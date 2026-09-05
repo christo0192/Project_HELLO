@@ -1,7 +1,23 @@
 import { useCallback, useEffect, useState } from 'react';
+import { Link } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import type { AshbyMcMapping, AshbyMcWorkflow, AshbyFeedbackForm } from '../types';
-import { Card } from '../components/ui';
+import {
+  Button,
+  buttonClass,
+  EmptyPanel,
+  GlassPanel,
+  InlineNotice,
+  LoadingPanel,
+  PageHeader,
+  RevealGroup,
+  RevealItem,
+  ScrollArea,
+  SectionHeader,
+  StatusBadge,
+  TextField,
+} from '../components/design';
+import type { StatusTone } from '../components/design';
 
 /**
  * Ashby Mission Control — admin-gated HR surface for the Ashby screening
@@ -28,6 +44,25 @@ import { Card } from '../components/ui';
  * by hand into the approved configuration process. The ids are held in
  * component state only and are never logged or sent to analytics.
  */
+
+/** Row separator inside a glass panel — a hairline, never a card border. */
+const ROW = 'border-b border-glass-ring py-3 last:border-0';
+/** Small neutral pill for ingestion / operation state. */
+/**
+ * Operator-facing form of a backend enum: underscores become spaces and the
+ * first letter is capitalised. The raw value is kept in a `title` so the
+ * exact vocabulary the API used stays one hover away.
+ */
+function humanize(value: string): string {
+  const spaced = value.replace(/_/g, ' ').trim();
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
+}
+
+const PILL =
+  'inline-flex items-center whitespace-nowrap rounded-full bg-ink/[0.05] px-2 py-0.5 text-xs text-ink-secondary';
+/** Above this many rows the workflow list scrolls instead of running down the page. */
+const WORKFLOW_SCROLL_AFTER = 6;
+
 export function AshbyMissionControlPage() {
   const [mappings, setMappings] = useState<AshbyMcMapping[]>([]);
   const [workflows, setWorkflows] = useState<AshbyMcWorkflow[]>([]);
@@ -155,213 +190,257 @@ export function AshbyMissionControlPage() {
     }
   }, []);
 
-  const mappingTone = (status: string): string =>
-    status === 'enabled'
-      ? 'text-emerald-700'
-      : status === 'drift'
-        ? 'text-red-700'
-        : 'text-amber-700';
+  const mappingTone = (status: string): StatusTone =>
+    status === 'enabled' ? 'success' : status === 'drift' ? 'danger' : 'warning';
+
+  const workflowRows = (
+    <ul>
+      {workflows.map((w) => (
+        <li key={w.applicationLinkId} className={ROW}>
+          <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+            <div className="flex min-w-0 flex-wrap items-center gap-2">
+              <span className="font-mono text-[13px] text-ink">{w.externalApplicationId}</span>
+              <StatusBadge
+                tone={
+                  w.terminalState != null
+                    ? 'danger'
+                    : w.lifecycle === 'writeback_pending'
+                      ? 'info'
+                      : 'neutral'
+                }
+              >
+                <span title={w.lifecycle}>{humanize(w.lifecycle)}</span>
+              </StatusBadge>
+              {w.terminalState && (
+                <StatusBadge tone="danger">
+                  <span title={w.terminalState}>{humanize(w.terminalState)}</span>
+                </StatusBadge>
+              )}
+              {w.ingestionState && (
+                <span className={PILL} title={w.ingestionState}>
+                  Ingest · {humanize(w.ingestionState)}
+                </span>
+              )}
+              {/* A completed screening whose link never reached
+                  `writeback_pending` is a completion park that did not
+                  land. The observer is best-effort by design (it must
+                  never discard a scored assessment), so this is where that
+                  case becomes visible instead of living only in a log. */}
+              {w.sessionStatus === 'completed'
+                && w.terminalState == null
+                && w.lifecycle !== 'writeback_pending' && (
+                <StatusBadge tone="warning">screened: not parked</StatusBadge>
+              )}
+            </div>
+            <div className="flex shrink-0 flex-wrap items-center gap-2">
+              {w.sessionId && w.sessionStatus === 'completed' && (
+                <a
+                  href={`/sessions/${encodeURIComponent(w.sessionId)}`}
+                  className={buttonClass('secondary', 'sm')}
+                >
+                  Review screening
+                </a>
+              )}
+              <Button
+                size="sm"
+                disabled={busy || w.terminalState != null}
+                onClick={() => void deliverInvite(w.applicationLinkId)}
+              >
+                {w.operations.some(
+                  (op) => op.type === 'invite_delivery' && op.state === 'succeeded',
+                )
+                  ? 'Reissue invite link'
+                  : 'Get invite link'}
+              </Button>
+              <Button
+                variant="danger"
+                size="sm"
+                disabled={busy || w.terminalState != null}
+                onClick={() => run(() => api.cancelAshbyWorkflow(w.applicationLinkId, 'manual_stage_cancel'))}
+              >
+                Cancel
+              </Button>
+            </div>
+          </div>
+
+          {inviteError?.linkId === w.applicationLinkId && (
+            <InlineNotice tone="danger" role="alert" className="mt-3">
+              {inviteError.message}
+            </InlineNotice>
+          )}
+
+          {invite?.linkId === w.applicationLinkId && (
+            <div className="glass-sunken mt-3 p-3">
+              {/*
+                The one-time candidate link. It lives in component state only —
+                it is not stored, not logged, and the token sits in the URL
+                fragment so it never reaches a server or an access log.
+              */}
+              <label
+                htmlFor={`invite-${w.applicationLinkId}`}
+                className="block text-[13px] font-medium text-ink-secondary"
+              >
+                Candidate link — shown once, expires{' '}
+                {new Date(invite.expiresAt).toLocaleString()}
+              </label>
+              <div className="mt-2 flex items-center gap-2">
+                <TextField
+                  id={`invite-${w.applicationLinkId}`}
+                  size="sm"
+                  readOnly
+                  value={invite.joinUrl}
+                  onFocus={(e) => e.currentTarget.select()}
+                  className="font-mono"
+                />
+                <Button size="sm" className="shrink-0" onClick={() => void copyInvite()}>
+                  {copied ? 'Copied' : 'Copy'}
+                </Button>
+              </div>
+              <p className="mt-2 text-[13px] leading-5 text-ink-tertiary">
+                Send this to the candidate yourself. It is not stored anywhere and cannot be
+                shown again — reissue to get a new one, which revokes this link.
+              </p>
+            </div>
+          )}
+          {w.operations.length > 0 && (
+            <ul className="mt-2 flex flex-wrap items-center gap-2">
+              {w.operations.map((op) => (
+                <li key={op.id} className="flex items-center gap-1.5">
+                  <span className={PILL} title={`${op.type}:${op.state}`}>
+                    {humanize(op.type)} · {humanize(op.state)}
+                    {op.errorCode ? ` (${op.errorCode})` : ''}
+                  </span>
+                  {op.state === 'failed' && (
+                    <Button
+                      size="sm"
+                      disabled={busy}
+                      onClick={() => run(() => api.retryAshbyOperation(op.id))}
+                    >
+                      Retry
+                    </Button>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </li>
+      ))}
+    </ul>
+  );
 
   return (
-    <main className="mx-auto max-w-5xl px-4 py-6">
-      <h1 className="text-xl font-semibold text-gray-900">Ashby Mission Control</h1>
-      <p className="mt-1 text-sm text-gray-500">
-        Screening-workflow health and controls. Data is sanitized — no candidate PII or tokens.
-      </p>
+    <div>
+      <PageHeader
+        eyebrow="Operations"
+        title="Ashby Mission Control"
+        description="Screening-workflow health and controls. Data is sanitized — no candidate PII or tokens."
+        actions={
+          <Link to="/mission-control" className={buttonClass('secondary', 'sm')}>
+            Mission Control
+          </Link>
+        }
+      />
 
-      {!loaded && (
-        <p className="mt-4 text-sm text-gray-500" role="status">
-          Loading…
-        </p>
-      )}
+      {!loaded && <LoadingPanel />}
       {error && (
-        <p className="mt-4 text-sm text-red-600" role="alert">
+        <InlineNotice tone="danger" role="alert" className="mt-6">
           {error}
-        </p>
+        </InlineNotice>
       )}
 
-      <Card className="mt-6 p-4">
-        <h2 className="text-base font-semibold text-gray-900">Job mappings</h2>
-        {loaded && mappings.length === 0 && (
-          <p className="mt-2 text-sm text-gray-500">No mappings.</p>
-        )}
-        <ul className="mt-3 divide-y divide-gray-100">
-          {mappings.map((m) => (
-            <li key={m.id} className="py-2">
-              <div className="flex items-center justify-between">
-                <div>
-                  <span className="font-mono text-sm text-gray-800">{m.externalJobId}</span>
-                  <span className={`ml-3 text-sm font-semibold ${mappingTone(m.status)}`}>{m.status}</span>
-                  {!(m.hasAiStage && m.hasTaStage) && (
-                    <span className="ml-2 text-xs text-amber-600">incomplete</span>
-                  )}
-                  {m.statusReason && <span className="ml-2 text-xs text-gray-400">{m.statusReason}</span>}
-                </div>
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    disabled={busy || m.status === 'paused'}
-                    onClick={() => run(() => api.pauseAshbyMapping(m.id))}
-                    className="rounded border border-gray-300 px-2 py-1 text-xs disabled:opacity-40"
-                  >
-                    Pause
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy || m.status === 'enabled' || !(m.hasAiStage && m.hasTaStage)}
-                    onClick={() => run(() => api.resumeAshbyMapping(m.id))}
-                    className="rounded border border-gray-300 px-2 py-1 text-xs disabled:opacity-40"
-                  >
-                    Resume
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy}
-                    onClick={() => void discoverForm(m.externalJobId)}
-                    className="rounded border border-gray-300 px-2 py-1 text-xs disabled:opacity-40"
-                  >
-                    Discover feedback form
-                  </button>
-                </div>
-              </div>
-
-              {formError?.jobId === m.externalJobId && (
-                <p role="alert" className="mt-2 text-xs text-red-700">
-                  {formError.message}
-                </p>
-              )}
-
-              {formSchema?.jobId === m.externalJobId && (
-                <FeedbackFormSchema forms={formSchema.forms} truncated={formSchema.truncated} />
-              )}
-            </li>
-          ))}
-        </ul>
-      </Card>
-
-      <Card className="mt-6 p-4">
-        <h2 className="text-base font-semibold text-gray-900">Application workflows</h2>
-        {loaded && workflows.length === 0 && (
-          <p className="mt-2 text-sm text-gray-500">No workflows.</p>
-        )}
-        <ul className="mt-3 divide-y divide-gray-100">
-          {workflows.map((w) => (
-            <li key={w.applicationLinkId} className="py-2">
-              <div className="flex items-center justify-between">
-                <div>
-                  <span className="font-mono text-sm text-gray-800">{w.externalApplicationId}</span>
-                  <span className="ml-3 text-sm text-gray-600">{w.lifecycle}</span>
-                  {w.terminalState && <span className="ml-2 text-xs text-red-600">{w.terminalState}</span>}
-                  {w.ingestionState && (
-                    <span className="ml-2 text-xs text-gray-500">ingest: {w.ingestionState}</span>
-                  )}
-                  {/* A completed screening whose link never reached
-                      `writeback_pending` is a completion park that did not
-                      land. The observer is best-effort by design (it must
-                      never discard a scored assessment), so this is where that
-                      case becomes visible instead of living only in a log. */}
-                  {w.sessionStatus === 'completed'
-                    && w.terminalState == null
-                    && w.lifecycle !== 'writeback_pending' && (
-                    <span className="ml-2 text-xs text-amber-700">screened: not parked</span>
-                  )}
-                </div>
-                <div className="flex items-center gap-2">
-                  {w.sessionId && w.sessionStatus === 'completed' && (
-                    <a
-                      href={`/sessions/${encodeURIComponent(w.sessionId)}`}
-                      className="rounded border border-blue-300 px-2 py-1 text-xs text-blue-800"
-                    >
-                      Review screening
-                    </a>
-                  )}
-                  <button
-                    type="button"
-                    disabled={busy || w.terminalState != null}
-                    onClick={() => void deliverInvite(w.applicationLinkId)}
-                    className="rounded border border-gray-300 px-2 py-1 text-xs disabled:opacity-40"
-                  >
-                    {w.operations.some(
-                      (op) => op.type === 'invite_delivery' && op.state === 'succeeded',
-                    )
-                      ? 'Reissue invite link'
-                      : 'Get invite link'}
-                  </button>
-                  <button
-                    type="button"
-                    disabled={busy || w.terminalState != null}
-                    onClick={() => run(() => api.cancelAshbyWorkflow(w.applicationLinkId, 'manual_stage_cancel'))}
-                    className="rounded border border-red-300 px-2 py-1 text-xs text-red-700 disabled:opacity-40"
-                  >
-                    Cancel
-                  </button>
-                </div>
-              </div>
-
-              {inviteError?.linkId === w.applicationLinkId && (
-                <p role="alert" className="mt-2 text-xs text-red-700">
-                  {inviteError.message}
-                </p>
-              )}
-
-              {invite?.linkId === w.applicationLinkId && (
-                <div className="mt-2 rounded border border-emerald-200 bg-emerald-50 p-2">
-                  <label
-                    htmlFor={`invite-${w.applicationLinkId}`}
-                    className="block text-xs font-medium text-emerald-900"
-                  >
-                    Candidate link — shown once, expires{' '}
-                    {new Date(invite.expiresAt).toLocaleString()}
-                  </label>
-                  <div className="mt-1 flex items-center gap-2">
-                    <input
-                      id={`invite-${w.applicationLinkId}`}
-                      readOnly
-                      value={invite.joinUrl}
-                      onFocus={(e) => e.currentTarget.select()}
-                      className="w-full rounded border border-emerald-300 bg-white px-2 py-1 font-mono text-xs"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => void copyInvite()}
-                      className="shrink-0 rounded border border-emerald-300 px-2 py-1 text-xs text-emerald-800"
-                    >
-                      {copied ? 'Copied' : 'Copy'}
-                    </button>
-                  </div>
-                  <p className="mt-1 text-xs text-emerald-800">
-                    Send this to the candidate yourself. It is not stored anywhere and cannot be
-                    shown again — reissue to get a new one, which revokes this link.
-                  </p>
-                </div>
-              )}
-              {w.operations.length > 0 && (
-                <ul className="mt-1 flex flex-wrap gap-2">
-                  {w.operations.map((op) => (
-                    <li key={op.id} className="flex items-center gap-1 text-xs text-gray-500">
-                      <span>
-                        {op.type}:{op.state}
-                        {op.errorCode ? ` (${op.errorCode})` : ''}
-                      </span>
-                      {op.state === 'failed' && (
-                        <button
-                          type="button"
-                          disabled={busy}
-                          onClick={() => run(() => api.retryAshbyOperation(op.id))}
-                          className="rounded border border-gray-300 px-1 text-xs disabled:opacity-40"
+      <RevealGroup className="mt-6 flex flex-col gap-6">
+        <RevealItem>
+          <GlassPanel>
+            <SectionHeader
+              level={2}
+              title="Job mappings"
+              meta={
+                loaded ? (
+                  <span className="text-[13px] text-ink-tertiary">{mappings.length}</span>
+                ) : undefined
+              }
+            />
+            {loaded && mappings.length === 0 ? (
+              <EmptyPanel compact className="mt-4" title="No mappings." />
+            ) : (
+              <ul className="mt-2">
+                {mappings.map((m) => (
+                  <li key={m.id} className={ROW}>
+                    <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+                      <div className="flex min-w-0 flex-wrap items-center gap-2">
+                        <span className="font-mono text-[13px] text-ink">{m.externalJobId}</span>
+                        {m.label && <span className="text-sm text-ink-secondary">{m.label}</span>}
+                        <StatusBadge tone={mappingTone(m.status)}>{m.status}</StatusBadge>
+                        {!(m.hasAiStage && m.hasTaStage) && <StatusBadge>incomplete</StatusBadge>}
+                        {m.statusReason && (
+                          <span className="text-[13px] text-ink-tertiary">{m.statusReason}</span>
+                        )}
+                      </div>
+                      <div className="flex shrink-0 flex-wrap items-center gap-2">
+                        <Button
+                          size="sm"
+                          disabled={busy || m.status === 'paused'}
+                          onClick={() => run(() => api.pauseAshbyMapping(m.id))}
                         >
-                          Retry
-                        </button>
-                      )}
-                    </li>
-                  ))}
-                </ul>
-              )}
-            </li>
-          ))}
-        </ul>
-      </Card>
-    </main>
+                          Pause
+                        </Button>
+                        <Button
+                          size="sm"
+                          disabled={busy || m.status === 'enabled' || !(m.hasAiStage && m.hasTaStage)}
+                          onClick={() => run(() => api.resumeAshbyMapping(m.id))}
+                        >
+                          Resume
+                        </Button>
+                        <Button
+                          size="sm"
+                          disabled={busy}
+                          onClick={() => void discoverForm(m.externalJobId)}
+                        >
+                          Discover feedback form
+                        </Button>
+                      </div>
+                    </div>
+
+                    {formError?.jobId === m.externalJobId && (
+                      <InlineNotice tone="danger" role="alert" className="mt-3">
+                        {formError.message}
+                      </InlineNotice>
+                    )}
+
+                    {formSchema?.jobId === m.externalJobId && (
+                      <FeedbackFormSchema forms={formSchema.forms} truncated={formSchema.truncated} />
+                    )}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </GlassPanel>
+        </RevealItem>
+
+        <RevealItem>
+          <GlassPanel>
+            <SectionHeader
+              level={2}
+              title="Application workflows"
+              meta={
+                loaded ? (
+                  <span className="text-[13px] text-ink-tertiary">{workflows.length}</span>
+                ) : undefined
+              }
+            />
+            {loaded && workflows.length === 0 ? (
+              <EmptyPanel compact className="mt-4" title="No workflows." />
+            ) : workflows.length > WORKFLOW_SCROLL_AFTER ? (
+              <ScrollArea maxHeight="36rem" label="Application workflows" className="mt-1">
+                {workflowRows}
+              </ScrollArea>
+            ) : (
+              <div className="mt-2">{workflowRows}</div>
+            )}
+          </GlassPanel>
+        </RevealItem>
+      </RevealGroup>
+    </div>
   );
 }
 
@@ -377,57 +456,58 @@ export function AshbyMissionControlPage() {
  */
 function FeedbackFormSchema({ forms, truncated }: { forms: AshbyFeedbackForm[]; truncated: boolean }) {
   return (
-    <div className="mt-2 rounded border border-blue-200 bg-blue-50 p-2">
-      <h3 className="text-xs font-semibold text-blue-900">
-        Feedback form schema — read-only, unverified
-      </h3>
-      <p className="mt-1 text-xs text-blue-800">
-        Structure only — no feedback content, scores, or comments are read. Nothing is saved or
-        bound to write-back; copy the ids by hand into the approved configuration process.
-      </p>
+    <div className="glass-sunken mt-3 p-4">
+      <SectionHeader
+        level={3}
+        title="Feedback form schema — read-only, unverified"
+        description="Structure only — no feedback content, scores, or comments are read. Nothing is saved or bound to write-back; copy the ids by hand into the approved configuration process."
+      />
       {truncated && (
-        <p className="mt-1 text-xs text-amber-800">
+        <InlineNotice tone="warning" className="mt-3">
           Result was truncated by a safety bound — this view is partial.
-        </p>
+        </InlineNotice>
       )}
       {forms.length === 0 ? (
-        <p className="mt-2 text-xs text-blue-900">
+        <p className="mt-3 text-[13px] text-ink-secondary">
           No feedback form is named in this job&apos;s interview plan.
         </p>
       ) : (
-        <ul className="mt-2 space-y-2">
+        <ul className="mt-3">
           {forms.map((f) => (
-            <li key={f.formDefinitionId} className="rounded border border-blue-200 bg-white p-2">
-              <p className="text-xs font-semibold text-gray-900">{f.title ?? 'Untitled form'}</p>
-              <p className="font-mono text-xs text-gray-700">form id: {f.formDefinitionId}</p>
+            <li
+              key={f.formDefinitionId}
+              className="border-t border-glass-ring pt-3 first:border-0 first:pt-0 [&+li]:mt-3"
+            >
+              <p className="text-sm font-medium text-ink">{f.title ?? 'Untitled form'}</p>
+              <p className="font-mono text-[13px] text-ink-secondary">form id: {f.formDefinitionId}</p>
               {(f.stageTitle || f.stageId) && (
-                <p className="text-xs text-gray-500">
+                <p className="text-[13px] text-ink-tertiary">
                   stage: {f.stageTitle ?? 'untitled'}
                   {f.stageId ? ` (${f.stageId})` : ''}
                 </p>
               )}
               {(f.interviewTitle || f.interviewId) && (
-                <p className="text-xs text-gray-500">
+                <p className="text-[13px] text-ink-tertiary">
                   interview: {f.interviewTitle ?? 'untitled'}
                   {f.interviewId ? ` (${f.interviewId})` : ''}
                 </p>
               )}
               {!f.schemaAvailable ? (
-                <p className="mt-1 text-xs text-amber-800">
+                <p className="mt-2 text-[13px] leading-5 text-warning-text">
                   Field-level schema is not available from the interview plan for this form — only
                   its id could be read. This is not a claim that the form has no fields.
                 </p>
               ) : (
                 <>
-                  <p className="mt-1 text-xs text-gray-500">{f.fieldCount} field(s)</p>
+                  <p className="mt-2 text-[13px] text-ink-tertiary">{f.fieldCount} field(s)</p>
                   {f.sections.map((sec, si) => (
-                    <div key={sec.id ?? `section-${si}`} className="mt-1">
-                      <p className="text-xs font-medium text-gray-700">
+                    <div key={sec.id ?? `section-${si}`} className="mt-2">
+                      <p className="text-[13px] font-medium text-ink-secondary">
                         {sec.title ?? 'Untitled section'}
                       </p>
                       <ul className="mt-1 space-y-1">
                         {sec.fields.map((field) => (
-                          <li key={field.id} className="text-xs text-gray-700">
+                          <li key={field.id} className="text-[13px] leading-5 text-ink-secondary">
                             <span className="font-mono">{field.id}</span>
                             {' — '}
                             {field.title ?? 'untitled'}
@@ -439,7 +519,7 @@ function FeedbackFormSchema({ forms, truncated }: { forms: AshbyFeedbackForm[]; 
                                 ? ' · required'
                                 : ' · optional'}
                             {field.options.length > 0 && (
-                              <span className="text-gray-500">
+                              <span className="text-ink-tertiary">
                                 {' · scale: '}
                                 {field.options
                                   .map((o) => (o.label ?? o.value ?? '').trim())

@@ -1,10 +1,9 @@
 /**
  * NavGroup — labelled sidebar navigation section.
  *
- * Groups related navigation under a small uppercase label (e.g.
- * "Workspace" for TA/HR daily items, "Operations" for the admin-only
- * Mission Control area). The label is hidden from the accessible tree
- * only when it duplicates surrounding context; here it is a real heading
+ * Groups related navigation under a small label (e.g. "Workspace" for
+ * TA/HR daily items, "Operations" for the admin-only Mission Control area).
+ * Sentence case, quiet weight — the label is a real heading for the group
  * so screen-reader users get section landmarks.
  */
 
@@ -17,10 +16,8 @@ export interface NavGroupProps {
 
 export function NavGroup({ label, children }: NavGroupProps) {
   return (
-    <div role="group" aria-label={label} className="mt-5 first:mt-0">
-      <p className="mb-1.5 px-3 text-[11px] font-semibold uppercase tracking-wider text-ink-tertiary">
-        {label}
-      </p>
+    <div role="group" aria-label={label} className="mt-6 first:mt-0">
+      <p className="mb-1.5 px-3 text-xs font-medium text-ink-tertiary">{label}</p>
       <div className="space-y-0.5">{children}</div>
     </div>
   );

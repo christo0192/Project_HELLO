@@ -7,16 +7,38 @@
  * message renders only after the API responds. Sessions in a terminal
  * state (failed/cancelled/expired/deleted) are immutable: the override
  * form is locked for them and no resurrection transition is offered.
+ *
+ * Layout: a paginated glass table on the left, a sticky override inspector
+ * on the right. The row radios and the inspector's session select are two
+ * views of the same `selectedId`.
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
 import type { AdminSessionRow } from '../../types';
-import { StatusBadge } from '../design';
-import { Table, THead, TBody, Tr, Th, Td } from '../design';
-import { ErrorState, LoadingState } from '../ui';
+import {
+  Button,
+  EmptyPanel,
+  ErrorPanel,
+  GlassPanel,
+  InlineNotice,
+  LoadingPanel,
+  Pagination,
+  RevealGroup,
+  RevealItem,
+  SectionHeader,
+  SelectField,
+  StatusBadge,
+  TBody,
+  THead,
+  Table,
+  Td,
+  TextField,
+  Th,
+  Tr,
+  usePagination,
+} from '../design';
 import { ConfirmButton } from './ConfirmButton';
-import { buttonClassNames } from './buttonStyles';
 import { sessionStatusLabel, sessionStatusTone } from '../talent';
 import {
   OVERRIDE_TARGET_STATUSES,
@@ -26,6 +48,9 @@ import {
   shortId,
   stableMutationMessage,
 } from './statusMeta';
+
+/** Stable empty reference so `usePagination` doesn't re-slice every render. */
+const NO_SESSIONS: AdminSessionRow[] = [];
 
 export function SessionsSection() {
   const [sessions, setSessions] = useState<AdminSessionRow[] | null>(null);
@@ -64,11 +89,19 @@ export function SessionsSection() {
     load();
   }, [load]);
 
+  // The admin list is bounded at 50 rows on this surface; pagination pages
+  // through that bound rather than widening it.
+  const bounded = useMemo(
+    () => (sessions ? sessions.slice(0, 50) : NO_SESSIONS),
+    [sessions],
+  );
+  const paged = usePagination(bounded, 10);
+
   if (loadError && !sessions) {
-    return <ErrorState message={loadError} onRetry={() => load()} />;
+    return <ErrorPanel message={loadError} onRetry={() => load()} />;
   }
   if (!sessions) {
-    return <LoadingState label="Loading sessions…" />;
+    return <LoadingPanel label="Loading sessions…" />;
   }
 
   const selected = sessions.find((s) => s.id === selectedId) ?? null;
@@ -113,215 +146,237 @@ export function SessionsSection() {
   ).length;
 
   return (
-    <div>
-      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 className="text-sm font-semibold text-ink">Sessions</h2>
-          <p className="mt-0.5 text-xs text-ink-tertiary">
-            Opaque identifiers only — no candidate PII. Terminal sessions
-            ({terminalCount} of {sessions.length}) are immutable.
-          </p>
-        </div>
-        <button
-          type="button"
-          onClick={() => load()}
-          className={buttonClassNames('secondary', 'px-3 py-1.5 text-xs')}
-        >
-          Refresh
-        </button>
-      </div>
+    <div className="space-y-5">
+      <SectionHeader
+        level={2}
+        title="Sessions"
+        meta={
+          <span className="text-[13px] tabular-nums text-ink-tertiary">
+            {sessions.length} total · {terminalCount} terminal
+          </span>
+        }
+        description="Opaque identifiers only — no candidate PII. Terminal sessions are immutable."
+        actions={
+          <Button size="sm" variant="secondary" onClick={() => load()}>
+            Refresh
+          </Button>
+        }
+      />
 
       {message && (
-        <p
-          role="status"
-          className={`mb-4 rounded-lg border px-3 py-2 text-sm ${
-            message.tone === 'ok'
-              ? 'border-success/30 bg-success-soft text-success'
-              : 'border-error/30 bg-error-soft text-error'
-          }`}
-        >
+        <InlineNotice role="status" tone={message.tone === 'ok' ? 'success' : 'danger'}>
           {message.text}
-        </p>
+        </InlineNotice>
       )}
 
-      {/* Filter */}
-      <div className="mb-4 flex flex-wrap items-center gap-2">
-        <label htmlFor="session-filter" className="text-xs font-medium text-ink-secondary">
+      <div className="flex flex-wrap items-center gap-2.5">
+        <label htmlFor="session-filter" className="text-[13px] font-medium text-ink-secondary">
           Status filter
         </label>
-        <select
-          id="session-filter"
-          value={filter}
-          onChange={(e) => changeFilter(e.target.value)}
-          className="rounded-lg border border-line bg-surface px-3 py-1.5 text-sm text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
-        >
-          <option value="all">All statuses</option>
-          {SESSION_FILTER_STATUSES.map((status) => (
-            <option key={status} value={status}>
-              {status}
-            </option>
-          ))}
-        </select>
+        <div className="w-56">
+          <SelectField
+            id="session-filter"
+            size="sm"
+            value={filter}
+            onChange={(e) => changeFilter(e.target.value)}
+          >
+            <option value="all">All statuses</option>
+            {SESSION_FILTER_STATUSES.map((status) => (
+              <option key={status} value={status}>
+                {sessionStatusLabel(status)}
+              </option>
+            ))}
+          </SelectField>
+        </div>
       </div>
 
-      {sessions.length === 0 ? (
-        <div className="rounded-xl border border-dashed border-line-strong bg-surface-secondary p-10 text-center">
-          <p className="text-sm font-medium text-ink-secondary">No sessions found</p>
-          <p className="mt-1 text-xs text-ink-tertiary">
-            {filter === 'all'
-              ? 'No sessions have been created yet.'
-              : 'No sessions match this status filter.'}
-          </p>
-        </div>
-      ) : (
-        <Table caption="Admin session list — id, status, candidate, created, started, ended">
-          <THead>
-            <Tr>
-              <Th>ID</Th>
-              <Th>Status</Th>
-              <Th>Candidate</Th>
-              <Th>Created</Th>
-              <Th>Started</Th>
-              <Th>Ended</Th>
-            </Tr>
-          </THead>
-          <TBody>
-            {sessions.slice(0, 50).map((session) => (
-              <Tr key={session.id}>
-                <Td className="font-mono text-xs text-ink-secondary">
-                  {shortId(session.id)}
-                </Td>
-                <Td>
-                  <StatusBadge tone={sessionStatusTone(session.status)}>
-                    {sessionStatusLabel(session.status)}
-                  </StatusBadge>
-                </Td>
-                <Td className="font-mono text-xs text-ink-secondary">
-                  {shortId(session.candidate_id)}
-                </Td>
-                <Td className="tabular-nums text-ink-secondary">
-                  {formatDateTime(session.created_at)}
-                </Td>
-                <Td className="tabular-nums text-ink-secondary">
-                  {formatDateTime(session.started_at)}
-                </Td>
-                <Td className="tabular-nums text-ink-secondary">
-                  {formatDateTime(session.ended_at)}
-                </Td>
-              </Tr>
-            ))}
-          </TBody>
-        </Table>
-      )}
-
-      {/* Override */}
-      <div className="mt-6 rounded-xl border border-line bg-surface p-5 shadow-card">
-        <h3 className="text-sm font-semibold text-ink">Override session status</h3>
-        <p className="mt-0.5 text-xs text-ink-tertiary">
-          Bounded CAS override with a required audit reason. Terminal states
-          (failed, cancelled, expired, deleted) cannot be changed — no
-          resurrection.
-        </p>
-
-        {sessions.length === 0 ? (
-          <p className="mt-4 text-sm text-ink-tertiary">
-            Nothing to override yet.
-          </p>
-        ) : (
-          <>
-            <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
-              <div>
-                <label htmlFor="override-session" className="mb-1 block text-xs font-medium text-ink-secondary">
-                  Session
-                </label>
-                <select
-                  id="override-session"
-                  value={selectedId}
-                  onChange={(e) => setSelectedId(e.target.value)}
-                  disabled={terminal}
-                  className="w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 disabled:opacity-50"
-                >
-                  {sessions.slice(0, 50).map((session) => (
-                    <option key={session.id} value={session.id}>
-                      {shortId(session.id)} — {session.status}
-                      {isTerminalSessionStatus(session.status)
-                        ? ' (terminal — locked)'
-                        : ''}
-                    </option>
+      <RevealGroup className="grid grid-cols-1 gap-6 lg:grid-cols-[minmax(0,1fr)_22rem]">
+        <RevealItem className="min-w-0">
+          {sessions.length === 0 ? (
+            <EmptyPanel
+              title="No sessions found"
+              hint={
+                filter === 'all'
+                  ? 'No sessions have been created yet.'
+                  : 'No sessions match this status filter.'
+              }
+            />
+          ) : (
+            <>
+              <Table caption="Admin session list — id, status, candidate, created, started, ended">
+                <THead>
+                  <Tr>
+                    <Th className="w-10">
+                      <span className="sr-only">Select</span>
+                    </Th>
+                    <Th>ID</Th>
+                    <Th>Status</Th>
+                    <Th>Candidate</Th>
+                    <Th>Created</Th>
+                    <Th>Started</Th>
+                    <Th>Ended</Th>
+                  </Tr>
+                </THead>
+                <TBody>
+                  {paged.items.map((session) => (
+                    <Tr
+                      key={session.id}
+                      className={session.id === selectedId ? 'bg-info-soft' : undefined}
+                    >
+                      <Td className="pr-0">
+                        <input
+                          type="radio"
+                          name="override-session"
+                          value={session.id}
+                          checked={session.id === selectedId}
+                          onChange={() => setSelectedId(session.id)}
+                          aria-label={`Select session ${shortId(session.id)}`}
+                          className="h-4 w-4 cursor-pointer accent-info"
+                        />
+                      </Td>
+                      <Td className="whitespace-nowrap font-mono text-xs text-ink-secondary">
+                        {shortId(session.id)}
+                      </Td>
+                      <Td>
+                        <StatusBadge tone={sessionStatusTone(session.status)}>
+                          {sessionStatusLabel(session.status)}
+                        </StatusBadge>
+                      </Td>
+                      <Td className="whitespace-nowrap font-mono text-xs text-ink-secondary">
+                        {shortId(session.candidate_id)}
+                      </Td>
+                      <Td className="whitespace-nowrap tabular-nums text-ink-secondary">
+                        {formatDateTime(session.created_at)}
+                      </Td>
+                      <Td className="whitespace-nowrap tabular-nums text-ink-secondary">
+                        {formatDateTime(session.started_at)}
+                      </Td>
+                      <Td className="whitespace-nowrap tabular-nums text-ink-secondary">
+                        {formatDateTime(session.ended_at)}
+                      </Td>
+                    </Tr>
                   ))}
-                </select>
+                </TBody>
+              </Table>
+              <Pagination state={paged} noun="sessions" />
+            </>
+          )}
+        </RevealItem>
+
+        <RevealItem>
+          <GlassPanel className="lg:sticky lg:top-20">
+            <SectionHeader
+              level={3}
+              title="Override session status"
+              description="Bounded CAS override with a required audit reason — terminal states (failed, cancelled, expired, deleted) cannot be changed, so no resurrection is offered."
+            />
+
+            {sessions.length === 0 ? (
+              <p className="mt-4 text-sm text-ink-tertiary">Nothing to override yet.</p>
+            ) : (
+              <div className="mt-4 space-y-3.5">
                 {selected && (
-                  <p className="mt-1.5 text-xs text-ink-tertiary">
-                    Current status:{' '}
+                  <div className="glass-sunken flex flex-wrap items-center justify-between gap-2 px-3 py-2.5">
+                    <span className="font-mono text-xs text-ink-secondary">
+                      {shortId(selected.id)}
+                    </span>
                     <StatusBadge tone={sessionStatusTone(selected.status)}>
                       {sessionStatusLabel(selected.status)}
                     </StatusBadge>
-                  </p>
+                  </div>
+                )}
+
+                <div className="flex flex-col gap-1.5">
+                  <label
+                    htmlFor="override-session"
+                    className="text-[13px] font-medium text-ink-secondary"
+                  >
+                    Session
+                  </label>
+                  <SelectField
+                    id="override-session"
+                    value={selectedId}
+                    disabled={terminal}
+                    onChange={(e) => setSelectedId(e.target.value)}
+                  >
+                    {bounded.map((session) => (
+                      <option key={session.id} value={session.id}>
+                        {shortId(session.id)} — {session.status}
+                        {isTerminalSessionStatus(session.status)
+                          ? ' (terminal — locked)'
+                          : ''}
+                      </option>
+                    ))}
+                  </SelectField>
+                </div>
+
+                <div className="flex flex-col gap-1.5">
+                  <label
+                    htmlFor="override-target"
+                    className="text-[13px] font-medium text-ink-secondary"
+                  >
+                    Target status
+                  </label>
+                  <SelectField
+                    id="override-target"
+                    value={targetStatus}
+                    disabled={terminal}
+                    onChange={(e) =>
+                      setTargetStatus(
+                        e.target.value as (typeof OVERRIDE_TARGET_STATUSES)[number],
+                      )
+                    }
+                  >
+                    {OVERRIDE_TARGET_STATUSES.map((status) => (
+                      <option key={status} value={status}>
+                        {status}
+                      </option>
+                    ))}
+                  </SelectField>
+                </div>
+
+                <div className="flex flex-col gap-1.5">
+                  <label
+                    htmlFor="override-reason"
+                    className="text-[13px] font-medium text-ink-secondary"
+                  >
+                    Reason (required)
+                  </label>
+                  <TextField
+                    id="override-reason"
+                    value={reason}
+                    onChange={(e) => setReason(e.target.value)}
+                    maxLength={200}
+                    placeholder="Audit reason…"
+                    disabled={terminal}
+                  />
+                </div>
+
+                {terminal && selected ? (
+                  <InlineNotice tone="warning">
+                    This session is in a terminal state (
+                    {sessionStatusLabel(selected.status)}) and cannot be changed.
+                  </InlineNotice>
+                ) : (
+                  <ConfirmButton
+                    label="Apply override"
+                    confirmLabel="Confirm override"
+                    disabled={!selected || reason.trim().length === 0}
+                    summary={
+                      <span>
+                        Set session <strong>{selected ? shortId(selected.id) : '—'}</strong>{' '}
+                        from <strong>{selected ? sessionStatusLabel(selected.status) : '—'}</strong>{' '}
+                        to <strong>{targetStatus}</strong>? Reason: “{reason.trim() || '—'}”.
+                      </span>
+                    }
+                    onConfirm={runOverride}
+                  />
                 )}
               </div>
-              <div>
-                <label htmlFor="override-target" className="mb-1 block text-xs font-medium text-ink-secondary">
-                  Target status
-                </label>
-                <select
-                  id="override-target"
-                  value={targetStatus}
-                  disabled={terminal}
-                  onChange={(e) =>
-                    setTargetStatus(
-                      e.target.value as (typeof OVERRIDE_TARGET_STATUSES)[number],
-                    )
-                  }
-                  className="w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 disabled:opacity-50"
-                >
-                  {OVERRIDE_TARGET_STATUSES.map((status) => (
-                    <option key={status} value={status}>
-                      {status}
-                    </option>
-                  ))}
-                </select>
-              </div>
-              <div>
-                <label htmlFor="override-reason" className="mb-1 block text-xs font-medium text-ink-secondary">
-                  Reason (required)
-                </label>
-                <input
-                  id="override-reason"
-                  value={reason}
-                  onChange={(e) => setReason(e.target.value)}
-                  maxLength={200}
-                  placeholder="Audit reason…"
-                  disabled={terminal}
-                  className="w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink placeholder:text-ink-tertiary focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 disabled:opacity-50"
-                />
-              </div>
-            </div>
-
-            {terminal && selected ? (
-              <p className="mt-4 rounded-lg border border-warning/30 bg-warning-soft px-3 py-2 text-sm text-warning">
-                This session is in a terminal state (
-                {sessionStatusLabel(selected.status)}) and cannot be changed.
-              </p>
-            ) : (
-              <div className="mt-4">
-                <ConfirmButton
-                  label="Apply override"
-                  confirmLabel="Confirm override"
-                  disabled={!selected || reason.trim().length === 0}
-                  summary={
-                    <span>
-                      Set session <strong>{selected ? shortId(selected.id) : '—'}</strong>{' '}
-                      from <strong>{selected ? sessionStatusLabel(selected.status) : '—'}</strong>{' '}
-                      to <strong>{targetStatus}</strong>? Reason: “{reason.trim() || '—'}”.
-                    </span>
-                  }
-                  onConfirm={runOverride}
-                />
-              </div>
             )}
-          </>
-        )}
-      </div>
+          </GlassPanel>
+        </RevealItem>
+      </RevealGroup>
     </div>
   );
 }

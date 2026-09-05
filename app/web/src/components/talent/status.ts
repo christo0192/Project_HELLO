@@ -28,6 +28,8 @@ export function candidateStatusLabel(status: string | null | undefined): string 
       return 'Advanced';
     case 'rejected':
       return 'Rejected';
+    case 'consent_declined':
+      return 'Consent declined';
     default:
       return (status ?? 'new').trim() || 'New';
   }
@@ -68,6 +70,10 @@ export function sessionStatusLabel(status: string | null | undefined): string {
       return 'Cancelled';
     case 'expired':
       return 'Expired';
+    case 'abandoned':
+      return 'Abandoned';
+    case 'deleted':
+      return 'Deleted';
     default:
       return status ?? '—';
   }

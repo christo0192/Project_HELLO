@@ -33,7 +33,7 @@ export function MobileMenuButton({
       aria-controls="app-sidebar"
       aria-label={open ? 'Close navigation menu' : 'Open navigation menu'}
       className={cx(
-        'inline-flex h-9 w-9 items-center justify-center rounded-lg border border-line bg-surface text-ink-secondary transition-colors hover:bg-surface-tertiary hover:text-ink lg:hidden',
+        'inline-flex h-9 w-9 items-center justify-center rounded-control bg-white/70 text-ink-secondary shadow-[inset_0_0_0_1px_var(--glass-ring-strong)] transition-colors duration-200 hover:bg-white hover:text-ink lg:hidden',
         className,
       )}
     >

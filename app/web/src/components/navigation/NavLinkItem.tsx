@@ -2,13 +2,16 @@
  * NavLinkItem — accessible sidebar navigation link.
  *
  * - Uses react-router `NavLink`; the active state is reflected visually
- *   (brand pill) and semantically (`aria-current="page"`).
+ *   (a white pill that glides between items via a shared `layoutId`) and
+ *   semantically (`aria-current="page"`).
  * - Renders an inline leading icon and a label; the whole row is a single
  *   link, so icon buttons never need their own accessible name.
  */
 
+import { motion } from 'motion/react';
 import { NavLink } from 'react-router-dom';
 import type { ReactNode } from 'react';
+import { useSelectionTransition } from '../../lib/motion';
 import { cx } from '../design/cx';
 
 export interface NavLinkItemProps {
@@ -27,6 +30,7 @@ export function NavLinkItem({
   end,
   onNavigate,
 }: NavLinkItemProps) {
+  const transition = useSelectionTransition();
   return (
     <NavLink
       to={to}
@@ -34,27 +38,32 @@ export function NavLinkItem({
       onClick={onNavigate}
       className={({ isActive }) =>
         cx(
-          'group flex items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium transition-colors',
-          isActive
-            ? 'bg-brand-50 text-brand-800 dark:bg-brand-950/60 dark:text-brand-200'
-            : 'text-ink-secondary hover:bg-surface-tertiary hover:text-ink',
+          'group relative flex h-9 items-center gap-3 rounded-[11px] px-3 text-sm font-medium transition-colors duration-200 ease-soft',
+          'focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-transparent',
+          isActive ? 'text-ink' : 'text-ink-secondary hover:bg-white/50 hover:text-ink',
         )
       }
     >
       {({ isActive }) => (
         <>
+          {isActive && (
+            <motion.span
+              layoutId="sidebar-nav-pill"
+              aria-hidden="true"
+              transition={transition}
+              className="absolute inset-0 rounded-[11px] bg-white shadow-pill"
+            />
+          )}
           <span
             aria-hidden="true"
             className={cx(
-              'flex h-4 w-4 items-center justify-center transition-colors',
-              isActive
-                ? 'text-brand-600 dark:text-brand-300'
-                : 'text-ink-tertiary group-hover:text-ink-secondary',
+              'relative z-10 flex h-4 w-4 items-center justify-center transition-colors duration-200',
+              isActive ? 'text-info' : 'text-ink-tertiary group-hover:text-ink-secondary',
             )}
           >
             {icon}
           </span>
-          <span className="truncate">{label}</span>
+          <span className="relative z-10 truncate">{label}</span>
         </>
       )}
     </NavLink>

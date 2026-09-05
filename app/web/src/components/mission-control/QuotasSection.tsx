@@ -12,11 +12,25 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../../api';
 import type { QuotaPolicy } from '../../types';
-import { StatusBadge } from '../design';
-import { Table, THead, TBody, Tr, Th, Td } from '../design';
-import { ErrorState, LoadingState } from '../ui';
-import { ConfirmButton, LinkAction } from './ConfirmButton';
-import { buttonClassNames } from './buttonStyles';
+import {
+  Button,
+  EmptyPanel,
+  ErrorPanel,
+  Field,
+  GlassPanel,
+  InlineNotice,
+  LoadingPanel,
+  Pagination,
+  RevealGroup,
+  RevealItem,
+  SectionHeader,
+  SelectField,
+  StatusBadge,
+  Switch,
+  TextField,
+  usePagination,
+} from '../design';
+import { ConfirmButton } from './ConfirmButton';
 import { formatDateTime, shortId, stableMutationMessage } from './statusMeta';
 
 interface CreateDraft {
@@ -54,6 +68,19 @@ function policySummary(policy: QuotaPolicy): string {
   ].join(' · ');
 }
 
+/** Row pills — the same limit facts as the summary, one per fact. */
+function policyLimits(policy: QuotaPolicy): string[] {
+  return [
+    `Max sessions ${policy.max_sessions ?? '∞'}`,
+    `Cost units ${policy.max_cost_units ?? '∞'}`,
+    `${policy.cost_units_per_session ?? '—'} units/session`,
+    policy.warning_percentage == null
+      ? 'Warning off'
+      : `Warn at ${policy.warning_percentage}%`,
+    `${policy.period_days}-day period`,
+  ];
+}
+
 export function QuotasSection() {
   const [policies, setPolicies] = useState<QuotaPolicy[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -75,11 +102,13 @@ export function QuotasSection() {
 
   useEffect(load, [load]);
 
+  const page = usePagination(policies ?? [], 10);
+
   if (loadError && !policies) {
-    return <ErrorState message={loadError} onRetry={load} />;
+    return <ErrorPanel message={loadError} onRetry={load} />;
   }
   if (!policies) {
-    return <LoadingState label="Loading quota policies…" />;
+    return <LoadingPanel label="Loading quota policies…" />;
   }
 
   function setDraftField<K extends keyof CreateDraft>(
@@ -217,239 +246,210 @@ export function QuotasSection() {
   const enabledCount = policies.filter((p) => p.enabled).length;
 
   return (
-    <div>
-      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 className="text-sm font-semibold text-ink">Quota policies</h2>
-          <p className="mt-0.5 text-xs text-ink-tertiary">
-            Abstract cost units only — never currency or provider price.
-            Policies are disabled by default; enforcement engages only once
-            enabled. {enabledCount} of {policies.length} currently enabled.
-          </p>
-        </div>
-        <LinkAction onClick={load}>Refresh</LinkAction>
-      </div>
+    <div className="space-y-5">
+      <SectionHeader
+        title="Quota policies"
+        description="Abstract cost units only — never currency or provider price; policies are disabled by default and enforcement engages only once enabled."
+        meta={
+          <span className="text-[13px] tabular-nums text-ink-tertiary">
+            {enabledCount} of {policies.length} enabled
+          </span>
+        }
+        actions={
+          <Button size="sm" onClick={load}>
+            Refresh
+          </Button>
+        }
+      />
 
       {message && (
-        <p
-          role="status"
-          className={`mb-4 rounded-lg border px-3 py-2 text-sm ${
-            message.tone === 'ok'
-              ? 'border-success/30 bg-success-soft text-success'
-              : 'border-error/30 bg-error-soft text-error'
-          }`}
-        >
+        <InlineNotice tone={message.tone === 'ok' ? 'success' : 'danger'} role="status">
           {message.text}
-        </p>
+        </InlineNotice>
       )}
 
       {policies.length === 0 ? (
-        <div className="mb-6 rounded-xl border border-dashed border-line-strong bg-surface-secondary p-10 text-center">
-          <p className="text-sm font-medium text-ink-secondary">
-            No quota policies configured
-          </p>
-          <p className="mt-1 text-xs text-ink-tertiary">
-            Quota enforcement is off. Create a policy below to set limits.
-          </p>
-        </div>
+        <EmptyPanel
+          title="No quota policies configured"
+          hint="Quota enforcement is off. Create a policy below to set limits."
+        />
       ) : (
-        <Table caption="Quota policies — scope, limits, state and actions">
-          <THead>
-            <Tr>
-              <Th>Scope</Th>
-              <Th>Limits</Th>
-              <Th>State</Th>
-              <Th>
-                <span className="sr-only">Actions</span>
-              </Th>
-            </Tr>
-          </THead>
-          <TBody>
-            {policies.map((policy) => (
-              <Tr key={policy.id}>
-                <Td>
-                  <p className="font-medium text-ink">
-                    {policy.scope === 'global' ? 'Global' : 'Candidate'}
-                  </p>
-                  {policy.scope === 'candidate' && (
-                    <p className="font-mono text-xs text-ink-tertiary">
-                      {shortId(policy.scope_id)}
-                    </p>
-                  )}
-                </Td>
-                <Td>
-                  {editId === policy.id ? (
+        <div>
+          <RevealGroup className="space-y-3">
+            {page.items.map((policy) => (
+              <RevealItem key={policy.id}>
+                <GlassPanel padding="sm" data-policy-row={policy.id}>
+                  <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-medium text-ink">
+                        {policy.scope === 'global' ? 'Global' : 'Candidate'}
+                      </p>
+                      {policy.scope === 'candidate' && (
+                        <p className="font-mono text-xs text-ink-tertiary">
+                          {shortId(policy.scope_id)}
+                        </p>
+                      )}
+                      <div className="mt-2 flex flex-wrap gap-1.5">
+                        {policyLimits(policy).map((limit) => (
+                          <span
+                            key={limit}
+                            className="rounded-full bg-ink/[0.05] px-2 py-0.5 text-xs text-ink-secondary"
+                          >
+                            {limit}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+
+                    <div className="shrink-0">
+                      <StatusBadge tone={policy.enabled ? 'success' : 'neutral'}>
+                        {policy.enabled ? 'enabled' : 'disabled'}
+                      </StatusBadge>
+                      <p className="mt-1 text-xs text-ink-tertiary">
+                        updated {formatDateTime(policy.updated_at)}
+                      </p>
+                    </div>
+
+                    <div className="flex shrink-0 flex-wrap items-start gap-2">
+                      <ConfirmButton
+                        label={policy.enabled ? 'Disable' : 'Enable'}
+                        variant="secondary"
+                        confirmLabel={`Confirm ${policy.enabled ? 'disable' : 'enable'}`}
+                        summary={
+                          <span>
+                            {policy.enabled ? 'Disable' : 'Enable'} the{' '}
+                            <strong>{policy.scope}</strong> quota policy (
+                            {policySummary(policy)})?
+                          </span>
+                        }
+                        onConfirm={() => togglePolicy(policy)}
+                      />
+                      {editId === policy.id ? (
+                        <ConfirmButton
+                          label="Save changes"
+                          variant="primary"
+                          confirmLabel="Confirm update"
+                          summary={
+                            <span>
+                              Update the <strong>{policy.scope}</strong> policy
+                              with the limits shown above?
+                            </span>
+                          }
+                          onConfirm={() => saveEdit(policy)}
+                        />
+                      ) : (
+                        <Button size="sm" onClick={() => startEdit(policy)}>
+                          Edit
+                        </Button>
+                      )}
+                    </div>
+                  </div>
+
+                  {editId === policy.id && (
                     <EditForm
                       policy={policy}
                       edit={edits[policy.id] ?? EMPTY_DRAFT}
-                      onChange={(key, value) =>
-                        setEditField(policy.id, key, value)
-                      }
+                      onChange={(key, value) => setEditField(policy.id, key, value)}
                       onCancel={() => setEditId(null)}
                     />
-                  ) : (
-                    <p className="text-xs text-ink-secondary">
-                      {policySummary(policy)}
-                    </p>
                   )}
-                </Td>
-                <Td>
-                  <StatusBadge tone={policy.enabled ? 'success' : 'neutral'}>
-                    {policy.enabled ? 'enabled' : 'disabled'}
-                  </StatusBadge>
-                  <p className="mt-0.5 text-xs text-ink-tertiary">
-                    updated {formatDateTime(policy.updated_at)}
-                  </p>
-                </Td>
-                <Td>
-                  <div className="flex flex-wrap gap-2">
-                    <ConfirmButton
-                      label={policy.enabled ? 'Disable' : 'Enable'}
-                      variant="secondary"
-                      confirmLabel={`Confirm ${policy.enabled ? 'disable' : 'enable'}`}
-                      summary={
-                        <span>
-                          {policy.enabled ? 'Disable' : 'Enable'} the{' '}
-                          <strong>{policy.scope}</strong> quota policy (
-                          {policySummary(policy)})?
-                        </span>
-                      }
-                      onConfirm={() => togglePolicy(policy)}
-                    />
-                    {editId === policy.id ? (
-                      <ConfirmButton
-                        label="Save changes"
-                        variant="primary"
-                        confirmLabel="Confirm update"
-                        summary={
-                          <span>
-                            Update the <strong>{policy.scope}</strong> policy
-                            with the limits shown above?
-                          </span>
-                        }
-                        onConfirm={() => saveEdit(policy)}
-                      />
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => startEdit(policy)}
-                        className={buttonClassNames('secondary', 'px-2.5 py-1.5 text-xs')}
-                      >
-                        Edit
-                      </button>
-                    )}
-                  </div>
-                </Td>
-              </Tr>
+                </GlassPanel>
+              </RevealItem>
             ))}
-          </TBody>
-        </Table>
+          </RevealGroup>
+          <Pagination state={page} noun="policies" />
+        </div>
       )}
 
       {/* Create */}
-      <div className="mt-6 rounded-xl border border-line bg-surface p-5 shadow-card">
-        <h3 className="text-sm font-semibold text-ink">Create policy</h3>
-        <p className="mt-0.5 text-xs text-ink-tertiary">
-          Blank limits mean unlimited. The confirmation below shows the exact
-          scope before anything is created.
-        </p>
-        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-3">
-          <div>
-            <label htmlFor="quota-scope" className="mb-1 block text-xs font-medium text-ink-secondary">
-              Scope
-            </label>
-            <select
-              id="quota-scope"
-              value={draft.scope}
-              onChange={(e) =>
-                setDraftField(
-                  'scope',
-                  e.target.value as CreateDraft['scope'],
-                )
-              }
-              className="w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
-            >
-              <option value="global">Global — all sessions</option>
-              <option value="candidate">Candidate — one person</option>
-            </select>
-          </div>
+      <GlassPanel>
+        <SectionHeader
+          level={3}
+          title="Create policy"
+          description="Blank limits mean unlimited — the confirmation below shows the exact scope before anything is created."
+        />
+        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+          <Field label="Scope" id="quota-scope">
+            {({ id }) => (
+              <SelectField
+                id={id}
+                value={draft.scope}
+                onChange={(e) =>
+                  setDraftField('scope', e.target.value as CreateDraft['scope'])
+                }
+              >
+                <option value="global">Global — all sessions</option>
+                <option value="candidate">Candidate — one person</option>
+              </SelectField>
+            )}
+          </Field>
           {draft.scope === 'candidate' && (
-            <div>
-              <label htmlFor="quota-scope-id" className="mb-1 block text-xs font-medium text-ink-secondary">
-                Candidate ID
-              </label>
-              <input
-                id="quota-scope-id"
-                value={draft.scopeId}
-                onChange={(e) => setDraftField('scopeId', e.target.value)}
-                placeholder="UUID"
-                className="w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink placeholder:text-ink-tertiary focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
-              />
-            </div>
+            <Field label="Candidate ID" id="quota-scope-id">
+              {({ id }) => (
+                <TextField
+                  id={id}
+                  value={draft.scopeId}
+                  onChange={(e) => setDraftField('scopeId', e.target.value)}
+                  placeholder="UUID"
+                />
+              )}
+            </Field>
           )}
-          <div>
-            <label htmlFor="quota-max-sessions" className="mb-1 block text-xs font-medium text-ink-secondary">
-              Max sessions (blank = unlimited)
-            </label>
-            <input
-              id="quota-max-sessions"
-              type="number"
-              min={1}
-              value={draft.maxSessions}
-              onChange={(e) => setDraftField('maxSessions', e.target.value)}
-              className="w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
-            />
-          </div>
-          <div>
-            <label htmlFor="quota-max-cost" className="mb-1 block text-xs font-medium text-ink-secondary">
-              Max cost units (abstract)
-            </label>
-            <input
-              id="quota-max-cost"
-              type="number"
-              min={1}
-              value={draft.maxCostUnits}
-              onChange={(e) => setDraftField('maxCostUnits', e.target.value)}
-              className="w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
-            />
-          </div>
-          <div>
-            <label htmlFor="quota-units-session" className="mb-1 block text-xs font-medium text-ink-secondary">
-              Cost units per session (abstract)
-            </label>
-            <input
-              id="quota-units-session"
-              type="number"
-              min={1}
-              value={draft.costPerSession}
-              onChange={(e) => setDraftField('costPerSession', e.target.value)}
-              className="w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
-            />
-          </div>
-          <div>
-            <label htmlFor="quota-warning" className="mb-1 block text-xs font-medium text-ink-secondary">
-              Warning % (blank = off)
-            </label>
-            <input
-              id="quota-warning"
-              type="number"
-              min={1}
-              max={100}
-              value={draft.warningPct}
-              onChange={(e) => setDraftField('warningPct', e.target.value)}
-              className="w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
-            />
-          </div>
-          <label className="flex items-center gap-2 pt-5 text-sm text-ink">
-            <input
-              type="checkbox"
-              checked={draft.enabled}
-              onChange={(e) => setDraftField('enabled', e.target.checked)}
-              className="h-4 w-4 rounded border-line-strong text-brand-600 focus:ring-brand-500"
-            />
-            Enabled
-          </label>
+          <Field label="Max sessions (blank = unlimited)" id="quota-max-sessions">
+            {({ id }) => (
+              <TextField
+                id={id}
+                type="number"
+                min={1}
+                value={draft.maxSessions}
+                onChange={(e) => setDraftField('maxSessions', e.target.value)}
+              />
+            )}
+          </Field>
+          <Field label="Max cost units (abstract)" id="quota-max-cost">
+            {({ id }) => (
+              <TextField
+                id={id}
+                type="number"
+                min={1}
+                value={draft.maxCostUnits}
+                onChange={(e) => setDraftField('maxCostUnits', e.target.value)}
+              />
+            )}
+          </Field>
+          <Field label="Cost units per session (abstract)" id="quota-units-session">
+            {({ id }) => (
+              <TextField
+                id={id}
+                type="number"
+                min={1}
+                value={draft.costPerSession}
+                onChange={(e) => setDraftField('costPerSession', e.target.value)}
+              />
+            )}
+          </Field>
+          <Field label="Warning % (blank = off)" id="quota-warning">
+            {({ id }) => (
+              <TextField
+                id={id}
+                type="number"
+                min={1}
+                max={100}
+                value={draft.warningPct}
+                onChange={(e) => setDraftField('warningPct', e.target.value)}
+              />
+            )}
+          </Field>
         </div>
+
+        <div className="glass-sunken mt-4 rounded-[14px] p-4">
+          <Switch
+            checked={draft.enabled}
+            onCheckedChange={(next) => setDraftField('enabled', next)}
+            label="Enabled"
+          />
+        </div>
+
         <div className="mt-4">
           <ConfirmButton
             label="Create policy"
@@ -470,7 +470,7 @@ export function QuotasSection() {
             onConfirm={createPolicy}
           />
         </div>
-      </div>
+      </GlassPanel>
     </div>
   );
 }
@@ -487,69 +487,73 @@ function EditForm({
   onCancel: () => void;
 }) {
   return (
-    <div className="grid grid-cols-2 gap-2">
-      <label className="text-xs text-ink-secondary">
-        Max sessions
-        <input
-          type="number"
-          min={1}
-          value={edit.maxSessions}
-          onChange={(e) => onChange('maxSessions', e.target.value)}
-          aria-label={`Max sessions for ${policy.id}`}
-          className="mt-1 w-full rounded-lg border border-line bg-surface px-2 py-1 text-xs text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
-        />
-      </label>
-      <label className="text-xs text-ink-secondary">
-        Max cost units
-        <input
-          type="number"
-          min={1}
-          value={edit.maxCostUnits}
-          onChange={(e) => onChange('maxCostUnits', e.target.value)}
-          aria-label={`Max cost units for ${policy.id}`}
-          className="mt-1 w-full rounded-lg border border-line bg-surface px-2 py-1 text-xs text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
-        />
-      </label>
-      <label className="text-xs text-ink-secondary">
-        Units / session
-        <input
-          type="number"
-          min={1}
-          value={edit.costPerSession}
-          onChange={(e) => onChange('costPerSession', e.target.value)}
-          aria-label={`Cost units per session for ${policy.id}`}
-          className="mt-1 w-full rounded-lg border border-line bg-surface px-2 py-1 text-xs text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
-        />
-      </label>
-      <label className="text-xs text-ink-secondary">
-        Warning %
-        <input
-          type="number"
-          min={1}
-          max={100}
-          value={edit.warningPct}
-          onChange={(e) => onChange('warningPct', e.target.value)}
-          aria-label={`Warning percentage for ${policy.id}`}
-          className="mt-1 w-full rounded-lg border border-line bg-surface px-2 py-1 text-xs text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
-        />
-      </label>
-      <label className="col-span-2 flex items-center gap-2 text-xs text-ink">
-        <input
-          type="checkbox"
+    <div className="glass-sunken mt-3 rounded-[14px] p-4">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <Field label="Max sessions">
+          {({ id }) => (
+            <TextField
+              id={id}
+              size="sm"
+              type="number"
+              min={1}
+              value={edit.maxSessions}
+              onChange={(e) => onChange('maxSessions', e.target.value)}
+              aria-label={`Max sessions for ${policy.id}`}
+            />
+          )}
+        </Field>
+        <Field label="Max cost units">
+          {({ id }) => (
+            <TextField
+              id={id}
+              size="sm"
+              type="number"
+              min={1}
+              value={edit.maxCostUnits}
+              onChange={(e) => onChange('maxCostUnits', e.target.value)}
+              aria-label={`Max cost units for ${policy.id}`}
+            />
+          )}
+        </Field>
+        <Field label="Units / session">
+          {({ id }) => (
+            <TextField
+              id={id}
+              size="sm"
+              type="number"
+              min={1}
+              value={edit.costPerSession}
+              onChange={(e) => onChange('costPerSession', e.target.value)}
+              aria-label={`Cost units per session for ${policy.id}`}
+            />
+          )}
+        </Field>
+        <Field label="Warning %">
+          {({ id }) => (
+            <TextField
+              id={id}
+              size="sm"
+              type="number"
+              min={1}
+              max={100}
+              value={edit.warningPct}
+              onChange={(e) => onChange('warningPct', e.target.value)}
+              aria-label={`Warning percentage for ${policy.id}`}
+            />
+          )}
+        </Field>
+      </div>
+      <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+        <Switch
+          size="sm"
           checked={edit.enabled}
-          onChange={(e) => onChange('enabled', e.target.checked)}
+          onCheckedChange={(next) => onChange('enabled', next)}
           aria-label={`Enabled for ${policy.id}`}
-          className="h-4 w-4 rounded border-line-strong text-brand-600 focus:ring-brand-500"
         />
-        Enabled
-      </label>
-      <button
-        type="button"
-        onClick={onCancel}
-        className={buttonClassNames('secondary', 'col-span-2 px-2.5 py-1.5 text-xs')}
-      >
-        Cancel edit
-      </button>
+        <Button size="sm" onClick={onCancel}>
+          Cancel edit
+        </Button>
+      </div>
     </div>
   );
 }

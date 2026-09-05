@@ -16,13 +16,17 @@ export interface KpiCardProps {
   icon?: ReactNode;
   formatValue?: (value: number) => string;
   loading?: boolean;
+  /** Optional trailing visual (sparkline, meter). */
+  aside?: ReactNode;
+  className?: string;
 }
 
+/* Headline figures are ≥ 18px, so the spec tone colours are AA here. */
 const toneStyles: Record<KpiTone, string> = {
   default: 'text-ink',
-  success: 'text-success',
-  warning: 'text-warning',
-  danger: 'text-error',
+  success: 'text-success-text',
+  warning: 'text-warning-text',
+  danger: 'text-error-text',
 };
 
 function formatDelta(delta: number): string {
@@ -31,8 +35,8 @@ function formatDelta(delta: number): string {
 }
 
 /**
- * KPI card with a Motion count-up value (gated by prefers-reduced-motion).
- * Numeric values use tabular figures for stable alignment.
+ * KPI glass card with a Motion count-up value (gated by
+ * prefers-reduced-motion). Numeric values use tabular figures.
  */
 export function KpiCard({
   label,
@@ -44,6 +48,8 @@ export function KpiCard({
   icon,
   formatValue,
   loading = false,
+  aside,
+  className,
 }: KpiCardProps) {
   const reduced = useReducedMotion();
   const animated = useCountUp(loading ? 0 : value, { disabled: reduced });
@@ -52,46 +58,47 @@ export function KpiCard({
     : Math.round(animated).toLocaleString();
 
   return (
-    <div className="rounded-xl border border-line bg-surface p-5 shadow-card">
+    <div className={cx('glass flex h-full flex-col p-5', className)}>
       <div className="flex items-start justify-between gap-3">
-        <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">
-          {label}
-        </p>
+        <p className="text-[13px] font-medium text-ink-secondary">{label}</p>
         {icon && (
           <span
             aria-hidden="true"
-            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-info-soft text-info"
+            className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-info-soft text-info"
           >
             {icon}
           </span>
         )}
       </div>
-      <div className="mt-2">
-        {loading ? (
-          <Skeleton width={96} height={28} radius={6} />
-        ) : (
-          <p className={cx('text-2xl font-semibold tabular-nums tracking-tight', toneStyles[tone])}>
-            {shown}
-            {unit && (
-              <span className="ml-1 text-sm font-normal text-ink-tertiary">{unit}</span>
-            )}
-          </p>
-        )}
-        <div className="mt-1 flex flex-wrap items-center gap-2">
-          {delta != null && !loading && (
-            <span
-              className={cx(
-                'inline-flex items-center rounded-md px-1.5 py-0.5 text-xs font-medium tabular-nums',
-                delta > 0 && 'bg-success-soft text-success',
-                delta < 0 && 'bg-error-soft text-error',
-                delta === 0 && 'bg-surface-tertiary text-ink-tertiary',
+      <div className="mt-3 flex items-end justify-between gap-3">
+        <div className="min-w-0">
+          {loading ? (
+            <Skeleton width={96} height={32} radius={8} />
+          ) : (
+            <p className={cx('text-stat tabular-nums', toneStyles[tone])}>
+              {shown}
+              {unit && (
+                <span className="ml-1.5 text-sm font-normal tracking-normal text-ink-tertiary">{unit}</span>
               )}
-            >
-              {formatDelta(delta)}
-            </span>
+            </p>
           )}
-          {hint && <p className="text-xs text-ink-tertiary">{hint}</p>}
+          <div className="mt-1.5 flex flex-wrap items-center gap-2">
+            {delta != null && !loading && (
+              <span
+                className={cx(
+                  'inline-flex items-center rounded-full px-1.5 py-0.5 text-xs font-medium tabular-nums',
+                  delta > 0 && 'bg-success-soft text-success-text',
+                  delta < 0 && 'bg-error-soft text-error-text',
+                  delta === 0 && 'bg-ink/[0.05] text-ink-tertiary',
+                )}
+              >
+                {formatDelta(delta)}
+              </span>
+            )}
+            {hint && <p className="text-xs text-ink-tertiary">{hint}</p>}
+          </div>
         </div>
+        {aside && <div className="shrink-0">{aside}</div>}
       </div>
     </div>
   );

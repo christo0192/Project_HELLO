@@ -1,19 +1,26 @@
 /**
  * Explicit-confirmation mutation trigger for writable admin surfaces.
  *
- * Flow: idle trigger button → inline confirmation panel that summarises
- * the EXACT change → "Confirm" runs `onConfirm` (busy + disabled while
- * pending) → returns to idle. Nothing is applied optimistically: the
- * caller awaits `onConfirm` (which performs the real API call) and only
- * then renders success/error feedback from the actual response.
+ * Flow: idle trigger button → an inline `glass-sunken` well that rises in
+ * and summarises the EXACT change → "Confirm" runs `onConfirm` (busy +
+ * disabled while pending) → returns to idle. Nothing is applied
+ * optimistically: the caller awaits `onConfirm` (which performs the real
+ * API call) and only then renders success/error feedback from the actual
+ * response.
  */
 
+import { motion } from 'motion/react';
 import { useId, useState } from 'react';
 import type { ReactNode } from 'react';
-import { cx } from '../design/cx';
-import { buttonClassNames } from './buttonStyles';
-import { MissionSpinner } from './Button';
+import { usePanelVariants } from '../../lib/motion';
+import { Button, buttonClass } from '../design';
+import type { ButtonVariant } from '../design';
 import type { MissionButtonVariant } from './buttonStyles';
+
+/** Mission variants are a subset of the design-system button variants. */
+function toButtonVariant(variant: MissionButtonVariant): ButtonVariant {
+  return variant;
+}
 
 export interface ConfirmButtonProps {
   /** Label of the trigger button (idle state). */
@@ -43,6 +50,7 @@ export function ConfirmButton({
   const confirmId = `confirm-${rawId.replace(/:/g, '-')}`;
   const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
+  const panelVariants = usePanelVariants();
 
   async function run() {
     setBusy(true);
@@ -58,43 +66,40 @@ export function ConfirmButton({
 
   return (
     <div className={className}>
-      <button
-        type="button"
+      <Button
+        size="lg"
+        variant={toButtonVariant(variant)}
         onClick={() => setConfirming((open) => !open)}
         aria-expanded={confirming}
         aria-controls={confirming ? confirmId : undefined}
         disabled={disabled}
-        className={buttonClassNames(variant)}
       >
         {label}
-      </button>
+      </Button>
 
       {confirming && (
-        <div
+        <motion.div
           id={confirmId}
-          className="mt-3 rounded-lg border border-line bg-surface-secondary p-4"
+          variants={panelVariants}
+          initial="initial"
+          animate="enter"
+          className="glass-sunken mt-3 rounded-[14px] p-4"
         >
           <p className="text-sm text-ink">{summary}</p>
           <div className="mt-3 flex flex-wrap items-center gap-2">
-            <button
-              type="button"
+            <Button
+        size="lg"
+              variant={toButtonVariant(variant)}
+              loading={busy}
               onClick={() => void run()}
-              disabled={busy}
-              className={buttonClassNames(variant)}
             >
-              {busy && <MissionSpinner className="h-4 w-4" />}
               {busy ? 'Applying…' : confirmLabel}
-            </button>
-            <button
-              type="button"
-              onClick={() => setConfirming(false)}
-              disabled={busy}
-              className={buttonClassNames('secondary')}
-            >
+            </Button>
+            <Button size="lg" variant="secondary" onClick={() => setConfirming(false)} disabled={busy}>
               {cancelLabel}
-            </button>
+            </Button>
           </div>
-        </div>
+        </motion.div>
       )}
     </div>
   );
@@ -117,12 +122,7 @@ export function LinkAction({
       type="button"
       onClick={onClick}
       disabled={disabled}
-      className={cx(
-        'inline-flex items-center gap-1.5 rounded-lg border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink-secondary transition-colors',
-        'hover:bg-surface-tertiary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-info',
-        'disabled:cursor-not-allowed disabled:opacity-50',
-        className,
-      )}
+      className={buttonClass('secondary', 'sm', className)}
     >
       {children}
     </button>

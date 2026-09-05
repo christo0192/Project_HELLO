@@ -1,4 +1,6 @@
 import type { ReactNode } from 'react';
+import { GlassPanel } from './GlassPanel';
+import { SectionHeader } from './SectionHeader';
 import { cx } from './cx';
 
 export interface ChartCardProps {
@@ -9,32 +11,26 @@ export interface ChartCardProps {
   className?: string;
   /** Prevents layout jump while the body is loading/chartless. */
   minHeight?: number;
+  /** Small count or badge next to the title. */
+  meta?: ReactNode;
 }
 
-/** Card container for chart/KPI blocks with a consistent header row. */
+/** Glass panel for chart/KPI blocks with a consistent header row. */
 export function ChartCard({
   title,
   description,
   actions,
   children,
   className,
-  minHeight = 260,
+  minHeight = 240,
+  meta,
 }: ChartCardProps) {
   return (
-    <section
-      aria-label={title}
-      className={cx('rounded-xl border border-line bg-surface p-5 shadow-card', className)}
-    >
-      <header className="mb-4 flex flex-wrap items-start justify-between gap-2">
-        <div>
-          <h2 className="text-sm font-semibold text-ink">{title}</h2>
-          {description && (
-            <p className="mt-0.5 text-xs text-ink-tertiary">{description}</p>
-          )}
-        </div>
-        {actions && <div className="flex items-center gap-2">{actions}</div>}
-      </header>
-      <div style={{ minHeight }}>{children}</div>
-    </section>
+    <GlassPanel as="section" aria-label={title} className={cx('flex flex-col', className)}>
+      <SectionHeader title={title} description={description} actions={actions} meta={meta} className="mb-4" />
+      <div className="flex-1" style={{ minHeight }}>
+        {children}
+      </div>
+    </GlassPanel>
   );
 }

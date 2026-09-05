@@ -21,11 +21,30 @@ import type {
   MeResponse,
   MembershipRole,
 } from '../../types';
-import { StatusBadge } from '../design';
-import { Table, THead, TBody, Tr, Th, Td } from '../design';
-import { ErrorState, LoadingState } from '../ui';
-import { ConfirmButton, LinkAction } from './ConfirmButton';
-import { buttonClassNames } from './buttonStyles';
+import {
+  Button,
+  EmptyPanel,
+  ErrorPanel,
+  Field,
+  GlassPanel,
+  InlineNotice,
+  LoadingPanel,
+  Pagination,
+  SectionHeader,
+  SegmentedControl,
+  SelectField,
+  StatusBadge,
+  Switch,
+  Table,
+  TBody,
+  Td,
+  TextField,
+  Th,
+  THead,
+  Tr,
+  usePagination,
+} from '../design';
+import { ConfirmButton } from './ConfirmButton';
 import {
   allowlistEntryState,
   allowlistStateLabel,
@@ -102,11 +121,22 @@ export function AccessSection() {
     return result;
   }, [entries]);
 
+  const filtered = useMemo(
+    () =>
+      (entries ?? []).filter((entry) => {
+        if (filter === 'all') return true;
+        return allowlistEntryState(entry) === filter;
+      }),
+    [entries, filter],
+  );
+
+  const page = usePagination(filtered, 10);
+
   if (loadError && !entries) {
-    return <ErrorState message={loadError} onRetry={load} />;
+    return <ErrorPanel message={loadError} onRetry={load} />;
   }
   if (!entries || !me) {
-    return <LoadingState label="Loading access list…" />;
+    return <LoadingPanel label="Loading access list…" />;
   }
 
   const normalizedPreview = normalizeEmailPreview(email);
@@ -186,241 +216,217 @@ export function AccessSection() {
     }
   }
 
-  const filtered = entries.filter((entry) => {
-    if (filter === 'all') return true;
-    return allowlistEntryState(entry) === filter;
-  });
-
-
   return (
-    <div>
-      <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
-        <div>
-          <h2 className="text-sm font-semibold text-ink">Access entries</h2>
-          <p className="mt-0.5 text-xs text-ink-tertiary">
-            Pre-login company emails — pending entries become linked once the
-            person signs in. Server-side normalization is authoritative.
-          </p>
-        </div>
-        <LinkAction onClick={load}>Refresh</LinkAction>
-      </div>
+    <div className="space-y-5">
+      <SectionHeader
+        title="Access entries"
+        description="Pre-login company emails become linked once the person signs in — server-side normalization is authoritative."
+        actions={
+          <Button size="sm" onClick={load}>
+            Refresh
+          </Button>
+        }
+      />
 
       {message && (
-        <p
-          role="status"
-          className={`mb-4 rounded-lg border px-3 py-2 text-sm ${
-            message.tone === 'ok'
-              ? 'border-success/30 bg-success-soft text-success'
-              : 'border-error/30 bg-error-soft text-error'
-          }`}
-        >
+        <InlineNotice tone={message.tone === 'ok' ? 'success' : 'danger'} role="status">
           {message.text}
-        </p>
+        </InlineNotice>
       )}
 
       {/* Add entry */}
-      <div className="mb-6 rounded-xl border border-line bg-surface p-5 shadow-card">
-        <h3 className="text-sm font-semibold text-ink">Add an access entry</h3>
-        <p className="mt-0.5 text-xs text-ink-tertiary">
-          The person does not need an account yet — this grants pre-login
-          access to the workspace.
-        </p>
-        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-[1fr_10rem_auto] sm:items-start">
-          <div>
-            <label htmlFor="access-email" className="mb-1 block text-xs font-medium text-ink-secondary">
-              Company email
-            </label>
-            <input
-              id="access-email"
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              placeholder="name@interviewkickstart.com"
-              autoComplete="off"
-              className="w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink placeholder:text-ink-tertiary focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
-            />
-            {notCompany && (
-              <p className="mt-1.5 text-xs text-warning" role="note">
-                Only @interviewkickstart.com emails can be added.
-              </p>
+      <GlassPanel>
+        <SectionHeader
+          level={3}
+          title="Add an access entry"
+          description="The person does not need an account yet — this grants pre-login access to the workspace."
+        />
+        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_10rem_auto] sm:items-start">
+          <Field label="Company email" id="access-email">
+            {({ id }) => (
+              <>
+                <TextField
+                  id={id}
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="name@interviewkickstart.com"
+                  autoComplete="off"
+                />
+                {notCompany && (
+                  <p className="text-xs leading-5 text-warning-text" role="note">
+                    Only @interviewkickstart.com emails can be added.
+                  </p>
+                )}
+                {hasNormalization && !notCompany && (
+                  <p className="text-xs leading-5 text-ink-tertiary" role="note">
+                    Will be stored as {normalizedPreview}
+                  </p>
+                )}
+              </>
             )}
-            {hasNormalization && !notCompany && (
-              <p className="mt-1.5 text-xs text-ink-tertiary" role="note">
-                Will be stored as {normalizedPreview}
-              </p>
+          </Field>
+          <Field label="Role" id="access-role">
+            {({ id }) => (
+              <SelectField
+                id={id}
+                value={newRole}
+                onChange={(e) => setNewRole(e.target.value as MembershipRole)}
+              >
+                <option value="viewer">viewer</option>
+                <option value="interviewer">interviewer</option>
+                <option value="admin">admin</option>
+              </SelectField>
             )}
-          </div>
-          <div>
-            <label htmlFor="access-role" className="mb-1 block text-xs font-medium text-ink-secondary">
-              Role
-            </label>
-            <select
-              id="access-role"
-              value={newRole}
-              onChange={(e) => setNewRole(e.target.value as MembershipRole)}
-              className="w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500"
-            >
-              <option value="viewer">viewer</option>
-              <option value="interviewer">interviewer</option>
-              <option value="admin">admin</option>
-            </select>
-          </div>
-          <div className="sm:pt-6">
-            <ConfirmButton
-              label="Add entry"
-              confirmLabel="Add access entry"
-              disabled={email.trim().length === 0}
-              summary={
-                <span>
-                  Add <strong>{email.trim() || 'this email'}</strong> as a{' '}
-                  <strong>{newRole}</strong>? The person can sign in before
-                  creating an account.
-                </span>
-              }
-              onConfirm={addEntry}
-            />
-          </div>
+          </Field>
+          <ConfirmButton
+            className="sm:pt-[1.375rem]"
+            label="Add entry"
+            confirmLabel="Add access entry"
+            disabled={email.trim().length === 0}
+            summary={
+              <span>
+                Add <strong>{email.trim() || 'this email'}</strong> as a{' '}
+                <strong>{newRole}</strong>? The person can sign in before
+                creating an account.
+              </span>
+            }
+            onConfirm={addEntry}
+          />
         </div>
-      </div>
+      </GlassPanel>
 
-      {/* Filter */}
-      <div role="group" aria-label="Filter access entries" className="mb-3 flex flex-wrap gap-2">
-        {FILTERS.map((f) => (
-          <button
-            key={f.value}
-            type="button"
-            aria-pressed={filter === f.value}
-            onClick={() => setFilter(f.value)}
-            className={buttonClassNames(
-              filter === f.value ? 'primary' : 'secondary',
-              'px-3 py-1.5 text-xs',
-            )}
-          >
-            {f.label}
-            <span className="ml-1 tabular-nums opacity-70">{counts[f.value]}</span>
-          </button>
-        ))}
-      </div>
+      <SegmentedControl
+        ariaLabel="Filter access entries"
+        value={filter}
+        onChange={setFilter}
+        options={FILTERS.map((f) => ({
+          value: f.value,
+          label: f.label,
+          count: counts[f.value],
+        }))}
+      />
 
       {filtered.length === 0 ? (
-        <div className="rounded-xl border border-dashed border-line-strong bg-surface-secondary p-10 text-center">
-          <p className="text-sm font-medium text-ink-secondary">
-            No {filter === 'all' ? '' : `${filter} `}access entries
-          </p>
-          <p className="mt-1 text-xs text-ink-tertiary">
-            {entries.length === 0
+        <EmptyPanel
+          title={`No ${filter === 'all' ? '' : `${filter} `}access entries`}
+          hint={
+            entries.length === 0
               ? 'Add an email above to start the allowlist.'
-              : 'Try another filter.'}
-          </p>
-        </div>
+              : 'Try another filter.'
+          }
+        />
       ) : (
-        <Table caption="Access list — email, role, active, state and actions">
-          <THead>
-            <Tr>
-              <Th>Email</Th>
-              <Th>Role</Th>
-              <Th>Active</Th>
-              <Th>State</Th>
-              <Th>
-                <span className="sr-only">Actions</span>
-              </Th>
-            </Tr>
-          </THead>
-          <TBody>
-            {filtered.map((entry) => {
-              const draft = drafts[entry.id];
-              const state = allowlistEntryState(entry);
-              const selfEntry = isSelfEntry(entry.email, me.email);
-              const lastLinkedAdmin =
-                linkedAdmins === 1 &&
-                entry.active &&
-                entry.linked_user_id != null &&
-                entry.role === 'admin';
-              const locked = selfEntry || lastLinkedAdmin;
-              const dirty =
-                draft != null &&
-                (draft.role !== entry.role || draft.active !== entry.active);
-              const changes: string[] = [];
-              if (draft && draft.role !== entry.role) {
-                changes.push(`role ${entry.role} → ${draft.role}`);
-              }
-              if (draft && draft.active !== entry.active) {
-                changes.push(`active ${entry.active ? 'yes' : 'no'} → ${draft.active ? 'yes' : 'no'}`);
-              }
-              return (
-                <Tr key={entry.id}>
-                  <Td>
-                    <span className="font-medium text-ink">{entry.email}</span>
-                    {locked && (
-                      <p className="mt-0.5 max-w-xs text-xs text-warning">
-                        {selfEntry
-                          ? 'Your own entry — self-modification is protected.'
-                          : 'Last linked active admin — cannot be removed or demoted.'}
-                      </p>
-                    )}
-                  </Td>
-                  <Td>
-                    <select
-                      aria-label={`Role for ${entry.email}`}
-                      value={draft?.role ?? entry.role}
-                      disabled={locked}
-                      onChange={(e) =>
-                        setDraft(entry.id, {
-                          role: e.target.value as MembershipRole,
-                        })
-                      }
-                      className="rounded-lg border border-line bg-surface px-2 py-1 text-sm text-ink focus:border-brand-500 focus:outline-none focus:ring-1 focus:ring-brand-500 disabled:opacity-50"
-                    >
-                      <option value="viewer">viewer</option>
-                      <option value="interviewer">interviewer</option>
-                      <option value="admin">admin</option>
-                    </select>
-                  </Td>
-                  <Td>
-                    <input
-                      type="checkbox"
-                      aria-label={`Active for ${entry.email}`}
-                      checked={draft?.active ?? entry.active}
-                      disabled={locked}
-                      onChange={(e) =>
-                        setDraft(entry.id, { active: e.target.checked })
-                      }
-                      className="h-4 w-4 rounded border-line-strong text-brand-600 focus:ring-brand-500 disabled:opacity-50"
-                    />
-                  </Td>
-                  <Td>
-                    <StatusBadge tone={allowlistStateTone(state)}>
-                      {allowlistStateLabel(state)}
-                    </StatusBadge>
-                    {state === 'linked' && entry.linked_at && (
-                      <p className="mt-0.5 text-xs text-ink-tertiary">
-                        linked {new Date(entry.linked_at).toLocaleDateString()}
-                      </p>
-                    )}
-                  </Td>
-                  <Td>
-                    <ConfirmButton
-                      label="Save"
-                      confirmLabel="Confirm change"
-                      variant="secondary"
-                      disabled={locked || !dirty}
-                      summary={
-                        <span>
-                          Update <strong>{entry.email}</strong> —{' '}
-                          {changes.length > 0 ? changes.join(', ') : 'no change'}?
-                        </span>
-                      }
-                      onConfirm={() => updateEntry(entry)}
-                    />
-                  </Td>
-                </Tr>
-              );
-            })}
-          </TBody>
-        </Table>
+        <div>
+          <Table caption="Access list — email, role, active, state and actions">
+            <THead>
+              <Tr>
+                <Th>Email</Th>
+                <Th>Role</Th>
+                <Th>Active</Th>
+                <Th>State</Th>
+                <Th>
+                  <span className="sr-only">Actions</span>
+                </Th>
+              </Tr>
+            </THead>
+            <TBody>
+              {page.items.map((entry) => {
+                const draft = drafts[entry.id];
+                const state = allowlistEntryState(entry);
+                const selfEntry = isSelfEntry(entry.email, me.email);
+                const lastLinkedAdmin =
+                  linkedAdmins === 1 &&
+                  entry.active &&
+                  entry.linked_user_id != null &&
+                  entry.role === 'admin';
+                const locked = selfEntry || lastLinkedAdmin;
+                const dirty =
+                  draft != null &&
+                  (draft.role !== entry.role || draft.active !== entry.active);
+                const changes: string[] = [];
+                if (draft && draft.role !== entry.role) {
+                  changes.push(`role ${entry.role} → ${draft.role}`);
+                }
+                if (draft && draft.active !== entry.active) {
+                  changes.push(`active ${entry.active ? 'yes' : 'no'} → ${draft.active ? 'yes' : 'no'}`);
+                }
+                return (
+                  <Tr key={entry.id}>
+                    <Td>
+                      <span className="font-medium text-ink">{entry.email}</span>
+                      {locked && (
+                        <p className="mt-0.5 max-w-xs text-xs leading-5 text-warning-text">
+                          {selfEntry
+                            ? 'Your own entry — self-modification is protected.'
+                            : 'Last linked active admin — cannot be removed or demoted.'}
+                        </p>
+                      )}
+                    </Td>
+                    <Td>
+                      <SelectField
+                        size="sm"
+                        aria-label={`Role for ${entry.email}`}
+                        value={draft?.role ?? entry.role}
+                        disabled={locked}
+                        onChange={(e) =>
+                          setDraft(entry.id, {
+                            role: e.target.value as MembershipRole,
+                          })
+                        }
+                        className="w-36 min-w-[9rem]"
+                      >
+                        <option value="viewer">viewer</option>
+                        <option value="interviewer">interviewer</option>
+                        <option value="admin">admin</option>
+                      </SelectField>
+                    </Td>
+                    <Td>
+                      <Switch
+                        size="sm"
+                        aria-label={`Active for ${entry.email}`}
+                        checked={draft?.active ?? entry.active}
+                        disabled={locked}
+                        onCheckedChange={(next) =>
+                          setDraft(entry.id, { active: next })
+                        }
+                      />
+                    </Td>
+                    <Td>
+                      <StatusBadge tone={allowlistStateTone(state)}>
+                        {allowlistStateLabel(state)}
+                      </StatusBadge>
+                      {state === 'linked' && entry.linked_at && (
+                        <p className="mt-0.5 text-xs text-ink-tertiary">
+                          linked {new Date(entry.linked_at).toLocaleDateString()}
+                        </p>
+                      )}
+                    </Td>
+                    <Td>
+                      <ConfirmButton
+                        label="Save"
+                        confirmLabel="Confirm change"
+                        variant="secondary"
+                        disabled={locked || !dirty}
+                        summary={
+                          <span>
+                            Update <strong>{entry.email}</strong> —{' '}
+                            {changes.length > 0 ? changes.join(', ') : 'no change'}?
+                          </span>
+                        }
+                        onConfirm={() => updateEntry(entry)}
+                      />
+                    </Td>
+                  </Tr>
+                );
+              })}
+            </TBody>
+          </Table>
+          <Pagination state={page} noun="entries" />
+        </div>
       )}
 
-      <p className="mt-3 text-xs text-ink-tertiary">
+      <p className="text-[13px] leading-5 text-ink-tertiary">
         Self-modification and removal of the last linked active admin are
         rejected by the server (409) — this surface never attempts to bypass
         those guards.

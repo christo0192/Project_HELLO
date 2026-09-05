@@ -8,17 +8,34 @@ import { cx } from './cx';
 export interface TableProps extends HTMLAttributes<HTMLTableElement> {
   /** Screen-reader-only caption describing the table. */
   caption?: string;
+  /** Render without the glass container (already inside a panel). */
+  bare?: boolean;
+  /** Sticky header inside a bounded scroll container. */
+  maxHeight?: string;
 }
 
 /**
- * Semantic table primitive. Wraps the table in a horizontal-scroll region so
- * narrow viewports never clip content (WCAG 1.4.10 reflow friendly).
+ * Semantic table primitive inside a glass container. Wraps the table in a
+ * horizontal-scroll region so narrow viewports never clip content (WCAG
+ * 1.4.10 reflow friendly); pass `maxHeight` for a sticky-header scroll.
  */
-export function Table({ caption, className, children, ...rest }: TableProps) {
+export function Table({ caption, className, children, bare = false, maxHeight, ...rest }: TableProps) {
   return (
-    <div className="w-full overflow-x-auto rounded-xl border border-line bg-surface shadow-card">
+    <div
+      // A bounded table is a scroll region: give keyboard users a focus stop
+      // and assistive technology a name (axe: scrollable-region-focusable).
+      role={maxHeight ? 'region' : undefined}
+      aria-label={maxHeight ? caption : undefined}
+      tabIndex={maxHeight ? 0 : undefined}
+      className={cx(
+        'w-full overflow-x-auto',
+        bare ? '' : 'glass rounded-card',
+        maxHeight && 'overflow-y-auto focus:outline-none focus-visible:ring-2 focus-visible:ring-info',
+      )}
+      style={maxHeight ? { maxHeight } : undefined}
+    >
       <table
-        className={cx('w-full min-w-full border-collapse text-sm', className)}
+        className={cx('w-full min-w-full border-separate border-spacing-0 text-sm', className)}
         {...rest}
       >
         {caption ? <caption className="sr-only">{caption}</caption> : null}
@@ -34,7 +51,7 @@ export function THead({
   ...rest
 }: HTMLAttributes<HTMLTableSectionElement>) {
   return (
-    <thead className={cx('bg-surface-secondary text-left', className)} {...rest}>
+    <thead className={cx('sticky top-0 z-10 text-left', className)} {...rest}>
       {children}
     </thead>
   );
@@ -46,7 +63,7 @@ export function TBody({
   ...rest
 }: HTMLAttributes<HTMLTableSectionElement>) {
   return (
-    <tbody className={cx('divide-y divide-line', className)} {...rest}>
+    <tbody className={cx('[&>tr:last-child>td]:border-b-0', className)} {...rest}>
       {children}
     </tbody>
   );
@@ -58,7 +75,7 @@ export function TFoot({
   ...rest
 }: HTMLAttributes<HTMLTableSectionElement>) {
   return (
-    <tfoot className={cx('bg-surface-secondary', className)} {...rest}>
+    <tfoot className={cx('bg-white/40', className)} {...rest}>
       {children}
     </tfoot>
   );
@@ -71,7 +88,7 @@ export function Tr({
 }: HTMLAttributes<HTMLTableRowElement>) {
   return (
     <tr
-      className={cx('transition-colors hover:bg-surface-tertiary', className)}
+      className={cx('group/row transition-colors duration-150 hover:bg-white/60', className)}
       {...rest}
     >
       {children}
@@ -88,7 +105,7 @@ export function Th({
     <th
       scope={rest.scope ?? 'col'}
       className={cx(
-        'px-4 py-2.5 text-xs font-semibold uppercase tracking-wide text-ink-secondary',
+        'h-10 border-b border-glass-ring bg-white/70 px-4 text-left text-xs font-medium text-ink-tertiary backdrop-blur-sm first:rounded-tl-card last:rounded-tr-card',
         className,
       )}
       {...rest}
@@ -104,7 +121,7 @@ export function Td({
   ...rest
 }: TdHTMLAttributes<HTMLTableCellElement>) {
   return (
-    <td className={cx('px-4 py-2.5 align-middle text-ink', className)} {...rest}>
+    <td className={cx('h-11 border-b border-glass-ring px-4 align-middle text-ink', className)} {...rest}>
       {children}
     </td>
   );

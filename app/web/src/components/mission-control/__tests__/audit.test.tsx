@@ -102,28 +102,28 @@ describe('AuditSection', () => {
     renderAudit();
     await screen.findByText(/Showing the most recent 50 events/);
 
-    // Newest page: Newer disabled, Older enabled.
-    expect(screen.getByRole('button', { name: /Newer/ })).toBeDisabled();
-    expect(screen.getByRole('button', { name: /Older/ })).toBeEnabled();
+    // Newest page: previous disabled, next enabled.
+    expect(screen.getByRole('button', { name: /Previous page/ })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Next page/ })).toBeEnabled();
 
-    fireEvent.click(screen.getByRole('button', { name: /Older/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Next page/ }));
     await waitFor(() => {
       expect(apiFns.listAdminAudit).toHaveBeenLastCalledWith(50, 50);
     });
     expect(await screen.findByText(/starting at #51/)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: /Newer/ })).toBeEnabled();
+    expect(screen.getByRole('button', { name: /Previous page/ })).toBeEnabled();
 
-    fireEvent.click(screen.getByRole('button', { name: /Newer/ }));
+    fireEvent.click(screen.getByRole('button', { name: /Previous page/ }));
     await waitFor(() => {
       expect(apiFns.listAdminAudit).toHaveBeenLastCalledWith(50, 0);
     });
     expect(screen.queryByText(/starting at #51/)).not.toBeInTheDocument();
   });
 
-  it('disables Older when the page is not full (no more records)', async () => {
+  it('disables the next-page control when the page is not full (no more records)', async () => {
     renderAudit();
     await screen.findByText(/Showing the most recent 1 events/);
-    expect(screen.getByRole('button', { name: /Older/ })).toBeDisabled();
+    expect(screen.getByRole('button', { name: /Next page/ })).toBeDisabled();
   });
 
   it('shows a truthful empty state', async () => {

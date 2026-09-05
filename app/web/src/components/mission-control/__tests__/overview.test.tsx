@@ -84,23 +84,23 @@ describe('OverviewSection', () => {
     const sessionsCard = screen
       .getAllByText('Sessions')
       .find((el) => el.tagName === 'P')!
-      .closest('.shadow-card') as HTMLElement;
+      .closest('.glass') as HTMLElement;
     await waitFor(() => {
       expect(within(sessionsCard).getByText('3')).toBeInTheDocument();
     }, KPI_TIMEOUT);
 
     await waitFor(() => {
-      const activeCard = screen.getByText('Active sessions').closest('.shadow-card') as HTMLElement;
+      const activeCard = screen.getByText('Active sessions').closest('.glass') as HTMLElement;
       expect(within(activeCard).getByText('1')).toBeInTheDocument();
 
-      const linkedCard = screen.getByText('Linked access').closest('.shadow-card') as HTMLElement;
+      const linkedCard = screen.getByText('Linked access').closest('.glass') as HTMLElement;
       expect(within(linkedCard).getByText('1')).toBeInTheDocument();
 
-      const quotaCard = screen.getByText('Quota policies enabled').closest('.shadow-card') as HTMLElement;
+      const quotaCard = screen.getByText('Quota policies enabled').closest('.glass') as HTMLElement;
       expect(within(quotaCard).getByText('1')).toBeInTheDocument();
 
       // Audit: 2 events in the last 24h within the 50-row page (a3 is old).
-      const auditCard = screen.getByText('Audit events · 24h').closest('.shadow-card') as HTMLElement;
+      const auditCard = screen.getByText('Audit events · 24h').closest('.glass') as HTMLElement;
       expect(within(auditCard).getByText('2')).toBeInTheDocument();
       expect(within(auditCard).getByText('within the 50 most recent events')).toBeInTheDocument();
     }, KPI_TIMEOUT);
@@ -157,7 +157,7 @@ describe('OverviewSection', () => {
     expect(await screen.findByText(/Quota policy state — quotas down/)).toBeInTheDocument();
     // KPI values for failed sources are never claimed — zero-filled 0 is
     // scoped to the Sessions card (not a fabricated total).
-    const sessionsCard = screen.getByText('Sessions').closest('.shadow-card') as HTMLElement;
+    const sessionsCard = screen.getByText('Sessions').closest('.glass') as HTMLElement;
     expect(within(sessionsCard).getByText('0')).toBeInTheDocument();
   });
 
