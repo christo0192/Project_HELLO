@@ -230,6 +230,8 @@ class FakeEventClient:
         self._commits = commits or {}
         self._complete = complete
         self.assessment_calls: list[tuple] = []
+        # 0082: the metrics snapshot passed to the most recent complete call.
+        self.last_complete_metrics = None
         self.boundaries: list[dict] = []
         # 0071 / X4: every per-item transcript write, in order. Modeled with
         # the server's idempotency: a repeat source_item_id converges on the
@@ -367,9 +369,13 @@ class FakeEventClient:
         })
         return phone.PhoneApiOutcome(True, "applied", duplicate=False)
 
-    async def complete_assessment(self, attempt_id, session_id):
+    async def complete_assessment(self, attempt_id, session_id, metrics=None):
+        # 0082: the optional per-call observability snapshot rides here. Record
+        # it so a test can assert it was threaded through, but keep the default
+        # behavior identical when it is absent.
         self.timeline.append("assessment.complete")
         self.assessment_calls.append(("complete", attempt_id, session_id))
+        self.last_complete_metrics = metrics
         if self._complete is not None:
             return self._complete
         return phone.PhoneApiOutcome(True, phone.ASSESSMENT_SCORED_STATUS)
@@ -3995,13 +4001,16 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         self.assertTrue(phone.phone_generated_prefix_authorized(
             "That sounds useful.", "Ask for one concrete example.",
         ))
-        self.assertEqual(
-            phone.phone_fallback_reply(
-                phone.PhonePlanQuestion("k", "What is your notice period?", True, None),
-                "I worked toward my target for two years.",
-            ),
-            "Thanks for walking me through that. What is your notice period?",
+        # The non-sensitive fallback is now shaped for expressive TTS: a warm,
+        # melodic opener (rotated by cursor_index) replaces the flat constant,
+        # and the plan spoken_text remains the payload (substring invariant).
+        shaped = phone.phone_fallback_reply(
+            phone.PhonePlanQuestion("k", "What is your notice period?", True, None),
+            "I worked toward my target for two years.",
+            cursor_index=0,
         )
+        self.assertIn("What is your notice period?", shaped)
+        self.assertEqual(shaped, "Got it — thanks for that! What is your notice period?")
         with patch.dict(os.environ, {"PHONE_GENERATIVE_OBJECTIVE_GUARD": "off"}):
             self.assertFalse(phone.phone_generative_objective_guard_enabled())
 
@@ -4087,6 +4096,121 @@ class TestNativePhoneArchitecture(unittest.TestCase):
             ),
             "What did you learn?",
         )
+
+    def test_expressive_fallback_is_warm_varied_and_keeps_the_question(self):
+        # A non-sensitive fallback speaks via session.say (bypasses the LLM), so
+        # it must carry its own melodic punctuation or Sarvam renders it flat.
+        # The opener rotates deterministically by cursor_index and the plan
+        # spoken_text is always preserved as the payload.
+        q = "What draws you to this kind of role?"
+        seen = set()
+        for i in range(len(phone._PHONE_EXPRESSIVE_FALLBACK_OPENERS) + 1):
+            line = phone.phone_expressive_fallback(
+                "Thanks for walking me through that.", q,
+                cursor_index=i, sensitive=False,
+            )
+            # (c) substring invariant + question keeps its terminal '?'
+            self.assertIn(q, line)
+            self.assertTrue(line.rstrip().endswith("?"))
+            # melodic punctuation before the question (warm opener present)
+            envelope = line[: line.index(q)]
+            self.assertTrue(any(p in envelope for p in "!.,—"))
+            self.assertNotIn("Thanks for walking me through that.", line)
+            seen.add(envelope)
+        # rotation actually varies the opener across cursor positions
+        self.assertGreater(len(seen), 1)
+
+    def test_sensitive_fallback_stays_plain_with_no_warm_filler(self):
+        # (b) compensation / consent / disclosure / callback / resume-discrepancy
+        # objectives keep the plain acknowledgement — never the warm opener set.
+        for objective in (
+            "What is your current CTC?",
+            "What are your salary expectations?",
+            "Do I have your consent to record this call?",
+            "Can we schedule a callback for tomorrow?",
+            "I noticed a discrepancy on your resume, can you clarify?",
+        ):
+            self.assertTrue(phone.phone_fallback_is_sensitive(objective))
+            line = phone.phone_expressive_fallback(
+                "Thanks for that.", objective, cursor_index=0, sensitive=True,
+            )
+            self.assertEqual(line, f"Thanks for that. {objective}")
+            for opener in phone._PHONE_EXPRESSIVE_FALLBACK_OPENERS:
+                self.assertNotIn(opener, line)
+            self.assertIn(objective, line)
+
+    def test_widened_sensitive_vocabulary_from_v117_review(self):
+        # v117 review found real false negatives that would land warm filler on a
+        # compliance turn via the deterministic path. Each MUST be sensitive now.
+        for objective in (
+            "Can we call you back later this week?",   # idiomatic "call you back"
+            "Can I ring you back tomorrow?",            # ring you back
+            "What is your expected pay?",               # pay synonym
+            "What are your wage expectations?",         # wage
+            "What is your in-hand salary?",             # in-hand
+            "What's your take-home figure?",            # take-home
+            "What is your cost to company?",            # cost to company
+            "Total comp you're targeting?",             # comp
+            "Is it okay if I record this conversation?",# record
+            "Can I capture this conversation?",         # capture
+            "This call may be taped for review.",       # taped
+            "There's a mismatch on your CV dates.",     # mismatch
+            "I see an inconsistency in the timeline.",  # inconsistency
+        ):
+            self.assertTrue(
+                phone.phone_fallback_is_sensitive(objective),
+                msg=f"expected sensitive: {objective!r}",
+            )
+            line = phone.phone_expressive_fallback(
+                "Thanks for that.", objective, cursor_index=2, sensitive=True,
+            )
+            for opener in phone._PHONE_EXPRESSIVE_FALLBACK_OPENERS:
+                self.assertNotIn(opener, line)
+            self.assertIn(objective, line)
+        # And a genuinely neutral objective must still be shaped (not over-broad
+        # into flatness for ordinary questions).
+        self.assertFalse(
+            phone.phone_fallback_is_sensitive("What did you enjoy most in that role?")
+        )
+
+    def test_fallback_reply_routes_sensitive_objectives_through_plain_path(self):
+        # phone_fallback_reply derives sensitivity from the spoken_text and does
+        # NOT warm-shape a compensation objective, but DOES shape a neutral one.
+        comp = phone.PhonePlanQuestion("c", "What is your current CTC?", True, None)
+        comp_reply = phone.phone_fallback_reply(comp, "It is nine LPA.", cursor_index=1)
+        self.assertIn("What is your current CTC?", comp_reply)
+        for opener in phone._PHONE_EXPRESSIVE_FALLBACK_OPENERS:
+            self.assertNotIn(opener, comp_reply)
+        neutral = phone.PhonePlanQuestion("n", "What did you learn there?", True, None)
+        neutral_reply = phone.phone_fallback_reply(
+            neutral, "I learned a lot.", cursor_index=1,
+        )
+        self.assertIn("What did you learn there?", neutral_reply)
+        self.assertIn(phone._PHONE_EXPRESSIVE_FALLBACK_OPENERS[1], neutral_reply)
+
+    def test_expressive_fallback_first_fragment_is_not_choppy(self):
+        # (d) the shaped output must never produce a sub-14-char first TTS
+        # fragment (the v114 "Mm," choppy-synth regression).
+        q = "What draws you to this kind of role?"
+
+        async def _first_fragment(text):
+            async def _src():
+                yield text
+            frags = [
+                f async for f in phone._tts_early_flush_segments(_src(), 200)
+            ]
+            return frags[0]
+
+        for i in range(len(phone._PHONE_EXPRESSIVE_FALLBACK_OPENERS)):
+            line = phone.phone_expressive_fallback(
+                "", q, cursor_index=i, sensitive=False,
+            )
+            first = asyncio.run(_first_fragment(line))
+            alpha = sum(ch.isalpha() for ch in first)
+            self.assertGreaterEqual(
+                alpha, phone._TTS_FIRST_FRAGMENT_MIN_CHARS,
+                f"choppy first fragment {first!r} for opener index {i}",
+            )
 
     def test_prefix_release_is_reset_for_each_reply_generation(self):
         class BaseAgent:
@@ -6330,7 +6454,16 @@ class TestPhoneSpeechWatchdog(unittest.IsolatedAsyncioTestCase):
         with patch.object(agent_mod, "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 0.01):
             await agent._on_reply_expected()
             await asyncio.sleep(0.08)
-        self.assertEqual(session.spoken[len(before):], ["First question?"])
+        # The watchdog fallback now speaks the EXPRESSIVELY-SHAPED line (a warm
+        # melodic opener + the plan spoken_text), never the flat raw question —
+        # session.say bypasses the LLM, so the punctuation is what makes Sarvam
+        # deliver it with warmth. spoken_text remains the payload.
+        new_spoken = session.spoken[len(before):]
+        self.assertEqual(len(new_spoken), 1)
+        self.assertEqual(
+            new_spoken[0], "Got it — thanks for that! First question?",
+        )
+        self.assertIn("First question?", new_spoken[0])
         self.assertIs(session.say_calls[-1]["allow_interruptions"], True)
         categories = [
             c.kwargs.get("error_category")

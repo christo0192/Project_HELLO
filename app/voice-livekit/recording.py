@@ -670,7 +670,7 @@ class InWorkerRecorder:
 
         mp3_path = self._ogg_path.with_suffix(".mp3")
         body: Optional[bytes] = None
-        content_type = "audio/mpeg"
+        content_type = "audio/ogg"
         try:
             # ── NO-AUDIO GUARD (RCA 2026-09-04, STEP 4): the OGG is MISSING or
             # EMPTY. This is the ACTUAL live failure on every phone call — zero
@@ -686,55 +686,113 @@ class InWorkerRecorder:
                 self._finish_failure = "no_audio_captured"
                 raise RuntimeError("no_audio_captured")
 
-            # ── PRIMARY: OGG→MP3 transcode, then upload the MP3. ────────────
-            transcoded_ok = False
+            # ── OGG-FIRST DURABLE UPLOAD (RCA 2026-09-05, prod v117) ────────
+            # THE v117 GAP: finish() runs INLINE in the post-teardown shutdown
+            # path (after `_close_phone_room`), and its steps used to be, in
+            # order: transcode (seconds of PyAV CPU on a loaded shared-cpu box)
+            # → then the presigned PUT. LiveKit's entrypoint-exit grace cancels
+            # the coroutine DURING the transcode / before the PUT completes, so
+            # the ALREADY-CAPTURED 3.9MB OGG (`ogg_exists=True ogg_bytes=…`) was
+            # NEVER uploaded: the storage object was never PUT, the API finalizer
+            # deferred `object_unreadable`, and the session stayed
+            # `recording_egress_status=active` forever.
+            #
+            # FIX: make the bytes we ALREADY HAVE durable FIRST — PUT the raw OGG
+            # immediately, before the slow transcode can be cancelled. This is
+            # the durability guarantee. The MP3 transcode is then a BEST-EFFORT
+            # UPGRADE that re-PUTs the same key (upsert) — if it is cancelled or
+            # fails, the durable OGG already landed and the manifest reflects it.
+            ogg_body = self._ogg_path.read_bytes()
+            if not ogg_body:
+                # Existed at stat() but read empty — same class as no-audio.
+                self._finish_failure = "no_audio_captured"
+                raise RuntimeError("no_audio_captured")
+            try:
+                await self._upload_fn(upload_url, ogg_body, "audio/ogg")
+            except Exception:
+                # The durability PUT itself failed — nothing landed. This is a
+                # real total loss; name the leg so the caller latches truthfully
+                # (do NOT attempt the transcode/upgrade on an unreachable store).
+                self._finish_failure = "upload_failed"
+                raise
+            body = ogg_body
+            content_type = "audio/ogg"
+            logger.info(
+                "in_worker_recording_uploaded_ogg",
+                extra={
+                    "object_key": self._object_key,
+                    "size_bytes": len(ogg_body),
+                    "content_type": "audio/ogg",
+                },
+            )
+
+            # ── BEST-EFFORT MP3 UPGRADE ─────────────────────────────────────
+            # The OGG is now durable. Attempt OGG→MP3 and re-PUT the same key
+            # (upsert:true, so the overwrite is permitted — see _default_upload).
+            # ANY failure here — transcode desync, empty MP3, upgrade PUT error,
+            # or asyncio.CancelledError from the shutdown grace — leaves the
+            # durable OGG in place and the OGG manifest already assigned above.
+            # CancelledError is RE-RAISED after we confirm the OGG PUT happened,
+            # so the shutdown path is not swallowed (the durability guarantee is
+            # met before we honour the cancellation).
+            # NOTE: _default_transcode runs the PyAV work via asyncio.to_thread,
+            # which is NOT interruptible — a CancelledError abandons the await but
+            # the OS thread runs to completion detached. So a shutdown cancel
+            # realistically lands on the OGG PUT await above (the first slow
+            # network await), not here; either way the OGG is already durable.
             try:
                 await self._transcode_fn(self._ogg_path, mp3_path)
                 mp3_body = mp3_path.read_bytes()
                 if not mp3_body:
                     raise RuntimeError("empty_mp3")
+                await self._upload_fn(upload_url, mp3_body, "audio/mpeg")
                 body = mp3_body
                 content_type = "audio/mpeg"
-                transcoded_ok = True
-            except Exception:  # noqa: BLE001 — DO NOT re-raise: try the fallback
-                # ── FALLBACK (live v114, 2026-09-04): NEVER lose the audio. ──
-                # The v114 call died here with `transcode_failed` on a
-                # sample/channel desync, and finish()'s `finally: _cleanup()`
-                # then DELETED the raw OGG — total loss of a recoverable call.
-                # So a failed MP3 transcode no longer discards everything: if a
-                # non-empty raw OGG exists, upload IT instead so a reviewable
-                # artifact survives. The server sniffs the object's container
-                # bytes and records `audio/ogg`, a status a human/QA can tell
-                # apart from a clean MP3 finalize.
+                logger.info(
+                    "in_worker_recording_uploaded",
+                    extra={
+                        "object_key": self._object_key,
+                        "size_bytes": len(mp3_body),
+                        "content_type": "audio/mpeg",
+                    },
+                )
+            except asyncio.CancelledError:
+                # The shutdown grace cancelled the upgrade. The OGG is already
+                # durable; honour the cancellation but keep the OGG manifest.
                 logger.warning(
-                    "in_worker_recording_transcode_failed_trying_ogg_fallback",
+                    "in_worker_recording_mp3_upgrade_cancelled_ogg_durable",
+                    extra={"object_key": self._object_key},
+                )
+                raise
+            except Exception:  # noqa: BLE001 — upgrade is best-effort only
+                # A failed MP3 upgrade is NOT a loss: the raw OGG already landed
+                # and remains the reviewable artifact (the server sniffs the
+                # object's container bytes and records `audio/ogg`, a status a
+                # human/QA can tell apart from a clean MP3 finalize).
+                logger.warning(
+                    "in_worker_recording_mp3_upgrade_failed_keeping_ogg",
                     extra={"object_key": self._object_key},
                     exc_info=True,
                 )
-                try:
-                    ogg_body = self._ogg_path.read_bytes()
-                except Exception:  # noqa: BLE001 — the OGG itself is unreadable
-                    ogg_body = b""
-                if not ogg_body:
-                    # No MP3, no OGG — genuinely nothing to keep.
-                    self._finish_failure = "transcode_failed"
-                    raise
-                body = ogg_body
-                content_type = "audio/ogg"
-
-            # ── UPLOAD (MP3 or the OGG fallback) to the presigned PUT. ──────
-            assert body is not None
-            try:
-                await self._upload_fn(upload_url, body, content_type)
-            except Exception:
-                # An upload failure is a real loss regardless of which body we
-                # sent. Name the leg so the caller latches truthfully — a
-                # fallback whose upload also failed is still a total loss, not a
-                # silent success.
-                self._finish_failure = (
-                    "upload_failed" if transcoded_ok else "transcode_failed"
-                )
+        except asyncio.CancelledError:
+            # Cancellation propagated from the upgrade block AFTER the durable
+            # OGG PUT succeeded (body/content_type are the OGG). Build the OGG
+            # manifest and return it rather than reporting a loss — the audio is
+            # safely stored. (A cancellation BEFORE the OGG PUT leaves body=None
+            # and falls through to the fail-open None return below via the outer
+            # structure — but that PUT is the first slow await, so in practice
+            # the OGG is durable well before any transcode-window cancel.)
+            self._cleanup()
+            if body is None:
                 raise
+            sha256 = hashlib.sha256(body).hexdigest()
+            duration_ms = self._probe_duration_ms()
+            return RecordingManifest(
+                sha256=sha256,
+                size_bytes=len(body),
+                duration_ms=duration_ms,
+                content_type=content_type,
+            )
         except Exception:  # noqa: BLE001 — fail-open, the call is already over
             logger.warning(
                 "in_worker_recording_finish_failed %s",
@@ -742,20 +800,25 @@ class InWorkerRecorder:
                 extra={"object_key": self._object_key},
                 exc_info=True,
             )
-            return None
-        finally:
             self._cleanup()
+            return None
+        except BaseException:
+            # A non-Exception, non-CancelledError BaseException (GeneratorExit,
+            # SystemExit, KeyboardInterrupt) can be raised during the awaits above
+            # — most plausibly the OGG PUT (line ~711), the first slow network
+            # await where a shutdown lands. The pre-reorder code used
+            # `finally: _cleanup()` and was immune to this; moving cleanup into
+            # explicit per-branch paths reintroduced a temp-file leak on this
+            # branch. Restore the guarantee so a long-lived worker never
+            # accumulates orphaned temp OGG/MP3 files across calls. _cleanup() is
+            # idempotent, so this is safe alongside the other cleanup callsites.
+            self._cleanup()
+            raise
 
+        self._cleanup()
+        assert body is not None
         sha256 = hashlib.sha256(body).hexdigest()
         duration_ms = self._probe_duration_ms()
-        logger.info(
-            "in_worker_recording_uploaded",
-            extra={
-                "object_key": self._object_key,
-                "size_bytes": len(body),
-                "content_type": content_type,
-            },
-        )
         return RecordingManifest(
             sha256=sha256,
             size_bytes=len(body),

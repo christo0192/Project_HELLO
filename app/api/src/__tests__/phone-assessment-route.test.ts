@@ -49,6 +49,29 @@ vi.mock('../services/assessment.js', () => ({
   runAssessment: vi.fn(async () => ({ id: 'assessment-1' })),
 }));
 
+// 0082: the per-call observability write targets the service-role supabase
+// singleton directly (an additive, best-effort `call_sessions.observability`
+// update). Mock it at the module boundary so the write is OBSERVABLE and never
+// touches the network. `observabilityUpdate` records the payload; the chain
+// resolves `{ error: null }` (success) by default, and `eq` returns the awaited
+// result so `await supabase.from(...).update(...).eq(...)` resolves.
+const observabilityUpdate = vi.fn();
+type ObservabilityResult = { error: { code?: string } | null };
+const observabilityEq = vi.fn(
+  async (): Promise<ObservabilityResult> => ({ error: null }),
+);
+vi.mock('../lib/supabase.js', () => ({
+  supabase: {
+    from: vi.fn(() => ({
+      update: (payload: unknown) => {
+        observabilityUpdate(payload);
+        return { eq: observabilityEq };
+      },
+    })),
+  },
+  RESUME_BUCKET: 'resumes_v2',
+}));
+
 const ATTEMPT = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
 const SESSION = '99999999-8888-4777-8666-555555555555';
 const SECRET = 'phone-worker-secret-0123456789abcdefghij';
@@ -60,6 +83,9 @@ let savedSecret: string | undefined;
 beforeEach(() => {
   savedSecret = process.env.WORKER_CONTEXT_SECRET;
   process.env.WORKER_CONTEXT_SECRET = SECRET;
+  observabilityUpdate.mockClear();
+  observabilityEq.mockClear();
+  observabilityEq.mockResolvedValue({ error: null });
 });
 afterEach(() => {
   if (savedSecret === undefined) delete process.env.WORKER_CONTEXT_SECRET;
@@ -777,6 +803,84 @@ describe('POST /assessment/complete — the ordering this phase exists for', () 
     const res = await post(h, '/assessment/complete', START_BODY);
     expect(res.body).toEqual({ ok: false, status: 'plan_missing' });
     expect(h.order).toEqual(['state']);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+describe('POST /assessment/complete — 0082 per-call observability (additive)', () => {
+  const METRICS = {
+    watchdog_fired_count: 2,
+    deterministic_fallback_count: 1,
+    headline_latency_ms: { median: 512.5, p95: 900.1, max: 1200.0, count: 7 },
+    provider_first_signal_ms: { llm: 410.0, tts: 250.0, stt: null },
+  };
+
+  function completeStates() {
+    return [
+      state({ planComplete: true, cursor: 2, completedKeys: ['k1', 'k2'] }),
+      state({ planComplete: true, cursor: 2, assessmentExists: true }),
+    ];
+  }
+
+  it('accepts an extended body with `metrics` (not 400) and issues the write', async () => {
+    const h = build({ states: completeStates() });
+    const res = await post(h, '/assessment/complete', { ...START_BODY, metrics: METRICS });
+    // The extended body is NOT rejected by the .strict() schema.
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, status: 'scored', adopted: false });
+    // The full snapshot is written verbatim to call_sessions.observability.
+    expect(observabilityUpdate).toHaveBeenCalledOnce();
+    expect(observabilityUpdate).toHaveBeenCalledWith({ observability: METRICS });
+    expect(observabilityEq).toHaveBeenCalledWith('id', SESSION);
+  });
+
+  it('back-compat: a body WITHOUT metrics still completes and issues NO write', async () => {
+    const h = build({ states: completeStates() });
+    const res = await post(h, '/assessment/complete', START_BODY);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, status: 'scored', adopted: false });
+    // No metrics key → the observability write is never attempted.
+    expect(observabilityUpdate).not.toHaveBeenCalled();
+  });
+
+  it('writes observability for a QUEUED completion too (before the queue return)', async () => {
+    // queueAssessment default is off in these unit builds, so a queued path is
+    // not exercised here; this asserts the write precedes the sync scoring path
+    // and is not gated on scoreSession. The write ran before `score`.
+    const h = build({ states: completeStates() });
+    await post(h, '/assessment/complete', { ...START_BODY, metrics: METRICS });
+    expect(observabilityUpdate).toHaveBeenCalledOnce();
+    // Scoring still ran — observability did not short-circuit the terminal path.
+    expect(h.scoreSession).toHaveBeenCalledOnce();
+  });
+
+  it('a WRITE FAILURE is swallowed — the terminal completion still succeeds', async () => {
+    observabilityEq.mockResolvedValueOnce({ error: { code: '42P01' } });
+    const h = build({ states: completeStates() });
+    const res = await post(h, '/assessment/complete', { ...START_BODY, metrics: METRICS });
+    // Best-effort: the completion is already over, so a write error must not
+    // change the terminal response.
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, status: 'scored', adopted: false });
+  });
+
+  it('a write THROW is swallowed — the terminal completion still succeeds', async () => {
+    observabilityEq.mockRejectedValueOnce(new Error('driver detail: session 42'));
+    const h = build({ states: completeStates() });
+    const res = await post(h, '/assessment/complete', { ...START_BODY, metrics: METRICS });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, status: 'scored', adopted: false });
+  });
+
+  it('an already-scored adoption does NOT write observability (no completion owed)', async () => {
+    const h = build({
+      states: [state({ planComplete: true, cursor: 2, assessmentExists: true, alreadyScored: true })],
+    });
+    const res = await post(h, '/assessment/complete', { ...START_BODY, metrics: METRICS });
+    expect(res.body).toEqual({ ok: true, status: 'scored', adopted: true });
+    // The handler short-circuits above the completion branch, so the write is
+    // never reached — observability rides the terminal-completion path only.
+    expect(observabilityUpdate).not.toHaveBeenCalled();
   });
 });
 

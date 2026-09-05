@@ -401,6 +401,33 @@ class TestAssessmentClient(unittest.IsolatedAsyncioTestCase):
                 outcome = await client.complete_assessment(_ATTEMPT_ID, _SESSION_ID)
                 self.assertEqual(outcome.ok, expected)
 
+    async def test_complete_omits_metrics_from_the_body_when_absent(self):
+        # 0082 back-compat: with no metrics the body is byte-identical to before
+        # — attempt_id + session_id only, no `metrics` key.
+        client = self._client({"ok": True, "status": "scored"})
+        await client.complete_assessment(_ATTEMPT_ID, _SESSION_ID)
+        self.assertEqual(self.posted[0][0], phone.ASSESSMENT_COMPLETE_PATH)
+        self.assertEqual(
+            self.posted[0][1], {"attempt_id": _ATTEMPT_ID, "session_id": _SESSION_ID}
+        )
+        self.assertNotIn("metrics", self.posted[0][1])
+
+    async def test_complete_includes_the_metrics_snapshot_when_provided(self):
+        # 0082: the full snapshot rides the completion body verbatim so the API
+        # can persist it last-write-wins.
+        snapshot = {
+            "watchdog_fired_count": 2,
+            "deterministic_fallback_count": 1,
+            "headline_latency_ms": {"median": 300.0, "p95": 500.0, "max": 500.0, "count": 5},
+            "provider_first_signal_ms": {"llm": 410.0, "tts": 250.0, "stt": None},
+        }
+        client = self._client({"ok": True, "status": "scored"})
+        await client.complete_assessment(_ATTEMPT_ID, _SESSION_ID, metrics=snapshot)
+        self.assertEqual(
+            self.posted[0][1],
+            {"attempt_id": _ATTEMPT_ID, "session_id": _SESSION_ID, "metrics": snapshot},
+        )
+
 
 # ── The default plan, and the SQL it must agree with ──────────────────
 

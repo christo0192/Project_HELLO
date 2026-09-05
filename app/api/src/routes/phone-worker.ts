@@ -288,10 +288,47 @@ const assessmentTurnSchema = z
   })
   .strict();
 
+/**
+ * Per-call phone observability snapshot (0082). Written verbatim to
+ * `call_sessions.observability` (jsonb, last-write-wins). Content-free: counts
+ * and millisecond durations only — no transcript / room / candidate / request
+ * IDs. Fully optional and permissive-partial so an older worker (no metrics) and
+ * a newer worker (extra fields tolerated) both post successfully; a future field
+ * never 400s the terminal completion. Bounded to keep the jsonb small.
+ */
+const observabilityLatencyBucketSchema = z
+  .object({
+    median: z.number().finite().optional(),
+    p95: z.number().finite().optional(),
+    max: z.number().finite().optional(),
+    count: z.number().int().nonnegative().optional(),
+  })
+  .partial()
+  .passthrough();
+
+const phoneObservabilitySchema = z
+  .object({
+    watchdog_fired_count: z.number().int().nonnegative().optional(),
+    deterministic_fallback_count: z.number().int().nonnegative().optional(),
+    headline_latency_ms: observabilityLatencyBucketSchema.optional(),
+    provider_first_signal_ms: z
+      .object({
+        llm: z.number().finite().nullable().optional(),
+        tts: z.number().finite().nullable().optional(),
+        stt: z.number().finite().nullable().optional(),
+      })
+      .partial()
+      .passthrough()
+      .optional(),
+  })
+  .partial()
+  .passthrough();
+
 const assessmentCompleteSchema = z
   .object({
     attempt_id: z.string().regex(UUID_RE),
     session_id: z.string().regex(UUID_RE),
+    metrics: phoneObservabilitySchema.optional(),
   })
   .strict();
 
@@ -1588,6 +1625,41 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         // `failed`, `cancelled`, `expired`: the session is terminal for some
         // other reason and no completion is owed.
         return res.json({ ok: false, status: 'session_not_active' });
+      }
+
+      // ── 0082 PER-CALL OBSERVABILITY (additive, best-effort) ─────────
+      // The completion is verified terminal-or-completing at this point (the
+      // session was just completed, or it was already `completed` on a reconnect
+      // leg). If the worker sent a metrics snapshot, persist it verbatim to
+      // `call_sessions.observability` (jsonb) keyed by the session id. It is a
+      // FULL snapshot (idempotent replace, never a merge/increment). NOTE: this
+      // block sits BELOW the already-scored short-circuit, so ONLY the leg that
+      // actually completes the session writes; retries and post-scoring reconnect
+      // legs adopt and skip the write (they never reach here). That is correct —
+      // no double-count — the only cost is that a reconnect on a fresh worker
+      // process with richer metrics, arriving after another leg scored, is
+      // dropped (acceptable for a health counter). It runs BEFORE both the queued
+      // and synchronous scoring paths so a queued completion still records
+      // observability. Best-effort: a write failure must NOT fail the terminal
+      // completion (the call is already over), so it is logged-and-swallowed.
+      if (parsed.data.metrics !== undefined) {
+        try {
+          const { error: observabilityError } = await supabase
+            .from('call_sessions')
+            .update({ observability: parsed.data.metrics })
+            .eq('id', sessionId);
+          if (observabilityError) {
+            phoneWorkerLog.warn('unknown_event', {
+              schema: 'phone_observability',
+              error_category: 'observability_write_failed',
+            });
+          }
+        } catch {
+          phoneWorkerLog.warn('unknown_event', {
+            schema: 'phone_observability',
+            error_category: 'observability_write_error',
+          });
+        }
       }
 
       if (queueAssessment) {
