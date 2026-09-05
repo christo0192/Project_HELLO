@@ -59,6 +59,13 @@ primary_region = "sin"
   SARVAM_TTS_MODEL = "bulbul:v3"
   SARVAM_TTS_VOICE = "simran"
   PHONE_TURN_DETECTION = "local"
+  # v115 latency RCA: pin the phone-local endpointing bounds explicitly in the
+  # deploy manifest (the code defaults match these). MIN is the ~0.8s median-
+  # latency floor beyond LLM+TTS; MAX bounds the wait on a mid-answer pause.
+  # Clamps: MIN in [0.3, 0.5], MAX in [0.5, 2.0]. Raise MAX (e.g. "1.25") to
+  # restore a longer slow-speaker tail without a code change.
+  PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC = "0.4"
+  PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC = "0.8"
   # Controller selects the objective; Gemini authors one natural bridge and
   # paraphrased question in a single phone-only generation.
   PHONE_TURN_MODE = "toolless"

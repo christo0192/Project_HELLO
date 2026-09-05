@@ -332,5 +332,67 @@ class TestQueuedScoringHold(unittest.TestCase):
         self.assertLess(phone.PHONE_CLOSE_TAIL_GRACE_SEC, 5)
 
 
+class TestAnswerDispositionFromTheLiveCall(unittest.TestCase):
+    """ANSWER-GATE (owner directive, 2026-09-05). The same live-call shapes that
+    the substance gate scored SUBSTANTIVE (so they advanced the cursor) must now
+    be caught as non-answers by the per-question disposition — while a genuine
+    answer or an explicit decline still advances.
+    """
+
+    CTC_Q = "What is your current CTC and what are your expectations?"
+
+    def test_the_live_ctc_conditional_counter_is_a_nonanswer(self):
+        # The CTC-skip shape: a conditional counter-question that supplied no
+        # number. It was substantive under the old gate and advanced past the
+        # owed compensation question.
+        self.assertEqual(
+            phone.phone_answer_disposition(
+                self.CTC_Q, "compensation",
+                "If I share my CTC, will you tell me the range for this role?",
+            ),
+            phone.PHONE_ANSWER_NONANSWER,
+        )
+
+    def test_the_live_conflict_deflection_is_a_nonanswer(self):
+        self.assertEqual(
+            phone.phone_answer_disposition(
+                "Tell me about your recent experience.", "open",
+                LIVE_CONFLICT_DEFLECTION,
+            ),
+            phone.PHONE_ANSWER_NONANSWER,
+        )
+
+    def test_a_ctc_decline_advances_not_loops(self):
+        self.assertEqual(
+            phone.phone_answer_disposition(
+                self.CTC_Q, "compensation", "I'd rather not share my CTC.",
+            ),
+            phone.PHONE_ANSWER_DECLINED,
+        )
+
+    def test_a_real_ctc_answer_advances(self):
+        # Both slots supplied in the labelled forms the existing extractor
+        # recognises (current … is N; expect around N) → answered.
+        self.assertEqual(
+            phone.phone_answer_disposition(
+                self.CTC_Q, "compensation",
+                "My current CTC is 14 LPA and I expect around 20 LPA.",
+            ),
+            phone.PHONE_ANSWER_ANSWERED,
+        )
+
+    def test_a_genuine_open_narrative_advances(self):
+        # The long substantive answers the round-1 table protects must count as
+        # answered for an OPEN objective — the gate must not demand completeness.
+        self.assertEqual(
+            phone.phone_answer_disposition(
+                "Tell me about your sales experience.", "open",
+                "I've closed admissions for two years — direct B2C counseling "
+                "and closing roles — and exceeded quota every quarter.",
+            ),
+            phone.PHONE_ANSWER_ANSWERED,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

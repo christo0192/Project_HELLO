@@ -788,5 +788,42 @@ class TestPhoneInstructionStateProjection(unittest.TestCase):
         self.assertEqual(state.resume_facts, {})
 
 
+class TestSingleFinalNameMismatchWireUp(unittest.TestCase):
+    """FIX 4 (adversarial-review repair). `phone_name_mismatch` must be wired at
+    the single-STT-final conflict site too, not only the coalesce branch, so a
+    genuine "my name is X" intro arriving as ONE final is still caught.
+    """
+
+    def test_single_final_composition_detects_name_conflict(self):
+        # The exact idiom the single-final path runs: a deterministic role/
+        # employer conflict comes back None (no role contradiction in this turn),
+        # and the name-mismatch fallback supplies the identity conflict.
+        phone = agent_mod.phone
+        resume_facts = {"name": "Rijo"}
+        text = "Hi there, my name is Christo, thanks for calling."
+        deterministic = phone.phone_deterministic_resume_conflict(text, resume_facts)
+        self.assertIsNone(deterministic)  # no role/employer contradiction here
+        conflict = deterministic or phone.phone_name_mismatch(
+            text,
+            resume_facts.get("name") if isinstance(resume_facts, dict) else None,
+        )
+        self.assertIsInstance(conflict, dict)
+        self.assertIn("rijo", conflict["resume_fact"])
+        self.assertIn("christo", conflict["spoken_claim"])
+
+    def test_both_conflict_sites_wire_the_name_mismatch(self):
+        # Static guard: the name-mismatch fallback must appear at BOTH conflict
+        # detection sites in agent.py (coalesce branch AND single-STT-final).
+        # A wire-up dropped from one site would silently regress FIX 4.
+        import inspect
+        source = inspect.getsource(agent_mod)
+        occurrences = source.count("phone.phone_name_mismatch(")
+        self.assertGreaterEqual(
+            occurrences, 2,
+            "phone_name_mismatch must be wired at both conflict sites "
+            f"(found {occurrences})",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

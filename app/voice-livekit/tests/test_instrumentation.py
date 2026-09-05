@@ -903,6 +903,8 @@ class TestPhoneCallMetricsSummary(unittest.TestCase):
         self.assertEqual(
             m["provider_first_signal_ms"], {"llm": [], "tts": [], "stt": []}
         )
+        # v115: bounded per-turn latency segment list starts empty.
+        self.assertEqual(m["turn_segments"], [])
 
     def test_p95_is_nearest_rank_on_a_sorted_list(self) -> None:
         # ceil(0.95 * 20) - 1 = 18 (0-based) -> the 19th value.
@@ -948,6 +950,85 @@ class TestPhoneCallMetricsSummary(unittest.TestCase):
         # Only the one finite sample survives.
         self.assertEqual(snap["headline_latency_ms"]["count"], 1)
         self.assertEqual(snap["headline_latency_ms"]["median"], 200.0)
+
+    # ── v115: per-turn latency segments ──────────────────────────────────
+    def test_emit_segment_appends_ms_to_turn_segments(self) -> None:
+        m = agent_mod._new_phone_call_metrics()
+        # 0.4s duration -> 400.0 ms, tagged with its schema.
+        agent_mod._emit_phone_latency_segment("local_vad_end_to_first_audio", 0.4, m)
+        self.assertEqual(
+            m["turn_segments"],
+            [{"schema": "local_vad_end_to_first_audio", "ms": 400.0}],
+        )
+
+    def test_emit_segment_without_accumulator_is_a_noop_on_state(self) -> None:
+        # Back-compat: the old 2-arg call must still work and not raise.
+        agent_mod._emit_phone_latency_segment("speech_end_to_first_audio", 0.25)
+
+    def test_emit_segment_rejects_out_of_range_without_appending(self) -> None:
+        m = agent_mod._new_phone_call_metrics()
+        agent_mod._emit_phone_latency_segment("x", float("nan"), m)
+        agent_mod._emit_phone_latency_segment("x", -1.0, m)
+        agent_mod._emit_phone_latency_segment("x", 999.0, m)
+        self.assertEqual(m["turn_segments"], [])
+
+    def test_turn_segments_list_is_hard_capped_dropping_oldest(self) -> None:
+        m = agent_mod._new_phone_call_metrics()
+        cap = agent_mod._PHONE_TURN_SEGMENTS_CAP
+        for i in range(cap + 5):
+            # duration in seconds; encode the index in ms so we can see which
+            # entries were dropped (oldest 5 should be gone).
+            agent_mod._emit_phone_latency_segment("seg", i / 1000.0, m)
+        self.assertEqual(len(m["turn_segments"]), cap)
+        # The five oldest (ms 0..4) were dropped; the list now starts at ms 5.
+        self.assertEqual(m["turn_segments"][0]["ms"], 5.0)
+        self.assertEqual(m["turn_segments"][-1]["ms"], float(cap + 4))
+
+    def test_summary_reduces_turn_segments_per_schema(self) -> None:
+        m = agent_mod._new_phone_call_metrics()
+        for ms in (100.0, 200.0, 300.0, 400.0, 500.0):
+            m["turn_segments"].append({"schema": "headline", "ms": ms})
+        m["turn_segments"].append({"schema": "solo", "ms": 42.0})
+        snap = agent_mod._summarize_phone_call_metrics(m)
+        self.assertEqual(
+            snap["turn_segments_ms"]["headline"],
+            {"median": 300.0, "p95": 500.0, "max": 500.0, "count": 5},
+        )
+        self.assertEqual(
+            snap["turn_segments_ms"]["solo"],
+            {"median": 42.0, "p95": 42.0, "max": 42.0, "count": 1},
+        )
+
+    def test_summary_omits_turn_segments_when_none_recorded(self) -> None:
+        m = agent_mod._new_phone_call_metrics()
+        snap = agent_mod._summarize_phone_call_metrics(m)
+        self.assertNotIn("turn_segments_ms", snap)
+
+    def test_summary_turn_segments_drops_malformed_and_non_finite(self) -> None:
+        m = agent_mod._new_phone_call_metrics()
+        m["turn_segments"] = [
+            {"schema": "a", "ms": float("nan")},
+            {"schema": "a", "ms": 200.0},
+            {"schema": None, "ms": 5.0},      # bad schema
+            {"ms": 5.0},                        # missing schema
+            "not-a-dict",                       # bad entry
+            {"schema": "a", "ms": "x"},        # non-numeric ms
+        ]
+        snap = agent_mod._summarize_phone_call_metrics(m)
+        # Only the single finite "a" sample survives.
+        self.assertEqual(
+            snap["turn_segments_ms"]["a"],
+            {"median": 200.0, "p95": 200.0, "max": 200.0, "count": 1},
+        )
+
+    def test_stt_bucket_populated_from_final_transcript_delta(self) -> None:
+        # The STT-null fix path: the summary must report a real stt median once a
+        # sample has been fed into the provider_first_signal_ms["stt"] bucket
+        # (mirrors the live append of the local-VAD-end -> STT-final delta in ms).
+        m = agent_mod._new_phone_call_metrics()
+        m["provider_first_signal_ms"]["stt"] = [180.0, 220.0]
+        snap = agent_mod._summarize_phone_call_metrics(m)
+        self.assertEqual(snap["provider_first_signal_ms"]["stt"], 200.0)
 
 
 if __name__ == "__main__":
