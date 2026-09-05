@@ -33,6 +33,27 @@ class TestOpeningAndIdentityDisclosure(unittest.TestCase):
         self.assertIn("answer truthfully", prompt)
         self.assertIn("Never claim to be human", prompt)
 
+    def test_system_prompt_confirms_name_instead_of_asserting_record_name(self):
+        prompt = system_prompt(candidate_name="Rijo")
+
+        # The record name is no longer asserted as established fact.
+        self.assertNotIn("The candidate is Rijo", prompt)
+        # It is framed as an unverified record and confirmed in-call.
+        self.assertIn("UNVERIFIED record name", prompt)
+        self.assertIn("just to confirm, am I speaking with Rijo?", prompt)
+        # If a different name is given, do not argue; use theirs.
+        self.assertIn("do NOT argue", prompt)
+        self.assertIn("use the name THEY give", prompt)
+
+    def test_closing_does_not_unconditionally_assert_record_name(self):
+        prompt = system_prompt(candidate_name="Rijo")
+
+        # The closing no longer hard-asserts "thank Rijo by name".
+        self.assertNotIn("thank Rijo by name", prompt)
+        # Closing is gated on a CONFIRMED name and drops the name otherwise.
+        self.assertIn("If you have CONFIRMED their name", prompt)
+        self.assertIn('WITHOUT asserting the record name "Rijo"', prompt)
+
     def test_resume_facts_include_bounded_recent_role_evidence(self):
         facts = format_resume_facts({
             "name": "Asha",

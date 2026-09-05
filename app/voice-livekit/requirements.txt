@@ -20,6 +20,13 @@
 livekit-agents==1.6.4
 livekit-plugins-openai==1.6.4
 livekit-plugins-sarvam==1.6.4
+# Native Google GenAI LLM plugin (matches the 1.6.4 series). Required so the
+# phone interviewer + coverage judge can speak to Gemini through the NATIVE
+# google-genai SDK instead of the OpenAI-compat endpoint: Google's implicit
+# prompt caching (the stable system-prompt prefix served from cache) engages
+# ONLY on the native SDK, not on the OpenAI-compat shim. It pulls in
+# google-genai transitively (observed google-genai==2.22.0 with this pin).
+livekit-plugins-google==1.6.4
 python-dotenv==1.2.2
 supabase==2.31.0
 httpx==0.28.1
