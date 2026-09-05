@@ -4091,12 +4091,22 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         self.assertIsNone(phone.phone_name_mismatch("my name is Priya", ""))
         self.assertIsNone(phone.phone_name_mismatch("my name is Priya", "R"))
 
-        # Genuine, obvious mismatch → conflict record.
+        # Genuine, obvious mismatch → GRADED identity record. The back-compat
+        # {resume_fact, spoken_claim} keys remain; the record now ALSO carries the
+        # graded fields (signal discriminator, root names, similarity ratio) so it
+        # travels on the identity channel, not the résumé-conflict channel.
         conflict = phone.phone_name_mismatch("Hi, my name is Rijo.", "Christo")
         self.assertIsNotNone(conflict)
-        self.assertEqual(set(conflict), {"resume_fact", "spoken_claim"})
+        self.assertTrue(
+            {"resume_fact", "spoken_claim", "signal", "spoken", "record", "ratio"}
+            <= set(conflict)
+        )
+        self.assertEqual(conflict["signal"], "name_mismatch")
         self.assertIn("christo", conflict["resume_fact"])
         self.assertIn("rijo", conflict["spoken_claim"])
+        self.assertEqual(conflict["record"], "christo")
+        self.assertEqual(conflict["spoken"], "rijo")
+        self.assertTrue(0.0 <= float(conflict["ratio"]) <= 1.0)
         # Field/length invariants match the conflict contract.
         self.assertLessEqual(len(conflict["resume_fact"]), 300)
         self.assertLessEqual(len(conflict["spoken_claim"]), 300)
@@ -4107,11 +4117,14 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         self.assertIn("rahul", conflict2["resume_fact"])
         self.assertIn("priya", conflict2["spoken_claim"])
 
-        # A conflict record must ride the existing conflict machinery cleanly.
-        key = phone.phone_conflict_key(conflict)
-        self.assertIsInstance(key, str)
-        instruction = phone.phone_judge_turn_instruction("Owed question?", conflict=conflict)
+        # The identity record keys on its OWN namespace, distinct from a
+        # résumé-conflict key, and drives a name-confirmation instruction.
+        name_key = phone.phone_name_mismatch_key(conflict)
+        self.assertTrue(name_key.startswith("name_mismatch:"))
+        self.assertNotEqual(name_key, phone.phone_conflict_key(conflict))
+        instruction = phone.phone_name_confirm_instruction(conflict)
         self.assertIsInstance(instruction, str)
+        self.assertIn("confirm", instruction.lower())
 
     def test_name_mismatch_ignores_bare_im_sentences(self):
         # FIX 2 (adversarial-review repair). Ordinary "I'm <word>" / "I am
@@ -4887,6 +4900,130 @@ class TestPhoneTtsDeliveryGuidance(unittest.TestCase):
         self.assertNotIn("NATURAL SPOKEN DELIVERY", browser)
 
 
+class TestPhonePromptCacheEnrichment(unittest.TestCase):
+    """The persona-depth + conversation-flow enrichment (FIX 1a) that grows the
+    STABLE phone prefix past Gemini 3/3.5's >=4,096-token implicit-caching
+    threshold (was ~3,200 => cache=0). It must be PHONE-ONLY (absent from the
+    sha-pinned browser surface), sit in the stable prefix, and push the measured
+    prefix over 4,096 tokens."""
+
+    def _state(self, *, resume_facts=None):
+        state = phone.PhoneAssessmentState.parse(_plan_payload())
+        state.role_title = "Senior Software Engineer"
+        state.role_focus = "backend systems, distributed services, API design"
+        state.resume_facts = resume_facts or {}
+        return state
+
+    def test_new_blocks_carry_persona_and_flow_content(self):
+        depth = phone.PHONE_PERSONA_DEPTH_TEXT
+        self.assertIn("MORE ABOUT CHRISTY", depth)
+        self.assertIn("unflappable", depth)
+        self.assertIn("on their side", depth)
+        flow = phone.PHONE_CONVERSATION_FLOW_TEXT
+        self.assertIn("NATURAL CONVERSATION FLOW", flow)
+        self.assertIn("Acknowledge before you advance", flow)
+        self.assertIn("Bridge between topics", flow)
+        self.assertIn("reverse questions", flow)
+        self.assertIn("ONE conversation", flow)
+
+    def test_enrichment_reaches_the_phone_instructions(self):
+        with patch.object(agent_mod, "system_prompt", return_value="BUILT"):
+            built = agent_mod._phone_instructions_text(self._state())
+        self.assertIn(phone.PHONE_PERSONA_DEPTH_TEXT, built)
+        self.assertIn(phone.PHONE_CONVERSATION_FLOW_TEXT, built)
+        # Persona depth sits right after the base persona (stable prefix, top).
+        self.assertLess(
+            built.index(phone.PHONE_PERSONA_DEPTH_TEXT),
+            built.index(phone.PHONE_TTS_EMOTION_TEXT),
+        )
+
+    def test_enrichment_is_absent_from_the_browser_prompt(self):
+        browser = prompting.system_prompt(
+            candidate_name="Asha", role_title="Senior Software Engineer",
+        )
+        self.assertNotIn(phone.PHONE_PERSONA_DEPTH_TEXT, browser)
+        self.assertNotIn(phone.PHONE_CONVERSATION_FLOW_TEXT, browser)
+        self.assertNotIn("MORE ABOUT CHRISTY", browser)
+        self.assertNotIn("NATURAL CONVERSATION FLOW", browser)
+
+    def _real_stable_prefix(self) -> str:
+        # STRENGTHENED (adversarial review, 2026-09-05): measure the REAL assembled
+        # phone instruction text (`_phone_instructions_text`) MINUS the per-turn
+        # tail, instead of hand-reconstructing the block concatenation — a hand
+        # rebuild silently diverges if a block is dropped/reordered in the real
+        # assembly. We build a state WITH résumé evidence (so the real assembly
+        # includes PHONE_RESUME_CONFLICT_TEXT and the résumé-facts span, both of
+        # which are stable across turns within a call) and NO turns (so there is
+        # no per-turn `render_resume_context` tail to strip). The result is exactly
+        # the span Gemini caches for that call.
+        state = phone.PhoneAssessmentState.parse(_plan_payload(turns=[]))
+        state.role_title = "Senior Software Engineer"
+        state.role_focus = "backend systems, distributed services, API design"
+        state.interviewer_instructions = (
+            "Focus on depth of hands-on experience and clarity of communication."
+        )
+        state.resume_facts = {
+            "current_role": {"title": "Senior Backend Engineer",
+                             "employer": "Acme Corp"},
+            "prior_roles": [{"title": "Backend Engineer", "employer": "Globex"}],
+            "skills": ["python", "postgres", "distributed systems"],
+        }
+        built = agent_mod._phone_instructions_text(state)
+        # No turns → no per-turn resume-context tail; assert that and use `built`.
+        self.assertEqual(phone.render_resume_context(state.turns), "")
+        return built
+
+    def test_stable_prefix_matches_the_real_assembly_block_order(self):
+        # A block dropped or reordered in `_phone_instructions_text` must fail
+        # here: every STABLE block appears in the REAL assembly, in order. This is
+        # the divergence guard the old hand-built prefix could not provide.
+        built = self._real_stable_prefix()
+        ordered_blocks = [
+            phone.PHONE_PERSONA_TEXT, phone.PHONE_PERSONA_DEPTH_TEXT,
+            phone.PHONE_TTS_EMOTION_TEXT, phone.PHONE_TTS_DELIVERY_TEXT,
+            phone.PHONE_CALLBACK_POLICY_TEXT, phone.PHONE_ROLE_GROUNDING_TEXT,
+            phone.PHONE_TURN_DISCIPLINE_TEXT, phone.PHONE_EXPRESSIVENESS_TEXT,
+            phone.PHONE_CONVERSATION_FLOW_TEXT, phone.PHONE_RESUME_CONFLICT_TEXT,
+        ]
+        last = -1
+        for block in ordered_blocks:
+            idx = built.find(block)
+            self.assertGreaterEqual(
+                idx, 0, "a stable block is missing from the real phone assembly")
+            self.assertGreater(
+                idx, last, "stable blocks are out of order in the real assembly")
+            last = idx
+
+    def test_stable_prefix_exceeds_gemini_implicit_cache_threshold(self):
+        # HONEST METRIC (2026-09-05): the load-bearing assertion is the Gemini
+        # chars/4 rule-of-thumb, NOT cl100k. Google documents ~4 chars/token for
+        # Gemini English prose, and Gemini's ~256k-vocab tokenizer counts English
+        # MORE SPARSELY than OpenAI's cl100k — so cl100k OVER-counts here and is
+        # the wrong floor. A prior version preferred cl100k when tiktoken was
+        # present (passed locally at ~4,125) but fell to chars/4 on CI (no
+        # tiktoken) where it FAILED at ~2,908. This made local and CI disagree
+        # and hid the real miss: by the conservative Gemini metric the prefix was
+        # UNDER 4,096, so Gemini would not have engaged implicit caching. The
+        # assertion below runs identically on local and CI and reflects Gemini
+        # reality; any cl100k reading is informational only and never gates.
+        prefix = self._real_stable_prefix()
+        approx = len(prefix) / 4  # Gemini rule-of-thumb: ~4 chars/token (English)
+        self.assertGreaterEqual(
+            approx, 4096,
+            f"stable phone prefix is ~{approx:.0f} tokens by the Gemini chars/4 "
+            f"rule-of-thumb ({len(prefix)} chars); Gemini implicit caching needs "
+            ">= 4,096. Grow PHONE_PERSONA_DEPTH_TEXT / PHONE_CONVERSATION_FLOW_TEXT.",
+        )
+        # Informational only — cl100k over-counts English vs Gemini, so it must
+        # NOT gate (that is exactly the tokenizer mismatch this test corrects).
+        try:
+            import tiktoken  # noqa: PLC0415 — optional; informational when present
+            _cl100k = len(tiktoken.get_encoding("cl100k_base").encode(prefix))
+            self.assertIsInstance(_cl100k, int)  # measured, never a floor here
+        except ImportError:
+            pass
+
+
 class TestTtsFirstFragmentBoundary(unittest.TestCase):
     """v114 — the FIRST speakable fragment must be a natural unit: a short
     leading filler ("Mm,") merges forward instead of flushing as its own tiny
@@ -5660,7 +5797,7 @@ class _InertSession:
 
 async def _make_native_coordinator(
     *, turn_mode="toolfirst", client=None, state=None,
-    coverage_judge_enabled=False,
+    coverage_judge_enabled=False, call_metrics=None,
 ):
     """Start a REAL `_run_native_phone_screening` and return its live turn hook.
 
@@ -5719,6 +5856,7 @@ async def _make_native_coordinator(
             close_event=close_event,
             turn_mode=turn_mode,
             coverage_judge_enabled=coverage_judge_enabled,
+            call_metrics=call_metrics,
         )
     )
     # Let the coordinator install its hook and deliver the (inert) first question.
@@ -5753,6 +5891,7 @@ async def _make_native_coordinator(
         "task": task,
         "log_patch": log_patch,
         "drive_terminal": drive_terminal,
+        "call_metrics": call_metrics,
     }
     return agent, session, state, client, hooks
 
@@ -5974,8 +6113,11 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
 
 
 class TestConflictRepursuitFlow(unittest.IsolatedAsyncioTestCase):
-    """F7 (live 2026-09-03): a brushed-off conflict probe earns ONE concrete,
-    kind re-pursuit — then the controller moves on regardless."""
+    """F7 (live 2026-09-03) → W2 (2026-09-05): a brushed-off conflict probe now
+    earns a BOUNDED loop of concrete, kind re-pursuits (was one-shot). The loop
+    holds the cursor while the candidate keeps deflecting, advances the moment
+    the reply reconciles/declines or a real (even off-point) answer arrives, and
+    at cap advances WITHOUT capitulating (RCA call 623d0c30)."""
 
     CONFLICT = {
         "resume_fact": "Proprietary trader at Alpha Markets since 2024",
@@ -6002,7 +6144,17 @@ class TestConflictRepursuitFlow(unittest.IsolatedAsyncioTestCase):
         )
         return agent, session, state, client, hooks
 
-    async def test_deflection_earns_one_concrete_repursuit_then_moves_on(self):
+    # A SECOND live deflection (a counter-question about the gap) — still a
+    # deflection, so under the bounded loop it earns a SECOND concrete re-ask
+    # rather than an advance.
+    SECOND_DEFLECTION = "What do you mean by that exactly?"
+
+    async def test_deflection_under_cap_earns_another_concrete_repursuit(self):
+        # W2 (2026-09-05): the loop is BOUNDED, not one-shot. A 2nd UNRESOLVED
+        # deflection while UNDER cap gets a 2nd CONCRETE conflict ask (not the
+        # plan question); only at cap does it advance. Rewritten from the old
+        # `test_deflection_earns_one_concrete_repursuit_then_moves_on`, which
+        # encoded the buggy one-shot contract.
         agent, _, state, _, hooks = await self._coordinator_with_pending_conflict()
         turn_ctx = types.SimpleNamespace(items=[])
         await hooks["on_native_turn"](
@@ -6010,37 +6162,140 @@ class TestConflictRepursuitFlow(unittest.IsolatedAsyncioTestCase):
             types.SimpleNamespace(text_content=self.DEFLECTION), turn_ctx,
         )
         injected = str(turn_ctx.items)
-        # The second ask is CONCRETE (names the finding as private context)…
+        # The first re-pursuit is CONCRETE (names the finding as private context)…
         self.assertIn(self.CONFLICT["resume_fact"], injected)
         self.assertIn("explain in ONE plain, warm sentence", injected)
-        # …and remains guarded.
-        self.assertIn("Never accuse", injected)
-        self.assertTrue(agent._conflict_reply_pending.get("repursued"))
+        self.assertIn("Never accuse", injected)  # …and remains guarded.
+        # One re-ask has been charged against the per-conflict cap.
+        key = phone.phone_conflict_key(self.CONFLICT)
+        self.assertEqual(agent._conflict_reask_counts.get(key), 1)
 
-        # The re-pursuit's own reply is consumed like a clarification: a SECOND
-        # deflection gets the owed planned question, never a third conflict ask.
+        # The re-pursuit's own reply deflects AGAIN and is still UNDER cap (2):
+        # a SECOND concrete conflict ask fires — NOT the plan question.
         agent._conflict_reply_pending["value"] = True
         second_ctx = types.SimpleNamespace(items=[])
         await hooks["on_native_turn"](
-            "I still don't understand what you mean by that.",
-            types.SimpleNamespace(
-                text_content="I still don't understand what you mean by that.",
-            ),
+            self.SECOND_DEFLECTION,
+            types.SimpleNamespace(text_content=self.SECOND_DEFLECTION),
             second_ctx,
         )
         second = str(second_ctx.items)
-        self.assertNotIn(self.CONFLICT["resume_fact"], second)
-        self.assertNotIn("explain in ONE plain, warm sentence", second)
+        self.assertIn(self.CONFLICT["resume_fact"], second)
+        self.assertIn("explain in ONE plain, warm sentence", second)
+        self.assertEqual(agent._conflict_reask_counts.get(key), 2)
         hooks["task"].cancel()
         await asyncio.gather(hooks["task"], return_exceptions=True)
         hooks["log_patch"].stop()
 
-    async def test_an_engaged_answer_returns_to_the_plan_without_repursuit(self):
+    async def test_conflict_holds_until_cap_then_advances_without_capitulation(self):
+        # W2: an unresolved gap is HELD across re-asks; at cap the loop advances,
+        # logs `conflict_unresolved_cap_reached`, and the owed-question hand-off
+        # carries the anti-capitulation clause (no "no worries", no validation).
+        agent, _, state, _, hooks = await self._coordinator_with_pending_conflict()
+        key = phone.phone_conflict_key(self.CONFLICT)
+        # Seed the counter AT cap so the very next deflection advances (proves the
+        # bound deterministically without firing N live turns).
+        agent._conflict_reask_counts[key] = phone.phone_conflict_max_reasks()
+        turn_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            self.DEFLECTION,
+            types.SimpleNamespace(text_content=self.DEFLECTION), turn_ctx,
+        )
+        injected = str(turn_ctx.items)
+        # No third conflict ask — the plan question is asked instead…
+        self.assertNotIn(self.CONFLICT["resume_fact"], injected)
+        self.assertNotIn("explain in ONE plain, warm sentence", injected)
+        self.assertIn(state.questions[0].text, injected)
+        # …with the anti-capitulation prefix wired onto the advance turn.
+        self.assertIn(
+            "The earlier point that did not line up with the resume stays "
+            "unresolved; we are moving on now.", injected,
+        )
+        self.assertIn("no worries", injected)
+        self.assertIn("do NOT validate", injected)
+        # The cap advance was logged.
+        categories = [
+            c.kwargs.get("error_category")
+            for c in hooks["log"].info.call_args_list
+            if c.kwargs.get("error_type") == "phone_coverage_conflict"
+        ]
+        self.assertIn("conflict_unresolved_cap_reached", categories)
+        hooks["task"].cancel()
+        await asyncio.gather(hooks["task"], return_exceptions=True)
+        hooks["log_patch"].stop()
+
+    async def test_conflict_reconciling_answer_advances_immediately(self):
+        # W2: a genuinely RECONCILING reply (explicit correction squaring the two
+        # sides) advances immediately with NO extra probe and NO re-ask charged.
+        agent, _, state, _, hooks = await self._coordinator_with_pending_conflict()
+        reconciling = (
+            "You're right, the resume is a bit out of date — I misspoke. I "
+            "actually moved from the trading role into EdTech sales last year."
+        )
+        turn_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            reconciling, types.SimpleNamespace(text_content=reconciling), turn_ctx,
+        )
+        injected = str(turn_ctx.items)
+        self.assertNotIn(self.CONFLICT["resume_fact"], injected)
+        self.assertNotIn("explain in ONE plain, warm sentence", injected)
+        key = phone.phone_conflict_key(self.CONFLICT)
+        self.assertEqual(agent._conflict_reask_counts.get(key, 0), 0)
+        # C-fix (2026-09-05): a RECONCILE advance is NOT an unresolved drop, so
+        # the cold anti-capitulation prefix ("do NOT validate their account") must
+        # NOT wrap the owed question — the candidate DID square the two sides.
+        self.assertNotIn(phone.PHONE_CONFLICT_DROP_ADVANCE_PREFIX, injected)
+        self.assertFalse(agent._conflict_reply_pending.get("dropped_on_advance"))
+        hooks["task"].cancel()
+        await asyncio.gather(hooks["task"], return_exceptions=True)
+        hooks["log_patch"].stop()
+
+    async def test_engaged_low_overlap_answer_advances_without_drop_prefix(self):
+        # C-fix (2026-09-05): a SUBSTANTIVE but off-point engaged answer (it does
+        # not reconcile the specific gap, but it is a real answer, not a
+        # deflection) advances — `phone_conflict_reply_unresolved` is False — and
+        # must advance CLEANLY, WITHOUT the anti-capitulation prefix. Only a
+        # genuinely-unresolved drop (cap reached) earns the prefix.
+        agent, _, state, _, hooks = await self._coordinator_with_pending_conflict()
+        engaged_off_point = (
+            "Honestly I really enjoy mentoring the junior folks and building "
+            "teams; that has been the most rewarding part of my career so far."
+        )
+        # Precondition: engaged (not a deflection) but does NOT reconcile the gap.
+        self.assertFalse(phone.phone_conflict_reply_unresolved(engaged_off_point))
+        self.assertFalse(
+            phone.phone_conflict_reply_reconciled(engaged_off_point, self.CONFLICT),
+        )
+        turn_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            engaged_off_point,
+            types.SimpleNamespace(text_content=engaged_off_point), turn_ctx,
+        )
+        injected = str(turn_ctx.items)
+        # It advanced (no further conflict probe) …
+        self.assertNotIn(self.CONFLICT["resume_fact"], injected)
+        self.assertNotIn("explain in ONE plain, warm sentence", injected)
+        # … and did so WITHOUT the cold anti-capitulation prefix.
+        self.assertNotIn(phone.PHONE_CONFLICT_DROP_ADVANCE_PREFIX, injected)
+        self.assertFalse(agent._conflict_reply_pending.get("dropped_on_advance"))
+        hooks["task"].cancel()
+        await asyncio.gather(hooks["task"], return_exceptions=True)
+        hooks["log_patch"].stop()
+
+    async def test_an_engaged_answer_that_reconciles_returns_to_the_plan(self):
+        # Tightened (W2): an engaged answer advances ONLY because it RECONCILES
+        # the specific gap (topical overlap with the finding), not on mere
+        # engagement. The account speaks to the trading↔EdTech mismatch directly.
         agent, _, state, _, hooks = await self._coordinator_with_pending_conflict()
         engaged = (
             "Right, so the trading role was a family business I helped part-time "
             "while my full-time employment stayed in EdTech sales — the resume "
             "lists both and the dates overlap."
+        )
+        # Precondition: this reply genuinely reconciles THIS finding.
+        self.assertTrue(
+            phone.phone_conflict_reply_reconciled(engaged, self.CONFLICT),
+            "the engaged answer must reconcile the specific gap, not merely engage",
         )
         turn_ctx = types.SimpleNamespace(items=[])
         await hooks["on_native_turn"](
@@ -6048,10 +6303,255 @@ class TestConflictRepursuitFlow(unittest.IsolatedAsyncioTestCase):
         )
         injected = str(turn_ctx.items)
         self.assertNotIn(self.CONFLICT["resume_fact"], injected)
-        self.assertFalse(agent._conflict_reply_pending.get("repursued"))
+        key = phone.phone_conflict_key(self.CONFLICT)
+        self.assertEqual(agent._conflict_reask_counts.get(key, 0), 0)
         hooks["task"].cancel()
         await asyncio.gather(hooks["task"], return_exceptions=True)
         hooks["log_patch"].stop()
+
+    async def test_unrelated_engagement_does_not_falsely_reconcile(self):
+        # W2 CORE GUARD: a substantive but OFF-POINT tangent (about something
+        # unrelated to the flagged gap) is NOT a reconciliation. It is also not a
+        # deflection, so it advances (we do not badger a real answer) — but the
+        # reconciliation predicate must NOT report it as resolving the gap, which
+        # is what protects the cap-hold semantics from a false green.
+        self.assertFalse(
+            phone.phone_conflict_reply_reconciled(
+                "I really enjoy mentoring the junior folks and building teams.",
+                self.CONFLICT,
+            ),
+        )
+
+    async def test_kill_switch_restores_one_shot_advance(self):
+        # W2: `PHONE_CONFLICT_GATE=off` reverts to the pre-loop behaviour — a
+        # single re-pursuit, then advance on the next deflection regardless of
+        # resolution (the old one-shot contract, available as a runtime defuse).
+        with patch.dict(phone.os.environ, {"PHONE_CONFLICT_GATE": "off"}):
+            self.assertFalse(phone.phone_conflict_gate_enabled())
+            agent, _, state, _, hooks = await self._coordinator_with_pending_conflict()
+            first = types.SimpleNamespace(items=[])
+            await hooks["on_native_turn"](
+                self.DEFLECTION,
+                types.SimpleNamespace(text_content=self.DEFLECTION), first,
+            )
+            self.assertIn(self.CONFLICT["resume_fact"], str(first.items))
+            self.assertTrue(agent._conflict_reply_pending.get("repursued"))
+            # Under the kill switch the counter is NOT used.
+            key = phone.phone_conflict_key(self.CONFLICT)
+            self.assertEqual(agent._conflict_reask_counts.get(key, 0), 0)
+            # A SECOND deflection advances (one-shot latch), no third ask.
+            agent._conflict_reply_pending["value"] = True
+            second = types.SimpleNamespace(items=[])
+            await hooks["on_native_turn"](
+                self.SECOND_DEFLECTION,
+                types.SimpleNamespace(text_content=self.SECOND_DEFLECTION), second,
+            )
+            self.assertNotIn(self.CONFLICT["resume_fact"], str(second.items))
+            hooks["task"].cancel()
+            await asyncio.gather(hooks["task"], return_exceptions=True)
+            hooks["log_patch"].stop()
+
+
+class TestNameMismatchTurnHook(unittest.IsolatedAsyncioTestCase):
+    """W-name identity channel driven through the REAL single-STT-final turn hook
+    (`on_native_turn`), not the isolated detector. Exercises the exact call-site
+    that had the `conflict = conflict or phone_name_mismatch(...)` short-circuit,
+    plus the A-fix (single-final name-confirm must HOLD the cursor like the
+    coalesce site) and the E-fix (when a résumé conflict owns the turn, the
+    identity signal is PERSISTED unresolved into call_metrics — observable
+    post-call — and the confirmation turn is not fired)."""
+
+    # resume_facts carrying BOTH a record name (for the mismatch) and a role
+    # (for the deterministic résumé conflict).
+    RESUME_FACTS = {"name": "Rijo", "current_role": {"title": "Data Engineer"}}
+
+    async def _coordinator(self, *, call_metrics=None):
+        state = _default_state(
+            questions=[
+                {"key": "k1", "text": "First question?", "mandatory": True, "hint": None},
+                {"key": "k2", "text": "Second question?", "mandatory": True, "hint": None},
+            ],
+            name="Rijo",
+        )
+        state.resume_facts = dict(self.RESUME_FACTS)
+        agent, session, st, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless", coverage_judge_enabled=True, state=state,
+            call_metrics=call_metrics,
+        )
+        hooks["assistant_delivery_complete"].set()
+        hooks["latest_assistant"][0] = state.questions[0].spoken_text
+        hooks["latest_assistant_anchor"][0] = 1
+        return agent, session, st, client, hooks
+
+    async def test_name_intro_only_fires_confirmation_and_holds_cursor(self):
+        # EXECUTION test (A-fix + name-confirm behaviour). A name-intro-only turn
+        # with a record-name mismatch produces a NAME-CONFIRMATION turn whose
+        # emitted instruction carries the confirm text, asserts NEITHER name as
+        # fact, and does NOT capitulate — and it HOLDS the cursor (mirrors the
+        # coalesce site) so the next planned question is not skipped.
+        agent, _, state, client, hooks = await self._coordinator()
+        cursor_before = state.cursor
+        text = "Hi, my name is Christo, nice to meet you."
+        # Precondition: this turn is a name mismatch but NOT a résumé conflict.
+        self.assertIsNone(
+            phone.phone_deterministic_resume_conflict(text, self.RESUME_FACTS))
+        self.assertIsInstance(
+            phone.phone_name_mismatch(text, self.RESUME_FACTS["name"]), dict)
+        turn_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            text, types.SimpleNamespace(text_content=text), turn_ctx,
+        )
+        injected = str(turn_ctx.items)
+        # The name-confirmation instruction was emitted …
+        self.assertIn("confirm", injected.lower())
+        self.assertIn("do not assert either name", injected.lower())
+        self.assertIn("never accuse", injected.lower())
+        # … and it is NOT the résumé-conflict remedy.
+        self.assertNotIn("does not line up with their resume", injected.lower())
+        # A-fix: the cursor is HELD. The single-final name-confirm path must
+        # RETURN before scheduling the background boundary commit, so NO boundary
+        # is committed to the server — mirroring the coalesce site which returns
+        # before ever populating `pending`. Give any spuriously-scheduled commit
+        # task a chance to run first; there must be none.
+        for _ in range(10):
+            await asyncio.sleep(0)
+        self.assertEqual(
+            client.committed_keys, [],
+            "the name-confirm turn must not schedule a boundary commit "
+            "(that would advance the cursor and skip the next question)",
+        )
+        self.assertEqual(cursor_before, 0)  # sanity: we started at the first Q
+        hooks["task"].cancel()
+        await asyncio.gather(hooks["task"], return_exceptions=True)
+        hooks["log_patch"].stop()
+
+    async def test_name_signal_persisted_unresolved_when_conflict_owns_turn(self):
+        # Rewritten `test_name_mismatch_evaluated_independently_of_conflict`
+        # equivalent driven through the REAL hook: a single turn that carries BOTH
+        # a résumé conflict AND a name introduction. The résumé conflict claims
+        # the turn (judge_instruction set first), so the identity signal must NOT
+        # be lost — it is PERSISTED `unresolved` into call_metrics identity
+        # signals (observable post-call), and NOT armed as a fired confirmation.
+        call_metrics = agent_mod._new_phone_call_metrics()
+        agent, _, state, client, hooks = await self._coordinator(
+            call_metrics=call_metrics)
+        text = "My name is Christo. I spent two years in sales and advisory roles."
+        # Precondition: this ONE turn is BOTH a résumé conflict AND a name mismatch.
+        self.assertIsInstance(
+            phone.phone_deterministic_resume_conflict(text, self.RESUME_FACTS), dict)
+        mismatch = phone.phone_name_mismatch(text, self.RESUME_FACTS["name"])
+        self.assertIsInstance(mismatch, dict)
+        turn_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            text, types.SimpleNamespace(text_content=text), turn_ctx,
+        )
+        injected = str(turn_ctx.items)
+        # The RÉSUMÉ conflict owns the turn (its remedy instruction is emitted),
+        # NOT the name-confirm remedy.
+        self.assertIn("does not line up with their resume", injected.lower())
+        self.assertNotIn("do not assert either name", injected.lower())
+        # The identity signal is NOT lost: it is persisted `unresolved`.
+        signals = call_metrics.get("identity_signals") or {}
+        key = phone.phone_name_mismatch_key(mismatch)
+        self.assertIn(key, signals)
+        self.assertEqual(signals[key].get("disposition"), "unresolved")
+        self.assertEqual(signals[key].get("spoken"), "christo")
+        self.assertEqual(signals[key].get("record"), "rijo")
+        # It was NOT added to the fired-arm set (the confirmation did not fire).
+        self.assertNotIn(key, agent._asked_name_mismatches)
+        hooks["task"].cancel()
+        await asyncio.gather(hooks["task"], return_exceptions=True)
+        hooks["log_patch"].stop()
+
+
+class TestPhoneConflictLoopConfig(unittest.TestCase):
+    """W2 accessors + reconciliation predicate (pure)."""
+
+    CONFLICT = {
+        "resume_fact": "Proprietary trader at Alpha Markets since 2024",
+        "spoken_claim": "Two years in EdTech sales and advisory roles",
+    }
+
+    def test_gate_flag_defaults_on_and_only_literal_off_disables(self):
+        for value, expected in (
+            ("", True), ("on", True), ("garbage", True),
+            ("OFF", False), (" off ", False),
+        ):
+            with patch.dict(phone.os.environ, {"PHONE_CONFLICT_GATE": value}):
+                self.assertEqual(phone.phone_conflict_gate_enabled(), expected)
+
+    def test_max_reasks_defaults_two_and_clamps(self):
+        with patch.dict(phone.os.environ, {}, clear=False):
+            phone.os.environ.pop("PHONE_CONFLICT_MAX_REASKS", None)
+            self.assertEqual(phone.phone_conflict_max_reasks(), 2)
+        for value, expected in (("0", 0), ("5", 5), ("99", 5), ("-3", 0), ("x", 2)):
+            with patch.dict(phone.os.environ, {"PHONE_CONFLICT_MAX_REASKS": value}):
+                self.assertEqual(phone.phone_conflict_max_reasks(), expected)
+
+    def test_reconciled_requires_more_than_engagement(self):
+        # Deflection: not reconciled.
+        self.assertFalse(phone.phone_conflict_reply_reconciled(
+            "What do you mean by that exactly?", self.CONFLICT))
+        # Off-point substantive tangent: engaged but NOT reconciled.
+        self.assertFalse(phone.phone_conflict_reply_reconciled(
+            "I love building teams and shipping product every quarter.",
+            self.CONFLICT))
+        # Explicit decline: terminal → reconciled.
+        self.assertTrue(phone.phone_conflict_reply_reconciled(
+            "I'd rather not get into that.", self.CONFLICT))
+        # Explicit correction squaring the two sides → reconciled.
+        self.assertTrue(phone.phone_conflict_reply_reconciled(
+            "You're right, the resume is outdated — I misspoke.", self.CONFLICT))
+        # Topical overlap with the finding → reconciled.
+        self.assertTrue(phone.phone_conflict_reply_reconciled(
+            "The trading role and the EdTech sales work actually overlapped.",
+            self.CONFLICT))
+        # Empty / non-str → not reconciled (conservative).
+        self.assertFalse(phone.phone_conflict_reply_reconciled("", self.CONFLICT))
+        self.assertFalse(phone.phone_conflict_reply_reconciled(None, self.CONFLICT))
+
+    def test_actually_i_deflections_do_not_falsely_reconcile(self):
+        # B-fix (SEVERE, adversarial review 2026-09-05): the bare `actually\s+i`
+        # alternative in `_CONFLICT_CORRECTION_RE` matched non-correction
+        # deflections, so the bounded loop advanced an UNRESOLVED conflict on the
+        # first dodge. These must NOT reconcile:
+        self.assertFalse(phone.phone_conflict_reply_reconciled(
+            "Actually I think you're confused about something else.", self.CONFLICT))
+        self.assertFalse(phone.phone_conflict_reply_reconciled(
+            "Actually I already moved past that.", self.CONFLICT))
+        # A GENUINE self-correction still reconciles:
+        self.assertTrue(phone.phone_conflict_reply_reconciled(
+            "Actually I misspoke, the resume is right.", self.CONFLICT))
+        self.assertTrue(phone.phone_conflict_reply_reconciled(
+            "Actually I meant the EdTech sales role, not trading.", self.CONFLICT))
+        # A bare interrogative deflection is BOTH non-reconciling AND unresolved,
+        # so the loop re-pursues it rather than advancing on the first dodge:
+        self.assertFalse(phone.phone_conflict_reply_reconciled(
+            "Actually, what do you mean exactly?", self.CONFLICT))
+        self.assertTrue(phone.phone_conflict_reply_unresolved(
+            "Actually, what do you mean exactly?"))
+
+    def test_stopword_only_overlap_does_not_reconcile(self):
+        # Load-bearing `_CONFLICT_OVERLAP_STOPWORDS`: a reply that shares tokens
+        # with the finding ONLY on generic stopwords ("role", "experience",
+        # "company", "work") must NOT read as topical overlap → NOT reconciled.
+        # If the stopword filter were removed, this reply would falsely reconcile.
+        stopword_only = (
+            "I would love to tell you more about my role and my experience at "
+            "the company and the work I have been doing there."
+        )
+        self.assertFalse(
+            phone.phone_conflict_reply_reconciled(stopword_only, self.CONFLICT),
+            "stopword-only overlap must not count as reconciling the gap",
+        )
+
+    def test_drop_advance_instruction_prepends_anticapitulation(self):
+        wrapped = phone.phone_conflict_drop_advance_instruction("Ask Q7 now.")
+        self.assertTrue(wrapped.startswith(phone.PHONE_CONFLICT_DROP_ADVANCE_PREFIX))
+        self.assertIn("Ask Q7 now.", wrapped)
+        self.assertIn("no worries", wrapped)
+        # Empty instruction is returned unchanged (defensive).
+        self.assertEqual(phone.phone_conflict_drop_advance_instruction(""), "")
 
 
 class TestPhoneCoverageJudgeCore(unittest.IsolatedAsyncioTestCase):
@@ -6803,8 +7303,12 @@ class TestPhoneInterviewerLlmFactory(unittest.TestCase):
         self.assertEqual(recorded["model"], "gemini-3.5-flash-lite")
         self.assertEqual(recorded["api_key"], "g" * 20)
         self.assertEqual(recorded["temperature"], 0.6)
-        # Thinking disabled via the real introspected param (dict thinking_budget).
-        self.assertEqual(recorded["thinking_config"], {"thinking_budget": 0})
+        # Thinking minimised via the correct Gemini-3 param. gemini-3.5-flash-lite
+        # is a Gemini-3 model, whose livekit-plugins-google 1.6.4 branch IGNORES
+        # thinking_budget and requires thinking_level; "minimal" is that branch's
+        # own default and the model's lowest tier. (Verified against the 1.6.4
+        # plugin source: llm.py reads thinking_config["thinking_level"].)
+        self.assertEqual(recorded["thinking_config"], {"thinking_level": "minimal"})
         # Native SDK: no OpenAI-compat base_url.
         self.assertNotIn("base_url", recorded)
         # Implicit caching only: explicit context cache must NOT be set.

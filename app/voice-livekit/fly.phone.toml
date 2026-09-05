@@ -56,6 +56,32 @@ primary_region = "sin"
   GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
   SARVAM_STT_MODEL = "saaras:v3"
   SARVAM_LANGUAGE = "en-IN"
+  # ── Sarvam STT end-of-utterance window (owner-gated A/B) ──────────────────
+  # Trim the STT-final wait toward ~0.8s. Live log showed the default silence
+  # window (phone_sarvam_vad_config=default, option_count=0) giving
+  # speech_end_to_final_transcript ~0.95s. These feed phone.phone_sarvam_vad_options()
+  # (PHONE-only; browser STT is untouched). saaras:v3 supports fine-grained VAD.
+  #
+  # FRAME MATH (from Sarvam streaming-STT docs): one VAD frame = 512 samples =
+  # 32 ms at the configured STT sample_rate (16 kHz; the plugin resamples the
+  # 8 kHz PSTN audio up to its 16 kHz default before VAD, so 32 ms/frame is the
+  # governing figure). End-of-speech triggers when `negative_frames_count`
+  # silence frames accumulate inside a sliding `negative_frames_window`.
+  #   Sarvam defaults: count=18, window=24
+  #     -> min fill 18*32ms = 576 ms; max (18-of-24) 24*32ms = 768 ms VAD window
+  #     -> plus finalization/network ~0.2-0.35s ≈ the observed ~0.95s total.
+  #   Chosen (this A/B): count=16, window=22
+  #     -> min fill 16*32ms = 512 ms; max (16-of-22) 22*32ms = 704 ms VAD window
+  #     -> plus finalization ≈ ~0.7-0.85s total, centered on the ~0.8s target.
+  # A modest 2-frame (~64 ms) trim off both bounds — NOT the aggressive
+  # high_vad_sensitivity 2/2 (~64 ms window) that cuts speakers off mid-pause.
+  # The window keeps the default 6-frame tolerance for non-silence blips, so a
+  # short in-answer pause does not end the turn. negative_speech_threshold is
+  # left UNSET (Sarvam default 0.45) so this A/B changes only the timing window,
+  # not the speech/silence decision boundary. Owner-gated: revert by removing
+  # these two lines to restore the deployed default window.
+  PHONE_SARVAM_NEGATIVE_FRAMES_COUNT = "16"
+  PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW = "22"
   SARVAM_TTS_MODEL = "bulbul:v3"
   SARVAM_TTS_VOICE = "simran"
   PHONE_TURN_DETECTION = "local"

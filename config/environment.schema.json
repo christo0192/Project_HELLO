@@ -194,6 +194,8 @@
         "PHONE_PATIENCE_GATE": { "requiredInProduction": false, "secret": false },
         "PHONE_ANSWER_GATE": { "requiredInProduction": false, "secret": false },
         "PHONE_ANSWER_GATE_MAX_REASKS": { "requiredInProduction": false, "secret": false },
+        "PHONE_CONFLICT_GATE": { "requiredInProduction": false, "secret": false },
+        "PHONE_CONFLICT_MAX_REASKS": { "requiredInProduction": false, "secret": false },
         "PHONE_COVERAGE_JUDGE": { "requiredInProduction": false, "secret": false },
         "PHONE_COVERAGE_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_JUDGE_RETRIES": { "requiredInProduction": false, "secret": false },
