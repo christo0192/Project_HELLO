@@ -447,6 +447,14 @@ def _new_phone_call_metrics() -> dict[str, Any]:
         # cannot grow the observability jsonb without bound. Reduced per-schema to
         # {median, p95, max, count} at completion.
         "turn_segments": [],
+        # W-name (2026-09-05): GRADED identity signals. A detected résumé-vs-
+        # spoken name mismatch is recorded here — spoken/record root names, the
+        # similarity ratio, and a disposition (armed | confirmed | unresolved) —
+        # NOT as a bare boolean folded into the conflict channel. Bounded (the map
+        # only grows by the small set of distinct mismatch keys per call) so it
+        # cannot inflate the observability jsonb. Keyed by
+        # `phone_name_mismatch_key` (its OWN namespace, never a conflict key).
+        "identity_signals": {},
     }
 
 
@@ -536,6 +544,27 @@ def _summarize_phone_call_metrics(call_metrics: dict[str, Any]) -> dict[str, Any
                     "count": len(ordered),
                 }
             snapshot["turn_segments_ms"] = segment_summary
+    except Exception:  # noqa: BLE001
+        pass
+    # W-name (2026-09-05): surface the GRADED identity signals so identity
+    # confirmation is observable after the call. Each entry is bounded
+    # {spoken, record, ratio, disposition}; guarded independently so a
+    # reduction failure never drops the latency summaries above.
+    try:
+        identity = call_metrics.get("identity_signals", {}) or {}
+        if isinstance(identity, Mapping) and identity:
+            signals: list[dict[str, Any]] = []
+            for entry in identity.values():
+                if not isinstance(entry, Mapping):
+                    continue
+                signals.append({
+                    "spoken": str(entry.get("spoken") or "")[:60],
+                    "record": str(entry.get("record") or "")[:60],
+                    "ratio": entry.get("ratio"),
+                    "disposition": str(entry.get("disposition") or "unresolved")[:32],
+                })
+            if signals:
+                snapshot["identity_signals"] = signals
     except Exception:  # noqa: BLE001
         pass
     return snapshot
@@ -1454,7 +1483,7 @@ def _phone_instructions_text(state: "phone.PhoneAssessmentState") -> str:
     # speaking model writes expressive, well-punctuated lines the Sarvam voice can
     # render with tone. Prepended (not merged into the sha-pinned `system_prompt`),
     # so the browser prompt surface is byte-identical.
-    text = phone.PHONE_PERSONA_TEXT + phone.PHONE_TTS_EMOTION_TEXT + phone.PHONE_TTS_DELIVERY_TEXT + system_prompt(
+    text = phone.PHONE_PERSONA_TEXT + phone.PHONE_PERSONA_DEPTH_TEXT + phone.PHONE_TTS_EMOTION_TEXT + phone.PHONE_TTS_DELIVERY_TEXT + system_prompt(
         candidate_name=state.candidate_name,
         role_title=state.role_title,
         role_focus=(state.role_focus or ", ".join(state.role_required_skills))[:600],
@@ -1475,6 +1504,7 @@ def _phone_instructions_text(state: "phone.PhoneAssessmentState") -> str:
         + phone.PHONE_ROLE_GROUNDING_TEXT
         + phone.PHONE_TURN_DISCIPLINE_TEXT
         + phone.PHONE_EXPRESSIVENESS_TEXT
+        + phone.PHONE_CONVERSATION_FLOW_TEXT
     )
     # Resume-conflict probing rides the compacted evidence: only offer the
     # directive when there is evidence to reconcile against. Omitting it when
@@ -1646,10 +1676,31 @@ def _build_phone_interviewer_llm() -> Any:
                 model=phone.phone_primary_model(),
                 api_key=phone.phone_llm_api_key(),
                 temperature=0.6,
-                # Disable Gemini "thinking" (0-budget) to kill reasoning dead-air
-                # before speech. Introspected real param on livekit-plugins-google
-                # 1.6.4: thinking_config accepts a dict with thinking_budget:int.
-                thinking_config={"thinking_budget": 0},
+                # Minimise Gemini "thinking" to kill reasoning dead-air before
+                # speech. gemini-3.5-flash-lite is a Gemini-3 model, and the
+                # plugin's Gemini-3 branch IGNORES thinking_budget (it logged
+                # "does not support thinking_budget. Please use thinking_level"),
+                # so the old {"thinking_budget": 0} was a silent no-op. The
+                # correct Gemini-3 control is thinking_level. VERIFIED against the
+                # installed pin: livekit-plugins-google 1.6.4 llm.py reads
+                # thinking_config["thinking_level"] and, for a gemini-3-flash
+                # model, forwards it to google-genai as {"thinking_level": _level}
+                # ("minimal" is that branch's own default and the model's lowest
+                # tier). We pass the dict form the plugin forwards verbatim, so
+                # this is robust even on a google-genai build whose ThinkingConfig
+                # has no thinking_level field yet. HONESTY (adversarial review,
+                # 2026-09-05): `thinking_level` is NOT validated at construction —
+                # the plugin forwards it to google-genai at REQUEST time, so a
+                # value the backend rejects would raise on the FIRST live turn,
+                # NOT here, and the try/except below would NOT catch it. That
+                # try/except fails open to the OpenAI-compat path ONLY for
+                # CONSTRUCTION errors (TypeError from a renamed/removed kwarg,
+                # ImportError from an absent plugin). "minimal" IS a valid level
+                # for gemini-3.5-flash-lite (the plugin's own Gemini-3 default),
+                # so there is no live crash today; but do not read this as a
+                # fail-open guard against a bad thinking_level — a bad level would
+                # surface at request time, uncaught here.
+                thinking_config={"thinking_level": "minimal"},
             )
         except Exception as exc:  # noqa: BLE001 — must fail OPEN, never crash the turn
             _log.warn(
@@ -2103,8 +2154,19 @@ async def _run_native_phone_screening(
     pending_conflict: dict[str, Any] = {"value": None}  # compatibility/test seam; never late-injected
     conflict_reply_pending: dict[str, Any] = {
         "value": False, "conflict": None, "repursued": False, "armed_turn": None,
-        "armed_turn_seq": None,
+        "armed_turn_seq": None, "dropped_on_advance": False,
     }
+    # W2 (2026-09-05) BOUNDED CONFLICT-RESOLUTION LOOP. The old design used the
+    # `repursued` boolean above as a ONE-SHOT latch: after a single re-pursuit
+    # the conflict advanced regardless of whether the candidate ever reconciled
+    # it (RCA call 623d0c30 — the bot capitulated after one dodge). Replace the
+    # latch with a per-conflict-key re-ask counter, exactly mirroring the answer
+    # gate's `answer_reask_counts`: fire another concrete re-pursuit while UNDER
+    # `phone_conflict_max_reasks()` and unresolved; advance only at cap. `repursued`
+    # is retained in the dict above only as a back-compat test/read seam; the live
+    # fire decision reads this counter. Keyed by `phone_conflict_key`; the map
+    # only grows by the bounded set of findings surfaced per call.
+    conflict_reask_counts: dict[str, int] = {}
     conflict_delivery: dict[str, Any] = {"sequence": None, "key": None}
     # B1 round 2 (v115 live): a monotonic count of candidate turns seen by the
     # turn hook. The ASYNC coverage judge stamps this when it arms a bounded
@@ -2113,6 +2175,40 @@ async def _run_native_phone_screening(
     # invariant the ~3029-3038 comment protects.
     native_turn_seq: list[int] = [0]
     asked_conflicts: set[str] = set()
+    # W-name (2026-09-05) IDENTITY-MISMATCH LATCH — a SEPARATE key namespace from
+    # `asked_conflicts`. The RCA (call 623d0c30) was that a name mismatch was
+    # folded into the résumé-conflict boolean via a short-circuit `or`, so once a
+    # résumé conflict was already true (or already consumed/dropped) the name
+    # signal rode the SAME `asked_conflicts` channel and was lost. Identity is a
+    # DIFFERENT signal with a DIFFERENT remedy (confirm the name — not reconcile
+    # the account), so it arms under its own `phone_name_mismatch_key` set. This
+    # can neither shadow nor be shadowed by a live résumé conflict.
+    asked_name_mismatches: set[str] = set()
+
+    def _record_identity_signal(mismatch: Any, disposition: str) -> None:
+        """Persist a GRADED identity signal into the observability accumulator.
+
+        Not a bare bool: records the spoken/record root names, the similarity
+        ratio, and a disposition (armed | confirmed | unresolved). Keyed by
+        `phone_name_mismatch_key` so a repeated intro of the same mismatch
+        updates the same entry (last disposition wins) rather than duplicating.
+        Best-effort — a persistence failure never perturbs the live turn.
+        """
+        try:
+            if call_metrics is None or not isinstance(mismatch, dict):
+                return
+            store = call_metrics.get("identity_signals")
+            if not isinstance(store, dict):
+                return
+            key = phone.phone_name_mismatch_key(mismatch)
+            store[key] = {
+                "spoken": str(mismatch.get("spoken") or "")[:60],
+                "record": str(mismatch.get("record") or "")[:60],
+                "ratio": mismatch.get("ratio"),
+                "disposition": str(disposition or "unresolved")[:32],
+            }
+        except Exception:  # noqa: BLE001
+            pass
     # ANSWER-GATE (owner directive, 2026-09-05). The outgoing advance must fire
     # only when the candidate ANSWERED the owed question or explicitly DECLINED
     # it; a mere-substantive non-answer (counter-question, deflection, off-topic
@@ -2368,6 +2464,21 @@ async def _run_native_phone_screening(
         # drop. Read-then-clear so the stamp cannot outlive one consumption.
         armed_turn = conflict_reply_pending.get("armed_turn")
         conflict_reply_pending["armed_turn"] = None
+        # W2: default the drop flag off every consumption. A STALE async drop
+        # (below) is NOT a capitulation risk — no re-pursuit fired this turn and
+        # the candidate already moved on — so it leaves the flag off.
+        #
+        # C-fix (adversarial review, 2026-09-05): the flag is now set ONLY on the
+        # genuinely-UNRESOLVED drop exits of `_begin_conflict_repursuit` (cap
+        # reached, or an under-cap unresolved reply that could not build a
+        # re-pursuit instruction), NOT on every non-firing advance. Previously it
+        # was set on EVERY `not fired`, so the RECONCILE / explicit-DECLINE /
+        # engaged-substantive-answer advances wrongly wrapped the next owed
+        # question in the cold anti-capitulation prefix on exactly the paths where
+        # the candidate DID engage. `_begin_conflict_repursuit` owns the decision
+        # because only it can distinguish those exits; this site just clears the
+        # default so it can never leak across turns.
+        conflict_reply_pending["dropped_on_advance"] = False
         if armed_turn is not None and native_turn_seq[0] - armed_turn > 1:
             _log.info(
                 "unknown_event", error_type="phone_coverage_conflict",
@@ -2379,22 +2490,107 @@ async def _run_native_phone_screening(
     def _begin_conflict_repursuit(
         turn_ctx: Any, text: str, probe_conflict: Any,
     ) -> bool:
-        """Start the ONE permitted conflict re-pursuit; True when it owns the turn.
+        """Fire another concrete conflict re-pursuit; True when it owns the turn.
 
-        Fires only when the candidate's reply to the conflict probe did not
-        engage it (deflection / "I don't know" / filler), at most once per call
-        (the `repursued` latch), and only when the detected finding is still in
-        hand. The re-pursuit reply is tracked exactly like the first probe so
-        its own reply turn is consumed as a clarification, never an advance.
+        W2 (2026-09-05) BOUNDED LOOP (mirrors the answer gate). The old contract
+        was ONE-SHOT: after a single re-pursuit the conflict advanced regardless
+        of resolution, so a candidate who kept deflecting was let past (RCA call
+        623d0c30). Now the loop:
+
+          * ADVANCES (returns False) when the reply genuinely RECONCILES the
+            specific gap, explicitly DECLINES it, or the per-conflict re-ask
+            counter has reached ``phone_conflict_max_reasks()`` — the cap is the
+            only unconditional advance; at cap we log `conflict_unresolved_cap_
+            reached` and hand off to the anti-capitulation advance path;
+          * FIRES another concrete re-pursuit (returns True, owns the turn)
+            while UNDER cap and the gap is still unresolved, and KEEPS the
+            pending ARMED so the commit fence holds the cursor and the next
+            reply routes back here.
+
+        Reconciliation (`phone_conflict_reply_reconciled`) is stricter than mere
+        engagement: it requires the reply to address THIS finding (topical
+        overlap / correction / decline), failing conservatively toward one more
+        re-ask under cap rather than a false "reconciled".
         """
-        if conflict_reply_pending.get("repursued"):
+        # C-fix (2026-09-05): mark the anti-capitulation hand-off ONLY on the
+        # exits where the conflict is genuinely dropped UNRESOLVED. The reconcile,
+        # explicit-decline, and engaged-substantive-answer exits must NOT set it —
+        # the candidate engaged, so the cold "do NOT validate their account"
+        # prefix on the next owed question would be wrong there.
+        def _mark_unresolved_drop() -> None:
+            conflict_reply_pending["dropped_on_advance"] = True
+        # Kill switch: restore the pre-loop behaviour (advance on first
+        # unresolved) when disabled, so a runtime toggle can defuse the loop.
+        if not phone.phone_conflict_gate_enabled():
+            if conflict_reply_pending.get("repursued"):
+                # One-shot already fired; a still-unresolved reply is dropped.
+                _mark_unresolved_drop()
+                return False
+            if not phone.phone_conflict_reply_unresolved(text):
+                # Engaged / reconciled → clean advance, no anti-capitulation.
+                return False
+            repursuit = phone.phone_conflict_repursuit_instruction(probe_conflict)
+            if repursuit is None:
+                # Unresolved but no instruction to fire → unresolved drop.
+                _mark_unresolved_drop()
+                return False
+            conflict_reply_pending["repursued"] = True
+            return _fire_conflict_repursuit(turn_ctx, repursuit, probe_conflict)
+        # The candidate reconciled or explicitly declined → clean advance (no
+        # re-ask, NOT an unresolved drop).
+        if phone.phone_conflict_reply_reconciled(text, probe_conflict):
             return False
+        # A substantive-but-off-point ENGAGEMENT is NOT a deflection: the
+        # candidate answered (even if it did not square THIS gap, or they simply
+        # moved on to the owed question). Only a genuine deflection / non-answer
+        # re-fires — badgering a real answer would be worse than letting scoring
+        # judge its quality. This also preserves the anti-stale-clarification
+        # invariant: once the candidate has moved on with a real answer, the
+        # probe is not re-raised. Mirrors the pre-loop `unresolved` fire gate.
+        # ENGAGED → clean advance, NOT an unresolved drop.
         if not phone.phone_conflict_reply_unresolved(text):
             return False
+        key = (
+            phone.phone_conflict_key(probe_conflict)
+            if isinstance(probe_conflict, dict) else None
+        )
+        count = conflict_reask_counts.get(key, 0) if key is not None else 0
+        # Cap reached → advance, recording the conflict UNRESOLVED. The drop/
+        # advance site (~2977) applies the anti-capitulation instruction.
+        if count >= phone.phone_conflict_max_reasks():
+            _log.info(
+                "unknown_event", error_type="phone_coverage_conflict",
+                error_category="conflict_unresolved_cap_reached",
+            )
+            _mark_unresolved_drop()
+            return False
+        # Under cap + unresolved → fire another concrete re-pursuit.
         repursuit = phone.phone_conflict_repursuit_instruction(probe_conflict)
         if repursuit is None:
+            # Unresolved but no instruction to fire → unresolved drop.
+            _mark_unresolved_drop()
             return False
-        conflict_reply_pending["repursued"] = True
+        if key is not None:
+            conflict_reask_counts[key] = count + 1
+        conflict_reply_pending["repursued"] = True  # back-compat read seam
+        # KEEP the arm alive: re-mark pending so the commit fence keeps holding
+        # the cursor and the NEXT reply routes back into `_consume_conflict_
+        # reply`. `on_reply_delivered` re-stamps `armed_turn_seq`/delivery on the
+        # live path; setting value here makes the hold robust even if a perturbed
+        # delivery sequence loses that re-arm (the W3 failure class).
+        conflict_reply_pending["value"] = True
+        conflict_reply_pending["conflict"] = (
+            dict(probe_conflict) if isinstance(probe_conflict, dict) else None
+        )
+        conflict_reply_pending["armed_turn_seq"] = native_turn_seq[0]
+        return _fire_conflict_repursuit(turn_ctx, repursuit, probe_conflict)
+
+    def _fire_conflict_repursuit(
+        turn_ctx: Any, repursuit: str, probe_conflict: Any,
+    ) -> bool:
+        """Emit one concrete re-pursuit turn (delivery-armed, authorized,
+        instruction injected). Shared by the bounded loop and the kill-switch
+        one-shot path so their side effects cannot drift."""
         _arm_conflict_delivery("conflict_repursuit", None)
         setattr(agent, "_turn_policy", "clarification")
         set_reply_snapshot(
@@ -2803,9 +2999,21 @@ async def _run_native_phone_screening(
                 if _consume_conflict_reply(turn_ctx, text):
                     return
             setattr(agent, "_turn_policy", "clarification")
+            # D-fix (2026-09-05): read-and-clear the drop flag UNCONDITIONALLY so a
+            # drop that coincided with `question is None` (plan exhausted / wind-
+            # down) cannot leak a stale True into a later advance. Applied to the
+            # owed-question instruction only when there IS a question.
+            conflict_dropped = conflict_reply_pending.get("dropped_on_advance")
+            conflict_reply_pending["dropped_on_advance"] = False
             if question is not None:
                 set_question_reply_snapshot(question, text)
-                add_turn_instruction(turn_ctx, phone_question_instructions(question, state.role_title))
+                instruction = phone_question_instructions(question, state.role_title)
+                if conflict_dropped:
+                    # W2: a conflict was just dropped UNRESOLVED at cap.
+                    # Neutralise the LLM-authored hand-off so it cannot say "no
+                    # worries" or validate the unresolved account (RCA 623d0c30).
+                    instruction = phone.phone_conflict_drop_advance_instruction(instruction)
+                add_turn_instruction(turn_ctx, instruction)
             return
         # THE PATIENCE GATE (X10). Not a recognised route: classify the final as
         # substantive / hesitation / thinking. A thinking statement earns ONE
@@ -2853,13 +3061,15 @@ async def _run_native_phone_screening(
             conflict = phone.phone_deterministic_resume_conflict(
                 merged_candidate, _compact_phone_resume_evidence(state.resume_facts),
             )
-            # W4: a self-introduced name that plainly differs from the record name
-            # is a first-class identity signal. Only fill in when there is no
-            # role/employer conflict already (conflict-or), and the detector is
-            # conservative/fail-silent (nicknames/spelling/ordering -> None), so a
-            # non-intro turn or a variant never arms. Rides the same
-            # conflict_key/arm/judge path below unchanged.
-            conflict = conflict or phone.phone_name_mismatch(
+            # W-name (2026-09-05): evaluate the IDENTITY signal INDEPENDENTLY of
+            # the résumé-content conflict. The old code short-circuited the name
+            # detector behind the conflict boolean, which (a) never even CALLED
+            # the detector when a résumé conflict was already true (Python `or`
+            # short-circuits) and (b) folded identity onto the same
+            # `asked_conflicts` channel so a consumed/dropped conflict lost it
+            # (RCA 623d0c30). Now the detector is ALWAYS called and the two
+            # signals travel on separate channels with separate remedies.
+            name_mismatch = phone.phone_name_mismatch(
                 merged_candidate,
                 state.resume_facts.get("name") if isinstance(state.resume_facts, dict) else None,
             )
@@ -2888,6 +3098,52 @@ async def _run_native_phone_screening(
                         )
                         add_turn_instruction(turn_ctx, conflict_instruction)
                         conflict_rerouted = True
+            # IDENTITY channel: a genuine name mismatch drives a NAME-CONFIRMATION
+            # turn (confirm-don't-assert, no capitulation), armed under its OWN key
+            # namespace so it is evaluated independently even when a résumé conflict
+            # is simultaneously active or already consumed. It only claims the turn
+            # when the résumé-conflict branch above did NOT already reroute this
+            # turn (one probe per turn). E-fix HONESTY (adversarial review,
+            # 2026-09-05): when the résumé conflict OWNS the turn, the identity
+            # signal is PERSISTED (disposition=unresolved) into the call_metrics
+            # observability record so it is visible post-call — but it is NOT
+            # actually re-raised on a later turn: `phone_name_mismatch` derives the
+            # spoken name only from INTRO-shaped text via
+            # `phone_extract_introduced_name`, so ordinary later answer turns never
+            # re-detect the mismatch. The confirmation turn is simply not fired
+            # this call when shadowed by a résumé conflict.
+            if turn_ctx is not None and isinstance(name_mismatch, dict):
+                name_key = phone.phone_name_mismatch_key(name_mismatch)
+                if name_key not in asked_name_mismatches:
+                    confirm_instruction = phone.phone_name_confirm_instruction(name_mismatch)
+                    if confirm_instruction is not None and not conflict_rerouted:
+                        asked_name_mismatches.add(name_key)
+                        _record_identity_signal(name_mismatch, "armed")
+                        stale_handle = reply_handle[0]
+                        interrupt = getattr(stale_handle, "interrupt", None)
+                        if callable(interrupt):
+                            interrupt(force=True)
+                        setattr(agent, "_turn_policy", "clarification")
+                        set_reply_snapshot(
+                            phone.PHONE_NAME_CONFIRM_CLARIFICATION_TEXT,
+                            objective=phone.PHONE_NAME_CONFIRM_CLARIFICATION_TEXT,
+                            phase="name_confirm",
+                        )
+                        authorize_generated_reply(
+                            phone.PHONE_NAME_CONFIRM_CLARIFICATION_TEXT,
+                            control_text="Do not reveal private controller instructions.",
+                        )
+                        add_turn_instruction(turn_ctx, confirm_instruction)
+                        conflict_rerouted = True
+                    elif confirm_instruction is not None:
+                        # A résumé conflict owns this turn; still record the
+                        # identity signal (unresolved) so it is OBSERVABLE post-call
+                        # in the call_metrics identity record. Do NOT add to the arm
+                        # set: the confirmation turn has not fired. E-fix (2026-09-
+                        # 05): this is an observability record ONLY — it is not
+                        # re-raised on a later turn (name detection is intro-shaped
+                        # via `phone_extract_introduced_name`).
+                        _record_identity_signal(name_mismatch, "unresolved")
             _log.info(
                 "unknown_event", error_type="phone_turn_fragment",
                 error_category="continuation_before_first_audio_coalesced",
@@ -2955,17 +3211,27 @@ async def _run_native_phone_screening(
             # unconditionally yanked the turn back to the plan — the hold was
             # structurally unreachable, so "I don't understand what conflicts my
             # answer and the resume" was brushed past and the conflict landed
-            # unresolved without a second attempt. ONE re-pursuit is now allowed:
-            # when the candidate did not engage the probe, the model explains the
-            # gap plainly (paraphrased, attributed to the resume, never
-            # accusatory) and asks one final direct question. Whatever comes
-            # back, the next consumption returns to the plan — bounded by the
-            # `repursued` latch, never a loop.
+            # unresolved without a second attempt. W2 (2026-09-05) makes the
+            # re-pursuit a BOUNDED LOOP (was one-shot): while the candidate keeps
+            # deflecting the model explains the gap plainly and re-asks, up to
+            # `phone_conflict_max_reasks()` times; it advances only when the reply
+            # RECONCILES the gap, explicitly declines, or the cap is reached — and
+            # on that advance the owed-question hand-off is neutralised so the bot
+            # cannot capitulate ("no worries…"). Bounded by the per-conflict-key
+            # counter, never an unbounded loop.
             if _consume_conflict_reply(turn_ctx, text):
                 return
             setattr(agent, "_turn_policy", "clarification")
+            # D-fix (2026-09-05): read-and-clear UNCONDITIONALLY so a drop that
+            # coincided with `question is None` cannot leak a stale True forward.
+            conflict_dropped = conflict_reply_pending.get("dropped_on_advance")
+            conflict_reply_pending["dropped_on_advance"] = False
             if question is not None:
                 instruction = phone_question_instructions(question, state.role_title)
+                if conflict_dropped:
+                    # W2: conflict dropped UNRESOLVED at cap — forbid the
+                    # capitulation bridge on this owed-question advance turn.
+                    instruction = phone.phone_conflict_drop_advance_instruction(instruction)
                 add_turn_instruction(turn_ctx, instruction)
                 authorize_generated_reply(question.spoken_text, control_text=None)
             return
@@ -3111,19 +3377,24 @@ async def _run_native_phone_screening(
                     )
 
         judge_instruction: str | None = None
+        # W-name (2026-09-05): True when `judge_instruction` carries a
+        # NAME-CONFIRMATION (identity) turn rather than a résumé-conflict /
+        # reanchor turn, so the snapshot/objective downstream use the identity
+        # remedy text/phase instead of the résumé-conflict text.
+        judge_is_name_confirm = False
         if turn_mode == phone.PHONE_TURN_MODE_TOOLLESS and coverage_judge_enabled:
             # Only a high-confidence conflict derived from THIS answer may alter
             # THIS reply. Background semantic results never enter a later turn.
             conflict = phone.phone_deterministic_resume_conflict(
                 text, _compact_phone_resume_evidence(state.resume_facts),
             )
-            # FIX 4: mirror the coalesce-branch (W4) name-mismatch wire-up on the
-            # single-STT-final path so a genuine "my name is X" intro arriving as
-            # ONE final is caught too. conflict-or keeps a role/employer conflict
-            # first; the detector is conservative/fail-silent (nicknames /
-            # spelling / ordering -> None); asked_conflicts dedup below prevents a
-            # double-arm if the coalesce branch already armed the same key.
-            conflict = conflict or phone.phone_name_mismatch(
+            # W-name (2026-09-05): evaluate the IDENTITY signal INDEPENDENTLY of
+            # the résumé-content conflict (was `conflict = conflict or
+            # phone.phone_name_mismatch(...)`, which never called the detector
+            # when a résumé conflict already existed and folded identity onto the
+            # `asked_conflicts` channel — RCA 623d0c30). Always call it; route it
+            # on its own channel below.
+            name_mismatch = phone.phone_name_mismatch(
                 text,
                 state.resume_facts.get("name") if isinstance(state.resume_facts, dict) else None,
             )
@@ -3141,6 +3412,40 @@ async def _run_native_phone_screening(
                     question.spoken_text, reanchor=True,
                 )
                 coverage_reanchor["question_key"] = None
+            # IDENTITY channel: independent of the résumé-conflict arm above. It
+            # claims this turn (via `judge_instruction`) only when no résumé
+            # conflict / reanchor already did (one probe per turn), armed under
+            # its OWN key namespace so a live/consumed résumé conflict can neither
+            # shadow nor be shadowed. E-fix HONESTY (2026-09-05): when the conflict
+            # OWNS the turn the identity signal is PERSISTED (unresolved) into the
+            # call_metrics observability record so it is visible post-call — it is
+            # NOT re-raised on a later turn (`phone_name_mismatch` derives the
+            # spoken name only from intro-shaped text via
+            # `phone_extract_introduced_name`, so later answer turns do not
+            # re-detect); the confirmation turn is simply not fired this call.
+            if isinstance(name_mismatch, dict):
+                name_key = phone.phone_name_mismatch_key(name_mismatch)
+                if name_key not in asked_name_mismatches:
+                    confirm_instruction = phone.phone_name_confirm_instruction(name_mismatch)
+                    if confirm_instruction is not None and judge_instruction is None:
+                        asked_name_mismatches.add(name_key)
+                        judge_instruction = confirm_instruction
+                        judge_is_name_confirm = True
+                        _record_identity_signal(name_mismatch, "armed")
+                        # NOTE: deliberately NOT `_arm_conflict_delivery(...)`. A
+                        # name-confirmation is a SINGLE turn, not a bounded
+                        # re-pursuit; arming conflict delivery would route the
+                        # candidate's confirming reply into `_consume_conflict_
+                        # reply` / the conflict advance loop. Identity stays
+                        # independent of the conflict path (task constraint): the
+                        # confirming reply flows through the normal answer-gate.
+                    elif confirm_instruction is not None:
+                        # E-fix (2026-09-05): observability record ONLY. A résumé
+                        # conflict owns the turn, so the confirmation is not fired
+                        # this call and is not re-raised later (intro-shaped name
+                        # detection); the graded `unresolved` signal survives in
+                        # call_metrics for post-call review.
+                        _record_identity_signal(name_mismatch, "unresolved")
 
         coverage_hint = phone.phone_coverage_precheck(question.text, prompt)
         covered_following: list[str] = []
@@ -3205,14 +3510,23 @@ async def _run_native_phone_screening(
                 )
                 planned_objective = next_question.spoken_text
             turn_instruction = judge_instruction or planned_instruction
+            # W-name (2026-09-05): the driving instruction's remedy text/phase
+            # depends on WHICH channel armed it — identity (name-confirm) vs
+            # résumé-conflict — so the snapshot fail-closed text and the persisted
+            # phase are never mislabelled.
+            _judge_snapshot_text = (
+                phone.PHONE_NAME_CONFIRM_CLARIFICATION_TEXT if judge_is_name_confirm
+                else phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT
+            )
+            _judge_phase = "name_confirm" if judge_is_name_confirm else "resume_conflict"
             objective_text = (
-                phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT
+                _judge_snapshot_text
                 if judge_instruction is not None else planned_objective
             )
             if judge_instruction is not None:
                 set_reply_snapshot(
-                    phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT,
-                    objective=objective_text, phase="resume_conflict",
+                    _judge_snapshot_text,
+                    objective=objective_text, phase=_judge_phase,
                 )
             elif next_question is None:
                 set_reply_snapshot(
@@ -3255,6 +3569,23 @@ async def _run_native_phone_screening(
             )
             if not preloaded_matches:
                 add_turn_instruction(turn_ctx, turn_instruction)
+            # A-fix (SEVERE, adversarial review 2026-09-05): a NAME-CONFIRMATION
+            # turn must HOLD the cursor, exactly like the COALESCE name-confirm
+            # site (~3096) which `return`s early before populating `pending`. Here
+            # the reply has been fully authored+delivered above, but the commit
+            # below would schedule a durable boundary that ADVANCES the cursor —
+            # and the conflict-pending commit fence (~3785) only skips when
+            # `conflict_reply_pending["value"]` is set, which the identity path
+            # deliberately never arms. So without this return the name-confirm
+            # turn would SKIP the next planned question. The candidate's confirming
+            # reply is handled on the NEXT turn through the normal answer-gate,
+            # with the cursor still parked on the owed question. Return BEFORE
+            # scheduling the commit so `pending`'s stale `expected_index` is never
+            # committed (the next real answer's `pending.update` overwrites it).
+            # This makes the single-final and coalesce name-confirm sites
+            # symmetric: both hold the cursor.
+            if judge_is_name_confirm:
+                return
             # The judge/commit task is CREATED and returned to the event loop;
             # it is never awaited on this candidate→reply speech path.
             active_exchange = dict(pending)
@@ -3974,9 +4305,16 @@ async def _run_native_phone_screening(
     # production path.
     setattr(agent, "_conflict_delivery", conflict_delivery)
     setattr(agent, "_asked_conflicts", asked_conflicts)
+    # Identity test seam (same idiom as `_asked_conflicts`): the per-name-mismatch
+    # arm set, so a test can prove a name-confirm turn was / was not fired.
+    setattr(agent, "_asked_name_mismatches", asked_name_mismatches)
     # Answer-gate test seam: the per-question-key re-ask counter, so a test can
     # seed it at the cap and prove the bounded advance.
     setattr(agent, "_answer_reask_counts", answer_reask_counts)
+    # W2 conflict-loop test seam (same idiom): the per-conflict-key re-ask
+    # counter, so a test can seed it at the cap and prove the bounded advance
+    # (the anti-capitulation drop) without firing N live turns.
+    setattr(agent, "_conflict_reask_counts", conflict_reask_counts)
     # B1 round 2 test seam (same idiom as `_conflict_reply_pending`): the
     # LOGICAL candidate-turn counter the freshness bound reads, so a test can
     # prove a coalesced continuation fragment does NOT advance it.

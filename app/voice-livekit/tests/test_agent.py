@@ -789,40 +789,176 @@ class TestPhoneInstructionStateProjection(unittest.TestCase):
 
 
 class TestSingleFinalNameMismatchWireUp(unittest.TestCase):
-    """FIX 4 (adversarial-review repair). `phone_name_mismatch` must be wired at
-    the single-STT-final conflict site too, not only the coalesce branch, so a
-    genuine "my name is X" intro arriving as ONE final is still caught.
+    """The identity name-mismatch signal must be wired at BOTH turn-hook sites
+    (coalesce branch AND single-STT-final), evaluated INDEPENDENTLY of the
+    résumé-content conflict (no short-circuit `or`), and driven onto its own
+    remedy channel (name-confirmation). RCA call 623d0c30.
     """
 
     def test_single_final_composition_detects_name_conflict(self):
-        # The exact idiom the single-final path runs: a deterministic role/
-        # employer conflict comes back None (no role contradiction in this turn),
-        # and the name-mismatch fallback supplies the identity conflict.
+        # The single-final path evaluates the name mismatch INDEPENDENTLY of the
+        # résumé conflict. A genuine intro that differs from the record name
+        # yields a graded identity signal (no role/employer contradiction here).
         phone = agent_mod.phone
         resume_facts = {"name": "Rijo"}
         text = "Hi there, my name is Christo, thanks for calling."
         deterministic = phone.phone_deterministic_resume_conflict(text, resume_facts)
         self.assertIsNone(deterministic)  # no role/employer contradiction here
-        conflict = deterministic or phone.phone_name_mismatch(
+        mismatch = phone.phone_name_mismatch(
             text,
             resume_facts.get("name") if isinstance(resume_facts, dict) else None,
         )
-        self.assertIsInstance(conflict, dict)
-        self.assertIn("rijo", conflict["resume_fact"])
-        self.assertIn("christo", conflict["spoken_claim"])
+        self.assertIsInstance(mismatch, dict)
+        self.assertEqual(mismatch.get("signal"), "name_mismatch")
+        self.assertIn("rijo", mismatch["resume_fact"])
+        self.assertIn("christo", mismatch["spoken_claim"])
 
     def test_both_conflict_sites_wire_the_name_mismatch(self):
-        # Static guard: the name-mismatch fallback must appear at BOTH conflict
-        # detection sites in agent.py (coalesce branch AND single-STT-final).
-        # A wire-up dropped from one site would silently regress FIX 4.
+        # Static guard: the name-mismatch detector must be evaluated at BOTH
+        # turn-hook sites in agent.py (coalesce branch AND single-STT-final).
         import inspect
         source = inspect.getsource(agent_mod)
         occurrences = source.count("phone.phone_name_mismatch(")
         self.assertGreaterEqual(
             occurrences, 2,
-            "phone_name_mismatch must be wired at both conflict sites "
+            "phone_name_mismatch must be evaluated at both turn-hook sites "
             f"(found {occurrences})",
         )
+
+    def test_name_mismatch_evaluated_independently_of_conflict(self):
+        # THE FIX. The old short-circuit `conflict = conflict or
+        # phone.phone_name_mismatch(...)` never evaluated the name signal when a
+        # résumé conflict was already true. It must be GONE from the source, and
+        # the detector must be assigned to its OWN variable, not folded into the
+        # conflict boolean. Proven two ways: (1) no `or phone.phone_name_mismatch`
+        # substring survives; (2) both sites bind the detector to `name_mismatch`.
+        import inspect
+        source = inspect.getsource(agent_mod)
+        # The short-circuit fold is gone (allow it only inside a comment that
+        # documents the removal: those comment lines contain "...)" not a live
+        # call, so we assert no LIVE `or phone.phone_name_mismatch(` remains).
+        self.assertNotIn(
+            "conflict or phone.phone_name_mismatch(", source,
+            "the résumé-conflict short-circuit that suppressed the name signal "
+            "must be removed (RCA 623d0c30)",
+        )
+        # Both sites bind the detector to an independent variable.
+        self.assertGreaterEqual(
+            source.count("name_mismatch = phone.phone_name_mismatch("), 2,
+            "both sites must evaluate the name mismatch into its own variable",
+        )
+        # Behavioral, driving the REAL call-site inputs (2026-09-05 rewrite — the
+        # old version built a `live_conflict` dict it never used and only called
+        # the isolated detector). Here we feed ONE turn text that is BOTH a résumé
+        # conflict AND a name introduction — the exact adversarial shape the
+        # short-circuit `conflict = conflict or phone_name_mismatch(...)` used to
+        # drop — through the two real detectors the single-final call-site runs,
+        # in the same order, and prove the name signal survives the presence of a
+        # live conflict. The full turn-hook drive (identity persisted `unresolved`
+        # into call_metrics when the conflict claims the turn; the name-confirm
+        # turn firing + cursor HOLD when it doesn't) is exercised end-to-end in
+        # test_phone_gate.py::TestNameMismatchTurnHook.
+        phone = agent_mod.phone
+        resume_facts = {"name": "Rijo", "current_role": {"title": "Data Engineer"}}
+        combined_turn = (
+            "My name is Christo. I spent two years in sales and advisory roles."
+        )
+        # The call-site evaluates the résumé conflict FIRST …
+        live_conflict = phone.phone_deterministic_resume_conflict(
+            combined_turn, resume_facts)
+        self.assertIsInstance(
+            live_conflict, dict,
+            "the combined turn must produce a live résumé conflict",
+        )
+        # … and then the name detector, INDEPENDENTLY (not gated on the conflict
+        # being falsy). With a live conflict active it STILL returns the signal.
+        mismatch = phone.phone_name_mismatch(combined_turn, resume_facts["name"])
+        self.assertIsInstance(
+            mismatch, dict,
+            "name mismatch must be evaluated even when a résumé conflict is "
+            "simultaneously active on the SAME turn (RCA 623d0c30)",
+        )
+        self.assertEqual(mismatch.get("signal"), "name_mismatch")
+        self.assertEqual(mismatch.get("spoken"), "christo")
+        self.assertEqual(mismatch.get("record"), "rijo")
+
+    def test_name_mismatch_arms_separate_key(self):
+        # The identity signal arms under `phone_name_mismatch_key` — a DISTINCT
+        # namespace from `phone_conflict_key` — so it neither shadows nor is
+        # shadowed by a résumé conflict.
+        phone = agent_mod.phone
+        mismatch = phone.phone_name_mismatch("my name is Christo", "Rijo")
+        conflict = {"resume_fact": "record name: rijo", "spoken_claim": "introduced as christo"}
+        name_key = phone.phone_name_mismatch_key(mismatch)
+        conflict_key = phone.phone_conflict_key(conflict)
+        self.assertNotEqual(
+            name_key, conflict_key,
+            "identity key must not collide with the résumé-conflict key",
+        )
+        self.assertTrue(name_key.startswith("name_mismatch:"))
+        # The source arms the identity signal against its OWN latch set, not
+        # `asked_conflicts`.
+        import inspect
+        source = inspect.getsource(agent_mod)
+        self.assertIn("asked_name_mismatches", source)
+        self.assertIn("name_key not in asked_name_mismatches", source)
+
+    def test_name_mismatch_persists_graded_signal(self):
+        # The signal is GRADED (spoken/record root names + similarity ratio +
+        # disposition), not a bare bool. The detector supplies the grade; the
+        # observability summary surfaces it.
+        phone = agent_mod.phone
+        mismatch = phone.phone_name_mismatch("my name is Christo", "Rijo")
+        self.assertIsInstance(mismatch, dict)
+        self.assertEqual(mismatch["spoken"], "christo")
+        self.assertEqual(mismatch["record"], "rijo")
+        ratio = float(mismatch["ratio"])
+        self.assertTrue(0.0 <= ratio <= 1.0)
+        # The observability accumulator records a graded entry, reduced to a
+        # {spoken, record, ratio, disposition} list at summary time.
+        metrics = agent_mod._new_phone_call_metrics()
+        self.assertIn("identity_signals", metrics)
+        key = phone.phone_name_mismatch_key(mismatch)
+        metrics["identity_signals"][key] = {
+            "spoken": mismatch["spoken"], "record": mismatch["record"],
+            "ratio": mismatch["ratio"], "disposition": "armed",
+        }
+        summary = agent_mod._summarize_phone_call_metrics(metrics)
+        self.assertIn("identity_signals", summary)
+        entry = summary["identity_signals"][0]
+        self.assertEqual(entry["spoken"], "christo")
+        self.assertEqual(entry["record"], "rijo")
+        self.assertEqual(entry["disposition"], "armed")
+        self.assertIsNotNone(entry["ratio"])
+        # It is not a bare boolean.
+        self.assertNotIsInstance(summary["identity_signals"], bool)
+
+    def test_name_mismatch_drives_confirmation_not_assertion(self):
+        # The remedy is a NAME-CONFIRMATION turn: the instruction asks the
+        # candidate to confirm the name, asserts NEITHER name as fact, and does
+        # NOT capitulate. It must NOT be the résumé-conflict "does not line up
+        # with their resume" instruction.
+        phone = agent_mod.phone
+        mismatch = phone.phone_name_mismatch("my name is Christo", "Rijo")
+        instruction = phone.phone_name_confirm_instruction(mismatch)
+        self.assertIsInstance(instruction, str)
+        low = instruction.lower()
+        # Confirm-the-name affordance.
+        self.assertIn("confirm", low)
+        # Does not assert either name as fact / does not accuse.
+        self.assertIn("do not assert either name", low)
+        self.assertIn("never accuse", low)
+        # No capitulation ("brush it off" is explicitly forbidden).
+        self.assertIn("do not brush it off", low)
+        # It is NOT the résumé-conflict remedy.
+        self.assertNotIn("does not line up with their resume", low)
+        # The single-final site routes this via a name-confirm phase, not a
+        # résumé-conflict phase, when the identity channel owns the turn.
+        import inspect
+        source = inspect.getsource(agent_mod)
+        self.assertIn("phone.phone_name_confirm_instruction(", source)
+        self.assertIn("PHONE_NAME_CONFIRM_CLARIFICATION_TEXT", source)
+        self.assertIn('phase="name_confirm"', source)
 
 
 if __name__ == "__main__":
