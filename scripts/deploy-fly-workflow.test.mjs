@@ -358,11 +358,21 @@ ok(!/FLY_API_TOKEN_API/.test(phone) && !/FLY_API_TOKEN_VOICE\b/.test(phone),
     // `awk '$NF=="stopped"'` parse passed here yet returned EMPTY against real
     // flyctl and silently failed every orchestration deploy (RCA 2026-09-06).
     // A stub that does not model the real wire format is worse than no test.
-    //   pool: "one"  -> one machine m1 (stopped, or started after a start)
-    //         "none" -> empty pool (no machine to start -> must fail closed)
+    //   pool: "one"     -> one machine m1 (stopped, or started after a start)
+    //         "started" -> one machine m1 ALREADY started (no stopped machine),
+    //                      modelling a lane whose only machine is always-on
+    //         "none"    -> empty pool (no machine to start -> must fail closed)
+    //   logsMode "stale" models an always-on machine registered in the PAST
+    //   (2019, before any watermark) that emits a FRESH registration only AFTER
+    //   a deploy (the deploy restarts the worker). This is essential: the old
+    //   stub's "registered" mode emitted a future-dated line ALWAYS, so the
+    //   watermarked pre-deploy proof always passed here yet failed in production
+    //   against a real already-started machine (RCA 2026-09-06). A stub that
+    //   cannot reproduce a stale pre-deploy registration is a false green.
     const calls = path.join(dir, "calls.log");
     const bin = path.join(dir, "flyctl");
     const started = JSON.stringify(path.join(dir, "started"));
+    const deployed = JSON.stringify(path.join(dir, "deployed"));
     writeFileSync(bin, [
       "#!/usr/bin/env bash",
       `echo "$@" >> ${JSON.stringify(calls)}`,
@@ -372,11 +382,15 @@ ok(!/FLY_API_TOKEN_API/.test(phone) && !/FLY_API_TOKEN_VOICE\b/.test(phone),
       '  logs)',
       `    case "${logsMode}" in`,
       "      registered) echo '2099-01-01T00:00:00 registered worker id=stub' ;;",
+      // Stale pre-deploy (2019 < any watermark); a deploy restarts the worker →
+      // a fresh (2099) registration the post-deploy proof accepts.
+      `      stale) if [ -f ${deployed} ]; then echo '2099-01-01T00:00:00 registered worker id=stub'; else echo '2019-01-01T00:00:00 registered worker id=stub'; fi ;;`,
       "      silent) : ;;",
       "    esac ;;",
       "  machine)",
       '    if [ "$2" = "list" ]; then',
       `      st=stopped; [ -f ${started} ] && st=started`,
+      `      [ "${pool}" = "started" ] && st=started`,
       `      if [ "${pool}" = "none" ]; then`,
       '        if $want_json; then echo "[]"; else echo "ID  NAME  STATE  REGION  SIZE"; fi',
       "      elif $want_json; then",
@@ -390,7 +404,7 @@ ok(!/FLY_API_TOKEN_API/.test(phone) && !/FLY_API_TOKEN_VOICE\b/.test(phone),
       `    elif [ "$2" = "start" ]; then touch ${started}; `,
       `    elif [ "$2" = "stop" ]; then rm -f ${started}; `,
       "    fi ;;",
-      `  deploy) exit ${deployRc} ;;`,
+      `  deploy) touch ${deployed}; exit ${deployRc} ;;`,
       "esac",
       "exit 0",
     ].join("\n"));
@@ -465,6 +479,32 @@ ok(!/FLY_API_TOKEN_API/.test(phone) && !/FLY_API_TOKEN_VOICE\b/.test(phone),
     ok(/no pool machine to start/.test(r.out),
       "empty pool must name the true cause (no pool machine), not a registration miss");
     ok(!/machine start/.test(r.callLog), "an empty pool must not attempt to start a machine");
+    rmSync(stub.dir, { recursive: true, force: true });
+  }
+  // (vi) RELY-ON-STARTED with a STALE pre-deploy registration must SUCCEED.
+  //      RCA 2026-09-06: a lane whose only machine is already-started (always-on)
+  //      has a registration that PREDATES the watermark, so the pre-deploy proof
+  //      can never pass. We skip it (we started nothing) and let the post-deploy
+  //      proof (fresh registration after the deploy restart) gate the new image.
+  //      This exact case failed EVERY browser orchestration deploy.
+  {
+    const stub = makeStub({ pool: "started", logsMode: "stale", deployRc: 0 });
+    const r = runScript(stub);
+    ok(r.code === 0, `rely-on-started with a stale pre-deploy registration must SUCCEED, got ${r.code}:\n${r.out}`);
+    ok(!/machine start/.test(r.callLog), "rely-on-started must NOT start a machine (none stopped)");
+    ok(/deploy --remote-only --config/.test(r.callLog), "rely-on-started must still deploy the new image");
+    ok(/skipping the watermarked pre-deploy proof/.test(r.out),
+      "must explain it skipped the pre-deploy proof for an already-started machine");
+    rmSync(stub.dir, { recursive: true, force: true });
+  }
+  // (vii) …but the POST-deploy proof STILL fails closed if the deployed image
+  //       never registers — the skip is pre-deploy-only, the new-image gate holds.
+  {
+    const stub = makeStub({ pool: "started", logsMode: "silent", deployRc: 0 });
+    const r = runScript(stub);
+    ok(r.code !== 0, `rely-on-started must STILL fail closed if the deployed image never registers, got ${r.code}:\n${r.out}`);
+    ok(/deployed image did not register/.test(r.out),
+      "the failure must be the POST-deploy new-image gate, not the skipped pre-proof");
     rmSync(stub.dir, { recursive: true, force: true });
   }
 
