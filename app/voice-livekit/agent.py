@@ -6574,11 +6574,24 @@ async def _run_session(
     # HIGH SEC-13: Build prompt from server-verified worker context,
     # never from client-visible room/participant metadata.
     if worker_ctx is not None:
+        # Browser-lane resume evidence (owner-approved 2026-09-07): derive the
+        # prompt facts EXACTLY the way the phone lane does — the same compaction
+        # (_compact_phone_resume_evidence) feeding the same formatter
+        # (prompting.format_resume_facts) — so the shared prompt's RESUME CHECK
+        # directive activates on real facts. When the API sends no evidence the
+        # surface stays byte-identical to before: facts None → "(not provided)".
+        _browser_evidence = _compact_phone_resume_evidence(
+            getattr(worker_ctx, "candidate_evidence", {}),
+        )
         sys_text = system_prompt(
             candidate_name=worker_ctx.candidate_name,
             role_title=worker_ctx.role_title,
             role_focus=worker_ctx.role_focus,
-            resume_facts=None,
+            resume_facts=(
+                prompting_format_resume_facts(_browser_evidence)
+                if _browser_evidence
+                else None
+            ),
             questions=prompting_format_questions(worker_ctx.screening_template),
             interviewer_instructions=worker_ctx.interviewer_instructions,
         )

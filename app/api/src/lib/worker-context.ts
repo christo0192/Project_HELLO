@@ -32,9 +32,11 @@ export interface WorkerContext {
   screening_template: unknown[];
   interviewer_instructions: string;
   /**
-   * Phone rooms only: an allowlisted structured projection of parsed resume
-   * evidence. Browser rooms receive an empty object, so their prompt and data
-   * surface remain unchanged. Raw resume text and contact fields never cross.
+   * An allowlisted structured projection of parsed resume evidence for BOTH
+   * screening lanes: phone rooms (phone-<uuid>) and browser rooms
+   * (screening-<uuid>) receive the identical bounded payload so the shared
+   * RESUME CHECK prompt directive can activate in either lane (owner-approved
+   * 2026-09-07). Raw resume text and contact fields never cross.
    */
   candidate_evidence: Record<string, unknown>;
 }
@@ -52,17 +54,25 @@ export interface WorkerContextResultErr {
 export type WorkerContextResult = WorkerContextResultOk | WorkerContextResultErr;
 
 const PHONE_ROOM_RE = /^phone-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+// Browser/WebRTC rooms are named by roomNameForSession() in room-provisioning.ts
+// (`screening-<sessionId>`); mirror the phone regex's strict UUID shape.
+const BROWSER_ROOM_RE = /^screening-[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 /**
- * Return only the structured resume fields the phone prompt is allowed to see.
+ * Return only the structured resume fields the screening prompt is allowed to
+ * see. Both lanes — phone (`phone-<uuid>`) and browser (`screening-<uuid>`) —
+ * receive the SAME bounded allowlist, so the shared RESUME CHECK directive can
+ * activate in the browser lane too (owner-approved 2026-09-07). Any other room
+ * name yields an empty object.
  *
- * The phone agent must be constructed with its complete prompt before its
- * first generation; returning raw `candidates.parsed` would solve that timing
+ * The agent must be constructed with its complete prompt before its first
+ * generation; returning raw `candidates.parsed` would solve that timing
  * problem by creating a much larger privacy problem. Keep the allowlist next
  * to the authenticated worker-context boundary instead.
  */
-function phoneCandidateEvidence(parsed: unknown, roomName: string): Record<string, unknown> {
-  if (!PHONE_ROOM_RE.test(roomName) || !parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+function screeningCandidateEvidence(parsed: unknown, roomName: string): Record<string, unknown> {
+  const allowedRoom = PHONE_ROOM_RE.test(roomName) || BROWSER_ROOM_RE.test(roomName);
+  if (!allowedRoom || !parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
     return {};
   }
   const source = parsed as Record<string, unknown>;
@@ -150,8 +160,8 @@ export async function resolveWorkerContext(
     return { ok: false, code: ERR_SESSION_NOT_ACTIVE };
   }
 
-  // Resolve name plus parsed structure. `phoneCandidateEvidence` immediately
-  // projects the phone-only allowlist; raw/contact fields never cross the API.
+  // Resolve name plus parsed structure. `screeningCandidateEvidence` immediately
+  // projects the bounded allowlist; raw/contact fields never cross the API.
   const { data: candidate } = await supabase
     .from('candidates')
     .select('name,parsed')
@@ -183,7 +193,7 @@ export async function resolveWorkerContext(
       role_required_skills: Array.isArray(role?.required_skills) ? role.required_skills : [],
       screening_template: Array.isArray(role?.screening_template) ? role.screening_template : [],
       interviewer_instructions: typeof role?.interviewer_instructions === 'string' ? role.interviewer_instructions : '',
-      candidate_evidence: phoneCandidateEvidence(candidate?.parsed, roomName),
+      candidate_evidence: screeningCandidateEvidence(candidate?.parsed, roomName),
     },
   };
 }
