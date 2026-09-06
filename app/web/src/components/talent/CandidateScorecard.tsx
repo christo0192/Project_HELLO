@@ -263,6 +263,9 @@ function WeightItem({ label, weight }: { label: string; weight: string }) {
   );
 }
 
+/** Where the Role fit group is rendered: inside the Signals grid, or by the host. */
+export type ScorecardRoleFit = 'inline' | 'none';
+
 export interface CandidateScorecardProps {
   assessment: Assessment;
   /**
@@ -272,12 +275,18 @@ export interface CandidateScorecardProps {
   headingLevel?: HeadingLevel;
   /** Where Resume conflicts + Summary go. See `ScorecardNarrative`. */
   narrative?: ScorecardNarrative;
+  /**
+   * `none` leaves Role fit out of the Signals grid so the host can render
+   * `CandidateScorecardRoleFit` as a full-width horizontal row instead.
+   */
+  roleFit?: ScorecardRoleFit;
 }
 
 export function CandidateScorecard({
   assessment,
   headingLevel = 3,
   narrative = 'inline',
+  roleFit = 'inline',
 }: CandidateScorecardProps) {
   const signalsId = useId();
   // Identical field + fallback chain to components/Scorecard.tsx.
@@ -433,6 +442,7 @@ export function CandidateScorecard({
             <Meter label="Score" value={motivation?.score ?? 0} />
           </Group>
 
+          {roleFit === 'inline' && (
           <Group
             title="Role fit"
             weight={SECTION_WEIGHTS.role_fit}
@@ -462,6 +472,7 @@ export function CandidateScorecard({
               />
             </SurfaceCard>
           </Group>
+          )}
         </div>
       </SurfaceCard>
 
@@ -475,10 +486,66 @@ export function CandidateScorecard({
   );
 }
 
+export interface CandidateScorecardRoleFitProps {
+  assessment: Assessment;
+  headingLevel?: HeadingLevel;
+  className?: string;
+}
+
+/**
+ * Role fit as a full-width horizontal row: fit-score meter on the left, the
+ * three tag groups side by side, notes beneath. Rendered by hosts that pass
+ * `roleFit="none"` to the scorecard.
+ */
+export function CandidateScorecardRoleFit({
+  assessment,
+  headingLevel = 3,
+  className,
+}: CandidateScorecardRoleFitProps) {
+  const headingId = useId();
+  const { role_fit } = assessment;
+  return (
+    <SurfaceCard as="section" labelledBy={headingId} className={cx('p-4 sm:p-5', className)}>
+      <div className="mb-3 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5">
+        <Heading level={headingLevel} id={headingId} className={CARD_TITLE}>
+          Role fit
+        </Heading>
+        <span className="text-xs text-[var(--c-ink-secondary)]">
+          Weight{' '}
+          <span className="font-mono tabular-nums text-[var(--c-ink-secondary)]">
+            {SECTION_WEIGHTS.role_fit}
+          </span>
+        </span>
+      </div>
+      <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-[14rem_minmax(0,1fr)]">
+        <Meter label="Fit score" value={role_fit.score} />
+        <SurfaceCard level="sunken" className="grid grid-cols-1 gap-3 p-3 sm:grid-cols-3">
+          <TagGroup
+            label="Matched skills"
+            srPrefix="Matched skill:"
+            items={role_fit.matched_skills}
+            tone="positive"
+          />
+          <TagGroup label="Gaps" srPrefix="Gap:" items={role_fit.gaps} tone="caution" />
+          <TagGroup
+            label="Red flags"
+            srPrefix="Red flag:"
+            items={role_fit.red_flags}
+            tone="negative"
+          />
+        </SurfaceCard>
+      </div>
+      <Prose>{role_fit.notes}</Prose>
+    </SurfaceCard>
+  );
+}
+
 export interface CandidateScorecardNarrativeProps {
   assessment: Assessment;
   headingLevel?: HeadingLevel;
   className?: string;
+  /** Render both blocks (default) or just one, so a host can place them apart. */
+  parts?: 'both' | 'conflicts' | 'summary';
 }
 
 /**
@@ -496,13 +563,15 @@ export function CandidateScorecardNarrative({
   assessment,
   headingLevel = 3,
   className,
+  parts = 'both',
 }: CandidateScorecardNarrativeProps) {
   const uid = useId();
   const conflictsId = `${uid}-conflicts`;
   const summaryId = `${uid}-summary`;
   const raw = assessment.raw ?? {};
-  const summary = assessment.summary;
-  const conflicts = assessment.resume_conflicts ?? raw.resume_conflicts ?? [];
+  const summary = parts === 'conflicts' ? '' : assessment.summary;
+  const conflicts =
+    parts === 'summary' ? [] : (assessment.resume_conflicts ?? raw.resume_conflicts ?? []);
 
   if (conflicts.length === 0 && !summary) return null;
   const both = conflicts.length > 0 && Boolean(summary);

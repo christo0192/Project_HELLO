@@ -38,6 +38,7 @@ import {
 import {
   CandidateScorecard,
   CandidateScorecardNarrative,
+  CandidateScorecardRoleFit,
 } from './CandidateScorecard';
 import { RecordingPlayer } from './RecordingPlayer';
 import type { RecordingPlayerHandle } from './RecordingPlayer';
@@ -192,14 +193,33 @@ export function TranscriptionSyncWorkspace({
   const contextSession = loadedSession ?? selectedSession;
   const turnCount = transcript.length;
 
-  /* The one two-column frame every branch renders into: transcript (or the
-     branch's message) left, scorecard right. `items-start` lets the right
-     column stick instead of stretching to the transcript's height. */
-  const frame = (left: React.ReactNode, right: React.ReactNode) => (
-    <div className="grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-12 lg:items-start">
-      <div className="min-w-0 lg:col-span-7">{left}</div>
-      <div className="min-w-0 lg:col-span-5 lg:sticky lg:top-20">{right}</div>
-    </div>
+  /* The one frame every branch renders into. Left column: the transcript
+     (or the branch's message) with the resume conflicts beneath it, so the
+     space under a bounded transcript is used. Right column: verdict +
+     signals. Beneath both, full width: Role fit as a horizontal row, then
+     the summary. Neither column is sticky — with a real scorecard both run
+     longer than a viewport, and a sticky column taller than the viewport
+     never sticks. */
+  const frame = (
+    left: React.ReactNode,
+    right: React.ReactNode,
+    assessment: Assessment | null,
+  ) => (
+    <>
+      <div className="grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-12 lg:items-start">
+        <div className="min-w-0 space-y-4 sm:space-y-6 lg:col-span-7">
+          {left}
+          {!blocked && assessment && (
+            <CandidateScorecardNarrative assessment={assessment} parts="conflicts" />
+          )}
+        </div>
+        <div className="min-w-0 lg:col-span-5">{right}</div>
+      </div>
+      {!blocked && assessment && <CandidateScorecardRoleFit assessment={assessment} />}
+      {!blocked && assessment && (
+        <CandidateScorecardNarrative assessment={assessment} parts="summary" />
+      )}
+    </>
   );
 
   if (selectableSessions.length === 0) {
@@ -221,9 +241,7 @@ export function TranscriptionSyncWorkspace({
             assessment={assessments[0] ?? null}
             heading={assessments.length > 0 ? 'Latest scorecard' : undefined}
           />,
-        )}
-        {!blocked && assessments[0] && (
-          <CandidateScorecardNarrative assessment={assessments[0]} />
+          assessments[0] ?? null,
         )}
       </div>
     );
@@ -368,12 +386,7 @@ export function TranscriptionSyncWorkspace({
                 : undefined
           }
         />,
-      )}
-
-      {/* Read-once narrative: full width beneath the grid, so the sticky
-          scorecard column stays shorter than the viewport. */}
-      {!blocked && scorecardAssessment && (
-        <CandidateScorecardNarrative assessment={scorecardAssessment} />
+        scorecardAssessment,
       )}
     </div>
   );
@@ -407,7 +420,7 @@ function ScorecardBlock({
           Scorecards are suppressed while an appeal is under review.
         </p>
       ) : assessment ? (
-        <CandidateScorecard assessment={assessment} narrative="none" />
+        <CandidateScorecard assessment={assessment} narrative="none" roleFit="none" />
       ) : (
         <p className="max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
           No scorecard for this session yet — complete a screening to generate
