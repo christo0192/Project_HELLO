@@ -165,6 +165,7 @@
         "PHONE_JUDGE_SDK": { "requiredInProduction": false, "secret": false },
         "PHONE_LLM_BASE_URL": { "requiredInProduction": false, "secret": false, "external": true },
         "PHONE_LLM_API_KEY": { "requiredInProduction": false, "secret": true, "external": true },
+        "PHONE_LLM_REASONING_EFFORT": { "requiredInProduction": false, "secret": false, "external": true },
         "PHONE_CONTEXT_MAX_ITEMS": { "requiredInProduction": false, "secret": false },
         "PHONE_CONTEXT_RECENT_ITEMS": { "requiredInProduction": false, "secret": false },
         "GEMINI_BASE_URL": { "requiredInProduction": true, "secret": false, "external": true },

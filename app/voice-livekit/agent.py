@@ -1646,11 +1646,15 @@ def _build_phone_interviewer_llm() -> Any:
             # the browser/WebRTC lane is byte-for-byte untouched.
             api_key=phone.phone_llm_api_key(),
             base_url=phone.phone_llm_base_url(),
-            # PHONE ONLY: bounded sampling; DISABLE reasoning on every request
-            # (reasoning_effort=null) to kill Sarvam's default reasoning dead-air.
-            # See the long-form rationale retained at the historical call site.
+            # PHONE ONLY: bounded sampling; reasoning control on every request.
+            # Default (env unset) stays reasoning_effort=None — the value that
+            # kills Sarvam's default reasoning dead-air. Hybrid thinking models
+            # (DeepSeek V4-Flash) treat null as "provider default" = THINKING;
+            # their documented disable value is the literal string "none", so
+            # the DeepSeek swap sets PHONE_LLM_REASONING_EFFORT=none. See
+            # phone.phone_llm_reasoning_effort for the verified evidence.
             temperature=0.6,
-            reasoning_effort=None,
+            reasoning_effort=phone.phone_llm_reasoning_effort(),
         )
 
     if phone.phone_use_google_llm():
