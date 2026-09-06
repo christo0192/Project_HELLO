@@ -292,6 +292,48 @@ describe('AuthProvider', () => {
     expect(getMe.mock.calls.length - callsBefore).toBeLessThanOrEqual(1);
   });
 
+  it('fails closed when a quiet role refresh is explicitly denied (403)', async () => {
+    let handler: ((event: string, session: unknown) => void) | null = null;
+    mockSupabase.auth.onAuthStateChange = vi.fn((cb: (event: string, session: unknown) => void) => {
+      handler = cb;
+      return { data: { subscription: { unsubscribe: vi.fn() } } };
+    });
+    mockSupabase.auth.getSession = vi
+      .fn()
+      .mockResolvedValue({ data: { session: mockSession }, error: null });
+    getMe.mockResolvedValue({ userId: mockSession.user.id, email: 'recruiter@example.com', role: 'admin', active: true });
+    renderWithProvider();
+    await waitFor(() => expect(screen.getByTestId('role')).toHaveTextContent('admin'));
+
+    // Allowlist entry revoked: the API now answers 403 to /api/me.
+    getMe.mockRejectedValue(Object.assign(new Error('forbidden'), { status: 403 }));
+    await act(async () => {
+      handler!('SIGNED_IN', mockSession);
+    });
+    await waitFor(() => expect(screen.getByTestId('role')).toHaveTextContent('null'));
+  });
+
+  it('keeps the resolved role across a transient failure of a quiet refresh', async () => {
+    let handler: ((event: string, session: unknown) => void) | null = null;
+    mockSupabase.auth.onAuthStateChange = vi.fn((cb: (event: string, session: unknown) => void) => {
+      handler = cb;
+      return { data: { subscription: { unsubscribe: vi.fn() } } };
+    });
+    mockSupabase.auth.getSession = vi
+      .fn()
+      .mockResolvedValue({ data: { session: mockSession }, error: null });
+    getMe.mockResolvedValue({ userId: mockSession.user.id, email: 'recruiter@example.com', role: 'admin', active: true });
+    renderWithProvider();
+    await waitFor(() => expect(screen.getByTestId('role')).toHaveTextContent('admin'));
+
+    getMe.mockRejectedValue(Object.assign(new Error('network'), { status: 0 }));
+    await act(async () => {
+      handler!('SIGNED_IN', mockSession);
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(screen.getByTestId('role')).toHaveTextContent('admin');
+  });
+
   it('fails closed (role null) when /api/me cannot be loaded', async () => {
     mockSupabase.auth.getSession = vi
       .fn()

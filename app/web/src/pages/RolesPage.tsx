@@ -34,13 +34,13 @@ function spokenQuestionIssue(question: string, allQuestions: QuestionRow[], inde
   const text = question.trim();
   if (!text) return null;
   if (text.length > 2000) return "Question is too long.";
-  if (/\\b(system|developer|assistant|model|prompt|instruction|interviewer|recruiter)\\b|\\b(must|should|do not|don't)\\s+(ask|say|tell|mention|reveal|ignore)\\b|[\\[\\]{}<>]/i.test(text)) {
+  if (/\b(system|developer|assistant|model|prompt|instruction|interviewer|recruiter)\b|\b(must|should|do not|don't)\s+(ask|say|tell|mention|reveal|ignore)\b|[\[\]{}<>]/i.test(text)) {
     return "Use candidate-facing spoken language, not instructions or markup.";
   }
-  if (!/[?]|\\b(tell|describe|walk|explain|what|how|why|when|where|which|could|can|have|did|would|are|do|is)\\b/i.test(text)) {
+  if (!/[?]|\b(tell|describe|walk|explain|what|how|why|when|where|which|could|can|have|did|would|are|do|is)\b/i.test(text)) {
     return "Write a speakable candidate-facing question.";
   }
-  const normalized = text.toLocaleLowerCase().replace(/[^\\p{L}\\p{N}]+/gu, " ").trim().replace(/\\s+/g, " ");
+  const normalized = text.toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim().replace(/\s+/g, " ");
   if (normalized && allQuestions.some((other, otherIndex) => otherIndex !== index && spokenQuestionIssueKey(other.question) === normalized)) {
     return "This question duplicates another question.";
   }
@@ -48,7 +48,7 @@ function spokenQuestionIssue(question: string, allQuestions: QuestionRow[], inde
 }
 
 function spokenQuestionIssueKey(value: string): string {
-  return value.toLocaleLowerCase().replace(/[^\\p{L}\\p{N}]+/gu, " ").trim().replace(/\\s+/g, " ");
+  return value.toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim().replace(/\s+/g, " ");
 }
 
 export function RolesPage() {
@@ -86,6 +86,7 @@ export function RolesPage() {
 
       {editing !== null && (
         <RoleForm
+          key={editing === "new" ? "new" : editing.id}
           role={editing === "new" ? null : editing}
           onCancel={() => setEditing(null)}
           onSaved={() => {
@@ -189,9 +190,9 @@ function PromptPreview({
     `Role focus: ${focus}`,
     instructions.trim() ? `Recruiter guidance: ${instructions.trim()}` : "Recruiter guidance: none provided.",
     "Flow: opening → relevant experience → role evidence → one realistic scenario → logistics → candidate questions → closing.",
-    questionLines.length ? `Recruiter questions:\n${questionLines.join("\\n")}` : "Recruiter questions: none; generate role-specific questions from the focus.",
+    questionLines.length ? `Recruiter questions:\n${questionLines.join("\n")}` : "Recruiter questions: none; generate role-specific questions from the focus.",
     "Do not ask protected or sensitive questions, reveal scores, promise a hiring outcome, or invent company facts.",
-  ].join("\\n\\n");
+  ].join("\n\n");
 
   return (
     <div className="glass-sunken p-4">

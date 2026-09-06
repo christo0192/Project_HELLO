@@ -70,6 +70,14 @@ export function ScreeningPage() {
         if (res.assessment) setAssessment(res.assessment);
       }
     } catch (err) {
+      // Roll back the optimistic turn and give the words back to the composer.
+      setTranscript((prev) => {
+        const next = [...(prev ?? [])];
+        const last = next[next.length - 1];
+        if (last && last.speaker === "candidate" && last.text === text) next.pop();
+        return next;
+      });
+      setDraft(text);
       setTurnError(
         err instanceof ApiError ? err.message : "Failed to send answer.",
       );

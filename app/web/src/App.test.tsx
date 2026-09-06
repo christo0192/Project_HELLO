@@ -130,7 +130,9 @@ beforeEach(() => {
 describe('App route wiring', () => {
   it('redirects / to the dashboard landing', async () => {
     renderApp('/');
-    expect(await screen.findByTestId('page-dashboard')).toBeInTheDocument();
+    // First test in the file pays the cold lazy-chunk import; under host
+    // load that can exceed the 1s default.
+    expect(await screen.findByTestId('page-dashboard', {}, { timeout: 5000 })).toBeInTheDocument();
   });
 
   it('renders the dashboard at /dashboard', async () => {

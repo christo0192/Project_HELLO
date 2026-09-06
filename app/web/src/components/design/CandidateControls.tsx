@@ -15,6 +15,7 @@ import type {
   ButtonHTMLAttributes,
   InputHTMLAttributes,
   ReactNode,
+  Ref,
   SelectHTMLAttributes,
 } from 'react';
 import { cx } from './cx';
@@ -67,6 +68,8 @@ export interface CandidateButtonProps
   extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: CandidateButtonVariant;
   loading?: boolean;
+  /** React 19 ref-as-prop, so hosts can return focus to the trigger. */
+  ref?: Ref<HTMLButtonElement>;
 }
 
 export function CandidateButton({
@@ -75,10 +78,12 @@ export function CandidateButton({
   className,
   children,
   disabled,
+  ref,
   ...rest
 }: CandidateButtonProps) {
   return (
     <button
+      ref={ref}
       className={cx(
         // 44px minimum target height (WCAG 2.5.8 / 2.5.5 AAA-friendly).
         'inline-flex min-h-11 items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors',
@@ -106,7 +111,7 @@ export function CandidateButton({
  */
 const fieldBase = cx(
   'min-h-11 rounded-lg border border-[var(--c-control-border)] bg-[var(--c-surface)] px-3 py-2 text-sm',
-  'text-[var(--c-ink)] placeholder:text-[var(--c-ink-muted)]',
+  'text-[var(--c-ink)] placeholder:text-[var(--c-ink-secondary)]',
   'focus:border-[var(--c-accent)] focus:outline-none focus:ring-1 focus:ring-[var(--c-accent)]',
   'disabled:bg-[var(--c-border-light)]',
 );
@@ -204,7 +209,7 @@ export function CandidateEmptyState({
     <div className="flex flex-col items-center justify-center gap-2 rounded-xl border border-dashed border-[var(--c-control-border)] bg-[var(--c-surface)] py-16 text-center">
       <p className="text-sm font-medium text-[var(--c-ink-secondary)]">{title}</p>
       {hint && (
-        <p className="max-w-prose px-4 text-sm text-[var(--c-ink-muted)]">{hint}</p>
+        <p className="max-w-prose px-4 text-sm text-[var(--c-ink-secondary)]">{hint}</p>
       )}
       {action && <div className="mt-2">{action}</div>}
     </div>

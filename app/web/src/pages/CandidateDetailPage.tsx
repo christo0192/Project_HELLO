@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useId, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import type {
@@ -91,6 +91,18 @@ export function CandidateDetailPage() {
 
   useEffect(load, [load]);
 
+  // Silent refresh: re-read the candidate (its session list feeds the Review
+  // tab) without unmounting the page. Used when a live call completes.
+  const refresh = useCallback(() => {
+    if (!id) return;
+    api
+      .getCandidate(id)
+      .then((d) => setDetail(d))
+      .catch(() => {
+        /* keep the current view; the next explicit load surfaces errors */
+      });
+  }, [id]);
+
   if (error)
     return (
       <CandidateShell variant="inset">
@@ -144,6 +156,7 @@ export function CandidateDetailPage() {
                   candidate={candidate}
                   sessions={sessions}
                   phoneRole={me.role}
+                  onSessionCompleted={refresh}
                 />
               ),
             },
@@ -171,10 +184,12 @@ function OverviewTab({
   candidate,
   sessions,
   phoneRole,
+  onSessionCompleted,
 }: {
   candidate: CandidateDetail["candidate"];
   sessions: CandidateDetail["sessions"];
   phoneRole: MeResponse["role"];
+  onSessionCompleted?: () => void;
 }) {
   return (
     // `fade-up-stagger` is the CSS-only reveal: candidate-scoped source may
@@ -215,6 +230,7 @@ function OverviewTab({
             <LiveCallPanel
               candidateId={candidate.id}
               candidateName={candidate.name || undefined}
+              onSessionCompleted={onSessionCompleted}
             />
           </div>
         </div>
@@ -265,6 +281,25 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
   const [error, setError] = useState<string | null>(null);
   const [reason, setReason] = useState<PhoneRescreenReason>("candidate_requested");
   const [confirming, setConfirming] = useState(false);
+  const confirmTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const confirmDialogRef = useRef<HTMLDivElement | null>(null);
+  // A non-modal inline dialog still owes keyboard users the basics: focus
+  // moves in when it opens, Escape closes it, and focus returns to the
+  // control that opened it.
+  useEffect(() => {
+    if (!confirming) return;
+    const dialog = confirmDialogRef.current;
+    dialog?.querySelector<HTMLElement>("button")?.focus();
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setConfirming(false);
+        confirmTriggerRef.current?.focus();
+      }
+    };
+    dialog?.addEventListener("keydown", onKeyDown);
+    return () => dialog?.removeEventListener("keydown", onKeyDown);
+  }, [confirming]);
   const [requesting, setRequesting] = useState(false);
   const [verifying, setVerifying] = useState(false);
   const [phone, setPhone] = useState("");
@@ -414,17 +449,18 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
       ) : data.cycles.length === 0 ? (
         <>
           <p className="mt-2 text-sm text-ink-secondary">No phone screening cycle has been created.</p>
-          <CandidateButton className="mt-3" variant="primary" onClick={() => { setMessage(null); setConfirming(true); }} disabled={requesting}>
+          <CandidateButton ref={confirmTriggerRef} className="mt-3" variant="primary" onClick={() => { setMessage(null); setConfirming(true); }} disabled={requesting}>
             Call candidate
           </CandidateButton>
           {confirming && (
             <div
+              ref={confirmDialogRef}
               role="dialog"
-              aria-modal="true"
               aria-labelledby={`${headingId}-confirm`}
-              // The same sunken material a `SurfaceCard level="sunken"` paints,
-              // applied directly because this well is also a dialog and must
-              // keep `role`/`aria-modal` on the same element.
+              // Non-modal on purpose: nothing outside is hidden, so no
+              // `aria-modal`. The same sunken material a `SurfaceCard
+              // level="sunken"` paints, applied directly so `role` stays on
+              // the well itself.
               className="glass-sunken mt-4 p-4"
             >
               <h3 id={`${headingId}-confirm`} className="text-[13px] font-medium text-ink">Confirm phone screening</h3>
@@ -435,7 +471,7 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
                 <CandidateButton variant="primary" onClick={() => void requestInitialCall()} loading={requesting}>
                   Confirm call
                 </CandidateButton>
-                <CandidateButton variant="secondary" onClick={() => setConfirming(false)} disabled={requesting}>
+                <CandidateButton variant="secondary" onClick={() => { setConfirming(false); confirmTriggerRef.current?.focus(); }} disabled={requesting}>
                   Cancel
                 </CandidateButton>
               </div>

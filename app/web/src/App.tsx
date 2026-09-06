@@ -24,17 +24,15 @@ import {
   Routes,
 } from 'react-router-dom';
 import { Layout } from './components/Layout';
+import { LoadingPanel } from './components/design';
 import { ProtectedRoute } from './components/ProtectedRoute';
 import { useAuth } from './lib/auth';
 import { consumeReturnTo } from './lib/return-to';
 import { LoginPage } from './pages/LoginPage';
 import { UnauthorizedPage } from './pages/UnauthorizedPage';
-import { CandidateJoinPage } from './pages/CandidateJoinPage';
-import { CandidateScreeningEndedPage } from './pages/CandidateScreeningEndedPage';
 import { PrivacyNoticePage } from './pages/PrivacyNoticePage';
 import { RolesPage } from './pages/RolesPage';
 import { CandidatesPage } from './pages/CandidatesPage';
-import { ScreeningPage } from './pages/ScreeningPage';
 import { StatusPage } from './pages/StatusPage';
 import { AppealPage } from './pages/AppealPage';
 import { NotFoundPage } from './pages/NotFoundPage';
@@ -51,6 +49,15 @@ function lazyPage<T extends { [K in string]: unknown }>(
 }
 
 const DashboardPage = lazyPage(() => import('./pages/DashboardPage'), 'DashboardPage');
+// Candidate-only routes carry the LiveKit WebRTC SDK (~560 KB): keep them
+// out of the recruiter entry chunk. The typed screening console is lazy for
+// the same reason it is rarely used.
+const CandidateJoinPage = lazyPage(() => import('./pages/CandidateJoinPage'), 'CandidateJoinPage');
+const CandidateScreeningEndedPage = lazyPage(
+  () => import('./pages/CandidateScreeningEndedPage'),
+  'CandidateScreeningEndedPage',
+);
+const ScreeningPage = lazyPage(() => import('./pages/ScreeningPage'), 'ScreeningPage');
 const CandidateDetailPage = lazyPage(
   () => import('./pages/CandidateDetailPage'),
   'CandidateDetailPage',
@@ -117,8 +124,22 @@ export default function App() {
         <Route path="/mfa/*" element={<Navigate to="/" replace />} />
         <Route path="/unauthorized" element={<UnauthorizedPage />} />
         <Route path="/privacy-notice" element={<PrivacyNoticePage />} />
-        <Route path="/candidate/join" element={<CandidateJoinPage />} />
-        <Route path="/candidate/ended" element={<CandidateScreeningEndedPage />} />
+        <Route
+          path="/candidate/join"
+          element={
+            <Suspense fallback={<LoadingPanel />}>
+              <CandidateJoinPage />
+            </Suspense>
+          }
+        />
+        <Route
+          path="/candidate/ended"
+          element={
+            <Suspense fallback={<LoadingPanel />}>
+              <CandidateScreeningEndedPage />
+            </Suspense>
+          }
+        />
         <Route path="/status" element={<StatusPage />} />
         <Route path="/appeal" element={<AppealPage />} />
 

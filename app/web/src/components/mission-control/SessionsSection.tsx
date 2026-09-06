@@ -68,13 +68,16 @@ export function SessionsSection() {
   const filterRef = useRef(filter);
   filterRef.current = filter;
 
+  const loadGen = useRef(0);
   const load = useCallback((nextFilter?: string) => {
     const status = nextFilter ?? filterRef.current;
+    const gen = ++loadGen.current;
     setLoadError(null);
     setSessions(null);
     api
       .listAdminSessions(status === 'all' ? undefined : status)
       .then((r) => {
+        if (gen !== loadGen.current) return;
         setSessions(r.sessions);
         setSelectedId((prev) =>
           prev && r.sessions.some((s) => s.id === prev)
@@ -82,7 +85,7 @@ export function SessionsSection() {
             : (r.sessions[0]?.id ?? ''),
         );
       })
-      .catch((e: ApiError) => setLoadError(e.message));
+      .catch((e: ApiError) => { if (gen === loadGen.current) setLoadError(e.message); });
   }, []);
 
   useEffect(() => {
@@ -95,7 +98,7 @@ export function SessionsSection() {
     () => (sessions ? sessions.slice(0, 50) : NO_SESSIONS),
     [sessions],
   );
-  const paged = usePagination(bounded, 10);
+  const paged = usePagination(bounded, 10, filter);
 
   if (loadError && !sessions) {
     return <ErrorPanel message={loadError} onRetry={() => load()} />;

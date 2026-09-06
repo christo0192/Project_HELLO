@@ -11,7 +11,7 @@
  * client-side slice.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
 import type { AdminAuditRow } from '../../types';
 import {
@@ -38,16 +38,19 @@ export function AuditSection() {
   const [offset, setOffset] = useState(0);
   const [loadError, setLoadError] = useState<string | null>(null);
 
+  const loadGen = useRef(0);
   const load = useCallback((nextOffset = 0) => {
+    const gen = ++loadGen.current;
     setLoadError(null);
     setAudit(null);
     api
       .listAdminAudit(PAGE_SIZE, nextOffset)
       .then((r) => {
+        if (gen !== loadGen.current) return;
         setAudit(r.audit);
         setOffset(nextOffset);
       })
-      .catch((e: ApiError) => setLoadError(e.message));
+      .catch((e: ApiError) => { if (gen === loadGen.current) setLoadError(e.message); });
   }, []);
 
   useEffect(() => {

@@ -5,7 +5,7 @@
  * a page-size select and previous/next controls inside a `nav` landmark.
  * The range line is `role="status"` so page changes are announced.
  */
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Button } from './Button';
 import { SelectField } from './Field';
 import { cx } from './cx';
@@ -26,11 +26,24 @@ export interface PaginationState<T> {
   setPageSize: (size: PageSize) => void;
 }
 
-export function usePagination<T>(rows: ReadonlyArray<T>, initialSize: PageSize = 10): PaginationState<T> {
+export function usePagination<T>(
+  rows: ReadonlyArray<T>,
+  initialSize: PageSize = 10,
+  /** Changes here (a filter key) return the user to page 1. */
+  resetKey?: string,
+): PaginationState<T> {
   const [page, setPageState] = useState(1);
   const [pageSize, setPageSizeState] = useState<PageSize>(initialSize);
   const total = rows.length;
   const pageCount = Math.max(1, Math.ceil(total / pageSize));
+
+  const lastKey = useRef(resetKey);
+  useEffect(() => {
+    if (lastKey.current !== resetKey) {
+      lastKey.current = resetKey;
+      setPageState(1);
+    }
+  }, [resetKey]);
 
   // Clamp when the data shrinks under the current page (filter, refresh).
   useEffect(() => {

@@ -476,7 +476,14 @@ export function PhoneCalendarPage() {
               stateFacets={stateFacets}
               filters={filters}
               view={view}
-              onViewChange={(next) => applyFilters({ ...filters, view: next })}
+              onViewChange={(next) => {
+                // An explicit choice must always land in the URL — the
+                // builder omits defaults, and on a narrow viewport the
+                // default is "queue", so "week" would otherwise be a no-op.
+                const params = buildPhoneCalendarSearch({ ...filters, view: next });
+                params.set('view', next);
+                setSearchParams(params);
+              }}
               onToggle={(dimension, value) =>
                 applyFilters(togglePhoneFacet(filters, dimension, value))
               }
@@ -535,6 +542,7 @@ export function PhoneCalendarPage() {
                 <aside className="flex min-w-0 flex-col gap-5 lg:sticky lg:top-20">
                   {selected && (
                     <PhoneAppointmentDetail
+                      key={selected.id}
                       appointment={selected}
                       canWrite={canWrite}
                       onReschedule={handleReschedule}

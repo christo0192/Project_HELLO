@@ -15,7 +15,8 @@ import { cx } from './cx';
 
 export const controlClass = cx(
   'w-full rounded-control bg-white/80 px-3 text-sm text-ink placeholder:text-ink-tertiary',
-  'shadow-[inset_0_0_0_1px_var(--glass-ring-strong)] transition-[box-shadow,background-color] duration-200 ease-soft',
+  // Control boundary must clear WCAG 1.4.11 (3:1): the muted ink is 4.68:1 on white.
+  'shadow-[inset_0_0_0_1px_var(--ink-muted)] transition-[box-shadow,background-color] duration-200 ease-soft',
   'hover:bg-white focus:bg-white focus:outline-none focus:shadow-[inset_0_0_0_1.5px_var(--info)]',
   'disabled:cursor-not-allowed disabled:bg-ink/[0.04] disabled:text-ink-tertiary',
 );

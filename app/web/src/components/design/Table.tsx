@@ -110,7 +110,7 @@ export function Th({
     <th
       scope={rest.scope ?? 'col'}
       className={cx(
-        'h-10 border-b border-glass-ring bg-white/70 px-4 text-left text-xs font-medium text-ink-tertiary backdrop-blur-sm first:rounded-tl-card last:rounded-tr-card',
+        'h-10 border-b border-glass-ring bg-white/80 px-4 text-left text-xs font-medium text-ink-tertiary first:rounded-tl-card last:rounded-tr-card',
         className,
       )}
       {...rest}
