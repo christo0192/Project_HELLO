@@ -12,9 +12,15 @@
  * With the shipped default (`WORKER_ORCHESTRATION=false`) this returns null:
  * no scheduler, no timer, no Fly call, no DB poll.
  *
- * This module is NOT wired into `index.ts` in this change — the plan sequences
- * runtime activation as a later step. It exists so the wiring is a one-line
- * addition when that step lands, and so the gating is testable now.
+ * WIRED into `index.ts` startup (gated on `env.workerOrchestration`, stopped on
+ * shutdown, mirroring the recording runtime). With the shipped flag off,
+ * construction returns null and nothing is started.
+ *
+ * It runs TWO loops: a PROMPT terminal-release pass (fast cadence — returns a
+ * finished call's pool slot in seconds by releasing every machine whose bound
+ * session is already terminal) and the REAPER (slower — the correctness
+ * backstop that stops any machine whose LiveKit room is dead past the grace
+ * window, catching anything the prompt path missed).
  */
 
 import {
@@ -35,6 +41,15 @@ export const BROWSER_FLY_APP = 'project-hello-voice';
 /** Reaper cadence (ms). §2.5 says every ~1–2 min; 90s sits in that band. */
 const DEFAULT_REAP_INTERVAL_MS = 90_000;
 
+/**
+ * Prompt-release cadence (ms). Runs FASTER than the reaper because it is the
+ * cost-optimisation path: a call that just ended should return its pool slot in
+ * seconds, not one 90s reaper window. It only touches sessions already TERMINAL
+ * (a bounded, cheap indexed read + one release each), so a tight cadence is
+ * safe. The reaper stays the correctness backstop for anything this misses.
+ */
+const DEFAULT_TERMINAL_RELEASE_INTERVAL_MS = 15_000;
+
 export interface WorkerOrchestrationRuntimeOptions {
   /** Injected service (tests use a fake). Production builds the default. */
   service?: WorkerOrchestrationService;
@@ -42,6 +57,8 @@ export interface WorkerOrchestrationRuntimeOptions {
   apps?: readonly string[];
   /** Reap loop interval (ms). Defaults to 90s. */
   reapIntervalMs?: number;
+  /** Prompt terminal-release loop interval (ms). Defaults to 15s. */
+  terminalReleaseIntervalMs?: number;
   /** Test seams for the scheduler's timers/jitter/clock. */
   scheduler?: {
     setTimer?: (fn: () => void, ms: number) => { unref?: () => void };
@@ -77,6 +94,8 @@ export function createWorkerOrchestrationRuntime(
   const service = options.service ?? createDefaultWorkerOrchestrationService();
   const apps = options.apps ?? [PHONE_FLY_APP, BROWSER_FLY_APP];
   const reapIntervalMs = options.reapIntervalMs ?? DEFAULT_REAP_INTERVAL_MS;
+  const terminalReleaseIntervalMs =
+    options.terminalReleaseIntervalMs ?? DEFAULT_TERMINAL_RELEASE_INTERVAL_MS;
 
   const reapOnce = async (): Promise<boolean> => {
     let stopped = 0;
@@ -95,10 +114,35 @@ export function createWorkerOrchestrationRuntime(
     return stopped > 0;
   };
 
+  // The prompt-release pass (§2 I2, cost path): release every machine whose
+  // bound session is already terminal, for BOTH apps. It is the primary
+  // terminal-release path — the reaper's LiveKit-liveness sweep is the backstop
+  // for anything it cannot reach (a deleted session row, a room the terminal
+  // write raced). Failing for one app never stops the other or the loop.
+  const releaseTerminalOnce = async (): Promise<boolean> => {
+    let released = 0;
+    for (const app of apps) {
+      try {
+        const result = await service.releaseTerminalSessions({ app });
+        released += result.released;
+      } catch {
+        logger.warn('unknown_event', {
+          error_category: 'worker_orchestration_terminal_release_error',
+        });
+      }
+    }
+    return released > 0;
+  };
+
   const scheduler = createLoopScheduler({
     ...(options.scheduler ?? {}),
     metricPrefix: 'worker_orch',
     loops: [
+      {
+        name: 'worker-orchestration-terminal-release',
+        intervalMs: terminalReleaseIntervalMs,
+        tick: releaseTerminalOnce,
+      },
       {
         name: 'worker-orchestration-reap',
         intervalMs: reapIntervalMs,
@@ -109,8 +153,14 @@ export function createWorkerOrchestrationRuntime(
 
   return {
     scheduler,
-    loopIntervalsMs: { 'worker-orchestration-reap': reapIntervalMs },
+    loopIntervalsMs: {
+      'worker-orchestration-terminal-release': terminalReleaseIntervalMs,
+      'worker-orchestration-reap': reapIntervalMs,
+    },
     async tickAll(): Promise<void> {
+      // Release first, then reap: a terminal session released this tick should
+      // not also be reaped this tick (the release already stopped it).
+      await releaseTerminalOnce();
       await reapOnce();
     },
     async stop(): Promise<void> {

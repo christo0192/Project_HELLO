@@ -119,6 +119,7 @@ function screeningConfig(over: Partial<PhoneScreeningConfig> = {}): PhoneScreeni
     dialAllowlist: [],
     slotSeconds: 1_800,
     reconnectBackoffSeconds: 120,
+    infraDeferBackoffSeconds: 300,
     ringTimeoutSeconds: 45,
     leaseSeconds: 60,
     webhookMaxBytes: 65_536,

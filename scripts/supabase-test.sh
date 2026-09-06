@@ -636,6 +636,36 @@ fi
 log '0072: PASS — partial-finalize selects the stranded disconnect, drives it completed, leaves the control, idempotent.'
 
 # =====================================================================
+# 0083 daily-cap infra-defer — the per-IST-day narrowing must discriminate
+# by abandon_reason, not by state='abandoned' alone. Seeds THREE same-day
+# eligible engagements each with a prior `initial` attempt differing only in
+# terminal shape: (A) abandoned+infra_deferred (EXCLUDED, redialable same
+# day), (B) abandoned+abandon_reason NULL (reclaim residue — day stays
+# charged), (C) ended (real call — day stays charged). Proves A re-admits on
+# BOTH the narrowed index and admit's two daily pre-checks (insert accepted,
+# admit='ok'), while B and C are refused 'daily_attempt_exists'. Assertions
+# RAISE on any violation, so ON_ERROR_STOP makes psql exit non-zero → harness
+# fails.
+# =====================================================================
+log '0083: daily-cap infra-defer — seeding A(infra)/B(reclaim)/C(ended) same-day fixture...'
+docker exec -i "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  < app/supabase/tests/phone_daily_cap_infra_defer_setup.sql 2>&1 | tee -a "$RESULTS_FILE"
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+  log 'ERROR: 0083 daily-cap infra-defer setup failed.'
+  exit 1
+fi
+log '0083: daily-cap infra-defer — asserting index + pre-check narrowing (A re-admits, B/C stay charged)...'
+docker exec -i "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  < app/supabase/tests/phone_daily_cap_infra_defer_assert.sql 2>&1 | tee -a "$RESULTS_FILE"
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+  log 'ERROR: 0083 daily-cap infra-defer assertions FAILED.'
+  exit 1
+fi
+log '0083: PASS — infra_deferred prior attempt frees the same-day redial (index + pre-check), reclaim-NULL and ended both hold the day.'
+
+# =====================================================================
 # TST-15 rollback rehearsal — clean reset / roll-forward / restore
 # (Phase 6 lane L4). No reverse SQL exists or is invented; this proves the
 # sanctioned recovery path: the committed migration set can always be

@@ -128,6 +128,7 @@ export function buildCanary1ScreeningConfig(
     dialAllowlist: [digest],
     slotSeconds: 1_800,
     reconnectBackoffSeconds: 120,
+    infraDeferBackoffSeconds: 300,
     ringTimeoutSeconds: ringSeconds,
     leaseSeconds: 180,
     webhookMaxBytes: 65_536,

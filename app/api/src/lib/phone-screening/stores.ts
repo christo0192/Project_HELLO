@@ -577,6 +577,24 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
       };
     },
 
+    async abandonAttemptInfra(input): Promise<{ status: string; restored?: boolean }> {
+      const { data, error } = await client.rpc('abandon_phone_attempt_infra', {
+        p_attempt_id: input.attemptId,
+        // P3: forward the backoff when the caller supplies one; the RPC defaults
+        // to 300 and clamps [60,3600], so omission stays safe.
+        ...(typeof input.backoffSeconds === 'number'
+          ? { p_backoff_seconds: input.backoffSeconds }
+          : {}),
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_abandon_infra_error');
+      const row = asRow(data);
+      return {
+        status: str(row, 'status') ?? 'unknown',
+        restored: bool(row, 'restored'),
+      };
+    },
+
     async applyEvent(input: ApplyPhoneEventInput): Promise<ApplyPhoneEventResult> {
       const { data, error } = await client.rpc('apply_phone_event', {
         p_source: input.source,

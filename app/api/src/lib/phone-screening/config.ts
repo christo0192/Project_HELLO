@@ -55,6 +55,7 @@ const _contractVisibleEnvReads = [
   process.env.PHONE_DIAL_ALLOWLIST,
   process.env.PHONE_SLOT_SECONDS,
   process.env.PHONE_RECONNECT_BACKOFF_SECONDS,
+  process.env.PHONE_INFRA_DEFER_BACKOFF_SEC,
   process.env.PHONE_RING_TIMEOUT_SECONDS,
   process.env.PHONE_LEASE_SECONDS,
   process.env.PHONE_WEBHOOK_MAX_BYTES,
@@ -102,6 +103,17 @@ export const PHONE_BOUNDS = {
    * 20:59 lands at 21:01, outside the window.
    */
   reconnectBackoffSeconds: { def: 120, min: 5, max: 3_600 },
+  /**
+   * 0083 / P3. How long `abandon_phone_attempt_infra` pushes an engagement's
+   * `next_eligible_at` forward after a pre-originate infra defer
+   * (`worker_not_ready`). Bounds a persistently-broken pool (empty pool / flag
+   * off / boot slower than the ready timeout) to ONE infra-defer per window
+   * instead of one per due tick: without it the restored engagement would be
+   * immediately due again and churn admit -> start -> wait -> stop -> abandon on
+   * every pass. 300s default; clamped [60,3600] here AND again in SQL (the RPC
+   * is service-role callable directly and must not trust its input).
+   */
+  infraDeferBackoffSeconds: { def: 300, min: 60, max: 3_600 },
   /** How long an unanswered outbound leg may ring before it is a no-answer. */
   ringTimeoutSeconds: { def: 45, min: 5, max: 120 },
   /**
@@ -163,6 +175,8 @@ export interface PhoneScreeningConfig {
   dialAllowlist: readonly string[];
   slotSeconds: number;
   reconnectBackoffSeconds: number;
+  /** 0083/P3: backoff (s) applied to next_eligible_at on a worker-not-ready infra defer. */
+  infraDeferBackoffSeconds: number;
   ringTimeoutSeconds: number;
   leaseSeconds: number;
   webhookMaxBytes: number;
@@ -231,6 +245,10 @@ export function loadPhoneScreeningConfig(
     reconnectBackoffSeconds: boundedInt(
       source.PHONE_RECONNECT_BACKOFF_SECONDS,
       PHONE_BOUNDS.reconnectBackoffSeconds,
+    ),
+    infraDeferBackoffSeconds: boundedInt(
+      source.PHONE_INFRA_DEFER_BACKOFF_SEC,
+      PHONE_BOUNDS.infraDeferBackoffSeconds,
     ),
     ringTimeoutSeconds: boundedInt(
       source.PHONE_RING_TIMEOUT_SECONDS,

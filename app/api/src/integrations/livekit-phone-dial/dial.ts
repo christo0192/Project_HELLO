@@ -148,6 +148,12 @@ export interface PhoneWorkerReadyGate {
     pipeline: 'phone';
     sessionId: string;
     epoch: number;
+    /**
+     * Wall-clock budget (seconds) for the machine to reach `ready`. The runtime
+     * passes `env.phoneWorkerReadyTimeoutSec` (default 75) so a slow-booting
+     * worker is not deferred prematurely; the service clamps it to [30, 300].
+     */
+    readyTimeoutSec?: number;
   }): Promise<
     | { status: 'ready'; machineId: string }
     | { status: 'no_capacity' }
@@ -156,6 +162,18 @@ export interface PhoneWorkerReadyGate {
     | { status: 'disabled' }
   >;
   releaseWorker(input: { app: string; machineId: string; sessionId: string }): Promise<void>;
+  /**
+   * Mark the gated machine `busy` once the dial reports success. Best-effort:
+   * a failure never changes the dial result — the lease is already `ready`,
+   * which the reaper spares while the LiveKit room is live. Gives the reaper a
+   * second liveness signal beyond room-liveness.
+   */
+  markBusy?(input: {
+    app: string;
+    machineId: string;
+    sessionId: string;
+    epoch: number;
+  }): Promise<void>;
   /** The Fly app the phone worker pool lives in. */
   readonly app: string;
 }
@@ -345,6 +363,9 @@ export async function dialPhoneAttempt(
       pipeline: 'phone',
       sessionId: request.sessionId,
       epoch,
+      // Gap 4: the runtime supplies env.phoneWorkerReadyTimeoutSec; the service
+      // clamps and defaults it. Undefined here (a hand-built gate) uses the
+      // service default.
     });
     if (gate.status === 'ready') {
       gatedMachineId = gate.machineId;
@@ -353,6 +374,32 @@ export async function dialPhoneAttempt(
       // was provisioned (we gate BEFORE the dispatch), so there is no room name
       // to report and no dispatch to undo. The service already released/stopped
       // any machine it claimed for this attempt, so we do not release here.
+      //
+      // ── Gap 5: SAME-IST-DAY RETRYABILITY ────────────────────────────────
+      // Admission has ALREADY committed this attempt and charged the per-IST-day
+      // index (that happens inside `admit_phone_attempt`, before this gate). A
+      // pre-originate infra defer reached NO carrier, so leaving the attempt
+      // `admitted` would wedge the engagement at `daily_attempt_exists` until
+      // IST midnight for a hiccup the candidate never experienced. So we abandon
+      // it NOW (transition #30, charges nothing) and — via the 0083 narrowed
+      // index — free the same engagement to redial the same IST day. Best-effort
+      // and fail-open: if the abandon RPC is absent (legacy fake) or fails, the
+      // lease-reclaim sweep still recovers the attempt (same-day-retryable under
+      // the same narrowed index), just not as promptly.
+      if (deps.stores.abandonAttemptInfra) {
+        try {
+          // P3: pass the configured backoff so the restore also pushes
+          // next_eligible_at forward — a persistently-broken pool defers once
+          // per window, not once per due tick. The RPC clamps [60,3600] again.
+          await deps.stores.abandonAttemptInfra({
+            attemptId,
+            backoffSeconds: config.infraDeferBackoffSeconds,
+            now: request.now,
+          });
+        } catch {
+          /* fail-open: reclaim sweep backstops the abandonment */
+        }
+      }
       return {
         status: 'refused',
         refusal: 'worker_not_ready',
@@ -468,6 +515,26 @@ export async function dialPhoneAttempt(
       roomName: room.roomName,
       providerContacted: true,
     };
+  }
+
+  // Gap 3: the dial is placed — mark the lease `busy` so the reaper has a
+  // second liveness signal (a lease past grace still reading `ready`, never
+  // `busy`, is a machine that was claimed but whose call never went live).
+  // Best-effort: a failure here never changes the dialing result — the lease is
+  // already `ready`, which the reaper spares while the LiveKit room is live. A
+  // synthetic rehearsal still marks busy: the lease bookkeeping is about the
+  // machine's claim, not about whether a real carrier was reached.
+  if (gatedMachineId !== undefined && deps.workerGate?.markBusy !== undefined) {
+    try {
+      await deps.workerGate.markBusy({
+        app: deps.workerGate.app,
+        machineId: gatedMachineId,
+        sessionId: request.sessionId,
+        epoch,
+      });
+    } catch {
+      /* best-effort: the lease is already ready, which the reaper spares */
+    }
   }
 
   return {

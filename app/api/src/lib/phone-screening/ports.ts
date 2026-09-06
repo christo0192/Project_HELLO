@@ -724,6 +724,27 @@ export interface PhoneStores {
     limit?: number;
     now: Date;
   }): Promise<ReclaimPhoneAttemptLeasesResult>;
+  /**
+   * 0083. Immediately abandon a post-admission, PRE-ORIGINATE attempt (a
+   * `worker_not_ready` infra defer that reached no carrier) and restore the
+   * engagement to its prior state — transition #30 without waiting for the
+   * lease to expire. Paired with the 0083 narrowed per-IST-day index, the same
+   * engagement can redial the SAME IST day. Charges no budget. Optional so
+   * legacy test doubles need not implement it; when absent the dial controller
+   * simply skips the immediate relief and the lease-reclaim sweep recovers the
+   * attempt (which, under the same narrowed index, is also same-day-retryable).
+   */
+  abandonAttemptInfra?(input: {
+    attemptId: string;
+    /**
+     * 0083/P3. Seconds to push the engagement's `next_eligible_at` forward on
+     * the restore, so a persistently-broken pool defers once per window rather
+     * than churning every due tick. Optional; the RPC defaults to 300 and
+     * clamps [60,3600], so an omitted value is safe.
+     */
+    backoffSeconds?: number;
+    now: Date;
+  }): Promise<{ status: string; restored?: boolean }>;
   applyEvent(input: ApplyPhoneEventInput): Promise<ApplyPhoneEventResult>;
   scheduleAppointment(
     input: SchedulePhoneAppointmentInput,

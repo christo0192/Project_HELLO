@@ -168,6 +168,12 @@ export const MIGRATION_0082_PATH = fileURLToPath(
 
 export const MIGRATION_0082 = readFileSync(MIGRATION_0082_PATH, 'utf8');
 
+export const MIGRATION_0083_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0083_voice_worker_terminal_release.sql', import.meta.url),
+);
+
+export const MIGRATION_0083 = readFileSync(MIGRATION_0083_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -175,6 +181,11 @@ export const MIGRATION_0082 = readFileSync(MIGRATION_0082_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0083 adds abandon_phone_attempt_infra (same-IST-day relief for a
+    // worker_not_ready infra defer) and narrows the per-IST-day index. Its two
+    // voice-worker RPCs are NOT phone-domain and are intentionally excluded from
+    // RPC_NAMES below. Newest-first per the scheme.
+    { name: '0083', sql: MIGRATION_0083 },
     // 0082 adds the call_sessions.observability jsonb column (per-call phone
     // observability, additive/columns-only). Newest-first per the scheme.
     { name: '0082', sql: MIGRATION_0082 },
@@ -334,6 +345,11 @@ export const RPC_NAMES = [
   'sweep_phone_stranded_recordings',
   // 0072 — server-side partial-finalize on a non-terminal-ending call.
   'finalize_phone_partial_sessions',
+  // 0083 — same-IST-day abandonment for a pre-originate infra defer. The
+  // migration's other two RPCs (release_voice_worker_by_session,
+  // list_terminal_session_leases) are the voice-worker orchestration domain,
+  // NOT phone screening, so they are deliberately not listed here.
+  'abandon_phone_attempt_infra',
 ] as const;
 
 /**
