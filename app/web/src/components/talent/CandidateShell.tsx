@@ -13,6 +13,11 @@
  *
  * The shell also carries the shared page rhythm so the three candidate
  * surfaces read as one system rather than three pages that agree.
+ *
+ * The ground itself is transparent: `--c-bg` is still declared here (every
+ * descendant that asks for it resolves it), but the shell no longer paints
+ * an opaque rectangle over the app's lit ground, so the glass surfaces
+ * inside it float on the same material as the rest of the shell.
  */
 
 import type { ElementType, ReactNode } from 'react';
@@ -54,7 +59,7 @@ export function CandidateShell({
       data-candidate-shell={variant}
       className={cx(
         CANDIDATE_SCOPE_CLASS,
-        'min-h-full bg-[var(--c-bg)] text-[var(--c-ink)]',
+        'min-h-full bg-transparent text-[var(--c-ink)]',
         RHYTHM[variant],
         variant === 'standalone' && (width === 'wide' ? 'max-w-6xl' : 'max-w-3xl'),
         className,
@@ -66,7 +71,7 @@ export function CandidateShell({
 }
 
 export interface CandidateHeaderProps {
-  /** Small uppercase label above the title. */
+  /** Small sentence-case label above the title. */
   eyebrow?: string;
   title: string;
   description?: string;
@@ -96,11 +101,11 @@ export function CandidateHeader({
     >
       <div className="min-w-0">
         {eyebrow && (
-          <p className="text-xs font-semibold uppercase tracking-wide text-[var(--c-accent)]">
+          <p className="text-[13px] font-medium text-[var(--c-ink-secondary)]">
             {eyebrow}
           </p>
         )}
-        <h1 className="mt-1 truncate text-xl font-semibold tracking-tight text-[var(--c-ink)] sm:text-2xl">
+        <h1 className="mt-1 truncate text-[1.75rem] font-semibold tracking-[-0.02em] text-[var(--c-ink)]">
           {title}
         </h1>
         {description && (

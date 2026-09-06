@@ -205,7 +205,7 @@ export function AshbyWorkflowCardView({ workflow }: AshbyWorkflowCardViewProps) 
   return (
     <>
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 id={HEADING_ID} className="text-sm font-semibold text-ink">
+        <h2 id={HEADING_ID} className="text-[15px] font-semibold tracking-tight text-ink">
           Ashby screening pipeline
         </h2>
         <StatusBadge tone={ashbyLifecycleTone(workflow.lifecycle)}>
@@ -219,7 +219,7 @@ export function AshbyWorkflowCardView({ workflow }: AshbyWorkflowCardViewProps) 
         </p>
       )}
 
-      <dl className="mt-3 space-y-2 text-sm">
+      <dl className="glass-sunken mt-3 space-y-2 p-3 text-sm">
         <div className="flex flex-wrap items-center justify-between gap-2">
           <dt className="text-ink-secondary">Resume ingestion</dt>
           <dd>
@@ -352,7 +352,7 @@ export function AshbyWorkflowCard({ source }: AshbyWorkflowCardProps) {
             <AshbyWorkflowCardView workflow={state.workflow} />
           ) : (
             <>
-              <h2 id={HEADING_ID} className="text-sm font-semibold text-ink">
+              <h2 id={HEADING_ID} className="text-[15px] font-semibold tracking-tight text-ink">
                 Ashby screening pipeline
               </h2>
               <p className="mt-2 text-sm text-ink-tertiary">

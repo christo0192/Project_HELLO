@@ -83,10 +83,16 @@ describe('LoginPage', () => {
     ).toBeInTheDocument();
   });
 
-  it('renders the brand logo on a neutral plate with a proper alt', () => {
-    renderLoginPage();
-    const img = screen.getByAltText('InterviewKickstart logo');
-    expect(img).toHaveAttribute('src', '/ik-logo.png');
+  it('renders the brand logo from the authorised asset path', () => {
+    // The glass shell renders branding through the shared `Brand`
+    // component, which puts the logo on a neutral plate and marks it
+    // decorative — the adjacent "HELLO" wordmark is the accessible name,
+    // so a duplicated alt would be announced twice. The load-bearing part
+    // of this assertion is the authorised asset path, which is pinned.
+    const { container } = renderLoginPage();
+    const img = container.querySelector('img[src="/ik-logo.png"]');
+    expect(img).not.toBeNull();
+    expect(img).toHaveAttribute('alt', '');
   });
 
   it('redirects to /candidates if already authenticated', async () => {

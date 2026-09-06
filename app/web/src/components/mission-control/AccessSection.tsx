@@ -75,10 +75,6 @@ export function AccessSection() {
     Record<string, { role: MembershipRole; active: boolean }>
   >({});
 
-  // Add form
-  const [email, setEmail] = useState('');
-  const [newRole, setNewRole] = useState<MembershipRole>('viewer');
-
   // Feedback
   const [message, setMessage] = useState<{ text: string; tone: 'ok' | 'error' } | null>(null);
 
@@ -139,10 +135,6 @@ export function AccessSection() {
     return <LoadingPanel label="Loading access list…" />;
   }
 
-  const normalizedPreview = normalizeEmailPreview(email);
-  const hasNormalization = email !== normalizedPreview && normalizedPreview.length > 0;
-  const notCompany = email.trim().length > 0 && !isCompanyEmail(email);
-
   function setDraft(
     id: string,
     patch: Partial<{ role: MembershipRole; active: boolean }>,
@@ -153,14 +145,13 @@ export function AccessSection() {
     }));
   }
 
-  async function addEntry() {
+  async function addEntry(email: string, role: MembershipRole): Promise<boolean> {
     setMessage(null);
     try {
-      await api.addAdminAllowlistEntry({ email: email.trim(), role: newRole });
-      setEmail('');
-      setNewRole('viewer');
+      await api.addAdminAllowlistEntry({ email: email.trim(), role });
       setMessage({ text: 'Access entry added.', tone: 'ok' });
       await refreshEntries();
+      return true;
     } catch (e) {
       setMessage({
         text: stableMutationMessage(
@@ -169,6 +160,7 @@ export function AccessSection() {
         ),
         tone: 'error',
       });
+      return false;
     }
   }
 
@@ -234,67 +226,9 @@ export function AccessSection() {
         </InlineNotice>
       )}
 
-      {/* Add entry */}
-      <GlassPanel>
-        <SectionHeader
-          level={3}
-          title="Add an access entry"
-          description="The person does not need an account yet — this grants pre-login access to the workspace."
-        />
-        <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_10rem_auto] sm:items-start">
-          <Field label="Company email" id="access-email">
-            {({ id }) => (
-              <>
-                <TextField
-                  id={id}
-                  type="email"
-                  value={email}
-                  onChange={(e) => setEmail(e.target.value)}
-                  placeholder="name@interviewkickstart.com"
-                  autoComplete="off"
-                />
-                {notCompany && (
-                  <p className="text-xs leading-5 text-warning-text" role="note">
-                    Only @interviewkickstart.com emails can be added.
-                  </p>
-                )}
-                {hasNormalization && !notCompany && (
-                  <p className="text-xs leading-5 text-ink-tertiary" role="note">
-                    Will be stored as {normalizedPreview}
-                  </p>
-                )}
-              </>
-            )}
-          </Field>
-          <Field label="Role" id="access-role">
-            {({ id }) => (
-              <SelectField
-                id={id}
-                value={newRole}
-                onChange={(e) => setNewRole(e.target.value as MembershipRole)}
-              >
-                <option value="viewer">viewer</option>
-                <option value="interviewer">interviewer</option>
-                <option value="admin">admin</option>
-              </SelectField>
-            )}
-          </Field>
-          <ConfirmButton
-            className="sm:pt-[1.375rem]"
-            label="Add entry"
-            confirmLabel="Add access entry"
-            disabled={email.trim().length === 0}
-            summary={
-              <span>
-                Add <strong>{email.trim() || 'this email'}</strong> as a{' '}
-                <strong>{newRole}</strong>? The person can sign in before
-                creating an account.
-              </span>
-            }
-            onConfirm={addEntry}
-          />
-        </div>
-      </GlassPanel>
+      {/* Add entry — its own component so typing re-renders the form, not
+          the whole entry table (keeps keystrokes cheap on long allowlists). */}
+      <AddEntryForm onAdd={addEntry} />
 
       <SegmentedControl
         ariaLabel="Filter access entries"
@@ -432,5 +366,93 @@ export function AccessSection() {
         those guards.
       </p>
     </div>
+  );
+}
+
+/**
+ * The add-entry form owns its draft state. `onAdd` resolves true when the
+ * server accepted the entry, which clears the form; the parent owns the
+ * feedback message and the list refresh.
+ */
+function AddEntryForm({
+  onAdd,
+}: {
+  onAdd: (email: string, role: MembershipRole) => Promise<boolean>;
+}) {
+  const [email, setEmail] = useState('');
+  const [newRole, setNewRole] = useState<MembershipRole>('viewer');
+  const normalizedPreview = normalizeEmailPreview(email);
+  const hasNormalization = email !== normalizedPreview && normalizedPreview.length > 0;
+  const notCompany = email.trim().length > 0 && !isCompanyEmail(email);
+
+  async function submit() {
+    const ok = await onAdd(email, newRole);
+    if (ok) {
+      setEmail('');
+      setNewRole('viewer');
+    }
+  }
+
+  return (
+    <GlassPanel>
+      <SectionHeader
+        level={3}
+        title="Add an access entry"
+        description="The person does not need an account yet — this grants pre-login access to the workspace."
+      />
+      <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-[minmax(0,1fr)_10rem_auto] sm:items-start">
+        <Field label="Company email" id="access-email">
+          {({ id }) => (
+            <>
+              <TextField
+                id={id}
+                type="email"
+                value={email}
+                onChange={(e) => setEmail(e.target.value)}
+                placeholder="name@interviewkickstart.com"
+                autoComplete="off"
+              />
+              {notCompany && (
+                <p className="text-xs leading-5 text-warning-text" role="note">
+                  Only @interviewkickstart.com emails can be added.
+                </p>
+              )}
+              {hasNormalization && !notCompany && (
+                <p className="text-xs leading-5 text-ink-tertiary" role="note">
+                  Will be stored as {normalizedPreview}
+                </p>
+              )}
+            </>
+          )}
+        </Field>
+        <Field label="Role" id="access-role">
+          {({ id }) => (
+            <SelectField
+              id={id}
+              value={newRole}
+              onChange={(e) => setNewRole(e.target.value as MembershipRole)}
+            >
+              <option value="viewer">viewer</option>
+              <option value="interviewer">interviewer</option>
+              <option value="admin">admin</option>
+            </SelectField>
+          )}
+        </Field>
+        <ConfirmButton
+          className="sm:pt-[1.375rem]"
+          label="Add entry"
+          confirmLabel="Add access entry"
+          disabled={email.trim().length === 0}
+          summary={
+            <span>
+              Add <strong>{email.trim() || 'this email'}</strong> as a{' '}
+              <strong>{newRole}</strong>? The person can sign in before
+              creating an account.
+            </span>
+          }
+          onConfirm={submit}
+        />
+      </div>
+    </GlassPanel>
   );
 }

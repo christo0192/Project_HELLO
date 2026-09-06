@@ -11,8 +11,8 @@
 import { useEffect, useId, useState } from 'react';
 import { api, ApiError } from '../../api';
 import type { Candidate, PhoneCandidateAppointmentCreateInput, PhoneSlot } from '../../types';
+import { Button, GlassPanel, SectionHeader, SelectField } from '../design';
 import { ConfirmButton } from '../mission-control/ConfirmButton';
-import { buttonClassNames } from '../mission-control/buttonStyles';
 import { formatIstLongDayLabel, formatIstTimeRange, type IstDate } from '../../lib/ist-datetime';
 import { PhoneSlotPicker } from './PhoneSlotPicker';
 
@@ -51,47 +51,56 @@ export function PhoneBookingPanel({ onCreate, today }: PhoneBookingPanelProps) {
   const ready = selected !== undefined && slot !== null;
 
   return (
-    <section
-      aria-label="Book a phone screening"
-      className="rounded-xl border border-line bg-surface p-4 shadow-card sm:p-5"
-    >
-      <h2 className="text-sm font-semibold text-ink">Book a phone screening</h2>
-      <p className="mt-0.5 text-xs text-ink-secondary">
-        Choose a candidate and an IST slot. The server resolves the active cycle atomically.
-      </p>
+    <GlassPanel as="section" aria-label="Book a phone screening" padding="sm">
+      <SectionHeader
+        title="Book a phone screening"
+        description="Choose a candidate and an IST slot. The server resolves the active cycle atomically."
+      />
 
-      <button
-        type="button"
+      <Button
+        size="lg"
+        variant="secondary"
+        className="mt-4"
         onClick={() => setOpen((value) => !value)}
         aria-expanded={open}
         aria-controls={open ? formId : undefined}
-        className={buttonClassNames('secondary', 'mt-3 min-h-[44px]')}
       >
         {open ? 'Close booking form' : 'Book a screening'}
-      </button>
+      </Button>
 
       {!open ? null : (
         <div id={formId}>
-          <div className="mt-4">
-            <label htmlFor={candidateFieldId} className="block text-xs font-medium text-ink-secondary">
+          <div className="mt-5">
+            <label
+              htmlFor={candidateFieldId}
+              className="block text-[13px] font-medium text-ink-secondary"
+            >
               Candidate
             </label>
             {candidateError ? (
-              <p id={candidateHintId} role="status" className="mt-1 text-sm text-error">
+              <p
+                id={candidateHintId}
+                role="status"
+                className="mt-1.5 rounded-[14px] bg-error-soft px-3.5 py-2.5 text-sm text-ink"
+              >
                 Candidate list unavailable. Close and reopen to retry.
               </p>
             ) : candidates === null ? (
-              <p id={candidateHintId} role="status" className="mt-1 text-sm text-ink-tertiary">Loading candidates…</p>
+              <p id={candidateHintId} role="status" className="mt-1.5 text-sm text-ink-tertiary">
+                Loading candidates…
+              </p>
             ) : candidates.length === 0 ? (
-              <p id={candidateHintId} role="status" className="mt-1 text-sm text-ink-secondary">No candidates are available.</p>
+              <p id={candidateHintId} role="status" className="mt-1.5 text-sm text-ink-tertiary">
+                No candidates are available.
+              </p>
             ) : (
               <>
-                <select
+                <SelectField
                   id={candidateFieldId}
                   value={candidateId}
                   onChange={(event) => { setCandidateId(event.target.value); setSlot(null); }}
                   aria-describedby={candidateHintId}
-                  className="mt-1 min-h-[44px] w-full rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 sm:max-w-md"
+                  className="mt-1.5 min-h-[44px] sm:max-w-md"
                 >
                   <option value="">Select a candidate</option>
                   {candidates.map((candidate) => (
@@ -99,15 +108,15 @@ export function PhoneBookingPanel({ onCreate, today }: PhoneBookingPanelProps) {
                       {candidate.name ?? 'Candidate'} · {candidate.status}
                     </option>
                   ))}
-                </select>
-                <p id={candidateHintId} className="mt-1 text-xs text-ink-tertiary">
+                </SelectField>
+                <p id={candidateHintId} className="mt-1.5 text-xs leading-5 text-ink-tertiary">
                   The candidate's current phone-screening cycle will be resolved by the server.
                 </p>
               </>
             )}
           </div>
 
-          <div className="mt-4">
+          <div className="mt-5">
             <PhoneSlotPicker
               idPrefix={idPrefix}
               date={slotDate}
@@ -140,6 +149,6 @@ export function PhoneBookingPanel({ onCreate, today }: PhoneBookingPanelProps) {
           />
         </div>
       )}
-    </section>
+    </GlassPanel>
   );
 }

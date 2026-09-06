@@ -20,8 +20,16 @@ import { useCallback, useEffect, useState } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import type { SessionDetail } from '../types';
-import { ErrorState, LoadingState, Card } from '../components/ui';
-import { PageHeader, StatusBadge } from '../components/design';
+import {
+  buttonClass,
+  ErrorPanel,
+  GlassPanel,
+  LoadingPanel,
+  PageHeader,
+  ScrollArea,
+  SectionHeader,
+  StatusBadge,
+} from '../components/design';
 import { RecordingCard, TranscriptList } from '../components/talent';
 import {
   formatDurationSec,
@@ -49,96 +57,108 @@ export function SessionDetailPage() {
 
   useEffect(load, [load]);
 
-  if (error) return <ErrorState message={error} onRetry={load} />;
-  if (!detail) return <LoadingState label="Loading session…" />;
+  if (error) return <ErrorPanel message={error} onRetry={load} />;
+  if (!detail) return <LoadingPanel label="Loading session…" />;
 
   const { session, transcript, assessment } = detail;
   const completed = session.status === 'completed';
 
   return (
-    <div>
-      <Link
-        to={`/candidates/${session.candidate_id}`}
-        className="mb-4 inline-flex items-center gap-1 text-sm text-ink-secondary hover:text-ink"
-      >
-        ← Back to candidate
-      </Link>
-
+    <div className="space-y-6">
       <PageHeader
         eyebrow="Session"
         title={`Session ${session.id.slice(0, 8)}`}
         description={`${sessionModeLabel(session.mode)} screening · created ${formatDateTime(session.created_at)}`}
-        actions={<StatusBadge tone={sessionStatusTone(session.status)}>{sessionStatusLabel(session.status)}</StatusBadge>}
+        actions={
+          <Link
+            to={`/candidates/${session.candidate_id}`}
+            className={buttonClass('secondary', 'sm')}
+          >
+            ← Back to candidate
+          </Link>
+        }
       />
 
-      <p className="mb-6 rounded-lg border border-line bg-surface-secondary px-4 py-3 text-xs text-ink-secondary">
+      <p className="glass-sunken px-4 py-3 text-[13px] leading-5 text-ink-secondary">
         This is a read-only view of the completed session. Transcript and
         scorecard are final; recordings are served through short-lived links
         created on request.
       </p>
 
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
         {/* Transcript */}
-        <Card className="p-5 lg:col-span-2">
-          <h2 className="mb-1 text-sm font-semibold text-ink">Transcript</h2>
-          <p className="mb-4 text-xs text-ink-tertiary">
-            {transcript.length} speaker turn{transcript.length === 1 ? '' : 's'}
-          </p>
-          <TranscriptList transcript={transcript} />
-        </Card>
+        <GlassPanel className="lg:col-span-7">
+          <SectionHeader
+            title="Transcript"
+            description={`${transcript.length} speaker turn${transcript.length === 1 ? '' : 's'}`}
+          />
+          {/* `TranscriptList` already exposes a region named "Transcript";
+              this scroll region needs a distinct name (axe landmark-unique). */}
+          <ScrollArea maxHeight="34rem" label="Session transcript" className="mt-3">
+            <TranscriptList transcript={transcript} />
+          </ScrollArea>
+        </GlassPanel>
 
-        {/* Session meta */}
-        <Card className="h-fit p-5">
-          <h2 className="mb-4 text-sm font-semibold text-ink">Session details</h2>
-          <dl className="space-y-3 text-sm">
-            <MetaField label="Status">
-              <StatusBadge tone={sessionStatusTone(session.status)}>
-                {sessionStatusLabel(session.status)}
-              </StatusBadge>
-            </MetaField>
-            <MetaField label="Mode">
-              {sessionModeLabel(session.mode)}
-            </MetaField>
-            <MetaField label="Duration">
-              {formatDurationSec(session.duration_sec)}
-            </MetaField>
-            <MetaField label="Started">
-              {formatDateTime(session.started_at ?? session.created_at)}
-            </MetaField>
-            <div className="pt-1">
-              <dt className="mb-1 text-xs font-medium text-ink-secondary">Session ID</dt>
-              <dd className="break-all font-mono text-xs text-ink-tertiary">{session.id}</dd>
+        <div className="space-y-6 lg:col-span-5">
+          {/* Session meta */}
+          <GlassPanel>
+            <SectionHeader title="Session details" />
+            <dl className="mt-4 grid grid-cols-[auto_1fr] gap-x-4 gap-y-3 text-sm">
+              <MetaField label="Status">
+                <StatusBadge tone={sessionStatusTone(session.status)}>
+                  {sessionStatusLabel(session.status)}
+                </StatusBadge>
+              </MetaField>
+              <MetaField label="Mode">
+                {sessionModeLabel(session.mode)}
+              </MetaField>
+              <MetaField label="Duration">
+                {formatDurationSec(session.duration_sec)}
+              </MetaField>
+              <MetaField label="Started">
+                {formatDateTime(session.started_at ?? session.created_at)}
+              </MetaField>
+              <dt className="text-[13px] text-ink-tertiary">Session ID</dt>
+              <dd className="break-all text-right font-mono text-xs text-ink-secondary">
+                {session.id}
+              </dd>
+            </dl>
+          </GlassPanel>
+
+          {/* Recording — authorized on-demand access */}
+          <GlassPanel>
+            <SectionHeader title="Recording" />
+            <div className="mt-4">
+              {completed ? (
+                <RecordingCard sessionId={session.id} title="Session recording" />
+              ) : (
+                <p className="text-sm text-ink-tertiary">
+                  Recording access is available once the session completes.
+                </p>
+              )}
             </div>
-          </dl>
-        </Card>
+          </GlassPanel>
+        </div>
+      </div>
 
-        {/* Scorecard */}
-        <Card className="p-5 lg:col-span-2">
-          <h2 className="mb-4 text-sm font-semibold text-ink">Scorecard</h2>
+      <div className="mt-6">
+      {/* Scorecard */}
+      <GlassPanel>
+        <SectionHeader title="Scorecard" />
+        <div className="mt-4">
           {assessment ? (
             <Scorecard assessment={assessment} />
           ) : completed ? (
-            <p className="rounded-lg border border-dashed border-line-strong bg-surface-secondary px-4 py-8 text-center text-sm text-ink-secondary">
+            <p className="glass-sunken px-4 py-8 text-center text-sm text-ink-secondary">
               No scorecard yet — assessment generation may still be running.
             </p>
           ) : (
-            <p className="rounded-lg border border-dashed border-line-strong bg-surface-secondary px-4 py-8 text-center text-sm text-ink-secondary">
+            <p className="glass-sunken px-4 py-8 text-center text-sm text-ink-secondary">
               No scorecard — the session has not completed.
             </p>
           )}
-        </Card>
-
-        {/* Recording — authorized on-demand access */}
-        <Card className="h-fit p-5">
-          <h2 className="mb-1 text-sm font-semibold text-ink">Recording</h2>
-          {completed ? (
-            <RecordingCard sessionId={session.id} title="Session recording" />
-          ) : (
-            <p className="text-sm text-ink-tertiary">
-              Recording access is available once the session completes.
-            </p>
-          )}
-        </Card>
+        </div>
+      </GlassPanel>
       </div>
     </div>
   );
@@ -152,9 +172,9 @@ function MetaField({
   children: React.ReactNode;
 }) {
   return (
-    <div className="flex items-center justify-between gap-4">
-      <dt className="text-xs font-medium text-ink-secondary">{label}</dt>
-      <dd className="text-right text-ink">{children}</dd>
-    </div>
+    <>
+      <dt className="text-[13px] text-ink-tertiary">{label}</dt>
+      <dd className="text-right text-sm text-ink">{children}</dd>
+    </>
   );
 }

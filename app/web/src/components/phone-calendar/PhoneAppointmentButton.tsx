@@ -2,9 +2,9 @@
  * One appointment, as a focusable control shared by both views.
  *
  * ── THE ACCESSIBLE NAME CARRIES EVERYTHING ────────────────────────────
- * Visually this is a compact chip: a time, a reference, a status badge. Those
- * three facts are legible together because they sit in a cell whose row and
- * column already say which day and which hour it is.
+ * Visually this is a compact glass chip: a time, a reference, a status badge.
+ * Those three facts are legible together because they sit in a cell whose row
+ * and column already say which day and which hour it is.
  *
  * None of that context survives being read aloud out of order, so the
  * control's accessible name restates it in full — who, when in IST, the
@@ -19,7 +19,8 @@
  *
  * ── TOUCH TARGET ──────────────────────────────────────────────────────
  * `min-h-[44px]` keeps the control at the 44×44 CSS-pixel floor on touch
- * (WCAG 2.5.5), which a text-sized chip would otherwise miss by half.
+ * (WCAG 2.5.5), which a text-sized chip would otherwise miss by half. The
+ * phone-calendar a11y gate looks for that literal class.
  */
 
 import type { PhoneCalendarAppointment } from '../../types';
@@ -55,11 +56,10 @@ export function PhoneAppointmentButton({
       aria-pressed={selected}
       aria-label={appointmentAccessibleName(appointment)}
       className={cx(
-        'flex w-full min-h-[44px] flex-col items-start gap-1 rounded-lg border px-2.5 py-2 text-left transition-colors',
+        'flex w-full min-h-[44px] flex-col items-start justify-center gap-1 rounded-[10px] bg-white px-2.5 py-1.5 text-left shadow-pill',
+        'transition-[box-shadow,background-color] duration-200 ease-soft',
         'focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500',
-        selected
-          ? 'border-brand-500 bg-brand-50 ring-1 ring-brand-500 dark:bg-brand-950'
-          : 'border-line bg-surface hover:bg-surface-tertiary',
+        selected ? 'ring-2 ring-info' : 'hover:shadow-card-hover',
       )}
     >
       <span aria-hidden="true" className="flex flex-wrap items-center gap-1.5">
@@ -69,7 +69,7 @@ export function PhoneAppointmentButton({
         </span>
         <StatusBadge tone={term.tone}>{term.label}</StatusBadge>
       </span>
-      <span aria-hidden="true" className="block w-full truncate text-xs text-ink-secondary">
+      <span aria-hidden="true" className="block w-full truncate text-xs text-ink-tertiary">
         {candidateReferenceText(appointment.candidate)}
       </span>
     </button>

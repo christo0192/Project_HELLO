@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 import { useCountUp, useReducedMotion } from '../../lib/motion';
 import { cx } from './cx';
+import { RollingNumber } from './RollingNumber';
 import { Skeleton } from './Skeleton';
 
 export type KpiTone = 'default' | 'success' | 'warning' | 'danger';
@@ -76,7 +77,7 @@ export function KpiCard({
             <Skeleton width={96} height={32} radius={8} />
           ) : (
             <p className={cx('text-stat tabular-nums', toneStyles[tone])}>
-              {shown}
+              <RollingNumber text={shown} />
               {unit && (
                 <span className="ml-1.5 text-sm font-normal tracking-normal text-ink-tertiary">{unit}</span>
               )}

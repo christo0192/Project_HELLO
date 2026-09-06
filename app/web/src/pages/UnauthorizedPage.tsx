@@ -4,27 +4,34 @@
  * Shown when a recruiter does not have permission to access a resource.
  * Stable UI — does not reveal account details or attempt recovery.
  */
-import { Button } from '../components/ui';
+import { Brand } from '../components/navigation';
+import { Button, GlassPanel } from '../components/design';
 
 export function UnauthorizedPage() {
   return (
-    <div className="flex min-h-screen items-center justify-center px-4">
-      <div className="text-center">
-        <h1 className="text-4xl font-bold text-gray-300">403</h1>
-        <p className="mt-2 text-lg font-semibold text-gray-900">
-          Access denied
-        </p>
-        <p className="mt-1 text-sm text-gray-500">
-          You do not have permission to access this resource.
-        </p>
-        <Button
-          variant="secondary"
-          className="mt-6"
-          onClick={() => (window.location.href = '/login')}
-        >
-          Return to sign-in
-        </Button>
-      </div>
+    <div className="app-ground flex min-h-screen items-center justify-center px-4 py-10">
+      <main className="w-full max-w-md">
+        <GlassPanel level="strong" padding="lg" className="text-center">
+          <div className="flex justify-center">
+            <Brand />
+          </div>
+          <p className="mt-6 text-stat text-ink-tertiary">403</p>
+          <h1 className="mt-1 text-[15px] font-semibold tracking-[-0.01em] text-ink">
+            Access denied
+          </h1>
+          <p className="mt-1.5 text-[13px] leading-5 text-ink-tertiary">
+            You do not have permission to access this resource.
+          </p>
+          <Button
+            variant="primary"
+            size="lg"
+            className="mt-6 w-full"
+            onClick={() => (window.location.href = '/login')}
+          >
+            Return to sign-in
+          </Button>
+        </GlassPanel>
+      </main>
     </div>
   );
 }

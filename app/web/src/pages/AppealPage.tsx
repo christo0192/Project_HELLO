@@ -1,7 +1,14 @@
 import { useEffect, useRef, useState } from 'react';
 import { api, ApiError } from '../api';
 import type { AppealCreateInput } from '../types';
-import { Button, Card } from '../components/ui';
+import {
+  Button,
+  Field,
+  GlassPanel,
+  InlineNotice,
+  SelectField,
+  TextArea,
+} from '../components/design';
 
 /**
  * Phase 9 L4 — candidate appeal submission (invariant 8).
@@ -63,95 +70,107 @@ export function AppealPage() {
 
   if (submitted) {
     return (
-      <main className="mx-auto flex min-h-screen max-w-xl items-center px-4">
-        <Card className="w-full p-6">
-          <h1 className="text-xl font-semibold text-gray-900">Appeal submitted</h1>
-          <p className="mt-2 text-sm text-gray-600">
-            Your appeal has been recorded. While it is under review, automated
-            decision use for this screening is paused and a human reviewer will
-            assess it.
-          </p>
-        </Card>
-      </main>
+      <div className="app-ground flex min-h-screen items-start justify-center px-4 py-10">
+        <main className="w-full max-w-2xl">
+          <GlassPanel level="strong" padding="lg">
+            <h1 className="text-title text-ink">Appeal submitted</h1>
+            <InlineNotice tone="success" className="mt-4">
+              Your appeal has been recorded. While it is under review, automated
+              decision use for this screening is paused and a human reviewer will
+              assess it.
+            </InlineNotice>
+          </GlassPanel>
+        </main>
+      </div>
     );
   }
 
   return (
-    <main className="mx-auto flex min-h-screen max-w-xl items-center px-4">
-      <Card className="w-full p-6">
-        <h1 className="text-xl font-semibold text-gray-900">Request a review</h1>
-        <p className="mt-2 text-sm text-gray-600">
-          If you believe a decision about your screening should be re-checked by
-          a human, submit an appeal. A human reviewer will review it.
-        </p>
-
-        {!ready && (
-          <p className="mt-4 text-sm text-gray-500" role="status">
-            Checking your link…
+    <div className="app-ground flex min-h-screen items-start justify-center px-4 py-10">
+      <main className="w-full max-w-2xl">
+        <GlassPanel level="strong" padding="lg">
+          <h1 className="text-title text-ink">Request a review</h1>
+          <p className="mt-1.5 max-w-xl text-sm leading-6 text-ink-secondary">
+            If you believe a decision about your screening should be re-checked by
+            a human, submit an appeal. A human reviewer will review it.
           </p>
-        )}
 
-        {ready && !tokenRef.current && (
-          <p className="mt-4 text-sm text-red-600" role="alert">
-            This appeal link is missing, expired, revoked, or already used.
-          </p>
-        )}
+          {!ready && (
+            <p className="mt-5 text-sm text-ink-tertiary" role="status">
+              Checking your link…
+            </p>
+          )}
 
-        {ready && tokenRef.current && (
-          <form
-            className="mt-5 space-y-4"
-            onSubmit={(e) => {
-              e.preventDefault();
-              void submit();
-            }}
-          >
-            <div>
-              <label htmlFor="appeal-category" className="block text-sm font-medium text-gray-700">
-                Category
-              </label>
-              <select
-                id="appeal-category"
-                value={category}
-                onChange={(e) => setCategory(e.target.value as AppealCreateInput['category'])}
-                className="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-accent-500 focus:outline-none focus:ring-accent-500"
+          {ready && !tokenRef.current && (
+            <InlineNotice tone="danger" role="alert" className="mt-5">
+              This appeal link is missing, expired, revoked, or already used.
+            </InlineNotice>
+          )}
+
+          {ready && tokenRef.current && (
+            <form
+              className="mt-6 space-y-5"
+              onSubmit={(e) => {
+                e.preventDefault();
+                void submit();
+              }}
+            >
+              <Field id="appeal-category" label="Category" className="max-w-xs">
+                {({ id }) => (
+                  <SelectField
+                    id={id}
+                    value={category}
+                    onChange={(e) =>
+                      setCategory(e.target.value as AppealCreateInput['category'])
+                    }
+                  >
+                    {CATEGORIES.map((c) => (
+                      <option key={c.value} value={c.value}>
+                        {c.label}
+                      </option>
+                    ))}
+                  </SelectField>
+                )}
+              </Field>
+
+              <Field id="appeal-description" label="Description">
+                {({ id }) => (
+                  <>
+                    <TextArea
+                      id={id}
+                      value={description}
+                      onChange={(e) => setDescription(e.target.value)}
+                      rows={5}
+                      maxLength={2000}
+                      required
+                      placeholder="Explain what you would like a human to re-check…"
+                    />
+                    <p className="text-right text-xs text-ink-tertiary">
+                      {description.length}/2000
+                    </p>
+                  </>
+                )}
+              </Field>
+
+              {error && (
+                <InlineNotice tone="danger" role="alert">
+                  {error}
+                </InlineNotice>
+              )}
+
+              <Button
+                type="submit"
+                variant="primary"
+                size="lg"
+                loading={submitting}
+                disabled={description.trim().length === 0}
               >
-                {CATEGORIES.map((c) => (
-                  <option key={c.value} value={c.value}>
-                    {c.label}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div>
-              <label htmlFor="appeal-description" className="block text-sm font-medium text-gray-700">
-                Description
-              </label>
-              <textarea
-                id="appeal-description"
-                value={description}
-                onChange={(e) => setDescription(e.target.value)}
-                rows={5}
-                maxLength={2000}
-                required
-                placeholder="Explain what you would like a human to re-check…"
-                className="mt-1 block w-full rounded-md border border-gray-300 px-3 py-2 text-sm focus:border-accent-500 focus:outline-none focus:ring-accent-500"
-              />
-              <p className="mt-1 text-right text-xs text-gray-400">{description.length}/2000</p>
-            </div>
-
-            {error && (
-              <p className="text-sm text-red-600" role="alert">
-                {error}
-              </p>
-            )}
-
-            <Button type="submit" loading={submitting} disabled={description.trim().length === 0}>
-              Submit appeal
-            </Button>
-          </form>
-        )}
-      </Card>
-    </main>
+                Submit appeal
+              </Button>
+            </form>
+          )}
+        </GlassPanel>
+      </main>
+    </div>
   );
 }

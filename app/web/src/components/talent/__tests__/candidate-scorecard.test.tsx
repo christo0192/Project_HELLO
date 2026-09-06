@@ -415,10 +415,29 @@ describe('CandidateScorecard accessibility', () => {
     expect(screen.getByText('Red flag:')).toHaveClass('sr-only');
   });
 
-  it('imports no motion library and declares no transition on the meters', () => {
+  /**
+   * The motion budget, restated for the glass redesign.
+   *
+   * The meter fill now GROWS into place — a CSS `transition-[width]`, which
+   * is what the design system asks a meter to do. That is deliberately not
+   * the thing this test guards. What it guards is that the candidate scope
+   * still runs no JS motion library and starts no keyframe animation: a
+   * `transition` collapses to 0.01ms under the global reduced-motion rule
+   * in index.css and repaints nothing on its own, while an `animate-*`
+   * keyframe runs unprompted and is budgeted by name in
+   * candidate-scope-palette.test.ts §6.
+   *
+   * Both halves are asserted, so weakening one does not silently pass: the
+   * width transition must be PRESENT (or the fill stopped growing and this
+   * test is measuring nothing), and no keyframe may appear.
+   */
+  it('grows the meter fill by transition only — no keyframe animation', () => {
     const { container } = render(<CandidateScorecard assessment={FULL} />);
-    for (const el of container.querySelectorAll('[role="meter"] > *')) {
-      expect(el.className).not.toMatch(/\b(transition|animate|duration)-/);
+    const fills = [...container.querySelectorAll('[role="meter"] > *')];
+    expect(fills.length).toBeGreaterThan(0);
+    for (const el of fills) {
+      expect(el.className).toMatch(/\btransition-\[width\]/);
+      expect(el.className).not.toMatch(/\banimate-/);
     }
   });
 });

@@ -29,7 +29,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api, ApiError } from '../../api';
 import type { PhoneSlot, PhoneSlotsResponse } from '../../types';
-import { cx } from '../design';
+import { Field, TextField, cx } from '../design';
 import { formatIstTimeRange, isIstDate } from '../../lib/ist-datetime';
 import type { IstDate } from '../../lib/ist-datetime';
 import { slotRefusalLabel } from './phoneVocabulary';
@@ -92,62 +92,54 @@ export function PhoneSlotPicker({
 
   return (
     <div>
-      <div className="mb-3">
-        <label
-          htmlFor={dateFieldId}
-          className="block text-xs font-medium text-ink-secondary"
-        >
-          Date (IST)
-        </label>
-        <input
-          id={dateFieldId}
-          type="date"
-          value={date}
-          disabled={disabled}
-          onChange={(e) => {
-            // A `type="date"` input reports '' while it is being cleared or
-            // partially typed. Forwarding that would fire a request for
-            // `?date=`, which the API refuses with a shape error the operator
-            // cannot act on — so an incomplete date simply does not move the
-            // grid.
-            const next = e.target.value;
-            if (!isIstDate(next)) return;
-            onChange(null);
-            onDateChange(next);
-          }}
-          className="mt-1 min-h-[44px] rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
-        />
-        <p className="mt-1 text-xs text-ink-tertiary">
-          Calling days are every day of the week. Times below are India
-          Standard Time.
-        </p>
-      </div>
+      <Field
+        id={dateFieldId}
+        label="Date (IST)"
+        hint="Calling days are every day of the week. Times below are India Standard Time."
+        className="mb-4 max-w-xs"
+      >
+        {({ id, describedBy }) => (
+          <TextField
+            id={id}
+            type="date"
+            value={date}
+            disabled={disabled}
+            aria-describedby={describedBy}
+            onChange={(e) => {
+              // A `type="date"` input reports '' while it is being cleared or
+              // partially typed. Forwarding that would fire a request for
+              // `?date=`, which the API refuses with a shape error the
+              // operator cannot act on — so an incomplete date simply does
+              // not move the grid.
+              const next = e.target.value;
+              if (!isIstDate(next)) return;
+              onChange(null);
+              onDateChange(next);
+            }}
+            className="min-h-[44px]"
+          />
+        )}
+      </Field>
 
       {error && (
-        <p
-          role="status"
-          className="rounded-lg border border-error/30 bg-error-soft px-3 py-2 text-sm text-error"
-        >
+        <p role="status" className="rounded-[14px] bg-error-soft px-3.5 py-2.5 text-sm text-ink">
           {error}
         </p>
       )}
 
       {!error && data === null && (
-        <p className="text-sm text-ink-secondary">Loading slots…</p>
+        <p className="text-sm text-ink-tertiary">Loading slots…</p>
       )}
 
       {!error && data && !data.enabled && (
-        <p
-          role="status"
-          className="rounded-lg border border-warning/30 bg-warning-soft px-3 py-2 text-sm text-warning"
-        >
+        <p role="status" className="rounded-[14px] bg-warning-soft px-3.5 py-2.5 text-sm text-ink">
           Phone screening is turned off, so no slots can be offered.
         </p>
       )}
 
       {!error && data && data.enabled && (
         <fieldset disabled={disabled}>
-          <legend id={groupLabelId} className="text-xs font-medium text-ink-secondary">
+          <legend id={groupLabelId} className="text-[13px] font-medium text-ink-secondary">
             Slot
           </legend>
 
@@ -166,7 +158,7 @@ export function PhoneSlotPicker({
           {data.occupancy_truncated && (
             <p
               role="status"
-              className="mt-2 rounded-lg border border-warning/30 bg-warning-soft px-3 py-2 text-xs text-warning"
+              className="mt-2 rounded-[14px] bg-warning-soft px-3.5 py-2.5 text-xs leading-5 text-ink"
             >
               This day held more appointments than the projection could count,
               so the booked counts below are a lower bound and the remaining
@@ -176,7 +168,7 @@ export function PhoneSlotPicker({
           )}
 
           {data.slots.length === 0 ? (
-            <p className="mt-2 text-sm text-ink-secondary">
+            <p className="mt-2 text-sm text-ink-tertiary">
               No slots on this date.
             </p>
           ) : (
@@ -184,16 +176,27 @@ export function PhoneSlotPicker({
               {data.slots.map((slot) => {
                 const chosen = slot.starts_at === value;
                 const blocked = !slot.bookable;
+                const refusalText = slot.refusals.map(slotRefusalLabel).join(' · ');
                 return (
                   <li key={slot.starts_at}>
+                    {/*
+                      A chip, but still a radio. Picking a slot is a
+                      choose-exactly-one decision, so the control stays a real
+                      radio in a real group — it is only painted as a chip,
+                      with the input visually hidden and the chip carrying the
+                      focus ring on its behalf.
+                    */}
                     <label
+                      title={blocked ? refusalText : undefined}
                       className={cx(
-                        'flex min-h-[44px] cursor-pointer items-start gap-2 rounded-lg border px-3 py-2 text-sm transition-colors',
+                        'flex min-h-[44px] items-start gap-2 rounded-control px-3 py-2 text-sm',
+                        'transition-[box-shadow,background-color] duration-200 ease-soft',
+                        'focus-within:ring-2 focus-within:ring-info focus-within:ring-offset-2 focus-within:ring-offset-surface-secondary',
                         blocked
-                          ? 'cursor-not-allowed border-line bg-surface-secondary text-ink-tertiary'
+                          ? 'cursor-not-allowed bg-ink/[0.04] text-ink-tertiary'
                           : chosen
-                            ? 'border-brand-500 bg-brand-50 text-ink ring-1 ring-brand-500 dark:bg-brand-950'
-                            : 'border-line bg-surface text-ink hover:bg-surface-tertiary',
+                            ? 'cursor-pointer bg-white text-ink shadow-pill ring-2 ring-info'
+                            : 'cursor-pointer bg-white/70 text-ink shadow-[inset_0_0_0_1px_var(--glass-ring-strong)] hover:bg-white',
                       )}
                     >
                       <input
@@ -203,22 +206,20 @@ export function PhoneSlotPicker({
                         checked={chosen}
                         disabled={blocked || disabled}
                         onChange={() => select(slot)}
-                        className="mt-1 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+                        className="sr-only"
                       />
                       <span>
                         <span className="block font-medium">
                           {formatIstTimeRange(slot.starts_at, slot.ends_at)}
                         </span>
-                        <span className="block text-xs">
+                        <span className="block text-xs text-ink-tertiary">
                           {/*
                             The word is always present; the styling only ever
                             reinforces it. "Available" and "at projected
                             capacity" both name themselves as projections here
                             and in the paragraph above.
                           */}
-                          {blocked
-                            ? slot.refusals.map(slotRefusalLabel).join(' · ')
-                            : 'Available (projected)'}
+                          {blocked ? refusalText : 'Available (projected)'}
                           {' · '}
                           {slot.booked} booked
                           {data.max_concurrent === null

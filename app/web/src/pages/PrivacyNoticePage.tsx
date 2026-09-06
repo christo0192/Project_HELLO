@@ -12,9 +12,10 @@
  */
 
 import { useState } from 'react';
+import type { ReactNode } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api, ApiError } from '../api';
-import { Button, Card } from '../components/ui';
+import { Button, GlassPanel, InlineNotice } from '../components/design';
 import type { ConsentType } from '../types';
 
 /** Placeholder privacy notice body — NOT Legal-approved. */
@@ -56,6 +57,85 @@ const REQUIRED_CONSENTS: ConsentType[] = [
   'purpose',
   'data_processing',
 ];
+
+/**
+ * Renders the placeholder notice with document typography.
+ *
+ * The notice constant above stays the single, byte-identical source of the
+ * copy; this only chooses the element for each line (`#`/`##` headings,
+ * `-` list items, `**…**` lead-in, paragraphs). No words are added,
+ * removed or reordered.
+ */
+function NoticeBody({ source }: { source: string }) {
+  const blocks: ReactNode[] = [];
+  let paragraph: string[] = [];
+  let bullets: string[] = [];
+
+  const flushParagraph = () => {
+    if (paragraph.length === 0) return;
+    blocks.push(
+      <p key={`p-${blocks.length}`} className="text-sm leading-6 text-ink-secondary">
+        {paragraph.join(' ')}
+      </p>,
+    );
+    paragraph = [];
+  };
+  const flushBullets = () => {
+    if (bullets.length === 0) return;
+    blocks.push(
+      <ul key={`ul-${blocks.length}`} className="ml-5 list-disc space-y-1 text-sm leading-6 text-ink-secondary">
+        {bullets.map((item) => (
+          <li key={item}>{item}</li>
+        ))}
+      </ul>,
+    );
+    bullets = [];
+  };
+  const flush = () => {
+    flushParagraph();
+    flushBullets();
+  };
+
+  for (const line of source.split('\n')) {
+    const text = line.trim();
+    if (text === '') {
+      flush();
+    } else if (text.startsWith('## ')) {
+      flush();
+      blocks.push(
+        <h2
+          key={`h2-${blocks.length}`}
+          className="mt-6 text-[15px] font-semibold tracking-[-0.01em] text-ink first:mt-0"
+        >
+          {text.slice(3)}
+        </h2>,
+      );
+    } else if (text.startsWith('# ')) {
+      flush();
+      blocks.push(
+        <h1 key={`h1-${blocks.length}`} className="text-title text-ink">
+          {text.slice(2)}
+        </h1>,
+      );
+    } else if (text.startsWith('- ')) {
+      flushParagraph();
+      bullets.push(text.slice(2));
+    } else if (text.startsWith('**') && text.endsWith('**')) {
+      flush();
+      blocks.push(
+        <p key={`lead-${blocks.length}`} className="text-sm font-semibold leading-6 text-ink">
+          {text.slice(2, -2)}
+        </p>,
+      );
+    } else {
+      flushBullets();
+      paragraph.push(text);
+    }
+  }
+  flush();
+
+  return <div className="space-y-3">{blocks}</div>;
+}
 
 interface PrivacyNoticePageProps {
   /** Override candidate_id for testing. */
@@ -141,41 +221,45 @@ export function PrivacyNoticePage({
   }
 
   return (
-    <main className="mx-auto flex min-h-screen max-w-2xl items-center px-4 py-8">
-      <Card className="w-full p-6">
-        <h1 className="text-xl font-semibold text-gray-900">Privacy Notice</h1>
-        <div className="mt-4 prose prose-sm max-w-none text-gray-700 whitespace-pre-line">
-          {PLACEHOLDER_NOTICE}
-        </div>
+    <div className="app-ground flex min-h-screen items-start justify-center px-4 py-10">
+      <main className="w-full max-w-3xl">
+        <GlassPanel level="strong" padding="lg">
+          <NoticeBody source={PLACEHOLDER_NOTICE} />
 
-        <div className="mt-6 flex gap-4">
-          <Button
-            className="flex-1"
-            onClick={handleAccept}
-            loading={status === 'accepting'}
-            disabled={status === 'declining'}
-          >
-            Accept
-          </Button>
-          <Button
-            className="flex-1"
-            variant="secondary"
-            onClick={handleDecline}
-            loading={status === 'declining'}
-            disabled={status === 'accepting'}
-          >
-            Decline
-          </Button>
-        </div>
+          <div className="mt-8 flex flex-wrap gap-3">
+            <Button
+              variant="primary"
+              size="lg"
+              className="flex-1"
+              onClick={handleAccept}
+              loading={status === 'accepting'}
+              disabled={status === 'declining'}
+            >
+              Accept
+            </Button>
+            <Button
+              variant="secondary"
+              size="lg"
+              className="flex-1"
+              onClick={handleDecline}
+              loading={status === 'declining'}
+              disabled={status === 'accepting'}
+            >
+              Decline
+            </Button>
+          </div>
 
-        {error && (
-          <p className="mt-3 text-sm text-red-600" role="alert">{error}</p>
-        )}
+          {error && (
+            <InlineNotice tone="danger" role="alert" className="mt-4">
+              {error}
+            </InlineNotice>
+          )}
 
-        <p className="mt-4 text-xs text-gray-500">
-          This is a placeholder privacy notice. Legal-approved copy is pending.
-        </p>
-      </Card>
-    </main>
+          <p className="mt-4 text-xs leading-5 text-ink-tertiary">
+            This is a placeholder privacy notice. Legal-approved copy is pending.
+          </p>
+        </GlassPanel>
+      </main>
+    </div>
   );
 }

@@ -25,7 +25,7 @@
  */
 
 import type { PhoneCalendarAppointment, PhoneWindow } from '../../types';
-import { Table, THead, TBody, Th, Td } from '../design';
+import { GlassPanel, Table, THead, TBody, Th, Td } from '../design';
 import {
   formatIstBandLabel,
   formatIstDayLabel,
@@ -57,102 +57,111 @@ export function PhoneWeekTable({
   const { byCell, outside } = placeAppointments(appointments, weekDates, bands);
 
   return (
-    <Table caption="Phone screening week — calling times in India Standard Time down the rows, calendar days across the columns">
-      <THead>
-        <tr>
-          {/*
-            The corner cell of a two-axis table. It labels the row-header
-            column, so it is a `col` header for those headers rather than an
-            empty cell — and the text is visible, because "IST time" is
-            exactly what an operator needs to know about that column.
-          */}
-          <Th scope="col" className="whitespace-nowrap">
-            IST time
-          </Th>
-          {weekDates.map((date) => (
-            <Th key={date} scope="col" className="whitespace-nowrap">
-              {/*
-                The abbreviated label is shown; the unabbreviated one is what
-                assistive technology announces. "Mon 24 Aug" is scannable in a
-                narrow column, but "Mon" read aloud is a guess between Monday
-                and month.
-              */}
-              <span aria-hidden="true">{formatIstDayLabel(date)}</span>
-              <span className="sr-only">{formatIstLongDayLabel(date)}</span>
-              {date === today && (
-                <span className="ml-1.5 text-xs font-medium normal-case text-brand-600 dark:text-brand-400">
-                  Today
-                </span>
-              )}
+    /*
+      One glass surface for the whole grid; the table itself is `bare` so the
+      panel and the table are not two stacked materials. The inner scroll
+      container keeps a seven-column week usable on a narrow viewport by
+      scrolling it rather than clipping it (WCAG 1.4.10).
+    */
+    <GlassPanel padding="none" className="overflow-hidden">
+      <Table bare caption="Phone screening week — calling times in India Standard Time down the rows, calendar days across the columns">
+        <THead>
+          <tr>
+            {/*
+              The corner cell of a two-axis table. It labels the row-header
+              column, so it is a `col` header for those headers rather than an
+              empty cell — and the text is visible, because "IST time" is
+              exactly what an operator needs to know about that column.
+            */}
+            <Th scope="col" className="whitespace-nowrap">
+              IST time
             </Th>
+            {weekDates.map((date) => (
+              <Th key={date} scope="col" className="whitespace-nowrap">
+                {/*
+                  The abbreviated label is shown; the unabbreviated one is what
+                  assistive technology announces. "Mon 24 Aug" is scannable in a
+                  narrow column, but "Mon" read aloud is a guess between Monday
+                  and month.
+                */}
+                <span aria-hidden="true">{formatIstDayLabel(date)}</span>
+                <span className="sr-only">{formatIstLongDayLabel(date)}</span>
+                {date === today && (
+                  <span className="ml-1.5 text-xs font-medium normal-case text-info">
+                    Today
+                  </span>
+                )}
+              </Th>
+            ))}
+          </tr>
+        </THead>
+        <TBody>
+          {bands.map((band) => (
+            <tr key={band.startHour} className="align-top">
+              <Th
+                scope="row"
+                className="whitespace-nowrap border-r border-glass-ring text-left align-top"
+              >
+                {formatIstBandLabel(band.startHour, band.endHour)}
+              </Th>
+              {weekDates.map((date) => {
+                const inCell = byCell.get(cellKey(date, band.startHour)) ?? [];
+                return (
+                  <Td key={date} className="min-w-[9rem] py-2 align-top">
+                    {inCell.length > 0 && (
+                      <ul className="flex flex-col gap-1.5">
+                        {inCell.map((appt) => (
+                          <li key={appt.id}>
+                            <PhoneAppointmentButton
+                              appointment={appt}
+                              selected={appt.id === selectedId}
+                              onSelect={onSelect}
+                            />
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </Td>
+                );
+              })}
+            </tr>
           ))}
-        </tr>
-      </THead>
-      <TBody>
-        {bands.map((band) => (
-          <tr key={band.startHour} className="align-top">
-            <Th
-              scope="row"
-              className="whitespace-nowrap border-r border-line text-left align-top"
-            >
-              {formatIstBandLabel(band.startHour, band.endHour)}
-            </Th>
-            {weekDates.map((date) => {
-              const inCell = byCell.get(cellKey(date, band.startHour)) ?? [];
-              return (
-                <Td key={date} className="min-w-[9rem] align-top">
-                  {inCell.length > 0 && (
-                    <ul className="flex flex-col gap-1.5">
-                      {inCell.map((appt) => (
-                        <li key={appt.id}>
-                          <PhoneAppointmentButton
-                            appointment={appt}
-                            selected={appt.id === selectedId}
-                            onSelect={onSelect}
-                          />
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                </Td>
-              );
-            })}
-          </tr>
-        ))}
 
-        {outside.length > 0 && (
-          <tr className="align-top">
-            <Th
-              scope="row"
-              className="whitespace-nowrap border-r border-line text-left align-top"
-            >
-              Outside the calling window
-            </Th>
-            <Td colSpan={weekDates.length} className="align-top">
-              <p className="mb-2 text-xs text-ink-secondary">
-                These appointments start outside the {formatIstBandLabel(
-                  bands[0].startHour,
-                  bands[bands.length - 1].endHour,
-                )}{' '}
-                window reported by the API, or on a day outside this week. They
-                are listed here rather than hidden.
-              </p>
-              <ul className="flex flex-wrap gap-1.5">
-                {outside.map((appt) => (
-                  <li key={appt.id}>
-                    <PhoneAppointmentButton
-                      appointment={appt}
-                      selected={appt.id === selectedId}
-                      onSelect={onSelect}
-                      showDate
-                    />
-                  </li>
-                ))}
-              </ul>
-            </Td>
-          </tr>
-        )}
-      </TBody>
-    </Table>
+          {outside.length > 0 && (
+            /* Tinted, because these rows are outside the calling window. */
+            <tr className="bg-ink/[0.03] align-top">
+              <Th
+                scope="row"
+                className="whitespace-nowrap border-r border-glass-ring text-left align-top"
+              >
+                Outside the calling window
+              </Th>
+              <Td colSpan={weekDates.length} className="align-top">
+                <p className="mb-2 text-[13px] leading-5 text-ink-tertiary">
+                  These appointments start outside the {formatIstBandLabel(
+                    bands[0].startHour,
+                    bands[bands.length - 1].endHour,
+                  )}{' '}
+                  window reported by the API, or on a day outside this week. They
+                  are listed here rather than hidden.
+                </p>
+                <ul className="flex flex-wrap gap-1.5">
+                  {outside.map((appt) => (
+                    <li key={appt.id}>
+                      <PhoneAppointmentButton
+                        appointment={appt}
+                        selected={appt.id === selectedId}
+                        onSelect={onSelect}
+                        showDate
+                      />
+                    </li>
+                  ))}
+                </ul>
+              </Td>
+            </tr>
+          )}
+        </TBody>
+      </Table>
+    </GlassPanel>
   );
 }

@@ -19,26 +19,42 @@
  * per-candidate N+1 fetches, and there is no aggregate endpoint): pipeline
  * "average score" and LLM "recommendation distribution" — those live only on
  * per-candidate assessments. Admin session-ops analytics live in Mission
- * Control (linked), not duplicated here.
+ * Control (linked from the header), not duplicated here.
+ *
+ * Surface language: the glass system (docs/design/hello-glass-design-system.md).
+ * One `GlassPanel` per logical block, `glass-sunken` wells inside, a staggered
+ * reveal for the KPI strip, bounded lists. No legacy `components/ui` imports.
  */
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { Link, useNavigate } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import type { Candidate, CandidatesSummary, MeResponse, NotificationIntent } from '../types';
-import { ErrorState, LoadingState } from '../components/ui';
-import { PageHeader } from '../components/design';
-import { KpiCard } from '../components/design';
-import { ChartCard } from '../components/design';
 import {
-  Table,
-  THead,
-  TBody,
-  Tr,
-  Th,
-  Td,
+  Button,
+  buttonClass,
+  ChartCard,
+  EmptyPanel,
+  ErrorPanel,
+  GlassPanel,
+  InlineNotice,
+  KpiCard,
+  LoadingPanel,
+  PageHeader,
+  RevealGroup,
+  RevealItem,
+  ScrollArea,
+  SectionHeader,
   StatusBadge,
+  Table,
+  TBody,
+  Td,
+  Th,
+  THead,
+  Tr,
+  cx,
 } from '../components/design';
+import type { StatusTone } from '../components/design';
 import { DonutChart, LineChart } from '../components/charts';
 import {
   candidateStatusLabel,
@@ -53,13 +69,20 @@ import {
 import { formatDateTime } from '../lib/datetime';
 import { addIstDays, istDayStartUtcIso, istToday } from '../lib/ist-datetime';
 import type { PhoneCalendarResponse } from '../types';
-import type { StatusTone } from '../components/design/StatusBadge';
 
 const INTENT_KIND_META: Record<string, { title: string; tone: StatusTone }> = {
   assessment_ready: { title: 'Screening ready for review', tone: 'info' },
   appeal_resolved: { title: 'Appeal resolved — review outcome', tone: 'success' },
   quota_warning: { title: 'Session quota nearing its limit', tone: 'warning' },
 };
+
+/** Same clothes as the Mission Control header quick links. */
+const quickLinkClass =
+  'inline-flex h-9 items-center gap-2 rounded-control bg-white/70 pl-2 pr-3 text-[13px] font-medium text-ink shadow-[inset_0_0_0_1px_var(--glass-ring-strong)] transition-[background-color,box-shadow,transform] duration-200 ease-soft hover:-translate-y-px hover:bg-white hover:shadow-pill focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface-secondary';
+
+/** Inline link inside body copy and table cells — the accent, never a brand utility. */
+const inlineLinkClass =
+  'font-medium text-info hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-info';
 
 export function DashboardPage() {
   const navigate = useNavigate();
@@ -136,10 +159,10 @@ export function DashboardPage() {
   );
 
   if (loadError) {
-    return <ErrorState message={loadError} onRetry={load} />;
+    return <ErrorPanel message={loadError} onRetry={load} />;
   }
   if (!candidates || !me) {
-    return <LoadingState label="Loading dashboard…" />;
+    return <LoadingPanel label="Loading dashboard…" />;
   }
 
   const byStatus = (statuses: string[]) =>
@@ -162,59 +185,83 @@ export function DashboardPage() {
       <PageHeader
         eyebrow="Talent workspace"
         title="Dashboard"
-        description="Your screening pipeline at a glance — every figure is derived from live API data, and every card drills into the matching candidates."
+        description="Your pipeline at a glance — every figure comes from live data and drills into the matching candidates."
         actions={
-          <button
-            type="button"
-            onClick={load}
-            className="inline-flex items-center rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink-secondary transition-colors hover:bg-surface-tertiary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
-          >
-            Refresh
-          </button>
+          <>
+            <Button size="sm" variant="secondary" onClick={load}>
+              Refresh
+            </Button>
+            {me.role === 'admin' && (
+              /*
+                Session operations, recording integrity and quotas live in
+                Mission Control. A real <Link> in the header (keyboard
+                reachable, open-in-new-tab friendly) replaces the trailing
+                paragraph that used to carry the same destination.
+              */
+              <Link to="/mission-control" className={quickLinkClass}>
+                <span
+                  aria-hidden="true"
+                  className="flex h-5 w-5 items-center justify-center rounded-md bg-info-soft text-[10px] font-semibold text-info"
+                >
+                  MC
+                </span>
+                Mission Control
+                <ArrowIcon />
+              </Link>
+            )}
+          </>
         }
       />
 
-      {/* KPI row — every card is a drill-down link */}
-      <div className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <KpiLink
-          href={candidatesHref()}
-          label="Candidates"
-          value={total}
-          hint="in pipeline"
-          ariaLabel={`${total} candidates in pipeline. View all candidates.`}
-        />
-        <KpiLink
-          href={candidatesHref({ statuses: ['new'] })}
-          label="Awaiting screening"
-          value={awaiting}
-          tone={awaiting > 0 ? 'warning' : 'default'}
-          hint="new · not yet screened"
-          ariaLabel={`${awaiting} candidates awaiting screening. View them.`}
-        />
-        <KpiLink
-          href={candidatesHref({ statuses: ['queued', 'screening'] })}
-          label="In screening"
-          value={inScreening}
-          tone={inScreening > 0 ? 'warning' : 'default'}
-          hint="queued or active"
-          ariaLabel={`${inScreening} candidates in screening. View them.`}
-        />
-        <KpiLink
-          href={candidatesHref({ statuses: ['screened'] })}
-          label="Awaiting decision"
-          value={awaitingDecision}
-          tone={awaitingDecision > 0 ? 'info' : 'default'}
-          hint="screened · ready to review"
-          ariaLabel={`${awaitingDecision} candidates awaiting a decision. Review them.`}
-        />
-      </div>
+      {/* KPI strip — every card is a drill-down link */}
+      <RevealGroup className="mt-6 grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <RevealItem className="h-full">
+          <KpiLink
+            href={candidatesHref()}
+            label="Candidates"
+            value={total}
+            hint="in pipeline"
+            ariaLabel={`${total} candidates in pipeline. View all candidates.`}
+          />
+        </RevealItem>
+        <RevealItem className="h-full">
+          <KpiLink
+            href={candidatesHref({ statuses: ['new'] })}
+            label="Awaiting screening"
+            value={awaiting}
+            tone={awaiting > 0 ? 'warning' : 'default'}
+            hint="new · not yet screened"
+            ariaLabel={`${awaiting} candidates awaiting screening. View them.`}
+          />
+        </RevealItem>
+        <RevealItem className="h-full">
+          <KpiLink
+            href={candidatesHref({ statuses: ['queued', 'screening'] })}
+            label="In screening"
+            value={inScreening}
+            tone={inScreening > 0 ? 'warning' : 'default'}
+            hint="queued or active"
+            ariaLabel={`${inScreening} candidates in screening. View them.`}
+          />
+        </RevealItem>
+        <RevealItem className="h-full">
+          <KpiLink
+            href={candidatesHref({ statuses: ['screened'] })}
+            label="Awaiting decision"
+            value={awaitingDecision}
+            tone={awaitingDecision > 0 ? 'info' : 'default'}
+            hint="screened · ready to review"
+            ariaLabel={`${awaitingDecision} candidates awaiting a decision. Review them.`}
+          />
+        </RevealItem>
+      </RevealGroup>
 
-      {/* Funnel + completion + trend */}
-      <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-3">
+      {/* Editorial row — the funnel reads wide, the summaries stack beside it */}
+      <div className="mt-6 grid grid-cols-1 items-start gap-6 lg:grid-cols-12">
         <ChartCard
           title="Screening funnel"
           description="Candidates by pipeline stage. Select a stage to view those candidates."
-          className="lg:col-span-2"
+          className="lg:col-span-7"
         >
           <DonutChart
             title="Screening funnel"
@@ -228,7 +275,7 @@ export function DashboardPage() {
           />
         </ChartCard>
 
-        <div className="flex flex-col gap-6">
+        <div className="flex flex-col gap-6 lg:col-span-5">
           <CompletionCard
             completionPct={completionPct}
             decided={decided}
@@ -239,9 +286,11 @@ export function DashboardPage() {
       </div>
 
       {/* Assessment outcomes — average score + recommendation distribution */}
-      <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-3">
-        <AverageScoreCard summary={summary} error={summaryError} />
-        <div className="lg:col-span-2">
+      <div className="mt-6 grid grid-cols-1 items-start gap-6 lg:grid-cols-12">
+        <div className="lg:col-span-4">
+          <AverageScoreCard summary={summary} error={summaryError} />
+        </div>
+        <div className="lg:col-span-8">
           <RecommendationDistribution
             summary={summary}
             error={summaryError}
@@ -267,7 +316,7 @@ export function DashboardPage() {
       </div>
 
       {/* Recent candidates + prioritized work */}
-      <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-2">
+      <div className="mt-6 grid grid-cols-1 items-start gap-6 lg:grid-cols-2">
         <RecentCandidates candidates={candidates} />
         <ActionQueue
           intents={intents}
@@ -280,19 +329,24 @@ export function DashboardPage() {
       {me.role !== 'viewer' && (
         <PhoneScheduleCard data={phoneSchedule} error={phoneScheduleError} />
       )}
-
-      {me.role === 'admin' && (
-        <p className="mt-6 text-sm text-ink-secondary">
-          Looking for session operations, recordings integrity and quotas?{' '}
-          <Link
-            to="/mission-control"
-            className="font-medium text-brand-700 hover:text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
-          >
-            Open Mission Control →
-          </Link>
-        </p>
-      )}
     </div>
+  );
+}
+
+function ArrowIcon() {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 24 24"
+      className="h-3.5 w-3.5 text-ink-tertiary"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+    >
+      <path d="M7 17 17 7M8 7h9v9" />
+    </svg>
   );
 }
 
@@ -314,73 +368,83 @@ function PhoneScheduleCard({
   const next = upcoming.slice(0, 3);
 
   return (
-    <section
-      aria-labelledby="phone-schedule-heading"
-      className="mt-6 rounded-xl border border-line bg-surface p-5 shadow-card"
-    >
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div>
-          <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">Operations</p>
-          <h2 id="phone-schedule-heading" className="mt-1 text-lg font-semibold text-ink">
-            Phone schedule
-          </h2>
-          <p className="mt-1 text-sm text-ink-secondary">
-            Upcoming callbacks and screening appointments in IST.
-          </p>
-        </div>
-        <Link
-          to="/phone-calendar"
-          className="inline-flex min-h-11 items-center rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink-secondary transition-colors hover:bg-surface-tertiary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
-        >
-          Open phone calendar
-        </Link>
-      </div>
+    <GlassPanel as="section" aria-labelledby="phone-schedule-heading" className="mt-6">
+      <SectionHeader
+        id="phone-schedule-heading"
+        title="Phone schedule"
+        description="Upcoming callbacks and screening appointments in IST."
+        actions={
+          <Link to="/phone-calendar" className={buttonClass('secondary', 'sm')}>
+            Open phone calendar
+          </Link>
+        }
+        className="mb-4"
+      />
 
       {error ? (
-        <p role="status" className="mt-4 text-sm text-error">
+        <InlineNotice tone="warning">
           Phone schedule unavailable. Open the phone calendar to retry.
-        </p>
+        </InlineNotice>
       ) : data === null ? (
-        <p role="status" className="mt-4 text-sm text-ink-tertiary">Loading schedule…</p>
+        <LoadingPanel compact label="Loading schedule…" />
       ) : !data.enabled ? (
-        <p role="status" className="mt-4 text-sm text-ink-secondary">
+        <InlineNotice tone="neutral">
           Phone screening is turned off. No appointments were loaded.
-        </p>
+        </InlineNotice>
       ) : (
         <>
-          <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-3">
+          <div className="grid grid-cols-3 gap-3">
             <ScheduleMetric label="Upcoming" value={upcoming.length} />
-            <ScheduleMetric label="Overdue" value={overdue.length} tone={overdue.length > 0 ? 'warning' : undefined} />
+            <ScheduleMetric
+              label="Overdue"
+              value={overdue.length}
+              tone={overdue.length > 0 ? 'warning' : undefined}
+            />
             <ScheduleMetric label="Loaded" value={data.count} />
           </div>
           {data.truncated && (
-            <p role="status" className="mt-3 text-xs text-warning">
-              The schedule is larger than this summary window; open the calendar for the full bounded view.
-            </p>
+            <InlineNotice tone="warning" className="mt-3">
+              The schedule is larger than this summary window; open the calendar for the full
+              bounded view.
+            </InlineNotice>
           )}
           {next.length > 0 ? (
-            <ul className="mt-4 divide-y divide-line" aria-label="Next phone appointments">
+            <ul className="mt-4 divide-y divide-glass-ring" aria-label="Next phone appointments">
               {next.map((appointment) => (
-                <li key={appointment.id} className="flex flex-wrap items-center justify-between gap-2 py-2 text-sm">
-                  <div>
-                    <p className="font-medium text-ink">
+                <li
+                  key={appointment.id}
+                  className="flex flex-wrap items-center justify-between gap-2 py-2.5 text-sm"
+                >
+                  <div className="min-w-0">
+                    <p className="truncate font-medium text-ink">
                       {appointment.candidate?.name ?? 'Candidate'}
                     </p>
-                    <p className="text-xs text-ink-tertiary">
-                      {formatDateTime(appointment.starts_at)} · {appointment.ist_start ?? 'IST time unavailable'} IST
+                    <p className="text-[13px] text-ink-tertiary">
+                      {formatDateTime(appointment.starts_at)} ·{' '}
+                      {appointment.ist_start ?? 'IST time unavailable'} IST
                     </p>
                   </div>
-                  <StatusBadge tone="info">{appointment.status}</StatusBadge>
+                  <StatusBadge tone="info" className="shrink-0">
+                    <span title={appointment.status}>{humanise(appointment.status)}</span>
+                  </StatusBadge>
                 </li>
               ))}
             </ul>
           ) : (
-            <p className="mt-4 text-sm text-ink-secondary">No upcoming appointments in the next seven days.</p>
+            <p className="mt-4 text-sm text-ink-secondary">
+              No upcoming appointments in the next seven days.
+            </p>
           )}
         </>
       )}
-    </section>
+    </GlassPanel>
   );
+}
+
+/** `snake_case` backend enum → sentence case; the raw value stays in `title`. */
+function humanise(raw: string): string {
+  const spaced = raw.replace(/_/g, ' ');
+  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
 }
 
 function ScheduleMetric({
@@ -393,9 +457,14 @@ function ScheduleMetric({
   tone?: 'warning';
 }) {
   return (
-    <div className="rounded-lg border border-line bg-surface-muted p-3">
-      <p className="text-xs font-medium uppercase tracking-wide text-ink-tertiary">{label}</p>
-      <p className={`mt-1 text-2xl font-semibold tabular-nums ${tone === 'warning' ? 'text-warning' : 'text-ink'}`}>
+    <div className="glass-sunken p-3">
+      <p className="text-[13px] font-medium text-ink-tertiary">{label}</p>
+      <p
+        className={cx(
+          'mt-1 text-2xl font-semibold tabular-nums tracking-[-0.02em]',
+          tone === 'warning' ? 'text-warning-text' : 'text-ink',
+        )}
+      >
         {value}
       </p>
     </div>
@@ -425,7 +494,9 @@ function KpiLink({
     <Link
       to={href}
       aria-label={ariaLabel}
-      className="group block rounded-xl transition-shadow hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+      // The hover lift belongs to the link, and its radius must match the card
+      // it wraps — otherwise the lifted shadow squares off the glass corners.
+      className="group block h-full rounded-card glass-interactive focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2"
     >
       <KpiCard label={label} value={value} hint={hint} tone={cardTone} />
     </Link>
@@ -441,56 +512,83 @@ function CompletionCard({
   decided: number;
   considered: number;
 }) {
+  // The track grows from zero after mount: a width transition only reads as
+  // motion if the first painted frame is empty. It collapses under
+  // prefers-reduced-motion via the global transition-duration override.
+  const [drawn, setDrawn] = useState(0);
+  useEffect(() => {
+    setDrawn(completionPct);
+  }, [completionPct]);
+
   return (
-    <div className="rounded-xl border border-line bg-surface p-5 shadow-card">
-      <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">
-        Completion
-      </p>
-      <p className="mt-2 text-2xl font-semibold tabular-nums tracking-tight text-ink">
+    <GlassPanel>
+      <p className="text-[13px] font-medium text-ink-secondary">Completion</p>
+      <p className="mt-2 text-stat tabular-nums text-ink">
         {completionPct}
-        <span className="ml-0.5 text-base font-normal text-ink-tertiary">%</span>
+        <span className="ml-0.5 text-base font-normal tracking-normal text-ink-tertiary">%</span>
       </p>
-      <p className="mt-1 text-xs text-ink-tertiary">
+      <p className="mt-1 text-[13px] text-ink-tertiary">
         {decided} of {considered} decided (advanced or rejected)
       </p>
       <div
-        className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-surface-tertiary"
+        className="mt-4 h-2 w-full overflow-hidden rounded-full bg-ink/[0.06]"
         role="img"
         aria-label={`Completion ${completionPct} percent`}
       >
         <div
-          className="h-full rounded-full bg-brand-500"
-          style={{ width: `${completionPct}%` }}
+          className="h-full rounded-full bg-info transition-[width] duration-700 ease-soft"
+          style={{ width: `${drawn}%` }}
         />
       </div>
-    </div>
+    </GlassPanel>
   );
 }
 
 function OutcomeLinks({ advanced, rejected }: { advanced: number; rejected: number }) {
   return (
-    <div className="grid grid-cols-2 gap-3">
-      <Link
-        to={candidatesHref({ statuses: ['advanced'] })}
-        className="rounded-xl border border-line bg-surface p-4 shadow-card transition-shadow hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
-        aria-label={`${advanced} advanced candidates. View them.`}
-      >
-        <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">
-          Advanced
-        </p>
-        <p className="mt-1 text-xl font-semibold tabular-nums text-success">{advanced}</p>
-      </Link>
-      <Link
-        to={candidatesHref({ statuses: ['rejected'] })}
-        className="rounded-xl border border-line bg-surface p-4 shadow-card transition-shadow hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
-        aria-label={`${rejected} rejected candidates. View them.`}
-      >
-        <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">
-          Rejected
-        </p>
-        <p className="mt-1 text-xl font-semibold tabular-nums text-error">{rejected}</p>
-      </Link>
+    <div className="grid grid-cols-2 gap-4">
+      <OutcomeLink
+        href={candidatesHref({ statuses: ['advanced'] })}
+        label="Advanced"
+        value={advanced}
+        valueClass="text-success-text"
+        ariaLabel={`${advanced} advanced candidates. View them.`}
+      />
+      <OutcomeLink
+        href={candidatesHref({ statuses: ['rejected'] })}
+        label="Rejected"
+        value={rejected}
+        valueClass="text-error-text"
+        ariaLabel={`${rejected} rejected candidates. View them.`}
+      />
     </div>
+  );
+}
+
+function OutcomeLink({
+  href,
+  label,
+  value,
+  valueClass,
+  ariaLabel,
+}: {
+  href: string;
+  label: string;
+  value: number;
+  valueClass: string;
+  ariaLabel: string;
+}) {
+  return (
+    <Link
+      to={href}
+      aria-label={ariaLabel}
+      className="group block h-full rounded-card focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2"
+    >
+      <GlassPanel interactive padding="sm" className="h-full">
+        <p className="text-[13px] font-medium text-ink-secondary">{label}</p>
+        <p className={cx('mt-1 text-xl font-semibold tabular-nums', valueClass)}>{value}</p>
+      </GlassPanel>
+    </Link>
   );
 }
 
@@ -512,32 +610,34 @@ function AverageScoreCard({
           ? `Average assessment score ${summary!.average_score} across ${summary!.assessed_count} assessed candidates. View them.`
           : 'View assessed candidates.'
       }
-      className="group block rounded-xl border border-line bg-surface p-5 shadow-card transition-shadow hover:shadow-md focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+      className="group block h-full rounded-card focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2"
     >
-      <p className="text-xs font-medium uppercase tracking-wide text-ink-secondary">
-        Average score
-      </p>
-      {error ? (
-        <p className="mt-2 text-sm text-error">{error}</p>
-      ) : summary == null ? (
-        <p className="mt-2 text-sm text-ink-tertiary">Loading…</p>
-      ) : summary.average_score == null ? (
-        <>
-          <p className="mt-2 text-2xl font-semibold text-ink-tertiary">—</p>
-          <p className="mt-1 text-xs text-ink-tertiary">No assessments yet</p>
-        </>
-      ) : (
-        <>
-          <p className="mt-2 text-2xl font-semibold tabular-nums tracking-tight text-ink">
-            {summary.average_score}
-            <span className="ml-0.5 text-base font-normal text-ink-tertiary">/ 100</span>
-          </p>
-          <p className="mt-1 text-xs text-ink-tertiary">
-            across {summary.assessed_count} assessed candidate
-            {summary.assessed_count === 1 ? '' : 's'}
-          </p>
-        </>
-      )}
+      <GlassPanel interactive className="flex h-full flex-col">
+        <p className="text-[13px] font-medium text-ink-secondary">Average score</p>
+        {error ? (
+          <ErrorPanel compact className="mt-3" message={error} />
+        ) : summary == null ? (
+          <LoadingPanel compact />
+        ) : summary.average_score == null ? (
+          <>
+            <p className="mt-2 text-stat tabular-nums text-ink-tertiary">—</p>
+            <p className="mt-1 text-[13px] text-ink-tertiary">No assessments yet</p>
+          </>
+        ) : (
+          <>
+            <p className="mt-2 text-stat tabular-nums text-ink">
+              {summary.average_score}
+              <span className="ml-1 text-base font-normal tracking-normal text-ink-tertiary">
+                / 100
+              </span>
+            </p>
+            <p className="mt-1 text-[13px] text-ink-tertiary">
+              across {summary.assessed_count} assessed candidate
+              {summary.assessed_count === 1 ? '' : 's'}
+            </p>
+          </>
+        )}
+      </GlassPanel>
     </Link>
   );
 }
@@ -568,25 +668,16 @@ function RecommendationDistribution({
       description="Latest assessment recommendation per candidate. Select a category to view those candidates."
     >
       {error ? (
-        <div role="alert" className="flex h-full min-h-40 flex-col items-center justify-center gap-3 rounded-xl border border-error/30 bg-error-soft px-4 text-center">
-          <p className="max-w-md text-sm text-error">{error}</p>
-          <button
-            type="button"
-            onClick={onRetry}
-            className="inline-flex items-center rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink transition-colors hover:bg-surface-tertiary"
-          >
-            Try again
-          </button>
-        </div>
+        <ErrorPanel compact className="h-full min-h-40" message={error} onRetry={onRetry} />
       ) : summary == null ? (
         <DonutChart title="Recommendation distribution" data={[]} isLoading height={240} />
       ) : total === 0 ? (
-        <div className="flex h-full min-h-40 flex-col items-center justify-center gap-1.5 rounded-xl border border-dashed border-line-strong bg-surface-secondary px-4 text-center">
-          <p className="text-sm font-medium text-ink-secondary">No assessments yet</p>
-          <p className="max-w-sm text-xs text-ink-tertiary">
-            Recommendation counts appear once candidates are assessed.
-          </p>
-        </div>
+        <EmptyPanel
+          compact
+          className="h-full min-h-40"
+          title="No assessments yet"
+          hint="Recommendation counts appear once candidates are assessed."
+        />
       ) : (
         <DonutChart
           title="Recommendation distribution"
@@ -610,28 +701,41 @@ function RecentCandidates({ candidates }: { candidates: Candidate[] }) {
 
   if (candidates.length === 0) {
     return (
-      <section
-        aria-label="Recent candidates"
-        className="rounded-xl border border-dashed border-line-strong bg-surface-secondary p-8 text-center"
-      >
-        <p className="text-sm font-medium text-ink-secondary">No candidates yet</p>
-        <p className="mx-auto mt-1 max-w-sm text-xs text-ink-tertiary">
-          Upload a resume from the Candidates page to start your pipeline.
-        </p>
-        <Link
-          to="/candidates"
-          className="mt-3 inline-block text-xs font-medium text-brand-700 hover:text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
-        >
-          Go to Candidates →
-        </Link>
-      </section>
+      <GlassPanel as="section" aria-label="Recent candidates">
+        <SectionHeader title="Recent candidates" className="mb-4" />
+        <EmptyPanel
+          compact
+          title="No candidates yet"
+          hint="Upload a resume from the Candidates page to start your pipeline."
+          action={
+            <Link to="/candidates" className={buttonClass('secondary', 'sm')}>
+              Go to Candidates
+            </Link>
+          }
+        />
+      </GlassPanel>
     );
   }
 
   return (
-    <section aria-label="Recent candidates">
-      <h2 className="mb-3 text-sm font-semibold text-ink">Recent candidates</h2>
-      <Table caption="Recent candidates, newest first">
+    <GlassPanel as="section" aria-label="Recent candidates">
+      <SectionHeader
+        title="Recent candidates"
+        meta={
+          <span className="text-[13px] tabular-nums text-ink-tertiary">
+            {candidates.length} total
+          </span>
+        }
+        actions={
+          candidates.length > recent.length ? (
+            <Link to="/candidates" className={buttonClass('ghost', 'sm')}>
+              View all {candidates.length}
+            </Link>
+          ) : undefined
+        }
+        className="mb-4"
+      />
+      <Table bare caption="Recent candidates, newest first">
         <THead>
           <Tr>
             <Th>Name</Th>
@@ -644,14 +748,11 @@ function RecentCandidates({ candidates }: { candidates: Candidate[] }) {
           {recent.map((candidate) => (
             <Tr key={candidate.id}>
               <Td>
-                <Link
-                  to={`/candidates/${candidate.id}`}
-                  className="font-medium text-brand-700 hover:text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
-                >
+                <Link to={`/candidates/${candidate.id}`} className={inlineLinkClass}>
                   {candidate.name || 'Unnamed'}
                 </Link>
                 {candidate.email && (
-                  <p className="text-xs text-ink-tertiary">{candidate.email}</p>
+                  <p className="text-[13px] text-ink-tertiary">{candidate.email}</p>
                 )}
               </Td>
               <Td>
@@ -659,12 +760,12 @@ function RecentCandidates({ candidates }: { candidates: Candidate[] }) {
                   {candidateStatusLabel(candidate.status)}
                 </StatusBadge>
               </Td>
-              <Td className="tabular-nums">
+              <Td className="whitespace-nowrap tabular-nums">
                 {candidate.experience_years != null
                   ? `${candidate.experience_years} yr`
                   : '—'}
               </Td>
-              <Td className="tabular-nums text-ink-secondary">
+              <Td className="whitespace-nowrap tabular-nums text-ink-secondary">
                 {formatDateTime(candidate.created_at, {
                   year: 'numeric',
                   month: 'short',
@@ -675,19 +776,15 @@ function RecentCandidates({ candidates }: { candidates: Candidate[] }) {
           ))}
         </TBody>
       </Table>
-      {candidates.length > recent.length && (
-        <Link
-          to="/candidates"
-          className="mt-3 inline-block text-xs font-medium text-brand-700 hover:text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
-        >
-          View all {candidates.length} candidates →
-        </Link>
-      )}
-    </section>
+    </GlassPanel>
   );
 }
 
 /* ── Prioritized work queue (real notification intents, no fabrication) ─ */
+
+const QUEUE_LIMIT = 8;
+/** Beyond this many rows the queue is bounded instead of running down the page. */
+const QUEUE_SCROLL_AFTER = 5;
 
 function ActionQueue({
   intents,
@@ -705,71 +802,70 @@ function ActionQueue({
     [candidates],
   );
 
+  const shown = intents ? intents.slice(0, QUEUE_LIMIT) : [];
+
+  const list = (
+    <ul className="divide-y divide-glass-ring">
+      {shown.map((intent) => {
+        const meta = INTENT_KIND_META[intent.kind] ?? {
+          title: humanise(intent.kind),
+          tone: 'neutral' as StatusTone,
+        };
+        const candidate = intent.candidate_id
+          ? candidateById.get(intent.candidate_id)
+          : undefined;
+        return (
+          <li key={intent.id} className="flex items-start justify-between gap-3 py-3">
+            <div className="min-w-0">
+              <StatusBadge tone={meta.tone}>{meta.title}</StatusBadge>
+              <p className="mt-1.5 truncate text-sm text-ink">
+                {candidate ? (
+                  <Link to={`/candidates/${candidate.id}`} className={inlineLinkClass}>
+                    {candidate.name || 'Unnamed candidate'}
+                  </Link>
+                ) : (
+                  <span className="text-ink-tertiary">
+                    {intent.candidate_id
+                      ? 'Candidate no longer available'
+                      : 'Workspace-wide'}
+                  </span>
+                )}
+              </p>
+              <p className="mt-0.5 text-[13px] text-ink-tertiary">
+                {formatDateTime(intent.created_at)}
+                {intent.consent_verified && (
+                  <span className="ml-2 rounded-full bg-success-soft px-1.5 py-0.5 text-[11px] font-medium text-success-text">
+                    consent verified
+                  </span>
+                )}
+              </p>
+            </div>
+          </li>
+        );
+      })}
+    </ul>
+  );
+
   return (
-    <section aria-label="Action queue">
-      <h2 className="mb-3 text-sm font-semibold text-ink">Prioritized work</h2>
-      <div className="rounded-xl border border-line bg-surface shadow-card">
-        {viewer ? (
-          <p className="px-4 py-6 text-center text-sm text-ink-tertiary">
-            Action items require interviewer or admin access.
-          </p>
-        ) : intents === null && !intentsError ? (
-          <p className="px-4 py-6 text-center text-sm text-ink-tertiary">
-            Loading action items…
-          </p>
-        ) : intentsError ? (
-          <div role="alert" className="m-3 rounded-lg border border-error/30 bg-error-soft p-3">
-            <p className="text-sm text-error">{intentsError}</p>
-          </div>
-        ) : intents === null || intents.length === 0 ? (
-          <p className="px-4 py-6 text-center text-sm text-ink-secondary">
-            You're all caught up — no pending items.
-          </p>
-        ) : (
-          <ul className="divide-y divide-line">
-            {intents.slice(0, 8).map((intent) => {
-              const meta = INTENT_KIND_META[intent.kind] ?? {
-                title: intent.kind,
-                tone: 'neutral' as StatusTone,
-              };
-              const candidate = intent.candidate_id
-                ? candidateById.get(intent.candidate_id)
-                : undefined;
-              return (
-                <li key={intent.id} className="flex items-start justify-between gap-3 px-4 py-3">
-                  <div className="min-w-0">
-                    <StatusBadge tone={meta.tone}>{meta.title}</StatusBadge>
-                    <p className="mt-1.5 truncate text-sm text-ink">
-                      {candidate ? (
-                        <Link
-                          to={`/candidates/${candidate.id}`}
-                          className="font-medium text-brand-700 hover:text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:text-brand-300"
-                        >
-                          {candidate.name || 'Unnamed candidate'}
-                        </Link>
-                      ) : (
-                        <span className="text-ink-tertiary">
-                          {intent.candidate_id
-                            ? 'Candidate no longer available'
-                            : 'Workspace-wide'}
-                        </span>
-                      )}
-                    </p>
-                    <p className="mt-0.5 text-xs text-ink-tertiary">
-                      {formatDateTime(intent.created_at)}
-                      {intent.consent_verified && (
-                        <span className="ml-2 rounded bg-success-soft px-1.5 py-0.5 text-[11px] font-medium text-success-text">
-                          consent verified
-                        </span>
-                      )}
-                    </p>
-                  </div>
-                </li>
-              );
-            })}
-          </ul>
-        )}
-      </div>
-    </section>
+    <GlassPanel as="section" aria-label="Action queue">
+      <SectionHeader title="Prioritized work" className="mb-4" />
+      {viewer ? (
+        <p className="py-6 text-center text-sm text-ink-tertiary">
+          Action items require interviewer or admin access.
+        </p>
+      ) : intents === null && !intentsError ? (
+        <LoadingPanel compact label="Loading action items…" />
+      ) : intentsError ? (
+        <ErrorPanel compact message={intentsError} />
+      ) : shown.length === 0 ? (
+        <EmptyPanel compact title="You're all caught up — no pending items." />
+      ) : shown.length > QUEUE_SCROLL_AFTER ? (
+        <ScrollArea maxHeight="22rem" label="Prioritized work">
+          {list}
+        </ScrollArea>
+      ) : (
+        list
+      )}
+    </GlassPanel>
   );
 }

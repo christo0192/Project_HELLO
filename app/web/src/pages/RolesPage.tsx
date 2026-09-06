@@ -3,16 +3,22 @@ import { api, ApiError } from "../api";
 import type { Role, RoleInput, ScreeningQuestion } from "../types";
 import {
   Button,
-  Card,
-  Chip,
-  EmptyState,
-  ErrorState,
-  Input,
-  Label,
-  LoadingState,
+  EmptyPanel,
+  ErrorPanel,
+  Field,
+  GlassPanel,
+  InlineNotice,
+  LoadingPanel,
   PageHeader,
-  Textarea,
-} from "../components/ui";
+  Pagination,
+  RevealGroup,
+  RevealItem,
+  SectionHeader,
+  StatusBadge,
+  TextArea,
+  TextField,
+  usePagination,
+} from "../components/design";
 
 interface QuestionRow {
   id: string;
@@ -61,82 +67,99 @@ export function RolesPage() {
 
   useEffect(load, [load]);
 
+  const pager = usePagination(roles ?? [], 10);
+
   return (
-    <div>
+    <div className="space-y-6">
       <PageHeader
+        eyebrow="Talent workspace"
         title="Roles"
         description="Define the jobs candidates are screened for and the questions Gopu will ask."
-        action={
-          editing === null && (
-            <Button onClick={() => setEditing("new")}>New role</Button>
-          )
+        actions={
+          editing === null ? (
+            <Button variant="primary" onClick={() => setEditing("new")}>
+              New role
+            </Button>
+          ) : undefined
         }
       />
 
       {editing !== null && (
-        <div className="mb-6">
-          <RoleForm
-            role={editing === "new" ? null : editing}
-            onCancel={() => setEditing(null)}
-            onSaved={() => {
-              setEditing(null);
-              load();
-            }}
-          />
-        </div>
+        <RoleForm
+          role={editing === "new" ? null : editing}
+          onCancel={() => setEditing(null)}
+          onSaved={() => {
+            setEditing(null);
+            load();
+          }}
+        />
       )}
 
-      {error && <ErrorState message={error} onRetry={load} />}
-      {!error && roles === null && <LoadingState label="Loading roles…" />}
+      {error && <ErrorPanel message={error} onRetry={load} />}
+      {!error && roles === null && <LoadingPanel label="Loading roles…" />}
       {!error && roles !== null && roles.length === 0 && editing === null && (
-        <EmptyState
+        <EmptyPanel
           title="No roles yet"
           hint="Create your first role to start screening candidates against it."
-          action={<Button onClick={() => setEditing("new")}>New role</Button>}
+          action={
+            <Button variant="primary" onClick={() => setEditing("new")}>
+              New role
+            </Button>
+          }
         />
       )}
 
       {roles && roles.length > 0 && (
-        <div className="space-y-3">
-          {roles.map((role) => (
-            <Card key={role.id} className="p-4">
-              <div className="flex items-start justify-between gap-4">
-                <div className="min-w-0">
-                  <div className="flex items-center gap-2">
-                    <h2 className="truncate text-sm font-semibold text-gray-900">
+        <div>
+          <RevealGroup className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
+            {pager.items.map((role) => (
+              <RevealItem key={role.id} as="article" className="h-full">
+                <GlassPanel
+                  interactive
+                  padding="sm"
+                  className="flex h-full flex-col gap-3"
+                >
+                  <div className="flex items-start justify-between gap-3">
+                    <h2 className="min-w-0 truncate text-[15px] font-semibold tracking-[-0.01em] text-ink">
                       {role.title}
                     </h2>
-                    <Chip tone={role.is_active ? "green" : "neutral"}>
+                    <StatusBadge tone={role.is_active ? "success" : "neutral"}>
                       {role.is_active ? "Active" : "Inactive"}
-                    </Chip>
+                    </StatusBadge>
                   </div>
-                  <p className="mt-1 line-clamp-2 text-sm text-gray-500">
+                  <p className="line-clamp-2 text-sm leading-6 text-ink-secondary">
                     {role.jd}
                   </p>
                   {role.required_skills.length > 0 && (
-                    <div className="mt-2 flex flex-wrap gap-1.5">
+                    <ul className="flex flex-wrap gap-1.5">
                       {role.required_skills.map((s) => (
-                        <Chip key={s} tone="accent">
+                        <li
+                          key={s}
+                          className="rounded-full bg-ink/[0.05] px-2 py-0.5 text-xs font-medium text-ink-secondary"
+                        >
                           {s}
-                        </Chip>
+                        </li>
                       ))}
-                    </div>
+                    </ul>
                   )}
-                  <p className="mt-2 text-xs text-gray-400">
-                    {role.screening_template.length} screening question
-                    {role.screening_template.length === 1 ? "" : "s"}
-                  </p>
-                </div>
-                <Button
-                  variant="secondary"
-                  onClick={() => setEditing(role)}
-                  className="shrink-0"
-                >
-                  Edit
-                </Button>
-              </div>
-            </Card>
-          ))}
+                  <div className="mt-auto flex items-end justify-between gap-3 pt-1">
+                    <p className="text-[13px] text-ink-tertiary">
+                      {role.screening_template.length} screening question{role.screening_template.length === 1 ? "" : "s"}
+                    </p>
+                    <Button
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => setEditing(role)}
+                      className="shrink-0"
+                    >
+                      Edit
+                    </Button>
+                  </div>
+                </GlassPanel>
+              </RevealItem>
+            ))}
+          </RevealGroup>
+          <Pagination state={pager} noun="roles" />
         </div>
       )}
     </div>
@@ -171,12 +194,19 @@ function PromptPreview({
   ].join("\\n\\n");
 
   return (
-    <div className="rounded-lg border border-indigo-100 bg-indigo-50/50 p-4">
-      <div className="mb-2 flex items-center justify-between">
-        <Label>Generated voice prompt preview</Label>
-        <span className="text-xs text-gray-500">updates as you edit</span>
+    <div className="glass-sunken p-4">
+      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+        <p className="text-[13px] font-medium text-ink-secondary">
+          Generated voice prompt preview
+        </p>
+        <span className="text-xs text-ink-tertiary">updates as you edit</span>
       </div>
-      <pre className="max-h-72 overflow-auto whitespace-pre-wrap rounded-md bg-white p-3 text-xs leading-5 text-gray-700">
+      <pre
+        role="region"
+        aria-label="Generated voice prompt preview"
+        tabIndex={0}
+        className="max-h-72 overflow-auto whitespace-pre-wrap rounded-control bg-white/70 p-3 font-mono text-xs leading-5 text-ink-secondary focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
+      >
         {prompt}
       </pre>
     </div>
@@ -274,114 +304,143 @@ function RoleForm({
   }
 
   return (
-    <Card className="p-5">
-      <h2 className="mb-4 text-sm font-semibold text-gray-900">
-        {role ? "Edit role" : "New role"}
-      </h2>
-      <form onSubmit={handleSubmit} className="space-y-4">
-        <div>
-          <Label htmlFor="role-title">Title</Label>
-          <Input
-            id="role-title"
-            value={title}
-            onChange={(e) => setTitle(e.target.value)}
-            placeholder="e.g. Senior Frontend Engineer"
-          />
-        </div>
+    <GlassPanel padding="lg">
+      <SectionHeader
+        title={role ? "Edit role" : "New role"}
+        description="The title, focus and questions below drive the screening conversation."
+      />
+      <form onSubmit={handleSubmit} className="mt-5 space-y-5">
+        <Field label="Title" id="role-title">
+          {({ id }) => (
+            <TextField
+              id={id}
+              value={title}
+              onChange={(e) => setTitle(e.target.value)}
+              placeholder="e.g. Senior Frontend Engineer"
+            />
+          )}
+        </Field>
+
+        <Field label="Job description" id="role-jd">
+          {({ id }) => (
+            <TextArea
+              id={id}
+              value={jd}
+              onChange={(e) => setJd(e.target.value)}
+              rows={4}
+              placeholder="Paste the JD or a short summary…"
+            />
+          )}
+        </Field>
+
+        <Field
+          label="Required skills"
+          id="role-skills"
+          hint="Separate skills with commas."
+        >
+          {({ id, describedBy }) => (
+            <TextField
+              id={id}
+              aria-describedby={describedBy}
+              value={skillsText}
+              onChange={(e) => setSkillsText(e.target.value)}
+              placeholder="React, TypeScript, CSS (comma-separated)"
+            />
+          )}
+        </Field>
 
         <div>
-          <Label htmlFor="role-jd">Job description</Label>
-          <Textarea
-            id="role-jd"
-            value={jd}
-            onChange={(e) => setJd(e.target.value)}
-            rows={4}
-            placeholder="Paste the JD or a short summary…"
+          <SectionHeader
+            level={3}
+            title="Screening questions"
+            actions={
+              <Button type="button" variant="ghost" size="sm" onClick={addQuestion}>
+                Add question
+              </Button>
+            }
           />
-        </div>
-
-        <div>
-          <Label htmlFor="role-skills">Required skills</Label>
-          <Input
-            id="role-skills"
-            value={skillsText}
-            onChange={(e) => setSkillsText(e.target.value)}
-            placeholder="React, TypeScript, CSS (comma-separated)"
-          />
-          <p className="mt-1 text-xs text-gray-400">
-            Separate skills with commas.
-          </p>
-        </div>
-
-        <div>
-          <div className="mb-2 flex items-center justify-between">
-            <Label>Screening questions</Label>
-            <Button type="button" variant="ghost" onClick={addQuestion}>
-              + Add question
-            </Button>
-          </div>
-          <div className="space-y-2">
-            {questions.map((q, idx) => (
-              <div key={idx} className="flex items-start gap-2">
-                <span className="mt-2.5 w-7 shrink-0 text-xs font-medium text-gray-400">
-                  {q.id || `q${idx + 1}`}
-                </span>
-                <div className="flex-1">
-                  <Input
-                    value={q.question}
-                    onChange={(e) =>
-                      updateQuestion(idx, { question: e.target.value })
-                    }
-                    placeholder="Question text…"
-                    aria-invalid={Boolean(spokenQuestionIssue(q.question, questions, idx))}
-                  />
-                  {spokenQuestionIssue(q.question, questions, idx) && (
-                    <p className="mt-1 text-xs text-amber-700" role="status">
-                      {spokenQuestionIssue(q.question, questions, idx)}
-                    </p>
-                  )}
+          <div className="mt-3 space-y-3">
+            {questions.map((q, idx) => {
+              const issue = spokenQuestionIssue(q.question, questions, idx);
+              return (
+                <div key={idx} className="glass-sunken space-y-3 p-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="font-mono text-[11px] text-ink-tertiary">
+                      {q.id || `q${idx + 1}`}
+                    </span>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => removeQuestion(idx)}
+                      aria-label="Remove question"
+                      disabled={questions.length === 1}
+                    >
+                      Remove
+                    </Button>
+                  </div>
+                  <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
+                    <Field
+                      className="min-w-0 flex-1"
+                      label={`Question ${idx + 1}`}
+                      id={`role-question-${idx}`}
+                      error={issue ?? undefined}
+                    >
+                      {({ id, describedBy, invalid }) => (
+                        <TextField
+                          id={id}
+                          aria-describedby={describedBy}
+                          value={q.question}
+                          onChange={(e) =>
+                            updateQuestion(idx, { question: e.target.value })
+                          }
+                          placeholder="Question text…"
+                          aria-invalid={invalid}
+                        />
+                      )}
+                    </Field>
+                    <Field
+                      className="sm:w-24"
+                      label="Weight"
+                      id={`role-question-${idx}-weight`}
+                    >
+                      {({ id }) => (
+                        <TextField
+                          id={id}
+                          type="number"
+                          min={0}
+                          step={1}
+                          value={q.weight}
+                          onChange={(e) =>
+                            updateQuestion(idx, { weight: Number(e.target.value) })
+                          }
+                          title="Weight"
+                        />
+                      )}
+                    </Field>
+                  </div>
                 </div>
-                <div className="w-20 shrink-0">
-                  <Input
-                    type="number"
-                    min={0}
-                    step={1}
-                    value={q.weight}
-                    onChange={(e) =>
-                      updateQuestion(idx, { weight: Number(e.target.value) })
-                    }
-                    aria-label="Weight"
-                    title="Weight"
-                  />
-                </div>
-                <Button
-                  type="button"
-                  variant="ghost"
-                  onClick={() => removeQuestion(idx)}
-                  className="mt-0.5 px-2 text-gray-400 hover:text-red-600"
-                  aria-label="Remove question"
-                  disabled={questions.length === 1}
-                >
-                  ✕
-                </Button>
-              </div>
-            ))}
+              );
+            })}
           </div>
         </div>
 
-        <div>
-          <Label htmlFor="role-instructions">Interviewer instructions</Label>
-          <Textarea
-            id="role-instructions"
-            value={interviewerInstructions}
-            onChange={(e) => setInterviewerInstructions(e.target.value)}
-            rows={5}
-            placeholder="Optional guidance: what good evidence looks like, which probes to prioritize, and what the interviewer should avoid…"
-          />
-          <p className="mt-1 text-xs text-gray-400">
-            This is included in the generated voice prompt and remains editable.
-          </p>
-        </div>
+        <Field
+          label="Interviewer instructions"
+          id="role-instructions"
+          hint="This is included in the generated voice prompt and remains editable."
+        >
+          {({ id, describedBy }) => (
+            <TextArea
+              id={id}
+              aria-describedby={describedBy}
+              value={interviewerInstructions}
+              onChange={(e) => setInterviewerInstructions(e.target.value)}
+              rows={5}
+              placeholder="Optional guidance: what good evidence looks like, which probes to prioritize, and what the interviewer should avoid…"
+            />
+          )}
+        </Field>
 
         <PromptPreview
           title={title}
@@ -392,13 +451,13 @@ function RoleForm({
         />
 
         {formError && (
-          <p className="text-sm text-red-600" role="alert">
+          <InlineNotice tone="danger" role="alert">
             {formError}
-          </p>
+          </InlineNotice>
         )}
 
-        <div className="flex gap-2 pt-1">
-          <Button type="submit" loading={saving}>
+        <div className="flex flex-wrap gap-2 pt-1">
+          <Button type="submit" variant="primary" loading={saving}>
             {role ? "Save changes" : "Create role"}
           </Button>
           <Button type="button" variant="secondary" onClick={onCancel}>
@@ -406,6 +465,6 @@ function RoleForm({
           </Button>
         </div>
       </form>
-    </Card>
+    </GlassPanel>
   );
 }

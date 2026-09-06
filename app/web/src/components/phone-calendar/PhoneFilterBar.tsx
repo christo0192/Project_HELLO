@@ -1,37 +1,40 @@
 /**
- * Facet filters over the week that is already loaded.
+ * The calendar toolbar: how the week is read, and which rows are shown.
  *
- * Every chip carries `aria-pressed`, so its on/off state is announced and is
- * never conveyed by fill colour alone. Each chip is at least 44px tall for
- * touch. Toggling one rewrites the query string and re-filters rows already
- * in memory — no request is issued, which a test pins.
+ * Everything here is a toggle over data that is ALREADY loaded. Switching
+ * view or toggling a facet rewrites the query string and re-filters rows in
+ * memory — no request is issued, which a test pins.
+ *
+ * Every control carries `aria-pressed`, so its on/off state is announced and
+ * is never conveyed by fill colour alone, and every control is at least 44px
+ * tall for touch (`Button size="lg"`).
  *
  * Zero-count facets are hidden, except an active one; see `phoneFacets` for
  * why that exception exists.
  */
 
 import { hasActivePhoneFilters } from './phoneCalendarFilters';
-import type { PhoneCalendarFilters, PhoneFacet } from './phoneCalendarFilters';
-import { cx } from '../design';
+import type {
+  PhoneCalendarFilters,
+  PhoneCalendarView,
+  PhoneFacet,
+} from './phoneCalendarFilters';
+import { Button, GlassPanel } from '../design';
 import { appointmentStatusTerm, engagementStateTerm } from './phoneVocabulary';
 
 export interface PhoneFilterBarProps {
   statusFacets: PhoneFacet[];
   stateFacets: PhoneFacet[];
   filters: PhoneCalendarFilters;
+  /** The view actually in effect (a narrow viewport may default it). */
+  view: PhoneCalendarView;
+  onViewChange: (view: PhoneCalendarView) => void;
   onToggle: (dimension: 'status' | 'state', value: string) => void;
   onClear: () => void;
 }
 
-function chipClasses(active: boolean): string {
-  return cx(
-    'inline-flex min-h-[44px] items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors',
-    'focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500',
-    active
-      ? 'border-brand-500 bg-brand-50 text-brand-800 dark:bg-brand-950 dark:text-brand-200'
-      : 'border-line bg-surface text-ink-secondary hover:bg-surface-tertiary hover:text-ink',
-  );
-}
+/** The one label style in this toolbar: sentence case, 13px, tertiary ink. */
+const legendClass = 'text-[13px] font-medium text-ink-tertiary';
 
 function FacetGroup({
   legend,
@@ -49,21 +52,21 @@ function FacetGroup({
   if (facets.length === 0) return null;
   return (
     <fieldset className="min-w-0">
-      <legend className="text-xs font-medium uppercase tracking-wide text-ink-tertiary">
-        {legend}
-      </legend>
-      <div className="mt-1.5 flex flex-wrap gap-2">
+      <legend className={legendClass}>{legend}</legend>
+      <div className="mt-2 flex flex-wrap gap-2">
         {facets.map((facet) => (
-          <button
+          <Button
             key={facet.value}
-            type="button"
+            size="lg"
+            variant={facet.active ? 'primary' : 'secondary'}
             aria-pressed={facet.active}
             onClick={() => onToggle(dimension, facet.value)}
-            className={chipClasses(facet.active)}
           >
             {labelFor(facet.value)}
-            <span className="text-ink-tertiary">{facet.count}</span>
-          </button>
+            <span className={facet.active ? 'text-white' : 'text-ink-tertiary'}>
+              {facet.count}
+            </span>
+          </Button>
         ))}
       </div>
     </fieldset>
@@ -74,14 +77,45 @@ export function PhoneFilterBar({
   statusFacets,
   stateFacets,
   filters,
+  view,
+  onViewChange,
   onToggle,
   onClear,
 }: PhoneFilterBarProps) {
   const anyActive = hasActivePhoneFilters(filters);
-  if (statusFacets.length === 0 && stateFacets.length === 0) return null;
 
   return (
-    <div className="mb-4 flex flex-col gap-4 rounded-xl border border-line bg-surface p-4 shadow-card sm:flex-row sm:flex-wrap sm:items-start">
+    <GlassPanel
+      padding="sm"
+      className="mb-5 flex flex-col gap-5 sm:flex-row sm:flex-wrap sm:items-start sm:gap-x-8"
+    >
+      <fieldset className="min-w-0">
+        <legend className={legendClass}>View</legend>
+        {/*
+          A sunken well holding two toggles rather than a `SegmentedControl`:
+          the segmented pill is 32px tall, and every control on this surface
+          has to clear the 44px touch target.
+        */}
+        <div className="glass-sunken mt-2 inline-flex gap-1 rounded-control p-1">
+          <Button
+            size="lg"
+            variant={view === 'week' ? 'primary' : 'ghost'}
+            aria-pressed={view === 'week'}
+            onClick={() => onViewChange('week')}
+          >
+            Week grid
+          </Button>
+          <Button
+            size="lg"
+            variant={view === 'queue' ? 'primary' : 'ghost'}
+            aria-pressed={view === 'queue'}
+            onClick={() => onViewChange('queue')}
+          >
+            Queue
+          </Button>
+        </div>
+      </fieldset>
+
       <FacetGroup
         legend="Appointment"
         facets={statusFacets}
@@ -97,14 +131,15 @@ export function PhoneFilterBar({
         onToggle={onToggle}
       />
       {anyActive && (
-        <button
-          type="button"
+        <Button
+          size="lg"
+          variant="ghost"
           onClick={onClear}
-          className="inline-flex min-h-[44px] items-center self-end rounded-lg border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink-secondary transition-colors hover:bg-surface-tertiary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+          className="self-end sm:ml-auto"
         >
           Clear filters
-        </button>
+        </Button>
       )}
-    </div>
+    </GlassPanel>
   );
 }

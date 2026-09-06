@@ -1,5 +1,15 @@
 import type { Assessment, Recommendation } from "../types";
-import { Card, Chip } from "./ui";
+import { GlassPanel, StatusBadge } from "./design";
+import type { StatusTone } from "./design";
+
+/** Legacy chip tones → design badge tones. */
+const BADGE_TONE: Record<string, StatusTone> = {
+  green: "success",
+  amber: "warning",
+  red: "danger",
+  accent: "info",
+  neutral: "neutral",
+};
 
 const recoConfig: Record<
   Recommendation,
@@ -7,28 +17,28 @@ const recoConfig: Record<
 > = {
   advance: {
     label: "Advance",
-    className: "bg-emerald-100 text-emerald-800 ring-1 ring-emerald-300",
+    className: "bg-success-soft text-success-text",
   },
   hold: {
     label: "Hold",
-    className: "bg-amber-100 text-amber-800 ring-1 ring-amber-300",
+    className: "bg-warning-soft text-warning-text",
   },
   reject: {
     label: "Reject",
-    className: "bg-red-100 text-red-800 ring-1 ring-red-300",
+    className: "bg-error-soft text-error-text",
   },
 };
 
 function scoreColor(score: number): string {
-  if (score >= 75) return "text-emerald-600";
-  if (score >= 50) return "text-amber-600";
-  return "text-red-600";
+  if (score >= 75) return "text-success-text";
+  if (score >= 50) return "text-warning-text";
+  return "text-error-text";
 }
 
 function barColor(value: number): string {
-  if (value >= 7) return "bg-emerald-500";
-  if (value >= 5) return "bg-amber-500";
-  return "bg-red-500";
+  if (value >= 7) return "bg-success";
+  if (value >= 5) return "bg-warning";
+  return "bg-error";
 }
 
 function MetricBar({ label, value }: { label: string; value: number }) {
@@ -37,10 +47,10 @@ function MetricBar({ label, value }: { label: string; value: number }) {
   return (
     <div>
       <div className="mb-1 flex items-center justify-between text-xs">
-        <span className="text-gray-600">{label}</span>
-        <span className="font-medium text-gray-800">{safe}/10</span>
+        <span className="text-ink-secondary">{label}</span>
+        <span className="font-medium text-ink">{safe}/10</span>
       </div>
-      <div className="h-1.5 w-full overflow-hidden rounded-full bg-gray-100">
+      <div className="h-1.5 w-full overflow-hidden rounded-full bg-ink/[0.06]">
         <div
           className={`h-full rounded-full ${barColor(safe)}`}
           style={{ width: `${pct}%` }}
@@ -60,10 +70,10 @@ function Section({
   notes?: string;
 }) {
   return (
-    <div className="rounded-lg border border-gray-200 p-4">
-      <h3 className="mb-3 text-sm font-semibold text-gray-900">{title}</h3>
+    <div className="glass-sunken p-4">
+      <h3 className="mb-3 text-sm font-semibold text-ink">{title}</h3>
       <div className="space-y-3">{children}</div>
-      {notes && <p className="mt-3 text-xs leading-relaxed text-gray-500">{notes}</p>}
+      {notes && <p className="mt-3 text-xs leading-relaxed text-ink-tertiary">{notes}</p>}
     </div>
   );
 }
@@ -79,15 +89,15 @@ function ChipGroup({
 }) {
   return (
     <div>
-      <p className="mb-1.5 text-xs font-medium text-gray-600">{label}</p>
+      <p className="mb-1.5 text-xs font-medium text-ink-secondary">{label}</p>
       {items.length === 0 ? (
-        <p className="text-xs text-gray-400">None</p>
+        <p className="text-xs text-ink-tertiary">None</p>
       ) : (
         <div className="flex flex-wrap gap-1.5">
           {items.map((item) => (
-            <Chip key={item} tone={tone}>
+            <StatusBadge dot={false} key={item} tone={BADGE_TONE[tone]}>
               {item}
-            </Chip>
+            </StatusBadge>
           ))}
         </div>
       )}
@@ -116,20 +126,20 @@ function SignalBlock({
         : "red";
 
   return (
-    <div className="rounded-md bg-gray-50 p-3">
+    <div className="rounded-[12px] bg-white/70 p-3">
       <div className="mb-2 flex items-center justify-between gap-3 text-xs">
-        <span className="font-medium text-gray-700">{label}</span>
-        <Chip tone={tone}>{signal.level}</Chip>
+        <span className="font-medium text-ink-secondary">{label}</span>
+        <StatusBadge dot={false} tone={BADGE_TONE[tone]}>{signal.level}</StatusBadge>
       </div>
       <MetricBar label="Impact" value={signal.impact_score} />
       {signal.examples.length > 0 && (
-        <p className="mt-2 text-xs text-gray-500">
+        <p className="mt-2 text-xs text-ink-tertiary">
           <span className="font-medium">Examples:</span>{" "}
           {signal.examples.join(", ")}
         </p>
       )}
       {signal.notes && (
-        <p className="mt-1 text-xs leading-relaxed text-gray-500">
+        <p className="mt-1 text-xs leading-relaxed text-ink-tertiary">
           {signal.notes}
         </p>
       )}
@@ -147,14 +157,14 @@ export function Scorecard({ assessment }: { assessment: Assessment }) {
   const reco = recoConfig[recommendation] ?? recoConfig.hold;
 
   return (
-    <Card className="overflow-hidden">
-      <div className="flex items-center justify-between gap-4 border-b border-gray-200 bg-gray-50/60 p-5">
+    <GlassPanel level="sunken" padding="none" className="overflow-hidden rounded-[16px]">
+      <div className="flex items-center justify-between gap-4 border-b border-glass-ring p-5">
         <div className="flex items-baseline gap-2">
           <span className={`text-4xl font-bold ${scoreColor(overall_score)}`}>
             {Math.round(overall_score)}
           </span>
-          <span className="text-sm text-gray-400">/ 100</span>
-          <span className="ml-2 text-sm text-gray-500">Overall score</span>
+          <span className="text-sm text-ink-tertiary">/ 100</span>
+          <span className="ml-2 text-sm text-ink-tertiary">Overall score</span>
         </div>
         <span
           className={`rounded-full px-3 py-1 text-sm font-semibold ${reco.className}`}
@@ -185,17 +195,17 @@ export function Scorecard({ assessment }: { assessment: Assessment }) {
             <MetricBar label="Rapport" value={communication.rapport} />
           )}
           {english && (
-            <div className="rounded-md bg-gray-50 p-3">
+            <div className="rounded-[12px] bg-white/70 p-3">
               <div className="mb-2 flex items-center justify-between text-xs">
-                <span className="font-medium text-gray-700">English band</span>
-                <Chip tone="accent">{english.band}</Chip>
+                <span className="font-medium text-ink-secondary">English band</span>
+                <StatusBadge dot={false} tone="info">{english.band}</StatusBadge>
               </div>
               <MetricBar label="Grammar" value={english.grammar} />
               <MetricBar label="Vocabulary" value={english.vocabulary} />
               <MetricBar label="Fluency" value={english.fluency} />
               <MetricBar label="Coherence" value={english.coherence} />
               {english.notes && (
-                <p className="mt-2 text-xs leading-relaxed text-gray-500">
+                <p className="mt-2 text-xs leading-relaxed text-ink-tertiary">
                   {english.notes}
                 </p>
               )}
@@ -226,8 +236,8 @@ export function Scorecard({ assessment }: { assessment: Assessment }) {
           <MetricBar label="Confidence" value={tone.confidence} />
           <MetricBar label="Professionalism" value={tone.professionalism} />
           <div className="flex items-center justify-between text-xs">
-            <span className="text-gray-600">Sentiment</span>
-            <Chip>{tone.sentiment}</Chip>
+            <span className="text-ink-secondary">Sentiment</span>
+            <StatusBadge dot={false}>{tone.sentiment}</StatusBadge>
           </div>
         </Section>
 
@@ -248,10 +258,10 @@ export function Scorecard({ assessment }: { assessment: Assessment }) {
       </div>
 
       {conflicts.length > 0 && (
-        <div className="border-t border-gray-200 p-5">
-          <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold text-gray-900">
+        <div className="border-t border-glass-ring p-5">
+          <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold text-ink">
             Resume conflicts
-            <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800 ring-1 ring-amber-300">
+            <span className="rounded-full bg-warning-soft px-2 py-0.5 text-xs font-medium text-warning-text">
               {conflicts.length}
             </span>
           </h3>
@@ -261,23 +271,23 @@ export function Scorecard({ assessment }: { assessment: Assessment }) {
                 key={i}
                 className={`rounded-lg border p-3 ${
                   c.resolved
-                    ? "border-gray-200 bg-gray-50"
-                    : "border-amber-300 bg-amber-50"
+                    ? "border-glass-ring bg-white/60"
+                    : "border-warning bg-warning-soft"
                 }`}
               >
                 <div className="mb-1 flex items-center justify-between">
-                  <span className="text-xs font-semibold text-gray-900">{c.topic}</span>
-                  <Chip tone={c.resolved ? "green" : "amber"}>
+                  <span className="text-xs font-semibold text-ink">{c.topic}</span>
+                  <StatusBadge tone={c.resolved ? "success" : "warning"}>
                     {c.resolved ? "resolved" : "unresolved"}
-                  </Chip>
+                  </StatusBadge>
                 </div>
-                <p className="text-xs text-gray-600">
+                <p className="text-xs text-ink-secondary">
                   <span className="font-medium">Resume:</span> {c.resume_says}
                 </p>
-                <p className="text-xs text-gray-600">
+                <p className="text-xs text-ink-secondary">
                   <span className="font-medium">Said on call:</span> {c.candidate_said}
                 </p>
-                {c.note && <p className="mt-1 text-xs italic text-gray-500">{c.note}</p>}
+                {c.note && <p className="mt-1 text-xs italic text-ink-tertiary">{c.note}</p>}
               </div>
             ))}
           </div>
@@ -285,11 +295,11 @@ export function Scorecard({ assessment }: { assessment: Assessment }) {
       )}
 
       {summary && (
-        <div className="border-t border-gray-200 p-5">
-          <h3 className="mb-1.5 text-sm font-semibold text-gray-900">Summary</h3>
-          <p className="text-sm leading-relaxed text-gray-600">{summary}</p>
+        <div className="border-t border-glass-ring p-5">
+          <h3 className="mb-1.5 text-sm font-semibold text-ink">Summary</h3>
+          <p className="text-sm leading-relaxed text-ink-secondary">{summary}</p>
         </div>
       )}
-    </Card>
+    </GlassPanel>
   );
 }

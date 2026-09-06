@@ -57,13 +57,18 @@ export function THead({
   );
 }
 
+/**
+ * Rows reveal with a short CSS stagger (`.rows-reveal`, index.css) on mount
+ * and whenever new rows mount (pagination, filters). Pure CSS so typing into
+ * a filter never re-runs an animation engine; collapses under reduced motion.
+ */
 export function TBody({
   className,
   children,
   ...rest
 }: HTMLAttributes<HTMLTableSectionElement>) {
   return (
-    <tbody className={cx('[&>tr:last-child>td]:border-b-0', className)} {...rest}>
+    <tbody className={cx('rows-reveal [&>tr:last-child>td]:border-b-0', className)} {...rest}>
       {children}
     </tbody>
   );

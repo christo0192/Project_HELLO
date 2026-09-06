@@ -57,9 +57,12 @@ export function CandidateProfileCard({
   const headingId = useId();
   return (
     <SurfaceCard as="section" labelledBy={headingId} className={className}>
-      <h2 id={headingId} className="mb-4 text-sm font-semibold text-ink">
+      <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
         Profile
       </h2>
+      <p className="mb-4 mt-0.5 text-[13px] text-ink-tertiary">
+        Identity and skills as parsed from the resume.
+      </p>
       <dl className="space-y-3 text-sm">
         <Field label="Phone">
           {candidate.phone_e164 ? (
@@ -132,7 +135,7 @@ function ResumeEvidence({ facts }: { facts?: CandidateResumeFacts | null }) {
   if (!hasEvidence) return null;
   return (
     <div className="mt-5 border-t border-line pt-4">
-      <h3 className="mb-3 text-xs font-semibold uppercase tracking-wide text-ink-secondary">Resume evidence</h3>
+      <h3 className="mb-3 text-[13px] font-medium text-ink-secondary">Resume evidence</h3>
       <dl className="space-y-3">
         {recentLabel && <Field label="Latest role"><span className="text-right">{recentLabel}</span></Field>}
         {prior.length > 0 && <div><dt className="mb-1 text-xs font-medium text-ink-secondary">Previous roles</dt><dd className="space-y-1 text-sm text-ink">{prior.map((role, i) => <div key={`${role}-${i}`}>{role}</div>)}</dd></div>}
@@ -165,9 +168,12 @@ export function SessionsSummary({
   const headingId = useId();
   return (
     <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
-      <h2 id={headingId} className="mb-3 text-sm font-semibold text-ink">
+      <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
         Screening sessions
       </h2>
+      <p className="mb-3 mt-0.5 text-[13px] text-ink-tertiary">
+        One row per screening session, as returned by the API.
+      </p>
       {sessions.length === 0 ? (
         <p className="text-sm text-ink-secondary">{emptyLabel}</p>
       ) : (
@@ -240,7 +246,7 @@ export function DecisionBlockedBanner() {
   return (
     <div
       role="alert"
-      className="mb-5 mt-4 rounded-md border border-warning/40 bg-warning-soft p-4"
+      className="mb-5 mt-4 rounded-card border border-warning bg-warning-soft p-4"
     >
       <p className="text-sm font-semibold text-warning">
         Decision use is paused — open appeal

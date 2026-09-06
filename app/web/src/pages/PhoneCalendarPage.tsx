@@ -53,8 +53,15 @@ import type {
   PhoneAppointmentPatchInput,
   PhoneCalendarResponse,
 } from '../types';
-import { ErrorState, LoadingState } from '../components/ui';
-import { PageHeader } from '../components/design';
+import {
+  Button,
+  EmptyPanel,
+  ErrorPanel,
+  GlassPanel,
+  LoadingPanel,
+  PageHeader,
+  cx,
+} from '../components/design';
 import {
   PHONE_STATE_ORDER,
   PHONE_STATUS_ORDER,
@@ -83,6 +90,46 @@ import {
 interface Message {
   text: string;
   tone: 'ok' | 'error';
+}
+
+/**
+ * A tinted, announced banner.
+ *
+ * Deliberately not `InlineNotice`: the announcement has to sit on the SAME
+ * element as the text, because that is what a test pins and, more to the
+ * point, what makes the tone and the words inseparable. Hue lives in the tint
+ * and the dot; the words are ink, never the tone colour.
+ */
+function Banner({
+  tone,
+  children,
+  className,
+}: {
+  tone: 'warning' | 'success' | 'danger';
+  children: React.ReactNode;
+  className?: string;
+}) {
+  const tint =
+    tone === 'warning'
+      ? 'bg-warning-soft'
+      : tone === 'success'
+        ? 'bg-success-soft'
+        : 'bg-error-soft';
+  const dot =
+    tone === 'warning' ? 'bg-warning' : tone === 'success' ? 'bg-success' : 'bg-error';
+  return (
+    <div
+      role="status"
+      className={cx(
+        'flex items-start gap-3 rounded-[14px] px-3.5 py-2.5 text-sm leading-6 text-ink',
+        tint,
+        className,
+      )}
+    >
+      <span aria-hidden="true" className={cx('mt-1.5 h-2 w-2 shrink-0 rounded-full', dot)} />
+      {children}
+    </div>
+  );
 }
 
 export function PhoneCalendarPage() {
@@ -293,8 +340,8 @@ export function PhoneCalendarPage() {
 
   // ── Gates before any phone data is requested or rendered ────────────
 
-  if (meError) return <ErrorState message={meError} onRetry={loadMe} />;
-  if (!me) return <LoadingState label="Checking access…" />;
+  if (meError) return <ErrorPanel message={meError} onRetry={loadMe} />;
+  if (!me) return <LoadingPanel label="Checking access…" />;
 
   if (!canRead) {
     return (
@@ -304,16 +351,12 @@ export function PhoneCalendarPage() {
           title="Phone calendar"
           description="Internal phone screening schedule."
         />
-        <div className="rounded-xl border border-line bg-surface p-10 text-center shadow-card">
-          <p className="text-sm font-medium text-ink-secondary">
-            Not available to your role
-          </p>
-          <p className="mx-auto mt-1 max-w-md text-xs text-ink-tertiary">
-            The phone screening calendar is available to interviewers and
-            admins. Nothing about the schedule has been loaded for this
-            account.
-          </p>
-        </div>
+        <GlassPanel padding="sm" className="mt-6">
+          <EmptyPanel
+            title="Not available to your role"
+            hint="The phone screening calendar is available to interviewers and admins. Nothing about the schedule has been loaded for this account."
+          />
+        </GlassPanel>
       </div>
     );
   }
@@ -322,12 +365,49 @@ export function PhoneCalendarPage() {
     addIstDays(weekStart, 6),
   )}`;
 
+  const showAside = Boolean(selected) || canWrite;
+
   return (
     <div>
       <PageHeader
         eyebrow="Operations"
         title="Phone calendar"
         description="Internal phone screening schedule, in India Standard Time. Calls are placed within the approved calling window, every day of the week."
+        actions={
+          <>
+            <Button size="lg" variant="secondary" onClick={reload}>
+              Refresh
+            </Button>
+            <nav aria-label="Week" className="flex flex-wrap items-center gap-2">
+              <Button
+                size="lg"
+                variant="secondary"
+                onClick={() =>
+                  applyFilters({ ...filters, weekStart: addIstDays(weekStart, -7) })
+                }
+              >
+                Previous week
+              </Button>
+              <Button
+                size="lg"
+                variant="secondary"
+                onClick={() => applyFilters({ ...filters, weekStart: today })}
+              >
+                This week
+              </Button>
+              <Button
+                size="lg"
+                variant="secondary"
+                onClick={() =>
+                  applyFilters({ ...filters, weekStart: addIstDays(weekStart, 7) })
+                }
+              >
+                Next week
+              </Button>
+              <p className="text-[13px] font-medium text-ink-secondary">{weekLabel} IST</p>
+            </nav>
+          </>
+        }
       />
 
       {/*
@@ -344,82 +424,22 @@ export function PhoneCalendarPage() {
         tabIndex={-1}
         className={
           message
-            ? message.tone === 'ok'
-              ? 'mt-4 rounded-lg border border-success/30 bg-success-soft px-3 py-2 text-sm text-success focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500'
-              : 'mt-4 rounded-lg border border-error/30 bg-error-soft px-3 py-2 text-sm text-error focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500'
+            ? cx(
+                'mt-5 rounded-[14px] px-3.5 py-2.5 text-sm leading-6 text-ink',
+                'focus:outline-none focus-visible:ring-2 focus-visible:ring-info',
+                message.tone === 'ok' ? 'bg-success-soft' : 'bg-error-soft',
+              )
             : 'sr-only'
         }
       >
         {message?.text ?? ''}
       </div>
 
-      <div className="mt-5 flex flex-wrap items-center gap-2">
-        <nav aria-label="Week" className="flex flex-wrap items-center gap-2">
-          <button
-            type="button"
-            onClick={() =>
-              applyFilters({ ...filters, weekStart: addIstDays(weekStart, -7) })
-            }
-            className="inline-flex min-h-[44px] items-center rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink-secondary transition-colors hover:bg-surface-tertiary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
-          >
-            Previous week
-          </button>
-          <button
-            type="button"
-            onClick={() => applyFilters({ ...filters, weekStart: today })}
-            className="inline-flex min-h-[44px] items-center rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink-secondary transition-colors hover:bg-surface-tertiary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
-          >
-            This week
-          </button>
-          <button
-            type="button"
-            onClick={() =>
-              applyFilters({ ...filters, weekStart: addIstDays(weekStart, 7) })
-            }
-            className="inline-flex min-h-[44px] items-center rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink-secondary transition-colors hover:bg-surface-tertiary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
-          >
-            Next week
-          </button>
-          <p className="text-sm font-medium text-ink">{weekLabel} IST</p>
-        </nav>
-
-        <div
-          role="group"
-          aria-label="View"
-          className="ml-auto flex flex-wrap items-center gap-2"
-        >
-          <button
-            type="button"
-            aria-pressed={view === 'week'}
-            onClick={() => applyFilters({ ...filters, view: 'week' })}
-            className={
-              view === 'week'
-                ? 'inline-flex min-h-[44px] items-center rounded-lg border border-brand-500 bg-brand-50 px-3 py-1.5 text-sm font-medium text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:bg-brand-950 dark:text-brand-200'
-                : 'inline-flex min-h-[44px] items-center rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink-secondary transition-colors hover:bg-surface-tertiary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500'
-            }
-          >
-            Week grid
-          </button>
-          <button
-            type="button"
-            aria-pressed={view === 'queue'}
-            onClick={() => applyFilters({ ...filters, view: 'queue' })}
-            className={
-              view === 'queue'
-                ? 'inline-flex min-h-[44px] items-center rounded-lg border border-brand-500 bg-brand-50 px-3 py-1.5 text-sm font-medium text-brand-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500 dark:bg-brand-950 dark:text-brand-200'
-                : 'inline-flex min-h-[44px] items-center rounded-lg border border-line bg-surface px-3 py-1.5 text-sm font-medium text-ink-secondary transition-colors hover:bg-surface-tertiary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500'
-            }
-          >
-            Queue
-          </button>
-        </div>
-      </div>
-
-      <div className="mt-5">
-        {loadError && <ErrorState message={loadError} onRetry={reload} />}
+      <div className="mt-6">
+        {loadError && <ErrorPanel message={loadError} onRetry={reload} />}
 
         {!loadError && data === null && (
-          <LoadingState label="Loading the phone calendar…" />
+          <LoadingPanel label="Loading the phone calendar…" />
         )}
 
         {/*
@@ -429,100 +449,105 @@ export function PhoneCalendarPage() {
           announced, and a second one would talk over it.
         */}
         {!loadError && data !== null && refreshing && (
-          <p aria-hidden="true" className="mb-3 text-xs text-ink-tertiary">
+          <p aria-hidden="true" className="mb-3 text-[13px] text-ink-tertiary">
             Refreshing…
           </p>
         )}
 
         {!loadError && data && !data.enabled && (
-          <div
-            role="status"
-            className="rounded-xl border border-warning/30 bg-warning-soft p-5 text-sm text-warning"
-          >
+          <Banner tone="warning">
             Phone screening is turned off. No schedule has been read, and no
             appointments can be booked while it stays off.
-          </div>
+          </Banner>
         )}
 
         {!loadError && data && data.enabled && (
           <>
             {data.truncated && (
-              <p
-                role="status"
-                className="mb-4 rounded-lg border border-warning/30 bg-warning-soft px-3 py-2 text-sm text-warning"
-              >
+              <Banner tone="warning" className="mb-5">
                 This week holds more appointments than one read returns, so the
                 view below is incomplete. Narrow the week before drawing any
                 conclusion from what is shown.
-              </p>
+              </Banner>
             )}
 
             <PhoneFilterBar
               statusFacets={statusFacets}
               stateFacets={stateFacets}
               filters={filters}
+              view={view}
+              onViewChange={(next) => applyFilters({ ...filters, view: next })}
               onToggle={(dimension, value) =>
                 applyFilters(togglePhoneFacet(filters, dimension, value))
               }
               onClear={() => applyFilters({ ...filters, statuses: [], states: [] })}
             />
 
-            {appointments.length === 0 ? (
-              <div className="rounded-xl border border-line bg-surface p-10 text-center shadow-card">
-                <p className="text-sm font-medium text-ink-secondary">
-                  No phone screenings this week
-                </p>
-                <p className="mx-auto mt-1 max-w-md text-xs text-ink-tertiary">
-                  Nothing is scheduled between {weekLabel} IST.
-                </p>
+            {/*
+              The week on the left, the inspector on the right. On a narrow
+              viewport the inspector simply follows the list, so nothing is
+              hidden behind a disclosure the operator has to find.
+            */}
+            <div
+              className={cx(
+                'grid grid-cols-1 gap-5',
+                showAside && 'lg:grid-cols-[minmax(0,1fr)_24rem] lg:items-start',
+              )}
+            >
+              <div className="min-w-0">
+                {appointments.length === 0 ? (
+                  <GlassPanel padding="sm">
+                    <EmptyPanel
+                      title="No phone screenings this week"
+                      hint={`Nothing is scheduled between ${weekLabel} IST.`}
+                    />
+                  </GlassPanel>
+                ) : visible.length === 0 ? (
+                  <GlassPanel padding="sm">
+                    <EmptyPanel
+                      title="No appointments match these filters"
+                      hint={`This week has ${appointments.length} ${
+                        appointments.length === 1 ? 'appointment' : 'appointments'
+                      }, none of which match the filters above.`}
+                    />
+                  </GlassPanel>
+                ) : view === 'week' ? (
+                  <PhoneWeekTable
+                    weekDates={weekDates}
+                    appointments={visible}
+                    window={data.window}
+                    selectedId={selectedId}
+                    onSelect={setSelectedId}
+                    today={today}
+                  />
+                ) : (
+                  <PhoneQueueList
+                    weekDates={weekDates}
+                    appointments={visible}
+                    selectedId={selectedId}
+                    onSelect={setSelectedId}
+                    today={today}
+                  />
+                )}
               </div>
-            ) : visible.length === 0 ? (
-              <div className="rounded-xl border border-line bg-surface p-10 text-center shadow-card">
-                <p className="text-sm font-medium text-ink-secondary">
-                  No appointments match these filters
-                </p>
-                <p className="mx-auto mt-1 max-w-md text-xs text-ink-tertiary">
-                  This week has {appointments.length}{' '}
-                  {appointments.length === 1 ? 'appointment' : 'appointments'},
-                  none of which match the filters above.
-                </p>
-              </div>
-            ) : view === 'week' ? (
-              <PhoneWeekTable
-                weekDates={weekDates}
-                appointments={visible}
-                window={data.window}
-                selectedId={selectedId}
-                onSelect={setSelectedId}
-                today={today}
-              />
-            ) : (
-              <PhoneQueueList
-                weekDates={weekDates}
-                appointments={visible}
-                selectedId={selectedId}
-                onSelect={setSelectedId}
-                today={today}
-              />
-            )}
 
-            {selected && (
-              <div className="mt-5">
-                <PhoneAppointmentDetail
-                  appointment={selected}
-                  canWrite={canWrite}
-                  onReschedule={handleReschedule}
-                  onCancel={handleCancel}
-                  today={today}
-                />
-              </div>
-            )}
-
-            {canWrite && (
-              <div className="mt-5">
-                <PhoneBookingPanel onCreate={handleCreate} today={today} />
-              </div>
-            )}
+              {showAside && (
+                <aside className="flex min-w-0 flex-col gap-5 lg:sticky lg:top-20">
+                  {selected && (
+                    <PhoneAppointmentDetail
+                      appointment={selected}
+                      canWrite={canWrite}
+                      onReschedule={handleReschedule}
+                      onCancel={handleCancel}
+                      today={today}
+                    />
+                  )}
+                  {canWrite && (
+                    <PhoneBookingPanel onCreate={handleCreate} today={today} />
+                  )}
+                </aside>
+              )}
+            </div>
           </>
         )}
       </div>
