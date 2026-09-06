@@ -35,18 +35,21 @@ primary_region = "sin"
   SCORING_HTTP_POOL_TIMEOUT = "10"
 
   # ── PR B: on-demand orchestration for the BROWSER worker (design §2.3b B-i) ──
-  # These are INERT by default. BROWSER_AGENT_NAME names the worker for explicit
-  # dispatch, but `build_worker_options` only APPLIES the name (and stops
-  # auto-dispatch) when WORKER_ORCHESTRATION == "worker". So a deploy with
-  # WORKER_ORCHESTRATION unset/off leaves this worker UNNAMED + auto-dispatching
-  # — byte-identical to today — even though the name is present in config. This
-  # is what makes the deploy-time fly.toml name safe: it takes effect ONLY when
-  # the runtime flag is on. The name MUST equal the API's BROWSER_AGENT_NAME
-  # (names_agree). Enabling is a two-step, owner-gated flip: set BOTH this app's
-  # WORKER_ORCHESTRATION=worker AND the API's WORKER_ORCHESTRATION=true +
-  # BROWSER_AGENT_NAME, and provision a stopped pool (register_voice_worker).
+  # ACTIVATED 2026-09-06 (browser cost cut). BROWSER_AGENT_NAME names the worker
+  # for explicit dispatch, and `build_worker_options` APPLIES the name (stopping
+  # auto-dispatch) because WORKER_ORCHESTRATION == "worker". The browser worker
+  # is now NAMED + scale-to-zero: the API's exchange gate (invites.ts Step 2c)
+  # starts a pool machine, confirms it is READY for the session, and EXPLICITLY
+  # dispatches this named worker into the room before minting a join token —
+  # naming stops auto-dispatch, so the explicit dispatch is mandatory and lives
+  # in the same gate. The name MUST equal the API's BROWSER_AGENT_NAME
+  # (names_agree). Activation prerequisites (all satisfied before this flip):
+  # the API's WORKER_ORCHESTRATION=true AND BROWSER_AGENT_NAME="browser-screener"
+  # (app/api/fly.toml), and a provisioned stopped pool (register_voice_worker,
+  # pipeline='browser'). Rollback = revert this flip AND scale the browser app
+  # UP first (runbook docs/runbooks/phone-worker-orchestration-activation.md §5).
   BROWSER_AGENT_NAME = "browser-screener"
-  WORKER_ORCHESTRATION = "off"
+  WORKER_ORCHESTRATION = "worker"
 
 # X1/VM PIN (2026-08-29 CPU-starvation incident): on `shared` CPU the worker's
 # VAD/EOU compute backed up (VAD backlog 67 s), the Sarvam STT websocket died

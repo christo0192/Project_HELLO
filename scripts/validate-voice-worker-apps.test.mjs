@@ -402,11 +402,13 @@ for (const [label, phone, apiEnv, apiFly] of AGREE_NEG) {
   const out = (r.stdout || "") + (r.stderr || "");
   ok(r.status === 0, `shipped configs must pass the posture check: ${out}`);
   // PLAN B ACTIVATION (2026-09-06): the phone lane ships orchestration ON
-  // (fly.phone.toml WORKER_ORCHESTRATION="worker"); the browser lane stays OFF.
+  // (fly.phone.toml WORKER_ORCHESTRATION="worker"). BROWSER ACTIVATION
+  // (2026-09-06): the browser lane now also ships orchestration ON
+  // (fly.toml WORKER_ORCHESTRATION="worker") + API BROWSER_AGENT_NAME set.
   // This pin is the deliberate activation friction — flipping a lane's posture
   // must update this expectation in the same reviewed PR.
-  ok(/orchestration_state=browser:off,phone:worker/.test(out),
-    `the shipped configs must SURFACE browser OFF and phone WORKER, got:\n${out}`);
+  ok(/orchestration_state=browser:worker,phone:worker/.test(out),
+    `the shipped configs must SURFACE both lanes on WORKER, got:\n${out}`);
 }
 
 if (failures.length) {

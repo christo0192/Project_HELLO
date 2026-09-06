@@ -10,9 +10,11 @@ name: Deploy (Fly)
 #   browser-voice→ project-hello-voice       (FLY_API_TOKEN_VOICE)
 #   phone-voice  → project-hello-phone-voice (FLY_API_TOKEN_PHONE_VOICE)
 # The two voice apps run the SAME source image (app/voice-livekit) with
-# different run postures (browser = unnamed auto-dispatch, always-on; phone =
-# named, dispatch-only, always-on since the §6 canary flip of
-# docs/runbooks/phone-worker-deployment.md). A change to that shared source
+# different run postures. Both are now NAMED, dispatch-only, and on-demand
+# (scale-to-zero) via orchestration: phone since the §6 canary flip
+# (docs/runbooks/phone-worker-deployment.md), browser since the 2026-09-06
+# activation (docs/runbooks/phone-worker-orchestration-activation.md §8). A
+# change to that shared source
 # deploys BOTH voice apps — each with its OWN app-scoped token, never conflated.
 #
 # Security properties (this file is production security code):

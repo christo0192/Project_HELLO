@@ -265,3 +265,44 @@ reuse the same claim/lease/release path and the reaper must treat a pre-started
 machine with no session exactly as it treats any other (spare while its room is
 live / the slot is imminent, reap past grace otherwise).
 ```
+
+## 8. Browser lane activation (2026-09-06)
+
+The browser WebRTC worker (`project-hello-voice`) uses the SAME substrate as the
+phone lane — the generic reconciliation deploy script, the shared reaper, the
+`voice_worker_leases` table (`pipeline='browser'`), and the exchange-path gate
+(`invites.ts` Step 2c: `ensureReadyWorker` → `dispatch` → 202-preparing on any
+non-ready verdict, ordered BEFORE the one-time invite is consumed). The only
+lane-specific facts:
+
+- **Agent name.** Worker registers as `BROWSER_AGENT_NAME="browser-screener"`
+  (`app/voice-livekit/fly.toml`) ONLY when its `WORKER_ORCHESTRATION="worker"`.
+  The API dispatches to that exact name via `BROWSER_AGENT_NAME` in
+  `app/api/fly.toml` (the API's `WORKER_ORCHESTRATION` is already `true`). The
+  two names MUST be identical (runtime-only check — a mismatch leaves the room
+  agent-less).
+- **The hazard is the SAME three-flag matrix as §0, and worse here because
+  browser screening is the PRIMARY live path.** Naming the worker stops its
+  auto-dispatch, so a NAMED worker with the API gate OFF = agent-less rooms; a
+  gate ON with no `pipeline='browser'` leases = `no_capacity` → 202-preparing
+  forever. Both are outages. So the browser pool MUST exist before the flip.
+
+**Activation order (zero-downtime):**
+1. **Provision the browser pool FIRST** (service_role; §2 with `--pipeline
+   browser --app project-hello-voice --size 2`). Nothing serves off these yet.
+2. Merge the activation PR (this flips `fly.toml`→`worker`, adds the API
+   `BROWSER_AGENT_NAME`, updates the posture pin). The deploy names the worker
+   and activates the gate. The pre-existing always-on machine (`89122ec…`)
+   redeploys as a NAMED `browser-screener` and keeps serving as a warm backstop —
+   dispatch to the name routes to it OR a started pool machine, so no cold-boot
+   outage during cutover.
+3. Verify a browser exchange starts/claims a pool machine and dispatches (§5
+   queries, `pipeline='browser'`).
+4. **Only after that proof**, stop the always-on `89122ec…` machine
+   (`flyctl machine stop 89122ec60edd28 -a project-hello-voice`;
+   `restart.policy=on-failure` so it stays down) to reach true scale-to-zero.
+
+**Rollback** (per §6): scale the browser app UP first
+(`flyctl machine start` the pool / the always-on machine), THEN revert the
+`fly.toml` flip and unset the API `BROWSER_AGENT_NAME`. Never flip the flag off
+while the app is at zero — that strands in-flight browser candidates.

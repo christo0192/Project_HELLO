@@ -11,7 +11,10 @@
 // line scanner over the TOML configs and the API .env.example.
 //
 //   1. fly.toml       → app = project-hello-voice, and NO PHONE_AGENT_NAME key
-//                       (the browser worker MUST stay unnamed / auto-dispatch).
+//                       (the browser worker registers under its OWN
+//                       BROWSER_AGENT_NAME when orchestration is on; carrying
+//                       the PHONE name would misroute phone dispatch / conflate
+//                       the two workers).
 //   2. fly.phone.toml → app = project-hello-phone-voice, with a NON-EMPTY
 //                       PHONE_AGENT_NAME (named worker; empty would make it a
 //                       second auto-dispatching browser worker).
@@ -225,7 +228,7 @@ for (const [label, text] of [["fly.toml", browser], ["fly.phone.toml", phoneCfg]
 ok(browserApp === "project-hello-voice", `fly.toml app must be project-hello-voice (got ${browserApp})`);
 ok(phoneApp === "project-hello-phone-voice", `fly.phone.toml app must be project-hello-phone-voice (got ${phoneApp})`);
 
-ok(!hasEnvKey(browser, "PHONE_AGENT_NAME"), "fly.toml (browser) must NOT set PHONE_AGENT_NAME — the browser worker stays unnamed / auto-dispatching");
+ok(!hasEnvKey(browser, "PHONE_AGENT_NAME"), "fly.toml (browser) must NOT set PHONE_AGENT_NAME — the browser worker registers under its own BROWSER_AGENT_NAME; carrying the phone name would misroute phone dispatch");
 const phoneName = envValue(phoneCfg, "PHONE_AGENT_NAME");
 ok(typeof phoneName === "string" && phoneName.trim().length > 0, "fly.phone.toml must set a NON-EMPTY PHONE_AGENT_NAME (named worker)");
 
@@ -347,5 +350,5 @@ if (failures.length) {
   process.exit(1);
 }
 for (const n of notes) console.error(`voice worker app config note: ${n}`);
-console.log("voice worker app configs valid (browser unnamed; phone named & API-dispatched; isolated; no secrets; approved deployment region across all three Fly app configs; worker<->API name agreement surfaced; orchestration posture consistent with scale-to-zero vs always-on).");
+console.log("voice worker app configs valid (both workers named & API-dispatched when orchestration on; isolated; no secrets; approved deployment region across all three Fly app configs; worker<->API name agreement surfaced; orchestration posture consistent with scale-to-zero vs always-on).");
 } // end if (isMain)
