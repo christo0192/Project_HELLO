@@ -738,10 +738,12 @@ _ERR_CONTEXT_API_ERROR = "context_api_error"
 
 
 class WorkerContext:
-    """Server-verified prompt context with phone-only allowlisted resume evidence.
+    """Server-verified prompt context with allowlisted resume evidence.
 
-    Contact fields and raw resume text are never present. Browser callers receive
-    an empty ``candidate_evidence`` mapping from the API.
+    Contact fields and raw resume text are never present. Both lanes — phone
+    (``phone-<uuid>``) and browser (``screening-<uuid>``) — receive the same
+    bounded ``candidate_evidence`` projection from the API (owner-approved
+    2026-09-07); any other room name yields an empty mapping.
     """
 
     __slots__ = ("session_id", "candidate_id", "role_id", "candidate_name", "room_name", "status", "role_title", "role_focus", "role_required_skills", "screening_template", "interviewer_instructions", "candidate_evidence")
