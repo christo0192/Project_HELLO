@@ -138,7 +138,7 @@ export function PhoneSlotPicker({
       )}
 
       {!error && data && data.enabled && (
-        <fieldset disabled={disabled}>
+        <fieldset disabled={disabled} className="min-w-0">
           <legend id={groupLabelId} className="text-[13px] font-medium text-ink-secondary">
             Slot
           </legend>

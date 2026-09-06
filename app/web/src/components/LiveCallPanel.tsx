@@ -1,7 +1,5 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { supabase } from "../lib/supabase";
-import { api, ApiError } from "../api";
-import { Scorecard } from "./Scorecard";
 import { Card } from "./ui";
 import type { Assessment, Recommendation } from "../types";
 import { presentTranscriptTurn } from "../lib/transcript-presentation";
@@ -244,8 +242,35 @@ export function LiveCallPanel({
         ) : null}
       </div>
 
-      {/* Transcript / empty state */}
-      {!session ? (
+      {/* Transcript / empty state. A COMPLETED call is not replayed here:
+          the Review tab owns the transcript, recording and scorecard, so
+          this panel collapses to a one-line status once the call ends. */}
+      {isCompleted ? (
+        <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-4">
+          <div>
+            <p className="text-sm font-medium text-gray-700">Call ended</p>
+            <p className="text-xs text-gray-500">
+              {session?.duration_sec != null
+                ? `${Math.floor(session.duration_sec / 60)}m ${session.duration_sec % 60}s · `
+                : ""}
+              Transcript, recording and scorecard are in the Review tab.
+            </p>
+          </div>
+          {assessment ? (
+            <span className="inline-flex items-center rounded-full bg-gray-100 px-2.5 py-0.5 text-xs font-medium text-gray-600">
+              Scorecard ready
+            </span>
+          ) : (
+            <span className="inline-flex items-center gap-2 text-xs font-medium text-gray-600">
+              <svg className="h-4 w-4 animate-spin text-accent-600" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z" />
+              </svg>
+              Scoring the conversation…
+            </span>
+          )}
+        </div>
+      ) : !session ? (
         <div className="flex flex-col items-center justify-center gap-1 px-4 py-12 text-center">
           <p className="text-sm font-medium text-gray-700">No active call</p>
           <p className="text-xs text-gray-500">
@@ -255,6 +280,9 @@ export function LiveCallPanel({
       ) : (
         <div
           ref={scrollRef}
+          role="region"
+          aria-label="Live transcript"
+          tabIndex={0}
           className="flex max-h-96 min-h-[12rem] flex-col gap-3 overflow-y-auto p-4"
         >
           {turns.length === 0 ? (
@@ -315,159 +343,6 @@ export function LiveCallPanel({
         </div>
       )}
 
-      {/* Call recording: on-demand signed URL via MIG-06 (never fetch on list render) */}
-      <RecordingDownloadSection sessionId={session?.id ?? null} status={status} />
-
-      {/* Assessment: skeleton while post-call scoring runs, then the scorecard */}
-      {assessment ? (
-        <div className="border-t border-gray-200 p-4">
-          <h3 className="mb-3 text-sm font-semibold text-gray-900">
-            Assessment
-          </h3>
-          <Scorecard assessment={assessment} />
-        </div>
-      ) : isCompleted ? (
-        <div className="border-t border-gray-200 p-4">
-          <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold text-gray-900">
-            <svg
-              className="h-4 w-4 animate-spin text-accent-600"
-              viewBox="0 0 24 24"
-              fill="none"
-            >
-              <circle
-                className="opacity-25"
-                cx="12"
-                cy="12"
-                r="10"
-                stroke="currentColor"
-                strokeWidth="4"
-              />
-              <path
-                className="opacity-75"
-                fill="currentColor"
-                d="M4 12a8 8 0 018-8v4a4 4 0 00-4 4H4z"
-              />
-            </svg>
-            Scoring the conversation…
-          </h3>
-          <div className="animate-pulse space-y-3" aria-hidden="true">
-            <div className="h-3 w-1/3 rounded bg-gray-200" />
-            <div className="grid grid-cols-2 gap-3">
-              <div className="h-16 rounded-lg bg-gray-100" />
-              <div className="h-16 rounded-lg bg-gray-100" />
-              <div className="h-16 rounded-lg bg-gray-100" />
-              <div className="h-16 rounded-lg bg-gray-100" />
-            </div>
-            <div className="h-3 w-full rounded bg-gray-200" />
-            <div className="h-3 w-5/6 rounded bg-gray-200" />
-            <div className="h-3 w-2/3 rounded bg-gray-200" />
-          </div>
-        </div>
-      ) : null}
     </Card>
-  );
-}
-
-/* ---------------- Recording download (MIG-06) ---------------- */
-
-interface RecordingDownloadSectionProps {
-  sessionId: string | null;
-  status: string | null;
-}
-
-/**
- * On-demand recording access (MIG-06). Fetches a short-TTL signed URL via
- * GET /api/recordings/:sessionId/download ONLY when the recruiter explicitly
- * clicks — never on render/mount. This avoids minting a signed URL and an
- * access audit event for recordings the recruiter never asked to view.
- *
- * Handles loading, error, unmount/race (stale responses ignored via a
- * generation counter), and URL expiry (a "Refresh link" re-mints a fresh URL).
- */
-function RecordingDownloadSection({ sessionId, status }: RecordingDownloadSectionProps) {
-  const [recordingUrl, setRecordingUrl] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-
-  const mountedRef = useRef(true);
-  const reqIdRef = useRef(0);
-
-  const isCompleted = status === "completed";
-
-  useEffect(() => {
-    mountedRef.current = true;
-    return () => {
-      mountedRef.current = false;
-    };
-  }, []);
-
-  // Discard any loaded URL (and invalidate in-flight fetches) when the
-  // session or its status changes. No fetch is triggered here.
-  useEffect(() => {
-    reqIdRef.current += 1;
-    setRecordingUrl(null);
-    setError(null);
-    setLoading(false);
-  }, [sessionId, isCompleted]);
-
-  const fetchUrl = useCallback(() => {
-    if (!sessionId || !isCompleted) return;
-    const reqId = ++reqIdRef.current;
-    setLoading(true);
-    setError(null);
-    api
-      .getRecordingDownloadUrl(sessionId)
-      .then((res) => {
-        if (!mountedRef.current || reqId !== reqIdRef.current) return;
-        setRecordingUrl(res.url);
-        setLoading(false);
-      })
-      .catch((e: ApiError) => {
-        if (!mountedRef.current || reqId !== reqIdRef.current) return;
-        setError(e.message || "Failed to load recording");
-        setLoading(false);
-      });
-  }, [sessionId, isCompleted]);
-
-  if (!sessionId || !isCompleted) return null;
-
-  return (
-    <div className="border-t border-gray-200 p-4">
-      <h3 className="mb-2 text-sm font-semibold text-gray-900">
-        Call recording
-      </h3>
-      {!recordingUrl && (
-        <button
-          type="button"
-          onClick={fetchUrl}
-          disabled={loading}
-          className="rounded bg-accent-600 px-3 py-1 text-xs font-medium text-white hover:bg-accent-700 disabled:opacity-50"
-        >
-          {loading ? "Loading…" : "Load recording"}
-        </button>
-      )}
-      {error && <p className="mt-2 text-sm text-red-600">{error}</p>}
-      {recordingUrl && !loading && (
-        <div className="space-y-1">
-          <audio
-            controls
-            preload="none"
-            src={recordingUrl}
-            className="h-9 w-full"
-          >
-            <a href={recordingUrl} target="_blank" rel="noreferrer">
-              Download recording
-            </a>
-          </audio>
-          <button
-            type="button"
-            onClick={fetchUrl}
-            className="text-xs font-medium text-accent-600 hover:text-accent-700"
-          >
-            Refresh link
-          </button>
-        </div>
-      )}
-    </div>
   );
 }

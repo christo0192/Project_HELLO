@@ -187,7 +187,7 @@ function OverviewTab({
     // cards, the phone cycle, the Ashby pipeline, appeals — own the wide
     // column. Below `lg` this is one ordinary stack, reference first.
     <div className="fade-up-stagger grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-12 lg:items-start">
-      <div className="order-2 space-y-4 lg:order-1 lg:sticky lg:top-20 lg:col-span-4">
+      <div className="order-2 space-y-4 lg:order-1 lg:col-span-4">
         <CandidateProfileCard
           candidate={candidate}
           className="p-4 sm:p-5"
@@ -204,14 +204,14 @@ function OverviewTab({
             side and stretched to a common height by their wrappers, so the
             large "No active call" body no longer stacks below a card that
             has already ended. Neither component is modified. */}
-        <div className="grid gap-4 sm:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] sm:items-stretch">
-          <div className="min-w-0 [&>*]:h-full">
+        <div className="grid gap-4 sm:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] sm:items-start">
+          <div className="min-w-0">
             <LiveKitCallCard
               candidateId={candidate.id}
               candidateName={candidate.name}
             />
           </div>
-          <div className="min-w-0 [&>*]:h-full">
+          <div className="min-w-0">
             <LiveCallPanel
               candidateId={candidate.id}
               candidateName={candidate.name || undefined}
