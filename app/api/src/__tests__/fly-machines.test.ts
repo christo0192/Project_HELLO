@@ -83,7 +83,9 @@ describe('construction', () => {
   it('constructs with a token and the default allowlisted origin', () => {
     const c = new FlyMachinesClient({ token: 'k' });
     expect(c).toBeInstanceOf(FlyMachinesClient);
-    expect(FLY_API_BASE_URL).toBe('https://api.fly.io/v1');
+    // api.machines.dev is the host that actually serves the Machines REST API
+    // (api.fly.io/v1 404s every /apps/{app}/machines call — RCA 2026-09-06).
+    expect(FLY_API_BASE_URL).toBe('https://api.machines.dev/v1');
   });
 
   it('constructs WITHOUT a token (fails closed at call time, not at import)', () => {

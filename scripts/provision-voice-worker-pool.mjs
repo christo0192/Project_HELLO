@@ -52,7 +52,10 @@
 import process from 'node:process';
 import { fileURLToPath } from 'node:url';
 
-const FLY_API = process.env.FLY_API_BASE_URL ?? 'https://api.fly.io/v1';
+// api.machines.dev is the host that serves the Machines REST API; api.fly.io/v1
+// 404s every /apps/{app}/machines call (RCA 2026-09-06 — the old default here
+// made an external run of this script fail its very first GET).
+const FLY_API = process.env.FLY_API_BASE_URL ?? 'https://api.machines.dev/v1';
 const APP_SLUG_RE = /^[a-z0-9][a-z0-9-]{0,62}$/;
 const MAX_SIZE = 50;
 

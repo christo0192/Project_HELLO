@@ -31,7 +31,16 @@
  */
 
 // ── The single allowlisted production origin for the Fly Machines API. ───────
-export const FLY_API_BASE_URL = 'https://api.fly.io/v1';
+// RCA 2026-09-06 (first live browser exchange): this was 'https://api.fly.io/v1',
+// which does NOT serve the Machines REST API — every /apps/{app}/machines call
+// 404s there (verified live with both an app-scoped deploy token and an org
+// token, against BOTH voice apps). The Machines API host is api.machines.dev
+// (what flyctl itself uses), where the same org token returns 200 for both
+// apps. The wrong host made every runtime startMachine fail
+// (worker_orchestration_start_failed + lease epoch churn + candidate stuck at
+// "preparing") — and was LATENT on the phone lane, which shares this client but
+// had never exercised a runtime start.
+export const FLY_API_BASE_URL = 'https://api.machines.dev/v1';
 
 /** Machine lifecycle states the wait endpoint accepts. */
 export type FlyMachineState = 'started' | 'stopped' | 'suspended' | 'destroyed';

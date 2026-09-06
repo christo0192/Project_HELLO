@@ -65,7 +65,7 @@ Everything below serves those two invariants, each with a **primary path** and a
 ### 2.2 Components (shared by both apps)
 - **Warm pool (per app):** worker machines are **pre-created but `stopped`** (stopped ≈ free). Starting a stopped machine is much faster than creating one. Pool size = max desired concurrency per pipeline.
 - **Control table** `voice_worker_leases` (Supabase, service-role only): `app, machine_id, pipeline(phone|browser), state(stopped|starting|ready|busy|draining), claimed_session_id, epoch, started_at, ready_at, last_heartbeat_at`. Fly Machines API + LiveKit RoomService are ground truth; this table is coordinator + audit trail.
-- **Fly Machines API** (base `https://api.fly.io/v1`, `Authorization: Bearer <FLY_API_TOKEN>` — app-scoped deploy token, secret): `POST /apps/{app}/machines/{id}/start`, `/stop`, `GET /…/wait?state=started`, `GET /apps/{app}/machines`.
+- **Fly Machines API** (base `https://api.machines.dev/v1`, `Authorization: Bearer <FLY_API_TOKEN>` — ORG-scoped token, secret; *superseded by RCA 2026-09-06: this doc originally said `api.fly.io/v1` + an app-scoped deploy token — the former does not serve the Machines REST API and the latter 403s the other voice app; see runbook §1*): `POST /apps/{app}/machines/{id}/start`, `/stop`, `GET /…/wait?state=started`, `GET /apps/{app}/machines`.
 - **Readiness handshake (new worker code, both workers):** on LiveKit registration, the worker `POST`s `/internal/voice-worker/ready {app, machine_id, agent_name, epoch}`; the API validates the agent identity (reuse PR100 names-agree). Only a `ready` machine may receive a caller/candidate.
 - **Reaper (both apps):** the cost-safety backstop (§2.5).
 

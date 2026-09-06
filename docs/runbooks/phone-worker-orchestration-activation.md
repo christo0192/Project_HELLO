@@ -53,9 +53,16 @@ keep them in step.
 On `project-hello-api` (the API app):
 
 ```bash
-# App/org-scoped Fly deploy token — the Machines API bearer. Never commit it.
-fly secrets set FLY_API_TOKEN="$(fly tokens create deploy -a project-hello-phone-voice)" -a project-hello-api
-# (FLY_API_BASE_URL defaults to https://api.fly.io/v1 — leave unset.)
+# ORG-scoped Fly token — the Machines API bearer. Never commit it.
+# MUST be org-scoped (RCA 2026-09-06): ONE FLY_API_TOKEN serves BOTH voice
+# lanes' runtime starts (phone AND browser). An app-scoped deploy token (the
+# old instruction here) 403s the OTHER app's machines — the browser lane's
+# first live exchange failed exactly this way, and the phone lane carried the
+# same latent fault.
+fly secrets set FLY_API_TOKEN="$(fly tokens create org personal)" -a project-hello-api
+# (FLY_API_BASE_URL defaults to https://api.machines.dev/v1 — the host that
+# actually serves the Machines REST API; api.fly.io/v1 404s every machines
+# call. Leave unset.)
 ```
 
 The API already has `SUPABASE_URL` and `SUPABASE_SERVICE_ROLE_KEY` (the

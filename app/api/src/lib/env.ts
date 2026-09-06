@@ -250,8 +250,9 @@ export const env = {
    * startup. Only meaningful when `workerOrchestration` is true.
    */
   flyApiToken: process.env.FLY_API_TOKEN ?? '',
-  /** Fly Machines API base origin. Defaults to the allowlisted production origin. */
-  flyApiBaseUrl: process.env.FLY_API_BASE_URL ?? 'https://api.fly.io/v1',
+  /** Fly Machines API base origin. Defaults to the allowlisted production origin
+   * (api.machines.dev — api.fly.io/v1 does not serve the Machines REST API). */
+  flyApiBaseUrl: process.env.FLY_API_BASE_URL ?? 'https://api.machines.dev/v1',
   /**
    * Grace period (seconds) a machine may sit `started` with no active session
    * before the future reaper stops it — the cost-safety backstop (§2.5). Bounds
