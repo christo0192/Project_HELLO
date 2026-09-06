@@ -149,10 +149,27 @@ else
 fi
 
 # ── 2. verify the CURRENT (pre-deploy) worker registers ───────────────────────
-# Proves the started machine actually comes up and registers before we ship.
-if ! verify_current_registration pre-deploy; then
-  echo "::error::no current 'registered worker' log at/after watermark $WATERMARK on $APP (pre-deploy start did not register)"
-  exit 1
+# Only meaningful when THIS run STARTED a stopped pool machine: the proof
+# confirms that freshly-booted machine registered at/after our watermark before
+# we ship. When we RELIED on an already-started machine (no stopped pool machine
+# to start — e.g. a lane whose only machine is always-on), there is NO fresh boot
+# to wait for: the machine is demonstrably up (it is what we are relying on) and
+# its registration necessarily PREDATES our watermark, so a watermarked
+# pre-deploy proof can never pass and need not — it would only prove the OLD
+# image, which is already running. The post-deploy proof (a FRESH watermark after
+# `flyctl deploy` restarts the worker) is the real gate on the NEW image and
+# still fails closed. RCA 2026-09-06: the browser lane's sole machine is
+# always-on, so this pre-proof failed EVERY browser deploy on a stale
+# registration; skipping it here (only in the rely-on-started branch) fixes that
+# without weakening the new-image gate. Phone is unaffected — it always starts a
+# stopped pool machine, so STARTED_MACHINE is set and the pre-proof runs.
+if [ -n "$STARTED_MACHINE" ]; then
+  if ! verify_current_registration pre-deploy; then
+    echo "::error::no current 'registered worker' log at/after watermark $WATERMARK on $APP (pre-deploy start did not register)"
+    exit 1
+  fi
+else
+  echo "relying on an already-started machine on $APP; skipping the watermarked pre-deploy proof (no fresh boot to wait for) — the post-deploy proof gates the new image"
 fi
 
 # ── 3. deploy the new image ───────────────────────────────────────────────────
