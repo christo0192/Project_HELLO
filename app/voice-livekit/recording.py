@@ -75,6 +75,30 @@ if not logger.handlers:
 _SAMPLE_RATE = 48_000
 _MP3_BITRATE_BPS = 64_000
 
+# ── FIX 4 (2026-09-06): AUDIO-PATH HEALTH HEARTBEAT ───────────────────────────
+# Live call ac7c8c77 lost OUTBOUND audio to the SIP leg at ~12:57:25 — the worker
+# kept generating and speaking into the recorder while the candidate heard 51s of
+# silence — and NOTHING surfaced it until the candidate hung up. The taps already
+# count every input/output frame (the zero-capture instrumentation); this
+# heartbeat turns those counters into a periodic, content-free health signal so a
+# starved audio path is visible in `fly logs` DURING the call, not only in the
+# post-mortem. Interval and the stall threshold are env-tunable but default sane.
+def _float_env(name: str, default: float) -> float:
+    raw = os.getenv(name)
+    if raw in (None, ""):
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+PHONE_AUDIO_HEALTH_INTERVAL_SEC = _float_env("PHONE_AUDIO_HEALTH_INTERVAL_SEC", 15.0)
+# WARN `no_input_audio` once the INPUT tap has gone this long with zero new
+# frames while recording is active — the candidate leg has stopped delivering
+# audio (drop / mute), the inbound half of what the live incident showed.
+PHONE_AUDIO_NO_INPUT_WARN_SEC = _float_env("PHONE_AUDIO_NO_INPUT_WARN_SEC", 20.0)
+
 # The transcode COMPLETENESS FLOOR (adversarial-review MED, v114 2026-09-04).
 # Per-frame skip tolerance makes the encode robust to a handful of malformed
 # boundary frames at a channel desync — but if a desync corrupts MOST frames,
@@ -499,6 +523,10 @@ class InWorkerRecorder:
         self._counter = _FrameCounter()
         self._wired_at_ms: Optional[int] = None
         self._begun_at_ms: Optional[int] = None
+        # FIX 4: the call.answered wall-clock (epoch ms), passed to begin() so the
+        # recording START offset vs answer (the observed ~28s head-gap) is logged
+        # once at recorder start. None → the offset line is skipped.
+        self._answered_epoch_ms: Optional[int] = None
 
     @property
     def active(self) -> bool:
@@ -517,6 +545,16 @@ class InWorkerRecorder:
         reports this reason via `/recording/failed` so the server can latch the
         session truthfully instead of retrying forever."""
         return self._finish_failure
+
+    @property
+    def input_frames(self) -> int:
+        """Total INPUT (candidate → worker) frames the tap has seen. FIX 4."""
+        return self._counter.input
+
+    @property
+    def output_frames(self) -> int:
+        """Total OUTPUT (worker TTS → candidate) frames the tap has seen. FIX 4."""
+        return self._counter.output
 
     def wire(self) -> bool:
         """Install the input/output taps around the session's LIVE audio I/O.
@@ -578,13 +616,22 @@ class InWorkerRecorder:
             self._recorder = None
             return False
 
-    async def begin(self, object_key: str) -> bool:
+    async def begin(
+        self, object_key: str, *, answered_epoch_ms: Optional[int] = None,
+    ) -> bool:
         """Start recording at the recording-permitted moment, using the object
         key the API bound in /recording/prepare. Everything from here on is
         captured; nothing before it is (RecorderAudioInput only accumulates while
-        RecorderIO.recording is True). Idempotent and fail-open."""
+        RecorderIO.recording is True). Idempotent and fail-open.
+
+        FIX 4 (2026-09-06): ``answered_epoch_ms`` (the call.answered wall clock)
+        lets `begin` log the recording START offset from answer — the observed
+        ~28s head-gap between a call being answered and capture engaging. It is
+        a diagnostic only; a missing value simply omits the offset field."""
         if self._failed or not self._wired or self._recorder is None:
             return False
+        if answered_epoch_ms is not None:
+            self._answered_epoch_ms = answered_epoch_ms
         if self._begun:
             return True
         try:
@@ -601,11 +648,20 @@ class InWorkerRecorder:
             # nothing — the SECONDARY hypothesis. `wire_to_begin_ms` is the gap
             # between installing the taps and starting capture (the pre-consent
             # window during which NOTHING is retained).
+            # FIX 4: the recording START offset from call.answered — the ~28s
+            # head-gap the live call showed between answer and capture engaging.
+            # -1 when no answered timestamp was threaded (nothing to compute).
+            answered_to_begin_ms = (
+                (self._begun_at_ms - self._answered_epoch_ms)
+                if self._answered_epoch_ms else -1
+            )
             logger.info(
-                "in_worker_recording_started recording=%s begun_at_ms=%d wire_to_begin_ms=%s",
+                "in_worker_recording_started recording=%s begun_at_ms=%d "
+                "wire_to_begin_ms=%s answered_to_begin_ms=%s",
                 bool(getattr(self._recorder, "recording", False)),
                 self._begun_at_ms,
                 (self._begun_at_ms - self._wired_at_ms) if self._wired_at_ms else -1,
+                answered_to_begin_ms,
                 extra={"object_key": self._object_key},
             )
             return True
@@ -616,6 +672,74 @@ class InWorkerRecorder:
             )
             self._failed = True
             return False
+
+    async def audio_health_heartbeat(
+        self,
+        *,
+        interval_sec: float = PHONE_AUDIO_HEALTH_INTERVAL_SEC,
+        no_input_warn_sec: float = PHONE_AUDIO_NO_INPUT_WARN_SEC,
+    ) -> None:
+        """Periodic, content-free audio-path health signal (FIX 4, 2026-09-06).
+
+        Emits `phone_audio_health` every ``interval_sec`` while recording is
+        active, carrying the INPUT/OUTPUT frame DELTAS since the last tick (and
+        the running totals). When the input tap goes ``no_input_warn_sec`` with
+        zero new frames while active, it also emits a WARN `no_input_audio` —
+        the inbound-starvation signal (candidate leg dropped / muted).
+
+        Pure observability: it reads two integers and logs counts/booleans only,
+        never audio. It stops when recording is no longer active. Fail-open: any
+        error ends the heartbeat quietly rather than perturbing the call — it is
+        cancelled by the caller in the same `finally` that finishes recording.
+        """
+        # Floor is small so tests can drive a fast cadence; production uses the
+        # 15s default. A zero/negative interval would busy-loop, hence the floor.
+        interval = max(0.001, float(interval_sec))
+        warn_after = max(interval, float(no_input_warn_sec))
+        last_input = self._counter.input
+        last_output = self._counter.output
+        last_input_change = time.monotonic()
+        input_warned = False
+        try:
+            while self.active:
+                await asyncio.sleep(interval)
+                if not self.active:
+                    break
+                cur_in = self._counter.input
+                cur_out = self._counter.output
+                in_delta = cur_in - last_input
+                out_delta = cur_out - last_output
+                now = time.monotonic()
+                if in_delta > 0:
+                    last_input_change = now
+                    input_warned = False
+                # Content-free: deltas + totals only, no audio, no ids beyond the
+                # object key the other recording lines already carry.
+                logger.info(
+                    "phone_audio_health in_delta=%d out_delta=%d "
+                    "in_total=%d out_total=%d",
+                    in_delta, out_delta, cur_in, cur_out,
+                    extra={"object_key": self._object_key},
+                )
+                if (
+                    not input_warned
+                    and (now - last_input_change) >= warn_after
+                ):
+                    input_warned = True
+                    logger.warning(
+                        "no_input_audio stalled_sec=%d in_total=%d out_total=%d",
+                        int(now - last_input_change), cur_in, cur_out,
+                        extra={"object_key": self._object_key},
+                    )
+                last_input = cur_in
+                last_output = cur_out
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — observability must never break a call
+            logger.warning(
+                "phone_audio_health_failed", extra={"object_key": self._object_key},
+                exc_info=True,
+            )
 
     async def finish(self, upload_url: str) -> Optional[RecordingManifest]:
         """Close the recorder, transcode OGG→MP3, upload to the presigned URL

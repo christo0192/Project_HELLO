@@ -430,6 +430,13 @@ PHONE_WRONG_NUMBER_TEXT = (
     "corrected. Thanks, and goodbye."
 )
 PHONE_SILENCE_PROMPT_TEXT = "Are you still there? No worries if you need a moment."
+#: The SECOND nudge (2026-09-06): spoken once after the first prompt goes
+#: unanswered, before the goodbye. A brief, warmer check-in so a candidate who
+#: stepped away briefly gets one more chance before the screening ends. Fixed
+#: copy — never a screening turn.
+PHONE_SILENCE_SECOND_NUDGE_TEXT = (
+    "I still can't hear you — are you able to continue?"
+)
 PHONE_SILENCE_GOODBYE_TEXT = (
     "Looks like you're unavailable, so I'll end the screening here. "
     "Thanks for your time, and goodbye."
@@ -488,6 +495,7 @@ def gate_copy_texts() -> frozenset[str]:
         PHONE_CANDIDATE_END_TEXT,
         PHONE_CALLBACK_DEFERRAL_TEXT,
         PHONE_SILENCE_PROMPT_TEXT,
+        PHONE_SILENCE_SECOND_NUDGE_TEXT,
         PHONE_SILENCE_GOODBYE_TEXT,
         _SCHEDULE_CONFIRMED_TEXT,
         _SCHEDULE_REFUSAL_FALLBACK,
@@ -4919,6 +4927,42 @@ def phone_is_compensation_objective(text: Any) -> bool:
     )
 
 
+#: The candidate volunteering compensation OR notice-period detail. The
+#: objective guard's ``compensation_drift`` check exists to stop a screening turn
+#: DRIFTING into a comp objective the plan did not authorize — a BOT-initiated
+#: drift. But on live call ac7c8c77 (2026-09-06 12:57:30) the candidate
+#: volunteered "my notice period is around 1 month", the model naturally
+#: acknowledged it, and the ack — which mentions the comp/notice vocabulary
+#: because the candidate just did — was rejected as drift. An acknowledgement of
+#: a topic the CANDIDATE introduced is not drift. This predicate gates the check
+#: so a genuine bot-initiated comp probe on a non-comp objective is still caught,
+#: while a reply that merely mirrors the candidate's own volunteered comp/notice
+#: content is allowed. Notice-period is included because it co-occurs with comp
+#: in the same conversational move and the drift regex's ``package``/``comp``
+#: vocabulary is what fires on a notice reply.
+_CANDIDATE_COMPENSATION_INTRO_RE = re.compile(
+    r"\b(?:"
+    r"salary|compensation|package|ctc|lpa|"
+    r"pay\w*|wage\w*|remunerat\w*|"
+    r"in[-\s]?hand|take[-\s]?home|cost[-\s]+to[-\s]+company|"
+    r"notice[-\s]?period|notice"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def phone_candidate_introduced_compensation(text: Any) -> bool:
+    """True when the candidate's turn itself raised compensation/notice content.
+
+    Used ONLY to gate the objective guard's ``compensation_drift`` rejection: a
+    reply may acknowledge a comp/notice topic the candidate volunteered without
+    that acknowledgement counting as bot-initiated drift.
+    """
+    return isinstance(text, str) and bool(
+        _CANDIDATE_COMPENSATION_INTRO_RE.search(text)
+    )
+
+
 _DURATION_ANSWER_RE = re.compile(
     r"\b(?:\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten)\s*"
     r"(?:\+\s*)?(?:years?|yrs?|months?)\b",
@@ -5814,6 +5858,22 @@ _GENERATED_REQUEST_QUESTION_RE = re.compile(
 )
 _GENERATED_QUOTED_TEXT_RE = re.compile(r'"[^"\n]*"|“[^”\n]*”')
 
+#: A trailing RHETORICAL TAG question — "right?", "you know?", "makes sense?",
+#: "okay?", "yeah?" — that a natural acknowledgement ends on. It is NOT a
+#: candidate-directed question act, yet the old ``?``-in-punctuation counter
+#: scored it as one, so an ack that ended "…, right?" plus the real question
+#: counted TWO acts and was rejected as stacked (`question_mark_count`) on a
+#: screening turn (live call ac7c8c77, 12:55:37). A tag is SHORT and formulaic;
+#: matching the WHOLE clause keeps a genuine short question ("what's your CTC?")
+#: counting, because that is not one of these fixed tag phrases.
+_GENERATED_RHETORICAL_TAG_RE = re.compile(
+    r"^(?:right|correct|okay|ok|yeah|yes|no|"
+    r"you\s+know|makes?\s+sense|isn'?t\s+it|"
+    r"does\s+that\s+(?:make\s+sense|work|sound\s+(?:good|right))|"
+    r"sound\s+(?:good|right)|fair\s+enough)$",
+    re.IGNORECASE,
+)
+
 
 def phone_generated_question_act_count(speech: Any) -> int:
     """Count candidate-directed question acts, not literal question marks.
@@ -5823,6 +5883,13 @@ def phone_generated_question_act_count(speech: Any) -> int:
     question mark. Treating punctuation as intent rejected both shapes. This
     bounded structural parser accepts one request/interrogative and still
     rejects stacked questions without adding a model call.
+
+    FIX 3 (2026-09-06): a trailing RHETORICAL TAG ("…, right?", "makes sense?")
+    is not a candidate-directed question act — it is how a natural
+    acknowledgement ends. Counting it inflated an ack-plus-one-question reply to
+    two acts and rejected it as stacked on a screening turn. A tag clause is
+    matched by a short fixed vocabulary and excluded; every genuine question,
+    including short ones, still counts.
     """
     if not isinstance(speech, str):
         return 0
@@ -5837,6 +5904,14 @@ def phone_generated_question_act_count(speech: Any) -> int:
         if not clause:
             continue
         if "?" in punctuation:
+            # A rhetorical TAG is the short trailing segment of an
+            # acknowledgement ("That makes sense, right?" → tail "right"). Test
+            # the tail after the last clause-internal boundary (comma/dash), not
+            # the whole clause, so "That makes sense, right?" is recognised as a
+            # tag while a genuine short question ("what's your CTC?") is not.
+            tail = re.split(r"[,—–-]\s*", clause)[-1].strip(" .!?")
+            if tail and _GENERATED_RHETORICAL_TAG_RE.match(tail):
+                continue
             count += len(re.findall(r"\?+", punctuation))
         else:
             count += len(_GENERATED_REQUEST_QUESTION_RE.findall(clause))
@@ -5915,6 +5990,7 @@ def phone_generated_prefix_authorized(
 def phone_generated_reply_rejection_reason(
     speech: Any, objective_text: Any, *, allow_closing: bool,
     control_text: Any = None, max_question_acts: int = 1,
+    candidate_text: Any = None,
 ) -> str | None:
     """Return a sanitized reason for rejecting a generated phone reply.
 
@@ -5924,6 +6000,13 @@ def phone_generated_reply_rejection_reason(
     ``phone_objective_guard_max_questions_for_phase``) so a natural
     confirm-plus-probe utterance is not rejected into the flat canned fallback.
     The value is clamped to at least 1 so a caller can never DISABLE the guard.
+
+    ``candidate_text`` (FIX 3, 2026-09-06) is the candidate's turn that this
+    reply answers. When the candidate volunteered compensation/notice content,
+    the ``compensation_drift`` check is suppressed: acknowledging a topic the
+    candidate raised is not bot-initiated drift. A genuine comp probe on a
+    non-comp objective with a candidate turn that never mentioned comp is still
+    rejected. Absent/None preserves the historical behaviour exactly.
     """
     ceiling = max_question_acts if isinstance(max_question_acts, int) and max_question_acts >= 1 else 1
     if not isinstance(speech, str) or not any(ch.isalpha() for ch in speech):
@@ -5941,7 +6024,12 @@ def phone_generated_reply_rejection_reason(
         # same as before; the phase-aware ceiling only WIDENS the upper bound.
         return "question_mark_count"
     objective_is_comp = phone_is_compensation_objective(objective_text)
-    if _COMPENSATION_OBJECTIVE_RE.search(compact) and not objective_is_comp:
+    if (
+        _COMPENSATION_OBJECTIVE_RE.search(compact)
+        and not objective_is_comp
+        # FIX 3: an ack of comp/notice the CANDIDATE volunteered is not drift.
+        and not phone_candidate_introduced_compensation(candidate_text)
+    ):
         return "compensation_drift"
     # REMOVED (2026-09-03): the exact-match `conflict_clarification_drift` clause
     # rejected any conflict-turn reply that was not PHONE_RESUME_CONFLICT_
@@ -5962,11 +6050,13 @@ def phone_generated_reply_rejection_reason(
 def phone_generated_reply_authorized(
     speech: Any, objective_text: Any, *, allow_closing: bool,
     control_text: Any = None, max_question_acts: int = 1,
+    candidate_text: Any = None,
 ) -> bool:
     """Fail closed on clear action/objective violations, not natural wording."""
     return phone_generated_reply_rejection_reason(
         speech, objective_text, allow_closing=allow_closing,
         control_text=control_text, max_question_acts=max_question_acts,
+        candidate_text=candidate_text,
     ) is None
 
 
@@ -7341,6 +7431,11 @@ def phone_agent_class(agent_base: Any) -> Any:
             # flight. Threaded into the objective guard so the confirm/conflict
             # phases may carry a natural two-part (confirm + probe) utterance.
             self._generation_phase: str | None = None
+            # FIX 3 (2026-09-06): the candidate turn the in-flight reply answers.
+            # Set from `on_user_turn_completed`; read by the objective guard to
+            # suppress `compensation_drift` when the candidate volunteered the
+            # comp/notice topic being acknowledged. Bounded and never logged.
+            self._generation_candidate_text: str | None = None
             self._generation_prefix_released = False
             self._reply_generation: int | None = None
             self._on_tts_first_frame: Callable[[int | None, float, float], Any] | None = None
@@ -7603,6 +7698,7 @@ def phone_agent_class(agent_base: Any) -> Any:
                 max_question_acts=phone_objective_guard_max_questions_for_phase(
                     self._generation_phase,
                 ),
+                candidate_text=self._generation_candidate_text,
             )
             if rejection_reason is None:
                 for chunk in held:
@@ -7631,6 +7727,13 @@ def phone_agent_class(agent_base: Any) -> Any:
             interruption, and playout lifecycle just as it does for WebRTC.
             """
             text = _message_text(new_message)
+            # FIX 3: remember the candidate turn this reply answers so the
+            # objective guard can tell a candidate-introduced comp/notice ack
+            # apart from bot-initiated compensation drift. Bounded; never logged.
+            self._generation_candidate_text = (
+                " ".join(text.split())[:800]
+                if isinstance(text, str) and text.strip() else None
+            )
             if self._native_turns:
                 # A new candidate turn starts a fresh tool cycle: the reply it
                 # triggers must resolve its own coordinator tool before the
