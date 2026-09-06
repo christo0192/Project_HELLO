@@ -64,11 +64,25 @@ function toAssessment(row: AssessmentRow): Assessment {
 export function LiveCallPanel({
   candidateId,
   candidateName,
+  onSessionCompleted,
 }: {
   candidateId: string;
   candidateName?: string;
+  /**
+   * Fired when the adopted call transitions to `completed` and again when
+   * its assessment lands, so the host can refresh the candidate's session
+   * list (the Review tab reads it) without a page reload.
+   */
+  onSessionCompleted?: () => void;
 }) {
   const [session, setSession] = useState<CallSession | null>(null);
+  const onCompletedRef = useRef(onSessionCompleted);
+  onCompletedRef.current = onSessionCompleted;
+  const notifiedRef = useRef<{ sid: string | null; completed: boolean; scored: boolean }>({
+    sid: null,
+    completed: false,
+    scored: false,
+  });
   const [turns, setTurns] = useState<TranscriptTurn[]>([]);
   const [assessment, setAssessment] = useState<Assessment | null>(null);
   const [interim, setInterim] = useState("");
@@ -217,6 +231,22 @@ export function LiveCallPanel({
 
   const isLive = status === "in_progress";
   const isCompleted = status === "completed";
+
+  // Notify the host once per transition: completion, then scoring.
+  useEffect(() => {
+    if (!sid) return;
+    if (notifiedRef.current.sid !== sid) {
+      notifiedRef.current = { sid, completed: false, scored: false };
+    }
+    if (isCompleted && !notifiedRef.current.completed) {
+      notifiedRef.current.completed = true;
+      onCompletedRef.current?.();
+    }
+    if (isCompleted && assessment && !notifiedRef.current.scored) {
+      notifiedRef.current.scored = true;
+      onCompletedRef.current?.();
+    }
+  }, [sid, isCompleted, assessment]);
 
   return (
     <Card className="flex flex-col overflow-hidden">

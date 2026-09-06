@@ -84,7 +84,7 @@ const FILTER_PILL_CLASS = (selected: boolean) =>
 
 /** The live count inside a pill. Never the tone colour on the tone's fill. */
 const PILL_COUNT_CLASS = (selected: boolean) =>
-  selected ? "tabular-nums" : "tabular-nums text-[var(--c-ink-muted)]";
+  selected ? "tabular-nums" : "tabular-nums text-[var(--c-ink-secondary)]";
 
 const RECOMMENDATION_TONE: Record<string, StatusTone> = {
   advance: "success",
@@ -116,13 +116,17 @@ export function CandidatesPage() {
    */
   const [uploadOpen, setUploadOpen] = useState(true);
 
+  // Generation counter: a slower earlier request must never overwrite the
+  // rows of the filter the user is now looking at.
+  const loadGen = useRef(0);
   const loadCandidates = useCallback((role: string | null) => {
+    const gen = ++loadGen.current;
     setError(null);
     setCandidates(null);
     api
       .listCandidates(role || undefined)
-      .then(setCandidates)
-      .catch((e: ApiError) => setError(e.message));
+      .then((rows) => { if (gen === loadGen.current) setCandidates(rows); })
+      .catch((e: ApiError) => { if (gen === loadGen.current) setError(e.message); });
   }, []);
 
   useEffect(() => {
@@ -182,7 +186,7 @@ export function CandidatesPage() {
     [candidates, filterKey],
   );
 
-  const page = usePagination(visible, 10);
+  const page = usePagination(visible, 10, filterKey);
 
   const active = hasActiveFilters(filters);
   const roleTitle = roles.find((r) => r.id === roleId)?.title;
@@ -261,7 +265,7 @@ export function CandidatesPage() {
           <h2 className="text-[15px] font-semibold tracking-[-0.01em] text-[var(--c-ink)]">
             All candidates
             {candidates && (
-              <span className="ml-2 font-normal text-[var(--c-ink-muted)]">
+              <span className="ml-2 font-normal text-[var(--c-ink-secondary)]">
                 {active
                   ? `${visible.length} of ${candidates.length}`
                   : candidates.length}
@@ -319,7 +323,7 @@ export function CandidatesPage() {
           role="group"
           aria-label="Filter by recommendation"
         >
-          <span className="text-[13px] font-medium text-[var(--c-ink-muted)]">
+          <span className="text-[13px] font-medium text-[var(--c-ink-secondary)]">
             Recommendation:
           </span>
           {RECOMMENDATION_ORDER.map((rec) => {
@@ -356,7 +360,7 @@ export function CandidatesPage() {
           role="group"
           aria-label="Filter by resume review"
         >
-          <span className="text-[13px] font-medium text-[var(--c-ink-muted)]">
+          <span className="text-[13px] font-medium text-[var(--c-ink-secondary)]">
             Resume:
           </span>
           {RESUME_REVIEW_ORDER.map((value) => {
@@ -487,7 +491,7 @@ export function CandidatesPage() {
                           {candidateDisplayName(c.name)}
                         </Link>
                         {c.email && (
-                          <p className="text-[13px] text-[var(--c-ink-muted)]">{c.email}</p>
+                          <p className="text-[13px] text-[var(--c-ink-secondary)]">{c.email}</p>
                         )}
                       </Td>
                       <Td>
@@ -496,12 +500,12 @@ export function CandidatesPage() {
                             <Tag key={s}>{s}</Tag>
                           ))}
                           {c.skills.length > 4 && (
-                            <span className="text-xs text-[var(--c-ink-muted)]">
+                            <span className="text-xs text-[var(--c-ink-secondary)]">
                               +{c.skills.length - 4}
                             </span>
                           )}
                           {c.skills.length === 0 && (
-                            <span className="text-[var(--c-ink-muted)]">—</span>
+                            <span className="text-[var(--c-ink-secondary)]">—</span>
                           )}
                         </div>
                       </Td>
@@ -529,13 +533,13 @@ export function CandidatesPage() {
                               {recommendationLabel(c.latest_recommendation)}
                             </StatusBadge>
                             {c.latest_score != null && (
-                              <span className="text-xs tabular-nums text-[var(--c-ink-muted)]">
+                              <span className="text-xs tabular-nums text-[var(--c-ink-secondary)]">
                                 {c.latest_score}
                               </span>
                             )}
                           </span>
                         ) : (
-                          <span className="text-[var(--c-ink-muted)]">—</span>
+                          <span className="text-[var(--c-ink-secondary)]">—</span>
                         )}
                       </Td>
                       <Td>
@@ -576,7 +580,7 @@ function FilterChip({
         type="button"
         onClick={onRemove}
         aria-label={`Remove filter ${label}`}
-        className="rounded-full px-1 text-[var(--c-ink-muted)] hover:text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+        className="rounded-full px-1 text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
       >
         ×
       </button>

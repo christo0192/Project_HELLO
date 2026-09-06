@@ -335,10 +335,10 @@ body .text-blue-700,
 body .text-indigo-600,
 body .text-indigo-700 { color: var(--info); }
 body .text-emerald-600,
-body .text-emerald-700 { color: var(--success); }
+body .text-emerald-700 { color: var(--success-text); }
 body .bg-amber-50 { background-color: var(--warning-soft); }
 body .text-amber-600,
-body .text-amber-700 { color: var(--warning); }
+body .text-amber-700 { color: var(--warning-text); }
 body .bg-red-50 { background-color: var(--error-soft); }
 body .text-red-600,
-body .text-red-700 { color: var(--error); }
+body .text-red-700 { color: var(--error-text); }

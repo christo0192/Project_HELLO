@@ -126,7 +126,7 @@ export function AccessSection() {
     [entries, filter],
   );
 
-  const page = usePagination(filtered, 10);
+  const page = usePagination(filtered, 10, filter);
 
   if (loadError && !entries) {
     return <ErrorPanel message={loadError} onRetry={load} />;

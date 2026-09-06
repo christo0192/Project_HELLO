@@ -64,13 +64,19 @@ export function EChart({
     return mergeThemedOption(base, option);
   }, [option, theme, reducedMotion]);
 
+  // Init ONCE per renderer. Callers build `option` as a fresh literal on
+  // every render, so keying the init effect on the option would dispose and
+  // rebuild the canvas on every parent re-render (the dashboard renders ~6×
+  // while its fetches land) and replay the entrance animation each time.
+  const themedRef = useRef(themed);
+  themedRef.current = themed;
   useEffect(() => {
     const node = containerRef.current;
     if (!node) return;
     const activeRenderer = import.meta.env['MODE'] === 'test' && renderer === 'canvas' ? 'svg' : renderer;
     const instance = echarts.init(node, undefined, { renderer: activeRenderer });
     instanceRef.current = instance;
-    instance.setOption(themed, true);
+    instance.setOption(themedRef.current, true);
     readyRef.current?.(instance);
 
     const resize = () => instance.resize();
@@ -80,7 +86,7 @@ export function EChart({
       instance.dispose();
       instanceRef.current = null;
     };
-  }, [renderer, themed]);
+  }, [renderer]);
 
   useEffect(() => {
     instanceRef.current?.setOption(themed, true);

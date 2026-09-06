@@ -315,7 +315,7 @@ export function CandidateScorecard({
             >
               {roundedOverall}
             </span>
-            <span className="text-sm text-[var(--c-ink-muted)]">/ 100</span>
+            <span className="text-sm text-[var(--c-ink-secondary)]">/ 100</span>
           </div>
           <Tag tone={recoTone} srPrefix="Recommendation:" className="px-3 py-1 text-sm">
             {recoLabel}
@@ -337,11 +337,11 @@ export function CandidateScorecard({
         {/* Weights as one 12px line, not a four-row block. */}
         <dl className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-[var(--c-border-light)] pt-2.5 text-xs">
           <WeightItem label="Communication" weight={SECTION_WEIGHTS.communication} />
-          <span aria-hidden className="text-[var(--c-ink-muted)]">·</span>
+          <span aria-hidden className="text-[var(--c-ink-secondary)]">·</span>
           <WeightItem label="Motivation" weight={SECTION_WEIGHTS.motivation} />
-          <span aria-hidden className="text-[var(--c-ink-muted)]">·</span>
+          <span aria-hidden className="text-[var(--c-ink-secondary)]">·</span>
           <WeightItem label="Tone" weight={SECTION_WEIGHTS.tone} />
-          <span aria-hidden className="text-[var(--c-ink-muted)]">·</span>
+          <span aria-hidden className="text-[var(--c-ink-secondary)]">·</span>
           <WeightItem label="Role fit" weight={SECTION_WEIGHTS.role_fit} />
         </dl>
       </SurfaceCard>

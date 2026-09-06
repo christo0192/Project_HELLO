@@ -147,12 +147,13 @@ export function TranscriptionSyncWorkspace({
   // <select> never shows a blank value and the effect never fetches a session
   // that has vanished from the list.
   useEffect(() => {
-    if (
-      selectedSessionId &&
-      !selectableSessions.some((s) => s.id === selectedSessionId)
-    ) {
-      setSelectedSessionId(selectableSessions[0]?.id ?? null);
-    }
+    const stillPresent =
+      selectedSessionId != null && selectableSessions.some((s) => s.id === selectedSessionId);
+    if (stillPresent) return;
+    // Also covers mounting with zero completed sessions: the first one that
+    // arrives later (a call that just finished) is adopted automatically.
+    const next = selectableSessions[0]?.id ?? null;
+    if (next !== selectedSessionId) setSelectedSessionId(next);
   }, [selectableSessions, selectedSessionId]);
 
   useEffect(() => {

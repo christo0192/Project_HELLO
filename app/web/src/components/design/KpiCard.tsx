@@ -1,5 +1,4 @@
 import type { ReactNode } from 'react';
-import { useCountUp, useReducedMotion } from '../../lib/motion';
 import { cx } from './cx';
 import { RollingNumber } from './RollingNumber';
 import { Skeleton } from './Skeleton';
@@ -52,11 +51,9 @@ export function KpiCard({
   aside,
   className,
 }: KpiCardProps) {
-  const reduced = useReducedMotion();
-  const animated = useCountUp(loading ? 0 : value, { disabled: reduced });
-  const shown = formatValue
-    ? formatValue(animated)
-    : Math.round(animated).toLocaleString();
+  // The rolling digits animate the change themselves; feeding them a
+  // count-up would re-target every digit on every frame.
+  const shown = formatValue ? formatValue(value) : Math.round(value).toLocaleString();
 
   return (
     <div className={cx('glass flex h-full flex-col p-5', className)}>

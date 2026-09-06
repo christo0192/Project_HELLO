@@ -232,8 +232,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       const me = await api.getMe();
       setRole(me.role);
       roleUserIdRef.current = me.userId;
-    } catch {
-      /* keep the resolved role; the server enforces access on every call */
+    } catch (error) {
+      // An explicit denial (allowlist entry revoked or deactivated → 403)
+      // fails closed exactly as the gated path does. Only a transport
+      // failure keeps the resolved role; the server enforces every call.
+      const status = (error as { status?: number } | null)?.status;
+      if (status === 403 || status === 401) {
+        setRole(null);
+        roleUserIdRef.current = null;
+      }
     }
   }, []);
 

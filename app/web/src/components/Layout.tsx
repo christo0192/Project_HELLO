@@ -341,7 +341,9 @@ export function Layout() {
       </aside>
 
       {/* ── Main column ─────────────────────────────────────────────── */}
-      <div className="flex min-w-0 flex-1 flex-col">
+      {/* While the mobile drawer is open the page behind it is inert, so
+          Tab cannot escape the drawer and assistive tech reads only it. */}
+      <div className="flex min-w-0 flex-1 flex-col" inert={drawerOpen && !isDesktop ? true : undefined}>
         <header
           className={`sticky top-0 z-20 flex h-14 items-center gap-3 border-b border-glass-ring bg-[var(--glass-bg-strong)] px-4 backdrop-blur-xl transition-shadow duration-300 sm:px-8 ${
             scrolled ? 'shadow-[0_8px_24px_-16px_rgba(15,23,42,0.22)]' : ''
