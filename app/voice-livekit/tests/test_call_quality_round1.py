@@ -394,5 +394,164 @@ class TestAnswerDispositionFromTheLiveCall(unittest.TestCase):
         )
 
 
+class _FakeMsg:
+    """A ChatMessage-shaped item with a pydantic-style `model_copy`."""
+
+    def __init__(self, role, content, msg_id=None):
+        self.role = role
+        self.content = content
+        self.id = msg_id
+
+    def model_copy(self, *, update=None):
+        clone = _FakeMsg(self.role, self.content, self.id)
+        for key, value in (update or {}).items():
+            setattr(clone, key, value)
+        return clone
+
+    def __repr__(self):
+        return f"_FakeMsg({self.role!r}, {self.content!r})"
+
+
+class _FakeCtx:
+    """A ChatContext-shaped holder with a copy() that clones the item list."""
+
+    def __init__(self, items):
+        self.items = list(items)
+
+    def copy(self):
+        return _FakeCtx(self.items)
+
+
+class TestDeveloperRoleRewrite(unittest.TestCase):
+    """F-B (live f5dee550, first DeepSeek call): every conversational request
+    400'd because DeepSeek's OpenAI-compat endpoint rejects the `developer`
+    role. The rewrite maps `developer`->`system` on the OUTGOING request only,
+    preserving order and leaving non-developer items untouched."""
+
+    def test_developer_is_rewritten_to_system(self):
+        ctx = _FakeCtx([
+            _FakeMsg("system", "policy"),
+            _FakeMsg("user", "hi"),
+            _FakeMsg("developer", "ask Q1"),
+            _FakeMsg("assistant", "sure"),
+        ])
+        out, count = phone.rewrite_developer_role_to_system(ctx)
+        self.assertEqual(count, 1)
+        roles = [m.role for m in out.items]
+        # Order preserved; the developer item became system; nothing else moved.
+        self.assertEqual(roles, ["system", "user", "system", "assistant"])
+        # The rewritten item preserved its content payload.
+        self.assertEqual(out.items[2].content, "ask Q1")
+
+    def test_order_preserved_with_multiple_developer_items(self):
+        ctx = _FakeCtx([
+            _FakeMsg("developer", "d1"),
+            _FakeMsg("user", "u1"),
+            _FakeMsg("developer", "d2"),
+            _FakeMsg("assistant", "a1"),
+            _FakeMsg("developer", "d3"),
+        ])
+        out, count = phone.rewrite_developer_role_to_system(ctx)
+        self.assertEqual(count, 3)
+        self.assertEqual(
+            [(m.role, m.content) for m in out.items],
+            [("system", "d1"), ("user", "u1"), ("system", "d2"),
+             ("assistant", "a1"), ("system", "d3")],
+        )
+
+    def test_no_developer_items_is_a_noop_same_object(self):
+        ctx = _FakeCtx([
+            _FakeMsg("system", "policy"),
+            _FakeMsg("user", "hi"),
+            _FakeMsg("assistant", "there"),
+        ])
+        out, count = phone.rewrite_developer_role_to_system(ctx)
+        self.assertEqual(count, 0)
+        # No rewrite → the SAME ctx object is returned (no needless copy).
+        self.assertIs(out, ctx)
+
+    def test_non_developer_roles_are_untouched(self):
+        ctx = _FakeCtx([
+            _FakeMsg("system", "s"), _FakeMsg("user", "u"),
+            _FakeMsg("assistant", "a"), _FakeMsg("tool", "t"),
+        ])
+        out, count = phone.rewrite_developer_role_to_system(ctx)
+        self.assertEqual(count, 0)
+        self.assertEqual([m.role for m in out.items], ["system", "user", "assistant", "tool"])
+
+    def test_source_does_not_mutate_the_input_items_in_place(self):
+        # The rewrite must not corrupt the passed ctx's own list when it copies.
+        original = _FakeMsg("developer", "d1")
+        ctx = _FakeCtx([original, _FakeMsg("user", "u1")])
+        out, count = phone.rewrite_developer_role_to_system(ctx)
+        self.assertEqual(count, 1)
+        self.assertIsNot(out, ctx)
+        # The original developer item object is unchanged (a fresh copy was made).
+        self.assertEqual(original.role, "developer")
+        self.assertEqual(out.items[0].role, "system")
+
+    def test_dict_shaped_items_are_rewritten_too(self):
+        # A test-harness ctx may carry plain dict items with no model_copy.
+        ctx = _FakeCtx([
+            {"role": "developer", "content": "d"},
+            {"role": "user", "content": "u"},
+        ])
+        out, count = phone.rewrite_developer_role_to_system(ctx)
+        self.assertEqual(count, 1)
+        self.assertEqual(out.items[0]["role"], "system")
+        self.assertEqual(out.items[1]["role"], "user")
+
+    def test_llm_node_applies_rewrite_only_on_openai_lane(self):
+        # The wiring guard must be `not phone_use_google_llm()`: the OpenAI-compat
+        # lane rewrites, the native google/Gemini lane does not. Verified via the
+        # source of the llm_node override (the lane gate is the load-bearing part).
+        import inspect
+        src = inspect.getsource(phone.phone_agent_class)
+        self.assertIn("if not phone_use_google_llm():", src)
+        self.assertIn("rewrite_developer_role_to_system(generation_ctx)", src)
+
+
+class TestRepeatedFallbackVariation(unittest.TestCase):
+    """F-D #1 (live transcript): the watchdog fallback re-asked the SAME
+    question byte-identically twice in a row and the candidate noticed. A
+    consecutive identical fallback must be re-worded (same question, rotated
+    prefix); a non-repeat is returned unchanged."""
+
+    QUESTION = "Walk me through your most recent role."
+
+    def test_first_fallback_is_unchanged(self):
+        out = phone.phone_vary_repeated_fallback(self.QUESTION, None, 0)
+        self.assertEqual(out, self.QUESTION)
+
+    def test_a_different_fallback_is_unchanged(self):
+        out = phone.phone_vary_repeated_fallback(
+            "A totally different question?", self.QUESTION, 0,
+        )
+        self.assertEqual(out, "A totally different question?")
+
+    def test_consecutive_identical_is_reworded_but_keeps_the_question(self):
+        out = phone.phone_vary_repeated_fallback(self.QUESTION, self.QUESTION, 0)
+        # Never byte-identical to the previous line …
+        self.assertNotEqual(out, self.QUESTION)
+        # … but the question body is preserved verbatim (case-insensitive, since
+        # the leading capital is lowered so the prefix reads naturally).
+        self.assertIn("walk me through your most recent role.", out.lower())
+        # The prefix is one of the fixed rotation entries.
+        self.assertTrue(
+            any(out.startswith(p) for p in phone.PHONE_REASK_VARIATION_PREFIXES),
+            out,
+        )
+
+    def test_rotation_advances_with_repeat_index(self):
+        first = phone.phone_vary_repeated_fallback(self.QUESTION, self.QUESTION, 0)
+        second = phone.phone_vary_repeated_fallback(self.QUESTION, self.QUESTION, 1)
+        # Two consecutive repeats pick DIFFERENT prefixes (deterministic rotation).
+        self.assertNotEqual(first, second)
+
+    def test_empty_and_non_string_are_safe(self):
+        self.assertEqual(phone.phone_vary_repeated_fallback("", "x", 0), "")
+        self.assertEqual(phone.phone_vary_repeated_fallback(None, "x", 0), "")
+
+
 if __name__ == "__main__":
     unittest.main()
