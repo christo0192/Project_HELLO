@@ -101,6 +101,14 @@ primary_region = "sin"
   # PHONE_SCREENING_ENABLED / PHONE_RUNTIME_ENABLED / PHONE_DIAL_MODE are
   # separate Fly SECRETS, all default-off.
   PHONE_AGENT_NAME = "phone-screener"
+  # Browser worker on-demand orchestration (design §2.3b B-i), ACTIVATED
+  # 2026-09-06. Non-empty means the API's exchange gate (invites.ts Step 2c)
+  # confirms a READY browser worker and DISPATCHES the browser room to this
+  # worker by name before minting a candidate join token. MUST equal the browser
+  # worker's BROWSER_AGENT_NAME (fly.toml, "browser-screener"); a mismatch leaves
+  # the room agent-less (checked only at runtime). Only takes effect together
+  # with WORKER_ORCHESTRATION=true (already set). A dispatch name, not a secret.
+  BROWSER_AGENT_NAME = "browser-screener"
 
 [http_service]
   internal_port = 8787
