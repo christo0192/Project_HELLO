@@ -8,6 +8,10 @@
  * - load() returns a Promise that resolves when the signed URL is set.
  * - Refresh preserves currentTime and play state where possible.
  * - Emits onTimeUpdate(currentTime) and onPlayState(playing) for parent sync.
+ * - Renders as a single toolbar ROW (no card chrome): it sits directly under
+ *   the Transcript card's title, so the host card owns the surface. The old
+ *   bordered box was the only thing in a 20rem column and left the rest of
+ *   that column empty.
  */
 
 import { useCallback, useEffect, useImperativeHandle, useRef, useState, forwardRef } from 'react';
@@ -42,11 +46,16 @@ export interface RecordingPlayerProps {
   onPlayState?: (playing: boolean) => void;
   onCanPlay?: () => void;
   className?: string;
+  /**
+   * Retained for call-site compatibility. The player is now always the
+   * compact toolbar row it used to become only under this flag, so it no
+   * longer selects a presentation — it is a no-op alias.
+   */
   compact?: boolean;
 }
 
 export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayerProps>(
-  function RecordingPlayer({ sessionId, onTimeUpdate, onPlayState, onCanPlay, className, compact = false }, ref) {
+  function RecordingPlayer({ sessionId, onTimeUpdate, onPlayState, onCanPlay, className }, ref) {
     const [url, setUrl] = useState<string | null>(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -241,34 +250,30 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
       },
     }), [fetchUrl, applyPendingSeek, url, error]);
 
+    // The player is a TOOLBAR ROW inside the Transcript card, not a card of
+    // its own: the old bordered box left a 20rem column empty beneath it.
+    // Every state is therefore a single row with no surface chrome; the host
+    // card supplies the surface.
+    const row = 'flex flex-wrap items-center justify-between gap-x-4 gap-y-2';
+
     // ── idle state (no URL fetched yet) ──────────────────────────
     // Must exclude the error case: an error also has url==null && !loading,
     // so without the !error guard this branch would shadow the error state
     // below and swallow the failure message + retry affordance.
     if (!url && !loading && !error) {
       return (
-        <div className={cx(
-          'rounded-lg border border-line bg-surface p-3',
-          compact && 'p-2',
-          className,
-        )}>
-          <div className={cx('flex items-center gap-3', compact && 'gap-2')}>
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-secondary shrink-0">
-              Recording
-            </h3>
-            {!compact && (
-              <p className="text-xs text-ink-tertiary">
-                A short-lived link is created on request and expires automatically.
-              </p>
-            )}
-            <CandidateButton
-              variant="secondary"
-              className={cx('shrink-0', compact ? 'px-3 py-2 text-xs' : 'mt-0')}
-              onClick={fetchUrl}
-            >
-              Load recording
-            </CandidateButton>
-          </div>
+        <div className={cx(row, className)}>
+          <h3 className="sr-only">Recording</h3>
+          <p className="text-[13px] text-[var(--c-ink-secondary)]">
+            Recording loads on request; the link expires automatically.
+          </p>
+          <CandidateButton
+            variant="secondary"
+            className="shrink-0"
+            onClick={fetchUrl}
+          >
+            Load recording
+          </CandidateButton>
         </div>
       );
     }
@@ -276,11 +281,9 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
     // ── loading state ────────────────────────────────────────────
     if (loading) {
       return (
-        <div className={cx('rounded-lg border border-line bg-surface p-3', compact && 'p-2', className)}>
-          <div className="flex items-center gap-3">
-            <div className="h-4 w-4 animate-spin rounded-full border-2 border-[var(--c-accent)] border-t-transparent" />
-            <p className="text-xs text-ink-tertiary">Loading recording…</p>
-          </div>
+        <div className={cx('flex items-center gap-3', className)}>
+          <div className="h-4 w-4 shrink-0 animate-spin rounded-full border-2 border-[var(--c-accent)] border-t-transparent" />
+          <p className="text-[13px] text-[var(--c-ink-secondary)]">Loading recording…</p>
         </div>
       );
     }
@@ -288,48 +291,38 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
     // ── error state ──────────────────────────────────────────────
     if (error) {
       return (
-        <div className={cx('rounded-lg border border-line bg-surface p-3', compact && 'p-2', className)} role="alert">
-          <div className={cx('flex items-center gap-3', compact && 'gap-2')}>
-            <p className="text-sm text-error">{error}</p>
-            <CandidateButton
-              variant="secondary"
-              className={cx('shrink-0', compact ? 'px-3 py-2 text-xs' : 'mt-0')}
-              onClick={fetchUrl}
-            >
-              Try again
-            </CandidateButton>
-          </div>
+        <div className={cx(row, className)} role="alert">
+          <h3 className="sr-only">Recording</h3>
+          <p className="text-[13px] text-[var(--c-ink-secondary)]">{error}</p>
+          <CandidateButton
+            variant="secondary"
+            className="shrink-0"
+            onClick={fetchUrl}
+          >
+            Try again
+          </CandidateButton>
         </div>
       );
     }
 
     // ── active player ────────────────────────────────────────────
     return (
-      <div className={cx('rounded-lg border border-line bg-surface p-3', compact && 'p-2', className)}>
-        <div className={cx('flex items-center gap-3', compact && 'flex-col items-stretch gap-1')}>
-          <h3 className={cx('text-xs font-semibold uppercase tracking-wide text-ink-secondary', compact && 'sr-only')}>
-            Recording
-          </h3>
-          {compact && (
-            <span className="text-[10px] font-semibold uppercase tracking-wide text-ink-tertiary" aria-hidden>
-              Recording
-            </span>
-          )}
-          <audio
-            ref={audioRef}
-            id="sync-workspace-audio"
-            controls
-            preload="none"
-            src={url!}
-            className={cx('h-9 w-full', compact && 'h-10')}
-            aria-label="Session recording player"
-          >
-            <a href={url!} target="_blank" rel="noreferrer">
-              Download recording
-            </a>
-          </audio>
-        </div>
-        <div className={cx('mt-2 flex flex-wrap items-center gap-3', compact && 'mt-1 gap-2')}>
+      <div className={cx('flex flex-col gap-1.5', className)}>
+        <h3 className="sr-only">Recording</h3>
+        <audio
+          ref={audioRef}
+          id="sync-workspace-audio"
+          controls
+          preload="none"
+          src={url!}
+          className="h-9 w-full"
+          aria-label="Session recording player"
+        >
+          <a href={url!} target="_blank" rel="noreferrer">
+            Download recording
+          </a>
+        </audio>
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
           <a
             href={url!}
             download
@@ -340,7 +333,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
           <button
             type="button"
             onClick={refreshUrl}
-            className="text-xs font-medium text-ink-secondary underline-offset-2 hover:text-ink hover:underline"
+            className="text-xs font-medium text-[var(--c-ink-secondary)] underline-offset-2 hover:text-[var(--c-ink)] hover:underline"
           >
             Refresh link
           </button>

@@ -143,7 +143,18 @@ export function PhoneSlotPicker({
             Slot
           </legend>
 
-          <p className="mt-1 text-xs text-ink-tertiary">
+          {/* One line on screen (the full sentence stays in the DOM and in
+              the tooltip): the same caveat is repeated by every host well. */}
+          <p
+            className="mt-1 truncate text-xs text-ink-tertiary"
+            title={`Capacity below is an advisory projection, not a reservation. The fleet limit is applied when the call is dialled, not when it is booked, so booking a slot does not guarantee dial capacity at that time. ${
+              data.max_concurrent === null
+                ? 'The fleet limit is currently unknown.'
+                : `The fleet limit is ${data.max_concurrent} concurrent ${
+                    data.max_concurrent === 1 ? 'call' : 'calls'
+                  }.`
+            }`}
+          >
             Capacity below is an <strong className="font-semibold">advisory
             projection</strong>, not a reservation. The fleet limit is applied
             when the call is dialled, not when it is booked, so booking a slot

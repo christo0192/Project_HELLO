@@ -168,7 +168,7 @@ function ScopedOverviewTab({
   applicationLinkId: string;
 }) {
   return (
-    <div className="fade-up-stagger grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-3">
+    <div className="fade-up-stagger grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-3 lg:items-start">
       <CandidateProfileCard candidate={candidate} />
       <div className="space-y-4 sm:space-y-6 lg:col-span-2">
         {/* The SAME read-only card as the normal Overview, read through the
