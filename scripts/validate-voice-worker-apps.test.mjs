@@ -401,12 +401,8 @@ for (const [label, phone, apiEnv, apiFly] of AGREE_NEG) {
   const r = spawnSync(process.execPath, [validator], { encoding: "utf8" });
   const out = (r.stdout || "") + (r.stderr || "");
   ok(r.status === 0, `shipped configs must pass the posture check: ${out}`);
-  // PLAN B ACTIVATION (2026-09-06): the phone lane ships orchestration ON
-  // (fly.phone.toml WORKER_ORCHESTRATION="worker"); the browser lane stays OFF.
-  // This pin is the deliberate activation friction — flipping a lane's posture
-  // must update this expectation in the same reviewed PR.
-  ok(/orchestration_state=browser:off,phone:worker/.test(out),
-    `the shipped configs must SURFACE browser OFF and phone WORKER, got:\n${out}`);
+  ok(/orchestration_state=browser:off,phone:off/.test(out),
+    `the shipped configs must SURFACE both voice apps as orchestration OFF, got:\n${out}`);
 }
 
 if (failures.length) {
