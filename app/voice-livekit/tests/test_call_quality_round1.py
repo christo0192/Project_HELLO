@@ -805,5 +805,148 @@ class TestRepeatedFallbackVariation(unittest.TestCase):
         self.assertEqual(phone.phone_vary_repeated_fallback(None, "x", 0), "")
 
 
+class TestCompensationDriftCandidateIntroduced(unittest.TestCase):
+    """FIX 3 (2026-09-06, live call ac7c8c77 12:57:30): the candidate volunteered
+    "my notice period is around 1 month", the model acknowledged it, and the ack
+    was rejected as `compensation_drift` on a screening turn — the drift guard
+    fired on an acknowledgement of a topic the CANDIDATE introduced. The guard
+    now gates on whether the candidate raised comp/notice, so an ack of
+    volunteered content passes while a genuine bot-initiated comp probe is still
+    caught."""
+
+    # A non-comp screening objective (the drift check only fires off-comp).
+    SCREENING_OBJECTIVE = (
+        "Ask the candidate to walk through their total sales experience."
+    )
+
+    # Table-driven candidate turns that SHOULD suppress the drift check.
+    CANDIDATE_INTRODUCED = (
+        ("notice", "My notice period is around 1 month."),
+        ("current_ctc", "My current CTC is about 12 LPA."),
+        ("salary_word", "I'd want the salary to be competitive."),
+        ("package", "The package matters to me a lot."),
+        ("take_home", "My take-home is around 80k a month."),
+    )
+
+    def test_live_shape_ack_of_volunteered_notice_is_not_drift(self):
+        # The exact live shape: candidate volunteered notice, model acknowledged
+        # it (mentions 'notice period') then asked the screening objective.
+        reply = (
+            "Got it — a one-month notice period is helpful to know. "
+            "Now, can you walk me through your total sales experience?"
+        )
+        # WITHOUT the candidate context this looks like drift (mentions 'package'
+        # vocabulary via the objective regex)…
+        self.assertEqual(
+            phone.phone_generated_reply_rejection_reason(
+                "Your notice and package aside — what is your current salary?",
+                self.SCREENING_OBJECTIVE, allow_closing=False,
+            ),
+            "compensation_drift",
+        )
+        # …but an ack of what the candidate volunteered passes.
+        self.assertIsNone(
+            phone.phone_generated_reply_rejection_reason(
+                reply, self.SCREENING_OBJECTIVE, allow_closing=False,
+                candidate_text="My notice period is around 1 month.",
+            ),
+        )
+
+    def test_candidate_introduced_topics_suppress_drift(self):
+        # A reply that names the comp/notice vocabulary (would trip the drift
+        # regex) is allowed when the candidate raised the topic in this turn.
+        reply = "Thanks for sharing your package details. Moving on."
+        for name, candidate in self.CANDIDATE_INTRODUCED:
+            with self.subTest(name):
+                self.assertIsNone(
+                    phone.phone_generated_reply_rejection_reason(
+                        reply + " Walk me through your experience.",
+                        self.SCREENING_OBJECTIVE, allow_closing=False,
+                        candidate_text=candidate,
+                    ),
+                )
+
+    def test_bot_initiated_comp_drift_still_rejected(self):
+        # The candidate said nothing about comp; a bot comp probe on a non-comp
+        # objective is genuine drift and stays rejected.
+        self.assertEqual(
+            phone.phone_generated_reply_rejection_reason(
+                "By the way, what is your expected salary package?",
+                self.SCREENING_OBJECTIVE, allow_closing=False,
+                candidate_text="I have about eight years in inside sales.",
+            ),
+            "compensation_drift",
+        )
+
+    def test_default_none_candidate_text_preserves_legacy_behaviour(self):
+        # Absent candidate_text, behaviour is byte-identical to before FIX 3.
+        self.assertEqual(
+            phone.phone_generated_reply_rejection_reason(
+                "What is your current CTC?", self.SCREENING_OBJECTIVE,
+                allow_closing=False,
+            ),
+            "compensation_drift",
+        )
+
+    def test_detector_predicate_shapes(self):
+        self.assertTrue(
+            phone.phone_candidate_introduced_compensation("notice period is 30 days"))
+        self.assertTrue(
+            phone.phone_candidate_introduced_compensation("my ctc is 10 lpa"))
+        self.assertFalse(
+            phone.phone_candidate_introduced_compensation("I lead a team of five."))
+        self.assertFalse(phone.phone_candidate_introduced_compensation(None))
+
+
+class TestRhetoricalTagQuestionCount(unittest.TestCase):
+    """FIX 3 (2026-09-06, live call ac7c8c77 12:55:37 phase=screening): an ack
+    ending on a rhetorical tag ("…, right?") plus one real question counted TWO
+    question acts and was rejected as `question_mark_count`. A rhetorical tag is
+    not a candidate-directed question act; it no longer inflates the count, while
+    a genuine second question still does."""
+
+    def test_trailing_tag_does_not_inflate_the_count(self):
+        # Ack + tag + ONE real question = one act (was two before the fix).
+        for tag_reply in (
+            "That makes sense, right? Now, walk me through your experience.",
+            "Great, you know? Tell me about your recent role.",
+            "Okay, does that make sense? What is your notice period?",
+            "Sounds good, yeah? Describe your last project.",
+        ):
+            with self.subTest(tag_reply[:32]):
+                self.assertEqual(
+                    phone.phone_generated_question_act_count(tag_reply), 1)
+                self.assertIsNone(
+                    phone.phone_generated_reply_rejection_reason(
+                        tag_reply,
+                        "Ask about the candidate's experience.",
+                        allow_closing=False,
+                    ),
+                )
+
+    def test_genuine_two_questions_still_counted_and_rejected(self):
+        # Two real candidate-directed questions is genuine stacking → rejected.
+        stacked = "What is your CTC? What is your notice period?"
+        self.assertEqual(phone.phone_generated_question_act_count(stacked), 2)
+        self.assertEqual(
+            phone.phone_generated_reply_rejection_reason(
+                stacked, "Ask about the candidate's CTC.", allow_closing=False,
+            ),
+            "question_mark_count",
+        )
+
+    def test_a_short_real_question_is_not_mistaken_for_a_tag(self):
+        # A short genuine question ("what's your CTC?") is NOT a tag phrase and
+        # still counts as one act.
+        self.assertEqual(
+            phone.phone_generated_question_act_count("What's your CTC?"), 1)
+
+    def test_tag_alone_with_no_real_question_is_zero_acts(self):
+        # Only a rhetorical tag and no real question = zero acts (and on a
+        # non-closing turn that is its own rejection, unchanged).
+        self.assertEqual(
+            phone.phone_generated_question_act_count("That makes sense, right?"), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

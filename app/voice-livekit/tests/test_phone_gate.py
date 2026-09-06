@@ -2873,6 +2873,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         interruptions=(),
         silence_reply=None,
         emit_auto_speech=True,
+        fire_away=False,
     ):
         ctx = FakeCtx(_PHONE_ROOM, participants=[_participant()] if participant else [])
         client = client if client is not None else FakeEventClient()
@@ -2912,6 +2913,18 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             )
             await asyncio.sleep(0.01)
             session = _FakePhoneSession.instances[-1] if _FakePhoneSession.instances else None
+            if fire_away and session is not None:
+                # FIX 2: simulate a LiveKit 'away' transition once the session's
+                # handlers are installed and screening is under way, so the away
+                # latch resolves the silence loop's first window immediately.
+                handler = session.handlers.get("user_state_changed")
+                if handler is not None:
+                    for _ in range(50):
+                        await asyncio.sleep(0)
+                        if getattr(session.agent, "_screening_authorized", False):
+                            break
+                    handler(types.SimpleNamespace(old_state="active", new_state="away"))
+                    await asyncio.sleep(0.01)
             if close_after and session is not None and session.start_calls:
                 session.emit_close()
             result = await asyncio.wait_for(task, timeout=5)
@@ -3590,7 +3603,8 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         # outcomes with two different terminal decisions, and a test that let
         # them race would be asserting whichever won.
         with patch.object(agent_mod, "CANDIDATE_SILENCE_PROMPT_SEC", 0.001), \
-             patch.object(agent_mod, "CANDIDATE_SILENCE_END_SEC", 0.001):
+             patch.object(agent_mod, "CANDIDATE_SILENCE_END_SEC", 0.001), \
+             patch.object(agent_mod, "CANDIDATE_SILENCE_SECOND_NUDGE_SEC", 0.001):
             _, client, _, _, _, _ = await self._run_session(
                 answers=("Yes, that's fine.",), replies=[None, None, None],
                 close_after=False,
@@ -3784,6 +3798,120 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertIn("user_away", states)
         self.assertIn("user_active", states)
+
+    async def test_resume_clears_the_away_latch(self):
+        # Review repair (2026-09-06): away -> resume must CLEAR the away latch,
+        # or a stale away_event set during a brief blip fires "are you still
+        # there?" over the candidate's resumed answer at the next loop check.
+        _, _, _, _, session, _ = await self._run_session(answers=("Yes, sure.",))
+        handler = session.handlers.get("user_state_changed")
+        self.assertIsNotNone(handler)
+        away_event = getattr(session.agent, "_away_event", None)
+        self.assertIsNotNone(away_event)
+        handler(types.SimpleNamespace(old_state="active", new_state="away"))
+        self.assertTrue(away_event.is_set())
+        handler(types.SimpleNamespace(old_state="away", new_state="active"))
+        self.assertFalse(away_event.is_set())
+
+    async def test_preemptive_objective_clears_candidate_text(self):
+        # Review repair (2026-09-06): the speculative llm_node pass authorized
+        # by prime_preemptive_objective runs BEFORE on_user_turn_completed
+        # refreshes the candidate text — the gate input must be cleared to None
+        # (fail-closed: drift guard fully armed) so a KEPT speculative reply
+        # cannot inherit the PRIOR turn's compensation suppression.
+        _, _, _, _, session, _ = await self._run_session(answers=("Yes, sure.",))
+        agent = session.agent
+        prime = getattr(agent, "_prime_preemptive_objective", None)
+        self.assertIsNotNone(prime)
+        agent._generation_candidate_text = "my notice period is one month"
+        with patch.dict(phone.os.environ, {
+            "PHONE_OBJECTIVE_PREEMPTIVE": "on", "PHONE_TURN_MODE": "toolless",
+        }):
+            await prime(None)
+        self.assertIsNone(agent._generation_candidate_text)
+
+    async def test_defaults_tuned_for_faster_silence_response(self):
+        # FIX 2 (2026-09-06): the first nudge must fire far sooner than the old
+        # 30s, and the ladder must include a second-nudge window.
+        self.assertEqual(agent_mod.CANDIDATE_SILENCE_PROMPT_SEC, 10.0)
+        self.assertEqual(agent_mod.CANDIDATE_SILENCE_END_SEC, 12.0)
+        self.assertEqual(agent_mod.CANDIDATE_SILENCE_SECOND_NUDGE_SEC, 8.0)
+        # Time-to-goodbye ≈ prompt + end + second-nudge ≈ 30s (kept near ~30s).
+        ladder = (
+            agent_mod.CANDIDATE_SILENCE_PROMPT_SEC
+            + agent_mod.CANDIDATE_SILENCE_END_SEC
+            + agent_mod.CANDIDATE_SILENCE_SECOND_NUDGE_SEC
+        )
+        self.assertLessEqual(ladder, 35.0)
+        self.assertGreaterEqual(ladder, 25.0)
+
+    async def test_second_nudge_and_goodbye_ladder(self):
+        # FIX 2: a persistently silent candidate hears PROMPT then a SECOND
+        # NUDGE then the GOODBYE, in that order, before the call ends. Constants
+        # short so the ladder resolves under the harness residency cap.
+        with patch.object(agent_mod, "CANDIDATE_SILENCE_PROMPT_SEC", 0.001), \
+             patch.object(agent_mod, "CANDIDATE_SILENCE_END_SEC", 0.001), \
+             patch.object(agent_mod, "CANDIDATE_SILENCE_SECOND_NUDGE_SEC", 0.001):
+            _, client, _, _, session, _ = await self._run_session(
+                answers=("Yes, that's fine.",), replies=[None, None, None],
+                close_after=False,
+            )
+        said = session.spoken
+        # All three lines were spoken, and the nudge came between prompt and
+        # goodbye.
+        self.assertIn(phone.PHONE_SILENCE_PROMPT_TEXT, said)
+        self.assertIn(phone.PHONE_SILENCE_SECOND_NUDGE_TEXT, said)
+        self.assertIn(phone.PHONE_SILENCE_GOODBYE_TEXT, said)
+        i_prompt = said.index(phone.PHONE_SILENCE_PROMPT_TEXT)
+        i_nudge = said.index(phone.PHONE_SILENCE_SECOND_NUDGE_TEXT)
+        i_bye = said.index(phone.PHONE_SILENCE_GOODBYE_TEXT)
+        self.assertLess(i_prompt, i_nudge)
+        self.assertLess(i_nudge, i_bye)
+        # The second nudge is fixed copy — never captured as a screening turn.
+        self.assertNotIn(
+            phone.PHONE_SILENCE_SECOND_NUDGE_TEXT,
+            [b["turns"][-1]["text"] for b in client.boundaries],
+        )
+
+    async def test_away_triggers_the_prompt_before_the_timer(self):
+        # FIX 2: with a LONG silence timer, an away transition still triggers the
+        # "are you still there?" prompt — proving away, not the timer, drove it.
+        # The candidate answers the prompt, so the screening resumes normally.
+        with patch.object(agent_mod, "CANDIDATE_SILENCE_PROMPT_SEC", 30.0):
+            _, client, _, _, session, _ = await self._run_session(
+                answers=("Yes, sure.",),
+                replies=[None, "My real first answer.", "My second answer."],
+                silence_reply="Yes, I'm still here.",
+                fire_away=True,
+                close_after=False,
+            )
+        # The prompt was spoken (away drove it, the 30s timer did not fire) and
+        # the prompt text was never captured as a screening turn.
+        self.assertIn(phone.PHONE_SILENCE_PROMPT_TEXT, session.spoken)
+        self.assertNotIn(
+            phone.PHONE_SILENCE_PROMPT_TEXT,
+            [b["turns"][-1]["text"] for b in client.boundaries],
+        )
+
+    async def test_away_does_not_double_prompt_with_the_timer(self):
+        # FIX 2: away + a short timer must not produce TWO prompts — the loop
+        # consumes the away latch the instant it acts, so only one
+        # "are you still there?" is spoken for a single silence episode.
+        with patch.object(agent_mod, "CANDIDATE_SILENCE_PROMPT_SEC", 0.001), \
+             patch.object(agent_mod, "CANDIDATE_SILENCE_END_SEC", 0.05), \
+             patch.object(agent_mod, "CANDIDATE_SILENCE_SECOND_NUDGE_SEC", 0.05):
+            _, client, _, _, session, _ = await self._run_session(
+                answers=("Yes, sure.",),
+                replies=[None, "Recovered answer.", "Second answer."],
+                silence_reply="I'm here now.",
+                fire_away=True,
+                close_after=False,
+            )
+        prompts = [t for t in session.spoken
+                   if t == phone.PHONE_SILENCE_PROMPT_TEXT]
+        # One prompt for this silence episode — away and the timer did not stack
+        # into two "are you still there?" utterances.
+        self.assertEqual(len(prompts), 1, session.spoken)
 
 
 class TestNativePhoneArchitecture(unittest.TestCase):

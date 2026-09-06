@@ -85,7 +85,17 @@ begin
   -- and the SESSION already `expired`/`grace_timeout` — the residue 0071's
   -- reclaim leaves. MUST be selected, returned with transitioned=false and
   -- disconnect_reason='worker_crash', and NOT re-transitioned.
-  for v_s in select unnest(array['stranded','control','crash']) loop
+  -- LEASE_LAPSED (slug 'lease'): the EXACT live-call ac7c8c77 shape (RCA
+  -- 2026-09-06). The candidate answered and was classified `human`, then the
+  -- leg was lost by disconnect: the worker's `disconnect` branch preserves the
+  -- room (reconnect) and returns, cancelling the heartbeat — so the lease STOPS
+  -- renewing and lapses, but the attempt is NEVER driven `ended`/`abandoned`.
+  -- The session stays `in_progress` forever. This is the selector's
+  -- LEASE-EXPIRY branch (`state in ('human'...)` with `lease_expires_at` past),
+  -- the one branch the stranded/crash fixtures do NOT exercise. 0072 MUST
+  -- select it, drive it to completed/conversation_complete, and report
+  -- disconnect_reason='worker_crash' (a lapsed lease in a live state).
+  for v_s in select unnest(array['stranded','control','crash','lease']) loop
     insert into screening_v2.candidates (role_id, name, email, phone_e164, phone_valid)
     values (v_role, 'pf72 ' || v_s, 'pf72-' || v_s || '@example.test',
             '+9199988' || lpad((abs(hashtext(v_s)) % 100000)::text, 5, '0'), true)
@@ -165,17 +175,32 @@ begin
     --     (candidate hangup). Stranded ended 600s ago; control 10s ago.
     --   * crash: `abandoned` with outcome NULL (reclaim's crash terminal),
     --     ended 600s ago — the residue 0072's abandoned-branch must select.
+    --   * lease: live-state `human`, outcome NULL, NO ended_at, and a lease
+    --     that lapsed 600s ago — the disconnect-abandoned RCA shape. Selected by
+    --     the lease-expiry branch, NOT the ended/abandoned branches.
     insert into screening_v2.phone_call_attempts
       (engagement_id, attempt_seq, epoch, kind, state, outcome_class,
-       ist_date, prior_engagement_state, session_id, admitted_at, answered_at, ended_at)
+       ist_date, prior_engagement_state, session_id, admitted_at, answered_at,
+       ended_at, lease_expires_at)
     values (v_eng, 1, 0, 'initial',
-            case when v_s = 'crash' then 'abandoned' else 'ended' end,
-            case when v_s = 'crash' then null else 'disconnected' end,
+            case
+              when v_s = 'crash' then 'abandoned'
+              when v_s = 'lease' then 'human'
+              else 'ended'
+            end,
+            case when v_s in ('crash','lease') then null else 'disconnected' end,
             '2026-08-24', 'eligible', v_sess,
             v_now - interval '1200 seconds', v_now - interval '1100 seconds',
-            case when v_s = 'control'
-                 then v_now - interval '10 seconds'
-                 else v_now - interval '600 seconds' end)
+            -- ended_at: NULL for the lease case (the attempt never terminalized).
+            case
+              when v_s = 'lease' then null
+              when v_s = 'control' then v_now - interval '10 seconds'
+              else v_now - interval '600 seconds'
+            end,
+            -- lease_expires_at: only the lease case relies on it (lapsed 600s
+            -- ago). The others leave it NULL — their selection is by ended_at.
+            case when v_s = 'lease' then v_now - interval '600 seconds'
+                 else null end)
     returning id into v_att;
   end loop;
 

@@ -113,8 +113,21 @@ def _float_env(name: str, default: float) -> float:
         return default
 
 
-CANDIDATE_SILENCE_PROMPT_SEC = _float_env("CANDIDATE_SILENCE_PROMPT_SEC", 30.0)
-CANDIDATE_SILENCE_END_SEC = _float_env("CANDIDATE_SILENCE_END_SEC", 20.0)
+# Silence-response tuning (2026-09-06, live call ac7c8c77): the candidate heard
+# ~51s of silence — including the away re-prompt — before the first "are you
+# still there?". The prior 30s/20s defaults meant 34s of dead air before the
+# FIRST nudge. Tightened so the first nudge fires at ~10s and the whole
+# prompt→nudge→goodbye ladder resolves in ~30s. Still env-overridable; the
+# documented `.env.example` and the environment schema carry the same defaults.
+CANDIDATE_SILENCE_PROMPT_SEC = _float_env("CANDIDATE_SILENCE_PROMPT_SEC", 10.0)
+CANDIDATE_SILENCE_END_SEC = _float_env("CANDIDATE_SILENCE_END_SEC", 12.0)
+# The SECOND nudge window (2026-09-06): after the first prompt goes unanswered we
+# wait CANDIDATE_SILENCE_END_SEC, speak a brief second nudge, then wait this much
+# more before the goodbye. Sized so prompt(10) + nudge-wait(12) does not stretch
+# time-to-goodbye far past ~30s; kept short deliberately.
+CANDIDATE_SILENCE_SECOND_NUDGE_SEC = _float_env(
+    "CANDIDATE_SILENCE_SECOND_NUDGE_SEC", 8.0,
+)
 PHONE_TERMINAL_REPLY_TIMEOUT_SEC = _float_env("PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 10.0)
 # Playout FLOOR for the guaranteed farewell (F-D#3 review repair): the terminal
 # knob above is unclamped and shared with the armed-reply sites, so the fixed
@@ -2027,6 +2040,13 @@ async def _run_native_phone_screening(
     agent_listening: asyncio.Event,
     agent_activity_changed: asyncio.Event,
     close_event: asyncio.Event,
+    # FIX 2 (2026-09-06): set by `_run_phone_session`'s user_state handler when
+    # LiveKit reports the candidate 'away'. The silence loop treats an away
+    # signal as an IMMEDIATE prompt trigger (LiveKit sees away ~15s before the
+    # 30s→10s timer would have fired), so a dropped/muted leg is nudged sooner.
+    # Defaulted so a direct-coordinator test that does not thread it stays
+    # correct (a never-set event never perturbs the timer path).
+    away_event: asyncio.Event | None = None,
     endpoint_delay_eou: list[float | None] | None = None,
     latency_state: dict[str, float | None] | None = None,
     call_metrics: dict[str, Any] | None = None,
@@ -2060,6 +2080,10 @@ async def _run_native_phone_screening(
     # completion-time summary can assume a dict.
     if call_metrics is None:
         call_metrics = _new_phone_call_metrics()
+    # FIX 2: an unset away_event never fires, so the away-trigger is inert unless
+    # `_run_phone_session` wires it — the timer path is unchanged for tests.
+    if away_event is None:
+        away_event = asyncio.Event()
     finished = asyncio.Event()
     terminal_reason: dict[str, str] = {}
     # A terminal reply is only a proposal until its speech handle completes.
@@ -2300,6 +2324,15 @@ async def _run_native_phone_screening(
         target: phone.PhonePlanQuestion | None,
     ) -> None:
         """Preload one stable next objective before the candidate speaks."""
+        # Review repair (2026-09-06): clear the guard's candidate-text input
+        # whenever the NEXT objective is primed — BEFORE the mode/enable guard,
+        # so it holds on every lane. The speculative llm_node pass (when
+        # preemptive is on) runs before on_user_turn_completed refreshes this
+        # field; leaving the PRIOR turn's text would let a KEPT speculative reply
+        # inherit that turn's compensation-drift suppression (or wrongful
+        # reject). None = fail closed (drift guard fully armed for the spec pass);
+        # the next real turn's completed-hook sets the fresh value.
+        setattr(agent, "_generation_candidate_text", None)
         if not (
             turn_mode == phone.PHONE_TURN_MODE_TOOLLESS
             and phone.phone_objective_preemptive_enabled()
@@ -2341,28 +2374,42 @@ async def _run_native_phone_screening(
                 error_category="preload_failed",
             )
 
-    async def wait_for_activity(timeout: float) -> str:
-        """Wait on LiveKit activity or close without creating a turn queue."""
+    async def wait_for_activity(timeout: float, *, honor_away: bool = False) -> str:
+        """Wait on LiveKit activity or close without creating a turn queue.
+
+        FIX 2 (2026-09-06): when ``honor_away`` is set, an already-set (or
+        newly-set) ``away_event`` resolves the wait immediately with ``"away"``
+        — LiveKit reports the candidate 'away' ~15s before the silence timer
+        would fire, so the FIRST silence window treats away as a prompt trigger.
+        The second-window wait does NOT honour away (the candidate is already
+        known unresponsive; a still-set away flag must not skip the grace).
+        """
         activity = asyncio.create_task(candidate_activity.wait())
         agent_changed = asyncio.create_task(agent_activity_changed.wait())
         closed = asyncio.create_task(close_event.wait())
+        away = asyncio.create_task(away_event.wait()) if honor_away else None
+        waiters = [activity, agent_changed, closed]
+        if away is not None:
+            waiters.append(away)
         try:
             done, _ = await asyncio.wait(
-                (activity, agent_changed, closed), timeout=max(0.0, timeout),
+                waiters, timeout=max(0.0, timeout),
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if closed in done:
                 return "closed"
+            if away is not None and away in done:
+                return "away"
             if activity in done:
                 return "activity"
             if agent_changed in done:
                 return "agent_state"
             return "timeout"
         finally:
-            for task in (activity, agent_changed, closed):
+            for task in waiters:
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(activity, agent_changed, closed, return_exceptions=True)
+            await asyncio.gather(*waiters, return_exceptions=True)
 
     async def native_silence_loop() -> None:
         """Use LiveKit state/activity as the only phone inactivity authority."""
@@ -2385,13 +2432,31 @@ async def _run_native_phone_screening(
                 continue
             candidate_activity.clear()
             agent_activity_changed.clear()
-            outcome = await wait_for_activity(CANDIDATE_SILENCE_PROMPT_SEC)
-            if outcome != "timeout":
+            # FIX 2: the first window honours the away signal. LiveKit's 'away'
+            # state precedes the silence timer by ~15s, so an away candidate is
+            # prompted immediately instead of waiting the full window. The
+            # away_event acts as a single-shot latch for this pass: it is cleared
+            # the moment we act on it (below) so it cannot double-prompt against
+            # the timer, and `_run_phone_session`'s handler re-sets it only on a
+            # fresh away transition.
+            outcome = await wait_for_activity(
+                CANDIDATE_SILENCE_PROMPT_SEC, honor_away=True,
+            )
+            if outcome not in {"timeout", "away"}:
                 if outcome == "closed" and not finished.is_set():
                     terminal_reason.setdefault("reason", "disconnect")
                     finished.set()
                 continue
+            # Consume the away latch so a still-set flag cannot re-trigger the
+            # next pass's first wait without a fresh away transition.
+            away_event.clear()
             silence_prompted["value"] = True
+            _log.info(
+                "unknown_event", error_type="phone_silence",
+                error_category=(
+                    "prompt_away" if outcome == "away" else "prompt_timeout"
+                ),
+            )
             prompt = session.say(
                 phone.PHONE_SILENCE_PROMPT_TEXT,
                 allow_interruptions=True,
@@ -2403,11 +2468,38 @@ async def _run_native_phone_screening(
                 continue
             candidate_activity.clear()
             # Ignore the prompt's own speaking→idle transitions. New agent
-            # activity in the second window still wakes the wait below.
+            # activity in the second window still wakes the wait below. The away
+            # signal is NOT honoured past the first prompt — the candidate is
+            # already known unresponsive and the remaining windows are the grace.
             agent_activity_changed.clear()
             outcome = await wait_for_activity(CANDIDATE_SILENCE_END_SEC)
             if outcome != "timeout":
                 continue
+            # FIX 2: a brief SECOND nudge before the goodbye — one more chance for
+            # a candidate who stepped away momentarily. Kept short so the whole
+            # prompt→nudge→goodbye ladder stays near ~30s to goodbye.
+            _log.info(
+                "unknown_event", error_type="phone_silence",
+                error_category="second_nudge",
+            )
+            nudge = session.say(
+                phone.PHONE_SILENCE_SECOND_NUDGE_TEXT,
+                allow_interruptions=True,
+            )
+            wait = getattr(nudge, "wait_for_playout", None)
+            if callable(wait):
+                await wait()
+            if candidate_activity.is_set():
+                continue
+            candidate_activity.clear()
+            agent_activity_changed.clear()
+            outcome = await wait_for_activity(CANDIDATE_SILENCE_SECOND_NUDGE_SEC)
+            if outcome != "timeout":
+                continue
+            _log.info(
+                "unknown_event", error_type="phone_silence",
+                error_category="goodbye",
+            )
             goodbye = session.say(
                 phone.PHONE_SILENCE_GOODBYE_TEXT,
                 allow_interruptions=True,
@@ -4741,6 +4833,11 @@ async def _run_native_phone_screening(
     # interrupt latch proves the coalesce/re-ask routing.
     setattr(agent, "_expected_reply_generation_snapshot", lambda: expected_reply_generation[0])
     setattr(agent, "_prior_turn_interrupted_snapshot", lambda: prior_turn_interrupted)
+    # Review-repair seams (2026-09-06): the away latch and the preemptive
+    # objective primer, so tests can pin the away->resume clear and the
+    # fail-closed candidate-text clear on the speculative lane.
+    setattr(agent, "_away_event", away_event)
+    setattr(agent, "_prime_preemptive_objective", prime_preemptive_objective)
     authorize = getattr(agent, "authorize_screening", None)
     if not callable(authorize):
         raise RuntimeError("phone_consent_authorization_unavailable")
@@ -5148,6 +5245,11 @@ async def _run_phone_session(
     agent_activity_changed = asyncio.Event()
     candidate_end_requested = asyncio.Event()
     close_event = asyncio.Event()
+    # FIX 2 (2026-09-06): set by `_on_phone_user_state_changed` on a LiveKit
+    # 'away' transition. The silence loop honours it as an immediate first-window
+    # prompt trigger. It is a re-armable latch: the loop clears it after acting,
+    # and the handler re-sets it only on a NEW away transition.
+    away_event = asyncio.Event()
     close_reason: dict[str, Any] = {}
     # Used only as evidence for the server-keyed native boundary.
     latest_assistant: list[str | None] = [None]
@@ -5165,6 +5267,10 @@ async def _run_phone_session(
     # upload. Both stay None on the egress provider and on every canary /
     # preflight / no-consent path, so those paths are byte-identical to today.
     recorder_holder: list[Any] = [None, None]  # [InWorkerRecorder | None, upload_url | None]
+    # FIX 4 (2026-09-06): the audio-path health heartbeat task, launched when
+    # recording begins and cancelled in `_finish_recording`. A holder so the
+    # nested begin/finish closures can share the single task handle.
+    audio_health_holder: list[Any] = [None]  # [asyncio.Task | None]
 
     # ── 0071 / X4: PER-ITEM TRANSCRIPT DURABILITY IN THE PHONE PATH ────────
     # The browser path persists every turn as it happens; the phone path
@@ -5469,7 +5575,21 @@ async def _run_phone_session(
                 "unknown_event", error_type="phone_user_state",
                 error_category="user_away",
             )
+            # FIX 2 (2026-09-06): don't merely LOG an away candidate — act on it.
+            # Setting this latch resolves the silence loop's first-window wait
+            # immediately (it honours away only in the first window), so the
+            # "are you still there?" prompt fires ~15s sooner than the timer
+            # alone. The loop clears the latch the instant it acts, so this can
+            # never double-prompt alongside the timer; a fresh away transition
+            # re-arms it.
+            away_event.set()
         elif old_state == "away":
+            # Review repair (2026-09-06): a candidate who RESUMES must clear the
+            # away latch, or a stale `away_event` set during a brief away blip
+            # fires the "are you still there?" prompt OVER their resumed answer
+            # the next time the silence loop consults it. Fresh away transitions
+            # re-arm it; a resume disarms it.
+            away_event.clear()
             _log.info(
                 "unknown_event", error_type="phone_user_state",
                 error_category="user_active",
@@ -5638,6 +5758,47 @@ async def _run_phone_session(
             error_category=bounded,
         )
         close_event.set()
+
+    # FIX 4 (2026-09-06): OUTBOUND-path diagnostics. The live call lost audio TO
+    # the SIP leg while the worker kept speaking, and nothing surfaced the track
+    # going away. LiveKit's Room emits track (un)subscribe and connection-quality
+    # events for the SIP participant; log them CONTENT-FREE (fixed category, no
+    # ids, no audio) so a degrading/severed outbound track is visible live. Wired
+    # defensively: a room double without `.on` simply skips this (fail-open).
+    def _register_room_audio_diagnostics() -> None:
+        room = getattr(ctx, "room", None)
+        on = getattr(room, "on", None)
+        if not callable(on):
+            return
+
+        def _on_track_unsubscribed(*_args: Any, **_kwargs: Any) -> None:
+            _log.warn(
+                "unknown_event", error_type="phone_audio_track",
+                error_category="track_unsubscribed",
+            )
+
+        def _on_connection_quality(*_args: Any, **_kwargs: Any) -> None:
+            # Quality changes are frequent; log only the transition existence,
+            # never the level value (kept content-free and low-volume by relying
+            # on the SDK firing this only on an actual change).
+            _log.info(
+                "unknown_event", error_type="phone_audio_track",
+                error_category="connection_quality_changed",
+            )
+
+        for event_name, handler in (
+            ("track_unsubscribed", _on_track_unsubscribed),
+            ("connection_quality_changed", _on_connection_quality),
+        ):
+            try:
+                on(event_name, handler)
+            except Exception:  # noqa: BLE001 — diagnostics only, never fatal
+                pass
+
+    try:
+        _register_room_audio_diagnostics()
+    except Exception:  # noqa: BLE001
+        pass
 
     async def say(text: str) -> None:
         started_ms = int(round(time.time() * 1000))
@@ -5839,8 +6000,25 @@ async def _run_phone_session(
             prepared = await recording_api.prepare_recording(attempt_id, sid)
             if not prepared:
                 return  # refusal / no binding ⇒ do NOT record
-            if await recorder.begin(prepared["object_key"]):
+            # FIX 4: the participant-arrival anchor is the closest wall-clock the
+            # worker holds for "answered"; passing it lets begin() log the
+            # recording START offset from answer (the observed ~28s head-gap).
+            if await recorder.begin(
+                prepared["object_key"],
+                answered_epoch_ms=participant_present_anchor[0],
+            ):
                 recorder_holder[1] = prepared["upload_url"]
+                # FIX 4: capture is live — start the audio-path health heartbeat.
+                # It self-stops when recording is no longer active and is also
+                # cancelled in `_finish_recording`. Best-effort: a launch failure
+                # never blocks recording or the call.
+                if audio_health_holder[0] is None:
+                    try:
+                        audio_health_holder[0] = asyncio.create_task(
+                            recorder.audio_health_heartbeat()
+                        )
+                    except Exception:  # noqa: BLE001
+                        pass
         except Exception:  # noqa: BLE001 — recording is strictly secondary
             _log.warn(
                 "unknown_event", error_type="phone_recording_begin",
@@ -5891,6 +6069,17 @@ async def _run_phone_session(
         begun on a non-consenting path. No-op unless a recording was begun AND
         an upload URL was minted. Fail-open: nothing here can affect the
         screening verdict, which has already been decided."""
+        # FIX 4: stop the audio-path health heartbeat before teardown. It also
+        # self-stops when recording goes inactive, but cancelling here is
+        # deterministic and covers the early-return branches below.
+        hb = audio_health_holder[0]
+        if hb is not None and not hb.done():
+            hb.cancel()
+            try:
+                await asyncio.gather(hb, return_exceptions=True)
+            except Exception:  # noqa: BLE001
+                pass
+            audio_health_holder[0] = None
         recorder = recorder_holder[0]
         upload_url = recorder_holder[1]
         if recorder is None or upload_url is None or not recorder.active:
@@ -6102,6 +6291,7 @@ async def _run_phone_session(
                 agent_listening=agent_listening,
                 agent_activity_changed=agent_activity_changed,
                 close_event=close_event,
+                away_event=away_event,
                 endpoint_delay_eou=endpoint_delay_eou,
                 latency_state=latency_state,
                 call_metrics=call_metrics,

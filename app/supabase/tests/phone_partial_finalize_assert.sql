@@ -36,6 +36,10 @@ declare
   v_stranded uuid;
   v_control  uuid;
   v_crash    uuid;
+  v_lease    uuid;
+  v_lease_status text;
+  v_lease_reason text;
+  v_lease_entry  jsonb;
   v_sess_status text;
   v_sess_reason text;
   v_ctrl_status text;
@@ -56,7 +60,9 @@ begin
    where external_call_id = 'phone-pf72-control';
   select id into v_crash    from screening_v2.call_sessions
    where external_call_id = 'phone-pf72-crash';
-  if v_stranded is null or v_control is null or v_crash is null then
+  select id into v_lease    from screening_v2.call_sessions
+   where external_call_id = 'phone-pf72-lease';
+  if v_stranded is null or v_control is null or v_crash is null or v_lease is null then
     raise exception 'pf72: fixture sessions missing — run the setup first';
   end if;
 
@@ -70,11 +76,26 @@ begin
     raise exception 'pf72: expected status ok, got %', v_res->>'status';
   end if;
 
-  -- Exactly one session was driven terminal (the stranded in_progress one);
-  -- the crash residue was selected but NOT transitioned.
+  -- TWO in_progress sessions were driven terminal this pass: the stranded
+  -- (ended/disconnected) one AND the lease-lapsed (RCA disconnect) one. The
+  -- crash residue was selected but NOT transitioned (already terminal).
   v_finalized := (v_res->>'finalized')::integer;
-  if v_finalized <> 1 then
-    raise exception 'pf72: expected finalized=1 (only stranded transitions), got %', v_finalized;
+  if v_finalized <> 2 then
+    raise exception 'pf72: expected finalized=2 (stranded + lease-lapsed transition), got %', v_finalized;
+  end if;
+
+  -- ── THE RCA SESSION: lease-lapsed in_progress → completed/conversation_complete.
+  -- This is the live-call ac7c8c77 shape (disconnect preserved the room, the
+  -- heartbeat stopped, the lease lapsed, the attempt never terminalized). The
+  -- selector's lease-expiry branch MUST have driven it terminal so the 0038
+  -- trigger promotes its MP3 and scoring becomes owed.
+  select status, terminal_reason into v_lease_status, v_lease_reason
+    from screening_v2.call_sessions where id = v_lease;
+  if v_lease_status <> 'completed' then
+    raise exception 'pf72: lease-lapsed session status = %, expected completed (RCA disconnect must finalize)', v_lease_status;
+  end if;
+  if v_lease_reason <> 'conversation_complete' then
+    raise exception 'pf72: lease-lapsed terminal_reason = %, expected conversation_complete', v_lease_reason;
   end if;
 
   -- The STRANDED session is now completed / conversation_complete: the exact
@@ -106,10 +127,10 @@ begin
     raise exception 'pf72: control session status = %, expected in_progress (still within grace)', v_ctrl_status;
   end if;
 
-  -- The returned sessions array names BOTH the stranded and the crash session
-  -- (the control is inside the grace and absent).
-  if jsonb_array_length(v_res->'sessions') <> 2 then
-    raise exception 'pf72: expected 2 returned sessions (stranded + crash), got %',
+  -- The returned sessions array names the stranded, crash AND lease-lapsed
+  -- sessions (the control is inside the grace and absent).
+  if jsonb_array_length(v_res->'sessions') <> 3 then
+    raise exception 'pf72: expected 3 returned sessions (stranded + crash + lease), got %',
       jsonb_array_length(v_res->'sessions');
   end if;
 
@@ -121,8 +142,23 @@ begin
   select e into v_crash_entry
     from jsonb_array_elements(v_res->'sessions') e
    where (e->>'session_id')::uuid = v_crash;
-  if v_str_entry is null or v_crash_entry is null then
-    raise exception 'pf72: returned array missing stranded or crash entry';
+  select e into v_lease_entry
+    from jsonb_array_elements(v_res->'sessions') e
+   where (e->>'session_id')::uuid = v_lease;
+  if v_str_entry is null or v_crash_entry is null or v_lease_entry is null then
+    raise exception 'pf72: returned array missing stranded, crash or lease entry';
+  end if;
+
+  -- ── LEASE-LAPSED entry (the RCA): transitioned=true, worker_crash. ──
+  -- A lapsed lease in a live state is reported as a worker_crash disconnect
+  -- (the leg died without a clean classified end), and it DID transition this
+  -- pass (it was in_progress, not already terminal).
+  if (v_lease_entry->>'transitioned')::boolean is not true then
+    raise exception 'pf72: expected transitioned=true for the lease-lapsed (RCA) session';
+  end if;
+  if v_lease_entry->>'disconnect_reason' <> 'worker_crash' then
+    raise exception 'pf72: lease disconnect_reason = %, expected worker_crash',
+      v_lease_entry->>'disconnect_reason';
   end if;
 
   -- ── STRANDED entry: transitioned=true, candidate_hangup, covered 2/plan. ──
@@ -180,6 +216,15 @@ begin
   values (v_stranded, v_cand, '3'::jsonb, '3'::jsonb, '3'::jsonb, '3'::jsonb, '3'::jsonb,
           60, 'advance', 'pf72 stranded partial', 'phone', true,
           '{"schema_version":0,"provider":"legacy","requestedModel":"unknown","workload":"unknown","prompt_template_version":"legacy","timestamp":"1970-01-01T00:00:00Z"}'::jsonb);
+  -- The lease-lapsed session is now completed too; give it an assessment so the
+  -- re-run is a clean no-op across ALL selected sessions.
+  select candidate_id into v_cand from screening_v2.call_sessions where id = v_lease;
+  insert into screening_v2.assessments
+    (session_id, candidate_id, english, tone, communication, motivation,
+     role_fit, overall_score, recommendation, summary, source, partial, provenance)
+  values (v_lease, v_cand, '3'::jsonb, '3'::jsonb, '3'::jsonb, '3'::jsonb, '3'::jsonb,
+          60, 'advance', 'pf72 lease partial', 'phone', true,
+          '{"schema_version":0,"provider":"legacy","requestedModel":"unknown","workload":"unknown","prompt_template_version":"legacy","timestamp":"1970-01-01T00:00:00Z"}'::jsonb);
 
   v_res := screening_v2.finalize_phone_partial_sessions(25, 180, v_now);
   if (v_res->>'finalized')::integer <> 0 then
@@ -190,6 +235,6 @@ begin
       jsonb_array_length(v_res->'sessions');
   end if;
 
-  raise notice 'pf72: PASS — stranded->completed, crash residue selected (transitioned=false, worker_crash) not re-transitioned, control untouched, idempotent after assessment';
+  raise notice 'pf72: PASS — stranded->completed, lease-lapsed (RCA disconnect)->completed, crash residue selected (transitioned=false, worker_crash) not re-transitioned, control untouched (within reconnect grace), idempotent after assessment';
 end;
 $$;

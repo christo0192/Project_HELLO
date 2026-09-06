@@ -11,6 +11,7 @@ import asyncio
 import os
 import tempfile
 import unittest
+import unittest.mock
 from pathlib import Path
 
 import recording as rec
@@ -1313,6 +1314,102 @@ class TestRecordingProvider(unittest.TestCase):
                 os.environ.pop("RECORDING_PROVIDER", None)
             else:
                 os.environ["RECORDING_PROVIDER"] = prior
+
+
+class TestAudioHealthHeartbeat(unittest.TestCase):
+    """FIX 4 (2026-09-06, live call ac7c8c77): the outbound audio path died while
+    the worker kept speaking and nothing surfaced it until the candidate hung up.
+    The recorder taps already count frames; this heartbeat turns those counters
+    into a periodic content-free health signal (input/output deltas) plus a WARN
+    when input audio stalls, so a starved path is visible DURING the call."""
+
+    def test_frame_count_properties_reflect_the_counter(self):
+        r, _, _ = _make()
+        r.wire()
+        _begin(r)
+        self.assertEqual(r.input_frames, 0)
+        self.assertEqual(r.output_frames, 0)
+        r._counter.input = 7
+        r._counter.output = 3
+        self.assertEqual(r.input_frames, 7)
+        self.assertEqual(r.output_frames, 3)
+
+    def test_heartbeat_logs_health_and_stops_when_inactive(self):
+        r, _, _ = _make()
+        r.wire()
+        _begin(r)
+        self.assertTrue(r.active)
+
+        async def drive():
+            # Simulate frames arriving between ticks, then flip inactive so the
+            # loop terminates.
+            with unittest.mock.patch.object(rec.logger, "info") as info, \
+                 unittest.mock.patch.object(rec.logger, "warning") as warn:
+                task = asyncio.ensure_future(
+                    r.audio_health_heartbeat(
+                        interval_sec=0.01, no_input_warn_sec=10.0,
+                    )
+                )
+                await asyncio.sleep(0.005)
+                r._counter.input = 40
+                r._counter.output = 25
+                await asyncio.sleep(0.02)
+                # Active flag off → the loop must exit on its own.
+                r._failed = True
+                await asyncio.wait_for(task, timeout=1)
+                return info, warn
+
+        info, warn = _run(drive())
+        health = [c for c in info.call_args_list
+                  if c.args and "phone_audio_health" in str(c.args[0])]
+        self.assertTrue(health, "expected at least one phone_audio_health line")
+        # No stall WARN on a path that received input.
+        self.assertFalse([c for c in warn.call_args_list
+                          if c.args and "no_input_audio" in str(c.args[0])])
+
+    def test_heartbeat_warns_when_input_stalls_while_output_flows(self):
+        r, _, _ = _make()
+        r.wire()
+        _begin(r)
+
+        async def drive():
+            with unittest.mock.patch.object(rec.logger, "warning") as warn:
+                task = asyncio.ensure_future(
+                    r.audio_health_heartbeat(
+                        interval_sec=0.01, no_input_warn_sec=0.02,
+                    )
+                )
+                # Output keeps flowing; input stays frozen → stall must WARN.
+                for _ in range(8):
+                    r._counter.output += 5
+                    await asyncio.sleep(0.01)
+                r._failed = True
+                await asyncio.wait_for(task, timeout=1)
+                return warn
+
+        warn = _run(drive())
+        stalls = [c for c in warn.call_args_list
+                  if c.args and "no_input_audio" in str(c.args[0])]
+        self.assertTrue(stalls, "a frozen input tap must emit no_input_audio")
+
+    def test_heartbeat_is_fail_open_on_a_never_begun_recorder(self):
+        r, _, _ = _make()
+        r.wire()
+        # Not begun → not active → the heartbeat returns immediately, no raise.
+        _run(r.audio_health_heartbeat(interval_sec=0.01))
+
+    def test_begin_logs_answered_offset_when_provided(self):
+        r, _, _ = _make()
+        r.wire()
+        with unittest.mock.patch.object(rec.logger, "info") as info:
+            _run(r.begin(OBJECT_KEY, answered_epoch_ms=1))
+        started = [c for c in info.call_args_list
+                   if c.args and "in_worker_recording_started" in str(c.args[0])]
+        self.assertTrue(started)
+        # The started line carries the answered_to_begin_ms field (>0, since a
+        # begin_at_ms far exceeds the epoch=1 sentinel).
+        fmt = str(started[-1].args[0])
+        self.assertIn("answered_to_begin_ms", fmt)
 
 
 if __name__ == "__main__":
