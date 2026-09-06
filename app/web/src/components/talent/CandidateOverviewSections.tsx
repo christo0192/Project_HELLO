@@ -19,7 +19,7 @@ import { useId } from 'react';
 import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import type { CandidateDetail, CandidateResumeFacts, Note, Session } from '../../types';
-import { StatusBadge } from '../design';
+import { ScrollArea, StatusBadge } from '../design';
 import { SurfaceCard, Tag } from '../design/candidate';
 import {
   candidateStatusLabel,
@@ -38,6 +38,27 @@ export function Field({ label, children }: { label: string; children: ReactNode 
       <dt className="text-xs font-medium text-ink-secondary">{label}</dt>
       <dd className="text-ink">{children}</dd>
     </div>
+  );
+}
+
+/**
+ * Rows past these counts scroll inside the card instead of growing it. The
+ * left rail of the Overview is sticky, so an unbounded list would push its
+ * own card past the viewport and take the rail's scroll with it.
+ *
+ * The region is named differently from the card that contains it: both are
+ * `region` landmarks, and two landmarks sharing a role AND an accessible
+ * name is an axe `landmark-unique` violation.
+ */
+const SESSION_ROWS_BEFORE_SCROLL = 5;
+const NOTE_ROWS_BEFORE_SCROLL = 4;
+
+function boundList(bounded: boolean, label: string, maxHeight: string, list: ReactNode): ReactNode {
+  if (!bounded) return list;
+  return (
+    <ScrollArea maxHeight={maxHeight} label={label} className="-my-1">
+      {list}
+    </ScrollArea>
   );
 }
 
@@ -105,11 +126,7 @@ export function CandidateProfileCard({
       </dl>
       <ResumeEvidence facts={candidate.parsed} />
       {footnote && (
-        <SurfaceCard level="sunken" className="mt-5 p-3">
-          <p className="max-w-prose text-xs leading-relaxed text-ink-secondary">
-            {footnote}
-          </p>
-        </SurfaceCard>
+        <p className="mt-4 text-[13px] leading-snug text-ink-tertiary">{footnote}</p>
       )}
     </SurfaceCard>
   );
@@ -177,42 +194,47 @@ export function SessionsSummary({
       {sessions.length === 0 ? (
         <p className="text-sm text-ink-secondary">{emptyLabel}</p>
       ) : (
-        <ul className="divide-y divide-line">
-          {sessions.map((s) => (
-            <li
-              key={s.id}
-              className="flex flex-wrap items-center justify-between gap-3 py-3 text-sm"
-            >
-              <div className="min-w-0">
-                <p className="font-medium text-ink">
-                  Session {s.id.slice(0, 8)}
-                  {s.mode && (
-                    <span className="ml-2 text-xs font-normal text-ink-tertiary">
-                      {sessionModeLabel(s.mode).toLowerCase()}
-                    </span>
+        boundList(
+          sessions.length > SESSION_ROWS_BEFORE_SCROLL,
+          'Screening session list',
+          '18rem',
+          <ul className="divide-y divide-line">
+            {sessions.map((s) => (
+              <li
+                key={s.id}
+                className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 py-2 text-sm"
+              >
+                <div className="min-w-0">
+                  <p className="truncate font-medium text-ink">
+                    Session {s.id.slice(0, 8)}
+                    {s.mode && (
+                      <span className="ml-2 text-[12px] font-normal text-ink-tertiary">
+                        {sessionModeLabel(s.mode).toLowerCase()}
+                      </span>
+                    )}
+                  </p>
+                  <p className="text-[12px] text-ink-tertiary">
+                    {formatDateTime(s.created_at)}
+                    {s.duration_sec ? ` · ${formatDurationSec(s.duration_sec)}` : ''}
+                  </p>
+                </div>
+                <div className="ml-auto flex shrink-0 items-center gap-2">
+                  <StatusBadge tone={sessionStatusTone(s.status)}>
+                    {sessionStatusLabel(s.status)}
+                  </StatusBadge>
+                  {linkToSession && (
+                    <Link
+                      to={`/sessions/${s.id}`}
+                      className="text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+                    >
+                      View details
+                    </Link>
                   )}
-                </p>
-                <p className="text-xs text-ink-tertiary">
-                  {formatDateTime(s.created_at)}
-                  {s.duration_sec ? ` · ${formatDurationSec(s.duration_sec)}` : ''}
-                </p>
-              </div>
-              <div className="flex items-center gap-3">
-                <StatusBadge tone={sessionStatusTone(s.status)}>
-                  {sessionStatusLabel(s.status)}
-                </StatusBadge>
-                {linkToSession && (
-                  <Link
-                    to={`/sessions/${s.id}`}
-                    className="text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
-                  >
-                    View details
-                  </Link>
-                )}
-              </div>
-            </li>
-          ))}
-        </ul>
+                </div>
+              </li>
+            ))}
+          </ul>,
+        )
       )}
     </SurfaceCard>
   );
@@ -229,15 +251,18 @@ export function NotesList({ notes, error = null }: NotesListProps) {
   if (error) return <p className="text-sm text-error">{error}</p>;
   if (notes === null) return <p className="text-sm text-ink-tertiary">Loading notes…</p>;
   if (notes.length === 0) return <p className="text-sm text-ink-secondary">No notes yet.</p>;
-  return (
+  return boundList(
+    notes.length > NOTE_ROWS_BEFORE_SCROLL,
+    'Note history',
+    '16rem',
     <ul className="divide-y divide-line">
       {notes.map((n) => (
         <li key={n.id} className="py-2 text-sm">
           <p className="whitespace-pre-wrap text-ink">{n.note}</p>
-          <p className="mt-0.5 text-xs text-ink-tertiary">{formatDateTime(n.created_at)}</p>
+          <p className="mt-0.5 text-[12px] text-ink-tertiary">{formatDateTime(n.created_at)}</p>
         </li>
       ))}
-    </ul>
+    </ul>,
   );
 }
 

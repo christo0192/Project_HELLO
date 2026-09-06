@@ -180,43 +180,72 @@ function OverviewTab({
     // `fade-up-stagger` is the CSS-only reveal: candidate-scoped source may
     // not import a motion library, and this collapses with every other
     // animation under the global reduced-motion rule in index.css.
-    <div className="fade-up-stagger grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-3">
-      {/* Profile */}
-      <CandidateProfileCard
-        candidate={candidate}
-        footnote="Start a browser voice screening below. Transcript, playback, and scorecard sync back and are reviewed in the Review tab."
-      />
-
-      {/* Live actions + sessions + notes + appeals */}
-      <div className="space-y-4 sm:space-y-6 lg:col-span-2">
-        <LiveKitCallCard
-          candidateId={candidate.id}
-          candidateName={candidate.name}
+    //
+    // Two columns, not one short card beside a six-card stack. The reference
+    // material — profile, session history, notes — is a sticky left rail that
+    // stays put while the operator works; the acting surfaces — the two call
+    // cards, the phone cycle, the Ashby pipeline, appeals — own the wide
+    // column. Below `lg` this is one ordinary stack, reference first.
+    <div className="fade-up-stagger grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-12 lg:items-start">
+      <div className="order-2 space-y-4 lg:order-1 lg:sticky lg:top-20 lg:col-span-4">
+        <CandidateProfileCard
+          candidate={candidate}
+          className="p-4 sm:p-5"
+          footnote="Transcript, playback and scorecard sync back into the Review tab."
         />
+
+        <SessionsSummary sessions={sessions} />
+
+        <NotesSection candidateId={candidate.id} />
+      </div>
+
+      <div className="order-1 space-y-4 sm:space-y-6 lg:order-2 lg:col-span-8">
+        {/* Both call cards are frozen components. They are placed side by
+            side and stretched to a common height by their wrappers, so the
+            large "No active call" body no longer stacks below a card that
+            has already ended. Neither component is modified. */}
+        <div className="grid gap-4 sm:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] sm:items-stretch">
+          <div className="min-w-0 [&>*]:h-full">
+            <LiveKitCallCard
+              candidateId={candidate.id}
+              candidateName={candidate.name}
+            />
+          </div>
+          <div className="min-w-0 [&>*]:h-full">
+            <LiveCallPanel
+              candidateId={candidate.id}
+              candidateName={candidate.name || undefined}
+            />
+          </div>
+        </div>
 
         {phoneRole !== "viewer" && (
-          <>
-            <PhoneCycleCard candidateId={candidate.id} admin={phoneRole === "admin"} />
-          </>
+          <PhoneCycleCard candidateId={candidate.id} admin={phoneRole === "admin"} />
         )}
-
-        <LiveCallPanel
-          candidateId={candidate.id}
-          candidateName={candidate.name || undefined}
-        />
 
         {/* Read-only Ashby pipeline status. Renders nothing for a candidate
             with no Ashby application link. */}
         <AshbyWorkflowCard source={{ kind: "candidate", candidateId: candidate.id }} />
 
-        <SessionsSummary sessions={sessions} />
-
-        <NotesSection candidateId={candidate.id} />
         <AppealsSection candidateId={candidate.id} sessions={sessions} />
       </div>
     </div>
   );
 }
+
+/**
+ * The booking advisory, preserved word for word.
+ *
+ * It is a truth claim — booking a slot promises nothing, admission does —
+ * so it stays in the DOM in full and is read in full by a screen reader. It
+ * is only laid out as one 12px line and carried in `title`, so the operator
+ * can read the whole sentence on hover without a paragraph of chrome above
+ * every picker.
+ */
+const SLOT_ADVISORY_NEW =
+  "Choose an IST slot. Availability is advisory; normal admission gates still decide whether a call can start.";
+const SLOT_ADVISORY_EXISTING =
+  "Choose an IST slot. Availability is advisory; the normal admission gates still decide whether a call can start.";
 
 function cycleLabel(cycle: PhoneScreeningCycle): string {
   return cycle.cycle_number == null ? "Screening cycle" : `Screening cycle ${cycle.cycle_number}`;
@@ -414,22 +443,24 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
           )}
           <SurfaceCard level="sunken" className="mt-4 p-3">
             <h3 className="text-[13px] font-medium text-ink-secondary">Schedule a slot</h3>
-            <p className="mt-1 text-xs text-ink-tertiary">
-              Choose an IST slot. Availability is advisory; normal admission gates still decide whether a call can start.
+            <p className="mt-1 truncate text-xs text-ink-tertiary" title={SLOT_ADVISORY_NEW}>
+              {SLOT_ADVISORY_NEW}
             </p>
-            <div className="mt-3">
-              <PhoneSlotPicker
-                date={slotDate}
-                onDateChange={(date) => { setSlotDate(date); setSelectedSlot(null); }}
-                value={selectedSlot?.starts_at ?? null}
-                onChange={setSelectedSlot}
-                idPrefix={`${headingId}-slot`}
-                disabled={savingAppointment}
-              />
+            <div className="mt-3 grid gap-x-4 gap-y-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
+              <div className="min-w-0">
+                <PhoneSlotPicker
+                  date={slotDate}
+                  onDateChange={(date) => { setSlotDate(date); setSelectedSlot(null); }}
+                  value={selectedSlot?.starts_at ?? null}
+                  onChange={setSelectedSlot}
+                  idPrefix={`${headingId}-slot`}
+                  disabled={savingAppointment}
+                />
+              </div>
+              <CandidateButton variant="primary" onClick={() => void saveAppointment()} loading={savingAppointment} disabled={!selectedSlot}>
+                Book slot
+              </CandidateButton>
             </div>
-            <CandidateButton className="mt-3" variant="primary" onClick={() => void saveAppointment()} loading={savingAppointment} disabled={!selectedSlot}>
-              Book slot
-            </CandidateButton>
           </SurfaceCard>
         </>
       ) : (
@@ -459,18 +490,21 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
             <p className="mt-3 text-sm text-warning">An administrator must verify a replacement number before this cycle can be re-screened.</p>
           ) : canRescreen && requiresVerification && admin ? (
             <SurfaceCard level="sunken" className="mt-4 p-3">
-              <label htmlFor={`${headingId}-phone`} className="block text-[13px] font-medium text-ink-secondary">
-                Verify replacement Indian mobile
-              </label>
-              <div className="mt-2 flex flex-wrap gap-2">
-                <CandidateInput
-                  id={`${headingId}-phone`}
-                  value={phone}
-                  onChange={(event) => setPhone(event.target.value)}
-                  placeholder="+91…"
-                  inputMode="tel"
-                  autoComplete="off"
-                />
+              <div className="grid gap-x-3 gap-y-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
+                <div className="min-w-0">
+                  <label htmlFor={`${headingId}-phone`} className="block text-[13px] font-medium text-ink-secondary">
+                    Verify replacement Indian mobile
+                  </label>
+                  <CandidateInput
+                    id={`${headingId}-phone`}
+                    value={phone}
+                    onChange={(event) => setPhone(event.target.value)}
+                    placeholder="+91…"
+                    inputMode="tel"
+                    autoComplete="off"
+                    className="mt-1 block w-full"
+                  />
+                </div>
                 <CandidateButton variant="secondary" onClick={() => void verifyNumber()} loading={verifying} disabled={!phone.trim()}>
                   Verify number
                 </CandidateButton>
@@ -478,20 +512,24 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
             </SurfaceCard>
           ) : canRescreen ? (
             <SurfaceCard level="sunken" className="mt-4 p-3">
-              <label htmlFor={`${headingId}-reason`} className="block text-[13px] font-medium text-ink-secondary">
-                Reason for new cycle
-              </label>
-              <CandidateSelect
-                id={`${headingId}-reason`}
-                value={reason}
-                onChange={(event) => setReason(event.target.value as PhoneRescreenReason)}
-                className="mt-2 block w-full"
-              >
-                {RESCREEN_REASONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
-              </CandidateSelect>
-              <CandidateButton className="mt-3" variant="primary" onClick={() => void requestRescreen()} loading={requesting}>
-                Request re-screen
-              </CandidateButton>
+              <div className="grid gap-x-3 gap-y-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
+                <div className="min-w-0">
+                  <label htmlFor={`${headingId}-reason`} className="block text-[13px] font-medium text-ink-secondary">
+                    Reason for new cycle
+                  </label>
+                  <CandidateSelect
+                    id={`${headingId}-reason`}
+                    value={reason}
+                    onChange={(event) => setReason(event.target.value as PhoneRescreenReason)}
+                    className="mt-1 block w-full"
+                  >
+                    {RESCREEN_REASONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
+                  </CandidateSelect>
+                </div>
+                <CandidateButton variant="primary" onClick={() => void requestRescreen()} loading={requesting}>
+                  Request re-screen
+                </CandidateButton>
+              </div>
             </SurfaceCard>
           ) : current?.terminal_at ? (
             <p className="mt-3 text-sm text-ink-secondary">This cycle is terminal; no new cycle can be started from its current state.</p>
@@ -499,36 +537,40 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
 
           {(!current || current.terminal_at === null) && (
             <SurfaceCard level="sunken" className="mt-4 p-3">
-              <h3 className="text-[13px] font-medium text-ink-secondary">
-                {current?.appointment ? "Move appointment" : "Schedule a slot"}
-              </h3>
-              <p className="mt-1 text-xs text-ink-tertiary">
-                Choose an IST slot. Availability is advisory; the normal admission gates still decide whether a call can start.
-              </p>
-              {current?.appointment && (
-                <p className="mt-2 text-sm text-ink-secondary">
-                  Current slot: {current.appointment.starts_at ? formatDateTime(current.appointment.starts_at) : "time unavailable"}
-                </p>
-              )}
-              <div className="mt-3">
-                <PhoneSlotPicker
-                  date={slotDate}
-                  onDateChange={(date) => { setSlotDate(date); setSelectedSlot(null); }}
-                  value={selectedSlot?.starts_at ?? null}
-                  onChange={setSelectedSlot}
-                  idPrefix={`${headingId}-slot`}
-                  disabled={savingAppointment}
-                />
-              </div>
-              <div className="mt-3 flex flex-wrap gap-2">
-                <CandidateButton variant="primary" onClick={() => void saveAppointment()} loading={savingAppointment} disabled={!selectedSlot}>
-                  {current?.appointment ? "Move appointment" : "Book slot"}
-                </CandidateButton>
+              <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
+                <h3 className="text-[13px] font-medium text-ink-secondary">
+                  {current?.appointment ? "Move appointment" : "Schedule a slot"}
+                </h3>
                 {current?.appointment && (
-                  <CandidateButton variant="secondary" onClick={() => void cancelAppointment()} loading={savingAppointment}>
-                    Cancel appointment
-                  </CandidateButton>
+                  <p className="text-[13px] text-ink-secondary">
+                    Current slot: {current.appointment.starts_at ? formatDateTime(current.appointment.starts_at) : "time unavailable"}
+                  </p>
                 )}
+              </div>
+              <p className="mt-1 truncate text-xs text-ink-tertiary" title={SLOT_ADVISORY_EXISTING}>
+                {SLOT_ADVISORY_EXISTING}
+              </p>
+              <div className="mt-3 grid gap-x-4 gap-y-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
+                <div className="min-w-0">
+                  <PhoneSlotPicker
+                    date={slotDate}
+                    onDateChange={(date) => { setSlotDate(date); setSelectedSlot(null); }}
+                    value={selectedSlot?.starts_at ?? null}
+                    onChange={setSelectedSlot}
+                    idPrefix={`${headingId}-slot`}
+                    disabled={savingAppointment}
+                  />
+                </div>
+                <div className="flex flex-wrap gap-2 sm:flex-col sm:items-stretch">
+                  <CandidateButton variant="primary" onClick={() => void saveAppointment()} loading={savingAppointment} disabled={!selectedSlot}>
+                    {current?.appointment ? "Move appointment" : "Book slot"}
+                  </CandidateButton>
+                  {current?.appointment && (
+                    <CandidateButton variant="secondary" onClick={() => void cancelAppointment()} loading={savingAppointment}>
+                      Cancel appointment
+                    </CandidateButton>
+                  )}
+                </div>
               </div>
             </SurfaceCard>
           )}
@@ -701,14 +743,16 @@ function AppealsSection({
         </ul>
       )}
 
-      <SurfaceCard level="sunken" className="mt-4 p-4">
+      <SurfaceCard level="sunken" className="mt-4 p-3">
         <h3 className="text-[13px] font-medium text-ink">Issue appeal grant</h3>
-        <p className="mt-1 max-w-prose text-[13px] leading-relaxed text-ink-tertiary">
+        <p className="mt-0.5 text-xs leading-snug text-ink-tertiary">
           A one-time fragment link the candidate opens at /appeal. Explicit
           expiry is required (1–72 hours); the plaintext is shown only once.
         </p>
-        <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
-          <div>
+        {/* One row: choose the session, state the expiry, issue. Same ids,
+            same labels, same call. */}
+        <div className="mt-3 grid gap-x-3 gap-y-2 sm:grid-cols-[minmax(0,1fr)_11rem_auto] sm:items-end">
+          <div className="min-w-0">
             <label htmlFor="appeal-session" className="block text-[13px] font-medium text-ink-secondary">
               Session
             </label>
@@ -729,7 +773,7 @@ function AppealsSection({
               )}
             </CandidateSelect>
           </div>
-          <div>
+          <div className="min-w-0">
             <label htmlFor="appeal-expiry" className="block text-[13px] font-medium text-ink-secondary">
               Expires in (hours, 1–72)
             </label>
@@ -743,16 +787,15 @@ function AppealsSection({
               className="mt-1 block w-full"
             />
           </div>
+          <CandidateButton
+            variant="secondary"
+            onClick={() => void issueGrant()}
+            loading={issuing}
+            disabled={!selectedSession}
+          >
+            Issue one-time appeal grant
+          </CandidateButton>
         </div>
-        <CandidateButton
-          className="mt-3"
-          variant="secondary"
-          onClick={() => void issueGrant()}
-          loading={issuing}
-          disabled={!selectedSession}
-        >
-          Issue one-time appeal grant
-        </CandidateButton>
         {msg && <p className="mt-2 max-w-prose text-xs text-ink-secondary">{msg}</p>}
         {grantLink && (
           <div className="mt-2 rounded-control border border-[var(--c-border)] bg-[var(--c-surface)] p-3">

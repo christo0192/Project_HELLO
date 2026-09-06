@@ -9,24 +9,29 @@
  *
  * It reads the SAME `Assessment` shape, with the SAME `raw.*` fallback
  * chain and the SAME empty-state copy, so no field or fallback is lost.
- * What changes is presentation, and only where the owner-supplied
- * screenshot showed a real defect:
+ * What changes is presentation:
  *
- *   - Four sections in a three-column grid left "Role fit" orphaned on a
- *     two-thirds-empty row. The layout is now explicit: Communication
- *     spans two rows beside the two short sections, Role fit takes the
- *     full width beneath. No breakpoint can orphan a cell.
+ *   - The card used to be a column of four full cards plus two more, each
+ *     with its own title bar and padding, so reading it meant scrolling
+ *     past ~1600px of chrome. The scored signals are now ONE "Signals"
+ *     card whose groups are cells of a two-column grid; the chrome is paid
+ *     for once instead of six times.
  *   - Weights were baked into heading strings ("Communication - 50%"), so
- *     they read as titles and were not machine-readable. They are now data
- *     labels beside the heading.
+ *     they read as titles and were not machine-readable. They are data
+ *     labels beside the group heading and a single line in the verdict
+ *     band.
  *   - Scores were 1.5px hairlines whose colour was the only signal. They
  *     are `Meter`s: number, band word, then colour (see design/Meter).
- *   - Notes were `text-xs` in a ~200px column — roughly a 22-character
- *     measure. Prose is now `text-sm leading-relaxed` at `max-w-prose`,
- *     full width within its section, and never in a narrow column.
+ *   - Notes were `text-xs` in a ~200px column. Prose is `text-sm
+ *     leading-relaxed` at `max-w-prose`, and the two groups that carry the
+ *     long notes (Communication, Role fit) span both grid columns.
  *   - Nested blocks repeated the parent's fill three levels deep. They are
  *     `SurfaceCard level="sunken"` inside a `base` card: exactly two
  *     levels, enforced by SurfaceCard's depth guard.
+ *   - Resume conflicts and Summary are read once, so they are split out
+ *     (`narrative="none"` + `CandidateScorecardNarrative`) and the host can
+ *     put them full width beneath a sticky scorecard column instead of
+ *     letting them stretch it past the viewport.
  *
  * Deliberately NOT added: any computed "contribution to the overall
  * score". The overall score is produced by the model, not by summing the
@@ -84,6 +89,16 @@ const SIGNAL_TONE: Record<string, 'positive' | 'caution' | 'negative'> = {
 
 export type HeadingLevel = 2 | 3 | 4;
 
+/**
+ * Where the read-once narrative (Resume conflicts, Summary) is rendered.
+ * `inline` keeps the card self-contained; `none` lets the host place
+ * `CandidateScorecardNarrative` full width, outside a sticky column.
+ */
+export type ScorecardNarrative = 'inline' | 'none';
+
+const CARD_TITLE =
+  'text-[15px] font-semibold tracking-tight text-[var(--c-ink)]';
+
 function Heading({
   level,
   id,
@@ -116,7 +131,12 @@ function Prose({ children }: { children: ReactNode }) {
   );
 }
 
-function Section({
+/**
+ * One scored group inside the Signals card. A `section` named by its
+ * heading — so it is still individually addressable as a region — but NOT a
+ * card: the Signals card is the one surface, and the group pays no chrome.
+ */
+function Group({
   title,
   weight,
   headingLevel,
@@ -136,21 +156,17 @@ function Section({
   // and `aria-labelledby` would silently resolve to the first one.
   const headingId = useId();
   return (
-    <SurfaceCard
-      as="section"
-      labelledBy={headingId}
-      className={cx('p-4 sm:p-5', className)}
-    >
-      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+    <section aria-labelledby={headingId} className={cx('min-w-0', className)}>
+      <div className="mb-2 flex flex-wrap items-baseline justify-between gap-x-3 gap-y-0.5">
         <Heading
           level={headingLevel}
           id={headingId}
-          className="text-[15px] font-semibold tracking-tight text-[var(--c-ink)]"
+          className="text-[13px] font-medium text-[var(--c-ink)]"
         >
           {title}
         </Heading>
         {weight && (
-          <span className="text-xs text-[var(--c-ink-muted)]">
+          <span className="text-xs text-[var(--c-ink-secondary)]">
             Weight{' '}
             <span className="font-mono tabular-nums text-[var(--c-ink-secondary)]">
               {weight}
@@ -160,7 +176,7 @@ function Section({
       </div>
       <div className="space-y-3">{children}</div>
       <Prose>{notes}</Prose>
-    </SurfaceCard>
+    </section>
   );
 }
 
@@ -185,14 +201,14 @@ function TagGroup({
   tone: 'positive' | 'caution' | 'negative';
 }) {
   return (
-    <div>
-      <p className="mb-1.5 text-xs font-medium text-[var(--c-ink-secondary)]">
+    <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1.5">
+      <p className="w-28 shrink-0 text-xs font-medium text-[var(--c-ink-secondary)]">
         {label}
       </p>
       {items.length === 0 ? (
-        <p className="text-xs text-[var(--c-ink-muted)]">None</p>
+        <p className="text-xs text-[var(--c-ink-secondary)]">None</p>
       ) : (
-        <div className="flex flex-wrap gap-1.5">
+        <div className="flex min-w-0 flex-wrap gap-1.5">
           {items.map((item) => (
             <Tag key={item} tone={tone} srPrefix={srPrefix}>
               {item}
@@ -238,6 +254,15 @@ function SignalBlock({
   );
 }
 
+function WeightItem({ label, weight }: { label: string; weight: string }) {
+  return (
+    <div className="flex items-center gap-1.5">
+      <dt className="text-[var(--c-ink-secondary)]">{label}</dt>
+      <dd className="font-mono tabular-nums text-[var(--c-ink)]">{weight}</dd>
+    </div>
+  );
+}
+
 export interface CandidateScorecardProps {
   assessment: Assessment;
   /**
@@ -245,26 +270,29 @@ export interface CandidateScorecardProps {
    * outline its host page already has without skipping a level.
    */
   headingLevel?: HeadingLevel;
+  /** Where Resume conflicts + Summary go. See `ScorecardNarrative`. */
+  narrative?: ScorecardNarrative;
 }
 
 export function CandidateScorecard({
   assessment,
   headingLevel = 3,
+  narrative = 'inline',
 }: CandidateScorecardProps) {
-  const uid = useId();
-  const conflictsId = `${uid}-conflicts`;
-  const summaryId = `${uid}-summary`;
+  const signalsId = useId();
   // Identical field + fallback chain to components/Scorecard.tsx.
   const raw = assessment.raw ?? {};
-  const { tone, role_fit, overall_score, recommendation, summary } = assessment;
+  const { tone, role_fit, overall_score, recommendation } = assessment;
   const communication = assessment.communication ?? raw.communication;
   const english = communication?.english_proficiency ?? assessment.english;
   const motivation = assessment.motivation ?? raw.motivation;
-  const conflicts = assessment.resume_conflicts ?? raw.resume_conflicts ?? [];
 
   const recoLabel = RECOMMENDATION_LABEL[recommendation] ?? RECOMMENDATION_LABEL.hold;
   const recoTone = RECOMMENDATION_TONE[recommendation] ?? RECOMMENDATION_TONE.hold;
   const roundedOverall = Math.round(overall_score);
+
+  const hasSignalBlocks =
+    communication?.filler_usage != null || communication?.native_language_usage != null;
 
   return (
     <div className="space-y-4">
@@ -273,7 +301,7 @@ export function CandidateScorecard({
         <div className="flex flex-wrap items-center justify-between gap-3">
           <div className="flex items-baseline gap-2">
             <span
-              className="font-mono text-4xl font-bold tabular-nums"
+              className="font-mono text-[2.25rem] font-bold leading-none tabular-nums"
               style={{ color: OVERALL_FILL[overallTone(overall_score)] }}
             >
               {roundedOverall}
@@ -285,7 +313,7 @@ export function CandidateScorecard({
           </Tag>
         </div>
 
-        <div className="mt-4">
+        <div className="mt-3">
           <Meter
             label="Overall score"
             value={overall_score}
@@ -297,144 +325,202 @@ export function CandidateScorecard({
           />
         </div>
 
-        <div className="mt-4 border-t border-[var(--c-border-light)] pt-3">
-          <p className="mb-1.5 text-[13px] font-medium text-[var(--c-ink-secondary)]">
-            Section weights
-          </p>
-          <dl className="flex flex-wrap gap-x-5 gap-y-1 text-xs">
-            <WeightItem label="Communication" weight={SECTION_WEIGHTS.communication} />
-            <WeightItem label="Motivation" weight={SECTION_WEIGHTS.motivation} />
-            <WeightItem label="Tone" weight={SECTION_WEIGHTS.tone} />
-            <WeightItem label="Role fit" weight={SECTION_WEIGHTS.role_fit} />
-          </dl>
+        {/* Weights as one 12px line, not a four-row block. */}
+        <dl className="mt-3 flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-[var(--c-border-light)] pt-2.5 text-xs">
+          <WeightItem label="Communication" weight={SECTION_WEIGHTS.communication} />
+          <span aria-hidden className="text-[var(--c-ink-muted)]">·</span>
+          <WeightItem label="Motivation" weight={SECTION_WEIGHTS.motivation} />
+          <span aria-hidden className="text-[var(--c-ink-muted)]">·</span>
+          <WeightItem label="Tone" weight={SECTION_WEIGHTS.tone} />
+          <span aria-hidden className="text-[var(--c-ink-muted)]">·</span>
+          <WeightItem label="Role fit" weight={SECTION_WEIGHTS.role_fit} />
+        </dl>
+      </SurfaceCard>
+
+      {/* ── Signals ──────────────────────────────────────────────────
+          ONE card, four groups as cells of a two-column grid:
+            <640px   one column
+            ≥640px   two columns — Communication and Role fit span both
+          Four cells with two spanners fill exactly, so no breakpoint can
+          leave an orphan; `items-start` keeps short groups at their own
+          height instead of stretching to the tallest in the row. */}
+      <SurfaceCard as="section" labelledBy={signalsId} className="p-4 sm:p-5">
+        <Heading level={headingLevel} id={signalsId} className={cx('mb-4', CARD_TITLE)}>
+          Signals
+        </Heading>
+        <div
+          data-scorecard-grid="true"
+          className="grid grid-cols-1 items-start gap-x-6 gap-y-5 sm:grid-cols-2"
+        >
+          <Group
+            title="Communication"
+            weight={SECTION_WEIGHTS.communication}
+            headingLevel={headingLevel}
+            notes={
+              communication?.notes ??
+              'No candidate responses are available to assess communication.'
+            }
+            className="sm:col-span-2"
+          >
+            <div className="grid grid-cols-1 gap-x-6 gap-y-3 sm:grid-cols-2">
+              <Meter label="Score" value={communication?.score ?? 0} />
+              {communication?.clarity != null && (
+                <Meter label="Clarity" value={communication.clarity} />
+              )}
+              {communication?.structure != null && (
+                <Meter label="Structure" value={communication.structure} />
+              )}
+              {communication?.listening != null && (
+                <Meter label="Listening" value={communication.listening} />
+              )}
+              {communication?.rapport != null && (
+                <Meter label="Rapport" value={communication.rapport} />
+              )}
+            </div>
+            {english && (
+              <SurfaceCard level="sunken" className="p-3">
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+                  <span className="font-medium text-[var(--c-ink-secondary)]">
+                    English band
+                  </span>
+                  <Tag tone="accent" srPrefix="English band:">
+                    {english.band}
+                  </Tag>
+                </div>
+                <div className="grid grid-cols-1 gap-x-6 gap-y-2 sm:grid-cols-2">
+                  <Meter label="Grammar" value={english.grammar} />
+                  <Meter label="Vocabulary" value={english.vocabulary} />
+                  <Meter label="Fluency" value={english.fluency} />
+                  <Meter label="Coherence" value={english.coherence} />
+                </div>
+                <Prose>{english.notes}</Prose>
+              </SurfaceCard>
+            )}
+            {hasSignalBlocks && (
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <SignalBlock label="Filler usage" signal={communication?.filler_usage} />
+                <SignalBlock
+                  label="Native-language usage"
+                  signal={communication?.native_language_usage}
+                />
+              </div>
+            )}
+          </Group>
+
+          <Group
+            title="Tone"
+            weight={SECTION_WEIGHTS.tone}
+            headingLevel={headingLevel}
+            notes={tone.notes}
+          >
+            <Meter label="Clarity" value={tone.clarity} />
+            <Meter label="Confidence" value={tone.confidence} />
+            <Meter label="Professionalism" value={tone.professionalism} />
+            <LabelledRow label="Sentiment">
+              <Tag srPrefix="Sentiment:">{tone.sentiment}</Tag>
+            </LabelledRow>
+          </Group>
+
+          <Group
+            title="Motivation"
+            weight={SECTION_WEIGHTS.motivation}
+            headingLevel={headingLevel}
+            notes={
+              motivation?.notes ??
+              'No candidate responses are available to assess motivation.'
+            }
+          >
+            <Meter label="Score" value={motivation?.score ?? 0} />
+          </Group>
+
+          <Group
+            title="Role fit"
+            weight={SECTION_WEIGHTS.role_fit}
+            headingLevel={headingLevel}
+            notes={role_fit.notes}
+            className="sm:col-span-2"
+          >
+            <Meter label="Fit score" value={role_fit.score} />
+            <SurfaceCard level="sunken" className="space-y-2 p-3">
+              <TagGroup
+                label="Matched skills"
+                srPrefix="Matched skill:"
+                items={role_fit.matched_skills}
+                tone="positive"
+              />
+              <TagGroup
+                label="Gaps"
+                srPrefix="Gap:"
+                items={role_fit.gaps}
+                tone="caution"
+              />
+              <TagGroup
+                label="Red flags"
+                srPrefix="Red flag:"
+                items={role_fit.red_flags}
+                tone="negative"
+              />
+            </SurfaceCard>
+          </Group>
         </div>
       </SurfaceCard>
 
-      {/* ── Sections ─────────────────────────────────────────────────
-          Explicit placement, so no breakpoint can leave an orphan cell:
-            <640px   one column
-            ≥640px   two columns — Communication and Role fit full width
-            ≥1024px  Communication spans both short sections' rows
-          `items-start` keeps unrelated cards at their natural heights. */}
-      <div
-        data-scorecard-grid="true"
-        className="grid grid-cols-1 items-start gap-4 sm:grid-cols-2 lg:grid-cols-12"
-      >
-        <Section
-          title="Communication"
-          weight={SECTION_WEIGHTS.communication}
+      {narrative === 'inline' && (
+        <CandidateScorecardNarrative
+          assessment={assessment}
           headingLevel={headingLevel}
-          notes={
-            communication?.notes ??
-            'No candidate responses are available to assess communication.'
-          }
-          className="sm:col-span-2 lg:col-span-7 lg:row-span-2"
-        >
-          <Meter label="Score" value={communication?.score ?? 0} />
-          {communication?.clarity != null && (
-            <Meter label="Clarity" value={communication.clarity} />
-          )}
-          {communication?.structure != null && (
-            <Meter label="Structure" value={communication.structure} />
-          )}
-          {communication?.listening != null && (
-            <Meter label="Listening" value={communication.listening} />
-          )}
-          {communication?.rapport != null && (
-            <Meter label="Rapport" value={communication.rapport} />
-          )}
-          {english && (
-            <SurfaceCard level="sunken" className="p-3">
-              <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs">
-                <span className="font-medium text-[var(--c-ink-secondary)]">
-                  English band
-                </span>
-                <Tag tone="accent" srPrefix="English band:">
-                  {english.band}
-                </Tag>
-              </div>
-              <div className="space-y-2 sm:grid sm:grid-cols-2 sm:gap-3 sm:space-y-0">
-                <Meter label="Grammar" value={english.grammar} />
-                <Meter label="Vocabulary" value={english.vocabulary} />
-                <Meter label="Fluency" value={english.fluency} />
-                <Meter label="Coherence" value={english.coherence} />
-              </div>
-              <Prose>{english.notes}</Prose>
-            </SurfaceCard>
-          )}
-          <SignalBlock label="Filler usage" signal={communication?.filler_usage} />
-          <SignalBlock
-            label="Native-language usage"
-            signal={communication?.native_language_usage}
-          />
-        </Section>
+        />
+      )}
+    </div>
+  );
+}
 
-        <Section
-          title="Motivation"
-          weight={SECTION_WEIGHTS.motivation}
-          headingLevel={headingLevel}
-          notes={
-            motivation?.notes ??
-            'No candidate responses are available to assess motivation.'
-          }
-          className="lg:col-span-5"
-        >
-          <Meter label="Score" value={motivation?.score ?? 0} />
-        </Section>
+export interface CandidateScorecardNarrativeProps {
+  assessment: Assessment;
+  headingLevel?: HeadingLevel;
+  className?: string;
+}
 
-        <Section
-          title="Tone"
-          weight={SECTION_WEIGHTS.tone}
-          headingLevel={headingLevel}
-          notes={tone.notes}
-          className="lg:col-span-5"
-        >
-          <Meter label="Clarity" value={tone.clarity} />
-          <Meter label="Confidence" value={tone.confidence} />
-          <Meter label="Professionalism" value={tone.professionalism} />
-          <LabelledRow label="Sentiment">
-            <Tag srPrefix="Sentiment:">{tone.sentiment}</Tag>
-          </LabelledRow>
-        </Section>
+/**
+ * Resume conflicts + Summary — the read-once half of the scorecard.
+ *
+ * Split out so a host can render it full width BENEATH a sticky scorecard
+ * column: both are read once and neither needs to track the transcript, so
+ * keeping them in the sticky column only made that column taller than the
+ * viewport, which is what stops a sticky column sticking at all.
+ *
+ * Side by side when both exist, full width when only one does — so a
+ * single block never sits in a half-empty row.
+ */
+export function CandidateScorecardNarrative({
+  assessment,
+  headingLevel = 3,
+  className,
+}: CandidateScorecardNarrativeProps) {
+  const uid = useId();
+  const conflictsId = `${uid}-conflicts`;
+  const summaryId = `${uid}-summary`;
+  const raw = assessment.raw ?? {};
+  const summary = assessment.summary;
+  const conflicts = assessment.resume_conflicts ?? raw.resume_conflicts ?? [];
 
-        <Section
-          title="Role fit"
-          weight={SECTION_WEIGHTS.role_fit}
-          headingLevel={headingLevel}
-          notes={role_fit.notes}
-          className="sm:col-span-2 lg:col-span-12"
-        >
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-            <Meter label="Fit score" value={role_fit.score} />
-            <TagGroup
-              label="Matched skills"
-              srPrefix="Matched skill:"
-              items={role_fit.matched_skills}
-              tone="positive"
-            />
-            <TagGroup
-              label="Gaps"
-              srPrefix="Gap:"
-              items={role_fit.gaps}
-              tone="caution"
-            />
-            <TagGroup
-              label="Red flags"
-              srPrefix="Red flag:"
-              items={role_fit.red_flags}
-              tone="negative"
-            />
-          </div>
-        </Section>
-      </div>
+  if (conflicts.length === 0 && !summary) return null;
+  const both = conflicts.length > 0 && Boolean(summary);
 
-      {/* ── Resume conflicts ─────────────────────────────────────── */}
+  return (
+    <div
+      className={cx(
+        'grid grid-cols-1 items-start gap-4',
+        both && 'sm:grid-cols-2',
+        className,
+      )}
+    >
       {conflicts.length > 0 && (
         <SurfaceCard as="section" labelledBy={conflictsId} className="p-4 sm:p-5">
           <Heading
             level={headingLevel}
             id={conflictsId}
-            className="mb-3 flex flex-wrap items-center gap-2 text-[15px] font-semibold tracking-tight text-[var(--c-ink)]"
+            className={cx('mb-3 flex flex-wrap items-center gap-2', CARD_TITLE)}
           >
             Resume conflicts
             <Tag tone="caution" srPrefix="Count:">
@@ -477,13 +563,12 @@ export function CandidateScorecard({
         </SurfaceCard>
       )}
 
-      {/* ── Summary ──────────────────────────────────────────────── */}
       {summary && (
         <SurfaceCard as="section" labelledBy={summaryId} className="p-4 sm:p-5">
           <Heading
             level={headingLevel}
             id={summaryId}
-            className="mb-1.5 text-[15px] font-semibold tracking-tight text-[var(--c-ink)]"
+            className={cx('mb-1.5', CARD_TITLE)}
           >
             Summary
           </Heading>
@@ -495,15 +580,6 @@ export function CandidateScorecard({
           </p>
         </SurfaceCard>
       )}
-    </div>
-  );
-}
-
-function WeightItem({ label, weight }: { label: string; weight: string }) {
-  return (
-    <div className="flex items-center gap-1.5">
-      <dt className="text-[var(--c-ink-secondary)]">{label}</dt>
-      <dd className="font-mono tabular-nums text-[var(--c-ink)]">{weight}</dd>
     </div>
   );
 }

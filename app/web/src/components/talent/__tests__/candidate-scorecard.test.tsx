@@ -16,7 +16,10 @@
 import { render, screen, within } from '@testing-library/react';
 import { describe, it, expect, afterEach } from 'vitest';
 import { Scorecard } from '../../Scorecard';
-import { CandidateScorecard } from '../CandidateScorecard';
+import {
+  CandidateScorecard,
+  CandidateScorecardNarrative,
+} from '../CandidateScorecard';
 import { CandidateShell } from '../CandidateShell';
 import type { Assessment } from '../../../types';
 
@@ -266,30 +269,77 @@ describe('CandidateScorecard field parity vs the legacy Scorecard', () => {
 });
 
 describe('CandidateScorecard layout defects', () => {
-  it('places Role fit full width at every breakpoint — no orphan cell', () => {
+  it('packs the scored signals into ONE card, with no orphan grid cell', () => {
     const { container } = render(<CandidateScorecard assessment={FULL} />);
+
+    // The six-card vertical stack the owner flagged is gone: everything
+    // scored now lives in exactly two base cards — the verdict band and
+    // Signals. (Sunken wells are depth 2 and are counted separately by the
+    // card-levels test below.)
+    const baseCards = container.querySelectorAll('[data-surface-depth="1"]');
+    expect(baseCards).toHaveLength(4); // verdict, Signals, conflicts, summary
+
     const grid = container.querySelector('[data-scorecard-grid]')!;
     expect(grid.className).toContain('grid-cols-1');
     expect(grid.className).toContain('sm:grid-cols-2');
-    expect(grid.className).toContain('lg:grid-cols-12');
-    // `items-start` keeps unrelated cards at their natural heights.
+    // `items-start` keeps a short group at its own height instead of
+    // stretching it to the tallest cell in the row.
     expect(grid.className).toContain('items-start');
+    // The grid is INSIDE the Signals card, not a sibling stack of cards.
+    expect(grid.closest('[data-surface-depth="1"]')).toBe(
+      screen.getByRole('region', { name: 'Signals' }),
+    );
 
-    const sections = [...grid.children] as HTMLElement[];
-    expect(sections).toHaveLength(4);
-    const [communication, motivation, tone, roleFit] = sections;
+    const groups = [...grid.children] as HTMLElement[];
+    expect(groups).toHaveLength(4);
+    const [communication, tone, motivation, roleFit] = groups;
+    expect(
+      groups.map((g) => within(g).getAllByRole('heading')[0].textContent),
+    ).toEqual(['Communication', 'Tone', 'Motivation', 'Role fit']);
 
-    // Communication spans the two short sections' rows; Role fit spans all.
-    expect(communication.className).toContain('lg:col-span-7');
-    expect(communication.className).toContain('lg:row-span-2');
-    expect(motivation.className).toContain('lg:col-span-5');
-    expect(tone.className).toContain('lg:col-span-5');
-    expect(roleFit.className).toContain('lg:col-span-12');
-
-    // 4 sections in a 2-column grid orphan unless the tall ones span both.
+    // Two spanners + two single cells fill 2-column rows exactly, so no
+    // breakpoint can leave a cell empty beside a group.
     expect(communication.className).toContain('sm:col-span-2');
     expect(roleFit.className).toContain('sm:col-span-2');
-    expect(within(roleFit).getByRole('heading', { name: 'Role fit' })).toBeInTheDocument();
+    expect(tone.className).not.toContain('col-span-2');
+    expect(motivation.className).not.toContain('col-span-2');
+
+    // Role fit still owns its own tag groups.
+    for (const label of ['Matched skills', 'Gaps', 'Red flags']) {
+      expect(within(roleFit).getByText(label)).toBeInTheDocument();
+    }
+  });
+
+  it('splits the read-once narrative out of the scored card on request', () => {
+    const { container, rerender } = render(
+      <CandidateScorecard assessment={FULL} narrative="none" />,
+    );
+    expect(screen.queryByText('Resume conflicts')).not.toBeInTheDocument();
+    expect(screen.queryByText(FULL.summary)).not.toBeInTheDocument();
+    // …and the scored half is now two cards, so a sticky host column stays
+    // shorter than the viewport.
+    expect(container.querySelectorAll('[data-surface-depth="1"]')).toHaveLength(2);
+
+    rerender(<CandidateScorecardNarrative assessment={FULL} />);
+    expect(screen.getByRole('heading', { name: /Resume conflicts/ })).toBeInTheDocument();
+    expect(screen.getByText(FULL.summary)).toBeInTheDocument();
+    // Both present → side by side; only one → full width.
+    const row = container.firstElementChild as HTMLElement;
+    expect(row.className).toContain('sm:grid-cols-2');
+
+    rerender(
+      <CandidateScorecardNarrative assessment={{ ...FULL, resume_conflicts: [] }} />,
+    );
+    expect(
+      (container.firstElementChild as HTMLElement).className,
+    ).not.toContain('sm:grid-cols-2');
+
+    rerender(
+      <CandidateScorecardNarrative
+        assessment={{ ...FULL, resume_conflicts: [], summary: '' }}
+      />,
+    );
+    expect(container.firstElementChild).toBeNull();
   });
 
   it('never renders prose inside a narrow column, and never at text-xs', () => {

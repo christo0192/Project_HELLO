@@ -93,13 +93,13 @@ export function SeekableTranscript({
     );
   } else if (error) {
     body = (
-      <div role="alert" className="rounded-lg border border-error/30 bg-error-soft p-3">
-        <p className="text-sm text-error">{error}</p>
+      <div role="alert" className="rounded-lg border border-[var(--c-negative)] bg-[var(--c-negative-light)] p-3">
+        <p className="text-sm text-[var(--c-ink-secondary)]">{error}</p>
         {onRetry && (
           <button
             type="button"
             onClick={onRetry}
-            className="mt-2 inline-flex items-center rounded-lg border border-line bg-surface px-3 py-1.5 text-xs font-medium text-ink transition-colors hover:bg-surface-tertiary"
+            className="mt-2 inline-flex min-h-[44px] items-center rounded-lg border border-[var(--c-control-border)] bg-[var(--c-surface)] px-3 py-1.5 text-xs font-medium text-[var(--c-ink)] transition-colors hover:bg-[var(--c-border-light)]"
           >
             Try again
           </button>
@@ -108,7 +108,7 @@ export function SeekableTranscript({
     );
   } else if (transcript.length === 0) {
     body = (
-      <p className="rounded-lg border border-dashed border-line-strong bg-surface-secondary px-4 py-8 text-center text-sm text-ink-secondary">
+      <p className="rounded-lg border border-dashed border-[var(--c-border)] px-4 py-8 text-center text-sm text-[var(--c-ink-secondary)]">
         No transcript lines recorded for this session yet.
       </p>
     );
@@ -116,21 +116,32 @@ export function SeekableTranscript({
     body = (
       <div>
         {!recordingReady && anyTimed && (
-          <p className="mb-3 rounded-md bg-surface-secondary px-3 py-2 text-xs text-ink-secondary">
+          <p className="mb-3 rounded-md bg-[var(--c-border-light)] px-3 py-2 text-xs text-[var(--c-ink-secondary)]">
             Click any timed transcript turn to automatically load the recording and jump to that moment.
           </p>
         )}
         {anyUntimed && anyTimed && (
-          <p className="mb-3 rounded-md bg-surface-secondary px-3 py-2 text-xs text-ink-secondary">
+          <p className="mb-3 rounded-md bg-[var(--c-border-light)] px-3 py-2 text-xs text-[var(--c-ink-secondary)]">
             Some turns lack timing data and cannot be used for playback — they are shown below without a timestamp.
           </p>
         )}
-        <ul className="space-y-0.5" role="list">
+        <ul className="space-y-1" role="list">
           {transcript.map((turn, index) => {
             const timed = hasTiming(turn);
             const active = activeTurnIndex === index;
             const presented = presentTranscriptTurn(turn.speaker, turn.text);
             const speaker = presented.label;
+            // Speaker is legible without colour: the label is always written
+            // out. The tint only makes the alternation scannable. The bot
+            // tint is the page ground and the candidate tint the card fill,
+            // which are DIFFERENT tokens from the accent tint the active turn
+            // takes — so an active bot turn is never the same fill as an
+            // inactive one, and the 2px accent rule reads as a change of
+            // state rather than a change of speaker.
+            const speakerTint =
+              turn.speaker === 'bot'
+                ? 'bg-[var(--c-bg)]'
+                : 'bg-[var(--c-surface)]';
 
             if (timed) {
               return (
@@ -142,22 +153,22 @@ export function SeekableTranscript({
                     aria-current={active ? 'true' : undefined}
                     aria-label={`Turn ${index + 1}: ${speaker}. At ${formatOffset(turn.start_offset_sec!)}. Click to play from here.`}
                     className={cx(
-                      'w-full text-left px-3 py-3 rounded-md transition-colors min-h-[44px]',
+                      'w-full min-h-[44px] rounded-md px-3 py-2.5 text-left transition-colors',
                       'focus:outline-none focus:ring-2 focus:ring-[var(--c-accent)] focus:ring-inset',
                       active
-                        ? 'bg-[var(--c-accent-light)] border-l-2 border-[var(--c-accent)]'
-                        : 'bg-transparent border-l-2 border-transparent hover:bg-surface-secondary',
+                        ? 'border-l-2 border-[var(--c-accent)] bg-[var(--c-accent-light)]'
+                        : cx('border-l-2 border-transparent', speakerTint, 'hover:bg-[var(--c-accent-light)]'),
                     )}
                   >
-                    <span className="flex items-center justify-between gap-2">
-                      <span className="text-[11px] font-medium uppercase tracking-wide text-ink-tertiary">
+                    <span className="flex items-baseline justify-between gap-2">
+                      <span className="text-xs font-medium text-[var(--c-ink-secondary)]">
                         {speaker}
                       </span>
-                      <span className="text-[11px] tabular-nums text-ink-tertiary">
+                      <span className="text-xs tabular-nums text-[var(--c-ink-secondary)]">
                         {formatOffset(turn.start_offset_sec!)}
                       </span>
                     </span>
-                    <span className="mt-0.5 block whitespace-pre-wrap text-sm leading-relaxed text-ink">
+                    <span className="mt-0.5 block whitespace-pre-wrap text-sm leading-relaxed text-[var(--c-ink)]">
                       {presented.text}
                     </span>
                   </button>
@@ -168,18 +179,21 @@ export function SeekableTranscript({
             return (
               <li key={index}>
                 <div
-                  className="px-3 py-3 rounded-md opacity-80 border-l-2 border-transparent min-h-[44px]"
+                  className={cx(
+                    'min-h-[44px] rounded-md border-l-2 border-transparent px-3 py-2.5',
+                    speakerTint,
+                  )}
                   aria-label={`Turn ${index + 1}: ${speaker}. Timing data not available.`}
                 >
-                  <span className="flex items-center justify-between gap-2">
-                    <span className="text-[11px] font-medium uppercase tracking-wide text-ink-tertiary">
+                  <span className="flex items-baseline justify-between gap-2">
+                    <span className="text-xs font-medium text-[var(--c-ink-secondary)]">
                       {speaker}
                     </span>
-                    <span className="text-[11px] italic text-ink-tertiary">
+                    <span className="text-xs italic text-[var(--c-ink-secondary)]">
                       no timing data
                     </span>
                   </span>
-                  <span className="mt-0.5 block whitespace-pre-wrap text-sm leading-relaxed text-ink">
+                  <span className="mt-0.5 block whitespace-pre-wrap text-sm leading-relaxed text-[var(--c-ink)]">
                     {presented.text}
                   </span>
                 </div>
@@ -191,12 +205,15 @@ export function SeekableTranscript({
     );
   }
 
+  // A plain wrapper, not a landmark: the workspace wraps this in the single
+  // bounded `role="region" aria-label="Transcript"` scroll container, and two
+  // regions with the same name would be a duplicate-landmark violation.
   return (
-    <section aria-label="Transcript" className={className}>
+    <div className={className}>
       <div role="status" aria-live="polite" className="sr-only">
         {announcement}
       </div>
       {body}
-    </section>
+    </div>
   );
 }
