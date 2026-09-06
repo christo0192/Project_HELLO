@@ -4382,6 +4382,75 @@ def phone_qna_done(text: Any) -> bool:
     return _QNA_DONE_RE.fullmatch(normalized) is not None
 
 
+#: FIX D (2026-09-06): an EXPLICIT dismissal during the questions-for-me phase.
+#: Live-call tail (transcript-proven): the candidate said "No follow up from me.
+#: You can just connect [disconnect] the call. Thank you." — a COMPOUND utterance
+#: whose middle clause ("you can just disconnect the call") is a clear "we're
+#: done" but which the ANCHORED `_QNA_DONE_RE` (a fullmatch) could never match.
+#: It fell through to the answer branch and the bot RE-OPENED with "Do you have
+#: any questions…?" before the final close. `phone_qna_done` stays anchored (a
+#: narrow "no more questions"); this SEPARATE predicate catches an unambiguous
+#: dismissal embedded ANYWHERE in the utterance and routes straight to the
+#: closing goodbye. Deliberately conservative — it fires only on explicit
+#: end-the-call / no-follow-up / we're-good phrasing, and it FAILS CLOSED on any
+#: utterance that also carries a question (never swallow a real late question).
+_QNA_DISMISSAL_RE = re.compile(
+    # "you can / please / just disconnect|hang up|end|drop the call", "cut the call"
+    r"\b(?:(?:you\s+can|please|just|go\s+ahead\s+and)\s+)?"
+    r"(?:disconnect|hang\s*up|hangup|end|drop|cut|close)\s+"
+    r"(?:the\s+|this\s+|our\s+)?call\b"
+    # "no follow up / no follow-up (from me)"
+    r"|\bno\s+follow[\s-]*ups?\b"
+    # "we're / we are (all) good / done", "i'm (all) good / done" — ONLY as a
+    # standalone/utterance-final clause (review repair: "I'm good at closing
+    # deals" is an ANSWER, not a dismissal; require end-of-clause so the phrase
+    # cannot match mid-sentence prose).
+    r"|\b(?:we(?:'re|\s+are)|i(?:'m|\s+am))\s+(?:all\s+)?(?:good|done|set)"
+    r"\s*(?:,?\s*(?:thank\s+you|thanks))?\s*(?:[.!]|$)"
+    # "that's all/it from me", "nothing (else) from my side/end"
+    r"|\bnothing\s+(?:else\s+)?(?:from\s+(?:my|our)\s+(?:side|end))\b"
+    r"|\bthat(?:'s|\s+is)\s+(?:all|it)\s+from\s+(?:me|my\s+(?:side|end))\b",
+    re.IGNORECASE,
+)
+
+
+def phone_qna_dismissal(text: Any) -> bool:
+    """True when a questions-phase reply is an EXPLICIT dismissal → close now.
+
+    Conservative deterministic detector for the wind-down turn BEFORE the goodbye
+    latch (which handles bare farewells AFTER the goodbye). Complements the
+    anchored `phone_qna_done`: this tolerates a compound utterance ("No follow up
+    from me. You can just disconnect the call. Thank you.") that the anchored
+    predicate misses. Fails CLOSED — returns False for a non-str, an empty
+    string, or any utterance that ALSO carries a question: an interrogative
+    opener on ANY clause (not just the first — review repair: "we're good on
+    that, but how does the next round work" must not close), a '?' anywhere,
+    or an explicit "one/another/quick/last question" mention — so a genuine
+    late question is never swallowed into a premature close."""
+    if not isinstance(text, str):
+        return False
+    clean = " ".join(text.strip().split())
+    if not clean:
+        return False
+    normalized = clean.replace("’", "'").replace("‘", "'")
+    # Never close on a turn that also asks something — checked EVERYWHERE in
+    # the utterance, not just at its edges (review finding: a mid-utterance
+    # question without a '?' slipped past the open/trailing checks).
+    if "?" in normalized:
+        return False
+    if re.search(
+        r"\b(?:one|a|another|quick|last|final)\s+(?:more\s+)?question\b",
+        normalized, re.IGNORECASE,
+    ):
+        return False
+    for clause in re.split(r"[.;!,]|\b(?:but|and|although|though)\b",
+                           normalized, flags=re.IGNORECASE):
+        clause = clause.strip()
+        if clause and _QUESTION_OPEN_RE.match(clause):
+            return False
+    return _QNA_DISMISSAL_RE.search(normalized) is not None
+
+
 #: A Q&A-phase utterance that is pure filler or a dangling, unfinished thought
 #: ("Uh, yeah, so"). During wind-down these must NOT burn a Q&A round or trigger
 #: the close — a live call (2026-09-02) tore the room down on exactly this while
@@ -5151,6 +5220,55 @@ def phone_conflict_max_reasks() -> int:
     return _bounded_int_env(os.getenv("PHONE_CONFLICT_MAX_REASKS"), 2, 0, 5)
 
 
+# ── Objective-guard question-act threshold (FIX B, 2026-09-06) ────────────────
+#
+# The generative-objective guard rejects a reply that carries more than the
+# permitted number of candidate-directed QUESTION ACTS (interrogatives + spoken-
+# request imperatives; quoted candidate wording is stripped first — see
+# `phone_generated_question_act_count`). The default permitted count is ONE.
+#
+# RCA (live DeepSeek call f4761967): on a name-confirmation or résumé-conflict
+# turn the model naturally produces a TWO-act utterance — a confirm question
+# PLUS a clarifying probe ("I have Christo on file — is that right? Or should I
+# use Deepak?"). The one-act rule rejected these, the flat canned clarification
+# line spoke instead, and the call felt robotic. A single-act natural confirm
+# ("I have X on file but you said Y — which should I use?") already passes (one
+# '?'); only genuine confirm+probe double-questions tripped it. So the fix is a
+# PHASE-AWARE ceiling: still one act on ordinary advance turns, but up to two on
+# the confirm/clarification phases where a two-part utterance is the natural
+# shape. Every OTHER rejection reason (instruction echo, premature closing,
+# compensation drift, objective drift) is unchanged.
+#: Phases on which a two-part (confirm + probe) utterance is natural.
+PHONE_OBJECTIVE_GUARD_RELAXED_PHASES: frozenset[str] = frozenset({
+    "name_confirm",
+    "resume_conflict",
+})
+
+
+def phone_objective_guard_max_questions() -> int:
+    """Ceiling on candidate-directed question acts for a RELAXED phase.
+
+    Default 2; clamped to [1, 2] so this can only ever WIDEN the base one-act
+    rule by a single act (a two-part confirm+probe) and can never disable it.
+    Setting it to 1 restores the pre-FIX-B behaviour on every phase. Read at the
+    call site with the literal env name so the env-contract scanner sees it.
+    """
+    return _bounded_int_env(os.getenv("PHONE_OBJECTIVE_GUARD_MAX_QUESTIONS"), 2, 1, 2)
+
+
+def phone_objective_guard_max_questions_for_phase(phase: Any) -> int:
+    """Return the permitted question-act ceiling for ``phase``.
+
+    One act everywhere except the confirm/clarification phases, where a
+    confirm-plus-probe two-act utterance is natural. The relaxation is a no-op
+    when ``PHONE_OBJECTIVE_GUARD_MAX_QUESTIONS`` is set to 1 (per-phase kill
+    switch). The relaxation is scoped to the enumerated phases so an ordinary
+    QnA advance turn still rejects a genuine double question."""
+    if isinstance(phase, str) and phase in PHONE_OBJECTIVE_GUARD_RELAXED_PHASES:
+        return phone_objective_guard_max_questions()
+    return 1
+
+
 def phone_deterministic_resume_conflict(
     answer: Any, resume_facts: Any,
 ) -> dict[str, str] | None:
@@ -5796,19 +5914,31 @@ def phone_generated_prefix_authorized(
 
 def phone_generated_reply_rejection_reason(
     speech: Any, objective_text: Any, *, allow_closing: bool,
-    control_text: Any = None,
+    control_text: Any = None, max_question_acts: int = 1,
 ) -> str | None:
-    """Return a sanitized reason for rejecting a generated phone reply."""
+    """Return a sanitized reason for rejecting a generated phone reply.
+
+    ``max_question_acts`` (FIX B, 2026-09-06) is the ceiling on candidate-
+    directed question acts. Default ONE preserves the historical rule for every
+    ordinary turn; the confirm/clarification phases pass 2 (via
+    ``phone_objective_guard_max_questions_for_phase``) so a natural
+    confirm-plus-probe utterance is not rejected into the flat canned fallback.
+    The value is clamped to at least 1 so a caller can never DISABLE the guard.
+    """
+    ceiling = max_question_acts if isinstance(max_question_acts, int) and max_question_acts >= 1 else 1
     if not isinstance(speech, str) or not any(ch.isalpha() for ch in speech):
         return "empty_or_nonspeakable"
     compact = " ".join(speech.split())
     if not allow_closing and _GENERATED_CLOSING_RE.search(compact):
         return "premature_closing"
     question_acts = phone_generated_question_act_count(compact)
-    if (not allow_closing and question_acts != 1) or question_acts > 1:
+    if (not allow_closing and question_acts < 1) or question_acts > ceiling:
         # Preserve the existing sanitized telemetry category for dashboard and
         # historical-series compatibility even though validation now counts
-        # spoken question acts rather than punctuation glyphs.
+        # spoken question acts rather than punctuation glyphs. When
+        # ``allow_closing`` is set the reply may legitimately carry zero
+        # questions (a terminal close), so only the upper bound applies there —
+        # same as before; the phase-aware ceiling only WIDENS the upper bound.
         return "question_mark_count"
     objective_is_comp = phone_is_compensation_objective(objective_text)
     if _COMPENSATION_OBJECTIVE_RE.search(compact) and not objective_is_comp:
@@ -5831,12 +5961,12 @@ def phone_generated_reply_rejection_reason(
 
 def phone_generated_reply_authorized(
     speech: Any, objective_text: Any, *, allow_closing: bool,
-    control_text: Any = None,
+    control_text: Any = None, max_question_acts: int = 1,
 ) -> bool:
     """Fail closed on clear action/objective violations, not natural wording."""
     return phone_generated_reply_rejection_reason(
         speech, objective_text, allow_closing=allow_closing,
-        control_text=control_text,
+        control_text=control_text, max_question_acts=max_question_acts,
     ) is None
 
 
@@ -6794,6 +6924,23 @@ PHONE_COMPANY_REVIEW_RESPONSE = (
     "to assess public reviews or make claims about employee experiences, so the "
     "hiring team is the right source for specific questions about the workplace."
 )
+#: Per-turn STYLE RIDER (2026-09-06, benchmark-selected "R1"). The stable
+#: prefix is a proven dead end for style on DeepSeek V4-Flash at
+#: reasoning=none (two production-fidelity benchmark rounds: prefix persona/
+#: rule additions moved punctuation nowhere and broke close compliance), but
+#: the PER-TURN instruction is the seam with proven adherence. This exact
+#: text, appended to the toolless planned instruction, measured: punct/word
+#: 0.165 -> 0.176 (best production-context number in the series), interjection
+#: openers 50% -> 58%, median TTFT 0.631 -> 0.496s (tighter sentences stream
+#: sooner), 6/6 clean closes, +62 uncached tokens/turn. Deliberately NOT
+#: appended to the qna_done close instruction (closes are already clean).
+PHONE_TURN_STYLE_RIDER = (
+    " Say it like a real person on the phone: use commas wherever a speaker "
+    "would breathe, an em-dash for a quick aside — like this — and end every "
+    "sentence with . ! or ?. Always use contractions (that's, you've, I'm). "
+    "Two to three short sentences, no more."
+)
+
 PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT = (
     "I noticed that your description of your recent experience differs from "
     "the resume information we received. Could you clarify the timeline and "
@@ -7190,6 +7337,10 @@ def phone_agent_class(agent_base: Any) -> Any:
             self._generation_objective: str | None = None
             self._generation_allow_closing = False
             self._generation_control_text: str | None = None
+            # FIX B (2026-09-06): the reply-snapshot phase for the reply now in
+            # flight. Threaded into the objective guard so the confirm/conflict
+            # phases may carry a natural two-part (confirm + probe) utterance.
+            self._generation_phase: str | None = None
             self._generation_prefix_released = False
             self._reply_generation: int | None = None
             self._on_tts_first_frame: Callable[[int | None, float, float], Any] | None = None
@@ -7202,7 +7353,7 @@ def phone_agent_class(agent_base: Any) -> Any:
 
         def authorize_generation(
             self, objective_text: str | None, *, allow_closing: bool = False,
-            control_text: str | None = None,
+            control_text: str | None = None, phase: str | None = None,
         ) -> None:
             self._generation_objective = (
                 " ".join(objective_text.split())[:800]
@@ -7213,6 +7364,14 @@ def phone_agent_class(agent_base: Any) -> Any:
             self._generation_control_text = (
                 " ".join(control_text.split())[:1200]
                 if isinstance(control_text, str) and control_text.strip()
+                else None
+            )
+            # FIX B: carry the phase (bounded to a short identifier) so the
+            # objective guard can widen the question-act ceiling on the
+            # confirm/clarification phases only.
+            self._generation_phase = (
+                " ".join(phase.split())[:64]
+                if isinstance(phase, str) and phase.strip()
                 else None
             )
 
@@ -7441,6 +7600,9 @@ def phone_agent_class(agent_base: Any) -> Any:
                 speech, objective,
                 allow_closing=self._generation_allow_closing,
                 control_text=self._generation_control_text,
+                max_question_acts=phone_objective_guard_max_questions_for_phase(
+                    self._generation_phase,
+                ),
             )
             if rejection_reason is None:
                 for chunk in held:

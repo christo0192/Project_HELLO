@@ -125,6 +125,14 @@ _KEY_TYPE_STRING: frozenset[str] = frozenset({
     "model",
     "schema",
     "speaker",
+    # FIX C (2026-09-06): the objective-guard rejection reason and the reply
+    # phase for `generation_completed_empty`. Both are fixed identifier-shaped
+    # category strings (e.g. "question_mark_count", "resume_conflict"); they are
+    # validated with the same SAFE_IDENT_RE as error_category. Without these keys
+    # the allowlist silently dropped the fields, so the guard's decision was
+    # invisible on the emitted line.
+    "rejection_reason",
+    "phase",
 })
 
 _KEY_TYPE_NUMBER: frozenset[str] = frozenset({
@@ -235,7 +243,8 @@ def _validate_string_field(key: str, val: str) -> Optional[str]:
         return _validate_origin(sanitised)
     if key in ("violated_directive", "effective_directive"):
         return sanitised if _CSP_DIRECTIVE_RE.match(sanitised) else None
-    if key in ("error_category", "error_type", "model", "schema"):
+    if key in ("error_category", "error_type", "model", "schema",
+               "rejection_reason", "phase"):
         return sanitised if _SAFE_IDENT_RE.match(sanitised) else None
     return sanitised
 

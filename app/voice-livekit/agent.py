@@ -2201,6 +2201,28 @@ async def _run_native_phone_screening(
     # the account), so it arms under its own `phone_name_mismatch_key` set. This
     # can neither shadow nor be shadowed by a live résumé conflict.
     asked_name_mismatches: set[str] = set()
+    # FIX A (2026-09-06) OWED CONFLICT PROBE latch. The ASYNC coverage judge
+    # (~4271) detects résumé conflicts ~1-2s after the cursor already moved. The
+    # old remedy armed `conflict_reply_pending` stamped with `native_turn_seq`
+    # and dropped it unless the candidate answered on EXACTLY `armed_turn + 1` —
+    # structurally unwinnable on phone, where STT fragments a single answer into
+    # several finals that each bump the counter (fired 0/3 live, call f4761967).
+    #
+    # Instead the async judge now sets ONE logical "owed conflict probe" here.
+    # The NEXT authored bot turn consumes it UNCONDITIONALLY (not gated on any
+    # turn-delta), promoting it into the SAME deterministic `judge_instruction`
+    # claim the synchronous detector uses (interrupt-free at the single-final
+    # site: set snapshot phase=resume_conflict, authorize, arm conflict delivery,
+    # add the turn instruction). So the bounded re-pursuit + anti-capitulation
+    # machinery (PR #234/#242) actually runs. Shape:
+    #   value:    True while a probe is owed and not yet delivered.
+    #   conflict: the judge's conflict dict (drives phone_conflict_key /
+    #             _repursuit_instruction / _reply_reconciled — same shape as the
+    #             deterministic detector's).
+    # Dedup rides `asked_conflicts` exactly like the deterministic path: an owed
+    # probe whose key was already asked is a no-op. Cleared on consumption and on
+    # kill-switch-off. Not turn-stamped: it survives STT fragmentation by design.
+    owed_conflict_probe: dict[str, Any] = {"value": False, "conflict": None}
 
     def _record_identity_signal(mismatch: Any, disposition: str) -> None:
         """Persist a GRADED identity signal into the observability accumulator.
@@ -2251,14 +2273,28 @@ async def _run_native_phone_screening(
 
     def authorize_generated_reply(
         objective: str | None, *, allow_closing: bool = False,
-        control_text: str | None = None,
+        control_text: str | None = None, phase: str | None = None,
     ) -> None:
         authorize = getattr(agent, "authorize_generation", None)
         if callable(authorize):
-            authorize(
-                objective, allow_closing=allow_closing,
-                control_text=control_text,
-            )
+            # FIX B (2026-09-06): pass the phase so the objective guard can widen
+            # its question-act ceiling on confirm/clarification turns. Every call
+            # site sets `reply_snapshot["phase"]` via `set_reply_snapshot`
+            # immediately before authorizing, so default to that snapshot phase
+            # when a caller does not name one explicitly — this keeps the phase
+            # in lock-step with the fallback text/objective for the same reply.
+            effective_phase = phase if phase is not None else reply_snapshot.get("phase")
+            try:
+                authorize(
+                    objective, allow_closing=allow_closing,
+                    control_text=control_text, phase=effective_phase,
+                )
+            except TypeError:
+                # Back-compat: an older Agent stub without the `phase` kwarg.
+                authorize(
+                    objective, allow_closing=allow_closing,
+                    control_text=control_text,
+                )
 
     async def prime_preemptive_objective(
         target: phone.PhonePlanQuestion | None,
@@ -3058,7 +3094,15 @@ async def _run_native_phone_screening(
                     "Do NOT say goodbye and do NOT move on.",
                 )
                 return
-            if phone.phone_qna_done(text):
+            # FIX D (2026-09-06): an EXPLICIT dismissal ("no follow up from me,
+            # you can just disconnect the call") during the questions-for-me phase
+            # proceeds to the closing goodbye instead of RE-OPENING with "Do you
+            # have any questions…?". The anchored `phone_qna_done` misses a
+            # compound dismissal; `phone_qna_dismissal` catches it and fails
+            # closed on any turn that also carries a question, so a genuine late
+            # question is never swallowed. Treated exactly like `phone_qna_done`
+            # (close warmly), so no new terminal path is introduced.
+            if phone.phone_qna_done(text) or phone.phone_qna_dismissal(text):
                 close_instruction = (
                     "The candidate has no more questions. Thank them warmly and "
                     "personally, say the team will review and be in touch soon, "
@@ -3666,7 +3710,40 @@ async def _run_native_phone_screening(
                     if judge_instruction is not None:
                         asked_conflicts.add(conflict_key)
                         _arm_conflict_delivery(conflict_key, conflict)
-            elif (
+            # FIX A (2026-09-06) OWED CONFLICT PROBE consumer. When NO fresh
+            # deterministic conflict / identity signal claimed this turn
+            # (`judge_instruction is None`) and the ASYNC judge owed a probe from a
+            # PRIOR turn, deliver it NOW by promoting it into the same
+            # `judge_instruction` claim — mirroring the deterministic conflict arm
+            # directly above. Consumed UNCONDITIONALLY (no turn-delta gate), so a
+            # single answer STT split into several finals cannot drop it. Dedup:
+            # if the deterministic detector ALREADY asked this conflict key this
+            # call, the owed probe is a no-op (respects `asked_conflicts`). The
+            # owed latch is cleared here whether or not it fires, so it can never
+            # linger past its one intended turn.
+            if judge_instruction is None and owed_conflict_probe["value"]:
+                owed_conflict = owed_conflict_probe["conflict"]
+                owed_conflict_probe["value"] = False
+                owed_conflict_probe["conflict"] = None
+                # Kill switch symmetry: if the gate was flipped OFF after the
+                # probe was owed, DROP it silently (do not deliver) — the runtime
+                # toggle defuses both the arm and the delivery.
+                if isinstance(owed_conflict, dict) and phone.phone_conflict_gate_enabled():
+                    owed_key = phone.phone_conflict_key(owed_conflict)
+                    if owed_key not in asked_conflicts:
+                        owed_instruction = phone.phone_judge_turn_instruction(
+                            question.spoken_text, conflict=owed_conflict,
+                        )
+                        if owed_instruction is not None:
+                            judge_instruction = owed_instruction
+                            asked_conflicts.add(owed_key)
+                            _arm_conflict_delivery(owed_key, owed_conflict)
+                            _log.info(
+                                "unknown_event",
+                                error_type="phone_coverage_conflict",
+                                error_category="owed_conflict_probe_delivered",
+                            )
+            if (
                 judge_instruction is None
                 and coverage_reanchor.get("question_key") == question.key
             ):
@@ -3759,6 +3836,7 @@ async def _run_native_phone_screening(
                     "React briefly to one concrete detail from the candidate's answer. "
                     "Then ask naturally whether they have any questions about the role, "
                     "team, company, or process. Do not say goodbye yet."
+                    + phone.PHONE_TURN_STYLE_RIDER
                 )
                 planned_objective = "Ask whether the candidate has questions about the role, team, company, or process."
             else:
@@ -3767,6 +3845,7 @@ async def _run_native_phone_screening(
                     "Then ask one clear question that reaches this authorized objective "
                     "in your own words. Do not introduce another topic: "
                     + next_question.spoken_text
+                    + phone.PHONE_TURN_STYLE_RIDER
                 )
                 planned_objective = next_question.spoken_text
             turn_instruction = judge_instruction or planned_instruction
@@ -4273,32 +4352,41 @@ async def _run_native_phone_screening(
                 "unknown_event", error_type="phone_coverage_conflict",
                 error_category="assessment_only_expired",
             )
-            # B1 round 2 (owner-approved, v115 live): the async judge is the ONLY
-            # thing that finds this conflict, and it used to ONLY log — the
-            # synchronous re-pursuit machinery (conflict_reply_pending) was never
-            # armed, so a real conflict never drove a verbal re-pursuit. Arm a
-            # BOUNDED re-pursuit here without adding ANY per-turn latency (this
-            # runs off the speech path). Bounds, ALL required:
-            #   1. ONCE per call — the `repursued` latch in _begin_conflict_
-            #      repursuit still gates the actual fire; do not re-arm if it has
-            #      already fired.
-            #   2. FRESH ONLY — stamp the current candidate-turn count so the
-            #      arm is honored solely on the IMMEDIATE next turn; a stale probe
-            #      after the candidate moved on is dropped (see the consume-side
-            #      freshness guard). This is exactly the anti-stale-clarification
-            #      invariant this comment block protects.
-            #   3. NEVER block the turn — a plain assignment, no await.
-            # The immediate next candidate turn routes into _consume_conflict_
-            # reply -> _begin_conflict_repursuit -> the deterministic re-assertion
-            # (phone_conflict_repursuit_instruction + PR #227 anti-endorsement).
-            if not conflict_reply_pending.get("repursued"):
-                # ASYNC arm through the single writer, stamped with the current
-                # LOGICAL candidate-turn count so the freshness bound fires it
-                # only on the immediate next turn (BUG 2: one writer owns the
-                # armed_turn field for both arm paths).
-                _arm_conflict_reply_pending(
-                    verdict.conflict, armed_turn=native_turn_seq[0],
-                )
+            # FIX A (2026-09-06): the async judge is the ONLY thing that finds
+            # this conflict, but the old remedy — arming `conflict_reply_pending`
+            # stamped with `native_turn_seq` and consuming it only on the EXACT
+            # next candidate turn (`armed_turn + 1`) — was structurally unwinnable
+            # on phone. The judge finishes ~1-2s after the cursor already moved,
+            # and STT fragments one answer into several finals that each bump the
+            # counter, so `native_turn_seq - armed_turn > 1` dropped it as stale
+            # (fired 0/3 live, call f4761967: assessment_only_expired ×3 +
+            # repursuit_dropped_stale ×1).
+            #
+            # Instead set ONE logical OWED CONFLICT PROBE. The next authored bot
+            # turn consumes it UNCONDITIONALLY (no turn-delta gate), promoting it
+            # into the SAME deterministic `judge_instruction` claim the
+            # synchronous detector uses — so the bounded re-pursuit +
+            # anti-capitulation loop actually runs. Bounds preserved:
+            #   1. Kill switch — reuse `phone_conflict_gate_enabled()`; when off
+            #      no probe is owed (old behaviour: assessment-only, log + expire).
+            #   2. Dedup — respect `asked_conflicts`; if the deterministic path
+            #      already probed this conflict key this call, do NOT owe another.
+            #   3. Once-in-flight — do not clobber an already-owed probe with a
+            #      later distinct finding (first owed wins; the loser re-derives
+            #      from the deterministic detector on a later duration/role turn).
+            #   4. NEVER block the turn — a plain assignment, no await.
+            if (
+                phone.phone_conflict_gate_enabled()
+                and not owed_conflict_probe["value"]
+            ):
+                conflict_key = phone.phone_conflict_key(verdict.conflict)
+                if conflict_key not in asked_conflicts:
+                    owed_conflict_probe["value"] = True
+                    owed_conflict_probe["conflict"] = dict(verdict.conflict)
+                    _log.info(
+                        "unknown_event", error_type="phone_coverage_conflict",
+                        error_category="owed_conflict_probe_armed",
+                    )
 
     async def native_say(text: str) -> None:
         speech = session.say(text, allow_interruptions=True)
@@ -4380,10 +4468,16 @@ async def _run_native_phone_screening(
                 # observability snapshot (additive; never perturbs recovery).
                 call_metrics["watchdog_fired_count"] += 1
                 if empty_wait in done and generation_empty.is_set():
+                    # FIX C (2026-09-06): serialize BOTH the guard's rejection
+                    # reason and the reply phase so the empty-generation line
+                    # shows WHICH guard rule fired on WHICH phase. Both keys are
+                    # now allowlisted in observability; before this they were
+                    # silently dropped and the decision was invisible.
                     _log.warn(
                         "unknown_event", error_type="phone_speech_lifecycle",
                         error_category="generation_completed_empty",
                         rejection_reason=generation_empty_reason[0],
+                        phase=snapshot.get("phase"),
                     )
                 else:
                     _log.warn(
@@ -4608,6 +4702,11 @@ async def _run_native_phone_screening(
     # production path.
     setattr(agent, "_conflict_delivery", conflict_delivery)
     setattr(agent, "_asked_conflicts", asked_conflicts)
+    # FIX A test seam (2026-09-06): the owed-conflict-probe latch, so a test can
+    # arm it (as the async judge would) and prove the NEXT authored bot turn
+    # delivers the conflict probe unconditionally (no turn-delta gate). Not read
+    # on any production path.
+    setattr(agent, "_owed_conflict_probe", owed_conflict_probe)
     # F2 test seam (2026-09-06): the author-time LLM-probe arming closure, so a
     # test can drive it directly with a probe-shaped outgoing reply and prove it
     # arms `conflict_delivery` (and, via on_reply_delivered, `conflict_reply_

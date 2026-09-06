@@ -13,6 +13,7 @@ Every case in here is anchored to a defect OBSERVED on that call:
     finished screening `abandoned`.
 """
 
+import os
 import unittest
 from unittest.mock import patch
 
@@ -293,6 +294,257 @@ class TestConflictGuardSatisfiable(unittest.TestCase):
             "Interesting. What is your salary expectation?",
             phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT, allow_closing=False,
         ), "compensation_drift")
+
+
+class TestTurnStyleRider(unittest.TestCase):
+    """Benchmark-selected R1 per-turn style rider (2026-09-06): rides the
+    toolless planned instruction (question + wind-down invite), NEVER the
+    close — closes were 6/6 clean without it and must stay untouched."""
+
+    def test_rider_constant_is_the_exact_benchmarked_text(self):
+        self.assertIn("commas wherever a speaker would breathe",
+                      phone.PHONE_TURN_STYLE_RIDER)
+        self.assertIn("Always use contractions", phone.PHONE_TURN_STYLE_RIDER)
+        self.assertIn("Two to three short sentences", phone.PHONE_TURN_STYLE_RIDER)
+        self.assertTrue(phone.PHONE_TURN_STYLE_RIDER.startswith(" "))
+
+    def test_rider_rides_both_planned_instruction_branches_not_the_close(self):
+        # agent.py is read as text (this suite has no livekit/dotenv stubs).
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "agent.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        # both toolless planned-instruction branches carry the rider
+        self.assertEqual(src.count("phone.PHONE_TURN_STYLE_RIDER"), 2)
+        # the qna_done close instruction must NOT carry it (ship note 2)
+        close_region = src[src.find("qna_done"):src.find("qna_done") + 4000]
+        self.assertNotIn("PHONE_TURN_STYLE_RIDER", close_region)
+
+
+class TestObjectiveGuardQuestionActCeiling(unittest.TestCase):
+    """FIX B (2026-09-06, live DeepSeek call f4761967): the objective guard
+    rejected NATURAL two-part confirm/probe utterances into the flat canned line.
+    A phase-aware question-act ceiling (≤2 on name_confirm / resume_conflict, 1
+    everywhere else) lets valid phrasing pass while every OTHER protection —
+    instruction-echo, premature-closing, compensation-drift — stays intact."""
+
+    # A natural single-act confirm (ONE '?') already passed before FIX B.
+    ONE_ACT_CONFIRM = (
+        "I have Christo on file but you said Deepak — which should I use?"
+    )
+    # A natural confirm-PLUS-probe: TWO question acts, the shape DeepSeek writes
+    # on a name/résumé clarification turn. Rejected by the old one-act rule.
+    TWO_ACT_CONFIRM = (
+        "I have Christo on file — is that right? Or should I use Deepak?"
+    )
+    TWO_ACT_RESUME_PROBE = (
+        "The resume lists a trading role — did I read that right? "
+        "How does that square with the EdTech sales you described?"
+    )
+
+    def test_the_natural_two_act_confirm_trips_the_base_one_act_rule(self):
+        # Baseline: with the default ceiling (1) the two-act confirm is rejected.
+        self.assertEqual(phone.phone_generated_question_act_count(self.TWO_ACT_CONFIRM), 2)
+        self.assertEqual(phone.phone_generated_reply_rejection_reason(
+            self.TWO_ACT_CONFIRM,
+            phone.PHONE_NAME_CONFIRM_CLARIFICATION_TEXT, allow_closing=False,
+        ), "question_mark_count")
+
+    def test_two_act_confirm_passes_on_the_relaxed_phases(self):
+        # With the phase-aware ceiling (2) the same utterances now PASS.
+        for text in (self.TWO_ACT_CONFIRM, self.TWO_ACT_RESUME_PROBE):
+            with self.subTest(text[:32]):
+                self.assertIsNone(phone.phone_generated_reply_rejection_reason(
+                    text, phone.PHONE_NAME_CONFIRM_CLARIFICATION_TEXT,
+                    allow_closing=False,
+                    max_question_acts=phone.phone_objective_guard_max_questions_for_phase(
+                        "name_confirm"),
+                ))
+        self.assertIsNone(phone.phone_generated_reply_rejection_reason(
+            self.TWO_ACT_RESUME_PROBE,
+            phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT, allow_closing=False,
+            max_question_acts=phone.phone_objective_guard_max_questions_for_phase(
+                "resume_conflict"),
+        ))
+
+    def test_one_act_confirm_passes_on_every_phase(self):
+        # An ack + one question (ONE '?') was always fine — verify the guard
+        # counts question ACTS, not sentences, so a normal advance ack+question
+        # is never rejected.
+        for phase in ("screening", "name_confirm", "resume_conflict", "candidate_qna"):
+            with self.subTest(phase):
+                self.assertIsNone(phone.phone_generated_reply_rejection_reason(
+                    self.ONE_ACT_CONFIRM,
+                    phone.PHONE_NAME_CONFIRM_CLARIFICATION_TEXT, allow_closing=False,
+                    max_question_acts=phone.phone_objective_guard_max_questions_for_phase(phase),
+                ))
+
+    def test_ordinary_advance_turn_still_rejects_a_genuine_double_question(self):
+        # A NON-confirm phase keeps the one-act rule: a genuine double question on
+        # an ordinary QnA advance turn is still rejected.
+        double = "What is your notice period? And what CTC do you expect?"
+        self.assertEqual(phone.phone_generated_question_act_count(double), 2)
+        self.assertEqual(phone.phone_generated_reply_rejection_reason(
+            double, "Ask about availability.", allow_closing=False,
+            max_question_acts=phone.phone_objective_guard_max_questions_for_phase("screening"),
+        ), "question_mark_count")
+
+    def test_other_protections_survive_the_relaxation(self):
+        # The relaxed ceiling must NOT weaken any OTHER rejection reason. A
+        # two-act utterance that ALSO leaks a private instruction / drifts to
+        # compensation / closes prematurely is still rejected on a relaxed phase.
+        comp = ("What is your notice period? And what salary do you expect?")
+        self.assertEqual(phone.phone_generated_reply_rejection_reason(
+            comp, phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT,
+            allow_closing=False, max_question_acts=2,
+        ), "compensation_drift")
+        closing = "Is that right? Thanks so much, goodbye and take care."
+        self.assertEqual(phone.phone_generated_reply_rejection_reason(
+            closing, phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT,
+            allow_closing=False, max_question_acts=2,
+        ), "premature_closing")
+
+    def test_phase_helper_is_relaxed_only_for_confirm_phases(self):
+        self.assertEqual(phone.phone_objective_guard_max_questions_for_phase("name_confirm"), 2)
+        self.assertEqual(phone.phone_objective_guard_max_questions_for_phase("resume_conflict"), 2)
+        for phase in ("screening", "candidate_qna", "wind_down", "closing", None, 123):
+            with self.subTest(phase):
+                self.assertEqual(
+                    phone.phone_objective_guard_max_questions_for_phase(phase), 1)
+
+    def test_kill_switch_flips_behavior(self):
+        # PHONE_OBJECTIVE_GUARD_MAX_QUESTIONS=1 restores the strict one-act rule
+        # on every phase (per-phase kill switch); default (unset) is 2.
+        with patch.dict(phone.os.environ, {"PHONE_OBJECTIVE_GUARD_MAX_QUESTIONS": "1"}):
+            self.assertEqual(
+                phone.phone_objective_guard_max_questions_for_phase("name_confirm"), 1)
+            self.assertEqual(phone.phone_generated_reply_rejection_reason(
+                self.TWO_ACT_CONFIRM,
+                phone.PHONE_NAME_CONFIRM_CLARIFICATION_TEXT, allow_closing=False,
+                max_question_acts=phone.phone_objective_guard_max_questions_for_phase("name_confirm"),
+            ), "question_mark_count")
+        # Unset defaults to 2; out-of-range clamps to [1, 2].
+        with patch.dict(phone.os.environ, {}, clear=False):
+            phone.os.environ.pop("PHONE_OBJECTIVE_GUARD_MAX_QUESTIONS", None)
+            self.assertEqual(phone.phone_objective_guard_max_questions(), 2)
+        for raw, expected in (("1", 1), ("2", 2), ("5", 2), ("0", 1), ("junk", 2)):
+            with self.subTest(raw):
+                with patch.dict(phone.os.environ, {"PHONE_OBJECTIVE_GUARD_MAX_QUESTIONS": raw}):
+                    self.assertEqual(phone.phone_objective_guard_max_questions(), expected)
+
+    def test_guard_cannot_be_disabled_below_one_act(self):
+        # Even if a caller passes a bogus ceiling, the guard never accepts zero
+        # questions on a non-closing turn (it clamps to >= 1).
+        self.assertEqual(phone.phone_generated_reply_rejection_reason(
+            "Thanks, that is helpful context.",  # zero question acts
+            phone.PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT, allow_closing=False,
+            max_question_acts=0,
+        ), "question_mark_count")
+
+
+    def test_guard_flag_env_contract_declared_both_sides(self):
+        # Review finding #3: pin the two-sided env contract for
+        # PHONE_OBJECTIVE_GUARD_MAX_QUESTIONS (schema + .env.example) so a
+        # future edit cannot drop one side silently.
+        import json as _json
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        repo_root = os.path.dirname(os.path.dirname(here))
+        with open(os.path.join(repo_root, "config", "environment.schema.json"),
+                  encoding="utf-8") as fh:
+            schema = _json.load(fh)
+        self.assertIn(
+            "PHONE_OBJECTIVE_GUARD_MAX_QUESTIONS",
+            schema["components"]["voice-livekit"]["variables"],
+        )
+        with open(os.path.join(here, ".env.example"), encoding="utf-8") as fh:
+            self.assertIn("PHONE_OBJECTIVE_GUARD_MAX_QUESTIONS=", fh.read())
+
+
+class TestQnaDismissalDetector(unittest.TestCase):
+    """FIX D (2026-09-06, live tail): an EXPLICIT dismissal during the
+    questions-for-me phase must proceed to the closing goodbye instead of the bot
+    re-opening ("Do you have any questions…?"). The anchored `phone_qna_done`
+    misses a compound dismissal; `phone_qna_dismissal` catches it and fails
+    closed on any turn that also carries a question."""
+
+    # The EXACT live transcript utterance that re-opened the wind-down loop.
+    LIVE_DISMISSAL = (
+        "No follow up from me. You can just disconnect the call. Thank you."
+    )
+
+    def test_the_live_compound_dismissal_is_caught(self):
+        self.assertTrue(phone.phone_qna_dismissal(self.LIVE_DISMISSAL))
+        # It is NOT caught by the anchored done-detector (the middle clause).
+        self.assertFalse(phone.phone_qna_done(self.LIVE_DISMISSAL))
+
+    def test_explicit_dismissal_phrasings(self):
+        for text in (
+            "You can hang up the call, thanks.",
+            "Please disconnect the call.",
+            "No follow-ups from me.",
+            "We're good, you can end the call.",
+            "That's all from me, nothing from my side.",
+            "I'm all set, go ahead and drop the call.",
+        ):
+            with self.subTest(text):
+                self.assertTrue(phone.phone_qna_dismissal(text), text)
+
+    def test_a_real_question_is_never_swallowed(self):
+        # Fail-closed: any turn that also asks something must NOT be a dismissal.
+        for text in (
+            "Before we end the call, what are the work timings?",
+            "Can you disconnect after you tell me the salary range?",
+            "We're good — but what's the notice period expectation?",
+            "What happens next in the process?",
+        ):
+            with self.subTest(text):
+                self.assertFalse(phone.phone_qna_dismissal(text), text)
+
+    def test_non_dismissal_content_stays_in_qna(self):
+        for text in (
+            "I actually have another question about the team.",
+            "Tell me more about the role.",
+            "Hmm, let me think.",
+        ):
+            with self.subTest(text):
+                self.assertFalse(phone.phone_qna_dismissal(text), text)
+
+    def test_fails_closed_on_non_str_and_empty(self):
+        self.assertFalse(phone.phone_qna_dismissal(None))
+        self.assertFalse(phone.phone_qna_dismissal(""))
+        self.assertFalse(phone.phone_qna_dismissal("   "))
+
+
+    def test_review_repair_midutterance_question_fails_closed(self):
+        # Review finding #1: a question embedded mid-utterance without a '?'
+        # must fail closed (not close the call).
+        for text in (
+            "we're good on that topic, but one question about salary",
+            "I'm done, but how does the next round work",
+            "no follow up from me although what is the salary range",
+            "you can end the call after one more question",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(phone.phone_qna_dismissal(text))
+
+    def test_review_repair_im_good_prose_is_not_a_dismissal(self):
+        # Review finding #2: "good/done/set" mid-sentence is an ANSWER.
+        for text in (
+            "I'm good at closing deals",
+            "we are good on the CRM side and I also track follow-ups",
+            "I'm set on targets every quarter",
+        ):
+            with self.subTest(text=text):
+                self.assertFalse(phone.phone_qna_dismissal(text))
+
+    def test_review_repair_standalone_dismissals_still_fire(self):
+        for text in (
+            "No no we are good thank you",
+            "I'm good, thanks.",
+            "No follow up from me. You can just connect the call. Thank you.",
+            "we're all done!",
+        ):
+            with self.subTest(text=text):
+                self.assertTrue(phone.phone_qna_dismissal(text))
 
 
 class TestTtsFlushKnobLive(unittest.TestCase):

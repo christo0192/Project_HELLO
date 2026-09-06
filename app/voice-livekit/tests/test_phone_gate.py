@@ -5922,6 +5922,47 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
         await self._finish(hooks)
         self.assertIn("assessment.completed", client.event_types)
 
+    async def test_fixd_explicit_dismissal_closes_without_reopening(self):
+        # FIX D (2026-09-06): an EXPLICIT dismissal in the questions-phase goes
+        # straight to the closing goodbye — the bot must NOT re-open with "anything
+        # else you'd like to ask?".
+        agent, _, _, client, hooks = await self._enter_qna()
+        # The EXACT live utterance (STT misheard "disconnect" as "connect", so it
+        # did NOT trip the explicit end-call gate and fell through to re-open).
+        # FIX D catches the "no follow up" clause and routes to the close.
+        dismissal = "No follow up from me. You can just connect the call. Thank you."
+        self.assertFalse(phone.is_explicit_end_call_request(dismissal))
+        close_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            dismissal, types.SimpleNamespace(text_content=dismissal), close_ctx,
+        )
+        rendered = str(close_ctx.items).lower()
+        # The dismissal routed to the closing goodbye (same path as phone_qna_done)…
+        self.assertIn("say goodbye", rendered)
+        # …and did NOT re-open with an "anything else" invite.
+        self.assertNotIn("anything else", rendered)
+        await self._finish(hooks)
+        self.assertIn("assessment.completed", client.event_types)
+
+    async def test_fixd_a_real_late_question_is_still_answered_not_closed(self):
+        # FIX D fail-closed: a genuine late question that also signals wrapping up
+        # is NOT swallowed into a premature close — it is answered and Q&A
+        # continues (dismissal detector returns False when a question is present).
+        agent, _, _, client, hooks = await self._enter_qna()
+        question = "We're good on my side, but what are the work timings for this role?"
+        q_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            question, types.SimpleNamespace(text_content=question), q_ctx,
+        )
+        rendered = str(q_ctx.items).lower()
+        self.assertIn("anything else", rendered)
+        self.assertIn("do not say goodbye yet", rendered)
+        self.assertEqual(agent._closing_state_machine.state.value, "candidate_qna")
+        self.assertNotIn("assessment.completed", client.event_types)
+        hooks["task"].cancel()
+        await asyncio.gather(hooks["task"], return_exceptions=True)
+        hooks["log_patch"].stop()
+
     async def test_qna_hesitation_does_not_consume_a_round_or_arm_closing(self):
         agent, _, _, client, hooks = await self._enter_qna()
         with self.assertRaises(sys.modules["livekit.agents"].StopResponse):
@@ -8547,6 +8588,36 @@ class TestPhoneSpeechWatchdog(unittest.IsolatedAsyncioTestCase):
         hooks["close_event"].set()
         await hooks["drive_terminal"]()
 
+    async def test_empty_generation_log_serializes_rejection_reason_and_phase(self):
+        # FIX C (2026-09-06): the empty-generation watchdog line must carry BOTH
+        # the guard's rejection_reason AND the reply phase, so the guard's
+        # decision is visible on the next call. Before FIX C both keys were
+        # silently dropped by the observability allowlist.
+        agent, session, _, _, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+        )
+        with patch.object(agent_mod, "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 4.0):
+            await agent._on_reply_expected()
+            # The guard rejected the reply for the question-act rule; the reply
+            # phase is a résumé-conflict clarification turn.
+            agent._generation_phase = "resume_conflict"
+            hooks["latest_assistant"][0] = "Tell me about your recent role."
+            # Set the snapshot phase the watchdog captures for THIS generation.
+            agent._on_generation_empty("question_mark_count")
+            await asyncio.sleep(0.05)
+        empty = [
+            c for c in hooks["log"].warn.call_args_list
+            if c.kwargs.get("error_type") == "phone_speech_lifecycle"
+            and c.kwargs.get("error_category") == "generation_completed_empty"
+        ]
+        self.assertTrue(empty, "an empty-generation warn line must be emitted")
+        self.assertEqual(empty[-1].kwargs.get("rejection_reason"), "question_mark_count")
+        # `phase` is passed from the captured reply snapshot (a screening turn by
+        # default in this harness); the key must be present and serializable.
+        self.assertIn("phase", empty[-1].kwargs)
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
+
     async def test_superseded_watchdog_cannot_create_a_second_fallback(self):
         agent, session, _, _, hooks = await _make_native_coordinator(
             turn_mode="toolless",
@@ -8689,7 +8760,13 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
 
     async def _arm_via_async_judge(self, hooks):
         """Drive one turn whose ASYNC coverage judge returns a conflict; wait
-        until the bounded re-pursuit is armed on conflict_reply_pending."""
+        until the OWED CONFLICT PROBE is armed (FIX A, 2026-09-06).
+
+        The async judge no longer arms `conflict_reply_pending` with a fragile
+        turn-delta freshness stamp (that fired 0/3 live because the judge
+        finishes ~2s late and STT fragmentation inflates the turn counter).
+        It now sets ONE logical owed-probe latch consumed by the NEXT authored
+        bot turn."""
         agent = hooks["agent"]
         with patch.object(
             phone, "judge_phone_coverage", new_callable=AsyncMock,
@@ -8700,69 +8777,127 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
             await self._turn(hooks, "I have done EdTech sales for two years.",
                              assistant_text="Tell me about your recent role.")
             armed = await self._drain(
-                lambda: agent._conflict_reply_pending.get("value") is True
+                lambda: agent._owed_conflict_probe.get("value") is True
             )
-        self.assertTrue(armed, "async judge conflict should arm a re-pursuit")
+        self.assertTrue(armed, "async judge conflict should owe a probe")
 
-    async def test_async_conflict_then_deflection_fires_specific_repursuit(self):
+    async def test_async_conflict_then_next_turn_delivers_the_probe(self):
+        # FIX A: an async-detected conflict is DELIVERED as an inline probe on the
+        # NEXT authored bot turn — naming the SPECIFIC resume_fact — instead of
+        # the planned question. This is the whole point: the old arm fired 0/3.
         agent, _, _, _, hooks = await self._coordinator()
         await self._arm_via_async_judge(hooks)
-        # The IMMEDIATE next candidate turn deflects -> the deterministic
-        # re-assertion fires, naming the SPECIFIC resume_fact (not a capitulation).
-        ctx = await self._turn(hooks, self.DEFLECTION)
+        ctx = await self._turn(hooks, "Anyway, my notice period is one month.",
+                               assistant_text="What is your notice period?")
+        injected = str(ctx.items)
+        # The owed probe was delivered: the conflict finding rides as private
+        # context and the model is told to ask the clarifying question this turn.
+        self.assertIn(self.ASYNC_CONFLICT["resume_fact"], injected)
+        self.assertIn("for your context only", injected.lower())
+        self.assertIn("in your own", injected.lower())
+        # The planned notice-period question is NOT asked this turn (the probe
+        # replaces it for one turn — same as the deterministic clarification).
+        self.assertNotIn("notice period", injected.lower())
+        # The latch is consumed and the finding recorded so it cannot double-probe.
+        self.assertFalse(agent._owed_conflict_probe.get("value"))
+        self.assertIn(
+            phone.phone_conflict_key(self.ASYNC_CONFLICT), agent._asked_conflicts,
+        )
+        # Delivered log emitted.
+        categories = [
+            c.kwargs.get("error_category") for c in hooks["log"].info.call_args_list
+            if c.kwargs.get("error_type") == "phone_coverage_conflict"
+        ]
+        self.assertIn("owed_conflict_probe_delivered", categories)
+        await self._close(hooks)
+
+    async def test_owed_probe_survives_stt_fragmentation_of_the_next_turn(self):
+        # FIX A survival property: the owed probe is NOT keyed on `native_turn_seq`
+        # deltas, so a next answer STT-fragmented into several finals (each
+        # bumping the raw counter) still delivers the probe. Simulate several
+        # elapsed logical turns before the probe can be delivered; the OLD
+        # armed_turn>1 freshness bound would have dropped it stale.
+        agent, _, _, _, hooks = await self._coordinator()
+        await self._arm_via_async_judge(hooks)
+        # Fast-forward the logical turn counter far past any freshness window.
+        agent._native_turn_seq[0] += 5
+        ctx = await self._turn(hooks, "Sure, one month.",
+                               assistant_text="What is your notice period?")
         injected = str(ctx.items)
         self.assertIn(self.ASYNC_CONFLICT["resume_fact"], injected)
-        self.assertIn("explain in ONE plain, warm sentence", injected)
-        self.assertIn("Never accuse", injected)
-        self.assertTrue(agent._conflict_reply_pending.get("repursued"))
+        self.assertFalse(agent._owed_conflict_probe.get("value"))
         await self._close(hooks)
 
-    async def test_async_conflict_dropped_when_candidate_moved_on(self):
+    async def test_owed_probe_kill_switch_off_restores_old_behavior(self):
+        # FIX A kill switch reuses `phone_conflict_gate_enabled()`: with the gate
+        # OFF the async judge owes NO probe (assessment-only, log + expire) — the
+        # pre-fix behavior. The next turn asks the plan question, not the probe.
         agent, _, _, _, hooks = await self._coordinator()
-        await self._arm_via_async_judge(hooks)
-        # The candidate moves on: two intervening turns elapse before any turn
-        # reaches the conflict-consume branch. Force the pending flag to persist
-        # across the intervening turns to prove the FRESHNESS bound (not just the
-        # normal single-turn consumption) drops the stale probe.
-        agent._conflict_reply_pending["value"] = True
-        await self._turn(hooks, "My notice period is one month.",
-                         assistant_text="What is your notice period?")
-        agent._conflict_reply_pending["value"] = True
-        ctx = await self._turn(hooks, self.DEFLECTION,
-                               assistant_text="What compensation do you expect?")
-        injected = str(ctx.items)
-        # No stale conflict probe fired; the re-pursuit never fired.
-        self.assertNotIn(self.ASYNC_CONFLICT["resume_fact"], injected)
-        self.assertFalse(agent._conflict_reply_pending.get("repursued"))
-        await self._close(hooks)
-
-    async def test_async_repursuit_fires_at_most_once_per_call(self):
-        agent, _, _, _, hooks = await self._coordinator()
-        await self._arm_via_async_judge(hooks)
-        # First deflection consumes the ONE permitted re-pursuit.
-        await self._turn(hooks, self.DEFLECTION)
-        self.assertTrue(agent._conflict_reply_pending.get("repursued"))
-        # A second async conflict must NOT re-arm (repursued latch); even if it
-        # somehow set the flag, the re-pursuit cannot fire twice.
-        await self._arm_via_async_judge_expect_no_rearm(hooks)
-        agent._conflict_reply_pending["value"] = True
-        ctx = await self._turn(hooks, self.DEFLECTION)
+        with patch.dict(os.environ, {"PHONE_CONFLICT_GATE": "off"}):
+            with patch.object(
+                phone, "judge_phone_coverage", new_callable=AsyncMock,
+                return_value=phone.PhoneCoverageVerdict(
+                    False, dict(self.ASYNC_CONFLICT), "model",
+                ),
+            ):
+                await self._turn(hooks, "I have done EdTech sales for two years.",
+                                 assistant_text="Tell me about your recent role.")
+                # Give the background task time; it must NOT owe a probe.
+                await asyncio.sleep(0.05)
+            self.assertFalse(agent._owed_conflict_probe.get("value"))
+            ctx = await self._turn(hooks, "One month.",
+                                   assistant_text="What is your notice period?")
         self.assertNotIn(self.ASYNC_CONFLICT["resume_fact"], str(ctx.items))
         await self._close(hooks)
 
-    async def _arm_via_async_judge_expect_no_rearm(self, hooks):
-        agent = hooks["agent"]
+    async def test_owed_probe_respects_asked_conflicts_dedup(self):
+        # FIX A dedup: if the DETERMINISTIC path already asked this conflict key
+        # this call, the owed probe is a no-op (it does not re-probe the same
+        # finding). Pre-seed asked_conflicts with the key, then owe + attempt to
+        # deliver.
+        agent, _, _, _, hooks = await self._coordinator()
+        await self._arm_via_async_judge(hooks)
+        agent._asked_conflicts.add(phone.phone_conflict_key(self.ASYNC_CONFLICT))
+        ctx = await self._turn(hooks, "One month.",
+                               assistant_text="What is your notice period?")
+        # No re-probe of the already-asked finding; the latch is still cleared.
+        self.assertNotIn(self.ASYNC_CONFLICT["resume_fact"], str(ctx.items))
+        self.assertFalse(agent._owed_conflict_probe.get("value"))
+        await self._close(hooks)
+
+    async def test_async_judge_owes_at_most_one_probe_in_flight(self):
+        # FIX A once-in-flight bound: while a probe is ALREADY owed, a second
+        # async conflict verdict does NOT clobber it (first owed wins). Pre-owe a
+        # probe, then run the judge for a NON-conflicting answer whose verdict
+        # nonetheless carries a distinct conflict; the guard leaves the owed probe
+        # intact because `value` is still True (no intervening authored turn
+        # consumed it in this drive — the owed probe is set directly).
+        agent, _, _, _, hooks = await self._coordinator()
+        first = dict(self.ASYNC_CONFLICT)
+        agent._owed_conflict_probe.update({"value": True, "conflict": dict(first)})
+        other = {
+            "resume_fact": "A totally different finding",
+            "spoken_claim": "A different claim",
+        }
+        # Drive the background judge WITHOUT letting the authoring turn consume
+        # the owed probe: seed a fresh deterministic conflict on the SAME turn so
+        # `judge_instruction` is non-None (the owed-probe consumer only runs when
+        # judge_instruction is None), leaving the owed latch untouched while the
+        # async judge for this turn runs and sees value already True.
         with patch.object(
             phone, "judge_phone_coverage", new_callable=AsyncMock,
-            return_value=phone.PhoneCoverageVerdict(
-                False, dict(self.ASYNC_CONFLICT), "model",
-            ),
+            return_value=phone.PhoneCoverageVerdict(False, dict(other), "model"),
         ):
-            await self._turn(hooks, "Another answer entirely.",
-                             assistant_text="What is your notice period?")
-            # Give the background task a chance to run; the repursued latch must
-            # keep it from re-arming a fresh conflict.
+            hooks["latest_assistant"][0] = "Tell me about your recent role."
+            with patch.object(
+                phone, "phone_deterministic_resume_conflict",
+                return_value={"resume_fact": "fresh", "spoken_claim": "fresh"},
+            ):
+                await self._turn(hooks, "I have done EdTech sales for two years.")
             await asyncio.sleep(0.05)
+        # The already-owed probe is unchanged (not clobbered by the newer one).
+        self.assertEqual(agent._owed_conflict_probe["conflict"], first)
+        await self._close(hooks)
 
     # ---- BUG 1: a coalesced STT fragment is ONE logical turn ----
 
@@ -8841,31 +8976,25 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
 
     # ---- BUG 2: armed_turn never leaks across arm paths ----
 
-    async def test_sync_arm_after_async_arm_is_not_dropped_stale(self):
+    async def test_sync_arm_is_never_dropped_stale(self):
+        # FIX A (2026-09-06, rewritten): the async judge no longer arms
+        # `conflict_reply_pending` at all (it owes a probe instead), so the old
+        # "async arm then sync arm" leak is impossible by construction. This
+        # retains the SYNC-path invariant it protected: a SYNChronous conflict arm
+        # (armed_turn=None, set by `on_reply_delivered` after a delivered probe)
+        # is NEVER subject to the freshness bound, even after many logical turns.
         agent, _, _, _, hooks = await self._coordinator()
-        # Async-arm at some turn, stamping armed_turn.
-        await self._arm_via_async_judge(hooks)
-        self.assertIsNotNone(agent._conflict_reply_pending.get("armed_turn"))
-        # Advance several turns so the async stamp is now STALE — but do NOT
-        # consume (simulate the async probe never having been the next turn).
-        await self._turn(hooks, "My notice period is one month.",
-                         assistant_text="What is your notice period?")
-        await self._turn(hooks, "I expect twenty LPA.",
-                         assistant_text="What compensation do you expect?")
-        # A fresh SYNChronous probe now arms via on_reply_delivered's path. Route
-        # it exactly as production does: arm conflict_delivery, deliver its seq.
+        hooks["assistant_delivery_complete"].set()
+        # Simulate many elapsed turns since detection.
+        agent._native_turn_seq[0] = 9
+        # Sync arm through the single writer's shape (armed_turn=None).
         agent._conflict_reply_pending.update(
-            {"value": False, "conflict": None, "repursued": False, "armed_turn": None},
+            {"value": True, "conflict": dict(self.ASYNC_CONFLICT),
+             "repursued": False, "armed_turn": None},
         )
-        agent._arm_conflict_delivery = getattr(agent, "_arm_conflict_delivery", None)
-        # Simulate the sync arm through the single writer (armed_turn=None) the
-        # way on_reply_delivered does, then a deflection consumes it.
-        agent._conflict_reply_pending.update(
-            {"value": True, "conflict": dict(self.ASYNC_CONFLICT), "armed_turn": None},
-        )
-        ctx = await self._turn(hooks, self.DEFLECTION)
-        # A sync arm (armed_turn=None) is NEVER dropped stale — the re-pursuit
-        # fires even though many turns elapsed since the earlier async arm.
+        ctx = await self._turn(hooks, self.DEFLECTION,
+                               assistant_text="What is your notice period?")
+        # armed_turn=None is never dropped stale — the re-pursuit fires.
         self.assertIn(self.ASYNC_CONFLICT["resume_fact"], str(ctx.items))
         self.assertTrue(agent._conflict_reply_pending.get("repursued"))
         await self._close(hooks)
@@ -8989,7 +9118,13 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(evidence)
         self.assertEqual(evidence["recent_role"]["period"], "2020-2026")
 
-    async def test_conflict_is_injected_exactly_once_for_the_same_discrepancy(self):
+    async def test_async_conflict_is_delivered_once_then_deduped(self):
+        # FIX A (2026-09-06, rewritten from the old
+        # `test_conflict_is_injected_exactly_once_for_the_same_discrepancy`, which
+        # asserted the BROKEN pre-fix behavior — the async conflict simply
+        # expired and was never delivered). Now the async judge owes a probe; the
+        # NEXT turn DELIVERS it exactly once (records the key), and a subsequent
+        # turn does NOT re-probe the same finding (asked_conflicts dedup).
         agent, _, state, client, hooks = await self._coordinator()
         state.resume_facts = {"recent_role": {"period": "2020-2026"}}
         conflict = {
@@ -9003,10 +9138,18 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         ):
             await self._turn(hooks, "I joined last month.")
             self.assertTrue(await self._drain(lambda: client.committed_keys == ["k1"]))
+            self.assertTrue(await self._drain(
+                lambda: agent._owed_conflict_probe.get("value") is True))
+            # Next turn DELIVERS the owed probe exactly once.
             hooks["latest_assistant"][0] = "What is your notice period?"
             second = await self._turn(hooks, "Thirty days.")
-        self.assertNotIn("Six years at Example Co", str(second.items))
-        self.assertEqual(len(agent._asked_conflicts), 0)
+        self.assertIn("Six years at Example Co", str(second.items))
+        self.assertEqual(len(agent._asked_conflicts), 1)
+        self.assertFalse(agent._owed_conflict_probe.get("value"))
+        # A further turn must NOT re-inject the same finding (deduped).
+        third = await self._turn(hooks, "I can start in two weeks.",
+                                 assistant_text="When can you start?")
+        self.assertNotIn("Six years at Example Co", str(third.items))
         await self._close(hooks)
 
     async def test_source_answer_gets_immediate_deterministic_resume_clarification(self):

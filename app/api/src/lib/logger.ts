@@ -61,6 +61,9 @@ export type AllowedMeta = Partial<{
   turn_index: number;
   speaker: string;
   duration_sec: number;
+  // Phone objective-guard observability (string) — FIX C (2026-09-06)
+  rejection_reason: string;
+  phase: string;
 }>;
 
 // ── Key→type maps ────────────────────────────────────────────────────────────
@@ -69,7 +72,7 @@ export type AllowedMeta = Partial<{
 const KEY_TYPE_STRING = new Set<string>([
   'shape', 'document_origin', 'violated_directive', 'effective_directive',
   'blocked_origin', 'error_category', 'error_type', 'method', 'model',
-  'schema', 'speaker',
+  'schema', 'speaker', 'rejection_reason', 'phase',
 ]);
 
 /** Keys whose runtime value must be a number. */
@@ -217,6 +220,8 @@ function validateStringField(key: string, raw: string): string | null {
     case 'error_type':
     case 'model':
     case 'schema':
+    case 'rejection_reason':
+    case 'phase':
       return SAFE_IDENT_RE.test(sanitised) ? sanitised : null;
     default:
       return sanitised;
