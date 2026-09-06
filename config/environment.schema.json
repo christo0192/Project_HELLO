@@ -198,6 +198,7 @@
         "PHONE_CONFLICT_MAX_REASKS": { "requiredInProduction": false, "secret": false },
         "PHONE_COVERAGE_JUDGE": { "requiredInProduction": false, "secret": false },
         "PHONE_COVERAGE_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
+        "PHONE_GOODBYE_LATCH": { "requiredInProduction": false, "secret": false },
         "PHONE_JUDGE_RETRIES": { "requiredInProduction": false, "secret": false },
         "PHONE_JUDGE_RETRY_BACKOFF_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_JUDGE_BREAKER_THRESHOLD": { "requiredInProduction": false, "secret": false },
