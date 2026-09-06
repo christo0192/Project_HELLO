@@ -3836,6 +3836,7 @@ async def _run_native_phone_screening(
                     "React briefly to one concrete detail from the candidate's answer. "
                     "Then ask naturally whether they have any questions about the role, "
                     "team, company, or process. Do not say goodbye yet."
+                    + phone.PHONE_TURN_STYLE_RIDER
                 )
                 planned_objective = "Ask whether the candidate has questions about the role, team, company, or process."
             else:
@@ -3844,6 +3845,7 @@ async def _run_native_phone_screening(
                     "Then ask one clear question that reaches this authorized objective "
                     "in your own words. Do not introduce another topic: "
                     + next_question.spoken_text
+                    + phone.PHONE_TURN_STYLE_RIDER
                 )
                 planned_objective = next_question.spoken_text
             turn_instruction = judge_instruction or planned_instruction

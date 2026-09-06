@@ -296,6 +296,30 @@ class TestConflictGuardSatisfiable(unittest.TestCase):
         ), "compensation_drift")
 
 
+class TestTurnStyleRider(unittest.TestCase):
+    """Benchmark-selected R1 per-turn style rider (2026-09-06): rides the
+    toolless planned instruction (question + wind-down invite), NEVER the
+    close — closes were 6/6 clean without it and must stay untouched."""
+
+    def test_rider_constant_is_the_exact_benchmarked_text(self):
+        self.assertIn("commas wherever a speaker would breathe",
+                      phone.PHONE_TURN_STYLE_RIDER)
+        self.assertIn("Always use contractions", phone.PHONE_TURN_STYLE_RIDER)
+        self.assertIn("Two to three short sentences", phone.PHONE_TURN_STYLE_RIDER)
+        self.assertTrue(phone.PHONE_TURN_STYLE_RIDER.startswith(" "))
+
+    def test_rider_rides_both_planned_instruction_branches_not_the_close(self):
+        # agent.py is read as text (this suite has no livekit/dotenv stubs).
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(here, "agent.py"), encoding="utf-8") as fh:
+            src = fh.read()
+        # both toolless planned-instruction branches carry the rider
+        self.assertEqual(src.count("phone.PHONE_TURN_STYLE_RIDER"), 2)
+        # the qna_done close instruction must NOT carry it (ship note 2)
+        close_region = src[src.find("qna_done"):src.find("qna_done") + 4000]
+        self.assertNotIn("PHONE_TURN_STYLE_RIDER", close_region)
+
+
 class TestObjectiveGuardQuestionActCeiling(unittest.TestCase):
     """FIX B (2026-09-06, live DeepSeek call f4761967): the objective guard
     rejected NATURAL two-part confirm/probe utterances into the flat canned line.

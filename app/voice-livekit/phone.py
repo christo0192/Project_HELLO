@@ -6924,6 +6924,23 @@ PHONE_COMPANY_REVIEW_RESPONSE = (
     "to assess public reviews or make claims about employee experiences, so the "
     "hiring team is the right source for specific questions about the workplace."
 )
+#: Per-turn STYLE RIDER (2026-09-06, benchmark-selected "R1"). The stable
+#: prefix is a proven dead end for style on DeepSeek V4-Flash at
+#: reasoning=none (two production-fidelity benchmark rounds: prefix persona/
+#: rule additions moved punctuation nowhere and broke close compliance), but
+#: the PER-TURN instruction is the seam with proven adherence. This exact
+#: text, appended to the toolless planned instruction, measured: punct/word
+#: 0.165 -> 0.176 (best production-context number in the series), interjection
+#: openers 50% -> 58%, median TTFT 0.631 -> 0.496s (tighter sentences stream
+#: sooner), 6/6 clean closes, +62 uncached tokens/turn. Deliberately NOT
+#: appended to the qna_done close instruction (closes are already clean).
+PHONE_TURN_STYLE_RIDER = (
+    " Say it like a real person on the phone: use commas wherever a speaker "
+    "would breathe, an em-dash for a quick aside — like this — and end every "
+    "sentence with . ! or ?. Always use contractions (that's, you've, I'm). "
+    "Two to three short sentences, no more."
+)
+
 PHONE_RESUME_CONFLICT_CLARIFICATION_TEXT = (
     "I noticed that your description of your recent experience differs from "
     "the resume information we received. Could you clarify the timeline and "
