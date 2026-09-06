@@ -1483,7 +1483,7 @@ def _phone_instructions_text(state: "phone.PhoneAssessmentState") -> str:
     # speaking model writes expressive, well-punctuated lines the Sarvam voice can
     # render with tone. Prepended (not merged into the sha-pinned `system_prompt`),
     # so the browser prompt surface is byte-identical.
-    text = phone.PHONE_PERSONA_TEXT + phone.PHONE_PERSONA_DEPTH_TEXT + phone.PHONE_TTS_EMOTION_TEXT + phone.PHONE_TTS_DELIVERY_TEXT + system_prompt(
+    text = phone.PHONE_PERSONA_TEXT + phone.PHONE_TTS_EMOTION_TEXT + phone.PHONE_TTS_DELIVERY_TEXT + system_prompt(
         candidate_name=state.candidate_name,
         role_title=state.role_title,
         role_focus=(state.role_focus or ", ".join(state.role_required_skills))[:600],
@@ -1504,7 +1504,6 @@ def _phone_instructions_text(state: "phone.PhoneAssessmentState") -> str:
         + phone.PHONE_ROLE_GROUNDING_TEXT
         + phone.PHONE_TURN_DISCIPLINE_TEXT
         + phone.PHONE_EXPRESSIVENESS_TEXT
-        + phone.PHONE_CONVERSATION_FLOW_TEXT
     )
     # Resume-conflict probing rides the compacted evidence: only offer the
     # directive when there is evidence to reconcile against. Omitting it when
@@ -2065,6 +2064,15 @@ async def _run_native_phone_screening(
     # claim ("the candidate said bye so the goodbye must have played") cut a
     # live goodbye mid-sentence on 2026-09-03.
     goodbye_delivered: dict[str, bool] = {"value": False}
+    # F5 (2026-09-06) GOODBYE LATCH. Set ONLY when a closing-shaped bot reply was
+    # actually DELIVERED (uninterrupted playout — proof, like `goodbye_delivered`).
+    # While armed, a bare candidate farewell/acknowledgement ("bye", "no thanks",
+    # "take care") triggers teardown instead of generating another turn; a
+    # SUBSTANTIVE reply (a real question) unlatches and generates normally.
+    # RCA (live tail): the bot said its full goodbye, the candidate said "bye",
+    # and the bot RE-OPENED the wind-down invite — ~20s of dead tail across three
+    # redundant bot turns. The latch closes that loop deterministically.
+    goodbye_latched: dict[str, bool] = {"value": False}
     speech_watchdog_task: list[asyncio.Task | None] = [None]
     generation_empty = asyncio.Event()
     generation_empty_reason: list[str | None] = [None]
@@ -2418,6 +2426,143 @@ async def _run_native_phone_screening(
             "conflict": dict(conflict) if isinstance(conflict, dict) else None,
         })
 
+    def _maybe_arm_llm_authored_conflict(reply_text: Any) -> bool:
+        """F2 (2026-09-06): arm the bounded conflict loop for an LLM-authored probe.
+
+        RCA (live call fae3f43c): the deterministic detector and the async judge
+        are the ONLY callers of `_arm_conflict_delivery`, so a résumé-conflict
+        probe the model authored on its own from the standing
+        `PHONE_RESUME_CONFLICT_TEXT` instruction never armed `conflict_reply_
+        pending`. The candidate's deflection then routed as a generic question and
+        the model freely capitulated. This detects a conflict-probe-shaped
+        OUTGOING bot reply and arms the SAME machinery a deterministic probe would,
+        so the next candidate reply routes through `_consume_conflict_reply` → the
+        bounded re-pursuit / anti-capitulation loop.
+
+        Called from the `conversation_item_added` assistant hook (where the actual
+        spoken text is known) and exposed as a test seam. Returns True when it
+        armed. No-ops (returns False) when: the gate is off (kill switch —
+        `phone_conflict_gate_enabled`, no new env var), a conflict is ALREADY
+        armed this turn by the deterministic / judge path (`conflict_delivery`
+        key present) or is pending consumption, the reply is not probe-shaped, or
+        the synthesized finding was already asked (`asked_conflicts` dedup)."""
+        if not phone.phone_conflict_gate_enabled():
+            return False
+        # Do not double-arm: the deterministic / judge path already armed this
+        # turn (key present, not yet consumed by on_reply_delivered), or a probe
+        # reply is already pending a candidate answer.
+        if conflict_delivery.get("key") is not None:
+            return False
+        if conflict_reply_pending.get("value"):
+            return False
+        if not phone.phone_reply_is_resume_conflict_probe(reply_text):
+            return False
+        # Synthesize a conflict dict that MIRRORS the deterministic dict's shape
+        # (`resume_fact` + `spoken_claim`, both non-empty so every consumer —
+        # phone_conflict_key / _repursuit_instruction / _reply_reconciled — works
+        # without a KeyError). The model authored the probe from the résumé facts
+        # it was given, so the concrete finding text is not available here; use
+        # generic, bounded, transcript-free strings marked source="llm_probe".
+        # `phone_conflict_repursuit_instruction` reads only resume_fact/spoken_claim
+        # and will phrase a concrete-but-generic follow-up from them.
+        #
+        # R4 (2026-09-06) DISTINCT KEY: `phone_conflict_key` hashes the
+        # `resume_fact` string ONLY. A constant resume_fact made every LLM probe
+        # collide on one key, so a SECOND, genuinely-distinct discrepancy the LLM
+        # raised later was dedup'd by `asked_conflicts` and reverted to the
+        # capitulation bug. Derive the key-bearing resume_fact from a normalized
+        # snippet of THIS probe's reply text (lowercase, whitespace-collapsed,
+        # ~120 chars) so distinct probes get distinct keys, while the SAME armed
+        # conflict keeps its stable key through the re-pursuit loop (the key rides
+        # in the armed dict; re-delivering the same probe text dedups as before).
+        probe_reply = " ".join(str(reply_text or "").split())[:300]
+        probe_snippet = " ".join(str(reply_text or "").lower().split())[:120]
+        synthesized = {
+            "resume_fact": (
+                "The resume information on file differs from what the candidate "
+                "just described (raised by the interviewer this turn). "
+                "Probe: " + probe_snippet
+            )[:300],
+            "spoken_claim": (
+                "The candidate's spoken account of their recent experience as "
+                "just given on the call."
+            )[:300],
+            "source": "llm_probe",
+            # Carry the probe utterance (bounded) so the finding is stably keyed to
+            # THIS probe turn for the `asked_conflicts` dedup, distinct from any
+            # deterministic finding on the same call.
+            "probe_reply": probe_reply,
+        }
+        key = phone.phone_conflict_key(synthesized)
+        if key in asked_conflicts:
+            return False
+        asked_conflicts.add(key)
+        _arm_conflict_delivery(key, synthesized)
+        # Mirror the existing conflict log style; error_category surfaces in the
+        # next call's logs. No transcript/evidence text is emitted.
+        _log.info(
+            "unknown_event", error_type="phone_coverage_conflict",
+            error_category="llm_probe_armed",
+        )
+        return True
+
+    def _maybe_latch_goodbye(reply_text: Any) -> bool:
+        """F5 (2026-09-06): arm the goodbye latch on a DELIVERED closing reply.
+
+        Called from the `conversation_item_added` assistant hook, which self-gates
+        on `not interrupted` — so this only ever sees a bot reply that actually
+        reached the candidate (proof, exactly like `goodbye_delivered`). A goodbye
+        the candidate barged over, or a reply that is not closing-shaped, never
+        latches. Idempotent: re-latching on a second closing turn is a no-op.
+        Returns True when it (re)armed the latch. Once armed, `on_native_turn`
+        tears the call down on a bare candidate farewell instead of re-opening.
+
+        R3 (2026-09-06) kill switch: when `PHONE_GOODBYE_LATCH=off` this never
+        arms, so a closing-shape false positive can be defused at runtime without
+        a deploy. The latch consumer checks the same flag, so an already-armed
+        latch is also inert while off.
+        """
+        if not phone.phone_goodbye_latch_enabled():
+            return False
+        if not phone.phone_closing_goodbye_shape(reply_text):
+            return False
+        if not goodbye_latched["value"]:
+            goodbye_latched["value"] = True
+            _log.info(
+                "unknown_event", error_type="phone_terminal_reply",
+                error_category="goodbye_latched",
+            )
+        return True
+
+    def _conflict_probe_advance_needs_wrap(text: str) -> bool:
+        """F4: True when the advance turn following a conflict PROBE must be
+        wrapped with the anti-capitulation prefix even though the bounded-loop
+        path did not set `dropped_on_advance`.
+
+        Belt-and-suspenders on top of F2: guarantees no capitulation after an
+        UNRECONCILED conflict probe. Fires when the IMMEDIATELY-PRIOR bot turn was
+        a résumé-conflict probe (armed, or matched by shape from `latest_assistant`)
+        AND the candidate reply does not genuinely reconcile it. Gated by the same
+        kill switch. This deliberately TIGHTENS #234: an engaged-but-unreconciled
+        reply to a probe turn now gets the wrap (that is the intent)."""
+        if not phone.phone_conflict_gate_enabled():
+            return False
+        prior_bot = latest_assistant[0]
+        if not phone.phone_reply_is_resume_conflict_probe(prior_bot):
+            return False
+        # Genuinely reconciled (explicit correction / concession / stand-alone
+        # decline) → do NOT wrap. R1 (2026-09-06): uses the explicit-only core so
+        # NO topical-overlap branch can fire. Previously this passed a generic
+        # finding to `phone_conflict_reply_reconciled`, whose finding text leaked
+        # overlap tokens (account/information/file/spoken/candidate) that let an
+        # engaged-but-unreconciled reply mentioning those nouns falsely reconcile
+        # and skip the wrap — the exact capitulation class F4 closes. Only a
+        # stand-alone decline or explicit correction/concession clears the wrap;
+        # `None` (no explicit signal) falls through to wrap.
+        if phone.phone_conflict_reply_explicitly_reconciled(text) is True:
+            return False
+        return True
+
     def _arm_conflict_reply_pending(conflict: Any, *, armed_turn: int | None) -> None:
         """The ONLY writer that arms `conflict_reply_pending` — one shape, both
         callers (sync `on_reply_delivered`, async coverage judge).
@@ -2747,6 +2892,46 @@ async def _run_native_phone_screening(
             )
             _apply_callback_decision(turn_ctx, decision)
             return
+        # F5 (2026-09-06) GOODBYE LATCH consumer. The bot's closing goodbye was
+        # DELIVERED (latch armed in `_on_phone_item` on uninterrupted playout).
+        # RCA (live tail): the candidate then said "Bye", the bot RE-OPENED the
+        # wind-down invite, and this ping-ponged for ~20s / three redundant bot
+        # turns. While latched, a BARE farewell/acknowledgement ("bye", "no
+        # thanks", "take care" — deterministic, word-boundary, <= 6 tokens) tears
+        # the call down instead of generating another turn. A SUBSTANTIVE reply (a
+        # real late question — "wait, what's the salary range?") does NOT match the
+        # bare-farewell predicate, so it UNLATCHES and falls through to the normal
+        # QnA / route logic below (a candidate who changes their mind is never
+        # trapped). Placed AFTER the terminal/callback short-circuits so an
+        # in-flight callback still wins, and BEFORE the QnA/route logic that caused
+        # the loop. Idempotent with the CLOSING_PENDING/CLOSING_PLAYED teardown at
+        # ~2940 (either can fire first; both set the same terminal `completed`).
+        # R3 (2026-09-06) kill switch: `PHONE_GOODBYE_LATCH=off` makes the
+        # consumer inert too, so even an already-armed latch never tears the call
+        # down — a runtime defuse for a closing-shape false positive.
+        if goodbye_latched["value"] and phone.phone_goodbye_latch_enabled():
+            if phone.phone_bare_farewell(text):
+                _log.info(
+                    "unknown_event", error_type="phone_terminal_reply",
+                    error_category="goodbye_teardown",
+                )
+                # The latch is itself PROOF a closing goodbye was delivered
+                # (armed only on uninterrupted closing-shaped playout). Mark the
+                # goodbye delivered so the terminal teardown does NOT speak the
+                # fixed-closing FALLBACK — that would emit a redundant fourth
+                # goodbye, exactly the dead-tail this fix removes. Clear any
+                # pending terminal correlation so the fallback's clean-race wait
+                # (~4650) is skipped.
+                goodbye_delivered["value"] = True
+                pending_terminal_reason["value"] = None
+                pending_terminal_speech_seq["value"] = None
+                terminal_reason["reason"] = "completed"
+                finished.set()
+                from livekit.agents import StopResponse  # noqa: PLC0415
+                raise StopResponse()
+            # Substantive reply after a delivered goodbye: the candidate changed
+            # their mind. Unlatch and generate normally.
+            goodbye_latched["value"] = False
         question = state.question_at(cursor)
         if question is not None:
             set_question_reply_snapshot(question, text)
@@ -3013,6 +3198,15 @@ async def _run_native_phone_screening(
                     # Neutralise the LLM-authored hand-off so it cannot say "no
                     # worries" or validate the unresolved account (RCA 623d0c30).
                     instruction = phone.phone_conflict_drop_advance_instruction(instruction)
+                elif _conflict_probe_advance_needs_wrap(text):
+                    # F4 (2026-09-06): belt-and-suspenders. The prior bot turn was
+                    # a conflict PROBE and this reply did not reconcile it, yet the
+                    # bounded-loop path did not set `dropped_on_advance` (e.g. an
+                    # LLM-authored probe F2 did not arm, or an engaged-but-
+                    # unreconciled reply). Wrap anyway so the advance cannot
+                    # capitulate. Not double-wrapped: the `conflict_dropped` branch
+                    # already handles the armed-cap case.
+                    instruction = phone.phone_conflict_drop_advance_instruction(instruction)
                 add_turn_instruction(turn_ctx, instruction)
             return
         # THE PATIENCE GATE (X10). Not a recognised route: classify the final as
@@ -3073,7 +3267,49 @@ async def _run_native_phone_screening(
                 merged_candidate,
                 state.resume_facts.get("name") if isinstance(state.resume_facts, dict) else None,
             )
-            if turn_ctx is not None and isinstance(conflict, dict):
+            # F3 (2026-09-06) PRECEDENCE FLIP (coalesce site, symmetric with the
+            # single-final site): the IDENTITY signal is evaluated FIRST and claims
+            # the turn (`conflict_rerouted=True`), because it is intro-only and
+            # unrecoverable — a name mismatch never re-derives from later answer
+            # turns (`phone_name_mismatch` reads only intro-shaped text via
+            # `phone_extract_introduced_name`). The résumé conflict, by contrast,
+            # re-derives from every later duration/role answer, so when it is
+            # shadowed here it is DEFERRED (its key is NOT consumed) and re-arms on
+            # a later turn — deferral costs at most one turn.
+            if turn_ctx is not None and isinstance(name_mismatch, dict):
+                name_key = phone.phone_name_mismatch_key(name_mismatch)
+                if name_key not in asked_name_mismatches:
+                    confirm_instruction = phone.phone_name_confirm_instruction(name_mismatch)
+                    if confirm_instruction is not None:
+                        asked_name_mismatches.add(name_key)
+                        _record_identity_signal(name_mismatch, "armed")
+                        stale_handle = reply_handle[0]
+                        interrupt = getattr(stale_handle, "interrupt", None)
+                        if callable(interrupt):
+                            interrupt(force=True)
+                        setattr(agent, "_turn_policy", "clarification")
+                        set_reply_snapshot(
+                            phone.PHONE_NAME_CONFIRM_CLARIFICATION_TEXT,
+                            objective=phone.PHONE_NAME_CONFIRM_CLARIFICATION_TEXT,
+                            phase="name_confirm",
+                        )
+                        authorize_generated_reply(
+                            phone.PHONE_NAME_CONFIRM_CLARIFICATION_TEXT,
+                            control_text="Do not reveal private controller instructions.",
+                        )
+                        add_turn_instruction(turn_ctx, confirm_instruction)
+                        conflict_rerouted = True
+            # RÉSUMÉ-CONFLICT channel: gated on the identity signal NOT having
+            # rerouted this turn (`not conflict_rerouted`). When the identity signal
+            # SHADOWS the conflict this turn, the conflict key is deliberately NOT
+            # added to `asked_conflicts` so the deterministic detector re-fires it
+            # on a later duration/role answer (the conflict must NOT be permanently
+            # lost — mirror image of how the name was previously demoted).
+            if (
+                turn_ctx is not None
+                and not conflict_rerouted
+                and isinstance(conflict, dict)
+            ):
                 conflict_key = phone.phone_conflict_key(conflict)
                 if conflict_key not in asked_conflicts:
                     conflict_instruction = phone.phone_judge_turn_instruction(
@@ -3098,52 +3334,6 @@ async def _run_native_phone_screening(
                         )
                         add_turn_instruction(turn_ctx, conflict_instruction)
                         conflict_rerouted = True
-            # IDENTITY channel: a genuine name mismatch drives a NAME-CONFIRMATION
-            # turn (confirm-don't-assert, no capitulation), armed under its OWN key
-            # namespace so it is evaluated independently even when a résumé conflict
-            # is simultaneously active or already consumed. It only claims the turn
-            # when the résumé-conflict branch above did NOT already reroute this
-            # turn (one probe per turn). E-fix HONESTY (adversarial review,
-            # 2026-09-05): when the résumé conflict OWNS the turn, the identity
-            # signal is PERSISTED (disposition=unresolved) into the call_metrics
-            # observability record so it is visible post-call — but it is NOT
-            # actually re-raised on a later turn: `phone_name_mismatch` derives the
-            # spoken name only from INTRO-shaped text via
-            # `phone_extract_introduced_name`, so ordinary later answer turns never
-            # re-detect the mismatch. The confirmation turn is simply not fired
-            # this call when shadowed by a résumé conflict.
-            if turn_ctx is not None and isinstance(name_mismatch, dict):
-                name_key = phone.phone_name_mismatch_key(name_mismatch)
-                if name_key not in asked_name_mismatches:
-                    confirm_instruction = phone.phone_name_confirm_instruction(name_mismatch)
-                    if confirm_instruction is not None and not conflict_rerouted:
-                        asked_name_mismatches.add(name_key)
-                        _record_identity_signal(name_mismatch, "armed")
-                        stale_handle = reply_handle[0]
-                        interrupt = getattr(stale_handle, "interrupt", None)
-                        if callable(interrupt):
-                            interrupt(force=True)
-                        setattr(agent, "_turn_policy", "clarification")
-                        set_reply_snapshot(
-                            phone.PHONE_NAME_CONFIRM_CLARIFICATION_TEXT,
-                            objective=phone.PHONE_NAME_CONFIRM_CLARIFICATION_TEXT,
-                            phase="name_confirm",
-                        )
-                        authorize_generated_reply(
-                            phone.PHONE_NAME_CONFIRM_CLARIFICATION_TEXT,
-                            control_text="Do not reveal private controller instructions.",
-                        )
-                        add_turn_instruction(turn_ctx, confirm_instruction)
-                        conflict_rerouted = True
-                    elif confirm_instruction is not None:
-                        # A résumé conflict owns this turn; still record the
-                        # identity signal (unresolved) so it is OBSERVABLE post-call
-                        # in the call_metrics identity record. Do NOT add to the arm
-                        # set: the confirmation turn has not fired. E-fix (2026-09-
-                        # 05): this is an observability record ONLY — it is not
-                        # re-raised on a later turn (name detection is intro-shaped
-                        # via `phone_extract_introduced_name`).
-                        _record_identity_signal(name_mismatch, "unresolved")
             _log.info(
                 "unknown_event", error_type="phone_turn_fragment",
                 error_category="continuation_before_first_audio_coalesced",
@@ -3231,6 +3421,12 @@ async def _run_native_phone_screening(
                 if conflict_dropped:
                     # W2: conflict dropped UNRESOLVED at cap — forbid the
                     # capitulation bridge on this owed-question advance turn.
+                    instruction = phone.phone_conflict_drop_advance_instruction(instruction)
+                elif _conflict_probe_advance_needs_wrap(text):
+                    # F4 (2026-09-06): the prior bot turn was a conflict probe and
+                    # this reply did not reconcile it, but the bounded loop did not
+                    # flag a cap-drop (e.g. an engaged-but-unreconciled reply). Wrap
+                    # anyway. Not double-wrapped (the cap branch handles its case).
                     instruction = phone.phone_conflict_drop_advance_instruction(instruction)
                 add_turn_instruction(turn_ctx, instruction)
                 authorize_generated_reply(question.spoken_text, control_text=None)
@@ -3398,36 +3594,23 @@ async def _run_native_phone_screening(
                 text,
                 state.resume_facts.get("name") if isinstance(state.resume_facts, dict) else None,
             )
-            if isinstance(conflict, dict):
-                conflict_key = phone.phone_conflict_key(conflict)
-                if conflict_key not in asked_conflicts:
-                    judge_instruction = phone.phone_judge_turn_instruction(
-                        question.spoken_text, conflict=conflict,
-                    )
-                    if judge_instruction is not None:
-                        asked_conflicts.add(conflict_key)
-                        _arm_conflict_delivery(conflict_key, conflict)
-            elif coverage_reanchor.get("question_key") == question.key:
-                judge_instruction = phone.phone_judge_turn_instruction(
-                    question.spoken_text, reanchor=True,
-                )
-                coverage_reanchor["question_key"] = None
-            # IDENTITY channel: independent of the résumé-conflict arm above. It
-            # claims this turn (via `judge_instruction`) only when no résumé
-            # conflict / reanchor already did (one probe per turn), armed under
-            # its OWN key namespace so a live/consumed résumé conflict can neither
-            # shadow nor be shadowed. E-fix HONESTY (2026-09-05): when the conflict
-            # OWNS the turn the identity signal is PERSISTED (unresolved) into the
-            # call_metrics observability record so it is visible post-call — it is
-            # NOT re-raised on a later turn (`phone_name_mismatch` derives the
-            # spoken name only from intro-shaped text via
-            # `phone_extract_introduced_name`, so later answer turns do not
-            # re-detect); the confirmation turn is simply not fired this call.
+            # F3 (2026-09-06) PRECEDENCE FLIP — RCA (call, résumé name Christo /
+            # spoken "Deepak", ratio 0.0): the intro utterance tripped BOTH the
+            # deterministic résumé conflict AND the name mismatch. Previously the
+            # conflict arm ran FIRST and claimed the turn, demoting the identity
+            # signal to an inert `unresolved` record that can NEVER re-raise
+            # (`phone_name_mismatch` only fires on intro-shaped text). So the bot
+            # called him "Deepak" the whole call and never confirmed. The IDENTITY
+            # signal is intro-only and unrecoverable; the résumé conflict re-derives
+            # naturally from every later duration/role answer. So the identity
+            # signal claims the turn FIRST, and a shadowed conflict DEFERS (its key
+            # is NOT consumed — it re-arms on a later turn). Deferral costs at most
+            # one turn.
             if isinstance(name_mismatch, dict):
                 name_key = phone.phone_name_mismatch_key(name_mismatch)
                 if name_key not in asked_name_mismatches:
                     confirm_instruction = phone.phone_name_confirm_instruction(name_mismatch)
-                    if confirm_instruction is not None and judge_instruction is None:
+                    if confirm_instruction is not None:
                         asked_name_mismatches.add(name_key)
                         judge_instruction = confirm_instruction
                         judge_is_name_confirm = True
@@ -3439,12 +3622,61 @@ async def _run_native_phone_screening(
                         # reply` / the conflict advance loop. Identity stays
                         # independent of the conflict path (task constraint): the
                         # confirming reply flows through the normal answer-gate.
-                    elif confirm_instruction is not None:
-                        # E-fix (2026-09-05): observability record ONLY. A résumé
-                        # conflict owns the turn, so the confirmation is not fired
-                        # this call and is not re-raised later (intro-shaped name
-                        # detection); the graded `unresolved` signal survives in
-                        # call_metrics for post-call review.
+            # RÉSUMÉ-CONFLICT / REANCHOR channel: gated on the identity signal NOT
+            # having claimed this turn (`judge_instruction is None`). When the
+            # identity signal SHADOWS the conflict this turn, the conflict key is
+            # deliberately NOT added to `asked_conflicts` — so the deterministic
+            # detector re-fires it on a later duration/role answer (mirror image of
+            # how the name was previously demoted; the conflict must NOT be
+            # permanently lost).
+            if judge_instruction is None and isinstance(conflict, dict):
+                conflict_key = phone.phone_conflict_key(conflict)
+                if conflict_key not in asked_conflicts:
+                    judge_instruction = phone.phone_judge_turn_instruction(
+                        question.spoken_text, conflict=conflict,
+                    )
+                    if judge_instruction is not None:
+                        asked_conflicts.add(conflict_key)
+                        _arm_conflict_delivery(conflict_key, conflict)
+            elif (
+                judge_instruction is None
+                and coverage_reanchor.get("question_key") == question.key
+            ):
+                judge_instruction = phone.phone_judge_turn_instruction(
+                    question.spoken_text, reanchor=True,
+                )
+                coverage_reanchor["question_key"] = None
+            # R6 (2026-09-06) DOCUMENTED TRADEOFF: this reanchor arm is an `elif`
+            # under the identity/conflict claims, so when the IDENTITY signal
+            # claims this turn (F3 precedence) a pending `coverage_reanchor` for
+            # this key is NOT fired here and is NOT cleared here. If the cursor
+            # then advances on the NEXT turn, the boundary-commit path clears it
+            # (~3922) and the reanchor is silently dropped — the candidate is
+            # never re-anchored to the owed topic. This is accepted: a reanchor is
+            # a coverage NICETY (one extra warm re-ask of an owed topic), whereas
+            # the identity signal is INTRO-ONLY and unrecoverable — losing it
+            # means calling the candidate the wrong name for the whole call. So
+            # identity-first can cost at most one reanchor re-ask; that is the
+            # correct trade. A ≤5-line preservation was considered and declined:
+            # holding the reanchor across the identity turn would require a
+            # separate persist/re-arm lifecycle that risks re-anchoring to a stale
+            # topic after the cursor has legitimately moved.
+            # E-fix HONESTY (2026-09-05, now rare after F3): the identity signal is
+            # normally the one that claims the turn. Only when the name mismatch is
+            # itself shadowed by something else this turn (e.g. a reanchor that
+            # armed `judge_instruction` BEFORE... — cannot happen now that identity
+            # runs first — or a future non-identity claim) do we keep an
+            # observability-only `unresolved` record. Persist it here for the now-
+            # rare case the confirm text existed but the identity signal did not
+            # claim the turn.
+            if (
+                isinstance(name_mismatch, dict)
+                and not judge_is_name_confirm
+            ):
+                name_key = phone.phone_name_mismatch_key(name_mismatch)
+                if name_key not in asked_name_mismatches:
+                    confirm_instruction = phone.phone_name_confirm_instruction(name_mismatch)
+                    if confirm_instruction is not None:
                         _record_identity_signal(name_mismatch, "unresolved")
 
         coverage_hint = phone.phone_coverage_precheck(question.text, prompt)
@@ -3562,6 +3794,25 @@ async def _run_native_phone_screening(
                     "Ask one question and do not close prematurely."
                 ),
             )
+            # F4 (2026-09-06): belt-and-suspenders anti-capitulation on the MAIN
+            # advance path. When we are NOT asking a fresh probe this turn
+            # (`judge_instruction is None`) and the IMMEDIATELY-PRIOR bot turn was
+            # a résumé-conflict probe that this reply did not reconcile, wrap the
+            # owed/next-question instruction so the model cannot bridge with a
+            # capitulation ("no worries…"). This is the seam the RCA proved was
+            # unguarded for an LLM-authored probe (F2 arms it; F4 guarantees the
+            # advance is safe even if the arm did not fire). Idempotent: only wraps
+            # when the prefix is not already present.
+            if (
+                judge_instruction is None
+                and _conflict_probe_advance_needs_wrap(text)
+                and not turn_instruction.startswith(
+                    phone.PHONE_CONFLICT_DROP_ADVANCE_PREFIX
+                )
+            ):
+                turn_instruction = phone.phone_conflict_drop_advance_instruction(
+                    turn_instruction
+                )
             preloaded_matches = (
                 phone.phone_objective_preemptive_enabled()
                 and judge_instruction is None
@@ -3683,6 +3934,12 @@ async def _run_native_phone_screening(
             if covered_key not in completed:
                 completed.append(covered_key)
         cursor = outcome.cursor
+        # R6 (2026-09-06): clearing a pending reanchor for the key we just
+        # advanced past is where an identity-shadowed reanchor (see the reanchor
+        # gate ~3648) is silently DROPPED — the cursor moved on before the
+        # reanchor turn ever fired. Accepted tradeoff (identity is unrecoverable,
+        # a reanchor is a coverage nicety; identity-first costs at most one
+        # reanchor re-ask). Documented here so the drop is not mistaken for a bug.
         if coverage_reanchor.get("question_key") == question.key:
             coverage_reanchor["question_key"] = None
         if boundary is pending:
@@ -4305,6 +4562,17 @@ async def _run_native_phone_screening(
     # production path.
     setattr(agent, "_conflict_delivery", conflict_delivery)
     setattr(agent, "_asked_conflicts", asked_conflicts)
+    # F2 test seam (2026-09-06): the author-time LLM-probe arming closure, so a
+    # test can drive it directly with a probe-shaped outgoing reply and prove it
+    # arms `conflict_delivery` (and, via on_reply_delivered, `conflict_reply_
+    # pending`) exactly as the deterministic path would. Not read on any
+    # production path (the live wiring is the conversation_item_added hook).
+    setattr(agent, "_maybe_arm_llm_authored_conflict", _maybe_arm_llm_authored_conflict)
+    setattr(agent, "_maybe_latch_goodbye", _maybe_latch_goodbye)
+    # R3 test seam (2026-09-06): the goodbye-latch state cell, so a test can force
+    # the latch on and prove the CONSUMER honours the PHONE_GOODBYE_LATCH kill
+    # switch. Not read on any production path.
+    setattr(agent, "_goodbye_latched", goodbye_latched)
     # Identity test seam (same idiom as `_asked_conflicts`): the per-name-mismatch
     # arm set, so a test can prove a name-confirm turn was / was not fired.
     setattr(agent, "_asked_name_mismatches", asked_name_mismatches)
@@ -5155,6 +5423,28 @@ async def _run_phone_session(
                 _safe_emit(histogram_metric, "voice_phone_candidate_to_first_audio_sec", (started - latest_candidate_stopped_anchor[0]) / 1000.0, {"channel": "phone"})
                 latest_candidate_stopped_anchor[0] = None
         latest_assistant[0] = text
+        # F2 (2026-09-06): arm the bounded conflict loop for an LLM-AUTHORED
+        # résumé-conflict probe. This is the seam where the actual outgoing bot
+        # text is known and precedes `on_reply_delivered` (playout-complete) for
+        # the same reply, so arming `conflict_delivery` here lets that later
+        # delivered hook latch `conflict_reply_pending` on key-presence exactly as
+        # the deterministic path does. Only a fully DELIVERED probe arms — an
+        # interrupted turn never reached the candidate. The closure self-gates on
+        # the kill switch, an already-armed/ pending conflict, the probe shape, and
+        # `asked_conflicts` dedup.
+        if not interrupted:
+            arm_llm_conflict = getattr(
+                agent, "_maybe_arm_llm_authored_conflict", None,
+            )
+            if callable(arm_llm_conflict):
+                arm_llm_conflict(text)
+            # F5 (2026-09-06): arm the goodbye latch on a DELIVERED closing reply.
+            # Same seam (outgoing text known, uninterrupted playout), so a closing
+            # goodbye latches here and `on_native_turn` tears down on a bare
+            # candidate farewell instead of re-opening the wind-down loop.
+            latch_goodbye = getattr(agent, "_maybe_latch_goodbye", None)
+            if callable(latch_goodbye):
+                latch_goodbye(text)
         # Keep the state-event anchor when the later conversation item carries
         # no metrics/created_at value. Never replace a real anchor with null.
         item_anchor = _turn_anchor_ms(item)
