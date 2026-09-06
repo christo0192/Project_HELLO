@@ -54,7 +54,7 @@ Two existing mechanisms disagree on posture: API egress attaches at `call.answer
 
 Full spec in `docs/design/phone-cost-and-scale-plan.md` §2 (copy into PR B). Summary:
 - Two invariants: never admit without a ready worker; never leave a machine started without a session (reaper backstop).
-- `voice_worker_leases` table; warm pool of stopped machines; readiness handshake (worker→API on LiveKit registration); Fly Machines API client (`https://api.fly.io/v1`, start/stop/wait/list, `FLY_API_TOKEN` secret).
+- `voice_worker_leases` table; warm pool of stopped machines; readiness handshake (worker→API on LiveKit registration); Fly Machines API client (`https://api.machines.dev/v1` — *corrected per RCA 2026-09-06; `api.fly.io/v1` does not serve the Machines API* — start/stop/wait/list, `FLY_API_TOKEN` org-scoped secret).
 - Phone: gate `admit_phone_attempt` on a ready claimed machine. Browser: **B-i** name the worker (`project-hello-voice`) + explicit dispatch + "Preparing…" gate.
 - Pure scale-to-zero. Deploy-gate reconciliation (start→verify registration→deploy→stop) + CI posture check. 1 session/worker (`max_jobs=1`), perf-1x pin retained.
 - Flag-gated so merge changes nothing until owner enables.
