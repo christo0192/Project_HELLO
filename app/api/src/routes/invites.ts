@@ -88,6 +88,12 @@ const hashToken = hashInviteToken;
 
 const STABLE_EXPIRY_MSG = 'invite_token_invalid_or_expired';
 
+// Same-bearer re-exchange grace window (RCA 2026-09-06): how long after the
+// consume CAS the SAME invite token may be re-presented and get the join
+// re-issued instead of a 404. Matches the candidate access grant TTL (5 min) —
+// past it, a consumed invite is terminal exactly as before.
+const CONSUMED_REEXCHANGE_WINDOW_MS = 5 * 60_000;
+
 // ── Interivewer auth context ─────────────────────────────────────────
 
 export interface InviteRequestContext {
@@ -366,8 +372,33 @@ invitesRouter.post(
         return res.status(404).json({ error: STABLE_EXPIRY_MSG });
       }
 
-      // Check not consumed and not revoked (NULL checks)
-      if (invite.consumed_at !== null || invite.revoked_at !== null) {
+      // Revoked is always terminal.
+      if (invite.revoked_at !== null) {
+        return res.status(404).json({ error: STABLE_EXPIRY_MSG });
+      }
+
+      // ── Same-bearer re-exchange grace (RCA 2026-09-06) ──────────────────
+      // The on-demand worker gate can hold an exchange open for tens of
+      // seconds while a machine cold-boots. A refresh / second click during
+      // that wait races the winner at the consume CAS: the winner's 200 (with
+      // the only token) lands on the request the candidate ABANDONED, the
+      // survivor loses the CAS and 404s, and the one-time invite is burned —
+      // the interview becomes permanently unjoinable while the dispatched
+      // agent sits alone in the room (observed live: grant minted 18:07:35,
+      // candidate never joined). Presenting the SAME secret bearer token again
+      // within a short window is the same authorization, not a replay by a
+      // third party — so re-issue idempotently instead of 404ing. Wrong
+      // tokens, revoked invites, expiry, and stale (post-window) retries are
+      // unchanged 404s, and the consent gate below still runs on this path.
+      // The winner already ensured a ready worker AND dispatched it (consume
+      // happens after dispatch), so re-issue does NOT re-enter the worker
+      // gate — no duplicate dispatch, no second machine.
+      const consumedAtMs = invite.consumed_at === null
+        ? null
+        : new Date(invite.consumed_at).getTime();
+      const isGraceReExchange = consumedAtMs !== null
+        && Date.now() - consumedAtMs <= CONSUMED_REEXCHANGE_WINDOW_MS;
+      if (consumedAtMs !== null && !isGraceReExchange) {
         return res.status(404).json({ error: STABLE_EXPIRY_MSG });
       }
 
@@ -407,7 +438,7 @@ invitesRouter.post(
         // Already provisioned (the recruiter `/start` path, or a concurrent
         // exchange that got here first). Untouched — no provider call.
         roomName = session.external_call_id as string;
-      } else if (sessionStatus === 'created') {
+      } else if (sessionStatus === 'created' && !isGraceReExchange) {
         // ── Step 2b: JIT room provisioning ────────────────────────────────
         // Ashby materialization creates exactly one `created` session with a
         // NULL external_call_id and no room. Provision it now — AFTER the
@@ -467,7 +498,7 @@ invitesRouter.post(
       // null gate.
       const browserGate = resolveBrowserGate();
       let gatedMachineId: string | undefined;
-      if (browserGate !== null) {
+      if (browserGate !== null && !isGraceReExchange) {
         const ready = await browserGate.ensureReadyWorker({ sessionId: session.id as string });
         if (ready.status === 'ready') {
           gatedMachineId = ready.machineId;
@@ -490,19 +521,39 @@ invitesRouter.post(
       }
 
       // Step 3: Atomic CAS — update consumed_at where consumed_at IS NULL.
-      const nowIso = new Date().toISOString();
-      const { data: consumed, error: consumeErr } = await supabase
-        .from('candidate_invites')
-        .update({ consumed_at: nowIso })
-        .eq('id', invite.id)
-        .is('consumed_at', null)
-        .is('revoked_at', null)
-        .gt('expires_at', nowIso)
-        .select('id');
+      // Skipped on a grace re-exchange: the invite is already consumed and the
+      // same bearer is being re-issued idempotently (see the grace block above).
+      if (!isGraceReExchange) {
+        const nowIso = new Date().toISOString();
+        const { data: consumed, error: consumeErr } = await supabase
+          .from('candidate_invites')
+          .update({ consumed_at: nowIso })
+          .eq('id', invite.id)
+          .is('consumed_at', null)
+          .is('revoked_at', null)
+          .gt('expires_at', nowIso)
+          .select('id');
 
-      if (consumeErr || !consumed || consumed.length === 0) {
-        // CAS failed — another request consumed this token first
-        return res.status(404).json({ error: STABLE_EXPIRY_MSG });
+        if (consumeErr || !consumed || consumed.length === 0) {
+          // CAS failed — a CONCURRENT request just consumed this token (both
+          // raced inside the same exchange window). That racer is the same
+          // bearer: fall through to re-issue (grace semantics) instead of
+          // burning the interview with a 404, but ONLY when the consume is
+          // fresh — re-read and bound by the same window.
+          const { data: fresh } = await supabase
+            .from('candidate_invites')
+            .select('consumed_at, revoked_at')
+            .eq('id', invite.id)
+            .single();
+          const freshConsumedMs = fresh?.consumed_at
+            ? new Date(fresh.consumed_at as string).getTime() : null;
+          const raceGrace = !!fresh && fresh.revoked_at === null
+            && freshConsumedMs !== null
+            && Date.now() - freshConsumedMs <= CONSUMED_REEXCHANGE_WINDOW_MS;
+          if (!raceGrace) {
+            return res.status(404).json({ error: STABLE_EXPIRY_MSG });
+          }
+        }
       }
 
       // Step 4: Create short-lived opaque candidate access grant (candidate_access_grants)
