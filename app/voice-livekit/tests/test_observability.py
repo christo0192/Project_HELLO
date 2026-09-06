@@ -371,6 +371,40 @@ class TestAdversarialRedaction(unittest.TestCase):
         for k in self.SEEDS:
             self.assertNotIn(k, parsed)
 
+    def test_fix_c_rejection_reason_and_phase_are_allowlisted(self) -> None:
+        # FIX C (2026-09-06): the objective-guard rejection_reason and reply phase
+        # must survive the allowlist (validated as identifier-shaped, like
+        # error_category) so `generation_completed_empty` shows the guard's
+        # decision. Before FIX C both keys were silently dropped.
+        lines: list[str] = []
+        log = make_logger(lines)
+        log.warn(
+            "unknown_event",
+            error_type="phone_speech_lifecycle",
+            error_category="generation_completed_empty",
+            rejection_reason="question_mark_count",
+            phase="resume_conflict",
+        )
+        parsed = json.loads(lines[0])
+        self.assertEqual(parsed.get("rejection_reason"), "question_mark_count")
+        self.assertEqual(parsed.get("phase"), "resume_conflict")
+
+    def test_fix_c_non_identifier_values_are_still_dropped(self) -> None:
+        # The identifier format check must still fire: a value with a space or an
+        # injected control sequence is dropped rather than partially emitted.
+        lines: list[str] = []
+        log = make_logger(lines)
+        log.warn(
+            "unknown_event",
+            error_type="phone_speech_lifecycle",
+            error_category="generation_completed_empty",
+            rejection_reason="not a valid identifier with spaces",
+            phase="also not valid; injected",
+        )
+        parsed = json.loads(lines[0])
+        self.assertNotIn("rejection_reason", parsed)
+        self.assertNotIn("phase", parsed)
+
 
 # =============================================================================
 #  MATRIX VALUE-SAFE REDACTION — EVERY SEED IN EVERY STRING FIELD
