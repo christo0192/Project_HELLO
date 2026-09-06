@@ -22,7 +22,8 @@ import { useState } from 'react';
 import { Navigate, useLocation } from 'react-router-dom';
 import { useAuth, ALLOWED_EMAIL_DOMAIN, isCompanyEmail } from '../lib/auth';
 import { rememberReturnTo, sanitizeReturnTo } from '../lib/return-to';
-import { Button, Card, Input, Label } from '../components/ui';
+import { Brand } from '../components/navigation';
+import { Button, Field, GlassPanel, InlineNotice, TextField } from '../components/design';
 
 function getSsoProviders(): string[] {
   const raw = import.meta.env.VITE_SSO_PROVIDERS;
@@ -119,107 +120,104 @@ export function LoginPage() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-gray-50 px-4">
-      <Card className="w-full max-w-sm p-8">
-        <div className="mb-6 text-center">
-          <div className="mx-auto mb-3 flex h-12 w-12 items-center justify-center overflow-hidden rounded-lg bg-white shadow-sm ring-1 ring-gray-200">
-            {/* Brand logo on a neutral plate — never CSS-inverted. */}
-            <img
-              src="/ik-logo.png"
-              alt="InterviewKickstart logo"
-              className="h-10 w-10 object-contain"
-            />
+    <div className="app-ground flex min-h-screen items-center justify-center px-4 py-10">
+      <main className="w-full max-w-sm">
+        <GlassPanel level="strong" padding="lg">
+          <div className="flex justify-center">
+            <Brand />
           </div>
-          <h1 className="text-lg font-semibold text-gray-900">HELLO</h1>
-          <p className="mt-0.5 text-sm text-gray-500">
-            Talent Workspace &amp; Mission Control
-          </p>
-          <p className="mt-2 text-xs text-gray-400">Recruiter sign-in</p>
-        </div>
+          <h1 className="mt-6 text-[15px] font-semibold tracking-[-0.01em] text-ink">
+            Recruiter sign-in
+          </h1>
 
-        <form onSubmit={handleSubmit} noValidate className="space-y-4">
-          <div>
-            <Label htmlFor="login-email">Email</Label>
-            <Input
-              id="login-email"
-              type="email"
-              autoComplete="email"
-              placeholder={`you@${ALLOWED_EMAIL_DOMAIN}`}
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              disabled={submitting}
-              required
-              aria-required="true"
-              aria-describedby={companyHint ? 'company-email-hint' : undefined}
-            />
-            {companyHint && (
-              <p id="company-email-hint" className="mt-1 text-xs text-gray-500">
-                {companyHint}
-              </p>
+          <form onSubmit={handleSubmit} noValidate className="mt-4 space-y-4">
+            <Field id="login-email" label="Email" hint={companyHint}>
+              {({ id, describedBy }) => (
+                <TextField
+                  id={id}
+                  type="email"
+                  autoComplete="email"
+                  placeholder={`you@${ALLOWED_EMAIL_DOMAIN}`}
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  disabled={submitting}
+                  required
+                  aria-required="true"
+                  aria-describedby={describedBy}
+                />
+              )}
+            </Field>
+
+            <Field id="login-password" label="Password">
+              {({ id }) => (
+                <TextField
+                  id={id}
+                  type="password"
+                  autoComplete="current-password"
+                  placeholder="Enter your password"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  disabled={submitting}
+                  required
+                  aria-required="true"
+                />
+              )}
+            </Field>
+
+            {error && (
+              <InlineNotice tone="danger" role="alert">
+                {error}
+              </InlineNotice>
             )}
-          </div>
-
-          <div>
-            <Label htmlFor="login-password">Password</Label>
-            <Input
-              id="login-password"
-              type="password"
-              autoComplete="current-password"
-              placeholder="Enter your password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              disabled={submitting}
-              required
-              aria-required="true"
-            />
-          </div>
-
-          {error && (
-            <p className="text-sm text-red-600" role="alert">
-              {error}
-            </p>
-          )}
-
-          <Button type="submit" className="w-full" loading={submitting || isLoading}>
-            {submitting ? 'Signing in…' : 'Sign in'}
-          </Button>
-        </form>
-
-        {ssoProviders.includes('google') && (
-          <>
-            <div className="my-4 flex items-center gap-3">
-              <span className="h-px flex-1 bg-gray-200" />
-              <span className="text-xs text-gray-400">or continue with</span>
-              <span className="h-px flex-1 bg-gray-200" />
-            </div>
 
             <Button
-              type="button"
-              variant="secondary"
-              onClick={() => handleSSO('google')}
-              disabled={submitting}
-              className="w-full border-gray-300 font-medium text-gray-700"
+              type="submit"
+              variant="primary"
+              size="lg"
+              className="w-full"
+              loading={submitting || isLoading}
             >
-              <GoogleMark />
-              <span>Continue with Google Workspace</span>
+              {submitting ? 'Signing in…' : 'Sign in'}
             </Button>
-          </>
-        )}
+          </form>
 
-        <div className="mt-6 space-y-1.5 text-center">
-          <p className="text-xs text-gray-400">
-            Company-only access: sign in with your{' '}
-            <span className="font-medium text-gray-500">
-              @{ALLOWED_EMAIL_DOMAIN}
-            </span>{' '}
-            Google Workspace account.
-          </p>
-          <p className="text-xs text-gray-400">
-            Access is limited to authorised team members. Sign-up is not
-            available.
-          </p>
-        </div>
-      </Card>
+          {ssoProviders.includes('google') && (
+            <>
+              <div className="my-5 flex items-center gap-3">
+                <span aria-hidden="true" className="h-px flex-1 bg-ink/[0.08]" />
+                <span className="text-xs text-ink-tertiary">or continue with</span>
+                <span aria-hidden="true" className="h-px flex-1 bg-ink/[0.08]" />
+              </div>
+
+              <Button
+                type="button"
+                variant="secondary"
+                size="lg"
+                onClick={() => handleSSO('google')}
+                disabled={submitting}
+                className="w-full"
+              >
+                <GoogleMark />
+                <span>Continue with Google Workspace</span>
+              </Button>
+            </>
+          )}
+
+          <div className="mt-6 space-y-1.5 text-center">
+            <p className="text-xs leading-5 text-ink-tertiary">
+              Company-only access: sign in with your{' '}
+              <span className="font-medium text-ink-secondary">
+                @{ALLOWED_EMAIL_DOMAIN}
+              </span>{' '}
+              Google Workspace account.
+            </p>
+            <p className="text-xs leading-5 text-ink-tertiary">
+              Access is limited to authorised team members. Sign-up is not
+              available.
+            </p>
+          </div>
+        </GlassPanel>
+      </main>
     </div>
   );
 }

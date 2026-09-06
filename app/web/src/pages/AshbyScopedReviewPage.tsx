@@ -85,7 +85,7 @@ export function AshbyScopedReviewPage() {
 
   if (error) {
     return (
-      <CandidateShell as="main" width="narrow">
+      <CandidateShell as="main" width="narrow" className="app-ground">
         <CandidateErrorState
           message={error}
           onRetry={error === UNAVAILABLE ? undefined : load}
@@ -95,7 +95,7 @@ export function AshbyScopedReviewPage() {
   }
   if (!detail) {
     return (
-      <CandidateShell as="main" width="narrow">
+      <CandidateShell as="main" width="narrow" className="app-ground">
         <CandidateLoadingState label="Loading review…" />
       </CandidateShell>
     );
@@ -109,7 +109,7 @@ export function AshbyScopedReviewPage() {
     // candidate palette is applied by CandidateShell, exactly as on the
     // normal candidate pages — styling grants no privilege and adds no
     // affordance; this route stays navigation-free and action-free.
-    <CandidateShell as="main" width="wide">
+    <CandidateShell as="main" width="wide" className="app-ground">
       <CandidateHeader
         divided
         eyebrow="Candidate review"
@@ -168,7 +168,7 @@ function ScopedOverviewTab({
   applicationLinkId: string;
 }) {
   return (
-    <div className="grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-3">
+    <div className="fade-up-stagger grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-3">
       <CandidateProfileCard candidate={candidate} />
       <div className="space-y-4 sm:space-y-6 lg:col-span-2">
         {/* The SAME read-only card as the normal Overview, read through the
@@ -209,10 +209,15 @@ function ScopedNotesCard({ applicationLinkId }: { applicationLinkId: string }) {
 
   return (
     <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
-      <h2 id={headingId} className="mb-3 text-sm font-semibold text-ink">
+      <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
         Notes
       </h2>
-      <NotesList notes={notes} error={err} />
+      <p className="mb-3 mt-0.5 text-[13px] text-ink-tertiary">
+        Recruiter notes, appended in order.
+      </p>
+      <SurfaceCard level="sunken" className="p-3">
+        <NotesList notes={notes} error={err} />
+      </SurfaceCard>
     </SurfaceCard>
   );
 }

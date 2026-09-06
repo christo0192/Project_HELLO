@@ -37,3 +37,7 @@ export { InlineNotice, EmptyPanel, ErrorPanel, LoadingPanel } from './Notice';
 export type { InlineNoticeProps, EmptyPanelProps, ErrorPanelProps, NoticeTone } from './Notice';
 export { RevealGroup, RevealItem, PageTransition } from './Reveal';
 export type { RevealGroupProps, RevealItemProps } from './Reveal';
+export { RollingNumber } from './RollingNumber';
+export type { RollingNumberProps } from './RollingNumber';
+export { ProportionBar } from './ProportionBar';
+export type { ProportionBarProps, ProportionTone } from './ProportionBar';

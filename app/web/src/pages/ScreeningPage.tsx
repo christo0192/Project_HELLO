@@ -5,10 +5,16 @@ import type { Assessment, TranscriptLine } from "../types";
 import { Scorecard } from "../components/Scorecard";
 import {
   Button,
-  ErrorState,
-  LoadingState,
-  Spinner,
-} from "../components/ui";
+  buttonClass,
+  ErrorPanel,
+  GlassPanel,
+  InlineNotice,
+  LoadingPanel,
+  PageHeader,
+  ScrollArea,
+  SectionHeader,
+  TextArea,
+} from "../components/design";
 
 export function ScreeningPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
@@ -40,10 +46,10 @@ export function ScreeningPage() {
   useEffect(load, [load]);
 
   useEffect(() => {
-    scrollRef.current?.scrollTo({
-      top: scrollRef.current.scrollHeight,
-      behavior: "smooth",
-    });
+    // `ScrollArea` owns the scrolling element; the ref sits on its content
+    // wrapper, so the scroll region is that wrapper's parent.
+    const region = scrollRef.current?.parentElement;
+    region?.scrollTo({ top: region.scrollHeight, behavior: "smooth" });
   }, [transcript, thinking, assessment]);
 
   async function sendTurn() {
@@ -79,58 +85,52 @@ export function ScreeningPage() {
     }
   }
 
-  if (loadError) return <ErrorState message={loadError} onRetry={load} />;
-  if (transcript === null) return <LoadingState label="Loading session…" />;
+  if (loadError) return <ErrorPanel message={loadError} onRetry={load} />;
+  if (transcript === null) return <LoadingPanel label="Loading session…" />;
 
   return (
-    <div>
-      <Link
-        to="/candidates"
-        className="mb-4 inline-flex items-center gap-1 text-sm text-gray-500 hover:text-gray-900"
-      >
-        ← Back to candidates
-      </Link>
+    <div className="space-y-6">
+      <PageHeader
+        eyebrow="Screening console"
+        title="Screening with Gopu"
+        description={
+          done
+            ? "Screening complete"
+            : "Type the candidate's spoken answers and send"
+        }
+        actions={
+          <Link to="/candidates" className={buttonClass("secondary", "sm")}>
+            ← Back to candidates
+          </Link>
+        }
+      />
 
-      <div className="mb-4 flex items-center gap-3">
-        <div className="flex h-9 w-9 items-center justify-center rounded-full bg-accent-600 text-sm font-bold text-white">
-          M
-        </div>
-        <div>
-          <h1 className="text-lg font-semibold text-gray-900">
-            Screening with Gopu
-          </h1>
-          <p className="text-xs text-gray-400">
-            {done
-              ? "Screening complete"
-              : "Type the candidate's spoken answers and send"}
-          </p>
-        </div>
-      </div>
-
-      {/* Chat window */}
-      <div className="flex h-[60vh] flex-col overflow-hidden rounded-xl border border-gray-200 bg-white shadow-card">
-        <div ref={scrollRef} className="flex-1 space-y-4 overflow-y-auto p-5">
-          {transcript.length === 0 && !thinking && (
-            <p className="py-10 text-center text-sm text-gray-400">
-              Waiting for the conversation to begin…
-            </p>
-          )}
-          {transcript.map((line, i) => (
-            <Bubble key={i} speaker={line.speaker} text={line.text} />
-          ))}
-          {thinking && <TypingIndicator />}
-        </div>
+      {/* Conversation */}
+      <GlassPanel padding="none" className="overflow-hidden">
+        <ScrollArea maxHeight="60vh" label="Conversation" className="px-5">
+          <div ref={scrollRef} className="space-y-4">
+            {transcript.length === 0 && !thinking && (
+              <p className="py-10 text-center text-sm text-ink-tertiary">
+                Waiting for the conversation to begin…
+              </p>
+            )}
+            {transcript.map((line, i) => (
+              <Bubble key={i} speaker={line.speaker} text={line.text} />
+            ))}
+            {thinking && <TypingIndicator />}
+          </div>
+        </ScrollArea>
 
         {/* Composer */}
-        <div className="border-t border-gray-200 p-3">
+        <div className="border-t border-glass-ring p-3">
           {done ? (
-            <div className="flex items-center justify-center gap-2 py-2 text-sm font-medium text-emerald-600">
+            <div className="flex items-center justify-center gap-2 py-2 text-sm font-medium text-success-text">
               <CheckIcon className="h-4 w-4" />
               Screening complete
             </div>
           ) : (
             <div className="flex items-end gap-2">
-              <textarea
+              <TextArea
                 value={draft}
                 onChange={(e) => setDraft(e.target.value)}
                 onKeyDown={onKeyDown}
@@ -138,9 +138,10 @@ export function ScreeningPage() {
                 disabled={thinking}
                 placeholder="Type the candidate's answer…"
                 aria-label="Candidate answer"
-                className="max-h-32 flex-1 resize-none rounded-lg border border-gray-300 px-3 py-2 text-sm focus:border-accent-500 focus:outline-none focus:ring-1 focus:ring-accent-500 disabled:bg-gray-50"
+                className="max-h-32 min-h-9 flex-1 resize-none py-2"
               />
               <Button
+                variant="primary"
                 onClick={sendTurn}
                 loading={thinking}
                 disabled={!draft.trim()}
@@ -150,20 +151,20 @@ export function ScreeningPage() {
             </div>
           )}
           {turnError && (
-            <p className="mt-2 text-sm text-red-600" role="alert">
+            <InlineNotice tone="danger" role="alert" className="mt-2">
               {turnError}
-            </p>
+            </InlineNotice>
           )}
         </div>
-      </div>
+      </GlassPanel>
 
       {done && assessment && (
-        <div className="mt-6">
-          <h2 className="mb-3 text-sm font-semibold text-gray-900">
-            Assessment
-          </h2>
-          <Scorecard assessment={assessment} />
-        </div>
+        <GlassPanel>
+          <SectionHeader title="Assessment" />
+          <div className="mt-4">
+            <Scorecard assessment={assessment} />
+          </div>
+        </GlassPanel>
       )}
     </div>
   );
@@ -173,16 +174,16 @@ function Bubble({ speaker, text }: TranscriptLine) {
   const isBot = speaker === "bot";
   return (
     <div className={`flex ${isBot ? "justify-start" : "justify-end"}`}>
-      <div className={`max-w-[78%] ${isBot ? "" : "text-right"}`}>
-        <p className="mb-1 px-1 text-[11px] font-medium text-gray-400">
+      <div className={`max-w-[70%] ${isBot ? "" : "text-right"}`}>
+        <p className="mb-1 px-1 text-[11px] font-medium text-ink-tertiary">
           {isBot ? "Gopu" : "Candidate"}
         </p>
         <div
-          className={`rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
+          className={
             isBot
-              ? "rounded-tl-sm bg-gray-100 text-gray-800"
-              : "rounded-tr-sm bg-accent-600 text-white"
-          }`}
+              ? "glass-sunken px-4 py-2.5 text-left text-sm leading-relaxed text-ink"
+              : "rounded-[18px] bg-info px-4 py-2.5 text-left text-sm leading-relaxed text-white"
+          }
         >
           {text}
         </div>
@@ -194,11 +195,27 @@ function Bubble({ speaker, text }: TranscriptLine) {
 function TypingIndicator() {
   return (
     <div className="flex justify-start">
-      <div className="max-w-[78%]">
-        <p className="mb-1 px-1 text-[11px] font-medium text-gray-400">Gopu</p>
-        <div className="flex items-center gap-2 rounded-2xl rounded-tl-sm bg-gray-100 px-4 py-3">
-          <Spinner className="h-4 w-4 text-gray-400" />
-          <span className="text-sm text-gray-500">Gopu is thinking…</span>
+      <div className="max-w-[70%]">
+        <p className="mb-1 px-1 text-[11px] font-medium text-ink-tertiary">
+          Gopu
+        </p>
+        <div
+          role="status"
+          className="glass-sunken flex items-center gap-1.5 px-4 py-3.5"
+        >
+          <span
+            aria-hidden="true"
+            className="h-1.5 w-1.5 animate-bounce rounded-full bg-ink-muted"
+          />
+          <span
+            aria-hidden="true"
+            className="h-1.5 w-1.5 animate-bounce rounded-full bg-ink-muted [animation-delay:150ms]"
+          />
+          <span
+            aria-hidden="true"
+            className="h-1.5 w-1.5 animate-bounce rounded-full bg-ink-muted [animation-delay:300ms]"
+          />
+          <span className="sr-only">Gopu is thinking…</span>
         </div>
       </div>
     </div>
@@ -207,7 +224,14 @@ function TypingIndicator() {
 
 function CheckIcon({ className }: { className?: string }) {
   return (
-    <svg className={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
+    <svg
+      className={className}
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2.5"
+      aria-hidden="true"
+    >
       <path d="M20 6 9 17l-5-5" />
     </svg>
   );

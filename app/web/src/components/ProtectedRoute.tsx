@@ -21,7 +21,7 @@
 import { Navigate, Outlet, useLocation } from 'react-router-dom';
 import { useAuth, type MembershipRole } from '../lib/auth';
 import { sanitizeReturnTo } from '../lib/return-to';
-import { Spinner } from './ui';
+import { LoadingPanel } from './design';
 
 interface ProtectedRouteProps {
   /**
@@ -39,11 +39,8 @@ export function ProtectedRoute({ requireRole }: ProtectedRouteProps = {}) {
   // Still checking session — no data rendered
   if (isLoading) {
     return (
-      <div className="flex min-h-screen items-center justify-center">
-        <div className="flex flex-col items-center gap-3">
-          <Spinner className="h-8 w-8 text-accent-500" />
-          <p className="text-sm text-gray-500">Checking session…</p>
-        </div>
+      <div className="app-ground flex min-h-screen items-center justify-center">
+        <LoadingPanel label="Checking session…" />
       </div>
     );
   }
@@ -67,11 +64,8 @@ export function ProtectedRoute({ requireRole }: ProtectedRouteProps = {}) {
   // candidate data can flash before authorization is known.
   if (isRoleLoading) {
     return (
-      <div className="flex min-h-screen items-center justify-center">
-        <div className="flex flex-col items-center gap-3">
-          <Spinner className="h-8 w-8 text-accent-500" />
-          <p className="text-sm text-gray-500">Checking access…</p>
-        </div>
+      <div className="app-ground flex min-h-screen items-center justify-center">
+        <LoadingPanel label="Checking access…" />
       </div>
     );
   }

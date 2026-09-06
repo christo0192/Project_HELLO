@@ -1,7 +1,8 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../api';
 import type { PublicStatus } from '../types';
-import { Card } from '../components/ui';
+import { GlassPanel, InlineNotice, StatusBadge } from '../components/design';
+import type { StatusTone } from '../components/design';
 
 /**
  * Phase 9 L4 — public StatusPage backed by the minimized GET /api/status.
@@ -27,51 +28,60 @@ export function StatusPage() {
     };
   }, []);
 
-  const tone =
+  const tone: StatusTone =
     status?.status === 'ok'
-      ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+      ? 'success'
       : status?.status === 'maintenance'
-        ? 'bg-amber-50 text-amber-800 border-amber-200'
-        : 'bg-red-50 text-red-800 border-red-200';
+        ? 'warning'
+        : 'danger';
+
+  const headline =
+    status?.status === 'ok'
+      ? 'All systems operational'
+      : status?.status === 'maintenance'
+        ? 'Scheduled maintenance'
+        : 'Service degraded';
 
   return (
-    <main className="mx-auto flex min-h-screen max-w-xl items-center px-4">
-      <Card className="w-full p-6">
-        <h1 className="text-xl font-semibold text-gray-900">Service status</h1>
-        <p className="mt-1 text-sm text-gray-500">
-          Current operational status of the screening service.
-        </p>
-
-        {!status && !error && (
-          <p className="mt-4 text-sm text-gray-500" role="status">
-            Checking…
+    <div className="app-ground flex min-h-screen items-center justify-center px-4 py-10">
+      <main className="w-full max-w-md">
+        <GlassPanel level="strong" padding="lg">
+          <h1 className="text-[15px] font-semibold tracking-[-0.01em] text-ink">
+            Service status
+          </h1>
+          <p className="mt-0.5 text-[13px] leading-5 text-ink-tertiary">
+            Current operational status of the screening service.
           </p>
-        )}
 
-        {error && (
-          <p className="mt-4 text-sm text-red-600" role="alert">
-            {error}
-          </p>
-        )}
+          {!status && !error && (
+            <p className="mt-5 text-sm text-ink-tertiary" role="status">
+              Checking…
+            </p>
+          )}
 
-        {status && (
-          <div className={`mt-4 rounded-md border p-4 ${tone}`} role="status">
-            <p className="text-sm font-semibold">
-              {status.status === 'ok'
-                ? 'All systems operational'
-                : status.status === 'maintenance'
-                  ? 'Scheduled maintenance'
-                  : 'Service degraded'}
-            </p>
-            {status.status === 'maintenance' && status.maintenance?.reason && (
-              <p className="mt-1 text-sm">{status.maintenance.reason}</p>
-            )}
-            <p className="mt-2 text-xs text-gray-500">
-              Updated {new Date(status.updated_at).toLocaleString()}
-            </p>
-          </div>
-        )}
-      </Card>
-    </main>
+          {error && (
+            <InlineNotice tone="danger" role="alert" className="mt-5">
+              {error}
+            </InlineNotice>
+          )}
+
+          {status && (
+            <div role="status" className="glass-sunken mt-5 rounded-[14px] px-4 py-4">
+              <StatusBadge tone={tone} className="px-2.5 py-1">
+                {headline}
+              </StatusBadge>
+              {status.status === 'maintenance' && status.maintenance?.reason && (
+                <p className="mt-2.5 text-sm leading-6 text-ink-secondary">
+                  {status.maintenance.reason}
+                </p>
+              )}
+              <p className="mt-2.5 text-xs text-ink-tertiary">
+                Updated {new Date(status.updated_at).toLocaleString()}
+              </p>
+            </div>
+          )}
+        </GlassPanel>
+      </main>
+    </div>
   );
 }

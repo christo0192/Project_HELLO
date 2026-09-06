@@ -45,7 +45,7 @@ export function Tag({ tone = 'neutral', srPrefix, className, children }: TagProp
   return (
     <span
       className={cx(
-        'inline-flex items-center rounded-md px-2 py-0.5 text-xs font-medium ring-1 ring-inset',
+        'inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset',
         toneStyles[tone],
         className,
       )}

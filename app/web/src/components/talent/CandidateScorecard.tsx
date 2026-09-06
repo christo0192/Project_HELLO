@@ -145,7 +145,7 @@ function Section({
         <Heading
           level={headingLevel}
           id={headingId}
-          className="text-sm font-semibold text-[var(--c-ink)]"
+          className="text-[15px] font-semibold tracking-tight text-[var(--c-ink)]"
         >
           {title}
         </Heading>
@@ -298,7 +298,7 @@ export function CandidateScorecard({
         </div>
 
         <div className="mt-4 border-t border-[var(--c-border-light)] pt-3">
-          <p className="mb-1.5 text-xs font-medium text-[var(--c-ink-muted)]">
+          <p className="mb-1.5 text-[13px] font-medium text-[var(--c-ink-secondary)]">
             Section weights
           </p>
           <dl className="flex flex-wrap gap-x-5 gap-y-1 text-xs">
@@ -434,7 +434,7 @@ export function CandidateScorecard({
           <Heading
             level={headingLevel}
             id={conflictsId}
-            className="mb-3 flex flex-wrap items-center gap-2 text-sm font-semibold text-[var(--c-ink)]"
+            className="mb-3 flex flex-wrap items-center gap-2 text-[15px] font-semibold tracking-tight text-[var(--c-ink)]"
           >
             Resume conflicts
             <Tag tone="caution" srPrefix="Count:">
@@ -483,7 +483,7 @@ export function CandidateScorecard({
           <Heading
             level={headingLevel}
             id={summaryId}
-            className="mb-1.5 text-sm font-semibold text-[var(--c-ink)]"
+            className="mb-1.5 text-[15px] font-semibold tracking-tight text-[var(--c-ink)]"
           >
             Summary
           </Heading>

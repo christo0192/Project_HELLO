@@ -275,8 +275,12 @@ describe('DashboardPage', () => {
   });
 
   it('shows the admin Mission Control link only for admins', async () => {
+    // Presentational change only: the destination moved from a trailing
+    // paragraph ("Open Mission Control →") into a header quick link. The
+    // route and the admin gate are unchanged.
     renderDashboard();
-    expect(await screen.findByRole('link', { name: /Open Mission Control/i })).toBeInTheDocument();
+    const link = await screen.findByRole('link', { name: 'Mission Control' });
+    expect(link).toHaveAttribute('href', '/mission-control');
   });
 
   it('handles a completely empty pipeline truthfully', async () => {

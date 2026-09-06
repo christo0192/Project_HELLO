@@ -5,7 +5,7 @@
  * Focus on the state machine: loading → signed out / signed in → AAL check.
  */
 
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AuthProvider, useAuth, getSsoProviders, isCompanyEmail, ALLOWED_EMAIL_DOMAIN } from '../auth';
@@ -246,6 +246,50 @@ describe('AuthProvider', () => {
     // Authoritative role comes from /api/me, not app_metadata.
     await waitFor(() => expect(screen.getByTestId('role')).toHaveTextContent('admin'));
     expect(getMe).toHaveBeenCalled();
+  });
+
+  it('does not re-gate the page when the session is re-announced on tab focus', async () => {
+    // Supabase re-emits SIGNED_IN / TOKEN_REFRESHED when a tab regains focus.
+    // Those events used to flip isRoleLoading, which made ProtectedRoute swap
+    // the mounted page for a spinner and every route refetched.
+    let handler: ((event: string, session: unknown) => void) | null = null;
+    mockSupabase.auth.onAuthStateChange = vi.fn((cb: (event: string, session: unknown) => void) => {
+      handler = cb;
+      return { data: { subscription: { unsubscribe: vi.fn() } } };
+    });
+    mockSupabase.auth.getSession = vi
+      .fn()
+      .mockResolvedValue({ data: { session: mockSession }, error: null });
+    getMe.mockResolvedValue({ userId: mockSession.user.id, email: 'recruiter@example.com', role: 'admin', active: true });
+
+    const loadingFlips: boolean[] = [];
+    function RoleGateProbe() {
+      const { isRoleLoading, role } = useAuth();
+      loadingFlips.push(isRoleLoading);
+      return <div data-testid="probe">{isRoleLoading ? 'gating' : (role ?? 'null')}</div>;
+    }
+    render(
+      <AuthProvider>
+        <RoleGateProbe />
+      </AuthProvider>,
+    );
+    await waitFor(() => expect(screen.getByTestId('probe')).toHaveTextContent('admin'));
+    const callsBefore = getMe.mock.calls.length;
+    loadingFlips.length = 0;
+
+    await act(async () => {
+      handler!('TOKEN_REFRESHED', mockSession);
+    });
+    await act(async () => {
+      handler!('SIGNED_IN', mockSession);
+    });
+    await waitFor(() => expect(screen.getByTestId('probe')).toHaveTextContent('admin'));
+
+    // Never gated again for the same user…
+    expect(loadingFlips.every((flag) => flag === false)).toBe(true);
+    // …a token refresh asks the API nothing, and a same-user SIGNED_IN asks
+    // quietly (at most once) without the loading gate.
+    expect(getMe.mock.calls.length - callsBefore).toBeLessThanOrEqual(1);
   });
 
   it('fails closed (role null) when /api/me cannot be loaded', async () => {

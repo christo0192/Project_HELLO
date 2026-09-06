@@ -10,6 +10,12 @@
  *   tab switches.
  *
  * Native buttons only — no div-based click targets.
+ *
+ * Presentation: a macOS-style segmented control — a `glass-sunken` track with
+ * the selected segment lifted onto the opaque candidate surface. The lift is
+ * a plain CSS transition, not a JS-driven sliding pill: candidate-scoped
+ * source may not import a motion library (candidate-scope-palette.test.ts),
+ * and the transition collapses under the global reduced-motion rule.
  */
 
 import { useId, useState } from 'react';
@@ -83,7 +89,7 @@ export function Tabs({
       <div
         role="tablist"
         aria-label={ariaLabel}
-        className="flex gap-1 overflow-x-auto border-b border-line"
+        className="glass-sunken inline-flex max-w-full gap-1 overflow-x-auto p-1"
       >
         {items.map((item, index) => {
           const selected = index === activeIndex;
@@ -99,13 +105,12 @@ export function Tabs({
               onClick={() => setActiveIndex(index)}
               onKeyDown={(event) => onKeyDown(event, index)}
               className={cx(
-                // 44px minimum touch target (WCAG 2.5.8).
-                'shrink-0 rounded-t-lg border-b-2 px-3 py-2 text-sm font-medium transition-colors sm:px-4',
-                'min-h-11',
-                'focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface',
+                'h-9 shrink-0 rounded-[10px] px-4 text-[13px] font-medium',
+                'transition-[background-color,color,box-shadow] duration-200 ease-out',
+                'focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--c-bg)]',
                 selected
-                  ? 'border-[var(--c-accent)] text-[var(--c-accent)]'
-                  : 'border-transparent text-ink-secondary hover:bg-surface-tertiary hover:text-ink',
+                  ? 'bg-[var(--c-surface)] text-[var(--c-ink)] shadow-pill'
+                  : 'text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)]',
               )}
             >
               {item.label}

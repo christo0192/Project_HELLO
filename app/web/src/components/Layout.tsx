@@ -122,7 +122,17 @@ export function Layout() {
 
   const [status, setStatus] = useState<Status>('checking');
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [scrolled, setScrolled] = useState(false);
   const isDesktop = useIsDesktop();
+
+  // The frosted top bar gains a soft shadow once content slides under it.
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const onScroll = () => setScrolled(window.scrollY > 4);
+    onScroll();
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
 
   const menuButtonRef = useRef<HTMLButtonElement | null>(null);
 
@@ -213,7 +223,7 @@ export function Layout() {
       <aside
         id="app-sidebar"
         inert={sidebarInert || undefined}
-        className={`glass-rail fixed inset-y-0 left-0 z-40 flex w-[264px] shrink-0 flex-col transition-transform duration-300 ease-soft max-lg:bg-white lg:static lg:z-auto lg:translate-x-0 ${
+        className={`glass-rail fixed inset-y-0 left-0 z-40 flex w-[264px] shrink-0 flex-col transition-transform duration-[380ms] ease-[cubic-bezier(0.2,0.9,0.25,1.04)] max-lg:bg-white lg:static lg:z-auto lg:translate-x-0 ${
           drawerOpen
             ? 'translate-x-0 shadow-pop lg:shadow-none'
             : '-translate-x-full lg:translate-x-0'
@@ -332,7 +342,11 @@ export function Layout() {
 
       {/* ── Main column ─────────────────────────────────────────────── */}
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="sticky top-0 z-20 flex h-14 items-center gap-3 border-b border-glass-ring bg-[var(--glass-bg-strong)] px-4 backdrop-blur-xl sm:px-8">
+        <header
+          className={`sticky top-0 z-20 flex h-14 items-center gap-3 border-b border-glass-ring bg-[var(--glass-bg-strong)] px-4 backdrop-blur-xl transition-shadow duration-300 sm:px-8 ${
+            scrolled ? 'shadow-[0_8px_24px_-16px_rgba(15,23,42,0.22)]' : ''
+          }`}
+        >
           <MobileMenuButton
             open={drawerOpen}
             onToggle={() => setDrawerOpen((open) => !open)}

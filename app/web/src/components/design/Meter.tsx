@@ -124,7 +124,10 @@ export function Meter({
         )}
       >
         <div
-          className="h-full rounded-full"
+          // The fill GROWS into place: a width transition, not a keyframe
+          // animation, so it costs no motion budget and collapses to 0.01ms
+          // under the global `prefers-reduced-motion` rule in index.css.
+          className="h-full rounded-full transition-[width] duration-700 ease-out"
           style={{ width: `${pct}%`, backgroundColor: bandFill[band] }}
         />
       </div>

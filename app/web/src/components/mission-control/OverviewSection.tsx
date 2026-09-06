@@ -333,10 +333,7 @@ function Breakdown({ rows, total }: { rows: BreakdownRow[]; total: number }) {
               aria-hidden="true"
               className="h-1.5 min-w-0 flex-1 overflow-hidden rounded-full bg-ink/[0.06]"
             >
-              <span
-                className={cx('block h-full rounded-full', row.fill)}
-                style={{ width: `${pct}%` }}
-              />
+              <GrowBar pct={pct} className={row.fill} />
             </span>
             <span className="w-8 shrink-0 text-right text-sm font-semibold tabular-nums text-ink">
               {row.value}
@@ -465,6 +462,21 @@ function SourceError({
       className="h-full min-h-40"
       message={`${label} — ${detail}`}
       onRetry={onRetry}
+    />
+  );
+}
+
+/** Bar fill that grows from zero to its share on mount (collapses under reduced motion). */
+function GrowBar({ pct, className }: { pct: number; className: string }) {
+  const [width, setWidth] = useState(0);
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => setWidth(pct));
+    return () => cancelAnimationFrame(frame);
+  }, [pct]);
+  return (
+    <span
+      className={cx('block h-full rounded-full transition-[width] duration-700 ease-soft', className)}
+      style={{ width: `${width}%` }}
     />
   );
 }

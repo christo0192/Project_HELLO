@@ -13,6 +13,12 @@
  * titled with the shared neutral `CANDIDATE_SHELL_TITLE` rather than a
  * fabricated identity, and carries the sanitized `resume_review` badge that
  * says how far its resume got — and nothing more.
+ *
+ * Surfaces: one glass panel per logical block — the upload form, the filter
+ * bar, the table — floating on the shell ground. The list is paginated at ten
+ * rows so it never runs off the page, and the filter contract
+ * (`parseCandidateFilters` / `buildCandidateSearch` / `matchesCandidateFilters`)
+ * is untouched: the chips, the counts and "Clear all" drive the same URL.
  */
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
@@ -20,24 +26,25 @@ import { Link, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import type { Candidate, Role } from "../types";
 import type { CandidateFilters } from "../components/talent";
+import { CandidateButton, Tag } from "../components/design/candidate";
 import {
-  CandidateButton,
-  CandidateEmptyState,
-  CandidateErrorState,
-  CandidateLabel,
-  CandidateLoadingState,
-  CandidateSelect,
-  CandidateSpinner,
-  SurfaceCard,
-} from "../components/design/candidate";
-import {
-  Table,
-  THead,
-  TBody,
-  Tr,
-  Th,
-  Td,
+  Button,
+  EmptyPanel,
+  ErrorPanel,
+  Field,
+  GlassPanel,
+  InlineNotice,
+  LoadingPanel,
+  Pagination,
+  SelectField,
   StatusBadge,
+  Table,
+  TBody,
+  Td,
+  Th,
+  THead,
+  Tr,
+  usePagination,
 } from "../components/design";
 import { CandidateHeader, CandidateShell } from "../components/talent";
 import {
@@ -60,18 +67,24 @@ import {
 import type { StatusTone } from "../components/design/StatusBadge";
 
 /**
- * Filter toggle. 44px minimum target, palette tokens only, and the selected
- * state carries `aria-pressed` (set by the caller) as well as colour, so the
- * distinction is never hue-only.
+ * Filter pill. Multi-select toggles, so these stay `button`s carrying
+ * `aria-pressed` rather than becoming a `SegmentedControl` (which is a
+ * single-choice radio group). The 44px minimum target is kept: `min-h-11`
+ * is what the scope integration test reads, and it is also the reason the
+ * pill is taller than the 32px chips elsewhere in the shell.
  */
-const FILTER_TOGGLE_CLASS = (selected: boolean) =>
+const FILTER_PILL_CLASS = (selected: boolean) =>
   [
-    "inline-flex min-h-11 items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium transition-colors",
+    "inline-flex min-h-11 items-center gap-1.5 rounded-full px-3 text-[13px] font-medium transition-colors duration-200",
     "focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]",
     selected
-      ? "border-[var(--c-accent)] bg-[var(--c-accent-light)] text-[var(--c-accent)]"
-      : "border-[var(--c-control-border)] bg-[var(--c-surface)] text-[var(--c-ink-secondary)] hover:bg-[var(--c-border-light)] hover:text-[var(--c-ink)]",
+      ? "bg-[var(--c-accent)] text-[var(--c-data-label-inside)] shadow-pill"
+      : "bg-[var(--c-surface)] text-[var(--c-ink-secondary)] shadow-[inset_0_0_0_1px_var(--c-border)] hover:bg-[var(--c-border-light)] hover:text-[var(--c-ink)]",
   ].join(" ");
+
+/** The live count inside a pill. Never the tone colour on the tone's fill. */
+const PILL_COUNT_CLASS = (selected: boolean) =>
+  selected ? "tabular-nums" : "tabular-nums text-[var(--c-ink-muted)]";
 
 const RECOMMENDATION_TONE: Record<string, StatusTone> = {
   advance: "success",
@@ -93,6 +106,15 @@ export function CandidatesPage() {
   const [roles, setRoles] = useState<Role[]>([]);
   const [candidates, setCandidates] = useState<Candidate[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const uploadPanelId = useId();
+  /**
+   * Open by default. The panel is a disclosure — the header button owns its
+   * `aria-expanded` — but the upload form is the way a recruiter puts a
+   * candidate into an empty workspace, and the empty state points at it
+   * ("Upload a resume above"), so it may not start hidden.
+   */
+  const [uploadOpen, setUploadOpen] = useState(true);
 
   const loadCandidates = useCallback((role: string | null) => {
     setError(null);
@@ -160,6 +182,8 @@ export function CandidatesPage() {
     [candidates, filterKey],
   );
 
+  const page = usePagination(visible, 10);
+
   const active = hasActiveFilters(filters);
   const roleTitle = roles.find((r) => r.id === roleId)?.title;
 
@@ -210,19 +234,34 @@ export function CandidatesPage() {
         eyebrow="Talent workspace"
         title="Candidates"
         description="Upload resumes, review parsed profiles, and move candidates through screening."
+        actions={
+          <Button
+            size="lg"
+            variant="primary"
+            aria-expanded={uploadOpen}
+            aria-controls={uploadPanelId}
+            onClick={() => setUploadOpen((open) => !open)}
+          >
+            Upload resume
+          </Button>
+        }
       />
 
-      <div className="mt-6">
-        <UploadCard roles={roles} onUploaded={() => loadCandidates(roleId)} />
-      </div>
+      <UploadPanel
+        id={uploadPanelId}
+        open={uploadOpen}
+        roles={roles}
+        onUploaded={() => loadCandidates(roleId)}
+      />
 
-      {/* Filter bar */}
-      <section aria-label="Filters" className="mt-8">
+      {/* Filter bar — one panel, so the whole filter contract reads as a
+          single control surface rather than four stacked rows. */}
+      <GlassPanel as="section" aria-label="Filters" padding="sm" className="mt-6">
         <div className="flex flex-wrap items-center justify-between gap-3">
-          <h2 className="text-sm font-semibold text-ink">
+          <h2 className="text-[15px] font-semibold tracking-[-0.01em] text-[var(--c-ink)]">
             All candidates
             {candidates && (
-              <span className="ml-2 font-normal text-ink-tertiary">
+              <span className="ml-2 font-normal text-[var(--c-ink-muted)]">
                 {active
                   ? `${visible.length} of ${candidates.length}`
                   : candidates.length}
@@ -234,7 +273,7 @@ export function CandidatesPage() {
               <label htmlFor="role-filter" className="sr-only">
                 Filter by role
               </label>
-              <CandidateSelect
+              <SelectField
                 id="role-filter"
                 value={roleId ?? ""}
                 onChange={(e) => setRole(e.target.value)}
@@ -247,7 +286,7 @@ export function CandidatesPage() {
                     {r.title}
                   </option>
                 ))}
-              </CandidateSelect>
+              </SelectField>
             </div>
           )}
         </div>
@@ -263,11 +302,11 @@ export function CandidatesPage() {
                 type="button"
                 onClick={() => toggleStatus(status)}
                 aria-pressed={selected}
-                className={FILTER_TOGGLE_CLASS(selected)}
+                className={FILTER_PILL_CLASS(selected)}
               >
                 {candidateStatusLabel(status)}
                 {candidates && (
-                  <span className="tabular-nums text-ink-tertiary">{count}</span>
+                  <span className={PILL_COUNT_CLASS(selected)}>{count}</span>
                 )}
               </button>
             );
@@ -280,7 +319,9 @@ export function CandidatesPage() {
           role="group"
           aria-label="Filter by recommendation"
         >
-          <span className="text-xs font-medium text-ink-tertiary">Recommendation:</span>
+          <span className="text-[13px] font-medium text-[var(--c-ink-muted)]">
+            Recommendation:
+          </span>
           {RECOMMENDATION_ORDER.map((rec) => {
             const selected = filters.recommendations.includes(rec);
             const count = recommendationCounts.get(rec) ?? 0;
@@ -290,11 +331,11 @@ export function CandidatesPage() {
                 type="button"
                 onClick={() => toggleRecommendation(rec)}
                 aria-pressed={selected}
-                className={FILTER_TOGGLE_CLASS(selected)}
+                className={FILTER_PILL_CLASS(selected)}
               >
                 {recommendationLabel(rec)}
                 {candidates && (
-                  <span className="tabular-nums text-ink-tertiary">{count}</span>
+                  <span className={PILL_COUNT_CLASS(selected)}>{count}</span>
                 )}
               </button>
             );
@@ -315,7 +356,9 @@ export function CandidatesPage() {
           role="group"
           aria-label="Filter by resume review"
         >
-          <span className="text-xs font-medium text-ink-tertiary">Resume:</span>
+          <span className="text-[13px] font-medium text-[var(--c-ink-muted)]">
+            Resume:
+          </span>
           {RESUME_REVIEW_ORDER.map((value) => {
             const selected = filters.resumeReview.includes(value);
             const count = resumeReviewCounts.get(value) ?? 0;
@@ -325,11 +368,11 @@ export function CandidatesPage() {
                 type="button"
                 onClick={() => toggleResumeReview(value)}
                 aria-pressed={selected}
-                className={FILTER_TOGGLE_CLASS(selected)}
+                className={FILTER_PILL_CLASS(selected)}
               >
                 {resumeReviewLabel(value)}
                 {candidates && (
-                  <span className="tabular-nums text-ink-tertiary">{count}</span>
+                  <span className={PILL_COUNT_CLASS(selected)}>{count}</span>
                 )}
               </button>
             );
@@ -339,7 +382,7 @@ export function CandidatesPage() {
 
         {/* Active-filter summary */}
         {active && (
-          <div className="mt-3 flex flex-wrap items-center gap-2 text-xs text-ink-secondary">
+          <div className="mt-3 flex flex-wrap items-center gap-2 text-[13px] text-[var(--c-ink-secondary)]">
             <span className="font-medium">Active filters:</span>
             {roleTitle && (
               <FilterChip
@@ -383,21 +426,21 @@ export function CandidatesPage() {
             </button>
           </div>
         )}
-      </section>
+      </GlassPanel>
 
       {/* Body states */}
       <div className="mt-4">
         {error && (
-          <CandidateErrorState
+          <ErrorPanel
             message={error}
             onRetry={() => loadCandidates(roleId)}
           />
         )}
         {!error && candidates === null && (
-          <CandidateLoadingState label="Loading candidates…" />
+          <LoadingPanel label="Loading candidates…" />
         )}
         {!error && candidates !== null && candidates.length === 0 && (
-          <CandidateEmptyState
+          <EmptyPanel
             title="No candidates yet"
             hint="Upload a resume above to parse a candidate and add them here."
           />
@@ -406,22 +449,19 @@ export function CandidatesPage() {
           candidates !== null &&
           candidates.length > 0 &&
           visible.length === 0 && (
-            <div className="rounded-xl border border-dashed border-[var(--c-control-border)] bg-[var(--c-surface)] p-8 text-center">
-              <p className="text-sm font-medium text-[var(--c-ink-secondary)]">
-                No candidates match these filters
-              </p>
-              <button
-                type="button"
-                onClick={clearFilters}
-                className="mt-2 inline-flex min-h-11 items-center text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
-              >
-                Clear filters
-              </button>
-            </div>
+            <EmptyPanel
+              title="No candidates match these filters"
+              action={
+                <Button variant="secondary" size="sm" onClick={clearFilters}>
+                  Clear filters
+                </Button>
+              }
+            />
           )}
 
         {!error && visible.length > 0 && (
-          <Table caption="Candidates in your pipeline">
+          <>
+            <Table caption="Candidates in your pipeline">
               <THead>
                 <Tr>
                   <Th>Name</Th>
@@ -432,8 +472,10 @@ export function CandidatesPage() {
                   <Th>Next action</Th>
                 </Tr>
               </THead>
-              <TBody>
-                {visible.map((c) => {
+              {/* Rows reveal in sequence; the class collapses under
+                  prefers-reduced-motion with the rest of the shell. */}
+              <TBody className="fade-up-stagger">
+                {page.items.map((c) => {
                   const next = candidateNextAction(c.status);
                   return (
                     <Tr key={c.id}>
@@ -445,30 +487,25 @@ export function CandidatesPage() {
                           {candidateDisplayName(c.name)}
                         </Link>
                         {c.email && (
-                          <p className="text-xs text-ink-tertiary">{c.email}</p>
+                          <p className="text-[13px] text-[var(--c-ink-muted)]">{c.email}</p>
                         )}
                       </Td>
                       <Td>
                         <div className="flex max-w-xs flex-wrap gap-1">
                           {c.skills.slice(0, 4).map((s) => (
-                            <span
-                              key={s}
-                              className="inline-flex items-center rounded-md bg-surface-tertiary px-2 py-0.5 text-xs font-medium text-ink-secondary"
-                            >
-                              {s}
-                            </span>
+                            <Tag key={s}>{s}</Tag>
                           ))}
                           {c.skills.length > 4 && (
-                            <span className="text-xs text-ink-tertiary">
+                            <span className="text-xs text-[var(--c-ink-muted)]">
                               +{c.skills.length - 4}
                             </span>
                           )}
                           {c.skills.length === 0 && (
-                            <span className="text-ink-tertiary">—</span>
+                            <span className="text-[var(--c-ink-muted)]">—</span>
                           )}
                         </div>
                       </Td>
-                      <Td className="tabular-nums text-ink-secondary">
+                      <Td className="tabular-nums text-[var(--c-ink-secondary)]">
                         {c.experience_years != null
                           ? `${c.experience_years} yr`
                           : "—"}
@@ -492,13 +529,13 @@ export function CandidatesPage() {
                               {recommendationLabel(c.latest_recommendation)}
                             </StatusBadge>
                             {c.latest_score != null && (
-                              <span className="text-xs tabular-nums text-ink-tertiary">
+                              <span className="text-xs tabular-nums text-[var(--c-ink-muted)]">
                                 {c.latest_score}
                               </span>
                             )}
                           </span>
                         ) : (
-                          <span className="text-ink-tertiary">—</span>
+                          <span className="text-[var(--c-ink-muted)]">—</span>
                         )}
                       </Td>
                       <Td>
@@ -506,7 +543,7 @@ export function CandidatesPage() {
                           className={
                             next.emphasis
                               ? "text-sm font-medium text-[var(--c-accent)]"
-                              : "text-sm text-ink-secondary"
+                              : "text-sm text-[var(--c-ink-secondary)]"
                           }
                         >
                           {next.label}
@@ -517,6 +554,8 @@ export function CandidatesPage() {
                 })}
               </TBody>
             </Table>
+            <Pagination state={page} noun="candidates" />
+          </>
         )}
       </div>
     </CandidateShell>
@@ -531,13 +570,13 @@ function FilterChip({
   onRemove: () => void;
 }) {
   return (
-    <span className="inline-flex items-center gap-1 rounded-full bg-surface-tertiary px-2 py-0.5 text-xs text-ink">
+    <span className="inline-flex items-center gap-1 rounded-full bg-[var(--c-border-light)] px-2 py-0.5 text-xs text-[var(--c-ink-secondary)]">
       {label}
       <button
         type="button"
         onClick={onRemove}
         aria-label={`Remove filter ${label}`}
-        className="rounded-full px-1 text-ink-tertiary hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+        className="rounded-full px-1 text-[var(--c-ink-muted)] hover:text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
       >
         ×
       </button>
@@ -545,10 +584,21 @@ function FilterChip({
   );
 }
 
-function UploadCard({
+/**
+ * The upload disclosure.
+ *
+ * Kept mounted and toggled with `hidden` rather than unmounted, so the
+ * header button's `aria-controls` always resolves to a real element and an
+ * in-progress upload is never destroyed by a stray click on the toggle.
+ */
+function UploadPanel({
+  id,
+  open,
   roles,
   onUploaded,
 }: {
+  id: string;
+  open: boolean;
   roles: Role[];
   onUploaded: () => void;
 }) {
@@ -579,48 +629,59 @@ function UploadCard({
   }
 
   return (
-    <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
-      <h2 id={headingId} className="mb-1 text-sm font-semibold text-ink">
+    <GlassPanel
+      as="section"
+      id={id}
+      hidden={!open}
+      aria-labelledby={headingId}
+      className="mt-6"
+    >
+      <h2
+        id={headingId}
+        className="text-[15px] font-semibold tracking-[-0.01em] text-[var(--c-ink)]"
+      >
         Upload a resume
       </h2>
-      <p className="mb-4 max-w-prose text-sm text-ink-secondary">
+      <p className="mt-0.5 text-[13px] leading-5 text-[var(--c-ink-secondary)]">
         PDF or DOCX. Parsing runs an LLM and can take 10–20 seconds.
       </p>
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-        <div className="sm:col-span-2">
-          <CandidateLabel htmlFor="resume-file">Resume file</CandidateLabel>
-          <input
-            id="resume-file"
-            ref={inputRef}
-            type="file"
-            accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
-            onChange={(e) => {
-              setFile(e.target.files?.[0] ?? null);
-              setSuccess(null);
-              setError(null);
-            }}
-            disabled={uploading}
-            className="block w-full text-sm text-ink-secondary file:mr-3 file:rounded-lg file:border-0 file:bg-[var(--c-accent-light)] file:px-3 file:py-2 file:text-sm file:font-medium file:text-[var(--c-accent)] disabled:opacity-60"
-          />
-        </div>
-        <div>
-          <CandidateLabel htmlFor="resume-role">Role (optional)</CandidateLabel>
-          <CandidateSelect
-            id="resume-role"
-            value={roleId}
-            onChange={(e) => setRoleId(e.target.value)}
-            disabled={uploading}
-            className="w-full"
-          >
-            <option value="">No role</option>
-            {roles.map((r) => (
-              <option key={r.id} value={r.id}>
-                {r.title}
-              </option>
-            ))}
-          </CandidateSelect>
-        </div>
+      <div className="mt-4 grid grid-cols-1 gap-4 sm:grid-cols-3">
+        <Field label="Resume file" id="resume-file" className="sm:col-span-2">
+          {({ id: fileId }) => (
+            <input
+              id={fileId}
+              ref={inputRef}
+              type="file"
+              accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+              onChange={(e) => {
+                setFile(e.target.files?.[0] ?? null);
+                setSuccess(null);
+                setError(null);
+              }}
+              disabled={uploading}
+              className="block w-full text-sm text-[var(--c-ink-secondary)] file:mr-3 file:rounded-control file:border-0 file:bg-[var(--c-accent-light)] file:px-3 file:py-2 file:text-sm file:font-medium file:text-[var(--c-accent)] disabled:opacity-60"
+            />
+          )}
+        </Field>
+        <Field label="Role (optional)" id="resume-role">
+          {({ id: selectId }) => (
+            <SelectField
+              id={selectId}
+              value={roleId}
+              onChange={(e) => setRoleId(e.target.value)}
+              disabled={uploading}
+              className="w-full"
+            >
+              <option value="">No role</option>
+              {roles.map((r) => (
+                <option key={r.id} value={r.id}>
+                  {r.title}
+                </option>
+              ))}
+            </SelectField>
+          )}
+        </Field>
       </div>
 
       <div className="mt-4 flex flex-wrap items-center gap-3">
@@ -628,18 +689,22 @@ function UploadCard({
           {uploading ? "Parsing…" : "Upload & Parse"}
         </CandidateButton>
         {uploading && (
-          <span className="flex items-center gap-2 text-sm text-ink-secondary">
-            <CandidateSpinner className="h-4 w-4 text-[var(--c-accent)]" />
+          <span className="text-sm text-[var(--c-ink-secondary)]">
             Extracting and parsing with the LLM…
           </span>
         )}
+        {/* Tone is a dot plus a tint, never coloured small text. */}
         {success && !uploading && (
-          <span className="text-sm text-success">{success}</span>
+          <InlineNotice tone="success" role="status">
+            {success}
+          </InlineNotice>
         )}
         {error && !uploading && (
-          <span className="text-sm text-error">{error}</span>
+          <InlineNotice tone="danger" role="alert">
+            {error}
+          </InlineNotice>
         )}
       </div>
-    </SurfaceCard>
+    </GlassPanel>
   );
 }

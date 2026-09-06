@@ -32,9 +32,15 @@ import type {
   PhoneOperatorCancelReason,
   PhoneSlot,
 } from '../../types';
-import { StatusBadge } from '../design';
+import {
+  Button,
+  Field,
+  GlassPanel,
+  SectionHeader,
+  SelectField,
+  StatusBadge,
+} from '../design';
 import { ConfirmButton } from '../mission-control/ConfirmButton';
-import { buttonClassNames } from '../mission-control/buttonStyles';
 import {
   formatIstDateTime,
   formatIstLongDayLabel,
@@ -68,12 +74,11 @@ export interface PhoneAppointmentDetailProps {
   today: IstDate;
 }
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+/** One read-only fact in the summary list. Sentence case, never shouted. */
+function Fact({ label, children }: { label: string; children: React.ReactNode }) {
   return (
     <div>
-      <dt className="text-xs font-medium uppercase tracking-wide text-ink-tertiary">
-        {label}
-      </dt>
+      <dt className="text-[13px] font-medium text-ink-tertiary">{label}</dt>
       <dd className="mt-0.5 text-sm text-ink">{children}</dd>
     </div>
   );
@@ -104,59 +109,53 @@ export function PhoneAppointmentDetail({
   const inFlight = isAttemptInFlight(appointment.engagement_state);
 
   return (
-    <section
-      aria-label="Selected appointment"
-      className="rounded-xl border border-line bg-surface p-4 shadow-card sm:p-5"
-    >
-      <h2 className="text-sm font-semibold text-ink">
-        {candidateReferenceText(appointment.candidate)}
-      </h2>
-      <p className="mt-0.5 text-sm text-ink-secondary">
-        {apptDate ? `${formatIstLongDayLabel(apptDate)}, ` : ''}
-        {formatIstTimeRange(appointment.starts_at, appointment.ends_at)}
-      </p>
+    <GlassPanel as="section" aria-label="Selected appointment" padding="sm">
+      <SectionHeader
+        title={candidateReferenceText(appointment.candidate)}
+        description={`${
+          apptDate ? `${formatIstLongDayLabel(apptDate)}, ` : ''
+        }${formatIstTimeRange(appointment.starts_at, appointment.ends_at)}`}
+      />
 
       <dl className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
-        <Field label="Appointment">
+        <Fact label="Appointment">
           <StatusBadge tone={statusTerm.tone}>{statusTerm.label}</StatusBadge>
-        </Field>
-        <Field label="Engagement">
+        </Fact>
+        <Fact label="Engagement">
           <StatusBadge tone={stateTerm.tone}>{stateTerm.label}</StatusBadge>
-        </Field>
-        <Field label="Pipeline status">
+        </Fact>
+        <Fact label="Pipeline status">
           {appointment.candidate?.status ?? 'Unavailable'}
-        </Field>
-        <Field label="Booked by">
+        </Fact>
+        <Fact label="Booked by">
           {appointment.source === 'hr_manual'
             ? 'HR, manually'
             : appointment.source === 'candidate_voice'
               ? 'The candidate, during a call'
               : 'A system deferral'}
-        </Field>
+        </Fact>
         {appointment.cancel_reason && (
-          <Field label="Cancellation reason">
+          <Fact label="Cancellation reason">
             {cancelReasonLabel(appointment.cancel_reason)}
-          </Field>
+          </Fact>
         )}
       </dl>
 
       {appointment.source === 'candidate_voice' && appointment.confirmed_at && (
-        <p className="mt-3 rounded-lg border border-success/30 bg-success-soft px-3 py-2 text-sm text-success">
+        <p className="mt-4 rounded-[14px] bg-success-soft px-3.5 py-2.5 text-sm leading-6 text-ink">
           Candidate confirmed this callback on {formatIstDateTime(appointment.confirmed_at)}. The
           ten-minute reservation is rechecked again when the callback becomes due.
         </p>
       )}
 
       {canWrite && live && (
-        <div className="mt-5 border-t border-line pt-4">
-          <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-tertiary">
-            Change this appointment
-          </h3>
+        <div className="mt-5 border-t border-glass-ring pt-4">
+          <SectionHeader level={3} title="Change this appointment" />
 
           {inFlight ? (
             <p
               role="status"
-              className="mt-2 rounded-lg border border-warning/30 bg-warning-soft px-3 py-2 text-sm text-warning"
+              className="mt-3 rounded-[14px] bg-warning-soft px-3.5 py-2.5 text-sm leading-6 text-ink"
             >
               A call attempt is in progress for this engagement. Rescheduling
               and cancelling are refused while a call is live.
@@ -164,15 +163,15 @@ export function PhoneAppointmentDetail({
           ) : (
             <>
               <div className="mt-3">
-                <button
-                  type="button"
+                <Button
+                  size="lg"
+                  variant="secondary"
                   onClick={() => setRescheduling((v) => !v)}
                   aria-expanded={rescheduling}
                   aria-controls={rescheduling ? rescheduleId : undefined}
-                  className={buttonClassNames('secondary', 'min-h-[44px]')}
                 >
                   {rescheduling ? 'Close reschedule' : 'Reschedule…'}
-                </button>
+                </Button>
               </div>
 
               {rescheduling && (
@@ -215,27 +214,29 @@ export function PhoneAppointmentDetail({
               </div>
               )}
 
-              <div className="mt-5 border-t border-line pt-4">
-                <label
-                  htmlFor={`cancel-reason-${appointment.id}`}
-                  className="block text-xs font-medium text-ink-secondary"
-                >
-                  Cancellation reason
-                </label>
-                <select
+              <div className="mt-5 border-t border-glass-ring pt-4">
+                <Field
                   id={`cancel-reason-${appointment.id}`}
-                  value={reason}
-                  onChange={(e) =>
-                    setReason(e.target.value as PhoneOperatorCancelReason)
-                  }
-                  className="mt-1 min-h-[44px] rounded-lg border border-line bg-surface px-3 py-2 text-sm text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500"
+                  label="Cancellation reason"
+                  className="max-w-xs"
                 >
-                  {OPERATOR_CANCEL_REASONS.map((r) => (
-                    <option key={r.value} value={r.value}>
-                      {r.label}
-                    </option>
-                  ))}
-                </select>
+                  {({ id }) => (
+                    <SelectField
+                      id={id}
+                      value={reason}
+                      onChange={(e) =>
+                        setReason(e.target.value as PhoneOperatorCancelReason)
+                      }
+                      className="min-h-[44px]"
+                    >
+                      {OPERATOR_CANCEL_REASONS.map((r) => (
+                        <option key={r.value} value={r.value}>
+                          {r.label}
+                        </option>
+                      ))}
+                    </SelectField>
+                  )}
+                </Field>
                 <ConfirmButton
                   className="mt-3"
                   variant="danger"
@@ -260,11 +261,11 @@ export function PhoneAppointmentDetail({
       )}
 
       {canWrite && !live && (
-        <p className="mt-4 border-t border-line pt-4 text-sm text-ink-secondary">
+        <p className="mt-5 border-t border-glass-ring pt-4 text-[13px] leading-5 text-ink-tertiary">
           This appointment is no longer live, so it cannot be rescheduled or
           cancelled.
         </p>
       )}
-    </section>
+    </GlassPanel>
   );
 }

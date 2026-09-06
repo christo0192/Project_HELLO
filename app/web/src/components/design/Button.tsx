@@ -1,20 +1,21 @@
 /**
  * Button — the shell's action control.
  *
- * Four variants, two sizes, spring press feedback (collapses under reduced
- * motion). `buttonClass()` is exported so router `<Link>`s can wear the
- * same clothes without becoming buttons.
+ * Four variants, three sizes, press feedback via a CSS scale transition
+ * (collapses under reduced motion through the global media rule). Pure CSS
+ * on purpose: buttons are the hottest primitive in the app and a motion
+ * element per button made typed-input tests measurably slower in jsdom.
+ * `buttonClass()` is exported so router `<Link>`s can wear the same clothes
+ * without becoming buttons.
  */
-import { motion } from 'motion/react';
 import type { ButtonHTMLAttributes, ReactNode } from 'react';
-import { SPRING_SNAPPY, useReducedMotion } from '../../lib/motion';
 import { cx } from './cx';
 
 export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger';
 export type ButtonSize = 'sm' | 'md' | 'lg';
 
 const base =
-  'inline-flex select-none items-center justify-center gap-2 whitespace-nowrap rounded-control font-medium transition-colors duration-200 ease-soft ' +
+  'inline-flex select-none items-center justify-center gap-2 whitespace-nowrap rounded-control font-medium transition-[color,background-color,box-shadow,transform] duration-200 ease-soft active:scale-[0.97] ' +
   'focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface-secondary ' +
   'disabled:cursor-not-allowed disabled:opacity-50';
 
@@ -65,23 +66,18 @@ export function Button({
   type = 'button',
   ...rest
 }: ButtonProps) {
-  const reduced = useReducedMotion();
   const isDisabled = disabled || loading;
   return (
-    <motion.button
+    <button
       type={type}
       className={buttonClass(variant, size, className)}
       disabled={isDisabled}
       aria-busy={loading || undefined}
-      whileTap={reduced || isDisabled ? undefined : { scale: 0.97 }}
-      transition={SPRING_SNAPPY}
-      // `motion.button` widens the event prop types; the caller's props are
-      // plain button props, so the cast is a no-op at runtime.
-      {...(rest as Record<string, unknown>)}
+      {...rest}
     >
       {loading ? <ButtonSpinner /> : icon ? <span aria-hidden="true" className="-ml-0.5 flex h-4 w-4 items-center justify-center">{icon}</span> : null}
       {children}
-    </motion.button>
+    </button>
   );
 }
 

@@ -201,15 +201,39 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
    * denials set role to null (fail closed — ProtectedRoute shows a safe
    * state). `isRoleLoading` brackets the request so no data renders first.
    */
+  /** User id the current `role` was resolved for (null until resolved). */
+  const roleUserIdRef = useRef<string | null>(null);
+
   const refreshRole = useCallback(async (): Promise<void> => {
     setIsRoleLoading(true);
     try {
       const me = await api.getMe();
       setRole(me.role);
+      roleUserIdRef.current = me.userId;
     } catch {
       setRole(null);
+      roleUserIdRef.current = null;
     } finally {
       setIsRoleLoading(false);
+    }
+  }, []);
+
+  /**
+   * Re-read the role WITHOUT raising `isRoleLoading`. Used when the session
+   * is re-announced for a user whose role is already resolved (Supabase emits
+   * SIGNED_IN / TOKEN_REFRESHED whenever the tab regains focus). Raising the
+   * loading flag there made ProtectedRoute swap the whole page for a spinner
+   * and every route refetched — the "dashboard reloads on tab switch" bug.
+   * A transient failure keeps the resolved role: the API remains
+   * authoritative on every request and a 401 still signs the user out.
+   */
+  const refreshRoleInBackground = useCallback(async (): Promise<void> => {
+    try {
+      const me = await api.getMe();
+      setRole(me.role);
+      roleUserIdRef.current = me.userId;
+    } catch {
+      /* keep the resolved role; the server enforces access on every call */
     }
   }, []);
 
@@ -394,9 +418,15 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         if (!cancelled) setIsRoleLoading(true);
         try {
           const me = await api.getMe();
-          if (!cancelled) setRole(me.role);
+          if (!cancelled) {
+            setRole(me.role);
+            roleUserIdRef.current = me.userId;
+          }
         } catch {
-          if (!cancelled) setRole(null);
+          if (!cancelled) {
+            setRole(null);
+            roleUserIdRef.current = null;
+          }
         } finally {
           if (!cancelled) setIsRoleLoading(false);
         }
@@ -418,10 +448,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
       setSession(currentSession);
       setUser(currentSession?.user ?? null);
 
+      // A refreshed token or the initial replay carries no new authorization
+      // facts: the role lives on the server allowlist, not in the JWT, and
+      // the initial restoration effect already resolves it. Nothing else to
+      // do — in particular no loading flag, so the mounted page stays put.
+      if (_event === 'TOKEN_REFRESHED' || _event === 'INITIAL_SESSION') {
+        return;
+      }
+
       if (_event === 'SIGNED_OUT') {
         setAal(null);
         setFactors([]);
         setRole(null);
+        roleUserIdRef.current = null;
         setIsRoleLoading(false);
         if (subscriptionRef.current) {
           subscriptionRef.current.unsubscribe();
@@ -430,13 +469,20 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         return;
       }
 
-      // For SIGNED_IN, TOKEN_REFRESHED, USER_UPDATED — refresh AAL
+      // For SIGNED_IN, USER_UPDATED — refresh AAL and the role.
       if (currentSession) {
         // AAL tracked for observability only (ADR-0011).
         getAalLevel().then((level) => {
           setAal(level);
         });
-        refreshRole();
+        // Same user, role already resolved (tab focus re-announces the
+        // session as SIGNED_IN): refresh quietly. New or different user:
+        // resolve with the loading gate so nothing renders before the role.
+        if (roleUserIdRef.current != null && roleUserIdRef.current === currentSession.user.id) {
+          refreshRoleInBackground();
+        } else {
+          refreshRole();
+        }
         getVerifiedTotpFactors().then((verifiedFactors) => {
           setFactors(verifiedFactors);
         });
@@ -449,7 +495,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     return () => {
       subscription.unsubscribe();
     };
-  }, [refreshRole]);
+  }, [refreshRole, refreshRoleInBackground]);
 
   /* ── Memoised context value ───────────────────────────────────── */
   const value = useMemo<AuthState>(

@@ -40,7 +40,7 @@ import {
   sessionStatusLabel,
 } from "../components/talent";
 import { formatDateTime } from "../lib/datetime";
-import { PhoneSlotPicker } from "../components/phone-calendar";
+import { PhoneSlotPicker, engagementStateTerm } from "../components/phone-calendar";
 import { istToday } from "../lib/ist-datetime";
 import type { IstDate } from "../lib/ist-datetime";
 import type { PhoneSlot } from "../types";
@@ -177,7 +177,10 @@ function OverviewTab({
   phoneRole: MeResponse["role"];
 }) {
   return (
-    <div className="grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-3">
+    // `fade-up-stagger` is the CSS-only reveal: candidate-scoped source may
+    // not import a motion library, and this collapses with every other
+    // animation under the global reduced-motion rule in index.css.
+    <div className="fade-up-stagger grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-3">
       {/* Profile */}
       <CandidateProfileCard
         candidate={candidate}
@@ -364,7 +367,12 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
 
   return (
     <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
-      <h2 id={headingId} className="text-sm font-semibold text-ink">Phone screening cycles</h2>
+      <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
+        Phone screening cycles
+      </h2>
+      <p className="mt-0.5 text-[13px] text-ink-tertiary">
+        A request never dials on its own — every call still passes the normal admission gates.
+      </p>
       {error ? (
         <div className="mt-2 flex flex-wrap items-center gap-2">
           <p role="alert" className="text-sm text-ink-secondary">Phone cycle history unavailable.</p>
@@ -385,9 +393,12 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
               role="dialog"
               aria-modal="true"
               aria-labelledby={`${headingId}-confirm`}
-              className="mt-4 rounded-lg border border-[var(--c-border)] bg-[var(--c-surface-muted)] p-4"
+              // The same sunken material a `SurfaceCard level="sunken"` paints,
+              // applied directly because this well is also a dialog and must
+              // keep `role`/`aria-modal` on the same element.
+              className="glass-sunken mt-4 p-4"
             >
-              <h3 id={`${headingId}-confirm`} className="text-sm font-semibold text-ink">Confirm phone screening</h3>
+              <h3 id={`${headingId}-confirm`} className="text-[13px] font-medium text-ink">Confirm phone screening</h3>
               <p className="mt-1 text-sm text-ink-secondary">
                 Request one phone screening for this candidate? The system will call only if every safety gate passes.
               </p>
@@ -401,8 +412,8 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
               </div>
             </div>
           )}
-          <div className="mt-4 rounded-lg border border-line bg-surface-muted p-3">
-            <h3 className="text-xs font-medium uppercase tracking-wide text-ink-secondary">Schedule a slot</h3>
+          <SurfaceCard level="sunken" className="mt-4 p-3">
+            <h3 className="text-[13px] font-medium text-ink-secondary">Schedule a slot</h3>
             <p className="mt-1 text-xs text-ink-tertiary">
               Choose an IST slot. Availability is advisory; normal admission gates still decide whether a call can start.
             </p>
@@ -419,7 +430,7 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
             <CandidateButton className="mt-3" variant="primary" onClick={() => void saveAppointment()} loading={savingAppointment} disabled={!selectedSlot}>
               Book slot
             </CandidateButton>
-          </div>
+          </SurfaceCard>
         </>
       ) : (
         <>
@@ -428,7 +439,9 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
               <li key={`${cycle.cycle_number}-${cycle.created_at}`} className="py-2 text-sm">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="font-medium text-ink">{cycleLabel(cycle)}</span>
-                  <StatusBadge tone={cycle.terminal_at ? "neutral" : "info"}>{cycle.state}</StatusBadge>
+                  <StatusBadge tone={cycle.terminal_at ? "neutral" : "info"}>
+                    <span title={cycle.state}>{cycle.state === "unknown" ? "Unknown" : engagementStateTerm(cycle.state).label}</span>
+                  </StatusBadge>
                 </div>
                 <p className="mt-1 text-xs text-ink-tertiary">
                   {cycle.has_assessment ? "Assessment recorded" : cycle.has_session ? "Session recorded" : "No session yet"}
@@ -445,8 +458,8 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
           ) : canRescreen && requiresVerification && !admin ? (
             <p className="mt-3 text-sm text-warning">An administrator must verify a replacement number before this cycle can be re-screened.</p>
           ) : canRescreen && requiresVerification && admin ? (
-            <div className="mt-4 rounded-lg border border-line bg-surface-muted p-3">
-              <label htmlFor={`${headingId}-phone`} className="block text-xs font-medium text-ink-secondary">
+            <SurfaceCard level="sunken" className="mt-4 p-3">
+              <label htmlFor={`${headingId}-phone`} className="block text-[13px] font-medium text-ink-secondary">
                 Verify replacement Indian mobile
               </label>
               <div className="mt-2 flex flex-wrap gap-2">
@@ -462,10 +475,10 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
                   Verify number
                 </CandidateButton>
               </div>
-            </div>
+            </SurfaceCard>
           ) : canRescreen ? (
-            <div className="mt-4 rounded-lg border border-line bg-surface-muted p-3">
-              <label htmlFor={`${headingId}-reason`} className="block text-xs font-medium text-ink-secondary">
+            <SurfaceCard level="sunken" className="mt-4 p-3">
+              <label htmlFor={`${headingId}-reason`} className="block text-[13px] font-medium text-ink-secondary">
                 Reason for new cycle
               </label>
               <CandidateSelect
@@ -479,14 +492,14 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
               <CandidateButton className="mt-3" variant="primary" onClick={() => void requestRescreen()} loading={requesting}>
                 Request re-screen
               </CandidateButton>
-            </div>
+            </SurfaceCard>
           ) : current?.terminal_at ? (
             <p className="mt-3 text-sm text-ink-secondary">This cycle is terminal; no new cycle can be started from its current state.</p>
           ) : null}
 
           {(!current || current.terminal_at === null) && (
-            <div className="mt-4 rounded-lg border border-line bg-surface-muted p-3">
-              <h3 className="text-xs font-medium uppercase tracking-wide text-ink-secondary">
+            <SurfaceCard level="sunken" className="mt-4 p-3">
+              <h3 className="text-[13px] font-medium text-ink-secondary">
                 {current?.appointment ? "Move appointment" : "Schedule a slot"}
               </h3>
               <p className="mt-1 text-xs text-ink-tertiary">
@@ -517,7 +530,7 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
                   </CandidateButton>
                 )}
               </div>
-            </div>
+            </SurfaceCard>
           )}
         </>
       )}
@@ -563,10 +576,15 @@ function NotesSection({ candidateId }: { candidateId: string }) {
 
   return (
     <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
-      <h2 id={headingId} className="mb-3 text-sm font-semibold text-ink">
+      <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
         Notes
       </h2>
-      <NotesList notes={notes} error={err} />
+      <p className="mb-3 mt-0.5 text-[13px] text-ink-tertiary">
+        Recruiter notes, appended in order.
+      </p>
+      <SurfaceCard level="sunken" className="p-3">
+        <NotesList notes={notes} error={err} />
+      </SurfaceCard>
       <div className="mt-3 flex flex-wrap gap-2">
         <label htmlFor="note-input" className="sr-only">
           Add a note
@@ -643,9 +661,12 @@ function AppealsSection({
 
   return (
     <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
-      <h2 id={headingId} className="mb-3 text-sm font-semibold text-ink">
+      <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
         Appeals
       </h2>
+      <p className="mb-3 mt-0.5 text-[13px] text-ink-tertiary">
+        Open and resolved appeals for this candidate.
+      </p>
       {err ? (
         <p className="text-sm text-error">{err}</p>
       ) : appeals === null ? (
@@ -680,15 +701,15 @@ function AppealsSection({
         </ul>
       )}
 
-      <div className="mt-4 rounded-lg border border-[var(--c-border)] p-4">
-        <h3 className="text-sm font-semibold text-ink">Issue appeal grant</h3>
-        <p className="mt-1 max-w-prose text-xs leading-relaxed text-ink-tertiary">
+      <SurfaceCard level="sunken" className="mt-4 p-4">
+        <h3 className="text-[13px] font-medium text-ink">Issue appeal grant</h3>
+        <p className="mt-1 max-w-prose text-[13px] leading-relaxed text-ink-tertiary">
           A one-time fragment link the candidate opens at /appeal. Explicit
           expiry is required (1–72 hours); the plaintext is shown only once.
         </p>
         <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
           <div>
-            <label htmlFor="appeal-session" className="block text-xs font-medium text-ink-secondary">
+            <label htmlFor="appeal-session" className="block text-[13px] font-medium text-ink-secondary">
               Session
             </label>
             <CandidateSelect
@@ -709,7 +730,7 @@ function AppealsSection({
             </CandidateSelect>
           </div>
           <div>
-            <label htmlFor="appeal-expiry" className="block text-xs font-medium text-ink-secondary">
+            <label htmlFor="appeal-expiry" className="block text-[13px] font-medium text-ink-secondary">
               Expires in (hours, 1–72)
             </label>
             <CandidateInput
@@ -734,7 +755,7 @@ function AppealsSection({
         </CandidateButton>
         {msg && <p className="mt-2 max-w-prose text-xs text-ink-secondary">{msg}</p>}
         {grantLink && (
-          <div className="mt-2 rounded-lg bg-[var(--c-border-light)] p-3">
+          <div className="mt-2 rounded-control border border-[var(--c-border)] bg-[var(--c-surface)] p-3">
             <p className="text-xs font-semibold text-ink-secondary">One-time link (shown once)</p>
             <code className="block break-all text-xs text-ink-secondary">{grantLink}</code>
             <p className="mt-1 max-w-prose text-[11px] leading-relaxed text-ink-tertiary">
@@ -743,7 +764,7 @@ function AppealsSection({
             </p>
           </div>
         )}
-      </div>
+      </SurfaceCard>
     </SurfaceCard>
   );
 }

@@ -10,11 +10,16 @@
  * mistake still stops CI, while a production page keeps rendering rather
  * than blanking over a visual-hierarchy rule. See the guard below.
  *
- *   level="base"    bordered white surface — a real card
+ *   level="base"    frosted glass panel floating on the lit ground
  *   level="sunken"  tinted well with no border — a block INSIDE a card
  *
- * Colour comes only from `--c-*`, which resolve solely under
- * `.candidate-scope` (see src/styles/candidate-palette.css).
+ * Depth is material: one glass panel per logical block, `glass-sunken` wells
+ * inside it, never glass inside glass — which is exactly what the depth
+ * clamp below enforces mechanically.
+ *
+ * Any colour this component adds on top comes only from `--c-*`, which
+ * resolve solely under `.candidate-scope` (see
+ * src/styles/candidate-palette.css).
  */
 
 import { createContext, useContext } from 'react';
@@ -29,8 +34,13 @@ const SurfaceDepthContext = createContext(0);
 export const MAX_SURFACE_DEPTH = 2;
 
 const levelStyles: Record<SurfaceLevel, string> = {
-  base: 'rounded-xl border border-[var(--c-border)] bg-[var(--c-surface)]',
-  sunken: 'rounded-lg bg-[var(--c-border-light)]',
+  // The glass material itself. `glass` and `glass-sunken` are the app's own
+  // surface utilities (src/index.css) — they carry the translucency, the
+  // hairline ring and the radius, and they collapse to opaque fills under
+  // `prefers-reduced-transparency` or a missing `backdrop-filter`. Neither
+  // is a colour word, so the candidate-scope source guard is unaffected.
+  base: 'glass rounded-card',
+  sunken: 'glass-sunken',
 };
 
 export interface SurfaceCardProps {
