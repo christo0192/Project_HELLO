@@ -118,6 +118,15 @@ export interface WorkerOrchestrationDeps {
   readonly readyPollMs?: number;
   /** Per-sweep reap cap. Defaults to 50. */
   readonly reapMaxPerRun?: number;
+  /**
+   * Optional structured-event sink. The component logger's meta allowlist drops
+   * non-allowlisted keys (counts like `released`/`stopFailed`, the `app`), so the
+   * log line carries only the event KIND. This sink receives the FULL payload,
+   * so operational counters and tests can observe what the log cannot. Called in
+   * addition to — never instead of — the log line. Best-effort: a throwing sink
+   * must never break a fail-open path, so it is wrapped.
+   */
+  readonly onEvent?: (kind: string, payload: Record<string, unknown>) => void;
 }
 
 // ── Result types ────────────────────────────────────────────────────────────
@@ -135,6 +144,12 @@ export interface ReapResult {
   disabled?: boolean;
 }
 
+export interface ReleaseTerminalResult {
+  released: number;
+  /** When the flag is off nothing is scanned; surfaced for the caller/health. */
+  disabled?: boolean;
+}
+
 export interface WorkerOrchestrationService {
   ensureReadyWorker(input: {
     app: string;
@@ -147,6 +162,40 @@ export interface WorkerOrchestrationService {
     app: string;
     machineId: string;
     sessionId: string;
+  }): Promise<void>;
+  /**
+   * Terminal-release choke point, addressed by SESSION rather than machine.
+   * Restart-safe: a process that never saw the dial (and so has no machineId)
+   * can still release the claim a session holds, because the lease table maps
+   * machine<->session. Drains the lease via `release_voice_worker_by_session`,
+   * then stops the returned machine and resets the row — the same
+   * release->stop->reset order `releaseWorker` uses, each step fail-open. A
+   * no-op (returns without touching Fly) when the session holds no live claim.
+   */
+  releaseWorkerBySession(input: { app: string; sessionId: string }): Promise<void>;
+  /**
+   * The PROMPT-release pass: find every live lease whose bound call_session is
+   * already terminal and release it now, rather than waiting for the reaper's
+   * grace window. The universal terminal signal — every terminal path drives
+   * the session terminal — so this catches call completed / failed / no_answer
+   * / abandoned / reconnect-exhausted / crash without any per-terminal wiring.
+   * Bounded per run. The reaper remains the backstop for anything this misses
+   * (e.g. a session row deleted before release).
+   */
+  releaseTerminalSessions(input: { app: string }): Promise<ReleaseTerminalResult>;
+  /**
+   * Mark the lease `busy` at the moment the API learns the dial succeeded and a
+   * call is live — the second liveness signal the reaper can lean on beyond
+   * LiveKit room-liveness. CAS on (machine, session, epoch): a stale caller
+   * matches no row and is a silent no-op. Best-effort: a failure never fails
+   * the dial (the lease is already `ready`, which the reaper spares while the
+   * room is live). No-op when the gate is disabled.
+   */
+  markBusy(input: {
+    app: string;
+    machineId: string;
+    sessionId: string;
+    epoch: number;
   }): Promise<void>;
   reapWorkers(input: { app: string }): Promise<ReapResult>;
 }
@@ -170,7 +219,7 @@ function envelope(
 }
 
 /** A metadata-only sweep/lifecycle log line. Never a session id or a token. */
-function event(kind: string, extra: Record<string, unknown> = {}): void {
+function logEvent(kind: string, extra: Record<string, unknown> = {}): void {
   log.info('unknown_event', { error_category: `worker_orchestration_${kind}`, ...extra });
 }
 
@@ -186,6 +235,23 @@ export function createWorkerOrchestrationService(
   const startWaitSec = deps.startWaitSec ?? DEFAULT_START_WAIT_SEC;
   const readyPollMs = Math.max(50, deps.readyPollMs ?? DEFAULT_READY_POLL_MS);
   const reapMaxPerRun = Math.max(1, deps.reapMaxPerRun ?? DEFAULT_REAP_MAX_PER_RUN);
+
+  /**
+   * Emit a lifecycle event. Always logs (KIND only, per the meta allowlist), and
+   * ALSO hands the full payload to the optional structured sink so counts the log
+   * cannot carry are still observable. The sink is wrapped so a throwing one can
+   * never break a fail-open path.
+   */
+  const event = (kind: string, payload: Record<string, unknown> = {}): void => {
+    logEvent(kind, payload);
+    if (deps.onEvent) {
+      try {
+        deps.onEvent(kind, payload);
+      } catch {
+        /* a sink must never break orchestration */
+      }
+    }
+  };
 
   /**
    * Best-effort teardown of a claim that never became a live session. Fail-OPEN
@@ -373,6 +439,148 @@ export function createWorkerOrchestrationService(
     }
   }
 
+  /**
+   * Drain a session's lease, then stop + reset the machine it named. Shared by
+   * the terminal handler (`releaseWorkerBySession`) and the prompt-release pass
+   * (`releaseTerminalSessions`).
+   *
+   * ── P4: FAIL-OPEN IS NOT FAIL-SILENT, AND `released` MEANS STOPPED ─────
+   * Every step is still fail-open (the reaper backstops), but each failure now
+   * emits a DISTINCT event so a swallowed error is observable rather than
+   * invisible. And the return distinguishes THREE outcomes so the pass can count
+   * honestly:
+   *   * `{ stopped: null }`           — no live claim / no machine id / release
+   *                                     RPC threw. Nothing was stopped.
+   *   * `{ stopped: id }`             — the machine was CONFIRMED stopped. Only
+   *                                     this counts toward `released`.
+   *   * `{ stopped: null, stopFailedMachineId: id }` — a machine was named but
+   *                                     the Fly stop threw. It is STILL RUNNING;
+   *                                     it must NOT count as released. The
+   *                                     reaper (or the next pass) retries.
+   * The old code returned the machine id even when the stop threw, so
+   * `releaseTerminalSessions` counted a still-running machine as `released` and
+   * reported success while cost kept accruing — the exact fail-open-as-success
+   * defect P4 flags.
+   */
+  async function drainSessionLease(
+    app: string,
+    sessionId: string,
+  ): Promise<{ stopped: string | null; stopFailedMachineId?: string }> {
+    let machineId: string | null = null;
+    try {
+      const res = envelope(
+        'release_voice_worker_by_session',
+        await deps.rpc('release_voice_worker_by_session', {
+          p_app: app,
+          p_session_id: sessionId,
+          p_now: new Date(now()).toISOString(),
+        }),
+      );
+      // 'already_released' carries no machine id (idempotent): nothing to stop.
+      if (res.status === 'draining' && typeof res.machine_id === 'string') {
+        machineId = res.machine_id;
+      }
+    } catch {
+      // The release RPC threw. Distinct event so it is not silently swallowed;
+      // the reaper backstops. Nothing to stop and nothing released.
+      event('terminal_release_rpc_error', { app });
+      return { stopped: null };
+    }
+    if (machineId === null) return { stopped: null };
+    try {
+      await deps.fly.stopMachine(app, machineId);
+    } catch {
+      // Could not stop — the machine is STILL RUNNING. Do NOT reset a row we did
+      // not confirm stopped, and do NOT count it released. Emit a distinct event
+      // and hand back the machine id under `stopFailedMachineId` so the pass can
+      // tally it separately. The lease is 'draining', which the reaper treats as
+      // reapable, and the next pass retries.
+      event('terminal_release_stop_failed', { app, machineId });
+      return { stopped: null, stopFailedMachineId: machineId };
+    }
+    try {
+      await deps.rpc('reset_voice_worker', {
+        p_app: app,
+        p_machine_id: machineId,
+        p_now: new Date(now()).toISOString(),
+      });
+    } catch {
+      // The machine IS stopped (cost is halted), only the pool-row reset failed.
+      // Distinct event; the row can be reset on a later pass. Still counts as
+      // released — the expensive thing (a running machine) is gone.
+      event('terminal_release_reset_failed', { app, machineId });
+    }
+    return { stopped: machineId };
+  }
+
+  async function releaseWorkerBySession(input: {
+    app: string;
+    sessionId: string;
+  }): Promise<void> {
+    if (!enabled) return;
+    await drainSessionLease(input.app, input.sessionId);
+  }
+
+  async function releaseTerminalSessions(input: {
+    app: string;
+  }): Promise<ReleaseTerminalResult> {
+    if (!enabled) return { released: 0, disabled: true };
+    const { app } = input;
+
+    let sessions: string[];
+    try {
+      const raw = await deps.rpc('list_terminal_session_leases', {
+        p_app: app,
+        p_limit: reapMaxPerRun,
+      });
+      if (raw.error) throw new Error('list_error');
+      const rows = Array.isArray(raw.data) ? raw.data : [];
+      sessions = rows
+        .map((r) => (r && typeof r === 'object' ? (r as Record<string, unknown>) : {}))
+        .map((r) => (typeof r.claimed_session_id === 'string' ? r.claimed_session_id : ''))
+        .filter((s) => s !== '');
+    } catch {
+      event('terminal_release_list_error', { app });
+      return { released: 0 };
+    }
+
+    let released = 0;
+    let stopFailed = 0;
+    let scanned = 0;
+    for (const sessionId of sessions) {
+      if (scanned >= reapMaxPerRun) break;
+      scanned += 1;
+      const outcome = await drainSessionLease(app, sessionId);
+      // Count `released` ONLY on a confirmed stop. A named-but-not-stopped
+      // machine is tallied separately as `stopFailed` (it is still running); the
+      // per-session `terminal_release_stop_failed` event already fired.
+      if (outcome.stopped !== null) released += 1;
+      else if (outcome.stopFailedMachineId !== undefined) stopFailed += 1;
+    }
+    event('terminal_release_swept', { app, released, stopFailed, scanned });
+    return { released };
+  }
+
+  async function markBusy(input: {
+    app: string;
+    machineId: string;
+    sessionId: string;
+    epoch: number;
+  }): Promise<void> {
+    if (!enabled) return;
+    try {
+      await deps.rpc('mark_voice_worker_busy', {
+        p_app: input.app,
+        p_machine_id: input.machineId,
+        p_session_id: input.sessionId,
+        p_epoch: input.epoch,
+        p_now: new Date(now()).toISOString(),
+      });
+    } catch {
+      /* best-effort: the lease is already 'ready', which the reaper spares */
+    }
+  }
+
   async function reapWorkers(input: { app: string }): Promise<ReapResult> {
     if (!enabled) return { stopped: 0, disabled: true };
     const { app } = input;
@@ -447,7 +655,14 @@ export function createWorkerOrchestrationService(
     return { stopped };
   }
 
-  return { ensureReadyWorker, releaseWorker, reapWorkers };
+  return {
+    ensureReadyWorker,
+    releaseWorker,
+    releaseWorkerBySession,
+    releaseTerminalSessions,
+    markBusy,
+    reapWorkers,
+  };
 }
 
 function boundReadyTimeout(readyTimeoutSec: number | undefined): number {

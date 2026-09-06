@@ -27,6 +27,10 @@ import {
   clearPhoneRuntimeRegistration,
   recordPhoneRuntimeStartFailure,
 } from './lib/phone-runtime/health.js';
+import {
+  createWorkerOrchestrationRuntime,
+  type WorkerOrchestrationRuntimeHandle,
+} from './lib/worker-orchestration-runtime.js';
 
 const startupLogger = createLogger('startup');
 const app = createApp();
@@ -98,6 +102,25 @@ try {
   recordPhoneRuntimeStartFailure();
 }
 
+// ── On-demand worker orchestration reaper (disabled by default) ───────────────
+// A FOURTH independent try/catch. `createWorkerOrchestrationRuntime` returns null
+// unless `WORKER_ORCHESTRATION` is true, so with the shipped default nothing is
+// constructed: no scheduler, no timer, no Fly client, no DB poll. It arms two
+// loops — a prompt terminal-release pass and the reaper backstop — that together
+// enforce invariant I2 (never leave a machine started without a live session).
+// A failure to construct it must never prevent the API — or the other three
+// runtimes — from serving.
+let workerOrchestrationRuntime: WorkerOrchestrationRuntimeHandle | null = null;
+try {
+  workerOrchestrationRuntime = createWorkerOrchestrationRuntime();
+} catch {
+  // Sanitized: the error is not logged verbatim because it can carry config text.
+  startupLogger.warn('unknown_event', {
+    error_category: 'worker_orchestration_runtime_start_failed',
+  });
+  workerOrchestrationRuntime = null;
+}
+
 server.listen(env.port, () => {
   if (recordingRuntime) {
     recordingRuntime.scheduler.start();
@@ -134,6 +157,12 @@ server.listen(env.port, () => {
       // surface, which `armPhoneRuntime` has already set.
       startupLogger.warn('unknown_event', { error_category: 'phone_runtime_arm_failed' });
     }
+  }
+  if (workerOrchestrationRuntime) {
+    // Only present when WORKER_ORCHESTRATION is on (construction returned null
+    // otherwise). Start the reaper + terminal-release loops now that the process
+    // is serving, mirroring the recording/ashby runtimes.
+    workerOrchestrationRuntime.scheduler.start();
   }
   startupLogger.info('startup_listen', {
     port: env.port,
@@ -175,6 +204,17 @@ shutdown.boot(server).then(async (code) => {
       // finalize job in flight either completes or fails UNDER ITS LEASE, and
       // an abandoned lease is recovered by the reclaim loop on any machine.
       await recordingRuntime.stop();
+    } catch {
+      // Never let a worker-stop failure change the process exit code.
+    }
+  }
+  if (workerOrchestrationRuntime) {
+    try {
+      // Stopped in its own try, like the others. A reap/terminal-release pass
+      // in flight either completes or is dropped mid-loop; either way the next
+      // process's loops (and the grace-based reaper) recover any machine left
+      // started, so an interrupted sweep leaks nothing durable.
+      await workerOrchestrationRuntime.stop();
     } catch {
       // Never let a worker-stop failure change the process exit code.
     }

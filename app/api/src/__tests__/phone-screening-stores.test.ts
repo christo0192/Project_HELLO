@@ -485,6 +485,10 @@ describe('errors and malformed answers', () => {
       // array, so a leaked PostgREST error must not escape either.
       ['phone_finalize_partial_sessions_error', () => stores.finalizePartialSessions!({
         now: NOW })],
+      // 0083. The same-IST-day infra abandon; a leaked driver error would quote
+      // the failing statement (attempt id), so it too must be sanitized.
+      ['phone_abandon_infra_error', () => stores.abandonAttemptInfra!({
+        attemptId: 'a', now: NOW })],
     ];
     expect(attempts).toHaveLength(PHONE_RPC_NAMES.length);
     for (const [code, run] of attempts) {

@@ -475,8 +475,14 @@ export function createPhoneRuntime(
               pipeline: input.pipeline,
               sessionId: input.sessionId,
               epoch: input.epoch,
+              // Gap 4: the phone gate raises the ready budget from the service
+              // default (30s) to accommodate historical 15-25s+ worker boots.
+              readyTimeoutSec: env.phoneWorkerReadyTimeoutSec,
             }),
           releaseWorker: (input) => orchestrationService.releaseWorker(input),
+          // Gap 3: mark the lease busy the instant the dial reports success, so
+          // the reaper has a second liveness signal beyond LiveKit room state.
+          markBusy: (input) => orchestrationService.markBusy(input),
         };
 
   // ── THE CLAIM GATE, CACHED AND FAIL-CLOSED ───────────────────────────

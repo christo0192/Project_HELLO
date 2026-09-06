@@ -38,6 +38,7 @@ const _contractVisibleEnvReads = [
   process.env.FLY_API_TOKEN,
   process.env.FLY_API_BASE_URL,
   process.env.WORKER_REAPER_GRACE_SEC,
+  process.env.PHONE_WORKER_READY_TIMEOUT_SEC,
 ];
 void _contractVisibleEnvReads;
 
@@ -257,6 +258,16 @@ export const env = {
    * one grace window of possible cost leak; clamped 30..3600.
    */
   workerReaperGraceSec: positiveInt('WORKER_REAPER_GRACE_SEC', 180, 30, 3600),
+  /**
+   * Wall-clock budget (seconds) the dial gate gives a claimed machine to boot,
+   * register with LiveKit and post its readiness ping before the dial is
+   * DEFERRED (`worker_not_ready`) and the claim cleaned up. The service default
+   * is 30s, but historical worker cold-boot is 15-25s+ and a browser+SDK warm
+   * can push past 30s, so the phone gate raises it to 75s to avoid deferring a
+   * machine that would have been ready moments later. Clamped 30..300. Only
+   * meaningful when `workerOrchestration` is true.
+   */
+  phoneWorkerReadyTimeoutSec: positiveInt('PHONE_WORKER_READY_TIMEOUT_SEC', 75, 30, 300),
   /**
    * The dispatch name of the NAMED browser worker (design §2.3b B-i). EMPTY by
    * default, which is byte-identical to today: the browser worker stays UNNAMED

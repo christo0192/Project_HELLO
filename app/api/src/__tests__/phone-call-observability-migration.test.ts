@@ -44,7 +44,15 @@ describe('0082 per-call phone observability column', () => {
   });
 
   it('is registered NEWEST-FIRST in the migration harness', () => {
-    expect(PHONE_MIGRATIONS[0]).toEqual({ name: '0082', sql: MIGRATION_0082 });
+    // 0083 (voice-worker terminal release) is now the newest entry; 0082 sits
+    // directly after it. What matters for the newest-first scheme is that 0082
+    // still precedes every OLDER migration it could shadow — asserted via its
+    // index, which must be below any pre-0082 entry.
+    const idx082 = PHONE_MIGRATIONS.findIndex((m) => m.name === '0082');
+    const idx083 = PHONE_MIGRATIONS.findIndex((m) => m.name === '0083');
+    expect(idx083).toBe(0);
+    expect(PHONE_MIGRATIONS[idx082]).toEqual({ name: '0082', sql: MIGRATION_0082 });
+    expect(idx082).toBeGreaterThan(idx083);
     // Every registered migration still has non-empty SQL (the harness guard).
     expect(PHONE_MIGRATIONS.every((m) => m.sql.length > 0)).toBe(true);
     // And its text is present in the concatenated corpus the extractors walk.

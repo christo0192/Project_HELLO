@@ -433,7 +433,35 @@ function analyzeMigrations(files) {
         const m = /drop\s+index\s+(?:if\s+exists\s+)?("?[a-z0-9_.-]+"?)/i.exec(stmt);
         const idxName = m ? m[1].replace(/^"|"$/g, "") : null;
         const idxUnqualified = idxName ? idxName.split(".").pop() : null;
-        if (idxUnqualified && model.indexes.has(idxUnqualified)) {
+        // 0083 narrows the per-IST-day partial UNIQUE by dropping and RE-CREATING
+        // it under the SAME name in the SAME migration (a partial-unique index
+        // cannot be narrowed in place). The narrowing only REMOVES rows from the
+        // index's coverage (infra-deferred abandonments), so it can never newly
+        // reject an admission the old index allowed, and the chain's final state
+        // still carries the index. This is the one sanctioned index-narrowing —
+        // migration-local, name-scoped, and requiring an inline sanction marker,
+        // a re-create of the same index in the same file, that the re-create
+        // FOLLOWS this DROP (order matters: a CREATE-then-DROP would leave the
+        // chain with NO index), AND that the re-create carries the EXPECTED
+        // narrowed predicate (`abandon_reason = 'infra_deferred'`). Reviewer
+        // minor: without the order + predicate assertions the same-name-recreate
+        // check would pass a broken swap. Every other DROP INDEX stays RED.
+        const dropIdxPos = sql.indexOf(stmt);
+        const createIdxRe = new RegExp(
+          `create\\s+unique\\s+index\\s+if\\s+not\\s+exists\\s+${idxUnqualified ?? ''}\\b[\\s\\S]*?abandon_reason\\s*=\\s*'infra_deferred'`,
+          'i',
+        );
+        const createIdxMatch = idxUnqualified ? createIdxRe.exec(sql) : null;
+        const createFollowsDrop =
+          createIdxMatch !== null && dropIdxPos >= 0 && createIdxMatch.index > dropIdxPos;
+        const sanctionedIndexNarrow =
+          migration.startsWith('0083_voice_worker_terminal_release') &&
+          idxUnqualified === 'uq_phone_attempts_one_per_ist_day' &&
+          /INDEX-NARROW SANCTION/.test(sql) &&
+          createFollowsDrop;
+        if (sanctionedIndexNarrow) {
+          ok(migration, stmt, "REPLACEABLE_DROP_INDEX", "0083 sanctioned index-narrow: drop + re-create same name (CREATE follows DROP, carries narrowed predicate; coverage only shrinks)");
+        } else if (idxUnqualified && model.indexes.has(idxUnqualified)) {
           red(migration, stmt, "DESTRUCTIVE_DROP_INDEX", `DROP INDEX '${idxName}' removes an index created by an earlier migration; no reverse SQL`);
         } else if (!guarded) {
           red(migration, stmt, "DESTRUCTIVE_DROP_INDEX_UNGUARDED", "DROP INDEX without IF EXISTS on a forward-only chain");

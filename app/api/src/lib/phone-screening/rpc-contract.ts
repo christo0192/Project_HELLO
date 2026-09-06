@@ -75,6 +75,10 @@ export const PHONE_RPC_NAMES = [
   'sweep_phone_stranded_recordings',
   // 0072 — server-side partial-finalize on a non-terminal-ending call.
   'finalize_phone_partial_sessions',
+  // 0083 — immediate same-IST-day abandonment for a pre-originate infra defer
+  // (worker_not_ready). Restores the engagement to its prior state; charges no
+  // budget. Paired with the 0083 narrowed per-IST-day index.
+  'abandon_phone_attempt_infra',
 ] as const;
 
 export type PhoneRpcName = (typeof PHONE_RPC_NAMES)[number];
@@ -222,6 +226,8 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
     finalize_phone_partial_sessions: [
       'p_limit', 'p_grace_seconds', 'p_now',
     ],
+    // 0083 (P3 adds p_backoff_seconds between the attempt id and p_now).
+    abandon_phone_attempt_infra: ['p_attempt_id', 'p_backoff_seconds', 'p_now'],
   });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -297,6 +303,19 @@ export const CLAIM_PHONE_SWEEP_STATUSES = ['ok', 'held_by_other', 'invalid_input
 
 /** `reclaim_phone_attempt_leases` — a bounded sweep always answers `ok`. */
 export const RECLAIM_PHONE_ATTEMPT_LEASES_STATUSES = ['ok'] as const;
+
+/**
+ * `abandon_phone_attempt_infra` (0083) — immediate same-IST-day abandonment of
+ * a pre-originate infra defer. `abandoned` on success, `already_ended` when the
+ * attempt is already terminal (a duplicate refusal — idempotent no-op),
+ * `unknown_attempt` when the id is unknown, `invalid_request` on a null id.
+ */
+export const ABANDON_PHONE_ATTEMPT_INFRA_STATUSES = [
+  'abandoned',
+  'already_ended',
+  'unknown_attempt',
+  'invalid_request',
+] as const;
 
 export type ReclaimPhoneAttemptLeasesStatus =
   (typeof RECLAIM_PHONE_ATTEMPT_LEASES_STATUSES)[number];
@@ -659,6 +678,7 @@ export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]
     commit_phone_item_turn: COMMIT_PHONE_ITEM_TURN_STATUSES,
     sweep_phone_stranded_recordings: SWEEP_PHONE_STRANDED_RECORDINGS_STATUSES,
     finalize_phone_partial_sessions: FINALIZE_PHONE_PARTIAL_SESSIONS_STATUSES,
+    abandon_phone_attempt_infra: ABANDON_PHONE_ATTEMPT_INFRA_STATUSES,
   });
 
 /**
@@ -704,8 +724,15 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
  *
  * 0081 takes it from 104 to 105: `arm_phone_test_gate` gains exactly ONE new
  * member, `test_gate_appointment_not_due` (the scheduled-but-not-due refusal).
+ *
+ * 0083 takes it from 105 to 108: `abandon_phone_attempt_infra` adds three new
+ * members — `abandoned`, `already_ended` and `invalid_request`. Its fourth
+ * member `unknown_attempt` was already in the union (from
+ * `confirm_candidate_voice_callback` / `apply_phone_event`). The exact number is
+ * RE-DERIVED by the drift test from the migration text; this constant is only a
+ * tripwire.
  */
-export const PHONE_RPC_STATUS_COUNT = 105;
+export const PHONE_RPC_STATUS_COUNT = 108;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.

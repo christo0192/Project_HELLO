@@ -36,6 +36,15 @@ function fakeService(ensure: EnsureReadyResult): WorkerOrchestrationService & {
     async releaseWorker(input) {
       releaseCalls.push(input);
     },
+    async releaseWorkerBySession() {
+      /* not exercised by the browser gate tests */
+    },
+    async releaseTerminalSessions() {
+      return { released: 0 };
+    },
+    async markBusy() {
+      /* not exercised by the browser gate tests */
+    },
     async reapWorkers() {
       return { stopped: 0 };
     },

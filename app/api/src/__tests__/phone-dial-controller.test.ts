@@ -140,6 +140,8 @@ interface Harness {
   dispatch: ReturnType<typeof vi.fn>;
   ensureReadyWorker: ReturnType<typeof vi.fn>;
   releaseWorker: ReturnType<typeof vi.fn>;
+  markBusy: ReturnType<typeof vi.fn>;
+  abandonAttemptInfra: ReturnType<typeof vi.fn>;
 }
 
 function harness(opts: {
@@ -177,9 +179,17 @@ function harness(opts: {
     // silently no-op fake would hide it if it did.
     throw new Error('phone_store_method_not_expected');
   };
+  // 0083 gap 5: the controller calls this ONLY on the worker_not_ready refusal,
+  // to make the attempt same-IST-day retryable. A spy (not `unreachable`) so
+  // tests can assert it fires exactly on that path and never otherwise.
+  const abandonAttemptInfra = vi.fn(async () => {
+    order.push('abandonAttemptInfra');
+    return { status: 'abandoned', restored: true };
+  });
   const stores = {
     admitAttempt: admit,
     heartbeatAttempt: heartbeat,
+    abandonAttemptInfra,
     // The dial controller uses the TOKEN-fenced door (it holds the token it
     // was just handed). The epoch-fenced one is the worker's, and reaching for
     // it from here would be a bug, so it throws.
@@ -242,6 +252,10 @@ function harness(opts: {
     order.push('releaseWorker');
     return undefined;
   });
+  const markBusy = vi.fn(async () => {
+    order.push('markBusy');
+    return undefined;
+  });
 
   const deps: PhoneDialDeps = {
     config: opts.config ?? screeningConfig(),
@@ -263,13 +277,14 @@ function harness(opts: {
             app: 'project-hello-phone-voice',
             ensureReadyWorker,
             releaseWorker,
+            markBusy,
           },
         }),
   };
 
   return {
     deps, admit, heartbeat, originate, createRoom, updateRoomMetadata, dispatch,
-    ensureReadyWorker, releaseWorker,
+    ensureReadyWorker, releaseWorker, markBusy, abandonAttemptInfra,
   };
 }
 
@@ -996,8 +1011,64 @@ describe('P5 dial — the on-demand worker gate', () => {
       // The service already released its own claim on a failing verdict, so the
       // controller does NOT double-release.
       expect(h.releaseWorker).not.toHaveBeenCalled();
+      // 0083 gap 5: the committed attempt is abandoned NOW so the engagement is
+      // redialable the same IST day (rather than wedged at daily_attempt_exists
+      // until IST midnight). The attempt id is the one admission returned.
+      expect(h.abandonAttemptInfra).toHaveBeenCalledTimes(1);
+      expect(h.abandonAttemptInfra).toHaveBeenCalledWith(
+        expect.objectContaining({ attemptId: ATTEMPT }),
+      );
+      // The refusal still carries the attempt id for the health surface.
+      expect(res.attemptId).toBe(ATTEMPT);
     });
   }
+
+  it('gap 5: a failing abandon RPC does not change the worker_not_ready refusal (fail-open)', async () => {
+    const h = harness({ worker: { status: 'no_capacity' } });
+    h.abandonAttemptInfra.mockRejectedValueOnce(new Error('db down'));
+    const res = await run(h);
+    expect(res.status).toBe('refused');
+    expect(res.refusal).toBe('worker_not_ready');
+    // The reclaim sweep is the backstop; the refusal is unchanged.
+  });
+
+  it('gap 5: abandon is NOT called on the READY happy path (only on the defer)', async () => {
+    const h = harness({ worker: { status: 'ready', machineId: 'm-42' } });
+    const res = await run(h);
+    expect(res.status).toBe('dialing');
+    expect(h.abandonAttemptInfra).not.toHaveBeenCalled();
+  });
+
+  it('gap 3: marks the lease BUSY after a successful dial, addressed by machine+session+epoch', async () => {
+    const h = harness({ worker: { status: 'ready', machineId: 'm-busy' } });
+    const res = await run(h);
+    expect(res.status).toBe('dialing');
+    expect(res.machineId).toBe('m-busy');
+    expect(h.markBusy).toHaveBeenCalledTimes(1);
+    expect(h.markBusy).toHaveBeenCalledWith({
+      app: 'project-hello-phone-voice',
+      machineId: 'm-busy',
+      sessionId: SESSION,
+      epoch: EPOCH,
+    });
+    // markBusy runs AFTER the originate (the dial is placed first).
+    expect(order.indexOf('originate')).toBeLessThan(order.indexOf('markBusy'));
+  });
+
+  it('gap 3: a failing markBusy does not change the dialing result (fail-open)', async () => {
+    const h = harness({ worker: { status: 'ready', machineId: 'm-busy' } });
+    h.markBusy.mockRejectedValueOnce(new Error('db down'));
+    const res = await run(h);
+    expect(res.status).toBe('dialing');
+    expect(res.machineId).toBe('m-busy');
+  });
+
+  it('gap 3: markBusy is NOT called when no gate is injected (byte-identical path)', async () => {
+    const h = harness({}); // no workerGate
+    const res = await run(h);
+    expect(res.status).toBe('dialing');
+    expect(h.markBusy).not.toHaveBeenCalled();
+  });
 
   it('treats the service `disabled` verdict as a passthrough — dial proceeds, no machine id', async () => {
     const h = harness({ worker: { status: 'disabled' } });

@@ -328,6 +328,10 @@ describe('the env contract holds in BOTH directions', () => {
     'PHONE_DIAL_ALLOWLIST',
     'PHONE_SLOT_SECONDS',
     'PHONE_RECONNECT_BACKOFF_SECONDS',
+    // 0083 / P3 — backoff applied to next_eligible_at on a worker-not-ready
+    // infra defer, read in `lib/phone-screening/config.ts`. A BOUND, not a
+    // switch; default 300, clamped [60,3600].
+    'PHONE_INFRA_DEFER_BACKOFF_SEC',
     'PHONE_RING_TIMEOUT_SECONDS',
     'PHONE_LEASE_SECONDS',
     'PHONE_WEBHOOK_MAX_BYTES',
@@ -374,11 +378,22 @@ describe('the env contract holds in BOTH directions', () => {
   });
 
   it('no PHONE_* variable exists in one place and not the others', () => {
-    const inSchema = Object.keys(SCHEMA.components.api.variables).filter((k) =>
-      k.startsWith('PHONE_'));
-    const inExample = [...ENV_EXAMPLE.matchAll(/^(PHONE_[A-Z0-9_]*)=/gm)].map((m) => m[1]);
+    // `PHONE_WORKER_READY_TIMEOUT_SEC` is a WORKER-ORCHESTRATION knob that
+    // happens to be PHONE_-prefixed (it sizes the phone dial gate's ready
+    // budget). It is read in `lib/env.ts` alongside the other WORKER_/FLY_ vars,
+    // NOT in any phone-CONFIG source file, so it is out of scope for this
+    // phone-runtime-config consistency check. The env-contract checker
+    // (scripts/check-env-contract.mjs) already proves it is declared + exampled
+    // + read. Excluded from all three filters so this test stays about the
+    // phone-config knobs it was written for.
+    const OUT_OF_SCOPE = new Set(['PHONE_WORKER_READY_TIMEOUT_SEC']);
+    const notOOS = (k: string): boolean => !OUT_OF_SCOPE.has(k);
+    const inSchema = Object.keys(SCHEMA.components.api.variables)
+      .filter((k) => k.startsWith('PHONE_')).filter(notOOS);
+    const inExample = [...ENV_EXAMPLE.matchAll(/^(PHONE_[A-Z0-9_]*)=/gm)]
+      .map((m) => m[1]).filter(notOOS);
     const inSource = [...ALL_CONFIG_SOURCE.matchAll(/process\.env\.(PHONE_[A-Z0-9_]*)/g)]
-      .map((m) => m[1]);
+      .map((m) => m[1]).filter(notOOS);
     expect(new Set(inSchema)).toEqual(new Set(NAMES));
     expect(new Set(inExample)).toEqual(new Set(NAMES));
     expect(new Set(inSource)).toEqual(new Set(NAMES));
