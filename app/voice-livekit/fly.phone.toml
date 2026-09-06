@@ -49,6 +49,17 @@ primary_region = "sin"
   dockerfile = "Dockerfile"
 
 [env]
+  # PLAN B ACTIVATION (2026-09-06): on-demand worker orchestration. This exact
+  # string flips BOTH the deploy workflow to the on-demand path (scale-to-zero,
+  # registration-proof deploy via deploy-voice-orchestration.sh) AND the
+  # worker's readiness ping (worker_ready_api.py posts /internal/voice-worker/
+  # ready on LiveKit registration so the API dial gate can proceed). Pool:
+  # 2 stopped machines (287d073f569398, 185121df799d98), leases registered;
+  # cold-boot drill measured 29s/29s boot-to-registered vs the 75s ready
+  # budget. Pairs with WORKER_ORCHESTRATION=true on the API app (set at
+  # activation, per docs/runbooks/phone-worker-orchestration-activation.md).
+  # ROLLBACK: scale the worker back up FIRST, then flip the API flag off.
+  WORKER_ORCHESTRATION = "worker"
   COMPANY_NAME = "Interview Kickstart"
   SUPABASE_SCHEMA = "screening_v2"
   API_BASE = "https://project-hello-api.fly.dev"
