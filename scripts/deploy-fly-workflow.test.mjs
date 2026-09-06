@@ -346,15 +346,28 @@ ok(!/FLY_API_TOKEN_API/.test(phone) && !/FLY_API_TOKEN_VOICE\b/.test(phone),
   ok(/registered worker/.test(scriptSrc) && /WATERMARK/.test(scriptSrc),
     "the reconciliation script must carry the same watermarked current-registration proof");
 
-  const makeStub = ({ logsMode = "registered", deployRc = 0 }) => {
+  const makeStub = ({ logsMode = "registered", deployRc = 0, pool = "one" }) => {
     const dir = mkdtempSync(path.join(tmpdir(), "orch-stub-"));
     // flyctl stub: records each machine start/stop into a call log; emits a
     // registration line for logs in "registered" mode; deploy exits deployRc.
+    //
+    // The `machine list` stub MODELS REAL flyctl OUTPUT: a box-drawing bordered
+    // TABLE for a plain list (where STATE is an interior column and $NF is the
+    // SIZE), and JSON for `--json`. This is deliberate — the prior stub emitted
+    // a 3-field "m1 app stopped" line where state WAS $NF, so the shipped
+    // `awk '$NF=="stopped"'` parse passed here yet returned EMPTY against real
+    // flyctl and silently failed every orchestration deploy (RCA 2026-09-06).
+    // A stub that does not model the real wire format is worse than no test.
+    //   pool: "one"  -> one machine m1 (stopped, or started after a start)
+    //         "none" -> empty pool (no machine to start -> must fail closed)
     const calls = path.join(dir, "calls.log");
     const bin = path.join(dir, "flyctl");
+    const started = JSON.stringify(path.join(dir, "started"));
     writeFileSync(bin, [
       "#!/usr/bin/env bash",
       `echo "$@" >> ${JSON.stringify(calls)}`,
+      // Does the invocation ask for --json?
+      'want_json=false; for a in "$@"; do [ "$a" = "--json" ] && want_json=true; done',
       'case "$1" in',
       '  logs)',
       `    case "${logsMode}" in`,
@@ -363,10 +376,19 @@ ok(!/FLY_API_TOKEN_API/.test(phone) && !/FLY_API_TOKEN_VOICE\b/.test(phone),
       "    esac ;;",
       "  machine)",
       '    if [ "$2" = "list" ]; then',
-      // one stopped machine 'm1'; after a start it reports started.
-      '      if [ -f ' + JSON.stringify(path.join(dir, "started")) + ' ]; then echo "m1 app started"; else echo "m1 app stopped"; fi',
-      '    elif [ "$2" = "start" ]; then touch ' + JSON.stringify(path.join(dir, "started")) + '; ',
-      '    elif [ "$2" = "stop" ]; then rm -f ' + JSON.stringify(path.join(dir, "started")) + '; ',
+      `      st=stopped; [ -f ${started} ] && st=started`,
+      `      if [ "${pool}" = "none" ]; then`,
+      '        if $want_json; then echo "[]"; else echo "ID  NAME  STATE  REGION  SIZE"; fi',
+      "      elif $want_json; then",
+      '        echo "[{\\"id\\":\\"m1\\",\\"state\\":\\"$st\\",\\"region\\":\\"sin\\"}]"',
+      "      else",
+      // Real bordered table: STATE is interior; $NF is the SIZE column. A parse
+      // anchored to $NF (the old bug) reads "performance-1x:2048MB", not $st.
+      '        echo "ID    NAME  STATE    REGION  SIZE"',
+      '        echo "m1    app   $st      sin     performance-1x:2048MB"',
+      "      fi",
+      `    elif [ "$2" = "start" ]; then touch ${started}; `,
+      `    elif [ "$2" = "stop" ]; then rm -f ${started}; `,
       "    fi ;;",
       `  deploy) exit ${deployRc} ;;`,
       "esac",
@@ -431,6 +453,46 @@ ok(!/FLY_API_TOKEN_API/.test(phone) && !/FLY_API_TOKEN_VOICE\b/.test(phone),
     ok(/empty pre-release watermark/.test(r.out), "must name the empty-watermark refusal");
     ok(!/machine start/.test(r.callLog), "an empty watermark must refuse BEFORE starting any machine");
     rmSync(stub.dir, { recursive: true, force: true });
+  }
+  // (v) Empty pool ⇒ FAIL CLOSED with an accurate error, and start NOTHING.
+  //     RCA 2026-09-06: an empty picker used to fall through to a misleading
+  //     "start did not register" proof failure. When orchestration is ON and no
+  //     pool machine is stopped OR started, the deploy must say so plainly.
+  {
+    const stub = makeStub({ logsMode: "registered", deployRc: 0, pool: "none" });
+    const r = runScript(stub);
+    ok(r.code !== 0, "on-demand must FAIL CLOSED when the pool has no machine to start");
+    ok(/no pool machine to start/.test(r.out),
+      "empty pool must name the true cause (no pool machine), not a registration miss");
+    ok(!/machine start/.test(r.callLog), "an empty pool must not attempt to start a machine");
+    rmSync(stub.dir, { recursive: true, force: true });
+  }
+
+  // ── 11c. REGRESSION: the machine-state parse must read a NAMED field, not a
+  // positional column of the human table. This is the exact production bug.
+  ok(/machine list -a "\$APP" --json/.test(scriptSrc),
+    "the machine picker/poll must read `flyctl machine list --json`, not the bordered human table");
+  ok(!/tolower\(\$NF\)=="stopped"/.test(scriptSrc) && !/\$NF.*started/.test(scriptSrc),
+    "the parse must NOT be anchored to awk $NF (the SIZE column in flyctl's table) — that returned empty in production");
+  // Behavioural fixtures: prove the OLD parse is empty on a real bordered table
+  // while the NEW json parse picks the stopped id. Locks in the regression so a
+  // future revert to table-parsing fails here instead of in a live deploy.
+  {
+    const table = [
+      "ID              NAME              STATE      REGION  SIZE",
+      "287d073f569398  frosty-sun-9042   stopped    sin     performance-1x:2048MB",
+      "d8d9564b50e908  wispy-fog-1180    started    sin     performance-1x:2048MB",
+    ].join("\n");
+    const json = JSON.stringify([
+      { id: "287d073f569398", state: "stopped", region: "sin" },
+      { id: "d8d9564b50e908", state: "started", region: "sin" },
+    ]);
+    const oldAwk = spawnSync("awk", ['tolower($NF)=="stopped"{print $1; exit}'], { input: table, encoding: "utf8" });
+    ok((oldAwk.stdout || "").trim() === "",
+      "the OLD $NF-anchored awk must return EMPTY on a real bordered table (this is why it failed in prod)");
+    const newJq = spawnSync("jq", ["-r", 'map(select(.state=="stopped")) | .[0].id // empty'], { input: json, encoding: "utf8" });
+    ok((newJq.stdout || "").trim() === "287d073f569398",
+      "the NEW jq parse must pick the stopped machine id from --json");
   }
 }
 

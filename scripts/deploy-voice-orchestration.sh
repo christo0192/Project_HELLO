@@ -106,11 +106,15 @@ echo "orchestration ON for $APP: start -> verify registration -> deploy -> verif
 flyctl status -a "$APP"
 
 # ── 1. pick a STOPPED pool machine and start it ───────────────────────────────
-# machine id is the first column; state the last. Prefer a stopped machine so we
-# never disturb one that is mid-call. If none is stopped, an already-running
-# machine can still satisfy the proof (we simply won't stop it in cleanup).
-machine_id="$(flyctl machine list -a "$APP" 2>/dev/null \
-  | awk 'tolower($NF)=="stopped"{print $1; exit}' || true)"
+# Parse machine state from `--json` (named fields), NOT the human table. RCA
+# 2026-09-06: `flyctl machine list` renders a box-drawing bordered table, so
+# `awk '$NF=="stopped"'` read the SIZE column ("performance-1x:2048MB"), matched
+# nothing, and this picker returned empty on EVERY run — no machine was ever
+# started, and the proof then only saw stale registrations and failed closed.
+# JSON is stable across flyctl table-rendering changes (the thing that broke).
+# Prefer a stopped machine so we never disturb one that is mid-call.
+machine_id="$(flyctl machine list -a "$APP" --json 2>/dev/null \
+  | jq -r 'map(select(.state=="stopped")) | .[0].id // empty' || true)"
 
 if [ -n "$machine_id" ]; then
   echo "starting pool machine $machine_id on $APP"
@@ -119,8 +123,8 @@ if [ -n "$machine_id" ]; then
   # Wait for the machine to reach a started state before expecting registration.
   started=false
   for _ in $(seq 1 "$START_ATTEMPTS"); do
-    state="$(flyctl machine list -a "$APP" 2>/dev/null \
-      | awk -v id="$machine_id" '$1==id{print tolower($NF)}' | tail -1 || true)"
+    state="$(flyctl machine list -a "$APP" --json 2>/dev/null \
+      | jq -r --arg id "$machine_id" '.[] | select(.id==$id) | .state' | tail -1 || true)"
     if [ "$state" = "started" ]; then started=true; break; fi
     sleep "$SLEEP_SECONDS"
   done
@@ -129,7 +133,19 @@ if [ -n "$machine_id" ]; then
     exit 1
   fi
 else
-  echo "::warning::no STOPPED pool machine found on $APP; relying on an already-running machine to satisfy the registration proof"
+  # Fail closed (RCA robustness): when orchestration is ON the steady state is
+  # scaled-to-zero, so "no stopped machine" almost always means the pool is
+  # unprovisioned or every machine is already up — NOT a healthy state to prove
+  # against. Only tolerate an already-STARTED pool machine (the true live-call
+  # case); otherwise error accurately instead of falling through to the
+  # misleading "start did not register" proof failure.
+  any_started="$(flyctl machine list -a "$APP" --json 2>/dev/null \
+    | jq -r 'map(select(.state=="started")) | length' || echo 0)"
+  if [ "${any_started:-0}" = "0" ]; then
+    echo "::error::no pool machine to start on $APP (none stopped, none started) - provision the pool (register_voice_worker) before activating orchestration"
+    exit 1
+  fi
+  echo "::warning::no STOPPED pool machine on $APP; relying on an already-started machine to satisfy the registration proof"
 fi
 
 # ── 2. verify the CURRENT (pre-deploy) worker registers ───────────────────────
