@@ -4585,6 +4585,24 @@ def phone_llm_api_key() -> str:
     return (os.getenv("PHONE_LLM_API_KEY") or os.getenv("SARVAM_API_KEY") or "").strip()
 
 
+def phone_llm_reasoning_effort() -> str | None:
+    """Phone-only speaking-LLM ``reasoning_effort`` request value.
+
+    Unset/empty (the default) keeps today's behaviour byte-for-byte: the
+    OpenAI-compat factory passes ``reasoning_effort=None`` (JSON null), which
+    disables Sarvam's default reasoning. Hybrid thinking models on other
+    OpenAI-compatible endpoints interpret null/omitted as "provider default" —
+    DeepSeek V4-Flash defaults to THINKING (verified live: all completion
+    tokens went to reasoning_content, empty spoken content = dead-air), and
+    its documented disable value is the literal string ``"none"``. Set
+    ``PHONE_LLM_REASONING_EFFORT=none`` alongside the DeepSeek swap env to
+    force non-thinking. Any non-empty value is forwarded verbatim (the
+    provider validates); whitespace-only collapses to unset.
+    """
+    value = (os.getenv("PHONE_LLM_REASONING_EFFORT") or "").strip()
+    return value or None
+
+
 def phone_judge_model() -> str:
     """Dedicated judge model; never inherits the speaking-model selection."""
     explicit = os.getenv("PHONE_JUDGE_MODEL", "")

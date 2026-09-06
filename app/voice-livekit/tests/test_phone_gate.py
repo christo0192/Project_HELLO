@@ -3843,6 +3843,53 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         self.assertNotIn("reasoning_effort", browser)
         self.assertNotIn("temperature", browser)
 
+    def test_phone_llm_reasoning_effort_env_forwards_verbatim(self):
+        # DeepSeek swap: PHONE_LLM_REASONING_EFFORT=none must reach the factory
+        # verbatim (V4-Flash treats null as "provider default" = THINKING; the
+        # documented disable value is the literal string "none" — verified live:
+        # with null every completion token went to reasoning_content). Unset and
+        # whitespace-only must keep today's None (the Sarvam disable value).
+        self.assertIsNone(phone.phone_llm_reasoning_effort())
+        with patch.dict(
+            phone.os.environ, {"PHONE_LLM_REASONING_EFFORT": "   "}, clear=False,
+        ):
+            self.assertIsNone(phone.phone_llm_reasoning_effort())
+        captured = {}
+
+        class _RecLLM:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+        class _RecSession:
+            def __init__(self, **kwargs):
+                pass
+
+            def on(self, _event):
+                return lambda fn: fn
+
+        with patch.object(agent_mod.openai, "LLM", _RecLLM), patch.object(
+            agent_mod, "AgentSession", _RecSession,
+        ), patch.dict(agent_mod.os.environ, {
+            "PHONE_LLM_BASE_URL": "https://api.deepseek.com/v1",
+            "PHONE_LLM_API_KEY": "phone-key",
+            "PHONE_PRIMARY_MODEL": "deepseek-v4-flash",
+            "PHONE_LLM_SDK": "openai",
+            "PHONE_LLM_REASONING_EFFORT": "none",
+        }, clear=False):
+            agent_mod._build_phone_provider_session()
+        self.assertEqual(captured["model"], "deepseek-v4-flash")
+        self.assertEqual(captured["base_url"], "https://api.deepseek.com/v1")
+        self.assertEqual(captured["reasoning_effort"], "none")
+        # The env contract must declare the new variable on both sides.
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        repo_root = os.path.dirname(os.path.dirname(here))
+        with open(os.path.join(here, ".env.example"), encoding="utf-8") as fh:
+            self.assertIn("PHONE_LLM_REASONING_EFFORT=", fh.read())
+        schema_path = os.path.join(
+            repo_root, "config", "environment.schema.json")
+        with open(schema_path, encoding="utf-8") as fh:
+            self.assertIn('"PHONE_LLM_REASONING_EFFORT"', fh.read())
+
     def test_phone_and_webrtc_share_one_agent_session_factory(self):
         self.assertIn(
             "_build_provider_session(",
