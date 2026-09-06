@@ -213,3 +213,63 @@ describe('exchange browser gate — ON', () => {
     expect(consumeUpdate).toHaveBeenCalledTimes(1);
   });
 });
+
+// ── Same-bearer re-exchange grace (RCA 2026-09-06) ──────────────────────────
+// A refresh during the cold-boot wait orphans the CAS winner's 200 and burns
+// the one-time invite. Within the grace window the SAME token re-issues the
+// join; past it (or revoked) the consumed invite is terminal exactly as before.
+describe('exchange — same-bearer re-exchange grace', () => {
+  function withInvite(overrides: Record<string, unknown>, gate: unknown = null) {
+    const base = {
+      id: 'iv1', candidate_id: CANDIDATE, session_id: SESSION,
+      expires_at: new Date(Date.now() + 3600_000).toISOString(),
+      consumed_at: null, revoked_at: null,
+    };
+    const prev = mockFrom.getMockImplementation()!;
+    mockFrom.mockImplementation((table: string) => {
+      if (table === 'candidate_invites') {
+        return {
+          select: () => ({
+            eq: () => ({ single: () => Promise.resolve({ data: { ...base, ...overrides }, error: null }) }),
+          }),
+          update: (...a: unknown[]) => consumeUpdate(...a),
+        };
+      }
+      return prev(table);
+    });
+    return appWithGate(gate);
+  }
+
+  it('re-issues the join for a token consumed INSIDE the window — no CAS, no gate', async () => {
+    const ensureReadyWorker = vi.fn();
+    const gate = { ensureReadyWorker, dispatch: vi.fn(), releaseWorker: vi.fn() };
+    const app = withInvite(
+      { consumed_at: new Date(Date.now() - 10_000).toISOString() },
+      gate,
+    );
+    const res = await exchange(app);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ session_id: SESSION, room_name: ROOM, livekit_token: 'jwt-token' });
+    // Idempotent re-issue: the already-consumed invite is not re-CASed, and the
+    // worker gate is not re-entered (the winner already dispatched the agent).
+    expect(consumeUpdate).not.toHaveBeenCalled();
+    expect(ensureReadyWorker).not.toHaveBeenCalled();
+  });
+
+  it('still 404s a token consumed OUTSIDE the window', async () => {
+    const app = withInvite({ consumed_at: new Date(Date.now() - 10 * 60_000).toISOString() });
+    const res = await exchange(app);
+    expect(res.status).toBe(404);
+    expect(res.body.livekit_token).toBeUndefined();
+  });
+
+  it('still 404s a revoked invite even when the consume is fresh', async () => {
+    const app = withInvite({
+      consumed_at: new Date(Date.now() - 10_000).toISOString(),
+      revoked_at: new Date(Date.now() - 5_000).toISOString(),
+    });
+    const res = await exchange(app);
+    expect(res.status).toBe(404);
+    expect(res.body.livekit_token).toBeUndefined();
+  });
+});
