@@ -2759,6 +2759,69 @@ def bounded_phone_chat_context(chat_ctx: Any) -> Any:
     return bounded
 
 
+def rewrite_developer_role_to_system(chat_ctx: Any) -> tuple[Any, int]:
+    """Rewrite chat items whose role is ``developer`` to role ``system``.
+
+    DeepSeek's OpenAI-compatible endpoint rejects the ``developer`` role
+    (``unknown variant 'developer', expected one of 'system', 'user',
+    'assistant', 'tool', 'latest_reminder'``) with a non-retryable 400,
+    which starved every conversational turn of first audio on the first
+    live DeepSeek call (2026-09-06). Gemini's native path handles
+    ``developer`` fine, so this is applied ONLY on the phone OpenAI-compat
+    lane by the caller.
+
+    ``system`` (not a merge into an adjacent user turn) is the target:
+    DeepSeek's own error lists ``system`` as accepted, and it preserves the
+    instruction's authority and its ORDER in the sequence — the per-turn
+    developer hints (answer-gate / conflict / name-confirm) are positional.
+
+    The outgoing REQUEST context is rewritten, never the session's canonical
+    ChatContext: LiveKit hands ``llm_node`` a per-call ``chat_ctx.copy()``
+    (agent_activity ~L2687), so item-level rewrites here cannot leak into
+    the durable transcript or later turns. Each rewritten message is a fresh
+    copy (``model_copy`` when available) so even the per-call item objects are
+    not mutated in place. Returns the (possibly same) ctx and the count of
+    items rewritten.
+    """
+    items = getattr(chat_ctx, "items", None)
+    if not isinstance(items, list):
+        return chat_ctx, 0
+    rewritten = 0
+    new_items: list[Any] = []
+    for item in items:
+        role = item.get("role") if isinstance(item, dict) else getattr(item, "role", None)
+        if isinstance(role, str) and role.lower() == "developer":
+            if isinstance(item, dict):
+                item = {**item, "role": "system"}
+                rewritten += 1
+            else:
+                model_copy = getattr(item, "model_copy", None)
+                if callable(model_copy):
+                    try:
+                        item = model_copy(update={"role": "system"})
+                        rewritten += 1
+                    except Exception:  # noqa: BLE001
+                        pass
+        new_items.append(item)
+    if rewritten == 0:
+        return chat_ctx, 0
+    copy_ctx = getattr(chat_ctx, "copy", None)
+    if callable(copy_ctx):
+        try:
+            out = copy_ctx()
+            out.items = new_items
+            return out, rewritten
+        except Exception:  # noqa: BLE001
+            pass
+    # No copy() available (e.g. a plain object in tests): rewrite the list on
+    # the passed ctx. Safe because the caller only ever passes a per-call copy.
+    try:
+        chat_ctx.items = new_items
+    except Exception:  # noqa: BLE001
+        pass
+    return chat_ctx, rewritten
+
+
 def render_recent_transcript(turns: list[dict[str, str]] | None) -> str:
     """Render the last few candidate/bot turns for the judge, or "" when none.
 
@@ -5569,6 +5632,47 @@ def phone_recovery_fallback(snapshot: Any, *, prefix_released: bool) -> str:
     return " ".join(fallback.split())
 
 
+#: F-D #1: deterministic re-ask prefixes used ONLY when the recovery fallback
+#: would otherwise repeat the previous fallback BYTE-IDENTICALLY. The candidate
+#: audibly noticed the watchdog re-asking the same sentence twice in a row on
+#: the first DeepSeek call; a small fixed rotation keeps the SAME question but
+#: never lets consecutive re-asks be identical. Rotation index is the count of
+#: prior identical repeats, so the phrasing advances each time.
+PHONE_REASK_VARIATION_PREFIXES = (
+    "Just to make sure I got that — ",
+    "Let me come back to that one: ",
+    "Sorry, one more time — ",
+)
+
+
+def phone_vary_repeated_fallback(text: Any, previous: Any, repeat_index: int = 0) -> str:
+    """Return ``text`` unchanged, or a re-worded variant when it repeats.
+
+    ``text`` is the fallback about to be spoken; ``previous`` is the last
+    fallback text this session actually spoke. When they are byte-identical
+    (after whitespace normalization) the same question is re-asked with a
+    rotating prefix so the candidate never hears the exact same sentence twice
+    in a row. The QUESTION itself is preserved verbatim — only a short lead-in
+    is prepended. A non-repeat returns ``text`` normalized and unchanged.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return text if isinstance(text, str) else ""
+    compact = " ".join(text.split())
+    prev_compact = " ".join(previous.split()) if isinstance(previous, str) else ""
+    if not prev_compact or compact != prev_compact:
+        return compact
+    prefix = PHONE_REASK_VARIATION_PREFIXES[
+        max(0, repeat_index) % len(PHONE_REASK_VARIATION_PREFIXES)
+    ]
+    # Lower-case the first letter of the question so the prefix reads naturally,
+    # but never touch an acronym / proper-noun start (only a lone capital
+    # followed by a lower-case letter is safe to downcase).
+    body = compact
+    if len(body) >= 2 and body[0].isupper() and body[1].islower():
+        body = body[0].lower() + body[1:]
+    return prefix + body
+
+
 def _private_phone_control_text(control_text: Any, objective_text: Any) -> str | None:
     """Remove authorized objective wording before scanning private instructions.
 
@@ -7090,6 +7194,11 @@ def phone_agent_class(agent_base: Any) -> Any:
             self._reply_generation: int | None = None
             self._on_tts_first_frame: Callable[[int | None, float, float], Any] | None = None
             self.bookings: list[ScheduleTurn] = []
+            # F-B: once-per-call latch + count for the developer->system role
+            # rewrite on the OpenAI-compat lane. Logged the first time a rewrite
+            # happens; count surfaced on session close if cheap.
+            self._developer_role_mapped = False
+            self._developer_role_mapped_count = 0
 
         def authorize_generation(
             self, objective_text: str | None, *, allow_closing: bool = False,
@@ -7143,6 +7252,22 @@ def phone_agent_class(agent_base: Any) -> Any:
             use the same Gemini node as the browser agent.
             """
             generation_ctx = bounded_phone_chat_context(chat_ctx)
+            # F-B: the phone OpenAI-compat lane (DeepSeek/Sarvam etc.) rejects the
+            # `developer` role with a non-retryable 400. Rewrite it to `system`
+            # on the OUTGOING request context only. The native google/Gemini path
+            # and the browser lane are untouched (Gemini handles developer fine,
+            # browser is sha-pinned). Applied after bounding so it also covers the
+            # retained authority items.
+            if not phone_use_google_llm():
+                generation_ctx, mapped = rewrite_developer_role_to_system(generation_ctx)
+                if mapped:
+                    self._developer_role_mapped_count += mapped
+                    if not self._developer_role_mapped:
+                        self._developer_role_mapped = True
+                        _log.info(
+                            "unknown_event", error_type="phone_llm_node",
+                            error_category="developer_role_mapped",
+                        )
             if self._gate_opening:
                 # The gate's spoken opening: tool-less and streamed, even though
                 # screening is not yet authorized. This is the ONE pre-consent

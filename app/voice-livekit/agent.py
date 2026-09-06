@@ -116,6 +116,11 @@ def _float_env(name: str, default: float) -> float:
 CANDIDATE_SILENCE_PROMPT_SEC = _float_env("CANDIDATE_SILENCE_PROMPT_SEC", 30.0)
 CANDIDATE_SILENCE_END_SEC = _float_env("CANDIDATE_SILENCE_END_SEC", 20.0)
 PHONE_TERMINAL_REPLY_TIMEOUT_SEC = _float_env("PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 10.0)
+# Playout FLOOR for the guaranteed farewell (F-D#3 review repair): the terminal
+# knob above is unclamped and shared with the armed-reply sites, so the fixed
+# closing's wait is max(knob, this floor) — a tightened knob can never truncate
+# the goodbye. Module constant (not env) so tests can patch it alongside the knob.
+PHONE_FAREWELL_PLAYOUT_FLOOR_SEC = 10.0
 PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC = _float_env(
     "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 4.0,
 )
@@ -2219,6 +2224,14 @@ async def _run_native_phone_screening(
                 "ratio": mismatch.get("ratio"),
                 "disposition": str(disposition or "unresolved")[:32],
             }
+            # Content-free live signal for the two dispositions the RCA cared
+            # about (name-arm and unresolved). No names in the log — the graded
+            # detail stays in the jsonb accumulator above, which is unchanged.
+            if disposition in ("armed", "unresolved"):
+                _log.info(
+                    "unknown_event", error_type="phone_identity_signal",
+                    error_category=disposition,
+                )
         except Exception:  # noqa: BLE001
             pass
     # ANSWER-GATE (owner directive, 2026-09-05). The outgoing advance must fire
@@ -3077,9 +3090,19 @@ async def _run_native_phone_screening(
                     "context' or any similar stock phrase, and never repeat the "
                     "same wording you used earlier in the call. "
                 )
+                # F-D #2: the fallback snapshot must not thank the candidate for a
+                # QUESTION when the turn carried none. The "Thanks for the
+                # question" opener is only truthful when the candidate actually
+                # asked something; reuse the existing route signal
+                # (`candidate_question`) rather than inventing a detector. A
+                # non-question that still landed here (e.g. a "Nope" that
+                # `phone_qna_done` failed to catch) gets a neutral ack instead.
+                turn_is_question = route == "candidate_question"
                 if qna_rounds["value"] < phone.PHONE_QNA_MAX_ROUNDS:
                     set_reply_snapshot(
-                        "Thanks for the question. Anything else you'd like to ask?",
+                        "Thanks for the question. Anything else you'd like to ask?"
+                        if turn_is_question else
+                        "Got it. Anything else you'd like to ask?",
                         phase="candidate_qna",
                     )
                     setattr(agent, "_turn_policy", "clarification")
@@ -3096,7 +3119,8 @@ async def _run_native_phone_screening(
                     # goodbye happens on their NEXT turn (a "no" closes warmly;
                     # one more question gets a brief answer + goodbye below).
                     set_reply_snapshot(
-                        "Thanks for the question. I should let you go shortly — "
+                        ("Thanks for the question. " if turn_is_question else "Got it. ")
+                        + "I should let you go shortly — "
                         "is there anything quick you'd like to ask before we "
                         "wrap up?",
                         phase="candidate_qna",
@@ -4286,6 +4310,11 @@ async def _run_native_phone_screening(
 
     expected_reply_generation: list[int] = [0]
     fallback_generation: list[int | None] = [None]
+    # F-D #1: the last recovery-fallback TEXT actually spoken this session, plus
+    # a count of consecutive byte-identical repeats. Used to vary the phrasing so
+    # the watchdog fallback never re-asks the same question verbatim twice
+    # running (the candidate audibly noticed on the first DeepSeek call).
+    last_fallback_text: dict[str, Any] = {"text": None, "repeats": 0}
 
     async def on_reply_expected(*, rearm_only: bool = False) -> None:
         """Arm one generation-correlated first-audio watchdog.
@@ -4413,6 +4442,19 @@ async def _run_native_phone_screening(
                 snapshot,
                 prefix_released=bool(getattr(agent, "_generation_prefix_released", False)),
             )
+            # F-D #1: never re-ask the SAME fallback question byte-identically
+            # twice running. If this fallback matches the last one spoken, vary
+            # the lead-in deterministically (same question, rotated prefix).
+            prev_fallback = last_fallback_text.get("text")
+            spoken_fallback = phone.phone_vary_repeated_fallback(
+                fallback, prev_fallback, int(last_fallback_text.get("repeats") or 0),
+            )
+            if isinstance(prev_fallback, str) and " ".join(fallback.split()) == " ".join(prev_fallback.split()):
+                last_fallback_text["repeats"] = int(last_fallback_text.get("repeats") or 0) + 1
+            else:
+                last_fallback_text["repeats"] = 0
+            last_fallback_text["text"] = fallback
+            fallback = spoken_fallback
             if pending_terminal_reason.get("value") is not None:
                 pending_terminal_speech_seq["value"] = speech_sequence[0] + 1
             try:
@@ -4746,7 +4788,21 @@ async def _run_native_phone_screening(
                     # BOUNDED: no watchdog covers a teardown say, and a wedged
                     # TTS websocket (the proven X2 class) would otherwise hold
                     # this leg — and its still-beating heartbeat — forever.
-                    await asyncio.wait_for(closing_value, timeout=10.0)
+                    # F-D #3: reuse the existing terminal-reply timeout constant
+                    # rather than a bespoke literal so the farewell guarantee and
+                    # the armed terminal reply share one bound — FLOORED by
+                    # PHONE_FAREWELL_PLAYOUT_FLOOR_SEC (review finding): the
+                    # terminal knob is unclamped and shared with three
+                    # armed-reply sites; an operator tightening it (e.g. to 2s)
+                    # must not truncate the multi-sentence farewell mid-playout.
+                    # The old bespoke 10.0 was load-bearing as a playout floor.
+                    await asyncio.wait_for(
+                        closing_value,
+                        timeout=max(
+                            PHONE_TERMINAL_REPLY_TIMEOUT_SEC,
+                            PHONE_FAREWELL_PLAYOUT_FLOOR_SEC,
+                        ),
+                    )
             goodbye_delivered["value"] = True
         except (Exception, asyncio.TimeoutError):  # noqa: BLE001
             # A failed goodbye must not change the truthful terminal reason
@@ -4774,6 +4830,16 @@ async def _run_native_phone_screening(
             _summarize_phone_call_metrics(call_metrics)
             if call_metrics is not None else None
         )
+        # F-B: surface the developer->system role-rewrite count once at close if
+        # any rewrite happened this call (cheap, content-free). The per-turn
+        # rewrite already logged once at first occurrence inside `llm_node`.
+        _dev_role_mapped = int(getattr(agent, "_developer_role_mapped_count", 0) or 0)
+        if _dev_role_mapped:
+            _log.info(
+                "unknown_event", error_type="phone_llm_node",
+                error_category="developer_role_mapped_total",
+                count=_dev_role_mapped,
+            )
         for attempt in range(20):
             done = await events.complete_assessment(
                 attempt_id, session_id, metrics=observability_snapshot,

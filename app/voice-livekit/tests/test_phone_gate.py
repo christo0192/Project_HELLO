@@ -3510,7 +3510,8 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
     async def test_failed_apology_playout_does_not_terminalize_persistence_halt(self):
         refusal = phone.PhoneApiOutcome(False, "stale_cursor")
         client = FakeEventClient(commits={"k1": refusal})
-        with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 0.001):
+        with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 0.001), \
+             patch.object(agent_mod, "PHONE_FAREWELL_PLAYOUT_FLOOR_SEC", 0.001):
             _, client, _, _, _, _ = await self._run_session(
                 answers=("Yes, sure.",), client=client, emit_auto_speech=False,
             )
@@ -5871,6 +5872,32 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
         for text in ("No, I actually have another question", "How large is the team?", "Maybe"):
             self.assertFalse(phone.phone_qna_done(text), text)
 
+    def test_fd2_a_non_question_in_qna_does_not_route_as_a_question(self):
+        # F-D #2 input signal: the RCA turn ("Nope, that's all I had.") reached the
+        # Q&A answer branch even though it carried NO question. The route the fix
+        # gates on must NOT classify it as `candidate_question`, so the fallback
+        # snapshot picks the neutral ack — while a real question still routes.
+        self.assertNotEqual(
+            phone.candidate_turn_route("Nope, that's all I had."), "candidate_question",
+        )
+        self.assertNotEqual(
+            phone.candidate_turn_route("No, I'm good, thanks."), "candidate_question",
+        )
+        self.assertEqual(
+            phone.candidate_turn_route("What are the work timings?"), "candidate_question",
+        )
+
+    def test_fd2_thanks_for_the_question_is_gated_on_a_detected_question(self):
+        # F-D #2 (live transcript): the fallback said "Thanks for the question."
+        # to a candidate turn that contained no question. The author now gates
+        # that opener on `turn_is_question` (the existing route signal) and uses a
+        # neutral ack otherwise. Source guard so the gate cannot silently regress.
+        import inspect
+        src = inspect.getsource(agent_mod)
+        self.assertIn('turn_is_question = route == "candidate_question"', src)
+        # The non-question branch supplies a neutral ack, not a false "question".
+        self.assertIn('"Got it. Anything else you\'d like to ask?"', src)
+
     async def test_question_is_answered_then_candidate_is_reinvited(self):
         agent, _, _, client, hooks = await self._enter_qna()
         turn_ctx = types.SimpleNamespace(items=[])
@@ -6041,6 +6068,21 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
         # screening still completed truthfully.
         self.assertIn(phone.PHONE_ASSESSMENT_CLOSING_TEXT, session.spoken)
         self.assertIn("assessment.completed", client.event_types)
+
+    def test_fd3_fixed_closing_reuses_the_terminal_reply_timeout(self):
+        # F-D #3: the farewell guarantee's teardown `say` must be bounded by the
+        # EXISTING PHONE_TERMINAL_REPLY_TIMEOUT_SEC, not a bespoke literal (the
+        # directive: reuse, do not create a new timeout). Source guard on the
+        # fixed-closing-fallback block.
+        import inspect
+        src = inspect.getsource(agent_mod)
+        self.assertIn("fixed_closing_fallback", src)
+        # Review repair: the shared knob is unclamped and shared with three
+        # armed-reply sites — the farewell keeps a 10s playout FLOOR so an
+        # operator tightening the knob cannot truncate the goodbye.
+        self.assertIn(
+            "PHONE_TERMINAL_REPLY_TIMEOUT_SEC,\n                            PHONE_FAREWELL_PLAYOUT_FLOOR_SEC,", src,
+        )
 
 
 class TestGoodbyeLatchDetectors(unittest.TestCase):
@@ -6647,6 +6689,32 @@ class TestNameMismatchTurnHook(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0)
         self.assertEqual(client.committed_keys, [])
         self.assertEqual(cursor_before, 0)
+        hooks["task"].cancel()
+        await asyncio.gather(hooks["task"], return_exceptions=True)
+        hooks["log_patch"].stop()
+
+    async def test_name_arm_emits_the_identity_signal_log(self):
+        # F-C (2026-09-06): the name-arm site must emit a content-free live log
+        # (`phone_identity_signal` / `armed`) so a mid-call identity arm is
+        # observable in the fly logs, not only in the post-call jsonb. No names
+        # in the log — this asserts the event fired with the disposition category.
+        call_metrics = agent_mod._new_phone_call_metrics()
+        agent, _, _, _, hooks = await self._coordinator(call_metrics=call_metrics)
+        text = "Hi, my name is Christo, nice to meet you."
+        turn_ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            text, types.SimpleNamespace(text_content=text), turn_ctx,
+        )
+        armed = [
+            c for c in hooks["log"].info.call_args_list
+            if c.kwargs.get("error_type") == "phone_identity_signal"
+            and c.kwargs.get("error_category") == "armed"
+        ]
+        self.assertTrue(armed, "the name-arm site must log phone_identity_signal/armed")
+        # The log carries NO name payload (content-free contract).
+        for c in armed:
+            self.assertNotIn("spoken", c.kwargs)
+            self.assertNotIn("record", c.kwargs)
         hooks["task"].cancel()
         await asyncio.gather(hooks["task"], return_exceptions=True)
         hooks["log_patch"].stop()
@@ -10046,7 +10114,8 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
         # Candidate-end sets `terminal_reply_required`, so the coordinator waits
         # for the terminal reply's playout; the inert session never plays one, so
         # shorten that bounded wait for the test.
-        with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 0.05):
+        with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 0.05), \
+             patch.object(agent_mod, "PHONE_FAREWELL_PLAYOUT_FLOOR_SEC", 0.05):
             await hooks["drive_terminal"]()
         self.assertIn("assessment.aborted", client.event_types)
 
@@ -10094,7 +10163,8 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.propose_calls, [])
         self.assertEqual(client.confirm_calls, [])
         self.assertEqual(client.committed_keys, [])
-        with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 0.05):
+        with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 0.05), \
+             patch.object(agent_mod, "PHONE_FAREWELL_PLAYOUT_FLOOR_SEC", 0.05):
             await hooks["drive_terminal"]()
         self.assertIn("assessment.aborted", client.event_types)
 
@@ -10132,7 +10202,8 @@ class TestBoundedCallbackBookingFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(getattr(agent, "_turn_policy"), "closing")
         # Ends scheduled: the booking owns the redial, so the leg posts NOTHING
         # (callback_scheduled is a retryable/post-nothing halt).
-        with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 0.05):
+        with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 0.05), \
+             patch.object(agent_mod, "PHONE_FAREWELL_PLAYOUT_FLOOR_SEC", 0.05):
             await hooks["drive_terminal"]()
         self.assertNotIn("assessment.aborted", client.event_types)
         self.assertNotIn("assessment.completed", client.event_types)
@@ -10150,7 +10221,8 @@ class TestBoundedCallbackBookingFlow(unittest.IsolatedAsyncioTestCase):
         await on_turn(text, types.SimpleNamespace(text_content=text), turn_ctx)
         self.assertEqual(client.propose_calls, [(_ATTEMPT_ID, self.RESOLVED)])
         self.assertEqual(client.confirm_calls, [(_ATTEMPT_ID, self.RESOLVED)])
-        with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 0.05):
+        with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 0.05), \
+             patch.object(agent_mod, "PHONE_FAREWELL_PLAYOUT_FLOOR_SEC", 0.05):
             await hooks["drive_terminal"]()
         self.assertNotIn("assessment.aborted", client.event_types)
         self.assertNotIn("assessment.completed", client.event_types)
@@ -11775,6 +11847,105 @@ class TestPhoneLlmCacheObservability(unittest.TestCase):
         self.assertNotIn("_phone_instructions_text(", src)
         # The only per-turn context mutations are developer-role messages.
         self.assertIn('role="developer"', inspect.getsource(agent_mod))
+
+
+class TestDeveloperRoleRewriteWiring(unittest.IsolatedAsyncioTestCase):
+    """Review repair (F-B): drive the REAL llm_node override end-to-end and
+    prove the developer->system rewrite reaches the base llm_node ONLY on the
+    OpenAI-compat lane, with the once-per-call log latch — not just the pure
+    helper (which the source-grep test cannot distinguish from a dead branch).
+    """
+
+    def _agent_capturing(self):
+        captured: dict = {}
+
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+
+            async def llm_node(self, chat_ctx, tools, model_settings):
+                captured["ctx"] = chat_ctx
+
+                async def chunks():
+                    yield "chunk"
+                return chunks()
+
+        cls = phone.phone_agent_class(BaseAgent)
+        agent = cls(
+            "instructions", client=FakeEventClient(), attempt_id=_ATTEMPT_ID,
+            say=AsyncMock(), native_turns=True,
+            on_user_turn=lambda *args, **kwargs: None,
+            on_advance=AsyncMock(return_value="Advance authorized."),
+            on_probe=AsyncMock(return_value="Probe authorized."),
+        )
+        agent.authorize_screening()
+        return agent, captured
+
+    class _Ctx:
+        def __init__(self, items):
+            self.items = items
+
+        def copy(self):
+            return TestDeveloperRoleRewriteWiring._Ctx(list(self.items))
+
+    def _ctx_with_developer(self):
+        return self._Ctx([
+            {"role": "system", "content": "You are Christy."},
+            {"role": "user", "content": "hello"},
+            {"role": "developer", "content": "Ask exactly one question."},
+        ])
+
+    async def _drive(self, agent, ctx):
+        async for _chunk in agent.llm_node(ctx, [], object()):
+            break
+
+    async def test_openai_lane_rewrites_and_latches_once(self):
+        agent, captured = self._agent_capturing()
+        env = {
+            "PHONE_LLM_SDK": "openai",
+            "PHONE_PRIMARY_MODEL": "deepseek-v4-flash",
+        }
+        with patch.dict(phone.os.environ, env, clear=False):
+            self.assertFalse(phone.phone_use_google_llm())
+            await self._drive(agent, self._ctx_with_developer())
+        roles = [
+            item.get("role") if isinstance(item, dict)
+            else getattr(item, "role", None)
+            for item in captured["ctx"].items
+        ]
+        self.assertNotIn("developer", roles)
+        self.assertEqual(roles.count("system"), 2)
+        # Order preserved: the mapped instruction stays LAST.
+        self.assertEqual(roles[-1], "system")
+        self.assertEqual(
+            captured["ctx"].items[-1].get("content"),
+            "Ask exactly one question.",
+        )
+        self.assertTrue(agent._developer_role_mapped)
+        self.assertGreaterEqual(agent._developer_role_mapped_count, 1)
+        # Second drive: count grows, the latch stays latched (log once/call).
+        with patch.dict(phone.os.environ, env, clear=False):
+            await self._drive(agent, self._ctx_with_developer())
+        self.assertGreaterEqual(agent._developer_role_mapped_count, 2)
+        self.assertTrue(agent._developer_role_mapped)
+
+    async def test_google_lane_leaves_developer_roles_untouched(self):
+        agent, captured = self._agent_capturing()
+        env = {
+            "PHONE_LLM_SDK": "google",
+            "PHONE_PRIMARY_MODEL": "gemini-3.5-flash-lite",
+        }
+        with patch.dict(phone.os.environ, env, clear=False):
+            self.assertTrue(phone.phone_use_google_llm())
+            await self._drive(agent, self._ctx_with_developer())
+        roles = [
+            item.get("role") if isinstance(item, dict)
+            else getattr(item, "role", None)
+            for item in captured["ctx"].items
+        ]
+        self.assertIn("developer", roles)
+        self.assertFalse(agent._developer_role_mapped)
+        self.assertEqual(agent._developer_role_mapped_count, 0)
 
 
 if __name__ == "__main__":
