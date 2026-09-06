@@ -284,7 +284,13 @@ drop index if exists screening_v2.uq_phone_attempts_one_per_ist_day;
 create unique index if not exists uq_phone_attempts_one_per_ist_day
   on screening_v2.phone_call_attempts(engagement_id, ist_date)
   where kind in ('initial','no_answer_retry','scheduled')
-    and not (state = 'abandoned' and abandon_reason = 'infra_deferred');
+    -- NULL-SAFE (0083 CI repair): reclaim-abandoned rows carry abandon_reason
+    -- NULL; `not (state='abandoned' and abandon_reason='infra_deferred')`
+    -- evaluates NULL for them (three-valued logic), silently dropping them
+    -- from the partial index — the exact same-day-harassment hole this
+    -- predicate exists to prevent. IS DISTINCT FROM is NULL-safe: NULL is
+    -- distinct from 'infra_deferred', so reclaim rows stay indexed/charged.
+    and (state <> 'abandoned' or abandon_reason is distinct from 'infra_deferred');
 
 comment on index screening_v2.uq_phone_attempts_one_per_ist_day is
   'I5 (0083-narrowed): one CHARGED no-answer-class attempt per engagement '
@@ -753,8 +759,11 @@ begin
                   where engagement_id = p_engagement_id
                     and ist_date = v_ist_date
                     and kind in ('initial','no_answer_retry','scheduled')
-                    and not (state = 'abandoned'
-                             and abandon_reason = 'infra_deferred')) then
+                    -- NULL-SAFE: see the index predicate. Reclaim rows have
+                    -- abandon_reason NULL; NOT(... AND NULL) is NULL and would
+                    -- silently uncount them. IS DISTINCT FROM keeps them charged.
+                    and (state <> 'abandoned'
+                         or abandon_reason is distinct from 'infra_deferred')) then
     return jsonb_build_object('status', 'daily_attempt_exists', 'ist_date', v_ist_date);
   end if;
 
@@ -824,8 +833,9 @@ begin
        and a.engagement_id <> p_engagement_id
        and a.ist_date = v_ist_date
        and a.kind in ('initial','no_answer_retry','scheduled')
-       and not (a.state = 'abandoned'
-                and a.abandon_reason = 'infra_deferred')
+       -- NULL-SAFE: see the index predicate (reclaim rows carry NULL reason).
+       and (a.state <> 'abandoned'
+            or a.abandon_reason is distinct from 'infra_deferred')
   ) then
     return jsonb_build_object('status', 'candidate_daily_attempt_exists',
                               'ist_date', v_ist_date);
@@ -998,4 +1008,3 @@ revoke all on function screening_v2.admit_phone_attempt(uuid, text, text, intege
   from public, anon, authenticated;
 grant execute on function screening_v2.admit_phone_attempt(uuid, text, text, integer, timestamptz)
   to service_role;
-
