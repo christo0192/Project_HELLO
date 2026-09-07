@@ -5247,6 +5247,18 @@ def phone_answer_disposition(
     if clean.endswith("?") and is_short:
         if _CONDITIONAL_COUNTER_RE.search(clean) or _QUESTION_OPEN_RE.search(clean):
             return PHONE_ANSWER_NONANSWER
+        # F-Q3b (call #2 RCA, 2026-09-07): STT fragment-splitting strands the
+        # interrogative word MID-sentence ("…how many rounds does…?" merged
+        # across finals), where the leading-anchored `_QUESTION_OPEN_RE` cannot
+        # see it — the live turn [10] counter-question was scored substantive/
+        # ANSWERED and the cursor advanced past an unanswered question. A short
+        # "?"-terminated turn that does NOT cover the owed objective is a
+        # counter-question shape, not an answer — NONANSWER even when the
+        # interrogative word is not leading. A genuine short answer that
+        # happens to end "?" and covers the objective still ADVANCES; one that
+        # does not is merely re-asked under the existing bounded caps.
+        if not phone_answer_covers_objective(question, clean):
+            return PHONE_ANSWER_NONANSWER
 
     # (3) An explicit decline is a terminal answer for this question: advance —
     #     UNLESS a substantive answer rides alongside the hedge, in which case the
