@@ -14246,6 +14246,14 @@ declare
   v_link_ok    uuid;   -- ready + deterministic-fallback tag → re-driven, ONE job
   v_link_model uuid;   -- ready + MODEL tag                  → refused, nothing spent
   v_link_fr    uuid;   -- failed_review                      → refused (0040's door)
+  v_cand       uuid;   -- the candidate the degraded first run populated
+  v_res_old    uuid;   -- the degraded parse's resumes row (superseded)
+  v_res_new    uuid;   -- the re-run's fresh resumes row (rebound)
+  v_res_new2   uuid;   -- the SECOND degraded run's resumes row
+  v_name       text;
+  v_praw       text;
+  v_pvalid     boolean;
+  v_meta       text;
   v_owner      uuid := '00000000-0000-4000-8000-0000000000af';
   v_res        jsonb;
   v_payload    jsonb;
@@ -14291,6 +14299,37 @@ begin
             repeat('a', 64), 'ashby-ephemeral-1', 'deterministic-fallback-1', null);
   select attempts into v_att0
     from screening_v2.ashby_resume_ingestions where application_link_id = v_link_ok;
+
+  -- ...and the DEGRADED PERSIST that first run left behind: a bound candidate
+  -- whose resume_id points at the fallback parse, phone non-dialable. This is
+  -- the F1 shape — the persist path's CAS (`resume_id IS NULL`) can never
+  -- match it again, so re-queuing WITHOUT the unbind repairs nothing.
+  insert into screening_v2.resumes (text_extracted, parsed)
+  values (null, '{"src":"pol84-degraded"}'::jsonb) returning id into v_res_old;
+  -- candidates.owner_id references auth.users; give the synthetic owner a
+  -- real auth row (same pattern as the RBAC fixtures above).
+  insert into auth.users (id, email) values (v_owner, 'pol84-owner@example.invalid')
+  on conflict (id) do nothing;
+  insert into screening_v2.candidates
+    (role_id, owner_id, resume_id, name, phone_raw, phone_e164, phone_valid,
+     status, ats_source)
+  values (v_role, v_owner, v_res_old, 'pol84 candidate', '98765 43210',
+          null, false, 'queued', 'ashby')
+  returning id into v_cand;
+  update screening_v2.ashby_application_links
+     set candidate_id = v_cand, updated_at = v_now
+   where id = v_link_ok;
+
+  -- F1 PRECONDITION, asserted rather than narrated: the worker's exact CAS
+  -- predicate matches ZERO rows on the degraded candidate.
+  update screening_v2.candidates set updated_at = updated_at
+   where id = v_cand and resume_id is null;
+  get diagnostics v_cnt = row_count;
+  perform _policy_tests.assert(
+    'ashby 0084 precondition: the persist CAS is DEAD on the degraded candidate',
+    v_cnt = 0,
+    'resume_id is already bound, so without the unbind the re-run''s parse '
+    'could never land; got ' || v_cnt || ' row(s)');
 
   -- ═══════════════════════════════════════════════════════════════════
   -- 1. THE GENERIC PATH STILL REFUSES. `runImport` calls
@@ -14375,6 +14414,71 @@ begin
     'ashby 0084: exactly one sanitized success audit row accompanies the admitted job',
     v_audits = 1, 'got ' || v_audits || ' audit row(s)');
 
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 2b. THE UNBIND (F1). Re-queuing alone repaired nothing: the recovery
+  --     must have re-armed the persist CAS, deleted the superseded
+  --     resume, kept every other candidate field, and audited what it
+  --     destroyed.
+  -- ═══════════════════════════════════════════════════════════════════
+  select resume_id is null, name, phone_raw into v_pvalid, v_name, v_praw
+    from screening_v2.candidates where id = v_cand;
+  perform _policy_tests.assert(
+    'ashby 0084 F1: the recovery clears resume_id and ONLY resume_id',
+    v_pvalid
+      and v_name = 'pol84 candidate'
+      and v_praw = '98765 43210',
+    'the candidate keeps its contact data for the short window until the '
+    're-run persists; got resume_id_null=' || v_pvalid
+      || ' name=' || coalesce(v_name, '<null>'));
+
+  select count(*) into v_cnt
+    from screening_v2.resumes where id = v_res_old;
+  perform _policy_tests.assert(
+    'ashby 0084 F1: the superseded degraded resumes row is deleted',
+    v_cnt = 0,
+    'candidates.resume_id is the only FK onto resumes and was cleared first; '
+    'got ' || v_cnt || ' surviving row(s)');
+
+  select metadata->>'superseded_resume_id' into v_meta
+    from screening_v2.audit_events
+   where action = 'ashby_ingestion_model_degraded_recovery'
+     and metadata->>'application_link_id' = v_link_ok::text
+   order by created_at desc limit 1;
+  perform _policy_tests.assert(
+    'ashby 0084 F1: the audit records the superseded resume id',
+    v_meta = v_res_old::text,
+    'the destructive half of the re-drive must be reconstructible from the '
+    'audit alone; got ' || coalesce(v_meta, '<null>'));
+
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 2c. THE REBIND. Replay the re-run's persist EXACTLY as the store
+  --     does (insert resumes row; single UPDATE under the same
+  --     `resume_id IS NULL` CAS) and prove the candidate RECEIVES the
+  --     re-parsed fields — resume rebound, phone provenance updated.
+  -- ═══════════════════════════════════════════════════════════════════
+  insert into screening_v2.resumes (text_extracted, parsed)
+  values (null, '{"src":"pol84-model"}'::jsonb) returning id into v_res_new;
+  update screening_v2.candidates
+     set resume_id = v_res_new,
+         phone_raw = '+91 90000 00000',
+         phone_e164 = '+919000000000',
+         phone_valid = true,
+         updated_at = v_now
+   where id = v_cand and resume_id is null;
+  get diagnostics v_cnt = row_count;
+  perform _policy_tests.assert(
+    'ashby 0084 F1: the re-armed CAS lands the fresh parse in exactly one row',
+    v_cnt = 1, 'got ' || v_cnt || ' row(s)');
+
+  select resume_id = v_res_new and phone_valid
+    into v_pvalid
+    from screening_v2.candidates where id = v_cand;
+  perform _policy_tests.assert(
+    'ashby 0084 F1: the candidate RECEIVES the re-parse — resume rebound, phone dialable',
+    v_pvalid,
+    'this is the whole point of the recovery: the model answer must reach '
+    'the candidate row, not be dropped as an orphan');
+
   -- A SECOND re-drive while the row is queued changes nothing: the loser
   -- sees `queued`, is refused, charges nothing, audits nothing, and no
   -- second job exists.
@@ -14399,6 +14503,70 @@ begin
       and v_audits = 1,
     'got ' || coalesce(v_res::text, '<null>') || ' live_jobs=' || v_cnt
       || ' attempts=' || coalesce(v_att::text, '<null>') || ' audits=' || v_audits);
+
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 2d. THE DOOR STAYS OPEN (F1). Simulate the re-run degrading AGAIN:
+  --     the job completes, the ingestion lands back on `ready` with the
+  --     fallback tag, and the fallback parse is re-persisted through the
+  --     re-armed CAS. A second recovery must then be ADMITTED — if the
+  --     unbind (or the tag) were one-shot, one bad model day would spend
+  --     the row's only chance.
+  -- ═══════════════════════════════════════════════════════════════════
+  update screening_v2.job_queue
+     set status = 'completed', completed_at = v_now
+   where dedup_key = 'ashby:ingestion:' || v_link_ok::text
+     and status = 'pending';
+  perform screening_v2.advance_ashby_ingestion(v_link_ok, 'fetching',    null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ok, 'scanning',    null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ok, 'extracting',  null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ok, 'structuring', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ok, 'ready',
+            repeat('a', 64), 'ashby-ephemeral-1', 'deterministic-fallback-1', null);
+  -- The second degraded persist: the CAS was re-armed by recovery #1, the
+  -- rebind above consumed it, so model failure #2 re-persisting the fallback
+  -- is exactly the first run's shape again. (In this test the rebind in 2c
+  -- already bound v_res_new; a real second-failure run would have bound its
+  -- own fallback row the same way. Either way resume_id is NON-null here,
+  -- which is the property that matters.)
+  select resume_id into v_res_new2
+    from screening_v2.candidates where id = v_cand;
+  perform _policy_tests.assert(
+    'ashby 0084 F1 precondition: the second degraded run leaves resume_id bound again',
+    v_res_new2 is not null, 'the door test needs the CAS dead again');
+
+  v_res := screening_v2.recover_ashby_model_degraded(v_link_ok, v_owner, v_now);
+  select resume_id is null into v_pvalid
+    from screening_v2.candidates where id = v_cand;
+  select count(*) into v_cnt
+    from screening_v2.resumes where id = v_res_new2;
+  perform _policy_tests.assert(
+    'ashby 0084 F1: a SECOND model failure keeps the door open — recovery #2 admitted, unbind repeated',
+    v_res->>'status' = 'ok'
+      and (v_res->>'attempts')::int = v_att0 + 2
+      and v_pvalid
+      and v_cnt = 0,
+    'the recovery must be self-consistent: degrade-again re-qualifies the '
+    'row within the unchanged budget; got ' || coalesce(v_res::text, '<null>')
+      || ' resume_id_null=' || v_pvalid || ' superseded_survivors=' || v_cnt);
+
+  select count(*) into v_audits
+    from screening_v2.audit_events
+   where action = 'ashby_ingestion_model_degraded_recovery'
+     and metadata->>'application_link_id' = v_link_ok::text
+     and result = 'success';
+  -- Both audits share created_at inside this one test transaction and the
+  -- id is a random uuid, so "latest" is not orderable here — assert
+  -- MEMBERSHIP instead: one audit per recovery, each carrying its own
+  -- superseded resume id.
+  select count(*) into v_cnt
+    from screening_v2.audit_events
+   where action = 'ashby_ingestion_model_degraded_recovery'
+     and metadata->>'application_link_id' = v_link_ok::text
+     and metadata->>'superseded_resume_id' = v_res_new2::text;
+  perform _policy_tests.assert(
+    'ashby 0084 F1: recovery #2 is separately audited with ITS superseded resume id',
+    v_audits = 2 and v_cnt = 1,
+    'got audits=' || v_audits || ' with_second_superseded=' || v_cnt);
 
   -- ═══════════════════════════════════════════════════════════════════
   -- 3. A MODEL-structured ready row is refused: nothing to recover.
@@ -14459,7 +14627,10 @@ begin
    where application_link_id in (v_link_ok, v_link_model, v_link_fr);
   delete from screening_v2.ashby_application_links
    where id in (v_link_ok, v_link_model, v_link_fr);
+  delete from screening_v2.candidates where id = v_cand;
+  delete from screening_v2.resumes where id in (v_res_old, v_res_new, v_res_new2);
   delete from screening_v2.ashby_job_mappings where id = v_map;
+  delete from auth.users where id = v_owner;
 end;
 $$;
 

@@ -310,3 +310,110 @@ describe('the Ashby parse port logs the degradation category', () => {
     }
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// The persist CAS and the 0084 unbind (F1)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The re-drive migration (0084) exists because re-queuing ALONE repaired
+// nothing: the degraded first run already bound `candidates.resume_id`, and
+// the persist path is CAS-guarded on `resume_id IS NULL`. These tests pin the
+// TS half of that story against a CAS-FAITHFUL store — one that actually
+// refuses the update when a resume is bound, unlike a permissive fake that
+// would hide exactly this defect class.
+//
+// The DB half — the RPC atomically clearing `resume_id`, deleting the
+// superseded resumes row, and staying open after a second failure — is pinned
+// in policy_tests.sql (ashby 0084 F1 section).
+
+import { populateExistingCandidate } from '../integrations/ashby/materialize.js';
+import type { MaterializationStore } from '../integrations/ashby/materialize.js';
+import type { StructuredResume } from '../integrations/ashby/resume-ingestion.js';
+import { deriveCandidatePhone, MODEL_STRUCTURER_VERSION } from '../lib/candidate-phone.js';
+
+const REPARSE: StructuredResume = {
+  name: 'Rohan Mehta', email: 'rohan@example.invalid', phone: '+91 90000 00000',
+  skills: ['TypeScript'], experience_years: 7, current_role: 'Engineer', summary: 'Synthetic.',
+};
+
+interface CandidateRow {
+  resumeId: string | null;
+  name: string | null;
+  phoneE164: string | null;
+  phoneValid: boolean;
+}
+
+/** A store whose `updateCandidateFromParse` honours the REAL CAS semantics. */
+function casStore(candidate: CandidateRow) {
+  let resumes = 0;
+  const deleted: Array<{ table: string; id: string }> = [];
+  const store: MaterializationStore = {
+    async insertResume() { resumes += 1; return { id: `resume_fresh_${resumes}` }; },
+    async insertCandidate() { throw new Error('not_under_test'); },
+    async updateCandidateFromParse(input) {
+      // The production store's `.is('resume_id', null)` guard, faithfully:
+      // a bound candidate matches zero rows and reports updated: false.
+      if (candidate.resumeId !== null) return { updated: false };
+      candidate.resumeId = input.resumeId;
+      candidate.name = input.parsed.name;
+      candidate.phoneE164 = input.phone?.valid ? input.phone.e164 : null;
+      candidate.phoneValid = input.phone?.valid ?? false;
+      return { updated: true };
+    },
+    async bindLinkColumn(input) { return { bound: input.value, wonRace: true }; },
+    async deleteOrphan(table, id) { deleted.push({ table, id }); },
+    async createSession() { return { id: 'sess_1' }; },
+    async findActiveInvite() { return null; },
+    async insertInvite() { return { id: 'inv_1' }; },
+  };
+  return { store, deleted };
+}
+
+describe('the persist CAS versus the 0084 unbind (F1)', () => {
+  const dialable = deriveCandidatePhone(REPARSE.phone, MODEL_STRUCTURER_VERSION);
+
+  it('WITHOUT the unbind, a re-parse of a degraded-bound candidate is thrown away (the defect)', async () => {
+    // The degraded first run's shape: resume bound, phone non-dialable.
+    const candidate: CandidateRow = {
+      resumeId: 'resume_degraded_1', name: 'Rohan Mehta', phoneE164: null, phoneValid: false,
+    };
+    const { store, deleted } = casStore(candidate);
+    const out = await populateExistingCandidate('cand_1', REPARSE, { store, phone: dialable });
+    // The CAS matches zero rows, the fresh resume is dropped as an orphan,
+    // and the candidate keeps the degraded parse — a "success" that repaired
+    // nothing. This is precisely why recover_ashby_model_degraded unbinds.
+    expect(out).toEqual({ status: 'reused', candidateId: 'cand_1' });
+    expect(deleted).toEqual([{ table: 'resumes', id: 'resume_fresh_1' }]);
+    expect(candidate.resumeId).toBe('resume_degraded_1');
+    expect(candidate.phoneValid).toBe(false);
+  });
+
+  it('AFTER the unbind (resume_id NULL), the SAME re-parse lands: resume rebound, phone dialable', async () => {
+    // The post-RPC shape: resume_id cleared, every other field left in place.
+    const candidate: CandidateRow = {
+      resumeId: null, name: 'Rohan Mehta', phoneE164: null, phoneValid: false,
+    };
+    const { store, deleted } = casStore(candidate);
+    const out = await populateExistingCandidate('cand_1', REPARSE, { store, phone: dialable });
+    expect(out).toEqual({ status: 'updated', candidateId: 'cand_1' });
+    expect(deleted).toEqual([]);            // nothing orphaned — the parse LANDED
+    expect(candidate.resumeId).toBe('resume_fresh_1');
+    expect(candidate.phoneE164).toBe('+919000000000');
+    expect(candidate.phoneValid).toBe(true); // provenance updated: now dialable
+  });
+
+  it('a SECOND model failure re-persists the fallback through the re-armed CAS, staying non-dialable', async () => {
+    // Model fails again on the re-run: no phone decision reaches the persist
+    // (fallback provenance). The write still lands — which is what keeps the
+    // ingestion tag deterministic-fallback% and the 0084 door OPEN for
+    // another bounded attempt (DB half asserted in policy_tests.sql).
+    const candidate: CandidateRow = {
+      resumeId: null, name: 'Rohan Mehta', phoneE164: null, phoneValid: false,
+    };
+    const { store } = casStore(candidate);
+    const out = await populateExistingCandidate('cand_1', REPARSE, { store });
+    expect(out).toEqual({ status: 'updated', candidateId: 'cand_1' });
+    expect(candidate.resumeId).toBe('resume_fresh_1');
+    expect(candidate.phoneValid).toBe(false); // fail-closed: nobody decided
+  });
+});

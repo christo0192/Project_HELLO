@@ -62,6 +62,46 @@
 -- fail-closed verification. A transition into a work-owing state must
 -- guarantee a live job in the SAME transaction — enqueue-after-commit
 -- would re-open the exact hole 0040 closed.
+--
+-- ── THE UNBIND, OR WHY RE-QUEUING ALONE REPAIRS NOTHING ───────────────
+-- The degraded first run already PERSISTED: `candidates.resume_id` is
+-- set and the non-dialable phone columns are written. The persist path
+-- the re-run drives (`populateExistingCandidate` →
+-- `updateCandidateFromParse`, runtime.ts) is CAS-guarded on
+-- `resume_id IS NULL` — deliberately, so a replay of the ready path can
+-- never double-write. Without the unbind below, the re-drive would:
+-- re-parse successfully, match ZERO rows on the CAS, delete its fresh
+-- resume row as an orphan, report `reused` (mapped ok), and re-tag the
+-- ingestion with the MODEL tag — after which this door answers
+-- `not_model_degraded` for ever. Net effect: a 200, an attempt charged,
+-- the model answer thrown away, the candidate permanently unrepairable.
+--
+-- The recovery therefore atomically UNBINDS the stale degraded parse in
+-- the SAME transaction that admits the job: it clears
+-- `candidates.resume_id` (re-arming the CAS) and deletes the superseded
+-- `resumes` row — the same row the TS orphan cleanup
+-- (`deleteOrphan('resumes', id)`) removes when a persist race goes the
+-- other way. `candidates.resume_id` is the ONLY FK onto `resumes`
+-- (0001, `on delete set null`), so the delete strands nothing.
+--
+-- Consequences, each wanted:
+--   * the re-run's persist matches the CAS and lands the fresh parse —
+--     fields, provenance, and (if the model answers) a dialable phone;
+--   * a SECOND model failure persists the deterministic fallback again
+--     through the same CAS, the tag stays `deterministic-fallback%`,
+--     and this door STAYS OPEN for another bounded attempt;
+--   * webhook redelivery still cannot double-write: the generic
+--     ready->queued edge stays refused, and the CAS is re-armed ONLY
+--     inside this audited transaction.
+--
+-- MID-WINDOW READERS: between this commit and the re-run's persist, the
+-- bound candidate has `resume_id IS NULL` with every OTHER parsed field
+-- (name, email, phone columns) left untouched. That is exactly the
+-- shape every reader already tolerates — a PII-minimal shell is born
+-- with `resume_id NULL` (materialize.ts), the DSAR export emits the
+-- column nullably, and dialability reads the phone columns, which this
+-- function never touches. The window is bounded by the queue lag of the
+-- job admitted in this same transaction.
 -- =====================================================================
 
 -- ═══════════════════════════════════════════════════════════════════════
@@ -339,6 +379,8 @@ declare
   v_attempts   integer;
   v_job_id     uuid;
   v_dedup_key  text;
+  -- The stale degraded parse being superseded (see THE UNBIND, header).
+  v_superseded_resume uuid;
   v_max_attempts     constant integer := 5;
   v_queue_name       constant text    := 'ashby.ingestion';
   v_job_max_attempts constant integer := 5;
@@ -416,6 +458,45 @@ begin
                               'state', v_ing.state);
   end if;
 
+  -- ── UNBIND THE STALE DEGRADED PARSE (see THE UNBIND, header) ─────────
+  -- The re-run's persist is CAS-guarded on `candidates.resume_id IS NULL`;
+  -- without this, the fresh parse would match zero rows, be dropped as an
+  -- orphan, and the ingestion would be re-tagged with the MODEL tag —
+  -- closing this door for ever while repairing nothing. Performed AFTER
+  -- every refusal above (a refusal must spend and change nothing) and in
+  -- the SAME transaction as the enqueue below, so a failed admission
+  -- rolls the unbind back too and the candidate is never left CAS-armed
+  -- with no job coming.
+  --
+  -- The candidate row is locked before it is written; the link row lock
+  -- (held since the top) already serialises this against a concurrent
+  -- recovery, and no other writer takes candidate-then-link, so no
+  -- inversion is introduced. Every parsed field EXCEPT `resume_id` is
+  -- left in place — the candidate keeps its (non-dialable) contact data
+  -- for the short window until the re-run's persist overwrites it, and
+  -- `resume_id IS NULL` is a shape every reader already tolerates (a
+  -- PII-minimal shell is born that way).
+  if v_link.candidate_id is not null then
+    select resume_id into v_superseded_resume
+      from screening_v2.candidates
+     where id = v_link.candidate_id
+     for update;
+    if v_superseded_resume is not null then
+      update screening_v2.candidates
+         set resume_id = null,
+             updated_at = p_now
+       where id = v_link.candidate_id;
+      -- The superseded resume row: the exact row the TS orphan cleanup
+      -- (`deleteOrphan('resumes', id)`) removes when a persist race goes
+      -- the other way. `candidates.resume_id` is the ONLY FK onto
+      -- `resumes` (0001, on delete set null) and it was cleared above, so
+      -- nothing dangles. Deleting rather than orphan-marking matches the
+      -- house pattern: no superseded/orphan marker column exists on
+      -- `resumes`, and every existing code path deletes.
+      delete from screening_v2.resumes where id = v_superseded_resume;
+    end if;
+  end if;
+
   update screening_v2.ashby_resume_ingestions
      set state = 'queued',
          failed_reason = null,
@@ -471,9 +552,15 @@ begin
      v_ing.id::text, 'success',
      -- Opaque ids and STABLE codes only. No file handle, no presigned URL,
      -- no invite token, no candidate field, no résumé content. The
-     -- structurer_version is a version TAG about our machine, never PII.
+     -- structurer_version is a version TAG about our machine, never PII, and
+     -- superseded_resume_id is the opaque id of the degraded resume row this
+     -- recovery unbound and deleted ('none' when no candidate parse was
+     -- bound) — recorded so the destructive half of the re-drive is
+     -- attributable and reconstructible from the audit alone.
      jsonb_build_object('application_link_id', p_application_link_id,
                         'structurer_version', v_ing.structurer_version,
+                        'superseded_resume_id',
+                          coalesce(v_superseded_resume::text, 'none'),
                         'attempts_before', v_ing.attempts,
                         'attempts_after', v_attempts,
                         'max_attempts', v_max_attempts));
@@ -499,11 +586,16 @@ comment on function screening_v2.recover_ashby_model_degraded is
   '(structurer_version LIKE deterministic-fallback%). Performs the 0084 '
   'ready -> queued transition — an edge advance_ashby_ingestion refuses on '
   'the generic path — CHARGES an attempt against the unchanged 5-requeue '
-  'ceiling, and ADMITS the ashby.ingestion queue job in the SAME transaction '
-  '(0040 contract): returning ok means a LIVE job exists, and if none can be '
-  'admitted everything rolls back and the row rests in ready. Self-limiting: '
-  'a re-run the model answers rewrites the structurer tag and closes the '
-  'door. Refuses a non-ready row (failed_review belongs to 0040/0041), a '
+  'ceiling, UNBINDS the stale degraded parse (clears candidates.resume_id to '
+  're-arm the persist CAS and deletes the superseded resumes row, recorded '
+  'in the audit as superseded_resume_id) and ADMITS the ashby.ingestion '
+  'queue job — all in ONE transaction (0040 contract): returning ok means a '
+  'LIVE job exists, and if none can be admitted everything, including the '
+  'unbind, rolls back and the row rests in ready with its parse still bound. '
+  'Self-limiting: a re-run the model answers rewrites the structurer tag and '
+  'closes the door; a re-run that degrades AGAIN re-persists the fallback '
+  'through the re-armed CAS and the door stays open within the budget. '
+  'Refuses a non-ready row (failed_review belongs to 0040/0041), a '
   'model-structured row (not_model_degraded), a terminal application '
   '(decided under the link row lock, taken BEFORE the ingestion lock to '
   'match cancel_ashby_application), an ingestion job still in flight '
