@@ -5388,6 +5388,128 @@ def phone_answer_disposition(
     return PHONE_ANSWER_NONANSWER
 
 
+#: Finding D (Codex review §6): stopword set for the conservative topic
+#: relation. Question-side tokens in this set never count as content anchors.
+_TOPIC_STOPWORDS = frozenset(
+    "a about an and any are as at be been but by can could did do does for "
+    "from had has have how i if in is it its me my of on or our so tell that "
+    "the their them they this to us walk we what when which who why will "
+    "with would you your please briefly describe share me currently".split()
+)
+
+#: Work-domain anchor vocabulary: a substantive turn that carries ANY of these
+#: is never classified "unrelated" — only speech with no question-token
+#: overlap, no structured answer signal, AND none of this vocabulary reads as
+#: off-topic. Deliberately broad so a legitimate answer phrased without the
+#: question's literal words ("I lead a team of five building payment systems")
+#: can never be mis-graded; a false "related" merely keeps today's behaviour.
+_WORK_DOMAIN_TOKENS = frozenset({
+    "work", "working", "worked", "job", "role", "roles", "team", "teams",
+    "company", "companies", "project", "projects", "experience", "years",
+    "year", "months", "month", "client", "clients", "customer", "customers",
+    "sales", "manage", "managed", "managing", "manager", "lead", "led",
+    "leading", "built", "build", "building", "developed", "develop",
+    "developing", "code", "coding", "engineer", "engineering", "notice",
+    "salary", "ctc", "lpa", "compensation", "package", "join", "joining",
+    "interview", "process", "career", "responsibility", "responsibilities",
+    "product", "products", "business", "designation", "profile",
+    "organization", "organisation", "office", "current", "expected",
+    "resume", "skills", "skill", "training", "certification", "degree",
+    # Duration / availability vocabulary and spelled small numbers: a turn
+    # carrying any of these is answer-shaped ("roughly sixty days"), never
+    # graded off-topic. False "related" is the safe direction.
+    "day", "days", "week", "weeks", "hour", "hours", "immediately",
+    "tomorrow", "today", "one", "two", "three", "four", "five", "six",
+    "seven", "eight", "nine", "ten", "fifteen", "twenty", "thirty", "forty",
+    "fifty", "sixty", "ninety", "hundred", "couple",
+})
+
+
+def phone_turn_dimensions(
+    question: Any, question_kind: Any, candidate_text: Any,
+) -> dict[str, Any]:
+    """Finding D (Codex review §6): one turn, INDEPENDENT dimensions.
+
+    Real speech is frequently answer AND question AND uncertainty at once.
+    The routing consumers used to force a turn into exactly one category
+    through ``phone_answer_disposition`` — so "If my current CTC is 20 LPA and
+    expected is 50 LPA, can your team offer that?" extracted both compensation
+    slots and then discarded them as a ``nonanswer``. This returns the
+    dimensions separately so consumers can compose them:
+
+      * ``disposition``      — the existing three-valued verdict (unchanged
+                               semantics; still the re-ask driver).
+      * ``slots``            — explicitly labelled compensation slots.
+      * ``answer_evidence``  — high-confidence proof the turn answers the OWED
+                               objective (``phone_answer_covers_objective``,
+                               which for compensation requires the slots the
+                               objective names). Values with this evidence
+                               must SURVIVE a counter-question in the same
+                               utterance.
+      * ``candidate_question`` — the turn also asks the interviewer something.
+      * ``clarification``    — the turn is a clarification/deflection shape.
+      * ``decline``          — explicit decline with no substantive signal.
+      * ``topic_relation``   — "covers" | "related" | "unrelated". VERY
+                               conservative toward "related": "unrelated"
+                               requires a substantive turn with zero question-
+                               token overlap, no structured answer signal, no
+                               slots, and no work-domain vocabulary at all —
+                               so off-topic substantive speech ("I enjoy
+                               cooking Italian food…") is never recorded as
+                               topical coverage, while an on-topic answer
+                               phrased in its own words never mis-grades.
+
+    Pure and deterministic; consumers must not treat ``disposition`` alone as
+    evidence of topical coverage (review §6).
+    """
+    clean = (
+        " ".join(candidate_text.strip().split())
+        if isinstance(candidate_text, str) else ""
+    )
+    slots = phone_compensation_slots(clean)
+    disposition = phone_answer_disposition(question, question_kind, clean)
+    covers = phone_answer_covers_objective(question, clean)
+    clarification = phone_clarification_shape(clean)
+    candidate_question = bool(clean) and (
+        clarification
+        or clean.endswith("?")
+        or bool(_QUESTION_OPEN_RE.search(clean))
+    )
+    topic_relation = "related"
+    if covers:
+        topic_relation = "covers"
+    elif (
+        clean
+        and disposition == PHONE_ANSWER_ANSWERED
+        and not slots
+        and not _answer_has_substantive_signal(clean)
+    ):
+        answer_tokens = {
+            token for token in _COVERAGE_TOKEN_RE.findall(clean.casefold())
+        }
+        question_tokens = {
+            token
+            for token in _COVERAGE_TOKEN_RE.findall(
+                question.casefold() if isinstance(question, str) else "",
+            )
+            if token not in _TOPIC_STOPWORDS
+        }
+        if (
+            not (answer_tokens & question_tokens)
+            and not (answer_tokens & _WORK_DOMAIN_TOKENS)
+        ):
+            topic_relation = "unrelated"
+    return {
+        "disposition": disposition,
+        "slots": slots,
+        "answer_evidence": covers,
+        "candidate_question": candidate_question,
+        "clarification": clarification,
+        "decline": disposition == PHONE_ANSWER_DECLINED,
+        "topic_relation": topic_relation,
+    }
+
+
 def phone_answer_gate_enabled() -> bool:
     """Kill switch for the outgoing answer-disposition advance gate.
 

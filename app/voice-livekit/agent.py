@@ -3781,10 +3781,16 @@ async def _run_native_phone_screening(
                         else None
                     )
                     merged_seen = answer_reask_counts.get(merged_question.key, 0)
+                    merged_dims = phone.phone_turn_dimensions(
+                        merged_question.text, merged_kind, merged_candidate,
+                    )
                     if (
-                        phone.phone_answer_disposition(
-                            merged_question.text, merged_kind, merged_candidate,
-                        ) == phone.PHONE_ANSWER_NONANSWER
+                        merged_dims["disposition"]
+                        == phone.PHONE_ANSWER_NONANSWER
+                        # Finding D: the merged utterance may CARRY the answer
+                        # alongside its counter-question — evidence survives
+                        # (same bypass as the single-final gate below).
+                        and not merged_dims["answer_evidence"]
                         and merged_seen < phone.phone_answer_gate_max_reasks()
                         and merged_seen
                         + ask_drift_reask_counts.get(merged_question.key, 0)
@@ -3957,6 +3963,26 @@ async def _run_native_phone_screening(
         # (hoisted from the boundary snapshot below) so the delivery gate and
         # the committed `coverage_hint` read the SAME signal — never recomputed.
         coverage_hint = phone.phone_coverage_precheck(question.text, prompt)
+        # ── Finding D (Codex review §6): MULTI-DIMENSIONAL TURN SIGNALS ──────
+        # One computation for the whole routing path: the disposition (the
+        # existing re-ask driver), answer evidence for the OWED objective,
+        # whether the turn ALSO asks the interviewer something, and a
+        # conservative topic relation. Real speech is frequently answer AND
+        # question at once — the reproduced defect extracted both compensation
+        # slots and then discarded them because the same utterance ended in a
+        # counter-question ("If my current CTC is 20 LPA and expected is 50
+        # LPA, can your team offer that?" → slots extracted, disposition
+        # nonanswer, values thrown away and the question re-asked). Consumers
+        # below compose these dimensions instead of forcing one category.
+        # NOTE: the `candidate_question` route block above still owns turns
+        # that are PURE questions/clarifications (no evidence rides them);
+        # widening that block is a noted follow-up, not this change.
+        question_kind = (
+            "compensation"
+            if phone.phone_is_compensation_objective(question.text)
+            else None
+        )
+        turn_dims = phone.phone_turn_dimensions(question.text, question_kind, text)
         # ── DELIVERY-VERIFIED COMMIT GATE (FIX 1, SE-call RCA 2026-09-07) ────
         # The commit below stamps `ask_delivered: True` from PLAYOUT alone. On
         # the live SE call the model's delivered reply drifted off the owed
@@ -4049,15 +4075,26 @@ async def _run_native_phone_screening(
             and phone.phone_answer_gate_enabled()
             and not conflict_reply_pending["value"]
         ):
-            question_kind = (
-                "compensation"
-                if phone.phone_is_compensation_objective(question.text)
-                else None
-            )
-            disposition = phone.phone_answer_disposition(
-                question.text, question_kind, text,
-            )
-            if disposition == phone.PHONE_ANSWER_NONANSWER:
+            disposition = turn_dims["disposition"]
+            if (
+                disposition == phone.PHONE_ANSWER_NONANSWER
+                and turn_dims["answer_evidence"]
+            ):
+                # ── Finding D: MIXED answer + question — the values SURVIVE.
+                # The utterance both answers the owed objective (high-
+                # confidence evidence: for compensation, the slots the
+                # objective names; otherwise the narrow coverage predicate)
+                # AND asks the interviewer something, so the broad disposition
+                # reads nonanswer. Discarding the extracted values and
+                # re-asking is the reproduced defect. Fall through to the
+                # ordinary substantive path: the boundary COMMITS the real
+                # exchange, and the reply instruction below answers the
+                # candidate's question without promises before continuing.
+                _log.info(
+                    "unknown_event", error_type="phone_answer_gate",
+                    error_category="mixed_intent_evidence_commit",
+                )
+            elif disposition == phone.PHONE_ANSWER_NONANSWER:
                 seen = answer_reask_counts.get(question.key, 0)
                 # FIX 1 companion (2026-09-07): compose with the delivery
                 # gate's drift re-asks — combined holds for one key ≤ the
@@ -4087,11 +4124,42 @@ async def _run_native_phone_screening(
                             "rules."
                         ),
                     )
+                    # Finding D: a counter-question RECEIVES A RESPONSE before
+                    # the re-ask — briefly and honestly, never with promises —
+                    # instead of being brushed past. Partial compensation
+                    # evidence keeps what was given: only missing slots are
+                    # re-asked (the values already ride `compensation_slots`).
+                    reask_lead = ""
+                    if turn_dims["candidate_question"]:
+                        reask_lead = (
+                            "First give a brief, honest answer to what the "
+                            "candidate just asked — from verified context "
+                            "only, never inventing specifics and never making "
+                            "promises or commitments. Then "
+                        )
+                    missing_slot_note = ""
+                    if question_kind == "compensation" and compensation_slots:
+                        known_slots = ", ".join(sorted(compensation_slots))
+                        missing_slots = [
+                            slot for slot in ("current", "expected")
+                            if slot not in compensation_slots
+                        ]
+                        if missing_slots:
+                            missing_slot_note = (
+                                " The candidate already supplied these "
+                                "compensation slots: " + known_slots
+                                + ". Ask ONLY for the missing slot(s): "
+                                + ", ".join(missing_slots)
+                                + ". Do not ask for a known slot again."
+                            )
                     add_turn_instruction(
                         turn_ctx,
-                        "The candidate has not yet answered this question. Gently "
-                        "re-ask the SAME topic in your own words and wait; do not "
-                        "move on: " + question.spoken_text,
+                        reask_lead
+                        + ("gently re-ask" if reask_lead else
+                           "The candidate has not yet answered this question. "
+                           "Gently re-ask")
+                        + " the SAME topic in your own words and wait; do not "
+                        "move on: " + question.spoken_text + missing_slot_note,
                     )
                     _log.info(
                         "unknown_event", error_type="phone_answer_gate",
@@ -4364,6 +4432,16 @@ async def _run_native_phone_screening(
             "ask_delivered": bool(ask_covers_objective or coverage_hint is True),
             "coverage_hint": coverage_hint,
             "covered_following_keys": covered_following,
+            # Finding D (Codex review §6): the independent turn dimensions ride
+            # the boundary so the durable commit can record a TRUTHFUL
+            # disposition — the broad `answered` verdict is not evidence of
+            # topical coverage (off-topic substantive speech reads
+            # topic_relation="unrelated" here and must never be recorded as
+            # covered by the consumers that feed commits).
+            "answer_disposition": turn_dims["disposition"],
+            "answer_evidence": turn_dims["answer_evidence"],
+            "candidate_question": turn_dims["candidate_question"],
+            "topic_relation": turn_dims["topic_relation"],
             "revision": 1,
             # W3 (2026-09-05): the LOGICAL candidate turn that captured this
             # boundary. The conflict-pending commit fence compares this against
@@ -4473,9 +4551,35 @@ async def _run_native_phone_screening(
                 turn_instruction = phone.phone_conflict_drop_advance_instruction(
                     turn_instruction
                 )
+            # Finding D (Codex review §6): a mixed answer+question turn gets
+            # its question ANSWERED before the conversation resumes — briefly,
+            # honestly, and without promises — instead of the bot re-asking or
+            # marching on as if nothing was asked. Composed as a PREFIX on the
+            # same single reply (never a second generation call).
+            if (
+                judge_instruction is None
+                and turn_dims.get("candidate_question")
+                # An anti-capitulation advance (unresolved conflict drop)
+                # outranks the answer-their-question nicety: its cold prefix
+                # must stay in the lead position its contract expects.
+                and not turn_instruction.startswith(
+                    phone.PHONE_CONFLICT_DROP_ADVANCE_PREFIX
+                )
+            ):
+                turn_instruction = (
+                    "The candidate's turn also carried a question for you. "
+                    "FIRST answer it briefly and honestly from verified "
+                    "context — never invent specifics and never make promises "
+                    "or commitments (for compensation, acknowledge their "
+                    "expectation neutrally; the hiring team owns budgets and "
+                    "bands). Then, in the same reply: " + turn_instruction
+                )
             preloaded_matches = (
                 phone.phone_objective_preemptive_enabled()
                 and judge_instruction is None
+                # A mixed-intent turn always injects: the preloaded objective
+                # context carries no answer-their-question directive.
+                and not turn_dims.get("candidate_question")
                 and preloaded_objective.get("text") == objective_text
             )
             if not preloaded_matches:
@@ -4854,6 +4958,13 @@ async def _run_native_phone_screening(
                 phone.phone_answer_disposition(
                     commit_question.text, commit_kind, candidate_text,
                 ) == phone.PHONE_ANSWER_NONANSWER
+                # Finding D: mirror the live hook's mixed-intent bypass — a
+                # boundary whose utterance carries high-confidence answer
+                # evidence for its own objective COMMITS (the hook advanced it
+                # deliberately); only an evidence-free nonanswer is fenced.
+                and not phone.phone_answer_covers_objective(
+                    commit_question.text, candidate_text,
+                )
                 and answer_reask_counts.get(commit_question.key, 0)
                 < phone.phone_answer_gate_max_reasks()
                 # FIX 1 companion (2026-09-07): mirror the live hook's composed
