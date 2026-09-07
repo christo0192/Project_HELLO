@@ -2363,6 +2363,16 @@ PHONE_PATIENCE_ENCOURAGEMENT_TEXT = (
 #: `system_prompt`. It hardens the plan-adherence the per-turn instruction
 #: already carries against the stt-endpointing failure mode where thinking
 #: fragments were answered, advanced past, and stacked on.
+#:
+#: Sarvam A/B prep (2026-09-07): the last two lines are model-neutral and
+#: target the two benchmarked Sarvam-105b weaknesses — false-premise
+#: capitulation (played along with "Messi the cricketer"-style baits 2/2 where
+#: DeepSeek corrected) and opener monotony (15/20 replies opened "Haha"/"Hmm",
+#: 11/20 contained "fair enough"). They ride THIS static per-call block, not
+#: `PHONE_TURN_STYLE_RIDER`: the style rider is appended to the PER-TURN
+#: planned instruction (which varies with the question text, so it is an
+#: uncached suffix), while this block sits in the stable per-call instruction
+#: prefix — cached after the first turn, zero extra uncached tokens per turn.
 PHONE_TURN_DISCIPLINE_TEXT = (
     "\n\nConversation discipline (mandatory):\n"
     "- Ask exactly ONE question per turn — never two. Do not stack a second "
@@ -2373,7 +2383,14 @@ PHONE_TURN_DISCIPLINE_TEXT = (
     "and stay on the current question.\n"
     "- If the candidate asks you to repeat the question or asks which question "
     "you meant, restate the CURRENT question only — never skip ahead to a "
-    "different one."
+    "different one.\n"
+    "- If the candidate says something clearly false or absurd — wrong facts, "
+    "an impossible claim — never play along or agree with it: gently correct "
+    "it or voice friendly doubt in one short clause, then return to the "
+    "question.\n"
+    "- Vary the opening word of every reply: never start consecutive replies "
+    "with the same filler (\"Haha\", \"Hmm\", \"Got it\"), and don't repeat a "
+    "stock phrase like \"fair enough\" more than once in a call."
 )
 
 
@@ -4297,13 +4314,22 @@ def is_post_goodbye_acknowledgement(text: Any) -> bool:
 # A TERMINAL farewell/closing token the bot uses to sign off. R3 (2026-09-06):
 # anchored to the END of text (allowing trailing punctuation / a very short
 # trailing clause) so a mid-utterance "bye" — e.g. the "Bye the way" typo — or an
-# incidental "take care with that" cannot arm the latch. "take care" now requires
-# an explicit farewell alongside it (it is NOT in this terminal set on its own).
+# incidental "take care with that" cannot arm the latch. D1 (2026-09-07, Sarvam
+# A/B call A): the live close "… Take care and good luck!" carried no bye-family
+# token, false-failed this gate, and the deterministic recovery spoke a SECOND
+# goodbye. The terminal set now includes the well-wish sign-offs ("good luck",
+# "best of luck", "all the best") and accepts "take care" WITHOUT a trailing
+# bye — the shape predicate still requires a co-occurring hand-off cue, so an
+# incidental mid-call "take care!" alone can never arm the latch, and the
+# terminal anchor still rejects "take care with that …" / "good luck with X, now
+# …" mid-sentence uses.
 _CLOSING_FAREWELL_TOKEN_RE = re.compile(
     r"\b(?:good\s*bye|bye(?:\s*bye)?|"
     r"have\s+a\s+(?:good|great|nice|wonderful|lovely)\s+"
     r"(?:day|one|rest\s+of\s+your\s+day)|"
-    r"take\s+care(?:[\s,.!-]*(?:now|then))?[\s,.!-]*(?:good\s*bye|bye(?:\s*bye)?))"
+    r"good\s+luck|best\s+of\s+luck|all\s+the\s+best|"
+    r"take\s+care(?:[\s,.!-]*(?:now|then))?"
+    r"(?:[\s,.!-]*(?:good\s*bye|bye(?:\s*bye)?))?)"
     # Terminal position: only trailing punctuation / whitespace / a tiny sign-off
     # tail (e.g. "bye now", "goodbye!") may follow — the farewell must close the
     # utterance, not sit mid-sentence.
@@ -4341,7 +4367,13 @@ def phone_closing_goodbye_shape(text: Any) -> bool:
     "take care" mid-conversation is NOT a closing shape, so the latch never arms
     early. R3 (2026-09-06): the terminal anchor rejects the "Bye the way …" typo
     and "Take care with that …" mid-call pleasantries that previously false-armed
-    the latch.
+    the latch. D1 (2026-09-07): the farewell vocabulary additionally accepts the
+    terminal well-wish sign-offs ("good luck", "best of luck", "all the best")
+    and a terminal "take care" without a bye — Sarvam A/B call A closed with
+    "… Take care and good luck!", this gate false-failed it, and the terminal
+    commit spoke the deterministic closing on top (double goodbye). The AND with
+    the hand-off cue is unchanged, so none of the new tokens can arm on their
+    own.
 
     R5 (2026-09-06) — WHAT ACTUALLY LATCHES: the goodbye latch arms ONLY on
     LLM-AUTHORED closes (the `phone_qna_done` wind-down path). The fixed
