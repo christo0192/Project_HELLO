@@ -67,9 +67,9 @@ const EPOCH = 7;
 const LEASE_OWNER = 'dialer-a';
 
 /** 15:00 IST — inside the restored 09:00–21:00 window. */
-const NOW = new Date('2026-09-07T09:30:00.000Z');
+const NOW = new Date('2026-09-14T09:30:00.000Z');
 /** 01:30 IST — outside the restored window. */
-const NIGHT = new Date('2026-09-07T20:00:00.000Z');
+const NIGHT = new Date('2026-09-14T20:00:00.000Z');
 
 const NUMBER = wrapDialableNumber('+919876543210');
 const DIGEST = NUMBER.digest;

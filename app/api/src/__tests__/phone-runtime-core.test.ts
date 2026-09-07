@@ -1475,14 +1475,16 @@ describe('CONTROL — the handler performs no I/O whatsoever', () => {
 
 describe('the due pass refuses outside 09:00-inclusive / 21:00-exclusive IST after the cutoff', () => {
   const instants: Array<[string, string, boolean]> = [
-    ['one second before open', '2026-09-07T03:29:59.000Z', false],
-    ['exactly 09:00:00 IST', '2026-09-07T03:30:00.000Z', true],
-    ['one second after open', '2026-09-07T03:30:01.000Z', true],
-    ['midday', '2026-09-07T06:00:00.000Z', true],
-    ['one second before close', '2026-09-07T15:29:59.000Z', true],
-    ['exactly 21:00:00 IST', '2026-09-07T15:30:00.000Z', false],
-    ['one second after close', '2026-09-07T15:30:01.000Z', false],
-    ['the dead of night', '2026-09-07T20:00:00.000Z', false],
+    // 2026-09-14 is the first post-cutoff IST day after the 0085-extended
+    // temporary override (24/7 through 2026-09-13 inclusive).
+    ['one second before open', '2026-09-14T03:29:59.000Z', false],
+    ['exactly 09:00:00 IST', '2026-09-14T03:30:00.000Z', true],
+    ['one second after open', '2026-09-14T03:30:01.000Z', true],
+    ['midday', '2026-09-14T06:00:00.000Z', true],
+    ['one second before close', '2026-09-14T15:29:59.000Z', true],
+    ['exactly 21:00:00 IST', '2026-09-14T15:30:00.000Z', false],
+    ['one second after close', '2026-09-14T15:30:01.000Z', false],
+    ['the dead of night', '2026-09-14T20:00:00.000Z', false],
   ];
 
   for (const [label, iso_, open] of instants) {
@@ -1506,7 +1508,7 @@ describe('the due pass refuses outside 09:00-inclusive / 21:00-exclusive IST aft
   it('offers a due engagement at midnight during the temporary window', async () => {
     const h = harness({ due: [engagement({ nextEligibleAt: null })] });
     const result = await runPhoneDuePass(h.deps, {
-      now: new Date('2026-09-06T18:29:59.000Z'),
+      now: new Date('2026-09-13T18:29:59.000Z'),
       limit: 10,
     });
     expect(result.skipped.outside_ist_window ?? 0).toBe(0);
@@ -1520,7 +1522,7 @@ describe('the due pass refuses outside 09:00-inclusive / 21:00-exclusive IST aft
     const h = harness({ backlogThrows: true });
     const result = await runPhoneDuePass(
       h.deps,
-      { now: new Date('2026-09-07T20:00:00.000Z'), limit: 10 }
+      { now: new Date('2026-09-14T20:00:00.000Z'), limit: 10 }
     );
     expect(result.status).toBe('halted');
   });
@@ -1535,7 +1537,7 @@ describe('the due pass refuses outside 09:00-inclusive / 21:00-exclusive IST aft
         engagement({ engagementId: 'e3', candidateId: 'c3', nextEligibleAt: null }),
       ],
     });
-    const result = await runPhoneDuePass(h.deps, { now: new Date('2026-09-07T20:00:00.000Z'), limit: 10 });
+    const result = await runPhoneDuePass(h.deps, { now: new Date('2026-09-14T20:00:00.000Z'), limit: 10 });
     expect(result.skipped).toEqual({ outside_ist_window: 3 });
     expect(result.examined).toBe(3);
   });

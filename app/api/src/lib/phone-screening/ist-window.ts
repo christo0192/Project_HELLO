@@ -5,8 +5,8 @@
  * ── THE DATABASE OWNS THE WINDOW ──────────────────────────────────────
  * `screening_v2.phone_ist_window_open_at()`, `phone_ist_window_close_at()`
  * and `phone_max_concurrent()` are the SINGLE definitions of the permanent
- * bounds and fleet cap. Migration 0064 owns the reviewed, date-bounded
- * temporary override; the effective predicate below mirrors that policy.
+ * bounds and fleet cap. Migration 0064 (cutoff re-asserted by 0085) owns the
+ * reviewed, date-bounded temporary override; the predicate below mirrors it.
  * TypeScript may NARROW the permanent bounds — a caller can refuse to dial
  * before 10:00 — but `narrowIstWindow` refuses any bound that would widen it.
  *
@@ -34,8 +34,19 @@ export const PHONE_IST_WINDOW_OPEN_AT = '09:00:00';
 /** Mirror of `screening_v2.phone_ist_window_close_at()` — 21:00 IST, EXCLUSIVE. */
 export const PHONE_IST_WINDOW_CLOSE_AT = '21:00:00';
 
-/** Inclusive final IST date of the reviewed temporary all-day window. */
-export const PHONE_TEMPORARY_247_UNTIL_IST = '2026-09-06';
+/**
+ * Inclusive final IST date of the reviewed temporary all-day window.
+ *
+ * 2026-09-07 reconciliation: the live DB's `phone_temporary_247_until()` was
+ * extended out-of-band to 2026-09-13 while this constant still said
+ * 2026-09-06, and because the due-loop preflight consults THIS mirror before
+ * admission ever reaches SQL, the DB extension was inert after 21:00 IST —
+ * TS/DB drift turned an approved extension into a silent after-hours block.
+ * Migration 0085 re-asserts the same cutoff in repo SQL; a follow-up to make
+ * one side authoritative (so a lone out-of-band change cannot go inert) is
+ * tracked separately.
+ */
+export const PHONE_TEMPORARY_247_UNTIL_IST = '2026-09-13';
 
 /** The temporary window's full-day bounds. The normal bounds remain above. */
 export const PHONE_24X7_WINDOW: IstWindowBounds = Object.freeze({

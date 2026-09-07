@@ -846,19 +846,21 @@ describe('P5 worker route — the server revalidates the instant', () => {
 
 describe('P5 worker route — the IST window and temporary 24/7 override', () => {
   // IST is UTC+05:30, so an IST wall clock of HH:MM is (HH:MM - 5:30) UTC.
+  // 2026-09-14 is the first post-cutoff IST day after the 0085-extended
+  // temporary override (24/7 through 2026-09-13 inclusive).
   const cases = [
-    { label: '09:00 IST (open, inclusive)', utc: '2026-09-07T03:30:00Z', open: true },
-    { label: '08:59 IST (one minute early)', utc: '2026-09-07T03:29:00Z', open: false },
-    { label: '20:59 IST (last legal minute)', utc: '2026-09-07T15:29:00Z', open: true },
-    { label: '21:00 IST (close, exclusive)', utc: '2026-09-07T15:30:00Z', open: false },
-    { label: '03:00 IST (the middle of the night)', utc: '2026-09-06T21:30:00Z', open: false },
+    { label: '09:00 IST (open, inclusive)', utc: '2026-09-14T03:30:00Z', open: true },
+    { label: '08:59 IST (one minute early)', utc: '2026-09-14T03:29:00Z', open: false },
+    { label: '20:59 IST (last legal minute)', utc: '2026-09-14T15:29:00Z', open: true },
+    { label: '21:00 IST (close, exclusive)', utc: '2026-09-14T15:30:00Z', open: false },
+    { label: '03:00 IST (the middle of the night)', utc: '2026-09-13T21:30:00Z', open: false },
   ];
 
-  it('accepts a call-start at 03:00 IST on September 6 during the temporary window', async () => {
+  it('accepts a call-start at 03:00 IST on September 13 during the temporary window', async () => {
     const h = build();
     const res = await post(h, '/appointments', {
       attempt_id: ATTEMPT,
-      starts_at: '2026-09-05T21:30:00Z',
+      starts_at: '2026-09-12T21:30:00Z',
       duration_seconds: 1800,
     });
     expect(res.body.ok).toBe(true);

@@ -27,7 +27,7 @@ import { PHONE_RPC_UNKNOWN_STATUS } from '../lib/phone-screening/rpc-contract.js
 import type { AdmitPhoneAttemptResult, PhoneStores } from '../lib/phone-screening/ports.js';
 import { functionBody } from './support/phone-migration.js';
 
-const NOW = new Date('2026-09-07T09:30:00.000Z'); // 15:00 IST — inside the restored window.
+const NOW = new Date('2026-09-14T09:30:00.000Z'); // 15:00 IST — inside the restored window.
 const DIGEST = 'c'.repeat(64);
 
 const ALL_SIX = ['ai_interview', 'recording', 'purpose', 'data_processing', 'retention', 'rights'];
@@ -309,17 +309,17 @@ describe('admission facade — the gates defer, they never admit', () => {
 
   it('a closed window defers with the next legal instant, and charges nothing', async () => {
     const f = fakeStores(okResult);
-    // 2026-09-07T16:00:00Z is 21:30 IST — after the restored close.
+    // 2026-09-14T16:00:00Z is 21:30 IST — after the restored close.
     const result = await admitPhoneEngagement(
       { stores: f.stores, config: enabledConfig, consentReader: reader(granted) },
-      { ...request, now: new Date('2026-09-07T16:00:00.000Z') },
+      { ...request, now: new Date('2026-09-14T16:00:00.000Z') },
     );
     expect(result).toMatchObject({
       decision: 'deferred', code: 'window_closed_defer', charged: false,
     });
     if (result.decision !== 'deferred') throw new Error('unreachable');
-    // Tomorrow 09:00 IST = 2026-09-08T03:30:00Z.
-    expect(result.retryAfter?.toISOString()).toBe('2026-09-08T03:30:00.000Z');
+    // Tomorrow 09:00 IST = 2026-09-15T03:30:00Z.
+    expect(result.retryAfter?.toISOString()).toBe('2026-09-15T03:30:00.000Z');
     expect(f.callsMade()).toBe(0);
   });
 

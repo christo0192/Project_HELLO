@@ -30,7 +30,7 @@ import {
   nextIstWindowOpen,
   parseIstClockTime,
 } from '../lib/phone-screening/ist-window.js';
-import { helperLiteral, functionBody, MIGRATION_0042, MIGRATION_0064 } from './support/phone-migration.js';
+import { helperLiteral, functionBody, MIGRATION_0042, MIGRATION_0064, MIGRATION_0085 } from './support/phone-migration.js';
 
 const IST_SOURCE = readFileSync(
   fileURLToPath(new URL('../lib/phone-screening/ist-window.ts', import.meta.url)),
@@ -61,6 +61,9 @@ describe('the DATABASE owns the window and the cap', () => {
     expect(body).toContain('>= screening_v2.phone_ist_window_open_at()');
     expect(body).toContain('< screening_v2.phone_ist_window_close_at()');
     expect(MIGRATION_0064).toContain("date '2026-09-06'");
+    // 0085 re-asserts the cutoff at the owner-approved extension date; the
+    // newest-first extractor therefore reads the effective predicate from it.
+    expect(MIGRATION_0085).toContain("date '2026-09-13'");
     expect(PHONE_IST_WINDOW.openSeconds).toBe(9 * 3600);
     expect(PHONE_IST_WINDOW.closeSeconds).toBe(21 * 3600);
   });
@@ -108,9 +111,9 @@ describe('the DATABASE owns the window and the cap', () => {
 });
 
 describe('boundaries, on all seven days', () => {
-  // 2026-09-07 is a Monday; the seven consecutive dates cover every weekday
-  // after the temporary override has ended.
-  const DAYS = [7, 8, 9, 10, 11, 12, 13];
+  // 2026-09-14 is a Monday; the seven consecutive dates cover every weekday
+  // after the temporary override (extended to 2026-09-13 by 0085) has ended.
+  const DAYS = [14, 15, 16, 17, 18, 19, 20];
 
   it('08:59:59 refused, 09:00:00 admitted, 20:59:59 admitted, 21:00:00 refused', () => {
     for (const day of DAYS) {
@@ -138,10 +141,10 @@ describe('boundaries, on all seven days', () => {
     expect(istDate(justAfterIstMidnight)).toBe('2026-08-23');
     expect(justAfterIstMidnight.toISOString().slice(0, 10)).toBe('2026-08-22');
 
-    // And the mirror case after the temporary period: 2026-09-07T00:30Z is
+    // And the mirror case after the temporary period: 2026-09-14T00:30Z is
     // 06:00 IST — before the restored window opens.
-    const utcMidnightish = new Date('2026-09-07T00:30:00.000Z');
-    expect(istDate(utcMidnightish)).toBe('2026-09-07');
+    const utcMidnightish = new Date('2026-09-14T00:30:00.000Z');
+    expect(istDate(utcMidnightish)).toBe('2026-09-14');
     expect(istWindowOpen(utcMidnightish)).toBe(false);
   });
 
@@ -164,35 +167,35 @@ describe('boundaries, on all seven days', () => {
 });
 
 describe('the effective temporary window', () => {
-  it('is 24/7 through September 6 inclusive and restores the normal bounds', () => {
-    expect(PHONE_TEMPORARY_247_UNTIL_IST).toBe('2026-09-06');
+  it('is 24/7 through September 13 inclusive and restores the normal bounds', () => {
+    expect(PHONE_TEMPORARY_247_UNTIL_IST).toBe('2026-09-13');
     expect(PHONE_24X7_WINDOW).toEqual({ openSeconds: 0, closeSeconds: 86_400 });
-    expect(istWindowForDate('2026-09-06')).toBe(PHONE_24X7_WINDOW);
-    expect(istWindowForDate('2026-09-07')).toBe(PHONE_IST_WINDOW);
-    expect(istWindowOpen(new Date('2026-09-06T18:29:59.000Z'))).toBe(true);
-    expect(istWindowOpen(new Date('2026-09-07T00:00:00.000Z'))).toBe(false);
+    expect(istWindowForDate('2026-09-13')).toBe(PHONE_24X7_WINDOW);
+    expect(istWindowForDate('2026-09-14')).toBe(PHONE_IST_WINDOW);
+    expect(istWindowOpen(new Date('2026-09-13T18:29:59.000Z'))).toBe(true);
+    expect(istWindowOpen(new Date('2026-09-14T00:00:00.000Z'))).toBe(false);
   });
 
   it('the next legal instant is now during the override, then 09:00 IST after it', () => {
-    const during = new Date('2026-09-06T18:29:59.000Z');
+    const during = new Date('2026-09-13T18:29:59.000Z');
     expect(nextIstWindowOpen(during).getTime()).toBe(during.getTime());
-    expect(nextIstWindowOpen(new Date('2026-09-07T00:00:00.000Z')).getTime())
-      .toBe(ist(2026, 9, 7, 9, 0, 0).getTime());
+    expect(nextIstWindowOpen(new Date('2026-09-14T00:00:00.000Z')).getTime())
+      .toBe(ist(2026, 9, 14, 9, 0, 0).getTime());
   });
 
   it('before today\'s open returns today\'s open after the cutoff', () => {
-    const early = ist(2026, 9, 7, 6, 0, 0);
-    expect(nextIstWindowOpen(early).getTime()).toBe(ist(2026, 9, 7, 9, 0, 0).getTime());
+    const early = ist(2026, 9, 14, 6, 0, 0);
+    expect(nextIstWindowOpen(early).getTime()).toBe(ist(2026, 9, 14, 9, 0, 0).getTime());
   });
 
   it('inside the window returns the instant itself', () => {
-    const inside = ist(2026, 9, 7, 14, 3, 7);
+    const inside = ist(2026, 9, 14, 14, 3, 7);
     expect(nextIstWindowOpen(inside).getTime()).toBe(inside.getTime());
   });
 
   it('at or after close returns TOMORROW\'S open', () => {
-    expect(nextIstWindowOpen(ist(2026, 9, 7, 21, 0, 0)).getTime())
-      .toBe(ist(2026, 9, 8, 9, 0, 0).getTime());
+    expect(nextIstWindowOpen(ist(2026, 9, 14, 21, 0, 0)).getTime())
+      .toBe(ist(2026, 9, 15, 9, 0, 0).getTime());
     expect(nextIstWindowOpen(ist(2026, 9, 30, 23, 30, 0)).getTime())
       .toBe(ist(2026, 10, 1, 9, 0, 0).getTime());
   });
@@ -201,21 +204,21 @@ describe('the effective temporary window', () => {
     // This is the reason the window is evaluated when the reconnect is ACTED
     // ON rather than when the drop happened: the wait is legal, the moment it
     // ends is not, and the deferral must go to the next real slot.
-    const drop = ist(2026, 9, 7, 20, 59, 0);
+    const drop = ist(2026, 9, 14, 20, 59, 0);
     expect(istWindowOpen(drop)).toBe(true);
 
     const afterBackoff = new Date(drop.getTime() + 120_000);
     expect(istWallClock(afterBackoff).hour).toBe(21);
     expect(istWindowOpen(afterBackoff)).toBe(false);
 
-    expect(nextIstWindowOpen(afterBackoff).getTime()).toBe(ist(2026, 9, 8, 9, 0, 0).getTime());
+    expect(nextIstWindowOpen(afterBackoff).getTime()).toBe(ist(2026, 9, 15, 9, 0, 0).getTime());
   });
 
   it('the next-IST-DAY helper always skips to tomorrow, even mid-window', () => {
     // The provider-failure deferral: today's attempt already holds today's
     // ist_date, so the per-day index refuses until the day rolls.
-    const midday = ist(2026, 9, 7, 12, 0, 0);
-    expect(nextIstDayWindowOpen(midday).getTime()).toBe(ist(2026, 9, 8, 9, 0, 0).getTime());
+    const midday = ist(2026, 9, 14, 12, 0, 0);
+    expect(nextIstDayWindowOpen(midday).getTime()).toBe(ist(2026, 9, 15, 9, 0, 0).getTime());
     expect(functionBody('apply_phone_event')).toContain(
       'screening_v2.phone_ist_date(p_now) + 1',
     );
