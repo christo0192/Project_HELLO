@@ -157,7 +157,7 @@ recordingsRouter.get(
       // recording_size_bytes feed the F1 download-time re-verification.
       let { data: session, error: sessionErr } = await supabase
         .from('call_sessions')
-        .select('owner_id, status, mode, recording_object_key, recording_sha256, recording_size_bytes, recording_quarantined, recording_revoked_at, recording_deleted_at, recording_egress_id, recording_egress_status')
+        .select('owner_id, status, mode, recording_object_key, recording_sha256, recording_size_bytes, recording_content_type, recording_quarantined, recording_revoked_at, recording_deleted_at, recording_egress_id, recording_egress_status')
         .eq('id', sessionId)
         .single();
 
@@ -230,7 +230,7 @@ recordingsRouter.get(
         if (finalization === 'ready') {
           const refreshed = await supabase
             .from('call_sessions')
-            .select('owner_id, status, mode, recording_object_key, recording_sha256, recording_size_bytes, recording_quarantined, recording_revoked_at, recording_deleted_at, recording_egress_id, recording_egress_status')
+            .select('owner_id, status, mode, recording_object_key, recording_sha256, recording_size_bytes, recording_content_type, recording_quarantined, recording_revoked_at, recording_deleted_at, recording_egress_id, recording_egress_status')
             .eq('id', sessionId)
             .single();
           if (!refreshed.error && refreshed.data) session = refreshed.data;
@@ -337,10 +337,35 @@ recordingsRouter.get(
       // ───────────────────────────────────────────────────────────────
 
       // ── Mint short-lived signed URL ─────────────────────────────
+      // FIX 6b (SE-call RCA 2026-09-07): the served Content-Type and the
+      // download filename EXTENSION derive from the manifest's SNIFFED
+      // `recording_content_type` (the finalizer reads the object's own magic
+      // bytes), NEVER from the storage key extension. The worker's raw-OGG
+      // transcode-failure fallback lands `audio/ogg` bytes at the same `.mp3`
+      // key, so a key-derived name hands the recruiter an unplayable `.mp3`.
+      // The object-key contract itself is untouched; sessions with no sniffed
+      // type (legacy browser uploads) keep the exact historical behavior.
+      const sniffedType = (session as { recording_content_type?: string | null })
+        .recording_content_type ?? null;
+      const extensionByType: Record<string, string> = {
+        'audio/ogg': '.ogg',
+        'audio/mpeg': '.mp3',
+      };
+      const downloadExt = sniffedType ? extensionByType[sniffedType] : undefined;
       const ttlSec = env.recordingDownloadTtlSec;
-      const { data: signedData, error: signErr } = await supabase.storage
-        .from(env.recordingsBucket)
-        .createSignedUrl(session.recording_object_key as string, ttlSec);
+      // `download` sets Content-Disposition on the storage response, so the
+      // saved file carries the sniffed-type extension regardless of the key's
+      // own extension. The option is omitted entirely (two-argument call,
+      // byte-identical to before) when the type is unknown/unsniffed.
+      const { data: signedData, error: signErr } = downloadExt
+        ? await supabase.storage
+            .from(env.recordingsBucket)
+            .createSignedUrl(session.recording_object_key as string, ttlSec, {
+              download: `recording-${sessionId}${downloadExt}`,
+            })
+        : await supabase.storage
+            .from(env.recordingsBucket)
+            .createSignedUrl(session.recording_object_key as string, ttlSec);
 
       if (signErr || !signedData?.signedUrl) {
         // Redacted stable error — never expose signing failure details.
@@ -361,8 +386,14 @@ recordingsRouter.get(
         },
       }).catch(() => {/* fail-open */});
 
-      // Return signed URL — never persisted or logged.
-      res.json({ url: signedData.signedUrl });
+      // Return signed URL — never persisted or logged. `content_type` (when
+      // sniffed at finalization) lets the client label/play the audio
+      // truthfully instead of trusting the storage key extension (FIX 6b).
+      res.json(
+        sniffedType
+          ? { url: signedData.signedUrl, content_type: sniffedType }
+          : { url: signedData.signedUrl },
+      );
     } catch (error) {
       next(error);
     }

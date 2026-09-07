@@ -110,7 +110,16 @@ primary_region = "sin"
   # coordinator owns objective order; preloading a future objective can create
   # repeated introductions or stale questions after an interruption.
   PHONE_OBJECTIVE_PREEMPTIVE = "off"
-  PHONE_TTS_FLUSH_MIN_CHARS = "0"
+  # 60 (owner-approved 2026-09-07, SE-call latency RCA): the early-flush fix is
+  # ACTIVE — first speakable fragment (first sentence terminator / clause pause /
+  # 60-char cap) reaches Sarvam immediately instead of waiting for the model's
+  # complete first sentence (~1.8s median reply->first-TTS block measured).
+  # "0" is the instant rollback (whole reply as ONE synthesis, no early flush).
+  # DEPLOY NOTE (operator step): a stale Fly SECRET also named
+  # PHONE_TTS_FLUSH_MIN_CHARS overrides this [env] value — it MUST be unset
+  # (`fly secrets unset PHONE_TTS_FLUSH_MIN_CHARS -a <phone-app>`) at deploy or
+  # this change silently does nothing.
+  PHONE_TTS_FLUSH_MIN_CHARS = "60"
   LIVEKIT_WORKER_DRAIN_SEC = "10"
   CANDIDATE_SILENCE_PROMPT_SEC = "30"
   CANDIDATE_SILENCE_END_SEC = "20"
