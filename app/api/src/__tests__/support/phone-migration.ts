@@ -174,6 +174,12 @@ export const MIGRATION_0083_PATH = fileURLToPath(
 
 export const MIGRATION_0083 = readFileSync(MIGRATION_0083_PATH, 'utf8');
 
+export const MIGRATION_0085_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0085_phone_temporary_247_extension.sql', import.meta.url),
+);
+
+export const MIGRATION_0085 = readFileSync(MIGRATION_0085_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -181,6 +187,12 @@ export const MIGRATION_0083 = readFileSync(MIGRATION_0083_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0085 re-declares phone_temporary_247_until, phone_ist_window_open and
+    // phone_next_window_open in full (0064-style bodies, cutoff 2026-09-13,
+    // aligning repo SQL with the out-of-band production extension), so it must
+    // be NEWEST-FIRST for the extractors to read the effective bodies rather
+    // than 0064's.
+    { name: '0085', sql: MIGRATION_0085 },
     // 0083 adds abandon_phone_attempt_infra (same-IST-day relief for a
     // worker_not_ready infra defer) and narrows the per-IST-day index. Its two
     // voice-worker RPCs are NOT phone-domain and are intentionally excluded from
