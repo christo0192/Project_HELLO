@@ -150,6 +150,12 @@ PHONE_CONTINUATION_SETTLE_SEC = 0.65
 # a monologue longer than this bound it fires anyway rather than going silent.
 # Module constant (not env) so tests can patch it alongside the audio timeout.
 PHONE_WATCHDOG_SPEECH_DEFER_MAX_SEC = 6.0
+# Finding E lifecycle (Codex review §7, 2026-09-07): how many times a
+# name-confirmation turn may be AUTHORED for one mismatch key before an
+# undelivered confirmation is recorded "unresolved" instead of re-authored.
+# 2 matches the existing bounded re-ask caps (answer gate, delivery gate,
+# conflict re-pursuits). Module constant (not env) so tests can patch it.
+PHONE_NAME_CONFIRM_MAX_AUTHORS = 2
 
 
 def _bounded_float_env(name: str, default: float, lo: float, hi: float) -> float:
@@ -2334,6 +2340,34 @@ async def _run_native_phone_screening(
     # the account), so it arms under its own `phone_name_mismatch_key` set. This
     # can neither shadow nor be shadowed by a live résumé conflict.
     asked_name_mismatches: set[str] = set()
+    # ── Finding E lifecycle (Codex review §7, 2026-09-07) ────────────────────
+    # `asked_name_mismatches` used to be the WHOLE lifecycle: a key entered it
+    # at AUTHOR time, so a rejected/interrupted confirmation read as already
+    # handled and the persisted identity signal froze at "armed" (Call A).
+    # Authoring, delivery, and confirmation are now tracked separately:
+    #   * `name_confirm_state[key]` — {authored: int, delivered: bool,
+    #     mismatch: dict}. `authored` counts authoring attempts (bounded by
+    #     `_NAME_CONFIRM_MAX_AUTHORS`, consistent with the existing re-ask
+    #     caps); `delivered` flips only on playout proof.
+    #   * `name_confirm_delivery` — the armed in-flight confirm turn, mirror of
+    #     `conflict_delivery` (sequence predicted at author time; delivery
+    #     proven by `on_reply_delivered` KEY-PRESENCE, the W3 idiom, so the
+    #     watchdog's canned name-confirm fallback still counts as delivery).
+    #   * `owed_name_confirm` — set when an authored confirmation was
+    #     interrupted before playout; the next authored turn re-authors it
+    #     (bounded), so an undelivered confirmation stays PENDING instead of
+    #     silently consumed. At the author cap it is recorded "unresolved".
+    #   * `name_confirm_awaiting_reply` — set at delivery; the next candidate
+    #     turn is checked ONCE against the conservative
+    #     `phone_name_confirm_reply_confirms` predicate and, on a match, the
+    #     identity signal is graded "confirmed". Purely observability — it
+    #     never routes the turn.
+    name_confirm_state: dict[str, dict[str, Any]] = {}
+    name_confirm_delivery: dict[str, Any] = {
+        "sequence": None, "key": None, "mismatch": None,
+    }
+    owed_name_confirm: dict[str, Any] = {"value": False, "mismatch": None}
+    name_confirm_awaiting_reply: dict[str, Any] = {"key": None, "mismatch": None}
     # FIX A (2026-09-06) OWED CONFLICT PROBE latch. The ASYNC coverage judge
     # (~4271) detects résumé conflicts ~1-2s after the cursor already moved. The
     # old remedy armed `conflict_reply_pending` stamped with `native_turn_seq`
@@ -2361,7 +2395,8 @@ async def _run_native_phone_screening(
         """Persist a GRADED identity signal into the observability accumulator.
 
         Not a bare bool: records the spoken/record root names, the similarity
-        ratio, and a disposition (armed | confirmed | unresolved). Keyed by
+        ratio, and a disposition (armed | delivered | confirmed | unresolved —
+        Finding E split authoring from delivery from confirmation). Keyed by
         `phone_name_mismatch_key` so a repeated intro of the same mismatch
         updates the same entry (last disposition wins) rather than duplicating.
         Best-effort — a persistence failure never perturbs the live turn.
@@ -2708,6 +2743,29 @@ async def _run_native_phone_screening(
             "origin": origin,
         })
         _bump_coverage_judge_metric(call_metrics, "conflict_probe_scheduled")
+
+    def _arm_name_confirm_delivery(name_key: str, mismatch: Any) -> None:
+        """Finding E: the ONLY writer that arms name-confirm delivery tracking.
+
+        Mirrors `_arm_conflict_delivery`: called at every AUTHOR site (fresh
+        detection at the single-final and coalesce sites, and the bounded owed
+        re-author), it counts the authoring attempt and predicts the speech
+        sequence of the confirm turn. Delivery is proven separately by
+        `on_reply_delivered` (key-presence, the W3 idiom); confirmation is
+        graded separately again from the candidate's next turn. Authoring is
+        not delivery; delivery is not confirmation.
+        """
+        entry = name_confirm_state.setdefault(
+            name_key,
+            {"authored": 0, "delivered": False,
+             "mismatch": dict(mismatch) if isinstance(mismatch, dict) else None},
+        )
+        entry["authored"] = int(entry.get("authored") or 0) + 1
+        name_confirm_delivery.update({
+            "sequence": speech_sequence[0] + 1,
+            "key": name_key,
+            "mismatch": dict(mismatch) if isinstance(mismatch, dict) else None,
+        })
 
     def _maybe_arm_llm_authored_conflict(reply_text: Any) -> bool:
         """F2 (2026-09-06): arm the bounded conflict loop for an LLM-authored probe.
@@ -3156,6 +3214,18 @@ async def _run_native_phone_screening(
         if finished.is_set():
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
+        # Finding E (Codex review §7): grade the ONE candidate turn that
+        # answers a DELIVERED name-confirmation. Observability only — it never
+        # routes the turn (the reply still flows through the normal gates).
+        # Read-and-clear so the broad affirmation vocabulary is consulted for
+        # exactly one turn; a non-confirming reply leaves the signal at the
+        # truthful "delivered", never an invented "confirmed".
+        if name_confirm_awaiting_reply.get("key") is not None:
+            awaiting_mismatch = name_confirm_awaiting_reply.get("mismatch")
+            name_confirm_awaiting_reply["key"] = None
+            name_confirm_awaiting_reply["mismatch"] = None
+            if phone.phone_name_confirm_reply_confirms(text, awaiting_mismatch):
+                _record_identity_signal(awaiting_mismatch, "confirmed")
         if candidate_end_requested.is_set() or phone.is_explicit_end_call_request(text):
             candidate_end_requested.set()
             reply_plan[0] = phone.PHONE_CANDIDATE_END_TEXT
@@ -3618,6 +3688,9 @@ async def _run_native_phone_screening(
                     if confirm_instruction is not None:
                         asked_name_mismatches.add(name_key)
                         _record_identity_signal(name_mismatch, "armed")
+                        # Finding E: authoring is not delivery (see the
+                        # single-final site) — track the in-flight confirm.
+                        _arm_name_confirm_delivery(name_key, name_mismatch)
                         stale_handle = reply_handle[0]
                         interrupt = getattr(stale_handle, "interrupt", None)
                         if callable(interrupt):
@@ -4110,6 +4183,10 @@ async def _run_native_phone_screening(
                         judge_instruction = confirm_instruction
                         judge_is_name_confirm = True
                         _record_identity_signal(name_mismatch, "armed")
+                        # Finding E: authoring is not delivery — track the
+                        # in-flight confirm turn so playout proof (or an
+                        # interruption) grades the signal truthfully.
+                        _arm_name_confirm_delivery(name_key, name_mismatch)
                         # NOTE: deliberately NOT `_arm_conflict_delivery(...)`. A
                         # name-confirmation is a SINGLE turn, not a bounded
                         # re-pursuit; arming conflict delivery would route the
@@ -4117,6 +4194,35 @@ async def _run_native_phone_screening(
                         # reply` / the conflict advance loop. Identity stays
                         # independent of the conflict path (task constraint): the
                         # confirming reply flows through the normal answer-gate.
+            # Finding E: OWED NAME-CONFIRM re-author. An authored confirmation
+            # that was interrupted before playout stays PENDING (the identity
+            # signal is intro-only and unrecoverable, so a lost confirm turn
+            # can never re-derive on its own). Re-author it on the next
+            # authored turn, bounded by PHONE_NAME_CONFIRM_MAX_AUTHORS —
+            # mirror of the owed conflict probe directly below. Runs AFTER the
+            # fresh-identity claim (a fresh mismatch outranks a stale one) and
+            # BEFORE the conflict channel (identity-first precedence, F3).
+            if judge_instruction is None and owed_name_confirm["value"]:
+                owed_mismatch = owed_name_confirm["mismatch"]
+                owed_name_confirm["value"] = False
+                owed_name_confirm["mismatch"] = None
+                if isinstance(owed_mismatch, dict):
+                    owed_name_key = phone.phone_name_mismatch_key(owed_mismatch)
+                    owed_entry = name_confirm_state.get(owed_name_key)
+                    if (
+                        owed_entry is not None
+                        and not owed_entry.get("delivered")
+                        and int(owed_entry.get("authored") or 0)
+                        < PHONE_NAME_CONFIRM_MAX_AUTHORS
+                    ):
+                        confirm_instruction = phone.phone_name_confirm_instruction(
+                            owed_mismatch,
+                        )
+                        if confirm_instruction is not None:
+                            judge_instruction = confirm_instruction
+                            judge_is_name_confirm = True
+                            _record_identity_signal(owed_mismatch, "armed")
+                            _arm_name_confirm_delivery(owed_name_key, owed_mismatch)
             # RÉSUMÉ-CONFLICT / REANCHOR channel: gated on the identity signal NOT
             # having claimed this turn (`judge_instruction is None`). When the
             # identity signal SHADOWS the conflict this turn, the conflict key is
@@ -5140,8 +5246,53 @@ async def _run_native_phone_screening(
         reason = pending_terminal_reason.get("value")
         expected_seq = pending_terminal_speech_seq.get("value")
         conflict_seq = conflict_delivery.get("sequence")
+        name_confirm_seq = name_confirm_delivery.get("sequence")
         if delivered_seq is None:
-            delivered_seq = expected_seq if expected_seq is not None else conflict_seq
+            delivered_seq = (
+                expected_seq if expected_seq is not None
+                else conflict_seq if conflict_seq is not None
+                else name_confirm_seq
+            )
+        # ── Finding E (Codex review §7): the name-confirm lifecycle proof ────
+        # Authoring is not delivery. An armed confirm turn interrupted on its
+        # OWN handle never reached the candidate: keep it PENDING (owed) under
+        # the bounded author cap, or record it unresolved at cap — the Call A
+        # signal froze at "armed" precisely because authoring consumed the one
+        # chance. A NON-interrupted delivery while the arm is present proves
+        # the confirmation was heard (KEY-PRESENCE, the W3 idiom — the
+        # watchdog's canned name-confirm fallback is a different sequence and
+        # still counts, exactly like the conflict probe's fallback delivery).
+        if name_confirm_delivery.get("key") is not None:
+            nc_key = name_confirm_delivery.get("key")
+            nc_mismatch = name_confirm_delivery.get("mismatch")
+            if interrupted:
+                if delivered_seq == name_confirm_seq:
+                    name_confirm_delivery.update({
+                        "sequence": None, "key": None, "mismatch": None,
+                    })
+                    entry = name_confirm_state.get(nc_key)
+                    authored = int((entry or {}).get("authored") or 0)
+                    if authored < PHONE_NAME_CONFIRM_MAX_AUTHORS:
+                        owed_name_confirm["value"] = True
+                        owed_name_confirm["mismatch"] = (
+                            dict(nc_mismatch) if isinstance(nc_mismatch, dict)
+                            else None
+                        )
+                    else:
+                        _record_identity_signal(nc_mismatch, "unresolved")
+            else:
+                name_confirm_delivery.update({
+                    "sequence": None, "key": None, "mismatch": None,
+                })
+                entry = name_confirm_state.get(nc_key)
+                if entry is not None:
+                    entry["delivered"] = True
+                _record_identity_signal(nc_mismatch, "delivered")
+                # The next candidate turn is graded ONCE for confirmation.
+                name_confirm_awaiting_reply["key"] = nc_key
+                name_confirm_awaiting_reply["mismatch"] = (
+                    dict(nc_mismatch) if isinstance(nc_mismatch, dict) else None
+                )
         if interrupted:
             # BARGE-IN CLEAR (W3, 2026-09-05; comment corrected in the
             # adversarial-review repair — FIX 5). A conflict probe interrupted on
@@ -5366,6 +5517,13 @@ async def _run_native_phone_screening(
     # Identity test seam (same idiom as `_asked_conflicts`): the per-name-mismatch
     # arm set, so a test can prove a name-confirm turn was / was not fired.
     setattr(agent, "_asked_name_mismatches", asked_name_mismatches)
+    # Finding E test seams: the authored/delivered lifecycle state, the armed
+    # in-flight confirm tracker, the owed re-author latch, and the one-turn
+    # confirmation grader input. Not read on any production path.
+    setattr(agent, "_name_confirm_state", name_confirm_state)
+    setattr(agent, "_name_confirm_delivery", name_confirm_delivery)
+    setattr(agent, "_owed_name_confirm", owed_name_confirm)
+    setattr(agent, "_name_confirm_awaiting_reply", name_confirm_awaiting_reply)
     # Answer-gate test seam: the per-question-key re-ask counter, so a test can
     # seed it at the cap and prove the bounded advance.
     setattr(agent, "_answer_reask_counts", answer_reask_counts)

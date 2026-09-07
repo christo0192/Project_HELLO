@@ -5985,6 +5985,21 @@ def phone_name_confirm_instruction(mismatch: Any) -> str | None:
     NOT capitulate ("no worries, doesn't matter"). It asks the candidate, warmly
     and once, to confirm which name they go by. Returns None on a malformed
     signal so the caller falls through without arming.
+
+    Finding E (Codex review §7, 2026-09-07): the instruction used to offer a
+    LITERAL second-person example ("just so I have it right, should I call you
+    …?"). Any instruction-literal model that copied it produced six contiguous
+    normalized words shared with this private control text, so the echo guard
+    rejected exactly the wording the instruction offered — twice on Call B —
+    and the deterministic fallback then spoke nearly the same words anyway.
+    The instruction now describes the confirmation in THIRD-person prose (no
+    verbatim speakable phrase), so a natural second-person confirmation can
+    never share a six-word window with it. The echo guard itself is untouched
+    — protection is not weakened, the instruction just stops offering what the
+    guard forbids. (`PHONE_NAME_CONFIRM_CLARIFICATION_TEXT`, the public
+    deterministic fallback line, is already exempt: it is the authorized
+    objective on name-confirm turns and `_private_phone_control_text` strips
+    the objective before echo scanning.)
     """
     if not isinstance(mismatch, dict):
         return None
@@ -5997,11 +6012,56 @@ def phone_name_confirm_instruction(mismatch: Any) -> str | None:
         "the name on record. For your context only — do NOT read these aloud or "
         "spell them out — the record shows \"" + record + "\" and they said \""
         + spoken + "\". In THIS turn, do NOT assert either name as correct and do "
-        "NOT brush it off as unimportant. Warmly and briefly confirm which name "
-        "they go by (for example, \"just so I have it right, should I call you "
-        "" + spoken + "?\"), then continue. Use the name THEY confirm for the "
-        "rest of the call. Never accuse them of giving a wrong name."
+        "NOT brush it off as unimportant. Warmly and briefly check, in your own "
+        "words, which name the candidate prefers to be called — address them "
+        "with the name they themselves just used — then continue. Use whichever "
+        "name THEY confirm for the rest of the call. Never accuse them of "
+        "giving a wrong name."
     )
+
+
+#: Finding E lifecycle (Codex review §7): affirmation shapes for the ONE
+#: candidate turn that answers a DELIVERED name-confirmation. Deliberately
+#: inclusive of "call me …" / "I go by …" correction shapes — a correction is
+#: still a confirmation of the preferred name. Evaluated only on that single
+#: turn, so the broad vocabulary cannot leak into general routing.
+_NAME_CONFIRM_AFFIRM_RE = re.compile(
+    r"\b(?:"
+    r"yes|yeah|yep|correct|exactly|"
+    r"that(?:'s| is)\s+(?:right|correct|fine|me)|"
+    r"(?:please\s+)?call\s+me|you\s+can\s+call\s+me|i\s+go\s+by|"
+    r"i\s+prefer|prefer\s+to\s+be\s+called|either\s+(?:is|works)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def phone_name_confirm_reply_confirms(text: Any, mismatch: Any) -> bool:
+    """True when the reply to a DELIVERED name-confirm turn confirms a name.
+
+    Finding E (Codex review §7): authoring is not delivery, and delivery is
+    not confirmation. This is the deterministic, conservative third stage —
+    it recognises an affirmation shape, or a turn that names either root name
+    (spoken or record), or a fresh introduction. Anything else leaves the
+    identity signal at "delivered" rather than inventing a confirmation.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return False
+    clean = " ".join(text.split())
+    if _NAME_CONFIRM_AFFIRM_RE.search(clean):
+        return True
+    if phone_extract_introduced_name(clean):
+        return True
+    names: set[str] = set()
+    if isinstance(mismatch, dict):
+        for field in ("spoken", "record"):
+            value = str(mismatch.get(field) or "").strip().lower()
+            if value:
+                names.add(value)
+    if not names:
+        return False
+    tokens = {token.lower() for token in re.findall(r"[A-Za-z]+", clean)}
+    return bool(names & tokens)
 
 
 def phone_instruction_echo_detected(speech: Any, control_text: Any) -> bool:
