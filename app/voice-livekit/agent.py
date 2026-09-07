@@ -150,6 +150,20 @@ PHONE_CONTINUATION_SETTLE_SEC = 0.65
 # a monologue longer than this bound it fires anyway rather than going silent.
 # Module constant (not env) so tests can patch it alongside the audio timeout.
 PHONE_WATCHDOG_SPEECH_DEFER_MAX_SEC = 6.0
+# F-P0b (Codex review §9, 2026-09-07): the closing-state VAD policy for the
+# `completed` pre-delete path. Deleting the room kills the SIP audio instantly;
+# the goodbye tail-grace protected the BOT's last words but nothing checked the
+# CANDIDATE's — a goodbye latch + grace could still delete the room while the
+# candidate was mid-sentence. Before a completed-teardown delete, the worker
+# now waits for end-of-speech while local VAD shows the candidate actively
+# speaking, or speech that ended less than RECENT_SEC ago (they may be pausing
+# between clauses) — bounded by WAIT_MAX_SEC so a monologue can never hold the
+# room open indefinitely. ONLY the `completed` path defers: explicit candidate
+# end requests (HALT_CANDIDATE_ENDED) and disconnects keep their immediate
+# handling. Module constants (not env) so tests can patch them, matching
+# PHONE_WATCHDOG_SPEECH_DEFER_MAX_SEC.
+PHONE_CLOSE_VAD_RECENT_SEC = 1.0
+PHONE_CLOSE_VAD_WAIT_MAX_SEC = 8.0
 # Finding E lifecycle (Codex review §7, 2026-09-07): how many times a
 # name-confirmation turn may be AUTHORED for one mismatch key before an
 # undelivered confirmation is recorded "unresolved" instead of re-authored.
@@ -6040,6 +6054,65 @@ async def _run_native_phone_screening(
                 error_category="snapshot_post_error",
             )
 
+    async def _await_candidate_silence_before_delete() -> None:
+        """F-P0b (Codex review §9): never delete a completed room mid-speech.
+
+        The goodbye tail-grace protects the BOT's last audio; this protects
+        the CANDIDATE's. While local VAD shows active candidate speech — or
+        speech that ended less than PHONE_CLOSE_VAD_RECENT_SEC ago (an
+        inter-clause pause is not silence) — the completed pre-delete WAITS
+        for end-of-speech, bounded by PHONE_CLOSE_VAD_WAIT_MAX_SEC so a
+        monologue can never hold the room open indefinitely. Only the
+        `completed` path calls this: explicit candidate end requests and
+        disconnects keep their immediate handling, and an unthreaded
+        candidate_speaking (tests, legacy paths) reads "not speaking" and
+        returns at once.
+        """
+        deadline = _monotonic() + PHONE_CLOSE_VAD_WAIT_MAX_SEC
+        deferred_logged = False
+        while True:
+            speaking = bool(candidate_speaking.get("value"))
+            ended_mono = candidate_speaking.get("ended_mono")
+            recently_ended = (
+                not speaking
+                and isinstance(ended_mono, (int, float))
+                and (_monotonic() - float(ended_mono))
+                < PHONE_CLOSE_VAD_RECENT_SEC
+            )
+            if not speaking and not recently_ended:
+                return
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                _log.info(
+                    "unknown_event", error_type="phone_room_teardown",
+                    error_category="close_vad_wait_timeout",
+                )
+                return
+            if not deferred_logged:
+                deferred_logged = True
+                _log.info(
+                    "unknown_event", error_type="phone_room_teardown",
+                    error_category="close_deferred_candidate_speaking",
+                )
+            if speaking:
+                # Clear-then-recheck so an end-of-speech landing between the
+                # flag read and the wait can never be missed (the F-Q4a idiom).
+                candidate_speech_ended.clear()
+                if not candidate_speaking.get("value"):
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        candidate_speech_ended.wait(), timeout=remaining,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+            else:
+                # Recently ended: sleep out the recency window (bounded by the
+                # shared deadline) and re-check.
+                await asyncio.sleep(
+                    min(PHONE_CLOSE_VAD_RECENT_SEC, max(remaining, 0.0)),
+                )
+
     if reason != "completed":
         # Every non-completed terminal exit (candidate hangup, no-answer,
         # malformed, disconnect, retryable recovery, aborts) persists its
@@ -6102,6 +6175,9 @@ async def _run_native_phone_screening(
             # first would delay the recording upload by up to the hold budget,
             # long enough for the finalize deferrals to exhaust and latch a
             # recording that was about to arrive (review find, 2026-09-03).
+            # F-P0b: the candidate may still be mid-sentence (a late thanks,
+            # a question racing the goodbye) — wait for end-of-speech, bounded.
+            await _await_candidate_silence_before_delete()
             close_grace = phone.PHONE_CLOSE_TAIL_GRACE_SEC - (
                 time.monotonic() - goodbye_finished_monotonic
             )
@@ -6189,6 +6265,9 @@ async def _run_native_phone_screening(
     # reason to `other_failure`, making a candidate goodbye and a crash
     # indistinguishable in the one log line that says WHY a room was deleted).
     if reason == "completed":
+        # F-P0b: the closing-state VAD check runs BEFORE the tail grace — the
+        # room must not come down while the candidate is audibly mid-sentence.
+        await _await_candidate_silence_before_delete()
         # Pre-delete tail grace, minus whatever the completion round-trips
         # already spent: deleting the room kills the SIP audio buffers
         # instantly and a goodbye clipped on its last words is perceived as a
@@ -6451,7 +6530,10 @@ async def _run_phone_session(
             return
         # F-Q4a: the candidate stopped speaking — release any deferred
         # watchdog recovery say() before the latency bookkeeping below.
+        # F-P0b: stamp WHEN speech ended so the completed pre-delete path can
+        # treat very recent speech (an inter-clause pause) as still-active.
         candidate_speaking["value"] = False
+        candidate_speaking["ended_mono"] = _monotonic()
         candidate_speech_ended.set()
         now_wall = time.time()
         latency_state["local_vad_end_wall"] = now_wall
@@ -6574,6 +6656,7 @@ async def _run_phone_session(
             candidate_speaking["value"] = True
         elif old_state == "speaking" and new_state in {"listening", "idle"}:
             candidate_speaking["value"] = False
+            candidate_speaking["ended_mono"] = _monotonic()
             candidate_speech_ended.set()
         if old_state == "speaking" and new_state in {"listening", "idle"}:
             # Explicit VAD observation is the authoritative local boundary. The
