@@ -2823,7 +2823,19 @@ class _FakePhoneSession:
             self.emit_bot_turn(opening)
             return speech
         interrupted = self.interruptions.pop(0) if self.interruptions else False
-        self.emit_bot_turn(f"asked-{len(self.instructions)}", interrupted=interrupted)
+        # F-P0a (call #2 RCA): a WELL-BEHAVED terminal reply is a goodbye, and
+        # the content gate in `on_reply_delivered` now reads the captured
+        # assistant text — so the fake models the obedient model faithfully and
+        # emits a closing-shaped goodbye on the terminal turn instead of the
+        # generic `asked-N` marker (which would read as the model disobeying
+        # and asking another question). Disobedience is modeled explicitly by
+        # the F-P0a tests, not implicitly by every session test.
+        bot_text = (
+            "Thanks so much for your time today — the team will be in touch "
+            "about next steps. Take care, bye."
+            if is_goodbye else f"asked-{len(self.instructions)}"
+        )
+        self.emit_bot_turn(bot_text, interrupted=interrupted)
         # A fixed line spoken WHILE a boundary is open — the callback
         # confirmation is the realistic case, because "call me back" can be
         # said in the middle of any question. It must not be committed as part
@@ -5858,6 +5870,7 @@ class _InertSession:
 async def _make_native_coordinator(
     *, turn_mode="toolfirst", client=None, state=None,
     coverage_judge_enabled=False, call_metrics=None,
+    candidate_speaking=None, candidate_speech_ended=None,
 ):
     """Start a REAL `_run_native_phone_screening` and return its live turn hook.
 
@@ -5917,6 +5930,8 @@ async def _make_native_coordinator(
             turn_mode=turn_mode,
             coverage_judge_enabled=coverage_judge_enabled,
             call_metrics=call_metrics,
+            candidate_speaking=candidate_speaking,
+            candidate_speech_ended=candidate_speech_ended,
         )
     )
     # Let the coordinator install its hook and deliver the (inert) first question.
@@ -6196,6 +6211,15 @@ class TestBoundedCandidateQna(unittest.IsolatedAsyncioTestCase):
             "Nothing else",
             types.SimpleNamespace(text_content="Nothing else"),
             turn_ctx,
+        )
+        # F-P0a: the terminal content gate reads the captured assistant text.
+        # This test is about interrupt handling, not content gating — model the
+        # obedient model faithfully (its authored terminal reply IS a goodbye)
+        # so the gate stays out of the picture. Disobedience is exercised by
+        # the dedicated F-P0a tests.
+        hooks["latest_assistant"][0] = (
+            "Thanks so much for your time today — the team will be in touch "
+            "about next steps. Take care, bye."
         )
         await self._finish(hooks, interrupted=True)
         # Direct coordinator tests do not create a second LiveKit speech handle;

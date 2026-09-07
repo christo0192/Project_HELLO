@@ -445,11 +445,15 @@ class TestConflictDetectorGeneralization(unittest.TestCase):
 # ── FIX 4: coverage-judge telemetry ──────────────────────────────────────────
 
 class TestCoverageJudgeTelemetry(unittest.TestCase):
+    # F-Q2a (call #2 RCA): `conflict_found_deterministic` joins the fixed set —
+    # the sync deterministic detector's findings were previously invisible
+    # (probe played, counters read 0/0).
     BUCKETS = (
         "covered_deterministic", "not_covered_deterministic",
         "covered_model", "not_covered_model",
         "judge_timeout", "judge_error",
-        "conflict_found", "conflict_probe_delivered",
+        "conflict_found", "conflict_found_deterministic",
+        "conflict_probe_delivered",
     )
 
     def test_accumulator_starts_with_honest_zeros(self):
