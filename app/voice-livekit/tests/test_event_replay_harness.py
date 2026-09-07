@@ -382,6 +382,77 @@ class TestConflictClarificationNeverStealsOwnership(_ReplayHarness):
                 self.assertNotIn("side project", text, key)
             await self._close(hooks)
 
+    async def test_armed_fence_skips_a_boundary_from_a_later_exchange(self):
+        # R2 (PR #260 adversarial review): the ARMED conflict-pending fence's
+        # live exchange-membership path gets its own red-capable schedule (the
+        # control-verified schedule above covers only the CONSUMED fence).
+        #
+        # The v125 class, replayed deterministically: the probe is delivered
+        # and the pending armed (exchange 1); a routing perturbation LOSES the
+        # arm (the watchdog's extra say() perturbed the delivered sequence
+        # live), so the candidate's next turn falls through the normal
+        # substantive path and captures a boundary on exchange 2; the delivery
+        # callback then RE-ARMS the pending before the background commit runs.
+        # The fence must skip that boundary — the cursor may not move past an
+        # unresolved conflict on the strength of a misrouted reply.
+        #
+        # DISABLE-CONTROL (run manually, 2026-09-07): with the fence's
+        # exchange-membership clause removed from `commit_after_reply`
+        # (leaving only the `not isinstance(boundary_exchange, int)` turn_seq
+        # fallback, which a live exchange-stamped boundary never enters), the
+        # boundary COMMITS under k2 and this test FAILS on both the
+        # `conflict_pending_commit_skipped` log and the committed-keys
+        # assertion. The schedule turns exactly the clause it guards red.
+        with patch.object(
+            phone, "judge_phone_coverage", new_callable=AsyncMock,
+            return_value=phone.PhoneCoverageVerdict(True, None, "model"),
+        ):
+            agent, _, _, client, hooks = await self._coordinator(
+                judge=True, resume_facts=self.RESUME,
+            )
+            # Exchange 1: the source answer detects the conflict, commits its
+            # own key, and the probe plays → pending armed on exchange 1.
+            await self._turn(hooks, _CONFLICT_ANSWER)
+            await self._drain_commits(client, 1)
+            await self._deliver(agent, False)
+            self.assertTrue(agent._conflict_reply_pending["value"])
+            self.assertEqual(
+                agent._conflict_reply_pending["armed_exchange_id"],
+                agent._exchange_state["id"],
+            )
+            # The perturbation: the arm is LOST at routing time…
+            agent._conflict_reply_pending["value"] = False
+            # …so the next candidate turn (exchange 2) falls through the
+            # normal substantive path and captures a k2-shaped boundary.
+            hooks["latest_assistant"][0] = _Q2
+            await self._turn(hooks, _ANSWER_2)
+            self.assertEqual(agent._pending.get("exchange_id"),
+                             agent._exchange_state["id"])
+            # …and the late delivery callback RE-ARMS the pending BEFORE the
+            # background commit task has run (no suspension since creation).
+            agent._conflict_reply_pending["value"] = True
+            for _ in range(50):
+                await asyncio.sleep(0.005)
+            # The fence held: nothing committed under k2.
+            self.assertEqual(client.committed_keys, ["k1"])
+            skipped = [
+                c.kwargs.get("error_category")
+                for c in hooks["log"].info.call_args_list
+                if c.kwargs.get("error_type") == "phone_toolless_commit"
+            ]
+            self.assertIn("conflict_pending_commit_skipped", skipped)
+            # Resolution: the clarification is consumed properly, and the REAL
+            # k2 answer (a fresh exchange) owns the key.
+            self._begin_streaming_reply(hooks, first_audio=True)
+            hooks["reply_started"].clear()
+            await self._turn(hooks, _RECONCILE)
+            await self._turn(hooks, _ANSWER_2)
+            self.assertTrue(await self._drain_commits(client, 2))
+            self.assertEqual(client.committed_keys, ["k1", "k2"])
+            charged = self._charged(client)
+            self.assertIn("thirty days", charged["k2"])
+            await self._close(hooks)
+
     async def test_clarification_never_commits_under_a_plan_key(self):
         for schedule in (
             "consumed_after_source_commit",

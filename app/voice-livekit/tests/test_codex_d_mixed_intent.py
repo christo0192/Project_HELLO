@@ -108,6 +108,48 @@ class TestTurnDimensions(unittest.TestCase):
         self.assertTrue(dims["candidate_question"])
 
 
+class TestDirectedQuestionPredicate(unittest.TestCase):
+    """R1 (PR #260 adversarial review): the ROUTING consumers use a stronger
+    directedness predicate. Indian-English answer forms open with an
+    interrogative word ("What I do currently is…") and matched the broad
+    `candidate_question` dimension — prefixing "the candidate asked you
+    something" onto those answers was a conversational regression. Directed =
+    terminal "?" OR (interrogative opening AND a you/your/company/team/role
+    token in the same clause)."""
+
+    ANSWER_FORMS = (
+        "What I do currently is manage a sales pipeline of about forty leads.",
+        "How I handle objections is by listening first and then explaining the value.",
+        "What I would say is that my current CTC is twenty LPA.",
+        "Where I worked before was a fintech startup in Bangalore.",
+        "How soon I can join depends on my notice period.",
+    )
+
+    REAL_QUESTIONS = (
+        "can your team offer that?",
+        "what does the role pay?",
+        # STT dropped the "?": directedness still recognises it.
+        "what does the role pay",
+        _MIXED_COMP,
+    )
+
+    def test_answer_forms_are_not_directed_questions(self):
+        for text in self.ANSWER_FORMS:
+            with self.subTest(text=text[:44]):
+                self.assertFalse(phone.phone_candidate_question_directed(text))
+                dims = phone.phone_turn_dimensions(
+                    "Tell me about your recent role.", None, text,
+                )
+                self.assertFalse(dims["directed_question"])
+                # The broad observability dimension is deliberately unchanged.
+                self.assertTrue(dims["candidate_question"])
+
+    def test_real_candidate_questions_are_directed(self):
+        for text in self.REAL_QUESTIONS:
+            with self.subTest(text=text[:44]):
+                self.assertTrue(phone.phone_candidate_question_directed(text))
+
+
 class _MixedIntentHarness(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
@@ -236,6 +278,43 @@ class TestMixedIntentCommit(_MixedIntentHarness):
             agent._pending.get("answer_disposition"), phone.PHONE_ANSWER_ANSWERED,
         )
         self.assertFalse(agent._pending.get("answer_evidence"))
+        await self._close(hooks)
+
+    async def test_answer_form_opening_gets_no_question_prefix(self):
+        # R1 live-path control: an interrogative-OPENING answer advances as an
+        # ordinary answer — no "also carried a question" prefix, no forced
+        # inject past the preloaded objective.
+        state = _default_state(questions=[
+            {"key": "role", "text": "Tell me about your recent role.", "mandatory": True, "hint": None},
+            {"key": "k2", "text": "What is your notice period?", "mandatory": True, "hint": None},
+        ])
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless", state=state,
+        )
+        hooks["assistant_delivery_complete"].set()
+        hooks["latest_assistant"][0] = state.questions[0].spoken_text
+        hooks["latest_assistant_anchor"][0] = 1
+        ctx = await self._turn(
+            hooks,
+            "What I do currently is manage a sales pipeline of about forty leads.",
+        )
+        self.assertTrue(await self._drain(
+            lambda: client.committed_keys == ["role"],
+        ))
+        injected = str(ctx.items)
+        self.assertNotIn("also carried a question", injected)
+        await self._close(hooks)
+
+    async def test_directed_question_still_gets_the_prefix(self):
+        # R1 positive control: a genuinely directed question keeps the Finding
+        # D behaviour (this is also pinned by
+        # test_supplied_values_survive_a_counter_question above).
+        agent, _, _, client, hooks = await self._coordinator()
+        ctx = await self._turn(hooks, _MIXED_COMP)
+        self.assertTrue(await self._drain(
+            lambda: client.committed_keys == ["comp"],
+        ))
+        self.assertIn("also carried a question", str(ctx.items))
         await self._close(hooks)
 
     async def test_coalesced_mixed_intent_also_keeps_its_values(self):

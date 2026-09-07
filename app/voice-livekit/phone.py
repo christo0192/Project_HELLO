@@ -1735,6 +1735,31 @@ class PhoneEventClient:
         if disposition is not None:
             body["disposition"] = str(disposition)
         response = await self._post(ASSESSMENT_TURN_PATH, body, "assessment_turn")
+        # ── R3 (PR #260 adversarial review): VERSION-SKEW DOWNGRADE ─────────
+        # During a parallel deploy a NEW worker can face an OLD API whose
+        # strict schema rejects the unknown `disposition` key with a flat 400
+        # — without this, every boundary commit 400s for the whole window and
+        # the fleet's cursors stall. On a business-class refusal to a body
+        # that carried the field, RETRY EXACTLY ONCE with the field omitted
+        # (the commit is idempotent on `source_event_id`, so the retry
+        # converges; the durable row records NULL = "not measured", exactly
+        # what an old worker would have written). Bounded: one retry, and a
+        # refusal with some OTHER cause simply refuses again on the retry and
+        # flows into the ordinary failure handling. Version-skew-safe forever;
+        # the log category makes a lingering old API visible.
+        if (
+            disposition is not None
+            and isinstance(response, str)
+            and response == _ERR_BUSINESS
+        ):
+            _log.info(
+                "unknown_event", error_type="phone_api_version_skew",
+                error_category="disposition_field_downgraded",
+            )
+            body.pop("disposition", None)
+            response = await self._post(
+                ASSESSMENT_TURN_PATH, body, "assessment_turn",
+            )
         if isinstance(response, str):
             return PhoneApiOutcome(False, error_category=response)
         data = _response_json(response)
@@ -5446,6 +5471,52 @@ _WORK_DOMAIN_TOKENS = frozenset({
 })
 
 
+#: R1 (PR #260 adversarial review): second-person directedness tokens. An
+#: interrogative OPENING alone is not a question to the interviewer — Indian-
+#: English answer forms open with one routinely ("What I do currently is…",
+#: "How I handle objections is…"). A non-"?"-terminated opening counts as a
+#: DIRECTED question only when the same clause also addresses the interviewer
+#: or their side of the table. Deliberately the narrow reviewed token set.
+_QUESTION_DIRECTED_TOKEN_RE = re.compile(
+    r"\b(?:you|your|company|team|role)\b", re.IGNORECASE,
+)
+
+
+def phone_candidate_question_directed(text: Any) -> bool:
+    """R1 (PR #260 adversarial review): a question DIRECTED AT the interviewer.
+
+    The broad ``candidate_question`` dimension (kept as-is for observability
+    and non-routing consumers) fires on ordinary answer openings, because
+    ``_QUESTION_OPEN_RE`` matches the interrogative word alone — "What I do
+    currently is…" / "How I handle objections is…" are ANSWERS, not questions.
+    The ROUTING consumers (the answer-their-question reply prefix and the
+    preload bypass) must use this stronger predicate: prefixing "the candidate
+    asked you something" onto a plain answer both burns the preloaded
+    objective and invites the model to answer a question nobody asked.
+
+    Directed means:
+      * a terminal ``?`` (question prosody the STT recognised), OR
+      * an interrogative OPENING whose same (first) clause carries a
+        second-person / interviewer-side token: you / your / company / team /
+        role.
+
+    "What I do currently is manage a pipeline." → False.
+    "what does the role pay" (STT dropped the "?") → True.
+    "can your team offer that?" → True.
+    """
+    if not isinstance(text, str):
+        return False
+    clean = " ".join(text.strip().split())
+    if not clean:
+        return False
+    if clean.endswith("?"):
+        return True
+    if not _QUESTION_OPEN_RE.search(clean):
+        return False
+    first_clause = re.split(r"[,.;:!?]", clean, maxsplit=1)[0]
+    return bool(_QUESTION_DIRECTED_TOKEN_RE.search(first_clause))
+
+
 def phone_turn_dimensions(
     question: Any, question_kind: Any, candidate_text: Any,
 ) -> dict[str, Any]:
@@ -5525,6 +5596,11 @@ def phone_turn_dimensions(
         "slots": slots,
         "answer_evidence": covers,
         "candidate_question": candidate_question,
+        # R1: the ROUTING-grade twin of `candidate_question` — terminal "?" or
+        # an interrogative opening with second-person directedness in the same
+        # clause. Only the reply-prefix / preload-bypass consumers read it;
+        # the broad dimension above stays for observability.
+        "directed_question": phone_candidate_question_directed(clean),
         "clarification": clarification,
         "decline": disposition == PHONE_ANSWER_DECLINED,
         "topic_relation": topic_relation,

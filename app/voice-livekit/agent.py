@@ -4691,9 +4691,14 @@ async def _run_native_phone_screening(
             # honestly, and without promises — instead of the bot re-asking or
             # marching on as if nothing was asked. Composed as a PREFIX on the
             # same single reply (never a second generation call).
+            # R1 (PR #260 adversarial review): gated on the DIRECTED predicate,
+            # not the broad dimension — ordinary answer openings ("What I do
+            # currently is…") match the interrogative regex but ask nothing;
+            # prefixing them invited the model to answer a question nobody
+            # asked and burned the preloaded objective on every such turn.
             if (
                 judge_instruction is None
-                and turn_dims.get("candidate_question")
+                and turn_dims.get("directed_question")
                 # An anti-capitulation advance (unresolved conflict drop)
                 # outranks the answer-their-question nicety: its cold prefix
                 # must stay in the lead position its contract expects.
@@ -4713,8 +4718,10 @@ async def _run_native_phone_screening(
                 phone.phone_objective_preemptive_enabled()
                 and judge_instruction is None
                 # A mixed-intent turn always injects: the preloaded objective
-                # context carries no answer-their-question directive.
-                and not turn_dims.get("candidate_question")
+                # context carries no answer-their-question directive. R1: the
+                # DIRECTED predicate, so an answer-form opening keeps riding
+                # the preloaded objective instead of forcing a fresh inject.
+                and not turn_dims.get("directed_question")
                 and preloaded_objective.get("text") == objective_text
             )
             if not preloaded_matches:

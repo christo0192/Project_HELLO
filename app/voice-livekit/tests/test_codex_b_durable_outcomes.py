@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import types
 import unittest
+from unittest.mock import MagicMock, patch
 
 from tests.test_phone_gate import (  # noqa: E402
     _default_state,
@@ -232,6 +233,96 @@ class TestDispositionRidesTheCommit(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(await self._drain(lambda: legacy.calls == ["k1"]))
         await self._close(hooks)
+
+
+class TestDispositionVersionSkewDowngrade(unittest.IsolatedAsyncioTestCase):
+    """R3 (PR #260 adversarial review): new worker + old API must not wedge.
+
+    An old API's strict schema rejects the unknown `disposition` key with a
+    flat 400 — pre-repair, every boundary commit failed for the whole
+    parallel-deploy window and the fleet's cursors stalled. The client now
+    retries EXACTLY ONCE with the field omitted (idempotent on
+    source_event_id; the row records NULL = "not measured") and logs
+    `disposition_field_downgraded` so a lingering old API stays visible.
+    """
+
+    class _Probe:
+        """Fake PhoneEventClient transport: an OLD API rejects any body
+        carrying `disposition` with a business-class 400."""
+
+        def __init__(self, reject_disposition, *, always_reject=False):
+            self.posts = []
+            self.reject_disposition = reject_disposition
+            self.always_reject = always_reject
+
+        async def _post(self, path, body, hint):
+            self.posts.append(dict(body))
+            if self.always_reject:
+                return phone._ERR_BUSINESS
+            if self.reject_disposition and "disposition" in body:
+                return phone._ERR_BUSINESS
+            return types.SimpleNamespace(json=lambda: {
+                "ok": True, "status": "applied", "duplicate": False,
+                "cursor": 1, "plan_complete": False, "expected_key": None,
+            })
+
+    TURNS = [
+        {"speaker": "bot", "text": "Q?"},
+        {"speaker": "candidate", "text": "A."},
+    ]
+
+    async def _commit(self, probe, disposition):
+        return await phone.PhoneEventClient.commit_boundary(
+            probe, "session", "k1", 0, "ev-1", self.TURNS,
+            disposition=disposition,
+        )
+
+    async def test_old_api_400_downgrades_once_and_the_commit_lands(self):
+        probe = self._Probe(reject_disposition=True)
+        spy = MagicMock(wraps=phone._log)
+        with patch.object(phone, "_log", spy):
+            outcome = await self._commit(probe, "asked_answered")
+        self.assertTrue(outcome.ok)
+        self.assertEqual(len(probe.posts), 2)
+        self.assertIn("disposition", probe.posts[0])
+        self.assertNotIn("disposition", probe.posts[1])
+        categories = [
+            c.kwargs.get("error_category") for c in spy.info.call_args_list
+            if c.kwargs.get("error_type") == "phone_api_version_skew"
+        ]
+        self.assertEqual(categories, ["disposition_field_downgraded"])
+
+    async def test_new_api_path_is_unchanged_one_post_field_kept(self):
+        probe = self._Probe(reject_disposition=False)
+        spy = MagicMock(wraps=phone._log)
+        with patch.object(phone, "_log", spy):
+            outcome = await self._commit(probe, "asked_answered")
+        self.assertTrue(outcome.ok)
+        self.assertEqual(len(probe.posts), 1)
+        self.assertIn("disposition", probe.posts[0])
+        self.assertFalse([
+            c for c in spy.info.call_args_list
+            if c.kwargs.get("error_type") == "phone_api_version_skew"
+        ])
+
+    async def test_no_disposition_means_no_retry_machinery_at_all(self):
+        # A dispositionless commit that 400s fails exactly as before — the
+        # downgrade path never engages when there is nothing to downgrade.
+        probe = self._Probe(reject_disposition=False, always_reject=True)
+        outcome = await phone.PhoneEventClient.commit_boundary(
+            probe, "session", "k1", 0, "ev-1", self.TURNS,
+        )
+        self.assertFalse(outcome.ok)
+        self.assertEqual(len(probe.posts), 1)
+
+    async def test_a_genuine_refusal_is_bounded_to_exactly_one_retry(self):
+        # The 400 had some OTHER cause: the single downgrade retry refuses
+        # again and the ordinary failure handling takes over — never a loop.
+        probe = self._Probe(reject_disposition=True, always_reject=True)
+        outcome = await self._commit(probe, "asked_answered")
+        self.assertFalse(outcome.ok)
+        self.assertEqual(outcome.error_category, phone._ERR_BUSINESS)
+        self.assertEqual(len(probe.posts), 2)
 
 
 if __name__ == "__main__":  # pragma: no cover
