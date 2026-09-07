@@ -745,6 +745,38 @@ def phone_tts_flush_min_chars() -> int:
     return _bounded_int_env(os.getenv("PHONE_TTS_FLUSH_MIN_CHARS"), 0, 0, 400)
 
 
+def phone_tts_tail_peek_timeout_sec() -> float:
+    """Bound on the numeric-protection read-ahead in the phone ``tts_node``.
+
+    Finding A (Codex review §3, 2026-09-07): after the first speakable fragment
+    was collected, the letter-free-remainder-lead fold used to READ AHEAD into
+    the remainder unconditionally — and when the ``llm_node`` guard was still
+    withholding the reply tail (its full-draft validation), that read blocked,
+    so an already-authorized, complete first sentence did not start downstream
+    synthesis until the whole generation finished. The composition sat directly
+    on the dead-air path.
+
+    The fix: a first fragment that ends at a SENTENCE TERMINATOR is complete
+    and synthesizes immediately with NO read-ahead (the fold never applied to
+    it anyway — a terminator-ended fragment refuses folds by construction). A
+    fragment flushed at a clause pause / the min-chars cap still runs the fold
+    peek — that is the digit-protection case ("Great question, 2019.") — but
+    the peek's CROSS-CHUNK wait is now bounded by this budget: characters
+    already in hand are always inspected for free, and only the wait for a
+    chunk the guard has not yet released is time-bounded. On timeout the
+    fragment synthesizes unfolded and the peeked characters lead the remainder
+    stream (text is never dropped). The residual risk window is the triple
+    coincidence of a clause-pause flush + a tail withheld past this budget + a
+    letter-free remainder lead, which restores only the pre-fold baseline
+    behaviour for that rare shape.
+
+    ``0`` disables the cross-chunk wait entirely (flush immediately; in-hand
+    characters are still folded). Clamped to [0, 2] seconds. Read at the call
+    site with the literal name so the env-contract scanner sees it.
+    """
+    return _bounded_float(os.getenv("PHONE_TTS_TAIL_PEEK_TIMEOUT_SEC"), 0.25, 0.0, 2.0)
+
+
 def phone_queued_scoring_hold_sec() -> float:
     """How long the worker keeps its lease alive after the durable scoring
     handoff, waiting for the assessment row and the terminal event to land.
@@ -8427,117 +8459,197 @@ def phone_agent_class(agent_base: Any) -> Any:
                         yield frame
                 return
 
-            # FOLD A LETTER-FREE REMAINDER LEAD FORWARD (call 28 follow-up: the
-            # remainder half of the alpha-guard). Splitting `first` at the early
-            # boundary can orphan a LETTER-FREE SENTENCE onto the front of the
-            # remainder — e.g. `"Great question, 2019."` flushes `first="Great
-            # question,"` and leaves `" 2019."`, which Sarvam's sentence tokenizer
-            # reads as a complete letter-free sentence and rejects `400: Text must
-            # contain at least one character from the alphabet`, dropping "2019".
-            # The first-fragment alpha-guard above does NOT cover this — it only
-            # guards the FIRST call. So here we BOUNDED-PEEK the remainder and fold
-            # a leading letter-free sentence-run (a maximal run ending at
-            # `.`/`!`/`?`, or the end of the stream) into `first`, until the
-            # remainder either begins with a real letter or is empty. The peek is
-            # bounded: it stops the instant it sees an alphabetic char OR a
-            # sentence terminator, so first-audio is delayed by at most the first
-            # word/clause of the remainder — the latency win is preserved.
+            # ── Finding A (Codex review §3, 2026-09-07): a complete, safe,
+            # authorized first sentence synthesizes WITHOUT waiting for
+            # subsequent text. The old flow ALWAYS ran the letter-free-lead
+            # peek below before synthesizing `first` — and when `llm_node`'s
+            # guarded incremental release was still withholding the reply tail
+            # (full-draft validation), the peek's read blocked on the source,
+            # so first-audio waited for the WHOLE generation (reproduced:
+            # terminator-ended prefix, comma-ended prefix, and the combined
+            # guard→TTS composition all held synthesis until tail release).
             #
-            # ONE INVARIANT ON THE FOLD ITSELF: a letter-free run is folded
-            # backward ONLY while `first` does not already END at a sentence
-            # terminator. If the early boundary WAS a terminator (`first="Wow."`),
-            # appending `" 2019."` would make `"Wow. 2019."` — a SECOND, letter-
-            # free sentence inside the first stream, i.e. relocating the 400
-            # rather than fixing it. In that case the letter-free run is the LLM's
-            # OWN sentence (it exists in the source regardless of any split), so it
-            # stays on the remainder exactly as the single-call baseline would
-            # emit it — the fold never INTRODUCES a letter-free sentence.
+            # A first fragment that ends at a SENTENCE TERMINATOR never folds
+            # anyway (folding into a closed sentence would just relocate the
+            # letter-free-400), so it needs NO read-ahead: synthesize it now.
+            # Only a clause-pause / min-chars-cap fragment (open clause) still
+            # runs the fold peek — the digit-protection case ("Great question,
+            # 2019.") — and that peek's CROSS-CHUNK wait is now bounded by
+            # `phone_tts_tail_peek_timeout_sec()`: characters already in hand
+            # are always folded for free; only the wait for a chunk the guard
+            # has not yet released is time-bounded. On timeout the fragment
+            # synthesizes unfolded and every peeked character leads the
+            # remainder stream — text is never dropped, and the abandoned
+            # chunk read is NEVER cancelled (cancelling the source generator
+            # would kill the upstream stream); it is handed to the remainder
+            # stream to await first.
             #
-            # `pending` holds the peeked remainder chars that are NOT folded into
-            # `first`; they lead the remainder stream. `leftover_iter` still holds
-            # whatever the peek never had to read.
-            leftover_iter = _leftover_then_src(leftover, src)
-            pending = ""              # peeked-but-not-folded remainder prefix
-            run = ""                  # current in-progress remainder sentence-run
-            remainder_exhausted = True
-            # Fold only while `first`'s trailing clause is still OPEN (no sentence
-            # terminator at its end). `first.rstrip()` ignores a trailing space.
-            can_fold = (
-                not first.rstrip() or first.rstrip()[-1] not in _TTS_SENTENCE_TERMINATORS
+            # FOLD SEMANTICS (unchanged from call 28): a leading LETTER-FREE
+            # sentence-run of the remainder (e.g. " 2019.") folds backward into
+            # `first`'s still-open clause so Sarvam never sees a letter-free
+            # sentence (`400: Text must contain at least one character from
+            # the alphabet` — it would DROP the digits). The fold only applies
+            # while `first` does not already end at a terminator; a letter-free
+            # run after a closed sentence is the LLM's own sentence and stays
+            # on the remainder exactly as the single-call baseline emits it.
+            first_trim = first.rstrip()
+            first_complete = bool(first_trim) and (
+                first_trim[-1] in _TTS_SENTENCE_TERMINATORS
             )
-            async for ch in leftover_iter:
-                run += ch
-                if ch.isalpha():
-                    # A real letter in this run: the remainder lead is speakable.
-                    # Everything peeked so far (this run) stays on the remainder.
-                    pending += run
-                    run = ""
-                    remainder_exhausted = False
-                    break
-                if ch in _TTS_SENTENCE_TERMINATORS:
-                    if can_fold:
-                        # A complete LETTER-FREE sentence (e.g. "2019.") folded
-                        # into `first`'s still-open clause so it never reaches
-                        # Sarvam as its own sentence. `first` now ends at a
-                        # terminator, so no FURTHER run may fold backward — stop
-                        # folding and let the rest lead the remainder.
-                        first += run
-                        run = ""
-                        can_fold = False
-                    else:
-                        # `first` already closed a sentence: this letter-free run
-                        # is the LLM's own sentence and stays on the remainder,
-                        # exactly as the single-call baseline emits it.
-                        pending += run
-                        run = ""
-                        remainder_exhausted = False
-                        break
-                # else: a non-letter, non-terminator char (digit/space/punct) —
-                # keep accumulating the current run.
-            else:
-                # The remainder was fully drained by the peek. Whatever is left in
-                # `run` is a trailing partial with no terminator; if it carries no
-                # letter AND we may still fold, it is a letter-free tail that must
-                # be folded into `first` (never emitted alone), otherwise it stays
-                # on the remainder.
-                remainder_exhausted = True
-                if run and can_fold and not any(c.isalpha() for c in run):
-                    first += run
-                    run = ""
+
+            async def _next_chunk_or_none(stream: Any) -> str | None:
+                try:
+                    return await stream.__anext__()
+                except StopAsyncIteration:
+                    return None
+
+            pending = ""              # remainder text already pulled off the stream
+            pending_chunk_task: asyncio.Task | None = None
+            remainder_open = True     # False once `src` is proven exhausted
+
+            def _abandon_pending_chunk_task() -> None:
+                # Interruption cleanup: a budgeted chunk read still in flight
+                # when this generator is closed (barge-in tears the pipeline
+                # down) is cancelled so it can neither leak nor warn at loop
+                # shutdown. Never runs on normal completion — every normal
+                # path consumes the task before finishing.
+                nonlocal pending_chunk_task
+                if pending_chunk_task is not None:
+                    task_ref = pending_chunk_task
+                    pending_chunk_task = None
+                    if not task_ref.done():
+                        task_ref.cancel()
+                    task_ref.add_done_callback(
+                        lambda t: t.cancelled() or t.exception(),
+                    )
+
+            try:
+                if first_complete:
+                    # No read-ahead: the whole leftover (if any) simply leads the
+                    # remainder. Nothing is folded — identical fold semantics to
+                    # the old can_fold=False path, minus the blocking peek.
+                    pending = leftover
                 else:
-                    pending += run
-                    run = ""
+                    run = ""              # current in-progress remainder sentence-run
+                    can_fold = True       # first's trailing clause is OPEN here
+                    decided = False
+                    buffer = leftover
+                    peek_deadline = (
+                        time_module.monotonic() + phone_tts_tail_peek_timeout_sec()
+                    )
+                    while True:
+                        consumed = 0
+                        for ch in buffer:
+                            consumed += 1
+                            run += ch
+                            if ch.isalpha():
+                                # A real letter: the remainder lead is speakable.
+                                decided = True
+                                break
+                            if ch in _TTS_SENTENCE_TERMINATORS:
+                                if can_fold:
+                                    # A complete LETTER-FREE sentence folds into
+                                    # `first`'s open clause; `first` now ends at a
+                                    # terminator, so no FURTHER run may fold.
+                                    first += run
+                                    run = ""
+                                    can_fold = False
+                                else:
+                                    decided = True
+                                    break
+                            # else: digit/space/punct — keep accumulating the run.
+                        buffer = buffer[consumed:]
+                        if decided:
+                            break
+                        # Need more characters. Budgeted, non-destructive read: the
+                        # chunk task is never cancelled — if the budget runs out it
+                        # is handed to the remainder stream below.
+                        remaining_budget = peek_deadline - time_module.monotonic()
+                        if pending_chunk_task is None:
+                            pending_chunk_task = asyncio.ensure_future(
+                                _next_chunk_or_none(src),
+                            )
+                        if remaining_budget > 0:
+                            done_set, _ = await asyncio.wait(
+                                {pending_chunk_task}, timeout=remaining_budget,
+                            )
+                        else:
+                            done_set = (
+                                {pending_chunk_task} if pending_chunk_task.done()
+                                else set()
+                            )
+                        if not done_set:
+                            # Budget exhausted while the tail is still withheld:
+                            # synthesize `first` unfolded; the peeked letter-free
+                            # run leads the remainder (baseline behaviour for this
+                            # rare shape — text preserved, never dropped).
+                            break
+                        chunk_value = pending_chunk_task.result()
+                        pending_chunk_task = None
+                        if chunk_value is None:
+                            remainder_open = False
+                            # Stream drained: a trailing letter-free partial with
+                            # no terminator folds while folding is still allowed —
+                            # it must never be emitted alone.
+                            if run and can_fold and not any(c.isalpha() for c in run):
+                                first += run
+                                run = ""
+                            break
+                        buffer = chunk_value
+                    # Whatever was peeked and not folded leads the remainder.
+                    pending = run + buffer
 
-            # Any partial `run` from a mid-peek break belongs on the remainder.
-            pending += run
-
-            # 1) Synthesize the first speakable clause ALONE → fast first-audio.
-            #    `first` carries a letter and the fold never introduced a letter-
-            #    free sentence into it, so this call cannot hand Sarvam one.
-            async for frame in _drive(_one_text(first)):
-                yield frame
-
-            # 2) Synthesize the ENTIRE REMAINDER as ONE call → Sarvam native
-            #    streaming, smooth prosody for the body of the reply. If the whole
-            #    remainder folded into `first` (short letter-free tail like
-            #    "Great question, 2019."), there is nothing left — the reply went
-            #    out as ONE combined call, digits intact, no 400.
-            #
-            #    The remainder is `pending` (the peeked-but-not-folded prefix)
-            #    followed by whatever `leftover_iter` still holds. It MUST drain
-            #    `leftover_iter`, not `src`: the peek pulled characters out of
-            #    `src` through `leftover_iter`, so `src` has already advanced past
-            #    them and reading it directly would DROP the tail of the chunk the
-            #    peek broke inside.
-            if pending or not remainder_exhausted:
-                async def _rest() -> Any:
-                    if pending:
-                        yield strip_markdown_for_speech(pending)
-                    async for ch in leftover_iter:
-                        yield strip_markdown_for_speech(ch)
-
-                async for frame in _drive(_rest()):
+                # 1) Synthesize the first speakable clause ALONE → fast first-audio.
+                #    `first` carries a letter and the fold never introduced a letter-
+                #    free sentence into it, so this call cannot hand Sarvam one.
+                async for frame in _drive(_one_text(first)):
                     yield frame
+
+                # 2) Synthesize the ENTIRE REMAINDER as ONE call → Sarvam native
+                #    streaming, smooth prosody for the body of the reply. If the
+                #    whole remainder folded into `first` (short letter-free tail
+                #    like "Great question, 2019."), there is nothing left — the
+                #    reply went out as ONE combined call, digits intact, no 400.
+                #
+                #    LAZY OPEN: the second downstream call is opened only once the
+                #    remainder is KNOWN to carry content — first-audio is already
+                #    out, so blocking here on a still-withheld tail is exactly the
+                #    intended behaviour, and an empty remainder never opens an
+                #    empty synthesis. Any in-flight budgeted chunk read is awaited
+                #    FIRST so no character of the stream is lost or reordered.
+                lead = pending
+                if not lead:
+                    while remainder_open:
+                        if pending_chunk_task is not None:
+                            chunk_value = await pending_chunk_task
+                            pending_chunk_task = None
+                        else:
+                            chunk_value = await _next_chunk_or_none(src)
+                        if chunk_value is None:
+                            remainder_open = False
+                            break
+                        if chunk_value:
+                            lead = chunk_value
+                            break
+                if lead:
+                    async def _rest() -> Any:
+                        nonlocal pending_chunk_task
+                        yield strip_markdown_for_speech(lead)
+                        if pending_chunk_task is not None:
+                            chunk_value = await pending_chunk_task
+                            pending_chunk_task = None
+                            if chunk_value is None:
+                                return
+                            if chunk_value:
+                                yield strip_markdown_for_speech(chunk_value)
+                        async for chunk_value in src:
+                            if chunk_value:
+                                yield strip_markdown_for_speech(chunk_value)
+
+                    async for frame in _drive(_rest()):
+                        yield frame
+            finally:
+                _abandon_pending_chunk_task()
 
         @_tool
         async def request_probe(self) -> str:
