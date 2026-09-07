@@ -4987,6 +4987,34 @@ class TestInstructionConstruction(unittest.TestCase):
         self.assertIn(phone.PHONE_EXPRESSIVENESS_TEXT, instructions)
         self.assertIn(phone.PHONE_RESUME_CONFLICT_TEXT, instructions)
 
+    def test_sarvam_prep_lines_ride_the_static_phone_prompt_only(self):
+        # Sarvam A/B prep (2026-09-07): the two model-neutral discipline lines
+        # (false-premise resistance + opener variety) must land in the BUILT
+        # per-call phone instructions — the stable, cacheable prefix — and NOT
+        # in the per-turn style rider (an uncached per-turn suffix: it rides a
+        # planned instruction that varies with the question text) nor in the
+        # sha-pinned browser surface.
+        instructions = agent_mod._phone_instructions_text(self._state())
+        false_premise = "never play along or agree with it"
+        opener_variety = "Vary the opening word of every reply"
+        self.assertIn(false_premise, instructions)
+        self.assertIn(opener_variety, instructions)
+        self.assertIn("\"fair enough\"", instructions)
+        # Cache safety: the per-turn rider stays byte-identical to the
+        # benchmarked R1 text — zero new uncached tokens per turn.
+        self.assertNotIn(false_premise, phone.PHONE_TURN_STYLE_RIDER)
+        self.assertNotIn(opener_variety, phone.PHONE_TURN_STYLE_RIDER)
+        # Browser lane untouched: the pinned system_prompt surface never
+        # carries the phone-only discipline block.
+        browser = prompting.system_prompt(
+            candidate_name="Pin Candidate", role_title="Pin Role",
+            role_focus="pin focus", resume_facts="pin facts",
+            questions=prompting.format_questions(None),
+            interviewer_instructions="pin guidance",
+        )
+        self.assertNotIn(false_premise, browser)
+        self.assertNotIn(opener_variety, browser)
+
     def test_reconnect_history_is_in_the_same_constructor_payload(self):
         instructions = agent_mod._phone_instructions_text(self._state(turns=[
             {"speaker": "bot", "text": "How many years?"},
@@ -6323,6 +6351,39 @@ class TestGoodbyeLatchDetectors(unittest.TestCase):
             "next steps. Take care, bye!"))
         self.assertTrue(phone.phone_closing_goodbye_shape(
             "That is everything I needed. Have a great day. Goodbye."))
+
+    def test_d1_call_a_final_reply_is_a_closing_shape_verbatim(self):
+        # D1 (Sarvam A/B call A, 2026-09-07): the live final reply, verbatim.
+        # It false-failed the shape gate (no bye-family token) and the terminal
+        # commit spoke the deterministic closing on top — a double goodbye.
+        self.assertTrue(phone.phone_closing_goodbye_shape(
+            "Thanks, Deepak. The team will review everything and be in touch "
+            "about next steps. Take care and good luck!"))
+
+    def test_d1_wellwish_farewells_close_with_a_handoff_cue(self):
+        self.assertTrue(phone.phone_closing_goodbye_shape(
+            "Thanks so much for your time today — the team will be in touch. "
+            "Best of luck!"))
+        self.assertTrue(phone.phone_closing_goodbye_shape(
+            "That's everything I needed. All the best!"))
+        # "take care" terminal + hand-off cue now closes even without a "bye".
+        self.assertTrue(phone.phone_closing_goodbye_shape(
+            "Thank you for your time. The team will reach out about next "
+            "steps. Take care!"))
+
+    def test_d1_wellwish_tokens_never_arm_alone_or_mid_sentence(self):
+        # No hand-off cue → not a closing shape, even with a terminal well-wish.
+        self.assertFalse(phone.phone_closing_goodbye_shape("Good luck!"))
+        self.assertFalse(phone.phone_closing_goodbye_shape("Take care!"))
+        # Hand-off cue present but the well-wish is NOT terminal → rejected by
+        # the terminal anchor (mid-call pleasantry, not a close).
+        self.assertFalse(phone.phone_closing_goodbye_shape(
+            "Good luck with the certification — the team will be in touch "
+            "about next steps. What time works for a quick follow-up?"))
+        # A question / mid-call text is still never a closing shape.
+        self.assertFalse(phone.phone_closing_goodbye_shape(
+            "All the best candidates mention Python — what's your experience "
+            "with it?"))
 
     def test_bare_farewell_matches_short_signoffs(self):
         for t in ("Bye", "bye bye", "Bye bye", "No no, bye", "Take care!",
