@@ -1,19 +1,21 @@
 /**
- * POST /ashby/mission-control/ingestions/:applicationLinkId/retry —
- * the audited, BOUNDED admin recovery for a parse-class failed_review.
+ * POST /ashby/mission-control/ingestions/:applicationLinkId/retry-model-degraded
+ * — the audited re-drive of a MODEL-DEGRADED ready ingestion (0084).
  *
- * WHY IT IS NOT A COUNTER RESET (and why that distinction is load-bearing):
- * 0036 zeroes an attempt counter, because a single now-fixed transport defect
- * had recorded one fault five times. That is a correction of mis-accounting.
- * A parse-class rest is not known to be one fault counted five times, so this
- * recovery instead performs the ordinary `failed_review -> queued` transition
- * and CHARGES an attempt for it. The five-attempt ceiling stays the real
- * bound, and an exhausted row answers 409 rather than being resurrected.
+ * WHY A THIRD DOOR EXISTS: both audited recoveries before it (0040 parse-class,
+ * 0041 legacy bad-output) demand `failed_review`. The row this route serves is
+ * the one they refuse for ever — a "successful" ingestion (`state = 'ready'`)
+ * whose structuring silently fell back to the deterministic extractor when the
+ * model call failed (RCA 2026-09-07: one of three identical résumés), leaving
+ * the candidate permanently non-dialable with no operator remedy short of a
+ * new application.
  *
  * The route contributes authentication, the admin gate, id validation and the
- * audit record. Everything that DECIDES whether the retry is permitted —
- * state, terminal application, the reason allowlist, the ceiling — is enforced
- * server-side in the RPC (migration 0039, proven in policy_tests.sql).
+ * audit record. Everything that DECIDES whether the re-drive is permitted —
+ * ready state, the deterministic-fallback structurer tag, terminal
+ * application, the unchanged five-attempt ceiling, the in-flight refusal — is
+ * enforced server-side in the RPC (migration 0084, proven in
+ * policy_tests.sql).
  */
 
 import { describe, it, expect, beforeEach, vi } from 'vitest';
@@ -23,8 +25,8 @@ import { createAshbyMissionControlRouter } from '../routes/ashby-mission-control
 import { setAuditSink, getAuditSink, type AuditEntry } from '../lib/audit.js';
 import type { MissionControlStore } from '../integrations/ashby/workflow-stores.js';
 
-const UUID = '11111111-1111-4111-8111-111111111111';
-const PATH = `/mc/ingestions/${UUID}/retry`;
+const UUID = '22222222-2222-4222-8222-222222222222';
+const PATH = `/mc/ingestions/${UUID}/retry-model-degraded`;
 
 function fakeStore(over: Partial<MissionControlStore> = {}): MissionControlStore {
   return {
@@ -68,40 +70,26 @@ beforeEach(() => {
 // ═══════════════════════════════════════════════════════════════════════
 
 describe('authorization', () => {
-  it('an unauthenticated caller is refused', async () => {
-    const calls = vi.fn();
-    const res = await request(appWith(null, fakeStore({ retryIngestionParse: calls as never })))
-      .post(PATH);
-    expect(res.status).toBe(403);
-    expect(calls).not.toHaveBeenCalled();
-  });
-
-  it('a viewer is refused', async () => {
-    const calls = vi.fn();
-    const res = await request(appWith('viewer', fakeStore({ retryIngestionParse: calls as never })))
-      .post(PATH);
-    expect(res.status).toBe(403);
-    expect(calls).not.toHaveBeenCalled();
-  });
-
-  it('an INTERVIEWER is refused — reads are interviewer+, this mutation is admin-only', async () => {
-    const calls = vi.fn();
-    const res = await request(appWith('interviewer', fakeStore({ retryIngestionParse: calls as never })))
-      .post(PATH);
-    expect(res.status).toBe(403);
-    expect(calls).not.toHaveBeenCalled();
-  });
+  for (const role of [null, 'viewer', 'interviewer'] as const) {
+    it(`${role ?? 'an unauthenticated caller'} is refused before the store is reached`, async () => {
+      const calls = vi.fn();
+      const res = await request(appWith(role, fakeStore({ retryModelDegraded: calls as never })))
+        .post(PATH);
+      expect(res.status).toBe(403);
+      expect(calls).not.toHaveBeenCalled();
+    });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════════════
 // 2. Validation, outcomes, and the refusal matrix the RPC owns
 // ═══════════════════════════════════════════════════════════════════════
 
-describe('admin recovery', () => {
+describe('admin re-drive', () => {
   it('rejects a malformed application link id before reaching the store', async () => {
     const calls = vi.fn();
-    const res = await request(appWith('admin', fakeStore({ retryIngestionParse: calls as never })))
-      .post('/mc/ingestions/not-a-uuid/retry');
+    const res = await request(appWith('admin', fakeStore({ retryModelDegraded: calls as never })))
+      .post('/mc/ingestions/not-a-uuid/retry-model-degraded');
     expect(res.status).toBe(400);
     expect(res.body).toEqual({ ok: false, error: 'invalid_application_link_id' });
     expect(calls).not.toHaveBeenCalled();
@@ -110,7 +98,7 @@ describe('admin recovery', () => {
   it('the happy path returns 200 and passes the ACTOR through for attribution', async () => {
     const seen: Array<[string, string]> = [];
     const res = await request(appWith('admin', fakeStore({
-      retryIngestionParse: async (linkId, actorId) => { seen.push([linkId, actorId]); return { status: 'ok' }; },
+      retryModelDegraded: async (linkId, actorId) => { seen.push([linkId, actorId]); return { status: 'ok' }; },
     }))).post(PATH);
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ ok: true });
@@ -121,12 +109,13 @@ describe('admin recovery', () => {
     'not_found',
     'not_recoverable',
     'blocked_terminal',
-    'not_a_parse_availability_failure',
+    'not_model_degraded',
     'retry_exhausted',
+    'ingestion_job_in_flight',
   ]) {
     it(`a ${status} verdict from the RPC surfaces as a 409 carrying the stable status`, async () => {
       const res = await request(appWith('admin', fakeStore({
-        retryIngestionParse: async () => ({ status }),
+        retryModelDegraded: async () => ({ status }),
       }))).post(PATH);
       expect(res.status).toBe(409);
       expect(res.body).toEqual({ ok: false, error: status });
@@ -135,10 +124,22 @@ describe('admin recovery', () => {
 
   it('a store failure is a truthful 500, never a fabricated success', async () => {
     const res = await request(appWith('admin', fakeStore({
-      retryIngestionParse: async () => { throw new Error('ashby_mc_ingestion_retry_error'); },
+      retryModelDegraded: async () => { throw new Error('ashby_mc_model_degraded_error'); },
     }))).post(PATH);
     expect(res.status).toBe(500);
     expect(res.body).toEqual({ ok: false, error: 'mission_control_action_error' });
+  });
+
+  it('this route drives the MODEL-DEGRADED door, never the failed_review ones', async () => {
+    const wrongDoor = vi.fn(async () => ({ status: 'ok' }));
+    const rightDoor = vi.fn(async () => ({ status: 'ok' }));
+    await request(appWith('admin', fakeStore({
+      retryIngestionParse: wrongDoor as never,
+      retryLegacyBadOutput: wrongDoor as never,
+      retryModelDegraded: rightDoor as never,
+    }))).post(PATH);
+    expect(rightDoor).toHaveBeenCalledTimes(1);
+    expect(wrongDoor).not.toHaveBeenCalled();
   });
 });
 
@@ -155,35 +156,29 @@ describe('audit and disclosure', () => {
     expect(row!.userRole).toBe('admin');
     expect(row!.statusCode).toBe(200);
     expect(row!.metadata).toMatchObject({ outcome: 'ok' });
-    // The audit redactor collapses the 12-digit trailing group of any UUID
-    // (its \b\d{10,}\b phone rule), so the recorded id is the same
-    // partially-redacted shape every other Mission Control audit writes —
-    // pre-existing, consistent, and over-redaction rather than under. The
-    // point of the assertion is that the id recorded is the one the caller
-    // supplied and nothing else.
-    expect(String(row!.metadata!.application_link_id)).toContain('11111111-1111-4111-8111-');
+    expect(String(row!.metadata!.application_link_id)).toContain('22222222-2222-4222-8222-');
   });
 
   it('a REFUSAL is audited too — a denied admin action must not be silent', async () => {
     await request(appWith('admin', fakeStore({
-      retryIngestionParse: async () => ({ status: 'blocked_terminal' }),
+      retryModelDegraded: async () => ({ status: 'not_model_degraded' }),
     }))).post(PATH);
     const row = audits.find((a) => a.metadata?.resource === 'ashby_resume_ingestion');
     expect(row!.statusCode).toBe(409);
-    expect(row!.metadata).toMatchObject({ outcome: 'blocked_terminal' });
+    expect(row!.metadata).toMatchObject({ outcome: 'not_model_degraded' });
   });
 
-  it('neither the response nor the audit row carries a failure reason, handle, token, or PII', async () => {
+  it('neither the response nor the audit row carries a structurer tag, handle, token, or PII', async () => {
     const res = await request(appWith('admin', fakeStore({
-      retryIngestionParse: async () => ({ status: 'not_a_parse_availability_failure' }),
+      retryModelDegraded: async () => ({ status: 'not_model_degraded' }),
     }))).post(PATH);
     const blob = JSON.stringify(res.body) + JSON.stringify(audits);
-    // The RPC knows the failed_reason; the route deliberately never asks for
-    // it and never echoes one. Nothing about the document reaches the client.
-    expect(blob).not.toMatch(/parse_extract_failed|scan_infected|guard_/);
+    // The RPC knows the structurer_version; the route deliberately never asks
+    // for it and never echoes one. Nothing about the document reaches the
+    // client.
+    expect(blob).not.toMatch(/deterministic-fallback|resume-model/);
     expect(blob).not.toMatch(/token|bearer|presigned|https?:\/\//i);
     expect(blob).not.toMatch(/@[a-z0-9.-]+\.[a-z]{2,}/i);
-    // The only id present is the one the caller already supplied.
     expect(blob).not.toMatch(/handle_|file_/);
   });
 

@@ -50,14 +50,53 @@ import { createResumeParserPool, type ResumeParserPool } from '../../lib/resume-
 import { fallbackParseResumeText } from '../../lib/resume-fallback.js';
 import { toCandidateColumns, MODEL_STRUCTURER_VERSION } from '../../lib/candidate-phone.js';
 import {
-  structureResumeWithModel,
+  structureResumeWithModelDetailed,
   mergeStructuredResume,
   defaultResumeModelRunner,
   type ResumeModelRunner,
+  type ResumeModelFailureCategory,
 } from '../../lib/resume-structurer.js';
+import { createLogger } from '../../lib/logger.js';
 
 /** Version tags recorded as ingestion provenance (never PII). */
 export const ASHBY_EXTRACTOR_VERSION = 'ashby-ephemeral-1';
+
+/**
+ * The fallback-observability logger. Component-scoped so the one line the
+ * degraded branch emits is greppable in isolation.
+ */
+const resumeModelFallbackLogger = createLogger('ashby-resume-structurer');
+
+/** The minimal shape the fallback emitter needs — injectable for tests. */
+export interface ResumeModelFallbackLog {
+  warn(event: 'unknown_event', meta: { error_category: string; error_type: string }): void;
+}
+
+/**
+ * Emit ONE structured line for a résumé that silently degraded to the
+ * deterministic extractor (RCA 2026-09-07: one of three identical résumés
+ * fell back with no trace of why).
+ *
+ * CATEGORY ONLY, never content: `error_type` carries the sanitized machine
+ * code from the structurer (`timeout`, `protocol:502`, `parse_error`,
+ * `shape_rejected`, `circuit_open`, `slot_timeout`, …) — a closed set that by
+ * construction holds no résumé text, no model echo, no PII. The underlying
+ * allowlist logger would drop anything else anyway; this function simply never
+ * offers it more.
+ */
+export function emitResumeModelFallback(
+  category: ResumeModelFailureCategory,
+  log: ResumeModelFallbackLog = resumeModelFallbackLogger,
+): void {
+  try {
+    log.warn('unknown_event', {
+      error_category: 'resume_model_fallback',
+      error_type: category,
+    });
+  } catch {
+    // Observability must never fail an ingestion.
+  }
+}
 
 /**
  * The DETERMINISTIC structurer tag — the regex extractor, and NOT on the
@@ -576,10 +615,12 @@ export function createAshbyRuntime(options: CreateAshbyRuntimeOptions): AshbyRun
 
         // ── TIER 1: the bounded model structurer ────────────────────────────
         // Never throws: a provider outage, an open breaker, a timeout or a
-        // malformed shape all return null. Ingestion must not fail because
-        // model structuring failed — the document was fetched, screened and
-        // parsed successfully, and that is still true.
-        const modelled = await structureResumeWithModel(parsed.text, modelRunner);
+        // malformed shape all surrender with a sanitized failure CATEGORY.
+        // Ingestion must not fail because model structuring failed — the
+        // document was fetched, screened and parsed successfully, and that is
+        // still true.
+        const modelOutcome = await structureResumeWithModelDetailed(parsed.text, modelRunner);
+        const modelled = modelOutcome.structured;
 
         // ── TIER 2: the deterministic extractor, run ALWAYS ────────────────
         // Not an else-branch. It is the floor: whatever the regex can find is
@@ -591,6 +632,12 @@ export function createAshbyRuntime(options: CreateAshbyRuntimeOptions): AshbyRun
         if (!modelled) {
           // No model answer at all. Exactly the pre-change behaviour, tagged
           // NON-dialable: a model outage costs a phone call, not a candidate.
+          //
+          // ONE structured line, CATEGORY only (see emitResumeModelFallback):
+          // the silent-degradation RCA showed a fallback row at rest is
+          // visible but not diagnosable — the category is the diagnosis, and
+          // it still carries no résumé content and no PII.
+          emitResumeModelFallback(modelOutcome.failure ?? 'unknown');
           return {
             text: parsed.text,
             structured: deterministic,

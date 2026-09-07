@@ -53,9 +53,11 @@ export interface DeepseekOptions {
   maxOutputBytes?: number;
   /**
    * reasoning_effort override. An empty string (or unset) OMITS the field from
-   * the request body — the fast, default JSON-extraction path. A non-empty
-   * string (V4-Flash documented values: 'high' / 'xhigh') is forwarded verbatim
-   * as `reasoning_effort`. Falls back to env.deepseekReasoningEffort when unset.
+   * the request body — which on V4-Flash means MODEL-DEFAULT reasoning, NOT
+   * "off" (V4-Flash thinks by default when the field is absent; PR #238).
+   * 'none' disables reasoning; 'high' / 'xhigh' increase it. Any non-empty
+   * string is forwarded verbatim as `reasoning_effort`. Falls back to
+   * env.deepseekReasoningEffort when unset.
    */
   reasoningEffort?: string;
 }

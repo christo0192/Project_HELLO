@@ -92,9 +92,13 @@ export const env = {
   deepseekScoringModel: process.env.DEEPSEEK_SCORING_MODEL ?? 'deepseek-v4-flash',
   /**
    * DeepSeek reasoning_effort. EMPTY (default) ⇒ the field is OMITTED from the
-   * request body: fast JSON extraction, no 400 risk from an unsupported value.
-   * A non-empty string (documented values: 'high' / 'xhigh' for V4-Flash) is
-   * forwarded verbatim as `reasoning_effort`. Not required, not secret.
+   * request body — which on V4-Flash means MODEL-DEFAULT reasoning, NOT "off":
+   * V4-Flash THINKS BY DEFAULT when the field is absent (PR #238 finding; an
+   * earlier version of this comment wrongly called omission the "fast" mode).
+   * The literal string 'none' is what disables reasoning; 'high' / 'xhigh'
+   * increase it. Any non-empty value is forwarded verbatim as
+   * `reasoning_effort`; omission still carries no 400 risk. Not required, not
+   * secret.
    */
   deepseekReasoningEffort: process.env.DEEPSEEK_REASONING_EFFORT ?? '',
   deepseekTimeoutMs: positiveInt('DEEPSEEK_TIMEOUT_MS', 120000, 1, 300000),

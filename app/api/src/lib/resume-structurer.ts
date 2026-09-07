@@ -34,6 +34,7 @@
 import type { ParsedResume } from './types.js';
 import { buildExtractionPrompt } from './prompts.js';
 import { runClaudeJSON } from './claude.js';
+import { BusinessError, ProviderError } from './provider-resilience.js';
 
 /**
  * The model call, as a seam.
@@ -457,39 +458,189 @@ export function mergeStructuredResume(
   };
 }
 
+// ── Failure taxonomy (observability) ────────────────────────────────────────
+//
+// A closed set of SANITIZED, stable category codes describing WHY the model
+// tier produced no answer. Categories name OUR MACHINE, never the document:
+// no résumé content, no model echo, no PII can ride one of these strings.
+// `protocol:<status>` carries only the HTTP status integer.
+
+/** Why the model tier surrendered. Stable machine codes — never content. */
+export type ResumeModelFailureCategory =
+  | 'slot_timeout'      // no semaphore slot freed within the wait budget
+  | 'timeout'           // provider call exceeded its wall clock
+  | 'circuit_open'      // breaker refused the call outright
+  | 'parse_error'       // output was not JSON, twice (runner's bounded retry)
+  | 'shape_rejected'    // JSON arrived but was not a usable structured resume
+  | 'missing_api_key'   // no provider credential configured
+  | 'connection'        // transport-level failure before a response
+  | 'output_limit'      // response exceeded the byte bound
+  | 'protocol'          // non-OK response with no usable status
+  | `protocol:${number}` // non-OK response, e.g. 'protocol:429', 'protocol:502'
+  | 'unknown';
+
+/** The model tier's answer plus, on surrender, the sanitized reason. */
+export interface ResumeModelOutcome {
+  structured: ParsedResume | null;
+  /** `null` on success; a stable {@link ResumeModelFailureCategory} otherwise. */
+  failure: ResumeModelFailureCategory | null;
+}
+
+/**
+ * Map a thrown runner error to a sanitized category. Reads only the stable
+ * `category`/`status` fields the shared runner's error types carry (
+ * `DeepseekError`, `ProviderError`) — never the message of an arbitrary error,
+ * which could echo content.
+ */
+function classifyModelFailure(err: unknown): ResumeModelFailureCategory {
+  if (err instanceof BusinessError) return 'parse_error';
+  if (err === null || typeof err !== 'object') return 'unknown';
+  const category = (err as { category?: unknown }).category;
+  if (typeof category !== 'string') return 'unknown';
+  switch (category) {
+    case 'timeout':
+    case 'circuit_open':
+    case 'missing_api_key':
+    case 'connection':
+    case 'output_limit':
+    case 'parse_error':
+      return category;
+    case 'protocol': {
+      const status = (err as { status?: unknown }).status;
+      return typeof status === 'number' && Number.isInteger(status) && status >= 100 && status <= 599
+        ? (`protocol:${status}` as ResumeModelFailureCategory)
+        : 'protocol';
+    }
+    default:
+      return 'unknown';
+  }
+}
+
+/**
+ * TRANSIENT provider failures — the only ones worth ONE bounded in-tier retry:
+ * a wall-clock timeout, a 429 and a 5xx are all statements about the
+ * provider's moment, not about the request. Everything else is either already
+ * retried by the runner (the bounded JSON re-ask that surfaces as
+ * `BusinessError`/`parse_error` — retrying it HERE would double it), or is a
+ * deterministic answer that a retry cannot change (4xx protocol,
+ * missing key, open breaker, output limit).
+ */
+function isTransientModelFailure(err: unknown): boolean {
+  if (err instanceof BusinessError) return false;
+  if (err instanceof ProviderError && err.category !== 'timeout') return false;
+  if (err === null || typeof err !== 'object') return false;
+  const category = (err as { category?: unknown }).category;
+  if (category === 'timeout') return true;
+  if (category === 'protocol') {
+    const status = (err as { status?: unknown }).status;
+    return status === 429 || (typeof status === 'number' && status >= 500 && status <= 599);
+  }
+  return false;
+}
+
+/** One short breath before the single transient retry. */
+const TRANSIENT_RETRY_BACKOFF_MS = 2_000;
+
+/** Overridable in tests so the retry path needs no real 2-second wait. */
+let transientRetryBackoffMs = TRANSIENT_RETRY_BACKOFF_MS;
+
+/**
+ * TEST SEAM ONLY. Shrinks the transient-retry backoff. Returns a restore
+ * function. Production always waits the constant above.
+ */
+export function __setModelRetryBackoffForTest(ms: number): () => void {
+  const prev = transientRetryBackoffMs;
+  transientRetryBackoffMs = ms;
+  return () => {
+    transientRetryBackoffMs = prev;
+  };
+}
+
+/** Unref'd sleep — a pending backoff must not hold the process open. */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const t = setTimeout(resolve, ms);
+    if (typeof t.unref === 'function') t.unref();
+  });
+}
+
+/**
+ * Structure one resume text with the bounded model runner, reporting WHY on
+ * surrender.
+ *
+ * NEVER throws and NEVER rejects. `structured: null` means "use the
+ * deterministic extractor and do not mark the result dialable", and `failure`
+ * then carries the sanitized category so the CALLER can log it.
+ *
+ * Nothing here logs, and that is still deliberate: the values in scope are
+ * the resume text and the model's echo of it, so the only PII-free thing
+ * worth saying is the failure CATEGORY — which is exactly what this returns,
+ * for the caller at the fallback branch to emit (see the Ashby parse port).
+ * The durable ingestion row still records `structurerVersion`, so an outage
+ * remains visible at rest; the category is what makes it DIAGNOSABLE.
+ *
+ * ── ONE BOUNDED IN-TIER RETRY ───────────────────────────────────────────────
+ * A TRANSIENT provider failure (timeout / 429 / 5xx) is retried exactly once
+ * after a short backoff, holding the already-acquired semaphore slot — the
+ * slot bounds provider fan-out, and a retry IS a provider call, so releasing
+ * and re-acquiring would let saturation double the fan-out. JSON-parse
+ * failures are NOT retried here: the shared runner already re-asks once, and
+ * a second layer of retry would quietly square the provider load.
+ */
+export async function structureResumeWithModelDetailed(
+  text: string,
+  runner: ResumeModelRunner = defaultResumeModelRunner,
+): Promise<ResumeModelOutcome> {
+  // Bound concurrent model calls. If no slot frees within the wait budget the
+  // call falls through to the deterministic fallback — saturation must degrade
+  // the answer, never throw into the caller or fail the ingestion.
+  const acquired = await modelSemaphore.acquire(modelAcquireTimeoutMs);
+  if (!acquired) return { structured: null, failure: 'slot_timeout' };
+  try {
+    // `buildExtractionPrompt` already slices the text to 12k before it reaches
+    // a provider — the prompt bound is not re-implemented here.
+    const prompt = buildExtractionPrompt(text);
+    let raw: unknown;
+    try {
+      raw = await runner(prompt);
+    } catch (err) {
+      if (!isTransientModelFailure(err)) {
+        return { structured: null, failure: classifyModelFailure(err) };
+      }
+      // ONE transient retry, slot still held (see the doc comment).
+      await sleep(transientRetryBackoffMs);
+      try {
+        raw = await runner(prompt);
+      } catch (err2) {
+        return { structured: null, failure: classifyModelFailure(err2) };
+      }
+    }
+    const structured = coerceStructuredResume(raw);
+    return structured !== null
+      ? { structured, failure: null }
+      : { structured: null, failure: 'shape_rejected' };
+  } catch (err) {
+    // Anything unexpected (a throwing prompt builder, a hostile value). Still
+    // "no model answer", never an ingestion failure.
+    return { structured: null, failure: classifyModelFailure(err) };
+  } finally {
+    // Always released — including on every surrender path above — so a
+    // failing call never permanently consumes a slot.
+    modelSemaphore.release();
+  }
+}
+
 /**
  * Structure one resume text with the bounded model runner.
  *
  * NEVER throws and NEVER rejects. `null` means "use the deterministic
- * extractor and do not mark the result dialable".
- *
- * Nothing here logs, and that is deliberate: the only values in scope are the
- * resume text and the model's echo of it, so there is no PII-free thing worth
- * saying. The outcome is already observable without a log line — the durable
- * ingestion row records `structurerVersion`, so a model outage shows up as
- * every row carrying the deterministic tag instead of the model one.
+ * extractor and do not mark the result dialable". Callers that want to know
+ * WHY use {@link structureResumeWithModelDetailed}; this wrapper keeps the
+ * original contract for callers that do not.
  */
 export async function structureResumeWithModel(
   text: string,
   runner: ResumeModelRunner = defaultResumeModelRunner,
 ): Promise<ParsedResume | null> {
-  // Bound concurrent model calls. If no slot frees within the wait budget the
-  // call falls through to `null` (deterministic fallback) — saturation must
-  // degrade the answer, never throw into the caller or fail the ingestion.
-  const acquired = await modelSemaphore.acquire(modelAcquireTimeoutMs);
-  if (!acquired) return null;
-  try {
-    // `buildExtractionPrompt` already slices the text to 12k before it reaches
-    // a provider — the prompt bound is not re-implemented here.
-    const raw = await runner(buildExtractionPrompt(text));
-    return coerceStructuredResume(raw);
-  } catch {
-    // Provider outage, open breaker, timeout, output-limit, unparseable JSON.
-    // All of them are "no model answer", none of them is an ingestion failure.
-    return null;
-  } finally {
-    // Always released — including on the throw path above — so a failing call
-    // never permanently consumes a slot.
-    modelSemaphore.release();
-  }
+  return (await structureResumeWithModelDetailed(text, runner)).structured;
 }

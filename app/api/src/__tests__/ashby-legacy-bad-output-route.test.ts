@@ -42,6 +42,7 @@ function fakeStore(over: Partial<MissionControlStore> = {}): MissionControlStore
     retryOperation: async () => ({ status: 'ok' }),
     retryIngestionParse: async () => ({ status: 'ok' }),
     retryLegacyBadOutput: async () => ({ status: 'ok' }),
+    retryModelDegraded: async () => ({ status: 'ok' }),
     upsertMapping: async () => ({ status: 'ok', id: UUID }),
     reissueManualInvite: async () => ({ status: 'ok', inviteId: UUID, revokedInvites: 0 }),
     ...over,

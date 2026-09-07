@@ -616,6 +616,19 @@ export interface MissionControlStore {
    * stamped, never against anything a caller supplies.
    */
   retryLegacyBadOutput(applicationLinkId: string, actorId: string): Promise<{ status: string }>;
+  /**
+   * Audited re-drive of a MODEL-DEGRADED ready ingestion (0084).
+   *
+   * Separate from both doors above on purpose: they demand `failed_review`,
+   * and the row this one exists for is the one every other door refuses for
+   * ever — a "successful" ingestion whose structuring silently fell back to
+   * the deterministic extractor (RCA 2026-09-07: one of three identical
+   * résumés), leaving the candidate permanently non-dialable. Eligibility —
+   * state `ready`, a `deterministic-fallback%` structurer tag, a non-terminal
+   * link, the unchanged five-attempt ceiling — is decided entirely
+   * server-side in the RPC. Nothing here can widen it.
+   */
+  retryModelDegraded(applicationLinkId: string, actorId: string): Promise<{ status: string }>;
 }
 
 /**
@@ -782,6 +795,17 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
         p_actor_id: actorId,
       });
       if (error) throw new Error('ashby_mc_legacy_bad_output_error');
+      return { status: statusOf(data) };
+    },
+    async retryModelDegraded(applicationLinkId, actorId) {
+      // 0084. Every eligibility decision — ready state, the
+      // deterministic-fallback structurer tag, terminal link, ceiling,
+      // in-flight job — is made inside the RPC. Nothing here can widen it.
+      const { data, error } = await client.rpc('recover_ashby_model_degraded', {
+        p_application_link_id: applicationLinkId,
+        p_actor_id: actorId,
+      });
+      if (error) throw new Error('ashby_mc_model_degraded_error');
       return { status: statusOf(data) };
     },
     async reissueManualInvite(input): Promise<MissionControlInviteIssue> {

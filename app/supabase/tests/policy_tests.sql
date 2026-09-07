@@ -14172,6 +14172,298 @@ end;
 $$;
 
 -- ═══════════════════════════════════════════════════════════════════════
+-- 0084 — recover_ashby_model_degraded: the audited re-drive of a READY
+--        ingestion whose MODEL structuring silently degraded.
+--
+-- RCA 2026-09-07: one of three identical résumés fell back to the
+-- deterministic extractor when the model call failed, landing `ready`
+-- with the non-dialable `deterministic-fallback-1` tag — a row EVERY
+-- prior recovery door (0040, 0041) refuses for ever, because both demand
+-- `failed_review`. These tests pin the new door's admission rule, the
+-- 0040 queue contract it reuses, and — most load-bearing — that the new
+-- `ready -> queued` trigger edge is reachable ONLY through the RPC:
+-- the generic advance a webhook redelivery drives must go on refusing,
+-- or every retransmission against a completed application would silently
+-- re-download the candidate's resume.
+-- ═══════════════════════════════════════════════════════════════════════
+
+select _policy_tests.assert(
+  'ashby 0084: recover_ashby_model_degraded is service-role only and pins search_path',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname = 'recover_ashby_model_degraded'
+      and p.prosecdef
+      and array_to_string(coalesce(p.proconfig, '{}'), ',') like '%search_path%'
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')
+      and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ) = 1,
+  'the model-degraded re-drive must be a service-role-only SECURITY DEFINER '
+  'with a pinned search_path'
+);
+
+-- The deadlock argument, asserted rather than asserted-in-prose:
+-- `cancel_ashby_application` locks the LINK and then writes the ingestion.
+-- The recovery must take the same two locks in the same order.
+select _policy_tests.assert(
+  'ashby 0084: the recovery locks the LINK before the ingestion',
+  (select position('from screening_v2.ashby_application_links' in body) > 0
+      and position('from screening_v2.ashby_resume_ingestions' in body) > 0
+      and position('from screening_v2.ashby_application_links' in body)
+        < position('from screening_v2.ashby_resume_ingestions' in body)
+     from (select pg_get_functiondef(p.oid) as body
+             from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+            where n.nspname = 'screening_v2'
+              and p.proname = 'recover_ashby_model_degraded') s),
+  'cancel_ashby_application takes link-then-ingestion; the reverse order here '
+  'would be a deadlock-prone inversion between two service-role writers'
+);
+
+select _policy_tests.assert(
+  'ashby 0084: the new audit action is permitted and nothing earlier was dropped',
+  (select pg_get_constraintdef(oid) from pg_constraint
+    where conname = 'chk_audit_action'
+      and conrelid = 'screening_v2.audit_events'::regclass)
+    like '%ashby_ingestion_model_degraded_recovery%'
+  and (select bool_and(pg_get_constraintdef(c.oid) like ('%' || a || '%'))
+         from pg_constraint c,
+              unnest(array['invite_sent','grant_issued','recording_quarantined',
+                           'ashby_mapping_update','ashby_operation_retry',
+                           'ashby_invite_delivered','ashby_ingestion_attempts_reset',
+                           'ashby_ingestion_parse_recovery',
+                           'ashby_ingestion_legacy_bad_output_recovery',
+                           'phone_attempt_admitted','phone_callback_confirmed']) as a
+        where c.conname = 'chk_audit_action'
+          and c.conrelid = 'screening_v2.audit_events'::regclass),
+  'widening chk_audit_action must be purely additive'
+);
+
+do $$
+declare
+  v_role       uuid;
+  v_map        uuid;
+  v_link_ok    uuid;   -- ready + deterministic-fallback tag → re-driven, ONE job
+  v_link_model uuid;   -- ready + MODEL tag                  → refused, nothing spent
+  v_link_fr    uuid;   -- failed_review                      → refused (0040's door)
+  v_owner      uuid := '00000000-0000-4000-8000-0000000000af';
+  v_res        jsonb;
+  v_payload    jsonb;
+  v_att        integer;
+  v_att0       integer;
+  v_cnt        integer;
+  v_audits     integer;
+  v_state      text;
+  v_ver        text;
+  v_job        record;
+  v_now        timestamptz := now();
+begin
+  select id into v_role from screening_v2.roles limit 1;
+  if v_role is null then
+    perform _policy_tests.assert('ashby 0084 functional: seed role present', false,
+      'no seed role available');
+    return;
+  end if;
+
+  insert into screening_v2.ashby_job_mappings
+    (external_job_id, role_id, owner_id, ai_screening_stage_id, ta_screening_stage_id,
+     status, delivery_mode)
+  values ('pol84-job', v_role, v_owner, 'pol84-ai', 'pol84-ta', 'enabled', 'manual')
+  returning id into v_map;
+
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol84-app-ok',    'pol84-job', v_map, repeat('h', 64)) returning id into v_link_ok;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol84-app-model', 'pol84-job', v_map, repeat('h', 64)) returning id into v_link_model;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id, external_resume_file_handle)
+  values ('pol84-app-fr',    'pol84-job', v_map, repeat('h', 64)) returning id into v_link_fr;
+
+  -- A COMPLETED, MODEL-DEGRADED ingestion: the RCA row, reconstructed.
+  perform screening_v2.advance_ashby_ingestion(v_link_ok, 'queued',      null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ok, 'fetching',    null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ok, 'scanning',    null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ok, 'extracting',  null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ok, 'structuring', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_ok, 'ready',
+            repeat('a', 64), 'ashby-ephemeral-1', 'deterministic-fallback-1', null);
+  select attempts into v_att0
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_ok;
+
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 1. THE GENERIC PATH STILL REFUSES. `runImport` calls
+  --    advance(link,'queued') unconditionally on every webhook redelivery;
+  --    the new trigger edge must be invisible to it.
+  -- ═══════════════════════════════════════════════════════════════════
+  v_res := screening_v2.advance_ashby_ingestion(v_link_ok, 'queued', null, null, null, null);
+  select state into v_state
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_ok;
+  perform _policy_tests.assert(
+    'ashby 0084: the generic advance REFUSES ready -> queued (redelivery cannot re-download)',
+    v_res->>'status' = 'not_requeueable'
+      and v_res->>'reason' = 'model_degraded_recovery_only'
+      and v_state = 'ready',
+    'the ready->queued edge belongs to recover_ashby_model_degraded alone; got '
+      || coalesce(v_res::text, '<null>') || ' state=' || coalesce(v_state, '<null>'));
+
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 2. The happy path: transition + attempt charge + ONE claimable job +
+  --    ONE audit row, all in one transaction (0040 contract).
+  -- ═══════════════════════════════════════════════════════════════════
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where name = 'ashby.ingestion'
+     and dedup_key = 'ashby:ingestion:' || v_link_ok::text;
+  perform _policy_tests.assert(
+    'ashby 0084 precondition: no ashby.ingestion job exists before the re-drive',
+    v_cnt = 0, 'got ' || v_cnt || ' pre-existing job(s)');
+
+  v_res := screening_v2.recover_ashby_model_degraded(v_link_ok, v_owner, v_now);
+  perform _policy_tests.assert(
+    'ashby 0084: a ready deterministic-fallback row is re-driven and charges one attempt',
+    v_res->>'status' = 'ok'
+      and v_res->>'state' = 'queued'
+      and (v_res->>'attempts')::int = v_att0 + 1
+      and (v_res->>'max_attempts')::int = 5,
+    'got ' || coalesce(v_res::text, '<null>'));
+
+  select state into v_state
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_ok;
+  perform _policy_tests.assert(
+    'ashby 0084: the re-driven row rests in queued',
+    v_state = 'queued', 'got state=' || coalesce(v_state, '<null>'));
+
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where name = 'ashby.ingestion'
+     and dedup_key = 'ashby:ingestion:' || v_link_ok::text
+     and status = 'pending';
+  select * into v_job
+    from screening_v2.job_queue
+   where name = 'ashby.ingestion'
+     and dedup_key = 'ashby:ingestion:' || v_link_ok::text
+   limit 1;
+  perform _policy_tests.assert(
+    'ashby 0084: the re-drive leaves EXACTLY ONE claimable job on the 0040 contract',
+    v_cnt = 1
+      and v_job.max_attempts = 5
+      and v_job.attempts = 0
+      and v_job.priority = 0
+      and v_job.scheduled_at = v_now,
+    'a transition that owes work must guarantee the work in the same '
+    'transaction; got ' || v_cnt || ' pending job(s)');
+
+  v_payload := v_job.payload;
+  perform _policy_tests.assert(
+    'ashby 0084: the payload is EXACTLY the consumer contract, and carries no PII',
+    v_payload = jsonb_build_object('provider', 'ashby',
+                                   'applicationLinkId', v_link_ok::text)
+      and (select count(*) from jsonb_object_keys(v_payload)) = 2
+      and v_payload::text not like '%' || repeat('h', 64) || '%'
+      and v_payload::text not like '%pol84-app%',
+    'the handler reads payload.applicationLinkId; any other shape dead-letters. '
+    'got ' || coalesce(v_payload::text, '<null>'));
+
+  select count(*) into v_audits
+    from screening_v2.audit_events
+   where action = 'ashby_ingestion_model_degraded_recovery'
+     and metadata->>'application_link_id' = v_link_ok::text
+     and result = 'success';
+  perform _policy_tests.assert(
+    'ashby 0084: exactly one sanitized success audit row accompanies the admitted job',
+    v_audits = 1, 'got ' || v_audits || ' audit row(s)');
+
+  -- A SECOND re-drive while the row is queued changes nothing: the loser
+  -- sees `queued`, is refused, charges nothing, audits nothing, and no
+  -- second job exists.
+  v_res := screening_v2.recover_ashby_model_degraded(v_link_ok, v_owner, v_now);
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where name = 'ashby.ingestion'
+     and dedup_key = 'ashby:ingestion:' || v_link_ok::text
+     and status in ('pending', 'active', 'delayed');
+  select attempts into v_att
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_ok;
+  select count(*) into v_audits
+    from screening_v2.audit_events
+   where action = 'ashby_ingestion_model_degraded_recovery'
+     and metadata->>'application_link_id' = v_link_ok::text;
+  perform _policy_tests.assert(
+    'ashby 0084: a repeat re-drive is refused and creates no second job/charge/audit',
+    v_res->>'status' = 'not_recoverable'
+      and v_res->>'state' = 'queued'
+      and v_cnt = 1
+      and v_att = v_att0 + 1
+      and v_audits = 1,
+    'got ' || coalesce(v_res::text, '<null>') || ' live_jobs=' || v_cnt
+      || ' attempts=' || coalesce(v_att::text, '<null>') || ' audits=' || v_audits);
+
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 3. A MODEL-structured ready row is refused: nothing to recover.
+  -- ═══════════════════════════════════════════════════════════════════
+  perform screening_v2.advance_ashby_ingestion(v_link_model, 'queued',      null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_model, 'fetching',    null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_model, 'scanning',    null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_model, 'extracting',  null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_model, 'structuring', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_model, 'ready',
+            repeat('b', 64), 'ashby-ephemeral-1', 'resume-model-1', null);
+  select attempts into v_att0
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_model;
+
+  v_res := screening_v2.recover_ashby_model_degraded(v_link_model, v_owner, v_now);
+  select state, structurer_version, attempts into v_state, v_ver, v_att
+    from screening_v2.ashby_resume_ingestions where application_link_id = v_link_model;
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where name = 'ashby.ingestion'
+     and dedup_key = 'ashby:ingestion:' || v_link_model::text;
+  perform _policy_tests.assert(
+    'ashby 0084: a MODEL-structured ready row is refused — no job, no charge, no change',
+    v_res->>'status' = 'not_model_degraded'
+      and v_state = 'ready'
+      and v_ver = 'resume-model-1'
+      and v_att = v_att0
+      and v_cnt = 0,
+    'got ' || coalesce(v_res::text, '<null>') || ' state=' || coalesce(v_state, '<null>')
+      || ' ver=' || coalesce(v_ver, '<null>') || ' jobs=' || v_cnt);
+
+  -- ═══════════════════════════════════════════════════════════════════
+  -- 4. A failed_review row is refused HERE — 0040/0041 are its doors, and
+  --    this one must not become a second, differently-gated retry for it.
+  -- ═══════════════════════════════════════════════════════════════════
+  perform screening_v2.advance_ashby_ingestion(v_link_fr, 'queued',   null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_fr, 'fetching', null, null, null, null);
+  perform screening_v2.advance_ashby_ingestion(v_link_fr, 'failed_review', null, null, null,
+                                               'parse_timeout');
+  v_res := screening_v2.recover_ashby_model_degraded(v_link_fr, v_owner, v_now);
+  select count(*) into v_cnt
+    from screening_v2.job_queue
+   where name = 'ashby.ingestion'
+     and dedup_key = 'ashby:ingestion:' || v_link_fr::text;
+  perform _policy_tests.assert(
+    'ashby 0084: a failed_review row is refused — that state belongs to the 0040/0041 doors',
+    v_res->>'status' = 'not_recoverable'
+      and v_res->>'state' = 'failed_review'
+      and v_cnt = 0,
+    'got ' || coalesce(v_res::text, '<null>') || ' jobs=' || v_cnt);
+
+  -- ── Cleanup (audit rows are append-only, 0007, and left behind) ──────
+  delete from screening_v2.job_queue
+   where dedup_key in ('ashby:ingestion:' || v_link_ok::text,
+                       'ashby:ingestion:' || v_link_model::text,
+                       'ashby:ingestion:' || v_link_fr::text);
+  delete from screening_v2.ashby_resume_ingestions
+   where application_link_id in (v_link_ok, v_link_model, v_link_fr);
+  delete from screening_v2.ashby_application_links
+   where id in (v_link_ok, v_link_model, v_link_fr);
+  delete from screening_v2.ashby_job_mappings where id = v_map;
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════
 
