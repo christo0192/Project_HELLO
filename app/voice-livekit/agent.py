@@ -2348,7 +2348,8 @@ async def _run_native_phone_screening(
     pending_conflict: dict[str, Any] = {"value": None}  # compatibility/test seam; never late-injected
     conflict_reply_pending: dict[str, Any] = {
         "value": False, "conflict": None, "repursued": False, "armed_turn": None,
-        "armed_turn_seq": None, "dropped_on_advance": False,
+        "armed_turn_seq": None, "armed_exchange_id": None,
+        "dropped_on_advance": False,
     }
     # W2 (2026-09-05) BOUNDED CONFLICT-RESOLUTION LOOP. The old design used the
     # `repursued` boolean above as a ONE-SHOT latch: after a single re-pursuit
@@ -2370,6 +2371,36 @@ async def _run_native_phone_screening(
     # moved on (freshness bound), preserving the anti-stale-clarification
     # invariant the ~3029-3038 comment protects.
     native_turn_seq: list[int] = [0]
+    # ── Finding C (Codex review §5): FIRST-CLASS EXCHANGE IDENTITY ──────────
+    # Native STT sequence numbers were substituting for exchange identity: a
+    # LOGICAL exchange (the candidate's coalesced speech plus the bot's reply
+    # cycle for it) can span several native turn_seqs when STT fragments it,
+    # so machinery keyed on seq equality/membership leaks across fragments —
+    # the Call A residual hole charged a clarification continuation to a
+    # never-asked plan key because consumption stamped one seq and the commit
+    # boundary carried another.
+    #
+    # `id` increments when a candidate final STARTS a new logical exchange;
+    # `revision` counts the finals folded into the current one. Membership
+    # rule (the same STRUCTURAL continuation signal the coalescer keys on,
+    # deliberately WITHOUT the active_exchange/cursor match — that match is
+    # what the residual fragments fail): a final arriving while the prior
+    # reply is still streaming pre-first-audio and was not interrupted REVISES
+    # the current exchange; anything else begins a new one. Suppressed/stale
+    # finals may burn an id — gaps are harmless, only agreement between the
+    # consumption record and the boundary stamp matters.
+    #
+    # MIGRATED IN THIS CHANGE: the conflict-clarification fences in
+    # `commit_after_reply` (armed + consumed) key on exchange membership.
+    # NOTED FOLLOW-UPS still on turn_seq: the async judge's `armed_turn`
+    # freshness bound, `_uncount_continuation_fragment`'s seq rollback, and
+    # the QnA round budget — each has its own lifecycle and moves separately.
+    exchange_state: dict[str, int] = {"id": 0, "revision": 1}
+    #: Exchanges on which the conflict machinery CONSUMED a clarification
+    #: reply. The commit fence skips any boundary stamped with one of these —
+    #: a later FRAGMENT of the same clarification exchange can no longer be
+    #: charged to a plan key just because it arrived under a fresh turn_seq.
+    conflict_consumed_exchange_ids: set[int] = set()
     asked_conflicts: set[str] = set()
     # F-Q3a (call #2 RCA, 2026-09-07): the LOGICAL candidate-turn seqs on which
     # the conflict machinery CONSUMED a pending clarification reply (the arrival
@@ -2977,6 +3008,9 @@ async def _run_native_phone_screening(
         # `armed_turn` (the ASYNC freshness stamp): this is set for BOTH the sync
         # and async arms so the commit fence works on either path.
         conflict_reply_pending["armed_turn_seq"] = native_turn_seq[0]
+        # Finding C: the exchange-keyed twin of the stamp above — the commit
+        # fence compares boundary exchange membership against this.
+        conflict_reply_pending["armed_exchange_id"] = exchange_state["id"]
 
     def _consume_conflict_reply(turn_ctx: Any, text: str) -> bool:
         """Consume the pending conflict-probe reply; True when the ONE
@@ -2988,12 +3022,18 @@ async def _run_native_phone_screening(
         # turn can never be charged to the plan key (the clarification reply
         # belongs to the conflict loop, not to a never-asked planned question).
         conflict_consumed_turn_seqs.add(native_turn_seq[0])
+        # Finding C: record the EXCHANGE too. The clarification exchange owns
+        # EVERY fragment belonging to it — a later STT final of this same
+        # clarification arrives under a fresh turn_seq (the Call A residual
+        # hole) but the same exchange id, and the commit fence now catches it.
+        conflict_consumed_exchange_ids.add(exchange_state["id"])
         conflict_reply_pending["value"] = False
         probe_conflict = conflict_reply_pending.get("conflict")
         conflict_reply_pending["conflict"] = None
         # W3 (2026-09-05): the pending is now consumed; clear its commit-fence
         # turn stamp so a later boundary can never read a stale value.
         conflict_reply_pending["armed_turn_seq"] = None
+        conflict_reply_pending["armed_exchange_id"] = None
         # B1 round 2 FRESHNESS BOUND: an ASYNC-armed re-pursuit carries a
         # non-None `armed_turn` stamp (written by the single arming writer). It is
         # valid ONLY on the immediate next candidate turn (armed_turn + 1). If the
@@ -3123,6 +3163,7 @@ async def _run_native_phone_screening(
             dict(probe_conflict) if isinstance(probe_conflict, dict) else None
         )
         conflict_reply_pending["armed_turn_seq"] = native_turn_seq[0]
+        conflict_reply_pending["armed_exchange_id"] = exchange_state["id"]
         return _fire_conflict_repursuit(turn_ctx, repursuit, probe_conflict)
 
     def _fire_conflict_repursuit(
@@ -3252,6 +3293,21 @@ async def _run_native_phone_screening(
         prior_handle_interrupted = bool(
             getattr(reply_handle[0], "interrupted", False)
         )
+        # Finding C: advance the FIRST-CLASS exchange identity from the same
+        # synchronous structural signals, before they are cleared below. A
+        # continuation fragment (prior reply streaming pre-first-audio, not
+        # interrupted) REVISES the current exchange; anything else starts a
+        # new one. Purely additive bookkeeping — it routes nothing itself.
+        if (
+            prior_reply_started
+            and not prior_speech_first_audio
+            and not prior_turn_interrupted["value"]
+            and not prior_handle_interrupted
+        ):
+            exchange_state["revision"] += 1
+        else:
+            exchange_state["id"] += 1
+            exchange_state["revision"] = 1
         reply_started.clear()
         speech_first_audio.clear()
         generation_empty.clear()
@@ -4508,6 +4564,12 @@ async def _run_native_phone_screening(
             # commit (same or earlier turn) is never blocked, only a strictly-
             # later misrouted clarification reply.
             "turn_seq": native_turn_seq[0],
+            # Finding C: the LOGICAL EXCHANGE this boundary belongs to, and
+            # which revision of its input captured it. The commit fences key
+            # on exchange membership (turn_seq remains as the legacy fallback
+            # for seam-seeded boundaries without these fields).
+            "exchange_id": exchange_state["id"],
+            "input_revision": exchange_state["revision"],
         })
         last_advance["text"] = None
         latest_candidate_anchor[0] = None
@@ -4966,11 +5028,26 @@ async def _run_native_phone_screening(
         # conflict must hold regardless of the answer-gate flag).
         boundary_turn = boundary.get("turn_seq")
         armed_turn_seq = conflict_reply_pending.get("armed_turn_seq")
-        if (
-            conflict_reply_pending["value"]
-            and isinstance(boundary_turn, int)
-            and isinstance(armed_turn_seq, int)
-            and boundary_turn > armed_turn_seq
+        # Finding C (Codex review §5): the fence keys on EXCHANGE membership.
+        # A boundary from an exchange STRICTLY AFTER the one the probe was
+        # armed/delivered on is a misrouted clarification reply; the source
+        # answer's own boundary (same or earlier exchange) is never blocked.
+        # Seam-seeded boundaries without exchange fields keep the legacy
+        # turn_seq comparison so the historical regression pins stay honest.
+        boundary_exchange = boundary.get("exchange_id")
+        armed_exchange = conflict_reply_pending.get("armed_exchange_id")
+        if conflict_reply_pending["value"] and (
+            (
+                isinstance(boundary_exchange, int)
+                and isinstance(armed_exchange, int)
+                and boundary_exchange > armed_exchange
+            )
+            or (
+                not isinstance(boundary_exchange, int)
+                and isinstance(boundary_turn, int)
+                and isinstance(armed_turn_seq, int)
+                and boundary_turn > armed_turn_seq
+            )
         ):
             _log.info(
                 "unknown_event", error_type="phone_toolless_commit",
@@ -4990,7 +5067,15 @@ async def _run_native_phone_screening(
         # commits under the same still-owed key. The SOURCE answer (which
         # detects the conflict and legitimately commits its own key) is never
         # a consumption turn, so it is never fenced here.
+        # Finding C: a boundary stamped with a CONSUMED exchange is a fragment
+        # of that clarification, whatever its turn_seq — the residual Call A
+        # hole was exactly a later final of the consumed clarification slipping
+        # past the seq-membership check under a fresh seq. The turn_seq check
+        # is retained alongside (belt: it can only fence consumption turns).
         if (
+            isinstance(boundary_exchange, int)
+            and boundary_exchange in conflict_consumed_exchange_ids
+        ) or (
             isinstance(boundary_turn, int)
             and boundary_turn in conflict_consumed_turn_seqs
         ):
@@ -5685,6 +5770,10 @@ async def _run_native_phone_screening(
     # the commit fence skips a boundary captured on that turn. Not read on any
     # production path.
     setattr(agent, "_conflict_consumed_turn_seqs", conflict_consumed_turn_seqs)
+    # Finding C test seams: the exchange identity cell and the exchange-keyed
+    # consumption record. Not read on any production path.
+    setattr(agent, "_exchange_state", exchange_state)
+    setattr(agent, "_conflict_consumed_exchange_ids", conflict_consumed_exchange_ids)
     # FIX A test seam (2026-09-06): the owed-conflict-probe latch, so a test can
     # arm it (as the async judge would) and prove the NEXT authored bot turn
     # delivers the conflict probe unconditionally (no turn-delta gate). Not read

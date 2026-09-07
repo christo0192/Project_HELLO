@@ -326,6 +326,62 @@ class TestConflictClarificationNeverStealsOwnership(_ReplayHarness):
             await self._close(hooks)
             return keys, charged
 
+    async def test_fragmented_clarification_spanning_seqs_cannot_steal_a_key(self):
+        # Finding C (Codex review §5) — THE RESIDUAL CALL A HOLE, closed by
+        # exchange identity. The clarification's SECOND STT final arrives as a
+        # continuation fragment under a FRESH native turn_seq (the coalescer's
+        # active_exchange/cursor match fails for a clarification, so nothing
+        # rolls the seq back). Consumption stamped only the FIRST final's seq,
+        # so the seq-membership fence let the fragment commit under the next
+        # plan key — `se_code_quality` was committed but never asked. The
+        # fragment is crafted to READ as an answer to k2 (covers the
+        # notice-period objective), which is exactly the shape that slipped.
+        with patch.object(
+            phone, "judge_phone_coverage", new_callable=AsyncMock,
+            return_value=phone.PhoneCoverageVerdict(True, None, "model"),
+        ):
+            agent, _, _, client, hooks = await self._coordinator(
+                judge=True, resume_facts=self.RESUME,
+            )
+            await self._turn(hooks, _CONFLICT_ANSWER)
+            await self._drain_commits(client, 1)
+            await self._deliver(agent, False)   # probe played → pending armed
+            # Clarification final #1 RECONCILES → consumption clears the
+            # pending on THIS turn/exchange; the bot's next reply (the owed
+            # k2 re-ask) starts streaming.
+            await self._turn(hooks, _RECONCILE)
+            clar_exchange = agent._exchange_state["id"]
+            self.assertIn(clar_exchange, agent._conflict_consumed_exchange_ids)
+            # Clarification final #2: a continuation fragment of the SAME
+            # exchange, arriving pre-first-audio under a fresh turn_seq, that
+            # happens to read like a k2 answer.
+            self._begin_streaming_reply(hooks, first_audio=False)
+            await self._turn(
+                hooks, "I could probably join within a month or so anyway.",
+            )
+            # Same exchange, new seq — the exact residual shape.
+            self.assertEqual(agent._exchange_state["id"], clar_exchange)
+            self.assertNotIn(
+                agent._native_turn_seq[0], agent._conflict_consumed_turn_seqs,
+            )
+            for _ in range(30):
+                await asyncio.sleep(0.005)
+            # The fragment did NOT commit under k2 (pre-fix it did).
+            self.assertEqual(client.committed_keys, ["k1"])
+            # The bot's k2 ask completes; the REAL k2 answer owns the key.
+            hooks["reply_started"].clear()
+            hooks["speech_first_audio"].set()
+            hooks["latest_assistant"][0] = _Q2
+            await self._turn(hooks, _ANSWER_2)
+            self.assertTrue(await self._drain_commits(client, 2))
+            charged = self._charged(client)
+            self.assertEqual(client.committed_keys, ["k1", "k2"])
+            self.assertIn("thirty days", charged["k2"])
+            for key, text in charged.items():
+                self.assertNotIn("month or so", text, key)
+                self.assertNotIn("side project", text, key)
+            await self._close(hooks)
+
     async def test_clarification_never_commits_under_a_plan_key(self):
         for schedule in (
             "consumed_after_source_commit",
