@@ -259,6 +259,74 @@ describe('GET /api/recordings/:sessionId/download', () => {
     expect(res.body.url).toBe(SIGNED_URL);
   });
 
+  // ── FIX 6b (SE-call RCA 2026-09-07): sniffed content type, not key ext ──
+  it('serves the download extension from the sniffed content type when OGG bytes sit at an .mp3 key', async () => {
+    configureTables({
+      call_sessions: {
+        owner_id: 'admin-1',
+        // The worker's raw-OGG transcode-failure fallback: OGG bytes, .mp3 key.
+        recording_object_key: `${VALID_SESSION}-recorder.mp3`,
+        recording_content_type: 'audio/ogg',
+      },
+    });
+    mockCreateSignedUrl.mockResolvedValue({ data: { signedUrl: SIGNED_URL }, error: null });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/${VALID_SESSION}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    // The signed URL is minted for the UNCHANGED key (key contract untouched),
+    // with a Content-Disposition filename whose extension comes from the type.
+    expect(mockCreateSignedUrl).toHaveBeenCalledWith(
+      `${VALID_SESSION}-recorder.mp3`,
+      expect.any(Number),
+      { download: `recording-${VALID_SESSION}.ogg` },
+    );
+    expect(res.body.content_type).toBe('audio/ogg');
+  });
+
+  it('labels a clean MP3 download .mp3 from its sniffed type', async () => {
+    configureTables({
+      call_sessions: {
+        owner_id: 'admin-1',
+        recording_object_key: `${VALID_SESSION}-recorder.mp3`,
+        recording_content_type: 'audio/mpeg',
+      },
+    });
+    mockCreateSignedUrl.mockResolvedValue({ data: { signedUrl: SIGNED_URL }, error: null });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/${VALID_SESSION}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(mockCreateSignedUrl).toHaveBeenCalledWith(
+      `${VALID_SESSION}-recorder.mp3`,
+      expect.any(Number),
+      { download: `recording-${VALID_SESSION}.mp3` },
+    );
+    expect(res.body.content_type).toBe('audio/mpeg');
+  });
+
+  it('preserves the exact legacy mint when no sniffed content type exists', async () => {
+    configureTables({
+      call_sessions: {
+        owner_id: 'admin-1',
+        recording_object_key: OBJECT_KEY,
+        recording_content_type: null,
+      },
+    });
+    mockCreateSignedUrl.mockResolvedValue({ data: { signedUrl: SIGNED_URL }, error: null });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/${VALID_SESSION}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    // No forced filename, no content_type field — byte-identical behavior
+    // (the two-argument mint the pre-fix route always made).
+    expect(mockCreateSignedUrl).toHaveBeenCalledWith(OBJECT_KEY, expect.any(Number));
+    expect(res.body).toEqual({ url: SIGNED_URL });
+  });
+
   // ── Viewer read-all 200 ───────────────────────────────────────────
   it('allows an active viewer to read any session (200)', async () => {
     configureTables({

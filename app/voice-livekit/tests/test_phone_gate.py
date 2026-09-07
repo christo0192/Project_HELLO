@@ -7734,10 +7734,17 @@ class TestPhoneCoverageJudgeCore(unittest.IsolatedAsyncioTestCase):
         infer.assert_awaited_once()
 
     async def test_timeout_or_unparseable_output_fails_toward_not_covered(self):
+        # FIX 4 (2026-09-07): both shapes still fail toward NOT covered, but a
+        # timeout now carries its own `judge_timeout` category while an
+        # unparseable body stays `judge_error` — the SE call could not tell a
+        # slow judge from a broken one.
         async def raises(_prompt):
             raise TimeoutError("synthetic")
 
-        for infer in (raises, AsyncMock(return_value="not-json")):
+        for infer, expected_category in (
+            (raises, "judge_timeout"),
+            (AsyncMock(return_value="not-json"), "judge_error"),
+        ):
             verdict = await phone.judge_phone_coverage(
                 question_text="Describe your recent role.",
                 assistant_reply="Walk me through your latest position.",
@@ -7745,7 +7752,7 @@ class TestPhoneCoverageJudgeCore(unittest.IsolatedAsyncioTestCase):
                 resume_facts={"current_role": "Lead"}, infer=infer,
             )
             self.assertFalse(verdict.covered)
-            self.assertEqual(verdict.category, "judge_error")
+            self.assertEqual(verdict.category, expected_category)
             self.assertIsNone(verdict.conflict)
 
     async def test_hanging_inference_is_bounded_by_the_async_wrapper(self):
@@ -7760,7 +7767,8 @@ class TestPhoneCoverageJudgeCore(unittest.IsolatedAsyncioTestCase):
                 resume_facts={"current_role": "Lead"}, infer=hangs,
             )
         self.assertFalse(verdict.covered)
-        self.assertEqual(verdict.category, "judge_error")
+        # FIX 4 (2026-09-07): a bounded deadline miss is `judge_timeout`.
+        self.assertEqual(verdict.category, "judge_timeout")
 
     def test_repair_composer_prioritises_one_safe_conflict_probe(self):
         conflict = {
@@ -9155,7 +9163,9 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(phone.phone_coverage_timeout_sec(), 1.0)
 
         # The wrapper bounds a hanging inference by the (patchable) module
-        # timeout + 0.25, so pinning the attribute short forces judge_error.
+        # timeout + 0.25, so pinning the attribute short forces the TIMEOUT
+        # category (FIX 4, 2026-09-07: a deadline miss is `judge_timeout`, no
+        # longer folded into `judge_error`).
         async def hangs(_prompt):
             await asyncio.Event().wait()
 
@@ -9166,7 +9176,7 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
                 candidate_answer="An answer.",
                 resume_facts={"current_role": "Lead"}, infer=hangs,
             )
-        self.assertEqual(verdict.category, "judge_error")
+        self.assertEqual(verdict.category, "judge_timeout")
 
     async def test_repeated_judge_errors_cannot_rewind_or_duplicate_cursor(self):
         agent, _, _, client, hooks = await self._coordinator()

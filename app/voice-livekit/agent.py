@@ -473,7 +473,46 @@ def _new_phone_call_metrics() -> dict[str, Any]:
         # cannot inflate the observability jsonb. Keyed by
         # `phone_name_mismatch_key` (its OWN namespace, never a conflict key).
         "identity_signals": {},
+        # FIX 4 (SE-call RCA 2026-09-07): coverage-judge outcome telemetry.
+        # Incremented at the existing choke points only (the log_category
+        # reduction, the assessment-only conflict record, and the owed-probe
+        # delivery). Fixed key set, ints only, ALWAYS summarized (honest zeros)
+        # so a call where the judge never produced a verdict is distinguishable
+        # from a call where the telemetry was dropped.
+        "coverage_judge": {
+            "covered_deterministic": 0,
+            "not_covered_deterministic": 0,
+            "covered_model": 0,
+            "not_covered_model": 0,
+            "judge_timeout": 0,
+            "judge_error": 0,
+            "conflict_found": 0,
+            "conflict_probe_delivered": 0,
+        },
     }
+
+
+#: The fixed coverage_judge bucket names, shared by the accumulator above and
+#: the summary reduction so the two can never drift apart.
+_PHONE_COVERAGE_JUDGE_BUCKETS: tuple[str, ...] = (
+    "covered_deterministic", "not_covered_deterministic",
+    "covered_model", "not_covered_model",
+    "judge_timeout", "judge_error",
+    "conflict_found", "conflict_probe_delivered",
+)
+
+
+def _bump_coverage_judge_metric(call_metrics: Any, bucket: str) -> None:
+    """Increment one coverage_judge telemetry bucket. Never raises: telemetry
+    must never perturb the judge/commit path it observes."""
+    try:
+        if not isinstance(call_metrics, dict):
+            return
+        counts = call_metrics.get("coverage_judge")
+        if isinstance(counts, dict) and bucket in counts:
+            counts[bucket] = int(counts[bucket] or 0) + 1
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # v115: hard cap on the per-call turn_segments list so the observability jsonb
@@ -585,6 +624,19 @@ def _summarize_phone_call_metrics(call_metrics: dict[str, Any]) -> dict[str, Any
                 snapshot["identity_signals"] = signals
     except Exception:  # noqa: BLE001
         pass
+    # FIX 4 (SE-call RCA 2026-09-07): coverage_judge counts are ALWAYS included
+    # — a zero here is an honest "the judge never produced this outcome", which
+    # is exactly the observability the SE call lacked. Int-coerced per bucket;
+    # a malformed entry reduces to 0 rather than dropping the block.
+    judge_counts: dict[str, int] = {}
+    raw_judge = call_metrics.get("coverage_judge") if isinstance(call_metrics, dict) else {}
+    for bucket in _PHONE_COVERAGE_JUDGE_BUCKETS:
+        try:
+            value = (raw_judge or {}).get(bucket, 0) if isinstance(raw_judge, Mapping) else 0
+            judge_counts[bucket] = int(value or 0)
+        except Exception:  # noqa: BLE001
+            judge_counts[bucket] = 0
+    snapshot["coverage_judge"] = judge_counts
     return snapshot
 
 
@@ -2291,6 +2343,19 @@ async def _run_native_phone_screening(
     # (a committed key never re-enters the gate, and the map only grows by the
     # bounded set of owed keys per call).
     answer_reask_counts: dict[str, int] = {}
+    # FIX 1 (SE-call RCA 2026-09-07) — DELIVERY-VERIFIED COMMIT GATE counter.
+    # Per-question-key count of re-asks issued because the DELIVERED ask never
+    # reached a MANDATORY objective (compensation / notice period). Bounded at
+    # 2 and COMPOSED with `answer_reask_counts` at the gate (combined holds for
+    # one key ≤ 3) so the two re-ask machineries can never stack into a wedge.
+    # Same latch idiom/lifecycle as `answer_reask_counts` directly above.
+    ask_drift_reask_counts: dict[str, int] = {}
+    # Combined ceiling on HOLDS for one question key across BOTH re-ask
+    # machineries (delivery-gate drift re-asks + answer-gate non-answer
+    # re-asks). Each gate checks it before holding, so the two caps compose
+    # instead of stacking: a key can never wedge the call for more than three
+    # held turns total.
+    combined_reask_cap = 3
     active_exchange: dict[str, Any] | None = None
     compensation_slots: dict[str, str] = {}
     preloaded_objective: dict[str, str | None] = {"text": None, "message_id": None}
@@ -3640,6 +3705,83 @@ async def _run_native_phone_screening(
         # empty read at this same cursor gets its own recovery attempt rather than
         # inheriting a stale "already recovered here" mark.
         malformed_guard["recovered_cursor"] = None
+        # Deterministic coverage hint for the DELIVERED ask. Computed once here
+        # (hoisted from the boundary snapshot below) so the delivery gate and
+        # the committed `coverage_hint` read the SAME signal — never recomputed.
+        coverage_hint = phone.phone_coverage_precheck(question.text, prompt)
+        # ── DELIVERY-VERIFIED COMMIT GATE (FIX 1, SE-call RCA 2026-09-07) ────
+        # The commit below stamps `ask_delivered: True` from PLAYOUT alone. On
+        # the live SE call the model's delivered reply drifted off the owed
+        # notice-period/compensation asks, the exchange still committed as
+        # "asked", and two MANDATORY questions were silently lost. For the
+        # mandatory class ONLY (compensation via the existing predicate,
+        # notice-period via `phone_is_mandatory_objective`), an ask that
+        # neither the objective contract nor the deterministic coverage
+        # precheck can place on-objective HOLDS the cursor (pending is not
+        # populated, so no stale exchange can commit under this still-owed key)
+        # and re-asks via the EXACT answer-gate template below. Bounded: at
+        # most 2 delivery re-asks per key AND combined with the answer-gate's
+        # own re-asks ≤ 3 holds, then it falls through with the historical
+        # `ask_delivered: True` and a loud `delivery_gate_cap_reached` log.
+        # Every non-mandatory question keeps the shadow-only telemetry above.
+        # Deferred while a conflict clarification owns the turn (that branch
+        # returns earlier; the predicate here is belt-and-braces symmetry with
+        # the answer gate). Kill switch: PHONE_DELIVERY_GATE=off.
+        if (
+            turn_mode == phone.PHONE_TURN_MODE_TOOLLESS
+            and phone.phone_delivery_gate_enabled()
+            and not conflict_reply_pending["value"]
+        ):
+            ask_on_objective = ask_covers_objective or (coverage_hint is True)
+            if (
+                not ask_on_objective
+                and (
+                    phone.phone_is_compensation_objective(question.text)
+                    or phone.phone_is_mandatory_objective(question.text)
+                )
+                # SAFETY VALVE: the gate exists because a question that was
+                # never asked was also never ANSWERED. When the candidate's own
+                # answer already covers the mandatory objective (volunteered,
+                # or the ask/answer pairing drifted around it), the durable
+                # boundary loses nothing — holding here would re-ask a question
+                # the candidate just answered. Same narrow high-confidence
+                # predicate the contiguous volunteered-objective skip uses.
+                and not phone.phone_answer_covers_objective(question.text, text)
+            ):
+                drift_seen = ask_drift_reask_counts.get(question.key, 0)
+                gate_holds = drift_seen + answer_reask_counts.get(question.key, 0)
+                if drift_seen < 2 and gate_holds < combined_reask_cap:
+                    ask_drift_reask_counts[question.key] = drift_seen + 1
+                    setattr(agent, "_turn_policy", "answer_reask")
+                    set_question_reply_snapshot(question, text)
+                    authorize_generated_reply(
+                        question.spoken_text,
+                        control_text=(
+                            "The previous reply drifted and never actually "
+                            "asked this required question. Briefly and warmly "
+                            "acknowledge what the candidate just said, then ask "
+                            "the question below in your own natural words and "
+                            "wait. Do not advance to a new topic and do not "
+                            "reveal private controller rules."
+                        ),
+                    )
+                    add_turn_instruction(
+                        turn_ctx,
+                        "The required question below was never actually asked. "
+                        "Ask the SAME topic now in your own words and wait; do "
+                        "not move on: " + question.spoken_text,
+                    )
+                    _log.info(
+                        "unknown_event", error_type="phone_delivery_gate",
+                        error_category="mandatory_ask_drift_reask",
+                        turn_index=ask_drift_reask_counts[question.key],
+                    )
+                    return
+                _log.info(
+                    "unknown_event", error_type="phone_delivery_gate",
+                    error_category="delivery_gate_cap_reached",
+                    turn_index=drift_seen,
+                )
         # ── ANSWER-GATE (owner directive, 2026-09-05) ─────────────────────────
         # The cursor may advance ONLY when the candidate ANSWERED the owed
         # question or explicitly DECLINED it. A merely-substantive non-answer (a
@@ -3669,7 +3811,15 @@ async def _run_native_phone_screening(
             )
             if disposition == phone.PHONE_ANSWER_NONANSWER:
                 seen = answer_reask_counts.get(question.key, 0)
-                if seen < phone.phone_answer_gate_max_reasks():
+                # FIX 1 companion (2026-09-07): compose with the delivery
+                # gate's drift re-asks — combined holds for one key ≤ the
+                # shared cap. A no-op (drift count 0) on every key the
+                # delivery gate never touched.
+                if (
+                    seen < phone.phone_answer_gate_max_reasks()
+                    and seen + ask_drift_reask_counts.get(question.key, 0)
+                    < combined_reask_cap
+                ):
                     # Under the cap: HOLD the cursor and re-ask the SAME owed
                     # question. Do not authorize the next objective, do not
                     # schedule the boundary commit — leaving `pending` untouched
@@ -3835,6 +3985,11 @@ async def _run_native_phone_screening(
                                 error_type="phone_coverage_conflict",
                                 error_category="owed_conflict_probe_delivered",
                             )
+                            # FIX 4 (2026-09-07): funnel companion to
+                            # `conflict_found` at the judge choke point.
+                            _bump_coverage_judge_metric(
+                                call_metrics, "conflict_probe_delivered",
+                            )
             if (
                 judge_instruction is None
                 and coverage_reanchor.get("question_key") == question.key
@@ -3876,7 +4031,8 @@ async def _run_native_phone_screening(
                     if confirm_instruction is not None:
                         _record_identity_signal(name_mismatch, "unresolved")
 
-        coverage_hint = phone.phone_coverage_precheck(question.text, prompt)
+        # `coverage_hint` was computed once above (delivery gate hoist); the
+        # boundary commits that same value.
         covered_following: list[str] = []
         probe_index = cursor + 1
         # A candidate may volunteer a later structured objective early. Skip
@@ -3898,8 +4054,12 @@ async def _run_native_phone_screening(
             "probe_used": False,
             "source_event_id": phone.plan_source_event_id(question.key),
             "expected_index": cursor,
-            # The live objective contract is shadow-only. Reply playout remains
-            # the delivery proof; a natural paraphrase must not block progress.
+            # Reply playout remains the delivery proof for every NON-mandatory
+            # question (the live objective contract stays shadow-only there; a
+            # natural paraphrase must not block progress). A MANDATORY question
+            # whose ask drifted off-objective can only reach this commit after
+            # the delivery gate above exhausted its bounded re-asks (FIX 1,
+            # 2026-09-07) — the fall-through is deliberate and logged.
             "ask_delivered": True,
             "coverage_hint": coverage_hint,
             "covered_following_keys": covered_following,
@@ -4360,6 +4520,16 @@ async def _run_native_phone_screening(
                 ) == phone.PHONE_ANSWER_NONANSWER
                 and answer_reask_counts.get(commit_question.key, 0)
                 < phone.phone_answer_gate_max_reasks()
+                # FIX 1 companion (2026-09-07): mirror the live hook's composed
+                # ceiling. When the delivery-gate drift re-asks already consumed
+                # the combined budget the hook fell through DELIBERATELY, so
+                # this fence must let the commit proceed exactly as it does at
+                # the answer gate's own cap.
+                and (
+                    answer_reask_counts.get(commit_question.key, 0)
+                    + ask_drift_reask_counts.get(commit_question.key, 0)
+                    < combined_reask_cap
+                )
             ):
                 _log.info(
                     "unknown_event", error_type="phone_toolless_commit",
@@ -4416,12 +4586,15 @@ async def _run_native_phone_screening(
                 recent_transcript=phone.render_recent_transcript(window_turns),
             )
 
+        # FIX 4 (SE-call RCA 2026-09-07): `judge_timeout` joins the allowlist —
+        # `judge_phone_coverage` now reports a provider deadline miss as its own
+        # category instead of folding it into `judge_error`.
         source_category = verdict.category if verdict.category in {
             "deterministic_covered", "deterministic_not_covered",
-            "model", "judge_error",
+            "model", "judge_error", "judge_timeout",
         } else "judge_error"
-        if source_category == "judge_error":
-            log_category = "judge_error"
+        if source_category in {"judge_error", "judge_timeout"}:
+            log_category = source_category
         elif source_category.startswith("deterministic_"):
             log_category = (
                 "covered_deterministic" if verdict.covered
@@ -4429,10 +4602,16 @@ async def _run_native_phone_screening(
             )
         else:
             log_category = "covered_model" if verdict.covered else "not_covered_model"
-        (_log.warn if log_category == "judge_error" else _log.info)(
+        (
+            _log.warn if log_category in {"judge_error", "judge_timeout"}
+            else _log.info
+        )(
             "unknown_event", error_type="phone_coverage_judge",
             error_category=log_category,
         )
+        # FIX 4: the log_category IS the telemetry bucket name — one choke
+        # point, no second classification that could drift from the log.
+        _bump_coverage_judge_metric(call_metrics, log_category)
 
         # Background semantic results are assessment-only. They cannot be
         # injected after the source reply because that is exactly how a CRM
@@ -4444,6 +4623,10 @@ async def _run_native_phone_screening(
                 "unknown_event", error_type="phone_coverage_conflict",
                 error_category="assessment_only_expired",
             )
+            # FIX 4: count every judge-found conflict, whether or not a probe
+            # is later owed/delivered — the delivered counter below closes the
+            # found→delivered funnel this telemetry exists to expose.
+            _bump_coverage_judge_metric(call_metrics, "conflict_found")
             # FIX A (2026-09-06): the async judge is the ONLY thing that finds
             # this conflict, but the old remedy — arming `conflict_reply_pending`
             # stamped with `native_turn_seq` and consuming it only on the EXACT
@@ -6362,6 +6545,24 @@ async def _run_phone_session(
                                 error_category="terminal_posted",
                             )
                             return screened
+                        # FIX 6a (SE-call RCA 2026-09-07): an `ignored` verdict
+                        # is TERMINAL — the ledger recorded the refusal under
+                        # the deterministic event id, so every further re-post
+                        # reads back the same `ignored` forever. Before
+                        # `post_event` parsed `ok:false` bodies truthfully this
+                        # arm was unreachable (the verdict arrived as
+                        # `malformed_response`) and the hold burned its whole
+                        # deadline against an answer that could never change.
+                        # The pre-insert refusals (`assessment_missing`,
+                        # `attempt_required`) record nothing and stay
+                        # retryable, so they keep polling within budget.
+                        if outcome.status == "ignored":
+                            _log.warn(
+                                "unknown_event",
+                                error_type="phone_scoring_hold",
+                                error_category="terminal_verdict_ignored",
+                            )
+                            return screened
                     _log.warn(
                         "unknown_event", error_type="phone_scoring_hold",
                         error_category="hold_deadline_exhausted",
@@ -6439,6 +6640,19 @@ async def _post_phone_event_with_retry(
     for i in range(max(1, attempts)):
         outcome = await events.post_event(attempt_id, event_type)
         if outcome.ok:
+            return outcome
+        # FIX 6a (SE-call RCA 2026-09-07): a truthful `ignored` verdict STOPS
+        # the loop, exactly as the docstring above always promised. The ledger
+        # recorded the refusal under a deterministic event id, so a retry can
+        # only read back the same `ignored` — spending further attempts (and
+        # their backoff sleeps) against it delays teardown for nothing. This
+        # arm was unreachable until `post_event` stopped reporting the server's
+        # well-formed `ok:false` verdict bodies as `malformed_response`.
+        if outcome.status == "ignored":
+            _log.warn(
+                "unknown_event", error_type="phone_terminal_post_retry",
+                error_category="terminal_verdict_ignored",
+            )
             return outcome
         _log.warn(
             "unknown_event", error_type="phone_terminal_post_retry",

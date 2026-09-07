@@ -1341,6 +1341,34 @@ class PhoneEventClient:
             return PhoneApiOutcome(False, error_category=response)
 
         data = _response_json(response)
+        # FIX 6a (SE-call RCA 2026-09-07): the server's events route answers a
+        # NON-applied verdict as `{ok:false, status, ignored_reason, duplicate}`
+        # — a well-formed, truthful refusal ("ok MEANS APPLIED; ignored IS NOT
+        # ok"). Reporting that as `malformed_response` erased the verdict: the
+        # terminal-post retry loop could never see the `ignored` status its own
+        # docstring promises to stop on, and the scoring-hold poll re-posted an
+        # event the ledger had already permanently refused. Parse it truthfully;
+        # only a body that carries neither `ok:true` nor an `ok:false`+status
+        # verdict remains malformed.
+        if (
+            isinstance(data, dict)
+            and data.get("ok") is False
+            and isinstance(data.get("status"), str)
+        ):
+            _log.info(
+                "unknown_event",
+                error_type="phone_event_refused",
+                schema=event_type,
+                error_category=str(data.get("status")),
+            )
+            return PhoneApiOutcome(
+                False,
+                str(data.get("status")),
+                duplicate=bool(data.get("duplicate")),
+                ignored_reason=(
+                    str(data["ignored_reason"]) if data.get("ignored_reason") else None
+                ),
+            )
         if not isinstance(data, dict) or data.get("ok") is not True:
             _log.warn(
                 "unknown_event", error_type="phone_api_failed",
@@ -4927,6 +4955,34 @@ def phone_is_compensation_objective(text: Any) -> bool:
     )
 
 
+#: FIX 1 (SE-call RCA 2026-09-07): the OTHER mandatory-class objective —
+#: notice period / joining availability. On the live SE call the model's reply
+#: drifted off the owed notice-period ask, the commit still recorded
+#: ``ask_delivered: True``, and a mandatory question was silently lost. The
+#: delivery-verified commit gate treats compensation (existing predicate above)
+#: and these notice-period shapes as MANDATORY: an off-objective ask for them
+#: holds the cursor and re-asks instead of committing a question never asked.
+PHONE_MANDATORY_OBJECTIVE_RES: tuple["re.Pattern[str]", ...] = (
+    re.compile(r"\bnotice\s*[-–]?\s*period\b", re.IGNORECASE),
+    re.compile(r"\bserving\s+(?:your\s+)?notice\b", re.IGNORECASE),
+    re.compile(r"\b(?:when|how\s+soon)\b.{0,48}\b(?:join|start)\b", re.IGNORECASE),
+    re.compile(r"\bavailab\w*\b.{0,48}\b(?:join|start)\b", re.IGNORECASE),
+    re.compile(r"\bjoining\s+(?:date|time(?:line)?|availability)\b", re.IGNORECASE),
+)
+
+
+def phone_is_mandatory_objective(text: Any) -> bool:
+    """True for a notice-period / joining-availability objective.
+
+    Companion to ``phone_is_compensation_objective``: together they name the
+    MANDATORY question class the delivery-verified commit gate protects. Every
+    other objective keeps the historical shadow-only telemetry behaviour.
+    """
+    if not isinstance(text, str):
+        return False
+    return any(pattern.search(text) for pattern in PHONE_MANDATORY_OBJECTIVE_RES)
+
+
 #: The candidate volunteering compensation OR notice-period detail. The
 #: objective guard's ``compensation_drift`` check exists to stop a screening turn
 #: DRIFTING into a comp objective the plan did not authorize — a BOT-initiated
@@ -5229,6 +5285,20 @@ def phone_answer_gate_max_reasks() -> int:
     return _bounded_int_env(os.getenv("PHONE_ANSWER_GATE_MAX_REASKS"), 2, 0, 5)
 
 
+def phone_delivery_gate_enabled() -> bool:
+    """Kill switch for the delivery-verified commit gate (FIX 1, 2026-09-07).
+
+    When ON (default), a mandatory-class question (compensation / notice
+    period) whose delivered ask never reached its objective holds the cursor
+    and re-asks (bounded) instead of committing ``ask_delivered: True`` for an
+    ask that never happened. Only the literal ``off`` (trimmed,
+    case-insensitive) disables it, restoring the shadow-only behaviour. Mirrors
+    the answer-gate flag style so the env-contract scanner sees the literal
+    name here.
+    """
+    return (os.getenv("PHONE_DELIVERY_GATE") or "").strip().lower() != "off"
+
+
 def phone_conflict_gate_enabled() -> bool:
     """Kill switch for the bounded résumé-conflict resolution loop (W2).
 
@@ -5313,23 +5383,215 @@ def phone_objective_guard_max_questions_for_phase(phase: Any) -> int:
     return 1
 
 
+#: FIX 3 (SE-call RCA 2026-09-07): small role-CLASS lexicon replacing the old
+#: claim-side ``sales|advisor|advisory|counselling`` gate, which made the
+#: detector structurally blind to every non-sales claim (a candidate claiming
+#: multi-year SOFTWARE work against a sales résumé sailed through). A side
+#: (spoken claim / résumé role) "classifies" when at least one class pattern
+#: matches; the title-mismatch fires ONLY when BOTH sides classify and their
+#: class sets are DISJOINT (an overlap — e.g. "Data Engineer" is both data and
+#: engineering — is compatible, and an unknown side stays None). Deliberately
+#: coarse: a class the lexicon does not know cannot produce an accusation.
+_ROLE_CLASS_LEXICON: tuple[tuple[str, "re.Pattern[str]"], ...] = (
+    ("engineering", re.compile(
+        r"\b(?:software|developer|engineer(?:ing)?|programmer|sde\d?|"
+        r"full[\s-]?stack|back[\s-]?end|front[\s-]?end|devops|sre)\b",
+        re.IGNORECASE)),
+    ("sales", re.compile(
+        r"\b(?:sales|advisor|advisory|counsell\w*|counselor|"
+        r"business\s+development|account\s+executive|telecall\w*|telesales)\b",
+        re.IGNORECASE)),
+    ("support", re.compile(
+        r"\b(?:support|helpdesk|help\s+desk|service\s+desk|"
+        r"customer\s+(?:service|care|success)|call\s+cent(?:re|er))\b",
+        re.IGNORECASE)),
+    ("data", re.compile(
+        r"\b(?:data|analytics|analyst|machine\s+learning|"
+        r"business\s+intelligence)\b",
+        re.IGNORECASE)),
+    ("qa", re.compile(
+        r"\b(?:qa|quality\s+assurance|sdet|test(?:er|ing)|"
+        r"automation\s+test\w*)\b",
+        re.IGNORECASE)),
+    ("management", re.compile(
+        r"\b(?:manager|management|team\s+lead|director|head\s+of|"
+        r"vice\s+president|vp|supervisor)\b",
+        re.IGNORECASE)),
+    ("design", re.compile(
+        r"\b(?:designer|ux|ui|graphic\s+design\w*|product\s+design\w*)\b",
+        re.IGNORECASE)),
+    ("finance", re.compile(
+        r"\b(?:finance|financial|account(?:ant|ing)|trader|trading|"
+        r"banking|investment|auditor)\b",
+        re.IGNORECASE)),
+)
+
+#: Employer/title checks are contained to CURRENT-work claims: an explicit
+#: current marker, or a duration-bearing claim that carries no explicit past
+#: marker (the original detector's high-confidence shape — "I spent two years
+#: in sales" — has no current marker, so duration-without-past must qualify or
+#: every proven sales-call fixture regresses).
+_CURRENT_WORK_MARKER_RE = re.compile(
+    r"\b(?:currently|current|right\s+now|my\s+current|i\s+am\s+an?\b|"
+    r"i['’]?m\s+an?\b|i\s*(?:['’]?ve|\s+have)\s+been\b.{0,60}\bfor\b)",
+    re.IGNORECASE,
+)
+_PAST_WORK_MARKER_RE = re.compile(
+    r"\b(?:previous(?:ly)?|earlier|before\s+(?:that|this|joining)|used\s+to|"
+    r"back\s+(?:in|then)|my\s+(?:last|previous|earlier|old)\s+"
+    r"(?:role|job|company|employer)|in\s+the\s+past)\b",
+    re.IGNORECASE,
+)
+
+#: Bounded claim-employer extraction: "at/with/for <ProperNoun>" (up to four
+#: capitalized tokens) plus the pre-existing "companies like/including ..."
+#: list shape. Case-sensitive proper-noun requirement keeps ordinary lowercase
+#: prose from reading as an employer claim.
+_CLAIM_EMPLOYER_RE = re.compile(
+    r"\b(?:at|with|for)\s+"
+    r"(?P<emp>[A-Z][A-Za-z0-9&.\-]*(?:\s+[A-Z][A-Za-z0-9&.\-]*){0,3})"
+)
+_CLAIM_EMPLOYER_LIST_RE = re.compile(
+    r"\b(?:companies|employers?)\s+(?:like|including)\s+([^.;]+)",
+    re.IGNORECASE,
+)
+#: Capitalized sentence-position tokens that must never read as an employer.
+_CLAIM_EMPLOYER_STOPWORDS = frozenset({
+    "i", "me", "my", "you", "your", "now", "the", "a", "an", "this", "that",
+    "example", "instance", "years", "months", "work", "working",
+})
+
+#: Total-experience claim shapes for the duration check: "N years of
+#: experience", "experience of N years", "total experience is N years". A bare
+#: tenure duration ("I was there for two years") deliberately does NOT match —
+#: comparing a single-role tenure against TOTAL résumé experience manufactures
+#: a false accusation.
+_SPOKEN_EXPERIENCE_WORD_NUMS = {
+    "one": 1.0, "two": 2.0, "three": 3.0, "four": 4.0, "five": 5.0,
+    "six": 6.0, "seven": 7.0, "eight": 8.0, "nine": 9.0, "ten": 10.0,
+}
+_SPOKEN_EXPERIENCE_RES = (
+    re.compile(
+        r"\b(?P<num>\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten)"
+        r"\s*(?:\+\s*)?(?:years?|yrs?)\b[\s,]*(?:of\s+)?"
+        r"(?:(?:total|overall|work|professional)\s+)?experience\b",
+        re.IGNORECASE),
+    re.compile(
+        r"\b(?:total|overall)?\s*experience\s+(?:is|of)\s+(?:around\s+|about\s+)?"
+        r"(?P<num>\d+(?:\.\d+)?|one|two|three|four|five|six|seven|eight|nine|ten)"
+        r"\s*(?:\+\s*)?(?:years?|yrs?)\b",
+        re.IGNORECASE),
+)
+
+
+def _role_classes(text: Any) -> frozenset[str]:
+    """All lexicon classes matching ``text``; empty set = unclassified."""
+    if not isinstance(text, str) or not text.strip():
+        return frozenset()
+    return frozenset(
+        name for name, pattern in _ROLE_CLASS_LEXICON if pattern.search(text)
+    )
+
+
+def _spoken_experience_years(spoken: str) -> float | None:
+    """Extract a TOTAL-experience claim in years from one spoken turn."""
+    for pattern in _SPOKEN_EXPERIENCE_RES:
+        match = pattern.search(spoken)
+        if match is None:
+            continue
+        raw = (match.group("num") or "").strip().casefold()
+        if raw in _SPOKEN_EXPERIENCE_WORD_NUMS:
+            return _SPOKEN_EXPERIENCE_WORD_NUMS[raw]
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        if 0.0 < value <= 60.0:
+            return value
+    return None
+
+
+def _resume_experience_years(resume_facts: dict) -> float | None:
+    """Bounded numeric read of the résumé's ``experience_years`` evidence."""
+    value = resume_facts.get("experience_years")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        years = float(value)
+    elif isinstance(value, str):
+        match = re.search(r"\d+(?:\.\d+)?", value)
+        if match is None:
+            return None
+        years = float(match.group(0))
+    else:
+        return None
+    return years if 0.0 < years <= 60.0 else None
+
+
+#: A "for <ProperNoun>" immediately after an application/interest verb is the
+#: TARGET company ("applying for Interview Kickstart"), not an employer claim.
+_CLAIM_EMPLOYER_TARGET_RE = re.compile(
+    r"\b(?:apply(?:ing)?|applied|interview(?:ing|ed)?|interested|looking|"
+    r"join(?:ing)?|considering)\b[^.;]{0,24}$",
+    re.IGNORECASE,
+)
+
+
+def _claimed_employers(spoken: str) -> list[str]:
+    """Bounded employer names the candidate claimed in one spoken turn."""
+    claimed: list[str] = []
+    for match in _CLAIM_EMPLOYER_RE.finditer(spoken):
+        name = " ".join(match.group("emp").split()).strip(" .,-")
+        first = name.split()[0].casefold() if name.split() else ""
+        if not name or first in _CLAIM_EMPLOYER_STOPWORDS or len(name) < 2:
+            continue
+        if _CLAIM_EMPLOYER_TARGET_RE.search(spoken[: match.start()]):
+            continue
+        claimed.append(name)
+        if len(claimed) >= 5:
+            break
+    list_match = _CLAIM_EMPLOYER_LIST_RE.search(spoken)
+    if list_match:
+        for part in re.split(r",|\band\b", list_match.group(1)):
+            name = " ".join(part.split()).strip(" .,-")
+            if name and len(name) >= 2 and name.casefold() not in _CLAIM_EMPLOYER_STOPWORDS:
+                claimed.append(name)
+            if len(claimed) >= 10:
+                break
+    return list(dict.fromkeys(claimed))
+
+
+def _employer_matches(claimed: str, resume_employer: str) -> bool:
+    """Casefold containment in EITHER direction (STT truncation tolerant)."""
+    a = claimed.casefold()
+    b = resume_employer.casefold()
+    return bool(a) and bool(b) and (a in b or b in a)
+
+
 def phone_deterministic_resume_conflict(
     answer: Any, resume_facts: Any,
 ) -> dict[str, str] | None:
     """Return one obvious role-history mismatch, otherwise defer to assessment.
 
     The live conflict judge is intentionally asynchronous. Letting its result
-    interrupt an unrelated later topic produced the latest call's unnatural
-    CRM→resume jump. This local detector covers the high-confidence shape from
-    that call (a multi-year sales/advisor claim against a different current
-    résumé role); ambiguous semantic results remain assessment-only.
+    interrupt an unrelated later topic produced the earlier call's unnatural
+    CRM→resume jump, so obvious conflicts are caught synchronously here.
+
+    FIX 3 (SE-call RCA 2026-09-07): the old claim-side gate matched ONLY
+    ``sales|advisor|advisory|counselling`` words, so a software-engineer claim
+    against a sales résumé (the live SE call) could never fire. Generalized to
+    a small role-CLASS lexicon (title mismatch fires only when BOTH the spoken
+    claim and the résumé role classify AND the classes are disjoint; unknown →
+    None), the employer-list comparison hoisted out of the sales branch, a
+    bounded ``at/with/for <ProperNoun>`` claim-employer extraction added, and a
+    total-experience divergence check (≥2 years or ≥50% vs the résumé's
+    ``experience_years``). False-positive containment: employer/title checks
+    run only for CURRENT-work claims; ambiguous shapes remain assessment-only.
     """
     if not isinstance(answer, str) or not isinstance(resume_facts, dict):
         return None
     spoken = " ".join(answer.split())[:300]
-    if not spoken or _DURATION_ANSWER_RE.search(spoken) is None:
-        return None
-    if not re.search(r"\b(?:sales|advisor|advisory|counselling)\b", spoken, re.IGNORECASE):
+    if not spoken:
         return None
 
     role: str | None = None
@@ -5346,43 +5608,75 @@ def phone_deterministic_resume_conflict(
             title = candidate.get("title")
             if isinstance(title, str) and title.strip():
                 role = title.strip()
-    if role is None:
-        return None
     resume_employers: list[str] = []
     if isinstance(recent, dict):
         employer = recent.get("employer")
         if isinstance(employer, str) and employer.strip():
             resume_employers.append(employer.strip())
-    for prior in resume_facts.get("prior_roles", []):
+    prior_roles = resume_facts.get("prior_roles")
+    for prior in prior_roles if isinstance(prior_roles, list) else []:
         if isinstance(prior, dict):
             employer = prior.get("employer")
             if isinstance(employer, str) and employer.strip():
                 resume_employers.append(employer.strip())
     unique_employers = list(dict.fromkeys(resume_employers))
-    if re.search(r"\b(?:sales|advisor|advisory|counsell)\w*\b", role, re.IGNORECASE):
-        # A claimed employer list that is absent from every structured resume
-        # employer is still a high-confidence source conflict, even when the
-        # resume role itself is compatible.
-        claim_list = re.search(
-            r"\b(?:companies|employers?)\s+(?:like|including)\s+([^.;]+)",
-            spoken, re.IGNORECASE,
-        )
-        if claim_list and unique_employers:
-            claimed = claim_list.group(1).casefold()
-            if not any(employer.casefold() in claimed for employer in unique_employers):
+
+    # CURRENT-work claim containment for the employer/title checks: an explicit
+    # current marker, or a duration-bearing claim with no explicit past marker.
+    is_current_claim = bool(_CURRENT_WORK_MARKER_RE.search(spoken)) or (
+        _DURATION_ANSWER_RE.search(spoken) is not None
+        and not _PAST_WORK_MARKER_RE.search(spoken)
+    )
+
+    if is_current_claim:
+        # (1) Title-class mismatch: both sides must classify, classes disjoint.
+        spoken_classes = _role_classes(spoken)
+        resume_classes = _role_classes(role)
+        if (
+            spoken_classes and resume_classes
+            and not (spoken_classes & resume_classes)
+            and role is not None
+        ):
+            employer_suffix = (
+                f"; resume employers: {', '.join(unique_employers)}"
+                if unique_employers else ""
+            )
+            return {
+                "resume_fact": (
+                    f"Current or most recent resume role: {role}{employer_suffix}"
+                )[:300],
+                "spoken_claim": spoken,
+            }
+        # (2) Employer mismatch (hoisted out of the old sales-only branch): the
+        # candidate names current employers and NONE of them appears in the
+        # structured résumé employers (containment both directions).
+        if unique_employers:
+            claimed = _claimed_employers(spoken)
+            if claimed and not any(
+                _employer_matches(claim, employer)
+                for claim in claimed for employer in unique_employers
+            ):
                 return {
-                    "resume_fact": f"Resume employers: {', '.join(unique_employers)}"[:300],
+                    "resume_fact": (
+                        f"Resume employers: {', '.join(unique_employers)}"
+                    )[:300],
                     "spoken_claim": spoken,
                 }
-        return None
-    employer_suffix = (
-        f"; resume employers: {', '.join(unique_employers)}"
-        if unique_employers else ""
-    )
-    return {
-        "resume_fact": f"Current or most recent resume role: {role}{employer_suffix}"[:300],
-        "spoken_claim": spoken,
-    }
+
+    # (3) Total-experience divergence: spoken TOTAL-experience claim vs the
+    # résumé's experience_years; fires at ≥2 years or ≥50% divergence.
+    spoken_years = _spoken_experience_years(spoken)
+    resume_years = _resume_experience_years(resume_facts)
+    if spoken_years is not None and resume_years is not None:
+        divergence = abs(spoken_years - resume_years)
+        if divergence >= 2.0 or divergence >= 0.5 * resume_years:
+            return {
+                "resume_fact": (
+                    f"Resume total experience: about {resume_years:g} years"
+                )[:300],
+                "spoken_claim": spoken,
+            }
+    return None
 
 
 # ── Name / identity consistency (conservative, fail-silent) ───────────────────
@@ -5990,7 +6284,7 @@ def phone_generated_prefix_authorized(
 def phone_generated_reply_rejection_reason(
     speech: Any, objective_text: Any, *, allow_closing: bool,
     control_text: Any = None, max_question_acts: int = 1,
-    candidate_text: Any = None,
+    candidate_text: Any = None, enforce_objective: bool = False,
 ) -> str | None:
     """Return a sanitized reason for rejecting a generated phone reply.
 
@@ -6007,6 +6301,18 @@ def phone_generated_reply_rejection_reason(
     candidate raised is not bot-initiated drift. A genuine comp probe on a
     non-comp objective with a candidate turn that never mentioned comp is still
     rejected. Absent/None preserves the historical behaviour exactly.
+
+    ``enforce_objective`` (FIX 2, SE-call RCA 2026-09-07): when True and the
+    turn is not closing-allowed, a reply whose question clause does not reach
+    the authorized objective is rejected as ``objective_drift`` — the SE call
+    proved a whole reply can wander off the owed plan question with every other
+    check green. Default False preserves every historical caller: ONLY the
+    plan-pursuit generation phase opts in (conflict / name-confirm / reanchor
+    turns are exempt at the call site — their objective is remedial text, not
+    the plan question). ``phone_generated_objective_covered`` fails open (True)
+    on custom/unmatched objectives, so a recruiter's custom question can never
+    be rejected by this check. A rejection lands in the existing
+    ``_on_generation_empty`` recovery, which speaks the authorized question.
     """
     ceiling = max_question_acts if isinstance(max_question_acts, int) and max_question_acts >= 1 else 1
     if not isinstance(speech, str) or not any(ch.isalpha() for ch in speech):
@@ -6031,6 +6337,14 @@ def phone_generated_reply_rejection_reason(
         and not phone_candidate_introduced_compensation(candidate_text)
     ):
         return "compensation_drift"
+    # FIX 2 (SE-call RCA 2026-09-07): plan-pursuit turns only (see docstring).
+    # `phone_generated_objective_covered` fails open on custom objectives.
+    if (
+        enforce_objective
+        and not allow_closing
+        and not phone_generated_objective_covered(compact, objective_text)
+    ):
+        return "objective_drift"
     # REMOVED (2026-09-03): the exact-match `conflict_clarification_drift` clause
     # rejected any conflict-turn reply that was not PHONE_RESUME_CONFLICT_
     # CLARIFICATION_TEXT character-for-character — while phone_judge_turn_
@@ -6050,13 +6364,13 @@ def phone_generated_reply_rejection_reason(
 def phone_generated_reply_authorized(
     speech: Any, objective_text: Any, *, allow_closing: bool,
     control_text: Any = None, max_question_acts: int = 1,
-    candidate_text: Any = None,
+    candidate_text: Any = None, enforce_objective: bool = False,
 ) -> bool:
     """Fail closed on clear action/objective violations, not natural wording."""
     return phone_generated_reply_rejection_reason(
         speech, objective_text, allow_closing=allow_closing,
         control_text=control_text, max_question_acts=max_question_acts,
-        candidate_text=candidate_text,
+        candidate_text=candidate_text, enforce_objective=enforce_objective,
     ) is None
 
 
@@ -6911,6 +7225,13 @@ async def judge_phone_coverage(
     attempts = 1 + phone_judge_retries()
     backoff = phone_judge_retry_backoff_sec()
     parsed: PhoneCoverageVerdict | None = None
+    # FIX 4 (SE-call RCA 2026-09-07): the bare `except` collapsed provider
+    # TIMEOUTS and real faults into one "judge_error" bucket, so a judge that
+    # was simply too slow for the deadline was indistinguishable from one that
+    # was broken. Split them: a timeout fails toward `judge_timeout`, any other
+    # exception (or an unparseable body) stays `judge_error`. The failure
+    # category of the LAST attempt is what the verdict carries.
+    failure_category = "judge_error"
     for attempt in range(attempts):
         started = time_module.monotonic()
         _log.info(
@@ -6923,8 +7244,15 @@ async def judge_phone_coverage(
                 timeout=_PHONE_COVERAGE_PROVIDER_TIMEOUT_SEC + 0.25,
             )
             parsed = parse_phone_coverage_verdict(raw)
+        except asyncio.TimeoutError:
+            parsed = None
+            failure_category = "judge_timeout"
         except Exception:  # noqa: BLE001
             parsed = None
+            failure_category = "judge_error"
+        else:
+            if parsed is None:
+                failure_category = "judge_error"
         duration = max(0.0, time_module.monotonic() - started)
         _log.info(
             "unknown_event", error_type="phone_coverage_judge_attempt",
@@ -6935,7 +7263,7 @@ async def judge_phone_coverage(
             return parsed
         if attempt + 1 < attempts and backoff > 0:
             await asyncio.sleep(backoff)
-    return PhoneCoverageVerdict(False, None, "judge_error")
+    return PhoneCoverageVerdict(False, None, failure_category)
 
 
 _HESITATION_ONLY_RE = re.compile(
@@ -7699,6 +8027,15 @@ def phone_agent_class(agent_base: Any) -> Any:
                     self._generation_phase,
                 ),
                 candidate_text=self._generation_candidate_text,
+                # FIX 2 (SE-call RCA 2026-09-07): objective-coverage enforcement
+                # is PHASE-GATED to plan-pursuit turns only. "screening" is the
+                # `set_question_reply_snapshot` default phase carried by every
+                # ordinary planned-question turn; conflict ("resume_conflict",
+                # which also carries reanchor turns), "name_confirm",
+                # "wind_down", QnA and closing phases stay exempt — their
+                # authorized objective is remedial/confirmation text that the
+                # plan-question contracts were never written for.
+                enforce_objective=(self._generation_phase == "screening"),
             )
             if rejection_reason is None:
                 for chunk in held:
