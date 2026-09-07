@@ -150,6 +150,26 @@ PHONE_CONTINUATION_SETTLE_SEC = 0.65
 # a monologue longer than this bound it fires anyway rather than going silent.
 # Module constant (not env) so tests can patch it alongside the audio timeout.
 PHONE_WATCHDOG_SPEECH_DEFER_MAX_SEC = 6.0
+# F-P0b (Codex review §9, 2026-09-07): the closing-state VAD policy for the
+# `completed` pre-delete path. Deleting the room kills the SIP audio instantly;
+# the goodbye tail-grace protected the BOT's last words but nothing checked the
+# CANDIDATE's — a goodbye latch + grace could still delete the room while the
+# candidate was mid-sentence. Before a completed-teardown delete, the worker
+# now waits for end-of-speech while local VAD shows the candidate actively
+# speaking, or speech that ended less than RECENT_SEC ago (they may be pausing
+# between clauses) — bounded by WAIT_MAX_SEC so a monologue can never hold the
+# room open indefinitely. ONLY the `completed` path defers: explicit candidate
+# end requests (HALT_CANDIDATE_ENDED) and disconnects keep their immediate
+# handling. Module constants (not env) so tests can patch them, matching
+# PHONE_WATCHDOG_SPEECH_DEFER_MAX_SEC.
+PHONE_CLOSE_VAD_RECENT_SEC = 1.0
+PHONE_CLOSE_VAD_WAIT_MAX_SEC = 8.0
+# Finding E lifecycle (Codex review §7, 2026-09-07): how many times a
+# name-confirmation turn may be AUTHORED for one mismatch key before an
+# undelivered confirmation is recorded "unresolved" instead of re-authored.
+# 2 matches the existing bounded re-ask caps (answer gate, delivery gate,
+# conflict re-pursuits). Module constant (not env) so tests can patch it.
+PHONE_NAME_CONFIRM_MAX_AUTHORS = 2
 
 
 def _bounded_float_env(name: str, default: float, lo: float, hi: float) -> float:
@@ -456,6 +476,55 @@ def _emit_phone_headline_latency(
         return None
 
 
+def _phone_boundary_disposition(boundary: Mapping[str, Any]) -> str | None:
+    """Finding B (Codex review §4): derive the truthful per-key outcome.
+
+    Computed at COMMIT time from the signals the boundary already carries
+    (honest ``ask_delivered``, the Finding D dimensions, the bounded-skip
+    mark), and recorded durably on the progress row — because cursor
+    advancement must not imply asked or covered. Returns ``None`` for a
+    boundary that carries no dimension signals at all (the tool-first lane,
+    legacy/test shapes): NULL in the row is an honest "not measured", never a
+    guessed enum member.
+
+    The mapping, in precedence order:
+      * ask NOT delivered + volunteered evidence  → volunteered_with_evidence
+      * ask NOT delivered + bounded-skip mark     → skipped_bounded
+      * ask NOT delivered otherwise               → not_delivered
+      * delivered + explicit decline              → asked_declined
+      * delivered + evidence, or answered ON-topic → asked_answered
+        (evidence outranks the broad disposition: a mixed answer+question
+        turn whose values survived — Finding D — was ANSWERED)
+      * delivered otherwise                       → asked_unanswered
+        (includes the re-ask-cap advance AND off-topic substantive speech —
+        the broad `answered` predicate is not evidence of topical coverage)
+    """
+    # The Finding D dimensions are the mapping's evidence; a boundary that
+    # never measured them (legacy/test seams seeding the raw pending dict,
+    # whose INITIAL shape carries only ask_delivered=False) must record NULL,
+    # not a guessed "not_delivered".
+    if "answer_disposition" not in boundary:
+        return None
+    ask_delivered = boundary.get("ask_delivered") is True
+    answer_disposition = boundary.get("answer_disposition")
+    topic_relation = boundary.get("topic_relation")
+    evidence = boundary.get("answer_evidence") is True
+    if not ask_delivered:
+        if evidence:
+            return "volunteered_with_evidence"
+        if boundary.get("bounded_skip") is True:
+            return "skipped_bounded"
+        return "not_delivered"
+    if answer_disposition == phone.PHONE_ANSWER_DECLINED:
+        return "asked_declined"
+    if evidence or (
+        answer_disposition == phone.PHONE_ANSWER_ANSWERED
+        and topic_relation != "unrelated"
+    ):
+        return "asked_answered"
+    return "asked_unanswered"
+
+
 def _new_phone_call_metrics() -> dict[str, Any]:
     """Fresh per-call phone observability accumulator.
 
@@ -499,10 +568,17 @@ def _new_phone_call_metrics() -> dict[str, Any]:
             # F-Q2a (call #2 RCA, 2026-09-07): conflicts found by the SYNC
             # deterministic detector. The live probe demonstrably played while
             # both counters above read 0/0, because only the ASYNC judge choke
-            # points bumped them; the deterministic fire sites now count here,
-            # and `conflict_probe_delivered` is also bumped when a sync-authored
-            # probe is proven delivered (`on_reply_delivered` key-presence).
+            # points bumped them; the deterministic fire sites now count here.
             "conflict_found_deterministic": 0,
+            # Codex review Finding F (2026-09-07): the funnel separates
+            # SCHEDULED (a probe was armed/selected for delivery — bumped at
+            # the single `_arm_conflict_delivery` choke point, every origin)
+            # from DELIVERED (the probe demonstrably PLAYED — bumped only by
+            # the `on_reply_delivered` proof, every origin). The async
+            # owed-probe branch used to bump `conflict_probe_delivered` at
+            # ARMING time, so the same metric mixed scheduled and played and
+            # a probe that never made it to audio still read as delivered.
+            "conflict_probe_scheduled": 0,
             "conflict_probe_delivered": 0,
         },
     }
@@ -515,7 +591,7 @@ _PHONE_COVERAGE_JUDGE_BUCKETS: tuple[str, ...] = (
     "covered_model", "not_covered_model",
     "judge_timeout", "judge_error",
     "conflict_found", "conflict_found_deterministic",
-    "conflict_probe_delivered",
+    "conflict_probe_scheduled", "conflict_probe_delivered",
 )
 
 
@@ -2286,7 +2362,8 @@ async def _run_native_phone_screening(
     pending_conflict: dict[str, Any] = {"value": None}  # compatibility/test seam; never late-injected
     conflict_reply_pending: dict[str, Any] = {
         "value": False, "conflict": None, "repursued": False, "armed_turn": None,
-        "armed_turn_seq": None, "dropped_on_advance": False,
+        "armed_turn_seq": None, "armed_exchange_id": None,
+        "dropped_on_advance": False,
     }
     # W2 (2026-09-05) BOUNDED CONFLICT-RESOLUTION LOOP. The old design used the
     # `repursued` boolean above as a ONE-SHOT latch: after a single re-pursuit
@@ -2308,6 +2385,36 @@ async def _run_native_phone_screening(
     # moved on (freshness bound), preserving the anti-stale-clarification
     # invariant the ~3029-3038 comment protects.
     native_turn_seq: list[int] = [0]
+    # ── Finding C (Codex review §5): FIRST-CLASS EXCHANGE IDENTITY ──────────
+    # Native STT sequence numbers were substituting for exchange identity: a
+    # LOGICAL exchange (the candidate's coalesced speech plus the bot's reply
+    # cycle for it) can span several native turn_seqs when STT fragments it,
+    # so machinery keyed on seq equality/membership leaks across fragments —
+    # the Call A residual hole charged a clarification continuation to a
+    # never-asked plan key because consumption stamped one seq and the commit
+    # boundary carried another.
+    #
+    # `id` increments when a candidate final STARTS a new logical exchange;
+    # `revision` counts the finals folded into the current one. Membership
+    # rule (the same STRUCTURAL continuation signal the coalescer keys on,
+    # deliberately WITHOUT the active_exchange/cursor match — that match is
+    # what the residual fragments fail): a final arriving while the prior
+    # reply is still streaming pre-first-audio and was not interrupted REVISES
+    # the current exchange; anything else begins a new one. Suppressed/stale
+    # finals may burn an id — gaps are harmless, only agreement between the
+    # consumption record and the boundary stamp matters.
+    #
+    # MIGRATED IN THIS CHANGE: the conflict-clarification fences in
+    # `commit_after_reply` (armed + consumed) key on exchange membership.
+    # NOTED FOLLOW-UPS still on turn_seq: the async judge's `armed_turn`
+    # freshness bound, `_uncount_continuation_fragment`'s seq rollback, and
+    # the QnA round budget — each has its own lifecycle and moves separately.
+    exchange_state: dict[str, int] = {"id": 0, "revision": 1}
+    #: Exchanges on which the conflict machinery CONSUMED a clarification
+    #: reply. The commit fence skips any boundary stamped with one of these —
+    #: a later FRAGMENT of the same clarification exchange can no longer be
+    #: charged to a plan key just because it arrived under a fresh turn_seq.
+    conflict_consumed_exchange_ids: set[int] = set()
     asked_conflicts: set[str] = set()
     # F-Q3a (call #2 RCA, 2026-09-07): the LOGICAL candidate-turn seqs on which
     # the conflict machinery CONSUMED a pending clarification reply (the arrival
@@ -2327,6 +2434,34 @@ async def _run_native_phone_screening(
     # the account), so it arms under its own `phone_name_mismatch_key` set. This
     # can neither shadow nor be shadowed by a live résumé conflict.
     asked_name_mismatches: set[str] = set()
+    # ── Finding E lifecycle (Codex review §7, 2026-09-07) ────────────────────
+    # `asked_name_mismatches` used to be the WHOLE lifecycle: a key entered it
+    # at AUTHOR time, so a rejected/interrupted confirmation read as already
+    # handled and the persisted identity signal froze at "armed" (Call A).
+    # Authoring, delivery, and confirmation are now tracked separately:
+    #   * `name_confirm_state[key]` — {authored: int, delivered: bool,
+    #     mismatch: dict}. `authored` counts authoring attempts (bounded by
+    #     `_NAME_CONFIRM_MAX_AUTHORS`, consistent with the existing re-ask
+    #     caps); `delivered` flips only on playout proof.
+    #   * `name_confirm_delivery` — the armed in-flight confirm turn, mirror of
+    #     `conflict_delivery` (sequence predicted at author time; delivery
+    #     proven by `on_reply_delivered` KEY-PRESENCE, the W3 idiom, so the
+    #     watchdog's canned name-confirm fallback still counts as delivery).
+    #   * `owed_name_confirm` — set when an authored confirmation was
+    #     interrupted before playout; the next authored turn re-authors it
+    #     (bounded), so an undelivered confirmation stays PENDING instead of
+    #     silently consumed. At the author cap it is recorded "unresolved".
+    #   * `name_confirm_awaiting_reply` — set at delivery; the next candidate
+    #     turn is checked ONCE against the conservative
+    #     `phone_name_confirm_reply_confirms` predicate and, on a match, the
+    #     identity signal is graded "confirmed". Purely observability — it
+    #     never routes the turn.
+    name_confirm_state: dict[str, dict[str, Any]] = {}
+    name_confirm_delivery: dict[str, Any] = {
+        "sequence": None, "key": None, "mismatch": None,
+    }
+    owed_name_confirm: dict[str, Any] = {"value": False, "mismatch": None}
+    name_confirm_awaiting_reply: dict[str, Any] = {"key": None, "mismatch": None}
     # FIX A (2026-09-06) OWED CONFLICT PROBE latch. The ASYNC coverage judge
     # (~4271) detects résumé conflicts ~1-2s after the cursor already moved. The
     # old remedy armed `conflict_reply_pending` stamped with `native_turn_seq`
@@ -2354,7 +2489,8 @@ async def _run_native_phone_screening(
         """Persist a GRADED identity signal into the observability accumulator.
 
         Not a bare bool: records the spoken/record root names, the similarity
-        ratio, and a disposition (armed | confirmed | unresolved). Keyed by
+        ratio, and a disposition (armed | delivered | confirmed | unresolved —
+        Finding E split authoring from delivery from confirmation). Keyed by
         `phone_name_mismatch_key` so a repeated intro of the same mismatch
         updates the same entry (last disposition wins) rather than duplicating.
         Best-effort — a persistence failure never perturbs the live turn.
@@ -2686,16 +2822,43 @@ async def _run_native_phone_screening(
         deterministic watchdog's extra `session.say()` fallback can no longer
         strand the arm.
 
-        F-Q2a: ``origin`` tags WHICH machinery armed this probe so the delivery
-        proof in `on_reply_delivered` can bump `conflict_probe_delivered` for the
-        SYNC deterministic sites only — the async owed-probe path already counts
-        itself at promotion time, and double-counting one delivery would corrupt
-        the found→delivered funnel the telemetry exists to expose."""
+        Finding F (Codex review §8, 2026-09-07): arming is SCHEDULING, not
+        delivery. This single writer bumps `conflict_probe_scheduled` for every
+        origin (deterministic sync, async owed promotion, LLM-authored, and
+        the re-pursuit), and `conflict_probe_delivered` is bumped ONLY by the
+        `on_reply_delivered` playout proof — also for every origin. The old
+        split (async counted "delivered" at promotion; sync counted at the
+        delivery callback) mixed scheduled and played probes in one metric.
+        ``origin`` remains as an observability tag on the armed record."""
         conflict_delivery.update({
             "sequence": speech_sequence[0] + 1,
             "key": key,
             "conflict": dict(conflict) if isinstance(conflict, dict) else None,
             "origin": origin,
+        })
+        _bump_coverage_judge_metric(call_metrics, "conflict_probe_scheduled")
+
+    def _arm_name_confirm_delivery(name_key: str, mismatch: Any) -> None:
+        """Finding E: the ONLY writer that arms name-confirm delivery tracking.
+
+        Mirrors `_arm_conflict_delivery`: called at every AUTHOR site (fresh
+        detection at the single-final and coalesce sites, and the bounded owed
+        re-author), it counts the authoring attempt and predicts the speech
+        sequence of the confirm turn. Delivery is proven separately by
+        `on_reply_delivered` (key-presence, the W3 idiom); confirmation is
+        graded separately again from the candidate's next turn. Authoring is
+        not delivery; delivery is not confirmation.
+        """
+        entry = name_confirm_state.setdefault(
+            name_key,
+            {"authored": 0, "delivered": False,
+             "mismatch": dict(mismatch) if isinstance(mismatch, dict) else None},
+        )
+        entry["authored"] = int(entry.get("authored") or 0) + 1
+        name_confirm_delivery.update({
+            "sequence": speech_sequence[0] + 1,
+            "key": name_key,
+            "mismatch": dict(mismatch) if isinstance(mismatch, dict) else None,
         })
 
     def _maybe_arm_llm_authored_conflict(reply_text: Any) -> bool:
@@ -2859,6 +3022,9 @@ async def _run_native_phone_screening(
         # `armed_turn` (the ASYNC freshness stamp): this is set for BOTH the sync
         # and async arms so the commit fence works on either path.
         conflict_reply_pending["armed_turn_seq"] = native_turn_seq[0]
+        # Finding C: the exchange-keyed twin of the stamp above — the commit
+        # fence compares boundary exchange membership against this.
+        conflict_reply_pending["armed_exchange_id"] = exchange_state["id"]
 
     def _consume_conflict_reply(turn_ctx: Any, text: str) -> bool:
         """Consume the pending conflict-probe reply; True when the ONE
@@ -2870,12 +3036,18 @@ async def _run_native_phone_screening(
         # turn can never be charged to the plan key (the clarification reply
         # belongs to the conflict loop, not to a never-asked planned question).
         conflict_consumed_turn_seqs.add(native_turn_seq[0])
+        # Finding C: record the EXCHANGE too. The clarification exchange owns
+        # EVERY fragment belonging to it — a later STT final of this same
+        # clarification arrives under a fresh turn_seq (the Call A residual
+        # hole) but the same exchange id, and the commit fence now catches it.
+        conflict_consumed_exchange_ids.add(exchange_state["id"])
         conflict_reply_pending["value"] = False
         probe_conflict = conflict_reply_pending.get("conflict")
         conflict_reply_pending["conflict"] = None
         # W3 (2026-09-05): the pending is now consumed; clear its commit-fence
         # turn stamp so a later boundary can never read a stale value.
         conflict_reply_pending["armed_turn_seq"] = None
+        conflict_reply_pending["armed_exchange_id"] = None
         # B1 round 2 FRESHNESS BOUND: an ASYNC-armed re-pursuit carries a
         # non-None `armed_turn` stamp (written by the single arming writer). It is
         # valid ONLY on the immediate next candidate turn (armed_turn + 1). If the
@@ -3005,6 +3177,7 @@ async def _run_native_phone_screening(
             dict(probe_conflict) if isinstance(probe_conflict, dict) else None
         )
         conflict_reply_pending["armed_turn_seq"] = native_turn_seq[0]
+        conflict_reply_pending["armed_exchange_id"] = exchange_state["id"]
         return _fire_conflict_repursuit(turn_ctx, repursuit, probe_conflict)
 
     def _fire_conflict_repursuit(
@@ -3134,6 +3307,21 @@ async def _run_native_phone_screening(
         prior_handle_interrupted = bool(
             getattr(reply_handle[0], "interrupted", False)
         )
+        # Finding C: advance the FIRST-CLASS exchange identity from the same
+        # synchronous structural signals, before they are cleared below. A
+        # continuation fragment (prior reply streaming pre-first-audio, not
+        # interrupted) REVISES the current exchange; anything else starts a
+        # new one. Purely additive bookkeeping — it routes nothing itself.
+        if (
+            prior_reply_started
+            and not prior_speech_first_audio
+            and not prior_turn_interrupted["value"]
+            and not prior_handle_interrupted
+        ):
+            exchange_state["revision"] += 1
+        else:
+            exchange_state["id"] += 1
+            exchange_state["revision"] = 1
         reply_started.clear()
         speech_first_audio.clear()
         generation_empty.clear()
@@ -3145,6 +3333,18 @@ async def _run_native_phone_screening(
         if finished.is_set():
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
+        # Finding E (Codex review §7): grade the ONE candidate turn that
+        # answers a DELIVERED name-confirmation. Observability only — it never
+        # routes the turn (the reply still flows through the normal gates).
+        # Read-and-clear so the broad affirmation vocabulary is consulted for
+        # exactly one turn; a non-confirming reply leaves the signal at the
+        # truthful "delivered", never an invented "confirmed".
+        if name_confirm_awaiting_reply.get("key") is not None:
+            awaiting_mismatch = name_confirm_awaiting_reply.get("mismatch")
+            name_confirm_awaiting_reply["key"] = None
+            name_confirm_awaiting_reply["mismatch"] = None
+            if phone.phone_name_confirm_reply_confirms(text, awaiting_mismatch):
+                _record_identity_signal(awaiting_mismatch, "confirmed")
         if candidate_end_requested.is_set() or phone.is_explicit_end_call_request(text):
             candidate_end_requested.set()
             reply_plan[0] = phone.PHONE_CANDIDATE_END_TEXT
@@ -3607,6 +3807,9 @@ async def _run_native_phone_screening(
                     if confirm_instruction is not None:
                         asked_name_mismatches.add(name_key)
                         _record_identity_signal(name_mismatch, "armed")
+                        # Finding E: authoring is not delivery (see the
+                        # single-final site) — track the in-flight confirm.
+                        _arm_name_confirm_delivery(name_key, name_mismatch)
                         stale_handle = reply_handle[0]
                         interrupt = getattr(stale_handle, "interrupt", None)
                         if callable(interrupt):
@@ -3697,10 +3900,16 @@ async def _run_native_phone_screening(
                         else None
                     )
                     merged_seen = answer_reask_counts.get(merged_question.key, 0)
+                    merged_dims = phone.phone_turn_dimensions(
+                        merged_question.text, merged_kind, merged_candidate,
+                    )
                     if (
-                        phone.phone_answer_disposition(
-                            merged_question.text, merged_kind, merged_candidate,
-                        ) == phone.PHONE_ANSWER_NONANSWER
+                        merged_dims["disposition"]
+                        == phone.PHONE_ANSWER_NONANSWER
+                        # Finding D: the merged utterance may CARRY the answer
+                        # alongside its counter-question — evidence survives
+                        # (same bypass as the single-final gate below).
+                        and not merged_dims["answer_evidence"]
                         and merged_seen < phone.phone_answer_gate_max_reasks()
                         and merged_seen
                         + ask_drift_reask_counts.get(merged_question.key, 0)
@@ -3873,6 +4082,31 @@ async def _run_native_phone_screening(
         # (hoisted from the boundary snapshot below) so the delivery gate and
         # the committed `coverage_hint` read the SAME signal — never recomputed.
         coverage_hint = phone.phone_coverage_precheck(question.text, prompt)
+        # ── Finding D (Codex review §6): MULTI-DIMENSIONAL TURN SIGNALS ──────
+        # One computation for the whole routing path: the disposition (the
+        # existing re-ask driver), answer evidence for the OWED objective,
+        # whether the turn ALSO asks the interviewer something, and a
+        # conservative topic relation. Real speech is frequently answer AND
+        # question at once — the reproduced defect extracted both compensation
+        # slots and then discarded them because the same utterance ended in a
+        # counter-question ("If my current CTC is 20 LPA and expected is 50
+        # LPA, can your team offer that?" → slots extracted, disposition
+        # nonanswer, values thrown away and the question re-asked). Consumers
+        # below compose these dimensions instead of forcing one category.
+        # NOTE: the `candidate_question` route block above still owns turns
+        # that are PURE questions/clarifications (no evidence rides them);
+        # widening that block is a noted follow-up, not this change.
+        question_kind = (
+            "compensation"
+            if phone.phone_is_compensation_objective(question.text)
+            else None
+        )
+        turn_dims = phone.phone_turn_dimensions(question.text, question_kind, text)
+        # Finding B: True when the delivery gate's bounded re-asks for a
+        # MANDATORY ask were exhausted THIS turn and the plan advances anyway
+        # — the durable disposition records `skipped_bounded`, the explicit
+        # "the bounded policy gave up" outcome, never a silent advance.
+        delivery_cap_exhausted = False
         # ── DELIVERY-VERIFIED COMMIT GATE (FIX 1, SE-call RCA 2026-09-07) ────
         # The commit below stamps `ask_delivered: True` from PLAYOUT alone. On
         # the live SE call the model's delivered reply drifted off the owed
@@ -3946,6 +4180,7 @@ async def _run_native_phone_screening(
                     error_category="delivery_gate_cap_reached",
                     turn_index=drift_seen,
                 )
+                delivery_cap_exhausted = True
         # ── ANSWER-GATE (owner directive, 2026-09-05) ─────────────────────────
         # The cursor may advance ONLY when the candidate ANSWERED the owed
         # question or explicitly DECLINED it. A merely-substantive non-answer (a
@@ -3965,15 +4200,26 @@ async def _run_native_phone_screening(
             and phone.phone_answer_gate_enabled()
             and not conflict_reply_pending["value"]
         ):
-            question_kind = (
-                "compensation"
-                if phone.phone_is_compensation_objective(question.text)
-                else None
-            )
-            disposition = phone.phone_answer_disposition(
-                question.text, question_kind, text,
-            )
-            if disposition == phone.PHONE_ANSWER_NONANSWER:
+            disposition = turn_dims["disposition"]
+            if (
+                disposition == phone.PHONE_ANSWER_NONANSWER
+                and turn_dims["answer_evidence"]
+            ):
+                # ── Finding D: MIXED answer + question — the values SURVIVE.
+                # The utterance both answers the owed objective (high-
+                # confidence evidence: for compensation, the slots the
+                # objective names; otherwise the narrow coverage predicate)
+                # AND asks the interviewer something, so the broad disposition
+                # reads nonanswer. Discarding the extracted values and
+                # re-asking is the reproduced defect. Fall through to the
+                # ordinary substantive path: the boundary COMMITS the real
+                # exchange, and the reply instruction below answers the
+                # candidate's question without promises before continuing.
+                _log.info(
+                    "unknown_event", error_type="phone_answer_gate",
+                    error_category="mixed_intent_evidence_commit",
+                )
+            elif disposition == phone.PHONE_ANSWER_NONANSWER:
                 seen = answer_reask_counts.get(question.key, 0)
                 # FIX 1 companion (2026-09-07): compose with the delivery
                 # gate's drift re-asks — combined holds for one key ≤ the
@@ -4003,11 +4249,42 @@ async def _run_native_phone_screening(
                             "rules."
                         ),
                     )
+                    # Finding D: a counter-question RECEIVES A RESPONSE before
+                    # the re-ask — briefly and honestly, never with promises —
+                    # instead of being brushed past. Partial compensation
+                    # evidence keeps what was given: only missing slots are
+                    # re-asked (the values already ride `compensation_slots`).
+                    reask_lead = ""
+                    if turn_dims["candidate_question"]:
+                        reask_lead = (
+                            "First give a brief, honest answer to what the "
+                            "candidate just asked — from verified context "
+                            "only, never inventing specifics and never making "
+                            "promises or commitments. Then "
+                        )
+                    missing_slot_note = ""
+                    if question_kind == "compensation" and compensation_slots:
+                        known_slots = ", ".join(sorted(compensation_slots))
+                        missing_slots = [
+                            slot for slot in ("current", "expected")
+                            if slot not in compensation_slots
+                        ]
+                        if missing_slots:
+                            missing_slot_note = (
+                                " The candidate already supplied these "
+                                "compensation slots: " + known_slots
+                                + ". Ask ONLY for the missing slot(s): "
+                                + ", ".join(missing_slots)
+                                + ". Do not ask for a known slot again."
+                            )
                     add_turn_instruction(
                         turn_ctx,
-                        "The candidate has not yet answered this question. Gently "
-                        "re-ask the SAME topic in your own words and wait; do not "
-                        "move on: " + question.spoken_text,
+                        reask_lead
+                        + ("gently re-ask" if reask_lead else
+                           "The candidate has not yet answered this question. "
+                           "Gently re-ask")
+                        + " the SAME topic in your own words and wait; do not "
+                        "move on: " + question.spoken_text + missing_slot_note,
                     )
                     _log.info(
                         "unknown_event", error_type="phone_answer_gate",
@@ -4099,6 +4376,10 @@ async def _run_native_phone_screening(
                         judge_instruction = confirm_instruction
                         judge_is_name_confirm = True
                         _record_identity_signal(name_mismatch, "armed")
+                        # Finding E: authoring is not delivery — track the
+                        # in-flight confirm turn so playout proof (or an
+                        # interruption) grades the signal truthfully.
+                        _arm_name_confirm_delivery(name_key, name_mismatch)
                         # NOTE: deliberately NOT `_arm_conflict_delivery(...)`. A
                         # name-confirmation is a SINGLE turn, not a bounded
                         # re-pursuit; arming conflict delivery would route the
@@ -4106,6 +4387,35 @@ async def _run_native_phone_screening(
                         # reply` / the conflict advance loop. Identity stays
                         # independent of the conflict path (task constraint): the
                         # confirming reply flows through the normal answer-gate.
+            # Finding E: OWED NAME-CONFIRM re-author. An authored confirmation
+            # that was interrupted before playout stays PENDING (the identity
+            # signal is intro-only and unrecoverable, so a lost confirm turn
+            # can never re-derive on its own). Re-author it on the next
+            # authored turn, bounded by PHONE_NAME_CONFIRM_MAX_AUTHORS —
+            # mirror of the owed conflict probe directly below. Runs AFTER the
+            # fresh-identity claim (a fresh mismatch outranks a stale one) and
+            # BEFORE the conflict channel (identity-first precedence, F3).
+            if judge_instruction is None and owed_name_confirm["value"]:
+                owed_mismatch = owed_name_confirm["mismatch"]
+                owed_name_confirm["value"] = False
+                owed_name_confirm["mismatch"] = None
+                if isinstance(owed_mismatch, dict):
+                    owed_name_key = phone.phone_name_mismatch_key(owed_mismatch)
+                    owed_entry = name_confirm_state.get(owed_name_key)
+                    if (
+                        owed_entry is not None
+                        and not owed_entry.get("delivered")
+                        and int(owed_entry.get("authored") or 0)
+                        < PHONE_NAME_CONFIRM_MAX_AUTHORS
+                    ):
+                        confirm_instruction = phone.phone_name_confirm_instruction(
+                            owed_mismatch,
+                        )
+                        if confirm_instruction is not None:
+                            judge_instruction = confirm_instruction
+                            judge_is_name_confirm = True
+                            _record_identity_signal(owed_mismatch, "armed")
+                            _arm_name_confirm_delivery(owed_name_key, owed_mismatch)
             # RÉSUMÉ-CONFLICT / REANCHOR channel: gated on the identity signal NOT
             # having claimed this turn (`judge_instruction is None`). When the
             # identity signal SHADOWS the conflict this turn, the conflict key is
@@ -4151,22 +4461,21 @@ async def _run_native_phone_screening(
                         if owed_instruction is not None:
                             judge_instruction = owed_instruction
                             asked_conflicts.add(owed_key)
-                            # F-Q2a: the async owed probe counts its own
-                            # delivery right below — the origin tag keeps the
-                            # `on_reply_delivered` sync bump from double-counting
-                            # this same probe.
+                            # Finding F (Codex review §8): this is the probe
+                            # being SCHEDULED (armed for the reply now being
+                            # authored), not delivered. `_arm_conflict_delivery`
+                            # counts `conflict_probe_scheduled`; the delivered
+                            # bump moved to the `on_reply_delivered` playout
+                            # proof, same as the sync deterministic path — the
+                            # old arm-time bump made a probe that never reached
+                            # audio read as delivered.
                             _arm_conflict_delivery(
                                 owed_key, owed_conflict, origin="async_owed",
                             )
                             _log.info(
                                 "unknown_event",
                                 error_type="phone_coverage_conflict",
-                                error_category="owed_conflict_probe_delivered",
-                            )
-                            # FIX 4 (2026-09-07): funnel companion to
-                            # `conflict_found` at the judge choke point.
-                            _bump_coverage_judge_metric(
-                                call_metrics, "conflict_probe_delivered",
+                                error_category="owed_conflict_probe_scheduled",
                             )
             if (
                 judge_instruction is None
@@ -4248,6 +4557,20 @@ async def _run_native_phone_screening(
             "ask_delivered": bool(ask_covers_objective or coverage_hint is True),
             "coverage_hint": coverage_hint,
             "covered_following_keys": covered_following,
+            # Finding D (Codex review §6): the independent turn dimensions ride
+            # the boundary so the durable commit can record a TRUTHFUL
+            # disposition — the broad `answered` verdict is not evidence of
+            # topical coverage (off-topic substantive speech reads
+            # topic_relation="unrelated" here and must never be recorded as
+            # covered by the consumers that feed commits).
+            "answer_disposition": turn_dims["disposition"],
+            "answer_evidence": turn_dims["answer_evidence"],
+            "candidate_question": turn_dims["candidate_question"],
+            "topic_relation": turn_dims["topic_relation"],
+            # Finding B: the delivery gate exhausted its bounded re-asks for a
+            # mandatory ask this turn — the durable outcome is an explicit
+            # `skipped_bounded`, never a silent advance.
+            "bounded_skip": delivery_cap_exhausted,
             "revision": 1,
             # W3 (2026-09-05): the LOGICAL candidate turn that captured this
             # boundary. The conflict-pending commit fence compares this against
@@ -4255,6 +4578,12 @@ async def _run_native_phone_screening(
             # commit (same or earlier turn) is never blocked, only a strictly-
             # later misrouted clarification reply.
             "turn_seq": native_turn_seq[0],
+            # Finding C: the LOGICAL EXCHANGE this boundary belongs to, and
+            # which revision of its input captured it. The commit fences key
+            # on exchange membership (turn_seq remains as the legacy fallback
+            # for seam-seeded boundaries without these fields).
+            "exchange_id": exchange_state["id"],
+            "input_revision": exchange_state["revision"],
         })
         last_advance["text"] = None
         latest_candidate_anchor[0] = None
@@ -4357,9 +4686,42 @@ async def _run_native_phone_screening(
                 turn_instruction = phone.phone_conflict_drop_advance_instruction(
                     turn_instruction
                 )
+            # Finding D (Codex review §6): a mixed answer+question turn gets
+            # its question ANSWERED before the conversation resumes — briefly,
+            # honestly, and without promises — instead of the bot re-asking or
+            # marching on as if nothing was asked. Composed as a PREFIX on the
+            # same single reply (never a second generation call).
+            # R1 (PR #260 adversarial review): gated on the DIRECTED predicate,
+            # not the broad dimension — ordinary answer openings ("What I do
+            # currently is…") match the interrogative regex but ask nothing;
+            # prefixing them invited the model to answer a question nobody
+            # asked and burned the preloaded objective on every such turn.
+            if (
+                judge_instruction is None
+                and turn_dims.get("directed_question")
+                # An anti-capitulation advance (unresolved conflict drop)
+                # outranks the answer-their-question nicety: its cold prefix
+                # must stay in the lead position its contract expects.
+                and not turn_instruction.startswith(
+                    phone.PHONE_CONFLICT_DROP_ADVANCE_PREFIX
+                )
+            ):
+                turn_instruction = (
+                    "The candidate's turn also carried a question for you. "
+                    "FIRST answer it briefly and honestly from verified "
+                    "context — never invent specifics and never make promises "
+                    "or commitments (for compensation, acknowledge their "
+                    "expectation neutrally; the hiring team owns budgets and "
+                    "bands). Then, in the same reply: " + turn_instruction
+                )
             preloaded_matches = (
                 phone.phone_objective_preemptive_enabled()
                 and judge_instruction is None
+                # A mixed-intent turn always injects: the preloaded objective
+                # context carries no answer-their-question directive. R1: the
+                # DIRECTED predicate, so an answer-form opening keeps riding
+                # the preloaded objective instead of forcing a fresh inject.
+                and not turn_dims.get("directed_question")
                 and preloaded_objective.get("text") == objective_text
             )
             if not preloaded_matches:
@@ -4452,10 +4814,27 @@ async def _run_native_phone_screening(
             {"speaker": "bot", "text": prompt, "turn_started_at_ms": latest_assistant_anchor[0]},
             {"speaker": "candidate", "text": candidate, "turn_started_at_ms": _turn_anchor_ms(message) if message is not None else None},
         ]
+        # Finding B (Codex review §4): the truthful per-key outcome is
+        # computed HERE, at commit, from the boundary's own signals, and rides
+        # the durable write. A legacy/in-memory client without the parameter
+        # keeps its old signature (probed, not assumed — the same defensive
+        # idiom `record_probe` uses).
+        commit_kwargs: dict[str, Any] = {}
+        boundary_disposition = _phone_boundary_disposition(boundary)
+        if boundary_disposition is not None:
+            try:
+                commit_params = inspect.signature(
+                    events.commit_boundary,
+                ).parameters
+            except (TypeError, ValueError):  # pragma: no cover - exotic client
+                commit_params = {}
+            if "disposition" in commit_params:
+                commit_kwargs["disposition"] = boundary_disposition
         outcome = await events.commit_boundary(
             session_id, question.key, expected_index,
             boundary["source_event_id"], turns,
             list(boundary.get("covered_following_keys") or []),
+            **commit_kwargs,
         )
         if outcome.ok and outcome.cursor == cursor and expected_index < cursor:
             # A later snapshot of the same keyed boundary finished after the
@@ -4670,11 +5049,26 @@ async def _run_native_phone_screening(
         # conflict must hold regardless of the answer-gate flag).
         boundary_turn = boundary.get("turn_seq")
         armed_turn_seq = conflict_reply_pending.get("armed_turn_seq")
-        if (
-            conflict_reply_pending["value"]
-            and isinstance(boundary_turn, int)
-            and isinstance(armed_turn_seq, int)
-            and boundary_turn > armed_turn_seq
+        # Finding C (Codex review §5): the fence keys on EXCHANGE membership.
+        # A boundary from an exchange STRICTLY AFTER the one the probe was
+        # armed/delivered on is a misrouted clarification reply; the source
+        # answer's own boundary (same or earlier exchange) is never blocked.
+        # Seam-seeded boundaries without exchange fields keep the legacy
+        # turn_seq comparison so the historical regression pins stay honest.
+        boundary_exchange = boundary.get("exchange_id")
+        armed_exchange = conflict_reply_pending.get("armed_exchange_id")
+        if conflict_reply_pending["value"] and (
+            (
+                isinstance(boundary_exchange, int)
+                and isinstance(armed_exchange, int)
+                and boundary_exchange > armed_exchange
+            )
+            or (
+                not isinstance(boundary_exchange, int)
+                and isinstance(boundary_turn, int)
+                and isinstance(armed_turn_seq, int)
+                and boundary_turn > armed_turn_seq
+            )
         ):
             _log.info(
                 "unknown_event", error_type="phone_toolless_commit",
@@ -4694,7 +5088,15 @@ async def _run_native_phone_screening(
         # commits under the same still-owed key. The SOURCE answer (which
         # detects the conflict and legitimately commits its own key) is never
         # a consumption turn, so it is never fenced here.
+        # Finding C: a boundary stamped with a CONSUMED exchange is a fragment
+        # of that clarification, whatever its turn_seq — the residual Call A
+        # hole was exactly a later final of the consumed clarification slipping
+        # past the seq-membership check under a fresh seq. The turn_seq check
+        # is retained alongside (belt: it can only fence consumption turns).
         if (
+            isinstance(boundary_exchange, int)
+            and boundary_exchange in conflict_consumed_exchange_ids
+        ) or (
             isinstance(boundary_turn, int)
             and boundary_turn in conflict_consumed_turn_seqs
         ):
@@ -4738,6 +5140,13 @@ async def _run_native_phone_screening(
                 phone.phone_answer_disposition(
                     commit_question.text, commit_kind, candidate_text,
                 ) == phone.PHONE_ANSWER_NONANSWER
+                # Finding D: mirror the live hook's mixed-intent bypass — a
+                # boundary whose utterance carries high-confidence answer
+                # evidence for its own objective COMMITS (the hook advanced it
+                # deliberately); only an evidence-free nonanswer is fenced.
+                and not phone.phone_answer_covers_objective(
+                    commit_question.text, candidate_text,
+                )
                 and answer_reask_counts.get(commit_question.key, 0)
                 < phone.phone_answer_gate_max_reasks()
                 # FIX 1 companion (2026-09-07): mirror the live hook's composed
@@ -5130,8 +5539,53 @@ async def _run_native_phone_screening(
         reason = pending_terminal_reason.get("value")
         expected_seq = pending_terminal_speech_seq.get("value")
         conflict_seq = conflict_delivery.get("sequence")
+        name_confirm_seq = name_confirm_delivery.get("sequence")
         if delivered_seq is None:
-            delivered_seq = expected_seq if expected_seq is not None else conflict_seq
+            delivered_seq = (
+                expected_seq if expected_seq is not None
+                else conflict_seq if conflict_seq is not None
+                else name_confirm_seq
+            )
+        # ── Finding E (Codex review §7): the name-confirm lifecycle proof ────
+        # Authoring is not delivery. An armed confirm turn interrupted on its
+        # OWN handle never reached the candidate: keep it PENDING (owed) under
+        # the bounded author cap, or record it unresolved at cap — the Call A
+        # signal froze at "armed" precisely because authoring consumed the one
+        # chance. A NON-interrupted delivery while the arm is present proves
+        # the confirmation was heard (KEY-PRESENCE, the W3 idiom — the
+        # watchdog's canned name-confirm fallback is a different sequence and
+        # still counts, exactly like the conflict probe's fallback delivery).
+        if name_confirm_delivery.get("key") is not None:
+            nc_key = name_confirm_delivery.get("key")
+            nc_mismatch = name_confirm_delivery.get("mismatch")
+            if interrupted:
+                if delivered_seq == name_confirm_seq:
+                    name_confirm_delivery.update({
+                        "sequence": None, "key": None, "mismatch": None,
+                    })
+                    entry = name_confirm_state.get(nc_key)
+                    authored = int((entry or {}).get("authored") or 0)
+                    if authored < PHONE_NAME_CONFIRM_MAX_AUTHORS:
+                        owed_name_confirm["value"] = True
+                        owed_name_confirm["mismatch"] = (
+                            dict(nc_mismatch) if isinstance(nc_mismatch, dict)
+                            else None
+                        )
+                    else:
+                        _record_identity_signal(nc_mismatch, "unresolved")
+            else:
+                name_confirm_delivery.update({
+                    "sequence": None, "key": None, "mismatch": None,
+                })
+                entry = name_confirm_state.get(nc_key)
+                if entry is not None:
+                    entry["delivered"] = True
+                _record_identity_signal(nc_mismatch, "delivered")
+                # The next candidate turn is graded ONCE for confirmation.
+                name_confirm_awaiting_reply["key"] = nc_key
+                name_confirm_awaiting_reply["mismatch"] = (
+                    dict(nc_mismatch) if isinstance(nc_mismatch, dict) else None
+                )
         if interrupted:
             # BARGE-IN CLEAR (W3, 2026-09-05; comment corrected in the
             # adversarial-review repair — FIX 5). A conflict probe interrupted on
@@ -5181,15 +5635,16 @@ async def _run_native_phone_screening(
             _arm_conflict_reply_pending(
                 conflict_delivery.get("conflict"), armed_turn=None,
             )
-            # F-Q2a: the probe is now PROVEN delivered. Close the deterministic
-            # found→delivered funnel here — the live call's probe demonstrably
-            # played while `conflict_probe_delivered` read 0, because only the
-            # async owed-probe promotion bumped it. Sync-armed probes only: the
-            # async path already counted itself at promotion (origin tag).
-            if conflict_delivery.get("origin") == "deterministic_sync":
-                _bump_coverage_judge_metric(
-                    call_metrics, "conflict_probe_delivered",
-                )
+            # Finding F (Codex review §8): the probe is now PROVEN delivered —
+            # this playout proof is the ONLY writer of `conflict_probe_
+            # delivered`, for EVERY origin. The async owed-probe promotion no
+            # longer counts itself at arming time (that mixed scheduled and
+            # played probes in one metric); arming counts `conflict_probe_
+            # scheduled` inside `_arm_conflict_delivery` instead, so the
+            # detected→scheduled→delivered funnel is separable after the call.
+            _bump_coverage_judge_metric(
+                call_metrics, "conflict_probe_delivered",
+            )
             conflict_delivery.update({
                 "sequence": None, "key": None, "conflict": None, "origin": None,
             })
@@ -5336,6 +5791,10 @@ async def _run_native_phone_screening(
     # the commit fence skips a boundary captured on that turn. Not read on any
     # production path.
     setattr(agent, "_conflict_consumed_turn_seqs", conflict_consumed_turn_seqs)
+    # Finding C test seams: the exchange identity cell and the exchange-keyed
+    # consumption record. Not read on any production path.
+    setattr(agent, "_exchange_state", exchange_state)
+    setattr(agent, "_conflict_consumed_exchange_ids", conflict_consumed_exchange_ids)
     # FIX A test seam (2026-09-06): the owed-conflict-probe latch, so a test can
     # arm it (as the async judge would) and prove the NEXT authored bot turn
     # delivers the conflict probe unconditionally (no turn-delta gate). Not read
@@ -5355,6 +5814,13 @@ async def _run_native_phone_screening(
     # Identity test seam (same idiom as `_asked_conflicts`): the per-name-mismatch
     # arm set, so a test can prove a name-confirm turn was / was not fired.
     setattr(agent, "_asked_name_mismatches", asked_name_mismatches)
+    # Finding E test seams: the authored/delivered lifecycle state, the armed
+    # in-flight confirm tracker, the owed re-author latch, and the one-turn
+    # confirmation grader input. Not read on any production path.
+    setattr(agent, "_name_confirm_state", name_confirm_state)
+    setattr(agent, "_name_confirm_delivery", name_confirm_delivery)
+    setattr(agent, "_owed_name_confirm", owed_name_confirm)
+    setattr(agent, "_name_confirm_awaiting_reply", name_confirm_awaiting_reply)
     # Answer-gate test seam: the per-question-key re-ask counter, so a test can
     # seed it at the cap and prove the bounded advance.
     setattr(agent, "_answer_reask_counts", answer_reask_counts)
@@ -5557,6 +6023,110 @@ async def _run_native_phone_screening(
     # network time has already elapsed — so the common path adds no dead-air.
     goodbye_finished_monotonic = time.monotonic()
 
+    async def _persist_observability_snapshot() -> None:
+        """Finding H (Codex review §10): persist the snapshot on EVERY exit.
+
+        The metrics snapshot used to be prepared and submitted only inside the
+        ``reason == "completed"`` completion loop; a candidate hangup,
+        disconnect, or recovery exit reached the API with
+        ``observability = {}`` (Call B, 2026-09-07). This helper posts the
+        same compact summary through the standalone observability endpoint:
+
+          * best-effort — a failure never changes terminal handling;
+          * idempotent — full-replace server-side, and the server refuses an
+            EMPTY snapshot so good data is never overwritten by nothing;
+          * bounded — one post per exit, no retry loop.
+
+        The ``completed`` leg keeps riding the completion body (verified,
+        retried); this helper is its fallback when that loop never landed.
+        """
+        if call_metrics is None:
+            return
+        poster = getattr(events, "post_observability", None)
+        if not callable(poster):
+            return
+        try:
+            snapshot = _summarize_phone_call_metrics(call_metrics)
+            if not snapshot:
+                return
+            outcome = await poster(session_id, snapshot)
+            if not getattr(outcome, "ok", False):
+                _log.info(
+                    "unknown_event", error_type="phone_observability",
+                    error_category="snapshot_post_failed",
+                )
+        except Exception:  # noqa: BLE001
+            _log.warn(
+                "unknown_event", error_type="phone_observability",
+                error_category="snapshot_post_error",
+            )
+
+    async def _await_candidate_silence_before_delete() -> None:
+        """F-P0b (Codex review §9): never delete a completed room mid-speech.
+
+        The goodbye tail-grace protects the BOT's last audio; this protects
+        the CANDIDATE's. While local VAD shows active candidate speech — or
+        speech that ended less than PHONE_CLOSE_VAD_RECENT_SEC ago (an
+        inter-clause pause is not silence) — the completed pre-delete WAITS
+        for end-of-speech, bounded by PHONE_CLOSE_VAD_WAIT_MAX_SEC so a
+        monologue can never hold the room open indefinitely. Only the
+        `completed` path calls this: explicit candidate end requests and
+        disconnects keep their immediate handling, and an unthreaded
+        candidate_speaking (tests, legacy paths) reads "not speaking" and
+        returns at once.
+        """
+        deadline = _monotonic() + PHONE_CLOSE_VAD_WAIT_MAX_SEC
+        deferred_logged = False
+        while True:
+            speaking = bool(candidate_speaking.get("value"))
+            ended_mono = candidate_speaking.get("ended_mono")
+            recently_ended = (
+                not speaking
+                and isinstance(ended_mono, (int, float))
+                and (_monotonic() - float(ended_mono))
+                < PHONE_CLOSE_VAD_RECENT_SEC
+            )
+            if not speaking and not recently_ended:
+                return
+            remaining = deadline - _monotonic()
+            if remaining <= 0:
+                _log.info(
+                    "unknown_event", error_type="phone_room_teardown",
+                    error_category="close_vad_wait_timeout",
+                )
+                return
+            if not deferred_logged:
+                deferred_logged = True
+                _log.info(
+                    "unknown_event", error_type="phone_room_teardown",
+                    error_category="close_deferred_candidate_speaking",
+                )
+            if speaking:
+                # Clear-then-recheck so an end-of-speech landing between the
+                # flag read and the wait can never be missed (the F-Q4a idiom).
+                candidate_speech_ended.clear()
+                if not candidate_speaking.get("value"):
+                    continue
+                try:
+                    await asyncio.wait_for(
+                        candidate_speech_ended.wait(), timeout=remaining,
+                    )
+                except asyncio.TimeoutError:
+                    continue
+            else:
+                # Recently ended: sleep out the recency window (bounded by the
+                # shared deadline) and re-check.
+                await asyncio.sleep(
+                    min(PHONE_CLOSE_VAD_RECENT_SEC, max(remaining, 0.0)),
+                )
+
+    if reason != "completed":
+        # Every non-completed terminal exit (candidate hangup, no-answer,
+        # malformed, disconnect, retryable recovery, aborts) persists its
+        # snapshot HERE, before the per-reason branches below (the disconnect
+        # branch returns early inside them).
+        await _persist_observability_snapshot()
+
     if reason == "completed":
         done = None
         queue_owned = False
@@ -5593,6 +6163,13 @@ async def _run_native_phone_screening(
                 # queue worker; this worker never re-drives scoring.
                 queue_owned = True
                 break
+        if not queue_owned and (done is None or not done.ok):
+            # Finding H fallback: the completion loop never landed (transport
+            # failure or a non-score refusal such as `plan_incomplete`), so the
+            # snapshot it carried was never written. Post it standalone —
+            # idempotent, and a later successful completion leg simply
+            # re-replaces it with the same data.
+            await _persist_observability_snapshot()
         if queue_owned:
             # ── QUEUED SCORING: CLOSE THE LEG, HAND THE HOLD TO THE CALLER ───
             # The old behavior returned straight through the caller's finally,
@@ -5605,6 +6182,9 @@ async def _run_native_phone_screening(
             # first would delay the recording upload by up to the hold budget,
             # long enough for the finalize deferrals to exhaust and latch a
             # recording that was about to arrive (review find, 2026-09-03).
+            # F-P0b: the candidate may still be mid-sentence (a late thanks,
+            # a question racing the goodbye) — wait for end-of-speech, bounded.
+            await _await_candidate_silence_before_delete()
             close_grace = phone.PHONE_CLOSE_TAIL_GRACE_SEC - (
                 time.monotonic() - goodbye_finished_monotonic
             )
@@ -5692,6 +6272,9 @@ async def _run_native_phone_screening(
     # reason to `other_failure`, making a candidate goodbye and a crash
     # indistinguishable in the one log line that says WHY a room was deleted).
     if reason == "completed":
+        # F-P0b: the closing-state VAD check runs BEFORE the tail grace — the
+        # room must not come down while the candidate is audibly mid-sentence.
+        await _await_candidate_silence_before_delete()
         # Pre-delete tail grace, minus whatever the completion round-trips
         # already spent: deleting the room kills the SIP audio buffers
         # instantly and a goodbye clipped on its last words is perceived as a
@@ -5954,7 +6537,10 @@ async def _run_phone_session(
             return
         # F-Q4a: the candidate stopped speaking — release any deferred
         # watchdog recovery say() before the latency bookkeeping below.
+        # F-P0b: stamp WHEN speech ended so the completed pre-delete path can
+        # treat very recent speech (an inter-clause pause) as still-active.
         candidate_speaking["value"] = False
+        candidate_speaking["ended_mono"] = _monotonic()
         candidate_speech_ended.set()
         now_wall = time.time()
         latency_state["local_vad_end_wall"] = now_wall
@@ -6077,6 +6663,7 @@ async def _run_phone_session(
             candidate_speaking["value"] = True
         elif old_state == "speaking" and new_state in {"listening", "idle"}:
             candidate_speaking["value"] = False
+            candidate_speaking["ended_mono"] = _monotonic()
             candidate_speech_ended.set()
         if old_state == "speaking" and new_state in {"listening", "idle"}:
             # Explicit VAD observation is the authoritative local boundary. The

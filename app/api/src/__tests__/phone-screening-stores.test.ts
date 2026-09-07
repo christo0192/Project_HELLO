@@ -396,6 +396,26 @@ describe('objective coverage adapter', () => {
     });
     expect(result.cursor).toBe(2);
   });
+
+  it('0086 (Finding B): a disposition rides the RPC args; omission omits the key', async () => {
+    const { client, calls } = fakeClient({ status: 'applied', applied: true, cursor: 1 });
+    await createPhoneStores(client).commitQuestionBoundary({
+      sessionId: 's', questionKey: 'k1', expectedIndex: 0,
+      sourceEventId: 'q:k1',
+      turns: [{ speaker: 'bot', text: 'Q?' }, { speaker: 'candidate', text: 'A.' }],
+      disposition: 'asked_declined', now: NOW,
+    });
+    expect(calls[0].args).toMatchObject({ p_disposition: 'asked_declined' });
+    // Omitted: the key is ABSENT (the RPC default records NULL), never null.
+    const { client: c2, calls: calls2 } = fakeClient({ status: 'applied', applied: true, cursor: 1 });
+    await createPhoneStores(c2).commitQuestionBoundary({
+      sessionId: 's', questionKey: 'k1', expectedIndex: 0,
+      sourceEventId: 'q:k1',
+      turns: [{ speaker: 'bot', text: 'Q?' }, { speaker: 'candidate', text: 'A.' }],
+      now: NOW,
+    });
+    expect('p_disposition' in (calls2[0].args as Record<string, unknown>)).toBe(false);
+  });
 });
 
 describe('errors and malformed answers', () => {

@@ -30,6 +30,7 @@ import type {
   ClearPhoneAttemptRecordingsStatus,
   StampPhoneSessionEgressStatus,
   CommitPhoneQuestionBoundaryStatus,
+  PhoneBoundaryDisposition,
   CommitPhoneQuestionBoundaryWithCoverageStatus,
   GetPhoneAssessmentStateStatus,
   RecordPhoneProbeStatus,
@@ -551,6 +552,12 @@ export interface CommitPhoneQuestionBoundaryInput {
   readonly turns: readonly PhoneBoundaryTurn[];
   /** Contiguous future objectives covered by the same real candidate answer. */
   readonly coveredQuestionKeys?: readonly string[];
+  /**
+   * 0086 (Finding B): the worker-computed truthful per-key outcome, recorded
+   * on the progress row at commit. Optional — an older worker (or the
+   * tool-first lane, which measures none) omits it and the row records NULL.
+   */
+  readonly disposition?: PhoneBoundaryDisposition;
   readonly now: Date;
 }
 

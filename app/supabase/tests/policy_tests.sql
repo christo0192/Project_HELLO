@@ -11651,7 +11651,7 @@ begin
 
   -- The model tries to answer the SECOND question first.
   v_res := screening_v2.commit_phone_question_boundary(
-             v_ids[3], 'k2', 0, 'ev-skip', v_turns, '2026-09-01T06:01:00Z'::timestamptz);
+             v_ids[3], 'k2', 0, 'ev-skip', v_turns, p_now => '2026-09-01T06:01:00Z'::timestamptz);
   perform _policy_tests.assert(
     '0044-D4: a key that is not the one the cursor owes is refused, and names the one owed',
     v_res ->> 'status' = 'key_not_current'
@@ -11662,14 +11662,14 @@ begin
 
   -- A stale cursor, and an ABSENT one, are both refused.
   v_res := screening_v2.commit_phone_question_boundary(
-             v_ids[3], 'k1', 1, 'ev-stale', v_turns, '2026-09-01T06:01:00Z'::timestamptz);
+             v_ids[3], 'k1', 1, 'ev-stale', v_turns, p_now => '2026-09-01T06:01:00Z'::timestamptz);
   perform _policy_tests.assert(
     '0044-D4: a stale expected index is refused and reports the real cursor',
     v_res ->> 'status' = 'stale_cursor' and (v_res ->> 'cursor')::int = 0
     and not exists (select 1 from screening_v2.transcript_turns where session_id = v_ids[3]),
     'stale cursor not refused: ' || v_res::text);
   v_res := screening_v2.commit_phone_question_boundary(
-             v_ids[3], 'k1', null, 'ev-null', v_turns, '2026-09-01T06:01:00Z'::timestamptz);
+             v_ids[3], 'k1', null, 'ev-null', v_turns, p_now => '2026-09-01T06:01:00Z'::timestamptz);
   perform _policy_tests.assert(
     '0044-D4: an OMITTED expected index is refused too — an absent CAS is not a weaker one',
     v_res ->> 'status' = 'stale_cursor',
@@ -11682,7 +11682,7 @@ begin
                {"speaker":"candidate","text":"About four."},
                {"speaker":"bot","text":"Four in total, or four in this stack?"},
                {"speaker":"candidate","text":"Four in this stack."}]'::jsonb,
-             '2026-09-01T06:02:00Z'::timestamptz);
+             p_now => '2026-09-01T06:02:00Z'::timestamptz);
   perform _policy_tests.assert(
     '0044-D4: a boundary appends every turn, records the key and advances the cursor, once',
     v_res ->> 'status' = 'applied'
@@ -11705,7 +11705,7 @@ begin
 
   -- The SAME source_event_id returns the ORIGINAL success and writes nothing.
   v_res := screening_v2.commit_phone_question_boundary(
-             v_ids[3], 'k1', 0, 'ev-1', v_turns, '2026-09-01T06:03:00Z'::timestamptz);
+             v_ids[3], 'k1', 0, 'ev-1', v_turns, p_now => '2026-09-01T06:03:00Z'::timestamptz);
   perform _policy_tests.assert(
     '0044-D4: a duplicate boundary returns the ORIGINAL success and appends nothing',
     v_res ->> 'status' = 'applied'
@@ -11751,7 +11751,7 @@ begin
              v_ids[3], 'k1', 0, 'ev-coverage-1',
              '[{"speaker":"bot","text":"First?"},
                {"speaker":"candidate","text":"First and second answered."}]'::jsonb,
-             array['k2'], '2026-09-01T06:01:00Z'::timestamptz);
+             array['k2'], p_now => '2026-09-01T06:01:00Z'::timestamptz);
   perform _policy_tests.assert(
     '0044-D4b: coverage returns and persists cursor 2 after k1 plus k2',
     v_res ->> 'status' = 'applied'
@@ -11767,7 +11767,7 @@ begin
              v_ids[3], 'k3', 2, 'ev-coverage-2',
              '[{"speaker":"bot","text":"Third?"},
                {"speaker":"candidate","text":"Third answered."}]'::jsonb,
-             '{}'::text[], '2026-09-01T06:02:00Z'::timestamptz);
+             '{}'::text[], p_now => '2026-09-01T06:02:00Z'::timestamptz);
   perform _policy_tests.assert(
     '0044-D4b: the next boundary accepts the persisted covered cursor',
     v_res ->> 'status' = 'applied'
@@ -11812,7 +11812,7 @@ begin
   loop
     v_res := screening_v2.commit_phone_question_boundary(
                v_ids[3], 'k1', 0, 'ev-' || v_case.label, v_case.turns::jsonb,
-               '2026-09-01T06:01:00Z'::timestamptz);
+               p_now => '2026-09-01T06:01:00Z'::timestamptz);
     if v_res ->> 'status' <> 'invalid_turns' then
       v_bad := v_bad || v_case.label || '=' || coalesce(v_res ->> 'status','null') || ' ';
     end if;
@@ -11854,7 +11854,7 @@ begin
     perform screening_v2.commit_phone_question_boundary(
               v_ids[3], 'k1', 0, 'ev-rollback',
               '[{"speaker":"bot","text":"A?"},{"speaker":"candidate","text":"Y"}]'::jsonb,
-              '2026-09-01T06:04:00Z'::timestamptz);
+              p_now => '2026-09-01T06:04:00Z'::timestamptz);
     v_bad := 'commit-succeeded';
   exception when others then
     v_bad := '';
@@ -11876,7 +11876,7 @@ begin
   perform screening_v2.commit_phone_question_boundary(
             v_ids[3], 'k1', 0, 'ev-rollback',
             '[{"speaker":"bot","text":"A?"},{"speaker":"candidate","text":"Y"}]'::jsonb,
-            '2026-09-01T06:05:00Z'::timestamptz);
+            p_now => '2026-09-01T06:05:00Z'::timestamptz);
   perform _policy_tests.assert(
     '0044-D5: CONTROL — the same boundary commits once the injected failure is gone',
     (select count(*) from screening_v2.transcript_turns where session_id = v_ids[3]) = 2
@@ -11891,7 +11891,7 @@ begin
   v_res := screening_v2.commit_phone_question_boundary(
              v_ids[3], 'k1', 0, 'ev-rollback',
              '[{"speaker":"bot","text":"only half an exchange"}]'::jsonb,
-             '2026-09-01T06:06:00Z'::timestamp with time zone);
+             p_now => '2026-09-01T06:06:00Z'::timestamp with time zone);
   perform _policy_tests.assert(
     '0044-D5: a malformed body carrying a KNOWN event id is invalid_turns, not applied',
     v_res ->> 'status' = 'invalid_turns',
@@ -11903,7 +11903,7 @@ begin
   v_res := screening_v2.commit_phone_question_boundary(
              v_ids[3], 'k1', 0, 'ev-rollback',
              '[{"speaker":"bot","text":"A?"},{"speaker":"candidate","text":"Y"}]'::jsonb,
-             '2026-09-01T06:07:00Z'::timestamp with time zone);
+             p_now => '2026-09-01T06:07:00Z'::timestamp with time zone);
   perform _policy_tests.assert(
     '0044-D5: CONTROL — a WELL-FORMED duplicate still returns the original success',
     v_res ->> 'status' = 'applied' and (v_res -> 'duplicate')::boolean
@@ -11938,7 +11938,7 @@ begin
   perform screening_v2.commit_phone_question_boundary(
             v_ids[3], 'k1', 0, 'ev-1',
             '[{"speaker":"bot","text":"A?"},{"speaker":"candidate","text":"Y"}]'::jsonb,
-            '2026-09-01T06:01:00Z'::timestamptz);
+            p_now => '2026-09-01T06:01:00Z'::timestamptz);
 
   select no_answer_attempts, reconnects_used, provider_failures
     into v_no_answer, v_reconnects, v_failures
@@ -12057,7 +12057,7 @@ begin
   perform screening_v2.commit_phone_question_boundary(
             v_ids[3], 'k1', 0, 'ev-1',
             '[{"speaker":"bot","text":"A?"},{"speaker":"candidate","text":"Y"}]'::jsonb,
-            '2026-09-01T06:01:00Z'::timestamptz);
+            p_now => '2026-09-01T06:01:00Z'::timestamptz);
 
   -- The session completes. Still UNSCORED at this point.
   update screening_v2.call_sessions
@@ -12188,7 +12188,7 @@ begin
   perform screening_v2.commit_phone_question_boundary(
             v_ids[3], 'k1', 0, 'ev-1',
             '[{"speaker":"bot","text":"A?"},{"speaker":"candidate","text":"Y"}]'::jsonb,
-            '2026-09-01T06:01:00Z'::timestamptz);
+            p_now => '2026-09-01T06:01:00Z'::timestamptz);
 
   begin
     update screening_v2.phone_session_plans
@@ -13735,7 +13735,7 @@ begin
              v_ids[3], 'k1', 0, 'pol67-seq-b1',
              '[{"speaker":"bot","text":"How many years?"},
                {"speaker":"candidate","text":"Four."}]'::jsonb,
-             '2026-09-01T06:01:00Z'::timestamptz);
+             p_now => '2026-09-01T06:01:00Z'::timestamptz);
 
   select array_agg(turn_index order by turn_index),
          count(*) filter (where is_gate),
@@ -13800,7 +13800,7 @@ begin
              v_ids[3], 'k1', 0, 'pol70-resume-b1',
              '[{"speaker":"bot","text":"How many years of experience?"},
                {"speaker":"candidate","text":"About four."}]'::jsonb,
-             '2026-09-01T06:02:00Z'::timestamptz);
+             p_now => '2026-09-01T06:02:00Z'::timestamptz);
 
   v_state := screening_v2.get_phone_assessment_state(v_ids[3]);
 
@@ -14636,6 +14636,164 @@ begin
   delete from screening_v2.resumes where id in (v_res_old, v_res_new, v_res_new2);
   delete from screening_v2.ashby_job_mappings where id = v_map;
   delete from auth.users where id = v_owner;
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0086 — Durable per-key boundary DISPOSITION (Codex review Finding B)
+-- ═══════════════════════════════════════════════════════════════════════
+-- Cursor advancement must not imply asked or covered: the progress row
+-- now records WHICH truthful outcome advanced it, in the same write-once
+-- transaction as the turns and the cursor CAS.
+
+-- ── 0086-A: grants — both re-declared signatures stay service-role-only ──
+do $$
+declare v_bad text := '';
+begin
+  if has_function_privilege('anon',
+       'screening_v2.commit_phone_question_boundary(uuid, text, integer, text, jsonb, text, timestamptz)',
+       'EXECUTE')
+     or has_function_privilege('authenticated',
+       'screening_v2.commit_phone_question_boundary(uuid, text, integer, text, jsonb, text, timestamptz)',
+       'EXECUTE') then
+    v_bad := v_bad || 'base:browser_executable ';
+  end if;
+  if has_function_privilege('anon',
+       'screening_v2.commit_phone_question_boundary_with_coverage(uuid, text, integer, text, jsonb, text[], text, timestamptz)',
+       'EXECUTE')
+     or has_function_privilege('authenticated',
+       'screening_v2.commit_phone_question_boundary_with_coverage(uuid, text, integer, text, jsonb, text[], text, timestamptz)',
+       'EXECUTE') then
+    v_bad := v_bad || 'coverage:browser_executable ';
+  end if;
+  -- Exactly ONE signature each — the 0086 drop-then-create left no
+  -- defaulted overload for PostgREST to find ambiguous.
+  if (select count(*) from pg_proc p
+        join pg_namespace n on n.oid = p.pronamespace
+       where n.nspname = 'screening_v2'
+         and p.proname = 'commit_phone_question_boundary') <> 1 then
+    v_bad := v_bad || 'base:overloaded ';
+  end if;
+  if (select count(*) from pg_proc p
+        join pg_namespace n on n.oid = p.pronamespace
+       where n.nspname = 'screening_v2'
+         and p.proname = 'commit_phone_question_boundary_with_coverage') <> 1 then
+    v_bad := v_bad || 'coverage:overloaded ';
+  end if;
+  perform _policy_tests.assert(
+    '0086-A: the re-declared boundary RPCs are single-signature and never browser-executable',
+    v_bad = '', 'violations: ' || v_bad);
+end;
+$$;
+
+-- ── 0086-B: the disposition is validated, recorded, and honest ────────
+do $$
+declare
+  v_ids uuid[]; v_role uuid; v_res jsonb; v_blocked integer := 0;
+  v_turns jsonb := '[{"speaker":"bot","text":"Q?"},
+                     {"speaker":"candidate","text":"An answer."}]'::jsonb;
+begin
+  v_ids := _policy_tests.phone44_fixture('pol86-disp');
+  select role_id into v_role from screening_v2.phone_engagements where id = v_ids[1];
+  update screening_v2.roles
+     set screening_template = '[{"id":"k1","question":"First?","mandatory":true},
+                                {"id":"k2","question":"Second?","mandatory":true},
+                                {"id":"k3","question":"Third?","mandatory":true},
+                                {"id":"k4","question":"Fourth?","mandatory":true}]'::jsonb
+   where id = v_role;
+  perform screening_v2.start_phone_assessment(
+            v_ids[2], v_ids[3], '2026-09-01T06:00:00Z'::timestamptz);
+
+  -- A value outside the closed vocabulary is refused BEFORE any write.
+  v_res := screening_v2.commit_phone_question_boundary(
+             v_ids[3], 'k1', 0, 'ev-86-bad', v_turns, 'asked_maybe',
+             p_now => '2026-09-01T06:01:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0086-B: an unknown disposition is refused and nothing is written',
+    v_res ->> 'status' = 'invalid_disposition'
+    and not exists (select 1 from screening_v2.phone_session_progress
+                     where session_id = v_ids[3])
+    and not exists (select 1 from screening_v2.transcript_turns
+                     where session_id = v_ids[3])
+    and (select current_question_index from screening_v2.call_sessions
+          where id = v_ids[3]) = 0,
+    'the database must defend its own column, not trust the API schema: '
+      || v_res::text);
+
+  -- A valid member is recorded on the row it advanced.
+  v_res := screening_v2.commit_phone_question_boundary(
+             v_ids[3], 'k1', 0, 'ev-86-1', v_turns, 'asked_answered',
+             p_now => '2026-09-01T06:02:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0086-B: a valid disposition is committed with the boundary, atomically',
+    v_res ->> 'status' = 'applied'
+    and (select disposition from screening_v2.phone_session_progress
+          where session_id = v_ids[3] and question_key = 'k1') = 'asked_answered',
+    'the outcome must ride the SAME transaction as the cursor advance: '
+      || v_res::text);
+
+  -- Coverage: the spoken exchange's row carries the CALLER's outcome; the
+  -- volunteered forward-skip row records volunteered_with_evidence — true
+  -- by construction, no synthetic bot turn invented.
+  v_res := screening_v2.commit_phone_question_boundary_with_coverage(
+             v_ids[3], 'k2', 1, 'ev-86-2', v_turns, array['k3'],
+             'asked_declined', p_now => '2026-09-01T06:03:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0086-B: coverage rows are volunteered_with_evidence; the main row keeps the caller''s outcome',
+    v_res ->> 'status' = 'applied'
+    and (v_res ->> 'cursor')::int = 3
+    and (select disposition from screening_v2.phone_session_progress
+          where session_id = v_ids[3] and question_key = 'k2') = 'asked_declined'
+    and (select disposition from screening_v2.phone_session_progress
+          where session_id = v_ids[3] and question_key = 'k3') = 'volunteered_with_evidence',
+    'a forward-skip row that claimed asked would be exactly the lie 0086 exists to end: '
+      || v_res::text);
+
+  -- Omission records NULL — an honest "not measured", never a guess. An
+  -- OLD worker (or the tool-first lane) commits exactly this shape.
+  v_res := screening_v2.commit_phone_question_boundary(
+             v_ids[3], 'k4', 3, 'ev-86-3', v_turns,
+             p_now => '2026-09-01T06:04:00Z'::timestamptz);
+  perform _policy_tests.assert(
+    '0086-B: an omitted disposition records NULL, and the commit is otherwise unchanged',
+    v_res ->> 'status' = 'applied'
+    and (select disposition from screening_v2.phone_session_progress
+          where session_id = v_ids[3] and question_key = 'k4') is null
+    and (v_res ->> 'plan_complete')::boolean,
+    'an older caller must keep working through the default: ' || v_res::text);
+
+  -- RESTART RECONSTRUCTION (review §4): the durable rows carry the four
+  -- distinct outcomes a resuming reader needs — no log, no memory.
+  perform _policy_tests.assert(
+    '0086-B: a restart can reconstruct every per-key outcome from the rows alone',
+    (select array_agg(coalesce(disposition, 'NULL') order by question_index)
+       from screening_v2.phone_session_progress where session_id = v_ids[3])
+      = array['asked_answered', 'asked_declined', 'volunteered_with_evidence', 'NULL'],
+    'the outcome column is the durable record cursor advancement stopped implying');
+
+  -- Write-once holds for the new column too: no correction path.
+  begin
+    update screening_v2.phone_session_progress
+       set disposition = 'asked_answered'
+     where session_id = v_ids[3] and question_key = 'k4';
+  exception when others then v_blocked := v_blocked + 1;
+  end;
+  -- And the CHECK closes the vocabulary for a direct INSERT as well.
+  begin
+    insert into screening_v2.phone_session_progress
+      (session_id, question_key, question_index, source_event_id,
+       first_turn_index, last_turn_index, turn_count, disposition)
+    values (v_ids[3], 'k9', 9, 'ev-86-direct', 0, 1, 2, 'asked_maybe');
+  exception when others then v_blocked := v_blocked + 1;
+  end;
+  perform _policy_tests.assert(
+    '0086-B: the disposition is write-once and its vocabulary is closed at the table',
+    v_blocked = 2
+    and (select disposition from screening_v2.phone_session_progress
+          where session_id = v_ids[3] and question_key = 'k4') is null,
+    'a correctable outcome column is an outcome nobody can trust');
+
+  perform _policy_tests.phone44_teardown('pol86-disp');
 end;
 $$;
 

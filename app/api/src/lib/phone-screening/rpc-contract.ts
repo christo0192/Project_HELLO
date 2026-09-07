@@ -157,6 +157,9 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
       'p_expected_index',
       'p_source_event_id',
       'p_turns',
+      // 0086 (Finding B): defaulted, BEFORE p_now — time injection stays the
+      // final parameter of every time-dependent RPC (contract invariant).
+      'p_disposition',
       'p_now',
     ],
     commit_phone_question_boundary_with_coverage: [
@@ -166,6 +169,8 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
       'p_source_event_id',
       'p_turns',
       'p_covered_question_keys',
+      // 0086 (Finding B): forwarded to the base commit, which validates it.
+      'p_disposition',
       'p_now',
     ],
     // ── 0045 ──────────────────────────────────────────────────────────
@@ -577,6 +582,11 @@ export type GetPhoneAssessmentStateStatus =
  */
 export const COMMIT_PHONE_QUESTION_BOUNDARY_STATUSES = [
   'applied',
+  // 0086 (Finding B): a non-null disposition outside the closed vocabulary
+  // is refused before anything is written — the database defends its own
+  // column even though the API schema gates the same enum a round trip
+  // earlier.
+  'invalid_disposition',
   'invalid_turns',
   'key_not_current',
   'plan_complete',
@@ -588,6 +598,23 @@ export const COMMIT_PHONE_QUESTION_BOUNDARY_STATUSES = [
 
 export type CommitPhoneQuestionBoundaryStatus =
   (typeof COMMIT_PHONE_QUESTION_BOUNDARY_STATUSES)[number];
+
+/**
+ * 0086 (Codex review Finding B) — the closed per-key boundary outcome
+ * vocabulary. The worker computes exactly one of these at commit time;
+ * `phone_session_progress.disposition` records it (NULL = not measured).
+ * Cursor advancement must not imply asked or covered — this is the durable
+ * record of which it was.
+ */
+export const PHONE_BOUNDARY_DISPOSITIONS = [
+  'asked_answered',
+  'volunteered_with_evidence',
+  'asked_declined',
+  'asked_unanswered',
+  'not_delivered',
+  'skipped_bounded',
+] as const;
+export type PhoneBoundaryDisposition = (typeof PHONE_BOUNDARY_DISPOSITIONS)[number];
 
 export const COMMIT_PHONE_QUESTION_BOUNDARY_WITH_COVERAGE_STATUSES = [
   ...COMMIT_PHONE_QUESTION_BOUNDARY_STATUSES,
@@ -732,7 +759,12 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
  * RE-DERIVED by the drift test from the migration text; this constant is only a
  * tripwire.
  */
-export const PHONE_RPC_STATUS_COUNT = 108;
+/*
+ * 0086 takes it from 108 to 109: the boundary commit gains exactly ONE new
+ * member, `invalid_disposition` (the closed-vocabulary refusal for the
+ * Finding B per-key outcome column).
+ */
+export const PHONE_RPC_STATUS_COUNT = 109;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.

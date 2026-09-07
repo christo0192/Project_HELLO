@@ -1070,7 +1070,13 @@ describe('OpenAPI document integrity', () => {
     // (RCA 2026-09-07). Same admin-gated Mission Control surface as the two
     // existing ingestion retries; widens no candidate-facing route.
     // 117 + 1 = 118.
-    expect(Object.keys(paths).length).toBe(118);
+    // Finding H (Codex review §10) adds ONE internal path —
+    // /api/internal/phone/observability — the standalone per-call snapshot
+    // writer for non-completed exits (candidate hangup / disconnect /
+    // recovery), which used to leave call_sessions.observability empty. Same
+    // worker-authenticated surface; widens no recruiter-facing route.
+    // 118 + 1 = 119.
+    expect(Object.keys(paths).length).toBe(119);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1142,7 +1148,12 @@ describe('OpenAPI document integrity', () => {
     // know its session); the response reuses VoiceWorkerReadyResponse. 232 + 1 = 233.
     // Call-quality round 1 adds the /recording/failed request/response pair
     // (PhoneRecordingFailedRequest + PhoneRecordingFailedResponse). 233 + 2 = 235.
-    expect(Object.keys(schemas).length).toBe(235);
+    // Finding H adds the /observability request/response pair
+    // (PhoneObservabilityWriteRequest + PhoneObservabilityWriteResponse). The
+    // request's metrics object is deliberately permissive-partial (the 0082
+    // snapshot shape) so a best-effort write never 400s across worker
+    // versions; the envelope stays additionalProperties:false. 235 + 2 = 237.
+    expect(Object.keys(schemas).length).toBe(237);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -1363,6 +1374,9 @@ describe('auth boundary vs spec security model', () => {
     // Same surface and same boundary: the worker's permanent-loss report that
     // latches a never-uploaded recording to failed (live 2026-09-03).
     'POST /api/internal/phone/recording/failed',
+    // Finding H, same surface and same boundary: the standalone per-call
+    // observability snapshot writer for non-completed exits.
+    'POST /api/internal/phone/observability',
     // Answer-first ("bounce") readiness poll, same surface and same boundary:
     // the worker GETs it behind WORKER_CONTEXT_SECRET, answering the worker's
     // 401 `authentication_required` rather than the recruiter middleware's

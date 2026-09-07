@@ -441,6 +441,33 @@ describe('POST /assessment/turn', () => {
     });
   });
 
+  it('0086 (Finding B): forwards a valid disposition to the store', async () => {
+    const h = build();
+    const res = await post(h, '/assessment/turn', {
+      ...TURN_BODY, disposition: 'asked_answered',
+    });
+    expect(res.status).toBe(200);
+    expect(h.commitQuestionBoundary).toHaveBeenCalledWith(
+      expect.objectContaining({ disposition: 'asked_answered' }),
+    );
+  });
+
+  it('0086: a body WITHOUT disposition omits the key entirely (NULL = not measured)', async () => {
+    const h = build();
+    await post(h, '/assessment/turn', TURN_BODY);
+    const input = h.commitQuestionBoundary.mock.calls[0][0] as Record<string, unknown>;
+    expect('disposition' in input).toBe(false);
+  });
+
+  it('0086: a disposition outside the closed vocabulary is a flat 400', async () => {
+    const h = build();
+    const res = await post(h, '/assessment/turn', {
+      ...TURN_BODY, disposition: 'asked_maybe',
+    });
+    expect(res.status).toBe(400);
+    expect(h.commitQuestionBoundary).not.toHaveBeenCalled();
+  });
+
   it('`ok` comes from the RPC\'s own applied flag, never from the status string', async () => {
     // The shape a careless projection reports as success: a status that reads
     // like one, with the durability flag absent.
@@ -864,6 +891,16 @@ describe('POST /assessment/complete — 0082 per-call observability (additive)',
     expect(res.body).toEqual({ ok: true, status: 'scored', adopted: false });
   });
 
+  it('Finding H: an EMPTY metrics object on completion issues NO write', async () => {
+    // A completing leg that somehow carried `{}` must not clobber a snapshot
+    // the hangup path already persisted through `/observability`.
+    const h = build({ states: completeStates() });
+    const res = await post(h, '/assessment/complete', { ...START_BODY, metrics: {} });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, status: 'scored', adopted: false });
+    expect(observabilityUpdate).not.toHaveBeenCalled();
+  });
+
   it('a write THROW is swallowed — the terminal completion still succeeds', async () => {
     observabilityEq.mockRejectedValueOnce(new Error('driver detail: session 42'));
     const h = build({ states: completeStates() });
@@ -1070,5 +1107,69 @@ describe('the PRODUCTION defaults, driven with an empty deps object', () => {
       .send(START_BODY);
     expect(res.body).toEqual({ ok: false, status: 'completion_failed' });
     expect(runAssessment).not.toHaveBeenCalled();
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Finding H (Codex review §10, 2026-09-07): the STANDALONE observability
+// writer. Every non-completed exit (candidate hangup, disconnect, recovery)
+// posts its snapshot here; the completion body remains the `completed` leg's
+// carrier. The route is idempotent full-replace and REFUSES an empty snapshot
+// so good data can never be overwritten by nothing.
+describe('POST /observability — Finding H standalone snapshot writer', () => {
+  const METRICS = {
+    watchdog_fired_count: 1,
+    deterministic_fallback_count: 0,
+    coverage_judge: { conflict_probe_scheduled: 1, conflict_probe_delivered: 0 },
+  };
+
+  it('writes a non-empty snapshot verbatim, keyed by session id', async () => {
+    const h = build();
+    const res = await post(h, '/observability', { session_id: SESSION, metrics: METRICS });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, status: 'ok' });
+    expect(observabilityUpdate).toHaveBeenCalledOnce();
+    expect(observabilityUpdate).toHaveBeenCalledWith({ observability: METRICS });
+    expect(observabilityEq).toHaveBeenCalledWith('id', SESSION);
+  });
+
+  it('REFUSES an empty snapshot — never overwrite good data with nothing', async () => {
+    const h = build();
+    const res = await post(h, '/observability', { session_id: SESSION, metrics: {} });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: false, status: 'empty_snapshot' });
+    expect(observabilityUpdate).not.toHaveBeenCalled();
+  });
+
+  it('rejects a malformed body with a flat 400 and no write', async () => {
+    const h = build();
+    const res = await post(h, '/observability', { session_id: 'not-a-uuid', metrics: METRICS });
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ ok: false, status: 'invalid_request' });
+    expect(observabilityUpdate).not.toHaveBeenCalled();
+  });
+
+  it('reports a write failure truthfully (ok:false) without throwing', async () => {
+    observabilityEq.mockResolvedValueOnce({ error: { code: '42P01' } });
+    const h = build();
+    const res = await post(h, '/observability', { session_id: SESSION, metrics: METRICS });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: false, status: 'write_failed' });
+  });
+
+  it('is disabled with the master switch, like every other worker route', async () => {
+    const h = build({ configSource: DISABLED });
+    const res = await post(h, '/observability', { session_id: SESSION, metrics: METRICS });
+    expect(res.status).toBe(503);
+    expect(observabilityUpdate).not.toHaveBeenCalled();
+  });
+
+  it('requires worker auth', async () => {
+    const h = build();
+    const res = await request(h.app)
+      .post('/api/internal/phone/observability')
+      .send({ session_id: SESSION, metrics: METRICS });
+    expect(res.status).toBe(401);
+    expect(observabilityUpdate).not.toHaveBeenCalled();
   });
 });

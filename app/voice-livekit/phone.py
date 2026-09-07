@@ -538,6 +538,14 @@ ITEM_TURN_PATH = "/api/internal/phone/assessment/item-turn"
 GATE_TURNS_PATH = "/api/internal/phone/assessment/gate-turns"
 PROBE_PATH = "/api/internal/phone/assessment/probe"
 ASSESSMENT_COMPLETE_PATH = "/api/internal/phone/assessment/complete"
+#: Finding H (Codex review §10): the standalone per-call observability writer.
+#: `/assessment/complete` only carries the snapshot on the `completed` leg, so a
+#: candidate hangup / disconnect / recovery exit used to leave
+#: `call_sessions.observability = {}` (Call B, 2026-09-07). Terminal-but-not-
+#: completed exits post the same compact snapshot here instead. Best-effort and
+#: idempotent (full-replace server-side; the server refuses an EMPTY snapshot so
+#: good data is never overwritten by nothing).
+OBSERVABILITY_PATH = "/api/internal/phone/observability"
 #: P5: the lease renewal. Under `/api/internal/phone` with every other worker
 #: call, because that is the ONE mount (`app.ts`: `app.use('/api/internal/phone',
 #: phoneWorkerRouter)`). An earlier constant said `/api/phone-worker/...` and
@@ -735,6 +743,38 @@ def phone_tts_flush_min_chars() -> int:
     name so the env-contract scanner sees it.
     """
     return _bounded_int_env(os.getenv("PHONE_TTS_FLUSH_MIN_CHARS"), 0, 0, 400)
+
+
+def phone_tts_tail_peek_timeout_sec() -> float:
+    """Bound on the numeric-protection read-ahead in the phone ``tts_node``.
+
+    Finding A (Codex review §3, 2026-09-07): after the first speakable fragment
+    was collected, the letter-free-remainder-lead fold used to READ AHEAD into
+    the remainder unconditionally — and when the ``llm_node`` guard was still
+    withholding the reply tail (its full-draft validation), that read blocked,
+    so an already-authorized, complete first sentence did not start downstream
+    synthesis until the whole generation finished. The composition sat directly
+    on the dead-air path.
+
+    The fix: a first fragment that ends at a SENTENCE TERMINATOR is complete
+    and synthesizes immediately with NO read-ahead (the fold never applied to
+    it anyway — a terminator-ended fragment refuses folds by construction). A
+    fragment flushed at a clause pause / the min-chars cap still runs the fold
+    peek — that is the digit-protection case ("Great question, 2019.") — but
+    the peek's CROSS-CHUNK wait is now bounded by this budget: characters
+    already in hand are always inspected for free, and only the wait for a
+    chunk the guard has not yet released is time-bounded. On timeout the
+    fragment synthesizes unfolded and the peeked characters lead the remainder
+    stream (text is never dropped). The residual risk window is the triple
+    coincidence of a clause-pause flush + a tail withheld past this budget + a
+    letter-free remainder lead, which restores only the pre-fold baseline
+    behaviour for that rare shape.
+
+    ``0`` disables the cross-chunk wait entirely (flush immediately; in-hand
+    characters are still folded). Clamped to [0, 2] seconds. Read at the call
+    site with the literal name so the env-contract scanner sees it.
+    """
+    return _bounded_float(os.getenv("PHONE_TTS_TAIL_PEEK_TIMEOUT_SEC"), 0.25, 0.0, 2.0)
 
 
 def phone_queued_scoring_hold_sec() -> float:
@@ -1668,6 +1708,7 @@ class PhoneEventClient:
         source_event_id: str,
         turns: list[dict[str, Any]],
         covered_question_keys: list[str] | None = None,
+        disposition: str | None = None,
     ) -> PhoneApiOutcome:
         """Commit ONE completed question boundary.
 
@@ -1675,6 +1716,13 @@ class PhoneEventClient:
         the server's own flag rather than inferred from the status string. A
         boundary that is not ``ok`` was not written, and the worker must
         neither ask the next question nor claim a completion.
+
+        ``disposition`` (0086, Codex review Finding B) is the truthful per-key
+        outcome the worker computed at commit — one of the six members of
+        ``PHONE_BOUNDARY_DISPOSITIONS`` — recorded on the durable progress row
+        because cursor advancement must not imply asked or covered. Omitted
+        (None) the body is byte-identical to before and the row records NULL
+        ("not measured").
         """
         body = {
             "session_id": str(session_id),
@@ -1684,7 +1732,34 @@ class PhoneEventClient:
             "turns": turns,
             "covered_question_keys": list(covered_question_keys or []),
         }
+        if disposition is not None:
+            body["disposition"] = str(disposition)
         response = await self._post(ASSESSMENT_TURN_PATH, body, "assessment_turn")
+        # ── R3 (PR #260 adversarial review): VERSION-SKEW DOWNGRADE ─────────
+        # During a parallel deploy a NEW worker can face an OLD API whose
+        # strict schema rejects the unknown `disposition` key with a flat 400
+        # — without this, every boundary commit 400s for the whole window and
+        # the fleet's cursors stall. On a business-class refusal to a body
+        # that carried the field, RETRY EXACTLY ONCE with the field omitted
+        # (the commit is idempotent on `source_event_id`, so the retry
+        # converges; the durable row records NULL = "not measured", exactly
+        # what an old worker would have written). Bounded: one retry, and a
+        # refusal with some OTHER cause simply refuses again on the retry and
+        # flows into the ordinary failure handling. Version-skew-safe forever;
+        # the log category makes a lingering old API visible.
+        if (
+            disposition is not None
+            and isinstance(response, str)
+            and response == _ERR_BUSINESS
+        ):
+            _log.info(
+                "unknown_event", error_type="phone_api_version_skew",
+                error_category="disposition_field_downgraded",
+            )
+            body.pop("disposition", None)
+            response = await self._post(
+                ASSESSMENT_TURN_PATH, body, "assessment_turn",
+            )
         if isinstance(response, str):
             return PhoneApiOutcome(False, error_category=response)
         data = _response_json(response)
@@ -1836,6 +1911,45 @@ class PhoneEventClient:
         outcome.adopted = data.get("adopted") is True
         return outcome
 
+    async def post_observability(
+        self,
+        session_id: str,
+        metrics: dict[str, Any],
+    ) -> PhoneApiOutcome:
+        """Persist the per-call observability snapshot OUTSIDE completion.
+
+        Finding H (Codex review §10): the snapshot used to ride ONLY the
+        ``reason == "completed"`` completion body, so a candidate hangup,
+        disconnect, or recovery exit reached the API with
+        ``observability = {}``. This posts the same compact snapshot for those
+        exits. Contract:
+
+          * BEST-EFFORT — a failure here must never change the terminal
+            handling of the call; callers log-and-continue.
+          * IDEMPOTENT — the snapshot is a full replace, so re-posting the
+            same one is harmless; the server refuses an EMPTY snapshot so a
+            late empty write can never clobber good data.
+          * BOUNDED — one post, no retry loop (the reconnect/completion legs
+            re-send richer snapshots on their own paths).
+        """
+        if not isinstance(metrics, dict) or not metrics:
+            return PhoneApiOutcome(False, error_category="empty_snapshot")
+        body: dict[str, Any] = {
+            "session_id": str(session_id),
+            "metrics": metrics,
+        }
+        response = await self._post(OBSERVABILITY_PATH, body, "observability")
+        if isinstance(response, str):
+            return PhoneApiOutcome(False, error_category=response)
+        data = _response_json(response)
+        if not isinstance(data, dict):
+            return PhoneApiOutcome(False, error_category=_ERR_MALFORMED)
+        status = data.get("status")
+        return PhoneApiOutcome(
+            data.get("ok") is True,
+            str(status) if status is not None else None,
+        )
+
 
 def _response_json(response: Any) -> Any:
     getter = getattr(response, "json", None)
@@ -1845,6 +1959,17 @@ def _response_json(response: Any) -> Any:
         return getter()
     except Exception:  # noqa: BLE001
         return None
+
+
+#: 0086 (Codex review Finding B) — the closed per-key boundary outcome
+#: vocabulary. The worker computes exactly one of these at commit time and the
+#: durable `phone_session_progress.disposition` column records it (NULL = not
+#: measured). Mirrors the API schema enum and the migration CHECK; the three
+#: cannot drift silently because the RPC refuses any other value.
+PHONE_BOUNDARY_DISPOSITIONS: frozenset[str] = frozenset({
+    "asked_answered", "volunteered_with_evidence", "asked_declined",
+    "asked_unanswered", "not_delivered", "skipped_bounded",
+})
 
 
 # ── 0044: the assessment plan, the resume, and the boundary loop ──────
@@ -5309,6 +5434,179 @@ def phone_answer_disposition(
     return PHONE_ANSWER_NONANSWER
 
 
+#: Finding D (Codex review §6): stopword set for the conservative topic
+#: relation. Question-side tokens in this set never count as content anchors.
+_TOPIC_STOPWORDS = frozenset(
+    "a about an and any are as at be been but by can could did do does for "
+    "from had has have how i if in is it its me my of on or our so tell that "
+    "the their them they this to us walk we what when which who why will "
+    "with would you your please briefly describe share me currently".split()
+)
+
+#: Work-domain anchor vocabulary: a substantive turn that carries ANY of these
+#: is never classified "unrelated" — only speech with no question-token
+#: overlap, no structured answer signal, AND none of this vocabulary reads as
+#: off-topic. Deliberately broad so a legitimate answer phrased without the
+#: question's literal words ("I lead a team of five building payment systems")
+#: can never be mis-graded; a false "related" merely keeps today's behaviour.
+_WORK_DOMAIN_TOKENS = frozenset({
+    "work", "working", "worked", "job", "role", "roles", "team", "teams",
+    "company", "companies", "project", "projects", "experience", "years",
+    "year", "months", "month", "client", "clients", "customer", "customers",
+    "sales", "manage", "managed", "managing", "manager", "lead", "led",
+    "leading", "built", "build", "building", "developed", "develop",
+    "developing", "code", "coding", "engineer", "engineering", "notice",
+    "salary", "ctc", "lpa", "compensation", "package", "join", "joining",
+    "interview", "process", "career", "responsibility", "responsibilities",
+    "product", "products", "business", "designation", "profile",
+    "organization", "organisation", "office", "current", "expected",
+    "resume", "skills", "skill", "training", "certification", "degree",
+    # Duration / availability vocabulary and spelled small numbers: a turn
+    # carrying any of these is answer-shaped ("roughly sixty days"), never
+    # graded off-topic. False "related" is the safe direction.
+    "day", "days", "week", "weeks", "hour", "hours", "immediately",
+    "tomorrow", "today", "one", "two", "three", "four", "five", "six",
+    "seven", "eight", "nine", "ten", "fifteen", "twenty", "thirty", "forty",
+    "fifty", "sixty", "ninety", "hundred", "couple",
+})
+
+
+#: R1 (PR #260 adversarial review): second-person directedness tokens. An
+#: interrogative OPENING alone is not a question to the interviewer — Indian-
+#: English answer forms open with one routinely ("What I do currently is…",
+#: "How I handle objections is…"). A non-"?"-terminated opening counts as a
+#: DIRECTED question only when the same clause also addresses the interviewer
+#: or their side of the table. Deliberately the narrow reviewed token set.
+_QUESTION_DIRECTED_TOKEN_RE = re.compile(
+    r"\b(?:you|your|company|team|role)\b", re.IGNORECASE,
+)
+
+
+def phone_candidate_question_directed(text: Any) -> bool:
+    """R1 (PR #260 adversarial review): a question DIRECTED AT the interviewer.
+
+    The broad ``candidate_question`` dimension (kept as-is for observability
+    and non-routing consumers) fires on ordinary answer openings, because
+    ``_QUESTION_OPEN_RE`` matches the interrogative word alone — "What I do
+    currently is…" / "How I handle objections is…" are ANSWERS, not questions.
+    The ROUTING consumers (the answer-their-question reply prefix and the
+    preload bypass) must use this stronger predicate: prefixing "the candidate
+    asked you something" onto a plain answer both burns the preloaded
+    objective and invites the model to answer a question nobody asked.
+
+    Directed means:
+      * a terminal ``?`` (question prosody the STT recognised), OR
+      * an interrogative OPENING whose same (first) clause carries a
+        second-person / interviewer-side token: you / your / company / team /
+        role.
+
+    "What I do currently is manage a pipeline." → False.
+    "what does the role pay" (STT dropped the "?") → True.
+    "can your team offer that?" → True.
+    """
+    if not isinstance(text, str):
+        return False
+    clean = " ".join(text.strip().split())
+    if not clean:
+        return False
+    if clean.endswith("?"):
+        return True
+    if not _QUESTION_OPEN_RE.search(clean):
+        return False
+    first_clause = re.split(r"[,.;:!?]", clean, maxsplit=1)[0]
+    return bool(_QUESTION_DIRECTED_TOKEN_RE.search(first_clause))
+
+
+def phone_turn_dimensions(
+    question: Any, question_kind: Any, candidate_text: Any,
+) -> dict[str, Any]:
+    """Finding D (Codex review §6): one turn, INDEPENDENT dimensions.
+
+    Real speech is frequently answer AND question AND uncertainty at once.
+    The routing consumers used to force a turn into exactly one category
+    through ``phone_answer_disposition`` — so "If my current CTC is 20 LPA and
+    expected is 50 LPA, can your team offer that?" extracted both compensation
+    slots and then discarded them as a ``nonanswer``. This returns the
+    dimensions separately so consumers can compose them:
+
+      * ``disposition``      — the existing three-valued verdict (unchanged
+                               semantics; still the re-ask driver).
+      * ``slots``            — explicitly labelled compensation slots.
+      * ``answer_evidence``  — high-confidence proof the turn answers the OWED
+                               objective (``phone_answer_covers_objective``,
+                               which for compensation requires the slots the
+                               objective names). Values with this evidence
+                               must SURVIVE a counter-question in the same
+                               utterance.
+      * ``candidate_question`` — the turn also asks the interviewer something.
+      * ``clarification``    — the turn is a clarification/deflection shape.
+      * ``decline``          — explicit decline with no substantive signal.
+      * ``topic_relation``   — "covers" | "related" | "unrelated". VERY
+                               conservative toward "related": "unrelated"
+                               requires a substantive turn with zero question-
+                               token overlap, no structured answer signal, no
+                               slots, and no work-domain vocabulary at all —
+                               so off-topic substantive speech ("I enjoy
+                               cooking Italian food…") is never recorded as
+                               topical coverage, while an on-topic answer
+                               phrased in its own words never mis-grades.
+
+    Pure and deterministic; consumers must not treat ``disposition`` alone as
+    evidence of topical coverage (review §6).
+    """
+    clean = (
+        " ".join(candidate_text.strip().split())
+        if isinstance(candidate_text, str) else ""
+    )
+    slots = phone_compensation_slots(clean)
+    disposition = phone_answer_disposition(question, question_kind, clean)
+    covers = phone_answer_covers_objective(question, clean)
+    clarification = phone_clarification_shape(clean)
+    candidate_question = bool(clean) and (
+        clarification
+        or clean.endswith("?")
+        or bool(_QUESTION_OPEN_RE.search(clean))
+    )
+    topic_relation = "related"
+    if covers:
+        topic_relation = "covers"
+    elif (
+        clean
+        and disposition == PHONE_ANSWER_ANSWERED
+        and not slots
+        and not _answer_has_substantive_signal(clean)
+    ):
+        answer_tokens = {
+            token for token in _COVERAGE_TOKEN_RE.findall(clean.casefold())
+        }
+        question_tokens = {
+            token
+            for token in _COVERAGE_TOKEN_RE.findall(
+                question.casefold() if isinstance(question, str) else "",
+            )
+            if token not in _TOPIC_STOPWORDS
+        }
+        if (
+            not (answer_tokens & question_tokens)
+            and not (answer_tokens & _WORK_DOMAIN_TOKENS)
+        ):
+            topic_relation = "unrelated"
+    return {
+        "disposition": disposition,
+        "slots": slots,
+        "answer_evidence": covers,
+        "candidate_question": candidate_question,
+        # R1: the ROUTING-grade twin of `candidate_question` — terminal "?" or
+        # an interrogative opening with second-person directedness in the same
+        # clause. Only the reply-prefix / preload-bypass consumers read it;
+        # the broad dimension above stays for observability.
+        "directed_question": phone_candidate_question_directed(clean),
+        "clarification": clarification,
+        "decline": disposition == PHONE_ANSWER_DECLINED,
+        "topic_relation": topic_relation,
+    }
+
+
 def phone_answer_gate_enabled() -> bool:
     """Kill switch for the outgoing answer-disposition advance gate.
 
@@ -5938,6 +6236,21 @@ def phone_name_confirm_instruction(mismatch: Any) -> str | None:
     NOT capitulate ("no worries, doesn't matter"). It asks the candidate, warmly
     and once, to confirm which name they go by. Returns None on a malformed
     signal so the caller falls through without arming.
+
+    Finding E (Codex review §7, 2026-09-07): the instruction used to offer a
+    LITERAL second-person example ("just so I have it right, should I call you
+    …?"). Any instruction-literal model that copied it produced six contiguous
+    normalized words shared with this private control text, so the echo guard
+    rejected exactly the wording the instruction offered — twice on Call B —
+    and the deterministic fallback then spoke nearly the same words anyway.
+    The instruction now describes the confirmation in THIRD-person prose (no
+    verbatim speakable phrase), so a natural second-person confirmation can
+    never share a six-word window with it. The echo guard itself is untouched
+    — protection is not weakened, the instruction just stops offering what the
+    guard forbids. (`PHONE_NAME_CONFIRM_CLARIFICATION_TEXT`, the public
+    deterministic fallback line, is already exempt: it is the authorized
+    objective on name-confirm turns and `_private_phone_control_text` strips
+    the objective before echo scanning.)
     """
     if not isinstance(mismatch, dict):
         return None
@@ -5950,11 +6263,56 @@ def phone_name_confirm_instruction(mismatch: Any) -> str | None:
         "the name on record. For your context only — do NOT read these aloud or "
         "spell them out — the record shows \"" + record + "\" and they said \""
         + spoken + "\". In THIS turn, do NOT assert either name as correct and do "
-        "NOT brush it off as unimportant. Warmly and briefly confirm which name "
-        "they go by (for example, \"just so I have it right, should I call you "
-        "" + spoken + "?\"), then continue. Use the name THEY confirm for the "
-        "rest of the call. Never accuse them of giving a wrong name."
+        "NOT brush it off as unimportant. Warmly and briefly check, in your own "
+        "words, which name the candidate prefers to be called — address them "
+        "with the name they themselves just used — then continue. Use whichever "
+        "name THEY confirm for the rest of the call. Never accuse them of "
+        "giving a wrong name."
     )
+
+
+#: Finding E lifecycle (Codex review §7): affirmation shapes for the ONE
+#: candidate turn that answers a DELIVERED name-confirmation. Deliberately
+#: inclusive of "call me …" / "I go by …" correction shapes — a correction is
+#: still a confirmation of the preferred name. Evaluated only on that single
+#: turn, so the broad vocabulary cannot leak into general routing.
+_NAME_CONFIRM_AFFIRM_RE = re.compile(
+    r"\b(?:"
+    r"yes|yeah|yep|correct|exactly|"
+    r"that(?:'s| is)\s+(?:right|correct|fine|me)|"
+    r"(?:please\s+)?call\s+me|you\s+can\s+call\s+me|i\s+go\s+by|"
+    r"i\s+prefer|prefer\s+to\s+be\s+called|either\s+(?:is|works)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def phone_name_confirm_reply_confirms(text: Any, mismatch: Any) -> bool:
+    """True when the reply to a DELIVERED name-confirm turn confirms a name.
+
+    Finding E (Codex review §7): authoring is not delivery, and delivery is
+    not confirmation. This is the deterministic, conservative third stage —
+    it recognises an affirmation shape, or a turn that names either root name
+    (spoken or record), or a fresh introduction. Anything else leaves the
+    identity signal at "delivered" rather than inventing a confirmation.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return False
+    clean = " ".join(text.split())
+    if _NAME_CONFIRM_AFFIRM_RE.search(clean):
+        return True
+    if phone_extract_introduced_name(clean):
+        return True
+    names: set[str] = set()
+    if isinstance(mismatch, dict):
+        for field in ("spoken", "record"):
+            value = str(mismatch.get(field) or "").strip().lower()
+            if value:
+                names.add(value)
+    if not names:
+        return False
+    tokens = {token.lower() for token in re.findall(r"[A-Za-z]+", clean)}
+    return bool(names & tokens)
 
 
 def phone_instruction_echo_detected(speech: Any, control_text: Any) -> bool:
@@ -8320,117 +8678,197 @@ def phone_agent_class(agent_base: Any) -> Any:
                         yield frame
                 return
 
-            # FOLD A LETTER-FREE REMAINDER LEAD FORWARD (call 28 follow-up: the
-            # remainder half of the alpha-guard). Splitting `first` at the early
-            # boundary can orphan a LETTER-FREE SENTENCE onto the front of the
-            # remainder — e.g. `"Great question, 2019."` flushes `first="Great
-            # question,"` and leaves `" 2019."`, which Sarvam's sentence tokenizer
-            # reads as a complete letter-free sentence and rejects `400: Text must
-            # contain at least one character from the alphabet`, dropping "2019".
-            # The first-fragment alpha-guard above does NOT cover this — it only
-            # guards the FIRST call. So here we BOUNDED-PEEK the remainder and fold
-            # a leading letter-free sentence-run (a maximal run ending at
-            # `.`/`!`/`?`, or the end of the stream) into `first`, until the
-            # remainder either begins with a real letter or is empty. The peek is
-            # bounded: it stops the instant it sees an alphabetic char OR a
-            # sentence terminator, so first-audio is delayed by at most the first
-            # word/clause of the remainder — the latency win is preserved.
+            # ── Finding A (Codex review §3, 2026-09-07): a complete, safe,
+            # authorized first sentence synthesizes WITHOUT waiting for
+            # subsequent text. The old flow ALWAYS ran the letter-free-lead
+            # peek below before synthesizing `first` — and when `llm_node`'s
+            # guarded incremental release was still withholding the reply tail
+            # (full-draft validation), the peek's read blocked on the source,
+            # so first-audio waited for the WHOLE generation (reproduced:
+            # terminator-ended prefix, comma-ended prefix, and the combined
+            # guard→TTS composition all held synthesis until tail release).
             #
-            # ONE INVARIANT ON THE FOLD ITSELF: a letter-free run is folded
-            # backward ONLY while `first` does not already END at a sentence
-            # terminator. If the early boundary WAS a terminator (`first="Wow."`),
-            # appending `" 2019."` would make `"Wow. 2019."` — a SECOND, letter-
-            # free sentence inside the first stream, i.e. relocating the 400
-            # rather than fixing it. In that case the letter-free run is the LLM's
-            # OWN sentence (it exists in the source regardless of any split), so it
-            # stays on the remainder exactly as the single-call baseline would
-            # emit it — the fold never INTRODUCES a letter-free sentence.
+            # A first fragment that ends at a SENTENCE TERMINATOR never folds
+            # anyway (folding into a closed sentence would just relocate the
+            # letter-free-400), so it needs NO read-ahead: synthesize it now.
+            # Only a clause-pause / min-chars-cap fragment (open clause) still
+            # runs the fold peek — the digit-protection case ("Great question,
+            # 2019.") — and that peek's CROSS-CHUNK wait is now bounded by
+            # `phone_tts_tail_peek_timeout_sec()`: characters already in hand
+            # are always folded for free; only the wait for a chunk the guard
+            # has not yet released is time-bounded. On timeout the fragment
+            # synthesizes unfolded and every peeked character leads the
+            # remainder stream — text is never dropped, and the abandoned
+            # chunk read is NEVER cancelled (cancelling the source generator
+            # would kill the upstream stream); it is handed to the remainder
+            # stream to await first.
             #
-            # `pending` holds the peeked remainder chars that are NOT folded into
-            # `first`; they lead the remainder stream. `leftover_iter` still holds
-            # whatever the peek never had to read.
-            leftover_iter = _leftover_then_src(leftover, src)
-            pending = ""              # peeked-but-not-folded remainder prefix
-            run = ""                  # current in-progress remainder sentence-run
-            remainder_exhausted = True
-            # Fold only while `first`'s trailing clause is still OPEN (no sentence
-            # terminator at its end). `first.rstrip()` ignores a trailing space.
-            can_fold = (
-                not first.rstrip() or first.rstrip()[-1] not in _TTS_SENTENCE_TERMINATORS
+            # FOLD SEMANTICS (unchanged from call 28): a leading LETTER-FREE
+            # sentence-run of the remainder (e.g. " 2019.") folds backward into
+            # `first`'s still-open clause so Sarvam never sees a letter-free
+            # sentence (`400: Text must contain at least one character from
+            # the alphabet` — it would DROP the digits). The fold only applies
+            # while `first` does not already end at a terminator; a letter-free
+            # run after a closed sentence is the LLM's own sentence and stays
+            # on the remainder exactly as the single-call baseline emits it.
+            first_trim = first.rstrip()
+            first_complete = bool(first_trim) and (
+                first_trim[-1] in _TTS_SENTENCE_TERMINATORS
             )
-            async for ch in leftover_iter:
-                run += ch
-                if ch.isalpha():
-                    # A real letter in this run: the remainder lead is speakable.
-                    # Everything peeked so far (this run) stays on the remainder.
-                    pending += run
-                    run = ""
-                    remainder_exhausted = False
-                    break
-                if ch in _TTS_SENTENCE_TERMINATORS:
-                    if can_fold:
-                        # A complete LETTER-FREE sentence (e.g. "2019.") folded
-                        # into `first`'s still-open clause so it never reaches
-                        # Sarvam as its own sentence. `first` now ends at a
-                        # terminator, so no FURTHER run may fold backward — stop
-                        # folding and let the rest lead the remainder.
-                        first += run
-                        run = ""
-                        can_fold = False
-                    else:
-                        # `first` already closed a sentence: this letter-free run
-                        # is the LLM's own sentence and stays on the remainder,
-                        # exactly as the single-call baseline emits it.
-                        pending += run
-                        run = ""
-                        remainder_exhausted = False
-                        break
-                # else: a non-letter, non-terminator char (digit/space/punct) —
-                # keep accumulating the current run.
-            else:
-                # The remainder was fully drained by the peek. Whatever is left in
-                # `run` is a trailing partial with no terminator; if it carries no
-                # letter AND we may still fold, it is a letter-free tail that must
-                # be folded into `first` (never emitted alone), otherwise it stays
-                # on the remainder.
-                remainder_exhausted = True
-                if run and can_fold and not any(c.isalpha() for c in run):
-                    first += run
-                    run = ""
+
+            async def _next_chunk_or_none(stream: Any) -> str | None:
+                try:
+                    return await stream.__anext__()
+                except StopAsyncIteration:
+                    return None
+
+            pending = ""              # remainder text already pulled off the stream
+            pending_chunk_task: asyncio.Task | None = None
+            remainder_open = True     # False once `src` is proven exhausted
+
+            def _abandon_pending_chunk_task() -> None:
+                # Interruption cleanup: a budgeted chunk read still in flight
+                # when this generator is closed (barge-in tears the pipeline
+                # down) is cancelled so it can neither leak nor warn at loop
+                # shutdown. Never runs on normal completion — every normal
+                # path consumes the task before finishing.
+                nonlocal pending_chunk_task
+                if pending_chunk_task is not None:
+                    task_ref = pending_chunk_task
+                    pending_chunk_task = None
+                    if not task_ref.done():
+                        task_ref.cancel()
+                    task_ref.add_done_callback(
+                        lambda t: t.cancelled() or t.exception(),
+                    )
+
+            try:
+                if first_complete:
+                    # No read-ahead: the whole leftover (if any) simply leads the
+                    # remainder. Nothing is folded — identical fold semantics to
+                    # the old can_fold=False path, minus the blocking peek.
+                    pending = leftover
                 else:
-                    pending += run
-                    run = ""
+                    run = ""              # current in-progress remainder sentence-run
+                    can_fold = True       # first's trailing clause is OPEN here
+                    decided = False
+                    buffer = leftover
+                    peek_deadline = (
+                        time_module.monotonic() + phone_tts_tail_peek_timeout_sec()
+                    )
+                    while True:
+                        consumed = 0
+                        for ch in buffer:
+                            consumed += 1
+                            run += ch
+                            if ch.isalpha():
+                                # A real letter: the remainder lead is speakable.
+                                decided = True
+                                break
+                            if ch in _TTS_SENTENCE_TERMINATORS:
+                                if can_fold:
+                                    # A complete LETTER-FREE sentence folds into
+                                    # `first`'s open clause; `first` now ends at a
+                                    # terminator, so no FURTHER run may fold.
+                                    first += run
+                                    run = ""
+                                    can_fold = False
+                                else:
+                                    decided = True
+                                    break
+                            # else: digit/space/punct — keep accumulating the run.
+                        buffer = buffer[consumed:]
+                        if decided:
+                            break
+                        # Need more characters. Budgeted, non-destructive read: the
+                        # chunk task is never cancelled — if the budget runs out it
+                        # is handed to the remainder stream below.
+                        remaining_budget = peek_deadline - time_module.monotonic()
+                        if pending_chunk_task is None:
+                            pending_chunk_task = asyncio.ensure_future(
+                                _next_chunk_or_none(src),
+                            )
+                        if remaining_budget > 0:
+                            done_set, _ = await asyncio.wait(
+                                {pending_chunk_task}, timeout=remaining_budget,
+                            )
+                        else:
+                            done_set = (
+                                {pending_chunk_task} if pending_chunk_task.done()
+                                else set()
+                            )
+                        if not done_set:
+                            # Budget exhausted while the tail is still withheld:
+                            # synthesize `first` unfolded; the peeked letter-free
+                            # run leads the remainder (baseline behaviour for this
+                            # rare shape — text preserved, never dropped).
+                            break
+                        chunk_value = pending_chunk_task.result()
+                        pending_chunk_task = None
+                        if chunk_value is None:
+                            remainder_open = False
+                            # Stream drained: a trailing letter-free partial with
+                            # no terminator folds while folding is still allowed —
+                            # it must never be emitted alone.
+                            if run and can_fold and not any(c.isalpha() for c in run):
+                                first += run
+                                run = ""
+                            break
+                        buffer = chunk_value
+                    # Whatever was peeked and not folded leads the remainder.
+                    pending = run + buffer
 
-            # Any partial `run` from a mid-peek break belongs on the remainder.
-            pending += run
-
-            # 1) Synthesize the first speakable clause ALONE → fast first-audio.
-            #    `first` carries a letter and the fold never introduced a letter-
-            #    free sentence into it, so this call cannot hand Sarvam one.
-            async for frame in _drive(_one_text(first)):
-                yield frame
-
-            # 2) Synthesize the ENTIRE REMAINDER as ONE call → Sarvam native
-            #    streaming, smooth prosody for the body of the reply. If the whole
-            #    remainder folded into `first` (short letter-free tail like
-            #    "Great question, 2019."), there is nothing left — the reply went
-            #    out as ONE combined call, digits intact, no 400.
-            #
-            #    The remainder is `pending` (the peeked-but-not-folded prefix)
-            #    followed by whatever `leftover_iter` still holds. It MUST drain
-            #    `leftover_iter`, not `src`: the peek pulled characters out of
-            #    `src` through `leftover_iter`, so `src` has already advanced past
-            #    them and reading it directly would DROP the tail of the chunk the
-            #    peek broke inside.
-            if pending or not remainder_exhausted:
-                async def _rest() -> Any:
-                    if pending:
-                        yield strip_markdown_for_speech(pending)
-                    async for ch in leftover_iter:
-                        yield strip_markdown_for_speech(ch)
-
-                async for frame in _drive(_rest()):
+                # 1) Synthesize the first speakable clause ALONE → fast first-audio.
+                #    `first` carries a letter and the fold never introduced a letter-
+                #    free sentence into it, so this call cannot hand Sarvam one.
+                async for frame in _drive(_one_text(first)):
                     yield frame
+
+                # 2) Synthesize the ENTIRE REMAINDER as ONE call → Sarvam native
+                #    streaming, smooth prosody for the body of the reply. If the
+                #    whole remainder folded into `first` (short letter-free tail
+                #    like "Great question, 2019."), there is nothing left — the
+                #    reply went out as ONE combined call, digits intact, no 400.
+                #
+                #    LAZY OPEN: the second downstream call is opened only once the
+                #    remainder is KNOWN to carry content — first-audio is already
+                #    out, so blocking here on a still-withheld tail is exactly the
+                #    intended behaviour, and an empty remainder never opens an
+                #    empty synthesis. Any in-flight budgeted chunk read is awaited
+                #    FIRST so no character of the stream is lost or reordered.
+                lead = pending
+                if not lead:
+                    while remainder_open:
+                        if pending_chunk_task is not None:
+                            chunk_value = await pending_chunk_task
+                            pending_chunk_task = None
+                        else:
+                            chunk_value = await _next_chunk_or_none(src)
+                        if chunk_value is None:
+                            remainder_open = False
+                            break
+                        if chunk_value:
+                            lead = chunk_value
+                            break
+                if lead:
+                    async def _rest() -> Any:
+                        nonlocal pending_chunk_task
+                        yield strip_markdown_for_speech(lead)
+                        if pending_chunk_task is not None:
+                            chunk_value = await pending_chunk_task
+                            pending_chunk_task = None
+                            if chunk_value is None:
+                                return
+                            if chunk_value:
+                                yield strip_markdown_for_speech(chunk_value)
+                        async for chunk_value in src:
+                            if chunk_value:
+                                yield strip_markdown_for_speech(chunk_value)
+
+                    async for frame in _drive(_rest()):
+                        yield frame
+            finally:
+                _abandon_pending_chunk_task()
 
         @_tool
         async def request_probe(self) -> str:

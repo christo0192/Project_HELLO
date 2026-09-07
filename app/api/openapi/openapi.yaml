@@ -1815,6 +1815,58 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneWorkerError'
 
+  /api/internal/phone/observability:
+    post:
+      tags: [phone]
+      operationId: postPhoneWorkerObservability
+      summary: Persist the per-call observability snapshot outside completion (Finding H)
+      description: Internal, service-authenticated. The per-call observability snapshot used to ride ONLY the completed leg of /api/internal/phone/assessment/complete, so a candidate hangup, disconnect, or recovery exit left call_sessions.observability empty (Codex review Finding H, Call B 2026-09-07). The worker posts the same compact, content-free snapshot here on those exits. Idempotent full replace, last-write-wins, exactly like the completion-path write; an EMPTY snapshot is refused (empty_snapshot) so good data is never overwritten by nothing; best-effort by contract - the worker logs-and-continues on failure and nothing about terminal handling depends on this write. No session-status gate - a snapshot for an already-terminal session is still the truthful record of the call that just ended. Disabled by default.
+      security:
+        - workerBearer: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneObservabilityWriteRequest'
+      responses:
+        '200':
+          description: ok=true with status ok means the snapshot was written. empty_snapshot and write_failed are truthful refusals (ok=false) that change nothing.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneObservabilityWriteResponse'
+        '400':
+          description: Request body failed validation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneObservabilityWriteResponse'
+        '401':
+          description: Worker bearer credential required.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '403':
+          description: Worker bearer credential invalid.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+        '500':
+          description: phone_observability_error - sanitized stable code.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneObservabilityWriteResponse'
+        '503':
+          description: Phone screening disabled, or the worker credential is not configured.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneWorkerError'
+
   /api/internal/phone/recording/failed:
     post:
       tags: [phone]
@@ -6976,6 +7028,31 @@ components:
             - invalid_request
             - phone_recording_complete_error
             - phone_screening_disabled
+      additionalProperties: false
+
+    PhoneObservabilityWriteRequest:
+      type: object
+      required: [session_id, metrics]
+      properties:
+        session_id:
+          type: string
+          format: uuid
+        metrics:
+          type: object
+          description: The compact per-call observability snapshot (0082 shape) - counts and millisecond durations only, no transcript, room, candidate, or request identifiers. Permissive-partial so an older or newer worker never 400s a best-effort write; an EMPTY object is refused by the route.
+          additionalProperties: true
+      additionalProperties: false
+
+    PhoneObservabilityWriteResponse:
+      type: object
+      required: [ok, status]
+      properties:
+        ok:
+          type: boolean
+          description: True only when the snapshot was written.
+        status:
+          type: string
+          description: ok, or a stable refusal - empty_snapshot, write_failed, invalid_request, phone_observability_error.
       additionalProperties: false
 
     PhoneRecordingFailedRequest:
