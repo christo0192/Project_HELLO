@@ -462,6 +462,55 @@ def _emit_phone_headline_latency(
         return None
 
 
+def _phone_boundary_disposition(boundary: Mapping[str, Any]) -> str | None:
+    """Finding B (Codex review §4): derive the truthful per-key outcome.
+
+    Computed at COMMIT time from the signals the boundary already carries
+    (honest ``ask_delivered``, the Finding D dimensions, the bounded-skip
+    mark), and recorded durably on the progress row — because cursor
+    advancement must not imply asked or covered. Returns ``None`` for a
+    boundary that carries no dimension signals at all (the tool-first lane,
+    legacy/test shapes): NULL in the row is an honest "not measured", never a
+    guessed enum member.
+
+    The mapping, in precedence order:
+      * ask NOT delivered + volunteered evidence  → volunteered_with_evidence
+      * ask NOT delivered + bounded-skip mark     → skipped_bounded
+      * ask NOT delivered otherwise               → not_delivered
+      * delivered + explicit decline              → asked_declined
+      * delivered + evidence, or answered ON-topic → asked_answered
+        (evidence outranks the broad disposition: a mixed answer+question
+        turn whose values survived — Finding D — was ANSWERED)
+      * delivered otherwise                       → asked_unanswered
+        (includes the re-ask-cap advance AND off-topic substantive speech —
+        the broad `answered` predicate is not evidence of topical coverage)
+    """
+    # The Finding D dimensions are the mapping's evidence; a boundary that
+    # never measured them (legacy/test seams seeding the raw pending dict,
+    # whose INITIAL shape carries only ask_delivered=False) must record NULL,
+    # not a guessed "not_delivered".
+    if "answer_disposition" not in boundary:
+        return None
+    ask_delivered = boundary.get("ask_delivered") is True
+    answer_disposition = boundary.get("answer_disposition")
+    topic_relation = boundary.get("topic_relation")
+    evidence = boundary.get("answer_evidence") is True
+    if not ask_delivered:
+        if evidence:
+            return "volunteered_with_evidence"
+        if boundary.get("bounded_skip") is True:
+            return "skipped_bounded"
+        return "not_delivered"
+    if answer_disposition == phone.PHONE_ANSWER_DECLINED:
+        return "asked_declined"
+    if evidence or (
+        answer_disposition == phone.PHONE_ANSWER_ANSWERED
+        and topic_relation != "unrelated"
+    ):
+        return "asked_answered"
+    return "asked_unanswered"
+
+
 def _new_phone_call_metrics() -> dict[str, Any]:
     """Fresh per-call phone observability accumulator.
 
@@ -3983,6 +4032,11 @@ async def _run_native_phone_screening(
             else None
         )
         turn_dims = phone.phone_turn_dimensions(question.text, question_kind, text)
+        # Finding B: True when the delivery gate's bounded re-asks for a
+        # MANDATORY ask were exhausted THIS turn and the plan advances anyway
+        # — the durable disposition records `skipped_bounded`, the explicit
+        # "the bounded policy gave up" outcome, never a silent advance.
+        delivery_cap_exhausted = False
         # ── DELIVERY-VERIFIED COMMIT GATE (FIX 1, SE-call RCA 2026-09-07) ────
         # The commit below stamps `ask_delivered: True` from PLAYOUT alone. On
         # the live SE call the model's delivered reply drifted off the owed
@@ -4056,6 +4110,7 @@ async def _run_native_phone_screening(
                     error_category="delivery_gate_cap_reached",
                     turn_index=drift_seen,
                 )
+                delivery_cap_exhausted = True
         # ── ANSWER-GATE (owner directive, 2026-09-05) ─────────────────────────
         # The cursor may advance ONLY when the candidate ANSWERED the owed
         # question or explicitly DECLINED it. A merely-substantive non-answer (a
@@ -4442,6 +4497,10 @@ async def _run_native_phone_screening(
             "answer_evidence": turn_dims["answer_evidence"],
             "candidate_question": turn_dims["candidate_question"],
             "topic_relation": turn_dims["topic_relation"],
+            # Finding B: the delivery gate exhausted its bounded re-asks for a
+            # mandatory ask this turn — the durable outcome is an explicit
+            # `skipped_bounded`, never a silent advance.
+            "bounded_skip": delivery_cap_exhausted,
             "revision": 1,
             # W3 (2026-09-05): the LOGICAL candidate turn that captured this
             # boundary. The conflict-pending commit fence compares this against
@@ -4672,10 +4731,27 @@ async def _run_native_phone_screening(
             {"speaker": "bot", "text": prompt, "turn_started_at_ms": latest_assistant_anchor[0]},
             {"speaker": "candidate", "text": candidate, "turn_started_at_ms": _turn_anchor_ms(message) if message is not None else None},
         ]
+        # Finding B (Codex review §4): the truthful per-key outcome is
+        # computed HERE, at commit, from the boundary's own signals, and rides
+        # the durable write. A legacy/in-memory client without the parameter
+        # keeps its old signature (probed, not assumed — the same defensive
+        # idiom `record_probe` uses).
+        commit_kwargs: dict[str, Any] = {}
+        boundary_disposition = _phone_boundary_disposition(boundary)
+        if boundary_disposition is not None:
+            try:
+                commit_params = inspect.signature(
+                    events.commit_boundary,
+                ).parameters
+            except (TypeError, ValueError):  # pragma: no cover - exotic client
+                commit_params = {}
+            if "disposition" in commit_params:
+                commit_kwargs["disposition"] = boundary_disposition
         outcome = await events.commit_boundary(
             session_id, question.key, expected_index,
             boundary["source_event_id"], turns,
             list(boundary.get("covered_following_keys") or []),
+            **commit_kwargs,
         )
         if outcome.ok and outcome.cursor == cursor and expected_index < cursor:
             # A later snapshot of the same keyed boundary finished after the

@@ -441,6 +441,33 @@ describe('POST /assessment/turn', () => {
     });
   });
 
+  it('0086 (Finding B): forwards a valid disposition to the store', async () => {
+    const h = build();
+    const res = await post(h, '/assessment/turn', {
+      ...TURN_BODY, disposition: 'asked_answered',
+    });
+    expect(res.status).toBe(200);
+    expect(h.commitQuestionBoundary).toHaveBeenCalledWith(
+      expect.objectContaining({ disposition: 'asked_answered' }),
+    );
+  });
+
+  it('0086: a body WITHOUT disposition omits the key entirely (NULL = not measured)', async () => {
+    const h = build();
+    await post(h, '/assessment/turn', TURN_BODY);
+    const input = h.commitQuestionBoundary.mock.calls[0][0] as Record<string, unknown>;
+    expect('disposition' in input).toBe(false);
+  });
+
+  it('0086: a disposition outside the closed vocabulary is a flat 400', async () => {
+    const h = build();
+    const res = await post(h, '/assessment/turn', {
+      ...TURN_BODY, disposition: 'asked_maybe',
+    });
+    expect(res.status).toBe(400);
+    expect(h.commitQuestionBoundary).not.toHaveBeenCalled();
+  });
+
   it('`ok` comes from the RPC\'s own applied flag, never from the status string', async () => {
     // The shape a careless projection reports as success: a status that reads
     // like one, with the durability flag absent.

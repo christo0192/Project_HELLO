@@ -1708,6 +1708,7 @@ class PhoneEventClient:
         source_event_id: str,
         turns: list[dict[str, Any]],
         covered_question_keys: list[str] | None = None,
+        disposition: str | None = None,
     ) -> PhoneApiOutcome:
         """Commit ONE completed question boundary.
 
@@ -1715,6 +1716,13 @@ class PhoneEventClient:
         the server's own flag rather than inferred from the status string. A
         boundary that is not ``ok`` was not written, and the worker must
         neither ask the next question nor claim a completion.
+
+        ``disposition`` (0086, Codex review Finding B) is the truthful per-key
+        outcome the worker computed at commit — one of the six members of
+        ``PHONE_BOUNDARY_DISPOSITIONS`` — recorded on the durable progress row
+        because cursor advancement must not imply asked or covered. Omitted
+        (None) the body is byte-identical to before and the row records NULL
+        ("not measured").
         """
         body = {
             "session_id": str(session_id),
@@ -1724,6 +1732,8 @@ class PhoneEventClient:
             "turns": turns,
             "covered_question_keys": list(covered_question_keys or []),
         }
+        if disposition is not None:
+            body["disposition"] = str(disposition)
         response = await self._post(ASSESSMENT_TURN_PATH, body, "assessment_turn")
         if isinstance(response, str):
             return PhoneApiOutcome(False, error_category=response)
@@ -1924,6 +1934,17 @@ def _response_json(response: Any) -> Any:
         return getter()
     except Exception:  # noqa: BLE001
         return None
+
+
+#: 0086 (Codex review Finding B) — the closed per-key boundary outcome
+#: vocabulary. The worker computes exactly one of these at commit time and the
+#: durable `phone_session_progress.disposition` column records it (NULL = not
+#: measured). Mirrors the API schema enum and the migration CHECK; the three
+#: cannot drift silently because the RPC refuses any other value.
+PHONE_BOUNDARY_DISPOSITIONS: frozenset[str] = frozenset({
+    "asked_answered", "volunteered_with_evidence", "asked_declined",
+    "asked_unanswered", "not_delivered", "skipped_bounded",
+})
 
 
 # ── 0044: the assessment plan, the resume, and the boundary loop ──────

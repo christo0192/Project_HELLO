@@ -995,6 +995,11 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
           ? { p_covered_question_keys: coveredQuestionKeys }
           : {}),
         p_now: isoInstant(input.now),
+        // 0086 (Finding B): omitted entirely when the worker measured none,
+        // so the RPC default records an honest NULL rather than a guess.
+        ...(input.disposition !== undefined
+          ? { p_disposition: input.disposition }
+          : {}),
       });
       if (error) throw new Error('phone_commit_boundary_error');
       const row = asRow(data);

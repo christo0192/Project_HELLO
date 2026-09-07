@@ -285,6 +285,16 @@ const assessmentTurnSchema = z
     covered_question_keys: z.array(
       z.string().trim().regex(/^[A-Za-z0-9_.:-]{1,100}$/),
     ).max(3).default([]),
+    // 0086 (Codex review Finding B): the worker-computed truthful per-key
+    // outcome. Optional — an older worker omits it and the progress row
+    // records NULL ("not measured"). The RPC re-validates the same closed
+    // vocabulary, so a value that bypassed this schema is still refused.
+    disposition: z
+      .enum([
+        'asked_answered', 'volunteered_with_evidence', 'asked_declined',
+        'asked_unanswered', 'not_delivered', 'skipped_bounded',
+      ])
+      .optional(),
   })
   .strict();
 
@@ -1451,6 +1461,9 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         turns: parsed.data.turns,
         ...(parsed.data.covered_question_keys.length > 0
           ? { coveredQuestionKeys: parsed.data.covered_question_keys }
+          : {}),
+        ...(parsed.data.disposition !== undefined
+          ? { disposition: parsed.data.disposition }
           : {}),
         now: now(),
       });

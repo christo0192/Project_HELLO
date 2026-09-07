@@ -349,7 +349,7 @@ class FakeEventClient:
 
     async def commit_boundary(
         self, session_id, question_key, expected_index, source_event_id, turns,
-        covered_question_keys=None,
+        covered_question_keys=None, disposition=None,
     ):
         self.boundaries.append({
             "session_id": session_id,
@@ -358,6 +358,9 @@ class FakeEventClient:
             "source_event_id": source_event_id,
             "turns": list(turns),
             "covered_question_keys": list(covered_question_keys or []),
+            # 0086 (Finding B): the durable per-key outcome, recorded so a
+            # test can assert the truthful disposition rode the commit.
+            "disposition": disposition,
         })
         self.assessment_calls.append(("turn", question_key, expected_index))
         scripted = self._commits.get(question_key)

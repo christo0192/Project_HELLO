@@ -276,8 +276,28 @@ describe('the three new RPCs', () => {
   it('the boundary RPC takes the CAS and the idempotency key as parameters', () => {
     expect(functionParameters('commit_phone_question_boundary')).toEqual([
       'p_session_id', 'p_question_key', 'p_expected_index',
-      'p_source_event_id', 'p_turns', 'p_now',
+      'p_source_event_id', 'p_turns',
+      // 0086 (Finding B): the per-key outcome, defaulted; p_now stays FINAL
+      // per the repo-wide time-injection invariant.
+      'p_disposition', 'p_now',
     ]);
+  });
+
+  it('0086: the boundary RPC validates and records the per-key disposition', () => {
+    const body = functionBody('commit_phone_question_boundary');
+    // The closed vocabulary is refused BEFORE anything is written.
+    expect(body).toContain("'status', 'invalid_disposition'");
+    for (const member of [
+      'asked_answered', 'volunteered_with_evidence', 'asked_declined',
+      'asked_unanswered', 'not_delivered', 'skipped_bounded',
+    ]) {
+      expect(body).toContain(`'${member}'`);
+    }
+    // The progress INSERT carries the value.
+    expect(body).toMatch(/turn_count, committed_at, disposition\)/);
+    // Volunteered-coverage rows are volunteered_with_evidence BY CONSTRUCTION.
+    const coverage = functionBody('commit_phone_question_boundary_with_coverage');
+    expect(coverage).toContain("'volunteered_with_evidence'");
   });
 
   it('the boundary RPC refuses a NULL expected index — an absent CAS is not a CAS', () => {

@@ -180,6 +180,12 @@ export const MIGRATION_0085_PATH = fileURLToPath(
 
 export const MIGRATION_0085 = readFileSync(MIGRATION_0085_PATH, 'utf8');
 
+export const MIGRATION_0086_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0086_phone_boundary_disposition.sql', import.meta.url),
+);
+
+export const MIGRATION_0086 = readFileSync(MIGRATION_0086_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -187,6 +193,12 @@ export const MIGRATION_0085 = readFileSync(MIGRATION_0085_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0086 re-declares commit_phone_question_boundary and
+    // commit_phone_question_boundary_with_coverage in full (appended
+    // p_disposition + the per-key disposition column), so it must be
+    // NEWEST-FIRST for the extractors to read the effective bodies rather
+    // than 0071/0077's.
+    { name: '0086', sql: MIGRATION_0086 },
     // 0085 re-declares phone_temporary_247_until, phone_ist_window_open and
     // phone_next_window_open in full (0064-style bodies, cutoff 2026-09-13,
     // aligning repo SQL with the out-of-band production extension), so it must
