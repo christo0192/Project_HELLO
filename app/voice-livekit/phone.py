@@ -538,6 +538,14 @@ ITEM_TURN_PATH = "/api/internal/phone/assessment/item-turn"
 GATE_TURNS_PATH = "/api/internal/phone/assessment/gate-turns"
 PROBE_PATH = "/api/internal/phone/assessment/probe"
 ASSESSMENT_COMPLETE_PATH = "/api/internal/phone/assessment/complete"
+#: Finding H (Codex review §10): the standalone per-call observability writer.
+#: `/assessment/complete` only carries the snapshot on the `completed` leg, so a
+#: candidate hangup / disconnect / recovery exit used to leave
+#: `call_sessions.observability = {}` (Call B, 2026-09-07). Terminal-but-not-
+#: completed exits post the same compact snapshot here instead. Best-effort and
+#: idempotent (full-replace server-side; the server refuses an EMPTY snapshot so
+#: good data is never overwritten by nothing).
+OBSERVABILITY_PATH = "/api/internal/phone/observability"
 #: P5: the lease renewal. Under `/api/internal/phone` with every other worker
 #: call, because that is the ONE mount (`app.ts`: `app.use('/api/internal/phone',
 #: phoneWorkerRouter)`). An earlier constant said `/api/phone-worker/...` and
@@ -1835,6 +1843,45 @@ class PhoneEventClient:
         )
         outcome.adopted = data.get("adopted") is True
         return outcome
+
+    async def post_observability(
+        self,
+        session_id: str,
+        metrics: dict[str, Any],
+    ) -> PhoneApiOutcome:
+        """Persist the per-call observability snapshot OUTSIDE completion.
+
+        Finding H (Codex review §10): the snapshot used to ride ONLY the
+        ``reason == "completed"`` completion body, so a candidate hangup,
+        disconnect, or recovery exit reached the API with
+        ``observability = {}``. This posts the same compact snapshot for those
+        exits. Contract:
+
+          * BEST-EFFORT — a failure here must never change the terminal
+            handling of the call; callers log-and-continue.
+          * IDEMPOTENT — the snapshot is a full replace, so re-posting the
+            same one is harmless; the server refuses an EMPTY snapshot so a
+            late empty write can never clobber good data.
+          * BOUNDED — one post, no retry loop (the reconnect/completion legs
+            re-send richer snapshots on their own paths).
+        """
+        if not isinstance(metrics, dict) or not metrics:
+            return PhoneApiOutcome(False, error_category="empty_snapshot")
+        body: dict[str, Any] = {
+            "session_id": str(session_id),
+            "metrics": metrics,
+        }
+        response = await self._post(OBSERVABILITY_PATH, body, "observability")
+        if isinstance(response, str):
+            return PhoneApiOutcome(False, error_category=response)
+        data = _response_json(response)
+        if not isinstance(data, dict):
+            return PhoneApiOutcome(False, error_category=_ERR_MALFORMED)
+        status = data.get("status")
+        return PhoneApiOutcome(
+            data.get("ok") is True,
+            str(status) if status is not None else None,
+        )
 
 
 def _response_json(response: Any) -> Any:

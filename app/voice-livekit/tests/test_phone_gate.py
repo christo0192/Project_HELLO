@@ -9024,12 +9024,13 @@ class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             phone.phone_conflict_key(self.ASYNC_CONFLICT), agent._asked_conflicts,
         )
-        # Delivered log emitted.
+        # Scheduled log emitted (Finding F: arming is scheduling, not
+        # delivery — the delivered proof lives in on_reply_delivered).
         categories = [
             c.kwargs.get("error_category") for c in hooks["log"].info.call_args_list
             if c.kwargs.get("error_type") == "phone_coverage_conflict"
         ]
-        self.assertIn("owed_conflict_probe_delivered", categories)
+        self.assertIn("owed_conflict_probe_scheduled", categories)
         await self._close(hooks)
 
     async def test_owed_probe_survives_stt_fragmentation_of_the_next_turn(self):

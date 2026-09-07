@@ -333,6 +333,22 @@ const assessmentCompleteSchema = z
   .strict();
 
 /**
+ * Finding H (Codex review §10, 2026-09-07) — the standalone observability
+ * writer's body. The snapshot used to ride ONLY the `completed` completion
+ * body, so a candidate hangup / disconnect / recovery exit left
+ * `call_sessions.observability = {}` (Call B). Same metrics shape as the
+ * completion body; `metrics` is REQUIRED here — this route exists only to
+ * carry a snapshot, and an empty one is refused so good data is never
+ * overwritten by nothing.
+ */
+const observabilityWriteSchema = z
+  .object({
+    session_id: z.string().regex(UUID_RE),
+    metrics: phoneObservabilitySchema,
+  })
+  .strict();
+
+/**
  * 0067 — the PRE-CONSENT (gate) transcript.
  *
  * The bounds MIRROR `commit_phone_gate_turns` exactly: 1..6 turns, text trimmed
@@ -1642,7 +1658,10 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       // and synchronous scoring paths so a queued completion still records
       // observability. Best-effort: a write failure must NOT fail the terminal
       // completion (the call is already over), so it is logged-and-swallowed.
-      if (parsed.data.metrics !== undefined) {
+      // Finding H: an EMPTY snapshot never writes — a completing leg that
+      // somehow carried `{}` must not clobber a snapshot the hangup path (or
+      // an earlier leg) already persisted through `/observability`.
+      if (parsed.data.metrics !== undefined && Object.keys(parsed.data.metrics).length > 0) {
         try {
           const { error: observabilityError } = await supabase
             .from('call_sessions')
@@ -1714,6 +1733,53 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       return res.json({ ok: true, status: 'scored', adopted: false });
     } catch {
       return res.status(500).json({ ok: false, status: 'phone_assessment_error' });
+    }
+  });
+
+  // ── POST /observability ───────────────────────────────────────────
+  // Finding H (Codex review §10, 2026-09-07). The per-call observability
+  // snapshot used to be written ONLY on the `/assessment/complete` `completed`
+  // leg; every other exit (candidate hangup, disconnect, recovery) reached the
+  // API with `observability = {}` (Call B). The worker now posts the same
+  // compact snapshot here on those exits. Semantics:
+  //   * idempotent full replace, last-write-wins — exactly like the
+  //     completion-path write;
+  //   * an EMPTY snapshot is REFUSED (`empty_snapshot`) so a late empty write
+  //     can never clobber good data;
+  //   * best-effort — the worker logs-and-continues on failure; nothing about
+  //     terminal handling depends on this write.
+  // No session-status gate: a snapshot for an already-terminal session is
+  // still the truthful record of the call that just ended.
+  router.post('/observability', requireWorkerPhoneAuth, async (req, res) => {
+    try {
+      if (!config().screeningEnabled) {
+        return res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      }
+      const parsed = observabilityWriteSchema.safeParse(req.body);
+      if (!parsed.success) {
+        return res.status(400).json({ ok: false, status: 'invalid_request' });
+      }
+      if (Object.keys(parsed.data.metrics).length === 0) {
+        return res.json({ ok: false, status: 'empty_snapshot' });
+      }
+      const { error: observabilityError } = await supabase
+        .from('call_sessions')
+        .update({ observability: parsed.data.metrics })
+        .eq('id', parsed.data.session_id);
+      if (observabilityError) {
+        phoneWorkerLog.warn('unknown_event', {
+          schema: 'phone_observability',
+          error_category: 'observability_write_failed',
+        });
+        return res.json({ ok: false, status: 'write_failed' });
+      }
+      return res.json({ ok: true, status: 'ok' });
+    } catch {
+      phoneWorkerLog.warn('unknown_event', {
+        schema: 'phone_observability',
+        error_category: 'observability_write_error',
+      });
+      return res.status(500).json({ ok: false, status: 'phone_observability_error' });
     }
   });
 

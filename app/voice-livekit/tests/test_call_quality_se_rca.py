@@ -453,7 +453,9 @@ class TestCoverageJudgeTelemetry(unittest.TestCase):
         "covered_model", "not_covered_model",
         "judge_timeout", "judge_error",
         "conflict_found", "conflict_found_deterministic",
-        "conflict_probe_delivered",
+        # Codex review Finding F: arming counts `scheduled`; only the playout
+        # proof counts `delivered` — for every origin.
+        "conflict_probe_scheduled", "conflict_probe_delivered",
     )
 
     def test_accumulator_starts_with_honest_zeros(self):
@@ -547,9 +549,21 @@ class TestCoverageJudgeTelemetryWiring(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(await self._drain(
                 lambda: call_metrics["coverage_judge"]["covered_model"] == 1))
             self.assertEqual(call_metrics["coverage_judge"]["conflict_found"], 1)
-            # The next authored turn delivers the owed probe.
+            # The next authored turn SCHEDULES the owed probe. Finding F
+            # (Codex review §8): arming is not delivery — the async promotion
+            # used to bump `conflict_probe_delivered` here, mixing scheduled
+            # and played probes in one metric.
             hooks["latest_assistant"][0] = "What is your notice period?"
             await self._turn(hooks, "Thirty days notice, I can start after that.")
+        self.assertEqual(
+            call_metrics["coverage_judge"]["conflict_probe_scheduled"], 1)
+        self.assertEqual(
+            call_metrics["coverage_judge"]["conflict_probe_delivered"], 0)
+        # Only the playout proof counts the delivery — same choke point as the
+        # sync deterministic path.
+        value = agent._on_reply_delivered(False)
+        if asyncio.iscoroutine(value):
+            await value
         self.assertEqual(
             call_metrics["coverage_judge"]["conflict_probe_delivered"], 1)
         await self._close(hooks)

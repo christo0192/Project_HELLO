@@ -499,10 +499,17 @@ def _new_phone_call_metrics() -> dict[str, Any]:
             # F-Q2a (call #2 RCA, 2026-09-07): conflicts found by the SYNC
             # deterministic detector. The live probe demonstrably played while
             # both counters above read 0/0, because only the ASYNC judge choke
-            # points bumped them; the deterministic fire sites now count here,
-            # and `conflict_probe_delivered` is also bumped when a sync-authored
-            # probe is proven delivered (`on_reply_delivered` key-presence).
+            # points bumped them; the deterministic fire sites now count here.
             "conflict_found_deterministic": 0,
+            # Codex review Finding F (2026-09-07): the funnel separates
+            # SCHEDULED (a probe was armed/selected for delivery — bumped at
+            # the single `_arm_conflict_delivery` choke point, every origin)
+            # from DELIVERED (the probe demonstrably PLAYED — bumped only by
+            # the `on_reply_delivered` proof, every origin). The async
+            # owed-probe branch used to bump `conflict_probe_delivered` at
+            # ARMING time, so the same metric mixed scheduled and played and
+            # a probe that never made it to audio still read as delivered.
+            "conflict_probe_scheduled": 0,
             "conflict_probe_delivered": 0,
         },
     }
@@ -515,7 +522,7 @@ _PHONE_COVERAGE_JUDGE_BUCKETS: tuple[str, ...] = (
     "covered_model", "not_covered_model",
     "judge_timeout", "judge_error",
     "conflict_found", "conflict_found_deterministic",
-    "conflict_probe_delivered",
+    "conflict_probe_scheduled", "conflict_probe_delivered",
 )
 
 
@@ -2686,17 +2693,21 @@ async def _run_native_phone_screening(
         deterministic watchdog's extra `session.say()` fallback can no longer
         strand the arm.
 
-        F-Q2a: ``origin`` tags WHICH machinery armed this probe so the delivery
-        proof in `on_reply_delivered` can bump `conflict_probe_delivered` for the
-        SYNC deterministic sites only — the async owed-probe path already counts
-        itself at promotion time, and double-counting one delivery would corrupt
-        the found→delivered funnel the telemetry exists to expose."""
+        Finding F (Codex review §8, 2026-09-07): arming is SCHEDULING, not
+        delivery. This single writer bumps `conflict_probe_scheduled` for every
+        origin (deterministic sync, async owed promotion, LLM-authored, and
+        the re-pursuit), and `conflict_probe_delivered` is bumped ONLY by the
+        `on_reply_delivered` playout proof — also for every origin. The old
+        split (async counted "delivered" at promotion; sync counted at the
+        delivery callback) mixed scheduled and played probes in one metric.
+        ``origin`` remains as an observability tag on the armed record."""
         conflict_delivery.update({
             "sequence": speech_sequence[0] + 1,
             "key": key,
             "conflict": dict(conflict) if isinstance(conflict, dict) else None,
             "origin": origin,
         })
+        _bump_coverage_judge_metric(call_metrics, "conflict_probe_scheduled")
 
     def _maybe_arm_llm_authored_conflict(reply_text: Any) -> bool:
         """F2 (2026-09-06): arm the bounded conflict loop for an LLM-authored probe.
@@ -4151,22 +4162,21 @@ async def _run_native_phone_screening(
                         if owed_instruction is not None:
                             judge_instruction = owed_instruction
                             asked_conflicts.add(owed_key)
-                            # F-Q2a: the async owed probe counts its own
-                            # delivery right below — the origin tag keeps the
-                            # `on_reply_delivered` sync bump from double-counting
-                            # this same probe.
+                            # Finding F (Codex review §8): this is the probe
+                            # being SCHEDULED (armed for the reply now being
+                            # authored), not delivered. `_arm_conflict_delivery`
+                            # counts `conflict_probe_scheduled`; the delivered
+                            # bump moved to the `on_reply_delivered` playout
+                            # proof, same as the sync deterministic path — the
+                            # old arm-time bump made a probe that never reached
+                            # audio read as delivered.
                             _arm_conflict_delivery(
                                 owed_key, owed_conflict, origin="async_owed",
                             )
                             _log.info(
                                 "unknown_event",
                                 error_type="phone_coverage_conflict",
-                                error_category="owed_conflict_probe_delivered",
-                            )
-                            # FIX 4 (2026-09-07): funnel companion to
-                            # `conflict_found` at the judge choke point.
-                            _bump_coverage_judge_metric(
-                                call_metrics, "conflict_probe_delivered",
+                                error_category="owed_conflict_probe_scheduled",
                             )
             if (
                 judge_instruction is None
@@ -5181,15 +5191,16 @@ async def _run_native_phone_screening(
             _arm_conflict_reply_pending(
                 conflict_delivery.get("conflict"), armed_turn=None,
             )
-            # F-Q2a: the probe is now PROVEN delivered. Close the deterministic
-            # found→delivered funnel here — the live call's probe demonstrably
-            # played while `conflict_probe_delivered` read 0, because only the
-            # async owed-probe promotion bumped it. Sync-armed probes only: the
-            # async path already counted itself at promotion (origin tag).
-            if conflict_delivery.get("origin") == "deterministic_sync":
-                _bump_coverage_judge_metric(
-                    call_metrics, "conflict_probe_delivered",
-                )
+            # Finding F (Codex review §8): the probe is now PROVEN delivered —
+            # this playout proof is the ONLY writer of `conflict_probe_
+            # delivered`, for EVERY origin. The async owed-probe promotion no
+            # longer counts itself at arming time (that mixed scheduled and
+            # played probes in one metric); arming counts `conflict_probe_
+            # scheduled` inside `_arm_conflict_delivery` instead, so the
+            # detected→scheduled→delivered funnel is separable after the call.
+            _bump_coverage_judge_metric(
+                call_metrics, "conflict_probe_delivered",
+            )
             conflict_delivery.update({
                 "sequence": None, "key": None, "conflict": None, "origin": None,
             })
@@ -5557,6 +5568,51 @@ async def _run_native_phone_screening(
     # network time has already elapsed — so the common path adds no dead-air.
     goodbye_finished_monotonic = time.monotonic()
 
+    async def _persist_observability_snapshot() -> None:
+        """Finding H (Codex review §10): persist the snapshot on EVERY exit.
+
+        The metrics snapshot used to be prepared and submitted only inside the
+        ``reason == "completed"`` completion loop; a candidate hangup,
+        disconnect, or recovery exit reached the API with
+        ``observability = {}`` (Call B, 2026-09-07). This helper posts the
+        same compact summary through the standalone observability endpoint:
+
+          * best-effort — a failure never changes terminal handling;
+          * idempotent — full-replace server-side, and the server refuses an
+            EMPTY snapshot so good data is never overwritten by nothing;
+          * bounded — one post per exit, no retry loop.
+
+        The ``completed`` leg keeps riding the completion body (verified,
+        retried); this helper is its fallback when that loop never landed.
+        """
+        if call_metrics is None:
+            return
+        poster = getattr(events, "post_observability", None)
+        if not callable(poster):
+            return
+        try:
+            snapshot = _summarize_phone_call_metrics(call_metrics)
+            if not snapshot:
+                return
+            outcome = await poster(session_id, snapshot)
+            if not getattr(outcome, "ok", False):
+                _log.info(
+                    "unknown_event", error_type="phone_observability",
+                    error_category="snapshot_post_failed",
+                )
+        except Exception:  # noqa: BLE001
+            _log.warn(
+                "unknown_event", error_type="phone_observability",
+                error_category="snapshot_post_error",
+            )
+
+    if reason != "completed":
+        # Every non-completed terminal exit (candidate hangup, no-answer,
+        # malformed, disconnect, retryable recovery, aborts) persists its
+        # snapshot HERE, before the per-reason branches below (the disconnect
+        # branch returns early inside them).
+        await _persist_observability_snapshot()
+
     if reason == "completed":
         done = None
         queue_owned = False
@@ -5593,6 +5649,13 @@ async def _run_native_phone_screening(
                 # queue worker; this worker never re-drives scoring.
                 queue_owned = True
                 break
+        if not queue_owned and (done is None or not done.ok):
+            # Finding H fallback: the completion loop never landed (transport
+            # failure or a non-score refusal such as `plan_incomplete`), so the
+            # snapshot it carried was never written. Post it standalone —
+            # idempotent, and a later successful completion leg simply
+            # re-replaces it with the same data.
+            await _persist_observability_snapshot()
         if queue_owned:
             # ── QUEUED SCORING: CLOSE THE LEG, HAND THE HOLD TO THE CALLER ───
             # The old behavior returned straight through the caller's finally,
