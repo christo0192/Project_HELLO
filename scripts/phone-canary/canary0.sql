@@ -181,7 +181,10 @@ begin
            jsonb_build_array(
              jsonb_build_object('speaker','bot','text','Asking the question.'),
              jsonb_build_object('speaker','candidate','text','Answering the question.')),
-           t + interval '30 seconds' + (cursor_now * interval '10 seconds'));
+           -- 0086: p_disposition sits before p_now (defaulted), so the clock
+           -- is passed by NAME — the repo-wide convention for the re-declared
+           -- boundary RPCs' callers.
+           p_now => t + interval '30 seconds' + (cursor_now * interval '10 seconds'));
     if r->>'status' <> 'applied' then
       perform _phone_canary.chk(s, 'boundary_applied', false,
                                 _phone_canary.code(r->>'status'));
@@ -207,7 +210,7 @@ begin
          jsonb_build_array(
            jsonb_build_object('speaker','bot','text','Asking the question.'),
            jsonb_build_object('speaker','candidate','text','Answering the question.')),
-         t + interval '5 minutes');
+         p_now => t + interval '5 minutes');
   perform _phone_canary.chk(s, 'boundary_replay_is_idempotent',
                             r->>'status' = 'applied' and (r->>'duplicate')::boolean,
                             _phone_canary.code(r->>'status'));
@@ -458,7 +461,7 @@ begin
          jsonb_build_array(
            jsonb_build_object('speaker','bot','text','Asking the first question.'),
            jsonb_build_object('speaker','candidate','text','Answering the first question.')),
-         t + interval '40 seconds');
+         p_now => t + interval '40 seconds');
   perform _phone_canary.chk(s, 'first_boundary_committed', r->>'status' = 'applied',
                             _phone_canary.code(r->>'status'));
 
