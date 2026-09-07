@@ -70,9 +70,20 @@ import type { AshbySignalPayload } from './ports.js';
 export const ASHBY_INGESTION_QUEUE = 'ashby.ingestion';
 
 /**
- * Ingestion states from which no further work is possible (0029 state machine).
- * A link in one of these must never re-enter fetch/scan/parse — re-downloading
- * a candidate's resume is both a PII cost and a provider cost.
+ * Ingestion states the GENERIC pipeline treats as settled: it must never
+ * re-enter fetch/scan/parse for a link resting in one of them —
+ * re-downloading a candidate's resume is both a PII cost and a provider cost.
+ *
+ * "Terminal" is deliberately the GENERIC-path claim, not an absolute one:
+ * since 0084, `ready` has one audited exit (`recover_ashby_model_degraded`,
+ * the model-degraded re-drive), which moves the row to `queued` inside its
+ * own RPC — at which point the state is no longer in this set and the
+ * ordinary pipeline runs it like any fresh ingestion. Both membership checks
+ * below remain exactly right: they gate the generic import/requeue paths,
+ * which must go on refusing settled rows (`advance_ashby_ingestion` enforces
+ * the same refusal DB-side with `model_degraded_recovery_only`). An earlier
+ * revision of this comment said "no further work is possible", which
+ * overstated it.
  */
 export const TERMINAL_INGESTION_STATES: ReadonlySet<string> = new Set(['ready', 'cancelled']);
 

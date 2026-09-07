@@ -28,6 +28,14 @@ primary_region = "sin"
   DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1/chat/completions"
   DEEPSEEK_TIMEOUT_MS = "120000"
   DEEPSEEK_MAX_OUTPUT_BYTES = "5242880"
+  # Parser/scoring reasoning bumped from model-default to "high"
+  # (owner-approved 2026-09-07). The parse path is async with the 120s timeout
+  # above, so latency is irrelevant there, and higher reasoning reduces the
+  # malformed/mistyped-output failure mode behind the deterministic-fallback
+  # RCA (one of three identical résumés silently degraded). The PHONE lane is
+  # unaffected: the phone LLM reads its own PHONE_LLM_* config (reasoning
+  # "none"), never this key.
+  DEEPSEEK_REASONING_EFFORT = "high"
   RECORDINGS_BUCKET = "recordings_v2"
   RECORDING_DOWNLOAD_TTL_SEC = "300"
   RECORDING_MAX_BYTES = "26214400"

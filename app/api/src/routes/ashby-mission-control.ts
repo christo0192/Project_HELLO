@@ -600,6 +600,52 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     }
   });
 
+  /**
+   * Audited re-drive of a MODEL-DEGRADED ready ingestion (0084).
+   *
+   * A DELIBERATELY SEPARATE route from the two retries above, because it
+   * admits the one row both of them refuse for ever: a "successful"
+   * ingestion (`state = 'ready'`) whose structuring silently fell back to
+   * the deterministic extractor when the model call failed (RCA 2026-09-07:
+   * one of three identical résumés), leaving the candidate permanently
+   * non-dialable with no operator remedy short of a new application.
+   *
+   * Everything that decides eligibility is SERVER-SIDE in the RPC: the state
+   * must be `ready`, the structurer tag must be in the
+   * `deterministic-fallback%` family, the application must not be terminal,
+   * the unchanged five-attempt ceiling must still allow it, and an in-flight
+   * ingestion job refuses before anything is spent. The recovery is
+   * self-limiting — a re-run the model answers rewrites the tag and closes
+   * the door. This route contributes authentication, the admin gate, id
+   * validation and the audit record, and nothing else.
+   *
+   * It issues no invite, moves no stage, and calls no provider.
+   */
+  router.post('/ingestions/:applicationLinkId/retry-model-degraded', requireRole('admin'), async (req: Request, res: Response) => {
+    const linkId = req.params.applicationLinkId;
+    if (!UUID_RE.test(linkId)) {
+      res.status(400).json({ ok: false, error: 'invalid_application_link_id' });
+      return;
+    }
+    try {
+      const actorId = req.authUser?.id ?? '';
+      const result = await store().retryModelDegraded(linkId, actorId);
+      // Opaque link id and a stable status only — never a structurer tag, an
+      // external Ashby id, a file handle, or a candidate field.
+      await recordAudit(req, 'resource.update', result.status === 'ok' ? 200 : 409, {
+        metadata: {
+          resource: 'ashby_resume_ingestion',
+          application_link_id: linkId,
+          outcome: result.status,
+        },
+      });
+      if (result.status === 'ok') { res.json({ ok: true }); return; }
+      res.status(409).json({ ok: false, error: result.status });
+    } catch {
+      res.status(500).json({ ok: false, error: 'mission_control_action_error' });
+    }
+  });
+
   return router;
 }
 

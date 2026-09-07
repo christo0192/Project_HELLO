@@ -1063,7 +1063,14 @@ describe('OpenAPI document integrity', () => {
     // report that latches a never-uploaded recording to `failed` instead of
     // letting the finalizer retry to exhaustion (live 2026-09-03). Same
     // worker-authenticated surface, same 404-when-off posture. 116 + 1 = 117.
-    expect(Object.keys(paths).length).toBe(117);
+    // The model-degraded re-drive (0084) adds ONE admin path —
+    // /api/integrations/ashby/mission-control/ingestions/{applicationLinkId}/
+    // retry-model-degraded — the audited re-drive of a READY ingestion whose
+    // model structuring silently degraded to the deterministic extractor
+    // (RCA 2026-09-07). Same admin-gated Mission Control surface as the two
+    // existing ingestion retries; widens no candidate-facing route.
+    // 117 + 1 = 118.
+    expect(Object.keys(paths).length).toBe(118);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas

@@ -53,6 +53,7 @@ function recorder(status = 'ok'): Recorder {
     retryOperation: async () => ({ status: 'ok' }),
     retryIngestionParse: async () => ({ status: 'ok' }),
     retryLegacyBadOutput: async () => ({ status: 'ok' }),
+    retryModelDegraded: async () => ({ status: 'ok' }),
     upsertMapping: async () => ({ status: 'ok', id: UUID }),
     reissueManualInvite: async (input) => {
       rec.reissues.push(input);

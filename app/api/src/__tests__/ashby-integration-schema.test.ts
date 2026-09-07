@@ -72,11 +72,25 @@ describe('ingestion state machine', () => {
     expect(isValidIngestionTransition('failed_review', 'cancelled')).toBe(true);
   });
 
-  it('rejects skips, backward moves, and transitions out of terminal states', () => {
+  it('rejects skips, backward moves, and transitions out of cancelled', () => {
     expect(isValidIngestionTransition('queued', 'ready')).toBe(false);        // skip
     expect(isValidIngestionTransition('extracting', 'fetching')).toBe(false); // backward
-    expect(isValidIngestionTransition('ready', 'queued')).toBe(false);        // terminal
     expect(isValidIngestionTransition('cancelled', 'queued')).toBe(false);    // terminal
+    expect(isValidIngestionTransition('cancelled', 'ready')).toBe(false);     // terminal
+  });
+
+  it('permits ready -> queued — the 0084 audited model-degraded re-drive, and ONLY that exit', () => {
+    // Since 0084 `ready` is no longer absolutely terminal: the audited
+    // recovery RPC may re-queue a ready row whose model structuring silently
+    // degraded. The edge is RPC-only in production — the generic
+    // advance_ashby_ingestion refuses it (model_degraded_recovery_only) — but
+    // the state machine itself must acknowledge it or this map lies to the
+    // next reader the way its earlier "ready: [] // terminal" entry did.
+    expect(isValidIngestionTransition('ready', 'queued')).toBe(true);
+    // ...and nothing else leaves ready.
+    for (const to of ['fetching', 'scanning', 'extracting', 'structuring', 'failed_review', 'cancelled'] as const) {
+      expect(isValidIngestionTransition('ready', to)).toBe(false);
+    }
   });
 });
 

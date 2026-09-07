@@ -49,7 +49,23 @@ export type OperationState = (typeof OPERATION_STATES)[number];
 
 // ── Resume ingestion state machine (parity with the DB trigger) ─────────────
 
-/** Legal next-states for each ingestion state; terminal states have none. */
+/**
+ * Legal next-states for each ingestion state.
+ *
+ * PARITY NOTE, read before trusting this map: the DB trigger has grown edges
+ * beyond the original 0029 shape. 0037/0039 added
+ * `fetching`/`scanning`/`extracting` -> `queued` (abandon-before-verdict and
+ * parse-deferral requeues, driven only by their own RPCs) — those internal
+ * mid-flight edges are deliberately NOT modelled here. 0084 added
+ * `ready -> queued` — the audited model-degraded re-drive
+ * (`recover_ashby_model_degraded`) — and that one IS modelled, because
+ * "ready is terminal" stopped being true: an earlier revision of this map
+ * said exactly that, and a reader who believed it would conclude a degraded
+ * ready row can never be repaired. The edge is reachable ONLY through the
+ * audited RPC; `advance_ashby_ingestion` refuses it on the generic path
+ * (`model_degraded_recovery_only`), so webhook redelivery still cannot walk
+ * it. `cancelled` remains fully terminal.
+ */
 export const INGESTION_TRANSITIONS: Readonly<Record<IngestionState, readonly IngestionState[]>> = {
   queued: ['fetching', 'cancelled'],
   fetching: ['scanning', 'failed_review', 'cancelled'],
@@ -57,7 +73,7 @@ export const INGESTION_TRANSITIONS: Readonly<Record<IngestionState, readonly Ing
   extracting: ['structuring', 'failed_review', 'cancelled'],
   structuring: ['ready', 'failed_review', 'cancelled'],
   failed_review: ['queued', 'cancelled'], // retriable
-  ready: [], // terminal
+  ready: ['queued'], // 0084 audited re-drive ONLY; generic advance refuses
   cancelled: [], // terminal
 } as const;
 
