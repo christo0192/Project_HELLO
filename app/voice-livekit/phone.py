@@ -930,6 +930,50 @@ def phone_generative_objective_guard_enabled() -> bool:
     }
 
 
+def phone_reply_token_streaming_enabled() -> bool:
+    """A0 (PR2b): 100%-TTFT true token streaming for NORMAL screening turns.
+
+    THE LATENCY PROBLEM (owner, 2026-09-08): "most of the TTFT is not going and
+    waiting for full generation when there is no acknowledgement… I want 100%
+    TTFT to get streamed." On a NORMAL planned-question turn, ``llm_node``'s
+    guarded incremental release (below) only lets an acknowledgement PREFIX
+    (``"?" not in prefix``) leave before the full draft is validated. A reply
+    that LEADS WITH the question — no preceding acknowledgement clause — never
+    satisfies that prefix gate, so its first speakable token is withheld until
+    the WHOLE generation completes and passes ``phone_generated_reply_rejection_
+    reason``. That whole-generation wait is the TTFT floor this fix removes.
+
+    THE FIX (default ON): for the NORMAL turn class ONLY — ``_turn_policy ==
+    "substantive"`` AND ``_generation_phase == "screening"`` (the ordinary
+    planned-question shape the per-turn prompt binds to "one brief
+    acknowledgement followed by exactly one question … do not close") — yield
+    every LLM chunk to TTS AS IT ARRIVES, so first audio tracks the LLM's
+    first-token latency, not full-generation latency. The reply validator still
+    runs on the fully assembled text, but ADVISORY (log-only) — it can no longer
+    gate pre-speech for a streamed turn because speech has already begun. The
+    downstream nets remain the pre-speech authorities they always were: the
+    answer-gate re-asks on the NEXT turn if the owed question went unanswered,
+    the delivery-gate detects drift, and objective_drift is already log-only
+    (B4, PR1a). Barge-in is unaffected: streaming just yields the SDK chunks the
+    parent node would have yielded anyway, so AgentSession's interruption still
+    cancels the in-flight stream exactly as it does for the browser lane.
+
+    SENSITIVE TURNS ARE NEVER STREAMED optimistically and this switch does not
+    touch them — the consent-answer discard, the gate opening, closing/terminal
+    turns (``allow_closing`` / phase ``closing``), résumé-conflict probes (phase
+    ``resume_conflict``), and name-confirmation turns (phase ``name_confirm``)
+    all stay on today's buffer-then-validate-then-speak path because they carry
+    a policy/phase this predicate deliberately excludes. See ``llm_node``.
+
+    ``off`` (or 0/false/no) restores the pre-A0 guarded-buffering behaviour for
+    every turn — the instant rollback. Read at the CALL SITE with the literal
+    name so the env-contract scanner sees it.
+    """
+    return (os.getenv("PHONE_REPLY_TOKEN_STREAMING") or "on").strip().lower() not in {
+        "0", "false", "off", "no",
+    }
+
+
 def phone_objective_preemptive_enabled() -> bool:
     """Overlap stable-objective LLM work with the bounded EOU tail.
 
@@ -1060,14 +1104,20 @@ def phone_turn_detection() -> str:
 
 def phone_static_endpointing_max_delay() -> float:
     """Read an optional phone-only max-delay override, defaulting to 0.8s. Bounded
-    to [0.5, 2.0]; the deployed value (0.8) shortens the slow-speaker tail and the
+    to [0.5, 3.0]; the deployed value shortens the slow-speaker tail and the
     dead-air after the candidate stops. A longer tail can still be restored via an
-    explicit override (e.g. 1.25) without a code change.
+    explicit override without a code change.
 
     v114 (live call): the clamp floor was lowered from 1.0 to 0.5 so a desired
     0.8s max is honoured verbatim instead of being clamped up to 1.0.
     v115 (latency RCA): the default itself was lowered 1.5 -> 0.8 — the long
-    default tail caused multi-second waits on natural mid-answer pauses."""
+    default tail caused multi-second waits on natural mid-answer pauses.
+    PR2a (fragmentation): the clamp CEILING was raised 2.0 -> 3.0 so the deploy
+    value can move toward the browser default (2.5). MAX only bounds the wait on
+    a genuinely-INCOMPLETE utterance — the built-in v1-mini EOU commits a
+    COMPLETE answer at MIN regardless of MAX — so a larger MAX lets a mid-thought
+    pause breathe like the browser lane at near-zero common-case latency cost.
+    The MIN reader and its [0.3, 0.5] clamp are unchanged."""
     raw = os.getenv("PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC")
     if raw in (None, ""):
         return PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC
@@ -1075,7 +1125,7 @@ def phone_static_endpointing_max_delay() -> float:
         value = float(raw)
     except ValueError:
         return PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC
-    return min(2.0, max(0.5, value))
+    return min(3.0, max(0.5, value))
 
 
 def phone_local_endpointing_delays() -> tuple[float, float]:
@@ -2751,6 +2801,29 @@ def strip_markdown_for_speech(text: Any) -> str:
     return text.translate(_MARKDOWN_SPEECH_CHARS)
 
 
+#: A0 (PR2b): the leading segment the streamed-turn content gate holds before it
+#: releases and streams. Small — a boundary-less lead still releases within a
+#: clause's worth of characters so first audio is not delayed, while giving the
+#: instruction-echo / premature-closing leak vetoes enough text to fire. The
+#: leak checks also run at any earlier clause/sentence boundary, so this cap only
+#: bounds the pathological no-punctuation lead.
+_A0_LEADING_SEGMENT_MAX_CHARS = 48
+
+
+async def _achain(prefix_items: list[Any], rest: Any) -> Any:
+    """Yield already-pulled chunks, then the untouched remainder of a stream.
+
+    A0 (PR2b): when the leading-segment content gate WITHHELDS a streamed reply
+    (leak/premature-close), the chunks it already pulled must be fed back ahead
+    of the untouched stream tail so the buffered guarded path sees the COMPLETE
+    reply, byte-for-byte, and can recover deterministically. No chunk is dropped
+    or reordered."""
+    for item in prefix_items:
+        yield item
+    async for item in rest:
+        yield item
+
+
 async def _aiter_text(text: Any) -> Any:
     """Normalise a TTS-node text source to an async iterator of str chunks.
 
@@ -3015,6 +3088,57 @@ def bounded_phone_chat_context(chat_ctx: Any) -> Any:
     bounded = copy_ctx()
     bounded.items = retained
     return bounded
+
+
+def _phone_turn_ctx_bindable(turn_ctx: Any) -> bool:
+    """True when ``turn_ctx`` can carry a per-turn developer instruction.
+
+    FIX #5 F0a fail-safe (PR2b): this is the EXACT capability probe the
+    coordinator's ``add_turn_instruction`` (agent.py) performs before it binds —
+    a callable ``add_message`` OR a list ``items``. ``on_user_turn_completed``
+    calls this BEFORE handing the ctx to the coordinator so a malformed/absent
+    ctx degrades to a harmless sink (see ``_PhoneDiscardTurnCtx``) instead of
+    ``add_turn_instruction`` raising ``phone_turn_context_unavailable`` out of
+    the hook and the SDK dropping the whole turn. Kept in lock-step with
+    ``add_turn_instruction``: if that probe ever changes, this must match.
+    """
+    if turn_ctx is None:
+        return False
+    if callable(getattr(turn_ctx, "add_message", None)):
+        return True
+    return isinstance(getattr(turn_ctx, "items", None), list)
+
+
+class _PhoneDiscardTurnCtx:
+    """A throwaway per-turn context that absorbs instructions and drops them.
+
+    FIX #5 F0a fail-safe (PR2b): when the SDK hands ``on_user_turn_completed`` a
+    ctx that cannot carry a per-turn instruction, we must NOT simply pass
+    ``None`` to the coordinator — several ``add_turn_instruction(turn_ctx, …)``
+    call sites in the coordinator are NOT guarded by ``turn_ctx is not None``, so
+    ``None`` would just relocate the ``phone_turn_context_unavailable`` raise to
+    ``add_turn_instruction`` (``getattr(None, …)`` → raise) and STILL drop the
+    turn. Instead we substitute this sink: it exposes BOTH a callable
+    ``add_message`` AND a list ``items``, so it satisfies ``add_turn_instruction``'s
+    capability probe and every call site — guarded or not — binds successfully,
+    landing the instruction in a discarded list. The coordinator only WRITES to
+    ``turn_ctx`` via ``add_turn_instruction`` and only ever reads a stored
+    ``turn_ctx`` back to pass it INTO ``add_turn_instruction`` again (never to
+    inspect its contents), so the discarded instructions are never observed. The
+    real reply then generates against the agent's standing chat context exactly
+    as it did before per-turn instructions existed — current behaviour, never a
+    dropped turn.
+    """
+
+    __slots__ = ("items",)
+
+    def __init__(self) -> None:
+        self.items: list[Any] = []
+
+    def add_message(self, *, role: Any = None, content: Any = None) -> None:
+        # Absorb and discard: keep the same signature the SDK ctx exposes so the
+        # coordinator's `add_message`-first branch is exercised identically.
+        self.items.append({"role": role, "content": content})
 
 
 def rewrite_developer_role_to_system(chat_ctx: Any) -> tuple[Any, int]:
@@ -5057,6 +5181,52 @@ def phone_llm_reasoning_effort() -> str | None:
     return value or None
 
 
+def phone_interviewer_on_deepseek() -> bool:
+    """Whether the phone INTERVIEWER speaks through a DeepSeek endpoint.
+
+    Detected from the OpenAI-compat base URL host (``api.deepseek.com`` or any
+    ``deepseek`` host). Used only by the reasoning-effort tripwire — DeepSeek is
+    the family whose ``reasoning_effort`` default (null/omitted) means THINKING,
+    the latency-degradation the tripwire guards against.
+    """
+    return "deepseek" in phone_llm_base_url().lower()
+
+
+def phone_interviewer_reasoning_tripwire_effort() -> str | None:
+    """Return the effective interviewer reasoning-effort IF it is a tripwire.
+
+    PR2a FIX A1 (guardrail, NOT a crash). DeepSeek V4-Flash defaults to THINKING
+    unless ``reasoning_effort`` is the literal ``"none"`` (verified: null/omitted
+    routes all tokens to reasoning_content = dead-air). Production runs the
+    interviewer with reasoning ``none`` on purpose, but nothing re-validates it,
+    so a stale or UNSET ``PHONE_LLM_REASONING_EFFORT`` secret could silently
+    re-enable thinking and reintroduce the dead-air.
+
+    This returns the offending effective value (a string, or ``None`` for the
+    unset/null case) WHEN the interviewer is on a DeepSeek endpoint AND the
+    effective effort is anything other than exactly ``"none"``; otherwise it
+    returns ``None`` meaning "no tripwire" — so a plain ``None`` return is the
+    all-clear. The caller LOGS this loudly and does NOT crash: reasoning-on is a
+    latency degradation, not a compliance breach, and crashing the phone worker
+    over it is worse than the degradation. NON-DeepSeek endpoints (Sarvam,
+    Gemini-compat) are never flagged — the null/thinking coupling is
+    DeepSeek-specific.
+
+    NB it is intentional that UNSET (effective ``None``) trips on DeepSeek: an
+    absent secret is precisely the "silently re-enabled thinking" case the
+    guardrail exists to surface. The sentinel string ``"__tripwire_null__"`` is
+    returned for the unset case so the caller can distinguish "no tripwire"
+    (function returns ``None``) from "tripwire, effort was null" without a second
+    read.
+    """
+    if not phone_interviewer_on_deepseek():
+        return None
+    effort = phone_llm_reasoning_effort()
+    if (effort or "").strip().lower() == "none":
+        return None
+    return effort if effort is not None else "__tripwire_null__"
+
+
 def phone_judge_model() -> str:
     """Dedicated judge model; never inherits the speaking-model selection."""
     explicit = os.getenv("PHONE_JUDGE_MODEL", "")
@@ -5297,6 +5467,55 @@ async def _default_phone_interviewer_text(instruction: str) -> str | None:
         return None
 
 
+def phone_prefix_warmup_enabled() -> bool:
+    """Whether to warm DeepSeek's server-side prefix cache at session start.
+
+    PR2a FIX A2. Default ON: the OPENING turn otherwise pays a full COLD DeepSeek
+    prefill on the large, byte-stable screener system prompt (the owner-observed
+    slow opening), because nothing has primed the provider's prefix cache yet. A
+    single throwaway completion of that same prefix, fired before turn-1 and
+    DISCARDED, makes turn-1 a cache HIT.
+
+    Set ``PHONE_PREFIX_WARMUP=off`` to disable; ANY other value (including unset)
+    keeps it on. Read at the call site with the literal name so the env-contract
+    scanner sees it; also read here so the reader is the single source of truth.
+    PHONE ONLY — the browser/WebRTC lane never calls this.
+    """
+    return (os.getenv("PHONE_PREFIX_WARMUP") or "").strip().lower() != "off"
+
+
+async def phone_warm_prefix_cache(
+    system_prefix: Any,
+    *,
+    infer: Callable[[str], Awaitable[Any]] | None = None,
+) -> None:
+    """Fire ONE best-effort completion of the static prompt prefix, discard it.
+
+    PR2a FIX A2. Mirrors ``_default_phone_interviewer_text`` — a one-shot
+    OpenAI-compat completion on the SAME interviewer model / base / key, over the
+    bounded coverage transport + breaker — but it is a pure SIDE EFFECT: the
+    response is thrown away. The point is only that DeepSeek sees (and caches)
+    the large static prefix once, so the real turn-1 request is a prefix-cache
+    hit rather than a cold full prefill.
+
+    FAIL-SILENT BY CONSTRUCTION. A missing prefix, an empty/whitespace prefix, a
+    disabled key, or ANY transport/provider failure is swallowed and returns
+    None — a failed warm-up must never affect the call. Never routed through the
+    live AgentSession.generate_reply (that would race the consent opening); this
+    is a raw completion on the interviewer endpoint, off the speech path.
+    """
+    prefix = str(system_prefix or "").strip()
+    if not prefix:
+        return
+    infer_fn = infer or _default_phone_interviewer_text
+    try:
+        # We only need DeepSeek to READ (and cache) the prefix; the generated
+        # continuation is irrelevant, so discard whatever comes back.
+        await infer_fn(prefix)
+    except Exception:  # noqa: BLE001 — a warm-up must never surface on the call
+        return
+
+
 async def phone_rephrase_first_question(
     question_text: Any,
     *,
@@ -5338,7 +5557,13 @@ def _coverage_keywords(text: Any) -> set[str]:
 
 
 _GENERATED_CLOSING_RE = re.compile(
-    r"\b(?:reached the end|end of (?:our|the) questions|that(?:'s| is) all(?: the)? questions|"
+    # "reached the end" is anchored to a closing NOUN (questions/interview/call/…)
+    # so it no longer false-fires on "reached the end of your degree/project" and
+    # truncates a legitimate streamed reply. Real closings are still caught here
+    # or by the goodbye/next-steps/team-will alternatives below.
+    r"\b(?:reached the end of (?:our|the|this|these|my) "
+    r"(?:questions?|interview|screening|conversation|call|session|chat|list)|"
+    r"end of (?:our|the) questions|that(?:'s| is) all(?: the)? questions|"
     r"team will (?:review|be in touch)|next steps soon|have a great (?:day|evening)|goodbye)\b",
     re.IGNORECASE,
 )
@@ -7236,6 +7461,92 @@ def phone_generated_prefix_authorized(
     return True
 
 
+def phone_streamed_leading_segment_safe(
+    speech: Any, objective_text: Any, *, control_text: Any = None,
+) -> bool:
+    """A0 (PR2b): may the leading segment of a STREAMED normal turn be spoken?
+
+    A0 streams a normal ``screening`` turn token-by-token, so the buffered
+    path's HARD pre-speech content-leak vetoes cannot gate the full reply. This
+    predicate re-imposes exactly the TWO leak vetoes that, when they occur,
+    surface at the TOP of a reply and must never reach the candidate:
+
+      * ``instruction_echo`` — a long contiguous copy of the private controller
+        prose (``phone_instruction_echo_detected``); and
+      * ``premature_closing`` — terminal/goodbye prose on a non-closing turn
+        (``_GENERATED_CLOSING_RE``).
+
+    Unlike ``phone_generated_prefix_authorized`` it does NOT veto a question act
+    — streaming the question IS the goal of A0, and question-count/objective are
+    already advisory (log-only, B4). It also does not veto compensation wording:
+    that is candidate-context-dependent (a candidate may have volunteered comp)
+    and is caught by the post-speech advisory check, not a pre-speech leak. A
+    ``False`` return routes the turn to the buffered guarded path (no speech,
+    deterministic recovery), so it fails SAFE. Non-str/empty → not safe (there
+    is nothing speakable to release yet)."""
+    if not isinstance(speech, str) or not any(ch.isalpha() for ch in speech):
+        return False
+    compact = " ".join(speech.split())
+    if _GENERATED_CLOSING_RE.search(compact):
+        return False
+    private_control = _private_phone_control_text(control_text, objective_text)
+    if phone_instruction_echo_detected(compact, private_control):
+        return False
+    return True
+
+
+def phone_streamed_tail_hard_veto(
+    speech: Any, objective_text: Any, *, control_text: Any = None,
+    candidate_text: Any = None,
+) -> str | None:
+    """A0 (PR2b tail-veto): does the streamed-so-far text trip a HARD veto?
+
+    F1/F2 gap (two independent reviewers): the A0 clean-release path validated
+    only the LEADING ≤48-char segment for leaks, then streamed the WHOLE
+    remainder verbatim with the full-reply validator downgraded to advisory. A
+    HARD-reject condition that surfaces in the TAIL (after the first clause) —
+    most dangerously ``premature_closing`` (``_GENERATED_CLOSING_RE`` goodbye
+    prose lands at the END of a reply) — was therefore SPOKEN, where the
+    buffered path recovered pre-speech. This predicate re-imposes, incrementally
+    over the accumulating streamed text, EXACTLY the buffered path's HARD content
+    vetoes so the streamed path's pre-speech hard-reject set equals the buffered
+    path's:
+
+      * ``premature_closing`` — ``_GENERATED_CLOSING_RE`` on a non-closing turn
+        (A0 streams only non-closing turns, so this is unconditional here); and
+      * ``instruction_echo`` — the buffered path's 6-contiguous-word private-
+        controller overlap (``phone_instruction_echo_detected``); and
+      * ``compensation_drift`` — a comp objective probe on a NON-comp objective,
+        with the buffered path's EXACT ``candidate volunteered compensation``
+        suppression (``phone_candidate_introduced_compensation``): a comp/notice
+        topic the candidate raised is not bot-initiated drift and is NOT vetoed.
+
+    The SOFT flags (``objective_drift``, ``question_mark_count``) are DELIBERATELY
+    NOT applied — they stay advisory (log-only) exactly as the buffered path and
+    B4 leave them, and streaming the question IS A0's goal. Returns the sanitized
+    veto reason string (matching ``phone_generated_reply_rejection_reason``'s
+    categories) or ``None`` when clean. Non-str/letter-free → ``None`` (there is
+    nothing spoken yet to veto; the caller only tests text it is about to
+    speak)."""
+    if not isinstance(speech, str) or not any(ch.isalpha() for ch in speech):
+        return None
+    compact = " ".join(speech.split())
+    if _GENERATED_CLOSING_RE.search(compact):
+        return "premature_closing"
+    if (
+        _COMPENSATION_OBJECTIVE_RE.search(compact)
+        and not phone_is_compensation_objective(objective_text)
+        # Match the buffered path's suppression exactly (FIX 3, ~7555): an ack of
+        # comp/notice the CANDIDATE volunteered is not drift.
+        and not phone_candidate_introduced_compensation(candidate_text)
+    ):
+        return "compensation_drift"
+    private_control = _private_phone_control_text(control_text, objective_text)
+    if phone_instruction_echo_detected(compact, private_control):
+        return "instruction_echo"
+    return None
+
+
 def phone_generated_reply_rejection_reason(
     speech: Any, objective_text: Any, *, allow_closing: bool,
     control_text: Any = None, max_question_acts: int = 1,
@@ -8998,6 +9309,262 @@ def phone_agent_class(agent_base: Any) -> Any:
                     return content
                 return chunk if isinstance(chunk, str) else ""
 
+            # ── A0 (PR2b): 100%-TTFT true token streaming for NORMAL turns ─────
+            #
+            # The guarded incremental release below only lets an acknowledgement
+            # PREFIX speak before the full draft is validated; a reply that LEADS
+            # WITH the question holds its first speakable token until the whole
+            # generation is complete (the owner's "waiting for full generation"
+            # latency floor). For the NORMAL turn class ONLY — an ordinary
+            # planned-question turn: `substantive` policy AND `screening` phase,
+            # not closing — yield every chunk to TTS as it arrives so first audio
+            # tracks the LLM's first-token latency.
+            #
+            # WHY THIS IS SAFE (does NOT weaken any sensitive-turn guarantee):
+            #   * SCOPE. The predicate requires `_turn_policy == "substantive"`
+            #     AND `_generation_phase == "screening"` AND NOT
+            #     `_generation_allow_closing`. Every buffer-then-validate turn is
+            #     structurally excluded: the consent-answer discard already
+            #     returned above (`not self._screening_authorized`); the gate
+            #     opening returned even earlier (`self._gate_opening`); closing /
+            #     terminal turns carry `allow_closing` or phase `closing`;
+            #     résumé-conflict probes carry phase `resume_conflict` under the
+            #     `clarification` policy; name-confirmation turns carry phase
+            #     `name_confirm` under `clarification`. None of those satisfy this
+            #     predicate, so all of them fall through to the UNCHANGED guarded
+            #     buffering path below and keep speaking nothing until the full
+            #     draft passes validation.
+            #   * THE HARD-REJECT CONDITIONS CANNOT SILENTLY HARM A STREAMED
+            #     NORMAL TURN. The per-turn prompt binds a `screening` turn to
+            #     "one brief specific acknowledgement followed by exactly one
+            #     question for this authorized objective … do not close", so
+            #     `empty`, `premature_closing` and stacked-question shapes are
+            #     off-contract; and the answer-gate (re-asks the owed question on
+            #     the NEXT turn if it went unanswered), the delivery-gate (drift),
+            #     and the already-log-only `objective_drift`/`question_mark_count`
+            #     soft flags (B4, PR1a) remain the downstream authorities. The
+            #     validator therefore still RUNS on the assembled text but is
+            #     ADVISORY (log-only) here: once a chunk has been spoken we cannot
+            #     un-speak it, and calling `_on_generation_empty` would make the
+            #     watchdog speak a SECOND full recovery line on top of what the
+            #     candidate already heard — so a streamed turn must never invoke
+            #     that recovery. We log the reason for dashboard continuity and
+            #     stop; the pre-speech gate stays intact for the sensitive turns
+            #     that still route through the buffering path below.
+            #   * BARGE-IN IS UNAFFECTED. Streaming yields exactly the SDK chunks
+            #     the parent `llm_node` produced, in order — the same shape the
+            #     browser (Christy) lane yields — so AgentSession's interruption
+            #     cancels this async generator on barge-in just as it does there.
+            #     No task is spawned and no chunk is held, so there is nothing to
+            #     defeat interruption.
+            if (
+                phone_reply_token_streaming_enabled()
+                and self._turn_policy == "substantive"
+                and self._generation_phase == "screening"
+                and not self._generation_allow_closing
+            ):
+                # LEADING-SEGMENT CONTENT GATE, then pure streaming.
+                #
+                # A0 must not surrender the TWO hard CONTENT-LEAK guards the
+                # buffered path enforced pre-speech: a leaked controller
+                # instruction (`instruction_echo`) and a premature goodbye
+                # (`premature_closing`). Both, when they happen, appear at the
+                # TOP of the reply. So we hold ONLY the first speakable segment
+                # (up to the first clause/sentence boundary OR a small char cap),
+                # validate exactly those two leak conditions on it, and:
+                #   * if the segment is clean → release it and STREAM every
+                #     remaining chunk verbatim (first audio ≈ first-segment
+                #     latency, not full-generation — the A0 win); or
+                #   * if the segment is a leak/premature-close → DO NOT speak it.
+                #     Fall through to the buffered guarded path below (which
+                #     re-reads the SAME stream tail and recovers deterministically
+                #     with the authorized question), exactly as today.
+                # We deliberately do NOT gate on question-count/objective here —
+                # streaming the question IS the goal, and those are already
+                # log-only (B4). The check is content-safety only, and it uses
+                # `phone_generated_prefix_authorized` MINUS its question-act veto
+                # via the dedicated leak predicate below.
+                held_prefix: list[Any] = []
+                prefix_parts: list[str] = []
+                prefix_ok = False
+                leak_detected = False
+                consumed_all = False
+                self._generation_prefix_released = False
+                while True:
+                    try:
+                        chunk = await result.__anext__()
+                    except StopAsyncIteration:
+                        consumed_all = True
+                        break
+                    held_prefix.append(chunk)
+                    prefix_parts.append(_chunk_text(chunk))
+                    segment = "".join(prefix_parts).strip()
+                    # Wait for a speakable boundary (clause/sentence punct) OR a
+                    # bounded char cap so a boundary-less lead still releases.
+                    if not any(ch.isalpha() for ch in segment):
+                        continue
+                    at_boundary = segment.endswith(
+                        (".", "!", "?", ",", ";", ":", "—", "–", "…")
+                    )
+                    if not at_boundary and len(segment) < _A0_LEADING_SEGMENT_MAX_CHARS:
+                        continue
+                    # Evaluate the leading segment for the HARD content vetoes.
+                    # `phone_streamed_leading_segment_safe` covers premature-close
+                    # + instruction-echo; the tail-veto predicate ALSO covers
+                    # compensation-drift (with the buffered path's candidate-
+                    # volunteered suppression), so a comp-drift lead falls through
+                    # to buffered recovery exactly as it does on the buffered path
+                    # — keeping the pre-speech hard-reject set equal at the lead as
+                    # well as the tail.
+                    if phone_streamed_leading_segment_safe(
+                        segment, objective,
+                        control_text=self._generation_control_text,
+                    ) and phone_streamed_tail_hard_veto(
+                        segment, objective,
+                        control_text=self._generation_control_text,
+                        candidate_text=self._generation_candidate_text,
+                    ) is None:
+                        prefix_ok = True
+                    else:
+                        leak_detected = True
+                    break
+                assembled_prefix = "".join(prefix_parts).strip()
+                has_speakable = any(ch.isalpha() for ch in assembled_prefix)
+                if not prefix_ok and not leak_detected and has_speakable:
+                    # The whole reply ended BEFORE any clause boundary or the char
+                    # cap (a short boundary-less reply, e.g. "Goodbye"), so the
+                    # per-segment leak check above never ran. Validate the full
+                    # speakable text now so a short leak/close can never slip
+                    # through unchecked into the clean-release branch.
+                    if phone_streamed_leading_segment_safe(
+                        assembled_prefix, objective,
+                        control_text=self._generation_control_text,
+                    ) and phone_streamed_tail_hard_veto(
+                        assembled_prefix, objective,
+                        control_text=self._generation_control_text,
+                        candidate_text=self._generation_candidate_text,
+                    ) is None:
+                        prefix_ok = True
+                    else:
+                        leak_detected = True
+                if leak_detected:
+                    # The lead is a controller-instruction echo or a premature
+                    # close: speak NOTHING and let the buffered path recover. Feed
+                    # the already-pulled chunks back ahead of the untouched tail so
+                    # the guarded path sees the complete reply, unmodified.
+                    result = _achain(held_prefix, result)
+                    _log.info(
+                        "unknown_event", error_type="phone_reply_soft_flag",
+                        error_category="streamed_leading_segment_withheld",
+                    )
+                    # fall through to the guarded buffering path below
+                elif not prefix_ok and consumed_all and not has_speakable:
+                    # The whole generation was non-speakable (empty / letter-free).
+                    # Nothing was spoken, so immediate recovery cannot double-speak
+                    # — signal it (as the buffered path would) instead of making
+                    # the candidate wait out the first-audio watchdog. No chunk was
+                    # yielded, so `_generation_prefix_released` stays False and the
+                    # recovery keeps its full acknowledgement.
+                    self._generation_prefix_released = False
+                    on_empty = getattr(self, "_on_generation_empty", None)
+                    if callable(on_empty):
+                        try:
+                            observed = on_empty("empty_or_nonspeakable")
+                        except TypeError:
+                            observed = on_empty()
+                        if inspect.isawaitable(observed):
+                            await observed
+                    return
+                else:
+                    # Clean lead (or a clean short whole-reply): release the held
+                    # segment and STREAM the remainder — but ENFORCE THE HARD
+                    # CONTENT VETOES INCREMENTALLY over the tail so the streamed
+                    # path's pre-speech hard-reject set EQUALS the buffered path's
+                    # (F1/F2). The leading segment already passed
+                    # `phone_streamed_leading_segment_safe`, so the held prefix is
+                    # clean and speaks; from there, BEFORE yielding each NEW chunk
+                    # we test whether `streamed-so-far + chunk` NEWLY trips a HARD
+                    # veto (`premature_closing` / `instruction_echo` /
+                    # `compensation_drift`, comp-suppression respected). If it
+                    # does we do NOT yield that chunk and STOP the stream — the
+                    # offending tail content is never spoken; the already-spoken
+                    # clean prefix stands.
+                    #
+                    # WHY TRUNCATION IS SAFE (no double-speak, no dead-air):
+                    #   * NO RECOVERY after clean chunks were already spoken —
+                    #     `_on_generation_empty` would make the watchdog speak a
+                    #     SECOND full recovery line on top of what the candidate
+                    #     heard. We just `return`; nothing else is spoken this turn.
+                    #   * The turn still COMPLETES (the generator returns cleanly,
+                    #     not an interruption), so no dead-air watchdog fires — the
+                    #     conversation-item hook records only the clean prefix that
+                    #     actually reached TTS.
+                    #   * If the truncated tail carried the mandatory QUESTION, it
+                    #     was never spoken → the candidate cannot answer it → the
+                    #     PR1 answer-gate / delivery-verified re-ask fires on the
+                    #     NEXT turn (playout-proven `ask_delivered`, agent.py), so
+                    #     the owed question is not lost.
+                    # The check is pure and cheap (regex + 6-word overlap on the
+                    # accumulated string); no task spawn, no buffering beyond the
+                    # accumulated string, and we keep yielding SYNCHRONOUSLY so a
+                    # barge-in `CancelledError`/`GeneratorExit` still propagates at
+                    # the `yield`.
+                    stream_parts = list(prefix_parts)
+                    for buffered in held_prefix:
+                        self._generation_prefix_released = True
+                        yield buffered
+                    truncated_reason: str | None = None
+                    if not consumed_all:
+                        async for chunk in result:
+                            candidate_speech = (
+                                "".join(stream_parts) + _chunk_text(chunk)
+                            )
+                            veto = phone_streamed_tail_hard_veto(
+                                candidate_speech, objective,
+                                control_text=self._generation_control_text,
+                                candidate_text=self._generation_candidate_text,
+                            )
+                            if veto is not None:
+                                # This chunk would speak a HARD-veto condition
+                                # (e.g. a premature goodbye at the tail). Do NOT
+                                # speak it and stop. No recovery — clean prefix
+                                # already spoke.
+                                truncated_reason = veto
+                                break
+                            stream_parts.append(_chunk_text(chunk))
+                            self._generation_prefix_released = True
+                            yield chunk
+                    if truncated_reason is not None:
+                        _log.info(
+                            "unknown_event", error_type="phone_reply_soft_flag",
+                            error_category="streamed_tail_hard_veto_truncated",
+                        )
+                        return
+                    # ADVISORY validation only for a reply that ALREADY SPOKE and
+                    # streamed to completion — it never gates speech and never
+                    # recovers (a second line on top of what the candidate heard
+                    # would double-speak). The SOFT flags stay advisory; the HARD
+                    # vetoes were already enforced incrementally above. The
+                    # downstream answer-gate / delivery-gate remain the pre-speech
+                    # authorities on the NEXT turn. Logged for series continuity.
+                    speech = "".join(stream_parts).strip()
+                    advisory_reason = phone_generated_reply_rejection_reason(
+                        speech, objective,
+                        allow_closing=self._generation_allow_closing,
+                        control_text=self._generation_control_text,
+                        max_question_acts=phone_objective_guard_max_questions_for_phase(
+                            self._generation_phase,
+                        ),
+                        candidate_text=self._generation_candidate_text,
+                        enforce_objective=False,
+                    )
+                    if advisory_reason is not None:
+                        _log.info(
+                            "unknown_event", error_type="phone_reply_soft_flag",
+                            error_category="streamed_reply_advisory",
+                        )
+                    return
+
             async def _collect(stream: Any) -> tuple[list[Any], str]:
                 chunks: list[Any] = []
                 parts: list[str] = []
@@ -9101,9 +9668,41 @@ def phone_agent_class(agent_base: Any) -> Any:
                 # `turn_ctx` is the SDK's temporary context for THIS reply.
                 # Do not mutate the durable Agent chat context or append the
                 # user message: AgentActivity owns both, and will add the
-                # message exactly once after this hook returns.
+                # message exactly once after this hook returns. This is the
+                # clean WebRTC binding contract (the browser `Christy` agent
+                # uses the SDK default hook and lets AgentActivity own history),
+                # ported to the phone path: the coordinator binds only PER-TURN
+                # developer instructions onto this temporary `turn_ctx` (via
+                # `add_turn_instruction`), never the durable transcript.
+                #
+                # FIX #5 F0a FAIL-SAFE (PR2b): `add_turn_instruction` (agent.py)
+                # is the coordinator's sole binding surface, and it RAISES
+                # `phone_turn_context_unavailable` when the ctx exposes neither a
+                # callable `add_message` NOR a list `items`. Several coordinator
+                # call sites (the plain planned-question / patience / candidate-
+                # end paths) invoke it WITHOUT a per-site `turn_ctx is not None`
+                # guard, so a malformed/absent ctx handed straight through would
+                # raise out of THIS hook and the SDK would DROP the whole turn —
+                # the candidate speaks and hears nothing back (dead air).
+                #
+                # Passing `None` would NOT fix this — it only relocates the same
+                # raise to the FIRST unguarded `add_turn_instruction(None, …)`
+                # (`getattr(None, …)` → raise). Instead substitute a harmless
+                # discard sink (`_PhoneDiscardTurnCtx`) that satisfies the
+                # capability probe with a list `items`, so EVERY call site
+                # (guarded or not) succeeds and the per-turn instruction lands in
+                # a discarded list nothing reads back. The reply still generates
+                # against the agent's standing chat context — current behaviour —
+                # instead of the turn being lost. Never raises here.
+                bindable_turn_ctx = turn_ctx
+                if not _phone_turn_ctx_bindable(turn_ctx):
+                    bindable_turn_ctx = _PhoneDiscardTurnCtx()
+                    _log.info(
+                        "unknown_event", error_type="phone_turn_context",
+                        error_category="turn_ctx_binding_unavailable_failsafe",
+                    )
                 if self._on_user_turn is not None and text:
-                    observed = self._on_user_turn(text, new_message, turn_ctx)
+                    observed = self._on_user_turn(text, new_message, bindable_turn_ctx)
                     if inspect.isawaitable(observed):
                         await observed
                     if self._on_reply_expected is not None:

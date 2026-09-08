@@ -1485,6 +1485,13 @@ def classify_answer_text(text: str) -> str | None:
 # working while making `phone.PHONE_NO_RECORDING` the single source.
 _PHONE_NO_RECORDING = phone.PHONE_NO_RECORDING
 
+# PR2a FIX A2: strong references to in-flight prefix-cache warm-up tasks. A
+# fire-and-forget `asyncio.create_task` is only weakly held by the loop, so
+# without this the warm-up could be GC'd before it issues its one request
+# (mirrors the per-item persist-task holder pattern used inside the session).
+# Entries are discarded on completion via a done-callback.
+_PHONE_WARMUP_TASKS: "set[asyncio.Task]" = set()
+
 
 async def _phone_recording_permitted() -> None:
     """The single legal call site for "recording may now exist".
@@ -1802,7 +1809,46 @@ def _build_phone_interviewer_llm() -> Any:
     """
     def _build_openai_compat_llm() -> Any:
         """The OpenAI-compat construction, byte-for-byte, so rollback + the
-        Sarvam config are preserved. Also the FIX 6 fail-open target."""
+        Sarvam config are preserved. Also the FIX 6 fail-open target.
+
+        PR2a FIX A4 — INTENTIONALLY NOT DONE (do not re-add a custom client
+        here without re-reading this). A4 proposed passing an explicit
+        httpx.AsyncClient with a keepalive pool so a cold worker does not pay
+        TLS+connect on turn-1. Verified against the PINNED wheel
+        livekit-plugins-openai==1.6.4 (llm.py): openai.LLM ALREADY builds its
+        default client as openai.AsyncClient(..., http_client=httpx.AsyncClient(
+        limits=httpx.Limits(max_connections=50, max_keepalive_connections=50,
+        keepalive_expiry=120))). So a keepalive pool + cross-turn connection
+        reuse is ALREADY the default; the socket is merely opened LAZILY on the
+        first request, so passing a custom `client=` (the supported kwarg — there
+        is NO `http_client` kwarg on LLM itself) that mirrors those defaults
+        would change NOTHING for turn-1 and, if sized smaller, would only shrink
+        headroom. The only real turn-1 win is to fire ONE request on THIS SAME
+        client before turn-1 — but the plugin OWNS this client (self._owns_client
+        / aclose), so sharing it with the A2 warm-up crosses
+        _build_provider_session -> _build_phone_interviewer_llm -> session ->
+        _run_phone_session and entangles teardown: NOT a surgical, low-risk PR2a
+        change. Decision (principal-architect arbitration, 2026-09-08): STOP A4;
+        the turn-1 prefill cost is addressed by FIX A2 (server-side prefix-cache
+        warm-up), which is transport-independent. A client-socket pre-open is a
+        fast-follow if turn-1 connect latency is still observed after A2."""
+        # PR2a FIX A1 — reasoning-effort tripwire (guardrail, NOT a crash).
+        # Reasoning is `none` on the DeepSeek interviewer on purpose, but nothing
+        # re-validates it: a stale/unset PHONE_LLM_REASONING_EFFORT secret could
+        # silently re-enable DeepSeek thinking -> dead-air. Log LOUDLY at
+        # construction (session start) if the interviewer is on a DeepSeek
+        # endpoint and the effective effort is anything but exactly "none"
+        # (including unset/null, the "silently re-enabled" case). We deliberately
+        # do NOT raise: reasoning-on is a latency degradation, not a compliance
+        # breach, and crashing the phone worker over it is worse than the
+        # degradation. Non-DeepSeek endpoints are never flagged.
+        _tripwire_effort = phone.phone_interviewer_reasoning_tripwire_effort()
+        if _tripwire_effort is not None:
+            _log.error(
+                "unknown_event",
+                error_type="phone_interviewer_reasoning_tripwire",
+                error_category=_tripwire_effort,
+            )
         return openai.LLM(
             model=phone.phone_primary_model(),
             # PHONE ONLY (OpenAI-compat path): the phone interviewer speaks
@@ -7252,11 +7298,15 @@ async def _run_phone_session(
         if phone.is_explicit_end_call_request(text):
             candidate_end_requested.set()
 
+    # Complete and immutable from construction. The exact owed question is
+    # still supplied only per turn; this prompt carries role, resume,
+    # phone-policy/style blocks and bounded reconnect history. Captured once so
+    # the A2 prefix-cache warm-up below primes the EXACT byte-stable prefix that
+    # turn-1 will send (a divergent prefix would not cache-hit).
+    phone_instructions = _phone_instructions_text(instruction_state)
+
     agent = phone.phone_agent_class(Agent)(
-        # Complete and immutable from construction. The exact owed question is
-        # still supplied only per turn; this prompt carries role, resume,
-        # phone-policy/style blocks and bounded reconnect history.
-        _phone_instructions_text(instruction_state),
+        phone_instructions,
         client=events,
         attempt_id=attempt_id,
         say=say,
@@ -7264,6 +7314,44 @@ async def _run_phone_session(
         native_turns=True,
         turn_mode=turn_mode,
     )
+
+    # ── PR2a FIX A2: DEEPSEEK PREFIX-CACHE WARM-UP ─────────────────────────
+    # Fire ONE throwaway completion of the (large, static) system-prompt prefix
+    # NOW — before the gate opening — so DeepSeek caches the prefix and the
+    # OPENING turn is a server-side cache hit instead of a cold full prefill (the
+    # owner-observed slow opening). Fire-and-forget: it overlaps
+    # `wait_for_participant` (the SIP-pickup wait) and `session.start`, so it
+    # completes well before turn-1 without adding any wall-time to the call. NOT
+    # routed through `session.generate_reply` (that would race the consent
+    # opening); it is a raw one-shot on the interviewer endpoint, off the speech
+    # path, that swallows every failure (`phone_warm_prefix_cache`). Gated on
+    # `PHONE_PREFIX_WARMUP` (default ON; `off` disables) — read here with the
+    # literal name so the env-contract scanner sees it. PHONE ONLY.
+    #
+    # Only fired on the OpenAI-compat interviewer (DeepSeek/Sarvam): the warm-up
+    # POSTs to `phone_llm_base_url` (the OpenAI-compat endpoint), so on the
+    # native-Gemini path (`phone_use_google_llm`) it would neither share the
+    # live LLM's transport nor warm Gemini's implicit cache — a wasted call. It
+    # is harmless there (errors are swallowed) but pointless, so skip it.
+    _phone_prefix_warmup_off = (os.getenv("PHONE_PREFIX_WARMUP") or "").strip().lower() == "off"
+    if (
+        phone.phone_prefix_warmup_enabled()
+        and not _phone_prefix_warmup_off
+        and not phone.phone_use_google_llm()
+    ):
+        try:
+            warmup_task = asyncio.create_task(
+                phone.phone_warm_prefix_cache(phone_instructions))
+            # Detach: never awaited on the call path, and a swallowed-error
+            # warm-up leaves nothing to observe. A stray reference keeps it from
+            # being GC'd mid-flight; discard on completion.
+            _PHONE_WARMUP_TASKS.add(warmup_task)
+            warmup_task.add_done_callback(_PHONE_WARMUP_TASKS.discard)
+        except RuntimeError:
+            # No running loop (defensive; this site always runs under the
+            # session loop). A missing warm-up only costs the cold turn-1 the
+            # fix was avoiding — never correctness.
+            pass
 
     async def wait_for_participant() -> Any:
         """Wait for the answer, and only then open the media session.
