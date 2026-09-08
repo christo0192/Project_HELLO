@@ -2,5 +2,78 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Dependency Audit Exceptions",
   "description": "High/critical vulnerabilities that are accepted for a limited time with documented compensating controls. Every entry must include owner, rationale, compensating_control, ISO 8601 expiry, and review_trigger. Only GHSA advisories are accepted; unmatched advisories always fail closed.",
-  "exceptions": []
+  "exceptions": [
+    {
+      "id": "GHSA-w2rr-34g9-rvrj",
+      "package": "@xmldom/xmldom",
+      "owner": "christo.b@interviewkickstart.com",
+      "rationale": "Transitive via mammoth@^0.8.6 (used only for .docx resume text extraction); @xmldom/xmldom is not imported directly anywhere in app/api/src. The advisories are fixed only in 0.9.x, which is outside mammoth's ^0.8.6 range, so no non-breaking upgrade exists yet without bumping/forking mammoth.",
+      "compensating_control": "Candidate .docx parsing runs inside the bounded, fail-closed sandboxed resume-parser child (binary stdin, no network egress) behind a ClamAV signature-freshness scan, with size/MIME gating before the bytes ever reach mammoth/@xmldom. No untrusted XML reaches @xmldom outside that sandbox, and a parse failure fails closed.",
+      "expiry": "2026-10-08",
+      "review_trigger": "A mammoth release depending on @xmldom/xmldom>=0.9.0 (or a verified npm override) becomes available; re-run the audit and remove these entries."
+    },
+    {
+      "id": "GHSA-4w3w-2rp5-g8jm",
+      "package": "@xmldom/xmldom",
+      "owner": "christo.b@interviewkickstart.com",
+      "rationale": "Transitive via mammoth@^0.8.6 (used only for .docx resume text extraction); @xmldom/xmldom is not imported directly anywhere in app/api/src. The advisories are fixed only in 0.9.x, which is outside mammoth's ^0.8.6 range, so no non-breaking upgrade exists yet without bumping/forking mammoth.",
+      "compensating_control": "Candidate .docx parsing runs inside the bounded, fail-closed sandboxed resume-parser child (binary stdin, no network egress) behind a ClamAV signature-freshness scan, with size/MIME gating before the bytes ever reach mammoth/@xmldom. No untrusted XML reaches @xmldom outside that sandbox, and a parse failure fails closed.",
+      "expiry": "2026-10-08",
+      "review_trigger": "A mammoth release depending on @xmldom/xmldom>=0.9.0 (or a verified npm override) becomes available; re-run the audit and remove these entries."
+    },
+    {
+      "id": "GHSA-c7q8-3ch8-vqpv",
+      "package": "@xmldom/xmldom",
+      "owner": "christo.b@interviewkickstart.com",
+      "rationale": "Transitive via mammoth@^0.8.6 (used only for .docx resume text extraction); @xmldom/xmldom is not imported directly anywhere in app/api/src. The advisories are fixed only in 0.9.x, which is outside mammoth's ^0.8.6 range, so no non-breaking upgrade exists yet without bumping/forking mammoth.",
+      "compensating_control": "Candidate .docx parsing runs inside the bounded, fail-closed sandboxed resume-parser child (binary stdin, no network egress) behind a ClamAV signature-freshness scan, with size/MIME gating before the bytes ever reach mammoth/@xmldom. No untrusted XML reaches @xmldom outside that sandbox, and a parse failure fails closed.",
+      "expiry": "2026-10-08",
+      "review_trigger": "A mammoth release depending on @xmldom/xmldom>=0.9.0 (or a verified npm override) becomes available; re-run the audit and remove these entries."
+    },
+    {
+      "id": "GHSA-27p8-2357-5qqv",
+      "package": "@xmldom/xmldom",
+      "owner": "christo.b@interviewkickstart.com",
+      "rationale": "Transitive via mammoth@^0.8.6 (used only for .docx resume text extraction); @xmldom/xmldom is not imported directly anywhere in app/api/src. The advisories are fixed only in 0.9.x, which is outside mammoth's ^0.8.6 range, so no non-breaking upgrade exists yet without bumping/forking mammoth.",
+      "compensating_control": "Candidate .docx parsing runs inside the bounded, fail-closed sandboxed resume-parser child (binary stdin, no network egress) behind a ClamAV signature-freshness scan, with size/MIME gating before the bytes ever reach mammoth/@xmldom. No untrusted XML reaches @xmldom outside that sandbox, and a parse failure fails closed.",
+      "expiry": "2026-10-08",
+      "review_trigger": "A mammoth release depending on @xmldom/xmldom>=0.9.0 (or a verified npm override) becomes available; re-run the audit and remove these entries."
+    },
+    {
+      "id": "GHSA-8344-3jmq-59r6",
+      "package": "@xmldom/xmldom",
+      "owner": "christo.b@interviewkickstart.com",
+      "rationale": "Transitive via mammoth@^0.8.6 (used only for .docx resume text extraction); @xmldom/xmldom is not imported directly anywhere in app/api/src. The advisories are fixed only in 0.9.x, which is outside mammoth's ^0.8.6 range, so no non-breaking upgrade exists yet without bumping/forking mammoth.",
+      "compensating_control": "Candidate .docx parsing runs inside the bounded, fail-closed sandboxed resume-parser child (binary stdin, no network egress) behind a ClamAV signature-freshness scan, with size/MIME gating before the bytes ever reach mammoth/@xmldom. No untrusted XML reaches @xmldom outside that sandbox, and a parse failure fails closed.",
+      "expiry": "2026-10-08",
+      "review_trigger": "A mammoth release depending on @xmldom/xmldom>=0.9.0 (or a verified npm override) becomes available; re-run the audit and remove these entries."
+    },
+    {
+      "id": "GHSA-x4fp-j954-r2f4",
+      "package": "@xmldom/xmldom",
+      "owner": "christo.b@interviewkickstart.com",
+      "rationale": "Transitive via mammoth@^0.8.6 (used only for .docx resume text extraction); @xmldom/xmldom is not imported directly anywhere in app/api/src. The advisories are fixed only in 0.9.x, which is outside mammoth's ^0.8.6 range, so no non-breaking upgrade exists yet without bumping/forking mammoth.",
+      "compensating_control": "Candidate .docx parsing runs inside the bounded, fail-closed sandboxed resume-parser child (binary stdin, no network egress) behind a ClamAV signature-freshness scan, with size/MIME gating before the bytes ever reach mammoth/@xmldom. No untrusted XML reaches @xmldom outside that sandbox, and a parse failure fails closed.",
+      "expiry": "2026-10-08",
+      "review_trigger": "A mammoth release depending on @xmldom/xmldom>=0.9.0 (or a verified npm override) becomes available; re-run the audit and remove these entries."
+    },
+    {
+      "id": "GHSA-965w-775f-mr7g",
+      "package": "@xmldom/xmldom",
+      "owner": "christo.b@interviewkickstart.com",
+      "rationale": "Transitive via mammoth@^0.8.6 (used only for .docx resume text extraction); @xmldom/xmldom is not imported directly anywhere in app/api/src. The advisories are fixed only in 0.9.x, which is outside mammoth's ^0.8.6 range, so no non-breaking upgrade exists yet without bumping/forking mammoth.",
+      "compensating_control": "Candidate .docx parsing runs inside the bounded, fail-closed sandboxed resume-parser child (binary stdin, no network egress) behind a ClamAV signature-freshness scan, with size/MIME gating before the bytes ever reach mammoth/@xmldom. No untrusted XML reaches @xmldom outside that sandbox, and a parse failure fails closed.",
+      "expiry": "2026-10-08",
+      "review_trigger": "A mammoth release depending on @xmldom/xmldom>=0.9.0 (or a verified npm override) becomes available; re-run the audit and remove these entries."
+    },
+    {
+      "id": "GHSA-93r5-fhx6-vmg9",
+      "package": "@xmldom/xmldom",
+      "owner": "christo.b@interviewkickstart.com",
+      "rationale": "Transitive via mammoth@^0.8.6 (used only for .docx resume text extraction); @xmldom/xmldom is not imported directly anywhere in app/api/src. The advisories are fixed only in 0.9.x, which is outside mammoth's ^0.8.6 range, so no non-breaking upgrade exists yet without bumping/forking mammoth.",
+      "compensating_control": "Candidate .docx parsing runs inside the bounded, fail-closed sandboxed resume-parser child (binary stdin, no network egress) behind a ClamAV signature-freshness scan, with size/MIME gating before the bytes ever reach mammoth/@xmldom. No untrusted XML reaches @xmldom outside that sandbox, and a parse failure fails closed.",
+      "expiry": "2026-10-08",
+      "review_trigger": "A mammoth release depending on @xmldom/xmldom>=0.9.0 (or a verified npm override) becomes available; re-run the audit and remove these entries."
+    }
+  ]
 }
