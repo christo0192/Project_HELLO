@@ -5557,7 +5557,13 @@ def _coverage_keywords(text: Any) -> set[str]:
 
 
 _GENERATED_CLOSING_RE = re.compile(
-    r"\b(?:reached the end|end of (?:our|the) questions|that(?:'s| is) all(?: the)? questions|"
+    # "reached the end" is anchored to a closing NOUN (questions/interview/call/…)
+    # so it no longer false-fires on "reached the end of your degree/project" and
+    # truncates a legitimate streamed reply. Real closings are still caught here
+    # or by the goodbye/next-steps/team-will alternatives below.
+    r"\b(?:reached the end of (?:our|the|this|these|my) "
+    r"(?:questions?|interview|screening|conversation|call|session|chat|list)|"
+    r"end of (?:our|the) questions|that(?:'s| is) all(?: the)? questions|"
     r"team will (?:review|be in touch)|next steps soon|have a great (?:day|evening)|goodbye)\b",
     re.IGNORECASE,
 )
