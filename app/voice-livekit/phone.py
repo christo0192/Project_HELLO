@@ -5895,9 +5895,12 @@ def phone_answer_gate_max_reasks() -> int:
     """How many times the answer gate re-asks a non-answered question before it
     gives up and advances (recording the question unanswered). Bounded so a
     persistently-evasive candidate can never wedge the plan in a re-ask loop.
-    Default 2; clamped to [0, 5].
+    Default 1 (PR1a, 2026-09-08): a single warm re-ask, then advance — two
+    re-asks on the same owed question read on a live call as nagging and cost a
+    full extra turn each time. Clamped to [0, 5]; `PHONE_ANSWER_GATE_MAX_REASKS`
+    overrides (env-revertible to the old 2).
     """
-    return _bounded_int_env(os.getenv("PHONE_ANSWER_GATE_MAX_REASKS"), 2, 0, 5)
+    return _bounded_int_env(os.getenv("PHONE_ANSWER_GATE_MAX_REASKS"), 1, 0, 5)
 
 
 def phone_delivery_gate_enabled() -> bool:
@@ -7172,14 +7175,28 @@ def phone_generated_reply_rejection_reason(
     if not allow_closing and _GENERATED_CLOSING_RE.search(compact):
         return "premature_closing"
     question_acts = phone_generated_question_act_count(compact)
-    if (not allow_closing and question_acts < 1) or question_acts > ceiling:
-        # Preserve the existing sanitized telemetry category for dashboard and
-        # historical-series compatibility even though validation now counts
-        # spoken question acts rather than punctuation glyphs. When
-        # ``allow_closing`` is set the reply may legitimately carry zero
-        # questions (a terminal close), so only the upper bound applies there —
-        # same as before; the phase-aware ceiling only WIDENS the upper bound.
+    # A non-closing reply that asks NOTHING (zero question acts) is still a HARD
+    # rejection: the bot must actually put the owed question to the candidate, so
+    # an ask-nothing statement must recover via the canned authorized question.
+    # This half of the historical `question_mark_count` guard is UNCHANGED.
+    if not allow_closing and question_acts < 1:
         return "question_mark_count"
+    if question_acts > ceiling:
+        # B4 (PR1a, 2026-09-08): the OVER-CEILING half is DOWNGRADED TO LOG-ONLY.
+        # A reply that carries a second question act is no longer swapped for the
+        # flat canned recovery line — on live calls that swap replaced a natural
+        # two-part turn ("Got it. And what's your notice period — also, are you
+        # open to relocating?") with a robotic single question and lost the
+        # warmth. The occurrence is still recorded so the dashboard series
+        # survives, but evaluation CONTINUES to the hard checks below rather than
+        # returning. Preserve the exact ``question_mark_count`` category string
+        # for historical-series compatibility. (The zero-question half above stays
+        # HARD — the phase-aware ceiling only ever WIDENS the upper bound, so an
+        # ask-nothing reply is never reachable through this soft branch.)
+        _log.info(
+            "unknown_event", error_type="phone_reply_soft_flag",
+            error_category="question_mark_count",
+        )
     objective_is_comp = phone_is_compensation_objective(objective_text)
     if (
         _COMPENSATION_OBJECTIVE_RE.search(compact)
@@ -7190,12 +7207,22 @@ def phone_generated_reply_rejection_reason(
         return "compensation_drift"
     # FIX 2 (SE-call RCA 2026-09-07): plan-pursuit turns only (see docstring).
     # `phone_generated_objective_covered` fails open on custom objectives.
+    # B4 (PR1a, 2026-09-08): DOWNGRADED TO LOG-ONLY. A plan-pursuit reply whose
+    # question clause does not lexically reach the authorized objective is no
+    # longer discarded for the canned line — the coverage predicate is a shadow
+    # signal that mis-fires on legitimate paraphrases, and swapping in the canned
+    # question there was worse than a slightly-off natural reply. The occurrence
+    # is recorded; evaluation continues to the hard ``instruction_echo`` check
+    # below. Preserve the exact ``objective_drift`` category string.
     if (
         enforce_objective
         and not allow_closing
         and not phone_generated_objective_covered(compact, objective_text)
     ):
-        return "objective_drift"
+        _log.info(
+            "unknown_event", error_type="phone_reply_soft_flag",
+            error_category="objective_drift",
+        )
     # REMOVED (2026-09-03): the exact-match `conflict_clarification_drift` clause
     # rejected any conflict-turn reply that was not PHONE_RESUME_CONFLICT_
     # CLARIFICATION_TEXT character-for-character — while phone_judge_turn_

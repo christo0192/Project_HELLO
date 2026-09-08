@@ -2616,6 +2616,17 @@ async def _run_native_phone_screening(
     # instead of stacking: a key can never wedge the call for more than three
     # held turns total.
     combined_reask_cap = 3
+    # FIX 3 (PR1a, 2026-09-08) — INTERRUPTED-RECOVERY re-ask counter. Per-question-
+    # key count of re-asks issued by the interrupted-recovery branch (the barged/
+    # undelivered-ask path in `on_native_turn`). Before this counter the branch
+    # re-asked on EVERY qualifying turn with no bound — a live call re-asked the
+    # intro four times in a row when the candidate's short replies kept landing
+    # before the ask proved delivered. Capped at ONE interrupted re-ask per key;
+    # once hit, the branch advances (credits the turn / records unanswered) rather
+    # than re-asking again. Same latch idiom/lifecycle as `answer_reask_counts`:
+    # keyed by question.key, only grows over the bounded set of owed keys.
+    interrupted_reask_counts: dict[str, int] = {}
+    INTERRUPTED_REASK_CAP = 1
     active_exchange: dict[str, Any] | None = None
     compensation_slots: dict[str, str] = {}
     preloaded_objective: dict[str, str | None] = {"text": None, "message_id": None}
@@ -4073,23 +4084,86 @@ async def _run_native_phone_screening(
             # FIX 2: the previous bot turn was interrupted (barge-in) or is not
             # yet proven delivered, and the candidate has now spoken again —
             # possibly just a connectivity check ("which program", "hello"). Owe
-            # an IMMEDIATE re-ask; never fall silent. Explicitly authorize the
-            # generation so the model actually speaks (a bare instruction with no
-            # armed objective could otherwise be dropped by the one-question
-            # validator), and clear the interrupt latch now that its owed re-ask
-            # is being issued.
-            prior_turn_interrupted["value"] = False
-            add_turn_instruction(turn_ctx, "The previous question was interrupted. Ask that same topic again in your own natural words and wait; do not advance.")
+            # an IMMEDIATE re-ask; never fall silent.
+            #
+            # FIX 3 (PR1a, 2026-09-08): the branch used to re-ask on EVERY
+            # qualifying turn with NO counter and NO evidence check — a live call
+            # re-asked the intro FOUR times because the candidate's short replies
+            # kept landing before the ask proved delivered (an unbounded loop).
+            # Two corrections, applied only when an owed question exists:
+            #   (b) EVIDENCE FIRST — if the candidate's CURRENT turn already
+            #       answers the owed question (high-confidence coverage via
+            #       `answer_evidence`), do NOT re-ask: clear the interrupt latch
+            #       and FALL THROUGH to the ordinary substantive path below, which
+            #       commits the exchange and advances the cursor exactly once (the
+            #       same commit path the normal turn uses — never duplicated here).
+            #   (a)/(c) BOUND — otherwise re-ask, but at most INTERRUPTED_REASK_CAP
+            #       (1) times per question key. Once the cap is hit, stop re-asking:
+            #       clear the latch and fall through so the plan advances (crediting
+            #       the substantive turn / recording it unanswered) instead of
+            #       looping. The answer-gate below still owns the ordinary
+            #       non-answer re-ask policy for a delivered ask.
             if question is not None:
-                set_question_reply_snapshot(question, text)
-                authorize_generated_reply(
-                    question.spoken_text,
-                    control_text="The previous question was interrupted. Re-ask the same topic naturally and wait; do not advance.",
+                interrupted_kind = (
+                    "compensation"
+                    if phone.phone_is_compensation_objective(question.text)
+                    else None
                 )
+                interrupted_dims = phone.phone_turn_dimensions(
+                    question.text, interrupted_kind, text,
+                )
+                # HIGH-CONFIDENCE only: `answer_evidence` is
+                # `phone_answer_covers_objective`, which requires the owed
+                # objective to actually be covered. A bare connectivity check
+                # ("Hello", "which program") reads SUBSTANTIVE by default (the
+                # disposition is fail-open) but does NOT cover the objective — so
+                # the disposition is deliberately NOT used here; only real
+                # coverage lets the turn skip the interrupted re-ask and advance.
+                answer_present = bool(interrupted_dims["answer_evidence"])
+                interrupted_seen = interrupted_reask_counts.get(question.key, 0)
+                if answer_present or interrupted_seen >= INTERRUPTED_REASK_CAP:
+                    # (b) real answer on this turn, or (c) the one interrupted
+                    # re-ask was already spent — clear the latch and let the
+                    # substantive commit path below run. Do NOT authorize a re-ask
+                    # here; the ordinary path authorizes the next objective (or the
+                    # answer gate holds/records under its OWN bounded policy).
+                    prior_turn_interrupted["value"] = False
+                    _log.info(
+                        "unknown_event", error_type="phone_interrupted_recovery",
+                        error_category=(
+                            "answer_present_advancing" if answer_present
+                            else "reask_cap_reached_advancing"
+                        ),
+                        turn_index=interrupted_seen,
+                    )
+                else:
+                    # (a) under the cap: owe ONE interrupted re-ask of the SAME
+                    # topic and clear the latch (its owed re-ask is being issued).
+                    # Explicitly authorize the generation so the model actually
+                    # speaks (a bare instruction with no armed objective could be
+                    # dropped by the one-question validator).
+                    interrupted_reask_counts[question.key] = interrupted_seen + 1
+                    prior_turn_interrupted["value"] = False
+                    setattr(agent, "_turn_policy", "interrupted_reask")
+                    add_turn_instruction(turn_ctx, "The previous question was interrupted. Ask that same topic again in your own natural words and wait; do not advance.")
+                    set_question_reply_snapshot(question, text)
+                    authorize_generated_reply(
+                        question.spoken_text,
+                        control_text="The previous question was interrupted. Re-ask the same topic naturally and wait; do not advance.",
+                    )
+                    _log.info(
+                        "unknown_event", error_type="phone_interrupted_recovery",
+                        error_category="interrupted_reask",
+                        turn_index=interrupted_reask_counts[question.key],
+                    )
+                    return
             else:
                 # No planned question at this cursor (e.g. post-plan Q&A / wind-
                 # down) — still acknowledge presence so a bare "hello" after an
-                # interrupt is never met with silence.
+                # interrupt is never met with silence. No owed key to cap or
+                # commit against, so the historical ack behaviour is unchanged.
+                prior_turn_interrupted["value"] = False
+                add_turn_instruction(turn_ctx, "The previous question was interrupted. Ask that same topic again in your own natural words and wait; do not advance.")
                 set_reply_snapshot(
                     phone.PHONE_POST_INTERRUPT_ACK_TEXT, phase="post_interrupt_ack",
                 )
@@ -4097,7 +4171,7 @@ async def _run_native_phone_screening(
                     phone.PHONE_POST_INTERRUPT_ACK_TEXT,
                     control_text="Briefly reassure the candidate you are still on the line and invite them to continue. Do not advance or close.",
                 )
-            return
+                return
         if conflict_reply_pending["value"]:
             # This turn answers a clarification proven delivered by its exact
             # speech sequence. Consume it; it cannot advance an unrelated
@@ -6019,6 +6093,10 @@ async def _run_native_phone_screening(
     # Answer-gate test seam: the per-question-key re-ask counter, so a test can
     # seed it at the cap and prove the bounded advance.
     setattr(agent, "_answer_reask_counts", answer_reask_counts)
+    # FIX 3 (PR1a) test seam (same idiom): the per-question-key interrupted-
+    # recovery re-ask counter, so a test can assert the bound (≤1) and that the
+    # branch advances instead of re-asking once the cap is hit.
+    setattr(agent, "_interrupted_reask_counts", interrupted_reask_counts)
     # W2 conflict-loop test seam (same idiom): the per-conflict-key re-ask
     # counter, so a test can seed it at the cap and prove the bounded advance
     # (the anti-capitulation drop) without firing N live turns.

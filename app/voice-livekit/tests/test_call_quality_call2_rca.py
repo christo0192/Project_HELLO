@@ -400,6 +400,20 @@ class TestCoalescedDisposition(_Call2Harness):
         # boundary; the coalesced whole is a counter-question. The merged
         # disposition must re-ask the SAME question and the in-flight commit
         # must be fence-skipped — cursor held, nothing committed.
+        #
+        # B2 (PR1a, 2026-09-08): the answer-gate DEFAULT cap dropped 2 -> 1. The
+        # live gate bumps `answer_reask_counts[key]` to 1 as it issues THIS re-ask,
+        # and the concurrent background-commit fence holds only while the count is
+        # STRICTLY BELOW the cap — so at the new default (1) the fence and the gate
+        # collide on the very first coalesced re-ask and the boundary would commit
+        # concurrently. This property test asserts the "re-ask AND hold on the same
+        # turn" invariant, which needs the one-count buffer, so it pins the cap to
+        # 2 explicitly (the old default, still reachable via the documented env
+        # override). The default-lowering itself is covered by
+        # test_reask_cap_accessor_bounds.
+        self.enterContext(patch.dict(
+            phone.os.environ, {"PHONE_ANSWER_GATE_MAX_REASKS": "2"},
+        ))
         agent, _, state, client, hooks = await self._coordinator()
         await self._turn(hooks, "I have been working in operations for a while now")
         # The round-trip reply is streaming, no first audio yet: the second
