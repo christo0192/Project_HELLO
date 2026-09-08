@@ -101,6 +101,142 @@ class TestAuthortimeDetector(unittest.TestCase):
         self.assertIn("Sales Advisor", conflict["resume_fact"])
 
 
+# ── FIX A: role-class lexicon widening (additive) ────────────────────────────
+
+class TestRoleClassLexiconWidening(unittest.TestCase):
+    """Titles that previously went UNCLASSIFIED (silent false-negatives) now
+    classify. RED before the widening (`_role_classes` returned an empty set for
+    these); GREEN after. Each new term is pinned to its MOST-SPECIFIC existing
+    class so no intra-family disjoint is manufactured (see FIX B below)."""
+
+    def test_qualified_architect_titles_classify_as_engineering(self):
+        # An engineering-flavoured QUALIFIER in front of "architect" classifies
+        # the title as engineering (2026-09-08 review repair: the term is now
+        # ``<qualifier> architect`` only, never a bare ``architect``).
+        for title in (
+            "Solutions Architect", "Software Architect", "Cloud Architect",
+            "Enterprise Architect", "Systems Architect", "Technical Architect",
+            "Data Architect", "Security Architect",
+        ):
+            self.assertIn(
+                "engineering", phone._role_classes(title),
+                f"{title!r} should classify as engineering",
+            )
+
+    def test_bare_and_non_engineering_architect_titles_stay_unclassified(self):
+        # 2026-09-08 review repair: the bare ``architect(?:ure)?`` term wrongly
+        # pulled non-engineering "architect" titles into the engineering class,
+        # manufacturing false disjoint conflicts against design (and other) JDs.
+        # These must classify as engineering NOWHERE (as on origin/main), so a
+        # design JD vs an "Information Architect" résumé is not a false conflict.
+        for title in (
+            "Architect", "Information Architect", "Naval Architect",
+            "Landscape Architect", "Enterprise Architecture",
+        ):
+            self.assertNotIn(
+                "engineering", phone._role_classes(title),
+                f"{title!r} must NOT classify as engineering",
+            )
+
+    def test_information_architect_is_not_a_false_conflict_against_design(self):
+        # End-to-end: an "Information Architect" résumé screened for a design
+        # role must NOT produce an author-time disjoint conflict. Under the old
+        # bare-architect term this fired (engineering vs design → disjoint).
+        self.assertIsNone(phone.phone_authortime_resume_conflict(
+            {"recent_role": {"title": "Information Architect"}},
+            "Senior Product Designer",
+        ))
+        # …while a QUALIFIED software architect vs the same design role is a
+        # genuine disjoint and is preserved.
+        conflict = phone.phone_authortime_resume_conflict(
+            {"recent_role": {"title": "Software Architect"}},
+            "Senior Product Designer",
+        )
+        self.assertIsInstance(conflict, dict)
+        self.assertIn("Software Architect", conflict["resume_fact"])
+
+    def test_product_lead_titles_classify_as_management(self):
+        # product manager already matched via `manager`; product owner and scrum
+        # master are added to the SAME class so the product family never reads as
+        # disjoint against itself.
+        for title in ("Product Owner", "Scrum Master", "Product Manager"):
+            self.assertIn(
+                "management", phone._role_classes(title),
+                f"{title!r} should classify as management",
+            )
+
+    def test_reliability_and_dev_synonyms_classify_as_engineering(self):
+        for title in (
+            "Reliability Engineer", "Site Reliability Engineer", "SRE",
+            "Coder", "Developer",
+        ):
+            self.assertIn(
+                "engineering", phone._role_classes(title),
+                f"{title!r} should classify as engineering",
+            )
+
+    def test_business_analyst_stays_data_not_a_new_class(self):
+        # Deliberately NOT moved to a bespoke class: it already classifies as
+        # `data` via `analyst`, and a new class would only create fresh disjoints
+        # against genuine data/analytics résumés.
+        self.assertEqual(phone._role_classes("Business Analyst"), frozenset({"data"}))
+
+    def test_widened_titles_now_produce_author_time_conflicts(self):
+        # End-to-end through the author-time detector: a product-owner résumé
+        # screened for a software-engineering role is a real disjoint that the
+        # OLD lexicon could not see (product owner was unclassified → None).
+        conflict = phone.phone_authortime_resume_conflict(
+            {"recent_role": {"title": "Product Owner"}}, "Backend Developer",
+        )
+        self.assertIsInstance(conflict, dict)
+        self.assertIn("Product Owner", conflict["resume_fact"])
+
+
+# ── FIX B: multi-class titles are NOT a false disjoint ───────────────────────
+
+class TestSharedDomainTokenIsNotDisjoint(unittest.TestCase):
+    """A title that legitimately spans two families (e.g. `trading systems
+    engineer` → {engineering, finance}) must NOT read as a hard disjoint against
+    either family — the existing set-INTERSECTION disjoint check already grants
+    this, and these tests pin it so a future lexicon edit cannot regress it. A
+    title with NO shared domain token (e.g. `software engineer` vs a trader
+    résumé) STILL conflicts."""
+
+    def test_trading_engineer_vs_trader_is_not_a_conflict(self):
+        # {engineering, finance} ∩ {finance} = {finance} ≠ ∅ → not disjoint.
+        self.assertIsNone(phone.phone_authortime_resume_conflict(
+            {"recent_role": {"title": "Proprietary Trader"}},
+            "Trading Systems Engineer",
+        ))
+
+    def test_software_engineer_vs_trader_still_conflicts(self):
+        # {engineering} ∩ {finance} = ∅ → disjoint → real conflict preserved.
+        conflict = phone.phone_authortime_resume_conflict(
+            {"recent_role": {"title": "Proprietary Trader"}}, "Software Engineer",
+        )
+        self.assertIsInstance(conflict, dict)
+        self.assertIn("Proprietary Trader", conflict["resume_fact"])
+
+    def test_sales_engineer_vs_sales_resume_is_not_a_conflict(self):
+        # {engineering, sales} ∩ {sales} = {sales} ≠ ∅ → not disjoint.
+        self.assertIsNone(phone.phone_authortime_resume_conflict(
+            {"recent_role": {"title": "Sales Advisor"}}, "Sales Engineer",
+        ))
+
+    def test_shared_domain_holds_in_the_spoken_answer_detector_too(self):
+        # Same tolerance on the live spoken-answer path: a current claim of a
+        # dual-domain title against the résumé's finance role does not fire, but
+        # a pure-engineering claim against the same résumé does.
+        self.assertIsNone(phone.phone_deterministic_resume_conflict(
+            "I am currently a trading systems engineer.",
+            {"recent_role": {"title": "Proprietary Trader"}},
+        ))
+        self.assertIsInstance(phone.phone_deterministic_resume_conflict(
+            "I am currently a software engineer.",
+            {"recent_role": {"title": "Proprietary Trader"}},
+        ), dict)
+
+
 # ── End-to-end: the author-time arm primes the owed probe with NO judge ──────
 
 class TestAuthortimeArming(unittest.IsolatedAsyncioTestCase):
@@ -225,6 +361,63 @@ class TestAuthortimeArming(unittest.IsolatedAsyncioTestCase):
                 if owed["value"]:
                     break
             self.assertTrue(owed["value"], "the judge-discovered conflict must arm the owed probe")
+            self.assertEqual(call_metrics["coverage_judge"]["conflict_found"], 1)
+            await self._close(hooks)
+
+    async def test_judge_name_conflict_arms_owed_probe_when_deterministic_silent(self):
+        # FIX C (SE-call: wrong name "Deepak" vs résumé "Christo" never raised).
+        # The judge emits a NAME contradiction as a conflict (resume_fact =
+        # resume_name, spoken_claim = the name given). It rides the SAME
+        # `verdict.conflict` → `owed_conflict_probe` path as a résumé-content
+        # conflict. This turn is engineered so EVERY deterministic path stays
+        # silent (compatible role classes, non-intro answer → no name mismatch,
+        # no author-time delta), so ONLY the judge can arm the probe — proving the
+        # judge-as-primary intent for name conflicts too. RED if the judge's NAME
+        # finding were dropped when the lexicon is silent; GREEN as shipped.
+        call_metrics = agent_mod._new_phone_call_metrics()
+        name_conflict = {
+            "resume_fact": "Christo",
+            "spoken_claim": "Deepak",
+        }
+        compatible_resume = {
+            "recent_role": {"title": "Software Engineer", "employer": "Acme"},
+            "name": "Christo",
+        }
+        with patch.object(
+            phone, "judge_phone_coverage", new_callable=AsyncMock,
+            return_value=phone.PhoneCoverageVerdict(False, name_conflict, "model"),
+        ):
+            agent, _, _, _, hooks = await _make_native_coordinator(
+                turn_mode="toolless",
+                # Compatible classes (engineering ∩ engineering) → NO author-time
+                # arm and NO spoken-answer conflict.
+                state=self._state("Backend Developer", compatible_resume),
+                coverage_judge_enabled=True,
+                call_metrics=call_metrics,
+            )
+            owed = getattr(agent, "_owed_conflict_probe", None)
+            self.assertFalse(owed["value"], "no deterministic conflict at session start")
+            ctx = types.SimpleNamespace(items=[])
+            hooks["assistant_delivery_complete"].set()
+            hooks["latest_assistant"][0] = "Tell me about your recent role."
+            hooks["latest_assistant_anchor"][0] = 1
+            # A neutral, non-intro, class-compatible answer: the deterministic
+            # name-mismatch AND résumé-conflict paths both stay silent.
+            neutral = "I have been building backend services in Python for a few years."
+            await hooks["on_native_turn"](
+                neutral, types.SimpleNamespace(text_content=neutral), ctx,
+            )
+            for _ in range(100):
+                await asyncio.sleep(0.005)
+                if owed["value"]:
+                    break
+            self.assertTrue(
+                owed["value"],
+                "the judge's NAME conflict must arm the owed probe with no "
+                "deterministic signal",
+            )
+            self.assertEqual(owed["conflict"]["resume_fact"], "Christo")
+            self.assertEqual(owed["conflict"]["spoken_claim"], "Deepak")
             self.assertEqual(call_metrics["coverage_judge"]["conflict_found"], 1)
             await self._close(hooks)
 

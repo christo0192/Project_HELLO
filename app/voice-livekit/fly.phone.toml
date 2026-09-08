@@ -91,19 +91,24 @@ primary_region = "sin"
   # left UNSET (Sarvam default 0.45) so this A/B changes only the timing window,
   # not the speech/silence decision boundary.
   #
-  # Call G RCA (2026-09-08) — REVERTED PHONE_TURN_DETECTION to "local" below, so
-  # these Sarvam VAD frames are NO LONGER the turn-gate: the local Silero
-  # endpointing (0.3/1.0 below) owns end-of-turn again. In local mode the frames
-  # only shape when Sarvam declares an STT final (which FEEDS the local
-  # endpointer), so they are re-tuned to the SAME 0.3s-min / ~1.0s-window intent
-  # as the local bounds: count 9 = 9*32ms ≈ 0.29s minimum silence fill; window
-  # 31 = 31*32ms ≈ 0.99s lookback (a wide non-silence tolerance so a mid-answer
-  # pause is not declared a final too early). These are DORMANT unless
-  # PHONE_TURN_DETECTION is flipped back to "stt"; kept coherent with the local
-  # bounds so an stt A/B starts from the same 0.3–1.0s envelope, not the old
-  # 18/24. ENV-REVERTIBLE without a code change.
-  PHONE_SARVAM_NEGATIVE_FRAMES_COUNT = "9"
-  PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW = "31"
+  # STT-GARBLING REVERT (PR1a, 2026-09-08) — restored 18/24 from the 9/31 pairing.
+  # In "local" mode (below) these Sarvam VAD frames are NOT the turn-gate — the
+  # local Silero endpointing owns end-of-turn — but they DO decide when Sarvam
+  # declares an STT final, i.e. when it CLOSES a transcription segment. The 9/31
+  # pairing finalized a segment after only ~0.29s of silence (count 9 × 32ms),
+  # cutting words mid-clause and producing garbled transcription: "frontend" ->
+  # "Friends", "tech stack" -> "text tax", plus stray in-segment language
+  # switches, because a natural inter-word gap tripped a premature final and the
+  # next syllables opened a new, mis-decoded segment. Restoring count=18 gives a
+  # ~0.58s minimum silence fill (18 × 32ms) before a segment is closed, so a
+  # clause finishes inside ONE coherent segment; window=24 keeps the standard
+  # 6-frame non-silence tolerance (24-of-18) so an in-clause blip does not split
+  # the segment either. This is the STT-final SHAPE only; end-of-turn latency is
+  # still governed by the local endpointing bounds below. DORMANT as the turn-gate
+  # unless PHONE_TURN_DETECTION is flipped back to "stt". ENV-REVERTIBLE without a
+  # code change (revert to 9/31 by resetting these two vars).
+  PHONE_SARVAM_NEGATIVE_FRAMES_COUNT = "18"
+  PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW = "24"
   SARVAM_TTS_MODEL = "bulbul:v3"
   SARVAM_TTS_VOICE = "simran"
   # Call G RCA (2026-09-08) — REVERTED "stt" -> "local". The X8 stt experiment
@@ -116,16 +121,19 @@ primary_region = "sin"
   # "stt" injects turn_detection="stt"; any other value (incl. "local") keeps the
   # local endpointer. ENV-REVERTIBLE without a code change.
   PHONE_TURN_DETECTION = "local"
-  # v115 latency RCA + Call G tune: pin the phone-local endpointing bounds in the
-  # deploy manifest. MIN is the silence floor after the candidate stops (drives
-  # common-case latency); MAX bounds the wait on a mid-answer pause (a longer MAX
-  # only costs latency WHEN the candidate pauses mid-thought, and buys fewer
-  # cut-offs). Call G tune: MIN 0.4->0.3 (faster commit on a clean end-of-speech)
-  # and MAX 0.8->0.6 (owner tune, tighter than the old 0.8: a snappier ceiling on
-  # a mid-answer pause, still 2x the 0.3 floor so a short pause is not cut off).
-  # Clamps: MIN in [0.3, 0.5], MAX in [0.5, 2.0]. Both are env-revertible live.
+  # v115 latency RCA + fragmentation revert (PR1a, 2026-09-08): pin the phone-local
+  # endpointing bounds in the deploy manifest. MIN is the silence floor after the
+  # candidate stops (drives common-case latency); MAX bounds the wait on a
+  # mid-answer pause. A longer MAX costs latency ONLY when the candidate actually
+  # pauses mid-thought, and it buys back fewer cut-offs. The 0.6 MAX was ending
+  # the turn on any >0.6s mid-answer pause and fragmenting a single answer into
+  # several finals (the bot barged in on a still-thinking candidate). MAX 0.6->1.0
+  # tolerates natural mid-sentence pauses so a whole answer stays one turn; MIN
+  # stays 0.3 so a clean end-of-speech still commits fast. Clamps: MIN in
+  # [0.3, 0.5], MAX in [0.5, 2.0] (1.0 is well inside the reader clamp). Both are
+  # env-revertible live.
   PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC = "0.3"
-  PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC = "0.6"
+  PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC = "1.0"
   # ── Coverage JUDGE provider (Call G, 2026-09-08) ─────────────────────────────
   # Point the off-speech-path coverage judge at DeepSeek V4-Flash with reasoning
   # DISABLED (owner request), replacing Gemini gemini-3.5-flash-lite. The judge

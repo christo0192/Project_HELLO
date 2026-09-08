@@ -5623,6 +5623,60 @@ def _answer_has_substantive_signal(text: str) -> bool:
     )
 
 
+#: A sentence segment with its (optional) trailing terminator. Used to walk an
+#: utterance clause-by-clause so a SUBSTANTIVE DECLARATIVE clause can be told
+#: apart from a trailing interrogative on the same turn.
+_SENTENCE_SEGMENT_RE = re.compile(r"[^.!?]+[.!?]*")
+
+
+def _answer_has_substantive_declarative(text: str) -> bool:
+    """True when the turn carries a substantive DECLARATIVE clause — a
+    non-interrogative sentence that answers with real content — as opposed to
+    being ONLY an interrogative.
+
+    REPAIR 3 (2026-09-08 review): a genuine answer that appends a short courtesy
+    / confirmation question ("I led the backend team at Acme for three years.
+    Shall I go on?", "Currently around 18 LPA. Does that work?", "My notice
+    period is 30 days. Is that okay?") was scored NONANSWER by the short-"?"
+    counter-question branch and re-asked. The discriminator is exactly the one
+    the reviewers named: is there a substantive declarative clause present, or
+    is the WHOLE utterance only an interrogative? A pure counter-question
+    ("The second round, how long does it usually take?", "You mean LPA?") has no
+    declarative clause and stays a non-answer.
+
+    Conservative by construction: a clause counts only when it does NOT end as a
+    question AND either carries a structured answer signal (digit / duration /
+    date / compensation slot) or reads as a clear multi-word substantive
+    statement that is not itself clarification-shaped. A one-or-two-word
+    fragment ("The second round") never qualifies.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return False
+    for match in _SENTENCE_SEGMENT_RE.finditer(text):
+        segment = match.group().strip()
+        if not segment or segment.endswith("?"):
+            # An interrogative (or empty) segment carries no declarative answer.
+            continue
+        clause = segment.rstrip(".!").strip()
+        if not clause:
+            continue
+        # A clause that is itself a clarification/deflection is not an answer.
+        if phone_clarification_shape(clause):
+            continue
+        # Arm 1: structured answer evidence in a declarative clause.
+        if _answer_has_substantive_signal(clause):
+            return True
+        # Arm 2: a clear multi-word substantive statement (an "actual
+        # statement", per the reviewer) — deliberately gated on length so a
+        # bare noun fragment stranded by STT can never qualify.
+        if (
+            len(clause.split()) >= 5
+            and phone_turn_substance(clause) == PHONE_SUBSTANCE_SUBSTANTIVE
+        ):
+            return True
+    return False
+
+
 PHONE_ANSWER_ANSWERED = "answered"
 PHONE_ANSWER_DECLINED = "declined"
 PHONE_ANSWER_NONANSWER = "nonanswer"
@@ -5687,7 +5741,18 @@ def phone_answer_disposition(
         # interrogative word is not leading. A genuine short answer that
         # happens to end "?" and covers the objective still ADVANCES; one that
         # does not is merely re-asked under the existing bounded caps.
-        if not phone_answer_covers_objective(question, clean):
+        #
+        # REPAIR 3 (2026-09-08 review): a substantive answer that merely APPENDS
+        # a short courtesy/confirmation question ("…for three years. Shall I go
+        # on?", "Currently around 18 LPA. Does that work?") carries a real
+        # DECLARATIVE answer clause — it is not a counter-question and must not
+        # be re-asked. Only reject as a counter-question when the whole turn is
+        # interrogative (no substantive declarative clause) AND it does not
+        # cover the owed objective. A pure counter-question ("The second round,
+        # how long does it take?") has no declarative clause and still re-asks.
+        if not _answer_has_substantive_declarative(clean) and not (
+            phone_answer_covers_objective(question, clean)
+        ):
             return PHONE_ANSWER_NONANSWER
 
     # (3) An explicit decline is a terminal answer for this question: advance —
@@ -5895,7 +5960,16 @@ def phone_answer_gate_max_reasks() -> int:
     """How many times the answer gate re-asks a non-answered question before it
     gives up and advances (recording the question unanswered). Bounded so a
     persistently-evasive candidate can never wedge the plan in a re-ask loop.
-    Default 2; clamped to [0, 5].
+    Default 2; clamped to [0, 5]. `PHONE_ANSWER_GATE_MAX_REASKS` overrides.
+
+    RESTORED to 2 (2026-09-08 review repair): the PR1a lowering to 1 collided
+    with the background-commit fence in ``agent.py`` — that fence gates the
+    concurrent boundary commit on ``answer_reask_counts.get(key) <
+    phone_answer_gate_max_reasks()``. At a cap of 1, the FIRST coalesced re-ask
+    already sets the counter to 1, so ``1 < 1`` is False and the background
+    boundary COMMITS while the live gate is still re-asking — the exact
+    F-Q3b double-commit / cursor-desync that fence exists to prevent. A cap of
+    2 keeps the fence's first-re-ask strictly-less-than comparison True.
     """
     return _bounded_int_env(os.getenv("PHONE_ANSWER_GATE_MAX_REASKS"), 2, 0, 5)
 
@@ -6007,10 +6081,40 @@ def phone_objective_guard_max_questions_for_phase(phase: Any) -> int:
 #: class sets are DISJOINT (an overlap — e.g. "Data Engineer" is both data and
 #: engineering — is compatible, and an unknown side stays None). Deliberately
 #: coarse: a class the lexicon does not know cannot produce an accusation.
+#: FIX A (SE/name-call slate 2026-09-08): additive widening for common titles
+#: the closed-world set left UNCLASSIFIED (silent false-negatives). Because a
+#: conflict needs DISJOINT class sets, a title that spans two families (e.g.
+#: "trading systems engineer" → {engineering, finance}) can never be a false
+#: disjoint against either — so every new term goes into its MOST SPECIFIC
+#: EXISTING class, keeping intra-family and adjacent roles sharing a class rather
+#: than minting a new class that would manufacture fresh disjoints:
+#:   * QUALIFIED architect titles (software / solutions / cloud / systems /
+#:     enterprise / technical / data / security architect) and "coder" are
+#:     engineering-family → the "engineering" class. A BARE "architect" and the
+#:     non-engineering qualifiers ("information architect", "naval architect",
+#:     "landscape architect") deliberately stay UNCLASSIFIED so they never read
+#:     as disjoint from a design (or other) JD;
+#:   * ``reliability`` is added to engineering so a bare "reliability engineer"
+#:     lands there (SRE / site reliability engineer already matched via engineer);
+#:   * product-lead titles (product owner, scrum master; product manager already
+#:     matched via ``manager``) → the "management" class, so an intra-product pair
+#:     can never read as disjoint;
+#:   * "business analyst" already classifies as ``data`` via ``analyst`` and is
+#:     left there deliberately (a bespoke class would only create new disjoints
+#:     against genuine data/analytics résumés).
 _ROLE_CLASS_LEXICON: tuple[tuple[str, "re.Pattern[str]"], ...] = (
     ("engineering", re.compile(
-        r"\b(?:software|developer|engineer(?:ing)?|programmer|sde\d?|"
-        r"full[\s-]?stack|back[\s-]?end|front[\s-]?end|devops|sre)\b",
+        r"\b(?:software|developer|coder|engineer(?:ing)?|programmer|sde\d?|"
+        r"full[\s-]?stack|back[\s-]?end|front[\s-]?end|devops|sre|"
+        r"reliability|"
+        # QUALIFIED architect only (2026-09-08 review repair): a bare
+        # ``architect(?:ure)?`` swept in non-engineering titles — "information
+        # architect", "naval architect", "landscape architect" — and produced
+        # false disjoint conflicts against design/other JDs. Require an
+        # engineering-flavoured qualifier so bare / information / naval /
+        # landscape architect stays UNCLASSIFIED (as on origin/main).
+        r"(?:software|solutions|cloud|systems|enterprise|technical|data|security)"
+        r"\s+architect)\b",
         re.IGNORECASE)),
     ("sales", re.compile(
         r"\b(?:sales|advisor|advisory|counsell\w*|counselor|"
@@ -6030,7 +6134,7 @@ _ROLE_CLASS_LEXICON: tuple[tuple[str, "re.Pattern[str]"], ...] = (
         re.IGNORECASE)),
     ("management", re.compile(
         r"\b(?:manager|management|team\s+lead|director|head\s+of|"
-        r"vice\s+president|vp|supervisor)\b",
+        r"vice\s+president|vp|supervisor|product\s+owner|scrum\s+master)\b",
         re.IGNORECASE)),
     ("design", re.compile(
         r"\b(?:designer|ux|ui|graphic\s+design\w*|product\s+design\w*)\b",
@@ -7172,14 +7276,28 @@ def phone_generated_reply_rejection_reason(
     if not allow_closing and _GENERATED_CLOSING_RE.search(compact):
         return "premature_closing"
     question_acts = phone_generated_question_act_count(compact)
-    if (not allow_closing and question_acts < 1) or question_acts > ceiling:
-        # Preserve the existing sanitized telemetry category for dashboard and
-        # historical-series compatibility even though validation now counts
-        # spoken question acts rather than punctuation glyphs. When
-        # ``allow_closing`` is set the reply may legitimately carry zero
-        # questions (a terminal close), so only the upper bound applies there —
-        # same as before; the phase-aware ceiling only WIDENS the upper bound.
+    # A non-closing reply that asks NOTHING (zero question acts) is still a HARD
+    # rejection: the bot must actually put the owed question to the candidate, so
+    # an ask-nothing statement must recover via the canned authorized question.
+    # This half of the historical `question_mark_count` guard is UNCHANGED.
+    if not allow_closing and question_acts < 1:
         return "question_mark_count"
+    if question_acts > ceiling:
+        # B4 (PR1a, 2026-09-08): the OVER-CEILING half is DOWNGRADED TO LOG-ONLY.
+        # A reply that carries a second question act is no longer swapped for the
+        # flat canned recovery line — on live calls that swap replaced a natural
+        # two-part turn ("Got it. And what's your notice period — also, are you
+        # open to relocating?") with a robotic single question and lost the
+        # warmth. The occurrence is still recorded so the dashboard series
+        # survives, but evaluation CONTINUES to the hard checks below rather than
+        # returning. Preserve the exact ``question_mark_count`` category string
+        # for historical-series compatibility. (The zero-question half above stays
+        # HARD — the phase-aware ceiling only ever WIDENS the upper bound, so an
+        # ask-nothing reply is never reachable through this soft branch.)
+        _log.info(
+            "unknown_event", error_type="phone_reply_soft_flag",
+            error_category="question_mark_count",
+        )
     objective_is_comp = phone_is_compensation_objective(objective_text)
     if (
         _COMPENSATION_OBJECTIVE_RE.search(compact)
@@ -7190,12 +7308,22 @@ def phone_generated_reply_rejection_reason(
         return "compensation_drift"
     # FIX 2 (SE-call RCA 2026-09-07): plan-pursuit turns only (see docstring).
     # `phone_generated_objective_covered` fails open on custom objectives.
+    # B4 (PR1a, 2026-09-08): DOWNGRADED TO LOG-ONLY. A plan-pursuit reply whose
+    # question clause does not lexically reach the authorized objective is no
+    # longer discarded for the canned line — the coverage predicate is a shadow
+    # signal that mis-fires on legitimate paraphrases, and swapping in the canned
+    # question there was worse than a slightly-off natural reply. The occurrence
+    # is recorded; evaluation continues to the hard ``instruction_echo`` check
+    # below. Preserve the exact ``objective_drift`` category string.
     if (
         enforce_objective
         and not allow_closing
         and not phone_generated_objective_covered(compact, objective_text)
     ):
-        return "objective_drift"
+        _log.info(
+            "unknown_event", error_type="phone_reply_soft_flag",
+            error_category="objective_drift",
+        )
     # REMOVED (2026-09-03): the exact-match `conflict_clarification_drift` clause
     # rejected any conflict-turn reply that was not PHONE_RESUME_CONFLICT_
     # CLARIFICATION_TEXT character-for-character — while phone_judge_turn_

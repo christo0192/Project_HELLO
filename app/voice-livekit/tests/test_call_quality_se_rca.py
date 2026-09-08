@@ -213,13 +213,18 @@ class TestObjectiveDriftGuard(unittest.TestCase):
     ON_OBJECTIVE_REPLY = "Thanks for that. What is your notice period at your current job?"
     NOTICE_OBJECTIVE = "What is your notice period?"
 
-    def test_plan_pursuit_drift_is_rejected(self):
-        self.assertEqual(
+    def test_plan_pursuit_drift_is_no_longer_rejected(self):
+        # B4 (PR1a, 2026-09-08): `objective_drift` is DOWNGRADED TO LOG-ONLY. A
+        # plan-pursuit reply whose question clause does not lexically reach the
+        # authorized objective is no longer swapped for the canned line — the
+        # coverage predicate is a shadow signal that mis-fires on paraphrases.
+        # RED before B4 (returned "objective_drift"); GREEN after (None). The
+        # occurrence is still logged as a soft flag.
+        self.assertIsNone(
             phone.phone_generated_reply_rejection_reason(
                 self.DRIFTING_REPLY, self.NOTICE_OBJECTIVE,
                 allow_closing=False, enforce_objective=True,
             ),
-            "objective_drift",
         )
 
     def test_on_objective_reply_passes(self):

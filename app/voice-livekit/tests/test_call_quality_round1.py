@@ -353,13 +353,16 @@ class TestObjectiveGuardQuestionActCeiling(unittest.TestCase):
         "How does that square with the EdTech sales you described?"
     )
 
-    def test_the_natural_two_act_confirm_trips_the_base_one_act_rule(self):
-        # Baseline: with the default ceiling (1) the two-act confirm is rejected.
+    def test_the_natural_two_act_confirm_is_no_longer_rejected(self):
+        # B4 (PR1a, 2026-09-08): the OVER-CEILING question-act case is now
+        # LOG-ONLY. With the default ceiling (1) the two-act confirm is NO LONGER
+        # rejected — it returns None (was "question_mark_count"). RED before B4;
+        # GREEN after. The count itself is unchanged (still 2 acts).
         self.assertEqual(phone.phone_generated_question_act_count(self.TWO_ACT_CONFIRM), 2)
-        self.assertEqual(phone.phone_generated_reply_rejection_reason(
+        self.assertIsNone(phone.phone_generated_reply_rejection_reason(
             self.TWO_ACT_CONFIRM,
             phone.PHONE_NAME_CONFIRM_CLARIFICATION_TEXT, allow_closing=False,
-        ), "question_mark_count")
+        ))
 
     def test_two_act_confirm_passes_on_the_relaxed_phases(self):
         # With the phase-aware ceiling (2) the same utterances now PASS.
@@ -390,15 +393,26 @@ class TestObjectiveGuardQuestionActCeiling(unittest.TestCase):
                     max_question_acts=phone.phone_objective_guard_max_questions_for_phase(phase),
                 ))
 
-    def test_ordinary_advance_turn_still_rejects_a_genuine_double_question(self):
-        # A NON-confirm phase keeps the one-act rule: a genuine double question on
-        # an ordinary QnA advance turn is still rejected.
-        double = "What is your notice period? And what CTC do you expect?"
+    def test_ordinary_advance_turn_no_longer_rejects_on_question_count_alone(self):
+        # B4 (PR1a, 2026-09-08): a genuine double question on an ordinary advance
+        # turn is NO LONGER rejected for the question count alone (log-only). A
+        # neutral-objective double question that trips no OTHER hard guard now
+        # returns None (was "question_mark_count").
+        double = "What did you enjoy most? And what happened next?"
         self.assertEqual(phone.phone_generated_question_act_count(double), 2)
-        self.assertEqual(phone.phone_generated_reply_rejection_reason(
-            double, "Ask about availability.", allow_closing=False,
+        self.assertIsNone(phone.phone_generated_reply_rejection_reason(
+            double, "Ask about their experience.", allow_closing=False,
             max_question_acts=phone.phone_objective_guard_max_questions_for_phase("screening"),
-        ), "question_mark_count")
+        ))
+        # But a double question that ALSO drifts to compensation on a non-comp
+        # objective is STILL rejected by the surviving hard `compensation_drift`
+        # guard — the question-count downgrade never weakens the other reasons.
+        comp_double = "What is your notice period? And what CTC do you expect?"
+        self.assertEqual(phone.phone_generated_question_act_count(comp_double), 2)
+        self.assertEqual(phone.phone_generated_reply_rejection_reason(
+            comp_double, "Ask about availability.", allow_closing=False,
+            max_question_acts=phone.phone_objective_guard_max_questions_for_phase("screening"),
+        ), "compensation_drift")
 
     def test_other_protections_survive_the_relaxation(self):
         # The relaxed ceiling must NOT weaken any OTHER rejection reason. A
@@ -423,17 +437,22 @@ class TestObjectiveGuardQuestionActCeiling(unittest.TestCase):
                 self.assertEqual(
                     phone.phone_objective_guard_max_questions_for_phase(phase), 1)
 
-    def test_kill_switch_flips_behavior(self):
-        # PHONE_OBJECTIVE_GUARD_MAX_QUESTIONS=1 restores the strict one-act rule
-        # on every phase (per-phase kill switch); default (unset) is 2.
+    def test_kill_switch_flips_the_phase_ceiling(self):
+        # The phase-ceiling accessor is still env-controlled:
+        # PHONE_OBJECTIVE_GUARD_MAX_QUESTIONS=1 restores the strict one-act
+        # ceiling on every phase; default (unset) is 2.
         with patch.dict(phone.os.environ, {"PHONE_OBJECTIVE_GUARD_MAX_QUESTIONS": "1"}):
             self.assertEqual(
                 phone.phone_objective_guard_max_questions_for_phase("name_confirm"), 1)
-            self.assertEqual(phone.phone_generated_reply_rejection_reason(
+            # B4 (PR1a, 2026-09-08): even with the ceiling clamped to 1, exceeding
+            # it is now LOG-ONLY — the two-act confirm returns None (was
+            # "question_mark_count"). The ceiling still drives the soft-flag
+            # decision; it no longer drives a rejection.
+            self.assertIsNone(phone.phone_generated_reply_rejection_reason(
                 self.TWO_ACT_CONFIRM,
                 phone.PHONE_NAME_CONFIRM_CLARIFICATION_TEXT, allow_closing=False,
                 max_question_acts=phone.phone_objective_guard_max_questions_for_phase("name_confirm"),
-            ), "question_mark_count")
+            ))
         # Unset defaults to 2; out-of-range clamps to [1, 2].
         with patch.dict(phone.os.environ, {}, clear=False):
             phone.os.environ.pop("PHONE_OBJECTIVE_GUARD_MAX_QUESTIONS", None)
@@ -656,6 +675,84 @@ class TestAnswerDispositionFromTheLiveCall(unittest.TestCase):
             ),
             phone.PHONE_ANSWER_ANSWERED,
         )
+
+    # ── REPAIR 3 (2026-09-08 review): a substantive answer that ENDS in a short
+    # courtesy / confirmation question is an ANSWER, not a counter-question ────
+    #
+    # Live gap: these were scored NONANSWER by the short-"?" branch (they end on
+    # a question and do not "cover the objective" by the narrow coverage rule)
+    # and re-asked. The discriminator is a substantive DECLARATIVE clause vs a
+    # whole-utterance interrogative.
+
+    #: (objective, kind, turn) — a real declarative answer + a courtesy tail.
+    SUBSTANTIVE_PLUS_TAIL = (
+        ("Tell me about your recent experience.", "open",
+         "I led the backend team at Acme for three years. Shall I go on?"),
+        (CTC_Q, "compensation",
+         "Currently around 18 LPA. Does that work?"),
+        ("What is your notice period?", "structured",
+         "My notice period is 30 days. Is that okay?"),
+        # A declarative statement with no digits still qualifies (Arm 2).
+        ("Tell me about your recent role.", "open",
+         "I led the backend team at Acme and shipped our payments platform. "
+         "Shall I go on?"),
+    )
+
+    def test_substantive_answer_with_courtesy_tail_is_answered(self):
+        for q, kind, turn in self.SUBSTANTIVE_PLUS_TAIL:
+            with self.subTest(turn):
+                self.assertEqual(
+                    phone.phone_answer_disposition(q, kind, turn),
+                    phone.PHONE_ANSWER_ANSWERED,
+                )
+
+    def test_courtesy_tail_answers_are_not_routed_as_counter_questions(self):
+        # Consistency with the live re-ask classifiers: a substantive-plus-tail
+        # turn must NOT route as a candidate_question, and the substance gate
+        # must read it substantive — so the disposition, route, and commit gate
+        # all agree it is an answer (no cursor desync).
+        for _q, _kind, turn in self.SUBSTANTIVE_PLUS_TAIL:
+            with self.subTest(turn):
+                self.assertIsNone(phone.candidate_turn_route(turn))
+                self.assertEqual(
+                    phone.phone_turn_substance(turn),
+                    phone.PHONE_SUBSTANCE_SUBSTANTIVE,
+                )
+
+    def test_pure_counter_questions_still_reask_after_the_relaxation(self):
+        # The relaxation must NOT regress the pure counter-question cases: no
+        # declarative answer clause is present, so each stays a NONANSWER.
+        pure_counter = (
+            # STT-stranded mid-sentence interrogative (F-Q3b) — one clause.
+            ("What is your notice period?", None,
+             "The second round, how long does it usually take from your side?"),
+            (self.CTC_Q, "compensation", "You mean LPA?"),
+            ("What is your notice period?", "structured",
+             "Like you're talking about the notice period?"),
+            (self.CTC_Q, "compensation", "By CTC what do you mean?"),
+            ("Tell me about your role.", "open", "Sorry?"),
+            # Leading-"If" conditional counter — unchanged.
+            (self.CTC_Q, "compensation",
+             "If I share my CTC, will you tell me the range for this role?"),
+        )
+        for q, kind, turn in pure_counter:
+            with self.subTest(turn):
+                self.assertEqual(
+                    phone.phone_answer_disposition(q, kind, turn),
+                    phone.PHONE_ANSWER_NONANSWER,
+                )
+
+    def test_substantive_declarative_predicate_red_green(self):
+        # Direct predicate coverage: a declarative clause with real content is
+        # detected; a whole-utterance interrogative is not.
+        self.assertTrue(phone._answer_has_substantive_declarative(
+            "Currently around 18 LPA. Does that work?"))
+        self.assertTrue(phone._answer_has_substantive_declarative(
+            "I led the backend team at Acme for three years. Shall I go on?"))
+        self.assertFalse(phone._answer_has_substantive_declarative(
+            "The second round, how long does it usually take from your side?"))
+        self.assertFalse(phone._answer_has_substantive_declarative("You mean LPA?"))
+        self.assertFalse(phone._answer_has_substantive_declarative(""))
 
 
 class _FakeMsg:
@@ -936,15 +1033,19 @@ class TestRhetoricalTagQuestionCount(unittest.TestCase):
                     ),
                 )
 
-    def test_genuine_two_questions_still_counted_and_rejected(self):
-        # Two real candidate-directed questions is genuine stacking → rejected.
+    def test_genuine_two_questions_still_counted(self):
+        # Two real candidate-directed questions still COUNT as two acts — the
+        # rhetorical-tag fix does not over-suppress genuine stacking.
         stacked = "What is your CTC? What is your notice period?"
         self.assertEqual(phone.phone_generated_question_act_count(stacked), 2)
-        self.assertEqual(
+        # B4 (PR1a, 2026-09-08): exceeding the ceiling is now LOG-ONLY, so this
+        # comp-objective double question is no longer rejected on count alone (it
+        # trips no other hard guard here — the objective IS compensation, so
+        # compensation_drift does not apply). RED before B4 ("question_mark_count").
+        self.assertIsNone(
             phone.phone_generated_reply_rejection_reason(
                 stacked, "Ask about the candidate's CTC.", allow_closing=False,
             ),
-            "question_mark_count",
         )
 
     def test_a_short_real_question_is_not_mistaken_for_a_tag(self):
