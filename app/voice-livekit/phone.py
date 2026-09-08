@@ -4248,8 +4248,9 @@ _OPENING_CONSENT_CUE_RE = re.compile(
 # continue?"). These catch a compound final question that pairs a consent cue
 # with an identity ask ("...okay to continue, and am I speaking with Christo?").
 _OPENING_IDENTITY_CUE_RE = re.compile(
-    r"\b(?:speaking (?:with|to)|am i (?:speaking|reaching)|have i reached|"
-    r"your name|the right person|reached the right)\b",
+    r"\b(?:speaking (?:with|to)|talking to|am i (?:speaking|reaching)|"
+    r"who am i|have i reached|reached the right|(?:the )?(?:right|correct) person|"
+    r"your name|confirm you are)\b",
     re.IGNORECASE,
 )
 

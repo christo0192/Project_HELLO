@@ -1784,6 +1784,15 @@ class TestPhoneParity2Gate(unittest.IsolatedAsyncioTestCase):
             "This call is recorded. Is it okay to continue, and am I speaking "
             "with Christo?"
         ))
+        # Compound endings whose identity clause uses varied phrasing must also
+        # fall back (defense-in-depth from the review — not a consent hole, but it
+        # re-introduces first-answer ambiguity).
+        for compound in (
+            "This call is recorded. Do I have the correct person to proceed?",
+            "This call is recorded. Who am I talking to, is that ok?",
+            "This call is recorded. Can you confirm you are Christo, shall we proceed?",
+        ):
+            self.assertFalse(phone._opening_is_verified(compound), compound)
 
     # ── post-consent role opening (CHANGE 2: bridge removed) ─────────────
 
