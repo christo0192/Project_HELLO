@@ -54,6 +54,10 @@ set -euo pipefail
 : "${FLY_CONFIG:?FLY_CONFIG is required}"
 READY_ATTEMPTS="${READY_ATTEMPTS:-24}"
 START_ATTEMPTS="${START_ATTEMPTS:-60}"
+# A stop settles fast; the post-deploy settle-stop wait is bounded much tighter
+# than START_ATTEMPTS because falling through is already safe (the guarded start
+# + started-state poll are the real gate), and this caps the worst-case red time.
+STOP_ATTEMPTS="${STOP_ATTEMPTS:-12}"
 SLEEP_SECONDS="${SLEEP_SECONDS:-5}"
 
 if [ -z "${WATERMARK:-}" ]; then
@@ -85,6 +89,7 @@ trap cleanup EXIT
 # pre-deploy watermark (ISO-8601 sorts lexically). Returns 0 on proof, 1 on none.
 verify_current_registration() {
   local phase="$1"
+  local ts
   for _ in $(seq 1 "$READY_ATTEMPTS"); do
     ts="$(flyctl logs -a "$APP" --no-tail 2>/dev/null \
           | grep 'registered worker' \
@@ -203,7 +208,7 @@ if [ -n "$STARTED_MACHINE" ]; then
   # image, not a restart that lands mid-rollout-churn. Best-effort: a machine the
   # rollout already stopped is fine.
   flyctl machine stop "$STARTED_MACHINE" -a "$APP" || true
-  for _ in $(seq 1 "$START_ATTEMPTS"); do
+  for _ in $(seq 1 "$STOP_ATTEMPTS"); do
     state="$(flyctl machine list -a "$APP" --json 2>/dev/null \
       | jq -r --arg id "$STARTED_MACHINE" '.[] | select(.id==$id) | .state' | tail -1 || true)"
     if [ "$state" = "stopped" ]; then break; fi
