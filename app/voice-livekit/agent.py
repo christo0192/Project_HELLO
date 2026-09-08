@@ -1648,7 +1648,7 @@ def _phone_instructions_text(state: "phone.PhoneAssessmentState") -> str:
     # speaking model writes expressive, well-punctuated lines the Sarvam voice can
     # render with tone. Prepended (not merged into the sha-pinned `system_prompt`),
     # so the browser prompt surface is byte-identical.
-    text = phone.PHONE_PERSONA_TEXT + phone.PHONE_TTS_EMOTION_TEXT + phone.PHONE_TTS_DELIVERY_TEXT + system_prompt(
+    text = phone.PHONE_PERSONA_TEXT + phone.PHONE_TTS_EMOTION_TEXT + system_prompt(
         candidate_name=state.candidate_name,
         role_title=state.role_title,
         role_focus=(state.role_focus or ", ".join(state.role_required_skills))[:600],
@@ -6068,13 +6068,18 @@ async def _run_native_phone_screening(
         terminal_reason["reason"] = "completed"
         finished.set()
     else:
-        # The first planned question is deterministic fixed speech. Starting a
-        # second instruction-only Gemini generation here can serialize a context
-        # whose last conversational item is the assistant role-opening line,
-        # which Gemini rejects as "Requests ending with a model turn are not
-        # supported." Later generated replies always originate from a real
-        # candidate turn.
-        speech = session.say(question.spoken_text, allow_interruptions=True)
+        # Q1 is spoken via `say`, NOT a live generation — the context here ends
+        # with the model's role-opening turn, which the LLM rejects ("Requests
+        # ending with a model turn are not supported"); Q2+ always originate from
+        # a real candidate turn and are generated normally.
+        # Call G (2026-09-08): its TEXT is now a model REPHRASE of the planned
+        # question so the opening question is as natural as Q2+. FAIL-SAFE — any
+        # miss (timeout, bad draft) returns the verbatim planned text. The
+        # rephrase LLM is already warm (the gate ran the consent + role openings),
+        # and the owed objective is unchanged: the candidate's first answer binds
+        # to it regardless of the phrasing actually spoken.
+        q1_text = await phone.phone_rephrase_first_question(question.spoken_text)
+        speech = session.say(q1_text, allow_interruptions=True)
         wait = getattr(speech, "wait_for_playout", None)
         if callable(wait):
             value = wait()
@@ -6112,7 +6117,10 @@ async def _run_native_phone_screening(
         # the committed key — WHICH question is authoritative is unchanged.
         if question is not None:
             if not (latest_assistant[0] or "").strip():
-                latest_assistant[0] = question.spoken_text
+                # Prime with the text ACTUALLY spoken (the rephrase, or the
+                # verbatim fallback) so a first answer that races the SDK events
+                # is measured against what the candidate really heard.
+                latest_assistant[0] = q1_text
             if latest_assistant_anchor[0] is None:
                 latest_assistant_anchor[0] = int(round(time.time() * 1000))
             if not assistant_delivery_complete.is_set():
@@ -7296,6 +7304,58 @@ async def _run_phone_session(
         spoken_text = latest_assistant[0]
         return spoken_text if isinstance(spoken_text, str) and spoken_text.strip() else None
 
+    async def speak_role_opening(role_title: str) -> str | None:
+        """Author the role-opening through the SAME gate window as `speak_opening`.
+
+        Call G (2026-09-08): replaces the deterministic role sentence with a
+        model-authored one that still names the EXACT server role. Runs in the
+        `_gate_opening` window (pre-consent-authorization, so it is spoken but not
+        captured as a screening turn — same as the consent opening), seeds one
+        user turn so the request always carries contents, reads the spoken line
+        back out of `latest_assistant`, and returns it ONLY when
+        `phone_role_opening_faithful` confirms it names the role verbatim.
+        Returns None on any failure or a role miss so the gate speaks the fixed
+        `phone_role_opening_text` fallback — the verbatim role is never lost.
+        The LLM is already warm here: the consent opening (`speak_opening`) runs
+        a generation ~2s earlier in this same gate path, so the role-opening
+        never pays the cold first-token cost.
+        """
+        instructions = phone.phone_role_opening_instruction(role_title)
+        generate = getattr(session, "generate_reply", None)
+        if instructions is None or not callable(generate):
+            return None
+        setter = getattr(agent, "set_gate_opening", None)
+        if callable(setter):
+            setter(True)
+        latest_assistant[0] = None
+        try:
+            try:
+                handle = generate(user_input="Hello?", instructions=instructions)
+            except TypeError:
+                handle = generate(instructions=instructions)
+            if inspect.isawaitable(handle):
+                handle = await handle
+            wait = getattr(handle, "wait_for_playout", None)
+            if callable(wait):
+                value = wait()
+                if inspect.isawaitable(value):
+                    await value
+        except Exception:  # noqa: BLE001
+            return None
+        finally:
+            if callable(setter):
+                setter(False)
+        spoken_text = latest_assistant[0]
+        if phone.phone_role_opening_faithful(spoken_text, role_title):
+            return spoken_text
+        # Generated line did not name the exact role — discard it and let the
+        # gate speak the deterministic fallback (never a paraphrased role).
+        _log.info(
+            "unknown_event", error_type="phone_role_opening",
+            error_category="generated_role_unfaithful",
+        )
+        return None
+
     async def fetch_durable_consent() -> "phone.PhoneAssessmentState | None":
         """The READ that lets a re-dispatched leg skip a second consent ask.
 
@@ -7389,6 +7449,7 @@ async def _run_phone_session(
         # server can start the egress from the top of the call.
         post_call_answered=True,
         speak_opening=speak_opening,
+        speak_role_opening=speak_role_opening,
         consent_reply_out=consent_reply_out,
         # Answer-first origination (Plivo bounce). OFF by default → byte-identical
         # current behavior. When ON, the gate waits for the server-verified

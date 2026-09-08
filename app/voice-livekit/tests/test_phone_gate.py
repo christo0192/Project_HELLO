@@ -5115,8 +5115,10 @@ class TestInstructionConstruction(unittest.TestCase):
         self.assertIn(false_premise, instructions)
         self.assertIn(opener_variety, instructions)
         self.assertIn("\"fair enough\"", instructions)
-        # Cache safety: the per-turn rider stays byte-identical to the
-        # benchmarked R1 text — zero new uncached tokens per turn.
+        # No duplication: the discipline block's UNIQUE behavioural rules
+        # (correct-false-claims, vary-openings) stay in the cached prefix and are
+        # NOT copied into the rider — the rider carries only the delivery essence
+        # and the reply-rejection rules (Call G consolidation).
         self.assertNotIn(false_premise, phone.PHONE_TURN_STYLE_RIDER)
         self.assertNotIn(opener_variety, phone.PHONE_TURN_STYLE_RIDER)
         # Browser lane untouched: the pinned system_prompt surface never
@@ -5183,60 +5185,150 @@ class TestPhoneRoleGrounding(unittest.TestCase):
         self.assertNotIn("Role-title grounding", browser)
 
 
-class TestPhoneTtsDeliveryGuidance(unittest.TestCase):
-    """The NATURAL SPOKEN DELIVERY block (fillers/pauses tuning for Sarvam
-    bulbul:v3). It must reach the PHONE Gemini system prompt and must NOT touch
-    the sha-pinned browser surface."""
+class TestConsolidatedTurnRider(unittest.TestCase):
+    """Call G (2026-09-08): the standalone NATURAL SPOKEN DELIVERY block was
+    RETIRED and its delivery essence + the reply-rejection rules were folded into
+    the concentrated per-turn PHONE_TURN_STYLE_RIDER, so the model sees them at
+    the point of generation and the guards reject fewer drafts. The cached prefix
+    no longer carries the delivery block; the browser surface is untouched."""
 
     def _state(self):
         return phone.PhoneAssessmentState.parse(_plan_payload())
 
-    def test_constant_carries_the_delivery_guidance_and_guardrails(self):
-        t = phone.PHONE_TTS_DELIVERY_TEXT
-        self.assertIn("NATURAL SPOKEN DELIVERY", t)
-        # sparing fillers, not decorative
-        self.assertIn("SPARINGLY", t)
-        for filler in ('"um"', '"hmm"', '"right"'):
-            self.assertIn(filler, t)
-        # v114: richer, more human filler vocabulary
-        for filler in (
-            '"you know"', '"I mean"', '"sort of"', '"kind of"',
-            '"honestly"', '"look"', '"I guess"',
-        ):
-            self.assertIn(filler, t)
-        # v114: explicit "commas around fillers" punctuation guidance so Sarvam
-        # renders the micro-pause and the filler is never comma-less.
-        self.assertIn("COMMAS", t)
-        self.assertIn("comma-less", t)
-        # ellipsis discipline
-        self.assertIn("do NOT stack ellipses", t)
-        # the sensitive-moment guardrail (mirrors the no-humor rule)
-        self.assertIn("NEVER use a filler", t)
-        self.assertIn("consent", t)
-        self.assertIn("recording disclosure", t)
-        self.assertIn("compensation", t)
-        self.assertIn("callback confirmation", t)
-        self.assertIn("resume-discrepancy", t)
-
-    def test_new_fillers_and_comma_guidance_absent_from_browser_prompt(self):
-        browser = prompting.system_prompt(candidate_name="Asha", role_title="Advisor")
-        for filler in ('"sort of"', '"kind of"', '"I guess"'):
-            self.assertNotIn(filler, browser)
-        self.assertNotIn("comma-less", browser)
-
-    def test_it_reaches_the_phone_gemini_system_prompt(self):
-        # The delivery block must be in the text the phone lane hands the LLM,
-        # sitting with the other spoken-delivery guidance (after the emotion
-        # primer). Mutation guard: removing the assembly append fails this.
+    def test_delivery_block_is_retired(self):
+        # Mutation guard: the old standalone constant is gone and its heading must
+        # no longer appear in the phone system prompt (folded into the rider).
+        self.assertFalse(hasattr(phone, "PHONE_TTS_DELIVERY_TEXT"))
         with patch.object(agent_mod, "system_prompt", return_value="BUILT"):
             built = agent_mod._phone_instructions_text(self._state())
-        self.assertIn(phone.PHONE_TTS_DELIVERY_TEXT, built)
-        self.assertIn(phone.PHONE_TTS_EMOTION_TEXT, built)
+        self.assertNotIn("NATURAL SPOKEN DELIVERY", built)
 
-    def test_it_does_NOT_appear_in_the_browser_system_prompt(self):
+    def test_rider_carries_delivery_essence(self):
+        r = phone.PHONE_TURN_STYLE_RIDER
+        self.assertIn("contractions", r)
+        self.assertIn("commas wherever a speaker would breathe", r)
+        self.assertIn("Two to three short sentences", r)
+        self.assertIn("stage directions", r)  # no spoken stage directions
+
+    def test_rider_carries_the_reply_rejection_rules(self):
+        # The rules whose violation makes phone_generated_reply_rejection_reason
+        # reject the draft into a canned fallback must be stated in the rider.
+        r = phone.PHONE_TURN_STYLE_RIDER
+        self.assertIn("exactly ONE question", r)            # question_mark_count
+        self.assertIn("never two, never zero", r)           # question_mark_count
+        self.assertIn("Stay on the question you're on", r)  # objective_drift
+        self.assertIn("pay or notice period", r)            # compensation_drift
+        self.assertIn("say goodbye unless you're told", r)  # premature_closing
+
+    def test_rider_stays_out_of_the_browser_surface(self):
         browser = prompting.system_prompt(candidate_name="Asha", role_title="Advisor")
-        self.assertNotIn(phone.PHONE_TTS_DELIVERY_TEXT, browser)
-        self.assertNotIn("NATURAL SPOKEN DELIVERY", browser)
+        self.assertNotIn("exactly ONE question", browser)
+        self.assertNotIn("say goodbye unless you're told", browser)
+
+
+class TestRoleOpeningGeneration(unittest.TestCase):
+    """Call G (2026-09-08): the role-opening is model-authored (#2), with the
+    deterministic line kept as the anti-hallucination fallback."""
+
+    def test_instruction_injects_the_exact_role_verbatim(self):
+        instr = phone.phone_role_opening_instruction("Sales Program Advisor")
+        self.assertIsNotNone(instr)
+        self.assertIn("Sales Program Advisor", instr)
+        self.assertIn("verbatim", instr)
+
+    def test_instruction_is_none_without_a_role(self):
+        self.assertIsNone(phone.phone_role_opening_instruction(""))
+        self.assertIsNone(phone.phone_role_opening_instruction(None))
+
+    def test_faithful_requires_the_role_verbatim(self):
+        role = "Sales Program Advisor"
+        self.assertTrue(phone.phone_role_opening_faithful(
+            "Great — so this is about the Sales Program Advisor role, glad you're here!", role))
+        # case/whitespace-insensitive
+        self.assertTrue(phone.phone_role_opening_faithful(
+            "this is the  sales program advisor  position", role))
+        # a RENAMED role (the call-24 hallucination) must fail closed
+        self.assertFalse(phone.phone_role_opening_faithful(
+            "this is about the Software Engineer role at Interview Kickstart", role))
+        # whole-phrase, not substring: a partial-word overlap must NOT pass
+        self.assertFalse(phone.phone_role_opening_faithful(
+            "this is an advisory board chat", "Advisor"))
+        self.assertTrue(phone.phone_role_opening_faithful(
+            "this is about the Advisor role", "Advisor"))
+        # empty / non-string fail closed
+        self.assertFalse(phone.phone_role_opening_faithful("", role))
+        self.assertFalse(phone.phone_role_opening_faithful("anything", ""))
+        self.assertFalse(phone.phone_role_opening_faithful(None, role))
+
+    def test_deterministic_fallback_still_names_the_role(self):
+        line = phone.phone_role_opening_text("Sales Program Advisor")
+        self.assertIn("Sales Program Advisor", line)
+        self.assertIsNone(phone.phone_role_opening_text(""))
+
+
+class TestQ1Rephrase(unittest.IsolatedAsyncioTestCase):
+    """Call G (2026-09-08): Q1 is a model rephrase of the planned question (#4),
+    fail-safe to the verbatim text on any miss."""
+
+    def test_instruction_carries_the_question_or_none(self):
+        instr = phone.phone_q1_rephrase_instruction("Tell me about your current role.")
+        self.assertIsNotNone(instr)
+        self.assertIn("Tell me about your current role.", instr)
+        self.assertIn("ONE question", instr)
+        self.assertIsNone(phone.phone_q1_rephrase_instruction(""))
+
+    def test_acceptable_requires_exactly_one_speakable_question(self):
+        self.assertTrue(phone.phone_rephrased_question_acceptable(
+            "So, to start — could you tell me about your current role?"))
+        # an imperative ask ("tell me…") is a valid SINGLE question act
+        self.assertTrue(phone.phone_rephrased_question_acceptable(
+            "Tell me about your current role."))
+        # zero question acts — a pure statement with no ask
+        self.assertFalse(phone.phone_rephrased_question_acceptable(
+            "Thanks so much, I'm really glad you could join today."))
+        # two stacked questions
+        self.assertFalse(phone.phone_rephrased_question_acceptable(
+            "What's your role? And what's your stack?"))
+        # empty / non-speakable / non-string
+        self.assertFalse(phone.phone_rephrased_question_acceptable(""))
+        self.assertFalse(phone.phone_rephrased_question_acceptable("?!"))
+        self.assertFalse(phone.phone_rephrased_question_acceptable(None))
+        # run-on
+        self.assertFalse(phone.phone_rephrased_question_acceptable("x " * 250 + "?"))
+
+    async def test_uses_a_good_rephrase(self):
+        async def infer(_instruction):
+            return "So, to kick things off — could you walk me through your current role?"
+        out = await phone.phone_rephrase_first_question(
+            "Introduce yourself and your current role.", infer=infer)
+        self.assertEqual(out, "So, to kick things off — could you walk me through your current role?")
+
+    async def test_falls_back_to_verbatim_on_bad_or_failed_generation(self):
+        verbatim = "Introduce yourself and your current role."
+
+        async def no_question(_i):
+            return "Thanks, let's get started."  # not a question -> reject
+
+        async def empty(_i):
+            return ""
+
+        async def raises(_i):
+            raise RuntimeError("boom")
+
+        for stub in (no_question, empty, raises):
+            with self.subTest(stub=stub.__name__):
+                out = await phone.phone_rephrase_first_question(verbatim, infer=stub)
+                self.assertEqual(out, verbatim)
+
+    async def test_empty_question_returns_empty_without_calling_infer(self):
+        called = {"n": 0}
+
+        async def infer(_i):
+            called["n"] += 1
+            return "x?"
+        out = await phone.phone_rephrase_first_question("", infer=infer)
+        self.assertEqual(out, "")
+        self.assertEqual(called["n"], 0)
 
 
 class TestTtsFirstFragmentBoundary(unittest.TestCase):
@@ -8172,6 +8264,48 @@ class TestJudgeRollingTranscriptWindow(unittest.IsolatedAsyncioTestCase):
         payload = json.loads(captured["prompt"])
         self.assertIn("recent_transcript", payload)
         self.assertIn("Just two months", payload["recent_transcript"])
+
+    async def test_resume_name_reaches_the_judge_as_its_own_field(self):
+        # Call G: the record name must be an EXPLICIT payload field so the judge's
+        # name-contradiction rule has an unambiguous value to compare against.
+        captured: dict = {}
+
+        async def infer(prompt):
+            captured["prompt"] = prompt
+            return json.dumps({"covered": True, "conflict": None})
+
+        await phone.judge_phone_coverage(
+            question_text="Tell me a bit about yourself.",
+            assistant_reply="So, tell me a little about yourself!",
+            candidate_answer="Yeah, my name is Deepak and I have eleven years...",
+            resume_facts={"name": "Christo Kingson", "experience_years": 11},
+            infer=infer,
+        )
+        payload = json.loads(captured["prompt"])
+        self.assertEqual(payload.get("resume_name"), "Christo Kingson")
+
+    async def test_name_conflict_surfaces_when_spoken_name_differs(self):
+        # A judge that reads resume_name against the introduced name flags the
+        # "Deepak" vs record "Christo" contradiction — the Call G miss.
+        async def infer(prompt):
+            payload = json.loads(prompt)
+            record = payload.get("resume_name", "")
+            answer = payload.get("candidate_answer", "")
+            if record == "Christo Kingson" and "Deepak" in answer:
+                return json.dumps({"covered": True, "conflict": {
+                    "resume_fact": record, "spoken_claim": "Deepak",
+                }})
+            return json.dumps({"covered": True, "conflict": None})
+
+        verdict = await phone.judge_phone_coverage(
+            question_text="Tell me a bit about yourself.",
+            assistant_reply="So, tell me a little about yourself!",
+            candidate_answer="Yeah, my name is Deepak and I have eleven years...",
+            resume_facts={"name": "Christo Kingson"},
+            infer=infer,
+        )
+        self.assertIsNotNone(verdict.conflict)
+        self.assertEqual(verdict.conflict["spoken_claim"], "Deepak")
 
     async def test_conflict_fragmented_across_turns_surfaces(self):
         # The single owed Q/A ("At Example Co.") is not itself a conflict; the

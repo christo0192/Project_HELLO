@@ -302,11 +302,23 @@ class TestTurnStyleRider(unittest.TestCase):
     close — closes were 6/6 clean without it and must stay untouched."""
 
     def test_rider_constant_is_the_exact_benchmarked_text(self):
+        # Call G (2026-09-08): the rider now also carries the reply-rejection
+        # rules folded in from the retired delivery block; the delivery essence
+        # below stays intact.
         self.assertIn("commas wherever a speaker would breathe",
                       phone.PHONE_TURN_STYLE_RIDER)
-        self.assertIn("Always use contractions", phone.PHONE_TURN_STYLE_RIDER)
+        self.assertIn("use contractions", phone.PHONE_TURN_STYLE_RIDER)
         self.assertIn("Two to three short sentences", phone.PHONE_TURN_STYLE_RIDER)
         self.assertTrue(phone.PHONE_TURN_STYLE_RIDER.startswith(" "))
+
+    def test_rider_carries_the_reply_rejection_rules(self):
+        # Point-of-generation acceptance contract: exactly one question, stay on
+        # the owed topic, no premature close (each mirrors a
+        # phone_generated_reply_rejection_reason category).
+        r = phone.PHONE_TURN_STYLE_RIDER
+        self.assertIn("exactly ONE question", r)
+        self.assertIn("Stay on the question you're on", r)
+        self.assertIn("say goodbye unless you're told", r)
 
     def test_rider_rides_both_planned_instruction_branches_not_the_close(self):
         # agent.py is read as text (this suite has no livekit/dotenv stubs).

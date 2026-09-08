@@ -121,11 +121,11 @@ primary_region = "sin"
   # common-case latency); MAX bounds the wait on a mid-answer pause (a longer MAX
   # only costs latency WHEN the candidate pauses mid-thought, and buys fewer
   # cut-offs). Call G tune: MIN 0.4->0.3 (faster commit on a clean end-of-speech)
-  # and MAX 0.8->1.0 (more tolerance for a mid-answer pause so a slow speaker is
-  # not cut off). Clamps: MIN in [0.3, 0.5], MAX in [0.5, 2.0]. Both are
-  # env-revertible live.
+  # and MAX 0.8->0.6 (owner tune, tighter than the old 0.8: a snappier ceiling on
+  # a mid-answer pause, still 2x the 0.3 floor so a short pause is not cut off).
+  # Clamps: MIN in [0.3, 0.5], MAX in [0.5, 2.0]. Both are env-revertible live.
   PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC = "0.3"
-  PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC = "1.0"
+  PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC = "0.6"
   # ── Coverage JUDGE provider (Call G, 2026-09-08) ─────────────────────────────
   # Point the off-speech-path coverage judge at DeepSeek V4-Flash with reasoning
   # DISABLED (owner request), replacing Gemini gemini-3.5-flash-lite. The judge
