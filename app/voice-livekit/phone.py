@@ -930,6 +930,50 @@ def phone_generative_objective_guard_enabled() -> bool:
     }
 
 
+def phone_reply_token_streaming_enabled() -> bool:
+    """A0 (PR2b): 100%-TTFT true token streaming for NORMAL screening turns.
+
+    THE LATENCY PROBLEM (owner, 2026-09-08): "most of the TTFT is not going and
+    waiting for full generation when there is no acknowledgement… I want 100%
+    TTFT to get streamed." On a NORMAL planned-question turn, ``llm_node``'s
+    guarded incremental release (below) only lets an acknowledgement PREFIX
+    (``"?" not in prefix``) leave before the full draft is validated. A reply
+    that LEADS WITH the question — no preceding acknowledgement clause — never
+    satisfies that prefix gate, so its first speakable token is withheld until
+    the WHOLE generation completes and passes ``phone_generated_reply_rejection_
+    reason``. That whole-generation wait is the TTFT floor this fix removes.
+
+    THE FIX (default ON): for the NORMAL turn class ONLY — ``_turn_policy ==
+    "substantive"`` AND ``_generation_phase == "screening"`` (the ordinary
+    planned-question shape the per-turn prompt binds to "one brief
+    acknowledgement followed by exactly one question … do not close") — yield
+    every LLM chunk to TTS AS IT ARRIVES, so first audio tracks the LLM's
+    first-token latency, not full-generation latency. The reply validator still
+    runs on the fully assembled text, but ADVISORY (log-only) — it can no longer
+    gate pre-speech for a streamed turn because speech has already begun. The
+    downstream nets remain the pre-speech authorities they always were: the
+    answer-gate re-asks on the NEXT turn if the owed question went unanswered,
+    the delivery-gate detects drift, and objective_drift is already log-only
+    (B4, PR1a). Barge-in is unaffected: streaming just yields the SDK chunks the
+    parent node would have yielded anyway, so AgentSession's interruption still
+    cancels the in-flight stream exactly as it does for the browser lane.
+
+    SENSITIVE TURNS ARE NEVER STREAMED optimistically and this switch does not
+    touch them — the consent-answer discard, the gate opening, closing/terminal
+    turns (``allow_closing`` / phase ``closing``), résumé-conflict probes (phase
+    ``resume_conflict``), and name-confirmation turns (phase ``name_confirm``)
+    all stay on today's buffer-then-validate-then-speak path because they carry
+    a policy/phase this predicate deliberately excludes. See ``llm_node``.
+
+    ``off`` (or 0/false/no) restores the pre-A0 guarded-buffering behaviour for
+    every turn — the instant rollback. Read at the CALL SITE with the literal
+    name so the env-contract scanner sees it.
+    """
+    return (os.getenv("PHONE_REPLY_TOKEN_STREAMING") or "on").strip().lower() not in {
+        "0", "false", "off", "no",
+    }
+
+
 def phone_objective_preemptive_enabled() -> bool:
     """Overlap stable-objective LLM work with the bounded EOU tail.
 
@@ -2757,6 +2801,29 @@ def strip_markdown_for_speech(text: Any) -> str:
     return text.translate(_MARKDOWN_SPEECH_CHARS)
 
 
+#: A0 (PR2b): the leading segment the streamed-turn content gate holds before it
+#: releases and streams. Small — a boundary-less lead still releases within a
+#: clause's worth of characters so first audio is not delayed, while giving the
+#: instruction-echo / premature-closing leak vetoes enough text to fire. The
+#: leak checks also run at any earlier clause/sentence boundary, so this cap only
+#: bounds the pathological no-punctuation lead.
+_A0_LEADING_SEGMENT_MAX_CHARS = 48
+
+
+async def _achain(prefix_items: list[Any], rest: Any) -> Any:
+    """Yield already-pulled chunks, then the untouched remainder of a stream.
+
+    A0 (PR2b): when the leading-segment content gate WITHHELDS a streamed reply
+    (leak/premature-close), the chunks it already pulled must be fed back ahead
+    of the untouched stream tail so the buffered guarded path sees the COMPLETE
+    reply, byte-for-byte, and can recover deterministically. No chunk is dropped
+    or reordered."""
+    for item in prefix_items:
+        yield item
+    async for item in rest:
+        yield item
+
+
 async def _aiter_text(text: Any) -> Any:
     """Normalise a TTS-node text source to an async iterator of str chunks.
 
@@ -3021,6 +3088,57 @@ def bounded_phone_chat_context(chat_ctx: Any) -> Any:
     bounded = copy_ctx()
     bounded.items = retained
     return bounded
+
+
+def _phone_turn_ctx_bindable(turn_ctx: Any) -> bool:
+    """True when ``turn_ctx`` can carry a per-turn developer instruction.
+
+    FIX #5 F0a fail-safe (PR2b): this is the EXACT capability probe the
+    coordinator's ``add_turn_instruction`` (agent.py) performs before it binds —
+    a callable ``add_message`` OR a list ``items``. ``on_user_turn_completed``
+    calls this BEFORE handing the ctx to the coordinator so a malformed/absent
+    ctx degrades to a harmless sink (see ``_PhoneDiscardTurnCtx``) instead of
+    ``add_turn_instruction`` raising ``phone_turn_context_unavailable`` out of
+    the hook and the SDK dropping the whole turn. Kept in lock-step with
+    ``add_turn_instruction``: if that probe ever changes, this must match.
+    """
+    if turn_ctx is None:
+        return False
+    if callable(getattr(turn_ctx, "add_message", None)):
+        return True
+    return isinstance(getattr(turn_ctx, "items", None), list)
+
+
+class _PhoneDiscardTurnCtx:
+    """A throwaway per-turn context that absorbs instructions and drops them.
+
+    FIX #5 F0a fail-safe (PR2b): when the SDK hands ``on_user_turn_completed`` a
+    ctx that cannot carry a per-turn instruction, we must NOT simply pass
+    ``None`` to the coordinator — several ``add_turn_instruction(turn_ctx, …)``
+    call sites in the coordinator are NOT guarded by ``turn_ctx is not None``, so
+    ``None`` would just relocate the ``phone_turn_context_unavailable`` raise to
+    ``add_turn_instruction`` (``getattr(None, …)`` → raise) and STILL drop the
+    turn. Instead we substitute this sink: it exposes BOTH a callable
+    ``add_message`` AND a list ``items``, so it satisfies ``add_turn_instruction``'s
+    capability probe and every call site — guarded or not — binds successfully,
+    landing the instruction in a discarded list. The coordinator only WRITES to
+    ``turn_ctx`` via ``add_turn_instruction`` and only ever reads a stored
+    ``turn_ctx`` back to pass it INTO ``add_turn_instruction`` again (never to
+    inspect its contents), so the discarded instructions are never observed. The
+    real reply then generates against the agent's standing chat context exactly
+    as it did before per-turn instructions existed — current behaviour, never a
+    dropped turn.
+    """
+
+    __slots__ = ("items",)
+
+    def __init__(self) -> None:
+        self.items: list[Any] = []
+
+    def add_message(self, *, role: Any = None, content: Any = None) -> None:
+        # Absorb and discard: keep the same signature the SDK ctx exposes so the
+        # coordinator's `add_message`-first branch is exercised identically.
+        self.items.append({"role": role, "content": content})
 
 
 def rewrite_developer_role_to_system(chat_ctx: Any) -> tuple[Any, int]:
@@ -7337,6 +7455,40 @@ def phone_generated_prefix_authorized(
     return True
 
 
+def phone_streamed_leading_segment_safe(
+    speech: Any, objective_text: Any, *, control_text: Any = None,
+) -> bool:
+    """A0 (PR2b): may the leading segment of a STREAMED normal turn be spoken?
+
+    A0 streams a normal ``screening`` turn token-by-token, so the buffered
+    path's HARD pre-speech content-leak vetoes cannot gate the full reply. This
+    predicate re-imposes exactly the TWO leak vetoes that, when they occur,
+    surface at the TOP of a reply and must never reach the candidate:
+
+      * ``instruction_echo`` — a long contiguous copy of the private controller
+        prose (``phone_instruction_echo_detected``); and
+      * ``premature_closing`` — terminal/goodbye prose on a non-closing turn
+        (``_GENERATED_CLOSING_RE``).
+
+    Unlike ``phone_generated_prefix_authorized`` it does NOT veto a question act
+    — streaming the question IS the goal of A0, and question-count/objective are
+    already advisory (log-only, B4). It also does not veto compensation wording:
+    that is candidate-context-dependent (a candidate may have volunteered comp)
+    and is caught by the post-speech advisory check, not a pre-speech leak. A
+    ``False`` return routes the turn to the buffered guarded path (no speech,
+    deterministic recovery), so it fails SAFE. Non-str/empty → not safe (there
+    is nothing speakable to release yet)."""
+    if not isinstance(speech, str) or not any(ch.isalpha() for ch in speech):
+        return False
+    compact = " ".join(speech.split())
+    if _GENERATED_CLOSING_RE.search(compact):
+        return False
+    private_control = _private_phone_control_text(control_text, objective_text)
+    if phone_instruction_echo_detected(compact, private_control):
+        return False
+    return True
+
+
 def phone_generated_reply_rejection_reason(
     speech: Any, objective_text: Any, *, allow_closing: bool,
     control_text: Any = None, max_question_acts: int = 1,
@@ -9099,6 +9251,193 @@ def phone_agent_class(agent_base: Any) -> Any:
                     return content
                 return chunk if isinstance(chunk, str) else ""
 
+            # ── A0 (PR2b): 100%-TTFT true token streaming for NORMAL turns ─────
+            #
+            # The guarded incremental release below only lets an acknowledgement
+            # PREFIX speak before the full draft is validated; a reply that LEADS
+            # WITH the question holds its first speakable token until the whole
+            # generation is complete (the owner's "waiting for full generation"
+            # latency floor). For the NORMAL turn class ONLY — an ordinary
+            # planned-question turn: `substantive` policy AND `screening` phase,
+            # not closing — yield every chunk to TTS as it arrives so first audio
+            # tracks the LLM's first-token latency.
+            #
+            # WHY THIS IS SAFE (does NOT weaken any sensitive-turn guarantee):
+            #   * SCOPE. The predicate requires `_turn_policy == "substantive"`
+            #     AND `_generation_phase == "screening"` AND NOT
+            #     `_generation_allow_closing`. Every buffer-then-validate turn is
+            #     structurally excluded: the consent-answer discard already
+            #     returned above (`not self._screening_authorized`); the gate
+            #     opening returned even earlier (`self._gate_opening`); closing /
+            #     terminal turns carry `allow_closing` or phase `closing`;
+            #     résumé-conflict probes carry phase `resume_conflict` under the
+            #     `clarification` policy; name-confirmation turns carry phase
+            #     `name_confirm` under `clarification`. None of those satisfy this
+            #     predicate, so all of them fall through to the UNCHANGED guarded
+            #     buffering path below and keep speaking nothing until the full
+            #     draft passes validation.
+            #   * THE HARD-REJECT CONDITIONS CANNOT SILENTLY HARM A STREAMED
+            #     NORMAL TURN. The per-turn prompt binds a `screening` turn to
+            #     "one brief specific acknowledgement followed by exactly one
+            #     question for this authorized objective … do not close", so
+            #     `empty`, `premature_closing` and stacked-question shapes are
+            #     off-contract; and the answer-gate (re-asks the owed question on
+            #     the NEXT turn if it went unanswered), the delivery-gate (drift),
+            #     and the already-log-only `objective_drift`/`question_mark_count`
+            #     soft flags (B4, PR1a) remain the downstream authorities. The
+            #     validator therefore still RUNS on the assembled text but is
+            #     ADVISORY (log-only) here: once a chunk has been spoken we cannot
+            #     un-speak it, and calling `_on_generation_empty` would make the
+            #     watchdog speak a SECOND full recovery line on top of what the
+            #     candidate already heard — so a streamed turn must never invoke
+            #     that recovery. We log the reason for dashboard continuity and
+            #     stop; the pre-speech gate stays intact for the sensitive turns
+            #     that still route through the buffering path below.
+            #   * BARGE-IN IS UNAFFECTED. Streaming yields exactly the SDK chunks
+            #     the parent `llm_node` produced, in order — the same shape the
+            #     browser (Christy) lane yields — so AgentSession's interruption
+            #     cancels this async generator on barge-in just as it does there.
+            #     No task is spawned and no chunk is held, so there is nothing to
+            #     defeat interruption.
+            if (
+                phone_reply_token_streaming_enabled()
+                and self._turn_policy == "substantive"
+                and self._generation_phase == "screening"
+                and not self._generation_allow_closing
+            ):
+                # LEADING-SEGMENT CONTENT GATE, then pure streaming.
+                #
+                # A0 must not surrender the TWO hard CONTENT-LEAK guards the
+                # buffered path enforced pre-speech: a leaked controller
+                # instruction (`instruction_echo`) and a premature goodbye
+                # (`premature_closing`). Both, when they happen, appear at the
+                # TOP of the reply. So we hold ONLY the first speakable segment
+                # (up to the first clause/sentence boundary OR a small char cap),
+                # validate exactly those two leak conditions on it, and:
+                #   * if the segment is clean → release it and STREAM every
+                #     remaining chunk verbatim (first audio ≈ first-segment
+                #     latency, not full-generation — the A0 win); or
+                #   * if the segment is a leak/premature-close → DO NOT speak it.
+                #     Fall through to the buffered guarded path below (which
+                #     re-reads the SAME stream tail and recovers deterministically
+                #     with the authorized question), exactly as today.
+                # We deliberately do NOT gate on question-count/objective here —
+                # streaming the question IS the goal, and those are already
+                # log-only (B4). The check is content-safety only, and it uses
+                # `phone_generated_prefix_authorized` MINUS its question-act veto
+                # via the dedicated leak predicate below.
+                held_prefix: list[Any] = []
+                prefix_parts: list[str] = []
+                prefix_ok = False
+                leak_detected = False
+                consumed_all = False
+                self._generation_prefix_released = False
+                while True:
+                    try:
+                        chunk = await result.__anext__()
+                    except StopAsyncIteration:
+                        consumed_all = True
+                        break
+                    held_prefix.append(chunk)
+                    prefix_parts.append(_chunk_text(chunk))
+                    segment = "".join(prefix_parts).strip()
+                    # Wait for a speakable boundary (clause/sentence punct) OR a
+                    # bounded char cap so a boundary-less lead still releases.
+                    if not any(ch.isalpha() for ch in segment):
+                        continue
+                    at_boundary = segment.endswith(
+                        (".", "!", "?", ",", ";", ":", "—", "–", "…")
+                    )
+                    if not at_boundary and len(segment) < _A0_LEADING_SEGMENT_MAX_CHARS:
+                        continue
+                    # Evaluate the leading segment for CONTENT LEAKS only.
+                    if phone_streamed_leading_segment_safe(
+                        segment, objective,
+                        control_text=self._generation_control_text,
+                    ):
+                        prefix_ok = True
+                    else:
+                        leak_detected = True
+                    break
+                assembled_prefix = "".join(prefix_parts).strip()
+                has_speakable = any(ch.isalpha() for ch in assembled_prefix)
+                if not prefix_ok and not leak_detected and has_speakable:
+                    # The whole reply ended BEFORE any clause boundary or the char
+                    # cap (a short boundary-less reply, e.g. "Goodbye"), so the
+                    # per-segment leak check above never ran. Validate the full
+                    # speakable text now so a short leak/close can never slip
+                    # through unchecked into the clean-release branch.
+                    if phone_streamed_leading_segment_safe(
+                        assembled_prefix, objective,
+                        control_text=self._generation_control_text,
+                    ):
+                        prefix_ok = True
+                    else:
+                        leak_detected = True
+                if leak_detected:
+                    # The lead is a controller-instruction echo or a premature
+                    # close: speak NOTHING and let the buffered path recover. Feed
+                    # the already-pulled chunks back ahead of the untouched tail so
+                    # the guarded path sees the complete reply, unmodified.
+                    result = _achain(held_prefix, result)
+                    _log.info(
+                        "unknown_event", error_type="phone_reply_soft_flag",
+                        error_category="streamed_leading_segment_withheld",
+                    )
+                    # fall through to the guarded buffering path below
+                elif not prefix_ok and consumed_all and not has_speakable:
+                    # The whole generation was non-speakable (empty / letter-free).
+                    # Nothing was spoken, so immediate recovery cannot double-speak
+                    # — signal it (as the buffered path would) instead of making
+                    # the candidate wait out the first-audio watchdog. No chunk was
+                    # yielded, so `_generation_prefix_released` stays False and the
+                    # recovery keeps its full acknowledgement.
+                    self._generation_prefix_released = False
+                    on_empty = getattr(self, "_on_generation_empty", None)
+                    if callable(on_empty):
+                        try:
+                            observed = on_empty("empty_or_nonspeakable")
+                        except TypeError:
+                            observed = on_empty()
+                        if inspect.isawaitable(observed):
+                            await observed
+                    return
+                else:
+                    # Clean lead (or a clean short whole-reply): release the held
+                    # segment and STREAM the remainder verbatim. From here the
+                    # path is pure passthrough — the A0 100%-TTFT behaviour.
+                    stream_parts: list[str] = list(prefix_parts)
+                    for buffered in held_prefix:
+                        self._generation_prefix_released = True
+                        yield buffered
+                    if not consumed_all:
+                        async for chunk in result:
+                            stream_parts.append(_chunk_text(chunk))
+                            self._generation_prefix_released = True
+                            yield chunk
+                    # ADVISORY validation only for a reply that ALREADY SPOKE — it
+                    # never gates speech and never recovers (a second line on top
+                    # of what the candidate heard would double-speak). The
+                    # downstream answer-gate / delivery-gate remain the pre-speech
+                    # authorities on the NEXT turn. Logged for series continuity.
+                    speech = "".join(stream_parts).strip()
+                    advisory_reason = phone_generated_reply_rejection_reason(
+                        speech, objective,
+                        allow_closing=self._generation_allow_closing,
+                        control_text=self._generation_control_text,
+                        max_question_acts=phone_objective_guard_max_questions_for_phase(
+                            self._generation_phase,
+                        ),
+                        candidate_text=self._generation_candidate_text,
+                        enforce_objective=False,
+                    )
+                    if advisory_reason is not None:
+                        _log.info(
+                            "unknown_event", error_type="phone_reply_soft_flag",
+                            error_category="streamed_reply_advisory",
+                        )
+                    return
+
             async def _collect(stream: Any) -> tuple[list[Any], str]:
                 chunks: list[Any] = []
                 parts: list[str] = []
@@ -9202,9 +9541,41 @@ def phone_agent_class(agent_base: Any) -> Any:
                 # `turn_ctx` is the SDK's temporary context for THIS reply.
                 # Do not mutate the durable Agent chat context or append the
                 # user message: AgentActivity owns both, and will add the
-                # message exactly once after this hook returns.
+                # message exactly once after this hook returns. This is the
+                # clean WebRTC binding contract (the browser `Christy` agent
+                # uses the SDK default hook and lets AgentActivity own history),
+                # ported to the phone path: the coordinator binds only PER-TURN
+                # developer instructions onto this temporary `turn_ctx` (via
+                # `add_turn_instruction`), never the durable transcript.
+                #
+                # FIX #5 F0a FAIL-SAFE (PR2b): `add_turn_instruction` (agent.py)
+                # is the coordinator's sole binding surface, and it RAISES
+                # `phone_turn_context_unavailable` when the ctx exposes neither a
+                # callable `add_message` NOR a list `items`. Several coordinator
+                # call sites (the plain planned-question / patience / candidate-
+                # end paths) invoke it WITHOUT a per-site `turn_ctx is not None`
+                # guard, so a malformed/absent ctx handed straight through would
+                # raise out of THIS hook and the SDK would DROP the whole turn —
+                # the candidate speaks and hears nothing back (dead air).
+                #
+                # Passing `None` would NOT fix this — it only relocates the same
+                # raise to the FIRST unguarded `add_turn_instruction(None, …)`
+                # (`getattr(None, …)` → raise). Instead substitute a harmless
+                # discard sink (`_PhoneDiscardTurnCtx`) that satisfies the
+                # capability probe with a list `items`, so EVERY call site
+                # (guarded or not) succeeds and the per-turn instruction lands in
+                # a discarded list nothing reads back. The reply still generates
+                # against the agent's standing chat context — current behaviour —
+                # instead of the turn being lost. Never raises here.
+                bindable_turn_ctx = turn_ctx
+                if not _phone_turn_ctx_bindable(turn_ctx):
+                    bindable_turn_ctx = _PhoneDiscardTurnCtx()
+                    _log.info(
+                        "unknown_event", error_type="phone_turn_context",
+                        error_category="turn_ctx_binding_unavailable_failsafe",
+                    )
                 if self._on_user_turn is not None and text:
-                    observed = self._on_user_turn(text, new_message, turn_ctx)
+                    observed = self._on_user_turn(text, new_message, bindable_turn_ctx)
                     if inspect.isawaitable(observed):
                         await observed
                     if self._on_reply_expected is not None:
