@@ -5250,6 +5250,11 @@ class TestRoleOpeningGeneration(unittest.TestCase):
         # a RENAMED role (the call-24 hallucination) must fail closed
         self.assertFalse(phone.phone_role_opening_faithful(
             "this is about the Software Engineer role at Interview Kickstart", role))
+        # whole-phrase, not substring: a partial-word overlap must NOT pass
+        self.assertFalse(phone.phone_role_opening_faithful(
+            "this is an advisory board chat", "Advisor"))
+        self.assertTrue(phone.phone_role_opening_faithful(
+            "this is about the Advisor role", "Advisor"))
         # empty / non-string fail closed
         self.assertFalse(phone.phone_role_opening_faithful("", role))
         self.assertFalse(phone.phone_role_opening_faithful("anything", ""))

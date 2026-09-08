@@ -518,7 +518,15 @@ def phone_role_opening_faithful(text: Any, role_title: Any) -> bool:
     spoken = " ".join(text.split()).strip().lower()
     if not spoken:
         return False
-    return role in spoken
+    # WHOLE-PHRASE match, not a raw substring: the role must appear bounded by
+    # non-alphanumeric characters or the string edges, so a partial-word overlap
+    # ("advisor" inside "advisory", "eng" inside "engineering") never counts as
+    # naming the role. (A model that PREPENDS a qualifier to a SHORT one-word
+    # title could still pass — an accepted residual; production titles here are
+    # multi-word, for which this is an exact contiguous-phrase check.)
+    return re.search(
+        r"(?<![a-z0-9])" + re.escape(role) + r"(?![a-z0-9])", spoken,
+    ) is not None
 
 
 def phone_q1_rephrase_instruction(question_text: Any) -> str | None:
