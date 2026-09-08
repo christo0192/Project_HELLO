@@ -6351,16 +6351,29 @@ def phone_name_confirm_instruction(mismatch: Any) -> str | None:
     spoken = " ".join(str(mismatch.get("spoken") or "").split())[:60]
     if not record or not spoken:
         return None
+    # Call C RCA (2026-09-08) PHASE ISOLATION: the instruction is
+    # CONFIRMATION-ONLY. The prior "… then continue. Use whichever name THEY
+    # confirm for the rest of the call." clause told the model to RESUME the
+    # owed plan objective in the same breath — so on Call C, with compensation
+    # still owed, the model appended a compensation question and the
+    # generated-reply guard rejected the whole draft as `compensation_drift`
+    # (twice, phase=name_confirm) → the canned fallback → the phantom loop. The
+    # remedy for a name mismatch is ONLY to confirm the name; the suspended plan
+    # question is resumed EXPLICITLY on a later turn by the coordinator, using
+    # its own answer evidence. The "for the rest of the call" naming policy is
+    # preserved without instructing an in-turn topic resume. The
+    # compensation-drift and instruction-echo guards themselves are untouched.
     return (
         "The name the candidate just introduced themselves with does not match "
         "the name on record. For your context only — do NOT read these aloud or "
         "spell them out — the record shows \"" + record + "\" and they said \""
         + spoken + "\". In THIS turn, do NOT assert either name as correct and do "
-        "NOT brush it off as unimportant. Warmly and briefly check, in your own "
-        "words, which name the candidate prefers to be called — address them "
-        "with the name they themselves just used — then continue. Use whichever "
-        "name THEY confirm for the rest of the call. Never accuse them of "
-        "giving a wrong name."
+        "NOT brush it off as unimportant, and do NOT move on to any other "
+        "question yet. Warmly and briefly check, in your own words, which name "
+        "the candidate prefers to be called — address them with the name they "
+        "themselves just used. Ask ONLY about the name on this turn. Use "
+        "whichever name they confirm for the rest of the call. Never accuse them "
+        "of giving a wrong name."
     )
 
 

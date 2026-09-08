@@ -2457,11 +2457,21 @@ async def _run_native_phone_screening(
     #     identity signal is graded "confirmed". Purely observability — it
     #     never routes the turn.
     name_confirm_state: dict[str, dict[str, Any]] = {}
+    # Call C RCA (2026-09-08) OWNERSHIP: ONE logical confirmation action owns
+    # every delivery attempt (the original generated reply AND the watchdog's
+    # recovery fallback). `action_id` is a monotonic id for the live action; the
+    # delivery lifecycle is MONOTONE — armed → awaiting → consumed — and an
+    # interrupt callback may never regress it. `awaiting_action_id` records which
+    # action last established awaiting-confirmation so a late/duplicate delivery
+    # cannot re-establish or tear it down (idempotency + monotonicity guard).
     name_confirm_delivery: dict[str, Any] = {
-        "sequence": None, "key": None, "mismatch": None,
+        "sequence": None, "key": None, "mismatch": None, "action_id": None,
     }
+    name_confirm_action_seq = [0]
     owed_name_confirm: dict[str, Any] = {"value": False, "mismatch": None}
-    name_confirm_awaiting_reply: dict[str, Any] = {"key": None, "mismatch": None}
+    name_confirm_awaiting_reply: dict[str, Any] = {
+        "key": None, "mismatch": None, "action_id": None,
+    }
 
     def _identity_ambiguous_leadins_allowed() -> bool:
         """Call C RCA (2026-09-08): may the AMBIGUOUS name-intro arms
@@ -2861,16 +2871,26 @@ async def _run_native_phone_screening(
         })
         _bump_coverage_judge_metric(call_metrics, "conflict_probe_scheduled")
 
-    def _arm_name_confirm_delivery(name_key: str, mismatch: Any) -> None:
+    def _arm_name_confirm_delivery(
+        name_key: str, mismatch: Any, *, new_action: bool = True,
+    ) -> None:
         """Finding E: the ONLY writer that arms name-confirm delivery tracking.
 
         Mirrors `_arm_conflict_delivery`: called at every AUTHOR site (fresh
         detection at the single-final and coalesce sites, and the bounded owed
         re-author), it counts the authoring attempt and predicts the speech
         sequence of the confirm turn. Delivery is proven separately by
-        `on_reply_delivered` (key-presence, the W3 idiom); confirmation is
-        graded separately again from the candidate's next turn. Authoring is
-        not delivery; delivery is not confirmation.
+        `on_reply_delivered`; confirmation is graded again from the candidate's
+        next turn. Authoring is not delivery; delivery is not confirmation.
+
+        Call C RCA (2026-09-08) OWNERSHIP: `new_action` mints a fresh
+        `action_id` for a genuinely new identity question (fresh detection). An
+        owed re-author (`new_action=False`) is the SAME logical action across a
+        second delivery attempt, so it KEEPS the live action_id — it is not an
+        independent identity question (Codex §3: "bound retries without counting
+        one recovery as an independent identity question"). The watchdog's
+        recovery fallback is NOT an author site; it adopts this same action by
+        re-pointing the observed sequence at say-time.
         """
         entry = name_confirm_state.setdefault(
             name_key,
@@ -2878,10 +2898,16 @@ async def _run_native_phone_screening(
              "mismatch": dict(mismatch) if isinstance(mismatch, dict) else None},
         )
         entry["authored"] = int(entry.get("authored") or 0) + 1
+        if new_action or name_confirm_delivery.get("action_id") is None:
+            name_confirm_action_seq[0] += 1
+            action_id = name_confirm_action_seq[0]
+        else:
+            action_id = name_confirm_delivery.get("action_id")
         name_confirm_delivery.update({
             "sequence": speech_sequence[0] + 1,
             "key": name_key,
             "mismatch": dict(mismatch) if isinstance(mismatch, dict) else None,
+            "action_id": action_id,
         })
 
     def _maybe_arm_llm_authored_conflict(reply_text: Any) -> bool:
@@ -3357,17 +3383,30 @@ async def _run_native_phone_screening(
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
         # Finding E (Codex review §7): grade the ONE candidate turn that
-        # answers a DELIVERED name-confirmation. Observability only — it never
-        # routes the turn (the reply still flows through the normal gates).
-        # Read-and-clear so the broad affirmation vocabulary is consulted for
-        # exactly one turn; a non-confirming reply leaves the signal at the
-        # truthful "delivered", never an invented "confirmed".
+        # answers a DELIVERED name-confirmation. Read-and-clear so the broad
+        # affirmation vocabulary is consulted for exactly one turn; a
+        # non-confirming reply leaves the signal at the truthful "delivered",
+        # never an invented "confirmed".
+        #
+        # Call C RCA (2026-09-08): a CONFIRMED reply must also RESOLVE the
+        # action — clear any stale owed re-author and retire the arm — so the
+        # loop cannot re-author a confirmation the candidate already answered.
+        # (On #260 this consume was observability-only; the owed latch survived
+        # and drove the second phantom confirm.) A non-confirming reply leaves
+        # owed intact, so a genuinely undelivered confirmation still re-drives.
         if name_confirm_awaiting_reply.get("key") is not None:
             awaiting_mismatch = name_confirm_awaiting_reply.get("mismatch")
             name_confirm_awaiting_reply["key"] = None
             name_confirm_awaiting_reply["mismatch"] = None
+            name_confirm_awaiting_reply["action_id"] = None
             if phone.phone_name_confirm_reply_confirms(text, awaiting_mismatch):
                 _record_identity_signal(awaiting_mismatch, "confirmed")
+                owed_name_confirm["value"] = False
+                owed_name_confirm["mismatch"] = None
+                name_confirm_delivery.update({
+                    "sequence": None, "key": None, "mismatch": None,
+                    "action_id": None,
+                })
         if candidate_end_requested.is_set() or phone.is_explicit_end_call_request(text):
             candidate_end_requested.set()
             reply_plan[0] = phone.PHONE_CANDIDATE_END_TEXT
@@ -4440,7 +4479,11 @@ async def _run_native_phone_screening(
                             judge_instruction = confirm_instruction
                             judge_is_name_confirm = True
                             _record_identity_signal(owed_mismatch, "armed")
-                            _arm_name_confirm_delivery(owed_name_key, owed_mismatch)
+                            # Same logical action, second delivery attempt — keep
+                            # the live action_id (not a new identity question).
+                            _arm_name_confirm_delivery(
+                                owed_name_key, owed_mismatch, new_action=False,
+                            )
             # RÉSUMÉ-CONFLICT / REANCHOR channel: gated on the identity signal NOT
             # having claimed this turn (`judge_instruction is None`). When the
             # identity signal SHADOWS the conflict this turn, the conflict key is
@@ -5513,6 +5556,26 @@ async def _run_native_phone_screening(
             fallback = spoken_fallback
             if pending_terminal_reason.get("value") is not None:
                 pending_terminal_speech_seq["value"] = speech_sequence[0] + 1
+            # ── Call C RCA (2026-09-08): identity-action HANDOFF ─────────────
+            # This recovery fallback IS the name-confirmation being spoken (the
+            # original generation was rejected on a name_confirm turn). ADOPT
+            # the still-armed identity action onto THIS delivery: re-point its
+            # sequence to the fallback's OBSERVED speech sequence (recorded at
+            # say-time — never predicted before the handle exists, which is the
+            # dangling-rebind hazard the early supersede returns above already
+            # foreclose), and clear owed because a delivery attempt is now in
+            # flight. The fallback's non-interrupted delivery callback then
+            # establishes awaiting-confirmation for this same action exactly
+            # once. Gated on phase + a live armed action so an ordinary
+            # (non-identity) recovery fallback never touches identity state.
+            if (
+                snapshot.get("phase") == "name_confirm"
+                and name_confirm_delivery.get("key") is not None
+                and name_confirm_delivery.get("action_id") is not None
+            ):
+                name_confirm_delivery["sequence"] = speech_sequence[0] + 1
+                owed_name_confirm["value"] = False
+                owed_name_confirm["mismatch"] = None
             try:
                 # Candidate speech must always be able to barge into recovery.
                 # Disabling interruptions caused LiveKit to discard the owner's
@@ -5571,46 +5634,82 @@ async def _run_native_phone_screening(
                 else conflict_seq if conflict_seq is not None
                 else name_confirm_seq
             )
-        # ── Finding E (Codex review §7): the name-confirm lifecycle proof ────
-        # Authoring is not delivery. An armed confirm turn interrupted on its
-        # OWN handle never reached the candidate: keep it PENDING (owed) under
-        # the bounded author cap, or record it unresolved at cap — the Call A
-        # signal froze at "armed" precisely because authoring consumed the one
-        # chance. A NON-interrupted delivery while the arm is present proves
-        # the confirmation was heard (KEY-PRESENCE, the W3 idiom — the
-        # watchdog's canned name-confirm fallback is a different sequence and
-        # still counts, exactly like the conflict probe's fallback delivery).
-        if name_confirm_delivery.get("key") is not None:
+        # ── Call C RCA (2026-09-08): ONE-ACTION ownership lifecycle ──────────
+        # ONE logical confirmation action owns EVERY delivery attempt — the
+        # original generated reply AND the watchdog's recovery fallback. The
+        # #260 defect: the original reply's interrupt callback CLEARED the arm
+        # and set owed, so when the watchdog then spoke the fallback its delivery
+        # callback found no armed action and NEVER established awaiting — the
+        # candidate's "It's Christo" was never credited and the owed re-author
+        # looped. Fix = SUPPRESS-THEN-ADOPT with a MONOTONE lifecycle:
+        #   * Correlate strictly on `delivered_seq == armed sequence` AND a live
+        #     action_id, so an UNRELATED completed reply never touches identity.
+        #   * An INTERRUPTED delivery of the armed action does NOT tear the arm
+        #     down — an interruption means "this attempt didn't complete", which
+        #     for an unconfirmed confirmation means STILL OWED, never resolved.
+        #     The arm is KEPT so the watchdog fallback can adopt it (it re-points
+        #     the observed sequence at say-time); if no replacement comes, owed
+        #     drives a bounded re-author. At the author cap it is recorded
+        #     unresolved and the arm cleared so nothing dangles.
+        #   * The FIRST non-interrupted delivery mapped to the action establishes
+        #     awaiting-confirmation EXACTLY once (guarded by `awaiting_action_id`).
+        #   * Lifecycle is MONOTONE (armed → awaiting → consumed); once awaiting
+        #     is established for an action_id, a late interrupt callback for that
+        #     same action can never regress it.
+        nc_action_id = name_confirm_delivery.get("action_id")
+        if (
+            name_confirm_delivery.get("key") is not None
+            and nc_action_id is not None
+            and name_confirm_seq is not None
+            and delivered_seq == name_confirm_seq
+        ):
             nc_key = name_confirm_delivery.get("key")
             nc_mismatch = name_confirm_delivery.get("mismatch")
+            already_awaiting = (
+                name_confirm_awaiting_reply.get("action_id") == nc_action_id
+            )
             if interrupted:
-                if delivered_seq == name_confirm_seq:
-                    name_confirm_delivery.update({
-                        "sequence": None, "key": None, "mismatch": None,
-                    })
+                # MONOTONICITY: never regress an action that already reached
+                # awaiting (this interrupt refers to a superseded earlier
+                # attempt of the same action — already accounted for).
+                if not already_awaiting:
                     entry = name_confirm_state.get(nc_key)
                     authored = int((entry or {}).get("authored") or 0)
                     if authored < PHONE_NAME_CONFIRM_MAX_AUTHORS:
+                        # STILL OWED — keep the arm so the watchdog fallback can
+                        # adopt it, or the next authored turn re-authors it.
                         owed_name_confirm["value"] = True
                         owed_name_confirm["mismatch"] = (
                             dict(nc_mismatch) if isinstance(nc_mismatch, dict)
                             else None
                         )
                     else:
+                        # Bounded: no further attempt — record and clear so no
+                        # stale arm can later be adopted by an unrelated reply.
                         _record_identity_signal(nc_mismatch, "unresolved")
-            else:
-                name_confirm_delivery.update({
-                    "sequence": None, "key": None, "mismatch": None,
-                })
+                        name_confirm_delivery.update({
+                            "sequence": None, "key": None, "mismatch": None,
+                            "action_id": None,
+                        })
+            elif not already_awaiting:
+                # ADOPT: the confirmation was heard. Establish awaiting ONCE and
+                # retire the arm's sequence so a later unrelated delivery cannot
+                # re-trigger this block (sequences are monotonic and unique).
                 entry = name_confirm_state.get(nc_key)
                 if entry is not None:
                     entry["delivered"] = True
+                owed_name_confirm["value"] = False
+                owed_name_confirm["mismatch"] = None
                 _record_identity_signal(nc_mismatch, "delivered")
-                # The next candidate turn is graded ONCE for confirmation.
                 name_confirm_awaiting_reply["key"] = nc_key
                 name_confirm_awaiting_reply["mismatch"] = (
                     dict(nc_mismatch) if isinstance(nc_mismatch, dict) else None
                 )
+                name_confirm_awaiting_reply["action_id"] = nc_action_id
+                name_confirm_delivery.update({
+                    "sequence": None, "key": None, "mismatch": None,
+                    "action_id": None,
+                })
         if interrupted:
             # BARGE-IN CLEAR (W3, 2026-09-05; comment corrected in the
             # adversarial-review repair — FIX 5). A conflict probe interrupted on
