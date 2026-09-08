@@ -100,7 +100,10 @@ verify_current_registration() {
   local phase="$1"
   local ts
   for _ in $(seq 1 "$READY_ATTEMPTS"); do
-    ts="$(flyctl logs -a "$APP" --no-tail 2>/dev/null \
+    # `timeout` bounds a hung logs transport: this poll runs up to
+    # READY_ATTEMPTS times per round and PREPROOF_ATTEMPTS rounds per phase, so an
+    # un-bounded stall here would be amplified into a many-minute silent hang.
+    ts="$(timeout 60 flyctl logs -a "$APP" --no-tail 2>/dev/null \
           | grep 'registered worker' \
           | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}' \
           | sort | tail -1 || true)"
@@ -112,7 +115,7 @@ verify_current_registration() {
   done
   # One unsuppressed logs attempt so a logs-transport/token failure is
   # distinguishable from a genuinely unregistered worker (M-1 misattribution).
-  flyctl logs -a "$APP" --no-tail || true
+  timeout 60 flyctl logs -a "$APP" --no-tail || true
   return 1
 }
 

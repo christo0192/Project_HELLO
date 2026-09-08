@@ -303,6 +303,10 @@ jobs:
       #    registration" failure, without discarding the registration safety. ──
       - name: Deploy browser voice worker on-demand (orchestration ON)
         if: needs.detect.outputs.voice_orchestration == 'worker'
+        # Backstop for the reap-retry poll surface: bound the step so a genuinely
+        # stuck deploy fails visibly instead of silently burning the 6h job cap.
+        # The happy path is ~5 min; even a couple of retry rounds stay well under.
+        timeout-minutes: 30
         working-directory: app/voice-livekit
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_VOICE }}
@@ -390,6 +394,10 @@ jobs:
       #    canary kill. The scale/stop lives in the SCRIPT, not this YAML. ──
       - name: Deploy phone voice worker on-demand (orchestration ON)
         if: needs.detect.outputs.phone_orchestration == 'worker'
+        # Backstop for the reap-retry poll surface: bound the step so a genuinely
+        # stuck deploy fails visibly instead of silently burning the 6h job cap.
+        # The happy path is ~5 min; even a couple of retry rounds stay well under.
+        timeout-minutes: 30
         working-directory: app/voice-livekit
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN_PHONE_VOICE }}
