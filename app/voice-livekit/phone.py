@@ -7489,6 +7489,58 @@ def phone_streamed_leading_segment_safe(
     return True
 
 
+def phone_streamed_tail_hard_veto(
+    speech: Any, objective_text: Any, *, control_text: Any = None,
+    candidate_text: Any = None,
+) -> str | None:
+    """A0 (PR2b tail-veto): does the streamed-so-far text trip a HARD veto?
+
+    F1/F2 gap (two independent reviewers): the A0 clean-release path validated
+    only the LEADING ≤48-char segment for leaks, then streamed the WHOLE
+    remainder verbatim with the full-reply validator downgraded to advisory. A
+    HARD-reject condition that surfaces in the TAIL (after the first clause) —
+    most dangerously ``premature_closing`` (``_GENERATED_CLOSING_RE`` goodbye
+    prose lands at the END of a reply) — was therefore SPOKEN, where the
+    buffered path recovered pre-speech. This predicate re-imposes, incrementally
+    over the accumulating streamed text, EXACTLY the buffered path's HARD content
+    vetoes so the streamed path's pre-speech hard-reject set equals the buffered
+    path's:
+
+      * ``premature_closing`` — ``_GENERATED_CLOSING_RE`` on a non-closing turn
+        (A0 streams only non-closing turns, so this is unconditional here); and
+      * ``instruction_echo`` — the buffered path's 6-contiguous-word private-
+        controller overlap (``phone_instruction_echo_detected``); and
+      * ``compensation_drift`` — a comp objective probe on a NON-comp objective,
+        with the buffered path's EXACT ``candidate volunteered compensation``
+        suppression (``phone_candidate_introduced_compensation``): a comp/notice
+        topic the candidate raised is not bot-initiated drift and is NOT vetoed.
+
+    The SOFT flags (``objective_drift``, ``question_mark_count``) are DELIBERATELY
+    NOT applied — they stay advisory (log-only) exactly as the buffered path and
+    B4 leave them, and streaming the question IS A0's goal. Returns the sanitized
+    veto reason string (matching ``phone_generated_reply_rejection_reason``'s
+    categories) or ``None`` when clean. Non-str/letter-free → ``None`` (there is
+    nothing spoken yet to veto; the caller only tests text it is about to
+    speak)."""
+    if not isinstance(speech, str) or not any(ch.isalpha() for ch in speech):
+        return None
+    compact = " ".join(speech.split())
+    if _GENERATED_CLOSING_RE.search(compact):
+        return "premature_closing"
+    if (
+        _COMPENSATION_OBJECTIVE_RE.search(compact)
+        and not phone_is_compensation_objective(objective_text)
+        # Match the buffered path's suppression exactly (FIX 3, ~7555): an ack of
+        # comp/notice the CANDIDATE volunteered is not drift.
+        and not phone_candidate_introduced_compensation(candidate_text)
+    ):
+        return "compensation_drift"
+    private_control = _private_phone_control_text(control_text, objective_text)
+    if phone_instruction_echo_detected(compact, private_control):
+        return "instruction_echo"
+    return None
+
+
 def phone_generated_reply_rejection_reason(
     speech: Any, objective_text: Any, *, allow_closing: bool,
     control_text: Any = None, max_question_acts: int = 1,
@@ -9350,11 +9402,22 @@ def phone_agent_class(agent_base: Any) -> Any:
                     )
                     if not at_boundary and len(segment) < _A0_LEADING_SEGMENT_MAX_CHARS:
                         continue
-                    # Evaluate the leading segment for CONTENT LEAKS only.
+                    # Evaluate the leading segment for the HARD content vetoes.
+                    # `phone_streamed_leading_segment_safe` covers premature-close
+                    # + instruction-echo; the tail-veto predicate ALSO covers
+                    # compensation-drift (with the buffered path's candidate-
+                    # volunteered suppression), so a comp-drift lead falls through
+                    # to buffered recovery exactly as it does on the buffered path
+                    # — keeping the pre-speech hard-reject set equal at the lead as
+                    # well as the tail.
                     if phone_streamed_leading_segment_safe(
                         segment, objective,
                         control_text=self._generation_control_text,
-                    ):
+                    ) and phone_streamed_tail_hard_veto(
+                        segment, objective,
+                        control_text=self._generation_control_text,
+                        candidate_text=self._generation_candidate_text,
+                    ) is None:
                         prefix_ok = True
                     else:
                         leak_detected = True
@@ -9370,7 +9433,11 @@ def phone_agent_class(agent_base: Any) -> Any:
                     if phone_streamed_leading_segment_safe(
                         assembled_prefix, objective,
                         control_text=self._generation_control_text,
-                    ):
+                    ) and phone_streamed_tail_hard_veto(
+                        assembled_prefix, objective,
+                        control_text=self._generation_control_text,
+                        candidate_text=self._generation_candidate_text,
+                    ) is None:
                         prefix_ok = True
                     else:
                         leak_detected = True
@@ -9404,20 +9471,74 @@ def phone_agent_class(agent_base: Any) -> Any:
                     return
                 else:
                     # Clean lead (or a clean short whole-reply): release the held
-                    # segment and STREAM the remainder verbatim. From here the
-                    # path is pure passthrough — the A0 100%-TTFT behaviour.
-                    stream_parts: list[str] = list(prefix_parts)
+                    # segment and STREAM the remainder — but ENFORCE THE HARD
+                    # CONTENT VETOES INCREMENTALLY over the tail so the streamed
+                    # path's pre-speech hard-reject set EQUALS the buffered path's
+                    # (F1/F2). The leading segment already passed
+                    # `phone_streamed_leading_segment_safe`, so the held prefix is
+                    # clean and speaks; from there, BEFORE yielding each NEW chunk
+                    # we test whether `streamed-so-far + chunk` NEWLY trips a HARD
+                    # veto (`premature_closing` / `instruction_echo` /
+                    # `compensation_drift`, comp-suppression respected). If it
+                    # does we do NOT yield that chunk and STOP the stream — the
+                    # offending tail content is never spoken; the already-spoken
+                    # clean prefix stands.
+                    #
+                    # WHY TRUNCATION IS SAFE (no double-speak, no dead-air):
+                    #   * NO RECOVERY after clean chunks were already spoken —
+                    #     `_on_generation_empty` would make the watchdog speak a
+                    #     SECOND full recovery line on top of what the candidate
+                    #     heard. We just `return`; nothing else is spoken this turn.
+                    #   * The turn still COMPLETES (the generator returns cleanly,
+                    #     not an interruption), so no dead-air watchdog fires — the
+                    #     conversation-item hook records only the clean prefix that
+                    #     actually reached TTS.
+                    #   * If the truncated tail carried the mandatory QUESTION, it
+                    #     was never spoken → the candidate cannot answer it → the
+                    #     PR1 answer-gate / delivery-verified re-ask fires on the
+                    #     NEXT turn (playout-proven `ask_delivered`, agent.py), so
+                    #     the owed question is not lost.
+                    # The check is pure and cheap (regex + 6-word overlap on the
+                    # accumulated string); no task spawn, no buffering beyond the
+                    # accumulated string, and we keep yielding SYNCHRONOUSLY so a
+                    # barge-in `CancelledError`/`GeneratorExit` still propagates at
+                    # the `yield`.
+                    stream_parts = list(prefix_parts)
                     for buffered in held_prefix:
                         self._generation_prefix_released = True
                         yield buffered
+                    truncated_reason: str | None = None
                     if not consumed_all:
                         async for chunk in result:
+                            candidate_speech = (
+                                "".join(stream_parts) + _chunk_text(chunk)
+                            )
+                            veto = phone_streamed_tail_hard_veto(
+                                candidate_speech, objective,
+                                control_text=self._generation_control_text,
+                                candidate_text=self._generation_candidate_text,
+                            )
+                            if veto is not None:
+                                # This chunk would speak a HARD-veto condition
+                                # (e.g. a premature goodbye at the tail). Do NOT
+                                # speak it and stop. No recovery — clean prefix
+                                # already spoke.
+                                truncated_reason = veto
+                                break
                             stream_parts.append(_chunk_text(chunk))
                             self._generation_prefix_released = True
                             yield chunk
-                    # ADVISORY validation only for a reply that ALREADY SPOKE — it
-                    # never gates speech and never recovers (a second line on top
-                    # of what the candidate heard would double-speak). The
+                    if truncated_reason is not None:
+                        _log.info(
+                            "unknown_event", error_type="phone_reply_soft_flag",
+                            error_category="streamed_tail_hard_veto_truncated",
+                        )
+                        return
+                    # ADVISORY validation only for a reply that ALREADY SPOKE and
+                    # streamed to completion — it never gates speech and never
+                    # recovers (a second line on top of what the candidate heard
+                    # would double-speak). The SOFT flags stay advisory; the HARD
+                    # vetoes were already enforced incrementally above. The
                     # downstream answer-gate / delivery-gate remain the pre-speech
                     # authorities on the NEXT turn. Logged for series continuity.
                     speech = "".join(stream_parts).strip()
