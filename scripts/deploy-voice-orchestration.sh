@@ -54,6 +54,10 @@ set -euo pipefail
 : "${FLY_CONFIG:?FLY_CONFIG is required}"
 READY_ATTEMPTS="${READY_ATTEMPTS:-24}"
 START_ATTEMPTS="${START_ATTEMPTS:-60}"
+# A stop settles fast; the post-deploy settle-stop wait is bounded much tighter
+# than START_ATTEMPTS because falling through is already safe (the guarded start
+# + started-state poll are the real gate), and this caps the worst-case red time.
+STOP_ATTEMPTS="${STOP_ATTEMPTS:-12}"
 SLEEP_SECONDS="${SLEEP_SECONDS:-5}"
 
 if [ -z "${WATERMARK:-}" ]; then
@@ -85,6 +89,7 @@ trap cleanup EXIT
 # pre-deploy watermark (ISO-8601 sorts lexically). Returns 0 on proof, 1 on none.
 verify_current_registration() {
   local phase="$1"
+  local ts
   for _ in $(seq 1 "$READY_ATTEMPTS"); do
     ts="$(flyctl logs -a "$APP" --no-tail 2>/dev/null \
           | grep 'registered worker' \
@@ -175,14 +180,72 @@ fi
 # ── 3. deploy the new image ───────────────────────────────────────────────────
 flyctl deploy --remote-only --config "$FLY_CONFIG"
 
-# ── 4. re-verify CURRENT registration for the NEW image ───────────────────────
-# A fresh watermark for the post-deploy proof: the deploy just restarted the
-# worker, so its registration must be at/after NOW, not merely after the original
-# pre-start watermark (which the pre-deploy boot already satisfied).
-WATERMARK="$(date -u +%Y-%m-%dT%H:%M:%S)"
-if ! verify_current_registration post-deploy; then
-  echo "::error::no current 'registered worker' log at/after watermark $WATERMARK on $APP (deployed image did not register)"
-  exit 1
+# ── 4. re-verify CURRENT registration for the NEW image via a CLEAN boot ───────
+# RCA 2026-09-08: `flyctl deploy` rolls the new image out by restarting the pool
+# machines. On a scale-to-zero worker app their desired state is STOPPED, so
+# WITHIN the rollout window a machine is cycled (start -> stop -> start) every
+# ~10-15s, while its cold boot needs ~27s (import ~15s + connect/register ~12s)
+# to log "registered worker". The old post-deploy proof merely polled logs for a
+# registration at/after a watermark captured the instant `flyctl deploy`
+# returned; that raced two ways and failed a GENUINELY-good deploy:
+#   (a) a machine that registered DURING the rollout did so a few seconds BEFORE
+#       the post-deploy watermark, so it was (correctly) rejected as pre-watermark;
+#   (b) the pool machine this run controls was still being cycled by the rollout
+#       and never got an uninterrupted ~27s window to register after the watermark.
+# The image itself deploys fine (the Fly release completes and every machine is
+# on the new image); only the PROOF failed — turning every on-demand voice deploy
+# red while the code was actually live.
+#
+# Fix: after the rollout completes, force ONE churn-free boot of the pool machine
+# THIS run controls — stop it, wait for STOPPED, capture the watermark, start it,
+# wait for STARTED — then run the SAME watermarked registration proof. A machine
+# booted cleanly OUTSIDE the rollout registers deterministically in ~27s (well
+# inside the 120s poll), so a healthy new image passes and a broken one still
+# fails closed. When this run only RELIED on an already-started machine (no pool
+# machine it controls), fall back to the original watermark-then-poll proof.
+if [ -n "$STARTED_MACHINE" ]; then
+  # Settle to a known STOPPED state so the next start is a clean boot on the new
+  # image, not a restart that lands mid-rollout-churn. Best-effort: a machine the
+  # rollout already stopped is fine.
+  flyctl machine stop "$STARTED_MACHINE" -a "$APP" || true
+  for _ in $(seq 1 "$STOP_ATTEMPTS"); do
+    state="$(flyctl machine list -a "$APP" --json 2>/dev/null \
+      | jq -r --arg id "$STARTED_MACHINE" '.[] | select(.id==$id) | .state' | tail -1 || true)"
+    if [ "$state" = "stopped" ]; then break; fi
+    sleep "$SLEEP_SECONDS"
+  done
+  # Watermark AFTER settling and BEFORE the clean start, so the registration we
+  # accept can only come from this fresh NEW-image boot — never the pre-deploy
+  # (old-image) registration this same machine logged in step 2.
+  WATERMARK="$(date -u +%Y-%m-%dT%H:%M:%S)"
+  echo "starting pool machine $STARTED_MACHINE for a churn-free post-deploy proof on $APP"
+  # Tolerate an "already started" race (the settle-stop may not have fully landed):
+  # the state poll below is the real gate, and cleanup stops this machine regardless.
+  flyctl machine start "$STARTED_MACHINE" -a "$APP" || true
+  post_started=false
+  for _ in $(seq 1 "$START_ATTEMPTS"); do
+    state="$(flyctl machine list -a "$APP" --json 2>/dev/null \
+      | jq -r --arg id "$STARTED_MACHINE" '.[] | select(.id==$id) | .state' | tail -1 || true)"
+    if [ "$state" = "started" ]; then post_started=true; break; fi
+    sleep "$SLEEP_SECONDS"
+  done
+  if [ "$post_started" != true ]; then
+    echo "::error::machine $STARTED_MACHINE on $APP did not reach 'started' for the post-deploy proof"
+    exit 1
+  fi
+  if ! verify_current_registration post-deploy; then
+    echo "::error::no current 'registered worker' log at/after watermark $WATERMARK on $APP (deployed image did not register)"
+    exit 1
+  fi
+else
+  # Rely-on-started branch (e.g. a lane whose sole machine is always-on): there is
+  # no pool machine this run controls to reboot, so keep the original proof — a
+  # fresh watermark then poll for the post-deploy restart's registration.
+  WATERMARK="$(date -u +%Y-%m-%dT%H:%M:%S)"
+  if ! verify_current_registration post-deploy; then
+    echo "::error::no current 'registered worker' log at/after watermark $WATERMARK on $APP (deployed image did not register)"
+    exit 1
+  fi
 fi
 
 echo "$APP deployed and re-registered on-demand; cleanup will return the pool machine to STOPPED"
