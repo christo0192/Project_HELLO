@@ -125,15 +125,18 @@ primary_region = "sin"
   # endpointing bounds in the deploy manifest. MIN is the silence floor after the
   # candidate stops (drives common-case latency); MAX bounds the wait on a
   # mid-answer pause. A longer MAX costs latency ONLY when the candidate actually
-  # pauses mid-thought, and it buys back fewer cut-offs. The 0.6 MAX was ending
-  # the turn on any >0.6s mid-answer pause and fragmenting a single answer into
-  # several finals (the bot barged in on a still-thinking candidate). MAX 0.6->1.0
-  # tolerates natural mid-sentence pauses so a whole answer stays one turn; MIN
-  # stays 0.3 so a clean end-of-speech still commits fast. Clamps: MIN in
-  # [0.3, 0.5], MAX in [0.5, 2.0] (1.0 is well inside the reader clamp). Both are
-  # env-revertible live.
+  # pauses mid-thought, and it buys back fewer cut-offs.
+  # PR2a (fragmentation, 2026-09-08): MAX 1.0->2.5 toward the browser default.
+  # The built-in v1-mini EOU governs turn-end — it COMMITS a COMPLETE answer at
+  # MIN regardless of MAX, and MAX only bounds the wait when the EOU judges the
+  # utterance genuinely INCOMPLETE. So raising MAX lets a natural mid-thought
+  # pause breathe like the browser lane WITHOUT adding latency to a clean
+  # end-of-speech turn — the common case still commits fast at MIN. This stops a
+  # single answer fragmenting into several finals (the bot barging in on a
+  # still-thinking candidate). MIN stays 0.3. Clamps: MIN in [0.3, 0.5], MAX in
+  # [0.5, 3.0] (2.5 is well inside the reader clamp). Both env-revertible live.
   PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC = "0.3"
-  PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC = "1.0"
+  PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC = "2.5"
   # ── Coverage JUDGE provider (Call G, 2026-09-08) ─────────────────────────────
   # Point the off-speech-path coverage judge at DeepSeek V4-Flash with reasoning
   # DISABLED (owner request), replacing Gemini gemini-3.5-flash-lite. The judge

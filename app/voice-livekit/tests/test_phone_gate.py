@@ -4746,8 +4746,11 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         try:
             # v114: floor lowered 1.0 -> 0.5 so a desired 0.8 is honoured
             # verbatim (not clamped to 1.0), while 0.3 still clamps up to 0.5.
+            # PR2a: ceiling raised 2.0 -> 3.0 so the deploy value 2.5 is honoured
+            # verbatim (was clamped to 2.0 before); 9 now clamps to 3.0 not 2.0.
             for raw, expected in [
-                ("1.25", 1.25), ("0.8", 0.8), ("0.3", 0.5), ("0.2", 0.5), ("9", 2.0),
+                ("1.25", 1.25), ("0.8", 0.8), ("0.3", 0.5), ("0.2", 0.5),
+                ("2.5", 2.5), ("3.0", 3.0), ("9", 3.0),
             ]:
                 _os.environ[key] = raw
                 self.assertAlmostEqual(phone.phone_static_endpointing_max_delay(), expected)
@@ -8818,6 +8821,47 @@ class TestPhoneInterviewerLlmFactory(unittest.TestCase):
         self.assertEqual(recorded["model"], "sarvam-105b-conversations")
         self.assertEqual(recorded["base_url"], "https://api.sarvam.ai/v1")
 
+    def test_reasoning_tripwire_logs_when_effort_high_on_deepseek(self):
+        # PR2a FIX A1 — the tripwire fires (error-level) at interviewer
+        # construction when on a DeepSeek endpoint with reasoning re-enabled.
+        # It must NOT crash: construction still returns the LLM.
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear()
+            with patch.object(agent_mod.openai, "LLM") as OpenAILLM:
+                OpenAILLM.side_effect = lambda **kw: object()
+                with patch.dict(os.environ, {
+                    "PHONE_LLM_SDK": "openai",
+                    "PHONE_PRIMARY_MODEL": "deepseek-v4-flash",
+                    "PHONE_LLM_API_KEY": "d" * 20,
+                    "PHONE_LLM_BASE_URL": "https://api.deepseek.com/v1",
+                    "PHONE_LLM_REASONING_EFFORT": "high",
+                }):
+                    with patch.object(agent_mod, "_log") as log:
+                        # Construction must succeed (guardrail, not a crash).
+                        self.assertIsNotNone(agent_mod._build_phone_interviewer_llm())
+        rendered = repr(log.method_calls)
+        self.assertIn("error", rendered)
+        self.assertIn("phone_interviewer_reasoning_tripwire", rendered)
+        self.assertIn("high", rendered)
+
+    def test_reasoning_tripwire_silent_when_effort_none_on_deepseek(self):
+        # GREEN: reasoning explicitly disabled on DeepSeek — no tripwire event.
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear()
+            with patch.object(agent_mod.openai, "LLM") as OpenAILLM:
+                OpenAILLM.side_effect = lambda **kw: object()
+                with patch.dict(os.environ, {
+                    "PHONE_LLM_SDK": "openai",
+                    "PHONE_PRIMARY_MODEL": "deepseek-v4-flash",
+                    "PHONE_LLM_API_KEY": "d" * 20,
+                    "PHONE_LLM_BASE_URL": "https://api.deepseek.com/v1",
+                    "PHONE_LLM_REASONING_EFFORT": "none",
+                }):
+                    with patch.object(agent_mod, "_log") as log:
+                        agent_mod._build_phone_interviewer_llm()
+        rendered = repr(log.method_calls)
+        self.assertNotIn("phone_interviewer_reasoning_tripwire", rendered)
+
 
 class TestPhoneJudgeRuntimeConfigBothSdks(unittest.TestCase):
     """The startup judge validator boots cleanly for BOTH flag values."""
@@ -11155,15 +11199,139 @@ class TestPhoneManifestTunables(unittest.TestCase):
         self.assertEqual(env["PHONE_SARVAM_NEGATIVE_FRAMES_COUNT"], "18")
         self.assertEqual(env["PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW"], "24")
 
-    def test_endpointing_max_raised_to_1_0_min_unchanged(self):
-        # FIX 2: a >0.6s mid-answer pause ended the turn and fragmented answers.
-        # MAX 0.6->1.0 tolerates natural pauses; MIN stays 0.3. RED before the
-        # change (MAX was "0.6"). 1.0 is inside the reader clamp [0.5, 2.0].
+    def test_endpointing_max_raised_to_2_5_min_unchanged(self):
+        # PR2a: the built-in v1-mini EOU commits a COMPLETE answer at MIN
+        # regardless of MAX; MAX only bounds the wait on a genuinely-INCOMPLETE
+        # mid-thought pause. Raising MAX 1.0->2.5 (toward the browser default)
+        # lets a natural pause breathe without adding common-case latency. MIN
+        # stays 0.3. RED before the change (MAX was "1.0"). 2.5 is inside the
+        # reader clamp, whose ceiling was raised to [0.5, 3.0] to honour it.
         env = self._phone_env()
-        self.assertEqual(env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"], "1.0")
+        self.assertEqual(env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"], "2.5")
         self.assertEqual(env["PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC"], "0.3")
         self.assertGreaterEqual(float(env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"]), 0.5)
-        self.assertLessEqual(float(env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"]), 2.0)
+        self.assertLessEqual(float(env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"]), 3.0)
+        # The manifest value must be HONOURED by the reader, not clamped down —
+        # this is the whole point of raising the clamp ceiling 2.0 -> 3.0.
+        with patch.dict(os.environ, {
+            "PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC":
+                env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"],
+        }):
+            self.assertAlmostEqual(phone.phone_static_endpointing_max_delay(), 2.5)
+
+
+class TestReasoningEffortTripwire(unittest.TestCase):
+    """PR2a FIX A1 — reasoning-effort tripwire (guardrail, NOT a crash).
+
+    The interviewer runs DeepSeek with reasoning `none` on purpose; a stale or
+    unset PHONE_LLM_REASONING_EFFORT could silently re-enable thinking = dead
+    air. The predicate returns the offending value on a DeepSeek endpoint when
+    effort is anything but exactly "none", and None (all-clear) otherwise. It
+    NEVER raises — the caller only logs.
+    """
+
+    def _clear(self):
+        os.environ.pop("PHONE_LLM_BASE_URL", None)
+        os.environ.pop("PHONE_LLM_REASONING_EFFORT", None)
+
+    def test_silent_when_effort_is_none_on_deepseek(self):
+        # GREEN path: reasoning explicitly disabled on the DeepSeek endpoint.
+        with patch.dict(os.environ, {
+            "PHONE_LLM_BASE_URL": "https://api.deepseek.com/v1",
+            "PHONE_LLM_REASONING_EFFORT": "none",
+        }, clear=False):
+            self.assertTrue(phone.phone_interviewer_on_deepseek())
+            self.assertIsNone(phone.phone_interviewer_reasoning_tripwire_effort())
+
+    def test_trips_when_effort_high_on_deepseek(self):
+        # RED-worthy: a non-"none" effort on DeepSeek re-enables thinking.
+        with patch.dict(os.environ, {
+            "PHONE_LLM_BASE_URL": "https://api.deepseek.com/v1",
+            "PHONE_LLM_REASONING_EFFORT": "high",
+        }, clear=False):
+            self.assertEqual(
+                phone.phone_interviewer_reasoning_tripwire_effort(), "high",
+            )
+
+    def test_trips_when_effort_unset_on_deepseek(self):
+        # The "stale/unset secret" case the guardrail exists to surface: null
+        # means provider-default = THINKING on DeepSeek, so it MUST trip.
+        with patch.dict(os.environ, {
+            "PHONE_LLM_BASE_URL": "https://api.deepseek.com/v1",
+        }, clear=False):
+            os.environ.pop("PHONE_LLM_REASONING_EFFORT", None)
+            self.assertEqual(
+                phone.phone_interviewer_reasoning_tripwire_effort(),
+                "__tripwire_null__",
+            )
+
+    def test_never_trips_off_deepseek(self):
+        # Sarvam (the current default base) and any non-DeepSeek host are never
+        # flagged — the null/thinking coupling is DeepSeek-specific.
+        for base in ("https://api.sarvam.ai/v1", "https://generativelanguage.googleapis.com/v1beta/openai"):
+            for effort in ("high", "none", None):
+                env = {"PHONE_LLM_BASE_URL": base}
+                if effort is not None:
+                    env["PHONE_LLM_REASONING_EFFORT"] = effort
+                with patch.dict(os.environ, env, clear=False):
+                    if effort is None:
+                        os.environ.pop("PHONE_LLM_REASONING_EFFORT", None)
+                    with self.subTest(base=base, effort=effort):
+                        self.assertFalse(phone.phone_interviewer_on_deepseek())
+                        self.assertIsNone(
+                            phone.phone_interviewer_reasoning_tripwire_effort(),
+                        )
+
+
+class TestPrefixWarmup(unittest.IsolatedAsyncioTestCase):
+    """PR2a FIX A2 — DeepSeek prefix-cache warm-up.
+
+    Fires ONE completion of the static prompt prefix before turn-1 so the
+    opening is a server-side cache hit. Best-effort: swallows every failure and
+    never surfaces on the call. Gated on PHONE_PREFIX_WARMUP (default ON).
+    """
+
+    def test_warmup_flag_default_on_and_off_disables(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PHONE_PREFIX_WARMUP", None)
+            self.assertTrue(phone.phone_prefix_warmup_enabled())
+        for value in ("off", "OFF", "  Off  "):
+            with patch.dict(os.environ, {"PHONE_PREFIX_WARMUP": value}, clear=False):
+                self.assertFalse(phone.phone_prefix_warmup_enabled())
+        for value in ("on", "1", "true", "yes", "garbage"):
+            with patch.dict(os.environ, {"PHONE_PREFIX_WARMUP": value}, clear=False):
+                self.assertTrue(phone.phone_prefix_warmup_enabled())
+
+    async def test_warmup_issues_exactly_one_completion_of_the_prefix(self):
+        calls: list[str] = []
+
+        async def _fake_infer(instruction: str):
+            calls.append(instruction)
+            return "ignored continuation"
+
+        await phone.phone_warm_prefix_cache("SYSTEM PREFIX TEXT", infer=_fake_infer)
+        self.assertEqual(calls, ["SYSTEM PREFIX TEXT"])
+
+    async def test_warmup_swallows_any_error(self):
+        async def _boom(_instruction: str):
+            raise RuntimeError("provider exploded")
+
+        # Must NOT raise — a failed warm-up can never affect the call.
+        result = await phone.phone_warm_prefix_cache("PREFIX", infer=_boom)
+        self.assertIsNone(result)
+
+    async def test_warmup_noops_on_empty_prefix(self):
+        called = False
+
+        async def _infer(_instruction: str):
+            nonlocal called
+            called = True
+            return "x"
+
+        await phone.phone_warm_prefix_cache("", infer=_infer)
+        await phone.phone_warm_prefix_cache("   ", infer=_infer)
+        await phone.phone_warm_prefix_cache(None, infer=_infer)
+        self.assertFalse(called)
 
 
 class TestToollessSessionFlow(unittest.IsolatedAsyncioTestCase):

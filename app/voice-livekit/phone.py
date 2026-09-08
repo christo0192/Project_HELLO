@@ -1060,14 +1060,20 @@ def phone_turn_detection() -> str:
 
 def phone_static_endpointing_max_delay() -> float:
     """Read an optional phone-only max-delay override, defaulting to 0.8s. Bounded
-    to [0.5, 2.0]; the deployed value (0.8) shortens the slow-speaker tail and the
+    to [0.5, 3.0]; the deployed value shortens the slow-speaker tail and the
     dead-air after the candidate stops. A longer tail can still be restored via an
-    explicit override (e.g. 1.25) without a code change.
+    explicit override without a code change.
 
     v114 (live call): the clamp floor was lowered from 1.0 to 0.5 so a desired
     0.8s max is honoured verbatim instead of being clamped up to 1.0.
     v115 (latency RCA): the default itself was lowered 1.5 -> 0.8 — the long
-    default tail caused multi-second waits on natural mid-answer pauses."""
+    default tail caused multi-second waits on natural mid-answer pauses.
+    PR2a (fragmentation): the clamp CEILING was raised 2.0 -> 3.0 so the deploy
+    value can move toward the browser default (2.5). MAX only bounds the wait on
+    a genuinely-INCOMPLETE utterance — the built-in v1-mini EOU commits a
+    COMPLETE answer at MIN regardless of MAX — so a larger MAX lets a mid-thought
+    pause breathe like the browser lane at near-zero common-case latency cost.
+    The MIN reader and its [0.3, 0.5] clamp are unchanged."""
     raw = os.getenv("PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC")
     if raw in (None, ""):
         return PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC
@@ -1075,7 +1081,7 @@ def phone_static_endpointing_max_delay() -> float:
         value = float(raw)
     except ValueError:
         return PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC
-    return min(2.0, max(0.5, value))
+    return min(3.0, max(0.5, value))
 
 
 def phone_local_endpointing_delays() -> tuple[float, float]:
@@ -5057,6 +5063,52 @@ def phone_llm_reasoning_effort() -> str | None:
     return value or None
 
 
+def phone_interviewer_on_deepseek() -> bool:
+    """Whether the phone INTERVIEWER speaks through a DeepSeek endpoint.
+
+    Detected from the OpenAI-compat base URL host (``api.deepseek.com`` or any
+    ``deepseek`` host). Used only by the reasoning-effort tripwire — DeepSeek is
+    the family whose ``reasoning_effort`` default (null/omitted) means THINKING,
+    the latency-degradation the tripwire guards against.
+    """
+    return "deepseek" in phone_llm_base_url().lower()
+
+
+def phone_interviewer_reasoning_tripwire_effort() -> str | None:
+    """Return the effective interviewer reasoning-effort IF it is a tripwire.
+
+    PR2a FIX A1 (guardrail, NOT a crash). DeepSeek V4-Flash defaults to THINKING
+    unless ``reasoning_effort`` is the literal ``"none"`` (verified: null/omitted
+    routes all tokens to reasoning_content = dead-air). Production runs the
+    interviewer with reasoning ``none`` on purpose, but nothing re-validates it,
+    so a stale or UNSET ``PHONE_LLM_REASONING_EFFORT`` secret could silently
+    re-enable thinking and reintroduce the dead-air.
+
+    This returns the offending effective value (a string, or ``None`` for the
+    unset/null case) WHEN the interviewer is on a DeepSeek endpoint AND the
+    effective effort is anything other than exactly ``"none"``; otherwise it
+    returns ``None`` meaning "no tripwire" — so a plain ``None`` return is the
+    all-clear. The caller LOGS this loudly and does NOT crash: reasoning-on is a
+    latency degradation, not a compliance breach, and crashing the phone worker
+    over it is worse than the degradation. NON-DeepSeek endpoints (Sarvam,
+    Gemini-compat) are never flagged — the null/thinking coupling is
+    DeepSeek-specific.
+
+    NB it is intentional that UNSET (effective ``None``) trips on DeepSeek: an
+    absent secret is precisely the "silently re-enabled thinking" case the
+    guardrail exists to surface. The sentinel string ``"__tripwire_null__"`` is
+    returned for the unset case so the caller can distinguish "no tripwire"
+    (function returns ``None``) from "tripwire, effort was null" without a second
+    read.
+    """
+    if not phone_interviewer_on_deepseek():
+        return None
+    effort = phone_llm_reasoning_effort()
+    if (effort or "").strip().lower() == "none":
+        return None
+    return effort if effort is not None else "__tripwire_null__"
+
+
 def phone_judge_model() -> str:
     """Dedicated judge model; never inherits the speaking-model selection."""
     explicit = os.getenv("PHONE_JUDGE_MODEL", "")
@@ -5295,6 +5347,55 @@ async def _default_phone_interviewer_text(instruction: str) -> str | None:
         return data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
         return None
+
+
+def phone_prefix_warmup_enabled() -> bool:
+    """Whether to warm DeepSeek's server-side prefix cache at session start.
+
+    PR2a FIX A2. Default ON: the OPENING turn otherwise pays a full COLD DeepSeek
+    prefill on the large, byte-stable screener system prompt (the owner-observed
+    slow opening), because nothing has primed the provider's prefix cache yet. A
+    single throwaway completion of that same prefix, fired before turn-1 and
+    DISCARDED, makes turn-1 a cache HIT.
+
+    Set ``PHONE_PREFIX_WARMUP=off`` to disable; ANY other value (including unset)
+    keeps it on. Read at the call site with the literal name so the env-contract
+    scanner sees it; also read here so the reader is the single source of truth.
+    PHONE ONLY — the browser/WebRTC lane never calls this.
+    """
+    return (os.getenv("PHONE_PREFIX_WARMUP") or "").strip().lower() != "off"
+
+
+async def phone_warm_prefix_cache(
+    system_prefix: Any,
+    *,
+    infer: Callable[[str], Awaitable[Any]] | None = None,
+) -> None:
+    """Fire ONE best-effort completion of the static prompt prefix, discard it.
+
+    PR2a FIX A2. Mirrors ``_default_phone_interviewer_text`` — a one-shot
+    OpenAI-compat completion on the SAME interviewer model / base / key, over the
+    bounded coverage transport + breaker — but it is a pure SIDE EFFECT: the
+    response is thrown away. The point is only that DeepSeek sees (and caches)
+    the large static prefix once, so the real turn-1 request is a prefix-cache
+    hit rather than a cold full prefill.
+
+    FAIL-SILENT BY CONSTRUCTION. A missing prefix, an empty/whitespace prefix, a
+    disabled key, or ANY transport/provider failure is swallowed and returns
+    None — a failed warm-up must never affect the call. Never routed through the
+    live AgentSession.generate_reply (that would race the consent opening); this
+    is a raw completion on the interviewer endpoint, off the speech path.
+    """
+    prefix = str(system_prefix or "").strip()
+    if not prefix:
+        return
+    infer_fn = infer or _default_phone_interviewer_text
+    try:
+        # We only need DeepSeek to READ (and cache) the prefix; the generated
+        # continuation is irrelevant, so discard whatever comes back.
+        await infer_fn(prefix)
+    except Exception:  # noqa: BLE001 — a warm-up must never surface on the call
+        return
 
 
 async def phone_rephrase_first_question(

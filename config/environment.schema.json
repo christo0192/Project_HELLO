@@ -192,6 +192,7 @@
         "PHONE_OBJECTIVE_PREEMPTIVE": { "requiredInProduction": false, "secret": false },
         "PHONE_TURN_DETECTION": { "requiredInProduction": false, "secret": false },
         "PHONE_DYNAMIC_ENDPOINTING": { "requiredInProduction": false, "secret": false },
+        "PHONE_PREFIX_WARMUP": { "requiredInProduction": false, "secret": false },
         "PHONE_SARVAM_HIGH_VAD_SENSITIVITY": { "requiredInProduction": false, "secret": false },
         "PHONE_SARVAM_NEGATIVE_SPEECH_THRESHOLD": { "requiredInProduction": false, "secret": false },
         "PHONE_SARVAM_NEGATIVE_FRAMES_COUNT": { "requiredInProduction": false, "secret": false },
