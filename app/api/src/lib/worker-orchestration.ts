@@ -119,6 +119,15 @@ export interface WorkerOrchestrationDeps {
   /** Per-sweep reap cap. Defaults to 50. */
   readonly reapMaxPerRun?: number;
   /**
+   * T2③ ORPHAN-REAP grace (seconds). The conservative idle window a MANAGED
+   * pool machine's lease must have been `stopped` and UNTOUCHED before the
+   * orphan sweep will consider stopping it (when Fly reports it `started`).
+   * Defaults to `env.workerOrphanGraceSec`. Longer than the normal reaper grace
+   * because an orphan has no per-session room to prove liveness against — the
+   * idle window IS the race guard.
+   */
+  readonly orphanGraceSec?: number;
+  /**
    * Optional structured-event sink. The component logger's meta allowlist drops
    * non-allowlisted keys (counts like `released`/`stopFailed`, the `app`), so the
    * log line carries only the event KIND. This sink receives the FULL payload,
@@ -235,6 +244,7 @@ export function createWorkerOrchestrationService(
   const startWaitSec = deps.startWaitSec ?? DEFAULT_START_WAIT_SEC;
   const readyPollMs = Math.max(50, deps.readyPollMs ?? DEFAULT_READY_POLL_MS);
   const reapMaxPerRun = Math.max(1, deps.reapMaxPerRun ?? DEFAULT_REAP_MAX_PER_RUN);
+  const orphanGraceSec = deps.orphanGraceSec ?? env.workerOrphanGraceSec;
 
   /**
    * Emit a lifecycle event. Always logs (KIND only, per the meta allowlist), and
@@ -652,6 +662,97 @@ export function createWorkerOrchestrationService(
     }
 
     event('reap_swept', { app, stopped, scanned });
+
+    // ── T2③ ORPHAN SWEEP (the reaper blind spot) ────────────────────────────
+    // The sweep above only sees NON-stopped leases. A pool machine that leaked
+    // `started` on Fly while its lease reads `stopped` (a manual start, prewarm,
+    // or secret-update restart) is invisible to it and burns VM-hours forever
+    // (observed ≥4×). This second sweep closes that hole conservatively:
+    //   1. `list_orphaned_voice_worker_leases` returns MANAGED pool machines
+    //      (they HAVE a lease row for this app — so unmanaged always-on
+    //      browser/API machines, which have NO row, can NEVER be candidates)
+    //      whose lease is `stopped` AND untouched for `orphanGraceSec` (the race
+    //      guard: a machine mid-claim moved its lease within seconds, so it is
+    //      excluded).
+    //   2. We read Fly's ACTUAL machine state ONCE (`listMachines`) and stop a
+    //      candidate ONLY when Fly reports it EXACTLY `started`. A transitional
+    //      `starting`/`stopping` is skipped (a claim may be bringing it up right
+    //      now); a `stopped`/`destroyed`/`suspended` is a false alarm (the DB was
+    //      right) and left alone.
+    //   3. Stop → reset via the SAME path a normal reap uses. Reset returns the
+    //      row to the clean stopped pool.
+    // There is deliberately NO room-liveness check here: an orphan by definition
+    // holds no claimed session (its lease is `stopped`), so there is no session
+    // room to consult — the long-idle guard is what makes stopping safe. Bounded
+    // by the same per-run cap (shared budget with the sweep above).
+    let orphanCandidates: Array<{ machineId: string }>;
+    try {
+      const raw = await deps.rpc('list_orphaned_voice_worker_leases', {
+        p_app: app,
+        p_grace_sec: orphanGraceSec,
+        p_now: new Date(now()).toISOString(),
+      });
+      if (raw.error) throw new Error('list_error');
+      const rows = Array.isArray(raw.data) ? raw.data : [];
+      orphanCandidates = rows
+        .map((r) => (r && typeof r === 'object' ? (r as Record<string, unknown>) : {}))
+        .map((r) => ({ machineId: typeof r.machine_id === 'string' ? r.machine_id : '' }))
+        .filter((r) => r.machineId !== '');
+    } catch {
+      // A failed orphan-candidate read must not lose the sweep's own result.
+      event('orphan_list_error', { app });
+      return { stopped };
+    }
+
+    if (orphanCandidates.length > 0 && scanned < reapMaxPerRun) {
+      // Read Fly's actual machine states ONCE for the whole app. A THROW here is
+      // "unknown" for every candidate → stop nothing this pass (the DB believing
+      // a machine stopped is not, by itself, proof it is running).
+      let flyStateById: Map<string, string> | null = null;
+      try {
+        const machines = await deps.fly.listMachines(app);
+        flyStateById = new Map(
+          (Array.isArray(machines) ? machines : []).map((m) => [m.id, m.state]),
+        );
+      } catch {
+        event('orphan_fly_list_error', { app });
+        flyStateById = null;
+      }
+
+      let orphansStopped = 0;
+      if (flyStateById !== null) {
+        for (const c of orphanCandidates) {
+          if (scanned >= reapMaxPerRun) break; // shared bounded budget
+          scanned += 1;
+          // Stop ONLY a machine Fly reports EXACTLY `started`. Absent from the
+          // list (id not found) or any non-`started` state → skip: either Fly
+          // agrees it is stopped (false alarm) or it is transitional (a
+          // concurrent claim may own it). Never stop on a guess.
+          const flyState = flyStateById.get(c.machineId);
+          if (flyState !== 'started') continue;
+          try {
+            await deps.fly.stopMachine(app, c.machineId);
+          } catch {
+            // Could not stop — leave the lease as-is; the next pass retries. Do
+            // NOT reset a machine we did not confirm stopped.
+            continue;
+          }
+          try {
+            await deps.rpc('reset_voice_worker', {
+              p_app: app,
+              p_machine_id: c.machineId,
+              p_now: new Date(now()).toISOString(),
+            });
+          } catch {
+            /* fail-open: the row can be reset on a later pass */
+          }
+          orphansStopped += 1;
+          stopped += 1;
+        }
+      }
+      event('orphan_swept', { app, orphansStopped, candidates: orphanCandidates.length });
+    }
+
     return { stopped };
   }
 

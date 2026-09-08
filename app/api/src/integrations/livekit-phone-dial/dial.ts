@@ -150,8 +150,10 @@ export interface PhoneWorkerReadyGate {
     epoch: number;
     /**
      * Wall-clock budget (seconds) for the machine to reach `ready`. The runtime
-     * passes `env.phoneWorkerReadyTimeoutSec` (default 75) so a slow-booting
-     * worker is not deferred prematurely; the service clamps it to [30, 300].
+     * passes `env.phoneWorkerReadyTimeoutSec` (default 120 — the service ceiling,
+     * raised from 75 so a first cold boot after a deploy/secret-change does not
+     * defer and burn the one-shot owner-test gate) so a slow-booting worker is
+     * not deferred prematurely; the service clamps it to [30, 300].
      */
     readyTimeoutSec?: number;
   }): Promise<

@@ -89,13 +89,32 @@ primary_region = "sin"
   # The window keeps the default 6-frame tolerance for non-silence blips, so a
   # short in-answer pause does not end the turn. negative_speech_threshold is
   # left UNSET (Sarvam default 0.45) so this A/B changes only the timing window,
-  # not the speech/silence decision boundary. Owner-gated: revert by removing
-  # these two lines to restore the deployed default window.
-  PHONE_SARVAM_NEGATIVE_FRAMES_COUNT = "16"
-  PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW = "22"
+  # not the speech/silence decision boundary.
+  #
+  # T3 (Call D, 2026-09-08) — restored to the CONSERVATIVE Sarvam default 18/24
+  # (was 16/22). RATIONALE: with PHONE_TURN_DETECTION="stt" below, Sarvam's STT
+  # VAD frames become the SOLE turn-gate — the local Silero 0.4/0.8 endpointing
+  # is skipped entirely. The 16/22 trim was tuned assuming Silero was the PRIMARY
+  # endpointer and these frames only shaped the STT-final wait; once STT is the
+  # only gate, the tighter window raises mid-thought cut-in risk, so the
+  # conservative 18/24 default (min fill 18*32ms=576ms; max 24*32ms=768ms VAD
+  # window) is the correct pairing. ENV-REVERTIBLE post-deploy without a code
+  # change: set both back to 16/22 to A/B-isolate the frames independently.
+  PHONE_SARVAM_NEGATIVE_FRAMES_COUNT = "18"
+  PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW = "24"
   SARVAM_TTS_MODEL = "bulbul:v3"
   SARVAM_TTS_VOICE = "simran"
-  PHONE_TURN_DETECTION = "local"
+  # T3/X8 (Call D, 2026-09-08) — "stt": delegate end-of-turn detection to Sarvam
+  # STT's own VAD (a final transcript on every pause), skipping the local Silero
+  # 0.4/0.8 endpointing path entirely (the code path is agent.py ~1928: only
+  # "stt" injects turn_detection="stt" into the phone AgentSession; any other
+  # value keeps "local"). This removes the local endpointing delay from the
+  # critical path. The Sarvam frames above (18/24) become the sole turn-gate in
+  # this mode, which is why they are set conservatively. ENV-REVERTIBLE post-
+  # deploy without a code change: set PHONE_TURN_DETECTION="local" to restore the
+  # Silero endpointing path, so this whole T3 latency change can be A/B-isolated
+  # live (turn-detection and frames revert independently).
+  PHONE_TURN_DETECTION = "stt"
   # v115 latency RCA: pin the phone-local endpointing bounds explicitly in the
   # deploy manifest (the code defaults match these). MIN is the ~0.8s median-
   # latency floor beyond LLM+TTS; MAX bounds the wait on a mid-answer pause.

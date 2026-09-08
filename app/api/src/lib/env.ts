@@ -38,6 +38,7 @@ const _contractVisibleEnvReads = [
   process.env.FLY_API_TOKEN,
   process.env.FLY_API_BASE_URL,
   process.env.WORKER_REAPER_GRACE_SEC,
+  process.env.WORKER_ORPHAN_GRACE_SEC,
   process.env.PHONE_WORKER_READY_TIMEOUT_SEC,
 ];
 void _contractVisibleEnvReads;
@@ -264,15 +265,43 @@ export const env = {
    */
   workerReaperGraceSec: positiveInt('WORKER_REAPER_GRACE_SEC', 180, 30, 3600),
   /**
+   * T2③ ORPHAN-REAP grace (seconds). The SECOND, conservative grace window,
+   * used ONLY by the orphan sweep that stops a MANAGED pool machine which Fly
+   * reports `started` while its lease reads `stopped` (a manual start / prewarm
+   * / secret-update restart left the DB behind). It is deliberately LONGER and
+   * has a HIGHER floor than `workerReaperGraceSec`: an orphan is stopped without
+   * a per-session LiveKit room to prove liveness against (a stopped lease has no
+   * claimed session), so the only race guard is "the lease has not been touched
+   * for a long time" — a mid-claim machine's lease moves within seconds, so a
+   * ≥10-minute idle floor makes stopping a machine another process is bringing
+   * up effectively impossible. Clamped 300..7200; default 600 (10 min). Only
+   * meaningful when `workerOrchestration` is true.
+   */
+  workerOrphanGraceSec: positiveInt('WORKER_ORPHAN_GRACE_SEC', 600, 300, 7200),
+  /**
    * Wall-clock budget (seconds) the dial gate gives a claimed machine to boot,
    * register with LiveKit and post its readiness ping before the dial is
    * DEFERRED (`worker_not_ready`) and the claim cleaned up. The service default
    * is 30s, but historical worker cold-boot is 15-25s+ and a browser+SDK warm
-   * can push past 30s, so the phone gate raises it to 75s to avoid deferring a
-   * machine that would have been ready moments later. Clamped 30..300. Only
-   * meaningful when `workerOrchestration` is true.
+   * can push past 30s.
+   *
+   * T2④ COLD-FLEET PREWARM (Call D, 2026-09-08): `ensureReadyWorker` ALREADY
+   * prewarms — it claims a stopped pool machine and STARTS it, then waits up to
+   * this budget for the readiness ping — so a cold fleet is booted on the arm,
+   * not left cold. The failure the owner kept hitting is the FIRST arm after a
+   * deploy / secret-change: that boot is a genuine cold boot (a fresh image
+   * pull + full worker+LiveKit registration) that can run past 75s on a
+   * degraded fleet, so the gate DEFERRED (worker_not_ready) and the one-shot
+   * owner-test slot was consumed before the machine finished coming up. Raising
+   * the default to 120s covers that worst-case cold boot with margin. 120s is
+   * the service's own MAX_READY_TIMEOUT_MS ceiling (worker-orchestration.ts),
+   * so this is the largest budget the service will honour and it changes NO
+   * refusal semantics — a machine that is genuinely never going to be ready
+   * still DEFERS (just later), and the deferred attempt stays same-IST-day
+   * retryable via the 0083 infra-abandon. Clamped 30..300. Only meaningful when
+   * `workerOrchestration` is true. Revert to 75 by setting the env explicitly.
    */
-  phoneWorkerReadyTimeoutSec: positiveInt('PHONE_WORKER_READY_TIMEOUT_SEC', 75, 30, 300),
+  phoneWorkerReadyTimeoutSec: positiveInt('PHONE_WORKER_READY_TIMEOUT_SEC', 120, 30, 300),
   /**
    * The dispatch name of the NAMED browser worker (design §2.3b B-i). EMPTY by
    * default, which is byte-identical to today: the browser worker stays UNNAMED
