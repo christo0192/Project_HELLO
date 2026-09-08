@@ -5902,6 +5902,7 @@ async def _make_native_coordinator(
     *, turn_mode="toolfirst", client=None, state=None,
     coverage_judge_enabled=False, call_metrics=None,
     candidate_speaking=None, candidate_speech_ended=None,
+    speech_sequence=None,
 ):
     """Start a REAL `_run_native_phone_screening` and return its live turn hook.
 
@@ -5930,6 +5931,8 @@ async def _make_native_coordinator(
     reply_started = asyncio.Event()
     speech_first_audio = asyncio.Event()
     reply_handle: list = [None]
+    if speech_sequence is None:
+        speech_sequence = [0]
     assistant_delivery_complete = asyncio.Event()
     candidate_activity = asyncio.Event()
     agent_listening = asyncio.Event()
@@ -5952,7 +5955,7 @@ async def _make_native_coordinator(
             latest_candidate_anchor=latest_candidate_anchor,
             candidate_end_requested=candidate_end_requested,
             reply_started=reply_started, speech_first_audio=speech_first_audio,
-            speech_sequence=[0], reply_handle=reply_handle,
+            speech_sequence=speech_sequence, reply_handle=reply_handle,
             assistant_delivery_complete=assistant_delivery_complete,
             candidate_activity=candidate_activity,
             agent_listening=agent_listening,
@@ -5998,6 +6001,7 @@ async def _make_native_coordinator(
         "log_patch": log_patch,
         "drive_terminal": drive_terminal,
         "call_metrics": call_metrics,
+        "speech_sequence": speech_sequence,
     }
     return agent, session, state, client, hooks
 
