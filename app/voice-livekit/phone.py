@@ -6010,10 +6010,28 @@ def phone_objective_guard_max_questions_for_phase(phase: Any) -> int:
 #: class sets are DISJOINT (an overlap — e.g. "Data Engineer" is both data and
 #: engineering — is compatible, and an unknown side stays None). Deliberately
 #: coarse: a class the lexicon does not know cannot produce an accusation.
+#: FIX A (SE/name-call slate 2026-09-08): additive widening for common titles
+#: the closed-world set left UNCLASSIFIED (silent false-negatives). Because a
+#: conflict needs DISJOINT class sets, a title that spans two families (e.g.
+#: "trading systems engineer" → {engineering, finance}) can never be a false
+#: disjoint against either — so every new term goes into its MOST SPECIFIC
+#: EXISTING class, keeping intra-family and adjacent roles sharing a class rather
+#: than minting a new class that would manufacture fresh disjoints:
+#:   * architecture titles (software / solutions / cloud / systems architect) and
+#:     "coder" are engineering-family → the "engineering" class;
+#:   * ``reliability`` is added to engineering so a bare "reliability engineer"
+#:     lands there (SRE / site reliability engineer already matched via engineer);
+#:   * product-lead titles (product owner, scrum master; product manager already
+#:     matched via ``manager``) → the "management" class, so an intra-product pair
+#:     can never read as disjoint;
+#:   * "business analyst" already classifies as ``data`` via ``analyst`` and is
+#:     left there deliberately (a bespoke class would only create new disjoints
+#:     against genuine data/analytics résumés).
 _ROLE_CLASS_LEXICON: tuple[tuple[str, "re.Pattern[str]"], ...] = (
     ("engineering", re.compile(
-        r"\b(?:software|developer|engineer(?:ing)?|programmer|sde\d?|"
-        r"full[\s-]?stack|back[\s-]?end|front[\s-]?end|devops|sre)\b",
+        r"\b(?:software|developer|coder|engineer(?:ing)?|programmer|sde\d?|"
+        r"full[\s-]?stack|back[\s-]?end|front[\s-]?end|devops|sre|"
+        r"reliability|architect(?:ure)?)\b",
         re.IGNORECASE)),
     ("sales", re.compile(
         r"\b(?:sales|advisor|advisory|counsell\w*|counselor|"
@@ -6033,7 +6051,7 @@ _ROLE_CLASS_LEXICON: tuple[tuple[str, "re.Pattern[str]"], ...] = (
         re.IGNORECASE)),
     ("management", re.compile(
         r"\b(?:manager|management|team\s+lead|director|head\s+of|"
-        r"vice\s+president|vp|supervisor)\b",
+        r"vice\s+president|vp|supervisor|product\s+owner|scrum\s+master)\b",
         re.IGNORECASE)),
     ("design", re.compile(
         r"\b(?:designer|ux|ui|graphic\s+design\w*|product\s+design\w*)\b",
