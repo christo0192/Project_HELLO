@@ -2462,6 +2462,29 @@ async def _run_native_phone_screening(
     }
     owed_name_confirm: dict[str, Any] = {"value": False, "mismatch": None}
     name_confirm_awaiting_reply: dict[str, Any] = {"key": None, "mismatch": None}
+
+    def _identity_ambiguous_leadins_allowed() -> bool:
+        """Call C RCA (2026-09-08): may the AMBIGUOUS name-intro arms
+        ("this is X" / "it's X") fire on THIS turn?
+
+        A conversational-STATE gate, not a turn/length gate. True only when the
+        turn is a plausible identity utterance:
+          * an active name-confirmation reply is awaited
+            (`name_confirm_awaiting_reply` armed), or
+          * the candidate is still on the INTRODUCTION objective (durable cursor
+            at the first plan question) — where a bare "this is <name>" is
+            genuinely a self-introduction.
+        During ordinary mid-call Q&A this is False, so an off-topic third-person
+        sentence ("this is his last match") can never arm a phantom name-confirm.
+        A legitimate MID-CALL correction is unaffected: it uses a STRONG arm
+        ("Actually, my name is …"), which is never gated.
+        """
+        if name_confirm_awaiting_reply.get("key") is not None:
+            return True
+        try:
+            return int(state.cursor) <= 0
+        except (TypeError, ValueError):
+            return False
     # FIX A (2026-09-06) OWED CONFLICT PROBE latch. The ASYNC coverage judge
     # (~4271) detects résumé conflicts ~1-2s after the cursor already moved. The
     # old remedy armed `conflict_reply_pending` stamped with `native_turn_seq`
@@ -3790,6 +3813,7 @@ async def _run_native_phone_screening(
             name_mismatch = phone.phone_name_mismatch(
                 merged_candidate,
                 state.resume_facts.get("name") if isinstance(state.resume_facts, dict) else None,
+                allow_ambiguous_leadins=_identity_ambiguous_leadins_allowed(),
             )
             # F3 (2026-09-06) PRECEDENCE FLIP (coalesce site, symmetric with the
             # single-final site): the IDENTITY signal is evaluated FIRST and claims
@@ -4354,6 +4378,7 @@ async def _run_native_phone_screening(
             name_mismatch = phone.phone_name_mismatch(
                 text,
                 state.resume_facts.get("name") if isinstance(state.resume_facts, dict) else None,
+                allow_ambiguous_leadins=_identity_ambiguous_leadins_allowed(),
             )
             # F3 (2026-09-06) PRECEDENCE FLIP — RCA (call, résumé name Christo /
             # spoken "Deepak", ratio 0.0): the intro utterance tripped BOTH the

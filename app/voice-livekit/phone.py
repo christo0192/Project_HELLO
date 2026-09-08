@@ -6053,21 +6053,64 @@ def phone_deterministic_resume_conflict(
 #: "I'm Rijo" (acceptable), because a false accusation is far worse than a miss.
 #: "myself X" is kept — a common Indian-English self-introduction phrasing.
 _NAME_TOKEN = r"[A-Za-z][A-Za-z'\-]{1,30}"
-_NAME_INTRO_RES = (
-    re.compile(r"\bmy\s+name\s+is\s+(?P<name>" + _NAME_TOKEN + r"(?:\s+" + _NAME_TOKEN + r")?)", re.IGNORECASE),
-    re.compile(r"\bthis\s+is\s+(?P<name>" + _NAME_TOKEN + r"(?:\s+" + _NAME_TOKEN + r")?)", re.IGNORECASE),
-    re.compile(r"\bmyself\s+(?P<name>" + _NAME_TOKEN + r"(?:\s+" + _NAME_TOKEN + r")?)", re.IGNORECASE),
-    re.compile(r"\b(?:it\s*['’]?s|you\s*['’]?re\s+speaking\s+(?:to|with)|speaking\s+with)\s+(?P<name>" + _NAME_TOKEN + r"(?:\s+" + _NAME_TOKEN + r")?)", re.IGNORECASE),
+#: (Call C RCA, 2026-09-08) The intro arms are split by CONFIDENCE.
+#:
+#: STRONG arms name the introduction explicitly ("my name is X", "myself X",
+#: "X here", "you're speaking with X"). Their lead-in is essentially never
+#: followed by a non-name, so they fire in ANY context (including an explicit
+#: mid-call correction — "Actually, my name is Deepak").
+#:
+#: AMBIGUOUS arms ("this is X", "it's X") share their surface form with ordinary
+#: THIRD-PERSON narration — "this is his last match", "this is John's brother",
+#: "it's the coach's call". Call C armed a spurious name-confirm because the
+#: `this is` arm captured the pronoun "his" from an off-topic sports remark. So
+#: the ambiguous arms only fire when the CALLER declares the turn is a plausible
+#: introduction or an active name-confirmation reply (`allow_ambiguous_leadins`)
+#: — a conversational-STATE gate, NOT a turn-index / length / two-token gate
+#: (each of those rejects legitimate short-name or single-name intros, or blocks
+#: legitimate mid-call corrections; Codex §2 "do not adopt these shortcuts").
+_NAME_INTRO_RES_STRONG = (
+    re.compile(r"\bmy\s+name\s+is\s+(?P<name>" + _NAME_TOKEN + r"(?:\s+" + _NAME_TOKEN + r")?)(?P<after>\s+" + _NAME_TOKEN + r")?", re.IGNORECASE),
+    re.compile(r"\bmyself\s+(?P<name>" + _NAME_TOKEN + r"(?:\s+" + _NAME_TOKEN + r")?)(?P<after>\s+" + _NAME_TOKEN + r")?", re.IGNORECASE),
+    re.compile(r"\byou\s*['’]?re\s+speaking\s+(?:to|with)\s+(?P<name>" + _NAME_TOKEN + r"(?:\s+" + _NAME_TOKEN + r")?)(?P<after>\s+" + _NAME_TOKEN + r")?", re.IGNORECASE),
+    re.compile(r"\bspeaking\s+with\s+(?P<name>" + _NAME_TOKEN + r"(?:\s+" + _NAME_TOKEN + r")?)(?P<after>\s+" + _NAME_TOKEN + r")?", re.IGNORECASE),
     re.compile(r"(?:^|[.,;!?]\s*)(?P<name>" + _NAME_TOKEN + r")\s+here\b", re.IGNORECASE),
+)
+_NAME_INTRO_RES_AMBIGUOUS = (
+    re.compile(r"\bthis\s+is\s+(?P<name>" + _NAME_TOKEN + r"(?:\s+" + _NAME_TOKEN + r")?)(?P<after>\s+" + _NAME_TOKEN + r")?", re.IGNORECASE),
+    re.compile(r"\b(?:it\s*['’]?s)\s+(?P<name>" + _NAME_TOKEN + r"(?:\s+" + _NAME_TOKEN + r")?)(?P<after>\s+" + _NAME_TOKEN + r")?", re.IGNORECASE),
 )
 
 #: Non-name words that commonly follow "I'm ..." / "this is ..." and must never
-#: be treated as an introduced name.
+#: be treated as an introduced name. (Call C RCA, 2026-09-08) EXTENDED with the
+#: closed-class pronouns / possessive determiners: "this is HIS last match"
+#: leaked "his" as a name (ratio 0.600 vs "christo") and armed the phantom
+#: name-confirm loop. Applied to the CAPTURED name token (first token of the
+#: `name` group), so a pronoun that follows the lead-in can never be a name in
+#: ANY arm. Cheap and fail-silent.
 _NAME_STOPWORDS = frozenset({
     "good", "fine", "great", "okay", "ok", "well", "doing", "here", "there",
     "not", "so", "just", "really", "very", "so-so", "alright", "all", "the",
     "a", "an", "sorry", "calling", "ready", "excited", "happy", "glad", "nervous",
     "from", "at", "in", "on", "an", "yeah", "yes", "no", "actually", "still",
+    # Closed-class pronouns & possessive/demonstrative determiners (Call C).
+    "his", "her", "hers", "him", "its", "their", "theirs", "them", "they",
+    "he", "she", "we", "us", "our", "ours", "your", "yours", "my", "mine",
+    "me", "i", "it", "this", "that", "these", "those",
+})
+
+#: (Call C RCA, 2026-09-08) A closed set of RELATION nouns. On the AMBIGUOUS
+#: arms, a captured name whose FOLLOWING token is one of these — or which itself
+#: carries a possessive `'s` — is a THIRD-PERSON reference ("this is John's
+#: brother", "this is Sam's manager"), never a self-introduction. Stopwords
+#: cannot catch this because the captured token ("John", "Sam") is a real name;
+#: the tell is the possessive/relation to its right. Scoped to the ambiguous
+#: arms only, so a genuine "this is Raj" (no trailing relation) still fires.
+_NAME_RELATION_NOUNS = frozenset({
+    "brother", "sister", "friend", "coach", "manager", "colleague", "wife",
+    "husband", "son", "daughter", "boss", "mom", "dad", "mother", "father",
+    "cousin", "uncle", "aunt", "nephew", "niece", "partner", "teammate",
+    "neighbour", "neighbor", "buddy", "mate", "cousin's", "team",
 })
 
 #: Nickname / spelling / transliteration families that must NEVER flag. Each
@@ -6103,32 +6146,78 @@ def _normalize_name_token(value: Any) -> str:
     return token
 
 
-def phone_extract_introduced_name(text: Any) -> str | None:
+def _accept_intro_capture(match: "re.Match[str]", *, ambiguous: bool) -> str | None:
+    """Shared post-filters for one intro-arm capture, else None.
+
+    Rejects a too-short token (<= 2 letters, an initial or STT fragment) and any
+    captured token in `_NAME_STOPWORDS` (now including pronouns/determiners).
+    For the AMBIGUOUS arms additionally rejects a THIRD-PERSON reference — a name
+    that carries a possessive `'s` or is immediately followed by a relation noun
+    ("this is John's brother", "this is Sam's manager") — which stopwords cannot
+    catch because the captured token is itself a real name.
+    """
+    raw = " ".join(match.group("name").split())
+    tokens = raw.split()
+    first_token = tokens[0] if tokens else ""
+    normalized = _normalize_name_token(first_token)
+    if len(normalized) <= 2:
+        return None
+    if normalized in _NAME_STOPWORDS:
+        return None
+    if ambiguous:
+        # Possessive on the captured name itself ("John's") → third-person.
+        if "'" in first_token or "’" in first_token:
+            return None
+        # The token immediately AFTER the captured name group. A relation noun
+        # (or a possessive-marked one) makes the capture a third-person ref.
+        after = match.groupdict().get("after")
+        if isinstance(after, str) and after.strip():
+            nxt = after.strip().split()[0]
+            nxt_norm = re.sub(r"[^a-z']", "", nxt.casefold())
+            if nxt_norm in _NAME_RELATION_NOUNS or nxt_norm.endswith("'s"):
+                return None
+    return normalized
+
+
+def phone_extract_introduced_name(
+    text: Any, *, allow_ambiguous_leadins: bool = True,
+) -> str | None:
     """Best-effort self-introduced FIRST name from an intro turn, else None.
 
     Deliberately narrow and fail-silent (FIX 2): ONLY strong, unambiguous
-    name-introduction lead-ins produce a candidate — "my name is X", "this is X",
-    "myself X", "X here", "speaking with X" / "you're speaking with X". The bare
-    "I'm X" / "I am X" shapes were removed because their first token is almost
-    never a name in ordinary speech ("I'm interested…", "I am currently…"). The
-    first token of the captured name is taken as the given name, obvious non-name
-    filler is rejected, and a too-short token (<= 2 letters, likely an initial or
-    STT fragment) is discarded.
+    name-introduction lead-ins produce a candidate — "my name is X", "myself X",
+    "X here", "speaking with X" / "you're speaking with X" (STRONG, always
+    evaluated) plus "this is X" / "it's X" (AMBIGUOUS, evaluated only when
+    `allow_ambiguous_leadins` is True). The bare "I'm X" / "I am X" shapes were
+    removed because their first token is almost never a name in ordinary speech.
+    The first token of the captured name is taken as the given name; obvious
+    non-name filler / pronouns are rejected, a too-short token (<= 2 letters) is
+    discarded, and on the ambiguous arms a third-person reference is rejected.
+
+    Call C RCA (2026-09-08): the ambiguous arms are context-gated so an off-topic
+    third-person sentence ("this is his last match") in the MIDDLE of screening
+    can never be read as a self-introduction. `allow_ambiguous_leadins` defaults
+    True so the strongest callers (an active name-confirmation reply, an early
+    introduction) keep the historical breadth; screening call sites pass False
+    once the candidate is answering plan questions.
     """
     if not isinstance(text, str) or not text.strip():
         return None
-    for pattern in _NAME_INTRO_RES:
+    for pattern in _NAME_INTRO_RES_STRONG:
         match = pattern.search(text)
         if match is None:
             continue
-        raw = " ".join(match.group("name").split())
-        first_token = raw.split()[0] if raw.split() else ""
-        normalized = _normalize_name_token(first_token)
-        if len(normalized) <= 2:
-            continue
-        if normalized in _NAME_STOPWORDS:
-            continue
-        return normalized
+        accepted = _accept_intro_capture(match, ambiguous=False)
+        if accepted is not None:
+            return accepted
+    if allow_ambiguous_leadins:
+        for pattern in _NAME_INTRO_RES_AMBIGUOUS:
+            match = pattern.search(text)
+            if match is None:
+                continue
+            accepted = _accept_intro_capture(match, ambiguous=True)
+            if accepted is not None:
+                return accepted
     return None
 
 
@@ -6158,7 +6247,9 @@ def _names_are_variant(a: str, b: str) -> bool:
     return False
 
 
-def phone_name_mismatch(intro_text: Any, record_name: Any) -> dict[str, str] | None:
+def phone_name_mismatch(
+    intro_text: Any, record_name: Any, *, allow_ambiguous_leadins: bool = True,
+) -> dict[str, str] | None:
     """Return an IDENTITY-signal record ONLY on an OBVIOUS name mismatch, else None.
 
     Conservative & fail-silent by contract. Returns None whenever the record
@@ -6181,7 +6272,9 @@ def phone_name_mismatch(intro_text: Any, record_name: Any) -> dict[str, str] | N
     record_first = _normalize_name_token(record_name.strip().split()[0] if record_name.strip().split() else "")
     if len(record_first) <= 2:
         return None
-    spoken = phone_extract_introduced_name(intro_text)
+    spoken = phone_extract_introduced_name(
+        intro_text, allow_ambiguous_leadins=allow_ambiguous_leadins,
+    )
     if not spoken:
         return None
     if _names_are_variant(spoken, record_first):
