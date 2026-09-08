@@ -4982,6 +4982,32 @@ def phone_judge_runtime_config() -> PhoneJudgeRuntimeConfig:
             else "invalid"
         )
     error: str | None = None
+    # ── T1② JUDGE-TIMEOUT INVESTIGATION (Call D, 2026-09-08) — DEFERRED ───────
+    # Symptom: the judge times out ~1/call (its verdict returns category
+    # "judge_timeout" and fails closed). Investigation of the root cause:
+    #   * The provider budget is PHONE_COVERAGE_TIMEOUT_SEC (default 2.0s),
+    #     enforced by asyncio.wait_for on both the native-Google and OpenAI-compat
+    #     inference paths, plus a +0.25s outer margin in `judge_phone_coverage`.
+    #   * Production runs SINGLE-SHOT: PHONE_JUDGE_RETRIES defaults to 0 and this
+    #     validator HARD-PINS it to 0 ("retries_not_zero" below).
+    #   * The `timeout_exceeds_budget` guard below REJECTS any timeout > 2.0s at
+    #     startup (RuntimeError, crash-loop). So the two obvious low-risk knobs —
+    #     "bump the budget" and "add a bounded retry" — are BOTH blocked by this
+    #     validator: raising either requires ALSO widening this ceiling, i.e.
+    #     changing the deliberate latency/trust contract the owner-call incident
+    #     established. That is not a clean, low-risk fix — it is exactly the
+    #     "ambiguous or risky" case the fix-slate says to DEFER rather than guess.
+    #   * The endpoint allowlist is NOT the cause: the native-Google SDK path
+    #     skips URL validation (validating it here is what crash-looped the worker
+    #     before), and gemini-3.5-flash-lite is the enforced model.
+    # DEFERRED: no code change to the budget/retry contract here. COMMIT 1
+    # (author-time conflict arming) already removes the PRIMARY dependence on
+    # this judge for the highest-value signal (résumé conflicts), so a
+    # ~1/call judge timeout is now lower-stakes. Reopening this item should
+    # measure the actual provider-side latency distribution FIRST (is 2.0s
+    # genuinely too tight for gemini-3.5-flash-lite off the speech path, or is
+    # the tail a breaker-cooldown artifact?) and then move the budget + this
+    # ceiling TOGETHER, with a test, in a dedicated change — not opportunistically.
     if not phone_judge_api_key().strip():
         error = "missing_isolated_key"
     elif not native_google and url != PHONE_JUDGE_GOOGLE_URL:
