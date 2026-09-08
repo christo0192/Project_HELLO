@@ -109,18 +109,51 @@ class TestRoleClassLexiconWidening(unittest.TestCase):
     these); GREEN after. Each new term is pinned to its MOST-SPECIFIC existing
     class so no intra-family disjoint is manufactured (see FIX B below)."""
 
-    def test_architecture_titles_classify_as_engineering(self):
-        # `software architect` already matched via `software`; the widening adds
-        # the standalone architect family so `solutions/cloud/enterprise
-        # architect` no longer read as an unknown class.
+    def test_qualified_architect_titles_classify_as_engineering(self):
+        # An engineering-flavoured QUALIFIER in front of "architect" classifies
+        # the title as engineering (2026-09-08 review repair: the term is now
+        # ``<qualifier> architect`` only, never a bare ``architect``).
         for title in (
             "Solutions Architect", "Software Architect", "Cloud Architect",
-            "Enterprise Architect", "Systems Architecture Lead",
+            "Enterprise Architect", "Systems Architect", "Technical Architect",
+            "Data Architect", "Security Architect",
         ):
             self.assertIn(
                 "engineering", phone._role_classes(title),
                 f"{title!r} should classify as engineering",
             )
+
+    def test_bare_and_non_engineering_architect_titles_stay_unclassified(self):
+        # 2026-09-08 review repair: the bare ``architect(?:ure)?`` term wrongly
+        # pulled non-engineering "architect" titles into the engineering class,
+        # manufacturing false disjoint conflicts against design (and other) JDs.
+        # These must classify as engineering NOWHERE (as on origin/main), so a
+        # design JD vs an "Information Architect" résumé is not a false conflict.
+        for title in (
+            "Architect", "Information Architect", "Naval Architect",
+            "Landscape Architect", "Enterprise Architecture",
+        ):
+            self.assertNotIn(
+                "engineering", phone._role_classes(title),
+                f"{title!r} must NOT classify as engineering",
+            )
+
+    def test_information_architect_is_not_a_false_conflict_against_design(self):
+        # End-to-end: an "Information Architect" résumé screened for a design
+        # role must NOT produce an author-time disjoint conflict. Under the old
+        # bare-architect term this fired (engineering vs design → disjoint).
+        self.assertIsNone(phone.phone_authortime_resume_conflict(
+            {"recent_role": {"title": "Information Architect"}},
+            "Senior Product Designer",
+        ))
+        # …while a QUALIFIED software architect vs the same design role is a
+        # genuine disjoint and is preserved.
+        conflict = phone.phone_authortime_resume_conflict(
+            {"recent_role": {"title": "Software Architect"}},
+            "Senior Product Designer",
+        )
+        self.assertIsInstance(conflict, dict)
+        self.assertIn("Software Architect", conflict["resume_fact"])
 
     def test_product_lead_titles_classify_as_management(self):
         # product manager already matched via `manager`; product owner and scrum

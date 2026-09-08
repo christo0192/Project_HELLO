@@ -5623,6 +5623,60 @@ def _answer_has_substantive_signal(text: str) -> bool:
     )
 
 
+#: A sentence segment with its (optional) trailing terminator. Used to walk an
+#: utterance clause-by-clause so a SUBSTANTIVE DECLARATIVE clause can be told
+#: apart from a trailing interrogative on the same turn.
+_SENTENCE_SEGMENT_RE = re.compile(r"[^.!?]+[.!?]*")
+
+
+def _answer_has_substantive_declarative(text: str) -> bool:
+    """True when the turn carries a substantive DECLARATIVE clause — a
+    non-interrogative sentence that answers with real content — as opposed to
+    being ONLY an interrogative.
+
+    REPAIR 3 (2026-09-08 review): a genuine answer that appends a short courtesy
+    / confirmation question ("I led the backend team at Acme for three years.
+    Shall I go on?", "Currently around 18 LPA. Does that work?", "My notice
+    period is 30 days. Is that okay?") was scored NONANSWER by the short-"?"
+    counter-question branch and re-asked. The discriminator is exactly the one
+    the reviewers named: is there a substantive declarative clause present, or
+    is the WHOLE utterance only an interrogative? A pure counter-question
+    ("The second round, how long does it usually take?", "You mean LPA?") has no
+    declarative clause and stays a non-answer.
+
+    Conservative by construction: a clause counts only when it does NOT end as a
+    question AND either carries a structured answer signal (digit / duration /
+    date / compensation slot) or reads as a clear multi-word substantive
+    statement that is not itself clarification-shaped. A one-or-two-word
+    fragment ("The second round") never qualifies.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return False
+    for match in _SENTENCE_SEGMENT_RE.finditer(text):
+        segment = match.group().strip()
+        if not segment or segment.endswith("?"):
+            # An interrogative (or empty) segment carries no declarative answer.
+            continue
+        clause = segment.rstrip(".!").strip()
+        if not clause:
+            continue
+        # A clause that is itself a clarification/deflection is not an answer.
+        if phone_clarification_shape(clause):
+            continue
+        # Arm 1: structured answer evidence in a declarative clause.
+        if _answer_has_substantive_signal(clause):
+            return True
+        # Arm 2: a clear multi-word substantive statement (an "actual
+        # statement", per the reviewer) — deliberately gated on length so a
+        # bare noun fragment stranded by STT can never qualify.
+        if (
+            len(clause.split()) >= 5
+            and phone_turn_substance(clause) == PHONE_SUBSTANCE_SUBSTANTIVE
+        ):
+            return True
+    return False
+
+
 PHONE_ANSWER_ANSWERED = "answered"
 PHONE_ANSWER_DECLINED = "declined"
 PHONE_ANSWER_NONANSWER = "nonanswer"
@@ -5687,7 +5741,18 @@ def phone_answer_disposition(
         # interrogative word is not leading. A genuine short answer that
         # happens to end "?" and covers the objective still ADVANCES; one that
         # does not is merely re-asked under the existing bounded caps.
-        if not phone_answer_covers_objective(question, clean):
+        #
+        # REPAIR 3 (2026-09-08 review): a substantive answer that merely APPENDS
+        # a short courtesy/confirmation question ("…for three years. Shall I go
+        # on?", "Currently around 18 LPA. Does that work?") carries a real
+        # DECLARATIVE answer clause — it is not a counter-question and must not
+        # be re-asked. Only reject as a counter-question when the whole turn is
+        # interrogative (no substantive declarative clause) AND it does not
+        # cover the owed objective. A pure counter-question ("The second round,
+        # how long does it take?") has no declarative clause and still re-asks.
+        if not _answer_has_substantive_declarative(clean) and not (
+            phone_answer_covers_objective(question, clean)
+        ):
             return PHONE_ANSWER_NONANSWER
 
     # (3) An explicit decline is a terminal answer for this question: advance —
@@ -5895,12 +5960,18 @@ def phone_answer_gate_max_reasks() -> int:
     """How many times the answer gate re-asks a non-answered question before it
     gives up and advances (recording the question unanswered). Bounded so a
     persistently-evasive candidate can never wedge the plan in a re-ask loop.
-    Default 1 (PR1a, 2026-09-08): a single warm re-ask, then advance — two
-    re-asks on the same owed question read on a live call as nagging and cost a
-    full extra turn each time. Clamped to [0, 5]; `PHONE_ANSWER_GATE_MAX_REASKS`
-    overrides (env-revertible to the old 2).
+    Default 2; clamped to [0, 5]. `PHONE_ANSWER_GATE_MAX_REASKS` overrides.
+
+    RESTORED to 2 (2026-09-08 review repair): the PR1a lowering to 1 collided
+    with the background-commit fence in ``agent.py`` — that fence gates the
+    concurrent boundary commit on ``answer_reask_counts.get(key) <
+    phone_answer_gate_max_reasks()``. At a cap of 1, the FIRST coalesced re-ask
+    already sets the counter to 1, so ``1 < 1`` is False and the background
+    boundary COMMITS while the live gate is still re-asking — the exact
+    F-Q3b double-commit / cursor-desync that fence exists to prevent. A cap of
+    2 keeps the fence's first-re-ask strictly-less-than comparison True.
     """
-    return _bounded_int_env(os.getenv("PHONE_ANSWER_GATE_MAX_REASKS"), 1, 0, 5)
+    return _bounded_int_env(os.getenv("PHONE_ANSWER_GATE_MAX_REASKS"), 2, 0, 5)
 
 
 def phone_delivery_gate_enabled() -> bool:
@@ -6017,8 +6088,12 @@ def phone_objective_guard_max_questions_for_phase(phase: Any) -> int:
 #: disjoint against either — so every new term goes into its MOST SPECIFIC
 #: EXISTING class, keeping intra-family and adjacent roles sharing a class rather
 #: than minting a new class that would manufacture fresh disjoints:
-#:   * architecture titles (software / solutions / cloud / systems architect) and
-#:     "coder" are engineering-family → the "engineering" class;
+#:   * QUALIFIED architect titles (software / solutions / cloud / systems /
+#:     enterprise / technical / data / security architect) and "coder" are
+#:     engineering-family → the "engineering" class. A BARE "architect" and the
+#:     non-engineering qualifiers ("information architect", "naval architect",
+#:     "landscape architect") deliberately stay UNCLASSIFIED so they never read
+#:     as disjoint from a design (or other) JD;
 #:   * ``reliability`` is added to engineering so a bare "reliability engineer"
 #:     lands there (SRE / site reliability engineer already matched via engineer);
 #:   * product-lead titles (product owner, scrum master; product manager already
@@ -6031,7 +6106,15 @@ _ROLE_CLASS_LEXICON: tuple[tuple[str, "re.Pattern[str]"], ...] = (
     ("engineering", re.compile(
         r"\b(?:software|developer|coder|engineer(?:ing)?|programmer|sde\d?|"
         r"full[\s-]?stack|back[\s-]?end|front[\s-]?end|devops|sre|"
-        r"reliability|architect(?:ure)?)\b",
+        r"reliability|"
+        # QUALIFIED architect only (2026-09-08 review repair): a bare
+        # ``architect(?:ure)?`` swept in non-engineering titles — "information
+        # architect", "naval architect", "landscape architect" — and produced
+        # false disjoint conflicts against design/other JDs. Require an
+        # engineering-flavoured qualifier so bare / information / naval /
+        # landscape architect stays UNCLASSIFIED (as on origin/main).
+        r"(?:software|solutions|cloud|systems|enterprise|technical|data|security)"
+        r"\s+architect)\b",
         re.IGNORECASE)),
     ("sales", re.compile(
         r"\b(?:sales|advisor|advisory|counsell\w*|counselor|"

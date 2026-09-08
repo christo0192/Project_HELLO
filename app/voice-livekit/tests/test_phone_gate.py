@@ -5060,14 +5060,13 @@ class TestPhoneAnswerDisposition(unittest.TestCase):
             self.assertEqual(phone.phone_answer_gate_max_reasks(), 5)
         with patch.dict(os.environ, {"PHONE_ANSWER_GATE_MAX_REASKS": "-3"}):
             self.assertEqual(phone.phone_answer_gate_max_reasks(), 0)
-        # B2 (PR1a, 2026-09-08): default lowered 2 -> 1. RED before the change
-        # (accessor returned 2 with the env var unset); GREEN after. The env
-        # override still resolves independently (asserted above).
+        # Default is 2 (2026-09-08 review repair: the PR1a lowering to 1 broke
+        # the agent.py background-commit fence, which gates on
+        # answer_reask_counts.get(key) < phone_answer_gate_max_reasks(); at a
+        # cap of 1 the first coalesced re-ask makes that 1 < 1 == False and the
+        # boundary double-commits. A default of 2 keeps the fence safe).
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("PHONE_ANSWER_GATE_MAX_REASKS", None)
-            self.assertEqual(phone.phone_answer_gate_max_reasks(), 1)
-        # The old default remains reachable via the documented env override.
-        with patch.dict(os.environ, {"PHONE_ANSWER_GATE_MAX_REASKS": "2"}):
             self.assertEqual(phone.phone_answer_gate_max_reasks(), 2)
 
     def test_gate_kill_switch(self):

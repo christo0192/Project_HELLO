@@ -676,6 +676,84 @@ class TestAnswerDispositionFromTheLiveCall(unittest.TestCase):
             phone.PHONE_ANSWER_ANSWERED,
         )
 
+    # ── REPAIR 3 (2026-09-08 review): a substantive answer that ENDS in a short
+    # courtesy / confirmation question is an ANSWER, not a counter-question ────
+    #
+    # Live gap: these were scored NONANSWER by the short-"?" branch (they end on
+    # a question and do not "cover the objective" by the narrow coverage rule)
+    # and re-asked. The discriminator is a substantive DECLARATIVE clause vs a
+    # whole-utterance interrogative.
+
+    #: (objective, kind, turn) — a real declarative answer + a courtesy tail.
+    SUBSTANTIVE_PLUS_TAIL = (
+        ("Tell me about your recent experience.", "open",
+         "I led the backend team at Acme for three years. Shall I go on?"),
+        (CTC_Q, "compensation",
+         "Currently around 18 LPA. Does that work?"),
+        ("What is your notice period?", "structured",
+         "My notice period is 30 days. Is that okay?"),
+        # A declarative statement with no digits still qualifies (Arm 2).
+        ("Tell me about your recent role.", "open",
+         "I led the backend team at Acme and shipped our payments platform. "
+         "Shall I go on?"),
+    )
+
+    def test_substantive_answer_with_courtesy_tail_is_answered(self):
+        for q, kind, turn in self.SUBSTANTIVE_PLUS_TAIL:
+            with self.subTest(turn):
+                self.assertEqual(
+                    phone.phone_answer_disposition(q, kind, turn),
+                    phone.PHONE_ANSWER_ANSWERED,
+                )
+
+    def test_courtesy_tail_answers_are_not_routed_as_counter_questions(self):
+        # Consistency with the live re-ask classifiers: a substantive-plus-tail
+        # turn must NOT route as a candidate_question, and the substance gate
+        # must read it substantive — so the disposition, route, and commit gate
+        # all agree it is an answer (no cursor desync).
+        for _q, _kind, turn in self.SUBSTANTIVE_PLUS_TAIL:
+            with self.subTest(turn):
+                self.assertIsNone(phone.candidate_turn_route(turn))
+                self.assertEqual(
+                    phone.phone_turn_substance(turn),
+                    phone.PHONE_SUBSTANCE_SUBSTANTIVE,
+                )
+
+    def test_pure_counter_questions_still_reask_after_the_relaxation(self):
+        # The relaxation must NOT regress the pure counter-question cases: no
+        # declarative answer clause is present, so each stays a NONANSWER.
+        pure_counter = (
+            # STT-stranded mid-sentence interrogative (F-Q3b) — one clause.
+            ("What is your notice period?", None,
+             "The second round, how long does it usually take from your side?"),
+            (self.CTC_Q, "compensation", "You mean LPA?"),
+            ("What is your notice period?", "structured",
+             "Like you're talking about the notice period?"),
+            (self.CTC_Q, "compensation", "By CTC what do you mean?"),
+            ("Tell me about your role.", "open", "Sorry?"),
+            # Leading-"If" conditional counter — unchanged.
+            (self.CTC_Q, "compensation",
+             "If I share my CTC, will you tell me the range for this role?"),
+        )
+        for q, kind, turn in pure_counter:
+            with self.subTest(turn):
+                self.assertEqual(
+                    phone.phone_answer_disposition(q, kind, turn),
+                    phone.PHONE_ANSWER_NONANSWER,
+                )
+
+    def test_substantive_declarative_predicate_red_green(self):
+        # Direct predicate coverage: a declarative clause with real content is
+        # detected; a whole-utterance interrogative is not.
+        self.assertTrue(phone._answer_has_substantive_declarative(
+            "Currently around 18 LPA. Does that work?"))
+        self.assertTrue(phone._answer_has_substantive_declarative(
+            "I led the backend team at Acme for three years. Shall I go on?"))
+        self.assertFalse(phone._answer_has_substantive_declarative(
+            "The second round, how long does it usually take from your side?"))
+        self.assertFalse(phone._answer_has_substantive_declarative("You mean LPA?"))
+        self.assertFalse(phone._answer_has_substantive_declarative(""))
+
 
 class _FakeMsg:
     """A ChatMessage-shaped item with a pydantic-style `model_copy`."""
