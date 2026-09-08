@@ -91,37 +91,68 @@ primary_region = "sin"
   # left UNSET (Sarvam default 0.45) so this A/B changes only the timing window,
   # not the speech/silence decision boundary.
   #
-  # T3 (Call D, 2026-09-08) — restored to the CONSERVATIVE Sarvam default 18/24
-  # (was 16/22). RATIONALE: with PHONE_TURN_DETECTION="stt" below, Sarvam's STT
-  # VAD frames become the SOLE turn-gate — the local Silero 0.4/0.8 endpointing
-  # is skipped entirely. The 16/22 trim was tuned assuming Silero was the PRIMARY
-  # endpointer and these frames only shaped the STT-final wait; once STT is the
-  # only gate, the tighter window raises mid-thought cut-in risk, so the
-  # conservative 18/24 default (min fill 18*32ms=576ms; max 24*32ms=768ms VAD
-  # window) is the correct pairing. ENV-REVERTIBLE post-deploy without a code
-  # change: set both back to 16/22 to A/B-isolate the frames independently.
-  PHONE_SARVAM_NEGATIVE_FRAMES_COUNT = "18"
-  PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW = "24"
+  # Call G RCA (2026-09-08) — REVERTED PHONE_TURN_DETECTION to "local" below, so
+  # these Sarvam VAD frames are NO LONGER the turn-gate: the local Silero
+  # endpointing (0.3/1.0 below) owns end-of-turn again. In local mode the frames
+  # only shape when Sarvam declares an STT final (which FEEDS the local
+  # endpointer), so they are re-tuned to the SAME 0.3s-min / ~1.0s-window intent
+  # as the local bounds: count 9 = 9*32ms ≈ 0.29s minimum silence fill; window
+  # 31 = 31*32ms ≈ 0.99s lookback (a wide non-silence tolerance so a mid-answer
+  # pause is not declared a final too early). These are DORMANT unless
+  # PHONE_TURN_DETECTION is flipped back to "stt"; kept coherent with the local
+  # bounds so an stt A/B starts from the same 0.3–1.0s envelope, not the old
+  # 18/24. ENV-REVERTIBLE without a code change.
+  PHONE_SARVAM_NEGATIVE_FRAMES_COUNT = "9"
+  PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW = "31"
   SARVAM_TTS_MODEL = "bulbul:v3"
   SARVAM_TTS_VOICE = "simran"
-  # T3/X8 (Call D, 2026-09-08) — "stt": delegate end-of-turn detection to Sarvam
-  # STT's own VAD (a final transcript on every pause), skipping the local Silero
-  # 0.4/0.8 endpointing path entirely (the code path is agent.py ~1928: only
-  # "stt" injects turn_detection="stt" into the phone AgentSession; any other
-  # value keeps "local"). This removes the local endpointing delay from the
-  # critical path. The Sarvam frames above (18/24) become the sole turn-gate in
-  # this mode, which is why they are set conservatively. ENV-REVERTIBLE post-
-  # deploy without a code change: set PHONE_TURN_DETECTION="local" to restore the
-  # Silero endpointing path, so this whole T3 latency change can be A/B-isolated
-  # live (turn-detection and frames revert independently).
-  PHONE_TURN_DETECTION = "stt"
-  # v115 latency RCA: pin the phone-local endpointing bounds explicitly in the
-  # deploy manifest (the code defaults match these). MIN is the ~0.8s median-
-  # latency floor beyond LLM+TTS; MAX bounds the wait on a mid-answer pause.
-  # Clamps: MIN in [0.3, 0.5], MAX in [0.5, 2.0]. Raise MAX (e.g. "1.25") to
-  # restore a longer slow-speaker tail without a code change.
-  PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC = "0.4"
-  PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC = "0.8"
+  # Call G RCA (2026-09-08) — REVERTED "stt" -> "local". The X8 stt experiment
+  # delegated end-of-turn to Sarvam's raw STT VAD with NO local floor, so a
+  # one-word backchannel ("Yeah", "please continue") fired a full turn-end and
+  # barged in on the bot mid-sentence, forcing regenerate storms: measured ~60s
+  # of zero outbound audio and a 3.49s median acoustic latency (vs ~1.2s on the
+  # local path). "local" restores the Silero endpointing floor (0.3/1.0 below)
+  # that debounces those backchannels. The code path is agent.py ~1928: only
+  # "stt" injects turn_detection="stt"; any other value (incl. "local") keeps the
+  # local endpointer. ENV-REVERTIBLE without a code change.
+  PHONE_TURN_DETECTION = "local"
+  # v115 latency RCA + Call G tune: pin the phone-local endpointing bounds in the
+  # deploy manifest. MIN is the silence floor after the candidate stops (drives
+  # common-case latency); MAX bounds the wait on a mid-answer pause (a longer MAX
+  # only costs latency WHEN the candidate pauses mid-thought, and buys fewer
+  # cut-offs). Call G tune: MIN 0.4->0.3 (faster commit on a clean end-of-speech)
+  # and MAX 0.8->1.0 (more tolerance for a mid-answer pause so a slow speaker is
+  # not cut off). Clamps: MIN in [0.3, 0.5], MAX in [0.5, 2.0]. Both are
+  # env-revertible live.
+  PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC = "0.3"
+  PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC = "1.0"
+  # ── Coverage JUDGE provider (Call G, 2026-09-08) ─────────────────────────────
+  # Point the off-speech-path coverage judge at DeepSeek V4-Flash with reasoning
+  # DISABLED (owner request), replacing Gemini gemini-3.5-flash-lite. The judge
+  # authors a small deterministic JSON verdict; DeepSeek V4-Flash with
+  # reasoning_effort="none" (its documented thinking-disable — see phone.py
+  # _default_phone_coverage_inference) keeps that fast and dead-air-free. SDK is
+  # the OpenAI-compat HTTP path (the native google SDK is Gemini-only). The URL
+  # is POSTed VERBATIM (no suffix appended), so it is the FULL chat/completions
+  # path. The isolated judge credential is PHONE_JUDGE_API_KEY; when unset on a
+  # DeepSeek endpoint the reader falls back to the dedicated DEEPSEEK_API_KEY
+  # secret (never the browser GEMINI key). ROLLBACK to Gemini: unset all three
+  # (PHONE_JUDGE_SDK/URL/MODEL) — the reader defaults back to the native google
+  # SDK + gemini-3.5-flash-lite.
+  #
+  # OPERATOR PREREQUISITES (these keys are read via os.getenv, so a Fly SECRET
+  # of the same name SHADOWS the value set here -- same trap as
+  # PHONE_TTS_FLUSH_MIN_CHARS below):
+  #   1. DEEPSEEK_API_KEY MUST be set as a secret on THIS app
+  #      (project-hello-phone-voice). When PHONE_JUDGE_API_KEY is UNSET the
+  #      reader falls back to DEEPSEEK_API_KEY on a DeepSeek endpoint; if NEITHER
+  #      is set the validator fails closed (missing_isolated_key -> crash-loop).
+  #   2. Ensure NO stale PHONE_JUDGE_SDK / PHONE_JUDGE_URL / PHONE_JUDGE_MODEL
+  #      secret exists (fly secrets list -a project-hello-phone-voice); a
+  #      leftover secret overrides these and the validator rejects the mismatch.
+  PHONE_JUDGE_SDK = "openai"
+  PHONE_JUDGE_URL = "https://api.deepseek.com/v1/chat/completions"
+  PHONE_JUDGE_MODEL = "deepseek-v4-flash"
   # Controller selects the objective; Gemini authors one natural bridge and
   # paraphrased question in a single phone-only generation.
   PHONE_TURN_MODE = "toolless"

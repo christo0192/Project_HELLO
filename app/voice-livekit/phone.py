@@ -4806,12 +4806,38 @@ def _phone_judge_is_sarvam(url: str) -> bool:
     ``sarvam-cache.corp.internal`` and leak the field to an untrusted endpoint.
     Any port and userinfo are stripped before matching.
     """
+    return _phone_judge_host(url) in ("sarvam.ai", "api.sarvam.ai") or _phone_judge_host(
+        url,
+    ).endswith(".sarvam.ai")
+
+
+def _phone_judge_host(url: str) -> str:
+    """Bare host of a judge URL: no scheme, userinfo, or port. Lowercased.
+
+    Shared by the Sarvam and DeepSeek host predicates so both match on the
+    registered domain exactly (never a substring), which is what stops a
+    look-alike like ``api.deepseekproxy.io`` from being treated as the provider.
+    """
     text = str(url or "").lower()
-    after_scheme = text.split("://", 1)[-1]
-    authority = after_scheme.split("/", 1)[0]
-    # Drop userinfo (user:pass@host) and any :port suffix.
-    host = authority.rsplit("@", 1)[-1].split(":", 1)[0]
-    return host == "sarvam.ai" or host == "api.sarvam.ai" or host.endswith(".sarvam.ai")
+    authority = text.split("://", 1)[-1].split("/", 1)[0]
+    return authority.rsplit("@", 1)[-1].split(":", 1)[0]
+
+
+def _phone_judge_is_deepseek(url: str) -> bool:
+    """True when the judge endpoint host is DeepSeek's official gateway.
+
+    EXACT / suffix match on the registered domain (same discipline as the
+    Sarvam predicate) so a look-alike host can never be treated as DeepSeek and
+    receive the ``reasoning_effort="none"`` thinking-disable or the DEEPSEEK_API_KEY
+    fallback. Any port and userinfo are stripped before matching.
+    """
+    host = _phone_judge_host(url)
+    return host in ("deepseek.com", "api.deepseek.com") or host.endswith(".deepseek.com")
+
+
+def _phone_model_is_deepseek(model: str | None) -> bool:
+    """True when the judge model name denotes a DeepSeek model (``deepseek-*``)."""
+    return str(model or "").strip().lower().startswith("deepseek")
 
 
 def phone_judge_url() -> str:
@@ -4937,8 +4963,23 @@ def phone_judge_model() -> str:
 
 
 def phone_judge_api_key() -> str:
-    """Dedicated judge credential; never falls back to the interviewer key."""
-    return os.getenv("PHONE_JUDGE_API_KEY", "")
+    """Dedicated judge credential; never falls back to the INTERVIEWER key.
+
+    An explicit ``PHONE_JUDGE_API_KEY`` always wins. When it is unset AND the
+    judge is pointed at the DeepSeek endpoint (OpenAI-compat SDK + a DeepSeek
+    URL), fall back to the dedicated ``DEEPSEEK_API_KEY`` secret — a
+    DeepSeek-only credential that is NEITHER the phone interviewer key
+    (``PHONE_LLM_API_KEY``) NOR the browser ``GEMINI_API_KEY`` (which stays
+    exclusive to the sha-pinned WebRTC lane). This lets an operator move the
+    judge to DeepSeek by config alone without minting a second identical secret,
+    while preserving the trust boundary the isolated-key guard exists for.
+    """
+    explicit = os.getenv("PHONE_JUDGE_API_KEY", "")
+    if explicit.strip():
+        return explicit
+    if phone_judge_sdk() == "openai" and _phone_judge_is_deepseek(phone_judge_url()):
+        return os.getenv("DEEPSEEK_API_KEY", "")
+    return explicit
 
 
 @dataclass(frozen=True)
@@ -4973,14 +5014,18 @@ def phone_judge_runtime_config() -> PhoneJudgeRuntimeConfig:
     # the strict URL allowlist. Every OTHER guard (isolated key, model, timeout,
     # retries) applies to BOTH paths so the trust/latency contract is unchanged.
     native_google = sdk == "google"
+    # DeepSeek judge (Call G, 2026-09-08): a SECOND allowlisted OpenAI-compat
+    # provider. Recognised only on the OpenAI-compat path AND by exact host, so
+    # the Google rollback URL and any look-alike host are unaffected.
+    is_deepseek = (not native_google) and _phone_judge_is_deepseek(url)
     if native_google:
         endpoint_host = "native_google_sdk"
+    elif is_deepseek:
+        endpoint_host = "api.deepseek.com"
+    elif url == PHONE_JUDGE_GOOGLE_URL:
+        endpoint_host = "generativelanguage.googleapis.com"
     else:
-        endpoint_host = (
-            "generativelanguage.googleapis.com"
-            if url == PHONE_JUDGE_GOOGLE_URL
-            else "invalid"
-        )
+        endpoint_host = "invalid"
     error: str | None = None
     # ── T1② JUDGE-TIMEOUT INVESTIGATION (Call D, 2026-09-08) — DEFERRED ───────
     # Symptom: the judge times out ~1/call (its verdict returns category
@@ -5008,11 +5053,19 @@ def phone_judge_runtime_config() -> PhoneJudgeRuntimeConfig:
     # genuinely too tight for gemini-3.5-flash-lite off the speech path, or is
     # the tail a breaker-cooldown artifact?) and then move the budget + this
     # ceiling TOGETHER, with a test, in a dedicated change — not opportunistically.
+    # Endpoint allowlist (OpenAI-compat path only): the Google rollback URL or
+    # the DeepSeek gateway. Model allowlist is keyed to the provider so a model
+    # and its endpoint can never be mismatched — a DeepSeek model on the Google
+    # URL, or a Gemini model on the DeepSeek URL, is rejected as before.
+    endpoint_ok = native_google or is_deepseek or url == PHONE_JUDGE_GOOGLE_URL
+    model_ok = (
+        _phone_model_is_deepseek(model) if is_deepseek else model == PHONE_JUDGE_GEMINI_MODEL
+    )
     if not phone_judge_api_key().strip():
         error = "missing_isolated_key"
-    elif not native_google and url != PHONE_JUDGE_GOOGLE_URL:
+    elif not endpoint_ok:
         error = "invalid_endpoint"
-    elif model != PHONE_JUDGE_GEMINI_MODEL:
+    elif not model_ok:
         error = "invalid_model"
     elif timeout_sec > 2.0:
         error = "timeout_exceeds_budget"
@@ -7722,9 +7775,19 @@ async def _default_phone_coverage_inference(prompt: str) -> Any:
     # rollback default keeps its tested "minimal" body untouched. A None value
     # sends reasoning_effort=null (disable). The robustness retry below still
     # protects any endpoint that rejects the field with a 400.
-    force_effort = _phone_judge_is_sarvam(url)
-    if force_effort:
+    if _phone_judge_is_sarvam(url):
         json_body["reasoning_effort"] = phone_judge_reasoning_effort()
+    elif _phone_judge_is_deepseek(url):
+        # DeepSeek V4-Flash (Call G judge swap) defaults to THINKING; a
+        # null/omitted/"minimal" reasoning_effort leaves thinking ON, which
+        # streams the whole verdict into `reasoning_content` and returns an
+        # EMPTY `content` — parsed as judge_error on every turn. DeepSeek's
+        # documented thinking-disable is the literal string "none". Applied
+        # AFTER the extra-body overlay so it is authoritative for a DeepSeek
+        # host, and ONLY for a DeepSeek host (the Gemini rollback keeps its
+        # tested "minimal" body). The 4xx retry below still strips the field if
+        # a future endpoint rejects it.
+        json_body["reasoning_effort"] = "none"
     json_body["model"] = model
     json_body["messages"] = messages
     headers = {

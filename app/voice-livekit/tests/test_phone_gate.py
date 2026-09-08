@@ -615,10 +615,122 @@ class TestWorkerOptions(unittest.TestCase):
         self.assertIn("duration_sec", rendered)
         self.assertNotIn("judge-test-key", rendered)
 
+    def test_named_worker_accepts_deepseek_judge(self):
+        # Call G judge swap: DeepSeek V4-Flash on the OpenAI-compat path must
+        # boot the worker (no #228 crash-loop) and log the truthful schema label.
+        with patch.object(agent_mod, "_log") as log:
+            self._build(
+                "phone-screener",
+                PHONE_JUDGE_URL="https://api.deepseek.com/v1/chat/completions",
+                PHONE_JUDGE_MODEL="deepseek-v4-flash",
+            )
+        rendered = repr(log.method_calls)
+        self.assertIn("deepseek_judge", rendered)
+        self.assertIn("valid_r0", rendered)
+        self.assertNotIn("judge-test-key", rendered)
+
     def test_blank_agent_name_stays_unnamed(self):
         for value in ("", "   "):
             with self.subTest(value=value):
                 self.assertNotIn("agent_name", self._build(value))
+
+
+class TestDeepSeekJudgeConfig(unittest.TestCase):
+    """Call G (2026-09-08): the coverage judge may run on DeepSeek V4-Flash via
+    the OpenAI-compat path, replacing Gemini. The startup validator must ACCEPT
+    that provider (no #228 crash-loop) while still rejecting a provider/model or
+    provider/endpoint MISMATCH and any look-alike host, and the judge credential
+    must fall back to the dedicated DEEPSEEK_API_KEY (never the interviewer or
+    browser key) only on a real DeepSeek endpoint."""
+
+    DEEPSEEK_URL = "https://api.deepseek.com/v1/chat/completions"
+
+    def _config(self, **overrides):
+        env = {
+            "PHONE_JUDGE_SDK": "openai",
+            "PHONE_JUDGE_URL": self.DEEPSEEK_URL,
+            "PHONE_JUDGE_MODEL": "deepseek-v4-flash",
+            "PHONE_JUDGE_API_KEY": "judge-deepseek-key",
+            "PHONE_COVERAGE_TIMEOUT_SEC": "2",
+            "PHONE_JUDGE_RETRIES": "0",
+        }
+        env.update(overrides)
+        drop = [k for k, v in env.items() if v is None]
+        env = {k: v for k, v in env.items() if v is not None}
+        with patch.dict(phone.os.environ, env, clear=False):
+            for k in drop:
+                phone.os.environ.pop(k, None)
+            return phone.phone_judge_runtime_config()
+
+    def test_deepseek_judge_config_is_accepted(self):
+        cfg = self._config()
+        self.assertTrue(cfg.ok, cfg.error)
+        self.assertIsNone(cfg.error)
+        self.assertEqual(cfg.endpoint_host, "api.deepseek.com")
+        self.assertEqual(cfg.model, "deepseek-v4-flash")
+
+    def test_gemini_model_on_deepseek_url_is_invalid_model(self):
+        cfg = self._config(PHONE_JUDGE_MODEL=phone.PHONE_JUDGE_GEMINI_MODEL)
+        self.assertFalse(cfg.ok)
+        self.assertEqual(cfg.error, "invalid_model")
+
+    def test_deepseek_model_on_google_url_is_invalid_model(self):
+        # A DeepSeek model is valid ONLY on a DeepSeek endpoint; on the Google
+        # rollback URL it must still be rejected (endpoint/model coupling), which
+        # is exactly the stale-override guard the existing worker tests assert.
+        cfg = self._config(PHONE_JUDGE_URL=phone.PHONE_JUDGE_GOOGLE_URL)
+        self.assertFalse(cfg.ok)
+        self.assertEqual(cfg.error, "invalid_model")
+
+    def test_deepseek_lookalike_host_is_invalid_endpoint(self):
+        cfg = self._config(
+            PHONE_JUDGE_URL="https://api.deepseekproxy.io/v1/chat/completions",
+        )
+        self.assertFalse(cfg.ok)
+        self.assertEqual(cfg.error, "invalid_endpoint")
+
+    def test_deepseek_host_predicate_is_exact(self):
+        self.assertTrue(phone._phone_judge_is_deepseek(self.DEEPSEEK_URL))
+        self.assertTrue(
+            phone._phone_judge_is_deepseek("https://api.deepseek.com/chat/completions"),
+        )
+        self.assertFalse(phone._phone_judge_is_deepseek("https://api.deepseekproxy.io/v1"))
+        self.assertFalse(phone._phone_judge_is_deepseek("https://deepseek.com.evil.io/v1"))
+        self.assertFalse(phone._phone_judge_is_deepseek(phone.PHONE_JUDGE_GOOGLE_URL))
+
+    def test_judge_key_falls_back_to_deepseek_key_on_deepseek_endpoint(self):
+        env = {
+            "PHONE_JUDGE_SDK": "openai",
+            "PHONE_JUDGE_URL": self.DEEPSEEK_URL,
+            "PHONE_JUDGE_API_KEY": "",
+            "DEEPSEEK_API_KEY": "dedicated-deepseek-key",
+            "PHONE_LLM_API_KEY": "interviewer-key-must-not-leak",
+            "GEMINI_API_KEY": "browser-key-must-not-leak",
+        }
+        with patch.dict(phone.os.environ, env, clear=False):
+            self.assertEqual(phone.phone_judge_api_key(), "dedicated-deepseek-key")
+
+    def test_explicit_judge_key_wins_over_deepseek_fallback(self):
+        env = {
+            "PHONE_JUDGE_SDK": "openai",
+            "PHONE_JUDGE_URL": self.DEEPSEEK_URL,
+            "PHONE_JUDGE_API_KEY": "explicit-judge-key",
+            "DEEPSEEK_API_KEY": "dedicated-deepseek-key",
+        }
+        with patch.dict(phone.os.environ, env, clear=False):
+            self.assertEqual(phone.phone_judge_api_key(), "explicit-judge-key")
+
+    def test_no_deepseek_fallback_on_google_judge(self):
+        # On the Gemini/Google judge an empty PHONE_JUDGE_API_KEY stays empty —
+        # it must never inherit DEEPSEEK_API_KEY or any other credential.
+        env = {
+            "PHONE_JUDGE_SDK": "openai",
+            "PHONE_JUDGE_URL": phone.PHONE_JUDGE_GOOGLE_URL,
+            "PHONE_JUDGE_API_KEY": "",
+            "DEEPSEEK_API_KEY": "dedicated-deepseek-key",
+        }
+        with patch.dict(phone.os.environ, env, clear=False):
+            self.assertEqual(phone.phone_judge_api_key(), "")
 
 
 class TestBrowserWorkerNaming(unittest.TestCase):
@@ -7776,6 +7888,33 @@ class TestPhoneCoverageJudgeCore(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(verdict.covered)
         self.assertEqual(verdict.category, "deterministic_covered")
         infer.assert_not_awaited()
+
+    async def test_deepseek_judge_sends_reasoning_none(self):
+        # Call G judge swap: on a DeepSeek endpoint the body must carry
+        # reasoning_effort="none" (DeepSeek's documented thinking-disable), NOT
+        # the Gemini "minimal" — else the verdict streams into reasoning_content
+        # and `content` is empty (judge_error every turn).
+        response = types.SimpleNamespace(json=lambda: {
+            "choices": [{"message": {"content": '{"covered":true,"conflict":null}'}}],
+        })
+        with patch.dict(phone.os.environ, {
+            "PHONE_JUDGE_SDK": "openai",
+            "PHONE_JUDGE_API_KEY": "x" * 40,
+            "PHONE_JUDGE_URL": "https://api.deepseek.com/v1/chat/completions",
+            "PHONE_JUDGE_MODEL": "deepseek-v4-flash",
+        }), patch.object(
+            phone, "_phone_coverage_transport", return_value=object(),
+        ), patch.object(
+            phone, "call_with_breaker", new_callable=AsyncMock, return_value=response,
+        ) as call:
+            raw = await phone._default_phone_coverage_inference("{}")
+        self.assertEqual(raw, '{"covered":true,"conflict":null}')
+        self.assertEqual(call.await_args.args[:2], (
+            "POST", "https://api.deepseek.com/v1/chat/completions",
+        ))
+        body = call.await_args.kwargs["json_body"]
+        self.assertEqual(body["model"], "deepseek-v4-flash")
+        self.assertEqual(body["reasoning_effort"], "none")
 
     async def test_default_inference_does_not_inherit_the_speaker_endpoint(self):
         response = types.SimpleNamespace(json=lambda: {

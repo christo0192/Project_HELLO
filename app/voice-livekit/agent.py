@@ -1336,6 +1336,8 @@ def build_worker_options() -> WorkerOptions:
                     "google_judge"
                     if judge_config.endpoint_host
                     in ("generativelanguage.googleapis.com", "native_google_sdk")
+                    else "deepseek_judge"
+                    if judge_config.endpoint_host == "api.deepseek.com"
                     else "invalid_judge"
                 ),
                 model=judge_config.model,
