@@ -41,9 +41,11 @@
 #                           machine, so a stale historical log cannot satisfy the
 #                           proof (identical semantics to the always-on job).
 #   FLY_API_TOKEN required  app-scoped deploy token (consumed by flyctl only)
-#   READY_ATTEMPTS optional registration-poll attempts       (default 24)
-#   START_ATTEMPTS optional machine-start-state poll attempts (default 60)
-#   SLEEP_SECONDS  optional per-poll sleep                    (default 5; 0 in tests)
+#   READY_ATTEMPTS  optional registration-poll attempts       (default 24)
+#   START_ATTEMPTS  optional machine-start-state poll attempts (default 60)
+#   STOP_ATTEMPTS   optional machine-stop-state poll attempts  (default 12)
+#   PREPROOF_ATTEMPTS optional start+register retry rounds     (default 3)
+#   SLEEP_SECONDS   optional per-poll sleep                    (default 5; 0 in tests)
 #
 # Idempotent / resumable: safe to re-run. It starts at most one machine, and its
 # cleanup stops only a machine THIS run started, so an interrupted+retried deploy
@@ -58,6 +60,13 @@ START_ATTEMPTS="${START_ATTEMPTS:-60}"
 # than START_ATTEMPTS because falling through is already safe (the guarded start
 # + started-state poll are the real gate), and this caps the worst-case red time.
 STOP_ATTEMPTS="${STOP_ATTEMPTS:-12}"
+# Start+register retry rounds. RCA 2026-09-08: an intermittent reconciler
+# occasionally SIGINTs a freshly-started pool machine ~12s into its cold boot —
+# before it registers — and the machine then goes back down. A clean boot
+# registers deterministically (~27s), so the reap is TRANSIENT: retrying the
+# whole start lets a later boot survive to register. A genuinely broken image
+# still fails closed after all rounds are exhausted.
+PREPROOF_ATTEMPTS="${PREPROOF_ATTEMPTS:-3}"
 SLEEP_SECONDS="${SLEEP_SECONDS:-5}"
 
 if [ -z "${WATERMARK:-}" ]; then
@@ -91,7 +100,10 @@ verify_current_registration() {
   local phase="$1"
   local ts
   for _ in $(seq 1 "$READY_ATTEMPTS"); do
-    ts="$(flyctl logs -a "$APP" --no-tail 2>/dev/null \
+    # `timeout` bounds a hung logs transport: this poll runs up to
+    # READY_ATTEMPTS times per round and PREPROOF_ATTEMPTS rounds per phase, so an
+    # un-bounded stall here would be amplified into a many-minute silent hang.
+    ts="$(timeout 60 flyctl logs -a "$APP" --no-tail 2>/dev/null \
           | grep 'registered worker' \
           | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}' \
           | sort | tail -1 || true)"
@@ -103,14 +115,52 @@ verify_current_registration() {
   done
   # One unsuppressed logs attempt so a logs-transport/token failure is
   # distinguishable from a genuinely unregistered worker (M-1 misattribution).
-  flyctl logs -a "$APP" --no-tail || true
+  timeout 60 flyctl logs -a "$APP" --no-tail || true
+  return 1
+}
+
+# ── start $STARTED_MACHINE and prove it registers, tolerating a transient reap ──
+# Starts the pool machine THIS run controls, waits for it to reach 'started', then
+# runs verify_current_registration against the current WATERMARK. If the boot is
+# reaped before it registers (see PREPROOF_ATTEMPTS rationale above) the machine
+# falls back to stopped, so we simply restart it and try again. Returns 0 once a
+# boot survives to register, 1 if every round is exhausted (genuine failure —
+# fails the deploy closed). Requires STARTED_MACHINE to be non-empty and WATERMARK
+# to be set by the caller BEFORE the first start (so a registration can only be
+# accepted if it is at/after that watermark).
+start_and_prove() {
+  local phase="$1"
+  local attempt started _ state
+  for attempt in $(seq 1 "$PREPROOF_ATTEMPTS"); do
+    echo "starting pool machine $STARTED_MACHINE on $APP ($phase attempt $attempt/$PREPROOF_ATTEMPTS)"
+    # Guarded: a machine still 'started' from a prior round (or mid-reap) makes
+    # start a no-op/soft-error; the started-state poll below is the real gate.
+    flyctl machine start "$STARTED_MACHINE" -a "$APP" || true
+    started=false
+    for _ in $(seq 1 "$START_ATTEMPTS"); do
+      state="$(flyctl machine list -a "$APP" --json 2>/dev/null \
+        | jq -r --arg id "$STARTED_MACHINE" '.[] | select(.id==$id) | .state' | tail -1 || true)"
+      if [ "$state" = "started" ]; then started=true; break; fi
+      sleep "$SLEEP_SECONDS"
+    done
+    if [ "$started" != true ]; then
+      echo "::warning::machine $STARTED_MACHINE on $APP did not reach 'started' ($phase attempt $attempt/$PREPROOF_ATTEMPTS)"
+      continue
+    fi
+    if verify_current_registration "$phase"; then
+      return 0
+    fi
+    echo "::warning::$phase proof: no 'registered worker' at/after watermark $WATERMARK on $APP ($phase attempt $attempt/$PREPROOF_ATTEMPTS) - likely a transient mid-boot reap; retrying"
+  done
   return 1
 }
 
 echo "orchestration ON for $APP: start -> verify registration -> deploy -> verify -> stop"
 flyctl status -a "$APP"
 
-# ── 1. pick a STOPPED pool machine and start it ───────────────────────────────
+# ── 1. pick (claim) a STOPPED pool machine ────────────────────────────────────
+# The actual start + registration proof (with reap-retry) happens in step 2 via
+# start_and_prove; here we only choose which machine this run will control.
 # Parse machine state from `--json` (named fields), NOT the human table. RCA
 # 2026-09-06: `flyctl machine list` renders a box-drawing bordered table, so
 # `awk '$NF=="stopped"'` read the SIZE column ("performance-1x:2048MB"), matched
@@ -122,21 +172,11 @@ machine_id="$(flyctl machine list -a "$APP" --json 2>/dev/null \
   | jq -r 'map(select(.state=="stopped")) | .[0].id // empty' || true)"
 
 if [ -n "$machine_id" ]; then
-  echo "starting pool machine $machine_id on $APP"
-  flyctl machine start "$machine_id" -a "$APP"
+  # Claim this stopped pool machine. start_and_prove (step 2) does the actual
+  # start and, if a transient reap kills the boot before it registers, restarts
+  # and retries. Setting STARTED_MACHINE here also arms the cleanup trap, which
+  # stops ONLY this machine — never a pre-existing one.
   STARTED_MACHINE="$machine_id"
-  # Wait for the machine to reach a started state before expecting registration.
-  started=false
-  for _ in $(seq 1 "$START_ATTEMPTS"); do
-    state="$(flyctl machine list -a "$APP" --json 2>/dev/null \
-      | jq -r --arg id "$machine_id" '.[] | select(.id==$id) | .state' | tail -1 || true)"
-    if [ "$state" = "started" ]; then started=true; break; fi
-    sleep "$SLEEP_SECONDS"
-  done
-  if [ "$started" != true ]; then
-    echo "::error::machine $machine_id on $APP did not reach 'started' state"
-    exit 1
-  fi
 else
   # Fail closed (RCA robustness): when orchestration is ON the steady state is
   # scaled-to-zero, so "no stopped machine" almost always means the pool is
@@ -169,8 +209,8 @@ fi
 # without weakening the new-image gate. Phone is unaffected — it always starts a
 # stopped pool machine, so STARTED_MACHINE is set and the pre-proof runs.
 if [ -n "$STARTED_MACHINE" ]; then
-  if ! verify_current_registration pre-deploy; then
-    echo "::error::no current 'registered worker' log at/after watermark $WATERMARK on $APP (pre-deploy start did not register)"
+  if ! start_and_prove pre-deploy; then
+    echo "::error::no current 'registered worker' log at/after watermark $WATERMARK on $APP (pre-deploy start did not register after $PREPROOF_ATTEMPTS attempts)"
     exit 1
   fi
 else
@@ -196,13 +236,15 @@ flyctl deploy --remote-only --config "$FLY_CONFIG"
 # on the new image); only the PROOF failed — turning every on-demand voice deploy
 # red while the code was actually live.
 #
-# Fix: after the rollout completes, force ONE churn-free boot of the pool machine
-# THIS run controls — stop it, wait for STOPPED, capture the watermark, start it,
-# wait for STARTED — then run the SAME watermarked registration proof. A machine
-# booted cleanly OUTSIDE the rollout registers deterministically in ~27s (well
-# inside the 120s poll), so a healthy new image passes and a broken one still
-# fails closed. When this run only RELIED on an already-started machine (no pool
-# machine it controls), fall back to the original watermark-then-poll proof.
+# Fix: after the rollout completes, force a churn-free boot of the pool machine
+# THIS run controls — stop it, wait for STOPPED, capture the watermark — then
+# start_and_prove starts it and runs the SAME watermarked registration proof,
+# retrying the start if a transient reap kills the boot before it registers. A
+# machine booted cleanly OUTSIDE the rollout registers deterministically in ~27s
+# (well inside the 120s poll), so a healthy new image passes and a broken one
+# still fails closed after all rounds. When this run only RELIED on an
+# already-started machine (no pool machine it controls), fall back to the
+# original watermark-then-poll proof.
 if [ -n "$STARTED_MACHINE" ]; then
   # Settle to a known STOPPED state so the next start is a clean boot on the new
   # image, not a restart that lands mid-rollout-churn. Best-effort: a machine the
@@ -215,26 +257,11 @@ if [ -n "$STARTED_MACHINE" ]; then
     sleep "$SLEEP_SECONDS"
   done
   # Watermark AFTER settling and BEFORE the clean start, so the registration we
-  # accept can only come from this fresh NEW-image boot — never the pre-deploy
+  # accept can only come from a fresh NEW-image boot — never the pre-deploy
   # (old-image) registration this same machine logged in step 2.
   WATERMARK="$(date -u +%Y-%m-%dT%H:%M:%S)"
-  echo "starting pool machine $STARTED_MACHINE for a churn-free post-deploy proof on $APP"
-  # Tolerate an "already started" race (the settle-stop may not have fully landed):
-  # the state poll below is the real gate, and cleanup stops this machine regardless.
-  flyctl machine start "$STARTED_MACHINE" -a "$APP" || true
-  post_started=false
-  for _ in $(seq 1 "$START_ATTEMPTS"); do
-    state="$(flyctl machine list -a "$APP" --json 2>/dev/null \
-      | jq -r --arg id "$STARTED_MACHINE" '.[] | select(.id==$id) | .state' | tail -1 || true)"
-    if [ "$state" = "started" ]; then post_started=true; break; fi
-    sleep "$SLEEP_SECONDS"
-  done
-  if [ "$post_started" != true ]; then
-    echo "::error::machine $STARTED_MACHINE on $APP did not reach 'started' for the post-deploy proof"
-    exit 1
-  fi
-  if ! verify_current_registration post-deploy; then
-    echo "::error::no current 'registered worker' log at/after watermark $WATERMARK on $APP (deployed image did not register)"
+  if ! start_and_prove post-deploy; then
+    echo "::error::no current 'registered worker' log at/after watermark $WATERMARK on $APP (deployed image did not register after $PREPROOF_ATTEMPTS attempts)"
     exit 1
   fi
 else
