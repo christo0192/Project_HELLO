@@ -1746,19 +1746,44 @@ class TestPhoneParity2Gate(unittest.IsolatedAsyncioTestCase):
         )
 
     def test_opening_verification_predicate(self):
-        # record + question shape → verified.
+        # record + ENDS on a consent question → verified (various phrasings).
         self.assertTrue(phone._opening_is_verified(
             "This call is recorded. Is it okay to continue?"
         ))
         self.assertTrue(phone._opening_is_verified(
-            "We record this call so the team can review; okay to continue"
+            "Hi, I'm Christy. This call is recorded so the team can review it. "
+            "Okay to go ahead?"
+        ))
+        self.assertTrue(phone._opening_is_verified(
+            "This call is recorded so the team can review it. Shall we proceed?"
         ))
         # missing 'record' → not verified.
         self.assertFalse(phone._opening_is_verified("Is it okay to continue?"))
-        # missing question shape → not verified.
+        # discloses but never ASKS (no trailing question) → not verified.
         self.assertFalse(phone._opening_is_verified("This call is recorded."))
+        # RCA 2026-09-09: statement-shaped "okay to continue" with NO trailing
+        # '?' is not a clear ask → fall back to the fixed disclosure.
+        self.assertFalse(phone._opening_is_verified(
+            "We record this call so the team can review; okay to continue"
+        ))
         self.assertFalse(phone._opening_is_verified(""))
         self.assertFalse(phone._opening_is_verified(None))
+        # RCA 2026-09-09 — the live defect: an opening that ENDS on an IDENTITY
+        # question (or a compound final question pairing consent + identity) is
+        # NOT verified, so the gate falls back to the canned line that ends on the
+        # consent ask. The candidate must never be left answering identity when the
+        # classifier is scoring for recording consent.
+        self.assertFalse(phone._opening_is_verified(
+            "Hi, this is Christy. This call is recorded so the team can review it. "
+            "Am I speaking with Christo?"
+        ))
+        self.assertFalse(phone._opening_is_verified(
+            "This call is recorded so the team can review it. Is this Christo?"
+        ))
+        self.assertFalse(phone._opening_is_verified(
+            "This call is recorded. Is it okay to continue, and am I speaking "
+            "with Christo?"
+        ))
 
     # ── post-consent role opening (CHANGE 2: bridge removed) ─────────────
 
@@ -2141,6 +2166,47 @@ class TestAnswerClassifier(unittest.TestCase):
                 return None
 
             return await agent_mod._classify_phone_answer(turns, say)
+
+        self.assertEqual(_run(_test()), phone.CLASSIFY_HUMAN)
+
+    def test_each_answer_attempt_is_bounded_and_fails_closed_on_silence(self):
+        # RCA 2026-09-09: each answer now has its OWN bounded wait. A silent line
+        # (queue never populated) must time out per attempt, re-ask once, then
+        # fail closed to MACHINE — not block forever. Pre-fix (`await turns.get()`
+        # unbounded) this test would HANG, so it is a genuine red/green guard.
+        async def _test():
+            turns: asyncio.Queue = asyncio.Queue()  # never populated
+            spoken: list[str] = []
+
+            async def say(text):
+                spoken.append(text)
+
+            decision = await agent_mod._classify_phone_answer(
+                turns, say, answer_timeout_sec=0.05
+            )
+            return decision, spoken
+
+        decision, spoken = _run(_test())
+        self.assertEqual(decision, phone.CLASSIFY_MACHINE)
+        # exactly one re-ask between the two independently-bounded attempts
+        self.assertEqual(spoken, [phone.PHONE_REASK_TEXT])
+
+    def test_reask_second_answer_gets_its_own_window(self):
+        # The affirmative arrives only AFTER the re-ask, partway into the second
+        # attempt's own window — it must still be captured (the live bug was the
+        # re-ask racing the leftovers of one shared budget and timing out).
+        async def _test():
+            turns: asyncio.Queue = asyncio.Queue()
+            turns.put_nowait("Sorry, what?")  # attempt 1: unreadable, immediate
+
+            async def say(text):
+                # The re-ask is spoken here; the candidate answers a beat later.
+                await asyncio.sleep(0.05)
+                turns.put_nowait("Yes, go ahead.")
+
+            return await agent_mod._classify_phone_answer(
+                turns, say, answer_timeout_sec=0.3
+            )
 
         self.assertEqual(_run(_test()), phone.CLASSIFY_HUMAN)
 

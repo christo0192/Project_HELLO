@@ -779,8 +779,26 @@ def phone_participant_wait_sec() -> float:
 
 
 def phone_classify_timeout_sec() -> float:
-    """Bounded wall clock for the human/machine decision."""
-    return _bounded_float(os.getenv("PHONE_CLASSIFY_TIMEOUT_SEC"), 20.0, 1.0, 120.0)
+    """Bounded wall clock BACKSTOP for the whole human/machine decision.
+
+    Raised 20->40s (RCA 2026-09-09): the classifier re-asks once on an unreadable
+    answer, and each answer is now bounded PER-ATTEMPT by
+    ``phone_classify_answer_timeout_sec`` (default 15s x 2 attempts = ~30s). The
+    old 20s wall clock cut the WHOLE thing short, so a candidate who answered a
+    beat late — or answered the wrong (identity) question and needed the re-ask —
+    was torn down to MACHINE before they could answer. This outer bound is now
+    only a hung-classifier backstop, sized above the per-attempt budget.
+    """
+    return _bounded_float(os.getenv("PHONE_CLASSIFY_TIMEOUT_SEC"), 40.0, 1.0, 120.0)
+
+
+def phone_classify_answer_timeout_sec() -> float:
+    """Bounded wall clock for ONE consent answer (per classify attempt).
+
+    Each attempt (the first answer, and the answer after the single re-ask) gets
+    its OWN window, so a re-ask always buys the candidate a fresh chance to reply
+    instead of racing the leftovers of a single shared budget."""
+    return _bounded_float(os.getenv("PHONE_CLASSIFY_ANSWER_TIMEOUT_SEC"), 15.0, 1.0, 60.0)
 
 
 def phone_answer_timeout_sec() -> float:
@@ -4212,15 +4230,42 @@ class PhoneGateResult:
         )
 
 
-def _opening_is_verified(text: Any) -> bool:
-    """True when a generated opening actually disclosed recording AND asked.
+# The FINAL question of the gate opening MUST be the recording-consent ask, not
+# an identity ("is this Christo?") or any other question. RCA 2026-09-09: a
+# model-authored opening tacked on an UNINSTRUCTED identity question and ENDED on
+# it ("...is it okay to record and continue, and am I speaking with Christo? Is
+# this Christo?"). The candidate naturally answered the identity ("yes, this is
+# Christo"), the strict consent classifier read that as unreadable, and the gate
+# timed out to MACHINE and tore the call down. The old check accepted ANY "?"
+# ANYWHERE, so it never caught an opening that ended on the wrong question.
+_OPENING_CONSENT_CUE_RE = re.compile(
+    r"\b(?:okay|ok|alright|all right|continue|proceed|go ahead|carry on|"
+    r"get started|good to go|move (?:forward|ahead))\b",
+    re.IGNORECASE,
+)
+# Only UNAMBIGUOUS identity phrasings — never "is this"/"is that"/"are you",
+# which also occur in legitimate consent asks ("is this okay?", "are you okay to
+# continue?"). These catch a compound final question that pairs a consent cue
+# with an identity ask ("...okay to continue, and am I speaking with Christo?").
+_OPENING_IDENTITY_CUE_RE = re.compile(
+    r"\b(?:speaking (?:with|to)|am i (?:speaking|reaching)|have i reached|"
+    r"your name|the right person|reached the right)\b",
+    re.IGNORECASE,
+)
 
-    Fixed, deterministic, and NARROW. The opening must contain the word
-    ``record`` (case-insensitive — the recording disclosure) AND read as a
-    consent question (it ends in a ``?`` somewhere, or carries the fixed
-    ``okay to continue`` phrasing). Anything else falls back to the fixed
-    disclosure, because an opening that greeted warmly but never disclosed
-    recording, or never asked, is not consent-safe.
+
+def _opening_is_verified(text: Any) -> bool:
+    """True when a generated opening disclosed recording AND ENDS on the consent ask.
+
+    Fixed, deterministic, and NARROW. The opening must (1) contain the word
+    ``record`` (the recording disclosure) and (2) END on the recording-consent
+    question: the text's LAST sentence must end in ``?``, carry a consent cue
+    (continue / okay to / go ahead / …), and NOT carry an identity cue. Anything
+    else falls back to the fixed ``PHONE_DISCLOSURE_TEXT`` (which ends verbatim on
+    "Is it okay to continue?"), because an opening that never disclosed recording,
+    never asked, or ended on a NON-consent question (identity, or a second
+    question the candidate would answer instead) is not consent-safe. Biasing to
+    the fixed fallback is safe; accepting a wrong-ending opening is the live bug.
     """
     if not isinstance(text, str):
         return False
@@ -4230,7 +4275,18 @@ def _opening_is_verified(text: Any) -> bool:
     lowered = clean.lower()
     if "record" not in lowered:
         return False
-    return "?" in clean or "okay to continue" in lowered
+    # Must END on a question (ignore trailing quotes/whitespace).
+    stripped = clean.rstrip().rstrip("\"'”’").rstrip()
+    if not stripped.endswith("?"):
+        return False
+    # The FINAL sentence is the gated question — it must be the consent ask.
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", clean) if s.strip()]
+    last = sentences[-1] if sentences else clean
+    if not _OPENING_CONSENT_CUE_RE.search(last):
+        return False
+    if _OPENING_IDENTITY_CUE_RE.search(last):
+        return False
+    return True
 
 
 async def run_phone_gate(

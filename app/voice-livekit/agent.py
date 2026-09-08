@@ -1512,22 +1512,34 @@ async def _classify_phone_answer(
     *,
     attempts: int = 2,
     consumed: "list[str] | None" = None,
+    answer_timeout_sec: float | None = None,
 ) -> str:
     """Read the response to the disclosure, re-asking at most once.
 
-    Turn-bounded here; wall-clock-bounded by the gate, which runs this under a
-    hard timeout — so neither a silent line nor an endlessly chatty one can keep
-    the call in the unclassified state where recording is forbidden and the
-    conversation has not started.
+    Each answer gets its OWN bounded wait (``answer_timeout_sec``, default
+    ``phone.phone_classify_answer_timeout_sec()``): the first answer, and the
+    answer after the single re-ask, are timed INDEPENDENTLY. RCA 2026-09-09: the
+    gate previously ran this whole coroutine under ONE short wall clock, so a
+    late first answer left no time to answer the re-ask and the call was torn down
+    to MACHINE mid-re-ask. A per-attempt window means a re-ask always buys a fresh
+    chance. The gate still wraps this in a generous backstop wall clock, so a
+    truly hung line cannot wedge the unclassified state.
 
     Every utterance this consumes is appended to ``consumed`` when provided, so
     the gate can read the RAW consent reply (the last consumed text) it decided
     HUMAN on and commit it as the candidate half of the gate transcript. The
     classifier reads it; the gate records it — no text is inferred after.
     """
+    if answer_timeout_sec is None:
+        answer_timeout_sec = phone.phone_classify_answer_timeout_sec()
     responsive = 0
     for attempt in range(max(1, attempts)):
-        text = await turns.get()
+        try:
+            text = await asyncio.wait_for(turns.get(), timeout=answer_timeout_sec)
+        except asyncio.TimeoutError:
+            # No speech within THIS answer's window. Treat as unreadable for the
+            # attempt: re-ask if one remains, else fall closed to MACHINE below.
+            text = ""
         if isinstance(text, str) and text.strip():
             responsive += 1
             if consumed is not None:
@@ -7435,7 +7447,11 @@ async def _run_phone_session(
             "verbatim, word for word, somewhere in your reply: "
             f"\"{phone.PHONE_DISCLOSURE_RECORDING_SENTENCE}\" "
             "Then ask whether it is okay to continue. Keep it to two or three "
-            "short sentences and end with the consent question."
+            "short sentences. Ask EXACTLY ONE question, and it MUST be the "
+            "consent question — do NOT ask their name, do NOT ask to confirm "
+            "who you are speaking with, and do NOT ask anything else. Your reply "
+            "MUST END with the consent question (for example, \"Is it okay to "
+            "continue?\") so a simple yes or no answers it."
         )
         try:
             # The FIRST generation of a call runs against an EMPTY chat
