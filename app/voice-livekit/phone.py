@@ -5936,20 +5936,8 @@ def phone_deterministic_resume_conflict(
     if not spoken:
         return None
 
-    role: str | None = None
+    role: str | None = _resume_role_title(resume_facts)
     recent = resume_facts.get("recent_role")
-    if isinstance(recent, dict):
-        candidate = recent.get("title")
-        if isinstance(candidate, str) and candidate.strip():
-            role = candidate.strip()
-    if role is None:
-        candidate = resume_facts.get("current_role")
-        if isinstance(candidate, str) and candidate.strip():
-            role = candidate.strip()
-        elif isinstance(candidate, dict):
-            title = candidate.get("title")
-            if isinstance(title, str) and title.strip():
-                role = title.strip()
     resume_employers: list[str] = []
     if isinstance(recent, dict):
         employer = recent.get("employer")
@@ -6019,6 +6007,88 @@ def phone_deterministic_resume_conflict(
                 "spoken_claim": spoken,
             }
     return None
+
+
+def _resume_role_title(resume_facts: Any) -> str | None:
+    """The candidate's current/most-recent résumé role title, or None.
+
+    Factored out of ``phone_deterministic_resume_conflict`` so the author-time
+    detector below reads the résumé role identically (recent_role.title first,
+    then current_role as str or dict). Keeping ONE reader means the two
+    detectors can never disagree about which title the résumé asserts.
+    """
+    if not isinstance(resume_facts, dict):
+        return None
+    recent = resume_facts.get("recent_role")
+    if isinstance(recent, dict):
+        candidate = recent.get("title")
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate.strip()
+    candidate = resume_facts.get("current_role")
+    if isinstance(candidate, str) and candidate.strip():
+        return candidate.strip()
+    if isinstance(candidate, dict):
+        title = candidate.get("title")
+        if isinstance(title, str) and title.strip():
+            return title.strip()
+    return None
+
+
+def phone_authortime_resume_conflict(
+    resume_facts: Any, role_title: Any,
+) -> dict[str, str] | None:
+    """A résumé↔screened-role class mismatch known BEFORE the candidate speaks.
+
+    Call D RCA (2026-09-08): a real résumé conflict existed (a "Proprietary
+    Trader" résumé being screened for a software-engineering role), offline
+    scoring caught it (``resume_conflicts``), but the DETERMINISTIC live probe
+    never armed (``conflict_probe_scheduled=0``) because every live arm path
+    required the candidate to first SPEAK a conflicting claim
+    (``phone_deterministic_resume_conflict`` takes a spoken ``answer``) OR the
+    flaky live judge to discover it mid-call. Neither happened.
+
+    This detector needs no spoken turn and no judge: the "claim" it compares the
+    résumé against is the SCREENED ROLE (``role_title``, the server-verified JD
+    title known at session start). It reuses the SAME role-class lexicon
+    (``_role_classes``) and the SAME résumé-role reader (``_resume_role_title``)
+    as the live detector, so its class decision is byte-identical to the live
+    path — only the counter-party ("what they claim to be") differs (the JD role
+    instead of a spoken sentence).
+
+    Contract (conservative, mirrors the live detector's title-class branch):
+      * BOTH the résumé role AND the screened role must classify into the
+        lexicon, and their class sets must be DISJOINT. Either side unclassified
+        → None (never manufacture a conflict from an unknown role).
+      * Returns the SAME ``{resume_fact, spoken_claim}`` shape the live detector
+        and the async judge emit, so it flows through the unchanged conflict
+        machinery (``phone_conflict_key`` dedup, ``phone_judge_turn_instruction``
+        authoring, the bounded re-pursuit loop) with no new plumbing.
+      * ``spoken_claim`` is phrased as the ROLE BEING SCREENED FOR (not a
+        fabricated quote) so the confirm-don't-assert probe copy stays truthful:
+        the bot asks the candidate to reconcile their résumé history with the
+        role, it never claims the candidate SAID something they did not.
+
+    Returning a conflict here only ARMS a confirm-style probe; it never grades
+    or rejects. The offline assessment remains the authority on the conflict.
+    """
+    role = _resume_role_title(resume_facts)
+    if role is None:
+        return None
+    if not isinstance(role_title, str) or not role_title.strip():
+        return None
+    screened = role_title.strip()
+    resume_classes = _role_classes(role)
+    screened_classes = _role_classes(screened)
+    if not resume_classes or not screened_classes:
+        return None
+    if resume_classes & screened_classes:
+        return None
+    return {
+        "resume_fact": (f"Current or most recent resume role: {role}")[:300],
+        "spoken_claim": (
+            f"Screening for a {screened} role"
+        )[:300],
+    }
 
 
 # ── Name / identity consistency (conservative, fail-silent) ───────────────────

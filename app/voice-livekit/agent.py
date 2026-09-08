@@ -2518,6 +2518,45 @@ async def _run_native_phone_screening(
     # kill-switch-off. Not turn-stamped: it survives STT fragmentation by design.
     owed_conflict_probe: dict[str, Any] = {"value": False, "conflict": None}
 
+    # ── T1① AUTHOR-TIME CONFLICT ARMING (Call D RCA, 2026-09-08) ─────────────
+    # A résumé↔screened-role class conflict that is KNOWN before the candidate
+    # speaks (e.g. Call D's "Proprietary Trader" résumé screened for a software
+    # role) must not depend on the flaky live judge to surface it. `role_title`
+    # (the server-verified JD title) and `state.resume_facts` are BOTH known here
+    # at session start — the author-time point — so we compute the deterministic
+    # delta ONCE and PRIME the exact same `owed_conflict_probe` latch the async
+    # judge uses. The unchanged consumer at the single-final site promotes it into
+    # the FIRST authored bot turn (via `phone_judge_turn_instruction`), so a
+    # known conflict surfaces with NO judge call.
+    #
+    # This is the PRIMARY arm; the live judge and the spoken-answer deterministic
+    # detector remain as SECONDARY discovery sources (belt-and-suspenders) — they
+    # still arm anything author-time missed, and their `asked_conflicts` dedup
+    # makes a double-arm of the same key a no-op. The consumer re-checks the
+    # kill switch and dedup, so priming here is inert when the gate is off or the
+    # key was already asked; we still gate + log here for observability parity
+    # with the async `owed_conflict_probe_armed` path. Bounded: exactly one probe
+    # per distinct conflict key (existing dedup); confirm-don't-assert phrasing is
+    # carried by `phone_judge_turn_instruction` unchanged.
+    if phone.phone_conflict_gate_enabled():
+        _authortime_conflict = phone.phone_authortime_resume_conflict(
+            getattr(state, "resume_facts", None),
+            getattr(state, "role_title", None),
+        )
+        if isinstance(_authortime_conflict, dict):
+            _authortime_key = phone.phone_conflict_key(_authortime_conflict)
+            if _authortime_key not in asked_conflicts:
+                owed_conflict_probe["value"] = True
+                owed_conflict_probe["conflict"] = dict(_authortime_conflict)
+                _bump_coverage_judge_metric(
+                    call_metrics, "conflict_found_deterministic",
+                )
+                _log.info(
+                    "unknown_event",
+                    error_type="phone_coverage_conflict",
+                    error_category="authortime_conflict_probe_armed",
+                )
+
     def _record_identity_signal(mismatch: Any, disposition: str) -> None:
         """Persist a GRADED identity signal into the observability accumulator.
 
