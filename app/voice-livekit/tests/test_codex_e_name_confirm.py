@@ -123,6 +123,97 @@ class TestNameConfirmEchoRepair(unittest.TestCase):
         )
 
 
+# ── Unit 1 (Call C RCA §2, 2026-09-08): conservative context-sensitive name
+# detection. The `this is X` / `it's X` arms leaked the pronoun "his" from an
+# off-topic third-person sentence and armed a phantom name-confirm loop. ────────
+
+class TestConservativeNameDetection(unittest.TestCase):
+
+    def test_call_c_exact_phrase_never_extracts_a_name(self):
+        # THE Call C trigger: "This is his last match" → "his" on #260.
+        self.assertIsNone(
+            phone.phone_extract_introduced_name("This is his last match."),
+        )
+        # …and therefore no identity mismatch arms against the record name.
+        self.assertIsNone(
+            phone.phone_name_mismatch("This is his last match.", "Christo"),
+        )
+
+    def test_third_person_pronouns_and_noun_phrases_are_negative(self):
+        for phrase in (
+            "This is his last match.",
+            "this is her sister",
+            "this is their team",
+            "this is the coach",
+            "it's his call to make",
+            "This is John's brother.",
+            "it's their decision anyway",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(
+                    phone.phone_extract_introduced_name(phrase),
+                    phrase,
+                )
+
+    def test_real_short_name_intros_still_supported(self):
+        # Length-based rejection would drop these — it must not.
+        for phrase, expected in (
+            ("my name is Raj", "raj"),
+            ("this is Sam", "sam"),
+            ("it's Lee", "lee"),
+            ("myself Raj", "raj"),
+            ("Sam here", "sam"),
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertEqual(
+                    phone.phone_extract_introduced_name(phrase), expected,
+                )
+
+    def test_strong_arms_fire_even_when_ambiguous_leadins_disabled(self):
+        # A mid-call correction uses a STRONG arm; it is never gated, so it
+        # survives even during active Q&A (ambiguous arms disabled).
+        for phrase, expected in (
+            ("Actually, my name is Deepak", "deepak"),
+            ("myself Deepak", "deepak"),
+            ("Deepak here", "deepak"),
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertEqual(
+                    phone.phone_extract_introduced_name(
+                        phrase, allow_ambiguous_leadins=False,
+                    ),
+                    expected,
+                )
+
+    def test_ambiguous_arms_are_context_gated(self):
+        # "this is Raj" is a name in an introduction context but must not fire
+        # mid-Q&A, where "this is <x>" is overwhelmingly third-person narration.
+        self.assertEqual(
+            phone.phone_extract_introduced_name(
+                "this is Raj", allow_ambiguous_leadins=True,
+            ),
+            "raj",
+        )
+        self.assertIsNone(
+            phone.phone_extract_introduced_name(
+                "this is Raj", allow_ambiguous_leadins=False,
+            ),
+        )
+
+    def test_genuine_mismatch_intro_still_triggers(self):
+        # CONTROL (Codex §9): the pronoun filter must not merely mask the
+        # lifecycle defect — a real different-name introduction still arms a
+        # bounded confirmation, even with the ambiguous arms disabled (it rides
+        # the strong "my name is" arm).
+        mismatch = phone.phone_name_mismatch(
+            "Hi, my name is Deepak and I lead data.", "Christo",
+            allow_ambiguous_leadins=False,
+        )
+        self.assertIsInstance(mismatch, dict)
+        self.assertEqual(mismatch["spoken"], "deepak")
+        self.assertEqual(mismatch["record"], "christo")
+
+
 class TestNameConfirmReplyPredicate(unittest.TestCase):
 
     def test_affirmations_and_corrections_confirm(self):

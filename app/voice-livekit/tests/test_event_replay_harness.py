@@ -473,5 +473,146 @@ class TestConflictClarificationNeverStealsOwnership(_ReplayHarness):
                     self.assertNotIn("side project", text, schedule)
 
 
+# ── Scenario 3: the Call C T18–T28 identity-recovery replay ──────────────────
+
+
+class TestCallCIdentityRecoveryReplay(_ReplayHarness):
+    """Codex §9: replay the Call C T18–T28 shape against the real coordinator
+    with the ACTUAL watchdog recovery path and reordered/split delivery
+    callbacks — no phantom name loop, and the compensation value plus the
+    candidate's feasibility question survive.
+
+    This is the durable-outcome net for the ownership repair: it exercises the
+    watchdog interrupt + `session.say` recovery and the two delivery callbacks,
+    not isolated happy-path callbacks.
+    """
+
+    RESUME = {"name": "Christo"}
+
+    @staticmethod
+    def _state(resume_facts=None):
+        state = _default_state(questions=[
+            {"key": "k1", "text": "Tell me about your recent role.",
+             "mandatory": True, "hint": None},
+            {"key": "k2", "text": "What are your current and expected "
+             "compensation figures?", "mandatory": True, "hint": None},
+        ])
+        state.resume_facts = resume_facts or {}
+        return state
+
+    async def _coordinator(self, *, judge=False, resume_facts=None,
+                           call_metrics=None):
+        self._seq = [3]
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless", state=self._state(resume_facts),
+            coverage_judge_enabled=judge, speech_sequence=self._seq,
+            call_metrics=call_metrics,
+        )
+        hooks["assistant_delivery_complete"].set()
+        hooks["latest_assistant"][0] = _Q1
+        hooks["latest_assistant_anchor"][0] = 1
+        return agent, session, state, client, hooks
+
+    async def _deliver(self, agent, interrupted, seq):
+        value = agent._on_reply_delivered(interrupted, seq)
+        if asyncio.iscoroutine(value):
+            await value
+
+    async def test_t18_t28_no_phantom_loop_values_and_question_preserved(self):
+        with patch.object(
+            phone, "judge_phone_coverage", new_callable=AsyncMock,
+            return_value=phone.PhoneCoverageVerdict(True, None, "model"),
+        ):
+            cm = agent_mod._new_phone_call_metrics()
+            agent, session, state, client, hooks = await self._coordinator(
+                judge=True, resume_facts=self.RESUME, call_metrics=cm,
+            )
+            hooks["latest_assistant"][0] = (
+                "What are your current and expected compensation figures?"
+            )
+            # T18: the exact Call C off-topic third-person sentence. With Unit 1
+            # it must NOT arm a name-confirm (mid-call, ambiguous arms gated off;
+            # "his" is a stopword) — the pronoun no longer becomes a name.
+            ctx = await self._turn(
+                hooks,
+                "I just woke up sad because this is his last match, he's "
+                "retiring, isn't it crazy.",
+            )
+            self.assertNotIn("name on record", str(ctx.items),
+                             "T18 must NOT arm a phantom name-confirm")
+            self.assertIsNone(agent._name_confirm_delivery["key"])
+            self.assertFalse(agent._owed_name_confirm["value"])
+            # T22: a further off-topic aside also does not arm identity.
+            ctx = await self._turn(hooks, "Do you like Virat Kohli or Messi?")
+            self.assertNotIn("name on record", str(ctx.items))
+            # T24/T28: the compensation values arrive with a feasibility question
+            # in the same breath. The turn is accepted WITHOUT ever detouring
+            # into a name-confirm, and neither the values nor the question are
+            # lost to a phantom identity exchange.
+            ctx = await self._turn(
+                hooks,
+                "The current is 20 LPA and expected is 50 LPA. Do you think "
+                "that's too much for this role?",
+            )
+            self.assertNotIn("name on record", str(ctx.items),
+                             "the compensation turn must not detour to identity")
+            self.assertIsNone(agent._name_confirm_delivery["key"])
+            # THE core invariant: no identity signal was EVER armed across the
+            # entire T18–T28 replay — the phantom loop is gone at the root (Unit
+            # 1 stopped the trigger, so the ownership machinery never engages on
+            # this call at all).
+            self.assertEqual(
+                len(cm["identity_signals"]), 0,
+                "no phantom identity signal anywhere in the T18–T28 replay",
+            )
+            self.assertFalse(agent._owed_name_confirm["value"])
+            await self._close(hooks)
+
+    async def test_genuine_mismatch_recovers_through_watchdog_no_loop(self):
+        # The control: a GENUINE mismatch intro DOES arm; the rejected-generation
+        # watchdog recovery still credits the confirmation exactly once (the
+        # ownership invariant) and does not loop — under the real watchdog path.
+        cm = agent_mod._new_phone_call_metrics()
+        with patch.object(
+            phone, "judge_phone_coverage", new_callable=AsyncMock,
+            return_value=phone.PhoneCoverageVerdict(True, None, "model"),
+        ):
+            self._seq = [3]
+            agent, session, state, client, hooks = await _make_native_coordinator(
+                turn_mode="toolless", state=self._state(self.RESUME),
+                coverage_judge_enabled=True, call_metrics=cm,
+                speech_sequence=self._seq,
+            )
+            hooks["assistant_delivery_complete"].set()
+            hooks["latest_assistant"][0] = _Q1
+            hooks["latest_assistant_anchor"][0] = 1
+            # Genuine mismatch (strong arm; fires even mid-call) arms confirm.
+            ctx = await self._turn(hooks, "Actually, my name is Deepak.")
+            self.assertIn("name on record", str(ctx.items))
+            armed_seq = agent._name_confirm_delivery["sequence"]
+            self._seq[0] = armed_seq
+            hooks["reply_handle"][0] = _FakeSpeech()
+            with patch.object(
+                agent_mod, "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 0.03,
+            ):
+                await agent._on_reply_expected()
+                agent._on_generation_empty("compensation_drift")
+                for _ in range(60):
+                    await asyncio.sleep(0.01)
+            fb = agent._name_confirm_delivery["sequence"]
+            self._seq[0] = fb
+            self.assertNotEqual(armed_seq, fb)
+            # Reordered callbacks: original interrupt then fallback delivery.
+            await self._deliver(agent, True, armed_seq)
+            await self._deliver(agent, False, fb)
+            await self._turn(hooks, "Yes, Deepak is right.")
+            signals = list(cm["identity_signals"].values())
+            self.assertEqual(signals[-1]["disposition"], "confirmed")
+            self.assertFalse(agent._owed_name_confirm["value"])
+            ctx = await self._turn(hooks, "Ok cool.")
+            self.assertNotIn("name on record", str(ctx.items))
+            await self._close(hooks)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
