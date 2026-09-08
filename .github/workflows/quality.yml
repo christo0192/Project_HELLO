@@ -102,6 +102,13 @@ jobs:
       #    distinct evidence. Gate visibility is satisfied by the named suite
       #    files appearing in the test and coverage output. Rationale documented
       #    in docs/runbooks/phase6-testing-ci.md §6. ──
+      # Per-app exception scoping: the API and web dependency trees differ, so
+      # each audit reads its OWN exceptions file. A transitive dep that is a
+      # blocking advisory in one tree but absent from the other would otherwise
+      # be flagged "stale" by the audit that doesn't see it. The API uses the
+      # canonical default (.github/audit-exceptions.json); web uses an app-scoped
+      # file passed by ABSOLUTE path (the script cd's into --dir, so a relative
+      # --exceptions would resolve under app/web and 404).
       - name: Audit API dependencies
         run: bash scripts/audit-deps.sh --dir app/api
       - name: Install, lint, test, and build web
@@ -114,7 +121,7 @@ jobs:
       - name: Smoke-test CSP header
         run: node scripts/smoke-test-csp.mjs
       - name: Audit web dependencies
-        run: bash scripts/audit-deps.sh --dir app/web
+        run: bash scripts/audit-deps.sh --dir app/web --exceptions "$GITHUB_WORKSPACE/.github/audit-exceptions.web.json"
       - name: Run seeded dependency-policy test
         run: node scripts/audit-seeded-vuln.test.mjs
       # ── Phase 6 lane L4 — TST-05 offline deterministic SAST (repo-owned
