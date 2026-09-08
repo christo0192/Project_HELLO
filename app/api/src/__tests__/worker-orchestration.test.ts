@@ -49,7 +49,11 @@ function eventRecorder(): {
 }
 
 /** A fake Fly client recording calls; each verb resolvable/rejectable per test. */
-function fakeFly(overrides: Partial<Record<'startMachine' | 'stopMachine' | 'waitForState', () => Promise<unknown>>> = {}) {
+function fakeFly(
+  overrides: Partial<
+    Record<'startMachine' | 'stopMachine' | 'waitForState' | 'listMachines', () => Promise<unknown>>
+  > = {},
+) {
   const calls: string[] = [];
   return {
     calls,
@@ -66,8 +70,10 @@ function fakeFly(overrides: Partial<Record<'startMachine' | 'stopMachine' | 'wai
         calls.push(`wait:${app}:${id}:${state}`);
         return overrides.waitForState ? overrides.waitForState() : {};
       },
-      // Unused by the service; present to satisfy the type at call sites.
-      async listMachines() { return []; },
+      async listMachines(app: string) {
+        calls.push(`list:${app}`);
+        return overrides.listMachines ? overrides.listMachines() : [];
+      },
       async getMachine(_app: string, id: string) { return { id, state: 'stopped', raw: {} } as never; },
     } as never,
   };
@@ -724,6 +730,140 @@ describe('reapWorkers', () => {
     const r = await svc.reapWorkers({ app: APP });
     expect(r.stopped).toBe(0);
     expect(fly.calls).not.toContain(`stop:${APP}:${A}`);
+  });
+});
+
+describe('reapWorkers — T2③ orphan sweep (Fly-started but lease-stopped)', () => {
+  const A = 'orphan01'; // a genuine orphan: lease stopped, Fly started
+  const B = 'midstart2'; // a machine Fly reports `starting` (a concurrent claim)
+  const C = 'agree0033'; // Fly agrees it is stopped (false alarm)
+
+  it('stops a MANAGED pool machine Fly reports `started` while its lease reads stopped', async () => {
+    const fly = fakeFly({
+      // Fly reports the orphan running, plus an always-on machine NOT in the
+      // orphan-candidate list (must be untouched — it has no lease row).
+      listMachines: async () => [
+        { id: A, state: 'started', raw: {} },
+        { id: 'alwayson', state: 'started', raw: {} },
+      ],
+    });
+    const { rpc, calls } = fakeRpc({
+      // Normal sweep: nothing.
+      list_reapable_voice_workers: [{ data: [] }],
+      // Orphan candidates: the pool machine whose lease is stopped + long-idle.
+      list_orphaned_voice_worker_leases: [{ data: [{ machine_id: A }] }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({ fly: fly.client, rpc }));
+    const r = await svc.reapWorkers({ app: APP });
+    expect(r.stopped).toBe(1);
+    expect(fly.calls).toContain(`stop:${APP}:${A}`);
+    // The always-on machine is NOT a candidate (no lease row → never listed), so
+    // it is never stopped even though Fly reports it started.
+    expect(fly.calls).not.toContain(`stop:${APP}:alwayson`);
+    const resets = calls.filter((c) => c.name === 'reset_voice_worker');
+    expect(resets).toHaveLength(1);
+    expect(resets[0].args.p_machine_id).toBe(A);
+  });
+
+  it('race (a): SKIPS a candidate Fly reports `starting` (a concurrent claim mid-boot)', async () => {
+    const fly = fakeFly({
+      listMachines: async () => [{ id: B, state: 'starting', raw: {} }],
+    });
+    const { rpc } = fakeRpc({
+      list_reapable_voice_workers: [{ data: [] }],
+      list_orphaned_voice_worker_leases: [{ data: [{ machine_id: B }] }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({ fly: fly.client, rpc }));
+    const r = await svc.reapWorkers({ app: APP });
+    expect(r.stopped).toBe(0);
+    expect(fly.calls).not.toContain(`stop:${APP}:${B}`);
+  });
+
+  it('SKIPS a candidate Fly agrees is stopped (the DB was right; false alarm)', async () => {
+    const fly = fakeFly({
+      listMachines: async () => [{ id: C, state: 'stopped', raw: {} }],
+    });
+    const { rpc } = fakeRpc({
+      list_reapable_voice_workers: [{ data: [] }],
+      list_orphaned_voice_worker_leases: [{ data: [{ machine_id: C }] }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({ fly: fly.client, rpc }));
+    const r = await svc.reapWorkers({ app: APP });
+    expect(r.stopped).toBe(0);
+    expect(fly.calls).not.toContain(`stop:${APP}:${C}`);
+  });
+
+  it('SKIPS a candidate absent from the Fly list (unknown ≠ running)', async () => {
+    const fly = fakeFly({ listMachines: async () => [] }); // empty: A not present
+    const { rpc } = fakeRpc({
+      list_reapable_voice_workers: [{ data: [] }],
+      list_orphaned_voice_worker_leases: [{ data: [{ machine_id: A }] }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({ fly: fly.client, rpc }));
+    const r = await svc.reapWorkers({ app: APP });
+    expect(r.stopped).toBe(0);
+    expect(fly.calls).not.toContain(`stop:${APP}:${A}`);
+  });
+
+  it('SPARES every candidate when the Fly listMachines call THROWS (unknown ≠ dead)', async () => {
+    const fly = fakeFly({
+      listMachines: async () => { throw new FlyMachinesError('server', { operation: 'listMachines' }); },
+    });
+    const { rpc } = fakeRpc({
+      list_reapable_voice_workers: [{ data: [] }],
+      list_orphaned_voice_worker_leases: [{ data: [{ machine_id: A }] }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({ fly: fly.client, rpc }));
+    const r = await svc.reapWorkers({ app: APP });
+    expect(r.stopped).toBe(0);
+    expect(fly.calls).not.toContain(`stop:${APP}:${A}`);
+  });
+
+  it('an orphan-candidate list error does NOT lose the normal sweep result', async () => {
+    // The normal sweep stops one; the orphan candidate RPC then errors. The
+    // combined count must still reflect the normal-sweep stop.
+    const fly = fakeFly();
+    const { rpc } = fakeRpc({
+      list_reapable_voice_workers: [{
+        data: [{ machine_id: 'norm0001', claimed_session_id: null, state: 'starting' }],
+      }],
+      list_orphaned_voice_worker_leases: [{ error: { message: 'db down' } }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({
+      fly: fly.client, rpc, roomIsLive: async () => false,
+    }));
+    const r = await svc.reapWorkers({ app: APP });
+    expect(r.stopped).toBe(1); // the normal sweep's stop survived
+    expect(fly.calls).toContain(`stop:${APP}:norm0001`);
+  });
+
+  it('does not query Fly at all when there are no orphan candidates', async () => {
+    const fly = fakeFly();
+    const { rpc } = fakeRpc({
+      list_reapable_voice_workers: [{ data: [] }],
+      list_orphaned_voice_worker_leases: [{ data: [] }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({ fly: fly.client, rpc }));
+    const r = await svc.reapWorkers({ app: APP });
+    expect(r.stopped).toBe(0);
+    // No candidates ⇒ no listMachines call (the SDK stays unloaded on the hot path).
+    expect(fly.calls.some((c) => c.startsWith('list:'))).toBe(false);
+  });
+
+  it('a stop-failure on one orphan leaves its lease untouched (no reset) and does not count it', async () => {
+    const fly = fakeFly({
+      listMachines: async () => [{ id: A, state: 'started', raw: {} }],
+      stopMachine: async () => { throw new FlyMachinesError('server', { operation: 'stopMachine' }); },
+    });
+    const { rpc, calls } = fakeRpc({
+      list_reapable_voice_workers: [{ data: [] }],
+      list_orphaned_voice_worker_leases: [{ data: [{ machine_id: A }] }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({ fly: fly.client, rpc }));
+    const r = await svc.reapWorkers({ app: APP });
+    expect(r.stopped).toBe(0);
+    // No reset for a machine we could not confirm stopped.
+    expect(calls.some((c) => c.name === 'reset_voice_worker')).toBe(false);
   });
 });
 

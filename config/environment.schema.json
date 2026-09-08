@@ -56,6 +56,7 @@
         "FLY_API_TOKEN": { "requiredInProduction": false, "secret": true, "external": true },
         "FLY_API_BASE_URL": { "requiredInProduction": false, "secret": false },
         "WORKER_REAPER_GRACE_SEC": { "requiredInProduction": false, "secret": false },
+        "WORKER_ORPHAN_GRACE_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_WORKER_READY_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
         "BROWSER_AGENT_NAME": { "requiredInProduction": false, "secret": false },
         "NODE_ENV": { "requiredInProduction": true, "secret": false },

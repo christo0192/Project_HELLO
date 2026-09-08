@@ -38,6 +38,7 @@ const _contractVisibleEnvReads = [
   process.env.FLY_API_TOKEN,
   process.env.FLY_API_BASE_URL,
   process.env.WORKER_REAPER_GRACE_SEC,
+  process.env.WORKER_ORPHAN_GRACE_SEC,
   process.env.PHONE_WORKER_READY_TIMEOUT_SEC,
 ];
 void _contractVisibleEnvReads;
@@ -263,6 +264,20 @@ export const env = {
    * one grace window of possible cost leak; clamped 30..3600.
    */
   workerReaperGraceSec: positiveInt('WORKER_REAPER_GRACE_SEC', 180, 30, 3600),
+  /**
+   * T2③ ORPHAN-REAP grace (seconds). The SECOND, conservative grace window,
+   * used ONLY by the orphan sweep that stops a MANAGED pool machine which Fly
+   * reports `started` while its lease reads `stopped` (a manual start / prewarm
+   * / secret-update restart left the DB behind). It is deliberately LONGER and
+   * has a HIGHER floor than `workerReaperGraceSec`: an orphan is stopped without
+   * a per-session LiveKit room to prove liveness against (a stopped lease has no
+   * claimed session), so the only race guard is "the lease has not been touched
+   * for a long time" — a mid-claim machine's lease moves within seconds, so a
+   * ≥10-minute idle floor makes stopping a machine another process is bringing
+   * up effectively impossible. Clamped 300..7200; default 600 (10 min). Only
+   * meaningful when `workerOrchestration` is true.
+   */
+  workerOrphanGraceSec: positiveInt('WORKER_ORPHAN_GRACE_SEC', 600, 300, 7200),
   /**
    * Wall-clock budget (seconds) the dial gate gives a claimed machine to boot,
    * register with LiveKit and post its readiness ping before the dial is
