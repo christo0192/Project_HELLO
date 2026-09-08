@@ -5854,6 +5854,36 @@ async def _run_native_phone_screening(
                 phone.phone_closing_goodbye_shape(delivered_text)
                 or watchdog_closing_delivered
             ):
+                # T4(a) POST-GOODBYE TAIL (Call D, 2026-09-08): when a closing
+                # goodbye ALREADY played this call, `goodbye_latched` is set (it
+                # arms ONLY on uninterrupted closing-shaped playout — it is proof).
+                # The candidate then said one more thing, the model answered with a
+                # NON-closing reply, and this branch would speak the deterministic
+                # closing AGAIN — the extra T27/T28 dead tail Call D emitted. A
+                # goodbye is already on the wire, so skip the redundant say: mark
+                # the goodbye delivered (so the teardown's fixed-closing fallback
+                # is also skipped) and conclude the completed terminal cleanly,
+                # exactly like the goodbye-latch teardown short-circuit does.
+                if goodbye_latched["value"] and phone.phone_goodbye_latch_enabled():
+                    _log.info(
+                        "unknown_event", error_type="phone_terminal_reply",
+                        error_category="terminal_reply_not_closing_latched_skip",
+                    )
+                    # Conclude the completed terminal WITHOUT speaking anything —
+                    # the latch is proof a closing goodbye already played. Mirror
+                    # the normal completed-commit tail (clear the arm, mark the
+                    # goodbye delivered so the teardown fixed-closing fallback is
+                    # ALSO skipped, drive the closing state machine, set finished)
+                    # so the terminal teardown proceeds; only the redundant say is
+                    # removed.
+                    pending_terminal_reason["value"] = None
+                    pending_terminal_speech_seq["value"] = None
+                    terminal_reason["reason"] = "completed"
+                    goodbye_delivered["value"] = True
+                    if closing.state is ClosingState.CLOSING_PENDING:
+                        closing.closing_delivered()
+                    finished.set()
+                    return
                 _log.warn(
                     "unknown_event", error_type="phone_terminal_reply",
                     error_category="terminal_reply_not_closing",
@@ -7754,6 +7784,14 @@ async def _run_phone_session(
 
 
 
+#: T4(b): the interlock's PRE-INSERT refusal statuses — the assessment row is
+#: not written YET. The idempotent, refused-until-present terminal post treats a
+#: retry against these as a benign poll for the row to land, not a failure, so
+#: they are logged at INFO (`terminal_row_pending`) rather than WARN. Any OTHER
+#: non-ok status remains a warn.
+_TERMINAL_POST_ROW_PENDING_STATUSES = frozenset({"assessment_missing", "attempt_required"})
+
+
 async def _post_phone_event_with_retry(
     events: Any,
     attempt_id: str,
@@ -7790,10 +7828,28 @@ async def _post_phone_event_with_retry(
                 error_category="terminal_verdict_ignored",
             )
             return outcome
-        _log.warn(
-            "unknown_event", error_type="phone_terminal_post_retry",
-            error_category=(outcome.error_category or outcome.status or "unknown"),
-        )
+        # T4(b) POLL-THEN-EMIT (Call D, 2026-09-08): the assessment-row PRE-INSERT
+        # refusals (`assessment_missing`, `attempt_required`) are the interlock
+        # saying "the scoring row is not written yet" — a BENIGN race between this
+        # terminal post and the score's own commit, not a failure. The post is
+        # deliberately idempotent and refused-until-present, so each retry IS the
+        # poll: the emission "waits" for the row by re-posting until it lands.
+        # Previously every such iteration logged a WARN, so a clean call that
+        # simply raced the row by a beat looked like ~5 errors before self-heal
+        # (Call D). Log these at INFO under a distinct, honest category and keep
+        # polling within the same bounded budget; a genuine transport/other
+        # failure still WARNs. No behaviour change to the retry bound, the
+        # idempotency, or the fail-closed contract.
+        if outcome.status in _TERMINAL_POST_ROW_PENDING_STATUSES:
+            _log.info(
+                "unknown_event", error_type="phone_terminal_post_retry",
+                error_category="terminal_row_pending",
+            )
+        else:
+            _log.warn(
+                "unknown_event", error_type="phone_terminal_post_retry",
+                error_category=(outcome.error_category or outcome.status or "unknown"),
+            )
         if i + 1 < max(1, attempts):
             await asyncio.sleep(delay_sec * (i + 1))
     return outcome

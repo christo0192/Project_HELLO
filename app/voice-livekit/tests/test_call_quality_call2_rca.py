@@ -169,6 +169,32 @@ class TestTerminalReplyContentGate(_Call2Harness):
             _DISOBEDIENT_TERMINAL,
         ))
 
+    async def test_t4a_non_closing_after_goodbye_latch_skips_the_extra_closing(self):
+        # T4(a) POST-GOODBYE TAIL (Call D): a closing goodbye ALREADY played
+        # (goodbye_latched is set — it arms only on uninterrupted closing
+        # playout). The candidate said one more thing, the model answered with a
+        # NON-closing reply, and the deterministic-closing recovery would speak
+        # the closing AGAIN (the extra T27/T28 dead tail). With the latch set the
+        # recovery is SKIPPED: no closing is spoken at all (the goodbye is already
+        # on the wire), the latched-skip INFO fires, and completion still posts.
+        agent, session, _, client, hooks = await self._enter_closing_pending()
+        agent._goodbye_latched["value"] = True
+        hooks["latest_assistant"][0] = _DISOBEDIENT_TERMINAL
+        await self._finish(hooks)
+        # The redundant deterministic closing was NOT spoken.
+        self.assertNotIn(phone.PHONE_ASSESSMENT_CLOSING_TEXT, session.spoken)
+        # It took the latched-skip path (INFO), not the warn recovery.
+        self.assertTrue(self._logs(
+            hooks, "phone_terminal_reply",
+            "terminal_reply_not_closing_latched_skip", level="info",
+        ))
+        self.assertFalse(self._logs(
+            hooks, "phone_terminal_reply", "terminal_reply_not_closing",
+            level="warn",
+        ))
+        # The screening still completes truthfully.
+        self.assertIn("assessment.completed", client.event_types)
+
 
 # ── F-P0c: Q&A rounds per coalesced logical turn ─────────────────────────────
 

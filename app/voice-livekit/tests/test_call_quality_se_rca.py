@@ -669,6 +669,56 @@ class TestTerminalPostRetryStops(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events.calls, 1)
         self.assertTrue(outcome.ok)
 
+    async def test_t4b_row_pending_refusal_logs_info_not_warn_then_succeeds(self):
+        # T4(b) POLL-THEN-EMIT (Call D): the row is not written on the first two
+        # posts (`assessment_missing` — the pre-insert interlock), then lands.
+        # Each pending post is a BENIGN poll: it must log at INFO under
+        # `terminal_row_pending`, NOT warn ~5 times before self-heal.
+        events = self._ScriptedEvents([
+            phone.PhoneApiOutcome(False, "assessment_missing"),
+            phone.PhoneApiOutcome(False, "assessment_missing"),
+            phone.PhoneApiOutcome(True, "applied"),
+        ])
+        from unittest.mock import MagicMock
+        spy = MagicMock(wraps=agent_mod._log)
+        with patch.object(agent_mod, "_log", spy):
+            outcome = await agent_mod._post_phone_event_with_retry(
+                events, "attempt", "assessment.completed",
+                attempts=3, delay_sec=0.0,
+            )
+        self.assertTrue(outcome.ok)
+        pending_info = [
+            c for c in spy.info.call_args_list
+            if c.kwargs.get("error_category") == "terminal_row_pending"
+        ]
+        self.assertEqual(len(pending_info), 2)
+        # A row-pending refusal is NEVER a warn.
+        pending_warn = [
+            c for c in spy.warn.call_args_list
+            if c.kwargs.get("error_category") in {"assessment_missing", "attempt_required"}
+        ]
+        self.assertEqual(pending_warn, [])
+
+    async def test_t4b_a_genuine_failure_still_warns(self):
+        # A non-pending, non-ignored failure (e.g. a transport/other status) still
+        # WARNs — the fix narrows ONLY the two pre-insert refusals.
+        events = self._ScriptedEvents([
+            phone.PhoneApiOutcome(False, "plan_incomplete"),
+        ])
+        from unittest.mock import MagicMock
+        spy = MagicMock(wraps=agent_mod._log)
+        with patch.object(agent_mod, "_log", spy):
+            await agent_mod._post_phone_event_with_retry(
+                events, "attempt", "assessment.completed",
+                attempts=2, delay_sec=0.0,
+            )
+        warned = [
+            c for c in spy.warn.call_args_list
+            if c.kwargs.get("error_type") == "phone_terminal_post_retry"
+            and c.kwargs.get("error_category") == "plan_incomplete"
+        ]
+        self.assertTrue(warned)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
