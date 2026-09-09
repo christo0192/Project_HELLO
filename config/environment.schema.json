@@ -131,7 +131,6 @@
         "PHONE_RUNTIME_JOB_LEASE_SECONDS": { "requiredInProduction": false, "secret": false },
         "PHONE_PARTIAL_FINALIZE_GRACE_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_BOUNCE_MODE": { "requiredInProduction": false, "secret": false },
-        "PHONE_DETERMINISTIC_OPENER": { "requiredInProduction": false, "secret": false },
         "PHONE_BOUNCE_TRUNK_ID": { "requiredInProduction": false, "secret": false, "external": true },
         "PHONE_BOUNCE_SIP_USER": { "requiredInProduction": false, "secret": false },
         "PHONE_BOUNCE_CALLER_ID": { "requiredInProduction": false, "secret": false, "external": true },
