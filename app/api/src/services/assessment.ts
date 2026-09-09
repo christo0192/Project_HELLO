@@ -7,6 +7,8 @@ import { buildAssessmentPrompt, formatResumeFacts } from '../lib/prompts.js';
 import { insertNotificationIntent } from '../lib/notification-intent.js';
 import type { Assessment, TranscriptTurn } from '../lib/types.js';
 import { scoringProvenance } from '../lib/model-provenance.js';
+import { loadActiveRoleScorecard } from '../lib/scorecards/store.js';
+import { scoreWithScorecard } from '../lib/scorecards/scorer.js';
 import {
   createPhoneStores,
   createPhoneReadStore,
@@ -209,51 +211,123 @@ async function runAssessmentImpl(
     .eq('id', session.candidate_id)
     .single();
 
-  // The provenance-aware call uses the configured provider's single
-  // breaker-managed runner and returns the configured design-intent model for
-  // immutable provenance.
-  const { data: assessment, requestedModel: scoringModel } = await runClaudeJSONWithProvenance<Assessment>(
-    buildAssessmentPrompt({
-      roleTitle,
-      requiredSkills,
-      candidateName: candidate?.name ?? null,
-      transcript,
-      resumeFacts: formatResumeFacts((candidate?.parsed as any) ?? null),
-      // Anchor for any relative callback phrase the candidate used. The phone
-      // path always has a session start; the browser path never asks for a
-      // callback, so a missing anchor there is harmless.
-      callTimestampIso:
-        typeof (session as { started_at?: unknown }).started_at === 'string'
-          ? ((session as { started_at?: string }).started_at as string)
-          : undefined,
-    }),
-    { model: env.deepseekScoringModel },
-  );
+  // Shared candidate context for whichever scoring path runs.
+  const candidateName = candidate?.name ?? null;
+  const resumeFacts = formatResumeFacts((candidate?.parsed as any) ?? null);
+  // Anchor for any relative callback phrase the candidate used. The phone
+  // path always has a session start; the browser path never asks for a
+  // callback, so a missing anchor there is harmless.
+  const callTimestampIso =
+    typeof (session as { started_at?: unknown }).started_at === 'string'
+      ? ((session as { started_at?: string }).started_at as string)
+      : undefined;
 
-  // Recompute overall_score + recommendation in code (transparent, tunable).
-  // Screening-stage weights: soft skills + motivation dominate; role fit is light.
-  const { overall, recommendation } = computeOverall(assessment);
-  assessment.overall_score = overall;
-  assessment.recommendation = recommendation;
+  // FORWARD-ONLY v2 SELECTION: if the role has an ACTIVE, immutable scorecard
+  // configuration (migration 0088), this screening is scored against that
+  // role's configured metrics and persisted as `schema_version = 2`. Otherwise
+  // the legacy v1 dimension scoring runs, byte-identical to before. A missing
+  // scorecard resolves to null (see store.ts), so the v1 path is the default.
+  const activeScorecard = session.role_id
+    ? await loadActiveRoleScorecard(supabase, session.role_id)
+    : null;
 
-  // Build scoring provenance using the requested model.
-  const scoringProvenanceValue = scoringProvenance(scoringModel);
+  // The object returned to callers and handed to the phone callback backstop.
+  // v1 → the scored Assessment; v2 → the ScorecardAssessmentV2 result (no v1
+  // sub-scores, no `callback` — so the backstop is a safe no-op for v2). Cast at
+  // the branch because the fixed runner signature is v1-shaped; the runtime
+  // value is the genuine result and no v1 field is ever fabricated.
+  let assessmentForReturn: Assessment;
+  // Drives the candidate status write below. v2 may be 'human_review'; the
+  // comparison there only cares about 'reject', so the wider union is safe.
+  let recommendationValue: 'advance' | 'hold' | 'reject' | 'human_review';
+  let scoringProvenanceValue: ReturnType<typeof scoringProvenance>;
+  let basePayload: Record<string, unknown>;
 
-  const basePayload: Record<string, unknown> = {
-    session_id: sessionId,
-    candidate_id: session.candidate_id,
-    english: assessment.english,
-    tone: assessment.tone,
-    communication: assessment.communication,
-    motivation: assessment.motivation,
-    role_fit: assessment.role_fit,
-    resume_conflicts: assessment.resume_conflicts ?? [],
-    overall_score: assessment.overall_score,
-    recommendation: assessment.recommendation,
-    summary: assessment.summary,
-    raw: assessment, // full object (fallback if optional columns absent)
-    provenance: scoringProvenanceValue, // LLM-06 provenance — required, fail closed if missing
-  };
+  if (activeScorecard) {
+    // ── SCHEMA v2: role-configured scorecard scoring ────────────────────
+    const scored = await scoreWithScorecard(
+      {},
+      {
+        scorecard: activeScorecard,
+        roleTitle,
+        candidateName,
+        transcript,
+        resumeFacts,
+        callTimestampIso,
+      },
+    );
+    // Provenance is the configured scoring model (the v2 scorer's default infer
+    // uses exactly this model); required and fail-closed if missing.
+    scoringProvenanceValue = scoringProvenance(env.deepseekScoringModel);
+    recommendationValue = scored.recommendation;
+    assessmentForReturn = scored as unknown as Assessment;
+    basePayload = {
+      session_id: sessionId,
+      candidate_id: session.candidate_id,
+      // v2 metadata satisfying chk_assessments_v2_shape: metric_results is a
+      // non-null jsonb array, and weighted_score_5 is present iff status is
+      // 'complete' (the scorer nulls it for 'incomplete_evidence').
+      schema_version: 2,
+      revision: 1,
+      scorecard_version_id: activeScorecard.id,
+      metric_results: scored.metricResults,
+      weighted_score_5: scored.weightedScore5,
+      scoring_status: scored.status,
+      overall_score: scored.overallScore,
+      // chk_assessments_recommendation admits only advance|hold|reject; a NULL
+      // satisfies the CHECK. 'human_review' (incomplete evidence) is therefore
+      // stored NULL in the column and preserved truthfully in `raw`.
+      recommendation: scored.recommendation === 'human_review' ? null : scored.recommendation,
+      // The v1 dimension columns (english/tone/communication/motivation/
+      // role_fit/summary/resume_conflicts) are all NULLABLE and are left unset
+      // on purpose — a v2 row invents no v1 sub-scores.
+      raw: scored, // full v2 object (mirrors v1's "raw = full result" contract)
+      provenance: scoringProvenanceValue, // LLM-06 provenance — required, fail closed if missing
+    };
+  } else {
+    // ── SCHEMA v1: legacy dimension scoring (UNCHANGED) ─────────────────
+    // The provenance-aware call uses the configured provider's single
+    // breaker-managed runner and returns the configured design-intent model for
+    // immutable provenance.
+    const { data: assessment, requestedModel: scoringModel } = await runClaudeJSONWithProvenance<Assessment>(
+      buildAssessmentPrompt({
+        roleTitle,
+        requiredSkills,
+        candidateName,
+        transcript,
+        resumeFacts,
+        callTimestampIso,
+      }),
+      { model: env.deepseekScoringModel },
+    );
+
+    // Recompute overall_score + recommendation in code (transparent, tunable).
+    // Screening-stage weights: soft skills + motivation dominate; role fit is light.
+    const { overall, recommendation } = computeOverall(assessment);
+    assessment.overall_score = overall;
+    assessment.recommendation = recommendation;
+
+    // Build scoring provenance using the requested model.
+    scoringProvenanceValue = scoringProvenance(scoringModel);
+    recommendationValue = recommendation;
+    assessmentForReturn = assessment;
+
+    basePayload = {
+      session_id: sessionId,
+      candidate_id: session.candidate_id,
+      english: assessment.english,
+      tone: assessment.tone,
+      communication: assessment.communication,
+      motivation: assessment.motivation,
+      role_fit: assessment.role_fit,
+      resume_conflicts: assessment.resume_conflicts ?? [],
+      overall_score: assessment.overall_score,
+      recommendation: assessment.recommendation,
+      summary: assessment.summary,
+      raw: assessment, // full object (fallback if optional columns absent)
+      provenance: scoringProvenanceValue, // LLM-06 provenance — required, fail closed if missing
+    };
+  }
   // 0044: passed ONLY for the phone path. The browser payload therefore has
   // exactly the keys it had before this migration, and the column default
   // (`browser`) applies to it — so `uq_assessments_phone_session`, which is
@@ -278,9 +352,9 @@ async function runAssessmentImpl(
       disconnect_reason: options?.disconnectReason ?? 'disconnected',
     };
     basePayload.partial = true;
-    // Attach to `raw` non-destructively: the full LLM object is preserved and a
-    // `partial` block is added alongside it.
-    basePayload.raw = { ...(assessment as unknown as Record<string, unknown>), partial: partialMeta };
+    // Attach to `raw` non-destructively: the full scoring object (v1 assessment
+    // OR v2 result) is preserved and a `partial` block is added alongside it.
+    basePayload.raw = { ...(basePayload.raw as Record<string, unknown>), partial: partialMeta };
   }
 
   let { data: row, error: aErr } = await supabase
@@ -365,7 +439,7 @@ async function runAssessmentImpl(
   if (!decisionBlocked) {
     await supabase
       .from('candidates')
-      .update({ status: assessment.recommendation === 'reject' ? 'rejected' : 'screened' })
+      .update({ status: recommendationValue === 'reject' ? 'rejected' : 'screened' })
       .eq('id', session.candidate_id);
   }
 
@@ -416,13 +490,13 @@ async function runAssessmentImpl(
   //     assessment: the scorecard is the product, the backstop is a courtesy.
   //   * NO PII IN LOGS. Only bounded reason codes and the extracted flag.
   if (isPhone) {
-    await bookPostCallCallbackBestEffort(sessionId, assessment).catch(() => {
+    await bookPostCallCallbackBestEffort(sessionId, assessmentForReturn).catch(() => {
       // Unreachable — the helper never throws — but a second belt so a
       // programming error inside it can never discard a scored assessment.
     });
   }
 
-  return { ...assessment, id: row.id };
+  return { ...assessmentForReturn, id: row.id };
 }
 
 /**
