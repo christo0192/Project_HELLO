@@ -7602,6 +7602,19 @@ async def _run_phone_session(
             # context only: it is not an STT turn, fires no turn hooks, and
             # the gate transcript takes the candidate's consent reply from
             # the classifier path, never from here.
+            # ── Deterministic opener (default; PHONE_DETERMINISTIC_OPENER) ─────
+            # The SIP output-subscription is now WARMED (block above), preserving
+            # the baseline-fix 4a latency win. In deterministic mode we author NO
+            # model opening: return None so `run_phone_gate` speaks the FIXED
+            # `PHONE_DISCLOSURE_TEXT` (the exact scripted consent line) with
+            # NOTHING spoken before it. This removes the speak-then-verify double
+            # opener RCA'd on session 4355b045 (the model appended "am I speaking
+            # to Christo?" — heard — and the fixed disclosure was then spoken on
+            # top) and drops one opening-time generation. The LLM path below runs
+            # only when PHONE_DETERMINISTIC_OPENER=false. The `finally` restores
+            # the gate window on this early return.
+            if phone.phone_deterministic_opener():
+                return None
             try:
                 handle = generate(
                     user_input="Hello?", instructions=opening_instructions,
@@ -7770,7 +7783,17 @@ async def _run_phone_session(
         # server can start the egress from the top of the call.
         post_call_answered=True,
         speak_opening=speak_opening,
-        speak_role_opening=speak_role_opening,
+        # Deterministic opener (default): withhold the LLM role opener so
+        # `_deliver_role_opening` speaks the FIXED `phone_role_opening_text`
+        # ("Before we dive in, just to confirm — this is about the {role} role at
+        # Interview Kickstart. Really glad you could hop on — let's dive in!").
+        # `speak_opening` itself self-gates on the same flag (returns None →
+        # fixed disclosure). Both openers are then scripted, never model-authored,
+        # so neither can be spoken-then-contradicted. PHONE_DETERMINISTIC_OPENER=false
+        # restores both LLM openers.
+        speak_role_opening=(
+            None if phone.phone_deterministic_opener() else speak_role_opening
+        ),
         consent_reply_out=consent_reply_out,
         # Answer-first origination (Plivo bounce). OFF by default → byte-identical
         # current behavior. When ON, the gate waits for the server-verified

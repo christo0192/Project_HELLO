@@ -1745,6 +1745,41 @@ class TestPhoneParity2Gate(unittest.IsolatedAsyncioTestCase):
             client.gate_commits[0]["turns"][0]["text"], phone.PHONE_DISCLOSURE_TEXT
         )
 
+    async def test_none_opening_logs_opening_fixed_and_speaks_disclosure_once(self):
+        # Deterministic opener: speak_opening returns None (it warmed the SIP
+        # subscription and authored nothing). The gate speaks the fixed
+        # PHONE_DISCLOSURE_TEXT exactly once and logs `opening_fixed` at INFO —
+        # never `opening_unverified` (reserved for a real LLM opener that was
+        # generated but failed verification). No model text is spoken by the gate,
+        # so the double-opener RCA (session 4355b045) cannot recur.
+        async def speak_opening():
+            return None
+
+        spy = MagicMock()
+        with patch.object(phone, "_log", spy):
+            result, client, recorder = await self._atomic_gate(speak_opening=speak_opening)
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(recorder.spoken.count(phone.PHONE_DISCLOSURE_TEXT), 1)
+        cats = [(c[0], c[2].get("error_category")) for c in spy.method_calls]
+        self.assertIn(("info", "opening_fixed"), cats)
+        self.assertNotIn(("warn", "opening_unverified"), cats)
+
+    async def test_nonempty_unverified_opening_logs_opening_unverified(self):
+        # A NON-EMPTY generated opening that fails verification is a real LLM
+        # misbehaviour → WARN `opening_unverified`; the fixed disclosure is still
+        # spoken exactly once (the gate never speaks the model text itself).
+        async def speak_opening():
+            return "Hi there, lovely to reach you today."
+
+        spy = MagicMock()
+        with patch.object(phone, "_log", spy):
+            result, client, recorder = await self._atomic_gate(speak_opening=speak_opening)
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(recorder.spoken.count(phone.PHONE_DISCLOSURE_TEXT), 1)
+        cats = [(c[0], c[2].get("error_category")) for c in spy.method_calls]
+        self.assertIn(("warn", "opening_unverified"), cats)
+        self.assertNotIn(("info", "opening_fixed"), cats)
+
     def test_opening_verification_predicate(self):
         # record + ENDS on a consent question → verified (various phrasings).
         self.assertTrue(phone._opening_is_verified(
@@ -3063,6 +3098,21 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         _FakePhoneSession.default_emit_auto_speech = True
         _FakePhoneSession.default_terminal_reply_interrupted = False
         _FakePhoneSession.include_timing = False
+        # These full-session tests simulate the LLM-AUTHORED opening via
+        # `_FakePhoneSession.gate_opening_text`; they are not about the opener
+        # itself. Run them against the LLM-opener path (PHONE_DETERMINISTIC_OPENER
+        # off) so their opener-incidental assertions still hold. The deterministic
+        # default (production) is covered by TestDeterministicOpenerFlag,
+        # TestJudgeAuthFailureHonest, the run_phone_gate `opening_fixed`/
+        # `opening_unverified` tests, and TestOpeningGenerationSeed.
+        # patch.dict captures + restores the prior value atomically; start()
+        # then addCleanup(stop) leaves no assignment gap that could leak "false"
+        # into other test classes/files under the suite's cross-file ordering.
+        _det_opener_patch = patch.dict(
+            os.environ, {"PHONE_DETERMINISTIC_OPENER": "false"}
+        )
+        _det_opener_patch.start()
+        self.addCleanup(_det_opener_patch.stop)
 
     async def _run_session(
         self,
@@ -5589,7 +5639,12 @@ class TestOpeningGenerationSeed(unittest.IsolatedAsyncioTestCase):
         async def recording_seam():
             return None
 
-        with patch.object(agent_mod, "AgentSession", _SeedProbeSession), \
+        # The `Hello?` seed belongs to the LLM-AUTHORED opening path, which is
+        # now behind PHONE_DETERMINISTIC_OPENER (default ON speaks the fixed
+        # disclosure and never generates an opening). Exercise the seed behaviour
+        # with the flag explicitly OFF.
+        with patch.dict(os.environ, {"PHONE_DETERMINISTIC_OPENER": "false"}), \
+             patch.object(agent_mod, "AgentSession", _SeedProbeSession), \
              patch.object(agent_mod, "persistence", MagicMock()), \
              patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
              patch.object(agent_mod, "_phone_recording_permitted", new=recording_seam), \
@@ -5602,6 +5657,45 @@ class TestOpeningGenerationSeed(unittest.IsolatedAsyncioTestCase):
                 timeout=5,
             )
         self.assertEqual(seen.get("user_input"), "Hello?")
+
+
+    async def test_deterministic_opener_sends_no_opening_seed(self):
+        # Default (PHONE_DETERMINISTIC_OPENER on): the consent opening speaks the
+        # FIXED disclosure and runs NO model generation, so the `Hello?` opening
+        # seed is never sent. This guards the double-opener RCA at the session
+        # level — nothing is authored that could contradict the fixed line.
+        seeds: list = []
+
+        class _NoSeedProbe(_FakePhoneSession):
+            def generate_reply(self, instructions=None, **kwargs):
+                seeds.append(kwargs.get("user_input"))
+                return super().generate_reply(instructions=instructions, **kwargs)
+
+        ctx = FakeCtx(_PHONE_ROOM, participants=[_participant()])
+        client = FakeEventClient()
+        _FakePhoneSession.default_answers = ["Yes, that's fine.", "First answer."]
+
+        async def classifier(turns, say):
+            return phone.CLASSIFY_HUMAN
+
+        async def recording_seam():
+            return None
+
+        with patch.dict(os.environ, {}, clear=False), \
+             patch.object(agent_mod, "AgentSession", _NoSeedProbe), \
+             patch.object(agent_mod, "persistence", MagicMock()), \
+             patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
+             patch.object(agent_mod, "_phone_recording_permitted", new=recording_seam), \
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+            os.environ.pop("PHONE_DETERMINISTIC_OPENER", None)
+            await asyncio.wait_for(
+                agent_mod._run_phone_session(
+                    ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
+                    client=client, classifier=classifier,
+                ),
+                timeout=5,
+            )
+        self.assertNotIn("Hello?", seeds)
 
 
 class TestDisclosureSentencePin(unittest.TestCase):
@@ -14418,6 +14512,88 @@ class TestDeveloperRoleRewriteWiring(unittest.IsolatedAsyncioTestCase):
         self.assertIn("developer", roles)
         self.assertFalse(agent._developer_role_mapped)
         self.assertEqual(agent._developer_role_mapped_count, 0)
+
+
+class TestDeterministicOpenerFlag(unittest.TestCase):
+    """PHONE_DETERMINISTIC_OPENER defaults ON; only the literal `false` disables."""
+
+    def test_default_on_and_off_tokens_disable(self):
+        for value, expected in (
+            # ON: unset/empty, truthy tokens, and anything unrecognised
+            ("", True), ("true", True), ("TRUE", True), ("on", True),
+            ("1", True), ("yes", True), ("garbage", True),
+            # OFF: the explicit off tokens (case-insensitive, trimmed)
+            ("false", False), ("FALSE", False), (" false ", False),
+            ("0", False), ("no", False), ("off", False), ("OFF", False),
+        ):
+            with patch.dict(phone.os.environ, {"PHONE_DETERMINISTIC_OPENER": value}):
+                self.assertEqual(phone.phone_deterministic_opener(), expected, value)
+
+    def test_unset_defaults_on(self):
+        with patch.dict(phone.os.environ, {}, clear=False):
+            phone.os.environ.pop("PHONE_DETERMINISTIC_OPENER", None)
+            self.assertTrue(phone.phone_deterministic_opener())
+
+
+class TestJudgeAuthFailureHonest(unittest.IsolatedAsyncioTestCase):
+    """A judge 401/403 is an AUTH failure, reported truthfully and never retried
+    as an unsupported parameter (session 4355b045: a stale phone-app
+    DEEPSEEK_API_KEY 401'd every turn but was mislabelled `unsupported_param_retry`
+    for a whole release)."""
+
+    _ENV = {
+        "PHONE_JUDGE_SDK": "openai",
+        "PHONE_JUDGE_API_KEY": "x" * 40,
+        "PHONE_JUDGE_URL": "https://api.deepseek.com/v1/chat/completions",
+        "PHONE_JUDGE_MODEL": "deepseek-v4-flash",
+    }
+
+    async def test_401_is_auth_not_param_and_is_not_retried(self):
+        from provider_resilience import BusinessError
+        call = AsyncMock(side_effect=BusinessError(status_code=401))
+        spy = MagicMock()
+        with patch.dict(phone.os.environ, self._ENV), \
+             patch.object(phone, "_phone_coverage_transport", return_value=object()), \
+             patch.object(phone, "call_with_breaker", call), \
+             patch.object(phone, "_log", spy):
+            with self.assertRaises(BusinessError):
+                await phone._default_phone_coverage_inference("{}")
+        # Exactly ONE attempt — the auth failure is surfaced, not retried.
+        self.assertEqual(call.await_count, 1)
+        cats = [(c[0], c[2].get("error_category")) for c in spy.method_calls]
+        self.assertIn(("warn", "judge_auth_failed"), cats)
+        self.assertNotIn(("info", "unsupported_param_retry"), cats)
+
+    async def test_403_is_also_treated_as_auth(self):
+        from provider_resilience import BusinessError
+        call = AsyncMock(side_effect=BusinessError(status_code=403))
+        spy = MagicMock()
+        with patch.dict(phone.os.environ, self._ENV), \
+             patch.object(phone, "_phone_coverage_transport", return_value=object()), \
+             patch.object(phone, "call_with_breaker", call), \
+             patch.object(phone, "_log", spy):
+            with self.assertRaises(BusinessError):
+                await phone._default_phone_coverage_inference("{}")
+        self.assertEqual(call.await_count, 1)
+
+    async def test_400_param_error_still_retries_with_params_stripped(self):
+        from provider_resilience import BusinessError
+        good = types.SimpleNamespace(json=lambda: {
+            "choices": [{"message": {"content": '{"covered":true,"conflict":null}'}}],
+        })
+        call = AsyncMock(side_effect=[BusinessError(status_code=400), good])
+        spy = MagicMock()
+        with patch.dict(phone.os.environ, self._ENV), \
+             patch.object(phone, "_phone_coverage_transport", return_value=object()), \
+             patch.object(phone, "call_with_breaker", call), \
+             patch.object(phone, "_log", spy):
+            raw = await phone._default_phone_coverage_inference("{}")
+        self.assertEqual(raw, '{"covered":true,"conflict":null}')
+        # A genuine unsupported-param 400 IS retried once with params stripped.
+        self.assertEqual(call.await_count, 2)
+        cats = [(c[0], c[2].get("error_category")) for c in spy.method_calls]
+        self.assertIn(("info", "unsupported_param_retry"), cats)
+        self.assertNotIn(("warn", "judge_auth_failed"), cats)
 
 
 if __name__ == "__main__":
