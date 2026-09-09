@@ -298,6 +298,33 @@ describe('an already-scored phone session is a success, not a refusal', () => {
 
 
 // ═══════════════════════════════════════════════════════════════════
+describe('FIX 2 — the phone reuse reader is scoped to the original revision=1 row', () => {
+  const REV1_ID = '00000000-0000-4000-8000-0000000000f1';
+
+  it('returns the ORIGINAL rev1 phone row and scopes the read to source=phone AND revision=1', async () => {
+    // After a rescore a phone session has >= 2 source='phone' rows (rev1 + rev2+).
+    // An unscoped `.maybeSingle()` would ERROR on the multiple rows and break the
+    // idempotent reuse. Scoping to revision=1 makes the read deterministic — it
+    // returns the first-score winner. The mock does not filter, so the enqueued
+    // response models the DB returning exactly the rev1 row for that scoped query.
+    setDefault('call_sessions', ok({ ...completedSession(), terminal_reason: 'assessment_done' }));
+    enqueue('assessments', ok({ id: REV1_ID, raw: { ...assessmentFixture, summary: 'original rev1' } }));
+
+    const result = await runAssessment(SESSION_ID, { source: 'phone' });
+
+    expect(result.id).toBe(REV1_ID);
+    expect(result.summary).toBe('original rev1');
+    // Pure reuse: nothing re-scored, nothing inserted.
+    expect(runClaudeJSONWithProvenance).not.toHaveBeenCalled();
+    expect(callsFor('assessments', 'insert')).toHaveLength(0);
+    // The reuse read is scoped to the original winner.
+    const eqCalls = callsFor('assessments', 'eq');
+    expect(eqCalls.some((c) => c.args[0] === 'source' && c.args[1] === 'phone')).toBe(true);
+    expect(eqCalls.some((c) => c.args[0] === 'revision' && c.args[1] === 1)).toBe(true);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════
 describe('the source is DERIVED from the session, not trusted from the caller', () => {
   // Four callers reach runAssessment — the phone completion endpoint, the
   // worker scoring callback, the admin re-score route and the screening queue —

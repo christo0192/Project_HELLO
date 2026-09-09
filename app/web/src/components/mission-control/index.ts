@@ -18,6 +18,7 @@ export { OverviewSection } from './OverviewSection';
 export { AccessSection } from './AccessSection';
 export { SessionsSection } from './SessionsSection';
 export { QuotasSection } from './QuotasSection';
+export { ScorebarSection } from './ScorebarSection';
 export { AuditSection } from './AuditSection';
 export { MaintenanceSection } from './MaintenanceSection';
 export {

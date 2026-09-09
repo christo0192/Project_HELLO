@@ -265,6 +265,34 @@ export function canAccessRecordingData(consentSource: string | null): boolean {
 }
 
 /**
+ * Project a v2 assessment's `metric_results` down to the CANDIDATE-FACING fields
+ * for a DSAR export. Each stored entry is a `ScorecardMetricResult`: the model's
+ * per-metric judgement plus a `metric` snapshot that embeds the recruiter's
+ * internal scoring config (`instruction`, `rubric`, `weightBps`). Those are
+ * scoring IP, not the data subject's own data, so they are DROPPED here — the
+ * entry keeps only its score, evidence status, rationale, evidence refs, and the
+ * metric's key + name.
+ *
+ * Non-array input (a v1 row's null, or anything malformed) passes through
+ * untouched so the v1 export shape is unaffected.
+ */
+export function projectDsarMetricResults(metricResults: unknown): unknown {
+  if (!Array.isArray(metricResults)) return metricResults;
+  return metricResults.map((entry: any) => {
+    const metric = entry?.metric ?? null;
+    return {
+      metric: metric
+        ? { key: metric.key ?? null, name: metric.name ?? null }
+        : null,
+      score: entry?.score ?? null,
+      evidenceStatus: entry?.evidenceStatus ?? null,
+      rationale: entry?.rationale ?? null,
+      evidenceRefs: Array.isArray(entry?.evidenceRefs) ? entry.evidenceRefs : [],
+    };
+  });
+}
+
+/**
  * Export all candidate data for DSAR.
  * Respects consent boundaries: recording/outbound data is only included
  * when explicit recording consent exists (not job_application alone).
@@ -380,7 +408,26 @@ export async function exportDSAR(
       recommendation: a.recommendation,
       summary: a.summary,
       created_at: a.created_at,
+      // v2 scorecard fields (Phase 6): a data-subject export must be complete for
+      // schema_version=2 assessments, whose scores live in these columns rather
+      // than in the v1 overall_score/recommendation/summary shape. Left as-is for
+      // v1 rows (schema_version=1, revision=1, weighted_score_5/metric_results
+      // null, scoring_status defaulted 'complete'), so the v1 export is intact.
+      schema_version: a.schema_version,
+      revision: a.revision,
+      weighted_score_5: a.weighted_score_5,
+      scoring_status: a.scoring_status,
+      // metric_results IS the data subject's own per-metric scoring, so the
+      // candidate-facing judgement is included — but the embedded `metric`
+      // snapshot carries the recruiter's INTERNAL scoring IP (instruction,
+      // rubric, weightBps). That is not the data subject's data and must not leak
+      // to a candidate-owner via a DSAR export, so each entry is projected down
+      // to candidate-facing fields only: the score, the evidence status, the
+      // rationale, the evidence refs, and just the metric's key + name.
+      metric_results: projectDsarMetricResults(a.metric_results),
       // Excluded: full assessment JSON if it contains internal notes
+      // Excluded: metric.instruction / metric.rubric / metric.weightBps (internal
+      //           recruiter scoring config)
     })),
     transcripts: (transcripts ?? []).map((t: any) => ({
       speaker: t.speaker,

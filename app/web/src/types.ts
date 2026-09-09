@@ -219,6 +219,239 @@ export interface Assessment {
   recommendation: Recommendation;
   summary: string;
   raw?: Partial<Assessment> | null;
+  /**
+   * Assessment schema version (scorecard rework Phase 1+). Absent or `1` is a
+   * legacy dimension assessment — THIS shape, with `tone`/`role_fit`/… — and is
+   * rendered by the existing legacy view unchanged. `2` is a role-scorecard v2
+   * row whose v1 dimension fields are NOT populated on the wire; never read them
+   * on a v2 row. Branch with `isAssessmentV2` / `readScorecardAssessmentV2`
+   * below, which read the rich v2 payload out of `raw` (see contracts.ts).
+   *
+   * These extra columns ride along on the same `assessments` rows the API
+   * projects with `select('*')`, so they are optional on the shared type
+   * rather than a separate carrier — no existing v1 consumer is disturbed.
+   */
+  schema_version?: 1 | 2;
+  scorecard_version_id?: string | null;
+  revision?: number;
+  scoring_status?: ScorecardAssessmentStatus;
+  weighted_score_5?: number | null;
+  metric_results?: ScorecardMetricModelResult[];
+}
+
+// ── Scorecards (Phase 3 web UI) ──────────────────────────────────────────
+//
+// Mirrors app/api/src/lib/scorecards/contracts.ts. Two wire conventions coexist
+// and are mirrored FAITHFULLY here rather than idealised:
+//   - the metric LIBRARY endpoints (GET/POST/PATCH/archive /metrics) return raw
+//     snake_case DB rows (and GET returns a BARE array, not `{ metrics }`);
+//   - the ROLE scorecard endpoints return camelCase domain objects.
+
+export const SCORECARD_WEIGHT_TOTAL_BPS = 10000 as const;
+export const SCORECARD_MAX_METRICS = 20 as const;
+export const SCORECARD_MAX_NAME_LENGTH = 100 as const;
+export const SCORECARD_MAX_INSTRUCTION_LENGTH = 1000 as const;
+export const SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH = 500 as const;
+
+/** 1..5 rubric level labels — Poor → Excellent (contracts.ts SCORE_LABELS). */
+export const SCORE_LABELS = {
+  1: 'Poor',
+  2: 'Below average',
+  3: 'Average',
+  4: 'Good',
+  5: 'Excellent',
+} as const;
+
+export type ScoreValue = 1 | 2 | 3 | 4 | 5;
+export type ScorecardRubric = Record<ScoreValue, string>;
+export type MetricEvidenceStatus = 'scored' | 'insufficient_evidence';
+export type ScorecardAssessmentStatus = 'complete' | 'incomplete_evidence';
+export type ScorecardRecommendation = 'advance' | 'hold' | 'reject' | 'human_review';
+
+/** Global metric library template — the wire is the snake_case DB row. */
+export interface ScorecardMetricTemplate {
+  id: string;
+  key: string;
+  name: string;
+  description: string | null;
+  default_instruction: string;
+  rubric: ScorecardRubric;
+  archived_at: string | null;
+  version: number;
+  created_at?: string;
+  updated_at?: string;
+  created_by?: string | null;
+}
+
+export interface ScorecardMetricCreateInput {
+  /** Optional — the API derives a stable key from `name` when omitted. */
+  key?: string;
+  name: string;
+  description?: string | null;
+  default_instruction: string;
+  rubric: ScorecardRubric;
+}
+
+export interface ScorecardMetricUpdateInput {
+  name?: string;
+  description?: string | null;
+  default_instruction?: string;
+  rubric?: ScorecardRubric;
+}
+
+/** Immutable per-role metric snapshot (camelCase, as the role API returns it). */
+export interface RoleScorecardMetric {
+  id: string;
+  libraryMetricId: string;
+  key: string;
+  name: string;
+  instruction: string;
+  rubric: ScorecardRubric;
+  weightBps: number;
+  displayOrder: number;
+}
+
+export interface RoleScorecardVersion {
+  id: string;
+  roleId: string;
+  version: number;
+  configurationHash: string;
+  metrics: RoleScorecardMetric[];
+}
+
+export interface RoleScorecardResponse {
+  scorecard: RoleScorecardVersion | null;
+}
+
+/** One desired metric in a PUT body. name/key/rubric are snapshotted server-side. */
+export interface PutRoleScorecardMetricInput {
+  libraryMetricId: string;
+  instruction?: string;
+  weightBps: number;
+  displayOrder?: number;
+}
+
+export interface PutRoleScorecardInput {
+  metrics: PutRoleScorecardMetricInput[];
+}
+
+export interface RedistributeWeightsInput {
+  metrics: RoleScorecardMetric[];
+  editedMetricId: string;
+  newWeightBps: number;
+}
+
+export interface RedistributeWeightsResponse {
+  metrics: RoleScorecardMetric[];
+}
+
+/** Model output per metric — the top-level `metric_results` column shape. */
+export interface ScorecardMetricModelResult {
+  configMetricId: string;
+  score: ScoreValue | null;
+  evidenceStatus: MetricEvidenceStatus;
+  rationale: string;
+  evidenceRefs: string[];
+}
+
+/** A model result joined to its immutable metric snapshot (from `raw`). */
+export interface ScorecardMetricResult extends ScorecardMetricModelResult {
+  metric: RoleScorecardMetric;
+}
+
+/** The full v2 assessment object carried in the row's `raw` field. */
+export interface ScorecardAssessmentV2 {
+  schemaVersion: 2;
+  scorecardVersionId: string;
+  revision: number;
+  status: ScorecardAssessmentStatus;
+  metricResults: ScorecardMetricResult[];
+  weightedScore5: number | null;
+  overallScore: number | null;
+  recommendation: ScorecardRecommendation;
+}
+
+/** Flattened, display-ready per-metric result (what the candidate v2 view needs). */
+export interface ScorecardMetricDisplay {
+  id: string;
+  name: string;
+  score: ScoreValue | null;
+  evidenceStatus: MetricEvidenceStatus;
+  rationale: string;
+  evidenceRefs: string[];
+  /** From the metric snapshot when available; null on a `raw`-less fallback. */
+  weightBps: number | null;
+}
+
+/** Normalised v2 read model the candidate scorecard renders. */
+export interface ScorecardAssessmentDisplay {
+  status: ScorecardAssessmentStatus;
+  weightedScore5: number | null;
+  overallScore: number | null;
+  recommendation: ScorecardRecommendation;
+  metrics: ScorecardMetricDisplay[];
+}
+
+/**
+ * True when an assessment row is a role-scorecard v2 row (schema_version == 2).
+ * Uses `Number(...)` so a stringy `'2'` on the wire still routes to the v2
+ * display — matching export.ts and the Ashby adapter, which both coerce with
+ * `Number(schema_version) === 2`.
+ */
+export function isAssessmentV2(a: Assessment | null | undefined): boolean {
+  return !!a && Number((a as { schema_version?: number | string }).schema_version) === 2;
+}
+
+/**
+ * Normalise a v2 assessment row into a flat display model, or `null` when the
+ * row is not v2. Prefers the rich `raw` object (it carries each metric's name
+ * and weight); falls back to the top-level columns (metric names then read as
+ * their opaque ids) so a `raw`-less row still renders truthfully rather than
+ * throwing. Never invents v1 fields.
+ */
+export function readScorecardAssessmentV2(
+  a: Assessment | null | undefined,
+): ScorecardAssessmentDisplay | null {
+  if (!isAssessmentV2(a)) return null;
+  const row = a as unknown as {
+    scoring_status?: ScorecardAssessmentStatus;
+    weighted_score_5?: number | null;
+    overall_score?: number | null;
+    recommendation?: ScorecardRecommendation | null;
+    metric_results?: ScorecardMetricModelResult[];
+    raw?: ScorecardAssessmentV2 | null;
+  };
+  const raw =
+    row.raw && Array.isArray(row.raw.metricResults) ? row.raw : null;
+
+  const metrics: ScorecardMetricDisplay[] = raw
+    ? raw.metricResults.map((r) => ({
+        id: r.configMetricId ?? r.metric?.id ?? '',
+        name: r.metric?.name ?? r.configMetricId ?? 'Metric',
+        score: r.score,
+        evidenceStatus: r.evidenceStatus,
+        rationale: r.rationale ?? '',
+        evidenceRefs: Array.isArray(r.evidenceRefs) ? r.evidenceRefs : [],
+        weightBps: typeof r.metric?.weightBps === 'number' ? r.metric.weightBps : null,
+      }))
+    : (row.metric_results ?? []).map((r) => ({
+        id: r.configMetricId,
+        name: r.configMetricId,
+        score: r.score,
+        evidenceStatus: r.evidenceStatus,
+        rationale: r.rationale ?? '',
+        evidenceRefs: Array.isArray(r.evidenceRefs) ? r.evidenceRefs : [],
+        weightBps: null,
+      }));
+
+  return {
+    status: raw?.status ?? row.scoring_status ?? 'incomplete_evidence',
+    weightedScore5: raw?.weightedScore5 ?? row.weighted_score_5 ?? null,
+    overallScore: raw?.overallScore ?? row.overall_score ?? null,
+    recommendation:
+      (raw?.recommendation ?? row.recommendation ?? 'human_review') as ScorecardRecommendation,
+    metrics,
+  };
 }
 
 export interface CandidateDetail {

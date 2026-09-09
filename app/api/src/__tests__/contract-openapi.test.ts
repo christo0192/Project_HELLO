@@ -1076,7 +1076,19 @@ describe('OpenAPI document integrity', () => {
     // recovery), which used to leave call_sessions.observability empty. Same
     // worker-authenticated surface; widens no recruiter-facing route.
     // 118 + 1 = 119.
-    expect(Object.keys(paths).length).toBe(119);
+    // Phase 4 (scorecard rework) adds ONE recruiter-facing path —
+    // POST /api/assess/{sessionId}/rescore — the admin explicit immutable
+    // rescore that produces a new superseding assessment revision.
+    // 119 + 1 = 120.
+    // Phase 4 (scorecard rework, Phase 2 HTTP API) adds the FIVE scorecard
+    // path keys (seven operations) on the /api/scorecards router: the metric
+    // library collection /metrics (GET list + POST create), the metric item
+    // /metrics/{id} (PATCH), its /metrics/{id}/archive (POST), the per-role
+    // /roles/{roleId}/scorecard (GET active version + PUT new version), and its
+    // /roles/{roleId}/scorecard/redistribute (POST preview). All response
+    // envelopes are documented INLINE, so the schema-count guard below is
+    // unchanged; only the path-count guard moves. 120 + 5 = 125.
+    expect(Object.keys(paths).length).toBe(125);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas

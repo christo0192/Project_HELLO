@@ -30,6 +30,7 @@ import { ashbyMissionControlRouter } from './routes/ashby-mission-control.js';
 import { ashbyReviewRouter } from './routes/ashby-review.js';
 import { phoneApiRouter } from './routes/phone.js';
 import { ashbyCandidateWorkflowRouter } from './routes/ashby-candidate-workflow.js';
+import { scorecardsRouter } from './routes/scorecards.js';
 import {
   malformedJsonHandler,
   oversizedJsonHandler,
@@ -360,6 +361,7 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api/me', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'me:', useUserKey: true }));
   app.use('/api/status', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'status:', useUserKey: true }));
   app.use('/api/notes', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'notes:', useUserKey: true }));
+  app.use('/api/scorecards', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'scorecards:', useUserKey: true }));
   app.use('/api/candidate-consent', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'candidate-consent:', useUserKey: true }));
   app.use('/api/notifications', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'notifications:', useUserKey: true }));
   app.use('/api/export', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'export:', useUserKey: true }));
@@ -416,6 +418,10 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api/status', statusRouter);
   app.use('/api/me', meRouter);
   app.use('/api/notes', notesRouter);
+  // Scorecard domain: global metric library ("Scorebar") + per-role scorecards.
+  // Reads are viewer/interviewer+, library mutations admin-only, role scorecard
+  // mutations interviewer-owns-own / admin-all (each guarded inside the router).
+  app.use('/api/scorecards', scorecardsRouter);
   app.use('/api/candidate-consent', candidateConsentRouter);
   app.use('/api/notifications', notificationsRouter);
   app.use('/api/export', exportRouter);

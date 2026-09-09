@@ -243,7 +243,10 @@ describe('VOI-08 assessment eligibility preflight', () => {
     // candidates update called once; transcript fetched; role fetched.
     expect(callsFor('candidates', 'update')).toHaveLength(1);
     expect(callsFor('transcript_turns', 'select')).toHaveLength(1);
-    expect(fromCalls('roles')).toBe(1);
+    // `roles` is now read TWICE on the eligible path: once for the scoring
+    // context (title/required_skills) and once by loadActiveRoleScorecard for
+    // the role's active scorecard pointer (which is absent here → v1 path).
+    expect(fromCalls('roles')).toBe(2);
   });
 
   // ══════════════════════════════════════════════════════════════════

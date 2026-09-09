@@ -29,6 +29,8 @@ export { Field, TextField, TextArea, SelectField, controlClass } from './Field';
 export type { FieldProps, TextFieldProps, SelectFieldProps } from './Field';
 export { SegmentedControl } from './SegmentedControl';
 export type { SegmentedControlProps, SegmentedOption } from './SegmentedControl';
+export { Slider } from './Slider';
+export type { SliderProps } from './Slider';
 export { Pagination, usePagination, PAGE_SIZES } from './Pagination';
 export type { PaginationProps, PaginationState, PageSize } from './Pagination';
 export { ScrollArea } from './ScrollArea';

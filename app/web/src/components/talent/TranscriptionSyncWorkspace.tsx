@@ -28,6 +28,7 @@
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
+import { readScorecardAssessmentV2 } from '../../types';
 import type { Assessment, Session, TranscriptLine } from '../../types';
 import { StatusBadge } from '../design';
 import {
@@ -40,6 +41,7 @@ import {
   CandidateScorecardNarrative,
   CandidateScorecardRoleFit,
 } from './CandidateScorecard';
+import { CandidateScorecardV2 } from './CandidateScorecardV2';
 import { RecordingPlayer } from './RecordingPlayer';
 import type { RecordingPlayerHandle } from './RecordingPlayer';
 import { SeekableTranscript } from './SeekableTranscript';
@@ -205,23 +207,29 @@ export function TranscriptionSyncWorkspace({
     left: React.ReactNode,
     right: React.ReactNode,
     assessment: Assessment | null,
-  ) => (
-    <>
-      <div className="grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-12 lg:items-start">
-        <div className="min-w-0 space-y-4 sm:space-y-6 lg:col-span-7">
-          {left}
-          {!blocked && assessment && (
-            <CandidateScorecardNarrative assessment={assessment} parts="conflicts" />
-          )}
+  ) => {
+    // The resume-conflicts, role-fit and summary blocks read v1-only fields. A
+    // v2 (role-scorecard) assessment carries none of them — its own card renders
+    // everything — so they are shown only for a legacy v1 assessment.
+    const legacyNarrative = !blocked && assessment && readScorecardAssessmentV2(assessment) == null;
+    return (
+      <>
+        <div className="grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-12 lg:items-start">
+          <div className="min-w-0 space-y-4 sm:space-y-6 lg:col-span-7">
+            {left}
+            {legacyNarrative && (
+              <CandidateScorecardNarrative assessment={assessment!} parts="conflicts" />
+            )}
+          </div>
+          <div className="min-w-0 lg:col-span-5">{right}</div>
         </div>
-        <div className="min-w-0 lg:col-span-5">{right}</div>
-      </div>
-      {!blocked && assessment && <CandidateScorecardRoleFit assessment={assessment} />}
-      {!blocked && assessment && (
-        <CandidateScorecardNarrative assessment={assessment} parts="summary" />
-      )}
-    </>
-  );
+        {legacyNarrative && <CandidateScorecardRoleFit assessment={assessment!} />}
+        {legacyNarrative && (
+          <CandidateScorecardNarrative assessment={assessment!} parts="summary" />
+        )}
+      </>
+    );
+  };
 
   if (selectableSessions.length === 0) {
     return (
@@ -405,6 +413,9 @@ function ScorecardBlock({
   heading?: string;
 }) {
   const headingId = useId();
+  // v2 (role-scorecard) assessments render the metric-based card; everything
+  // else renders the legacy 1–10 card unchanged.
+  const v2 = assessment ? readScorecardAssessmentV2(assessment) : null;
   // A plain section, not a card: the scorecard's own sections are the first
   // card level and their sunken blocks the second, so wrapping the whole
   // thing in another card would make three — the nesting the owner flagged.
@@ -420,6 +431,8 @@ function ScorecardBlock({
         <p className="max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
           Scorecards are suppressed while an appeal is under review.
         </p>
+      ) : v2 ? (
+        <CandidateScorecardV2 scorecard={v2} />
       ) : assessment ? (
         <CandidateScorecard assessment={assessment} narrative="none" roleFit="none" />
       ) : (

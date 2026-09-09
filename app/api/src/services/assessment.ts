@@ -7,6 +7,8 @@ import { buildAssessmentPrompt, formatResumeFacts } from '../lib/prompts.js';
 import { insertNotificationIntent } from '../lib/notification-intent.js';
 import type { Assessment, TranscriptTurn } from '../lib/types.js';
 import { scoringProvenance } from '../lib/model-provenance.js';
+import { loadActiveRoleScorecard } from '../lib/scorecards/store.js';
+import { scoreWithScorecard } from '../lib/scorecards/scorer.js';
 import {
   createPhoneStores,
   createPhoneReadStore,
@@ -25,6 +27,25 @@ const assessmentLog = createLogger('assessment');
  * the authoritative `conversation_complete` terminal reason.
  */
 export const ERR_SESSION_NOT_COMPLETED = 'ERR_SESSION_NOT_COMPLETED';
+
+/**
+ * Phase 4: a RESCORE was requested for a session whose role has no active v2
+ * scorecard. A rescore produces an immutable `schema_version = 2` revision, so
+ * without a scorecard there is nothing to score against — fail closed rather
+ * than fabricate a v1 rescore (v1 rows carry no supersede/revision semantics
+ * and fall outside `uq_assessments_v2_session_revision`). The admin route maps
+ * this stable code to a 409.
+ */
+export const ERR_RESCORE_NO_SCORECARD = 'ERR_RESCORE_NO_SCORECARD';
+
+/**
+ * Phase 4: the bounded rescore-insert retry exhausted against a persistent
+ * (session_id, revision) race — nothing was written. The admin route maps this
+ * stable code to a RETRYABLE 409 (the caller may retry with the SAME request id,
+ * whose idempotency read then adopts whichever revision eventually landed). It
+ * must map to 409, never fall through to a 500.
+ */
+export const ERR_RESCORE_REVISION_CONFLICT = 'rescore_revision_conflict';
 
 // ── Runner abstraction for testability ──────────────────────────────────
 
@@ -57,6 +78,18 @@ export interface RunAssessmentOptions {
   readonly total?: number | null;
   /** 0072: `candidate_hangup` | `disconnected`. No PII. */
   readonly disconnectReason?: string;
+  /**
+   * Phase 4: EXPLICIT IMMUTABLE RESCORE. When present, this re-scores an
+   * already-completed session against its role's CURRENT active v2 scorecard
+   * and persists a NEW immutable revision that supersedes the latest one — the
+   * prior row is never mutated or deleted. It is idempotent per `requestId`:
+   * the `uq_assessments_rescore_request` partial index admits at most one
+   * assessment per id, so a repeat returns the existing revision without
+   * re-scoring. A rescore requires an active v2 scorecard; a role without one
+   * throws `ERR_RESCORE_NO_SCORECARD`. Absent → the ordinary first-score path,
+   * entirely unchanged (revision defaults to 1, no supersede, no request id).
+   */
+  readonly rescore?: { readonly requestId: string };
 }
 
 export interface AssessmentRunner {
@@ -127,6 +160,13 @@ async function runAssessmentImpl(
   const isPhone =
     options?.source === 'phone' || isPhoneSession(session.external_call_id as unknown);
 
+  // Phase 4: EXPLICIT IMMUTABLE RESCORE. A caller-supplied request id turns this
+  // call into a re-score of an already-completed session against the role's
+  // CURRENT active v2 scorecard, producing a NEW revision. Absent → the ordinary
+  // first-score path below, unchanged.
+  const rescoreRequestId = options?.rescore?.requestId ?? null;
+  const isRescore = rescoreRequestId !== null;
+
   // VOI-08: technical scoring eligibility — fail closed unless the session is
   // completed with the authoritative initial scoring reason. Blocks
   // failed/cancelled/expired/in_progress/created/waiting, missing/null or
@@ -154,7 +194,22 @@ async function runAssessmentImpl(
     session.status === 'expired' &&
     session.terminal_reason === 'grace_timeout';
 
-  if (!isCleanTerminal && !isCrashPartialTerminal) {
+  if (isRescore) {
+    // A rescore runs ONLY on a session that reached completion. It deliberately
+    // does NOT fall into the phone idempotent-completion reuse below: that path
+    // collapses to a single row per session (`maybeSingle`), whereas a rescored
+    // session has SEVERAL. `assessment_done` (a prior score already flipped the
+    // reason) is the ordinary case here, so gate on `completed` alone.
+    if (session.status !== 'completed') {
+      throw new Error(ERR_SESSION_NOT_COMPLETED);
+    }
+    // IDEMPOTENCY FIRST: a repeat with the same request id returns the existing
+    // revision unchanged — no re-score, no new row, none of the follow-on work.
+    // `uq_assessments_rescore_request` guarantees at most one, so this makes an
+    // admin retry safe, and it happens BEFORE any transcript fetch or LLM call.
+    const already = await loadAssessmentByRescoreRequestId(rescoreRequestId!);
+    if (already) return already;
+  } else if (!isCleanTerminal && !isCrashPartialTerminal) {
     // 0044: for the PHONE path only, an already-scored session is a SUCCESS,
     // not a refusal. Two legs racing a completion is the ordinary case a
     // reconnect creates: the winner scores and flips `terminal_reason` to
@@ -209,51 +264,163 @@ async function runAssessmentImpl(
     .eq('id', session.candidate_id)
     .single();
 
-  // The provenance-aware call uses the configured provider's single
-  // breaker-managed runner and returns the configured design-intent model for
-  // immutable provenance.
-  const { data: assessment, requestedModel: scoringModel } = await runClaudeJSONWithProvenance<Assessment>(
-    buildAssessmentPrompt({
-      roleTitle,
-      requiredSkills,
-      candidateName: candidate?.name ?? null,
-      transcript,
-      resumeFacts: formatResumeFacts((candidate?.parsed as any) ?? null),
-      // Anchor for any relative callback phrase the candidate used. The phone
-      // path always has a session start; the browser path never asks for a
-      // callback, so a missing anchor there is harmless.
-      callTimestampIso:
-        typeof (session as { started_at?: unknown }).started_at === 'string'
-          ? ((session as { started_at?: string }).started_at as string)
-          : undefined,
-    }),
-    { model: env.deepseekScoringModel },
-  );
+  // Shared candidate context for whichever scoring path runs.
+  const candidateName = candidate?.name ?? null;
+  const resumeFacts = formatResumeFacts((candidate?.parsed as any) ?? null);
+  // Anchor for any relative callback phrase the candidate used. The phone
+  // path always has a session start; the browser path never asks for a
+  // callback, so a missing anchor there is harmless.
+  const callTimestampIso =
+    typeof (session as { started_at?: unknown }).started_at === 'string'
+      ? ((session as { started_at?: string }).started_at as string)
+      : undefined;
 
-  // Recompute overall_score + recommendation in code (transparent, tunable).
-  // Screening-stage weights: soft skills + motivation dominate; role fit is light.
-  const { overall, recommendation } = computeOverall(assessment);
-  assessment.overall_score = overall;
-  assessment.recommendation = recommendation;
+  // FORWARD-ONLY v2 SELECTION: if the role has an ACTIVE, immutable scorecard
+  // configuration (migration 0088), this screening is scored against that
+  // role's configured metrics and persisted as `schema_version = 2`. Otherwise
+  // the legacy v1 dimension scoring runs, byte-identical to before. A missing
+  // scorecard resolves to null (see store.ts), so the v1 path is the default.
+  const activeScorecard = session.role_id
+    ? await loadActiveRoleScorecard(supabase, session.role_id)
+    : null;
 
-  // Build scoring provenance using the requested model.
-  const scoringProvenanceValue = scoringProvenance(scoringModel);
+  // Phase 4: a rescore is a v2-ONLY operation — there is no immutable-revision
+  // model for the legacy v1 dimension path. A role without an active scorecard
+  // therefore cannot be rescored; fail closed (the route maps this to a 409)
+  // rather than silently writing a v1 row that supersedes nothing. This is
+  // checked before scoring, so no LLM call is made on the reject.
+  if (isRescore && !activeScorecard) {
+    throw new Error(ERR_RESCORE_NO_SCORECARD);
+  }
 
-  const basePayload: Record<string, unknown> = {
-    session_id: sessionId,
-    candidate_id: session.candidate_id,
-    english: assessment.english,
-    tone: assessment.tone,
-    communication: assessment.communication,
-    motivation: assessment.motivation,
-    role_fit: assessment.role_fit,
-    resume_conflicts: assessment.resume_conflicts ?? [],
-    overall_score: assessment.overall_score,
-    recommendation: assessment.recommendation,
-    summary: assessment.summary,
-    raw: assessment, // full object (fallback if optional columns absent)
-    provenance: scoringProvenanceValue, // LLM-06 provenance — required, fail closed if missing
-  };
+  // The next immutable revision and the row it supersedes. A FIRST score (no
+  // rescore) stays revision 1 with no supersede. A RESCORE reads the current
+  // max revision for this session across ALL schema versions and advances it;
+  // the prior row is never touched. Null max → the session has no assessment yet,
+  // so the rescore writes revision 1 with no supersede (a request-id-tagged first
+  // score).
+  //
+  // ALL-SCHEMA max, not v2-only: a phone session first scored as v1 (revision 1,
+  // source='phone') and later rescored would, under a v2-only max, recompute
+  // revision 1 forever — colliding with uq_assessments_phone_session (partial
+  // over source='phone' AND revision=1, schema-agnostic, 0088) on every one of
+  // the bounded retries and finally throwing. Advancing off the all-schema max
+  // sends that rescore to revision 2, clear of both the phone index and
+  // uq_assessments_v2_session_revision.
+  let rescoreRevision = 1;
+  let supersedesAssessmentId: string | null = null;
+  if (isRescore) {
+    const latest = await loadLatestRevisionAnySchema(sessionId);
+    rescoreRevision = (latest?.maxRevision ?? 0) + 1;
+    supersedesAssessmentId = latest?.id ?? null;
+  }
+
+  // The object returned to callers and handed to the phone callback backstop.
+  // v1 → the scored Assessment; v2 → the ScorecardAssessmentV2 result (no v1
+  // sub-scores, no `callback` — so the backstop is a safe no-op for v2). Cast at
+  // the branch because the fixed runner signature is v1-shaped; the runtime
+  // value is the genuine result and no v1 field is ever fabricated.
+  let assessmentForReturn: Assessment;
+  // Drives the candidate status write below. v2 may be 'human_review'; the
+  // comparison there only cares about 'reject', so the wider union is safe.
+  let recommendationValue: 'advance' | 'hold' | 'reject' | 'human_review';
+  let scoringProvenanceValue: ReturnType<typeof scoringProvenance>;
+  let basePayload: Record<string, unknown>;
+
+  if (activeScorecard) {
+    // ── SCHEMA v2: role-configured scorecard scoring ────────────────────
+    const scored = await scoreWithScorecard(
+      {},
+      {
+        scorecard: activeScorecard,
+        roleTitle,
+        candidateName,
+        transcript,
+        resumeFacts,
+        callTimestampIso,
+      },
+    );
+    // Provenance is the configured scoring model (the v2 scorer's default infer
+    // uses exactly this model); required and fail-closed if missing.
+    scoringProvenanceValue = scoringProvenance(env.deepseekScoringModel);
+    recommendationValue = scored.recommendation;
+    assessmentForReturn = scored as unknown as Assessment;
+    basePayload = {
+      session_id: sessionId,
+      candidate_id: session.candidate_id,
+      // v2 metadata satisfying chk_assessments_v2_shape: metric_results is a
+      // non-null jsonb array, and weighted_score_5 is present iff status is
+      // 'complete' (the scorer nulls it for 'incomplete_evidence').
+      schema_version: 2,
+      revision: rescoreRevision,
+      // Phase 4: on a RESCORE this new revision records the row it supersedes and
+      // the idempotency key. On a first score both keys are omitted so the column
+      // defaults (null) apply and the payload is byte-identical to before.
+      ...(isRescore
+        ? {
+            supersedes_assessment_id: supersedesAssessmentId,
+            rescore_request_id: rescoreRequestId,
+          }
+        : {}),
+      scorecard_version_id: activeScorecard.id,
+      metric_results: scored.metricResults,
+      weighted_score_5: scored.weightedScore5,
+      scoring_status: scored.status,
+      overall_score: scored.overallScore,
+      // chk_assessments_recommendation admits only advance|hold|reject; a NULL
+      // satisfies the CHECK. 'human_review' (incomplete evidence) is therefore
+      // stored NULL in the column and preserved truthfully in `raw`.
+      recommendation: scored.recommendation === 'human_review' ? null : scored.recommendation,
+      // The v1 dimension columns (english/tone/communication/motivation/
+      // role_fit/summary/resume_conflicts) are all NULLABLE and are left unset
+      // on purpose — a v2 row invents no v1 sub-scores.
+      raw: scored, // full v2 object (mirrors v1's "raw = full result" contract)
+      provenance: scoringProvenanceValue, // LLM-06 provenance — required, fail closed if missing
+    };
+  } else {
+    // ── SCHEMA v1: legacy dimension scoring (UNCHANGED) ─────────────────
+    // The provenance-aware call uses the configured provider's single
+    // breaker-managed runner and returns the configured design-intent model for
+    // immutable provenance.
+    const { data: assessment, requestedModel: scoringModel } = await runClaudeJSONWithProvenance<Assessment>(
+      buildAssessmentPrompt({
+        roleTitle,
+        requiredSkills,
+        candidateName,
+        transcript,
+        resumeFacts,
+        callTimestampIso,
+      }),
+      { model: env.deepseekScoringModel },
+    );
+
+    // Recompute overall_score + recommendation in code (transparent, tunable).
+    // Screening-stage weights: soft skills + motivation dominate; role fit is light.
+    const { overall, recommendation } = computeOverall(assessment);
+    assessment.overall_score = overall;
+    assessment.recommendation = recommendation;
+
+    // Build scoring provenance using the requested model.
+    scoringProvenanceValue = scoringProvenance(scoringModel);
+    recommendationValue = recommendation;
+    assessmentForReturn = assessment;
+
+    basePayload = {
+      session_id: sessionId,
+      candidate_id: session.candidate_id,
+      english: assessment.english,
+      tone: assessment.tone,
+      communication: assessment.communication,
+      motivation: assessment.motivation,
+      role_fit: assessment.role_fit,
+      resume_conflicts: assessment.resume_conflicts ?? [],
+      overall_score: assessment.overall_score,
+      recommendation: assessment.recommendation,
+      summary: assessment.summary,
+      raw: assessment, // full object (fallback if optional columns absent)
+      provenance: scoringProvenanceValue, // LLM-06 provenance — required, fail closed if missing
+    };
+  }
   // 0044: passed ONLY for the phone path. The browser payload therefore has
   // exactly the keys it had before this migration, and the column default
   // (`browser`) applies to it — so `uq_assessments_phone_session`, which is
@@ -278,57 +445,102 @@ async function runAssessmentImpl(
       disconnect_reason: options?.disconnectReason ?? 'disconnected',
     };
     basePayload.partial = true;
-    // Attach to `raw` non-destructively: the full LLM object is preserved and a
-    // `partial` block is added alongside it.
-    basePayload.raw = { ...(assessment as unknown as Record<string, unknown>), partial: partialMeta };
+    // Attach to `raw` non-destructively: the full scoring object (v1 assessment
+    // OR v2 result) is preserved and a `partial` block is added alongside it.
+    basePayload.raw = { ...(basePayload.raw as Record<string, unknown>), partial: partialMeta };
   }
 
-  let { data: row, error: aErr } = await supabase
-    .from('assessments')
-    .insert(basePayload)
-    .select()
-    .single();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- the schema
+  // client returns loosely-typed rows; `row.id` is read below exactly as the
+  // pre-Phase-4 code did.
+  let row: any;
 
-  // If optional communication/motivation columns haven't been migrated yet,
-  // retry with those columns only.  Provenance is *never* dropped — it must
-  // exist in the schema.  If the provenance column itself is missing, the
-  // insert fails closed (the migration is a prerequisite).
-  if (aErr && /(resume_conflicts|communication|motivation)/i.test(aErr.message)) {
-    const { resume_conflicts, communication, motivation, ...base } = basePayload;
-    ({ data: row, error: aErr } = await supabase
+  if (isRescore) {
+    // ── Phase 4: IMMUTABLE RESCORE insert ───────────────────────────────
+    // A NEW revision row is inserted; the prior assessment is NEVER mutated or
+    // deleted. Two partial unique indexes can raise a 23505 here, and we tell
+    // them apart WITHOUT parsing a constraint name (which would rot on a rename
+    // and match unrelated driver strings) — by reading back by request id:
+    //   * uq_assessments_rescore_request — another caller with the SAME request
+    //     id won the idempotency race; a row with our id now exists → return it
+    //     unchanged (no new row, and none of the follow-on work runs).
+    //   * uq_assessments_v2_session_revision — a concurrent revision took our
+    //     (session_id, revision) slot; our id is NOT present, so re-read
+    //     max(revision)+1 and the new latest, then retry. Bounded to a couple of
+    //     attempts. Scoring is NOT repeated — only the insert is retried.
+    const MAX_REVISION_ATTEMPTS = 4;
+    for (let attempt = 0; attempt < MAX_REVISION_ATTEMPTS; attempt += 1) {
+      const { data, error } = await supabase
+        .from('assessments')
+        .insert(basePayload)
+        .select()
+        .single();
+      if (!error) {
+        row = data;
+        break;
+      }
+      if (!isUniqueViolation(error)) throw new Error(error.message);
+      const winner = await loadAssessmentByRescoreRequestId(rescoreRequestId!);
+      if (winner) return winner; // idempotency race — another request won.
+      const latest = await loadLatestRevisionAnySchema(sessionId);
+      basePayload.revision = (latest?.maxRevision ?? 0) + 1;
+      basePayload.supersedes_assessment_id = latest?.id ?? null;
+    }
+    // Exhausted the bounded retry against a persistent revision race. Nothing
+    // was written; fail loudly rather than silently drop the rescore. The
+    // caller may retry with the SAME request id — the idempotency read above
+    // then adopts whichever revision eventually landed. The route maps this
+    // stable code to a retryable 409.
+    if (!row) throw new Error(ERR_RESCORE_REVISION_CONFLICT);
+  } else {
+    let { data, error: aErr } = await supabase
       .from('assessments')
-      .insert(base)
+      .insert(basePayload)
       .select()
-      .single());
+      .single();
+
+    // If optional communication/motivation columns haven't been migrated yet,
+    // retry with those columns only.  Provenance is *never* dropped — it must
+    // exist in the schema.  If the provenance column itself is missing, the
+    // insert fails closed (the migration is a prerequisite).
+    if (aErr && /(resume_conflicts|communication|motivation)/i.test(aErr.message)) {
+      const { resume_conflicts, communication, motivation, ...base } = basePayload;
+      ({ data, error: aErr } = await supabase
+        .from('assessments')
+        .insert(base)
+        .select()
+        .single());
+    }
+    // 0072: if the `partial` column has not been migrated yet, retry WITHOUT it.
+    // The coverage/reason detail still lands because it also rides in `raw` (a
+    // jsonb column that is always present), so a stale schema loses only the
+    // filterable boolean, never the scorecard.
+    if (aErr && /\bpartial\b/i.test(aErr.message)) {
+      const { partial, ...base } = basePayload;
+      ({ data, error: aErr } = await supabase
+        .from('assessments')
+        .insert(base)
+        .select()
+        .single());
+    }
+    // ── 0044: EXACTLY ONE phone assessment per session ──────────────────
+    // `uq_assessments_phone_session` is the authority. Two concurrent phone
+    // completions both reach this insert; one wins and one gets 23505, and the
+    // loser must REUSE the winner's row rather than fail. That is what makes
+    // "scored exactly once, and one writeback" true under concurrency, which
+    // the pre-0044 `terminal_reason` flip could not manage — it ran AFTER the
+    // insert and admitted its own TOCTOU race.
+    //
+    // The loser returns HERE, before the notification intent, the candidate
+    // status update, the `terminal_reason` flip and the Ashby completion
+    // observer — so none of those runs twice.
+    if (aErr && isPhone && isUniqueViolation(aErr)) {
+      const existing = await loadPhoneAssessment(sessionId);
+      if (existing) return existing;
+    }
+    if (aErr) throw new Error(aErr.message);
+    row = data;
   }
-  // 0072: if the `partial` column has not been migrated yet, retry WITHOUT it.
-  // The coverage/reason detail still lands because it also rides in `raw` (a
-  // jsonb column that is always present), so a stale schema loses only the
-  // filterable boolean, never the scorecard.
-  if (aErr && /\bpartial\b/i.test(aErr.message)) {
-    const { partial, ...base } = basePayload;
-    ({ data: row, error: aErr } = await supabase
-      .from('assessments')
-      .insert(base)
-      .select()
-      .single());
-  }
-  // ── 0044: EXACTLY ONE phone assessment per session ──────────────────
-  // `uq_assessments_phone_session` is the authority. Two concurrent phone
-  // completions both reach this insert; one wins and one gets 23505, and the
-  // loser must REUSE the winner's row rather than fail. That is what makes
-  // "scored exactly once, and one writeback" true under concurrency, which
-  // the pre-0044 `terminal_reason` flip could not manage — it ran AFTER the
-  // insert and admitted its own TOCTOU race.
-  //
-  // The loser returns HERE, before the notification intent, the candidate
-  // status update, the `terminal_reason` flip and the Ashby completion
-  // observer — so none of those runs twice.
-  if (aErr && isPhone && isUniqueViolation(aErr)) {
-    const existing = await loadPhoneAssessment(sessionId);
-    if (existing) return existing;
-  }
-  if (aErr) throw new Error(aErr.message);
 
   // Phase 9 L4 (invariant 9): a recruiter notification intent is logged
   // IDEMPOTENTLY and only after the assessment row is successfully persisted.
@@ -365,7 +577,7 @@ async function runAssessmentImpl(
   if (!decisionBlocked) {
     await supabase
       .from('candidates')
-      .update({ status: assessment.recommendation === 'reject' ? 'rejected' : 'screened' })
+      .update({ status: recommendationValue === 'reject' ? 'rejected' : 'screened' })
       .eq('id', session.candidate_id);
   }
 
@@ -416,13 +628,13 @@ async function runAssessmentImpl(
   //     assessment: the scorecard is the product, the backstop is a courtesy.
   //   * NO PII IN LOGS. Only bounded reason codes and the extracted flag.
   if (isPhone) {
-    await bookPostCallCallbackBestEffort(sessionId, assessment).catch(() => {
+    await bookPostCallCallbackBestEffort(sessionId, assessmentForReturn).catch(() => {
       // Unreachable — the helper never throws — but a second belt so a
       // programming error inside it can never discard a scored assessment.
     });
   }
 
-  return { ...assessment, id: row.id };
+  return { ...assessmentForReturn, id: row.id };
 }
 
 /**
@@ -542,12 +754,16 @@ function isUniqueViolation(error: { code?: string | null } | null | undefined): 
 }
 
 /**
- * Read back the phone assessment that already exists for this session.
+ * Read back the ORIGINAL phone assessment that already exists for this session.
  *
  * Returns `null` when there is none — the caller must then fail rather than
- * invent a success. `maybeSingle()` is deliberate: with the partial unique
- * index in place there can be at most one, and a second row would be a
- * schema failure that should surface rather than be silently picked from.
+ * invent a success. Scoped to `revision = 1` deliberately: the reuse must land
+ * on the original first-score winner, and that is exactly the row
+ * `uq_assessments_phone_session` admits (partial over `source = 'phone' AND
+ * revision = 1`, 0088). Once a phone session has been rescored it carries two or
+ * more `source = 'phone'` rows, so a `maybeSingle()` WITHOUT the revision filter
+ * would error on the multiple rows and break the idempotent reuse; the filter
+ * makes the read deterministic — at most one row can satisfy it.
  */
 async function loadPhoneAssessment(
   sessionId: string,
@@ -557,11 +773,67 @@ async function loadPhoneAssessment(
     .select('id,raw')
     .eq('session_id', sessionId)
     .eq('source', 'phone')
+    .eq('revision', 1)
     .maybeSingle();
   if (error || !data?.id) return null;
   const raw = (data.raw ?? null) as Assessment | null;
   if (!raw) return null;
   return { ...raw, id: data.id as string };
+}
+
+/**
+ * Phase 4: read back the assessment already recorded under a rescore request
+ * id, if any. `uq_assessments_rescore_request` is partial over
+ * `rescore_request_id is not null` and admits at most one row, so `maybeSingle`
+ * is exact. Returns null when the id has not been used — the caller then scores
+ * a fresh revision. A read error also resolves to null: the idempotency read is
+ * an OPTIMISATION (it avoids re-scoring the common retry), and the insert-time
+ * 23505 handling is the authoritative backstop, so a transient read failure
+ * here never risks a duplicate — the unique index still forces the reuse.
+ */
+async function loadAssessmentByRescoreRequestId(
+  rescoreRequestId: string,
+): Promise<(Assessment & { id: string }) | null> {
+  const { data, error } = await supabase
+    .from('assessments')
+    .select('id,raw')
+    .eq('rescore_request_id', rescoreRequestId)
+    .maybeSingle();
+  if (error || !data?.id) return null;
+  const raw = (data.raw ?? null) as Assessment | null;
+  if (!raw) return null;
+  return { ...raw, id: data.id as string };
+}
+
+/**
+ * Phase 4 (rev-collision fix): the current maximum revision for a session across
+ * ALL schema versions, and the id of that latest row. Used to compute the next
+ * immutable rescore revision (max + 1) and its supersede pointer.
+ *
+ * ALL schema versions on purpose — NOT `schema_version = 2` only. A phone
+ * session first scored as v1 carries a `revision = 1` row; scoping the max to v2
+ * would ignore it, recompute revision 1, and collide forever with
+ * `uq_assessments_phone_session` (partial over `source = 'phone' AND revision =
+ * 1`). Advancing off the all-schema max sends the v1-origin rescore to revision
+ * 2 — clear of both that phone index and `uq_assessments_v2_session_revision`.
+ *
+ * Ordered by revision desc then created_at desc, so the single row returned is
+ * the highest revision and, among any ties, the newest. Null when the session
+ * has no assessment yet — the rescore then writes revision 1 with no supersede.
+ */
+async function loadLatestRevisionAnySchema(
+  sessionId: string,
+): Promise<{ id: string; maxRevision: number } | null> {
+  const { data, error } = await supabase
+    .from('assessments')
+    .select('id,revision,created_at')
+    .eq('session_id', sessionId)
+    .order('revision', { ascending: false })
+    .order('created_at', { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error || !data?.id || typeof data.revision !== 'number') return null;
+  return { id: data.id as string, maxRevision: data.revision as number };
 }
 
 // ── Weighted overall score (screening-stage; tune here) ──────────────

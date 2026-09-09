@@ -382,12 +382,14 @@ export const PROVIDER_BOUNDARIES: readonly ProviderBoundaryEntry[] = [
     runtime: 'api',
     boundaryKind: 'scoring',
     constructorPath: 'app/api/src/services/assessment.ts',
-    envVars: ['CLAUDE_SCORING_MODEL'],
+    envVars: ['DEEPSEEK_SCORING_MODEL', 'DEEPSEEK_REASONING_EFFORT'],
     allowlists: [],
     policyStatus: 'PROPOSED',
     notes:
-      'Runs buildAssessmentPrompt through runClaudeJSONWithProvenance with the scoring model, recomputes ' +
-      'overall/recommendation in code from fixed weights, and persists the assessment with scoringProvenance.',
+      'Runs buildAssessmentPrompt through runClaudeJSONWithProvenance (a DeepSeek runner behind the ' +
+      'legacy claude.ts name) with DEEPSEEK_SCORING_MODEL (V4-Pro) at reasoning DEEPSEEK_REASONING_EFFORT ' +
+      '(high), recomputes overall/recommendation in code from fixed weights, and persists the assessment ' +
+      'with scoringProvenance.',
   },
   {
     id: 'api-provenance',
