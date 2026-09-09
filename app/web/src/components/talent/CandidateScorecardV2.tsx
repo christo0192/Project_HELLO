@@ -108,6 +108,8 @@ export function CandidateScorecardV2({ scorecard }: CandidateScorecardV2Props) {
   const reco = RECOMMENDATION[scorecard.recommendation] ?? RECOMMENDATION.human_review;
   const overall = scorecard.overallScore;
   const incomplete = scorecard.status === 'incomplete_evidence';
+  const totalCount = scorecard.metrics.length;
+  const scoredCount = scorecard.metrics.filter((metric) => metric.score != null).length;
 
   return (
     <div className="space-y-4">
@@ -145,11 +147,12 @@ export function CandidateScorecardV2({ scorecard }: CandidateScorecardV2Props) {
         {incomplete && (
           <div className="mt-3 flex flex-wrap items-center gap-2 border-t border-[var(--c-border-light)] pt-2.5">
             <Tag tone="caution" srPrefix="Status:">
-              Incomplete evidence
+              {overall == null ? 'Incomplete evidence' : 'Provisional score'}
             </Tag>
             <span className="text-xs text-[var(--c-ink-secondary)]">
-              One or more metrics could not be scored from the available evidence, so the
-              overall score is withheld pending human review.
+              {overall == null
+                ? 'No metric could be scored from the available evidence — this screening needs human review.'
+                : `Provisional score from ${scoredCount} of ${totalCount} metrics — the rest lacked evidence and were excluded from the weighted score. Confirm before a decision.`}
             </span>
           </div>
         )}

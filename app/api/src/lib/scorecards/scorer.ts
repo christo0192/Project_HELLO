@@ -4,7 +4,8 @@
  * Flow (all server-owned; the model only supplies per-metric judgements):
  *   buildScorecardPrompt → infer → parse `results` array
  *     → domain.validateMetricResults  (exactly one per metric, closed shape)
- *     → domain.calculateWeightedScore  (null if ANY metric lacks evidence)
+ *     → domain.calculateWeightedScore  (PARTIAL: renormalized over the evidenced
+ *                                       metrics; null only when NONE were scored)
  *     → domain.weightedScoreToOverall → domain.recommendationForOverall
  *
  * FAIL-CLOSED: any parse/shape failure throws `ScorecardValidationError`. The
@@ -13,8 +14,12 @@
  * the configured rubric or it fails loudly for retry.
  *
  * The status is `incomplete_evidence` whenever ANY metric comes back
- * `insufficient_evidence`; in that case `weightedScore5`/`overallScore` are
- * `null` (the schema forbids a weighted score without full evidence) and the
+ * `insufficient_evidence`. PARTIAL SCORING: a mix of scored + insufficient
+ * metrics still yields a real `weightedScore5`/`overallScore`/`recommendation`
+ * (renormalized over the scored metrics) so a good screening is never voided by
+ * one un-evidenced metric — it is `incomplete_evidence` AND provisionally scored,
+ * and the recruiter card shows that. Only when EVERY metric is
+ * `insufficient_evidence` are `weightedScore5`/`overallScore` `null` and the
  * recommendation collapses to `human_review`.
  */
 

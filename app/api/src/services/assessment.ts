@@ -324,33 +324,53 @@ async function runAssessmentImpl(
   // Drives the candidate status write below. v2 may be 'human_review'; the
   // comparison there only cares about 'reject', so the wider union is safe.
   let recommendationValue: 'advance' | 'hold' | 'reject' | 'human_review';
+  // True when the v2 verdict is PROVISIONAL (incomplete_evidence — scored over a
+  // SUBSET of metrics). A provisional verdict is shown on the card but must NOT
+  // auto-terminate the candidate below, even if the provisional call is 'reject'.
+  let isProvisionalRecommendation = false;
   let scoringProvenanceValue: ReturnType<typeof scoringProvenance>;
   let basePayload: Record<string, unknown>;
 
   if (activeScorecard) {
     // ── SCHEMA v2: role-configured scorecard scoring ────────────────────
-    const scored = await scoreWithScorecard(
-      {},
-      {
-        scorecard: activeScorecard,
-        roleTitle,
-        candidateName,
-        transcript,
-        resumeFacts,
-        callTimestampIso,
-      },
-    );
+    let scored: Awaited<ReturnType<typeof scoreWithScorecard>>;
+    try {
+      scored = await scoreWithScorecard(
+        {},
+        {
+          scorecard: activeScorecard,
+          roleTitle,
+          candidateName,
+          transcript,
+          resumeFacts,
+          callTimestampIso,
+        },
+      );
+    } catch (err) {
+      // A hard scorer/provider failure gets a NAMED boundary signal before it
+      // propagates. The queue retries this job to its cap and, on exhaustion,
+      // DLQs it — where v_funnel_failures now surfaces it (0091). Sanitized: the
+      // error message (which can carry provider text) is never logged, only its
+      // class.
+      assessmentLog.warn('unknown_event', {
+        error_category: 'scorecard_scoring_failed',
+        error_type: err instanceof Error ? err.name : 'unknown',
+      });
+      throw err;
+    }
     // Provenance is the configured scoring model (the v2 scorer's default infer
     // uses exactly this model); required and fail-closed if missing.
     scoringProvenanceValue = scoringProvenance(env.deepseekScoringModel);
     recommendationValue = scored.recommendation;
+    isProvisionalRecommendation = scored.status === 'incomplete_evidence';
     assessmentForReturn = scored as unknown as Assessment;
     basePayload = {
       session_id: sessionId,
       candidate_id: session.candidate_id,
-      // v2 metadata satisfying chk_assessments_v2_shape: metric_results is a
-      // non-null jsonb array, and weighted_score_5 is present iff status is
-      // 'complete' (the scorer nulls it for 'incomplete_evidence').
+      // v2 metadata satisfying chk_assessments_v2_shape (relaxed by 0091):
+      // metric_results is a non-null jsonb array; a 'complete' row always carries a
+      // weighted_score_5, and an 'incomplete_evidence' row carries a PROVISIONAL one
+      // when >=1 metric was scored (null only when none were — partial scoring).
       schema_version: 2,
       revision: rescoreRevision,
       // Phase 4: on a RESCORE this new revision records the row it supersedes and
@@ -575,9 +595,14 @@ async function runAssessmentImpl(
     candidateRow?.decision_use_blocked_at != null &&
     candidateRow.decision_use_blocked_at !== '';
   if (!decisionBlocked) {
+    // Auto-terminate to 'rejected' ONLY on a COMPLETE reject. A PROVISIONAL
+    // reject (incomplete_evidence — scored over a subset of metrics) must land
+    // 'screened' so a human confirms before the candidate is rejected on partial
+    // evidence; the provisional verdict is still shown on the scorecard.
+    const terminalReject = recommendationValue === 'reject' && !isProvisionalRecommendation;
     await supabase
       .from('candidates')
-      .update({ status: recommendationValue === 'reject' ? 'rejected' : 'screened' })
+      .update({ status: terminalReject ? 'rejected' : 'screened' })
       .eq('id', session.candidate_id);
   }
 

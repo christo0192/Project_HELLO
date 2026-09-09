@@ -2,10 +2,12 @@
  * scorer.ts — role-configured scorecard scoring, all boundaries mocked.
  *
  * Proves the scorer computes server-owned weighted/overall/recommendation/status
- * from a valid model output, collapses to incomplete_evidence + null weighted
- * when ANY metric lacks evidence, and FAILS CLOSED (throws) on malformed,
- * unknown-id, duplicate, or count-mismatched model output — never fabricating a
- * score. The inference boundary is injected, so no network/CLI call happens.
+ * from a valid model output, marks status incomplete_evidence when ANY metric
+ * lacks evidence while STILL producing a provisional weighted/overall/reco
+ * renormalized over the scored metrics (null only when NONE scored), and FAILS
+ * CLOSED (throws) on malformed, unknown-id, duplicate, or count-mismatched model
+ * output — never fabricating a score. The inference boundary is injected, so no
+ * network/CLI call happens.
  */
 
 import { describe, it, expect, vi } from 'vitest';
@@ -97,18 +99,33 @@ describe('scoreWithScorecard — valid output', () => {
   });
 });
 
-describe('scoreWithScorecard — insufficient evidence', () => {
-  it('collapses to incomplete_evidence with null weighted/overall and human_review', async () => {
+describe('scoreWithScorecard — insufficient evidence (PARTIAL scoring)', () => {
+  it('stays incomplete_evidence but still yields a PROVISIONAL score over the scored metrics', async () => {
+    // One metric lacks evidence, two are scored. The scorecard must NOT be
+    // voided (the production failure): renormalize over {metric-0: 5000@5,
+    // metric-1: 3000@3} = (25000+9000)/8000 = 4.25 → overall round((4.25-1)/4*100)
+    // = 81 → 'advance'. Status remains incomplete_evidence so the card can flag it.
     const infer = inferReturning({ results: modelResults([5, 3, null]) });
+    const result = await scoreWithScorecard({ infer }, input());
+
+    expect(result.status).toBe('incomplete_evidence');
+    expect(result.weightedScore5).toBe(4.25);
+    expect(result.overallScore).toBe(81);
+    expect(result.recommendation).toBe('advance');
+    // The insufficient metric keeps score null; it is not invented.
+    expect(result.metricResults[2].score).toBeNull();
+    expect(result.metricResults[2].evidenceStatus).toBe('insufficient_evidence');
+  });
+
+  it('collapses to null weighted/overall + human_review ONLY when NO metric was scored', async () => {
+    const infer = inferReturning({ results: modelResults([null, null, null]) });
     const result = await scoreWithScorecard({ infer }, input());
 
     expect(result.status).toBe('incomplete_evidence');
     expect(result.weightedScore5).toBeNull();
     expect(result.overallScore).toBeNull();
     expect(result.recommendation).toBe('human_review');
-    // The insufficient metric keeps score null; it is not invented.
-    expect(result.metricResults[2].score).toBeNull();
-    expect(result.metricResults[2].evidenceStatus).toBe('insufficient_evidence');
+    expect(result.metricResults.every((r) => r.score === null)).toBe(true);
   });
 });
 
