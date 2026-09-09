@@ -156,9 +156,12 @@ export function scorecardSourceFromV2Assessment(
     return { blocked: 'not_v2' };
   }
 
-  // 2. Fail closed on incomplete evidence: no overall may be invented. The
-  //    scorer nulls weighted_score_5 whenever any metric lacked evidence, so a
-  //    non-'complete' status or a null/out-of-range weighted score is blocked.
+  // 2. Fail closed on anything less than fully-evidenced. Since partial scoring
+  //    (0091) an 'incomplete_evidence' row MAY carry a provisional weighted score,
+  //    but that verdict is NOT authoritative for an Ashby writeback — a human must
+  //    confirm it first. So this gate keys on STATUS: only a 'complete' row flows
+  //    on; any non-'complete' status is blocked here (the weighted null/range check
+  //    below is then a defensive backstop, unreachable for a complete row).
   if (row.scoring_status !== 'complete') {
     return { blocked: 'incomplete_evidence' };
   }

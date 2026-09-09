@@ -123,6 +123,56 @@ const V2_INCOMPLETE = {
   raw: V2_INCOMPLETE_RAW,
 } as unknown as Assessment;
 
+// PARTIAL: incomplete_evidence but WITH a provisional score (the recovered /
+// go-forward shape). Two metrics scored, one insufficient → weighted 3.0 /
+// overall 50 / 'hold'. The card must show the number + a "Provisional score"
+// banner, NOT a blank "—" / human-review card.
+const V2_PARTIAL_RAW: ScorecardAssessmentV2 = {
+  schemaVersion: 2,
+  scorecardVersionId: 'ver-3',
+  revision: 1,
+  status: 'incomplete_evidence',
+  weightedScore5: 3.0,
+  overallScore: 50,
+  recommendation: 'hold',
+  metricResults: [
+    {
+      configMetricId: 'sm-0',
+      score: 3,
+      evidenceStatus: 'scored',
+      rationale: 'Clear, structured answers throughout.',
+      evidenceRefs: [],
+      metric: snapshot(0, 'Communication', 'communication', 3400),
+    },
+    {
+      configMetricId: 'sm-1',
+      score: null,
+      evidenceStatus: 'insufficient_evidence',
+      rationale: 'Compensation was never discussed on this call.',
+      evidenceRefs: [],
+      metric: snapshot(1, 'Compensation fit', 'compensation_fit', 3300),
+    },
+    {
+      configMetricId: 'sm-2',
+      score: 3,
+      evidenceStatus: 'scored',
+      rationale: 'Consistent tenure across roles.',
+      evidenceRefs: [],
+      metric: snapshot(2, 'Stability', 'stability', 3300),
+    },
+  ],
+};
+
+const V2_PARTIAL = {
+  id: 'a-v2c',
+  schema_version: 2,
+  scoring_status: 'incomplete_evidence',
+  weighted_score_5: 3.0,
+  overall_score: 50,
+  recommendation: 'hold',
+  raw: V2_PARTIAL_RAW,
+} as unknown as Assessment;
+
 const V1: Assessment = {
   id: 'a-v1',
   overall_score: 72,
@@ -185,7 +235,7 @@ describe('CandidateScorecardV2', () => {
     expect(screen.getByText('Hold')).toBeInTheDocument();
   });
 
-  it('shows "Insufficient evidence" and withholds the overall when incomplete', () => {
+  it('shows "Insufficient evidence" and withholds the overall when NO metric was scored', () => {
     render(
       <CandidateShell>
         <CandidateScorecardV2 scorecard={readScorecardAssessmentV2(V2_INCOMPLETE)!} />
@@ -195,6 +245,27 @@ describe('CandidateScorecardV2', () => {
     expect(screen.getByText('Incomplete evidence')).toBeInTheDocument();
     expect(screen.getByText('—')).toBeInTheDocument();
     expect(screen.getByText('Needs human review')).toBeInTheDocument();
+  });
+
+  it('shows a PROVISIONAL score (never blank) when some metrics scored and some did not', () => {
+    render(
+      <CandidateShell>
+        <CandidateScorecardV2 scorecard={readScorecardAssessmentV2(V2_PARTIAL)!} />
+      </CandidateShell>,
+    );
+    // The overall number is shown (NOT the blank "—"), with its recommendation.
+    expect(screen.queryByText('—')).not.toBeInTheDocument();
+    expect(screen.getAllByText('50').length).toBeGreaterThan(0);
+    expect(screen.getByText(/3\.00/)).toBeInTheDocument();
+    expect(screen.getByText('Hold')).toBeInTheDocument();
+    // It is flagged PROVISIONAL, not "Incomplete evidence".
+    expect(screen.getByText('Provisional score')).toBeInTheDocument();
+    expect(screen.queryByText('Incomplete evidence')).not.toBeInTheDocument();
+    // The coverage caveat names the scored/total split (2 of 3 here).
+    expect(screen.getByText(/Provisional score from 2 of 3 metrics/)).toBeInTheDocument();
+    // The scored metrics carry their real SCORE_LABELS word; the unevidenced one is flagged.
+    expect(screen.getByText('Insufficient evidence')).toBeInTheDocument();
+    expect(screen.getAllByText('Score · Average').length).toBe(2); // score 3 → SCORE_LABELS[3]
   });
 });
 

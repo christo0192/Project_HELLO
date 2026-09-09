@@ -187,10 +187,25 @@ export function calculateWeightedScore(
 ): number | null {
   const configured = validateRoleMetrics(configuredMetrics);
   const validated = validateMetricResults(configured, results);
-  if (validated.some((result) => result.score === null)) return null;
   const byId = new Map(validated.map((result) => [result.configMetricId, result]));
-  const score = configured.reduce((sum, metric) => sum + metric.weightBps * byId.get(metric.id)!.score!, 0) / SCORECARD_WEIGHT_TOTAL_BPS;
-  return Math.round(score * 10_000) / 10_000;
+  // PARTIAL SCORING: average over the metrics that HAVE a score, renormalizing
+  // their configured weights among themselves. A single metric the model could
+  // not evidence must NOT void the whole scorecard — that discarded the good
+  // scores and produced a blank "human review" card (the exact production
+  // failure this repairs). The result is null ONLY when NOT ONE metric was
+  // scored (a genuinely unscoreable screening → human_review). When every metric
+  // is scored, weightTotal == SCORECARD_WEIGHT_TOTAL_BPS, so this is byte-for-byte
+  // the prior full-coverage result.
+  let weightedSum = 0;
+  let weightTotal = 0;
+  for (const metric of configured) {
+    const score = byId.get(metric.id)!.score;
+    if (score === null) continue;
+    weightedSum += metric.weightBps * score;
+    weightTotal += metric.weightBps;
+  }
+  if (weightTotal === 0) return null;
+  return Math.round((weightedSum / weightTotal) * 10_000) / 10_000;
 }
 
 export function weightedScoreToOverall(score: number | null): number | null {

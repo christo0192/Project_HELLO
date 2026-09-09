@@ -103,7 +103,25 @@ describe('scorecard domain', () => {
     expect(recommendationForOverall(65)).toBe('advance');
     expect(recommendationForOverall(45)).toBe('hold');
     expect(recommendationForOverall(null)).toBe('human_review');
-    expect(calculateWeightedScore(metrics(), results([5, null, 1]))).toBeNull();
+  });
+
+  it('PARTIAL SCORING: renormalizes over the scored metrics; null ONLY when none scored', () => {
+    // The production failure (assessment e333af5d): one un-evidenced metric must
+    // NOT void the whole card. With weights [5000, 3000, 2000], scoring only
+    // metric-0 (5) and metric-2 (1) renormalizes over {5000, 2000}:
+    //   (5000*5 + 2000*1) / (5000+2000) = 27000/7000 = 3.8571 (4dp).
+    expect(calculateWeightedScore(metrics(), results([5, null, 1]))).toBe(3.8571);
+    // The e333af5d shape itself: 5 equal metrics, 3 scored @3, 2 insufficient →
+    // renormalizes to exactly 3.0 (→ overall 50 → 'hold'), the recovered value.
+    expect(calculateWeightedScore(metrics([2000, 2000, 2000, 2000, 2000]), results([3, null, null, 3, 3]))).toBe(3);
+    expect(weightedScoreToOverall(3)).toBe(50);
+    expect(recommendationForOverall(50)).toBe('hold');
+    // A single scored metric still yields that metric's score (renormalized to 1).
+    expect(calculateWeightedScore(metrics(), results([null, 4, null]))).toBe(4);
+    // Null ONLY when NOT ONE metric was scored — a genuinely unscoreable screening.
+    expect(calculateWeightedScore(metrics(), results([null, null, null]))).toBeNull();
+    // Full coverage is unchanged: weightTotal == 10000, so identical to before.
+    expect(calculateWeightedScore(metrics(), results([5, 3, 1]))).toBe(3.6);
   });
 
   it('rejects missing, extra, duplicate, fractional, and invented scores', () => {

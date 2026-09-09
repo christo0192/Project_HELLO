@@ -26,12 +26,14 @@ const {
   insertNotificationIntent,
   observeAshbyCompletion,
   loadActiveRoleScorecard,
+  loggerWarn,
 } = vi.hoisted(() => ({
   mockFrom: vi.fn(),
   runClaudeJSONWithProvenance: vi.fn(),
   insertNotificationIntent: vi.fn(),
   observeAshbyCompletion: vi.fn(),
   loadActiveRoleScorecard: vi.fn(),
+  loggerWarn: vi.fn(),
 }));
 
 vi.mock('../lib/supabase.js', () => ({
@@ -41,6 +43,13 @@ vi.mock('../lib/claude.js', () => ({ runClaudeJSONWithProvenance }));
 vi.mock('../lib/notification-intent.js', () => ({ insertNotificationIntent }));
 vi.mock('../integrations/ashby/completion-observer.js', () => ({ observeAshbyCompletion }));
 vi.mock('../lib/scorecards/store.js', () => ({ loadActiveRoleScorecard }));
+// Spread the ACTUAL logger module (keeps EVENT_NAMES_SET etc. that transitive
+// modules import) and override only createLogger so we can spy on the scorer
+// boundary warning without disturbing the real event-name contract.
+vi.mock('../lib/logger.js', async (importActual) => {
+  const actual = await importActual<typeof import('../lib/logger.js')>();
+  return { ...actual, createLogger: () => ({ warn: loggerWarn, info: vi.fn(), error: vi.fn(), debug: vi.fn() }) };
+});
 
 // ── Per-table response queue (same harness as the idempotency suite) ──
 const CHAIN = [
@@ -205,7 +214,11 @@ describe('v2 branch — a role with an active scorecard', () => {
     expect(callsFor('call_sessions', 'update')).toHaveLength(1);
   });
 
-  it('an incomplete-evidence result nulls the weighted score and recommendation column', async () => {
+  it('a PARTIAL incomplete-evidence result persists a PROVISIONAL score + recommendation (never blank)', async () => {
+    // The production failure this repairs: one un-evidenced metric must NOT void
+    // the card. [5, 3, null] over weights [5000, 3000, 2000] renormalizes to
+    // (25000+9000)/8000 = 4.25 → overall 81 → 'advance'. The row is v2 +
+    // incomplete_evidence but carries a real score the recruiter can see.
     runClaudeJSONWithProvenance.mockResolvedValue({
       data: { results: modelResults([5, 3, null]) },
       requestedModel: 'deepseek-v4-pro',
@@ -213,11 +226,76 @@ describe('v2 branch — a role with an active scorecard', () => {
     await runAssessment(SESSION_ID);
     const payload = callsFor('assessments', 'insert')[0].args[0] as Record<string, unknown>;
     expect(payload.scoring_status).toBe('incomplete_evidence');
+    expect(payload.weighted_score_5).toBe(4.25);
+    expect(payload.overall_score).toBe(81);
+    expect(payload.recommendation).toBe('advance');
+    // The full provisional verdict is also in `raw` (what the candidate card reads).
+    expect((payload.raw as { recommendation: string }).recommendation).toBe('advance');
+    expect((payload.raw as { weightedScore5: number }).weightedScore5).toBe(4.25);
+  });
+
+  it('nulls weighted/overall/recommendation ONLY when NOT ONE metric was scored', async () => {
+    // Genuinely unscoreable — nothing to renormalize. human_review is not an
+    // allowed column value (chk_assessments_recommendation), so it stores NULL.
+    runClaudeJSONWithProvenance.mockResolvedValue({
+      data: { results: modelResults([null, null, null]) },
+      requestedModel: 'deepseek-v4-pro',
+    });
+    await runAssessment(SESSION_ID);
+    const payload = callsFor('assessments', 'insert')[0].args[0] as Record<string, unknown>;
+    expect(payload.scoring_status).toBe('incomplete_evidence');
     expect(payload.weighted_score_5).toBeNull();
     expect(payload.overall_score).toBeNull();
-    // human_review is not an allowed value for chk_assessments_recommendation,
-    // so the column is stored NULL (the true value lives in raw/metric_results).
     expect(payload.recommendation).toBeNull();
+  });
+
+  it('a PROVISIONAL reject does NOT auto-terminate the candidate (status screened, not rejected)', async () => {
+    // [1, 1, null] → weighted 1.0 → overall 0 → 'reject', but status is
+    // incomplete_evidence (metric-2 unscored). A partial-evidence reject must
+    // land 'screened' for human confirmation, never auto-reject the candidate.
+    runClaudeJSONWithProvenance.mockResolvedValue({
+      data: { results: modelResults([1, 1, null]) },
+      requestedModel: 'deepseek-v4-pro',
+    });
+    await runAssessment(SESSION_ID);
+    const payload = callsFor('assessments', 'insert')[0].args[0] as Record<string, unknown>;
+    expect(payload.scoring_status).toBe('incomplete_evidence');
+    expect(payload.recommendation).toBe('reject'); // shown on the card…
+    const update = callsFor('candidates', 'update')[0].args[0] as Record<string, unknown>;
+    expect(update.status).toBe('screened'); // …but the candidate is NOT auto-rejected.
+  });
+
+  it('a COMPLETE reject still auto-terminates the candidate (status rejected)', async () => {
+    // [1, 1, 1] → all scored → weighted 1.0 → 'reject', status complete. A fully
+    // evidenced reject keeps the existing auto-terminate behavior.
+    runClaudeJSONWithProvenance.mockResolvedValue({
+      data: { results: modelResults([1, 1, 1]) },
+      requestedModel: 'deepseek-v4-pro',
+    });
+    await runAssessment(SESSION_ID);
+    const payload = callsFor('assessments', 'insert')[0].args[0] as Record<string, unknown>;
+    expect(payload.scoring_status).toBe('complete');
+    expect(payload.recommendation).toBe('reject');
+    const update = callsFor('candidates', 'update')[0].args[0] as Record<string, unknown>;
+    expect(update.status).toBe('rejected');
+  });
+
+  it('FAILS CLOSED on a hard scorer failure: rejects, persists nothing, logs the named boundary', async () => {
+    // A malformed model output makes the scorer throw. assessment.ts must emit a
+    // NAMED boundary signal (error_category=scorecard_scoring_failed — the code
+    // the queue DLQs and v_funnel_failures surfaces) and rethrow, WITHOUT writing
+    // a half-baked assessment row or touching the candidate's status.
+    runClaudeJSONWithProvenance.mockResolvedValue({
+      data: { results: 'not-an-array' },
+      requestedModel: 'deepseek-v4-pro',
+    });
+    await expect(runAssessment(SESSION_ID)).rejects.toThrow();
+    expect(callsFor('assessments', 'insert')).toHaveLength(0);
+    expect(callsFor('candidates', 'update')).toHaveLength(0);
+    expect(loggerWarn).toHaveBeenCalledWith(
+      'unknown_event',
+      expect.objectContaining({ error_category: 'scorecard_scoring_failed' }),
+    );
   });
 
   it('a phone v2 assessment carries source=phone and revision=1 (index coverage)', async () => {
