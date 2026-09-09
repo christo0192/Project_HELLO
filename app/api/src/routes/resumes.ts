@@ -129,6 +129,19 @@ export function createResumesRouter(deps: ResumesRouterDeps = {}): Router {
         const file = req.file!;
         const roleId = (req.body?.role_id as string) || null;
 
+        // Best-effort capture of a sync-upload parse failure, so the funnel's
+        // "entered the parser" denominator is not silently short on this path
+        // (0090 resume_intake_failures — the Ashby async path already records
+        // its failures on the ingestion row). Sanitized stable CODE only; the
+        // insert can never block or fail the request.
+        const recordIntakeFailure = async (code: string): Promise<void> => {
+          try {
+            await supabase.from('resume_intake_failures').insert({ role_id: roleId, failed_reason: code });
+          } catch {
+            /* observability capture is best-effort — never affects the response */
+          }
+        };
+
         // ── 4a. Upload guard: validate file structural integrity ──────
         let guardResult;
         try {
@@ -197,6 +210,9 @@ export function createResumesRouter(deps: ResumesRouterDeps = {}): Router {
           const isParseError = errCode === 'PARSER_ERROR' || errName === 'ParserError';
 
           if (isTimeout || isOutputExceeded || isParseError) {
+            await recordIntakeFailure(
+              isTimeout ? 'parser_timeout' : isOutputExceeded ? 'parser_output_exceeded' : 'parser_error',
+            );
             return res.status(422).json({
               error: { type: 'parse_error', message: 'Could not extract readable text from this file.' },
             });
@@ -208,6 +224,7 @@ export function createResumesRouter(deps: ResumesRouterDeps = {}): Router {
         if (!text || text.trim().length < 20) {
           // Cleanup orphan
           await supabase.storage.from(RESUME_BUCKET).remove([storageKey]).then(() => {}, () => {});
+          await recordIntakeFailure('no_extractable_text');
           return res.status(422).json({
             error: { type: 'parse_error', message: 'Could not extract readable text from this file.' },
           });
@@ -249,6 +266,7 @@ export function createResumesRouter(deps: ResumesRouterDeps = {}): Router {
           const fallback = fallbackParseResumeText(text);
           if (!hasUsefulFallbackResume(fallback)) {
             await supabase.storage.from(RESUME_BUCKET).remove([storageKey]).then(() => {}, () => {});
+            await recordIntakeFailure('no_extractable_fields');
             return res.status(502).json({
               error: { type: 'brain_error', message: 'Failed to parse resume content.' },
             });

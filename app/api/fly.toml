@@ -39,6 +39,13 @@ primary_region = "sin"
   RECORDINGS_BUCKET = "recordings_v2"
   RECORDING_DOWNLOAD_TTL_SEC = "300"
   RECORDING_MAX_BYTES = "26214400"
+  # Funnel observability rollup refresh: OFF by default. Flipping
+  # FUNNEL_OBSERVABILITY_ENABLED to "true" starts one loop that recomputes the
+  # derived screening_v2.funnel_stage_daily rollup via the advisory-locked
+  # refresh_funnel_rollup RPC. Interval/window are read + clamped in env.ts.
+  FUNNEL_OBSERVABILITY_ENABLED = "false"
+  FUNNEL_ROLLUP_INTERVAL_MS = "900000"
+  FUNNEL_ROLLUP_WINDOW_DAYS = "30"
   WORKER_CONTEXT_TIMEOUT_SEC = "5"
   RESUME_SCANNER = "clamav"
   # Real clamscan loads ~1 GiB of signatures on one shared CPU; 30s was below

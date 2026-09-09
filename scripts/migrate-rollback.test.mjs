@@ -549,6 +549,29 @@ function analyzeMigrations(files) {
         continue;
       }
 
+      // ── CREATE / DROP / ALTER VIEW ───────────────────────────────
+      // A view carries NO data and is re-created wholesale on each apply, so a
+      // CREATE OR REPLACE VIEW (including a WITH (security_invoker = ...) clause)
+      // is additive/replaceable like a function, a guarded DROP VIEW loses
+      // nothing, and ALTER VIEW SET options is data-independent. This is the
+      // first migration in the chain to define views (0090 funnel observability).
+      if (/^create\s+(?:or\s+replace\s+)?(?:temp(?:orary)?\s+)?(?:recursive\s+)?view\b/.test(low)) {
+        ok(migration, stmt, "CREATE_VIEW", "view creation / replacement (no data; replacement is sanctioned)");
+        continue;
+      }
+      if (/^drop\s+view\b/.test(low)) {
+        if (!/\bif\s+exists\b/.test(low)) {
+          red(migration, stmt, "DESTRUCTIVE_DROP_VIEW_UNGUARDED", "DROP VIEW without IF EXISTS; guard required in a forward-only chain");
+        } else {
+          ok(migration, stmt, "REPLACEABLE_DROP_VIEW", "DROP VIEW IF EXISTS — no data; replaceable");
+        }
+        continue;
+      }
+      if (/^alter\s+view\b/.test(low)) {
+        ok(migration, stmt, "ALTER_VIEW_OK", "ALTER VIEW (e.g. SET options); no data change");
+        continue;
+      }
+
       // ── CREATE TYPE / ALTER TYPE (non-drop) ─────────────────────
       if (/^create\s+type\b/.test(low)) {
         const m = /create\s+type\s+("?[a-z0-9_.-]+"?)/i.exec(stmt);
@@ -720,6 +743,22 @@ function runSelfTests() {
     ]);
     check("P6 0026 pattern (timing columns + guarded overload replacement) → not RED", reds.length === 0, `unexpected reds: ${JSON.stringify(reds.map((r) => r.rule))}`);
     check("P6 function replacement tracked as sanctioned", findings.some((f) => f.rule === "REPLACEABLE_DROP_FUNCTION") && findings.some((f) => f.rule === "CREATE_FUNCTION"), "expected REPLACEABLE_DROP_FUNCTION + CREATE_FUNCTION");
+  }
+  {
+    // 0090 pattern: the first VIEWS in the chain. CREATE OR REPLACE VIEW with a
+    // WITH (security_invoker = ...) clause, a guarded DROP VIEW, and ALTER VIEW
+    // SET must all be non-RED (a view carries no data, re-created wholesale).
+    const { reds, findings } = runScannerOn([
+      { name: "0090_views.sql", sql: "create or replace view screening_v2.v_funnel_intake\n  with (security_invoker = true) as\n  select c.id::text as entity_id from screening_v2.candidates c; drop view if exists screening_v2.v_old_funnel; alter view screening_v2.v_funnel_intake set (security_invoker = true);" },
+    ]);
+    check("P7 CREATE OR REPLACE VIEW (security_invoker) + guarded drop + alter → not RED", reds.length === 0, `unexpected reds: ${JSON.stringify(reds.map((r) => r.rule))}`);
+    check("P7 view creation tracked as sanctioned", findings.some((f) => f.rule === "CREATE_VIEW"), "expected CREATE_VIEW");
+  }
+  {
+    const { reds } = runScannerOn([
+      { name: "9009_negative_drop_view.sql", sql: "drop view screening_v2.v_funnel_intake;" },
+    ]);
+    check("N9 unguarded DROP VIEW → RED", reds.some((r) => r.rule === "DESTRUCTIVE_DROP_VIEW_UNGUARDED"), "expected DESTRUCTIVE_DROP_VIEW_UNGUARDED");
   }
 
   return results;

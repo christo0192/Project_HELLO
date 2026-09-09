@@ -224,6 +224,17 @@ export const env = {
   recordingJobReapAgeSec: positiveInt('RECORDING_JOB_REAP_AGE_SEC', 604_800, 3_600, 7_776_000),
   /** Rows the reaper may delete per pass. */
   recordingJobReapLimit: positiveInt('RECORDING_JOB_REAP_LIMIT', 500, 1, 5_000),
+  // ── 0090: funnel observability rollup refresh (disabled by default) ────
+  // Master gate. False (default) ⇒ createFunnelRuntime() returns null: no
+  // scheduler, no timer, no DB call. Enabling it starts ONE loop that
+  // periodically recomputes screening_v2.funnel_stage_daily via the
+  // advisory-locked, idempotent refresh_funnel_rollup RPC. The rollup is
+  // purely derived, so nothing accumulates while this is off.
+  funnelObservabilityEnabled: booleanEnv('FUNNEL_OBSERVABILITY_ENABLED', false),
+  /** Cadence of the rollup recompute. 15 min default; 1 min–6 h bounds. */
+  funnelRollupIntervalMs: positiveInt('FUNNEL_ROLLUP_INTERVAL_MS', 900_000, 60_000, 21_600_000),
+  /** Trailing window (days) each recompute reaches back over. */
+  funnelRollupWindowDays: positiveInt('FUNNEL_ROLLUP_WINDOW_DAYS', 30, 1, 3650),
   /** MIG-06: TTL (seconds) for recruiter recording download signed URLs. Range 60..900. */
   recordingDownloadTtlSec: positiveInt('RECORDING_DOWNLOAD_TTL_SEC', 300, 60, 900),
   /**
