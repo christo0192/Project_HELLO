@@ -717,6 +717,105 @@ export interface AdminAuditListResponse {
   audit: AdminAuditRow[];
 }
 
+// ── Funnel observability (0090 / PR2) ────────────────────────────────
+export interface FunnelSummaryTotals {
+  entered_parse: number;
+  parsed_ok: number;
+  needs_review: number;
+  parse_failed: number;
+  dialed: number;
+  connected: number;
+  consent_passed: number;
+  consent_dropped: number;
+  answered_ge1: number;
+  scored: number;
+  qualified: number;
+  on_hold: number;
+  disqualified: number;
+  human_review: number;
+  reached_reference_check: number;
+  attempts_total: number;
+  connects_total: number;
+  total_call_seconds: number;
+}
+
+export interface FunnelConversions {
+  parse_to_dial: number | null;
+  dial_to_connect: number | null;
+  connect_to_consent: number | null;
+  consent_to_answered: number | null;
+  answered_to_scored: number | null;
+  scored_to_qualified: number | null;
+  qualified_to_reference_check: number | null;
+}
+
+export interface FunnelDailyRow extends FunnelSummaryTotals {
+  cohort_day: string;
+  role_id: string | null;
+  median_ttfc_sec: number | null;
+  p95_ttfc_sec: number | null;
+}
+
+export interface FunnelSummaryResponse {
+  range: { from: string; to: string };
+  totals: FunnelSummaryTotals;
+  conversions: FunnelConversions;
+  series: FunnelDailyRow[];
+  refreshed_at: string | null;
+}
+
+export interface FunnelFailureGroup {
+  stage: string;
+  code: string;
+  count: number;
+}
+
+export interface FunnelFailureRow {
+  stage: string;
+  code: string;
+  entity_id: string;
+  occurred_at: string;
+}
+
+export interface FunnelFailuresResponse {
+  groups: FunnelFailureGroup[];
+  recent: FunnelFailureRow[];
+  /** True when the window held more failures than the fetch cap, so the group counts undercount. */
+  truncated: boolean;
+  range: { from: string; to: string };
+}
+
+export interface FunnelCandidateRow {
+  candidate_id: string;
+  role_id: string | null;
+  role_title: string | null;
+  resume_role_class: string | null;
+  intake_at: string;
+  furthest_stage: string;
+  drop_reason: string | null;
+  missing_phone: boolean;
+  dialed: boolean;
+  connected: boolean;
+  consent_passed: boolean;
+  answered_questions: number;
+  attempts_total: number;
+  connects_total: number;
+  recommendation: string | null;
+  scoring_status: string | null;
+  reached_reference_check: boolean;
+}
+
+export interface FunnelCandidatesResponse {
+  candidates: FunnelCandidateRow[];
+  limit: number;
+  offset: number;
+}
+
+export interface FunnelRefreshResponse {
+  ok: boolean;
+  result: unknown;
+}
+
 export interface AdminSessionRow {
   id: string;
   candidate_id: string;

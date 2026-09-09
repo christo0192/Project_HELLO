@@ -30,6 +30,12 @@ import {
   adminSessionOverrideSchema,
   adminUserIdParamSchema,
 } from '../schemas/admin.js';
+import {
+  funnelCandidatesQuerySchema,
+  funnelFailuresQuerySchema,
+  funnelRefreshSchema,
+  funnelSummaryQuerySchema,
+} from '../schemas/funnel.js';
 
 export const adminRouter = Router();
 
@@ -487,3 +493,206 @@ adminRouter.patch(
     }
   },
 );
+
+// ════════════════════════════════════════════════════════════════════
+//  Funnel observability (0090) — read the DERIVED funnel views + stored
+//  rollup. Counts, sanitized codes and opaque ids only (the views/rollup
+//  carry no PII by construction). Admin-gated at the router boundary above.
+// ════════════════════════════════════════════════════════════════════
+
+const FUNNEL_COUNT_FIELDS = [
+  'entered_parse', 'parsed_ok', 'needs_review', 'parse_failed',
+  'dialed', 'connected', 'consent_passed', 'consent_dropped', 'answered_ge1',
+  'scored', 'qualified', 'on_hold', 'disqualified', 'human_review', 'reached_reference_check',
+  'attempts_total', 'connects_total', 'total_call_seconds',
+] as const;
+
+/** YYYY-MM-DD `days` before today (UTC). */
+function funnelDayOffset(days: number): string {
+  return new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
+}
+
+/** YYYY-MM-DD `days` before the given YYYY-MM-DD (UTC). */
+function funnelDayBefore(ymd: string, days: number): string {
+  return new Date(Date.parse(`${ymd}T00:00:00Z`) - days * 86_400_000).toISOString().slice(0, 10);
+}
+
+// Defense-in-depth cap on the queryable span, so a hand-crafted from/to cannot
+// pull the whole rollup / failure history in one admin call.
+const FUNNEL_MAX_SPAN_DAYS = 400;
+
+/**
+ * GET /api/admin/funnel/summary
+ * Topline funnel over a date window (default trailing 30d) read from the
+ * stored funnel_stage_daily rollup: summed totals, derived stage-to-stage
+ * conversion ratios, and the per-day series (with timing percentiles) for
+ * trend charts. Empty when the rollup has not been refreshed yet — POST
+ * /funnel/refresh (or the refresh loop) populates it.
+ */
+adminRouter.get('/funnel/summary', validateQuery(funnelSummaryQuerySchema), async (req, res, next) => {
+  try {
+    const to = (req.query.to as string | undefined) ?? funnelDayOffset(0);
+    const requestedFrom = (req.query.from as string | undefined) ?? funnelDayOffset(29);
+    const minFrom = funnelDayBefore(to, FUNNEL_MAX_SPAN_DAYS);
+    const from = requestedFrom < minFrom ? minFrom : requestedFrom;
+    const roleId = req.query.role_id as string | undefined;
+
+    let q = supabase
+      .from('funnel_stage_daily')
+      .select(
+        'cohort_day, role_id, entered_parse, parsed_ok, needs_review, parse_failed, dialed, connected, consent_passed, consent_dropped, answered_ge1, scored, qualified, on_hold, disqualified, human_review, reached_reference_check, attempts_total, connects_total, total_call_seconds, median_ttfc_sec, p95_ttfc_sec, refreshed_at',
+      )
+      .gte('cohort_day', from)
+      .lte('cohort_day', to)
+      .order('cohort_day', { ascending: true });
+    if (roleId) q = q.eq('role_id', roleId);
+    const { data, error } = await q;
+    if (error) return next(new Error('failed to load funnel summary'));
+
+    const rows = (data ?? []) as Array<Record<string, unknown>>;
+    const totals: Record<string, number> = {};
+    for (const f of FUNNEL_COUNT_FIELDS) totals[f] = 0;
+    let refreshedAt: string | null = null;
+    for (const r of rows) {
+      for (const f of FUNNEL_COUNT_FIELDS) totals[f] += Number(r[f] ?? 0);
+      const ra = r.refreshed_at as string | null | undefined;
+      if (ra && (!refreshedAt || ra > refreshedAt)) refreshedAt = ra;
+    }
+    const ratio = (num: number, den: number): number | null => (den > 0 ? num / den : null);
+    const conversions = {
+      parse_to_dial: ratio(totals.dialed, totals.parsed_ok),
+      dial_to_connect: ratio(totals.connected, totals.dialed),
+      connect_to_consent: ratio(totals.consent_passed, totals.connected),
+      consent_to_answered: ratio(totals.answered_ge1, totals.consent_passed),
+      answered_to_scored: ratio(totals.scored, totals.answered_ge1),
+      scored_to_qualified: ratio(totals.qualified, totals.scored),
+      qualified_to_reference_check: ratio(totals.reached_reference_check, totals.qualified),
+    };
+    // Aggregate the per-(day, role) rollup rows into a per-DAY trend, summing
+    // across roles when no role filter is applied, so a day is never
+    // double-plotted. Percentiles cannot be summed across roles, so they are
+    // carried only when a single row contributes to the day.
+    const byDay = new Map<string, Record<string, unknown> & { __n: number }>();
+    for (const r of rows) {
+      const day = r.cohort_day as string;
+      let agg = byDay.get(day);
+      if (!agg) {
+        agg = {
+          cohort_day: day,
+          role_id: null,
+          median_ttfc_sec: (r.median_ttfc_sec as number | null) ?? null,
+          p95_ttfc_sec: (r.p95_ttfc_sec as number | null) ?? null,
+          __n: 0,
+        };
+        for (const f of FUNNEL_COUNT_FIELDS) agg[f] = 0;
+        byDay.set(day, agg);
+      }
+      for (const f of FUNNEL_COUNT_FIELDS) (agg[f] as number) += Number(r[f] ?? 0);
+      agg.__n += 1;
+      if (agg.__n > 1) {
+        agg.median_ttfc_sec = null;
+        agg.p95_ttfc_sec = null;
+      }
+    }
+    const series = [...byDay.values()]
+      .sort((a, b) => ((a.cohort_day as string) < (b.cohort_day as string) ? -1 : 1))
+      .map(({ __n: _n, ...row }) => row);
+    res.json({ range: { from, to }, totals, conversions, series, refreshed_at: refreshedAt });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/admin/funnel/failures
+ * The unified failure taxonomy (v_funnel_failures) over an optional window +
+ * stage filter: `groups` are {stage, code, count} over the returned window
+ * (bounded), and `recent` is the newest-first list capped at `limit`.
+ */
+adminRouter.get('/funnel/failures', validateQuery(funnelFailuresQuerySchema), async (req, res, next) => {
+  try {
+    const limit = req.query.limit as unknown as number;
+    const stage = req.query.stage as string | undefined;
+    // ALWAYS bound the window (default trailing 30d, span-capped), like
+    // /summary. Without a default the UI's no-arg call groups over ALL-TIME
+    // rows capped at FETCH_CAP, silently biasing every count toward recent
+    // failures and presenting a partial count as authoritative.
+    const to = (req.query.to as string | undefined) ?? funnelDayOffset(0);
+    const requestedFrom = (req.query.from as string | undefined) ?? funnelDayOffset(29);
+    const minFrom = funnelDayBefore(to, FUNNEL_MAX_SPAN_DAYS);
+    const from = requestedFrom < minFrom ? minFrom : requestedFrom;
+
+    const FETCH_CAP = 1000;
+    let q = supabase
+      .from('v_funnel_failures')
+      .select('stage, code, entity_id, occurred_at')
+      .gte('occurred_at', from)
+      .lte('occurred_at', `${to}T23:59:59.999Z`)
+      .order('occurred_at', { ascending: false });
+    if (stage) q = q.eq('stage', stage);
+    const { data, error } = await q.limit(FETCH_CAP);
+    if (error) return next(new Error('failed to load funnel failures'));
+
+    const all = (data ?? []) as Array<{ stage: string; code: string; entity_id: string; occurred_at: string }>;
+    const map = new Map<string, { stage: string; code: string; count: number }>();
+    for (const r of all) {
+      const key = `${r.stage}|${r.code}`;
+      const g = map.get(key) ?? { stage: r.stage, code: r.code, count: 0 };
+      g.count += 1;
+      map.set(key, g);
+    }
+    const groups = [...map.values()].sort((a, b) => b.count - a.count);
+    // `truncated` = the window still held >= FETCH_CAP failures, so `groups`
+    // counts the newest FETCH_CAP only and undercounts — surfaced so the UI
+    // never presents a partial count as authoritative.
+    const truncated = all.length >= FETCH_CAP;
+    res.json({ groups, recent: all.slice(0, limit), truncated, range: { from, to } });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * GET /api/admin/funnel/candidates
+ * Paginated per-candidate drill-down (v_funnel_candidate), newest intake
+ * first, with optional role / furthest_stage / drop_reason filters. Opaque
+ * ids + stage flags only — no name/email/phone/transcript.
+ */
+adminRouter.get('/funnel/candidates', validateQuery(funnelCandidatesQuerySchema), async (req, res, next) => {
+  try {
+    const limit = req.query.limit as unknown as number;
+    const offset = req.query.offset as unknown as number;
+    let q = supabase
+      .from('v_funnel_candidate')
+      .select(
+        'candidate_id, role_id, role_title, resume_role_class, intake_at, furthest_stage, drop_reason, missing_phone, dialed, connected, consent_passed, answered_questions, attempts_total, connects_total, recommendation, scoring_status, reached_reference_check',
+      )
+      .order('intake_at', { ascending: false });
+    if (req.query.role_id) q = q.eq('role_id', req.query.role_id as string);
+    if (req.query.furthest_stage) q = q.eq('furthest_stage', req.query.furthest_stage as string);
+    if (req.query.drop_reason) q = q.eq('drop_reason', req.query.drop_reason as string);
+    const { data, error } = await q.range(offset, offset + limit - 1);
+    if (error) return next(new Error('failed to load funnel candidates'));
+    res.json({ candidates: data ?? [], limit, offset });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/admin/funnel/refresh
+ * Trigger an on-demand recompute of funnel_stage_daily (the same
+ * advisory-locked, idempotent RPC the refresh loop calls). Lets an admin
+ * populate/refresh the rollup even when FUNNEL_OBSERVABILITY_ENABLED is off.
+ */
+adminRouter.post('/funnel/refresh', validateBody(funnelRefreshSchema), async (req, res, next) => {
+  try {
+    const { data, error } = await supabase.rpc('refresh_funnel_rollup', {
+      p_window_days: req.body.window_days,
+    });
+    if (error) return next(new Error('failed to refresh funnel rollup'));
+    res.json({ ok: true, result: data });
+  } catch (error) {
+    next(error);
+  }
+});

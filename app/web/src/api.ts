@@ -29,6 +29,10 @@ import type {
   AdminMemberUpdateInput,
   AdminSessionListResponse,
   AdminSessionOverrideInput,
+  FunnelSummaryResponse,
+  FunnelFailuresResponse,
+  FunnelCandidatesResponse,
+  FunnelRefreshResponse,
   AppealCreateInput,
   AppealCreateResponse,
   AppealGrantResult,
@@ -436,6 +440,46 @@ export const api = {
       `/api/admin/sessions${status ? `?status=${encodeURIComponent(status)}` : ''}`,
     ),
   listAdminQuotas: () => request<QuotaPolicyListResponse>('/api/admin/quotas'),
+  // Funnel observability (0090 / PR2) — admin-gated reads of the derived
+  // funnel views + stored rollup, plus an on-demand rollup recompute.
+  getFunnelSummary: (params?: { from?: string; to?: string; role_id?: string }) => {
+    const qs = new URLSearchParams();
+    if (params?.from) qs.set('from', params.from);
+    if (params?.to) qs.set('to', params.to);
+    if (params?.role_id) qs.set('role_id', params.role_id);
+    const q = qs.toString();
+    return request<FunnelSummaryResponse>(`/api/admin/funnel/summary${q ? `?${q}` : ''}`);
+  },
+  listFunnelFailures: (params?: { stage?: string; from?: string; to?: string; limit?: number }) => {
+    const qs = new URLSearchParams();
+    if (params?.stage) qs.set('stage', params.stage);
+    if (params?.from) qs.set('from', params.from);
+    if (params?.to) qs.set('to', params.to);
+    if (params?.limit != null) qs.set('limit', String(params.limit));
+    const q = qs.toString();
+    return request<FunnelFailuresResponse>(`/api/admin/funnel/failures${q ? `?${q}` : ''}`);
+  },
+  listFunnelCandidates: (params?: {
+    role_id?: string;
+    furthest_stage?: string;
+    drop_reason?: string;
+    limit?: number;
+    offset?: number;
+  }) => {
+    const qs = new URLSearchParams();
+    if (params?.role_id) qs.set('role_id', params.role_id);
+    if (params?.furthest_stage) qs.set('furthest_stage', params.furthest_stage);
+    if (params?.drop_reason) qs.set('drop_reason', params.drop_reason);
+    if (params?.limit != null) qs.set('limit', String(params.limit));
+    if (params?.offset != null) qs.set('offset', String(params.offset));
+    const q = qs.toString();
+    return request<FunnelCandidatesResponse>(`/api/admin/funnel/candidates${q ? `?${q}` : ''}`);
+  },
+  refreshFunnel: (windowDays?: number) =>
+    request<FunnelRefreshResponse>('/api/admin/funnel/refresh', {
+      method: 'POST',
+      body: JSON.stringify(windowDays != null ? { window_days: windowDays } : {}),
+    }),
   createQuotaPolicy: (body: QuotaPolicyInput) =>
     request<QuotaPolicyMutationResponse>('/api/admin/quotas', {
       method: 'POST',
