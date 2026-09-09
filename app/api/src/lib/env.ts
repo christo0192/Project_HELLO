@@ -90,7 +90,12 @@ export const env = {
   // being discontinued, so the code default now points at V4-Flash to match the
   // official endpoint; fly.toml [env] pins the exact id explicitly.
   deepseekModel: process.env.DEEPSEEK_MODEL ?? 'deepseek-v4-flash',
-  deepseekScoringModel: process.env.DEEPSEEK_SCORING_MODEL ?? 'deepseek-v4-flash',
+  // Scoring runs on the larger V4-Pro model (not Flash) with reasoning HIGH
+  // (via the global DEEPSEEK_REASONING_EFFORT below): the candidate scorecard is
+  // an off-the-speech-path, quality-over-latency judgement over the whole
+  // transcript, so it is worth the slower/pricier Pro model. fly.toml [env]
+  // pins the exact id; this default keeps local/dev in step.
+  deepseekScoringModel: process.env.DEEPSEEK_SCORING_MODEL ?? 'deepseek-v4-pro',
   /**
    * DeepSeek reasoning_effort. EMPTY (default) ⇒ the field is OMITTED from the
    * request body — which on V4-Flash means MODEL-DEFAULT reasoning, NOT "off":
