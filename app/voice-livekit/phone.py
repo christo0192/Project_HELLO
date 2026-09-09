@@ -953,6 +953,34 @@ def phone_bounce_mode() -> bool:
     return (os.getenv("PHONE_BOUNCE_MODE") or "").strip().lower() == "true"
 
 
+def phone_deterministic_opener() -> bool:
+    """Fixed, scripted consent + role openings instead of LLM-authored ones.
+    DEFAULT ON — an explicit off token (``false``/``0``/``no``/``off``, case-
+    insensitive) disables it; anything else (incl. unset) leaves it ON.
+
+    RCA (session 4355b045 retest, 2026-09-09): the openings were LLM-authored
+    and SPOKEN BEFORE they were verified. ``speak_opening`` streams the model's
+    greeting to TTS and waits for playout, THEN ``run_phone_gate`` verifies it;
+    a model that disobeyed its instruction and appended an identity question
+    ("am I speaking to Christo?") was HEARD, and the fixed ``PHONE_DISCLOSURE_TEXT``
+    was then spoken ON TOP — a double opener with no gap. The role opener
+    (``speak_role_opening`` -> ``_deliver_role_opening`` fixed fallback) has the
+    identical speak-then-verify shape.
+
+    When this is ON, the consent opening is the fixed ``PHONE_DISCLOSURE_TEXT``
+    and the role opening is the fixed ``phone_role_opening_text`` — never
+    LLM-authored — so nothing can be spoken-then-contradicted, and two
+    opening-time model generations are removed (a small latency win). The
+    bounded SIP-output-subscription warm-up (baseline fix 4a) is preserved on
+    the deterministic path. Set ``PHONE_DETERMINISTIC_OPENER=false`` to restore
+    the LLM-authored openers. Read at the call site with the literal name so the
+    env-contract scanner sees it.
+    """
+    return (os.getenv("PHONE_DETERMINISTIC_OPENER") or "true").strip().lower() not in (
+        "false", "0", "no", "off",
+    )
+
+
 # The two per-turn coordination shapes the phone lane can run.
 PHONE_TURN_MODE_TOOLFIRST = "toolfirst"
 PHONE_TURN_MODE_TOOLLESS = "toolless"
@@ -4491,10 +4519,25 @@ async def run_phone_gate(
             opening_spoken.append(generated.strip())  # type: ignore[union-attr]
             spoken.append(generated.strip())  # type: ignore[union-attr]
         else:
-            _log.warn(
-                "unknown_event", error_type="phone_opening_fallback",
-                error_category="opening_unverified",
-            )
+            # A None/empty return is the DELIBERATE deterministic path (the
+            # opener callable warmed the SIP subscription and spoke nothing) or a
+            # clean generation miss: the fixed disclosure is verified-by-
+            # construction, not an error, so log it at info as `opening_fixed`.
+            # A NON-EMPTY string that failed verification is a real LLM opener
+            # that misbehaved (e.g. appended an identity question) — that is worth
+            # a warn (`opening_unverified`). Both speak the fixed disclosure
+            # exactly once; the deterministic path never speaks the model text, so
+            # there is no double opener.
+            if isinstance(generated, str) and generated.strip():
+                _log.warn(
+                    "unknown_event", error_type="phone_opening_fallback",
+                    error_category="opening_unverified",
+                )
+            else:
+                _log.info(
+                    "unknown_event", error_type="phone_opening_fallback",
+                    error_category="opening_fixed",
+                )
             await _say(PHONE_DISCLOSURE_TEXT)
             opening_spoken.append(PHONE_DISCLOSURE_TEXT)
     else:
@@ -8552,9 +8595,23 @@ async def _default_phone_coverage_inference(prompt: str) -> Any:
             # The judge runs off the speech path, so the added logging is free.
             log_failures=True,
         )
-    except BusinessError:
-        # A 4xx (typically a 400 "unsupported param") is most often the judge
-        # endpoint rejecting an optional knob — historically reasoning_effort,
+    except BusinessError as exc:
+        # HONEST AUTH DIAGNOSIS (session 4355b045, 2026-09-09): a 401/403 is an
+        # AUTH failure (a stale/invalid PHONE_JUDGE key), NOT an unsupported
+        # parameter — stripping optional knobs and retrying can never fix it, and
+        # doing so mislabels every turn as `unsupported_param_retry`, hiding the
+        # real cause. The phone app's DEEPSEEK_API_KEY was stale for a whole
+        # release and this branch reported it as a param problem the entire time.
+        # Surface it truthfully and re-raise WITHOUT the futile param retry.
+        _status = getattr(exc, "status_code", None)
+        if _status in (401, 403):
+            _log.warn(
+                "unknown_event", error_type="phone_coverage_judge",
+                error_category="judge_auth_failed", schema=f"http_{_status}",
+            )
+            raise
+        # Any OTHER 4xx (typically a 400 "unsupported param") is most often the
+        # judge endpoint rejecting an optional knob — historically reasoning_effort,
         # and (baseline-fix, session 4355b045) response_format, which DeepSeek
         # V4-Flash 400s on. Retry ONCE with BOTH optional params stripped so a
         # stale operator config can never reintroduce a permanent wedge and a

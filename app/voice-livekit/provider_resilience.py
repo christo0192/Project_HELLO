@@ -127,10 +127,17 @@ class ProviderError(Exception):
 
 
 class BusinessError(Exception):
-    """A business/validation error that does NOT count toward the breaker."""
+    """A business/validation error that does NOT count toward the breaker.
 
-    def __init__(self) -> None:
+    Carries the originating HTTP status when known (``None`` otherwise) so a
+    caller can tell an auth failure (401/403) apart from a genuine unsupported
+    parameter (400) instead of retrying blindly — the phone coverage judge's
+    stale-key 401 was misread as an unsupported-param 400 for a whole release
+    (session 4355b045, 2026-09-09)."""
+
+    def __init__(self, status_code: "Optional[int]" = None) -> None:
         super().__init__("business_error")
+        self.status_code = status_code
 
 
 def _is_provider_failure(err: Exception) -> bool:
@@ -601,5 +608,5 @@ async def _call_and_classify(
     if cls is ProviderError:
         raise ProviderError("protocol")
     elif cls is BusinessError:
-        raise BusinessError()
+        raise BusinessError(status_code=getattr(response, "status_code", None))
     return response
