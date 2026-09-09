@@ -125,6 +125,14 @@ returns trigger language plpgsql security definer set search_path = pg_catalog, 
 declare v_version_id uuid := coalesce(new.scorecard_version_id, old.scorecard_version_id);
 declare v_count integer; v_total integer;
 begin
+  -- A parent role/version FK cascade has already removed the version. Its
+  -- snapshot rows must be allowed to disappear; a direct metric delete still
+  -- finds the parent and is rejected by the exact-total check below.
+  if tg_op = 'DELETE' and not exists (
+    select 1 from screening_v2.role_scorecard_versions where id = v_version_id
+  ) then
+    return null;
+  end if;
   select count(*), coalesce(sum(weight_bps), 0) into v_count, v_total
   from screening_v2.role_scorecard_version_metrics where scorecard_version_id = v_version_id;
   if v_count < 1 or v_count > 20 or v_total <> 10000 then
