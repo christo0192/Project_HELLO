@@ -4,6 +4,7 @@ import {
   runAssessment,
   ERR_SESSION_NOT_COMPLETED,
   ERR_RESCORE_NO_SCORECARD,
+  ERR_RESCORE_REVISION_CONFLICT,
 } from '../services/assessment.js';
 import { validateParams } from '../lib/validation.js';
 import { assessSessionIdParamSchema, rescoreBodySchema } from '../schemas/assess.js';
@@ -144,6 +145,16 @@ assessRouter.post(
           error: {
             type: 'rescore_requires_active_scorecard',
             message: 'Role has no active scorecard to rescore against',
+          },
+        });
+      }
+      // The bounded revision-race retry was exhausted → RETRYABLE 409, never a
+      // 500. The caller may retry with the same request id.
+      if (error instanceof Error && error.message === ERR_RESCORE_REVISION_CONFLICT) {
+        return res.status(409).json({
+          error: {
+            type: 'rescore_revision_conflict',
+            message: 'A concurrent rescore advanced the revision; retry with the same request id',
           },
         });
       }

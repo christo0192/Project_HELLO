@@ -24,6 +24,7 @@ import {
   injectAssessmentRunner,
   ERR_SESSION_NOT_COMPLETED,
   ERR_RESCORE_NO_SCORECARD,
+  ERR_RESCORE_REVISION_CONFLICT,
 } from '../services/assessment.js';
 
 // services/assessment loads supabase + the LLM runner at import; the injected
@@ -173,5 +174,17 @@ describe('service error mapping', () => {
       .send({ rescore_request_id: REQ_ID });
     expect(res.status).toBe(409);
     expect(res.body.error.type).toBe('rescore_requires_active_scorecard');
+  });
+
+  it('ERR_RESCORE_REVISION_CONFLICT → 409 rescore_revision_conflict (retryable, not 500)', async () => {
+    // FIX 6: the exhausted revision-race retry must map to a retryable 409, not
+    // fall through to the global 500 handler.
+    runnerSpy.mockRejectedValueOnce(new Error(ERR_RESCORE_REVISION_CONFLICT));
+    const res = await request(makeApp(makeUser('admin')))
+      .post(`/api/assess/${SESSION_ID}/rescore`)
+      .set(AUTH)
+      .send({ rescore_request_id: REQ_ID });
+    expect(res.status).toBe(409);
+    expect(res.body.error.type).toBe('rescore_revision_conflict');
   });
 });

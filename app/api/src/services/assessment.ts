@@ -38,6 +38,15 @@ export const ERR_SESSION_NOT_COMPLETED = 'ERR_SESSION_NOT_COMPLETED';
  */
 export const ERR_RESCORE_NO_SCORECARD = 'ERR_RESCORE_NO_SCORECARD';
 
+/**
+ * Phase 4: the bounded rescore-insert retry exhausted against a persistent
+ * (session_id, revision) race — nothing was written. The admin route maps this
+ * stable code to a RETRYABLE 409 (the caller may retry with the SAME request id,
+ * whose idempotency read then adopts whichever revision eventually landed). It
+ * must map to 409, never fall through to a 500.
+ */
+export const ERR_RESCORE_REVISION_CONFLICT = 'rescore_revision_conflict';
+
 // ── Runner abstraction for testability ──────────────────────────────────
 
 /**
@@ -286,13 +295,22 @@ async function runAssessmentImpl(
 
   // The next immutable revision and the row it supersedes. A FIRST score (no
   // rescore) stays revision 1 with no supersede. A RESCORE reads the current
-  // max v2 revision for this session and advances it; the prior row is never
-  // touched. Null max → the session has no v2 assessment yet, so the rescore
-  // writes revision 1 with no supersede (a request-id-tagged first v2 score).
+  // max revision for this session across ALL schema versions and advances it;
+  // the prior row is never touched. Null max → the session has no assessment yet,
+  // so the rescore writes revision 1 with no supersede (a request-id-tagged first
+  // score).
+  //
+  // ALL-SCHEMA max, not v2-only: a phone session first scored as v1 (revision 1,
+  // source='phone') and later rescored would, under a v2-only max, recompute
+  // revision 1 forever — colliding with uq_assessments_phone_session (partial
+  // over source='phone' AND revision=1, schema-agnostic, 0088) on every one of
+  // the bounded retries and finally throwing. Advancing off the all-schema max
+  // sends that rescore to revision 2, clear of both the phone index and
+  // uq_assessments_v2_session_revision.
   let rescoreRevision = 1;
   let supersedesAssessmentId: string | null = null;
   if (isRescore) {
-    const latest = await loadLatestV2Revision(sessionId);
+    const latest = await loadLatestRevisionAnySchema(sessionId);
     rescoreRevision = (latest?.maxRevision ?? 0) + 1;
     supersedesAssessmentId = latest?.id ?? null;
   }
@@ -464,15 +482,16 @@ async function runAssessmentImpl(
       if (!isUniqueViolation(error)) throw new Error(error.message);
       const winner = await loadAssessmentByRescoreRequestId(rescoreRequestId!);
       if (winner) return winner; // idempotency race — another request won.
-      const latest = await loadLatestV2Revision(sessionId);
+      const latest = await loadLatestRevisionAnySchema(sessionId);
       basePayload.revision = (latest?.maxRevision ?? 0) + 1;
       basePayload.supersedes_assessment_id = latest?.id ?? null;
     }
     // Exhausted the bounded retry against a persistent revision race. Nothing
     // was written; fail loudly rather than silently drop the rescore. The
     // caller may retry with the SAME request id — the idempotency read above
-    // then adopts whichever revision eventually landed.
-    if (!row) throw new Error('rescore_revision_conflict');
+    // then adopts whichever revision eventually landed. The route maps this
+    // stable code to a retryable 409.
+    if (!row) throw new Error(ERR_RESCORE_REVISION_CONFLICT);
   } else {
     let { data, error: aErr } = await supabase
       .from('assessments')
@@ -735,12 +754,16 @@ function isUniqueViolation(error: { code?: string | null } | null | undefined): 
 }
 
 /**
- * Read back the phone assessment that already exists for this session.
+ * Read back the ORIGINAL phone assessment that already exists for this session.
  *
  * Returns `null` when there is none — the caller must then fail rather than
- * invent a success. `maybeSingle()` is deliberate: with the partial unique
- * index in place there can be at most one, and a second row would be a
- * schema failure that should surface rather than be silently picked from.
+ * invent a success. Scoped to `revision = 1` deliberately: the reuse must land
+ * on the original first-score winner, and that is exactly the row
+ * `uq_assessments_phone_session` admits (partial over `source = 'phone' AND
+ * revision = 1`, 0088). Once a phone session has been rescored it carries two or
+ * more `source = 'phone'` rows, so a `maybeSingle()` WITHOUT the revision filter
+ * would error on the multiple rows and break the idempotent reuse; the filter
+ * makes the read deterministic — at most one row can satisfy it.
  */
 async function loadPhoneAssessment(
   sessionId: string,
@@ -750,6 +773,7 @@ async function loadPhoneAssessment(
     .select('id,raw')
     .eq('session_id', sessionId)
     .eq('source', 'phone')
+    .eq('revision', 1)
     .maybeSingle();
   if (error || !data?.id) return null;
   const raw = (data.raw ?? null) as Assessment | null;
@@ -782,21 +806,30 @@ async function loadAssessmentByRescoreRequestId(
 }
 
 /**
- * Phase 4: the current maximum v2 revision for a session, and the id of that
- * latest row. Used to compute the next immutable revision and its supersede
- * pointer. Scoped to `schema_version = 2` because only v2 rows participate in
- * the revision chain (`uq_assessments_v2_session_revision`). Null when the
- * session has no v2 assessment yet — the rescore then writes revision 1.
+ * Phase 4 (rev-collision fix): the current maximum revision for a session across
+ * ALL schema versions, and the id of that latest row. Used to compute the next
+ * immutable rescore revision (max + 1) and its supersede pointer.
+ *
+ * ALL schema versions on purpose — NOT `schema_version = 2` only. A phone
+ * session first scored as v1 carries a `revision = 1` row; scoping the max to v2
+ * would ignore it, recompute revision 1, and collide forever with
+ * `uq_assessments_phone_session` (partial over `source = 'phone' AND revision =
+ * 1`). Advancing off the all-schema max sends the v1-origin rescore to revision
+ * 2 — clear of both that phone index and `uq_assessments_v2_session_revision`.
+ *
+ * Ordered by revision desc then created_at desc, so the single row returned is
+ * the highest revision and, among any ties, the newest. Null when the session
+ * has no assessment yet — the rescore then writes revision 1 with no supersede.
  */
-async function loadLatestV2Revision(
+async function loadLatestRevisionAnySchema(
   sessionId: string,
 ): Promise<{ id: string; maxRevision: number } | null> {
   const { data, error } = await supabase
     .from('assessments')
-    .select('id,revision')
+    .select('id,revision,created_at')
     .eq('session_id', sessionId)
-    .eq('schema_version', 2)
     .order('revision', { ascending: false })
+    .order('created_at', { ascending: false })
     .limit(1)
     .maybeSingle();
   if (error || !data?.id || typeof data.revision !== 'number') return null;

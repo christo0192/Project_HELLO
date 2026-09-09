@@ -175,6 +175,13 @@ scorecardsRouter.post('/metrics', requireRole('admin'), validateBody(createMetri
 // PATCH /metrics/:id — edit template fields in place and bump its version.
 // Library edits DO NOT touch existing role snapshots: those were copied at
 // attach time into role_scorecard_version_metrics and are immutable.
+//
+// KNOWN (accepted) RACE: the version bump is read-then-write (SELECT version →
+// UPDATE version = current + 1) with no compare-and-set, so two concurrent
+// admin PATCHes can compute the same next version (last-writer-wins). Benign for
+// this admin-only surface and left as-is on purpose; the atomic follow-up is a
+// SECURITY DEFINER RPC (or a `version = version + 1` expression update). (Not
+// changed in this pass.)
 scorecardsRouter.patch(
   '/metrics/:id',
   requireRole('admin'),
@@ -283,9 +290,15 @@ async function loadRoleWithAccess(req: any, res: any): Promise<RoleAccessRow | n
 }
 
 // GET /roles/:roleId/scorecard — the active immutable version (or null).
+//
+// OWNER-SCOPED, not viewer-readable: the active scorecard exposes the role's
+// internal per-metric config (instructions, rubric, weights) — recruiter scoring
+// IP. So it is gated exactly like the PUT: requireRole('interviewer') blocks
+// viewers, and loadRoleWithAccess then owner-scopes interviewers (a non-owner
+// interviewer gets 403) while admins see all.
 scorecardsRouter.get(
   '/roles/:roleId/scorecard',
-  requireRole('viewer'),
+  requireRole('interviewer'),
   validateParams(roleScorecardParamSchema),
   async (req, res, next) => {
     const role = await loadRoleWithAccess(req, res);
@@ -301,6 +314,14 @@ scorecardsRouter.get(
 );
 
 // PUT /roles/:roleId/scorecard — create a NEW immutable version and repoint.
+//
+// KNOWN (accepted) NON-ATOMICITY: the write below is THREE separate statements
+// (version row → metric rows → roles pointer repoint). A crash between them can
+// leave an ORPHAN version (rows with no role pointing at them), and two
+// concurrent PUTs are last-writer-wins on the pointer. This is benign for an
+// owner-only, low-frequency admin surface and is left as-is on purpose; the
+// follow-up is to fold all three writes into a single atomic SECURITY DEFINER
+// RPC. (Not changed in this pass.)
 scorecardsRouter.put(
   '/roles/:roleId/scorecard',
   requireRole('interviewer'),

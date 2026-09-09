@@ -244,6 +244,41 @@ describe('a fresh rescore writes a superseding revision, prior row untouched', (
 });
 
 // ═══════════════════════════════════════════════════════════════════════
+describe('FIX 1 — a v1-origin phone rescore advances off the ALL-SCHEMA max', () => {
+  const V1_PHONE_ID = '00000000-0000-4000-8000-0000000000e1';
+  const PHONE_ROOM = `phone-${SESSION_ID}`;
+
+  it('a phone session first scored as v1 (revision 1) rescores to revision 2, superseding the v1 row, no collision', async () => {
+    // The session is a PHONE session (derived from its room name) that was first
+    // scored as v1 — a revision 1, source='phone' row. Under a v2-ONLY max the
+    // rescore would recompute revision 1 and collide with
+    // uq_assessments_phone_session (partial over source='phone' AND revision=1)
+    // on every bounded retry, then throw. The all-schema max sends it to
+    // revision 2, clear of both that index and uq_assessments_v2_session_revision.
+    setDefault('call_sessions', ok(scoredSession({ external_call_id: PHONE_ROOM })));
+    enqueue(
+      'assessments',
+      ok(null), // idempotency-first: no row under this request id yet
+      // latest revision ACROSS ALL SCHEMAS is the v1 phone first-score row.
+      ok({ id: V1_PHONE_ID, revision: 1, created_at: '2026-09-01T06:05:00.000Z' }),
+      ok({ id: NEW_ID }), // the insert succeeds first try — revision 2 does not collide
+    );
+
+    const result = await runAssessment(SESSION_ID, { rescore: { requestId: REQ_ID } });
+
+    const payload = callsFor('assessments', 'insert')[0].args[0] as Record<string, unknown>;
+    expect(payload.revision).toBe(2);
+    expect(payload.supersedes_assessment_id).toBe(V1_PHONE_ID);
+    expect(payload.source).toBe('phone');
+    expect(payload.schema_version).toBe(2);
+    expect(payload.rescore_request_id).toBe(REQ_ID);
+    // Exactly one insert attempt: revision 2 is clean, so no revision-race retry.
+    expect(callsFor('assessments', 'insert')).toHaveLength(1);
+    expect(result.id).toBe(NEW_ID);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
 describe('a repeat with the SAME request id is idempotent', () => {
   it('returns the existing revision without scoring, inserting, or side-effects', async () => {
     enqueue(

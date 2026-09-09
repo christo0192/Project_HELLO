@@ -148,6 +148,18 @@ describe('readScorecardAssessmentV2 / isAssessmentV2', () => {
     expect(display.metrics[0].score).toBe(4);
     expect(display.metrics[0].weightBps).toBe(6000);
   });
+
+  it('treats a stringy schema_version "2" as v2 (FIX 7 — Number coercion)', () => {
+    // export.ts and the Ashby adapter coerce with Number(schema_version) === 2;
+    // isAssessmentV2 now matches, so a stringy '2' still routes to the v2 display.
+    const stringy = { ...V2_COMPLETE, schema_version: '2' } as unknown as Assessment;
+    expect(isAssessmentV2(stringy)).toBe(true);
+    const display = readScorecardAssessmentV2(stringy)!;
+    expect(display).not.toBeNull();
+    expect(display.overallScore).toBe(63);
+    // A v1 (no schema_version) still reads false — Number(undefined) is NaN.
+    expect(isAssessmentV2(V1)).toBe(false);
+  });
 });
 
 describe('CandidateScorecardV2', () => {

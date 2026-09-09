@@ -62,6 +62,13 @@ function clampInt(value: number, min: number, max: number): number {
  * `newWeightBps` is clamped to [1, 10000 - (others.length)] so every other
  * metric can still hold at least a whole bps — the same envelope the server's
  * domain validator enforces.
+ *
+ * Every OTHER metric ends at >= 1 bps: 1 bps is RESERVED per other metric, only
+ * the surplus (`remainder - others.length`) is spread by the largest-remainder
+ * rule, and the reserved 1 is added back. Without this the proportional split
+ * can floor a small-weight metric to 0 (e.g. pinning one metric near 100% twice)
+ * — an invalid weight the server would 400. This is BYTE-IDENTICAL to the
+ * server's app/api/src/lib/scorecards/domain.ts redistributeWeights.
  */
 export function redistributeWeights<T extends WeightedMetric>(
   metrics: readonly T[],
@@ -79,20 +86,24 @@ export function redistributeWeights<T extends WeightedMetric>(
 
   const pinned = clampInt(newWeightBps, 1, SCORECARD_WEIGHT_TOTAL_BPS - others.length);
   const remainder = SCORECARD_WEIGHT_TOTAL_BPS - pinned;
+  // Reserve 1 bps per other metric so none can floor to 0; distribute only the
+  // surplus proportionally, then add the reserved 1 back. The clamp above keeps
+  // `remainder >= others.length`, so `distributable` is never negative.
+  const distributable = remainder - others.length;
   const oldOtherTotal = others.reduce((sum, m) => sum + m.weightBps, 0);
 
   const shares = others.map((metric) => {
-    const numerator = oldOtherTotal > 0 ? remainder * metric.weightBps : remainder;
+    const numerator = oldOtherTotal > 0 ? distributable * metric.weightBps : distributable;
     const denominator = oldOtherTotal > 0 ? oldOtherTotal : others.length;
     const floor = Math.floor(numerator / denominator);
     return { metric, floor, fractional: numerator % denominator };
   });
 
-  let unallocated = remainder - shares.reduce((sum, s) => sum + s.floor, 0);
+  let unallocated = distributable - shares.reduce((sum, s) => sum + s.floor, 0);
   shares.sort(
     (a, b) => b.fractional - a.fractional || a.metric.displayOrder - b.metric.displayOrder,
   );
-  const redistributed = new Map(shares.map((s) => [s.metric.id, s.floor]));
+  const redistributed = new Map(shares.map((s) => [s.metric.id, s.floor + 1]));
   for (const share of shares) {
     if (unallocated-- <= 0) break;
     redistributed.set(share.metric.id, (redistributed.get(share.metric.id) ?? 0) + 1);

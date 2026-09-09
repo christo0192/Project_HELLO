@@ -548,8 +548,17 @@ describe('GOV-05: DSAR Export', () => {
           score: 5,
           evidenceStatus: 'scored',
           rationale: 'excellent',
-          evidenceRefs: [],
-          metric: { id: '00000000-0000-4000-8000-0000000000m1', key: 'communication' },
+          evidenceRefs: ['turn:3'],
+          // The stored snapshot embeds the recruiter's INTERNAL scoring config;
+          // the DSAR export must strip instruction/rubric/weightBps.
+          metric: {
+            id: '00000000-0000-4000-8000-0000000000m1',
+            key: 'communication',
+            name: 'Customer Communication',
+            instruction: 'INTERNAL-INSTRUCTION-MARKER judge clarity to a customer',
+            rubric: { 1: 'a', 2: 'b', 3: 'c', 4: 'd', 5: 'e' },
+            weightBps: 6000,
+          },
         },
       ],
     });
@@ -577,13 +586,27 @@ describe('GOV-05: DSAR Export', () => {
     expect(v1.weighted_score_5).toBeNull();
     expect(v1.metric_results).toBeNull();
 
-    // v2 export is COMPLETE: the richer scorecard fields are all present.
+    // v2 export is COMPLETE for the data subject's OWN judgement, but stripped of
+    // the recruiter's internal scoring config.
     expect(v2.revision).toBe(2);
     expect(v2.weighted_score_5).toBe(4.5);
     expect(v2.scoring_status).toBe('complete');
     expect(Array.isArray(v2.metric_results)).toBe(true);
+    // Candidate-facing fields PRESENT: score, rationale, evidence status, and the
+    // metric's key + name.
     expect(v2.metric_results[0].metric.key).toBe('communication');
+    expect(v2.metric_results[0].metric.name).toBe('Customer Communication');
     expect(v2.metric_results[0].score).toBe(5);
+    expect(v2.metric_results[0].rationale).toBe('excellent');
+    expect(v2.metric_results[0].evidenceStatus).toBe('scored');
+    expect(v2.metric_results[0].evidenceRefs).toEqual(['turn:3']);
+    // FIX 4: internal recruiter scoring IP DROPPED — instruction/rubric/weightBps
+    // must not leak to a candidate-owner via the DSAR export.
+    expect(v2.metric_results[0].metric.instruction).toBeUndefined();
+    expect(v2.metric_results[0].metric.rubric).toBeUndefined();
+    expect(v2.metric_results[0].metric.weightBps).toBeUndefined();
+    // Belt-and-braces: the internal instruction text is nowhere in the payload.
+    expect(JSON.stringify(exportRes.body)).not.toContain('INTERNAL-INSTRUCTION-MARKER');
   });
 });
 

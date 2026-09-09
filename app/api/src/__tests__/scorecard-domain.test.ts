@@ -55,6 +55,40 @@ describe('scorecard domain', () => {
     ));
   });
 
+  it('reserves a positive weight for every metric under an adversarial double-pin (FIX 3, no 0 bps)', () => {
+    // start [2500,2500,2500,2500] → pin metric-0=9900 → then pin metric-1=9800.
+    // The old proportional split floored metric-3 to 0 bps (invalid weightBps<1,
+    // the save 400s and the slider sticks). The reserve-1 rule keeps every OTHER
+    // metric >= 1 while still totalling 10000 with the pin exact.
+    const start = metrics([2500, 2500, 2500, 2500]);
+    const afterFirst = redistributeWeights(start, 'metric-0', 9900);
+    expect(afterFirst.map((m) => m.weightBps)).toEqual([9900, 34, 33, 33]);
+
+    const afterSecond = redistributeWeights(afterFirst, 'metric-1', 9800);
+    expect(afterSecond.map((m) => m.weightBps)).toEqual([197, 9800, 2, 1]);
+    expect(afterSecond.reduce((sum, m) => sum + m.weightBps, 0)).toBe(10_000);
+    expect(afterSecond.find((m) => m.id === 'metric-1')!.weightBps).toBe(9800);
+    expect(afterSecond.every((m) => m.weightBps >= 1)).toBe(true);
+  });
+
+  it('produces the byte-identical result the client mirror asserts (shared cases)', () => {
+    // These SAME cases + expected literals are asserted in the web client test
+    // app/web/src/lib/__tests__/scorecard-weights.test.ts; editing one side of
+    // the redistribution math without the other breaks this equality.
+    const cases: Array<{ weights: number[]; editIndex: number; newWeight: number; expected: number[] }> = [
+      { weights: [5000, 3000, 2000], editIndex: 0, newWeight: 4000, expected: [4000, 3600, 2400] },
+      { weights: [2500, 2500, 2500, 2500], editIndex: 0, newWeight: 9900, expected: [9900, 34, 33, 33] },
+      { weights: [3334, 3333, 3333], editIndex: 0, newWeight: 1, expected: [1, 5000, 4999] },
+      { weights: [3334, 3333, 3333], editIndex: 0, newWeight: 5000, expected: [5000, 2500, 2500] },
+      { weights: [3333, 3333, 3334], editIndex: 0, newWeight: 3000, expected: [3000, 3499, 3501] },
+    ];
+    for (const { weights, editIndex, newWeight, expected } of cases) {
+      const out = redistributeWeights(metrics(weights), `metric-${editIndex}`, newWeight);
+      expect(out.map((m) => m.weightBps), `[${weights}] pin#${editIndex}=${newWeight}`).toEqual(expected);
+      expect(out.reduce((sum, m) => sum + m.weightBps, 0)).toBe(10_000);
+    }
+  });
+
   it('hashes the canonical display order and snapshot fields', () => {
     const original = metrics();
     expect(hashRoleScorecard(original)).toBe(hashRoleScorecard([...original].reverse()));

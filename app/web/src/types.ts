@@ -392,9 +392,14 @@ export interface ScorecardAssessmentDisplay {
   metrics: ScorecardMetricDisplay[];
 }
 
-/** True when an assessment row is a role-scorecard v2 row (schema_version === 2). */
+/**
+ * True when an assessment row is a role-scorecard v2 row (schema_version == 2).
+ * Uses `Number(...)` so a stringy `'2'` on the wire still routes to the v2
+ * display — matching export.ts and the Ashby adapter, which both coerce with
+ * `Number(schema_version) === 2`.
+ */
 export function isAssessmentV2(a: Assessment | null | undefined): boolean {
-  return !!a && (a as { schema_version?: number }).schema_version === 2;
+  return !!a && Number((a as { schema_version?: number | string }).schema_version) === 2;
 }
 
 /**

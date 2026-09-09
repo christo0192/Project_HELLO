@@ -284,6 +284,28 @@ describe('GET /api/scorecards/roles/:roleId/scorecard', () => {
     const res = await request(makeApp(makeUser('interviewer'))).get(`/api/scorecards/roles/${ROLE_ID}/scorecard`).set(AUTH);
     expect(res.status).toBe(403);
   });
+
+  it('FIX 8 — a viewer can no longer read a role scorecard (now owner-scoped) → 403, no DB read', async () => {
+    // The GET used to require only `viewer`, exposing a role's internal per-metric
+    // config to any viewer. It is now interviewer-gated, so requireRole blocks a
+    // viewer before the handler ever touches the database.
+    const res = await request(makeApp(makeUser('viewer', { aal: 'aal1' })))
+      .get(`/api/scorecards/roles/${ROLE_ID}/scorecard`)
+      .set(AUTH);
+    expect(res.status).toBe(403);
+    expect(mockFrom).not.toHaveBeenCalled();
+  });
+
+  it('FIX 8 — an admin still reads any role scorecard (not owner-scoped)', async () => {
+    // requireRole('interviewer') admits admin, and loadRoleWithAccess owner-scopes
+    // only interviewers — so an admin reads a role it does not own.
+    mockFrom.mockReturnValueOnce(chainable({ data: { id: ROLE_ID, owner_id: OTHER_ID, active_scorecard_version_id: null }, error: null }));
+    const res = await request(makeApp(makeUser('admin')))
+      .get(`/api/scorecards/roles/${ROLE_ID}/scorecard`)
+      .set(AUTH);
+    expect(res.status).toBe(200);
+    expect(res.body.scorecard).toBeNull();
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════

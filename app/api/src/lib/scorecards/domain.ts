@@ -97,6 +97,17 @@ export function hashRoleScorecard(metrics: readonly RoleScorecardMetric[]): stri
  * Pin one metric at `newWeightBps`; redistribute the remaining bps over every
  * other metric proportionally. Largest-remainder rounding with display order
  * tie-breaking makes the result deterministic and exact.
+ *
+ * Every OTHER metric is guaranteed a weight of at least 1 bps: the proportional
+ * split can otherwise floor a small-weight metric to 0 (e.g. after pinning one
+ * metric near 100% twice in a row), which violates `weightBps >= 1` and 400s the
+ * save / freezes the slider. So one bps is RESERVED per other metric up front,
+ * only the surplus (`remainder - others.length`) is spread by the largest-
+ * remainder rule, and the reserved 1 is added back to each. The guard above
+ * ensures `remainder >= others.length`, so the surplus is never negative.
+ *
+ * This math is BYTE-IDENTICAL to the client mirror in
+ * app/web/src/lib/scorecard-weights.ts — the two MUST stay in lock-step.
  */
 export function redistributeWeights(
   metrics: readonly RoleScorecardMetric[],
@@ -113,16 +124,19 @@ export function redistributeWeights(
   if (!others.length) return [{ ...edited, weightBps: SCORECARD_WEIGHT_TOTAL_BPS }];
 
   const remainder = SCORECARD_WEIGHT_TOTAL_BPS - newWeightBps;
+  // Reserve 1 bps per other metric so none can floor to 0; distribute only the
+  // surplus proportionally, then add the reserved 1 back.
+  const distributable = remainder - others.length;
   const oldOtherTotal = others.reduce((sum, metric) => sum + metric.weightBps, 0);
   const shares = others.map((metric) => {
-    const numerator = oldOtherTotal > 0 ? remainder * metric.weightBps : remainder;
+    const numerator = oldOtherTotal > 0 ? distributable * metric.weightBps : distributable;
     const denominator = oldOtherTotal > 0 ? oldOtherTotal : others.length;
     const floor = Math.floor(numerator / denominator);
     return { metric, floor, fractional: numerator % denominator };
   });
-  let unallocated = remainder - shares.reduce((sum, share) => sum + share.floor, 0);
+  let unallocated = distributable - shares.reduce((sum, share) => sum + share.floor, 0);
   shares.sort((a, b) => b.fractional - a.fractional || a.metric.displayOrder - b.metric.displayOrder);
-  const redistributed = new Map(shares.map((share) => [share.metric.id, share.floor]));
+  const redistributed = new Map(shares.map((share) => [share.metric.id, share.floor + 1]));
   for (const share of shares) {
     if (unallocated-- <= 0) break;
     redistributed.set(share.metric.id, (redistributed.get(share.metric.id) ?? 0) + 1);

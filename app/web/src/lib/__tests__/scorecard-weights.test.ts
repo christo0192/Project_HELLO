@@ -78,6 +78,40 @@ describe('redistributeWeights', () => {
     const set = [m('a', 6000, 0), m('b', 4000, 1)];
     expect(redistributeWeights(set, 'missing', 5000)).toEqual(set);
   });
+
+  it('reserves a positive weight for every metric under an adversarial double-pin (FIX 3, no 0 bps)', () => {
+    // start [2500,2500,2500,2500] → pin a=9900 → then pin b=9800. The old
+    // proportional split floored the last metric to 0 bps (server rejects a save
+    // with weightBps<1, and the slider sticks). Reserve-1 keeps every OTHER
+    // metric >= 1 while totalling 100% with the pin exact.
+    const start = [m('a', 2500, 0), m('b', 2500, 1), m('c', 2500, 2), m('d', 2500, 3)];
+    const first = redistributeWeights(start, 'a', 9900);
+    expect(first.map((x) => x.weightBps)).toEqual([9900, 34, 33, 33]);
+    const second = redistributeWeights(first, 'b', 9800);
+    expect(second.map((x) => x.weightBps)).toEqual([197, 9800, 2, 1]);
+    expect(totalWeightBps(second)).toBe(SCORECARD_WEIGHT_TOTAL_BPS);
+    for (const item of second) expect(item.weightBps).toBeGreaterThanOrEqual(1);
+  });
+
+  it('matches the server domain byte-for-byte on shared cases (client-vs-server equality)', () => {
+    // These SAME cases + expected literals are asserted in the API domain test
+    // app/api/src/__tests__/scorecard-domain.test.ts. The two redistribution
+    // implementations MUST stay in lock-step; this pins that equality.
+    const cases: Array<{ weights: number[]; editIndex: number; newWeight: number; expected: number[] }> = [
+      { weights: [5000, 3000, 2000], editIndex: 0, newWeight: 4000, expected: [4000, 3600, 2400] },
+      { weights: [2500, 2500, 2500, 2500], editIndex: 0, newWeight: 9900, expected: [9900, 34, 33, 33] },
+      { weights: [3334, 3333, 3333], editIndex: 0, newWeight: 1, expected: [1, 5000, 4999] },
+      { weights: [3334, 3333, 3333], editIndex: 0, newWeight: 5000, expected: [5000, 2500, 2500] },
+      { weights: [3333, 3333, 3334], editIndex: 0, newWeight: 3000, expected: [3000, 3499, 3501] },
+    ];
+    for (const { weights, editIndex, newWeight, expected } of cases) {
+      const set = weights.map((w, i) => m(`m${i}`, w, i));
+      const out = redistributeWeights(set, `m${editIndex}`, newWeight);
+      const byOrder = [...out].sort((a, b) => a.displayOrder - b.displayOrder);
+      expect(byOrder.map((x) => x.weightBps)).toEqual(expected);
+      expect(totalWeightBps(out)).toBe(SCORECARD_WEIGHT_TOTAL_BPS);
+    }
+  });
 });
 
 describe('evenWeights', () => {
