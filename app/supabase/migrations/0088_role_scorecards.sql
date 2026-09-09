@@ -101,7 +101,8 @@ create trigger trg_roles_active_scorecard_pointer
   before insert or update of active_scorecard_version_id on screening_v2.roles
   for each row execute function screening_v2.assert_role_scorecard_pointer();
 
--- Metric rows are immutable once committed. New role versions are created instead.
+-- Metric rows are immutable once committed. RLS denies ordinary clients any
+-- delete privilege; delete must remain possible for FK role-deletion cleanup.
 create or replace function screening_v2.prevent_scorecard_version_mutation()
 returns trigger language plpgsql security invoker set search_path = pg_catalog as $$
 begin
@@ -110,11 +111,11 @@ end;
 $$;
 drop trigger if exists trg_prevent_role_scorecard_versions_mutation on screening_v2.role_scorecard_versions;
 create trigger trg_prevent_role_scorecard_versions_mutation
-  before update or delete on screening_v2.role_scorecard_versions
+  before update on screening_v2.role_scorecard_versions
   for each row execute function screening_v2.prevent_scorecard_version_mutation();
 drop trigger if exists trg_prevent_role_scorecard_metrics_mutation on screening_v2.role_scorecard_version_metrics;
 create trigger trg_prevent_role_scorecard_metrics_mutation
-  before update or delete on screening_v2.role_scorecard_version_metrics
+  before update on screening_v2.role_scorecard_version_metrics
   for each row execute function screening_v2.prevent_scorecard_version_mutation();
 
 -- The total is checked at transaction end so an atomic complete configuration
