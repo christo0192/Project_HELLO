@@ -4435,15 +4435,18 @@ async def _run_native_phone_screening(
                 # the candidate just answered. Same narrow high-confidence
                 # predicate the contiguous volunteered-objective skip uses.
                 and not phone.phone_answer_covers_objective(question.text, text)
-                # Baseline-fix 2a (session 4355b045, 2026-09-08): a turn that
-                # already exhausted the interrupted-recovery budget THIS turn must
-                # NOT also be held here. On the intro/name question — whose ask can
-                # never be placed on-objective (`ask_on_objective` is always False
-                # for it) — this branch would otherwise re-hold with
-                # `mandatory_ask_drift_reask` every turn, so the cursor never
-                # advanced and compensation (and every later plan item) was
-                # structurally unreachable. The interrupted branch already spent
-                # its bounded re-ask; let the turn fall through and advance.
+                # Baseline-fix 2a (session 4355b045, 2026-09-08): a MANDATORY
+                # question (compensation / notice-period — the only classes this
+                # delivery-drift branch fires on) that already exhausted its
+                # interrupted-recovery budget THIS turn must NOT also be re-held
+                # here, or a mandatory item whose ask keeps drifting off-objective
+                # (e.g. while the coverage judge is dead) never advances and every
+                # later plan item stays unreachable. The interrupted branch already
+                # spent its bounded re-ask; let the turn fall through and advance.
+                # NOTE: this guard does NOT fix the intro/name loop — the intro is
+                # not mandatory-class, so this branch never fires on it. The intro
+                # loop is broken by Fix 3b (crediting the substantive intro answer
+                # that `phone_answer_covers_objective` structurally cannot match).
                 and not interrupted_cap_forced_advance
             ):
                 drift_seen = ask_drift_reask_counts.get(question.key, 0)
@@ -5477,9 +5480,17 @@ async def _run_native_phone_screening(
                 # the combined budget the hook fell through DELIBERATELY, so
                 # this fence must let the commit proceed exactly as it does at
                 # the answer gate's own cap.
+                # Baseline-fix repair (2026-09-09): fold interrupted_reask_counts
+                # into the SAME composed ceiling the two live gates use (4460,
+                # 4548). Without it, a mandatory key barged past its interrupted
+                # cap (interrupted_cap_forced_advance) whose turn is a genuine
+                # nonanswer re-held HERE — defeating 2a/2b's terminal-advance for
+                # that turn class. The three machineries now share one budget on
+                # the commit side too.
                 and (
                     answer_reask_counts.get(commit_question.key, 0)
                     + ask_drift_reask_counts.get(commit_question.key, 0)
+                    + interrupted_reask_counts.get(commit_question.key, 0)
                     < combined_reask_cap
                 )
             ):
@@ -7565,34 +7576,23 @@ async def _run_phone_session(
                         asyncio.shield(subscribed_fut),
                         timeout=phone.phone_output_subscribe_timeout_sec(),
                     )
-            except (asyncio.TimeoutError, AttributeError, Exception):  # noqa: BLE001
-                # Proceed unchanged; the subscription may still complete during
+            except Exception:  # noqa: BLE001
+                # Fail-open: TimeoutError/AttributeError and any other error all
+                # proceed unchanged; the subscription may still complete during
                 # generation (the first frame's own await backstops it).
+                # CancelledError is BaseException (not Exception) so task
+                # cancellation still propagates.
                 pass
-            # ── Baseline-fix 4b (session 4355b045, 2026-09-08): DEFENSE-IN-DEPTH
-            # FIRST-AUDIO WATCHDOG FOR THE OPENING. ────────────────────────────
-            # The first-audio watchdog (`_on_reply_expected`) is wired only by the
-            # NATIVE screening loop (`_run_native_phone_screening`), which runs
-            # AFTER the consent gate — so during THIS gate-time opening the agent's
-            # `_on_reply_expected` is still `None` (its `__init__` default) and
-            # there is no native watchdog to arm here. A best-effort, fail-open arm
-            # is made anyway so that IF the arming seam is ever moved earlier the
-            # opening is covered; today it is a deliberate no-op. Crucially, a
-            # stalled/verification-failed opening is ALREADY observable and
-            # recoverable WITHOUT this watchdog: `run_phone_gate` wraps this call
-            # in try/except, logs `opening_unverified`, and speaks the fixed
-            # `PHONE_DISCLOSURE_TEXT` fallback when `speak_opening` returns None —
-            # so the "logged + deterministic fallback" guarantee holds via the gate
-            # path, and 4a bounds the one previously-unbounded wait (the SIP
-            # subscription). Never raises.
-            arm_opening_watchdog = getattr(agent, "_on_reply_expected", None)
-            if callable(arm_opening_watchdog):
-                try:
-                    armed = arm_opening_watchdog()
-                    if inspect.isawaitable(armed):
-                        await armed
-                except Exception:  # noqa: BLE001
-                    pass
+            # NOTE (baseline-fix repair, 2026-09-09): a defense-in-depth
+            # first-audio watchdog arm for the opening was REMOVED here as dead
+            # code — `_on_reply_expected` is wired only by the native screening
+            # loop, which runs AFTER this consent-gate opening, so at gate time it
+            # is always `None` and the arm could never fire (a guard that cannot
+            # fire). A stalled or verification-failed opening is already observable
+            # and recovered without it: `run_phone_gate` wraps this call, logs
+            # `opening_unverified`, and speaks the fixed `PHONE_DISCLOSURE_TEXT`
+            # fallback when `speak_opening` returns None; and 4a above bounds the
+            # one previously-unbounded wait (the SIP output-track subscription).
             # The FIRST generation of a call runs against an EMPTY chat
             # context, and Gemini refuses a request with no contents
             # (400 INVALID_ARGUMENT, observed live 2026-08-29 — the opening

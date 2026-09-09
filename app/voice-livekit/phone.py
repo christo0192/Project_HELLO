@@ -8543,10 +8543,13 @@ async def _default_phone_coverage_inference(prompt: str) -> Any:
             headers=headers,
             json_body=json_body,
             endpoint_hint="unknown",
-            # Baseline-fix (session 4355b045): surface the provider's 400 reason
-            # in the logs. The judge runs off the speech path, so a redacted
-            # provider log line adds no latency and turns a future silent wedge
-            # into something visible.
+            # Baseline-fix (session 4355b045): surface TRANSIENT provider failure
+            # detail (5xx/429/timeout → ProviderError honors this flag). NOTE: a
+            # 4xx is a BusinessError, which call_with_breaker re-raises WITHOUT
+            # logging regardless of this flag — so the actual 400 body is not
+            # surfaced here; the caller's `unsupported_param_retry` log + the
+            # response_format/reasoning_effort strip are what handle the param-400.
+            # The judge runs off the speech path, so the added logging is free.
             log_failures=True,
         )
     except BusinessError:

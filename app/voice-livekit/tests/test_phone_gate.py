@@ -9684,6 +9684,14 @@ class TestPhoneCoverageJudgeResponseFormat(unittest.IsolatedAsyncioTestCase):
     the whole request/retry machinery is proven, not just the assembled body.
     """
 
+    async def asyncSetUp(self):
+        # Repair (2026-09-09): the shared module-level breaker leaked OPEN across
+        # tests once under combined ordering. Reset it BEFORE every test and
+        # register an after-cleanup so no test can inherit or leave OPEN residue,
+        # regardless of run order.
+        self._reset_breaker()
+        self.addCleanup(self._reset_breaker)
+
     def _clear(self):
         for key in ("PHONE_JUDGE_URL", "PHONE_JUDGE_MODEL", "PHONE_JUDGE_API_KEY",
                     "PHONE_JUDGE_MAX_TOKENS", "PHONE_JUDGE_EXTRA_BODY_JSON",
@@ -10421,15 +10429,6 @@ class TestOpeningSubscribeReadiness(unittest.IsolatedAsyncioTestCase):
             getattr(session, "_room_io", None), "subscribed_fut", None,
         )
         self.assertIsNone(subscribed_fut)
-
-    def test_opening_arms_first_audio_watchdog_best_effort(self):
-        # 4b GUARD (non-vacuous): the opening makes a fail-open best-effort call
-        # to the first-audio watchdog arm (`_on_reply_expected`). During the gate
-        # this is a no-op (the native loop wires it later), but the seam is
-        # present and guarded. Revert 4b → these markers vanish → RED.
-        src = self._speak_opening_src()
-        self.assertIn('getattr(agent, "_on_reply_expected", None)', src)
-        self.assertIn("callable(arm_opening_watchdog)", src)
 
 
 class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
