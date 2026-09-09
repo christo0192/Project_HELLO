@@ -19,6 +19,7 @@ import {
   TextField,
   usePagination,
 } from "../components/design";
+import { RoleScorecardEditor } from "../components/roles/RoleScorecardEditor";
 
 interface QuestionRow {
   id: string;
@@ -305,6 +306,7 @@ function RoleForm({
   }
 
   return (
+    <div className="space-y-6">
     <GlassPanel padding="lg">
       <SectionHeader
         title={role ? "Edit role" : "New role"}
@@ -467,5 +469,13 @@ function RoleForm({
         </div>
       </form>
     </GlassPanel>
+
+      {/*
+        Per-role scorecard configuration. Only for an EXISTING role — a new,
+        unsaved role has no id to attach a scorecard version to. Save the role
+        first, reopen it, then configure the scorecard here.
+      */}
+      {role && <RoleScorecardEditor roleId={role.id} />}
+    </div>
   );
 }

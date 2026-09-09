@@ -80,6 +80,13 @@ import type {
   PhoneVerificationInput,
   PhoneVerificationResponse,
   PhoneSlotsResponse,
+  PutRoleScorecardInput,
+  RedistributeWeightsInput,
+  RedistributeWeightsResponse,
+  RoleScorecardResponse,
+  ScorecardMetricCreateInput,
+  ScorecardMetricTemplate,
+  ScorecardMetricUpdateInput,
   SessionDetail,
   StartLiveKitResult,
   StartScreeningResult,
@@ -569,5 +576,44 @@ export const api = {
     request<PhoneCancelResponse>(
       `/api/phone/appointments/${encodeURIComponent(id)}`,
       { method: 'DELETE', body: JSON.stringify(input) },
+    ),
+
+  // ── Scorecards (Phase 3) ─────────────────────────────────────────
+  // Metric LIBRARY ("Scorebar") is admin-only server-side; GET returns a bare
+  // array of snake_case rows. Role scorecard reads need interviewer+ (owner of
+  // the role, admin all) and return camelCase domain objects. The API re-checks
+  // the role and role-ownership on every request regardless of what is sent.
+
+  listScorecardMetrics: () =>
+    request<ScorecardMetricTemplate[]>('/api/scorecards/metrics'),
+  createScorecardMetric: (body: ScorecardMetricCreateInput) =>
+    request<ScorecardMetricTemplate>('/api/scorecards/metrics', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
+  updateScorecardMetric: (id: string, body: ScorecardMetricUpdateInput) =>
+    request<ScorecardMetricTemplate>(`/api/scorecards/metrics/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      body: JSON.stringify(body),
+    }),
+  archiveScorecardMetric: (id: string) =>
+    request<ScorecardMetricTemplate>(`/api/scorecards/metrics/${encodeURIComponent(id)}/archive`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+
+  getRoleScorecard: (roleId: string) =>
+    request<RoleScorecardResponse>(
+      `/api/scorecards/roles/${encodeURIComponent(roleId)}/scorecard`,
+    ),
+  putRoleScorecard: (roleId: string, body: PutRoleScorecardInput) =>
+    request<RoleScorecardResponse>(
+      `/api/scorecards/roles/${encodeURIComponent(roleId)}/scorecard`,
+      { method: 'PUT', body: JSON.stringify(body) },
+    ),
+  redistributeRoleScorecardWeights: (roleId: string, body: RedistributeWeightsInput) =>
+    request<RedistributeWeightsResponse>(
+      `/api/scorecards/roles/${encodeURIComponent(roleId)}/scorecard/redistribute`,
+      { method: 'POST', body: JSON.stringify(body) },
     ),
 };
