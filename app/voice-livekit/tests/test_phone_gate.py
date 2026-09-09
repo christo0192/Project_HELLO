@@ -9677,6 +9677,153 @@ class TestPhoneJudgeProviderConfig(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class TestPhoneCoverageJudgeResponseFormat(unittest.IsolatedAsyncioTestCase):
+    """Baseline-fix (session 4355b045, 2026-09-08): DeepSeek judge must NOT send
+    `response_format` (it 400s on it → judge_error every turn), while Google/Gemini
+    keeps it. Exercises the REAL `call_with_breaker` path (breaker + transport) so
+    the whole request/retry machinery is proven, not just the assembled body.
+    """
+
+    async def asyncSetUp(self):
+        # Repair (2026-09-09): the shared module-level breaker leaked OPEN across
+        # tests once under combined ordering. Reset it BEFORE every test and
+        # register an after-cleanup so no test can inherit or leave OPEN residue,
+        # regardless of run order.
+        self._reset_breaker()
+        self.addCleanup(self._reset_breaker)
+
+    def _clear(self):
+        for key in ("PHONE_JUDGE_URL", "PHONE_JUDGE_MODEL", "PHONE_JUDGE_API_KEY",
+                    "PHONE_JUDGE_MAX_TOKENS", "PHONE_JUDGE_EXTRA_BODY_JSON",
+                    "PHONE_JUDGE_SDK", "PHONE_JUDGE_REASONING_EFFORT"):
+            os.environ.pop(key, None)
+
+    def _reset_breaker(self):
+        # A shared module-level breaker persists across tests; a prior test's
+        # failures could otherwise leave it OPEN and short-circuit this call.
+        phone._PHONE_COVERAGE_BREAKER.reset()
+
+    @staticmethod
+    def _rf_sensitive_transport():
+        """Transport that mimics DeepSeek V4-Flash: 400 iff the body carries
+        `response_format`, 200 with a valid verdict otherwise. Records every
+        posted body so the test can assert exactly what went on the wire.
+        """
+        import provider_resilience as pr
+
+        class _RFResponse:
+            # call_with_breaker returns the response object; the inference reads
+            # response.json()["choices"][0]["message"]["content"].
+            def __init__(self, status_code, verdict):
+                self.status_code = status_code
+                self._verdict = verdict
+
+            def json(self):
+                return {"choices": [{"message": {"content": self._verdict}}]}
+
+        class _RFTransport(pr.AsyncTransport):
+            def __init__(self) -> None:
+                self.bodies: list = []
+
+            async def request(self, method, url, *, json=None, timeout=None,
+                              headers=None):
+                self.bodies.append(json)
+                if isinstance(json, dict) and "response_format" in json:
+                    return _RFResponse(400, None)
+                return _RFResponse(200, '{"covered":true,"conflict":null}')
+
+        return _RFTransport()
+
+    async def test_deepseek_judge_omits_response_format_and_returns_verdict(self):
+        # GREEN: with the fix, the DeepSeek body has NO response_format, so the
+        # rf-sensitive transport returns 200 on the FIRST call and the inference
+        # yields a real verdict (no judge_error).
+        transport = self._rf_sensitive_transport()
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear()
+            self._reset_breaker()
+            with patch.dict(os.environ, {
+                "PHONE_JUDGE_SDK": "openai",
+                "PHONE_JUDGE_URL": "https://api.deepseek.com/v1/chat/completions",
+                "PHONE_JUDGE_MODEL": "deepseek-v4-flash",
+                "PHONE_JUDGE_API_KEY": "d" * 40,
+            }), patch.object(
+                phone, "_phone_coverage_transport", return_value=transport,
+            ):
+                raw = await phone._default_phone_coverage_inference("{}")
+        # A real verdict, parseable, covered=True.
+        self.assertEqual(raw, '{"covered":true,"conflict":null}')
+        verdict = phone.parse_phone_coverage_verdict(raw)
+        self.assertIsNotNone(verdict)
+        self.assertTrue(verdict.covered)
+        # The DeepSeek body that went on the wire carried NO response_format,
+        # carried reasoning_effort="none", and succeeded on the FIRST attempt
+        # (no retry needed).
+        self.assertEqual(len(transport.bodies), 1)
+        first = transport.bodies[0]
+        self.assertNotIn("response_format", first)
+        self.assertEqual(first["reasoning_effort"], "none")
+
+    async def test_retry_strips_response_format_on_a_400(self):
+        # RED/GREEN for the retry-strip change. A NON-DeepSeek endpoint (here
+        # Sarvam) keeps `response_format` in the FIRST body (the DeepSeek pop
+        # does not apply), so the rf-sensitive transport 400s the first call.
+        # Post-fix the retry strips BOTH reasoning_effort AND response_format,
+        # so the second call has no response_format and succeeds. Revert the
+        # retry change (drop response_format from the strip set) and both
+        # attempts carry response_format → both 400 → BusinessError propagates
+        # → judge_error (this test reddens).
+        transport = self._rf_sensitive_transport()
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear()
+            self._reset_breaker()
+            with patch.dict(os.environ, {
+                "PHONE_JUDGE_SDK": "openai",
+                "PHONE_JUDGE_URL": "https://api.sarvam.ai/v1/chat/completions",
+                "PHONE_JUDGE_MODEL": "sarvam-105b",
+                "PHONE_JUDGE_API_KEY": "s" * 40,
+                "PHONE_JUDGE_REASONING_EFFORT": "low",
+            }), patch.object(
+                phone, "_phone_coverage_transport", return_value=transport,
+            ):
+                raw = await phone._default_phone_coverage_inference("{}")
+        self.assertEqual(raw, '{"covered":true,"conflict":null}')
+        # First attempt carried response_format (Sarvam keeps it), 400'd; retry
+        # stripped BOTH response_format and reasoning_effort and succeeded.
+        self.assertEqual(len(transport.bodies), 2)
+        self.assertIn("response_format", transport.bodies[0])
+        self.assertNotIn("response_format", transport.bodies[1])
+        self.assertNotIn("reasoning_effort", transport.bodies[1])
+
+    async def test_google_judge_body_still_carries_response_format(self):
+        # ROLLBACK GUARD: the Google/Gemini judge path must keep response_format
+        # AND reasoning_effort="minimal" byte-for-byte. Assert the assembled body
+        # directly via call_with_breaker capture (no transport wedge).
+        response = types.SimpleNamespace(json=lambda: {
+            "choices": [{"message": {"content": '{"covered":true,"conflict":null}'}}],
+        })
+        with patch.dict(os.environ, {}, clear=False):
+            self._clear()
+            self._reset_breaker()
+            with patch.dict(os.environ, {
+                "PHONE_JUDGE_SDK": "openai",
+                "PHONE_JUDGE_URL":
+                    "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                "PHONE_JUDGE_MODEL": "gemini-3.5-flash-lite",
+                "PHONE_JUDGE_API_KEY": "j" * 40,
+            }), patch.object(
+                phone, "_phone_coverage_transport", return_value=object(),
+            ), patch.object(
+                phone, "call_with_breaker", new_callable=AsyncMock,
+                return_value=response,
+            ) as call:
+                raw = await phone._default_phone_coverage_inference("{}")
+        self.assertEqual(raw, '{"covered":true,"conflict":null}')
+        body = call.await_args.kwargs["json_body"]
+        self.assertEqual(body["response_format"], {"type": "json_object"})
+        self.assertEqual(body["reasoning_effort"], "minimal")
+
+
 class TestPhoneSdkSelectors(unittest.TestCase):
     """Native-SDK switch: PHONE_LLM_SDK / PHONE_JUDGE_SDK accessors."""
 
@@ -10201,6 +10348,87 @@ class TestPhoneSpeechWatchdog(unittest.IsolatedAsyncioTestCase):
         self.assertIn("interrupt(force=True)", watchdog)
         self.assertNotIn('getattr(session, "interrupt"', watchdog)
         self.assertNotIn("allow_interruptions=False", watchdog)
+
+
+class TestOpeningSubscribeReadiness(unittest.IsolatedAsyncioTestCase):
+    """Baseline-fix 4 (session 4355b045, 2026-09-08): the ~17-20s first-audio
+    cold-start is a LiveKit SIP outbound-audio subscription stall (RoomIO's first
+    `capture_frame` blocks on an untimed `wait_for_subscription`). `speak_opening`
+    now awaits `session._room_io.subscribed_fut` with a BOUNDED, fail-open timeout
+    BEFORE generating so the subscribe handshake overlaps the pre-opening work.
+    """
+
+    @staticmethod
+    def _speak_opening_src():
+        # `speak_opening` is a closure inside `_run_phone_session`; slice its
+        # source out so the guards below pin the REAL code, not a copy.
+        src = inspect.getsource(agent_mod._run_phone_session)
+        start = src.index("async def speak_opening")
+        end = src.index("async def speak_role_opening")
+        return src[start:end]
+
+    def test_reader_default_and_clamp(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("PHONE_OUTPUT_SUBSCRIBE_TIMEOUT_SEC", None)
+            self.assertEqual(phone.phone_output_subscribe_timeout_sec(), 8.0)
+        for raw, expected in (("2.5", 2.5), ("0.1", 0.5), ("999", 30.0),
+                              ("garbage", 8.0), ("", 8.0)):
+            with patch.dict(os.environ,
+                            {"PHONE_OUTPUT_SUBSCRIBE_TIMEOUT_SEC": raw}):
+                with self.subTest(raw=raw):
+                    self.assertEqual(
+                        phone.phone_output_subscribe_timeout_sec(), expected,
+                    )
+
+    def test_opening_awaits_subscription_readiness_before_generating(self):
+        # 4a GUARD (non-vacuous): the opening slices out the RoomIO
+        # subscription-readiness future and awaits it under a bounded timeout,
+        # BEFORE the generate call. Revert 4a → these markers vanish → RED.
+        src = self._speak_opening_src()
+        self.assertIn("subscribed_fut", src)
+        self.assertIn("phone_output_subscribe_timeout_sec()", src)
+        self.assertIn("_room_io", src)
+        # The wait is bounded (never an unbounded await) and shields the SDK
+        # future so a timeout here cannot cancel the SDK's own subscription.
+        self.assertIn("asyncio.wait_for", src)
+        self.assertIn("asyncio.shield(subscribed_fut)", src)
+        # And it happens BEFORE the generation, so it overlaps the pre-opening
+        # work rather than being paid on the first spoken frame.
+        self.assertLess(
+            src.index("subscribed_fut"),
+            src.index("generate("),
+            "the subscription wait must precede the generate() call",
+        )
+
+    async def test_opening_subscription_wait_is_fail_open(self):
+        # 4a SEMANTICS (behavioral): the exact fail-open pattern the opening uses
+        # — wait_for(shield(fut), timeout) swallowing TimeoutError — must PROCEED
+        # when the future never resolves, and must NOT cancel the underlying SDK
+        # future (shield). Executes the real semantics, so it stays honest.
+        loop = asyncio.get_running_loop()
+        pending = loop.create_future()  # never resolved → models a stalled peer
+        proceeded = False
+        try:
+            await asyncio.wait_for(asyncio.shield(pending), timeout=0.02)
+        except (asyncio.TimeoutError, AttributeError, Exception):  # noqa: BLE001
+            proceeded = True
+        self.assertTrue(proceeded, "a stalled subscription must fail open")
+        # shield protected the SDK future: it is still pending, not cancelled.
+        self.assertFalse(pending.cancelled(),
+                         "the SDK subscription future must not be cancelled")
+        self.assertFalse(pending.done())
+        pending.cancel()  # cleanup
+
+    def test_opening_proceeds_when_room_io_absent(self):
+        # 4a fail-open on a missing attribute: `getattr(session, "_room_io",
+        # None)` → None → no await, opening proceeds. The stub `_InertSession`
+        # (used across this suite) has no `_room_io`, mirroring exactly this.
+        session = _InertSession()
+        self.assertIsNone(getattr(session, "_room_io", None))
+        subscribed_fut = getattr(
+            getattr(session, "_room_io", None), "subscribed_fut", None,
+        )
+        self.assertIsNone(subscribed_fut)
 
 
 class TestPhoneCoverageJudgeCoordinator(unittest.IsolatedAsyncioTestCase):
@@ -11546,6 +11774,210 @@ class TestInterruptedRecoveryBound(unittest.IsolatedAsyncioTestCase):
         # Counter never exceeds the cap of 1.
         self.assertEqual(agent._interrupted_reask_counts.get("k1", 0), 1)
         self.assertFalse(agent._prior_turn_interrupted_snapshot()["value"])
+        await self._close(hooks)
+
+
+class TestInterruptedRecoveryBaselineFixes(unittest.IsolatedAsyncioTestCase):
+    """Baseline-fix 2+3 (session 4355b045, 2026-09-08). Live RCA: an interrupted
+    re-ask loop sat on the INTRO question for ~10 min and compensation was never
+    reached. Two entangled causes, fixed together:
+
+      3b — a genuine SUBSTANTIVE post-barge-in answer to a question whose
+           objective `answer_covers_objective` structurally cannot match (the
+           intro / name question) was never credited, so the branch re-asked
+           forever. Broadened the credit condition to also accept a substantive
+           DECLARATIVE answer that is not a counter-question — WITHOUT crediting a
+           bare connectivity check ("Hello", "which program"), whose answer
+           disposition is fail-open.
+
+      2a/2b — once the interrupted cap was exhausted, a MANDATORY (compensation /
+           notice-period) question fell straight into the delivery-verified commit
+           gate, which re-held with `mandatory_ask_drift_reask` because the ask
+           could not be placed on-objective and the coverage judge was dead — the
+           cursor never advanced. 2a exempts a cap-forced-advance turn from that
+           hold; 2b folds the interrupted re-asks into the combined hold cap so a
+           mandatory question bounds-and-advances even with a permanently dead
+           judge.
+    """
+
+    @staticmethod
+    def _intro_state():
+        # The intro objective: `phone_answer_covers_objective` structurally cannot
+        # match it, which is exactly the class the live loop sat on.
+        return _default_state(questions=[
+            {"key": "intro",
+             "text": "Ask the candidate to introduce themselves and "
+                     "summarize their current work.",
+             "mandatory": True, "hint": None},
+            {"key": "k2", "text": "Tell me about your recent role.",
+             "mandatory": True, "hint": None},
+        ])
+
+    @staticmethod
+    def _comp_state():
+        # A COMPENSATION objective is in the delivery gate's mandatory class, so a
+        # drifted ask for it is what the gate re-holds on (the 2a/2b wedge).
+        return _default_state(questions=[
+            {"key": "comp", "text": "What is your expected CTC and current salary?",
+             "mandatory": True, "hint": None},
+            {"key": "k2", "text": "Tell me about your recent role.",
+             "mandatory": True, "hint": None},
+        ])
+
+    async def _coordinator(self, state, *, delivered_ask):
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless", state=state, coverage_judge_enabled=False,
+        )
+        # The DELIVERED ask the delivery gate reads. A drifted ask makes
+        # `ask_covers_objective` False so the gate would fire on a mandatory
+        # objective (that is the condition the 2a exemption governs).
+        hooks["latest_assistant"][0] = delivered_ask
+        hooks["latest_assistant_anchor"][0] = 1
+        return agent, session, state, client, hooks
+
+    @staticmethod
+    def _mark_prior_interrupted(hooks, agent):
+        hooks["assistant_delivery_complete"].clear()
+        hooks["reply_started"].set()
+        hooks["speech_first_audio"].clear()
+        hooks["reply_handle"][0] = _FakeSpeech(interrupted=True)
+        agent._prior_turn_interrupted_snapshot()["value"] = True
+
+    @staticmethod
+    async def _turn(hooks, text):
+        ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](
+            text, types.SimpleNamespace(text_content=text), ctx,
+        )
+        return ctx
+
+    @staticmethod
+    def _log_categories(hooks):
+        calls = (
+            hooks["log"].info.call_args_list
+            + hooks["log"].warn.call_args_list
+        )
+        return [c.kwargs.get("error_category") for c in calls]
+
+    async def _close(self, hooks):
+        hooks["close_event"].set()
+        await hooks["drive_terminal"]()
+
+    async def test_3b_substantive_intro_answer_is_credited_not_reasked(self):
+        # 3b GREEN: a real self-introduction (covers=False for the intro
+        # objective) is credited and the interrupted branch does NOT re-ask; the
+        # interrupted counter is untouched. Revert 3b (drop the substantive-
+        # declarative arm) → this turn is re-asked (RED), which is the live wedge.
+        intro = self._intro_state()
+        spoken = intro.questions[0].spoken_text
+        agent, _, _, _, hooks = await self._coordinator(intro, delivered_ask=spoken)
+        self._mark_prior_interrupted(hooks, agent)
+        answer = ("Sure, my name is Priya and I currently lead the enterprise "
+                  "sales team at Acme, handling strategic accounts.")
+        # Sanity: the objective genuinely cannot be covered by this answer, so the
+        # ONLY thing that credits it is the 3b broadening.
+        self.assertFalse(phone.phone_answer_covers_objective(
+            intro.questions[0].text, answer,
+        ))
+        ctx = await self._turn(hooks, answer)
+        rendered = str(ctx.items).lower()
+        self.assertNotIn("ask that same topic again", rendered,
+                         "a substantive intro answer must be credited, not "
+                         "re-asked")
+        self.assertEqual(agent._interrupted_reask_counts.get("intro", 0), 0)
+        self.assertFalse(agent._prior_turn_interrupted_snapshot()["value"])
+        await self._close(hooks)
+
+    async def test_3b_bare_connectivity_check_still_reasks_once(self):
+        # 3b GUARD (RCA test d): a bare connectivity check whose disposition is
+        # fail-open ("answered") must NOT be credited by 3b — it still gets its
+        # one bounded interrupted re-ask. This proves the broadening did not
+        # over-credit greetings.
+        intro = self._intro_state()
+        spoken = intro.questions[0].spoken_text
+        agent, _, _, _, hooks = await self._coordinator(intro, delivered_ask=spoken)
+        self._mark_prior_interrupted(hooks, agent)
+        # Disposition is fail-open ("answered"), but it is a candidate_question
+        # and carries no substantive declarative clause → NOT credited.
+        dims = phone.phone_turn_dimensions(
+            intro.questions[0].text, None, "which program is this",
+        )
+        self.assertEqual(dims["disposition"], phone.PHONE_ANSWER_ANSWERED)
+        self.assertFalse(phone.phone_turn_is_substantive_declarative(
+            "which program is this",
+        ))
+        ctx = await self._turn(hooks, "which program is this")
+        self.assertIn("ask that same topic again", str(ctx.items).lower(),
+                      "a bare connectivity check must still re-ask once")
+        self.assertEqual(agent._interrupted_reask_counts.get("intro", 0), 1)
+        await self._close(hooks)
+
+    async def test_2a_mandatory_question_advances_after_interrupted_cap_dead_judge(self):
+        # 2a/2b GREEN: with the coverage judge DEAD (disabled) and the delivered
+        # ask drifted off a MANDATORY (compensation) objective, exhaust the
+        # interrupted-recovery budget with two bare connectivity checks. Once the
+        # cap is hit the turn must FALL THROUGH and advance — it must NOT be
+        # re-held by the delivery gate's `mandatory_ask_drift_reask`. Revert 2a
+        # (drop the `not interrupted_cap_forced_advance` guard) → the gate holds
+        # `mandatory_ask_drift_reask` and the cursor wedges (RED).
+        comp = self._comp_state()
+        agent, _, _, client, hooks = await self._coordinator(
+            comp, delivered_ask="So, tell me — what did you have for breakfast?",
+        )
+        # First interrupted non-answer → exactly ONE interrupted re-ask.
+        self._mark_prior_interrupted(hooks, agent)
+        await self._turn(hooks, "which program is this")
+        self.assertEqual(agent._interrupted_reask_counts.get("comp", 0), 1)
+        # Second interrupted non-answer → cap reached, forced advance. The
+        # delivery gate must NOT hold this turn.
+        self._mark_prior_interrupted(hooks, agent)
+        await self._turn(hooks, "which company is calling")
+        categories = self._log_categories(hooks)
+        self.assertNotIn(
+            "mandatory_ask_drift_reask", categories,
+            "a cap-forced-advance turn must not be re-held by the delivery gate",
+        )
+        # The interrupted re-ask cap is never exceeded.
+        self.assertEqual(agent._interrupted_reask_counts.get("comp", 0), 1)
+        await self._close(hooks)
+
+    async def test_interrupted_reask_recovers_via_sdk_watchdog_no_dead_air(self):
+        # 3a EVIDENCE: the interrupted re-ask return is a NORMAL return, so the
+        # SDK hook `on_user_turn_completed` arms the first-audio watchdog via
+        # `_on_reply_expected()` right after it — the SAME single arming site the
+        # normal path uses. Driving the FULL SDK sequence (not just the raw turn
+        # hook) proves the interrupted re-ask is recovered by the deterministic
+        # fallback: there is NO dead air, and no explicit arm inside the branch is
+        # required (adding one would DOUBLE-ARM). Non-vacuous: it asserts the
+        # fallback line actually speaks.
+        intro = self._intro_state()
+        spoken = intro.questions[0].spoken_text
+        agent, session, _, _, hooks = await self._coordinator(
+            intro, delivered_ask=spoken,
+        )
+        self._mark_prior_interrupted(hooks, agent)
+        before = list(session.spoken)
+        message = types.SimpleNamespace(text_content="which program is this")
+        with patch.object(agent_mod, "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 0.02):
+            # The real SDK entry point: it awaits on_native_turn (interrupted
+            # re-ask return) THEN calls _on_reply_expected() — exactly production.
+            await agent.on_user_turn_completed(
+                types.SimpleNamespace(items=[]), message,
+            )
+            await asyncio.sleep(0.12)
+        new_spoken = session.spoken[len(before):]
+        self.assertEqual(len(new_spoken), 1,
+                         "the interrupted re-ask must be recovered by exactly "
+                         "one deterministic fallback — no dead air")
+        self.assertIn(intro.questions[0].spoken_text, new_spoken[0])
+        # And it was the interrupted branch that ran (counter consumed once).
+        self.assertEqual(agent._interrupted_reask_counts.get("intro", 0), 1)
+        categories = [
+            c.kwargs.get("error_category")
+            for c in hooks["log"].warn.call_args_list
+            if c.kwargs.get("error_type") == "phone_speech_lifecycle"
+        ]
+        self.assertIn("no_speech_created", categories)
         await self._close(hooks)
 
 

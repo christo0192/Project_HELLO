@@ -428,6 +428,36 @@ class TestCoalescedDisposition(_Call2Harness):
         ))
         await self._close(hooks)
 
+    async def test_interrupted_cap_folds_into_commit_fence_so_mandatory_advances(self):
+        # Baseline-fix repair (2026-09-09): the commit-side nonanswer fence must
+        # fold `interrupted_reask_counts` into its combined-cap check exactly as
+        # the two LIVE gates (agent.py 4460/4548) do. Once the shared re-ask
+        # budget for the key is exhausted, a genuine nonanswer boundary must
+        # COMMIT (advance) instead of being re-held — otherwise 2a/2b's
+        # terminal-advance is defeated on the commit side and a mandatory item
+        # (compensation is a LATER key) stays unreachable. Pre-repair the fence
+        # composed only answer+drift, so this same turn was skipped (RED: revert
+        # the interrupted_reask_counts term → committed_keys == []).
+        agent, _, state, client, hooks = await self._coordinator()
+        # Exhaust the shared budget for k1 via the interrupted machinery.
+        agent._interrupted_reask_counts[state.questions[0].key] = 3  # combined_reask_cap
+        await self._turn(hooks, "I have been working in operations for a while now")
+        stale = _FakeSpeech()
+        hooks["reply_handle"][0] = stale
+        hooks["reply_started"].set()
+        hooks["speech_first_audio"].clear()
+        await self._turn(
+            hooks, "and the next steps for this role, what does that involve?",
+        )
+        for _ in range(30):
+            await asyncio.sleep(0.005)
+        # Budget exhausted → the nonanswer fence does NOT re-hold; commit proceeds.
+        self.assertEqual(client.committed_keys, [state.questions[0].key])
+        self.assertFalse(self._logs(
+            hooks, "phone_toolless_commit", "nonanswer_commit_skipped",
+        ))
+        await self._close(hooks)
+
 
 # ── F-Q3c: honest ask_delivered recording ────────────────────────────────────
 

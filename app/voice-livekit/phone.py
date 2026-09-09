@@ -778,6 +778,23 @@ def phone_participant_wait_sec() -> float:
     return _bounded_float(os.getenv("PHONE_PARTICIPANT_WAIT_SEC"), 45.0, 1.0, 180.0)
 
 
+def phone_output_subscribe_timeout_sec() -> float:
+    """Bounded wall clock for the SIP peer to subscribe to the agent's audio
+    output track BEFORE the opening is generated.
+
+    Baseline-fix 4a (session 4355b045, 2026-09-08): the ~17-20s first-audio
+    cold-start is a LiveKit SIP outbound-audio-track SUBSCRIPTION stall — the
+    first `capture_frame` blocks on the SIP peer subscribing to the agent's
+    published track. `speak_opening` awaits RoomIO's subscription-readiness
+    future for at most this long BEFORE generating, so the subscribe handshake
+    OVERLAPS the pre-opening work instead of stalling the first utterance. It is
+    a fail-open BOUND, not a target: on timeout (or a missing SDK attribute) the
+    opening proceeds EXACTLY as before, so this can never ADD latency to a call
+    whose peer subscribes quickly, and can never wedge a call whose peer never
+    subscribes. Default 8.0s; clamped to a sane range."""
+    return _bounded_float(os.getenv("PHONE_OUTPUT_SUBSCRIBE_TIMEOUT_SEC"), 8.0, 0.5, 30.0)
+
+
 def phone_classify_timeout_sec() -> float:
     """Bounded wall clock BACKSTOP for the whole human/machine decision.
 
@@ -5959,6 +5976,24 @@ def _answer_has_substantive_declarative(text: str) -> bool:
     return False
 
 
+def phone_turn_is_substantive_declarative(text: Any) -> bool:
+    """Public predicate: does the turn carry a substantive DECLARATIVE clause?
+
+    Baseline-fix (session 4355b045, 2026-09-08): the interrupted-recovery branch
+    in agent.py needs to credit a genuine post-barge-in answer to a question
+    whose objective ``phone_answer_covers_objective`` structurally cannot match
+    (the intro / name question), WITHOUT crediting a bare connectivity check
+    ("Hello", "yeah", "which program") — the answer DISPOSITION is fail-open and
+    reads a bare greeting as ``answered``, so disposition alone must never gate
+    the advance. This is a thin, intentionally-named surface over the internal
+    ``_answer_has_substantive_declarative`` discriminator (which already tells a
+    real declarative answer apart from a pure greeting / counter-question),
+    exposed so agent.py does not reach into a private helper. Behaviour is
+    identical to the internal predicate.
+    """
+    return _answer_has_substantive_declarative(text if isinstance(text, str) else "")
+
+
 PHONE_ANSWER_ANSWERED = "answered"
 PHONE_ANSWER_DECLINED = "declined"
 PHONE_ANSWER_NONANSWER = "nonanswer"
@@ -8480,6 +8515,18 @@ async def _default_phone_coverage_inference(prompt: str) -> Any:
         # tested "minimal" body). The 4xx retry below still strips the field if
         # a future endpoint rejects it.
         json_body["reasoning_effort"] = "none"
+        # Baseline-fix (session 4355b045, 2026-09-08): DeepSeek V4-Flash 400s on
+        # `response_format` — the previous body carried `{"type":"json_object"}`
+        # unconditionally, so EVERY judge turn failed with a 400 and the retry
+        # below (which only stripped reasoning_effort) 400'd again → judge_error
+        # on every turn. The working interviewer LLM path
+        # (`_default_phone_interviewer_text`) and the résumé parser
+        # (app/api/src/lib/deepseek.ts) both OMIT response_format on DeepSeek and
+        # succeed. The system prompt already instructs "Return JSON only" and
+        # `parse_phone_coverage_verdict` tolerates a bare JSON string, so
+        # json-mode is not required here. Google/Gemini keeps response_format
+        # (its body is left byte-for-byte unchanged).
+        json_body.pop("response_format", None)
     json_body["model"] = model
     json_body["messages"] = messages
     headers = {
@@ -8496,20 +8543,33 @@ async def _default_phone_coverage_inference(prompt: str) -> Any:
             headers=headers,
             json_body=json_body,
             endpoint_hint="unknown",
-            log_failures=False,
+            # Baseline-fix (session 4355b045): surface TRANSIENT provider failure
+            # detail (5xx/429/timeout → ProviderError honors this flag). NOTE: a
+            # 4xx is a BusinessError, which call_with_breaker re-raises WITHOUT
+            # logging regardless of this flag — so the actual 400 body is not
+            # surfaced here; the caller's `unsupported_param_retry` log + the
+            # response_format/reasoning_effort strip are what handle the param-400.
+            # The judge runs off the speech path, so the added logging is free.
+            log_failures=True,
         )
     except BusinessError:
-        # A 4xx (typically a 400 "unknown/unsupported param") is most often the
-        # judge endpoint rejecting reasoning_effort. Retry ONCE with the field
-        # stripped so a Google judge (rollback default) that dislikes the value
-        # still returns a verdict rather than failing the whole turn. If the
-        # field was never in the body, this simply re-raises on the second 4xx.
-        if "reasoning_effort" not in json_body:
+        # A 4xx (typically a 400 "unsupported param") is most often the judge
+        # endpoint rejecting an optional knob — historically reasoning_effort,
+        # and (baseline-fix, session 4355b045) response_format, which DeepSeek
+        # V4-Flash 400s on. Retry ONCE with BOTH optional params stripped so a
+        # stale operator config can never reintroduce a permanent wedge and a
+        # Google judge that dislikes a value still returns a verdict rather than
+        # failing the whole turn. If neither field was in the body, this simply
+        # re-raises on the second 4xx.
+        if "reasoning_effort" not in json_body and "response_format" not in json_body:
             raise
-        retry_body = {k: v for k, v in json_body.items() if k != "reasoning_effort"}
+        retry_body = {
+            k: v for k, v in json_body.items()
+            if k not in ("reasoning_effort", "response_format")
+        }
         _log.info(
             "unknown_event", error_type="phone_coverage_judge",
-            error_category="reasoning_effort_unsupported_retry",
+            error_category="unsupported_param_retry",
         )
         response = await call_with_breaker(
             "POST",
@@ -8519,7 +8579,7 @@ async def _default_phone_coverage_inference(prompt: str) -> Any:
             headers=headers,
             json_body=retry_body,
             endpoint_hint="unknown",
-            log_failures=False,
+            log_failures=True,
         )
     data = getattr(response, "json", lambda: {})()
     try:

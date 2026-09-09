@@ -4138,6 +4138,16 @@ async def _run_native_phone_screening(
                 )
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
+        # Baseline-fix 2a (session 4355b045, 2026-09-08): True when THIS turn
+        # already exhausted the interrupted-recovery re-ask budget and is falling
+        # through to commit. Consumed by the delivery-verified commit gate below
+        # so a mandatory question that already spent its interrupted-recovery
+        # re-ask is NOT ALSO held by `mandatory_ask_drift_reask` (which, on a
+        # question whose ask can never be placed on-objective — e.g. the intro —
+        # would otherwise re-hold forever and never advance the cursor, so
+        # compensation and every later plan item stayed structurally
+        # unreachable). Per-turn; default False.
+        interrupted_cap_forced_advance = False
         if not assistant_delivery_complete.is_set():
             # FIX 2: the previous bot turn was interrupted (barge-in) or is not
             # yet proven delivered, and the candidate has now spoken again —
@@ -4170,14 +4180,30 @@ async def _run_native_phone_screening(
                 interrupted_dims = phone.phone_turn_dimensions(
                     question.text, interrupted_kind, text,
                 )
-                # HIGH-CONFIDENCE only: `answer_evidence` is
-                # `phone_answer_covers_objective`, which requires the owed
-                # objective to actually be covered. A bare connectivity check
-                # ("Hello", "which program") reads SUBSTANTIVE by default (the
-                # disposition is fail-open) but does NOT cover the objective — so
-                # the disposition is deliberately NOT used here; only real
-                # coverage lets the turn skip the interrupted re-ask and advance.
-                answer_present = bool(interrupted_dims["answer_evidence"])
+                # CREDIT an answer on this turn when EITHER:
+                #  (1) `answer_evidence` (`phone_answer_covers_objective`) proves
+                #      the owed objective is covered — the historical high-
+                #      confidence path; OR
+                #  (2) Baseline-fix 3b (session 4355b045, 2026-09-08): the turn
+                #      is a genuine SUBSTANTIVE DECLARATIVE answer that is NOT a
+                #      counter-question. This closes the live wedge where the
+                #      barged-on question was the INTRO/name question, whose
+                #      objective `answer_covers_objective` STRUCTURALLY cannot
+                #      match — so a real self-introduction was never credited and
+                #      the branch re-asked forever. The answer DISPOSITION is
+                #      fail-open (a bare "Hello"/"yeah"/"which program" reads as
+                #      `answered`), so disposition ALONE must never gate the
+                #      advance; `phone_turn_is_substantive_declarative` is the
+                #      discriminator that tells a real declarative answer apart
+                #      from a bare greeting or a pure counter-question, and
+                #      `candidate_question` excludes "which program?"-style checks.
+                #      Bare connectivity checks stay UNCREDITED → they get their
+                #      one bounded interrupted re-ask, exactly as before.
+                answer_present = bool(interrupted_dims["answer_evidence"]) or (
+                    interrupted_dims["disposition"] == phone.PHONE_ANSWER_ANSWERED
+                    and not interrupted_dims["candidate_question"]
+                    and phone.phone_turn_is_substantive_declarative(text)
+                )
                 interrupted_seen = interrupted_reask_counts.get(question.key, 0)
                 if answer_present or interrupted_seen >= INTERRUPTED_REASK_CAP:
                     # (b) real answer on this turn, or (c) the one interrupted
@@ -4186,6 +4212,14 @@ async def _run_native_phone_screening(
                     # here; the ordinary path authorizes the next objective (or the
                     # answer gate holds/records under its OWN bounded policy).
                     prior_turn_interrupted["value"] = False
+                    # Baseline-fix 2a: only the CAP-REACHED fall-through (not the
+                    # answer-present one) forces the advance past the delivery
+                    # gate. When the turn was credited as a real answer the
+                    # ordinary gates should still apply normally; it is ONLY the
+                    # budget-exhausted case that must not be re-held by the
+                    # delivery gate's mandatory-drift branch.
+                    if not answer_present:
+                        interrupted_cap_forced_advance = True
                     _log.info(
                         "unknown_event", error_type="phone_interrupted_recovery",
                         error_category=(
@@ -4214,12 +4248,32 @@ async def _run_native_phone_screening(
                         error_category="interrupted_reask",
                         turn_index=interrupted_reask_counts[question.key],
                     )
+                    # Baseline-fix 3a note (session 4355b045, 2026-09-08): the
+                    # first-audio watchdog does NOT need an explicit arm here.
+                    # This is a NORMAL return (not a raised StopResponse), so the
+                    # SDK hook `on_user_turn_completed` (phone.py) invokes
+                    # `_on_reply_expected()` immediately after this coroutine
+                    # returns — the SAME single arming site every normal-return
+                    # turn (including the ordinary substantive path) relies on. A
+                    # second `await on_reply_expected()` here would DOUBLE-ARM
+                    # (the second call cancels the first watchdog and bumps the
+                    # generation twice) with no benefit. Verified empirically: the
+                    # interrupted re-ask return already fires the deterministic
+                    # `no_speech_created` fallback via 9805 — there is no dead air
+                    # from a missing arm. (The original spec assumed this branch
+                    # skipped arming; the 9805 arming has covered it since
+                    # 2026-08-31.) The live ~9-min loop was NOT dead-air-from-
+                    # no-arm; it was (ii) real answers never credited + (iii) the
+                    # mandatory question never advancing — fixed by 3b + 2a/2b.
                     return
             else:
                 # No planned question at this cursor (e.g. post-plan Q&A / wind-
                 # down) — still acknowledge presence so a bare "hello" after an
                 # interrupt is never met with silence. No owed key to cap or
                 # commit against, so the historical ack behaviour is unchanged.
+                # (3a note: same as the re-ask return above — the SDK arms the
+                # first-audio watchdog via `_on_reply_expected()` after this
+                # normal return, so no explicit arm is added here.)
                 prior_turn_interrupted["value"] = False
                 add_turn_instruction(turn_ctx, "The previous question was interrupted. Ask that same topic again in your own natural words and wait; do not advance.")
                 set_reply_snapshot(
@@ -4381,9 +4435,33 @@ async def _run_native_phone_screening(
                 # the candidate just answered. Same narrow high-confidence
                 # predicate the contiguous volunteered-objective skip uses.
                 and not phone.phone_answer_covers_objective(question.text, text)
+                # Baseline-fix 2a (session 4355b045, 2026-09-08): a MANDATORY
+                # question (compensation / notice-period — the only classes this
+                # delivery-drift branch fires on) that already exhausted its
+                # interrupted-recovery budget THIS turn must NOT also be re-held
+                # here, or a mandatory item whose ask keeps drifting off-objective
+                # (e.g. while the coverage judge is dead) never advances and every
+                # later plan item stays unreachable. The interrupted branch already
+                # spent its bounded re-ask; let the turn fall through and advance.
+                # NOTE: this guard does NOT fix the intro/name loop — the intro is
+                # not mandatory-class, so this branch never fires on it. The intro
+                # loop is broken by Fix 3b (crediting the substantive intro answer
+                # that `phone_answer_covers_objective` structurally cannot match).
+                and not interrupted_cap_forced_advance
             ):
                 drift_seen = ask_drift_reask_counts.get(question.key, 0)
-                gate_holds = drift_seen + answer_reask_counts.get(question.key, 0)
+                # Baseline-fix 2b (session 4355b045): fold the interrupted-recovery
+                # re-asks into the combined hold accounting so total HOLDS per key
+                # across ALL THREE machineries (interrupted recovery + delivery-gate
+                # drift + answer-gate non-answer) can never exceed the shared cap.
+                # A mandatory question must bound-and-advance even if the coverage
+                # judge is permanently dead — no single key can wedge the call for
+                # more than `combined_reask_cap` held turns total.
+                gate_holds = (
+                    drift_seen
+                    + answer_reask_counts.get(question.key, 0)
+                    + interrupted_reask_counts.get(question.key, 0)
+                )
                 if drift_seen < 2 and gate_holds < combined_reask_cap:
                     ask_drift_reask_counts[question.key] = drift_seen + 1
                     setattr(agent, "_turn_policy", "answer_reask")
@@ -4461,9 +4539,16 @@ async def _run_native_phone_screening(
                 # gate's drift re-asks — combined holds for one key ≤ the
                 # shared cap. A no-op (drift count 0) on every key the
                 # delivery gate never touched.
+                # Baseline-fix 2b (session 4355b045): ALSO fold the interrupted-
+                # recovery re-asks into the combined accounting so the three
+                # machineries compose — a mandatory question bounds-and-advances
+                # even when the coverage judge is permanently dead, and no single
+                # key can be held more than `combined_reask_cap` times total.
                 if (
                     seen < phone.phone_answer_gate_max_reasks()
-                    and seen + ask_drift_reask_counts.get(question.key, 0)
+                    and seen
+                    + ask_drift_reask_counts.get(question.key, 0)
+                    + interrupted_reask_counts.get(question.key, 0)
                     < combined_reask_cap
                 ):
                     # Under the cap: HOLD the cursor and re-ask the SAME owed
@@ -5395,9 +5480,17 @@ async def _run_native_phone_screening(
                 # the combined budget the hook fell through DELIBERATELY, so
                 # this fence must let the commit proceed exactly as it does at
                 # the answer gate's own cap.
+                # Baseline-fix repair (2026-09-09): fold interrupted_reask_counts
+                # into the SAME composed ceiling the two live gates use (4460,
+                # 4548). Without it, a mandatory key barged past its interrupted
+                # cap (interrupted_cap_forced_advance) whose turn is a genuine
+                # nonanswer re-held HERE — defeating 2a/2b's terminal-advance for
+                # that turn class. The three machineries now share one budget on
+                # the commit side too.
                 and (
                     answer_reask_counts.get(commit_question.key, 0)
                     + ask_drift_reask_counts.get(commit_question.key, 0)
+                    + interrupted_reask_counts.get(commit_question.key, 0)
                     < combined_reask_cap
                 )
             ):
@@ -7454,6 +7547,52 @@ async def _run_phone_session(
             "continue?\") so a simple yes or no answers it."
         )
         try:
+            # ── Baseline-fix 4a (session 4355b045, 2026-09-08): OVERLAP THE SIP
+            # OUTBOUND-AUDIO SUBSCRIPTION WAIT WITH THE OPENING. ────────────────
+            # The ~17-20s first-audio cold-start is NOT the LLM (the opening
+            # generation finishes ~2.25s with a prefix-cache hit). It is a
+            # LiveKit SIP outbound-audio-track SUBSCRIPTION stall: the agent's
+            # audio output track is published after the participant arrives, and
+            # the FIRST `capture_frame` blocks on `_subscribed_fut` (an UNTIMED
+            # `await self._publication.wait_for_subscription()` inside RoomIO's
+            # `_ParticipantAudioOutput.capture_frame`) until the SIP peer
+            # subscribes. RoomIO exposes that readiness as
+            # `session._room_io.subscribed_fut` (verified against livekit-agents
+            # 1.6.4 `voice/room_io/room_io.py` + `_output.py`). Awaiting it HERE,
+            # before the generation, lets the subscribe handshake run CONCURRENTLY
+            # with the pre-opening work and BOUNDS it, instead of paying the whole
+            # untimed stall on the first spoken frame. Strictly fail-open: on
+            # timeout, a missing `_room_io`, a `None` future, or any error, the
+            # opening proceeds EXACTLY as before — so a fast-subscribing peer pays
+            # no added latency (the future is already done → returns instantly)
+            # and a peer that never subscribes can never wedge the opening. The
+            # test/stub `_InertSession` has no `_room_io`, so this is a no-op
+            # there. Never an unbounded wait.
+            try:
+                room_io = getattr(session, "_room_io", None)
+                subscribed_fut = getattr(room_io, "subscribed_fut", None)
+                if subscribed_fut is not None:
+                    await asyncio.wait_for(
+                        asyncio.shield(subscribed_fut),
+                        timeout=phone.phone_output_subscribe_timeout_sec(),
+                    )
+            except Exception:  # noqa: BLE001
+                # Fail-open: TimeoutError/AttributeError and any other error all
+                # proceed unchanged; the subscription may still complete during
+                # generation (the first frame's own await backstops it).
+                # CancelledError is BaseException (not Exception) so task
+                # cancellation still propagates.
+                pass
+            # NOTE (baseline-fix repair, 2026-09-09): a defense-in-depth
+            # first-audio watchdog arm for the opening was REMOVED here as dead
+            # code — `_on_reply_expected` is wired only by the native screening
+            # loop, which runs AFTER this consent-gate opening, so at gate time it
+            # is always `None` and the arm could never fire (a guard that cannot
+            # fire). A stalled or verification-failed opening is already observable
+            # and recovered without it: `run_phone_gate` wraps this call, logs
+            # `opening_unverified`, and speaks the fixed `PHONE_DISCLOSURE_TEXT`
+            # fallback when `speak_opening` returns None; and 4a above bounds the
+            # one previously-unbounded wait (the SIP output-track subscription).
             # The FIRST generation of a call runs against an EMPTY chat
             # context, and Gemini refuses a request with no contents
             # (400 INVALID_ARGUMENT, observed live 2026-08-29 — the opening
