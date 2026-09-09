@@ -1088,7 +1088,11 @@ describe('OpenAPI document integrity', () => {
     // /roles/{roleId}/scorecard/redistribute (POST preview). All response
     // envelopes are documented INLINE, so the schema-count guard below is
     // unchanged; only the path-count guard moves. 120 + 5 = 125.
-    expect(Object.keys(paths).length).toBe(125);
+    // Funnel observability (0090 / PR2) adds FOUR admin paths — funnel
+    // summary/failures/candidates reads plus the on-demand rollup refresh —
+    // all with INLINE (opaque object) response bodies, so the schema-count
+    // guard below is again unchanged. 125 + 4 = 129.
+    expect(Object.keys(paths).length).toBe(129);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas

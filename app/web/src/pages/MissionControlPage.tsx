@@ -30,6 +30,7 @@ import {
   AccessSection,
   AuditSection,
   MaintenanceSection,
+  FunnelSection,
   MissionControlSections,
   OverviewSection,
   QuotasSection,
@@ -38,7 +39,7 @@ import {
 } from '../components/mission-control';
 import { CalendarIcon } from '../components/navigation';
 
-const SECTION_IDS = ['overview', 'access', 'sessions', 'quotas', 'scorebar', 'audit', 'maintenance'] as const;
+const SECTION_IDS = ['overview', 'access', 'sessions', 'quotas', 'scorebar', 'funnel', 'audit', 'maintenance'] as const;
 type SectionId = (typeof SECTION_IDS)[number];
 
 function sectionFromHash(hash: string): SectionId {
@@ -140,6 +141,7 @@ export function MissionControlPage() {
           { id: 'sessions', label: 'Sessions', render: () => <SessionsSection /> },
           { id: 'quotas', label: 'Quotas', render: () => <QuotasSection /> },
           { id: 'scorebar', label: 'Scorebar', render: () => <ScorebarSection /> },
+          { id: 'funnel', label: 'Funnel', render: () => <FunnelSection /> },
           { id: 'audit', label: 'Audit', render: () => <AuditSection /> },
           { id: 'maintenance', label: 'Maintenance', render: () => <MaintenanceSection /> },
         ]}
