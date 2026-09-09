@@ -672,6 +672,18 @@ export function createAshbyRuntime(options: CreateAshbyRuntimeOptions): AshbyRun
       // unavailable (deferrable). Unwired, the orchestrator treats every parse
       // failure as a verdict — the pre-repair behaviour, byte for byte.
       classifyParse: PARSE_CLASSIFIER,
+      // The completeness observation was defined by the orchestrator but never
+      // wired here, so "the document parsed and every role was lost" happened
+      // in silence for every Ashby ingestion. One CATEGORY-only line — no
+      // content, no length, no identifier — so the degrade is countable.
+      onCompleteness: (signal) => {
+        try {
+          resumeModelFallbackLogger.warn('unknown_event', {
+            error_category: signal.category,
+            error_type: signal.structurerVersion.replace(/[^a-zA-Z0-9_:.-]/g, '_').slice(0, 64),
+          });
+        } catch { /* observability must never fail an ingestion */ }
+      },
       onState: input.onState,
       extractorVersion: ASHBY_EXTRACTOR_VERSION,
     };

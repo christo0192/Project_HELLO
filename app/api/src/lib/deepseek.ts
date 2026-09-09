@@ -60,6 +60,16 @@ export interface DeepseekOptions {
    * env.deepseekReasoningEffort when unset.
    */
   reasoningEffort?: string;
+  /**
+   * Provider-enforced JSON output. When `'json_object'`, the request carries
+   * `response_format: { type: 'json_object' }` (DeepSeek "JSON Output" mode) so
+   * the model is constrained to emit one valid JSON object instead of prose
+   * wrapped around JSON. OPT-IN per call, never a default: the provider
+   * requires the word "json" to appear in the prompt, and a caller whose
+   * prompt lacks it would turn a good request into a 4xx. Only callers that
+   * already `JSON.parse` the answer and whose prompt asks for JSON set this.
+   */
+  responseFormat?: 'json_object';
 }
 
 /**
@@ -147,6 +157,9 @@ function validateRuntimeOverrides(opts: DeepseekOptions): void {
     if (opts.reasoningEffort.length > 64) {
       throw new TypeError('reasoningEffort must not exceed 64 characters');
     }
+  }
+  if (opts.responseFormat !== undefined && opts.responseFormat !== 'json_object') {
+    throw new TypeError("responseFormat must be 'json_object' when given");
   }
 }
 
@@ -261,9 +274,15 @@ export function createDeepseekRunner(deps?: Partial<DeepseekRunnerDeps>): Deepse
       messages: typeof messages;
       temperature: number;
       reasoning_effort?: string;
+      response_format?: { type: 'json_object' };
     } = { model, messages, temperature: 0.2 };
     if (typeof reasoningEffort === 'string' && reasoningEffort.length > 0) {
       requestBody.reasoning_effort = reasoningEffort;
+    }
+    // Appended AFTER the messages, so the cached prompt prefix is untouched:
+    // the automatic prefix cache keys on message tokens, not on this field.
+    if (opts.responseFormat === 'json_object') {
+      requestBody.response_format = { type: 'json_object' };
     }
 
     return breaker.call(async () => {

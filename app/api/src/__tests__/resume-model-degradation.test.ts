@@ -34,6 +34,7 @@ import {
   structureResumeWithModelDetailed,
   __setModelRetryBackoffForTest,
   __setModelConcurrencyForTest,
+  MODEL_MAX_ATTEMPTS,
   type ResumeModelRunner,
 } from '../lib/resume-structurer.js';
 import { DeepseekError } from '../lib/deepseek.js';
@@ -84,14 +85,42 @@ describe('structureResumeWithModelDetailed — bounded transient retry', () => {
     expect(out.structured).not.toBeNull();
   });
 
-  it('retries at most once: a second transient failure surrenders with ITS category', async () => {
+  it('retries at most three times (four attempts): an exhausted ladder surrenders with the LAST category', async () => {
     fastRetry();
     const runner = vi.fn<ResumeModelRunner>()
       .mockRejectedValueOnce(new DeepseekError('timeout'))
+      .mockRejectedValueOnce(new DeepseekError('protocol', 503))
+      .mockRejectedValueOnce(new DeepseekError('connection'))
       .mockRejectedValueOnce(new DeepseekError('protocol', 502));
     const out = await structureResumeWithModelDetailed('résumé text', runner);
-    expect(runner).toHaveBeenCalledTimes(2);
+    expect(runner).toHaveBeenCalledTimes(MODEL_MAX_ATTEMPTS);
+    expect(MODEL_MAX_ATTEMPTS).toBe(4);
     expect(out).toEqual({ structured: null, failure: 'protocol:502' });
+  });
+
+  it('a transient failure followed by a NON-transient one stops the ladder at the non-transient category', async () => {
+    fastRetry();
+    const runner = vi.fn<ResumeModelRunner>()
+      .mockRejectedValueOnce(new DeepseekError('timeout'))
+      .mockRejectedValueOnce(new DeepseekError('protocol', 400));
+    const out = await structureResumeWithModelDetailed('résumé text', runner);
+    expect(runner).toHaveBeenCalledTimes(2);
+    expect(out).toEqual({ structured: null, failure: 'protocol:400' });
+  });
+
+  it.each([
+    ['circuit_open (the shared breaker, tripped by any DeepSeek caller)', new ProviderError('circuit_open')],
+    ['connection', new DeepseekError('connection')],
+  ])('retries %s and succeeds once the provider answers', async (_label, err) => {
+    fastRetry();
+    const runner = vi.fn<ResumeModelRunner>()
+      .mockRejectedValueOnce(err)
+      .mockRejectedValueOnce(err)
+      .mockResolvedValueOnce(GOOD_SHAPE);
+    const out = await structureResumeWithModelDetailed('résumé text', runner);
+    expect(runner).toHaveBeenCalledTimes(3);
+    expect(out.failure).toBeNull();
+    expect(out.structured?.name).toBe('Rohan Mehta');
   });
 
   it('does NOT retry a non-transient protocol failure (4xx that is not 429)', async () => {
@@ -115,9 +144,7 @@ describe('structureResumeWithModelDetailed — bounded transient retry', () => {
   });
 
   it.each([
-    ['circuit_open', new ProviderError('circuit_open'), 'circuit_open'],
     ['missing_api_key', new DeepseekError('missing_api_key'), 'missing_api_key'],
-    ['connection', new DeepseekError('connection'), 'connection'],
     ['output_limit', new DeepseekError('output_limit'), 'output_limit'],
     ['statusless protocol', new DeepseekError('protocol'), 'protocol'],
     ['unclassifiable error', new Error('SENTINEL: never surfaces'), 'unknown'],
