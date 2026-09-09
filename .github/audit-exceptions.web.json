@@ -1,0 +1,6 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Dependency Audit Exceptions (app/web)",
+  "description": "Web-app-scoped audit exceptions. Kept separate from the API's exceptions so an API-only exception (e.g. a transitive dep not present in the web tree) is not flagged stale when auditing app/web. Empty = no accepted web vulns.",
+  "exceptions": []
+}

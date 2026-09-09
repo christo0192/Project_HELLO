@@ -202,7 +202,15 @@ primary_region = "sin"
   PHONE_AGENT_NAME = "phone-screener"
   PHONE_EVENT_TIMEOUT_SEC = "10"
   PHONE_PARTICIPANT_WAIT_SEC = "45"
-  PHONE_CLASSIFY_TIMEOUT_SEC = "20"
+  # RCA 2026-09-09: this is now the BACKSTOP wall clock for the WHOLE consent
+  # classification (raised 20->40). Each individual answer — the first, and the
+  # answer after the single re-ask — is bounded by PHONE_CLASSIFY_ANSWER_TIMEOUT_SEC
+  # below, so a candidate who answered a beat late (or answered the wrong question
+  # and needed the re-ask) is no longer torn down to MACHINE mid-re-ask. Keep this
+  # >= 2 x the per-answer bound.
+  PHONE_CLASSIFY_TIMEOUT_SEC = "40"
+  # Per-answer window for ONE consent reply (each classify attempt gets its own).
+  PHONE_CLASSIFY_ANSWER_TIMEOUT_SEC = "15"
   PHONE_ANSWER_TIMEOUT_SEC = "90"
 
 # X1/VM PIN (2026-08-29 CPU-starvation incident): on `shared` CPU the worker's
