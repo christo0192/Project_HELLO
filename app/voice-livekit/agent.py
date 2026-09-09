@@ -7768,6 +7768,114 @@ async def _run_phone_session(
                 error_category="begin_failed",
             )
 
+    # ── 2026-09-09 latency fixes: consent endpointing + role-line pre-render ───
+    def _set_consent_endpointing_max(max_delay: float) -> None:
+        """Live max-endpointing override for the consent turn (Fix 1).
+
+        Meaningful only in local turn-detection mode, where max_endpointing_delay
+        bounds the wait on an utterance the EOU scores incomplete (a bare "yes").
+        Uses the supported AgentSession.update_options seam (livekit-agents 1.6.4;
+        endpointing_opts["max_delay"] is the exact field the constructor sets via
+        _migrate_turn_handling and the running turn detector reads). Errors
+        PROPAGATE by design: run_phone_gate wraps every call in try/except (its
+        single fail-open point) and logs the applied/restored value, so a no-op or
+        a failed restore is visible in the logs rather than silently swallowed. A
+        stub/older session without update_options is a quiet no-op.
+        """
+        upd = getattr(session, "update_options", None)
+        if not callable(upd):
+            return
+        upd(endpointing_opts={"max_delay": float(max_delay)})
+
+    # Fix 2: pre-render the FIXED role line during the consent wait. Enabled only
+    # in deterministic-opener mode with a known role (the fixed line is then what
+    # `_deliver_role_opening` speaks) and when the flag is on; otherwise the gate
+    # keeps its byte-identical on-demand `_say` path (helpers passed as None).
+    _role_prerender_text = (
+        phone.phone_role_opening_text(instruction_state.role_title)
+        if phone.phone_deterministic_opener()
+        and phone.phone_role_opening_prerender_enabled()
+        else None
+    )
+    _role_prerender_frames: list[Any] = []
+    _role_prerender_task: list[Any] = [None]
+
+    async def _render_role_frames(text: str) -> None:
+        tts_obj = getattr(session, "tts", None)
+        synth = getattr(tts_obj, "synthesize", None)
+        if not callable(synth):
+            return
+        stream = None
+        try:
+            stream = synth(text)
+            async for ev in stream:
+                frame = getattr(ev, "frame", None)
+                if frame is not None:
+                    _role_prerender_frames.append(frame)
+        except Exception:  # noqa: BLE001
+            # A synthesis failure must never surface — the say path re-synthesizes.
+            _role_prerender_frames.clear()
+        finally:
+            # Close the synthesis stream so a partial/failed render never leaks a
+            # provider connection (the say path opens its own stream on fallback).
+            aclose = getattr(stream, "aclose", None)
+            if callable(aclose):
+                try:
+                    await aclose()
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _start_role_prerender() -> None:
+        if _role_prerender_text is None or _role_prerender_task[0] is not None:
+            return
+        try:
+            _role_prerender_task[0] = asyncio.ensure_future(
+                _render_role_frames(_role_prerender_text)
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def _say_role_opening(text: str) -> None:
+        task = _role_prerender_task[0]
+        ready = (
+            _role_prerender_text is not None
+            and text == _role_prerender_text
+            and task is not None
+            and task.done()
+            and not task.cancelled()
+            and task.exception() is None
+            and len(_role_prerender_frames) > 0
+        )
+        if ready:
+            frames = list(_role_prerender_frames)
+
+            async def _aiter():
+                for f in frames:
+                    yield f
+
+            # Split "start the pre-rendered say" from "await its playout": if
+            # say() itself raises, NOTHING was queued, so falling back to on-demand
+            # synthesis is safe. But once say() has accepted the frames, a later
+            # playout error must NOT re-speak — that would double the role line
+            # (partial pre-rendered audio + a full re-synthesis). Review repair.
+            speech = None
+            try:
+                speech = session.say(
+                    text, audio=_aiter(), allow_interruptions=False,
+                )
+            except Exception:  # noqa: BLE001
+                speech = None  # nothing played → safe to synthesize on demand
+            if speech is not None:
+                wait_for_playout = getattr(speech, "wait_for_playout", None)
+                if callable(wait_for_playout):
+                    try:
+                        await wait_for_playout()
+                    except Exception:  # noqa: BLE001
+                        # Audio already committed to the output; do not re-speak.
+                        pass
+                return
+        await say(text)
+
     result = await phone.run_phone_gate(
         attempt_id=attempt_id,
         client=events,
@@ -7775,6 +7883,22 @@ async def _run_phone_session(
         classify=classify,
         say=say,
         start_recording=_phone_recording_permitted_and_begin,
+        set_endpointing_max=(
+            # Fixed-local endpointing only: max_endpointing_delay governs the tail
+            # there. Excluded in dynamic mode (opt-in, off by default) whose
+            # turn_handling envelope is a different, untested shape, and in stt
+            # mode where the STT provider owns end-of-utterance.
+            _set_consent_endpointing_max
+            if phone.phone_turn_detection() == phone.PHONE_TURN_DETECTION_LOCAL
+            and not phone.phone_dynamic_endpointing_enabled()
+            else None
+        ),
+        start_role_prerender=(
+            _start_role_prerender if _role_prerender_text is not None else None
+        ),
+        say_role_opening=(
+            _say_role_opening if _role_prerender_text is not None else None
+        ),
         epoch=epoch,
         # F2 (2026-08-29 consent replay): consulted once before the disclosure
         # so a mid-call re-dispatch resumes instead of re-asking for consent.
@@ -7809,6 +7933,16 @@ async def _run_phone_session(
         # /assessment/start) and the egress silently never starts.
         session_id=phone.session_id_from_room_name(room_name),
     )
+
+    # Review repair: cancel a still-running role pre-render once the gate has
+    # returned. On a machine/refused/opt-out call (or a HUMAN call where the
+    # buffer wasn't ready in time and the line was synthesized on demand) the
+    # task would otherwise finish a full, discarded TTS synthesis and could
+    # linger as a pending task at teardown. Cancelling (no await) stops the
+    # wasted work; asyncio does not warn about an unretrieved CancelledError.
+    _pt = _role_prerender_task[0]
+    if _pt is not None and not _pt.done():
+        _pt.cancel()
 
     async def _finish_recording() -> None:
         """PR A SEAM 3: the SINGLE common teardown for the recording.

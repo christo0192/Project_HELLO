@@ -543,10 +543,13 @@ def phone_q1_rephrase_instruction(question_text: Any) -> str | None:
     if not text:
         return None
     return (
-        "Warmly ask the candidate this first screening question in your own "
-        "natural spoken words — keep the SAME meaning, ask exactly ONE question, "
-        "two to three short sentences, and open by welcoming them briefly. Do "
-        f"not add a second topic. The question to convey is: {text}"
+        "The candidate has ALREADY been greeted and told what this call is "
+        "about, so do NOT greet them again or say hi/hello — a second greeting "
+        "sounds like the call is restarting and breaks the flow. Go straight "
+        "into asking the candidate this first screening question in your own "
+        "warm, natural spoken words — keep the SAME meaning, ask exactly ONE "
+        "question, two to three short sentences. Do not add a second topic. "
+        f"The question to convey is: {text}"
     )
 
 
@@ -981,6 +984,24 @@ def phone_deterministic_opener() -> bool:
     )
 
 
+def phone_role_opening_prerender_enabled() -> bool:
+    """Pre-synthesize the deterministic role line during the consent wait.
+
+    2026-09-09 latency RCA: the fixed role-framing line (``phone_role_opening_text``)
+    is known from the server ``role_title`` BEFORE consent, so its TTS can render
+    during the disclosure playout + consent wait — dead time — and play the
+    instant consent commits, instead of paying that synthesis on the post-consent
+    critical path. DEFAULT ON; an explicit off token (``false``/``0``/``no``/
+    ``off``) disables it and restores byte-identical on-demand synthesis. This is
+    a pure optimization with a fallback: a not-ready buffer or any failure speaks
+    the line on demand exactly as before. Read at the call site with the literal
+    name so the env-contract scanner sees it.
+    """
+    return (os.getenv("PHONE_ROLE_OPENING_PRERENDER") or "true").strip().lower() not in (
+        "false", "0", "no", "off",
+    )
+
+
 # The two per-turn coordination shapes the phone lane can run.
 PHONE_TURN_MODE_TOOLFIRST = "toolfirst"
 PHONE_TURN_MODE_TOOLLESS = "toolless"
@@ -1189,6 +1210,36 @@ def phone_static_endpointing_max_delay() -> float:
     except ValueError:
         return PHONE_LOCAL_ENDPOINTING_MAX_DELAY_SEC
     return min(3.0, max(0.5, value))
+
+
+#: Short max-endpointing for the CONSENT turn only (2026-09-09 latency RCA). A
+#: bare affirmation ("yes") is never a mid-thought pause, yet the local v1-mini
+#: EOU scores a short reply INCOMPLETE and waits out the full mid-answer max tail
+#: (2.5s deployed) before the turn commits — the live call measured 0.94s STT +
+#: 1.56s dead-air = the exact 2.5s ceiling, all before the role line could speak.
+#: This ceiling is applied for the consent turn ALONE and restored to
+#: `phone_static_endpointing_max_delay` before the screening Q&A, where the long
+#: tail is wanted so real answers with mid-thought pauses still breathe.
+PHONE_CONSENT_ENDPOINTING_MAX_DELAY_SEC_DEFAULT = 0.5
+
+
+def phone_consent_endpointing_max_delay() -> float:
+    """Consent-turn max-endpointing, defaulting to 0.5s. Bounded to [0.3, 3.0].
+
+    Set ``PHONE_CONSENT_ENDPOINTING_MAX_DELAY_SEC`` equal to the global
+    ``PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC`` to disable the shortening — a full
+    rollback with no code change (the caller only tightens when this is strictly
+    below the global max). Read at the call site with the literal name so the
+    env-contract scanner sees it.
+    """
+    raw = os.getenv("PHONE_CONSENT_ENDPOINTING_MAX_DELAY_SEC")
+    if raw in (None, ""):
+        return PHONE_CONSENT_ENDPOINTING_MAX_DELAY_SEC_DEFAULT
+    try:
+        value = float(raw)
+    except ValueError:
+        return PHONE_CONSENT_ENDPOINTING_MAX_DELAY_SEC_DEFAULT
+    return min(3.0, max(0.3, value))
 
 
 def phone_local_endpointing_delays() -> tuple[float, float]:
@@ -4361,6 +4412,19 @@ async def run_phone_gate(
     fetch_durable_consent: Optional[
         Callable[[], Awaitable[Optional["PhoneAssessmentState"]]]
     ] = None,
+    # 2026-09-09 latency fixes (all optional; absent ⇒ byte-identical behaviour):
+    # Set the live turn-detection max-endpointing delay (seconds). The gate calls
+    # this to tighten the ceiling for the CONSENT turn only and restore it right
+    # after, so a bare "yes" commits at the STT floor instead of the full
+    # mid-answer tail. Injected (not `session`-bound) so the gate stays testable.
+    set_endpointing_max: Optional[Callable[[float], Any]] = None,
+    # Begin pre-rendering the deterministic role line's TTS (fires once, before
+    # the disclosure, so it renders during the consent wait). No-op unless wired.
+    start_role_prerender: Optional[Callable[[], Any]] = None,
+    # Speak the deterministic role line, preferring pre-rendered audio when ready
+    # and falling back to on-demand synthesis. Used ONLY for the fixed fallback
+    # line; absent ⇒ the line is spoken through `say` exactly as before.
+    say_role_opening: Optional[Callable[[str], Awaitable[Any]]] = None,
 ) -> PhoneGateResult:
     """Run the phone screening's opening, in the ONLY order that is safe.
 
@@ -4509,6 +4573,19 @@ async def run_phone_gate(
                 events=events, spoken=spoken, assessment_state=durable,
             )
 
+    # ── Fix 2 (2026-09-09): pre-render the deterministic role line NOW ─────────
+    # Kicked off before a word of the disclosure is spoken, so the fixed role
+    # line's TTS renders during the disclosure playout + consent wait (dead time)
+    # and can play the instant consent commits — off the post-consent critical
+    # path. Fires once, never blocks, and is a no-op unless the caller wired it
+    # (deterministic-opener mode with a known role). Placed AFTER the durable-
+    # consent short-circuit so a re-entry that skips the disclosure never renders.
+    if start_role_prerender is not None:
+        try:
+            start_role_prerender()
+        except Exception:  # noqa: BLE001
+            pass
+
     # ── The opening: model-generated-and-verified, or the fixed disclosure ─
     if speak_opening is not None:
         try:
@@ -4548,6 +4625,33 @@ async def run_phone_gate(
         classify_timeout_sec if classify_timeout_sec is not None
         else phone_classify_timeout_sec()
     )
+    # ── Consent-turn short max-endpointing (2026-09-09 latency RCA) ────────────
+    # The consent reply is a bare affirmation ("yes"), which the local v1-mini
+    # EOU scores INCOMPLETE — so it waits out the full mid-answer max tail (2.5s)
+    # before the turn commits (measured: 0.94s STT + 1.56s dead-air). Tighten the
+    # ceiling for THIS turn only and restore the configured tail immediately
+    # after, so the screening Q&A still lets mid-thought pauses breathe. Scoped
+    # to exactly the classify await via try/finally: every downstream return path
+    # sees the restored value. No-op unless a setter is wired and the consent max
+    # is strictly shorter than the global max (the rollback: set them equal).
+    consent_max = phone_consent_endpointing_max_delay()
+    normal_max = phone_static_endpointing_max_delay()
+    tightened_endpointing = False
+    if set_endpointing_max is not None and consent_max < normal_max:
+        try:
+            set_endpointing_max(consent_max)
+            tightened_endpointing = True
+        except Exception:  # noqa: BLE001
+            # Nothing changed → nothing to restore; proceed on the global tail.
+            tightened_endpointing = False
+        # Observability: emit the APPLIED ceiling so a live call can confirm the
+        # consent turn actually got the short tail (a silent no-op here would
+        # otherwise be invisible — the branch's whole purpose is latency).
+        if tightened_endpointing:
+            _log.info(
+                "unknown_event", error_type="phone_consent_endpointing",
+                schema="tightened", duration_sec=consent_max,
+            )
     try:
         decision = await asyncio.wait_for(classify(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -4562,6 +4666,22 @@ async def run_phone_gate(
     except Exception:  # noqa: BLE001
         # A broken classifier must not become consent.
         decision = CLASSIFY_MACHINE
+    finally:
+        if tightened_endpointing:
+            try:
+                set_endpointing_max(normal_max)
+                _log.info(
+                    "unknown_event", error_type="phone_consent_endpointing",
+                    schema="restored", duration_sec=normal_max,
+                )
+            except Exception:  # noqa: BLE001
+                # A FAILED restore would leave the whole Q&A on the short ceiling
+                # (premature commit of real mid-thought pauses) — surface it
+                # loudly rather than swallow, so it is caught in the logs.
+                _log.warn(
+                    "unknown_event", error_type="phone_consent_endpointing",
+                    schema="restore_failed", duration_sec=normal_max,
+                )
     if decision not in PHONE_CLASSIFICATIONS:
         decision = CLASSIFY_MACHINE
 
@@ -4655,7 +4775,16 @@ async def run_phone_gate(
                 if isinstance(generated, str) and generated.strip():
                     return True
             if role_fallback is not None:
-                await _say(role_fallback)
+                # Fix 2: prefer the pre-rendered audio (rendered during the
+                # consent wait) so the line plays with no synthesis latency; the
+                # injected helper falls back to on-demand synthesis when the
+                # buffer is not ready. Record the spoken line for the transcript
+                # exactly as `_say` would. Absent ⇒ byte-identical `_say` path.
+                if say_role_opening is not None:
+                    spoken.append(role_fallback)
+                    await say_role_opening(role_fallback)
+                else:
+                    await _say(role_fallback)
                 return True
             return False
 

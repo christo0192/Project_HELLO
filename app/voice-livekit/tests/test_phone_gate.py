@@ -5419,6 +5419,19 @@ class TestQ1Rephrase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("ONE question", instr)
         self.assertIsNone(phone.phone_q1_rephrase_instruction(""))
 
+    def test_instruction_forbids_a_second_greeting(self):
+        # 2026-09-09 latency/naturalness RCA: the opener already greets and gets
+        # consent, so Q1 must NOT re-greet ("Hi ..." on Q1 felt like a restart).
+        # The instruction must tell the model the greeting already happened and
+        # never re-open with a welcome (the old "open by welcoming them briefly"
+        # is exactly what produced the duplicate "Hi").
+        instr = phone.phone_q1_rephrase_instruction("Tell me about your current role.")
+        self.assertIsNotNone(instr)
+        lowered = instr.lower()
+        self.assertNotIn("welcoming", lowered)
+        self.assertIn("already been greeted", lowered)
+        self.assertIn("hi/hello", lowered)
+
     def test_acceptable_requires_exactly_one_speakable_question(self):
         self.assertTrue(phone.phone_rephrased_question_acceptable(
             "So, to start — could you tell me about your current role?"))
@@ -14594,6 +14607,170 @@ class TestJudgeAuthFailureHonest(unittest.IsolatedAsyncioTestCase):
         cats = [(c[0], c[2].get("error_category")) for c in spy.method_calls]
         self.assertIn(("info", "unsupported_param_retry"), cats)
         self.assertNotIn(("warn", "judge_auth_failed"), cats)
+
+
+class TestConsentLatencyFixes(unittest.IsolatedAsyncioTestCase):
+    """2026-09-09 latency/naturalness RCA: consent-turn short max-endpointing
+    (Fix 1) and the pre-rendered deterministic role line (Fix 2). Fix 3 (no
+    duplicate greeting on Q1) is covered by
+    TestQ1Rephrase.test_instruction_forbids_a_second_greeting.
+    """
+
+    async def _run_gate(self, **overrides):
+        recorder = overrides.pop("recorder", None) or Recorder()
+        client = overrides.pop("client", None) or _AtomicEventClient(
+            state=_default_state(role_title="Sales Program Advisor")
+        )
+        consent_reply_out: list[str] = []
+
+        async def wait_for_participant():
+            return _participant()
+
+        async def classify():
+            consent_reply_out.append("Yes, that's fine.")
+            return phone.CLASSIFY_HUMAN
+
+        kwargs = dict(
+            attempt_id=_ATTEMPT_ID,
+            client=client,
+            wait_for_participant=wait_for_participant,
+            classify=classify,
+            say=recorder.say,
+            start_recording=recorder.start_recording,
+            classify_timeout_sec=0.05,
+            session_id=_SESSION_ID,
+            epoch=_EPOCH,
+            post_call_answered=True,
+            consent_reply_out=consent_reply_out,
+        )
+        kwargs.update(overrides)
+        result = await phone.run_phone_gate(**kwargs)
+        return result, client, recorder
+
+    # ── Fix 1: reader ─────────────────────────────────────────────────────
+    def test_consent_endpointing_reader_default_override_and_clamp(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertAlmostEqual(phone.phone_consent_endpointing_max_delay(), 0.5)
+        with patch.dict(os.environ, {"PHONE_CONSENT_ENDPOINTING_MAX_DELAY_SEC": "0.4"}):
+            self.assertAlmostEqual(phone.phone_consent_endpointing_max_delay(), 0.4)
+        # clamp [0.3, 3.0]
+        with patch.dict(os.environ, {"PHONE_CONSENT_ENDPOINTING_MAX_DELAY_SEC": "0.05"}):
+            self.assertAlmostEqual(phone.phone_consent_endpointing_max_delay(), 0.3)
+        with patch.dict(os.environ, {"PHONE_CONSENT_ENDPOINTING_MAX_DELAY_SEC": "9"}):
+            self.assertAlmostEqual(phone.phone_consent_endpointing_max_delay(), 3.0)
+        # non-numeric falls back to the default
+        with patch.dict(os.environ, {"PHONE_CONSENT_ENDPOINTING_MAX_DELAY_SEC": "nope"}):
+            self.assertAlmostEqual(phone.phone_consent_endpointing_max_delay(), 0.5)
+
+    # ── Fix 1: gate tighten/restore ───────────────────────────────────────
+    async def test_consent_turn_tightens_then_restores_endpointing(self):
+        calls: list[float] = []
+        with patch.dict(os.environ, {
+            "PHONE_CONSENT_ENDPOINTING_MAX_DELAY_SEC": "0.4",
+            "PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC": "2.5",
+        }):
+            result, _, _ = await self._run_gate(
+                set_endpointing_max=lambda m: calls.append(m),
+            )
+        self.assertTrue(result.assessment_allowed)
+        # Tighten to the consent ceiling for the consent turn, then restore the
+        # configured mid-answer tail — in that order, exactly once each.
+        self.assertEqual(calls, [0.4, 2.5])
+
+    async def test_endpointing_untouched_when_no_setter_wired(self):
+        # Absent setter ⇒ byte-identical behaviour; the gate still consents.
+        result, _, _ = await self._run_gate()
+        self.assertTrue(result.assessment_allowed)
+
+    async def test_endpointing_not_tightened_when_consent_max_not_shorter(self):
+        # Rollback: consent max == global max ⇒ never call the setter.
+        calls: list[float] = []
+        with patch.dict(os.environ, {
+            "PHONE_CONSENT_ENDPOINTING_MAX_DELAY_SEC": "2.5",
+            "PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC": "2.5",
+        }):
+            result, _, _ = await self._run_gate(
+                set_endpointing_max=lambda m: calls.append(m),
+            )
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(calls, [])
+
+    async def test_setter_failure_on_tighten_never_blocks_the_gate(self):
+        def boom(_m):
+            raise RuntimeError("update_options exploded")
+
+        with patch.dict(os.environ, {
+            "PHONE_CONSENT_ENDPOINTING_MAX_DELAY_SEC": "0.4",
+            "PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC": "2.5",
+        }):
+            result, _, _ = await self._run_gate(set_endpointing_max=boom)
+        # A failed tighten is swallowed, no restore is attempted, and consent
+        # still proceeds normally.
+        self.assertTrue(result.assessment_allowed)
+
+    # ── Fix 2: reader ─────────────────────────────────────────────────────
+    def test_prerender_flag_default_on_and_off_tokens(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(phone.phone_role_opening_prerender_enabled())
+        for off in ("false", "0", "no", "off", "OFF"):
+            with patch.dict(os.environ, {"PHONE_ROLE_OPENING_PRERENDER": off}):
+                self.assertFalse(phone.phone_role_opening_prerender_enabled())
+        with patch.dict(os.environ, {"PHONE_ROLE_OPENING_PRERENDER": "true"}):
+            self.assertTrue(phone.phone_role_opening_prerender_enabled())
+
+    # ── Fix 2: gate uses the pre-render seam for the fixed role line ───────
+    async def test_role_line_delivered_via_prerender_seam_and_kicked_off_before_disclosure(self):
+        recorder = Recorder()
+        role_line = phone.phone_role_opening_text("Sales Program Advisor")
+        said_via_prerender: list[str] = []
+        prerender = {"n": 0, "spoken_len_at_call": None}
+
+        def start_prerender():
+            prerender["n"] += 1
+            prerender["spoken_len_at_call"] = len(recorder.spoken)
+
+        async def say_role(text):
+            said_via_prerender.append(text)
+
+        result, _, _ = await self._run_gate(
+            recorder=recorder,
+            speak_role_opening=None,  # deterministic mode: fixed line is spoken
+            start_role_prerender=start_prerender,
+            say_role_opening=say_role,
+        )
+        self.assertTrue(result.assessment_allowed)
+        self.assertTrue(result.role_opening_spoken)
+        # The fixed role line went through the pre-render seam, NOT plain say().
+        self.assertEqual(said_via_prerender, [role_line])
+        self.assertNotIn(role_line, recorder.spoken)
+        # It is still recorded in the gate transcript exactly as _say would.
+        self.assertIn(role_line, result.spoken)
+        # Pre-render was kicked off exactly once, BEFORE the disclosure was spoken.
+        self.assertEqual(prerender["n"], 1)
+        self.assertEqual(prerender["spoken_len_at_call"], 0)
+        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, recorder.spoken)
+
+    async def test_role_prerender_not_started_on_durable_consent_reentry(self):
+        # A re-entry that already consented skips the disclosure entirely, so the
+        # role pre-render must NOT fire (there is no consent wait to mask).
+        started = {"n": 0}
+
+        def start_prerender():
+            started["n"] += 1
+
+        payload = _plan_payload(cursor=1, completed=["k1"], role_title="Sales Program Advisor")
+        payload["gate_recorded"] = True
+        durable = phone.PhoneAssessmentState.parse(payload)
+
+        async def fetch_durable_consent():
+            return durable
+
+        result, _, _ = await self._run_gate(
+            start_role_prerender=start_prerender,
+            fetch_durable_consent=fetch_durable_consent,
+        )
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(started["n"], 0)
 
 
 if __name__ == "__main__":
