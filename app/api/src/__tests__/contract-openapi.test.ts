@@ -1076,7 +1076,11 @@ describe('OpenAPI document integrity', () => {
     // recovery), which used to leave call_sessions.observability empty. Same
     // worker-authenticated surface; widens no recruiter-facing route.
     // 118 + 1 = 119.
-    expect(Object.keys(paths).length).toBe(119);
+    // Phase 4 (scorecard rework) adds ONE recruiter-facing path —
+    // POST /api/assess/{sessionId}/rescore — the admin explicit immutable
+    // rescore that produces a new superseding assessment revision.
+    // 119 + 1 = 120.
+    expect(Object.keys(paths).length).toBe(120);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas

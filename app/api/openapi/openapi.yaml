@@ -940,6 +940,58 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
 
+  /api/assess/{sessionId}/rescore:
+    parameters:
+      - name: sessionId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [assess]
+      operationId: rescoreAssessment
+      summary: Re-score a completed session against its role's current scorecard as a new immutable revision (admin only)
+      description: Phase 4. Re-runs scoring for a completed session against its role's CURRENT active v2 scorecard and persists a NEW immutable assessment revision that supersedes the prior one; the old row is never mutated or deleted. Idempotent per the caller-supplied rescore_request_id (the uq_assessments_rescore_request index admits at most one assessment per id), so a repeat returns the existing revision without re-scoring. A role with no active scorecard cannot be rescored.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [rescore_request_id]
+              properties:
+                rescore_request_id:
+                  type: string
+                  format: uuid
+                  description: Caller idempotency key for this rescore.
+      responses:
+        '200':
+          description: The new, or on an idempotent repeat the existing, immutable assessment revision.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Assessment'
+        '400':
+          description: Request validation failed (missing or non-UUID rescore_request_id).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: Session is not eligible for assessment, or the role has no active scorecard to rescore against.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '500':
+          description: Internal error (including fail-closed audit sink failure).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
   /api/internal/assess/{sessionId}:
     parameters:
       - name: sessionId
