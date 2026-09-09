@@ -19,6 +19,7 @@ export { AccessSection } from './AccessSection';
 export { SessionsSection } from './SessionsSection';
 export { QuotasSection } from './QuotasSection';
 export { ScorebarSection } from './ScorebarSection';
+export { FunnelSection } from './FunnelSection';
 export { AuditSection } from './AuditSection';
 export { MaintenanceSection } from './MaintenanceSection';
 export {

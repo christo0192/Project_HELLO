@@ -4819,6 +4819,189 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
 
+  # ── Funnel observability (0090 / PR2): derived funnel views + rollup ──
+  /api/admin/funnel/summary:
+    get:
+      tags: [admin]
+      operationId: getFunnelSummary
+      summary: Funnel topline over a date window from the stored rollup — totals, step conversions, per-day series. Counts only, no PII.
+      parameters:
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: role_id
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Funnel summary (totals, conversions, series). Empty until the rollup is refreshed.
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          description: Invalid date or role filter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Non-admin denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/admin/funnel/failures:
+    get:
+      tags: [admin]
+      operationId: listFunnelFailures
+      summary: Unified pipeline failure taxonomy — grouped {stage, code, count} plus a recent list. Sanitized codes only, no PII.
+      parameters:
+        - name: stage
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [resume_parse, dial, recording, call, scoring]
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+      responses:
+        '200':
+          description: Grouped and recent failures.
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          description: Invalid filter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Non-admin denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/admin/funnel/candidates:
+    get:
+      tags: [admin]
+      operationId: listFunnelCandidates
+      summary: Per-candidate funnel drill-down (paginated). Opaque ids and stage flags only — no name/email/phone/transcript.
+      parameters:
+        - name: role_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: furthest_stage
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [parsed, dialed, connected, consent_passed, answered, scored, qualified, reference_check]
+        - name: drop_reason
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            maximum: 10000
+      responses:
+        '200':
+          description: Paginated funnel candidate rows.
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          description: Invalid filter or pagination.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Non-admin denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/admin/funnel/refresh:
+    post:
+      tags: [admin]
+      operationId: refreshFunnelRollup
+      summary: On-demand recompute of the funnel_stage_daily rollup (advisory-locked, idempotent). Populates the summary without the background loop.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                window_days:
+                  type: integer
+                  minimum: 1
+                  maximum: 3650
+      responses:
+        '200':
+          description: Refresh result (status + rows recomputed).
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          description: Invalid window.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Non-admin denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
   # ── Phase 9 review repair: admin audit / sessions / quota policy views ──
   /api/admin/audit:
     get:
