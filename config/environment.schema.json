@@ -255,6 +255,7 @@
         "PHONE_AGENT_NAME": { "requiredInProduction": false, "secret": false },
         "PHONE_EVENT_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_PARTICIPANT_WAIT_SEC": { "requiredInProduction": false, "secret": false },
+        "PHONE_OUTPUT_SUBSCRIBE_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_CLASSIFY_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_CLASSIFY_ANSWER_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_ANSWER_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
