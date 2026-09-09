@@ -43,7 +43,7 @@ create index if not exists idx_scorecard_metric_library_active
 -- ── Immutable role configuration versions ───────────────────────────────
 create table if not exists screening_v2.role_scorecard_versions (
   id uuid primary key default gen_random_uuid(),
-  role_id uuid not null references screening_v2.roles(id) on delete restrict,
+  role_id uuid not null references screening_v2.roles(id) on delete cascade,
   version integer not null,
   configuration_hash text not null,
   created_by uuid references auth.users(id) on delete set null,
@@ -57,7 +57,7 @@ create index if not exists idx_role_scorecard_versions_role on screening_v2.role
 
 create table if not exists screening_v2.role_scorecard_version_metrics (
   id uuid primary key default gen_random_uuid(),
-  scorecard_version_id uuid not null references screening_v2.role_scorecard_versions(id) on delete restrict,
+  scorecard_version_id uuid not null references screening_v2.role_scorecard_versions(id) on delete cascade,
   library_metric_id uuid not null references screening_v2.scorecard_metric_library(id) on delete restrict,
   metric_key text not null,
   name text not null,
@@ -142,7 +142,7 @@ create constraint trigger trg_role_scorecard_exact_weights
 alter table screening_v2.assessments
   add column if not exists schema_version integer not null default 1,
   add column if not exists revision integer not null default 1,
-  add column if not exists scorecard_version_id uuid references screening_v2.role_scorecard_versions(id) on delete restrict,
+  add column if not exists scorecard_version_id uuid references screening_v2.role_scorecard_versions(id) on delete set null,
   add column if not exists metric_results jsonb,
   add column if not exists weighted_score_5 numeric(5,4),
   add column if not exists scoring_status text not null default 'complete',
@@ -160,7 +160,7 @@ alter table screening_v2.assessments add constraint chk_assessments_scoring_stat
 alter table screening_v2.assessments drop constraint if exists chk_assessments_v2_shape;
 alter table screening_v2.assessments add constraint chk_assessments_v2_shape check (
   (schema_version = 1 and scorecard_version_id is null and metric_results is null and weighted_score_5 is null)
-  or (schema_version = 2 and scorecard_version_id is not null and metric_results is not null
+  or (schema_version = 2 and metric_results is not null
       and jsonb_typeof(metric_results) = 'array'
       and ((scoring_status = 'complete' and weighted_score_5 is not null) or (scoring_status = 'incomplete_evidence' and weighted_score_5 is null)))
 );
