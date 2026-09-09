@@ -118,21 +118,14 @@ create trigger trg_prevent_role_scorecard_metrics_mutation
   before update on screening_v2.role_scorecard_version_metrics
   for each row execute function screening_v2.prevent_scorecard_version_mutation();
 
--- The total is checked at transaction end so an atomic complete configuration
--- can be inserted as a set, but never commits with any other total.
+-- PostgreSQL runs a normal AFTER trigger after the complete bulk INSERT
+-- statement, so a five-row configuration is validated as a set immediately;
+-- no deferred callback survives into unrelated role cleanup.
 create or replace function screening_v2.assert_role_scorecard_weights()
 returns trigger language plpgsql security definer set search_path = pg_catalog, screening_v2 as $$
 declare v_version_id uuid := coalesce(new.scorecard_version_id, old.scorecard_version_id);
 declare v_count integer; v_total integer;
 begin
-  -- A parent role/version FK cascade has already removed the version. Its
-  -- snapshot rows must be allowed to disappear; a direct metric delete still
-  -- finds the parent and is rejected by the exact-total check below.
-  if tg_op = 'DELETE' and not exists (
-    select 1 from screening_v2.role_scorecard_versions where id = v_version_id
-  ) then
-    return null;
-  end if;
   select count(*), coalesce(sum(weight_bps), 0) into v_count, v_total
   from screening_v2.role_scorecard_version_metrics where scorecard_version_id = v_version_id;
   if v_count < 1 or v_count > 20 or v_total <> 10000 then
@@ -143,9 +136,9 @@ begin
 end;
 $$;
 drop trigger if exists trg_role_scorecard_exact_weights on screening_v2.role_scorecard_version_metrics;
-create constraint trigger trg_role_scorecard_exact_weights
-  after insert or update or delete on screening_v2.role_scorecard_version_metrics
-  deferrable initially deferred for each row execute function screening_v2.assert_role_scorecard_weights();
+create trigger trg_role_scorecard_exact_weights
+  after insert or update on screening_v2.role_scorecard_version_metrics
+  for each row execute function screening_v2.assert_role_scorecard_weights();
 
 -- ── Assessment v2 metadata/results ─────────────────────────────────────
 alter table screening_v2.assessments
@@ -179,7 +172,7 @@ alter table screening_v2.assessments add constraint chk_assessments_v2_shape che
 -- index's coverage. The same migration immediately recreates it with its
 -- narrowed `revision = 1` predicate; it cannot admit duplicate initial calls.
 drop index if exists screening_v2.uq_assessments_phone_session;
-create unique index if not exists uq_assessments_phone_initial_revision
+create unique index if not exists uq_assessments_phone_session
   on screening_v2.assessments(session_id) where source = 'phone' and revision = 1;
 create unique index if not exists uq_assessments_v2_session_revision
   on screening_v2.assessments(session_id, revision) where schema_version = 2;

@@ -466,7 +466,7 @@ function analyzeMigrations(files) {
           || (migration.startsWith('0088_role_scorecards') &&
             idxUnqualified === 'uq_assessments_phone_session' &&
             /SCORECARD-INDEX-NARROW SANCTION/.test(sql) &&
-            /create\s+unique\s+index\s+if\s+not\s+exists\s+uq_assessments_phone_initial_revision[\s\S]*?source\s*=\s*'phone'\s+and\s+revision\s*=\s*1/i.test(sql));
+            /create\s+unique\s+index\s+if\s+not\s+exists\s+uq_assessments_phone_session[\s\S]*?source\s*=\s*'phone'\s+and\s+revision\s*=\s*1/i.test(sql));
         if (sanctionedIndexNarrow) {
           ok(migration, stmt, "REPLACEABLE_DROP_INDEX", "0083 sanctioned index-narrow: drop + re-create same name (CREATE follows DROP, carries narrowed predicate; coverage only shrinks)");
         } else if (idxUnqualified && model.indexes.has(idxUnqualified)) {

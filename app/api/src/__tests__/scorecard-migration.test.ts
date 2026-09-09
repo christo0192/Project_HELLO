@@ -27,7 +27,7 @@ describe('0088 role scorecards migration contract', () => {
   });
 
   it('pins v2 assessment revision/idempotency without permitting duplicate initial phone scoring', () => {
-    expect(migration).toContain('uq_assessments_phone_initial_revision');
+    expect(migration).toContain('uq_assessments_phone_session');
     expect(migration).toContain("source = 'phone' and revision = 1");
     expect(migration).toContain('uq_assessments_v2_session_revision');
     expect(migration).toContain('uq_assessments_rescore_request');
