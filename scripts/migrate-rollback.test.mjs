@@ -455,10 +455,18 @@ function analyzeMigrations(files) {
         const createFollowsDrop =
           createIdxMatch !== null && dropIdxPos >= 0 && createIdxMatch.index > dropIdxPos;
         const sanctionedIndexNarrow =
-          migration.startsWith('0083_voice_worker_terminal_release') &&
-          idxUnqualified === 'uq_phone_attempts_one_per_ist_day' &&
-          /INDEX-NARROW SANCTION/.test(sql) &&
-          createFollowsDrop;
+          (migration.startsWith('0083_voice_worker_terminal_release') &&
+            idxUnqualified === 'uq_phone_attempts_one_per_ist_day' &&
+            /INDEX-NARROW SANCTION/.test(sql) &&
+            createFollowsDrop)
+          // 0088 evolves the initial phone assessment unique index in place.
+          // It retains the same name and narrows coverage only to revision 1,
+          // preserving exactly-once initial phone scoring while allowing an
+          // explicit later assessment revision. Keep this exception exact.
+          || (migration.startsWith('0088_role_scorecards') &&
+            idxUnqualified === 'uq_assessments_phone_session' &&
+            /SCORECARD-INDEX-NARROW SANCTION/.test(sql) &&
+            /create\s+unique\s+index\s+if\s+not\s+exists\s+uq_assessments_phone_initial_revision[\s\S]*?source\s*=\s*'phone'\s+and\s+revision\s*=\s*1/i.test(sql));
         if (sanctionedIndexNarrow) {
           ok(migration, stmt, "REPLACEABLE_DROP_INDEX", "0083 sanctioned index-narrow: drop + re-create same name (CREATE follows DROP, carries narrowed predicate; coverage only shrinks)");
         } else if (idxUnqualified && model.indexes.has(idxUnqualified)) {
@@ -501,8 +509,8 @@ function analyzeMigrations(files) {
       }
 
       // ── CREATE / DROP TRIGGER ────────────────────────────────────
-      if (/^create\s+trigger\b/.test(low)) {
-        const m = /create\s+trigger\s+("?[a-z0-9_.-]+"?)/i.exec(stmt);
+      if (/^create\s+(?:constraint\s+)?trigger\b/.test(low)) {
+        const m = /create\s+(?:constraint\s+)?trigger\s+("?[a-z0-9_.-]+"?)/i.exec(stmt);
         const on = tableFromOn(stmt);
         if (on && !model.tables.has(on.name)) {
           red(migration, stmt, "CONTRACT_UNKNOWN_TABLE", `CREATE TRIGGER targets '${on.name}' which is not in the contract`);
