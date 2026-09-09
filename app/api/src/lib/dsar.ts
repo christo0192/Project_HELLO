@@ -380,6 +380,18 @@ export async function exportDSAR(
       recommendation: a.recommendation,
       summary: a.summary,
       created_at: a.created_at,
+      // v2 scorecard fields (Phase 6): a data-subject export must be complete for
+      // schema_version=2 assessments, whose scores live in these columns rather
+      // than in the v1 overall_score/recommendation/summary shape. Left as-is for
+      // v1 rows (schema_version=1, revision=1, weighted_score_5/metric_results
+      // null, scoring_status defaulted 'complete'), so the v1 export is intact.
+      // metric_results IS the data subject's own per-metric scoring, so it is
+      // included in full here (unlike the data-minimized CSV export).
+      schema_version: a.schema_version,
+      revision: a.revision,
+      weighted_score_5: a.weighted_score_5,
+      scoring_status: a.scoring_status,
+      metric_results: a.metric_results,
       // Excluded: full assessment JSON if it contains internal notes
     })),
     transcripts: (transcripts ?? []).map((t: any) => ({

@@ -516,6 +516,75 @@ describe('GOV-05: DSAR Export', () => {
     expect(exportRes.body.data.recordingDataIncluded).toBe(false);
     expect(exportRes.body.data.recordings.length).toBe(0);
   });
+
+  it('should include v2 scorecard fields in the assessment export projection (v1 rows intact)', async () => {
+    const { app } = createGovApp(makeInterviewer());
+    const ALICE = '11111111-1111-4111-8111-111111111111';
+    // Make the existing v1 assessment realistic (DB carries schema_version=1 +
+    // defaulted scoring_status), so the projection reports the discriminator.
+    Object.assign(tables.assessments[0], {
+      schema_version: 1,
+      revision: 1,
+      weighted_score_5: null,
+      scoring_status: 'complete',
+      metric_results: null,
+    });
+    // Add a schema_version=2 assessment for the same candidate.
+    tables.assessments.push({
+      id: '00000000-0000-4000-8000-0000000000e2',
+      candidate_id: ALICE,
+      overall_score: 88,
+      recommendation: 'advance',
+      summary: null,
+      created_at: '2025-06-01T00:00:00.000Z',
+      schema_version: 2,
+      revision: 2,
+      scorecard_version_id: '00000000-0000-4000-8000-0000000000sv',
+      weighted_score_5: 4.5,
+      scoring_status: 'complete',
+      metric_results: [
+        {
+          configMetricId: '00000000-0000-4000-8000-0000000000m1',
+          score: 5,
+          evidenceStatus: 'scored',
+          rationale: 'excellent',
+          evidenceRefs: [],
+          metric: { id: '00000000-0000-4000-8000-0000000000m1', key: 'communication' },
+        },
+      ],
+    });
+
+    const crate = await request(app).post('/api/dsar').set('Authorization', VALID_TOKEN).send({
+      candidate_id: ALICE, request_type: 'export',
+    });
+    expect(crate.status).toBe(201);
+    const dsarId = crate.body.data.id;
+
+    const exportRes = await request(app).post(`/api/dsar/${dsarId}/export`).set('Authorization', VALID_TOKEN);
+    expect(exportRes.status).toBe(200);
+    const exported: any[] = exportRes.body.data.assessments;
+
+    const v1 = exported.find((a) => a.schema_version === 1);
+    const v2 = exported.find((a) => a.schema_version === 2);
+    expect(v1).toBeTruthy();
+    expect(v2).toBeTruthy();
+
+    // v1 export shape intact: original fields preserved, v2 columns null.
+    expect(v1.overall_score).toBe(85);
+    expect(v1.recommendation).toBe('advance');
+    expect(v1.summary).toBe('Strong candidate');
+    expect(v1.revision).toBe(1);
+    expect(v1.weighted_score_5).toBeNull();
+    expect(v1.metric_results).toBeNull();
+
+    // v2 export is COMPLETE: the richer scorecard fields are all present.
+    expect(v2.revision).toBe(2);
+    expect(v2.weighted_score_5).toBe(4.5);
+    expect(v2.scoring_status).toBe('complete');
+    expect(Array.isArray(v2.metric_results)).toBe(true);
+    expect(v2.metric_results[0].metric.key).toBe('communication');
+    expect(v2.metric_results[0].score).toBe(5);
+  });
 });
 
 describe('GOV-05: DSAR Delete (Erasure)', () => {

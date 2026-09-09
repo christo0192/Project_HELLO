@@ -162,9 +162,10 @@ describe('GET /api/export/:candidateId/csv — content contract', () => {
       `attachment; filename="screening-export-${CANDIDATE_ID}.csv"`,
     );
     expect(res.text.startsWith(CSV_BOM)).toBe(true);
-    // Header row present with the record_type discriminator.
+    // Header row present with the record_type discriminator (v1 columns
+    // unchanged, v2 scorecard columns appended at the end).
     expect(res.text).toContain(
-      'record_type,candidate_id,candidate_status,session_id,assessment_id,turn_index,speaker,transcript_text,english,tone,communication,motivation,role_fit,overall_score,recommendation,created_at',
+      'record_type,candidate_id,candidate_status,session_id,assessment_id,turn_index,speaker,transcript_text,english,tone,communication,motivation,role_fit,overall_score,recommendation,created_at,schema_version,weighted_score_5,scoring_status,metric_scores',
     );
     // Scorecard row present.
     expect(res.text).toContain('scorecard');
@@ -253,6 +254,123 @@ describe('GET /api/export/:candidateId/csv — content contract', () => {
     expect(res.text).toContain('日本語も話せます');
     const roundTrip = Buffer.from(res.text, 'utf-8').toString('utf-8');
     expect(roundTrip).toBe(res.text);
+  });
+});
+
+describe('GET /api/export/:candidateId/csv — v2 scorecard columns (Phase 6)', () => {
+  // A schema_version=1 assessment (v1 dimension scores present, DB carries
+  // schema_version=1 and NULL v2 columns) and a schema_version=2 assessment
+  // (v1 dimension columns NULL, scores live in weighted_score_5 + metric_results)
+  // in one export. Deterministic order: created_at asc → v1 first, v2 second.
+  const V1_ID = '00000000-0000-4000-8000-0000000000c1';
+  const V2_ID = '00000000-0000-4000-8000-0000000000c2';
+
+  const V1_ROW = {
+    id: V1_ID,
+    session_id: '00000000-0000-4000-8000-0000000000a1',
+    english: { band: 'B2', grammar: 7, vocabulary: 8, fluency: 7, coherence: 8 },
+    tone: { clarity: 8, confidence: 7, professionalism: 9 },
+    communication: { score: 7.5, clarity: 7 },
+    motivation: { score: 8 },
+    role_fit: { score: 6 },
+    overall_score: 76,
+    recommendation: 'advance',
+    created_at: '2025-01-01T00:00:00.000Z',
+    schema_version: 1,
+    weighted_score_5: null,
+    scoring_status: 'complete', // DB default even for v1 — the export must still blank it
+    metric_results: null,
+  };
+
+  const V2_ROW = {
+    id: V2_ID,
+    session_id: null, // v2 rescore rows may not carry session_id in this projection
+    english: null,
+    tone: null,
+    communication: null,
+    motivation: null,
+    role_fit: null,
+    overall_score: 77,
+    recommendation: 'advance',
+    created_at: '2025-02-01T00:00:00.000Z',
+    schema_version: 2,
+    weighted_score_5: 4.2,
+    scoring_status: 'complete',
+    metric_results: [
+      {
+        configMetricId: '00000000-0000-4000-8000-0000000000m1',
+        score: 4,
+        evidenceStatus: 'scored',
+        rationale: 'clear and structured',
+        evidenceRefs: [],
+        metric: { id: '00000000-0000-4000-8000-0000000000m1', key: 'communication' },
+      },
+      {
+        configMetricId: '00000000-0000-4000-8000-0000000000m2',
+        score: null,
+        evidenceStatus: 'insufficient_evidence',
+        rationale: '',
+        evidenceRefs: [],
+        metric: { id: '00000000-0000-4000-8000-0000000000m2', key: 'problem_solving' },
+      },
+    ],
+  };
+
+  /** Header-indexed CSV parse. Safe here: no fixture cell contains a comma or
+   * quote (metric_scores uses ";" as its separator, not ","). */
+  function parseScorecardRows(text: string): Array<Record<string, string>> {
+    const lines = text.replace(CSV_BOM, '').split('\r\n').filter((l) => l.length > 0);
+    const header = lines[0].split(',');
+    return lines
+      .slice(1)
+      .map((line) => {
+        const cells = line.split(',');
+        const obj: Record<string, string> = {};
+        header.forEach((h, i) => (obj[h] = cells[i] ?? ''));
+        return obj;
+      })
+      .filter((r) => r.record_type === 'scorecard');
+  }
+
+  it('exports v2 scorecard fields and leaves v1 rows unchanged', async () => {
+    mockFrom
+      .mockReturnValueOnce(chainable({ data: { owner_id: RECRUITER_ID, status: 'screened' }, error: null }))
+      .mockReturnValueOnce(chainable({ data: [V1_ROW, V2_ROW], error: null }))
+      .mockReturnValueOnce(chainable({ data: [], error: null })) // no sessions → no transcript query
+      .mockReturnValueOnce(chainable({ data: null, error: null })); // audit insert
+    const res = await request(makeApp(makeUser('interviewer')))
+      .get(`/api/export/${CANDIDATE_ID}/csv`)
+      .set(AUTH);
+    expect(res.status).toBe(200);
+    // Header carries the appended v2 columns.
+    expect(res.text).toContain(',created_at,schema_version,weighted_score_5,scoring_status,metric_scores');
+
+    const rows = parseScorecardRows(res.text);
+    const v1 = rows.find((r) => r.assessment_id === V1_ID)!;
+    const v2 = rows.find((r) => r.assessment_id === V2_ID)!;
+    expect(v1).toBeTruthy();
+    expect(v2).toBeTruthy();
+
+    // v1 row: existing columns intact; v2-specific columns empty; discriminator = 1.
+    expect(v1.english).toBe('7.5'); // mean of numeric sub-scores, unchanged
+    expect(v1.overall_score).toBe('76');
+    expect(v1.recommendation).toBe('advance');
+    expect(v1.schema_version).toBe('1');
+    expect(v1.weighted_score_5).toBe('');
+    expect(v1.scoring_status).toBe(''); // blanked even though the DB column defaults to 'complete'
+    expect(v1.metric_scores).toBe('');
+
+    // v2 row: v1 dimension columns empty (no invented sub-scores); v2 columns populated.
+    expect(v2.english).toBe('');
+    expect(v2.tone).toBe('');
+    expect(v2.communication).toBe('');
+    expect(v2.overall_score).toBe('77'); // v2 scorer still writes overall_score + recommendation
+    expect(v2.recommendation).toBe('advance');
+    expect(v2.schema_version).toBe('2');
+    expect(v2.weighted_score_5).toBe('4.2');
+    expect(v2.scoring_status).toBe('complete');
+    // Compact per-metric representation: key=score pairs; unscored → n/a.
+    expect(v2.metric_scores).toBe('communication=4; problem_solving=n/a');
   });
 });
 
