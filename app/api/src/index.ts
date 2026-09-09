@@ -31,6 +31,10 @@ import {
   createWorkerOrchestrationRuntime,
   type WorkerOrchestrationRuntimeHandle,
 } from './lib/worker-orchestration-runtime.js';
+import {
+  createFunnelRuntime,
+  type FunnelRuntimeHandle,
+} from './lib/funnel/runtime.js';
 
 const startupLogger = createLogger('startup');
 const app = createApp();
@@ -121,6 +125,21 @@ try {
   workerOrchestrationRuntime = null;
 }
 
+// ── Funnel observability runtime (disabled by default) ───────────────────────
+// A FIFTH independent try/catch, same rule as the four above: its own gate
+// (`FUNNEL_OBSERVABILITY_ENABLED`), so `createFunnelRuntime` returns null with
+// the shipped default and constructs nothing — no scheduler, no timer, no DB
+// call. It only recomputes a DERIVED rollup, so a failure to build it must
+// never prevent the API — or any other runtime — from serving.
+let funnelRuntime: FunnelRuntimeHandle | null = null;
+try {
+  funnelRuntime = createFunnelRuntime();
+} catch {
+  // Sanitized: the error is not logged verbatim because it can carry config text.
+  startupLogger.warn('unknown_event', { error_category: 'funnel_runtime_start_failed' });
+  funnelRuntime = null;
+}
+
 server.listen(env.port, () => {
   if (recordingRuntime) {
     recordingRuntime.scheduler.start();
@@ -163,6 +182,11 @@ server.listen(env.port, () => {
     // otherwise). Start the reaper + terminal-release loops now that the process
     // is serving, mirroring the recording/ashby runtimes.
     workerOrchestrationRuntime.scheduler.start();
+  }
+  if (funnelRuntime) {
+    // Only present when FUNNEL_OBSERVABILITY_ENABLED is on. Start the single
+    // rollup-refresh loop now that the process is serving, mirroring the others.
+    funnelRuntime.scheduler.start();
   }
   startupLogger.info('startup_listen', {
     port: env.port,
@@ -215,6 +239,16 @@ shutdown.boot(server).then(async (code) => {
       // process's loops (and the grace-based reaper) recover any machine left
       // started, so an interrupted sweep leaks nothing durable.
       await workerOrchestrationRuntime.stop();
+    } catch {
+      // Never let a worker-stop failure change the process exit code.
+    }
+  }
+  if (funnelRuntime) {
+    try {
+      // Stopped in its own try, like the others. The refresh RPC is idempotent
+      // and advisory-locked, so an interrupted recompute leaves the rollup
+      // consistent and the next tick simply recomputes the window again.
+      await funnelRuntime.stop();
     } catch {
       // Never let a worker-stop failure change the process exit code.
     }

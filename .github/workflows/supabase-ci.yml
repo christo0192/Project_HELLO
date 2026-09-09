@@ -7,6 +7,7 @@ on:
       - 'scripts/*synthetic*'
       - 'scripts/*seed*'
       - 'scripts/supabase-*.sh'
+      - 'scripts/test-funnel-views.sh'
       - 'scripts/phone-canary/**'
       - 'docs/runbooks/synthetic-*.md'
       - 'docs/runbooks/supabase-*.md'
@@ -25,6 +26,7 @@ on:
       - 'scripts/*synthetic*'
       - 'scripts/*seed*'
       - 'scripts/supabase-*.sh'
+      - 'scripts/test-funnel-views.sh'
       - 'scripts/phone-canary/**'
       - 'docs/runbooks/synthetic-*.md'
       - 'docs/runbooks/supabase-*.md'
@@ -54,6 +56,14 @@ jobs:
         env:
           SUPABASE_CLI_VERSION: 2.110.0
         run: bash scripts/supabase-test.sh
+
+  funnel-views-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Funnel views + refresh RPC behavior (isolated real Postgres)
+        run: bash scripts/test-funnel-views.sh
 
   supabase-static-security:
     runs-on: ubuntu-latest
