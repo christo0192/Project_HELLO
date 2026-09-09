@@ -4644,6 +4644,14 @@ async def run_phone_gate(
         except Exception:  # noqa: BLE001
             # Nothing changed → nothing to restore; proceed on the global tail.
             tightened_endpointing = False
+        # Observability: emit the APPLIED ceiling so a live call can confirm the
+        # consent turn actually got the short tail (a silent no-op here would
+        # otherwise be invisible — the branch's whole purpose is latency).
+        if tightened_endpointing:
+            _log.info(
+                "unknown_event", error_type="phone_consent_endpointing",
+                schema="tightened", duration_sec=consent_max,
+            )
     try:
         decision = await asyncio.wait_for(classify(), timeout=timeout)
     except asyncio.TimeoutError:
@@ -4662,8 +4670,18 @@ async def run_phone_gate(
         if tightened_endpointing:
             try:
                 set_endpointing_max(normal_max)
+                _log.info(
+                    "unknown_event", error_type="phone_consent_endpointing",
+                    schema="restored", duration_sec=normal_max,
+                )
             except Exception:  # noqa: BLE001
-                pass
+                # A FAILED restore would leave the whole Q&A on the short ceiling
+                # (premature commit of real mid-thought pauses) — surface it
+                # loudly rather than swallow, so it is caught in the logs.
+                _log.warn(
+                    "unknown_event", error_type="phone_consent_endpointing",
+                    schema="restore_failed", duration_sec=normal_max,
+                )
     if decision not in PHONE_CLASSIFICATIONS:
         decision = CLASSIFY_MACHINE
 

@@ -7774,17 +7774,18 @@ async def _run_phone_session(
 
         Meaningful only in local turn-detection mode, where max_endpointing_delay
         bounds the wait on an utterance the EOU scores incomplete (a bare "yes").
-        Uses the supported AgentSession.update_options seam (livekit-agents 1.6.4)
-        and fails open on any stub/older session, so an endpointing tweak can
-        never block the gate.
+        Uses the supported AgentSession.update_options seam (livekit-agents 1.6.4;
+        endpointing_opts["max_delay"] is the exact field the constructor sets via
+        _migrate_turn_handling and the running turn detector reads). Errors
+        PROPAGATE by design: run_phone_gate wraps every call in try/except (its
+        single fail-open point) and logs the applied/restored value, so a no-op or
+        a failed restore is visible in the logs rather than silently swallowed. A
+        stub/older session without update_options is a quiet no-op.
         """
         upd = getattr(session, "update_options", None)
         if not callable(upd):
             return
-        try:
-            upd(endpointing_opts={"max_delay": float(max_delay)})
-        except Exception:  # noqa: BLE001
-            pass
+        upd(endpointing_opts={"max_delay": float(max_delay)})
 
     # Fix 2: pre-render the FIXED role line during the consent wait. Enabled only
     # in deterministic-opener mode with a known role (the fixed line is then what
@@ -7852,17 +7853,27 @@ async def _run_phone_session(
                 for f in frames:
                     yield f
 
+            # Split "start the pre-rendered say" from "await its playout": if
+            # say() itself raises, NOTHING was queued, so falling back to on-demand
+            # synthesis is safe. But once say() has accepted the frames, a later
+            # playout error must NOT re-speak — that would double the role line
+            # (partial pre-rendered audio + a full re-synthesis). Review repair.
+            speech = None
             try:
                 speech = session.say(
                     text, audio=_aiter(), allow_interruptions=False,
                 )
+            except Exception:  # noqa: BLE001
+                speech = None  # nothing played → safe to synthesize on demand
+            if speech is not None:
                 wait_for_playout = getattr(speech, "wait_for_playout", None)
                 if callable(wait_for_playout):
-                    await wait_for_playout()
+                    try:
+                        await wait_for_playout()
+                    except Exception:  # noqa: BLE001
+                        # Audio already committed to the output; do not re-speak.
+                        pass
                 return
-            except Exception:  # noqa: BLE001
-                # Fall through to on-demand synthesis (today's path).
-                pass
         await say(text)
 
     result = await phone.run_phone_gate(
@@ -7873,8 +7884,13 @@ async def _run_phone_session(
         say=say,
         start_recording=_phone_recording_permitted_and_begin,
         set_endpointing_max=(
+            # Fixed-local endpointing only: max_endpointing_delay governs the tail
+            # there. Excluded in dynamic mode (opt-in, off by default) whose
+            # turn_handling envelope is a different, untested shape, and in stt
+            # mode where the STT provider owns end-of-utterance.
             _set_consent_endpointing_max
             if phone.phone_turn_detection() == phone.PHONE_TURN_DETECTION_LOCAL
+            and not phone.phone_dynamic_endpointing_enabled()
             else None
         ),
         start_role_prerender=(
@@ -7917,6 +7933,16 @@ async def _run_phone_session(
         # /assessment/start) and the egress silently never starts.
         session_id=phone.session_id_from_room_name(room_name),
     )
+
+    # Review repair: cancel a still-running role pre-render once the gate has
+    # returned. On a machine/refused/opt-out call (or a HUMAN call where the
+    # buffer wasn't ready in time and the line was synthesized on demand) the
+    # task would otherwise finish a full, discarded TTS synthesis and could
+    # linger as a pending task at teardown. Cancelling (no await) stops the
+    # wasted work; asyncio does not warn about an unretrieved CancelledError.
+    _pt = _role_prerender_task[0]
+    if _pt is not None and not _pt.done():
+        _pt.cancel()
 
     async def _finish_recording() -> None:
         """PR A SEAM 3: the SINGLE common teardown for the recording.
