@@ -60,8 +60,9 @@ Before disclosure, the older `/appointments` compatibility path ends the attempt
 as an uncharged pre-disclosure deferral before booking. New candidate confirmation
 never uses that compatibility path. Past, illegal, out-of-window, ambiguous,
 full, or unavailable slots are refusals and must not be spoken as confirmations.
-The temporary 24/7 period does not bypass consent, halt, capacity, budget, or any
-other admission control. A booked callback must not be converted into a completed
+The temporary 24/7 testing period (ended by migration 0092 on 2026-09-10) never
+bypassed consent, halt, capacity, budget, or any other admission control; the
+09:00–21:00 IST window now applies to every booking. A booked callback must not be converted into a completed
 or re-screened cycle.
 
 ## Reschedule and cancellation

@@ -186,6 +186,12 @@ export const MIGRATION_0086_PATH = fileURLToPath(
 
 export const MIGRATION_0086 = readFileSync(MIGRATION_0086_PATH, 'utf8');
 
+export const MIGRATION_0092_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0092_phone_end_temporary_247_window.sql', import.meta.url),
+);
+
+export const MIGRATION_0092 = readFileSync(MIGRATION_0092_PATH, 'utf8');
+
 /**
  * Every phone migration, NEWEST FIRST. Extraction walks this in order and the
  * first file that declares a thing wins, which is what "the latest declaration
@@ -193,6 +199,10 @@ export const MIGRATION_0086 = readFileSync(MIGRATION_0086_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0092 re-declares phone_temporary_247_until (cutoff pulled back to the
+    // elapsed 2026-09-09, ENDING the testing all-hours window). Newest-first so
+    // helperLiteral('phone_temporary_247_until') reads the effective date.
+    { name: '0092', sql: MIGRATION_0092 },
     // 0086 re-declares commit_phone_question_boundary and
     // commit_phone_question_boundary_with_coverage in full (appended
     // p_disposition + the per-key disposition column), so it must be
@@ -201,9 +211,9 @@ export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: s
     { name: '0086', sql: MIGRATION_0086 },
     // 0085 re-declares phone_temporary_247_until, phone_ist_window_open and
     // phone_next_window_open in full (0064-style bodies, cutoff 2026-09-13,
-    // aligning repo SQL with the out-of-band production extension), so it must
-    // be NEWEST-FIRST for the extractors to read the effective bodies rather
-    // than 0064's.
+    // aligning repo SQL with the out-of-band production extension). Its two
+    // PREDICATE bodies are still the effective ones (0092 changed only the
+    // cutoff helper), so it stays ahead of 0064.
     { name: '0085', sql: MIGRATION_0085 },
     // 0083 adds abandon_phone_attempt_infra (same-IST-day relief for a
     // worker_not_ready infra defer) and narrows the per-IST-day index. Its two
@@ -514,7 +524,8 @@ export function checkMembers(constraintName: string): string[] {
  */
 export function helperLiteral(name: string): string {
   const body = functionBody(name);
-  const m = /as \$\$\s*select\s+(?:time\s+)?'?([^'\s]+)'?\s*(?:\$\$)?\s*$/.exec(body.trim());
+  // `time '09:00:00'`, `date '2026-09-09'` and a bare integer all read the same way.
+  const m = /as \$\$\s*select\s+(?:(?:time|date)\s+)?'?([^'\s]+)'?\s*(?:\$\$)?\s*$/.exec(body.trim());
   if (!m) throw new Error(`phone helper literal unreadable: ${name}`);
   return m[1];
 }

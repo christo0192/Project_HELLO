@@ -587,19 +587,38 @@ state can be admitted with.
 
 ## 8. The IST calling window
 
-The permanent fallback is **09:00:00 inclusive to 21:00:00 exclusive, Asia/Kolkata,
-all seven days**. The reviewed temporary override is **24/7 through September 6, 2026
-inclusive**; the permanent 09:00–21:00 window resumes automatically on September 7,
-2026 IST. The override is fixed in migration `0064_phone_temporary_247_window.sql`,
-not an environment variable and not an operator-editable bypass.
+The window is **09:00:00 inclusive to 21:00:00 exclusive, Asia/Kolkata, all seven
+days**. A reviewed temporary 24/7 override existed for testing — introduced by
+migration `0064_phone_temporary_247_window.sql` (through September 6, 2026), extended
+by `0085` (through September 13), and **ended by `0092` on September 10, 2026** by
+pulling the cutoff back to the already-elapsed September 9. The override mechanism
+remains in SQL with a past cutoff; it is not an environment variable and not an
+operator-editable bypass. Re-opening it for another test period requires a new
+migration AND the matching change to the TypeScript mirror
+(`app/api/src/lib/phone-screening/ist-window.ts`, `PHONE_TEMPORARY_247_UNTIL_IST`)
+in the same change — the two must never differ.
 
-The permanent bounds remain defined once in SQL:
+The bounds remain defined once in SQL:
 
 ```sql
 phone_ist_window_open_at()  -> time '09:00:00'
 phone_ist_window_close_at() -> time '21:00:00'
-phone_temporary_247_until() -> date '2026-09-06'
+phone_temporary_247_until() -> date '2026-09-09'   -- elapsed: the override is closed
 ```
+
+**Owner test calls and the window.** The owner-test gate (`POST
+/api/candidates/:id/phone-test-gate`) bypasses `operator_pause` only — never the
+window. A gate armed after 21:00 IST returns `202 armed`, the due loop then logs
+`phone_due_diag … skip.outside_ist_window` every tick, and the gate expires
+unconsumed after its 10-minute lifetime; nothing dials at 09:00 the next day.
+Re-arm inside 09:00–21:00 IST.
+
+**Appointments booked under a wider window.** Since 0092 the appointment trigger
+re-validates `starts_at` only when the slot is set or moved, so a slot booked
+legitimately during the 24/7 period can still be cancelled, expired or fulfilled;
+0092 also cancelled any live after-hours slot it found (`cancel_reason =
+'window_restored_0092'`, engagement back to `eligible`, audit action
+`phone_appointment_window_restored`).
 
 `phone_ist_window_open(at)` applies the temporary all-day rule through the cutoff and
 then applies the permanent bounds. `phone_next_window_open(at)` follows the same rule,

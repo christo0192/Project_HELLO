@@ -107,17 +107,29 @@ describe('the grid honours the window boundaries', () => {
     expect(slots.at(-1)!.endsAt).toBe('2026-09-14T15:30:00.000Z');
   });
 
-  it('uses the full temporary day through September 13, without offering a cross-midnight slot', () => {
+  it('used the full temporary day through September 9 (the last 24/7 day), without offering a cross-midnight slot', () => {
     const slots = buildPhoneSlotGrid({
-      date: { year: 2026, month: 9, day: 13 },
+      date: { year: 2026, month: 9, day: 9 },
       slotSeconds: 1_800,
-      now: new Date('2026-09-12T18:30:00Z'),
+      now: new Date('2026-09-08T18:30:00Z'),
       occupancy: [],
     });
     expect(slots[0].istStart).toBe('00:00');
     expect(slots).toHaveLength(47);
     expect(slots.at(-1)?.istStart).toBe('23:00');
     expect(slots.at(-1)?.istEnd).toBe('23:30');
+  });
+
+  it('from September 10 the grid is the 09:00–21:00 IST window again (0092 ended the testing allowance)', () => {
+    const slots = buildPhoneSlotGrid({
+      date: { year: 2026, month: 9, day: 10 },
+      slotSeconds: 1_800,
+      now: new Date('2026-09-09T18:30:00Z'),
+      occupancy: [],
+    });
+    expect(slots[0].istStart).toBe('09:00');
+    expect(slots).toHaveLength(24);
+    expect(slots.at(-1)?.istStart).toBe('20:30');
   });
 
   it('is contiguous — each slot begins where the last ended', () => {

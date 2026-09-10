@@ -9312,28 +9312,141 @@ begin
 end;
 $$;
 
--- ── B1-T: the reviewed temporary 24/7 window (0085-extended cutoff) ──
+-- ── B1-T: the reviewed temporary 24/7 window, ENDED by 0092 ──────────
+-- 0064 opened it through 2026-09-06, 0085 extended it through 2026-09-13,
+-- 0092 pulled the cutoff back to the elapsed 2026-09-09 when testing ended.
+-- The mechanism still reads correctly for the days it covered, and every
+-- later IST date is the plain 0042 gate.
 select _policy_tests.assert(
-  '0085: temporary window is open at every tested hour through 2026-09-13',
-  screening_v2.phone_temporary_247_until() = date '2026-09-13'
-  and screening_v2.phone_ist_window_open('2026-09-13T00:00:00Z')
-  and screening_v2.phone_ist_window_open('2026-09-12T18:30:00Z')
-  and screening_v2.phone_ist_window_open('2026-09-13T18:29:59Z'),
+  '0092: the temporary cutoff is 2026-09-09 and was open at every tested hour through that day',
+  screening_v2.phone_temporary_247_until() = date '2026-09-09'
+  and screening_v2.phone_ist_window_open('2026-09-09T00:00:00Z')
+  and screening_v2.phone_ist_window_open('2026-09-08T18:30:00Z')
+  and screening_v2.phone_ist_window_open('2026-09-09T18:29:59Z'),
   'the temporary cutoff or 24/7 predicate drifted');
 
 select _policy_tests.assert(
-  '0085: normal 09:00-21:00 IST gate resumes on 2026-09-14',
-  not screening_v2.phone_ist_window_open('2026-09-14T00:00:00Z')
-  and screening_v2.phone_ist_window_open('2026-09-14T03:30:00Z')
-  and screening_v2.phone_ist_window_open('2026-09-14T15:29:59Z')
-  and not screening_v2.phone_ist_window_open('2026-09-14T15:30:00Z'),
+  '0092: normal 09:00-21:00 IST gate governs from 2026-09-10 — the former 09-13 all-hours day is CLOSED after hours',
+  not screening_v2.phone_ist_window_open('2026-09-09T18:30:00Z')   -- 00:00 IST 09-10
+  and screening_v2.phone_ist_window_open('2026-09-10T03:30:00Z')   -- 09:00 IST
+  and screening_v2.phone_ist_window_open('2026-09-10T15:29:59Z')   -- 20:59:59 IST
+  and not screening_v2.phone_ist_window_open('2026-09-10T15:30:00Z') -- 21:00 IST
+  and not screening_v2.phone_ist_window_open('2026-09-12T21:30:00Z') -- 03:00 IST 09-13, formerly legal
+  and not screening_v2.phone_ist_window_open('2026-09-14T00:00:00Z')
+  and screening_v2.phone_ist_window_open('2026-09-14T03:30:00Z'),
   'the original daily gate was not restored after the cutoff');
 
 select _policy_tests.assert(
-  '0085: next legal instant is now during override and 09:00 IST after it',
-  screening_v2.phone_next_window_open('2026-09-13T18:29:59Z') = '2026-09-13T18:29:59Z'::timestamptz
+  '0092: next legal instant is now during the (elapsed) override and 09:00 IST after it',
+  screening_v2.phone_next_window_open('2026-09-09T18:29:59Z') = '2026-09-09T18:29:59Z'::timestamptz
+  and screening_v2.phone_next_window_open('2026-09-09T18:30:00Z') = '2026-09-10T03:30:00Z'::timestamptz
+  and screening_v2.phone_next_window_open('2026-09-12T21:30:00Z') = '2026-09-13T03:30:00Z'::timestamptz
   and screening_v2.phone_next_window_open('2026-09-14T00:00:00Z') = '2026-09-14T03:30:00Z'::timestamptz,
-  'next-window calculation did not follow the bounded override');
+  'next-window calculation did not follow the ended override');
+
+-- ── B1-U: 0092 — a slot booked under the wider window is still MANAGEABLE ──
+-- The 0042 trigger re-validated `starts_at` on EVERY update. Once the window
+-- narrowed, a legitimately-booked after-hours slot became un-cancellable,
+-- un-expirable and un-fulfillable, and one such row at the head of the
+-- expiry scan aborted the whole sweep. 0092 narrows the trigger to slot
+-- changes. Legacy rows are created here by bypassing the trigger, exactly as
+-- they exist in a database migrated from the 24/7 period.
+do $$
+declare
+  v_eng    uuid;
+  v_eng2   uuid;
+  v_apt    uuid;
+  v_apt2   uuid;
+  v_res    jsonb;
+  v_ok     boolean;
+  v_status text;
+  v_state  text;
+  v_t      constant timestamptz := '2026-09-11T05:00:00Z';   -- 10:30 IST, inside the window
+begin
+  v_eng  := _policy_tests.phone_fixture('pol92-legacy-a', 'scheduled');
+  v_eng2 := _policy_tests.phone_fixture('pol92-legacy-b', 'scheduled');
+
+  alter table screening_v2.phone_appointments disable trigger trg_phone_appointment_window;
+  insert into screening_v2.phone_appointments
+    (engagement_id, starts_at, ends_at, ist_date, status, source)
+  values (v_eng, '2026-09-10T21:30:00Z', '2026-09-10T22:00:00Z',   -- 03:00–03:30 IST 09-11
+          date '2026-09-11', 'scheduled', 'hr_manual')
+  returning id into v_apt;
+  -- The second legacy slot sits a day LATER (03:00 IST 09-12), so the expiry
+  -- sweep at v_t (10:30 IST 09-11) must leave it alone and HR can cancel it.
+  insert into screening_v2.phone_appointments
+    (engagement_id, starts_at, ends_at, ist_date, status, source)
+  values (v_eng2, '2026-09-11T21:30:00Z', '2026-09-11T22:00:00Z',  -- 03:00–03:30 IST 09-12
+          date '2026-09-12', 'scheduled', 'hr_manual')
+  returning id into v_apt2;
+  alter table screening_v2.phone_appointments enable trigger trg_phone_appointment_window;
+
+  perform _policy_tests.assert(
+    '0092: the legacy slots are indeed outside the restored window (fixture sanity)',
+    not screening_v2.phone_ist_window_open('2026-09-10T21:30:00Z'),
+    'fixture instant unexpectedly inside the window');
+
+  -- A status-only transition passes the trigger.
+  begin
+    update screening_v2.phone_appointments set status = 'confirmed', version = version + 1
+     where id = v_apt;
+    v_ok := true;
+  exception when others then
+    v_ok := false;
+  end;
+  perform _policy_tests.assert(
+    '0092: a status-only UPDATE of a legacy after-hours slot is NOT re-validated against the window',
+    v_ok, 'the trigger still re-litigates starts_at on every write');
+
+  -- Moving the slot to another after-hours instant is still refused.
+  begin
+    update screening_v2.phone_appointments
+       set starts_at = '2026-09-11T21:30:00Z', ends_at = '2026-09-11T22:00:00Z'
+     where id = v_apt;
+    v_ok := false;
+  exception when others then
+    v_ok := sqlerrm like '%outside the approved IST calling window%';
+  end;
+  perform _policy_tests.assert(
+    '0092: moving a slot to an after-hours instant is still rejected by the trigger',
+    v_ok, 'narrowing the trigger must not disable slot validation');
+
+  -- The expiry sweep processes the legacy row instead of aborting.
+  v_res := screening_v2.expire_phone_appointments(0, 50, v_t);
+  select status into v_status from screening_v2.phone_appointments where id = v_apt;
+  select state  into v_state  from screening_v2.phone_engagements  where id = v_eng;
+  perform _policy_tests.assert(
+    '0092: expire_phone_appointments sweeps a legacy after-hours slot to missed and frees the engagement',
+    v_res->>'status' = 'ok' and v_status = 'missed' and v_state = 'eligible',
+    'res=' || coalesce(v_res::text, '<null>') || ' status=' || coalesce(v_status, '<null>')
+      || ' state=' || coalesce(v_state, '<null>'));
+  select status into v_status from screening_v2.phone_appointments where id = v_apt2;
+  perform _policy_tests.assert(
+    '0092: the sweep did not touch the legacy slot that is not yet due',
+    v_status = 'scheduled', 'status=' || coalesce(v_status, '<null>'));
+
+  -- HR can still cancel the other one.
+  v_res := screening_v2.cancel_phone_appointment(v_apt2, 'hr_cancelled',
+             '00000000-0000-4000-8000-0000000000ad', null, v_t);
+  select status into v_status from screening_v2.phone_appointments where id = v_apt2;
+  perform _policy_tests.assert(
+    '0092: cancel_phone_appointment still works on a legacy after-hours slot',
+    v_res->>'status' = 'ok' and v_status = 'cancelled',
+    'res=' || coalesce(v_res::text, '<null>') || ' status=' || coalesce(v_status, '<null>'));
+
+  -- The migration's own repair pass left no live after-hours rows behind.
+  perform _policy_tests.assert(
+    '0092: no live appointment starts outside the restored window after the repair pass',
+    not exists (
+      select 1 from screening_v2.phone_appointments
+       where status in ('scheduled', 'confirmed')
+         and not screening_v2.phone_ist_window_open(starts_at)),
+    'the 0092 repair block missed a row, or a writer can still book after hours');
+
+  perform _policy_tests.phone_teardown('pol92-legacy-a');
+  perform _policy_tests.phone_teardown('pol92-legacy-b');
+end;
+$$;
 
 -- The day rolls at IST midnight, not at UTC midnight. 18:29:59Z is
 -- 23:59:59 IST; one second later is the next IST day while UTC has not

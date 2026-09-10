@@ -1505,14 +1505,27 @@ describe('the due pass refuses outside 09:00-inclusive / 21:00-exclusive IST aft
     });
   }
 
-  it('offers a due engagement at midnight during the temporary window', async () => {
+  it('offered a due engagement at midnight during the temporary window (last 24/7 instant, 2026-09-09 23:59:59 IST)', async () => {
     const h = harness({ due: [engagement({ nextEligibleAt: null })] });
     const result = await runPhoneDuePass(h.deps, {
-      now: new Date('2026-09-13T18:29:59.000Z'),
+      now: new Date('2026-09-09T18:29:59.000Z'),
       limit: 10,
     });
     expect(result.skipped.outside_ist_window ?? 0).toBe(0);
     expect(h.calls.dial).toBe(1);
+  });
+
+  it('one second later — 00:00 IST on 2026-09-10 — the same engagement is skipped as outside the window', async () => {
+    // 0092 ended the testing allowance: the very next instant is governed by
+    // the permanent 09:00–21:00 IST bounds, and the due-loop preflight (which
+    // consults the TS mirror) must agree with SQL about that.
+    const h = harness({ due: [engagement({ nextEligibleAt: null })] });
+    const result = await runPhoneDuePass(h.deps, {
+      now: new Date('2026-09-09T18:30:00.000Z'),
+      limit: 10,
+    });
+    expect(result.skipped.outside_ist_window ?? 0).toBe(1);
+    expect(h.calls.dial).toBe(0);
   });
 
   it('the window is checked AFTER the halt, so a halted lane reports halted', async () => {
