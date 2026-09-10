@@ -4722,6 +4722,34 @@ async def run_phone_gate(
         spoken.append(text)
         await say(text)
 
+    async def _terminal_outcome(
+        decision: str, *, schema: str | None = None,
+    ) -> PhoneGateResult:
+        """Post the outcome event, speak its closing, and return the result.
+
+        THE ONE implementation of the non-human terminal, shared by the
+        post-consent outcomes and the 0095 identity-mismatch hang-up. It exists
+        because the second caller was originally a hand-copy of the first, and
+        the copy was wrong in two ways within a single edit.
+
+        It deliberately does NOT commit the gate transcript: the post-consent
+        outcomes have never done so, and a caller that needs to commit does it
+        explicitly before calling here.
+        """
+        event_type = _OUTCOME_EVENT.get(decision)
+        if event_type is not None:
+            outcome = await client.post_event(attempt_id, event_type, epoch=epoch)
+            if event_applied(outcome):
+                events.append(event_type)
+        closing = _OUTCOME_CLOSING.get(decision)
+        if closing is not None:
+            await _say(closing)
+        _log.info(
+            "unknown_event", error_type="phone_gate_outcome",
+            schema=schema or decision,
+        )
+        return PhoneGateResult(decision, events=events, spoken=spoken)
+
     async def _commit_gate_turns() -> None:
         """Persist the gate transcript once, best effort. Never fails the gate.
 
@@ -4949,22 +4977,24 @@ async def run_phone_gate(
         # speaks `PHONE_WRONG_NUMBER_TEXT` and suppresses the number, which is
         # exactly the right outcome for a line that does not reach the
         # candidate. No new vocabulary, no new closing copy.
-        decision = CLASSIFY_WRONG_NUMBER
-        event = _OUTCOME_EVENT.get(decision)
-        if event is not None:
-            posted = await _post(event)
-            if event_applied(posted):
-                events.append(event)
-        closing = _OUTCOME_CLOSING.get(decision)
-        if closing:
-            await _say(closing)
-            spoken.append(closing)
+        #
+        # Routed through `_terminal_outcome` rather than a second copy of that
+        # block. An earlier draft DID copy it, and the copy immediately drifted
+        # in two ways a reviewer caught and the test suite could not: it called
+        # a `_post` that does not exist in this scope (a NameError on the only
+        # path that reaches it) and it appended to `spoken` a second time, which
+        # `_say` had already done.
+        #
+        # The gate transcript IS committed here, unlike the post-consent
+        # non-human outcomes which deliberately commit nothing. The difference
+        # is that those have only the disclosure to record, while this path has
+        # a real exchange — the identity ask, the candidate's name, the re-ask
+        # and their confirmation — and that exchange is the entire evidence for
+        # why a number was suppressed.
         await _commit_gate_turns()
-        _log.info(
-            "unknown_event", error_type="phone_gate_outcome",
-            error_category=decision, schema="identity_mismatch_confirmed",
+        return await _terminal_outcome(
+            CLASSIFY_WRONG_NUMBER, schema="identity_mismatch_confirmed",
         )
-        return PhoneGateResult(decision, events=events, spoken=spoken)
 
     # ── The opening: model-generated-and-verified, or the fixed disclosure ─
     if speak_opening is not None:
@@ -5066,18 +5096,7 @@ async def run_phone_gate(
         decision = CLASSIFY_MACHINE
 
     if decision != CLASSIFY_HUMAN:
-        event_type = _OUTCOME_EVENT[decision]
-        outcome = await client.post_event(
-            attempt_id, event_type, epoch=epoch,
-        )
-        if event_applied(outcome):
-            events.append(event_type)
-        closing = _OUTCOME_CLOSING.get(decision)
-        if closing is not None:
-            await _say(closing)
-        _log.info(
-            "unknown_event", error_type="phone_gate_outcome", schema=decision,
-        )
+        return await _terminal_outcome(decision)
         return PhoneGateResult(decision, events=events, spoken=spoken)
 
     # The raw consent utterance the classifier consumed to decide HUMAN, threaded
