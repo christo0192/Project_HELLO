@@ -189,6 +189,7 @@
         "PHONE_BOUNCE_MODE": { "requiredInProduction": false, "secret": false },
         "PHONE_DETERMINISTIC_OPENER": { "requiredInProduction": false, "secret": false },
         "PHONE_GATE_FLOW": { "requiredInProduction": false, "secret": false },
+        "PHONE_IDENTITY_MISMATCH_SUPPRESSES": { "requiredInProduction": false, "secret": false },
         "PHONE_TURN_MODE": { "requiredInProduction": false, "secret": false },
         "PHONE_GENERATIVE_OBJECTIVE_GUARD": { "requiredInProduction": false, "secret": false },
         "PHONE_REPLY_TOKEN_STREAMING": { "requiredInProduction": false, "secret": false },
