@@ -194,27 +194,50 @@ function TagGroup({
   srPrefix,
   items,
   tone,
+  block = false,
 }: {
   label: string;
   srPrefix: string;
   items: string[];
   tone: 'positive' | 'caution' | 'negative';
+  /**
+   * `block` stacks each item as a full-width rounded rectangle for LONG items
+   * (gaps, red flags) that wrap to two or three lines; the default lays SHORT
+   * items (matched skills) out as inline pills. The label sits above the items
+   * either way, so a narrow column gives the items its full width instead of
+   * cramping them beside a fixed label.
+   */
+  block?: boolean;
 }) {
   return (
-    <div className="flex flex-wrap items-baseline gap-x-3 gap-y-1.5">
-      <p className="w-28 shrink-0 text-xs font-medium text-[var(--c-ink-secondary)]">
-        {label}
-      </p>
+    <div className="min-w-0">
+      <p className="mb-1.5 text-xs font-medium text-[var(--c-ink-secondary)]">{label}</p>
       {items.length === 0 ? (
         <p className="text-xs text-[var(--c-ink-secondary)]">None</p>
-      ) : (
-        <div className="flex min-w-0 flex-wrap gap-1.5">
-          {items.map((item) => (
-            <Tag key={item} tone={tone} srPrefix={srPrefix}>
-              {item}
-            </Tag>
+      ) : block ? (
+        // A real list so a screen reader announces the count and lets the user
+        // move item-to-item; `role="list"` is kept because the palette resets
+        // list-style, which otherwise strips list semantics in Safari/VoiceOver.
+        // Keys are index-composite so a model that repeats an item never collides.
+        <ul role="list" className="space-y-1.5">
+          {items.map((item, i) => (
+            <li key={`${i}-${item}`}>
+              <Tag tone={tone} srPrefix={srPrefix} block>
+                {item}
+              </Tag>
+            </li>
           ))}
-        </div>
+        </ul>
+      ) : (
+        <ul role="list" className="flex min-w-0 flex-wrap gap-1.5">
+          {items.map((item, i) => (
+            <li key={`${i}-${item}`}>
+              <Tag tone={tone} srPrefix={srPrefix}>
+                {item}
+              </Tag>
+            </li>
+          ))}
+        </ul>
       )}
     </div>
   );
@@ -463,12 +486,14 @@ export function CandidateScorecard({
                 srPrefix="Gap:"
                 items={role_fit.gaps}
                 tone="caution"
+                block
               />
               <TagGroup
                 label="Red flags"
                 srPrefix="Red flag:"
                 items={role_fit.red_flags}
                 tone="negative"
+                block
               />
             </SurfaceCard>
           </Group>
@@ -490,17 +515,26 @@ export interface CandidateScorecardRoleFitProps {
   assessment: Assessment;
   headingLevel?: HeadingLevel;
   className?: string;
+  /**
+   * `supplementary` renders the role fit as a pure matched-skills / gaps /
+   * red-flags summary — no fit-score meter and no weight badge. Used by the v2
+   * (role-scorecard) card, where the recruiter-configured metrics carry the
+   * weighted verdict and a second generic 0–10 "fit score" would only compete
+   * with it. Default (`false`) keeps the v1 fit-score + weight exactly as before.
+   */
+  supplementary?: boolean;
 }
 
 /**
- * Role fit as a full-width horizontal row: fit-score meter on the left, the
- * three tag groups side by side, notes beneath. Rendered by hosts that pass
- * `roleFit="none"` to the scorecard.
+ * Role fit as a full-width row: the matched-skills / gaps / red-flags summary,
+ * with (for v1) a fit-score meter on the left and a weight badge. Rendered by
+ * hosts that pass `roleFit="none"` to the scorecard.
  */
 export function CandidateScorecardRoleFit({
   assessment,
   headingLevel = 3,
   className,
+  supplementary = false,
 }: CandidateScorecardRoleFitProps) {
   const headingId = useId();
   const { role_fit } = assessment;
@@ -510,28 +544,36 @@ export function CandidateScorecardRoleFit({
         <Heading level={headingLevel} id={headingId} className={CARD_TITLE}>
           Role fit
         </Heading>
-        <span className="text-xs text-[var(--c-ink-secondary)]">
-          Weight{' '}
-          <span className="font-mono tabular-nums text-[var(--c-ink-secondary)]">
-            {SECTION_WEIGHTS.role_fit}
+        {!supplementary && (
+          <span className="text-xs text-[var(--c-ink-secondary)]">
+            Weight{' '}
+            <span className="font-mono tabular-nums text-[var(--c-ink-secondary)]">
+              {SECTION_WEIGHTS.role_fit}
+            </span>
           </span>
-        </span>
+        )}
       </div>
-      <div className="grid grid-cols-1 items-start gap-4 lg:grid-cols-[14rem_minmax(0,1fr)]">
-        <Meter label="Fit score" value={role_fit.score} />
-        <SurfaceCard level="sunken" className="grid grid-cols-1 gap-3 p-3 sm:grid-cols-3">
+      <div
+        className={cx(
+          'grid grid-cols-1 items-start gap-4',
+          !supplementary && 'lg:grid-cols-[14rem_minmax(0,1fr)]',
+        )}
+      >
+        {!supplementary && <Meter label="Fit score" value={role_fit.score} />}
+        <SurfaceCard level="sunken" className="grid grid-cols-1 gap-4 p-3 sm:grid-cols-3">
           <TagGroup
             label="Matched skills"
             srPrefix="Matched skill:"
-            items={role_fit.matched_skills}
+            items={role_fit.matched_skills ?? []}
             tone="positive"
           />
-          <TagGroup label="Gaps" srPrefix="Gap:" items={role_fit.gaps} tone="caution" />
+          <TagGroup label="Gaps" srPrefix="Gap:" items={role_fit.gaps ?? []} tone="caution" block />
           <TagGroup
             label="Red flags"
             srPrefix="Red flag:"
-            items={role_fit.red_flags}
+            items={role_fit.red_flags ?? []}
             tone="negative"
+            block
           />
         </SurfaceCard>
       </div>

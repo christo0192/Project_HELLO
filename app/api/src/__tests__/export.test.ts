@@ -372,6 +372,31 @@ describe('GET /api/export/:candidateId/csv — v2 scorecard columns (Phase 6)', 
     // Compact per-metric representation: key=score pairs; unscored → n/a.
     expect(v2.metric_scores).toBe('communication=4; problem_solving=n/a');
   });
+
+  it('exports the supplementary integrity role_fit score for a v2 row (fourth-carrier guard)', async () => {
+    // Since the v2 scorer was extended, a v2 row can carry an integrity-derived
+    // role_fit. The export's role_fit column is populated for BOTH versions, so
+    // this asserts that behavior is intentional: the v2 role_fit fit-score exports
+    // while the true v1-only dimensions (english/tone/…) stay empty.
+    const V2_WITH_ROLEFIT = {
+      ...V2_ROW,
+      role_fit: { score: 4, matched_skills: ['Python'], gaps: [], red_flags: ['x'], notes: 'weak' },
+    };
+    mockFrom
+      .mockReturnValueOnce(chainable({ data: { owner_id: RECRUITER_ID, status: 'screened' }, error: null }))
+      .mockReturnValueOnce(chainable({ data: [V2_WITH_ROLEFIT], error: null }))
+      .mockReturnValueOnce(chainable({ data: [], error: null }))
+      .mockReturnValueOnce(chainable({ data: null, error: null }));
+    const res = await request(makeApp(makeUser('interviewer')))
+      .get(`/api/export/${CANDIDATE_ID}/csv`)
+      .set(AUTH);
+    expect(res.status).toBe(200);
+    const v2 = parseScorecardRows(res.text).find((r) => r.assessment_id === V2_ID)!;
+    expect(v2.schema_version).toBe('2');
+    expect(v2.role_fit).toBe('4'); // integrity fit-score exported for v2
+    expect(v2.english).toBe(''); // true v1-only dimensions remain empty for v2
+    expect(v2.tone).toBe('');
+  });
 });
 
 describe('lib/export-csv — formula injection neutralization', () => {

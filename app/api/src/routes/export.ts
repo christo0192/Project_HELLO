@@ -164,12 +164,16 @@ exportRouter.get(
           turn_index: '',
           speaker: '',
           transcript_text: '',
-          // v1 dimension scores: populated for v1 rows; null (→ empty) for v2 rows,
-          // which invent no v1 sub-scores.
+          // v1 SCORING dimensions: populated for v1 rows; empty for v2 rows, which
+          // invent no v1 sub-scores.
           english: extractScore(a.english),
           tone: extractScore(a.tone),
           communication: extractScore(a.communication),
           motivation: extractScore(a.motivation),
+          // role_fit is populated for BOTH versions: the v1 dimension for v1 rows,
+          // and (since the scorer was extended) the supplementary integrity fit
+          // score 0–10 for v2 rows. It is a SEPARATE signal from the v2 weighted
+          // verdict, which rides in overall_score / recommendation / weighted_score_5.
           role_fit: extractScore(a.role_fit),
           // Populated for BOTH schema versions (the v2 scorer writes overall_score
           // and recommendation too).

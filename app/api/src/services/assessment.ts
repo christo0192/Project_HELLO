@@ -9,6 +9,7 @@ import type { Assessment, TranscriptTurn } from '../lib/types.js';
 import { scoringProvenance } from '../lib/model-provenance.js';
 import { loadActiveRoleScorecard } from '../lib/scorecards/store.js';
 import { scoreWithScorecard } from '../lib/scorecards/scorer.js';
+import { analyzeResumeIntegrity } from '../lib/scorecards/integrity.js';
 import {
   createPhoneStores,
   createPhoneReadStore,
@@ -364,6 +365,26 @@ async function runAssessmentImpl(
     recommendationValue = scored.recommendation;
     isProvisionalRecommendation = scored.status === 'incomplete_evidence';
     assessmentForReturn = scored as unknown as Assessment;
+    // Supplementary résumé-integrity + role-fit signals. FAIL-SOFT by contract
+    // (analyzeResumeIntegrity never throws — a provider/parse failure returns
+    // empty), so it can never block a scorecard that already scored. Persisted
+    // into the same v1-shaped resume_conflicts / role_fit columns the candidate
+    // card already reads, so a v2 screening surfaces résumé conflicts and the
+    // matched-skills / gaps / red-flags summary too.
+    //
+    // Skipped entirely when the candidate said nothing (no candidate turns):
+    // there is nothing to assess, it avoids fabricated flags from thin input,
+    // and it saves a wasted provider call. NOTE: this second call shares the one
+    // provider circuit breaker with the fail-CLOSED metric scorer, so it roughly
+    // doubles per-v2-screening provider pressure; that is an accepted trade-off
+    // for a queued, retryable, fail-soft supplementary signal (skipping the
+    // no-input case keeps the extra volume off degenerate screenings).
+    const integrity = transcript.some((turn) => turn.speaker !== 'bot')
+      ? await analyzeResumeIntegrity(
+          {},
+          { roleTitle, candidateName, transcript, resumeFacts, callTimestampIso },
+        )
+      : { roleFit: null, resumeConflicts: [] };
     basePayload = {
       session_id: sessionId,
       candidate_id: session.candidate_id,
@@ -391,9 +412,16 @@ async function runAssessmentImpl(
       // satisfies the CHECK. 'human_review' (incomplete evidence) is therefore
       // stored NULL in the column and preserved truthfully in `raw`.
       recommendation: scored.recommendation === 'human_review' ? null : scored.recommendation,
-      // The v1 dimension columns (english/tone/communication/motivation/
-      // role_fit/summary/resume_conflicts) are all NULLABLE and are left unset
-      // on purpose — a v2 row invents no v1 sub-scores.
+      // The v1 SCORING dimensions (english/tone/communication/motivation/summary)
+      // are NULLABLE and left unset — a v2 row invents no v1 sub-scores. The two
+      // cross-cutting integrity signals ARE populated (v1-shaped) when the
+      // supplementary analysis found anything, so the candidate card can render
+      // the résumé-conflicts and role-fit (matched skills / gaps / red flags)
+      // sections for a v2 screening; omitted (columns stay null) when it found none.
+      ...(integrity.roleFit ? { role_fit: integrity.roleFit } : {}),
+      ...(integrity.resumeConflicts.length > 0
+        ? { resume_conflicts: integrity.resumeConflicts }
+        : {}),
       raw: scored, // full v2 object (mirrors v1's "raw = full result" contract)
       provenance: scoringProvenanceValue, // LLM-06 provenance — required, fail closed if missing
     };

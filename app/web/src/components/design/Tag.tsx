@@ -37,15 +37,26 @@ export interface TagProps {
   tone?: TagTone;
   /** Screen-reader-only classification, e.g. "Gap:" before the skill name. */
   srPrefix?: string;
+  /**
+   * A tinted, ringed CHIP for a SHORT label by default (`inline-flex`,
+   * fully-rounded, single line). Set `block` for a LONG, wrapping item (a gap or
+   * a red flag): the same tint + ring, but a block-level rounded RECTANGLE with
+   * room to breathe and normal wrapping — a fully-rounded pill with `py-0.5`
+   * cramps and overflows once its text wraps to two or three lines.
+   */
+  block?: boolean;
   className?: string;
   children: ReactNode;
 }
 
-export function Tag({ tone = 'neutral', srPrefix, className, children }: TagProps) {
+export function Tag({ tone = 'neutral', srPrefix, block = false, className, children }: TagProps) {
   return (
     <span
       className={cx(
-        'inline-flex items-center rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 ring-inset',
+        'text-xs font-medium ring-1 ring-inset',
+        block
+          ? 'block rounded-lg px-2.5 py-1.5 leading-snug'
+          : 'inline-flex items-center rounded-full px-2.5 py-0.5',
         toneStyles[tone],
         className,
       )}
