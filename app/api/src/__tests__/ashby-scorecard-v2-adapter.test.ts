@@ -75,11 +75,14 @@ describe('scorecardSourceFromV2Assessment — happy path', () => {
     expect(isV2AdapterBlocked(result)).toBe(false);
     if (isV2AdapterBlocked(result)) return;
 
-    // english 5 → 10, communication 3 → 6 (score * 2).
+    // english 5 → 10, communication 3 → 6 (score * 2). Each dimension also
+    // carries the metric NAME (what the auto-binder matches to a form field
+    // title) and the raw 1–5 score (submitted 1:1 on a five-point field).
     expect(result.dimensions).toEqual([
-      { key: 'english', score: 10 },
-      { key: 'communication', score: 6 },
+      { key: 'english', score: 10, name: 'Metric english', metricScore: 5 },
+      { key: 'communication', score: 6, name: 'Metric communication', metricScore: 3 },
     ]);
+    expect(result.schemaVersion).toBe(2);
     expect(METRIC_SCORE_TO_DIMENSION_FACTOR).toBe(2);
   });
 
@@ -111,10 +114,14 @@ describe('scorecardSourceFromV2Assessment — happy path', () => {
     }
   });
 
-  it('produces a bounded count summary and carries provenance + reviewPath', () => {
+  it('produces the recruiter-facing rich summary (one line per metric) and carries provenance + reviewPath', () => {
     const result = scorecardSourceFromV2Assessment(v2Row(), { reviewPath: REVIEW_PATH });
     if (isV2AdapterBlocked(result)) throw new Error('unexpected block');
-    expect(result.summary).toBe('2 metrics scored; weighted 4/5.');
+    expect(result.summary).toBe(
+      'AI phone screen — weighted 4/5 across 2 metrics.\n'
+      + 'Metric english — 5/5: rationale for english\n'
+      + 'Metric communication — 3/5: rationale for communication',
+    );
     expect(result.provenance).toEqual({
       model: 'deepseek-v4-pro',
       scoredAt: '2026-09-09T00:00:00Z',
@@ -179,32 +186,55 @@ describe('scorecardSourceFromV2Assessment — omission & redaction', () => {
     });
     const result = scorecardSourceFromV2Assessment(row, { reviewPath: REVIEW_PATH });
     if (isV2AdapterBlocked(result)) throw new Error('unexpected block');
-    expect(result.dimensions).toEqual([{ key: 'english', score: 10 }]);
+    expect(result.dimensions).toEqual([{ key: 'english', score: 10, name: 'Metric english', metricScore: 5 }]);
     expect(result.dimensions.some((d) => d.key === 'motivation')).toBe(false);
+    // …but the recruiter is TOLD it was considered and why it has no score.
+    expect(result.summary).toContain('Metric motivation — not scored (insufficient evidence): rationale for motivation');
   });
 
-  it('never leaks metric name, rationale, or evidence refs into the source', () => {
+  it('never leaks evidence refs; rationale appears ONLY in the summary; the name only on its dimension', () => {
+    // Owner decision (#275): the Summary field carries the per-metric
+    // rationales — that is the recruiter-facing "why". Evidence refs (transcript
+    // turn ids, recording clips) are still never copied anywhere.
     const row = v2Row({
       metric_results: [
         metricResult('english', 5, {
-          rationale: 'SECRET_RATIONALE candidate mentioned the raw transcript',
-          name: 'reasoning dump name',
+          rationale: 'RATIONALE_ONE candidate gave two concrete examples',
+          name: 'Display Name One',
           evidenceRefs: ['recording://clip-1', 'turn-42'],
         }),
-        metricResult('communication', 3, { rationale: 'more SECRET_RATIONALE text' }),
+        metricResult('communication', 3, { rationale: 'RATIONALE_TWO text' }),
       ],
     });
     const result = scorecardSourceFromV2Assessment(row, { reviewPath: REVIEW_PATH });
     if (isV2AdapterBlocked(result)) throw new Error('unexpected block');
 
     const serialized = JSON.stringify(result);
-    expect(serialized).not.toContain('SECRET_RATIONALE');
-    expect(serialized).not.toContain('reasoning dump');
     expect(serialized).not.toContain('recording://');
     expect(serialized).not.toContain('turn-42');
-    expect(serialized).not.toContain('transcript');
+    expect(serialized).not.toContain('evidenceRefs');
+    // Rationale text lives in the summary and nowhere else.
+    expect(result.summary).toContain('RATIONALE_ONE');
+    expect(JSON.stringify({ ...result, summary: '' })).not.toContain('RATIONALE_ONE');
+    // The name rides on its dimension (for the auto-binder) and in the summary.
+    expect(result.dimensions[0].name).toBe('Display Name One');
     // Forbidden-key scan passes and the payload builds.
     expect(isScorecardSafe(result)).toBe(true);
+    expect(buildScorecard(result, SCALE).ok).toBe(true);
+  });
+
+  it('bounds an over-long rationale and control characters, and keeps the summary under the field budget', () => {
+    const long = 'x'.repeat(2_000);
+    const row = v2Row({
+      metric_results: Array.from({ length: 12 }, (_, i) => metricResult(`m${i}`, 4, { rationale: `${long}\u0000\n\ttail` })),
+    });
+    const result = scorecardSourceFromV2Assessment(row, { reviewPath: REVIEW_PATH });
+    if (isV2AdapterBlocked(result)) throw new Error('unexpected block');
+    expect(result.summary.length).toBeLessThanOrEqual(2_000);
+    expect(result.summary).not.toContain('\u0000');
+    expect(result.summary.startsWith('AI phone screen — weighted 4/5 across 12 metrics.')).toBe(true);
+    // Whole lines only — every line that made it in ends with the ellipsis of a bounded rationale.
+    for (const line of result.summary.split('\n').slice(1)) expect(line.endsWith('…')).toBe(true);
     expect(buildScorecard(result, SCALE).ok).toBe(true);
   });
 });

@@ -38,9 +38,15 @@ makes **no** claim of tenant validation or live Ashby connectivity.
 ## Endpoints (for tenant probing only)
 
 `application.info`, `application.list`, `candidate.info`, `file.info`,
-`jobInterviewPlan.info`, `applicationFeedback.list`,
-`applicationFeedbackRequest.create`, `applicationFeedback.submit`, and
-`application.changeStage`.
+`jobInterviewPlan.info`, `feedbackFormDefinition.info`,
+`applicationFeedback.list`, `applicationFeedbackRequest.create`,
+`applicationFeedback.submit`, and `application.changeStage`.
+
+`feedbackFormDefinition.info` (read; needs the `hiringProcessMetadataRead`
+scope) returns one form's STRUCTURE — sections, fields, types, paths, and
+Score scales — and is what the v2 scorecard auto-binder and the Mission
+Control binding preview read (`docs/runbooks/ashby-scorecard-fields.md`). It
+returns no submitted feedback.
 
 `candidate.info` takes the candidate identifier as `id` on the wire (with an
 optional `externalMappingId`); the helper argument is still named `candidateId`

@@ -68,6 +68,7 @@ export type AshbyOperation =
   | 'candidate.info'
   | 'file.info'
   | 'jobInterviewPlan.info'
+  | 'feedbackFormDefinition.info'
   | 'applicationFeedback.list'
   | 'applicationFeedbackRequest.create'
   | 'applicationFeedback.submit'
@@ -91,6 +92,10 @@ export const ASHBY_OPERATIONS: Readonly<Record<AshbyOperation, AshbyOperationSpe
   'candidate.info':                    { path: '/candidate.info',                    mutation: false },
   'file.info':                         { path: '/file.info',                         mutation: false },
   'jobInterviewPlan.info':             { path: '/jobInterviewPlan.info',             mutation: false },
+  // Form STRUCTURE only (sections/fields/types/scales). Read by the scorecard
+  // auto-binder and the Mission Control binding preview; never returns any
+  // submitted feedback content.
+  'feedbackFormDefinition.info':       { path: '/feedbackFormDefinition.info',       mutation: false },
   'applicationFeedback.list':          { path: '/applicationFeedback.list',          mutation: false },
   'applicationFeedbackRequest.create': { path: '/applicationFeedbackRequest.create', mutation: true },
   'applicationFeedback.submit':        { path: '/applicationFeedback.submit',        mutation: true },

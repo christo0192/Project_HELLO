@@ -1,7 +1,13 @@
 import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError } from '../api';
-import type { AshbyMcMapping, AshbyMcWorkflow, AshbyFeedbackForm } from '../types';
+import type {
+  AshbyMcMapping,
+  AshbyMcWorkflow,
+  AshbyFeedbackForm,
+  AshbyScorecardBindingPreview,
+  AshbyScorecardBindingPreviewResponse,
+} from '../types';
 import {
   Button,
   buttonClass,
@@ -89,6 +95,15 @@ export function AshbyMissionControlPage() {
     { jobId: string; forms: AshbyFeedbackForm[]; truncated: boolean } | null
   >(null);
   const [formError, setFormError] = useState<{ jobId: string; message: string } | null>(null);
+  /**
+   * Read-only scorecard binding preview for ONE mapping (issue #275). Same
+   * discipline as the schema panel: structure only, nothing is bound by
+   * viewing it.
+   */
+  const [bindingPreview, setBindingPreview] = useState<
+    { mappingId: string; scoringPath: NonNullable<AshbyScorecardBindingPreviewResponse['scoringPath']>; preview: AshbyScorecardBindingPreview } | null
+  >(null);
+  const [bindingError, setBindingError] = useState<{ mappingId: string; message: string } | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -184,6 +199,33 @@ export function AshbyMissionControlPage() {
       setFormError({
         jobId: externalJobId,
         message: e instanceof ApiError ? e.message : 'Could not read the feedback form',
+      });
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  /**
+   * Preview what a v2 scorecard write would bind for this mapping's role.
+   * Read-only end to end: the API performs one provider READ of the verified
+   * form definition plus two table reads, writes nothing, and this handler
+   * only renders the result.
+   */
+  const previewBinding = useCallback(async (mappingId: string) => {
+    setBusy(true);
+    setBindingError(null);
+    setBindingPreview(null);
+    try {
+      const res = await api.previewAshbyScorecardBinding(mappingId);
+      if (res.ok && res.preview && res.scoringPath) {
+        setBindingPreview({ mappingId, scoringPath: res.scoringPath, preview: res.preview });
+      } else {
+        setBindingError({ mappingId, message: bindingErrorCopy(res.error) });
+      }
+    } catch (e) {
+      setBindingError({
+        mappingId,
+        message: e instanceof ApiError ? e.message : 'Could not preview the scorecard binding',
       });
     } finally {
       setBusy(false);
@@ -398,6 +440,13 @@ export function AshbyMissionControlPage() {
                         >
                           Discover feedback form
                         </Button>
+                        <Button
+                          size="sm"
+                          disabled={busy}
+                          onClick={() => void previewBinding(m.id)}
+                        >
+                          Preview scorecard binding
+                        </Button>
                       </div>
                     </div>
 
@@ -409,6 +458,19 @@ export function AshbyMissionControlPage() {
 
                     {formSchema?.jobId === m.externalJobId && (
                       <FeedbackFormSchema forms={formSchema.forms} truncated={formSchema.truncated} />
+                    )}
+
+                    {bindingError?.mappingId === m.id && (
+                      <InlineNotice tone="danger" role="alert" className="mt-3">
+                        {bindingError.message}
+                      </InlineNotice>
+                    )}
+
+                    {bindingPreview?.mappingId === m.id && (
+                      <ScorecardBindingPreviewPanel
+                        scoringPath={bindingPreview.scoringPath}
+                        preview={bindingPreview.preview}
+                      />
                     )}
                   </li>
                 ))}
@@ -538,6 +600,156 @@ function FeedbackFormSchema({ forms, truncated }: { forms: AshbyFeedbackForm[]; 
             </li>
           ))}
         </ul>
+      )}
+    </div>
+  );
+}
+
+/** Sanitized API error code → HR-readable copy. Never echoes provider text. */
+function bindingErrorCopy(code: string | undefined): string {
+  switch (code) {
+    case 'integration_disabled':
+      return 'The Ashby integration is disabled, so the form definition cannot be read.';
+    case 'mapping_not_found':
+      return 'This mapping no longer exists.';
+    case 'binding_unverified':
+      return 'The scorecard form binding is not verified; write-back is closed.';
+    case 'probe_unavailable':
+      return 'Ashby did not return the feedback form definition. Check the API key scopes (hiringProcessMetadataRead) and that the form still exists.';
+    default:
+      return 'Could not preview the scorecard binding';
+  }
+}
+
+const METRIC_STATUS_COPY: Record<AshbyScorecardBindingPreview['metrics'][number]['status'], string> = {
+  bound: 'will be written',
+  no_field: 'no Score field with this title — add an optional Score field titled exactly like the metric',
+  ambiguous_title: 'more than one field carries this title — keep exactly one',
+  not_score_type: 'the field with this title is not a Score field — change its type to Score',
+  no_path: 'the field has no submission path — recreate it in Ashby',
+};
+
+const FIXED_FIELD_LABEL: Record<AshbyScorecardBindingPreview['fixedFields'][number]['name'], string> = {
+  overall: 'Overall recommendation',
+  summary: 'Summary',
+  redFlags: 'Red flags',
+  detailedReport: 'Detailed report',
+};
+
+/**
+ * Read-only rendering of the v2 scorecard binding preview (issue #275).
+ *
+ * Every value here is form STRUCTURE plus dashboard metric NAMES: paths,
+ * titles, types, scales. There is no submitted score, comment, or candidate
+ * field, and nothing is persisted or bound by viewing it. The rule it teaches
+ * is one sentence: for every metric a role scores, the form needs an optional
+ * Score field whose title equals the metric's name.
+ */
+function ScorecardBindingPreviewPanel({
+  scoringPath,
+  preview,
+}: {
+  scoringPath: NonNullable<AshbyScorecardBindingPreviewResponse['scoringPath']>;
+  preview: AshbyScorecardBindingPreview;
+}) {
+  const unbound = preview.metrics.filter((m) => m.status !== 'bound');
+  return (
+    <div className="glass-sunken mt-3 p-4">
+      <SectionHeader
+        level={3}
+        title="Scorecard binding preview — read-only"
+        description="What a v2 scorecard write would bind on the verified form, by metric name. Nothing is written or bound by viewing this."
+      />
+      <p className="mt-2 text-[13px] text-ink-secondary">
+        {preview.formTitle ?? 'Untitled form'}{' '}
+        <span className="font-mono text-ink-tertiary">form id: {preview.formDefinitionId}</span>
+      </p>
+
+      {scoringPath === 'no_role' && (
+        <InlineNotice tone="warning" className="mt-3">
+          This mapping has no dashboard role, so no metrics can be previewed.
+        </InlineNotice>
+      )}
+      {scoringPath === 'v1_legacy' && (
+        <InlineNotice tone="warning" className="mt-3">
+          This role has no active dashboard scorecard. Screenings use the fixed v1 binding; no name matching applies until a scorecard is activated.
+        </InlineNotice>
+      )}
+      {!preview.formMatchesBinding && (
+        <InlineNotice tone="danger" className="mt-3">
+          {preview.archived
+            ? 'The verified form is archived in Ashby. Scorecard writes will fail closed until it is restored.'
+            : 'The form definition read does not match the verified binding. Scorecard writes will fail closed.'}
+        </InlineNotice>
+      )}
+      {!preview.schemaAvailable && (
+        <InlineNotice tone="warning" className="mt-3">
+          Field-level schema was not available from this read — only the form id could be checked. This is not a claim that the form has no fields.
+        </InlineNotice>
+      )}
+
+      {scoringPath === 'v2_autobind' && (
+        <p className="mt-3 text-sm font-medium text-ink" data-testid="binding-readiness">
+          {preview.ready
+            ? 'Ready — every metric and every fixed field would be written.'
+            : unbound.length > 0
+              ? `${unbound.length} of ${preview.metrics.length} metric(s) would be omitted from the Ashby card.`
+              : 'Not ready — a fixed field is missing or mistyped.'}
+        </p>
+      )}
+
+      <p className="mt-3 text-[13px] font-medium text-ink-secondary">Fixed fields (verified binding)</p>
+      <ul className="mt-1 space-y-1">
+        {preview.fixedFields.map((f) => (
+          <li key={f.name} className="text-[13px] leading-5 text-ink-secondary">
+            {FIXED_FIELD_LABEL[f.name]}
+            {' — '}
+            <span className="font-mono">[{f.path}]</span>
+            {f.status === 'present' && ' · present'}
+            {f.status === 'missing' && (
+              <span className="text-error-text"> · missing on the form — writes will fail closed</span>
+            )}
+            {f.status === 'type_mismatch' && (
+              <span className="text-error-text">
+                {' · type changed to '}{f.actualType ?? 'unknown'}{' (expected '}{f.expectedType}{') — writes will fail closed'}
+              </span>
+            )}
+          </li>
+        ))}
+      </ul>
+
+      {scoringPath === 'v2_autobind' && (
+        <>
+          <p className="mt-3 text-[13px] font-medium text-ink-secondary">Metrics (bound by name)</p>
+          {preview.metrics.length === 0 ? (
+            <p className="mt-1 text-[13px] text-ink-tertiary">The active scorecard has no metrics.</p>
+          ) : (
+            <ul className="mt-1 space-y-1">
+              {preview.metrics.map((m) => (
+                <li key={m.key} className="text-[13px] leading-5 text-ink-secondary">
+                  <span className="text-ink">{m.name}</span>
+                  {m.status === 'bound' ? (
+                    <>
+                      {' → '}
+                      <span className="font-mono">[{m.fieldPath}]</span>
+                      {m.scale ? ` · ${m.scale.min}–${m.scale.max} scale` : ''}
+                      {' · '}{METRIC_STATUS_COPY.bound}
+                    </>
+                  ) : (
+                    <span className="text-warning-text">{' · '}{METRIC_STATUS_COPY[m.status]}</span>
+                  )}
+                </li>
+              ))}
+            </ul>
+          )}
+        </>
+      )}
+
+      {preview.unusedScoreFields.length > 0 && (
+        <p className="mt-3 text-[13px] text-ink-tertiary">
+          Score fields no metric claims (left empty on the card):{' '}
+          {preview.unusedScoreFields.map((u) => u.title ?? u.fieldId).join(', ')}
+        </p>
       )}
     </div>
   );

@@ -53,6 +53,38 @@ import {
 import { runReconciliation, DEFAULT_CHECKPOINT_KEY } from './reconciliation.js';
 import type { ReconcileResult, ReconcileSkipCounts, ReconcileStop } from './reconciliation.js';
 import { runAshbyOperationPass } from './operation-worker.js';
+import { probeFeedbackFormDefinition, type FormDefinitionReader, type ProbeFeedbackForm } from './probe.js';
+
+/**
+ * How long a form definition read is reused before it is fetched again. Long
+ * enough that a burst of scorecards costs one provider read; short enough that
+ * a recruiter who adds a metric field to the form sees it bind within minutes.
+ */
+export const FORM_DEFINITION_CACHE_MS = 5 * 60_000;
+
+const formDefinitionCache = new Map<string, { at: number; form: ProbeFeedbackForm | null }>();
+
+/**
+ * Cached, read-only form STRUCTURE for the scorecard auto-binder. A failed or
+ * empty read is NOT cached: the worker retries the operation later, and the
+ * next attempt must reach the provider again rather than replay the miss.
+ */
+export async function readFormDefinitionCached(
+  formDefinitionId: string,
+  reader: FormDefinitionReader,
+  nowMs: () => number = () => Date.now(),
+): Promise<ProbeFeedbackForm | null> {
+  const hit = formDefinitionCache.get(formDefinitionId);
+  if (hit && nowMs() - hit.at < FORM_DEFINITION_CACHE_MS) return hit.form;
+  const form = await probeFeedbackFormDefinition(formDefinitionId, reader);
+  if (form && form.schemaAvailable) formDefinitionCache.set(formDefinitionId, { at: nowMs(), form });
+  return form;
+}
+
+/** TEST SEAM: forget every cached definition. */
+export function __resetFormDefinitionCacheForTest(): void {
+  formDefinitionCache.clear();
+}
 import {
   materializeCandidate,
   materializeCandidateShell,
@@ -925,6 +957,10 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
             scorecard: {
               submit: (request) => runtime.client.applicationFeedbackSubmit(request),
               dashboardOrigin: (process.env.WEB_ORIGIN ?? '').split(',')[0]?.trim() ?? '',
+              // Read-only form STRUCTURE for the v2 auto-binder (#275). Cached
+              // briefly so a burst of scorecards costs one provider read.
+              readFormDefinition: (formDefinitionId) =>
+                readFormDefinitionCached(formDefinitionId, runtime.client),
             },
             resolveMappingForLink: runtime.resolveMappingForLink,
             reissuePathFor,

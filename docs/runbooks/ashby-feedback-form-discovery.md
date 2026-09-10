@@ -46,9 +46,13 @@ GET /jobs/{externalJobId}/feedback-form   (admin)
         └── extractFeedbackForms(results)             ← pure, no I/O
 ```
 
-`PROBE_READ_OPERATIONS` stays `['jobInterviewPlan.info']`. `assertReadOnly`
-rejects every mutating registry entry and every non-allowlisted read, so the
-module has no write seam to misuse.
+`PROBE_READ_OPERATIONS` is `['jobInterviewPlan.info', 'feedbackFormDefinition.info']`
+— the second was added for issue #275 so the scorecard auto-binder and the
+`Preview scorecard binding` control can read ONE form's definition directly
+(`probeFeedbackFormDefinition` / `extractFormDefinition`; see
+`docs/runbooks/ashby-scorecard-fields.md`). `assertReadOnly` rejects every
+mutating registry entry and every non-allowlisted read, so the module has no
+write seam to misuse.
 
 ### What the extractor returns
 

@@ -32,12 +32,25 @@ export interface ScorecardDimension {
   key: string;
   /** Raw 0–10 dimension score. */
   score: number;
+  /**
+   * v2 only: the metric's display name as configured in the dashboard. It is
+   * what the auto-binder matches against a form field's title. Never PII.
+   */
+  name?: string;
+  /**
+   * v2 only: the metric's own 1–5 rubric score. When the bound Score field is
+   * itself five-point the value is submitted 1:1 instead of re-bucketing the
+   * 0–10 projection (which would collapse 4 and 5 on a four-point field).
+   */
+  metricScore?: number;
 }
 
 /** Bounded, PII-light view the saga extracts from a persisted assessment. */
 export interface ScorecardSource {
   /** Opaque Ashby application id used only as the provider request identity. */
   externalApplicationId?: string;
+  /** 1 (legacy columns) or 2 (per-metric scorecard). Absent means 1. */
+  schemaVersion?: 1 | 2;
   /** Overall 0–100 score. */
   overallScore: number;
   /** Informational recommendation. */
@@ -150,7 +163,7 @@ export interface NormalizedScorecard {
   scaleValue: number;
   scale: ScorecardScale;
   recommendation: Recommendation;
-  dimensions: { key: string; score: number }[];
+  dimensions: { key: string; score: number; name?: string; metricScore?: number }[];
   summary: string;
   reviewPath: string;
   provenance: { model?: string; scoredAt?: string; version?: string };
@@ -327,7 +340,20 @@ export function buildScorecard(source: ScorecardSource, scale: ScorecardScale): 
   const dims = (source.dimensions ?? [])
     .filter((d) => d && typeof d.key === 'string' && d.key.length > 0)
     .slice(0, MAX_DIMENSIONS)
-    .map((d) => ({ key: d.key, score: Math.round(clampNum(d.score, 0, 10) * 100) / 100 }));
+    .map((d) => {
+      const out: NormalizedScorecard['dimensions'][number] = {
+        key: d.key,
+        score: Math.round(clampNum(d.score, 0, 10) * 100) / 100,
+      };
+      // v2 carriers, kept only when well-formed: a bounded display name and an
+      // integer 1–5 rubric score. Neither is PII; both are hashed into the
+      // marker below as part of the dimension list.
+      if (typeof d.name === 'string' && d.name.trim().length > 0) out.name = d.name.trim().slice(0, 100);
+      if (typeof d.metricScore === 'number' && Number.isInteger(d.metricScore) && d.metricScore >= 1 && d.metricScore <= 5) {
+        out.metricScore = d.metricScore;
+      }
+      return out;
+    });
   if (dims.length === 0) return { ok: false, reason: 'no_dimensions' };
 
   const recommendation: Recommendation = RECOMMENDATIONS.includes(source.recommendation)
@@ -419,8 +445,15 @@ export interface ScorecardFormBinding {
    * field takes a bare string, and only `RichText` takes a PlainText envelope.
    */
   fieldTypes?: { redFlags?: string; detailedReport?: string };
-  /** Verified Ashby Score scale for dimension fields. */
+  /** Verified Ashby Score scale for dimension fields (the default for every key). */
   dimensionScale?: ScorecardScale;
+  /**
+   * Per-dimension Score scales, keyed like `fieldPaths.dimensions`. Set by the
+   * auto-binder from each field's own definition so a five-point field and a
+   * four-point field on the same form each receive a value on ITS scale.
+   * A key absent here uses `dimensionScale`.
+   */
+  dimensionScales?: Record<string, ScorecardScale>;
 }
 
 /** The approved synthetic Hello Christy tenant binding. */
@@ -474,6 +507,32 @@ function mapDimensionToScale(score: number, scale: ScorecardScale): number {
   if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return min;
   const pct = clampNum(score, 0, 10) / 10;
   return min + Math.min(max - min, Math.floor(pct * (max - min + 1)));
+}
+
+/**
+ * The value submitted for one dimension on one field's scale.
+ *
+ * A v2 dimension carries the metric's own 1–5 rubric score; on a FIVE-point
+ * field it is submitted exactly (1→1 … 5→5). On any other scale — and for a
+ * v1 dimension, which has only its 0–10 projection — the projection is
+ * bucketed as before (on the verified four-point fields 1→1, 2→2, 3→3, and
+ * both 4 and 5 → 4).
+ */
+export function dimensionValueOnScale(
+  d: { score: number; metricScore?: number },
+  scale: ScorecardScale,
+): number {
+  const min = Math.round(scale.min);
+  const max = Math.round(scale.max);
+  if (
+    typeof d.metricScore === 'number'
+    && Number.isInteger(d.metricScore)
+    && min === 1 && max === 5
+    && d.metricScore >= 1 && d.metricScore <= 5
+  ) {
+    return d.metricScore;
+  }
+  return mapDimensionToScale(d.score, scale);
 }
 
 /**
@@ -538,7 +597,8 @@ export function bindFeedbackForm(
   for (const d of scorecard.dimensions) {
     const fieldKey = dimKeys[d.key];
     if (typeof fieldKey === 'string' && fieldKey.length > 0) {
-      fieldSubmissions.push({ path: fieldKey, value: { score: mapDimensionToScale(d.score, dimensionScale) } });
+      const scale = binding.dimensionScales?.[d.key] ?? dimensionScale;
+      fieldSubmissions.push({ path: fieldKey, value: { score: dimensionValueOnScale(d, scale) } });
     }
   }
   const feedbackForm: Record<string, unknown> = { fieldSubmissions };

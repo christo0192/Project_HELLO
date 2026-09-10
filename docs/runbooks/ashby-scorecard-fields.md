@@ -1,11 +1,69 @@
-# Runbook — Ashby scorecard `Detailed report` + `Red flags` fields
+# Runbook — Ashby scorecard fields (v2 metrics by name; `Detailed report` + `Red flags`)
 
 Scope: `app/api/src/integrations/ashby/scorecard.ts` (binding + normalization),
-`app/api/src/integrations/ashby/workflow-stores.ts` (the two `ScorecardSource`
-build sites), and the scorecard branch of
-`app/api/src/integrations/ashby/operation-worker.ts`.
+`scorecard-autobind.ts` (metric → Score field matching, #275),
+`scorecard-v2-adapter.ts` (v2 assessment → `ScorecardSource`),
+`workflow-stores.ts` (the `ScorecardSource` build site), the scorecard branch
+of `operation-worker.ts`, and the Mission Control preview route
+`GET /mappings/:id/scorecard-binding`.
 
-## What changed
+## v2 metrics bind to the form BY NAME (issue #275)
+
+**The rule for the Ashby form is one sentence:** for every metric a role's
+active scorecard can score, the form carries an **optional `Score` field whose
+title equals the metric's name** (`Profile relevance`, `Communication`,
+`Night-shift fit`, `Compensation fit`, `Stability`, …). Adding a metric in the
+dashboard then needs a form field and **no code change**.
+
+How a v2 `scorecard_write` runs (`operation-worker.ts`):
+
+1. `readScorecardSource` maps the v2 assessment row (`schema_version = 2`,
+   `metric_results`, `weighted_score_5`) through `scorecard-v2-adapter.ts`:
+   one dimension per metric, keyed by `metric.key`, carrying the metric `name`
+   and its 1–5 `metricScore`; the Summary becomes a per-metric report
+   (`"<Name> — <score>/5: <rationale>"`, unscored metrics say so); red flags
+   come from `role_fit.red_flags` as before. Evidence refs never leave the DB.
+   **Role fit rides along** (owner request): the v2 integrity pass (#282)
+   writes a v1-shaped `role_fit.score` (0–10); the adapter appends one extra
+   dimension named `Role fit` so the kept v1 `Role fit` Score field on the form
+   is filled by title, bucketed onto that field's scale exactly as v1 did.
+   Absent/non-numeric → omitted; a dashboard metric keyed `role_fit` wins.
+2. The worker reads the verified form's definition
+   (`feedbackFormDefinition.info`, cached 5 min in `runtime-workers.ts`,
+   misses never cached). Unreadable → `form_schema_unavailable`, **retryable**,
+   nothing submitted. A card with metrics silently dropped is never sent.
+3. `autobindScorecardDimensions` matches each metric name to exactly one
+   `Score` field by normalised title (NFKC, case-insensitive, punctuation and
+   separators collapsed — `Night-shift fit` = `night shift fit`). No field,
+   two fields with the title, a non-Score field, or a field without a path →
+   the metric is **unmatched and omitted**; the reason is emitted as a count
+   (`scorecard_autobind: matched_N_unmatched_M`), never as a name.
+4. `composeAutoboundBinding` keeps the four FIXED fields from the verified
+   static binding (they are never auto-bound) and replaces the dimension table
+   with the matched paths + each field's own scale. A definition for another
+   form id, or an archived form → `form_definition_mismatch`, **not**
+   retryable, nothing submitted.
+5. `bindFeedbackForm` writes each dimension on ITS field's scale
+   (`dimensionValueOnScale`): 1:1 when the field is five-point and a
+   `metricScore` exists, otherwise the pre-existing bucketing (on a four-point
+   field 5 → 4).
+
+v1 rows (`schema_version = 1`) are untouched: static binding, five fixed
+dimensions, no form read.
+
+**Before a candidate is scored**, an admin clicks `Preview scorecard binding`
+on the mapping in Ashby Mission Control. It performs the same read and shows,
+per metric, `bound → [path] · scale` or the exact fix (`add an optional Score
+field titled exactly like the metric`, `more than one field carries this
+title`, `not a Score field`), plus whether the four fixed fields are still
+present with their verified types. It writes and binds nothing; the audit row
+carries counts only. `scoringPath` is `v2_autobind`, `v1_legacy` (role has no
+active scorecard), or `no_role`.
+
+Unused v1 Score fields (`English`, `Tone`, `Motivation`, `Role fit`) may stay
+on the form; they are simply left empty on v2 cards.
+
+## What changed (Detailed report + Red flags)
 
 The approved Hello Christy feedback form binding now populates two further
 fields that already existed on the tenant's form and were previously left empty:

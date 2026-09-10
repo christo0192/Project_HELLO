@@ -1133,6 +1133,60 @@ export interface AshbyFeedbackFormResponse {
   error?: string;
 }
 
+/**
+ * Read-only preview of what a v2 scorecard write WOULD bind for one mapping's
+ * role (issue #275): metrics bind to form Score fields BY NAME at write time.
+ * Structure only — field paths, titles, types, scales. Never a submitted
+ * value or a candidate datum, and viewing it binds nothing.
+ */
+export type AshbyScorecardMetricBindStatus =
+  | 'bound'
+  | 'no_field'
+  | 'ambiguous_title'
+  | 'not_score_type'
+  | 'no_path';
+
+export interface AshbyScorecardFixedFieldCheck {
+  name: 'overall' | 'summary' | 'redFlags' | 'detailedReport';
+  path: string;
+  expectedType: string | null;
+  status: 'present' | 'missing' | 'type_mismatch';
+  actualType: string | null;
+}
+
+export interface AshbyScorecardMetricBindRow {
+  key: string;
+  name: string;
+  status: AshbyScorecardMetricBindStatus;
+  fieldPath: string | null;
+  scale: { min: number; max: number } | null;
+}
+
+export interface AshbyScorecardBindingPreview {
+  formDefinitionId: string;
+  formTitle: string | null;
+  schemaAvailable: boolean;
+  archived: boolean;
+  formMatchesBinding: boolean;
+  fixedFields: AshbyScorecardFixedFieldCheck[];
+  metrics: AshbyScorecardMetricBindRow[];
+  unusedScoreFields: Array<{ fieldId: string; title: string | null }>;
+  /** True only when every fixed field and EVERY metric would bind. */
+  ready: boolean;
+}
+
+export interface AshbyScorecardBindingPreviewResponse {
+  ok: boolean;
+  /**
+   * `v2_autobind` = the role has an active dashboard scorecard and metrics
+   * bind by name; `v1_legacy` = no active scorecard, the fixed v1 binding is
+   * used; `no_role` = the mapping carries no role.
+   */
+  scoringPath?: 'v2_autobind' | 'v1_legacy' | 'no_role';
+  preview?: AshbyScorecardBindingPreview;
+  error?: string;
+}
+
 export interface AshbyMcActionResponse {
   ok: boolean;
   status?: string;

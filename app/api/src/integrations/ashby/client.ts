@@ -474,6 +474,20 @@ export class AshbyClient {
     return this.request<T>('jobInterviewPlan.info', { jobId, ...(extra ?? {}) });
   }
 
+  /**
+   * Read ONE feedback form's definition — its sections, fields, types and
+   * scales. Structure only: the endpoint carries no submitted feedback. This is
+   * what lets the scorecard auto-binder match a role's metrics to the tenant's
+   * form fields by title at write time, instead of a hand-maintained id table.
+   */
+  async feedbackFormDefinitionInfo<T = OpaqueRecord>(
+    feedbackFormDefinitionId: string,
+    extra?: OpaqueRecord,
+  ): Promise<AshbyResult<T>> {
+    validateId('feedbackFormDefinition.info', 'feedbackFormDefinitionId', feedbackFormDefinitionId);
+    return this.request<T>('feedbackFormDefinition.info', { feedbackFormDefinitionId, ...(extra ?? {}) });
+  }
+
   async applicationFeedbackList<T = OpaqueRecord>(applicationId: string, extra?: OpaqueRecord): Promise<AshbyResult<T>> {
     validateId('applicationFeedback.list', 'applicationId', applicationId);
     return this.request<T>('applicationFeedback.list', { applicationId, ...(extra ?? {}) });
