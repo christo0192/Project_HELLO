@@ -545,7 +545,9 @@ describe('probeJobFeedbackForms — exactly one allowlisted read, nothing writte
   });
 
   it('keeps `applicationFeedback.list` out of the probe allowlist', () => {
-    expect([...PROBE_READ_OPERATIONS]).toEqual(['jobInterviewPlan.info']);
+    // Two STRUCTURE reads only: the interview plan and one form definition
+    // (#275 auto-binder). Neither returns submitted feedback.
+    expect([...PROBE_READ_OPERATIONS]).toEqual(['jobInterviewPlan.info', 'feedbackFormDefinition.info']);
     // The operation exists in the registry — it is excluded on purpose, not
     // absent by accident.
     expect(ASHBY_OPERATIONS['applicationFeedback.list']).toBeDefined();

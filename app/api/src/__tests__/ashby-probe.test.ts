@@ -146,7 +146,11 @@ describe('probe module has no write capability', () => {
       'PROBE_READ_OPERATIONS',
       'assertReadOnly',
       'extractFeedbackForms',
+      // #275: one form definition's STRUCTURE (fields/types/scales), read by the
+      // scorecard auto-binder and the Mission Control binding preview.
+      'extractFormDefinition',
       'extractStages',
+      'probeFeedbackFormDefinition',
       'probeJobFeedbackForms',
       'probeJobStages',
     ]);

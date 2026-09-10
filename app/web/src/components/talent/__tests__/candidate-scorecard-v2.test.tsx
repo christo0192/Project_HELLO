@@ -3,15 +3,21 @@
  *
  * Covers the schema_version discriminator/normaliser, the v2 scorecard
  * component (per-metric score + label + rationale + weighted overall, and the
- * insufficient-evidence path), and the branch inside TranscriptionSyncWorkspace:
- * a v2 assessment renders the metric view, a v1 assessment renders the legacy
- * 1–10 view unchanged.
+ * insufficient-evidence path), the per-assessment rubric SCALE (new rows are
+ * 1–4 with Poor/Average/Good/Excellent; historical rows stay 1–5 with the legacy
+ * labels), and the branch inside TranscriptionSyncWorkspace: a v2 assessment
+ * renders the metric view, a v1 assessment renders the legacy 1–10 view
+ * unchanged.
  */
 
 import { render, screen } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
 import { readScorecardAssessmentV2, isAssessmentV2 } from '../../../types';
-import type { Assessment, ScorecardAssessmentV2 } from '../../../types';
+import type {
+  Assessment,
+  ScorecardAssessmentV2,
+  ScorecardAssessmentV2Raw,
+} from '../../../types';
 import { CandidateScorecardV2 } from '../CandidateScorecardV2';
 import { CandidateShell } from '../CandidateShell';
 
@@ -31,7 +37,7 @@ vi.mock('../../../api', () => ({
 
 import { TranscriptionSyncWorkspace } from '../TranscriptionSyncWorkspace';
 
-const RUBRIC = { 1: 'a', 2: 'b', 3: 'c', 4: 'd', 5: 'e' } as const;
+const RUBRIC = { 1: 'a', 2: 'b', 3: 'c', 4: 'd' } as const;
 
 function snapshot(i: number, name: string, key: string, weightBps: number) {
   return {
@@ -51,6 +57,7 @@ const V2_COMPLETE_RAW: ScorecardAssessmentV2 = {
   scorecardVersionId: 'ver-1',
   revision: 1,
   status: 'complete',
+  scoreScaleMax: 4,
   weightedScore5: 3.5,
   overallScore: 63,
   recommendation: 'hold',
@@ -98,6 +105,7 @@ const V2_INCOMPLETE_RAW: ScorecardAssessmentV2 = {
   scorecardVersionId: 'ver-2',
   revision: 1,
   status: 'incomplete_evidence',
+  scoreScaleMax: 4,
   weightedScore5: null,
   overallScore: null,
   recommendation: 'human_review',
@@ -132,6 +140,7 @@ const V2_PARTIAL_RAW: ScorecardAssessmentV2 = {
   scorecardVersionId: 'ver-3',
   revision: 1,
   status: 'incomplete_evidence',
+  scoreScaleMax: 4,
   weightedScore5: 3.0,
   overallScore: 50,
   recommendation: 'hold',
@@ -217,6 +226,7 @@ describe('readScorecardAssessmentV2 / isAssessmentV2', () => {
     expect(display).not.toBeNull();
     expect(display.overallScore).toBe(63);
     expect(display.weightedScore5).toBe(3.5);
+    expect(display.scoreScaleMax).toBe(4);
     expect(display.recommendation).toBe('hold');
     expect(display.metrics.map((m) => m.name)).toEqual(['Technical depth', 'Leadership']);
     expect(display.metrics[0].score).toBe(4);
@@ -245,9 +255,10 @@ describe('CandidateScorecardV2', () => {
     );
     expect(screen.getByText('Technical depth')).toBeInTheDocument();
     expect(screen.getByText('Leadership')).toBeInTheDocument();
-    // Score 4 carries its SCORE_LABELS word.
-    expect(screen.getByText('Score · Good')).toBeInTheDocument();
-    expect(screen.getByText('Score · Below average')).toBeInTheDocument();
+    // Scores carry their four-level SCORE_LABELS word (4 → Excellent, 2 → Average).
+    expect(screen.getByText('Score · Excellent')).toBeInTheDocument();
+    expect(screen.getByText('Score · Average')).toBeInTheDocument();
+    expect(screen.queryByText('Score · Below average')).not.toBeInTheDocument();
     // Verbose rationale.
     expect(
       screen.getByText('Explained the trade-offs clearly and in depth.'),
@@ -256,6 +267,7 @@ describe('CandidateScorecardV2', () => {
     expect(screen.getByText('/ 100')).toBeInTheDocument();
     expect(screen.getAllByText('63').length).toBeGreaterThan(0);
     expect(screen.getByText(/3\.50/)).toBeInTheDocument();
+    expect(screen.getByText('/ 4 weighted')).toBeInTheDocument();
     expect(screen.getByText('Hold')).toBeInTheDocument();
   });
 
@@ -289,7 +301,111 @@ describe('CandidateScorecardV2', () => {
     expect(screen.getByText(/Provisional score from 2 of 3 metrics/)).toBeInTheDocument();
     // The scored metrics carry their real SCORE_LABELS word; the unevidenced one is flagged.
     expect(screen.getByText('Insufficient evidence')).toBeInTheDocument();
-    expect(screen.getAllByText('Score · Average').length).toBe(2); // score 3 → SCORE_LABELS[3]
+    expect(screen.getAllByText('Score · Good').length).toBe(2); // score 3 → SCORE_LABELS[3]
+  });
+});
+
+// ── Rubric scale per assessment ──────────────────────────────────────────
+//
+// Historical rows were scored 1–5 and are NOT rescored: their `raw` predates
+// `scoreScaleMax` (and older API payloads may also lack the `score_scale_max`
+// column), so the reader resolves them to 5 and the card renders them on that
+// scale with the legacy labels. New rows carry `scoreScaleMax: 4`.
+const V2_HISTORICAL_RAW: ScorecardAssessmentV2Raw = {
+  schemaVersion: 2,
+  scorecardVersionId: 'ver-old',
+  revision: 1,
+  status: 'complete',
+  // No `scoreScaleMax` — persisted before the four-level rubric.
+  weightedScore5: 3.8,
+  overallScore: 70,
+  recommendation: 'advance',
+  metricResults: [
+    {
+      configMetricId: 'sm-0',
+      score: 5,
+      evidenceStatus: 'scored',
+      rationale: 'Outstanding depth on the old scale.',
+      evidenceRefs: [],
+      metric: snapshot(0, 'Technical depth', 'technical_depth', 6000),
+    },
+    {
+      configMetricId: 'sm-1',
+      score: 2,
+      evidenceStatus: 'scored',
+      rationale: 'Weak ownership on the old scale.',
+      evidenceRefs: [],
+      metric: snapshot(1, 'Leadership', 'leadership', 4000),
+    },
+  ],
+};
+
+const V2_HISTORICAL = {
+  id: 'a-v2-old',
+  schema_version: 2,
+  scoring_status: 'complete',
+  weighted_score_5: 3.8,
+  overall_score: 70,
+  recommendation: 'advance',
+  // No `score_scale_max` column either — an older API payload.
+  raw: V2_HISTORICAL_RAW,
+} as unknown as Assessment;
+
+describe('scoreScaleMax — four-level rubric vs historical 1–5 rows', () => {
+  it('resolves a raw lacking scoreScaleMax (and no column) to the historical 5', () => {
+    const display = readScorecardAssessmentV2(V2_HISTORICAL)!;
+    expect(display.scoreScaleMax).toBe(5);
+    expect(display.metrics[0].score).toBe(5);
+  });
+
+  it('falls back to the score_scale_max column when raw lacks the field', () => {
+    const fromColumn = { ...V2_HISTORICAL, score_scale_max: 5 } as unknown as Assessment;
+    expect(readScorecardAssessmentV2(fromColumn)!.scoreScaleMax).toBe(5);
+    const migrated = { ...V2_HISTORICAL, score_scale_max: 4 } as unknown as Assessment;
+    expect(readScorecardAssessmentV2(migrated)!.scoreScaleMax).toBe(4);
+  });
+
+  it('prefers raw.scoreScaleMax over the column, and treats an unknown scale as 5', () => {
+    const rawWins = { ...V2_COMPLETE, score_scale_max: 5 } as unknown as Assessment;
+    expect(readScorecardAssessmentV2(rawWins)!.scoreScaleMax).toBe(4);
+    const garbage = { ...V2_HISTORICAL, score_scale_max: 6 } as unknown as Assessment;
+    expect(readScorecardAssessmentV2(garbage)!.scoreScaleMax).toBe(5);
+  });
+
+  it('renders a historical assessment on its own 1–5 scale with the legacy labels', () => {
+    render(
+      <CandidateShell>
+        <CandidateScorecardV2 scorecard={readScorecardAssessmentV2(V2_HISTORICAL)!} />
+      </CandidateShell>,
+    );
+    // Weighted line reads "/ 5 weighted", not "/ 4".
+    expect(screen.getByText(/3\.80/)).toBeInTheDocument();
+    expect(screen.getByText('/ 5 weighted')).toBeInTheDocument();
+    expect(screen.queryByText('/ 4 weighted')).not.toBeInTheDocument();
+    // A score of 5 is "Excellent" on the legacy scale and the meter runs to 5.
+    const top = screen.getByRole('meter', { name: 'Score · Excellent' });
+    expect(top).toHaveAttribute('aria-valuenow', '5');
+    expect(top).toHaveAttribute('aria-valuemax', '5');
+    // A score of 2 keeps its legacy "Below average" word (NOT the new "Average").
+    const low = screen.getByRole('meter', { name: 'Score · Below average' });
+    expect(low).toHaveAttribute('aria-valuenow', '2');
+    expect(low).toHaveAttribute('aria-valuemax', '5');
+    expect(screen.queryByText('Score · Average')).not.toBeInTheDocument();
+  });
+
+  it('renders a new assessment on the 1–4 scale with the four-level labels', () => {
+    render(
+      <CandidateShell>
+        <CandidateScorecardV2 scorecard={readScorecardAssessmentV2(V2_COMPLETE)!} />
+      </CandidateShell>,
+    );
+    expect(screen.getByText('/ 4 weighted')).toBeInTheDocument();
+    expect(screen.queryByText('/ 5 weighted')).not.toBeInTheDocument();
+    // A score of 4 is "Excellent" on the new scale and the meter runs to 4.
+    const top = screen.getByRole('meter', { name: 'Score · Excellent' });
+    expect(top).toHaveAttribute('aria-valuenow', '4');
+    expect(top).toHaveAttribute('aria-valuemax', '4');
+    expect(screen.queryByText('Score · Below average')).not.toBeInTheDocument();
   });
 });
 

@@ -22,8 +22,13 @@
 
 import { ASHBY_OPERATIONS, type AshbyOperation, type OpaqueRecord } from './types.js';
 
-/** The ONLY operations the probe may perform. Every one is `mutation: false`. */
-export const PROBE_READ_OPERATIONS = ['jobInterviewPlan.info'] as const;
+/**
+ * The ONLY operations the probe may perform. Every one is `mutation: false`.
+ * `feedbackFormDefinition.info` returns a form's STRUCTURE (sections, fields,
+ * types, scales) and no submitted feedback — it is what makes the scorecard
+ * auto-binder and the Mission Control binding preview possible.
+ */
+export const PROBE_READ_OPERATIONS = ['jobInterviewPlan.info', 'feedbackFormDefinition.info'] as const;
 export type ProbeReadOperation = (typeof PROBE_READ_OPERATIONS)[number];
 
 /**
@@ -57,6 +62,14 @@ export interface ProbeResult {
 /** Narrow reader seam — satisfied by AshbyClient. Injected for tests. */
 export interface ProbeReader {
   jobInterviewPlanInfo<T = OpaqueRecord>(jobId: string, extra?: OpaqueRecord): Promise<{ results: T }>;
+}
+
+/** Reader seam for one form definition — satisfied by AshbyClient. */
+export interface FormDefinitionReader {
+  feedbackFormDefinitionInfo<T = OpaqueRecord>(
+    feedbackFormDefinitionId: string,
+    extra?: OpaqueRecord,
+  ): Promise<{ results: T }>;
 }
 
 const MAX_STAGES = 100;
@@ -205,10 +218,12 @@ export interface ProbeFeedbackForm {
   /**
    * FALSE means the plan payload named this form but carried no field-level
    * schema — the id is real, and the empty `sections` is NOT a claim that the
-   * form has no fields. Reading fields needs `feedbackFormDefinition.info`,
-   * which is not in this integration's operation registry.
+   * form has no fields. The field-level schema comes from
+   * `feedbackFormDefinition.info` (see {@link probeFeedbackFormDefinition}).
    */
   schemaAvailable: boolean;
+  /** True when the definition itself says it is archived (definition reads only). */
+  archived?: boolean;
 }
 
 export interface ProbeFormsResult {
@@ -503,4 +518,44 @@ export async function probeJobFeedbackForms(
   assertReadOnly('jobInterviewPlan.info');
   const res = await reader.jobInterviewPlanInfo(externalJobId);
   return extractFeedbackForms(res.results);
+}
+
+/**
+ * Pull ONE form definition's schema out of an opaque `feedbackFormDefinition.info`
+ * payload (`results: { id, title, isArchived, formDefinition: { sections } }`).
+ *
+ * Reuses the same bounded, allowlisted field walk as the plan extractor (the
+ * definition is wrapped in a one-form plan-shaped envelope), so the two
+ * discovery paths cannot drift in what they are willing to read. Returns
+ * `null` when the payload names no usable form id — an id is never invented.
+ */
+export function extractFormDefinition(results: unknown): ProbeFeedbackForm | null {
+  if (results === null || typeof results !== 'object' || Array.isArray(results)) return null;
+  const rec = results as Record<string, unknown>;
+  const id = typeof rec.id === 'string' && ID_RE.test(rec.id) ? rec.id : null;
+  if (id === null) return null;
+  // Present the definition to the plan extractor as a single form-bearing root.
+  const { forms } = extractFeedbackForms({ feedbackFormDefinitions: [results] });
+  const form = forms.find((f) => f.formDefinitionId === id) ?? null;
+  if (form === null) return null;
+  // A definition that reports ZERO fields is not a form with no fields — an
+  // Ashby feedback form always has some — it is a shape this extractor could
+  // not read. Say "unavailable" so the caller waits and retries rather than
+  // binding nothing and writing an empty card it can never rewrite.
+  const usable = form.fieldCount > 0 ? form : { ...form, schemaAvailable: false };
+  return rec.isArchived === true ? { ...usable, archived: true } : usable;
+}
+
+/**
+ * Read one feedback form's definition. Exactly one allowlisted READ; returns
+ * sanitized STRUCTURE only. `null` when the tenant answered with no usable
+ * definition (the caller treats that as "cannot bind", never as a guess).
+ */
+export async function probeFeedbackFormDefinition(
+  feedbackFormDefinitionId: string,
+  reader: FormDefinitionReader,
+): Promise<ProbeFeedbackForm | null> {
+  assertReadOnly('feedbackFormDefinition.info');
+  const res = await reader.feedbackFormDefinitionInfo(feedbackFormDefinitionId);
+  return extractFormDefinition(res.results);
 }

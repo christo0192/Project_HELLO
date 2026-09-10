@@ -16,7 +16,7 @@ function renderPage() {
   );
 }
 
-const { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm } = vi.hoisted(() => ({
+const { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm, previewAshbyScorecardBinding } = vi.hoisted(() => ({
   listAshbyMappings: vi.fn(),
   listAshbyWorkflows: vi.fn(),
   pauseAshbyMapping: vi.fn(),
@@ -25,10 +25,11 @@ const { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMap
   retryAshbyOperation: vi.fn(),
   deliverAshbyManualInvite: vi.fn(),
   discoverAshbyFeedbackForm: vi.fn(),
+  previewAshbyScorecardBinding: vi.fn(),
 }));
 
 vi.mock('../api', () => ({
-  api: { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm },
+  api: { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm, previewAshbyScorecardBinding },
   ApiError: class ApiError extends Error {
     status: number;
     constructor(m: string, s: number) { super(m); this.status = s; }
@@ -416,6 +417,191 @@ describe('AshbyMissionControlPage — feedback-form schema discovery (read-only)
     const { container } = renderPage();
     await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
     await screen.findByText(/form id: form_1/);
+    await expect(container).toHaveNoViolations();
+  });
+});
+
+/**
+ * Issue #275 — read-only scorecard binding preview. Metrics bind to Score
+ * fields BY NAME at write time; this panel shows a recruiter which metric
+ * titles are missing on the form before a candidate is ever scored.
+ */
+const BINDING_PREVIEW = {
+  ok: true,
+  scoringPath: 'v2_autobind',
+  preview: {
+    formDefinitionId: 'form_1',
+    formTitle: 'Hello Christy Feedback',
+    schemaAvailable: true,
+    archived: false,
+    formMatchesBinding: true,
+    fixedFields: [
+      { name: 'overall', path: 'overall_recommendation', expectedType: null, status: 'present', actualType: 'ValueSelect' },
+      { name: 'summary', path: 'p-summary', expectedType: 'RichText', status: 'present', actualType: 'RichText' },
+      { name: 'redFlags', path: 'p-red', expectedType: 'String', status: 'present', actualType: 'String' },
+      { name: 'detailedReport', path: 'p-url', expectedType: 'Url', status: 'type_mismatch', actualType: 'String' },
+    ],
+    metrics: [
+      { key: 'profile_relevance', name: 'Profile relevance', status: 'bound', fieldPath: 'p-pr', scale: { min: 1, max: 5 } },
+      { key: 'communication', name: 'Communication', status: 'bound', fieldPath: 'p-co', scale: { min: 1, max: 4 } },
+      { key: 'stability', name: 'Stability', status: 'no_field', fieldPath: null, scale: null },
+      { key: 'night_shift_fit', name: 'Night-shift fit', status: 'ambiguous_title', fieldPath: null, scale: null },
+    ],
+    unusedScoreFields: [{ fieldId: 'f-old', title: 'English' }],
+    ready: false,
+  },
+};
+
+describe('AshbyMissionControlPage — scorecard binding preview (read-only)', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    listAshbyMappings.mockResolvedValue(MAPPINGS);
+    listAshbyWorkflows.mockResolvedValue(WORKFLOWS);
+    previewAshbyScorecardBinding.mockResolvedValue(BINDING_PREVIEW);
+  });
+
+  it('shows each metric, its field and scale, and the exact fix for an unbound one', async () => {
+    renderPage();
+    const buttons = await screen.findAllByRole('button', { name: /preview scorecard binding/i });
+    await userEvent.click(buttons[0]);
+    await waitFor(() => expect(previewAshbyScorecardBinding).toHaveBeenCalledWith('m1'));
+    expect(previewAshbyScorecardBinding).toHaveBeenCalledTimes(1);
+
+    expect(await screen.findByText(/Scorecard binding preview — read-only/)).toBeInTheDocument();
+    const text = document.body.textContent ?? '';
+    expect(text).toContain('Profile relevance');
+    expect(text).toContain('[p-pr]');
+    expect(text).toContain('1–5 scale');
+    expect(text).toContain('[p-co]');
+    expect(text).toContain('1–4 scale');
+    // The unbound metric names the rule the recruiter must apply on the form.
+    expect(text).toMatch(/Stability.*no Score field with this title.*add an optional Score field titled exactly like the metric/);
+    expect(text).toMatch(/Night-shift fit.*more than one field carries this title/);
+    // Fixed-field drift is reported as fail-closed, never as "will still write".
+    expect(text).toMatch(/Detailed report.*type changed to String \(expected Url\).*fail closed/);
+    // A broken FIXED field blocks the whole write, so the headline says that
+    // rather than "N metrics would be omitted" (which implies a card is sent).
+    expect(screen.getByTestId('binding-readiness').textContent)
+      .toMatch(/Not ready — 1 fixed field\(s\) no longer match the verified binding\./);
+    expect(text).toContain('Score fields no metric claims');
+    expect(text).toContain('English');
+    // Structure only — no submitted value, address, or secret material.
+    const panel = screen.getByText(/Scorecard binding preview — read-only/).closest('div')!;
+    const panelText = panel.textContent ?? '';
+    expect(panelText).not.toMatch(/\S+@\S+\.\S+/);
+    expect(panelText).not.toMatch(/bearer|presigned|invite_token|transcript|recording/i);
+  });
+
+  it('reports metric omission only when nothing more serious is wrong', async () => {
+    previewAshbyScorecardBinding.mockResolvedValue({
+      ...BINDING_PREVIEW,
+      preview: {
+        ...BINDING_PREVIEW.preview,
+        fixedFields: BINDING_PREVIEW.preview.fixedFields.map((f) => ({ ...f, status: 'present', actualType: f.expectedType ?? 'ValueSelect' })),
+      },
+    });
+    renderPage();
+    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+    expect((await screen.findByTestId('binding-readiness')).textContent)
+      .toMatch(/2 of 4 metric\(s\) would be omitted from the Ashby card\./);
+  });
+
+  it('says the binding could not be checked when the read carried no field schema', async () => {
+    previewAshbyScorecardBinding.mockResolvedValue({
+      ...BINDING_PREVIEW,
+      preview: {
+        ...BINDING_PREVIEW.preview,
+        schemaAvailable: false,
+        fixedFields: BINDING_PREVIEW.preview.fixedFields.map((f) => ({ ...f, status: 'missing', actualType: null })),
+        metrics: BINDING_PREVIEW.preview.metrics.map((m) => ({ ...m, status: 'no_field', fieldPath: null, scale: null })),
+        ready: false,
+      },
+    });
+    renderPage();
+    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+    const verdict = (await screen.findByTestId('binding-readiness')).textContent ?? '';
+    expect(verdict).toMatch(/Cannot be checked — this read returned no field schema/);
+    // It must not claim metrics would be dropped: the worker retries instead.
+    expect(verdict).not.toMatch(/would be omitted/);
+    // …and a fixed field is "not checked", never reported as deleted.
+    const text = document.body.textContent ?? '';
+    expect(text).toContain('not checked by this read');
+    expect(text).not.toContain('missing on the form');
+  });
+
+  it('reports ready when every metric and fixed field binds', async () => {
+    previewAshbyScorecardBinding.mockResolvedValue({
+      ...BINDING_PREVIEW,
+      preview: {
+        ...BINDING_PREVIEW.preview,
+        fixedFields: BINDING_PREVIEW.preview.fixedFields.map((f) => ({ ...f, status: 'present', actualType: f.expectedType ?? 'ValueSelect' })),
+        metrics: BINDING_PREVIEW.preview.metrics.slice(0, 2),
+        ready: true,
+      },
+    });
+    renderPage();
+    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+    expect((await screen.findByTestId('binding-readiness')).textContent).toMatch(/^Ready — every metric/);
+  });
+
+  it('explains the v1 legacy path and a role-less mapping instead of an empty table', async () => {
+    previewAshbyScorecardBinding.mockResolvedValue({ ...BINDING_PREVIEW, scoringPath: 'v1_legacy', preview: { ...BINDING_PREVIEW.preview, metrics: [], ready: false } });
+    renderPage();
+    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+    expect(await screen.findByText(/no active dashboard scorecard/i)).toBeInTheDocument();
+    expect(screen.queryByTestId('binding-readiness')).not.toBeInTheDocument();
+    expect(screen.queryByText(/Metrics \(bound by name\)/)).not.toBeInTheDocument();
+
+    previewAshbyScorecardBinding.mockResolvedValue({ ...BINDING_PREVIEW, scoringPath: 'no_role', preview: { ...BINDING_PREVIEW.preview, metrics: [], ready: false } });
+    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[1]);
+    expect(await screen.findByText(/has no dashboard role/i)).toBeInTheDocument();
+  });
+
+  it('flags an archived or mismatched form as fail-closed, even when every metric binds', async () => {
+    previewAshbyScorecardBinding.mockResolvedValue({
+      ...BINDING_PREVIEW,
+      preview: {
+        ...BINDING_PREVIEW.preview,
+        archived: true,
+        formMatchesBinding: false,
+        fixedFields: BINDING_PREVIEW.preview.fixedFields.map((f) => ({ ...f, status: 'present', actualType: f.expectedType ?? 'ValueSelect' })),
+        metrics: BINDING_PREVIEW.preview.metrics.slice(0, 2),
+        ready: false,
+      },
+    });
+    renderPage();
+    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+    expect(await screen.findByText(/archived in Ashby.*fail closed/i)).toBeInTheDocument();
+    // The headline must name the archived form, not blame a fixed field.
+    const verdict = screen.getByTestId('binding-readiness').textContent ?? '';
+    expect(verdict).toMatch(/Not ready — the verified form is archived/);
+    expect(verdict).not.toMatch(/fixed field/);
+  });
+
+  it('renders sanitized copy for each API error code and never the raw code alone', async () => {
+    for (const [code, fragment] of [
+      ['integration_disabled', /integration is disabled/i],
+      ['probe_unavailable', /hiringProcessMetadataRead/],
+      ['mapping_not_found', /no longer exists/i],
+      ['binding_unverified', /not verified/i],
+    ] as const) {
+      previewAshbyScorecardBinding.mockResolvedValue({ ok: false, error: code });
+      const view = renderPage();
+      await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+      const alert = await screen.findByRole('alert');
+      expect(alert.textContent).toMatch(fragment);
+      view.unmount();
+    }
+    previewAshbyScorecardBinding.mockRejectedValue({ message: 'network down' });
+    renderPage();
+    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+    expect((await screen.findByRole('alert')).textContent).toMatch(/could not preview/i);
+  });
+
+  it('has no axe violations with a preview rendered', async () => {
+    const { container } = renderPage();
+    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+    await screen.findByText(/Scorecard binding preview — read-only/);
     await expect(container).toHaveNoViolations();
   });
 });

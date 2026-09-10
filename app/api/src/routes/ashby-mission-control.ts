@@ -40,8 +40,16 @@ import {
   describeAshbyRuntime,
   isAshbyRuntimeActive,
 } from '../integrations/ashby/config.js';
-import { probeJobStages, probeJobFeedbackForms } from '../integrations/ashby/probe.js';
+import {
+  probeJobStages,
+  probeJobFeedbackForms,
+  probeFeedbackFormDefinition,
+  type FormDefinitionReader,
+} from '../integrations/ashby/probe.js';
 import { createAshbyProbeClient } from '../integrations/ashby/runtime.js';
+import { HELLO_CHRISTY_SCORECARD_BINDING } from '../integrations/ashby/scorecard.js';
+import { previewScorecardBinding, withRoleFit, type MetricToBind } from '../integrations/ashby/scorecard-autobind.js';
+import { loadActiveRoleScorecard } from '../lib/scorecards/store.js';
 import {
   snapshotScheduler,
   readBacklog,
@@ -104,6 +112,22 @@ export interface AshbyMissionControlDeps {
    * integration answers 503 without constructing a client or touching the network.
    */
   probeReader?: Parameters<typeof probeJobStages>[1] | null;
+  /**
+   * Injected read-only reader for one feedback-form DEFINITION (#275 binding
+   * preview). Production uses the same probe client as the stage probe; an
+   * explicit `null` means "disabled" (tests).
+   */
+  formDefinitionReader?: FormDefinitionReader | null;
+  /**
+   * Injected role/metric lookups for the binding preview (tests). Production
+   * reads the mapping's role and the role's ACTIVE scorecard version.
+   */
+  scorecardPreview?: {
+    /** `undefined` = mapping not found; `null` = mapping has no role. */
+    readMappingRoleId(mappingId: string): Promise<string | null | undefined>;
+    /** `null` = the role has no active v2 scorecard (v1 legacy path). */
+    loadMetrics(roleId: string): Promise<MetricToBind[] | null>;
+  };
   /** Injected last-reconciliation-pass snapshot for deterministic health tests. */
   reconcilePass?: () => ReturnType<typeof snapshotReconcilePass>;
   /** Injected config sources for deterministic health tests. */
@@ -132,21 +156,53 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
   // This builds ONLY a client — not a whole runtime — so the route owns no
   // parser pool or other resource it would need to shut down (finding L3).
   let probeResolved = false;
-  let probeReader: Parameters<typeof probeJobStages>[1] | null = null;
-  const resolveProbeReader = (): Parameters<typeof probeJobStages>[1] | null => {
-    if (deps.probeReader !== undefined) return deps.probeReader;
-    if (probeResolved) return probeReader;
+  let probeClient: ReturnType<typeof createAshbyProbeClient> = null;
+  const resolveProbeClient = (): ReturnType<typeof createAshbyProbeClient> => {
+    if (probeResolved) return probeClient;
     probeResolved = true;
     try {
       const source = deps.configSource ?? process.env;
-      probeReader = createAshbyProbeClient({
+      probeClient = createAshbyProbeClient({
         config: loadAshbyConfig(source),
         runtimeConfig: loadAshbyRuntimeConfig(source),
       });
     } catch {
-      probeReader = null;
+      probeClient = null;
     }
-    return probeReader;
+    return probeClient;
+  };
+  const resolveProbeReader = (): Parameters<typeof probeJobStages>[1] | null => {
+    if (deps.probeReader !== undefined) return deps.probeReader;
+    return resolveProbeClient();
+  };
+  // The same gated client serves the form-DEFINITION read; a disabled
+  // integration answers 503 here exactly as it does for the stage probe.
+  const resolveFormDefinitionReader = (): FormDefinitionReader | null => {
+    if (deps.formDefinitionReader !== undefined) return deps.formDefinitionReader;
+    // `probeReader: null` is the "integration disabled" seam every existing
+    // test relies on; it must disable THIS reader too, so no test (or gate)
+    // that closed the stage probe can have a real client built behind it.
+    if (deps.probeReader === null) return null;
+    return resolveProbeClient();
+  };
+  const scorecardPreview = deps.scorecardPreview ?? {
+    async readMappingRoleId(mappingId: string): Promise<string | null | undefined> {
+      const { data, error } = await supabase
+        .from('ashby_job_mappings')
+        .select('role_id')
+        .eq('id', mappingId)
+        .eq('provider', 'ashby')
+        .maybeSingle();
+      if (error) throw new Error('ashby_mc_mapping_role_error');
+      if (!data) return undefined;
+      const roleId = (data as { role_id?: string | null }).role_id ?? null;
+      return typeof roleId === 'string' && UUID_RE.test(roleId) ? roleId : null;
+    },
+    async loadMetrics(roleId: string): Promise<MetricToBind[] | null> {
+      const version = await loadActiveRoleScorecard(supabase as never, roleId);
+      if (!version) return null;
+      return version.metrics.map((m) => ({ key: m.key, name: m.name }));
+    },
   };
 
   // ── Reads (interviewer+) ──────────────────────────────────────────────────
@@ -426,6 +482,67 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
         },
       });
       res.json({ ok: true, forms: result.forms, empty: result.empty, truncated: result.truncated });
+    } catch {
+      // A tenant 401/403/404 or an unparseable body is a sanitized capability
+      // failure. Never echo the provider body.
+      res.status(502).json({ ok: false, error: 'probe_unavailable' });
+    }
+  });
+
+  // ── Read-only scorecard binding preview (admin) — issue #275 ──────────────
+  // v2 metrics bind to the tenant form BY NAME at write time (see
+  // integrations/ashby/scorecard-autobind.ts). This shows a recruiter what
+  // that binding WOULD do for one mapping's role — which metrics have a Score
+  // field titled exactly like them, which do not and why, and whether the four
+  // fixed fields are still where the verified binding expects them — BEFORE a
+  // candidate is scored. One allowlisted READ (feedbackFormDefinition.info) of
+  // the verified form, plus two server-side table reads. Nothing is written,
+  // persisted, bound, or submitted; no feedback content is read.
+  router.get('/mappings/:id/scorecard-binding', requireRole('admin'), async (req: Request, res: Response) => {
+    const id = req.params.id;
+    if (!UUID_RE.test(id)) { res.status(400).json({ ok: false, error: 'invalid_mapping_id' }); return; }
+    const reader = resolveFormDefinitionReader();
+    if (!reader) {
+      // Runtime gates closed → no client is constructed and no call is made.
+      res.status(503).json({ ok: false, error: 'integration_disabled' }); return;
+    }
+    const formDefinitionId = HELLO_CHRISTY_SCORECARD_BINDING.formDefinitionId;
+    if (!HELLO_CHRISTY_SCORECARD_BINDING.verified || !formDefinitionId) {
+      res.status(409).json({ ok: false, error: 'binding_unverified' }); return;
+    }
+
+    let roleId: string | null | undefined;
+    let metrics: MetricToBind[] | null;
+    try {
+      roleId = await scorecardPreview.readMappingRoleId(id);
+      if (roleId === undefined) { res.status(404).json({ ok: false, error: 'mapping_not_found' }); return; }
+      metrics = roleId ? await scorecardPreview.loadMetrics(roleId) : null;
+    } catch {
+      res.status(500).json({ ok: false, error: 'mission_control_read_error' }); return;
+    }
+
+    try {
+      const form = await probeFeedbackFormDefinition(formDefinitionId, reader);
+      if (!form) { res.status(502).json({ ok: false, error: 'probe_unavailable' }); return; }
+      // No active v2 scorecard → the worker takes the v1 legacy path, which
+      // uses the static binding and needs no name matching. Say so rather than
+      // rendering an empty metric table as "nothing to bind".
+      // A v2 write also carries the derived "Role fit" dimension (#282 signal
+      // on the form's kept v1 field), so the preview shows that row as well.
+      const preview = previewScorecardBinding(HELLO_CHRISTY_SCORECARD_BINDING, form, metrics ? withRoleFit(metrics) : []);
+      const scoringPath: 'v2_autobind' | 'v1_legacy' | 'no_role' = !roleId ? 'no_role' : metrics ? 'v2_autobind' : 'v1_legacy';
+      // Audit carries bounded COUNTS only — a field path or metric name is
+      // tenant configuration and stays inside the one authenticated response.
+      await recordAudit(req, 'resource.read', 200, {
+        metadata: {
+          resource: 'ashby_scorecard_binding_preview',
+          scoring_path: scoringPath,
+          metric_count: preview.metrics.length,
+          bound_count: preview.metrics.filter((m) => m.status === 'bound').length,
+          ready: preview.ready,
+        },
+      });
+      res.json({ ok: true, scoringPath, preview });
     } catch {
       // A tenant 401/403/404 or an unparseable body is a sanitized capability
       // failure. Never echo the provider body.

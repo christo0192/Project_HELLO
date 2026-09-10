@@ -8,7 +8,13 @@ import {
   SCORECARD_SCHEMA_VERSION,
   SCORECARD_WEIGHT_TOTAL_BPS,
   SCORE_LABELS,
+  SCORE_MAX,
+  SCORE_MIN,
+  SCORE_SCALE_MAX_VALUES,
+  LEGACY_SCORE_LABELS_5,
   asLegacyAssessment,
+  isScoreOnScale,
+  isScoreScaleMax,
   isScoreValue,
   type ScorecardMetricModelResult,
   type ScorecardRubric,
@@ -20,7 +26,6 @@ const rubric: ScorecardRubric = {
   2: 'Demonstrates it inconsistently.',
   3: 'Meets the expected standard.',
   4: 'Clearly exceeds the expected standard.',
-  5: 'Demonstrates exceptional evidence of the criterion.',
 };
 
 const legacy: Assessment = {
@@ -41,7 +46,7 @@ const legacy: Assessment = {
 };
 
 describe('scorecard v2 domain contract', () => {
-  it('pins the closed five-point scale and persisted bounds', () => {
+  it('pins the closed four-point scale and persisted bounds', () => {
     expect(SCORECARD_SCHEMA_VERSION).toBe(2);
     expect(SCORECARD_WEIGHT_TOTAL_BPS).toBe(10_000);
     expect(SCORECARD_MAX_METRICS).toBe(20);
@@ -49,13 +54,46 @@ describe('scorecard v2 domain contract', () => {
     expect(SCORECARD_MAX_INSTRUCTION_LENGTH).toBe(1_000);
     expect(SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH).toBe(500);
     expect(SCORECARD_MAX_RATIONALE_LENGTH).toBe(1_000);
-    expect(SCORE_LABELS).toEqual({ 1: 'Poor', 2: 'Below average', 3: 'Average', 4: 'Good', 5: 'Excellent' });
-    expect(Object.keys(rubric)).toEqual(['1', '2', '3', '4', '5']);
+    // 0093 (owner decision #275/#284): FOUR levels, matching an Ashby Score field
+    // so a metric score is written 1:1 with no bucketing.
+    expect(SCORE_MIN).toBe(1);
+    expect(SCORE_MAX).toBe(4);
+    expect(SCORE_LABELS).toEqual({ 1: 'Poor', 2: 'Average', 3: 'Good', 4: 'Excellent' });
+    expect(Object.keys(rubric)).toEqual(['1', '2', '3', '4']);
+  });
+
+  it('keeps the retired five-level labels for DISPLAY of pre-0093 assessments only', () => {
+    // A row scored before 0093 keeps its 1–5 scores; the card must still be able
+    // to name them. These labels are display-only — they are NOT the rubric.
+    expect(LEGACY_SCORE_LABELS_5).toEqual({
+      1: 'Poor', 2: 'Below average', 3: 'Average', 4: 'Good', 5: 'Excellent',
+    });
+    expect(Object.keys(LEGACY_SCORE_LABELS_5)).toHaveLength(5);
+    // The live rubric is the four-level one; the legacy map never replaces it.
+    expect(Object.keys(SCORE_LABELS)).toHaveLength(4);
   });
 
   it('accepts only integer scores on the closed scale', () => {
-    for (const score of [1, 2, 3, 4, 5]) expect(isScoreValue(score)).toBe(true);
-    for (const score of [0, 6, 1.5, '5', null, undefined]) expect(isScoreValue(score)).toBe(false);
+    for (const score of [1, 2, 3, 4]) expect(isScoreValue(score)).toBe(true);
+    // 5 was valid on the retired scale and must now be rejected for NEW scoring.
+    for (const score of [0, 5, 6, 1.5, '4', null, undefined]) expect(isScoreValue(score)).toBe(false);
+  });
+
+  it('range-checks a PERSISTED score against the row own scale, not the current one', () => {
+    // isScoreOnScale is what readers of a persisted row use: a pre-0093 row is
+    // tagged scale 5 and its 5 is legitimate; the same 5 on a 0093 row is not.
+    expect(isScoreOnScale(5, 5)).toBe(true);
+    expect(isScoreOnScale(5, 4)).toBe(false);
+    for (const score of [1, 2, 3, 4]) expect(isScoreOnScale(score, 4)).toBe(true);
+    for (const bad of [0, 2.5, '3', null, undefined]) expect(isScoreOnScale(bad, 5)).toBe(false);
+  });
+
+  it('admits exactly the two rubric scales a persisted row may carry', () => {
+    expect([...SCORE_SCALE_MAX_VALUES]).toEqual([4, 5]);
+    expect(isScoreScaleMax(4)).toBe(true);
+    expect(isScoreScaleMax(5)).toBe(true);
+    // Nothing else — an unknown scale must fail closed rather than be projected.
+    for (const bad of [0, 3, 6, 10, '4', null, undefined]) expect(isScoreScaleMax(bad)).toBe(false);
   });
 
   it('makes arbitrary template names data, not model-output schema keys', () => {

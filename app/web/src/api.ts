@@ -22,6 +22,7 @@ import type {
   AshbyMcActionResponse,
   AshbyManualInviteResponse,
   AshbyFeedbackFormResponse,
+  AshbyScorecardBindingPreviewResponse,
   AshbyCandidateWorkflowResponse,
   AdminMaintenanceInput,
   AdminAuditListResponse,
@@ -541,6 +542,15 @@ export const api = {
   discoverAshbyFeedbackForm: (externalJobId: string) =>
     request<AshbyFeedbackFormResponse>(
       `/api/integrations/ashby/mission-control/jobs/${encodeURIComponent(externalJobId)}/feedback-form`,
+    ),
+  /**
+   * Read-only preview of the v2 scorecard binding for one mapping's role
+   * (issue #275): which dashboard metrics would land on which form Score
+   * field, by name. Structure only; nothing is written or bound by viewing it.
+   */
+  previewAshbyScorecardBinding: (mappingId: string) =>
+    request<AshbyScorecardBindingPreviewResponse>(
+      `/api/integrations/ashby/mission-control/mappings/${encodeURIComponent(mappingId)}/scorecard-binding`,
     ),
   // ── Ashby candidate-scoped review ────────────────────────────────
   // Purpose-built READ endpoints. The candidate/session are resolved

@@ -91,7 +91,7 @@ const SESSION_ID = '00000000-0000-4000-8000-000000000001';
 const CANDIDATE_ID = '00000000-0000-4000-8000-000000000002';
 const ROLE_ID = '00000000-0000-4000-8000-000000000003';
 
-const rubric = { 1: 'Poor', 2: 'Below average', 3: 'Average', 4: 'Good', 5: 'Excellent' } as const;
+const rubric = { 1: 'Poor', 2: 'Average', 3: 'Good', 4: 'Excellent' } as const;
 
 const activeScorecard: RoleScorecardVersion = {
   id: 'ver-1',
@@ -110,7 +110,7 @@ const activeScorecard: RoleScorecardVersion = {
   })),
 };
 
-function modelResults(scores: Array<1 | 2 | 3 | 4 | 5 | null>): ScorecardMetricModelResult[] {
+function modelResults(scores: Array<1 | 2 | 3 | 4 | null>): ScorecardMetricModelResult[] {
   return scores.map((score, index) => ({
     configMetricId: `metric-${index}`,
     score,
@@ -176,7 +176,7 @@ describe('v2 branch — a role with an active scorecard', () => {
     loadActiveRoleScorecard.mockResolvedValue(activeScorecard);
     // The v2 scorer's default infer calls runClaudeJSONWithProvenance.
     runClaudeJSONWithProvenance.mockResolvedValue({
-      data: { results: modelResults([5, 3, 1]) },
+      data: { results: modelResults([4, 3, 1]) },
       requestedModel: 'deepseek-v4-pro',
     });
   });
@@ -191,8 +191,13 @@ describe('v2 branch — a role with an active scorecard', () => {
     expect(payload.revision).toBe(1);
     expect(payload.scorecard_version_id).toBe('ver-1');
     expect(payload.scoring_status).toBe('complete');
-    expect(payload.weighted_score_5).toBe(3.6);
-    expect(payload.overall_score).toBe(65);
+    // (5000*4 + 3000*3 + 2000*1) / 10000 = 3.1 on the four-point rubric,
+    // → round(((3.1-1)/3)*100) = 70.
+    expect(payload.weighted_score_5).toBe(3.1);
+    expect(payload.overall_score).toBe(70);
+    // 0093: the row records the rubric scale it was scored on, so the Ashby
+    // adapter and the candidate card project it correctly forever after.
+    expect(payload.score_scale_max).toBe(4);
     expect(payload.recommendation).toBe('advance');
     expect(Array.isArray(payload.metric_results)).toBe(true);
     expect(payload.metric_results as unknown[]).toHaveLength(3);
@@ -216,22 +221,24 @@ describe('v2 branch — a role with an active scorecard', () => {
 
   it('a PARTIAL incomplete-evidence result persists a PROVISIONAL score + recommendation (never blank)', async () => {
     // The production failure this repairs: one un-evidenced metric must NOT void
-    // the card. [5, 3, null] over weights [5000, 3000, 2000] renormalizes to
-    // (25000+9000)/8000 = 4.25 → overall 81 → 'advance'. The row is v2 +
+    // the card. [4, 3, null] over weights [5000, 3000, 2000] renormalizes to
+    // (20000+9000)/8000 = 3.625 → overall 88 → 'advance'. The row is v2 +
     // incomplete_evidence but carries a real score the recruiter can see.
     runClaudeJSONWithProvenance.mockResolvedValue({
-      data: { results: modelResults([5, 3, null]) },
+      data: { results: modelResults([4, 3, null]) },
       requestedModel: 'deepseek-v4-pro',
     });
     await runAssessment(SESSION_ID);
     const payload = callsFor('assessments', 'insert')[0].args[0] as Record<string, unknown>;
     expect(payload.scoring_status).toBe('incomplete_evidence');
-    expect(payload.weighted_score_5).toBe(4.25);
-    expect(payload.overall_score).toBe(81);
+    expect(payload.weighted_score_5).toBe(3.625);
+    expect(payload.overall_score).toBe(88);
     expect(payload.recommendation).toBe('advance');
-    // The full provisional verdict is also in `raw` (what the candidate card reads).
+    // The full provisional verdict is also in `raw` (what the candidate card reads),
+    // including the scale it must be rendered on.
     expect((payload.raw as { recommendation: string }).recommendation).toBe('advance');
-    expect((payload.raw as { weightedScore5: number }).weightedScore5).toBe(4.25);
+    expect((payload.raw as { weightedScore5: number }).weightedScore5).toBe(3.625);
+    expect((payload.raw as { scoreScaleMax: number }).scoreScaleMax).toBe(4);
   });
 
   it('nulls weighted/overall/recommendation ONLY when NOT ONE metric was scored', async () => {
@@ -311,7 +318,7 @@ describe('v2 branch — a role with an active scorecard', () => {
   // integrity prompt asks for "resume_conflicts") to return the right shape.
   const integrityAwareInfer = (integrityData: unknown) =>
     async (prompt: string) => ({
-      data: prompt.includes('"resume_conflicts"') ? integrityData : { results: modelResults([5, 3, 1]) },
+      data: prompt.includes('"resume_conflicts"') ? integrityData : { results: modelResults([4, 3, 1]) },
       requestedModel: 'deepseek-v4-pro',
     });
 
@@ -357,14 +364,14 @@ describe('v2 branch — a role with an active scorecard', () => {
   it('FAIL-SOFT: a scorecard still persists when the integrity analysis throws', async () => {
     runClaudeJSONWithProvenance.mockImplementation(async (prompt: string) => {
       if (prompt.includes('"resume_conflicts"')) throw new Error('integrity provider 500');
-      return { data: { results: modelResults([5, 3, 1]) }, requestedModel: 'deepseek-v4-pro' };
+      return { data: { results: modelResults([4, 3, 1]) }, requestedModel: 'deepseek-v4-pro' };
     });
     await runAssessment(SESSION_ID);
     const inserts = callsFor('assessments', 'insert');
     expect(inserts).toHaveLength(1); // the scorecard was NOT blocked
     const payload = inserts[0].args[0] as Record<string, unknown>;
     expect(payload.schema_version).toBe(2);
-    expect(payload.weighted_score_5).toBe(3.6);
+    expect(payload.weighted_score_5).toBe(3.1);
     expect(Object.keys(payload)).not.toContain('role_fit');
   });
 });

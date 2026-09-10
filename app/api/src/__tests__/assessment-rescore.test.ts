@@ -105,7 +105,7 @@ const EXISTING_ID = '00000000-0000-4000-8000-0000000000c0';
 const WINNER_ID = '00000000-0000-4000-8000-0000000000d0';
 const REQ_ID = '11111111-2222-4333-8444-555555555555';
 
-const rubric = { 1: 'Poor', 2: 'Below average', 3: 'Average', 4: 'Good', 5: 'Excellent' } as const;
+const rubric = { 1: 'Poor', 2: 'Average', 3: 'Good', 4: 'Excellent' } as const;
 
 const activeScorecard: RoleScorecardVersion = {
   id: 'ver-1',
@@ -124,7 +124,7 @@ const activeScorecard: RoleScorecardVersion = {
   })),
 };
 
-function modelResults(scores: Array<1 | 2 | 3 | 4 | 5 | null>): ScorecardMetricModelResult[] {
+function modelResults(scores: Array<1 | 2 | 3 | 4 | null>): ScorecardMetricModelResult[] {
   return scores.map((score, index) => ({
     configMetricId: `metric-${index}`,
     score,
@@ -170,7 +170,7 @@ beforeEach(() => {
   setDefault('roles', ok({ title: 'Advisor', required_skills: [] }));
   loadActiveRoleScorecard.mockResolvedValue(activeScorecard);
   runClaudeJSONWithProvenance.mockResolvedValue({
-    data: { results: modelResults([5, 3, 1]) },
+    data: { results: modelResults([4, 3, 1]) },
     requestedModel: 'deepseek-v4-pro',
   });
   insertNotificationIntent.mockResolvedValue(undefined);
@@ -202,7 +202,7 @@ describe('a fresh rescore writes a superseding revision, prior row untouched', (
     expect(payload.rescore_request_id).toBe(REQ_ID);
     expect(payload.scorecard_version_id).toBe('ver-1');
     expect(payload.scoring_status).toBe('complete');
-    expect(payload.weighted_score_5).toBe(3.6);
+    expect(payload.weighted_score_5).toBe(3.1);
 
     expect(result.id).toBe(NEW_ID);
     // Scoring ran exactly once — two model calls for a v2 rescore: the metric
@@ -284,7 +284,7 @@ describe('a repeat with the SAME request id is idempotent', () => {
   it('returns the existing revision without scoring, inserting, or side-effects', async () => {
     enqueue(
       'assessments',
-      ok({ id: EXISTING_ID, raw: { marker: 'existing-revision', weightedScore5: 3.6 } }),
+      ok({ id: EXISTING_ID, raw: { marker: 'existing-revision', weightedScore5: 3.1 } }),
     );
 
     const result = await runAssessment(SESSION_ID, { rescore: { requestId: REQ_ID } });

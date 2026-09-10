@@ -52,9 +52,12 @@ interface VersionRow {
 }
 
 /**
- * Coerce the jsonb rubric ({"1": "...", ... , "5": "..."}) into the numeric-keyed
+ * Coerce the jsonb rubric ({"1": "...", ... , "4": "..."}) into the numeric-keyed
  * `ScorecardRubric` the contracts use. jsonb always presents string keys; JS
  * treats `r[1]` and `r['1']` identically, so this is a faithful, lossless map.
+ * Migration 0093 rewrote every stored rubric to four levels, so a fifth key
+ * cannot be present; if one somehow were, it is dropped here rather than
+ * carried into a prompt that renders exactly four.
  */
 function toRubric(value: unknown): ScorecardRubric {
   const r = (value ?? {}) as Record<string, string>;
@@ -63,7 +66,6 @@ function toRubric(value: unknown): ScorecardRubric {
     2: r['2'],
     3: r['3'],
     4: r['4'],
-    5: r['5'],
   };
 }
 

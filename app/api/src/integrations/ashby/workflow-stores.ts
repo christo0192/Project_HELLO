@@ -20,6 +20,73 @@ import type {
 } from './orchestration.js';
 import type { AshbyLinkLookup } from './completion-observer.js';
 import { ashbyReviewPath, buildScorecard, type ScorecardSource } from './scorecard.js';
+import {
+  isV2AdapterBlocked,
+  scorecardSourceFromV2Assessment,
+  type PersistedV2AssessmentRow,
+} from './scorecard-v2-adapter.js';
+
+/**
+ * The assessment columns BOTH scorecard build sites read. One list, so the
+ * enqueue-time and execute-time sources are built from identical inputs and
+ * their idempotency markers agree. v1 (legacy dimension columns) and v2
+ * (per-metric scorecard) columns are both present; `schema_version` decides
+ * which builder runs.
+ */
+const SCORECARD_ASSESSMENT_COLUMNS =
+  'id, schema_version, scoring_status, score_scale_max, weighted_score_5, metric_results, '
+  + 'english, tone, communication, motivation, role_fit, overall_score, recommendation, summary, provenance, created_at';
+
+/**
+ * Build the provider-neutral source for ONE persisted assessment row.
+ *
+ * v2 (`schema_version = 2`) → the per-metric adapter (dimensions keyed by
+ * metric key, carrying the metric name for auto-binding; rich summary from the
+ * rationales; red flags from the integrity pass). A blocked v2 row returns
+ * `null`, exactly as a missing assessment does — no overall is ever invented
+ * for an evidence-incomplete scorecard.
+ * v1 (anything else) → the legacy column reader, byte-for-byte as before.
+ */
+function scorecardSourceFromAssessmentRow(
+  a: Record<string, unknown>,
+  applicationLinkId: string,
+  externalApplicationId: string | undefined,
+): ScorecardSource | null {
+  if (Number(a.schema_version) === 2) {
+    const adapted = scorecardSourceFromV2Assessment(a as PersistedV2AssessmentRow, {
+      reviewPath: ashbyReviewPath(applicationLinkId),
+      externalApplicationId,
+    });
+    return isV2AdapterBlocked(adapted) ? null : adapted;
+  }
+  const obj = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
+  const num = (value: unknown): number => typeof value === 'number' ? value : Number(value) || 0;
+  const english = obj(a.english), tone = obj(a.tone), communication = obj(a.communication), motivation = obj(a.motivation), roleFit = obj(a.role_fit), provenance = obj(a.provenance);
+  return {
+    schemaVersion: 1,
+    externalApplicationId,
+    overallScore: num(a.overall_score),
+    recommendation: a.recommendation === 'advance' || a.recommendation === 'reject' ? a.recommendation : 'hold',
+    dimensions: [
+      { key: 'english', score: (num(english.grammar) + num(english.vocabulary) + num(english.fluency) + num(english.coherence)) / 4 },
+      { key: 'tone', score: (num(tone.clarity) + num(tone.confidence) + num(tone.professionalism)) / 3 },
+      { key: 'communication', score: num(communication.score) },
+      { key: 'motivation', score: num(motivation.score) },
+      { key: 'role_fit', score: num(roleFit.score) },
+    ],
+    summary: typeof a.summary === 'string' ? a.summary : '',
+    provenance: {
+      model: typeof provenance.requestedModel === 'string' ? provenance.requestedModel : undefined,
+      scoredAt: typeof a.created_at === 'string' ? a.created_at : undefined,
+      version: typeof provenance.prompt_template_version === 'string' ? provenance.prompt_template_version : undefined,
+    },
+    reviewPath: ashbyReviewPath(applicationLinkId),
+    // ONLY the persisted `role_fit.red_flags` array. Never any other
+    // provider/user payload key; normalization + bounds live in
+    // `normalizeRedFlags` so both build sites agree byte-for-byte.
+    redFlags: Array.isArray(roleFit.red_flags) ? roleFit.red_flags : [],
+  };
+}
 
 const SYSTEM_ACTOR = '00000000-0000-4000-8000-000000000001';
 
@@ -240,39 +307,17 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       if (linkError || !link || !sessionId) return null;
       const { data: assessment, error: assessmentError } = await client
         .from('assessments')
-        .select('english, tone, communication, motivation, role_fit, overall_score, recommendation, summary, provenance, created_at')
+        .select(SCORECARD_ASSESSMENT_COLUMNS)
         .eq('session_id', sessionId)
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle();
       if (assessmentError || !assessment) return null;
-      const a = assessment as Record<string, unknown>;
-      const obj = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-      const num = (value: unknown): number => typeof value === 'number' ? value : Number(value) || 0;
-      const english = obj(a.english), tone = obj(a.tone), communication = obj(a.communication), motivation = obj(a.motivation), roleFit = obj(a.role_fit), provenance = obj(a.provenance);
-      return {
-        externalApplicationId: String(link.external_application_id),
-        overallScore: num(a.overall_score),
-        recommendation: a.recommendation === 'advance' || a.recommendation === 'reject' ? a.recommendation : 'hold',
-        dimensions: [
-          { key: 'english', score: (num(english.grammar) + num(english.vocabulary) + num(english.fluency) + num(english.coherence)) / 4 },
-          { key: 'tone', score: (num(tone.clarity) + num(tone.confidence) + num(tone.professionalism)) / 3 },
-          { key: 'communication', score: num(communication.score) },
-          { key: 'motivation', score: num(motivation.score) },
-          { key: 'role_fit', score: num(roleFit.score) },
-        ],
-        summary: typeof a.summary === 'string' ? a.summary : '',
-        provenance: {
-          model: typeof provenance.requestedModel === 'string' ? provenance.requestedModel : undefined,
-          scoredAt: typeof a.created_at === 'string' ? a.created_at : undefined,
-          version: typeof provenance.prompt_template_version === 'string' ? provenance.prompt_template_version : undefined,
-        },
-        reviewPath: ashbyReviewPath(applicationLinkId),
-        // ONLY the persisted `role_fit.red_flags` array. Never any other
-        // provider/user payload key; normalization + bounds live in
-        // `normalizeRedFlags` so both build sites agree byte-for-byte.
-        redFlags: Array.isArray(roleFit.red_flags) ? roleFit.red_flags : [],
-      };
+      return scorecardSourceFromAssessmentRow(
+        assessment as unknown as Record<string, unknown>,
+        applicationLinkId,
+        String(link.external_application_id),
+      );
     },
     async readLink(applicationLinkId): Promise<WorkflowLinkRow | null> {
       const { data, error } = await client
@@ -400,43 +445,24 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       }
       const { data: assessment, error: assessmentError } = await client
         .from('assessments')
-        .select('id, english, tone, communication, motivation, role_fit, overall_score, recommendation, summary, provenance, created_at')
+        .select(SCORECARD_ASSESSMENT_COLUMNS)
         .eq('session_id', sessionId)
         .order('created_at', { ascending: false })
         .limit(1)
         .maybeSingle();
       if (assessmentError || !assessment) return { status: 'assessment_missing' };
-      const a = assessment as Record<string, unknown>;
-      const number = (value: unknown): number => typeof value === 'number' ? value : Number(value) || 0;
-      const object = (value: unknown): Record<string, unknown> => value && typeof value === 'object' && !Array.isArray(value) ? value as Record<string, unknown> : {};
-      const english = object(a.english);
-      const tone = object(a.tone);
-      const communication = object(a.communication);
-      const motivation = object(a.motivation);
-      const roleFit = object(a.role_fit);
-      const provenance = object(a.provenance);
-      const source: ScorecardSource = {
-        overallScore: number(a.overall_score),
-        recommendation: a.recommendation === 'advance' || a.recommendation === 'reject' ? a.recommendation : 'hold',
-        dimensions: [
-          { key: 'english', score: (number(english.grammar) + number(english.vocabulary) + number(english.fluency) + number(english.coherence)) / 4 },
-          { key: 'tone', score: (number(tone.clarity) + number(tone.confidence) + number(tone.professionalism)) / 3 },
-          { key: 'communication', score: number(communication.score) },
-          { key: 'motivation', score: number(motivation.score) },
-          { key: 'role_fit', score: number(roleFit.score) },
-        ],
-        summary: typeof a.summary === 'string' ? a.summary : '',
-        provenance: {
-          model: typeof provenance.requestedModel === 'string' ? provenance.requestedModel : undefined,
-          scoredAt: typeof a.created_at === 'string' ? a.created_at : undefined,
-          version: typeof provenance.prompt_template_version === 'string' ? provenance.prompt_template_version : undefined,
-        },
-        reviewPath: ashbyReviewPath(applicationLinkId),
-        // ONLY the persisted `role_fit.red_flags` array. Never any other
-        // provider/user payload key; normalization + bounds live in
-        // `normalizeRedFlags` so both build sites agree byte-for-byte.
-        redFlags: Array.isArray(roleFit.red_flags) ? roleFit.red_flags : [],
-      };
+      // The SAME builder the execute-time read uses, so the marker hashed here
+      // is the marker the worker recomputes. A v2 row that is not fully
+      // evidenced yields no source and is not enqueued (a human confirms it
+      // first) — reported distinctly from a missing assessment.
+      const source = scorecardSourceFromAssessmentRow(
+        assessment as unknown as Record<string, unknown>,
+        applicationLinkId,
+        typeof (link as Record<string, unknown>).external_application_id === 'string'
+          ? String((link as Record<string, unknown>).external_application_id)
+          : undefined,
+      );
+      if (!source) return { status: 'assessment_incomplete' };
       const built = buildScorecard(source, { min: 1, max: 4 });
       if (!built.ok) return { status: `scorecard_${built.reason}` };
       // Every cycle, including the initial one, must bind the exact assessment

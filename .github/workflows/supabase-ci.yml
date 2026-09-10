@@ -9,6 +9,7 @@ on:
       - 'scripts/supabase-*.sh'
       - 'scripts/test-funnel-views.sh'
       - 'scripts/test-scorecard-partial.sh'
+      - 'scripts/test-scorecard-scale.sh'
       - 'scripts/phone-canary/**'
       - 'docs/runbooks/synthetic-*.md'
       - 'docs/runbooks/supabase-*.md'
@@ -29,6 +30,7 @@ on:
       - 'scripts/supabase-*.sh'
       - 'scripts/test-funnel-views.sh'
       - 'scripts/test-scorecard-partial.sh'
+      - 'scripts/test-scorecard-scale.sh'
       - 'scripts/phone-canary/**'
       - 'docs/runbooks/synthetic-*.md'
       - 'docs/runbooks/supabase-*.md'
@@ -74,6 +76,14 @@ jobs:
       - uses: actions/checkout@v4
       - name: Scorecard 0091 recovery + relaxed CHECK + funnel branch (isolated real Postgres)
         run: bash scripts/test-scorecard-partial.sh
+
+  scorecard-scale-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Scorecard 0093 rubric rescale 1-5 to 1-4 (isolated real Postgres)
+        run: bash scripts/test-scorecard-scale.sh
 
   supabase-static-security:
     runs-on: ubuntu-latest

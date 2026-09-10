@@ -21,6 +21,7 @@
  */
 
 import { createHash } from 'node:crypto';
+import { SCORE_MAX, SCORE_SCALE_MAX_VALUES } from '../../lib/scorecards/contracts.js';
 
 /** Informational recommendation — NEVER drives an auto-reject/stage decision. */
 export const RECOMMENDATIONS = ['advance', 'hold', 'reject'] as const;
@@ -32,12 +33,30 @@ export interface ScorecardDimension {
   key: string;
   /** Raw 0–10 dimension score. */
   score: number;
+  /**
+   * v2 only: the metric's display name as configured in the dashboard. It is
+   * what the auto-binder matches against a form field's title. Never PII.
+   */
+  name?: string;
+  /**
+   * v2 only: the metric's own rubric score (1..metricScaleMax). When the bound
+   * Ashby Score field has the SAME scale the value is submitted 1:1 instead of
+   * re-bucketing the 0–10 projection (which would lose resolution).
+   */
+  metricScore?: number;
+  /**
+   * v2 only: the rubric scale `metricScore` is on — 4 since migration 0093,
+   * 5 for assessments scored before it. Absent means the current scale.
+   */
+  metricScaleMax?: number;
 }
 
 /** Bounded, PII-light view the saga extracts from a persisted assessment. */
 export interface ScorecardSource {
   /** Opaque Ashby application id used only as the provider request identity. */
   externalApplicationId?: string;
+  /** 1 (legacy columns) or 2 (per-metric scorecard). Absent means 1. */
+  schemaVersion?: 1 | 2;
   /** Overall 0–100 score. */
   overallScore: number;
   /** Informational recommendation. */
@@ -150,7 +169,7 @@ export interface NormalizedScorecard {
   scaleValue: number;
   scale: ScorecardScale;
   recommendation: Recommendation;
-  dimensions: { key: string; score: number }[];
+  dimensions: { key: string; score: number; name?: string; metricScore?: number; metricScaleMax?: number }[];
   summary: string;
   reviewPath: string;
   provenance: { model?: string; scoredAt?: string; version?: string };
@@ -163,7 +182,7 @@ export interface NormalizedScorecard {
 }
 
 /** Remove UTF-16 surrogate halves that have no partner. */
-function stripLoneSurrogates(value: string): string {
+export function stripLoneSurrogates(value: string): string {
   return value
     .replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/g, '')
     .replace(/(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, '');
@@ -327,7 +346,27 @@ export function buildScorecard(source: ScorecardSource, scale: ScorecardScale): 
   const dims = (source.dimensions ?? [])
     .filter((d) => d && typeof d.key === 'string' && d.key.length > 0)
     .slice(0, MAX_DIMENSIONS)
-    .map((d) => ({ key: d.key, score: Math.round(clampNum(d.score, 0, 10) * 100) / 100 }));
+    .map((d) => {
+      const out: NormalizedScorecard['dimensions'][number] = {
+        key: d.key,
+        score: Math.round(clampNum(d.score, 0, 10) * 100) / 100,
+      };
+      // v2 carriers, kept only when well-formed: a bounded display name and an
+      // integer 1–5 rubric score. Neither is PII; both are hashed into the
+      // marker below as part of the dimension list.
+      if (typeof d.name === 'string' && d.name.trim().length > 0) out.name = d.name.trim().slice(0, 100);
+      // The rubric scale the metric score is on (4 since 0093, 5 for older
+      // assessments). Only a KNOWN scale is carried; anything else falls back
+      // to the 0–10 projection rather than submitting an unscaled number.
+      const scaleMax = typeof d.metricScaleMax === 'number' && (SCORE_SCALE_MAX_VALUES as readonly number[]).includes(d.metricScaleMax)
+        ? d.metricScaleMax
+        : SCORE_MAX;
+      if (typeof d.metricScore === 'number' && Number.isInteger(d.metricScore) && d.metricScore >= 1 && d.metricScore <= scaleMax) {
+        out.metricScore = d.metricScore;
+        out.metricScaleMax = scaleMax;
+      }
+      return out;
+    });
   if (dims.length === 0) return { ok: false, reason: 'no_dimensions' };
 
   const recommendation: Recommendation = RECOMMENDATIONS.includes(source.recommendation)
@@ -419,8 +458,15 @@ export interface ScorecardFormBinding {
    * field takes a bare string, and only `RichText` takes a PlainText envelope.
    */
   fieldTypes?: { redFlags?: string; detailedReport?: string };
-  /** Verified Ashby Score scale for dimension fields. */
+  /** Verified Ashby Score scale for dimension fields (the default for every key). */
   dimensionScale?: ScorecardScale;
+  /**
+   * Per-dimension Score scales, keyed like `fieldPaths.dimensions`. Set by the
+   * auto-binder from each field's own definition so a five-point field and a
+   * four-point field on the same form each receive a value on ITS scale.
+   * A key absent here uses `dimensionScale`.
+   */
+  dimensionScales?: Record<string, ScorecardScale>;
 }
 
 /** The approved synthetic Hello Christy tenant binding. */
@@ -474,6 +520,35 @@ function mapDimensionToScale(score: number, scale: ScorecardScale): number {
   if (!Number.isFinite(min) || !Number.isFinite(max) || max <= min) return min;
   const pct = clampNum(score, 0, 10) / 10;
   return min + Math.min(max - min, Math.floor(pct * (max - min + 1)));
+}
+
+/**
+ * The value submitted for one dimension on one field's scale.
+ *
+ * A v2 dimension carries the metric's own rubric score and the scale it was
+ * scored on (4 since migration 0093; 5 for older assessments). When the Ashby
+ * field has THAT SAME scale the score is submitted exactly — which is the
+ * normal case now that the rubric is four-point like Ashby's Score fields, so
+ * nothing is bucketed and nothing is lost. Otherwise — a differently-scaled
+ * field, or a v1 dimension that has only its 0–10 projection — the projection
+ * is bucketed exactly as before.
+ */
+export function dimensionValueOnScale(
+  d: { score: number; metricScore?: number; metricScaleMax?: number },
+  scale: ScorecardScale,
+): number {
+  const min = Math.round(scale.min);
+  const max = Math.round(scale.max);
+  const metricScaleMax = typeof d.metricScaleMax === 'number' ? Math.round(d.metricScaleMax) : SCORE_MAX;
+  if (
+    typeof d.metricScore === 'number'
+    && Number.isInteger(d.metricScore)
+    && min === 1 && max === metricScaleMax
+    && d.metricScore >= 1 && d.metricScore <= metricScaleMax
+  ) {
+    return d.metricScore;
+  }
+  return mapDimensionToScale(d.score, scale);
 }
 
 /**
@@ -535,10 +610,20 @@ export function bindFeedbackForm(
   }
   const dimKeys = paths?.dimensions ?? binding.dimensionFieldIds ?? {};
   const dimensionScale = binding.dimensionScale ?? { min: 1, max: 4 };
+  const usedPaths = new Set(fieldSubmissions.map((s) => s.path));
   for (const d of scorecard.dimensions) {
     const fieldKey = dimKeys[d.key];
     if (typeof fieldKey === 'string' && fieldKey.length > 0) {
-      fieldSubmissions.push({ path: fieldKey, value: { score: mapDimensionToScale(d.score, dimensionScale) } });
+      // One field, one value. Two dimensions mapped to the same path would
+      // submit two values for it — undefined provider behaviour, and one score
+      // silently overwriting the other on a card that cannot be rewritten.
+      // The binder upstream already refuses to produce that; this is the
+      // structural backstop, and it refuses the WHOLE submission rather than
+      // dropping one silently.
+      if (usedPaths.has(fieldKey)) return { ok: false, reason: 'binding_incomplete' };
+      usedPaths.add(fieldKey);
+      const scale = binding.dimensionScales?.[d.key] ?? dimensionScale;
+      fieldSubmissions.push({ path: fieldKey, value: { score: dimensionValueOnScale(d, scale) } });
     }
   }
   const feedbackForm: Record<string, unknown> = { fieldSubmissions };

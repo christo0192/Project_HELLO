@@ -1,6 +1,6 @@
 /**
  * prompt.ts — the scorecard scoring prompt presents each configured metric
- * (name + per-role instruction + all five rubric levels) and demands the
+ * (name + per-role instruction + all four rubric levels) and demands the
  * results-array / configMetricId output contract.
  */
 
@@ -19,9 +19,8 @@ const metrics: RoleScorecardMetric[] = [
     rubric: {
       1: 'RUBRIC-COMM-ONE incoherent',
       2: 'RUBRIC-COMM-TWO hard to follow',
-      3: 'RUBRIC-COMM-THREE adequate',
-      4: 'RUBRIC-COMM-FOUR clear',
-      5: 'RUBRIC-COMM-FIVE outstanding',
+      3: 'RUBRIC-COMM-THREE clear',
+      4: 'RUBRIC-COMM-FOUR outstanding',
     },
     weightBps: 6000,
     displayOrder: 0,
@@ -35,9 +34,8 @@ const metrics: RoleScorecardMetric[] = [
     rubric: {
       1: 'RUBRIC-MOTIV-ONE none',
       2: 'RUBRIC-MOTIV-TWO weak',
-      3: 'RUBRIC-MOTIV-THREE some',
-      4: 'RUBRIC-MOTIV-FOUR strong',
-      5: 'RUBRIC-MOTIV-FIVE compelling',
+      3: 'RUBRIC-MOTIV-THREE strong',
+      4: 'RUBRIC-MOTIV-FOUR compelling',
     },
     weightBps: 4000,
     displayOrder: 1,
@@ -66,12 +64,37 @@ describe('buildScorecardPrompt', () => {
     }
   });
 
-  it('presents all five rubric levels for every metric', () => {
+  it('presents all four rubric levels for every metric, labelled Poor..Excellent', () => {
     for (const metric of metrics) {
-      for (const level of [1, 2, 3, 4, 5] as const) {
+      for (const level of [1, 2, 3, 4] as const) {
         expect(prompt).toContain(metric.rubric[level]);
       }
     }
+    // The level labels the recruiter sees are the ones the model is given (0093).
+    expect(prompt).toContain('1 (Poor):');
+    expect(prompt).toContain('2 (Average):');
+    expect(prompt).toContain('3 (Good):');
+    expect(prompt).toContain('4 (Excellent):');
+    // No fifth level is offered anywhere — the retired scale must not leak back
+    // in via a label, a rubric line, or the range the model is told to use.
+    expect(prompt).not.toContain('Below average');
+    expect(prompt).not.toMatch(/^\s*5 \(/m);
+    expect(prompt).not.toContain('1..5');
+  });
+
+  it('states the integer 1..4 range in BOTH the directive and the output contract', () => {
+    // A stale "1..5" here is how an off-scale 5 gets into the model output and
+    // then fails domain validation, so both statements of the range are pinned.
+    expect(prompt).toContain('scored on an integer 1..4 scale');
+    expect(prompt).toContain('"score": <integer 1..4, or null>');
+    expect(prompt).toContain('"score" to the integer 1..4');
+  });
+
+  it('forbids copying personal identifiers into the rationale', () => {
+    // The rationale is written verbatim onto the Ashby summary, so the prompt
+    // must bar phone numbers / emails / addresses / third-party names from it.
+    expect(prompt).toMatch(/Never copy personal identifiers into "rationale"/);
+    expect(prompt).toMatch(/phone numbers, email addresses/);
   });
 
   it('demands the results-array / configMetricId output contract', () => {

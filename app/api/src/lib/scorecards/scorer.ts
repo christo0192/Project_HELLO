@@ -26,6 +26,7 @@
 import { env } from '../env.js';
 import { runClaudeJSONWithProvenance } from '../claude.js';
 import {
+  SCORE_MAX,
   SCORECARD_SCHEMA_VERSION,
   type RoleScorecardMetric,
   type RoleScorecardVersion,
@@ -137,6 +138,9 @@ export async function scoreWithScorecard(
     revision: 1,
     status,
     metricResults: attachMetrics(metrics, validated),
+    // The rubric scale this pass scored on, recorded so a reader never has to
+    // guess (pre-0093 rows lack it and are read as the historical 5).
+    scoreScaleMax: SCORE_MAX,
     weightedScore5,
     overallScore,
     recommendation,

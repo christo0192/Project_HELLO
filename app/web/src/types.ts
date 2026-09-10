@@ -236,6 +236,8 @@ export interface Assessment {
   revision?: number;
   scoring_status?: ScorecardAssessmentStatus;
   weighted_score_5?: number | null;
+  /** Rubric scale the row was scored on (4 since the four-level rubric; 5 before). Absent on older API payloads. */
+  score_scale_max?: ScoreScaleMax | null;
   metric_results?: ScorecardMetricModelResult[];
 }
 
@@ -253,8 +255,29 @@ export const SCORECARD_MAX_NAME_LENGTH = 100 as const;
 export const SCORECARD_MAX_INSTRUCTION_LENGTH = 1000 as const;
 export const SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH = 500 as const;
 
-/** 1..5 rubric level labels — Poor → Excellent (contracts.ts SCORE_LABELS). */
+/**
+ * Rubric scale — FOUR levels since 2026-09-10 (owner decision; mirrors
+ * contracts.ts SCORE_MIN/SCORE_MAX/SCORE_LABELS). Ashby `Score` fields are
+ * four-point, so the dashboard rubric uses the same four levels. Assessments
+ * scored before the change are NOT rescored: they carry `scoreScaleMax = 5`
+ * and are displayed on their own scale with {@link LEGACY_SCORE_LABELS_5}.
+ */
+export const SCORE_MIN = 1 as const;
+export const SCORE_MAX = 4 as const;
+
+/** Every scale a persisted assessment may carry (`assessments.score_scale_max`). */
+export type ScoreScaleMax = 4 | 5;
+
+/** 1..4 rubric level labels — Poor → Excellent (contracts.ts SCORE_LABELS). */
 export const SCORE_LABELS = {
+  1: 'Poor',
+  2: 'Average',
+  3: 'Good',
+  4: 'Excellent',
+} as const;
+
+/** Labels of the retired five-level scale, for DISPLAY of pre-migration assessments only. */
+export const LEGACY_SCORE_LABELS_5 = {
   1: 'Poor',
   2: 'Below average',
   3: 'Average',
@@ -262,8 +285,26 @@ export const SCORE_LABELS = {
   5: 'Excellent',
 } as const;
 
-export type ScoreValue = 1 | 2 | 3 | 4 | 5;
+/** A rubric level on the CURRENT (four-level) scale — what the library/role editors author. */
+export type ScoreValue = 1 | 2 | 3 | 4;
 export type ScorecardRubric = Record<ScoreValue, string>;
+/**
+ * A metric score as PERSISTED on an assessment row — on that row's own scale,
+ * so `5` is valid for a historical `scoreScaleMax = 5` row. Deliberately wider
+ * than {@link ScoreValue}: the read path must render old rows truthfully, never
+ * narrow or re-bucket them.
+ */
+export type PersistedScoreValue = 1 | 2 | 3 | 4 | 5;
+
+export function isScoreScaleMax(value: unknown): value is ScoreScaleMax {
+  return value === 4 || value === 5;
+}
+
+/** The label for a persisted metric score on the scale it was scored on. */
+export function scoreLabel(score: number, scaleMax: ScoreScaleMax): string {
+  const labels: Record<number, string> = scaleMax === 5 ? LEGACY_SCORE_LABELS_5 : SCORE_LABELS;
+  return labels[score] ?? String(score);
+}
 export type MetricEvidenceStatus = 'scored' | 'insufficient_evidence';
 export type ScorecardAssessmentStatus = 'complete' | 'incomplete_evidence';
 export type ScorecardRecommendation = 'advance' | 'hold' | 'reject' | 'human_review';
@@ -348,7 +389,8 @@ export interface RedistributeWeightsResponse {
 /** Model output per metric — the top-level `metric_results` column shape. */
 export interface ScorecardMetricModelResult {
   configMetricId: string;
-  score: ScoreValue | null;
+  /** On the row's own scale (`scoreScaleMax`) — see {@link PersistedScoreValue}. */
+  score: PersistedScoreValue | null;
   evidenceStatus: MetricEvidenceStatus;
   rationale: string;
   evidenceRefs: string[];
@@ -366,16 +408,29 @@ export interface ScorecardAssessmentV2 {
   revision: number;
   status: ScorecardAssessmentStatus;
   metricResults: ScorecardMetricResult[];
+  /**
+   * The rubric scale this assessment was scored on. `4` since the four-level
+   * rubric; a `raw` object persisted before that LACKS the field and readers
+   * treat it as `5` (see `readScorecardAssessmentV2`). `weightedScore5` keeps
+   * its historical name; its range is 1..scoreScaleMax.
+   */
+  scoreScaleMax: ScoreScaleMax;
   weightedScore5: number | null;
   overallScore: number | null;
   recommendation: ScorecardRecommendation;
 }
 
+/** `raw` as it may actually sit on a persisted row: pre-migration objects have no `scoreScaleMax`. */
+export type ScorecardAssessmentV2Raw = Omit<ScorecardAssessmentV2, 'scoreScaleMax'> & {
+  scoreScaleMax?: ScoreScaleMax;
+};
+
 /** Flattened, display-ready per-metric result (what the candidate v2 view needs). */
 export interface ScorecardMetricDisplay {
   id: string;
   name: string;
-  score: ScoreValue | null;
+  /** On the assessment's own scale (`ScorecardAssessmentDisplay.scoreScaleMax`). */
+  score: PersistedScoreValue | null;
   evidenceStatus: MetricEvidenceStatus;
   rationale: string;
   evidenceRefs: string[];
@@ -386,6 +441,8 @@ export interface ScorecardMetricDisplay {
 /** Normalised v2 read model the candidate scorecard renders. */
 export interface ScorecardAssessmentDisplay {
   status: ScorecardAssessmentStatus;
+  /** Scale every metric score and `weightedScore5` on this card are read against (4 or 5). */
+  scoreScaleMax: ScoreScaleMax;
   weightedScore5: number | null;
   overallScore: number | null;
   recommendation: ScorecardRecommendation;
@@ -416,13 +473,20 @@ export function readScorecardAssessmentV2(
   const row = a as unknown as {
     scoring_status?: ScorecardAssessmentStatus;
     weighted_score_5?: number | null;
+    score_scale_max?: number | null;
     overall_score?: number | null;
     recommendation?: ScorecardRecommendation | null;
     metric_results?: ScorecardMetricModelResult[];
-    raw?: ScorecardAssessmentV2 | null;
+    raw?: ScorecardAssessmentV2Raw | null;
   };
   const raw =
     row.raw && Array.isArray(row.raw.metricResults) ? row.raw : null;
+
+  // Scale resolution: the raw object (new rows) → the DB column (new reads of
+  // older rows) → 5. A row with neither predates the four-level rubric and was
+  // scored 1–5; it is displayed on that scale, never re-bucketed.
+  const scaleCandidate = raw?.scoreScaleMax ?? row.score_scale_max ?? 5;
+  const scoreScaleMax: ScoreScaleMax = isScoreScaleMax(scaleCandidate) ? scaleCandidate : 5;
 
   const metrics: ScorecardMetricDisplay[] = raw
     ? raw.metricResults.map((r) => ({
@@ -446,6 +510,7 @@ export function readScorecardAssessmentV2(
 
   return {
     status: raw?.status ?? row.scoring_status ?? 'incomplete_evidence',
+    scoreScaleMax,
     weightedScore5: raw?.weightedScore5 ?? row.weighted_score_5 ?? null,
     overallScore: raw?.overallScore ?? row.overall_score ?? null,
     recommendation:
@@ -1130,6 +1195,62 @@ export interface AshbyFeedbackFormResponse {
   empty?: boolean;
   /** True when a bound clipped the result — the view is partial. */
   truncated?: boolean;
+  error?: string;
+}
+
+/**
+ * Read-only preview of what a v2 scorecard write WOULD bind for one mapping's
+ * role (issue #275): metrics bind to form Score fields BY NAME at write time.
+ * Structure only — field paths, titles, types, scales. Never a submitted
+ * value or a candidate datum, and viewing it binds nothing.
+ */
+export type AshbyScorecardMetricBindStatus =
+  | 'bound'
+  | 'no_field'
+  | 'ambiguous_title'
+  /** Two metrics carry this name, so neither may claim the field. */
+  | 'ambiguous_metric'
+  | 'not_score_type'
+  | 'no_path';
+
+export interface AshbyScorecardFixedFieldCheck {
+  name: 'overall' | 'summary' | 'redFlags' | 'detailedReport';
+  path: string;
+  expectedType: string | null;
+  status: 'present' | 'missing' | 'type_mismatch';
+  actualType: string | null;
+}
+
+export interface AshbyScorecardMetricBindRow {
+  key: string;
+  name: string;
+  status: AshbyScorecardMetricBindStatus;
+  fieldPath: string | null;
+  scale: { min: number; max: number } | null;
+}
+
+export interface AshbyScorecardBindingPreview {
+  formDefinitionId: string;
+  formTitle: string | null;
+  schemaAvailable: boolean;
+  archived: boolean;
+  formMatchesBinding: boolean;
+  fixedFields: AshbyScorecardFixedFieldCheck[];
+  metrics: AshbyScorecardMetricBindRow[];
+  unusedScoreFields: Array<{ fieldId: string; title: string | null }>;
+  /** True only when every fixed field and EVERY metric would bind. */
+  ready: boolean;
+}
+
+export interface AshbyScorecardBindingPreviewResponse {
+  ok: boolean;
+  /**
+   * `v2_autobind` = the role has an active dashboard scorecard and metrics
+   * bind by name; `v1_legacy` = no active scorecard, the fixed v1 binding is
+   * used; `no_role` = the mapping carries no role.
+   */
+  scoringPath?: 'v2_autobind' | 'v1_legacy' | 'no_role';
+  preview?: AshbyScorecardBindingPreview;
   error?: string;
 }
 

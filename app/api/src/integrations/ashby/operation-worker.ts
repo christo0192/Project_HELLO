@@ -60,7 +60,14 @@
  */
 
 import type { RuntimeWorkflowStores, OperationClaimRow } from './orchestration.js';
-import { bindFeedbackForm, buildScorecard, HELLO_CHRISTY_SCORECARD_BINDING } from './scorecard.js';
+import {
+  bindFeedbackForm,
+  buildScorecard,
+  HELLO_CHRISTY_SCORECARD_BINDING,
+  type ScorecardFormBinding,
+} from './scorecard.js';
+import { autobindScorecardDimensions, composeAutoboundBinding } from './scorecard-autobind.js';
+import type { ProbeFeedbackForm } from './probe.js';
 import { materializeInvite, type MaterializationStore, type MaterializationMapping } from './materialize.js';
 import type { EmailProviderState } from './invite-delivery.js';
 import { isAshbyError } from './errors.js';
@@ -97,6 +104,20 @@ export interface OperationWorkerDeps {
   scorecard?: {
     submit(req: { applicationId: string; formDefinitionId: string; feedbackForm: Record<string, unknown> }): Promise<unknown>;
     dashboardOrigin: string;
+    /**
+     * Read-only form STRUCTURE for the verified form (sections/fields/types/
+     * scales; never submitted feedback). Required for a v2 scorecard: the
+     * auto-binder matches each metric to the Score field whose title equals
+     * the metric's name. Absent ⇒ a v2 operation fails closed as
+     * `form_schema_unavailable`; v1 operations never call it.
+     */
+    /**
+     * Read-only form STRUCTURE for the v2 auto-binder. `fresh` bypasses any
+     * cache — the worker asks for it before accepting an unmatched metric, so
+     * a stale definition can never silently drop a metric from a card that
+     * cannot be rewritten.
+     */
+    readFormDefinition?(formDefinitionId: string, fresh?: boolean): Promise<ProbeFeedbackForm | null>;
   };
   /** Resolve mapping config for a link's job. Null when no usable mapping. */
   resolveMappingForLink(applicationLinkId: string): Promise<MaterializationMapping | null>;
@@ -223,7 +244,74 @@ export async function runClaimedAshbyOperation(
         const r = await deps.stores.failOperation(claim.id, claim.leaseToken, `scorecard_${built.reason}`, false);
         return { claimed: true, operationType: claim.operationType, committed: false, staleLease: r === 'not_owned', code: `scorecard_${built.reason}` };
       }
-      const bound = bindFeedbackForm(built.scorecard, HELLO_CHRISTY_SCORECARD_BINDING, deps.scorecard.dashboardOrigin);
+      // ── Which binding? ────────────────────────────────────────────────
+      // v1: the verified static table, unchanged.
+      // v2: the FIXED fields from the static binding plus dimension fields
+      // AUTO-BOUND by name from the form's live definition (#275). The form
+      // read is a transient dependency: when it is unavailable the operation is
+      // failed RETRYABLE and tries again later, rather than submitting a card
+      // with every metric silently dropped. A definition that does not
+      // describe the verified form refuses the whole binding (fail closed).
+      let binding: ScorecardFormBinding = HELLO_CHRISTY_SCORECARD_BINDING;
+      if (source.schemaVersion === 2) {
+        // A form the tenant's API cannot serve right now is a WAIT, not a
+        // failure: DEFER (refunding the attempt the claim charged) so a brief
+        // provider blip cannot burn max_attempts in ~25 seconds and strand a
+        // scorecard that can never be written again.
+        const deferFormRead = async () => {
+          const r = await deps.stores.deferOperation(claim.id, claim.leaseToken, 'form_schema_unavailable', deferSeconds);
+          emit('deferred', 'form_schema_unavailable');
+          return { claimed: true as const, operationType: claim.operationType, committed: false, staleLease: r === 'not_owned', code: 'form_schema_unavailable' };
+        };
+        if (!deps.scorecard.readFormDefinition || !HELLO_CHRISTY_SCORECARD_BINDING.formDefinitionId) {
+          return deferFormRead();
+        }
+        const formId = HELLO_CHRISTY_SCORECARD_BINDING.formDefinitionId;
+        const readFormDefinition = deps.scorecard.readFormDefinition;
+        const readForm = async (fresh: boolean): Promise<ProbeFeedbackForm | null> => {
+          try {
+            return await readFormDefinition(formId, fresh);
+          } catch {
+            return null;
+          }
+        };
+        let form = await readForm(false);
+        if (!form || !form.schemaAvailable) return deferFormRead();
+        const metrics = built.scorecard.dimensions
+          .filter((d) => typeof d.name === 'string' && d.name.length > 0)
+          .map((d) => ({ key: d.key, name: d.name as string }));
+        let autobind = autobindScorecardDimensions(form, metrics);
+        // A cached definition can be up to a few minutes old. Rather than write
+        // an irretractable card that drops a metric the recruiter has just
+        // added a field for, re-read the definition uncached and re-bind before
+        // accepting ANY unmatched metric.
+        if (autobind.unmatched.length > 0) {
+          const fresh = await readForm(true);
+          if (!fresh || !fresh.schemaAvailable) return deferFormRead();
+          form = fresh;
+          autobind = autobindScorecardDimensions(form, metrics);
+        }
+        const composed = composeAutoboundBinding(HELLO_CHRISTY_SCORECARD_BINDING, form, autobind);
+        if (!composed) {
+          const r = await deps.stores.failOperation(claim.id, claim.leaseToken, 'form_definition_mismatch', false);
+          emit('blocked', 'form_definition_mismatch');
+          return { claimed: true, operationType: claim.operationType, committed: false, staleLease: r === 'not_owned', code: 'form_definition_mismatch' };
+        }
+        // A card carrying NO metric score at all is worse than no card: the
+        // scorecard cannot be retracted or rewritten, so writing one before the
+        // form has any matching field loses every per-metric score forever.
+        // Fail closed and let a recruiter fix the form titles (the Mission
+        // Control binding preview names exactly which ones).
+        if (metrics.length > 0 && autobind.matched.length === 0) {
+          const r = await deps.stores.failOperation(claim.id, claim.leaseToken, 'no_metric_fields_bound', false);
+          emit('blocked', 'no_metric_fields_bound');
+          return { claimed: true, operationType: claim.operationType, committed: false, staleLease: r === 'not_owned', code: 'no_metric_fields_bound' };
+        }
+        // Counts only — a metric NAME is tenant configuration, not for logs.
+        emit('scorecard_autobind', `matched_${autobind.matched.length}_unmatched_${autobind.unmatched.length}`);
+        binding = composed;
+      }
+      const bound = bindFeedbackForm(built.scorecard, binding, deps.scorecard.dashboardOrigin);
       if (!bound.ok || !source.externalApplicationId) {
         const reason = bound.ok ? 'application_id_missing' : bound.reason;
         const r = await deps.stores.failOperation(claim.id, claim.leaseToken, reason, false);

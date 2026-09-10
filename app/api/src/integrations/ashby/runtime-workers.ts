@@ -53,6 +53,44 @@ import {
 import { runReconciliation, DEFAULT_CHECKPOINT_KEY } from './reconciliation.js';
 import type { ReconcileResult, ReconcileSkipCounts, ReconcileStop } from './reconciliation.js';
 import { runAshbyOperationPass } from './operation-worker.js';
+import { probeFeedbackFormDefinition, type FormDefinitionReader, type ProbeFeedbackForm } from './probe.js';
+
+/**
+ * How long a form definition read is reused before it is fetched again. Long
+ * enough that a burst of scorecards costs one provider read; short enough that
+ * a recruiter who adds a metric field to the form sees it bind within minutes.
+ */
+export const FORM_DEFINITION_CACHE_MS = 5 * 60_000;
+
+const formDefinitionCache = new Map<string, { at: number; form: ProbeFeedbackForm | null }>();
+
+/**
+ * Cached, read-only form STRUCTURE for the scorecard auto-binder. A failed or
+ * empty read is NOT cached: the worker retries the operation later, and the
+ * next attempt must reach the provider again rather than replay the miss.
+ */
+export async function readFormDefinitionCached(
+  formDefinitionId: string,
+  reader: FormDefinitionReader,
+  nowMs: () => number = () => Date.now(),
+  fresh = false,
+): Promise<ProbeFeedbackForm | null> {
+  const hit = fresh ? undefined : formDefinitionCache.get(formDefinitionId);
+  if (hit && nowMs() - hit.at < FORM_DEFINITION_CACHE_MS) return hit.form;
+  const form = await probeFeedbackFormDefinition(formDefinitionId, reader);
+  // An ARCHIVED definition is never cached either: archiving is reversible in
+  // the Ashby UI, and caching it would keep failing scorecard writes closed for
+  // the whole TTL after the form is restored.
+  if (form && form.schemaAvailable && form.archived !== true) {
+    formDefinitionCache.set(formDefinitionId, { at: nowMs(), form });
+  }
+  return form;
+}
+
+/** TEST SEAM: forget every cached definition. */
+export function __resetFormDefinitionCacheForTest(): void {
+  formDefinitionCache.clear();
+}
 import {
   materializeCandidate,
   materializeCandidateShell,
@@ -925,12 +963,27 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
             scorecard: {
               submit: (request) => runtime.client.applicationFeedbackSubmit(request),
               dashboardOrigin: (process.env.WEB_ORIGIN ?? '').split(',')[0]?.trim() ?? '',
+              // Read-only form STRUCTURE for the v2 auto-binder (#275). Cached
+              // briefly so a burst of scorecards costs one provider read.
+              readFormDefinition: (formDefinitionId, fresh) =>
+                readFormDefinitionCached(formDefinitionId, runtime.client, undefined, fresh === true),
             },
             resolveMappingForLink: runtime.resolveMappingForLink,
             reissuePathFor,
             email: { providerApproved: false, domainVerified: false },
             owner,
             leaseSeconds: rc.leaseSeconds,
+            // Metadata only: operation kind + sanitized code (for the v2
+            // auto-binder these are COUNTS such as `matched_4_unmatched_1`,
+            // never a metric name or a field path). Without this the binding
+            // outcome of a scorecard write was observable nowhere.
+            onEvent: (e) => {
+              logger.info('unknown_event', {
+                error_category: `operation_${e.kind}`,
+                error_type: e.operationType,
+                ...(e.code ? { schema: e.code } : {}),
+              });
+            },
           });
           return r.invite.claimed || r.scorecard.claimed;
         },
