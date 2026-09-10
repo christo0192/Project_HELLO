@@ -6,8 +6,12 @@
  * It claims `invite_delivery` and `scorecard_write`. It NEVER claims
  * `stage_move`.
  *
- * `scorecard_write` became executable when the tenant-verified Hello Christy
- * form binding landed (#275). What keeps it honest:
+ * `scorecard_write` became executable on 2026-08-20 (be2c10e) when the
+ * tenant-verified Hello Christy form binding landed, and v1 scorecards have
+ * been reaching Ashby ever since. #275 did NOT switch write-back on; it
+ * changed how a v2 (role-scorecard) assessment binds: metrics match form
+ * fields by NAME, the derived Role fit rides along, and the rubric is
+ * four-level. What keeps all of it honest:
  *   - `bindFeedbackForm` still fails closed with `binding_unverified` for
  *     anything unverified, and the four FIXED fields (overall recommendation,
  *     Summary, Red flags, Detailed report) come only from that hand-verified
@@ -80,13 +84,14 @@ import type { EmailProviderState } from './invite-delivery.js';
 import { isAshbyError } from './errors.js';
 
 /**
- * The ONLY operation types this runtime executes. Deliberately excludes
- * `scorecard_write` and `stage_move` — see the module header.
+ * The ONLY operation types this runtime executes. `stage_move` is deliberately
+ * absent — see the module header.
  */
 export const SUPPORTED_OPERATION_TYPES = ['invite_delivery', 'scorecard_write'] as const;
 export type SupportedOperationType = (typeof SUPPORTED_OPERATION_TYPES)[number];
 
-/** Operation types the runtime must never claim while no result sink exists. */
+/** Operation types the runtime must never claim. Acting on a candidate's
+ *  application is a product decision, not a capability gap. */
 export const REFUSED_OPERATION_TYPES = ['stage_move'] as const;
 
 /**
@@ -115,14 +120,10 @@ export interface OperationWorkerDeps {
      * Read-only form STRUCTURE for the verified form (sections/fields/types/
      * scales; never submitted feedback). Required for a v2 scorecard: the
      * auto-binder matches each metric to the Score field whose title equals
-     * the metric's name. Absent ⇒ a v2 operation fails closed as
-     * `form_schema_unavailable`; v1 operations never call it.
-     */
-    /**
-     * Read-only form STRUCTURE for the v2 auto-binder. `fresh` bypasses any
-     * cache — the worker asks for it before accepting an unmatched metric, so
-     * a stale definition can never silently drop a metric from a card that
-     * cannot be rewritten.
+     * the metric's name. `fresh` bypasses the cache, which the worker asks for
+     * before accepting an unmatched metric so a stale definition can never
+     * silently drop a metric from a card that cannot be rewritten. Absent ⇒ a
+     * v2 operation defers as `form_schema_unavailable`; v1 never calls it.
      */
     readFormDefinition?(formDefinitionId: string, fresh?: boolean): Promise<ProbeFeedbackForm | null>;
   };

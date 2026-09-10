@@ -328,8 +328,10 @@ unused.
 ## 7. What is written back to Ashby, and what is still refused
 
 **The scorecard IS published. The stage move is NOT.** This section used to say
-nothing was written back at all; that stopped being true when the verified
-Hello Christy form binding landed (#275). Read it as two separate questions.
+nothing was written back at all. That stopped being true on **2026-08-20**
+(`be2c10e`), when the tenant-verified Hello Christy form binding landed — v1
+scorecards have been reaching Ashby ever since, and this page told operators
+the opposite for three weeks. Read it as two separate questions.
 
 ### 7a. Scorecard write-back — LIVE
 
@@ -337,6 +339,14 @@ Hello Christy form binding landed (#275). Read it as two separate questions.
 completed screening enqueues one `scorecard_write` per application link and the
 worker submits `applicationFeedback.submit` against the verified form
 `1c9a92c0-c18f-4bf1-898f-c29e71d7d303`.
+
+**Two shapes reach that form.** A v1 (legacy dimension) assessment has been
+writing since 2026-08-20 and is proven in production. A **v2** (role-scorecard)
+assessment binds differently — metrics match form fields by NAME, the derived
+Role fit rides along, and scores are on the four-level rubric — and as of
+2026-09-10 that path has **not yet run against a real screening**. Check
+`ashby_operations` for the link's `scorecard_write` state after the first v2
+completion rather than assuming it behaved like v1.
 
 What still holds it closed when it should be closed:
 
