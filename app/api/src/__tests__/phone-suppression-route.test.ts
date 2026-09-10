@@ -46,11 +46,11 @@ interface SuppressionSpy {
 function suppressionStores(over: Partial<PhoneStores> = {}): SuppressionSpy {
   const calls: Array<{ op: string; input: unknown }> = [];
   const stores = {
-    async suppressCandidatePhone(input) {
+    async suppressCandidatePhone(input: unknown) {
       calls.push({ op: 'suppress', input });
       return { status: 'ok' as const, alreadySuppressed: false, dialsStopped: 0 };
     },
-    async releaseCandidatePhoneSuppression(input) {
+    async releaseCandidatePhoneSuppression(input: unknown) {
       calls.push({ op: 'release', input });
       return {
         status: 'ok' as const,
@@ -59,7 +59,7 @@ function suppressionStores(over: Partial<PhoneStores> = {}): SuppressionSpy {
         releasedSource: 'candidate' as const,
       };
     },
-    async phoneSuppressionState(input) {
+    async phoneSuppressionState(input: unknown) {
       calls.push({ op: 'state', input });
       return { status: 'ok' as const, suppressed: false, owned: false };
     },
