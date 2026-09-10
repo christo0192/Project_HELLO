@@ -36,6 +36,15 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+export const MIGRATION_0094_PATH = fileURLToPath(
+  new URL(
+    '../../../../supabase/migrations/0094_phone_dial_scope_fleet_cap_suppressions.sql',
+    import.meta.url,
+  ),
+);
+
+export const MIGRATION_0094 = readFileSync(MIGRATION_0094_PATH, 'utf8');
+
 export const MIGRATION_0042_PATH = fileURLToPath(
   new URL('../../../../supabase/migrations/0042_phone_screening.sql', import.meta.url),
 );
@@ -199,6 +208,13 @@ export const MIGRATION_0092 = readFileSync(MIGRATION_0092_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0094 re-declares admit_phone_attempt IN FULL (0083's body plus the fleet
+    // daily cap), so it must come FIRST or every extractor reads 0083's
+    // superseded body and the new `fleet_daily_cap_reached` refusal is
+    // invisible to the drift test — which is precisely the silent gap this
+    // support module exists to close. It also declares the three 0094
+    // suppression RPCs, which no earlier migration mentions.
+    { name: '0094', sql: MIGRATION_0094 },
     // 0092 re-declares phone_temporary_247_until (cutoff pulled back to the
     // elapsed 2026-09-09, ENDING the testing all-hours window). Newest-first so
     // helperLiteral('phone_temporary_247_until') reads the effective date.
@@ -289,6 +305,12 @@ export const CLOCK_FREE_RPCS: readonly string[] = Object.freeze([
   // 0045: a constant. It answers how long a phone `waiting` session may
   // legitimately live, which is a property of the ladder, not of the clock.
   'phone_stale_session_seconds',
+  // 0094: a pure read of present state — is this candidate's number on the
+  // do-not-call list, and why. Suppression has no expiry, so there is no
+  // instant for the answer to depend on. Its two SIBLINGS are deliberately
+  // NOT here: they write audit rows and so take `p_now` like every other
+  // writer in this lane.
+  'phone_suppression_state',
 ]);
 
 /**
@@ -384,6 +406,13 @@ export const RPC_NAMES = [
   // list_terminal_session_leases) are the voice-worker orchestration domain,
   // NOT phone screening, so they are deliberately not listed here.
   'abandon_phone_attempt_infra',
+  // 0094 — the do-not-call write path that `phone_suppressions` never had.
+  // `phone_max_daily_dials()` is deliberately NOT listed: it is a constant
+  // helper like `phone_max_concurrent()`, not a service-role RPC, and it
+  // returns an integer rather than a status envelope.
+  'suppress_candidate_phone',
+  'release_candidate_phone_suppression',
+  'phone_suppression_state',
 ] as const;
 
 /**

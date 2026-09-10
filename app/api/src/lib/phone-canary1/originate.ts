@@ -126,6 +126,13 @@ export function buildCanary1ScreeningConfig(
     // Exactly one entry, built from the value typed at the prompt, and never
     // written anywhere. See the header on why this makes the check vacuous.
     dialAllowlist: [digest],
+    // 0094: pinned to `allowlist` DELIBERATELY, and never read from the
+    // environment. The canary's contract is that it can dial exactly the one
+    // number typed at the prompt and nothing else; `pipeline` scope would make
+    // the check above unconditional and quietly widen a rehearsal tool into a
+    // dialer. The vacuity here is by construction from a single-entry list,
+    // which is auditable — not by skipping the comparison.
+    dialScope: 'allowlist',
     slotSeconds: 1_800,
     reconnectBackoffSeconds: 120,
     infraDeferBackoffSeconds: 300,

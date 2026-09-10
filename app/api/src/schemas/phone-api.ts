@@ -30,6 +30,8 @@ import { uuidSchema } from './common.js';
 import {
   PHONE_APPOINTMENT_CANCEL_REASONS,
   PHONE_HALT_REASONS,
+  PHONE_SUPPRESSION_REASONS,
+  PHONE_SUPPRESSION_SOURCES,
 } from '../lib/phone-screening/index.js';
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -212,3 +214,33 @@ export const phoneHaltClearSchema = z
   .strict();
 
 export type PhoneHaltClearInput = z.infer<typeof phoneHaltClearSchema>;
+
+/**
+ * Adding a candidate's line to the do-not-call list (0094).
+ *
+ * THE BODY CARRIES NO NUMBER, and there is deliberately no field in which one
+ * could be sent. The candidate is named by id in the PATH; the RPC reads
+ * `phone_e164` from the candidate row and digests it inside the database, so
+ * the number never enters this process — the same property `admit_phone_attempt`
+ * maintains and the reason this route cannot be given a "suppress this number"
+ * convenience form later without breaking it.
+ *
+ * Both vocabularies are the schema's own CHECK allowlists, mirrored in
+ * `phone-screening/vocabulary.ts` and drift-tested against the migration.
+ * `source` defaults to `operator` because this route IS the operator surface;
+ * a candidate-initiated opt-out arriving through some future self-service path
+ * would send `candidate` explicitly rather than inheriting a wrong default.
+ */
+export const phoneSuppressionCreateSchema = z
+  .object({
+    reason: z.enum(PHONE_SUPPRESSION_REASONS),
+    source: z.enum(PHONE_SUPPRESSION_SOURCES).default('operator'),
+  })
+  .strict();
+
+export type PhoneSuppressionCreateInput = z.infer<typeof phoneSuppressionCreateSchema>;
+
+/** `/suppressions/:candidateId` — the candidate whose line is addressed. */
+export const phoneCandidateIdParamSchema = z
+  .object({ candidateId: uuidSchema })
+  .strict();

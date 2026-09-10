@@ -22,6 +22,7 @@ import {
   loadPhoneScreeningConfig,
   parseDialAllowlist,
   parseDialMode,
+  parseDialScope,
 } from '../lib/phone-screening/config.js';
 
 /**
@@ -278,6 +279,10 @@ describe('the health view leaks nothing', () => {
       runtimeEnabled: true,
       runtimeActive: true,
       dialMode: 'live',
+      // 0094. A closed two-member vocabulary, not an identifier about anyone,
+      // and reported because it changes which refusals an operator should
+      // expect to see for a candidate who is not being called.
+      dialScope: 'allowlist',
       dialAllowlistSize: 2,
       liveDialPermitted: true,
     });
@@ -326,6 +331,11 @@ describe('the env contract holds in BOTH directions', () => {
     'PHONE_RUNTIME_ENABLED',
     'PHONE_DIAL_MODE',
     'PHONE_DIAL_ALLOWLIST',
+    // 0094 — which question the pre-claim dial gate asks. `allowlist` (the
+    // default, and the rollback) filters by digest against the list above;
+    // `pipeline` delegates to admit_phone_attempt. Read in
+    // `lib/phone-screening/config.ts`.
+    'PHONE_DIAL_SCOPE',
     'PHONE_SLOT_SECONDS',
     'PHONE_RECONNECT_BACKOFF_SECONDS',
     // 0083 / P3 — backoff applied to next_eligible_at on a worker-not-ready
@@ -516,5 +526,102 @@ describe('the shipped .env.example satisfies the bounds it will be measured agai
     // nothing can violate.
     const ring = exampleInts().PHONE_RING_TIMEOUT_SECONDS;
     expect(60).toBeLessThan(ring + PHONE_OPENING_GATE_SECONDS);
+  });
+});
+
+
+// ════════════════════════════════════════════════════════════════════
+//  0094 — PHONE_DIAL_SCOPE
+// ════════════════════════════════════════════════════════════════════
+
+describe('the dial SCOPE decides which question the pre-claim gate asks', () => {
+  const live = (over: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv => ({
+    PHONE_SCREENING_ENABLED: 'true',
+    PHONE_RUNTIME_ENABLED: 'true',
+    PHONE_DIAL_MODE: 'live',
+    ...over,
+  });
+
+  it('defaults to `allowlist` — merging this change alters nothing', () => {
+    expect(loadPhoneScreeningConfig({}).dialScope).toBe('allowlist');
+    expect(loadPhoneScreeningConfig(live()).dialScope).toBe('allowlist');
+  });
+
+  it('an unrecognised value reads as the NARROWER scope, never the wider', () => {
+    // Same reasoning as an unrecognised dial mode reading as `off`: a typo on
+    // a billable dialer must not widen who can be called.
+    for (const raw of ['pipelin', 'pipe', 'all', 'any', 'none', '', ' ', 'true', '1']) {
+      expect(parseDialScope(raw), `${JSON.stringify(raw)} must not widen`).toBe('allowlist');
+    }
+    expect(parseDialScope(undefined)).toBe('allowlist');
+    // CASE AND SURROUNDING SPACE ARE NOT typos, and are accepted — exactly as
+    // `parseDialMode` accepts them. An operator who wrote `PIPELINE` said what
+    // they meant; silently narrowing that would be its own surprise, and would
+    // make the two sibling parsers disagree about what an environment means.
+    for (const raw of ['pipeline', 'PIPELINE', 'Pipeline', ' pipeline ', '\tpipeline\n']) {
+      expect(parseDialScope(raw), `${JSON.stringify(raw)} is not a typo`).toBe('pipeline');
+      expect(parseDialMode(raw.replace(/pipeline/i, 'LIVE'))).toBe('live');
+    }
+  });
+
+  it('under `allowlist`, an empty list still fails closed', () => {
+    const cfg = loadPhoneScreeningConfig(live({ PHONE_DIAL_ALLOWLIST: '' }));
+    expect(isLiveDialPermitted(cfg)).toBe(false);
+    expect(isDialAllowedForDigest(cfg, DIGEST_A)).toBe(false);
+  });
+
+  it('under `allowlist`, only a listed digest passes', () => {
+    const cfg = loadPhoneScreeningConfig(live({
+      PHONE_DIAL_ALLOWLIST: DIGEST_A, PHONE_DIAL_SCOPE: 'allowlist',
+    }));
+    expect(isDialAllowedForDigest(cfg, DIGEST_A)).toBe(true);
+    expect(isDialAllowedForDigest(cfg, DIGEST_B)).toBe(false);
+  });
+
+  it('under `pipeline`, an EMPTY allowlist permits live dialling', () => {
+    // The point of the flag. Requiring a non-empty list here would make it
+    // self-defeating: an operator who set `pipeline` and cleared the
+    // now-meaningless digests would silently dial nobody.
+    const cfg = loadPhoneScreeningConfig(live({ PHONE_DIAL_SCOPE: 'pipeline' }));
+    expect(cfg.dialAllowlist).toHaveLength(0);
+    expect(isLiveDialPermitted(cfg)).toBe(true);
+    expect(isDialAllowedForDigest(cfg, DIGEST_A)).toBe(true);
+    expect(isDialAllowedForDigest(cfg, DIGEST_B)).toBe(true);
+  });
+
+  it('`pipeline` widens the DIGEST gate and NOTHING else', () => {
+    // It is not an override for the mode or the two switches. Each of these
+    // must still refuse on its own, or the flag would be a way to dial from a
+    // system somebody had deliberately turned off.
+    for (const off of [
+      { PHONE_SCREENING_ENABLED: 'false' },
+      { PHONE_RUNTIME_ENABLED: 'false' },
+      { PHONE_DIAL_MODE: 'off' },
+      { PHONE_DIAL_MODE: 'synthetic' },
+    ]) {
+      const cfg = loadPhoneScreeningConfig(live({ PHONE_DIAL_SCOPE: 'pipeline', ...off }));
+      expect(isLiveDialPermitted(cfg), JSON.stringify(off)).toBe(false);
+      expect(isDialAllowedForDigest(cfg, DIGEST_A), JSON.stringify(off)).toBe(false);
+    }
+  });
+
+  it('the health view reports the scope, and still never the digests', () => {
+    const cfg = loadPhoneScreeningConfig(live({
+      PHONE_DIAL_SCOPE: 'pipeline', PHONE_DIAL_ALLOWLIST: `${DIGEST_A},${DIGEST_B}`,
+    }));
+    const view = describePhoneScreeningConfig(cfg);
+    expect(view.dialScope).toBe('pipeline');
+    expect(view.dialAllowlistSize).toBe(2);
+    expect(JSON.stringify(view)).not.toContain(DIGEST_A);
+    expect(JSON.stringify(view)).not.toContain(DIGEST_B);
+  });
+
+  it('the fleet daily cap is STILL not a knob here — it lives in SQL', () => {
+    // 0094 added the ceiling this file used to say did not exist, and put it in
+    // `phone_max_daily_dials()` where `admit_phone_attempt` enforces it under
+    // the admission lock. A cap read from an environment is bypassed by any
+    // other caller and raced by a second replica.
+    expect(CONFIG_SOURCE).not.toContain('PHONE_MAX_DIALS_PER_IST_DAY');
+    expect(loadPhoneScreeningConfig({})).not.toHaveProperty('maxDailyDials');
   });
 });

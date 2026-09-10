@@ -24,6 +24,9 @@ import type {
   SchedulePhoneAppointmentStatus,
   ConfirmCandidateVoiceCallbackStatus,
   SetPhoneHaltStatus,
+  SuppressCandidatePhoneStatus,
+  ReleaseCandidatePhoneSuppressionStatus,
+  PhoneSuppressionStateStatus,
   AttachPhoneAttemptRecordingStatus,
   FinalizePhoneAttemptRecordingStatus,
   ListPhoneEngagementRecordingsStatus,
@@ -49,6 +52,8 @@ import type {
   PhoneEventSource,
   PhoneHaltReason,
   PhoneRecordingRole,
+  PhoneSuppressionReason,
+  PhoneSuppressionSource,
 } from './vocabulary.js';
 
 /** Every store result carries either a declared status or `unknown_status`. */
@@ -344,6 +349,57 @@ export interface SetPhoneHaltResult {
 export interface ClearPhoneHaltResult {
   readonly status: OrUnknown<ClearPhoneHaltStatus>;
   readonly wasHalted?: boolean;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Suppression — the do-not-call list (0094)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// The halt stops EVERY call; suppression stops calls to ONE person, for ever,
+// until an operator lifts it. Until 0094 `phone_suppressions` was read by
+// `admit_phone_attempt` and written by nothing, so the only way to guarantee
+// somebody was never rung was to keep their digest out of a hand-maintained
+// env var — which is exactly what `PHONE_DIAL_SCOPE=pipeline` retires.
+//
+// NO METHOD HERE TAKES OR RETURNS A NUMBER OR A DIGEST. The candidate id is
+// the whole input; the RPC reads `phone_e164` from the candidate row and
+// digests it inside the database, so the number never enters this process.
+
+export interface SuppressCandidatePhoneResult {
+  readonly status: OrUnknown<SuppressCandidatePhoneStatus>;
+  /** True when the number was ALREADY suppressed; the original row is kept. */
+  readonly alreadySuppressed?: boolean;
+  /**
+   * Queued `phone.dial` jobs this suppression stopped. Recording the promise
+   * is not keeping it: admission checks suppression at claim time and the
+   * dialer does not re-check, so an attempt admitted moments earlier would
+   * otherwise still ring. A job already `active` is executing on a worker the
+   * RPC cannot reach and is NOT counted here.
+   */
+  readonly dialsStopped?: number;
+}
+
+export interface ReleaseCandidatePhoneSuppressionResult {
+  readonly status: OrUnknown<ReleaseCandidatePhoneSuppressionStatus>;
+  readonly released?: number;
+  /** What was lifted. A bare count could not tell an opt-out from a note. */
+  readonly releasedReason?: PhoneSuppressionReason;
+  readonly releasedSource?: PhoneSuppressionSource;
+}
+
+export interface PhoneSuppressionStateResult {
+  readonly status: OrUnknown<PhoneSuppressionStateStatus>;
+  readonly suppressed?: boolean;
+  /**
+   * Whether the promise sits on THIS candidate's record or on another sharing
+   * the line. Both mean "do not dial", but only an owned one can be released
+   * here — an operator who cannot see the difference will try to lift one that
+   * is not theirs and meet a status they had no way to anticipate.
+   */
+  readonly owned?: boolean;
+  readonly reason?: PhoneSuppressionReason;
+  readonly source?: PhoneSuppressionSource;
+  readonly createdAt?: string;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -772,6 +828,27 @@ export interface PhoneStores {
     now: Date;
   }): Promise<SetPhoneHaltResult>;
   clearHalt(input: { actorId?: string | null; now: Date }): Promise<ClearPhoneHaltResult>;
+  /**
+   * 0094. Optional on the port so the many legacy test doubles that implement
+   * `PhoneStores` by hand keep compiling; the production store implements all
+   * three, and `routes/phone.ts` refuses with 503 rather than pretending a
+   * suppression was recorded when the seam is absent.
+   */
+  suppressCandidatePhone?(input: {
+    candidateId: string;
+    reason: PhoneSuppressionReason;
+    source: PhoneSuppressionSource;
+    actorId?: string | null;
+    now: Date;
+  }): Promise<SuppressCandidatePhoneResult>;
+  releaseCandidatePhoneSuppression?(input: {
+    candidateId: string;
+    actorId?: string | null;
+    now: Date;
+  }): Promise<ReleaseCandidatePhoneSuppressionResult>;
+  phoneSuppressionState?(input: {
+    candidateId: string;
+  }): Promise<PhoneSuppressionStateResult>;
   backlog(input: { now: Date }): Promise<PhoneBacklogResult>;
   attachAttemptRecording(
     input: AttachPhoneAttemptRecordingInput,

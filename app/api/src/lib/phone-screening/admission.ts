@@ -175,9 +175,22 @@ export async function admitPhoneEngagement(
   if (config.dialMode === 'off') {
     return { decision: 'deferred', code: 'dial_mode_off', charged: false };
   }
-  if (config.dialMode === 'live') {
+  if (config.dialMode === 'live' && config.dialScope === 'allowlist') {
     // The digest gate applies only to `live`. `synthetic` reaches no carrier,
     // so an allowlist there would block the very rehearsal it exists to permit.
+    //
+    // 0094 — AND ONLY UNDER `allowlist` SCOPE. This is the hand-maintained
+    // canary described in `config.ts`: it asks whether an operator nominated
+    // this number, which is a fact about the operator, not about the
+    // candidate. Under `pipeline` scope the question belongs to
+    // `admit_phone_attempt`, which per this file's own header is the sole
+    // grantor and cannot be overruled by a local gate anyway — and which
+    // additionally refuses on suppression, mapping state, ingestion, consent,
+    // budgets, the halt, the window, the concurrency cap and the 0094 fleet
+    // daily cap. Skipping the digest comparison removes a NOMINATION check,
+    // not a safety check, and it removes the one refusal in this whole lane
+    // that is invisible: a deferral writes nothing, so a missing digest looks
+    // exactly like a system doing nothing at all.
     if (!request.phoneDigest || !isDialAllowedForDigest(config, request.phoneDigest)) {
       return { decision: 'deferred', code: 'dial_not_allowlisted', charged: false };
     }

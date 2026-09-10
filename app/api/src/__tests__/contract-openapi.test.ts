@@ -1095,7 +1095,11 @@ describe('OpenAPI document integrity', () => {
     // #275 adds ONE admin read — the scorecard binding preview
     // (/mappings/{id}/scorecard-binding) — with four documented schemas
     // (counted below). 129 + 1 = 130.
-    expect(Object.keys(paths).length).toBe(130);
+    // 0094 adds ONE path, /api/phone/suppressions/{candidateId}, carrying all
+    // THREE suppression verbs (GET/POST/DELETE) — the do-not-call write path
+    // `phone_suppressions` never had. Paths are counted by URL, not by verb,
+    // so three routes move this guard by one. 130 + 1 = 131.
+    expect(Object.keys(paths).length).toBe(131);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1176,7 +1180,13 @@ describe('OpenAPI document integrity', () => {
     // the preview body, one fixed-field check row and one metric row. All are
     // additionalProperties:false and carry form STRUCTURE plus metric names
     // only — no feedback content. 237 + 4 = 241.
-    expect(Object.keys(schemas).length).toBe(241);
+    // 0094 adds FOUR for the do-not-call surface: the create body and the
+    // three response envelopes (state read, create, delete). All are
+    // additionalProperties:false, and every one of them carries a candidate
+    // id, a boolean and closed-vocabulary strings — never a number and never
+    // a suppression digest, which the phone operator boundary refuses to
+    // emit. 241 + 4 = 245.
+    expect(Object.keys(schemas).length).toBe(245);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.

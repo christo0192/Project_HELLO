@@ -666,6 +666,43 @@ fi
 log '0083: PASS — infra_deferred prior attempt frees the same-day redial (index + pre-check), reclaim-NULL and ended both hold the day.'
 
 # =====================================================================
+# 0094 — the FLEET daily cap and the suppression write path.
+#
+# The cap is what lets PHONE_DIAL_SCOPE=pipeline retire the hand-maintained
+# PHONE_DIAL_ALLOWLIST without giving up a bound on how many DISTINCT people a
+# bug could ring: phone_max_concurrent() bounds simultaneity, not volume. The
+# suppression RPCs are the write path phone_suppressions never had — it has
+# been READ by admit_phone_attempt since 0042 with nothing able to write it, so
+# under `pipeline` it is the only do-not-call mechanism there is.
+#
+# The vitest suites mock Supabase, so nothing else executes either. Seeds four
+# eligible engagements on an IST date NO OTHER SUITE USES (2026-09-05; the 0083
+# and concurrency fixtures both sit on 2026-09-06), because the cap is
+# fleet-wide and would otherwise be perturbed by their rows. Proves the cap
+# fires at the boundary, refuses WITHOUT writing an attempt or moving the
+# engagement, excludes `reconnect` and infra-deferred rows, and that
+# suppression add/read/release round-trips and actually reaches admission.
+# Assertions RAISE, so ON_ERROR_STOP makes psql exit non-zero → harness fails.
+# =====================================================================
+log '0094: fleet cap + suppression — seeding four same-day eligible engagements...'
+docker exec -i "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  < app/supabase/tests/phone_dial_scope_fleet_cap_setup.sql 2>&1 | tee -a "$RESULTS_FILE"
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+  log 'ERROR: 0094 fleet-cap/suppression setup failed.'
+  exit 1
+fi
+log '0094: fleet cap + suppression — asserting the cap boundary and the do-not-call round trip...'
+docker exec -i "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  < app/supabase/tests/phone_dial_scope_fleet_cap_assert.sql 2>&1 | tee -a "$RESULTS_FILE"
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+  log 'ERROR: 0094 fleet-cap/suppression assertions FAILED.'
+  exit 1
+fi
+log '0094: PASS — fleet daily cap refuses at the boundary without writing; reconnect and infra-defer excluded; suppression reaches admission and releases cleanly.'
+
+# =====================================================================
 # TST-15 rollback rehearsal — clean reset / roll-forward / restore
 # (Phase 6 lane L4). No reverse SQL exists or is invented; this proves the
 # sanctioned recovery path: the committed migration set can always be

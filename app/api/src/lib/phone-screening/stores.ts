@@ -43,6 +43,9 @@ import {
   type ConfirmCandidateVoiceCallbackStatus,
   type RequestPhoneRescreenStatus,
   type SetPhoneHaltStatus,
+  type SuppressCandidatePhoneStatus,
+  type ReleaseCandidatePhoneSuppressionStatus,
+  type PhoneSuppressionStateStatus,
   type AttachPhoneAttemptRecordingStatus,
   StampPhoneSessionEgressStatus,
   type FinalizePhoneAttemptRecordingStatus,
@@ -78,6 +81,9 @@ import type {
   RequestPhoneRescreenInput,
   RequestPhoneRescreenResult,
   SetPhoneHaltResult,
+  SuppressCandidatePhoneResult,
+  ReleaseCandidatePhoneSuppressionResult,
+  PhoneSuppressionStateResult,
   AttachPhoneAttemptRecordingInput,
   AttachPhoneAttemptRecordingResult,
   StampPhoneSessionEgressResult,
@@ -113,11 +119,15 @@ import {
   PHONE_ENGAGEMENT_STATES,
   PHONE_EVENT_IGNORED_REASONS,
   PHONE_RECORDING_ROLES,
+  PHONE_SUPPRESSION_REASONS,
+  PHONE_SUPPRESSION_SOURCES,
   type PhoneAttemptKind,
   type PhoneAttemptState,
   type PhoneEngagementState,
   type PhoneEventIgnoredReason,
   type PhoneRecordingRole,
+  type PhoneSuppressionReason,
+  type PhoneSuppressionSource,
 } from './vocabulary.js';
 
 /**
@@ -777,6 +787,72 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
       return {
         status: narrowPhoneRpcStatus<ClearPhoneHaltStatus>('clear_phone_halt', row),
         wasHalted: bool(row, 'was_halted'),
+      };
+    },
+
+    async suppressCandidatePhone(input): Promise<SuppressCandidatePhoneResult> {
+      const { data, error } = await client.rpc('suppress_candidate_phone', {
+        p_candidate_id: input.candidateId,
+        p_reason: input.reason,
+        p_source: input.source,
+        p_actor_id: input.actorId ?? null,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_suppress_candidate_error');
+      const row = asRow(data);
+      return {
+        status: narrowPhoneRpcStatus<SuppressCandidatePhoneStatus>(
+          'suppress_candidate_phone', row,
+        ),
+        alreadySuppressed: bool(row, 'already_suppressed'),
+        dialsStopped: num(row, 'dials_stopped'),
+      };
+    },
+
+    async releaseCandidatePhoneSuppression(
+      input,
+    ): Promise<ReleaseCandidatePhoneSuppressionResult> {
+      const { data, error } = await client.rpc('release_candidate_phone_suppression', {
+        p_candidate_id: input.candidateId,
+        p_actor_id: input.actorId ?? null,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_release_suppression_error');
+      const row = asRow(data);
+      return {
+        status: narrowPhoneRpcStatus<ReleaseCandidatePhoneSuppressionStatus>(
+          'release_candidate_phone_suppression', row,
+        ),
+        released: num(row, 'released'),
+        releasedReason: member<PhoneSuppressionReason>(
+          row, 'released_reason', PHONE_SUPPRESSION_REASONS,
+        ),
+        releasedSource: member<PhoneSuppressionSource>(
+          row, 'released_source', PHONE_SUPPRESSION_SOURCES,
+        ),
+      };
+    },
+
+    async phoneSuppressionState(input): Promise<PhoneSuppressionStateResult> {
+      // No `p_now`: suppression does not expire, so the answer does not depend
+      // on an instant. `CLOCK_FREE_RPCS` in the migration drift test pins that.
+      const { data, error } = await client.rpc('phone_suppression_state', {
+        p_candidate_id: input.candidateId,
+      });
+      if (error) throw new Error('phone_suppression_state_error');
+      const row = asRow(data);
+      return {
+        status: narrowPhoneRpcStatus<PhoneSuppressionStateStatus>(
+          'phone_suppression_state', row,
+        ),
+        suppressed: bool(row, 'suppressed'),
+        owned: bool(row, 'owned'),
+        // Narrowed through the shared helper rather than cast: the columns are
+        // CHECK-constrained in the schema, but a value that somehow escaped the
+        // vocabulary must not be handed onward as if it belonged to it.
+        reason: member<PhoneSuppressionReason>(row, 'reason', PHONE_SUPPRESSION_REASONS),
+        source: member<PhoneSuppressionSource>(row, 'source', PHONE_SUPPRESSION_SOURCES),
+        createdAt: iso(row, 'created_at'),
       };
     },
 

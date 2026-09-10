@@ -6301,6 +6301,202 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
+
+  /api/phone/suppressions/{candidateId}:
+    parameters:
+      - name: candidateId
+        in: path
+        required: true
+        description: The candidate whose LINE is addressed. No phone number appears in this API in either direction — the RPC reads it from the candidate row and digests it inside the database.
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [phone]
+      operationId: getPhoneSuppression
+      summary: Whether this candidate's line is on the do-not-call list
+      description: Interviewer or above. Returns a boolean plus the closed-vocabulary reason and source. Never returns the digest — a suppression digest is among the values the phone operator boundary refuses to emit.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The suppression state, suppressed or not.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneSuppressionStateResponse'
+        '404':
+          description: candidate_not_found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '500':
+          description: phone_rpc_unknown_status or phone_action_error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '503':
+          description: phone_screening_disabled, or phone_suppression_unavailable when the store seam is absent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '400':
+          description: Shape validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '401':
+          description: No bearer token, or a token the server could not validate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+    post:
+      tags: [phone]
+      operationId: createPhoneSuppression
+      summary: Never call this candidate's line again
+      description: Admin only. Adds the candidate's number digest to phone_suppressions, which admit_phone_attempt has consulted since 0042. IDEMPOTENT — a repeat returns 200 with already_suppressed true and leaves the original reason, source and actor intact, because re-suppressing asks for a state that is already true. Under PHONE_DIAL_SCOPE=pipeline this is the ONLY mechanism that guarantees a person is never rung.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PhoneSuppressionCreateBody'
+      responses:
+        '200':
+          description: The line is suppressed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneSuppressionCreateResponse'
+        '404':
+          description: candidate_not_found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '409':
+          description: phone_absent when the candidate row carries no usable number, or suppression_lost when a concurrent release won the race. invalid_reason / invalid_source are NOT reachable here — the request body is validated against the same closed vocabularies first and a bad value is a 400.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '500':
+          description: phone_rpc_unknown_status, phone_action_error or phone_audit_write_failed. An audit failure is NOT compensated — undoing a do-not-call promise because our own audit sink failed would fail open in the direction that causes calls.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '503':
+          description: phone_screening_disabled, or phone_suppression_unavailable when the store seam is absent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '400':
+          description: Shape validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '401':
+          description: No bearer token, or a token the server could not validate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+    delete:
+      tags: [phone]
+      operationId: deletePhoneSuppression
+      summary: Lift a do-not-call suppression
+      description: Admin only. Deliberately NOT idempotent-as-success — lifting a suppression that was never there returns 409 not_suppressed, because this is the direction that can cause a call and an operator with a wrong model of who is about to be rung should be made to look.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: The suppression was lifted.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneSuppressionDeleteResponse'
+        '404':
+          description: candidate_not_found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '409':
+          description: not_suppressed — there was nothing to lift; suppressed_by_other_candidate — the line is suppressed by a different candidate's record and the promise is not this caller's to lift; or phone_absent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '500':
+          description: phone_rpc_unknown_status, phone_action_error or phone_audit_write_failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '503':
+          description: phone_screening_disabled, or phone_suppression_unavailable when the store seam is absent.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhoneApiError'
+        '400':
+          description: Shape validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '401':
+          description: No bearer token, or a token the server could not validate.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '403':
+          description: Authenticated but insufficiently privileged.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '429':
+          description: Per-user rate limit exceeded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
 components:
   securitySchemes:
     bearerAuth:
@@ -10834,7 +11030,7 @@ components:
     PhoneConfigState:
       description: Booleans, a mode and a COUNT. Never the dial allowlist contents, which are digests of specific people's numbers.
       type: object
-      required: [screeningEnabled, runtimeEnabled, runtimeActive, dialMode, dialAllowlistSize, liveDialPermitted]
+      required: [screeningEnabled, runtimeEnabled, runtimeActive, dialMode, dialScope, dialAllowlistSize, liveDialPermitted]
       properties:
         screeningEnabled:
           type: boolean
@@ -10845,10 +11041,96 @@ components:
         dialMode:
           type: string
           enum: [off, synthetic, live]
+        dialScope:
+          description: Which question the PRE-CLAIM dial gate asks. `allowlist` (default) filters by digest against PHONE_DIAL_ALLOWLIST, a hand-maintained list. `pipeline` delegates to admit_phone_attempt, which decides on consent, mapping, ingestion, suppression, budgets, the halt, the window and the caps. Reported because it changes which refusals an operator should expect: under `allowlist` a blocked candidate leaves NO trace at all, under `pipeline` every refusal is a named database verdict.
+          type: string
+          enum: [allowlist, pipeline]
         dialAllowlistSize:
           type: integer
         liveDialPermitted:
           type: boolean
+      additionalProperties: false
+
+    PhoneSuppressionCreateBody:
+      description: The reason and source for a do-not-call entry. There is deliberately NO number field — the candidate is named by id in the path.
+      type: object
+      required: [reason]
+      properties:
+        reason:
+          description: chk_phone_suppressions_reason. WHY this line must never be dialled.
+          type: string
+          enum: [candidate_opt_out, wrong_number, dnd_registry, operator]
+        source:
+          description: chk_phone_suppressions_source. WHO decided it. Defaults to `operator` because this route is the operator surface; a self-service opt-out would send `candidate` explicitly.
+          type: string
+          enum: [candidate, operator, system, registry]
+          default: operator
+      additionalProperties: false
+
+    PhoneSuppressionStateResponse:
+      type: object
+      required: [ok, candidate_id, suppressed, owned, reason, source, created_at]
+      properties:
+        ok:
+          type: boolean
+        candidate_id:
+          type: string
+          format: uuid
+        suppressed:
+          type: boolean
+        owned:
+          description: Whether the promise sits on THIS candidate's record or on another sharing the line. Both mean do-not-dial, but only an owned one can be released here.
+          type: boolean
+        reason:
+          type: string
+          nullable: true
+        source:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          nullable: true
+      additionalProperties: false
+
+    PhoneSuppressionCreateResponse:
+      type: object
+      required: [ok, candidate_id, suppressed, already_suppressed, dials_stopped]
+      properties:
+        ok:
+          type: boolean
+        candidate_id:
+          type: string
+          format: uuid
+        suppressed:
+          type: boolean
+        already_suppressed:
+          description: True when the line was already on the list. The original reason, source and actor are preserved.
+          type: boolean
+        dials_stopped:
+          description: Queued phone.dial jobs this suppression stopped. A job already executing on a worker cannot be reached and is not counted.
+          type: integer
+      additionalProperties: false
+
+    PhoneSuppressionDeleteResponse:
+      type: object
+      required: [ok, candidate_id, suppressed, released, released_reason, released_source]
+      properties:
+        ok:
+          type: boolean
+        candidate_id:
+          type: string
+          format: uuid
+        suppressed:
+          type: boolean
+        released:
+          type: integer
+        released_reason:
+          description: What was lifted. A bare count could not tell a candidate's own opt-out from an operator's note.
+          type: string
+          nullable: true
+        released_source:
+          type: string
+          nullable: true
       additionalProperties: false
 
     PhoneHealthWindow:

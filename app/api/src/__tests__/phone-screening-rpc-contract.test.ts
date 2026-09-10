@@ -68,9 +68,10 @@ describe('the extractor itself is not over-broad', () => {
 
   it('the status extractor is not vacuous — it finds what is there', () => {
     // A silently-empty extraction would make every vocabulary assertion pass.
-    // 28 since 0045 added candidate_call_in_flight and
-    // candidate_daily_attempt_exists — the two per-CANDIDATE refusals.
-    expect(functionStatuses('admit_phone_attempt').size).toBe(28);
+    // 29 since 0094 added `fleet_daily_cap_reached` to the 28 that 0045 left
+    // (which had added candidate_call_in_flight and
+    // candidate_daily_attempt_exists — the two per-CANDIDATE refusals).
+    expect(functionStatuses('admit_phone_attempt').size).toBe(29);
     expect(functionStatuses('schedule_phone_appointment')).toContain('ok_prereqs_pending');
     expect(() => functionStatuses('phone_ist_date')).toThrow(/no statuses extracted/);
     expect(() => functionBody('no_such_function')).toThrow(/no phone migration declares/);
@@ -82,8 +83,9 @@ describe('the phone RPCs', () => {
     expect(new Set(PHONE_RPC_NAMES)).toEqual(new Set(RPC_NAMES));
     // Core phone RPCs plus recording, assessment, liveness and cycle doors,
     // plus 0071's per-item turn writer and stranded-recording sweep, and
-    // 0072's partial-finalize sweeper, and 0083's same-IST-day infra abandon.
-    expect(PHONE_RPC_NAMES).toHaveLength(33);
+    // 0072's partial-finalize sweeper, and 0083's same-IST-day infra abandon,
+    // and 0094's three suppression doors (write, release, read).
+    expect(PHONE_RPC_NAMES).toHaveLength(36);
     for (const name of PHONE_RPC_NAMES) {
       // Searched across BOTH migrations: the question here is "is this granted
       // anywhere in the phone schema", not "which declaration wins".

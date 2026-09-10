@@ -23,13 +23,37 @@
  * `candidates` row and the digest computed from it. EMPTY BY DEFAULT, and an
  * empty allowlist is FAIL-CLOSED: nothing is dialable.
  *
- * ── NO FLEET DAILY CAP HERE ───────────────────────────────────────────
- * There is deliberately no fleet-wide daily-dial knob. 0042 has no fleet-wide
- * daily control at all — `uq_phone_attempts_one_per_ist_day` is
- * PER-ENGAGEMENT — so shipping one now would hand an operator a dial that
- * changes nothing until a later phase enforces it. A value with no consumer is
- * a decoration, and this lane has already paid for that lesson. A structural
- * assertion keeps the name out of this file, the schema and the example.
+ * ── `PHONE_DIAL_SCOPE` — WHICH QUESTION THE LOCAL GATE ASKS (0094) ────
+ * The allowlist was a BRING-UP CANARY: prove the dialer can only reach numbers
+ * an operator nominated by hand. It is not a decision about the candidate — it
+ * is a decision about the operator's confidence, and it has outlived its
+ * purpose. Nothing populates it, it silently truncates past
+ * `MAX_DIAL_ALLOWLIST_ENTRIES`, and its refusal is a pre-claim DEFERRAL that
+ * writes nothing, so a missing digest leaves a candidate `eligible` for ever
+ * with no attempt row and no error. That happened in production on 2026-09-10.
+ *
+ * `allowlist` (DEFAULT) is the behaviour above, byte-for-byte. `pipeline`
+ * stops pre-filtering by number and lets `admit_phone_attempt` — the SOLE
+ * GRANTOR, which this module's own header says can never be overruled by a
+ * local gate — answer the question it already answers far more precisely:
+ * application live, mapping `enabled`, ingestion `ready`, consent
+ * granted/unexpired/complete, a valid Indian mobile, NOT SUPPRESSED, not
+ * halted, inside the window, within every budget, under the concurrency cap
+ * and under the 0094 fleet daily cap.
+ *
+ * `pipeline` is NOT "no gate". It is the gate moving to where the facts are.
+ * An UNRECOGNISED value reads as `allowlist`, the narrower of the two, for the
+ * same reason an unrecognised dial mode reads as `off`.
+ *
+ * ── NO FLEET DAILY CAP KNOB HERE ──────────────────────────────────────
+ * 0094 added the fleet-wide daily ceiling this file used to say did not exist,
+ * and deliberately put it in SQL — `phone_max_daily_dials()`, enforced inside
+ * `admit_phone_attempt` under the same advisory lock as every other guard,
+ * exactly as the concurrency cap is. It is NOT configurable here and must not
+ * become so: a cap read from an environment is bypassed by any other caller
+ * and raced by a second replica, and a value with no consumer is a decoration
+ * — a lesson this lane has already paid for. A structural assertion keeps the
+ * name out of this file, the schema and the example.
  *
  * ── THE WINDOW AND THE FLEET CAP ARE NOT CONFIGURED HERE ──────────────
  * The IST calling window and the fleet concurrency cap live in
@@ -53,6 +77,7 @@ const _contractVisibleEnvReads = [
   process.env.PHONE_RUNTIME_ENABLED,
   process.env.PHONE_DIAL_MODE,
   process.env.PHONE_DIAL_ALLOWLIST,
+  process.env.PHONE_DIAL_SCOPE,
   process.env.PHONE_SLOT_SECONDS,
   process.env.PHONE_RECONNECT_BACKOFF_SECONDS,
   process.env.PHONE_INFRA_DEFER_BACKOFF_SEC,
@@ -67,6 +92,15 @@ void _contractVisibleEnvReads;
 export const PHONE_DIAL_MODES = ['off', 'synthetic', 'live'] as const;
 
 export type PhoneDialMode = (typeof PHONE_DIAL_MODES)[number];
+
+/**
+ * The two dial SCOPES. `allowlist` is the default and the rollback: the
+ * pre-claim gate keeps filtering by digest exactly as before. `pipeline`
+ * delegates the "may we ring this person" question to `admit_phone_attempt`.
+ */
+export const PHONE_DIAL_SCOPES = ['allowlist', 'pipeline'] as const;
+
+export type PhoneDialScope = (typeof PHONE_DIAL_SCOPES)[number];
 
 /**
  * Bounds for every numeric knob. Inputs are CLAMPED, never trusted and never
@@ -173,6 +207,12 @@ export interface PhoneScreeningConfig {
   dialMode: PhoneDialMode;
   /** Lowercased SHA-256 digests of permitted numbers. EMPTY = nothing dialable. */
   dialAllowlist: readonly string[];
+  /**
+   * `allowlist` (default) | `pipeline`. Which question the PRE-CLAIM gate
+   * asks. Only `allowlist` consults `dialAllowlist`; under `pipeline` the
+   * digest list is not read and `admit_phone_attempt` decides alone.
+   */
+  dialScope: PhoneDialScope;
   slotSeconds: number;
   reconnectBackoffSeconds: number;
   /** 0083/P3: backoff (s) applied to next_eligible_at on a worker-not-ready infra defer. */
@@ -210,6 +250,18 @@ export function parseDialMode(raw: string | undefined): PhoneDialMode {
 }
 
 /**
+ * Resolve the dial scope. An UNRECOGNISED value reads as `allowlist` — the
+ * NARROWER of the two — for the same reason a typo'd dial mode reads as `off`:
+ * a misconfiguration must never widen who can be called.
+ */
+export function parseDialScope(raw: string | undefined): PhoneDialScope {
+  const value = typeof raw === 'string' ? raw.trim().toLowerCase() : '';
+  return (PHONE_DIAL_SCOPES as readonly string[]).includes(value)
+    ? (value as PhoneDialScope)
+    : 'allowlist';
+}
+
+/**
  * Parse the digest allowlist. Each entry must be a complete lowercase SHA-256
  * hex digest; anything else — a raw number, a partial digest, an uppercase
  * variant, whitespace-mangled input — is DROPPED rather than coerced, so a
@@ -241,6 +293,7 @@ export function loadPhoneScreeningConfig(
     runtimeEnabled: source.PHONE_RUNTIME_ENABLED === 'true',
     dialMode: parseDialMode(source.PHONE_DIAL_MODE),
     dialAllowlist: parseDialAllowlist(source.PHONE_DIAL_ALLOWLIST),
+    dialScope: parseDialScope(source.PHONE_DIAL_SCOPE),
     slotSeconds: boundedInt(source.PHONE_SLOT_SECONDS, PHONE_BOUNDS.slotSeconds),
     reconnectBackoffSeconds: boundedInt(
       source.PHONE_RECONNECT_BACKOFF_SECONDS,
@@ -273,21 +326,37 @@ export function isPhoneRuntimeActive(config: PhoneScreeningConfig): boolean {
 
 /**
  * True iff a call could reach a real carrier: the runtime is active, the mode
- * is `live`, and the allowlist is non-empty. An empty allowlist FAILS CLOSED
- * even in `live` mode — the enable and the target list are two decisions, and
- * neither is allowed to imply the other.
+ * is `live`, and — under `allowlist` scope — the allowlist is non-empty. An
+ * empty allowlist FAILS CLOSED even in `live` mode: the enable and the target
+ * list are two decisions, and neither is allowed to imply the other.
+ *
+ * 0094: under `pipeline` scope there IS no target list, so requiring one would
+ * make the flag self-defeating — an operator who set `PHONE_DIAL_SCOPE=pipeline`
+ * and cleared the now-meaningless digests would silently dial nobody. The two
+ * decisions stay two: the runtime must be active AND the mode must be `live`.
+ * What replaces the list is not nothing — it is `admit_phone_attempt`, which
+ * refuses far more than a digest set ever could, plus the 0094 fleet daily cap
+ * bounding blast radius by volume instead of by hand.
  */
 export function isLiveDialPermitted(config: PhoneScreeningConfig): boolean {
-  return isPhoneRuntimeActive(config) && config.dialMode === 'live'
-    && config.dialAllowlist.length > 0;
+  if (!isPhoneRuntimeActive(config) || config.dialMode !== 'live') return false;
+  return config.dialScope === 'pipeline' || config.dialAllowlist.length > 0;
 }
 
 /**
  * True iff this digest may be dialled under the current configuration. Takes a
  * DIGEST, never a number, so no caller is tempted to pass one.
+ *
+ * 0094: under `pipeline` scope this answers "live dialling is permitted at
+ * all", because the per-number question is no longer this layer's to answer.
+ * Callers that need the NUMBER-specific verdict — `lib/phone-canary1/originate.ts`
+ * builds a single-entry allowlist from the number it was handed precisely so
+ * its own check cannot fail — are unaffected, because that construction sets
+ * the default `allowlist` scope.
  */
 export function isDialAllowedForDigest(config: PhoneScreeningConfig, digest: string): boolean {
   if (!isLiveDialPermitted(config)) return false;
+  if (config.dialScope === 'pipeline') return true;
   return config.dialAllowlist.includes(digest.trim().toLowerCase());
 }
 
@@ -301,6 +370,7 @@ export function describePhoneScreeningConfig(config: PhoneScreeningConfig): {
   runtimeEnabled: boolean;
   runtimeActive: boolean;
   dialMode: PhoneDialMode;
+  dialScope: PhoneDialScope;
   dialAllowlistSize: number;
   liveDialPermitted: boolean;
 } {
@@ -309,6 +379,13 @@ export function describePhoneScreeningConfig(config: PhoneScreeningConfig): {
     runtimeEnabled: config.runtimeEnabled,
     runtimeActive: isPhoneRuntimeActive(config),
     dialMode: config.dialMode,
+    // Reported because it changes WHICH refusals an operator should expect to
+    // see. Under `pipeline` a dial that goes nowhere is a DB verdict with a
+    // named status, not a silent local deferral — and an operator staring at
+    // an eligible engagement needs to know which of those two worlds they are
+    // debugging. The scope name is a closed two-member vocabulary, not an
+    // identifier about anyone.
+    dialScope: config.dialScope,
     dialAllowlistSize: config.dialAllowlist.length,
     liveDialPermitted: isLiveDialPermitted(config),
   };
