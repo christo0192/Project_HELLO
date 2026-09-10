@@ -41,6 +41,39 @@ each represents a distinct decision, and none is allowed to imply another.
 | `PHONE_SIP_TRUNK_ID` | empty | Provider-neutral trunk. **Empty is fail-closed.** |
 | LiveKit credentials | — | Checked independently of the phone flags. |
 
+### 2z. Voice-tuning rollback point — 2026-09-10
+
+The phone worker's voice tuning lives in **Fly secrets**, which SHADOW the
+`[env]` values in `fly.phone.toml`. Secrets are opaque — `fly secrets list`
+shows only a digest — so the values below are recorded here BECAUSE THEY CANNOT
+BE READ BACK. Update this block whenever they change, or the next rollback is a
+guess.
+
+| Secret (`project-hello-phone-voice`) | Before 2026-09-10 | Set 2026-09-10 | toml `[env]` (shadowed) |
+|---|---|---|---|
+| `PHONE_TTS_FLUSH_MIN_CHARS` | `20` | `40` | `60` |
+| `PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC` | `1.5` | `1.25` | `2.5` |
+
+**To roll back to the 2026-09-10 pre-change production setup:**
+
+```
+fly secrets set PHONE_TTS_FLUSH_MIN_CHARS=20 \
+                PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC=1.5 \
+                --app project-hello-phone-voice
+```
+
+That restarts the worker machines; no deploy and no merge is involved, so it
+works even if a code change has since shipped. `PHONE_TTS_FLUSH_MIN_CHARS=0`
+is the deeper rollback — it disables the first-fragment early flush entirely
+and restores the ~2.9 s LLM-invoke→first-audio floor that four prior PRs were
+spent removing, so prefer the table above.
+
+Why these two moved: on the 2026-09-10 live call a word came out cracked at the
+first-fragment join. `tts_node` synthesizes the first fragment and the
+remainder as SEPARATE Sarvam calls, and at a 20-character cap the split lands
+mid-phrase far more often than at 40. The endpointing max is a separate
+complaint — the tail a slow speaker gets before their turn is closed.
+
 ### 2a. `PHONE_DIAL_SCOPE` — allowlist or pipeline (0094)
 
 `PHONE_DIAL_ALLOWLIST` was a **bring-up canary**: prove the dialer can only

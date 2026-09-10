@@ -10656,17 +10656,43 @@ def phone_agent_class(agent_base: Any) -> Any:
                         # Both halves of a split word then belong to the same
                         # synthesis call.
                         if not _terminator and not _clause_pause:
-                            cut = first.rfind(" ")
-                            # Only back off to a real word boundary that still
-                            # leaves something speakable. A single word longer
-                            # than the cap (no space at all, or nothing but
-                            # punctuation before the space) keeps the previous
-                            # behaviour — there is no better cut available, and
-                            # refusing to flush would forfeit the latency the
-                            # cap exists to buy.
-                            if cut > 0 and any(c.isalpha() for c in first[:cut]):
-                                leftover = first[cut + 1:] + leftover
-                                first = first[:cut]
+                            # `rsplit` on ANY whitespace, not `rfind(" ")`:
+                            # `dense` is counted with `isspace()`, so a newline
+                            # or tab is a word boundary to the cap and would be
+                            # invisible to a literal-space search.
+                            cut = max(
+                                (i for i, c in enumerate(first) if c.isspace()),
+                                default=-1,
+                            )
+                            head = first[:cut] if cut >= 0 else ""
+                            sep = first[cut] if cut >= 0 else ""
+                            tail = first[cut + 1:] if cut >= 0 else first
+                            # THE SEPARATOR STAYS ON THE FIRST FRAGMENT. An
+                            # earlier draft dropped it (`first[:cut]` +
+                            # `first[cut+1:]`), and because a backed-off
+                            # fragment never ends on a terminator the tail-peek
+                            # below ALWAYS runs and can re-join the two halves —
+                            # gluing them across the deleted space, so
+                            # "the range is 1250000." became "…is1250000.".
+                            # That is the very defect this back-off exists to
+                            # remove, reintroduced by the fix for it.
+                            #
+                            # The floor is the v114 invariant: never emit a
+                            # fragment below `_TTS_FIRST_FRAGMENT_MIN_CHARS`
+                            # letters. Without it "Sure, 9876543210 is…" backs
+                            # off to "Sure," — a ~0.2 s isolated synthesis that
+                            # re-primes Sarvam's prosody and stutters, which is
+                            # the choppy-tiny-synth regression v114 fixed.
+                            # Below the floor there is no good cut, so keep the
+                            # mid-word one rather than trade one artefact for a
+                            # worse one.
+                            if (
+                                sep
+                                and sum(1 for c in head if c.isalpha())
+                                >= _TTS_FIRST_FRAGMENT_MIN_CHARS
+                            ):
+                                leftover = tail + leftover
+                                first = head + sep
                         found = True
                         break
                 if found:

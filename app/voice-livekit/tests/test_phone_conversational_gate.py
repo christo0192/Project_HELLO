@@ -20,7 +20,9 @@ than one wasted screening.
 
 import asyncio
 import os
+import types
 import unittest
+from unittest import mock
 
 import phone
 
@@ -200,81 +202,105 @@ class TestFixedFallbackCopy(unittest.TestCase):
 
 
 class TestWordBoundaryFlush(unittest.IsolatedAsyncioTestCase):
-    """The `min_chars` cap must not cut a word in half (part of the same PR)."""
+    """The `min_chars` cap must not cut a word in half.
 
-    async def test_the_cap_backs_off_to_the_last_space(self):
-        # The cap is the only arm that lands on an arbitrary character. Each
-        # fragment becomes its own Sarvam synthesis, so a word split across the
-        # two is voiced twice with no context — the audible "cracked word".
-        agent = _FragmentProbe()
-        first, rest = await agent.split(
+    These drive the REAL `PhoneScreeningAgent.tts_node`, not a copy of its
+    algorithm. An earlier version of this file reimplemented the scan inside
+    the test; deleting the production fix left every assertion passing, which
+    is the definition of a test that guards nothing. The harness below is the
+    one `test_codex_a_tts_first_fragment.py` already uses: a base agent whose
+    `tts_node` records each downstream synthesis as a separate string, so the
+    assertions can talk about what Sarvam actually receives.
+    """
+
+    def _agent(self, streams):
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+                self.chat_ctx = types.SimpleNamespace(items=[])
+
+            async def tts_node(self, text, model_settings):
+                buf = []
+                async for chunk in text:
+                    buf.append(chunk)
+                    yield chunk
+                streams.append("".join(buf))
+
+        return phone.phone_agent_class(BaseAgent)(
+            "sys", client=None, attempt_id="a1",
+            say=None, on_user_turn=lambda *a, **k: None, native_turns=True,
+        )
+
+    async def _synthesized(self, text, *, min_chars):
+        streams = []
+        agent = self._agent(streams)
+        with mock.patch.dict(
+            phone.os.environ, {"PHONE_TTS_FLUSH_MIN_CHARS": str(min_chars)},
+        ):
+            async def _src():
+                yield text
+            async for _ in agent.tts_node(_src(), None):
+                pass
+        return streams
+
+    async def test_the_cap_does_not_split_a_word(self):
+        # 20 dense chars lands inside "confirming". The first synthesis must
+        # end on a whole word, and the partial must travel to the second.
+        streams = await self._synthesized(
             "Thanks for confirming that, let me ask about your experience.",
             min_chars=20,
         )
-        self.assertFalse(first.endswith(("t", "h")) and not first.endswith(" "),
-                         f"fragment ended mid-word: {first!r}")
-        self.assertTrue(first.rstrip() == first.rstrip().rstrip(" "))
-        # Nothing is lost or duplicated across the boundary.
+        self.assertTrue(streams)
+        first = streams[0]
+        self.assertTrue(
+            first.endswith((" ", ".", ",", "!", "?")) or first == first.rstrip(),
+            f"fragment ended mid-token: {first!r}",
+        )
+        self.assertNotIn("confirmin", first.replace("confirming", ""))
+
+    async def test_no_character_is_lost_or_duplicated_across_the_join(self):
+        # SPACES INCLUDED. Comparing with whitespace stripped is exactly what
+        # hid the earlier defect, where the separator at the cut belonged to
+        # neither fragment and the tail-peek then glued the halves together
+        # ("the range is 1250000." -> "...is1250000.").
+        source = "Thanks for sharing that, the budgeted range is 1250000 rupees."
+        for cap in (20, 40, 60):
+            streams = await self._synthesized(source, min_chars=cap)
+            self.assertEqual("".join(streams), source, f"min_chars={cap}")
+
+    async def test_a_digit_run_after_the_cap_keeps_its_leading_space(self):
+        # The exact reported shape: the cap lands inside a long number.
+        source = "Sure, the number to reach me on is 9876543210 any time."
+        streams = await self._synthesized(source, min_chars=30)
+        self.assertEqual("".join(streams), source)
+        self.assertNotIn("is9876543210", "".join(streams))
+
+    async def test_the_backoff_DECLINES_rather_than_emit_a_tiny_fragment(self):
+        # v114: a sub-14-letter first synthesis re-primes Sarvam's prosody and
+        # stutters. "Sure," followed by a long spaceless run is the trap — the
+        # nearest word boundary is only 4 letters in, so backing off to it
+        # would trade a mid-word cut for a worse artefact.
+        #
+        # The property this asserts is the DECLINE, not a floor on the cap
+        # itself: the cap arm has never had one, and giving it one would delay
+        # first audio, which is the latency the cap exists to buy. So the
+        # fragment here is still whatever the cap produced — what must NOT
+        # happen is the back-off shrinking it to "Sure,".
+        streams = await self._synthesized(
+            "Sure, 9876543210 is the number to call.", min_chars=20,
+        )
+        self.assertTrue(streams)
+        self.assertNotEqual(streams[0].strip(), "Sure,")
+        self.assertIn("9876543210", streams[0])
         self.assertEqual(
-            (first + rest).replace(" ", ""),
-            "Thanks for confirming that, let me ask about your experience.".replace(" ", ""),
+            "".join(streams), "Sure, 9876543210 is the number to call.",
         )
 
-    async def test_a_single_word_longer_than_the_cap_still_flushes(self):
-        # No space to back off to. Refusing to flush would forfeit the latency
-        # the cap exists to buy, so the previous behaviour is kept.
-        agent = _FragmentProbe()
-        first, rest = await agent.split("Supercalifragilistic expialidocious", min_chars=10)
-        self.assertTrue(first)
-        self.assertEqual((first + rest).replace(" ", ""),
-                         "Supercalifragilisticexpialidocious")
-
     async def test_punctuation_boundaries_are_untouched(self):
-        agent = _FragmentProbe()
-        first, _ = await agent.split("Got it. Let me ask you something else.", min_chars=200)
-        self.assertEqual(first, "Got it.")
-
-
-class _FragmentProbe:
-    """Replays `tts_node`'s first-fragment scan without a LiveKit session.
-
-    The scan is inline in `tts_node` (the module-level `_tts_early_flush_segments`
-    is a different, unused implementation), so this mirrors the live arms
-    including the 0095 word-boundary back-off. Kept in lockstep by the
-    assertions above, which state the PROPERTY rather than the algorithm.
-    """
-
-    async def split(self, text, *, min_chars):
-        first = ""
-        dense = 0
-        alpha = 0
-        leftover = ""
-        found = False
-        for idx, ch in enumerate(text):
-            first += ch
-            if not ch.isspace():
-                dense += 1
-            if ch.isalpha():
-                alpha += 1
-            terminator = ch in phone._TTS_SENTENCE_TERMINATORS
-            clause = (
-                ch in phone._TTS_CLAUSE_PAUSE_PUNCT
-                and alpha >= phone._TTS_FIRST_FRAGMENT_MIN_CHARS
-            )
-            if (terminator or clause or dense >= min_chars) and any(
-                c.isalpha() for c in first
-            ):
-                leftover = text[idx + 1:]
-                if not terminator and not clause:
-                    cut = first.rfind(" ")
-                    if cut > 0 and any(c.isalpha() for c in first[:cut]):
-                        leftover = first[cut + 1:] + leftover
-                        first = first[:cut]
-                found = True
-                break
-        if not found:
-            return text, ""
-        return first, leftover
+        streams = await self._synthesized(
+            "Got it. Let me ask you something else.", min_chars=200,
+        )
+        self.assertEqual(streams[0], "Got it.")
 
 
 if __name__ == "__main__":
