@@ -6,9 +6,10 @@
  * Three facts, and only three:
  *   1. `phone_ist_window_open_at()` / `phone_ist_window_close_at()` remain the
  *      permanent 09:00 INCLUSIVE to 21:00 EXCLUSIVE IST bounds. Migration 0064
- *      (cutoff extended by 0085) temporarily makes the effective start-time
- *      predicate 24/7 through 2026-09-13 inclusive; the appointment trigger
- *      applies it to `starts_at` and to nothing else.
+ *      (cutoff extended by 0085, then ENDED by 0092 at the elapsed 2026-09-09)
+ *      temporarily made the effective start-time predicate 24/7; every date
+ *      after the cutoff is the permanent window. The appointment trigger
+ *      applies the predicate to `starts_at` and to nothing else.
  *   2. `phone_max_concurrent()` — the fleet-wide cap of ten simultaneous live
  *      attempts.
  *   3. The live appointments themselves: `status in ('scheduled','confirmed')`

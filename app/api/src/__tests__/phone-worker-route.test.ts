@@ -874,7 +874,7 @@ describe('P5 worker route — the IST window and temporary 24/7 override', () =>
       starts_at: '2026-09-12T21:30:00Z',
       duration_seconds: 1800,
     });
-    expect(res.body.ok).toBe(false);
+    expect(res.body).toEqual({ ok: false, status: 'window_closed' });
     expect(h.scheduleAppointment).not.toHaveBeenCalled();
   });
 

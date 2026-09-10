@@ -211,9 +211,9 @@ export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: s
     { name: '0086', sql: MIGRATION_0086 },
     // 0085 re-declares phone_temporary_247_until, phone_ist_window_open and
     // phone_next_window_open in full (0064-style bodies, cutoff 2026-09-13,
-    // aligning repo SQL with the out-of-band production extension), so it must
-    // be NEWEST-FIRST for the extractors to read the effective bodies rather
-    // than 0064's.
+    // aligning repo SQL with the out-of-band production extension). Its two
+    // PREDICATE bodies are still the effective ones (0092 changed only the
+    // cutoff helper), so it stays ahead of 0064.
     { name: '0085', sql: MIGRATION_0085 },
     // 0083 adds abandon_phone_attempt_infra (same-IST-day relief for a
     // worker_not_ready infra defer) and narrows the per-IST-day index. Its two

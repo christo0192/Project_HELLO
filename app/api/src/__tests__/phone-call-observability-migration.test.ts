@@ -44,15 +44,18 @@ describe('0082 per-call phone observability column', () => {
   });
 
   it('is registered NEWEST-FIRST in the migration harness', () => {
-    // 0086 (boundary disposition) is now the newest entry; 0085, 0083 and
-    // 0082 sit after it in order. What matters for the newest-first scheme is
-    // that 0082 still precedes every OLDER migration it could shadow —
-    // asserted via its index, which must be below any pre-0082 entry.
+    // 0092 (end of the temporary 24/7 window) is the newest entry, then 0086
+    // (boundary disposition); 0085, 0083 and 0082 sit after them in order.
+    // What matters for the newest-first scheme is that 0082 still precedes
+    // every OLDER migration it could shadow — asserted via its index, which
+    // must be below any pre-0082 entry.
     const idx082 = PHONE_MIGRATIONS.findIndex((m) => m.name === '0082');
     const idx083 = PHONE_MIGRATIONS.findIndex((m) => m.name === '0083');
     const idx085 = PHONE_MIGRATIONS.findIndex((m) => m.name === '0085');
     const idx086 = PHONE_MIGRATIONS.findIndex((m) => m.name === '0086');
-    expect(idx086).toBe(0);
+    const idx092 = PHONE_MIGRATIONS.findIndex((m) => m.name === '0092');
+    expect(idx092).toBe(0);
+    expect(idx086).toBe(1);
     expect(idx085).toBeGreaterThan(idx086);
     expect(PHONE_MIGRATIONS[idx082]).toEqual({ name: '0082', sql: MIGRATION_0082 });
     expect(idx083).toBeGreaterThan(idx085);
