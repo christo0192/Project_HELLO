@@ -856,15 +856,26 @@ describe('P5 worker route — the IST window and temporary 24/7 override', () =>
     { label: '03:00 IST (the middle of the night)', utc: '2026-09-13T21:30:00Z', open: false },
   ];
 
-  it('accepts a call-start at 03:00 IST on September 13 during the temporary window', async () => {
+  it('accepted a call-start at 03:00 IST on September 9 during the temporary window', async () => {
+    const h = build();
+    const res = await post(h, '/appointments', {
+      attempt_id: ATTEMPT,
+      starts_at: '2026-09-08T21:30:00Z',
+      duration_seconds: 1800,
+    });
+    expect(res.body.ok).toBe(true);
+    expect(h.scheduleAppointment).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a call-start at 03:00 IST on September 13 — the testing allowance ended on September 9 (0092)', async () => {
     const h = build();
     const res = await post(h, '/appointments', {
       attempt_id: ATTEMPT,
       starts_at: '2026-09-12T21:30:00Z',
       duration_seconds: 1800,
     });
-    expect(res.body.ok).toBe(true);
-    expect(h.scheduleAppointment).toHaveBeenCalledTimes(1);
+    expect(res.body.ok).toBe(false);
+    expect(h.scheduleAppointment).not.toHaveBeenCalled();
   });
 
   for (const c of cases) {

@@ -605,7 +605,7 @@ describe('the calendar projection', () => {
       time_zone: 'Asia/Kolkata',
       open_ist: '09:00:00',
       close_ist: '21:00:00',
-      temporary_247_until_ist: '2026-09-13',
+      temporary_247_until_ist: '2026-09-09',
     });
   });
 

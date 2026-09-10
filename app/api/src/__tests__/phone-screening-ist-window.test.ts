@@ -30,7 +30,7 @@ import {
   nextIstWindowOpen,
   parseIstClockTime,
 } from '../lib/phone-screening/ist-window.js';
-import { helperLiteral, functionBody, MIGRATION_0042, MIGRATION_0064, MIGRATION_0085 } from './support/phone-migration.js';
+import { helperLiteral, functionBody, MIGRATION_0042, MIGRATION_0064, MIGRATION_0085, MIGRATION_0092 } from './support/phone-migration.js';
 
 const IST_SOURCE = readFileSync(
   fileURLToPath(new URL('../lib/phone-screening/ist-window.ts', import.meta.url)),
@@ -61,11 +61,25 @@ describe('the DATABASE owns the window and the cap', () => {
     expect(body).toContain('>= screening_v2.phone_ist_window_open_at()');
     expect(body).toContain('< screening_v2.phone_ist_window_close_at()');
     expect(MIGRATION_0064).toContain("date '2026-09-06'");
-    // 0085 re-asserts the cutoff at the owner-approved extension date; the
-    // newest-first extractor therefore reads the effective predicate from it.
+    // 0085 re-asserted the cutoff at the owner-approved extension date; 0092
+    // ENDED the testing allowance by pulling it back to an elapsed date. The
+    // newest-first extractor reads the effective cutoff from 0092, and the TS
+    // mirror must say the same thing — the two moved together.
     expect(MIGRATION_0085).toContain("date '2026-09-13'");
+    expect(MIGRATION_0092).toContain("date '2026-09-09'");
+    expect(helperLiteral('phone_temporary_247_until')).toBe(PHONE_TEMPORARY_247_UNTIL_IST);
     expect(PHONE_IST_WINDOW.openSeconds).toBe(9 * 3600);
     expect(PHONE_IST_WINDOW.closeSeconds).toBe(21 * 3600);
+  });
+
+  it('the temporary all-hours allowance is CLOSED: its cutoff is in the past relative to the restore date', () => {
+    // 0092 lands on 2026-09-10 IST; the cutoff is the day before, so no
+    // future instant is ever admitted outside 09:00–21:00 IST again.
+    expect(PHONE_TEMPORARY_247_UNTIL_IST < '2026-09-10').toBe(true);
+    expect(istWindowForDate('2026-09-10')).toBe(PHONE_IST_WINDOW);
+    expect(istWindowOpen(new Date('2026-09-10T01:00:00.000Z'))).toBe(false); // 06:30 IST
+    expect(istWindowOpen(new Date('2026-09-10T16:00:00.000Z'))).toBe(false); // 21:30 IST
+    expect(istWindowOpen(new Date('2026-09-10T04:00:00.000Z'))).toBe(true);  // 09:30 IST
   });
 
   it('narrowing is allowed; widening is REFUSED, not clamped', () => {
@@ -167,18 +181,21 @@ describe('boundaries, on all seven days', () => {
 });
 
 describe('the effective temporary window', () => {
-  it('is 24/7 through September 13 inclusive and restores the normal bounds', () => {
-    expect(PHONE_TEMPORARY_247_UNTIL_IST).toBe('2026-09-13');
+  it('was 24/7 through September 9 inclusive and restores the normal bounds from September 10', () => {
+    expect(PHONE_TEMPORARY_247_UNTIL_IST).toBe('2026-09-09');
     expect(PHONE_24X7_WINDOW).toEqual({ openSeconds: 0, closeSeconds: 86_400 });
-    expect(istWindowForDate('2026-09-13')).toBe(PHONE_24X7_WINDOW);
-    expect(istWindowForDate('2026-09-14')).toBe(PHONE_IST_WINDOW);
-    expect(istWindowOpen(new Date('2026-09-13T18:29:59.000Z'))).toBe(true);
+    expect(istWindowForDate('2026-09-09')).toBe(PHONE_24X7_WINDOW);
+    expect(istWindowForDate('2026-09-10')).toBe(PHONE_IST_WINDOW);
+    expect(istWindowOpen(new Date('2026-09-09T18:29:59.000Z'))).toBe(true);  // 23:59:59 IST on the last 24/7 day
+    expect(istWindowOpen(new Date('2026-09-09T18:30:00.000Z'))).toBe(false); // 00:00 IST 2026-09-10
     expect(istWindowOpen(new Date('2026-09-14T00:00:00.000Z'))).toBe(false);
   });
 
   it('the next legal instant is now during the override, then 09:00 IST after it', () => {
-    const during = new Date('2026-09-13T18:29:59.000Z');
+    const during = new Date('2026-09-09T18:29:59.000Z');
     expect(nextIstWindowOpen(during).getTime()).toBe(during.getTime());
+    expect(nextIstWindowOpen(new Date('2026-09-09T18:30:00.000Z')).getTime())
+      .toBe(ist(2026, 9, 10, 9, 0, 0).getTime());
     expect(nextIstWindowOpen(new Date('2026-09-14T00:00:00.000Z')).getTime())
       .toBe(ist(2026, 9, 14, 9, 0, 0).getTime());
   });
