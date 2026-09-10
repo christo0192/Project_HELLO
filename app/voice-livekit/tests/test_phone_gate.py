@@ -10467,10 +10467,18 @@ class TestOpeningSubscribeReadiness(unittest.IsolatedAsyncioTestCase):
 
     @staticmethod
     def _speak_opening_src():
-        # `speak_opening` is a closure inside `_run_phone_session`; slice its
+        # The gate-speech closures inside `_run_phone_session`; slice their
         # source out so the guards below pin the REAL code, not a copy.
+        #
+        # 0095 widened the slice. The subscription wait used to be inline in
+        # `speak_opening`; it now lives in `_await_output_subscription`, which
+        # `_speak_gate_generation` runs before EVERY gate generation (identity,
+        # consent, role) and which `speak_opening` also calls directly so the
+        # deterministic path still warms it. The guard is unchanged in substance
+        # — the wait is bounded, shielded, and precedes `generate(` — so the
+        # slice follows the code rather than the assertions being relaxed.
         src = inspect.getsource(agent_mod._run_phone_session)
-        start = src.index("async def speak_opening")
+        start = src.index("async def _await_output_subscription")
         end = src.index("async def speak_role_opening")
         return src[start:end]
 
