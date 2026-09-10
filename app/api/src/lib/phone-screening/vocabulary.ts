@@ -197,6 +197,34 @@ export function phoneAttemptRecordingManifestKey(attemptId: string): string {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
+// The do-not-call list
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Both CHECKs have existed since 0042. Until 0094 gave the table a write path
+// they constrained rows nothing could create, so these unions are new to
+// TypeScript while the vocabulary they mirror is not.
+
+/** `chk_phone_suppressions_reason` — WHY this line must never be dialled. */
+export const PHONE_SUPPRESSION_REASONS = [
+  'candidate_opt_out',
+  'wrong_number',
+  'dnd_registry',
+  'operator',
+] as const;
+
+export type PhoneSuppressionReason = (typeof PHONE_SUPPRESSION_REASONS)[number];
+
+/** `chk_phone_suppressions_source` — WHO decided it. */
+export const PHONE_SUPPRESSION_SOURCES = [
+  'candidate',
+  'operator',
+  'system',
+  'registry',
+] as const;
+
+export type PhoneSuppressionSource = (typeof PHONE_SUPPRESSION_SOURCES)[number];
+
+// ═══════════════════════════════════════════════════════════════════════
 // The internal calendar
 // ═══════════════════════════════════════════════════════════════════════
 

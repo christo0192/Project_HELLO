@@ -631,30 +631,66 @@ export function createPhoneRuntime(
           const diagGate = reader.activeTestGate
             ? await reader.activeTestGate({ now })
             : null;
-          // Sanitise each sub-code so a `:detail` cannot form the entropy /
-          // token pattern the logger's value-defense drops (which silently
-          // nulled the whole field last iteration). Non-alphanumerics collapse
-          // to `_`, each code caps at 28 chars, and codes join with `-` — no
-          // 30+ alphanumeric run, no colon, no path.
-          const sanitizeCodes = (keys: string[]): string =>
-            keys.map((raw) => raw.replace(/[^a-z0-9]+/gi, '_').slice(0, 28)).join('-')
-            || 'none';
-          const diagSkip = sanitizeCodes(Object.keys(result.skipped ?? {}));
-          const diagRef = sanitizeCodes(Object.keys(result.refusals ?? {}));
+          // ── WHY THIS IS NOT ONE COMPOSED STRING ANY MORE ─────────────
+          // It used to be, and it reported NOTHING exactly when there was
+          // something to report. `logger.ts` validates `error_category`
+          // against SAFE_IDENT_RE, which caps at 64 CHARACTERS; this line
+          // built up to 180 and truncated to 180. So a quiet tick
+          // (`gate.0:st.ok:ex0:of0:di0:skip.none:ref.none`, 42 chars)
+          // survived, and a tick carrying a real refusal
+          // (`…:ref.dial_not_allowlisted`, 59 chars — or over 64 the moment
+          // a second code appeared) was dropped to null. The previous fix
+          // blamed the entropy/token defense and sanitised the sub-codes,
+          // which was not the cause and so changed nothing.
+          //
+          // Codes are now emitted ONE PER LINE, where each value is a single
+          // refusal code well inside the cap and needs no truncation, and the
+          // summary carries only counts. Nothing here is derived from a
+          // provider payload: `skipped`/`refusals` are keyed by the closed
+          // deferral/status vocabularies.
+          // The counts are clamped to six digits for two independent reasons,
+          // both of which would otherwise null the field: SAFE_IDENT_RE's
+          // 64-char cap, and DEFENSE_RE's `\d{10,}` rule, which reads ten
+          // consecutive digits as a phone number or card number.
+          const n = (v: number): string => String(Math.max(0, Math.min(999_999, v | 0)));
+          // COUNTS ONLY — no status. With the status inline this line reached
+          // 67 characters on `candidate_daily_attempt_exists` and was dropped;
+          // it is bounded at 33 here regardless of what any later migration
+          // names a refusal. The status gets its own line below, where it is a
+          // whole value rather than a substring competing for a budget.
+          const summary = `gate.${diagGate !== null ? 1 : 0}`
+            + `:ex${n(result.examined)}:of${n(result.offered)}:di${n(result.dialing)}`;
+          const skipCodes = Object.keys(result.skipped ?? {});
+          const refusalCodes = Object.keys(result.refusals ?? {});
           if (
             diagGate !== null
-            || diagSkip !== 'none'
-            || diagRef !== 'none'
+            || skipCodes.length > 0
+            || refusalCodes.length > 0
             || result.status !== 'ok'
           ) {
+            // Every value below is asserted to survive the REAL logger by
+            // phone-due-diag-logging.test.ts, across the entire status union
+            // and the entire deferral vocabulary — not by re-implementing the
+            // length rule here, which is how the two drifted apart last time.
             logger.info('unknown_event', {
               error_type: 'phone_due_diag',
-              error_category: (
-                `gate.${diagGate !== null ? 1 : 0}:st.${result.status}`
-                + `:ex${result.examined}:of${result.offered}:di${result.dialing}`
-                + `:skip.${diagSkip}:ref.${diagRef}`
-              ).slice(0, 180),
+              error_category: summary,
             });
+            logger.info('unknown_event', {
+              error_type: 'phone_due_status',
+              error_category: result.status,
+            });
+            for (const [kind, codes] of [
+              ['phone_due_skip', skipCodes],
+              ['phone_due_refusal', refusalCodes],
+            ] as const) {
+              for (const code of codes) {
+                logger.info('unknown_event', {
+                  error_type: kind,
+                  error_category: code,
+                });
+              }
+            }
           }
         } catch {
           // Diagnostics must never affect the tick.

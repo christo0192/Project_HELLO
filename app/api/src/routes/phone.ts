@@ -16,6 +16,9 @@
  *   DELETE /appointments/:id          admin         cancel
  *   POST   /halt                      admin         raise the kill switch
  *   POST   /halt/clear                admin         lower it
+ *   GET    /suppressions/:candidateId interviewer+  is this line do-not-call
+ *   POST   /suppressions/:candidateId admin         never call this line
+ *   DELETE /suppressions/:candidateId admin         lift that
  *
  * ── THIS IS AN OPERATOR SURFACE, NOT A CANDIDATE ONE ──────────────────
  * Nothing here is reachable by a candidate, and nothing here contacts a
@@ -60,9 +63,12 @@ import {
   phoneAppointmentCreateSchema,
   phoneAppointmentPatchSchema,
   phoneCalendarQuerySchema,
+  phoneCandidateIdParamSchema,
   phoneHaltClearSchema,
   phoneHaltSchema,
   phoneSlotsQuerySchema,
+  phoneSuppressionCreateSchema,
+  type PhoneSuppressionCreateInput,
 } from '../schemas/phone-api.js';
 import {
   IST_TIME_ZONE,
@@ -232,6 +238,11 @@ function budgetBlock(row: PhoneEngagementRow): Record<string, unknown> {
  */
 function refusalStatusCode(status: string): number {
   if (status === 'not_found') return 404;
+  // 0094: the suppression RPCs address a CANDIDATE, so their "no such row" is
+  // spelled differently. Without this it would map to 409, telling a caller
+  // their request conflicted with some state when in fact the candidate does
+  // not exist — the one refusal a client can actually fix by looking again.
+  if (status === 'candidate_not_found') return 404;
   if (status === 'unknown_status') return 500;
   return 409;
 }
@@ -1174,6 +1185,175 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
         );
         if (!ok) return;
         res.json({ ok: true, halted: false, was_halted: wasHalted, previous_reason: priorReason });
+      } catch {
+        res.status(500).json({ ok: false, error: 'phone_action_error' });
+      }
+    },
+  );
+
+  // ══════════════════════════════════════════════════════════════════
+  //  SUPPRESSIONS — the do-not-call list (0094)
+  // ══════════════════════════════════════════════════════════════════
+  //
+  // `phone_suppressions` has been read by `admit_phone_attempt` since 0042 and
+  // had no writer anywhere: zero rows, no route, no RPC. While
+  // `PHONE_DIAL_ALLOWLIST` was the gate that hardly mattered, because a number
+  // absent from the allowlist could not be dialled either way. Under
+  // `PHONE_DIAL_SCOPE=pipeline` it is the ONLY "never call this person"
+  // mechanism there is, which is why these three routes ship in the same
+  // change as the flag rather than after it.
+  //
+  // NO NUMBER CROSSES THIS BOUNDARY, in either direction. The candidate is
+  // named by id in the path; the RPC reads `phone_e164` from the candidate row
+  // and digests it in SQL. The reads below return a boolean and two
+  // closed-vocabulary strings — never the digest, which the module header
+  // names among the things that may not cross.
+  //
+  // A missing store seam is a 503, never a silent success: `PhoneStores`
+  // declares these optional so the many hand-written test doubles keep
+  // compiling, and reporting `ok` when nothing was recorded would be the worst
+  // possible failure for a do-not-call promise.
+
+  const suppressionStore = (): {
+    suppress: NonNullable<PhoneStores['suppressCandidatePhone']>;
+    release: NonNullable<PhoneStores['releaseCandidatePhoneSuppression']>;
+    state: NonNullable<PhoneStores['phoneSuppressionState']>;
+  } | null => {
+    const store = writeStore();
+    if (!store.suppressCandidatePhone
+      || !store.releaseCandidatePhoneSuppression
+      || !store.phoneSuppressionState) return null;
+    return {
+      suppress: store.suppressCandidatePhone.bind(store),
+      release: store.releaseCandidatePhoneSuppression.bind(store),
+      state: store.phoneSuppressionState.bind(store),
+    };
+  };
+
+  /** GET /suppressions/:candidateId — is this line on the list, and why. */
+  router.get(
+    '/suppressions/:candidateId',
+    requireRole('interviewer'),
+    validateParams(phoneCandidateIdParamSchema),
+    async (req: Request, res: Response) => {
+      if (refuseIfDisabled(res)) return;
+      const candidateId = req.params.candidateId as string;
+      const store = suppressionStore();
+      if (!store) {
+        res.status(503).json({ ok: false, error: 'phone_suppression_unavailable' });
+        return;
+      }
+      try {
+        const result = await store.state({ candidateId });
+        if (result.status !== 'ok') {
+          sendRefusal(res, result.status);
+          return;
+        }
+        res.json({
+          ok: true,
+          candidate_id: candidateId,
+          suppressed: result.suppressed ?? false,
+          reason: result.reason ?? null,
+          source: result.source ?? null,
+          created_at: result.createdAt ?? null,
+        });
+      } catch {
+        res.status(500).json({ ok: false, error: 'phone_action_error' });
+      }
+    },
+  );
+
+  /** POST /suppressions/:candidateId — never call this line again. */
+  router.post(
+    '/suppressions/:candidateId',
+    requireRole('admin'),
+    validateParams(phoneCandidateIdParamSchema),
+    validateBody(phoneSuppressionCreateSchema),
+    async (req: Request, res: Response) => {
+      if (refuseIfDisabled(res)) return;
+      const candidateId = req.params.candidateId as string;
+      const body = req.body as PhoneSuppressionCreateInput;
+      const actorId = req.authUser?.id ?? null;
+      const store = suppressionStore();
+      if (!store) {
+        res.status(503).json({ ok: false, error: 'phone_suppression_unavailable' });
+        return;
+      }
+      try {
+        const result = await store.suppress({
+          candidateId,
+          reason: body.reason,
+          source: body.source,
+          actorId,
+          now: now(),
+        });
+        if (result.status !== 'ok') {
+          sendRefusal(res, result.status);
+          return;
+        }
+        const alreadySuppressed = result.alreadySuppressed ?? false;
+        // NO COMPENSATION on an audit failure, and the reasoning is the halt's:
+        // undoing a suppression because our own audit sink failed would lift a
+        // do-not-call promise on the strength of a bookkeeping error, in the
+        // direction that causes calls. The RPC writes its own audit row, so
+        // the act is durably recorded regardless of what happens here.
+        const ok = await auditOrFail(req, res, 'resource.create', 200, {
+          resource: 'phone_suppression',
+          candidate_id: candidateId,
+          reason: body.reason,
+          source: body.source,
+          already_suppressed: alreadySuppressed,
+        });
+        if (!ok) return;
+        res.json({
+          ok: true,
+          candidate_id: candidateId,
+          suppressed: true,
+          already_suppressed: alreadySuppressed,
+        });
+      } catch {
+        res.status(500).json({ ok: false, error: 'phone_action_error' });
+      }
+    },
+  );
+
+  /** DELETE /suppressions/:candidateId — lift it. */
+  router.delete(
+    '/suppressions/:candidateId',
+    requireRole('admin'),
+    validateParams(phoneCandidateIdParamSchema),
+    async (req: Request, res: Response) => {
+      if (refuseIfDisabled(res)) return;
+      const candidateId = req.params.candidateId as string;
+      const actorId = req.authUser?.id ?? null;
+      const store = suppressionStore();
+      if (!store) {
+        res.status(503).json({ ok: false, error: 'phone_suppression_unavailable' });
+        return;
+      }
+      try {
+        const result = await store.release({ candidateId, actorId, now: now() });
+        // `not_suppressed` is deliberately NOT folded into success the way
+        // `already_cancelled` is on the calendar. This direction can cause a
+        // call: an operator who believes they lifted a suppression that was
+        // never there has a wrong model of who is about to be rung, and 409
+        // makes them look.
+        if (result.status !== 'ok') {
+          sendRefusal(res, result.status);
+          return;
+        }
+        const ok = await auditOrFail(req, res, 'resource.delete', 200, {
+          resource: 'phone_suppression',
+          candidate_id: candidateId,
+          released: result.released ?? 0,
+        });
+        if (!ok) return;
+        res.json({
+          ok: true,
+          candidate_id: candidateId,
+          suppressed: false,
+          released: result.released ?? 0,
+        });
       } catch {
         res.status(500).json({ ok: false, error: 'phone_action_error' });
       }

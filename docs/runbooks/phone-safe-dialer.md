@@ -36,9 +36,60 @@ each represents a distinct decision, and none is allowed to imply another.
 | `PHONE_SCREENING_ENABLED` | `false` | The domain master switch. |
 | `PHONE_RUNTIME_ENABLED` | `false` | Arms workers/timers, independently. |
 | `PHONE_DIAL_MODE` | `off` | `off` \| `synthetic` \| `live`. Only `live` can reach a carrier. |
-| `PHONE_DIAL_ALLOWLIST` | empty | SHA-256 **digests** of permitted numbers. **Empty is fail-closed.** |
+| `PHONE_DIAL_ALLOWLIST` | empty | SHA-256 **digests** of permitted numbers. **Empty is fail-closed** — under `allowlist` scope only. |
+| `PHONE_DIAL_SCOPE` | `allowlist` | `allowlist` \| `pipeline`. Which question the pre-claim gate asks. See §2a. |
 | `PHONE_SIP_TRUNK_ID` | empty | Provider-neutral trunk. **Empty is fail-closed.** |
 | LiveKit credentials | — | Checked independently of the phone flags. |
+
+### 2a. `PHONE_DIAL_SCOPE` — allowlist or pipeline (0094)
+
+`PHONE_DIAL_ALLOWLIST` was a **bring-up canary**: prove the dialer can only
+reach numbers an operator nominated by hand. It answers a question about the
+operator's confidence, not about the candidate, and it has three properties
+that stop being acceptable once real applicants are in the funnel:
+
+* **Nothing populates it.** Every new candidate needs a manual
+  `fly secrets set` plus an API restart before they can ever be called.
+* **It truncates silently** past `MAX_DIAL_ALLOWLIST_ENTRIES` (64).
+* **Its refusal is invisible.** `dial_not_allowlisted` is a pre-claim
+  *deferral*: no attempt row, no state change, no error. A candidate missing
+  from the list sits `eligible` for ever and the dashboard shows nothing.
+
+On 2026-09-10 a candidate added to the pipeline at 11:58Z was never dialled
+because the secret had last been written at 11:12Z. There was no way to see
+this from the product.
+
+**`pipeline` moves the gate to where the facts are.** `admit_phone_attempt` is
+the *sole grantor* — a local gate can refuse, it can never admit — and before
+it grants a dial it already requires: the application live and not terminal,
+the job mapping `enabled`, résumé ingestion `ready`, consent granted,
+unexpired and carrying every type the active template requires, a valid Indian
+mobile, **not suppressed**, not halted, inside the IST window, past
+`next_eligible_at`, within the no-answer budget, one attempt per engagement
+per IST day, one per candidate per IST day, under `phone_max_concurrent()`
+and under `phone_max_daily_dials()`.
+
+Two things ship with the flag and are what make it safe:
+
+* **The fleet daily cap** (`phone_max_daily_dials()`, 50/IST-day). The
+  allowlist's real value was bounding blast radius; this bounds it by volume
+  instead of by hand. `phone_max_concurrent()` bounds *simultaneity* — ten at a
+  time, all day, is thousands of calls. Raising the cap is a migration, on
+  purpose: a bound any operator can raise in a hurry is not a bound.
+* **The suppression write path** (`POST/DELETE /api/phone/suppressions/{candidateId}`).
+  `phone_suppressions` had been read by admission since 0042 and written by
+  nothing. Under `pipeline` it is the only "never call this person" mechanism
+  there is.
+
+**To cut over:** `fly secrets set PHONE_DIAL_SCOPE=pipeline --app project-hello-api`,
+wait for the roll, confirm `dialScope: "pipeline"` on `GET /api/phone/health`.
+**To roll back:** unset it, or set it to `allowlist`. The allowlist value is
+left untouched by the flag, so rollback needs no secret to be reconstructed.
+An unrecognised value reads as `allowlist` — the narrower of the two.
+
+**What `pipeline` does NOT do:** it does not override `PHONE_SCREENING_ENABLED`,
+`PHONE_RUNTIME_ENABLED` or `PHONE_DIAL_MODE`, and it does not skip the consent
+preflight. It widens the digest comparison and nothing else.
 
 `PHONE_AGENT_NAME` is a sixth, orthogonal knob — see §5.
 

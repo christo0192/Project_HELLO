@@ -117,6 +117,10 @@ function screeningConfig(over: Partial<PhoneScreeningConfig> = {}): PhoneScreeni
     runtimeEnabled: true,
     dialMode: 'synthetic',
     dialAllowlist: [],
+    // 0094: the fixtures exercise `synthetic`, where the digest gate does not
+    // run at all, so the scope is inert here. Pinned to the DEFAULT so the
+    // fixture keeps describing production's out-of-the-box configuration.
+    dialScope: 'allowlist',
     slotSeconds: 1_800,
     reconnectBackoffSeconds: 120,
     infraDeferBackoffSeconds: 300,

@@ -261,6 +261,109 @@ describe('admission facade — the gates defer, they never admit', () => {
     expect(PHONE_OUTCOME_CLASSES).not.toContain(result.code as never);
   });
 
+  // ── 0094: PHONE_DIAL_SCOPE=pipeline ────────────────────────────────
+  //
+  // The gate stops asking "did an operator nominate this number" and lets
+  // `admit_phone_attempt` — which this module's header names as the sole
+  // grantor — answer the question it already answers. The assertions below
+  // are about WHERE the decision is made, not about relaxing it: every one
+  // checks that the RPC is now REACHED, because reaching it is what puts
+  // consent, suppression, the mapping, the budgets, the halt, the window and
+  // both caps back in charge.
+
+  const pipelineConfig = loadPhoneScreeningConfig({
+    PHONE_SCREENING_ENABLED: 'true',
+    PHONE_RUNTIME_ENABLED: 'true',
+    PHONE_DIAL_MODE: 'live',
+    PHONE_DIAL_SCOPE: 'pipeline',
+  });
+
+  it('pipeline scope reaches the RPC with an EMPTY allowlist', () => {
+    expect(pipelineConfig.dialAllowlist).toHaveLength(0);
+  });
+
+  it('pipeline scope admits a digest no allowlist ever mentioned', async () => {
+    const f = fakeStores(okResult);
+    const result = await admitPhoneEngagement(
+      { stores: f.stores, config: pipelineConfig, consentReader: reader(granted) },
+      request,
+    );
+    expect(result.decision).toBe('admitted');
+    // The RPC was actually CALLED. A pass that returned `admitted` without
+    // reaching the database would mean the gate had been removed rather than
+    // moved, which is the failure this whole change must not be.
+    expect(f.callsMade()).toBe(1);
+  });
+
+  it('pipeline scope does not require a digest at all', async () => {
+    // Under `allowlist` a missing digest is fail-closed, because "we do not
+    // know which line this is" cannot be matched against a list. Under
+    // `pipeline` the digest is not the basis of the decision: the RPC reads
+    // the number from the candidate row itself and refuses `phone_invalid`
+    // if it is unusable, so the local gate has nothing to add.
+    const f = fakeStores(okResult);
+    const result = await admitPhoneEngagement(
+      { stores: f.stores, config: pipelineConfig, consentReader: reader(granted) },
+      { ...request, phoneDigest: undefined },
+    );
+    expect(result.decision).toBe('admitted');
+    expect(f.callsMade()).toBe(1);
+  });
+
+  it('pipeline scope does NOT bypass the consent preflight', async () => {
+    // The scope widens the DIGEST gate and nothing else. Consent is checked
+    // both here (advisory) and inside the RPC (authoritative); a flag that
+    // quietly skipped the preflight would place a call this layer knows it
+    // should not, and would do it before the database ever saw the request.
+    const f = fakeStores(okResult);
+    const result = await admitPhoneEngagement(
+      { stores: f.stores, config: pipelineConfig, consentReader: reader(null) },
+      request,
+    );
+    expect(result).toMatchObject({ decision: 'deferred', code: 'consent_preflight_refused' });
+    expect(f.callsMade()).toBe(0);
+  });
+
+  it('pipeline scope does NOT bypass the disabled switches or dial mode', async () => {
+    for (const off of [
+      { PHONE_SCREENING_ENABLED: 'false' },
+      { PHONE_RUNTIME_ENABLED: 'false' },
+      { PHONE_DIAL_MODE: 'off' },
+    ]) {
+      const config = loadPhoneScreeningConfig({
+        PHONE_SCREENING_ENABLED: 'true',
+        PHONE_RUNTIME_ENABLED: 'true',
+        PHONE_DIAL_MODE: 'live',
+        PHONE_DIAL_SCOPE: 'pipeline',
+        ...off,
+      });
+      const f = fakeStores(okResult);
+      const result = await admitPhoneEngagement(
+        { stores: f.stores, config, consentReader: reader(granted) },
+        request,
+      );
+      expect(result.decision, JSON.stringify(off)).toBe('deferred');
+      expect(f.callsMade(), JSON.stringify(off)).toBe(0);
+    }
+  });
+
+  it('the DEFAULT scope is unchanged — an unlisted digest still defers', async () => {
+    // The rollback path, asserted rather than assumed. Omitting
+    // PHONE_DIAL_SCOPE entirely must behave exactly as it did before 0094.
+    const config = loadPhoneScreeningConfig({
+      PHONE_SCREENING_ENABLED: 'true',
+      PHONE_RUNTIME_ENABLED: 'true',
+      PHONE_DIAL_MODE: 'live',
+    });
+    expect(config.dialScope).toBe('allowlist');
+    const f = fakeStores(okResult);
+    expect(await admitPhoneEngagement(
+      { stores: f.stores, config, consentReader: reader(granted) },
+      request,
+    )).toMatchObject({ decision: 'deferred', code: 'dial_not_allowlisted' });
+    expect(f.callsMade()).toBe(0);
+  });
+
   it('live mode with an empty or non-matching allowlist defers', async () => {
     const config = loadPhoneScreeningConfig({
       PHONE_SCREENING_ENABLED: 'true',

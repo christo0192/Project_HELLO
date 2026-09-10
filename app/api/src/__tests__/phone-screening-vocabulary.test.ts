@@ -19,6 +19,8 @@ import {
   PHONE_OUTCOME_CLASSES,
   PHONE_APPOINTMENT_STATUSES,
   PHONE_APPOINTMENT_SOURCES,
+  PHONE_SUPPRESSION_REASONS,
+  PHONE_SUPPRESSION_SOURCES,
   PHONE_APPOINTMENT_CANCEL_REASONS,
   PHONE_EVENT_SOURCES,
   PHONE_EVENT_IGNORED_REASONS,
@@ -118,6 +120,20 @@ describe('phone-screening vocabulary mirrors 0042 exactly', () => {
     // start is a pre-claim deferral; see `admission.ts`.
     expect(isPhoneOutcomeClass('cold_start')).toBe(false);
     expect(MIGRATION_0042).not.toContain("'cold_start'");
+  });
+
+  it('suppression reasons and sources match their CHECKs (0042 tables, 0094 writer)', () => {
+    // Both CHECKs have existed since 0042. Until 0094 gave the table a write
+    // path they constrained rows nothing could create, so these two unions are
+    // new to TypeScript while the vocabulary they mirror is not — which is
+    // exactly the case where a hand-typed list drifts unnoticed, because no
+    // running code would have exercised a wrong member.
+    expect(set(PHONE_SUPPRESSION_REASONS)).toEqual(
+      set(checkMembers('chk_phone_suppressions_reason')),
+    );
+    expect(set(PHONE_SUPPRESSION_SOURCES)).toEqual(
+      set(checkMembers('chk_phone_suppressions_source')),
+    );
   });
 
   it('appointment statuses, sources and cancel reasons match their CHECKs', () => {

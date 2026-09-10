@@ -111,6 +111,7 @@
         "PHONE_RUNTIME_ENABLED": { "requiredInProduction": false, "secret": false },
         "PHONE_DIAL_MODE": { "requiredInProduction": false, "secret": false },
         "PHONE_DIAL_ALLOWLIST": { "requiredInProduction": false, "secret": false },
+        "PHONE_DIAL_SCOPE": { "requiredInProduction": false, "secret": false },
         "PHONE_SLOT_SECONDS": { "requiredInProduction": false, "secret": false },
         "PHONE_RECONNECT_BACKOFF_SECONDS": { "requiredInProduction": false, "secret": false },
         "PHONE_INFRA_DEFER_BACKOFF_SEC": { "requiredInProduction": false, "secret": false },

@@ -79,6 +79,12 @@ export const PHONE_RPC_NAMES = [
   // (worker_not_ready). Restores the engagement to its prior state; charges no
   // budget. Paired with the 0083 narrowed per-IST-day index.
   'abandon_phone_attempt_infra',
+  // 0094 — the do-not-call write path. `phone_suppressions` had been READ by
+  // admission since 0042 with nothing anywhere able to write it; these are
+  // that missing door. All three take a candidate id and never a number.
+  'suppress_candidate_phone',
+  'release_candidate_phone_suppression',
+  'phone_suppression_state',
 ] as const;
 
 export type PhoneRpcName = (typeof PHONE_RPC_NAMES)[number];
@@ -233,6 +239,13 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
     ],
     // 0083 (P3 adds p_backoff_seconds between the attempt id and p_now).
     abandon_phone_attempt_infra: ['p_attempt_id', 'p_backoff_seconds', 'p_now'],
+    // 0094 — the do-not-call write path. No `p_phone`: the number is read
+    // from the candidate row inside the RPC and digested there.
+    suppress_candidate_phone: [
+      'p_candidate_id', 'p_reason', 'p_source', 'p_actor_id', 'p_now',
+    ],
+    release_candidate_phone_suppression: ['p_candidate_id', 'p_actor_id', 'p_now'],
+    phone_suppression_state: ['p_candidate_id'],
   });
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -275,6 +288,16 @@ export const ADMIT_PHONE_ATTEMPT_STATUSES = [
   // rather than of the row.
   'candidate_call_in_flight',
   'candidate_daily_attempt_exists',
+  // ── 0094: the FLEET daily cap ─────────────────────────────────────────
+  // Every daily refusal above is scoped to one engagement or one person.
+  // This one is scoped to the whole system: `phone_max_daily_dials()` cold
+  // calls per IST day, counted under the admission lock. It is the
+  // compensating control that lets `PHONE_DIAL_SCOPE=pipeline` retire the
+  // hand-maintained digest allowlist without giving up a bound on how many
+  // DISTINCT people a bug could ring. Deliberately NOT `at_capacity`: that
+  // is simultaneity and clears itself as calls end, while this clears at
+  // IST midnight.
+  'fleet_daily_cap_reached',
 ] as const;
 
 export type AdmitPhoneAttemptStatus = (typeof ADMIT_PHONE_ATTEMPT_STATUSES)[number];
@@ -431,6 +454,47 @@ export type SetPhoneHaltStatus = (typeof SET_PHONE_HALT_STATUSES)[number];
 export const CLEAR_PHONE_HALT_STATUSES = ['ok', 'halt_unreadable'] as const;
 
 export type ClearPhoneHaltStatus = (typeof CLEAR_PHONE_HALT_STATUSES)[number];
+
+/**
+ * `suppress_candidate_phone` (0094) — the do-not-call write path.
+ *
+ * Takes a CANDIDATE ID, never a number: the RPC reads `phone_e164` from the
+ * candidate row and digests it itself, so no caller can supply or learn one.
+ * `ok` is returned for a repeat too — the result carries `already_suppressed`
+ * — because the outcome the caller asked for is true either way, and an error
+ * on a second click is how operators learn to click twice.
+ */
+export const SUPPRESS_CANDIDATE_PHONE_STATUSES = [
+  'ok',
+  'candidate_not_found',
+  'invalid_reason',
+  'invalid_source',
+  'phone_absent',
+] as const;
+
+export type SuppressCandidatePhoneStatus = (typeof SUPPRESS_CANDIDATE_PHONE_STATUSES)[number];
+
+/**
+ * `release_candidate_phone_suppression` (0094) — lifting the promise.
+ *
+ * `not_suppressed` is distinct from `ok` on purpose: this is the direction
+ * that can cause a call, so "there was nothing to lift" must not read as
+ * "lifted".
+ */
+export const RELEASE_CANDIDATE_PHONE_SUPPRESSION_STATUSES = [
+  'ok',
+  'candidate_not_found',
+  'not_suppressed',
+  'phone_absent',
+] as const;
+
+export type ReleaseCandidatePhoneSuppressionStatus =
+  (typeof RELEASE_CANDIDATE_PHONE_SUPPRESSION_STATUSES)[number];
+
+/** `phone_suppression_state` (0094) — a read; never returns the digest. */
+export const PHONE_SUPPRESSION_STATE_STATUSES = ['ok', 'candidate_not_found'] as const;
+
+export type PhoneSuppressionStateStatus = (typeof PHONE_SUPPRESSION_STATE_STATUSES)[number];
 
 /** `expire_phone_appointments` — a bounded sweep always answers `ok`. */
 export const EXPIRE_PHONE_APPOINTMENTS_STATUSES = ['ok'] as const;
@@ -706,6 +770,9 @@ export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]
     sweep_phone_stranded_recordings: SWEEP_PHONE_STRANDED_RECORDINGS_STATUSES,
     finalize_phone_partial_sessions: FINALIZE_PHONE_PARTIAL_SESSIONS_STATUSES,
     abandon_phone_attempt_infra: ABANDON_PHONE_ATTEMPT_INFRA_STATUSES,
+    suppress_candidate_phone: SUPPRESS_CANDIDATE_PHONE_STATUSES,
+    release_candidate_phone_suppression: RELEASE_CANDIDATE_PHONE_SUPPRESSION_STATUSES,
+    phone_suppression_state: PHONE_SUPPRESSION_STATE_STATUSES,
   });
 
 /**
@@ -764,7 +831,16 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
  * member, `invalid_disposition` (the closed-vocabulary refusal for the
  * Finding B per-key outcome column).
  */
-export const PHONE_RPC_STATUS_COUNT = 109;
+/*
+ * 0094 takes it from 109 to 112 — THREE new members across four new refusals:
+ * `fleet_daily_cap_reached` (admit), `invalid_source` (suppress) and
+ * `not_suppressed` (release). The fourth, `phone_absent`, was already in the
+ * union, as were `ok`, `invalid_reason` (from `set_phone_halt`) and
+ * `candidate_not_found` — which is why three new RPCs move the count by three
+ * rather than by the seven statuses they name. The exact number is RE-DERIVED
+ * by the drift test from the migration text; this constant is only a tripwire.
+ */
+export const PHONE_RPC_STATUS_COUNT = 112;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.
