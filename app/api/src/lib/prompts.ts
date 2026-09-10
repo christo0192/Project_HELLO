@@ -44,9 +44,25 @@ Type rules: every string field is a JSON string (or null), "skills"/"career_high
 
 Resume text:`;
 
-export function buildExtractionPrompt(resumeText: string): string {
-  // Static instructions FIRST (stable cache prefix), résumé text LAST.
+/**
+ * The calendar month the model should treat as "today" when a role says
+ * "Present". A model's own sense of the date lags its training cut-off by a
+ * year or more, and "experience_years" is CALCULATED from open-ended roles, so
+ * without this every current role is under-counted. It sits AFTER the static
+ * instruction block (so the cached prefix is byte-identical across calls) and
+ * changes once a month, which is the cache invalidation it costs.
+ */
+export function extractionTodayLine(now: Date = new Date()): string {
+  const y = now.getUTCFullYear();
+  const m = String(now.getUTCMonth() + 1).padStart(2, '0');
+  return `Today is ${y}-${m}.`;
+}
+
+export function buildExtractionPrompt(resumeText: string, now: Date = new Date()): string {
+  // Static instructions FIRST (stable cache prefix), then today's month (a
+  // one-line variable suffix to the instructions), résumé text LAST.
   return `${EXTRACTION_INSTRUCTIONS}
+${extractionTodayLine(now)}
 """
 ${resumeText.slice(0, 12000)}
 """`;

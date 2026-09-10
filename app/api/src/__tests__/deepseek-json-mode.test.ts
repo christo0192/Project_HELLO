@@ -11,10 +11,11 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   createDeepseekRunner,
+  DeepseekError,
   type DeepseekTransport,
   type DeepseekTransportRequest,
 } from '../lib/deepseek.js';
-import { CircuitBreaker } from '../lib/provider-resilience.js';
+import { BusinessError, CircuitBreaker, isProviderFailure } from '../lib/provider-resilience.js';
 import { EXTRACTION_INSTRUCTIONS } from '../lib/prompts.js';
 
 function capturing() {
@@ -61,5 +62,45 @@ describe('DeepSeek response_format wiring', () => {
 
   it('the résumé extraction prompt satisfies the provider precondition (contains "json")', () => {
     expect(EXTRACTION_INSTRUCTIONS.toLowerCase()).toContain('json');
+  });
+});
+
+describe('DeepSeek JSON mode — the documented blank answer', () => {
+  function blankRunner() {
+    let calls = 0;
+    const transport: DeepseekTransport = async () => {
+      calls += 1;
+      return {
+        ok: true, status: 200,
+        text: async () => JSON.stringify({ choices: [{ message: { content: '   ' } }] }),
+      };
+    };
+    const runner = createDeepseekRunner({
+      transport,
+      breaker: new CircuitBreaker({ failureThreshold: 5, cooldownMs: 30_000 }),
+    });
+    return { runner, calls: () => calls };
+  }
+
+  beforeEach(() => { process.env.DEEPSEEK_API_KEY = 'test-key'; });
+
+  it('in JSON mode surfaces as a distinct, retryable empty_content error after ONE call', async () => {
+    // "The API may occasionally return empty content" — DeepSeek JSON Output
+    // docs. The structurer retries this on its transient ladder; a generic
+    // parse_error would not be retried and would cost the candidate a phone.
+    const { runner, calls } = blankRunner();
+    await expect(runner.runDeepseekJSON('Return json', { responseFormat: 'json_object' }))
+      .rejects.toMatchObject({ category: 'empty_content' });
+    expect(calls()).toBe(1);
+  });
+
+  it('on the plain path keeps the historical treatment: one re-ask, then a parse_error BusinessError', async () => {
+    const { runner, calls } = blankRunner();
+    await expect(runner.runDeepseekJSON('prompt')).rejects.toBeInstanceOf(BusinessError);
+    expect(calls()).toBe(2);
+  });
+
+  it('is not counted as a breaker failure', () => {
+    expect(isProviderFailure(new DeepseekError('empty_content'))).toBe(false);
   });
 });

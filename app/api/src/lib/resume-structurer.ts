@@ -189,8 +189,8 @@ export function __setModelConcurrencyForTest(
  * prose or a fence, and the runner's `extractJson` slice was the only thing
  * standing between that and a `parse_error` surrender to the keyword
  * extractor. The extraction prompt already contains the word "json" (the
- * provider's precondition for the mode) — `resume-extraction-prompt.test.ts`
- * pins that so the two cannot drift apart.
+ * provider's precondition for the mode) — `deepseek-json-mode.test.ts` pins
+ * that so the two cannot drift apart.
  */
 export const defaultResumeModelRunner: ResumeModelRunner = (prompt) =>
   runClaudeJSON<unknown>(prompt, { responseFormat: 'json_object' });
@@ -213,6 +213,8 @@ const MAX_SKILL_LEN = 80;
  * beyond it is not a phone number.
  */
 const MAX_PHONE_LEN = 64;
+/** Below this many digits a value cannot be a subscriber number in any plan. */
+const MIN_PHONE_DIGITS = 7;
 /** A sane human range; outside it the value is noise, not an answer. */
 const MAX_EXPERIENCE_YEARS = 80;
 /** Rich screening context remains small enough for prompt and storage bounds. */
@@ -235,11 +237,12 @@ function absent(v: unknown): boolean {
  */
 const NULL_WORDS = new Set([
   'null', 'none', 'n/a', 'na', 'nil', 'unknown', 'not specified', 'not provided',
-  'not available', 'not mentioned', 'unspecified', '-', '—', '--',
+  'not available', 'not mentioned', 'not applicable', 'not found', 'not given',
+  'not stated', 'unavailable', 'unspecified', 'tbd', '-', '—', '--',
 ]);
 
 function isNullWord(s: string): boolean {
-  return NULL_WORDS.has(s.trim().toLowerCase());
+  return NULL_WORDS.has(s.trim().toLowerCase().replace(/[.!]+$/, ''));
 }
 
 // ── TOLERANT COERCION, AND WHY THE STRICT VERSION HAD TO GO ─────────────────
@@ -310,8 +313,26 @@ function coerceEmail(v: unknown, max: number): string | null {
   return EMAIL_SHAPE.test(s) ? s : null;
 }
 
-/** Separators a model uses when it flattens a list into one string. */
-const LIST_SPLIT_RE = /\s*(?:[,;|•·\n]|\s{2,}-\s+|^\s*-\s+)\s*/;
+/**
+ * Separators a model uses when it flattens a list into one string.
+ *
+ * Two flavours, because a comma means different things in different fields:
+ * in `skills`/`certifications` it separates items ("Sales, CRM, Excel"); in
+ * `career_highlights`/`education` it sits INSIDE an item ("Grew ARR 40%, closed
+ * 12 deals" is one highlight, "B.Tech, IIT Delhi, 2015" one degree). Prose
+ * fields therefore split only on hard separators — newline, semicolon, pipe,
+ * bullet, and a " - " that begins a line or follows a wide gap.
+ *
+ * Both are LINEAR: single-character alternatives plus one bounded `\s{2,}-\s`
+ * — no overlapping whitespace quantifiers (an earlier `\s*(…|\s{2,}-\s+)\s*`
+ * was ~n³ on a whitespace run and could stall the event loop on a field the
+ * model echoed from a whitespace-padded résumé table). The input is also
+ * length-bounded BEFORE splitting (see `coerceStringList`).
+ */
+const LIST_SPLIT_ITEMS_RE = /[,;|•·\n]|\s{2,}-\s|^-\s/m;
+const LIST_SPLIT_PROSE_RE = /[;|•·\n]|\s{2,}-\s|^-\s/m;
+
+type ListFlavour = 'items' | 'prose';
 
 /**
  * Coerce a list field. An array keeps its string entries (non-string entries
@@ -320,13 +341,24 @@ const LIST_SPLIT_RE = /\s*(?:[,;|•·\n]|\s{2,}-\s+|^\s*-\s+)\s*/;
  * anything else is an empty list. Trimmed, bounded, case-insensitively
  * de-duplicated, order preserved.
  */
-function coerceStringList(v: unknown, limit: number, itemLimit: number): string[] {
+function coerceStringList(
+  v: unknown,
+  limit: number,
+  itemLimit: number,
+  flavour: ListFlavour = 'items',
+): string[] {
   if (absent(v)) return [];
   let items: unknown[];
   if (Array.isArray(v)) {
     items = v;
   } else if (typeof v === 'string') {
-    items = isNullWord(v) ? [] : v.split(LIST_SPLIT_RE);
+    // Bounded BEFORE the split: no list of `limit` items each `itemLimit`
+    // long needs more input than this, and the bound keeps the split linear
+    // in a small constant however long the model's string was.
+    const bounded = v.slice(0, limit * (itemLimit + 4));
+    items = isNullWord(bounded)
+      ? []
+      : bounded.split(flavour === 'items' ? LIST_SPLIT_ITEMS_RE : LIST_SPLIT_PROSE_RE);
   } else {
     return [];
   }
@@ -336,17 +368,20 @@ function coerceStringList(v: unknown, limit: number, itemLimit: number): string[
     // A non-string ENTRY is skipped rather than fatal: one bad element in an
     // otherwise good list is noise, and these fields decide nothing dangerous.
     // A short object entry with a `name`/`title` (a "skill" the model wrapped)
-    // is unwrapped rather than lost.
+    // is unwrapped rather than lost — OWN properties only, like every other
+    // read in this module.
     let s: string | null = null;
     if (typeof item === 'string') {
       s = item;
     } else if (item !== null && typeof item === 'object' && !Array.isArray(item)) {
       const rec = item as Record<string, unknown>;
-      const inner = ['name', 'title', 'skill', 'value', 'text'].map((k) => rec[k]).find((x) => typeof x === 'string');
-      if (typeof inner === 'string') s = inner;
+      for (const k of ['name', 'title', 'skill', 'value', 'text']) {
+        if (Object.hasOwn(rec, k) && typeof rec[k] === 'string') { s = rec[k] as string; break; }
+      }
     }
     if (s === null) continue;
-    s = s.trim().slice(0, itemLimit);
+    // A leading list bullet the splitter left behind ("- CRM") is not content.
+    s = s.trim().replace(/^[-•·*]\s+/, '').trim().slice(0, itemLimit);
     if (s === '' || isNullWord(s) || seen.has(s.toLowerCase())) continue;
     seen.add(s.toLowerCase());
     out.push(s);
@@ -365,7 +400,7 @@ type RoleEvidence = NonNullable<ParsedResume['recent_role']>;
 const ROLE_KEY_ALIASES: Readonly<Record<keyof RoleEvidence, readonly string[]>> = {
   title: ['title', 'role', 'position', 'job_title', 'designation'],
   employer: ['employer', 'company', 'organization', 'organisation', 'org'],
-  period: ['period', 'dates', 'duration', 'tenure', 'date_range', 'years'],
+  period: ['period', 'dates', 'duration', 'tenure', 'date_range'],
   highlights: ['highlights', 'achievements', 'responsibilities', 'bullets'],
 };
 
@@ -392,7 +427,7 @@ function coerceRoleEvidence(v: unknown): RoleEvidence | null {
     title: coerceString(pick(ROLE_KEY_ALIASES.title), MAX_DISPLAY_LEN),
     employer: coerceString(pick(ROLE_KEY_ALIASES.employer), MAX_DISPLAY_LEN),
     period: coerceString(pick(ROLE_KEY_ALIASES.period), MAX_DISPLAY_LEN),
-    highlights: coerceStringList(pick(ROLE_KEY_ALIASES.highlights), MAX_ROLE_HIGHLIGHTS, MAX_EVIDENCE_LEN),
+    highlights: coerceStringList(pick(ROLE_KEY_ALIASES.highlights), MAX_ROLE_HIGHLIGHTS, MAX_EVIDENCE_LEN, 'prose'),
   };
   return role.title || role.employer || role.period || role.highlights.length > 0 ? role : null;
 }
@@ -414,13 +449,20 @@ function coercePriorRoles(v: unknown): RoleEvidence[] {
   return roles;
 }
 
-/** Leading decimal in a years string: "5+", "5.5 years", "6 yrs", "7-9 years" → 5, 5.5, 6, 7. */
-const YEARS_IN_STRING_RE = /^\D{0,12}?(\d{1,3}(?:\.\d{1,2})?)/;
+/**
+ * A years string: an optional short lead-in ("about", "approx."), the figure,
+ * an optional "+", and the unit that decides what the figure MEANS. "6 months"
+ * is 0.5 years, not 6; "7-9 years" reads its first figure; a leading "-" or a
+ * "%" is not an experience figure at all.
+ */
+const YEARS_IN_STRING_RE =
+  /^(?:[a-z.~]{0,12}\s{0,2})?(\d{1,3}(?:\.\d{1,2})?)\s*\+?\s*(?:-\s*\d{1,3}\s*)?(years?|yrs?|y\b|months?|mos?\b|m\b)?/i;
 
 /**
- * Coerce total years. A JSON number is taken as-is; a string with a leading
- * figure (`"5+"`, `"5 years"`, `"6.5"`) yields that figure. Out-of-range,
- * non-finite or unparseable values null ONLY this field.
+ * Coerce total years. A JSON number is taken as-is; a string with a figure and
+ * a unit (`"5+"`, `"5 years"`, `"6.5"`, `"18 months"` → 1.5) yields that
+ * figure in YEARS. Out-of-range, negative, percentage, non-finite or
+ * unparseable values null ONLY this field.
  */
 function coerceYears(v: unknown): number | null {
   if (absent(v)) return null;
@@ -428,10 +470,13 @@ function coerceYears(v: unknown): number | null {
   if (typeof v === 'number') {
     n = v;
   } else if (typeof v === 'string') {
-    if (isNullWord(v)) return null;
-    const m = v.trim().match(YEARS_IN_STRING_RE);
+    const s = v.trim();
+    if (isNullWord(s) || s.startsWith('-') || s.includes('%')) return null;
+    const m = s.match(YEARS_IN_STRING_RE);
     if (!m) return null;
     n = Number(m[1]);
+    const unit = (m[2] ?? '').toLowerCase();
+    if (unit.startsWith('mo') || unit === 'm') n = Math.round((n / 12) * 10) / 10;
   } else {
     return null;
   }
@@ -465,11 +510,11 @@ function coercePhone(v: unknown): string | null {
     if (!Number.isSafeInteger(v) || v <= 0) return null;
     s = String(v);
   } else if (Array.isArray(v)) {
-    // Several numbers listed: take the first string entry. The rest are lost
-    // rather than guessed at — one candidate, one number.
-    const first = v.find((x) => typeof x === 'string');
-    if (typeof first !== 'string') return null;
-    s = first;
+    // Several numbers listed: take the first string or integer entry. The rest
+    // are lost rather than guessed at — one candidate, one number.
+    const first = v.find((x) => typeof x === 'string' || (typeof x === 'number' && Number.isSafeInteger(x) && x > 0));
+    if (first === undefined) return null;
+    s = String(first);
   } else {
     return null;
   }
@@ -482,6 +527,11 @@ function coercePhone(v: unknown): string | null {
   // "+  " run is collapsed; a "+" appearing mid-string is left alone.
   const trimmed = s.trim().replace(/^\+\s+/, '+');
   if (trimmed === '' || isNullWord(trimmed) || trimmed.length > MAX_PHONE_LEN) return null;
+  // Fewer than seven digits is not a phone number anywhere (a PIN code, a
+  // "5", an extension). Returning null here lets the merge fall through to
+  // the number the deterministic extractor found, instead of letting a junk
+  // model value overwrite a real one in `phone_raw`.
+  if (trimmed.replace(/\D/g, '').length < MIN_PHONE_DIGITS) return null;
   return trimmed;
 }
 
@@ -537,8 +587,8 @@ function coerceChecked(raw: unknown): ParsedResume | null {
       summary: coerceString(own('summary'), MAX_SUMMARY_LEN),
       recent_role,
       prior_roles,
-      career_highlights: coerceStringList(own('career_highlights'), MAX_CAREER_HIGHLIGHTS, MAX_EVIDENCE_LEN),
-      education: coerceStringList(own('education'), MAX_EDUCATION, MAX_EVIDENCE_LEN),
+      career_highlights: coerceStringList(own('career_highlights'), MAX_CAREER_HIGHLIGHTS, MAX_EVIDENCE_LEN, 'prose'),
+      education: coerceStringList(own('education'), MAX_EDUCATION, MAX_EVIDENCE_LEN, 'prose'),
       certifications: coerceStringList(own('certifications'), MAX_CERTIFICATIONS, MAX_EVIDENCE_LEN),
     };
   } catch {
@@ -642,6 +692,7 @@ export type ResumeModelFailureCategory =
   | 'missing_api_key'   // no provider credential configured
   | 'connection'        // transport-level failure before a response
   | 'output_limit'      // response exceeded the byte bound
+  | 'empty_content'     // JSON-mode answer arrived blank (documented provider behaviour)
   | 'protocol'          // non-OK response with no usable status
   | `protocol:${number}` // non-OK response, e.g. 'protocol:429', 'protocol:502'
   | 'unknown';
@@ -670,6 +721,7 @@ function classifyModelFailure(err: unknown): ResumeModelFailureCategory {
     case 'missing_api_key':
     case 'connection':
     case 'output_limit':
+    case 'empty_content':
     case 'parse_error':
       return category;
     case 'protocol': {
@@ -684,7 +736,7 @@ function classifyModelFailure(err: unknown): ResumeModelFailureCategory {
 }
 
 /**
- * TRANSIENT provider failures — the only ones worth ONE bounded in-tier retry:
+ * TRANSIENT provider failures — the ones worth a bounded in-tier retry:
  * a wall-clock timeout, a 429 and a 5xx are all statements about the
  * provider's moment, not about the request. Everything else is either already
  * retried by the runner (the bounded JSON re-ask that surfaces as
@@ -696,14 +748,10 @@ function isTransientModelFailure(err: unknown): boolean {
   if (err instanceof BusinessError) return false;
   if (err === null || typeof err !== 'object') return false;
   const category = (err as { category?: unknown }).category;
-  // `circuit_open` is a statement about the LAST few calls, not this résumé:
-  // the shared breaker trips on five consecutive provider failures from ANY
-  // DeepSeek caller in the process (the scorer included) and stays open for
-  // its cooldown. Before this it surrendered instantly and every résumé that
-  // arrived during the cooldown became a keyword-extracted, undialable row —
-  // the "burst of fallback rows" signature. The ladder below outlasts one
-  // cooldown, so a breaker that closes again is given the chance to answer.
-  if (category === 'timeout' || category === 'connection' || category === 'circuit_open') return true;
+  // `empty_content` is DeepSeek JSON mode's documented occasional blank
+  // answer — a statement about the provider's moment, and the one JSON-mode
+  // failure that must not cost a candidate their phone number.
+  if (category === 'timeout' || category === 'connection' || category === 'empty_content') return true;
   if (category === 'protocol') {
     const status = (err as { status?: unknown }).status;
     return status === 429 || (typeof status === 'number' && status >= 500 && status <= 599);
@@ -712,34 +760,83 @@ function isTransientModelFailure(err: unknown): boolean {
 }
 
 /**
- * The bounded transient-retry LADDER, in milliseconds of backoff before each
- * retry. Three retries, four attempts in total. The steps sum to 42s — chosen
- * to exceed the breaker's default 30s cooldown (`BREAKER_COOLDOWN_MS`), so a
- * `circuit_open` seen on the first attempt can be retried after the breaker
- * has had the chance to half-open. Under a genuine outage a résumé therefore
- * costs at most ~42s plus four provider timeouts before it falls back, and
- * the semaphore slot is held throughout so the fan-out bound is unchanged.
+ * `circuit_open` is a statement about the LAST few calls, not this résumé:
+ * the shared breaker trips on five consecutive provider failures from ANY
+ * DeepSeek caller in the process (the scorer included) and stays open for its
+ * cooldown. Before this change it surrendered instantly and every résumé that
+ * arrived during the cooldown became a keyword-extracted, undialable row — the
+ * "burst of fallback rows" signature. It is retried on its OWN ladder because
+ * it has a property the transient class lacks: a call refused by an open
+ * breaker never reaches the provider and records no failure, so waiting it out
+ * costs nothing but time.
  */
-const TRANSIENT_RETRY_BACKOFF_LADDER_MS: readonly number[] = [2_000, 8_000, 32_000];
-
-/** Overridable in tests so the retry path needs no real waits. */
-let transientRetryBackoffLadderMs: readonly number[] = TRANSIENT_RETRY_BACKOFF_LADDER_MS;
+function isCircuitOpenFailure(err: unknown): boolean {
+  return err !== null && typeof err === 'object'
+    && (err as { category?: unknown }).category === 'circuit_open';
+}
 
 /**
- * TEST SEAM ONLY. Replaces every step of the retry ladder with `ms` (the
- * ladder LENGTH — and so the attempt count — is unchanged). Returns a restore
- * function. Production always waits the constants above.
+ * How the model tier retries, per caller.
+ *
+ * `transientLadderMs` — backoff before each retry of a TRANSIENT failure
+ *   (timeout / connection / 429 / 5xx / empty JSON-mode content). Every such
+ *   attempt reaches the provider and, on failure, COUNTS toward the shared
+ *   breaker (threshold 5). The ingestion queue runs two résumés at once, so
+ *   the ladder is kept to ONE retry: 2 × 2 = 4 consecutive failures can never
+ *   open the breaker on their own and take the scorer down with them. Any
+ *   longer ladder would.
+ * `circuitOpenLadderMs` — backoff before each retry after `circuit_open`.
+ *   These attempts never reach the provider and never count. The default
+ *   steps sum to 42s, past the breaker's default 30s cooldown
+ *   (`BREAKER_COOLDOWN_MS`), so a breaker that closes again gets to answer.
+ *
+ * Both ladders hold the semaphore slot throughout: a retry IS a provider call
+ * (or the intent of one), so releasing and re-acquiring would let saturation
+ * multiply the fan-out.
+ */
+export interface ResumeModelRetryPolicy {
+  transientLadderMs: readonly number[];
+  circuitOpenLadderMs: readonly number[];
+}
+
+/**
+ * Background ingestion: nobody is waiting on the request, so waiting out a
+ * breaker cooldown is the right trade — a candidate row that stays callable.
+ */
+export const INGESTION_MODEL_RETRY_POLICY: ResumeModelRetryPolicy = {
+  transientLadderMs: [2_000],
+  circuitOpenLadderMs: [2_000, 8_000, 32_000],
+};
+
+/**
+ * Interactive callers (the recruiter upload route holds an HTTP request open):
+ * one quick transient retry, exactly the pre-change behaviour, and NO wait on
+ * an open breaker — degrading to the deterministic extractor in ~2s beats a
+ * 42s hang that the proxy or browser cuts off first.
+ */
+export const INTERACTIVE_MODEL_RETRY_POLICY: ResumeModelRetryPolicy = {
+  transientLadderMs: [2_000],
+  circuitOpenLadderMs: [],
+};
+
+/** Test-only override: when set, every ladder step of every policy waits this long. */
+let retryBackoffOverrideMs: number | null = null;
+
+/**
+ * TEST SEAM ONLY. Replaces every step of every retry ladder with `ms` (the
+ * ladder LENGTHS — and so the attempt counts — are unchanged). Returns a
+ * restore function. Production always waits the policy's own steps.
  */
 export function __setModelRetryBackoffForTest(ms: number): () => void {
-  const prev = transientRetryBackoffLadderMs;
-  transientRetryBackoffLadderMs = TRANSIENT_RETRY_BACKOFF_LADDER_MS.map(() => ms);
+  const prev = retryBackoffOverrideMs;
+  retryBackoffOverrideMs = ms;
   return () => {
-    transientRetryBackoffLadderMs = prev;
+    retryBackoffOverrideMs = prev;
   };
 }
 
-/** Attempts the model tier makes per résumé at most (1 + ladder length). */
-export const MODEL_MAX_ATTEMPTS = 1 + TRANSIENT_RETRY_BACKOFF_LADDER_MS.length;
+/** Attempts the ingestion policy makes per résumé on an open breaker (1 + ladder length). */
+export const MODEL_MAX_CIRCUIT_OPEN_ATTEMPTS = 1 + INGESTION_MODEL_RETRY_POLICY.circuitOpenLadderMs.length;
 
 /** Unref'd sleep — a pending backoff must not hold the process open. */
 function sleep(ms: number): Promise<void> {
@@ -764,18 +861,18 @@ function sleep(ms: number): Promise<void> {
  * The durable ingestion row still records `structurerVersion`, so an outage
  * remains visible at rest; the category is what makes it DIAGNOSABLE.
  *
- * ── A BOUNDED IN-TIER RETRY LADDER ──────────────────────────────────────────
- * A TRANSIENT provider failure (timeout / connection / 429 / 5xx / open
- * breaker) is retried after each step of {@link TRANSIENT_RETRY_BACKOFF_LADDER_MS}
- * — three retries, four attempts — holding the already-acquired semaphore
- * slot: the slot bounds provider fan-out, and a retry IS a provider call, so
- * releasing and re-acquiring would let saturation multiply the fan-out.
- * JSON-parse failures are NOT retried here: the shared runner already re-asks
- * once, and a second layer of retry would quietly square the provider load.
+ * ── BOUNDED IN-TIER RETRIES, PER {@link ResumeModelRetryPolicy} ─────────────
+ * A TRANSIENT provider failure (timeout / connection / 429 / 5xx / empty
+ * JSON-mode content) is retried on the policy's transient ladder; an open
+ * breaker on its own, longer ladder (those attempts never reach the provider
+ * and never count as failures). Both hold the already-acquired semaphore
+ * slot. JSON-parse failures are NOT retried here: the shared runner already
+ * re-asks once, and a second layer would quietly square the provider load.
  */
 export async function structureResumeWithModelDetailed(
   text: string,
   runner: ResumeModelRunner = defaultResumeModelRunner,
+  policy: ResumeModelRetryPolicy = INGESTION_MODEL_RETRY_POLICY,
 ): Promise<ResumeModelOutcome> {
   // Bound concurrent model calls. If no slot frees within the wait budget the
   // call falls through to the deterministic fallback — saturation must degrade
@@ -787,21 +884,30 @@ export async function structureResumeWithModelDetailed(
     // a provider — the prompt bound is not re-implemented here.
     const prompt = buildExtractionPrompt(text);
     let raw: unknown;
-    // The bounded ladder, slot still held (see the doc comments above). A
-    // non-transient failure surrenders immediately with its own category; a
-    // transient one is retried after each step of the ladder and, when the
-    // ladder is exhausted, surrenders with the LAST failure's category.
-    let attempt = 0;
+    // The bounded ladders, slot still held (see the doc comments above). A
+    // non-retryable failure surrenders immediately with its own category; a
+    // transient or breaker-open failure is retried after the next step of ITS
+    // ladder and, when that ladder is exhausted, surrenders with the LAST
+    // failure's category.
+    let transientRetries = 0;
+    let circuitRetries = 0;
     for (;;) {
       try {
         raw = await runner(prompt);
         break;
       } catch (err) {
-        if (!isTransientModelFailure(err) || attempt >= transientRetryBackoffLadderMs.length) {
+        let backoff: number | undefined;
+        if (isCircuitOpenFailure(err)) {
+          backoff = policy.circuitOpenLadderMs[circuitRetries];
+          circuitRetries += 1;
+        } else if (isTransientModelFailure(err)) {
+          backoff = policy.transientLadderMs[transientRetries];
+          transientRetries += 1;
+        }
+        if (backoff === undefined) {
           return { structured: null, failure: classifyModelFailure(err) };
         }
-        await sleep(transientRetryBackoffLadderMs[attempt]);
-        attempt += 1;
+        await sleep(retryBackoffOverrideMs ?? backoff);
       }
     }
     const structured = coerceStructuredResume(raw);
@@ -830,6 +936,7 @@ export async function structureResumeWithModelDetailed(
 export async function structureResumeWithModel(
   text: string,
   runner: ResumeModelRunner = defaultResumeModelRunner,
+  policy: ResumeModelRetryPolicy = INGESTION_MODEL_RETRY_POLICY,
 ): Promise<ParsedResume | null> {
-  return (await structureResumeWithModelDetailed(text, runner)).structured;
+  return (await structureResumeWithModelDetailed(text, runner, policy)).structured;
 }

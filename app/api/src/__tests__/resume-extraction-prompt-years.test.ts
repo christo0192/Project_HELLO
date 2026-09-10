@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect } from 'vitest';
-import { EXTRACTION_INSTRUCTIONS, buildExtractionPrompt } from '../lib/prompts.js';
+import { EXTRACTION_INSTRUCTIONS, buildExtractionPrompt, extractionTodayLine } from '../lib/prompts.js';
 
 describe('résumé extraction prompt — experience_years contract', () => {
   it('instructs the model to CALCULATE total years from the role dates when no total is stated', () => {
@@ -34,5 +34,17 @@ describe('résumé extraction prompt — experience_years contract', () => {
     const p = buildExtractionPrompt('unique-marker-4471');
     expect(p.startsWith(EXTRACTION_INSTRUCTIONS)).toBe(true);
     expect(p.indexOf('unique-marker-4471')).toBeGreaterThan(EXTRACTION_INSTRUCTIONS.length);
+  });
+
+  it('tells the model what "today" is, AFTER the static prefix and BEFORE the résumé (review H3)', () => {
+    // A model's sense of the date lags its training cut-off; "Present" roles
+    // would otherwise be under-counted by a year or more, and the model's own
+    // figure is preferred over the deterministic derivation.
+    const now = new Date(Date.UTC(2026, 8, 10));
+    expect(extractionTodayLine(now)).toBe('Today is 2026-09.');
+    const p = buildExtractionPrompt('unique-marker-4471', now);
+    const today = p.indexOf('Today is 2026-09.');
+    expect(today).toBe(EXTRACTION_INSTRUCTIONS.length + 1);
+    expect(today).toBeLessThan(p.indexOf('unique-marker-4471'));
   });
 });

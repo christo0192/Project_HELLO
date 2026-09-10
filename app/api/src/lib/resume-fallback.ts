@@ -1,4 +1,5 @@
 import type { ParsedResume, ResumeRoleEvidence } from './types.js';
+import { deriveExperienceYearsFromRoles, extractPeriodFromLine } from './resume-experience.js';
 
 const SKILL_KEYWORDS = [
   'javascript', 'typescript', 'react', 'node.js', 'node', 'python', 'java', 'sql', 'postgres',
@@ -327,11 +328,18 @@ export function fallbackParseResumeText(text: string): ParsedResume {
   const recentTitle =
     currentIsMessyProse && prose.recent?.title ? prose.recent.title : current_role;
 
+  // The role line a structured résumé puts its dates on ("Senior Sales
+  // Executive, Acme — Bengaluru   Jan 2021 – Present") carries the one thing
+  // the prose miner never sees: a PERIOD. Copy that substring verbatim so the
+  // total-years derivation has evidence to add up on the deterministic path
+  // too — otherwise every model-outage upload keeps showing "—" for experience.
+  const recentPeriod = current_role ? extractPeriodFromLine(current_role) : null;
+
   const recent_role: ResumeRoleEvidence | null = current_role
     ? {
         title: recentTitle,
         employer: prose.recent?.employer ?? null,
-        period: null,
+        period: recentPeriod,
         highlights: [],
       }
     : prose.recent;
@@ -344,12 +352,30 @@ export function fallbackParseResumeText(text: string): ParsedResume {
       )
     : prose.prior;
 
+  // Dated role lines beyond the first: any line in the top of the document
+  // that names a role word AND carries a date range is a stint the recruiter
+  // would count. Bounded to the first 60 lines and 8 spans, evidence-only.
+  const datedLinePeriods: string[] = [];
+  for (const line of lines.slice(0, 60)) {
+    if (datedLinePeriods.length >= 8) break;
+    if (line === current_role || !roleIndicators.test(line) || line.length > 200) continue;
+    const p = extractPeriodFromLine(line);
+    if (p) datedLinePeriods.push(p);
+  }
+
   return {
     name,
     email,
     phone,
     skills,
-    experience_years,
+    // The stated phrase ("5+ years of experience") when the résumé has one;
+    // otherwise the sum of the dated role lines, exactly as the model tier's
+    // derivation does. Null when neither exists — never a guess.
+    experience_years: experience_years
+      ?? deriveExperienceYearsFromRoles([
+        recent_role,
+        ...datedLinePeriods.map((period) => ({ title: null, employer: null, period, highlights: [] })),
+      ]),
     current_role,
     summary,
     recent_role,

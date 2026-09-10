@@ -41,7 +41,7 @@ describe('coerceStructuredResume — benign type deviations are coerced, not fat
     ['summary as object nulls only itself', { summary: { text: 'x' } }, (o: any) => expect(o.summary).toBeNull()],
     ['skills as comma string splits', { skills: 'Sales, Negotiation; CRM' }, (o: any) => expect(o.skills).toEqual(['Sales', 'Negotiation', 'CRM'])],
     ['skills as object entries unwrap', { skills: [{ name: 'Excel' }, 'Salesforce', 7] }, (o: any) => expect(o.skills).toEqual(['Excel', 'Salesforce'])],
-    ['education as single string', { education: 'MBA, Symbiosis 2018' }, (o: any) => expect(o.education).toEqual(['MBA', 'Symbiosis 2018'])],
+    ['education as single string stays ONE entry (commas live inside a degree line)', { education: 'MBA, Symbiosis 2018' }, (o: any) => expect(o.education).toEqual(['MBA, Symbiosis 2018'])],
     ['recent_role as plain string → title', { recent_role: 'Senior Sales Executive at Acme' },
       (o: any) => expect(o.recent_role).toEqual({ title: 'Senior Sales Executive at Acme', employer: null, period: null, highlights: [] })],
     ['recent_role with alias keys', { recent_role: { position: 'Sales Lead', company: 'Acme', dates: '2020 – 2022', achievements: ['Grew ARR'] } },
@@ -49,7 +49,18 @@ describe('coerceStructuredResume — benign type deviations are coerced, not fat
     ['prior_roles with a string entry', { prior_roles: ['Sales Associate at Beta', { title: 'Intern' }] },
       (o: any) => expect(o.prior_roles.map((r: any) => r.title)).toEqual(['Sales Associate at Beta', 'Intern'])],
     ['prior_roles as a lone object', { prior_roles: { title: 'Intern' } }, (o: any) => expect(o.prior_roles).toHaveLength(1)],
-    ['null-words become null', { current_role: 'Not specified', email: 'none' }, (o: any) => { expect(o.current_role).toBeNull(); expect(o.email).toBeNull(); }],
+    ['null-words become null', { current_role: 'Not specified', email: 'none', summary: 'Not applicable.' }, (o: any) => { expect(o.current_role).toBeNull(); expect(o.email).toBeNull(); expect(o.summary).toBeNull(); }],
+    ['experience_years in MONTHS converts to years (review: "6 months" was 6)', { experience_years: '18 months' }, (o: any) => expect(o.experience_years).toBe(1.5)],
+    ['experience_years "6 months" → 0.5', { experience_years: '6 months' }, (o: any) => expect(o.experience_years).toBe(0.5)],
+    ['experience_years negative / percentage → null', { experience_years: '-5' }, (o: any) => expect(o.experience_years).toBeNull()],
+    ['experience_years "less than 1 year" → 1 (leading figure)', { experience_years: 'about 1 year' }, (o: any) => expect(o.experience_years).toBe(1)],
+    ['prose fields are NOT comma-split', { career_highlights: 'Grew ARR 40%, closed 12 enterprise deals, built a team of 8' },
+      (o: any) => expect(o.career_highlights).toEqual(['Grew ARR 40%, closed 12 enterprise deals, built a team of 8'])],
+    ['education keeps degree, institute, year together', { education: 'B.Tech, Computer Science, IIT Delhi, 2015\nMBA, IIM Bangalore, 2019' },
+      (o: any) => expect(o.education).toEqual(['B.Tech, Computer Science, IIT Delhi, 2015', 'MBA, IIM Bangalore, 2019'])],
+    ['bulleted string lists drop the bullets on every line', { skills: '- Sales\n- CRM\n- Excel' }, (o: any) => expect(o.skills).toEqual(['Sales', 'CRM', 'Excel'])],
+    ['a junk numeric phone (a PIN, a "5") is null so the regex number can win the merge', { phone: 560001 }, (o: any) => expect(o.phone).toBeNull()],
+    ['a junk short string phone is null too', { phone: 'ext 22' }, (o: any) => expect(o.phone).toBeNull()],
   ])('%s — result KEPT', (_label, extra, check) => {
     const out = coerceStructuredResume({ ...BASE, ...extra });
     expect(out).not.toBeNull();
@@ -72,6 +83,22 @@ describe('coerceStructuredResume — benign type deviations are coerced, not fat
     expect(coerceStructuredResume({ ...BASE, phone: 2 ** 60 })!.phone).toBeNull();
     // A fallback-tagged coerced phone is refused by provenance, as before.
     expect(deriveCandidatePhone(out.phone, `${MODEL_STRUCTURER_VERSION}+fallback`).valid).toBe(false);
+  });
+
+  it('splits a long whitespace-padded list string in linear time (review: the old splitter was ~n³)', () => {
+    const padded = `Sales${' '.repeat(20_000)}CRM`;
+    const t0 = performance.now();
+    const out = coerceStructuredResume({ ...BASE, skills: padded, career_highlights: padded, education: padded })!;
+    expect(performance.now() - t0).toBeLessThan(200);
+    expect(out.skills.length).toBeGreaterThanOrEqual(1);
+  });
+
+  it('the merge lets the regex number win when the model’s phone was junk', () => {
+    const model = coerceStructuredResume({ ...BASE, phone: 5 })!;
+    const det = fallbackParseResumeText('Priya Sharma\nBengaluru | +91 98765 43210 | p@example.com');
+    const merged = mergeStructuredResume(model, det);
+    expect(merged.structured.phone).toBe('+91 98765 43210');
+    expect(merged.phoneFromModel).toBe(false); // …and it is tagged +fallback, undialable, as before
   });
 
   it('still rejects the WHOLE answer when it is not an object, or reading it throws', () => {

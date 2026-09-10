@@ -16,7 +16,7 @@
 import { Router } from 'express';
 import multer from 'multer';
 import { supabase, RESUME_BUCKET } from '../lib/supabase.js';
-import { structureResumeWithModel } from '../lib/resume-structurer.js';
+import { structureResumeWithModel, INTERACTIVE_MODEL_RETRY_POLICY } from '../lib/resume-structurer.js';
 import {
   deriveCandidatePhone,
   toCandidateColumns,
@@ -249,7 +249,10 @@ export function createResumesRouter(deps: ResumesRouterDeps = {}): Router {
         // TypeError on a value that was never a phone number. Both structuring
         // paths now share one validator.
         try {
-          const modelled = await structureResumeWithModel(text);
+          // INTERACTIVE policy: this handler holds an HTTP request open, so it
+          // takes one quick transient retry and does NOT wait out an open
+          // breaker — the background ingestion does, this route must not.
+          const modelled = await structureResumeWithModel(text, undefined, INTERACTIVE_MODEL_RETRY_POLICY);
           // A model answering `{}` — or an unrelated object — coerces to an
           // all-null result, which is NOT a parse. Without this check the
           // candidate would be created empty AND carry the dialable tag. The

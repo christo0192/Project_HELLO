@@ -27,7 +27,16 @@ export type DeepseekErrorCategory =
   | 'connection'
   | 'protocol'
   | 'parse_error'
-  | 'output_limit';
+  | 'output_limit'
+  /**
+   * JSON-mode answer with blank `content`. DeepSeek documents that JSON Output
+   * "may occasionally return empty content". Raised ONLY when the caller asked
+   * for `responseFormat: 'json_object'` — a blank answer on the plain path
+   * keeps its historical treatment (the JSON runner's own re-ask, then
+   * `parse_error`). Not a breaker failure: it is a provider hiccup, not an
+   * outage, and `isProviderFailure` does not list it.
+   */
+  | 'empty_content';
 
 export class DeepseekError extends Error {
   public readonly category: DeepseekErrorCategory;
@@ -307,6 +316,9 @@ export function createDeepseekRunner(deps?: Partial<DeepseekRunnerDeps>): Deepse
         }
         if (!response.ok) throw new DeepseekError('protocol', response.status);
         const content = parseContent(raw);
+        if (opts.responseFormat === 'json_object' && content === '') {
+          throw new DeepseekError('empty_content');
+        }
         // Surface automatic prefix-cache accounting. Extraction never throws;
         // the sink is wrapped so it cannot fault the request path.
         cacheSink(extractCacheUsage(raw));
