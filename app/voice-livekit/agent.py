@@ -7635,11 +7635,17 @@ async def _run_phone_session(
                 if inspect.isawaitable(value):
                     await value
         except Exception:  # noqa: BLE001
-            return None
+            # NOT an unconditional None. `wait_for_playout()` can raise AFTER
+            # the frames have already gone out, and telling the gate "nothing
+            # was spoken" then makes it speak the full fixed opener over live
+            # audio. Fall through to the emitted latch, which knows.
+            failed = True
+        else:
+            failed = False
         finally:
             if callable(setter):
                 setter(False)
-        spoken_text = latest_assistant[0]
+        spoken_text = None if failed else latest_assistant[0]
         if isinstance(spoken_text, str) and spoken_text.strip():
             return spoken_text
         # SPOKEN, BUT NOT READ BACK. `latest_assistant[0]` comes from the SDK's
@@ -7797,6 +7803,15 @@ async def _run_phone_session(
         spoken_text = await _speak_gate_generation(instructions)
         if phone.phone_role_opening_faithful(spoken_text, role_title):
             return spoken_text
+        if spoken_text == "":
+            # Spoken, but the transcript never came back — the same contract the
+            # identity turn uses. The gate must NOT speak the fixed role line on
+            # top of a role line the candidate already heard; `""` tells it so.
+            _log.warn(
+                "unknown_event", error_type="phone_role_opening",
+                error_category="generated_role_unreadable",
+            )
+            return ""
         # Generated line did not name the exact role — discard it and let the
         # gate speak the deterministic fallback (never a paraphrased role).
         _log.info(

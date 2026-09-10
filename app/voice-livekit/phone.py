@@ -462,6 +462,28 @@ PHONE_WRONG_NUMBER_TEXT = (
 )
 
 
+#: Characters a candidate's given name may contribute to SPOKEN COPY and to a
+#: CLASSIFIER PROMPT. `candidates.name` is populated by résumé parsing, so it is
+#: document-controlled text: a crafted PDF can put quotes, newlines or the
+#: literal word `other_person` into it, and that value is interpolated into
+#: `_IDENTITY_CLASSIFY_PROMPT` — whose one-word answer decides whether the call
+#: ends. Length-bounding is not sanitization. Letters (any script), spaces,
+#: hyphens, apostrophes and periods are everything a real given name needs.
+_NAME_SAFE_RE = re.compile(r"[\d_]|[^\w\s.'\-]", re.UNICODE)
+
+
+def phone_safe_first_name(candidate_name: Any) -> str:
+    """The candidate's given name, safe to speak and to interpolate. May be ""."""
+    if not isinstance(candidate_name, str):
+        return ""
+    parts = candidate_name.strip().split()
+    if not parts:
+        return ""
+    first = _NAME_SAFE_RE.sub("", parts[0]).strip(" .-'")
+    first = " ".join(first.split())
+    return first if 0 < len(first) <= 40 else ""
+
+
 def phone_identity_text(candidate_name: Any) -> str:
     """The fixed identity opener — the FALLBACK for the conversational gate.
 
@@ -474,19 +496,23 @@ def phone_identity_text(candidate_name: Any) -> str:
     compares anyway. An unusable name degrades to a nameless-but-still-natural
     opener rather than speaking a placeholder.
     """
-    first = ""
-    if isinstance(candidate_name, str):
-        parts = candidate_name.strip().split()
-        if parts:
-            first = parts[0].strip()
-    if not first or len(first) > 40:
+    first = phone_safe_first_name(candidate_name)
+    # IT DOES NOT SAY WHY WE ARE CALLING, and that is new in 0095.
+    # `PHONE_DISCLOSURE_TEXT` (main's first utterance) says "about your job
+    # application", which was acceptable when it was spoken to a number the
+    # system had no opinion about. Here it would be spoken alongside the
+    # candidate's NAME, before any identity check — binding a named person to
+    # job-seeking status in the first breath, on a line that may be a shared
+    # household or office phone. The purpose is disclosed one turn later, after
+    # the answer says we reached them.
+    if not first:
         return (
-            f"Hi, this is Christy, an AI voice assistant calling from {_COMPANY} "
-            "about your job application. Am I speaking to the right person?"
+            f"Hi, this is Christy, an AI voice assistant calling from {_COMPANY}. "
+            "Am I speaking to the right person?"
         )
     return (
-        f"Hi, this is Christy, an AI voice assistant calling from {_COMPANY} "
-        f"about your job application. Am I speaking to {first}?"
+        f"Hi, this is Christy, an AI voice assistant calling from {_COMPANY}. "
+        f"Am I speaking to {first}?"
     )
 
 
@@ -498,19 +524,15 @@ def phone_identity_reask_text(candidate_name: Any) -> str:
     household member answering, a nickname the résumé does not carry, and a
     genuinely wrong number all sound the same from here.
     """
-    first = ""
-    if isinstance(candidate_name, str):
-        parts = candidate_name.strip().split()
-        if parts:
-            first = parts[0].strip()
-    if not first or len(first) > 40:
-        return (
-            "Sorry — I may have the wrong number. Am I speaking to the person "
-            "who applied for this role?"
-        )
+    first = phone_safe_first_name(candidate_name)
+    # IT NAMES NOBODY. The previous version said "I'm trying to reach Priya" —
+    # to a person who had just said they are not Priya. That tells a parent,
+    # spouse or colleague that a recruiter is calling her, which is precisely
+    # the disclosure the identity check exists to avoid making. A closed
+    # question does the same job and reveals nothing further.
     return (
-        f"Sorry — I think I may have the wrong number. I'm trying to reach "
-        f"{first}. Is that you?"
+        "Sorry — I think I may have the wrong number. Am I speaking to the "
+        "right person?"
     )
 
 
@@ -529,12 +551,8 @@ def phone_identity_repair_text(candidate_name: Any) -> str:
     short clause that supplies only what verification found missing: the
     identity question itself.
     """
-    first = ""
-    if isinstance(candidate_name, str):
-        parts = candidate_name.strip().split()
-        if parts:
-            first = parts[0].strip()
-    if not first or len(first) > 40:
+    first = phone_safe_first_name(candidate_name)
+    if not first:
         return "Sorry — am I speaking to the right person?"
     return f"Sorry — am I speaking to {first}?"
 
@@ -549,18 +567,16 @@ def phone_identity_instruction(candidate_name: Any) -> str:
     front of somebody who may not be the candidate, and a second question would
     take the answer the identity classifier is waiting for.
     """
-    first = ""
-    if isinstance(candidate_name, str):
-        parts = candidate_name.strip().split()
-        if parts:
-            first = parts[0].strip()
-    who = f"{first}" if first and len(first) <= 40 else "the person who applied"
+    first = phone_safe_first_name(candidate_name)
+    who = first or "the person who applied"
     return (
         "You are Christy, an AI voice assistant calling from "
-        f"{_COMPANY} about the candidate's job application. This is the very "
-        "first thing you say on the call. Greet them warmly in ONE short "
-        "sentence, say who you are and why you are calling, and then ask "
-        f"whether you are speaking to {who}. "
+        f"{_COMPANY}. This is the very first thing you say on the call. Greet "
+        "them warmly in ONE short sentence, say who you are and which company "
+        f"you are calling from, and then ask whether you are speaking to {who}. "
+        "Do NOT say why you are calling and do NOT mention a job, an "
+        "application, a role, a company they work for, or anything from their "
+        "background — you have not yet confirmed who is on the line. "
         "Ask EXACTLY ONE question and it MUST be that identity question — your "
         "reply MUST END with it so a simple yes or no answers it. "
         "Do NOT mention recording. Do NOT ask for permission or consent to "
@@ -580,16 +596,15 @@ def phone_identity_reask_instruction(candidate_name: Any) -> str:
     apologise for the possible error and ask a closed question, not to challenge
     what the person just said.
     """
-    first = ""
-    if isinstance(candidate_name, str):
-        parts = candidate_name.strip().split()
-        if parts:
-            first = parts[0].strip()
-    who = f"{first}" if first and len(first) <= 40 else "the person who applied"
+    first = phone_safe_first_name(candidate_name)
+    who = first or "the person who applied"
     return (
         "The person on the line may not be the candidate. Apologise briefly for "
-        "possibly having the wrong number, say you are trying to reach "
-        f"{who}, and ask whether that is them. "
+        "possibly having the wrong number and ask, as a closed question, "
+        "whether you have reached the wrong person. "
+        "Do NOT say the name of the person you are trying to reach, do NOT say "
+        "why you are calling, and do NOT mention a job or an application: this "
+        "person has just told you they are somebody else. "
         "Ask EXACTLY ONE question and END on it. Be warm and never accusatory — "
         "they may simply have given a nickname. Do NOT mention recording, do "
         "NOT ask for consent, and do NOT ask anything else. One or two short "
@@ -1237,7 +1252,7 @@ def phone_gate_flow() -> str:
 
 
 def phone_identity_mismatch_suppresses() -> bool:
-    """Whether a confirmed identity mismatch SUPPRESSES the number. Default YES.
+    """Whether a confirmed identity mismatch SUPPRESSES the number. Default NO.
 
     ``candidate.wrong_number`` is not a log line. It moves the engagement to
     ``wrong_number`` and, in the same transaction, writes a ``phone_suppressions``
@@ -1262,21 +1277,39 @@ def phone_identity_mismatch_suppresses() -> bool:
         it and the same wrong number was dialled again — repeat-calling the
         person the suppression exists to stop calling.
 
-    So BOTH settings now post a real event, and the choice is only which one:
+    So BOTH settings now post a real purging event, and the choice is only
+    whether a suppression is written:
 
-      * ON (default) — ``candidate.wrong_number``: purges, ends the engagement,
-        and writes the line-level suppression. An operator can undo it with the
-        0094 release RPC.
-      * OFF — ``candidate.deferred_pre_disclosure``: purges, ends the attempt
-        uncharged, no suppression, and the engagement defers to the next IST
-        day. Choose this while the classifier has no live track record, and
-        accept that a genuinely wrong number will be tried again tomorrow.
+      * OFF (DEFAULT) — ``candidate.deferred_pre_disclosure``: purges, ends the
+        attempt uncharged, no suppression, engagement defers to the next IST
+        day. A genuinely wrong number is tried again tomorrow.
+      * ON — ``candidate.wrong_number``: purges, ends the engagement, AND
+        writes the line-level suppression. Undoable only via the 0094 release
+        RPC.
+
+    WHY OFF IS THE DEFAULT, HAVING BRIEFLY BEEN ON. Once the deferral terminal
+    existed, the purge stopped being an argument for suppressing — both paths
+    destroy the pre-consent recording. What is left is the question of evidence,
+    and the evidence is weaker than it looks: the deterministic backstop that is
+    supposed to stop a model ending a call on a name the record supports only
+    fires when ``phone_extract_introduced_name`` can pull a name out, and that
+    reader matches "this is X" shapes, NOT a bare "I'm X". Verified by
+    execution, for record name "Priya Sharma":
+
+        "This is Priya"          -> extracted, backstop CAN fire
+        "No, I'm Priya"          -> nothing extracted, backstop CANNOT fire
+        "Priya speaking"         -> nothing extracted, backstop CANNOT fire
+
+    So the commonest way a real candidate corrects a mangled name is exactly the
+    shape the backstop misses. Two model verdicts plus a mis-heard name should
+    not be able to blocklist a phone number for every candidate and every future
+    application. Turn it on when the classifier has a live track record.
 
     Read at the call site with the literal name so the env-contract scanner
     sees it.
     """
-    return (os.getenv("PHONE_IDENTITY_MISMATCH_SUPPRESSES") or "true").strip().lower() not in (
-        "false", "0", "no", "off",
+    return (os.getenv("PHONE_IDENTITY_MISMATCH_SUPPRESSES") or "").strip().lower() in (
+        "true", "1", "yes", "on",
     )
 
 
@@ -3224,6 +3257,12 @@ _A0_LEADING_SEGMENT_MAX_CHARS = 48
 #: server-side: `phone-worker.ts` (`.max(6)`) and 0067 (`invalid_turns`).
 _GATE_TURNS_MAX = 6
 
+#: The gate window's LAST-RESORT release point, used only when a generation
+#: produces no punctuation at all. Far above `_A0_LEADING_SEGMENT_MAX_CHARS`
+#: because the gate releases on a boundary, not on a cap — the cap here exists
+#: solely so a pathological boundary-less stream cannot hold audio indefinitely.
+_GATE_LEAK_HARD_CAP_CHARS = 400
+
 #: The gate-window leak veto must hold at least this many words before it can
 #: release. `phone_instruction_echo_detected` compares SIX-word windows and
 #: returns False outright when either side has fewer than six tokens, so a veto
@@ -4743,6 +4782,7 @@ def _identity_line_asks_identity(text: Any) -> bool:
     clean = text.strip()
     if not clean:
         return False
+    lowered = clean.lower()
     stripped = clean.rstrip().rstrip("\"'”’").rstrip()
     if not stripped.endswith("?"):
         return False
@@ -4751,6 +4791,17 @@ def _identity_line_asks_identity(text: Any) -> bool:
     if not _OPENING_IDENTITY_CUE_RE.search(last):
         return False
     if _OPENING_CONSENT_CUE_RE.search(last):
+        return False
+    # AND IT MUST NOT HAVE DISCLOSED RECORDING, anywhere in the line.
+    #
+    # The instruction tells the model not to; an instruction is not an
+    # enforcement. Without this, "Hi, this is Christy. This call is recorded for
+    # the hiring team. Am I speaking to Priya?" passed verification and was
+    # spoken — reading the recording notice one turn early, to somebody whose
+    # identity is exactly what the turn is still establishing, and before the
+    # consent classifier has any question to attach an answer to. Checked over
+    # the WHOLE line, not the last sentence, because that is where it lands.
+    if "record" in lowered:
         return False
     return True
 
@@ -4855,12 +4906,8 @@ async def phone_classify_identity(
     """
     if not isinstance(reply, str) or not reply.strip():
         return PHONE_IDENTITY_UNCLEAR
-    first = ""
-    if isinstance(candidate_name, str):
-        parts = candidate_name.strip().split()
-        if parts:
-            first = parts[0].strip()
-    who = first if first and len(first) <= 40 else "the person who applied"
+    first = phone_safe_first_name(candidate_name)
+    who = first or "the person who applied"
     # Bound the reply: an STT final is a sentence, and an unbounded one would be
     # a prompt-injection surface as well as a cost.
     spoken = " ".join(reply.strip().split())[:400]
@@ -4910,11 +4957,7 @@ async def phone_classify_identity(
     # would downgrade EVERY other_person verdict to self, screening whoever
     # answered. The backstop may only overrule the model when the record has a
     # name to overrule it WITH.
-    record_first = ""
-    if isinstance(candidate_name, str):
-        parts = candidate_name.strip().split()
-        if parts:
-            record_first = parts[0].strip()
+    record_first = phone_safe_first_name(candidate_name)
     introduced = phone_extract_introduced_name(reply)
     if (
         len(record_first) > 2
@@ -5357,29 +5400,44 @@ async def run_phone_gate(
                 spoken_line = await speak_gate_line(instruction)
             except Exception:  # noqa: BLE001
                 spoken_line = None
-        if isinstance(spoken_line, str) and spoken_line.strip():
-            line = spoken_line.strip()
-            gate_turns.append({"speaker": "bot", "text": line})
-            if _identity_line_asks_identity(line):
-                _log.info(
-                    "unknown_event", error_type="phone_identity_opening",
-                    error_category="identity_generated",
-                )
-            else:
-                _log.warn(
-                    "unknown_event", error_type="phone_identity_opening",
-                    error_category="identity_repaired",
-                )
-                repair = phone_identity_repair_text(candidate_name)
-                await _say(repair)
-                gate_turns.append({"speaker": "bot", "text": repair})
-        else:
+        # `None` means NOTHING was spoken. ANY string — including the EMPTY
+        # one — means audio went out. That distinction is the whole contract
+        # (`_speak_gate_generation` returns "" for "spoken, transcript never
+        # came back", which the SDK does routinely), and an earlier version of
+        # this branch tested `spoken_line.strip()`, which is FALSY for "" — so
+        # the one case the contract exists for fell into the
+        # nothing-was-spoken arm and spoke the full fixed opener ON TOP of live
+        # audio. That is the 2026-09-09 double-opener, reproduced by the code
+        # written to prevent it. Test `is None`, never truthiness.
+        if spoken_line is None:
             _log.info(
                 "unknown_event", error_type="phone_identity_opening",
                 error_category="identity_fixed",
             )
             await _say(fixed_line)
             gate_turns.append({"speaker": "bot", "text": fixed_line})
+        else:
+            line = spoken_line.strip()
+            if line:
+                gate_turns.append({"speaker": "bot", "text": line})
+            if line and _identity_line_asks_identity(line):
+                _log.info(
+                    "unknown_event", error_type="phone_identity_opening",
+                    error_category="identity_generated",
+                )
+            else:
+                # Either the line missed the ask, or it was spoken and we
+                # cannot read it back. Both are repaired ADDITIVELY — never
+                # restarted — because the candidate has already heard us.
+                _log.warn(
+                    "unknown_event", error_type="phone_identity_opening",
+                    error_category=(
+                        "identity_repaired" if line else "identity_unreadable"
+                    ),
+                )
+                repair = phone_identity_repair_text(candidate_name)
+                await _say(repair)
+                gate_turns.append({"speaker": "bot", "text": repair})
 
         # THE BARRIER. Everything queued up to this instant predates the end
         # of our question and therefore cannot be its answer.
@@ -5435,11 +5493,8 @@ async def run_phone_gate(
         # The regex predecessor collapsed this into `wrong_number` — "she is not
         # available right now" hung up AND wrote a permanent line-level DNC for
         # a candidate who had simply stepped away.
-        # The transcript is deliberately NOT committed here. Nothing was
-        # refused and nobody was screened, so there is no decision to evidence —
-        # and the speaker may be a bystander whose words would be filed under
-        # the candidate's session labelled "candidate", which is the only
-        # speaker value the schema has besides "bot".
+        # NOT committed — see the `other_person` terminal below for why no
+        # pre-consent path may persist a transcript.
         await _say(PHONE_CALLBACK_DEFERRAL_TEXT)
         return await _terminal_outcome(
             CLASSIFY_DEFERRED_PRE_DISCLOSURE,
@@ -5450,13 +5505,24 @@ async def run_phone_gate(
         # The wrong person, confirmed twice by two independent judgements on two
         # different utterances. Apologise and hang up.
         #
-        # The gate transcript IS committed here, unlike the post-consent
-        # non-human outcomes which deliberately commit nothing. The difference
-        # is that those have only the disclosure to record, while this path has
-        # a real exchange — the identity ask, the reply, the re-ask and its
-        # confirmation — and that exchange is the ONLY evidence for why a call
-        # was ended, so it must outlive the call.
-        await _commit_gate_turns()
+        # NOTHING IS PERSISTED HERE, and that reverses an earlier draft.
+        #
+        # That draft committed the exchange as evidence for why the call ended.
+        # But on THIS path the system has just concluded the speaker is NOT the
+        # candidate, and `transcript_turns` has only two speaker values — so the
+        # commit files a bystander's words under the candidate's session,
+        # labelled "candidate". Worse, nothing can remove them: the
+        # `candidate.wrong_number` purge deletes RECORDINGS only, and the DSAR
+        # erase keys on a `candidate_id` column `transcript_turns` does not
+        # have, so it silently no-ops. A third party's speech would have no
+        # erasure route at all, while a DSAR export would hand it to the
+        # candidate as her own.
+        #
+        # `main` had exactly ONE `_commit_gate_turns` call site, after consent
+        # succeeded. That invariant — nothing is persisted without consent — is
+        # restored here rather than weakened. The verdicts are already in the
+        # structured log (`phone_identity_verdict`), which is where the
+        # operational evidence belongs; the transcript is not the audit log.
         if phone_identity_mismatch_suppresses():
             # DEFAULT. `candidate.wrong_number` purges the pre-consent
             # recording, ends the engagement, and writes the line-level
@@ -5655,6 +5721,15 @@ async def run_phone_gate(
                 except Exception:  # noqa: BLE001
                     generated = None
                 if isinstance(generated, str) and generated.strip():
+                    return True
+                if generated == "":
+                    # Spoken, transcript unreadable. Speaking the fixed role
+                    # line now would announce the role TWICE — the same shape
+                    # the identity turn guards against. Nothing further is said.
+                    _log.warn(
+                        "unknown_event", error_type="phone_role_opening",
+                        error_category="role_spoken_unreadable",
+                    )
                     return True
             if role_fallback is not None:
                 # Fix 2: prefer the pre-rendered audio (rendered during the
@@ -10619,9 +10694,27 @@ def phone_agent_class(agent_base: Any) -> Any:
                     # returned instruction_echo.
                     if len(_COVERAGE_TOKEN_RE.findall(segment)) < _GATE_LEAK_MIN_TOKENS:
                         continue
+                    # RELEASE ONLY AT A PUNCTUATION BOUNDARY, never on a raw
+                    # character cap.
+                    #
+                    # A0's 48-char cap exists so a boundary-less screening reply
+                    # still starts speaking quickly. Applied here it opened a
+                    # hole: "Hi, I can see you are a Senior Data Engineer at
+                    # Infosys" is 54 chars with no boundary, so the cap released
+                    # it — and because `phone_instruction_echo_detected` needs
+                    # SIX contiguous words, the five résumé words ahead of the
+                    # cap were spoken pre-consent, to a party whose identity is
+                    # exactly what this turn is still establishing. Verified by
+                    # driving the real `llm_node`.
+                    #
+                    # Holding to a boundary means a recital like that is checked
+                    # as a whole sentence, where the echo detector does see six
+                    # words. The cost is first-audio latency on a gate line with
+                    # no early punctuation; `_GATE_LEAK_HARD_CAP_CHARS` bounds
+                    # that so a pathological stream cannot hold audio forever.
                     if not segment.endswith(
                         (".", "!", "?", ",", ";", ":", "—", "–", "…")
-                    ) and len(segment) < _A0_LEADING_SEGMENT_MAX_CHARS:
+                    ) and len(segment) < _GATE_LEAK_HARD_CAP_CHARS:
                         continue
                     if not phone_streamed_leading_segment_safe(
                         segment, None, control_text=self._gate_leak_control,

@@ -262,21 +262,20 @@ class TestGateFlowFlag(unittest.TestCase):
             os.environ["PHONE_GATE_FLOW"] = raw
             self.assertEqual(phone.phone_gate_flow(), "deterministic", raw)
 
-    def test_suppression_is_on_unless_explicitly_disabled(self):
-        # Default ON, and the reason is NOT "suppression is obviously right".
-        # It is that `candidate.wrong_number` is what PURGES the pre-consent
-        # recording (`PURGE_BEFORE_EVENTS`), and an earlier draft that defaulted
-        # this off posted no event at all — leaving a non-consenting third
-        # party's audio in the bucket forever and the engagement in `dialing`
-        # for the reaper to restore and redial. Both settings now post a real
-        # purging event; only the suppression differs.
-        self.assertTrue(phone.phone_identity_mismatch_suppresses())
-        for raw in ("true", "1", "YES", " on ", "", "maybe"):
-            os.environ["PHONE_IDENTITY_MISMATCH_SUPPRESSES"] = raw
-            self.assertTrue(phone.phone_identity_mismatch_suppresses(), raw)
-        for raw in ("false", "0", "no", "off"):
+    def test_suppression_is_off_unless_explicitly_enabled(self):
+        # Default OFF. Both settings post a purging terminal, so the purge is
+        # no longer an argument for suppressing; what is left is evidence, and
+        # the deterministic backstop misses the commonest correction shape
+        # ("No, I'm Priya" extracts no name). Two model verdicts plus a
+        # mis-heard name must not blocklist a number for every candidate and
+        # every future application.
+        self.assertFalse(phone.phone_identity_mismatch_suppresses())
+        for raw in ("false", "0", "no", "off", "", "maybe"):
             os.environ["PHONE_IDENTITY_MISMATCH_SUPPRESSES"] = raw
             self.assertFalse(phone.phone_identity_mismatch_suppresses(), raw)
+        for raw in ("true", "1", "YES", " on "):
+            os.environ["PHONE_IDENTITY_MISMATCH_SUPPRESSES"] = raw
+            self.assertTrue(phone.phone_identity_mismatch_suppresses(), raw)
 
 
 class TestFixedFallbackCopy(unittest.TestCase):
@@ -313,10 +312,15 @@ class TestFixedFallbackCopy(unittest.TestCase):
             lowered = instruction.lower()
             self.assertIn("do not mention recording", lowered, instruction)
 
-    def test_the_reask_is_a_closed_question_and_does_not_accuse(self):
+    def test_the_reask_names_nobody(self):
+        # It is spoken to a person who has just said they are NOT the candidate.
+        # Naming her tells a parent, spouse or colleague that a recruiter is
+        # calling her — the disclosure the identity check exists to avoid.
         line = phone.phone_identity_reask_text(NAME)
         self.assertTrue(line.rstrip().endswith("?"))
-        self.assertIn("Priya", line)
+        self.assertNotIn("Priya", line)
+        self.assertNotIn("Sharma", line)
+        self.assertTrue(phone._identity_line_asks_identity(line), line)
 
     def test_the_repair_line_does_not_introduce_us_a_second_time(self):
         # THE #279 "double-Hi" CLASS. The repair is appended to a line the
@@ -544,34 +548,29 @@ class TestGateIdentityFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn(phone.PHONE_WRONG_NUMBER_TEXT, h.spoken)
         self.assertNotIn(phone.PHONE_DISCLOSURE_TEXT, h.spoken)
         self.assertNotIn(phone.PHONE_DISCLOSURE_CONTINUATION_TEXT, h.spoken)
-        self.assertEqual(result.outcome, phone.CLASSIFY_WRONG_NUMBER)
+        self.assertEqual(result.outcome, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
         self.assertFalse(result.assessment_allowed)
         self.assertFalse(result.recording_allowed)
 
-    async def test_a_confirmed_mismatch_posts_a_purging_terminal_by_default(self):
+    async def test_a_confirmed_mismatch_defers_rather_than_blocklisting(self):
         h = _GateHarness(
             replies=["No, this is Ravi.", "Wrong number."],
             verdicts=["other_person", "other_person"],
         )
         await self._gate(h)
-        self.assertIn("candidate.wrong_number", h.events)
+        self.assertIn("candidate.deferred_pre_disclosure", h.events)
+        self.assertNotIn("candidate.wrong_number", h.events)
 
-    async def test_suppression_can_be_switched_off_and_STILL_posts_an_event(self):
-        # THE DEFECT THIS PINS. Switching suppression off must not degrade into
-        # posting NOTHING: the server records from `call.answered`, and the only
-        # thing that destroys that pre-consent audio is an event in
-        # `PURGE_BEFORE_EVENTS`. Silence would also leave the engagement in
-        # `dialing` for the reaper to restore and redial the same number.
+    async def test_suppression_can_be_switched_on(self):
         h = _GateHarness(
             replies=["No, this is Ravi.", "Wrong number."],
             verdicts=["other_person", "other_person"],
         )
         with mock.patch.dict(
-            os.environ, {"PHONE_IDENTITY_MISMATCH_SUPPRESSES": "false"},
+            os.environ, {"PHONE_IDENTITY_MISMATCH_SUPPRESSES": "true"},
         ):
             await self._gate(h)
-        self.assertNotIn("candidate.wrong_number", h.events)
-        self.assertIn("candidate.deferred_pre_disclosure", h.events)
+        self.assertIn("candidate.wrong_number", h.events)
         self.assertIn(phone.PHONE_WRONG_NUMBER_TEXT, h.spoken)
 
     async def test_every_identity_terminal_posts_a_purging_event(self):
@@ -596,15 +595,23 @@ class TestGateIdentityFlow(unittest.IsolatedAsyncioTestCase):
                 f"{label}: terminal posted no purging event ({h.events})",
             )
 
-    async def test_the_confirmed_mismatch_commits_its_evidence(self):
-        h = _GateHarness(
-            replies=["No, this is Ravi.", "Wrong number."],
-            verdicts=["other_person", "other_person"],
-        )
-        await self._gate(h)
-        self.assertTrue(h.committed, "the exchange is the only evidence for ending the call")
-        speakers = [t["speaker"] for t in h.committed[0]]
-        self.assertEqual(speakers.count("candidate"), 2)
+    async def test_no_transcript_is_persisted_before_consent(self):
+        # `main` had ONE `_commit_gate_turns` call site, after consent. An
+        # earlier draft added pre-consent ones "as evidence" — which files a
+        # bystander's words under the candidate's session labelled "candidate",
+        # with no erasure route (the wrong_number purge deletes RECORDINGS only,
+        # and the DSAR erase keys on a column `transcript_turns` does not have).
+        # The verdicts live in the structured log instead.
+        for replies, verdicts in (
+            (["No, this is Ravi.", "Wrong number."], ["other_person", "other_person"]),
+            (["She's in a meeting."], ["unavailable"]),
+        ):
+            h = _GateHarness(replies=replies, verdicts=verdicts)
+            await self._gate(h)
+            self.assertEqual(
+                h.committed, [],
+                f"persisted a transcript with no consent: {h.committed!r}",
+            )
 
     async def test_not_available_now_takes_the_callback_path_not_the_wrong_number_one(self):
         # The regex predecessor classified "she is not available right now" as a
@@ -811,6 +818,22 @@ class TestGateSpokenLineRepair(unittest.IsolatedAsyncioTestCase):
             f"introduced twice: {h.spoken!r}",
         )
 
+    async def test_SPOKEN_BUT_UNREADABLE_is_repaired_not_restarted(self):
+        # THE CONTRACT THAT WAS BROKEN. `_speak_gate_generation` returns "" for
+        # "audio went out, transcript never came back" — which the SDK does
+        # routinely, and which every leak-veto abandon also produces. The gate
+        # tested `spoken_line.strip()`, and "" is FALSY, so the one case the
+        # contract exists for fell into the nothing-was-spoken arm and spoke the
+        # full fixed opener over live audio: the 2026-09-09 double-opener,
+        # reproduced by the code written to prevent it. No test passed "".
+        h = await self._run_with([""])
+        self.assertNotIn(phone.phone_identity_text(NAME), h.spoken)
+        self.assertIn(phone.phone_identity_repair_text(NAME), h.spoken)
+        self.assertEqual(
+            sum(1 for line in h.spoken if "AI voice assistant" in line), 0,
+            f"re-introduced over live audio: {h.spoken!r}",
+        )
+
     async def test_nothing_generated_speaks_the_fixed_line_exactly_once(self):
         h = await self._run_with([None])
         self.assertIn(phone.phone_identity_text(NAME), h.spoken)
@@ -960,13 +983,67 @@ class TestGateWindowLeakVeto(unittest.IsolatedAsyncioTestCase):
         # was a real one.
         chunks = ["Hi, ", "I can see you are a Senior Data Engineer at Infosys ",
                   "in Bengaluru. Am I speaking to Priya?"]
+        # UNCONDITIONAL. An earlier version guarded its real assertion behind
+        # `if spoken:`, so it was skipped exactly when the veto worked — and it
+        # concealed that the baseline DID speak "a Senior Data Engineer at
+        # Infosys": five résumé words, released by the 48-char cap before the
+        # six-word echo detector could see them.
         spoken = await self._spoken(chunks)
-        self.assertNotIn("in Bengaluru", spoken)
-        if spoken:
-            self.assertGreaterEqual(
-                len(spoken.split()), 6,
-                f"released on a sub-window segment: {spoken!r}",
-            )
+        for leaked in ("Senior", "Data Engineer", "Infosys", "Bengaluru"):
+            self.assertNotIn(leaked, spoken, f"résumé leaked pre-consent: {spoken!r}")
+
+    async def test_no_resume_token_escapes_on_a_boundaryless_recital(self):
+        # The cap-release hole, stated directly: a recital with no punctuation
+        # until the end must be held and checked whole, not released at 48 chars.
+        chunks = ["I can see you are a Senior Data Engineer at Infosys in "
+                  "Bengaluru with four years of experience. Am I speaking to Priya?"]
+        self.assertEqual(await self._spoken(chunks), "")
+
+    async def test_a_vetoed_stream_is_closed_not_abandoned_open(self):
+        # A vetoed gate turn that leaves the provider stream open leaks a
+        # connection and keeps billing tokens, on the most cost-sensitive path.
+        closed = []
+
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+                self.chat_ctx = types.SimpleNamespace(items=[])
+
+            def llm_node(self, chat_ctx, tools, model_settings):
+                class _Stream:
+                    def __aiter__(self_inner):
+                        async def _gen():
+                            yield ("Hi there, I can see you are a Senior Data "
+                                   "Engineer at Infosys in Bengaluru.")
+                        return _gen()
+
+                    async def aclose(self_inner):
+                        closed.append(True)
+
+                return _Stream()
+
+        agent = phone.phone_agent_class(BaseAgent)(
+            "sys", client=None, attempt_id="a1", say=None,
+            on_user_turn=lambda *a, **k: None, native_turns=True,
+        )
+        agent.set_gate_leak_control(self.RESUME)
+        agent.set_gate_opening(True)
+        out = []
+        async for chunk in agent.llm_node(types.SimpleNamespace(items=[]), [], None):
+            out.append(chunk)
+        self.assertEqual("".join(out), "")
+        self.assertEqual(closed, [True], "the vetoed provider stream was left open")
+
+    async def test_a_generated_identity_line_may_not_disclose_recording(self):
+        # The instruction asks the model not to; an instruction is not an
+        # enforcement. These were accepted and spoken before the check existed.
+        for line in (
+            "Hi, this is Christy. This call is recorded for the hiring team. "
+            "Am I speaking to Priya?",
+            "Hi, Christy here. We record these calls. Have I reached the right "
+            "person?",
+        ):
+            self.assertFalse(phone._identity_line_asks_identity(line), line)
 
     async def test_a_short_reply_with_no_boundary_is_still_checked(self):
         self.assertEqual(await self._spoken(["Goodbye"]), "")
@@ -1034,16 +1111,24 @@ class TestWordBoundaryFlush(unittest.IsolatedAsyncioTestCase):
         # nothing. The property that actually holds: the fragment ends on a
         # word boundary, so its last token is a whole token of the source.
         self.assertTrue(first.strip(), first)
+        # `assertIn(token, SOURCE_STRING)` was the previous attempt and it is
+        # SUBSTRING containment — true for every prefix of every word, i.e. for
+        # exactly the mid-word family it claimed to exclude ("Thanks for
+        # confir" passed it). Split the source into WORDS so the membership
+        # test means what it says.
+        source = "Thanks for confirming that, let me ask about your experience."
+        words = {w.strip(".,!?;:") for w in source.split()}
         last_token = first.split()[-1].strip(".,!?;:")
         self.assertIn(
-            last_token,
-            "Thanks for confirming that, let me ask about your experience.",
+            last_token, words,
             f"fragment ended mid-token: {first!r}",
         )
-        self.assertNotIn("confirmin ", first)
-        self.assertFalse(
-            first.rstrip().endswith("confirmin"),
-            f"cut inside 'confirming': {first!r}",
+        # And the character the cut fell on is a boundary in the source, not
+        # the middle of a token.
+        cut = len(first.rstrip())
+        self.assertTrue(
+            cut >= len(source) or source[cut].isspace(),
+            f"cut is not at a word boundary: {first!r}",
         )
 
     async def test_no_character_is_lost_or_duplicated_across_the_join(self):
@@ -1061,7 +1146,15 @@ class TestWordBoundaryFlush(unittest.IsolatedAsyncioTestCase):
         source = "Sure, the number to reach me on is 9876543210 any time."
         streams = await self._synthesized(source, min_chars=30)
         self.assertEqual("".join(streams), source)
-        self.assertNotIn("is9876543210", "".join(streams))
+        # THE PROPERTY THAT MATTERS, and the one nothing asserted: the digit run
+        # must live INSIDE ONE synthesis. Deleting the back-off entirely used to
+        # leave this class green while splitting the number into "987" +
+        # "6543210" across two Sarvam calls — worse than the defect the back-off
+        # was written for, and invisible to every assertion here.
+        self.assertTrue(
+            any("9876543210" in chunk for chunk in streams),
+            f"the digit run was split across syntheses: {streams!r}",
+        )
 
     async def test_the_backoff_DECLINES_rather_than_emit_a_tiny_fragment(self):
         # v114: a sub-14-letter first synthesis re-primes Sarvam's prosody and

@@ -119,13 +119,14 @@ the gate returns to the fixed disclosure with no identity turn and no
 pre-consent generation. Secrets-only, so it needs no deploy and no revert, and it
 works even if later code has shipped.
 
-A third flag, `PHONE_IDENTITY_MISMATCH_SUPPRESSES`, defaults to **on**. Both
-settings post a real terminal event; the only difference is the suppression:
+A third flag, `PHONE_IDENTITY_MISMATCH_SUPPRESSES`, defaults to **off**. Both
+settings post a real purging terminal event; the only difference is whether a
+suppression is written:
 
 | Value | Event posted | Recording purged | Engagement | Suppression |
 |---|---|---|---|---|
-| unset / `true` (default) | `candidate.wrong_number` | yes | terminal | **permanent, line-level** |
-| `false` | `candidate.deferred_pre_disclosure` | yes | deferred to next IST day | none |
+| unset / `false` (default) | `candidate.deferred_pre_disclosure` | yes | deferred to next IST day | none |
+| `true` | `candidate.wrong_number` | yes | terminal | **permanent, line-level** |
 
 **Why neither option is "post nothing".** The egress starts at `call.answered`,
 *before* consent (0067: "record from answer, keep only if consented"), and the
@@ -136,9 +137,15 @@ somebody who was never told they were being recorded in the bucket permanently,
 same wrong number is dialled again. An earlier draft of this change did exactly
 that while believing it was the safer choice.
 
-Set `false` while the classifier has no live track record, and accept that a
-genuinely wrong number will be tried again the next day. The suppression written
-by the default is undoable by an operator with the 0094 release RPC.
+**Why the default is `false`.** Once the deferral terminal existed, the purge
+stopped being an argument for suppressing — both settings destroy the audio. What
+is left is evidence, and it is weaker than it looks: the deterministic backstop
+that stops a model ending a call on a name the record supports only fires when
+`phone_extract_introduced_name` can pull a name out, and that reader matches
+"this is X" shapes, **not** a bare "I'm X". So "No, I'm Priya" — the commonest
+way a real candidate corrects a mis-heard name — is exactly the shape it misses.
+Turn suppression on once the classifier has a live track record; the row it
+writes is undoable only with the 0094 release RPC.
 
 ### What §2y does NOT cover
 
@@ -150,11 +157,28 @@ be undone by reverting code:
 - `PHONE_TTS_FLUSH_MIN_CHARS = "60"` in `fly.phone.toml` — note a Fly *secret*
   of the same name shadows it, so the live value is the one in §2z;
 - `PHONE_OPENING_GATE_SECONDS` 60 → 106 and the `leaseSeconds` default 180 → 240
-  (`app/api/src/lib/phone-screening/config.ts`). These size the lease so the
-  identity turn cannot outlive it; they are API-side and unaffected by the worker
-  flags. Left at the old values, a conversational-flow call whose gate overruns
-  meets a lapsed lease, the first heartbeat answers `lease_lost`, and the agent
-  hangs up seconds after the candidate consented.
+  (`app/api/src/lib/phone-screening/config.ts`), plus the two call sites that
+  carried the old literal (`app/api/.env.example`, `phone-canary1/originate.ts`).
+  These size the lease so the identity turn cannot outlive it; they are API-side
+  and unaffected by the worker flags. They move the pre-provider refusal
+  threshold (`lease_too_short_for_gate`) for **every dial on every deployment**.
+  Left at the old values, a conversational-flow call whose gate overruns meets a
+  lapsed lease, the first heartbeat answers `lease_lost`, and the agent hangs up
+  seconds after the candidate consented;
+- `agent.py` — the leak-veto arming (`set_gate_leak_control`) runs on every call
+  and reads no flag. It only writes résumé text onto the agent object; nothing
+  reads it unless the gate window opens, which needs both flags. Failures are
+  swallowed, so a call that armed and one that did not look identical;
+- `agent.py` — `run_phone_gate` is now called unconditionally with
+  `speak_gate_line=` / `reset_turn_buffer=`, and `_compose_gate_line` is gone. A
+  worker running a mismatched `agent.py`/`phone.py` pair is a `TypeError`, and no
+  flag undoes that: deploy them together;
+- `agent.py` — `_await_output_subscription()` now also runs on the deterministic
+  path, so the fixed disclosure pays a bounded wait (8 s default) it did not pay
+  before. That is the point — it replaces an UNBOUNDED one — but it is a change
+  on the default path;
+- `agent.py` — the `voice_phone_participant_to_disclosure_sec` metric now matches
+  either disclosure variant, on every call.
 
 ### 2a. `PHONE_DIAL_SCOPE` — allowlist or pipeline (0094)
 

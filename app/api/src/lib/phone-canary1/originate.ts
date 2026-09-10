@@ -73,7 +73,11 @@ import {
   type SipClientResolution,
 } from '../../integrations/livekit-phone-dial/sip.js';
 import type { DialableNumber } from '../../integrations/livekit-phone-dial/dialable-number.js';
-import { isDialAllowedForDigest, type PhoneScreeningConfig } from '../phone-screening/config.js';
+import {
+  isDialAllowedForDigest,
+  PHONE_OPENING_GATE_SECONDS,
+  type PhoneScreeningConfig,
+} from '../phone-screening/config.js';
 import type { PhoneDialConfig } from '../../integrations/livekit-phone-dial/config.js';
 import { discardingErrors, scrubVerbosity } from './containment.js';
 import { buildCanary1DispatchMetadata, buildCanary1RoomMetadata } from './metadata.js';
@@ -137,7 +141,12 @@ export function buildCanary1ScreeningConfig(
     reconnectBackoffSeconds: 120,
     infraDeferBackoffSeconds: 300,
     ringTimeoutSeconds: ringSeconds,
-    leaseSeconds: 180,
+    // DERIVED, not a literal. `dialPhoneAttempt` refuses
+    // `lease_too_short_for_gate` when the lease cannot span
+    // ring + PHONE_OPENING_GATE_SECONDS, and 0095 raised that constant to pay
+    // for the conversational gate's pre-consent identity turn. A hardcoded 180
+    // silently refused every canary dial once the ring timeout exceeded 74 s.
+    leaseSeconds: ringSeconds + PHONE_OPENING_GATE_SECONDS,
     webhookMaxBytes: 65_536,
     webhookToleranceSeconds: 300,
   };
