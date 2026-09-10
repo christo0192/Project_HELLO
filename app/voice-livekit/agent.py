@@ -7395,7 +7395,12 @@ async def _run_phone_session(
         wait_for_playout = getattr(speech, "wait_for_playout", None)
         if callable(wait_for_playout):
             await wait_for_playout()
-        if text == phone.PHONE_DISCLOSURE_TEXT and participant_present_anchor[0] is not None:
+        # Both disclosure variants, or the metric silently loses every sample
+        # the moment the conversational flow is enabled (that flow speaks
+        # `PHONE_DISCLOSURE_CONTINUATION_TEXT` and never the other one).
+        if text in (
+            phone.PHONE_DISCLOSURE_TEXT, phone.PHONE_DISCLOSURE_CONTINUATION_TEXT,
+        ) and participant_present_anchor[0] is not None:
             delta_ms = started_ms - participant_present_anchor[0]
             if delta_ms >= 0:
                 _safe_emit(histogram_metric, "voice_phone_participant_to_disclosure_sec", delta_ms / 1000.0, {"channel": "phone"})
@@ -7527,6 +7532,21 @@ async def _run_phone_session(
             user_turns, say, consumed=consent_reply_out
         )
 
+    # Arm the gate-window leak veto with the RÉSUMÉ FACTS — the text that must
+    # not reach a pre-consent listener, and that the bot is never meant to say.
+    # Deliberately NOT the system prompt: that is what instructs the greeting,
+    # so scanning against it vetoes the correct line (verified by execution).
+    try:
+        _gate_leak_setter = getattr(agent, "set_gate_leak_control", None)
+        if callable(_gate_leak_setter):
+            _facts = getattr(instruction_state, "resume_facts", None)
+            if isinstance(_facts, dict) and _facts:
+                _gate_leak_setter(
+                    " ".join(str(v) for v in _facts.values())[:8000]
+                )
+    except Exception:  # noqa: BLE001 — a missing veto must never fail a call.
+        pass
+
     async def _await_output_subscription() -> None:
         """Bound the SIP outbound-audio-track SUBSCRIPTION wait. Fail-open.
 
@@ -7620,7 +7640,23 @@ async def _run_phone_session(
             if callable(setter):
                 setter(False)
         spoken_text = latest_assistant[0]
-        return spoken_text if isinstance(spoken_text, str) and spoken_text.strip() else None
+        if isinstance(spoken_text, str) and spoken_text.strip():
+            return spoken_text
+        # SPOKEN, BUT NOT READ BACK. `latest_assistant[0]` comes from the SDK's
+        # `conversation_item_added`, which can lag the audio, arrive empty, or
+        # not arrive at all — and `wait_for_playout` can raise after the frames
+        # have already left. Returning None in those cases would tell the gate
+        # "nothing was spoken", and the gate would then speak its full fixed
+        # opener ON TOP of a line the candidate already heard: the 2026-09-09
+        # double-opener, reproduced by the helper written to prevent it.
+        #
+        # So the agent reports what it actually knows — whether the gate window
+        # released audio — and an empty string means "spoken, text unknown".
+        # The gate repairs that case instead of restarting.
+        emitted = getattr(agent, "gate_stream_emitted", None)
+        if callable(emitted) and emitted():
+            return ""
+        return None
 
     async def _speak_gate_line(instructions: str) -> str | None:
         """Speak ONE model-authored gate line (the identity turn and its re-ask).
@@ -7638,6 +7674,15 @@ async def _run_phone_session(
         live call before model-authored pre-consent speech is switched on.
         """
         if phone.phone_deterministic_opener():
+            # Stage 1 (conversational flow, fixed copy): this returns None and
+            # the GATE speaks the fixed identity line — which means the first
+            # audio of the call is that `session.say`, not a generation. The
+            # subscription warm-up lives inside `_speak_gate_generation`, so
+            # without this the first frame pays the whole untimed
+            # `wait_for_subscription` stall that baseline-fix 4a exists to bound
+            # (~17-20 s, and it would eat the identity answer window and the
+            # lease with it).
+            await _await_output_subscription()
             return None
         return await _speak_gate_generation(instructions)
 

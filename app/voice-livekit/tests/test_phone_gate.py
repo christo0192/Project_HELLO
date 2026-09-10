@@ -1726,12 +1726,29 @@ class TestPhoneParity2Gate(unittest.IsolatedAsyncioTestCase):
 
         result, client, recorder = await self._atomic_gate(speak_opening=speak_opening)
         self.assertTrue(result.assessment_allowed)
-        # Fell back to the fixed disclosure...
-        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, recorder.spoken)
-        # ...and STILL committed the gate turns, with the fixed opening text.
+        # Fell back — but to the CONTINUATION, not the full disclosure.
+        #
+        # 0095 changed this deliberately. The model's line WAS SPOKEN ("Hi
+        # there, lovely to reach you today"), so following it with the full
+        # `PHONE_DISCLOSURE_TEXT` introduces Christy a second time in the next
+        # breath — the 2026-09-09 double-opener, which is the incident this
+        # whole verification path exists because of. The continuation carries
+        # the recording sentence verbatim and the same consent question, so
+        # nothing consent-critical changes; it just does not say hello twice.
+        self.assertIn(phone.PHONE_DISCLOSURE_CONTINUATION_TEXT, recorder.spoken)
+        self.assertNotIn(phone.PHONE_DISCLOSURE_TEXT, recorder.spoken)
+        # The consent-critical content is still delivered, exactly once.
+        disclosures = [
+            line for line in recorder.spoken
+            if phone.PHONE_DISCLOSURE_RECORDING_SENTENCE in line
+        ]
+        self.assertEqual(len(disclosures), 1)
+        self.assertTrue(disclosures[0].rstrip().endswith("Is it okay to continue?"))
+        # ...and it STILL committed the gate turns, with the spoken opening text.
         self.assertEqual(len(client.gate_commits), 1)
         self.assertEqual(
-            client.gate_commits[0]["turns"][0]["text"], phone.PHONE_DISCLOSURE_TEXT
+            client.gate_commits[0]["turns"][0]["text"],
+            phone.PHONE_DISCLOSURE_CONTINUATION_TEXT,
         )
 
     async def test_speak_opening_that_raises_falls_back_to_fixed_disclosure(self):
@@ -1775,7 +1792,12 @@ class TestPhoneParity2Gate(unittest.IsolatedAsyncioTestCase):
         with patch.object(phone, "_log", spy):
             result, client, recorder = await self._atomic_gate(speak_opening=speak_opening)
         self.assertTrue(result.assessment_allowed)
-        self.assertEqual(recorder.spoken.count(phone.PHONE_DISCLOSURE_TEXT), 1)
+        # Spoken exactly once, and it is the continuation (see the sibling test:
+        # the model's greeting was already heard, so a second self-introduction
+        # would be the double-opener).
+        self.assertEqual(
+            recorder.spoken.count(phone.PHONE_DISCLOSURE_CONTINUATION_TEXT), 1)
+        self.assertEqual(recorder.spoken.count(phone.PHONE_DISCLOSURE_TEXT), 0)
         cats = [(c[0], c[2].get("error_category")) for c in spy.method_calls]
         self.assertIn(("warn", "opening_unverified"), cats)
         self.assertNotIn(("info", "opening_fixed"), cats)

@@ -74,6 +74,88 @@ remainder as SEPARATE Sarvam calls, and at a 20-character cap the split lands
 mid-phrase far more often than at 40. The endpointing max is a separate
 complaint — the tail a slow speaker gets before their turn is closed.
 
+`PHONE_TTS_PACE` is deliberately NOT set anywhere. The reader exists
+(`phone_tts_pace()`, default `1.0`) so it can be applied as a secret, but the
+value is unverified against `bulbul:v3`: the reader's `[0.5, 2.0]` clamp was
+invented and Sarvam documents `0.3–3.0`, so a rejected synthesis is SILENCE, and
+this lane has prior form for Sarvam 400s being swallowed rather than raised.
+Apply it as a secret on ONE test call and listen before pinning it in the toml —
+no secret shadows that name, so a toml entry ships hot on the next deploy.
+
+### 2y. Conversational gate rollback point — 2026-09-10 (0095)
+
+The identity turn before consent is behind TWO flags, and **both default to the
+setup that is live today**, so merging changes nothing until they are set. Unlike
+§2z these are `[env]` defaults in code, not secrets, so they CAN be read back —
+but the staging order matters, so it is recorded.
+
+| Stage | `PHONE_GATE_FLOW` | `PHONE_DETERMINISTIC_OPENER` | What the candidate hears |
+|---|---|---|---|
+| 0 (today, and the rollback target) | unset / `deterministic` | unset / `true` | Fixed disclosure → fixed role line → Q1 |
+| 1 | `conversational` | unset / `true` | Fixed identity ask → fixed consent → fixed role → Q1 |
+| 2 | `conversational` | `false` | Model-authored identity ask, consent and role line, all streamed |
+
+Stage 1 exists on purpose: it proves the new turn ORDER, the identity classifier
+and the turn-buffer barrier on a live call **without** switching on
+model-authored pre-consent speech. Do not skip it.
+
+**To enable stage 1, then stage 2:**
+
+```
+fly secrets set PHONE_GATE_FLOW=conversational --app project-hello-phone-voice
+# listen to a call, then:
+fly secrets set PHONE_DETERMINISTIC_OPENER=false --app project-hello-phone-voice
+```
+
+**To roll all the way back to the 2026-09-10 production setup:**
+
+```
+fly secrets unset PHONE_GATE_FLOW PHONE_DETERMINISTIC_OPENER \
+                  --app project-hello-phone-voice
+```
+
+Unsetting is the true rollback: both readers default to the current behaviour, so
+the gate returns to the fixed disclosure with no identity turn and no
+pre-consent generation. Secrets-only, so it needs no deploy and no revert, and it
+works even if later code has shipped.
+
+A third flag, `PHONE_IDENTITY_MISMATCH_SUPPRESSES`, defaults to **on**. Both
+settings post a real terminal event; the only difference is the suppression:
+
+| Value | Event posted | Recording purged | Engagement | Suppression |
+|---|---|---|---|---|
+| unset / `true` (default) | `candidate.wrong_number` | yes | terminal | **permanent, line-level** |
+| `false` | `candidate.deferred_pre_disclosure` | yes | deferred to next IST day | none |
+
+**Why neither option is "post nothing".** The egress starts at `call.answered`,
+*before* consent (0067: "record from answer, keep only if consented"), and the
+only thing that destroys that pre-consent audio is the worker posting an event in
+`PURGE_BEFORE_EVENTS`. A terminal that posts nothing leaves the recording of
+somebody who was never told they were being recorded in the bucket permanently,
+*and* leaves the engagement in `dialing` for the lease reaper to restore — so the
+same wrong number is dialled again. An earlier draft of this change did exactly
+that while believing it was the safer choice.
+
+Set `false` while the classifier has no live track record, and accept that a
+genuinely wrong number will be tried again the next day. The suppression written
+by the default is undoable by an operator with the 0094 release RPC.
+
+### What §2y does NOT cover
+
+`fly secrets unset PHONE_GATE_FLOW PHONE_DETERMINISTIC_OPENER` rolls back **the
+gate only**. Three things on this branch ship regardless of any flag and can only
+be undone by reverting code:
+
+- the `tts_node` word-boundary back-off (from `3cad63f`);
+- `PHONE_TTS_FLUSH_MIN_CHARS = "60"` in `fly.phone.toml` — note a Fly *secret*
+  of the same name shadows it, so the live value is the one in §2z;
+- `PHONE_OPENING_GATE_SECONDS` 60 → 106 and the `leaseSeconds` default 180 → 240
+  (`app/api/src/lib/phone-screening/config.ts`). These size the lease so the
+  identity turn cannot outlive it; they are API-side and unaffected by the worker
+  flags. Left at the old values, a conversational-flow call whose gate overruns
+  meets a lapsed lease, the first heartbeat answers `lease_lost`, and the agent
+  hangs up seconds after the candidate consented.
+
 ### 2a. `PHONE_DIAL_SCOPE` — allowlist or pipeline (0094)
 
 `PHONE_DIAL_ALLOWLIST` was a **bring-up canary**: prove the dialer can only

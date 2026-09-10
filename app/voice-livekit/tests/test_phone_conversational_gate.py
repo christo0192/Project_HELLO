@@ -159,6 +159,41 @@ class TestIdentityClassifier(unittest.TestCase):
         _run(phone.phone_classify_identity("x" * 5000, NAME, infer=_spy))
         self.assertLess(len(seen[0]), 1200, "an unbounded reply is a cost and an injection surface")
 
+    def test_a_reflexive_pronoun_is_not_the_word_self(self):
+        # THE MISREAD THAT MADE THIS FAIL UNSAFE. `self` is a substring of
+        # himself / herself / myself / yourself / itself — the exact vocabulary
+        # a model uses to describe who picked up a phone. Taking the first
+        # `str.find` hit routed a THIRD PARTY into the recording disclosure and
+        # the full screening. Each line below was reproduced against the old
+        # parser and returned `self`.
+        for raw, want in (
+            ("He cannot come to the phone himself, so: unavailable",
+             phone.PHONE_IDENTITY_UNAVAILABLE),
+            ("She identified herself as the mother. other_person",
+             phone.PHONE_IDENTITY_OTHER),
+            ("The replier is not Priya herself, so other_person.",
+             phone.PHONE_IDENTITY_OTHER),
+        ):
+            self.assertEqual(
+                _run(phone.phone_classify_identity(
+                    "No, this is her father.", NAME, infer=_verdict(raw))),
+                want, raw,
+            )
+
+    def test_a_body_naming_two_verdicts_is_not_an_answer(self):
+        # A model echoing the option list, or reasoning aloud, is not a verdict.
+        # It must read as `unclear` (which proceeds), never as whichever word
+        # happened to come first.
+        for raw in (
+            "Options: self, other_person, unavailable, unclear. "
+            "The answer is other_person",
+            "It is either self or unavailable, hard to say",
+        ):
+            self.assertEqual(
+                _run(phone.phone_classify_identity("hello", NAME, infer=_verdict(raw))),
+                phone.PHONE_IDENTITY_UNCLEAR, raw,
+            )
+
     def test_the_record_name_spoken_back_cannot_be_called_another_person(self):
         # THE REGRESSION THAT BLOCKED THIS BRANCH. `_IDENTITY_DENY_RE` hung up on
         # a candidate CORRECTING the bot, and `candidate.wrong_number` wrote a
@@ -227,14 +262,21 @@ class TestGateFlowFlag(unittest.TestCase):
             os.environ["PHONE_GATE_FLOW"] = raw
             self.assertEqual(phone.phone_gate_flow(), "deterministic", raw)
 
-    def test_suppression_is_off_unless_explicitly_enabled(self):
-        self.assertFalse(phone.phone_identity_mismatch_suppresses())
-        for raw in ("false", "0", "no", "off", "", "maybe"):
-            os.environ["PHONE_IDENTITY_MISMATCH_SUPPRESSES"] = raw
-            self.assertFalse(phone.phone_identity_mismatch_suppresses(), raw)
-        for raw in ("true", "1", "YES", " on "):
+    def test_suppression_is_on_unless_explicitly_disabled(self):
+        # Default ON, and the reason is NOT "suppression is obviously right".
+        # It is that `candidate.wrong_number` is what PURGES the pre-consent
+        # recording (`PURGE_BEFORE_EVENTS`), and an earlier draft that defaulted
+        # this off posted no event at all — leaving a non-consenting third
+        # party's audio in the bucket forever and the engagement in `dialing`
+        # for the reaper to restore and redial. Both settings now post a real
+        # purging event; only the suppression differs.
+        self.assertTrue(phone.phone_identity_mismatch_suppresses())
+        for raw in ("true", "1", "YES", " on ", "", "maybe"):
             os.environ["PHONE_IDENTITY_MISMATCH_SUPPRESSES"] = raw
             self.assertTrue(phone.phone_identity_mismatch_suppresses(), raw)
+        for raw in ("false", "0", "no", "off"):
+            os.environ["PHONE_IDENTITY_MISMATCH_SUPPRESSES"] = raw
+            self.assertFalse(phone.phone_identity_mismatch_suppresses(), raw)
 
 
 class TestFixedFallbackCopy(unittest.TestCase):
@@ -246,19 +288,30 @@ class TestFixedFallbackCopy(unittest.TestCase):
         self.assertIn("Priya", line)
         self.assertNotIn("Sharma", line, "a full legal name reads as a debt collector")
 
-    def test_no_gate_line_before_consent_mentions_recording(self):
+    def test_no_spoken_gate_line_before_consent_mentions_recording(self):
         # Recording belongs to the consent turn. A disclosure that arrives one
         # turn early is a disclosure the candidate did not consent to yet — and
         # it may be read to somebody who is not the candidate at all.
+        #
+        # The token is "record", not "recorded". Asserting the past tense let
+        # "Hi, we record this call. Am I speaking to Priya?" pass — verified by
+        # execution. And the list is SPOKEN LINES only: the two instruction
+        # builders necessarily contain "record", because their job is to forbid
+        # it, and mixing them in is what forced the narrower token in the first
+        # place.
         for line in (phone.phone_identity_text(NAME),
                      phone.phone_identity_text(None),
                      phone.phone_identity_reask_text(NAME),
                      phone.phone_identity_reask_text(None),
                      phone.phone_identity_repair_text(NAME),
-                     phone.phone_identity_repair_text(None),
-                     phone.phone_identity_instruction(NAME),
-                     phone.phone_identity_reask_instruction(NAME)):
-            self.assertNotIn("recorded", line.lower(), line)
+                     phone.phone_identity_repair_text(None)):
+            self.assertNotIn("record", line.lower(), line)
+
+    def test_the_instructions_forbid_recording_rather_than_mention_it(self):
+        for instruction in (phone.phone_identity_instruction(NAME),
+                            phone.phone_identity_reask_instruction(NAME)):
+            lowered = instruction.lower()
+            self.assertIn("do not mention recording", lowered, instruction)
 
     def test_the_reask_is_a_closed_question_and_does_not_accuse(self):
         line = phone.phone_identity_reask_text(NAME)
@@ -295,17 +348,35 @@ class _GateHarness:
         self.spoken: list[str] = []
         self.events: list[str] = []
         self.committed: list[list[dict]] = []
-        self.queue: list[str] = list(replies)
+        # TWO things, deliberately, because the defect lives in the difference.
+        #
+        # `queue` is the live STT buffer: utterances that were ALREADY finalised
+        # when the reader looked — the callee's "Hello?" on pickup. It is
+        # drainable, exactly as production's `user_turns` is.
+        #
+        # `replies` is what the candidate says IN RESPONSE to the question just
+        # asked. It arrives after the drain by construction, which is what makes
+        # "the barrier ate the real answer" a failure this harness can actually
+        # observe rather than one it defines away.
+        self.queue: list[str] = []
+        self.replies: list[str] = list(replies)
         self.verdicts: list[str] = list(verdicts)
         self.generated = generated
         self.classify_calls = 0
+        self.consent_saw: str | None = None
 
-    # -- the shared STT FIFO, and the drain that gives each question its own --
     async def next_candidate_turn(self) -> str:
-        return self.queue.pop(0) if self.queue else ""
+        if self.queue:
+            # A stale utterance survived the barrier — the bug.
+            return self.queue.pop(0)
+        return self.replies.pop(0) if self.replies else ""
 
     def reset_turn_buffer(self) -> None:
-        self.queue = [t for t in self.queue if not t.startswith("STALE:")]
+        # UNCONDITIONAL, exactly like production `_drain_user_turns`. A
+        # selective drain keyed on a prefix the test itself writes would model a
+        # friendlier world than the one the code runs in: a production drain
+        # that dropped only *some* items would still be green.
+        self.queue = []
 
     async def say(self, text: str) -> None:
         self.spoken.append(text)
@@ -319,7 +390,13 @@ class _GateHarness:
         return line
 
     async def classify(self) -> str:
+        # READS THE SAME QUEUE, exactly as `_classify_phone_answer` does. A
+        # harness whose consent classifier never touched the buffer could not
+        # observe cross-contamination between the two readers at all — which is
+        # the entire defect this flow was blocked on. `consent_saw` is what the
+        # consent turn actually consumed.
         self.classify_calls += 1
+        self.consent_saw = await self.next_candidate_turn()
         return phone.CLASSIFY_HUMAN
 
     async def infer(self, _prompt):
@@ -343,6 +420,15 @@ class _RecordingClient:
     async def commit_gate_turns(self, session, turns, key):
         return await self._sink.commit_gate_turns(session, turns, key)
 
+    async def consent_and_start_assessment(self, _attempt, _session, _epoch):
+        # Wiring this is what lets the tests reach the POST-CONSENT commit —
+        # where the gate transcript is longest and where the server's 6-row
+        # bound actually bites. Without it every test stopped at a terminal.
+        return types.SimpleNamespace(
+            ok=True, role_title=None, status="ok", assessment_id="as1",
+            plan=None, questions=(), cursor=0, role_focus=None,
+        )
+
 
 class TestGateIdentityFlow(unittest.IsolatedAsyncioTestCase):
     """End-to-end through `run_phone_gate` under the conversational flow."""
@@ -365,6 +451,10 @@ class TestGateIdentityFlow(unittest.IsolatedAsyncioTestCase):
             classify=harness.classify,
             say=harness.say,
             session_id="s1",
+            # Required alongside session_id for the gate to run the atomic
+            # consent/start RPC — and therefore to reach the post-consent
+            # transcript commit, where the server's 6-row bound bites.
+            epoch=1,
             next_candidate_turn=harness.next_candidate_turn,
             speak_gate_line=harness.speak_gate_line,
             reset_turn_buffer=harness.reset_turn_buffer,
@@ -458,28 +548,53 @@ class TestGateIdentityFlow(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result.assessment_allowed)
         self.assertFalse(result.recording_allowed)
 
-    async def test_a_confirmed_mismatch_does_not_suppress_the_number_by_default(self):
-        # `candidate.wrong_number` moves the engagement AND writes a permanent
-        # line-level suppression in the same transaction, blocking that number
-        # for every candidate and every future application. Two model verdicts
-        # on a noisy phone call are not grounds for that.
+    async def test_a_confirmed_mismatch_posts_a_purging_terminal_by_default(self):
         h = _GateHarness(
             replies=["No, this is Ravi.", "Wrong number."],
             verdicts=["other_person", "other_person"],
         )
         await self._gate(h)
-        self.assertNotIn("candidate.wrong_number", h.events)
+        self.assertIn("candidate.wrong_number", h.events)
 
-    async def test_suppression_can_be_switched_back_on(self):
+    async def test_suppression_can_be_switched_off_and_STILL_posts_an_event(self):
+        # THE DEFECT THIS PINS. Switching suppression off must not degrade into
+        # posting NOTHING: the server records from `call.answered`, and the only
+        # thing that destroys that pre-consent audio is an event in
+        # `PURGE_BEFORE_EVENTS`. Silence would also leave the engagement in
+        # `dialing` for the reaper to restore and redial the same number.
         h = _GateHarness(
             replies=["No, this is Ravi.", "Wrong number."],
             verdicts=["other_person", "other_person"],
         )
         with mock.patch.dict(
-            os.environ, {"PHONE_IDENTITY_MISMATCH_SUPPRESSES": "true"},
+            os.environ, {"PHONE_IDENTITY_MISMATCH_SUPPRESSES": "false"},
         ):
             await self._gate(h)
-        self.assertIn("candidate.wrong_number", h.events)
+        self.assertNotIn("candidate.wrong_number", h.events)
+        self.assertIn("candidate.deferred_pre_disclosure", h.events)
+        self.assertIn(phone.PHONE_WRONG_NUMBER_TEXT, h.spoken)
+
+    async def test_every_identity_terminal_posts_a_purging_event(self):
+        # Generalised, because "ends the call without posting anything" is the
+        # shape of the bug, not one instance of it. Every PURGE_BEFORE_EVENTS
+        # member destroys the pre-consent recording; a terminal outside that set
+        # silently keeps it.
+        purging = {"candidate.wrong_number", "candidate.deferred_pre_disclosure"}
+        for label, replies, verdicts, env in (
+            ("mismatch/suppressing", ["No, this is Ravi.", "Wrong number."],
+             ["other_person", "other_person"], {}),
+            ("mismatch/deferring", ["No, this is Ravi.", "Wrong number."],
+             ["other_person", "other_person"],
+             {"PHONE_IDENTITY_MISMATCH_SUPPRESSES": "false"}),
+            ("unavailable", ["She's in a meeting."], ["unavailable"], {}),
+        ):
+            h = _GateHarness(replies=replies, verdicts=verdicts)
+            with mock.patch.dict(os.environ, env):
+                await self._gate(h)
+            self.assertTrue(
+                purging & set(h.events),
+                f"{label}: terminal posted no purging event ({h.events})",
+            )
 
     async def test_the_confirmed_mismatch_commits_its_evidence(self):
         h = _GateHarness(
@@ -512,9 +627,8 @@ class TestGateIdentityFlow(unittest.IsolatedAsyncioTestCase):
         # callee's "Hello?" on pickup is already queued. Without a barrier the
         # identity reader pops THAT and the real identity answer is popped by
         # the CONSENT classifier.
-        h = _GateHarness(
-            replies=["STALE:Hello?", "Yes, this is Priya."], verdicts=["self"],
-        )
+        h = _GateHarness(replies=["Yes, this is Priya."], verdicts=["self"])
+        h.queue.append("Hello?")   # already finalised when the gate starts
         seen = []
 
         async def _spy(prompt):
@@ -527,19 +641,119 @@ class TestGateIdentityFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Yes, this is Priya.", seen[0])
         self.assertNotIn("Hello?", seen[0])
 
+    async def test_an_utterance_arriving_DURING_the_question_is_not_its_answer(self):
+        # THE WINDOW THE FIRST BARRIER MISSED. STT is live from pickup, so the
+        # callee's "Hello?" is usually still in flight when the turn begins: its
+        # final lands while the question is generating and playing, i.e. AFTER a
+        # drain placed before generation. Only a drain after playout — right
+        # before we wait for a reply — actually closes it.
+        h = _GateHarness(replies=["Yes, this is Priya."], verdicts=["self"])
+        real_speak = h.speak_gate_line
+
+        async def _speak_then_stt(instruction):
+            out = await real_speak(instruction)
+            # The pickup "Hello?" finalises mid-playout — AFTER any drain that
+            # ran before generation began.
+            h.queue.insert(0, "Hello?")
+            return out
+
+        h.speak_gate_line = _speak_then_stt
+        seen = []
+
+        async def _spy(prompt):
+            seen.append(prompt)
+            return "self"
+
+        h.infer = _spy
+        await self._gate(h)
+        self.assertEqual(len(seen), 1)
+        self.assertIn("Yes, this is Priya.", seen[0])
+        self.assertNotIn("Hello?", seen[0])
+
+    async def test_the_gate_transcript_is_bounded_to_what_the_server_accepts(self):
+        # The route (`.max(6)`) and the RPC (`invalid_turns`) both refuse more
+        # than six rows, and the conversational flow can produce seven: a
+        # repaired identity ask (line + repair + reply), a re-ask (line + reply),
+        # then the consent pair. Unbounded, the ENTIRE commit is rejected and the
+        # transcript is lost on exactly the calls that need it.
+        bad = "Hi, this is Christy, an AI voice assistant. Lovely weather."
+        alsobad = "Sorry about that. Lovely weather though."
+        h = _GateHarness(
+            replies=["No, this is Ravi.", "Actually it's Priya, sorry."],
+            verdicts=["other_person", "self"],
+            generated=[bad, alsobad],
+        )
+        await self._gate(h)
+        self.assertTrue(h.committed, "the post-consent commit did not run")
+        self.assertLessEqual(
+            len(h.committed[0]), 6,
+            f"server refuses >6 rows; sent {len(h.committed[0])}",
+        )
+        # And truncation keeps the LAST rows, which is what makes it safe: the
+        # consent evidence — the disclosure that was actually spoken — is the
+        # newest row and must never be the one dropped.
+        self.assertIn(
+            phone.PHONE_DISCLOSURE_CONTINUATION_TEXT,
+            [row["text"] for row in h.committed[0]],
+            "truncation dropped the consent disclosure",
+        )
+        # EXACTLY at the cap, not merely under it. This flow produces SEVEN
+        # rows — two repaired asks (line + repair + reply each) plus the
+        # disclosure — so `== 6` only holds because truncation ran. Asserting
+        # `<= 6` alone would pass against no truncation at all on any shorter
+        # path, which is how an untested cap looks green.
+        self.assertEqual(len(h.committed[0]), 6)
+
+    async def test_a_late_identity_utterance_never_reaches_the_consent_parser(self):
+        # THE CROSS-CONTAMINATION THE FLOW WAS BLOCKED ON, stated as a test.
+        # The candidate answers the identity question in two STT finals
+        # ("Yes, this is Priya." then "...how can I help?"). The first is
+        # consumed as the identity answer; without a drain before the
+        # disclosure, the SECOND is popped by the CONSENT classifier and read as
+        # consent to being recorded.
+        h = _GateHarness(
+            replies=["Yes, this is Priya.", "Yes, that's fine."],
+            verdicts=["self"],
+        )
+        real_next = h.next_candidate_turn
+        fired = []
+
+        async def _next_then_trailing():
+            out = await real_next()
+            if not fired:
+                fired.append(1)
+                h.queue.append("...how can I help?")
+            return out
+
+        h.next_candidate_turn = _next_then_trailing
+        await self._gate(h)
+        self.assertEqual(
+            h.consent_saw, "Yes, that's fine.",
+            f"the consent turn consumed the wrong utterance: {h.consent_saw!r}",
+        )
+
     async def test_the_consent_turn_starts_from_a_drained_buffer(self):
         h = _GateHarness(replies=["Yes, this is Priya."], verdicts=["self"])
         drains = []
         real = h.reset_turn_buffer
 
         def _counting():
-            drains.append(len(h.queue))
+            drains.append(len(h.spoken))
             real()
 
         h.reset_turn_buffer = _counting
         await self._gate(h)
-        # Once before the identity ask, once before the consent disclosure.
-        self.assertGreaterEqual(len(drains), 2)
+        # ORDERING, not a count. A drain must fall between the identity answer
+        # and the consent disclosure, which means one has to happen when at
+        # least one line has been spoken and before the disclosure is. Counting
+        # drains alone would pass on two drains in the wrong places.
+        self.assertTrue(drains, "nothing drained at all")
+        spoken_before_disclosure = h.spoken.index(
+            phone.PHONE_DISCLOSURE_CONTINUATION_TEXT)
+        self.assertTrue(
+            any(0 < d <= spoken_before_disclosure for d in drains),
+            f"no drain between the identity answer and the disclosure: {drains}",
+        )
 
 
 class TestGateSpokenLineRepair(unittest.IsolatedAsyncioTestCase):
@@ -649,6 +863,119 @@ class TestDeterministicFlowIsUntouched(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.outcome, phone.CLASSIFY_HUMAN)
 
 
+class TestGateWindowLeakVeto(unittest.IsolatedAsyncioTestCase):
+    """The `_gate_opening` branch of the REAL `llm_node`.
+
+    This branch had NO test. Both `if False:` (veto can never fire) and
+    `if True:` (veto always fires, so the gate window yields nothing on every
+    call) survived the whole repository's suite — the always-veto mutant was
+    *cleaner* than the baseline. It is the only new safety mechanism in this
+    change, and it is the same shape as the three defects that blocked the
+    previous round: a new guard on a path nothing executes.
+
+    So these drive the real `llm_node` with `set_gate_opening(True)` and assert
+    on the chunks that reach `tts_node`.
+    """
+
+    RESUME = (
+        "Senior Data Engineer at Infosys in Bengaluru with four years of "
+        "experience building Spark pipelines for retail analytics"
+    )
+
+    def _agent(self, chunks):
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+                self.chat_ctx = types.SimpleNamespace(items=[])
+
+            def llm_node(self, chat_ctx, tools, model_settings):
+                async def _gen():
+                    for c in chunks:
+                        yield c
+                return _gen()
+
+        agent = phone.phone_agent_class(BaseAgent)(
+            "You are Christy, an AI voice assistant calling from the company "
+            "about the candidate's job application.",
+            client=None, attempt_id="a1", say=None,
+            on_user_turn=lambda *a, **k: None, native_turns=True,
+        )
+        agent.set_gate_leak_control(self.RESUME)
+        agent.set_gate_opening(True)
+        return agent
+
+    async def _spoken(self, chunks):
+        agent = self._agent(chunks)
+        out = []
+        async for chunk in agent.llm_node(
+            types.SimpleNamespace(items=[]), [], None,
+        ):
+            out.append(chunk)
+        return "".join(out)
+
+    async def test_a_clean_greeting_is_spoken_in_full(self):
+        # THE FALSE-POSITIVE CASE, and the reason the veto scans the résumé
+        # facts rather than the system prompt. This greeting shares six
+        # contiguous tokens with the prompt ("an AI voice assistant calling
+        # from") because the prompt is what tells the bot to say them. Scanned
+        # against the prompt it was vetoed — silently replacing every authored
+        # line with the fixed one.
+        line = ("Hi, this is Christy, an AI voice assistant calling from the "
+                "company about your job application. Am I speaking to Priya?")
+        self.assertEqual(await self._spoken([line]), line)
+
+    async def test_a_verbatim_resume_recital_is_vetoed_before_any_audio(self):
+        leak = ("Hi there, I can see you are a Senior Data Engineer at Infosys "
+                "in Bengaluru with four years of experience. Am I speaking to "
+                "Priya?")
+        self.assertEqual(await self._spoken([leak]), "")
+
+    async def test_a_leak_in_the_TAIL_is_stopped_mid_stream(self):
+        # The lead is clean, so it releases — and A0's F1/F2 review finding was
+        # exactly that the remainder then streamed unchecked. The tail veto has
+        # to truncate, not merely decline to start.
+        chunks = [
+            "Hi, this is Christy calling about your application. ",
+            "I can see you are a Senior Data Engineer at Infosys in Bengaluru ",
+            "with four years of experience. Am I speaking to Priya?",
+        ]
+        spoken = await self._spoken(chunks)
+        self.assertTrue(spoken.startswith("Hi, this is Christy"))
+        self.assertNotIn("Infosys in Bengaluru with four years", spoken)
+
+    async def test_a_premature_goodbye_is_vetoed(self):
+        self.assertEqual(
+            await self._spoken(["Thanks for your time, and goodbye."]), "",
+        )
+
+    async def test_the_veto_holds_a_whole_window_before_releasing(self):
+        # It must not release at the first clause boundary. "Hi," is ONE word,
+        # and `phone_instruction_echo_detected` returns False below six tokens,
+        # so a veto that released there could never fire on anything at all —
+        # which is exactly what the first draft did.
+        #
+        # Asserted as the property the code guarantees rather than a byte
+        # string: the leak never reaches the candidate, and whatever IS released
+        # is at least a full detector window, so the check that let it through
+        # was a real one.
+        chunks = ["Hi, ", "I can see you are a Senior Data Engineer at Infosys ",
+                  "in Bengaluru. Am I speaking to Priya?"]
+        spoken = await self._spoken(chunks)
+        self.assertNotIn("in Bengaluru", spoken)
+        if spoken:
+            self.assertGreaterEqual(
+                len(spoken.split()), 6,
+                f"released on a sub-window segment: {spoken!r}",
+            )
+
+    async def test_a_short_reply_with_no_boundary_is_still_checked(self):
+        self.assertEqual(await self._spoken(["Goodbye"]), "")
+        self.assertEqual(await self._spoken(["Hello?"]), "Hello?")
+
+    async def test_an_empty_stream_yields_nothing_and_does_not_hang(self):
+        self.assertEqual(await self._spoken([]), "")
+
+
 class TestWordBoundaryFlush(unittest.IsolatedAsyncioTestCase):
     """The `min_chars` cap must not cut a word in half.
 
@@ -700,11 +1027,24 @@ class TestWordBoundaryFlush(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(streams)
         first = streams[0]
-        self.assertTrue(
-            first.endswith((" ", ".", ",", "!", "?")) or first == first.rstrip(),
+        # `first == first.rstrip()` was the original assertion here and it is
+        # TRUE FOR EVERY STRING that does not end in whitespace — including
+        # "Thanks for confirmin", the exact mid-word cut this test exists to
+        # catch (verified by execution). It read as a guarantee and enforced
+        # nothing. The property that actually holds: the fragment ends on a
+        # word boundary, so its last token is a whole token of the source.
+        self.assertTrue(first.strip(), first)
+        last_token = first.split()[-1].strip(".,!?;:")
+        self.assertIn(
+            last_token,
+            "Thanks for confirming that, let me ask about your experience.",
             f"fragment ended mid-token: {first!r}",
         )
-        self.assertNotIn("confirmin", first.replace("confirming", ""))
+        self.assertNotIn("confirmin ", first)
+        self.assertFalse(
+            first.rstrip().endswith("confirmin"),
+            f"cut inside 'confirming': {first!r}",
+        )
 
     async def test_no_character_is_lost_or_duplicated_across_the_join(self):
         # SPACES INCLUDED. Comparing with whitespace stripped is exactly what

@@ -423,8 +423,19 @@ PHONE_DISCLOSURE_TEXT = (
 #: notice are unchanged. Written as a plain literal, like its sibling, so the
 #: API's cross-language contract extractor can read it (f-string lines are
 #: invisible to it).
+#: It does NOT say "thanks for confirming". This line is spoken on every
+#: non-terminal identity verdict, and that includes `unclear` — the fail-open
+#: default chosen on silence, an empty reply, a timeout or any classifier
+#: error. Thanking somebody for a confirmation they never gave is the bot
+#: telling the candidate it misheard them, on the turn right before it asks for
+#: consent.
+#: The recording sentence appears VERBATIM and as its OWN sentence, exactly as
+#: it does in `PHONE_DISCLOSURE_TEXT`. A first draft opened "Just so you know,
+#: this call is recorded…", which lower-cased the "This" and silently broke the
+#: verbatim-containment guarantee the disclosure copy is pinned on. Caught by
+#: the test, not by reading it.
 PHONE_DISCLOSURE_CONTINUATION_TEXT = (
-    "Thanks for confirming. This call is recorded so the hiring team can "
+    "Quick note before we start. This call is recorded so the hiring team can "
     "review it. Is it okay to continue?"
 )
 
@@ -743,6 +754,13 @@ def gate_copy_texts() -> frozenset[str]:
     """Every fixed line the bot may speak that is not a screening turn."""
     return frozenset([
         PHONE_DISCLOSURE_TEXT,
+        # 0095. Without this the conversational flow's disclosure is not
+        # recognised as gate copy, so it reaches `latest_assistant[0]`, the
+        # conflict-arming probe and the goodbye latch as if it were a screening
+        # turn — and a polluted `latest_assistant[0]` makes the Q1 priming guard
+        # skip, binding the candidate's first answer to the disclosure text
+        # instead of Q1.
+        PHONE_DISCLOSURE_CONTINUATION_TEXT,
         PHONE_REASK_TEXT,
         PHONE_REFUSED_TEXT,
         PHONE_OPT_OUT_TEXT,
@@ -1219,7 +1237,7 @@ def phone_gate_flow() -> str:
 
 
 def phone_identity_mismatch_suppresses() -> bool:
-    """Whether a confirmed identity mismatch SUPPRESSES the number. Default NO.
+    """Whether a confirmed identity mismatch SUPPRESSES the number. Default YES.
 
     ``candidate.wrong_number`` is not a log line. It moves the engagement to
     ``wrong_number`` and, in the same transaction, writes a ``phone_suppressions``
@@ -1228,21 +1246,37 @@ def phone_identity_mismatch_suppresses() -> bool:
     application, permanently, and can only be undone by an operator running the
     0094 release RPC.
 
-    That is a proportionate response to a human operator marking a number wrong.
-    It is NOT a proportionate response to two model classifications of a noisy
-    phone call: households share numbers, a relative may answer, STT mangles
-    names, and the person who says "no, this is her father" is often standing
-    next to the candidate. So the DEFAULT is off: a confirmed mismatch
-    apologises, commits the gate transcript as the evidence, and hangs up
-    WITHOUT posting the event — the attempt simply ends with no assessment and
-    no recording, exactly like the machine/no-answer terminals.
+    It is a heavy response to two model classifications of a noisy phone call:
+    households share numbers, a relative may answer, and STT mangles names. So
+    an earlier draft defaulted this OFF and posted NO event at all — and that
+    was a worse mistake than the one it was avoiding, for a reason that is only
+    visible from the server:
 
-    Set ``PHONE_IDENTITY_MISMATCH_SUPPRESSES=true`` to restore the suppressing
-    behaviour once the classifier has a live track record. Read at the call site
-    with the literal name so the env-contract scanner sees it.
+      * the egress starts at ``call.answered``, BEFORE consent (0067's "record
+        from answer, keep only if consented"), and the ONLY thing that destroys
+        that audio is the worker posting an event in ``PURGE_BEFORE_EVENTS``;
+      * ``candidate.wrong_number`` is in that set. Posting nothing left the
+        recording of a person who was never told they were being recorded, and
+        never consented, in the bucket permanently; and
+      * it also left the engagement in ``dialing``, so the lease reaper restored
+        it and the same wrong number was dialled again — repeat-calling the
+        person the suppression exists to stop calling.
+
+    So BOTH settings now post a real event, and the choice is only which one:
+
+      * ON (default) — ``candidate.wrong_number``: purges, ends the engagement,
+        and writes the line-level suppression. An operator can undo it with the
+        0094 release RPC.
+      * OFF — ``candidate.deferred_pre_disclosure``: purges, ends the attempt
+        uncharged, no suppression, and the engagement defers to the next IST
+        day. Choose this while the classifier has no live track record, and
+        accept that a genuinely wrong number will be tried again tomorrow.
+
+    Read at the call site with the literal name so the env-contract scanner
+    sees it.
     """
-    return (os.getenv("PHONE_IDENTITY_MISMATCH_SUPPRESSES") or "").strip().lower() in (
-        "true", "1", "yes", "on",
+    return (os.getenv("PHONE_IDENTITY_MISMATCH_SUPPRESSES") or "true").strip().lower() not in (
+        "false", "0", "no", "off",
     )
 
 
@@ -3185,6 +3219,19 @@ def strip_markdown_for_speech(text: Any) -> str:
 #: bounds the pathological no-punctuation lead.
 _A0_LEADING_SEGMENT_MAX_CHARS = 48
 
+#: The server's hard bound on a gate-transcript commit, mirrored here so the
+#: worker truncates rather than having the whole commit refused. Enforced twice
+#: server-side: `phone-worker.ts` (`.max(6)`) and 0067 (`invalid_turns`).
+_GATE_TURNS_MAX = 6
+
+#: The gate-window leak veto must hold at least this many words before it can
+#: release. `phone_instruction_echo_detected` compares SIX-word windows and
+#: returns False outright when either side has fewer than six tokens, so a veto
+#: that released on the first clause boundary — which for "Hi, this is Christy,"
+#: is four words — could never fire. The check is only real once the segment is
+#: long enough for the detector to see a window.
+_GATE_LEAK_MIN_TOKENS = 6
+
 
 async def _achain(prefix_items: list[Any], rest: Any) -> Any:
     """Yield already-pulled chunks, then the untouched remainder of a stream.
@@ -4372,6 +4419,27 @@ CLASSIFY_MACHINE = "machine"
 CLASSIFY_REFUSED = "disclosure_refused"
 CLASSIFY_OPT_OUT = "opt_out"
 CLASSIFY_WRONG_NUMBER = "wrong_number"
+#: 0095. A pre-disclosure exit that ends the attempt UNCHARGED and writes NO
+#: suppression. It exists because the two new identity terminals need to end a
+#: call without either of the two things `wrong_number` does — and, critically,
+#: because ending one WITHOUT AN EVENT is not an option.
+#:
+#: The server has recorded from `call.answered` since 0067 ("record from answer,
+#: keep only if consented"), and the ONLY thing that destroys that pre-consent
+#: audio is the worker posting an event in `PURGE_BEFORE_EVENTS`
+#: (`phone-worker.ts`). A terminal that posts nothing therefore leaves the
+#: recording of somebody who was never told they were being recorded sitting in
+#: the bucket, AND leaves the engagement in `dialing` for the lease reaper to
+#: restore — so the same person is dialled again. An earlier draft of this
+#: change did exactly that while believing it was the safer option.
+#:
+#: `candidate.deferred_pre_disclosure` is in `PURGE_BEFORE_EVENTS`, is already
+#: in the worker's allowed vocabulary, and 0067 documents it as the member of
+#: its branch "that is not a hangup: the candidate answered, said call me
+#: later, and asked for it BEFORE the disclosure" — the attempt ends, nothing is
+#: charged, the engagement leaves `dialing` for `eligible` and defers to the
+#: next IST day.
+CLASSIFY_DEFERRED_PRE_DISCLOSURE = "deferred_pre_disclosure"
 
 PHONE_CLASSIFICATIONS: frozenset[str] = frozenset([
     CLASSIFY_HUMAN,
@@ -4379,6 +4447,7 @@ PHONE_CLASSIFICATIONS: frozenset[str] = frozenset([
     CLASSIFY_REFUSED,
     CLASSIFY_OPT_OUT,
     CLASSIFY_WRONG_NUMBER,
+    CLASSIFY_DEFERRED_PRE_DISCLOSURE,
 ])
 
 # Outcome → the single event that outcome posts. `classify.human` is posted
@@ -4389,6 +4458,7 @@ _OUTCOME_EVENT: dict[str, str] = {
     CLASSIFY_REFUSED: "disclosure.refused",
     CLASSIFY_OPT_OUT: "candidate.opt_out",
     CLASSIFY_WRONG_NUMBER: "candidate.wrong_number",
+    CLASSIFY_DEFERRED_PRE_DISCLOSURE: "candidate.deferred_pre_disclosure",
 }
 
 _OUTCOME_CLOSING: dict[str, str] = {
@@ -4707,6 +4777,17 @@ PHONE_IDENTITY_VERDICTS: frozenset[str] = frozenset([
     PHONE_IDENTITY_UNCLEAR,
 ])
 
+#: The verdict words as WHOLE words. The `\b` on each side is load-bearing:
+#: without it `self` matches inside himself / herself / myself / yourself /
+#: itself — see `phone_classify_identity` for the misreads that produced.
+#: Longest-first alternation so `other_person` is never clipped to a prefix.
+_IDENTITY_VERDICT_TOKEN_RE = re.compile(
+    r"\b(?:" + "|".join(
+        sorted((re.escape(v) for v in PHONE_IDENTITY_VERDICTS),
+               key=len, reverse=True)
+    ) + r")\b",
+)
+
 _IDENTITY_CLASSIFY_PROMPT = (
     "A recruiter's voice assistant called a phone number and asked: \"Am I "
     "speaking to {who}?\"\n"
@@ -4791,26 +4872,55 @@ async def phone_classify_identity(
         return PHONE_IDENTITY_UNCLEAR
     if not isinstance(raw, str):
         return PHONE_IDENTITY_UNCLEAR
-    # Take the first vocabulary word that appears. A model that answers
-    # "other_person" or "The answer is: other_person." both resolve; anything
-    # else is unreadable and falls through to `unclear`.
+    # WHOLE WORDS, AND EXACTLY ONE OF THEM.
+    #
+    # An earlier draft took the first vocabulary word `str.find` located, under
+    # a comment asserting "`self` is a substring of nothing here". That was
+    # false, and it failed UNSAFE rather than open: `self` is a substring of
+    # himself / herself / myself / yourself / itself — the exact vocabulary a
+    # model reaches for when describing who picked up a phone. Reproduced by
+    # executing this function:
+    #
+    #   "He cannot come to the phone himself, so: unavailable"  -> self
+    #   "She identified herself as the mother. other_person"    -> self
+    #   "Options: self, other_person, unavailable, unclear.
+    #    The answer is other_person"                            -> self
+    #
+    # Each of those routes a THIRD PARTY into the recording disclosure and the
+    # screening. `phone_judge_max_tokens()` defaults to 1200 and this call sets
+    # no `response_format`, so a prose answer is the expected shape.
+    #
+    # So: word-boundary matching, and a body naming two or more DIFFERENT
+    # verdicts is not an answer — it is the model reasoning aloud or echoing
+    # the option list, and the honest reading is `unclear`, which proceeds.
     lowered = raw.strip().lower()
-    verdict = PHONE_IDENTITY_UNCLEAR
-    best = len(lowered) + 1
-    for candidate in PHONE_IDENTITY_VERDICTS:
-        at = lowered.find(candidate)
-        if at >= 0 and at < best:
-            best, verdict = at, candidate
-    # `self` is a substring of nothing here, but `unclear` and `unavailable`
-    # share no prefix and `other_person` is unambiguous, so first-occurrence
-    # ordering is sufficient and there is no need to tokenize.
+    words = [m.group(0) for m in _IDENTITY_VERDICT_TOKEN_RE.finditer(lowered)]
+    if len(set(words)) != 1:
+        return PHONE_IDENTITY_UNCLEAR
+    verdict = words[0]
     if verdict != PHONE_IDENTITY_OTHER:
         return verdict
     # Property 2: the deterministic backstop. Only ever moves toward continuing,
     # and only when a name was actually EXTRACTED (see the docstring — a bare
     # "mismatch is None" test would swallow the feature).
+    # `phone_name_mismatch` returns None for "no usable RECORD name" as well
+    # as for "the names agree" — it bails out when `record_name` is not a str
+    # and when the record's first name is <= 2 characters. Without this check a
+    # missing or very short record name (candidate_name is None, "Bo", "Li")
+    # would downgrade EVERY other_person verdict to self, screening whoever
+    # answered. The backstop may only overrule the model when the record has a
+    # name to overrule it WITH.
+    record_first = ""
+    if isinstance(candidate_name, str):
+        parts = candidate_name.strip().split()
+        if parts:
+            record_first = parts[0].strip()
     introduced = phone_extract_introduced_name(reply)
-    if introduced and phone_name_mismatch(reply, candidate_name) is None:
+    if (
+        len(record_first) > 2
+        and introduced
+        and phone_name_mismatch(reply, candidate_name) is None
+    ):
         _log.info(
             "unknown_event", error_type="phone_identity_verdict",
             error_category="other_downgraded_record_name_spoken",
@@ -5032,9 +5142,26 @@ async def run_phone_gate(
             return
         if not gate_turns:
             return
+        # BOUND IT. Both the route (`phone-worker.ts`, `.max(6)`) and the RPC
+        # (0067, `v_count > 6 -> invalid_turns`) refuse more than six rows, and
+        # the conversational flow can produce seven: a repaired identity ask
+        # (line + repair + reply) then a re-ask (line + reply) then the consent
+        # pair. Unbounded, the whole commit was rejected and `_commit_gate_turns`
+        # logged `gate_turns_unconfirmed` and moved on — losing the transcript
+        # on precisely the calls whose transcript this code calls "the ONLY
+        # evidence". The LAST six are kept because a terminal is about what
+        # just happened, and on the consent path they are the disclosure and
+        # the consent reply.
+        turns = list(gate_turns)
+        if len(turns) > _GATE_TURNS_MAX:
+            _log.info(
+                "unknown_event", error_type="phone_gate_turns_truncated",
+                error_category=f"kept_last_{_GATE_TURNS_MAX}",
+            )
+            turns = turns[-_GATE_TURNS_MAX:]
         try:
             outcome = await committer(
-                session_id, list(gate_turns), f"gate:{session_id}",
+                session_id, turns, f"gate:{session_id}",
             )
         except Exception:  # noqa: BLE001
             _log.warn(
@@ -5212,7 +5339,18 @@ async def run_phone_gate(
         * NOTHING was spoken at all                       → `fixed_line`, which
           is safe precisely because no audio preceded it.
         """
-        _reset_turns()
+        # NOTE: there is deliberately NO drain here, before the question is
+        # generated. A first draft had one and it was the ONLY barrier — which
+        # did not close the window it was written for. STT is live from the
+        # moment the participant joins, the gate then spends a few hundred ms on
+        # `call.answered` and the durable-consent read, and the final for the
+        # callee's pickup "Hello?" lands during the generation and playout that
+        # follow. A drain placed here runs before all of that and misses it.
+        #
+        # The drain that matters is after playout, immediately before we wait
+        # for a reply (below). It strictly subsumes this one — mutation testing
+        # confirmed removing this line changes no observable behaviour — so it
+        # is gone rather than left as a line no test can falsify.
         spoken_line: str | None = None
         if speak_gate_line is not None:
             try:
@@ -5243,6 +5381,9 @@ async def run_phone_gate(
             await _say(fixed_line)
             gate_turns.append({"speaker": "bot", "text": fixed_line})
 
+        # THE BARRIER. Everything queued up to this instant predates the end
+        # of our question and therefore cannot be its answer.
+        _reset_turns()
         reply = ""
         try:
             reply = await next_candidate_turn()  # type: ignore[misc]
@@ -5294,13 +5435,16 @@ async def run_phone_gate(
         # The regex predecessor collapsed this into `wrong_number` — "she is not
         # available right now" hung up AND wrote a permanent line-level DNC for
         # a candidate who had simply stepped away.
-        await _commit_gate_turns()
+        # The transcript is deliberately NOT committed here. Nothing was
+        # refused and nobody was screened, so there is no decision to evidence —
+        # and the speaker may be a bystander whose words would be filed under
+        # the candidate's session labelled "candidate", which is the only
+        # speaker value the schema has besides "bot".
         await _say(PHONE_CALLBACK_DEFERRAL_TEXT)
-        _log.info(
-            "unknown_event", error_type="phone_gate_outcome",
+        return await _terminal_outcome(
+            CLASSIFY_DEFERRED_PRE_DISCLOSURE,
             schema="identity_unavailable_callback",
         )
-        return PhoneGateResult(CLASSIFY_HUMAN, events=events, spoken=spoken)
 
     if identity_verdict == PHONE_IDENTITY_OTHER:
         # The wrong person, confirmed twice by two independent judgements on two
@@ -5314,22 +5458,21 @@ async def run_phone_gate(
         # was ended, so it must outlive the call.
         await _commit_gate_turns()
         if phone_identity_mismatch_suppresses():
-            # Opt-in (see `phone_identity_mismatch_suppresses`): post
-            # `candidate.wrong_number`, which moves the engagement AND writes a
-            # permanent line-level suppression in the same transaction.
+            # DEFAULT. `candidate.wrong_number` purges the pre-consent
+            # recording, ends the engagement, and writes the line-level
+            # suppression — all in the same transaction.
             return await _terminal_outcome(
                 CLASSIFY_WRONG_NUMBER, schema="identity_mismatch_confirmed",
             )
-        # DEFAULT: apologise with the same copy, but post NO event — so nothing
-        # suppresses a number on the strength of two model classifications. The
-        # call still ends with no assessment and no recording, because the
-        # caller gates both on `assessment_allowed`, which is False here.
+        # Opt-out: the same apology, but the DEFERRAL terminal, so the recording
+        # is still purged and the attempt still ends — just without the
+        # permanent line-level suppression. NEVER silence; see
+        # `phone_identity_mismatch_suppresses` for what posting nothing costs.
         await _say(PHONE_WRONG_NUMBER_TEXT)
-        _log.info(
-            "unknown_event", error_type="phone_gate_outcome",
+        return await _terminal_outcome(
+            CLASSIFY_DEFERRED_PRE_DISCLOSURE,
             schema="identity_mismatch_confirmed_unsuppressed",
         )
-        return PhoneGateResult(CLASSIFY_WRONG_NUMBER, events=events, spoken=spoken)
 
     # The consent question is the next thing the candidate will hear, so its
     # answer window starts here — not wherever the identity answer left the
@@ -5357,7 +5500,12 @@ async def run_phone_gate(
             # a warn (`opening_unverified`). Both speak the fixed disclosure
             # exactly once; the deterministic path never speaks the model text, so
             # there is no double opener.
-            if isinstance(generated, str) and generated.strip():
+            # `None` means NOTHING was spoken — the deterministic path, a
+            # generation failure, or no seam wired. Any string means audio went
+            # out, INCLUDING the empty string, which `speak_opening` returns for
+            # "spoken but the transcript never came back".
+            heard = generated is not None
+            if heard:
                 _log.warn(
                     "unknown_event", error_type="phone_opening_fallback",
                     error_category="opening_unverified",
@@ -5367,8 +5515,20 @@ async def run_phone_gate(
                     "unknown_event", error_type="phone_opening_fallback",
                     error_category="opening_fixed",
                 )
-            await _say(_fixed_disclosure_text())
-            opening_spoken.append(_fixed_disclosure_text())
+            # WHAT WE SPEAK DEPENDS ON WHETHER ANYTHING WAS HEARD, and this is
+            # the 2026-09-09 double-opener stated as a rule. The model's
+            # greeting introduced Christy; following it with the FULL fixed
+            # disclosure introduces her again in the next breath — the exact
+            # sequence that RCA recorded. The continuation carries the same
+            # recording sentence verbatim and ends on the same consent question,
+            # so the classifier and the notice are unaffected; it just does not
+            # say hello twice.
+            fallback = (
+                PHONE_DISCLOSURE_CONTINUATION_TEXT if heard
+                else _fixed_disclosure_text()
+            )
+            await _say(fallback)
+            opening_spoken.append(fallback)
     else:
         await _say(_fixed_disclosure_text())
         opening_spoken.append(_fixed_disclosure_text())
@@ -10217,6 +10377,34 @@ def phone_agent_class(agent_base: Any) -> Any:
             # turn falls back to the discard path: the deterministic classifier
             # stays the sole consent authority.
             self._gate_opening = False
+            # Whether the CURRENT gate window actually released audio. A
+            # readback of the spoken text is NOT proof of speech: the SDK's
+            # transcript item can lag, be empty, or never arrive while the audio
+            # has already gone out. The gate needs the difference, because
+            # "nothing was spoken" may safely be followed by the full fixed
+            # opener and "spoken but unreadable" may not — that is the
+            # 2026-09-09 double-opener.
+            self._gate_stream_emitted = False
+            # The text the gate-window leak veto scans against — the RÉSUMÉ
+            # FACTS only, never the whole system prompt.
+            #
+            # An earlier draft passed `_system_instructions`, and that guard
+            # fired on CORRECT output. Verified by execution: the natural
+            # greeting "Hi, this is Christy, an AI voice assistant calling from
+            # <company> about your job application. Am I speaking to Priya?"
+            # trips `instruction_echo` against the screening prompt, because the
+            # prompt is what TELLS the bot to say those words — six contiguous
+            # shared tokens ("an AI voice assistant calling from") is all it
+            # takes. Left in, it would have silently replaced every authored
+            # gate line with the fixed one, on every call.
+            #
+            # The résumé facts are the right control text because they are the
+            # thing that must never be spoken pre-consent AND are never
+            # something the bot is supposed to say. Scope this honestly: a
+            # 6-contiguous-word test catches VERBATIM recitation, not
+            # paraphrase. It is a backstop behind the instruction, not a
+            # content filter.
+            self._gate_leak_control: str | None = None
             self._callback_proposal: CallbackProposal | None = None
             # One session-bounded semantic authorization for the next generated
             # spoken reply. It controls objective/action only; Gemini still owns
@@ -10279,6 +10467,17 @@ def phone_agent_class(agent_base: Any) -> Any:
         def set_gate_opening(self, opening: bool) -> None:
             """Toggle the gate-opening stream window (see `_gate_opening`)."""
             self._gate_opening = bool(opening)
+            if opening:
+                # Per-window, not per-call: each gate line asks its own question.
+                self._gate_stream_emitted = False
+
+        def set_gate_leak_control(self, text: Any) -> None:
+            """Set the résumé-facts text the gate leak veto scans (see field)."""
+            self._gate_leak_control = text if isinstance(text, str) and text.strip() else None
+
+        def gate_stream_emitted(self) -> bool:
+            """Did the last gate window release any audio? See the field."""
+            return bool(self._gate_stream_emitted)
 
         def authorize_screening(self) -> None:
             """Release the held consent-phase Gemini output after API grant."""
@@ -10368,48 +10567,96 @@ def phone_agent_class(agent_base: Any) -> Any:
                 # `_private_phone_control_text` treats a None objective as "keep
                 # the whole control text private", which is exactly right
                 # pre-consent.
+                async def _abandon(source: Any) -> None:
+                    """Close the provider stream we are walking away from."""
+                    closer = getattr(source, "aclose", None)
+                    if not callable(closer):
+                        return
+                    try:
+                        await closer()
+                    except Exception:  # noqa: BLE001
+                        pass
+
                 held: list[Any] = []
                 parts: list[str] = []
                 released = False
+                streamed = ""
                 async for chunk in result:
                     if released:
+                        # THE TAIL IS CHECKED TOO, incrementally, exactly as the
+                        # A0 screening path checks it. Releasing the lead and
+                        # then streaming the remainder unchecked was the F1/F2
+                        # review finding on A0, and this branch had reproduced
+                        # it — which would have left a PRE-consent turn, spoken
+                        # to an unidentified person, with weaker enforcement
+                        # than a post-consent turn spoken to a consenting one.
+                        streamed += _chunk_text(chunk)
+                        veto = phone_streamed_tail_hard_veto(
+                            streamed, None,
+                            control_text=self._gate_leak_control,
+                        )
+                        if veto is not None:
+                            _log.warn(
+                                "unknown_event", error_type="phone_gate_opening",
+                                error_category=f"tail_vetoed_{veto}",
+                            )
+                            await _abandon(result)
+                            return
                         yield chunk
                         continue
                     held.append(chunk)
                     parts.append(_chunk_text(chunk))
                     segment = "".join(parts).strip()
-                    if not any(ch.isalpha() for ch in segment):
+                    # HOLD FOR A WHOLE WINDOW, not a whole clause. An earlier
+                    # draft released at the first clause boundary, which for
+                    # every natural opener is "Hi," — one word. The echo
+                    # detector compares SIX-word windows and returns False
+                    # outright below six tokens, so that veto could not fire and
+                    # the rest of the line (the part that would carry a résumé
+                    # recital) streamed unchecked. Verified by simulation: a
+                    # line reciting the candidate's employer and title released
+                    # at "Hi," while the same predicate over the whole line
+                    # returned instruction_echo.
+                    if len(_COVERAGE_TOKEN_RE.findall(segment)) < _GATE_LEAK_MIN_TOKENS:
                         continue
                     if not segment.endswith(
                         (".", "!", "?", ",", ";", ":", "—", "–", "…")
                     ) and len(segment) < _A0_LEADING_SEGMENT_MAX_CHARS:
                         continue
                     if not phone_streamed_leading_segment_safe(
-                        segment, None, control_text=self._system_instructions,
+                        segment, None, control_text=self._gate_leak_control,
                     ):
                         _log.warn(
                             "unknown_event", error_type="phone_gate_opening",
                             error_category="leading_segment_vetoed",
                         )
+                        await _abandon(result)
                         return
                     released = True
+                    streamed = "".join(parts)
+                    self._gate_stream_emitted = True
                     for pending in held:
                         yield pending
                     held.clear()
                 if not released:
-                    # The whole reply ended before any boundary or the cap, so
-                    # the per-segment check never ran. Validate what there is.
+                    # The whole reply ended before it reached a full window, so
+                    # the per-segment check never ran. Validate what there is —
+                    # a reply this short cannot contain a six-word echo, but it
+                    # can still be a premature goodbye.
                     tail = "".join(parts).strip()
                     if any(ch.isalpha() for ch in tail) and not (
                         phone_streamed_leading_segment_safe(
-                            tail, None, control_text=self._system_instructions,
+                            tail, None, control_text=self._gate_leak_control,
                         )
                     ):
                         _log.warn(
                             "unknown_event", error_type="phone_gate_opening",
                             error_category="short_reply_vetoed",
                         )
+                        await _abandon(result)
                         return
+                    if any(ch.isalpha() for ch in tail):
+                        self._gate_stream_emitted = True
                     for pending in held:
                         yield pending
                 return
