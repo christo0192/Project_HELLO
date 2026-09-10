@@ -9372,10 +9372,12 @@ begin
   values (v_eng, '2026-09-10T21:30:00Z', '2026-09-10T22:00:00Z',   -- 03:00–03:30 IST 09-11
           date '2026-09-11', 'scheduled', 'hr_manual')
   returning id into v_apt;
+  -- The second legacy slot sits a day LATER (03:00 IST 09-12), so the expiry
+  -- sweep at v_t (10:30 IST 09-11) must leave it alone and HR can cancel it.
   insert into screening_v2.phone_appointments
     (engagement_id, starts_at, ends_at, ist_date, status, source)
-  values (v_eng2, '2026-09-10T22:00:00Z', '2026-09-10T22:30:00Z',  -- 03:30–04:00 IST 09-11
-          date '2026-09-11', 'scheduled', 'hr_manual')
+  values (v_eng2, '2026-09-11T21:30:00Z', '2026-09-11T22:00:00Z',  -- 03:00–03:30 IST 09-12
+          date '2026-09-12', 'scheduled', 'hr_manual')
   returning id into v_apt2;
   alter table screening_v2.phone_appointments enable trigger trg_phone_appointment_window;
 
@@ -9418,6 +9420,10 @@ begin
     v_res->>'status' = 'ok' and v_status = 'missed' and v_state = 'eligible',
     'res=' || coalesce(v_res::text, '<null>') || ' status=' || coalesce(v_status, '<null>')
       || ' state=' || coalesce(v_state, '<null>'));
+  select status into v_status from screening_v2.phone_appointments where id = v_apt2;
+  perform _policy_tests.assert(
+    '0092: the sweep did not touch the legacy slot that is not yet due',
+    v_status = 'scheduled', 'status=' || coalesce(v_status, '<null>'));
 
   -- HR can still cancel the other one.
   v_res := screening_v2.cancel_phone_appointment(v_apt2, 'hr_cancelled',
@@ -9436,6 +9442,9 @@ begin
        where status in ('scheduled', 'confirmed')
          and not screening_v2.phone_ist_window_open(starts_at)),
     'the 0092 repair block missed a row, or a writer can still book after hours');
+
+  perform _policy_tests.phone_teardown('pol92-legacy-a');
+  perform _policy_tests.phone_teardown('pol92-legacy-b');
 end;
 $$;
 
