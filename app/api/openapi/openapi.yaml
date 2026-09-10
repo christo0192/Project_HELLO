@@ -6394,7 +6394,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneApiError'
         '409':
-          description: phone_absent when the candidate row carries no usable number, or invalid_reason / invalid_source.
+          description: phone_absent when the candidate row carries no usable number, or suppression_lost when a concurrent release won the race. invalid_reason / invalid_source are NOT reachable here — the request body is validated against the same closed vocabularies first and a bad value is a 400.
           content:
             application/json:
               schema:
@@ -6456,7 +6456,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneApiError'
         '409':
-          description: not_suppressed — there was nothing to lift; or phone_absent.
+          description: not_suppressed — there was nothing to lift; suppressed_by_other_candidate — the line is suppressed by a different candidate's record and the promise is not this caller's to lift; or phone_absent.
           content:
             application/json:
               schema:
@@ -11069,7 +11069,7 @@ components:
 
     PhoneSuppressionStateResponse:
       type: object
-      required: [ok, candidate_id, suppressed, reason, source, created_at]
+      required: [ok, candidate_id, suppressed, owned, reason, source, created_at]
       properties:
         ok:
           type: boolean
@@ -11077,6 +11077,9 @@ components:
           type: string
           format: uuid
         suppressed:
+          type: boolean
+        owned:
+          description: Whether the promise sits on THIS candidate's record or on another sharing the line. Both mean do-not-dial, but only an owned one can be released here.
           type: boolean
         reason:
           type: string
@@ -11091,7 +11094,7 @@ components:
 
     PhoneSuppressionCreateResponse:
       type: object
-      required: [ok, candidate_id, suppressed, already_suppressed]
+      required: [ok, candidate_id, suppressed, already_suppressed, dials_stopped]
       properties:
         ok:
           type: boolean
@@ -11103,11 +11106,14 @@ components:
         already_suppressed:
           description: True when the line was already on the list. The original reason, source and actor are preserved.
           type: boolean
+        dials_stopped:
+          description: Queued phone.dial jobs this suppression stopped. A job already executing on a worker cannot be reached and is not counted.
+          type: integer
       additionalProperties: false
 
     PhoneSuppressionDeleteResponse:
       type: object
-      required: [ok, candidate_id, suppressed, released]
+      required: [ok, candidate_id, suppressed, released, released_reason, released_source]
       properties:
         ok:
           type: boolean
@@ -11118,6 +11124,13 @@ components:
           type: boolean
         released:
           type: integer
+        released_reason:
+          description: What was lifted. A bare count could not tell a candidate's own opt-out from an operator's note.
+          type: string
+          nullable: true
+        released_source:
+          type: string
+          nullable: true
       additionalProperties: false
 
     PhoneHealthWindow:

@@ -76,10 +76,30 @@ Two things ship with the flag and are what make it safe:
   instead of by hand. `phone_max_concurrent()` bounds *simultaneity* — ten at a
   time, all day, is thousands of calls. Raising the cap is a migration, on
   purpose: a bound any operator can raise in a hurry is not a bound.
-* **The suppression write path** (`POST/DELETE /api/phone/suppressions/{candidateId}`).
-  `phone_suppressions` had been read by admission since 0042 and written by
-  nothing. Under `pipeline` it is the only "never call this person" mechanism
-  there is.
+* **The suppression write path** (`GET/POST/DELETE /api/phone/suppressions/{candidateId}`).
+  `phone_suppressions` has been read by admission since 0042 and has had exactly
+  one writer in all that time: `apply_phone_event`, which records a
+  `candidate_opt_out` / `wrong_number` row when somebody says "don't call me"
+  **during a call**. There has never been an operator path, and no way to lift a
+  row once written. Under `pipeline` this is the only "never call this person"
+  mechanism there is.
+
+  Three things about it are worth knowing before you use it:
+
+  * **It is keyed on the line, not the row.** Two candidates sharing a household
+    or reassigned number resolve to one suppression. `GET` reports `owned: false`
+    when the promise belongs to the other record, and `DELETE` refuses it with
+    `suppressed_by_other_candidate` — a release cannot reach across and destroy
+    somebody else's opt-out.
+  * **Suppressing also stops a dial already queued.** Admission checks
+    suppression at claim time and the dialer does not re-check, so an attempt
+    admitted moments earlier would otherwise still ring. The response's
+    `dials_stopped` says how many were stopped; a call already connected cannot
+    be reached and is not counted.
+  * **It survives a number correction.** `verify_candidate_phone` rewrites
+    `candidates.phone_e164` with no suppression check, so admission checks the
+    **candidate** as well as the digest. Without that, fixing a typo would undo
+    an opt-out.
 
 **To cut over:** `fly secrets set PHONE_DIAL_SCOPE=pipeline --app project-hello-api`,
 wait for the roll, confirm `dialScope: "pipeline"` on `GET /api/phone/health`.

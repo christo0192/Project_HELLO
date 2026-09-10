@@ -470,6 +470,11 @@ export const SUPPRESS_CANDIDATE_PHONE_STATUSES = [
   'invalid_reason',
   'invalid_source',
   'phone_absent',
+  // Lost a race with a concurrent release: the insert conflicted, and the
+  // re-read found nothing. Reported rather than smoothed into `ok`, because a
+  // do-not-call write path that says "recorded" about a row that does not
+  // exist is the worst answer it can give.
+  'suppression_lost',
 ] as const;
 
 export type SuppressCandidatePhoneStatus = (typeof SUPPRESS_CANDIDATE_PHONE_STATUSES)[number];
@@ -486,6 +491,11 @@ export const RELEASE_CANDIDATE_PHONE_SUPPRESSION_STATUSES = [
   'candidate_not_found',
   'not_suppressed',
   'phone_absent',
+  // The line is suppressed, but by a DIFFERENT candidate's record — a shared
+  // household or reassigned number. Distinct from `not_suppressed` on purpose:
+  // folding them would tell an operator the line is free when it is not, in
+  // the direction that causes calls. The promise is not this caller's to lift.
+  'suppressed_by_other_candidate',
 ] as const;
 
 export type ReleaseCandidatePhoneSuppressionStatus =
@@ -832,15 +842,25 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
  * Finding B per-key outcome column).
  */
 /*
- * 0094 takes it from 109 to 112 — THREE new members across four new refusals:
- * `fleet_daily_cap_reached` (admit), `invalid_source` (suppress) and
- * `not_suppressed` (release). The fourth, `phone_absent`, was already in the
- * union, as were `ok`, `invalid_reason` (from `set_phone_halt`) and
- * `candidate_not_found` — which is why three new RPCs move the count by three
- * rather than by the seven statuses they name. The exact number is RE-DERIVED
- * by the drift test from the migration text; this constant is only a tripwire.
+ * 0094 takes it from 109 to 114 — FIVE new members:
+ *   * `fleet_daily_cap_reached` (admit_phone_attempt)
+ *   * `phone_absent`            (suppress + release)
+ *   * `not_suppressed`          (release)
+ *   * `suppression_lost`        (suppress — lost a race with a release)
+ *   * `suppressed_by_other_candidate` (release — a shared line's promise)
+ * The other four statuses the new RPCs name were ALREADY in the union and add
+ * nothing: `ok` everywhere, `candidate_not_found` (request_phone_rescreen),
+ * `invalid_reason` (set_phone_halt / cancel_phone_appointment) and
+ * `invalid_source` (apply_phone_event, schedule_phone_appointment,
+ * request_phone_rescreen). That is why three new doors move the count by
+ * five rather than by the nine statuses they declare.
+ *
+ * The exact number is RE-DERIVED by the drift test from the migration text;
+ * this constant is only a tripwire. Do not reason from this comment alone —
+ * an earlier draft of it had `invalid_source` and `phone_absent` the wrong way
+ * round, and the total was still right because the two errors cancelled.
  */
-export const PHONE_RPC_STATUS_COUNT = 112;
+export const PHONE_RPC_STATUS_COUNT = 114;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.

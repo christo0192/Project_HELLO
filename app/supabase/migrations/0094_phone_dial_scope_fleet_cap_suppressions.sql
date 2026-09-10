@@ -24,15 +24,26 @@
 --       `admit_phone_attempt`. The allowlist's real value was bounding blast
 --       radius; this bounds it by volume instead of by hand.
 --    2. `suppress_candidate_phone` / `release_candidate_phone_suppression`.
---       `phone_suppressions` has been read by the grantor since 0042 and had
---       NO write path anywhere in the API — zero rows, no route, no RPC. While
---       the allowlist was the gate that hardly mattered; the moment it is not,
---       suppression is the only "never call this number" mechanism there is.
+--       `phone_suppressions` has been read by the grantor since 0042 and has
+--       had exactly ONE writer in all that time: `apply_phone_event`, which
+--       records a `candidate_opt_out` / `wrong_number` row when somebody says
+--       "don't call me" DURING a call (latest body 0067:699). There has never
+--       been an OPERATOR path — no route, no RPC, nothing a recruiter could
+--       use, and no way to lift a row once written. While the allowlist stood
+--       that hardly mattered, because an unlisted number could not be dialled
+--       either way. The moment it does not, suppression is the only "never
+--       call this person" mechanism there is.
+--
+--       Those existing candidate-authored rows are also why the RELEASE path
+--       below carries an ownership predicate. A release keyed on the digest
+--       alone would let an admin acting on one candidate destroy a different
+--       candidate's spoken opt-out on a shared line.
 --    3. `phone_suppression_state`, so an operator surface can show it.
 --
 --  FORWARD-ONLY. `admit_phone_attempt` is replaced wholesale (copied verbatim
---  from 0083 with one block added) because Postgres has no way to patch a
---  function body. The ONLY behavioural change is the new cap.
+--  from 0083 with two blocks added) because Postgres has no way to patch a
+--  function body. The behavioural changes are the new fleet cap and the
+--  candidate-scoped half of the suppression check.
 --
 --  NO ENV KNOB. The cap is a SQL helper exactly like `phone_max_concurrent()`,
 --  and for the same reason `phone-screening/config.ts` gives: this lane has
@@ -48,6 +59,15 @@
 --  argument-free, mirroring `phone_max_concurrent()`; raising it is a
 --  migration, which is the point — a blast-radius bound that any operator can
 --  raise in a hurry is not a bound.
+--  Declared and GRANTED exactly as `phone_max_concurrent()` is: `language sql
+--  immutable`, revoked from public/anon/authenticated, granted only to
+--  service_role. It is not SECURITY DEFINER, and like the six sibling constants
+--  it is named in the `not_definer` exemption list in policy_tests.sql — a
+--  function that reads nothing has nothing to define security over.
+--
+--  An earlier draft granted execute to `authenticated`, which tripped the
+--  `browser_executable` posture sweep. Nothing in app/api or app/web calls this
+--  function, so that grant had no consumer and was pure posture regression.
 create or replace function screening_v2.phone_max_daily_dials()
 returns integer
 language sql
@@ -58,11 +78,12 @@ as $$ select 50 $$;
 comment on function screening_v2.phone_max_daily_dials() is
   'Fleet-wide cold-dial ceiling per IST day. Enforced ONLY inside '
   'admit_phone_attempt, under the phone_admission advisory lock. Excludes '
-  'reconnect (already-charged budget) and infra-deferred abandonments.';
+  'reconnect (already-charged budget) and infra-deferred abandonments. '
+  'scheduled dials are COUNTED but never refused.';
 
-revoke all on function screening_v2.phone_max_daily_dials() from public, anon;
-grant execute on function screening_v2.phone_max_daily_dials()
-  to authenticated, service_role;
+revoke all on function screening_v2.phone_max_daily_dials()
+  from public, anon, authenticated;
+grant execute on function screening_v2.phone_max_daily_dials() to service_role;
 
 -- ── 2. `admit_phone_attempt`, verbatim from 0083 + the fleet daily cap ──────
 create or replace function screening_v2.admit_phone_attempt(
@@ -260,8 +281,30 @@ begin
   end if;
 
   v_digest := screening_v2.sha256_hex(v_phone);
+  -- ── 0094: SUPPRESSION IS CHECKED ON THE LINE **AND** ON THE PERSON ──
+  -- The digest half is 0042's and is unchanged: it is what makes a
+  -- do-not-call promise survive the person applying to a second role, and
+  -- what covers a household or reassigned line.
+  --
+  -- The `candidate_id` half is new, and it closes a hole that the retiring
+  -- allowlist was incidentally covering. `phone_suppressions` keys on the
+  -- digest of the number AT THE TIME THE PROMISE WAS MADE, while
+  -- `verify_candidate_phone` (0057) rewrites `candidates.phone_e164` for an
+  -- arbitrary candidate with no suppression check at all. So: candidate opts
+  -- out in-call, HR later corrects a typo in the number, the new digest
+  -- matches nothing, and the person who said "never call me" is dialable
+  -- again. Under `allowlist` that could not happen automatically, because the
+  -- corrected number ALSO had to be hand-pasted into PHONE_DIAL_ALLOWLIST
+  -- before anything could dial it, and a human was in that loop.
+  -- `PHONE_DIAL_SCOPE=pipeline` removes the human, so the check has to be
+  -- here instead.
+  --
+  -- The two halves are an OR, deliberately: either the line is suppressed or
+  -- this person is, and both refuse. A row whose `candidate_id` was NULLed by
+  -- the FK's ON DELETE SET NULL still refuses on the digest half.
   if exists (select 1 from screening_v2.phone_suppressions
-              where phone_sha256 = v_digest) then
+              where phone_sha256 = v_digest
+                 or candidate_id = v_eng.candidate_id) then
     return jsonb_build_object('status', 'suppressed');
   end if;
 
@@ -408,20 +451,6 @@ begin
                               'ist_date', v_ist_date);
   end if;
 
-  -- ── The fleet cap: a DB-derived count, never a stored counter ──────
-  -- Counted under the advisory lock, over live states holding an
-  -- UNEXPIRED lease. A lease that is not actively renewed by P5's
-  -- heartbeat expires and frees its slot; that is a stated dependency,
-  -- not a hidden one.
-  select count(*) into v_live
-    from screening_v2.phone_call_attempts
-   where state in ('admitted','ringing','answered_unclassified','human','machine')
-     and lease_expires_at > p_now;
-  if v_live >= v_max_concurrent then
-    return jsonb_build_object('status', 'at_capacity', 'live', v_live,
-                              'max_concurrent', v_max_concurrent);
-  end if;
-
   -- ── 0094: THE FLEET DAILY CAP ──────────────────────────────────────
   -- The blast-radius control that lets `PHONE_DIAL_SCOPE=pipeline` retire
   -- the per-number allowlist. Until now the only thing bounding how many
@@ -438,24 +467,57 @@ begin
   -- `pg_advisory_xact_lock(hashtext('phone_admission'))`, count-then-refuse
   -- is atomic by construction.
   --
-  -- COUNTED, NEVER STORED. Same shape as the concurrency cap directly above:
-  -- derived from `phone_call_attempts` at decision time, so there is no
-  -- counter to drift, to reset at IST midnight, or to leave wrong after a
-  -- manual row change.
+  -- COUNTED, NEVER STORED. Derived from `phone_call_attempts` at decision
+  -- time, so there is no counter to drift, to reset at IST midnight, or to
+  -- leave wrong after a manual row change.
   --
-  -- `reconnect` is EXCLUDED, and the exclusion is load-bearing rather than
-  -- cosmetic. A reconnect redeems a budget already charged at the grant
-  -- (apply_phone_event #19); refusing it would strand the engagement in
-  -- `reconnecting` with no edge out — the cap would be enforced by wedging
-  -- rows rather than by declining calls. This is the same reasoning the
-  -- no-answer budget above states for itself.
+  -- ── WHY THIS SITS BEFORE THE CONCURRENCY CAP ───────────────────────
+  -- Both refusals can be true at once, and the caller is told only the first.
+  -- `at_capacity` clears BY ITSELF as live calls end; `fleet_daily_cap_reached`
+  -- clears at IST midnight and not before. Reporting the self-clearing one
+  -- first sends an operator to wait for calls to finish that will not help —
+  -- the precise misreport `rpc-contract.ts` promises this status will not
+  -- make. The one that clears LAST is the one that must be reported.
+  --
+  -- ── `reconnect` IS EXCLUDED ────────────────────────────────────────
+  -- Load-bearing rather than cosmetic. A reconnect redeems a budget already
+  -- charged at the grant (apply_phone_event #19); refusing it would strand
+  -- the engagement in `reconnecting` with no edge out — the cap would be
+  -- enforced by wedging rows rather than by declining calls. Same reasoning
+  -- the no-answer budget above states for itself.
+  --
+  -- ── `scheduled` IS COUNTED BUT NEVER REFUSED ───────────────────────
+  -- This is the distinction Guard B above spends a paragraph on, and an
+  -- earlier draft of this block got it wrong in the direction that breaks a
+  -- promise. A scheduled dial is NOT a cold call: it is a slot the candidate
+  -- or HR booked, and `schedule_phone_appointment` sources it `hr_manual` or
+  -- `candidate_voice`. Refusing it means the candidate agreed to a time,
+  -- nobody rang, and the appointment sat `scheduled` until the expiry sweep
+  -- marked it `missed` — with the only signal a counter on a health page,
+  -- which is the exact failure shape this whole migration exists to end.
+  --
+  -- It is still COUNTED, because it is a real billable call and the ceiling
+  -- is about spend and blast radius. So a day full of booked slots can push
+  -- the count past the ceiling and stop COLD calls, which is right: the
+  -- people who asked to be called still are, and the people who did not are
+  -- not rung by a runaway.
   --
   -- The infra-defer narrowing matches the per-engagement and per-candidate
   -- daily pre-checks and the 0083 index predicate exactly: a pool hiccup
   -- that placed no call must not spend the fleet's day. Reclaim rows carry
   -- a NULL `abandon_reason` and IS DISTINCT FROM keeps them counted, because
   -- those calls did reach somebody.
-  if p_kind in ('initial','no_answer_retry','scheduled') then
+  --
+  -- THE DAY KEY IS `p_now`, not the machine clock, exactly like every other
+  -- guard in this function. That is a deliberate, structurally-enforced
+  -- property (`phone-screening-rpc-contract.test.ts` asserts no RPC body
+  -- reads the clock), and it means the ceiling is only as strong as the
+  -- caller's clock: a caller supplying a date inside the IST window gets that
+  -- date's budget. Production has exactly one caller and it passes the real
+  -- instant. Anything that backfills or replays MUST pass the true `p_now`,
+  -- or it will both mint a fresh budget and write a wrong `ist_date` into the
+  -- per-IST-day uniqueness index.
+  if p_kind in ('initial','no_answer_retry') then
     select count(*) into v_day_dials
       from screening_v2.phone_call_attempts
      where ist_date = v_ist_date
@@ -468,6 +530,20 @@ begin
                                 'dials_today', v_day_dials,
                                 'max_daily', v_max_daily);
     end if;
+  end if;
+
+  -- ── The fleet cap: a DB-derived count, never a stored counter ──────
+  -- Counted under the advisory lock, over live states holding an
+  -- UNEXPIRED lease. A lease that is not actively renewed by P5's
+  -- heartbeat expires and frees its slot; that is a stated dependency,
+  -- not a hidden one.
+  select count(*) into v_live
+    from screening_v2.phone_call_attempts
+   where state in ('admitted','ringing','answered_unclassified','human','machine')
+     and lease_expires_at > p_now;
+  if v_live >= v_max_concurrent then
+    return jsonb_build_object('status', 'at_capacity', 'live', v_live,
+                              'max_concurrent', v_max_concurrent);
   end if;
 
   -- ── Everything below is one transaction: attempt + lease + job ─────
@@ -693,6 +769,7 @@ declare
   v_digest  text;
   v_id      uuid;
   v_existed boolean := false;
+  v_stopped integer := 0;
 begin
   -- Closed vocabularies, checked here so the caller gets a named refusal
   -- instead of a constraint-violation exception. These mirror
@@ -744,13 +821,57 @@ begin
     if v_id is null then
       -- Lost a race with a concurrent suppression. The outcome the caller
       -- asked for is nonetheless true, so report it as already-suppressed
-      -- rather than as an error.
+      -- rather than as an error — BUT ONLY IF IT REALLY IS TRUE. An earlier
+      -- draft set `v_existed := true` unconditionally here, so a racer that
+      -- aborted, or a release landing between the insert and this re-read,
+      -- produced `{"status":"ok","already_suppressed":true}` with no row
+      -- anywhere. A do-not-call write path must fail CLOSED: reporting a
+      -- promise that was never recorded is the worst answer this function
+      -- can give.
       select id into v_id
         from screening_v2.phone_suppressions
        where phone_sha256 = v_digest;
+      if not found then
+        return jsonb_build_object('status', 'suppression_lost');
+      end if;
       v_existed := true;
     end if;
   end if;
+
+  -- ── STOP ANY DIAL ALREADY IN FLIGHT FOR THIS PERSON ────────────────
+  -- Recording the promise is not keeping it. `admit_phone_attempt` checks
+  -- suppression at ADMISSION, and `dial.ts` deliberately does not re-check it
+  -- downstream, so an attempt admitted a moment ago still has a claimable
+  -- `phone.dial` job and the phone rings anyway. An operator who was told
+  -- "ok" while the call connects has been failed as completely as one who
+  -- was told nothing.
+  --
+  -- Only `pending`/`delayed` jobs are stopped — a job already `active` is
+  -- being executed by a worker this transaction cannot reach, and rewriting
+  -- its row would race the runner. That residue is bounded by one dial and is
+  -- reported honestly in `dials_stopped` rather than papered over.
+  --
+  -- `failed` rather than a new `cancelled` member: `chk_job_queue_status` is a
+  -- closed five-member vocabulary and widening a queue-wide CHECK to describe
+  -- one caller's intent is a bigger change than this migration should make.
+  -- `failed` is terminal, the runner does not claim it, and `error_message`
+  -- carries the reason — so the row says truthfully that the dial did not and
+  -- will not happen. `attempts` is pinned to `max_attempts` so no retry path
+  -- can resurrect it.
+  update screening_v2.job_queue j
+     set status        = 'failed',
+         failed_at     = p_now,
+         attempts      = j.max_attempts,
+         error_message = 'phone_suppressed'
+   where j.name = 'phone.dial'
+     and j.status in ('pending','delayed')
+     and exists (
+       select 1
+         from screening_v2.phone_call_attempts a
+         join screening_v2.phone_engagements e on e.id = a.engagement_id
+        where e.candidate_id = p_candidate_id
+          and j.dedup_key = 'phone.dial:' || a.id::text);
+  get diagnostics v_stopped = row_count;
 
   -- No number, no digest. An audit row that carried the digest would put a
   -- per-person identifier into a table read far more widely than
@@ -762,10 +883,12 @@ begin
      'recruiter', 'phone_suppression_added', 'candidate',
      p_candidate_id::text, 'success',
      jsonb_build_object('reason', p_reason, 'source', p_source,
-                        'already_suppressed', v_existed));
+                        'already_suppressed', v_existed,
+                        'dials_stopped', v_stopped));
 
   return jsonb_build_object('status', 'ok',
-                            'already_suppressed', v_existed);
+                            'already_suppressed', v_existed,
+                            'dials_stopped', v_stopped);
 end;
 $$;
 
@@ -788,6 +911,9 @@ declare
   v_phone   text;
   v_digest  text;
   v_deleted integer;
+  v_reason  text;
+  v_source  text;
+  v_created timestamptz;
 begin
   select phone_e164 into v_phone
     from screening_v2.candidates
@@ -801,27 +927,81 @@ begin
 
   v_digest := screening_v2.sha256_hex(v_phone);
 
+  -- ── THE OWNERSHIP PREDICATE IS LOAD-BEARING ────────────────────────
+  -- `uq_phone_suppressions_phone` is on the DIGEST, so one row can cover
+  -- several candidate records that share a line — a household phone, a
+  -- reassigned number, a duplicate application. That is correct for the ADD
+  -- direction and is why 0042 keys it that way.
+  --
+  -- It is catastrophic for the DELETE direction without this predicate. An
+  -- earlier draft deleted on the digest alone, so an admin lifting candidate
+  -- B's suppression destroyed candidate A's row — and A's row is very often
+  -- the one that matters, because `apply_phone_event` has written
+  -- `reason='candidate_opt_out', source='candidate'` there since 0042 every
+  -- time somebody says "don't call me" DURING a call. The audit row named B,
+  -- the deleted row's reason and owner were unreconstructable, and under
+  -- `PHONE_DIAL_SCOPE=pipeline` A became dialable again.
+  --
+  -- So a release may only lift a promise this candidate's own record carries.
+  -- Anything else is refused by name, below, rather than silently widened.
+  --
+  -- ── AND IT IS KEYED ON THE PERSON, NOT ON TODAY'S DIGEST ───────────
+  -- A first attempt at this predicate matched `phone_sha256 = v_digest AND
+  -- candidate_id = p_candidate_id`, which looks right and strands people:
+  -- `verify_candidate_phone` rewrites `candidates.phone_e164`, so after a
+  -- corrected typo the stored row's digest no longer matches the candidate's
+  -- current number and the release answered `not_suppressed` for ever. The
+  -- candidate stayed (correctly) undialable via the candidate_id half of
+  -- admission's check, with no operator path to lift it — a dead end this
+  -- suite caught as assertion E4.
+  --
+  -- `candidate_id` is therefore the key. The orphan arm covers a row whose
+  -- owner was deleted (the FK is ON DELETE SET NULL): nobody owns it, so the
+  -- candidate whose line it currently blocks may lift it.
+  --
+  -- RETURNING INTO takes the first row when several match — a candidate whose
+  -- number changed twice can own two rows. That is fine for the audit's
+  -- purpose (`released` carries the true count) and no STRICT is wanted here,
+  -- because more than one row is a legitimate outcome rather than an error.
   delete from screening_v2.phone_suppressions
-   where phone_sha256 = v_digest;
+   where candidate_id = p_candidate_id
+      or (phone_sha256 = v_digest and candidate_id is null)
+  returning reason, source, created_at
+      into v_reason, v_source, v_created;
   get diagnostics v_deleted = row_count;
 
   if v_deleted = 0 then
+    -- DISTINGUISH "nothing to lift" from "somebody else's promise". Folding
+    -- the second into `not_suppressed` would tell an operator the line is
+    -- free when it is not, in the direction that causes calls.
+    if exists (select 1 from screening_v2.phone_suppressions
+                where phone_sha256 = v_digest) then
+      return jsonb_build_object('status', 'suppressed_by_other_candidate');
+    end if;
     return jsonb_build_object('status', 'not_suppressed');
   end if;
 
   -- A release is the direction that can cause a call, so it is audited even
-  -- though the add already is. `p_now` is accepted for signature parity with
-  -- every other operator RPC in this lane and is not otherwise read; the audit
-  -- row's own `created_at` default is the authority on when this happened.
+  -- though the add already is — and it records WHAT was lifted. A hard DELETE
+  -- with a bare `{"released": 1}` left no way to reconstruct whether the
+  -- promise had been a candidate's own opt-out or an operator's note. Reason
+  -- and source are closed vocabularies, not identifiers; the digest is still
+  -- never written here. `p_now` is stamped for parity with every other
+  -- operator RPC in this lane.
   insert into screening_v2.audit_events
     (actor_id, actor_type, action, target_type, target_id, result, metadata)
   values
     (coalesce(p_actor_id, '00000000-0000-4000-8000-000000000001'::uuid),
      'recruiter', 'phone_suppression_released', 'candidate',
      p_candidate_id::text, 'success',
-     jsonb_build_object('released', v_deleted, 'at', p_now));
+     jsonb_build_object('released', v_deleted, 'at', p_now,
+                        'released_reason', v_reason,
+                        'released_source', v_source,
+                        'suppressed_at', v_created));
 
-  return jsonb_build_object('status', 'ok', 'released', v_deleted);
+  return jsonb_build_object('status', 'ok', 'released', v_deleted,
+                            'released_reason', v_reason,
+                            'released_source', v_source);
 end;
 $$;
 
@@ -865,7 +1045,13 @@ begin
     return jsonb_build_object('status', 'ok', 'suppressed', false);
   end if;
 
+  -- `owned` says whether the promise is on THIS candidate's record or on
+  -- another one sharing the line. Both mean "do not dial", so `suppressed`
+  -- is true either way — but only an owned promise can be lifted here, and an
+  -- operator who cannot see the difference will try to lift one that is not
+  -- theirs and be refused by a status they have no way to anticipate.
   return jsonb_build_object('status', 'ok', 'suppressed', true,
+                            'owned', v_row.candidate_id is not distinct from p_candidate_id,
                             'reason', v_row.reason,
                             'source', v_row.source,
                             'created_at', v_row.created_at);
@@ -875,3 +1061,31 @@ $$;
 revoke all on function screening_v2.phone_suppression_state(uuid)
   from public, anon, authenticated;
 grant execute on function screening_v2.phone_suppression_state(uuid) to service_role;
+
+-- ── 6. The index the fleet cap counts on ────────────────────────────────────
+--  Without this the cap's `count(*)` seq-scans EVERY attempt ever recorded, on
+--  every admission, while holding `pg_advisory_xact_lock('phone_admission')` —
+--  the global serialiser. Measured on a rehearsal database: 4 rows → Index Only
+--  Scan, 2 buffers, 0.3 ms; 96k rows → Seq Scan, 1,574 buffers, 31.8 ms, with
+--  95,996 rows removed by filter. The cost is O(all attempts ever) rather than
+--  O(today's), it is paid inside the lock so it throttles the whole fleet, and
+--  it degrades linearly and invisibly. 0083 added an index when it added its
+--  pre-checks; this migration owes one for the same reason.
+--
+--  The predicate mirrors the count's WHERE clause exactly, so the index answers
+--  it rather than merely narrowing it. `kind` and the infra-defer narrowing are
+--  IMMUTABLE expressions over the row, so the partial index is legal.
+--
+--  NOT `concurrently`: the migration runner wraps each file in a transaction and
+--  CREATE INDEX CONCURRENTLY cannot run inside one. `phone_call_attempts` holds
+--  ~150 rows in production today, so the brief ACCESS EXCLUSIVE lock is measured
+--  in milliseconds. If this table is ever large at deploy time, build the index
+--  out-of-band first and `if not exists` makes this statement a no-op.
+create index if not exists idx_phone_attempts_ist_date_fleet
+  on screening_v2.phone_call_attempts (ist_date)
+  where kind in ('initial','no_answer_retry','scheduled')
+    and (state <> 'abandoned' or abandon_reason is distinct from 'infra_deferred');
+
+comment on index screening_v2.idx_phone_attempts_ist_date_fleet is
+  'Serves the 0094 fleet daily-dial count inside admit_phone_attempt. Its '
+  'predicate must stay identical to that count''s WHERE clause.';

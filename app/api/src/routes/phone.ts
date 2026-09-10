@@ -1249,10 +1249,19 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
           sendRefusal(res, result.status);
           return;
         }
+        // AUDITED, like every other read on this surface. Asking whether a
+        // named person is on the do-not-call list is a per-person compliance
+        // read, and it was the only read here that left no trace. Best-effort
+        // in the same way the sibling reads are: a read is not undone by a
+        // bookkeeping failure, so it does not use `auditOrFail`.
+        await recordAudit(req, 'resource.read', 200, {
+          metadata: { resource: 'phone_suppression', candidate_id: candidateId },
+        }).catch(() => undefined);
         res.json({
           ok: true,
           candidate_id: candidateId,
           suppressed: result.suppressed ?? false,
+          owned: result.owned ?? false,
           reason: result.reason ?? null,
           source: result.source ?? null,
           created_at: result.createdAt ?? null,
@@ -1297,12 +1306,14 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
         // do-not-call promise on the strength of a bookkeeping error, in the
         // direction that causes calls. The RPC writes its own audit row, so
         // the act is durably recorded regardless of what happens here.
+        const dialsStopped = result.dialsStopped ?? 0;
         const ok = await auditOrFail(req, res, 'resource.create', 200, {
           resource: 'phone_suppression',
           candidate_id: candidateId,
           reason: body.reason,
           source: body.source,
           already_suppressed: alreadySuppressed,
+          dials_stopped: dialsStopped,
         });
         if (!ok) return;
         res.json({
@@ -1310,6 +1321,7 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
           candidate_id: candidateId,
           suppressed: true,
           already_suppressed: alreadySuppressed,
+          dials_stopped: dialsStopped,
         });
       } catch {
         res.status(500).json({ ok: false, error: 'phone_action_error' });
@@ -1342,17 +1354,47 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
           sendRefusal(res, result.status);
           return;
         }
-        const ok = await auditOrFail(req, res, 'resource.delete', 200, {
-          resource: 'phone_suppression',
-          candidate_id: candidateId,
-          released: result.released ?? 0,
-        });
+        const releasedReason = result.releasedReason ?? null;
+        const releasedSource = result.releasedSource ?? null;
+        const ok = await auditOrFail(
+          req, res, 'resource.delete', 200,
+          {
+            resource: 'phone_suppression',
+            candidate_id: candidateId,
+            released: result.released ?? 0,
+            released_reason: releasedReason,
+            released_source: releasedSource,
+          },
+          async () => {
+            // COMPENSATED, and deliberately the OPPOSITE of the POST above.
+            // The no-compensation rule protects a do-not-call promise from
+            // being lifted by our own audit failure — on THIS verb the row is
+            // already gone, so not compensating is what lifts it. Re-suppress
+            // with the reason we just destroyed, so a failed release leaves
+            // the person no more dialable than before it started.
+            //
+            // Reported to the caller as `rolled_back`. Without this, a retry
+            // would answer 409 `not_suppressed` — telling an operator nothing
+            // was there while the person was dialable.
+            if (!releasedReason || !releasedSource) return false;
+            const undo = await store.suppress({
+              candidateId,
+              reason: releasedReason,
+              source: releasedSource,
+              actorId,
+              now: now(),
+            });
+            return undo.status === 'ok';
+          },
+        );
         if (!ok) return;
         res.json({
           ok: true,
           candidate_id: candidateId,
           suppressed: false,
           released: result.released ?? 0,
+          released_reason: releasedReason,
+          released_source: releasedSource,
         });
       } catch {
         res.status(500).json({ ok: false, error: 'phone_action_error' });

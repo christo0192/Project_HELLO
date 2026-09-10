@@ -369,16 +369,34 @@ export interface SuppressCandidatePhoneResult {
   readonly status: OrUnknown<SuppressCandidatePhoneStatus>;
   /** True when the number was ALREADY suppressed; the original row is kept. */
   readonly alreadySuppressed?: boolean;
+  /**
+   * Queued `phone.dial` jobs this suppression stopped. Recording the promise
+   * is not keeping it: admission checks suppression at claim time and the
+   * dialer does not re-check, so an attempt admitted moments earlier would
+   * otherwise still ring. A job already `active` is executing on a worker the
+   * RPC cannot reach and is NOT counted here.
+   */
+  readonly dialsStopped?: number;
 }
 
 export interface ReleaseCandidatePhoneSuppressionResult {
   readonly status: OrUnknown<ReleaseCandidatePhoneSuppressionStatus>;
   readonly released?: number;
+  /** What was lifted. A bare count could not tell an opt-out from a note. */
+  readonly releasedReason?: PhoneSuppressionReason;
+  readonly releasedSource?: PhoneSuppressionSource;
 }
 
 export interface PhoneSuppressionStateResult {
   readonly status: OrUnknown<PhoneSuppressionStateStatus>;
   readonly suppressed?: boolean;
+  /**
+   * Whether the promise sits on THIS candidate's record or on another sharing
+   * the line. Both mean "do not dial", but only an owned one can be released
+   * here — an operator who cannot see the difference will try to lift one that
+   * is not theirs and meet a status they had no way to anticipate.
+   */
+  readonly owned?: boolean;
   readonly reason?: PhoneSuppressionReason;
   readonly source?: PhoneSuppressionSource;
   readonly createdAt?: string;

@@ -10,14 +10,22 @@
 --   * fleet94-c            — the engagement the cap must REFUSE.
 --   * fleet94-d            — parked in `reconnecting`, to prove a
 --                            reconnect is EXCLUDED from the cap.
+--   * fleet94-e            — SHARES fleet94-c's phone number. The
+--                            household/reassigned-line case: proves a
+--                            release scoped to one candidate cannot
+--                            destroy the other's opt-out.
+--   * fleet94-f            — a spare eligible engagement for the
+--                            `scheduled` and `no_answer_retry` paths.
 --
--- THE FROZEN INSTANT IS ON ITS OWN DATE. 2026-09-05 IST is used by no
--- other suite in `scripts/supabase-test.sh` (the 0083 daily-cap and the
--- admission-concurrency fixtures both sit on 2026-09-06), so the
--- fleet-wide count this migration introduces cannot be perturbed by
--- another suite's rows, nor perturb theirs. Noon IST is inside the
--- 09:00-21:00 window 0092 restored, so the instant stays valid without
--- depending on the 0064/0085 temporary 24/7 extension.
+-- THE FROZEN INSTANT IS ON ITS OWN DATE. 2026-09-05 IST appears in no
+-- other fixture in `scripts/supabase-test.sh` — 0083's daily-cap suite
+-- sits on 2026-09-06 and the admission-concurrency fixtures on
+-- 2026-09-10/11/12 — so the fleet-wide count this migration introduces
+-- cannot be perturbed by another suite's rows, nor perturb theirs. The
+-- real control is the exclusivity guard below, which FAILS the suite if
+-- the date is ever shared; this note only records why it was chosen.
+-- Noon IST is inside the 09:00-21:00 window 0092 restored, so the instant
+-- stays valid without depending on the 0064/0085 temporary 24/7 extension.
 --
 -- Run (wired into scripts/supabase-test.sh; standalone form below):
 --   psql -v ON_ERROR_STOP=1 -f phone_dial_scope_fleet_cap_setup.sql
@@ -114,15 +122,18 @@ begin
         where ist_date = screening_v2.phone_ist_date(v_now));
   end if;
 
-  for v_s in select unnest(array['a','b','c','d']) loop
+  for v_s in select unnest(array['a','b','c','d','e','f']) loop
     v_slug := 'fleet94-' || v_s;
 
-    -- Distinct, valid +91 mobiles. The digest is what suppression keys on,
-    -- so two fixtures sharing a number would make the suppression
-    -- assertions lie.
+    -- Distinct, valid +91 mobiles — EXCEPT `e`, which deliberately shares
+    -- `c`'s number. `phone_suppressions` is keyed on the digest, so that pair
+    -- is the household/reassigned-line case 0042 says the keying exists for,
+    -- and it is the only way to test that a release cannot reach across it.
     insert into screening_v2.candidates (role_id, name, email, phone_e164, phone_valid)
     values (v_role, 'fleet94 ' || v_s, v_slug || '@example.test',
-            '+91988' || lpad((7100000 + (abs(hashtext(v_slug)) % 800000))::text, 7, '0'), true)
+            '+91988' || lpad((7100000 + (
+              abs(hashtext(case when v_s = 'e' then 'fleet94-c' else v_slug end)) % 800000
+            ))::text, 7, '0'), true)
     returning id into v_cand;
 
     insert into screening_v2.consent_records (candidate_id, status, consents, version)
@@ -157,7 +168,7 @@ begin
     returning id into v_eng;
   end loop;
 
-  raise notice 'fleet94: 4 engagements ready (ist_date %) at %',
+  raise notice 'fleet94: 6 engagements ready (ist_date %) at %',
     screening_v2.phone_ist_date(v_now), v_now;
 end;
 $$;

@@ -112,6 +112,7 @@ import {
 } from './read.js';
 import { createPhoneRoomClients } from './livekit-clients.js';
 import {
+  phoneDueDiagSummary,
   runPhoneDuePass,
   type PhoneDueResult,
   type PhoneSessionPort,
@@ -648,18 +649,13 @@ export function createPhoneRuntime(
           // summary carries only counts. Nothing here is derived from a
           // provider payload: `skipped`/`refusals` are keyed by the closed
           // deferral/status vocabularies.
-          // The counts are clamped to six digits for two independent reasons,
-          // both of which would otherwise null the field: SAFE_IDENT_RE's
-          // 64-char cap, and DEFENSE_RE's `\d{10,}` rule, which reads ten
-          // consecutive digits as a phone number or card number.
-          const n = (v: number): string => String(Math.max(0, Math.min(999_999, v | 0)));
-          // COUNTS ONLY — no status. With the status inline this line reached
-          // 67 characters on `candidate_daily_attempt_exists` and was dropped;
-          // it is bounded at 33 here regardless of what any later migration
-          // names a refusal. The status gets its own line below, where it is a
-          // whole value rather than a substring competing for a budget.
-          const summary = `gate.${diagGate !== null ? 1 : 0}`
-            + `:ex${n(result.examined)}:of${n(result.offered)}:di${n(result.dialing)}`;
+          // Composed by the shared helper, NOT inline: the test drives the
+          // same function, so it measures the string the logger actually
+          // receives. See `phoneDueDiagSummary` for why it carries no status
+          // and why the counts are clamped.
+          const summary = phoneDueDiagSummary(
+            diagGate !== null, result.examined, result.offered, result.dialing,
+          );
           const skipCodes = Object.keys(result.skipped ?? {});
           const refusalCodes = Object.keys(result.refusals ?? {});
           if (

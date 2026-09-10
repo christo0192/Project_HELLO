@@ -805,6 +805,7 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
           'suppress_candidate_phone', row,
         ),
         alreadySuppressed: bool(row, 'already_suppressed'),
+        dialsStopped: num(row, 'dials_stopped'),
       };
     },
 
@@ -823,6 +824,12 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
           'release_candidate_phone_suppression', row,
         ),
         released: num(row, 'released'),
+        releasedReason: member<PhoneSuppressionReason>(
+          row, 'released_reason', PHONE_SUPPRESSION_REASONS,
+        ),
+        releasedSource: member<PhoneSuppressionSource>(
+          row, 'released_source', PHONE_SUPPRESSION_SOURCES,
+        ),
       };
     },
 
@@ -834,24 +841,18 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
       });
       if (error) throw new Error('phone_suppression_state_error');
       const row = asRow(data);
-      const reason = row?.reason;
-      const source = row?.source;
-      const createdAt = row?.created_at;
       return {
         status: narrowPhoneRpcStatus<PhoneSuppressionStateStatus>(
           'phone_suppression_state', row,
         ),
         suppressed: bool(row, 'suppressed'),
-        // Narrowed rather than cast: the columns are CHECK-constrained in the
-        // schema, but a value that somehow escaped the vocabulary must not be
-        // handed onward as if it belonged to it.
-        reason: PHONE_SUPPRESSION_REASONS.includes(reason as PhoneSuppressionReason)
-          ? (reason as PhoneSuppressionReason)
-          : undefined,
-        source: PHONE_SUPPRESSION_SOURCES.includes(source as PhoneSuppressionSource)
-          ? (source as PhoneSuppressionSource)
-          : undefined,
-        createdAt: typeof createdAt === 'string' ? createdAt : undefined,
+        owned: bool(row, 'owned'),
+        // Narrowed through the shared helper rather than cast: the columns are
+        // CHECK-constrained in the schema, but a value that somehow escaped the
+        // vocabulary must not be handed onward as if it belonged to it.
+        reason: member<PhoneSuppressionReason>(row, 'reason', PHONE_SUPPRESSION_REASONS),
+        source: member<PhoneSuppressionSource>(row, 'source', PHONE_SUPPRESSION_SOURCES),
+        createdAt: iso(row, 'created_at'),
       };
     },
 

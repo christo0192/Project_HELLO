@@ -195,6 +195,36 @@ const EXPANDED_REFUSAL_DETAILS: ReadonlyMap<string, ReadonlySet<string>> = new M
  * Both vocabularies stay CLOSED: an unrecognised detail becomes
  * `<refusal>:unknown`, never the string itself.
  */
+/**
+ * The `phone_due_diag` summary value, composed in ONE place (0094).
+ *
+ * It lives here rather than inline in `runtime.ts` so the test can drive the
+ * exact string production emits. The previous version of that test re-declared
+ * the shape and therefore measured a string the logger never saw — which is
+ * how the diagnostic came to be silently dropped for its entire life.
+ *
+ * COUNTS ONLY — no status. With the status inline this value reached 67
+ * characters on `candidate_daily_attempt_exists` and was rejected by
+ * SAFE_IDENT_RE's 64-char cap; the status is logged on its own line instead,
+ * where it is a whole value rather than a substring competing for a budget.
+ *
+ * Counts are clamped to six digits for two independent reasons, both of which
+ * would otherwise null the field: that same cap, and DEFENSE_RE's `\d{10,}`
+ * rule, which reads ten consecutive digits as a phone or card number.
+ */
+export function phoneDueDiagSummary(
+  gate: boolean,
+  examined: number,
+  offered: number,
+  dialing: number,
+): string {
+  const n = (v: number): string => {
+    const i = Number.isFinite(v) ? Math.trunc(v) : 0;
+    return String(Math.max(0, Math.min(999_999, i)));
+  };
+  return `gate.${gate ? 1 : 0}:ex${n(examined)}:of${n(offered)}:di${n(dialing)}`;
+}
+
 export function phoneRefusalCountKey(refusal: string, detail: string | undefined): string {
   const vocabulary = EXPANDED_REFUSAL_DETAILS.get(refusal);
   if (vocabulary === undefined) return refusal;

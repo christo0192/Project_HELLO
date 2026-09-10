@@ -278,8 +278,13 @@ describe('admission facade — the gates defer, they never admit', () => {
     PHONE_DIAL_SCOPE: 'pipeline',
   });
 
-  it('pipeline scope reaches the RPC with an EMPTY allowlist', () => {
+  it('PRECONDITION — the pipeline fixture really does carry an empty allowlist', () => {
+    // Named as a precondition on purpose. It asserts the fixture, not the
+    // behaviour: the reachability claim is the NEXT test, which proves it by
+    // counting RPC calls. A test titled for a behaviour its body cannot fail
+    // on is worse than no test.
     expect(pipelineConfig.dialAllowlist).toHaveLength(0);
+    expect(pipelineConfig.dialScope).toBe('pipeline');
   });
 
   it('pipeline scope admits a digest no allowlist ever mentioned', async () => {
@@ -504,6 +509,11 @@ describe('admission facade — the DATABASE is authoritative', () => {
       'halted', 'halt_unreadable', 'at_capacity', 'window_closed', 'suppressed',
       'phone_invalid', 'daily_attempt_exists', 'attempt_in_flight', 'not_yet_eligible',
       'no_answer_budget_exhausted', 'engagement_terminal', 'ingestion_not_ready',
+      // 0094's fleet-wide daily ceiling. A NEW refusal must be proved to
+      // surface as one — a status the facade did not recognise would fall
+      // through to `unknown_status` and read as "we never got an answer"
+      // rather than as the deliberate volume refusal it is.
+      'fleet_daily_cap_reached',
     ] as const) {
       const f = fakeStores({ status });
       const result = await admitPhoneEngagement(

@@ -377,6 +377,55 @@ describe('P5 dial — a deferral is a wait, and it carries the deferral code', (
     expect(h.admit).not.toHaveBeenCalled();
   });
 
+  it('0094: pipeline scope dials an UNLISTED digest — the gate this flag opens', async () => {
+    // The only test in this change that reaches the transport gate. Every
+    // other `pipeline` assertion stops at the `admitPhoneEngagement` facade
+    // with a fake store; this one drives the controller, whose SIP originate
+    // is gated on `isLiveDialPermitted(config)` — the call that flips from
+    // false to true under `pipeline` with an empty allowlist, which IS the
+    // intended production configuration.
+    const h = harness({
+      config: screeningConfig({
+        PHONE_DIAL_SCOPE: 'pipeline',
+        PHONE_DIAL_ALLOWLIST: OTHER_DIGEST,
+      }),
+    });
+    const res = await run(h);
+
+    expect(res.detail).not.toBe('dial_not_allowlisted');
+    // It REACHED admission — the decision moved to the database rather than
+    // being removed. A pass that returned `dialing` without calling admit
+    // would mean the gate had been deleted, not relocated.
+    expect(h.admit).toHaveBeenCalled();
+    expect(res.status).toBe('dialing');
+  });
+
+  it('0094: an EMPTY allowlist under pipeline still reaches the carrier path', async () => {
+    // `isLiveDialPermitted` used to require a non-empty allowlist, so this is
+    // the exact combination that would have silently dialled nobody had the
+    // flag been added without relaxing it — the flag would have looked inert
+    // and the bug would have read as "pipeline does not work".
+    const h = harness({
+      config: screeningConfig({ PHONE_DIAL_SCOPE: 'pipeline', PHONE_DIAL_ALLOWLIST: '' }),
+    });
+    const res = await run(h);
+
+    expect(res.detail).not.toBe('dial_not_allowlisted');
+    expect(h.admit).toHaveBeenCalled();
+    expect(res.status).toBe('dialing');
+  });
+
+  it('0094: the DEFAULT scope still refuses an unlisted digest — the rollback', async () => {
+    // Asserted rather than assumed. Omitting PHONE_DIAL_SCOPE must behave
+    // exactly as it did before, all the way down to the transport gate.
+    const h = harness({ config: screeningConfig({ PHONE_DIAL_ALLOWLIST: OTHER_DIGEST }) });
+    const res = await run(h);
+
+    expect(res.detail).toBe('dial_not_allowlisted');
+    expectNoNetwork(res, h);
+    expect(h.admit).not.toHaveBeenCalled();
+  });
+
   it('defers with window_closed_defer at 01:30 IST — and never with the outcome_class name', async () => {
     const h = harness();
     const res = await run(h, NIGHT);

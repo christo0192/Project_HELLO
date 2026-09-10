@@ -1374,6 +1374,12 @@ describe('the health surface', () => {
       runtimeEnabled: false,
       runtimeActive: false,
       dialMode: 'off',
+      // 0094. A closed two-member vocabulary, not an identifier about anyone.
+      // It is reported because it changes WHICH refusals an operator should
+      // expect for a candidate who is not being called: under `allowlist` a
+      // blocked candidate leaves no trace at all, under `pipeline` every
+      // refusal is a named database verdict.
+      dialScope: 'allowlist',
       dialAllowlistSize: 0,
       liveDialPermitted: false,
     });

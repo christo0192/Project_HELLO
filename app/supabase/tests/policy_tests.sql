@@ -8798,13 +8798,30 @@ begin
                              -- silently skips is one nobody is checking.
                              'start_phone_assessment',
                              'get_phone_assessment_state',
-                             'commit_phone_question_boundary'))
+                             'commit_phone_question_boundary',
+                             -- 0094: the do-not-call WRITE path. Neither
+                             -- matches `phone\_%`, and these two are the
+                             -- functions that create and DESTROY suppression
+                             -- rows — the only "never call this person"
+                             -- mechanism once PHONE_DIAL_SCOPE=pipeline
+                             -- retires the allowlist. Skipping them would be
+                             -- the worst instance of exactly what the comment
+                             -- above warns about.
+                             'suppress_candidate_phone',
+                             'release_candidate_phone_suppression'))
   loop
     if not v_fn.prosecdef and v_fn.proname not in ('phone_ist_date','phone_ist_window_open',
                                                    'phone_ist_window_open_at',
                                                    'phone_ist_window_close_at',
                                                    'phone_temporary_247_until',
                                                    'phone_max_concurrent',
+                                                   -- 0094. The fleet daily-dial
+                                                   -- ceiling: the same kind of
+                                                   -- pure constant as
+                                                   -- phone_max_concurrent
+                                                   -- directly above, declared
+                                                   -- and granted identically.
+                                                   'phone_max_daily_dials',
                                                    'phone_event_metadata_sanitized',
                                                    'phone_next_window_open',
                                                    -- 0045. A pure constant of the
@@ -8861,7 +8878,17 @@ begin
                              -- silently skips is one nobody is checking.
                              'start_phone_assessment',
                              'get_phone_assessment_state',
-                             'commit_phone_question_boundary'))
+                             'commit_phone_question_boundary',
+                             -- 0094: the do-not-call WRITE path. Neither
+                             -- matches `phone\_%`, and these two are the
+                             -- functions that create and DESTROY suppression
+                             -- rows — the only "never call this person"
+                             -- mechanism once PHONE_DIAL_SCOPE=pipeline
+                             -- retires the allowlist. Skipping them would be
+                             -- the worst instance of exactly what the comment
+                             -- above warns about.
+                             'suppress_candidate_phone',
+                             'release_candidate_phone_suppression'))
   loop
     -- Everything after the opening dollar-quote is the body; the
     -- signature (and therefore `p_now timestamptz default now()`) is

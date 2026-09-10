@@ -509,6 +509,17 @@ describe('errors and malformed answers', () => {
       // the failing statement (attempt id), so it too must be sanitized.
       ['phone_abandon_infra_error', () => stores.abandonAttemptInfra!({
         attemptId: 'a', now: NOW })],
+      // 0094. The do-not-call adapters. A leaked PostgREST error here would
+      // quote the failing statement of a query whose predicate is a phone
+      // DIGEST, so these must be sanitized like every other adapter — and
+      // they are enumerated here because this assertion pins itself to
+      // PHONE_RPC_NAMES.length, so a new RPC cannot be added without one.
+      ['phone_suppress_candidate_error', () => stores.suppressCandidatePhone!({
+        candidateId: 'c', reason: 'operator', source: 'operator', now: NOW })],
+      ['phone_release_suppression_error', () => stores.releaseCandidatePhoneSuppression!({
+        candidateId: 'c', now: NOW })],
+      ['phone_suppression_state_error', () => stores.phoneSuppressionState!({
+        candidateId: 'c' })],
     ];
     expect(attempts).toHaveLength(PHONE_RPC_NAMES.length);
     for (const [code, run] of attempts) {
@@ -548,4 +559,130 @@ describe('errors and malformed answers', () => {
     })).rejects.toThrow('phone_now_invalid');
     expect(calls).toHaveLength(0);
   });
+});
+
+
+// ════════════════════════════════════════════════════════════════════
+//  0094 — the do-not-call adapters
+// ════════════════════════════════════════════════════════════════════
+//
+// These three are declared OPTIONAL on `PhoneStores` so the many hand-written
+// doubles in this repo keep compiling. That is a real hole in the type safety
+// every other adapter enjoys: deleting or renaming one of them here is NOT a
+// compile error, the route's seam check finds `undefined`, all three verbs 503
+// for ever, and the do-not-call surface is silently dead. So the FIRST
+// assertion below is that the production store actually implements them.
+//
+// The argument names matter for the same reason `rpc-contract.ts` says they do
+// everywhere else: PostgREST resolves an RPC by argument NAME, so a rename is
+// not a type error — it is a 404 at runtime.
+
+describe('the suppression adapters exist and call their RPCs by name', () => {
+  it('the PRODUCTION store implements all three — absence would 503 silently', () => {
+    const { client } = fakeClient({ status: 'ok' });
+    const store = createPhoneStores(client);
+    expect(typeof store.suppressCandidatePhone).toBe('function');
+    expect(typeof store.releaseCandidatePhoneSuppression).toBe('function');
+    expect(typeof store.phoneSuppressionState).toBe('function');
+  });
+
+  it('suppressCandidatePhone — name, keys, and no p_phone anywhere', async () => {
+    const { client, calls } = fakeClient({
+      status: 'ok', already_suppressed: false, dials_stopped: 2,
+    });
+    const result = await createPhoneStores(client).suppressCandidatePhone!({
+      candidateId: 'c1', reason: 'candidate_opt_out', source: 'candidate',
+      actorId: 'admin-1', now: NOW,
+    });
+    expect(calls[0]!.name).toBe('suppress_candidate_phone');
+    expect(calls[0]!.args).toEqual({
+      p_candidate_id: 'c1',
+      p_reason: 'candidate_opt_out',
+      p_source: 'candidate',
+      p_actor_id: 'admin-1',
+      p_now: NOW.toISOString(),
+    });
+    // The number never enters this process: the RPC reads `phone_e164` from
+    // the candidate row and digests it in SQL. There is no argument in which
+    // one could be sent, and this asserts the adapter did not invent one.
+    expect(Object.keys(calls[0]!.args)).not.toContain('p_phone');
+    expect(Object.keys(calls[0]!.args)).not.toContain('p_digest');
+    expect(result).toEqual({
+      status: 'ok', alreadySuppressed: false, dialsStopped: 2,
+    });
+  });
+
+  it('releaseCandidatePhoneSuppression — name, keys, and what it lifted', async () => {
+    const { client, calls } = fakeClient({
+      status: 'ok', released: 1,
+      released_reason: 'candidate_opt_out', released_source: 'candidate',
+    });
+    const result = await createPhoneStores(client).releaseCandidatePhoneSuppression!({
+      candidateId: 'c1', actorId: null, now: NOW,
+    });
+    expect(calls[0]!.name).toBe('release_candidate_phone_suppression');
+    expect(calls[0]!.args).toEqual({
+      p_candidate_id: 'c1', p_actor_id: null, p_now: NOW.toISOString(),
+    });
+    expect(result).toEqual({
+      status: 'ok', released: 1,
+      releasedReason: 'candidate_opt_out', releasedSource: 'candidate',
+    });
+  });
+
+  it('phoneSuppressionState — a pure read, and it takes NO clock', async () => {
+    const { client, calls } = fakeClient({
+      status: 'ok', suppressed: true, owned: false,
+      reason: 'wrong_number', source: 'operator',
+      created_at: '2026-08-01T00:00:00.000Z',
+    });
+    const result = await createPhoneStores(client).phoneSuppressionState!({ candidateId: 'c1' });
+    expect(calls[0]!.name).toBe('phone_suppression_state');
+    // Suppression does not expire, so the answer depends on no instant.
+    // `CLOCK_FREE_RPCS` in the migration drift test pins that, and this is the
+    // call site that would break it.
+    expect(calls[0]!.args).toEqual({ p_candidate_id: 'c1' });
+    expect(result).toEqual({
+      status: 'ok', suppressed: true, owned: false,
+      reason: 'wrong_number', source: 'operator',
+      createdAt: '2026-08-01T00:00:00.000Z',
+    });
+  });
+
+  it('a value outside the closed vocabulary is DROPPED, never forwarded', async () => {
+    // The columns are CHECK-constrained, so this cannot happen today. It is
+    // asserted because the failure would be silent: a caller narrowing on
+    // `reason` would meet a string its type says is impossible.
+    const { client } = fakeClient({
+      status: 'ok', suppressed: true, owned: true,
+      reason: 'because_i_said_so', source: 'telepathy', created_at: 42,
+    });
+    const result = await createPhoneStores(client).phoneSuppressionState!({ candidateId: 'c1' });
+    expect(result.reason).toBeUndefined();
+    expect(result.source).toBeUndefined();
+    expect(result.createdAt).toBeUndefined();
+    expect(result.suppressed).toBe(true);
+  });
+
+  it('every new refusal narrows to itself, and a stranger becomes unknown_status', async () => {
+    for (const status of ['candidate_not_found', 'phone_absent', 'suppression_lost'] as const) {
+      const { client } = fakeClient({ status });
+      expect((await createPhoneStores(client).suppressCandidatePhone!({
+        candidateId: 'c1', reason: 'operator', source: 'operator', now: NOW,
+      })).status).toBe(status);
+    }
+    for (const status of [
+      'not_suppressed', 'suppressed_by_other_candidate', 'candidate_not_found',
+    ] as const) {
+      const { client } = fakeClient({ status });
+      expect((await createPhoneStores(client).releaseCandidatePhoneSuppression!({
+        candidateId: 'c1', now: NOW,
+      })).status).toBe(status);
+    }
+    const { client } = fakeClient({ status: 'a_status_no_migration_declares' });
+    expect((await createPhoneStores(client).releaseCandidatePhoneSuppression!({
+      candidateId: 'c1', now: NOW,
+    })).status).toBe(PHONE_RPC_UNKNOWN_STATUS);
+  });
+
 });
