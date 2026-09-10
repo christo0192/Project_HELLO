@@ -305,6 +305,68 @@ describe('v2 branch — a role with an active scorecard', () => {
     expect(payload.revision).toBe(1);
     expect(payload.schema_version).toBe(2);
   });
+
+  // The v2 scorer makes TWO model calls: the metric scorer, then the
+  // supplementary integrity analysis. The mock branches on the prompt (only the
+  // integrity prompt asks for "resume_conflicts") to return the right shape.
+  const integrityAwareInfer = (integrityData: unknown) =>
+    async (prompt: string) => ({
+      data: prompt.includes('"resume_conflicts"') ? integrityData : { results: modelResults([5, 3, 1]) },
+      requestedModel: 'deepseek-v4-pro',
+    });
+
+  it('persists role_fit + resume_conflicts (v1-shaped columns) from the integrity analysis', async () => {
+    runClaudeJSONWithProvenance.mockImplementation(
+      integrityAwareInfer({
+        role_fit: {
+          score: 4,
+          matched_skills: ['Python'],
+          gaps: ['No verifiable SWE role on resume'],
+          red_flags: ['Identity mismatch: resume Christo, said Kopu/Bopu'],
+          notes: 'Weak fit; claims unverifiable.',
+        },
+        resume_conflicts: [
+          { topic: 'Amazon tenure', resume_says: 'no Amazon role', candidate_said: '11 years at Amazon', resolved: false, note: '' },
+        ],
+      }),
+    );
+    await runAssessment(SESSION_ID);
+    const payload = callsFor('assessments', 'insert')[0].args[0] as Record<string, unknown>;
+    expect(payload.schema_version).toBe(2);
+    const roleFit = payload.role_fit as { matched_skills: string[]; red_flags: string[] };
+    expect(roleFit.matched_skills).toEqual(['Python']);
+    expect(roleFit.red_flags).toEqual(['Identity mismatch: resume Christo, said Kopu/Bopu']);
+    const conflicts = payload.resume_conflicts as Array<{ topic: string }>;
+    expect(conflicts).toHaveLength(1);
+    expect(conflicts[0].topic).toBe('Amazon tenure');
+  });
+
+  it('omits role_fit + resume_conflicts when the integrity analysis finds nothing', async () => {
+    runClaudeJSONWithProvenance.mockImplementation(
+      integrityAwareInfer({
+        role_fit: { score: 0, matched_skills: [], gaps: [], red_flags: [], notes: '' },
+        resume_conflicts: [],
+      }),
+    );
+    await runAssessment(SESSION_ID);
+    const payload = callsFor('assessments', 'insert')[0].args[0] as Record<string, unknown>;
+    expect(Object.keys(payload)).not.toContain('role_fit');
+    expect(Object.keys(payload)).not.toContain('resume_conflicts');
+  });
+
+  it('FAIL-SOFT: a scorecard still persists when the integrity analysis throws', async () => {
+    runClaudeJSONWithProvenance.mockImplementation(async (prompt: string) => {
+      if (prompt.includes('"resume_conflicts"')) throw new Error('integrity provider 500');
+      return { data: { results: modelResults([5, 3, 1]) }, requestedModel: 'deepseek-v4-pro' };
+    });
+    await runAssessment(SESSION_ID);
+    const inserts = callsFor('assessments', 'insert');
+    expect(inserts).toHaveLength(1); // the scorecard was NOT blocked
+    const payload = inserts[0].args[0] as Record<string, unknown>;
+    expect(payload.schema_version).toBe(2);
+    expect(payload.weighted_score_5).toBe(3.6);
+    expect(Object.keys(payload)).not.toContain('role_fit');
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════

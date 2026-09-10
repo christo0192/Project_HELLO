@@ -173,6 +173,30 @@ const V2_PARTIAL = {
   raw: V2_PARTIAL_RAW,
 } as unknown as Assessment;
 
+// A v2 row that ALSO carries the supplementary integrity signals (résumé
+// conflicts + role fit) the extended scorer now persists into the v1-shaped
+// columns. The candidate workspace must surface both sections for it.
+const V2_WITH_INTEGRITY = {
+  ...V2_PARTIAL,
+  id: 'a-v2d',
+  role_fit: {
+    score: 4,
+    matched_skills: ['Python', 'TypeScript'],
+    gaps: ['No verifiable software engineering role on resume'],
+    red_flags: ['Claimed 11 years at Amazon, but resume lists no such role'],
+    notes: 'Background does not clearly support the role.',
+  },
+  resume_conflicts: [
+    {
+      topic: 'Amazon tenure',
+      resume_says: 'No software-engineer role at Amazon.',
+      candidate_said: 'Said 11 years as a software engineer at Amazon.',
+      resolved: false,
+      note: '',
+    },
+  ],
+} as unknown as Assessment;
+
 const V1: Assessment = {
   id: 'a-v1',
   overall_score: 72,
@@ -291,5 +315,35 @@ describe('TranscriptionSyncWorkspace scorecard branch', () => {
     expect(screen.getByRole('heading', { name: 'Signals' })).toBeInTheDocument();
     // No v2 metric leaks into the legacy view.
     expect(screen.queryByText('Technical depth')).not.toBeInTheDocument();
+  });
+
+  it('surfaces résumé conflicts + role fit for a v2 assessment that carries them', () => {
+    render(
+      <CandidateShell>
+        <TranscriptionSyncWorkspace sessions={[]} assessments={[V2_WITH_INTEGRITY]} blocked={false} />
+      </CandidateShell>,
+    );
+    // Both integrity sections render alongside the v2 metric card.
+    expect(screen.getByRole('heading', { name: 'Metrics' })).toBeInTheDocument();
+    // The conflicts heading carries a count badge, so match by prefix.
+    expect(screen.getByRole('heading', { name: /Resume conflicts/ })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Role fit' })).toBeInTheDocument();
+    expect(screen.getByText('Amazon tenure')).toBeInTheDocument();
+    expect(screen.getByText('Claimed 11 years at Amazon, but resume lists no such role')).toBeInTheDocument();
+    expect(screen.getByText('Python')).toBeInTheDocument();
+    // Supplementary role fit: NO generic fit-score meter — the configured
+    // metrics own the weighted verdict, so a second 0–10 score is not shown.
+    expect(screen.queryByText('Fit score')).not.toBeInTheDocument();
+  });
+
+  it('does NOT render the integrity sections for a v2 assessment without that data', () => {
+    render(
+      <CandidateShell>
+        <TranscriptionSyncWorkspace sessions={[]} assessments={[V2_COMPLETE]} blocked={false} />
+      </CandidateShell>,
+    );
+    expect(screen.getByRole('heading', { name: 'Metrics' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Resume conflicts' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Role fit' })).not.toBeInTheDocument();
   });
 });

@@ -205,8 +205,9 @@ describe('a fresh rescore writes a superseding revision, prior row untouched', (
     expect(payload.weighted_score_5).toBe(3.6);
 
     expect(result.id).toBe(NEW_ID);
-    // Scoring ran exactly once.
-    expect(runClaudeJSONWithProvenance).toHaveBeenCalledOnce();
+    // Scoring ran exactly once — two model calls for a v2 rescore: the metric
+    // scorer, then the supplementary résumé-integrity analysis.
+    expect(runClaudeJSONWithProvenance).toHaveBeenCalledTimes(2);
     // IMMUTABILITY: the prior row is never mutated or deleted.
     expect(callsFor('assessments', 'update')).toHaveLength(0);
     expect(callsFor('assessments', 'delete')).toHaveLength(0);
@@ -349,8 +350,9 @@ describe('concurrency at the insert', () => {
     expect((inserts[1].args[0] as Record<string, unknown>).rescore_request_id).toBe(REQ_ID);
 
     expect(result.id).toBe(NEW_ID);
-    // Scoring is NOT repeated on a revision retry.
-    expect(runClaudeJSONWithProvenance).toHaveBeenCalledOnce();
+    // Scoring is NOT repeated on a revision retry — the two model calls (metric
+    // scorer + integrity analysis) happen once; the insert retry adds none.
+    expect(runClaudeJSONWithProvenance).toHaveBeenCalledTimes(2);
   });
 
   it('adopts the winner when the rescore-request id lost the race at insert time', async () => {

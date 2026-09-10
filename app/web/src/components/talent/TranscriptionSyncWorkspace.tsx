@@ -28,8 +28,8 @@
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
-import { readScorecardAssessmentV2 } from '../../types';
-import type { Assessment, Session, TranscriptLine } from '../../types';
+import { readScorecardAssessmentV2, isAssessmentV2 } from '../../types';
+import type { Assessment, ResumeConflict, RoleFitScore, Session, TranscriptLine } from '../../types';
 import { StatusBadge } from '../design';
 import {
   CandidateErrorState,
@@ -57,6 +57,25 @@ export interface TranscriptionSyncWorkspaceProps {
   sessions: Session[];
   assessments: Assessment[];
   blocked: boolean;
+}
+
+/** Résumé conflicts, whether they arrive on the column or (rarely) inside raw. */
+function resumeConflictsOf(a: Assessment): ResumeConflict[] {
+  const raw = a.raw as { resume_conflicts?: ResumeConflict[] } | null | undefined;
+  const list = a.resume_conflicts ?? raw?.resume_conflicts;
+  return Array.isArray(list) ? list : [];
+}
+
+/** Null-safe: a role_fit worth rendering has at least one tag or a note. */
+function roleFitHasContent(rf: RoleFitScore | null | undefined): boolean {
+  if (!rf || typeof rf !== 'object') return false;
+  const filled = (x: unknown) => Array.isArray(x) && x.length > 0;
+  return (
+    filled(rf.matched_skills) ||
+    filled(rf.gaps) ||
+    filled(rf.red_flags) ||
+    (typeof rf.notes === 'string' && rf.notes.trim().length > 0)
+  );
 }
 
 function findActiveTurnIndex(
@@ -208,24 +227,42 @@ export function TranscriptionSyncWorkspace({
     right: React.ReactNode,
     assessment: Assessment | null,
   ) => {
-    // The resume-conflicts, role-fit and summary blocks read v1-only fields. A
-    // v2 (role-scorecard) assessment carries none of them — its own card renders
-    // everything — so they are shown only for a legacy v1 assessment.
-    const legacyNarrative = !blocked && assessment && readScorecardAssessmentV2(assessment) == null;
+    // v1 shows the full legacy narrative (résumé conflicts, role fit, summary).
+    // A v2 (role-scorecard) row historically carried none of these; since the
+    // scorer was extended it now ALSO persists résumé conflicts + role fit (the
+    // v1-shaped columns), so those two sections are shown for a v2 row too —
+    // gated on the data actually being present, and null-safe for older v2 rows
+    // that predate the change. The 1–10 `summary` remains v1-only.
+    const isV2 = !blocked && !!assessment && isAssessmentV2(assessment);
+    const legacyNarrative = !blocked && !!assessment && !isAssessmentV2(assessment);
+    const showConflicts = !blocked && !!assessment && resumeConflictsOf(assessment).length > 0;
+    const showV2RoleFit = isV2 && roleFitHasContent(assessment!.role_fit);
     return (
       <>
         <div className="grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-12 lg:items-start">
           <div className="min-w-0 space-y-4 sm:space-y-6 lg:col-span-7">
             {left}
-            {legacyNarrative && (
-              <CandidateScorecardNarrative assessment={assessment!} parts="conflicts" />
+            {/* headingLevel=2 so these read as top-level assessment sections,
+                peers of "Transcript" and "Scorecard" — not a subsection of the
+                transcript they happen to sit beneath in the DOM. */}
+            {showConflicts && (
+              <CandidateScorecardNarrative
+                assessment={assessment!}
+                parts="conflicts"
+                headingLevel={2}
+              />
             )}
           </div>
           <div className="min-w-0 lg:col-span-5">{right}</div>
         </div>
-        {legacyNarrative && <CandidateScorecardRoleFit assessment={assessment!} />}
         {legacyNarrative && (
-          <CandidateScorecardNarrative assessment={assessment!} parts="summary" />
+          <CandidateScorecardRoleFit assessment={assessment!} headingLevel={2} />
+        )}
+        {showV2RoleFit && (
+          <CandidateScorecardRoleFit assessment={assessment!} supplementary headingLevel={2} />
+        )}
+        {legacyNarrative && (
+          <CandidateScorecardNarrative assessment={assessment!} parts="summary" headingLevel={2} />
         )}
       </>
     );
