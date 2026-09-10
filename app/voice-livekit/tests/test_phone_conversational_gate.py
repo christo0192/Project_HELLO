@@ -180,19 +180,49 @@ class TestIdentityClassifier(unittest.TestCase):
                 want, raw,
             )
 
-    def test_a_body_naming_two_verdicts_is_not_an_answer(self):
-        # A model echoing the option list, or reasoning aloud, is not a verdict.
-        # It must read as `unclear` (which proceeds), never as whichever word
-        # happened to come first.
+    def test_a_reasoning_body_resolves_to_its_FINAL_verdict(self):
+        # An earlier fix rejected any multi-verdict body as "reasoning aloud".
+        # That made `other_person` UNREACHABLE for a judge that reasons — the
+        # shape this classifier documents as expected — so every one of these
+        # returned `unclear`, proceeded to consent, and screened the wrong
+        # person. A model that reasons puts its answer last.
         for raw in (
             "Options: self, other_person, unavailable, unclear. "
             "The answer is other_person",
-            "It is either self or unavailable, hard to say",
+            "This is not a self identification. other_person",
+            "The reply says she is the mother, so this is not self; "
+            "it is other_person.",
         ):
+            self.assertEqual(
+                _run(phone.phone_classify_identity(
+                    "No, this is her father.", NAME, infer=_verdict(raw))),
+                phone.PHONE_IDENTITY_OTHER, raw,
+            )
+
+    def test_a_body_naming_no_verdict_at_all_is_unclear(self):
+        for raw in ("It is either way, hard to say", "", "   ", "no idea"):
             self.assertEqual(
                 _run(phone.phone_classify_identity("hello", NAME, infer=_verdict(raw))),
                 phone.PHONE_IDENTITY_UNCLEAR, raw,
             )
+
+    def test_a_hyphenated_compound_is_not_a_verdict(self):
+        # A hyphen is a non-word character, so `\bself\b` matched inside
+        # "self-employed" — the same class of bug the word-boundary fix was
+        # written for, one character over.
+        for raw in ("self-employed", "the caller is self-employed"):
+            self.assertEqual(
+                _run(phone.phone_classify_identity("hello", NAME, infer=_verdict(raw))),
+                phone.PHONE_IDENTITY_UNCLEAR, raw,
+            )
+
+    def test_the_deferral_terminal_is_not_consent_vocabulary(self):
+        # `PHONE_CLASSIFICATIONS` is the CONSENT vocabulary, and the gate uses it
+        # to coerce an unrecognised consent verdict to MACHINE — a fail-closed
+        # guard. A non-consent terminal inside it would let a future classify
+        # seam have a deferral waved through as a consent decision.
+        self.assertNotIn(
+            phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE, phone.PHONE_CLASSIFICATIONS)
 
     def test_the_record_name_spoken_back_cannot_be_called_another_person(self):
         # THE REGRESSION THAT BLOCKED THIS BRANCH. `_IDENTITY_DENY_RE` hung up on

@@ -4486,6 +4486,14 @@ PHONE_CLASSIFICATIONS: frozenset[str] = frozenset([
     CLASSIFY_REFUSED,
     CLASSIFY_OPT_OUT,
     CLASSIFY_WRONG_NUMBER,
+])
+
+#: NOT a member of `PHONE_CLASSIFICATIONS`, deliberately. That set is the
+#: CONSENT vocabulary, and `run_phone_gate` uses it to coerce an unrecognised
+#: consent verdict to MACHINE — a fail-closed guard. Adding a non-consent
+#: terminal to it would let a future classify seam return a deferral and have
+#: that guard wave it through as if it were a consent decision.
+_PHONE_NON_CONSENT_TERMINALS: frozenset[str] = frozenset([
     CLASSIFY_DEFERRED_PRE_DISCLOSURE,
 ])
 
@@ -4833,10 +4841,10 @@ PHONE_IDENTITY_VERDICTS: frozenset[str] = frozenset([
 #: itself — see `phone_classify_identity` for the misreads that produced.
 #: Longest-first alternation so `other_person` is never clipped to a prefix.
 _IDENTITY_VERDICT_TOKEN_RE = re.compile(
-    r"\b(?:" + "|".join(
+    r"(?<![\w-])(?:" + "|".join(
         sorted((re.escape(v) for v in PHONE_IDENTITY_VERDICTS),
                key=len, reverse=True)
-    ) + r")\b",
+    ) + r")(?![\w-])",
 )
 
 _IDENTITY_CLASSIFY_PROMPT = (
@@ -4937,14 +4945,33 @@ async def phone_classify_identity(
     # screening. `phone_judge_max_tokens()` defaults to 1200 and this call sets
     # no `response_format`, so a prose answer is the expected shape.
     #
-    # So: word-boundary matching, and a body naming two or more DIFFERENT
-    # verdicts is not an answer — it is the model reasoning aloud or echoing
-    # the option list, and the honest reading is `unclear`, which proceeds.
+    # So: word-boundary matching, and THE LAST token wins.
+    #
+    # An earlier fix rejected any body naming two or more different verdicts,
+    # reading it as the model reasoning aloud. That was safe and inert: a judge
+    # that reasons — the shape this very function documents as expected, since
+    # it sets no `response_format` and allows 1200 tokens — can then NEVER
+    # return `other_person`. Every one of these resolved to `unclear`, which
+    # proceeds to consent, so the wrong person was screened anyway:
+    #
+    #   "This is not a self identification. other_person"
+    #   "The reply says she is the mother, so this is not self; it is
+    #    other_person."
+    #   "Options: self, other_person, unavailable, unclear. Answer:
+    #    other_person"
+    #
+    # Taking the LAST token reads all three correctly, because a model that
+    # reasons puts its answer at the end. It is not perfect — a body ending
+    # "...self, not other_person" reads backwards — but the blast radius is
+    # bounded on both sides: a wrong `self` proceeds, which is what happened on
+    # every call before this gate existed, and a wrong `other_person` still
+    # needs a SECOND independent `other_person` on a different utterance before
+    # anything ends the call.
     lowered = raw.strip().lower()
     words = [m.group(0) for m in _IDENTITY_VERDICT_TOKEN_RE.finditer(lowered)]
-    if len(set(words)) != 1:
+    if not words:
         return PHONE_IDENTITY_UNCLEAR
-    verdict = words[0]
+    verdict = words[-1]
     if verdict != PHONE_IDENTITY_OTHER:
         return verdict
     # Property 2: the deterministic backstop. Only ever moves toward continuing,
@@ -5665,7 +5692,6 @@ async def run_phone_gate(
 
     if decision != CLASSIFY_HUMAN:
         return await _terminal_outcome(decision)
-        return PhoneGateResult(decision, events=events, spoken=spoken)
 
     # The raw consent utterance the classifier consumed to decide HUMAN, threaded
     # out for the gate transcript. `None` when the caller did not wire the sink.
