@@ -1,29 +1,36 @@
 /**
  * ashby/operation-worker.ts — leased executor for the `ashby_operations` outbox.
  *
- * ══ THE RESULT-SINK REFUSAL (read before changing SUPPORTED_OPERATION_TYPES) ══
+ * ══ WHAT THIS PUBLISHES (read before changing SUPPORTED_OPERATION_TYPES) ══
  *
- * This worker claims `invite_delivery` and NOTHING else. `scorecard_write` and
- * `stage_move` are never claimed and never executed, because no approved Ashby
- * result sink exists:
+ * It claims `invite_delivery` and `scorecard_write`. It NEVER claims
+ * `stage_move`.
  *
- *   1. `bindFeedbackForm` fails closed with `binding_unverified` unless a
- *      tenant-VERIFIED form binding is supplied, and no column, RPC, or config
- *      anywhere produces one — `ashby_job_mappings.feedback_form_id` is a bare
- *      text column with no verified flag and no field-id columns.
- *   2. `AshbyClient.applicationFeedbackSubmit` and `applicationChangeStage`
- *      therefore have
- *      no production caller, and this worker adds none.
- *   3. The 0029 `trg_ashby_operation_dependency` trigger raises P0001 if a
+ * `scorecard_write` became executable when the tenant-verified Hello Christy
+ * form binding landed (#275). What keeps it honest:
+ *   - `bindFeedbackForm` still fails closed with `binding_unverified` for
+ *     anything unverified, and the four FIXED fields (overall recommendation,
+ *     Summary, Red flags, Detailed report) come only from that hand-verified
+ *     table — they are never auto-bound.
+ *   - A v2 metric reaches a field only by an exact name match against the
+ *     form's live definition. No field, two fields with the title, a non-Score
+ *     field, or two metrics sharing a name, and the metric is OMITTED — never
+ *     guessed onto a field.
+ *   - If NOT ONE metric matched, the operation fails `no_metric_fields_bound`
+ *     rather than submitting a card with no scores. An Ashby scorecard cannot
+ *     be retracted, so a wrong card is worse than no card.
+ *
+ * `stage_move` stays refused, and that is a product decision about acting on a
+ * candidate's application, not a missing capability. Two locks back it up:
+ *
+ *   1. The 0029 `trg_ashby_operation_dependency` trigger raises P0001 if a
  *      `stage_move` tries to reach running/succeeded before its `scorecard_write`
  *      dependency has succeeded — a DB-level backstop, not application logic.
- *   4. `enqueueStageMove` re-reads `application.info` and refuses when a human
+ *   2. `enqueueStageMove` re-reads `application.info` and refuses when a human
  *      moved the application away from the mapped AI stage.
  *
- * A completed screening therefore parks at `writeback_pending` (0032) and no TA
- * stage move occurs. Widening SUPPORTED_OPERATION_TYPES without first landing a
- * verified binding would break that guarantee — the accompanying test asserts
- * the two forbidden types are never passed to `claim_ashby_operation`.
+ * So there is no TA stage move and no auto-reject anywhere. The accompanying
+ * test asserts `stage_move` is never passed to `claim_ashby_operation`.
  *
  * Every mutation is CAS'd on the live lease, so a worker whose lease expired or
  * was reclaimed commits nothing.

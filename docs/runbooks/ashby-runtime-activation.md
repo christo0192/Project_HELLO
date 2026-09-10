@@ -73,7 +73,7 @@ Four independent, jittered, single-flight loops (see `scheduler.ts`):
 | Loop | Work |
 |---|---|
 | `signal` | Claims `ashby.signal`, `ashby.import`, `ashby.ingestion` jobs through the leased queue runner. |
-| `operation` | Claims **`invite_delivery` operations and nothing else** (see §7). |
+| `operation` | Claims **`invite_delivery` and `scorecard_write`** — never `stage_move` (see §7). |
 | `reconcile` | The dropped-webhook safety net, under a DB single-flight lease. |
 | `reclaim` | `reclaimExpired` — requeues or dead-letters jobs whose lease expired. |
 
@@ -107,7 +107,7 @@ Do not proceed on a red gate. Each stage is independently reversible.
 | 6 | Enable **one** mapping via `POST …/mappings/{id}/resume`. | One application flows to a minted invite whose delivery operation rests at `awaiting_manual_delivery`. An admin then clicks **Get invite link** in Mission Control (or calls `POST …/workflows/{id}/invite`), receives the candidate URL once, and the operation becomes `succeeded`. Email stays `blocked_provider`. |
 | 7 | Remaining mappings. | DLQ empty; reconciliation advancing; `no_progress_runs` at 0. |
 
-There is deliberately **no write-back stage**: see §7.
+The scorecard write-back stage is LIVE; the TA stage move is still refused. Before step 6 on a real job, confirm the form with **Preview scorecard binding** in Mission Control. See §7.
 
 ---
 
@@ -325,34 +325,63 @@ unused.
 
 ---
 
-## 7. Why nothing is written back to Ashby (read this before "fixing" it)
+## 7. What is written back to Ashby, and what is still refused
 
-**No approved Ashby result sink exists.** A completed screening therefore parks
-at the `writeback_pending` lifecycle state (0032) and NOTHING is published: no
-`applicationFeedback.submit`, no `applicationFeedbackRequest.create`, no
-`application.changeStage`, and **no TA stage move**. There is no auto-reject
-anywhere.
+**The scorecard IS published. The stage move is NOT.** This section used to say
+nothing was written back at all; that stopped being true when the verified
+Hello Christy form binding landed (#275). Read it as two separate questions.
 
-Four independent locks enforce this:
+### 7a. Scorecard write-back — LIVE
 
-1. **The worker refuses.** `SUPPORTED_OPERATION_TYPES` is `['invite_delivery']`;
-   `scorecard_write` and `stage_move` are never passed to
-   `claim_ashby_operation`.
-2. **The payload cannot be built.** `bindFeedbackForm` fails closed with
-   `binding_unverified` unless a tenant-VERIFIED form binding is supplied, and no
-   column, RPC, or config produces one — `ashby_job_mappings.feedback_form_id` is
-   a bare text column with no verified flag and no field-id columns.
-3. **The database refuses.** The 0029 `trg_ashby_operation_dependency` trigger
+`SUPPORTED_OPERATION_TYPES` is `['invite_delivery', 'scorecard_write']`. A
+completed screening enqueues one `scorecard_write` per application link and the
+worker submits `applicationFeedback.submit` against the verified form
+`1c9a92c0-c18f-4bf1-898f-c29e71d7d303`.
+
+What still holds it closed when it should be closed:
+
+- **The binding must be verified.** `bindFeedbackForm` returns
+  `binding_unverified` for anything else, and the four fixed fields (overall
+  recommendation, Summary, Red flags, Detailed report) come only from the
+  hand-verified table — never auto-bound.
+- **A metric binds only by exact name.** v2 metrics are matched to the form's
+  `Score` fields by normalised title at write time. No field, two fields with
+  the same title, a non-Score field, or two metrics sharing a name and the
+  metric is OMITTED, never guessed onto a field.
+- **Never an empty card.** If a v2 assessment has metrics and NOT ONE matched,
+  the operation fails `no_metric_fields_bound` rather than writing a card with
+  no scores. An Ashby scorecard cannot be retracted, so a wrong card is worse
+  than none.
+- **A form read failure waits.** An unreadable definition DEFERS (refunding the
+  attempt) as `form_schema_unavailable`; a definition for a different or
+  archived form fails `form_definition_mismatch`.
+- **One scorecard per link, forever.** A link-scoped admission read plus the
+  `ashby:scorecard:link:<id>` operation key and its unique constraint.
+
+Before enabling a mapping for real traffic, open Ashby Mission Control →
+the mapping → **Preview scorecard binding**. Every metric row must read
+"will be written". Anything else names the exact fix on the form.
+
+See `docs/runbooks/ashby-scorecard-fields.md` for the field table, the
+four-level rubric, and the derived Role fit dimension.
+
+### 7b. Stage move — still REFUSED
+
+No `application.changeStage` is ever executed and there is **no TA stage move
+and no auto-reject anywhere**. `stage_move` stays in `REFUSED_OPERATION_TYPES`
+and is never passed to `claim_ashby_operation`. Two further locks back that up:
+
+1. **The database refuses.** The 0029 `trg_ashby_operation_dependency` trigger
    raises `P0001` if a `stage_move` tries to reach `running`/`succeeded` before
    its `scorecard_write` dependency has succeeded.
-4. **The saga refuses.** `enqueueStageMove` re-reads `application.info` and skips
+2. **The saga refuses.** `enqueueStageMove` re-reads `application.info` and skips
    with `human_moved` unless the application is still at the mapped AI stage — a
    human's move is never undone.
 
-`ashby-writeback-fail-closed.test.ts` asserts all four as an executable gate.
-**Unlocking write-back requires a tenant probe that pins the feedback-form field
-ids AND a durable verified binding — it is not a flag flip, and widening
-`SUPPORTED_OPERATION_TYPES` without that binding would break the guarantee.**
+`ashby-writeback-fail-closed.test.ts` asserts the refusals that remain as an
+executable gate. **Widening `SUPPORTED_OPERATION_TYPES` to include `stage_move`
+is a product decision about acting on a candidate's application, not a flag
+flip.**
 
 ---
 
@@ -424,8 +453,8 @@ flag on but a dead scheduler reports `degraded`, not `healthy`.
 | `invite_blocked_failed_ingestion` in `reasons` | An invite is blocked behind a `failed_review` ingestion, which only a human can requeue | Real, non-transient. Fix the `failed_reason` cause, then requeue the ingestion per §2a of the recovery runbook. It will never clear on its own. |
 | `ingestion_stuck` in `reasons` | A resume ingestion has sat in `queued`/`fetching` past the stuck window | Real fault. Diagnose via the recovery runbook — check the scanner first, it is the usual cause. |
 | `invite_prerequisite_failed` in `reasons` | Invites killed by the pre-0035 ordering defect | Recovery backlog, not a live fault. Run `reopen_ashby_invite_delivery` per the recovery runbook. |
-| `writebackPending` climbing | Screenings completing with no approved result sink | Expected (§7). These are results awaiting manual publication. |
-| A workflow shows `screened: not parked` (session `completed`, lifecycle not `writeback_pending`, not terminal) | The completion observer's park did not land — it is best-effort so that a transient failure can never discard a scored assessment | The assessment itself is safe and visible on the ordinary session surfaces. Nothing downstream waits on `writeback_pending` (there is no result sink), so this is a bookkeeping gap. Re-parking is idempotent: it self-corrects on any later completion for that session, and the state is legible here rather than log-only. |
+| `writebackPending` climbing | Screenings parked after completion | Expected bookkeeping (§7). The scorecard itself is published by its own `scorecard_write` operation — check that operation's state, not this counter, to tell whether the Ashby card landed. |
+| A workflow shows `screened: not parked` (session `completed`, lifecycle not `writeback_pending`, not terminal) | The completion observer's park did not land — it is best-effort so that a transient failure can never discard a scored assessment | The assessment itself is safe and visible on the ordinary session surfaces. The scorecard write-back is enqueued by the completion observer independently of this park, so a missed park does not withhold the Ashby card; this is a bookkeeping gap. Re-parking is idempotent: it self-corrects on any later completion for that session, and the state is legible here rather than log-only. |
 | An `invite_delivery` operation shows `failed / blocked_provider` | The email channel is gated off (§5) | Expected for `email`/`both` mappings. Switch the mapping to `manual`, or wait for an approved provider. |
 | Health `degraded` with `scheduler_loop_stale` | A loop stopped ticking on THIS machine | Check the process; the backlog fields tell you whether another machine is still draining. |
 
