@@ -2048,12 +2048,15 @@ def _build_provider_session(
         tts=sarvam.TTS(
             model=os.getenv("SARVAM_TTS_MODEL", "bulbul:v3"),
             speaker=os.getenv("SARVAM_TTS_VOICE", "simran"),
-            pace=1.0,
+            # PHONE ONLY knob, default 1.0 — the browser lane keeps the frozen
+            # literal. `os.getenv` is named literally here so the env-contract
+            # scanner sees it; the bounded read + clamp lives in
+            # `phone.phone_tts_pace()`.
+            pace=(phone.phone_tts_pace() if phone_mode else 1.0),
             # PHONE ONLY: warmer TTS sampling (0.8 -> 1.0) for more expressive,
             # less flat prosody, matching the v114 naturalness tuning. The
             # browser/WebRTC path is deliberately frozen/sha-pinned, so it keeps
             # 0.8 untouched (mirrors the LLM temperature gating just below).
-            # `pace` stays 1.0 on both paths by owner request.
             temperature=(1.0 if phone_mode else 0.8),
         ),
         # PHONE ONLY: the interviewer LLM is built by a dedicated factory that
@@ -7438,11 +7441,19 @@ async def _run_phone_session(
     # native-Gemini path (`phone_use_google_llm`) it would neither share the
     # live LLM's transport nor warm Gemini's implicit cache — a wasted call. It
     # is harmless there (errors are swallowed) but pointless, so skip it.
+    #
+    # 0095 EXCEPTION: the conversational gate composes its identity line through
+    # `_default_phone_interviewer_text` — the OPENAI-COMPAT one-shot path — no
+    # matter which SDK the live session LLM uses. On that flow the warm-up warms
+    # exactly the transport the first spoken line depends on, so the
+    # "pointless on Gemini" reasoning above does not apply and skipping it would
+    # put a cold TLS+connect between the candidate's "hello?" and our greeting.
     _phone_prefix_warmup_off = (os.getenv("PHONE_PREFIX_WARMUP") or "").strip().lower() == "off"
+    _phone_gate_needs_oneshot = phone.phone_gate_flow() == "conversational"
     if (
         phone.phone_prefix_warmup_enabled()
         and not _phone_prefix_warmup_off
-        and not phone.phone_use_google_llm()
+        and (not phone.phone_use_google_llm() or _phone_gate_needs_oneshot)
     ):
         try:
             warmup_task = asyncio.create_task(
@@ -7876,6 +7887,58 @@ async def _run_phone_session(
                 return
         await say(text)
 
+    async def _next_candidate_turn() -> str:
+        """One candidate utterance for the gate's identity turn, or "" on silence.
+
+        Reads the SAME `user_turns` queue the consent classifier reads
+        (`on_candidate_turn` feeds it), under the SAME per-answer budget
+        `PHONE_CLASSIFY_ANSWER_TIMEOUT_SEC` — so the identity turn cannot wait
+        longer for a reply than the consent turn does, and a silent line reaches
+        its terminal state on the schedule the gate already promises.
+
+        Returns "" rather than raising on timeout: the gate treats an
+        unextractable reply as "proceed", and an exception here would end a call
+        that a real candidate is on.
+        """
+        try:
+            text = await asyncio.wait_for(
+                user_turns.get(), timeout=phone.phone_classify_answer_timeout_sec(),
+            )
+        except asyncio.TimeoutError:
+            return ""
+        except Exception:  # noqa: BLE001
+            return ""
+        return text if isinstance(text, str) else ""
+
+    async def _compose_gate_line(kind: str) -> Optional[str]:
+        """Compose ONE gate line from the model and return it as TEXT.
+
+        IT DOES NOT SPEAK, and that is the design. `run_phone_gate` verifies
+        what comes back and speaks it itself, so a line that fails verification
+        is REPLACED rather than spoken and then contradicted. The 2026-09-09
+        double-opener happened because generation and speech were the same call
+        (`generate_reply` streams to TTS and the gate checked afterwards); here
+        they cannot be.
+
+        The cost of that is one short generation on the critical path instead of
+        streamed first audio. It is paid where the candidate is least likely to
+        notice — the moment they say "hello" — and `phone_warm_prefix_cache`
+        above has already taken the cold prefill.
+
+        Uses the same one-shot text path as the Q1 rephrase
+        (`phone_rephrase_first_question`), which has been carrying production
+        traffic since the gate's first live call. Any failure returns None and
+        the gate speaks its fixed line.
+        """
+        try:
+            if kind == "identity":
+                return await phone.phone_compose_identity_line(
+                    getattr(instruction_state, "candidate_name", None),
+                )
+        except Exception:  # noqa: BLE001
+            return None
+        return None
+
     result = await phone.run_phone_gate(
         attempt_id=attempt_id,
         client=events,
@@ -7932,6 +7995,14 @@ async def _run_phone_session(
         # disclosure-time DB read finds no session (it is bound only at
         # /assessment/start) and the egress silently never starts.
         session_id=phone.session_id_from_room_name(room_name),
+        # ── 0095: the conversational identity turn ─────────────────────────
+        # All three are wired unconditionally; the GATE decides whether to use
+        # them from `PHONE_GATE_FLOW`. Wiring them here rather than branching
+        # keeps one call site and lets a flag flip change behaviour without a
+        # deploy, exactly like every other knob in this lane.
+        next_candidate_turn=_next_candidate_turn,
+        compose_gate_line=_compose_gate_line,
+        candidate_name=getattr(instruction_state, "candidate_name", None),
     )
 
     # Review repair: cancel a still-running role pre-render once the gate has

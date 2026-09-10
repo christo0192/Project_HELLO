@@ -429,6 +429,58 @@ PHONE_WRONG_NUMBER_TEXT = (
     "Sorry about that, I've reached the wrong person. I'll have this number "
     "corrected. Thanks, and goodbye."
 )
+
+
+def phone_identity_text(candidate_name: Any) -> str:
+    """The fixed identity opener — the FALLBACK for the conversational gate.
+
+    One question, and it is the identity one. It names us before it asks for
+    them, because a cold call from an unknown number that opens by demanding
+    who you are is the shape of a scam call.
+
+    The given name only: a full legal name read aloud sounds like a debt
+    collector, and the record's first token is what the mismatch detector
+    compares anyway. An unusable name degrades to a nameless-but-still-natural
+    opener rather than speaking a placeholder.
+    """
+    first = ""
+    if isinstance(candidate_name, str):
+        parts = candidate_name.strip().split()
+        if parts:
+            first = parts[0].strip()
+    if not first or len(first) > 40:
+        return (
+            f"Hi, this is Christy, an AI voice assistant calling from {_COMPANY} "
+            "about your job application. Am I speaking to the right person?"
+        )
+    return (
+        f"Hi, this is Christy, an AI voice assistant calling from {_COMPANY} "
+        f"about your job application. Am I speaking to {first}?"
+    )
+
+
+def phone_identity_reask_text(candidate_name: Any) -> str:
+    """Asked ONCE when the first reply names somebody other than the candidate.
+
+    It states who we are trying to reach and asks a closed question, because
+    the next answer decides whether the call ends. It never accuses: a
+    household member answering, a nickname the résumé does not carry, and a
+    genuinely wrong number all sound the same from here.
+    """
+    first = ""
+    if isinstance(candidate_name, str):
+        parts = candidate_name.strip().split()
+        if parts:
+            first = parts[0].strip()
+    if not first or len(first) > 40:
+        return (
+            "Sorry — I may have the wrong number. Am I speaking to the person "
+            "who applied for this role?"
+        )
+    return (
+        f"Sorry — I think I may have the wrong number. I'm trying to reach "
+        f"{first}. Is that you?"
+    )
 PHONE_SILENCE_PROMPT_TEXT = "Are you still there? No worries if you need a moment."
 #: The SECOND nudge (2026-09-06): spoken once after the first prompt goes
 #: unanswered, before the goodbye. A brief, warmer check-in so a candidate who
@@ -880,6 +932,30 @@ def phone_tts_flush_min_chars() -> int:
     return _bounded_int_env(os.getenv("PHONE_TTS_FLUSH_MIN_CHARS"), 0, 0, 400)
 
 
+def phone_tts_pace() -> float:
+    """Sarvam ``bulbul`` speaking rate for the PHONE lane. Default 1.0.
+
+    Hardcoded at ``pace=1.0`` until now, on both lanes, with a comment saying it
+    stayed there by owner request — so slowing the voice meant editing code and
+    redeploying the worker. It is a knob for the same reason the TTS voice and
+    model are: it changes how the bot SOUNDS to a candidate, and that is tuned
+    against live calls rather than decided once.
+
+    LOWER IS SLOWER. Sarvam treats this as a multiplier on the delivery rate, so
+    0.9 is a ~10% slower read. A slower read also makes the first-fragment join
+    less noticeable, because each half is articulated more fully — it compounds
+    with the word-boundary fix in ``tts_node`` rather than substituting for it.
+
+    Clamped to [0.5, 2.0]: outside that Sarvam's own validation rejects the
+    request, and a rejected synthesis is silence on a live call. A malformed
+    value falls back to 1.0 rather than raising, like every other bounded reader
+    here. PHONE ONLY — the browser lane keeps its hardcoded 1.0, which is
+    deliberately frozen. Read at the call site with the literal name so the
+    env-contract scanner sees it.
+    """
+    return _bounded_float(os.getenv("PHONE_TTS_PACE"), 1.0, 0.5, 2.0)
+
+
 def phone_tts_tail_peek_timeout_sec() -> float:
     """Bound on the numeric-protection read-ahead in the phone ``tts_node``.
 
@@ -982,6 +1058,82 @@ def phone_deterministic_opener() -> bool:
     return (os.getenv("PHONE_DETERMINISTIC_OPENER") or "true").strip().lower() not in (
         "false", "0", "no", "off",
     )
+
+
+def phone_gate_flow() -> str:
+    """``deterministic`` (DEFAULT) or ``conversational`` — the opening's SHAPE.
+
+    ``deterministic`` is today's gate, unchanged to the byte: one fixed
+    disclosure that ends on the consent ask, then the fixed role line. Merging
+    this change alters nothing until the value is set.
+
+    ``conversational`` inserts ONE turn before consent — an identity check:
+
+        bot        "Hi, this is Christy … am I speaking to Priya?"
+        candidate  "Yes, this is Priya."          → consent, as today
+        candidate  "No, this is Ravi."            → ONE confirming re-ask
+        candidate  (confirms the mismatch)        → apologise and hang up
+
+    WHY IT IS A SEPARATE TURN, AND NOT A LONGER OPENING. On 2026-09-09 a model
+    folded an identity question onto the end of the consent opening. The
+    candidate answered the identity ("yes, this is Christo"), the strict consent
+    classifier could not read that as consent, and the gate timed out to MACHINE
+    and tore the call down. ``_OPENING_IDENTITY_CUE_RE`` was added to reject that
+    shape, and the whole LLM opener was switched off behind
+    ``PHONE_DETERMINISTIC_OPENER``.
+
+    The lesson was not "never ask who you are speaking to". It was that ONE
+    QUESTION GETS ONE CLASSIFIER. Here the identity question has its own turn and
+    its own reader (``phone_name_mismatch``), and the consent question keeps the
+    strict affirmative classifier it has always had. Neither answer can land on
+    the other's parser.
+
+    WHAT ENDS THE CALL, AND WHAT DOES NOT. Only a name that was EXTRACTED and is
+    genuinely different ends it, and only after a confirming re-ask.
+    ``phone_name_mismatch`` already returns None for a nickname, a spelling or
+    transliteration variant, a first/last ordering swap, and — importantly — for
+    any reply it cannot pull a name out of at all. So "Yes", "Speaking", or
+    silence proceed to consent exactly as before. The bar for hanging up on a
+    real applicant is deliberately high; the cost of one wasted screening is far
+    lower than the cost of refusing to talk to the right person.
+
+    ROLLBACK: unset, or set ``deterministic``. Read at the call site with the
+    literal name so the env-contract scanner sees it.
+    """
+    value = (os.getenv("PHONE_GATE_FLOW") or "").strip().lower()
+    return "conversational" if value == "conversational" else "deterministic"
+
+
+def phone_identity_reask_confirms_mismatch(text: Any, candidate_name: Any) -> bool:
+    """True when the re-ask answer CONFIRMS we have the wrong person.
+
+    Fail-CLOSED toward continuing the call, which is the opposite of the consent
+    classifier's bias and deliberately so. Consent must be affirmatively given,
+    so an unreadable consent answer is refused. Identity is the reverse: we
+    already believe this is the right number — the pipeline dialled it from the
+    candidate's own record — so an unreadable identity answer must NOT hang up
+    on somebody who may well be the applicant.
+
+    Only two things confirm a mismatch:
+      * an explicit negative to "is that you?" ("no", "nope", "wrong number",
+        "not me", "he's not here"), or
+      * a SECOND extracted name that still does not match the record.
+
+    Anything else — "yes", "speaking", silence, a mumble, a name that turns out
+    to be a variant — continues to consent.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return False
+    lowered = text.strip().lower()
+    # An affirmative wins outright: "yes, that's me" must never be read as a
+    # mismatch just because a stray token later in the sentence looks like a name.
+    if _IDENTITY_AFFIRM_RE.search(lowered):
+        return False
+    if _IDENTITY_DENY_RE.search(lowered):
+        return True
+    # No explicit denial — fall back to the name evidence. A second mismatching
+    # name is a confirmation; anything unextractable is not.
+    return phone_name_mismatch(text, candidate_name) is not None
 
 
 def phone_role_opening_prerender_enabled() -> bool:
@@ -4343,12 +4495,79 @@ _OPENING_CONSENT_CUE_RE = re.compile(
 # which also occur in legitimate consent asks ("is this okay?", "are you okay to
 # continue?"). These catch a compound final question that pairs a consent cue
 # with an identity ask ("...okay to continue, and am I speaking with Christo?").
+# ── The identity re-ask's two verdicts (0095, conversational gate) ──────────
+# Read ONLY against the answer to "is that you?" — never against a consent
+# answer, and never mid-screening.
+#
+# `_IDENTITY_AFFIRM_RE` is checked FIRST and wins outright, because "yes, this
+# is Priya's phone, she's right here" contains a name the extractor would read
+# as a third party. An affirmation is the candidate telling us we reached them;
+# nothing later in the sentence should overturn it.
+#
+# `_IDENTITY_DENY_RE` is narrow on purpose. It must not fire on "no worries",
+# "no problem" or "I'm not sure" — three things a real candidate says while
+# confirming they ARE the candidate — so the bare-negative arm is anchored and
+# the rest require an explicit wrong-person phrase.
+_IDENTITY_AFFIRM_RE = re.compile(
+    r"^(?:\W*(?:um+|uh+|er+|ah+|oh|hi|hello|hey|yeah|well)\W+){0,3}"
+    r"(?:yes|yeah|yea|yep|yup|ya|speaking|that'?s me|this is me|it'?s me|"
+    r"you are|you have|correct|right|absolutely|indeed|i am|i'?m)\b"
+    r"|\bthat'?s (?:me|right|correct)\b|\byou'?ve got (?:me|the right)\b",
+    re.IGNORECASE,
+)
+_IDENTITY_DENY_RE = re.compile(
+    r"^(?:\W*(?:um+|uh+|er+|ah+|oh|sorry)\W+){0,3}(?:no|nope|nah)\b"
+    r"|\bwrong (?:number|person)\b|\bnot me\b|\bthat'?s not me\b"
+    r"|\b(?:he|she|they)(?:'s| is| are)? not (?:here|available|in)\b"
+    r"|\bno one (?:by|with) that name\b|\bnobody (?:by|with) that name\b"
+    r"|\bdoes(?:n't| not) live here\b|\byou(?:'ve| have) got the wrong\b",
+    re.IGNORECASE,
+)
+
 _OPENING_IDENTITY_CUE_RE = re.compile(
     r"\b(?:speaking (?:with|to)|talking to|am i (?:speaking|reaching)|"
     r"who am i|have i reached|reached the right|(?:the )?(?:right|correct) person|"
     r"your name|confirm you are)\b",
     re.IGNORECASE,
 )
+
+
+def _identity_is_verified(text: Any) -> bool:
+    """True when a generated identity opener ENDS on the identity ask.
+
+    The mirror of ``_opening_is_verified``, and it exists for the same reason
+    that one does: the candidate answers the LAST question they heard. If the
+    identity line ends on anything else — a consent ask, a second question, a
+    statement — the reply lands on the wrong classifier and the turn is wasted
+    or, worse, misread.
+
+    So: END on ``?``, the final sentence must carry an identity cue, and it must
+    NOT carry a consent cue. The consent-cue rejection is the load-bearing half.
+    A model that helpfully folds "…and is it okay if I record this?" into the
+    greeting collapses two turns into one, and the name-mismatch check would
+    then run against an answer that was about recording. That is the 2026-09-09
+    incident with the roles reversed.
+
+    It deliberately does NOT check that the candidate's name appears. A model
+    asked to greet "Priya" may reasonably say "am I speaking with the right
+    person?" — still a valid identity ask, and the mismatch detector reads the
+    ANSWER, not this question.
+    """
+    if not isinstance(text, str):
+        return False
+    clean = text.strip()
+    if not clean:
+        return False
+    stripped = clean.rstrip().rstrip("\"'”’").rstrip()
+    if not stripped.endswith("?"):
+        return False
+    sentences = [s for s in re.split(r"(?<=[.!?])\s+", clean) if s.strip()]
+    last = sentences[-1] if sentences else clean
+    if not _OPENING_IDENTITY_CUE_RE.search(last):
+        return False
+    if _OPENING_CONSENT_CUE_RE.search(last):
+        return False
+    return True
 
 
 def _opening_is_verified(text: Any) -> bool:
@@ -4425,6 +4644,23 @@ async def run_phone_gate(
     # and falling back to on-demand synthesis. Used ONLY for the fixed fallback
     # line; absent ⇒ the line is spoken through `say` exactly as before.
     say_role_opening: Optional[Callable[[str], Awaitable[Any]]] = None,
+    # ── 0095: the conversational identity turn. All three are optional and
+    # absent ⇒ the deterministic flow, byte-identical. They are injected rather
+    # than session-bound for the same reason every other seam here is: the gate
+    # owns the ORDER, `agent.py` owns the machinery, and the tests drive the
+    # order without a LiveKit session.
+    #
+    # Returns the candidate's next utterance as text, or "" on silence. The
+    # caller owns the timeout — the gate does not invent a second clock.
+    next_candidate_turn: Optional[Callable[[], Awaitable[str]]] = None,
+    # Compose ONE gate line from the model and return it as TEXT. It must NOT
+    # speak: the gate verifies what it gets back and speaks it itself, which is
+    # what makes speak-then-verify structurally impossible here. `None` ⇒ the
+    # fixed line for that step.
+    compose_gate_line: Optional[Callable[[str], Awaitable[Optional[str]]]] = None,
+    # The name on the application, used to address the candidate and as the
+    # record side of the mismatch comparison.
+    candidate_name: str | None = None,
 ) -> PhoneGateResult:
     """Run the phone screening's opening, in the ONLY order that is safe.
 
@@ -4474,10 +4710,45 @@ async def run_phone_gate(
     #: The exact opening the bot spoke — from whichever path — so the gate
     #: transcript commit records what the candidate actually heard.
     opening_spoken: list[str] = []
+    #: The gate transcript IN SPOKEN ORDER (0095). The deterministic flow fills
+    #: this with the same two rows it always committed — [opening, consent
+    #: reply] — assembled just before the commit. The conversational flow
+    #: appends the identity exchange as it happens, so the order is the order
+    #: the candidate heard rather than a shape reassembled afterwards.
+    #: `commit_phone_gate_turns` and its route both accept 1..6 rows.
+    gate_turns: list[dict[str, Any]] = []
 
     async def _say(text: str) -> None:
         spoken.append(text)
         await say(text)
+
+    async def _commit_gate_turns() -> None:
+        """Persist the gate transcript once, best effort. Never fails the gate.
+
+        Defined HERE, above every caller, because the conversational flow can
+        end the call at the identity turn — before the consent block that used
+        to own this function even runs.
+        """
+        committer = getattr(client, "commit_gate_turns", None)
+        if not callable(committer) or session_id is None:
+            return
+        if not gate_turns:
+            return
+        try:
+            outcome = await committer(
+                session_id, list(gate_turns), f"gate:{session_id}",
+            )
+        except Exception:  # noqa: BLE001
+            _log.warn(
+                "unknown_event", error_type="phone_gate_turns_failed",
+                error_category="gate_turns_exception",
+            )
+            return
+        if not outcome.ok:
+            _log.warn(
+                "unknown_event", error_type="phone_gate_turns_failed",
+                error_category="gate_turns_unconfirmed",
+            )
 
     participant = await wait_for_participant()
     if participant is None:
@@ -4585,6 +4856,115 @@ async def run_phone_gate(
             start_role_prerender()
         except Exception:  # noqa: BLE001
             pass
+
+    # ── 0095: THE IDENTITY TURN (conversational flow only) ────────────────
+    # One question — "am I speaking to <name>?" — with its OWN reader, spoken
+    # BEFORE the consent disclosure and never folded into it. See
+    # `phone_gate_flow` for why this is a separate turn rather than a longer
+    # opening: one question gets one classifier, and the 2026-09-09 teardown
+    # was caused by two questions sharing the consent parser.
+    #
+    # EVERYTHING BELOW IS SKIPPED ENTIRELY under the default flow, so the
+    # deterministic gate stays byte-identical.
+    identity_confirmed_wrong = False
+    if (
+        phone_gate_flow() == "conversational"
+        and next_candidate_turn is not None
+    ):
+        identity_line = None
+        if compose_gate_line is not None:
+            try:
+                identity_line = await compose_gate_line("identity")
+            except Exception:  # noqa: BLE001
+                identity_line = None
+        # VERIFY BEFORE SPEAKING. The composer returns TEXT, never audio, and
+        # this is the only place it can reach the candidate — so an opener that
+        # folded the consent ask into the greeting is replaced here rather than
+        # spoken and then contradicted. That inversion is the whole point: the
+        # 2026-09-09 incident was speak-then-verify.
+        if not _identity_is_verified(identity_line):
+            if isinstance(identity_line, str) and identity_line.strip():
+                _log.warn(
+                    "unknown_event", error_type="phone_identity_opening",
+                    error_category="identity_unverified",
+                )
+            identity_line = phone_identity_text(candidate_name)
+        else:
+            identity_line = identity_line.strip()  # type: ignore[union-attr]
+            _log.info(
+                "unknown_event", error_type="phone_identity_opening",
+                error_category="identity_generated",
+            )
+        await _say(identity_line)
+        gate_turns.append({"speaker": "bot", "text": identity_line})
+
+        first_reply = ""
+        try:
+            first_reply = await next_candidate_turn()
+        except Exception:  # noqa: BLE001
+            first_reply = ""
+        if first_reply:
+            gate_turns.append({"speaker": "candidate", "text": first_reply})
+
+        # `phone_name_mismatch` is conservative by contract: it returns None for
+        # a nickname, a spelling or transliteration variant, a first/last
+        # ordering swap, AND for any reply it cannot extract a name from at all.
+        # So "Yes", "Speaking" and silence all fall through to consent — only an
+        # extracted, genuinely different name reaches the re-ask.
+        mismatch = phone_name_mismatch(first_reply, candidate_name)
+        if mismatch is not None:
+            _log.info(
+                "unknown_event", error_type="phone_identity_mismatch",
+                error_category="reask", schema=mismatch.get("ratio"),
+            )
+            reask_line = phone_identity_reask_text(candidate_name)
+            await _say(reask_line)
+            gate_turns.append({"speaker": "bot", "text": reask_line})
+
+            second_reply = ""
+            try:
+                second_reply = await next_candidate_turn()
+            except Exception:  # noqa: BLE001
+                second_reply = ""
+            if second_reply:
+                gate_turns.append({"speaker": "candidate", "text": second_reply})
+
+            # Fail-OPEN toward continuing: only an explicit denial or a SECOND
+            # mismatching name ends the call. Silence, a mumble, or an
+            # affirmation all proceed to consent — hanging up on the actual
+            # applicant is far more costly than one wasted screening.
+            identity_confirmed_wrong = phone_identity_reask_confirms_mismatch(
+                second_reply, candidate_name,
+            )
+            _log.info(
+                "unknown_event", error_type="phone_identity_mismatch",
+                error_category=(
+                    "confirmed" if identity_confirmed_wrong else "cleared"
+                ),
+            )
+
+    if identity_confirmed_wrong:
+        # The wrong person, twice. Apologise and hang up on the EXISTING
+        # terminal path — `candidate.wrong_number` already posts the event,
+        # speaks `PHONE_WRONG_NUMBER_TEXT` and suppresses the number, which is
+        # exactly the right outcome for a line that does not reach the
+        # candidate. No new vocabulary, no new closing copy.
+        decision = CLASSIFY_WRONG_NUMBER
+        event = _OUTCOME_EVENT.get(decision)
+        if event is not None:
+            posted = await _post(event)
+            if event_applied(posted):
+                events.append(event)
+        closing = _OUTCOME_CLOSING.get(decision)
+        if closing:
+            await _say(closing)
+            spoken.append(closing)
+        await _commit_gate_turns()
+        _log.info(
+            "unknown_event", error_type="phone_gate_outcome",
+            error_category=decision, schema="identity_mismatch_confirmed",
+        )
+        return PhoneGateResult(decision, events=events, spoken=spoken)
 
     # ── The opening: model-generated-and-verified, or the fixed disclosure ─
     if speak_opening is not None:
@@ -4709,33 +5089,14 @@ async def run_phone_gate(
         else None
     )
 
-    async def _commit_gate_turns() -> None:
-        """Persist [opening, consent reply] once, best effort. Never fails the gate."""
-        committer = getattr(client, "commit_gate_turns", None)
-        if not callable(committer) or session_id is None:
-            return
-        turns: list[dict[str, Any]] = []
-        if opening_spoken:
-            turns.append({"speaker": "bot", "text": opening_spoken[-1]})
-        if consent_reply:
-            turns.append({"speaker": "candidate", "text": consent_reply})
-        if not turns:
-            return
-        try:
-            outcome = await committer(
-                session_id, turns, f"gate:{session_id}",
-            )
-        except Exception:  # noqa: BLE001
-            _log.warn(
-                "unknown_event", error_type="phone_gate_turns_failed",
-                error_category="gate_turns_exception",
-            )
-            return
-        if not outcome.ok:
-            _log.warn(
-                "unknown_event", error_type="phone_gate_turns_failed",
-                error_category="gate_turns_unconfirmed",
-            )
+    # The consent exchange, appended in spoken order. Under the deterministic
+    # flow these are the ONLY two rows, byte-identical to what this gate has
+    # always committed; under the conversational flow they follow the identity
+    # exchange already appended above.
+    if opening_spoken:
+        gate_turns.append({"speaker": "bot", "text": opening_spoken[-1]})
+    if consent_reply:
+        gate_turns.append({"speaker": "candidate", "text": consent_reply})
 
     # New clients use the single atomic consent/start boundary. Legacy fakes
     # remain supported during rollout, but production's client always exposes
@@ -5760,6 +6121,76 @@ async def phone_warm_prefix_cache(
         await infer_fn(prefix)
     except Exception:  # noqa: BLE001 — a warm-up must never surface on the call
         return
+
+
+#: Bound on the identity-line composition. Tighter than the Q1 rephrase's 3.0s
+#: because this one sits between "hello?" and our first word: a candidate who
+#: has just picked up is listening to silence, and past ~2s that silence reads
+#: as a dropped call. On expiry the fixed line is spoken instead, so the cost of
+#: the bound is a scripted greeting, never dead air.
+PHONE_IDENTITY_COMPOSE_TIMEOUT_SEC = 2.0
+
+
+def phone_identity_instruction(candidate_name: Any) -> str | None:
+    """The instruction for the identity opener, or None when there is no name.
+
+    Everything the model is forbidden from doing here is something a previous
+    live call actually did. It must not mention recording or consent (that is
+    the NEXT turn, and folding them collapses two classifiers into one); it must
+    not ask a second question (the candidate answers the last one they heard);
+    and it must end on the identity question itself.
+    """
+    if not isinstance(candidate_name, str):
+        return None
+    first = candidate_name.strip().split()[0] if candidate_name.strip().split() else ""
+    if not first or len(first) > 40:
+        return None
+    return (
+        "You are Christy, an AI voice assistant calling a job applicant on the "
+        f"phone for {_COMPANY}. This is the very first thing you say after they "
+        "pick up.\n"
+        "Greet them warmly, say who you are and that you are calling about "
+        f"their job application, then ask whether you are speaking to {first}.\n"
+        "RULES:\n"
+        "- Ask EXACTLY ONE question, and it MUST be whether you are speaking to "
+        f"{first}.\n"
+        "- Do NOT mention recording, consent, or continuing — that comes later.\n"
+        "- Do NOT ask anything else. End your reply on the question.\n"
+        "- Two short sentences at most. Speakable plain text, no markdown, no "
+        "emoji, no stage directions.\n"
+    )
+
+
+async def phone_compose_identity_line(
+    candidate_name: Any,
+    *,
+    infer: Callable[[str], Awaitable[Any]] | None = None,
+) -> str | None:
+    """A model-authored identity opener, or None to use the fixed line.
+
+    Returns TEXT and speaks nothing — see `run_phone_gate`, which verifies the
+    result with `_identity_is_verified` before a word reaches TTS. Returning
+    None on every failure (no name, no instruction, timeout, non-string body,
+    empty draft) means the caller's fixed line is the single fallback and there
+    is no path on which an unverified draft is spoken.
+
+    The verification itself deliberately lives at the CALL SITE rather than
+    here: a composer that both generated and validated could be bypassed by a
+    future caller that forgot to check. The gate cannot forget, because it
+    speaks only what it has verified.
+    """
+    instruction = phone_identity_instruction(candidate_name)
+    if instruction is None:
+        return None
+    infer_fn = infer or _default_phone_interviewer_text
+    try:
+        raw = await asyncio.wait_for(
+            infer_fn(instruction), timeout=PHONE_IDENTITY_COMPOSE_TIMEOUT_SEC,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    draft = raw.strip() if isinstance(raw, str) else ""
+    return draft or None
 
 
 async def phone_rephrase_first_question(
@@ -10176,15 +10607,47 @@ def phone_agent_class(agent_base: Any) -> Any:
                     # (alpha-guard: a letter-free first fragment like "2019." is
                     # rejected 400 by Sarvam). A boundary reached before any
                     # letter keeps accumulating so digits/punct merge FORWARD.
+                    _terminator = ch in _TTS_SENTENCE_TERMINATORS
+                    _clause_pause = (
+                        ch in _TTS_CLAUSE_PAUSE_PUNCT
+                        and alpha >= _TTS_FIRST_FRAGMENT_MIN_CHARS
+                    )
                     if (
-                        ch in _TTS_SENTENCE_TERMINATORS
-                        or (
-                            ch in _TTS_CLAUSE_PAUSE_PUNCT
-                            and alpha >= _TTS_FIRST_FRAGMENT_MIN_CHARS
-                        )
+                        _terminator
+                        or _clause_pause
                         or dense >= min_chars
                     ) and any(c.isalpha() for c in first):
                         leftover = chunk[idx + 1:]
+                        # ── THE CAP MUST NOT CUT A WORD IN HALF ────────────
+                        # The two punctuation arms above always land on a
+                        # boundary. The `min_chars` arm is a raw character
+                        # count and lands wherever it lands — including the
+                        # MIDDLE OF A WORD. Each fragment is its own Sarvam
+                        # synthesis, so a word split across the two calls is
+                        # voiced twice with no context on either side: the
+                        # audible result is a cracked or mispronounced word at
+                        # the join, once per utterance. Reported on the live
+                        # call of 2026-09-10 and the reason the deployed value
+                        # was raised — but raising it only makes a mid-word cut
+                        # RARER, it does not stop one.
+                        #
+                        # So when the cap fired ALONE, back the fragment off to
+                        # the last space and hand the partial word forward to
+                        # the remainder, which is where its context lives.
+                        # Both halves of a split word then belong to the same
+                        # synthesis call.
+                        if not _terminator and not _clause_pause:
+                            cut = first.rfind(" ")
+                            # Only back off to a real word boundary that still
+                            # leaves something speakable. A single word longer
+                            # than the cap (no space at all, or nothing but
+                            # punctuation before the space) keeps the previous
+                            # behaviour — there is no better cut available, and
+                            # refusing to flush would forfeit the latency the
+                            # cap exists to buy.
+                            if cut > 0 and any(c.isalpha() for c in first[:cut]):
+                                leftover = first[cut + 1:] + leftover
+                                first = first[:cut]
                         found = True
                         break
                 if found:
