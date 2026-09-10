@@ -353,14 +353,19 @@ export function fallbackParseResumeText(text: string): ParsedResume {
     : prose.prior;
 
   // Dated role lines beyond the first: any line in the top of the document
-  // that names a role word AND carries a date range is a stint the recruiter
-  // would count. Bounded to the first 60 lines and 8 spans, evidence-only.
-  const datedLinePeriods: string[] = [];
+  // that names a WHOLE role word (boundary-anchored — "Engineering" in a degree
+  // line is not "engineer") AND carries a date range is a stint the recruiter
+  // would count. Bullet lines are achievements, never stints. The line itself
+  // is passed as the pseudo-role's title so the derivation's education veto
+  // ("Bachelor of Engineering, VIT, 2014 – 2018") can see it. Bounded to the
+  // first 60 lines and 8 spans, evidence-only.
+  const datedLineRoles: ResumeRoleEvidence[] = [];
   for (const line of lines.slice(0, 60)) {
-    if (datedLinePeriods.length >= 8) break;
-    if (line === current_role || !roleIndicators.test(line) || line.length > 200) continue;
-    const p = extractPeriodFromLine(line);
-    if (p) datedLinePeriods.push(p);
+    if (datedLineRoles.length >= 8) break;
+    if (line === current_role || line.length > 200) continue;
+    if (/^[-•·*]\s/.test(line) || !ROLE_TITLE_WORD.test(line)) continue;
+    const period = extractPeriodFromLine(line);
+    if (period) datedLineRoles.push({ title: line, employer: null, period, highlights: [] });
   }
 
   return {
@@ -373,8 +378,8 @@ export function fallbackParseResumeText(text: string): ParsedResume {
     // derivation does. Null when neither exists — never a guess.
     experience_years: experience_years
       ?? deriveExperienceYearsFromRoles([
-        recent_role,
-        ...datedLinePeriods.map((period) => ({ title: null, employer: null, period, highlights: [] })),
+        recent_role ? { ...recent_role, title: current_role ?? recent_role.title } : null,
+        ...datedLineRoles,
       ]),
     current_role,
     summary,

@@ -285,9 +285,10 @@ export function parsePeriod(period: string | null | undefined, now: Date): Perio
       const last = tokens[tokens.length - 1];
       end = toIndex(last) + END_WIDTH_MONTHS[last.precision];
       imprecise = last.precision === 'year';
-      // A bare-year end is imprecise; a stated duration on the same segment
-      // ("2018 – 2020 (2.5 yrs)") is the document's own, better answer.
-      if (imprecise && duration !== null && start + duration > end) end = start + duration;
+      // A bare-year end is imprecise either way (out by up to 11 months); a
+      // stated duration on the same segment ("2018 – 2020 (2.5 yrs)",
+      // "2019 – 2020 (6 months)") is the document's own, better answer.
+      if (imprecise && duration !== null) end = start + duration;
     } else if (duration !== null) {
       end = start + duration;
     } else {
@@ -304,7 +305,7 @@ export function parsePeriod(period: string | null | undefined, now: Date): Perio
   // A duration stated in its own segment ("2019 – 2020 | 2 yrs") outranks a
   // bare-year range it accompanies — the years alone can be out by up to 11
   // months either way, the document's own figure cannot.
-  if (spans.length > 0 && allEndsImprecise && durationOnly !== null && durationOnly > unionMonths(spans)) {
+  if (spans.length > 0 && allEndsImprecise && durationOnly !== null) {
     const start = Math.min(...spans.map((s) => s[0]));
     return { spans: [[start, start + durationOnly]], durationOnlyMonths: null };
   }
@@ -330,16 +331,34 @@ export function unionMonths(spans: ReadonlyArray<[number, number]>): number {
 }
 
 /**
- * Titles that are education, not employment. The tolerant structurer turns a
- * string entry such as "B.Tech CSE, VIT, 2018 – 2022" into a role, and a
- * model sometimes files a degree under `prior_roles`; neither is experience.
+ * Education, not employment. The tolerant structurer turns a string entry such
+ * as "B.Tech CSE, VIT, 2018 – 2022" into a role, and a model sometimes files a
+ * degree under `prior_roles`; neither is experience.
+ *
+ * Two lexicons, applied asymmetrically, because the candidate pool this bot
+ * screens is full of people who WORK at institutions (admission counsellors at
+ * universities, school coordinators, campus recruiters):
+ *   · a DEGREE word in the title ("B.Tech", "MBA", "Bachelor of Engineering",
+ *     "Class of 2019") marks education outright;
+ *   · an INSTITUTION word ("university", "college", "school") marks education
+ *     only when there is no job title to say otherwise — a "Program Advisor at
+ *     Amity University" is a job.
+ * A recognisable job word in the title always wins.
  */
-const EDUCATION_TITLE_RE =
-  /\b(?:b\.?\s?tech|b\.?\s?e\.?|b\.?\s?sc|b\.?\s?com|b\.?\s?a\.?|b\.?\s?b\.?\s?a|b\.?\s?c\.?\s?a|m\.?\s?tech|m\.?\s?sc|m\.?\s?com|m\.?\s?c\.?\s?a|mba|pgdm|ph\.?\s?d|bachelor|master'?s?|diploma|degree|university|college|institute of|school|class of|batch of|graduat(?:e|ed|ion)|higher secondary|hsc|ssc|10th|12th|xii|cbse|icse)\b/i;
+const DEGREE_TITLE_RE =
+  /\b(?:b\.?\s?tech|b\.?\s?e\.?|b\.?\s?sc|b\.?\s?com|b\.?\s?a\.?|b\.?\s?b\.?\s?a|b\.?\s?c\.?\s?a|m\.?\s?tech|m\.?\s?sc|m\.?\s?com|m\.?\s?c\.?\s?a|mba|pgdm|ph\.?\s?d|bachelor(?:'s|s)?|master(?:'s|s)?\s+(?:of|in|degree)|diploma|class of|batch of|graduat(?:e|ed|ion)|higher secondary|senior secondary|hsc|ssc|10th|12th|xii|cbse|icse|student|scholar)\b/i;
+const INSTITUTION_RE = /\b(?:university|college|institute of|school|polytechnic|vidyalaya|academy)\b/i;
+const JOB_TITLE_WORD_RE =
+  /\b(?:engineer|developer|manager|analyst|executive|associate|consultant|lead|intern|trainee|officer|specialist|teacher|professor|lecturer|faculty|counsell?or|advisor|adviser|coordinator|recruiter|trainer|head|director|president|dean|registrar|principal|scientist|accountant|administrator|fellow|representative|sales|support|designer|architect|technician|marketer|strategist|founder|owner|partner)\b/i;
 
 export function isEducationLikeRole(role: ResumeRoleEvidence): boolean {
-  const text = `${role.title ?? ''} ${role.employer ?? ''}`;
-  return EDUCATION_TITLE_RE.test(text) && !/\b(?:engineer|developer|manager|analyst|executive|associate|consultant|lead|intern|trainee|officer|specialist|teacher|professor|lecturer|faculty)\b/i.test(role.title ?? '');
+  const title = role.title ?? '';
+  const employer = role.employer ?? '';
+  if (DEGREE_TITLE_RE.test(title)) return true;
+  if (JOB_TITLE_WORD_RE.test(title)) return false;
+  // No job word in the title: an institution employer (or a bare institution
+  // line with no title at all) reads as schooling.
+  return INSTITUTION_RE.test(`${title} ${employer}`);
 }
 
 /**
@@ -369,24 +388,43 @@ export function deriveExperienceYearsFromRoles(
 }
 
 /**
+ * One date token, WITHOUT capture groups, for composing the range scanner
+ * below. Kept in lockstep with `DATE_TOKEN_RE` (same six alternatives).
+ */
+const TOKEN_NC_SRC = [
+  /\b[a-z]{3,9}\.?[\s.'’-]{0,3}(?:\d{1,2}(?:st|nd|rd|th)?,?\s{1,3})?\d{4}\b/.source,
+  /\b[a-z]{3,9}\.?\s{0,3}['’]\s{0,2}\d{2}\b/.source,
+  /\bq[1-4]\s{0,2}['’]?\s{0,2}\d{4}\b/.source,
+  /\b\d{1,2}[/.-]\d{4}\b/.source,
+  /\b\d{4}[/.-]\d{1,2}\b/.source,
+  /\b(?:19|20)\d{2}\b/.source,
+].join('|');
+
+/**
+ * A DATE RANGE on a line: `<date> <separator> (<date> | <present marker>)`.
+ * Anchoring on the separator is what keeps a stray 4-digit number earlier on
+ * the line ("Acme (Est. 1985)", "Room 2019", "Class of 2019") from becoming
+ * the start year — only the token immediately before the dash/"to" is.
+ */
+const RANGE_ON_LINE_RE = new RegExp(
+  `(?:${TOKEN_NC_SRC})\\s{0,3}(?:[–—-]|to|till|until|through|thru)\\s{0,3}(?:(?:${TOKEN_NC_SRC})|${PRESENT_WORD_RE.source.replace(/^\\b|\\b$/g, '')})`,
+  'gi',
+);
+
+/**
  * The verbatim period substring of one résumé line, for the deterministic
- * extractor: from the first date token to the last date token or present
- * marker. `null` when the line carries fewer than a range's worth of dates.
- * Used so a prose/section role line such as "Senior Sales Executive, Acme —
- * Bengaluru  Jan 2021 – Present" contributes its dates to the total.
+ * extractor: the LAST `<date> – <date|present>` range on the line, so a role
+ * line such as "Senior Sales Executive, Acme — Bengaluru  Jan 2021 – Present"
+ * contributes its dates to the total. `null` when the line carries no range.
  */
 export function extractPeriodFromLine(line: string, now: Date = new Date()): string | null {
   const text = line.slice(0, 400);
-  const tokens = extractDateTokens(text, now);
-  if (tokens.length === 0) return null;
-  const firstIdx = text.search(/(?:19|20)\d{2}|['’]\d{2}\b|\b[A-Za-z]{3,9}\.?[\s.'’-]{0,3}(?:\d{1,2}(?:st|nd|rd|th)?,?\s{1,3})?(?:19|20)\d{2}/);
-  if (firstIdx === -1) return null;
-  const tail = text.slice(firstIdx);
-  const present = tail.match(PRESENT_WORD_RE);
-  const lastYear = [...tail.matchAll(/(?:19|20)\d{2}|['’]\d{2}\b/g)].pop();
-  let endIdx = lastYear ? (lastYear.index ?? 0) + lastYear[0].length : 0;
-  if (present && (present.index ?? 0) + present[0].length > endIdx) endIdx = (present.index ?? 0) + present[0].length;
-  const period = tail.slice(0, endIdx).trim();
-  if (!period) return null;
-  return tokens.length >= 2 || PRESENT_WORD_RE.test(period) ? period : null;
+  let last: string | null = null;
+  RANGE_ON_LINE_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = RANGE_ON_LINE_RE.exec(text)) !== null) last = m[0];
+  if (last === null) return null;
+  const period = last.trim();
+  // The range must parse into a span under this module's own rules.
+  return parsePeriod(period, now).spans.length > 0 ? period : null;
 }

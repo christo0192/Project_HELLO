@@ -323,11 +323,11 @@ function coerceEmail(v: unknown, max: number): string | null {
  * fields therefore split only on hard separators — newline, semicolon, pipe,
  * bullet, and a " - " that begins a line or follows a wide gap.
  *
- * Both are LINEAR: single-character alternatives plus one bounded `\s{2,}-\s`
- * — no overlapping whitespace quantifiers (an earlier `\s*(…|\s{2,}-\s+)\s*`
- * was ~n³ on a whitespace run and could stall the event loop on a field the
- * model echoed from a whitespace-padded résumé table). The input is also
- * length-bounded BEFORE splitting (see `coerceStringList`).
+ * Both are cheap: single-character alternatives plus one `\s{2,}-\s` (at
+ * worst quadratic over a whitespace run — an earlier `\s*(…|\s{2,}-\s+)\s*`
+ * was ~n³ and could stall the event loop on a field the model echoed from a
+ * whitespace-padded résumé table). What bounds the cost is that the input is
+ * length-capped BEFORE splitting (see `coerceStringList`): ~17 ms worst case.
  */
 const LIST_SPLIT_ITEMS_RE = /[,;|•·\n]|\s{2,}-\s|^-\s/m;
 const LIST_SPLIT_PROSE_RE = /[;|•·\n]|\s{2,}-\s|^-\s/m;
@@ -456,7 +456,7 @@ function coercePriorRoles(v: unknown): RoleEvidence[] {
  * "%" is not an experience figure at all.
  */
 const YEARS_IN_STRING_RE =
-  /^(?:[a-z.~]{0,12}\s{0,2})?(\d{1,3}(?:\.\d{1,2})?)\s*\+?\s*(?:-\s*\d{1,3}\s*)?(years?|yrs?|y\b|months?|mos?\b|m\b)?/i;
+  /^(?:~\s?)?(?:[a-z]{1,12}\.?\s+){0,3}(\d{1,3}(?:\.\d{1,2})?)\s*\+?\s*(?:-\s*\d{1,3}\s*)?(years?|yrs?|y\b|months?|mos?\b|m\b)?/i;
 
 /**
  * Coerce total years. A JSON number is taken as-is; a string with a figure and
@@ -510,9 +510,12 @@ function coercePhone(v: unknown): string | null {
     if (!Number.isSafeInteger(v) || v <= 0) return null;
     s = String(v);
   } else if (Array.isArray(v)) {
-    // Several numbers listed: take the first string or integer entry. The rest
-    // are lost rather than guessed at — one candidate, one number.
-    const first = v.find((x) => typeof x === 'string' || (typeof x === 'number' && Number.isSafeInteger(x) && x > 0));
+    // Several numbers listed: take the first entry that is at least
+    // phone-shaped (≥ MIN_PHONE_DIGITS digits). The rest are lost rather than
+    // guessed at — one candidate, one number.
+    const first = v.find((x) =>
+      (typeof x === 'string' || (typeof x === 'number' && Number.isSafeInteger(x) && x > 0))
+      && String(x).replace(/\D/g, '').length >= MIN_PHONE_DIGITS);
     if (first === undefined) return null;
     s = String(first);
   } else {

@@ -20,6 +20,7 @@ import {
   parsePeriod,
   extractDateTokens,
   extractPeriodFromLine,
+  isEducationLikeRole,
   parseDurationMonths,
   monthFromWord,
   unionMonths,
@@ -199,8 +200,50 @@ describe('extractPeriodFromLine — the deterministic extractor’s evidence', (
       .toBe('Jun 2018 – Dec 2020');
   });
 
-  it('returns null for a line with fewer than a range’s worth of dates', () => {
+  it('keeps apostrophe-year and numeric-month tokens whole (verification F3)', () => {
+    expect(extractPeriodFromLine("Sales Executive, Acme, Jun'18 – Present", NOW)).toBe("Jun'18 – Present");
+    expect(extractPeriodFromLine('Sales Executive, Acme, 03/2019 - 06/2021', NOW)).toBe('03/2019 - 06/2021');
+    expect(extractPeriodFromLine('Sales Executive, Acme, 2019/03 - 2021/06', NOW)).toBe('2019/03 - 2021/06');
+  });
+
+  it('anchors on the range separator so a stray number is never the start year (verification F4)', () => {
+    expect(extractPeriodFromLine('Sales Executive, Acme (Est. 1985), Jan 2021 – Present', NOW)).toBe('Jan 2021 – Present');
+    expect(extractPeriodFromLine('Sales Executive, Room 2019, Acme Towers, 2021 - Present', NOW)).toBe('2021 - Present');
+    expect(extractPeriodFromLine('Sales Executive, Acme, Pune 411001, 9876543210, Jan 2021 – Present', NOW)).toBe('Jan 2021 – Present');
+  });
+
+  it('returns null for a line with no range', () => {
     expect(extractPeriodFromLine('Sales Associate, Beta Solutions, Pune', NOW)).toBeNull();
     expect(extractPeriodFromLine('Joined in 2019', NOW)).toBeNull();
+    expect(extractPeriodFromLine('- Managing sales team since 2015, currently leading 20 reps', NOW)).toBeNull();
+    expect(extractPeriodFromLine('- Won Sales Excellence award in 2010 and 2012', NOW)).toBeNull();
+  });
+});
+
+describe('isEducationLikeRole — degrees are education, jobs at institutions are jobs (verification F2)', () => {
+  const r = (title: string | null, employer: string | null) => ({ title, employer, period: '2018 – 2020', highlights: [] });
+  it.each([
+    ['Program Advisor', 'Amity University'], ['Admissions Counsellor', 'LPU'], ['School Counsellor', 'DPS'],
+    ['Coordinator', 'Delhi Public School'], ['Campus Recruiter', 'Bennett University'], ['Sales Head', 'IIT Madras'],
+    ['Master Trainer', "Byju's"], ['Accountant', "St Xavier's College"], ['Assistant Professor', 'VIT'],
+    ['Sales Executive', 'Symbiosis Institute of Business Management'], ['College Relations Manager', 'Acme'],
+    ['Master Data Analyst', 'Acme'], ['Degree Apprentice Engineer', 'Rolls-Royce'],
+  ])('%s @ %s is a job', (title, employer) => {
+    expect(isEducationLikeRole(r(title, employer))).toBe(false);
+  });
+  it.each([
+    ['B.Tech CSE', 'VIT'], ['Bachelor of Engineering', 'VIT'], ['MBA (Sales & Marketing)', 'Symbiosis'],
+    ['Higher Secondary', 'DAV School'], ['Class of 2019', 'IIM Indore'], ['Student', 'VIT'],
+    [null, 'Anna University'], ['Bachelor of Engineering, VIT, 2014 – 2018', null],
+  ])('%s @ %s is education', (title, employer) => {
+    expect(isEducationLikeRole(r(title, employer))).toBe(true);
+  });
+});
+
+describe('stated durations on a bare-year range go both ways', () => {
+  it('shortens as well as lengthens', () => {
+    expect(years('2019 – 2020 (6 months)')).toBe(0.5);
+    expect(years('2019 – 2020 | 6 months')).toBe(0.5);
+    expect(years('Jan 2020 – Mar 2020 (3 years)')).toBe(0.3); // month-precise end still wins
   });
 });

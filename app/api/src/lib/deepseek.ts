@@ -51,7 +51,9 @@ export class DeepseekError extends Error {
 }
 
 export function isDeepseekProviderFailure(err: unknown): boolean {
-  if (err instanceof DeepseekError) return err.category !== 'parse_error';
+  if (err instanceof DeepseekError) {
+    return err.category !== 'parse_error' && err.category !== 'empty_content';
+  }
   return isProviderFailure(err);
 }
 
