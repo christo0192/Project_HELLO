@@ -1,29 +1,40 @@
 /**
  * ashby/operation-worker.ts — leased executor for the `ashby_operations` outbox.
  *
- * ══ THE RESULT-SINK REFUSAL (read before changing SUPPORTED_OPERATION_TYPES) ══
+ * ══ WHAT THIS PUBLISHES (read before changing SUPPORTED_OPERATION_TYPES) ══
  *
- * This worker claims `invite_delivery` and NOTHING else. `scorecard_write` and
- * `stage_move` are never claimed and never executed, because no approved Ashby
- * result sink exists:
+ * It claims `invite_delivery` and `scorecard_write`. It NEVER claims
+ * `stage_move`.
  *
- *   1. `bindFeedbackForm` fails closed with `binding_unverified` unless a
- *      tenant-VERIFIED form binding is supplied, and no column, RPC, or config
- *      anywhere produces one — `ashby_job_mappings.feedback_form_id` is a bare
- *      text column with no verified flag and no field-id columns.
- *   2. `AshbyClient.applicationFeedbackSubmit` and `applicationChangeStage`
- *      therefore have
- *      no production caller, and this worker adds none.
- *   3. The 0029 `trg_ashby_operation_dependency` trigger raises P0001 if a
+ * `scorecard_write` became executable on 2026-08-20 (be2c10e) when the
+ * tenant-verified Hello Christy form binding landed, and v1 scorecards have
+ * been reaching Ashby ever since. #275 did NOT switch write-back on; it
+ * changed how a v2 (role-scorecard) assessment binds: metrics match form
+ * fields by NAME, the derived Role fit rides along, and the rubric is
+ * four-level. What keeps all of it honest:
+ *   - `bindFeedbackForm` still fails closed with `binding_unverified` for
+ *     anything unverified, and the four FIXED fields (overall recommendation,
+ *     Summary, Red flags, Detailed report) come only from that hand-verified
+ *     table — they are never auto-bound.
+ *   - A v2 metric reaches a field only by an exact name match against the
+ *     form's live definition. No field, two fields with the title, a non-Score
+ *     field, or two metrics sharing a name, and the metric is OMITTED — never
+ *     guessed onto a field.
+ *   - If NOT ONE metric matched, the operation fails `no_metric_fields_bound`
+ *     rather than submitting a card with no scores. An Ashby scorecard cannot
+ *     be retracted, so a wrong card is worse than no card.
+ *
+ * `stage_move` stays refused, and that is a product decision about acting on a
+ * candidate's application, not a missing capability. Two locks back it up:
+ *
+ *   1. The 0029 `trg_ashby_operation_dependency` trigger raises P0001 if a
  *      `stage_move` tries to reach running/succeeded before its `scorecard_write`
  *      dependency has succeeded — a DB-level backstop, not application logic.
- *   4. `enqueueStageMove` re-reads `application.info` and refuses when a human
+ *   2. `enqueueStageMove` re-reads `application.info` and refuses when a human
  *      moved the application away from the mapped AI stage.
  *
- * A completed screening therefore parks at `writeback_pending` (0032) and no TA
- * stage move occurs. Widening SUPPORTED_OPERATION_TYPES without first landing a
- * verified binding would break that guarantee — the accompanying test asserts
- * the two forbidden types are never passed to `claim_ashby_operation`.
+ * So there is no TA stage move and no auto-reject anywhere. The accompanying
+ * test asserts `stage_move` is never passed to `claim_ashby_operation`.
  *
  * Every mutation is CAS'd on the live lease, so a worker whose lease expired or
  * was reclaimed commits nothing.
@@ -73,13 +84,14 @@ import type { EmailProviderState } from './invite-delivery.js';
 import { isAshbyError } from './errors.js';
 
 /**
- * The ONLY operation types this runtime executes. Deliberately excludes
- * `scorecard_write` and `stage_move` — see the module header.
+ * The ONLY operation types this runtime executes. `stage_move` is deliberately
+ * absent — see the module header.
  */
 export const SUPPORTED_OPERATION_TYPES = ['invite_delivery', 'scorecard_write'] as const;
 export type SupportedOperationType = (typeof SUPPORTED_OPERATION_TYPES)[number];
 
-/** Operation types the runtime must never claim while no result sink exists. */
+/** Operation types the runtime must never claim. Acting on a candidate's
+ *  application is a product decision, not a capability gap. */
 export const REFUSED_OPERATION_TYPES = ['stage_move'] as const;
 
 /**
@@ -108,14 +120,10 @@ export interface OperationWorkerDeps {
      * Read-only form STRUCTURE for the verified form (sections/fields/types/
      * scales; never submitted feedback). Required for a v2 scorecard: the
      * auto-binder matches each metric to the Score field whose title equals
-     * the metric's name. Absent ⇒ a v2 operation fails closed as
-     * `form_schema_unavailable`; v1 operations never call it.
-     */
-    /**
-     * Read-only form STRUCTURE for the v2 auto-binder. `fresh` bypasses any
-     * cache — the worker asks for it before accepting an unmatched metric, so
-     * a stale definition can never silently drop a metric from a card that
-     * cannot be rewritten.
+     * the metric's name. `fresh` bypasses the cache, which the worker asks for
+     * before accepting an unmatched metric so a stale definition can never
+     * silently drop a metric from a card that cannot be rewritten. Absent ⇒ a
+     * v2 operation defers as `form_schema_unavailable`; v1 never calls it.
      */
     readFormDefinition?(formDefinitionId: string, fresh?: boolean): Promise<ProbeFeedbackForm | null>;
   };
