@@ -32,7 +32,9 @@ import { PHONE_DEFERRAL_CODES } from '../lib/phone-screening/admission.js';
 import { PHONE_RPC_STATUS_UNION } from '../lib/phone-screening/rpc-contract.js';
 import {
   PHONE_ADMISSION_DEFERRAL,
+  PHONE_ADMISSION_DEFERRAL_DETAILS,
   PHONE_ADMISSION_REFUSAL,
+  PHONE_ADMISSION_REFUSAL_DETAILS,
   PHONE_DUE_SKIPS,
   PHONE_UNKNOWN_ADMISSION_DETAIL,
   phoneDueDiagSummary,
@@ -51,13 +53,27 @@ function emitted(meta: { error_type: string; error_category: string }): Record<s
   return JSON.parse(lines[0]!) as Record<string, unknown>;
 }
 
-/** Every key the loop can put in `refusals`, composed exactly as it composes them. */
+/**
+ * Every key the loop can put in `refusals`, composed exactly as it composes
+ * them.
+ *
+ * Driven from the DETAIL VOCABULARIES the composer actually expands, not from
+ * the full RPC status union: `phoneRefusalCountKey` collapses anything outside
+ * `EXPANDED_REFUSAL_DETAILS` to `<refusal>:unknown`, so feeding it 114 statuses
+ * would produce one key and a false sense of coverage. The collapse itself is
+ * asserted below, because that key is emitted too.
+ */
 function everyRefusalKey(): string[] {
   const out = new Set<string>();
-  for (const refusal of [PHONE_ADMISSION_REFUSAL, PHONE_ADMISSION_DEFERRAL]) {
+  for (const [refusal, details] of [
+    [PHONE_ADMISSION_REFUSAL, PHONE_ADMISSION_REFUSAL_DETAILS],
+    [PHONE_ADMISSION_DEFERRAL, PHONE_ADMISSION_DEFERRAL_DETAILS],
+  ] as const) {
     // The unknown-detail fallback is a real emitted key, not a placeholder.
     out.add(phoneRefusalCountKey(refusal, PHONE_UNKNOWN_ADMISSION_DETAIL));
     out.add(phoneRefusalCountKey(refusal, undefined));
+    for (const detail of details) out.add(phoneRefusalCountKey(refusal, detail));
+    // A status from a newer migration collapses rather than passing through.
     for (const detail of [...PHONE_RPC_STATUS_UNION, ...PHONE_DEFERRAL_CODES]) {
       out.add(phoneRefusalCountKey(refusal, detail));
     }
@@ -163,9 +179,17 @@ describe('each skip and refusal key is emitted whole, and survives', () => {
     // emits `admission_refused:<detail>`, an 18-character prefix on top of the
     // detail; measuring the bare detail understated every key by that much.
     const keys = everyRefusalKey();
-    expect(keys.length).toBeGreaterThan(100);
-    expect(keys.some((k) => k.startsWith(`${PHONE_ADMISSION_REFUSAL}:`))).toBe(true);
-    expect(keys.some((k) => k.startsWith(`${PHONE_ADMISSION_DEFERRAL}:`))).toBe(true);
+    // Every member of BOTH expanded vocabularies, both `unknown` collapses,
+    // and the six bare refusals — the complete set the loop can emit.
+    expect(keys.length).toBe(
+      PHONE_ADMISSION_REFUSAL_DETAILS.length + PHONE_ADMISSION_DEFERRAL_DETAILS.length + 2 + 6,
+    );
+    for (const detail of PHONE_ADMISSION_REFUSAL_DETAILS) {
+      expect(keys).toContain(`${PHONE_ADMISSION_REFUSAL}:${detail}`);
+    }
+    for (const detail of PHONE_ADMISSION_DEFERRAL_DETAILS) {
+      expect(keys).toContain(`${PHONE_ADMISSION_DEFERRAL}:${detail}`);
+    }
     for (const key of keys) {
       expect(
         emitted({ error_type: 'phone_due_refusal', error_category: key }).error_category,
