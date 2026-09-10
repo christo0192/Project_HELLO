@@ -20,9 +20,12 @@
 --     phone digest, and deleting one would re-enable dialling someone who
 --     opted out. Their candidate_id is nulled by the FK, nothing else.
 --
---  AFTER COMMIT: storage objects are NOT removed by SQL. Take the object keys
---  the preview printed and delete them from the resume/recording buckets.
---  Then refresh the funnel rollup (see the tail of this file).
+--  STORAGE FIRST. Résumé files and call recordings live in Supabase Storage
+--  and SQL cannot delete them. Their object keys are named by the very rows
+--  this script destroys, so once it commits nothing can derive them any more.
+--  Run `node scripts/purge-test-storage.mjs --confirm` BEFORE this script (or
+--  keep the key list the preview printed). Then refresh the funnel rollup —
+--  see the tail of this file.
 -- ============================================================================
 
 begin;
@@ -229,7 +232,9 @@ end $$;
 commit;
 
 -- ── After the commit ────────────────────────────────────────────────────────
--- 1. Delete the storage objects the preview listed (resume + recording keys).
+-- 1. Storage should already be clean (purge-test-storage.mjs, run BEFORE this).
+--    If it was not, use the key list the preview printed — the rows that named
+--    those objects no longer exist.
 -- 2. Rebuild the funnel rollup from what is left:
 --      select screening_v2.refresh_funnel_rollup();
 --    (Check the exact function name with:
