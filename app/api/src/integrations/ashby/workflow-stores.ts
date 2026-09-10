@@ -34,7 +34,7 @@ import {
  * which builder runs.
  */
 const SCORECARD_ASSESSMENT_COLUMNS =
-  'id, schema_version, scoring_status, weighted_score_5, metric_results, '
+  'id, schema_version, scoring_status, score_scale_max, weighted_score_5, metric_results, '
   + 'english, tone, communication, motivation, role_fit, overall_score, recommendation, summary, provenance, created_at';
 
 /**

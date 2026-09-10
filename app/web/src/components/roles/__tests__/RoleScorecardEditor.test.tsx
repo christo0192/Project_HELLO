@@ -32,7 +32,7 @@ vi.mock('../../../api', () => ({
 
 import { RoleScorecardEditor } from '../RoleScorecardEditor';
 
-const RUBRIC = { 1: 'a', 2: 'b', 3: 'c', 4: 'd', 5: 'e' };
+const RUBRIC = { 1: 'a', 2: 'b', 3: 'c', 4: 'd' };
 
 function metric(i: number, name: string, key: string, weightBps: number) {
   return {

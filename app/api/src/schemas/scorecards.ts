@@ -14,7 +14,7 @@ import {
  * These are the first line of validation (shape/bounds/whitelisting). The
  * scorecard DOMAIN helpers (`validateRubric`, `validateRoleMetrics`,
  * `redistributeWeights`) remain the authority on cross-field invariants
- * (weights totalling 10000 bps, five-level rubric normalisation, unique
+ * (weights totalling 10000 bps, four-level rubric normalisation, unique
  * keys/orders); the route calls them after these schemas pass. The database
  * CHECK constraints and triggers are the final backstop. Bounds here are kept
  * in lock-step with the shared `SCORECARD_*` constants so the three layers can
@@ -24,14 +24,19 @@ import {
 /** Stable metric-key grammar shared with the DB CHECK and domain validators. */
 export const METRIC_KEY_RE = /^[a-z][a-z0-9_]{1,62}$/;
 
-/** A five-level rubric ({"1".."5"} → short descriptors). */
+/**
+ * A four-level rubric ({"1".."4"} → short descriptors): 1 Poor, 2 Average,
+ * 3 Good, 4 Excellent. Four-level since migration 0093 — Ashby Score fields
+ * are four-point, so a metric score is written there 1:1. `.strict()` means a
+ * request still carrying the retired `"5"` is rejected here rather than
+ * reaching `validateRubric`.
+ */
 const rubricSchema = z
   .object({
     '1': z.string().trim().min(1).max(SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH),
     '2': z.string().trim().min(1).max(SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH),
     '3': z.string().trim().min(1).max(SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH),
     '4': z.string().trim().min(1).max(SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH),
-    '5': z.string().trim().min(1).max(SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH),
   })
   .strict();
 

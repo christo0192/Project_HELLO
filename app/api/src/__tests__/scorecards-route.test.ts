@@ -36,12 +36,12 @@ const LIB_B = '00000000-0000-4000-8000-0000000000a2';
 const METRIC_ID = '00000000-0000-4000-8000-0000000000b1';
 const HASH = 'a'.repeat(64);
 
+// 0093: the rubric is FOUR levels (Poor / Average / Good / Excellent).
 const RUBRIC = {
   '1': 'No relevant evidence.',
-  '2': 'Limited evidence.',
-  '3': 'Adequate evidence.',
-  '4': 'Strong evidence.',
-  '5': 'Exceptional evidence.',
+  '2': 'Adequate evidence.',
+  '3': 'Strong evidence.',
+  '4': 'Exceptional evidence.',
 };
 
 let inserted: any[] = [];
@@ -183,14 +183,23 @@ describe('POST /api/scorecards/metrics', () => {
     expect(res.body.error.type).toBe('conflict');
   });
 
-  it('rubric missing a level rejected by schema → 400', async () => {
-    const badRubric = { '1': 'a', '2': 'b', '3': 'c', '4': 'd' };
-    const res = await request(makeApp(makeUser('admin')))
-      .post('/api/scorecards/metrics')
-      .set(AUTH)
-      .send({ name: 'Broken', default_instruction: 'x', rubric: badRubric });
-    expect(res.status).toBe(400);
-    expect(mockFrom).not.toHaveBeenCalled();
+  it('a rubric that is not EXACTLY levels 1..4 is rejected by schema → 400', async () => {
+    // Both directions must fail closed: a short rubric leaves a level the model
+    // could still pick undefined, and the retired FIVE-level shape (what a stale
+    // client or an un-migrated import would send) must not be silently accepted
+    // and truncated — the scorer would then score against a level nobody wrote.
+    for (const badRubric of [
+      { '1': 'a', '2': 'b', '3': 'c' },
+      { '1': 'a', '2': 'b', '3': 'c', '4': 'd', '5': 'e' },
+    ]) {
+      mockFrom.mockReset();
+      const res = await request(makeApp(makeUser('admin')))
+        .post('/api/scorecards/metrics')
+        .set(AUTH)
+        .send({ name: 'Broken', default_instruction: 'x', rubric: badRubric });
+      expect(res.status, JSON.stringify(badRubric)).toBe(400);
+      expect(mockFrom).not.toHaveBeenCalled();
+    }
   });
 });
 

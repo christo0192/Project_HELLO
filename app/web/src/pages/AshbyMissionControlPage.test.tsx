@@ -479,11 +479,54 @@ describe('AshbyMissionControlPage — scorecard binding preview (read-only)', ()
     expect(text).toMatch(/Night-shift fit.*more than one field carries this title/);
     // Fixed-field drift is reported as fail-closed, never as "will still write".
     expect(text).toMatch(/Detailed report.*type changed to String \(expected Url\).*fail closed/);
-    expect(screen.getByTestId('binding-readiness').textContent).toMatch(/2 of 4 metric\(s\) would be omitted/);
+    // A broken FIXED field blocks the whole write, so the headline says that
+    // rather than "N metrics would be omitted" (which implies a card is sent).
+    expect(screen.getByTestId('binding-readiness').textContent)
+      .toMatch(/Not ready — 1 fixed field\(s\) no longer match the verified binding\./);
     expect(text).toContain('Score fields no metric claims');
     expect(text).toContain('English');
-    // Nothing here is a submitted value or a candidate datum.
-    expect(text).not.toMatch(/candidate|email|phone|token/i);
+    // Structure only — no submitted value, address, or secret material.
+    const panel = screen.getByText(/Scorecard binding preview — read-only/).closest('div')!;
+    const panelText = panel.textContent ?? '';
+    expect(panelText).not.toMatch(/\S+@\S+\.\S+/);
+    expect(panelText).not.toMatch(/bearer|presigned|invite_token|transcript|recording/i);
+  });
+
+  it('reports metric omission only when nothing more serious is wrong', async () => {
+    previewAshbyScorecardBinding.mockResolvedValue({
+      ...BINDING_PREVIEW,
+      preview: {
+        ...BINDING_PREVIEW.preview,
+        fixedFields: BINDING_PREVIEW.preview.fixedFields.map((f) => ({ ...f, status: 'present', actualType: f.expectedType ?? 'ValueSelect' })),
+      },
+    });
+    renderPage();
+    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+    expect((await screen.findByTestId('binding-readiness')).textContent)
+      .toMatch(/2 of 4 metric\(s\) would be omitted from the Ashby card\./);
+  });
+
+  it('says the binding could not be checked when the read carried no field schema', async () => {
+    previewAshbyScorecardBinding.mockResolvedValue({
+      ...BINDING_PREVIEW,
+      preview: {
+        ...BINDING_PREVIEW.preview,
+        schemaAvailable: false,
+        fixedFields: BINDING_PREVIEW.preview.fixedFields.map((f) => ({ ...f, status: 'missing', actualType: null })),
+        metrics: BINDING_PREVIEW.preview.metrics.map((m) => ({ ...m, status: 'no_field', fieldPath: null, scale: null })),
+        ready: false,
+      },
+    });
+    renderPage();
+    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+    const verdict = (await screen.findByTestId('binding-readiness')).textContent ?? '';
+    expect(verdict).toMatch(/Cannot be checked — this read returned no field schema/);
+    // It must not claim metrics would be dropped: the worker retries instead.
+    expect(verdict).not.toMatch(/would be omitted/);
+    // …and a fixed field is "not checked", never reported as deleted.
+    const text = document.body.textContent ?? '';
+    expect(text).toContain('not checked by this read');
+    expect(text).not.toContain('missing on the form');
   });
 
   it('reports ready when every metric and fixed field binds', async () => {
@@ -514,11 +557,25 @@ describe('AshbyMissionControlPage — scorecard binding preview (read-only)', ()
     expect(await screen.findByText(/has no dashboard role/i)).toBeInTheDocument();
   });
 
-  it('flags an archived or mismatched form as fail-closed', async () => {
-    previewAshbyScorecardBinding.mockResolvedValue({ ...BINDING_PREVIEW, preview: { ...BINDING_PREVIEW.preview, archived: true, formMatchesBinding: false, ready: false } });
+  it('flags an archived or mismatched form as fail-closed, even when every metric binds', async () => {
+    previewAshbyScorecardBinding.mockResolvedValue({
+      ...BINDING_PREVIEW,
+      preview: {
+        ...BINDING_PREVIEW.preview,
+        archived: true,
+        formMatchesBinding: false,
+        fixedFields: BINDING_PREVIEW.preview.fixedFields.map((f) => ({ ...f, status: 'present', actualType: f.expectedType ?? 'ValueSelect' })),
+        metrics: BINDING_PREVIEW.preview.metrics.slice(0, 2),
+        ready: false,
+      },
+    });
     renderPage();
     await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
     expect(await screen.findByText(/archived in Ashby.*fail closed/i)).toBeInTheDocument();
+    // The headline must name the archived form, not blame a fixed field.
+    const verdict = screen.getByTestId('binding-readiness').textContent ?? '';
+    expect(verdict).toMatch(/Not ready — the verified form is archived/);
+    expect(verdict).not.toMatch(/fixed field/);
   });
 
   it('renders sanitized copy for each API error code and never the raw code alone', async () => {

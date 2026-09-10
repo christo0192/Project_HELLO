@@ -7,6 +7,10 @@ import {
   SCORECARD_MAX_RATIONALE_LENGTH,
   SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH,
   SCORECARD_WEIGHT_TOTAL_BPS,
+  SCORE_MAX,
+  SCORE_MIN,
+  isScoreScaleMax,
+  isScoreValue,
   type MetricEvidenceStatus,
   type RoleScorecardMetric,
   type ScoreValue,
@@ -32,19 +36,18 @@ function boundedText(value: unknown, field: string, max: number): string {
 
 export function validateRubric(value: unknown): ScorecardRubric {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
-    throw new ScorecardValidationError('rubric must be an object with levels 1..5');
+    throw new ScorecardValidationError('rubric must be an object with levels 1..4');
   }
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record).sort();
-  if (keys.join(',') !== '1,2,3,4,5') {
-    throw new ScorecardValidationError('rubric must have exactly levels 1,2,3,4,5');
+  if (keys.join(',') !== '1,2,3,4') {
+    throw new ScorecardValidationError('rubric must have exactly levels 1,2,3,4');
   }
   return {
     1: boundedText(record['1'], 'rubric.1', SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH),
     2: boundedText(record['2'], 'rubric.2', SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH),
     3: boundedText(record['3'], 'rubric.3', SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH),
     4: boundedText(record['4'], 'rubric.4', SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH),
-    5: boundedText(record['5'], 'rubric.5', SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH),
   };
 }
 
@@ -167,8 +170,8 @@ export function validateMetricResults(
     if (result.evidenceStatus !== 'scored' && result.evidenceStatus !== 'insufficient_evidence') {
       throw new ScorecardValidationError('metric evidence status is invalid');
     }
-    if (result.evidenceStatus === 'scored' && (!Number.isInteger(result.score) || result.score! < 1 || result.score! > 5)) {
-      throw new ScorecardValidationError('scored metric must have an integer score from 1 to 5');
+    if (result.evidenceStatus === 'scored' && !isScoreValue(result.score)) {
+      throw new ScorecardValidationError(`scored metric must have an integer score from ${SCORE_MIN} to ${SCORE_MAX}`);
     }
     if (result.evidenceStatus === 'insufficient_evidence' && result.score !== null) {
       throw new ScorecardValidationError('insufficient-evidence metric must not receive an invented score');
@@ -208,10 +211,18 @@ export function calculateWeightedScore(
   return Math.round((weightedSum / weightTotal) * 10_000) / 10_000;
 }
 
-export function weightedScoreToOverall(score: number | null): number | null {
+/**
+ * Project a weighted rubric score onto 0–100. `scaleMax` is the rubric scale the
+ * score was produced on — 4 today, 5 for assessments persisted before 0093 —
+ * so a historical 3/5 (50) and a new 2.5/4 (50) mean the same thing.
+ */
+export function weightedScoreToOverall(score: number | null, scaleMax: number = SCORE_MAX): number | null {
   if (score === null) return null;
-  if (!Number.isFinite(score) || score < 1 || score > 5) throw new ScorecardValidationError('weighted score must be between 1 and 5');
-  return Math.round(((score - 1) / 4) * 100);
+  if (!isScoreScaleMax(scaleMax)) throw new ScorecardValidationError('unknown rubric scale');
+  if (!Number.isFinite(score) || score < SCORE_MIN || score > scaleMax) {
+    throw new ScorecardValidationError(`weighted score must be between ${SCORE_MIN} and ${scaleMax}`);
+  }
+  return Math.round(((score - SCORE_MIN) / (scaleMax - SCORE_MIN)) * 100);
 }
 
 export function recommendationForOverall(overall: number | null): 'advance' | 'hold' | 'reject' | 'human_review' {

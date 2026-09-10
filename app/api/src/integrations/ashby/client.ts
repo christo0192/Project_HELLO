@@ -485,7 +485,9 @@ export class AshbyClient {
     extra?: OpaqueRecord,
   ): Promise<AshbyResult<T>> {
     validateId('feedbackFormDefinition.info', 'feedbackFormDefinitionId', feedbackFormDefinitionId);
-    return this.request<T>('feedbackFormDefinition.info', { feedbackFormDefinitionId, ...(extra ?? {}) });
+    // The validated id is written LAST so an `extra` carrying the same key
+    // cannot slip an unvalidated id past the check above.
+    return this.request<T>('feedbackFormDefinition.info', { ...(extra ?? {}), feedbackFormDefinitionId });
   }
 
   async applicationFeedbackList<T = OpaqueRecord>(applicationId: string, extra?: OpaqueRecord): Promise<AshbyResult<T>> {

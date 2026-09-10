@@ -3,17 +3,19 @@
  *
  * Proves: a complete v2 row maps to metric-keyed 0–10 dimensions with the
  * overall taken from weighted_score_5 and the recommendation passed through;
- * an evidence-incomplete row fails closed with NO invented overall; a null-score
- * metric is omitted (never a fabricated 0); no metric name / rationale / evidence
- * ref leaks into the produced source; and the produced dimension keys, run
- * through the REAL bindFeedbackForm, submit only the keys the tenant binding
- * maps and silently omit the rest.
+ * the row's OWN rubric scale (`score_scale_max`: 4 since 0093, 5 for a
+ * historical row, defaulted to 4 when the column is absent) governs projection,
+ * range-checking and the summary text; an evidence-incomplete row fails closed
+ * with NO invented overall; a null-score metric is omitted (never a fabricated
+ * 0); no metric name / rationale / evidence ref leaks into the produced source;
+ * and the produced dimension keys, run through the REAL bindFeedbackForm,
+ * submit only the keys the tenant binding maps and silently omit the rest.
  */
 
 import { describe, it, expect } from 'vitest';
 import {
-  METRIC_SCORE_TO_DIMENSION_FACTOR,
   isV2AdapterBlocked,
+  metricScoreToDimensionScore,
   scorecardSourceFromV2Assessment,
   type PersistedV2AssessmentRow,
 } from '../integrations/ashby/scorecard-v2-adapter.js';
@@ -49,7 +51,7 @@ function metricResult(
       key,
       name: opts.name ?? `Metric ${key}`,
       instruction: `instruction ${key}`,
-      rubric: { 1: 'Poor', 2: 'Below', 3: 'Average', 4: 'Good', 5: 'Excellent' },
+      rubric: { 1: 'Poor', 2: 'Average', 3: 'Good', 4: 'Excellent' },
       weightBps: 2000,
       displayOrder: 0,
     },
@@ -60,43 +62,65 @@ function v2Row(overrides: Partial<PersistedV2AssessmentRow> = {}): PersistedV2As
   return {
     schema_version: 2,
     scoring_status: 'complete',
-    weighted_score_5: 4, // → overall round(((4-1)/4)*100) = 75
+    // No `score_scale_max` on purpose: the default row exercises the
+    // absent-column path, which must be read as the CURRENT four-point scale.
+    weighted_score_5: 3.5, // → overall round(((3.5-1)/3)*100) = 83
     recommendation: 'advance',
-    metric_results: [metricResult('english', 5), metricResult('communication', 3)],
+    metric_results: [metricResult('english', 4), metricResult('communication', 3)],
     provenance: { requestedModel: 'deepseek-v4-pro', prompt_template_version: 'scoring-v2' },
     created_at: '2026-09-09T00:00:00Z',
     ...overrides,
   };
 }
 
+/** A row persisted BEFORE 0093: five-point rubric, explicitly tagged as such. */
+function legacyFivePointRow(overrides: Partial<PersistedV2AssessmentRow> = {}): PersistedV2AssessmentRow {
+  return v2Row({
+    score_scale_max: 5,
+    weighted_score_5: 4, // → overall round(((4-1)/4)*100) = 75 on the 1..5 scale
+    metric_results: [metricResult('english', 5), metricResult('communication', 3)],
+    ...overrides,
+  });
+}
+
 describe('scorecardSourceFromV2Assessment — happy path', () => {
-  it('maps metrics to 0–10 dimensions keyed by metric key', () => {
+  it('maps metrics to 0–10 dimensions keyed by metric key, on the four-point rubric', () => {
     const result = scorecardSourceFromV2Assessment(v2Row(), { reviewPath: REVIEW_PATH });
     expect(isV2AdapterBlocked(result)).toBe(false);
     if (isV2AdapterBlocked(result)) return;
 
-    // english 5 → 10, communication 3 → 6 (score * 2). Each dimension also
-    // carries the metric NAME (what the auto-binder matches to a form field
-    // title) and the raw 1–5 score (submitted 1:1 on a five-point field).
+    // round(score / scaleMax * 10): english 4/4 → 10, communication 3/4 → 8.
+    // Each dimension also carries the metric NAME (what the auto-binder matches
+    // to a form field title), the raw rubric score, and the SCALE that score is
+    // on — so a four-point Ashby field receives the score 1:1, unbucketed.
     expect(result.dimensions).toEqual([
-      { key: 'english', score: 10, name: 'Metric english', metricScore: 5 },
-      { key: 'communication', score: 6, name: 'Metric communication', metricScore: 3 },
+      { key: 'english', score: 10, name: 'Metric english', metricScore: 4, metricScaleMax: 4 },
+      { key: 'communication', score: 8, name: 'Metric communication', metricScore: 3, metricScaleMax: 4 },
     ]);
     expect(result.schemaVersion).toBe(2);
-    expect(METRIC_SCORE_TO_DIMENSION_FACTOR).toBe(2);
   });
 
-  it('takes overallScore from weighted_score_5 via the domain fn (1–5 → 0–100)', () => {
-    const result = scorecardSourceFromV2Assessment(v2Row({ weighted_score_5: 4 }), {
+  it('projects every rubric level to a STRICTLY POSITIVE 0–10 dimension score, on both scales', () => {
+    // A scored-but-poor metric must never collapse to 0, because 0 is how an
+    // OMITTED (un-evidenced) metric would otherwise be misread.
+    expect([1, 2, 3, 4].map((s) => metricScoreToDimensionScore(s))).toEqual([3, 5, 8, 10]);
+    expect([1, 2, 3, 4].map((s) => metricScoreToDimensionScore(s, 4))).toEqual([3, 5, 8, 10]);
+    // A pre-0093 row keeps the historical `score * 2` mapping.
+    expect([1, 2, 3, 4, 5].map((s) => metricScoreToDimensionScore(s, 5))).toEqual([2, 4, 6, 8, 10]);
+    expect(metricScoreToDimensionScore(1)).toBeGreaterThan(0);
+  });
+
+  it('takes overallScore from weighted_score_5 via the domain fn (1–4 → 0–100)', () => {
+    const result = scorecardSourceFromV2Assessment(v2Row({ weighted_score_5: 3.5 }), {
       reviewPath: REVIEW_PATH,
     });
     if (isV2AdapterBlocked(result)) throw new Error('unexpected block');
-    expect(result.overallScore).toBe(75); // round(((4-1)/4)*100)
+    expect(result.overallScore).toBe(83); // round(((3.5-1)/3)*100)
 
     const min = scorecardSourceFromV2Assessment(v2Row({ weighted_score_5: 1 }), {
       reviewPath: REVIEW_PATH,
     });
-    const max = scorecardSourceFromV2Assessment(v2Row({ weighted_score_5: 5 }), {
+    const max = scorecardSourceFromV2Assessment(v2Row({ weighted_score_5: 4 }), {
       reviewPath: REVIEW_PATH,
     });
     if (isV2AdapterBlocked(min) || isV2AdapterBlocked(max)) throw new Error('unexpected block');
@@ -118,9 +142,9 @@ describe('scorecardSourceFromV2Assessment — happy path', () => {
     const result = scorecardSourceFromV2Assessment(v2Row(), { reviewPath: REVIEW_PATH });
     if (isV2AdapterBlocked(result)) throw new Error('unexpected block');
     expect(result.summary).toBe(
-      'AI phone screen — weighted 4/5 across 2 metrics.\n'
-      + 'Metric english — 5/5: rationale for english\n'
-      + 'Metric communication — 3/5: rationale for communication',
+      'AI phone screen — weighted 3.5/4 across 2 metrics.\n'
+      + 'Metric english — 4/4: rationale for english\n'
+      + 'Metric communication — 3/4: rationale for communication',
     );
     expect(result.provenance).toEqual({
       model: 'deepseek-v4-pro',
@@ -145,13 +169,38 @@ describe('scorecardSourceFromV2Assessment — fail closed', () => {
     expect(result).not.toHaveProperty('overallScore');
   });
 
-  it('blocks a complete row whose weighted score is missing/out of range', () => {
+  it('blocks a complete row whose weighted score is missing/out of range FOR ITS OWN SCALE', () => {
     expect(scorecardSourceFromV2Assessment(v2Row({ weighted_score_5: null }), { reviewPath: REVIEW_PATH })).toEqual({
       blocked: 'incomplete_evidence',
     });
     expect(scorecardSourceFromV2Assessment(v2Row({ weighted_score_5: 6 }), { reviewPath: REVIEW_PATH })).toEqual({
       blocked: 'incomplete_evidence',
     });
+    // 4.5 is legitimate on a pre-0093 five-point row and OUT OF RANGE on an
+    // untagged (four-point) one — the range check follows the row's own scale
+    // rather than a fixed constant, so a mis-tagged row fails closed.
+    expect(scorecardSourceFromV2Assessment(v2Row({ weighted_score_5: 4.5 }), { reviewPath: REVIEW_PATH })).toEqual({
+      blocked: 'incomplete_evidence',
+    });
+    const legacy = scorecardSourceFromV2Assessment(legacyFivePointRow({ weighted_score_5: 4.5 }), {
+      reviewPath: REVIEW_PATH,
+    });
+    expect(isV2AdapterBlocked(legacy)).toBe(false);
+  });
+
+  it('treats an UNKNOWN score_scale_max as the current scale rather than trusting it', () => {
+    // A garbage/unsupported scale must not be used to project: it falls back to
+    // SCORE_MAX (4), which then range-checks the 1..5 metric scores out.
+    const bogus = scorecardSourceFromV2Assessment(
+      legacyFivePointRow({ score_scale_max: 7 }),
+      { reviewPath: REVIEW_PATH },
+    );
+    // weighted 4 is still in 1..4, so the row survives the weighted gate…
+    if (isV2AdapterBlocked(bogus)) throw new Error('unexpected block');
+    // …but the english metric scored 5 is off the four-point scale and is
+    // dropped rather than projected against a scale we cannot trust.
+    expect(bogus.dimensions.map((d) => d.key)).toEqual(['communication']);
+    expect(bogus.summary).toContain('Metric english — not scored (insufficient evidence)');
   });
 
   it('blocks a non-v2 row (schema_version != 2)', () => {
@@ -182,11 +231,13 @@ describe('scorecardSourceFromV2Assessment — omission & redaction', () => {
     // Defensive: a genuinely complete row would not carry a null-score metric,
     // but the adapter must never emit a 0 for one if it appears.
     const row = v2Row({
-      metric_results: [metricResult('english', 5), metricResult('motivation', null)],
+      metric_results: [metricResult('english', 4), metricResult('motivation', null)],
     });
     const result = scorecardSourceFromV2Assessment(row, { reviewPath: REVIEW_PATH });
     if (isV2AdapterBlocked(result)) throw new Error('unexpected block');
-    expect(result.dimensions).toEqual([{ key: 'english', score: 10, name: 'Metric english', metricScore: 5 }]);
+    expect(result.dimensions).toEqual([
+      { key: 'english', score: 10, name: 'Metric english', metricScore: 4, metricScaleMax: 4 },
+    ]);
     expect(result.dimensions.some((d) => d.key === 'motivation')).toBe(false);
     // …but the recruiter is TOLD it was considered and why it has no score.
     expect(result.summary).toContain('Metric motivation — not scored (insufficient evidence): rationale for motivation');
@@ -198,7 +249,7 @@ describe('scorecardSourceFromV2Assessment — omission & redaction', () => {
     // turn ids, recording clips) are still never copied anywhere.
     const row = v2Row({
       metric_results: [
-        metricResult('english', 5, {
+        metricResult('english', 4, {
           rationale: 'RATIONALE_ONE candidate gave two concrete examples',
           name: 'Display Name One',
           evidenceRefs: ['recording://clip-1', 'turn-42'],
@@ -232,7 +283,7 @@ describe('scorecardSourceFromV2Assessment — omission & redaction', () => {
     if (isV2AdapterBlocked(result)) throw new Error('unexpected block');
     expect(result.summary.length).toBeLessThanOrEqual(2_000);
     expect(result.summary).not.toContain('\u0000');
-    expect(result.summary.startsWith('AI phone screen — weighted 4/5 across 12 metrics.')).toBe(true);
+    expect(result.summary.startsWith('AI phone screen — weighted 3.5/4 across 12 metrics.')).toBe(true);
     // Whole lines only — every line that made it in ends with the ellipsis of a bounded rationale.
     for (const line of result.summary.split('\n').slice(1)) expect(line.endsWith('…')).toBe(true);
     expect(buildScorecard(result, SCALE).ok).toBe(true);
@@ -246,8 +297,8 @@ describe('mapped vs unmapped — end to end through the real bindFeedbackForm', 
     // guessed onto a field.
     const row = v2Row({
       metric_results: [
-        metricResult('english', 5),
-        metricResult('communication', 4),
+        metricResult('english', 4),
+        metricResult('communication', 3),
         metricResult('seniority', 2),
       ],
     });
@@ -280,5 +331,71 @@ describe('mapped vs unmapped — end to end through the real bindFeedbackForm', 
     expect(dimPaths).toEqual([dims.communication, dims.english].sort());
     expect(dimPaths).toHaveLength(2);
     expect(dimPaths).not.toContain(dims.motivation); // mapped in binding but not scored here
+
+    // …and each mapped field receives the RUBRIC score itself, because the form
+    // scale (1..4) now equals the rubric scale — no bucketing, nothing lost.
+    const valueAt = (path: string) => (submissions.find((s) => s.path === path)!.value as { score: number }).score;
+    expect(valueAt(dims.english)).toBe(4);
+    expect(valueAt(dims.communication)).toBe(3);
+  });
+});
+
+describe('a pre-0093 five-point row keeps its own scale end to end', () => {
+  it('accepts 1–5 metric scores, tags each dimension metricScaleMax 5, and says /5 in the summary', () => {
+    const result = scorecardSourceFromV2Assessment(legacyFivePointRow(), { reviewPath: REVIEW_PATH });
+    if (isV2AdapterBlocked(result)) throw new Error('unexpected block');
+
+    // A 5 is in range for THIS row (it would be dropped on a four-point row),
+    // and the historical `score * 2` projection is preserved.
+    expect(result.dimensions).toEqual([
+      { key: 'english', score: 10, name: 'Metric english', metricScore: 5, metricScaleMax: 5 },
+      { key: 'communication', score: 6, name: 'Metric communication', metricScore: 3, metricScaleMax: 5 },
+    ]);
+    // overall is projected on 1..5, so weighted 4 → 75 (not the 100 it would be on 1..4).
+    expect(result.overallScore).toBe(75);
+    expect(result.summary).toBe(
+      'AI phone screen — weighted 4/5 across 2 metrics.\n'
+      + 'Metric english — 5/5: rationale for english\n'
+      + 'Metric communication — 3/5: rationale for communication',
+    );
+    expect(buildScorecard(result, SCALE).ok).toBe(true);
+  });
+
+  it('defaults to the four-point scale when the column is absent', () => {
+    // The same metric scores, untagged: 5 is now off-scale and dropped, 3 is
+    // read as 3/4. This is the difference the persisted column buys us.
+    const untagged = scorecardSourceFromV2Assessment(
+      v2Row({ weighted_score_5: 4, metric_results: [metricResult('english', 5), metricResult('communication', 3)] }),
+      { reviewPath: REVIEW_PATH },
+    );
+    if (isV2AdapterBlocked(untagged)) throw new Error('unexpected block');
+    expect(untagged.dimensions).toEqual([
+      { key: 'communication', score: 8, name: 'Metric communication', metricScore: 3, metricScaleMax: 4 },
+    ]);
+    expect(untagged.overallScore).toBe(100); // weighted 4 on 1..4
+    expect(untagged.summary).toContain('weighted 4/4 across 2 metrics.');
+    expect(untagged.summary).toContain('Metric english — not scored (insufficient evidence)');
+  });
+
+  it('bucketing still applies when the form scale differs from the row rubric scale', () => {
+    // The tenant form is 1..4 but this row was scored on 1..5, so the metric
+    // score cannot be written 1:1 — the 0–10 projection is bucketed instead.
+    const source = scorecardSourceFromV2Assessment(legacyFivePointRow(), { reviewPath: REVIEW_PATH });
+    if (isV2AdapterBlocked(source)) throw new Error('unexpected block');
+    const built = buildScorecard(source, SCALE);
+    expect(built.ok).toBe(true);
+    if (!built.ok) return;
+    const bound = bindFeedbackForm(built.scorecard, HELLO_CHRISTY_SCORECARD_BINDING, ORIGIN);
+    expect(bound.ok).toBe(true);
+    if (!bound.ok) return;
+
+    const submissions = (bound.feedbackForm as { fieldSubmissions: Array<{ path: string; value: unknown }> })
+      .fieldSubmissions;
+    const dims = HELLO_CHRISTY_SCORECARD_BINDING.fieldPaths!.dimensions;
+    const valueAt = (path: string) => (submissions.find((s) => s.path === path)!.value as { score: number }).score;
+    // english 10/10 → top bucket 4; communication 6/10 → bucket 3. Both stay
+    // inside the field's 1..4 range, so nothing is submitted off-scale.
+    expect(valueAt(dims.english)).toBe(4);
+    expect(valueAt(dims.communication)).toBe(3);
   });
 });

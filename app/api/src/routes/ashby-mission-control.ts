@@ -179,6 +179,10 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
   // integration answers 503 here exactly as it does for the stage probe.
   const resolveFormDefinitionReader = (): FormDefinitionReader | null => {
     if (deps.formDefinitionReader !== undefined) return deps.formDefinitionReader;
+    // `probeReader: null` is the "integration disabled" seam every existing
+    // test relies on; it must disable THIS reader too, so no test (or gate)
+    // that closed the stage probe can have a real client built behind it.
+    if (deps.probeReader === null) return null;
     return resolveProbeClient();
   };
   const scorecardPreview = deps.scorecardPreview ?? {

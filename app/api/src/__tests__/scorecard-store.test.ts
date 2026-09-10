@@ -40,7 +40,7 @@ const metricRows = [
     metric_key: 'communication',
     name: 'Communication',
     instruction: 'Judge clarity.',
-    rubric: { '1': 'one', '2': 'two', '3': 'three', '4': 'four', '5': 'five' },
+    rubric: { '1': 'one', '2': 'two', '3': 'three', '4': 'four' },
     weight_bps: 6000,
     display_order: 0,
   },
@@ -50,11 +50,21 @@ const metricRows = [
     metric_key: 'motivation',
     name: 'Motivation',
     instruction: 'Judge intent.',
-    rubric: { '1': 'a', '2': 'b', '3': 'c', '4': 'd', '5': 'e' },
+    rubric: { '1': 'a', '2': 'b', '3': 'c', '4': 'd' },
     weight_bps: 4000,
     display_order: 1,
   },
 ];
+
+/**
+ * A row written before 0093, still carrying the retired fifth level in its jsonb
+ * rubric. 0093 migrates these, but a lagging replica / un-migrated tenant row
+ * must not produce a five-key rubric in memory.
+ */
+const legacyFiveLevelMetricRow = {
+  ...metricRows[0],
+  rubric: { '1': 'one', '2': 'two', '3': 'three', '4': 'four', '5': 'five' },
+};
 
 describe('loadActiveRoleScorecard — mapping', () => {
   it('maps DB rows into a RoleScorecardVersion (camelCase, coerced rubric)', async () => {
@@ -81,15 +91,33 @@ describe('loadActiveRoleScorecard — mapping', () => {
       key: 'communication',
       name: 'Communication',
       instruction: 'Judge clarity.',
-      rubric: { 1: 'one', 2: 'two', 3: 'three', 4: 'four', 5: 'five' },
+      rubric: { 1: 'one', 2: 'two', 3: 'three', 4: 'four' },
       weightBps: 6000,
       displayOrder: 0,
     });
     // Numeric rubric indexing works after coercion from jsonb string keys.
     expect(m0.rubric[1]).toBe('one');
-    expect(m0.rubric[5]).toBe('five');
+    expect(m0.rubric[4]).toBe('four');
     expect(m1.key).toBe('motivation');
     expect(m1.weightBps).toBe(4000);
+  });
+
+  it('coerces a pre-0093 five-level jsonb rubric down to exactly the four live levels', async () => {
+    const client = makeClient({
+      roles: { data: { active_scorecard_version_id: 'ver-1' }, error: null },
+      role_scorecard_versions: { data: versionRow, error: null },
+      role_scorecard_version_metrics: { data: [legacyFiveLevelMetricRow], error: null },
+    });
+
+    const result = await loadActiveRoleScorecard(client, 'role-1');
+    expect(result).not.toBeNull();
+    const rubric = result!.metrics[0].rubric;
+    // The retired level 5 is DROPPED, not carried through: the prompt renders
+    // levels 1..4 and domain.validateRubric refuses a five-key rubric, so a
+    // stale row must never reach either with an extra level attached.
+    expect(Object.keys(rubric)).toEqual(['1', '2', '3', '4']);
+    expect(rubric).toEqual({ 1: 'one', 2: 'two', 3: 'three', 4: 'four' });
+    expect((rubric as Record<string, unknown>)['5']).toBeUndefined();
   });
 });
 

@@ -31,33 +31,33 @@
  */
 
 import {
-  isScoreValue,
+  isScoreOnScale,
+  isScoreScaleMax,
+  SCORE_MAX,
   SCORECARD_MAX_METRICS,
   SCORECARD_SCHEMA_VERSION,
+  type ScoreScaleMax,
 } from '../../lib/scorecards/contracts.js';
 import { weightedScoreToOverall } from '../../lib/scorecards/domain.js';
-import { RECOMMENDATIONS, type Recommendation, type ScorecardSource } from './scorecard.js';
-import { ROLE_FIT_DIMENSION } from './scorecard-autobind.js';
+import { RECOMMENDATIONS, stripLoneSurrogates, type Recommendation, type ScorecardSource } from './scorecard.js';
+import { ROLE_FIT_DIMENSION, normalizeTitle } from './scorecard-autobind.js';
 
 /**
- * The 1–5 metric score → 0–10 dimension-scale factor.
+ * Metric score (on the row's own rubric scale) → the 0–10 dimension scale.
  *
- * Mapping: `dimensionScore = metricScore * 2`, so 1→2, 2→4, 3→6, 4→8, 5→10.
- * Chosen deliberately over `((score-1)/4)*10` (which would map 1→0):
- *   - it is a plain linear map with each discrete 1–5 landing on a distinct even
- *     value, so it round-trips and is trivially explainable; and
- *   - every genuinely-scored metric stays strictly positive (2–10), so a
- *     scored-but-poor metric (2/10) can never be confused with a metric that was
- *     OMITTED because it had no evidence (absent from the dimension list). That
- *     is the whole point of not emitting a fabricated 0.
- * buildScorecard clamps dimension scores to 0–10 and rounds, so 2/4/6/8/10 pass
- * through unchanged.
+ * Mapping: `round(metricScore / scaleMax * 10)`. On the four-level rubric
+ * (0093) that is 1→3, 2→5, 3→8, 4→10; on a pre-0093 five-level row it is the
+ * historical 1→2, 2→4, 3→6, 4→8, 5→10 (`metricScore * 2`). Chosen over
+ * `((score-1)/(max-1))*10` (which would map 1→0) because every genuinely
+ * scored metric must stay strictly POSITIVE: a scored-but-poor metric can never
+ * be confused with a metric that was OMITTED for lack of evidence (absent from
+ * the dimension list). That is the whole point of not emitting a fabricated 0.
+ * buildScorecard clamps dimension scores to 0–10 and rounds, so these pass
+ * through unchanged. The 0–10 projection is only a fallback: when the bound
+ * Ashby field's scale equals the rubric scale the metric score is written 1:1.
  */
-export const METRIC_SCORE_TO_DIMENSION_FACTOR = 2 as const;
-
-/** Map one validated 1–5 metric score onto the 0–10 dimension scale. */
-export function metricScoreToDimensionScore(metricScore: number): number {
-  return metricScore * METRIC_SCORE_TO_DIMENSION_FACTOR;
+export function metricScoreToDimensionScore(metricScore: number, scaleMax: number = SCORE_MAX): number {
+  return Math.round((metricScore / scaleMax) * 10);
 }
 
 /** Bounds for the rich summary. The whole summary is further capped by buildScorecard. */
@@ -73,6 +73,13 @@ const MAX_METRIC_NAME_LEN = 100;
 export interface PersistedV2AssessmentRow {
   readonly schema_version?: number | null;
   readonly scoring_status?: string | null;
+  /**
+   * Rubric scale the row was scored on (0093): 4 today, 5 for pre-0093 rows.
+   * Absent/invalid → treated as the CURRENT scale (`SCORE_MAX`); the metric
+   * scores are then range-checked against it, so a mis-tagged row fails closed
+   * rather than mis-projecting.
+   */
+  readonly score_scale_max?: number | null;
   readonly weighted_score_5?: number | null;
   readonly recommendation?: string | null;
   /** jsonb array of ScorecardMetricResult ({ metric: { key, name }, score, evidenceStatus, rationale, … }). */
@@ -151,8 +158,12 @@ function cleanText(raw: string, max: number): string {
     const code = ch.codePointAt(0) ?? 0;
     out += code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f) ? ' ' : ch;
   }
-  out = out.replace(/\s+/g, ' ').trim();
-  return out.length > max ? `${out.slice(0, max - 1).trimEnd()}…` : out;
+  // Truncation cuts UTF-16 code units, so an emoji or other astral character
+  // on the boundary would leave an orphaned surrogate half in the JSON body —
+  // which a provider may reject outright. Drop those halves, as the red-flag
+  // normalizer already does.
+  out = stripLoneSurrogates(out).replace(/\s+/g, ' ').trim();
+  return out.length > max ? `${stripLoneSurrogates(out.slice(0, max - 1)).trimEnd()}…` : out;
 }
 
 function formatWeighted(weighted: number): string {
@@ -170,8 +181,9 @@ export function buildV2RichSummary(
   weighted: number,
   lines: readonly string[],
   maxTotalLen: number = MAX_SUMMARY_TOTAL_LEN,
+  scaleMax: number = SCORE_MAX,
 ): string {
-  const header = `AI phone screen — weighted ${formatWeighted(weighted)}/5 across ${lines.length} metric${lines.length === 1 ? '' : 's'}.`;
+  const header = `AI phone screen — weighted ${formatWeighted(weighted)}/${scaleMax} across ${lines.length} metric${lines.length === 1 ? '' : 's'}.`;
   let out = header;
   for (const line of lines) {
     const candidate = `${out}\n${line}`;
@@ -210,13 +222,15 @@ export function scorecardSourceFromV2Assessment(
   if (row.scoring_status !== 'complete') {
     return { blocked: 'incomplete_evidence' };
   }
+  // The row's own rubric scale (0093). Absent → current scale.
+  const scaleMax: ScoreScaleMax = isScoreScaleMax(row.score_scale_max) ? row.score_scale_max : SCORE_MAX;
   const weighted = row.weighted_score_5;
-  if (typeof weighted !== 'number' || !Number.isFinite(weighted) || weighted < 1 || weighted > 5) {
+  if (typeof weighted !== 'number' || !Number.isFinite(weighted) || weighted < 1 || weighted > scaleMax) {
     return { blocked: 'incomplete_evidence' };
   }
-  // Reuse the domain function (single source of truth for 1–5 → 0–100). Guarded
-  // above, so it neither throws nor returns null here.
-  const overallScore = weightedScoreToOverall(weighted);
+  // Reuse the domain function (single source of truth for rubric → 0–100 on
+  // the row's scale). Guarded above, so it neither throws nor returns null here.
+  const overallScore = weightedScoreToOverall(weighted, scaleMax);
   if (overallScore === null) return { blocked: 'incomplete_evidence' };
 
   // 3. Recommendation pass-through. A 'complete' row stores advance/hold/reject
@@ -244,7 +258,7 @@ export function scorecardSourceFromV2Assessment(
     if (key === null) continue;
     const name = readMetricName(entry, key);
     const rationale = typeof entry.rationale === 'string' ? cleanText(entry.rationale, MAX_SUMMARY_RATIONALE_LEN) : '';
-    if (entry.evidenceStatus !== 'scored' || !isScoreValue(entry.score)) {
+    if (entry.evidenceStatus !== 'scored' || !isScoreOnScale(entry.score, scaleMax)) {
       summaryLines.push(`${name} — not scored (insufficient evidence)${rationale ? `: ${rationale}` : ''}`);
       continue;
     }
@@ -252,11 +266,12 @@ export function scorecardSourceFromV2Assessment(
       dimensions.push({
         key,
         name,
-        score: metricScoreToDimensionScore(entry.score),
+        score: metricScoreToDimensionScore(entry.score, scaleMax),
         metricScore: entry.score,
+        metricScaleMax: scaleMax,
       });
     }
-    summaryLines.push(`${name} — ${entry.score}/5${rationale ? `: ${rationale}` : ''}`);
+    summaryLines.push(`${name} — ${entry.score}/${scaleMax}${rationale ? `: ${rationale}` : ''}`);
   }
   if (dimensions.length === 0) return { blocked: 'no_dimensions' };
 
@@ -270,11 +285,18 @@ export function scorecardSourceFromV2Assessment(
   //     `role_fit` wins and the derived signal is dropped.
   const roleFit = asObject(row.role_fit);
   const roleFitScore = roleFit?.score;
+  // (Role fit sits OUTSIDE the SCORECARD_MAX_METRICS cap — it is not a metric —
+  //  so a role at the cap still gets it, exactly as the preview promises.)
+  // Shadowed by a dashboard metric with the same key OR the same display name:
+  // a metric named "Role fit" already claims that form field, and two
+  // dimensions must never contend for one field.
+  const roleFitTaken = dimensions.some(
+    (d) => d.key === ROLE_FIT_DIMENSION.key || normalizeTitle(d.name) === normalizeTitle(ROLE_FIT_DIMENSION.name),
+  );
   if (
     typeof roleFitScore === 'number' && Number.isFinite(roleFitScore)
     && roleFitScore >= 0 && roleFitScore <= 10
-    && !dimensions.some((d) => d.key === ROLE_FIT_DIMENSION.key)
-    && dimensions.length < SCORECARD_MAX_METRICS
+    && !roleFitTaken
   ) {
     const rounded = Math.round(roleFitScore);
     dimensions.push({ key: ROLE_FIT_DIMENSION.key, name: ROLE_FIT_DIMENSION.name, score: rounded });
@@ -282,7 +304,7 @@ export function scorecardSourceFromV2Assessment(
   }
 
   // 5. Recruiter-facing summary, bounded on whole lines.
-  const summary = buildV2RichSummary(weighted, summaryLines);
+  const summary = buildV2RichSummary(weighted, summaryLines, MAX_SUMMARY_TOTAL_LEN, scaleMax);
 
   // 6. Provenance — same keys the v1 builder reads, all optional.
   const provenanceObj = asObject(row.provenance) ?? {};

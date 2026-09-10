@@ -8,11 +8,12 @@ import {
   redistributeWeights,
   validateMetricResults,
   validateRoleMetrics,
+  validateRubric,
   weightedScoreToOverall,
 } from '../lib/scorecards/domain.js';
 import type { RoleScorecardMetric, ScorecardMetricModelResult } from '../lib/scorecards/contracts.js';
 
-const rubric = { 1: 'Poor', 2: 'Below average', 3: 'Average', 4: 'Good', 5: 'Excellent' } as const;
+const rubric = { 1: 'Poor', 2: 'Average', 3: 'Good', 4: 'Excellent' } as const;
 function metrics(weights = [5000, 3000, 2000]): RoleScorecardMetric[] {
   return weights.map((weightBps, index) => ({
     id: `metric-${index}`, libraryMetricId: `library-${index}`, key: `metric_${index + 1}`,
@@ -20,7 +21,7 @@ function metrics(weights = [5000, 3000, 2000]): RoleScorecardMetric[] {
     weightBps, displayOrder: index,
   }));
 }
-function results(scores: Array<1 | 2 | 3 | 4 | 5 | null>): ScorecardMetricModelResult[] {
+function results(scores: Array<1 | 2 | 3 | 4 | null>): ScorecardMetricModelResult[] {
   return scores.map((score, index) => ({
     configMetricId: `metric-${index}`, score,
     evidenceStatus: score === null ? 'insufficient_evidence' : 'scored',
@@ -33,6 +34,20 @@ describe('scorecard domain', () => {
     expect(() => validateRoleMetrics(metrics([5000, 4999, 0]))).toThrow(ScorecardValidationError);
     expect(() => validateRoleMetrics([{ ...metrics()[0], rubric: { ...rubric, 6: 'Injected' } as unknown as typeof rubric }])).toThrow(ScorecardValidationError);
     expect(validateRoleMetrics(metrics())).toHaveLength(3);
+  });
+
+  it('accepts EXACTLY the four rubric levels — a 5-key or 3-key rubric is rejected', () => {
+    // 0093 closed the rubric at four levels. The retired five-level shape is the
+    // one a stale caller (or an un-migrated library row) would send, so it must
+    // be refused as loudly as a short rubric — never silently truncated.
+    const fiveLevel = { ...rubric, 5: 'Excellent (retired level)' } as unknown as typeof rubric;
+    const threeLevel = { 1: 'Poor', 2: 'Average', 3: 'Good' } as unknown as typeof rubric;
+    expect(() => validateRubric(fiveLevel)).toThrow(/exactly levels 1,2,3,4/);
+    expect(() => validateRubric(threeLevel)).toThrow(/exactly levels 1,2,3,4/);
+    expect(() => validateRubric(null)).toThrow(/levels 1\.\.4/);
+    expect(() => validateRubric([rubric[1], rubric[2], rubric[3], rubric[4]])).toThrow(/levels 1\.\.4/);
+    // …and the four-level rubric round-trips with numeric keys.
+    expect(validateRubric({ ...rubric })).toEqual(rubric);
   });
 
   it('redistributes proportionally with deterministic largest-remainder rounding', () => {
@@ -96,38 +111,89 @@ describe('scorecard domain', () => {
   });
 
   it('computes server-owned scores and never invents missing evidence', () => {
-    expect(calculateWeightedScore(metrics(), results([5, 3, 1]))).toBe(3.6);
+    // (5000*4 + 3000*3 + 2000*1) / 10000 = 3.1 on the four-point rubric.
+    expect(calculateWeightedScore(metrics(), results([4, 3, 1]))).toBe(3.1);
     expect(weightedScoreToOverall(1)).toBe(0);
-    expect(weightedScoreToOverall(3)).toBe(50);
-    expect(weightedScoreToOverall(5)).toBe(100);
+    expect(weightedScoreToOverall(2.5)).toBe(50); // the midpoint of 1..4
+    expect(weightedScoreToOverall(3.1)).toBe(70);
+    expect(weightedScoreToOverall(4)).toBe(100);
     expect(recommendationForOverall(65)).toBe('advance');
     expect(recommendationForOverall(45)).toBe('hold');
     expect(recommendationForOverall(null)).toBe('human_review');
   });
 
+  it('projects a pre-0093 five-point row and a 0093 four-point row onto the SAME 0–100 meaning', () => {
+    // The whole point of carrying `score_scale_max` on the row: the midpoint of
+    // each scale must land on the same overall, so a historical assessment and a
+    // new one are comparable on the candidate card and in the funnel rollups.
+    expect(weightedScoreToOverall(3, 5)).toBe(50);
+    expect(weightedScoreToOverall(2.5, 4)).toBe(50);
+    // Endpoints agree too.
+    expect(weightedScoreToOverall(1, 5)).toBe(0);
+    expect(weightedScoreToOverall(1, 4)).toBe(0);
+    expect(weightedScoreToOverall(5, 5)).toBe(100);
+    expect(weightedScoreToOverall(4, 4)).toBe(100);
+    // The default scale is the CURRENT one, so an untagged call is four-point.
+    expect(weightedScoreToOverall(4)).toBe(weightedScoreToOverall(4, 4));
+    // A null weighted score stays null on either scale — never an invented 0.
+    expect(weightedScoreToOverall(null, 5)).toBeNull();
+    expect(weightedScoreToOverall(null)).toBeNull();
+  });
+
+  it('fails closed on an unknown rubric scale and on a score outside that scale', () => {
+    // Only 4 and 5 are admissible scales; anything else would silently
+    // mis-project a persisted score, so it throws instead.
+    expect(() => weightedScoreToOverall(3, 6)).toThrow(/unknown rubric scale/);
+    expect(() => weightedScoreToOverall(3, 10)).toThrow(/unknown rubric scale/);
+    // 5 is in range for a pre-0093 row and OUT of range on the four-point scale.
+    expect(weightedScoreToOverall(5, 5)).toBe(100);
+    expect(() => weightedScoreToOverall(5)).toThrow(/weighted score must be between 1 and 4/);
+    expect(() => weightedScoreToOverall(0.5)).toThrow(/weighted score must be between 1 and 4/);
+    expect(() => weightedScoreToOverall(5.5, 5)).toThrow(/weighted score must be between 1 and 5/);
+  });
+
   it('PARTIAL SCORING: renormalizes over the scored metrics; null ONLY when none scored', () => {
     // The production failure (assessment e333af5d): one un-evidenced metric must
     // NOT void the whole card. With weights [5000, 3000, 2000], scoring only
-    // metric-0 (5) and metric-2 (1) renormalizes over {5000, 2000}:
-    //   (5000*5 + 2000*1) / (5000+2000) = 27000/7000 = 3.8571 (4dp).
-    expect(calculateWeightedScore(metrics(), results([5, null, 1]))).toBe(3.8571);
+    // metric-0 (4) and metric-2 (1) renormalizes over {5000, 2000}:
+    //   (5000*4 + 2000*1) / (5000+2000) = 22000/7000 = 3.1429 (4dp).
+    expect(calculateWeightedScore(metrics(), results([4, null, 1]))).toBe(3.1429);
     // The e333af5d shape itself: 5 equal metrics, 3 scored @3, 2 insufficient →
-    // renormalizes to exactly 3.0 (→ overall 50 → 'hold'), the recovered value.
+    // renormalizes to exactly 3.0, the recovered weighted value.
     expect(calculateWeightedScore(metrics([2000, 2000, 2000, 2000, 2000]), results([3, null, null, 3, 3]))).toBe(3);
-    expect(weightedScoreToOverall(3)).toBe(50);
+    // That weighted 3.0 is projected on the RUBRIC SCALE OF THE ROW. The 0091
+    // recovery ran on the five-point rubric, where 3/5 → 50 → 'hold'. The same
+    // shape scored today is 3/4 ('Good') → 67 → 'advance'. Both are correct for
+    // their own scale — which is exactly why the scale is persisted per row.
+    expect(weightedScoreToOverall(3, 5)).toBe(50);
     expect(recommendationForOverall(50)).toBe('hold');
+    expect(weightedScoreToOverall(3)).toBe(67);
+    expect(recommendationForOverall(67)).toBe('advance');
     // A single scored metric still yields that metric's score (renormalized to 1).
     expect(calculateWeightedScore(metrics(), results([null, 4, null]))).toBe(4);
     // Null ONLY when NOT ONE metric was scored — a genuinely unscoreable screening.
     expect(calculateWeightedScore(metrics(), results([null, null, null]))).toBeNull();
     // Full coverage is unchanged: weightTotal == 10000, so identical to before.
-    expect(calculateWeightedScore(metrics(), results([5, 3, 1]))).toBe(3.6);
+    expect(calculateWeightedScore(metrics(), results([4, 3, 1]))).toBe(3.1);
   });
 
-  it('rejects missing, extra, duplicate, fractional, and invented scores', () => {
-    expect(() => validateMetricResults(metrics(), results([5, 4]))).toThrow(ScorecardValidationError);
-    expect(() => validateMetricResults(metrics(), [...results([5, 4, 3]), { ...results([5])[0], configMetricId: 'unknown' }])).toThrow(ScorecardValidationError);
-    expect(() => validateMetricResults(metrics(), [{ ...results([5])[0], score: 2.5 as 3 }, ...results([4, 3]).slice(1)])).toThrow(ScorecardValidationError);
-    expect(() => validateMetricResults(metrics(), [{ ...results([null])[0], score: 3 as 3 }, ...results([4, 3]).slice(1)])).toThrow(ScorecardValidationError);
+  it('rejects missing, extra, duplicate, fractional, off-scale, and invented scores', () => {
+    // A FULL-LENGTH result list with only element 0 corrupted, so each case trips
+    // the guard it names rather than the (earlier) count check.
+    const corruptFirst = (patch: Partial<ScorecardMetricModelResult>): ScorecardMetricModelResult[] =>
+      [{ ...results([4])[0], ...patch }, ...results([4, 3, 2]).slice(1)];
+
+    expect(() => validateMetricResults(metrics(), results([4, 3]))).toThrow(ScorecardValidationError);
+    expect(() => validateMetricResults(metrics(), [...results([4, 3, 2]), { ...results([4])[0], configMetricId: 'unknown' }])).toThrow(ScorecardValidationError);
+    expect(() => validateMetricResults(metrics(), corruptFirst({ configMetricId: 'metric-1' }))).toThrow(ScorecardValidationError);
+    expect(() => validateMetricResults(metrics(), corruptFirst({ score: 2.5 as 3 })))
+      .toThrow(/scored metric must have an integer score from 1 to 4/);
+    // A 5 is what a stale prompt/model would still emit; on the four-point rubric
+    // it is off-scale and must be refused rather than clamped down to 4.
+    expect(() => validateMetricResults(metrics(), corruptFirst({ score: 5 as 3 })))
+      .toThrow(/scored metric must have an integer score from 1 to 4/);
+    // insufficient_evidence must never carry a score — the fabrication guard.
+    expect(() => validateMetricResults(metrics(), corruptFirst({ evidenceStatus: 'insufficient_evidence' })))
+      .toThrow(/must not receive an invented score/);
   });
 });

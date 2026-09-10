@@ -219,7 +219,7 @@ paths:
                       type: string
                     rubric:
                       type: object
-                      description: Five-level rubric object ("1".."5" → short descriptors).
+                      description: Four-level rubric object ("1".."4" → short descriptors); 1 Poor, 2 Average, 3 Good, 4 Excellent.
                     archived_at:
                       type: string
                       format: date-time
@@ -274,7 +274,7 @@ paths:
                   type: string
                 rubric:
                   type: object
-                  description: Five-level rubric object ("1".."5" → short descriptors).
+                  description: Four-level rubric object ("1".."4" → short descriptors); 1 Poor, 2 Average, 3 Good, 4 Excellent.
       responses:
         '201':
           description: The created metric library row (snake_case DB row).
@@ -369,7 +369,7 @@ paths:
                   type: string
                 rubric:
                   type: object
-                  description: Five-level rubric object ("1".."5" → short descriptors).
+                  description: Four-level rubric object ("1".."4" → short descriptors); 1 Poor, 2 Average, 3 Good, 4 Excellent.
       responses:
         '200':
           description: The updated metric library row (snake_case DB row).
@@ -3076,6 +3076,29 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AshbyFeedbackFormResponse'
+  /api/integrations/ashby/mission-control/mappings/{id}/scorecard-binding:
+    get:
+      tags: [ashby]
+      operationId: previewAshbyScorecardBinding
+      summary: Read-only preview of the v2 scorecard binding for a mapping's role
+      description: Admin-only. Reads the verified feedback form's definition (feedbackFormDefinition.info) plus the mapping's role and its active scorecard metrics, and reports which metrics would bind to a Score field by title, which would not and why, and whether the four fixed fields are still present with their verified types. Structure and metric names only — no feedback content, no candidate data. Nothing is written, bound, or submitted. 404 when the mapping is unknown, 503 when the integration is disabled, 502 when the provider read fails.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: Mapping id.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Binding preview.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyScorecardBindingPreviewResponse'
   /api/integrations/ashby/mission-control/workflows:
     get:
       tags: [ashby]
@@ -6783,6 +6806,110 @@ components:
         truncated:
           type: boolean
           description: True when a safety bound clipped the result — the view is partial.
+      additionalProperties: false
+
+    AshbyScorecardFixedFieldCheck:
+      type: object
+      required: [name, path, expectedType, status, actualType]
+      properties:
+        name:
+          type: string
+          enum: [overall, summary, redFlags, detailedReport]
+        path:
+          type: string
+          description: Verified submission path the worker uses.
+        expectedType:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [present, missing, type_mismatch]
+        actualType:
+          type: string
+          nullable: true
+      additionalProperties: false
+
+    AshbyScorecardMetricBindRow:
+      type: object
+      required: [key, name, status, fieldPath, scale]
+      properties:
+        key:
+          type: string
+        name:
+          type: string
+          description: Dashboard metric name — the form field title it must equal.
+        status:
+          type: string
+          enum: [bound, no_field, ambiguous_title, ambiguous_metric, not_score_type, no_path]
+        fieldPath:
+          type: string
+          nullable: true
+        scale:
+          type: object
+          nullable: true
+          required: [min, max]
+          properties:
+            min:
+              type: integer
+            max:
+              type: integer
+          additionalProperties: false
+      additionalProperties: false
+
+    AshbyScorecardBindingPreview:
+      type: object
+      required: [formDefinitionId, formTitle, schemaAvailable, archived, formMatchesBinding, fixedFields, metrics, unusedScoreFields, ready]
+      properties:
+        formDefinitionId:
+          type: string
+        formTitle:
+          type: string
+          nullable: true
+        schemaAvailable:
+          type: boolean
+          description: False when the definition read carried no field schema — not a claim that the form has no fields.
+        archived:
+          type: boolean
+        formMatchesBinding:
+          type: boolean
+          description: The definition is for the verified form id and it is not archived.
+        fixedFields:
+          type: array
+          items:
+            $ref: '#/components/schemas/AshbyScorecardFixedFieldCheck'
+        metrics:
+          type: array
+          items:
+            $ref: '#/components/schemas/AshbyScorecardMetricBindRow'
+        unusedScoreFields:
+          type: array
+          items:
+            type: object
+            required: [fieldId, title]
+            properties:
+              fieldId:
+                type: string
+              title:
+                type: string
+                nullable: true
+            additionalProperties: false
+        ready:
+          type: boolean
+          description: True only when the form matches, every fixed field is present with its type, and every metric would bind.
+      additionalProperties: false
+
+    AshbyScorecardBindingPreviewResponse:
+      type: object
+      required: [ok, scoringPath, preview]
+      properties:
+        ok:
+          type: boolean
+        scoringPath:
+          type: string
+          enum: [v2_autobind, v1_legacy, no_role]
+          description: v2_autobind = role has an active dashboard scorecard; v1_legacy = fixed v1 binding is used; no_role = mapping carries no role.
+        preview:
+          $ref: '#/components/schemas/AshbyScorecardBindingPreview'
       additionalProperties: false
 
     AshbyMappingUpsertRequest:

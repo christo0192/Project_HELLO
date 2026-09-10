@@ -4,20 +4,26 @@
  *
  * Rendered by `TranscriptionSyncWorkspace` when the selected assessment is v2;
  * the legacy 1–10 `CandidateScorecard` is rendered unchanged for v1 rows. It
- * shows the weighted OVERALL score, each metric's 1–5 score with its SCORE_LABEL
+ * shows the weighted OVERALL score, each metric's score with its rubric-label
  * word (or "Insufficient evidence" when the model could not score it), the
- * verbose per-metric RATIONALE, and any evidence references. It reuses the same
+ * verbose per-metric RATIONALE, and any evidence references.
+ *
+ * Every score is rendered on the assessment's OWN scale (`scoreScaleMax`): new
+ * rows are 1–4 (Poor/Average/Good/Excellent, matching Ashby's four-point Score
+ * fields); rows scored before the four-level rubric stay 1–5 with the legacy
+ * labels and are never re-bucketed. It reuses the same
  * candidate primitives (SurfaceCard, Meter, Tag) as the legacy card, so it reads
  * as one system, keeps the two-level depth rule, and stays colour-redundant.
  */
 
 import { useId } from 'react';
 import type { ReactNode } from 'react';
-import { SCORE_LABELS } from '../../types';
+import { scoreLabel } from '../../types';
 import type {
   ScorecardAssessmentDisplay,
   ScorecardMetricDisplay,
   ScorecardRecommendation,
+  ScoreScaleMax,
 } from '../../types';
 import { Meter, SurfaceCard, Tag } from '../design/candidate';
 import { formatWeightPercent } from '../../lib/scorecard-weights';
@@ -47,7 +53,14 @@ function Prose({ children }: { children: ReactNode }) {
   );
 }
 
-function MetricCard({ metric }: { metric: ScorecardMetricDisplay }) {
+function MetricCard({
+  metric,
+  scaleMax,
+}: {
+  metric: ScorecardMetricDisplay;
+  /** The assessment's own rubric scale — the meter max and the label vocabulary. */
+  scaleMax: ScoreScaleMax;
+}) {
   const headingId = useId();
   const scored = metric.score != null;
   return (
@@ -68,9 +81,9 @@ function MetricCard({ metric }: { metric: ScorecardMetricDisplay }) {
 
       {scored ? (
         <Meter
-          label={`Score · ${SCORE_LABELS[metric.score as 1 | 2 | 3 | 4 | 5]}`}
+          label={`Score · ${scoreLabel(metric.score as number, scaleMax)}`}
           value={metric.score as number}
-          max={5}
+          max={scaleMax}
         />
       ) : (
         <Tag tone="caution" srPrefix="Evidence:">
@@ -129,7 +142,7 @@ export function CandidateScorecardV2({ scorecard }: CandidateScorecardV2Props) {
                 <span className="font-mono tabular-nums">
                   {scorecard.weightedScore5.toFixed(2)}
                 </span>{' '}
-                / 5 weighted
+                / {scorecard.scoreScaleMax} weighted
               </span>
             )}
           </div>
@@ -170,7 +183,11 @@ export function CandidateScorecardV2({ scorecard }: CandidateScorecardV2Props) {
         ) : (
           <div className="space-y-3" data-scorecard-v2-metrics="true">
             {scorecard.metrics.map((metric) => (
-              <MetricCard key={metric.id || metric.name} metric={metric} />
+              <MetricCard
+                key={metric.id || metric.name}
+                metric={metric}
+                scaleMax={scorecard.scoreScaleMax}
+              />
             ))}
           </div>
         )}

@@ -405,6 +405,9 @@ async function runAssessmentImpl(
         : {}),
       scorecard_version_id: activeScorecard.id,
       metric_results: scored.metricResults,
+      // 0093: the rubric scale this row was scored on (4 since 2026-09-10;
+      // pre-0093 rows carry 5). Readers project/display on the row's own scale.
+      score_scale_max: scored.scoreScaleMax,
       weighted_score_5: scored.weightedScore5,
       scoring_status: scored.status,
       overall_score: scored.overallScore,

@@ -3,8 +3,9 @@
  *
  * Admin-only CRUD of reusable metric templates. Each template carries a name, an
  * optional description, an INSTRUCTION (the LLM-direction prompt the scorer is
- * given for this metric) and a 1..5 RUBRIC (five short descriptors, Poor →
- * Excellent). Writes go only through the audited scorecard API
+ * given for this metric) and a 1..4 RUBRIC (four short descriptors, Poor →
+ * Excellent — the same four levels as Ashby's Score fields). Writes go only
+ * through the audited scorecard API
  * (POST/PATCH/archive /api/scorecards/metrics); editing a template bumps its
  * version and never rewrites the immutable snapshots already copied into role
  * scorecards. Archiving soft-hides a template — existing role scorecards keep
@@ -39,7 +40,7 @@ import {
 import { ConfirmButton } from './ConfirmButton';
 import { stableMutationMessage } from './statusMeta';
 
-const SCORE_VALUES: ScoreValue[] = [1, 2, 3, 4, 5];
+const SCORE_VALUES: ScoreValue[] = [1, 2, 3, 4];
 
 type RubricDraft = Record<ScoreValue, string>;
 
@@ -50,7 +51,7 @@ interface MetricDraft {
   rubric: RubricDraft;
 }
 
-const EMPTY_RUBRIC: RubricDraft = { 1: '', 2: '', 3: '', 4: '', 5: '' };
+const EMPTY_RUBRIC: RubricDraft = { 1: '', 2: '', 3: '', 4: '' };
 const EMPTY_DRAFT: MetricDraft = {
   name: '',
   description: '',
@@ -68,7 +69,6 @@ function draftFromMetric(metric: ScorecardMetricTemplate): MetricDraft {
       2: metric.rubric?.[2] ?? '',
       3: metric.rubric?.[3] ?? '',
       4: metric.rubric?.[4] ?? '',
-      5: metric.rubric?.[5] ?? '',
     },
   };
 }
@@ -106,7 +106,6 @@ function draftToBody(draft: MetricDraft) {
       2: draft.rubric[2].trim(),
       3: draft.rubric[3].trim(),
       4: draft.rubric[4].trim(),
-      5: draft.rubric[5].trim(),
     } as RubricDraft,
   };
 }
@@ -226,7 +225,7 @@ export function ScorebarSection() {
     <div className="space-y-5">
       <SectionHeader
         title="Scorecard metrics"
-        description="The reusable metric library. Each metric carries a scoring instruction and a 1–5 rubric; roles attach these and set per-role weights. Editing a metric bumps its version and never rewrites the copies already inside role scorecards."
+        description="The reusable metric library. Each metric carries a scoring instruction and a 1–4 rubric (Poor, Average, Good, Excellent — matching Ashby's four-point Score fields); roles attach these and set per-role weights. Editing a metric bumps its version and never rewrites the copies already inside role scorecards."
         meta={
           <span className="text-[13px] tabular-nums text-ink-tertiary">
             {metrics.length} metric{metrics.length === 1 ? '' : 's'}
@@ -350,7 +349,7 @@ export function ScorebarSection() {
         <SectionHeader
           level={3}
           title="Add a metric"
-          description="Name the metric, describe it, give the scorer an instruction, and fill all five rubric levels."
+          description="Name the metric, describe it, give the scorer an instruction, and fill all four rubric levels."
         />
         <div className="mt-4">
           <MetricFields
@@ -434,7 +433,7 @@ function MetricFields({
 
       <fieldset className="space-y-3">
         <legend className="text-[13px] font-medium text-ink-secondary">
-          Rubric — 1 (Poor) to 5 (Excellent)
+          Rubric — 1 (Poor) to 4 (Excellent)
         </legend>
         <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           {SCORE_VALUES.map((level) => (

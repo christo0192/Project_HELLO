@@ -60,8 +60,41 @@ present with their verified types. It writes and binds nothing; the audit row
 carries counts only. `scoringPath` is `v2_autobind`, `v1_legacy` (role has no
 active scorecard), or `no_role`.
 
-Unused v1 Score fields (`English`, `Tone`, `Motivation`, `Role fit`) may stay
-on the form; they are simply left empty on v2 cards.
+The v1-only Score fields `English`, `Tone` and `Motivation` may stay on the
+form; no v2 metric claims them, so they are left empty on v2 cards. `Role fit`
+is the exception — it IS filled, from the derived résumé-vs-role signal (step 1
+above). A v2 submission is therefore 4 fixed fields + one per matched metric +
+Role fit.
+
+Two more fail-closed rules protect a card that can never be rewritten:
+
+- **Never an empty card.** If a v2 assessment has metrics but NOT ONE matched a
+  field, the operation fails `no_metric_fields_bound` rather than writing a
+  card carrying only the fixed fields — the per-metric scores would be lost for
+  good. Fix the field titles (the preview names them) and retry from Mission
+  Control.
+- **Never two values for one field.** Metric display names are not unique in
+  the database. If two metrics (or a metric named `Role fit` and the derived
+  signal) resolve to the same field, neither binds and both are reported as
+  `ambiguous_metric`; `bindFeedbackForm` refuses the whole submission as a
+  structural backstop.
+
+A form read that fails or returns no field schema is a WAIT, not a failure: the
+operation is DEFERRED (its attempt refunded) so a brief provider blip cannot
+burn `max_attempts` in seconds. Before accepting ANY unmatched metric the
+worker re-reads the definition uncached, so a field added minutes ago is never
+missed because of the 5-minute cache.
+
+## Rubric scale — FOUR levels (migration 0093)
+
+Ashby `Score` fields are four-point, so the dashboard rubric is four-point too:
+**1 Poor · 2 Average · 3 Good · 4 Excellent**. A metric score is written to a
+four-point Ashby field 1:1, with no bucketing. Assessments scored before 0093
+carry `assessments.score_scale_max = 5`, keep their 1–5 scores, and are read,
+displayed and projected on that scale (`weightedScoreToOverall(score, scaleMax)`
+makes 3/5 and 2.5/4 both 50). Nothing is rescored. 0093 also rewrote every
+stored rubric — the seeds and any recruiter edits — as `{1: old1, 2: old3,
+3: old4, 4: old5}`, because the new labels equal the old levels 1/3/4/5.
 
 ## What changed (Detailed report + Red flags)
 
@@ -83,7 +116,7 @@ Two consequences for the existing payload:
   PlainText summary and nothing else; the clickable destination lives only in
   `Detailed report`. That also means a maximum-length summary can no longer
   crowd out the link — they are separate fields with separate budgets.
-- **The submission is exactly nine `fieldSubmissions`**, in a fixed order:
+- **A v1 submission is exactly nine `fieldSubmissions`**, in a fixed order:
   overall recommendation, Summary, Red flags, Detailed report, then the five
   dimensions. `ashby-scorecard-fields.test.ts` pins that list.
 

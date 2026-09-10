@@ -625,9 +625,40 @@ const METRIC_STATUS_COPY: Record<AshbyScorecardBindingPreview['metrics'][number]
   bound: 'will be written',
   no_field: 'no Score field with this title — add an optional Score field titled exactly like the metric',
   ambiguous_title: 'more than one field carries this title — keep exactly one',
+  ambiguous_metric: 'another metric has the same name — rename one of them so each claims its own field',
   not_score_type: 'the field with this title is not a Score field — change its type to Score',
   no_path: 'the field has no submission path — recreate it in Ashby',
 };
+
+/**
+ * ONE verdict, in precedence order, so the headline can never contradict the
+ * rows beneath it. A form whose schema could not be read tells the operator
+ * nothing about its fields — the worker retries rather than writing a card —
+ * and an archived or mismatched form blocks the write entirely, so neither
+ * state may be reported as "metrics would be omitted".
+ */
+function bindingVerdict(preview: AshbyScorecardBindingPreview): string {
+  if (!preview.schemaAvailable) {
+    return 'Cannot be checked — this read returned no field schema. A scorecard write would retry rather than send a partial card.';
+  }
+  if (!preview.formMatchesBinding) {
+    return preview.archived
+      ? 'Not ready — the verified form is archived, so no scorecard would be written.'
+      : 'Not ready — this is not the verified form, so no scorecard would be written.';
+  }
+  const brokenFixed = preview.fixedFields.filter((f) => f.status !== 'present').length;
+  if (brokenFixed > 0) {
+    return `Not ready — ${brokenFixed} fixed field(s) no longer match the verified binding.`;
+  }
+  if (preview.metrics.length === 0) {
+    return 'Not ready — the active scorecard has no metrics to write.';
+  }
+  const unbound = preview.metrics.filter((m) => m.status !== 'bound').length;
+  if (unbound > 0) {
+    return `${unbound} of ${preview.metrics.length} metric(s) would be omitted from the Ashby card.`;
+  }
+  return 'Ready — every metric and every fixed field would be written.';
+}
 
 const FIXED_FIELD_LABEL: Record<AshbyScorecardBindingPreview['fixedFields'][number]['name'], string> = {
   overall: 'Overall recommendation',
@@ -652,7 +683,6 @@ function ScorecardBindingPreviewPanel({
   scoringPath: NonNullable<AshbyScorecardBindingPreviewResponse['scoringPath']>;
   preview: AshbyScorecardBindingPreview;
 }) {
-  const unbound = preview.metrics.filter((m) => m.status !== 'bound');
   return (
     <div className="glass-sunken mt-3 p-4">
       <SectionHeader
@@ -690,11 +720,7 @@ function ScorecardBindingPreviewPanel({
 
       {scoringPath === 'v2_autobind' && (
         <p className="mt-3 text-sm font-medium text-ink" data-testid="binding-readiness">
-          {preview.ready
-            ? 'Ready — every metric and every fixed field would be written.'
-            : unbound.length > 0
-              ? `${unbound.length} of ${preview.metrics.length} metric(s) would be omitted from the Ashby card.`
-              : 'Not ready — a fixed field is missing or mistyped.'}
+          {bindingVerdict(preview)}
         </p>
       )}
 
@@ -707,7 +733,12 @@ function ScorecardBindingPreviewPanel({
             <span className="font-mono">[{f.path}]</span>
             {f.status === 'present' && ' · present'}
             {f.status === 'missing' && (
-              <span className="text-error-text"> · missing on the form — writes will fail closed</span>
+              preview.schemaAvailable ? (
+                <span className="text-error-text"> · missing on the form — writes will fail closed</span>
+              ) : (
+                // No field schema came back, so absence proves nothing.
+                <span> · not checked by this read</span>
+              )
             )}
             {f.status === 'type_mismatch' && (
               <span className="text-error-text">

@@ -19,7 +19,7 @@ import type {
 } from '../lib/scorecards/contracts.js';
 import type { TranscriptTurn } from '../lib/types.js';
 
-const rubric = { 1: 'Poor', 2: 'Below average', 3: 'Average', 4: 'Good', 5: 'Excellent' } as const;
+const rubric = { 1: 'Poor', 2: 'Average', 3: 'Good', 4: 'Excellent' } as const;
 
 function scorecard(weights: number[] = [5000, 3000, 2000]): RoleScorecardVersion {
   return {
@@ -40,7 +40,7 @@ function scorecard(weights: number[] = [5000, 3000, 2000]): RoleScorecardVersion
   };
 }
 
-function modelResults(scores: Array<1 | 2 | 3 | 4 | 5 | null>): ScorecardMetricModelResult[] {
+function modelResults(scores: Array<1 | 2 | 3 | 4 | null>): ScorecardMetricModelResult[] {
   return scores.map((score, index) => ({
     configMetricId: `metric-${index}`,
     score,
@@ -71,15 +71,18 @@ function inferReturning(value: unknown) {
 
 describe('scoreWithScorecard — valid output', () => {
   it('computes weighted/overall/recommendation/status and attaches each metric', async () => {
-    const infer = inferReturning({ results: modelResults([5, 3, 1]) });
+    const infer = inferReturning({ results: modelResults([4, 3, 1]) });
     const result = await scoreWithScorecard({ infer }, input());
 
-    // (5000*5 + 3000*3 + 2000*1) / 10000 = 3.6
-    expect(result.weightedScore5).toBe(3.6);
-    expect(result.overallScore).toBe(65); // round((3.6-1)/4*100)
+    // (5000*4 + 3000*3 + 2000*1) / 10000 = 3.1
+    expect(result.weightedScore5).toBe(3.1);
+    expect(result.overallScore).toBe(70); // round((3.1-1)/3*100)
     expect(result.recommendation).toBe('advance');
     expect(result.status).toBe('complete');
     expect(result.schemaVersion).toBe(2);
+    // 0093: the scorer stamps the rubric scale it scored on, so every reader
+    // projects this row on 1..4 even after the scale changes again.
+    expect(result.scoreScaleMax).toBe(4);
     expect(result.scorecardVersionId).toBe('ver-1');
     expect(result.revision).toBe(1);
 
@@ -102,15 +105,15 @@ describe('scoreWithScorecard — valid output', () => {
 describe('scoreWithScorecard — insufficient evidence (PARTIAL scoring)', () => {
   it('stays incomplete_evidence but still yields a PROVISIONAL score over the scored metrics', async () => {
     // One metric lacks evidence, two are scored. The scorecard must NOT be
-    // voided (the production failure): renormalize over {metric-0: 5000@5,
-    // metric-1: 3000@3} = (25000+9000)/8000 = 4.25 → overall round((4.25-1)/4*100)
-    // = 81 → 'advance'. Status remains incomplete_evidence so the card can flag it.
-    const infer = inferReturning({ results: modelResults([5, 3, null]) });
+    // voided (the production failure): renormalize over {metric-0: 5000@4,
+    // metric-1: 3000@3} = (20000+9000)/8000 = 3.625 → overall round((3.625-1)/3*100)
+    // = 88 → 'advance'. Status remains incomplete_evidence so the card can flag it.
+    const infer = inferReturning({ results: modelResults([4, 3, null]) });
     const result = await scoreWithScorecard({ infer }, input());
 
     expect(result.status).toBe('incomplete_evidence');
-    expect(result.weightedScore5).toBe(4.25);
-    expect(result.overallScore).toBe(81);
+    expect(result.weightedScore5).toBe(3.625);
+    expect(result.overallScore).toBe(88);
     expect(result.recommendation).toBe('advance');
     // The insufficient metric keeps score null; it is not invented.
     expect(result.metricResults[2].score).toBeNull();
@@ -140,30 +143,40 @@ describe('scoreWithScorecard — fail closed', () => {
   });
 
   it('throws when the result count does not match the configured metrics', async () => {
-    await expect(scoreWithScorecard({ infer: inferReturning({ results: modelResults([5, 3]) }) }, input()))
+    await expect(scoreWithScorecard({ infer: inferReturning({ results: modelResults([4, 3]) }) }, input()))
       .rejects.toBeInstanceOf(ScorecardValidationError);
   });
 
   it('throws on an unknown configMetricId (invented metric)', async () => {
-    const bad = modelResults([5, 3, 1]);
+    const bad = modelResults([4, 3, 1]);
     (bad[2] as { configMetricId: string }).configMetricId = 'metric-invented';
     await expect(scoreWithScorecard({ infer: inferReturning({ results: bad }) }, input()))
       .rejects.toBeInstanceOf(ScorecardValidationError);
   });
 
   it('throws on a duplicate configMetricId', async () => {
-    const dup = modelResults([5, 3, 1]);
+    const dup = modelResults([4, 3, 1]);
     (dup[2] as { configMetricId: string }).configMetricId = 'metric-0';
     await expect(scoreWithScorecard({ infer: inferReturning({ results: dup }) }, input()))
       .rejects.toBeInstanceOf(ScorecardValidationError);
   });
 
   it('throws when a scored metric carries an out-of-range/invented score shape', async () => {
-    const bad = modelResults([5, 3, 1]);
+    const bad = modelResults([4, 3, 1]);
     // insufficient_evidence must NOT carry a score — this is the fabrication guard.
     (bad[1] as { evidenceStatus: string }).evidenceStatus = 'insufficient_evidence';
     await expect(scoreWithScorecard({ infer: inferReturning({ results: bad }) }, input()))
       .rejects.toBeInstanceOf(ScorecardValidationError);
+  });
+
+  it('throws when the model returns a RETIRED five-point score (never clamps it to 4)', async () => {
+    // The realistic post-0093 failure: a cached/stale prompt makes the model
+    // answer on the old 1..5 scale. A 5 must fail closed — silently clamping it
+    // to 4 would fabricate a rubric level the recruiter never defined.
+    const bad = modelResults([4, 3, 1]);
+    (bad[0] as { score: number }).score = 5;
+    await expect(scoreWithScorecard({ infer: inferReturning({ results: bad }) }, input()))
+      .rejects.toThrow(/scored metric must have an integer score from 1 to 4/);
   });
 
   it('throws when a result element is not an object', async () => {

@@ -1092,7 +1092,10 @@ describe('OpenAPI document integrity', () => {
     // summary/failures/candidates reads plus the on-demand rollup refresh —
     // all with INLINE (opaque object) response bodies, so the schema-count
     // guard below is again unchanged. 125 + 4 = 129.
-    expect(Object.keys(paths).length).toBe(129);
+    // #275 adds ONE admin read — the scorecard binding preview
+    // (/mappings/{id}/scorecard-binding) — with four documented schemas
+    // (counted below). 129 + 1 = 130.
+    expect(Object.keys(paths).length).toBe(130);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1169,7 +1172,11 @@ describe('OpenAPI document integrity', () => {
     // request's metrics object is deliberately permissive-partial (the 0082
     // snapshot shape) so a best-effort write never 400s across worker
     // versions; the envelope stays additionalProperties:false. 235 + 2 = 237.
-    expect(Object.keys(schemas).length).toBe(237);
+    // #275 adds FOUR for the scorecard binding preview: the response envelope,
+    // the preview body, one fixed-field check row and one metric row. All are
+    // additionalProperties:false and carry form STRUCTURE plus metric names
+    // only — no feedback content. 237 + 4 = 241.
+    expect(Object.keys(schemas).length).toBe(241);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.

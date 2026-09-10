@@ -538,7 +538,12 @@ export function extractFormDefinition(results: unknown): ProbeFeedbackForm | nul
   const { forms } = extractFeedbackForms({ feedbackFormDefinitions: [results] });
   const form = forms.find((f) => f.formDefinitionId === id) ?? null;
   if (form === null) return null;
-  return rec.isArchived === true ? { ...form, archived: true } : form;
+  // A definition that reports ZERO fields is not a form with no fields — an
+  // Ashby feedback form always has some — it is a shape this extractor could
+  // not read. Say "unavailable" so the caller waits and retries rather than
+  // binding nothing and writing an empty card it can never rewrite.
+  const usable = form.fieldCount > 0 ? form : { ...form, schemaAvailable: false };
+  return rec.isArchived === true ? { ...usable, archived: true } : usable;
 }
 
 /**

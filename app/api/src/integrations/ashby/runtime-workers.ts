@@ -73,11 +73,17 @@ export async function readFormDefinitionCached(
   formDefinitionId: string,
   reader: FormDefinitionReader,
   nowMs: () => number = () => Date.now(),
+  fresh = false,
 ): Promise<ProbeFeedbackForm | null> {
-  const hit = formDefinitionCache.get(formDefinitionId);
+  const hit = fresh ? undefined : formDefinitionCache.get(formDefinitionId);
   if (hit && nowMs() - hit.at < FORM_DEFINITION_CACHE_MS) return hit.form;
   const form = await probeFeedbackFormDefinition(formDefinitionId, reader);
-  if (form && form.schemaAvailable) formDefinitionCache.set(formDefinitionId, { at: nowMs(), form });
+  // An ARCHIVED definition is never cached either: archiving is reversible in
+  // the Ashby UI, and caching it would keep failing scorecard writes closed for
+  // the whole TTL after the form is restored.
+  if (form && form.schemaAvailable && form.archived !== true) {
+    formDefinitionCache.set(formDefinitionId, { at: nowMs(), form });
+  }
   return form;
 }
 
@@ -959,14 +965,25 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
               dashboardOrigin: (process.env.WEB_ORIGIN ?? '').split(',')[0]?.trim() ?? '',
               // Read-only form STRUCTURE for the v2 auto-binder (#275). Cached
               // briefly so a burst of scorecards costs one provider read.
-              readFormDefinition: (formDefinitionId) =>
-                readFormDefinitionCached(formDefinitionId, runtime.client),
+              readFormDefinition: (formDefinitionId, fresh) =>
+                readFormDefinitionCached(formDefinitionId, runtime.client, undefined, fresh === true),
             },
             resolveMappingForLink: runtime.resolveMappingForLink,
             reissuePathFor,
             email: { providerApproved: false, domainVerified: false },
             owner,
             leaseSeconds: rc.leaseSeconds,
+            // Metadata only: operation kind + sanitized code (for the v2
+            // auto-binder these are COUNTS such as `matched_4_unmatched_1`,
+            // never a metric name or a field path). Without this the binding
+            // outcome of a scorecard write was observable nowhere.
+            onEvent: (e) => {
+              logger.info('unknown_event', {
+                error_category: `operation_${e.kind}`,
+                error_type: e.operationType,
+                ...(e.code ? { schema: e.code } : {}),
+              });
+            },
           });
           return r.invite.claimed || r.scorecard.claimed;
         },
