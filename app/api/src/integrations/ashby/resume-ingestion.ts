@@ -31,9 +31,12 @@
  *        exposure class is one the product had already accepted — just not,
  *        until now, on this path;
  *      · NO tools and no instructions honoured: the reply is parsed as JSON
- *        and SCHEMA-VALIDATED (`lib/resume-structurer.ts`), never executed,
- *        and a wrong-typed field rejects the whole result rather than being
- *        coerced;
+ *        and SCHEMA-VALIDATED (`lib/resume-structurer.ts`), never executed.
+ *        A wrong-typed field is coerced to the approved type or nulled on
+ *        its own; the answer as a whole is rejected only when it is not an
+ *        object at all. Nothing about DIALING rides on that validation —
+ *        the strict number gate and provenance allowlist in
+ *        `lib/candidate-phone.ts` decide that, downstream, on every path;
  *      · FAIL-SOFT: the model tier never throws. An outage, an open breaker, a
  *        timeout, unparseable output or a malformed shape all degrade to the
  *        deterministic extractor, so a model failure costs a phone number, not

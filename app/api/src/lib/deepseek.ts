@@ -27,7 +27,16 @@ export type DeepseekErrorCategory =
   | 'connection'
   | 'protocol'
   | 'parse_error'
-  | 'output_limit';
+  | 'output_limit'
+  /**
+   * JSON-mode answer with blank `content`. DeepSeek documents that JSON Output
+   * "may occasionally return empty content". Raised ONLY when the caller asked
+   * for `responseFormat: 'json_object'` — a blank answer on the plain path
+   * keeps its historical treatment (the JSON runner's own re-ask, then
+   * `parse_error`). Not a breaker failure: it is a provider hiccup, not an
+   * outage, and `isProviderFailure` does not list it.
+   */
+  | 'empty_content';
 
 export class DeepseekError extends Error {
   public readonly category: DeepseekErrorCategory;
@@ -42,7 +51,9 @@ export class DeepseekError extends Error {
 }
 
 export function isDeepseekProviderFailure(err: unknown): boolean {
-  if (err instanceof DeepseekError) return err.category !== 'parse_error';
+  if (err instanceof DeepseekError) {
+    return err.category !== 'parse_error' && err.category !== 'empty_content';
+  }
   return isProviderFailure(err);
 }
 
@@ -60,6 +71,16 @@ export interface DeepseekOptions {
    * env.deepseekReasoningEffort when unset.
    */
   reasoningEffort?: string;
+  /**
+   * Provider-enforced JSON output. When `'json_object'`, the request carries
+   * `response_format: { type: 'json_object' }` (DeepSeek "JSON Output" mode) so
+   * the model is constrained to emit one valid JSON object instead of prose
+   * wrapped around JSON. OPT-IN per call, never a default: the provider
+   * requires the word "json" to appear in the prompt, and a caller whose
+   * prompt lacks it would turn a good request into a 4xx. Only callers that
+   * already `JSON.parse` the answer and whose prompt asks for JSON set this.
+   */
+  responseFormat?: 'json_object';
 }
 
 /**
@@ -147,6 +168,9 @@ function validateRuntimeOverrides(opts: DeepseekOptions): void {
     if (opts.reasoningEffort.length > 64) {
       throw new TypeError('reasoningEffort must not exceed 64 characters');
     }
+  }
+  if (opts.responseFormat !== undefined && opts.responseFormat !== 'json_object') {
+    throw new TypeError("responseFormat must be 'json_object' when given");
   }
 }
 
@@ -261,9 +285,15 @@ export function createDeepseekRunner(deps?: Partial<DeepseekRunnerDeps>): Deepse
       messages: typeof messages;
       temperature: number;
       reasoning_effort?: string;
+      response_format?: { type: 'json_object' };
     } = { model, messages, temperature: 0.2 };
     if (typeof reasoningEffort === 'string' && reasoningEffort.length > 0) {
       requestBody.reasoning_effort = reasoningEffort;
+    }
+    // Appended AFTER the messages, so the cached prompt prefix is untouched:
+    // the automatic prefix cache keys on message tokens, not on this field.
+    if (opts.responseFormat === 'json_object') {
+      requestBody.response_format = { type: 'json_object' };
     }
 
     return breaker.call(async () => {
@@ -288,6 +318,9 @@ export function createDeepseekRunner(deps?: Partial<DeepseekRunnerDeps>): Deepse
         }
         if (!response.ok) throw new DeepseekError('protocol', response.status);
         const content = parseContent(raw);
+        if (opts.responseFormat === 'json_object' && content === '') {
+          throw new DeepseekError('empty_content');
+        }
         // Surface automatic prefix-cache accounting. Extraction never throws;
         // the sink is wrapped so it cannot fault the request path.
         cacheSink(extractCacheUsage(raw));

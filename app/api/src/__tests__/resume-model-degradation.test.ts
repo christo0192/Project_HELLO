@@ -34,6 +34,9 @@ import {
   structureResumeWithModelDetailed,
   __setModelRetryBackoffForTest,
   __setModelConcurrencyForTest,
+  MODEL_MAX_CIRCUIT_OPEN_ATTEMPTS,
+  INGESTION_MODEL_RETRY_POLICY,
+  INTERACTIVE_MODEL_RETRY_POLICY,
   type ResumeModelRunner,
 } from '../lib/resume-structurer.js';
 import { DeepseekError } from '../lib/deepseek.js';
@@ -84,7 +87,11 @@ describe('structureResumeWithModelDetailed — bounded transient retry', () => {
     expect(out.structured).not.toBeNull();
   });
 
-  it('retries at most once: a second transient failure surrenders with ITS category', async () => {
+  it('retries a TRANSIENT failure at most once: a second one surrenders with ITS category', async () => {
+    // Every transient attempt reaches the provider and counts toward the
+    // SHARED breaker (threshold 5). Two concurrent ingestions × 2 attempts = 4
+    // can never open it alone; any longer transient ladder would, and take the
+    // scorer down with it.
     fastRetry();
     const runner = vi.fn<ResumeModelRunner>()
       .mockRejectedValueOnce(new DeepseekError('timeout'))
@@ -92,6 +99,81 @@ describe('structureResumeWithModelDetailed — bounded transient retry', () => {
     const out = await structureResumeWithModelDetailed('résumé text', runner);
     expect(runner).toHaveBeenCalledTimes(2);
     expect(out).toEqual({ structured: null, failure: 'protocol:502' });
+  });
+
+  it('a transient failure followed by a NON-transient one stops at the non-transient category', async () => {
+    fastRetry();
+    const runner = vi.fn<ResumeModelRunner>()
+      .mockRejectedValueOnce(new DeepseekError('timeout'))
+      .mockRejectedValueOnce(new DeepseekError('protocol', 400));
+    const out = await structureResumeWithModelDetailed('résumé text', runner);
+    expect(runner).toHaveBeenCalledTimes(2);
+    expect(out).toEqual({ structured: null, failure: 'protocol:400' });
+  });
+
+  it.each([
+    ['connection', new DeepseekError('connection')],
+    ['empty_content (JSON mode blank answer)', new DeepseekError('empty_content')],
+  ])('retries %s once and succeeds when the provider answers', async (_label, err) => {
+    fastRetry();
+    const runner = vi.fn<ResumeModelRunner>()
+      .mockRejectedValueOnce(err)
+      .mockResolvedValueOnce(GOOD_SHAPE);
+    const out = await structureResumeWithModelDetailed('résumé text', runner);
+    expect(runner).toHaveBeenCalledTimes(2);
+    expect(out.failure).toBeNull();
+    expect(out.structured?.name).toBe('Rohan Mehta');
+  });
+
+  it('an OPEN BREAKER is retried on its own longer ladder (4 attempts) — those attempts never reach the provider', async () => {
+    fastRetry();
+    const runner = vi.fn<ResumeModelRunner>()
+      .mockRejectedValueOnce(new ProviderError('circuit_open'))
+      .mockRejectedValueOnce(new ProviderError('circuit_open'))
+      .mockRejectedValueOnce(new ProviderError('circuit_open'))
+      .mockResolvedValueOnce(GOOD_SHAPE);
+    const out = await structureResumeWithModelDetailed('résumé text', runner);
+    expect(runner).toHaveBeenCalledTimes(MODEL_MAX_CIRCUIT_OPEN_ATTEMPTS);
+    expect(MODEL_MAX_CIRCUIT_OPEN_ATTEMPTS).toBe(4);
+    expect(out.structured?.name).toBe('Rohan Mehta');
+    // The ingestion ladder is sized to outlast one default breaker cooldown.
+    const ladderMs = INGESTION_MODEL_RETRY_POLICY.circuitOpenLadderMs.reduce((a, b) => a + b, 0);
+    expect(ladderMs).toBeGreaterThan(30_000);
+  });
+
+  it('an open breaker that never closes surrenders with circuit_open after the ladder', async () => {
+    fastRetry();
+    const runner = vi.fn<ResumeModelRunner>().mockRejectedValue(new ProviderError('circuit_open'));
+    const out = await structureResumeWithModelDetailed('résumé text', runner);
+    expect(runner).toHaveBeenCalledTimes(MODEL_MAX_CIRCUIT_OPEN_ATTEMPTS);
+    expect(out).toEqual({ structured: null, failure: 'circuit_open' });
+  });
+
+  it('the two ladders are independent: a breaker wait does not spend the transient retry', async () => {
+    fastRetry();
+    const runner = vi.fn<ResumeModelRunner>()
+      .mockRejectedValueOnce(new ProviderError('circuit_open'))
+      .mockRejectedValueOnce(new DeepseekError('timeout'))
+      .mockResolvedValueOnce(GOOD_SHAPE);
+    const out = await structureResumeWithModelDetailed('résumé text', runner);
+    expect(runner).toHaveBeenCalledTimes(3);
+    expect(out.failure).toBeNull();
+  });
+
+  it('the INTERACTIVE policy (recruiter upload) does not wait on an open breaker and keeps one transient retry', async () => {
+    fastRetry();
+    const open = vi.fn<ResumeModelRunner>().mockRejectedValue(new ProviderError('circuit_open'));
+    const a = await structureResumeWithModelDetailed('résumé text', open, INTERACTIVE_MODEL_RETRY_POLICY);
+    expect(open).toHaveBeenCalledTimes(1);
+    expect(a).toEqual({ structured: null, failure: 'circuit_open' });
+
+    const flaky = vi.fn<ResumeModelRunner>()
+      .mockRejectedValueOnce(new DeepseekError('timeout'))
+      .mockResolvedValueOnce(GOOD_SHAPE);
+    const b = await structureResumeWithModelDetailed('résumé text', flaky, INTERACTIVE_MODEL_RETRY_POLICY);
+    expect(flaky).toHaveBeenCalledTimes(2);
+    expect(b.structured?.name).toBe('Rohan Mehta');
+    expect(INTERACTIVE_MODEL_RETRY_POLICY.circuitOpenLadderMs).toEqual([]);
   });
 
   it('does NOT retry a non-transient protocol failure (4xx that is not 429)', async () => {
@@ -115,9 +197,7 @@ describe('structureResumeWithModelDetailed — bounded transient retry', () => {
   });
 
   it.each([
-    ['circuit_open', new ProviderError('circuit_open'), 'circuit_open'],
     ['missing_api_key', new DeepseekError('missing_api_key'), 'missing_api_key'],
-    ['connection', new DeepseekError('connection'), 'connection'],
     ['output_limit', new DeepseekError('output_limit'), 'output_limit'],
     ['statusless protocol', new DeepseekError('protocol'), 'protocol'],
     ['unclassifiable error', new Error('SENTINEL: never surfaces'), 'unknown'],
@@ -415,5 +495,41 @@ describe('the persist CAS versus the 0084 unbind (F1)', () => {
     expect(out).toEqual({ status: 'updated', candidateId: 'cand_1' });
     expect(candidate.resumeId).toBe('resume_fresh_1');
     expect(candidate.phoneValid).toBe(false); // fail-closed: nobody decided
+  });
+});
+
+// ── The completeness signal is WIRED, not just defined ──────────────────────
+
+describe('the Ashby parse port wires the completeness observation', () => {
+  it('emits ONE category-only warn line when the orchestrator reports a role-less structured result', async () => {
+    // `runResumeIngestion` defined `onCompleteness` for exactly this degrade
+    // ("the document parsed, the ingestion succeeded, every role was lost"),
+    // but `buildIngestionPorts` never supplied a sink — so the signal was a
+    // no-op in production and the degrade invisible. The sink must exist, log
+    // the category, and carry nothing content-shaped.
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      const { ports, shutdown } = await realParsePort(async () => ({ name: 'Rohan Mehta' }));
+      try {
+        expect(ports.onCompleteness).toBeTypeOf('function');
+        await ports.onCompleteness!({
+          category: 'resume_structured_empty_text_present',
+          textLength: 4_321,
+          structurerVersion: 'model-extraction-1+fallback',
+        });
+      } finally {
+        await shutdown();
+      }
+      const lines = warnSpy.mock.calls.map((c) => String(c[0])).filter((l) => l.includes('resume_structured_empty_text_present'));
+      expect(lines).toHaveLength(1);
+      const entry = JSON.parse(lines[0]) as Record<string, unknown>;
+      expect(entry.error_category).toBe('resume_structured_empty_text_present');
+      // The tag is sanitised into the logger's identifier alphabet, not dropped.
+      expect(entry.error_type).toBe('model-extraction-1_fallback');
+      expect(lines[0]).not.toContain('4321');
+      expect(lines[0]).not.toContain('Rohan');
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 });

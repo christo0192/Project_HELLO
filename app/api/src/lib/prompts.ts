@@ -27,7 +27,7 @@ Return a JSON object with EXACTLY these keys:
 - "email": email address (string or null)
 - "phone": the candidate's phone number, including the country code with a leading "+" (string or null). Find it even when it is embedded in a header, footer, address block, or "contact" line, and even when it sits directly next to a postal/PIN code (e.g. "Handwara J&K 193302 9741076931"). Return ONLY the phone number itself — never include the postal/PIN code or any address text in this field. If a country code is present, keep it and prefix it with "+"; if none is present, return the number exactly as written.
 - "skills": array of technical/professional skills (string[])
-- "experience_years": total years of professional experience as a number (number or null)
+- "experience_years": total years of professional experience as a JSON number, e.g. 5.5 (number or null — never a string). If the resume states a total (e.g. "5+ years of experience"), use that figure. Otherwise CALCULATE it from the employment dates of the roles listed: add up the role durations, treat "Present"/"Current" as today, and do not double-count overlapping roles. Return null only when the resume has neither a stated total nor any dated roles.
 - "current_role": most recent job title (string or null)
 - "summary": a 1-2 sentence professional summary (string or null). The summary must describe the candidate's experience ONLY — do NOT copy the contact block into it. Name, address, phone, and email belong in their own fields, never in "summary".
 - "recent_role": the most recent role as {"title": string|null, "employer": string|null, "period": string|null, "highlights": string[]} or null
@@ -38,13 +38,31 @@ Return a JSON object with EXACTLY these keys:
 
 Roles, employers, and titles are NOT only found under a dated "Experience" or "Work History" heading. They may appear inside a narrative professional summary or objective (e.g. "Senior Sales Consultant at Acme with 6 years advising clients"). Extract them into "recent_role"/"current_role"/"prior_roles" from that prose too, not only from a formal experience section.
 
-Copy evidence only. Do not infer employers, dates, achievements, education, or certifications that are not explicitly present.
+Copy evidence only. Do not infer employers, dates, achievements, education, or certifications that are not explicitly present. Adding up the dates that ARE present to compute "experience_years" is required, not inference.
+
+Type rules: every string field is a JSON string (or null), "skills"/"career_highlights"/"education"/"certifications" are JSON arrays of strings, "recent_role" is an object, "prior_roles" is an array of objects, "experience_years" is a JSON number. Respond with the JSON object only — no commentary before or after it.
 
 Resume text:`;
 
-export function buildExtractionPrompt(resumeText: string): string {
-  // Static instructions FIRST (stable cache prefix), résumé text LAST.
+/**
+ * The calendar month the model should treat as "today" when a role says
+ * "Present". A model's own sense of the date lags its training cut-off by a
+ * year or more, and "experience_years" is CALCULATED from open-ended roles, so
+ * without this every current role is under-counted. It sits AFTER the static
+ * instruction block (so the cached prefix is byte-identical across calls) and
+ * changes once a month, which is the cache invalidation it costs.
+ */
+export function extractionTodayLine(now: Date = new Date()): string {
+  const y = now.getUTCFullYear();
+  const m = String(now.getUTCMonth() + 1).padStart(2, '0');
+  return `Today is ${y}-${m}.`;
+}
+
+export function buildExtractionPrompt(resumeText: string, now: Date = new Date()): string {
+  // Static instructions FIRST (stable cache prefix), then today's month (a
+  // one-line variable suffix to the instructions), résumé text LAST.
   return `${EXTRACTION_INSTRUCTIONS}
+${extractionTodayLine(now)}
 """
 ${resumeText.slice(0, 12000)}
 """`;

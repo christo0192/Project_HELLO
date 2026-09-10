@@ -286,14 +286,32 @@ describe('the Ashby parse port structures with the model', () => {
     ['a bare string', 'not json at all'],
     ['an array', [{ phone: '9876543210' }]],
     ['null', null],
-    ['a number-typed phone', { phone: 9876543210, skills: [] }],
-    ['a non-array skills field', { phone: '9876543210', skills: 'TypeScript' }],
-    ['a string-typed experience_years', { phone: '9876543210', experience_years: '7' }],
-  ])('MALFORMED model output (%s) falls back and is never dialable', async (_label, payload) => {
+  ])('NOT-AN-OBJECT model output (%s) falls back and is never dialable', async (_label, payload) => {
     const runner: ResumeModelRunner = async () => payload;
     const { structurerVersion } = await runParse(runner);
     expect(structurerVersion).toBe(ASHBY_STRUCTURER_VERSION);
     expect(isDialableStructurer(structurerVersion)).toBe(false);
+  });
+
+  it.each([
+    ['a number-typed phone', { phone: 9876543210, skills: [] }, '9876543210'],
+    ['a non-array skills field', { phone: '9876543210', skills: 'TypeScript' }, '9876543210'],
+    ['a string-typed experience_years', { phone: '9876543210', experience_years: '7' }, '9876543210'],
+  ])('a BENIGN type deviation (%s) is coerced: the model answer stands and the strict gate alone decides dialing', async (_label, payload, rawPhone) => {
+    // These three cases used to be classed MALFORMED and threw the whole
+    // answer away — the keyword extractor took over and the candidate became
+    // undialable for a serialisation detail. The answer is now kept. What
+    // makes the number dialable is unchanged: model provenance AND the strict
+    // Indian-mobile gate, applied by `deriveCandidatePhone`.
+    const runner: ResumeModelRunner = async () => payload;
+    const { structured, structurerVersion } = await runParse(runner);
+    expect(structurerVersion).toBe(MODEL_STRUCTURER_VERSION);
+    expect(deriveCandidatePhone(structured.phone, structurerVersion))
+      .toEqual({ raw: rawPhone, e164: '+919876543210', valid: true });
+    // …and the same coerced answer with a non-strict number is still refused.
+    const landline: ResumeModelRunner = async () => ({ ...(payload as object), phone: 2212345678 });
+    const l = await runParse(landline);
+    expect(deriveCandidatePhone(l.structured.phone, l.structurerVersion).valid).toBe(false);
   });
 
   it('does not fail the ingestion when structuring fails', async () => {
@@ -350,14 +368,22 @@ describe('coerceStructuredResume — the validator that replaced a cast', () => 
     }
   });
 
-  it('rejects a present key whose TYPE is wrong', () => {
-    // A wrong shape is not a partially-good answer. Falling back is safer than
-    // keeping the fields that happened to be right.
-    expect(coerceStructuredResume({ phone: 9876543210 })).toBeNull();
-    expect(coerceStructuredResume({ name: 42 })).toBeNull();
-    expect(coerceStructuredResume({ skills: 'TypeScript' })).toBeNull();
-    expect(coerceStructuredResume({ experience_years: '7' })).toBeNull();
-    expect(coerceStructuredResume({ summary: { text: 'x' } })).toBeNull();
+  it('COERCES a present key whose TYPE is merely unexpected — it does not discard the résumé', () => {
+    // This test used to assert the opposite ("a wrong shape is not a
+    // partially-good answer"). Measured against real model output that rule
+    // discarded ordinary answers wholesale and replaced them with the keyword
+    // extractor's `Sales / Communication / Excel` and an UNDIALABLE phone. The
+    // dialing decision never rested on this check — `deriveCandidatePhone`'s
+    // strict gate and the provenance allowlist do, downstream, unchanged. See
+    // `resume-structurer-tolerant-shape.test.ts` for the full matrix.
+    expect(coerceStructuredResume({ phone: 9876543210 })!.phone).toBe('9876543210');
+    expect(coerceStructuredResume({ name: 42 })!.name).toBe('42');
+    expect(coerceStructuredResume({ skills: 'TypeScript' })!.skills).toEqual(['TypeScript']);
+    expect(coerceStructuredResume({ experience_years: '7' })!.experience_years).toBe(7);
+    // A value that cannot be rendered nulls ONLY its own field.
+    const out = coerceStructuredResume({ summary: { text: 'x' }, name: 'Kept' })!;
+    expect(out.summary).toBeNull();
+    expect(out.name).toBe('Kept');
   });
 
   it('treats an ABSENT key as null rather than malformed', () => {
