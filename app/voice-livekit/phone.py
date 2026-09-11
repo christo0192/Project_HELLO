@@ -4517,6 +4517,32 @@ _OUTCOME_CLOSING: dict[str, str] = {
 GATE_NO_PARTICIPANT = "no_participant"
 GATE_PARTICIPANT_LEFT = "participant_left"
 
+
+class PhoneParticipantGone(Exception):
+    """The callee's leg ended while the gate was mid-await. NOT an error.
+
+    Raised by the injected `say` when the AgentSession has already closed, and
+    caught once at the gate's call site.
+
+    WHY THIS EXISTS. Every spoken gate line sits behind an await that can
+    outlast the call: the bounded SIP output-subscription wait, a generation, a
+    playout. If the leg drops inside one of those windows, the next
+    `session.say` raises `RuntimeError("AgentSession isn't running")` — an
+    UNHANDLED exception that kills the job entrypoint. Observed live on
+    2026-09-11 06:11:06Z: the leg dropped 0.8 s after answer, the gate finished
+    its 8 s subscription wait, spoke, and crashed.
+
+    The crash is the expensive part, not the hang-up. It skips every terminal
+    path, so NO event is posted — which means the pre-consent recording is
+    never purged (only a `PURGE_BEFORE_EVENTS` member destroys it) and the
+    engagement is left in `dialing` for the lease reaper. A dropped call is
+    ordinary; leaving unconsented audio behind because of one is not.
+
+    A dedicated type rather than catching `RuntimeError` broadly: the SDK
+    raises that for several unrelated conditions, and swallowing all of them
+    here would hide real faults behind a routine one.
+    """
+
 # ── Bounce-mode answer wait ───────────────────────────────────────────
 # In answer-first origination the SIP participant is present ~1 s after
 # dispatch, before the real candidate has answered, so the gate cannot treat

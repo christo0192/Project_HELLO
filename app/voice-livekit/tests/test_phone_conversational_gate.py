@@ -916,6 +916,68 @@ class TestDeterministicFlowIsUntouched(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.outcome, phone.CLASSIFY_HUMAN)
 
 
+class TestParticipantGoneMidGate(unittest.IsolatedAsyncioTestCase):
+    """A leg that drops while the gate is mid-await must not crash the job.
+
+    LIVE INCIDENT 2026-09-11 06:11:06Z. The callee's leg ended 0.8 s after
+    `call.answered`; the gate was inside its 8 s SIP output-subscription wait,
+    came out of it, called `_say`, and the SDK raised
+    `RuntimeError: AgentSession isn't running` — unhandled, so the job
+    entrypoint died.
+
+    The hang-up is ordinary. The CRASH is the defect: it skips every terminal,
+    so no event posts, the pre-consent recording (the egress starts at
+    `call.answered`) is never purged, and the engagement is left in `dialing`
+    for the lease reaper. This predates the identity turn — `main` crashed the
+    same way at `await _say(PHONE_DISCLOSURE_TEXT)`.
+    """
+
+    def setUp(self):
+        self._saved = os.environ.get("PHONE_GATE_FLOW")
+        os.environ["PHONE_GATE_FLOW"] = "conversational"
+
+    def tearDown(self):
+        if self._saved is None:
+            os.environ.pop("PHONE_GATE_FLOW", None)
+        else:
+            os.environ["PHONE_GATE_FLOW"] = self._saved
+
+    async def test_a_dead_session_raises_the_typed_signal_not_a_bare_runtime_error(self):
+        h = _GateHarness(replies=["Yes, this is Priya."], verdicts=["self"])
+
+        async def _dead_say(_text):
+            raise phone.PhoneParticipantGone()
+
+        h.say = _dead_say
+        with mock.patch.object(phone, "_default_phone_identity_inference", h.infer):
+            with self.assertRaises(phone.PhoneParticipantGone):
+                await phone.run_phone_gate(
+                    attempt_id="a1",
+                    client=_RecordingClient(h),
+                    wait_for_participant=lambda: asyncio.sleep(0, result=object()),
+                    classify=h.classify,
+                    say=h.say,
+                    session_id="s1",
+                    epoch=1,
+                    next_candidate_turn=h.next_candidate_turn,
+                    speak_gate_line=h.speak_gate_line,
+                    reset_turn_buffer=h.reset_turn_buffer,
+                    candidate_name=NAME,
+                )
+
+    def test_the_signal_is_its_own_type_not_a_broad_runtime_catch(self):
+        # Catching RuntimeError broadly here would swallow unrelated SDK faults
+        # behind a routine hang-up.
+        self.assertTrue(issubclass(phone.PhoneParticipantGone, Exception))
+        self.assertFalse(issubclass(phone.PhoneParticipantGone, RuntimeError))
+
+    def test_the_participant_left_outcome_exists_and_denies_assessment(self):
+        result = phone.PhoneGateResult(
+            phone.GATE_PARTICIPANT_LEFT, events=[], spoken=[])
+        self.assertFalse(result.assessment_allowed)
+        self.assertFalse(result.recording_allowed)
+
+
 class TestGateWindowLeakVeto(unittest.IsolatedAsyncioTestCase):
     """The `_gate_opening` branch of the REAL `llm_node`.
 

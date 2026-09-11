@@ -7391,7 +7391,22 @@ async def _run_phone_session(
 
     async def say(text: str) -> None:
         started_ms = int(round(time.time() * 1000))
-        speech = session.say(text, allow_interruptions=False)
+        try:
+            speech = session.say(text, allow_interruptions=False)
+        except RuntimeError as exc:
+            # The leg dropped while the gate was mid-await. Translate the SDK's
+            # generic RuntimeError into the typed signal the gate call site
+            # catches, so a hang-up ends the call through a terminal instead of
+            # killing the job entrypoint and leaving the attempt wedged with its
+            # pre-consent recording unpurged. Matched narrowly on the SDK's own
+            # message so any OTHER RuntimeError still propagates as a real fault.
+            if "isn't running" not in str(exc) and "is not running" not in str(exc):
+                raise
+            _log.warn(
+                "unknown_event", error_type="phone_say_after_close",
+                error_category="participant_gone",
+            )
+            raise phone.PhoneParticipantGone() from exc
         wait_for_playout = getattr(speech, "wait_for_playout", None)
         if callable(wait_for_playout):
             await wait_for_playout()
@@ -8029,73 +8044,113 @@ async def _run_phone_session(
             return ""
         return text if isinstance(text, str) else ""
 
-    result = await phone.run_phone_gate(
-        attempt_id=attempt_id,
-        client=events,
-        wait_for_participant=wait_for_participant,
-        classify=classify,
-        say=say,
-        start_recording=_phone_recording_permitted_and_begin,
-        set_endpointing_max=(
-            # Fixed-local endpointing only: max_endpointing_delay governs the tail
-            # there. Excluded in dynamic mode (opt-in, off by default) whose
-            # turn_handling envelope is a different, untested shape, and in stt
-            # mode where the STT provider owns end-of-utterance.
-            _set_consent_endpointing_max
-            if phone.phone_turn_detection() == phone.PHONE_TURN_DETECTION_LOCAL
-            and not phone.phone_dynamic_endpointing_enabled()
-            else None
-        ),
-        start_role_prerender=(
-            _start_role_prerender if _role_prerender_text is not None else None
-        ),
-        say_role_opening=(
-            _say_role_opening if _role_prerender_text is not None else None
-        ),
-        epoch=epoch,
-        # F2 (2026-08-29 consent replay): consulted once before the disclosure
-        # so a mid-call re-dispatch resumes instead of re-asking for consent.
-        fetch_durable_consent=fetch_durable_consent,
-        # Recording-from-answer: post call.answered before the disclosure so the
-        # server can start the egress from the top of the call.
-        post_call_answered=True,
-        speak_opening=speak_opening,
-        # Deterministic opener (default): withhold the LLM role opener so
-        # `_deliver_role_opening` speaks the FIXED `phone_role_opening_text`
-        # ("Before we dive in, just to confirm — this is about the {role} role at
-        # Interview Kickstart. Really glad you could hop on — let's dive in!").
-        # `speak_opening` itself self-gates on the same flag (returns None →
-        # fixed disclosure). Both openers are then scripted, never model-authored,
-        # so neither can be spoken-then-contradicted. PHONE_DETERMINISTIC_OPENER=false
-        # restores both LLM openers.
-        speak_role_opening=(
-            None if phone.phone_deterministic_opener() else speak_role_opening
-        ),
-        consent_reply_out=consent_reply_out,
-        # Answer-first origination (Plivo bounce). OFF by default → byte-identical
-        # current behavior. When ON, the gate waits for the server-verified
-        # answer (the Plivo webhook applies `call.answered`) before it speaks a
-        # word, because the SIP participant is present ~1s after dispatch, long
-        # before the real candidate has picked up. The wait budget is the same
-        # `PHONE_ANSWER_TIMEOUT_SEC` bound used elsewhere in the gate.
-        bounce_mode=phone.phone_bounce_mode(),
-        # The session hint for the server-side recording start: derived from
-        # the room name the dialer minted (`phone-<sessionId>`), the same
-        # derivation 0044's binding re-verifies. Without it the server's
-        # disclosure-time DB read finds no session (it is bound only at
-        # /assessment/start) and the egress silently never starts.
-        session_id=phone.session_id_from_room_name(room_name),
-        # ── 0095: the conversational identity turn ─────────────────────────
-        # All four are wired unconditionally; the GATE decides whether to use
-        # them from `PHONE_GATE_FLOW`, and `_speak_gate_line` decides whether to
-        # generate from `PHONE_DETERMINISTIC_OPENER`. Wiring here rather than
-        # branching keeps one call site and lets a flag flip change behaviour
-        # without a deploy, exactly like every other knob in this lane.
-        next_candidate_turn=_next_candidate_turn,
-        speak_gate_line=_speak_gate_line,
-        reset_turn_buffer=_drain_user_turns,
-        candidate_name=getattr(instruction_state, "candidate_name", None),
-    )
+    async def _run_gate() -> "phone.PhoneGateResult":
+        return await phone.run_phone_gate(
+            attempt_id=attempt_id,
+            client=events,
+            wait_for_participant=wait_for_participant,
+            classify=classify,
+            say=say,
+            start_recording=_phone_recording_permitted_and_begin,
+            set_endpointing_max=(
+                # Fixed-local endpointing only: max_endpointing_delay governs the tail
+                # there. Excluded in dynamic mode (opt-in, off by default) whose
+                # turn_handling envelope is a different, untested shape, and in stt
+                # mode where the STT provider owns end-of-utterance.
+                _set_consent_endpointing_max
+                if phone.phone_turn_detection() == phone.PHONE_TURN_DETECTION_LOCAL
+                and not phone.phone_dynamic_endpointing_enabled()
+                else None
+            ),
+            start_role_prerender=(
+                _start_role_prerender if _role_prerender_text is not None else None
+            ),
+            say_role_opening=(
+                _say_role_opening if _role_prerender_text is not None else None
+            ),
+            epoch=epoch,
+            # F2 (2026-08-29 consent replay): consulted once before the disclosure
+            # so a mid-call re-dispatch resumes instead of re-asking for consent.
+            fetch_durable_consent=fetch_durable_consent,
+            # Recording-from-answer: post call.answered before the disclosure so the
+            # server can start the egress from the top of the call.
+            post_call_answered=True,
+            speak_opening=speak_opening,
+            # Deterministic opener (default): withhold the LLM role opener so
+            # `_deliver_role_opening` speaks the FIXED `phone_role_opening_text`
+            # ("Before we dive in, just to confirm — this is about the {role} role at
+            # Interview Kickstart. Really glad you could hop on — let's dive in!").
+            # `speak_opening` itself self-gates on the same flag (returns None →
+            # fixed disclosure). Both openers are then scripted, never model-authored,
+            # so neither can be spoken-then-contradicted. PHONE_DETERMINISTIC_OPENER=false
+            # restores both LLM openers.
+            speak_role_opening=(
+                None if phone.phone_deterministic_opener() else speak_role_opening
+            ),
+            consent_reply_out=consent_reply_out,
+            # Answer-first origination (Plivo bounce). OFF by default → byte-identical
+            # current behavior. When ON, the gate waits for the server-verified
+            # answer (the Plivo webhook applies `call.answered`) before it speaks a
+            # word, because the SIP participant is present ~1s after dispatch, long
+            # before the real candidate has picked up. The wait budget is the same
+            # `PHONE_ANSWER_TIMEOUT_SEC` bound used elsewhere in the gate.
+            bounce_mode=phone.phone_bounce_mode(),
+            # The session hint for the server-side recording start: derived from
+            # the room name the dialer minted (`phone-<sessionId>`), the same
+            # derivation 0044's binding re-verifies. Without it the server's
+            # disclosure-time DB read finds no session (it is bound only at
+            # /assessment/start) and the egress silently never starts.
+            session_id=phone.session_id_from_room_name(room_name),
+            # ── 0095: the conversational identity turn ─────────────────────────
+            # All four are wired unconditionally; the GATE decides whether to use
+            # them from `PHONE_GATE_FLOW`, and `_speak_gate_line` decides whether to
+            # generate from `PHONE_DETERMINISTIC_OPENER`. Wiring here rather than
+            # branching keeps one call site and lets a flag flip change behaviour
+            # without a deploy, exactly like every other knob in this lane.
+            next_candidate_turn=_next_candidate_turn,
+            speak_gate_line=_speak_gate_line,
+            reset_turn_buffer=_drain_user_turns,
+            candidate_name=getattr(instruction_state, "candidate_name", None),
+        )
+
+    # ONE catch for every spoken line in the gate. `say` raises
+    # `PhoneParticipantGone` when the AgentSession has already closed under it,
+    # which happens whenever the leg drops inside one of the gate's awaits — the
+    # bounded SIP-subscription wait, a generation, a playout. Guarding each
+    # speaking site instead would be the per-site duplication that put a `_post`
+    # NameError on this lane's last new terminal; there is one call site here,
+    # so there is one guard.
+    #
+    # Observed live 2026-09-11 06:11:06Z: leg dropped 0.8 s after answer, the
+    # gate finished its 8 s subscription wait, spoke, and the job CRASHED with
+    # `RuntimeError: AgentSession isn't running`. The crash is what costs — it
+    # skips every terminal, so no event posts, the pre-consent recording is
+    # never purged and the engagement is left in `dialing` for the reaper.
+    try:
+        result = await _run_gate()
+    except phone.PhoneParticipantGone:
+        _log.info(
+            "unknown_event", error_type="phone_gate_outcome",
+            schema=phone.GATE_PARTICIPANT_LEFT,
+        )
+        # Post the PURGING terminal before returning. Not crashing is only half
+        # the fix: the egress starts at `call.answered`, and only a
+        # `PURGE_BEFORE_EVENTS` member destroys that audio. Best-effort — a
+        # failure here must not re-raise into the entrypoint, which is the very
+        # crash being removed.
+        try:
+            await events.post_event(
+                attempt_id, "candidate.deferred_pre_disclosure", epoch=epoch,
+            )
+        except Exception:  # noqa: BLE001
+            _log.warn(
+                "unknown_event", error_type="phone_gate_outcome",
+                error_category="participant_left_terminal_failed",
+            )
+        result = phone.PhoneGateResult(
+            phone.GATE_PARTICIPANT_LEFT, events=[], spoken=[],
+        )
+
 
     # Review repair: cancel a still-running role pre-render once the gate has
     # returned. On a machine/refused/opt-out call (or a HUMAN call where the
