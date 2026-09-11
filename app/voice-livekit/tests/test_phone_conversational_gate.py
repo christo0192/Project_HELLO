@@ -1597,6 +1597,40 @@ class TestEmittedMeansAudioNotChunks(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(spoken, "")
         self.assertFalse(emitted)
 
+    async def test_a_LETTER_FREE_chunk_is_not_counted_as_audio(self):
+        # Non-empty is not the same as audible. `tts_node` merges letter-free
+        # fragments forward — "no letter-free text is ever handed downstream" —
+        # so a whitespace- or markdown-only chunk passes a `_chunk_text` test and
+        # still makes no sound. Behind the one-word lookahead it can be the ONLY
+        # thing yielded before the tail veto ends the turn, which lands in the
+        # same place as the empty-delta case: the gate skips its own opener and
+        # leads with "Sorry — am I speaking to X?".
+        #
+        # The `not released` branch below already requires a letter; these sites
+        # have to agree with it.
+        # The middle chunk matters. Without a clean boundary the whole lead is
+        # vetoed before anything is yielded, the latch is never reached, and the
+        # test passes whatever the latch does — which is how the first version
+        # of this test let the mutation live. Here "Hi there," releases, the
+        # lookahead retains it, and the LETTER-FREE chunk is the only thing that
+        # actually goes out before the recital trips the tail veto.
+        for lead in ("  ", "**", " — ", "\n"):
+            spoken, emitted = await self._run([
+                lead,
+                "Hi there, ",
+                "I can see you are a Senior Data Engineer at Infosys in "
+                "Bengaluru with four years of experience. Am I speaking to "
+                "Priya?",
+            ])
+            self.assertFalse(
+                any(ch.isalpha() for ch in spoken),
+                f"résumé text reached the caller: {spoken!r}")
+            self.assertFalse(
+                emitted,
+                f"a letter-free lead {lead!r} was recorded as audio; the gate "
+                f"will skip its own introduction and open with the repair line",
+            )
+
     async def test_real_text_DOES_still_count_as_audio(self):
         # The guard must not swing the other way: a line that really is spoken
         # has to report so, or `run_phone_gate` speaks its fixed opener OVER the

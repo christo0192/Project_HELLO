@@ -14958,6 +14958,27 @@ class _LegDropsSession(_FakePhoneSession):
         return super().say(text, **kwargs)
 
 
+class _PlayoutDropsSession(_FakePhoneSession):
+    """The leg drops DURING playout, not at the `say` call.
+
+    This is the likelier of the two windows by a wide margin — a model-authored
+    disclosure plays for ten seconds or more while `session.say` itself occupies
+    almost none — and it was the one covered only by a source-text count.
+    """
+
+    def say(self, text, **kwargs):
+        handle = super().say(text, **kwargs)
+
+        class _Handle:
+            def __getattr__(self_inner, name):
+                return getattr(handle, name)
+
+            async def wait_for_playout(self_inner):
+                raise RuntimeError("AgentSession isn't running")
+
+        return _Handle()
+
+
 class _FlakyPurgeClient(FakeEventClient):
     """Fails the purge post ONCE, by returning a not-ok outcome.
 
@@ -15083,6 +15104,17 @@ class TestDroppedLegOnTheConversationalGate(unittest.IsolatedAsyncioTestCase):
                   if event == "candidate.deferred_pre_disclosure"]
         self.assertTrue(purges)
         self.assertEqual(purges[0].get("epoch"), _EPOCH)
+
+    async def test_a_leg_that_drops_DURING_PLAYOUT_is_handled_too(self):
+        # `say` returns fine and the crash lands in `wait_for_playout`. Covered
+        # until now only by `test_BOTH_call_sites_use_the_same_translation`,
+        # which counts occurrences in the source — so replacing this site's
+        # `except RuntimeError` with a never-raised class left the suite green.
+        client = FakeEventClient()
+        result = await self._run(client, session_cls=_PlayoutDropsSession)
+        self.assertEqual(result.outcome, phone.GATE_PARTICIPANT_LEFT)
+        posted = [event for _a, event, _kw in client.calls]
+        self.assertIn("candidate.deferred_pre_disclosure", posted, posted)
 
     async def test_an_UNRELATED_RuntimeError_still_surfaces(self):
         # The translation matches the SDK's own wording narrowly. Widening it to

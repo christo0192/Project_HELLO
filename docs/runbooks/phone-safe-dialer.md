@@ -105,12 +105,17 @@ recording and the job out of the identity turn, and Christy introduced herself
 exactly once. PRODUCTION now runs stage 2 by secret.
 
 The code DEFAULTS deliberately stay at stage 0. A flip was drafted and dropped
-on review: it gains nothing production does not already have, and costs three
+on review: it gains nothing production does not already have, and costs two
 things — a mistyped rollback token would fail OPEN (`determinstic` selects the
-conversational gate), a fresh or rebuilt deployment would speak model-authored
-copy before consent with nothing configured, and no test exercises `agent.py`
-with the conversational gate on, so the shipped default would be the untested
-one. `fly secrets unset` therefore remains a true rollback.
+conversational gate), and a fresh or rebuilt deployment would speak
+model-authored copy before consent with nothing configured. `fly secrets unset`
+therefore remains a true rollback.
+
+(A third reason given when the flip was dropped — "no test exercises `agent.py`
+with the conversational gate on" — no longer holds:
+`TestDroppedLegOnTheConversationalGate` and `TestUnsetEnvSelectsTheScriptedGate`
+now drive `_run_phone_session` on both sides of the flag. The first two reasons
+stand on their own.)
 
 **To enable stage 1, then stage 2:**
 

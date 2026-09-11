@@ -19,6 +19,7 @@ These tests import `agent` and drive the real functions.
 from __future__ import annotations
 
 import asyncio
+import time
 import types
 import unittest
 
@@ -193,6 +194,112 @@ class TestClassifyPhoneAnswerSkipsStaleTurns(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(decision, phone.CLASSIFY_MACHINE)
         self.assertEqual(consumed, [], "a stale turn was consumed as consent")
+
+
+class TestIdentityReaderSkipsStaleTurns(unittest.IsolatedAsyncioTestCase):
+    """`_read_fresh_turn` — the IDENTITY side of the barrier, driven directly.
+
+    This had no test at all, and a review proved it: deleting the staleness skip
+    (`if False and _queued_turn_is_stale(...)`) and emptying
+    `_mark_question_asked` each left the ENTIRE 1895-test suite green, while
+    driving the real session showed the identity check reading the callee's
+    pickup — `['Hello? Hello?']` instead of `['Yes, this is Christo.']`. That is
+    precisely the live 2026-09-11 defect this branch exists to fix.
+
+    The only thing that looked like coverage, `_GateHarness.next_candidate_turn`
+    in `test_phone_conversational_gate.py`, RE-IMPLEMENTS the rule, so it tests
+    its own copy. And no session test can reach the real one: the harness
+    patches `persistence` with a bare `MagicMock`, so `normalize_turn_anchor_ms`
+    returns a Mock that `_queued_turn` discards, and `_FakePhoneSession` stamps a
+    fixed 2024 anchor that the one-hour sanity window reads as a wrong clock —
+    two independent reasons the rule is invisible there.
+    """
+
+    async def _read(self, items, anchor, timeout=0.05):
+        turns: asyncio.Queue = asyncio.Queue()
+        for item in items:
+            turns.put_nowait(item)
+        return await agent_mod._read_fresh_turn(
+            turns, (lambda: anchor), timeout)
+
+    async def test_the_PICKUP_hello_is_skipped_and_the_answer_is_read(self):
+        # The live defect, in one line. "Hello?" began 3 s before the gate asked;
+        # the real answer began after it.
+        self.assertEqual(
+            await self._read(
+                [("Hello?", 1_000), ("Yes, this is Christo.", 5_000)],
+                anchor=4_000),
+            "Yes, this is Christo.",
+        )
+
+    async def test_a_BARGE_IN_answer_over_the_question_is_KEPT(self):
+        # Began 1 ms after the question was anchored — mid-playout. Dropping
+        # this is what made the identity check verify nothing on the stage-2
+        # call, so the barrier must not be "discard anything early".
+        self.assertEqual(
+            await self._read([("Yeah, speaking.", 4_001)], anchor=4_000),
+            "Yeah, speaking.",
+        )
+
+    async def test_stale_turns_do_not_BUY_or_SPEND_the_answer_budget(self):
+        # Skipped within the SAME budget: a stale utterance must not extend the
+        # window, and must not consume it either. Only stale turns here, so the
+        # reader must exhaust its budget and report nothing usable.
+        started = time.monotonic()
+        self.assertEqual(
+            await self._read(
+                [("Hello?", 1_000), ("Hello?", 1_100), ("Hello?", 1_200)],
+                anchor=9_000, timeout=0.05),
+            "",
+        )
+        self.assertLess(time.monotonic() - started, 1.0,
+                        "stale turns extended the answer window")
+
+    async def test_an_UNTIMED_turn_is_kept_rather_than_lost(self):
+        # Fail-open: losing a real answer costs the identity check, reading a
+        # stale one costs a re-ask.
+        self.assertEqual(
+            await self._read([("Yes, that's me.", None)], anchor=4_000),
+            "Yes, that's me.")
+        self.assertEqual(
+            await self._read([("Yes, that's me.", 1_000)], anchor=None),
+            "Yes, that's me.")
+
+    async def test_a_WRONG_CLOCK_anchor_does_not_silence_the_candidate(self):
+        # A monotonic-shaped `started_speaking_at` normalises to 1970. Without
+        # the sanity window every turn reads as stale, the identity reader
+        # returns "", and every consenting candidate is torn down as a machine.
+        now_ms = int(round(time.time() * 1000))
+        self.assertEqual(
+            await self._read([("Yes, speaking.", 12_345_678)], anchor=now_ms),
+            "Yes, speaking.",
+        )
+
+    async def test_an_EMPTY_queue_returns_nothing_rather_than_hanging(self):
+        started = time.monotonic()
+        self.assertEqual(await self._read([], anchor=4_000, timeout=0.05), "")
+        self.assertLess(time.monotonic() - started, 1.0)
+
+    async def test_the_anchor_is_read_LIVE_not_captured_once(self):
+        # `_mark_question_asked` re-arms the anchor for each gate question, so
+        # the reader must see the CURRENT one. Captured at call time, the second
+        # question would be judged against the first question's anchor and the
+        # first question's trailing answer would be read as the second's.
+        anchor = {"ms": 1_000}
+        turns: asyncio.Queue = asyncio.Queue()
+        turns.put_nowait(("answer to question one", 2_000))
+        got = await agent_mod._read_fresh_turn(
+            turns, (lambda: anchor["ms"]), 0.05)
+        self.assertEqual(got, "answer to question one")
+
+        anchor["ms"] = 9_000          # question two is asked
+        turns.put_nowait(("answer to question one", 2_000))
+        self.assertEqual(
+            await agent_mod._read_fresh_turn(
+                turns, (lambda: anchor["ms"]), 0.05),
+            "",
+            "a stale answer was re-read against the NEXT question's anchor",
+        )
 
 
 class TestSayTranslatesADeadSession(unittest.IsolatedAsyncioTestCase):

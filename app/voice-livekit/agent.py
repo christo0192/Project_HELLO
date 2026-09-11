@@ -942,6 +942,47 @@ _TURN_ANCHOR_SANE_LOOKBACK_MS = 60 * 60 * 1000
 _SDK_SESSION_STOPPED_MARKERS = ("isn't running", "is not running")
 
 
+async def _read_fresh_turn(
+    user_turns: "asyncio.Queue",
+    question_anchor: "Callable[[], int | None]",
+    timeout_sec: float,
+) -> str:
+    """Pop the first utterance that began AFTER the question, within one budget.
+
+    THE IDENTITY HALF OF THE TURN BARRIER, and module-level so a test can reach
+    it. Left inside `_run_phone_session`'s closure it was unreachable: the
+    session harness patches `persistence` with a bare `MagicMock`, so
+    `normalize_turn_anchor_ms` returns a Mock that `_queued_turn` discards, and
+    `_FakePhoneSession` stamps a fixed 2024 anchor that the one-hour sanity
+    window reads as a wrong clock. Two independent reasons no session test could
+    ever observe this rule — which is how the live 2026-09-11 defect it fixes
+    would have come straight back.
+
+    Stale utterances are skipped WITHIN the same budget: one must not buy the
+    candidate extra time, nor spend theirs. Returns "" when the budget runs out,
+    which the caller reads as "nothing usable" rather than as an answer.
+    """
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return ""
+        try:
+            item = await asyncio.wait_for(user_turns.get(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return ""
+        except Exception:  # noqa: BLE001
+            return ""
+        text, anchor_ms = _queued_turn(item)
+        if _queued_turn_is_stale(anchor_ms, question_anchor()):
+            _log.info(
+                "unknown_event", error_type="phone_gate_turn_barrier",
+                error_category="pre_question_turn_skipped",
+            )
+            continue
+        return text
+
+
 def _participant_gone_from(exc: RuntimeError, *, category: str) -> Exception:
     """Translate an SDK "session stopped" RuntimeError, or re-raise it.
 
@@ -8178,28 +8219,14 @@ async def _run_phone_session(
         unextractable reply as "proceed", and an exception here would end a call
         that a real candidate is on.
         """
-        deadline = time.monotonic() + phone.phone_classify_answer_timeout_sec()
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return ""
-            try:
-                item = await asyncio.wait_for(user_turns.get(), timeout=remaining)
-            except asyncio.TimeoutError:
-                return ""
-            except Exception:  # noqa: BLE001
-                return ""
-            text, anchor_ms = _queued_turn(item)
-            # Skip anything that began before THIS question and keep waiting
-            # within the SAME budget — a stale utterance must not buy the
-            # candidate extra time, nor spend theirs.
-            if _queued_turn_is_stale(anchor_ms, gate_question_anchor[0]):
-                _log.info(
-                    "unknown_event", error_type="phone_gate_turn_barrier",
-                    error_category="pre_question_turn_skipped",
-                )
-                continue
-            return text
+        # Delegates to the module-level reader so the RULE is reachable by a
+        # test. Inlined here it was covered only by a harness that
+        # re-implemented it, i.e. by its own copy.
+        return await _read_fresh_turn(
+            user_turns,
+            lambda: gate_question_anchor[0],
+            phone.phone_classify_answer_timeout_sec(),
+        )
 
     async def _run_gate() -> "phone.PhoneGateResult":
         return await phone.run_phone_gate(
