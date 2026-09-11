@@ -14604,31 +14604,34 @@ class TestDeveloperRoleRewriteWiring(unittest.IsolatedAsyncioTestCase):
 
 
 class TestDeterministicOpenerFlag(unittest.TestCase):
-    """Since 2026-09-11 the model-authored openers are the DEFAULT.
+    """Scripted copy is the DEFAULT, and generation needs an explicit `false`.
 
-    The flip followed two live owner-test calls in which both stages reached
-    `disclosure.delivered`. Scripted copy is now the ROLLBACK and needs an
-    explicit `true` — an unset selects generation. These tests pin the
-    inversion, because the failure mode of getting it wrong is silent: an
-    operator who believes `unset` still means scripted would ship generation.
+    A flip was drafted 2026-09-11, after two live owner-test calls in which both
+    stages reached `disclosure.delivered`, and was dropped on review: production
+    selects the authored openers by SECRET, so flipping the code default gained
+    nothing and cost the fail-safe direction. These tests pin THAT, because the
+    failure mode is silent either way — a deployment with nothing configured
+    must speak the verified copy, not generate before consent.
     """
 
-    def test_scripted_copy_needs_an_EXPLICIT_true(self):
+    def test_generation_needs_an_EXPLICIT_false(self):
         for value, expected in (
-            # ON (scripted rollback): only the explicit truthy tokens
-            ("true", True), ("TRUE", True), (" true ", True), ("on", True),
-            ("1", True), ("yes", True),
-            # OFF (generation, the default): unset/empty and anything else
-            ("", False), ("false", False), ("FALSE", False), ("0", False),
-            ("no", False), ("off", False), ("garbage", False),
+            # OFF (generation): only the explicit falsy tokens select it.
+            ("false", False), ("FALSE", False), (" false ", False),
+            ("0", False), ("no", False), ("off", False),
+            # ON (scripted, the default): unset/empty, the truthy tokens, and —
+            # the point of the case — anything unrecognised. A mistyped rollback
+            # token must land on the scripted gate, never past it.
+            ("", True), ("true", True), ("TRUE", True), ("1", True),
+            ("yes", True), ("on", True), ("garbage", True), ("fasle", True),
         ):
             with patch.dict(phone.os.environ, {"PHONE_DETERMINISTIC_OPENER": value}):
                 self.assertEqual(phone.phone_deterministic_opener(), expected, value)
 
-    def test_unset_now_defaults_to_GENERATION(self):
+    def test_unset_defaults_to_SCRIPTED(self):
         with patch.dict(phone.os.environ, {}, clear=False):
             phone.os.environ.pop("PHONE_DETERMINISTIC_OPENER", None)
-            self.assertFalse(phone.phone_deterministic_opener())
+            self.assertTrue(phone.phone_deterministic_opener())
 
 
 class TestJudgeAuthFailureHonest(unittest.IsolatedAsyncioTestCase):
