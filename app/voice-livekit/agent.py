@@ -937,6 +937,33 @@ def _turn_anchor_ms(item: Any) -> int | None:
 #: turn and far below the gap a wrong-clock value produces.
 _TURN_ANCHOR_SANE_LOOKBACK_MS = 60 * 60 * 1000
 
+#: The SDK's own wording when the session has stopped. Matched narrowly, so any
+#: OTHER RuntimeError still surfaces as the real fault it is.
+_SDK_SESSION_STOPPED_MARKERS = ("isn't running", "is not running")
+
+
+def _participant_gone_from(exc: RuntimeError, *, category: str) -> Exception:
+    """Translate an SDK "session stopped" RuntimeError, or re-raise it.
+
+    Lives here rather than inside `say`'s closure so the match on vendor prose
+    is REACHABLE BY A TEST. It previously existed twice inside
+    `_run_phone_session`, where the only thing a test could reach was a string
+    literal it had written itself — which is not a test of anything, on exactly
+    the defect class this file keeps hitting.
+
+    Returns the signal for the caller to raise (so the `from exc` chain stays at
+    the call site); raises the original for anything that is not a stopped
+    session.
+    """
+    message = str(exc)
+    if not any(marker in message for marker in _SDK_SESSION_STOPPED_MARKERS):
+        raise exc
+    _log.warn(
+        "unknown_event", error_type="phone_say_after_close",
+        error_category=category,
+    )
+    return phone.PhoneParticipantGone()
+
 
 def _queued_turn(item: Any) -> tuple[str, int | None]:
     """Unpack a `user_turns` entry as (text, speech_start_ms).
@@ -7478,15 +7505,9 @@ async def _run_phone_session(
             # generic RuntimeError into the typed signal the gate call site
             # catches, so a hang-up ends the call through a terminal instead of
             # killing the job entrypoint and leaving the attempt wedged with its
-            # pre-consent recording unpurged. Matched narrowly on the SDK's own
-            # message so any OTHER RuntimeError still propagates as a real fault.
-            if "isn't running" not in str(exc) and "is not running" not in str(exc):
-                raise
-            _log.warn(
-                "unknown_event", error_type="phone_say_after_close",
-                error_category="participant_gone",
-            )
-            raise phone.PhoneParticipantGone() from exc
+            # pre-consent recording unpurged.
+            raise _participant_gone_from(
+                exc, category="participant_gone") from exc
         wait_for_playout = getattr(speech, "wait_for_playout", None)
         if callable(wait_for_playout):
             try:
@@ -7497,13 +7518,8 @@ async def _run_phone_session(
                 # disclosure plays for ten seconds or more while `session.say`
                 # itself occupies almost none. Same translation as above, or
                 # this window reproduces the crash the guard exists to remove.
-                if "isn't running" not in str(exc) and "is not running" not in str(exc):
-                    raise
-                _log.warn(
-                    "unknown_event", error_type="phone_say_after_close",
-                    error_category="participant_gone_during_playout",
-                )
-                raise phone.PhoneParticipantGone() from exc
+                raise _participant_gone_from(
+                    exc, category="participant_gone_during_playout") from exc
         # Both disclosure variants, or the metric silently loses every sample
         # the moment the conversational flow is enabled (that flow speaks
         # `PHONE_DISCLOSURE_CONTINUATION_TEXT` and never the other one).
@@ -7531,10 +7547,15 @@ async def _run_phone_session(
         # defect this mechanism exists to close. Only the reader knows its own
         # question, so only the reader can decide.
         #
-        # `_turn_anchor_ms` is the SDK's VAD `started_speaking_at` (a
+        # `_turn_anchor_ms` prefers the SDK's VAD `started_speaking_at` (a
         # `time.time()` seconds float, normalised to ms — the same clock and
-        # units as the anchors the readers compare against). `None` when the
-        # message carries no usable timing, which the readers treat as KEEP.
+        # units as the anchors the readers compare against), and FALLS BACK to
+        # `created_at`, the message-FINALISATION time. That fallback is a
+        # different instant: a barge-in answer finalises after the question, so
+        # it survives, while a late final of pre-question speech can finalise
+        # after the anchor and be kept. Fail-open either way, which is the
+        # chosen direction. Only a message with neither is `None`, which the
+        # readers also treat as KEEP.
         user_turns.put_nowait((text, _turn_anchor_ms(message)))
 
     # Complete and immutable from construction. The exact owed question is

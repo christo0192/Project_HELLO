@@ -37,8 +37,11 @@ def setUpModule() -> None:
     This file tests the phone SESSION — the Q&A loop, the goodbye ladder, the
     silence prompts, the watchdog. The gate in front of it is a FIXTURE, not the
     subject: these fixtures drive `run_phone_gate` without wiring an identity
-    answer, so under the 2026-09-11 default (conversational) they simply block
-    for the 15 s answer window and time out. 45 of them did.
+    answer, so under the conversational flow they simply block for the 15 s
+    answer window and time out. 45 of them did, when a 2026-09-11 draft briefly
+    made that flow the default. The draft was dropped and `deterministic` is the
+    default again, so this pin is now belt-and-braces rather than load-bearing —
+    it keeps these tests pinned to their subject even if the default moves.
 
     Pinning the rollback tokens keeps each test exercising the thing it was
     written for, and costs no coverage of the conversational gate: that path has

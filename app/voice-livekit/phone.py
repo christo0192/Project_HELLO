@@ -8530,24 +8530,58 @@ def phone_instruction_echo_detected(speech: Any, control_text: Any) -> bool:
     return any(tuple(spoken[i:i + 6]) in windows for i in range(len(spoken) - 5))
 
 
+#: Shortest verbatim run that counts as a recital FORMING, rather than a word
+#: two texts happen to share.
+#:
+#: NOT 1, and that is measured, not chosen. A parsed-résumé blob is prose — the
+#: 8000-char cap `agent.py` arms with runs to ~1200 tokens — so it contains
+#: "there", "morning", "with", "from". Holding on any single shared token means
+#: a clean greeting is held until it reaches a boundary whose last word happens
+#: to be absent from the résumé: driving the real `llm_node` with a production-
+#: sized control, "Hi there, good morning! This is Christy calling from
+#: Interview Kickstart." waited 63 chars before first audio, WORSE than the
+#: 73-char hold this whole change exists to remove.
+#:
+#: At 2 the same lines wait 10 and 14 chars — identical to no hold at all — and
+#: a verbatim recital is still stopped, because a recital is by definition a
+#: long run and trips this on its second word. Two texts sharing two CONSECUTIVE
+#: words in the same order is already unusual; sharing one is not evidence of
+#: anything.
+_GATE_CONTROL_RUN_MIN_TOKENS = 2
+
+#: Chunks held back behind the decision point, so the FIRST word of a run is
+#: still recallable when the second word reveals what it was. Without it the
+#: run's opening token is already spoken by the time the run becomes visible —
+#: measured as "Senior" escaping on an otherwise-stopped recital.
+_GATE_RUN_LOOKAHEAD_CHUNKS = 1
+
+
 @functools.lru_cache(maxsize=4)
 def _control_run_index(control_text: str) -> "frozenset[tuple[str, ...]]":
-    """Every contiguous 1-to-5-token run in the control text.
+    """Contiguous control runs that could still GROW into a six-word window.
 
-    Memoised because `phone_control_run_forming` is called once per streamed
-    CHUNK, and re-tokenising an 8000-char résumé (the cap `agent.py` arms with)
-    fifteen times per line measured at 24 ms — small beside the second this
-    change gives back, but pure waste on the one path being optimised. Keyed on
-    the exact control string and derived from nothing else, so it cannot go
-    stale; `maxsize=4` because a worker handles one call at a time.
+    Two things matter here and both were review findings. Runs shorter than
+    `_GATE_CONTROL_RUN_MIN_TOKENS` are excluded, or every single résumé token
+    matches and the predicate degenerates into "is this word in the résumé?" —
+    which holds a clean greeting for 63 chars. And a run is only worth holding
+    for if six tokens can actually follow from where it starts, so the start
+    positions stop at `len - 5`: a run matching the very END of the control can
+    never complete a window.
+
+    Memoised because `phone_control_run_forming` runs once per streamed CHUNK,
+    and re-tokenising 8000 chars fifteen times a line measured at 24 ms — small
+    beside the second this change gives back, but pure waste on the one path
+    being optimised. Keyed on the exact control string and derived from nothing
+    else, so it cannot go stale; `maxsize=4` because a worker takes one call at
+    a time.
     """
     control = _COVERAGE_TOKEN_RE.findall(control_text.casefold())
     if len(control) < 6:
         return frozenset()
     return frozenset(
         tuple(control[i:i + size])
-        for size in range(1, 6)
-        for i in range(len(control) - size + 1)
+        for size in range(_GATE_CONTROL_RUN_MIN_TOKENS, 6)
+        for i in range(len(control) - 5)
     )
 
 
@@ -8576,15 +8610,18 @@ def phone_control_run_forming(streamed: Any, control_text: Any) -> bool:
     if not isinstance(streamed, str) or not isinstance(control_text, str):
         return False
     spoken = _COVERAGE_TOKEN_RE.findall(streamed.casefold())
-    if not spoken:
+    if len(spoken) < _GATE_CONTROL_RUN_MIN_TOKENS:
         return False
     # Empty below six control tokens: the detector itself is inert there, so
     # there is no run to be part-way through and nothing to hold for.
     runs = _control_run_index(control_text)
     if not runs:
         return False
-    return any(tuple(spoken[-size:]) in runs
-               for size in range(min(len(spoken), 5), 0, -1))
+    return any(
+        tuple(spoken[-size:]) in runs
+        for size in range(min(len(spoken), 5),
+                          _GATE_CONTROL_RUN_MIN_TOKENS - 1, -1)
+    )
 
 
 def phone_fallback_acknowledgement(answer: Any, *, answer_is_question: bool = False) -> str:
@@ -10946,9 +10983,18 @@ def phone_agent_class(agent_base: Any) -> Any:
                             streamed, self._gate_leak_control,
                         ):
                             continue
-                        for ready in pending:
-                            yield ready
-                        pending.clear()
+                        # Keep the newest chunk back. A run only becomes visible
+                        # on its SECOND word, so flushing everything here speaks
+                        # the first one a beat before the check can recognise it
+                        # — measured as "Senior" escaping an otherwise-stopped
+                        # recital. One chunk of lookahead makes the opening word
+                        # recallable; it costs a single token of lag on a stream
+                        # that is already playing.
+                        keep = _GATE_RUN_LOOKAHEAD_CHUNKS
+                        ready, pending[:] = pending[:-keep], pending[-keep:]
+                        for chunk_out in ready:
+                            self._gate_stream_emitted = True
+                            yield chunk_out
                         continue
                     held.append(chunk)
                     parts.append(_chunk_text(chunk))
@@ -10998,9 +11044,24 @@ def phone_agent_class(agent_base: Any) -> Any:
                         continue
                     released = True
                     streamed = "".join(parts)
-                    self._gate_stream_emitted = True
-                    for ready in held:
-                        yield ready
+                    # The lead's LAST chunk carries the same risk as any other:
+                    # it may be the opening word of a run the next chunk
+                    # completes. Hand it to `pending` so the loop above decides
+                    # it with one chunk of hindsight, instead of speaking it
+                    # here and finding out afterwards.
+                    #
+                    # `_gate_stream_emitted` is therefore set at the YIELD, not
+                    # here. Releasing no longer implies audio: with the lead
+                    # held back, a veto on the next chunk can end the turn with
+                    # nothing spoken. Marking it here would tell
+                    # `run_phone_gate` a line went out when none did, and it
+                    # would skip the fixed opener — a SILENT gate, the mirror of
+                    # the 2026-09-09 double-opener.
+                    keep = _GATE_RUN_LOOKAHEAD_CHUNKS
+                    ready, pending[:] = held[:-keep], held[-keep:]
+                    for chunk_out in ready:
+                        self._gate_stream_emitted = True
+                        yield chunk_out
                     held.clear()
                 if not released:
                     # The whole reply ended before it reached a full window, so
@@ -11030,6 +11091,7 @@ def phone_agent_class(agent_base: Any) -> Any:
                 # longer fire, these are safe and must not be dropped — the
                 # candidate would hear a sentence cut off mid-clause.
                 for ready in pending:
+                    self._gate_stream_emitted = True
                     yield ready
                 pending.clear()
                 return

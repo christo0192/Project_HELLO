@@ -400,9 +400,11 @@ class _GateHarness:
         # "the barrier ate the real answer" a failure this harness can actually
         # observe rather than one it defines away.
         # Stale utterances, each with the ms at which its SPEECH STARTED.
-        # Production filters these at the producer (`on_candidate_turn`) by
-        # comparing that start against the question anchor; the harness applies
-        # the same rule at the reader, which is observably identical.
+        # Production filters these at the READER (`_next_candidate_turn` and
+        # `_classify_phone_answer`), comparing that start against the anchor of
+        # the question each reader itself asked — a producer-side filter cannot,
+        # because only the reader knows which question is outstanding. The
+        # harness applies the same rule in the same place.
         self.queue: list[tuple[str, int]] = []
         self.anchor_ms: int | None = None
         # A monotonic tick, not a wall clock. Production compares real
@@ -924,9 +926,10 @@ class TestDeterministicFlowIsUntouched(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         self._saved = os.environ.get("PHONE_GATE_FLOW")
-        # EXPLICIT now. Since the 2026-09-11 flip an unset selects the
-        # conversational flow, so a test of the rollback path must set the
-        # rollback token — popping it would silently test the new default.
+        # EXPLICIT, not popped. The default is `deterministic`, so popping
+        # would pass for the wrong reason — it would test the DEFAULT rather
+        # than the rollback token, and keep passing if the token stopped
+        # working. A 2026-09-11 draft did flip the default; it was dropped.
         os.environ["PHONE_GATE_FLOW"] = "deterministic"
 
     def tearDown(self):
@@ -1103,14 +1106,20 @@ class TestGateWindowLeakVeto(unittest.IsolatedAsyncioTestCase):
         # The lead is clean, so it releases — and A0's F1/F2 review finding was
         # exactly that the remainder then streamed unchecked. The tail veto has
         # to truncate, not merely decline to start.
+        #
+        # With one chunk of lookahead the lead's LAST chunk is still in hand
+        # when the recital arrives, so at this coarse granularity the whole lead
+        # is withheld and the turn ends silent — `run_phone_gate` then speaks
+        # its fixed line. Safer than truncating, so the assertion is on the
+        # guarantee that matters rather than on which of the two happened.
         chunks = [
             "Hi, this is Christy calling about your application. ",
             "I can see you are a Senior Data Engineer at Infosys in Bengaluru ",
             "with four years of experience. Am I speaking to Priya?",
         ]
         spoken = await self._spoken(chunks)
-        self.assertTrue(spoken.startswith("Hi, this is Christy"))
         self.assertNotIn("Infosys in Bengaluru with four years", spoken)
+        self.assertNotIn("Senior Data Engineer", spoken)
 
     async def test_a_premature_goodbye_is_vetoed(self):
         self.assertEqual(
@@ -1321,25 +1330,111 @@ class TestGateLeakVetoAtTokenGranularity(TestGateWindowLeakVeto):
                     f"{line!r}: {spoken!r}",
                 )
 
+    #: A parsed-résumé blob as `agent.py` actually arms it — prose, near the
+    #: 8000-char cap, containing the ordinary words a greeting is built from.
+    #: The 122-char `RESUME` above is not a latency test: with only 18 distinct
+    #: tokens it collides with almost nothing, and the hold never fires.
+    PROD_RESUME = ((
+        "Senior Data Engineer at Infosys in Bengaluru with four years of "
+        "experience building Spark pipelines for retail analytics. Good "
+        "communication skills and a track record of speaking with stakeholders "
+        "every morning during standup. There is a strong preference for remote "
+        "work. Previously Data Analyst at Wipro working with SQL and Python on "
+        "customer segmentation. Holds a Bachelor of Engineering in Computer "
+        "Science from Anna University. Notice period is sixty days. Open to "
+        "relocating to Hyderabad or Pune for the right role. Speaks English, "
+        "Hindi, Tamil and Kannada. Hobbies include long distance running and "
+        "volunteering at a local school on Saturday mornings. Comfortable "
+        "calling into early meetings with international clients. ") * 9)[:8000]
+
+    async def _consumed_before_first_audio(self, line, control):
+        """How much source was pulled before ANY audio escaped.
+
+        Not `out[0]`: held chunks replay in source order, so the first EMITTED
+        chunk is the first SOURCE chunk however long it was held. An assertion
+        on it stays green while the whole line is withheld to end-of-stream —
+        exactly the regression being guarded against.
+        """
+        chunks = _token_chunks(line)
+        pulled: list[str] = []
+
+        class BaseAgent:
+            def __init__(self, instructions=""):
+                self.instructions = instructions
+                self.chat_ctx = types.SimpleNamespace(items=[])
+
+            def llm_node(self, chat_ctx, tools, model_settings):
+                async def _gen():
+                    for c in chunks:
+                        pulled.append(c)
+                        yield c
+                return _gen()
+
+        agent = phone.phone_agent_class(BaseAgent)(
+            "You are Christy, an AI voice assistant calling from the company.",
+            client=None, attempt_id="a1", say=None,
+            on_user_turn=lambda *a, **k: None, native_turns=True,
+        )
+        agent.set_gate_leak_control(control)
+        agent.set_gate_opening(True)
+        waited = None
+        out = []
+        async for chunk in agent.llm_node(
+            types.SimpleNamespace(items=[]), [], None,
+        ):
+            if waited is None:
+                waited = len("".join(pulled))
+            out.append(chunk)
+        return waited, "".join(out)
+
+    async def test_a_PRODUCTION_SIZED_resume_does_not_delay_a_clean_line(self):
+        # THE REGRESSION THE OWNER WOULD HEAR, pinned against a control the size
+        # `agent.py` really arms. An earlier version of this hold fired on any
+        # single shared token; because a real résumé contains "there" and
+        # "morning", first audio slipped from 10 chars to 63 — worse than the
+        # 73-char hold the whole change exists to remove, and invisible to every
+        # other test in this file.
+        for line in (
+            "Hi there, good morning! This is Christy calling from Interview "
+            "Kickstart. Am I speaking with Christo?",
+            "Good morning, this is Christy from Interview Kickstart. Am I "
+            "speaking with Christo?",
+            "Hello, this is Christy, an AI voice assistant calling about your "
+            "application. Have I reached Priya?",
+        ):
+            with_facts, spoken = await self._consumed_before_first_audio(
+                line, self.PROD_RESUME)
+            without, _ = await self._consumed_before_first_audio(line, "")
+            self.assertEqual(spoken, line, f"a clean line was altered: {line!r}")
+            self.assertEqual(
+                with_facts, without,
+                f"the résumé delayed a clean line by "
+                f"{(with_facts or 0) - (without or 0)} chars: {line!r}",
+            )
+
+    async def test_a_recital_still_speaks_NOTHING_at_production_size(self):
+        # The other half: the shorter hold must not have bought the latency back
+        # by giving up the protection.
+        _, spoken = await self._consumed_before_first_audio(
+            "Hi there, I can see you are a Senior Data Engineer at Infosys in "
+            "Bengaluru with four years of experience. Am I speaking to Priya?",
+            self.PROD_RESUME,
+        )
+        for word in ("Senior", "Data", "Engineer", "Infosys", "Bengaluru"):
+            self.assertNotIn(word, spoken, f"résumé word spoken: {spoken!r}")
+
     async def test_a_clean_line_is_spoken_WHOLE_and_is_not_delayed(self):
         # The other half of the trade. The hold must be specific to a forming
         # résumé run: a clean line must release on the first boundary, exactly
         # as a screening turn does, and must arrive complete.
         line = ("Hi there, good morning! This is Christy calling from Interview "
                 "Kickstart. Am I speaking with Christo?")
-        agent = self._agent(_token_chunks(line))
-        first_release = None
-        out = []
-        async for chunk in agent.llm_node(
-            types.SimpleNamespace(items=[]), [], None,
-        ):
-            out.append(chunk)
-            if first_release is None:
-                first_release = "".join(out)
-        self.assertEqual("".join(out), line, "a clean line was altered")
-        # Release happens on the segment "Hi there," — the same 9-char point the
-        # A0 screening path releases at. The first CHUNK out is "Hi ".
-        self.assertEqual(first_release, "Hi ")
+        waited, spoken = await self._consumed_before_first_audio(
+            line, self.RESUME)
+        self.assertEqual(spoken, line, "a clean line was altered")
+        # Released on the segment "Hi there," — the same point the A0 screening
+        # path releases at — minus the one chunk of lookahead.
+        self.assertLessEqual(waited, len("Hi there, good "))
 
     async def test_a_shared_phrase_that_BREAKS_is_released_not_swallowed(self):
         # The hold must end when the run stops growing, or a line that merely
@@ -1372,10 +1467,25 @@ class TestControlRunForming(unittest.TestCase):
     RESUME = TestGateWindowLeakVeto.RESUME
 
     def test_a_run_in_progress_HOLDS(self):
-        for tail in ("Senior", "Senior Data", "Senior Data Engineer",
+        for tail in ("Senior Data", "Senior Data Engineer",
                      "Senior Data Engineer at", "Senior Data Engineer at Infosys"):
             self.assertTrue(
                 phone.phone_control_run_forming(f"Hi there, you are a {tail}",
+                                                self.RESUME), tail)
+
+    def test_a_SINGLE_shared_word_does_not_hold(self):
+        # The measured reason for `_GATE_CONTROL_RUN_MIN_TOKENS = 2`. A real
+        # résumé blob is prose and contains ordinary words, so holding on one
+        # shared token holds every greeting built from ordinary words: with a
+        # production-sized control, "Hi there, good morning! This is Christy
+        # calling from Interview Kickstart." waited 63 chars for first audio —
+        # worse than the 73-char hold this change exists to remove.
+        #
+        # Nothing is lost by it: the lookahead keeps the opening word of a run
+        # recallable, so a recital is still stopped with NOTHING spoken.
+        for tail in ("Senior", "Infosys", "Bengaluru", "experience"):
+            self.assertFalse(
+                phone.phone_control_run_forming(f"Are you the {tail}",
                                                 self.RESUME), tail)
 
     def test_text_that_touches_NOTHING_in_the_control_releases(self):
@@ -1389,6 +1499,20 @@ class TestControlRunForming(unittest.TestCase):
         # ended and the held words are provably outside any six-word window.
         self.assertFalse(phone.phone_control_run_forming(
             "the Senior Data Engineer we", self.RESUME))
+
+    def test_a_run_at_the_very_END_of_the_control_cannot_hold(self):
+        # A run that matches only the control's last few tokens can never grow
+        # into a six-word window — there are not six tokens left to match — so
+        # holding for it is pure delay with no protection bought. The index
+        # therefore only takes start positions with room for a full window.
+        control = ("alpha bravo charlie delta echo foxtrot golf hotel "
+                   "india juliet zulu quebec")
+        # Same pair, early enough that six tokens can follow: HOLD.
+        self.assertTrue(
+            phone.phone_control_run_forming("you said alpha bravo", control))
+        # The final pair: nothing can follow it, so there is nothing to wait for.
+        self.assertFalse(
+            phone.phone_control_run_forming("you said zulu quebec", control))
 
     def test_an_EMPTY_or_short_control_never_holds(self):
         # Below six control tokens the echo detector is inert, so holding for it

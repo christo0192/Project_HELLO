@@ -113,6 +113,26 @@ class TestTurnAnchorSource(unittest.TestCase):
     def test_a_message_with_no_timing_at_all_is_untimed(self):
         self.assertIsNone(agent_mod._turn_anchor_ms(_msg()))
 
+    def test_created_at_is_the_FALLBACK_and_is_a_different_instant(self):
+        # Worth pinning because it is easy to read the call site as "VAD start
+        # or nothing". It is not: with no VAD metrics the anchor becomes
+        # `created_at`, the message-FINALISATION time, which is LATER than the
+        # speech start it stands in for. That biases toward keeping a turn,
+        # which is the fail-open direction the readers want — but a test that
+        # only ever passes `created_at=None` never sees this path at all.
+        self.assertEqual(
+            agent_mod._turn_anchor_ms(_msg(created_at=1_723_000_000.0)),
+            1_723_000_000_000,
+        )
+        # And VAD wins when both are present, or the barrier would compare
+        # finalisation times against speech-start anchors.
+        self.assertEqual(
+            agent_mod._turn_anchor_ms(
+                _msg(started_speaking_at=1_723_000_000.0,
+                     created_at=1_723_000_009.0)),
+            1_723_000_000_000,
+        )
+
 
 class TestClassifyPhoneAnswerSkipsStaleTurns(unittest.IsolatedAsyncioTestCase):
     """The CONSENT reader, driven directly.
@@ -185,15 +205,47 @@ class TestSayTranslatesADeadSession(unittest.IsolatedAsyncioTestCase):
     """
 
     def test_the_sdk_message_is_translated(self):
-        exc = RuntimeError("AgentSession isn't running")
-        self.assertIn("isn't running", str(exc))
+        # Drives the REAL translation. The earlier version of this test built a
+        # RuntimeError and asserted the string contained its own substring —
+        # true of any string, executing no production code, while a mutation
+        # that deleted the translation outright kept the whole suite green.
+        for message in ("AgentSession isn't running",
+                        "the session is not running",
+                        "RuntimeError: AgentSession isn't running"):
+            got = agent_mod._participant_gone_from(
+                RuntimeError(message), category="participant_gone")
+            self.assertIsInstance(got, phone.PhoneParticipantGone, message)
 
     def test_an_UNRELATED_runtime_error_must_not_be_swallowed(self):
         # Catching RuntimeError broadly here would hide real faults behind a
-        # routine hang-up.
-        exc = RuntimeError("event loop is closed")
-        self.assertNotIn("isn't running", str(exc))
-        self.assertNotIn("is not running", str(exc))
+        # routine hang-up — a wedged event loop would look like a hang-up and
+        # the attempt would be closed as `deferred_pre_disclosure`.
+        for message in ("event loop is closed", "cannot reuse already awaited",
+                        ""):
+            with self.assertRaises(RuntimeError) as caught:
+                agent_mod._participant_gone_from(
+                    RuntimeError(message), category="participant_gone")
+            self.assertEqual(str(caught.exception), message)
+
+    def test_BOTH_call_sites_use_the_same_translation(self):
+        # `say` and `wait_for_playout` each had their own copy of the match. The
+        # playout one is the likelier of the two — a model-authored disclosure
+        # plays for ten seconds while `session.say` occupies almost none — so a
+        # divergence between them would fail on exactly the common case.
+        import inspect
+        source = inspect.getsource(agent_mod._run_phone_session)
+        self.assertEqual(
+            source.count("_participant_gone_from"), 2,
+            "a call site stopped using the shared translation",
+        )
+        # Match the inlined COMPARISON, not the prose — the prose also appears
+        # in a comment explaining the crash, and asserting on that would make
+        # this test fail on documentation.
+        self.assertNotIn(
+            "not in str(exc)", source,
+            "a call site re-inlined the vendor-prose match, which puts it back "
+            "inside a closure where no test can reach it",
+        )
 
     def test_the_signal_is_its_own_type(self):
         self.assertTrue(issubclass(phone.PhoneParticipantGone, Exception))
