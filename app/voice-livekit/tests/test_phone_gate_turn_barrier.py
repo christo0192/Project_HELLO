@@ -281,24 +281,68 @@ class TestIdentityReaderSkipsStaleTurns(unittest.IsolatedAsyncioTestCase):
         self.assertLess(time.monotonic() - started, 1.0)
 
     async def test_the_anchor_is_read_LIVE_not_captured_once(self):
-        # `_mark_question_asked` re-arms the anchor for each gate question, so
-        # the reader must see the CURRENT one. Captured at call time, the second
-        # question would be judged against the first question's anchor and the
-        # first question's trailing answer would be read as the second's.
+        # The anchor must be re-read on EVERY iteration, not once per call.
+        #
+        # AN EARLIER VERSION OF THIS TEST DID NOT PROVE THAT. It made two
+        # separate calls with a fresh lambda each time, and a capture-once
+        # implementation reads the right anchor at the top of each call — so it
+        # passed either way, while its name, and the commit message citing it,
+        # claimed otherwise. Exactly the defect this file exists to catch,
+        # committed in the file that exists to catch it.
+        #
+        # To discriminate, the anchor has to move DURING a single call, which is
+        # the real scenario: `_mark_question_asked` re-arms while this reader is
+        # already waiting.
         anchor = {"ms": 1_000}
-        turns: asyncio.Queue = asyncio.Queue()
-        turns.put_nowait(("answer to question one", 2_000))
-        got = await agent_mod._read_fresh_turn(
-            turns, (lambda: anchor["ms"]), 0.05)
-        self.assertEqual(got, "answer to question one")
 
-        anchor["ms"] = 9_000          # question two is asked
-        turns.put_nowait(("answer to question one", 2_000))
+        class _ReArmingQueue(asyncio.Queue):
+            async def get(self_inner):
+                item = await super().get()
+                # The gate asks its next question while the reader waits.
+                anchor["ms"] = 9_000
+                return item
+
+        turns = _ReArmingQueue()
+        turns.put_nowait(("trailing answer to question one", 2_000))
+        turns.put_nowait(("answer to question two", 9_500))
+        got = await agent_mod._read_fresh_turn(
+            turns, (lambda: anchor["ms"]), 0.2)
         self.assertEqual(
-            await agent_mod._read_fresh_turn(
-                turns, (lambda: anchor["ms"]), 0.05),
-            "",
-            "a stale answer was re-read against the NEXT question's anchor",
+            got, "answer to question two",
+            "the anchor was captured at call time, so question one's trailing "
+            "answer was read as question two's",
+        )
+
+    async def test_stale_turns_do_not_BUY_extra_time(self):
+        # The other half of the budget property, and the half a pre-filled queue
+        # cannot see: with every item already queued `get()` never blocks, the
+        # deadline is consulted once, and a per-skip deadline RESET is invisible.
+        # Dripping stale turns in slower than the budget makes it visible — with
+        # the deadline reset on each skip the reader waits for ever.
+        anchor = 9_000
+        turns: asyncio.Queue = asyncio.Queue()
+
+        # UNBOUNDED on purpose. A fixed number of stale turns lets even a
+        # deadline-resetting reader finish once the drip dries up — which is how
+        # the first version of this test passed against that exact mutation. The
+        # drip must outlast the assertion, so the only way to return is to hold
+        # the original budget.
+        async def _drip():
+            while True:
+                await asyncio.sleep(0.04)
+                turns.put_nowait(("Hello?", 1_000))
+
+        drip = asyncio.ensure_future(_drip())
+        self.addCleanup(drip.cancel)
+        started = time.monotonic()
+        got = await asyncio.wait_for(
+            agent_mod._read_fresh_turn(turns, (lambda: anchor), 0.05),
+            timeout=1.0,
+        )
+        self.assertEqual(got, "")
+        self.assertLess(
+            time.monotonic() - started, 0.9,
+            "each stale turn bought the candidate a fresh answer budget",
         )
 
 
