@@ -932,6 +932,12 @@ def _turn_anchor_ms(item: Any) -> int | None:
     return persistence.normalize_turn_anchor_ms(created_at)
 
 
+#: How far before a question an utterance may plausibly have STARTED and
+#: still be a late STT final for it. One hour is far beyond any real phone
+#: turn and far below the gap a wrong-clock value produces.
+_TURN_ANCHOR_SANE_LOOKBACK_MS = 60 * 60 * 1000
+
+
 def _queued_turn(item: Any) -> tuple[str, int | None]:
     """Unpack a `user_turns` entry as (text, speech_start_ms).
 
@@ -957,11 +963,19 @@ def _queued_turn_is_stale(anchor_ms: int | None, question_anchor_ms: int | None)
     not time is kept. Losing a genuine answer costs the identity check; reading
     a stale one costs a re-ask.
     """
-    return (
-        anchor_ms is not None
-        and question_anchor_ms is not None
-        and anchor_ms < question_anchor_ms
-    )
+    if anchor_ms is None or question_anchor_ms is None:
+        return False
+    # A speech-start that predates the question by more than this is not a late
+    # STT final — it is a value from a different clock. `normalize_turn_anchor_ms`
+    # accepts anything from 1 ms to the year 2100, so a monotonic/uptime-shaped
+    # `started_speaking_at` (e.g. 12345.678) normalises to 1970 and would mark
+    # EVERY turn stale: the identity reader would return "", the consent
+    # classifier would burn both attempts on skips, and every consenting
+    # candidate would be torn down as a machine. Treat the implausible as
+    # untimed and KEEP it, so the failure direction stays open.
+    if question_anchor_ms - anchor_ms > _TURN_ANCHOR_SANE_LOOKBACK_MS:
+        return False
+    return anchor_ms < question_anchor_ms
 
 
 def _native_turn_predates_question(message: Any, question_anchor_ms: int | None) -> bool:
@@ -7475,7 +7489,21 @@ async def _run_phone_session(
             raise phone.PhoneParticipantGone() from exc
         wait_for_playout = getattr(speech, "wait_for_playout", None)
         if callable(wait_for_playout):
-            await wait_for_playout()
+            try:
+                await wait_for_playout()
+            except RuntimeError as exc:
+                # The leg can drop DURING playout just as easily as between
+                # awaits — more easily, in fact, since a model-authored
+                # disclosure plays for ten seconds or more while `session.say`
+                # itself occupies almost none. Same translation as above, or
+                # this window reproduces the crash the guard exists to remove.
+                if "isn't running" not in str(exc) and "is not running" not in str(exc):
+                    raise
+                _log.warn(
+                    "unknown_event", error_type="phone_say_after_close",
+                    error_category="participant_gone_during_playout",
+                )
+                raise phone.PhoneParticipantGone() from exc
         # Both disclosure variants, or the metric silently loses every sample
         # the moment the conversational flow is enabled (that flow speaks
         # `PHONE_DISCLOSURE_CONTINUATION_TEXT` and never the other one).
@@ -8246,14 +8274,31 @@ async def _run_phone_session(
         # `PURGE_BEFORE_EVENTS` member destroys that audio. Best-effort — a
         # failure here must not re-raise into the entrypoint, which is the very
         # crash being removed.
-        try:
-            await events.post_event(
-                attempt_id, "candidate.deferred_pre_disclosure", epoch=epoch,
-            )
-        except Exception:  # noqa: BLE001
+        # Posted DIRECTLY rather than through `_post_phone_event_with_retry`,
+        # which does not forward `epoch` — every other terminal in this gate
+        # carries it, and dropping it here would change which staleness rules
+        # the server applies. One bounded retry covers a transport blip; the
+        # post is idempotent by 0042's deterministic event id.
+        applied = False
+        for _ in range(2):
+            try:
+                outcome = await events.post_event(
+                    attempt_id, "candidate.deferred_pre_disclosure", epoch=epoch,
+                )
+                applied = phone.event_applied(outcome)
+            except Exception:  # noqa: BLE001
+                applied = False
+            if applied:
+                break
+        if not applied:
+            # `post_event` FAILS CLOSED by returning a not-ok outcome rather
+            # than raising, so catching exceptions alone was a guard that could
+            # not fire. An unapplied event means the pre-consent recording was
+            # NOT purged — the one thing this block exists to guarantee — so it
+            # has to be visible rather than assumed.
             _log.warn(
                 "unknown_event", error_type="phone_gate_outcome",
-                error_category="participant_left_terminal_failed",
+                error_category="participant_left_terminal_not_applied",
             )
         result = phone.PhoneGateResult(
             phone.GATE_PARTICIPANT_LEFT, events=[], spoken=[],

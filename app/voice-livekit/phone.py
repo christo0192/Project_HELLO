@@ -1192,11 +1192,12 @@ def phone_deterministic_opener() -> bool:
     the LLM-authored openers. Read at the call site with the literal name so the
     env-contract scanner sees it.
     """
-    # DEFAULT FLIPPED 2026-09-11 (see `phone_gate_flow`): the model-authored
-    # openers are production. `false` is now the default, so ROLLBACK to scripted
-    # copy is an explicit `PHONE_DETERMINISTIC_OPENER=true`, not an unset.
-    return (os.getenv("PHONE_DETERMINISTIC_OPENER") or "false").strip().lower() in (
-        "true", "1", "yes", "on",
+    # Default stays ON (scripted). See `phone_gate_flow` for why the 2026-09-11
+    # flip was dropped: production selects the authored openers by SECRET, so an
+    # unconfigured deployment keeps the verified-by-construction copy and a
+    # mistyped rollback token still fails safe.
+    return (os.getenv("PHONE_DETERMINISTIC_OPENER") or "true").strip().lower() not in (
+        "false", "0", "no", "off",
     )
 
 
@@ -1250,18 +1251,21 @@ def phone_gate_flow() -> str:
     ROLLBACK: unset, or set ``deterministic``. Read at the call site with the
     literal name so the env-contract scanner sees it.
     """
-    # DEFAULT FLIPPED 2026-09-11, after both stages were proven on live calls
-    # (owner test, candidate Christo Kingson): stage 1 and stage 2 each reached
-    # `disclosure.delivered`, the model-authored copy held every constraint, and
-    # the two defects those calls exposed — the barge-in barrier and the cold
-    # opening — are fixed in the same change as this flip.
+    # THE DEFAULT DELIBERATELY STAYS `deterministic`, and production runs the
+    # conversational gate through an explicit SECRET instead.
     #
-    # ROLLBACK IS NOW AN EXPLICIT SET, NOT AN UNSET:
-    #   fly secrets set PHONE_GATE_FLOW=deterministic
-    # Unsetting now selects the CONVERSATIONAL flow. That inversion is the whole
-    # point of writing it here rather than only in the runbook.
+    # A flip was drafted 2026-09-11 after both stages ran clean on live calls,
+    # and was dropped on review. Flipping costs nothing to gain — production is
+    # already conversational by secret — and buys three hazards: a typo'd
+    # rollback token would fail OPEN (`determinstic` -> conversational, where
+    # today every typo falls back to the scripted gate); a fresh or rebuilt
+    # deployment would speak model-authored copy before consent with nothing
+    # configured; and no test in this repository exercises `agent.py` with the
+    # conversational gate on, so the shipped default would be the untested one.
+    #
+    # Flip it when those are addressed, not before.
     value = (os.getenv("PHONE_GATE_FLOW") or "").strip().lower()
-    return "deterministic" if value == "deterministic" else "conversational"
+    return "conversational" if value == "conversational" else "deterministic"
 
 
 def phone_identity_mismatch_suppresses() -> bool:
@@ -3270,19 +3274,29 @@ _A0_LEADING_SEGMENT_MAX_CHARS = 48
 #: server-side: `phone-worker.ts` (`.max(6)`) and 0067 (`invalid_turns`).
 _GATE_TURNS_MAX = 6
 
-#: The gate window's LAST-RESORT release point, used only when a generation
-#: produces no punctuation at all. Far above `_A0_LEADING_SEGMENT_MAX_CHARS`
-#: because the gate releases on a boundary, not on a cap — the cap here exists
-#: solely so a pathological boundary-less stream cannot hold audio indefinitely.
-_GATE_LEAK_HARD_CAP_CHARS = 400
-
-#: The gate-window leak veto must hold at least this many words before it can
-#: release. `phone_instruction_echo_detected` compares SIX-word windows and
-#: returns False outright when either side has fewer than six tokens, so a veto
-#: that released on the first clause boundary — which for "Hi, this is Christy,"
-#: is four words — could never fire. The check is only real once the segment is
-#: long enough for the detector to see a window.
-_GATE_LEAK_MIN_TOKENS = 6
+#: The gate window's release cap — DELIBERATELY the same as
+#: `_A0_LEADING_SEGMENT_MAX_CHARS`, so a gate line starts speaking at the same
+#: point a screening turn would.
+#:
+#: It was briefly 400 (release only at a punctuation boundary), to give the
+#: six-word echo detector more text to look at. Measured, that cost roughly
+#: EIGHT TIMES the lead-in: on "Hi there, good morning! This is Christy calling
+#: from Interview Kickstart. Am I speaking with Christo?" a screening turn
+#: starts speaking after "Hi there," (9 chars) and the gate held 73 — a second
+#: or more of extra dead air, on the one turn a candidate has no context for,
+#: and the owner heard it on a live stage-2 call.
+#:
+#: The trade was not worth it and did not buy much. `phone_instruction_echo_detected`
+#: compares SIX-word windows and returns False outright below six tokens — executed,
+#: not assumed: "Senior Data Engineer at Infosys" (5) is False, the same run plus
+#: "Bangalore" (6) is True — so holding past six words buys nothing the tail veto
+#: does not already do on every chunk for the whole reply.
+#:
+#: What the cap costs, plainly: up to this many characters of lead can be spoken
+#: before a six-word résumé run becomes detectable. That is the same exposure a
+#: screening turn already carries, and the tail veto truncates mid-stream the
+#: moment such a run appears after release.
+_GATE_LEAK_HARD_CAP_CHARS = _A0_LEADING_SEGMENT_MAX_CHARS
 
 
 async def _achain(prefix_items: list[Any], rest: Any) -> Any:
@@ -5240,7 +5254,22 @@ async def run_phone_gate(
                 events.append(event_type)
         closing = _OUTCOME_CLOSING.get(decision)
         if closing is not None:
-            await _say(closing)
+            try:
+                await _say(closing)
+            except PhoneParticipantGone:
+                # The event is ALREADY posted — this block posts before it
+                # speaks, deliberately, so the purge precedes the terminal. The
+                # closing line is courtesy; a hang-up during it is the expected
+                # ending, not a failure. Letting it propagate would reach the
+                # call site's participant-gone handler and post
+                # `candidate.deferred_pre_disclosure` as a SECOND terminal for
+                # the same attempt — on the commonest refusal path there is
+                # ("no thanks" then hang up). Swallowed here, where the context
+                # to know it is harmless exists.
+                _log.info(
+                    "unknown_event", error_type="phone_gate_outcome",
+                    error_category="closing_unheard_participant_gone",
+                )
         _log.info(
             "unknown_event", error_type="phone_gate_outcome",
             schema=schema or decision,
@@ -6764,11 +6793,18 @@ async def phone_warm_google_connection(
     prompt and on Gemini that would send résumé facts to a provider the call had
     not yet touched, for no caching benefit (flash-lite has no implicit cache).
 
-    So this warms the thing that IS worth warming and nothing else: the TLS
-    handshake, the connection and the SDK client. The prompt is the literal
-    string below — no résumé, no role, no name, no system prompt — so the
-    privacy objection that killed the earlier widening does not apply. One token
-    out, discarded.
+    So this warms what can be warmed from outside the plugin and nothing else.
+    The prompt is the literal string below — no résumé, no role, no name, no
+    system prompt — so the privacy objection that killed the earlier widening
+    does not apply. One token out, discarded.
+
+    SCOPE, STATED HONESTLY. The live interviewer is
+    `livekit.plugins.google.LLM`, which builds its OWN `genai.Client` with its
+    own httpx pool, so the TCP/TLS session opened here is NOT the one the first
+    turn uses. What is genuinely shared is DNS resolution, the module import,
+    and any provider-side project/model warm. Treat this as a partial mitigation
+    for the measured 20 s cold opening, not a fix — the fix that actually
+    removes that window is keeping a worker warm.
 
     Fires only when the interviewer actually is native Gemini; the OpenAI-compat
     lane already has its own warm-up and would gain nothing.
@@ -6786,19 +6822,37 @@ async def phone_warm_google_connection(
         from google.genai import types as genai_types  # noqa: PLC0415
 
         client = genai.Client(api_key=api_key)
-        await asyncio.wait_for(
-            client.aio.models.generate_content(
-                model=phone_primary_model(),
-                contents="hi",
-                config=genai_types.GenerateContentConfig(
-                    max_output_tokens=1,
-                    thinking_config=genai_types.ThinkingConfig(
-                        thinking_level="minimal"),
+        try:
+            await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=phone_primary_model(),
+                    contents="hi",
+                    config=genai_types.GenerateContentConfig(
+                        max_output_tokens=1,
+                        thinking_config=genai_types.ThinkingConfig(
+                            thinking_level="minimal"),
+                    ),
                 ),
-            ),
-            timeout=PHONE_GOOGLE_WARMUP_TIMEOUT_SEC,
-        )
+                timeout=PHONE_GOOGLE_WARMUP_TIMEOUT_SEC,
+            )
+        finally:
+            # CLOSE IT. This client is a throwaway; the live interviewer builds
+            # its own inside `livekit.plugins.google.LLM`. Leaving it open leaks
+            # an httpx client and its connection pool on EVERY call.
+            closer = getattr(client, "aclose", None)
+            if callable(closer):
+                try:
+                    await closer()
+                except Exception:  # noqa: BLE001
+                    pass
     except Exception:  # noqa: BLE001 — a cold turn is the only cost of failure.
+        # Logged, not silent. Success used to be the only thing that emitted,
+        # so "is the warm-up working?" was unanswerable from the logs and a
+        # permanently broken warm-up looked identical to a healthy one.
+        _log.info(
+            "unknown_event", error_type="phone_google_warmup",
+            error_category="warmup_failed",
+        )
         return
     _log.info(
         "unknown_event", error_type="phone_google_warmup",
@@ -10818,36 +10872,22 @@ def phone_agent_class(agent_base: Any) -> Any:
                     held.append(chunk)
                     parts.append(_chunk_text(chunk))
                     segment = "".join(parts).strip()
-                    # HOLD FOR A WHOLE WINDOW, not a whole clause. An earlier
-                    # draft released at the first clause boundary, which for
-                    # every natural opener is "Hi," — one word. The echo
-                    # detector compares SIX-word windows and returns False
-                    # outright below six tokens, so that veto could not fire and
-                    # the rest of the line (the part that would carry a résumé
-                    # recital) streamed unchecked. Verified by simulation: a
-                    # line reciting the candidate's employer and title released
-                    # at "Hi," while the same predicate over the whole line
-                    # returned instruction_echo.
-                    if len(_COVERAGE_TOKEN_RE.findall(segment)) < _GATE_LEAK_MIN_TOKENS:
-                        continue
-                    # RELEASE ONLY AT A PUNCTUATION BOUNDARY, never on a raw
-                    # character cap.
+                    # RELEASE ON EXACTLY THE RULE A SCREENING TURN USES —
+                    # boundary or cap, and nothing else.
                     #
-                    # A0's 48-char cap exists so a boundary-less screening reply
-                    # still starts speaking quickly. Applied here it opened a
-                    # hole: "Hi, I can see you are a Senior Data Engineer at
-                    # Infosys" is 54 chars with no boundary, so the cap released
-                    # it — and because `phone_instruction_echo_detected` needs
-                    # SIX contiguous words, the five résumé words ahead of the
-                    # cap were spoken pre-consent, to a party whose identity is
-                    # exactly what this turn is still establishing. Verified by
-                    # driving the real `llm_node`.
-                    #
-                    # Holding to a boundary means a recital like that is checked
-                    # as a whole sentence, where the echo detector does see six
-                    # words. The cost is first-audio latency on a gate line with
-                    # no early punctuation; `_GATE_LEAK_HARD_CAP_CHARS` bounds
-                    # that so a pathological stream cannot hold audio forever.
+                    # A six-token floor used to gate the RELEASE here as well, so
+                    # the echo detector would always have a full window to look
+                    # at. That was the wrong lever. It delayed first audio on
+                    # EVERY gate line to buy a check the tail veto below already
+                    # performs on every chunk for the whole reply: on the line
+                    # the owner heard live — "Hi there, good morning! This is
+                    # Christy calling from Interview Kickstart. Am I speaking
+                    # with Christo?" — a screening turn starts speaking after
+                    # "Hi there," (9 chars) and this branch held 73. Eight times
+                    # the lead-in, on the one turn a candidate has no context
+                    # for, which is exactly where dead air reads as a dropped
+                    # call. See `_GATE_LEAK_HARD_CAP_CHARS` for the measurement
+                    # and for what the shorter hold costs.
                     if not segment.endswith(
                         (".", "!", "?", ",", ";", ":", "—", "–", "…")
                     ) and len(segment) < _GATE_LEAK_HARD_CAP_CHARS:

@@ -283,29 +283,21 @@ class TestGateFlowFlag(unittest.TestCase):
             else:
                 os.environ[k] = v
 
-    def test_unset_is_CONVERSATIONAL_since_the_2026_09_11_flip(self):
-        # The flip is the product decision; this pins the INVERSION so nobody
-        # reads the old runbook and assumes `unset` still means scripted.
-        self.assertEqual(phone.phone_gate_flow(), "conversational")
-        self.assertFalse(phone.phone_deterministic_opener())
+    def test_unset_is_deterministic_and_a_TYPO_FAILS_SAFE(self):
+        # Production selects the conversational gate by SECRET; the code default
+        # stays scripted. The second half is the point: a flipped default would
+        # make `determinstic` — a plausible typo — select model-authored
+        # pre-consent speech. Here every unrecognised token falls back.
+        self.assertEqual(phone.phone_gate_flow(), "deterministic")
+        self.assertTrue(phone.phone_deterministic_opener())
+        for typo in ("determinstic", "deterministc", "scripted", "off", "0", ""):
+            os.environ["PHONE_GATE_FLOW"] = typo
+            self.assertEqual(phone.phone_gate_flow(), "deterministic", typo)
 
-    def test_rollback_needs_an_EXPLICIT_token_not_an_unset(self):
-        for raw in ("deterministic", "  Deterministic  ", "DETERMINISTIC"):
-            os.environ["PHONE_GATE_FLOW"] = raw
-            self.assertEqual(phone.phone_gate_flow(), "deterministic", raw)
-        # Anything else — including the tokens an operator might guess — leaves
-        # the conversational flow in place.
-        for raw in ("", "yes", "true", "1", "convo", "off", "conversational"):
+    def test_only_the_exact_token_enables_the_conversational_gate(self):
+        for raw in ("conversational", "  Conversational  ", "CONVERSATIONAL"):
             os.environ["PHONE_GATE_FLOW"] = raw
             self.assertEqual(phone.phone_gate_flow(), "conversational", raw)
-
-    def test_the_scripted_opener_rollback_is_also_an_explicit_token(self):
-        for raw in ("true", "1", "YES", " on "):
-            os.environ["PHONE_DETERMINISTIC_OPENER"] = raw
-            self.assertTrue(phone.phone_deterministic_opener(), raw)
-        for raw in ("", "false", "0", "no", "off", "maybe"):
-            os.environ["PHONE_DETERMINISTIC_OPENER"] = raw
-            self.assertFalse(phone.phone_deterministic_opener(), raw)
 
     def test_suppression_is_off_unless_explicitly_enabled(self):
         # Default OFF. Both settings post a purging terminal, so the purge is
@@ -1125,26 +1117,39 @@ class TestGateWindowLeakVeto(unittest.IsolatedAsyncioTestCase):
             await self._spoken(["Thanks for your time, and goodbye."]), "",
         )
 
-    async def test_the_veto_holds_a_whole_window_before_releasing(self):
-        # It must not release at the first clause boundary. "Hi," is ONE word,
-        # and `phone_instruction_echo_detected` returns False below six tokens,
-        # so a veto that released there could never fire on anything at all —
-        # which is exactly what the first draft did.
+    async def test_the_lead_is_bounded_and_the_recital_is_truncated(self):
+        # THE TRADE, STATED HONESTLY. The gate releases on exactly the rule a
+        # screening turn uses — boundary or `_A0_LEADING_SEGMENT_MAX_CHARS` —
+        # because holding longer cost ~8x the lead-in and the owner heard it as
+        # dead air on a live stage-2 call.
         #
-        # Asserted as the property the code guarantees rather than a byte
-        # string: the leak never reaches the candidate, and whatever IS released
-        # is at least a full detector window, so the check that let it through
-        # was a real one.
+        # So a short lead CAN contain résumé words: the echo detector needs six
+        # CONTIGUOUS verbatim ones and a 48-char lead may carry five. What is
+        # guaranteed is that the recital does not CONTINUE — the tail veto
+        # re-checks every chunk and truncates the moment six appear. This test
+        # asserts that guarantee and the bound, not a stronger claim.
         chunks = ["Hi, ", "I can see you are a Senior Data Engineer at Infosys ",
-                  "in Bengaluru. Am I speaking to Priya?"]
-        # UNCONDITIONAL. An earlier version guarded its real assertion behind
-        # `if spoken:`, so it was skipped exactly when the veto worked — and it
-        # concealed that the baseline DID speak "a Senior Data Engineer at
-        # Infosys": five résumé words, released by the 48-char cap before the
-        # six-word echo detector could see them.
+                  "in Bengaluru with four years of experience. Am I speaking to Priya?"]
         spoken = await self._spoken(chunks)
-        for leaked in ("Senior", "Data Engineer", "Infosys", "Bengaluru"):
-            self.assertNotIn(leaked, spoken, f"résumé leaked pre-consent: {spoken!r}")
+        self.assertNotIn("in Bengaluru", spoken, f"recital continued: {spoken!r}")
+        self.assertNotIn("four years", spoken, f"recital continued: {spoken!r}")
+        self.assertLessEqual(
+            len(spoken), phone._A0_LEADING_SEGMENT_MAX_CHARS + len(chunks[1]),
+            f"lead was not bounded: {spoken!r}",
+        )
+
+    async def test_the_gate_lead_is_not_slower_than_a_screening_turn(self):
+        # The latency regression the owner reported, pinned. The gate window and
+        # the A0 screening path must release on the SAME rule; a floor or a
+        # wider cap here is invisible in every other test and audible on every
+        # call.
+        self.assertEqual(
+            phone._GATE_LEAK_HARD_CAP_CHARS, phone._A0_LEADING_SEGMENT_MAX_CHARS,
+            "the gate would hold audio longer than a screening turn",
+        )
+        line = "Hi there, good morning! This is Christy calling from Interview Kickstart."
+        spoken = await self._spoken([line])
+        self.assertEqual(spoken, line)
 
     async def test_no_resume_token_escapes_on_a_boundaryless_recital(self):
         # The cap-release hole, stated directly: a recital with no punctuation
