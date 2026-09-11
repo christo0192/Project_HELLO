@@ -1631,6 +1631,50 @@ class TestEmittedMeansAudioNotChunks(unittest.IsolatedAsyncioTestCase):
                 f"will skip its own introduction and open with the repair line",
             )
 
+    async def test_a_PUNCTUATION_ONLY_lead_does_not_veto_the_whole_line(self):
+        # An em-dash-led opener. "— " ends with a boundary character, so the
+        # release rule fires on it; `phone_streamed_leading_segment_safe` then
+        # rejects letter-free text and the entire authored line is thrown away.
+        # Fed as ONE chunk the same line is spoken in full — a granularity
+        # difference, which is exactly the class of bug this file exists for.
+        # The six-token floor used to mask it by never releasing that early.
+        line = "— Hi there, this is Christy. Am I speaking with Christo?"
+        for chunks in ([line], _token_chunks(line)):
+            agent = TestGateWindowLeakVeto._agent(self, chunks)
+            out = []
+            async for chunk in agent.llm_node(
+                types.SimpleNamespace(items=[]), [], None,
+            ):
+                out.append(chunk)
+            self.assertEqual("".join(out), line,
+                             f"a punctuation lead lost the line: {chunks!r}")
+            self.assertTrue(agent._gate_stream_emitted)
+
+    async def test_NON_LATIN_speech_counts_as_audio(self):
+        # The latch tests `str.isalpha()`, which is Unicode-aware, while
+        # `_COVERAGE_TOKEN_RE` is ASCII `[a-z0-9]+`. If the latch had used the
+        # tokeniser instead, a Devanagari or Tamil line would go out with the
+        # latch False and `run_phone_gate` would speak its fixed opener OVER live
+        # audio — the 2026-09-09 double-opener. This bot calls Indian candidates;
+        # the name and role fields are not reliably Latin.
+        for line in (
+            "नमस्ते, क्या मैं प्रिया से बात कर रहा हूँ?",
+            "வணக்கம், நான் ப்ரியாவுடன் பேசுகிறேனா?",
+            "Bonjour, êtes-vous Chloé Dubois?",
+        ):
+            spoken, emitted = await self._run(_token_chunks(line))
+            self.assertEqual(spoken, line)
+            self.assertTrue(emitted, f"non-Latin speech was not counted: {line!r}")
+
+    async def test_a_LETTER_FREE_reply_speaks_nothing_at_all(self):
+        # The other half of the same coherence rule. Letter-free text makes no
+        # audio, so yielding it while leaving the latch False is the worst of
+        # both: `run_phone_gate` speaks its fixed opener believing nothing went
+        # out, and anything that did reach the wire lands underneath it.
+        spoken, emitted = await self._run(["1234 5678 9012 3456 7890"])
+        self.assertEqual(spoken, "")
+        self.assertFalse(emitted)
+
     async def test_real_text_DOES_still_count_as_audio(self):
         # The guard must not swing the other way: a line that really is spoken
         # has to report so, or `run_phone_gate` speaks its fixed opener OVER the

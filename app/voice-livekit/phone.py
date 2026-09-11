@@ -11089,6 +11089,21 @@ def phone_agent_class(agent_base: Any) -> Any:
                         (".", "!", "?", ",", ";", ":", "—", "–", "…")
                     ) and len(segment) < _GATE_LEAK_HARD_CAP_CHARS:
                         continue
+                    # NOTHING TO SPEAK AND NOTHING TO CHECK YET. A first chunk
+                    # that is pure punctuation — "— " on an em-dash-led opener —
+                    # ends with a boundary character, so the rule above releases
+                    # it; `phone_streamed_leading_segment_safe` then rejects
+                    # letter-free text and the whole authored line is vetoed. Fed
+                    # as ONE chunk the identical line is spoken in full, which is
+                    # how it stayed hidden. The six-token floor used to mask this
+                    # by never releasing that early.
+                    #
+                    # A0's streamed screening path already does exactly this, in
+                    # exactly this position — ahead of its own boundary test. The
+                    # gate was the one that did not, which is the parity this
+                    # whole change is about.
+                    if not any(ch.isalpha() for ch in segment):
+                        continue
                     if not phone_streamed_leading_segment_safe(
                         segment, None, control_text=self._gate_leak_control,
                     ):
@@ -11155,8 +11170,16 @@ def phone_agent_class(agent_base: Any) -> Any:
                         )
                         await _abandon(result)
                         return
-                    if any(ch.isalpha() for ch in tail):
-                        self._gate_stream_emitted = True
+                    if not any(ch.isalpha() for ch in tail):
+                        # LETTER-FREE, so it makes no audio: `tts_node` merges
+                        # such fragments forward and never hands them
+                        # downstream. Yielding it anyway while leaving the latch
+                        # False is the worst of both — `run_phone_gate` reads
+                        # "nothing was spoken" and speaks its fixed opener, and
+                        # if any of this DID reach the wire it lands underneath.
+                        # Speak nothing and let the fixed line stand alone.
+                        return
+                    self._gate_stream_emitted = True
                     for ready in held:
                         yield ready
                     return
