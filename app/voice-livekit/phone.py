@@ -8549,11 +8549,49 @@ def phone_instruction_echo_detected(speech: Any, control_text: Any) -> bool:
 #: anything.
 _GATE_CONTROL_RUN_MIN_TOKENS = 2
 
-#: Chunks held back behind the decision point, so the FIRST word of a run is
-#: still recallable when the second word reveals what it was. Without it the
-#: run's opening token is already spoken by the time the run becomes visible —
-#: measured as "Senior" escaping on an otherwise-stopped recital.
-_GATE_RUN_LOOKAHEAD_CHUNKS = 1
+def phone_gate_unsafe_tail_chars(streamed: Any) -> int:
+    """Trailing characters of a released stream that are not yet safe to speak.
+
+    A token can only be cleared once the NEXT one is known: the run check looks
+    at the trailing pair, so the final token is always still a candidate to open
+    a run that the next chunk completes. Everything from the start of that final
+    token to the end therefore has to wait.
+
+    Measured in CHARACTERS, not chunks, because chunk size is the provider's
+    choice and not ours. An earlier version held back one chunk, which recalls a
+    whole word from a word-at-a-time stream and a single LETTER from a
+    character-at-a-time one — "Senior" reached the caller on a recital that the
+    same code stopped completely when the chunks happened to be bigger. A
+    guarantee that depends on the provider's tokenizer is not a guarantee.
+    """
+    if not isinstance(streamed, str) or not streamed:
+        return 0
+    last = None
+    for last in _COVERAGE_TOKEN_RE.finditer(streamed):
+        pass
+    if last is None:
+        # No complete token at all — nothing can be cleared yet.
+        return len(streamed)
+    return len(streamed) - last.start()
+
+
+def phone_gate_split_ready(chunk_lengths: "list[int]", unsafe_chars: int) -> int:
+    """How many LEADING chunks may be yielded while retaining `unsafe_chars`.
+
+    Takes lengths rather than chunks so it stays a plain function of numbers —
+    the caller knows how to read a chunk's text, and this does not need to.
+
+    Splits only on chunk boundaries, because chunks are what gets yielded, so it
+    rounds in the SAFE direction and may retain more than asked for.
+    """
+    if unsafe_chars <= 0:
+        return len(chunk_lengths)
+    retained = 0
+    for index in range(len(chunk_lengths) - 1, -1, -1):
+        retained += chunk_lengths[index]
+        if retained >= unsafe_chars:
+            return index
+    return 0
 
 
 @functools.lru_cache(maxsize=4)
@@ -8609,6 +8647,17 @@ def phone_control_run_forming(streamed: Any, control_text: Any) -> bool:
     """
     if not isinstance(streamed, str) or not isinstance(control_text, str):
         return False
+    # A CHUNK CAN END MID-WORD, and then the last "token" is a fragment that
+    # matches nothing, so the hold releases in the middle of the very run it is
+    # holding for. Providers really do split words — this file already handles
+    # `tts_node` "cutting mid-word" — and measured against the real `llm_node`
+    # with word-piece chunks, "Senior Data Engineer at" went to air while the
+    # same line split on spaces aired nothing.
+    #
+    # Refuse to decide on a prefix that may be mid-word: HOLD until a separator
+    # proves the last token is whole. Costs at most the rest of one word.
+    if streamed and _COVERAGE_TOKEN_RE.fullmatch(streamed[-1]):
+        return True
     spoken = _COVERAGE_TOKEN_RE.findall(streamed.casefold())
     if len(spoken) < _GATE_CONTROL_RUN_MIN_TOKENS:
         return False
@@ -10983,15 +11032,17 @@ def phone_agent_class(agent_base: Any) -> Any:
                             streamed, self._gate_leak_control,
                         ):
                             continue
-                        # Keep the newest chunk back. A run only becomes visible
-                        # on its SECOND word, so flushing everything here speaks
+                        # Keep the final WORD back. A run only becomes visible
+                        # on its second word, so flushing everything here speaks
                         # the first one a beat before the check can recognise it
                         # — measured as "Senior" escaping an otherwise-stopped
-                        # recital. One chunk of lookahead makes the opening word
-                        # recallable; it costs a single token of lag on a stream
-                        # that is already playing.
-                        keep = _GATE_RUN_LOOKAHEAD_CHUNKS
-                        ready, pending[:] = pending[:-keep], pending[-keep:]
+                        # recital. Held by character count, not chunk count, so
+                        # the guarantee does not depend on how the provider
+                        # happens to split its stream.
+                        cut = phone_gate_split_ready(
+                            [len(_chunk_text(c)) for c in pending],
+                            phone_gate_unsafe_tail_chars(streamed))
+                        ready, pending[:] = pending[:cut], pending[cut:]
                         for chunk_out in ready:
                             self._gate_stream_emitted = True
                             yield chunk_out
@@ -11038,8 +11089,12 @@ def phone_agent_class(agent_base: Any) -> Any:
                     # holding while the run is still growing; the next chunks
                     # either complete it, and the check above then vetoes with
                     # nothing spoken, or break it and release.
+                    # UNSTRIPPED on purpose. `segment` is `.strip()`ed, so it
+                    # can never end in a separator — the mid-word test above
+                    # would be meaningless against it and would hold every lead.
+                    # The raw text is what says whether the last word is whole.
                     if phone_control_run_forming(
-                        segment, self._gate_leak_control,
+                        "".join(parts), self._gate_leak_control,
                     ):
                         continue
                     released = True
@@ -11057,8 +11112,10 @@ def phone_agent_class(agent_base: Any) -> Any:
                     # `run_phone_gate` a line went out when none did, and it
                     # would skip the fixed opener — a SILENT gate, the mirror of
                     # the 2026-09-09 double-opener.
-                    keep = _GATE_RUN_LOOKAHEAD_CHUNKS
-                    ready, pending[:] = held[:-keep], held[-keep:]
+                    cut = phone_gate_split_ready(
+                        [len(_chunk_text(c)) for c in held],
+                        phone_gate_unsafe_tail_chars(streamed))
+                    ready, pending[:] = held[:cut], held[cut:]
                     for chunk_out in ready:
                         self._gate_stream_emitted = True
                         yield chunk_out

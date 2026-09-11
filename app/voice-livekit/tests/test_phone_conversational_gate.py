@@ -1455,6 +1455,123 @@ class TestGateLeakVetoAtTokenGranularity(TestGateWindowLeakVeto):
         self.assertEqual(await self._spoken([line]), line)
 
 
+def _piece_chunks(text, size):
+    """Fixed-width pieces — the shape a BPE/SentencePiece delta stream has.
+
+    Word-at-a-time is the FRIENDLY case. A model emits sub-word deltas, and
+    `" Seni"` + `"or"` is an ordinary way for "Senior" to arrive.
+    """
+    return [text[i:i + size] for i in range(0, len(text), size)]
+
+
+class TestGateLeakVetoAtSubWordGranularity(unittest.IsolatedAsyncioTestCase):
+    """The leak guarantee must not depend on the provider's tokenizer.
+
+    A review found that the word-granularity fix still leaked when chunks split
+    WORDS: the final token of the accumulated text is then a fragment
+    ("seni", "info") that matches no control run, so the hold released
+    mid-recital. Measured against the real `llm_node`, "Senior Data Engineer at"
+    reached the caller at four- and six-character chunks while the identical
+    line split on spaces reached nobody.
+
+    Nothing in the code enforces whole-word chunks, and `phone.py` already
+    handles `tts_node` "cutting mid-word", so this granularity is not
+    hypothetical.
+    """
+
+    RESUME = TestGateWindowLeakVeto.RESUME
+    RESUME_WORDS = ("Senior", "Data", "Engineer", "Infosys", "Bengaluru",
+                    "Spark")
+
+    async def _spoken(self, text, size):
+        agent = TestGateWindowLeakVeto._agent(self, _piece_chunks(text, size))
+        out = []
+        async for chunk in agent.llm_node(
+            types.SimpleNamespace(items=[]), [], None,
+        ):
+            out.append(chunk)
+        return "".join(out)
+
+    async def test_no_resume_word_airs_at_ANY_chunk_size(self):
+        recitals = (
+            "Hi there, I can see you are a Senior Data Engineer at Infosys in "
+            "Bengaluru with four years of experience. Am I speaking to Priya?",
+            "Senior Data Engineer at Infosys, in Bengaluru with four years of "
+            "experience. Am I speaking to Priya?",
+            "Hi, you are a Senior Data Engineer at Infosys in Bengaluru. "
+            "Am I speaking to Priya?",
+        )
+        # 1 = character at a time, the pathological floor.
+        for size in (1, 2, 3, 4, 6, 9):
+            for line in recitals:
+                spoken = await self._spoken(line, size)
+                for word in self.RESUME_WORDS:
+                    self.assertNotIn(
+                        word, spoken,
+                        f"chunk size {size} put {word!r} on the wire: "
+                        f"{spoken!r}",
+                    )
+
+    async def test_a_clean_line_survives_ANY_chunk_size_intact(self):
+        # The hold must not start eating ordinary greetings just because the
+        # chunks got smaller.
+        line = ("Hi there, good morning! This is Christy calling from Interview "
+                "Kickstart. Am I speaking with Christo?")
+        for size in (1, 2, 3, 4, 6, 9):
+            self.assertEqual(await self._spoken(line, size), line,
+                             f"chunk size {size} altered a clean line")
+
+
+class TestGateUnsafeTailAccounting(unittest.TestCase):
+    """`phone_gate_unsafe_tail_chars` / `phone_gate_split_ready`.
+
+    The retained amount is counted in CHARACTERS because chunk size is the
+    provider's choice. Holding "one chunk" recalls a whole word from a
+    word-at-a-time stream and a single LETTER from a character-at-a-time one —
+    the same code, the same line, two different guarantees.
+    """
+
+    def test_the_final_whole_word_is_retained(self):
+        # "a Senior" -> the last token starts 6 chars from the end.
+        self.assertEqual(phone.phone_gate_unsafe_tail_chars("you are a Senior"),
+                         len("Senior"))
+
+    def test_a_trailing_separator_still_retains_the_word_before_it(self):
+        # The word is complete, but it can still OPEN a run with whatever comes
+        # next, so it is not yet safe to speak.
+        self.assertEqual(
+            phone.phone_gate_unsafe_tail_chars("you are a Senior "),
+            len("Senior "))
+
+    def test_text_with_no_complete_token_retains_everything(self):
+        for text in ("", "   ", "--- ,,, "):
+            self.assertEqual(phone.phone_gate_unsafe_tail_chars(text),
+                             len(text), repr(text))
+
+    def test_non_strings_retain_nothing_rather_than_raising(self):
+        for bad in (None, 42, [], {"a": 1}):
+            self.assertEqual(phone.phone_gate_unsafe_tail_chars(bad), 0)
+
+    def test_the_split_rounds_toward_RETAINING(self):
+        # Chunks are what gets yielded, so a chunk straddling the boundary must
+        # be held, not split.
+        self.assertEqual(phone.phone_gate_split_ready([5, 5, 5], 0), 3)
+        self.assertEqual(phone.phone_gate_split_ready([5, 5, 5], 5), 2)
+        self.assertEqual(phone.phone_gate_split_ready([5, 5, 5], 6), 1)
+        self.assertEqual(phone.phone_gate_split_ready([5, 5, 5], 15), 0)
+        # More unsafe than exists: retain everything rather than under-retain.
+        self.assertEqual(phone.phone_gate_split_ready([5, 5, 5], 999), 0)
+        self.assertEqual(phone.phone_gate_split_ready([], 4), 0)
+
+    def test_one_character_chunks_still_retain_a_whole_word(self):
+        # The regression this replaced: a one-CHUNK lookahead recalls one
+        # character here, and "Senior" went out a letter at a time.
+        lengths = [1] * len("you are a Senior")
+        cut = phone.phone_gate_split_ready(
+            lengths, phone.phone_gate_unsafe_tail_chars("you are a Senior"))
+        self.assertEqual(cut, len("you are a "))
+
+
 class TestControlRunForming(unittest.TestCase):
     """`phone_control_run_forming` — the hold predicate, on its own.
 
@@ -1470,7 +1587,7 @@ class TestControlRunForming(unittest.TestCase):
         for tail in ("Senior Data", "Senior Data Engineer",
                      "Senior Data Engineer at", "Senior Data Engineer at Infosys"):
             self.assertTrue(
-                phone.phone_control_run_forming(f"Hi there, you are a {tail}",
+                phone.phone_control_run_forming(f"Hi there, you are a {tail} ",
                                                 self.RESUME), tail)
 
     def test_a_SINGLE_shared_word_does_not_hold(self):
@@ -1485,11 +1602,11 @@ class TestControlRunForming(unittest.TestCase):
         # recallable, so a recital is still stopped with NOTHING spoken.
         for tail in ("Senior", "Infosys", "Bengaluru", "experience"):
             self.assertFalse(
-                phone.phone_control_run_forming(f"Are you the {tail}",
+                phone.phone_control_run_forming(f"Are you the {tail} ",
                                                 self.RESUME), tail)
 
     def test_text_that_touches_NOTHING_in_the_control_releases(self):
-        for tail in ("Hi there,", "Hi there, good morning! This is Christy",
+        for tail in ("Hi there,", "Hi there, good morning! This is Christy ",
                      "Am I speaking to Priya?"):
             self.assertFalse(phone.phone_control_run_forming(tail, self.RESUME),
                              tail)
@@ -1498,7 +1615,7 @@ class TestControlRunForming(unittest.TestCase):
         # "Senior Data Engineer" is in the résumé; "we" is not, so the run has
         # ended and the held words are provably outside any six-word window.
         self.assertFalse(phone.phone_control_run_forming(
-            "the Senior Data Engineer we", self.RESUME))
+            "the Senior Data Engineer we ", self.RESUME))
 
     def test_a_run_at_the_very_END_of_the_control_cannot_hold(self):
         # A run that matches only the control's last few tokens can never grow
@@ -1509,17 +1626,17 @@ class TestControlRunForming(unittest.TestCase):
                    "india juliet zulu quebec")
         # Same pair, early enough that six tokens can follow: HOLD.
         self.assertTrue(
-            phone.phone_control_run_forming("you said alpha bravo", control))
+            phone.phone_control_run_forming("you said alpha bravo ", control))
         # The final pair: nothing can follow it, so there is nothing to wait for.
         self.assertFalse(
-            phone.phone_control_run_forming("you said zulu quebec", control))
+            phone.phone_control_run_forming("you said zulu quebec ", control))
 
     def test_an_EMPTY_or_short_control_never_holds(self):
         # Below six control tokens the echo detector is inert, so holding for it
         # would mute the gate forever for no possible benefit.
         for control in ("", "Senior Data Engineer", "   "):
             self.assertFalse(
-                phone.phone_control_run_forming("you are a Senior", control),
+                phone.phone_control_run_forming("you are a Senior ", control),
                 repr(control))
 
     def test_non_strings_do_not_raise(self):
@@ -1532,6 +1649,27 @@ class TestControlRunForming(unittest.TestCase):
         # and then be caught (or not) by a detector that folds case anyway.
         self.assertTrue(phone.phone_control_run_forming(
             "you are a SENIOR DATA ENGINEER,", self.RESUME))
+
+    def test_text_that_may_end_MID_WORD_always_holds(self):
+        # THE SUB-WORD LEAK. Providers split words — this file's own `tts_node`
+        # notes guard against "cutting mid-word" — and a chunk ending inside one
+        # leaves a FRAGMENT as the final token. "Seni" matches no run, so the
+        # hold released in the middle of the recital it was holding for:
+        # measured against the real `llm_node`, word-piece chunks put "Senior
+        # Data Engineer at" on the wire while the same line split on spaces put
+        # out nothing.
+        #
+        # So a prefix that may be mid-word is UNDECIDABLE and holds. The cost is
+        # the rest of one word.
+        for partial in ("you are a Seni", "you are a Senior Dat",
+                        "Hi there, good mor"):
+            self.assertTrue(
+                phone.phone_control_run_forming(partial, self.RESUME), partial)
+        # A separator proves the last token is whole, and then the ordinary rule
+        # applies — otherwise this would hold every line forever.
+        self.assertFalse(
+            phone.phone_control_run_forming("Hi there, good morning! ",
+                                            self.RESUME))
 
 
 class TestWordBoundaryFlush(unittest.IsolatedAsyncioTestCase):
