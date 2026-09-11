@@ -1212,6 +1212,204 @@ class TestGateWindowLeakVeto(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self._spoken([]), "")
 
 
+def _token_chunks(text):
+    """Split into TOKEN-sized chunks — the granularity production streams at.
+
+    Every other test in this file feeds phrase- or line-sized chunks, and that
+    is the blind spot: `phone_instruction_echo_detected` judges what it is
+    GIVEN, so a whole line is vetoed before any audio while the same line
+    arriving a word at a time has already spoken five words of it by the time
+    the sixth makes the echo visible.
+    """
+    out, buf = [], ""
+    for ch in text:
+        buf += ch
+        if ch == " ":
+            out.append(buf)
+            buf = ""
+    if buf:
+        out.append(buf)
+    return out
+
+
+class TestGateLeakVetoAtTokenGranularity(TestGateWindowLeakVeto):
+    """Every leak assertion above, re-run one word at a time.
+
+    WHY THIS CLASS EXISTS. `phone.py` documents the gate window as streaming
+    "token by token through `llm_node` → `tts_node`", and `_A0_FIRST_FRAGMENT`
+    notes real first fragments can be two characters. But every chunk list in
+    the parent class is a whole phrase, so the parent proved the veto works on
+    a granularity production never uses. Driven a word at a time, the same
+    "vetoed before any audio" line put `Senior Data Engineer at Infosys` — five
+    verbatim résumé words — in front of a listener whose identity the gate had
+    not yet established, with the egress already recording.
+
+    Subclassing re-runs the parent's cases through `_spoken`, which is
+    overridden here to re-chunk. Cases that are already single short tokens are
+    unaffected; the recital cases are the ones that change.
+    """
+
+    async def _spoken(self, chunks):
+        return await super()._spoken(_token_chunks("".join(chunks)))
+
+    async def test_a_verbatim_resume_recital_is_vetoed_before_any_audio(self):
+        # The parent asserts NOTHING is spoken, which is achievable only by
+        # holding the whole line — the 73-char hold the owner heard as dead air.
+        # Word by word, the clean preamble is released on its first boundary
+        # exactly as a screening turn would release it, and the hold begins when
+        # the RUN does. So the guarantee at this granularity is narrower and is
+        # the one that actually protects the candidate: not one résumé word.
+        leak = ("Hi there, I can see you are a Senior Data Engineer at Infosys "
+                "in Bengaluru with four years of experience. Am I speaking to "
+                "Priya?")
+        spoken = await self._spoken([leak])
+        for word in ("Senior", "Data", "Engineer", "Infosys", "Bengaluru"):
+            self.assertNotIn(word, spoken, f"résumé word spoken: {spoken!r}")
+        self.assertNotIn("four years", spoken)
+
+    async def test_a_premature_goodbye_is_vetoed(self):  # noqa: D102 — overrides
+        # AN HONEST DOWNGRADE, recorded rather than hidden. Fed whole, this line
+        # is vetoed before any audio. Word by word, "Thanks for your time, and "
+        # releases on its comma before "goodbye" has arrived, so the closing
+        # veto fires one word later and truncates instead of preventing.
+        #
+        # Accepted deliberately: this is the exposure a POST-consent screening
+        # turn already carries — A0 releases on the same boundary-or-cap rule —
+        # and the cost is a few words of filler before `run_phone_gate` speaks
+        # its fixed line, not a disclosure. The résumé hold above is the part
+        # that is pre-consent-specific, and that one is absolute.
+        spoken = await self._spoken(["Thanks for your time, and goodbye."])
+        self.assertNotIn("goodbye", spoken.casefold(),
+                         f"the closing itself was spoken: {spoken!r}")
+        self.assertLess(len(spoken), len("Thanks for your time, and goodbye."))
+
+    async def test_the_lead_is_bounded_and_the_recital_is_truncated(self):
+        # The parent's bound is `48 + len(chunks[1])`, which at phrase
+        # granularity is 99 chars and is really "one chunk after release" — a
+        # bound that says almost nothing. At token granularity the only bound
+        # worth asserting is the one that matters: NO résumé word is spoken.
+        chunks = ["Hi, ", "I can see you are a Senior Data Engineer at Infosys ",
+                  "in Bengaluru with four years of experience. Am I speaking to Priya?"]
+        spoken = await self._spoken(chunks)
+        for word in ("Senior", "Data", "Engineer", "Infosys", "Bengaluru"):
+            self.assertNotIn(word, spoken, f"résumé word spoken: {spoken!r}")
+
+    async def test_a_pure_recital_speaks_NOTHING_word_by_word(self):
+        # The worst shape: no preamble at all, and a comma five words in, so the
+        # boundary rule alone would release the whole recital.
+        line = ("Senior Data Engineer at Infosys, in Bengaluru with four years "
+                "of experience. Am I speaking to Priya?")
+        self.assertEqual(await self._spoken([line]), "")
+
+    async def test_not_one_resume_word_escapes_on_any_recital_shape(self):
+        for line in (
+            "Hi there, I can see you are a Senior Data Engineer at Infosys in "
+            "Bengaluru with four years of experience. Am I speaking to Priya?",
+            "Hi, you are a Senior Data Engineer at Infosys in Bengaluru. "
+            "Am I speaking to Priya?",
+            "Senior Data Engineer at Infosys in Bengaluru with four years of "
+            "experience — am I speaking to Priya?",
+            "Bonjour, vous êtes Senior Data Engineer at Infosys in Bengaluru "
+            "with four years of experience?",
+        ):
+            spoken = await self._spoken([line])
+            for word in ("Senior", "Data", "Engineer", "Infosys", "Bengaluru",
+                         "Spark"):
+                self.assertNotIn(
+                    word, spoken,
+                    f"résumé word {word!r} reached a pre-consent listener from "
+                    f"{line!r}: {spoken!r}",
+                )
+
+    async def test_a_clean_line_is_spoken_WHOLE_and_is_not_delayed(self):
+        # The other half of the trade. The hold must be specific to a forming
+        # résumé run: a clean line must release on the first boundary, exactly
+        # as a screening turn does, and must arrive complete.
+        line = ("Hi there, good morning! This is Christy calling from Interview "
+                "Kickstart. Am I speaking with Christo?")
+        agent = self._agent(_token_chunks(line))
+        first_release = None
+        out = []
+        async for chunk in agent.llm_node(
+            types.SimpleNamespace(items=[]), [], None,
+        ):
+            out.append(chunk)
+            if first_release is None:
+                first_release = "".join(out)
+        self.assertEqual("".join(out), line, "a clean line was altered")
+        # Release happens on the segment "Hi there," — the same 9-char point the
+        # A0 screening path releases at. The first CHUNK out is "Hi ".
+        self.assertEqual(first_release, "Hi ")
+
+    async def test_a_shared_phrase_that_BREAKS_is_released_not_swallowed(self):
+        # The hold must end when the run stops growing, or a line that merely
+        # brushes the résumé would be truncated mid-sentence — the false
+        # positive that matters, since the role title is BOTH a résumé fact and
+        # a natural thing for the opener to mention.
+        line = "Hi there, am I speaking with the Senior Data Engineer we wrote to?"
+        self.assertEqual(await self._spoken([line]), line)
+
+    async def test_a_run_still_FORMING_at_the_end_is_flushed_not_dropped(self):
+        # The other end of the same seam. Here the line STOPS inside the shared
+        # phrase, so the hold is still open when the stream ends and there is no
+        # further chunk to break it. Those words were withheld for a check that
+        # can no longer fire — the full-text veto has already passed on them —
+        # so they must be spoken. Dropped instead, the candidate hears the
+        # question amputated: "Hi there, am I speaking with the".
+        line = "Hi there, am I speaking with the Senior Data Engineer?"
+        self.assertEqual(await self._spoken([line]), line)
+
+
+class TestControlRunForming(unittest.TestCase):
+    """`phone_control_run_forming` — the hold predicate, on its own.
+
+    It exists because `phone_instruction_echo_detected` is blind until the
+    sixth copied word. Its whole job is to say "a run is mid-growth, keep
+    holding", so the two directions it can be wrong in are: never holding (the
+    leak returns) and always holding (the gate goes mute).
+    """
+
+    RESUME = TestGateWindowLeakVeto.RESUME
+
+    def test_a_run_in_progress_HOLDS(self):
+        for tail in ("Senior", "Senior Data", "Senior Data Engineer",
+                     "Senior Data Engineer at", "Senior Data Engineer at Infosys"):
+            self.assertTrue(
+                phone.phone_control_run_forming(f"Hi there, you are a {tail}",
+                                                self.RESUME), tail)
+
+    def test_text_that_touches_NOTHING_in_the_control_releases(self):
+        for tail in ("Hi there,", "Hi there, good morning! This is Christy",
+                     "Am I speaking to Priya?"):
+            self.assertFalse(phone.phone_control_run_forming(tail, self.RESUME),
+                             tail)
+
+    def test_a_BROKEN_run_releases(self):
+        # "Senior Data Engineer" is in the résumé; "we" is not, so the run has
+        # ended and the held words are provably outside any six-word window.
+        self.assertFalse(phone.phone_control_run_forming(
+            "the Senior Data Engineer we", self.RESUME))
+
+    def test_an_EMPTY_or_short_control_never_holds(self):
+        # Below six control tokens the echo detector is inert, so holding for it
+        # would mute the gate forever for no possible benefit.
+        for control in ("", "Senior Data Engineer", "   "):
+            self.assertFalse(
+                phone.phone_control_run_forming("you are a Senior", control),
+                repr(control))
+
+    def test_non_strings_do_not_raise(self):
+        for bad in (None, 42, [], {"a": 1}):
+            self.assertFalse(phone.phone_control_run_forming(bad, self.RESUME))
+            self.assertFalse(phone.phone_control_run_forming("Senior", bad))
+
+    def test_it_is_CASE_and_PUNCTUATION_insensitive_like_the_detector(self):
+        # Or a recital in different case would stream straight through the hold
+        # and then be caught (or not) by a detector that folds case anyway.
+        self.assertTrue(phone.phone_control_run_forming(
+            "you are a SENIOR DATA ENGINEER,", self.RESUME))
+
+
 class TestWordBoundaryFlush(unittest.IsolatedAsyncioTestCase):
     """The `min_chars` cap must not cut a word in half.
 

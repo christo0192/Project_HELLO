@@ -3286,16 +3286,22 @@ _GATE_TURNS_MAX = 6
 #: or more of extra dead air, on the one turn a candidate has no context for,
 #: and the owner heard it on a live stage-2 call.
 #:
-#: The trade was not worth it and did not buy much. `phone_instruction_echo_detected`
-#: compares SIX-word windows and returns False outright below six tokens — executed,
-#: not assumed: "Senior Data Engineer at Infosys" (5) is False, the same run plus
-#: "Bangalore" (6) is True — so holding past six words buys nothing the tail veto
-#: does not already do on every chunk for the whole reply.
+#: THE TOKEN FLOOR THAT WENT WITH IT DID MORE THAN IT LOOKED LIKE, and removing
+#: it alone reopened a real leak. Sitting BEFORE the boundary test, it forced the
+#: hold past the first comma to the NEXT boundary — the end of the first sentence
+#: — which is exactly where `phone_instruction_echo_detected` has a full six-word
+#: window. Dropping it collapsed the check window from "first sentence" to "first
+#: comma", and since production streams token by token, the detector could no
+#: longer fire before words one to five of a recital were already spoken.
+#: Reproduced by driving the real `llm_node`: "Senior Data Engineer at Infosys, "
+#: reached the caller, while the identical line fed as ONE chunk was vetoed with
+#: no audio.
 #:
-#: What the cap costs, plainly: up to this many characters of lead can be spoken
-#: before a six-word résumé run becomes detectable. That is the same exposure a
-#: screening turn already carries, and the tail veto truncates mid-stream the
-#: moment such a run appears after release.
+#: So the hold is now targeted instead of unconditional:
+#: `phone_control_run_forming` keeps holding only while the tail is PART-WAY
+#: through a control run. A clean line has no such run and releases here, at the
+#: same point a screening turn does; a recital is held until the detector can see
+#: it. That buys back the lead-in without paying for it in résumé words.
 _GATE_LEAK_HARD_CAP_CHARS = _A0_LEADING_SEGMENT_MAX_CHARS
 
 
@@ -8523,6 +8529,44 @@ def phone_instruction_echo_detected(speech: Any, control_text: Any) -> bool:
     return any(tuple(spoken[i:i + 6]) in windows for i in range(len(spoken) - 5))
 
 
+def phone_control_run_forming(streamed: Any, control_text: Any) -> bool:
+    """Could the streamed TAIL still grow into a six-word control run?
+
+    `phone_instruction_echo_detected` cannot fire until the SIXTH copied word
+    arrives. That is fine when a whole line is judged at once, and wrong when
+    the line is streamed: by the time the sixth word makes the echo visible,
+    words one to five have already been handed to `tts_node` and spoken. In the
+    gate window those words are résumé facts, and the listener has not yet
+    confirmed who they are — verified by driving the real `llm_node` token by
+    token, where "Senior Data Engineer at Infosys, " reached the caller while
+    the same line fed as ONE chunk was vetoed before any audio.
+
+    So this answers the question the detector cannot: is the tail PART-WAY
+    through a control run right now? While it is, the caller keeps holding, and
+    the run either completes — the detector fires, nothing is spoken — or breaks,
+    at which point the held words are provably not inside any six-word run and
+    can be released. A clean line has no run at its tail and is never delayed.
+
+    Deliberately a superset: a suffix matching the LAST tokens of the control
+    cannot reach six, and is held anyway. Over-holding costs a token of lead-in;
+    under-holding speaks the résumé.
+    """
+    if not isinstance(streamed, str) or not isinstance(control_text, str):
+        return False
+    spoken = _COVERAGE_TOKEN_RE.findall(streamed.casefold())
+    control = _COVERAGE_TOKEN_RE.findall(control_text.casefold())
+    # Below six control tokens the detector itself is inert, so there is no run
+    # to be part-way through and nothing to hold for.
+    if not spoken or len(control) < 6:
+        return False
+    for size in range(min(len(spoken), 5), 0, -1):
+        run = tuple(spoken[-size:])
+        if any(tuple(control[i:i + size]) == run
+               for i in range(len(control) - size + 1)):
+            return True
+    return False
+
+
 def phone_fallback_acknowledgement(answer: Any, *, answer_is_question: bool = False) -> str:
     """Select a safe fallback reaction from explicit route state only.
 
@@ -10843,6 +10887,7 @@ def phone_agent_class(agent_base: Any) -> Any:
                         pass
 
                 held: list[Any] = []
+                pending: list[Any] = []
                 parts: list[str] = []
                 released = False
                 streamed = ""
@@ -10867,7 +10912,23 @@ def phone_agent_class(agent_base: Any) -> Any:
                             )
                             await _abandon(result)
                             return
-                        yield chunk
+                        # HOLD WHILE A CONTROL RUN IS MID-GROWTH. The veto above
+                        # cannot fire until the SIXTH copied word, so yielding
+                        # each chunk the moment it passes speaks words one to
+                        # five of a recital before the check can see it — which
+                        # is exactly what happens in production, where the model
+                        # streams token by token rather than in the phrase-sized
+                        # chunks the tests used to feed. Buffered here, the run
+                        # either completes (vetoed above, nothing spoken) or
+                        # breaks (released below, having been proven clean).
+                        pending.append(chunk)
+                        if phone_control_run_forming(
+                            streamed, self._gate_leak_control,
+                        ):
+                            continue
+                        for ready in pending:
+                            yield ready
+                        pending.clear()
                         continue
                     held.append(chunk)
                     parts.append(_chunk_text(chunk))
@@ -10875,19 +10936,21 @@ def phone_agent_class(agent_base: Any) -> Any:
                     # RELEASE ON EXACTLY THE RULE A SCREENING TURN USES —
                     # boundary or cap, and nothing else.
                     #
-                    # A six-token floor used to gate the RELEASE here as well, so
-                    # the echo detector would always have a full window to look
-                    # at. That was the wrong lever. It delayed first audio on
-                    # EVERY gate line to buy a check the tail veto below already
-                    # performs on every chunk for the whole reply: on the line
+                    # A six-token floor used to gate the RELEASE here as well,
+                    # holding every line to its first full sentence. On the line
                     # the owner heard live — "Hi there, good morning! This is
                     # Christy calling from Interview Kickstart. Am I speaking
                     # with Christo?" — a screening turn starts speaking after
                     # "Hi there," (9 chars) and this branch held 73. Eight times
                     # the lead-in, on the one turn a candidate has no context
                     # for, which is exactly where dead air reads as a dropped
-                    # call. See `_GATE_LEAK_HARD_CAP_CHARS` for the measurement
-                    # and for what the shorter hold costs.
+                    # call.
+                    #
+                    # The floor is gone, but NOT its protection: the targeted
+                    # hold below keeps a forming résumé run off the wire, while a
+                    # clean line releases right here. See
+                    # `_GATE_LEAK_HARD_CAP_CHARS` for why removing the floor on
+                    # its own was a leak.
                     if not segment.endswith(
                         (".", "!", "?", ",", ";", ":", "—", "–", "…")
                     ) and len(segment) < _GATE_LEAK_HARD_CAP_CHARS:
@@ -10901,11 +10964,23 @@ def phone_agent_class(agent_base: Any) -> Any:
                         )
                         await _abandon(result)
                         return
+                    # Clean SO FAR is not the same as safe to speak. The check
+                    # above is blind below six copied words, so a lead that ends
+                    # part-way through a résumé run — "…you are a Senior Data
+                    # Engineer at Infosys," is five words and a comma, a legal
+                    # boundary — passes it and takes the recital to air. Keep
+                    # holding while the run is still growing; the next chunks
+                    # either complete it, and the check above then vetoes with
+                    # nothing spoken, or break it and release.
+                    if phone_control_run_forming(
+                        segment, self._gate_leak_control,
+                    ):
+                        continue
                     released = True
                     streamed = "".join(parts)
                     self._gate_stream_emitted = True
-                    for pending in held:
-                        yield pending
+                    for ready in held:
+                        yield ready
                     held.clear()
                 if not released:
                     # The whole reply ended before it reached a full window, so
@@ -10926,8 +11001,17 @@ def phone_agent_class(agent_base: Any) -> Any:
                         return
                     if any(ch.isalpha() for ch in tail):
                         self._gate_stream_emitted = True
-                    for pending in held:
-                        yield pending
+                    for ready in held:
+                        yield ready
+                    return
+                # The stream ENDED with a run still mid-growth, so it never
+                # reached six words and the full-text veto above has already
+                # passed on every chunk here. Held back for a check that can no
+                # longer fire, these are safe and must not be dropped — the
+                # candidate would hear a sentence cut off mid-clause.
+                for ready in pending:
+                    yield ready
+                pending.clear()
                 return
             if self._turn_policy == "substantive" and self._turn_mode == PHONE_TURN_MODE_TOOLLESS:
                 # TOOLLESS substantive turn (browser-style). ONE Gemini call:
