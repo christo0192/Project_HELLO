@@ -932,6 +932,38 @@ def _turn_anchor_ms(item: Any) -> int | None:
     return persistence.normalize_turn_anchor_ms(created_at)
 
 
+def _queued_turn(item: Any) -> tuple[str, int | None]:
+    """Unpack a `user_turns` entry as (text, speech_start_ms).
+
+    Accepts a BARE STRING as well as the `(text, anchor)` pair the live producer
+    enqueues. The tolerance is deliberate: `_classify_phone_answer` is a
+    module-level function with its own direct tests that hand it a plain
+    `Queue[str]`, and widening the queue should not force every one of those to
+    learn a shape they do not care about.
+    """
+    if isinstance(item, tuple) and len(item) == 2:
+        text, anchor = item
+        return (text if isinstance(text, str) else ""), (
+            anchor if isinstance(anchor, int) and not isinstance(anchor, bool) else None
+        )
+    return (item if isinstance(item, str) else ""), None
+
+
+def _queued_turn_is_stale(anchor_ms: int | None, question_anchor_ms: int | None) -> bool:
+    """True when this utterance began BEFORE the question now asking for it.
+
+    The reader-side half of the gate barrier. FAIL-OPEN by construction: both
+    anchors must be real for a turn to be rejected, so anything the SDK could
+    not time is kept. Losing a genuine answer costs the identity check; reading
+    a stale one costs a re-ask.
+    """
+    return (
+        anchor_ms is not None
+        and question_anchor_ms is not None
+        and anchor_ms < question_anchor_ms
+    )
+
+
 def _native_turn_predates_question(message: Any, question_anchor_ms: int | None) -> bool:
     """True only when both real anchors prove the final belongs before this ask."""
     started_ms = _turn_anchor_ms(message)
@@ -1513,6 +1545,7 @@ async def _classify_phone_answer(
     attempts: int = 2,
     consumed: "list[str] | None" = None,
     answer_timeout_sec: float | None = None,
+    question_anchor: "Callable[[], int | None] | None" = None,
 ) -> str:
     """Read the response to the disclosure, re-asking at most once.
 
@@ -1534,12 +1567,33 @@ async def _classify_phone_answer(
         answer_timeout_sec = phone.phone_classify_answer_timeout_sec()
     responsive = 0
     for attempt in range(max(1, attempts)):
-        try:
-            text = await asyncio.wait_for(turns.get(), timeout=answer_timeout_sec)
-        except asyncio.TimeoutError:
-            # No speech within THIS answer's window. Treat as unreadable for the
-            # attempt: re-ask if one remains, else fall closed to MACHINE below.
-            text = ""
+        # Skip utterances that began before THIS question, inside the SAME
+        # per-attempt budget. The consent turn shares one FIFO with the identity
+        # reader, so a trailing fragment of the identity answer is sitting in it,
+        # legitimately enqueued under the identity anchor — and read here it
+        # would be consent. That is the shared-FIFO defect, and it is why the
+        # staleness test lives at the READER: only the reader knows its question.
+        text = ""
+        deadline = time.monotonic() + answer_timeout_sec
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # No usable speech within THIS answer's window. Treat as
+                # unreadable: re-ask if one remains, else fall closed to MACHINE.
+                text = ""
+                break
+            try:
+                item = await asyncio.wait_for(turns.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                text = ""
+                break
+            candidate_text, anchor_ms = _queued_turn(item)
+            if question_anchor is not None and _queued_turn_is_stale(
+                anchor_ms, question_anchor()
+            ):
+                continue
+            text = candidate_text
+            break
         if isinstance(text, str) and text.strip():
             responsive += 1
             if consumed is not None:
@@ -6798,7 +6852,13 @@ async def _run_phone_session(
 
     # Candidate-only queue used exclusively by the pre-consent disclosure
     # classifier. Post-consent turns remain inside LiveKit AgentSession.
-    user_turns: "asyncio.Queue[str]" = asyncio.Queue()
+    # (text, speech_start_ms). The anchor TRAVELS WITH the utterance because the
+    # question it belongs to is not known until it is READ: a trailing fragment
+    # of the identity answer is legitimately enqueued under the identity anchor
+    # and then popped by the CONSENT classifier, which is the shared-FIFO defect
+    # this whole mechanism exists to close. Filtering at the producer cannot see
+    # that; filtering at the reader can.
+    user_turns: "asyncio.Queue[tuple[str, int | None]]" = asyncio.Queue()
     # The gate's CURRENT question, as a speech-start anchor in ms. Set when the
     # gate begins asking, cleared when the gate returns. While set, a candidate
     # final whose SPEECH STARTED before it is never enqueued -- see
@@ -7433,37 +7493,21 @@ async def _run_phone_session(
         # up whenever it was said.
         if phone.is_explicit_end_call_request(text):
             candidate_end_requested.set()
-        # ── THE GATE'S QUESTION BARRIER ───────────────────────────────────
-        # Filter at the PRODUCER, by the utterance's own SPEECH-START time.
+        # RECORD the utterance with its own SPEECH-START; do not judge it here.
         #
-        # The predecessor drained the queue after the question finished playing.
-        # That fixed the stale pickup "Hello?" and broke something worse: a
-        # candidate who answers OVER the question's tail had their reply
-        # discarded, the reader then blocked to timeout, and the identity verdict
-        # failed open to `unclear`. Observed live 2026-09-11 on the stage-2 call
-        # -- the transcript has NO candidate turn between the identity question
-        # and consent, and the model wrote "No worries if you're still getting
-        # settled", which is what it says when it received nothing. The identity
-        # check verified nothing on that call.
+        # An earlier version filtered HERE, at the producer, and it could not
+        # work: whether a turn is stale depends on WHICH QUESTION eventually
+        # reads it, and that is unknown at arrival. A trailing fragment of the
+        # identity answer legitimately postdates the identity anchor, is
+        # enqueued, and is then popped by the CONSENT classifier — the shared-FIFO
+        # defect this mechanism exists to close. Only the reader knows its own
+        # question, so only the reader can decide.
         #
-        # Arrival time cannot separate those two cases: BOTH finals arrive after
-        # the question starts, because STT finalises late. SPEECH-START can, and
-        # `_turn_anchor_ms` already exposes it (the SDK's VAD
-        # `started_speaking_at`). The stale "Hello?" started speaking at pickup,
-        # before the question existed; a barge-in answer started during its
-        # playout. So compare starts, not arrivals.
-        #
-        # FAIL-OPEN: `_native_turn_predates_question` requires BOTH anchors to be
-        # real, so a message with no usable timing is KEPT. Losing a genuine
-        # answer is worse than reading a stale one.
-        anchor = gate_question_anchor[0]
-        if anchor is not None and _native_turn_predates_question(message, anchor):
-            _log.info(
-                "unknown_event", error_type="phone_gate_turn_barrier",
-                error_category="pre_question_turn_dropped",
-            )
-            return
-        user_turns.put_nowait(text)
+        # `_turn_anchor_ms` is the SDK's VAD `started_speaking_at` (a
+        # `time.time()` seconds float, normalised to ms — the same clock and
+        # units as the anchors the readers compare against). `None` when the
+        # message carries no usable timing, which the readers treat as KEEP.
+        user_turns.put_nowait((text, _turn_anchor_ms(message)))
 
     # Complete and immutable from construction. The exact owed question is
     # still supplied only per turn; this prompt carries role, resume,
@@ -7601,7 +7645,8 @@ async def _run_phone_session(
         if classifier is not None:
             return await classifier(user_turns, say)
         return await _classify_phone_answer(
-            user_turns, say, consumed=consent_reply_out
+            user_turns, say, consumed=consent_reply_out,
+            question_anchor=lambda: gate_question_anchor[0],
         )
 
     # Arm the gate-window leak veto with the RÉSUMÉ FACTS — the text that must
@@ -8084,15 +8129,28 @@ async def _run_phone_session(
         unextractable reply as "proceed", and an exception here would end a call
         that a real candidate is on.
         """
-        try:
-            text = await asyncio.wait_for(
-                user_turns.get(), timeout=phone.phone_classify_answer_timeout_sec(),
-            )
-        except asyncio.TimeoutError:
-            return ""
-        except Exception:  # noqa: BLE001
-            return ""
-        return text if isinstance(text, str) else ""
+        deadline = time.monotonic() + phone.phone_classify_answer_timeout_sec()
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ""
+            try:
+                item = await asyncio.wait_for(user_turns.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                return ""
+            except Exception:  # noqa: BLE001
+                return ""
+            text, anchor_ms = _queued_turn(item)
+            # Skip anything that began before THIS question and keep waiting
+            # within the SAME budget — a stale utterance must not buy the
+            # candidate extra time, nor spend theirs.
+            if _queued_turn_is_stale(anchor_ms, gate_question_anchor[0]):
+                _log.info(
+                    "unknown_event", error_type="phone_gate_turn_barrier",
+                    error_category="pre_question_turn_skipped",
+                )
+                continue
+            return text
 
     async def _run_gate() -> "phone.PhoneGateResult":
         return await phone.run_phone_gate(
