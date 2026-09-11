@@ -21,13 +21,18 @@ import asyncio
 import inspect
 import json
 import os
+import re
+import sys
+import types
+import unittest
+from datetime import datetime, timezone
+from unittest.mock import AsyncMock, MagicMock, patch
 
-import pytest
+_SCRIPTED_GATE_SAVED: dict[str, str | None] = {}
 
 
-@pytest.fixture(autouse=True)
-def _scripted_gate_by_default(request):
-    """Pin the SCRIPTED gate for this module unless a test opts out.
+def setUpModule() -> None:
+    """Pin the SCRIPTED gate for this module.
 
     This file tests the phone SESSION — the Q&A loop, the goodbye ladder, the
     silence prompts, the watchdog. The gate in front of it is a FIXTURE, not the
@@ -36,34 +41,33 @@ def _scripted_gate_by_default(request):
     for the 15 s answer window and time out. 45 of them did.
 
     Pinning the rollback tokens keeps each test exercising the thing it was
-    written for. It costs no coverage of the conversational gate: that path has
+    written for, and costs no coverage of the conversational gate: that path has
     its own end-to-end suite in `test_phone_conversational_gate.py`, which drives
     the real `run_phone_gate` and the real `llm_node`.
 
-    Opt out with `@pytest.mark.gate_flow_default` when the default itself is
-    what a test is about.
+    `setUpModule`, NOT a pytest autouse fixture. CI runs these with
+    `python3 -m unittest discover` (quality.yml), where a pytest fixture simply
+    does not exist — the first attempt used one, passed locally under pytest,
+    and failed CI with 12 errors. `setUpModule` is honoured by both runners.
+
+    Individual tests that are ABOUT the defaults override with `patch.dict`,
+    which nests correctly inside this.
     """
-    if request.node.get_closest_marker("gate_flow_default"):
-        yield
-        return
-    saved = {k: os.environ.get(k)
-             for k in ("PHONE_GATE_FLOW", "PHONE_DETERMINISTIC_OPENER")}
-    os.environ["PHONE_GATE_FLOW"] = "deterministic"
-    os.environ["PHONE_DETERMINISTIC_OPENER"] = "true"
-    try:
-        yield
-    finally:
-        for k, v in saved.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
-import re
-import sys
-import types
-import unittest
-from datetime import datetime, timezone
-from unittest.mock import AsyncMock, MagicMock, patch
+    for key, value in (
+        ("PHONE_GATE_FLOW", "deterministic"),
+        ("PHONE_DETERMINISTIC_OPENER", "true"),
+    ):
+        _SCRIPTED_GATE_SAVED[key] = os.environ.get(key)
+        os.environ[key] = value
+
+
+def tearDownModule() -> None:
+    for key, value in _SCRIPTED_GATE_SAVED.items():
+        if value is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = value
+    _SCRIPTED_GATE_SAVED.clear()
 
 
 # ── SDK stub (additive — never clobbers a stub another test file installed) ──

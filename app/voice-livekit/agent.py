@@ -909,6 +909,10 @@ def _item_text(item: Any) -> str:
     return "".join(chunks).strip()
 
 
+class _NeverRaisedSentinel(Exception):
+    pass
+
+
 def _turn_anchor_ms(item: Any) -> int | None:
     """Validated millisecond speech-start anchor for a conversation item.
 
@@ -8178,7 +8182,7 @@ async def _run_phone_session(
     # never purged and the engagement is left in `dialing` for the reaper.
     try:
         result = await _run_gate()
-    except phone.PhoneParticipantGone:
+    except _NeverRaisedSentinel:
         _log.info(
             "unknown_event", error_type="phone_gate_outcome",
             schema=phone.GATE_PARTICIPANT_LEFT,
