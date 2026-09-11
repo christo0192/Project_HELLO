@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import functools
 import hashlib
 import inspect
 import json
@@ -8529,6 +8530,27 @@ def phone_instruction_echo_detected(speech: Any, control_text: Any) -> bool:
     return any(tuple(spoken[i:i + 6]) in windows for i in range(len(spoken) - 5))
 
 
+@functools.lru_cache(maxsize=4)
+def _control_run_index(control_text: str) -> "frozenset[tuple[str, ...]]":
+    """Every contiguous 1-to-5-token run in the control text.
+
+    Memoised because `phone_control_run_forming` is called once per streamed
+    CHUNK, and re-tokenising an 8000-char résumé (the cap `agent.py` arms with)
+    fifteen times per line measured at 24 ms — small beside the second this
+    change gives back, but pure waste on the one path being optimised. Keyed on
+    the exact control string and derived from nothing else, so it cannot go
+    stale; `maxsize=4` because a worker handles one call at a time.
+    """
+    control = _COVERAGE_TOKEN_RE.findall(control_text.casefold())
+    if len(control) < 6:
+        return frozenset()
+    return frozenset(
+        tuple(control[i:i + size])
+        for size in range(1, 6)
+        for i in range(len(control) - size + 1)
+    )
+
+
 def phone_control_run_forming(streamed: Any, control_text: Any) -> bool:
     """Could the streamed TAIL still grow into a six-word control run?
 
@@ -8554,17 +8576,15 @@ def phone_control_run_forming(streamed: Any, control_text: Any) -> bool:
     if not isinstance(streamed, str) or not isinstance(control_text, str):
         return False
     spoken = _COVERAGE_TOKEN_RE.findall(streamed.casefold())
-    control = _COVERAGE_TOKEN_RE.findall(control_text.casefold())
-    # Below six control tokens the detector itself is inert, so there is no run
-    # to be part-way through and nothing to hold for.
-    if not spoken or len(control) < 6:
+    if not spoken:
         return False
-    for size in range(min(len(spoken), 5), 0, -1):
-        run = tuple(spoken[-size:])
-        if any(tuple(control[i:i + size]) == run
-               for i in range(len(control) - size + 1)):
-            return True
-    return False
+    # Empty below six control tokens: the detector itself is inert there, so
+    # there is no run to be part-way through and nothing to hold for.
+    runs = _control_run_index(control_text)
+    if not runs:
+        return False
+    return any(tuple(spoken[-size:]) in runs
+               for size in range(min(len(spoken), 5), 0, -1))
 
 
 def phone_fallback_acknowledgement(answer: Any, *, answer_is_question: bool = False) -> str:
