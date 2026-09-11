@@ -117,11 +117,33 @@ export type PhoneDialScope = (typeof PHONE_DIAL_SCOPES)[number];
  * it on the agent, and its only job here is to size the lease so the gate
  * cannot outlive the slot it is holding.
  *
- * Sixty seconds is deliberately generous. The cost of being too generous is a
- * fleet slot held slightly longer than necessary; the cost of being too mean
- * is hanging up on a candidate who has just consented.
+ * Sixty seconds was deliberately generous for the DETERMINISTIC gate. The cost
+ * of being too generous is a fleet slot held slightly longer than necessary;
+ * the cost of being too mean is hanging up on a candidate who has just
+ * consented.
+ *
+ * 0095 RAISED IT, because the conversational gate puts a whole extra
+ * conversation AHEAD of consent and the old allowance never counted it:
+ *
+ *   identity line playout                        ~6 s
+ *   the candidate's answer   PHONE_CLASSIFY_ANSWER_TIMEOUT_SEC   15 s
+ *   the identity verdict     PHONE_IDENTITY_CLASSIFY_TIMEOUT_SEC  2 s
+ *   ── and, on a mismatch, the re-ask does all three again ──   +23 s
+ *
+ * That is up to ~46 s spent before the disclosure is even spoken, on a budget
+ * that assumed "a ring, a fixed disclosure line and a classification". Left at
+ * 60 this is precisely the failure the `leaseSeconds` comment below describes:
+ * the first heartbeat answers `lease_lost` and the agent hangs up seconds after
+ * the candidate consented, charging a reconnect because the engagement is
+ * already `in_call`.
+ *
+ * The allowance is unconditional rather than flag-aware because the API cannot
+ * see the worker's `PHONE_GATE_FLOW`. Sizing for the longer flow costs the
+ * shorter one nothing but a slot reservation that is released the moment the
+ * call ends.
  */
-export const PHONE_OPENING_GATE_SECONDS = 60;
+export const PHONE_IDENTITY_TURN_SECONDS = 46;
+export const PHONE_OPENING_GATE_SECONDS = 60 + PHONE_IDENTITY_TURN_SECONDS;
 
 export const PHONE_BOUNDS = {
   /**
@@ -177,15 +199,23 @@ export const PHONE_BOUNDS = {
    * consented — and because the engagement is `in_call` by then, the room
    * close charged a reconnect and the next leg carried the same risk.
    *
-   * 180 covers `ringTimeoutSeconds` at its maximum plus a full
+   * The default covers `ringTimeoutSeconds` at its MAXIMUM (120) plus a full
    * `PHONE_OPENING_GATE_SECONDS`, and still leaves the published heartbeat
-   * cadence (a third of the lease, 60s) comfortably under half of it.
+   * cadence (a third of the lease) comfortably under half of it.
+   *
+   * 0095 raised it from 180 to 240 for exactly that reason and no other:
+   * `PHONE_OPENING_GATE_SECONDS` grew by `PHONE_IDENTITY_TURN_SECONDS` to pay
+   * for the conversational gate's pre-consent turn, and 180 no longer satisfied
+   * `120 + 106`. Leaving the lease at 180 would have made every dial with a
+   * ring timeout above 74 s refuse `lease_too_short_for_gate` — the guard doing
+   * its job, against a bound that had moved underneath it.
    *
    * The relation is ENFORCED, not merely defaulted — see
-   * `lease_too_short_for_gate` in `dialPhoneAttempt`. This PR has twice
-   * shipped a bound that lived only in a paragraph, and twice had it missed.
+   * `lease_too_short_for_gate` in `dialPhoneAttempt`. This lane has twice
+   * shipped a bound that lived only in a paragraph, and twice had it missed;
+   * that is why the arithmetic above is spelled out rather than asserted.
    */
-  leaseSeconds: { def: 180, min: 5, max: 900 },
+  leaseSeconds: { def: 240, min: 5, max: 900 },
   /** Largest ingress webhook body accepted before it is refused unread. */
   webhookMaxBytes: { def: 65_536, min: 1_024, max: 1_048_576 },
   /** Replay tolerance on a signed ingress timestamp. */

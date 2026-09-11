@@ -51,7 +51,10 @@ import {
 import type {
   PhoneRoomServiceClientLike,
 } from '../integrations/livekit-phone-dial/phone-room.js';
-import { loadPhoneScreeningConfig } from '../lib/phone-screening/config.js';
+import {
+  loadPhoneScreeningConfig,
+  PHONE_OPENING_GATE_SECONDS,
+} from '../lib/phone-screening/config.js';
 import type { ConsentReader, ConsentRecordSnapshot } from '../lib/phone-screening/consent.js';
 import type {
   AdmitPhoneAttemptResult,
@@ -921,9 +924,15 @@ describe('a lease that cannot span ring + opening gate is REFUSED, not stretched
   // consented. Because the engagement is `in_call` by then, the room close
   // charges a reconnect and the next leg carries the same risk.
 
+  // Derived, never literal. 0095 moved PHONE_OPENING_GATE_SECONDS to pay for
+  // the conversational gate's pre-consent identity turn, and a hard-coded
+  // boundary here would have gone on asserting the OLD relation while the real
+  // one moved — the exact drift the constant's own comment warns about twice.
+  const AT_BOUND = 45 + PHONE_OPENING_GATE_SECONDS;
+
   for (const [lease, ring, label] of [
     ['60', '45', 'the OLD shipped default — 60 against a 45s ring'],
-    ['104', '45', 'one second under the relation'],
+    [String(AT_BOUND - 1), '45', 'one second under the relation'],
     ['5', '5', 'both at their floor'],
   ] as const) {
     it(`refuses before the SDK: ${label}`, async () => {
@@ -951,7 +960,7 @@ describe('a lease that cannot span ring + opening gate is REFUSED, not stretched
   it('exactly AT the relation is admitted — the bound is >=, not >', async () => {
     const h = harness({
       config: screeningConfig({
-        PHONE_LEASE_SECONDS: '105',
+        PHONE_LEASE_SECONDS: String(AT_BOUND),
         PHONE_RING_TIMEOUT_SECONDS: '45',
       }),
       dialConfig: loadPhoneDialConfig({

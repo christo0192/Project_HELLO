@@ -120,11 +120,20 @@ describe('defaults: an empty environment does nothing', () => {
     expect(c.slotSeconds).toBe(1_800);
     expect(c.reconnectBackoffSeconds).toBe(120);
     expect(c.ringTimeoutSeconds).toBe(45);
-    // 180, not 60. The lease has to span the whole stretch during which
-    // nobody is heartbeating yet — the ring, then the opening gate with its
-    // awaited egress call — and at 60 a candidate answering on the last ring
-    // left roughly thirty seconds for it.
-    expect(c.leaseSeconds).toBe(180);
+    // Not 60, and since 0095 not 180 either. The lease has to span the whole
+    // stretch during which nobody is heartbeating yet — the ring, then the
+    // opening gate with its awaited egress call — and at 60 a candidate
+    // answering on the last ring left roughly thirty seconds for it.
+    //
+    // Asserted as the RELATION rather than a literal, because that is the
+    // thing that actually has to hold: the default must still cover the
+    // maximum ring plus a full opening gate, which now includes the
+    // conversational gate's pre-consent identity turn. Pinning the literal is
+    // what let the bound move underneath its own test.
+    expect(c.leaseSeconds).toBe(240);
+    expect(c.leaseSeconds).toBeGreaterThanOrEqual(
+      PHONE_BOUNDS.ringTimeoutSeconds.max + PHONE_OPENING_GATE_SECONDS,
+    );
     expect(c.webhookMaxBytes).toBe(65_536);
     expect(c.webhookToleranceSeconds).toBe(300);
   });

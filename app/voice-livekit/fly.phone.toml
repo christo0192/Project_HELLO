@@ -181,6 +181,16 @@ primary_region = "sin"
   # (`fly secrets unset PHONE_TTS_FLUSH_MIN_CHARS -a <phone-app>`) at deploy or
   # this change silently does nothing.
   PHONE_TTS_FLUSH_MIN_CHARS = "60"
+  # 0095 — PHONE_TTS_PACE is DELIBERATELY NOT SET HERE. The reader
+  # (`phone_tts_pace()`, default 1.0) ships so the value can be applied as a
+  # secret, but the value itself is unverified against `bulbul:v3`: the [0.5,
+  # 2.0] clamp in that reader was invented, Sarvam documents 0.3-3.0, and a
+  # rejected synthesis is SILENCE on a live call — this lane has prior form for
+  # Sarvam 400s being swallowed rather than raised (see the B2 recording RCA).
+  # Unlike PHONE_TTS_FLUSH_MIN_CHARS above, no secret shadows this name, so an
+  # [env] entry here would ship HOT on the next deploy with no way to observe
+  # the failure first. Set it as a secret on one test call, listen, and only
+  # then consider pinning it here.
   LIVEKIT_WORKER_DRAIN_SEC = "10"
   CANDIDATE_SILENCE_PROMPT_SEC = "30"
   CANDIDATE_SILENCE_END_SEC = "20"
