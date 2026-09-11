@@ -1423,6 +1423,29 @@ class TestGateLeakVetoAtTokenGranularity(TestGateWindowLeakVeto):
         for word in ("Senior", "Data", "Engineer", "Infosys", "Bengaluru"):
             self.assertNotIn(word, spoken, f"résumé word spoken: {spoken!r}")
 
+    async def test_a_BOUNDARYLESS_lead_past_the_cap_is_released_not_swallowed(self):
+        # The lead seam is handed the UNSTRIPPED text, because `segment` is
+        # `.strip()`ed and so can never end in a separator — the mid-word test
+        # would then read every lead as possibly-mid-word and hold it.
+        #
+        # This is the only shape that distinguishes the two, found by measuring
+        # rather than by argument: a lead with no punctuation at all, longer
+        # than the 48-char cap, followed by a recital. With the raw text the
+        # clean lead is released; with the stripped one it is held to
+        # end-of-stream and then vetoed whole, so the caller hears nothing where
+        # they should hear the opener. Stripped never speaks MORE — both
+        # directions are leak-safe — but "unobservable" was wrong.
+        lead = "a" * 60
+        spoken = await self._spoken(
+            [lead + " Senior Data Engineer at Infosys in Bengaluru with four "
+                    "years of experience"])
+        self.assertTrue(
+            spoken.startswith("a" * 10),
+            f"the clean lead was swallowed rather than released: {spoken!r}",
+        )
+        for word in ("Senior", "Data", "Engineer", "Infosys", "Bengaluru"):
+            self.assertNotIn(word, spoken, f"résumé word spoken: {spoken!r}")
+
     async def test_a_clean_line_is_spoken_WHOLE_and_is_not_delayed(self):
         # The other half of the trade. The hold must be specific to a forming
         # résumé run: a clean line must release on the first boundary, exactly
@@ -1520,6 +1543,69 @@ class TestGateLeakVetoAtSubWordGranularity(unittest.IsolatedAsyncioTestCase):
         for size in (1, 2, 3, 4, 6, 9):
             self.assertEqual(await self._spoken(line, size), line,
                              f"chunk size {size} altered a clean line")
+
+
+class TestEmittedMeansAudioNotChunks(unittest.IsolatedAsyncioTestCase):
+    """`_gate_stream_emitted` must mean TEXT went out, not "a chunk went out".
+
+    A role-only first delta — `delta.content = None`, which every
+    OpenAI-compatible stream opens with — carries no text. Held behind the
+    lookahead it can be the ONLY thing yielded before a recital trips the tail
+    veto: zero audio, but the flag set.
+
+    What that costs is not cosmetic. `_speak_gate_generation` then returns `""`
+    ("spoken, transcript unknown") instead of `None`, so `_ask_identity` takes
+    the unreadable branch and speaks `phone_identity_repair_text` — "Sorry — am
+    I speaking to Priya?" — as the FIRST audio of the call, in place of
+    `phone_identity_text`, which names us before it asks for them precisely
+    because a cold call from an unknown number that opens by demanding who you
+    are is the shape of a scam call. The consent turn then speaks the
+    CONTINUATION disclosure, which deliberately carries no self-introduction —
+    so the bot never identifies itself or the company at all.
+
+    And it fires exactly when the leak veto fires: on the one path the veto
+    exists for.
+    """
+
+    RESUME = TestGateWindowLeakVeto.RESUME
+
+    async def _run(self, chunks):
+        agent = TestGateWindowLeakVeto._agent(self, chunks)
+        out = []
+        async for chunk in agent.llm_node(
+            types.SimpleNamespace(items=[]), [], None,
+        ):
+            out.append(chunk)
+        return "".join(out), agent._gate_stream_emitted
+
+    async def test_an_EMPTY_leading_delta_is_not_counted_as_audio(self):
+        spoken, emitted = await self._run([
+            "",
+            "Hi there, ",
+            "I can see you are a Senior Data Engineer at Infosys in Bengaluru "
+            "with four years of experience. Am I speaking to Priya?",
+        ])
+        self.assertEqual(spoken, "", "a résumé recital reached the caller")
+        self.assertFalse(
+            emitted,
+            "nothing was spoken, but the gate recorded audio — it will skip its "
+            "own opener and lead with the repair line",
+        )
+
+    async def test_a_stream_of_ONLY_empty_deltas_emits_nothing(self):
+        spoken, emitted = await self._run(["", "", ""])
+        self.assertEqual(spoken, "")
+        self.assertFalse(emitted)
+
+    async def test_real_text_DOES_still_count_as_audio(self):
+        # The guard must not swing the other way: a line that really is spoken
+        # has to report so, or `run_phone_gate` speaks its fixed opener OVER the
+        # top of it — the 2026-09-09 double-opener.
+        line = ("Hi there, good morning! This is Christy calling from Interview "
+                "Kickstart. Am I speaking with Christo?")
+        spoken, emitted = await self._run(["", line])
+        self.assertEqual(spoken, line)
+        self.assertTrue(emitted)
 
 
 class TestGateUnsafeTailAccounting(unittest.TestCase):

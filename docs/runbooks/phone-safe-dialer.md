@@ -183,7 +183,7 @@ be undone by reverting code:
   reads it unless the gate window opens, which needs both flags. Failures are
   swallowed, so a call that armed and one that did not look identical;
 - `agent.py` — `run_phone_gate` is now called unconditionally with
-  `speak_gate_line=` / `reset_turn_buffer=`, and `_compose_gate_line` is gone. A
+  `speak_gate_line=` / `mark_question_asked=`, and `_compose_gate_line` is gone. A
   worker running a mismatched `agent.py`/`phone.py` pair is a `TypeError`, and no
   flag undoes that: deploy them together;
 - `agent.py` — `_await_output_subscription()` now also runs on the deterministic

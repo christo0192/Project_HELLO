@@ -11044,7 +11044,18 @@ def phone_agent_class(agent_base: Any) -> Any:
                             phone_gate_unsafe_tail_chars(streamed))
                         ready, pending[:] = pending[:cut], pending[cut:]
                         for chunk_out in ready:
-                            self._gate_stream_emitted = True
+                            # TEXT, not merely a chunk. A role-only first delta
+                            # (`delta.content = None` on every OpenAI-compatible
+                            # stream) carries nothing, and marking it as audio
+                            # makes `_speak_gate_generation` return "" instead of
+                            # None — "spoken, transcript unknown". The gate then
+                            # skips its own opener and leads with the repair line
+                            # "Sorry — am I speaking to X?", so a cold call from
+                            # an unknown number opens by demanding who you are:
+                            # the shape of a scam call, and the exact thing
+                            # `phone_identity_text` is worded to avoid.
+                            if _chunk_text(chunk_out):
+                                self._gate_stream_emitted = True
                             yield chunk_out
                         continue
                     held.append(chunk)
@@ -11117,7 +11128,8 @@ def phone_agent_class(agent_base: Any) -> Any:
                         phone_gate_unsafe_tail_chars(streamed))
                     ready, pending[:] = held[:cut], held[cut:]
                     for chunk_out in ready:
-                        self._gate_stream_emitted = True
+                        if _chunk_text(chunk_out):
+                            self._gate_stream_emitted = True
                         yield chunk_out
                     held.clear()
                 if not released:
@@ -11148,7 +11160,8 @@ def phone_agent_class(agent_base: Any) -> Any:
                 # longer fire, these are safe and must not be dropped — the
                 # candidate would hear a sentence cut off mid-clause.
                 for ready in pending:
-                    self._gate_stream_emitted = True
+                    if _chunk_text(ready):
+                        self._gate_stream_emitted = True
                     yield ready
                 pending.clear()
                 return

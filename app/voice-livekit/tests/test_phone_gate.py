@@ -5739,15 +5739,16 @@ class TestOpeningGenerationSeed(unittest.IsolatedAsyncioTestCase):
 
 
     async def test_the_scripted_opener_ROLLBACK_sends_no_opening_seed(self):
-        # `PHONE_DETERMINISTIC_OPENER=true` — the ROLLBACK since the 2026-09-11
-        # flip, no longer the default. The consent opening speaks the FIXED
-        # disclosure and runs NO model generation, so the `Hello?` seed is never
-        # sent. This guards the double-opener RCA at the session level: on this
-        # path nothing is authored that could contradict the fixed line.
+        # `PHONE_DETERMINISTIC_OPENER=true` — the DEFAULT. The consent opening
+        # speaks the FIXED disclosure and runs NO model generation, so the
+        # `Hello?` seed is never sent. This guards the double-opener RCA at the
+        # session level: on this path nothing is authored that could contradict
+        # the fixed line.
         #
-        # Set EXPLICITLY rather than unset. Popping the variable used to select
-        # scripted copy; since the flip it selects generation, so a pop here
-        # would silently invert what the test asserts.
+        # Set EXPLICITLY so the test names the behaviour it wants rather than
+        # inheriting it. `test_the_scripted_opener_is_what_an_UNSET_env_selects`
+        # below covers the unset case, so the pair distinguishes "the token
+        # works" from "the default happens to be this".
         seeds: list = []
 
         class _NoSeedProbe(_FakePhoneSession):
@@ -14860,6 +14861,248 @@ class TestConsentLatencyFixes(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(result.assessment_allowed)
         self.assertEqual(started["n"], 0)
+
+
+class TestUnsetEnvSelectsTheScriptedGate(unittest.IsolatedAsyncioTestCase):
+    """What a deployment with NOTHING configured actually speaks.
+
+    The 2026-09-11 flip briefly made `conversational` + generation the default,
+    and in doing so it changed the one session-level test that popped
+    `PHONE_DETERMINISTIC_OPENER` into one that sets it explicitly. The flip was
+    dropped, but the pop was not restored — leaving no test anywhere that
+    exercises the UNSET path end to end. That is the path a fresh or rebuilt
+    worker takes, and the one `fly secrets unset` rolls back to.
+
+    `setUpModule` pins the tokens for this file, so these pop them deliberately
+    and restore them afterwards.
+    """
+
+    def setUp(self):
+        _FakePhoneSession.instances = []
+        _FakePhoneSession.default_answers = ["Yes, that's fine.", "First answer."]
+        self._saved = {
+            name: os.environ.get(name)
+            for name in ("PHONE_GATE_FLOW", "PHONE_DETERMINISTIC_OPENER")
+        }
+        for name in self._saved:
+            os.environ.pop(name, None)
+
+    def tearDown(self):
+        for name, value in self._saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+
+    def test_the_readers_agree_with_the_documented_defaults(self):
+        # `.env.example` says "Default true" and "`deterministic` (DEFAULT)".
+        # A doc and a default that disagree is a defect this lane has shipped
+        # before — in the very commit that declared the variable.
+        self.assertTrue(phone.phone_deterministic_opener())
+        self.assertEqual(phone.phone_gate_flow(), "deterministic")
+
+    async def test_an_UNSET_deployment_speaks_the_FIXED_disclosure(self):
+        # End to end, not just the readers: no identity turn, no model-authored
+        # pre-consent speech, and the verified fixed disclosure on the wire.
+        ctx = FakeCtx(_PHONE_ROOM, participants=[_participant()])
+        client = FakeEventClient()
+
+        async def recording_seam():
+            return None
+
+        async def classifier(turns, say):
+            return phone.CLASSIFY_HUMAN
+
+        with patch.object(agent_mod, "AgentSession", _FakePhoneSession), \
+             patch.object(agent_mod, "persistence", MagicMock()), \
+             patch.object(
+                 agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
+             patch.object(
+                 agent_mod, "_phone_recording_permitted", new=recording_seam), \
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+            task = asyncio.ensure_future(agent_mod._run_phone_session(
+                ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
+                client=client, classifier=classifier))
+            await asyncio.sleep(0.02)
+            session = (_FakePhoneSession.instances[-1]
+                       if _FakePhoneSession.instances else None)
+            if session is not None and session.start_calls:
+                session.emit_close()
+            await asyncio.wait_for(task, timeout=10)
+
+        self.assertIsNotNone(session)
+        spoken = " ".join(session.spoken)
+        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, session.spoken,
+                      f"the fixed disclosure was not spoken: {session.spoken!r}")
+        # The identity turn is the conversational flow's, and must not appear.
+        self.assertNotIn("Am I speaking", spoken,
+                         f"an identity turn ran with nothing configured: {spoken!r}")
+
+
+class _LegDropsSession(_FakePhoneSession):
+    """A session whose leg drops the way the SDK reports it: mid-`say`.
+
+    `session.say` on a closed AgentSession raises a generic
+    `RuntimeError("AgentSession isn't running")`. Observed live 2026-09-11
+    06:11:06Z — the leg dropped 0.8 s after answer, the gate finished its
+    subscription wait, spoke, and the JOB CRASHED, skipping every terminal: no
+    event posted, the pre-consent recording never purged, the engagement left in
+    `dialing` for the reaper.
+    """
+
+    raise_on_say = True
+
+    def say(self, text, **kwargs):
+        if type(self).raise_on_say:
+            raise RuntimeError("AgentSession isn't running")
+        return super().say(text, **kwargs)
+
+
+class _FlakyPurgeClient(FakeEventClient):
+    """Fails the purge post ONCE, by returning a not-ok outcome.
+
+    Deliberately not by raising. `post_event` fails CLOSED — it returns an
+    outcome rather than throwing — which is why catching exceptions alone was a
+    guard that could not fire.
+    """
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.purge_posts = 0
+
+    async def post_event(self, attempt_id, event_type, *, epoch=None, session_id=None):
+        if event_type == "candidate.deferred_pre_disclosure":
+            self.purge_posts += 1
+            self.calls.append((attempt_id, event_type, {"epoch": epoch}))
+            if self.purge_posts == 1:
+                return phone.PhoneApiOutcome(False, "conflict")
+            return phone.PhoneApiOutcome(True, phone.EVENT_STATUS_APPLIED)
+        return await super().post_event(
+            attempt_id, event_type, epoch=epoch, session_id=session_id)
+
+
+class TestDroppedLegOnTheConversationalGate(unittest.IsolatedAsyncioTestCase):
+    """The dropped-leg guard and the purge post, driven on the REAL session path.
+
+    WHY THIS CLASS EXISTS, PRECISELY. A review agent once replaced
+    `except phone.PhoneParticipantGone:` at the gate call site with a
+    never-raised sentinel — disabling this guard entirely — and the mutation was
+    swept into a commit (`b1f5cde`, reverted in `2d634ca`) because the ENTIRE
+    1875-test suite stayed green. A later review confirmed it STILL stayed green
+    after the revert: nothing anywhere drove `_run_phone_session` with
+    `PHONE_GATE_FLOW=conversational`, `test_phone_gate.py` pins the scripted gate
+    module-wide, and `test_phone_conversational_gate.py` never imports `agent`.
+    `TestParticipantGoneMidGate` injects a `say` that already raises
+    `PhoneParticipantGone` into `phone.run_phone_gate`, which proves phone.py
+    does not swallow it — never that agent.py catches it.
+
+    So these drive the real `_run_phone_session`, with the conversational flow
+    on, and a `say` that raises what the SDK actually raises.
+    """
+
+    def setUp(self):
+        _FakePhoneSession.instances = []
+        _FakePhoneSession.default_answers = []
+        _LegDropsSession.raise_on_say = True
+        # The flow this branch adds, and the one no other test turns on. Fixed
+        # copy so the gate is deterministic; the crash is not about the wording.
+        patcher = patch.dict(os.environ, {
+            "PHONE_GATE_FLOW": "conversational",
+            "PHONE_DETERMINISTIC_OPENER": "true",
+        })
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    async def _run(self, client, session_cls=None):
+        # Parameterised, because `_run` patches `AgentSession` itself — an outer
+        # `patch.object` would be silently overridden by the inner one, and the
+        # test would pass for the wrong reason.
+        session_cls = session_cls or _LegDropsSession
+        ctx = FakeCtx(_PHONE_ROOM, participants=[_participant()])
+
+        async def recording_seam():
+            return None
+
+        async def classifier(turns, say):
+            return phone.CLASSIFY_HUMAN
+
+        with patch.object(agent_mod, "AgentSession", session_cls), \
+             patch.object(agent_mod, "persistence", MagicMock()), \
+             patch.object(
+                 agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
+             patch.object(
+                 agent_mod, "_phone_recording_permitted", new=recording_seam), \
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+            return await asyncio.wait_for(
+                agent_mod._run_phone_session(
+                    ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
+                    client=client, classifier=classifier,
+                ),
+                timeout=10,
+            )
+
+    async def test_a_dropped_leg_ENDS_the_call_instead_of_crashing_the_job(self):
+        # Kills the exact `b1f5cde` mutation: with the catch disabled, the
+        # translated `PhoneParticipantGone` escapes `_run_phone_session` and
+        # this await raises instead of returning a result.
+        client = FakeEventClient()
+        result = await self._run(client)
+        self.assertEqual(result.outcome, phone.GATE_PARTICIPANT_LEFT)
+
+    async def test_a_dropped_leg_POSTS_THE_PURGING_TERMINAL(self):
+        # Not crashing is only half of it. The egress starts at `call.answered`,
+        # BEFORE consent, and only a `PURGE_BEFORE_EVENTS` member destroys that
+        # audio. A guard that returns cleanly but posts nothing leaves a
+        # non-consenting person's recording in the bucket forever AND leaves the
+        # engagement in `dialing` to be redialled.
+        client = FakeEventClient()
+        await self._run(client)
+        posted = [event for _a, event, _kw in client.calls]
+        self.assertIn("candidate.deferred_pre_disclosure", posted, posted)
+
+    async def test_an_UNAPPLIED_purge_is_RETRIED_not_assumed(self):
+        # Kills `applied = True`. `post_event` fails CLOSED by returning a
+        # not-ok outcome rather than raising, so a `try/except` around it could
+        # never fire and an unpurged recording looked identical to a purged one.
+        client = _FlakyPurgeClient()
+        result = await self._run(client)
+        self.assertEqual(result.outcome, phone.GATE_PARTICIPANT_LEFT)
+        self.assertEqual(
+            client.purge_posts, 2,
+            "a not-ok purge outcome was treated as success",
+        )
+
+    async def test_the_purge_carries_the_EPOCH(self):
+        # Posted directly rather than through `_post_phone_event_with_retry`,
+        # which does not forward `epoch`. Every other terminal in this gate
+        # carries it, and dropping it changes which staleness rules the server
+        # applies.
+        client = FakeEventClient()
+        await self._run(client)
+        purges = [kw for _a, event, kw in client.calls
+                  if event == "candidate.deferred_pre_disclosure"]
+        self.assertTrue(purges)
+        self.assertEqual(purges[0].get("epoch"), _EPOCH)
+
+    async def test_an_UNRELATED_RuntimeError_still_surfaces(self):
+        # The translation matches the SDK's own wording narrowly. Widening it to
+        # every RuntimeError would close real faults — a wedged event loop, a
+        # programming error — as a routine hang-up, with a purging terminal and
+        # no trace of the actual bug.
+        class _OtherFault(_LegDropsSession):
+            def say(self, text, **kwargs):
+                raise RuntimeError("event loop is closed")
+
+        client = FakeEventClient()
+        with self.assertRaises(RuntimeError) as caught:
+            await self._run(client, session_cls=_OtherFault)
+        self.assertIn("event loop is closed", str(caught.exception))
+        self.assertNotIsInstance(caught.exception, phone.PhoneParticipantGone)
+        posted = [event for _a, event, _kw in client.calls]
+        self.assertNotIn(
+            "candidate.deferred_pre_disclosure", posted,
+            "a real fault was closed out as a routine hang-up",
+        )
 
 
 if __name__ == "__main__":
