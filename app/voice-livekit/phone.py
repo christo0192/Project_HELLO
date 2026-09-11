@@ -1192,8 +1192,11 @@ def phone_deterministic_opener() -> bool:
     the LLM-authored openers. Read at the call site with the literal name so the
     env-contract scanner sees it.
     """
-    return (os.getenv("PHONE_DETERMINISTIC_OPENER") or "true").strip().lower() not in (
-        "false", "0", "no", "off",
+    # DEFAULT FLIPPED 2026-09-11 (see `phone_gate_flow`): the model-authored
+    # openers are production. `false` is now the default, so ROLLBACK to scripted
+    # copy is an explicit `PHONE_DETERMINISTIC_OPENER=true`, not an unset.
+    return (os.getenv("PHONE_DETERMINISTIC_OPENER") or "false").strip().lower() in (
+        "true", "1", "yes", "on",
     )
 
 
@@ -1247,8 +1250,18 @@ def phone_gate_flow() -> str:
     ROLLBACK: unset, or set ``deterministic``. Read at the call site with the
     literal name so the env-contract scanner sees it.
     """
+    # DEFAULT FLIPPED 2026-09-11, after both stages were proven on live calls
+    # (owner test, candidate Christo Kingson): stage 1 and stage 2 each reached
+    # `disclosure.delivered`, the model-authored copy held every constraint, and
+    # the two defects those calls exposed — the barge-in barrier and the cold
+    # opening — are fixed in the same change as this flip.
+    #
+    # ROLLBACK IS NOW AN EXPLICIT SET, NOT AN UNSET:
+    #   fly secrets set PHONE_GATE_FLOW=deterministic
+    # Unsetting now selects the CONVERSATIONAL flow. That inversion is the whole
+    # point of writing it here rather than only in the runbook.
     value = (os.getenv("PHONE_GATE_FLOW") or "").strip().lower()
-    return "conversational" if value == "conversational" else "deterministic"
+    return "deterministic" if value == "deterministic" else "conversational"
 
 
 def phone_identity_mismatch_suppresses() -> bool:
@@ -5121,19 +5134,27 @@ async def run_phone_gate(
     # path from every other turn. Verification is now a REPAIR (see
     # `phone_identity_repair_text`), never a replacement.
     speak_gate_line: Optional[Callable[[str], Awaitable[Optional[str]]]] = None,
-    # Discard anything the STT has already queued. Called immediately BEFORE each
-    # gate question is spoken, so an utterance that predates a question can never
-    # be read as its answer.
+    # Anchor the question the gate is about to ask. Called immediately BEFORE
+    # each gate question, so a candidate final whose SPEECH STARTED earlier is
+    # never read as its answer.
     #
-    # THIS IS A CORRECTNESS FIX, NOT A TIDY-UP. `user_turns` is ONE FIFO and the
-    # identity reader and the consent classifier both take from it with a bare
-    # `get()`. STT is live from the moment the participant joins, so the callee's
-    # "Hello?" on pickup is ALREADY QUEUED when the gate starts speaking: the
-    # identity reader pops that, and the candidate's real identity answer is then
-    # popped by the CONSENT classifier. Draining at the moment a question STARTS
-    # is the correct boundary — it cannot eat a barge-in answer, which by
-    # definition arrives after the question began.
-    reset_turn_buffer: Optional[Callable[[], Any]] = None,
+    # THIS IS A CORRECTNESS FIX, NOT A TIDY-UP, and it is the SECOND attempt at
+    # one. `user_turns` is ONE FIFO that the identity reader and the consent
+    # classifier both take from with a bare `get()`, and STT is live from the
+    # moment the participant joins — so the callee's "Hello?" on pickup is
+    # already in flight when the gate starts speaking.
+    #
+    # The first attempt DRAINED the queue after the question finished playing.
+    # It fixed the stale pickup and broke something worse: a candidate answering
+    # over the question's tail had their reply discarded, the reader blocked to
+    # timeout, and the verdict failed open to `unclear`. Observed live
+    # 2026-09-11 — the stage-2 transcript has no candidate turn at all between
+    # the identity question and consent, so the identity check verified nothing.
+    #
+    # Arrival time cannot tell those two apart; both arrive after the question
+    # starts, because STT finalises late. SPEECH-START can. The agent filters at
+    # the producer against this anchor and keeps anything it cannot time.
+    mark_question_asked: Optional[Callable[[], Any]] = None,
     # The name on the application, used to address the candidate and as the
     # record side of the mismatch comparison.
     candidate_name: str | None = None,
@@ -5409,14 +5430,14 @@ async def run_phone_gate(
             else PHONE_DISCLOSURE_TEXT
         )
 
-    def _reset_turns() -> None:
-        """Drop anything STT queued before the question we are about to ask."""
-        if reset_turn_buffer is None:
+    def _ask_barrier() -> None:
+        """Anchor the question about to be asked. Never fails the gate."""
+        if mark_question_asked is None:
             return
         try:
-            reset_turn_buffer()
+            mark_question_asked()
         except Exception:  # noqa: BLE001
-            # A failed drain costs correctness, not the call: the worst case is
+            # A failed anchor costs correctness, not the call: the worst case is
             # the pre-existing shared-queue behaviour. Never fail the gate.
             pass
 
@@ -5435,18 +5456,19 @@ async def run_phone_gate(
         * NOTHING was spoken at all                       → `fixed_line`, which
           is safe precisely because no audio preceded it.
         """
-        # NOTE: there is deliberately NO drain here, before the question is
-        # generated. A first draft had one and it was the ONLY barrier — which
-        # did not close the window it was written for. STT is live from the
-        # moment the participant joins, the gate then spends a few hundred ms on
-        # `call.answered` and the durable-consent read, and the final for the
-        # callee's pickup "Hello?" lands during the generation and playout that
-        # follow. A drain placed here runs before all of that and misses it.
+        # THE BARRIER, and it goes HERE — before the question is produced, not
+        # after it finishes playing.
         #
-        # The drain that matters is after playout, immediately before we wait
-        # for a reply (below). It strictly subsumes this one — mutation testing
-        # confirmed removing this line changes no observable behaviour — so it
-        # is gone rather than left as a line no test can falsify.
+        # The anchor is compared against each utterance's SPEECH-START, so the
+        # earliest sensible placement is the correct one: the pickup "Hello?"
+        # began speaking long before the gate reached this line, so it predates
+        # this anchor and is rejected; a barge-in answer begins during the
+        # question's playout, which is AFTER this anchor, so it is kept.
+        #
+        # Anchoring after playout — the previous attempt — made a barge-in reply
+        # predate the anchor and be dropped, which is how the stage-2 identity
+        # check ended up verifying nothing on a live call.
+        _ask_barrier()
         spoken_line: str | None = None
         if speak_gate_line is not None:
             try:
@@ -5492,9 +5514,6 @@ async def run_phone_gate(
                 await _say(repair)
                 gate_turns.append({"speaker": "bot", "text": repair})
 
-        # THE BARRIER. Everything queued up to this instant predates the end
-        # of our question and therefore cannot be its answer.
-        _reset_turns()
         reply = ""
         try:
             reply = await next_candidate_turn()  # type: ignore[misc]
@@ -5595,10 +5614,15 @@ async def run_phone_gate(
 
     # The consent question is the next thing the candidate will hear, so its
     # answer window starts here — not wherever the identity answer left the
-    # shared queue. Deterministic flow keeps its exact current behaviour: this
-    # is a no-op there because nothing wires `reset_turn_buffer`.
+    # shared queue. Placed before `speak_opening` for the same reason as the
+    # identity barrier: the anchor is compared against speech-START, so it must
+    # precede the question, not follow its playout.
+    #
+    # Scoped to the conversational flow so the deterministic rollback stays
+    # byte-identical. There is no identity turn there, so nothing can have been
+    # left in the queue by one.
     if identity_ran:
-        _reset_turns()
+        _ask_barrier()
 
     # ── The opening: model-generated-and-verified, or the fixed disclosure ─
     if speak_opening is not None:
@@ -6720,6 +6744,66 @@ async def _default_phone_interviewer_text(instruction: str) -> str | None:
         return data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
         return None
+
+
+#: Bound on the Gemini connection warm-up. It runs off the speech path and is
+#: discarded, so the only cost of expiry is the cold turn it was avoiding.
+PHONE_GOOGLE_WARMUP_TIMEOUT_SEC = 6.0
+
+
+async def phone_warm_google_connection(
+    *, infer: Callable[[], Awaitable[Any]] | None = None,
+) -> None:
+    """Open the Gemini connection before the first spoken line. Never raises.
+
+    WHY THIS EXISTS. Measured on a live call 2026-09-11: 20 SECONDS from
+    `call.answered` to the identity line being spoken, on a conversational-flow
+    call whose first spoken line is a real generation. `phone_warm_prefix_cache`
+    — the warm-up that solves exactly this for the OpenAI-compat lane — is
+    deliberately SKIPPED on native Gemini, because it POSTs the full system
+    prompt and on Gemini that would send résumé facts to a provider the call had
+    not yet touched, for no caching benefit (flash-lite has no implicit cache).
+
+    So this warms the thing that IS worth warming and nothing else: the TLS
+    handshake, the connection and the SDK client. The prompt is the literal
+    string below — no résumé, no role, no name, no system prompt — so the
+    privacy objection that killed the earlier widening does not apply. One token
+    out, discarded.
+
+    Fires only when the interviewer actually is native Gemini; the OpenAI-compat
+    lane already has its own warm-up and would gain nothing.
+    """
+    if not phone_use_google_llm():
+        return
+    api_key = phone_llm_api_key()
+    if not api_key:
+        return
+    try:
+        if infer is not None:
+            await asyncio.wait_for(infer(), timeout=PHONE_GOOGLE_WARMUP_TIMEOUT_SEC)
+            return
+        from google import genai  # noqa: PLC0415
+        from google.genai import types as genai_types  # noqa: PLC0415
+
+        client = genai.Client(api_key=api_key)
+        await asyncio.wait_for(
+            client.aio.models.generate_content(
+                model=phone_primary_model(),
+                contents="hi",
+                config=genai_types.GenerateContentConfig(
+                    max_output_tokens=1,
+                    thinking_config=genai_types.ThinkingConfig(
+                        thinking_level="minimal"),
+                ),
+            ),
+            timeout=PHONE_GOOGLE_WARMUP_TIMEOUT_SEC,
+        )
+    except Exception:  # noqa: BLE001 — a cold turn is the only cost of failure.
+        return
+    _log.info(
+        "unknown_event", error_type="phone_google_warmup",
+        error_category="connection_warmed",
+    )
 
 
 def phone_prefix_warmup_enabled() -> bool:

@@ -6799,6 +6799,12 @@ async def _run_phone_session(
     # Candidate-only queue used exclusively by the pre-consent disclosure
     # classifier. Post-consent turns remain inside LiveKit AgentSession.
     user_turns: "asyncio.Queue[str]" = asyncio.Queue()
+    # The gate's CURRENT question, as a speech-start anchor in ms. Set when the
+    # gate begins asking, cleared when the gate returns. While set, a candidate
+    # final whose SPEECH STARTED before it is never enqueued -- see
+    # `on_candidate_turn`. `None` outside the gate, so the screening loop's own
+    # `latest_assistant_anchor` machinery is untouched.
+    gate_question_anchor: list[int | None] = [None]
     candidate_activity = asyncio.Event()
     agent_listening = asyncio.Event()
     agent_listening.set()
@@ -7422,9 +7428,42 @@ async def _run_phone_session(
 
     def on_candidate_turn(text: str, message: Any = None, turn_ctx: Any = None) -> None:
         candidate_activity.set()
-        user_turns.put_nowait(text)
+        # Liveness and an explicit hang-up request are honoured even for a turn
+        # the gate will not read: the person IS there, and "hang up" means hang
+        # up whenever it was said.
         if phone.is_explicit_end_call_request(text):
             candidate_end_requested.set()
+        # ── THE GATE'S QUESTION BARRIER ───────────────────────────────────
+        # Filter at the PRODUCER, by the utterance's own SPEECH-START time.
+        #
+        # The predecessor drained the queue after the question finished playing.
+        # That fixed the stale pickup "Hello?" and broke something worse: a
+        # candidate who answers OVER the question's tail had their reply
+        # discarded, the reader then blocked to timeout, and the identity verdict
+        # failed open to `unclear`. Observed live 2026-09-11 on the stage-2 call
+        # -- the transcript has NO candidate turn between the identity question
+        # and consent, and the model wrote "No worries if you're still getting
+        # settled", which is what it says when it received nothing. The identity
+        # check verified nothing on that call.
+        #
+        # Arrival time cannot separate those two cases: BOTH finals arrive after
+        # the question starts, because STT finalises late. SPEECH-START can, and
+        # `_turn_anchor_ms` already exposes it (the SDK's VAD
+        # `started_speaking_at`). The stale "Hello?" started speaking at pickup,
+        # before the question existed; a barge-in answer started during its
+        # playout. So compare starts, not arrivals.
+        #
+        # FAIL-OPEN: `_native_turn_predates_question` requires BOTH anchors to be
+        # real, so a message with no usable timing is KEPT. Losing a genuine
+        # answer is worse than reading a stale one.
+        anchor = gate_question_anchor[0]
+        if anchor is not None and _native_turn_predates_question(message, anchor):
+            _log.info(
+                "unknown_event", error_type="phone_gate_turn_barrier",
+                error_category="pre_question_turn_dropped",
+            )
+            return
+        user_turns.put_nowait(text)
 
     # Complete and immutable from construction. The exact owed question is
     # still supplied only per turn; this prompt carries role, resume,
@@ -7471,6 +7510,24 @@ async def _run_phone_session(
     # would POST the full system prompt, résumé facts included, to a second
     # provider that previously received nothing from this call. Reverted.
     _phone_prefix_warmup_off = (os.getenv("PHONE_PREFIX_WARMUP") or "").strip().lower() == "off"
+    # NATIVE GEMINI gets a connection warm-up instead of a prefix warm-up.
+    # Measured live 2026-09-11: 20 s from answer to the first spoken line on a
+    # conversational-flow call, because that line is a real generation against a
+    # cold connection. This opens the TLS/session with a one-token throwaway
+    # prompt carrying NO candidate data, so it buys the latency without the
+    # privacy cost that made the prefix warm-up wrong here. Detached and
+    # swallowed, exactly like its sibling below.
+    if (
+        phone.phone_prefix_warmup_enabled()
+        and not _phone_prefix_warmup_off
+        and phone.phone_use_google_llm()
+    ):
+        try:
+            _gwarm = asyncio.create_task(phone.phone_warm_google_connection())
+            _PHONE_WARMUP_TASKS.add(_gwarm)
+            _gwarm.add_done_callback(_PHONE_WARMUP_TASKS.discard)
+        except RuntimeError:
+            pass
     if (
         phone.phone_prefix_warmup_enabled()
         and not _phone_prefix_warmup_off
@@ -7707,31 +7764,24 @@ async def _run_phone_session(
             return None
         return await _speak_gate_generation(instructions)
 
-    def _drain_user_turns() -> None:
-        """Discard STT finals that predate the question we are about to ask.
+    def _mark_question_asked() -> None:
+        """Anchor the gate's current question at NOW (ms).
 
-        `user_turns` is ONE FIFO shared by `_next_candidate_turn` (the identity
-        reader) and `_classify_phone_answer` (the consent classifier), and both
-        take from it with a bare `get()`. STT is live from the moment the
-        participant joins, so on a real call the callee's "Hello?" on pickup is
-        ALREADY QUEUED before the gate speaks: the identity reader pops that, and
-        the candidate's actual identity answer is then popped by the CONSENT
-        classifier — which is how a "yes, this is Priya" became a consent grant.
-        The commit message on the first draft claimed "neither answer can land on
-        the other's parser"; that was false, the separation was a 15s timer.
+        Called by the gate as it begins each question. Everything about WHY this
+        is a speech-start anchor rather than a queue drain is in
+        `on_candidate_turn`.
 
-        Draining at the moment a question STARTS is the correct boundary. An
-        utterance that predates the question cannot be its answer, and a barge-in
-        answer — which by definition arrives after the question began — is never
-        dropped.
+        Anchoring at the moment the gate STARTS the question -- not when its
+        audio begins -- is deliberate and sufficient: the utterance this must
+        reject (the pickup "Hello?") started speaking seconds before the gate
+        reached this line at all, so it predates even the earliest anchor. Using
+        generation-start keeps the rule simple and never rejects a real answer.
         """
-        while True:
-            try:
-                user_turns.get_nowait()
-            except asyncio.QueueEmpty:
-                return
-            except Exception:  # noqa: BLE001
-                return
+        gate_question_anchor[0] = int(round(time.time() * 1000))
+
+    def _clear_question_anchor() -> None:
+        """Drop the barrier when the gate is done, so screening turns flow."""
+        gate_question_anchor[0] = None
 
     async def speak_opening() -> str | None:
         """Generate a warm, verified opening through the tool-less gate window.
@@ -8109,7 +8159,7 @@ async def _run_phone_session(
             # without a deploy, exactly like every other knob in this lane.
             next_candidate_turn=_next_candidate_turn,
             speak_gate_line=_speak_gate_line,
-            reset_turn_buffer=_drain_user_turns,
+            mark_question_asked=_mark_question_asked,
             candidate_name=getattr(instruction_state, "candidate_name", None),
         )
 
@@ -8150,6 +8200,12 @@ async def _run_phone_session(
         result = phone.PhoneGateResult(
             phone.GATE_PARTICIPANT_LEFT, events=[], spoken=[],
         )
+    finally:
+        # The barrier belongs to the GATE's questions only. Left set, a screening
+        # answer whose speech began before the last gate question would be
+        # silently dropped, and the screening loop has its own
+        # `latest_assistant_anchor` machinery for that job.
+        _clear_question_anchor()
 
 
     # Review repair: cancel a still-running role pre-render once the gate has

@@ -21,6 +21,43 @@ import asyncio
 import inspect
 import json
 import os
+
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _scripted_gate_by_default(request):
+    """Pin the SCRIPTED gate for this module unless a test opts out.
+
+    This file tests the phone SESSION — the Q&A loop, the goodbye ladder, the
+    silence prompts, the watchdog. The gate in front of it is a FIXTURE, not the
+    subject: these fixtures drive `run_phone_gate` without wiring an identity
+    answer, so under the 2026-09-11 default (conversational) they simply block
+    for the 15 s answer window and time out. 45 of them did.
+
+    Pinning the rollback tokens keeps each test exercising the thing it was
+    written for. It costs no coverage of the conversational gate: that path has
+    its own end-to-end suite in `test_phone_conversational_gate.py`, which drives
+    the real `run_phone_gate` and the real `llm_node`.
+
+    Opt out with `@pytest.mark.gate_flow_default` when the default itself is
+    what a test is about.
+    """
+    if request.node.get_closest_marker("gate_flow_default"):
+        yield
+        return
+    saved = {k: os.environ.get(k)
+             for k in ("PHONE_GATE_FLOW", "PHONE_DETERMINISTIC_OPENER")}
+    os.environ["PHONE_GATE_FLOW"] = "deterministic"
+    os.environ["PHONE_DETERMINISTIC_OPENER"] = "true"
+    try:
+        yield
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
 import re
 import sys
 import types
@@ -5694,11 +5731,16 @@ class TestOpeningGenerationSeed(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen.get("user_input"), "Hello?")
 
 
-    async def test_deterministic_opener_sends_no_opening_seed(self):
-        # Default (PHONE_DETERMINISTIC_OPENER on): the consent opening speaks the
-        # FIXED disclosure and runs NO model generation, so the `Hello?` opening
-        # seed is never sent. This guards the double-opener RCA at the session
-        # level — nothing is authored that could contradict the fixed line.
+    async def test_the_scripted_opener_ROLLBACK_sends_no_opening_seed(self):
+        # `PHONE_DETERMINISTIC_OPENER=true` — the ROLLBACK since the 2026-09-11
+        # flip, no longer the default. The consent opening speaks the FIXED
+        # disclosure and runs NO model generation, so the `Hello?` seed is never
+        # sent. This guards the double-opener RCA at the session level: on this
+        # path nothing is authored that could contradict the fixed line.
+        #
+        # Set EXPLICITLY rather than unset. Popping the variable used to select
+        # scripted copy; since the flip it selects generation, so a pop here
+        # would silently invert what the test asserts.
         seeds: list = []
 
         class _NoSeedProbe(_FakePhoneSession):
@@ -5722,7 +5764,7 @@ class TestOpeningGenerationSeed(unittest.IsolatedAsyncioTestCase):
              patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
              patch.object(agent_mod, "_phone_recording_permitted", new=recording_seam), \
              patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
-            os.environ.pop("PHONE_DETERMINISTIC_OPENER", None)
+            os.environ["PHONE_DETERMINISTIC_OPENER"] = "true"
             await asyncio.wait_for(
                 agent_mod._run_phone_session(
                     ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
@@ -14558,24 +14600,31 @@ class TestDeveloperRoleRewriteWiring(unittest.IsolatedAsyncioTestCase):
 
 
 class TestDeterministicOpenerFlag(unittest.TestCase):
-    """PHONE_DETERMINISTIC_OPENER defaults ON; only the literal `false` disables."""
+    """Since 2026-09-11 the model-authored openers are the DEFAULT.
 
-    def test_default_on_and_off_tokens_disable(self):
+    The flip followed two live owner-test calls in which both stages reached
+    `disclosure.delivered`. Scripted copy is now the ROLLBACK and needs an
+    explicit `true` — an unset selects generation. These tests pin the
+    inversion, because the failure mode of getting it wrong is silent: an
+    operator who believes `unset` still means scripted would ship generation.
+    """
+
+    def test_scripted_copy_needs_an_EXPLICIT_true(self):
         for value, expected in (
-            # ON: unset/empty, truthy tokens, and anything unrecognised
-            ("", True), ("true", True), ("TRUE", True), ("on", True),
-            ("1", True), ("yes", True), ("garbage", True),
-            # OFF: the explicit off tokens (case-insensitive, trimmed)
-            ("false", False), ("FALSE", False), (" false ", False),
-            ("0", False), ("no", False), ("off", False), ("OFF", False),
+            # ON (scripted rollback): only the explicit truthy tokens
+            ("true", True), ("TRUE", True), (" true ", True), ("on", True),
+            ("1", True), ("yes", True),
+            # OFF (generation, the default): unset/empty and anything else
+            ("", False), ("false", False), ("FALSE", False), ("0", False),
+            ("no", False), ("off", False), ("garbage", False),
         ):
             with patch.dict(phone.os.environ, {"PHONE_DETERMINISTIC_OPENER": value}):
                 self.assertEqual(phone.phone_deterministic_opener(), expected, value)
 
-    def test_unset_defaults_on(self):
+    def test_unset_now_defaults_to_GENERATION(self):
         with patch.dict(phone.os.environ, {}, clear=False):
             phone.os.environ.pop("PHONE_DETERMINISTIC_OPENER", None)
-            self.assertTrue(phone.phone_deterministic_opener())
+            self.assertFalse(phone.phone_deterministic_opener())
 
 
 class TestJudgeAuthFailureHonest(unittest.IsolatedAsyncioTestCase):

@@ -89,35 +89,40 @@ setup that is live today**, so merging changes nothing until they are set. Unlik
 §2z these are `[env]` defaults in code, not secrets, so they CAN be read back —
 but the staging order matters, so it is recorded.
 
+> **DEFAULTS FLIPPED 2026-09-11.** Stage 2 is now PRODUCTION, after both stages
+> were proven on live owner-test calls. **An unset flag now selects the
+> conversational, model-authored gate.** Rolling back is an EXPLICIT SET, not an
+> unset — `fly secrets unset` no longer returns you to the scripted gate.
+
 | Stage | `PHONE_GATE_FLOW` | `PHONE_DETERMINISTIC_OPENER` | What the candidate hears |
 |---|---|---|---|
-| 0 (today, and the rollback target) | unset / `deterministic` | unset / `true` | Fixed disclosure → fixed role line → Q1 |
-| 1 | `conversational` | unset / `true` | Fixed identity ask → fixed consent → fixed role → Q1 |
-| 2 | `conversational` | `false` | Model-authored identity ask, consent and role line, all streamed |
+| 2 (**DEFAULT**, production) | unset / `conversational` | unset / `false` | Model-authored identity ask, consent and role line, all streamed |
+| 1 (partial rollback) | unset / `conversational` | **`true`** | Fixed identity ask → fixed consent → fixed role → Q1 |
+| 0 (full rollback) | **`deterministic`** | **`true`** | Fixed disclosure → fixed role line → Q1 |
 
 Stage 1 exists on purpose: it proves the new turn ORDER, the identity classifier
 and the turn-buffer barrier on a live call **without** switching on
 model-authored pre-consent speech. Do not skip it.
 
-**To enable stage 1, then stage 2:**
+**Proven live 2026-09-11** (owner test, candidate Christo Kingson). Both stages
+reached `disclosure.delivered`; the model-authored copy kept recording and the
+job out of the identity turn and introduced Christy exactly once. The two
+defects those calls exposed — a barge-in identity answer being dropped, and a
+20 s cold opening — are fixed, so no staged enable is needed any more. A fresh
+deployment gets stage 2 with no secrets set at all.
+
+**To roll all the way back to the scripted gate:**
 
 ```
-fly secrets set PHONE_GATE_FLOW=conversational --app project-hello-phone-voice
-# listen to a call, then:
-fly secrets set PHONE_DETERMINISTIC_OPENER=false --app project-hello-phone-voice
+fly secrets set PHONE_GATE_FLOW=deterministic \
+                PHONE_DETERMINISTIC_OPENER=true \
+                --app project-hello-phone-voice
 ```
 
-**To roll all the way back to the 2026-09-10 production setup:**
-
-```
-fly secrets unset PHONE_GATE_FLOW PHONE_DETERMINISTIC_OPENER \
-                  --app project-hello-phone-voice
-```
-
-Unsetting is the true rollback: both readers default to the current behaviour, so
-the gate returns to the fixed disclosure with no identity turn and no
-pre-consent generation. Secrets-only, so it needs no deploy and no revert, and it
-works even if later code has shipped.
+**DO NOT `fly secrets unset` to roll back.** Since the 2026-09-11 flip an unset
+selects the conversational, model-authored gate — unsetting would move you
+FORWARD, not back. The rollback is secrets-only and needs no deploy, but it must
+name both tokens explicitly.
 
 A third flag, `PHONE_IDENTITY_MISMATCH_SUPPRESSES`, defaults to **off**. Both
 settings post a real purging terminal event; the only difference is whether a

@@ -26,6 +26,7 @@ was green while the feature was unshippable.
 
 import asyncio
 import os
+import time
 import types
 import unittest
 from unittest import mock
@@ -269,6 +270,7 @@ class TestGateFlowFlag(unittest.TestCase):
         self._saved = {
             k: os.environ.get(k) for k in (
                 "PHONE_GATE_FLOW", "PHONE_IDENTITY_MISMATCH_SUPPRESSES",
+                "PHONE_DETERMINISTIC_OPENER",
             )
         }
         for k in self._saved:
@@ -281,16 +283,29 @@ class TestGateFlowFlag(unittest.TestCase):
             else:
                 os.environ[k] = v
 
-    def test_unset_is_deterministic(self):
-        self.assertEqual(phone.phone_gate_flow(), "deterministic")
+    def test_unset_is_CONVERSATIONAL_since_the_2026_09_11_flip(self):
+        # The flip is the product decision; this pins the INVERSION so nobody
+        # reads the old runbook and assumes `unset` still means scripted.
+        self.assertEqual(phone.phone_gate_flow(), "conversational")
+        self.assertFalse(phone.phone_deterministic_opener())
 
-    def test_only_the_exact_token_enables_it(self):
-        for raw in ("conversational", "  Conversational  ", "CONVERSATIONAL"):
-            os.environ["PHONE_GATE_FLOW"] = raw
-            self.assertEqual(phone.phone_gate_flow(), "conversational", raw)
-        for raw in ("", "yes", "true", "1", "convo", "deterministic"):
+    def test_rollback_needs_an_EXPLICIT_token_not_an_unset(self):
+        for raw in ("deterministic", "  Deterministic  ", "DETERMINISTIC"):
             os.environ["PHONE_GATE_FLOW"] = raw
             self.assertEqual(phone.phone_gate_flow(), "deterministic", raw)
+        # Anything else — including the tokens an operator might guess — leaves
+        # the conversational flow in place.
+        for raw in ("", "yes", "true", "1", "convo", "off", "conversational"):
+            os.environ["PHONE_GATE_FLOW"] = raw
+            self.assertEqual(phone.phone_gate_flow(), "conversational", raw)
+
+    def test_the_scripted_opener_rollback_is_also_an_explicit_token(self):
+        for raw in ("true", "1", "YES", " on "):
+            os.environ["PHONE_DETERMINISTIC_OPENER"] = raw
+            self.assertTrue(phone.phone_deterministic_opener(), raw)
+        for raw in ("", "false", "0", "no", "off", "maybe"):
+            os.environ["PHONE_DETERMINISTIC_OPENER"] = raw
+            self.assertFalse(phone.phone_deterministic_opener(), raw)
 
     def test_suppression_is_off_unless_explicitly_enabled(self):
         # Default OFF. Both settings post a purging terminal, so the purge is
@@ -392,7 +407,18 @@ class _GateHarness:
         # asked. It arrives after the drain by construction, which is what makes
         # "the barrier ate the real answer" a failure this harness can actually
         # observe rather than one it defines away.
-        self.queue: list[str] = []
+        # Stale utterances, each with the ms at which its SPEECH STARTED.
+        # Production filters these at the producer (`on_candidate_turn`) by
+        # comparing that start against the question anchor; the harness applies
+        # the same rule at the reader, which is observably identical.
+        self.queue: list[tuple[str, int]] = []
+        self.anchor_ms: int | None = None
+        # A monotonic tick, not a wall clock. Production compares real
+        # millisecond speech-start anchors; in a test that runs in under a
+        # millisecond those collide, and a collision silently turns the
+        # assertion into "kept" regardless of the code. A counter models the
+        # ORDERING the rule actually depends on.
+        self._tick = 0
         self.replies: list[str] = list(replies)
         self.verdicts: list[str] = list(verdicts)
         self.generated = generated
@@ -400,17 +426,21 @@ class _GateHarness:
         self.consent_saw: str | None = None
 
     async def next_candidate_turn(self) -> str:
-        if self.queue:
-            # A stale utterance survived the barrier — the bug.
-            return self.queue.pop(0)
+        while self.queue:
+            text, started_ms = self.queue.pop(0)
+            if self.anchor_ms is not None and started_ms < self.anchor_ms:
+                continue          # predates the question — correctly rejected
+            return text           # began after the question — a real answer
         return self.replies.pop(0) if self.replies else ""
 
-    def reset_turn_buffer(self) -> None:
-        # UNCONDITIONAL, exactly like production `_drain_user_turns`. A
-        # selective drain keyed on a prefix the test itself writes would model a
-        # friendlier world than the one the code runs in: a production drain
-        # that dropped only *some* items would still be green.
-        self.queue = []
+    def speech(self, text: str) -> None:
+        """Record an utterance as starting NOW (relative to the anchor)."""
+        self._tick += 1
+        self.queue.append((text, self._tick))
+
+    def mark_question_asked(self) -> None:
+        self._tick += 1
+        self.anchor_ms = self._tick
 
     async def say(self, text: str) -> None:
         self.spoken.append(text)
@@ -491,7 +521,7 @@ class TestGateIdentityFlow(unittest.IsolatedAsyncioTestCase):
             epoch=1,
             next_candidate_turn=harness.next_candidate_turn,
             speak_gate_line=harness.speak_gate_line,
-            reset_turn_buffer=harness.reset_turn_buffer,
+            mark_question_asked=harness.mark_question_asked,
             candidate_name=NAME,
         )
         kwargs.update(overrides)
@@ -665,7 +695,7 @@ class TestGateIdentityFlow(unittest.IsolatedAsyncioTestCase):
         # identity reader pops THAT and the real identity answer is popped by
         # the CONSENT classifier.
         h = _GateHarness(replies=["Yes, this is Priya."], verdicts=["self"])
-        h.queue.append("Hello?")   # already finalised when the gate starts
+        h.speech("Hello?")   # spoken at pickup, BEFORE any question
         seen = []
 
         async def _spy(prompt):
@@ -678,23 +708,49 @@ class TestGateIdentityFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Yes, this is Priya.", seen[0])
         self.assertNotIn("Hello?", seen[0])
 
-    async def test_an_utterance_arriving_DURING_the_question_is_not_its_answer(self):
-        # THE WINDOW THE FIRST BARRIER MISSED. STT is live from pickup, so the
-        # callee's "Hello?" is usually still in flight when the turn begins: its
-        # final lands while the question is generating and playing, i.e. AFTER a
-        # drain placed before generation. Only a drain after playout — right
-        # before we wait for a reply — actually closes it.
-        h = _GateHarness(replies=["Yes, this is Priya."], verdicts=["self"])
+    async def test_an_answer_spoken_OVER_the_question_is_KEPT(self):
+        # THE LIVE DEFECT, 2026-09-11. The first barrier drained the queue AFTER
+        # playout, so a candidate who answered over the question's tail had the
+        # reply discarded; the reader blocked to timeout and the verdict failed
+        # open to `unclear`. The stage-2 transcript had NO candidate turn between
+        # the identity question and consent, so the check verified nothing.
+        #
+        # Speech that STARTS after the question was asked is an answer, however
+        # early it lands. It must survive.
+        h = _GateHarness(replies=[], verdicts=["self"])
         real_speak = h.speak_gate_line
 
-        async def _speak_then_stt(instruction):
+        async def _speak_then_bargein(instruction):
             out = await real_speak(instruction)
-            # The pickup "Hello?" finalises mid-playout — AFTER any drain that
-            # ran before generation began.
-            h.queue.insert(0, "Hello?")
+            h.speech("Yes, this is Priya.")     # starts AFTER the anchor
             return out
 
-        h.speak_gate_line = _speak_then_stt
+        h.speak_gate_line = _speak_then_bargein
+        seen = []
+
+        async def _spy(prompt):
+            seen.append(prompt)
+            return "self"
+
+        h.infer = _spy
+        await self._gate(h)
+        self.assertEqual(len(seen), 1, "the barge-in answer was dropped")
+        self.assertIn("Yes, this is Priya.", seen[0])
+
+    async def test_a_stale_utterance_and_a_barge_in_are_told_apart(self):
+        # Both land after the question STARTS; only their speech-start differs.
+        # Arrival time cannot separate them, which is exactly why the first
+        # attempt could not get both cases right at once.
+        h = _GateHarness(replies=[], verdicts=["self"])
+        h.speech("Hello?")                      # before the anchor
+        real_speak = h.speak_gate_line
+
+        async def _speak_then_bargein(instruction):
+            out = await real_speak(instruction)
+            h.speech("Yeah, Priya speaking.")   # after the anchor
+            return out
+
+        h.speak_gate_line = _speak_then_bargein
         seen = []
 
         async def _spy(prompt):
@@ -704,8 +760,9 @@ class TestGateIdentityFlow(unittest.IsolatedAsyncioTestCase):
         h.infer = _spy
         await self._gate(h)
         self.assertEqual(len(seen), 1)
-        self.assertIn("Yes, this is Priya.", seen[0])
+        self.assertIn("Yeah, Priya speaking.", seen[0])
         self.assertNotIn("Hello?", seen[0])
+
 
     async def test_the_gate_transcript_is_bounded_to_what_the_server_accepts(self):
         # The route (`.max(6)`) and the RPC (`invalid_turns`) both refuse more
@@ -759,7 +816,7 @@ class TestGateIdentityFlow(unittest.IsolatedAsyncioTestCase):
             out = await real_next()
             if not fired:
                 fired.append(1)
-                h.queue.append("...how can I help?")
+                h.speech("...how can I help?")
             return out
 
         h.next_candidate_turn = _next_then_trailing
@@ -769,27 +826,27 @@ class TestGateIdentityFlow(unittest.IsolatedAsyncioTestCase):
             f"the consent turn consumed the wrong utterance: {h.consent_saw!r}",
         )
 
-    async def test_the_consent_turn_starts_from_a_drained_buffer(self):
+    async def test_the_consent_question_gets_its_own_anchor(self):
         h = _GateHarness(replies=["Yes, this is Priya."], verdicts=["self"])
-        drains = []
-        real = h.reset_turn_buffer
+        anchors = []
+        real = h.mark_question_asked
 
         def _counting():
-            drains.append(len(h.spoken))
+            anchors.append(len(h.spoken))
             real()
 
-        h.reset_turn_buffer = _counting
+        h.mark_question_asked = _counting
         await self._gate(h)
-        # ORDERING, not a count. A drain must fall between the identity answer
-        # and the consent disclosure, which means one has to happen when at
-        # least one line has been spoken and before the disclosure is. Counting
-        # drains alone would pass on two drains in the wrong places.
-        self.assertTrue(drains, "nothing drained at all")
-        spoken_before_disclosure = h.spoken.index(
+        # ORDERING, not a count. One anchor must fall between the identity
+        # answer and the consent disclosure, or the consent classifier inherits
+        # the identity question's window. Counting alone would pass on two
+        # anchors in the wrong places.
+        self.assertTrue(anchors, "no question was ever anchored")
+        before_disclosure = h.spoken.index(
             phone.PHONE_DISCLOSURE_CONTINUATION_TEXT)
         self.assertTrue(
-            any(0 < d <= spoken_before_disclosure for d in drains),
-            f"no drain between the identity answer and the disclosure: {drains}",
+            any(0 < a <= before_disclosure for a in anchors),
+            f"no anchor between the identity answer and the disclosure: {anchors}",
         )
 
 
@@ -822,7 +879,7 @@ class TestGateSpokenLineRepair(unittest.IsolatedAsyncioTestCase):
                 session_id="s1",
                 next_candidate_turn=h.next_candidate_turn,
                 speak_gate_line=h.speak_gate_line,
-                reset_turn_buffer=h.reset_turn_buffer,
+                mark_question_asked=h.mark_question_asked,
                 candidate_name=NAME,
             )
         return h
@@ -875,16 +932,21 @@ class TestDeterministicFlowIsUntouched(unittest.IsolatedAsyncioTestCase):
 
     def setUp(self):
         self._saved = os.environ.get("PHONE_GATE_FLOW")
-        os.environ.pop("PHONE_GATE_FLOW", None)
+        # EXPLICIT now. Since the 2026-09-11 flip an unset selects the
+        # conversational flow, so a test of the rollback path must set the
+        # rollback token — popping it would silently test the new default.
+        os.environ["PHONE_GATE_FLOW"] = "deterministic"
 
     def tearDown(self):
-        if self._saved is not None:
+        if self._saved is None:
+            os.environ.pop("PHONE_GATE_FLOW", None)
+        else:
             os.environ["PHONE_GATE_FLOW"] = self._saved
 
-    async def test_no_identity_turn_no_drain_no_classifier_call(self):
+    async def test_no_identity_turn_no_anchor_no_classifier_call(self):
         h = _GateHarness(replies=["Yes, this is Priya."], verdicts=["other_person"])
-        drained = []
-        h.reset_turn_buffer = lambda: drained.append(1)
+        anchored = []
+        h.mark_question_asked = lambda: anchored.append(1)
         spoke_gate_line = []
 
         async def _spy_line(_i):
@@ -906,11 +968,11 @@ class TestDeterministicFlowIsUntouched(unittest.IsolatedAsyncioTestCase):
                 session_id="s1",
                 next_candidate_turn=h.next_candidate_turn,
                 speak_gate_line=h.speak_gate_line,
-                reset_turn_buffer=h.reset_turn_buffer,
+                mark_question_asked=h.mark_question_asked,
                 candidate_name=NAME,
             )
         self.assertEqual(spoke_gate_line, [])
-        self.assertEqual(drained, [], "the deterministic gate keeps its exact behaviour")
+        self.assertEqual(anchored, [], "the deterministic gate keeps its exact behaviour")
         self.assertNotIn(phone.phone_identity_text(NAME), h.spoken)
         self.assertIn(phone.PHONE_DISCLOSURE_TEXT, h.spoken)
         self.assertEqual(result.outcome, phone.CLASSIFY_HUMAN)
@@ -961,7 +1023,7 @@ class TestParticipantGoneMidGate(unittest.IsolatedAsyncioTestCase):
                     epoch=1,
                     next_candidate_turn=h.next_candidate_turn,
                     speak_gate_line=h.speak_gate_line,
-                    reset_turn_buffer=h.reset_turn_buffer,
+                    mark_question_asked=h.mark_question_asked,
                     candidate_name=NAME,
                 )
 
