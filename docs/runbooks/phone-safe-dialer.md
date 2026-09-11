@@ -99,6 +99,24 @@ Stage 1 exists on purpose: it proves the new turn ORDER, the identity classifier
 and the turn-buffer barrier on a live call **without** switching on
 model-authored pre-consent speech. Do not skip it.
 
+**Both stages ran clean on live owner-test calls 2026-09-11** (candidate Christo
+Kingson): each reached `disclosure.delivered`, the model-authored copy kept
+recording and the job out of the identity turn, and Christy introduced herself
+exactly once. PRODUCTION now runs stage 2 by secret.
+
+The code DEFAULTS deliberately stay at stage 0. A flip was drafted and dropped
+on review: it gains nothing production does not already have, and costs two
+things — a mistyped rollback token would fail OPEN (`determinstic` selects the
+conversational gate), and a fresh or rebuilt deployment would speak
+model-authored copy before consent with nothing configured. `fly secrets unset`
+therefore remains a true rollback.
+
+(A third reason given when the flip was dropped — "no test exercises `agent.py`
+with the conversational gate on" — no longer holds:
+`TestDroppedLegOnTheConversationalGate` and `TestUnsetEnvSelectsTheScriptedGate`
+now drive `_run_phone_session` on both sides of the flag. The first two reasons
+stand on their own.)
+
 **To enable stage 1, then stage 2:**
 
 ```
@@ -170,7 +188,7 @@ be undone by reverting code:
   reads it unless the gate window opens, which needs both flags. Failures are
   swallowed, so a call that armed and one that did not look identical;
 - `agent.py` — `run_phone_gate` is now called unconditionally with
-  `speak_gate_line=` / `reset_turn_buffer=`, and `_compose_gate_line` is gone. A
+  `speak_gate_line=` / `mark_question_asked=`, and `_compose_gate_line` is gone. A
   worker running a mismatched `agent.py`/`phone.py` pair is a `TypeError`, and no
   flag undoes that: deploy them together;
 - `agent.py` — `_await_output_subscription()` now also runs on the deterministic

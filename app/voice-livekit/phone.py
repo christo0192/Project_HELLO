@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import functools
 import hashlib
 import inspect
 import json
@@ -1192,6 +1193,10 @@ def phone_deterministic_opener() -> bool:
     the LLM-authored openers. Read at the call site with the literal name so the
     env-contract scanner sees it.
     """
+    # Default stays ON (scripted). See `phone_gate_flow` for why the 2026-09-11
+    # flip was dropped: production selects the authored openers by SECRET, so an
+    # unconfigured deployment keeps the verified-by-construction copy and a
+    # mistyped rollback token still fails safe.
     return (os.getenv("PHONE_DETERMINISTIC_OPENER") or "true").strip().lower() not in (
         "false", "0", "no", "off",
     )
@@ -1247,6 +1252,19 @@ def phone_gate_flow() -> str:
     ROLLBACK: unset, or set ``deterministic``. Read at the call site with the
     literal name so the env-contract scanner sees it.
     """
+    # THE DEFAULT DELIBERATELY STAYS `deterministic`, and production runs the
+    # conversational gate through an explicit SECRET instead.
+    #
+    # A flip was drafted 2026-09-11 after both stages ran clean on live calls,
+    # and was dropped on review. Flipping costs nothing to gain — production is
+    # already conversational by secret — and buys three hazards: a typo'd
+    # rollback token would fail OPEN (`determinstic` -> conversational, where
+    # today every typo falls back to the scripted gate); a fresh or rebuilt
+    # deployment would speak model-authored copy before consent with nothing
+    # configured; and no test in this repository exercises `agent.py` with the
+    # conversational gate on, so the shipped default would be the untested one.
+    #
+    # Flip it when those are addressed, not before.
     value = (os.getenv("PHONE_GATE_FLOW") or "").strip().lower()
     return "conversational" if value == "conversational" else "deterministic"
 
@@ -3257,19 +3275,35 @@ _A0_LEADING_SEGMENT_MAX_CHARS = 48
 #: server-side: `phone-worker.ts` (`.max(6)`) and 0067 (`invalid_turns`).
 _GATE_TURNS_MAX = 6
 
-#: The gate window's LAST-RESORT release point, used only when a generation
-#: produces no punctuation at all. Far above `_A0_LEADING_SEGMENT_MAX_CHARS`
-#: because the gate releases on a boundary, not on a cap — the cap here exists
-#: solely so a pathological boundary-less stream cannot hold audio indefinitely.
-_GATE_LEAK_HARD_CAP_CHARS = 400
-
-#: The gate-window leak veto must hold at least this many words before it can
-#: release. `phone_instruction_echo_detected` compares SIX-word windows and
-#: returns False outright when either side has fewer than six tokens, so a veto
-#: that released on the first clause boundary — which for "Hi, this is Christy,"
-#: is four words — could never fire. The check is only real once the segment is
-#: long enough for the detector to see a window.
-_GATE_LEAK_MIN_TOKENS = 6
+#: The gate window's release cap — DELIBERATELY the same as
+#: `_A0_LEADING_SEGMENT_MAX_CHARS`, so a gate line starts speaking at the same
+#: point a screening turn would.
+#:
+#: It was briefly 400 (release only at a punctuation boundary), to give the
+#: six-word echo detector more text to look at. Measured, that cost roughly
+#: EIGHT TIMES the lead-in: on "Hi there, good morning! This is Christy calling
+#: from Interview Kickstart. Am I speaking with Christo?" a screening turn
+#: starts speaking after "Hi there," (9 chars) and the gate held 73 — a second
+#: or more of extra dead air, on the one turn a candidate has no context for,
+#: and the owner heard it on a live stage-2 call.
+#:
+#: THE TOKEN FLOOR THAT WENT WITH IT DID MORE THAN IT LOOKED LIKE, and removing
+#: it alone reopened a real leak. Sitting BEFORE the boundary test, it forced the
+#: hold past the first comma to the NEXT boundary — the end of the first sentence
+#: — which is exactly where `phone_instruction_echo_detected` has a full six-word
+#: window. Dropping it collapsed the check window from "first sentence" to "first
+#: comma", and since production streams token by token, the detector could no
+#: longer fire before words one to five of a recital were already spoken.
+#: Reproduced by driving the real `llm_node`: "Senior Data Engineer at Infosys, "
+#: reached the caller, while the identical line fed as ONE chunk was vetoed with
+#: no audio.
+#:
+#: So the hold is now targeted instead of unconditional:
+#: `phone_control_run_forming` keeps holding only while the tail is PART-WAY
+#: through a control run. A clean line has no such run and releases here, at the
+#: same point a screening turn does; a recital is held until the detector can see
+#: it. That buys back the lead-in without paying for it in résumé words.
+_GATE_LEAK_HARD_CAP_CHARS = _A0_LEADING_SEGMENT_MAX_CHARS
 
 
 async def _achain(prefix_items: list[Any], rest: Any) -> Any:
@@ -4517,6 +4551,32 @@ _OUTCOME_CLOSING: dict[str, str] = {
 GATE_NO_PARTICIPANT = "no_participant"
 GATE_PARTICIPANT_LEFT = "participant_left"
 
+
+class PhoneParticipantGone(Exception):
+    """The callee's leg ended while the gate was mid-await. NOT an error.
+
+    Raised by the injected `say` when the AgentSession has already closed, and
+    caught once at the gate's call site.
+
+    WHY THIS EXISTS. Every spoken gate line sits behind an await that can
+    outlast the call: the bounded SIP output-subscription wait, a generation, a
+    playout. If the leg drops inside one of those windows, the next
+    `session.say` raises `RuntimeError("AgentSession isn't running")` — an
+    UNHANDLED exception that kills the job entrypoint. Observed live on
+    2026-09-11 06:11:06Z: the leg dropped 0.8 s after answer, the gate finished
+    its 8 s subscription wait, spoke, and crashed.
+
+    The crash is the expensive part, not the hang-up. It skips every terminal
+    path, so NO event is posted — which means the pre-consent recording is
+    never purged (only a `PURGE_BEFORE_EVENTS` member destroys it) and the
+    engagement is left in `dialing` for the lease reaper. A dropped call is
+    ordinary; leaving unconsented audio behind because of one is not.
+
+    A dedicated type rather than catching `RuntimeError` broadly: the SDK
+    raises that for several unrelated conditions, and swallowing all of them
+    here would hide real faults behind a routine one.
+    """
+
 # ── Bounce-mode answer wait ───────────────────────────────────────────
 # In answer-first origination the SIP participant is present ~1 s after
 # dispatch, before the real candidate has answered, so the gate cannot treat
@@ -5095,19 +5155,27 @@ async def run_phone_gate(
     # path from every other turn. Verification is now a REPAIR (see
     # `phone_identity_repair_text`), never a replacement.
     speak_gate_line: Optional[Callable[[str], Awaitable[Optional[str]]]] = None,
-    # Discard anything the STT has already queued. Called immediately BEFORE each
-    # gate question is spoken, so an utterance that predates a question can never
-    # be read as its answer.
+    # Anchor the question the gate is about to ask. Called immediately BEFORE
+    # each gate question, so a candidate final whose SPEECH STARTED earlier is
+    # never read as its answer.
     #
-    # THIS IS A CORRECTNESS FIX, NOT A TIDY-UP. `user_turns` is ONE FIFO and the
-    # identity reader and the consent classifier both take from it with a bare
-    # `get()`. STT is live from the moment the participant joins, so the callee's
-    # "Hello?" on pickup is ALREADY QUEUED when the gate starts speaking: the
-    # identity reader pops that, and the candidate's real identity answer is then
-    # popped by the CONSENT classifier. Draining at the moment a question STARTS
-    # is the correct boundary — it cannot eat a barge-in answer, which by
-    # definition arrives after the question began.
-    reset_turn_buffer: Optional[Callable[[], Any]] = None,
+    # THIS IS A CORRECTNESS FIX, NOT A TIDY-UP, and it is the SECOND attempt at
+    # one. `user_turns` is ONE FIFO that the identity reader and the consent
+    # classifier both take from with a bare `get()`, and STT is live from the
+    # moment the participant joins — so the callee's "Hello?" on pickup is
+    # already in flight when the gate starts speaking.
+    #
+    # The first attempt DRAINED the queue after the question finished playing.
+    # It fixed the stale pickup and broke something worse: a candidate answering
+    # over the question's tail had their reply discarded, the reader blocked to
+    # timeout, and the verdict failed open to `unclear`. Observed live
+    # 2026-09-11 — the stage-2 transcript has no candidate turn at all between
+    # the identity question and consent, so the identity check verified nothing.
+    #
+    # Arrival time cannot tell those two apart; both arrive after the question
+    # starts, because STT finalises late. SPEECH-START can. The agent filters at
+    # the producer against this anchor and keeps anything it cannot time.
+    mark_question_asked: Optional[Callable[[], Any]] = None,
     # The name on the application, used to address the candidate and as the
     # record side of the mismatch comparison.
     candidate_name: str | None = None,
@@ -5193,7 +5261,22 @@ async def run_phone_gate(
                 events.append(event_type)
         closing = _OUTCOME_CLOSING.get(decision)
         if closing is not None:
-            await _say(closing)
+            try:
+                await _say(closing)
+            except PhoneParticipantGone:
+                # The event is ALREADY posted — this block posts before it
+                # speaks, deliberately, so the purge precedes the terminal. The
+                # closing line is courtesy; a hang-up during it is the expected
+                # ending, not a failure. Letting it propagate would reach the
+                # call site's participant-gone handler and post
+                # `candidate.deferred_pre_disclosure` as a SECOND terminal for
+                # the same attempt — on the commonest refusal path there is
+                # ("no thanks" then hang up). Swallowed here, where the context
+                # to know it is harmless exists.
+                _log.info(
+                    "unknown_event", error_type="phone_gate_outcome",
+                    error_category="closing_unheard_participant_gone",
+                )
         _log.info(
             "unknown_event", error_type="phone_gate_outcome",
             schema=schema or decision,
@@ -5383,14 +5466,14 @@ async def run_phone_gate(
             else PHONE_DISCLOSURE_TEXT
         )
 
-    def _reset_turns() -> None:
-        """Drop anything STT queued before the question we are about to ask."""
-        if reset_turn_buffer is None:
+    def _ask_barrier() -> None:
+        """Anchor the question about to be asked. Never fails the gate."""
+        if mark_question_asked is None:
             return
         try:
-            reset_turn_buffer()
+            mark_question_asked()
         except Exception:  # noqa: BLE001
-            # A failed drain costs correctness, not the call: the worst case is
+            # A failed anchor costs correctness, not the call: the worst case is
             # the pre-existing shared-queue behaviour. Never fail the gate.
             pass
 
@@ -5409,18 +5492,19 @@ async def run_phone_gate(
         * NOTHING was spoken at all                       → `fixed_line`, which
           is safe precisely because no audio preceded it.
         """
-        # NOTE: there is deliberately NO drain here, before the question is
-        # generated. A first draft had one and it was the ONLY barrier — which
-        # did not close the window it was written for. STT is live from the
-        # moment the participant joins, the gate then spends a few hundred ms on
-        # `call.answered` and the durable-consent read, and the final for the
-        # callee's pickup "Hello?" lands during the generation and playout that
-        # follow. A drain placed here runs before all of that and misses it.
+        # THE BARRIER, and it goes HERE — before the question is produced, not
+        # after it finishes playing.
         #
-        # The drain that matters is after playout, immediately before we wait
-        # for a reply (below). It strictly subsumes this one — mutation testing
-        # confirmed removing this line changes no observable behaviour — so it
-        # is gone rather than left as a line no test can falsify.
+        # The anchor is compared against each utterance's SPEECH-START, so the
+        # earliest sensible placement is the correct one: the pickup "Hello?"
+        # began speaking long before the gate reached this line, so it predates
+        # this anchor and is rejected; a barge-in answer begins during the
+        # question's playout, which is AFTER this anchor, so it is kept.
+        #
+        # Anchoring after playout — the previous attempt — made a barge-in reply
+        # predate the anchor and be dropped, which is how the stage-2 identity
+        # check ended up verifying nothing on a live call.
+        _ask_barrier()
         spoken_line: str | None = None
         if speak_gate_line is not None:
             try:
@@ -5466,9 +5550,6 @@ async def run_phone_gate(
                 await _say(repair)
                 gate_turns.append({"speaker": "bot", "text": repair})
 
-        # THE BARRIER. Everything queued up to this instant predates the end
-        # of our question and therefore cannot be its answer.
-        _reset_turns()
         reply = ""
         try:
             reply = await next_candidate_turn()  # type: ignore[misc]
@@ -5569,10 +5650,15 @@ async def run_phone_gate(
 
     # The consent question is the next thing the candidate will hear, so its
     # answer window starts here — not wherever the identity answer left the
-    # shared queue. Deterministic flow keeps its exact current behaviour: this
-    # is a no-op there because nothing wires `reset_turn_buffer`.
+    # shared queue. Placed before `speak_opening` for the same reason as the
+    # identity barrier: the anchor is compared against speech-START, so it must
+    # precede the question, not follow its playout.
+    #
+    # Scoped to the conversational flow so the deterministic rollback stays
+    # byte-identical. There is no identity turn there, so nothing can have been
+    # left in the queue by one.
     if identity_ran:
-        _reset_turns()
+        _ask_barrier()
 
     # ── The opening: model-generated-and-verified, or the fixed disclosure ─
     if speak_opening is not None:
@@ -6694,6 +6780,91 @@ async def _default_phone_interviewer_text(instruction: str) -> str | None:
         return data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
         return None
+
+
+#: Bound on the Gemini connection warm-up. It runs off the speech path and is
+#: discarded, so the only cost of expiry is the cold turn it was avoiding.
+PHONE_GOOGLE_WARMUP_TIMEOUT_SEC = 6.0
+
+
+async def phone_warm_google_connection(
+    *, infer: Callable[[], Awaitable[Any]] | None = None,
+) -> None:
+    """Open the Gemini connection before the first spoken line. Never raises.
+
+    WHY THIS EXISTS. Measured on a live call 2026-09-11: 20 SECONDS from
+    `call.answered` to the identity line being spoken, on a conversational-flow
+    call whose first spoken line is a real generation. `phone_warm_prefix_cache`
+    — the warm-up that solves exactly this for the OpenAI-compat lane — is
+    deliberately SKIPPED on native Gemini, because it POSTs the full system
+    prompt and on Gemini that would send résumé facts to a provider the call had
+    not yet touched, for no caching benefit (flash-lite has no implicit cache).
+
+    So this warms what can be warmed from outside the plugin and nothing else.
+    The prompt is the literal string below — no résumé, no role, no name, no
+    system prompt — so the privacy objection that killed the earlier widening
+    does not apply. One token out, discarded.
+
+    SCOPE, STATED HONESTLY. The live interviewer is
+    `livekit.plugins.google.LLM`, which builds its OWN `genai.Client` with its
+    own httpx pool, so the TCP/TLS session opened here is NOT the one the first
+    turn uses. What is genuinely shared is DNS resolution, the module import,
+    and any provider-side project/model warm. Treat this as a partial mitigation
+    for the measured 20 s cold opening, not a fix — the fix that actually
+    removes that window is keeping a worker warm.
+
+    Fires only when the interviewer actually is native Gemini; the OpenAI-compat
+    lane already has its own warm-up and would gain nothing.
+    """
+    if not phone_use_google_llm():
+        return
+    api_key = phone_llm_api_key()
+    if not api_key:
+        return
+    try:
+        if infer is not None:
+            await asyncio.wait_for(infer(), timeout=PHONE_GOOGLE_WARMUP_TIMEOUT_SEC)
+            return
+        from google import genai  # noqa: PLC0415
+        from google.genai import types as genai_types  # noqa: PLC0415
+
+        client = genai.Client(api_key=api_key)
+        try:
+            await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=phone_primary_model(),
+                    contents="hi",
+                    config=genai_types.GenerateContentConfig(
+                        max_output_tokens=1,
+                        thinking_config=genai_types.ThinkingConfig(
+                            thinking_level="minimal"),
+                    ),
+                ),
+                timeout=PHONE_GOOGLE_WARMUP_TIMEOUT_SEC,
+            )
+        finally:
+            # CLOSE IT. This client is a throwaway; the live interviewer builds
+            # its own inside `livekit.plugins.google.LLM`. Leaving it open leaks
+            # an httpx client and its connection pool on EVERY call.
+            closer = getattr(client, "aclose", None)
+            if callable(closer):
+                try:
+                    await closer()
+                except Exception:  # noqa: BLE001
+                    pass
+    except Exception:  # noqa: BLE001 — a cold turn is the only cost of failure.
+        # Logged, not silent. Success used to be the only thing that emitted,
+        # so "is the warm-up working?" was unanswerable from the logs and a
+        # permanently broken warm-up looked identical to a healthy one.
+        _log.info(
+            "unknown_event", error_type="phone_google_warmup",
+            error_category="warmup_failed",
+        )
+        return
+    _log.info(
+        "unknown_event", error_type="phone_google_warmup",
+        error_category="connection_warmed",
+    )
 
 
 def phone_prefix_warmup_enabled() -> bool:
@@ -8357,6 +8528,149 @@ def phone_instruction_echo_detected(speech: Any, control_text: Any) -> bool:
         return False
     windows = {tuple(control[i:i + 6]) for i in range(len(control) - 5)}
     return any(tuple(spoken[i:i + 6]) in windows for i in range(len(spoken) - 5))
+
+
+#: Shortest verbatim run that counts as a recital FORMING, rather than a word
+#: two texts happen to share.
+#:
+#: NOT 1, and that is measured, not chosen. A parsed-résumé blob is prose — the
+#: 8000-char cap `agent.py` arms with runs to ~1200 tokens — so it contains
+#: "there", "morning", "with", "from". Holding on any single shared token means
+#: a clean greeting is held until it reaches a boundary whose last word happens
+#: to be absent from the résumé: driving the real `llm_node` with a production-
+#: sized control, "Hi there, good morning! This is Christy calling from
+#: Interview Kickstart." waited 63 chars before first audio, WORSE than the
+#: 73-char hold this whole change exists to remove.
+#:
+#: At 2 the same lines wait 10 and 14 chars — identical to no hold at all — and
+#: a verbatim recital is still stopped, because a recital is by definition a
+#: long run and trips this on its second word. Two texts sharing two CONSECUTIVE
+#: words in the same order is already unusual; sharing one is not evidence of
+#: anything.
+_GATE_CONTROL_RUN_MIN_TOKENS = 2
+
+def phone_gate_unsafe_tail_chars(streamed: Any) -> int:
+    """Trailing characters of a released stream that are not yet safe to speak.
+
+    A token can only be cleared once the NEXT one is known: the run check looks
+    at the trailing pair, so the final token is always still a candidate to open
+    a run that the next chunk completes. Everything from the start of that final
+    token to the end therefore has to wait.
+
+    Measured in CHARACTERS, not chunks, because chunk size is the provider's
+    choice and not ours. An earlier version held back one chunk, which recalls a
+    whole word from a word-at-a-time stream and a single LETTER from a
+    character-at-a-time one — "Senior" reached the caller on a recital that the
+    same code stopped completely when the chunks happened to be bigger. A
+    guarantee that depends on the provider's tokenizer is not a guarantee.
+    """
+    if not isinstance(streamed, str) or not streamed:
+        return 0
+    last = None
+    for last in _COVERAGE_TOKEN_RE.finditer(streamed):
+        pass
+    if last is None:
+        # No complete token at all — nothing can be cleared yet.
+        return len(streamed)
+    return len(streamed) - last.start()
+
+
+def phone_gate_split_ready(chunk_lengths: "list[int]", unsafe_chars: int) -> int:
+    """How many LEADING chunks may be yielded while retaining `unsafe_chars`.
+
+    Takes lengths rather than chunks so it stays a plain function of numbers —
+    the caller knows how to read a chunk's text, and this does not need to.
+
+    Splits only on chunk boundaries, because chunks are what gets yielded, so it
+    rounds in the SAFE direction and may retain more than asked for.
+    """
+    if unsafe_chars <= 0:
+        return len(chunk_lengths)
+    retained = 0
+    for index in range(len(chunk_lengths) - 1, -1, -1):
+        retained += chunk_lengths[index]
+        if retained >= unsafe_chars:
+            return index
+    return 0
+
+
+@functools.lru_cache(maxsize=4)
+def _control_run_index(control_text: str) -> "frozenset[tuple[str, ...]]":
+    """Contiguous control runs that could still GROW into a six-word window.
+
+    Two things matter here and both were review findings. Runs shorter than
+    `_GATE_CONTROL_RUN_MIN_TOKENS` are excluded, or every single résumé token
+    matches and the predicate degenerates into "is this word in the résumé?" —
+    which holds a clean greeting for 63 chars. And a run is only worth holding
+    for if six tokens can actually follow from where it starts, so the start
+    positions stop at `len - 5`: a run matching the very END of the control can
+    never complete a window.
+
+    Memoised because `phone_control_run_forming` runs once per streamed CHUNK,
+    and re-tokenising 8000 chars fifteen times a line measured at 24 ms — small
+    beside the second this change gives back, but pure waste on the one path
+    being optimised. Keyed on the exact control string and derived from nothing
+    else, so it cannot go stale; `maxsize=4` because a worker takes one call at
+    a time.
+    """
+    control = _COVERAGE_TOKEN_RE.findall(control_text.casefold())
+    if len(control) < 6:
+        return frozenset()
+    return frozenset(
+        tuple(control[i:i + size])
+        for size in range(_GATE_CONTROL_RUN_MIN_TOKENS, 6)
+        for i in range(len(control) - 5)
+    )
+
+
+def phone_control_run_forming(streamed: Any, control_text: Any) -> bool:
+    """Could the streamed TAIL still grow into a six-word control run?
+
+    `phone_instruction_echo_detected` cannot fire until the SIXTH copied word
+    arrives. That is fine when a whole line is judged at once, and wrong when
+    the line is streamed: by the time the sixth word makes the echo visible,
+    words one to five have already been handed to `tts_node` and spoken. In the
+    gate window those words are résumé facts, and the listener has not yet
+    confirmed who they are — verified by driving the real `llm_node` token by
+    token, where "Senior Data Engineer at Infosys, " reached the caller while
+    the same line fed as ONE chunk was vetoed before any audio.
+
+    So this answers the question the detector cannot: is the tail PART-WAY
+    through a control run right now? While it is, the caller keeps holding, and
+    the run either completes — the detector fires, nothing is spoken — or breaks,
+    at which point the held words are provably not inside any six-word run and
+    can be released. A clean line has no run at its tail and is never delayed.
+
+    Deliberately a superset: a suffix matching the LAST tokens of the control
+    cannot reach six, and is held anyway. Over-holding costs a token of lead-in;
+    under-holding speaks the résumé.
+    """
+    if not isinstance(streamed, str) or not isinstance(control_text, str):
+        return False
+    # A CHUNK CAN END MID-WORD, and then the last "token" is a fragment that
+    # matches nothing, so the hold releases in the middle of the very run it is
+    # holding for. Providers really do split words — this file already handles
+    # `tts_node` "cutting mid-word" — and measured against the real `llm_node`
+    # with word-piece chunks, "Senior Data Engineer at" went to air while the
+    # same line split on spaces aired nothing.
+    #
+    # Refuse to decide on a prefix that may be mid-word: HOLD until a separator
+    # proves the last token is whole. Costs at most the rest of one word.
+    if streamed and _COVERAGE_TOKEN_RE.fullmatch(streamed[-1]):
+        return True
+    spoken = _COVERAGE_TOKEN_RE.findall(streamed.casefold())
+    if len(spoken) < _GATE_CONTROL_RUN_MIN_TOKENS:
+        return False
+    # Empty below six control tokens: the detector itself is inert there, so
+    # there is no run to be part-way through and nothing to hold for.
+    runs = _control_run_index(control_text)
+    if not runs:
+        return False
+    return any(
+        tuple(spoken[-size:]) in runs
+        for size in range(min(len(spoken), 5),
+                          _GATE_CONTROL_RUN_MIN_TOKENS - 1, -1)
+    )
 
 
 def phone_fallback_acknowledgement(answer: Any, *, answer_is_question: bool = False) -> str:
@@ -10679,6 +10993,7 @@ def phone_agent_class(agent_base: Any) -> Any:
                         pass
 
                 held: list[Any] = []
+                pending: list[Any] = []
                 parts: list[str] = []
                 released = False
                 streamed = ""
@@ -10703,44 +11018,91 @@ def phone_agent_class(agent_base: Any) -> Any:
                             )
                             await _abandon(result)
                             return
-                        yield chunk
+                        # HOLD WHILE A CONTROL RUN IS MID-GROWTH. The veto above
+                        # cannot fire until the SIXTH copied word, so yielding
+                        # each chunk the moment it passes speaks words one to
+                        # five of a recital before the check can see it — which
+                        # is exactly what happens in production, where the model
+                        # streams token by token rather than in the phrase-sized
+                        # chunks the tests used to feed. Buffered here, the run
+                        # either completes (vetoed above, nothing spoken) or
+                        # breaks (released below, having been proven clean).
+                        pending.append(chunk)
+                        if phone_control_run_forming(
+                            streamed, self._gate_leak_control,
+                        ):
+                            continue
+                        # Keep the final WORD back. A run only becomes visible
+                        # on its second word, so flushing everything here speaks
+                        # the first one a beat before the check can recognise it
+                        # — measured as "Senior" escaping an otherwise-stopped
+                        # recital. Held by character count, not chunk count, so
+                        # the guarantee does not depend on how the provider
+                        # happens to split its stream.
+                        cut = phone_gate_split_ready(
+                            [len(_chunk_text(c)) for c in pending],
+                            phone_gate_unsafe_tail_chars(streamed))
+                        ready, pending[:] = pending[:cut], pending[cut:]
+                        for chunk_out in ready:
+                            # AUDIBLE text, not merely a chunk. A role-only first delta
+                            # (`delta.content = None` on every OpenAI-compatible
+                            # stream) carries nothing, and marking it as audio
+                            # makes `_speak_gate_generation` return "" instead of
+                            # None — "spoken, transcript unknown". The gate then
+                            # skips its own opener and leads with the repair line
+                            # "Sorry — am I speaking to X?", so a cold call from
+                            # an unknown number opens by demanding who you are:
+                            # the shape of a scam call, and the exact thing
+                            # `phone_identity_text` is worded to avoid.
+                            # `_chunk_text` alone is not enough: `tts_node`
+                            # merges letter-free fragments forward, so a
+                            # whitespace- or markdown-only chunk is non-empty
+                            # and still produces NO audio. The `not released`
+                            # branch below already tests for a letter; these
+                            # sites have to agree with it.
+                            if any(ch.isalpha() for ch in _chunk_text(chunk_out)):
+                                self._gate_stream_emitted = True
+                            yield chunk_out
                         continue
                     held.append(chunk)
                     parts.append(_chunk_text(chunk))
                     segment = "".join(parts).strip()
-                    # HOLD FOR A WHOLE WINDOW, not a whole clause. An earlier
-                    # draft released at the first clause boundary, which for
-                    # every natural opener is "Hi," — one word. The echo
-                    # detector compares SIX-word windows and returns False
-                    # outright below six tokens, so that veto could not fire and
-                    # the rest of the line (the part that would carry a résumé
-                    # recital) streamed unchecked. Verified by simulation: a
-                    # line reciting the candidate's employer and title released
-                    # at "Hi," while the same predicate over the whole line
-                    # returned instruction_echo.
-                    if len(_COVERAGE_TOKEN_RE.findall(segment)) < _GATE_LEAK_MIN_TOKENS:
-                        continue
-                    # RELEASE ONLY AT A PUNCTUATION BOUNDARY, never on a raw
-                    # character cap.
+                    # RELEASE ON EXACTLY THE RULE A SCREENING TURN USES —
+                    # boundary or cap, and nothing else.
                     #
-                    # A0's 48-char cap exists so a boundary-less screening reply
-                    # still starts speaking quickly. Applied here it opened a
-                    # hole: "Hi, I can see you are a Senior Data Engineer at
-                    # Infosys" is 54 chars with no boundary, so the cap released
-                    # it — and because `phone_instruction_echo_detected` needs
-                    # SIX contiguous words, the five résumé words ahead of the
-                    # cap were spoken pre-consent, to a party whose identity is
-                    # exactly what this turn is still establishing. Verified by
-                    # driving the real `llm_node`.
+                    # A six-token floor used to gate the RELEASE here as well,
+                    # holding every line to its first full sentence. On the line
+                    # the owner heard live — "Hi there, good morning! This is
+                    # Christy calling from Interview Kickstart. Am I speaking
+                    # with Christo?" — a screening turn starts speaking after
+                    # "Hi there," (9 chars) and this branch held 73. Eight times
+                    # the lead-in, on the one turn a candidate has no context
+                    # for, which is exactly where dead air reads as a dropped
+                    # call.
                     #
-                    # Holding to a boundary means a recital like that is checked
-                    # as a whole sentence, where the echo detector does see six
-                    # words. The cost is first-audio latency on a gate line with
-                    # no early punctuation; `_GATE_LEAK_HARD_CAP_CHARS` bounds
-                    # that so a pathological stream cannot hold audio forever.
+                    # The floor is gone, but NOT its protection: the targeted
+                    # hold below keeps a forming résumé run off the wire, while a
+                    # clean line releases right here. See
+                    # `_GATE_LEAK_HARD_CAP_CHARS` for why removing the floor on
+                    # its own was a leak.
                     if not segment.endswith(
                         (".", "!", "?", ",", ";", ":", "—", "–", "…")
                     ) and len(segment) < _GATE_LEAK_HARD_CAP_CHARS:
+                        continue
+                    # NOTHING TO SPEAK AND NOTHING TO CHECK YET. A first chunk
+                    # that is pure punctuation — "— " on an em-dash-led opener —
+                    # ends with a boundary character, so the rule above releases
+                    # it; `phone_streamed_leading_segment_safe` then rejects
+                    # letter-free text and the whole authored line is vetoed. Fed
+                    # as ONE chunk the identical line is spoken in full, which is
+                    # how it stayed hidden. The six-token floor used to mask this
+                    # by never releasing that early.
+                    #
+                    # A0's streamed screening path already does exactly this, in
+                    # exactly this position — ahead of its own boundary test. The
+                    # gate was the one that did not, which is the parity this
+                    # whole change is about.
+                    if not any(ch.isalpha() for ch in segment):
                         continue
                     if not phone_streamed_leading_segment_safe(
                         segment, None, control_text=self._gate_leak_control,
@@ -10751,11 +11113,45 @@ def phone_agent_class(agent_base: Any) -> Any:
                         )
                         await _abandon(result)
                         return
+                    # Clean SO FAR is not the same as safe to speak. The check
+                    # above is blind below six copied words, so a lead that ends
+                    # part-way through a résumé run — "…you are a Senior Data
+                    # Engineer at Infosys," is five words and a comma, a legal
+                    # boundary — passes it and takes the recital to air. Keep
+                    # holding while the run is still growing; the next chunks
+                    # either complete it, and the check above then vetoes with
+                    # nothing spoken, or break it and release.
+                    # UNSTRIPPED on purpose. `segment` is `.strip()`ed, so it
+                    # can never end in a separator — the mid-word test above
+                    # would be meaningless against it and would hold every lead.
+                    # The raw text is what says whether the last word is whole.
+                    if phone_control_run_forming(
+                        "".join(parts), self._gate_leak_control,
+                    ):
+                        continue
                     released = True
                     streamed = "".join(parts)
-                    self._gate_stream_emitted = True
-                    for pending in held:
-                        yield pending
+                    # The lead's LAST chunk carries the same risk as any other:
+                    # it may be the opening word of a run the next chunk
+                    # completes. Hand it to `pending` so the loop above decides
+                    # it with one chunk of hindsight, instead of speaking it
+                    # here and finding out afterwards.
+                    #
+                    # `_gate_stream_emitted` is therefore set at the YIELD, not
+                    # here. Releasing no longer implies audio: with the lead
+                    # held back, a veto on the next chunk can end the turn with
+                    # nothing spoken. Marking it here would tell
+                    # `run_phone_gate` a line went out when none did, and it
+                    # would skip the fixed opener — a SILENT gate, the mirror of
+                    # the 2026-09-09 double-opener.
+                    cut = phone_gate_split_ready(
+                        [len(_chunk_text(c)) for c in held],
+                        phone_gate_unsafe_tail_chars(streamed))
+                    ready, pending[:] = held[:cut], held[cut:]
+                    for chunk_out in ready:
+                        if any(ch.isalpha() for ch in _chunk_text(chunk_out)):
+                            self._gate_stream_emitted = True
+                        yield chunk_out
                     held.clear()
                 if not released:
                     # The whole reply ended before it reached a full window, so
@@ -10774,10 +11170,29 @@ def phone_agent_class(agent_base: Any) -> Any:
                         )
                         await _abandon(result)
                         return
-                    if any(ch.isalpha() for ch in tail):
+                    if not any(ch.isalpha() for ch in tail):
+                        # LETTER-FREE, so it makes no audio: `tts_node` merges
+                        # such fragments forward and never hands them
+                        # downstream. Yielding it anyway while leaving the latch
+                        # False is the worst of both — `run_phone_gate` reads
+                        # "nothing was spoken" and speaks its fixed opener, and
+                        # if any of this DID reach the wire it lands underneath.
+                        # Speak nothing and let the fixed line stand alone.
+                        return
+                    self._gate_stream_emitted = True
+                    for ready in held:
+                        yield ready
+                    return
+                # The stream ENDED with a run still mid-growth, so it never
+                # reached six words and the full-text veto above has already
+                # passed on every chunk here. Held back for a check that can no
+                # longer fire, these are safe and must not be dropped — the
+                # candidate would hear a sentence cut off mid-clause.
+                for ready in pending:
+                    if any(ch.isalpha() for ch in _chunk_text(ready)):
                         self._gate_stream_emitted = True
-                    for pending in held:
-                        yield pending
+                    yield ready
+                pending.clear()
                 return
             if self._turn_policy == "substantive" and self._turn_mode == PHONE_TURN_MODE_TOOLLESS:
                 # TOOLLESS substantive turn (browser-style). ONE Gemini call:

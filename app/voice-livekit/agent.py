@@ -932,6 +932,120 @@ def _turn_anchor_ms(item: Any) -> int | None:
     return persistence.normalize_turn_anchor_ms(created_at)
 
 
+#: How far before a question an utterance may plausibly have STARTED and
+#: still be a late STT final for it. One hour is far beyond any real phone
+#: turn and far below the gap a wrong-clock value produces.
+_TURN_ANCHOR_SANE_LOOKBACK_MS = 60 * 60 * 1000
+
+#: The SDK's own wording when the session has stopped. Matched narrowly, so any
+#: OTHER RuntimeError still surfaces as the real fault it is.
+_SDK_SESSION_STOPPED_MARKERS = ("isn't running", "is not running")
+
+
+async def _read_fresh_turn(
+    user_turns: "asyncio.Queue",
+    question_anchor: "Callable[[], int | None]",
+    timeout_sec: float,
+) -> str:
+    """Pop the first utterance that began AFTER the question, within one budget.
+
+    THE IDENTITY HALF OF THE TURN BARRIER, and module-level so a test can reach
+    it. Left inside `_run_phone_session`'s closure it was unreachable: the
+    session harness patches `persistence` with a bare `MagicMock`, so
+    `normalize_turn_anchor_ms` returns a Mock that `_queued_turn` discards, and
+    `_FakePhoneSession` stamps a fixed 2024 anchor that the one-hour sanity
+    window reads as a wrong clock. Two independent reasons no session test could
+    ever observe this rule — which is how the live 2026-09-11 defect it fixes
+    would have come straight back.
+
+    Stale utterances are skipped WITHIN the same budget: one must not buy the
+    candidate extra time, nor spend theirs. Returns "" when the budget runs out,
+    which the caller reads as "nothing usable" rather than as an answer.
+    """
+    deadline = time.monotonic() + timeout_sec
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return ""
+        try:
+            item = await asyncio.wait_for(user_turns.get(), timeout=remaining)
+        except asyncio.TimeoutError:
+            return ""
+        except Exception:  # noqa: BLE001
+            return ""
+        text, anchor_ms = _queued_turn(item)
+        if _queued_turn_is_stale(anchor_ms, question_anchor()):
+            _log.info(
+                "unknown_event", error_type="phone_gate_turn_barrier",
+                error_category="pre_question_turn_skipped",
+            )
+            continue
+        return text
+
+
+def _participant_gone_from(exc: RuntimeError, *, category: str) -> Exception:
+    """Translate an SDK "session stopped" RuntimeError, or re-raise it.
+
+    Lives here rather than inside `say`'s closure so the match on vendor prose
+    is REACHABLE BY A TEST. It previously existed twice inside
+    `_run_phone_session`, where the only thing a test could reach was a string
+    literal it had written itself — which is not a test of anything, on exactly
+    the defect class this file keeps hitting.
+
+    Returns the signal for the caller to raise (so the `from exc` chain stays at
+    the call site); raises the original for anything that is not a stopped
+    session.
+    """
+    message = str(exc)
+    if not any(marker in message for marker in _SDK_SESSION_STOPPED_MARKERS):
+        raise exc
+    _log.warn(
+        "unknown_event", error_type="phone_say_after_close",
+        error_category=category,
+    )
+    return phone.PhoneParticipantGone()
+
+
+def _queued_turn(item: Any) -> tuple[str, int | None]:
+    """Unpack a `user_turns` entry as (text, speech_start_ms).
+
+    Accepts a BARE STRING as well as the `(text, anchor)` pair the live producer
+    enqueues. The tolerance is deliberate: `_classify_phone_answer` is a
+    module-level function with its own direct tests that hand it a plain
+    `Queue[str]`, and widening the queue should not force every one of those to
+    learn a shape they do not care about.
+    """
+    if isinstance(item, tuple) and len(item) == 2:
+        text, anchor = item
+        return (text if isinstance(text, str) else ""), (
+            anchor if isinstance(anchor, int) and not isinstance(anchor, bool) else None
+        )
+    return (item if isinstance(item, str) else ""), None
+
+
+def _queued_turn_is_stale(anchor_ms: int | None, question_anchor_ms: int | None) -> bool:
+    """True when this utterance began BEFORE the question now asking for it.
+
+    The reader-side half of the gate barrier. FAIL-OPEN by construction: both
+    anchors must be real for a turn to be rejected, so anything the SDK could
+    not time is kept. Losing a genuine answer costs the identity check; reading
+    a stale one costs a re-ask.
+    """
+    if anchor_ms is None or question_anchor_ms is None:
+        return False
+    # A speech-start that predates the question by more than this is not a late
+    # STT final — it is a value from a different clock. `normalize_turn_anchor_ms`
+    # accepts anything from 1 ms to the year 2100, so a monotonic/uptime-shaped
+    # `started_speaking_at` (e.g. 12345.678) normalises to 1970 and would mark
+    # EVERY turn stale: the identity reader would return "", the consent
+    # classifier would burn both attempts on skips, and every consenting
+    # candidate would be torn down as a machine. Treat the implausible as
+    # untimed and KEEP it, so the failure direction stays open.
+    if question_anchor_ms - anchor_ms > _TURN_ANCHOR_SANE_LOOKBACK_MS:
+        return False
+    return anchor_ms < question_anchor_ms
+
+
 def _native_turn_predates_question(message: Any, question_anchor_ms: int | None) -> bool:
     """True only when both real anchors prove the final belongs before this ask."""
     started_ms = _turn_anchor_ms(message)
@@ -1513,6 +1627,7 @@ async def _classify_phone_answer(
     attempts: int = 2,
     consumed: "list[str] | None" = None,
     answer_timeout_sec: float | None = None,
+    question_anchor: "Callable[[], int | None] | None" = None,
 ) -> str:
     """Read the response to the disclosure, re-asking at most once.
 
@@ -1534,12 +1649,33 @@ async def _classify_phone_answer(
         answer_timeout_sec = phone.phone_classify_answer_timeout_sec()
     responsive = 0
     for attempt in range(max(1, attempts)):
-        try:
-            text = await asyncio.wait_for(turns.get(), timeout=answer_timeout_sec)
-        except asyncio.TimeoutError:
-            # No speech within THIS answer's window. Treat as unreadable for the
-            # attempt: re-ask if one remains, else fall closed to MACHINE below.
-            text = ""
+        # Skip utterances that began before THIS question, inside the SAME
+        # per-attempt budget. The consent turn shares one FIFO with the identity
+        # reader, so a trailing fragment of the identity answer is sitting in it,
+        # legitimately enqueued under the identity anchor — and read here it
+        # would be consent. That is the shared-FIFO defect, and it is why the
+        # staleness test lives at the READER: only the reader knows its question.
+        text = ""
+        deadline = time.monotonic() + answer_timeout_sec
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                # No usable speech within THIS answer's window. Treat as
+                # unreadable: re-ask if one remains, else fall closed to MACHINE.
+                text = ""
+                break
+            try:
+                item = await asyncio.wait_for(turns.get(), timeout=remaining)
+            except asyncio.TimeoutError:
+                text = ""
+                break
+            candidate_text, anchor_ms = _queued_turn(item)
+            if question_anchor is not None and _queued_turn_is_stale(
+                anchor_ms, question_anchor()
+            ):
+                continue
+            text = candidate_text
+            break
         if isinstance(text, str) and text.strip():
             responsive += 1
             if consumed is not None:
@@ -6798,7 +6934,19 @@ async def _run_phone_session(
 
     # Candidate-only queue used exclusively by the pre-consent disclosure
     # classifier. Post-consent turns remain inside LiveKit AgentSession.
-    user_turns: "asyncio.Queue[str]" = asyncio.Queue()
+    # (text, speech_start_ms). The anchor TRAVELS WITH the utterance because the
+    # question it belongs to is not known until it is READ: a trailing fragment
+    # of the identity answer is legitimately enqueued under the identity anchor
+    # and then popped by the CONSENT classifier, which is the shared-FIFO defect
+    # this whole mechanism exists to close. Filtering at the producer cannot see
+    # that; filtering at the reader can.
+    user_turns: "asyncio.Queue[tuple[str, int | None]]" = asyncio.Queue()
+    # The gate's CURRENT question, as a speech-start anchor in ms. Set when the
+    # gate begins asking, cleared when the gate returns. While set, a candidate
+    # final whose SPEECH STARTED before it is never enqueued -- see
+    # `on_candidate_turn`. `None` outside the gate, so the screening loop's own
+    # `latest_assistant_anchor` machinery is untouched.
+    gate_question_anchor: list[int | None] = [None]
     candidate_activity = asyncio.Event()
     agent_listening = asyncio.Event()
     agent_listening.set()
@@ -7391,10 +7539,28 @@ async def _run_phone_session(
 
     async def say(text: str) -> None:
         started_ms = int(round(time.time() * 1000))
-        speech = session.say(text, allow_interruptions=False)
+        try:
+            speech = session.say(text, allow_interruptions=False)
+        except RuntimeError as exc:
+            # The leg dropped while the gate was mid-await. Translate the SDK's
+            # generic RuntimeError into the typed signal the gate call site
+            # catches, so a hang-up ends the call through a terminal instead of
+            # killing the job entrypoint and leaving the attempt wedged with its
+            # pre-consent recording unpurged.
+            raise _participant_gone_from(
+                exc, category="participant_gone") from exc
         wait_for_playout = getattr(speech, "wait_for_playout", None)
         if callable(wait_for_playout):
-            await wait_for_playout()
+            try:
+                await wait_for_playout()
+            except RuntimeError as exc:
+                # The leg can drop DURING playout just as easily as between
+                # awaits — more easily, in fact, since a model-authored
+                # disclosure plays for ten seconds or more while `session.say`
+                # itself occupies almost none. Same translation as above, or
+                # this window reproduces the crash the guard exists to remove.
+                raise _participant_gone_from(
+                    exc, category="participant_gone_during_playout") from exc
         # Both disclosure variants, or the metric silently loses every sample
         # the moment the conversational flow is enabled (that flow speaks
         # `PHONE_DISCLOSURE_CONTINUATION_TEXT` and never the other one).
@@ -7407,9 +7573,31 @@ async def _run_phone_session(
 
     def on_candidate_turn(text: str, message: Any = None, turn_ctx: Any = None) -> None:
         candidate_activity.set()
-        user_turns.put_nowait(text)
+        # Liveness and an explicit hang-up request are honoured even for a turn
+        # the gate will not read: the person IS there, and "hang up" means hang
+        # up whenever it was said.
         if phone.is_explicit_end_call_request(text):
             candidate_end_requested.set()
+        # RECORD the utterance with its own SPEECH-START; do not judge it here.
+        #
+        # An earlier version filtered HERE, at the producer, and it could not
+        # work: whether a turn is stale depends on WHICH QUESTION eventually
+        # reads it, and that is unknown at arrival. A trailing fragment of the
+        # identity answer legitimately postdates the identity anchor, is
+        # enqueued, and is then popped by the CONSENT classifier — the shared-FIFO
+        # defect this mechanism exists to close. Only the reader knows its own
+        # question, so only the reader can decide.
+        #
+        # `_turn_anchor_ms` prefers the SDK's VAD `started_speaking_at` (a
+        # `time.time()` seconds float, normalised to ms — the same clock and
+        # units as the anchors the readers compare against), and FALLS BACK to
+        # `created_at`, the message-FINALISATION time. That fallback is a
+        # different instant: a barge-in answer finalises after the question, so
+        # it survives, while a late final of pre-question speech can finalise
+        # after the anchor and be kept. Fail-open either way, which is the
+        # chosen direction. Only a message with neither is `None`, which the
+        # readers also treat as KEEP.
+        user_turns.put_nowait((text, _turn_anchor_ms(message)))
 
     # Complete and immutable from construction. The exact owed question is
     # still supplied only per turn; this prompt carries role, resume,
@@ -7456,6 +7644,24 @@ async def _run_phone_session(
     # would POST the full system prompt, résumé facts included, to a second
     # provider that previously received nothing from this call. Reverted.
     _phone_prefix_warmup_off = (os.getenv("PHONE_PREFIX_WARMUP") or "").strip().lower() == "off"
+    # NATIVE GEMINI gets a connection warm-up instead of a prefix warm-up.
+    # Measured live 2026-09-11: 20 s from answer to the first spoken line on a
+    # conversational-flow call, because that line is a real generation against a
+    # cold connection. This opens the TLS/session with a one-token throwaway
+    # prompt carrying NO candidate data, so it buys the latency without the
+    # privacy cost that made the prefix warm-up wrong here. Detached and
+    # swallowed, exactly like its sibling below.
+    if (
+        phone.phone_prefix_warmup_enabled()
+        and not _phone_prefix_warmup_off
+        and phone.phone_use_google_llm()
+    ):
+        try:
+            _gwarm = asyncio.create_task(phone.phone_warm_google_connection())
+            _PHONE_WARMUP_TASKS.add(_gwarm)
+            _gwarm.add_done_callback(_PHONE_WARMUP_TASKS.discard)
+        except RuntimeError:
+            pass
     if (
         phone.phone_prefix_warmup_enabled()
         and not _phone_prefix_warmup_off
@@ -7529,7 +7735,8 @@ async def _run_phone_session(
         if classifier is not None:
             return await classifier(user_turns, say)
         return await _classify_phone_answer(
-            user_turns, say, consumed=consent_reply_out
+            user_turns, say, consumed=consent_reply_out,
+            question_anchor=lambda: gate_question_anchor[0],
         )
 
     # Arm the gate-window leak veto with the RÉSUMÉ FACTS — the text that must
@@ -7692,31 +7899,24 @@ async def _run_phone_session(
             return None
         return await _speak_gate_generation(instructions)
 
-    def _drain_user_turns() -> None:
-        """Discard STT finals that predate the question we are about to ask.
+    def _mark_question_asked() -> None:
+        """Anchor the gate's current question at NOW (ms).
 
-        `user_turns` is ONE FIFO shared by `_next_candidate_turn` (the identity
-        reader) and `_classify_phone_answer` (the consent classifier), and both
-        take from it with a bare `get()`. STT is live from the moment the
-        participant joins, so on a real call the callee's "Hello?" on pickup is
-        ALREADY QUEUED before the gate speaks: the identity reader pops that, and
-        the candidate's actual identity answer is then popped by the CONSENT
-        classifier — which is how a "yes, this is Priya" became a consent grant.
-        The commit message on the first draft claimed "neither answer can land on
-        the other's parser"; that was false, the separation was a 15s timer.
+        Called by the gate as it begins each question. Everything about WHY this
+        is a speech-start anchor rather than a queue drain is in
+        `on_candidate_turn`.
 
-        Draining at the moment a question STARTS is the correct boundary. An
-        utterance that predates the question cannot be its answer, and a barge-in
-        answer — which by definition arrives after the question began — is never
-        dropped.
+        Anchoring at the moment the gate STARTS the question -- not when its
+        audio begins -- is deliberate and sufficient: the utterance this must
+        reject (the pickup "Hello?") started speaking seconds before the gate
+        reached this line at all, so it predates even the earliest anchor. Using
+        generation-start keeps the rule simple and never rejects a real answer.
         """
-        while True:
-            try:
-                user_turns.get_nowait()
-            except asyncio.QueueEmpty:
-                return
-            except Exception:  # noqa: BLE001
-                return
+        gate_question_anchor[0] = int(round(time.time() * 1000))
+
+    def _clear_question_anchor() -> None:
+        """Drop the barrier when the gate is done, so screening turns flow."""
+        gate_question_anchor[0] = None
 
     async def speak_opening() -> str | None:
         """Generate a warm, verified opening through the tool-less gate window.
@@ -8019,83 +8219,145 @@ async def _run_phone_session(
         unextractable reply as "proceed", and an exception here would end a call
         that a real candidate is on.
         """
-        try:
-            text = await asyncio.wait_for(
-                user_turns.get(), timeout=phone.phone_classify_answer_timeout_sec(),
-            )
-        except asyncio.TimeoutError:
-            return ""
-        except Exception:  # noqa: BLE001
-            return ""
-        return text if isinstance(text, str) else ""
+        # Delegates to the module-level reader so the RULE is reachable by a
+        # test. Inlined here it was covered only by a harness that
+        # re-implemented it, i.e. by its own copy.
+        return await _read_fresh_turn(
+            user_turns,
+            lambda: gate_question_anchor[0],
+            phone.phone_classify_answer_timeout_sec(),
+        )
 
-    result = await phone.run_phone_gate(
-        attempt_id=attempt_id,
-        client=events,
-        wait_for_participant=wait_for_participant,
-        classify=classify,
-        say=say,
-        start_recording=_phone_recording_permitted_and_begin,
-        set_endpointing_max=(
-            # Fixed-local endpointing only: max_endpointing_delay governs the tail
-            # there. Excluded in dynamic mode (opt-in, off by default) whose
-            # turn_handling envelope is a different, untested shape, and in stt
-            # mode where the STT provider owns end-of-utterance.
-            _set_consent_endpointing_max
-            if phone.phone_turn_detection() == phone.PHONE_TURN_DETECTION_LOCAL
-            and not phone.phone_dynamic_endpointing_enabled()
-            else None
-        ),
-        start_role_prerender=(
-            _start_role_prerender if _role_prerender_text is not None else None
-        ),
-        say_role_opening=(
-            _say_role_opening if _role_prerender_text is not None else None
-        ),
-        epoch=epoch,
-        # F2 (2026-08-29 consent replay): consulted once before the disclosure
-        # so a mid-call re-dispatch resumes instead of re-asking for consent.
-        fetch_durable_consent=fetch_durable_consent,
-        # Recording-from-answer: post call.answered before the disclosure so the
-        # server can start the egress from the top of the call.
-        post_call_answered=True,
-        speak_opening=speak_opening,
-        # Deterministic opener (default): withhold the LLM role opener so
-        # `_deliver_role_opening` speaks the FIXED `phone_role_opening_text`
-        # ("Before we dive in, just to confirm — this is about the {role} role at
-        # Interview Kickstart. Really glad you could hop on — let's dive in!").
-        # `speak_opening` itself self-gates on the same flag (returns None →
-        # fixed disclosure). Both openers are then scripted, never model-authored,
-        # so neither can be spoken-then-contradicted. PHONE_DETERMINISTIC_OPENER=false
-        # restores both LLM openers.
-        speak_role_opening=(
-            None if phone.phone_deterministic_opener() else speak_role_opening
-        ),
-        consent_reply_out=consent_reply_out,
-        # Answer-first origination (Plivo bounce). OFF by default → byte-identical
-        # current behavior. When ON, the gate waits for the server-verified
-        # answer (the Plivo webhook applies `call.answered`) before it speaks a
-        # word, because the SIP participant is present ~1s after dispatch, long
-        # before the real candidate has picked up. The wait budget is the same
-        # `PHONE_ANSWER_TIMEOUT_SEC` bound used elsewhere in the gate.
-        bounce_mode=phone.phone_bounce_mode(),
-        # The session hint for the server-side recording start: derived from
-        # the room name the dialer minted (`phone-<sessionId>`), the same
-        # derivation 0044's binding re-verifies. Without it the server's
-        # disclosure-time DB read finds no session (it is bound only at
-        # /assessment/start) and the egress silently never starts.
-        session_id=phone.session_id_from_room_name(room_name),
-        # ── 0095: the conversational identity turn ─────────────────────────
-        # All four are wired unconditionally; the GATE decides whether to use
-        # them from `PHONE_GATE_FLOW`, and `_speak_gate_line` decides whether to
-        # generate from `PHONE_DETERMINISTIC_OPENER`. Wiring here rather than
-        # branching keeps one call site and lets a flag flip change behaviour
-        # without a deploy, exactly like every other knob in this lane.
-        next_candidate_turn=_next_candidate_turn,
-        speak_gate_line=_speak_gate_line,
-        reset_turn_buffer=_drain_user_turns,
-        candidate_name=getattr(instruction_state, "candidate_name", None),
-    )
+    async def _run_gate() -> "phone.PhoneGateResult":
+        return await phone.run_phone_gate(
+            attempt_id=attempt_id,
+            client=events,
+            wait_for_participant=wait_for_participant,
+            classify=classify,
+            say=say,
+            start_recording=_phone_recording_permitted_and_begin,
+            set_endpointing_max=(
+                # Fixed-local endpointing only: max_endpointing_delay governs the tail
+                # there. Excluded in dynamic mode (opt-in, off by default) whose
+                # turn_handling envelope is a different, untested shape, and in stt
+                # mode where the STT provider owns end-of-utterance.
+                _set_consent_endpointing_max
+                if phone.phone_turn_detection() == phone.PHONE_TURN_DETECTION_LOCAL
+                and not phone.phone_dynamic_endpointing_enabled()
+                else None
+            ),
+            start_role_prerender=(
+                _start_role_prerender if _role_prerender_text is not None else None
+            ),
+            say_role_opening=(
+                _say_role_opening if _role_prerender_text is not None else None
+            ),
+            epoch=epoch,
+            # F2 (2026-08-29 consent replay): consulted once before the disclosure
+            # so a mid-call re-dispatch resumes instead of re-asking for consent.
+            fetch_durable_consent=fetch_durable_consent,
+            # Recording-from-answer: post call.answered before the disclosure so the
+            # server can start the egress from the top of the call.
+            post_call_answered=True,
+            speak_opening=speak_opening,
+            # Deterministic opener (default): withhold the LLM role opener so
+            # `_deliver_role_opening` speaks the FIXED `phone_role_opening_text`
+            # ("Before we dive in, just to confirm — this is about the {role} role at
+            # Interview Kickstart. Really glad you could hop on — let's dive in!").
+            # `speak_opening` itself self-gates on the same flag (returns None →
+            # fixed disclosure). Both openers are then scripted, never model-authored,
+            # so neither can be spoken-then-contradicted. PHONE_DETERMINISTIC_OPENER=false
+            # restores both LLM openers.
+            speak_role_opening=(
+                None if phone.phone_deterministic_opener() else speak_role_opening
+            ),
+            consent_reply_out=consent_reply_out,
+            # Answer-first origination (Plivo bounce). OFF by default → byte-identical
+            # current behavior. When ON, the gate waits for the server-verified
+            # answer (the Plivo webhook applies `call.answered`) before it speaks a
+            # word, because the SIP participant is present ~1s after dispatch, long
+            # before the real candidate has picked up. The wait budget is the same
+            # `PHONE_ANSWER_TIMEOUT_SEC` bound used elsewhere in the gate.
+            bounce_mode=phone.phone_bounce_mode(),
+            # The session hint for the server-side recording start: derived from
+            # the room name the dialer minted (`phone-<sessionId>`), the same
+            # derivation 0044's binding re-verifies. Without it the server's
+            # disclosure-time DB read finds no session (it is bound only at
+            # /assessment/start) and the egress silently never starts.
+            session_id=phone.session_id_from_room_name(room_name),
+            # ── 0095: the conversational identity turn ─────────────────────────
+            # All four are wired unconditionally; the GATE decides whether to use
+            # them from `PHONE_GATE_FLOW`, and `_speak_gate_line` decides whether to
+            # generate from `PHONE_DETERMINISTIC_OPENER`. Wiring here rather than
+            # branching keeps one call site and lets a flag flip change behaviour
+            # without a deploy, exactly like every other knob in this lane.
+            next_candidate_turn=_next_candidate_turn,
+            speak_gate_line=_speak_gate_line,
+            mark_question_asked=_mark_question_asked,
+            candidate_name=getattr(instruction_state, "candidate_name", None),
+        )
+
+    # ONE catch for every spoken line in the gate. `say` raises
+    # `PhoneParticipantGone` when the AgentSession has already closed under it,
+    # which happens whenever the leg drops inside one of the gate's awaits — the
+    # bounded SIP-subscription wait, a generation, a playout. Guarding each
+    # speaking site instead would be the per-site duplication that put a `_post`
+    # NameError on this lane's last new terminal; there is one call site here,
+    # so there is one guard.
+    #
+    # Observed live 2026-09-11 06:11:06Z: leg dropped 0.8 s after answer, the
+    # gate finished its 8 s subscription wait, spoke, and the job CRASHED with
+    # `RuntimeError: AgentSession isn't running`. The crash is what costs — it
+    # skips every terminal, so no event posts, the pre-consent recording is
+    # never purged and the engagement is left in `dialing` for the reaper.
+    try:
+        result = await _run_gate()
+    except phone.PhoneParticipantGone:
+        _log.info(
+            "unknown_event", error_type="phone_gate_outcome",
+            schema=phone.GATE_PARTICIPANT_LEFT,
+        )
+        # Post the PURGING terminal before returning. Not crashing is only half
+        # the fix: the egress starts at `call.answered`, and only a
+        # `PURGE_BEFORE_EVENTS` member destroys that audio. Best-effort — a
+        # failure here must not re-raise into the entrypoint, which is the very
+        # crash being removed.
+        # Posted DIRECTLY rather than through `_post_phone_event_with_retry`,
+        # which does not forward `epoch` — every other terminal in this gate
+        # carries it, and dropping it here would change which staleness rules
+        # the server applies. One bounded retry covers a transport blip; the
+        # post is idempotent by 0042's deterministic event id.
+        applied = False
+        for _ in range(2):
+            try:
+                outcome = await events.post_event(
+                    attempt_id, "candidate.deferred_pre_disclosure", epoch=epoch,
+                )
+                applied = phone.event_applied(outcome)
+            except Exception:  # noqa: BLE001
+                applied = False
+            if applied:
+                break
+        if not applied:
+            # `post_event` FAILS CLOSED by returning a not-ok outcome rather
+            # than raising, so catching exceptions alone was a guard that could
+            # not fire. An unapplied event means the pre-consent recording was
+            # NOT purged — the one thing this block exists to guarantee — so it
+            # has to be visible rather than assumed.
+            _log.warn(
+                "unknown_event", error_type="phone_gate_outcome",
+                error_category="participant_left_terminal_not_applied",
+            )
+        result = phone.PhoneGateResult(
+            phone.GATE_PARTICIPANT_LEFT, events=[], spoken=[],
+        )
+    finally:
+        # The barrier belongs to the GATE's questions only. Left set, a screening
+        # answer whose speech began before the last gate question would be
+        # silently dropped, and the screening loop has its own
+        # `latest_assistant_anchor` machinery for that job.
+        _clear_question_anchor()
+
 
     # Review repair: cancel a still-running role pre-render once the gate has
     # returned. On a machine/refused/opt-out call (or a HUMAN call where the
