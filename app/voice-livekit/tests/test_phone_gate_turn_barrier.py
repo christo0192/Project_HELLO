@@ -346,6 +346,237 @@ class TestIdentityReaderSkipsStaleTurns(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class TestTheGateAnchorRisesToFirstAudio(unittest.TestCase):
+    """The barrier must anchor on when the question was HEARD, not composed.
+
+    `_mark_question_asked` stamps when the gate begins a question, and its
+    docstring used to argue that was sufficient. On 2026-09-12 it was not: the
+    gate reached the identity line ~0.3s after the participant appeared, but
+    first audio was ~15s later (bounded subscription wait, then generation).
+    Everything said in that window counted as an answer to a question the
+    candidate had not yet heard.
+
+    Source-level because the raise lives inside `_run_phone_session`'s
+    `agent_state_changed` closure; `_queued_turn_is_stale` covers the rule.
+    """
+
+    def test_the_speaking_transition_raises_the_gate_anchor(self):
+        import inspect
+        src = inspect.getsource(agent_mod._run_phone_session)
+        # The AGENT handler, not the user one — both contain the same
+        # `new_state == "speaking"` line and the first match is the wrong side.
+        start = src.index("def _on_phone_agent_state_changed")
+        block = src[start:start + 2600]
+        self.assertIn("gate_question_anchor[0] is not None", block)
+        self.assertIn("gate_question_anchor[0] = _first_audio_ms", block)
+
+    def test_the_raise_is_ONE_WAY_only(self):
+        # A late state change must never move the barrier BACKWARDS onto a turn
+        # already judged, and it must never reach playout end — a barge-in answer
+        # begins after first audio and has to survive, which is the guarantee
+        # #289 restored.
+        import inspect
+        src = inspect.getsource(agent_mod._run_phone_session)
+        start = src.index("def _on_phone_agent_state_changed")
+        block = src[start:start + 2600]
+        self.assertIn("_first_audio_ms > gate_question_anchor[0]", block)
+
+    def test_the_stamp_docstring_no_longer_claims_generation_start_suffices(self):
+        import inspect
+        doc = inspect.getsource(agent_mod._run_phone_session)
+        marker = "def _mark_question_asked()"
+        body = doc[doc.index(marker):doc.index(marker) + 1200]
+        self.assertIn("FLOOR", body)
+        self.assertNotIn("deliberate and sufficient", body)
+
+
+class TestInterruptionTuningIsSet(unittest.TestCase):
+    """Barge-in must require WORDS, not raw energy.
+
+    Left unset the SDK uses `min_interruption_words=0`, so a breath, a keyboard
+    tap or line noise truncates the bot mid-sentence. Two live calls did exactly
+    that: 2026-09-10 (Praveetha, 8/8 bot turns truncated) and 2026-09-12
+    (session ffab6c2a) where "Ah, got it" and "Perfect, so you could" were cut
+    off with the candidate silent. The 2026-09-10 RCA diagnosed it and the
+    tuning was never actually added — these pin that it now is.
+    """
+
+    def test_the_defaults_require_words_and_are_rollbackable(self):
+        for name, fn, default in (
+            ("PHONE_MIN_INTERRUPTION_WORDS",
+             phone.phone_min_interruption_words, 2),
+            ("PHONE_MIN_INTERRUPTION_DURATION_SEC",
+             phone.phone_min_interruption_duration_sec, 0.8),
+        ):
+            import os as _os
+            from unittest.mock import patch as _patch
+            with _patch.dict(_os.environ, {}, clear=False):
+                _os.environ.pop(name, None)
+                self.assertEqual(fn(), default, name)
+            with _patch.dict(_os.environ, {name: "garbage"}):
+                self.assertEqual(fn(), default, f"{name} typo must fail safe")
+        # The SDK default is the documented rollback.
+        import os as _os
+        from unittest.mock import patch as _patch
+        with _patch.dict(_os.environ, {"PHONE_MIN_INTERRUPTION_WORDS": "0"}):
+            self.assertEqual(phone.phone_min_interruption_words(), 0)
+
+    def test_EVERY_turn_detection_branch_carries_the_tuning(self):
+        # THE FOOTGUN. `agent_session.py` ignores every deprecated kwarg the
+        # moment `turn_handling` is passed — so tuning set in only one dialect is
+        # either dropped itself, or silently drops the endpointing beside it.
+        # Each branch must therefore carry a COMPLETE set in its own dialect.
+        import inspect
+        src = inspect.getsource(agent_mod._build_provider_session)
+        start = src.index("turn_detection = phone.phone_turn_detection()")
+        end = src.index('error_type="phone_turn_detection"')
+        block = src[start:end]
+        # deprecated dialect, used by the stt and local branches
+        self.assertEqual(block.count('"min_interruption_words"'), 2, block)
+        self.assertEqual(block.count('"min_interruption_duration"'), 2, block)
+        # turn_handling dialect, used by the dynamic branch alongside endpointing
+        self.assertIn('"interruption"', block)
+        self.assertIn('"min_words"', block)
+        self.assertIn('"min_duration"', block)
+        # and the dynamic branch must still carry endpointing in the same dict
+        self.assertIn('"endpointing"', block)
+
+
+class TestPatienceGateDoesNotSWALLOW_an_interrupted_turn(unittest.TestCase):
+    """A filler after a CUT-OFF bot line must not be suppressed.
+
+    `StopResponse` is how the patience gate stays quiet while a candidate thinks
+    aloud, and that is right when the bot FINISHED speaking. After a barge-in it
+    is the freeze: the SDK's `except StopResponse: return` emits no
+    `conversation_item_added` at all, so the turn vanishes AND the reply is
+    suppressed — the bot stops mid-sentence and waits for a turn that already
+    happened. Live 2026-09-12: 8.3s and 9.4s of dead air, broken only when the
+    candidate spoke again.
+
+    Source-level because both sites live deep inside `on_native_turn`'s closure;
+    the behavioural proof is the mutation battery.
+    """
+
+    def test_both_patience_suppressions_check_the_interrupt_latch(self):
+        import inspect
+        src = inspect.getsource(agent_mod._run_native_phone_screening)
+        # One shared read, then both gates consult it.
+        self.assertIn("prior_interrupted = bool(", src)
+        # Count CODE, not the comment that explains it.
+        code = "\n".join(
+            line for line in src.splitlines()
+            if "not prior_interrupted" in line and not line.lstrip().startswith("#")
+        )
+        self.assertEqual(
+            code.count("not prior_interrupted"), 2,
+            f"a patience suppression still swallows an interrupted turn:\n{code}",
+        )
+        # And the sibling coalesce guard still reads the raw signals.
+        self.assertIn('not prior_turn_interrupted["value"]', src)
+
+
+class TestIdentityReadHasItsOwnBudget(unittest.IsolatedAsyncioTestCase):
+    """The identity read must bound SILENCE without cutting off a slow answer.
+
+    On the live 2026-09-12 call the candidate answered, the answer never
+    produced a turn, and this reader then sat on the CONSENT classifier's 15s
+    budget while he heard nothing — he said "hello" into the gap and that became
+    the identity answer. A timeout here is `unclear`, which proceeds to the
+    disclosure, so waiting longer cannot improve the verdict; it only adds dead
+    air.
+    """
+
+    def test_the_GATE_CALL_SITE_uses_the_identity_budget(self):
+        # The behavioural tests below drive `_read_fresh_turn` directly with
+        # explicit timeouts, so they cannot see WHICH reader the gate passes.
+        # Without this, swapping the call site back to the consent classifier's
+        # 15s budget is invisible — the exact regression this fix removes.
+        import inspect
+        src = inspect.getsource(agent_mod._run_phone_session)
+        start = src.index("async def _next_candidate_turn()")
+        block = src[start:start + 2000]
+        self.assertIn("phone.phone_identity_answer_timeout_sec()", block)
+        # And the hard cap must still be the OLD budget, so the extension can
+        # never wait longer than the behaviour it replaced.
+        self.assertIn(
+            "hard_timeout_sec=phone.phone_classify_answer_timeout_sec()", block)
+        self.assertIn("speaking=", block)
+
+    def test_the_identity_budget_is_SHORTER_than_the_consent_one(self):
+        # The whole point. If someone raises the identity default to the consent
+        # value the silence comes back, and every behavioural test still passes
+        # because they pass their own timeouts.
+        self.assertLess(
+            phone.phone_identity_answer_timeout_sec(),
+            phone.phone_classify_answer_timeout_sec(),
+        )
+
+    async def test_a_silent_line_gives_up_on_the_SHORT_budget(self):
+        turns: asyncio.Queue = asyncio.Queue()
+        started = time.monotonic()
+        got = await agent_mod._read_fresh_turn(
+            turns, (lambda: None), 0.05,
+            speaking=(lambda: False), hard_timeout_sec=5.0,
+        )
+        self.assertEqual(got, "")
+        self.assertLess(
+            time.monotonic() - started, 1.0,
+            "a silent line waited on the long budget",
+        )
+
+    async def test_a_candidate_STILL_SPEAKING_is_not_cut_off(self):
+        # The whole reason the short budget is safe. Speech arrives well after
+        # the short budget would have expired; because they are audibly
+        # speaking, the window extends and the answer is read.
+        turns: asyncio.Queue = asyncio.Queue()
+        speaking = {"value": True}
+
+        async def _late():
+            await asyncio.sleep(0.25)
+            speaking["value"] = False
+            turns.put_nowait(("Yes, this is Christo.", None))
+
+        task = asyncio.ensure_future(_late())
+        self.addCleanup(task.cancel)
+        got = await agent_mod._read_fresh_turn(
+            turns, (lambda: None), 0.05,
+            speaking=(lambda: speaking["value"]), hard_timeout_sec=5.0,
+        )
+        self.assertEqual(got, "Yes, this is Christo.")
+
+    async def test_the_extension_CANNOT_exceed_the_old_budget(self):
+        # A noisy line that reads as "speaking" for ever must still terminate,
+        # and never later than the budget this replaced.
+        turns: asyncio.Queue = asyncio.Queue()
+        started = time.monotonic()
+        got = await agent_mod._read_fresh_turn(
+            turns, (lambda: None), 0.05,
+            speaking=(lambda: True), hard_timeout_sec=0.4,
+        )
+        self.assertEqual(got, "")
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 2.0, "the speaking extension ran unbounded")
+        self.assertGreater(elapsed, 0.2, "the hard cap was not honoured at all")
+
+    async def test_a_BROKEN_speaking_probe_does_not_hang_the_call(self):
+        turns: asyncio.Queue = asyncio.Queue()
+
+        def _boom():
+            raise RuntimeError("probe exploded")
+
+        got = await agent_mod._read_fresh_turn(
+            turns, (lambda: None), 0.05,
+            speaking=_boom, hard_timeout_sec=5.0,
+        )
+        self.assertEqual(got, "")
+
+    async def test_no_speaking_probe_is_the_OLD_behaviour(self):
+        # Back-compat: every existing caller passes only a timeout.
+        turns: asyncio.Queue = asyncio.Queue()
+        got = await agent_mod._read_fresh_turn(turns, (lambda: None), 0.05)
+        self.assertEqual(got, "")
+
+
 class TestSayTranslatesADeadSession(unittest.IsolatedAsyncioTestCase):
     """The `RuntimeError` -> `PhoneParticipantGone` translation.
 
