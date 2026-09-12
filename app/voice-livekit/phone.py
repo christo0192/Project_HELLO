@@ -677,11 +677,21 @@ def phone_role_opening_instruction(role_title: str | None) -> str | None:
     return (
         "You are Christy, warmly opening a friendly phone screening. In ONE or "
         "two short, natural spoken sentences: confirm this chat is about the "
-        f"\"{role}\" role at Interview Kickstart, say you're glad they could hop "
-        "on, and lead into the first question. You MUST say the exact role title "
+        f"\"{role}\" role at Interview Kickstart, and say you're glad they could "
+        "hop on. You MUST say the exact role title "
         f"\"{role}\" verbatim, word for word — never paraphrase, shorten, or "
-        "guess a different role. No stage directions. End by inviting them in, "
-        "not with a question."
+        "guess a different role. No stage directions. "
+        # THE CONTRADICTION THAT CAUSED THE DOUBLE QUESTION. This used to say
+        # "and lead into the first question", then "End by inviting them in, not
+        # with a question" — instructing the model to introduce the first
+        # question and simultaneously not to ask one. It obliged: on 2026-09-12
+        # (session ffab6c2a) it ended with "To get us started, can you tell me a
+        # little about what you are doing right now?", and the planned Q1 was
+        # then asked on top of it a second later. The interviewer asks the first
+        # question; this line only hands over to it.
+        "Do NOT ask the candidate anything. Do NOT ask the first question — "
+        "another part of the system asks it immediately after you. Your line "
+        "must not contain a question mark and must not request any information."
     )
 
 
@@ -710,6 +720,29 @@ def phone_role_opening_faithful(text: Any, role_title: Any) -> bool:
     return re.search(
         r"(?<![a-z0-9])" + re.escape(role) + r"(?![a-z0-9])", spoken,
     ) is not None
+
+
+def phone_role_opening_clean(text: Any, role_title: Any) -> bool:
+    """True when a generated role opening is faithful AND asks nothing.
+
+    `phone_role_opening_faithful` checks exactly one thing — that the role title
+    is spoken verbatim — so a line that names the role and THEN asks the first
+    question passes it. That is what shipped a double question on 2026-09-12
+    (session ffab6c2a): the model's role line ended "To get us started, can you
+    tell me a little about what you are doing right now?", the planned Q1 was
+    asked a second later, and the candidate was asked two different things.
+
+    The identity line has had a hard predicate for this since #288
+    (`_identity_line_asks_identity`). The role line had no analogue; this is it.
+
+    Question acts are counted STRUCTURALLY, not by punctuation, because the line
+    that caused the defect would also be caught by a question mark but "tell me
+    a little about your day" would not — and that is the same failure wearing a
+    period.
+    """
+    if not phone_role_opening_faithful(text, role_title):
+        return False
+    return phone_generated_question_act_count(text) == 0
 
 
 def phone_q1_rephrase_instruction(question_text: Any) -> str | None:
@@ -1009,6 +1042,27 @@ def phone_classify_answer_timeout_sec() -> float:
     its OWN window, so a re-ask always buys the candidate a fresh chance to reply
     instead of racing the leftovers of a single shared budget."""
     return _bounded_float(os.getenv("PHONE_CLASSIFY_ANSWER_TIMEOUT_SEC"), 15.0, 1.0, 60.0)
+
+
+def phone_identity_answer_timeout_sec() -> float:
+    """Bounded wall clock for the IDENTITY answer, separate from consent's.
+
+    The identity reader used to share the consent budget (15s). That is far too
+    long for a question whose timeout is HARMLESS: an unread identity answer is
+    `PHONE_IDENTITY_UNCLEAR`, the documented fail-open, and the gate proceeds
+    straight to the recording disclosure. So a timeout here recovers BY
+    SPEAKING — strictly better than more silence.
+
+    On the live 2026-09-12 call (session ffab6c2a) the candidate's answer never
+    produced a turn, and this reader then sat on its 15s budget while he heard
+    nothing; he said "hello" into the gap and THAT became the identity answer.
+    Four seconds bounds that silence without rushing a real answer, and the
+    caller extends it for as long as the candidate is audibly speaking.
+
+    Rollback: set `PHONE_IDENTITY_ANSWER_TIMEOUT_SEC=15` for the old behaviour.
+    """
+    return _bounded_float(
+        os.getenv("PHONE_IDENTITY_ANSWER_TIMEOUT_SEC"), 4.0, 2.0, 30.0)
 
 
 def phone_answer_timeout_sec() -> float:
@@ -1595,6 +1649,34 @@ def phone_local_endpointing_delays() -> tuple[float, float]:
         phone_static_endpointing_min_delay(),
         phone_static_endpointing_max_delay(),
     )
+
+
+def phone_min_interruption_words() -> int:
+    """How many WORDS a barge-in must carry before it may cut the bot off.
+
+    The SDK default is 0 — barge-in fires on raw VAD energy, so a breath, a
+    keyboard tap or line noise truncates the bot mid-sentence. On a phone line
+    that is not hypothetical: the 2026-09-10 Praveetha call had 8/8 bot turns
+    barged-in and truncated, and 2026-09-12 (session ffab6c2a) cut off "Ah, got
+    it" and "Perfect, so you could" with the candidate silent both times.
+
+    Two words, not one, because a single filler token ("um", "oh") is exactly
+    what a false trigger transcribes as. Nothing is lost by waiting for the
+    second: the SDK keeps the audio and folds it into the next committed turn,
+    so a genuine interruption is DEFERRED to the end of the sentence, never
+    discarded. 0 restores the SDK default.
+    """
+    return _bounded_int_env(os.getenv("PHONE_MIN_INTERRUPTION_WORDS"), 2, 0, 5)
+
+
+def phone_min_interruption_duration_sec() -> float:
+    """How long speech must last before it may cut the bot off.
+
+    Paired with `phone_min_interruption_words`: the word count is the real
+    guard, this is the cheap one that runs first. The SDK default is 0.5s.
+    """
+    return _bounded_float(
+        os.getenv("PHONE_MIN_INTERRUPTION_DURATION_SEC"), 0.8, 0.2, 3.0)
 
 
 # ── P5: the heartbeat cadence envelope ────────────────────────────────
@@ -5821,11 +5903,18 @@ async def run_phone_gate(
 
         async def _deliver_role_opening() -> bool:
             # Call G: prefer the MODEL-AUTHORED opening (natural, not scripted).
-            # `speak_role_opening` returns the spoken line only after its own
-            # readback verified it names the exact role; a None return (generation
-            # failed or renamed the role) falls through to the fixed line, so the
-            # verbatim server role is never lost. Whichever runs, it overlaps the
-            # commit + egress below — the latency mask is unchanged.
+            # `speak_role_opening` COMPOSES and VALIDATES before speaking, and
+            # returns the spoken line; None means nothing was said (rejected
+            # draft, timeout, or a renamed role) and the fixed line below runs,
+            # so the verbatim server role is never lost. Whichever runs, it
+            # overlaps the commit + egress below — the latency mask is unchanged.
+            #
+            # There is no "spoken but unreadable" case any more. That `""`
+            # sentinel existed because the old implementation STREAMED the line
+            # and then tried to read it back out of `latest_assistant`, which can
+            # come back empty after audio has gone out. Composing first means the
+            # text is in hand before playout, so the ambiguity is gone rather
+            # than handled.
             has_role = isinstance(role_title, str) and bool(role_title.strip())
             if speak_role_opening is not None and has_role:
                 try:
@@ -5833,15 +5922,6 @@ async def run_phone_gate(
                 except Exception:  # noqa: BLE001
                     generated = None
                 if isinstance(generated, str) and generated.strip():
-                    return True
-                if generated == "":
-                    # Spoken, transcript unreadable. Speaking the fixed role
-                    # line now would announce the role TWICE — the same shape
-                    # the identity turn guards against. Nothing further is said.
-                    _log.warn(
-                        "unknown_event", error_type="phone_role_opening",
-                        error_category="role_spoken_unreadable",
-                    )
                     return True
             if role_fallback is not None:
                 # Fix 2: prefer the pre-rendered audio (rendered during the
@@ -6914,6 +6994,49 @@ async def phone_warm_prefix_cache(
         await infer_fn(prefix)
     except Exception:  # noqa: BLE001 — a warm-up must never surface on the call
         return
+
+
+PHONE_ROLE_OPENING_COMPOSE_TIMEOUT_SEC = 3.0
+
+
+async def phone_compose_role_opening(
+    role_title: Any,
+    *,
+    infer: Callable[[str], Awaitable[Any]] | None = None,
+) -> str | None:
+    """Compose the role-opening OUT OF BAND, or None on any miss.
+
+    COMPOSE-THEN-SPEAK, not speak-then-check. The old path streamed the model's
+    words straight to TTS and only inspected them afterwards, which cannot work
+    for a constraint: by the time a bad line is detected, the candidate has
+    already heard it. On 2026-09-12 (session ffab6c2a) that shipped a question
+    the caller answered and no part of the system recorded.
+
+    Returning the text instead lets the caller validate FIRST and speak exactly
+    one of {model line, fixed line}. That is strictly safer than the streamed
+    version — nothing can be half-withdrawn — and it is the same shape
+    `phone_rephrase_first_question` already uses for Q1.
+
+    Costs this one line its streaming. Accepted for it alone: it plays under the
+    latency mask that already absorbs the commit, and the identity and consent
+    openings — the first audio of the call — keep streaming.
+    """
+    role = str(role_title or "").strip()
+    instruction = phone_role_opening_instruction(role)
+    if not role or instruction is None:
+        return None
+    infer_fn = infer or _default_phone_interviewer_text
+    try:
+        raw = await asyncio.wait_for(
+            infer_fn(instruction),
+            timeout=PHONE_ROLE_OPENING_COMPOSE_TIMEOUT_SEC,
+        )
+    except Exception:  # noqa: BLE001
+        return None
+    draft = raw.strip() if isinstance(raw, str) else ""
+    if draft and phone_role_opening_clean(draft, role):
+        return draft
+    return None
 
 
 async def phone_rephrase_first_question(
@@ -9997,6 +10120,76 @@ async def _default_phone_identity_inference(prompt: str) -> str | None:
         return data["choices"][0]["message"]["content"]
     except (KeyError, IndexError, TypeError):
         return None
+
+
+PHONE_JUDGE_WARMUP_TIMEOUT_SEC = 3.0
+
+
+async def phone_warm_judge_connection(
+    *, post: Callable[..., Awaitable[Any]] | None = None,
+) -> None:
+    """Open the JUDGE connection before the gate needs it. Never raises.
+
+    WHY THIS EXISTS. `phone_classify_identity` is the FIRST request this call
+    makes to the judge provider — the only other judge caller, the coverage
+    check, runs post-consent. So the identity verdict pays DNS + TLS + a cold
+    model inside its 2.0s cap, and it is SERIAL and SILENT: the candidate hears
+    nothing while it runs, and a timeout returns `unclear`, i.e. it can burn the
+    whole budget to learn nothing. Measured on the live 2026-09-12 call
+    (session ffab6c2a), the gate took 48s answer→consent with this in the middle.
+
+    Unlike `phone_warm_google_connection` — which the code admits is partial,
+    because the LiveKit plugin builds its own httpx pool — this one genuinely
+    shares what the classifier will use: `_phone_coverage_transport()` is a
+    process-wide keepalive pool (`pool_maxsize=2`), so the connection opened
+    here is the connection the verdict reuses.
+
+    Sends a fixed one-token prompt. No candidate data, no résumé, no name —
+    the same privacy scope as the Gemini warm-up.
+    """
+    api_key = phone_judge_api_key()
+    if not api_key:
+        return
+    url = phone_judge_url()
+    if phone_judge_sdk() == "google" or not url:
+        # The google lane builds a client per call; there is no shared pool to
+        # warm, and firing a Gemini request here would buy nothing.
+        return
+    json_body: dict[str, Any] = {
+        "model": phone_judge_model(),
+        "temperature": 0,
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}],
+    }
+    if _phone_judge_is_deepseek(url):
+        json_body["reasoning_effort"] = "none"
+    poster = post or call_with_breaker
+    try:
+        await asyncio.wait_for(
+            poster(
+                "POST", url,
+                breaker=_PHONE_COVERAGE_BREAKER,
+                transport=_phone_coverage_transport(),
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                    "Cache-Control": "no-store",
+                },
+                json_body=json_body,
+                endpoint_hint="unknown", log_failures=False,
+            ),
+            timeout=PHONE_JUDGE_WARMUP_TIMEOUT_SEC,
+        )
+    except Exception:  # noqa: BLE001 — a cold verdict is the only cost.
+        _log.info(
+            "unknown_event", error_type="phone_judge_warmup",
+            error_category="warmup_failed",
+        )
+        return
+    _log.info(
+        "unknown_event", error_type="phone_judge_warmup",
+        error_category="connection_warmed",
+    )
 
 
 async def _default_phone_coverage_inference(prompt: str) -> Any:

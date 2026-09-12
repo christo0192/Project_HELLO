@@ -942,10 +942,19 @@ _TURN_ANCHOR_SANE_LOOKBACK_MS = 60 * 60 * 1000
 _SDK_SESSION_STOPPED_MARKERS = ("isn't running", "is not running")
 
 
+#: How much longer to wait each time the budget expires while the candidate is
+#: still audibly mid-utterance. Short, because it re-checks: a real answer keeps
+#: extending, a silent line gives up on the next pass.
+_SPEAKING_GRACE_SEC = 1.0
+
+
 async def _read_fresh_turn(
     user_turns: "asyncio.Queue",
     question_anchor: "Callable[[], int | None]",
     timeout_sec: float,
+    *,
+    speaking: "Callable[[], bool] | None" = None,
+    hard_timeout_sec: float | None = None,
 ) -> str:
     """Pop the first utterance that began AFTER the question, within one budget.
 
@@ -963,14 +972,41 @@ async def _read_fresh_turn(
     which the caller reads as "nothing usable" rather than as an answer.
     """
     deadline = time.monotonic() + timeout_sec
+    # NEVER WAIT LONGER THAN THE CALLER'S OLD BUDGET, however much the candidate
+    # is speaking. Absent a hard cap the grace below could extend indefinitely
+    # on a noisy line, which is the failure this whole change exists to bound.
+    hard_deadline = time.monotonic() + max(
+        timeout_sec,
+        hard_timeout_sec if hard_timeout_sec is not None else timeout_sec,
+    )
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
+            now = time.monotonic()
+            # DON'T CUT OFF A SLOW STARTER. The budget is short so that SILENCE
+            # is bounded, not so that a candidate mid-sentence gets talked over.
+            # Extending only while they are audibly speaking separates the two:
+            # a real answer keeps the window open, a quiet line closes it on
+            # schedule.
+            if speaking is not None and now < hard_deadline:
+                try:
+                    still_speaking = bool(speaking())
+                except Exception:  # noqa: BLE001 — a broken probe must not end the call
+                    still_speaking = False
+                if still_speaking:
+                    deadline = min(hard_deadline, now + _SPEAKING_GRACE_SEC)
+                    continue
             return ""
         try:
             item = await asyncio.wait_for(user_turns.get(), timeout=remaining)
         except asyncio.TimeoutError:
-            return ""
+            # BACK TO THE TOP, not straight out. `wait_for` expires before the
+            # loop head is re-evaluated, so returning here would skip the
+            # speaking extension entirely and the short budget would cut off a
+            # slow answer — the exact failure the extension exists to prevent.
+            # The head re-checks: still speaking and under the cap ⇒ extend;
+            # otherwise it returns "" immediately, as before.
+            continue
         except Exception:  # noqa: BLE001
             return ""
         text, anchor_ms = _queued_turn(item)
@@ -2121,8 +2157,23 @@ def _build_provider_session(
         # receives `turn_detection`. Logged once below at construction.
         turn_detection = phone.phone_turn_detection()
         endpoint_min, endpoint_max = phone.phone_local_endpointing_delays()
+        # BARGE-IN MUST BE WORDS, NOT ENERGY. Left unset the SDK uses
+        # `min_interruption_words=0`, so a breath or line noise truncates the bot
+        # mid-sentence; `_build_phone_vad` compounds it by taking every Silero
+        # default. Both live defects this fixes (2026-09-10 Praveetha, 2026-09-12
+        # session ffab6c2a) are that trigger firing on a silent candidate.
+        #
+        # CARRIED INTO BOTH BRANCHES DELIBERATELY. `agent_session.py` ignores
+        # EVERY deprecated kwarg the moment `turn_handling` is passed, so putting
+        # these only in one place would either lose them (dynamic) or silently
+        # drop the 0.4/0.8 endpointing below (local). Each branch therefore
+        # carries a COMPLETE set in its own dialect.
+        interrupt_words = phone.phone_min_interruption_words()
+        interrupt_secs = phone.phone_min_interruption_duration_sec()
         if turn_detection == phone.PHONE_TURN_DETECTION_STT:
             session_options["turn_detection"] = "stt"
+            session_options["min_interruption_duration"] = interrupt_secs
+            session_options["min_interruption_words"] = interrupt_words
         elif phone.phone_dynamic_endpointing_enabled():
             # Opt-in phone-only adaptation, hard-bounded to the fixed safety
             # envelope. Fixed endpointing remains the default/rollback path.
@@ -2132,11 +2183,21 @@ def _build_provider_session(
                     "min_delay": endpoint_min,
                     "max_delay": endpoint_max,
                 },
+                # Same dict, because passing `turn_handling` at all disables the
+                # deprecated kwargs — including the interruption ones.
+                "interruption": {
+                    "min_duration": interrupt_secs,
+                    "min_words": interrupt_words,
+                },
             }
         else:
             # Local Silero VAD + LiveKit v1-mini EOU, with a bounded tail.
             session_options["min_endpointing_delay"] = endpoint_min
             session_options["max_endpointing_delay"] = endpoint_max
+            # Deprecated dialect, to match the endpointing kwargs above. Mixing
+            # dialects is what silently drops one set or the other.
+            session_options["min_interruption_duration"] = interrupt_secs
+            session_options["min_interruption_words"] = interrupt_words
         _log.info(
             "unknown_event", error_type="phone_turn_detection",
             error_category=turn_detection,
@@ -3605,6 +3666,12 @@ async def _run_native_phone_screening(
         prior_handle_interrupted = bool(
             getattr(reply_handle[0], "interrupted", False)
         )
+        # THE PRIOR TURN WAS CUT OFF MID-SENTENCE. Read once, here, from both
+        # signals — the coalesce guard below already does exactly this, and the
+        # patience gates need the same fact.
+        prior_interrupted = bool(
+            prior_turn_interrupted["value"] or prior_handle_interrupted
+        )
         # Finding C: advance the FIRST-CLASS exchange identity from the same
         # synchronous structural signals, before they are cleared below. A
         # continuation fragment (prior reply streaming pre-first-audio, not
@@ -3748,7 +3815,29 @@ async def _run_native_phone_screening(
             )
             _apply_callback_decision(turn_ctx, decision)
             return
-        if patience_on and (route == "hesitation" or substance == phone.PHONE_SUBSTANCE_HESITATION):
+        # `and not prior_interrupted` — THE FREEZE. Suppressing a bare filler is
+        # right when the bot finished speaking: the candidate is thinking aloud
+        # and deserves silence. It is WRONG when the bot was cut off mid-sentence,
+        # because the SDK's `except StopResponse: return` emits no
+        # `conversation_item_added` at all, so the turn vanishes AND the reply is
+        # suppressed — the bot simply stops, having said half a sentence, and
+        # waits for a candidate turn that already happened. Observed live
+        # 2026-09-12 (session ffab6c2a): "[interrupted question] Ah, got it" then
+        # 8.3s of nothing until the candidate said "Hello"; and again at
+        # "Perfect, so you could" + 9.4s until "Sorry, please go on."
+        #
+        # Nothing else recovers: the first-audio watchdog early-returns because
+        # audio DID start, and the silence ladder's first nudge is 10s away and
+        # restarts on every agent-state change. Falling through instead reaches
+        # the interrupted re-ask (~4290), bounded by `INTERRUPTED_REASK_CAP`.
+        #
+        # The coalesce guard below carries this same condition for the same
+        # reason — its comment names the doom-loop session it was written for.
+        if (
+            patience_on
+            and not prior_interrupted
+            and (route == "hesitation" or substance == phone.PHONE_SUBSTANCE_HESITATION)
+        ):
             setattr(agent, "_turn_policy", "patience_suppressed")
             _log.info(
                 "unknown_event", error_type="phone_turn_completion",
@@ -3974,7 +4063,10 @@ async def _run_native_phone_screening(
         # bot respond to thinking-out-loud on the stt-endpointing path.
         if route is not None:
             if route == "hesitation":
-                if patience_on:
+                # Same interrupted-turn carve-out as the gate above: a filler
+                # that follows a CUT-OFF bot line must not be swallowed, or the
+                # turn is destroyed and the bot goes silent mid-sentence.
+                if patience_on and not prior_interrupted:
                     setattr(agent, "_turn_policy", "patience_suppressed")
                     from livekit.agents import StopResponse  # noqa: PLC0415
                     raise StopResponse()
@@ -7351,6 +7443,26 @@ async def _run_phone_session(
             first_audio_mono = _monotonic()
             first_audio_wall = time.time()
             latest_assistant_anchor[0] = int(round(first_audio_wall * 1000))
+            # RAISE THE GATE ANCHOR TO FIRST AUDIO.
+            #
+            # `_mark_question_asked` stamps when the gate BEGINS a question, and
+            # its docstring argued that was sufficient because the only utterance
+            # to reject — the pickup "Hello?" — predates even that. On the live
+            # 2026-09-12 call that argument failed: the gate reached the identity
+            # line ~0.3s after the participant appeared, but first audio was ~15s
+            # later (bounded subscription wait, then generation). Everything the
+            # candidate said in that 15s window counted as "after the question"
+            # while they had not yet heard a word of it.
+            #
+            # Raised at FIRST AUDIO, never at playout end. A barge-in answer
+            # begins after first audio and still survives, which is exactly the
+            # guarantee #289 restored; anchoring at playout end is what dropped
+            # it. Monotonic in one direction only, so a late state change can
+            # never move the barrier backwards onto a turn already judged.
+            if gate_question_anchor[0] is not None:
+                _first_audio_ms = int(round(first_audio_wall * 1000))
+                if _first_audio_ms > gate_question_anchor[0]:
+                    gate_question_anchor[0] = _first_audio_ms
             created_mono = latency_state.get("speech_created_mono")
             if created_mono is not None:
                 _emit_phone_latency_segment(
@@ -7662,6 +7774,20 @@ async def _run_phone_session(
             _gwarm.add_done_callback(_PHONE_WARMUP_TASKS.discard)
         except RuntimeError:
             pass
+    # THE JUDGE, warmed on EVERY lane — unlike its siblings this is not gated on
+    # which interviewer is configured, because the identity verdict runs on the
+    # independently-configured judge endpoint regardless. It is the first judge
+    # request of the call, and it is serial and silent inside the gate: the
+    # candidate hears nothing while it resolves DNS, negotiates TLS and waits on
+    # a cold model, and if that exceeds 2.0s the verdict is `unclear` anyway.
+    # Fired here so it overlaps the ring rather than the conversation.
+    if phone.phone_prefix_warmup_enabled() and not _phone_prefix_warmup_off:
+        try:
+            _jwarm = asyncio.create_task(phone.phone_warm_judge_connection())
+            _PHONE_WARMUP_TASKS.add(_jwarm)
+            _jwarm.add_done_callback(_PHONE_WARMUP_TASKS.discard)
+        except RuntimeError:
+            pass
     if (
         phone.phone_prefix_warmup_enabled()
         and not _phone_prefix_warmup_off
@@ -7906,11 +8032,15 @@ async def _run_phone_session(
         is a speech-start anchor rather than a queue drain is in
         `on_candidate_turn`.
 
-        Anchoring at the moment the gate STARTS the question -- not when its
-        audio begins -- is deliberate and sufficient: the utterance this must
-        reject (the pickup "Hello?") started speaking seconds before the gate
-        reached this line at all, so it predates even the earliest anchor. Using
-        generation-start keeps the rule simple and never rejects a real answer.
+        This is the FLOOR, not the final value. `_on_phone_agent_state_changed`
+        raises it to FIRST AUDIO when the line actually starts playing, because
+        generation-start alone was not sufficient: measured on 2026-09-12, the
+        gate reached the identity line ~0.3s after the participant appeared but
+        was not audible for ~15s, so anything said in between counted as an
+        answer to a question the candidate had not heard.
+
+        Stamping here as well keeps the barrier armed for the window BEFORE
+        first audio, which is what rejects the pickup "Hello?".
         """
         gate_question_anchor[0] = int(round(time.time() * 1000))
 
@@ -7982,43 +8112,60 @@ async def _run_phone_session(
         return await _speak_gate_generation(opening_instructions)
 
     async def speak_role_opening(role_title: str) -> str | None:
-        """Author the role-opening through the SAME gate window as `speak_opening`.
+        """Author the role-opening OUT OF BAND, validate it, then speak it.
 
-        Call G (2026-09-08): replaces the deterministic role sentence with a
-        model-authored one that still names the EXACT server role. Runs in the
-        `_gate_opening` window (pre-consent-authorization, so it is spoken but not
-        captured as a screening turn — same as the consent opening), seeds one
-        user turn so the request always carries contents, reads the spoken line
-        back out of `latest_assistant`, and returns it ONLY when
-        `phone_role_opening_faithful` confirms it names the role verbatim.
-        Returns None on any failure or a role miss so the gate speaks the fixed
-        `phone_role_opening_text` fallback — the verbatim role is never lost.
-        The LLM is already warm here: the consent opening (`speak_opening`) runs
-        a generation ~2s earlier in this same gate path, so the role-opening
-        never pays the cold first-token cost.
+        Call G (2026-09-08) replaced the deterministic role sentence with a
+        model-authored one naming the EXACT server role. It ran inside the
+        `_gate_opening` streaming window — and that is what had to change: a
+        streamed line is audible before it can be judged, so the only check
+        (`phone_role_opening_faithful`, verbatim title) could not stop the model
+        ALSO asking the first question. See `phone_compose_role_opening`.
+
+        Returns the spoken text, or None when the draft was rejected or never
+        arrived — in which case the gate speaks the fixed
+        `phone_role_opening_text`, so the verbatim role is never lost.
+
+        The LLM is already warm here: `speak_opening` ran a generation ~2s
+        earlier in this same gate path, so composing pays no cold-start cost.
         """
-        instructions = phone.phone_role_opening_instruction(role_title)
-        if instructions is None:
+        # COMPOSE, VALIDATE, THEN SPEAK — deliberately NOT the streamed gate
+        # window the identity and consent lines use.
+        #
+        # Streaming cannot enforce a constraint on content. The old path sent the
+        # model's words to TTS and inspected them afterwards, so a line that
+        # named the role and then asked the first question passed
+        # `phone_role_opening_faithful` (its only check is the verbatim title)
+        # and was already audible. Live 2026-09-12 (session ffab6c2a): the role
+        # line ended "To get us started, can you tell me a little about what you
+        # are doing right now?", the planned Q1 followed a second later, and the
+        # candidate was asked two different questions — the first of which
+        # reached no transcript row and therefore no scorer.
+        #
+        # Nothing is emitted until `phone_role_opening_clean` passes, so exactly
+        # one of {model line, fixed line} is ever spoken. There is no
+        # unreadable-transcript case to contract around any more: the text is in
+        # hand BEFORE playout, which is why the `""` sentinel is gone.
+        composed = await phone.phone_compose_role_opening(role_title)
+        if composed is None:
+            # Timed out, or asked something, or renamed the role. The gate speaks
+            # the deterministic `phone_role_opening_text` — the verbatim role is
+            # never lost, which is the F1/call-24 guarantee.
+            _log.info(
+                "unknown_event", error_type="phone_role_opening",
+                error_category="composed_role_rejected",
+            )
             return None
-        spoken_text = await _speak_gate_generation(instructions)
-        if phone.phone_role_opening_faithful(spoken_text, role_title):
-            return spoken_text
-        if spoken_text == "":
-            # Spoken, but the transcript never came back — the same contract the
-            # identity turn uses. The gate must NOT speak the fixed role line on
-            # top of a role line the candidate already heard; `""` tells it so.
+        try:
+            await say(composed)
+        except phone.PhoneParticipantGone:
+            raise
+        except Exception:  # noqa: BLE001
             _log.warn(
                 "unknown_event", error_type="phone_role_opening",
-                error_category="generated_role_unreadable",
+                error_category="composed_role_say_failed",
             )
-            return ""
-        # Generated line did not name the exact role — discard it and let the
-        # gate speak the deterministic fallback (never a paraphrased role).
-        _log.info(
-            "unknown_event", error_type="phone_role_opening",
-            error_category="generated_role_unfaithful",
-        )
-        return None
+            return None
+        return composed
 
     async def fetch_durable_consent() -> "phone.PhoneAssessmentState | None":
         """The READ that lets a re-dispatched leg skip a second consent ask.
@@ -8222,10 +8369,19 @@ async def _run_phone_session(
         # Delegates to the module-level reader so the RULE is reachable by a
         # test. Inlined here it was covered only by a harness that
         # re-implemented it, i.e. by its own copy.
+        # ITS OWN BUDGET, not the consent classifier's 15s. A missed identity
+        # answer is `PHONE_IDENTITY_UNCLEAR` — the documented fail-open — and the
+        # gate proceeds straight to the recording disclosure, so a timeout here
+        # recovers BY SPEAKING. Waiting 15s to reach the same verdict just adds
+        # silence, which is exactly what the candidate heard on 2026-09-12.
+        # Extended while they are audibly speaking, hard-capped at the old value
+        # so this can never wait LONGER than before.
         return await _read_fresh_turn(
             user_turns,
             lambda: gate_question_anchor[0],
-            phone.phone_classify_answer_timeout_sec(),
+            phone.phone_identity_answer_timeout_sec(),
+            speaking=lambda: bool(candidate_speaking.get("value")),
+            hard_timeout_sec=phone.phone_classify_answer_timeout_sec(),
         )
 
     async def _run_gate() -> "phone.PhoneGateResult":
