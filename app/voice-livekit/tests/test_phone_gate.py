@@ -14798,6 +14798,60 @@ class TestConsentLatencyFixes(unittest.IsolatedAsyncioTestCase):
         # still proceeds normally.
         self.assertTrue(result.assessment_allowed)
 
+    async def test_an_UNCERTAIN_role_say_does_not_announce_the_role_TWICE(self):
+        """`""` from `speak_role_opening` means "may have been spoken".
+
+        Composing the role line before speaking it removes the ambiguity about
+        the TEXT, but not about whether AUDIO REACHED THE CALLER: `say` speaks
+        and then awaits playout, so a fault can land either side of first audio
+        and from out here the two are indistinguishable.
+
+        Treating that as "nothing was said" makes the gate speak the FIXED role
+        line on top of a role announcement the candidate may have just heard —
+        the double-opener this lane has shipped before. This branch was deleted
+        as "dead" while writing the compose-then-speak change and had to be
+        restored; without a test it would go again.
+        """
+        recorder = Recorder()
+        role_line = phone.phone_role_opening_text("Sales Program Advisor")
+
+        async def _uncertain(_role_title):
+            return ""
+
+        result, _, _ = await self._run_gate(
+            recorder=recorder, speak_role_opening=_uncertain,
+        )
+        self.assertTrue(result.assessment_allowed)
+        # The gate considers the role handled and adds NOTHING on top.
+        self.assertTrue(result.role_opening_spoken)
+        self.assertNotIn(
+            role_line, recorder.spoken,
+            "the fixed role line was spoken over an uncertain announcement",
+        )
+
+    async def test_a_REJECTED_draft_still_speaks_the_fixed_role_line(self):
+        """None means nothing was said — the verbatim role must not be lost.
+
+        The other half of the contract. A draft that timed out, asked a
+        question, or renamed the role returns None, and the F1/call-24
+        guarantee (the EXACT server role is stated) is carried by the fixed
+        fallback.
+        """
+        recorder = Recorder()
+        role_line = phone.phone_role_opening_text("Sales Program Advisor")
+
+        async def _rejected(_role_title):
+            return None
+
+        result, _, _ = await self._run_gate(
+            recorder=recorder, speak_role_opening=_rejected,
+        )
+        self.assertTrue(result.assessment_allowed)
+        self.assertIn(
+            role_line, result.spoken,
+            "a rejected draft lost the verbatim role entirely",
+        )
+
     # ── Fix 2: reader ─────────────────────────────────────────────────────
     def test_prerender_flag_default_on_and_off_tokens(self):
         with patch.dict(os.environ, {}, clear=True):

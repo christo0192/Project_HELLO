@@ -30,6 +30,7 @@ import time
 import types
 import unittest
 from unittest import mock
+from unittest.mock import patch
 
 import phone
 
@@ -1734,6 +1735,105 @@ class TestGateUnsafeTailAccounting(unittest.TestCase):
         cut = phone.phone_gate_split_ready(
             lengths, phone.phone_gate_unsafe_tail_chars("you are a Senior"))
         self.assertEqual(cut, len("you are a "))
+
+
+class TestRoleOpeningIsComposedNotStreamed(unittest.IsolatedAsyncioTestCase):
+    """The role line must never ask a question. Live defect, 2026-09-12.
+
+    The gate's model-authored role opening ended "To get us started, can you
+    tell me a little about what you are doing right now?", the planned Q1 was
+    asked a second later, and the candidate was asked two different things ~1s
+    apart. The first reached no transcript row, so no scorer and no recruiter
+    ever saw a question he had answered.
+
+    The prompt caused it — it said "lead into the first question" AND "not with
+    a question" — but the prompt is a request. `phone_role_opening_faithful`
+    checks one thing, the verbatim role title, so a question-ending line passed
+    it. The identity line has had a hard predicate since #288; this is the role
+    line's.
+    """
+
+    ROLE = "Sales Program Advisor"
+
+    def test_the_INSTRUCTION_no_longer_contradicts_itself(self):
+        text = phone.phone_role_opening_instruction(self.ROLE)
+        self.assertIsNotNone(text)
+        low = text.lower()
+        self.assertNotIn(
+            "lead into the first question", low,
+            "the instruction still tells the model to introduce the question",
+        )
+        self.assertIn("do not ask", low)
+        # The role must still be demanded verbatim — that is the F1/call-24
+        # guarantee and it is what the fallback exists to protect.
+        self.assertIn(self.ROLE, text)
+
+    def test_the_EXACT_live_line_is_rejected(self):
+        live = ("Lovely, this chat is about the Sales Program Advisor role at "
+                "Interview Kickstart. To get us started, can you tell me a "
+                "little about what you are doing right now?")
+        self.assertTrue(
+            phone.phone_role_opening_faithful(live, self.ROLE),
+            "the old check passed this line — that is why it shipped",
+        )
+        self.assertFalse(phone.phone_role_opening_clean(live, self.ROLE))
+
+    def test_an_IMPERATIVE_request_with_no_question_mark_is_rejected(self):
+        # Punctuation is not intent. "Tell me about X." asks just as hard as
+        # "Can you tell me about X?" and a question-mark check misses it.
+        line = ("This is about the Sales Program Advisor role. Tell me a little "
+                "about your most recent job.")
+        self.assertFalse(phone.phone_role_opening_clean(line, self.ROLE))
+
+    def test_a_clean_role_line_is_ACCEPTED(self):
+        line = ("Great — this chat is about the Sales Program Advisor role at "
+                "Interview Kickstart, and I'm glad you could hop on.")
+        self.assertTrue(phone.phone_role_opening_clean(line, self.ROLE))
+
+    def test_a_RENAMED_role_is_still_rejected(self):
+        line = "This is about the Engineering role, glad you could hop on."
+        self.assertFalse(phone.phone_role_opening_clean(line, self.ROLE))
+
+    async def test_compose_returns_None_rather_than_speaking_a_question(self):
+        async def _asks(_instruction):
+            return ("This is about the Sales Program Advisor role. So to start, "
+                    "what are you working on right now?")
+        self.assertIsNone(
+            await phone.phone_compose_role_opening(self.ROLE, infer=_asks),
+            "a question-ending draft must be withheld, not spoken then judged",
+        )
+
+    async def test_compose_returns_a_clean_draft(self):
+        async def _clean(_instruction):
+            return ("Lovely — this chat is about the Sales Program Advisor role "
+                    "at Interview Kickstart, and I'm glad you could hop on.")
+        got = await phone.phone_compose_role_opening(self.ROLE, infer=_clean)
+        self.assertIsNotNone(got)
+        self.assertIn(self.ROLE, got)
+
+    async def test_compose_fails_SAFE_on_a_timeout_or_a_broken_provider(self):
+        async def _hangs(_instruction):
+            await asyncio.sleep(60)
+
+        async def _explodes(_instruction):
+            raise RuntimeError("provider down")
+
+        async def _junk(_instruction):
+            return {"not": "a string"}
+
+        with patch.object(phone, "PHONE_ROLE_OPENING_COMPOSE_TIMEOUT_SEC", 0.05):
+            self.assertIsNone(
+                await phone.phone_compose_role_opening(self.ROLE, infer=_hangs))
+        for bad in (_explodes, _junk):
+            self.assertIsNone(
+                await phone.phone_compose_role_opening(self.ROLE, infer=bad))
+
+    async def test_no_role_title_composes_nothing(self):
+        async def _never(_instruction):
+            raise AssertionError("must not be called without a role")
+        for role in (None, "", "   "):
+            self.assertIsNone(
+                await phone.phone_compose_role_opening(role, infer=_never))
 
 
 class TestControlRunForming(unittest.TestCase):
