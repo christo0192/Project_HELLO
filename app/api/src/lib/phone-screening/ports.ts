@@ -163,6 +163,21 @@ export interface SweepPhoneDayRolledResult {
   readonly skipped?: number;
 }
 
+/**
+ * 0095. The same-day second chance.
+ *
+ * `released`, not `rolled`: nothing about the day has changed. The day-roll
+ * sweep answers "has a new day begun?"; this one answers "have five hours
+ * passed?", and naming them the same would invite a future reader to merge two
+ * sweeps that must stay mutually exclusive.
+ */
+export interface SweepPhoneSameDayRetryResult {
+  readonly status: OrUnknown<'ok'>;
+  readonly examined?: number;
+  readonly released?: number;
+  readonly skipped?: number;
+}
+
 export interface SweepPhoneStrandedSessionsResult {
   readonly status: OrUnknown<'ok'>;
   readonly examined?: number;
@@ -189,6 +204,19 @@ export interface SweepPhoneStrandedRecordingsResult {
 export interface PhonePartialFinalizeSession {
   readonly sessionId: string;
   readonly attemptId: string | null;
+  /** 0095 — the engagement to post `screening.not_started` against. */
+  readonly engagementId: string | null;
+  /**
+   * 0095 / issue #286 — the session carries NO non-gate transcript turn, so
+   * the call never reached a question. The RPC has already driven it
+   * `failed` / `screening_never_started` rather than
+   * `completed` / `conversation_complete`.
+   *
+   * The caller MUST NOT enqueue scoring for such a session: there are no
+   * answers, so the assessment eligibility guard would DLQ it and the failure
+   * would read as a broken scorer rather than a call that never happened.
+   */
+  readonly neverStarted: boolean;
   /** Questions covered = `call_sessions.current_question_index`. */
   readonly covered: number | null;
   /** Plan length; `null` when the plan row is unresolvable (still score). */
@@ -745,6 +773,18 @@ export interface PhoneStores {
     readonly limit?: number;
     readonly now: Date;
   }): Promise<SweepPhoneDayRolledResult>;
+
+  /**
+   * 0095. Drives transition #27b — the SAME-day no-answer retry.
+   *
+   * Separate from `sweepDayRolled` on purpose: the two select on opposite
+   * sides of the same IST-date comparison, so an engagement is claimed by
+   * exactly one of them and neither can answer for the other.
+   */
+  sweepSameDayRetry(input: {
+    readonly limit?: number;
+    readonly now: Date;
+  }): Promise<SweepPhoneSameDayRetryResult>;
 
   /** 0045. Resolves engagements left pointing at an already-ended session. */
   sweepStrandedSessions(input: {

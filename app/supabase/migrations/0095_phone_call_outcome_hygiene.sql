@@ -124,7 +124,111 @@ $$;
 comment on function screening_v2.phone_same_day_retry_delay() is
   'Gap between the first dial and the same-day no-answer retry.';
 
--- ── 3. THE THREE FUNCTIONS, PATCHED ──────────────────────────────────
+-- ── 3. THE VOCABULARY THE NEW EDGES NEED ──────────────────────────────
+--
+-- Every terminal label in this schema lives in a closed CHECK allowlist, and
+-- a CHECK cannot be extended in place — it is dropped and re-declared IN
+-- FULL. Both constraints below are re-declared with their existing members
+-- copied verbatim and the new ones appended, exactly as 0043 and 0042 did
+-- before. NO PRIOR MEMBER IS REMOVED; a diff of these blocks against 0043:91
+-- and 0042:1143 should show additions only.
+--
+-- Without this section the edges added in section 4 do not fail a test — they
+-- raise `check_violation` at runtime, on the first real call that hits them.
+
+-- 3a. phone_call_attempts.outcome_class — two new terminal outcomes.
+alter table screening_v2.phone_call_attempts
+  drop constraint if exists chk_phone_call_attempts_outcome;
+alter table screening_v2.phone_call_attempts
+  add constraint chk_phone_call_attempts_outcome check (
+    outcome_class is null or outcome_class in (
+      'completed','disconnected','no_answer','busy','voicemail','declined',
+      'wrong_number','opt_out','provider_error','window_closed','cancelled',
+      'abandoned_pre_disclosure',
+      -- 0095, additive. Kept as two labels, not one, because they are two
+      -- different failures with two different owners, and merging them would
+      -- make the distinction unrecoverable after the fact:
+      --   * `consent_failed` — the gate itself broke (our RPC, our judge, our
+      --     classifier). NOT a refusal; `declined` already carries that, is
+      --     terminal, and must never be dialled again.
+      --   * `screening_not_started` — the gate PASSED and the call still died
+      --     before a single question was asked.
+      'consent_failed','screening_not_started'))
+  not valid;
+alter table screening_v2.phone_call_attempts
+  validate constraint chk_phone_call_attempts_outcome;
+
+comment on constraint chk_phone_call_attempts_outcome
+  on screening_v2.phone_call_attempts is
+  'Closed outcome allowlist, extended ADDITIVELY by 0043 with '
+  '`abandoned_pre_disclosure` and by 0095 with `consent_failed` and '
+  '`screening_not_started`. No prior member has ever been removed.';
+
+-- 3b. call_sessions.terminal_reason — the never-started session's reason.
+--
+-- Added to the `failed` family, which is the whole point of the change: a
+-- session that never reached a question must not wear a `completed` status.
+-- MP3 is unaffected — `trg_enqueue_recording_finalize` fires on
+-- status IN ('completed','failed','cancelled','expired'), so `failed`
+-- finalizes the recording exactly as `completed` did. Scoring is unaffected
+-- because `assessment.ts` admits only ('completed','conversation_complete')
+-- or ('expired','grace_timeout'), and this pair is neither — correctly, as
+-- there are no answers to score.
+alter table screening_v2.call_sessions
+  drop constraint if exists chk_call_sessions_terminal_reason;
+alter table screening_v2.call_sessions
+  add constraint chk_call_sessions_terminal_reason check (
+    (
+      status not in ('completed', 'failed', 'cancelled', 'expired')
+      and terminal_reason is null
+    )
+    or
+    (
+      status = 'completed'
+      and terminal_reason in ('conversation_complete', 'assessment_done')
+    )
+    or
+    (
+      status = 'failed'
+      and terminal_reason in (
+        'room_create_error', 'worker_crash', 'provider_error',
+        'assessment_error', 'shutdown_forced', 'drain_timeout',
+        'residency_timeout',
+        -- 0095: consent passed, the call then ended before question one.
+        'screening_never_started'
+      )
+    )
+    or
+    (
+      status = 'cancelled'
+      and terminal_reason in (
+        'recruiter_cancelled', 'migrated_abandoned',
+        'duplicate_session', 'shutdown_drain',
+        'candidate_opt_out', 'wrong_number'
+      )
+    )
+    or
+    (
+      status = 'expired'
+      and terminal_reason in ('idle_timeout', 'grace_timeout')
+    )
+    or
+    (
+      status in ('completed', 'failed', 'cancelled', 'expired')
+      and terminal_reason = 'legacy_unknown'
+    )
+  ) not valid;
+alter table screening_v2.call_sessions
+  validate constraint chk_call_sessions_terminal_reason;
+
+comment on constraint chk_call_sessions_terminal_reason on screening_v2.call_sessions is
+  'Family-structured terminal-reason allowlist, extended ADDITIVELY by 0042 '
+  'with the two cancelled pairs and by 0095 with '
+  '("failed","screening_never_started"). voicemail_detected is deliberately '
+  'absent: no session is bound before human classification, so a '
+  'machine-answered attempt has no session to terminalise.';
+
+-- ── 4. THE THREE FUNCTIONS, PATCHED ──────────────────────────────────
 --
 -- Lifted verbatim from the migrations that last defined them (0094, 0067,
 -- 0072) and patched surgically, so the parts NOT being changed are
@@ -1187,6 +1291,41 @@ begin
           v_att_state := 'ended'; v_outcome := 'consent_failed';
         end if;
 
+      -- #31 (0095). CONSENT PASSED, BUT NO SCREENING EVER HAPPENED.
+      -- The other half of the owner's 2026-09-13 ask: a candidate who
+      -- picked up and consented, and whose call then died before a single
+      -- question was asked, is NOT screened and must be called back.
+      --
+      -- `finalize_phone_partial_sessions` now proves this from the
+      -- transcript — no non-gate turn — and drives the session
+      -- `failed` / `screening_never_started`. That fixes the SESSION's
+      -- story. Without this edge the ENGAGEMENT's story stays wrong: the
+      -- sweep posts nothing, so the engagement sits in `in_call` until a
+      -- reaper or a scoring write-back closes it, and the candidate is
+      -- never dialled again.
+      --
+      -- Deliberately NOT `assessment.aborted` (#22's sibling), which is
+      -- terminal `failed`. A scoring run that aborted really is the end of
+      -- the road; a call that never reached a question is a call we still
+      -- owe. Same destination as #30 for the same reason — `awaiting_retry`
+      -- hands it to the ordinary retry machinery: the same-day edge #27b if
+      -- the day's budget allows, otherwise the day roll.
+      --
+      -- Unconditional on state, exactly as #30 is, and safe for the same
+      -- reason: the `terminal_at is not null -> 'terminal'` guard above
+      -- already refuses every terminal engagement before this case is
+      -- reached, so this can neither resurrect a closed engagement nor
+      -- raise from the immutability trigger. The only poster is the partial
+      -- sweep, once per session, and only for a session it has just proven
+      -- carries no non-gate turn.
+      when p_event_type = 'screening.not_started' then
+        v_new_state := 'awaiting_retry';                                -- #31
+        v_reason    := 'screening_never_started';
+        if v_att.id is not null and v_att.state in
+           ('admitted','ringing','answered_unclassified','human','machine') then
+          v_att_state := 'ended'; v_outcome := 'screening_not_started';
+        end if;
+
       when p_event_type in ('hr.cancelled','emergency.stop','ashby.stage_left','prereq.lost') then
         v_new_state := 'cancelled';                                     -- #3 / #29
         v_reason    := replace(p_event_type, '.', '_');
@@ -1506,6 +1645,14 @@ begin
            s.current_question_index as covered,
            s.recording_object_key,
            a.id            as attempt_id,
+           -- 0095: returned so the CALLER can post `screening.not_started`.
+           -- It is posted from the caller and NOT from inside this loop on
+           -- purpose: this sweep holds `for update of s` on call_sessions,
+           -- which is LAST in the pinned lock order, and `apply_phone_event`
+           -- locks the engagement and the attempt. Calling it here would take
+           -- engagement-after-session and invert that order against every
+           -- other writer — a deadlock, not a test failure.
+           a.engagement_id as engagement_id,
            a.state         as attempt_state,
            a.outcome_class as attempt_outcome,
            a.ended_at      as attempt_ended_at,
@@ -1666,6 +1813,7 @@ begin
     v_sessions := v_sessions || jsonb_build_object(
       'session_id',         v_row.session_id,
       'attempt_id',         v_row.attempt_id,
+      'engagement_id',      v_row.engagement_id,
       'covered',            v_row.covered,
       'total',              v_total,
       'disconnect_reason',  v_reason,
@@ -1692,7 +1840,7 @@ begin
 end;
 $$;
 
--- ── 4. THE SWEEP THAT NOTICES A SAME-DAY RETRY IS DUE ─────────────────
+-- ── 5. THE SWEEP THAT NOTICES A SAME-DAY RETRY IS DUE ─────────────────
 --
 -- The mirror of `sweep_phone_day_rolled`, and deliberately a separate function
 -- rather than a widening of it. That sweep asks "has a new day begun?"; this one

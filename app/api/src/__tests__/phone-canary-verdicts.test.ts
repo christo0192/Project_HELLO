@@ -185,6 +185,7 @@ function fakeRuntime(over: {
       lastExpired: null,
       lastReconciled: null,
       lastRolled: null,
+      lastSameDayReleased: null,
       lastStranded: null,
       lastRecStranded: null,
       lastPartialFinalized: null,

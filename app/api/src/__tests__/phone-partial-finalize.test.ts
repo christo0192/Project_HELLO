@@ -44,11 +44,21 @@ const SESSION_A = '11111111-1111-4111-a111-111111111111';
 const SESSION_B = '22222222-2222-4222-a222-222222222222';
 const ATTEMPT_A = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
 const ATTEMPT_B = 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb';
+const ENGAGEMENT_A = 'eeeeeeee-eeee-4eee-aeee-eeeeeeeeeeee';
 
 interface EnqueueCall {
   readonly name: string;
   readonly payload: unknown;
   readonly options: { dedupKey?: string; maxAttempts?: number } | undefined;
+}
+
+/** Every `apply_phone_event` the tick posts, in order. */
+interface EventCall {
+  readonly eventType: string;
+  readonly engagementId: string | null | undefined;
+  readonly attemptId: string | null | undefined;
+  readonly providerEventId: string | null | undefined;
+  readonly source: string;
 }
 
 function screeningConfig(): PhoneScreeningConfig {
@@ -87,6 +97,10 @@ function makeStores(opts: {
     finalized: number;
     sessions: PhonePartialFinalizeSession[];
   };
+  /** 0095 — collects every engagement event the tick posts. */
+  events?: EventCall[];
+  /** 0095 — make `applyEvent` throw, to pin the best-effort contract. */
+  applyEventThrows?: boolean;
 }): PhoneStores {
   return {
     async backlog() {
@@ -103,6 +117,26 @@ function makeStores(opts: {
     },
     async sweepStrandedRecordings() {
       return { status: 'ok' as const, examined: 0, finalized: 0, skipped: 0 };
+    },
+    async sweepSameDayRetry() {
+      return { status: 'ok' as const, examined: 0, released: 0, skipped: 0 };
+    },
+    async applyEvent(input: {
+      source: string;
+      eventType: string;
+      engagementId?: string | null;
+      attemptId?: string | null;
+      providerEventId?: string | null;
+    }) {
+      if (opts.applyEventThrows) throw new Error('apply_event_boom');
+      opts.events?.push({
+        eventType: input.eventType,
+        engagementId: input.engagementId,
+        attemptId: input.attemptId,
+        providerEventId: input.providerEventId,
+        source: input.source,
+      });
+      return { status: 'applied' as const, applied: true };
     },
     async finalizePartialSessions(input: { limit?: number; graceSeconds?: number; now: Date }) {
       const r = opts.onFinalize(input);
@@ -186,6 +220,11 @@ function partialSession(over: Partial<PhonePartialFinalizeSession> = {}): PhoneP
   return {
     sessionId: SESSION_A,
     attemptId: ATTEMPT_A,
+    engagementId: ENGAGEMENT_A,
+    // The DEFAULT is a call that really was screened — `neverStarted` is the
+    // exception, and every pre-0095 test in this file asserts the behaviour
+    // that must survive it unchanged.
+    neverStarted: false,
     covered: 3,
     total: 5,
     disconnectReason: 'candidate_hangup',
@@ -222,6 +261,156 @@ describe('the partial-finalize tick delivers the scorecard on a disconnect', () 
     expect(enqueues[0].options?.maxAttempts).toBe(5);
     // The snapshot reports the finalize count for the health surface.
     expect(runtime.snapshot().lastPartialFinalized).toBe(1);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 0095 / issue #286 — a call that never reached a question
+  // ─────────────────────────────────────────────────────────────────────
+  //
+  // The defect: candidate NEELU S picked up, the consent gate broke, and this
+  // sweep stamped the session `completed` / `conversation_complete` — the same
+  // transition the happy path uses. She was "screened" without being asked a
+  // single question, and nothing would ever dial her again.
+
+  it('a never-started session is NOT enqueued for scoring', async () => {
+    const enqueues: EnqueueCall[] = [];
+    const events: EventCall[] = [];
+    const stores = makeStores({
+      onFinalize: () => ({
+        status: 'ok',
+        finalized: 1,
+        sessions: [partialSession({ neverStarted: true, covered: 0 })],
+      }),
+      events,
+    });
+    const runtime = buildRuntime({ stores, queue: makeQueue(enqueues) });
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    // Wait on the RELEASE, not on a fixed number of turns. An absence proved
+    // by "nothing happened yet" is not proof of anything — this waits for the
+    // tick to reach the end of the never-started branch, so by the time the
+    // enqueue assertion runs the tick demonstrably processed the session.
+    await drainMicrotasks(() => events.length > 0);
+    expect(events).toHaveLength(1);
+
+    // There are no non-gate turns, so there is nothing to score. Enqueuing
+    // anyway would DLQ against the assessment eligibility guard and read as a
+    // broken scorer rather than a call that never happened.
+    expect(enqueues).toHaveLength(0);
+  });
+
+  it('a never-started session releases its ENGAGEMENT for a redial', async () => {
+    const events: EventCall[] = [];
+    const stores = makeStores({
+      onFinalize: () => ({
+        status: 'ok',
+        finalized: 1,
+        sessions: [partialSession({ neverStarted: true, covered: 0 })],
+      }),
+      events,
+    });
+    const runtime = buildRuntime({ stores, queue: makeQueue([]) });
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await drainMicrotasks(() => events.length > 0);
+
+    expect(events).toHaveLength(1);
+    expect(events[0].eventType).toBe('screening.not_started');
+    expect(events[0].engagementId).toBe(ENGAGEMENT_A);
+    // NAMED, so `apply_phone_event` can end the attempt with outcome
+    // `screening_not_started`. A null attempt id would leave the attempt row
+    // still telling the old story, which is half the point of the change.
+    expect(events[0].attemptId).toBe(ATTEMPT_A);
+    // Keyed on the SESSION: the RPC re-selects a session until it leaves
+    // `in_progress`, so a second pass must replay the first verdict rather
+    // than release the engagement twice.
+    expect(events[0].providerEventId).toBe(`notstarted:${SESSION_A}`);
+    expect(events[0].source).toBe('internal');
+  });
+
+  it('a session WITH answers still scores and posts no release event', async () => {
+    // The other half of the contract, and the one the owner named explicitly:
+    // MP3 and scorecard generation must be untouched. A call that reached the
+    // questions and then dropped is a real, scorable partial — it must take
+    // exactly the pre-0095 path.
+    const enqueues: EnqueueCall[] = [];
+    const events: EventCall[] = [];
+    const stores = makeStores({
+      onFinalize: () => ({
+        status: 'ok',
+        finalized: 1,
+        sessions: [partialSession({ neverStarted: false, covered: 3, total: 5 })],
+      }),
+      events,
+    });
+    const runtime = buildRuntime({ stores, queue: makeQueue(enqueues) });
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await drainMicrotasks(() => enqueues.length > 0);
+
+    expect(enqueues).toHaveLength(1);
+    expect(enqueues[0].payload).toMatchObject({
+      session_id: SESSION_A,
+      partial: true,
+      covered: 3,
+      total: 5,
+    });
+    // No engagement release: this candidate WAS screened, and redialling them
+    // would be the mirror-image defect.
+    expect(events).toHaveLength(0);
+  });
+
+  it('a failed release does not abort the loop or block another session', async () => {
+    // Best-effort, exactly like the enqueue: the next pass re-posts under the
+    // same dedup key. A throwing `applyEvent` must not strand the sweep.
+    const enqueues: EnqueueCall[] = [];
+    const stores = makeStores({
+      onFinalize: () => ({
+        status: 'ok',
+        finalized: 2,
+        sessions: [
+          partialSession({ neverStarted: true, covered: 0 }),
+          partialSession({ sessionId: SESSION_B, attemptId: ATTEMPT_B, neverStarted: false }),
+        ],
+      }),
+      applyEventThrows: true,
+    });
+    const runtime = buildRuntime({ stores, queue: makeQueue(enqueues) });
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await drainMicrotasks(() => enqueues.length > 0);
+
+    // The never-started session's release threw; the SECOND session still got
+    // its scorecard.
+    expect(enqueues).toHaveLength(1);
+    expect(enqueues[0].payload).toMatchObject({ session_id: SESSION_B });
+  });
+
+  it('a never-started session with no engagement id posts nothing and still skips scoring', async () => {
+    // The RPC returns `engagement_id` from the attempt join; a malformed or
+    // absent value must not become a post with a null engagement (which
+    // `apply_phone_event` would refuse) nor resurrect the scoring enqueue.
+    const enqueues: EnqueueCall[] = [];
+    const events: EventCall[] = [];
+    const stores = makeStores({
+      onFinalize: () => ({
+        status: 'ok',
+        finalized: 1,
+        sessions: [partialSession({ neverStarted: true, engagementId: null })],
+      }),
+      events,
+    });
+    const runtime = buildRuntime({ stores, queue: makeQueue(enqueues) });
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    // `lastPartialFinalized` is published at the END of the tick, so waiting
+    // on it proves the tick RAN TO COMPLETION. Two absences asserted against
+    // a tick that never fired would pass for the wrong reason.
+    await drainMicrotasks(() => runtime.snapshot().lastPartialFinalized === 1);
+    expect(runtime.snapshot().lastPartialFinalized).toBe(1);
+
+    expect(events).toHaveLength(0);
+    expect(enqueues).toHaveLength(0);
   });
 
   it('the configured grace is passed to the selector (must be far below 0071 7200s)', async () => {
@@ -432,8 +621,6 @@ function makeAssessmentClient(opts: {
   };
   return { client, rpcCalls };
 }
-
-const ENGAGEMENT_A = 'cccccccc-cccc-4ccc-cccc-cccccccccccc';
 
 describe('the scorer plumbing forwards the partial fields', () => {
   it('a partial job scores with partial:true + coverage + disconnect_reason', async () => {
