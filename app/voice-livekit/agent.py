@@ -8142,9 +8142,7 @@ async def _run_phone_session(
         # reached no transcript row and therefore no scorer.
         #
         # Nothing is emitted until `phone_role_opening_clean` passes, so exactly
-        # one of {model line, fixed line} is ever spoken. There is no
-        # unreadable-transcript case to contract around any more: the text is in
-        # hand BEFORE playout, which is why the `""` sentinel is gone.
+        # one of {model line, fixed line} is ever spoken.
         composed = await phone.phone_compose_role_opening(role_title)
         if composed is None:
             # Timed out, or asked something, or renamed the role. The gate speaks
@@ -8160,11 +8158,25 @@ async def _run_phone_session(
         except phone.PhoneParticipantGone:
             raise
         except Exception:  # noqa: BLE001
+            # `""` MEANS "SOMETHING MAY HAVE BEEN SPOKEN — DO NOT SPEAK AGAIN".
+            #
+            # Composing first removes the ambiguity about the TEXT, not about
+            # whether AUDIO REACHED THE CALLER. `say` speaks and then awaits
+            # playout, so a failure here can land either side of first audio: a
+            # fault from `session.say` itself probably means nothing was heard,
+            # one from `wait_for_playout` means the line was already playing.
+            # From out here the two are indistinguishable.
+            #
+            # Returning None would make the gate speak the FIXED role line on
+            # top of a role announcement the candidate may have just heard —
+            # the double-opener this lane has shipped before. `""` is the
+            # established contract for that uncertainty (the identity turn uses
+            # it for the same reason), and the caller honours it.
             _log.warn(
                 "unknown_event", error_type="phone_role_opening",
                 error_category="composed_role_say_failed",
             )
-            return None
+            return ""
         return composed
 
     async def fetch_durable_consent() -> "phone.PhoneAssessmentState | None":

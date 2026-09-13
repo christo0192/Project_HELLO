@@ -5909,12 +5909,14 @@ async def run_phone_gate(
             # so the verbatim server role is never lost. Whichever runs, it
             # overlaps the commit + egress below — the latency mask is unchanged.
             #
-            # There is no "spoken but unreadable" case any more. That `""`
-            # sentinel existed because the old implementation STREAMED the line
-            # and then tried to read it back out of `latest_assistant`, which can
-            # come back empty after audio has gone out. Composing first means the
-            # text is in hand before playout, so the ambiguity is gone rather
-            # than handled.
+            # `""` STILL MEANS "MAY HAVE BEEN SPOKEN — SAY NOTHING MORE".
+            #
+            # Composing before speaking removed one ambiguity (what the text is)
+            # but not the other (whether audio reached the caller). `say` speaks
+            # and then awaits playout, so a fault can land either side of first
+            # audio. Speaking the fixed role line on top of a role announcement
+            # the candidate may have just heard is the double-opener this lane
+            # has shipped before, so the uncertain case says nothing further.
             has_role = isinstance(role_title, str) and bool(role_title.strip())
             if speak_role_opening is not None and has_role:
                 try:
@@ -5922,6 +5924,12 @@ async def run_phone_gate(
                 except Exception:  # noqa: BLE001
                     generated = None
                 if isinstance(generated, str) and generated.strip():
+                    return True
+                if generated == "":
+                    _log.warn(
+                        "unknown_event", error_type="phone_role_opening",
+                        error_category="role_spoken_uncertain",
+                    )
                     return True
             if role_fallback is not None:
                 # Fix 2: prefer the pre-rendered audio (rendered during the
@@ -10146,6 +10154,16 @@ async def phone_warm_judge_connection(
 
     Sends a fixed one-token prompt. No candidate data, no résumé, no name —
     the same privacy scope as the Gemini warm-up.
+
+    SHARES `_PHONE_COVERAGE_BREAKER` with the verdict, deliberately, and that is
+    safe here rather than merely tolerable. A failing warm-up does count toward
+    the threshold (6), but the cooldown is 3s while the gap from warm-up to
+    verdict is the whole ring plus the identity turn — ~40s on the live call
+    that motivated this. So the breaker cannot still be open when the verdict
+    runs. And if warm-ups ARE failing the provider is down, in which case the
+    verdict fails too and lands on `unclear`, the documented fail-open. Giving
+    the warm-up its own breaker would hide exactly the signal the shared one is
+    for.
     """
     api_key = phone_judge_api_key()
     if not api_key:

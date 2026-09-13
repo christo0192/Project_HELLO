@@ -390,6 +390,43 @@ class TestTheGateAnchorRisesToFirstAudio(unittest.TestCase):
         self.assertNotIn("deliberate and sufficient", body)
 
 
+class TestRoleOpeningSayFailureIsAmbiguous(unittest.TestCase):
+    """`speak_role_opening` must return `""`, not None, when `say` fails.
+
+    THE WEAKNESS, STATED. `speak_role_opening` is a closure inside
+    `_run_phone_session`, so nothing can call it directly; the caller-side
+    contract is covered behaviourally by
+    `TestConsentLatencyFixes.test_an_UNCERTAIN_role_say_does_not_announce_the_role_TWICE`,
+    and this source check is all that is reachable for the PRODUCER. Verified by
+    mutation: changing the caller branch is caught behaviourally, changing this
+    return is caught only here.
+
+    Why it matters: returning None would tell the gate nothing was said, and it
+    would speak the fixed role line on top of an announcement the candidate may
+    have just heard. `say` speaks and then awaits playout, so a fault can land
+    either side of first audio — indistinguishable from outside.
+    """
+
+    def test_the_say_failure_path_returns_the_ambiguity_sentinel(self):
+        import inspect
+        src = inspect.getsource(agent_mod._run_phone_session)
+        start = src.index("async def speak_role_opening")
+        end = src.index("async def fetch_durable_consent")
+        block = src[start:end]
+        # The rejected-draft path returns None (nothing spoken, fixed line runs)
+        self.assertIn("return None", block)
+        # The say-failure path returns "" (may have been spoken, say no more)
+        self.assertIn('return ""', block)
+        self.assertIn("composed_role_say_failed", block)
+        # And the two must not be confused: the `""` return has to sit inside
+        # the exception handler, after the `say`.
+        say_at = block.index("await say(composed)")
+        self.assertGreater(
+            block.index('return ""'), say_at,
+            "the ambiguity sentinel moved above the say — it now means nothing",
+        )
+
+
 class TestInterruptionTuningIsSet(unittest.TestCase):
     """Barge-in must require WORDS, not raw energy.
 
