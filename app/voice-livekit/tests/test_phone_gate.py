@@ -1273,7 +1273,14 @@ class TestPhoneGate(unittest.IsolatedAsyncioTestCase):
             {"disclosure.delivered": phone.PhoneApiOutcome(False, error_category="transport")}
         )
         result, client, recorder = await self._gate(phone.CLASSIFY_HUMAN, client=client)
-        self.assertEqual(client.event_types, ["classify.human", "disclosure.delivered"])
+        # Recording still never starts on an unrecorded disclosure — the point
+        # of this test, unchanged. 0095 adds the report: consent was given on
+        # the wire but the system could not prove it, so the pre-consent audio
+        # is purged and the engagement is released rather than left silent for
+        # the reaper to stamp `completed` (issue #286).
+        self.assertEqual(
+            client.event_types,
+            ["classify.human", "disclosure.delivered", "consent.failed"])
         self.assertFalse(result.assessment_allowed)
         self.assertFalse(result.recording_allowed)
         self.assertEqual(recorder.recording_calls, 0)
@@ -1283,7 +1290,14 @@ class TestPhoneGate(unittest.IsolatedAsyncioTestCase):
             {"classify.human": phone.PhoneApiOutcome(False, error_category="transport")}
         )
         result, client, recorder = await self._gate(phone.CLASSIFY_HUMAN, client=client)
-        self.assertEqual(client.event_types, ["classify.human"])
+        # 0095 / issue #286: the gate REPORTS the failure instead of returning
+        # silently. `disclosure.delivered` must still never follow a failed
+        # `classify.human` — that was the original point of this test and it is
+        # unchanged — but the run no longer ends with nothing posted, which is
+        # what left the engagement for the reaper and got the session stamped
+        # `completed`.
+        self.assertEqual(client.event_types, ["classify.human", "consent.failed"])
+        self.assertNotIn("disclosure.delivered", client.event_types)
         self.assertFalse(result.recording_allowed)
         self.assertEqual(recorder.recording_calls, 0)
 
@@ -1334,8 +1348,16 @@ class TestPhoneGate(unittest.IsolatedAsyncioTestCase):
                 self.assertIs(result.assessment_allowed, False)
                 self.assertIs(result.recording_allowed, False)
                 self.assertEqual(recorder.recording_calls, 0)
-                # The consent record is never even attempted.
-                self.assertEqual(client.event_types, ["classify.human"])
+                # The consent record is never even attempted — unchanged, and
+                # still the point. 0095 adds the REPORT of the failure after it:
+                # `consent.failed` purges the pre-consent audio and releases the
+                # engagement for a retry, where before the gate returned in
+                # silence and the session was later stamped `completed`.
+                self.assertEqual(
+                    client.event_types, ["classify.human", "consent.failed"])
+                self.assertNotIn("disclosure.delivered", client.event_types)
+                # `result.events` stays empty: it records what the gate ACHIEVED,
+                # and a reported failure achieved nothing.
                 self.assertEqual(result.events, [])
 
     async def test_an_ignored_disclosure_grants_nothing(self):

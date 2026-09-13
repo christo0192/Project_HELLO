@@ -126,6 +126,10 @@ export const PURGE_BEFORE_EVENTS: ReadonlySet<string> = new Set([
   // exits must destroy them before the event posts, exactly like the refusals.
   'classify.machine',
   'candidate.deferred_pre_disclosure',
+  // 0095: a consent gate that failed on our side leaves exactly the same
+  // pre-consent audio as the refusals above — the egress started at
+  // `call.answered`. Whose fault it was does not change whose voice it is.
+  'consent.failed',
 ]);
 
 export const WORKER_PHONE_EVENTS = [
@@ -140,6 +144,18 @@ export const WORKER_PHONE_EVENTS = [
   'candidate.opt_out',
   'candidate.wrong_number',
   'candidate.deferred_pre_disclosure',
+  // 0095 / issue #286: the consent gate broke because OUR side failed —
+  // the consent/start RPC returned a malformed body, or `classify.human` /
+  // `disclosure.delivered` came back `ignored`. Before this event those three
+  // exits posted NOTHING: the worker returned, the reaper found the session,
+  // and the partial-session sweep stamped `completed`/`conversation_complete`,
+  // so a candidate who was never asked a question was recorded as screened and
+  // could not be redialled without a human noticing.
+  //
+  // Emphatically NOT `disclosure.refused`. A candidate who declines is
+  // terminal and must never be dialled again; this is a fault we own and the
+  // candidate is owed the call they never got.
+  'consent.failed',
   'sip.participant_left',
   'assessment.completed',
   'assessment.aborted',
