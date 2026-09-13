@@ -1746,14 +1746,28 @@ begin
     -- "crashed after eight answers" and "hung up before asking anything"
     -- both landed on `completed` / `conversation_complete`.
     --
-    -- The test is the DIRECT evidence the issue names: a session with no
-    -- non-gate transcript turn never reached a question. Gate turns
-    -- (identity, consent) are excluded because they are exactly what a
-    -- never-started call DOES have.
+    -- The test is DIRECT evidence, not a coverage threshold: did the
+    -- CANDIDATE ever say anything outside the gate?
+    --
+    -- Gate turns (identity, consent) are excluded because they are exactly
+    -- what a never-started call DOES have. And the speaker filter is
+    -- load-bearing: `commit_phone_item_turn` (0071:179) writes BOTH 'bot'
+    -- and 'candidate' turns with is_gate = false, so testing for any
+    -- non-gate turn would count the bot ASKING question one as evidence the
+    -- candidate answered it. A call that died the instant Q1 was asked would
+    -- then be a completed screening — the precise defect this migration
+    -- exists to remove, reintroduced one turn later.
+    --
+    -- Keyed on the candidate it is also the SAFE direction for scoring: if
+    -- the candidate contributed no non-gate turn there is, by construction,
+    -- nothing to score, so skipping the enqueue can never cost a real
+    -- scorecard. Any candidate answer at all — even one — takes the
+    -- `completed` branch and scores exactly as it did before 0095.
     select not exists (
       select 1 from screening_v2.transcript_turns t
        where t.session_id = v_row.session_id
          and t.is_gate = false
+         and t.speaker = 'candidate'
     ) into v_never_started;
 
     -- Already-present signals — reported, never gating. The caller's dedup key
