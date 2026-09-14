@@ -334,6 +334,41 @@ export function decidePhoneOutcome(
         deferral: 'next_ist_day',
       };
 
+    // ── 0095: the two ways a call reached a human and produced no screening ──
+    //
+    // Both CHARGE NOTHING, for the same reason `abandoned_pre_disclosure`
+    // charges nothing: the budgets exist to stop us pestering a candidate who
+    // is not answering, and in both of these the candidate DID answer — we
+    // are the ones who failed. Charging a no-answer budget for our own broken
+    // consent gate would spend the candidate's allowance on our bug and then
+    // abandon them as unreachable.
+    //
+    // Both land on `awaiting_retry` (edges #30 and #31), NOT `eligible`, so
+    // the retry machinery decides when: the same-day edge #27b once
+    // `phone_same_day_retry_delay()` has elapsed and the day's two-dial budget
+    // allows, otherwise the day roll. The deferral is therefore NOT
+    // `next_ist_day` — unlike `abandoned_pre_disclosure`, these may legally be
+    // retried the SAME day, which is the whole point of 0095.
+    case 'consent_failed':
+      return {
+        ...base,
+        charge: 'none',
+        counters: noCharge(counters),
+        engagementState: 'awaiting_retry',
+        terminal: false,
+        stateReason: 'consent_gate_failed',
+      };
+
+    case 'screening_not_started':
+      return {
+        ...base,
+        charge: 'none',
+        counters: noCharge(counters),
+        engagementState: 'awaiting_retry',
+        terminal: false,
+        stateReason: 'screening_never_started',
+      };
+
     // ── Declared in the CHECK, written by nothing in 0042 ───────────────
     // Neither has an edge in `apply_phone_event`. Returning an invented
     // transition here would be a decision no migration has made; a null state
@@ -380,6 +415,11 @@ export const PHONE_OUTCOME_MIGRATION_REASONS: Readonly<
   window_closed: [],
   cancelled: ['hr_cancelled', 'emergency_stop', 'ashby_stage_left', 'prereq_lost'],
   abandoned_pre_disclosure: ['abandoned_pre_disclosure'],
+  // 0095, edges #30 and #31. One reason each, and they are NOT interchangeable:
+  // the gate breaking is a different failure, with a different owner, from the
+  // gate passing and the call dying before question one.
+  consent_failed: ['consent_gate_failed'],
+  screening_not_started: ['screening_never_started'],
 });
 
 /**

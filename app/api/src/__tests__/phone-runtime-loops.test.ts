@@ -130,6 +130,10 @@ const LOOP_KNOBS = {
   // disconnect. On the EXPIRE cadence: a disconnect does not need sub-minute
   // detection, and the reconnect grace already dominates the latency.
   'phone-partial-finalize': 'expireMs',
+  // 0095. The same-day no-answer retry (transition #27b) — the mirror of
+  // `phone-dayroll`, and on the same EXPIRE cadence for the same reason: the
+  // five-hour delay dominates, so detection latency is irrelevant.
+  'phone-sameday': 'expireMs',
 } as const satisfies Readonly<Record<string, keyof PhoneRuntimeConfig>>;
 
 const LOOP_NAMES = Object.keys(LOOP_KNOBS) as ReadonlyArray<keyof typeof LOOP_KNOBS>;
@@ -1656,7 +1660,8 @@ describe('F. M-1 — a reconcile sweep that is NOT RUNNING is not a sweep that f
     const c = counters();
     const runtime = buildRuntime({ stores: makeStores(c), queue: makeEmptyQueue(c) });
     expect(Object.keys(runtime.snapshot().sweepNotOk).sort())
-      .toEqual(['dayroll', 'expire', 'partialfin', 'reclaim', 'reconcile', 'recstrand', 'stranded']);
+      // Sorted, so 0095's `sameday` sits between `recstrand` and `stranded`.
+      .toEqual(['dayroll', 'expire', 'partialfin', 'reclaim', 'reconcile', 'recstrand', 'sameday', 'stranded']);
   });
 });
 
@@ -1685,7 +1690,11 @@ describe('the day-roll and stranded sweeps run, and the claim gates them', () =>
     // single replica silently monopolise both. 0071 adds `recstrand`; 0072
     // adds `partialfin`.
     expect(new Set(c.sweepClaims)).toEqual(
-      new Set(['dayroll', 'stranded', 'recstrand', 'partialfin']),
+      // 0095 adds `sameday` — the same-day no-answer retry. It claims under
+      // its OWN name, not the day-roll's: the two sweeps ask different
+      // questions (has a new day begun? / have five hours passed?) and
+      // sharing a claim would let one starve the other.
+      new Set(['dayroll', 'stranded', 'recstrand', 'partialfin', 'sameday']),
     );
   });
 
