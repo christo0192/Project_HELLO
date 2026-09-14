@@ -110,10 +110,19 @@ comment on column screening_v2.phone_call_attempts.ist_day_seq is
 
 -- ── 2. HOW LONG A NO-ANSWER WAITS FOR ITS SECOND CHANCE ───────────────
 
+-- Declared exactly like `phone_stale_session_seconds` (0045:320): a pure
+-- constant, `language sql immutable`, `set search_path = pg_catalog`, revoked
+-- from public/anon/authenticated and granted only to service_role. The
+-- policy-test rule "every phone function is definer-or-helper, pins
+-- search_path, and is not browser-executable" checks the search_path on EVERY
+-- function, including the ones exempt from SECURITY DEFINER — a constant reads
+-- nothing and so has nothing to define security over, but it must still not
+-- resolve names through a caller-controlled path.
 create or replace function screening_v2.phone_same_day_retry_delay()
 returns interval
 language sql
 immutable
+set search_path = pg_catalog
 as $$
   -- Five hours. Long enough that the second dial is a genuinely different part
   -- of the candidate's day (a morning miss retries after lunch) rather than

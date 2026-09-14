@@ -8833,6 +8833,18 @@ begin
                                                    -- and so has nothing to define
                                                    -- security over.
                                                    'phone_stale_session_seconds',
+                                                   -- 0095. The gap between the
+                                                   -- first dial and the same-day
+                                                   -- no-answer retry: the same
+                                                   -- pure constant as the seven
+                                                   -- above, `language sql
+                                                   -- immutable` with
+                                                   -- `set search_path =
+                                                   -- pg_catalog`, revoked from
+                                                   -- public/anon/authenticated
+                                                   -- and granted only to
+                                                   -- service_role.
+                                                   'phone_same_day_retry_delay',
                                                    'prevent_phone_call_event_mutation',
                                                    'enforce_phone_engagement_transition',
                                                    'enforce_phone_appointment_window') then
@@ -9761,6 +9773,7 @@ declare
   v_eng uuid; v_res jsonb; v_att uuid;
   v_t timestamptz := '2026-08-24T06:00:00Z';   -- 11:30 IST
   v_na integer; v_rc integer;
+  v_seq smallint;                              -- 0095: ist_day_seq
 begin
   v_eng := _policy_tests.phone_fixture('pol42-day');
 
@@ -9777,20 +9790,49 @@ begin
     '0042: a ring timeout charges exactly one no-answer attempt',
     v_na = 1, 'no_answer_attempts=' || v_na);
 
-  -- Same IST day, later hour. Refused: one no-answer-class call a day.
+  -- Same IST day, later hour. 0095 CHANGES THIS ANSWER, and the change is the
+  -- feature: an unanswered call is retried once more the same day rather than
+  -- waiting for the IST date to roll. The ceiling moved from one to two; it
+  -- did not go away, and (b3) below is where that is proved.
   update screening_v2.phone_engagements set state = 'eligible' where id = v_eng;
   v_res := screening_v2.admit_phone_attempt(v_eng, 'no_answer_retry', null, 60,
                                             v_t + interval '4 hours');
   perform _policy_tests.assert(
-    '0042: a second no-answer-class attempt on the SAME IST day is refused',
+    '0095: a second no-answer-class attempt on the SAME IST day is ADMITTED',
+    v_res->>'status' = 'ok',
+    'the same-day retry is the point of 0095; got ' || coalesce(v_res::text, '<null>'));
+  v_att := (v_res->>'attempt_id')::uuid;
+
+  select ist_day_seq into v_seq from screening_v2.phone_call_attempts where id = v_att;
+  perform _policy_tests.assert(
+    '0095: the same-day retry is recorded as the SECOND dial of the day',
+    v_seq = 2,
+    'the ladder is what bounds the day; an unsequenced retry would be invisible to the cap. ist_day_seq='
+      || coalesce(v_seq::text, '<null>'));
+
+  -- ── THE CEILING. A THIRD same-day dial is refused ───────────────────
+  -- End the second attempt first: `uq_phone_attempts_one_live` would
+  -- otherwise refuse on liveness and answer a different question.
+  update screening_v2.phone_call_attempts
+     set state = 'ended', ended_at = v_t + interval '5 hours'
+   where id = v_att;
+  update screening_v2.phone_engagements set state = 'eligible' where id = v_eng;
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'no_answer_retry', null, 60,
+                                            v_t + interval '8 hours');
+  perform _policy_tests.assert(
+    '0095: a THIRD no-answer-class attempt on the same IST day is refused',
     v_res->>'status' = 'daily_attempt_exists',
-    'calling the same person twice in a day is the harassment this index exists to prevent; got '
+    'calling the same person three times in a day is the harassment the ladder exists to prevent; got '
+      || coalesce(v_res::text, '<null>'));
+  perform _policy_tests.assert(
+    '0095: the refusal NAMES the ceiling, so a cap is distinguishable from a race',
+    (v_res->>'max_per_day') = '2',
+    'a bare daily_attempt_exists reads the same as a lost unique-index race; got '
       || coalesce(v_res::text, '<null>'));
 
   -- An ENDED attempt must not block the next admission; that is the
   -- mirror of the PR #70 wedge, where a live row nothing could reclaim
-  -- blocked an engagement for ever. The attempt above is already
-  -- `ended` — the ring timeout ended it.
+  -- blocked an engagement for ever. Both of today's attempts are ended.
   update screening_v2.phone_engagements set state = 'eligible' where id = v_eng;
   v_res := screening_v2.admit_phone_attempt(v_eng, 'no_answer_retry', null, 60,
                                             v_t + interval '1 day');
@@ -10064,16 +10106,33 @@ begin
     '0042: reclaiming an expired lease genuinely frees its fleet slot',
     v_res->>'status' = 'ok', coalesce(v_res::text, '<null>'));
 
-  -- And a reclaimed engagement is admissible again — on the NEXT IST
-  -- day. The per-day index still holds: an abandoned attempt may well
-  -- have rung the phone before the worker died, and an anti-harassment
-  -- invariant must fail closed on that uncertainty. No budget was spent,
-  -- so the candidate keeps all three attempts.
+  -- And a reclaimed engagement is admissible again. The per-day ladder
+  -- still holds and still fails closed on the uncertainty it was written
+  -- for: a reclaim-abandoned attempt (abandon_reason NULL) may well have
+  -- rung the phone before the worker died, so it CHARGES the day. 0095
+  -- changes only the ceiling — one such charged attempt now leaves one dial
+  -- left, so this is admitted as the day's SECOND rather than refused.
+  -- 0083's `infra_deferred` abandonments are the ones that charge nothing,
+  -- and `phone_daily_cap_infra_defer_assert.sql` is where that is proved.
   v_res := screening_v2.admit_phone_attempt(v_engs[1], 'initial', 'owner-1', 60,
                                             v_t + interval '12 minutes');
   perform _policy_tests.assert(
-    '0042: a reclaimed engagement still respects the per-IST-day call limit',
+    '0095: a reclaimed engagement gets the day''s SECOND dial, not a refusal',
+    v_res->>'status' = 'ok', coalesce(v_res::text, '<null>'));
+
+  -- The ceiling still bites on the third. End the live attempt first so the
+  -- refusal is the DAILY one and not `attempt_in_flight`.
+  update screening_v2.phone_call_attempts
+     set state = 'ended', ended_at = v_t + interval '13 minutes'
+   where id = (v_res->>'attempt_id')::uuid;
+  update screening_v2.phone_engagements set state = 'eligible' where id = v_engs[1];
+  v_res := screening_v2.admit_phone_attempt(v_engs[1], 'initial', 'owner-1', 60,
+                                            v_t + interval '14 minutes');
+  perform _policy_tests.assert(
+    '0095: a reclaimed engagement still cannot exceed TWO dials in an IST day',
     v_res->>'status' = 'daily_attempt_exists', coalesce(v_res::text, '<null>'));
+
+  update screening_v2.phone_engagements set state = 'eligible' where id = v_engs[1];
   v_res := screening_v2.admit_phone_attempt(v_engs[1], 'initial', 'owner-1', 60,
                                             v_t + interval '1 day');
   perform _policy_tests.assert(
