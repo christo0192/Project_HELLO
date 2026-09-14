@@ -203,6 +203,32 @@ SESSION_MAX_RESIDENCY_SEC = _bounded_float_env(
     "SESSION_MAX_RESIDENCY_SEC", 3600.0, 60.0, 21600.0
 )
 
+# ── THE OPENING GATE GETS A WALL CLOCK ────────────────────────────────────
+# RCA 2026-09-10. `run_phone_gate` had NO time bound of any kind, and every
+# line it speaks ends in an untimed `await wait_for_playout()` — seventeen such
+# awaits on this path. A single wedged playout (the documented LiveKit SIP
+# outbound-track subscription wedge is bounded only in `speak_opening`, not on
+# the `say`/role-opening paths) therefore froze a call indefinitely, with the
+# candidate hearing dead air and nothing renewing the lease. Two answered calls
+# were reaped mid-gate that day with people on the line.
+#
+# Bounding the GATE bounds all seventeen at once, and does it with the honest
+# semantic: this stretch has a budget, and overrunning it is a fault to be
+# reported rather than a wait to be extended. The API sizes the concurrency
+# lease on exactly this number — `PHONE_OPENING_GATE_SECONDS = 60 +
+# PHONE_IDENTITY_TURN_SECONDS (46) = 106` in
+# `app/api/src/lib/phone-screening/config.ts:146` — so the two are deliberately
+# the same 106s, plus a small margin so the worker's own timeout fires FIRST
+# and produces a diagnosable `gate_timed_out` instead of a silent server-side
+# reap.
+#
+# Floor of 30s: below the classify wait (40s) the bound would cut off healthy
+# calls. Ceiling of 600s: a gate that has run ten minutes is wedged by
+# definition.
+PHONE_GATE_MAX_SECONDS = _bounded_float_env(
+    "PHONE_GATE_MAX_SECONDS", 116.0, 30.0, 600.0
+)
+
 
 def _int_env(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -1511,7 +1537,61 @@ def build_worker_options() -> WorkerOptions:
         # adds ONLY the prewarm hook and nothing else drifts.
         if _phone_worker_orchestrated():
             options["prewarm_fnc"] = _prewarm_post_machine_ready
+        # ── ONE CALL PER MACHINE ──────────────────────────────────────────
+        # `docs/design/phone-cost-and-scale-plan.md` §2.7 specifies "each
+        # worker runs max_jobs=1 … 1 session/worker keeps the VAD/EOU CPU path
+        # safe", and it was never implemented — `grep max_jobs` across this
+        # repo returns nothing.
+        #
+        # IT COULD NOT HAVE BEEN IMPLEMENTED AS WRITTEN. livekit-agents 1.6.4
+        # has no `max_jobs` on WorkerOptions (verified against the pinned
+        # wheel: the only concurrency controls are `load_threshold` and
+        # `num_idle_processes`). Passing it would raise TypeError and the
+        # worker would fail to boot — which is why the note above about not
+        # guessing kwargs against an unimportable SDK is worth keeping.
+        #
+        # `load_threshold` cannot do this job either. It gates on a 2.5s
+        # LAGGING CPU average, and at the moment a second dispatch arrives the
+        # first call is still RINGING — no audio pipeline, no VAD, no TTS — so
+        # measured load is ~0 and the second job is accepted unconditionally.
+        #
+        # `request_fnc` is the lever that actually exists: the SDK calls it per
+        # job request, and `reject(terminate=False)` declines while LEAVING THE
+        # JOB ASSIGNABLE TO ANOTHER WORKER (the SDK uses exactly that form on
+        # its own load path, worker.py:1432). `terminate=True` — the DEFAULT —
+        # would mean "not assigned to another worker", i.e. it would kill the
+        # call outright, so the keyword is passed explicitly and must stay.
+        options["request_fnc"] = _phone_accept_one_job_at_a_time
     return WorkerOptions(**options)
+
+
+#: Job ids this process is CURRENTLY RUNNING. Entries are added when a job's
+#: entrypoint begins and removed in its `finally`, so the set reflects work
+#: actually in flight rather than work merely accepted.
+#:
+#: Accounting deliberately hangs off the ENTRYPOINT, not off `accept()`. An
+#: accept is not a promise: the SFU may never assign the job, and a counter
+#: incremented there would stick at 1 for ever and silently make the machine
+#: permanently unavailable — a worse failure than the double-booking it set out
+#: to prevent, because it is invisible. The cost of this choice is a narrow
+#: race (two requests arriving before either entrypoint starts can both be
+#: accepted), which is exactly today's behaviour and therefore no regression.
+_ACTIVE_PHONE_JOBS: set[str] = set()
+
+
+async def _phone_accept_one_job_at_a_time(req: Any) -> None:
+    """Accept a dispatch only when this machine is not already on a call."""
+    if _ACTIVE_PHONE_JOBS:
+        # Declined, NOT terminated: another pool machine takes it. With a pool
+        # sized to the concurrency target this is the mechanism that keeps N
+        # simultaneous calls on N machines instead of stacking them onto one.
+        _log.warn(
+            "unknown_event", error_type="phone_job_declined",
+            error_category="machine_busy",
+        )
+        await req.reject(terminate=False)
+        return
+    await req.accept()
 
 
 async def _wait_for_sip_participant(ctx: JobContext, timeout_sec: float) -> Any:
@@ -8479,7 +8559,20 @@ async def _run_phone_session(
     # skips every terminal, so no event posts, the pre-consent recording is
     # never purged and the engagement is left in `dialing` for the reaper.
     try:
-        result = await _run_gate()
+        # BOUNDED. See `PHONE_GATE_MAX_SECONDS`: every spoken line in the gate
+        # ends in an untimed playout await, so without this one wedge freezes
+        # the call for ever. On overrun the leg ends with a named outcome and
+        # falls through to the post-gate body, whose first check returns on
+        # `assessment_allowed=False` — inside the `try` whose `finally` closes
+        # the room and finishes the recording.
+        result = await asyncio.wait_for(_run_gate(), timeout=PHONE_GATE_MAX_SECONDS)
+    except asyncio.TimeoutError:
+        _log.warn(
+            "unknown_event", error_type="phone_gate_outcome",
+            schema=phone.GATE_TIMED_OUT,
+            duration_sec=PHONE_GATE_MAX_SECONDS,
+        )
+        result = phone.PhoneGateResult(phone.GATE_TIMED_OUT, events=[], spoken=[])
     except phone.PhoneParticipantGone:
         _log.info(
             "unknown_event", error_type="phone_gate_outcome",
@@ -9032,7 +9125,19 @@ async def entrypoint(ctx: JobContext) -> None:
         return
 
     if _phone_agent_name():
-        await _run_phone_entrypoint(ctx, room_identity)
+        # Register this job as IN FLIGHT for the one-call-per-machine guard
+        # (`_phone_accept_one_job_at_a_time`). Registered here rather than at
+        # accept() so the set can only ever describe work that really started,
+        # and removed in a `finally` so no exit path — including a crash — can
+        # leave the machine looking busy for ever.
+        job_key = str(
+            getattr(getattr(ctx, "job", None), "id", None) or room_identity or id(ctx)
+        )
+        _ACTIVE_PHONE_JOBS.add(job_key)
+        try:
+            await _run_phone_entrypoint(ctx, room_identity)
+        finally:
+            _ACTIVE_PHONE_JOBS.discard(job_key)
         return
 
     await ctx.connect()

@@ -21,6 +21,7 @@ import asyncio
 import inspect
 import json
 import os
+import pathlib
 import re
 import sys
 import types
@@ -637,6 +638,78 @@ class TestWorkerOptions(unittest.TestCase):
                     agent_mod.os.environ.pop("PHONE_AGENT_NAME", None)
                 agent_mod.build_worker_options()
         return dict(_OptionsRecorder.last)
+
+    def test_the_PHONE_worker_accepts_one_job_at_a_time(self):
+        """`docs/design/phone-cost-and-scale-plan.md` §2.7 specifies one session
+        per worker. It was never implemented, and could not have been as
+        written: livekit-agents 1.6.4 has NO `max_jobs` on WorkerOptions — only
+        `load_threshold` and `num_idle_processes` — so passing it would raise
+        TypeError and the worker would not boot.
+
+        `request_fnc` is the control that exists, and it is wired on the PHONE
+        worker only.
+        """
+        options = self._build("phone-screener")
+        self.assertIs(
+            options["request_fnc"], agent_mod._phone_accept_one_job_at_a_time
+        )
+
+    def test_the_BROWSER_worker_is_left_alone(self):
+        """The browser lane shares this source file and must not inherit a
+        phone concurrency policy: an unnamed worker keeps automatic dispatch and
+        every option it has always had."""
+        options = self._build(None)
+        self.assertNotIn("request_fnc", options)
+
+    async def test_a_busy_machine_DECLINES_without_terminating_the_job(self):
+        """The distinction the whole guard rests on.
+
+        `JobRequest.reject()` defaults to `terminate=True`, documented as "the
+        job will not be assigned to another worker" — that would KILL the call
+        rather than move it. Declining must pass the work on, so
+        `terminate=False` is explicit and is asserted here.
+        """
+        calls: list[Any] = []
+
+        class _Req:
+            async def accept(self, **kw):
+                calls.append(("accept", kw))
+
+            async def reject(self, **kw):
+                calls.append(("reject", kw))
+
+        agent_mod._ACTIVE_PHONE_JOBS.clear()
+        try:
+            # Idle machine: accepts.
+            await agent_mod._phone_accept_one_job_at_a_time(_Req())
+            self.assertEqual(calls, [("accept", {})])
+
+            # Busy machine: declines, and leaves the job assignable.
+            calls.clear()
+            agent_mod._ACTIVE_PHONE_JOBS.add("job-1")
+            await agent_mod._phone_accept_one_job_at_a_time(_Req())
+            self.assertEqual(calls, [("reject", {"terminate": False})])
+        finally:
+            agent_mod._ACTIVE_PHONE_JOBS.clear()
+
+    async def test_the_busy_set_is_emptied_even_when_the_call_crashes(self):
+        """A leaked entry would make the machine permanently unavailable —
+        silently, and worse than the double-booking the guard prevents. The
+        entrypoint removes it in a `finally`, so no exit path can strand it."""
+        agent_mod._ACTIVE_PHONE_JOBS.clear()
+
+        async def _boom(_ctx, _room):
+            raise RuntimeError("call died")
+
+        ctx = SimpleNamespace(job=SimpleNamespace(id="job-xyz"))
+        with patch.object(agent_mod, "_phone_agent_name", lambda: "phone-screener"), \
+             patch.object(agent_mod, "_worker_handles_room", lambda *a, **k: True), \
+             patch.object(agent_mod, "_room_name_from_context", lambda _c: _PHONE_ROOM), \
+             patch.object(agent_mod, "_room_metadata_from_context", lambda _c: None), \
+             patch.object(agent_mod, "_run_phone_entrypoint", _boom):
+            with self.assertRaises(RuntimeError):
+                await agent_mod.entrypoint(ctx)
+        self.assertEqual(agent_mod._ACTIVE_PHONE_JOBS, set())
 
     def test_default_worker_has_no_agent_name(self):
         options = self._build(None)
@@ -3384,6 +3457,64 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persistence_spy.mock_calls, [])
         # The leg is torn down rather than left on a slot it does not hold.
         delete.assert_awaited()
+
+    async def test_a_WEDGED_gate_is_bounded_and_ends_the_leg(self):
+        """RCA 2026-09-10: the gate had no wall clock and every line it speaks
+        ends in an untimed playout await, so one wedge froze the call until the
+        server reaped the lease — twice, with candidates on the line.
+
+        A gate that overruns must now END with a named outcome rather than wait
+        for ever. The room is torn down; nothing is claimed about a screening
+        that never happened.
+        """
+        async def _never_returns(*_a, **_kw):
+            await asyncio.sleep(3600)
+
+        with patch.object(agent_mod, "PHONE_GATE_MAX_SECONDS", 0.05), \
+             patch.object(phone, "run_phone_gate", _never_returns):
+            result, client, _, delete, _, persistence_spy = await self._run_session(
+                answers=("Yes, that's fine.",), close_after=False,
+            )
+
+        self.assertEqual(result.outcome, phone.GATE_TIMED_OUT)
+        self.assertFalse(result.assessment_allowed)
+        # Nothing is claimed about a conversation that never happened.
+        self.assertNotIn("assessment.completed", client.event_types)
+        self.assertEqual(client.assessment_calls, [])
+        self.assertEqual(persistence_spy.mock_calls, [])
+        # And the leg is actually torn down rather than left holding a slot.
+        delete.assert_awaited()
+
+    async def test_the_gate_bound_matches_the_API_lease_allowance(self):
+        """The worker's gate budget and the API's lease allowance describe the
+        same stretch of a call, so they must not drift apart.
+
+        `PHONE_OPENING_GATE_SECONDS = 60 + PHONE_IDENTITY_TURN_SECONDS (46)` in
+        `app/api/src/lib/phone-screening/config.ts`. The worker's bound is that
+        number plus a small margin, so the WORKER times out first and produces a
+        diagnosable `gate_timed_out` instead of a silent server-side reap.
+        """
+        cfg = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "api" / "src" / "lib" / "phone-screening" / "config.ts"
+        ).read_text(encoding="utf-8")
+        identity = int(
+            re.search(r"PHONE_IDENTITY_TURN_SECONDS\s*=\s*(\d+)", cfg).group(1)
+        )
+        gate = re.search(
+            r"PHONE_OPENING_GATE_SECONDS\s*=\s*(\d+)\s*\+\s*PHONE_IDENTITY_TURN_SECONDS",
+            cfg,
+        )
+        api_allowance = int(gate.group(1)) + identity
+        self.assertGreater(
+            agent_mod.PHONE_GATE_MAX_SECONDS, api_allowance,
+            "the worker must outlast the API's allowance so IT reports the fault",
+        )
+        self.assertLessEqual(
+            agent_mod.PHONE_GATE_MAX_SECONDS, api_allowance + 30,
+            "a bound far above the allowance lets the server reap first, which is"
+            " the silent failure this bound exists to replace",
+        )
 
     async def test_the_lease_is_re_based_ONCE_on_answer_and_not_beaten_again(self):
         """The narrowed successor to "nothing is heartbeaten before consent".

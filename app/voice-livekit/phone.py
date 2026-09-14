@@ -4710,6 +4710,14 @@ _OUTCOME_CLOSING: dict[str, str] = {
 
 GATE_NO_PARTICIPANT = "no_participant"
 GATE_PARTICIPANT_LEFT = "participant_left"
+#: The opening gate overran its wall clock (`PHONE_GATE_MAX_SECONDS`).
+#:
+#: Unreachable before 2026-09-14: the gate had no bound at all, so a wedged
+#: playout simply froze the call until the server reaped the lease — which on
+#: 2026-09-10 it did, twice, with candidates on the line. A gate that overruns
+#: is now a REPORTED fault rather than an indefinite wait, which is the whole
+#: difference between a diagnosable incident and dead air.
+GATE_TIMED_OUT = "gate_timed_out"
 
 
 class PhoneParticipantGone(Exception):

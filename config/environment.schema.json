@@ -186,6 +186,7 @@
         "PHONE_AUDIO_NO_INPUT_WARN_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_TERMINAL_REPLY_TIMEOUT_SEC": { "requiredInProduction": true, "secret": false },
         "SESSION_MAX_RESIDENCY_SEC": { "requiredInProduction": false, "secret": false },
+        "PHONE_GATE_MAX_SECONDS": { "requiredInProduction": false, "secret": false },
         "PHONE_BOUNCE_MODE": { "requiredInProduction": false, "secret": false },
         "PHONE_DETERMINISTIC_OPENER": { "requiredInProduction": false, "secret": false },
         "PHONE_GATE_FLOW": { "requiredInProduction": false, "secret": false },
