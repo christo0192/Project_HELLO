@@ -1555,43 +1555,66 @@ def build_worker_options() -> WorkerOptions:
         # first call is still RINGING — no audio pipeline, no VAD, no TTS — so
         # measured load is ~0 and the second job is accepted unconditionally.
         #
-        # `request_fnc` is the lever that actually exists: the SDK calls it per
-        # job request, and `reject(terminate=False)` declines while LEAVING THE
-        # JOB ASSIGNABLE TO ANOTHER WORKER (the SDK uses exactly that form on
-        # its own load path, worker.py:1432). `terminate=True` — the DEFAULT —
-        # would mean "not assigned to another worker", i.e. it would kill the
-        # call outright, so the keyword is passed explicitly and must stay.
-        options["request_fnc"] = _phone_accept_one_job_at_a_time
+        # `load_fnc` is the lever that actually exists AND runs in the right
+        # process. `request_fnc` looks like the obvious place for this and is a
+        # TRAP: it runs in the worker's MAIN process, while every entrypoint
+        # runs in its own forked job process (`JobExecutorType.PROCESS` is the
+        # default on Linux — worker.py:125-129). So any "am I busy" flag set
+        # inside the entrypoint is written in the CHILD and is invisible to the
+        # parent that answers the next dispatch. A guard built that way can
+        # never fire, and would have shipped looking exactly like a fix.
+        #
+        # `load_fnc` is called in the parent, with the worker itself
+        # (worker.py:1280-1289 passes `self` to any one-argument callable), and
+        # `Worker.active_jobs` is the parent's own view of the job processes it
+        # has launched. The SDK refreshes the load before EVERY availability
+        # answer (`_answer_availability` -> `_refresh_worker_load`) and answers
+        # `available=False` without `terminate` when it is over threshold —
+        # which is precisely "decline, but let another worker take it".
+        options["load_fnc"] = _phone_one_call_per_machine_load
+        # Pinned, not left to the default. The default is a ServerEnvOption
+        # whose DEV value is `math.inf`, and `_is_available` short-circuits to
+        # True on an infinite threshold — so in dev the gate would silently be
+        # off. A plain float applies in both modes. It must stay < 1 (the SDK
+        # refuses `>= 1` in prod) and > 0, and anything in that range works:
+        # the load signal below is 0.0 or 1.0, never in between.
+        options["load_threshold"] = 0.75
     return WorkerOptions(**options)
 
 
-#: Job ids this process is CURRENTLY RUNNING. Entries are added when a job's
-#: entrypoint begins and removed in its `finally`, so the set reflects work
-#: actually in flight rather than work merely accepted.
+#: How many phone calls one machine may conduct at once.
 #:
-#: Accounting deliberately hangs off the ENTRYPOINT, not off `accept()`. An
-#: accept is not a promise: the SFU may never assign the job, and a counter
-#: incremented there would stick at 1 for ever and silently make the machine
-#: permanently unavailable — a worse failure than the double-booking it set out
-#: to prevent, because it is invisible. The cost of this choice is a narrow
-#: race (two requests arriving before either entrypoint starts can both be
-#: accepted), which is exactly today's behaviour and therefore no regression.
-_ACTIVE_PHONE_JOBS: set[str] = set()
+#: ONE, per `docs/design/phone-cost-and-scale-plan.md` §2.7 ("1 session/worker
+#: keeps the VAD/EOU CPU path safe"). Ten simultaneous calls therefore means
+#: ten pool machines, not one machine taking ten jobs — stacking calls onto a
+#: machine is the failure this exists to prevent, not a fallback for a pool
+#: that is too small.
+PHONE_JOBS_PER_MACHINE = 1
 
 
-async def _phone_accept_one_job_at_a_time(req: Any) -> None:
-    """Accept a dispatch only when this machine is not already on a call."""
-    if _ACTIVE_PHONE_JOBS:
-        # Declined, NOT terminated: another pool machine takes it. With a pool
-        # sized to the concurrency target this is the mechanism that keeps N
-        # simultaneous calls on N machines instead of stacking them onto one.
-        _log.warn(
-            "unknown_event", error_type="phone_job_declined",
-            error_category="machine_busy",
-        )
-        await req.reject(terminate=False)
-        return
-    await req.accept()
+def _phone_one_call_per_machine_load(server: Any) -> float:
+    """Report a saturated machine as fully loaded. Runs in the PARENT process.
+
+    Deliberately NOT a CPU measurement. The SDK's default load function reads a
+    2.5-second lagging CPU average, and at the moment a second dispatch arrives
+    the first call is still RINGING — no audio pipeline, no VAD, no TTS — so
+    measured load is ~0 and the second job is accepted onto the same machine.
+    That is exactly how two simultaneous calls ended up sharing one box.
+
+    What the gate needs is a COUNT, and `Worker.active_jobs` is the parent's own
+    list of the job processes it has launched. Reading it costs nothing and
+    cannot lie about a child's state the way a module global would.
+
+    A machine that cannot be asked how busy it is reports itself BUSY: the SDK
+    swallows nothing here, and refusing a dispatch costs one redial from the
+    pool, while accepting a second call onto a saturated machine costs the
+    conversation that is already on it.
+    """
+    try:
+        active = len(server.active_jobs)
+    except Exception:  # pragma: no cover - defensive; the SDK owns this
+        return 1.0
+    return 1.0 if active >= PHONE_JOBS_PER_MACHINE else 0.0
 
 
 async def _wait_for_sip_participant(ctx: JobContext, timeout_sec: float) -> Any:
@@ -9125,19 +9148,12 @@ async def entrypoint(ctx: JobContext) -> None:
         return
 
     if _phone_agent_name():
-        # Register this job as IN FLIGHT for the one-call-per-machine guard
-        # (`_phone_accept_one_job_at_a_time`). Registered here rather than at
-        # accept() so the set can only ever describe work that really started,
-        # and removed in a `finally` so no exit path — including a crash — can
-        # leave the machine looking busy for ever.
-        job_key = str(
-            getattr(getattr(ctx, "job", None), "id", None) or room_identity or id(ctx)
-        )
-        _ACTIVE_PHONE_JOBS.add(job_key)
-        try:
-            await _run_phone_entrypoint(ctx, room_identity)
-        finally:
-            _ACTIVE_PHONE_JOBS.discard(job_key)
+        # No job accounting here. The one-call-per-machine gate lives in
+        # `_phone_one_call_per_machine_load`, which runs in the worker's MAIN
+        # process; this entrypoint runs in a FORKED job process, so anything it
+        # recorded would be invisible to the process that answers the next
+        # dispatch.
+        await _run_phone_entrypoint(ctx, room_identity)
         return
 
     await ctx.connect()

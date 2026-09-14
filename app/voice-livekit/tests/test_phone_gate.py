@@ -639,77 +639,88 @@ class TestWorkerOptions(unittest.TestCase):
                 agent_mod.build_worker_options()
         return dict(_OptionsRecorder.last)
 
-    def test_the_PHONE_worker_accepts_one_job_at_a_time(self):
+    def test_the_PHONE_worker_admits_one_call_at_a_time(self):
         """`docs/design/phone-cost-and-scale-plan.md` §2.7 specifies one session
         per worker. It was never implemented, and could not have been as
-        written: livekit-agents 1.6.4 has NO `max_jobs` on WorkerOptions — only
-        `load_threshold` and `num_idle_processes` — so passing it would raise
-        TypeError and the worker would not boot.
+        written: livekit-agents 1.6.4 has NO `max_jobs` on WorkerOptions.
 
-        `request_fnc` is the control that exists, and it is wired on the PHONE
-        worker only.
+        `load_fnc` + `load_threshold` are the controls that exist, and both are
+        wired on the PHONE worker only. The threshold is PINNED rather than
+        left to the SDK default, because that default is infinite in dev mode
+        and `_is_available` short-circuits to True on an infinite threshold.
         """
         options = self._build("phone-screener")
         self.assertIs(
-            options["request_fnc"], agent_mod._phone_accept_one_job_at_a_time
+            options["load_fnc"], agent_mod._phone_one_call_per_machine_load
         )
+        threshold = options["load_threshold"]
+        self.assertIsInstance(threshold, float)
+        # Strictly between 0 and 1: the SDK refuses >= 1 in prod, and <= 0 would
+        # make the machine permanently unavailable.
+        self.assertGreater(threshold, 0.0)
+        self.assertLess(threshold, 1.0)
 
     def test_the_BROWSER_worker_is_left_alone(self):
         """The browser lane shares this source file and must not inherit a
         phone concurrency policy: an unnamed worker keeps automatic dispatch and
         every option it has always had."""
         options = self._build(None)
-        self.assertNotIn("request_fnc", options)
+        self.assertNotIn("load_fnc", options)
+        self.assertNotIn("load_threshold", options)
 
-    async def test_a_busy_machine_DECLINES_without_terminating_the_job(self):
-        """The distinction the whole guard rests on.
+    def test_a_BUSY_machine_reports_itself_fully_loaded(self):
+        """The signal the SDK gates on.
 
-        `JobRequest.reject()` defaults to `terminate=True`, documented as "the
-        job will not be assigned to another worker" — that would KILL the call
-        rather than move it. Declining must pass the work on, so
-        `terminate=False` is explicit and is asserted here.
+        `_answer_availability` refreshes the load and answers `available=False`
+        WITHOUT `terminate` when it is at or over threshold — which is exactly
+        "decline this dispatch, but let another worker take it". An idle
+        machine must report 0.0 or it would never take a call at all.
         """
-        calls: list[Any] = []
+        idle = types.SimpleNamespace(active_jobs=[])
+        busy = types.SimpleNamespace(active_jobs=[object()])
+        self.assertEqual(agent_mod._phone_one_call_per_machine_load(idle), 0.0)
+        self.assertEqual(agent_mod._phone_one_call_per_machine_load(busy), 1.0)
+        # And the reported load must actually cross the threshold the options
+        # pin, or the gate is decorative.
+        options = self._build("phone-screener")
+        self.assertLess(
+            agent_mod._phone_one_call_per_machine_load(idle), options["load_threshold"]
+        )
+        self.assertGreaterEqual(
+            agent_mod._phone_one_call_per_machine_load(busy), options["load_threshold"]
+        )
 
-        class _Req:
-            async def accept(self, **kw):
-                calls.append(("accept", kw))
+    def test_a_machine_that_cannot_be_asked_reports_itself_BUSY(self):
+        """Fail closed. Refusing a dispatch costs one redial from the pool;
+        accepting a second call onto a saturated machine costs the conversation
+        already on it."""
 
-            async def reject(self, **kw):
-                calls.append(("reject", kw))
+        class _Broken:
+            @property
+            def active_jobs(self):
+                raise RuntimeError("ipc gone")
 
-        agent_mod._ACTIVE_PHONE_JOBS.clear()
-        try:
-            # Idle machine: accepts.
-            await agent_mod._phone_accept_one_job_at_a_time(_Req())
-            self.assertEqual(calls, [("accept", {})])
+        self.assertEqual(agent_mod._phone_one_call_per_machine_load(_Broken()), 1.0)
 
-            # Busy machine: declines, and leaves the job assignable.
-            calls.clear()
-            agent_mod._ACTIVE_PHONE_JOBS.add("job-1")
-            await agent_mod._phone_accept_one_job_at_a_time(_Req())
-            self.assertEqual(calls, [("reject", {"terminate": False})])
-        finally:
-            agent_mod._ACTIVE_PHONE_JOBS.clear()
+    def test_the_gate_is_NOT_built_on_entrypoint_state(self):
+        """The trap this replaced.
 
-    async def test_the_busy_set_is_emptied_even_when_the_call_crashes(self):
-        """A leaked entry would make the machine permanently unavailable —
-        silently, and worse than the double-booking the guard prevents. The
-        entrypoint removes it in a `finally`, so no exit path can strand it."""
-        agent_mod._ACTIVE_PHONE_JOBS.clear()
+        Every entrypoint runs in a FORKED job process (`JobExecutorType.PROCESS`
+        is the SDK default on Linux), while the availability answer is made in
+        the worker's MAIN process. A busy-flag set inside the entrypoint is
+        written in the child and is invisible to the parent, so a guard built
+        that way can never fire — and would have shipped looking like a fix.
 
-        async def _boom(_ctx, _room):
-            raise RuntimeError("call died")
-
-        ctx = SimpleNamespace(job=SimpleNamespace(id="job-xyz"))
-        with patch.object(agent_mod, "_phone_agent_name", lambda: "phone-screener"), \
-             patch.object(agent_mod, "_worker_handles_room", lambda *a, **k: True), \
-             patch.object(agent_mod, "_room_name_from_context", lambda _c: _PHONE_ROOM), \
-             patch.object(agent_mod, "_room_metadata_from_context", lambda _c: None), \
-             patch.object(agent_mod, "_run_phone_entrypoint", _boom):
-            with self.assertRaises(RuntimeError):
-                await agent_mod.entrypoint(ctx)
-        self.assertEqual(agent_mod._ACTIVE_PHONE_JOBS, set())
+        Asserted structurally: no module-level job registry, and the phone
+        entrypoint adds nothing to one.
+        """
+        self.assertFalse(
+            hasattr(agent_mod, "_ACTIVE_PHONE_JOBS"),
+            "a parent-invisible job registry is back",
+        )
+        self.assertFalse(hasattr(agent_mod, "_phone_accept_one_job_at_a_time"))
+        options = self._build("phone-screener")
+        self.assertNotIn("request_fnc", options)
 
     def test_default_worker_has_no_agent_name(self):
         options = self._build(None)
