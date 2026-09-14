@@ -209,6 +209,25 @@ _BROWSER_ROOM = "screening-5b2a34cb-a912-4c68-a2c2-79ccdc1dcdd1"
 
 _EPOCH = 3
 
+#: How long a harness-driven fake call may live before `_run_phone_session`'s
+#: residency watchdog ends it.
+#:
+#: This was 0.05 s, and at that value THE CAP decided outcomes rather than the
+#: code under test. A clean call took ~0.03 s, so any extra await in the call
+#: path — a lease renewal at answer, one more scheduling round — tipped the leg
+#: into `residency_timeout` and tests asserting a goodbye, a nudge ladder or a
+#: terminal verdict failed for a reason that had nothing to do with their
+#: subject. Production's default is 3600 s with a 60 s floor (`agent.py:202`),
+#: so 0.05 s was never modelling anything real; it was only "end the fake call
+#: quickly".
+#:
+#: One second keeps the suite fast (only a call that never ends on its own
+#: waits this long) while leaving two orders of magnitude of headroom, so the
+#: watchdog fires when a call genuinely hangs and not when it is merely slower
+#: than 50 ms. Tests that want the residency to win still patch it lower
+#: themselves.
+_HARNESS_RESIDENCY_SEC = 1.0
+
 
 def _dispatch_metadata(
     *, session_id=_SESSION_ID, attempt_id=_ATTEMPT_ID, channel="phone",
@@ -3244,7 +3263,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
              patch.object(
                  agent_mod, "_phone_recording_permitted", new=recording_seam
              ), \
-             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", _HARNESS_RESIDENCY_SEC):
             task = asyncio.ensure_future(
                 agent_mod._run_phone_session(
                     ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
@@ -3339,14 +3358,25 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         engagement's previous state, so `assessment.aborted` would be untrue
         and ignored, and `assessment.completed` would be a lie.
         """
+        # TWO scripted refusals, not one. The lease is now re-based on the
+        # ANSWER (`rebase_lease_on_answer`), so the first scripted outcome is
+        # consumed by that renewal inside the gate; the periodic heartbeat's
+        # first beat takes the second. Scripting only one would have let the
+        # loop see the default `ok` and the conversation would carry on — the
+        # test would still pass its later assertions while no longer exercising
+        # a lost lease at all.
         client = FakeEventClient(heartbeats=[
+            phone.PhoneApiOutcome(False, phone.HEARTBEAT_LEASE_LOST_STATUS),
             phone.PhoneApiOutcome(False, phone.HEARTBEAT_LEASE_LOST_STATUS),
         ])
         result, client, recording, delete, session, persistence_spy = (
             await self._run_session(answers=("Yes, that's fine.",), client=client)
         )
         self.assertTrue(result.assessment_allowed)
-        self.assertEqual(client.heartbeats, [(_ATTEMPT_ID, _SESSION_ID, _EPOCH)])
+        self.assertEqual(
+            client.heartbeats,
+            [(_ATTEMPT_ID, _SESSION_ID, _EPOCH), (_ATTEMPT_ID, _SESSION_ID, _EPOCH)],
+        )
         self.assertNotIn("assessment.completed", client.event_types)
         self.assertNotIn("assessment.aborted", client.event_types)
         # The screening never even began, because the slot was already gone.
@@ -3355,14 +3385,70 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         # The leg is torn down rather than left on a slot it does not hold.
         delete.assert_awaited()
 
-    async def test_nothing_is_heartbeaten_before_the_gate_CONSENTS(self):
-        """A machine, a refusal or a silent line is not a conversation, and
-        renewing a lease for one would hold a fleet slot for nobody."""
+    async def test_the_lease_is_re_based_ONCE_on_answer_and_not_beaten_again(self):
+        """The narrowed successor to "nothing is heartbeaten before consent".
+
+        RCA 2026-09-10. The old contract renewed nothing until consent, reasoning
+        that "a machine or a refusal is not a conversation, and renewing a lease
+        for one would hold a fleet slot for nobody". True of the SLOT — but the
+        lease is minted at ADMISSION, so a call that answered late (a cold
+        machine boot: 62.6 s on the Deepti leg) entered a 105 s gate with 117 s
+        left, and two answered calls were reaped mid-gate with people on the
+        line.
+
+        So exactly ONE renewal now happens, at `call.answered`, re-basing the
+        clock on the moment a human picked up. The slot argument still holds:
+        this is one renewal, not a loop — a machine pickup holds the slot for
+        the length of the gate and not a beat longer, and the periodic heartbeat
+        still starts only once the call is a consented conversation.
+        """
         result, client, *_ = await self._run_session(
             answers=("Please leave a message after the tone.",)
         )
         self.assertFalse(result.assessment_allowed)
+        # ONE beat — the answer re-base — naming this attempt/session/epoch.
+        self.assertEqual(client.heartbeats, [(_ATTEMPT_ID, _SESSION_ID, _EPOCH)])
+
+    async def test_the_re_base_makes_no_call_without_a_session_or_epoch(self):
+        """The fence guard, tested directly.
+
+        `heartbeat_phone_attempt_by_epoch` answers `lease_lost` to a null
+        session or epoch — it requires BOTH from the caller even though it
+        matches the attempt row on `session_id is null or session_id = p_…`.
+        So calling without them is a guaranteed-useless round trip on the
+        answer→disclosure path, which is the one stretch of a call where added
+        latency is silence the candidate hears.
+        """
+        client = FakeEventClient()
+        self.assertFalse(
+            await phone.rebase_lease_on_answer(client, _ATTEMPT_ID, None, _EPOCH)
+        )
+        self.assertFalse(
+            await phone.rebase_lease_on_answer(client, _ATTEMPT_ID, _SESSION_ID, None)
+        )
         self.assertEqual(client.heartbeats, [])
+        # And with both present it renews exactly once.
+        self.assertTrue(
+            await phone.rebase_lease_on_answer(
+                client, _ATTEMPT_ID, _SESSION_ID, _EPOCH
+            )
+        )
+        self.assertEqual(client.heartbeats, [(_ATTEMPT_ID, _SESSION_ID, _EPOCH)])
+
+    async def test_the_re_base_never_raises_into_the_call(self):
+        """Best effort means best effort: a throwing client must not kill a
+        call that is otherwise fine. The renewal is fired and not awaited on the
+        live path, so an exception here would surface as an unretrieved task
+        exception rather than anything anyone acts on."""
+        class _Boom(FakeEventClient):
+            async def heartbeat_attempt(self, *a, **kw):
+                raise RuntimeError("transport died")
+
+        self.assertFalse(
+            await phone.rebase_lease_on_answer(
+                _Boom(), _ATTEMPT_ID, _SESSION_ID, _EPOCH
+            )
+        )
 
     # ── Answer-first origination (Plivo bounce), wired through the session ─
 
@@ -3577,7 +3663,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
                  agent_mod, "_delete_livekit_room", new_callable=AsyncMock,
              ), \
              patch.object(agent_mod, "_phone_recording_permitted", new=recording_seam), \
-             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", _HARNESS_RESIDENCY_SEC):
             await asyncio.wait_for(
                 agent_mod._run_phone_session(
                     ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
@@ -4086,7 +4172,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
                  patch.object(agent_mod, "persistence", MagicMock()), \
                  patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
                  patch.object(agent_mod, "_phone_recording_permitted", new=recording_seam), \
-                 patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+                 patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", _HARNESS_RESIDENCY_SEC):
                 task = asyncio.ensure_future(
                     agent_mod._run_phone_session(
                         ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
@@ -5679,7 +5765,7 @@ class TestNumberNeverCarried(unittest.IsolatedAsyncioTestCase):
              patch.object(phone._log, "_emit", _capture), \
              patch.object(agent_mod, "AgentSession", _FakePhoneSession), \
              patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
-             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", _HARNESS_RESIDENCY_SEC):
             task = asyncio.ensure_future(
                 agent_mod._run_phone_session(
                     ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
@@ -5749,7 +5835,7 @@ class TestOpeningGenerationSeed(unittest.IsolatedAsyncioTestCase):
              patch.object(agent_mod, "persistence", MagicMock()), \
              patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
              patch.object(agent_mod, "_phone_recording_permitted", new=recording_seam), \
-             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", _HARNESS_RESIDENCY_SEC):
             await asyncio.wait_for(
                 agent_mod._run_phone_session(
                     ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
@@ -5793,7 +5879,7 @@ class TestOpeningGenerationSeed(unittest.IsolatedAsyncioTestCase):
              patch.object(agent_mod, "persistence", MagicMock()), \
              patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
              patch.object(agent_mod, "_phone_recording_permitted", new=recording_seam), \
-             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", _HARNESS_RESIDENCY_SEC):
             os.environ["PHONE_DETERMINISTIC_OPENER"] = "true"
             await asyncio.wait_for(
                 agent_mod._run_phone_session(
@@ -14995,7 +15081,7 @@ class TestUnsetEnvSelectsTheScriptedGate(unittest.IsolatedAsyncioTestCase):
                  agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
              patch.object(
                  agent_mod, "_phone_recording_permitted", new=recording_seam), \
-             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", _HARNESS_RESIDENCY_SEC):
             task = asyncio.ensure_future(agent_mod._run_phone_session(
                 ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
                 client=client, classifier=classifier))
@@ -15129,7 +15215,7 @@ class TestDroppedLegOnTheConversationalGate(unittest.IsolatedAsyncioTestCase):
                  agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
              patch.object(
                  agent_mod, "_phone_recording_permitted", new=recording_seam), \
-             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", _HARNESS_RESIDENCY_SEC):
             return await asyncio.wait_for(
                 agent_mod._run_phone_session(
                     ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
