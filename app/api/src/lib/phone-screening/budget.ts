@@ -359,16 +359,6 @@ export function decidePhoneOutcome(
         stateReason: 'consent_gate_failed',
       };
 
-    case 'screening_not_started':
-      return {
-        ...base,
-        charge: 'none',
-        counters: noCharge(counters),
-        engagementState: 'awaiting_retry',
-        terminal: false,
-        stateReason: 'screening_never_started',
-      };
-
     // ── Declared in the CHECK, written by nothing in 0042 ───────────────
     // Neither has an edge in `apply_phone_event`. Returning an invented
     // transition here would be a decision no migration has made; a null state
@@ -415,11 +405,11 @@ export const PHONE_OUTCOME_MIGRATION_REASONS: Readonly<
   window_closed: [],
   cancelled: ['hr_cancelled', 'emergency_stop', 'ashby_stage_left', 'prereq_lost'],
   abandoned_pre_disclosure: ['abandoned_pre_disclosure'],
-  // 0095, edges #30 and #31. One reason each, and they are NOT interchangeable:
-  // the gate breaking is a different failure, with a different owner, from the
-  // gate passing and the call dying before question one.
+  // 0095, edge #30. The gate BREAKING is its own failure, with its own owner.
+  // Not folded into any existing reason: an operator filtering for calls we
+  // broke cannot recover them once merged with a candidate's refusal.
   consent_failed: ['consent_gate_failed'],
-  screening_not_started: ['screening_never_started'],
+
 });
 
 /**

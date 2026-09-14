@@ -209,6 +209,8 @@ interface Counters {
   strandedSweeps: number;
   /** 0071 / X5b. Crashed-session recording-finalization sweep passes. */
   recStrandedSweeps: number;
+  /** 0095 — same-day no-answer retry releases. */
+  sameDaySweeps: number;
   /** 0072. Partial-finalize sweep passes. */
   partialFinalizeSweeps: number;
 }
@@ -216,7 +218,7 @@ interface Counters {
 function counters(): Counters {
   return {
     duePasses: 0, backlogReads: 0, reclaims: 0, expires: 0, claims: [],
-    sweepClaims: [], dayRolls: 0, strandedSweeps: 0, recStrandedSweeps: 0,
+    sweepClaims: [], dayRolls: 0, strandedSweeps: 0, recStrandedSweeps: 0, sameDaySweeps: 0,
     partialFinalizeSweeps: 0,
   };
 }
@@ -275,6 +277,15 @@ function makeStores(
     async sweepStrandedRecordings() {
       c.recStrandedSweeps += 1;
       return { status: 'ok' as const, examined: 0, finalized: 0, skipped: 0 };
+    },
+    // 0095. WITHOUT THIS THE NEW SWEEP HAS NO COVERAGE AT ALL. The
+    // `phone-sameday` loop calls it unguarded, so a fake missing the method
+    // makes every tick in this suite throw a TypeError that the scheduler
+    // swallows — the loop is wired, runs, fails, and reports nothing. That is
+    // the exact failure this fixture's own comment above warns about.
+    async sweepSameDayRetry() {
+      c.sameDaySweeps += 1;
+      return { status: 'ok' as const, examined: 0, released: 0, skipped: 0 };
     },
     // 0072. Same reason as the sweeps above: the loop CALLS this, so a fake
     // missing it would leave the new loop uncovered. Returns no sessions by
@@ -1686,6 +1697,12 @@ describe('the day-roll and stranded sweeps run, and the claim gates them', () =>
 
     expect(c.dayRolls).toBeGreaterThan(0);
     expect(c.strandedSweeps).toBeGreaterThan(0);
+    // 0095. The same-day sweep is the DRIVER of this PR's headline change —
+    // without it running, a no-answer waits for the IST day to roll exactly as
+    // before. Asserted by CALL COUNT, not merely by its claim name: the claim
+    // is taken before the store call, so a sweep that claimed and then threw
+    // would still show up in `sweepClaims`.
+    expect(c.sameDaySweeps).toBeGreaterThan(0);
     // Separate claim names: one sweep taking the other's claim would let a
     // single replica silently monopolise both. 0071 adds `recstrand`; 0072
     // adds `partialfin`.

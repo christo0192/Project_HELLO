@@ -101,23 +101,85 @@ begin
     raise exception 'dcap83(a-precheck): expected admit=ok for A (re-admission), got % (should reach ok on the full eligible 24/7 seed)', v_status;
   end if;
 
-  -- ── (b) Engagement B: reclaim-abandoned (abandon_reason NULL) stays charged ──
-  -- A call that rang/answered spends the anti-harassment budget; the day must
-  -- stay charged even though the attempt is `abandoned`. admit must REFUSE.
+  -- ── (b) Engagement B: reclaim-abandoned — CHARGED, but the day allows 2 ──
+  --
+  -- 0095 CHANGES THE EXPECTED VALUE HERE, and the change is the feature.
+  -- Before 0095 the ceiling was one dial per IST day, so B's prior attempt
+  -- (abandoned with abandon_reason NULL — a call that really rang) refused the
+  -- next admission outright. The ceiling is now TWO, so B's charged prior
+  -- attempt leaves exactly one dial left and this admission is ADMITTED as the
+  -- day's second.
+  --
+  -- What is NOT weakened: B's prior attempt still COUNTS. The distinction this
+  -- fixture exists to prove — a reclaim-abandoned row (NULL reason) charges the
+  -- day, an infra-deferred one does not — is asserted by (b3) below, where B
+  -- has two charged rows and is refused while A, with one infra-deferred row
+  -- and one real one, is not.
   v_res    := screening_v2.admit_phone_attempt(v_eng_b, 'initial', 'dcap83-b', 60, v_now);
   v_status := v_res->>'status';
-  if v_status <> 'daily_attempt_exists' then
-    raise exception 'dcap83(b): expected daily_attempt_exists for B (reclaim-abandoned, abandon_reason NULL — day stays charged), got %', v_status;
+  if v_status = 'daily_attempt_exists' then
+    raise exception 'dcap83(b): B was refused on its SECOND same-day dial — 0095 raised the ceiling to 2, so the pre-check and the per-day-seq index disagree';
+  end if;
+  if v_status <> 'ok' then
+    raise exception 'dcap83(b): expected admit=ok for B (second dial of the day), got %', v_status;
   end if;
 
-  -- ── (c) Engagement C: completed/ended attempt stays charged ───────────
+  -- ── (b3) THE CEILING IS PHYSICAL, not a caller's good manners ─────────
+  --
+  -- Asserted against the SCHEMA rather than through `admit_phone_attempt`,
+  -- deliberately and for two reasons. B's engagement is now `dialing` after
+  -- the admission above, so a third admit call would be refused
+  -- `state_not_admissible` — a true answer to a different question, and it
+  -- would pass whether or not any daily ceiling existed. And the claim 0095
+  -- actually makes is stronger than "admission declines": a third same-day
+  -- dial is IMPOSSIBLE no matter which caller tries, because
+  -- `chk_phone_attempts_ist_day_seq` bounds the sequence at 2.
+  --
+  -- Both failure shapes are probed inside sub-blocks and rolled back.
+  v_unique := false;
+  begin
+    insert into screening_v2.phone_call_attempts
+      (engagement_id, attempt_seq, epoch, kind, state, ist_date, ist_day_seq,
+       prior_engagement_state, admitted_at, created_at)
+    values (v_eng_b, 90, 0, 'initial', 'admitted', v_ist, 3, 'eligible', v_now, v_now);
+    delete from screening_v2.phone_call_attempts
+     where engagement_id = v_eng_b and attempt_seq = 90;
+  exception
+    when check_violation then
+      v_unique := true;
+  end;
+  if not v_unique then
+    raise exception 'dcap83(b3-check): a THIRD same-day dial (ist_day_seq=3) was accepted — chk_phone_attempts_ist_day_seq is not bounding the ladder at 2';
+  end if;
+
+  -- And the sequence cannot be reused to smuggle a third past the CHECK:
+  -- seq 2 is already taken today, so the unique index must refuse it.
+  v_unique := false;
+  begin
+    insert into screening_v2.phone_call_attempts
+      (engagement_id, attempt_seq, epoch, kind, state, ist_date, ist_day_seq,
+       prior_engagement_state, admitted_at, created_at)
+    values (v_eng_b, 91, 0, 'initial', 'admitted', v_ist, 2, 'eligible', v_now, v_now);
+    delete from screening_v2.phone_call_attempts
+     where engagement_id = v_eng_b and attempt_seq = 91;
+  exception
+    when unique_violation then
+      v_unique := true;
+  end;
+  if not v_unique then
+    raise exception 'dcap83(b3-index): a duplicate ist_day_seq=2 was accepted for the same engagement+day — uq_phone_attempts_per_ist_day_seq is not enforcing the ladder';
+  end if;
+
+  -- ── (c) Engagement C: completed/ended attempt is likewise charged ─────
+  -- Same shape as (b): C's ended attempt charges the day, and the second dial
+  -- is admitted under the new ceiling.
   v_res    := screening_v2.admit_phone_attempt(v_eng_c, 'initial', 'dcap83-c', 60, v_now);
   v_status := v_res->>'status';
-  if v_status <> 'daily_attempt_exists' then
-    raise exception 'dcap83(c): expected daily_attempt_exists for C (completed/ended attempt still holds the day), got %', v_status;
+  if v_status <> 'ok' then
+    raise exception 'dcap83(c): expected admit=ok for C (second dial of the day), got %', v_status;
   end if;
 
-  raise notice 'dcap83: PASS — A re-admits (index + pre-check both exclude infra_deferred), B (reclaim NULL) and C (ended) both stay charged (daily_attempt_exists)';
+  raise notice 'dcap83: PASS — A re-admits (index + pre-check both exclude infra_deferred); B and C are charged but admitted as the day''s SECOND dial; a THIRD is physically impossible (chk_phone_attempts_ist_day_seq rejects seq 3, uq_phone_attempts_per_ist_day_seq rejects a reused seq 2)';
 end;
 $$;
 

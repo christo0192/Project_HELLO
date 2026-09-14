@@ -204,17 +204,23 @@ export interface SweepPhoneStrandedRecordingsResult {
 export interface PhonePartialFinalizeSession {
   readonly sessionId: string;
   readonly attemptId: string | null;
-  /** 0095 — the engagement to post `screening.not_started` against. */
+  /** 0095 — reported so a log line can name the engagement. Not acted on. */
   readonly engagementId: string | null;
   /**
-   * 0095 / issue #286 — the session carries NO non-gate transcript turn, so
-   * the call never reached a question. The RPC has already driven it
-   * `failed` / `screening_never_started` rather than
-   * `completed` / `conversation_complete`.
+   * 0095 — the session carries no non-gate transcript turn from the CANDIDATE,
+   * i.e. on the available evidence the call never reached a question.
    *
-   * The caller MUST NOT enqueue scoring for such a session: there are no
-   * answers, so the assessment eligibility guard would DLQ it and the failure
-   * would read as a broken scorer rather than a call that never happened.
+   * REPORTED ONLY. It is written to the partial-finalize log line and nothing
+   * branches on it. A draft skipped the scoring enqueue for these sessions and
+   * drove them to a different terminal status; both were reverted, because the
+   * evidence cannot bear that weight — the per-item transcript writer is
+   * fire-and-forget (`agent.py`, `asyncio.create_task`, never awaited, failures
+   * swallowed) and the boundary writer suppresses its own insert when any
+   * per-item row exists, so a genuine screening whose candidate turn was lost
+   * in transit reads as never-started.
+   *
+   * Good enough to tell an operator where to look. Not good enough to withhold
+   * a scorecard or redirect a call.
    */
   readonly neverStarted: boolean;
   /** Questions covered = `call_sessions.current_question_index`. */

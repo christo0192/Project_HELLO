@@ -1359,30 +1359,44 @@ describe('0067 — recording starts on an APPLIED call.answered', () => {
 // because the recording now starts at ANSWER, before consent. The behaviour is
 // identical to the refusals: destroy and verify before the event posts.
 //
-// 0095 adds `consent.failed`, and RENAMES this list, because the name had been
-// wrong since 0067: the rule was never "terminal". `candidate.deferred_pre_disclosure`
-// lands on `eligible` and has been in this set, non-terminal, for two
-// migrations. The rule that actually holds — and the one the audio purge
-// exists to enforce — is CONSENT WAS NOT OBTAINED. Whether the engagement is
-// over is a different question from whether we are allowed to keep the tape.
+// 0095 RENAMES this list, because the name had been wrong since 0067: the rule
+// was never "terminal". `candidate.deferred_pre_disclosure` lands on `eligible`
+// and has been in this set, non-terminal, for two migrations.
 //
-// `consent.failed` is the clearest case there is: the gate broke, so the
-// candidate never consented to anything, and the recording has been running
-// since `call.answered`. That we intend to CALL THEM BACK does not earn us
-// the right to keep audio of a person who never agreed to be recorded — if
-// anything it argues the other way.
+// But the rule is not simply "consent was not obtained" either. THE PURGE IS
+// ENGAGEMENT-WIDE — `list_phone_engagement_recordings` enumerates every attempt
+// of the engagement and `clear_phone_attempt_recordings` nulls all their keys —
+// so a member must additionally guarantee that NO SIBLING ATTEMPT holds
+// consented audio. Every member below does, by being pre-consent AND ending the
+// engagement (or deferring it before any consented leg can exist).
+//
+// `consent.failed` was briefly added here and REMOVED after an adversarial
+// review: it is non-terminal, so its engagement can carry an earlier attempt
+// that consented and recorded a real screening, and the engagement-wide purge
+// would delete that recording irreversibly. See the long note on
+// PURGE_BEFORE_EVENTS in routes/phone-worker.ts. Restoring it requires an
+// attempt-scoped purge first.
 const NON_CONSENTING_EXITS = [
   'disclosure.refused',
   'candidate.opt_out',
   'candidate.wrong_number',
   'classify.machine',
   'candidate.deferred_pre_disclosure',
-  'consent.failed',
 ] as const;
 
 describe('a non-consenting exit purges the recordings BEFORE it is acknowledged', () => {
-  it('the purge set is exactly the six non-consenting exits (record from answer, keep only if consented)', () => {
+  it('the purge set is exactly the five non-consenting exits (record from answer, keep only if consented)', () => {
     expect([...PURGE_BEFORE_EVENTS].sort()).toEqual([...NON_CONSENTING_EXITS].sort());
+  });
+
+  it('consent.failed does NOT purge — the purge is engagement-wide and it is not terminal', () => {
+    // Pinned POSITIVELY rather than left to the set comparison above, because
+    // the reasoning is not recoverable from the list: this event DOES leave
+    // un-consented audio, and the only reason it must not purge is that the
+    // purge would reach a SIBLING attempt's consented recording.
+    expect(PURGE_BEFORE_EVENTS.has('consent.failed')).toBe(false);
+    // It remains a legal worker event — it just does not purge.
+    expect(WORKER_PHONE_EVENTS).toContain('consent.failed');
   });
 
   for (const event of NON_CONSENTING_EXITS) {

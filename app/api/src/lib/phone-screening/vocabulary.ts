@@ -157,15 +157,6 @@ export const PHONE_OUTCOME_CLASSES = [
    * redials someone who said no or abandons someone we failed.
    */
   'consent_failed',
-  /**
-   * 0095: consent PASSED and the call still ended before a single question
-   * was asked — no non-gate transcript turn from the candidate exists.
-   *
-   * Distinct from `abandoned_pre_disclosure` (which never got as far as the
-   * disclosure) and from `disconnected` (which means a real conversation
-   * dropped). Issue #286: these were being recorded as COMPLETED screenings.
-   */
-  'screening_not_started',
 ] as const;
 
 export type PhoneOutcomeClass = (typeof PHONE_OUTCOME_CLASSES)[number];

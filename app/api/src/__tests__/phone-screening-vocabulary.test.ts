@@ -101,23 +101,21 @@ describe('phone-screening vocabulary mirrors 0042 exactly', () => {
     );
   });
 
-  it('EXACTLY fourteen outcome classes, matching chk_phone_call_attempts_outcome', () => {
-    // TWELVE since 0043 (`abandoned_pre_disclosure`), FOURTEEN since 0095,
-    // which re-declares this CHECK in full again to add the two ways a call
-    // can reach a human and still produce no screening. `checkMembers` reads
+  it('EXACTLY thirteen outcome classes, matching chk_phone_call_attempts_outcome', () => {
+    // TWELVE since 0043 (`abandoned_pre_disclosure`), THIRTEEN since 0095,
+    // which re-declares this CHECK in full again to add `consent_failed`. `checkMembers` reads
     // the NEWEST declaration, so this compares against what the database
     // actually enforces rather than against a superseded inline list.
     const members = checkMembers('chk_phone_call_attempts_outcome');
     expect(set(PHONE_OUTCOME_CLASSES)).toEqual(set(members));
-    expect(PHONE_OUTCOME_CLASSES).toHaveLength(14);
-    expect(members).toHaveLength(14);
+    expect(PHONE_OUTCOME_CLASSES).toHaveLength(13);
+    expect(members).toHaveLength(13);
     // The added members BY VALUE, so a re-declaration that silently dropped
     // one fails on the value and not only on the count. Each of these CHECKs
     // has now been re-declared in full twice; a dropped member is the failure
     // mode that pattern invites.
     expect(members).toContain('abandoned_pre_disclosure');
     expect(members).toContain('consent_failed');
-    expect(members).toContain('screening_not_started');
     // `consent_failed` is NOT `declined`. `declined` is the candidate
     // refusing — terminal, never dialled again. Losing that distinction
     // either redials someone who said no or abandons someone we failed.

@@ -979,66 +979,39 @@ export function createPhoneRuntime(
         // enqueue that throws is retried on the next pass (the RPC re-selects
         // the same session until it carries an assessment).
         for (const s of resolved.sessions) {
-          if (s.neverStarted) {
-            // 0095 / issue #286. THE CALL NEVER BECAME A SCREENING.
-            //
-            // NOT enqueued for scoring: the session carries no non-gate
-            // transcript turn, so there is nothing to score, and the
-            // assessment eligibility guard would DLQ it — a call that never
-            // happened would show up as a broken scorer. The RPC has already
-            // driven the session `failed` / `screening_never_started`, which
-            // finalizes the MP3 exactly as `completed` did.
-            //
-            // Instead the ENGAGEMENT is told, so the candidate gets the call
-            // they are owed. Posted HERE rather than inside the RPC because
-            // that sweep holds `for update of s` on call_sessions — last in
-            // the pinned lock order — and `apply_phone_event` locks the
-            // engagement and attempt; posting inline would invert the order.
-            // By now the RPC's transaction has committed and its locks are
-            // gone.
-            // `typeof` guarded like `finalize` above: a store double without
-            // the method must not throw on a tick it never meant to drive.
-            if (s.engagementId !== null && typeof stores.applyEvent === 'function') {
-              try {
-                await stores.applyEvent({
-                  source: 'internal',
-                  eventType: 'screening.not_started',
-                  // Named so `apply_phone_event` can end the attempt with
-                  // outcome `screening_not_started` — the DB record the owner
-                  // asked for. A null attempt would leave the attempt row
-                  // telling the old story.
-                  attemptId: s.attemptId,
-                  engagementId: s.engagementId,
-                  // Keyed on the SESSION, so a re-run (the RPC re-selects a
-                  // session until it is no longer `in_progress`) replays the
-                  // first verdict instead of posting a second release.
-                  providerEventId: `notstarted:${s.sessionId}`,
-                  now: new Date(),
-                });
-              } catch {
-                // Best-effort, exactly like the enqueue below: the next pass
-                // re-posts under the same dedup key. Never abort the loop.
-              }
-            }
-          } else {
-            try {
-              await queue.enqueue(
-                PHONE_ASSESSMENT_QUEUE,
-                {
-                  session_id: s.sessionId,
-                  attempt_id: s.attemptId,
-                  partial: true,
-                  covered: s.covered,
-                  total: s.total,
-                  disconnect_reason: s.disconnectReason,
-                },
-                { dedupKey: phoneAssessmentDedupKey(s.sessionId), maxAttempts: 5 },
-              );
-            } catch {
-              // Best-effort: the next pass re-selects and re-enqueues. Do not
-              // let one session's enqueue failure abort the loop for the
-              // others.
-            }
+          // EVERY selected session is enqueued, `neverStarted` included.
+          //
+          // A draft skipped the enqueue when the RPC reported no candidate
+          // transcript turn. Three reviews killed it, for two independent
+          // reasons:
+          //   * the sweep re-selects a session until an assessment row exists,
+          //     so skipping the enqueue meant those rows were re-selected
+          //     FOR EVER — and with `limit 25` oldest-first they displace
+          //     every real partial screening from the window;
+          //   * the crash-partial pair (`expired` + `grace_timeout`) IS
+          //     admitted by the scoring eligibility gate, so such a session
+          //     was scored before and silently stopped being scored, without
+          //     the gate changing at all.
+          // `neverStarted` is now reported in the log line below and acted on
+          // nowhere, which is all its evidence can support: the per-item
+          // transcript writer is fire-and-forget, so a real screening can
+          // read as never-started.
+          try {
+            await queue.enqueue(
+              PHONE_ASSESSMENT_QUEUE,
+              {
+                session_id: s.sessionId,
+                attempt_id: s.attemptId,
+                partial: true,
+                covered: s.covered,
+                total: s.total,
+                disconnect_reason: s.disconnectReason,
+              },
+              { dedupKey: phoneAssessmentDedupKey(s.sessionId), maxAttempts: 5 },
+            );
+          } catch {
+            // Best-effort: the next pass re-selects and re-enqueues. Do not
+            // let one session's enqueue failure abort the loop for the others.
           }
           // Bounded, PII-free structured line. The logger allowlist carries
           // only `error_category`/`error_type` for this event, so coverage and

@@ -94,6 +94,82 @@ describe('the adapters call the RPCs by name, with the declared keys', () => {
     });
   });
 
+  it('finalizePartialSessions parses the RPC snake_case keys, including 0095s', async () => {
+    // THE WIRE SEAM, WHICH NOTHING ELSE COVERS. `phone-partial-finalize.test.ts`
+    // hand-builds `PhonePartialFinalizeSession` objects and never crosses this
+    // boundary, so a mis-spelled key here — `neverStarted` instead of
+    // `never_started` — would make every session parse as `neverStarted:
+    // false`, and the whole suite would stay green while the observability
+    // this migration exists to provide silently reported nothing.
+    const { client, calls } = fakeClient({
+      status: 'ok',
+      examined: 2,
+      finalized: 1,
+      skipped: 1,
+      sessions: [
+        {
+          session_id: 's1',
+          attempt_id: 'a1',
+          engagement_id: 'e1',
+          covered: 3,
+          total: 5,
+          disconnect_reason: 'worker_crash',
+          transitioned: true,
+          assessment_present: false,
+          recording_present: true,
+          never_started: true,
+        },
+      ],
+    });
+    const result = await createPhoneStores(client).finalizePartialSessions!({
+      limit: 25, graceSeconds: 180, now: NOW,
+    });
+    expect(calls[0].name).toBe('finalize_phone_partial_sessions');
+    expect(result.status).toBe('ok');
+    expect(result.sessions).toHaveLength(1);
+    expect(result.sessions[0]).toEqual({
+      sessionId: 's1',
+      attemptId: 'a1',
+      engagementId: 'e1',
+      covered: 3,
+      total: 5,
+      disconnectReason: 'worker_crash',
+      transitioned: true,
+      assessmentPresent: false,
+      recordingPresent: true,
+      neverStarted: true,
+    });
+  });
+
+  it('finalizePartialSessions defaults the 0095 fields SAFELY on an older RPC', async () => {
+    // An old database returns neither key. The parse must reproduce pre-0095
+    // behaviour exactly — `neverStarted: false` — rather than defaulting to
+    // the flag that would mark every call as a non-screening.
+    const { client } = fakeClient({
+      status: 'ok',
+      examined: 1,
+      finalized: 1,
+      skipped: 0,
+      sessions: [
+        {
+          session_id: 's1',
+          attempt_id: 'a1',
+          covered: 4,
+          total: 4,
+          disconnect_reason: 'candidate_hangup',
+          transitioned: true,
+          assessment_present: false,
+          recording_present: false,
+        },
+      ],
+    });
+    const result = await createPhoneStores(client).finalizePartialSessions!({
+      limit: 25, now: NOW,
+    });
+    expect(result.sessions[0].neverStarted).toBe(false);
+    expect(result.sessions[0].engagementId).toBeNull();
+  });
+
   it('a refusal carries only sanitized detail — codes, counts and instants', async () => {
     const { client } = fakeClient({
       status: 'at_capacity',

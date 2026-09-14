@@ -126,10 +126,39 @@ export const PURGE_BEFORE_EVENTS: ReadonlySet<string> = new Set([
   // exits must destroy them before the event posts, exactly like the refusals.
   'classify.machine',
   'candidate.deferred_pre_disclosure',
-  // 0095: a consent gate that failed on our side leaves exactly the same
-  // pre-consent audio as the refusals above — the egress started at
-  // `call.answered`. Whose fault it was does not change whose voice it is.
-  'consent.failed',
+  // ── `consent.failed` IS DELIBERATELY NOT HERE (0095) ──────────────────
+  //
+  // It was, and an adversarial review found it destroys consented audio.
+  //
+  // THE PURGE IS ENGAGEMENT-WIDE, not attempt-wide:
+  // `list_phone_engagement_recordings` (0043:1074) enumerates EVERY attempt of
+  // the engagement with a recording key, the purge deletes and verifies all of
+  // them, and `clear_phone_attempt_recordings` (0043:1141) then nulls the keys
+  // on all of them. That is safe for every member above because each of those
+  // is BOTH terminal and pre-consent, so no sibling attempt can be holding
+  // consented audio.
+  //
+  // `consent.failed` is neither. It is non-terminal (the engagement goes to
+  // `awaiting_retry`), so an engagement can carry an EARLIER attempt that
+  // reached consent and recorded a real screening. `run_phone_gate` normally
+  // short-circuits on a reconnect into an already-consented call
+  // (`phone.py` — `gate_recorded` returns early), which would make this
+  // unreachable — except that path "fails OPEN toward gating": any
+  // `fetch_durable_consent` error falls through and re-runs the full gate.
+  // A transport blip there, during exactly the kind of incident this event
+  // reports, re-runs the gate on a consented call, fails it, and deletes the
+  // first leg's recording of a screening that really happened. Irreversibly.
+  //
+  // Doing nothing here is NOT a regression: before 0095 these three exits
+  // posted no event and purged nothing, so pre-consent audio was retained
+  // exactly as it is now. The improvement is deferred, not the invariant.
+  //
+  // FOLLOW-UP (required, not optional): an ATTEMPT-scoped purge —
+  // `list_phone_attempt_recordings(p_attempt_id)` +
+  // `clear_phone_attempt_recordings(p_attempt_id)` — which lets this event
+  // destroy its own leg's audio without touching a sibling's. That is a new
+  // pair of RPCs on the destructive path and belongs in its own change, with
+  // its own review, not bolted onto this one.
 ]);
 
 export const WORKER_PHONE_EVENTS = [

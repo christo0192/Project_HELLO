@@ -900,6 +900,18 @@ PHONE_WORKER_EVENTS: frozenset[str] = frozenset([
     "sip.participant_left",
     "assessment.completed",
     "assessment.aborted",
+    # 0095 / issue #286. The consent gate broke on OUR side — a malformed RPC
+    # body, a classifier error, a disclosure that was never recorded.
+    #
+    # THIS LINE IS THE FEATURE. The server half (`WORKER_PHONE_EVENTS` and
+    # `PURGE_BEFORE_EVENTS` in routes/phone-worker.ts) was updated and this one
+    # was not, so every `consent.failed` short-circuited at the check below,
+    # logged `consent_failed_not_applied`, and posted nothing: the pre-consent
+    # audio was not purged and the engagement was not released. #286 was
+    # unchanged on the primary path while the tests passed, because the test
+    # double has no allowlist. `test_phone_gate.py` now pins the two
+    # allowlists against each other.
+    "consent.failed",
 ])
 
 _ERR_CONFIGURATION = "configuration"

@@ -267,150 +267,100 @@ describe('the partial-finalize tick delivers the scorecard on a disconnect', () 
   // 0095 / issue #286 — a call that never reached a question
   // ─────────────────────────────────────────────────────────────────────
   //
-  // The defect: candidate NEELU S picked up, the consent gate broke, and this
-  // sweep stamped the session `completed` / `conversation_complete` — the same
-  // transition the happy path uses. She was "screened" without being asked a
-  // single question, and nothing would ever dial her again.
+  // The RPC now REPORTS `never_started` (no non-gate transcript turn from the
+  // candidate). Nothing branches on it, and these tests exist to keep it that
+  // way.
+  //
+  // A draft skipped the scoring enqueue for such sessions and drove them to a
+  // different terminal status. Three adversarial reviews and the repo's own
+  // `phone_partial_finalize_assert.sql` all rejected it: the sweep re-selects a
+  // session until an assessment row exists, so skipping the enqueue made those
+  // rows permanent residents of a 25-row oldest-first window and starved real
+  // partial screenings out of it; and the crash-partial pair IS admitted by the
+  // scoring gate, so a class that was scored silently stopped being scored.
 
-  it('a never-started session is NOT enqueued for scoring', async () => {
+  it('a never-started session is STILL enqueued for scoring', async () => {
     const enqueues: EnqueueCall[] = [];
-    const events: EventCall[] = [];
     const stores = makeStores({
       onFinalize: () => ({
         status: 'ok',
         finalized: 1,
         sessions: [partialSession({ neverStarted: true, covered: 0 })],
       }),
-      events,
-    });
-    const runtime = buildRuntime({ stores, queue: makeQueue(enqueues) });
-    runtime.scheduler.start();
-    await vi.advanceTimersByTimeAsync(1_000);
-    // Wait on the RELEASE, not on a fixed number of turns. An absence proved
-    // by "nothing happened yet" is not proof of anything — this waits for the
-    // tick to reach the end of the never-started branch, so by the time the
-    // enqueue assertion runs the tick demonstrably processed the session.
-    await drainMicrotasks(() => events.length > 0);
-    expect(events).toHaveLength(1);
-
-    // There are no non-gate turns, so there is nothing to score. Enqueuing
-    // anyway would DLQ against the assessment eligibility guard and read as a
-    // broken scorer rather than a call that never happened.
-    expect(enqueues).toHaveLength(0);
-  });
-
-  it('a never-started session releases its ENGAGEMENT for a redial', async () => {
-    const events: EventCall[] = [];
-    const stores = makeStores({
-      onFinalize: () => ({
-        status: 'ok',
-        finalized: 1,
-        sessions: [partialSession({ neverStarted: true, covered: 0 })],
-      }),
-      events,
-    });
-    const runtime = buildRuntime({ stores, queue: makeQueue([]) });
-    runtime.scheduler.start();
-    await vi.advanceTimersByTimeAsync(1_000);
-    await drainMicrotasks(() => events.length > 0);
-
-    expect(events).toHaveLength(1);
-    expect(events[0].eventType).toBe('screening.not_started');
-    expect(events[0].engagementId).toBe(ENGAGEMENT_A);
-    // NAMED, so `apply_phone_event` can end the attempt with outcome
-    // `screening_not_started`. A null attempt id would leave the attempt row
-    // still telling the old story, which is half the point of the change.
-    expect(events[0].attemptId).toBe(ATTEMPT_A);
-    // Keyed on the SESSION: the RPC re-selects a session until it leaves
-    // `in_progress`, so a second pass must replay the first verdict rather
-    // than release the engagement twice.
-    expect(events[0].providerEventId).toBe(`notstarted:${SESSION_A}`);
-    expect(events[0].source).toBe('internal');
-  });
-
-  it('a session WITH answers still scores and posts no release event', async () => {
-    // The other half of the contract, and the one the owner named explicitly:
-    // MP3 and scorecard generation must be untouched. A call that reached the
-    // questions and then dropped is a real, scorable partial — it must take
-    // exactly the pre-0095 path.
-    const enqueues: EnqueueCall[] = [];
-    const events: EventCall[] = [];
-    const stores = makeStores({
-      onFinalize: () => ({
-        status: 'ok',
-        finalized: 1,
-        sessions: [partialSession({ neverStarted: false, covered: 3, total: 5 })],
-      }),
-      events,
     });
     const runtime = buildRuntime({ stores, queue: makeQueue(enqueues) });
     runtime.scheduler.start();
     await vi.advanceTimersByTimeAsync(1_000);
     await drainMicrotasks(() => enqueues.length > 0);
 
+    // The enqueue is what lets the session LEAVE the sweep's selection set:
+    // the RPC re-selects it until an assessment row exists. Withholding it
+    // does not merely skip a scorecard, it wedges the sweep.
     expect(enqueues).toHaveLength(1);
     expect(enqueues[0].payload).toMatchObject({
       session_id: SESSION_A,
       partial: true,
-      covered: 3,
-      total: 5,
     });
-    // No engagement release: this candidate WAS screened, and redialling them
-    // would be the mirror-image defect.
-    expect(events).toHaveLength(0);
   });
 
-  it('a failed release does not abort the loop or block another session', async () => {
-    // Best-effort, exactly like the enqueue: the next pass re-posts under the
-    // same dedup key. A throwing `applyEvent` must not strand the sweep.
-    const enqueues: EnqueueCall[] = [];
-    const stores = makeStores({
-      onFinalize: () => ({
-        status: 'ok',
-        finalized: 2,
-        sessions: [
-          partialSession({ neverStarted: true, covered: 0 }),
-          partialSession({ sessionId: SESSION_B, attemptId: ATTEMPT_B, neverStarted: false }),
-        ],
-      }),
-      applyEventThrows: true,
-    });
-    const runtime = buildRuntime({ stores, queue: makeQueue(enqueues) });
-    runtime.scheduler.start();
-    await vi.advanceTimersByTimeAsync(1_000);
-    await drainMicrotasks(() => enqueues.length > 0);
+  it('never-started and normal sessions are treated IDENTICALLY by the tick', async () => {
+    // The strongest form of "nothing branches on it": drive both shapes and
+    // assert the tick cannot tell them apart. A future `if (s.neverStarted)`
+    // anywhere in this loop body fails here.
+    const neverStarted: EnqueueCall[] = [];
+    const normal: EnqueueCall[] = [];
 
-    // The never-started session's release threw; the SECOND session still got
-    // its scorecard.
-    expect(enqueues).toHaveLength(1);
-    expect(enqueues[0].payload).toMatchObject({ session_id: SESSION_B });
+    const runOne = async (flag: boolean, sink: EnqueueCall[]) => {
+      const stores = makeStores({
+        onFinalize: () => ({
+          status: 'ok',
+          finalized: 1,
+          sessions: [partialSession({ neverStarted: flag })],
+        }),
+      });
+      const runtime = buildRuntime({ stores, queue: makeQueue(sink) });
+      runtime.scheduler.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await drainMicrotasks(() => sink.length > 0);
+    };
+
+    await runOne(true, neverStarted);
+    await runOne(false, normal);
+
+    // Length is not asserted: the first runtime keeps ticking on its 1s
+    // cadence while the second runs, so both sinks accumulate. What matters is
+    // that BOTH produced an enqueue and the FIRST of each is identical.
+    expect(neverStarted.length).toBeGreaterThan(0);
+    expect(normal.length).toBeGreaterThan(0);
+    expect(neverStarted[0].payload).toEqual(normal[0].payload);
+    expect(neverStarted[0].options?.dedupKey).toEqual(normal[0].options?.dedupKey);
   });
 
-  it('a never-started session with no engagement id posts nothing and still skips scoring', async () => {
-    // The RPC returns `engagement_id` from the attempt join; a malformed or
-    // absent value must not become a post with a null engagement (which
-    // `apply_phone_event` would refuse) nor resurrect the scoring enqueue.
-    const enqueues: EnqueueCall[] = [];
+  it('the tick posts NO engagement event — the release path was removed', async () => {
+    // Edge #31 and `screening.not_started` are gone. The engagement is
+    // permanently bound to its session (`start_phone_assessment` is the only
+    // writer of `phone_engagements.session_id` in 95 migrations and nothing
+    // clears it), so a release could never produce a screenable redial — it
+    // only handed the engagement to the stranded sweep, which terminally
+    // failed it.
     const events: EventCall[] = [];
+    const enqueues: EnqueueCall[] = [];
     const stores = makeStores({
       onFinalize: () => ({
         status: 'ok',
         finalized: 1,
-        sessions: [partialSession({ neverStarted: true, engagementId: null })],
+        sessions: [partialSession({ neverStarted: true })],
       }),
       events,
     });
     const runtime = buildRuntime({ stores, queue: makeQueue(enqueues) });
     runtime.scheduler.start();
     await vi.advanceTimersByTimeAsync(1_000);
-    // `lastPartialFinalized` is published at the END of the tick, so waiting
-    // on it proves the tick RAN TO COMPLETION. Two absences asserted against
-    // a tick that never fired would pass for the wrong reason.
-    await drainMicrotasks(() => runtime.snapshot().lastPartialFinalized === 1);
-    expect(runtime.snapshot().lastPartialFinalized).toBe(1);
+    // Wait on the ENQUEUE, so the absence below is asserted against a tick
+    // that demonstrably reached the end of its loop body.
+    await drainMicrotasks(() => enqueues.length > 0);
 
     expect(events).toHaveLength(0);
-    expect(enqueues).toHaveLength(0);
   });
 
   it('the configured grace is passed to the selector (must be far below 0071 7200s)', async () => {

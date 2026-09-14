@@ -150,15 +150,20 @@ alter table screening_v2.phone_call_attempts
       'completed','disconnected','no_answer','busy','voicemail','declined',
       'wrong_number','opt_out','provider_error','window_closed','cancelled',
       'abandoned_pre_disclosure',
-      -- 0095, additive. Kept as two labels, not one, because they are two
-      -- different failures with two different owners, and merging them would
-      -- make the distinction unrecoverable after the fact:
-      --   * `consent_failed` — the gate itself broke (our RPC, our judge, our
-      --     classifier). NOT a refusal; `declined` already carries that, is
-      --     terminal, and must never be dialled again.
-      --   * `screening_not_started` — the gate PASSED and the call still died
-      --     before a single question was asked.
-      'consent_failed','screening_not_started'))
+      -- 0095, additive: the consent gate itself BROKE — our RPC returned a
+      -- malformed body, our classifier errored, our disclosure was never
+      -- recorded. Deliberately NOT `declined`, which means the candidate
+      -- refused, is terminal, and must never be dialled again. Conflating
+      -- them either redials someone who said no or abandons someone we
+      -- failed, and the distinction is unrecoverable after the fact.
+      --
+      -- A sibling label `screening_not_started` was drafted for "the gate
+      -- passed and the call still died before question one" and DROPPED: the
+      -- only available evidence for it is the transcript, whose writer is
+      -- fire-and-forget, so the label would have been applied to real
+      -- screenings. This schema does not carry vocabulary with no trustworthy
+      -- writer — see 0042's note on `voicemail_detected`.
+      'consent_failed'))
   not valid;
 alter table screening_v2.phone_call_attempts
   validate constraint chk_phone_call_attempts_outcome;
@@ -166,72 +171,23 @@ alter table screening_v2.phone_call_attempts
 comment on constraint chk_phone_call_attempts_outcome
   on screening_v2.phone_call_attempts is
   'Closed outcome allowlist, extended ADDITIVELY by 0043 with '
-  '`abandoned_pre_disclosure` and by 0095 with `consent_failed` and '
-  '`screening_not_started`. No prior member has ever been removed.';
+  '`abandoned_pre_disclosure` and by 0095 with `consent_failed`. '
+  'No prior member has ever been removed.';
 
--- 3b. call_sessions.terminal_reason — the never-started session's reason.
+-- 3b. call_sessions.terminal_reason — DELIBERATELY NOT TOUCHED.
 --
--- Added to the `failed` family, which is the whole point of the change: a
--- session that never reached a question must not wear a `completed` status.
--- MP3 is unaffected — `trg_enqueue_recording_finalize` fires on
--- status IN ('completed','failed','cancelled','expired'), so `failed`
--- finalizes the recording exactly as `completed` did. Scoring is unaffected
--- because `assessment.ts` admits only ('completed','conversation_complete')
--- or ('expired','grace_timeout'), and this pair is neither — correctly, as
--- there are no answers to score.
-alter table screening_v2.call_sessions
-  drop constraint if exists chk_call_sessions_terminal_reason;
-alter table screening_v2.call_sessions
-  add constraint chk_call_sessions_terminal_reason check (
-    (
-      status not in ('completed', 'failed', 'cancelled', 'expired')
-      and terminal_reason is null
-    )
-    or
-    (
-      status = 'completed'
-      and terminal_reason in ('conversation_complete', 'assessment_done')
-    )
-    or
-    (
-      status = 'failed'
-      and terminal_reason in (
-        'room_create_error', 'worker_crash', 'provider_error',
-        'assessment_error', 'shutdown_forced', 'drain_timeout',
-        'residency_timeout',
-        -- 0095: consent passed, the call then ended before question one.
-        'screening_never_started'
-      )
-    )
-    or
-    (
-      status = 'cancelled'
-      and terminal_reason in (
-        'recruiter_cancelled', 'migrated_abandoned',
-        'duplicate_session', 'shutdown_drain',
-        'candidate_opt_out', 'wrong_number'
-      )
-    )
-    or
-    (
-      status = 'expired'
-      and terminal_reason in ('idle_timeout', 'grace_timeout')
-    )
-    or
-    (
-      status in ('completed', 'failed', 'cancelled', 'expired')
-      and terminal_reason = 'legacy_unknown'
-    )
-  ) not valid;
-alter table screening_v2.call_sessions
-  validate constraint chk_call_sessions_terminal_reason;
-
-comment on constraint chk_call_sessions_terminal_reason on screening_v2.call_sessions is
-  'Family-structured terminal-reason allowlist, extended ADDITIVELY by 0042 '
-  'with the two cancelled pairs and by 0095 with '
-  '("failed","screening_never_started"). voicemail_detected is deliberately '
-  'absent: no session is bound before human classification, so a '
-  'machine-answered attempt has no session to terminalise.';
+-- A draft of this migration added ('failed','screening_never_started') here
+-- and drove a session that never reached a question to that pair instead of
+-- completed/conversation_complete. It is gone, along with everything that
+-- wrote it. `finalize_phone_partial_sessions` below now makes the SAME
+-- transition 0072 shipped, so MP3 finalization and scorecard eligibility are
+-- untouched by 0095 — which is the owner's explicit constraint — and the
+-- repo's own phone_partial_finalize_assert.sql passes unchanged.
+--
+-- The reasoning is recorded in full beside that UPDATE. In short: the status
+-- change starved the sweep, cost the MP3 one of its three recovery paths,
+-- silently removed a scorecard class the eligibility gate still admits, and
+-- rested on transcript evidence written by a fire-and-forget task.
 
 -- ── 4. THE THREE FUNCTIONS, PATCHED ──────────────────────────────────
 --
@@ -520,17 +476,51 @@ begin
   -- (abandon_reason NULL — the call rang/answered) is NOT excluded and still
   -- charges the day.
   v_ist_date := screening_v2.phone_ist_date(p_now);
-  if p_kind in ('initial','no_answer_retry','scheduled')
-     and exists (select 1 from screening_v2.phone_call_attempts
-                  where engagement_id = p_engagement_id
-                    and ist_date = v_ist_date
-                    and kind in ('initial','no_answer_retry','scheduled')
-                    -- NULL-SAFE: see the index predicate. Reclaim rows have
-                    -- abandon_reason NULL; NOT(... AND NULL) is NULL and would
-                    -- silently uncount them. IS DISTINCT FROM keeps them charged.
-                    and (state <> 'abandoned'
-                         or abandon_reason is distinct from 'infra_deferred')) then
-    return jsonb_build_object('status', 'daily_attempt_exists', 'ist_date', v_ist_date);
+
+  -- ── 0095: WHICH DIAL OF THE IST DAY THIS WOULD BE ──────────────────
+  -- This REPLACES 0083's `exists(...)` test in place. It is deliberately not
+  -- a second check bolted on somewhere below: 0083's own comment above warns
+  -- that a pre-check which disagrees with the index leaves "the index fix
+  -- alone INERT", and an `exists` test in front of a 1..2 sequence index is
+  -- exactly that disagreement — it refuses the SECOND dial before the
+  -- sequence is ever consulted, making the whole same-day retry dead code.
+  -- One site now decides both the refusal and the sequence number, so they
+  -- cannot drift apart again.
+  --
+  -- Counted over exactly the rows the unique index covers, under the same
+  -- advisory lock that serialises admission, so the count and the index can
+  -- never disagree. 0094's `infra_deferred` exemption is honoured here too:
+  -- an attempt our own infrastructure deferred never consumed the
+  -- candidate's day.
+  --
+  -- Guarded by `p_kind` exactly as the old check was, so `reconnect` is
+  -- NEITHER COUNTED NOR REFUSED. Refusing a reconnect here would strand the
+  -- engagement in `reconnecting` for ever with no edge out — the failure this
+  -- function warns about twice elsewhere. A reconnect keeps the column's
+  -- default of 1 and sits outside the index predicate entirely.
+  if p_kind in ('initial','no_answer_retry','scheduled') then
+    select coalesce(max(a.ist_day_seq), 0) + 1 into v_day_seq
+      from screening_v2.phone_call_attempts a
+     where a.engagement_id = p_engagement_id
+       and a.ist_date = v_ist_date
+       and a.kind = any (array['initial','no_answer_retry','scheduled'])
+       -- NULL-SAFE: see the index predicate. Reclaim rows have
+       -- abandon_reason NULL; NOT(... AND NULL) is NULL and would
+       -- silently uncount them. IS DISTINCT FROM keeps them charged.
+       and (a.state <> 'abandoned'
+            or a.abandon_reason is distinct from 'infra_deferred');
+
+    if v_day_seq > 2 then
+      -- The anti-harassment invariant, refused in the open rather than as an
+      -- index violation, so the caller learns WHY. 0043 held this at one dial
+      -- per IST day; 0095 moves it to two and not one more.
+      return jsonb_build_object('status', 'daily_attempt_exists',
+                                'ist_date', v_ist_date,
+                                'dials_today', v_day_seq - 1,
+                                'max_per_day', 2);
+    end if;
+  else
+    v_day_seq := 1;
   end if;
 
   -- ── 0045: THE PER-CANDIDATE GUARDS ────────────────────────────────
@@ -707,28 +697,12 @@ begin
     from screening_v2.phone_call_attempts
    where engagement_id = p_engagement_id;
 
-  -- WHICH DIAL OF THE DAY THIS IS. Counted under the same advisory lock
-  -- that serialises admission, over exactly the rows the unique index
-  -- covers — so the count and the index can never disagree. 0094's
-  -- `infra_deferred` exemption is honoured here too: an attempt our own
-  -- infrastructure deferred never consumed the candidate's day.
-  select coalesce(max(a.ist_day_seq), 0) + 1 into v_day_seq
-    from screening_v2.phone_call_attempts a
-   where a.engagement_id = p_engagement_id
-     and a.ist_date = v_ist_date
-     and a.kind = any (array['initial','no_answer_retry','scheduled'])
-     and (a.state <> 'abandoned'
-          or a.abandon_reason is distinct from 'infra_deferred');
-
-  if v_day_seq > 2 then
-    -- The anti-harassment invariant, refused in the open rather than as an
-    -- index violation, so the caller learns WHY. 0043 held this at one dial
-    -- per IST day; 0095 moves it to two (an initial and one same-day
-    -- no-answer retry) and not one more.
-    return jsonb_build_object('status', 'daily_attempt_exists',
-                              'dials_today', v_day_seq - 1,
-                              'max_per_day', 2);
-  end if;
+  -- `v_day_seq` was decided ABOVE, in the same place as the refusal, and is
+  -- not recomputed here. An earlier draft had the count in this position,
+  -- behind 0083's untouched `exists(...)` pre-check — which meant the second
+  -- same-day dial was refused ~180 lines before this line could ever run, and
+  -- the entire same-day retry feature was dead code. Deciding the sequence
+  -- and the refusal at one site is what stops that recurring.
 
   v_lease_token   := gen_random_uuid();
   v_lease_expires := p_now + (greatest(5, least(coalesce(p_lease_seconds, 60), 900))
@@ -752,9 +726,20 @@ begin
     -- looking for a call that is not happening.
     when unique_violation then
       get stacked diagnostics v_constraint = constraint_name;
-      if v_constraint = 'uq_phone_attempts_one_per_ist_day' then
+      -- BOTH names are matched. 0095 replaces
+      -- `uq_phone_attempts_one_per_ist_day` with
+      -- `uq_phone_attempts_per_ist_day_seq`, and this handler was written
+      -- against the old name. Left unchanged, every race lost on the NEW
+      -- index would fall through to `attempt_in_flight` — precisely the
+      -- misreport the comment above forbids, and one that sends an operator
+      -- looking for a call that is not happening. The old name is kept so
+      -- the handler stays correct against a database where 0095 has not yet
+      -- been applied.
+      if v_constraint in ('uq_phone_attempts_one_per_ist_day',
+                          'uq_phone_attempts_per_ist_day_seq') then
         return jsonb_build_object('status', 'daily_attempt_exists',
-                                  'ist_date', v_ist_date);
+                                  'ist_date', v_ist_date,
+                                  'max_per_day', 2);
       end if;
       return jsonb_build_object('status', 'attempt_in_flight',
                                 'constraint', v_constraint);
@@ -1296,41 +1281,6 @@ begin
           v_att_state := 'ended'; v_outcome := 'consent_failed';
         end if;
 
-      -- #31 (0095). CONSENT PASSED, BUT NO SCREENING EVER HAPPENED.
-      -- The other half of the owner's 2026-09-13 ask: a candidate who
-      -- picked up and consented, and whose call then died before a single
-      -- question was asked, is NOT screened and must be called back.
-      --
-      -- `finalize_phone_partial_sessions` now proves this from the
-      -- transcript — no non-gate turn — and drives the session
-      -- `failed` / `screening_never_started`. That fixes the SESSION's
-      -- story. Without this edge the ENGAGEMENT's story stays wrong: the
-      -- sweep posts nothing, so the engagement sits in `in_call` until a
-      -- reaper or a scoring write-back closes it, and the candidate is
-      -- never dialled again.
-      --
-      -- Deliberately NOT `assessment.aborted` (#22's sibling), which is
-      -- terminal `failed`. A scoring run that aborted really is the end of
-      -- the road; a call that never reached a question is a call we still
-      -- owe. Same destination as #30 for the same reason — `awaiting_retry`
-      -- hands it to the ordinary retry machinery: the same-day edge #27b if
-      -- the day's budget allows, otherwise the day roll.
-      --
-      -- Unconditional on state, exactly as #30 is, and safe for the same
-      -- reason: the `terminal_at is not null -> 'terminal'` guard above
-      -- already refuses every terminal engagement before this case is
-      -- reached, so this can neither resurrect a closed engagement nor
-      -- raise from the immutability trigger. The only poster is the partial
-      -- sweep, once per session, and only for a session it has just proven
-      -- carries no non-gate turn.
-      when p_event_type = 'screening.not_started' then
-        v_new_state := 'awaiting_retry';                                -- #31
-        v_reason    := 'screening_never_started';
-        if v_att.id is not null and v_att.state in
-           ('admitted','ringing','answered_unclassified','human','machine') then
-          v_att_state := 'ended'; v_outcome := 'screening_not_started';
-        end if;
-
       when p_event_type in ('hr.cancelled','emergency.stop','ashby.stage_left','prereq.lost') then
         v_new_state := 'cancelled';                                     -- #3 / #29
         v_reason    := replace(p_event_type, '.', '_');
@@ -1650,13 +1600,10 @@ begin
            s.current_question_index as covered,
            s.recording_object_key,
            a.id            as attempt_id,
-           -- 0095: returned so the CALLER can post `screening.not_started`.
-           -- It is posted from the caller and NOT from inside this loop on
-           -- purpose: this sweep holds `for update of s` on call_sessions,
-           -- which is LAST in the pinned lock order, and `apply_phone_event`
-           -- locks the engagement and the attempt. Calling it here would take
-           -- engagement-after-session and invert that order against every
-           -- other writer — a deadlock, not a test failure.
+           -- 0095: reported so an operator reading the sweep's output can tie
+           -- a finalized session to its engagement without a second query.
+           -- Nothing ACTS on it — the draft that posted an engagement event
+           -- from the caller is gone with edge #31.
            a.engagement_id as engagement_id,
            a.state         as attempt_state,
            a.outcome_class as attempt_outcome,
@@ -1794,28 +1741,46 @@ begin
     -- finalized by 0071's reclaim): re-transitioning `expired -> completed` is
     -- not a legal 0006 edge, so we deliberately leave it terminal and report
     -- `transitioned=false`. Its scoring is still owed and still returned below.
-    -- A session that never reached a question is driven to `failed` /
-    -- `screening_never_started` instead of `completed` /
-    -- `conversation_complete`.
+    -- ── THE SESSION TRANSITION IS UNCHANGED BY 0095 ───────────────────
     --
-    -- WHAT THIS DELIBERATELY PRESERVES:
-    --   * MP3 — `trg_enqueue_recording_finalize` fires on
-    --     status IN ('completed','failed','cancelled','expired'), so `failed`
-    --     finalizes the recording exactly as `completed` did.
-    --   * SCORING — `assessment.ts` admits only
-    --     (`completed` + `conversation_complete`) or the crash-partial
-    --     (`expired` + `grace_timeout`). `failed` is admitted by neither, which
-    --     is correct: there are no non-gate turns, so there is nothing to
-    --     score. A session WITH captured answers still takes the branch below
-    --     and keeps the exact pair scoring accepts.
-    --   * `in_progress -> failed` is a legal edge in
-    --     `enforce_session_transition`.
+    -- An earlier draft drove a never-started session to `failed` /
+    -- `screening_never_started`. Three reviews and the repo's own
+    -- `phone_partial_finalize_assert.sql` all rejected it, and they were
+    -- right. `never_started` is now REPORTED and never acted on here.
+    --
+    -- Why the status must not move:
+    --   * THE SWEEP STARVES ITSELF. The selection admits
+    --     `expired`/`grace_timeout` as well as `in_progress`, but this UPDATE
+    --     is guarded `status = 'in_progress'`, so that arm is never
+    --     re-stamped. It leaves the set only once an assessment row exists.
+    --     Skipping the scoring enqueue for these sessions meant no row was
+    --     ever written, so they were re-selected for ever — and with
+    --     `limit 25` and `order by started_at asc`, 25 of them displace every
+    --     REAL partial screening from the window. Those lose both the
+    --     scorecard and the terminal transition that drives the MP3.
+    --   * THE MP3 LOSES A RECOVERY PATH. The 0038 trigger and the sweeper do
+    --     treat `failed` like `completed`, but the download route's
+    --     on-demand finalize backstop is `status = 'completed'` only.
+    --   * SCORING CHANGES FOR A CLASS THAT HAD IT. The crash-partial pair
+    --     (`expired` + `grace_timeout`) is admitted by the eligibility gate,
+    --     so such a session was scored before; withholding the enqueue takes
+    --     that away without touching the gate, which is what made the change
+    --     invisible.
+    --   * THE EVIDENCE IS NOT SAFE TO ACT ON. The per-item transcript writer
+    --     is fire-and-forget (`agent.py`, `asyncio.create_task`, never
+    --     awaited, failures swallowed) and the boundary writer SUPPRESSES its
+    --     own insert when any per-item row exists (0086). If the bot's write
+    --     lands and the candidate's does not, a real screening reads as
+    --     never-started. Good enough to REPORT; not good enough to withhold a
+    --     scorecard or redirect a call on.
+    --
+    -- So the transition below is byte-for-byte what 0072 shipped: the SAME
+    -- transition the worker's happy path uses. MP3 and scorecard generation
+    -- are therefore untouched by this migration, which is the owner's
+    -- explicit constraint.
     update screening_v2.call_sessions s
-       set status          = case when v_never_started then 'failed'
-                                  else 'completed' end,
-           terminal_reason = case when v_never_started
-                                  then 'screening_never_started'
-                                  else 'conversation_complete' end,
+       set status          = 'completed',
+           terminal_reason = 'conversation_complete',
            ended_at        = coalesce(s.ended_at, p_now),
            updated_at      = p_now
      where s.id = v_row.session_id
