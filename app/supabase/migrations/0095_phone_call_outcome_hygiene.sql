@@ -1273,7 +1273,20 @@ begin
       -- Lands on `awaiting_retry`, so the ordinary retry machinery carries
       -- it: the same-day edge above if the budget allows, otherwise the day
       -- roll. The engagement is NOT terminal and the cycle is NOT closed.
-      when p_event_type = 'consent.failed' then
+      -- SCOPED TO `dialing`, exactly like `disclosure.refused` (#17) and every
+      -- other gate edge. The whole consent gate runs while the engagement is
+      -- `dialing`: `classify.human` (#16) moves no state, and
+      -- `disclosure.delivered` (#18) is the ONLY edge to `in_call`. So all
+      -- three exits that post this event are in `dialing` by construction.
+      --
+      -- An earlier draft left this unconditional on state. That handed a
+      -- buggy or replayed worker post the power to yank a LIVE screening out
+      -- of `in_call` and into `awaiting_retry` mid-conversation. It is
+      -- reachable: `run_phone_gate` fails OPEN on a `fetch_durable_consent`
+      -- error, so a reconnect into an already-consented call can re-run the
+      -- gate. Out of `dialing` this is now `unexpected_event` — logged,
+      -- recorded, and unable to touch a call in progress.
+      when v_eng.state = 'dialing' and p_event_type = 'consent.failed' then
         v_new_state := 'awaiting_retry';                                -- #30
         v_reason    := 'consent_gate_failed';
         if v_att.id is not null and v_att.state in
