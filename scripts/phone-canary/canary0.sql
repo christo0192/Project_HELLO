@@ -652,10 +652,34 @@ begin
                             _phone_canary.code(r->>'status'));
   -- Construct the precondition the INDEX exists for: eligible now, with a
   -- cold call already recorded against today's IST date.
+  --
+  -- 0095 MOVES THIS ANSWER from one dial a day to two. The index still bounds
+  -- the day — it is now a per-day SEQUENCE bounded 1..2 — so the second cold
+  -- call is admitted and the THIRD is refused. Both halves are asserted;
+  -- checking only the admission would pass with no ceiling at all.
   update screening_v2.phone_engagements set next_eligible_at = null where id = engb;
   r := screening_v2.admit_phone_attempt(engb, 'initial', 'canary0', 180,
                                         d1 + interval '2 hours');
-  perform _phone_canary.chk(s, 'same_day_cold_call_refused_by_index',
+  perform _phone_canary.chk(s, 'same_day_second_cold_call_admitted',
+                            r->>'status' = 'ok',
+                            _phone_canary.code(r->>'status'));
+  attb := (r->>'attempt_id')::uuid;
+  perform _phone_canary.chk(s, 'same_day_retry_is_the_second_dial',
+                            (select ist_day_seq from screening_v2.phone_call_attempts
+                              where id = attb) = 2,
+                            'ist_day_seq');
+
+  -- End it and re-arm, so the third refusal is the DAILY one rather than
+  -- `attempt_in_flight` from the one-live index.
+  update screening_v2.phone_call_attempts
+     set state = 'ended', ended_at = d1 + interval '3 hours'
+   where id = attb;
+  update screening_v2.phone_engagements
+     set state = 'eligible', next_eligible_at = null
+   where id = engb;
+  r := screening_v2.admit_phone_attempt(engb, 'initial', 'canary0', 180,
+                                        d1 + interval '4 hours');
+  perform _phone_canary.chk(s, 'same_day_third_cold_call_refused_by_index',
                             r->>'status' = 'daily_attempt_exists',
                             _phone_canary.code(r->>'status'));
 
