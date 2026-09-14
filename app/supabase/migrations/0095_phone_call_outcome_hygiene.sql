@@ -121,6 +121,11 @@ as $$
   select interval '5 hours';
 $$;
 
+revoke all on function screening_v2.phone_same_day_retry_delay()
+  from public, anon, authenticated;
+grant execute on function screening_v2.phone_same_day_retry_delay()
+  to service_role;
+
 comment on function screening_v2.phone_same_day_retry_delay() is
   'Gap between the first dial and the same-day no-answer retry.';
 
@@ -1861,14 +1866,28 @@ $$;
 -- asks "have five hours passed?" — different questions, different dedup keys,
 -- and neither can answer for the other.
 
+-- THE SIGNATURE IS FORMATTED TO THE HOUSE CONVENTION, NOT TO TASTE. The
+-- RPC-contract tests read these functions out of the migration with regexes,
+-- and three details are load-bearing:
+--   * `timestamptz`, never `timestamp with time zone` — the "no RPC body
+--     reads the machine clock" test pins the literal spelling of the `p_now`
+--     default;
+--   * `)` and `returns` on separate lines — the parameter extractor slices
+--     on `)\nreturns`;
+--   * NO COMMENTS BETWEEN THE PARAMETERS — the extractor walks them with a
+--     non-multiline regex anchored on `,`, so a comment line after a comma
+--     silently swallows the parameter that follows it.
+-- Body quoted `$$`, like every other function in this chain: the extractor
+-- only understands that terminator and runs on past a `$function$`.
 create or replace function screening_v2.sweep_phone_same_day_retry(
   p_limit integer default 25,
-  p_now   timestamp with time zone default now()
-) returns jsonb
+  p_now timestamptz default now()
+)
+returns jsonb
 language plpgsql
 security definer
 set search_path to 'pg_catalog', 'screening_v2'
-as $function$
+as $$
 declare
   v_limit    integer := greatest(1, least(coalesce(p_limit, 25), 200));
   v_row      record;
@@ -1943,7 +1962,12 @@ begin
     'limit',    v_limit
   );
 end;
-$function$;
+$$;
+
+revoke all on function screening_v2.sweep_phone_same_day_retry(integer, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.sweep_phone_same_day_retry(integer, timestamptz)
+  to service_role;
 
 comment on function screening_v2.sweep_phone_same_day_retry(integer, timestamptz) is
   'Releases an awaiting_retry engagement for its SECOND dial of the same IST '

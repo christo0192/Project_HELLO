@@ -161,7 +161,10 @@ describe('1. every phone write goes through an RPC', () => {
     // `release_candidate_phone_suppression`) and its read
     // (`phone_suppression_state`) — which is the compensating control that
     // lets PHONE_DIAL_SCOPE=pipeline retire the hand-maintained allowlist.
-    expect(new Set(rpcCalls).size).toBe(35);
+    // 0095 added ONE: `sweep_phone_same_day_retry`, the driver for the new
+    // same-day no-answer retry (transition #27b), mirroring the day-roll
+    // sweep 0045 added for #27.
+    expect(new Set(rpcCalls).size).toBe(36);
     // The write seam reaches NO table, only RPCs.
     expect(writeBody, 'stores.ts uses a table accessor').not.toMatch(/\bclient\s*\.\s*from\s*\(/);
     // A type-only import of the client type is fine; a VALUE import is not.

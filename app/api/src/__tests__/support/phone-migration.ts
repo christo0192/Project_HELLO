@@ -36,6 +36,20 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+// 0095 re-declares apply_phone_event, admit_phone_attempt and
+// finalize_phone_partial_sessions IN FULL (lifted verbatim from 0067, 0094 and
+// 0072 respectively, then patched), and declares the same-day retry sweep. It
+// must therefore be FIRST in PHONE_MIGRATIONS so `newestContaining` resolves
+// those four to this file rather than to a superseded body.
+export const MIGRATION_0095_PATH = fileURLToPath(
+  new URL(
+    '../../../../supabase/migrations/0095_phone_call_outcome_hygiene.sql',
+    import.meta.url,
+  ),
+);
+
+export const MIGRATION_0095 = readFileSync(MIGRATION_0095_PATH, 'utf8');
+
 export const MIGRATION_0094_PATH = fileURLToPath(
   new URL(
     '../../../../supabase/migrations/0094_phone_dial_scope_fleet_cap_suppressions.sql',
@@ -208,6 +222,14 @@ export const MIGRATION_0092 = readFileSync(MIGRATION_0092_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0095 re-declares THREE functions in full — apply_phone_event (edges #27b,
+    // #30, #31), admit_phone_attempt (the second dial of the IST day) and
+    // finalize_phone_partial_sessions (a never-started call is not a completed
+    // screening) — so it must come FIRST, ahead of 0094, for exactly the reason
+    // spelled out below: an extractor that reads a superseded body makes the
+    // drift test blind to the new refusals and outcomes. It also declares
+    // sweep_phone_same_day_retry, which no earlier migration mentions.
+    { name: '0095', sql: MIGRATION_0095 },
     // 0094 re-declares admit_phone_attempt IN FULL (0083's body plus the fleet
     // daily cap), so it must come FIRST or every extractor reads 0083's
     // superseded body and the new `fleet_daily_cap_reached` refusal is
@@ -413,6 +435,12 @@ export const RPC_NAMES = [
   'suppress_candidate_phone',
   'release_candidate_phone_suppression',
   'phone_suppression_state',
+  // 0095 — the same-day no-answer retry driver, mirror of
+  // `sweep_phone_day_rolled`. `phone_same_day_retry_delay()` is deliberately
+  // NOT listed, for the same reason `phone_max_daily_dials()` is not: it is a
+  // constant helper, not a service-role RPC, and it returns an interval
+  // rather than a status envelope.
+  'sweep_phone_same_day_retry',
 ] as const;
 
 /**

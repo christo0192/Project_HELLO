@@ -1358,20 +1358,34 @@ describe('0067 — recording starts on an APPLIED call.answered', () => {
 // have pre-consent audio — a machine pickup and a pre-disclosure deferral —
 // because the recording now starts at ANSWER, before consent. The behaviour is
 // identical to the refusals: destroy and verify before the event posts.
-const TERMINAL_REFUSALS = [
+//
+// 0095 adds `consent.failed`, and RENAMES this list, because the name had been
+// wrong since 0067: the rule was never "terminal". `candidate.deferred_pre_disclosure`
+// lands on `eligible` and has been in this set, non-terminal, for two
+// migrations. The rule that actually holds — and the one the audio purge
+// exists to enforce — is CONSENT WAS NOT OBTAINED. Whether the engagement is
+// over is a different question from whether we are allowed to keep the tape.
+//
+// `consent.failed` is the clearest case there is: the gate broke, so the
+// candidate never consented to anything, and the recording has been running
+// since `call.answered`. That we intend to CALL THEM BACK does not earn us
+// the right to keep audio of a person who never agreed to be recorded — if
+// anything it argues the other way.
+const NON_CONSENTING_EXITS = [
   'disclosure.refused',
   'candidate.opt_out',
   'candidate.wrong_number',
   'classify.machine',
   'candidate.deferred_pre_disclosure',
+  'consent.failed',
 ] as const;
 
-describe('a terminal refusal purges the recordings BEFORE it is acknowledged', () => {
-  it('the purge set is exactly the five non-consenting exits (record from answer, keep only if consented)', () => {
-    expect([...PURGE_BEFORE_EVENTS].sort()).toEqual([...TERMINAL_REFUSALS].sort());
+describe('a non-consenting exit purges the recordings BEFORE it is acknowledged', () => {
+  it('the purge set is exactly the six non-consenting exits (record from answer, keep only if consented)', () => {
+    expect([...PURGE_BEFORE_EVENTS].sort()).toEqual([...NON_CONSENTING_EXITS].sort());
   });
 
-  for (const event of TERMINAL_REFUSALS) {
+  for (const event of NON_CONSENTING_EXITS) {
     it(`${event}: purges first, then posts the event`, async () => {
       const h = build({ withPurge: true });
       const order: string[] = [];
@@ -1435,8 +1449,13 @@ describe('a terminal refusal purges the recordings BEFORE it is acknowledged', (
     expect(h.applyEvent).not.toHaveBeenCalled();
   });
 
-  it('NON-terminal events do not purge at all', async () => {
-    for (const event of WORKER_PHONE_EVENTS.filter((e) => !TERMINAL_REFUSALS.includes(e as never))) {
+  it('every OTHER worker event does not purge at all', async () => {
+    // The complement, and still a real guard: the purge is destructive and
+    // unverifiable after the fact, so exactly the listed events may trigger
+    // it and nothing else. Deriving the complement from the list (rather than
+    // from "is it terminal") is what keeps this honest now that the set
+    // contains non-terminal members.
+    for (const event of WORKER_PHONE_EVENTS.filter((e) => !NON_CONSENTING_EXITS.includes(e as never))) {
       const h = build({ withPurge: true });
       const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: event });
       expect(res.status).toBe(200);

@@ -483,6 +483,10 @@ describe('errors and malformed answers', () => {
       ['phone_heartbeat_attempt_error', () => stores.heartbeatAttemptByEpoch({
         attemptId: 'a', epoch: 1, sessionId: 's', now: NOW })],
       ['phone_sweep_day_rolled_error', () => stores.sweepDayRolled({ now: NOW })],
+      // 0095 — the same-day retry driver. Same risk as its day-roll sibling:
+      // the raw PostgREST error carries a connection string and a candidate
+      // row, so the seam must answer with a stable code and nothing else.
+      ['phone_sweep_same_day_retry_error', () => stores.sweepSameDayRetry({ now: NOW })],
       ['phone_sweep_stranded_error', () => stores.sweepStrandedSessions({ now: NOW })],
       ['phone_claim_sweep_error', () => stores.claimSweep({
         sweep: 'reconcile', owner: 'o', now: NOW })],
