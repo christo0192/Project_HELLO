@@ -163,6 +163,21 @@ export interface SweepPhoneDayRolledResult {
   readonly skipped?: number;
 }
 
+/**
+ * 0095. The same-day second chance.
+ *
+ * `released`, not `rolled`: nothing about the day has changed. The day-roll
+ * sweep answers "has a new day begun?"; this one answers "have five hours
+ * passed?", and naming them the same would invite a future reader to merge two
+ * sweeps that must stay mutually exclusive.
+ */
+export interface SweepPhoneSameDayRetryResult {
+  readonly status: OrUnknown<'ok'>;
+  readonly examined?: number;
+  readonly released?: number;
+  readonly skipped?: number;
+}
+
 export interface SweepPhoneStrandedSessionsResult {
   readonly status: OrUnknown<'ok'>;
   readonly examined?: number;
@@ -189,6 +204,25 @@ export interface SweepPhoneStrandedRecordingsResult {
 export interface PhonePartialFinalizeSession {
   readonly sessionId: string;
   readonly attemptId: string | null;
+  /** 0095 — reported so a log line can name the engagement. Not acted on. */
+  readonly engagementId: string | null;
+  /**
+   * 0095 — the session carries no non-gate transcript turn from the CANDIDATE,
+   * i.e. on the available evidence the call never reached a question.
+   *
+   * REPORTED ONLY. It is written to the partial-finalize log line and nothing
+   * branches on it. A draft skipped the scoring enqueue for these sessions and
+   * drove them to a different terminal status; both were reverted, because the
+   * evidence cannot bear that weight — the per-item transcript writer is
+   * fire-and-forget (`agent.py`, `asyncio.create_task`, never awaited, failures
+   * swallowed) and the boundary writer suppresses its own insert when any
+   * per-item row exists, so a genuine screening whose candidate turn was lost
+   * in transit reads as never-started.
+   *
+   * Good enough to tell an operator where to look. Not good enough to withhold
+   * a scorecard or redirect a call.
+   */
+  readonly neverStarted: boolean;
   /** Questions covered = `call_sessions.current_question_index`. */
   readonly covered: number | null;
   /** Plan length; `null` when the plan row is unresolvable (still score). */
@@ -745,6 +779,18 @@ export interface PhoneStores {
     readonly limit?: number;
     readonly now: Date;
   }): Promise<SweepPhoneDayRolledResult>;
+
+  /**
+   * 0095. Drives transition #27b — the SAME-day no-answer retry.
+   *
+   * Separate from `sweepDayRolled` on purpose: the two select on opposite
+   * sides of the same IST-date comparison, so an engagement is claimed by
+   * exactly one of them and neither can answer for the other.
+   */
+  sweepSameDayRetry(input: {
+    readonly limit?: number;
+    readonly now: Date;
+  }): Promise<SweepPhoneSameDayRetryResult>;
 
   /** 0045. Resolves engagements left pointing at an already-ended session. */
   sweepStrandedSessions(input: {

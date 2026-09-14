@@ -185,6 +185,7 @@ function fakeStores(over: Partial<PhoneStores> = {}): WriteSpy {
     heartbeatAttempt: async () => ({ status: 'ok' }),
     heartbeatAttemptByEpoch: async () => ({ status: 'ok' as const }),
     sweepDayRolled: async () => ({ status: 'ok' as const, examined: 0, rolled: 0, skipped: 0 }),
+    sweepSameDayRetry: async () => ({ status: 'ok' as const, examined: 0, released: 0, skipped: 0 }),
     sweepStrandedSessions: async () => ({
       status: 'ok' as const, examined: 0, completed: 0, failed: 0, skipped: 0,
     }),
@@ -1158,6 +1159,7 @@ function fakeRuntime(over: {
       lastExpired: null,
       lastReconciled: null,
       lastRolled: null,
+      lastSameDayReleased: null,
       lastStranded: null,
       lastRecStranded: null,
       lastPartialFinalized: null,

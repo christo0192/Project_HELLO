@@ -79,6 +79,7 @@ function fakeStores(admit: AdmitPhoneAttemptResult): FakeStores {
     heartbeatAttempt: unreachable,
     heartbeatAttemptByEpoch: unreachable,
     sweepDayRolled: unreachable,
+    sweepSameDayRetry: unreachable,
     sweepStrandedSessions: unreachable,
     claimSweep: unreachable,
     reclaimAttemptLeases: unreachable,

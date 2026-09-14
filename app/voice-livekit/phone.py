@@ -900,6 +900,18 @@ PHONE_WORKER_EVENTS: frozenset[str] = frozenset([
     "sip.participant_left",
     "assessment.completed",
     "assessment.aborted",
+    # 0095 / issue #286. The consent gate broke on OUR side — a malformed RPC
+    # body, a classifier error, a disclosure that was never recorded.
+    #
+    # THIS LINE IS THE FEATURE. The server half (`WORKER_PHONE_EVENTS` and
+    # `PURGE_BEFORE_EVENTS` in routes/phone-worker.ts) was updated and this one
+    # was not, so every `consent.failed` short-circuited at the check below,
+    # logged `consent_failed_not_applied`, and posted nothing: the pre-consent
+    # audio was not purged and the engagement was not released. #286 was
+    # unchanged on the primary path while the tests passed, because the test
+    # double has no allowlist. `test_phone_gate.py` now pins the two
+    # allowlists against each other.
+    "consent.failed",
 ])
 
 _ERR_CONFIGURATION = "configuration"
@@ -5879,6 +5891,46 @@ async def run_phone_gate(
     if consent_reply:
         gate_turns.append({"speaker": "candidate", "text": consent_reply})
 
+    async def _report_consent_failed(category: str) -> None:
+        """Tell the server the gate broke on OUR side. Never raises.
+
+        THE HOLE THIS CLOSES (issue #286). Three exits after `call.answered`
+        posted nothing at all — `consent_start_failed`, `classify_human_failed`
+        and `disclosure_not_recorded`. The worker just returned. The engagement
+        was left in `dialing` for the lease reaper, the pre-consent recording
+        (egress starts at `call.answered`, before consent) was never destroyed,
+        and `finalize_phone_partial_sessions` then stamped the session
+        `completed` / `conversation_complete` — the same transition the happy
+        path uses. Candidate NEELU S was recorded as SCREENED on 2026-09-10
+        without ever being asked a question, and could not be redialled without
+        a human noticing.
+
+        `consent.failed` is in `PURGE_BEFORE_EVENTS`, so posting it destroys
+        that audio, and it lands the engagement on `awaiting_retry` rather than
+        a terminal state — the candidate is owed the call we failed to make.
+
+        Never `disclosure.refused`: that is the candidate declining, it is
+        terminal, and redialling someone who declined is an opt-out breach.
+        """
+        _log.warn(
+            "unknown_event", error_type="phone_gate_blocked",
+            error_category=category,
+        )
+        try:
+            outcome = await client.post_event(
+                attempt_id, "consent.failed", epoch=epoch,
+            )
+        except Exception:  # noqa: BLE001 — a failed report must not also crash.
+            outcome = None
+        if outcome is None or not event_applied(outcome):
+            # Visible, not assumed. An unapplied post means the recording was
+            # NOT purged and the engagement was NOT released, which is the one
+            # thing this block exists to guarantee.
+            _log.warn(
+                "unknown_event", error_type="phone_gate_blocked",
+                error_category="consent_failed_not_applied",
+            )
+
     # New clients use the single atomic consent/start boundary. Legacy fakes
     # remain supported during rollout, but production's client always exposes
     # this method and cannot return an authorized state without the RPC.
@@ -5888,7 +5940,7 @@ async def run_phone_gate(
         # server role_title is in hand before we speak.
         combined = await consent_start(attempt_id, session_id, epoch)
         if not combined.ok:
-            _log.warn("unknown_event", error_type="phone_gate_blocked", error_category="consent_start_failed")
+            await _report_consent_failed("consent_start_failed")
             return PhoneGateResult(CLASSIFY_HUMAN, events=events, spoken=spoken)
         events.extend(["classify.human", "disclosure.delivered"])
         # THE LATENCY MASK. The deterministic role-opening line (a USEFUL
@@ -5969,10 +6021,7 @@ async def run_phone_gate(
         # `ok` is not consent. An `ignored` verdict — terminal, stale_epoch,
         # unknown_attempt — means the API recorded NOTHING, and proceeding on it
         # would screen a candidate whose conversation the system has ended.
-        _log.warn(
-            "unknown_event", error_type="phone_gate_blocked",
-            error_category="classify_human_failed",
-        )
+        await _report_consent_failed("classify_human_failed")
         return PhoneGateResult(CLASSIFY_HUMAN, events=events, spoken=spoken)
     events.append("classify.human")
 
@@ -5983,10 +6032,7 @@ async def run_phone_gate(
         # Consent was given on the wire but not recorded. Proceeding would score
         # a call whose consent the system cannot prove. An `ignored` verdict is
         # exactly that case: a 200 body that recorded nothing.
-        _log.warn(
-            "unknown_event", error_type="phone_gate_blocked",
-            error_category="disclosure_not_recorded",
-        )
+        await _report_consent_failed("disclosure_not_recorded")
         return PhoneGateResult(CLASSIFY_HUMAN, events=events, spoken=spoken)
     events.append("disclosure.delivered")
 

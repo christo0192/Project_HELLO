@@ -147,6 +147,16 @@ export const PHONE_OUTCOME_CLASSES = [
    * difference after the fact if the two share a label.
    */
   'abandoned_pre_disclosure',
+  /**
+   * 0095: the consent gate itself FAILED — our RPC returned a malformed body,
+   * our classifier errored, our disclosure was never recorded.
+   *
+   * Deliberately NOT `declined`. `declined` is the candidate refusing, which
+   * is terminal and must never be dialled again. This is a fault we own, and
+   * the candidate is owed the call they never got. Conflating them either
+   * redials someone who said no or abandons someone we failed.
+   */
+  'consent_failed',
 ] as const;
 
 export type PhoneOutcomeClass = (typeof PHONE_OUTCOME_CLASSES)[number];

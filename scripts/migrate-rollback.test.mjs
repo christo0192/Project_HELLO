@@ -466,7 +466,50 @@ function analyzeMigrations(files) {
           || (migration.startsWith('0088_role_scorecards') &&
             idxUnqualified === 'uq_assessments_phone_session' &&
             /SCORECARD-INDEX-NARROW SANCTION/.test(sql) &&
-            /create\s+unique\s+index\s+if\s+not\s+exists\s+uq_assessments_phone_session[\s\S]*?source\s*=\s*'phone'\s+and\s+revision\s*=\s*1/i.test(sql));
+            /create\s+unique\s+index\s+if\s+not\s+exists\s+uq_assessments_phone_session[\s\S]*?source\s*=\s*'phone'\s+and\s+revision\s*=\s*1/i.test(sql))
+          // 0095 replaces the one-dial-per-IST-day index with a per-day
+          // SEQUENCE, so a no-answer can be retried once more the same day
+          // (issue #286 / owner request 2026-09-13). The daily cap is not
+          // removed: it moves from 1 to 2 and is still enforced by a unique
+          // index, with `chk_phone_attempts_ist_day_seq` making a third
+          // physically impossible. The replacement must carry the same partial
+          // predicate — including 0094's `infra_deferred` exemption — or an
+          // abandoned attempt would start consuming the candidate's day.
+          // Keep this exception exact.
+          || (migration.startsWith('0095_phone_call_outcome_hygiene') &&
+            idxUnqualified === 'uq_phone_attempts_one_per_ist_day' &&
+            /DAILY-DIAL-CAP SANCTION/.test(sql) &&
+            // ONE regex, bounded by `[^;]` so every conjunct must hold INSIDE
+            // the replacement index's own CREATE statement.
+            //
+            // The first draft of this sanction spelled the exemption as a
+            // separate file-wide `/infra_deferred/.test(sql)`. That conjunct
+            // COULD NOT FAIL: `infra_deferred` appears nine times elsewhere in
+            // 0095 (in the lifted function bodies), so a replacement index that
+            // dropped the exemption — and therefore let an infra-deferred
+            // abandonment consume the candidate's daily dial slot — was
+            // sanctioned. An adversarial review built that exact mutant and
+            // confirmed the guard passed it.
+            //
+            // `[^;]*?` cannot cross a statement boundary, so the columns AND
+            // the exemption must both belong to this CREATE.
+            new RegExp(
+              'create\\s+unique\\s+index\\s+if\\s+not\\s+exists\\s+' +
+              'uq_phone_attempts_per_ist_day_seq' +
+              '[^;]*?\\(\\s*engagement_id\\s*,\\s*ist_date\\s*,\\s*ist_day_seq\\s*\\)' +
+              '[^;]*?infra_deferred[^;]*?;',
+              'i',
+            ).test(sql) &&
+            // Same ordering assertion the 0083 branch carries: a
+            // CREATE-then-DROP would leave the chain with NO index at all.
+            (() => {
+              const m = new RegExp(
+                'create\\s+unique\\s+index\\s+if\\s+not\\s+exists\\s+' +
+                'uq_phone_attempts_per_ist_day_seq[^;]*?infra_deferred',
+                'i',
+              ).exec(sql);
+              return m !== null && dropIdxPos >= 0 && m.index > dropIdxPos;
+            })());
         if (sanctionedIndexNarrow) {
           ok(migration, stmt, "REPLACEABLE_DROP_INDEX", "0083 sanctioned index-narrow: drop + re-create same name (CREATE follows DROP, carries narrowed predicate; coverage only shrinks)");
         } else if (idxUnqualified && model.indexes.has(idxUnqualified)) {

@@ -1358,7 +1358,25 @@ describe('0067 — recording starts on an APPLIED call.answered', () => {
 // have pre-consent audio — a machine pickup and a pre-disclosure deferral —
 // because the recording now starts at ANSWER, before consent. The behaviour is
 // identical to the refusals: destroy and verify before the event posts.
-const TERMINAL_REFUSALS = [
+//
+// 0095 RENAMES this list, because the name had been wrong since 0067: the rule
+// was never "terminal". `candidate.deferred_pre_disclosure` lands on `eligible`
+// and has been in this set, non-terminal, for two migrations.
+//
+// But the rule is not simply "consent was not obtained" either. THE PURGE IS
+// ENGAGEMENT-WIDE — `list_phone_engagement_recordings` enumerates every attempt
+// of the engagement and `clear_phone_attempt_recordings` nulls all their keys —
+// so a member must additionally guarantee that NO SIBLING ATTEMPT holds
+// consented audio. Every member below does, by being pre-consent AND ending the
+// engagement (or deferring it before any consented leg can exist).
+//
+// `consent.failed` was briefly added here and REMOVED after an adversarial
+// review: it is non-terminal, so its engagement can carry an earlier attempt
+// that consented and recorded a real screening, and the engagement-wide purge
+// would delete that recording irreversibly. See the long note on
+// PURGE_BEFORE_EVENTS in routes/phone-worker.ts. Restoring it requires an
+// attempt-scoped purge first.
+const NON_CONSENTING_EXITS = [
   'disclosure.refused',
   'candidate.opt_out',
   'candidate.wrong_number',
@@ -1366,12 +1384,22 @@ const TERMINAL_REFUSALS = [
   'candidate.deferred_pre_disclosure',
 ] as const;
 
-describe('a terminal refusal purges the recordings BEFORE it is acknowledged', () => {
+describe('a non-consenting exit purges the recordings BEFORE it is acknowledged', () => {
   it('the purge set is exactly the five non-consenting exits (record from answer, keep only if consented)', () => {
-    expect([...PURGE_BEFORE_EVENTS].sort()).toEqual([...TERMINAL_REFUSALS].sort());
+    expect([...PURGE_BEFORE_EVENTS].sort()).toEqual([...NON_CONSENTING_EXITS].sort());
   });
 
-  for (const event of TERMINAL_REFUSALS) {
+  it('consent.failed does NOT purge — the purge is engagement-wide and it is not terminal', () => {
+    // Pinned POSITIVELY rather than left to the set comparison above, because
+    // the reasoning is not recoverable from the list: this event DOES leave
+    // un-consented audio, and the only reason it must not purge is that the
+    // purge would reach a SIBLING attempt's consented recording.
+    expect(PURGE_BEFORE_EVENTS.has('consent.failed')).toBe(false);
+    // It remains a legal worker event — it just does not purge.
+    expect(WORKER_PHONE_EVENTS).toContain('consent.failed');
+  });
+
+  for (const event of NON_CONSENTING_EXITS) {
     it(`${event}: purges first, then posts the event`, async () => {
       const h = build({ withPurge: true });
       const order: string[] = [];
@@ -1435,8 +1463,13 @@ describe('a terminal refusal purges the recordings BEFORE it is acknowledged', (
     expect(h.applyEvent).not.toHaveBeenCalled();
   });
 
-  it('NON-terminal events do not purge at all', async () => {
-    for (const event of WORKER_PHONE_EVENTS.filter((e) => !TERMINAL_REFUSALS.includes(e as never))) {
+  it('every OTHER worker event does not purge at all', async () => {
+    // The complement, and still a real guard: the purge is destructive and
+    // unverifiable after the fact, so exactly the listed events may trigger
+    // it and nothing else. Deriving the complement from the list (rather than
+    // from "is it terminal") is what keeps this honest now that the set
+    // contains non-terminal members.
+    for (const event of WORKER_PHONE_EVENTS.filter((e) => !NON_CONSENTING_EXITS.includes(e as never))) {
       const h = build({ withPurge: true });
       const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: event });
       expect(res.status).toBe(200);

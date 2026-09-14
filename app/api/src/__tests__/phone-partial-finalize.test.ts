@@ -44,11 +44,21 @@ const SESSION_A = '11111111-1111-4111-a111-111111111111';
 const SESSION_B = '22222222-2222-4222-a222-222222222222';
 const ATTEMPT_A = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
 const ATTEMPT_B = 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb';
+const ENGAGEMENT_A = 'eeeeeeee-eeee-4eee-aeee-eeeeeeeeeeee';
 
 interface EnqueueCall {
   readonly name: string;
   readonly payload: unknown;
   readonly options: { dedupKey?: string; maxAttempts?: number } | undefined;
+}
+
+/** Every `apply_phone_event` the tick posts, in order. */
+interface EventCall {
+  readonly eventType: string;
+  readonly engagementId: string | null | undefined;
+  readonly attemptId: string | null | undefined;
+  readonly providerEventId: string | null | undefined;
+  readonly source: string;
 }
 
 function screeningConfig(): PhoneScreeningConfig {
@@ -87,6 +97,10 @@ function makeStores(opts: {
     finalized: number;
     sessions: PhonePartialFinalizeSession[];
   };
+  /** 0095 — collects every engagement event the tick posts. */
+  events?: EventCall[];
+  /** 0095 — make `applyEvent` throw, to pin the best-effort contract. */
+  applyEventThrows?: boolean;
 }): PhoneStores {
   return {
     async backlog() {
@@ -103,6 +117,26 @@ function makeStores(opts: {
     },
     async sweepStrandedRecordings() {
       return { status: 'ok' as const, examined: 0, finalized: 0, skipped: 0 };
+    },
+    async sweepSameDayRetry() {
+      return { status: 'ok' as const, examined: 0, released: 0, skipped: 0 };
+    },
+    async applyEvent(input: {
+      source: string;
+      eventType: string;
+      engagementId?: string | null;
+      attemptId?: string | null;
+      providerEventId?: string | null;
+    }) {
+      if (opts.applyEventThrows) throw new Error('apply_event_boom');
+      opts.events?.push({
+        eventType: input.eventType,
+        engagementId: input.engagementId,
+        attemptId: input.attemptId,
+        providerEventId: input.providerEventId,
+        source: input.source,
+      });
+      return { status: 'applied' as const, applied: true };
     },
     async finalizePartialSessions(input: { limit?: number; graceSeconds?: number; now: Date }) {
       const r = opts.onFinalize(input);
@@ -186,6 +220,11 @@ function partialSession(over: Partial<PhonePartialFinalizeSession> = {}): PhoneP
   return {
     sessionId: SESSION_A,
     attemptId: ATTEMPT_A,
+    engagementId: ENGAGEMENT_A,
+    // The DEFAULT is a call that really was screened — `neverStarted` is the
+    // exception, and every pre-0095 test in this file asserts the behaviour
+    // that must survive it unchanged.
+    neverStarted: false,
     covered: 3,
     total: 5,
     disconnectReason: 'candidate_hangup',
@@ -222,6 +261,106 @@ describe('the partial-finalize tick delivers the scorecard on a disconnect', () 
     expect(enqueues[0].options?.maxAttempts).toBe(5);
     // The snapshot reports the finalize count for the health surface.
     expect(runtime.snapshot().lastPartialFinalized).toBe(1);
+  });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 0095 / issue #286 — a call that never reached a question
+  // ─────────────────────────────────────────────────────────────────────
+  //
+  // The RPC now REPORTS `never_started` (no non-gate transcript turn from the
+  // candidate). Nothing branches on it, and these tests exist to keep it that
+  // way.
+  //
+  // A draft skipped the scoring enqueue for such sessions and drove them to a
+  // different terminal status. Three adversarial reviews and the repo's own
+  // `phone_partial_finalize_assert.sql` all rejected it: the sweep re-selects a
+  // session until an assessment row exists, so skipping the enqueue made those
+  // rows permanent residents of a 25-row oldest-first window and starved real
+  // partial screenings out of it; and the crash-partial pair IS admitted by the
+  // scoring gate, so a class that was scored silently stopped being scored.
+
+  it('a never-started session is STILL enqueued for scoring', async () => {
+    const enqueues: EnqueueCall[] = [];
+    const stores = makeStores({
+      onFinalize: () => ({
+        status: 'ok',
+        finalized: 1,
+        sessions: [partialSession({ neverStarted: true, covered: 0 })],
+      }),
+    });
+    const runtime = buildRuntime({ stores, queue: makeQueue(enqueues) });
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await drainMicrotasks(() => enqueues.length > 0);
+
+    // The enqueue is what lets the session LEAVE the sweep's selection set:
+    // the RPC re-selects it until an assessment row exists. Withholding it
+    // does not merely skip a scorecard, it wedges the sweep.
+    expect(enqueues).toHaveLength(1);
+    expect(enqueues[0].payload).toMatchObject({
+      session_id: SESSION_A,
+      partial: true,
+    });
+  });
+
+  it('never-started and normal sessions are treated IDENTICALLY by the tick', async () => {
+    // The strongest form of "nothing branches on it": drive both shapes and
+    // assert the tick cannot tell them apart. A future `if (s.neverStarted)`
+    // anywhere in this loop body fails here.
+    const neverStarted: EnqueueCall[] = [];
+    const normal: EnqueueCall[] = [];
+
+    const runOne = async (flag: boolean, sink: EnqueueCall[]) => {
+      const stores = makeStores({
+        onFinalize: () => ({
+          status: 'ok',
+          finalized: 1,
+          sessions: [partialSession({ neverStarted: flag })],
+        }),
+      });
+      const runtime = buildRuntime({ stores, queue: makeQueue(sink) });
+      runtime.scheduler.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await drainMicrotasks(() => sink.length > 0);
+    };
+
+    await runOne(true, neverStarted);
+    await runOne(false, normal);
+
+    // Length is not asserted: the first runtime keeps ticking on its 1s
+    // cadence while the second runs, so both sinks accumulate. What matters is
+    // that BOTH produced an enqueue and the FIRST of each is identical.
+    expect(neverStarted.length).toBeGreaterThan(0);
+    expect(normal.length).toBeGreaterThan(0);
+    expect(neverStarted[0].payload).toEqual(normal[0].payload);
+    expect(neverStarted[0].options?.dedupKey).toEqual(normal[0].options?.dedupKey);
+  });
+
+  it('the tick posts NO engagement event — the release path was removed', async () => {
+    // Edge #31 and `screening.not_started` are gone. The engagement is
+    // permanently bound to its session (`start_phone_assessment` is the only
+    // writer of `phone_engagements.session_id` in 95 migrations and nothing
+    // clears it), so a release could never produce a screenable redial — it
+    // only handed the engagement to the stranded sweep, which terminally
+    // failed it.
+    const events: EventCall[] = [];
+    const enqueues: EnqueueCall[] = [];
+    const stores = makeStores({
+      onFinalize: () => ({
+        status: 'ok',
+        finalized: 1,
+        sessions: [partialSession({ neverStarted: true })],
+      }),
+      events,
+    });
+    const runtime = buildRuntime({ stores, queue: makeQueue(enqueues) });
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    // Wait on the ENQUEUE, so the absence below is asserted against a tick
+    // that demonstrably reached the end of its loop body.
+    await drainMicrotasks(() => enqueues.length > 0);
+
+    expect(events).toHaveLength(0);
   });
 
   it('the configured grace is passed to the selector (must be far below 0071 7200s)', async () => {
@@ -432,8 +571,6 @@ function makeAssessmentClient(opts: {
   };
   return { client, rpcCalls };
 }
-
-const ENGAGEMENT_A = 'cccccccc-cccc-4ccc-cccc-cccccccccccc';
 
 describe('the scorer plumbing forwards the partial fields', () => {
   it('a partial job scores with partial:true + coverage + disconnect_reason', async () => {

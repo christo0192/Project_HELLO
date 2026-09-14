@@ -138,6 +138,14 @@ export interface PhoneRuntimeSnapshot {
   readonly lastReconciled: number | null;
   /** 0045. Engagements rolled onto a new IST day by the last day-roll pass. */
   readonly lastRolled: number | null;
+  /**
+   * 0095. Engagements released for their SECOND dial of the same IST day.
+   *
+   * Distinct from `lastRolled` because a same-day release and a day roll are
+   * different events, and an operator watching the ladder needs to tell a
+   * five-hour retry from a new day.
+   */
+  readonly lastSameDayReleased: number | null;
   /** 0045. Stranded engagements resolved — completed plus truthfully failed. */
   readonly lastStranded: number | null;
   /**
@@ -369,9 +377,10 @@ export function createPhoneRuntime(
   // not happen" must reach the health surface as different answers.
   const sweepNotOk: Record<string, boolean> = {
     reclaim: false, expire: false, reconcile: false, dayroll: false, stranded: false,
-    recstrand: false, partialfin: false,
+    recstrand: false, partialfin: false, sameday: false,
   };
   let lastRolled: number | null = null;
+  let lastSameDayReleased: number | null = null;
   let lastStranded: number | null = null;
   // 0071 / X5b: sessions driven terminal so a crashed call's recording could
   // finalize. Kept apart from `stranded` (0045), which resolves the opposite
@@ -439,6 +448,7 @@ export function createPhoneRuntime(
     if (verdict === 'mine') return true;
     sweepNotOk[sweep] = verdict === 'broken';
     if (sweep === 'dayroll') lastRolled = null;
+    if (sweep === 'sameday') lastSameDayReleased = null;
     if (sweep === 'stranded') lastStranded = null;
     if (sweep === 'recstrand') lastRecStranded = null;
     if (sweep === 'partialfin') lastPartialFinalized = null;
@@ -821,6 +831,33 @@ export function createPhoneRuntime(
       },
     },
     {
+      // ── 0095: THE SAME-DAY HALF OF THE NO-ANSWER LADDER ────────────
+      // Its own tick, not a branch of `phone-dayroll`, because the two ask
+      // different questions and must be separately claimable, separately
+      // observable, and separately stoppable during an incident. They select
+      // on opposite sides of the same IST-date comparison, so an engagement
+      // is claimed by exactly one of them.
+      //
+      // Shares the expire cadence: a five-hour wait does not need watching
+      // more often than the day boundary does.
+      name: 'phone-sameday',
+      intervalMs: runtimeConfig.expireMs,
+      tick: async () => {
+        const verdict = await claimed('sameday');
+        if (!applyClaim('sameday', verdict)) {
+          return verdict === 'theirs' ? HOLD_BASE_CADENCE : ALLOW_IDLE_BACKOFF;
+        }
+        const released = await stores.sweepSameDayRetry({
+          limit: runtimeConfig.reclaimLimit,
+          now: new Date(),
+        });
+        sweepNotOk.sameday = released.status !== 'ok';
+        lastSameDayReleased =
+          released.status === 'ok' ? (released.released ?? 0) : null;
+        return released.status === 'ok' ? HOLD_BASE_CADENCE : ALLOW_IDLE_BACKOFF;
+      },
+    },
+    {
       name: 'phone-stranded',
       intervalMs: runtimeConfig.expireMs,
       tick: async () => {
@@ -942,6 +979,23 @@ export function createPhoneRuntime(
         // enqueue that throws is retried on the next pass (the RPC re-selects
         // the same session until it carries an assessment).
         for (const s of resolved.sessions) {
+          // EVERY selected session is enqueued, `neverStarted` included.
+          //
+          // A draft skipped the enqueue when the RPC reported no candidate
+          // transcript turn. Three reviews killed it, for two independent
+          // reasons:
+          //   * the sweep re-selects a session until an assessment row exists,
+          //     so skipping the enqueue meant those rows were re-selected
+          //     FOR EVER — and with `limit 25` oldest-first they displace
+          //     every real partial screening from the window;
+          //   * the crash-partial pair (`expired` + `grace_timeout`) IS
+          //     admitted by the scoring eligibility gate, so such a session
+          //     was scored before and silently stopped being scored, without
+          //     the gate changing at all.
+          // `neverStarted` is now reported in the log line below and acted on
+          // nowhere, which is all its evidence can support: the per-item
+          // transcript writer is fire-and-forget, so a real screening can
+          // read as never-started.
           try {
             await queue.enqueue(
               PHONE_ASSESSMENT_QUEUE,
@@ -956,8 +1010,8 @@ export function createPhoneRuntime(
               { dedupKey: phoneAssessmentDedupKey(s.sessionId), maxAttempts: 5 },
             );
           } catch {
-            // Best-effort: the next pass re-selects and re-enqueues. Do not let
-            // one session's enqueue failure abort the loop for the others.
+            // Best-effort: the next pass re-selects and re-enqueues. Do not
+            // let one session's enqueue failure abort the loop for the others.
           }
           // Bounded, PII-free structured line. The logger allowlist carries
           // only `error_category`/`error_type` for this event, so coverage and
@@ -968,9 +1022,14 @@ export function createPhoneRuntime(
           const cov = s.covered ?? -1;
           const tot = s.total ?? -1;
           logger.info('unknown_event', {
+            // `ns.1` is 0095's addition and the one the owner asked to be able
+            // to see: this call never reached a question, so it was NOT
+            // scored and the engagement was released for a redial. Still
+            // bounded and SAFE_IDENT-shaped, still no PII.
             error_category:
               `phone_partial_finalize:c${cov}:t${tot}` +
-              `:mp3.${s.recordingPresent ? 1 : 0}:sc.${s.assessmentPresent ? 1 : 0}`,
+              `:mp3.${s.recordingPresent ? 1 : 0}:sc.${s.assessmentPresent ? 1 : 0}` +
+              `:ns.${s.neverStarted ? 1 : 0}`,
             error_type: s.disconnectReason,
           });
         }
@@ -1055,6 +1114,7 @@ export function createPhoneRuntime(
       lastExpired,
       lastReconciled,
       lastRolled,
+      lastSameDayReleased,
       lastStranded,
       lastRecStranded,
       lastPartialFinalized,

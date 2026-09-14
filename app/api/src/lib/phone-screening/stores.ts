@@ -106,6 +106,7 @@ import type {
   StartPhoneAssessmentInput,
   HeartbeatPhoneAttemptByEpochInput,
   SweepPhoneDayRolledResult,
+  SweepPhoneSameDayRetryResult,
   SweepPhoneStrandedSessionsResult,
   SweepPhoneStrandedRecordingsResult,
   FinalizePhonePartialSessionsResult,
@@ -472,6 +473,21 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
       };
     },
 
+    async sweepSameDayRetry(input): Promise<SweepPhoneSameDayRetryResult> {
+      const { data, error } = await client.rpc('sweep_phone_same_day_retry', {
+        p_limit: input.limit ?? 25,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_sweep_same_day_retry_error');
+      const row = asRow(data);
+      return {
+        status: narrowPhoneRpcStatus<'ok'>('sweep_phone_same_day_retry', row),
+        examined: num(row, 'examined'),
+        released: num(row, 'released'),
+        skipped: num(row, 'skipped'),
+      };
+    },
+
     async sweepStrandedSessions(input): Promise<SweepPhoneStrandedSessionsResult> {
       const { data, error } = await client.rpc('sweep_phone_stranded_sessions', {
         p_limit: input.limit ?? 25,
@@ -534,6 +550,11 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
               return {
                 sessionId,
                 attemptId: str(e, 'attempt_id') ?? null,
+                engagementId: str(e, 'engagement_id') ?? null,
+                // Defaults FALSE when the field is absent or malformed, so an
+                // older RPC (or a store double) keeps today's behaviour —
+                // score it — rather than silently dropping every scorecard.
+                neverStarted: bool(e, 'never_started') ?? false,
                 covered: covered ?? null,
                 total: total ?? null,
                 disconnectReason: str(e, 'disconnect_reason') ?? 'disconnected',
