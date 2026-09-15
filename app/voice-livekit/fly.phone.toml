@@ -188,11 +188,14 @@ primary_region = "sin"
   #       why this [env] line still read 60 — the secret shadowed it, and the
   #       repo could not see the live value).
   #   30  owner-requested 2026-09-15 as the midpoint between "20 broke words"
-  #       and "40 feels laggy". Shipped, then RETIRED the same day: the sweep
-  #       below put it one step short of safe, and a live call confirmed the
-  #       lag complaint was real, so 35 takes both.
+  #       and "40 feels laggy". Shipped, then RETIRED the same day — the sweep
+  #       below put it one step short of safe. NOT retired for latency: an
+  #       earlier draft of this line claimed "a live call confirmed the lag
+  #       complaint was real", which cited no session and argued the wrong way
+  #       (a confirmed lag complaint would push the cap DOWN, not up).
   #   35  owner-approved 2026-09-15 after the sweep. The lowest cap that broke
-  #       NO word on the corpus while still firing earlier than 40.
+  #       NO word on the corpus while still firing earlier than 40 — so it is
+  #       the only value satisfying both constraints that were set.
   #
   # MEASURED, so the next reader is not misled.
   #

@@ -2932,6 +2932,12 @@ class TestScheduleCallback(unittest.IsolatedAsyncioTestCase):
     async def test_tool_never_mentions_google_calendar_or_email(self):
         texts = [phone._SCHEDULE_CONFIRMED_TEXT, phone._SCHEDULE_REFUSAL_FALLBACK]
         texts.extend(phone._SCHEDULE_REFUSAL_TEXT.values())
+        # The TERMINAL wording of the same refusals. Omitting it let this guard
+        # cover a shrinking subset of the schedule copy: a review injected
+        # "Check your Google Calendar and email for the invite." into a line the
+        # bot actually speaks and the whole suite stayed green.
+        texts.extend(phone._SCHEDULE_TERMINAL_TEXT.values())
+        texts.append(phone.PHONE_CALLBACK_DEFERRAL_TEXT)
         for text in texts:
             with self.subTest(text=text):
                 lowered = text.lower()
@@ -13987,6 +13993,21 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
                           types.SimpleNamespace(text_content="Tomorrow at 1 PM."), turn1)
         self.assertEqual(getattr(agent, "_turn_policy"), "closing")
         self.assertEqual(client.confirm_calls, [])
+
+    def test_the_two_sign_offs_cannot_drift_apart(self):
+        """`_SCHEDULE_TERMINAL_TAIL` is a byte-copy of the deferral's tail.
+
+        Two separate literals saying the same thing is exactly what
+        `gate_copy_texts()` warns about one screen up: "Matched by exact text
+        because every member is a CONSTANT. A line that changes has to change
+        here too." Edit the deferral copy and the explained sign-off silently
+        says something different — with nothing going red. This is that guard.
+        """
+        self.assertTrue(
+            phone.PHONE_CALLBACK_DEFERRAL_TEXT.endswith(phone._SCHEDULE_TERMINAL_TAIL),
+            "the explained sign-off no longer matches the bare deferral's "
+            "tail — one of the two literals was edited alone",
+        )
 
     def test_a_SPENT_re_ask_still_says_why_before_signing_off(self):
         """Every retryable refusal needs TERMINAL wording, not just a re-ask.
