@@ -73,20 +73,45 @@ export type RpcCaller = (
 ) => Promise<{ data: unknown; error: { message?: string } | null }>;
 
 /**
- * A bounded, read-only view of a machine's lease state — the readiness-poll
- * seam. It reads ONLY the `state` column of the lease for (app, machineId),
- * because that is the single fact the poll needs and the narrowest thing to
- * expose. There is no `get_voice_worker_lease` RPC in the committed substrate
- * (0079), so production reads the service-role-only `voice_worker_leases` table
+ * What the readiness poll reads back off a lease row.
+ *
+ * `state` ALONE is not enough, and reading only it was a real race. The poll
+ * runs for up to two minutes against a row that another actor can take away:
+ * the reaper releases a claim it judges dead, `claim_voice_worker` then hands
+ * the same machine to the NEXT session, and that session's worker posts its
+ * readiness ping. A poll watching only `state` sees `ready`, believes it, and
+ * dials a candidate into a machine that belongs to somebody else — where, since
+ * the worker now accepts one job at a time, the second dispatch is DECLINED and
+ * the candidate hears silence. That is reachable exactly when the pool is
+ * saturated, which is the load this whole change exists to survive.
+ *
+ * So the poll reads the claim's identity alongside its state and believes
+ * `ready` only while the row still carries THIS session at THIS epoch.
+ */
+export interface LeaseStateSnapshot {
+  /** The lifecycle state, or null when no row exists for (app, machineId). */
+  readonly state: string | null;
+  /** Who holds the lease right now. Null iff the machine is `stopped`. */
+  readonly claimedSessionId: string | null;
+  /** The fencing token of the CURRENT claim, not of ours. */
+  readonly epoch: number | null;
+}
+
+/**
+ * A bounded, read-only view of a machine's lease — the readiness-poll seam.
+ *
+ * It reads the three columns the poll must fence on and nothing else: the
+ * state, and the claim identity that says whether that state is still ours.
+ * There is no `get_voice_worker_lease` RPC in the committed substrate (0079),
+ * so production reads the service-role-only `voice_worker_leases` table
  * directly (RLS forces service_role); this seam keeps that read injectable and
- * keeps the rest of the service ignorant of the storage shape. Returns the
- * lease state string, or null when no row is found. Must reject rather than
- * invent on a transport failure.
+ * keeps the rest of the service ignorant of the storage shape. Must reject
+ * rather than invent on a transport failure.
  */
 export type LeaseStateReader = (input: {
   app: string;
   machineId: string;
-}) => Promise<string | null>;
+}) => Promise<LeaseStateSnapshot>;
 
 /**
  * A bounded, read-only LiveKit room-liveness check. `true` iff the named room
@@ -268,21 +293,56 @@ export function createWorkerOrchestrationService(
    * on every step: the reaper is the backstop, so a transient Fly/DB error here
    * must not throw out of the caller's failure path. Enforces I2.
    */
+  /**
+   * Give a claimed machine back — and ONLY a machine this session still holds.
+   *
+   * `release_voice_worker` is CAS'd on (app, machine_id, session); the two
+   * steps after it are not. `stopMachine` kills whatever is running on that
+   * machine and `reset_voice_worker` is documented "unconditional on
+   * session/epoch by design", so running them for a claim we no longer hold
+   * stops SOMEBODY ELSE'S live call and marks their lease free for a third
+   * session to claim.
+   *
+   * That is reachable: this runs on the failure exits of `ensureReadyWorker`,
+   * up to two minutes after the claim, and in between the reaper can stop and
+   * reset our machine (our session's room has no participants yet, so the
+   * liveness check cannot spare it) and the next dial can claim it. At a
+   * saturated pool, "the next dial" is always waiting.
+   *
+   * So the release is the AUTHORITY, not a formality: only a `draining` answer
+   * proves the claim was still ours, and only then do we stop anything.
+   * Anything else — `already_released`, an unexpected status, a transport
+   * throw — means we cannot prove ownership, and the machine is left to the
+   * reaper, which is the designed backstop for exactly this.
+   */
   async function cleanupClaim(app: string, machineId: string, sessionId: string): Promise<void> {
+    let held = false;
     try {
-      await deps.rpc('release_voice_worker', {
-        p_app: app,
-        p_machine_id: machineId,
-        p_session_id: sessionId,
-        p_now: new Date(now()).toISOString(),
-      });
+      const released = envelope(
+        'release_voice_worker',
+        await deps.rpc('release_voice_worker', {
+          p_app: app,
+          p_machine_id: machineId,
+          p_session_id: sessionId,
+          p_now: new Date(now()).toISOString(),
+        }),
+      );
+      held = released.status === 'draining';
     } catch {
-      /* fail-open: reaper backstops */
+      /* fail-open: reaper backstops. `held` stays false — we stop nothing. */
+    }
+    if (!held) {
+      // Not ours (or unprovable). Stopping here would be the destructive act.
+      event('cleanup_not_held', { app });
+      return;
     }
     try {
       await deps.fly.stopMachine(app, machineId);
     } catch {
-      /* fail-open: reaper backstops */
+      // Could not stop it; do NOT reset a machine we did not confirm stopped —
+      // that would return a still-running machine to the claimable pool.
+      event('cleanup_stop_failed', { app });
+      return;
     }
     try {
       await deps.rpc('reset_voice_worker', {
@@ -363,20 +423,42 @@ export function createWorkerOrchestrationService(
     // not-ready-yet and simply retried within the budget.
     const deadline = now() + readyTimeoutMs;
     let observedReady = false;
+    let claimLost = false;
+
+    /**
+     * Believe a lease read only while the row is still OUR claim.
+     *
+     * A row carrying another session, or a HIGHER epoch, has been re-claimed
+     * out from under this poll and nothing on it is ours to act on — not even
+     * a `ready`. A row that has gone `stopped` (null session) is merely not
+     * ready yet from our side; the cleanup path handles it and the CAS in
+     * `release_voice_worker` makes a late release harmless. Reading `null`
+     * state (no row) is likewise just "not yet".
+     */
+    const verdict = (snap: LeaseStateSnapshot): 'ready' | 'lost' | 'waiting' => {
+      if (snap.claimedSessionId !== null && snap.claimedSessionId !== sessionId) return 'lost';
+      if (typeof snap.epoch === 'number' && snap.epoch > epoch) return 'lost';
+      // 'busy' can only be reached from 'ready' (mark_voice_worker_busy CAS),
+      // so observing it also satisfies "was confirmed ready".
+      return snap.state === 'ready' || snap.state === 'busy' ? 'ready' : 'waiting';
+    };
+
     // Read once immediately, then poll until the deadline.
     // (A first read before the initial sleep avoids waiting a full cadence when
     // the worker was already ready — e.g. a warm-standby machine.)
     for (;;) {
-      let state: string | null = null;
+      let seen: 'ready' | 'lost' | 'waiting' = 'waiting';
       try {
-        state = await deps.readLeaseState({ app, machineId });
+        seen = verdict(await deps.readLeaseState({ app, machineId }));
       } catch {
-        state = null; // transient; retry within budget
+        seen = 'waiting'; // transient; retry within budget
       }
-      if (state === 'ready' || state === 'busy') {
-        // 'busy' can only be reached from 'ready' (mark_voice_worker_busy CAS),
-        // so observing it also satisfies "was confirmed ready".
+      if (seen === 'ready') {
         observedReady = true;
+        break;
+      }
+      if (seen === 'lost') {
+        claimLost = true;
         break;
       }
       if (now() >= deadline) break;
@@ -385,8 +467,9 @@ export function createWorkerOrchestrationService(
         // One last read after the final sleep, so a ready that landed during
         // the sleep is not missed.
         try {
-          const s = await deps.readLeaseState({ app, machineId });
-          if (s === 'ready' || s === 'busy') observedReady = true;
+          const last = verdict(await deps.readLeaseState({ app, machineId }));
+          if (last === 'ready') observedReady = true;
+          if (last === 'lost') claimLost = true;
         } catch {
           /* keep observedReady false */
         }
@@ -394,8 +477,19 @@ export function createWorkerOrchestrationService(
       }
     }
 
+    if (claimLost) {
+      // ── 4a. Somebody else owns this machine now. ────────────────────
+      // Deliberately NOT a `ready`: the readiness we may have just seen is
+      // theirs. Cleanup still runs, and is now a no-op by construction — it
+      // stops nothing until `release_voice_worker` proves the claim was ours,
+      // and for a machine that has moved on it answers `already_released`.
+      event('claim_lost', { app });
+      await cleanupClaim(app, machineId, sessionId);
+      return { status: 'timeout' };
+    }
+
     if (!observedReady) {
-      // ── 4. Readiness timeout → clean up, return timeout (never ready). ─
+      // ── 4b. Readiness timeout → clean up, return timeout (never ready). ─
       event('ready_timeout', { app });
       await cleanupClaim(app, machineId, sessionId);
       return { status: 'timeout' };
@@ -810,13 +904,29 @@ export function createDefaultWorkerOrchestrationService(
   const readLeaseState: LeaseStateReader = async ({ app, machineId }) => {
     const { data, error } = await client
       .from('voice_worker_leases')
-      .select('state')
+      .select('state, claimed_session_id, epoch')
       .eq('app', app)
       .eq('machine_id', machineId)
       .maybeSingle();
     if (error) throw new Error('lease_read_error');
-    const state = (data as { state?: unknown } | null)?.state;
-    return typeof state === 'string' ? state : null;
+    const row = data as {
+      state?: unknown;
+      claimed_session_id?: unknown;
+      epoch?: unknown;
+    } | null;
+    return {
+      state: typeof row?.state === 'string' ? row.state : null,
+      claimedSessionId:
+        typeof row?.claimed_session_id === 'string' ? row.claimed_session_id : null,
+      // `epoch` is a bigint; PostgREST hands bigints back as strings on some
+      // driver versions, so accept both and refuse to guess on anything else —
+      // an unparsed epoch must read as "no fence available", not as zero.
+      epoch: typeof row?.epoch === 'number'
+        ? row.epoch
+        : typeof row?.epoch === 'string' && /^\d+$/.test(row.epoch)
+          ? Number(row.epoch)
+          : null,
+    };
   };
 
   // The LiveKit RoomServiceClient is imported lazily on first use, so a
