@@ -4823,6 +4823,74 @@ class TestNativePhoneArchitecture(unittest.TestCase):
                 f"a sales ANSWER was heard as a hang-up request: {text!r}",
             )
 
+    def test_the_widened_trigger_still_matches_everything_the_OLD_one_did(self):
+        """A silent NARROWING is the regression nobody would be watching for.
+
+        The whole change is framed as a widening, so a phrasing the previous
+        pattern caught and this one drops would ship unnoticed — and it would
+        show up as the bot interviewing over a candidate who asked to hang up,
+        which is exactly the bug being fixed.
+
+        The pre-2026-09-15 pattern is pinned here verbatim and every string it
+        was built to accept is generated and re-checked.
+        """
+        import re as _re
+        old = _re.compile(
+            r"\b(?:call|ring)\s+me\s+(?:back\s+)?(?:later|tomorrow|another\s+time)\b|"
+            r"\b(?:can|could|would)\s+(?:you|we)\s+(?:(?:please\s+)?(?:call\s+back|reschedule)|"
+            r"(?:please\s+)?(?:book|schedule|arrange|set\s+up)\s+(?:me\s+)?"
+            r"(?:an?\s+|another\s+|the\s+)?(?:call|callback|appointment|meeting|follow[ -]?up(?:\s+call)?))\b|"
+            r"\b(?:book|schedule|arrange|set\s+up)\s+(?:me\s+)?"
+            r"(?:an?\s+|another\s+|the\s+)?(?:call|callback|appointment|meeting|follow[ -]?up(?:\s+call)?)\b|"
+            r"\b(?:i(?:'m|\s+am)\s+busy\s+(?:right\s+now|at\s+the\s+moment)|"
+            r"i\s+(?:cannot|can't)\s+talk\s+(?:right\s+now|at\s+the\s+moment)|"
+            r"this\s+is\s+not\s+a\s+good\s+time)\b",
+            _re.IGNORECASE,
+        )
+        cases = []
+        for verb in ("call", "ring"):
+            for tail in ("later", "tomorrow", "another time"):
+                cases.append(f"{verb} me {tail}")
+                cases.append(f"{verb} me back {tail}")
+        objects = ("call", "callback", "appointment", "meeting",
+                   "follow-up", "follow up", "followup", "follow-up call")
+        articles = ("", "a ", "an ", "another ", "the ")
+        bookverbs = ("book", "schedule", "arrange", "set up")
+        for modal in ("can", "could", "would"):
+            for subject in ("you", "we"):
+                for polite in ("", "please "):
+                    cases.append(f"{modal} {subject} {polite}call back")
+                    cases.append(f"{modal} {subject} {polite}reschedule")
+                    for bv in bookverbs:
+                        for art in articles:
+                            for ob in objects:
+                                cases.append(f"{modal} {subject} {polite}{bv} {art}{ob}")
+                                cases.append(f"{modal} {subject} {polite}{bv} me {art}{ob}")
+        for bv in bookverbs:
+            for art in articles:
+                for ob in objects:
+                    cases.append(f"{bv} {art}{ob}")
+                    cases.append(f"{bv} me {art}{ob}")
+        cases += [
+            "I'm busy right now", "I am busy right now",
+            "I'm busy at the moment", "I am busy at the moment",
+            "i cannot talk right now", "i can't talk right now",
+            "i cannot talk at the moment", "i can't talk at the moment",
+            "this is not a good time",
+        ]
+
+        checked = 0
+        for text in cases:
+            if not old.search(text):
+                continue
+            checked += 1
+            self.assertIsNotNone(
+                phone._CALLBACK_DEFERRAL_RE.search(text),
+                f"the widened trigger LOST a phrasing the old one caught: {text!r}",
+            )
+        # Non-vacuous: the generator must actually exercise the old pattern.
+        self.assertGreater(checked, 4000)
+
     def test_every_trigger_branch_is_named_and_compiles(self):
         """The pattern is a table so each branch can be reasoned about alone.
 
