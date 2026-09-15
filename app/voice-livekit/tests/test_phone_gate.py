@@ -2396,6 +2396,63 @@ class TestAnswerClassifier(unittest.TestCase):
                     f"candidate who already consented",
                 )
 
+    def test_an_affirmative_OPENER_never_infers_consent_that_was_refused(self):
+        """The worst failure this gate has, and the one widening invites.
+
+        `_AFFIRMATIVE_RE` is anchored and stops at its first match, so it
+        accepts any utterance that OPENS affirmatively no matter what follows.
+        Every word added to it widens that hole. Adding "no problem", "right"
+        and "understood" turned these four into CONSENT — i.e. the bot would
+        have recorded someone who had just declined:
+
+            "no problem, I'll pass"
+            "no problem but I'm not interested"
+            "understood, but I'm not interested"
+            "right, but I'd rather you didn't record this"
+
+        The fix is that the refusal clauses are UNANCHORED and run first, so a
+        refusal anywhere beats an affirmative opener. Any future widening of
+        the affirmative vocabulary must keep this test green.
+        """
+        for text in (
+            "yes but don't record",
+            "yes, but please don't record this",
+            "okay but no recording",
+            "sure, but I don't want to be recorded",
+            "right, but I'd rather you didn't record this",
+            "fine, as long as it's not recorded",
+            "alright but no recording please",
+            "correct, but I'm not comfortable with recording",
+            "no problem, but don't record me",
+            "of course, but no recording",
+            "perfect, but please don't record",
+            "understood, but I'm not interested",
+            "no problem, I'll pass",
+            "no problem but I'm not interested",
+        ):
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
+                    f"{text!r} REFUSES consent; reading it as granted would "
+                    f"record a candidate who declined",
+                )
+
+        # The stronger readings still win over a bare refusal.
+        self.assertEqual(
+            agent_mod.classify_answer_text("cool, but don't call me again"),
+            phone.CLASSIFY_OPT_OUT,
+        )
+        self.assertEqual(
+            agent_mod.classify_answer_text("sure, wrong number though"),
+            phone.CLASSIFY_WRONG_NUMBER,
+        )
+        # ...and an UNqualified affirmative is still consent.
+        for text in ("no problem", "right", "understood", "alright"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
+                )
+
     def test_the_widening_did_not_let_a_REFUSAL_through_as_consent(self):
         """The direction that matters legally: consent must not be inferred.
 

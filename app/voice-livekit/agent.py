@@ -1756,10 +1756,24 @@ _OPT_OUT_RE = re.compile(
 #: The recording clause is also widened from the literal `don't record`, which
 #: missed the far commoner "I don't want to be recorded".
 _REFUSED_RE = re.compile(
+    # ── UNANCHORED CLAUSES: a refusal ANYWHERE beats an affirmative opener ──
+    # `_AFFIRMATIVE_RE` is anchored and stops at its first match, so it accepts
+    # an utterance that OPENS affirmatively no matter what follows. Widening
+    # its vocabulary therefore widens that hole: "no problem, I'll pass" and
+    # "right, but I'd rather you didn't record this" both became HUMAN, which
+    # is the worst failure this gate has — consent inferred where it was
+    # refused. These clauses run first and are deliberately not anchored.
     r"do(?:n't| not)\s+(?:want\s+(?:to\s+be\s+|me\s+to\s+be\s+)?)?record|"
+    r"(?:did|would|could)(?:n't| not)\s+(?:want\s+)?(?:to\s+be\s+)?record|"
+    r"rather\s+(?:you\s+)?(?:did\s*n[o']?t|not)\b|"
+    r"\bnot\s+record(?:ed|ing)?\b|"
     r"no recording|not (?:comfortable|okay|ok) with|"
+    r"\bnot\s+interested\b|\bi'?(?:ll| will)\s+pass\b|"
+    # ── ANCHORED: a bare "no" only refuses when it OPENS the answer. The
+    #    lookahead keeps "no problem/issues/worries" — ordinary ways of saying
+    #    YES — from ending the call, while "no thanks" still refuses.
     r"^\s*(?:no(?!\s+(?:problem|problems|probs|issue|issues|worries|"
-    r"objection|objections|doubt))|nope|no thanks|not interested)\b",
+    r"objection|objections|doubt))|nope|no thanks)\b",
     re.IGNORECASE,
 )
 # Anchored deliberately. An affirmative has to BE the answer: matching "sure"
