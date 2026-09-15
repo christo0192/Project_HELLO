@@ -11075,7 +11075,7 @@ _CALLBACK_DEFERRAL_PATTERNS: tuple[tuple[str, str], ...] = (
     # 7. + 8. The original book/schedule/arrange/set-up branches, verbatim.
     (
         "modal_book_object",
-        r"\b(?:can|could|would)\s+(?:you|we)\s+(?:please\s+)?"
+        r"\b(?:can|could|would|will)\s+(?:you|we)\s+(?:please\s+)?"
         r"(?:book|schedule|arrange|set\s+up)\s+(?:me\s+)?"
         r"(?:an?\s+|another\s+|the\s+)?"
         r"(?:call|callback|appointment|meeting|follow[ -]?up(?:\s+call)?)\b",
@@ -11151,10 +11151,16 @@ _CALLBACK_DEFERRAL_PATTERNS: tuple[tuple[str, str], ...] = (
         # `have got` BEFORE `have`: regex alternation is ordered, so the
         # shorter arm would win and then fail on "got".
         r"\bi\s+(?:have\s+got|have|got)\s+(?:an?\s+)?"
-        r"(?:meeting|call|client|customer|interview|class|session)"
-        # "a CLIENT CALL right now" — the compound noun is how people say it.
-        r"(?:\s+(?:call|meeting|session))?\s+"
-        r"(?:right\s+now|now|at\s+the\s+moment|in\s+a\s+minute)\b",
+        # `client`/`customer` are ADJECTIVES here, never the head noun:
+        # "I have a customer now who has been with us three years" is a
+        # tenure answer, not a request to hang up.
+        r"(?:(?:client|customer|team|sales|training)\s+)?"
+        r"(?:meeting|call|interview|class|session)\s+"
+        # Same `and then` guard branch 9 carries — "I have a call now and
+        # then with my manager" is a frequency, not an instant. And the
+        # marker must END the clause, for the reason given on branch 15.
+        r"(?:right\s+now|now(?!\s+and\s+then)|at\s+the\s+moment|"
+        r"in\s+a\s+minute)\s*[.,;!?]*\s*$",
     ),
     # 15. LEADING now-marker: "Right now I'm busy", "At the moment I am busy."
     #     Branch 9 only accepts the marker AFTER "busy", so this ordering —
@@ -11166,7 +11172,12 @@ _CALLBACK_DEFERRAL_PATTERNS: tuple[tuple[str, str], ...] = (
         r"i(?:'m|m|\s+am)\s+"
         r"(?:(?:kind\s+of|sort\s+of|a\s+bit|a\s+little|little|really|quite|"
         r"pretty|very|so|super|too|bit)\s+)?"
-        r"busy\b",
+        # ANCHORED. Branch 9 is safe because `busy right now` is a CLOSED
+        # predicate — nothing can follow it. Leading with the marker leaves
+        # the predicate open, and "Right now I am busy WITH THE Q3 PIPELINE"
+        # is an ordinary answer. Requiring the clause to end at `busy`
+        # restores the property branch 9's own comment relies on.
+        r"busy\s*[.,;!?]*\s*$",
     ),
     # 13. "can we talk later", "can we do this later".
     (
@@ -11197,11 +11208,16 @@ _CALLBACK_VETO_PATTERNS: tuple[tuple[str, str], ...] = (
     # "Prospects call me back after a day", "most of them call me back".
     (
         "third_person_actor",
-        # The actor must be a SUBJECT, not a noun modifier. Without these
-        # lookbehinds "I have got A CLIENT CALL right now" vetoed itself:
-        # "client call" is the candidate's own meeting, not a client placing
-        # a call. A determiner in front means it is a noun phrase.
-        r"(?<!a\s)(?<!an\s)(?<!the\s)(?<!my\s)(?<!our\s)(?<!this\s)"
+        # The actor must be a SUBJECT, not a noun modifier. Without this
+        # "I have got A CLIENT CALL right now" vetoed itself: "client call"
+        # is the candidate's own meeting, not a client placing a call.
+        #
+        # ONLY the indefinite article. An earlier version also excluded
+        # `the|my|our|this` and that blew a hole straight through this veto —
+        # "The clients call me back later", "Our customers call me back in
+        # the afternoon" are exactly the pipeline descriptions it exists to
+        # reject, and all of them started firing.
+        r"(?<!a\s)(?<!an\s)"
         r"\b(?:prospects?|parents?|clients?|customers?|leads?|students?|people|"
         r"they|them|he|she|everyone|candidates?|recruiters?|counsell?ors?|"
         r"founders?|employers?|managers?|bosses|hr|admissions?)\s+"
@@ -11239,7 +11255,7 @@ _CALLBACK_VETO_PATTERNS: tuple[tuple[str, str], ...] = (
     # still reach the trigger, as must "book ME a call".
     (
         "booking_process",
-        r"(?<!can\s)(?<!could\s)(?<!would\s)(?<!please\s)(?<!shall\s)"
+        r"(?<!can\s)(?<!could\s)(?<!would\s)(?<!please\s)(?<!shall\s)(?<!will\s)"
         r"\b(?:i|we|they|you|our\s+team|the\s+team|the\s+counsell?or)\s+"
         r"(?:usually\s+|always\s+|often\s+|then\s+|first\s+|also\s+)?"
         r"(?:book|schedule|arrange|set\s+up|reschedule)\s+"
@@ -11291,7 +11307,12 @@ _CALLBACK_TURN_VETO_PATTERNS: tuple[tuple[str, str], ...] = (
         r"\b(?:they|people|prospects?|parents?|clients?|customers?|leads?|"
         r"students?|everyone|most\s+of\s+them)\s+(?:tell|tells|told)\s+"
         r"(?:me|us)\b|"
-        r"\bi\s+(?:hear|get)\s+(?:every|all|a\s+lot|that|this)\b",
+        # "is what THEY always ask" — the trailing report with a third-person
+        # subject. An `i (hear|get) (a lot|every|...)` arm used to live here
+        # and vetoed ordinary answers like "I get a lot of inbound"; its one
+        # motivating case is already caught by the `is the usual` arm.
+        r"\bis\s+what\s+(?:they|people|everyone|most)\s+"
+        r"(?:\w+\s+)?(?:ask|asks|say|says|want)\b",
     ),
 )
 
@@ -11302,6 +11323,58 @@ _CALLBACK_DEFERRAL_RE = re.compile(
 
 _CALLBACK_TURN_VETO_RE = re.compile(
     "|".join(f"(?:{pattern})" for _name, pattern in _CALLBACK_TURN_VETO_PATTERNS),
+    re.IGNORECASE,
+)
+
+#: Branches whose match is UNAMBIGUOUSLY ADDRESSED TO US — a second-person
+#: modal ("can you call me back"), a "please", a "let's", or a CONCRETE TIME.
+#:
+#: This split is what decides the scope of the veto, and getting it wrong cost
+#: two rounds of review. The two kinds of match are not the same kind of claim:
+#:
+#:   DIRECTED   "Sorry, can you call me back at 1 PM?"
+#:              Nothing said elsewhere in the turn can make this a description.
+#:              The candidate is talking TO us. Judged on its own clause, so an
+#:              answer in the same breath cannot swallow it — which is the
+#:              production incident this PR exists to fix.
+#:
+#:   UNDIRECTED "call me back later", "I'm busy right now"
+#:              These are the exact phrases a Sales Program Advisor QUOTES when
+#:              asked how they handle objections. The surrounding turn is the
+#:              only thing that distinguishes performing them from reporting
+#:              them, so they are matched and vetoed over the WHOLE TURN.
+#:
+#: Scoping everything per clause (the first attempt at this fix) made 20
+#: ordinary answers end the interview, because it threw away the framing that
+#: undirected phrases depend on.
+_CALLBACK_DIRECTED_BRANCHES: frozenset[str] = frozenset({
+    "call_me_back_addressed",
+    "call_me_back_at_time",   # a concrete time is request shape; objections are vague
+    "give_me_a_call",
+    "modal_call_back_or_reschedule",
+    "modal_book_object",
+    "reschedule_requested",
+    "can_we_later",
+})
+
+#: The only vetoes that can disqualify a DIRECTED request: the ones saying
+#: somebody ELSE is speaking. A process or tooling description cannot — "I use
+#: Outlook, can you call me back at 6?" is a request with an answer attached.
+_CALLBACK_QUOTING_VETO_RE = re.compile(
+    "|".join(
+        f"(?:{pattern})" for name, pattern in _CALLBACK_VETO_PATTERNS
+        if name in {"third_person_actor", "hypothetical_or_quoted"}
+    ),
+    re.IGNORECASE,
+)
+
+#: Trailing reported speech ("... is what they always ask") reframes even a
+#: directed request, so this one turn-scoped branch applies to both kinds.
+_CALLBACK_REPORTED_SPEECH_RE = re.compile(
+    "|".join(
+        f"(?:{pattern})" for name, pattern in _CALLBACK_TURN_VETO_PATTERNS
+        if name == "reported_speech_trailing"
+    ),
     re.IGNORECASE,
 )
 
@@ -11321,8 +11394,17 @@ _CALLBACK_VETO_RE = re.compile(
 #: `(?<![A-Z])` keeps "1:00 P.M." and initials in one piece: a terminator
 #: preceded by a lone capital is an abbreviation, not a sentence end.
 _CALLBACK_CLAUSE_SPLIT_RE = re.compile(
-    r"(?<![A-Z])(?<=[.!?])\s+|\s*,\s*(?=(?:but|anyway|sorry|however|though)\b)",
-    re.IGNORECASE,
+    # `(?<![A-Z]\.)` spans TWO characters — the capital AND the period — so
+    # "1:00 P.M." and "Dr. Rao" stay whole. Written `(?<![A-Z])` it inspected
+    # the same character `(?<=[.!?])` already pins to punctuation, which is
+    # never a capital, so the guard could never fail and split every
+    # abbreviation it claimed to protect.
+    # NO `re.IGNORECASE` on this pattern. Under that flag `[A-Z]` matches
+    # lowercase too, so the abbreviation guard blocked EVERY sentence split
+    # and the clause scoping silently did nothing at all. The one place that
+    # actually wants case-insensitivity is the discourse-marker list, which
+    # asks for it locally.
+    r"(?<![A-Z]\.)(?<=[.!?])\s+|\s*,\s*(?=(?i:but|anyway|sorry|however|though)\b)",
 )
 
 
@@ -11354,31 +11436,52 @@ def callback_request_match(text: Any) -> str | None:
     into a one-line diff. The names are compile-time literals, so nothing the
     candidate said can reach a log through this.
 
-    Compiled alternations are matched a second time here, one branch at a
-    time, ONLY on a turn that already matched the combined pattern — so the
-    per-turn cost on the overwhelmingly common no-match path is unchanged.
+    Branches are matched individually rather than through the combined
+    alternation, which costs roughly 2-3x on a short turn — tens of
+    microseconds, against a ~2.9s measured turn latency. An earlier version of
+    this docstring claimed the no-match path was "unchanged"; it is not,
+    because the undirected pass runs before any veto can short-circuit it.
     """
     clean = str(text or "").strip()
     if not clean:
         return None
-    # Meta-discourse governs the WHOLE turn, so it is checked before the turn
-    # is cut into clauses — otherwise the framing sentence and the sentence it
-    # frames end up judged apart, which is the hole clause scoping opened.
-    if _CALLBACK_TURN_VETO_RE.search(clean):
-        return None
+
+    # ── UNDIRECTED: matched and vetoed over the WHOLE TURN ──────────────
+    # Whole-turn scope is deliberate and is what `unavailable_state`'s
+    # end-anchor means: "I'm driving." is a deferral when it IS the answer,
+    # and a description in "I am in a meeting. Then I run demos."
+    turn_vetoed = bool(
+        _CALLBACK_VETO_RE.search(clean) or _CALLBACK_TURN_VETO_RE.search(clean)
+    )
+    if not turn_vetoed:
+        for name, pattern in _CALLBACK_DEFERRAL_PATTERNS:
+            if name in _CALLBACK_DIRECTED_BRANCHES:
+                continue
+            if re.search(pattern, clean, re.IGNORECASE):
+                return name
+
+    # ── DIRECTED: judged PER CLAUSE ─────────────────────────────────────
+    # An addressed request cannot be reframed by an answer sitting beside it,
+    # so only its own clause — and only the vetoes that say somebody else is
+    # speaking — can disqualify it. This is the half that fixes the incident:
+    # "I usually handle forty leads a day. Sorry, can you call me back at
+    # 1 PM?" must be heard, and a turn-wide veto threw it away.
     for clause in _callback_clauses(clean):
-        if _CALLBACK_VETO_RE.search(clause):
-            continue
-        if not _CALLBACK_DEFERRAL_RE.search(clause):
+        # Reported speech is checked on the CLAUSE here, not the turn: "Can
+        # you call me back later is what they always ask" carries both halves
+        # in one breath and is a quote, while "That is the most common
+        # objection. Anyway, can you call me back at 4?" is an answer followed
+        # by a real request, and a turn-wide check threw the request away.
+        if (
+            _CALLBACK_QUOTING_VETO_RE.search(clause)
+            or _CALLBACK_REPORTED_SPEECH_RE.search(clause)
+        ):
             continue
         for name, pattern in _CALLBACK_DEFERRAL_PATTERNS:
+            if name not in _CALLBACK_DIRECTED_BRANCHES:
+                continue
             if re.search(pattern, clause, re.IGNORECASE):
                 return name
-        # The combined pattern matched but no single branch did. Structurally
-        # impossible (the combined pattern IS the alternation of these
-        # branches), but returning a name rather than None keeps the caller's
-        # contract: a request was heard, and the flow must still own the turn.
-        return "unattributed"
     return None
 
 

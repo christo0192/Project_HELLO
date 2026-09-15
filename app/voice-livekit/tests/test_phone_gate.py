@@ -4960,6 +4960,62 @@ class TestNativePhoneArchitecture(unittest.TestCase):
                 "Our team schedules a callback whenever the parent asks for one.",
                 "They schedule the meeting and I just run the demo.",
             ],
+            "determiner_before_actor": [
+                # ZERO of these existed in the corpus. Adding determiner
+                # lookbehinds to `third_person_actor` — to stop ONE self-veto
+                # — blew a hole straight through the most load-bearing veto in
+                # the file, and nothing noticed. A determiner in front of
+                # "clients/parents/leads" is the NORMAL way to describe a
+                # pipeline.
+                "The clients call me back later.",
+                "The parents call me back in the evening.",
+                "Our customers call me back in the afternoon.",
+                "The parents usually call me after six, my window.",
+                "Those leads call me back within a day.",
+            ],
+            "leading_now_marker": [
+                # ZERO of these existed either. Branch 9 is safe because
+                # `busy right now` is a CLOSED predicate; the branch that puts
+                # the marker FIRST left the predicate open, so an ordinary
+                # answer about being busy WITH something ended the interview.
+                "Right now I am busy with the Q3 pipeline.",
+                "Currently I am busy building the north region.",
+                "At the moment I am a bit busy ramping two reps.",
+                # This is the suite's own negative from branch 9's comment,
+                # with a leading marker prepended. It fired.
+                "Right now I am busy in the mornings but afternoons are free.",
+            ],
+            "have_a_noun_now": [
+                # ZERO of these too. `now` was accepted bare, WITHOUT the
+                # `and then` guard the same diff had just added one screen
+                # above, and `client|customer` were head nouns rather than the
+                # adjectives they are in "a client call".
+                "I have a customer now who has been with us three years.",
+                "I have a call now and then with my manager.",
+                "I have a session now and then with the training team.",
+                "I have a client now in the enterprise segment.",
+            ],
+            "state_then_more_answer": [
+                # Clause scoping silently redefined `unavailable_state`'s
+                # end-anchor from END OF TURN to END OF SENTENCE, with no
+                # comment and no test. "I'm driving." is a deferral when it IS
+                # the answer; it is a description when an answer follows.
+                "I am in a meeting. Then I run demos.",
+                "I'm on another call. Quality program as well, we score calls.",
+                "I'm driving. Revenue growth for the north is my KPI.",
+                "I am occupied. Escalations take most of my day.",
+                "Honestly half the time I am in a meeting. The rest is dialling.",
+            ],
+            "framing_then_quoted_objection": [
+                # The framing sentence must still protect the sentence it
+                # frames when the trigger is UNDIRECTED. These are the
+                # standard answer to "how do you handle objections?" and five
+                # of six ended the interview.
+                "I hear it constantly. Call me back tomorrow. I always pin a time.",
+                "I usually get one line only. Call me back later. Then I pin a slot.",
+                "Every day it is the same. Call me back next week. I just re-dial.",
+                "I always confirm before 5 p.m. Call me back later, that is their line.",
+            ],
             "quoting_the_objection": [
                 # THE HOLE CLAUSE SCOPING OPENED. Judging each clause on its
                 # own is what stopped the gate throwing away a request made in
@@ -5165,6 +5221,78 @@ class TestNativePhoneArchitecture(unittest.TestCase):
                 f"[{name}] does not actually match its own example: {text!r}",
             )
 
+    def test_a_request_heard_beside_an_ANSWER_is_always_a_DIRECTED_branch(self):
+        """The invariant that licenses ignoring the surrounding turn.
+
+        A request is allowed to survive framing elsewhere in the turn ONLY
+        because it is addressed to us — a second-person modal, a "please", or
+        a concrete time. An UNDIRECTED phrase ("call me back later", "I'm busy
+        right now") is exactly what a Sales Program Advisor quotes when asked
+        how they handle objections, so it is judged against the whole turn.
+
+        If one of these ever reports an undirected branch, the gate has
+        started ignoring framing for phrases that depend on it, and the 20
+        false positives a sixth review measured are back.
+        """
+        for text in [
+            "I'm driving. Can you call me back at 4?",
+            "My job is inside sales. Can you call me back later please?",
+            "I usually handle forty leads. Sorry, can you call me back at 1 PM?",
+            "I handle objections all day. Sorry, can you call me back at 1 PM?",
+            "I use Outlook, can you call me back at 6?",
+            "They say I am the best closer. Can you call me back later?",
+        ]:
+            name = phone.callback_request_match(text)
+            self.assertIsNotNone(name, f"request not heard: {text!r}")
+            self.assertIn(
+                name, phone._CALLBACK_DIRECTED_BRANCHES,
+                f"{text!r} was heard via {name!r}, an UNDIRECTED branch. Those "
+                f"are judged against the whole turn precisely because they are "
+                f"the phrases candidates QUOTE; only a branch addressed to us "
+                f"may ignore the framing around it.",
+            )
+
+    def test_the_clause_splitter_does_the_work_it_claims(self):
+        """Both arms, and the abbreviation guard, asserted by behaviour.
+
+        Each of these was a real defect, not a hypothetical:
+
+        * `re.IGNORECASE` on the split pattern made `[A-Z]` match lowercase,
+          so the abbreviation guard blocked EVERY sentence split and the
+          clause scoping silently did nothing at all.
+        * Written `(?<![A-Z])` the guard inspected the same character
+          `(?<=[.!?])` already pins to punctuation — provably inert, and it
+          split "1:00 P.M." in half.
+        * The comma arm survived deletion with the whole suite green.
+        """
+        split = phone._callback_clauses
+        # Sentence arm.
+        self.assertEqual(
+            split("I handle the north region. Can you call me back at 4?"),
+            ["I handle the north region.", "Can you call me back at 4?"],
+        )
+        # Abbreviation guard: a capital before the period means it is not a
+        # sentence end. This is the owner's own transcript shape.
+        self.assertEqual(
+            split("Can you call me back at 1:00 P.M. I am driving."),
+            ["Can you call me back at 1:00 P.M. I am driving."],
+        )
+        # ...and the guard must be CASE SENSITIVE, or it blocks everything.
+        self.assertGreater(
+            len(split("I am the best closer. Can you call me back later?")), 1,
+            "a lowercase letter before the period is an ordinary sentence "
+            "end — if this is one clause the split regex has IGNORECASE on "
+            "and the scoping is inert",
+        )
+        # Comma arm: discourse markers separate an answer from a request.
+        self.assertEqual(
+            split("I run demos all day, but can you call me back at 6?"),
+            # the marker stays with the clause it introduces (lookahead)
+            ["I run demos all day", "but can you call me back at 6?"],
+        )
+        # Nothing to split is not an error.
+        self.assertEqual(split("call me back later"), ["call me back later"])
+
     def test_the_widened_trigger_still_matches_everything_the_OLD_one_did(self):
         """A silent NARROWING is the regression nobody would be watching for.
 
@@ -5261,9 +5389,9 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         # Each turn-scoped branch must be load-bearing on its own.
         turn_examples = {
             "objection_vocabulary":
-                "Let me describe my objection handling. Call me back later is what I hear most.",
+                "Objection handling is the strongest part of my profile. Call me back later.",
             "reported_speech_trailing":
-                "The most common brush-off is simple. I'm busy right now, they tell me.",
+                "Call me back later is what they always ask.",
         }
         self.assertEqual(
             sorted(turn_examples), sorted(turn_names),
@@ -5275,6 +5403,20 @@ class TestNativePhoneArchitecture(unittest.TestCase):
                 _re.search(pattern, turn_examples[name], _re.IGNORECASE),
                 f"turn veto {name!r} does not match its own example",
             )
+            # NON-SHADOWING, same as the clause tier. A mutation showed
+            # `reported_speech_trailing`'s own motivating example was ALSO
+            # caught by `objection_vocabulary`, so the arm could be deleted
+            # with the suite green even though it is load-bearing live.
+            others = "|".join(
+                f"(?:{p})" for n, p in phone._CALLBACK_TURN_VETO_PATTERNS
+                if n != name
+            )
+            if others:
+                self.assertIsNone(
+                    _re.search(others, turn_examples[name], _re.IGNORECASE),
+                    f"turn veto {name!r} is SHADOWED by a sibling on its own "
+                    f"example, so deleting it would change nothing here",
+                )
         # And a polite opener must NOT be swallowed by it: "excuse me" is how
         # people interrupt, which is why the vocabulary branch takes only the
         # PLURAL noun.
