@@ -86,7 +86,10 @@ describe('the phone RPCs', () => {
     // 0072's partial-finalize sweeper, and 0083's same-IST-day infra abandon,
     // and 0094's three suppression doors (write, release, read).
     // 0095 adds the same-day no-answer retry sweep (transition #27b).
-    expect(PHONE_RPC_NAMES).toHaveLength(37);
+    // 0096 adds `sweep_phone_orphan_sessions` — the reaper for a `waiting`
+    // session that never got an attempt, which every other sweep is blind to
+    // and which wedges the worker lease claimed against it.
+    expect(PHONE_RPC_NAMES).toHaveLength(38);
     for (const name of PHONE_RPC_NAMES) {
       // Searched across BOTH migrations: the question here is "is this granted
       // anywhere in the phone schema", not "which declaration wins".

@@ -564,6 +564,10 @@ describe('errors and malformed answers', () => {
       // row, so the seam must answer with a stable code and nothing else.
       ['phone_sweep_same_day_retry_error', () => stores.sweepSameDayRetry({ now: NOW })],
       ['phone_sweep_stranded_error', () => stores.sweepStrandedSessions({ now: NOW })],
+      // 0096 — the orphan-session reaper. It selects on `call_sessions`, so a
+      // leaked PostgREST error would quote a predicate over session ids and,
+      // through the join it plans, the connection string that reached them.
+      ['phone_sweep_orphan_sessions_error', () => stores.sweepOrphanSessions({ now: NOW })],
       ['phone_claim_sweep_error', () => stores.claimSweep({
         sweep: 'reconcile', owner: 'o', now: NOW })],
       ['phone_record_probe_error', () => stores.recordProbe!({

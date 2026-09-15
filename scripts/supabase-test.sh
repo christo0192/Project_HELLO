@@ -703,6 +703,48 @@ fi
 log '0094: PASS — fleet daily cap refuses at the boundary without writing; reconnect and infra-defer excluded; suppression reaches admission and releases cleanly.'
 
 # =====================================================================
+# 0096 — a connected call is not a dead leg, and an orphan session is not
+#        invisible.
+#
+# RCA 2026-09-10. `reclaim_phone_attempt_leases` had ZERO grace and no
+# liveness check, and `'human'` — a consented, TALKING candidate — sat in the
+# same IN-list as a leg that never rang. The reap does not hang up: the
+# candidate keeps talking to a bot whose attempt is already `abandoned` and
+# whose engagement has been rolled back, and whatever that leg scores is then
+# ignored. Two live conversations were lost that way, silently.
+#
+# The second half is the session NOTHING could see. `ensureSession` writes the
+# `call_sessions` row BEFORE admission runs, so every refused dial strands a
+# `waiting` session with no attempt — invisible to the partial-finalize sweep
+# (it INNER-joins attempts), to the lease reaper (it scans attempts) and to
+# the terminal-lease lister (it needs a terminal session). One was then adopted
+# by a later dial, claimed a worker lease, and held HALF the phone pool for
+# four days.
+#
+# Both halves are predicates over real rows, and the vitest suites match these
+# migrations as TEXT — nothing there can tell a correct predicate from one that
+# compiles and selects the wrong set. Assertions RAISE, so ON_ERROR_STOP makes
+# psql exit non-zero → harness fails.
+# =====================================================================
+log '0096: live-call protection — seeding three lease-expired legs and four waiting sessions...'
+docker exec -i "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  < app/supabase/tests/phone_live_call_protection_setup.sql 2>&1 | tee -a "$RESULTS_FILE"
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+  log 'ERROR: 0096 live-call-protection setup failed.'
+  exit 1
+fi
+log '0096: live-call protection — asserting the answered grace and the orphan sweep...'
+docker exec -i "$SUPABASE_DB_CONTAINER" \
+  psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  < app/supabase/tests/phone_live_call_protection_assert.sql 2>&1 | tee -a "$RESULTS_FILE"
+if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+  log 'ERROR: 0096 live-call-protection assertions FAILED.'
+  exit 1
+fi
+log '0096: PASS — a connected call inside the grace is spared and one past it is not; a never-answered leg gets no grace; the orphan session is expired/idle_timeout while young, dialled and engaged rows are untouched.'
+
+# =====================================================================
 # TST-15 rollback rehearsal — clean reset / roll-forward / restore
 # (Phase 6 lane L4). No reverse SQL exists or is invented; this proves the
 # sanctioned recovery path: the committed migration set can always be

@@ -8845,6 +8845,19 @@ begin
                                                    -- and granted only to
                                                    -- service_role.
                                                    'phone_same_day_retry_delay',
+                                                   -- 0096. How long a leg that
+                                                   -- ANSWERED is spared before
+                                                   -- the reclaim sweep may
+                                                   -- abandon it: the same pure
+                                                   -- constant as the eight
+                                                   -- above, `language sql
+                                                   -- immutable` with
+                                                   -- `set search_path =
+                                                   -- pg_catalog`, revoked from
+                                                   -- public/anon/authenticated
+                                                   -- and granted only to
+                                                   -- service_role.
+                                                   'phone_answered_reclaim_grace',
                                                    'prevent_phone_call_event_mutation',
                                                    'enforce_phone_engagement_transition',
                                                    'enforce_phone_appointment_window') then

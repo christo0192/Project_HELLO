@@ -107,6 +107,7 @@ import type {
   HeartbeatPhoneAttemptByEpochInput,
   SweepPhoneDayRolledResult,
   SweepPhoneSameDayRetryResult,
+  SweepPhoneOrphanSessionsResult,
   SweepPhoneStrandedSessionsResult,
   SweepPhoneStrandedRecordingsResult,
   FinalizePhonePartialSessionsResult,
@@ -484,6 +485,25 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
         status: narrowPhoneRpcStatus<'ok'>('sweep_phone_same_day_retry', row),
         examined: num(row, 'examined'),
         released: num(row, 'released'),
+        skipped: num(row, 'skipped'),
+      };
+    },
+
+    async sweepOrphanSessions(input): Promise<SweepPhoneOrphanSessionsResult> {
+      const { data, error } = await client.rpc('sweep_phone_orphan_sessions', {
+        p_limit: input.limit ?? 25,
+        // Left to the RPC's own default when the caller does not name one, so
+        // the grace has exactly ONE definition and it lives beside the query
+        // that uses it.
+        p_grace_seconds: input.graceSeconds ?? null,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_sweep_orphan_sessions_error');
+      const row = asRow(data);
+      return {
+        status: narrowPhoneRpcStatus<'ok'>('sweep_phone_orphan_sessions', row),
+        examined: num(row, 'examined'),
+        expired: num(row, 'expired'),
         skipped: num(row, 'skipped'),
       };
     },

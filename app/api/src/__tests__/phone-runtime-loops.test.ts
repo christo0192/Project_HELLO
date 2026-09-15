@@ -134,6 +134,10 @@ const LOOP_KNOBS = {
   // `phone-dayroll`, and on the same EXPIRE cadence for the same reason: the
   // five-hour delay dominates, so detection latency is irrelevant.
   'phone-sameday': 'expireMs',
+  // 0096. The orphan-session reaper. EXPIRE cadence: the row is fifteen
+  // minutes old before it is even eligible, so detection latency is noise
+  // against the grace it waits out.
+  'phone-orphansess': 'expireMs',
 } as const satisfies Readonly<Record<string, keyof PhoneRuntimeConfig>>;
 
 const LOOP_NAMES = Object.keys(LOOP_KNOBS) as ReadonlyArray<keyof typeof LOOP_KNOBS>;
@@ -1672,7 +1676,7 @@ describe('F. M-1 — a reconcile sweep that is NOT RUNNING is not a sweep that f
     const runtime = buildRuntime({ stores: makeStores(c), queue: makeEmptyQueue(c) });
     expect(Object.keys(runtime.snapshot().sweepNotOk).sort())
       // Sorted, so 0095's `sameday` sits between `recstrand` and `stranded`.
-      .toEqual(['dayroll', 'expire', 'partialfin', 'reclaim', 'reconcile', 'recstrand', 'sameday', 'stranded']);
+      .toEqual(['dayroll', 'expire', 'orphansess', 'partialfin', 'reclaim', 'reconcile', 'recstrand', 'sameday', 'stranded']);
   });
 });
 
@@ -1711,7 +1715,7 @@ describe('the day-roll and stranded sweeps run, and the claim gates them', () =>
       // its OWN name, not the day-roll's: the two sweeps ask different
       // questions (has a new day begun? / have five hours passed?) and
       // sharing a claim would let one starve the other.
-      new Set(['dayroll', 'stranded', 'recstrand', 'partialfin', 'sameday']),
+      new Set(['dayroll', 'stranded', 'recstrand', 'partialfin', 'sameday', 'orphansess']),
     );
   });
 

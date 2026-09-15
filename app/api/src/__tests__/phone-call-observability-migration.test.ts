@@ -44,7 +44,10 @@ describe('0082 per-call phone observability column', () => {
   });
 
   it('is registered NEWEST-FIRST in the migration harness', () => {
-    // 0095 (call-outcome hygiene) is the newest entry — it re-declares
+    // 0096 (live-call protection) is the newest entry — it re-declares
+    // reclaim_phone_attempt_leases IN FULL over 0071's, so anything ahead of it
+    // would make the extractors read the ungraced reaper that abandoned a live
+    // conversation. Then 0095 (call-outcome hygiene) — it re-declares
     // apply_phone_event, admit_phone_attempt AND finalize_phone_partial_sessions
     // IN FULL, so anything ahead of it would make the extractors read 0067's,
     // 0094's and 0072's superseded bodies. Then 0094 (dial scope + fleet cap),
@@ -60,10 +63,12 @@ describe('0082 per-call phone observability column', () => {
     const idx092 = PHONE_MIGRATIONS.findIndex((m) => m.name === '0092');
     const idx094 = PHONE_MIGRATIONS.findIndex((m) => m.name === '0094');
     const idx095 = PHONE_MIGRATIONS.findIndex((m) => m.name === '0095');
-    expect(idx095).toBe(0);
-    expect(idx094).toBe(1);
-    expect(idx092).toBe(2);
-    expect(idx086).toBe(3);
+    const idx096 = PHONE_MIGRATIONS.findIndex((m) => m.name === '0096');
+    expect(idx096).toBe(0);
+    expect(idx095).toBe(1);
+    expect(idx094).toBe(2);
+    expect(idx092).toBe(3);
+    expect(idx086).toBe(4);
     expect(idx085).toBeGreaterThan(idx086);
     expect(PHONE_MIGRATIONS[idx082]).toEqual({ name: '0082', sql: MIGRATION_0082 });
     expect(idx083).toBeGreaterThan(idx085);

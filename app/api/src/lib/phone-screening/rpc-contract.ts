@@ -60,6 +60,7 @@ export const PHONE_RPC_NAMES = [
   'sweep_phone_day_rolled',
   // 0095 — the same-day half of the no-answer ladder.
   'sweep_phone_same_day_retry',
+  'sweep_phone_orphan_sessions',
   'sweep_phone_stranded_sessions',
   'claim_phone_sweep',
   // 0057 — governed immutable cycle operations. Number verification is
@@ -197,6 +198,11 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
       'p_limit',
       'p_now',
     ],
+    sweep_phone_orphan_sessions: [
+      'p_limit',
+      'p_grace_seconds',
+      'p_now',
+    ],
     sweep_phone_stranded_sessions: [
       'p_limit',
       'p_now',
@@ -328,6 +334,9 @@ export const HEARTBEAT_PHONE_ATTEMPT_BY_EPOCH_STATUSES = ['ok', 'lease_lost'] as
 /** The two bounded 0045 sweeps. A bounded sweep always answers `ok`. */
 export const SWEEP_PHONE_DAY_ROLLED_STATUSES = ['ok'] as const;
 export const SWEEP_PHONE_SAME_DAY_RETRY_STATUSES = ['ok'] as const;
+
+/** `sweep_phone_orphan_sessions` (0096) — a bounded sweep answers `ok`. */
+export const SWEEP_PHONE_ORPHAN_SESSIONS_STATUSES = ['ok'] as const;
 export const SWEEP_PHONE_STRANDED_SESSIONS_STATUSES = ['ok'] as const;
 
 /**
@@ -777,6 +786,7 @@ export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]
     heartbeat_phone_attempt_by_epoch: HEARTBEAT_PHONE_ATTEMPT_BY_EPOCH_STATUSES,
     sweep_phone_day_rolled: SWEEP_PHONE_DAY_ROLLED_STATUSES,
     sweep_phone_same_day_retry: SWEEP_PHONE_SAME_DAY_RETRY_STATUSES,
+    sweep_phone_orphan_sessions: SWEEP_PHONE_ORPHAN_SESSIONS_STATUSES,
     sweep_phone_stranded_sessions: SWEEP_PHONE_STRANDED_SESSIONS_STATUSES,
     claim_phone_sweep: CLAIM_PHONE_SWEEP_STATUSES,
     request_phone_rescreen: REQUEST_PHONE_RESCREEN_STATUSES,
