@@ -171,16 +171,76 @@ primary_region = "sin"
   # coordinator owns objective order; preloading a future objective can create
   # repeated introductions or stale questions after an interruption.
   PHONE_OBJECTIVE_PREEMPTIVE = "off"
-  # 60 (owner-approved 2026-09-07, SE-call latency RCA): the early-flush fix is
-  # ACTIVE — first speakable fragment (first sentence terminator / clause pause /
-  # 60-char cap) reaches Sarvam immediately instead of waiting for the model's
-  # complete first sentence (~1.8s median reply->first-TTS block measured).
-  # "0" is the instant rollback (whole reply as ONE synthesis, no early flush).
+  # The early-flush fix is ACTIVE — the first speakable fragment (first sentence
+  # terminator / clause pause / this char cap, whichever comes first) reaches
+  # Sarvam immediately instead of waiting for the model's complete first
+  # sentence. "0" is the instant rollback (whole reply as ONE synthesis, no
+  # early flush) and is the SLOWEST setting, not the fastest — the name reads
+  # like a minimum but zero is a disable sentinel.
+  #
+  # ── TUNING HISTORY, because this value has been moved by ear ──────────
+  #   60  owner-approved 2026-09-07 (SE-call latency RCA); ~1.8s median
+  #       reply->first-TTS block measured at the time.
+  #   20  tried during tuning: audible WORD BREAKAGE. See WORD BREAKAGE below
+  #       for the mechanism — there IS a word-boundary back-off, but it
+  #       DECLINES on a short lead, which is why a low cap still cracked words.
+  #   40  settled on after that, and ran in production as a SECRET (which is
+  #       why this [env] line still read 60 — the secret shadowed it, and the
+  #       repo could not see the live value).
+  #   30  owner-requested 2026-09-15 as the midpoint between "20 broke words"
+  #       and "40 feels laggy".
+  #
+  # MEASURED, so the next reader is not misled.
+  #
+  # LATENCY: on session a57e6113 the headline turn latency was 2857ms median,
+  # of which ~996ms is end-of-speech detection and ~1003ms is LLM
+  # time-to-first-token. The flush sits inside the remaining ~12%. An earlier
+  # draft of this comment claimed the gain was exactly zero because
+  # `_A0_LEADING_SEGMENT_MAX_CHARS` (48) releases in a burst; that is WRONG for
+  # a normal reply. The A0 gate releases at the first clause boundary OR 48
+  # chars, and this bot is instructed to open by reacting ("Got it,", "Sure,",
+  # "Mm,"), so the real release is at 3-12 chars and 30 does fire ~10 dense
+  # characters before 40. Small, not nil.
+  #
+  # WORD BREAKAGE: there IS a word-boundary back-off, and it DECLINES when the
+  # head before the last space carries fewer than `_TTS_FIRST_FRAGMENT_MIN_CHARS`
+  # (14) alphabetic characters — deliberately, to avoid a tiny choppy
+  # synthesis. So the cap cuts mid-word exactly when the lead is short on
+  # LETTERS.
+  #
+  # An earlier draft of this comment claimed "the decline rate is zero from 28
+  # upward" and that 30 was "the FIRST clean value". BOTH ARE FALSE — an
+  # adversarial review transcribed the live first-fragment logic and swept a
+  # corpus of realistic bot turns:
+  #
+  #     cap   turns that hit the cap   of those, cracked a word
+  #      20            12                        6
+  #      28             9                        1
+  #      30             8                        1   <- SHIPPED
+  #      32             7                        1
+  #      35             5                        0   <- lowest clean value
+  #      40             3                        0   <- the value replaced
+  #
+  # So 30 is one step better than 40 on latency and one step short of safe.
+  # 35 is the lowest cap that broke nothing on that corpus while still firing
+  # earlier than 40. 30 is shipped because the owner chose it explicitly after
+  # being told the risk was measured and real; if a cracked word is heard on
+  # the next call, "35" is the better first move and "40" is the full revert.
+  #
+  # The margin is spent by digits, and this bot asks about compensation on
+  # every call. Reproduced at 30, clean at 40:
+  #   "Mm, 1250000 fixed plus 200000 variable is what you are on today?"
+  #     30 -> back-off declines (head has 11 alpha < 14); cut lands "varia|ble"
+  #     40 -> cuts cleanly after "variable is what "
+  # So expect a cracked word specifically on number-heavy leads. If you hear
+  # one, `PHONE_TTS_FLUSH_MIN_CHARS = "40"` here is the one-line revert.
+  #
   # DEPLOY NOTE (operator step): a stale Fly SECRET also named
   # PHONE_TTS_FLUSH_MIN_CHARS overrides this [env] value — it MUST be unset
   # (`fly secrets unset PHONE_TTS_FLUSH_MIN_CHARS -a <phone-app>`) at deploy or
-  # this change silently does nothing.
-  PHONE_TTS_FLUSH_MIN_CHARS = "60"
+  # this change silently does nothing. The live value was 40 via exactly such a
+  # secret until 2026-09-15.
+  PHONE_TTS_FLUSH_MIN_CHARS = "30"
   # 0095 — PHONE_TTS_PACE is DELIBERATELY NOT SET HERE. The reader
   # (`phone_tts_pace()`, default 1.0) ships so the value can be applied as a
   # secret, but the value itself is unverified against `bulbul:v3`: the [0.5,

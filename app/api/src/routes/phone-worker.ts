@@ -1048,16 +1048,22 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         return res.json({ ok: false, status: 'unknown_attempt' });
       }
       if (resolved.engagementState === 'scheduled') {
+        phoneWorkerLog.info('unknown_event', { schema: 'callback_proposal', error_category: 'attempt_in_flight' });
         return res.json({ ok: false, status: 'attempt_in_flight' });
       }
       if (startsAt.getTime() < at.getTime() + PHONE_VOICE_CALLBACK_MIN_LEAD_SECONDS * 1000) {
+        phoneWorkerLog.info('unknown_event', { schema: 'callback_proposal', error_category: 'lead_time_too_short' });
         return res.json({ ok: false, status: 'lead_time_too_short' });
       }
-      if (!istWindowOpen(startsAt)) return res.json({ ok: false, status: 'window_closed' });
+      if (!istWindowOpen(startsAt)) {
+        phoneWorkerLog.info('unknown_event', { schema: 'callback_proposal', error_category: 'window_closed' });
+        return res.json({ ok: false, status: 'window_closed' });
+      }
       const endsAt = new Date(
         startsAt.getTime() + PHONE_VOICE_CALLBACK_DURATION_SECONDS * 1000,
       );
       if (istDate(startsAt) !== istDate(endsAt)) {
+        phoneWorkerLog.info('unknown_event', { schema: 'callback_proposal', error_category: 'slot_straddles_ist_midnight' });
         return res.json({ ok: false, status: 'slot_straddles_ist_midnight' });
       }
       if (resolved.engagementState === 'dialing' || resolved.engagementState === 'in_call') {
@@ -1069,6 +1075,12 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
           attempt.istDate === istDate(startsAt) &&
           ['initial', 'no_answer_retry', 'scheduled'].includes(attempt.kind)
         )) {
+          // THE SAME-DAY REFUSAL. The predicate matches the call in progress —
+          // this attempt's own `ist_date` — so any callback a candidate asks
+          // for TODAY lands here. On 2026-09-15 that ended a live screening
+          // with "our team will reach out" and no booking, and this branch
+          // logged nothing, so the server side of the incident was invisible.
+          phoneWorkerLog.info('unknown_event', { schema: 'callback_proposal', error_category: 'slot_not_yet_eligible' });
           return res.json({ ok: false, status: 'slot_not_yet_eligible' });
         }
       }
@@ -1130,6 +1142,9 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         duration_seconds: PHONE_VOICE_CALLBACK_DURATION_SECONDS,
       });
     } catch {
+      phoneWorkerLog.info('unknown_event', {
+        schema: 'callback_proposal', error_category: 'phone_callback_proposal_error',
+      });
       return res.status(503).json({ ok: false, status: 'phone_callback_proposal_error' });
     }
   });

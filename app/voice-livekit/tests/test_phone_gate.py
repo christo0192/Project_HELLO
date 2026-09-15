@@ -4714,6 +4714,855 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         ))
         self.assertIn("don't have verified context", phone.PHONE_COMPANY_REVIEW_RESPONSE)
 
+    def test_the_THREE_ways_a_candidate_asked_to_be_called_back(self):
+        """RCA 2026-09-15, session a57e6113 — the verbatim live utterances.
+
+        A candidate asked to be called back three times. The first two were
+        missed and the bot carried on interviewing; only the third, which
+        happened to contain the verb "schedule", started the booking flow.
+        The words that decided it were `schedule` versus `call me back`.
+        """
+        missed_live = [
+            "By the way, can you call me back today at 1:00 AM, sorry, 1:00 PM?",
+            "Uh I'm sorry, I'm kind of busy right now. Please call me back at 1 PM.",
+        ]
+        for text in missed_live:
+            self.assertEqual(
+                phone.candidate_turn_route(text), "callback_deferral",
+                f"the live miss is still missed: {text!r}",
+            )
+        # The one that DID work must keep working.
+        self.assertEqual(
+            phone.candidate_turn_route("Can you schedule a call back?"),
+            "callback_deferral",
+        )
+
+    def test_every_natural_way_to_ask_for_a_callback_is_heard(self):
+        """The owner's complaint: "each candidate says that in different way".
+
+        Missing one of these does not degrade the call — it CONTINUES THE
+        INTERVIEW over somebody who has said they cannot talk.
+        """
+        for text in [
+            # the phrasing the old pattern could not hear at all
+            "can you call me back",
+            "could you please call me back",
+            "please call me back",
+            # a SPECIFIC time — the more committed form, and the one that missed
+            "call me back at 1 PM",
+            "call me after 6",
+            "call me in an hour",
+            "call me back around 3",
+            "ring me back this evening",
+            "phone me back tonight",
+            # a different verb entirely
+            "can you give me a call later",
+            "give me a call later",
+            "give me a ring tomorrow",
+            # rescheduling without a modal in front of it
+            "lets reschedule",
+            "can we reschedule",
+            "I need to reschedule",
+            # "busy", hedged the way people actually hedge it
+            "I'm a bit busy right now",
+            "I'm really busy at the moment",
+            "I'm kind of busy right now",
+            # can't talk — a NOW marker is required, because without one
+            # "I can't speak Marathi" and "I can't talk about my employer's
+            # revenue" are both ordinary screening answers.
+            "I cannot talk now",
+            "I can't talk at the moment",
+            # "not a good time", without the literal "this is" lead-in
+            "now is not a good time",
+            "it is not a good time",
+            "not a good time right now",
+            "bad time right now",
+            # states that mean "not now"
+            "I'm driving",
+            "I am currently driving",
+            "I'm in a meeting",
+            "I'm on another call",
+            # deferring the conversation itself
+            "can we talk later",
+            "can we do this later",
+            "could we continue later",
+            "shall we catch up tomorrow",
+            # STT SHAPE: no punctuation, lowercase, disfluencies. Production
+            # never sees the tidy strings above — it sees these.
+            "um yeah can you call me back at one pm please",
+            "sorry im kind of busy right now please call me back",
+            "uh i am driving can we talk later",
+            "yeah give me a call after six",
+            # ── ADDED after a FIFTH review measured 31 of 39 natural requests
+            #    missed. The first group is the worst of them: the branch
+            #    built FOR the incident did not match the incident's own
+            #    phrasing, because a day word between "back" and the time
+            #    blocked the time tail.
+            "call me back today at 1 PM",
+            "call me back today at 1:00 PM please",
+            "yeah call me back today at one",
+            "call me back tomorrow at 11",
+            # "later" has many more forms than the four that were listed
+            "call me back in the evening",
+            "call me back in the afternoon",
+            "call me back on Monday",
+            "call me back next week",
+            "call me back after office hours",
+            "call me back after some time",
+            "call me back in a while",
+            "call me back post lunch",
+            # unavailability states the branch did not name
+            "I'm on the road right now",
+            "I'm with a customer right now",
+            "I am in the middle of something right now",
+            # `have` rather than a state verb
+            "I have a meeting right now",
+            "I have got a client call right now",
+            # the now-marker FIRST, which is the more natural Indian-English
+            # ordering and matched nothing
+            "Right now I am busy",
+            "at the moment I'm a bit busy",
+            # ── THE TURN-SCOPING REGRESSION. An answer and a request in one
+            #    breath is the shape of the incident utterance ("By the way,
+            #    can you call me back today at 1:00 PM?" came after an
+            #    answer). A veto read over the WHOLE turn threw every one of
+            #    these away — deterministically, for any candidate whose
+            #    speech habit includes "my job is" or "I usually".
+            "I usually handle about forty leads a day. Sorry, can you call me back at 1 PM?",
+            "My job is inside sales for the north region. Can you call me back later please?",
+            "My day starts at 9. Can you please call me back after 6?",
+            "They say I am the best closer. Can you call me back later?",
+            "I was in a meeting earlier. Can you call me back at 4?",
+            "I'm not too busy to talk, but can you call me back at 1 PM?",
+            "Sorry, I was driving. Please call me back at 6.",
+        ]:
+            self.assertEqual(
+                phone.candidate_turn_route(text), "callback_deferral",
+                f"a callback request was not heard: {text!r}",
+            )
+
+    def test_a_SALES_answer_never_ends_the_interview(self):
+        """The cost of a false positive here is a TERMINATED live interview.
+
+        `agent.py` routes every later turn into the callback flow once it
+        fires, and then raises StopResponse — there is no edge back to the
+        screening plan. So a misfire does not degrade the call, it ends it.
+
+        This screening is for a Sales Program Advisor. These candidates
+        describe callbacks, follow-ups, scheduling and being busy as their
+        actual job. Every string below is a realistic ANSWER, and an adversarial
+        review found that a first draft of the widened trigger fired on THIRTY
+        of them — including a candidate saying they were AVAILABLE.
+
+        Each group names the guard it probes, so a regression says which one
+        broke rather than just that something did.
+        """
+        cases = {
+            # the guard pinned since the pattern was first written
+            "original_pin": [
+                "I organize CRM callbacks and follow-up across multiple prospects.",
+            ],
+            # NEGATION — "not busy" is a POSITIVE availability answer. A
+            # wildcard hedge swallowed the "not" and hung up on it.
+            "negated_busy": [
+                "I'm not busy at all, I can start on Monday.",
+                "I am not busy right now, happy to continue.",
+                "I'm not busy right now so we can continue.",
+                "I am available any time, I'm not busy.",
+            ],
+            # "busy" describing the WORK, not this moment. The now-marker is
+            # what separates them.
+            "busy_without_now": [
+                "I'm busy in the mornings but afternoons are free.",
+                "I'm busy on weekends because that is when parents are free.",
+                "I am busy but I can absolutely take this call now.",
+                "I am busy from nine to six with the calling window.",
+                "I'm busy, with a pipeline of about fifty leads.",
+                "I'm busy with a pipeline of about fifty leads.",
+                "I am busy managing renewals and escalations.",
+                "I'm busy closing three deals this quarter.",
+            ],
+            # a modal + "call" with ANY object is not a request about this call
+            "call_with_other_object": [
+                "Can you call the prospect first or email them?",
+                "Can you call out the main KPIs you were measured on?",
+                "So could you call the lead twice a day in that process?",
+                "Will you call the shots on pricing in this role?",
+                "Can we call it a pipeline of about forty leads?",
+                "Would you call that a good conversion rate for outbound?",
+                "Can you please call my reference, he will confirm the numbers.",
+                "Could you call me Chris, everyone does.",
+                "sir can you call the counsellor also for this profile",
+            ],
+            # "driving" is a top-tier sales résumé verb
+            "unavailable_verb_as_resume_verb": [
+                "I'm driving revenue growth for the inside sales team.",
+                "I am driving the outbound motion end to end.",
+                "I'm currently driving adoption of the new CRM across the floor.",
+                "I am driving conversions up by about fifteen percent.",
+                "I'm in a meeting-heavy role, about six demos a day.",
+                "I'm on another call quality program as well, we score recordings.",
+            ],
+            # language fluency and NDA deflections — both routine here
+            "cannot_speak_without_now": [
+                "I can't speak Marathi but I'm fluent in Hindi and English.",
+                "I can't speak Tamil, but Hindi and English are fluent.",
+                "I cannot speak for the whole team, only my own numbers.",
+                "I can't talk about my current employer's revenue, it's confidential.",
+                "I can't talk numbers because of the NDA I signed.",
+                "I can't do this without a proper CRM, that was my main blocker.",
+            ],
+            # the objection-handling ANSWER for this exact role
+            "quoted_objection": [
+                "When a parent says now is not a good time, I ask when is better.",
+                "The prospect says it is not a good time, so I note it and follow up.",
+                "If a client says now is not a good time, I ask for a better slot.",
+            ],
+            # somebody ELSE is the actor
+            "third_person_actor": [
+                "Prospects call me back after a day or two if they are interested.",
+                "Parents usually call me after six in the evening, my best window.",
+                "They call me in a panic when the lead goes cold.",
+                "I leave a voicemail and most of them call me back.",
+                "Prospects usually call me back within a day.",
+                "I ask them to give me a call when they are free.",
+                "Leads give me a call after a couple of days sometimes.",
+            ],
+            # describing a process, including SINGULAR objects — an earlier
+            # corpus used only plurals and passed by luck.
+            "process_description": [
+                "If the prospect is busy I reschedule the call for a better time.",
+                "We reschedule the interview when the counsellor is on leave.",
+                "I schedule my callbacks in the CRM every morning.",
+                "I schedule a callback in the CRM every morning.",
+                "My follow-up cadence is a call back after two days.",
+                "My job is to schedule the call with the counsellor.",
+                "After the demo I book a meeting with the decision maker.",
+                "I arrange a meeting with the counsellor once the lead is qualified.",
+                "I set up an appointment in the calendar for them.",
+                "I book meetings for the sales team all day.",
+                "I set up appointments with prospects every week.",
+                "I arrange meetings between the prospect and the counsellor.",
+                "I track every callback and follow-up in the pipeline.",
+                # ── EVERY ENTRY ABOVE USES THE SUBJECT "I". That is why this
+                #    group proved nothing: the veto guarding it demanded a
+                #    literal "I" too, so the test and the bug shared the same
+                #    blind spot. A fifth review wrote 40 natural answers to
+                #    this bot's own questions and SIX ended the interview —
+                #    all six phrased with "we", a bare "then", or a tool name.
+                #    Keep at least one of each shape here forever.
+                "We qualify the lead, then we schedule a call with the senior counsellor.",
+                "I own the mid funnel, so once marketing passes the lead we arrange a call.",
+                "First I qualify on budget and intent, then we set up a call with the expert.",
+                "After the first conversation we schedule a follow-up call within two days.",
+                "The process is simple: connect, understand the goal, then book an appointment.",
+                "Salesforce mainly, and we use Calendly to book a meeting with the counsellor.",
+                "Our team schedules a callback whenever the parent asks for one.",
+                "They schedule the meeting and I just run the demo.",
+            ],
+            "determiner_before_actor": [
+                # ZERO of these existed in the corpus. Adding determiner
+                # lookbehinds to `third_person_actor` — to stop ONE self-veto
+                # — blew a hole straight through the most load-bearing veto in
+                # the file, and nothing noticed. A determiner in front of
+                # "clients/parents/leads" is the NORMAL way to describe a
+                # pipeline.
+                "The clients call me back later.",
+                "The parents call me back in the evening.",
+                "Our customers call me back in the afternoon.",
+                "The parents usually call me after six, my window.",
+                "Those leads call me back within a day.",
+            ],
+            "leading_now_marker": [
+                # ZERO of these existed either. Branch 9 is safe because
+                # `busy right now` is a CLOSED predicate; the branch that puts
+                # the marker FIRST left the predicate open, so an ordinary
+                # answer about being busy WITH something ended the interview.
+                "Right now I am busy with the Q3 pipeline.",
+                "Currently I am busy building the north region.",
+                "At the moment I am a bit busy ramping two reps.",
+                # This is the suite's own negative from branch 9's comment,
+                # with a leading marker prepended. It fired.
+                "Right now I am busy in the mornings but afternoons are free.",
+            ],
+            "have_a_noun_now": [
+                # ZERO of these too. `now` was accepted bare, WITHOUT the
+                # `and then` guard the same diff had just added one screen
+                # above, and `client|customer` were head nouns rather than the
+                # adjectives they are in "a client call".
+                "I have a customer now who has been with us three years.",
+                "I have a call now and then with my manager.",
+                "I have a session now and then with the training team.",
+                "I have a client now in the enterprise segment.",
+            ],
+            "state_then_more_answer": [
+                # Clause scoping silently redefined `unavailable_state`'s
+                # end-anchor from END OF TURN to END OF SENTENCE, with no
+                # comment and no test. "I'm driving." is a deferral when it IS
+                # the answer; it is a description when an answer follows.
+                "I am in a meeting. Then I run demos.",
+                "I'm on another call. Quality program as well, we score calls.",
+                "I'm driving. Revenue growth for the north is my KPI.",
+                "I am occupied. Escalations take most of my day.",
+                "Honestly half the time I am in a meeting. The rest is dialling.",
+            ],
+            "framing_then_quoted_objection": [
+                # The framing sentence must still protect the sentence it
+                # frames when the trigger is UNDIRECTED. These are the
+                # standard answer to "how do you handle objections?" and five
+                # of six ended the interview.
+                "I hear it constantly. Call me back tomorrow. I always pin a time.",
+                "I usually get one line only. Call me back later. Then I pin a slot.",
+                "Every day it is the same. Call me back next week. I just re-dial.",
+                "I always confirm before 5 p.m. Call me back later, that is their line.",
+            ],
+            "reporting_then_quoting": [
+                # "I get THAT a lot" + the quote. The veto arm covering this
+                # was deleted once with the justification that it vetoed "I
+                # get a lot of inbound" — which it never matched, because the
+                # object is mandatory. Removing a veto can only ADD false
+                # positives, and these five were the result.
+                "I get that a lot. Call me back later.",
+                "I hear this all the time. Call me back later.",
+                "I hear all of them. I'm busy right now.",
+                "I get that every single day. Call me back tomorrow.",
+                "I hear every one of them. Now is not a good time.",
+                # ...while an ordinary answer with the same verb is NOT
+                # vetoed, which is what the deleted arm was wrongly accused of.
+                "Their standard brush-off, call me back at 4 pm.",
+                "The most common objection I get is can we talk later.",
+                "I have to reschedule about five demos a week because parents forget.",
+            ],
+            "quoting_the_objection": [
+                # THE HOLE CLAUSE SCOPING OPENED. Judging each clause on its
+                # own is what stopped the gate throwing away a request made in
+                # the same breath as an answer — but it also means a framing
+                # sentence no longer protects the sentence it frames. Read
+                # alone, clause 2 of each of these IS a request. Three of them
+                # fired before `_CALLBACK_TURN_VETO_PATTERNS` was added.
+                "Let me describe my objection handling. Call me back later is what I hear most.",
+                "The most common brush-off is simple. I'm busy right now, they tell me.",
+                "I hear every excuse. I can't talk right now is the usual one.",
+                "That happens a lot with parents. Now is not a good time, they usually say.",
+            ],
+            "topic_deflection": [
+                # These carry the WORDS of a deferral while deflecting a
+                # QUESTION. All four fired before the fifth review.
+                "It is a bad time for me to quote exact numbers without the dashboard.",
+                "There is not time right now to cover all of it, but briefly...",
+                "I am busy now and then with escalations.",
+                "Founders call me after six sometimes.",
+            ],
+            "past_tense": [
+                "I was driving to a client meeting when they called.",
+                "He was in a meeting so I called back later.",
+                "They said it was not a good time and I noted it.",
+            ],
+            "trigger_adjacent": [
+                "My last role involved a lot of scheduling.",
+                "I handle the follow-up process end to end.",
+                "We do a weekly call with the team.",
+                "The appointment setting was part of my job.",
+                "They call me at tennis practice on Sundays.",
+            ],
+        }
+        for guard, texts in cases.items():
+            for text in texts:
+                # NOT `assertIsNone`: several of these are genuine candidate
+                # questions ("Can you call out the main KPIs?") and routing
+                # them as `candidate_question` is correct. The only routing
+                # that ENDS the interview is `callback_deferral`, so that is
+                # what must never happen.
+                self.assertNotEqual(
+                    phone.candidate_turn_route(text), "callback_deferral",
+                    f"[{guard}] a sales ANSWER was heard as a hang-up "
+                    f"request, which ENDS the interview: {text!r}",
+                )
+
+    def test_the_false_positives_an_ADVERSARIAL_REVIEW_found_stay_dead(self):
+        r"""Every one of these hung up on a real answer in the first draft.
+
+        A reviewer enumerated the old pattern's language, ran it forwards and
+        backwards against the new one, and produced these. They are kept
+        verbatim — not paraphrased, not shortened — because each one killed a
+        SPECIFIC mechanism, and a paraphrase can stop exercising it:
+
+          * "can you call the prospect first"  — the object was OPTIONAL, so
+            the branch collapsed to "modal + call + anything".
+          * "I am not busy at all"             — the hedge slot was `\w+`,
+            which swallowed the NEGATION.
+          * "I am driving revenue"             — `driving` had no guard, and
+            "driving revenue/adoption/the motion" is this role's vocabulary.
+          * "I reschedule the call whenever"   — a PROCESS description, which
+            is what a Sales Program Advisor does for a living.
+
+        These are the answers the bot would have ended the interview on.
+        """
+        for text in [
+            # object was optional
+            "Can you call the prospect first and then update the CRM?",
+            "Could you call out the main challenge you faced?",
+            "Can we call it a day once the quota is hit?",
+            "Will you call them or should I?",
+            "Please call the number on the website for pricing.",
+            # negation swallowed by the hedge slot
+            "I am not busy at all, please go ahead.",
+            "I am not too busy to take this call.",
+            "I am rarely busy in the mornings.",
+            # unguarded unavailability verbs vs. sales vocabulary
+            "I am currently driving revenue for the north region.",
+            "I am driving the outbound motion for the team.",
+            "I am in a meeting cadence with my manager every Monday.",
+            # process description, not a request
+            "I reschedule the call whenever a prospect misses it.",
+            "Prospects can call me back or give me a call later if they prefer.",
+        ]:
+            self.assertNotEqual(
+                phone.candidate_turn_route(text), "callback_deferral",
+                f"REGRESSION: an adversarial review already caught this exact "
+                f"string ending the interview on a real answer: {text!r}",
+            )
+
+    def test_a_misfire_can_be_traced_to_the_BRANCH_that_caused_it(self):
+        """This gate ends the call, so a misfire must be attributable.
+
+        On the production incident the only evidence was a transcript that
+        stopped; nothing said which of thirteen patterns decided it. The
+        branch name is logged at both entry points in `agent.py`, so the
+        contract is: a heard request always names a branch, and that name is
+        one of the declared ones (never candidate speech, which is what makes
+        it safe to log).
+        """
+        declared = {name for name, _ in phone._CALLBACK_DEFERRAL_PATTERNS}
+        # The logger DROPS a value that fails `_SAFE_IDENT_RE`, silently. A
+        # branch named outside that charset would log nothing at all and the
+        # misfire would be exactly as untraceable as before.
+        for name in declared | {"unattributed"}:
+            self.assertRegex(name, r"^[a-zA-Z0-9_:.\-]{1,64}$")
+        for text in [
+            "can you call me back at 1pm today",
+            "I'm a bit busy right now, call me later",
+            "can we reschedule",
+        ]:
+            name = phone.callback_request_match(text)
+            self.assertIsNotNone(name, f"trigger stopped matching: {text!r}")
+            self.assertIn(
+                name, declared,
+                f"the reported branch {name!r} is not a declared branch — a "
+                f"log line naming it would be untraceable",
+            )
+        # A vetoed string reports nothing at all, so the two halves cannot
+        # drift into disagreeing about whether a request was heard.
+        self.assertIsNone(
+            phone.callback_request_match(
+                "My job is to schedule the call with the counsellor."
+            )
+        )
+        self.assertIsNone(phone.callback_request_match(""))
+        self.assertIsNone(phone.callback_request_match(None))
+        # The boolean gate is DERIVED from the name, not a second copy of the
+        # logic that could disagree with it.
+        for text in ["can you call me back tomorrow at 3pm", "tell me about the role"]:
+            self.assertEqual(
+                phone.is_callback_request(text),
+                phone.callback_request_match(text) is not None,
+            )
+
+    def test_the_veto_is_what_makes_the_widening_safe(self):
+        """The trigger alone is deliberately loose; the veto is the guard.
+
+        Stated explicitly so the two halves are not silently decoupled: these
+        strings DO match the trigger and MUST still be rejected overall. If
+        someone removes the veto, the trigger tests keep passing and only this
+        one fails — which is the point.
+
+        ONE STRING PER BRANCH, and each must be UNIQUELY needed. A fifth
+        adversarial review deleted veto branches one at a time and ran the
+        whole suite: `hypothetical_or_quoted` and `habitual` both survived,
+        because every string meant to exercise them was *also* caught by a
+        sibling. Overlapping guards make a corpus look thorough while testing
+        nothing — the same review measured 86% of the strings in the big
+        negative corpus as vacuous. Asserting uniqueness is what stops that.
+        """
+        import re as _re
+
+        # branch name -> a sales answer that ONLY that branch rejects
+        per_branch = {
+            "third_person_actor":
+                "I leave a voicemail and most of them call me back later.",
+            "hypothetical_or_quoted":
+                "Clients typically set up a callback when they are free.",
+            "habitual":
+                "I typically book a meeting with the counsellor after the demo.",
+            "job_description":
+                "My job is to schedule the call with the counsellor.",
+            "booking_process":
+                "We qualify the lead, then we schedule a call with the senior counsellor.",
+            "sequenced_booking_process":
+                "The process is simple: connect, understand the goal, then book an appointment.",
+            "tooling_description":
+                "Salesforce mainly, and we use Calendly to book a meeting with the counsellor.",
+        }
+        declared = [name for name, _ in phone._CALLBACK_VETO_PATTERNS]
+        self.assertEqual(
+            sorted(per_branch), sorted(declared),
+            "every veto branch needs its own uniquely-needed example here; a "
+            "branch with no example is a guard nothing tests",
+        )
+
+        by_name = dict(phone._CALLBACK_VETO_PATTERNS)
+        for name, text in per_branch.items():
+            self.assertIsNotNone(
+                phone._CALLBACK_DEFERRAL_RE.search(text),
+                f"[{name}] this string is supposed to exercise the VETO, but "
+                f"the trigger no longer matches it — vacuous: {text!r}",
+            )
+            self.assertFalse(
+                phone.is_callback_request(text),
+                f"[{name}] the veto failed to reject: {text!r}",
+            )
+            # UNIQUENESS: with this one branch removed, the string must slip
+            # through. That is what proves the branch — not its siblings — is
+            # doing the work.
+            others = "|".join(
+                f"(?:{p})" for n, p in phone._CALLBACK_VETO_PATTERNS if n != name
+            )
+            self.assertIsNone(
+                _re.search(others, text, _re.IGNORECASE),
+                f"[{name}] is SHADOWED: {text!r} is already rejected by another "
+                f"branch, so deleting {name!r} would change nothing and this "
+                f"assertion proves nothing",
+            )
+            self.assertIsNotNone(
+                _re.search(by_name[name], text, _re.IGNORECASE),
+                f"[{name}] does not actually match its own example: {text!r}",
+            )
+
+    def test_a_QUOTED_request_never_ends_the_interview(self):
+        """Every framing veto x every directed branch. 28/28 used to fire.
+
+        "How do you handle objections?" is a GUARANTEED question for a Sales
+        Program Advisor, and the answer quotes the objection. When directed
+        branches were given a reduced veto set — on the theory that a process
+        description cannot reframe an addressed request — `objection_
+        vocabulary`, `habitual`, `job_description`, `booking_process` and
+        `tooling_description` all went dead for them, and every one of these
+        ended the interview.
+
+        The matrix shape matters: the bug was not in any single branch, it was
+        in the INTERACTION between the veto set and the branch tier, so only a
+        product of the two could find it.
+        """
+        frames = [
+            "The most common objection is",     # objection_vocabulary
+            "I usually hear",                   # habitual
+            "My job is getting past",           # job_description
+            "We use a script for",              # tooling_description
+            "Every day I hear",                 # job_description
+            "Every parent says the same thing.",  # quotation_frame (same-thing arm)
+            # TWO clauses on purpose: the clause veto reaches clause 1 only,
+            # so only the TURN-wide quotation frame can stop clause 2.
+            "Every client says that.",            # quotation_frame (every-X-says arm)
+            "Their standard line is this.",       # quotation_frame (standard-line arm)
+        ]
+        quotes = [
+            "can you call me back later",       # call_me_back_addressed
+            "can you call me back at 4",        # call_me_back_at_time
+            "give me a call later",             # give_me_a_call
+            "could you reschedule",             # modal_call_back_or_reschedule
+            "can you schedule a callback",      # modal_book_object
+            "can we talk later",                # can_we_later
+            "let's reschedule",                 # reschedule_requested
+        ]
+        # Sanity: the quotes must be real requests on their own, or the
+        # matrix below proves nothing.
+        for q in quotes:
+            self.assertEqual(
+                phone.candidate_turn_route(q), "callback_deferral",
+                f"this must be a genuine request for the matrix to mean "
+                f"anything: {q!r}",
+            )
+        for frame in frames:
+            for quote in quotes:
+                text = f"{frame} {quote}."
+                self.assertNotEqual(
+                    phone.candidate_turn_route(text), "callback_deferral",
+                    f"a QUOTED objection ended the interview: {text!r}",
+                )
+
+    def test_a_request_heard_beside_an_ANSWER_is_always_a_DIRECTED_branch(self):
+        """The invariant that licenses ignoring the surrounding turn.
+
+        A request is allowed to survive framing elsewhere in the turn ONLY
+        because it is addressed to us — a second-person modal, a "please", or
+        a concrete time. An UNDIRECTED phrase ("call me back later", "I'm busy
+        right now") is exactly what a Sales Program Advisor quotes when asked
+        how they handle objections, so it is judged against the whole turn.
+
+        If one of these ever reports an undirected branch, the gate has
+        started ignoring framing for phrases that depend on it, and the 20
+        false positives a sixth review measured are back.
+
+        DELIBERATELY ABSENT: "I handle objections all day. Sorry, can you call
+        me back at 1 PM?" and "I use Outlook, can you call me back at 6?".
+        Both are genuine requests and both are now MISSED, because
+        meta-discourse is turn-scoped and a process description vetoes its own
+        clause. That is the accepted price of
+        `test_a_QUOTED_request_never_ends_the_interview`: a miss costs one
+        repeated question, and the 35 combinations it guards each cost an
+        interview.
+        """
+        for text in [
+            "I'm driving. Can you call me back at 4?",
+            "My job is inside sales. Can you call me back later please?",
+            "I usually handle forty leads. Sorry, can you call me back at 1 PM?",
+            "They say I am the best closer. Can you call me back later?",
+        ]:
+            name = phone.callback_request_match(text)
+            self.assertIsNotNone(name, f"request not heard: {text!r}")
+            self.assertIn(
+                name, phone._CALLBACK_DIRECTED_BRANCHES,
+                f"{text!r} was heard via {name!r}, an UNDIRECTED branch. Those "
+                f"are judged against the whole turn precisely because they are "
+                f"the phrases candidates QUOTE; only a branch addressed to us "
+                f"may ignore the framing around it.",
+            )
+
+    def test_the_clause_splitter_does_the_work_it_claims(self):
+        """Both arms, and the abbreviation guard, asserted by behaviour.
+
+        Each of these was a real defect, not a hypothetical:
+
+        * `re.IGNORECASE` on the split pattern made `[A-Z]` match lowercase,
+          so the abbreviation guard blocked EVERY sentence split and the
+          clause scoping silently did nothing at all.
+        * Written `(?<![A-Z])` the guard inspected the same character
+          `(?<=[.!?])` already pins to punctuation — provably inert, and it
+          split "1:00 P.M." in half.
+        * The comma arm survived deletion with the whole suite green.
+        """
+        split = phone._callback_clauses
+        # Sentence arm.
+        self.assertEqual(
+            split("I handle the north region. Can you call me back at 4?"),
+            ["I handle the north region.", "Can you call me back at 4?"],
+        )
+        # Abbreviation guard: a capital before the period means it is not a
+        # sentence end. This is the owner's own transcript shape.
+        self.assertEqual(
+            split("Can you call me back at 1:00 P.M. I am driving."),
+            ["Can you call me back at 1:00 P.M. I am driving."],
+        )
+        # Lowercase-final abbreviations need their own guards: `(?<![A-Z]\.)`
+        # alone protects only forms whose LAST letter is uppercase, so "Dr."
+        # and "Rs." were split in half while a comment claimed otherwise.
+        self.assertEqual(
+            split("Dr. Rao was my biggest account. I'm driving."),
+            ["Dr. Rao was my biggest account.", "I'm driving."],
+        )
+        self.assertEqual(
+            split("Target was Rs. 25 lakh. I am occupied."),
+            ["Target was Rs. 25 lakh.", "I am occupied."],
+        )
+        self.assertEqual(
+            split("I work nine a.m. to six p.m. Right now I am busy."),
+            ["I work nine a.m. to six p.m. Right now I am busy."],
+        )
+        # ...and the guard must be CASE SENSITIVE, or it blocks everything.
+        self.assertGreater(
+            len(split("I am the best closer. Can you call me back later?")), 1,
+            "a lowercase letter before the period is an ordinary sentence "
+            "end — if this is one clause the split regex has IGNORECASE on "
+            "and the scoping is inert",
+        )
+        # Comma arm: discourse markers separate an answer from a request.
+        self.assertEqual(
+            split("I run demos all day, but can you call me back at 6?"),
+            # the marker stays with the clause it introduces (lookahead)
+            ["I run demos all day", "but can you call me back at 6?"],
+        )
+        # Nothing to split is not an error.
+        self.assertEqual(split("call me back later"), ["call me back later"])
+
+    def test_the_widened_trigger_still_matches_everything_the_OLD_one_did(self):
+        """A silent NARROWING is the regression nobody would be watching for.
+
+        The whole change is framed as a widening, so a phrasing the previous
+        pattern caught and this one drops would ship unnoticed — and it would
+        show up as the bot interviewing over a candidate who asked to hang up,
+        which is exactly the bug being fixed.
+
+        The pre-2026-09-15 pattern is pinned here verbatim and every string it
+        was built to accept is generated and re-checked.
+        """
+        import re as _re
+        old = _re.compile(
+            r"\b(?:call|ring)\s+me\s+(?:back\s+)?(?:later|tomorrow|another\s+time)\b|"
+            r"\b(?:can|could|would)\s+(?:you|we)\s+(?:(?:please\s+)?(?:call\s+back|reschedule)|"
+            r"(?:please\s+)?(?:book|schedule|arrange|set\s+up)\s+(?:me\s+)?"
+            r"(?:an?\s+|another\s+|the\s+)?(?:call|callback|appointment|meeting|follow[ -]?up(?:\s+call)?))\b|"
+            r"\b(?:book|schedule|arrange|set\s+up)\s+(?:me\s+)?"
+            r"(?:an?\s+|another\s+|the\s+)?(?:call|callback|appointment|meeting|follow[ -]?up(?:\s+call)?)\b|"
+            r"\b(?:i(?:'m|\s+am)\s+busy\s+(?:right\s+now|at\s+the\s+moment)|"
+            r"i\s+(?:cannot|can't)\s+talk\s+(?:right\s+now|at\s+the\s+moment)|"
+            r"this\s+is\s+not\s+a\s+good\s+time)\b",
+            _re.IGNORECASE,
+        )
+        cases = []
+        for verb in ("call", "ring"):
+            for tail in ("later", "tomorrow", "another time"):
+                cases.append(f"{verb} me {tail}")
+                cases.append(f"{verb} me back {tail}")
+        objects = ("call", "callback", "appointment", "meeting",
+                   "follow-up", "follow up", "followup", "follow-up call")
+        articles = ("", "a ", "an ", "another ", "the ")
+        bookverbs = ("book", "schedule", "arrange", "set up")
+        for modal in ("can", "could", "would"):
+            for subject in ("you", "we"):
+                for polite in ("", "please "):
+                    cases.append(f"{modal} {subject} {polite}call back")
+                    cases.append(f"{modal} {subject} {polite}reschedule")
+                    for bv in bookverbs:
+                        for art in articles:
+                            for ob in objects:
+                                cases.append(f"{modal} {subject} {polite}{bv} {art}{ob}")
+                                cases.append(f"{modal} {subject} {polite}{bv} me {art}{ob}")
+        for bv in bookverbs:
+            for art in articles:
+                for ob in objects:
+                    cases.append(f"{bv} {art}{ob}")
+                    cases.append(f"{bv} me {art}{ob}")
+        cases += [
+            "I'm busy right now", "I am busy right now",
+            "I'm busy at the moment", "I am busy at the moment",
+            "i cannot talk right now", "i can't talk right now",
+            "i cannot talk at the moment", "i can't talk at the moment",
+            "this is not a good time",
+        ]
+
+        checked = 0
+        for text in cases:
+            if not old.search(text):
+                continue
+            checked += 1
+            self.assertIsNotNone(
+                phone._CALLBACK_DEFERRAL_RE.search(text),
+                f"the widened trigger LOST a phrasing the old one caught: {text!r}",
+            )
+        # Non-vacuous: the generator must actually exercise the old pattern.
+        self.assertGreater(checked, 4000)
+
+    def test_every_trigger_branch_is_named_and_compiles(self):
+        """The pattern is a table so each branch can be reasoned about alone.
+
+        A single opaque blob is how the narrow `call me back (later|tomorrow|
+        another time)` survived unexamined. Each entry must be a (name,
+        pattern) pair that compiles on its own.
+        """
+        import re as _re
+        names = [name for name, _p in phone._CALLBACK_DEFERRAL_PATTERNS]
+        self.assertEqual(len(names), len(set(names)), "duplicate branch name")
+        veto_names = [name for name, _p in phone._CALLBACK_VETO_PATTERNS]
+        self.assertEqual(len(veto_names), len(set(veto_names)), "duplicate veto name")
+
+        # The TURN tier is a separate list with a separate scope, and it is
+        # every bit as load-bearing: it is the only thing standing between
+        # clause scoping and a candidate who QUOTES the objection they hear
+        # ("Call me back later is what I hear most"). Names must be unique
+        # across BOTH tiers, or a log line naming one is ambiguous.
+        turn_names = [name for name, _p in phone._CALLBACK_TURN_VETO_PATTERNS]
+        self.assertTrue(turn_names, "the turn-scoped veto tier must not be empty")
+        self.assertEqual(len(turn_names), len(set(turn_names)), "duplicate turn veto")
+        self.assertEqual(
+            set(turn_names) & set(veto_names), set(),
+            "a name is reused across the two veto tiers",
+        )
+        # Each turn-scoped branch must be load-bearing on its own.
+        turn_examples = {
+            "objection_vocabulary":
+                "Objection handling is the strongest part of my profile. Call me back later.",
+            "reported_speech_trailing":
+                "Call me back later is what they always ask.",
+            "quotation_frame":
+                "Every parent says the same thing. Can you call me back later.",
+        }
+        self.assertEqual(
+            sorted(turn_examples), sorted(turn_names),
+            "every turn-scoped veto needs an example proving it is needed",
+        )
+        for name, pattern in phone._CALLBACK_TURN_VETO_PATTERNS:
+            self.assertTrue(name and name.replace("_", "").isalnum(), name)
+            self.assertIsNotNone(
+                _re.search(pattern, turn_examples[name], _re.IGNORECASE),
+                f"turn veto {name!r} does not match its own example",
+            )
+            # NON-SHADOWING, same as the clause tier. A mutation showed
+            # `reported_speech_trailing`'s own motivating example was ALSO
+            # caught by `objection_vocabulary`, so the arm could be deleted
+            # with the suite green even though it is load-bearing live.
+            others = "|".join(
+                f"(?:{p})" for n, p in phone._CALLBACK_TURN_VETO_PATTERNS
+                if n != name
+            )
+            if others:
+                self.assertIsNone(
+                    _re.search(others, turn_examples[name], _re.IGNORECASE),
+                    f"turn veto {name!r} is SHADOWED by a sibling on its own "
+                    f"example, so deleting it would change nothing here",
+                )
+        # And a polite opener must NOT be swallowed by it: "excuse me" is how
+        # people interrupt, which is why the vocabulary branch takes only the
+        # PLURAL noun.
+        self.assertTrue(
+            phone.is_callback_request("excuse me, can you call me back at 1 PM?"),
+            "'excuse me' is a polite opener, not a discussion of excuses",
+        )
+
+        # EVERY branch must be load-bearing. Compiling each one proves nothing
+        # — the union already compiled at import, so a malformed branch would
+        # have raised before this test ran. What matters is that no branch is
+        # dead weight shadowed by another, because a shadowed branch is a
+        # guard nobody is maintaining.
+        requests = [
+            "call me back later",                  # call_me_back_vague
+            "call me back at 1 PM",                # call_me_back_at_time
+            "can you call me back",                # call_me_back_addressed
+            "give me a call later",                # give_me_a_call
+            "could you reschedule",                # modal_call_back_or_reschedule
+            "let's reschedule",                    # reschedule_requested
+            "can you schedule a callback",         # modal_book_object
+            "book an appointment",                 # book_object
+            "I'm kind of busy right now",          # im_busy_now
+            "I can't talk right now",              # cannot_talk_now
+            "now is not a good time",              # not_a_good_time
+            "I'm driving",                         # unavailable_state
+            "can we talk later",                   # can_we_later
+            "I have a meeting right now",           # have_conflict_now
+            "Right now I am busy",                  # now_marker_then_busy
+        ]
+        legacy_verbatim = {"modal_call_back_or_reschedule", "modal_book_object"}
+        for name, pattern in phone._CALLBACK_DEFERRAL_PATTERNS:
+            self.assertTrue(name and name.replace("_", "").isalnum(), name)
+            if name in legacy_verbatim:
+                # Kept byte-identical from the old pattern. Subsumed by a
+                # sibling, but deleting it would change legacy matching, which
+                # `test_the_widened_trigger_still_matches_everything_the_OLD_one_did`
+                # exists to prevent.
+                continue
+            others = "|".join(
+                f"(?:{p})" for n, p in phone._CALLBACK_DEFERRAL_PATTERNS if n != name
+            )
+            without = _re.compile(others, _re.IGNORECASE)
+            uniquely_needed = [
+                r for r in requests
+                if _re.search(pattern, r, _re.IGNORECASE) and not without.search(r)
+            ]
+            self.assertTrue(
+                uniquely_needed,
+                f"branch {name!r} is shadowed by the others — no request in the "
+                f"corpus needs it, so it is unmaintained dead weight",
+            )
+
     def test_generative_objective_authorization_and_compensation_slots(self):
         self.assertTrue(phone.phone_generated_reply_authorized(
             "That workflow sounds disciplined. When would you be available to start?",
@@ -12942,6 +13791,219 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
             await hooks["drive_terminal"]()
         self.assertIn("assessment.aborted", client.event_types)
 
+    async def test_a_REFUSED_time_is_explained_and_re_asked_ONCE(self):
+        """RCA 2026-09-15 — the bot promised a callback it had not booked.
+
+        The candidate said "today at 1 PM". It parsed correctly. The server
+        refused it `slot_not_yet_eligible` (a same-IST-day callback is banned —
+        it would be a second contact against one day's ledger). The worker then
+        DISCARDED that status and spoke the generic deferral — "our team will
+        reach out" — and ended the call. No appointment was written, no event
+        was posted, and the candidate had been told otherwise.
+
+        `_SCHEDULE_REFUSAL_TEXT` had carried a purpose-written line for exactly
+        this case all along; it was unreachable, because its only callers are
+        LLM tools that production strips on every turn.
+        """
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+        )
+        on_turn = hooks["on_native_turn"]
+
+        opener = "Can you schedule a call back?"
+        self.assertEqual(phone.candidate_turn_route(opener), "callback_deferral")
+        turn0 = types.SimpleNamespace(items=[])
+        await on_turn(opener, types.SimpleNamespace(text_content=opener), turn0)
+
+        # The candidate names a time the SERVER will refuse as same-day.
+        asked = "Today at 1 PM."
+        resolved = phone.parse_callback_time_ist(
+            asked, datetime(2026, 9, 15, 6, 55, tzinfo=timezone.utc),
+        )
+        self.assertIsNotNone(resolved, "the time must parse — it did live")
+        client.script_proposal(resolved, "slot_not_yet_eligible")
+
+        turn1 = types.SimpleNamespace(items=[])
+        with patch.object(phone, "parse_callback_time_ist", lambda *_a, **_k: resolved):
+            await on_turn(asked, types.SimpleNamespace(text_content=asked), turn1)
+
+        spoken = " ".join(
+            m["content"] if isinstance(m, dict) else "" for m in turn1.items
+        ).lower()
+        # It SAYS WHY, and it asks for a time it can actually accept.
+        self.assertIn("tomorrow", spoken)
+        self.assertNotIn("reach out", spoken)
+        # And it is NOT terminal — the candidate gets to answer.
+        self.assertNotEqual(getattr(agent, "_turn_policy"), "closing")
+        # Nothing was confirmed: a refusal must never look like a booking.
+        self.assertEqual(client.confirm_calls, [])
+
+        # A SECOND refusal spends the one re-ask and terminalizes. The bound
+        # stays provable: the flow cannot re-ask twice.
+        second = "Then today at 4 PM."
+        resolved2 = "2026-09-15T10:30:00Z"
+        client.script_proposal(resolved2, "slot_not_yet_eligible")
+        turn2 = types.SimpleNamespace(items=[])
+        with patch.object(phone, "parse_callback_time_ist", lambda *_a, **_k: resolved2):
+            await on_turn(second, types.SimpleNamespace(text_content=second), turn2)
+        spoken2 = " ".join(
+            m["content"] if isinstance(m, dict) else "" for m in turn2.items
+        ).lower()
+        self.assertIn("reach out", spoken2)
+        self.assertEqual(getattr(agent, "_turn_policy"), "closing")
+        self.assertEqual(client.confirm_calls, [])
+
+    async def test_an_UNACTIONABLE_refusal_does_not_re_ask(self):
+        """Re-asking is only kind when a different answer could work.
+
+        `engagement_terminal` does not get better if the candidate names
+        another time, so asking them to would be a question with no right
+        answer. Those statuses stay terminal.
+        """
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+        )
+        on_turn = hooks["on_native_turn"]
+        opener = "Can you schedule a call back?"
+        turn0 = types.SimpleNamespace(items=[])
+        await on_turn(opener, types.SimpleNamespace(text_content=opener), turn0)
+
+        resolved = "2026-09-16T07:30:00Z"
+        client.script_proposal(resolved, "engagement_terminal")
+        turn1 = types.SimpleNamespace(items=[])
+        with patch.object(phone, "parse_callback_time_ist", lambda *_a, **_k: resolved):
+            await on_turn("Tomorrow at 1 PM.",
+                          types.SimpleNamespace(text_content="Tomorrow at 1 PM."), turn1)
+        self.assertEqual(getattr(agent, "_turn_policy"), "closing")
+        self.assertEqual(client.confirm_calls, [])
+
+    def test_the_refusal_vocabulary_has_a_line_for_every_retryable_status(self):
+        """A retryable status with no written line would speak the generic
+        fallback — which is the exact bug: a refusal the candidate cannot act
+        on because nobody told them what was wrong."""
+        for status in phone._CALLBACK_RETRYABLE_REFUSALS:
+            self.assertIn(
+                status, phone._SCHEDULE_REFUSAL_TEXT,
+                f"retryable status {status!r} has no spoken line",
+            )
+            self.assertNotEqual(
+                phone.schedule_refusal_text(status),
+                phone._SCHEDULE_REFUSAL_FALLBACK,
+                f"{status!r} falls through to the generic line",
+            )
+
+    def test_every_refusal_the_SERVER_can_speak_is_classified(self):
+        """The set was checked against our own text table and nothing else.
+
+        That is circular: both halves live in `phone.py`, so they agree by
+        construction and a status the SERVER adds is invisible to both. The
+        RCA bug was exactly a server refusal nobody had classified.
+
+        This reads the propose route and asserts every refusal it can actually
+        return is a DELIBERATE decision — either retryable (the candidate can
+        fix it by naming another time) or listed below as terminal-on-purpose.
+        Adding a refusal to the route without deciding which it is fails here.
+
+        Scoped to HTTP 200 bodies on purpose. A 4xx/5xx becomes a
+        `BusinessError`/`ProviderError` in `call_with_breaker`, so `_post`
+        returns a category string and the body is NEVER parsed — `status` is
+        unset and the flow takes the transport path. That is why
+        `invalid_request` (400) and `phone_callback_proposal_error` (503) are
+        not in either set: they cannot reach the classifier at all.
+        """
+        source = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "api" / "src" / "routes" / "phone-worker.ts"
+        ).read_text(encoding="utf-8")
+        start = source.index("router.post('/callbacks/propose'")
+        end = source.index("router.post('/callbacks/confirm'", start)
+        body = source[start:end]
+
+        # `res.json(...)` only — `res.status(4xx|5xx).json(...)` is excluded by
+        # the pattern, which is the HTTP-200 scoping described above.
+        served = set(re.findall(
+            r"return\s+res\.json\(\{\s*ok:\s*false,\s*status:\s*'([a-z_]+)'",
+            body,
+        ))
+        self.assertTrue(
+            served,
+            "no 200-refusals parsed out of the propose route — the route was "
+            "restructured and this test has gone vacuous",
+        )
+
+        # Refusals a different TIME cannot fix. Each needs a reason, because
+        # putting one here is a decision to end the call on it.
+        terminal_on_purpose = {
+            # The attempt row is gone or was never ours. Re-asking cannot help,
+            # and the worker has nothing to schedule against.
+            "unknown_attempt",
+            # Another dial is live on this engagement. A callback booked now
+            # would collide with the call already in progress.
+            "attempt_in_flight",
+        }
+
+        unclassified = served - phone._CALLBACK_RETRYABLE_REFUSALS - terminal_on_purpose
+        self.assertEqual(
+            unclassified, set(),
+            f"the propose route can refuse with {sorted(unclassified)}, which "
+            f"is in neither set — so the worker speaks the generic 'our team "
+            f"will reach out' and ENDS the interview on it. Decide: retryable "
+            f"(add a line to _SCHEDULE_REFUSAL_TEXT too) or terminal (say why "
+            f"above).",
+        )
+
+        # And the converse: a retryable status the route can no longer emit is
+        # dead weight that reads as coverage the code does not have.
+        from_confirm = {"daily_attempt_exists"}
+        stale = phone._CALLBACK_RETRYABLE_REFUSALS - served - from_confirm
+        self.assertEqual(
+            stale, set(),
+            f"{sorted(stale)} is marked retryable but the propose route never "
+            f"emits it, and it is not one of the confirm-leg statuses",
+        )
+
+    def test_the_phase_ranks_make_the_flow_provably_finite(self):
+        """The re-ask is the first edge that could have created a loop.
+
+        Loop-freedom used to be a prose claim in a docstring. It is now a rank
+        the code checks, so every phase must have one and `done` must be last.
+        """
+        ranks = phone._CALLBACK_PHASE_RANK
+        # The FULL order, asserted as a strict total order. Asserting only
+        # "done is highest" and "clarify < retime" is not enough: an
+        # adversarial review showed that swapping RETIME and ALT_PICK passes
+        # both of those and then loops FOREVER, because the alternatives round
+        # and the re-ask would each be reachable from the other.
+        expected_order = [
+            phone.CALLBACK_PHASE_AWAITING_TIME,
+            phone.CALLBACK_PHASE_AWAITING_CLARIFY,
+            phone.CALLBACK_PHASE_AWAITING_RETIME,
+            phone.CALLBACK_PHASE_AWAITING_ALT_PICK,
+            phone.CALLBACK_PHASE_DONE,
+        ]
+        for phase in expected_order:
+            self.assertIn(phase, ranks)
+        self.assertEqual(
+            [ranks[p] for p in expected_order],
+            sorted(ranks[p] for p in expected_order),
+            "the phase ranks are not in the declared order — every transition "
+            "in this flow is guarded by a rank comparison, so a reordering "
+            "makes the flow re-enterable and it will never terminate",
+        )
+        self.assertEqual(
+            len({ranks[p] for p in expected_order}), len(expected_order),
+            "two phases share a rank, so a guard comparing them cannot fire",
+        )
+        self.assertEqual(
+            max(ranks.values()), ranks[phone.CALLBACK_PHASE_DONE],
+            "done must be the highest rank or the flow can leave a terminal phase",
+        )
+        # An unknown phase ranks terminal, so a corrupted state cannot loop.
+        self.assertEqual(
+            phone._callback_phase_rank("not_a_real_phase"),
+            ranks[phone.CALLBACK_PHASE_DONE],
+        )
+
     async def test_a_callback_deferral_without_a_time_asks_once_then_defers(self):
         # CHANGE 5 (this PR): in-call callback booking is a BOUNDED negotiation,
         # not the old de-looped terminal deferral. A "call me back later" with no
@@ -12990,6 +14052,180 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
              patch.object(agent_mod, "PHONE_FAREWELL_PLAYOUT_FLOOR_SEC", 0.05):
             await hooks["drive_terminal"]()
         self.assertIn("assessment.aborted", client.event_types)
+
+
+class TestTheFlowCANNOTLoop(unittest.IsolatedAsyncioTestCase):
+    """The rank guards, tested by BEHAVIOUR instead of by their lookup table.
+
+    A fifth adversarial review mutated the shipped code and ran the whole
+    705-test suite against each mutant. Five survived with everything green,
+    and two of them made the flow run FOREVER:
+
+      delete `_callback_phase_rank(entry_phase) < retime_rank_c`  -> 705 passed
+      delete `_callback_phase_rank(flow.phase) < alt_rank`        -> 705 passed
+      delete the whole AWAITING_RETIME handler                    -> 705 passed
+      move `flow.phase = DONE` back after the confirm await       -> 705 passed
+      disable the confirm-leg re-ask entirely                     -> 705 passed
+
+    `test_the_phase_ranks_make_the_flow_provably_finite` asserts only the rank
+    TABLE. The table is data; the guards are the mechanism, and the mechanism
+    was unguarded. These tests drive the real `run_callback_turn` against a
+    server that refuses forever and assert the flow still stops — which is the
+    property the whole design claims, stated as a test rather than a comment.
+    """
+
+    RESOLVED = "2026-09-05T05:30:00Z"
+    NOW = datetime(2026, 9, 2, 6, 0, tzinfo=timezone.utc)
+    TIME_TEXT = "on 2026-09-05 at 11am"
+    MAX_TURNS = 12
+
+    async def _drive(self, client, replies):
+        """Feed replies until the flow terminates; return the turns it took."""
+        flow = phone.CallbackFlowState()
+        seen = []
+        for i in range(self.MAX_TURNS):
+            text = replies[i] if i < len(replies) else replies[-1]
+            decision = await phone.run_callback_turn(
+                flow, client, _ATTEMPT_ID, text, self.NOW,
+            )
+            seen.append((flow.phase, decision.terminal))
+            if decision.terminal:
+                return seen
+        self.fail(
+            f"the flow DID NOT TERMINATE in {self.MAX_TURNS} turns — it is "
+            f"looping, and a looping flow means a live call that never ends. "
+            f"phases: {seen}"
+        )
+
+    async def test_a_server_that_always_offers_alternatives_still_ends(self):
+        """Kills: deleting the alternatives-round rank guard.
+
+        With that guard gone, every `slot_full` re-enters AWAITING_ALT_PICK and
+        the candidate is offered alternatives forever.
+        """
+        client = FakeEventClient()
+        alts = [{
+            "starts_at": self.RESOLVED, "ends_at": self.RESOLVED,
+            "weekday": "Saturday", "ist_date": "2026-09-05",
+            "ist_time": "11:00", "time_zone": "Asia/Kolkata",
+        }]
+        client.script_proposal(self.RESOLVED, "slot_full", alternatives=alts)
+        seen = await self._drive(client, [self.TIME_TEXT])
+        alt_rounds = [ph for ph, _ in seen if ph == phone.CALLBACK_PHASE_AWAITING_ALT_PICK]
+        self.assertLessEqual(
+            len(alt_rounds), 1,
+            f"the alternatives round must happen AT MOST ONCE: {seen}",
+        )
+
+    async def test_a_confirm_leg_that_always_refuses_still_ends(self):
+        """Kills: deleting the confirm-leg re-ask rank guard.
+
+        Propose accepts, confirm refuses retryably. Without the guard the
+        re-ask fires on every confirm and the flow never leaves AWAITING_RETIME.
+        """
+        client = FakeEventClient()
+        client.script_proposal(self.RESOLVED, "proposal_valid")
+        client.script_confirm(self.RESOLVED, False, "daily_attempt_exists")
+        seen = await self._drive(client, [self.TIME_TEXT])
+        retimes = [ph for ph, _ in seen if ph == phone.CALLBACK_PHASE_AWAITING_RETIME]
+        self.assertLessEqual(
+            len(retimes), 1, f"the re-ask must be spent ONCE: {seen}",
+        )
+
+    async def test_the_confirm_leg_EXPLAINS_a_refusal_it_alone_can_see(self):
+        """Kills: disabling the confirm-leg re-ask.
+
+        `confirm_candidate_voice_callback` re-validates `next_eligible_at`, the
+        per-IST-day ledger and attempt-state drift — none of which the propose
+        route reads. So a time can be accepted and then refused for a reason a
+        DIFFERENT time would fix. Discarding that status is the same defect the
+        propose leg had; nothing tested that it had been fixed on this leg, and
+        `daily_attempt_exists` is in `_CALLBACK_RETRYABLE_REFUSALS` for this
+        path and this path only.
+        """
+        client = FakeEventClient()
+        client.script_proposal(self.RESOLVED, "proposal_valid")
+        client.script_confirm(self.RESOLVED, False, "daily_attempt_exists")
+        flow = phone.CallbackFlowState()
+        decision = await phone.run_callback_turn(
+            flow, client, _ATTEMPT_ID, self.TIME_TEXT, self.NOW,
+        )
+        self.assertFalse(
+            decision.terminal,
+            "a refusal the candidate can fix by naming another day must NOT "
+            "end the call — that is the entire bug this PR exists to fix",
+        )
+        self.assertEqual(flow.phase, phone.CALLBACK_PHASE_AWAITING_RETIME)
+        self.assertEqual(
+            decision.spoken, phone.schedule_refusal_text("daily_attempt_exists"),
+            "the candidate must hear the REAL reason, not the generic deferral",
+        )
+        self.assertNotEqual(decision.spoken, phone._SCHEDULE_REFUSAL_FALLBACK)
+
+    async def test_a_THROWING_confirm_leaves_the_flow_terminal_not_reentrant(self):
+        """Kills: moving `flow.phase = DONE` back after the confirm await.
+
+        `confirm_callback` is called OUTSIDE the try that guards propose. If it
+        raises with the phase still at its entry value, the coordinator routes
+        the next turn straight back in — unbounded. Terminalizing BEFORE the
+        await is the fix, and it is invisible to every other test because the
+        real client never raises.
+        """
+        class _ThrowingConfirm(FakeEventClient):
+            async def confirm_callback(self, attempt_id, starts_at):
+                raise RuntimeError("transport died mid-handshake")
+
+        client = _ThrowingConfirm()
+        client.script_proposal(self.RESOLVED, "proposal_valid")
+        flow = phone.CallbackFlowState()
+        # The throw must NOT escape: there is no try/except anywhere up the
+        # chain, so an escaping exception kills the turn handler and the call
+        # goes silent with no goodbye — the freeze shape from PR #290.
+        decision = await phone.run_callback_turn(
+            flow, client, _ATTEMPT_ID, self.TIME_TEXT, self.NOW,
+        )
+        self.assertEqual(
+            flow.phase, phone.CALLBACK_PHASE_DONE,
+            "after a throw the flow MUST be terminal; otherwise the next "
+            "candidate turn re-enters it and the call never ends",
+        )
+        self.assertFalse(
+            decision.booked,
+            "a booking must never be claimed when the confirm never returned",
+        )
+        self.assertNotEqual(
+            decision.terminal_reason, phone.HALT_CANDIDATE_ENDED,
+            "infrastructure failing is not the candidate ending the assessment",
+        )
+
+    async def test_the_RETIME_phase_actually_proposes_the_second_time(self):
+        """Kills: deleting the AWAITING_RETIME handler entirely.
+
+        Without it the phase falls through to the default deferral, and the
+        existing test cannot tell the difference: both paths end the call. The
+        distinguishing evidence is that a SECOND proposal is actually sent.
+        """
+        second = "2026-09-06T05:30:00Z"
+        client = FakeEventClient()
+        client.script_proposal(self.RESOLVED, "slot_not_yet_eligible")
+        client.script_proposal(second, "proposal_valid")
+        client.script_confirm(second, True, "ok")
+        flow = phone.CallbackFlowState()
+        first = await phone.run_callback_turn(
+            flow, client, _ATTEMPT_ID, self.TIME_TEXT, self.NOW,
+        )
+        self.assertFalse(first.terminal)
+        self.assertEqual(flow.phase, phone.CALLBACK_PHASE_AWAITING_RETIME)
+        second_decision = await phone.run_callback_turn(
+            flow, client, _ATTEMPT_ID, "on 2026-09-06 at 11am", self.NOW,
+        )
+        self.assertEqual(
+            len(client.propose_calls), 2,
+            "the re-ask must actually PROPOSE the new time — a phase that "
+            "merely defers would send only one proposal",
+        )
+        self.assertTrue(second_decision.booked)
+        self.assertEqual(second_decision.terminal_reason, phone.HALT_CALLBACK_SCHEDULED)
 
 
 class TestBoundedCallbackBookingFlow(unittest.IsolatedAsyncioTestCase):
@@ -13132,6 +14368,33 @@ class TestPhoneManifestTunables(unittest.TestCase):
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(here, "fly.phone.toml"), "rb") as fh:
             return tomllib.load(fh)["env"]
+
+    def test_the_tts_flush_cap_is_pinned_in_the_manifest(self):
+        """This value has been moved by ear and lived in a SECRET, invisible
+        to the repo — the `[env]` line said 60 while production ran 40.
+
+        Pinning it here is what makes a future change visible in review.
+
+        A band is asserted as well as the number, but the FLOOR IS 20, not 28.
+        An earlier version of this test asserted 28 and justified it with
+        "below ~28 the back-off declines" — a measured sweep disproved that:
+        28, 30 and 32 all still crack a word on number-heavy leads, and 35 is
+        the lowest cap that broke nothing. There is no clean threshold to
+        assert, so the floor is the one value with live evidence behind it —
+        20, which the owner audibly heard break words. The sweep table lives
+        in the fly.phone.toml comment next to the value.
+        """
+        env = self._phone_env()
+        value = env.get("PHONE_TTS_FLUSH_MIN_CHARS")
+        self.assertIsNotNone(
+            value, "PHONE_TTS_FLUSH_MIN_CHARS must stay pinned in fly.phone.toml"
+        )
+        self.assertEqual(value, "30")
+        self.assertGreater(
+            int(value), 20,
+            "20 is the value the owner heard break words on a live call",
+        )
+        self.assertLessEqual(int(value), 60)
 
     def test_sarvam_frames_restored_to_18_24(self):
         # FIX 1: 9/31 finalized STT segments after ~0.29s of silence, cutting
