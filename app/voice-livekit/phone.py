@@ -4657,7 +4657,22 @@ async def _propose_and_confirm(
         # unbounded. Terminalizing first makes the flow finite even on a throw.
         entry_phase = flow.phase
         flow.phase = CALLBACK_PHASE_DONE
-        confirm = await client.confirm_callback(attempt_id, starts_at)
+        try:
+            confirm = await client.confirm_callback(attempt_id, starts_at)
+        except Exception:  # noqa: BLE001
+            # There is NO try/except anywhere up the call chain — not in
+            # `run_callback_turn`, not in the route branch, not in the turn
+            # handler. A throw here escaped the handler entirely and the call
+            # went silent with no goodbye and no terminal event: the freeze
+            # shape from PR #290. Latent today (the real client's `_post`
+            # catches everything and returns a category string), but the cost
+            # of it becoming live is an abandoned call, so it is caught here
+            # and answered with the same honest line a failed confirm gets.
+            _log.warn(
+                "unknown_event", error_type="phone_callback_confirm_failed",
+                error_category=_ERR_TRANSPORT,
+            )
+            return _confirmation_failure_decision()
         if confirm.ok and confirm.status in {"ok", "already_confirmed"}:
             return CallbackDecision(
                 _SCHEDULE_CONFIRMED_TEXT,
@@ -10948,6 +10963,15 @@ _CALLBACK_TIME_TAIL = (
     r")"
 )
 
+#: The states that mean "I cannot talk at this instant". Shared by the
+#: `unavailable_state` branch's two arms so they can never drift apart, which
+#: is how "on the road" ended up matching one arm and not the other.
+_CALLBACK_UNAVAILABLE_VERBS = (
+    r"(?:driving|in\s+a\s+meeting|on\s+another\s+call|on\s+the\s+road|"
+    r"tied\s+up|occupied|with\s+a\s+(?:customer|client|candidate|student)|"
+    r"in\s+the\s+middle\s+of\s+something)"
+)
+
 # ── "please call me back" — the request that ends the interview ────────
 #
 # RCA 2026-09-15 (session a57e6113). A candidate asked THREE times to be called
@@ -10987,14 +11011,26 @@ _CALLBACK_DEFERRAL_PATTERNS: tuple[tuple[str, str], ...] = (
         "call_me_back_vague",
         r"\b(?:call|ring|phone)\s+me\s+(?:back\s+)?"
         r"(?:later|tomorrow|another\s+time|tonight|"
-        r"this\s+(?:morning|afternoon|evening))\b",
+        r"this\s+(?:morning|afternoon|evening)|"
+        # Added after a fifth review measured 31/39 natural requests missed.
+        # These are how the request is actually phrased on the phone.
+        r"in\s+the\s+(?:morning|afternoon|evening|night)|"
+        r"in\s+(?:a|an|some)\s+(?:while|bit|hour|hours|time)|"
+        r"on\s+(?:mon|tues|wednes|thurs|fri|satur|sun)day|"
+        r"next\s+(?:week|monday|time)|"
+        r"after\s+(?:office\s+hours|some\s+time|sometime|lunch|work|a\s+while)|"
+        r"post\s+lunch|"
+        r"some\s*time\s+(?:today|tomorrow|later)|"
+        r"once\s+i\s+am\s+free|when\s+i\s+am\s+free)\b",
     ),
     # 2. THE MISS FROM THE INCIDENT: "call me back AT 1 PM", "call me after 6".
     #    A specific time is the MORE committed form of the request and was the
     #    one that fell through. Needs a real time token (see the tail above).
     (
         "call_me_back_at_time",
-        r"\b(?:call|ring|phone)\s+me\s+(?:back\s+)?" + _CALLBACK_TIME_TAIL,
+        r"\b(?:call|ring|phone)\s+me\s+(?:back\s+)?"
+        r"(?:today\s+|tomorrow\s+|tonight\s+|later\s+|again\s+)?"
+        + _CALLBACK_TIME_TAIL,
     ),
     # 3. "CAN YOU call me back", "PLEASE call me back" — addressed to us.
     #
@@ -11063,7 +11099,8 @@ _CALLBACK_DEFERRAL_PATTERNS: tuple[tuple[str, str], ...] = (
         r"\bi(?:'m|m|\s+am)\s+"
         r"(?:(?:kind\s+of|sort\s+of|a\s+bit|a\s+little|little|really|quite|"
         r"pretty|very|so|super|too|bit)\s+)?"
-        r"busy\s+(?:right\s+now|now|at\s+the\s+moment|at\s+present|currently)\b",
+        r"busy\s+(?:right\s+now|now(?!\s+and\s+then)|at\s+the\s+moment|"
+        r"at\s+present|currently)\b",
     ),
     # 10. "I can't talk right now". The NOW marker is mandatory: dropping it
     #     fired on "I can't speak Marathi", "I cannot speak for the whole
@@ -11081,8 +11118,17 @@ _CALLBACK_DEFERRAL_PATTERNS: tuple[tuple[str, str], ...] = (
     (
         "not_a_good_time",
         r"\b(?:this|that|now|it)\s+is\s*(?:not|n'?t)\s+a\s+good\s+time\b|"
-        r"\b(?:not|bad)\s+a?\s*(?:good\s+)?time\s+"
-        r"(?:right\s+now|at\s+the\s+moment|for\s+me)\b",
+        # `for me` is gone: "a bad time for me to quote exact numbers without
+        # the dashboard" is a TOPIC deflection, not a request to end the call.
+        #
+        # The two arms are split because the article matters for one and not
+        # the other. "Bad time right now" is idiomatic with no article, but
+        # `not` without one is a different sentence entirely — `not a?\s*time`
+        # matched the bare noun in "there is not time right now to cover all
+        # of it", which is a candidate apologising for a long answer.
+        r"\bbad\s+time\s+(?:right\s+now|at\s+the\s+moment)\b|"
+        r"\bnot\s+a\s+(?:good\s+)?time\s+"
+        r"(?:right\s+now|at\s+the\s+moment)\b",
     ),
     # 12. Unavailable right now. Must be UTTERANCE-FINAL or carry a now
     #     marker: "driving" is a top-tier sales résumé verb and an unanchored
@@ -11091,11 +11137,36 @@ _CALLBACK_DEFERRAL_PATTERNS: tuple[tuple[str, str], ...] = (
     (
         "unavailable_state",
         r"\bi(?:'m|m|\s+am)\s+(?:currently\s+)?"
-        r"(?:driving|in\s+a\s+meeting|on\s+another\s+call|tied\s+up|occupied)"
-        r"(?:\s+(?:right\s+now|at\s+the\s+moment))?\s*[.,;!?]*\s*$|"
+        + _CALLBACK_UNAVAILABLE_VERBS
+        + r"(?:\s+(?:right\s+now|at\s+the\s+moment))?\s*[.,;!?]*\s*$|"
         r"\bi(?:'m|m|\s+am)\s+(?:currently\s+)?"
-        r"(?:driving|in\s+a\s+meeting|on\s+another\s+call|tied\s+up|occupied)"
-        r"\s+(?:right\s+now|at\s+the\s+moment)\b",
+        + _CALLBACK_UNAVAILABLE_VERBS
+        + r"\s+(?:right\s+now|at\s+the\s+moment)\b",
+    ),
+    # 14. "I have a meeting / a client call right now." Same shape as 12 but
+    #     with `have` rather than a state verb; the NOW marker stays mandatory
+    #     so "I have a meeting every Monday" is not a request to hang up.
+    (
+        "have_conflict_now",
+        # `have got` BEFORE `have`: regex alternation is ordered, so the
+        # shorter arm would win and then fail on "got".
+        r"\bi\s+(?:have\s+got|have|got)\s+(?:an?\s+)?"
+        r"(?:meeting|call|client|customer|interview|class|session)"
+        # "a CLIENT CALL right now" — the compound noun is how people say it.
+        r"(?:\s+(?:call|meeting|session))?\s+"
+        r"(?:right\s+now|now|at\s+the\s+moment|in\s+a\s+minute)\b",
+    ),
+    # 15. LEADING now-marker: "Right now I'm busy", "At the moment I am busy."
+    #     Branch 9 only accepts the marker AFTER "busy", so this ordering —
+    #     which is the more natural one in Indian English — was missed. Same
+    #     hedge ALLOWLIST as branch 9, so the negation cannot slip through.
+    (
+        "now_marker_then_busy",
+        r"\b(?:right\s+now|at\s+the\s+moment|at\s+present|currently)\s*,?\s*"
+        r"i(?:'m|m|\s+am)\s+"
+        r"(?:(?:kind\s+of|sort\s+of|a\s+bit|a\s+little|little|really|quite|"
+        r"pretty|very|so|super|too|bit)\s+)?"
+        r"busy\b",
     ),
     # 13. "can we talk later", "can we do this later".
     (
@@ -11114,15 +11185,26 @@ _CALLBACK_DEFERRAL_PATTERNS: tuple[tuple[str, str], ...] = (
 #: cost recall: a vetoed genuine request is one repeated question, an
 #: un-vetoed answer is a terminated interview.
 _CALLBACK_VETO_PATTERNS: tuple[tuple[str, str], ...] = (
-    # "I'm NOT busy", "I am not busy right now" — a POSITIVE availability
-    # answer that the hedge wildcard read as a request to hang up.
-    ("negated_busy", r"\bnot\s+(?:\w+\s+){0,2}busy\b"),
+    # NOTE — two branches were REMOVED here after a fifth review proved them
+    # dead. `negated_busy` and `past_unavailability` guarded shapes that the
+    # trigger no longer matches at all (the hedge became an allowlist, and
+    # `unavailable_state` requires present-tense "I'm"), so deleting them
+    # flipped ZERO outcomes across a 19,643-string corpus. What they still did
+    # was suppress genuine requests — "I'm not too busy to talk, but can you
+    # call me back at 1 PM?" and "Sorry, I was driving. Please call me back at
+    # 6." were both silently dropped. Pure recall loss, no precision gain.
     # Somebody else is the actor: the candidate is describing their pipeline.
     # "Prospects call me back after a day", "most of them call me back".
     (
         "third_person_actor",
+        # The actor must be a SUBJECT, not a noun modifier. Without these
+        # lookbehinds "I have got A CLIENT CALL right now" vetoed itself:
+        # "client call" is the candidate's own meeting, not a client placing
+        # a call. A determiner in front means it is a noun phrase.
+        r"(?<!a\s)(?<!an\s)(?<!the\s)(?<!my\s)(?<!our\s)(?<!this\s)"
         r"\b(?:prospects?|parents?|clients?|customers?|leads?|students?|people|"
-        r"they|them|he|she|everyone|candidates?|recruiters?|counsell?ors?)\s+"
+        r"they|them|he|she|everyone|candidates?|recruiters?|counsell?ors?|"
+        r"founders?|employers?|managers?|bosses|hr|admissions?)\s+"
         r"(?:\w+\s+){0,2}(?:call|calls|ring|rings|phone|phones|give|gives|"
         r"say|says|said|reschedule|reschedules)\b",
     ),
@@ -11141,22 +11223,43 @@ _CALLBACK_VETO_PATTERNS: tuple[tuple[str, str], ...] = (
         r"\bmy\s+(?:job|role|work|day|process)\b|\bpart\s+of\s+my\b|"
         r"\bevery\s+(?:day|morning|evening|week|month)\b",
     ),
-    # Past-tense narration, scoped to the unavailability verbs so an ordinary
-    # past-tense answer elsewhere in a long turn does not veto a real request.
+    # PROCESS description. "After the demo we book a meeting with the decision
+    # maker" is what this job IS. `book_object` (branch 8) has no subject
+    # requirement at all, so this veto is the only thing standing between an
+    # ordinary process answer and a terminated interview.
+    #
+    # An earlier version demanded the literal subject "I". A fifth adversarial
+    # review wrote 40 natural answers to this bot's own questions and SIX ended
+    # the interview — every one of them phrased with "we" or a bare "then":
+    #   "We qualify the lead, then we schedule a call with the counsellor."
+    #   "The process is simple: connect, understand the goal, then book an
+    #    appointment."
+    # The subject list is now open, and the request shapes are excluded by
+    # lookbehind instead: "can/could/would/please book" is a REQUEST and must
+    # still reach the trigger, as must "book ME a call".
     (
-        "past_unavailability",
-        r"\b(?:was|were)\s+(?:driving|in\s+a\s+meeting|on\s+another\s+call|busy)\b",
-    ),
-    # First-person PROCESS description. "After the demo I book a meeting with
-    # the decision maker" is what this job IS; a request would carry a modal
-    # ("can you book"), a "please", or an indirect object ("book me a call").
-    # This one also retires a PRE-EXISTING false positive: the verbatim
-    # `book_object` branch has matched this shape since long before this change.
-    (
-        "first_person_booking_process",
-        r"\bi\s+(?:usually\s+|always\s+|often\s+|then\s+)?"
+        "booking_process",
+        r"(?<!can\s)(?<!could\s)(?<!would\s)(?<!please\s)(?<!shall\s)"
+        r"\b(?:i|we|they|you|our\s+team|the\s+team|the\s+counsell?or)\s+"
+        r"(?:usually\s+|always\s+|often\s+|then\s+|first\s+|also\s+)?"
         r"(?:book|schedule|arrange|set\s+up|reschedule)\s+"
         r"(?!me\b)",
+    ),
+    # The same process description with the subject elided — "connect,
+    # understand the goal, THEN book an appointment". No subject to match, so
+    # the branch above cannot see it.
+    (
+        "sequenced_booking_process",
+        r"(?:\bthen|\band|,)\s+(?:book|schedule|arrange|set\s+up)\s+"
+        r"(?:an?\s+|another\s+|the\s+)?"
+        r"(?:call|callback|appointment|meeting|follow[ -]?up)\b(?!\s+for\s+me\b)",
+    ),
+    # Tool/stack description: "we use Calendly to book a meeting". Naming the
+    # software you book with is never a request to be called back.
+    (
+        "tooling_description",
+        r"\b(?:i|we|they)\s+use\s+\w+|\b(?:via|using|through)\s+"
+        r"(?:calendly|salesforce|hubspot|zoom|outlook|the\s+crm)\b",
     ),
 )
 
@@ -11171,12 +11274,41 @@ _CALLBACK_VETO_RE = re.compile(
 )
 
 
+#: Clause boundaries. The veto and the trigger must be judged over the SAME
+#: span, and a spoken turn routinely carries an answer and a request in one
+#: breath: "I usually handle forty leads a day. Sorry, can you call me back at
+#: 1 PM?" — the answer trips `habitual`, the request is real, and a veto read
+#: over the whole turn throws the request away. That is the production
+#: incident, so it is scoped per clause instead.
+#:
+#: `(?<![A-Z])` keeps "1:00 P.M." and initials in one piece: a terminator
+#: preceded by a lone capital is an abbreviation, not a sentence end.
+_CALLBACK_CLAUSE_SPLIT_RE = re.compile(
+    r"(?<![A-Z])(?<=[.!?])\s+|\s*,\s*(?=(?:but|anyway|sorry|however|though)\b)",
+    re.IGNORECASE,
+)
+
+
+def _callback_clauses(clean: str) -> list[str]:
+    """Split a turn into the spans the gate judges independently."""
+    parts = [p.strip() for p in _CALLBACK_CLAUSE_SPLIT_RE.split(clean)]
+    return [p for p in parts if p] or [clean]
+
+
 def callback_request_match(text: Any) -> str | None:
     """Return the NAME of the branch that heard a callback request, or None.
 
-    Trigger THEN veto. The veto is what separates a request from a Sales
-    Program Advisor describing the callbacks they make for a living, and it is
-    the half that keeps a widened trigger from hanging up on an answer.
+    Trigger THEN veto, PER CLAUSE. The veto is what separates a request from a
+    Sales Program Advisor describing the callbacks they make for a living, and
+    it is the half that keeps a widened trigger from hanging up on an answer.
+
+    Judged per clause because the two halves have different natural scopes. A
+    trigger is local — it is a phrase. A veto is about FRAMING, and framing
+    belongs to the clause it sits in, not to the whole turn. Reading the veto
+    over the turn made the gate strictly worse than no veto at all for anyone
+    whose speech habit includes "my job is…" or "I usually…": every request
+    they ever made was dropped, deterministically, which is exactly the three
+    consecutive misses the incident recorded.
 
     The name exists so a misfire is ATTRIBUTABLE. This gate ENDS the interview
     when it fires, and the only evidence on the previous production incident
@@ -11192,18 +11324,20 @@ def callback_request_match(text: Any) -> str | None:
     clean = str(text or "").strip()
     if not clean:
         return None
-    if _CALLBACK_VETO_RE.search(clean):
-        return None
-    if not _CALLBACK_DEFERRAL_RE.search(clean):
-        return None
-    for name, pattern in _CALLBACK_DEFERRAL_PATTERNS:
-        if re.search(pattern, clean, re.IGNORECASE):
-            return name
-    # The combined pattern matched but no single branch did. Structurally
-    # impossible (the combined pattern IS the alternation of these branches),
-    # but returning a name rather than None keeps the caller's contract:
-    # a request was heard, and the flow must still own the turn.
-    return "unattributed"
+    for clause in _callback_clauses(clean):
+        if _CALLBACK_VETO_RE.search(clause):
+            continue
+        if not _CALLBACK_DEFERRAL_RE.search(clause):
+            continue
+        for name, pattern in _CALLBACK_DEFERRAL_PATTERNS:
+            if re.search(pattern, clause, re.IGNORECASE):
+                return name
+        # The combined pattern matched but no single branch did. Structurally
+        # impossible (the combined pattern IS the alternation of these
+        # branches), but returning a name rather than None keeps the caller's
+        # contract: a request was heard, and the flow must still own the turn.
+        return "unattributed"
+    return None
 
 
 def is_callback_request(text: Any) -> bool:

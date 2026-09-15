@@ -206,9 +206,26 @@ primary_region = "sin"
   # head before the last space carries fewer than `_TTS_FIRST_FRAGMENT_MIN_CHARS`
   # (14) alphabetic characters — deliberately, to avoid a tiny choppy
   # synthesis. So the cap cuts mid-word exactly when the lead is short on
-  # LETTERS. A sweep over realistic replies puts the decline rate at zero from
-  # 28 upward, which is why 20 audibly broke words and 40 did not — and it puts
-  # 30 at the FIRST clean value, with no margin.
+  # LETTERS.
+  #
+  # An earlier draft of this comment claimed "the decline rate is zero from 28
+  # upward" and that 30 was "the FIRST clean value". BOTH ARE FALSE — an
+  # adversarial review transcribed the live first-fragment logic and swept a
+  # corpus of realistic bot turns:
+  #
+  #     cap   turns that hit the cap   of those, cracked a word
+  #      20            12                        6
+  #      28             9                        1
+  #      30             8                        1   <- SHIPPED
+  #      32             7                        1
+  #      35             5                        0   <- lowest clean value
+  #      40             3                        0   <- the value replaced
+  #
+  # So 30 is one step better than 40 on latency and one step short of safe.
+  # 35 is the lowest cap that broke nothing on that corpus while still firing
+  # earlier than 40. 30 is shipped because the owner chose it explicitly after
+  # being told the risk was measured and real; if a cracked word is heard on
+  # the next call, "35" is the better first move and "40" is the full revert.
   #
   # The margin is spent by digits, and this bot asks about compensation on
   # every call. Reproduced at 30, clean at 40:

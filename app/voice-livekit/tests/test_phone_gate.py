@@ -4793,6 +4793,48 @@ class TestNativePhoneArchitecture(unittest.TestCase):
             "sorry im kind of busy right now please call me back",
             "uh i am driving can we talk later",
             "yeah give me a call after six",
+            # ── ADDED after a FIFTH review measured 31 of 39 natural requests
+            #    missed. The first group is the worst of them: the branch
+            #    built FOR the incident did not match the incident's own
+            #    phrasing, because a day word between "back" and the time
+            #    blocked the time tail.
+            "call me back today at 1 PM",
+            "call me back today at 1:00 PM please",
+            "yeah call me back today at one",
+            "call me back tomorrow at 11",
+            # "later" has many more forms than the four that were listed
+            "call me back in the evening",
+            "call me back in the afternoon",
+            "call me back on Monday",
+            "call me back next week",
+            "call me back after office hours",
+            "call me back after some time",
+            "call me back in a while",
+            "call me back post lunch",
+            # unavailability states the branch did not name
+            "I'm on the road right now",
+            "I'm with a customer right now",
+            "I am in the middle of something right now",
+            # `have` rather than a state verb
+            "I have a meeting right now",
+            "I have got a client call right now",
+            # the now-marker FIRST, which is the more natural Indian-English
+            # ordering and matched nothing
+            "Right now I am busy",
+            "at the moment I'm a bit busy",
+            # ── THE TURN-SCOPING REGRESSION. An answer and a request in one
+            #    breath is the shape of the incident utterance ("By the way,
+            #    can you call me back today at 1:00 PM?" came after an
+            #    answer). A veto read over the WHOLE turn threw every one of
+            #    these away — deterministically, for any candidate whose
+            #    speech habit includes "my job is" or "I usually".
+            "I usually handle about forty leads a day. Sorry, can you call me back at 1 PM?",
+            "My job is inside sales for the north region. Can you call me back later please?",
+            "My day starts at 9. Can you please call me back after 6?",
+            "They say I am the best closer. Can you call me back later?",
+            "I was in a meeting earlier. Can you call me back at 4?",
+            "I'm not too busy to talk, but can you call me back at 1 PM?",
+            "Sorry, I was driving. Please call me back at 6.",
         ]:
             self.assertEqual(
                 phone.candidate_turn_route(text), "callback_deferral",
@@ -4902,6 +4944,29 @@ class TestNativePhoneArchitecture(unittest.TestCase):
                 "I set up appointments with prospects every week.",
                 "I arrange meetings between the prospect and the counsellor.",
                 "I track every callback and follow-up in the pipeline.",
+                # ── EVERY ENTRY ABOVE USES THE SUBJECT "I". That is why this
+                #    group proved nothing: the veto guarding it demanded a
+                #    literal "I" too, so the test and the bug shared the same
+                #    blind spot. A fifth review wrote 40 natural answers to
+                #    this bot's own questions and SIX ended the interview —
+                #    all six phrased with "we", a bare "then", or a tool name.
+                #    Keep at least one of each shape here forever.
+                "We qualify the lead, then we schedule a call with the senior counsellor.",
+                "I own the mid funnel, so once marketing passes the lead we arrange a call.",
+                "First I qualify on budget and intent, then we set up a call with the expert.",
+                "After the first conversation we schedule a follow-up call within two days.",
+                "The process is simple: connect, understand the goal, then book an appointment.",
+                "Salesforce mainly, and we use Calendly to book a meeting with the counsellor.",
+                "Our team schedules a callback whenever the parent asks for one.",
+                "They schedule the meeting and I just run the demo.",
+            ],
+            "topic_deflection": [
+                # These carry the WORDS of a deferral while deflecting a
+                # QUESTION. All four fired before the fifth review.
+                "It is a bad time for me to quote exact numbers without the dashboard.",
+                "There is not time right now to cover all of it, but briefly...",
+                "I am busy now and then with escalations.",
+                "Founders call me after six sometimes.",
             ],
             "past_tense": [
                 "I was driving to a client meeting when they called.",
@@ -5025,22 +5090,67 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         strings DO match the trigger and MUST still be rejected overall. If
         someone removes the veto, the trigger tests keep passing and only this
         one fails — which is the point.
+
+        ONE STRING PER BRANCH, and each must be UNIQUELY needed. A fifth
+        adversarial review deleted veto branches one at a time and ran the
+        whole suite: `hypothetical_or_quoted` and `habitual` both survived,
+        because every string meant to exercise them was *also* caught by a
+        sibling. Overlapping guards make a corpus look thorough while testing
+        nothing — the same review measured 86% of the strings in the big
+        negative corpus as vacuous. Asserting uniqueness is what stops that.
         """
-        for text in [
-            "When a parent says now is not a good time, I ask when is better.",
-            "My job is to schedule the call with the counsellor.",
-            "I leave a voicemail and most of them call me back later.",
-            "After the demo I book a meeting with the decision maker.",
-            "If a client says now is not a good time, I ask for a better slot.",
-        ]:
+        import re as _re
+
+        # branch name -> a sales answer that ONLY that branch rejects
+        per_branch = {
+            "third_person_actor":
+                "I leave a voicemail and most of them call me back later.",
+            "hypothetical_or_quoted":
+                "Clients typically set up a callback when they are free.",
+            "habitual":
+                "I typically book a meeting with the counsellor after the demo.",
+            "job_description":
+                "My job is to schedule the call with the counsellor.",
+            "booking_process":
+                "We qualify the lead, then we schedule a call with the senior counsellor.",
+            "sequenced_booking_process":
+                "The process is simple: connect, understand the goal, then book an appointment.",
+            "tooling_description":
+                "Salesforce mainly, and we use Calendly to book a meeting with the counsellor.",
+        }
+        declared = [name for name, _ in phone._CALLBACK_VETO_PATTERNS]
+        self.assertEqual(
+            sorted(per_branch), sorted(declared),
+            "every veto branch needs its own uniquely-needed example here; a "
+            "branch with no example is a guard nothing tests",
+        )
+
+        by_name = dict(phone._CALLBACK_VETO_PATTERNS)
+        for name, text in per_branch.items():
             self.assertIsNotNone(
                 phone._CALLBACK_DEFERRAL_RE.search(text),
-                f"this string is supposed to exercise the VETO, but the "
-                f"trigger no longer matches it — the test has gone vacuous: {text!r}",
+                f"[{name}] this string is supposed to exercise the VETO, but "
+                f"the trigger no longer matches it — vacuous: {text!r}",
             )
             self.assertFalse(
                 phone.is_callback_request(text),
-                f"the veto failed to reject: {text!r}",
+                f"[{name}] the veto failed to reject: {text!r}",
+            )
+            # UNIQUENESS: with this one branch removed, the string must slip
+            # through. That is what proves the branch — not its siblings — is
+            # doing the work.
+            others = "|".join(
+                f"(?:{p})" for n, p in phone._CALLBACK_VETO_PATTERNS if n != name
+            )
+            self.assertIsNone(
+                _re.search(others, text, _re.IGNORECASE),
+                f"[{name}] is SHADOWED: {text!r} is already rejected by another "
+                f"branch, so deleting {name!r} would change nothing and this "
+                f"assertion proves nothing",
+            )
+            self.assertIsNotNone(
+                _re.search(by_name[name], text, _re.IGNORECASE),
+                f"[{name}] does not actually match its own example: {text!r}",
             )
 
     def test_the_widened_trigger_still_matches_everything_the_OLD_one_did(self):
@@ -5143,6 +5253,8 @@ class TestNativePhoneArchitecture(unittest.TestCase):
             "now is not a good time",              # not_a_good_time
             "I'm driving",                         # unavailable_state
             "can we talk later",                   # can_we_later
+            "I have a meeting right now",           # have_conflict_now
+            "Right now I am busy",                  # now_marker_then_busy
         ]
         legacy_verbatim = {"modal_call_back_or_reschedule", "modal_book_object"}
         for name, pattern in phone._CALLBACK_DEFERRAL_PATTERNS:
@@ -13658,6 +13770,180 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
         self.assertIn("assessment.aborted", client.event_types)
 
 
+class TestTheFlowCANNOTLoop(unittest.IsolatedAsyncioTestCase):
+    """The rank guards, tested by BEHAVIOUR instead of by their lookup table.
+
+    A fifth adversarial review mutated the shipped code and ran the whole
+    705-test suite against each mutant. Five survived with everything green,
+    and two of them made the flow run FOREVER:
+
+      delete `_callback_phase_rank(entry_phase) < retime_rank_c`  -> 705 passed
+      delete `_callback_phase_rank(flow.phase) < alt_rank`        -> 705 passed
+      delete the whole AWAITING_RETIME handler                    -> 705 passed
+      move `flow.phase = DONE` back after the confirm await       -> 705 passed
+      disable the confirm-leg re-ask entirely                     -> 705 passed
+
+    `test_the_phase_ranks_make_the_flow_provably_finite` asserts only the rank
+    TABLE. The table is data; the guards are the mechanism, and the mechanism
+    was unguarded. These tests drive the real `run_callback_turn` against a
+    server that refuses forever and assert the flow still stops — which is the
+    property the whole design claims, stated as a test rather than a comment.
+    """
+
+    RESOLVED = "2026-09-05T05:30:00Z"
+    NOW = datetime(2026, 9, 2, 6, 0, tzinfo=timezone.utc)
+    TIME_TEXT = "on 2026-09-05 at 11am"
+    MAX_TURNS = 12
+
+    async def _drive(self, client, replies):
+        """Feed replies until the flow terminates; return the turns it took."""
+        flow = phone.CallbackFlowState()
+        seen = []
+        for i in range(self.MAX_TURNS):
+            text = replies[i] if i < len(replies) else replies[-1]
+            decision = await phone.run_callback_turn(
+                flow, client, _ATTEMPT_ID, text, self.NOW,
+            )
+            seen.append((flow.phase, decision.terminal))
+            if decision.terminal:
+                return seen
+        self.fail(
+            f"the flow DID NOT TERMINATE in {self.MAX_TURNS} turns — it is "
+            f"looping, and a looping flow means a live call that never ends. "
+            f"phases: {seen}"
+        )
+
+    async def test_a_server_that_always_offers_alternatives_still_ends(self):
+        """Kills: deleting the alternatives-round rank guard.
+
+        With that guard gone, every `slot_full` re-enters AWAITING_ALT_PICK and
+        the candidate is offered alternatives forever.
+        """
+        client = FakeEventClient()
+        alts = [{
+            "starts_at": self.RESOLVED, "ends_at": self.RESOLVED,
+            "weekday": "Saturday", "ist_date": "2026-09-05",
+            "ist_time": "11:00", "time_zone": "Asia/Kolkata",
+        }]
+        client.script_proposal(self.RESOLVED, "slot_full", alternatives=alts)
+        seen = await self._drive(client, [self.TIME_TEXT])
+        alt_rounds = [ph for ph, _ in seen if ph == phone.CALLBACK_PHASE_AWAITING_ALT_PICK]
+        self.assertLessEqual(
+            len(alt_rounds), 1,
+            f"the alternatives round must happen AT MOST ONCE: {seen}",
+        )
+
+    async def test_a_confirm_leg_that_always_refuses_still_ends(self):
+        """Kills: deleting the confirm-leg re-ask rank guard.
+
+        Propose accepts, confirm refuses retryably. Without the guard the
+        re-ask fires on every confirm and the flow never leaves AWAITING_RETIME.
+        """
+        client = FakeEventClient()
+        client.script_proposal(self.RESOLVED, "proposal_valid")
+        client.script_confirm(self.RESOLVED, False, "daily_attempt_exists")
+        seen = await self._drive(client, [self.TIME_TEXT])
+        retimes = [ph for ph, _ in seen if ph == phone.CALLBACK_PHASE_AWAITING_RETIME]
+        self.assertLessEqual(
+            len(retimes), 1, f"the re-ask must be spent ONCE: {seen}",
+        )
+
+    async def test_the_confirm_leg_EXPLAINS_a_refusal_it_alone_can_see(self):
+        """Kills: disabling the confirm-leg re-ask.
+
+        `confirm_candidate_voice_callback` re-validates `next_eligible_at`, the
+        per-IST-day ledger and attempt-state drift — none of which the propose
+        route reads. So a time can be accepted and then refused for a reason a
+        DIFFERENT time would fix. Discarding that status is the same defect the
+        propose leg had; nothing tested that it had been fixed on this leg, and
+        `daily_attempt_exists` is in `_CALLBACK_RETRYABLE_REFUSALS` for this
+        path and this path only.
+        """
+        client = FakeEventClient()
+        client.script_proposal(self.RESOLVED, "proposal_valid")
+        client.script_confirm(self.RESOLVED, False, "daily_attempt_exists")
+        flow = phone.CallbackFlowState()
+        decision = await phone.run_callback_turn(
+            flow, client, _ATTEMPT_ID, self.TIME_TEXT, self.NOW,
+        )
+        self.assertFalse(
+            decision.terminal,
+            "a refusal the candidate can fix by naming another day must NOT "
+            "end the call — that is the entire bug this PR exists to fix",
+        )
+        self.assertEqual(flow.phase, phone.CALLBACK_PHASE_AWAITING_RETIME)
+        self.assertEqual(
+            decision.spoken, phone.schedule_refusal_text("daily_attempt_exists"),
+            "the candidate must hear the REAL reason, not the generic deferral",
+        )
+        self.assertNotEqual(decision.spoken, phone._SCHEDULE_REFUSAL_FALLBACK)
+
+    async def test_a_THROWING_confirm_leaves_the_flow_terminal_not_reentrant(self):
+        """Kills: moving `flow.phase = DONE` back after the confirm await.
+
+        `confirm_callback` is called OUTSIDE the try that guards propose. If it
+        raises with the phase still at its entry value, the coordinator routes
+        the next turn straight back in — unbounded. Terminalizing BEFORE the
+        await is the fix, and it is invisible to every other test because the
+        real client never raises.
+        """
+        class _ThrowingConfirm(FakeEventClient):
+            async def confirm_callback(self, attempt_id, starts_at):
+                raise RuntimeError("transport died mid-handshake")
+
+        client = _ThrowingConfirm()
+        client.script_proposal(self.RESOLVED, "proposal_valid")
+        flow = phone.CallbackFlowState()
+        # The throw must NOT escape: there is no try/except anywhere up the
+        # chain, so an escaping exception kills the turn handler and the call
+        # goes silent with no goodbye — the freeze shape from PR #290.
+        decision = await phone.run_callback_turn(
+            flow, client, _ATTEMPT_ID, self.TIME_TEXT, self.NOW,
+        )
+        self.assertEqual(
+            flow.phase, phone.CALLBACK_PHASE_DONE,
+            "after a throw the flow MUST be terminal; otherwise the next "
+            "candidate turn re-enters it and the call never ends",
+        )
+        self.assertFalse(
+            decision.booked,
+            "a booking must never be claimed when the confirm never returned",
+        )
+        self.assertNotEqual(
+            decision.terminal_reason, phone.HALT_CANDIDATE_ENDED,
+            "infrastructure failing is not the candidate ending the assessment",
+        )
+
+    async def test_the_RETIME_phase_actually_proposes_the_second_time(self):
+        """Kills: deleting the AWAITING_RETIME handler entirely.
+
+        Without it the phase falls through to the default deferral, and the
+        existing test cannot tell the difference: both paths end the call. The
+        distinguishing evidence is that a SECOND proposal is actually sent.
+        """
+        second = "2026-09-06T05:30:00Z"
+        client = FakeEventClient()
+        client.script_proposal(self.RESOLVED, "slot_not_yet_eligible")
+        client.script_proposal(second, "proposal_valid")
+        client.script_confirm(second, True, "ok")
+        flow = phone.CallbackFlowState()
+        first = await phone.run_callback_turn(
+            flow, client, _ATTEMPT_ID, self.TIME_TEXT, self.NOW,
+        )
+        self.assertFalse(first.terminal)
+        self.assertEqual(flow.phase, phone.CALLBACK_PHASE_AWAITING_RETIME)
+        second_decision = await phone.run_callback_turn(
+            flow, client, _ATTEMPT_ID, "on 2026-09-06 at 11am", self.NOW,
+        )
+        self.assertEqual(
+            len(client.propose_calls), 2,
+            "the re-ask must actually PROPOSE the new time — a phase that "
+            "merely defers would send only one proposal",
+        )
+        self.assertTrue(second_decision.booked)
+        self.assertEqual(second_decision.terminal_reason, phone.HALT_CALLBACK_SCHEDULED)
+
+
 class TestBoundedCallbackBookingFlow(unittest.IsolatedAsyncioTestCase):
     """The bounded in-call callback negotiation, driven through the REAL hook.
 
@@ -13803,11 +14089,16 @@ class TestPhoneManifestTunables(unittest.TestCase):
         """This value has been moved by ear and lived in a SECRET, invisible
         to the repo — the `[env]` line said 60 while production ran 40.
 
-        Pinning it here is what makes a future change visible in review. The
-        band is asserted rather than just the number: below ~28 the
-        word-boundary back-off starts declining and the cap cuts mid-word
-        (the owner heard exactly that at 20), and 0 is a DISABLE sentinel that
-        silently reverts to waiting for a whole first sentence.
+        Pinning it here is what makes a future change visible in review.
+
+        A band is asserted as well as the number, but the FLOOR IS 20, not 28.
+        An earlier version of this test asserted 28 and justified it with
+        "below ~28 the back-off declines" — a measured sweep disproved that:
+        28, 30 and 32 all still crack a word on number-heavy leads, and 35 is
+        the lowest cap that broke nothing. There is no clean threshold to
+        assert, so the floor is the one value with live evidence behind it —
+        20, which the owner audibly heard break words. The sweep table lives
+        in the fly.phone.toml comment next to the value.
         """
         env = self._phone_env()
         value = env.get("PHONE_TTS_FLUSH_MIN_CHARS")
@@ -13815,10 +14106,9 @@ class TestPhoneManifestTunables(unittest.TestCase):
             value, "PHONE_TTS_FLUSH_MIN_CHARS must stay pinned in fly.phone.toml"
         )
         self.assertEqual(value, "30")
-        self.assertGreaterEqual(
-            int(value), 28,
-            "below ~28 the back-off declines and the first fragment cuts "
-            "mid-word — the regime the owner heard at 20",
+        self.assertGreater(
+            int(value), 20,
+            "20 is the value the owner heard break words on a live call",
         )
         self.assertLessEqual(int(value), 60)
 

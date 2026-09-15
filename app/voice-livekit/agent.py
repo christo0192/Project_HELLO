@@ -3988,7 +3988,7 @@ async def _run_native_phone_screening(
         # flow owns subsequent candidate turns.
         if (
             closing.state in {ClosingState.CANDIDATE_QNA, ClosingState.CLOSING_PENDING}
-            and phone.candidate_turn_route(text) == "callback_deferral"
+            and route == "callback_deferral"
         ):
             closing.cancel_for_callback()
             pending_terminal_reason["value"] = None
