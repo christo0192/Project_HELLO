@@ -5016,6 +5016,23 @@ class TestNativePhoneArchitecture(unittest.TestCase):
                 "Every day it is the same. Call me back next week. I just re-dial.",
                 "I always confirm before 5 p.m. Call me back later, that is their line.",
             ],
+            "reporting_then_quoting": [
+                # "I get THAT a lot" + the quote. The veto arm covering this
+                # was deleted once with the justification that it vetoed "I
+                # get a lot of inbound" — which it never matched, because the
+                # object is mandatory. Removing a veto can only ADD false
+                # positives, and these five were the result.
+                "I get that a lot. Call me back later.",
+                "I hear this all the time. Call me back later.",
+                "I hear all of them. I'm busy right now.",
+                "I get that every single day. Call me back tomorrow.",
+                "I hear every one of them. Now is not a good time.",
+                # ...while an ordinary answer with the same verb is NOT
+                # vetoed, which is what the deleted arm was wrongly accused of.
+                "Their standard brush-off, call me back at 4 pm.",
+                "The most common objection I get is can we talk later.",
+                "I have to reschedule about five demos a week because parents forget.",
+            ],
             "quoting_the_objection": [
                 # THE HOLE CLAUSE SCOPING OPENED. Judging each clause on its
                 # own is what stopped the gate throwing away a request made in
@@ -5221,6 +5238,58 @@ class TestNativePhoneArchitecture(unittest.TestCase):
                 f"[{name}] does not actually match its own example: {text!r}",
             )
 
+    def test_a_QUOTED_request_never_ends_the_interview(self):
+        """Every framing veto x every directed branch. 28/28 used to fire.
+
+        "How do you handle objections?" is a GUARANTEED question for a Sales
+        Program Advisor, and the answer quotes the objection. When directed
+        branches were given a reduced veto set — on the theory that a process
+        description cannot reframe an addressed request — `objection_
+        vocabulary`, `habitual`, `job_description`, `booking_process` and
+        `tooling_description` all went dead for them, and every one of these
+        ended the interview.
+
+        The matrix shape matters: the bug was not in any single branch, it was
+        in the INTERACTION between the veto set and the branch tier, so only a
+        product of the two could find it.
+        """
+        frames = [
+            "The most common objection is",     # objection_vocabulary
+            "I usually hear",                   # habitual
+            "My job is getting past",           # job_description
+            "We use a script for",              # tooling_description
+            "Every day I hear",                 # job_description
+            "Every parent says the same thing.",  # quotation_frame (same-thing arm)
+            # TWO clauses on purpose: the clause veto reaches clause 1 only,
+            # so only the TURN-wide quotation frame can stop clause 2.
+            "Every client says that.",            # quotation_frame (every-X-says arm)
+            "Their standard line is this.",       # quotation_frame (standard-line arm)
+        ]
+        quotes = [
+            "can you call me back later",       # call_me_back_addressed
+            "can you call me back at 4",        # call_me_back_at_time
+            "give me a call later",             # give_me_a_call
+            "could you reschedule",             # modal_call_back_or_reschedule
+            "can you schedule a callback",      # modal_book_object
+            "can we talk later",                # can_we_later
+            "let's reschedule",                 # reschedule_requested
+        ]
+        # Sanity: the quotes must be real requests on their own, or the
+        # matrix below proves nothing.
+        for q in quotes:
+            self.assertEqual(
+                phone.candidate_turn_route(q), "callback_deferral",
+                f"this must be a genuine request for the matrix to mean "
+                f"anything: {q!r}",
+            )
+        for frame in frames:
+            for quote in quotes:
+                text = f"{frame} {quote}."
+                self.assertNotEqual(
+                    phone.candidate_turn_route(text), "callback_deferral",
+                    f"a QUOTED objection ended the interview: {text!r}",
+                )
+
     def test_a_request_heard_beside_an_ANSWER_is_always_a_DIRECTED_branch(self):
         """The invariant that licenses ignoring the surrounding turn.
 
@@ -5233,13 +5302,20 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         If one of these ever reports an undirected branch, the gate has
         started ignoring framing for phrases that depend on it, and the 20
         false positives a sixth review measured are back.
+
+        DELIBERATELY ABSENT: "I handle objections all day. Sorry, can you call
+        me back at 1 PM?" and "I use Outlook, can you call me back at 6?".
+        Both are genuine requests and both are now MISSED, because
+        meta-discourse is turn-scoped and a process description vetoes its own
+        clause. That is the accepted price of
+        `test_a_QUOTED_request_never_ends_the_interview`: a miss costs one
+        repeated question, and the 35 combinations it guards each cost an
+        interview.
         """
         for text in [
             "I'm driving. Can you call me back at 4?",
             "My job is inside sales. Can you call me back later please?",
             "I usually handle forty leads. Sorry, can you call me back at 1 PM?",
-            "I handle objections all day. Sorry, can you call me back at 1 PM?",
-            "I use Outlook, can you call me back at 6?",
             "They say I am the best closer. Can you call me back later?",
         ]:
             name = phone.callback_request_match(text)
@@ -5276,6 +5352,21 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         self.assertEqual(
             split("Can you call me back at 1:00 P.M. I am driving."),
             ["Can you call me back at 1:00 P.M. I am driving."],
+        )
+        # Lowercase-final abbreviations need their own guards: `(?<![A-Z]\.)`
+        # alone protects only forms whose LAST letter is uppercase, so "Dr."
+        # and "Rs." were split in half while a comment claimed otherwise.
+        self.assertEqual(
+            split("Dr. Rao was my biggest account. I'm driving."),
+            ["Dr. Rao was my biggest account.", "I'm driving."],
+        )
+        self.assertEqual(
+            split("Target was Rs. 25 lakh. I am occupied."),
+            ["Target was Rs. 25 lakh.", "I am occupied."],
+        )
+        self.assertEqual(
+            split("I work nine a.m. to six p.m. Right now I am busy."),
+            ["I work nine a.m. to six p.m. Right now I am busy."],
         )
         # ...and the guard must be CASE SENSITIVE, or it blocks everything.
         self.assertGreater(
@@ -5392,6 +5483,8 @@ class TestNativePhoneArchitecture(unittest.TestCase):
                 "Objection handling is the strongest part of my profile. Call me back later.",
             "reported_speech_trailing":
                 "Call me back later is what they always ask.",
+            "quotation_frame":
+                "Every parent says the same thing. Can you call me back later.",
         }
         self.assertEqual(
             sorted(turn_examples), sorted(turn_names),

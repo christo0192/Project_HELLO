@@ -11068,9 +11068,15 @@ _CALLBACK_DEFERRAL_PATTERNS: tuple[tuple[str, str], ...] = (
         # NO modal arm: `modal_call_back_or_reschedule` above already owns
         # "can/could/would you reschedule". Duplicating it here made that
         # branch dead weight, which the shadow check in the suite now rejects.
-        r"\b(?:let'?s\s+reschedule|"
-        r"i\s+(?:want|need|would\s+like|have)\s+to\s+reschedule|"
-        r"shall\s+we\s+reschedule)\b",
+        r"\b(?:let'?s\s+reschedule|shall\s+we\s+reschedule)\b|"
+        # The first-person arm needs an OBJECT that is THIS call, or none at
+        # all. Bare `i have to reschedule` matched "I have to reschedule about
+        # five demos a week because parents forget" — a workload answer — and
+        # this branch is filed as an ADDRESSED request, so nothing else would
+        # have caught it.
+        r"\bi\s+(?:want|need|would\s+like|have)\s+to\s+reschedule"
+        r"(?:\s+(?:this|it|that|the\s+call|our\s+call|the\s+interview|"
+        r"this\s+call|this\s+interview))?\s*[.,;!?]*\s*$",
     ),
     # 7. + 8. The original book/schedule/arrange/set-up branches, verbatim.
     (
@@ -11297,6 +11303,23 @@ _CALLBACK_TURN_VETO_PATTERNS: tuple[tuple[str, str], ...] = (
     # Naming the thing being described. `excuses` is PLURAL on purpose —
     # "excuse me, can you call me back?" is a real request.
     ("objection_vocabulary", r"\b(?:objections?|brush[-\s]?offs?|excuses)\b"),
+    # EXPLICIT QUOTE INTRODUCERS. These announce that what follows is somebody
+    # else's words, which is why they are turn-scoped: the quote lands in the
+    # NEXT clause, where a directed phrasing would otherwise be heard as a
+    # real request — "Every parent says the same thing. Can you call me back
+    # later." was the surviving case after the veto tiers were repaired.
+    #
+    # Deliberately narrow. A candidate describing themselves ("They say I am
+    # the best closer. Can you call me back later?") uses none of these, and
+    # that request must still be heard.
+    (
+        "quotation_frame",
+        r"\bsays?\s+the\s+same\s+(?:thing|line)\b|"
+        r"\b(?:their|the)\s+(?:standard|usual|typical|common)\s+"
+        r"(?:line|reply|response|answer|one)\b|"
+        r"\bevery\s+(?:parent|client|prospect|customer|lead|student|one)\s+"
+        r"(?:\w+\s+)?says?\b",
+    ),
     # Post-posed reporting: the deferral phrase is the SUBJECT of the sentence
     # rather than the thing being asked. `hypothetical_or_quoted` only catches
     # the reporting verb BEFORE the quote ("they say now is not...").
@@ -11308,11 +11331,17 @@ _CALLBACK_TURN_VETO_PATTERNS: tuple[tuple[str, str], ...] = (
         r"students?|everyone|most\s+of\s+them)\s+(?:tell|tells|told)\s+"
         r"(?:me|us)\b|"
         # "is what THEY always ask" — the trailing report with a third-person
-        # subject. An `i (hear|get) (a lot|every|...)` arm used to live here
-        # and vetoed ordinary answers like "I get a lot of inbound"; its one
-        # motivating case is already caught by the `is the usual` arm.
+        # subject.
         r"\bis\s+what\s+(?:they|people|everyone|most)\s+"
-        r"(?:\w+\s+)?(?:ask|asks|say|says|want)\b",
+        r"(?:\w+\s+)?(?:ask|asks|say|says|want)\b|"
+        # "I get THAT a lot", "I hear THIS all the time" — the candidate
+        # reporting what is said TO them, then quoting it. This arm was
+        # deleted once on the grounds that it vetoed "I get a lot of inbound";
+        # that was wrong twice over — the object is mandatory, so that string
+        # never matched it, and removing a veto can only ever ADD false
+        # positives. It was restored after five of its cases were shown
+        # ending interviews.
+        r"\bi\s+(?:hear|get)\s+(?:every|all|a\s+lot|that|this)\b",
     ),
 )
 
@@ -11357,54 +11386,52 @@ _CALLBACK_DIRECTED_BRANCHES: frozenset[str] = frozenset({
     "can_we_later",
 })
 
-#: The only vetoes that can disqualify a DIRECTED request: the ones saying
-#: somebody ELSE is speaking. A process or tooling description cannot — "I use
-#: Outlook, can you call me back at 6?" is a request with an answer attached.
-_CALLBACK_QUOTING_VETO_RE = re.compile(
-    "|".join(
-        f"(?:{pattern})" for name, pattern in _CALLBACK_VETO_PATTERNS
-        if name in {"third_person_actor", "hypothetical_or_quoted"}
-    ),
-    re.IGNORECASE,
-)
-
-#: Trailing reported speech ("... is what they always ask") reframes even a
-#: directed request, so this one turn-scoped branch applies to both kinds.
-_CALLBACK_REPORTED_SPEECH_RE = re.compile(
-    "|".join(
-        f"(?:{pattern})" for name, pattern in _CALLBACK_TURN_VETO_PATTERNS
-        if name == "reported_speech_trailing"
-    ),
-    re.IGNORECASE,
-)
-
+#: NOTE — there is deliberately NO reduced veto set for directed branches.
+#: An earlier version let only `third_person_actor` and
+#: `hypothetical_or_quoted` disqualify a directed match, reasoning that a
+#: process description cannot reframe an addressed request. That made
+#: `objection_vocabulary`, `habitual`, `job_description`, `booking_process`
+#: and `tooling_description` DEAD for all seven directed branches, and 28 of
+#: 28 framing x directed combinations ended the interview:
+#:
+#:   "The most common objection is can you call me back later."
+#:   "I usually hear can you call me back tomorrow."
+#:   "My job is getting past can we talk later."
+#:
+#: Directed branches take the FULL clause veto. The price is that a request
+#: sharing ONE CLAUSE with a process description is missed ("I use Outlook,
+#: can you call me back at 6?"). One repeated question against dozens of
+#: terminated interviews is the trade this gate is tuned for everywhere else.
 _CALLBACK_VETO_RE = re.compile(
     "|".join(f"(?:{pattern})" for _name, pattern in _CALLBACK_VETO_PATTERNS),
     re.IGNORECASE,
 )
 
 
-#: Clause boundaries. The veto and the trigger must be judged over the SAME
-#: span, and a spoken turn routinely carries an answer and a request in one
-#: breath: "I usually handle forty leads a day. Sorry, can you call me back at
-#: 1 PM?" — the answer trips `habitual`, the request is real, and a veto read
-#: over the whole turn throws the request away. That is the production
-#: incident, so it is scoped per clause instead.
-#:
-#: `(?<![A-Z])` keeps "1:00 P.M." and initials in one piece: a terminator
-#: preceded by a lone capital is an abbreviation, not a sentence end.
+#: Clause boundaries, used ONLY for the directed branches. A spoken turn
+#: routinely carries an answer and a request in one breath — "I usually handle
+#: forty leads a day. Sorry, can you call me back at 1 PM?" — where the answer
+#: trips `habitual`, the request is real, and a veto read over the whole turn
+#: throws it away. That is the production incident.
 _CALLBACK_CLAUSE_SPLIT_RE = re.compile(
-    # `(?<![A-Z]\.)` spans TWO characters — the capital AND the period — so
-    # "1:00 P.M." and "Dr. Rao" stay whole. Written `(?<![A-Z])` it inspected
-    # the same character `(?<=[.!?])` already pins to punctuation, which is
-    # never a capital, so the guard could never fail and split every
-    # abbreviation it claimed to protect.
+    # THREE abbreviation guards, because one shape is not enough. An earlier
+    # version had only the first and claimed in this comment that "Dr. Rao"
+    # stayed whole; it did not — that guard only protects abbreviations whose
+    # LAST letter is uppercase.
+    #   (?<![A-Z]\.)      "1:00 P.M."          last letter uppercase
+    #   (?<!\.\w\.)       "nine a.m. to six"   dotted single letters
+    #   (?<![A-Z][a-z]\.) "Dr. Rao", "Rs. 25"  capitalised short forms
+    # Written `(?<![A-Z])` the guard inspected the same character
+    # `(?<=[.!?])` already pins to punctuation, which is never a capital, so
+    # it could never fail and split every abbreviation it claimed to protect.
+    #
     # NO `re.IGNORECASE` on this pattern. Under that flag `[A-Z]` matches
-    # lowercase too, so the abbreviation guard blocked EVERY sentence split
-    # and the clause scoping silently did nothing at all. The one place that
-    # actually wants case-insensitivity is the discourse-marker list, which
-    # asks for it locally.
-    r"(?<![A-Z]\.)(?<=[.!?])\s+|\s*,\s*(?=(?i:but|anyway|sorry|however|though)\b)",
+    # lowercase too, so the guards blocked EVERY sentence split and the clause
+    # scoping silently did nothing at all. The one place that actually wants
+    # case-insensitivity is the discourse-marker list, which asks for it
+    # locally.
+    r"(?<![A-Z]\.)(?<!\.\w\.)(?<![A-Z][a-z]\.)(?<=[.!?])\s+"
+    r"|\s*,\s*(?=(?i:but|anyway|sorry|however|though)\b)",
 )
 
 
@@ -11446,14 +11473,19 @@ def callback_request_match(text: Any) -> str | None:
     if not clean:
         return None
 
+    # META-DISCOURSE governs the whole turn, for BOTH kinds. A candidate who
+    # announces they are describing objections is describing them in every
+    # clause that follows, addressed phrasing included: "The most common
+    # brush-off is simple. Can you call me back later." is a quotation, not a
+    # request, and no amount of clause scoping makes it one.
+    if _CALLBACK_TURN_VETO_RE.search(clean):
+        return None
+
     # ── UNDIRECTED: matched and vetoed over the WHOLE TURN ──────────────
     # Whole-turn scope is deliberate and is what `unavailable_state`'s
     # end-anchor means: "I'm driving." is a deferral when it IS the answer,
     # and a description in "I am in a meeting. Then I run demos."
-    turn_vetoed = bool(
-        _CALLBACK_VETO_RE.search(clean) or _CALLBACK_TURN_VETO_RE.search(clean)
-    )
-    if not turn_vetoed:
+    if not _CALLBACK_VETO_RE.search(clean):
         for name, pattern in _CALLBACK_DEFERRAL_PATTERNS:
             if name in _CALLBACK_DIRECTED_BRANCHES:
                 continue
@@ -11467,15 +11499,7 @@ def callback_request_match(text: Any) -> str | None:
     # "I usually handle forty leads a day. Sorry, can you call me back at
     # 1 PM?" must be heard, and a turn-wide veto threw it away.
     for clause in _callback_clauses(clean):
-        # Reported speech is checked on the CLAUSE here, not the turn: "Can
-        # you call me back later is what they always ask" carries both halves
-        # in one breath and is a quote, while "That is the most common
-        # objection. Anyway, can you call me back at 4?" is an answer followed
-        # by a real request, and a turn-wide check threw the request away.
-        if (
-            _CALLBACK_QUOTING_VETO_RE.search(clause)
-            or _CALLBACK_REPORTED_SPEECH_RE.search(clause)
-        ):
+        if _CALLBACK_VETO_RE.search(clause):
             continue
         for name, pattern in _CALLBACK_DEFERRAL_PATTERNS:
             if name not in _CALLBACK_DIRECTED_BRANCHES:
