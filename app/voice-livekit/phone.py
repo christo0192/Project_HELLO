@@ -3132,20 +3132,41 @@ def plan_source_event_id(question_key: str) -> str:
 #: me tomorrow" and the model IMPROVISED a promise ("I'll send you a link")
 #: it has no ability to keep, while the question loop kept going. The policy
 #: names the one legitimate path and forbids the improvisation.
+#: ── THE PROMPT MUST NOT PROMISE WHAT THE MODEL CANNOT DO ──────────────
+#:
+#: RCA 2026-09-15 (session a57e6113). This text used to instruct the model to
+#: "Offer to arrange a callback and … call propose_callback". Neither half was
+#: true in production:
+#:
+#:   * `propose_callback` / `confirm_callback` are STRIPPED from the tool list
+#:     on every turn policy under `PHONE_TURN_MODE=toolless` (the deployed
+#:     mode), so the model has no booking lever at all.
+#:   * the worker — not the model — owns the callback conversation, via
+#:     `candidate_turn_route` -> `run_callback_turn`, and speaks its own fixed
+#:     lines.
+#:
+#: So the model did the only half it COULD do: it offered. Twice it said "Of
+#: course, I can set up a callback for you" and then, obeying the competing
+#: per-turn rider ("ask exactly ONE question — never zero"), carried straight
+#: on with the interview. The candidate asked three times and was interviewed
+#: through two of them.
+#:
+#: The policy now tells the model the truth: recognise the request, ACKNOWLEDGE
+#: IT AND STOP. The worker takes the turn from there. A prompt that names a
+#: tool the model does not have is not guidance, it is a promise the system
+#: cannot keep.
 PHONE_CALLBACK_POLICY_TEXT = (
     "\n\nPhone-call policy (mandatory):\n"
     "- If the candidate says they are busy, cannot talk, or asks to be called "
-    "back later, STOP asking interview questions immediately.\n"
-    "- Offer to arrange a callback and, once they name an exact time, call "
-    "propose_callback. It only checks the time and reads back the exact "
-    "weekday, date and India time; it does not book anything.\n"
-    "- Book only after the candidate clearly says yes to that exact read-back. "
-    "Then call confirm_callback. Never call confirm_callback without that yes.\n"
+    "back at any time, STOP asking interview questions immediately. Do not ask "
+    "another question in that same reply, even a short one.\n"
+    "- Acknowledge the request briefly and stop there. Scheduling is handled "
+    "for you: you do not arrange the time yourself, and you must not ask for a "
+    "day or a time.\n"
+    "- Never say a callback is booked, arranged, or confirmed. You cannot book "
+    "one. Saying so is a promise the system cannot keep.\n"
     "- Never promise links, emails, messages, or follow-ups of any kind: you "
-    "cannot send anything. Callback confirmation is the ONLY commitment you "
-    "may make.\n"
-    "- If the tool refuses, say only what it said; do not improvise an "
-    "alternative promise.\n"
+    "cannot send anything.\n"
     "- Ask one question at a time and wait for the answer. Never re-ask a "
     "question the candidate has already answered; briefly acknowledge and "
     "move on instead."
@@ -4406,8 +4427,61 @@ async def schedule_callback_turn(
 # Phases. Strictly forward; a flow only ever moves DOWN this list or terminates.
 CALLBACK_PHASE_AWAITING_TIME = "awaiting_time"          # first "call me back"
 CALLBACK_PHASE_AWAITING_CLARIFY = "awaiting_clarify"    # asked once for a time
+CALLBACK_PHASE_AWAITING_RETIME = "awaiting_retime"      # refused once, re-asked
 CALLBACK_PHASE_AWAITING_ALT_PICK = "awaiting_alt_pick"  # offered alternatives
 CALLBACK_PHASE_DONE = "done"                            # terminal (booked or deferred)
+
+#: Phase ORDER, as a rank. The flow's loop-freedom rests on every transition
+#: moving strictly forward, and until now that was a prose claim in a
+#: docstring. It is now a number the code checks, because the one new
+#: edge added below (a refusal that RE-ASKS) is exactly the shape that
+#: would break it if it were ever entered twice.
+_CALLBACK_PHASE_RANK: dict[str, int] = {
+    CALLBACK_PHASE_AWAITING_TIME: 0,
+    CALLBACK_PHASE_AWAITING_CLARIFY: 1,
+    CALLBACK_PHASE_AWAITING_RETIME: 2,
+    CALLBACK_PHASE_AWAITING_ALT_PICK: 3,
+    CALLBACK_PHASE_DONE: 4,
+}
+
+
+def _callback_phase_rank(phase: Any) -> int:
+    """Rank of a phase; an UNKNOWN phase ranks terminal so it cannot loop."""
+    return _CALLBACK_PHASE_RANK.get(
+        str(phase), _CALLBACK_PHASE_RANK[CALLBACK_PHASE_DONE]
+    )
+
+
+#: Refusals where naming a DIFFERENT time could still succeed.
+#:
+#: RCA 2026-09-15. A candidate asked to be called back "today at 1 PM". The
+#: time parsed correctly, the server refused it `slot_not_yet_eligible` (a
+#: same-IST-day callback is banned — it would be a second contact against one
+#: day's ledger), and `_propose_and_confirm` threw that status away and spoke
+#: the generic deferral: "our team will reach out". Nothing was booked,
+#: nothing was recorded, and the candidate was told otherwise.
+#:
+#: `_SCHEDULE_REFUSAL_TEXT` has carried a purpose-written line for that exact
+#: case since it was authored — "I can't book another call for today, but I
+#: can from tomorrow onwards" — and it was UNREACHABLE from this path,
+#: because the only callers of `schedule_refusal_text` are the LLM tools,
+#: which production strips on every turn (`PHONE_TURN_MODE=toolless`).
+#:
+#: Membership means ONE thing: the candidate can act on it. Statuses where a
+#: different time changes nothing (`attempt_in_flight`, `version_conflict`,
+#: `engagement_terminal`) stay terminal — re-asking there would be a question
+#: the candidate has no way to answer.
+_CALLBACK_RETRYABLE_REFUSALS: frozenset[str] = frozenset({
+    "slot_in_past",
+    "lead_time_too_short",
+    "slot_full",
+    "daily_attempt_exists",
+    "slot_straddles_ist_midnight",
+    "window_closed",
+    "slot_not_yet_eligible",
+    "slot_duration_invalid",
+    "phone_callback_proposal_error",
+})
 
 # What the bot says when it needs the candidate to name a specific time. Asked
 # AT MOST ONCE (the clarification), then the flow falls back to the deferral.
@@ -4570,9 +4644,37 @@ async def _propose_and_confirm(
         return CallbackDecision(
             _alternatives_offer_text(outcome.alternatives), terminal=False,
         )
-    # Any other refusal (window closed, lead too short, slot_full with no
-    # alternatives, or a slot_full reached from the alternatives round itself):
-    # do not loop, fall back to the terminal deferral.
+
+    # ── SAY WHY, AND LET THEM NAME ANOTHER TIME — ONCE ──────────────────
+    # The refusal STATUS is the only thing that tells the candidate what to
+    # ask for instead, and until 2026-09-15 it was discarded here: every
+    # refusal spoke one generic "our team will reach out" and ended the call.
+    # A candidate who said "today at 1 PM" was told a human would follow up,
+    # when saying "tomorrow at 1 PM" would have booked instantly.
+    #
+    # BOUNDED BY RANK, not by trust. The re-ask is allowed only from a phase
+    # STRICTLY EARLIER than the one it moves to, so it can be entered at most
+    # once per flow; a second refusal arrives already at `awaiting_retime`,
+    # fails the rank test, and terminalizes. The flow stays forward-only and
+    # its termination is still provable by inspection.
+    status = str(outcome.status or "").strip().lower()
+    retime_rank = _CALLBACK_PHASE_RANK[CALLBACK_PHASE_AWAITING_RETIME]
+    if (
+        status in _CALLBACK_RETRYABLE_REFUSALS
+        and _callback_phase_rank(flow.phase) < retime_rank
+    ):
+        _log.info(
+            "unknown_event", error_type="phone_callback_refused",
+            error_category=status, schema="retried",
+        )
+        flow.phase = CALLBACK_PHASE_AWAITING_RETIME
+        return CallbackDecision(schedule_refusal_text(status), terminal=False)
+
+    # Not actionable by the candidate, or the one re-ask is already spent.
+    _log.info(
+        "unknown_event", error_type="phone_callback_refused",
+        error_category=status or _ERR_MALFORMED, schema="deferred",
+    )
     flow.phase = CALLBACK_PHASE_DONE
     return _deferral_decision()
 
@@ -4588,8 +4690,9 @@ async def run_callback_turn(
 
     STRUCTURALLY loop-free: each call either terminates the flow or moves it to
     a strictly later phase, and there is no phase that can return to an earlier
-    one. A candidate who never names a valid time reaches the terminal deferral
-    within: initial parse → one clarification → deferral.
+    one — now ENFORCED by `_callback_phase_rank` rather than asserted here.
+    A candidate who never reaches a bookable time reaches the terminal deferral
+    within: initial parse → one clarification → one refusal re-ask → deferral.
     """
     phase = flow.phase
 
@@ -4606,6 +4709,18 @@ async def run_callback_turn(
         if starts_at is not None:
             return await _propose_and_confirm(client, attempt_id, starts_at, flow)
         # Still unparseable after the one clarification: terminal deferral.
+        flow.phase = CALLBACK_PHASE_DONE
+        return _deferral_decision()
+
+    if phase == CALLBACK_PHASE_AWAITING_RETIME:
+        # The candidate was told WHY their time was refused and asked for
+        # another. This phase is entered at most once (see the rank check in
+        # `_propose_and_confirm`), so whatever happens here the flow ends:
+        # a parsed time goes back to propose/confirm, where a second refusal
+        # can no longer re-ask, and an unparseable answer defers immediately.
+        starts_at = parse_callback_time_ist(candidate_text, now)
+        if starts_at is not None:
+            return await _propose_and_confirm(client, attempt_id, starts_at, flow)
         flow.phase = CALLBACK_PHASE_DONE
         return _deferral_decision()
 
@@ -10713,16 +10828,156 @@ _CONNECTIVITY_RE = re.compile(
     r"(?:are\s+you\s+there|is\s+the\s+line\s+(?:working|clear))\??$",
     re.IGNORECASE,
 )
+# ── "please call me back" — the request that ends the interview ────────
+#
+# RCA 2026-09-15 (session a57e6113). A candidate asked THREE times to be called
+# back. The first two were missed and the bot carried on interviewing:
+#
+#   "can you call me back today at 1:00 PM?"        -> no match
+#   "I'm KIND OF busy right now. Please call me     -> no match
+#    back at 1 PM."
+#   "Can you SCHEDULE a call back?"                 -> matched
+#
+# The discriminator was the verb `schedule`. `call me back` reached the pattern
+# only when followed by the three literal words `later` / `tomorrow` /
+# `another time`; a specific time ("at 1 PM") missed. `I'm busy right now`
+# matched only unhedged — one filler word ("kind of") defeated it.
+#
+# WHY THIS IS BUILT AS NAMED BRANCHES. This regex runs on EVERY candidate turn
+# and a false positive TERMINATES A LIVE INTERVIEW. The previous single blob
+# could not be reasoned about branch by branch, and the population it runs
+# against is the worst possible one: Sales Program Advisor candidates, who talk
+# about callbacks and follow-ups for a living. The pinned negative
+# "I organize CRM callbacks and follow-up across multiple prospects." exists for
+# exactly that reason (tests/test_phone_gate.py) and must stay unmatched.
+#
+# So each branch below is named, separately commented, and separately testable,
+# and every widening carries its own guard against the sales vocabulary.
+#: What counts as "a time" after a callback verb. STT transcribes spoken
+#: numbers as WORDS ("after six", "at one"), so a digit-only pattern misses
+#: the most common form a candidate actually produces.
+_CALLBACK_TIME_TAIL = (
+    r"(?:at|after|around|by|before|in)\s+"
+    r"(?:\d|a\s|an\s|half|couple|few|"
+    r"one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve|"
+    r"the\s+(?:morning|afternoon|evening))"
+)
+
+_CALLBACK_DEFERRAL_PATTERNS: tuple[tuple[str, str], ...] = (
+    # 1. "call me back later / tomorrow / another time" — the original branch,
+    #    kept verbatim so nothing that matched before stops matching.
+    (
+        "call_me_back_vague",
+        r"\b(?:call|ring|phone)\s+me\s+(?:back\s+)?"
+        r"(?:later|tomorrow|another\s+time|tonight|"
+        r"this\s+(?:morning|afternoon|evening))\b",
+    ),
+    # 2. THE MISS FROM THE INCIDENT: "call me back AT 1 PM", "call me after 6",
+    #    "call me in an hour". A specific time is the MORE committed form of the
+    #    request, and it was the one that fell through.
+    #
+    #    Requires a time-ish continuation rather than accepting a bare
+    #    "call me back", because a bare one appears inside sales answers
+    #    ("I leave a voicemail and they call me back"). That shape is caught by
+    #    branch 3 instead, which demands the request be addressed to us.
+    (
+        "call_me_back_at_time",
+        r"\b(?:call|ring|phone)\s+me\s+(?:back\s+)?" + _CALLBACK_TIME_TAIL,
+    ),
+    # 3. "CAN YOU call me back", "PLEASE call me back" — addressed to us, so no
+    #    time expression is needed. The modal/please is what separates a request
+    #    from a candidate describing their own prospecting.
+    (
+        "call_me_back_addressed",
+        r"\b(?:(?:can|could|would|will)\s+(?:you|we)\s+(?:please\s+)?|please\s+)"
+        r"(?:call|ring|phone)\s+(?:me|us)?\s*(?:back)?\b",
+    ),
+    # 4. "give me a call later / at 6" — a different verb for the same request.
+    #
+    #    Must be ADDRESSED to us or TIME-BOUND. A bare "give me a call" is a
+    #    sales answer, not a request: "I ask them to give me a call when they
+    #    are free" was a live false positive caught by the corpus below, and it
+    #    would have hung up on a candidate mid-answer.
+    (
+        "give_me_a_call",
+        r"\b(?:(?:can|could|would|will)\s+(?:you|we)\s+(?:please\s+)?|please\s+)"
+        r"give\s+me\s+a\s+(?:call|ring|callback)\b|"
+        r"\bgive\s+me\s+a\s+(?:call|ring|callback)\s+"
+        r"(?:back|later|tomorrow|tonight|" + _CALLBACK_TIME_TAIL + r")",
+    ),
+    # 5. The original modal + call-back/reschedule branch, kept verbatim.
+    (
+        "modal_call_back_or_reschedule",
+        r"\b(?:can|could|would)\s+(?:you|we)\s+(?:please\s+)?"
+        r"(?:call\s+back|reschedule)\b",
+    ),
+    # 6. "let's reschedule", "reschedule the call" — bare `reschedule` needed a
+    #    modal before. Still requires a request shape or an object, so the noun
+    #    "reschedule" inside an answer does not fire it.
+    (
+        "reschedule_plain",
+        r"\b(?:let'?s\s+reschedule|reschedule\s+(?:this|the|our|my)\s+"
+        r"(?:call|chat|interview|conversation))\b",
+    ),
+    # 7. + 8. The original book/schedule/arrange/set-up branches, verbatim.
+    (
+        "modal_book_object",
+        r"\b(?:can|could|would)\s+(?:you|we)\s+(?:please\s+)?"
+        r"(?:book|schedule|arrange|set\s+up)\s+(?:me\s+)?"
+        r"(?:an?\s+|another\s+|the\s+)?"
+        r"(?:call|callback|appointment|meeting|follow[ -]?up(?:\s+call)?)\b",
+    ),
+    (
+        "book_object",
+        r"\b(?:book|schedule|arrange|set\s+up)\s+(?:me\s+)?"
+        r"(?:an?\s+|another\s+|the\s+)?"
+        r"(?:call|callback|appointment|meeting|follow[ -]?up(?:\s+call)?)\b",
+    ),
+    # 9. "I'm busy" — now tolerant of hedges ("kind of", "a bit", "really"),
+    #    which is how people actually say it and which defeated the old literal.
+    #
+    #    The negative lookahead is the guard: "I'm busy WITH a pipeline of
+    #    fifty leads" / "I'm busy MANAGING renewals" are ANSWERS from exactly
+    #    this candidate population, not requests to hang up.
+    (
+        "im_busy",
+        r"\bi(?:'m|\s+am)\s+(?:\w+\s+){0,3}busy\b"
+        r"(?!\s+(?:with|managing|handling|working|running|doing|building|"
+        r"selling|closing|chasing|calling))",
+    ),
+    # 10. "I can't talk" — "right now" / "at the moment" are now optional, and
+    #     bare "now" is accepted.
+    (
+        "cannot_talk",
+        r"\bi\s+(?:cannot|can'?t)\s+(?:talk|speak|do\s+this)\b",
+    ),
+    # 11. "not a good time" — the old pattern demanded the literal lead-in
+    #     "this is". "Now is not a good time" and a bare "not a good time right
+    #     now" are at least as common.
+    (
+        "not_a_good_time",
+        r"\b(?:this|that|now|it|today)\s+is\s*(?:not|n'?t)\s+a\s+good\s+time\b|"
+        r"\bnot\s+a\s+good\s+time\s+(?:right\s+now|at\s+the\s+moment|for\s+me)\b|"
+        r"\bbad\s+time\s+(?:right\s+now|at\s+the\s+moment)\b",
+    ),
+    # 12. Unavailable-right-now states. Present tense and first person, so a
+    #     past-tense answer ("I was driving to a client meeting") does not fire.
+    (
+        "unavailable_state",
+        r"\bi(?:'m|\s+am)\s+(?:currently\s+)?"
+        r"(?:driving|in\s+a\s+meeting|on\s+another\s+call|in\s+the\s+middle\s+of\s+something)\b",
+    ),
+    # 13. "can we talk later", "can we do this later", "can we continue later".
+    (
+        "can_we_later",
+        r"\b(?:can|could|shall)\s+we\s+(?:please\s+)?"
+        r"(?:talk|speak|do\s+this|continue|connect|catch\s+up)\s+"
+        r"(?:again\s+)?(?:later|tomorrow|another\s+time)\b",
+    ),
+)
+
 _CALLBACK_DEFERRAL_RE = re.compile(
-    r"\b(?:call|ring)\s+me\s+(?:back\s+)?(?:later|tomorrow|another\s+time)\b|"
-    r"\b(?:can|could|would)\s+(?:you|we)\s+(?:(?:please\s+)?(?:call\s+back|reschedule)|"
-    r"(?:please\s+)?(?:book|schedule|arrange|set\s+up)\s+(?:me\s+)?"
-    r"(?:an?\s+|another\s+|the\s+)?(?:call|callback|appointment|meeting|follow[ -]?up(?:\s+call)?))\b|"
-    r"\b(?:book|schedule|arrange|set\s+up)\s+(?:me\s+)?"
-    r"(?:an?\s+|another\s+|the\s+)?(?:call|callback|appointment|meeting|follow[ -]?up(?:\s+call)?)\b|"
-    r"\b(?:i(?:'m|\s+am)\s+busy\s+(?:right\s+now|at\s+the\s+moment)|"
-    r"i\s+(?:cannot|can't)\s+talk\s+(?:right\s+now|at\s+the\s+moment)|"
-    r"this\s+is\s+not\s+a\s+good\s+time)\b",
+    "|".join(f"(?:{pattern})" for _name, pattern in _CALLBACK_DEFERRAL_PATTERNS),
     re.IGNORECASE,
 )
 _COMPANY_REVIEW_QUESTION_RE = re.compile(

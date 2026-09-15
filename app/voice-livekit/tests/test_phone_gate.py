@@ -4694,6 +4694,149 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         self.assertIsNone(phone.candidate_turn_route(
             "I organize CRM callbacks and follow-up across multiple prospects."
         ))
+
+    def test_the_THREE_ways_a_candidate_asked_to_be_called_back(self):
+        """RCA 2026-09-15, session a57e6113 — the verbatim live utterances.
+
+        A candidate asked to be called back three times. The first two were
+        missed and the bot carried on interviewing; only the third, which
+        happened to contain the verb "schedule", started the booking flow.
+        The words that decided it were `schedule` versus `call me back`.
+        """
+        missed_live = [
+            "By the way, can you call me back today at 1:00 AM, sorry, 1:00 PM?",
+            "Uh I'm sorry, I'm kind of busy right now. Please call me back at 1 PM.",
+        ]
+        for text in missed_live:
+            self.assertEqual(
+                phone.candidate_turn_route(text), "callback_deferral",
+                f"the live miss is still missed: {text!r}",
+            )
+        # The one that DID work must keep working.
+        self.assertEqual(
+            phone.candidate_turn_route("Can you schedule a call back?"),
+            "callback_deferral",
+        )
+
+    def test_every_natural_way_to_ask_for_a_callback_is_heard(self):
+        """The owner's complaint: "each candidate says that in different way".
+
+        Missing one of these does not degrade the call — it CONTINUES THE
+        INTERVIEW over somebody who has said they cannot talk.
+        """
+        for text in [
+            # the phrasing the old pattern could not hear at all
+            "can you call me back",
+            "could you please call me back",
+            "please call me back",
+            # a SPECIFIC time — the more committed form, and the one that missed
+            "call me back at 1 PM",
+            "call me after 6",
+            "call me in an hour",
+            "call me back around 3",
+            "ring me back this evening",
+            "phone me back tonight",
+            # a different verb entirely
+            "can you give me a call later",
+            "give me a call later",
+            "give me a ring tomorrow",
+            # rescheduling without a modal in front of it
+            "lets reschedule",
+            "reschedule the call",
+            "reschedule this interview",
+            # "busy", hedged the way people actually hedge it
+            "I am busy",
+            "I'm a bit busy right now",
+            "I'm really busy at the moment",
+            "I'm kind of busy",
+            # can't talk, without the exact old suffixes
+            "I can't talk",
+            "I cannot talk now",
+            "I can't do this right now",
+            # "not a good time", without the literal "this is" lead-in
+            "now is not a good time",
+            "it is not a good time",
+            "not a good time right now",
+            "bad time right now",
+            # states that mean "not now"
+            "I'm driving",
+            "I am currently driving",
+            "I'm in a meeting",
+            "I'm on another call",
+            # deferring the conversation itself
+            "can we talk later",
+            "can we do this later",
+            "could we continue later",
+            "shall we catch up tomorrow",
+            # STT SHAPE: no punctuation, lowercase, disfluencies. Production
+            # never sees the tidy strings above — it sees these.
+            "um yeah can you call me back at one pm please",
+            "sorry im kind of busy right now please call me back",
+            "uh i am driving can we talk later",
+            "yeah give me a call after six",
+        ]:
+            self.assertEqual(
+                phone.candidate_turn_route(text), "callback_deferral",
+                f"a callback request was not heard: {text!r}",
+            )
+
+    def test_a_SALES_answer_never_ends_the_interview(self):
+        """The cost of a false positive here is a TERMINATED live interview.
+
+        This screening is for a Sales Program Advisor. The candidates talk
+        about callbacks, follow-ups, scheduling and being busy for a living —
+        every one of these is an ANSWER, and the widened trigger must not hear
+        any of them as a request to hang up.
+        """
+        for text in [
+            # the guard that has been pinned since the pattern was written
+            "I organize CRM callbacks and follow-up across multiple prospects.",
+            # the rest of the sales vocabulary, as answers
+            "I schedule my callbacks in the CRM every morning.",
+            "My follow-up cadence is a call back after two days.",
+            "I book meetings for the sales team all day.",
+            "I set up appointments with prospects every week.",
+            "I arrange meetings between the prospect and the counsellor.",
+            "I leave a voicemail and most of them call me back.",
+            "Prospects usually call me back within a day.",
+            "I ask them to give me a call when they are free.",
+            "I track every callback and follow-up in the pipeline.",
+            # "busy" describing the WORK, not the moment
+            "I'm busy with a pipeline of about fifty leads.",
+            "I am busy managing renewals and escalations.",
+            "I'm busy handling inbound queries most of the day.",
+            "I am busy running the outbound motion for the team.",
+            "I'm busy closing three deals this quarter.",
+            "I'm busy chasing warm leads from the webinar.",
+            # past tense / third person
+            "I was driving to a client meeting when they called.",
+            "He was in a meeting so I called back later.",
+            "They said it was not a good time and I noted it.",
+            # ordinary answers containing trigger-adjacent words
+            "My last role involved a lot of scheduling.",
+            "I handle the follow-up process end to end.",
+            "We do a weekly call with the team.",
+            "The appointment setting was part of my job.",
+        ]:
+            self.assertIsNone(
+                phone.candidate_turn_route(text),
+                f"a sales ANSWER was heard as a hang-up request: {text!r}",
+            )
+
+    def test_every_trigger_branch_is_named_and_compiles(self):
+        """The pattern is a table so each branch can be reasoned about alone.
+
+        A single opaque blob is how the narrow `call me back (later|tomorrow|
+        another time)` survived unexamined. Each entry must be a (name,
+        pattern) pair that compiles on its own.
+        """
+        import re as _re
+        names = [name for name, _p in phone._CALLBACK_DEFERRAL_PATTERNS]
+        self.assertEqual(len(names), len(set(names)), "duplicate branch name")
+        self.assertGreaterEqual(len(names), 13)
+        for name, pattern in phone._CALLBACK_DEFERRAL_PATTERNS:
+            self.assertTrue(name and name.replace("_", "").isalnum(), name)
+            _re.compile(pattern)  # raises if a branch is malformed
         self.assertEqual(
             phone.parse_callback_time_ist(
                 "Can you schedule a call tomorrow at 10:00 AM?",
@@ -12941,6 +13084,137 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
              patch.object(agent_mod, "PHONE_FAREWELL_PLAYOUT_FLOOR_SEC", 0.05):
             await hooks["drive_terminal"]()
         self.assertIn("assessment.aborted", client.event_types)
+
+    async def test_a_REFUSED_time_is_explained_and_re_asked_ONCE(self):
+        """RCA 2026-09-15 — the bot promised a callback it had not booked.
+
+        The candidate said "today at 1 PM". It parsed correctly. The server
+        refused it `slot_not_yet_eligible` (a same-IST-day callback is banned —
+        it would be a second contact against one day's ledger). The worker then
+        DISCARDED that status and spoke the generic deferral — "our team will
+        reach out" — and ended the call. No appointment was written, no event
+        was posted, and the candidate had been told otherwise.
+
+        `_SCHEDULE_REFUSAL_TEXT` had carried a purpose-written line for exactly
+        this case all along; it was unreachable, because its only callers are
+        LLM tools that production strips on every turn.
+        """
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+        )
+        on_turn = hooks["on_native_turn"]
+
+        opener = "Can you schedule a call back?"
+        self.assertEqual(phone.candidate_turn_route(opener), "callback_deferral")
+        turn0 = types.SimpleNamespace(items=[])
+        await on_turn(opener, types.SimpleNamespace(text_content=opener), turn0)
+
+        # The candidate names a time the SERVER will refuse as same-day.
+        asked = "Today at 1 PM."
+        resolved = phone.parse_callback_time_ist(
+            asked, datetime(2026, 9, 15, 6, 55, tzinfo=timezone.utc),
+        )
+        self.assertIsNotNone(resolved, "the time must parse — it did live")
+        client.script_proposal(resolved, "slot_not_yet_eligible")
+
+        turn1 = types.SimpleNamespace(items=[])
+        with patch.object(phone, "parse_callback_time_ist", lambda *_a, **_k: resolved):
+            await on_turn(asked, types.SimpleNamespace(text_content=asked), turn1)
+
+        spoken = " ".join(
+            m["content"] if isinstance(m, dict) else "" for m in turn1.items
+        ).lower()
+        # It SAYS WHY, and it asks for a time it can actually accept.
+        self.assertIn("tomorrow", spoken)
+        self.assertNotIn("reach out", spoken)
+        # And it is NOT terminal — the candidate gets to answer.
+        self.assertNotEqual(getattr(agent, "_turn_policy"), "closing")
+        # Nothing was confirmed: a refusal must never look like a booking.
+        self.assertEqual(client.confirm_calls, [])
+
+        # A SECOND refusal spends the one re-ask and terminalizes. The bound
+        # stays provable: the flow cannot re-ask twice.
+        second = "Then today at 4 PM."
+        resolved2 = "2026-09-15T10:30:00Z"
+        client.script_proposal(resolved2, "slot_not_yet_eligible")
+        turn2 = types.SimpleNamespace(items=[])
+        with patch.object(phone, "parse_callback_time_ist", lambda *_a, **_k: resolved2):
+            await on_turn(second, types.SimpleNamespace(text_content=second), turn2)
+        spoken2 = " ".join(
+            m["content"] if isinstance(m, dict) else "" for m in turn2.items
+        ).lower()
+        self.assertIn("reach out", spoken2)
+        self.assertEqual(getattr(agent, "_turn_policy"), "closing")
+        self.assertEqual(client.confirm_calls, [])
+
+    async def test_an_UNACTIONABLE_refusal_does_not_re_ask(self):
+        """Re-asking is only kind when a different answer could work.
+
+        `engagement_terminal` does not get better if the candidate names
+        another time, so asking them to would be a question with no right
+        answer. Those statuses stay terminal.
+        """
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless",
+        )
+        on_turn = hooks["on_native_turn"]
+        opener = "Can you schedule a call back?"
+        turn0 = types.SimpleNamespace(items=[])
+        await on_turn(opener, types.SimpleNamespace(text_content=opener), turn0)
+
+        resolved = "2026-09-16T07:30:00Z"
+        client.script_proposal(resolved, "engagement_terminal")
+        turn1 = types.SimpleNamespace(items=[])
+        with patch.object(phone, "parse_callback_time_ist", lambda *_a, **_k: resolved):
+            await on_turn("Tomorrow at 1 PM.",
+                          types.SimpleNamespace(text_content="Tomorrow at 1 PM."), turn1)
+        self.assertEqual(getattr(agent, "_turn_policy"), "closing")
+        self.assertEqual(client.confirm_calls, [])
+
+    def test_the_refusal_vocabulary_has_a_line_for_every_retryable_status(self):
+        """A retryable status with no written line would speak the generic
+        fallback — which is the exact bug: a refusal the candidate cannot act
+        on because nobody told them what was wrong."""
+        for status in phone._CALLBACK_RETRYABLE_REFUSALS:
+            self.assertIn(
+                status, phone._SCHEDULE_REFUSAL_TEXT,
+                f"retryable status {status!r} has no spoken line",
+            )
+            self.assertNotEqual(
+                phone.schedule_refusal_text(status),
+                phone._SCHEDULE_REFUSAL_FALLBACK,
+                f"{status!r} falls through to the generic line",
+            )
+
+    def test_the_phase_ranks_make_the_flow_provably_finite(self):
+        """The re-ask is the first edge that could have created a loop.
+
+        Loop-freedom used to be a prose claim in a docstring. It is now a rank
+        the code checks, so every phase must have one and `done` must be last.
+        """
+        ranks = phone._CALLBACK_PHASE_RANK
+        for phase in (
+            phone.CALLBACK_PHASE_AWAITING_TIME,
+            phone.CALLBACK_PHASE_AWAITING_CLARIFY,
+            phone.CALLBACK_PHASE_AWAITING_RETIME,
+            phone.CALLBACK_PHASE_AWAITING_ALT_PICK,
+            phone.CALLBACK_PHASE_DONE,
+        ):
+            self.assertIn(phase, ranks)
+        self.assertEqual(
+            max(ranks.values()), ranks[phone.CALLBACK_PHASE_DONE],
+            "done must be the highest rank or the flow can leave a terminal phase",
+        )
+        self.assertLess(
+            ranks[phone.CALLBACK_PHASE_AWAITING_CLARIFY],
+            ranks[phone.CALLBACK_PHASE_AWAITING_RETIME],
+            "the re-ask must sit AFTER the clarification, or it can be entered twice",
+        )
+        # An unknown phase ranks terminal, so a corrupted state cannot loop.
+        self.assertEqual(
+            phone._callback_phase_rank("not_a_real_phase"),
+            ranks[phone.CALLBACK_PHASE_DONE],
+        )
 
     async def test_a_callback_deferral_without_a_time_asks_once_then_defers(self):
         # CHANGE 5 (this PR): in-call callback booking is a BOUNDED negotiation,

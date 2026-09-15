@@ -171,16 +171,40 @@ primary_region = "sin"
   # coordinator owns objective order; preloading a future objective can create
   # repeated introductions or stale questions after an interruption.
   PHONE_OBJECTIVE_PREEMPTIVE = "off"
-  # 60 (owner-approved 2026-09-07, SE-call latency RCA): the early-flush fix is
-  # ACTIVE — first speakable fragment (first sentence terminator / clause pause /
-  # 60-char cap) reaches Sarvam immediately instead of waiting for the model's
-  # complete first sentence (~1.8s median reply->first-TTS block measured).
-  # "0" is the instant rollback (whole reply as ONE synthesis, no early flush).
+  # The early-flush fix is ACTIVE — the first speakable fragment (first sentence
+  # terminator / clause pause / this char cap, whichever comes first) reaches
+  # Sarvam immediately instead of waiting for the model's complete first
+  # sentence. "0" is the instant rollback (whole reply as ONE synthesis, no
+  # early flush) and is the SLOWEST setting, not the fastest — the name reads
+  # like a minimum but zero is a disable sentinel.
+  #
+  # ── TUNING HISTORY, because this value has been moved by ear ──────────
+  #   60  owner-approved 2026-09-07 (SE-call latency RCA); ~1.8s median
+  #       reply->first-TTS block measured at the time.
+  #   20  tried during tuning: audible WORD BREAKAGE. The cap lands wherever it
+  #       lands, including mid-word (phone.py:12247), so a low cap cracks the
+  #       word at the fragment join.
+  #   40  settled on after that, and ran in production as a SECRET (which is
+  #       why this [env] line still read 60 — the secret shadowed it, and the
+  #       repo could not see the live value).
+  #   30  owner-requested 2026-09-15 as the midpoint between "20 broke words"
+  #       and "40 feels laggy".
+  #
+  # MEASURED EXPECTATION, so the next reader is not misled: on session
+  # a57e6113 the headline turn latency was 2857ms median, of which ~996ms is
+  # end-of-speech detection and ~1003ms is LLM time-to-first-token. This cap
+  # sits downstream of `_A0_LEADING_SEGMENT_MAX_CHARS = 48` (phone.py:3365),
+  # which releases held chunks as a BURST — so any cap <= 48 is satisfied at
+  # the same instant and the timing gain from 40->30 is ~0. What DOES change is
+  # where the first fragment is cut, i.e. the word-breakage risk. Listen for a
+  # cracked word at the join before trusting this value.
+  #
   # DEPLOY NOTE (operator step): a stale Fly SECRET also named
   # PHONE_TTS_FLUSH_MIN_CHARS overrides this [env] value — it MUST be unset
   # (`fly secrets unset PHONE_TTS_FLUSH_MIN_CHARS -a <phone-app>`) at deploy or
-  # this change silently does nothing.
-  PHONE_TTS_FLUSH_MIN_CHARS = "60"
+  # this change silently does nothing. The live value was 40 via exactly such a
+  # secret until 2026-09-15.
+  PHONE_TTS_FLUSH_MIN_CHARS = "30"
   # 0095 — PHONE_TTS_PACE is DELIBERATELY NOT SET HERE. The reader
   # (`phone_tts_pace()`, default 1.0) ships so the value can be applied as a
   # secret, but the value itself is unverified against `bulbul:v3`: the [0.5,
