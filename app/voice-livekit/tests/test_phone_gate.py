@@ -2347,6 +2347,53 @@ class TestAnswerClassifier(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN)
 
+    def test_a_hum_on_the_line_cannot_stall_the_worker(self):
+        """Catastrophic backtracking in the filler alternation.
+
+        `_AFFIRMATIVE_RE`'s filler group holds `hmm+|mm+` inside a `{0,4}`
+        repetition, and both branches consume the same run of `m`s. Measured
+        before the fix: 0.6ms at "h"+18m, DOUBLING every ~4 characters — about
+        a second by 60 and minutes beyond. A hum on a PSTN line is exactly how
+        Sarvam produces such a run, and this classifier runs synchronously on
+        the worker event loop.
+
+        A length cap does not fix it (400 characters of `m` still hangs); the
+        run collapse does, and it is semantically free above three repeats.
+        """
+        import time
+
+        for n in (40, 2000, 50000):
+            text = "h" + "m" * n
+            started = time.perf_counter()
+            agent_mod.classify_answer_text(text)
+            elapsed = time.perf_counter() - started
+            self.assertLess(
+                elapsed, 0.5,
+                f"classifying a {n}-character hum took {elapsed:.2f}s — the "
+                f"filler alternation is backtracking and would stall a live "
+                f"call",
+            )
+
+        # ...and real speech is untouched by the collapse.
+        self.assertEqual(
+            agent_mod.classify_answer_text("hmm yes"), phone.CLASSIFY_HUMAN)
+        self.assertEqual(
+            agent_mod.classify_answer_text("mmhmm"), phone.CLASSIFY_HUMAN)
+        self.assertEqual(
+            agent_mod.classify_answer_text("haan"), phone.CLASSIFY_HUMAN)
+        # A collapsed run inside the FILLER group still reaches the affirmative
+        # after it — which is the part the collapse had to keep working.
+        self.assertEqual(
+            agent_mod.classify_answer_text("hmmmmmmmm yes"),
+            phone.CLASSIFY_HUMAN,
+        )
+        # NOT asserted: that "yeahhhhhhh" == "yeah". It does not, and the
+        # collapse does not change that — the affirmative alternation ends in
+        # `\b`, so any trailing repeat of the final letter blocks the match
+        # however short the run is. That is a PRE-EXISTING miss in the safe
+        # direction (a re-ask, never false consent), separate from this fix.
+        self.assertIsNone(agent_mod.classify_answer_text("yeahhhhhhh"))
+
     def test_NO_PROBLEM_is_a_yes_and_must_never_end_the_call(self):
         """The severest consent defect found so far. Live-reported 2026-09-15.
 

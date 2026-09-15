@@ -1727,6 +1727,11 @@ async def _wait_for_sip_participant(ctx: JobContext, timeout_sec: float) -> Any:
 # read as one of the five outcomes is a machine, because a machine gets no
 # assessment, no recording and no scorecard — the safe direction to be wrong in.
 
+#: Any character repeated four or more times, collapsed to three before the
+#: consent classifier runs. See `classify_answer_text` for why this exists —
+#: it is the bound that makes the filler alternation safe against a hum.
+_REPEATED_RUN_RE = re.compile(r"(.)\1{3,}", re.DOTALL)
+
 _MACHINE_RE = re.compile(
     r"leave (?:a )?(?:your )?message|after the (?:tone|beep)|voice\s?mail|"
     r"not available (?:right now|at the moment)|record your message|"
@@ -1872,6 +1877,22 @@ def classify_answer_text(text: str) -> str | None:
     value = (text or "").strip()
     if not value:
         return None
+    # COLLAPSE LONG CHARACTER RUNS BEFORE MATCHING.
+    #
+    # `_AFFIRMATIVE_RE`'s filler group contains `hmm+|mm+` inside a `{0,4}`
+    # repetition, and both branches can consume the same run of `m`s. That is
+    # textbook catastrophic backtracking: measured 0.6ms at "h"+18m, doubling
+    # every ~4 characters — about a second by 60, minutes beyond that. A hum on
+    # a PSTN line is exactly how Sarvam produces such a run, and this classifier
+    # runs SYNCHRONOUSLY on the worker event loop, so one hum would stall a
+    # live call (and, with the pool one-call-per-machine, that call only).
+    #
+    # A length cap does not fix it — 400 characters of `m` still hangs. Bounding
+    # the RUN does, and it is semantically free: no real answer depends on the
+    # fourth consecutive identical letter, and "yesss"/"haaan"/"mmmm" all keep
+    # their meaning. Linear, and it runs before every branch, so the
+    # machine/refusal patterns are protected too.
+    value = _REPEATED_RUN_RE.sub(r"\1\1\1", value)
     if _MACHINE_RE.search(value):
         return phone.CLASSIFY_MACHINE
     if _WRONG_NUMBER_RE.search(value):
