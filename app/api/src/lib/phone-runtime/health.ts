@@ -173,6 +173,16 @@ export interface PhoneRuntimeView {
   /** 0071 / X5b. Crashed sessions terminalized so their recordings finalize. */
   last_rec_stranded: number | null;
   /**
+   * 0096. Orphan `waiting` sessions terminalized by the last pass.
+   *
+   * Surfaced rather than left in the snapshot because a non-zero number here
+   * is the POOL BEING GIVEN BACK: each of those sessions was holding a worker
+   * lease that nothing else could release. During a multi-call test that is
+   * the difference between "we are down a machine" and "we were, and it came
+   * back", and the operator is watching this endpoint.
+   */
+  last_orphan_expired: number | null;
+  /**
    * Names of the sweeps whose last run did NOT answer `ok`. Codes only.
    * Empty is the healthy state; a count of `0` on a sweep NOT named here
    * means "ran, nothing to do", which is a different fact.
@@ -237,6 +247,7 @@ export function phoneRuntimeView(now: Date = new Date()): PhoneRuntimeView {
       last_rolled: null,
       last_stranded: null,
       last_rec_stranded: null,
+      last_orphan_expired: null,
       sweeps_not_ok: [],
       // The ONLY difference between "off" and "broken" on this surface.
       start_failed: startFailed,
@@ -272,6 +283,8 @@ export function phoneRuntimeView(now: Date = new Date()): PhoneRuntimeView {
     last_stranded: snapshot.lastStranded,
     // 0071 / X5b: crashed sessions terminalized so their recordings finalize.
     last_rec_stranded: snapshot.lastRecStranded,
+    // 0096: orphan sessions terminalized — each one a worker lease released.
+    last_orphan_expired: snapshot.lastOrphanExpired,
     sweeps_not_ok: Object.entries(snapshot.sweepNotOk)
       .filter(([, notOk]) => notOk)
       .map(([name]) => name)

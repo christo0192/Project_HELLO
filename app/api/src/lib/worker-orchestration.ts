@@ -12,13 +12,19 @@
  *       error — returns a NON-ready status, and the caller must not dial/admit
  *       on any of them. There is no code path that returns 'ready' without a
  *       ready lease read.
- *   I2  NEVER LEAK A STARTED MACHINE. Every failure exit of `ensureReadyWorker`
- *       after a successful claim runs a best-effort cleanup (stopMachine +
- *       release + reset) so a machine that was started but never confirmed
- *       ready does not sit `started` burning cost. `reapWorkers` is the
- *       independent backstop: it stops ANY non-stopped machine whose claimed
- *       session has no live LiveKit room beyond the grace window, even if every
- *       orchestration event was lost.
+ *   I2  NEVER LEAK A STARTED MACHINE — AND NEVER STOP SOMEBODY ELSE'S.
+ *       Every failure exit of `ensureReadyWorker` after a successful claim runs
+ *       a best-effort cleanup so a machine that was started but never confirmed
+ *       ready does not sit `started` burning cost. That cleanup acts ONLY on a
+ *       claim `release_voice_worker` proved was still ours (`draining`): the
+ *       stop and the reset are both unfenced, so running them on a claim that
+ *       has moved on ends a live call. The one exit that skips cleanup
+ *       entirely is the claim-lost branch, where the lease read already told us
+ *       the machine is not ours and the release CAS — which is NOT
+ *       epoch-fenced — could not tell us otherwise.
+ *       `reapWorkers` is the independent backstop: it stops ANY non-stopped
+ *       machine whose claimed session has no live LiveKit room beyond the grace
+ *       window, even if every orchestration event was lost.
  *
  * ── DISABLED BY DEFAULT ───────────────────────────────────────────────
  * The whole module is inert unless `env.workerOrchestration` is true. Each
@@ -115,9 +121,14 @@ export type LeaseStateReader = (input: {
 
 /**
  * A bounded, read-only LiveKit room-liveness check. `true` iff the named room
- * currently has at least one participant. The reaper treats a THROW as
- * "unknown" and SPARES the machine (never stops on an unproven-dead room), so
- * this must reject rather than invent on failure.
+ * currently has at least one participant.
+ *
+ * The reaper treats a THROW as "unknown" and SPARES the machine (never stops on
+ * an unproven-dead room), so this must reject rather than invent on failure —
+ * with ONE exception it must get right: a room that does not exist is not
+ * unknown, it is empty, and must answer `false`. Reporting a missing room as
+ * "unknown" makes the reaper spare that machine on every pass for ever, which
+ * is how a lease survives with a 32-hour-dead heartbeat while its machine burns.
  */
 export type RoomLivenessChecker = (roomName: string) => Promise<boolean>;
 
@@ -252,6 +263,31 @@ function envelope(
   return data as Record<string, unknown>;
 }
 
+/**
+ * True when a LiveKit room read failed because the room is GONE, not because
+ * the call failed.
+ *
+ * The server SDK raises a Twirp error carrying `code: 'not_found'` for a room
+ * that no longer exists; older/newer builds have surfaced the same condition as
+ * an HTTP 404 and as a message-only error. All three are checked, because the
+ * cost of missing one is the reaper sparing a dead machine for ever — the
+ * failure this classifier exists to end — while the cost of a false positive is
+ * bounded: the reaper then treats a live room as empty and stops a machine one
+ * grace window early, which `list_reapable_voice_workers` already requires to
+ * be past its heartbeat grace.
+ *
+ * Deliberately NARROW on the message: only the SDK's own wording for a missing
+ * room, never a substring that a transport failure could also produce.
+ */
+function isRoomNotFound(err: unknown): boolean {
+  if (err === null || typeof err !== 'object') return false;
+  const e = err as { code?: unknown; status?: unknown; statusCode?: unknown; message?: unknown };
+  if (typeof e.code === 'string' && e.code.toLowerCase() === 'not_found') return true;
+  if (e.status === 404 || e.statusCode === 404) return true;
+  return typeof e.message === 'string'
+    && /requested room does not exist/i.test(e.message);
+}
+
 /** A metadata-only sweep/lifecycle log line. Never a session id or a token. */
 function logEvent(kind: string, extra: Record<string, unknown> = {}): void {
   log.info('unknown_event', { error_category: `worker_orchestration_${kind}`, ...extra });
@@ -288,11 +324,6 @@ export function createWorkerOrchestrationService(
     }
   };
 
-  /**
-   * Best-effort teardown of a claim that never became a live session. Fail-OPEN
-   * on every step: the reaper is the backstop, so a transient Fly/DB error here
-   * must not throw out of the caller's failure path. Enforces I2.
-   */
   /**
    * Give a claimed machine back — and ONLY a machine this session still holds.
    *
@@ -480,11 +511,23 @@ export function createWorkerOrchestrationService(
     if (claimLost) {
       // ── 4a. Somebody else owns this machine now. ────────────────────
       // Deliberately NOT a `ready`: the readiness we may have just seen is
-      // theirs. Cleanup still runs, and is now a no-op by construction — it
-      // stops nothing until `release_voice_worker` proves the claim was ours,
-      // and for a machine that has moved on it answers `already_released`.
+      // theirs.
+      //
+      // AND DELIBERATELY NO TEARDOWN. The obvious move — "cleanup is safe, the
+      // release CAS will answer `already_released`" — is WRONG for half the
+      // cases that get here. `release_voice_worker` (0079) matches on
+      // `(app, machine_id, claimed_session_id)` and NOT on epoch, so when the
+      // same session re-claimed the same machine at a higher epoch the row
+      // still matches ours: release answers `draining`, the teardown believes
+      // it holds the claim, and it stops the machine the NEWER claim just
+      // booted. (`claim_voice_worker` orders `by machine_id limit 1`, so a
+      // re-claim deterministically prefers the same machine — this is not a
+      // rare interleaving.)
+      //
+      // We could not prove ownership from the lease read, so we do not act on
+      // the lease at all. The machine belongs to whoever holds it now; if that
+      // claim is itself dead, the reaper is the thing designed to notice.
       event('claim_lost', { app });
-      await cleanupClaim(app, machineId, sessionId);
       return { status: 'timeout' };
     }
 
@@ -511,36 +554,17 @@ export function createWorkerOrchestrationService(
   }): Promise<void> {
     if (!enabled) return;
     const { app, machineId, sessionId } = input;
-    // release → stop → reset, in that order, each fail-open. The order matters:
-    // release drops the claim (so the reaper won't fight us), stop halts the
-    // cost, reset returns the row to the stopped pool. A Fly error on stop does
-    // NOT abort the reset — the reaper will stop it later, and the pool row
-    // should still be reusable. Idempotent: release/reset are no-ops on an
-    // already-released/stopped row.
-    try {
-      await deps.rpc('release_voice_worker', {
-        p_app: app,
-        p_machine_id: machineId,
-        p_session_id: sessionId,
-        p_now: new Date(now()).toISOString(),
-      });
-    } catch {
-      /* fail-open */
-    }
-    try {
-      await deps.fly.stopMachine(app, machineId);
-    } catch {
-      /* fail-open: the reaper stops it later */
-    }
-    try {
-      await deps.rpc('reset_voice_worker', {
-        p_app: app,
-        p_machine_id: machineId,
-        p_now: new Date(now()).toISOString(),
-      });
-    } catch {
-      /* fail-open */
-    }
+    // release → stop → reset, in that order. The order matters: release drops
+    // the claim (so the reaper won't fight us), stop halts the cost, reset
+    // returns the row to the stopped pool.
+    //
+    // Routed through the SAME ownership proof the claim teardown uses, and for
+    // the same reason: `stopMachine` and `reset_voice_worker` are both
+    // unfenced, so running them for a claim that has moved on stops somebody
+    // else's live call. This path's window is shorter — the claim is seconds
+    // old, not two minutes — but "shorter" is not an argument for keeping the
+    // destructive version of a sequence we already have a safe version of.
+    await cleanupClaim(app, machineId, sessionId);
   }
 
   /**
@@ -728,9 +752,25 @@ export function createWorkerOrchestrationService(
       if (c.claimedSessionId !== null) {
         try {
           live = await deps.roomIsLive(roomNameForSession(c.claimedSessionId));
-        } catch {
-          // Unknown liveness — do not stop this machine this pass.
-          continue;
+        } catch (err) {
+          // ── A ROOM THAT IS GONE IS NOT "UNKNOWN" ──────────────────────
+          // The rule is never to stop on an UNPROVEN-dead room, and a
+          // `not_found` proves the opposite of unknown: the room has already
+          // been torn down, so nobody is in it. Reading that as unknown is how
+          // a lease survives with a 32-hour-dead heartbeat while its machine
+          // burns — the reaper asks about a room that no longer exists, gets a
+          // throw, and declines to act, on every pass, for ever. One such
+          // lease held half a two-machine pool for four days.
+          //
+          // Classified HERE rather than inside the checker so the rule holds
+          // for every injected `RoomLivenessChecker`, and so it is reachable
+          // from a test that does not need the LiveKit SDK.
+          if (!isRoomNotFound(err)) {
+            // Anything else really is unknown — a transport failure proves
+            // nothing about the room. Spare it this pass.
+            continue;
+          }
+          live = false;
         }
       }
       if (live) continue; // a live room is real work; leave it alone.
@@ -931,11 +971,15 @@ export function createDefaultWorkerOrchestrationService(
 
   // The LiveKit RoomServiceClient is imported lazily on first use, so a
   // deployment that never reaps never loads the SDK. A room is LIVE iff it has
-  // at least one participant. `listParticipants` throws for a room that does
-  // not exist on some SDK versions — the reaper treats that throw as "unknown"
-  // and spares, so we translate a not-found into `false` (no participants =
-  // not live) only when the SDK returns cleanly; a genuine transport error
-  // still propagates.
+  // at least one participant.
+  //
+  // It REJECTS rather than inventing, including for a room that no longer
+  // exists — `listParticipants` throws `not_found` for that. The reaper
+  // classifies the rejection (see `isRoomNotFound` at its call site): a missing
+  // room is empty, anything else is genuinely unknown and spares the machine.
+  // An earlier comment here claimed this checker performed that translation
+  // itself. It did not, and it should not — putting the rule in the reaper
+  // makes it hold for every injected checker, not just this one.
   let roomClient: { listParticipants(room: string): Promise<Array<unknown>> } | undefined;
   const roomIsLive: RoomLivenessChecker = async (roomName) => {
     if (!roomClient) {

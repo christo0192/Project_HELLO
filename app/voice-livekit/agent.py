@@ -222,12 +222,94 @@ SESSION_MAX_RESIDENCY_SEC = _bounded_float_env(
 # and produces a diagnosable `gate_timed_out` instead of a silent server-side
 # reap.
 #
+# ── IT MEASURES THE POST-ANSWER STRETCH, AND ONLY THAT ────────────────────
+# `PHONE_OPENING_GATE_SECONDS` is defined as the spend "from the moment
+# somebody answers", but `run_phone_gate`'s FIRST await is the ring — the
+# bounded `wait_for_participant()` (45s in production), and in bounce mode a
+# further verified-answer wait (90s). Wrapping the whole coroutine in a 116s
+# timeout therefore charged the ring against a budget sized for the
+# conversation: a candidate who picks up on ring 25 would have had 91s for a
+# flow this repo itself sizes at up to 106s, and one identity re-ask would cut
+# off a perfectly healthy call. The two numbers describe different stretches
+# and comparing them directly was the error.
+#
+# So the wall clock handed to `asyncio.wait_for` is this budget PLUS the
+# pre-answer waits, each of which is already separately bounded — see
+# `_phone_gate_wall_clock_seconds`. The knob keeps its meaning (how long the
+# conversation half of the gate may take) and the wrapper covers what it
+# actually wraps.
+#
 # Floor of 30s: below the classify wait (40s) the bound would cut off healthy
 # calls. Ceiling of 600s: a gate that has run ten minutes is wedged by
 # definition.
 PHONE_GATE_MAX_SECONDS = _bounded_float_env(
     "PHONE_GATE_MAX_SECONDS", 116.0, 30.0, 600.0
 )
+
+
+def _phone_gate_wall_clock_seconds() -> float:
+    """The timeout for the WHOLE gate coroutine, ring included.
+
+    `PHONE_GATE_MAX_SECONDS` budgets the post-answer conversation. The gate
+    also owns the waits that precede the answer, and those are the ones whose
+    duration is set by the candidate rather than by us:
+
+      * `wait_for_participant()` — the ring, `PHONE_PARTICIPANT_WAIT_SEC`.
+      * in bounce mode only, the server-verified answer wait,
+        `PHONE_ANSWER_TIMEOUT_SEC`.
+
+    Both are ALREADY bounded, and a gate that overruns in either of them
+    returns cleanly on its own (`GATE_NO_PARTICIPANT`), so adding them here
+    does not weaken the wedge detection this bound exists for — it only stops
+    the bound firing on a call that simply rang for a while.
+    """
+    pre_answer = phone.phone_participant_wait_sec()
+    if phone.phone_bounce_mode():
+        pre_answer += phone.phone_answer_timeout_sec()
+    return pre_answer + PHONE_GATE_MAX_SECONDS
+
+
+async def _post_gate_purging_terminal(
+    events: Any, attempt_id: str, epoch: Any, origin: str,
+) -> bool:
+    """Post the terminal that DESTROYS the pre-consent recording. Never raises.
+
+    The server egress starts at `call.answered` — before the candidate has been
+    told anything — and only a `PURGE_BEFORE_EVENTS` member destroys that
+    audio. Every gate exit after the answer therefore owes one, and the two
+    that can happen without the gate reaching a verdict of its own (the leg
+    dropping mid-await, and the wall clock firing) both come here.
+
+    Shared rather than duplicated: this lane already shipped a `_post`
+    NameError once by writing the same terminal twice at two sites.
+
+    Posted DIRECTLY rather than through `_post_phone_event_with_retry`, which
+    does not forward `epoch` — every other terminal in this gate carries it,
+    and dropping it would change which staleness rules the server applies. One
+    bounded retry covers a transport blip; the post is idempotent by 0042's
+    deterministic event id.
+
+    `post_event` FAILS CLOSED by RETURNING a not-ok outcome rather than
+    raising, so catching exceptions alone would be a guard that could not fire.
+    An unapplied event means the recording was NOT purged — the one thing this
+    exists to guarantee — so it is logged rather than assumed.
+    """
+    applied = False
+    for _ in range(2):
+        try:
+            outcome = await events.post_event(
+                attempt_id, "candidate.deferred_pre_disclosure", epoch=epoch,
+            )
+            applied = phone.event_applied(outcome)
+        except Exception:  # noqa: BLE001 — a terminal must never re-raise
+            applied = False
+        if applied:
+            return True
+    _log.warn(
+        "unknown_event", error_type="phone_gate_outcome",
+        error_category=f"{origin}_terminal_not_applied",
+    )
+    return False
 
 
 def _int_env(name: str, default: int) -> int:
@@ -8588,13 +8670,27 @@ async def _run_phone_session(
         # falls through to the post-gate body, whose first check returns on
         # `assessment_allowed=False` — inside the `try` whose `finally` closes
         # the room and finishes the recording.
-        result = await asyncio.wait_for(_run_gate(), timeout=PHONE_GATE_MAX_SECONDS)
+        #
+        # The wall clock covers the RING too, because the gate does — see
+        # `_phone_gate_wall_clock_seconds`. Charging the ring against a
+        # conversation budget would cut off a candidate who simply took a few
+        # seconds to pick up.
+        _gate_wall_clock = _phone_gate_wall_clock_seconds()
+        result = await asyncio.wait_for(_run_gate(), timeout=_gate_wall_clock)
     except asyncio.TimeoutError:
         _log.warn(
             "unknown_event", error_type="phone_gate_outcome",
             schema=phone.GATE_TIMED_OUT,
-            duration_sec=PHONE_GATE_MAX_SECONDS,
+            duration_sec=_gate_wall_clock,
         )
+        # PURGE THE PRE-CONSENT AUDIO. The egress starts at `call.answered`,
+        # before anybody has been told they are being recorded, and ONLY a
+        # `PURGE_BEFORE_EVENTS` member destroys it. The sibling
+        # `PhoneParticipantGone` branch below has posted this terminal from the
+        # day it was written, for exactly this reason; a timeout that posted
+        # nothing would leave that audio in the bucket and the engagement stuck
+        # in `dialing` — a worse outcome than the freeze it replaces.
+        await _post_gate_purging_terminal(events, attempt_id, epoch, "gate_timed_out")
         result = phone.PhoneGateResult(phone.GATE_TIMED_OUT, events=[], spoken=[])
     except phone.PhoneParticipantGone:
         _log.info(
@@ -8603,35 +8699,11 @@ async def _run_phone_session(
         )
         # Post the PURGING terminal before returning. Not crashing is only half
         # the fix: the egress starts at `call.answered`, and only a
-        # `PURGE_BEFORE_EVENTS` member destroys that audio. Best-effort — a
-        # failure here must not re-raise into the entrypoint, which is the very
-        # crash being removed.
-        # Posted DIRECTLY rather than through `_post_phone_event_with_retry`,
-        # which does not forward `epoch` — every other terminal in this gate
-        # carries it, and dropping it here would change which staleness rules
-        # the server applies. One bounded retry covers a transport blip; the
-        # post is idempotent by 0042's deterministic event id.
-        applied = False
-        for _ in range(2):
-            try:
-                outcome = await events.post_event(
-                    attempt_id, "candidate.deferred_pre_disclosure", epoch=epoch,
-                )
-                applied = phone.event_applied(outcome)
-            except Exception:  # noqa: BLE001
-                applied = False
-            if applied:
-                break
-        if not applied:
-            # `post_event` FAILS CLOSED by returning a not-ok outcome rather
-            # than raising, so catching exceptions alone was a guard that could
-            # not fire. An unapplied event means the pre-consent recording was
-            # NOT purged — the one thing this block exists to guarantee — so it
-            # has to be visible rather than assumed.
-            _log.warn(
-                "unknown_event", error_type="phone_gate_outcome",
-                error_category="participant_left_terminal_not_applied",
-            )
+        # `PURGE_BEFORE_EVENTS` member destroys that audio. Shared with the
+        # wall-clock exit above — see `_post_gate_purging_terminal`.
+        await _post_gate_purging_terminal(
+            events, attempt_id, epoch, "participant_left",
+        )
         result = phone.PhoneGateResult(
             phone.GATE_PARTICIPANT_LEFT, events=[], spoken=[],
         )

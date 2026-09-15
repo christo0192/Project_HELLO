@@ -79,6 +79,23 @@ begin
     raise exception 'lcp96: a NEVER-ANSWERED leg was given grace it must not get (state=%)', v_state;
   end if;
 
+  -- VOICEMAIL: answered, and at the IDENTICAL lease expiry as the spared leg
+  -- — 30s past, well inside the grace. It is reclaimed anyway, because the
+  -- grace protects a CONVERSATION and `machine` is a classified answering
+  -- machine with nobody on it. `answered_at` is stamped for voicemail too
+  -- (0055 stamps it on the answered_unclassified transition regardless of who
+  -- picked up), so a grace keyed on that column alone would hold a fleet slot
+  -- two extra minutes for every voicemail in a burst — at a cap of ten, that
+  -- is a candidate who does not get called.
+  select a.state into v_state
+    from screening_v2.phone_call_attempts a
+    join screening_v2.phone_engagements e on e.id = a.engagement_id
+    join screening_v2.ashby_application_links l on l.id = e.application_link_id
+   where l.external_application_id = 'lcp96-voicemail-app';
+  if v_state is distinct from 'abandoned' then
+    raise exception 'lcp96: a VOICEMAIL leg was given the human grace (state=%)', v_state;
+  end if;
+
   -- And the spared leg is reclaimed once the grace HAS elapsed. Without this
   -- the fix would be indistinguishable from "answered legs are immortal",
   -- which would leak a fleet slot on every crashed call.
@@ -94,7 +111,7 @@ begin
   end if;
 
   raise notice 'lcp96/A: PASS — answered+inside-grace spared, answered+past-grace reaped, '
-               'never-answered reaped with no grace, and the grace does expire';
+               'never-answered and VOICEMAIL reaped with no grace, and the grace does expire';
 
   -- ═══════════════════════════════════════════════════════════════════
   -- B. THE ORPHAN SESSION IS FINALLY VISIBLE
@@ -106,7 +123,7 @@ begin
   v_expired  := (v_res ->> 'expired')::integer;
   v_examined := (v_res ->> 'examined')::integer;
 
-  -- ORPHAN: no attempt, no live engagement, past the grace → terminalized.
+  -- ORPHAN: nothing in flight for this candidate, past the grace → taken.
   select status, terminal_reason into v_status, v_reason
     from screening_v2.call_sessions where external_call_id = 'phone-lcp96-orphan';
   if v_status is distinct from 'expired' or v_reason is distinct from 'idle_timeout' then
@@ -114,42 +131,58 @@ begin
       v_status, v_reason;
   end if;
 
-  -- YOUNG: same shape, 60s old. Inside the grace, so untouched — taking it
-  -- would race an admission that is still in flight.
+  -- FINISHED: the candidate HAS had an attempt, but it is terminal. The
+  -- stranded session must still be reapable, or the guard below would make the
+  -- sweep useless for every candidate who has ever been called.
+  select status into v_status
+    from screening_v2.call_sessions where external_call_id = 'phone-lcp96-finished';
+  if v_status is distinct from 'expired' then
+    raise exception 'lcp96: a stranded session whose call is OVER was not reaped (status=%)',
+      v_status;
+  end if;
+
+  -- ── THE ONE THAT MATTERS ────────────────────────────────────────────
+  -- LIVE_GATE: a real call, mid-opening-gate. Answered, classified `human`,
+  -- `start_phone_assessment` not yet run — so the attempt's `session_id` is
+  -- still NULL, the engagement's is still NULL, and the session is still
+  -- `waiting` and two hours old from earlier refused dials. Every
+  -- SESSION-level check reads exactly like the orphan above; only the
+  -- candidate's live attempt separates them.
+  --
+  -- Terminalizing it is not a cosmetic error: `list_terminal_session_leases`
+  -- would then hand the worker lease to `releaseTerminalSessions`, which stops
+  -- the Fly machine — with a consenting human on the line — and
+  -- `start_phone_assessment` would answer `session_not_active` if the machine
+  -- somehow survived.
+  select status into v_status
+    from screening_v2.call_sessions where external_call_id = 'phone-lcp96-live_gate';
+  if v_status is distinct from 'waiting' then
+    raise exception 'lcp96: a session with a LIVE CALL on it was expired (status=%) '
+                    '— this is the Sep 10 failure, reintroduced by the sweep', v_status;
+  end if;
+
+  -- YOUNG: inside the grace. Taking it would race an admission in flight.
   select status into v_status
     from screening_v2.call_sessions where external_call_id = 'phone-lcp96-young';
   if v_status is distinct from 'waiting' then
     raise exception 'lcp96: a session INSIDE the grace was expired (status=%)', v_status;
   end if;
 
-  -- DIALLED: an attempt exists against it. A real call happened here.
-  select status into v_status
-    from screening_v2.call_sessions where external_call_id = 'phone-lcp96-dialled';
-  if v_status is distinct from 'waiting' then
-    raise exception 'lcp96: a session WITH an attempt was expired (status=%)', v_status;
+  -- COLLATERAL BOUND. The four checks above name the rows we know about; this
+  -- one bounds what the pass did to rows we did not. Counting only the
+  -- fixture's own namespace keeps it independent of whatever else the harness
+  -- has seeded.
+  if v_expired <> 2 then
+    raise exception 'lcp96: orphan sweep expired % sessions (expected exactly 2: orphan + finished)',
+      v_expired;
+  end if;
+  if v_examined < 2 then
+    raise exception 'lcp96: orphan sweep examined only % rows', v_examined;
   end if;
 
-  -- ENGAGED: a non-terminal engagement points at it — a screening in flight.
-  select status into v_status
-    from screening_v2.call_sessions where external_call_id = 'phone-lcp96-engaged';
-  if v_status is distinct from 'waiting' then
-    raise exception 'lcp96: a session held by a LIVE engagement was expired (status=%)', v_status;
-  end if;
-
-  -- Exactly one of the four was taken. A sweep that terminalized more (or
-  -- fewer) would still satisfy the four checks above if the counts lied, so
-  -- the RETURNED numbers are asserted too — they are what the runtime
-  -- publishes to the health surface.
-  if v_expired < 1 then
-    raise exception 'lcp96: orphan sweep reported expired=% (expected >= 1)', v_expired;
-  end if;
-  if v_examined < v_expired then
-    raise exception 'lcp96: examined=% < expired=% — the counters disagree', v_examined, v_expired;
-  end if;
-
-  -- IDEMPOTENT: the second pass finds nothing left of ours. `expired` counts
-  -- only rows this pass drove, and the orphan is now terminal and invisible
-  -- to the `status = 'waiting'` selector.
+  -- IDEMPOTENT: a repeat pass takes nothing more. `expired` counts only rows
+  -- this pass drove, and the two it took are terminal and invisible to the
+  -- `status = 'waiting'` selector.
   select screening_v2.sweep_phone_orphan_sessions(25, 900, v_now) into v_res;
   if (v_res ->> 'expired')::integer <> 0 then
     raise exception 'lcp96: a second pass expired % more sessions — not idempotent',
@@ -167,8 +200,18 @@ begin
     raise exception 'lcp96: the orphan was terminalized as grace_timeout — it would be scored';
   end if;
 
-  raise notice 'lcp96/B: PASS — orphan expired/idle_timeout; young, dialled and engaged '
-               'untouched; counts agree; second pass is a no-op';
+  -- THE GRACE FLOOR. A caller asking for a grace shorter than the retry ladder
+  -- must not get one: `infraDeferBackoffSeconds` is 300s, so a 60s grace would
+  -- have the sweep racing the very redial it is cleaning up after.
+  select screening_v2.sweep_phone_orphan_sessions(25, 60, v_now) into v_res;
+  if (v_res ->> 'expired')::integer <> 0 then
+    raise exception 'lcp96: a 60-second grace request took % rows — the floor is not enforced',
+      v_res ->> 'expired';
+  end if;
+
+  raise notice 'lcp96/B: PASS — orphan and finished reaped as expired/idle_timeout; a '
+               'LIVE mid-gate call and a young session untouched; grace floor '
+               'enforced; second pass a no-op';
 end;
 $$;
 

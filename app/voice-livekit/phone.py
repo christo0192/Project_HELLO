@@ -3928,24 +3928,28 @@ async def rebase_lease_on_answer(
         # answers `lease_lost` to a null session or epoch, so calling would be
         # a guaranteed-useless round trip on the critical path.
         return False
+    # The WHOLE body, not just the round trip. This runs as a detached task, so
+    # anything that escapes surfaces only as "Task exception was never
+    # retrieved" at loop teardown — and the two lines below reach into an
+    # outcome object and format a log record, neither of which is guaranteed
+    # total. A best-effort renewal that can still raise is not best-effort.
     try:
         outcome = await client.heartbeat_attempt(attempt_id, session_id, epoch=epoch)
+        if outcome.ok:
+            _log.info(
+                "unknown_event", error_type="phone_lease_rebase",
+                error_category="rebased_on_answer",
+            )
+            return True
+        _log.warn(
+            "unknown_event", error_type="phone_lease_rebase",
+            error_category=outcome.status or outcome.error_category or _ERR_MALFORMED,
+        )
     except Exception:  # noqa: BLE001 — best effort, never fatal
         _log.warn(
             "unknown_event", error_type="phone_lease_rebase",
             error_category=_ERR_TRANSPORT,
         )
-        return False
-    if outcome.ok:
-        _log.info(
-            "unknown_event", error_type="phone_lease_rebase",
-            error_category="rebased_on_answer",
-        )
-        return True
-    _log.warn(
-        "unknown_event", error_type="phone_lease_rebase",
-        error_category=outcome.status or outcome.error_category or _ERR_MALFORMED,
-    )
     return False
 
 
@@ -5554,33 +5558,43 @@ async def run_phone_gate(
         )
         if event_applied(answered) or answered.duplicate:
             events.append("call.answered")
-            # RE-BASE THE LEASE ON THE ANSWER. The clock has been running since
-            # ADMISSION — through the dial, the ring, and any machine cold boot
-            # — so without this the conversation inherits whatever is left
-            # rather than its own budget. See `rebase_lease_on_answer`; this is
-            # what decouples a late answer (the signature of a cold pool, i.e.
-            # of CONCURRENCY) from a lease that expires mid-call.
-            #
-            # FIRED, NOT AWAITED, and that is deliberate on two counts. This is
-            # the answer→disclosure path: every await here is silence the
-            # candidate hears before the bot says anything, and this lane has
-            # spent three PRs removing exactly that (#279, #289, #290). And the
-            # renewal is best-effort by construction — nothing downstream reads
-            # its result, so awaiting it buys nothing but dead air.
-            #
-            # The reference is held so the task cannot be garbage-collected
-            # mid-flight, and the gate's own teardown outlives it: the renewal
-            # is a single bounded HTTP round trip.
-            _rebase = asyncio.ensure_future(
-                rebase_lease_on_answer(client, attempt_id, session_id, epoch)
-            )
-            _lease_rebase_tasks.add(_rebase)
-            _rebase.add_done_callback(_lease_rebase_tasks.discard)
         else:
             _log.warn(
                 "unknown_event", error_type="phone_call_answered_not_applied",
                 error_category="call_answered_unconfirmed",
             )
+
+        # RE-BASE THE LEASE ON THE ANSWER. The clock has been running since
+        # ADMISSION — through the dial, the ring, and any machine cold boot —
+        # so without this the conversation inherits whatever is left rather
+        # than its own budget. See `rebase_lease_on_answer`; this is what
+        # decouples a late answer (the signature of a cold pool, i.e. of
+        # CONCURRENCY) from a lease that expires mid-call.
+        #
+        # OUTSIDE the `if`, deliberately. The event post and the lease renewal
+        # are two independent round trips, and gating the renewal on the post
+        # made a single transport blip lose BOTH at once: no `answered_at`
+        # stamped (so `reclaim_phone_attempt_leases` grants no answered grace)
+        # AND no renewal (so the admission lease runs out on schedule) — the
+        # 2026-09-10 shape exactly, on the one call that most needed the fix.
+        # A human picked up; that is true whether or not the server heard about
+        # it, and it is the only fact this renewal depends on.
+        #
+        # FIRED, NOT AWAITED, and that is deliberate on two counts. This is the
+        # answer→disclosure path: every await here is silence the candidate
+        # hears before the bot says anything, and this lane has spent three PRs
+        # removing exactly that (#279, #289, #290). And the renewal is
+        # best-effort by construction — nothing downstream reads its result, so
+        # awaiting it buys nothing but dead air.
+        #
+        # The reference is held so the task cannot be garbage-collected
+        # mid-flight, and the gate's own teardown outlives it: the renewal is a
+        # single bounded HTTP round trip.
+        _rebase = asyncio.ensure_future(
+            rebase_lease_on_answer(client, attempt_id, session_id, epoch)
+        )
+        _lease_rebase_tasks.add(_rebase)
+        _rebase.add_done_callback(_lease_rebase_tasks.discard)
 
     # ── Durable consent short-circuit: a re-entry never re-asks ────────────
     # A worker deploy/crash mid-call re-dispatches this leg into a conversation

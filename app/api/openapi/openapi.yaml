@@ -11229,7 +11229,7 @@ components:
     PhoneRuntimeState:
       description: PROCESS-LOCAL view of the phone runtime loops. Describes the loops running in THIS api process and nothing else; on a multi-process deployment each replica answers for itself, so enabled false means this process is not running the loops, never that the fleet is idle. Aggregates only - counts, stable status and skip/refusal codes, and loop names. No engagement id, candidate id, attempt id, phone number, provider payload or lease token appears anywhere in this object.
       type: object
-      required: [enabled, running, loops, last_due, config, dial_jobs, last_reclaimed, last_expired, last_reconciled, last_rolled, last_stranded, last_rec_stranded, sweeps_not_ok, start_failed]
+      required: [enabled, running, loops, last_due, config, dial_jobs, last_reclaimed, last_expired, last_reconciled, last_rolled, last_stranded, last_rec_stranded, last_orphan_expired, sweeps_not_ok, start_failed]
       properties:
         enabled:
           description: Whether this process constructed and registered a runtime. False is the shipped default and is not a fault.
@@ -11278,8 +11278,12 @@ components:
           description: 0071 / X5b. Sessions driven terminal by the most recent stranded-recording pass so a crashed call's authoritative recording could finalize. The OPPOSITE shape from last_stranded - a still-in_progress SESSION with an active egress and no object key, which a worker crash leaves forever because the 0038 finalize trigger fires only on a terminal transition. The pass drives it to expired/grace_timeout, which fires that trigger and enqueues finalization; it never touches a live session (grace >= the worker residency cap). Null on the same two terms as last_reclaimed, with sweeps_not_ok naming recstrand.
           type: integer
           nullable: true
+        last_orphan_expired:
+          description: 0096. Orphan `waiting` sessions terminalized by the most recent pass - and every one of them is a worker lease RELEASED. ensureSession writes the call_sessions row BEFORE admission runs, so a refused dial strands a waiting session with no attempt permanently, and a later dial that ADOPTS one claims a worker lease against it that only a terminal session can release; one such row held half a two-machine pool for four days. No other sweep can see the shape - the partial-finalize scan INNER-joins the attempts, the lease reaper scans attempts, the terminal-lease lister needs a terminal session. Drives expired/idle_timeout, which the scoring eligibility gate does NOT admit, because an orphan has no conversation to score. Null on the same two terms as last_reclaimed, with sweeps_not_ok naming orphansess.
+          type: integer
+          nullable: true
         sweeps_not_ok:
-          description: Names of the sweeps whose most recent run did NOT answer ok, as stable codes and sorted. The vocabulary is SIX names - reclaim, expire, reconcile, dayroll, stranded, recstrand. Empty is the healthy state. A count of 0 on a sweep that is NOT named here means "ran, nothing to do", which is a different fact from "the sweep did not happen"; only this array distinguishes them, which is why every one of the six nulls its count and names itself here on a non-ok status rather than publishing a quiet zero. Non-empty contributes the phone_sweep_not_ok degradation reason.
+          description: Names of the sweeps whose most recent run did NOT answer ok, as stable codes and sorted. The vocabulary is NINE names - reclaim, expire, reconcile, dayroll, sameday, stranded, recstrand, partialfin, orphansess. Empty is the healthy state. A count of 0 on a sweep that is NOT named here means "ran, nothing to do", which is a different fact from "the sweep did not happen"; only this array distinguishes them, which is why every one of the six nulls its count and names itself here on a non-ok status rather than publishing a quiet zero. Non-empty contributes the phone_sweep_not_ok degradation reason.
           type: array
           items:
             type: string

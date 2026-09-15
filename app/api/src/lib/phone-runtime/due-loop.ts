@@ -303,6 +303,37 @@ export interface PhoneDueDeps {
 export interface PhoneDueOptions {
   readonly now: Date;
   readonly limit: number;
+  /**
+   * The clock read again AT EACH DIAL. Defaults to the host clock; injected
+   * only so a test can pin it.
+   *
+   * ── WHY `now` IS NOT ENOUGH, AND WHY THIS IS NOT A NICETY ────────────
+   * `now` is the instant the PASS began, and the pass is SEQUENTIAL: each
+   * `dial()` awaits `ensureReadyWorker`, which claims a machine, starts it on
+   * Fly and then polls for readiness for up to `PHONE_WORKER_READY_TIMEOUT_SEC`
+   * (120s). A cold boot is ~30s and a degraded one is minutes, so by the time
+   * the eighth of ten dials is placed the pass clock can be several minutes
+   * stale.
+   *
+   * That clock is handed to `admit_phone_attempt` as `p_now`, and 0042 mints
+   * `lease_expires_at := p_now + lease_seconds` FROM IT. A late dial in a long
+   * pass is therefore admitted with a lease that is already half spent — or,
+   * past `leaseSeconds` of drift, one that has ALREADY EXPIRED. The reclaim
+   * sweep runs on a real clock and abandons the attempt while the candidate's
+   * phone is still ringing; they then answer and talk to a bot whose attempt
+   * the database has written off, and the screening is discarded because
+   * `assessment.completed` is gated on `in_call`.
+   *
+   * The `lease_too_short` gate could not catch it: it measured the remaining
+   * lease against the SAME stale clock and always saw a full window. Nor could
+   * the answer re-base — `heartbeat_phone_attempt_by_epoch` requires
+   * `lease_expires_at > p_now` and refuses by design to revive a lapsed lease.
+   *
+   * Reading the clock here also re-dates the IST-window check inside
+   * admission, so a pass that begins inside the window and runs past its close
+   * stops dialling instead of placing calls outside it.
+   */
+  readonly clock?: () => Date;
 }
 
 const ZERO: PhoneDueResult = Object.freeze({
@@ -532,13 +563,15 @@ export async function runPhoneDuePass(
     if (sessionId === null) { bump(skipped, 'no_session'); continue; }
 
     offered += 1;
+    // FRESH, per dial. See `PhoneDueOptions.clock`: this instant becomes the
+    // attempt's lease start, and the pass clock can be minutes old by now.
     const result = await deps.dialer.dial({
       engagementId: row.engagementId,
       candidateId: row.candidateId,
       sessionId,
       kind,
       number,
-      now: options.now,
+      now: (options.clock ?? (() => new Date()))(),
       testGateId: testGate?.id,
     });
     if (result.status === 'dialing') dialing += 1;

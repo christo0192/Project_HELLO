@@ -225,8 +225,6 @@ describe('ensureReadyWorker', () => {
     const fly = fakeFly();
     const { rpc, calls } = fakeRpc({
       claim_voice_worker: [{ data: { status: 'claimed', machine_id: MACHINE, epoch: 4 } }],
-      // The claim moved on, so OUR release matches no row.
-      release_voice_worker: [{ data: { status: 'already_released' } }],
     });
     const svc = createWorkerOrchestrationService(baseDeps({
       fly: fly.client,
@@ -243,6 +241,11 @@ describe('ensureReadyWorker', () => {
     // unconditional on the session, so running them here would have killed it.
     expect(fly.calls).not.toContain(`stop:${APP}:${MACHINE}`);
     expect(calls.map((c) => c.name)).not.toContain('reset_voice_worker');
+    // Not even the release is attempted. The release CAS is NOT epoch-fenced,
+    // so on the sibling shape below (same session, newer epoch) it answers
+    // `draining` and the teardown would believe it holds a claim it does not.
+    // On an unprovable claim the only safe move is to touch nothing.
+    expect(calls.map((c) => c.name)).not.toContain('release_voice_worker');
   });
 
   it('a HIGHER epoch on our own session id is still a lost claim', async () => {
@@ -251,10 +254,17 @@ describe('ensureReadyWorker', () => {
     // only the fencing token can tell the two claims apart — and acting on the
     // newer claim's readiness with the older claim's epoch would mark busy,
     // release and stop against a lifecycle that is no longer ours.
+    //
+    // THIS shape is why the claim-lost branch runs no teardown at all.
+    // `release_voice_worker` matches on (app, machine_id, claimed_session_id)
+    // and NOT on epoch (0079), so for the SAME session at a newer epoch it
+    // answers `draining` — the very proof the teardown reads as ownership —
+    // and would stop the machine the newer claim just booted. The fake is left
+    // UNSCRIPTED deliberately, so it answers `draining` exactly as the real RPC
+    // would; the assertions below pass only because nothing asks it.
     const fly = fakeFly();
     const { rpc, calls } = fakeRpc({
       claim_voice_worker: [{ data: { status: 'claimed', machine_id: MACHINE, epoch: 4 } }],
-      release_voice_worker: [{ data: { status: 'already_released' } }],
     });
     const svc = createWorkerOrchestrationService(baseDeps({
       fly: fly.client,
@@ -266,6 +276,7 @@ describe('ensureReadyWorker', () => {
     expect(r).toEqual({ status: 'timeout' });
     expect(fly.calls).not.toContain(`stop:${APP}:${MACHINE}`);
     expect(calls.map((c) => c.name)).not.toContain('reset_voice_worker');
+    expect(calls.map((c) => c.name)).not.toContain('release_voice_worker');
   });
 
   it('an EQUAL epoch is OUR claim — readiness on it is believed', async () => {
@@ -296,6 +307,14 @@ describe('ensureReadyWorker', () => {
     const fly = fakeFly();
     const { rpc, calls } = fakeRpc({
       claim_voice_worker: [{ data: { status: 'claimed', machine_id: MACHINE, epoch: 1 } }],
+      // What the REAL RPC answers for the row this test describes. A `stopped`
+      // lease carries a null claim, and `release_voice_worker` requires
+      // `claimed_session_id = p_session_id and state in ('starting','ready',
+      // 'busy','draining')` — so it matches nothing and answers
+      // `already_released`. Scripted explicitly because the unscripted default
+      // is `draining`, which would let this test assert a teardown production
+      // would never perform.
+      release_voice_worker: [{ data: { status: 'already_released' } }],
     });
     let reads = 0;
     let t = 0;
@@ -313,11 +332,62 @@ describe('ensureReadyWorker', () => {
       app: APP, pipeline: 'phone', sessionId: SESSION, readyTimeoutSec: 20,
     });
     expect(r).toEqual({ status: 'timeout' });
-    // It kept polling rather than bailing on read one.
+    // It kept polling rather than bailing on read one — the point of the test.
     expect(reads).toBeGreaterThan(1);
-    // And because the release proved the claim WAS ours, teardown ran in full.
+    // Teardown asked, could not prove ownership, and stopped nothing. The
+    // machine is left to the reaper, which is the designed backstop.
+    expect(calls.map((c) => c.name)).toContain('release_voice_worker');
+    expect(fly.calls).not.toContain(`stop:${APP}:${MACHINE}`);
+    expect(calls.map((c) => c.name)).not.toContain('reset_voice_worker');
+  });
+
+  it('a room that no longer EXISTS is not live, and the reaper stops its machine', async () => {
+    // The wedge that ate half the pool for four days. `listParticipants` throws
+    // `not_found` once a room is gone; the reaper reads any throw as "liveness
+    // unknown" and SPARES — so the machine whose room had already been torn
+    // down was spared on every pass, for ever, while its lease sat `ready`
+    // with a 32-hour-dead heartbeat. A missing room is not unknown; it is
+    // empty.
+    const fly = fakeFly();
+    const { rpc } = fakeRpc({
+      list_reapable_voice_workers: [{
+        data: [{ machine_id: MACHINE, state: 'ready', claimed_session_id: SESSION }],
+      }],
+      list_orphaned_voice_worker_leases: [{ data: [] }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({
+      fly: fly.client,
+      rpc,
+      roomIsLive: async () => {
+        // The shape the LiveKit server SDK raises for a room that is gone.
+        throw Object.assign(new Error('requested room does not exist'), { code: 'not_found' });
+      },
+    }));
+
+    const r = await svc.reapWorkers({ app: APP });
+    expect(r.stopped).toBe(1);
     expect(fly.calls).toContain(`stop:${APP}:${MACHINE}`);
-    expect(calls.map((c) => c.name)).toContain('reset_voice_worker');
+  });
+
+  it('a room check that fails for ANY OTHER reason still spares the machine', async () => {
+    // The rule the not-found translation must not erode: never stop a machine
+    // on an unproven-dead room. A transport error proves nothing.
+    const fly = fakeFly();
+    const { rpc } = fakeRpc({
+      list_reapable_voice_workers: [{
+        data: [{ machine_id: MACHINE, state: 'ready', claimed_session_id: SESSION }],
+      }],
+      list_orphaned_voice_worker_leases: [{ data: [] }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({
+      fly: fly.client,
+      rpc,
+      roomIsLive: async () => { throw new Error('ECONNRESET'); },
+    }));
+
+    const r = await svc.reapWorkers({ app: APP });
+    expect(r.stopped).toBe(0);
+    expect(fly.calls).not.toContain(`stop:${APP}:${MACHINE}`);
   });
 
   it('teardown does NOT reset a machine Fly refused to stop', async () => {
@@ -404,7 +474,18 @@ describe('ensureReadyWorker', () => {
 describe('releaseWorker', () => {
   it('release → stop → reset, in order', async () => {
     const order: string[] = [];
-    const rpc: RpcCaller = async (name) => { order.push(name); return { data: { status: 'ok' }, error: null }; };
+    // `draining` is what the real `release_voice_worker` answers when the
+    // caller DID hold the claim — and holding the claim is the premise of this
+    // test. The teardown now treats that answer as its proof of ownership, so
+    // a fake that said `ok` would assert the ordering against a path
+    // production never takes.
+    const rpc: RpcCaller = async (name) => {
+      order.push(name);
+      return {
+        data: { status: name === 'release_voice_worker' ? 'draining' : 'ok' },
+        error: null,
+      };
+    };
     const fly = {
       async startMachine() { return {}; },
       async stopMachine() { order.push('stop'); return {}; },
@@ -417,9 +498,22 @@ describe('releaseWorker', () => {
     expect(order).toEqual(['release_voice_worker', 'stop', 'reset_voice_worker']);
   });
 
-  it('fail-open on a fly stop error: still resets', async () => {
+  it('a fly stop error is fail-open but NO LONGER resets — the machine is still running', async () => {
+    // BEHAVIOUR CHANGE, deliberate. This used to reset the lease even when the
+    // stop had failed, which returns a machine that is STILL RUNNING to the
+    // claimable pool — and a machine handed to a second session while the
+    // first is live on it is how one box ends up with two calls. The reaper
+    // has always refused this ("do NOT reset a machine we did not confirm
+    // stopped"); the release path now refuses it too, and the lease is left
+    // non-`stopped` so the reaper retries it.
     const names: string[] = [];
-    const rpc: RpcCaller = async (name) => { names.push(name); return { data: { status: 'ok' }, error: null }; };
+    const rpc: RpcCaller = async (name) => {
+      names.push(name);
+      return {
+        data: { status: name === 'release_voice_worker' ? 'draining' : 'ok' },
+        error: null,
+      };
+    };
     const fly = fakeFly({
       stopMachine: async () => { throw new FlyMachinesError('server', { operation: 'stopMachine' }); },
     });
@@ -427,7 +521,28 @@ describe('releaseWorker', () => {
     await expect(
       svc.releaseWorker({ app: APP, machineId: MACHINE, sessionId: SESSION }),
     ).resolves.toBeUndefined();
-    expect(names).toContain('reset_voice_worker'); // reset ran despite the stop error
+    expect(names).toContain('release_voice_worker');
+    expect(names).not.toContain('reset_voice_worker');
+  });
+
+  it('releases NOTHING for a claim it cannot prove is ours', async () => {
+    // The same ownership proof the claim teardown uses, on the path
+    // `releaseGatedWorker` takes from the dialer. `already_released` means the
+    // reaper (or another session) got here first; stopping then would end
+    // whatever is running now.
+    const names: string[] = [];
+    const rpc: RpcCaller = async (name) => {
+      names.push(name);
+      return {
+        data: { status: name === 'release_voice_worker' ? 'already_released' : 'ok' },
+        error: null,
+      };
+    };
+    const fly = fakeFly();
+    const svc = createWorkerOrchestrationService(baseDeps({ fly: fly.client, rpc }));
+    await svc.releaseWorker({ app: APP, machineId: MACHINE, sessionId: SESSION });
+    expect(fly.calls).not.toContain(`stop:${APP}:${MACHINE}`);
+    expect(names).not.toContain('reset_voice_worker');
   });
 });
 

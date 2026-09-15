@@ -83,7 +83,8 @@ grant execute on function screening_v2.phone_answered_reclaim_grace()
 
 comment on function screening_v2.phone_answered_reclaim_grace() is
   'Extra grace before `reclaim_phone_attempt_leases` may abandon an attempt '
-  'that was ANSWERED. A leg that never rang is reclaimed with no grace at all.';
+  'that was ANSWERED BY A PERSON. A leg that never rang, and one classified as '
+  'an answering machine, are both reclaimed with no grace at all.';
 
 
 -- ── 2. THE REAPER, PATCHED ────────────────────────────────────────────
@@ -137,8 +138,19 @@ begin
        -- sweep has no such signal available in SQL, so bounded extra patience
        -- is the honest substitute.
        and lease_expires_at <=
-             p_now - case when answered_at is null then interval '0 seconds'
-                          else screening_v2.phone_answered_reclaim_grace() end
+             p_now - case
+                       when answered_at is null then interval '0 seconds'
+                       -- VOICEMAIL GETS NO GRACE. The grace protects a
+                       -- CONVERSATION; `machine` is a classified answering
+                       -- machine, with nobody to protect and a fleet slot that
+                       -- another candidate is waiting for. `answered_at` is
+                       -- stamped on the answered_unclassified transition
+                       -- regardless of who picked up, so without this the
+                       -- grace would hold a slot two extra minutes for every
+                       -- voicemail in a burst — at a cap of ten, that is real.
+                       when state = 'machine' then interval '0 seconds'
+                       else screening_v2.phone_answered_reclaim_grace()
+                     end
      order by lease_expires_at asc
      limit v_limit
   loop
@@ -160,8 +172,19 @@ begin
        -- between the two — and without repeating the grace here, a call that
        -- became live in that window would still be abandoned.
        and lease_expires_at <=
-             p_now - case when answered_at is null then interval '0 seconds'
-                          else screening_v2.phone_answered_reclaim_grace() end
+             p_now - case
+                       when answered_at is null then interval '0 seconds'
+                       -- VOICEMAIL GETS NO GRACE. The grace protects a
+                       -- CONVERSATION; `machine` is a classified answering
+                       -- machine, with nobody to protect and a fleet slot that
+                       -- another candidate is waiting for. `answered_at` is
+                       -- stamped on the answered_unclassified transition
+                       -- regardless of who picked up, so without this the
+                       -- grace would hold a slot two extra minutes for every
+                       -- voicemail in a burst — at a cap of ten, that is real.
+                       when state = 'machine' then interval '0 seconds'
+                       else screening_v2.phone_answered_reclaim_grace()
+                     end
      for update skip locked;
     if not found then
       continue;
@@ -300,7 +323,7 @@ grant execute on function screening_v2.reclaim_phone_attempt_leases(integer, tim
 -- lines; NO comments between the parameters; body quoted `$$`.
 create or replace function screening_v2.sweep_phone_orphan_sessions(
   p_limit integer default 25,
-  p_grace_seconds integer default 900,
+  p_grace_seconds integer default 14400,
   p_now timestamptz default now()
 )
 returns jsonb
@@ -310,7 +333,26 @@ set search_path to 'pg_catalog', 'screening_v2'
 as $$
 declare
   v_limit     integer := greatest(1, least(coalesce(p_limit, 25), 200));
-  v_grace     integer := greatest(300, least(coalesce(p_grace_seconds, 900), 86400));
+  -- FLOOR 900, DEFAULT 14400 (four hours).
+  --
+  -- The lower bound is set by the RETRY LADDER, not by the call: a refused
+  -- dial comes back after `infraDeferBackoffSeconds` (300s), and when the pool
+  -- is small every dial in a burst defers, so one session can be stranded and
+  -- re-adopted several times in a quarter of an hour. A grace anywhere near
+  -- that is a sweep racing the dial it is meant to be cleaning up after.
+  --
+  -- The upper bound is set by what this is FOR: releasing a worker lease that
+  -- nothing else can release. Four hours detects that inside a working day.
+  --
+  -- NOT `phone_stale_session_seconds()` (four days), and the difference is
+  -- deliberate. That constant answers "how long may a `waiting` session
+  -- legitimately live before an operator should be TOLD about it" — it spans
+  -- the three-IST-day no-answer ladder, and it drives a report, never a write.
+  -- This one answers "how long before we collect it", and collecting one
+  -- between ladder rungs costs nothing: `findReusableSession` simply finds no
+  -- adoptable row and `ensureSession` mints a fresh one, which that function's
+  -- own comment calls the cheap direction. What it buys is the machine back.
+  v_grace     integer := greatest(900, least(coalesce(p_grace_seconds, 14400), 345600));
   v_row       record;
   v_updated   integer;
   v_examined  integer := 0;
@@ -327,20 +369,46 @@ begin
        -- that is still being screened.
        and s.status = 'waiting'
        and s.started_at is not null
+       -- Age is `started_at`, and deliberately NOT `greatest(started_at,
+       -- updated_at)`: adoption does not write to `call_sessions` at all, so
+       -- `updated_at` says nothing about recent USE for the one status this
+       -- sweep can see. (It is also unwritable by a caller — the 0001
+       -- `set_updated_at` trigger overwrites it with the host clock — so a
+       -- rule built on it could not be tested against an injected clock.)
+       -- The fence against a session in active use is the live-attempt check
+       -- below; the age is only a floor under how stale a row must look first.
        and s.started_at <= p_now - (v_grace * interval '1 second')
-       -- NEVER DIALLED. The defining property of the orphan: the due loop
-       -- created the row and admission then refused, so no attempt was ever
-       -- inserted. A session WITH an attempt has a real call behind it and is
-       -- somebody else's problem — including one whose attempt was reclaimed,
-       -- which the engagement machinery owns.
+       -- ── NO CALL IS IN FLIGHT FOR THIS CANDIDATE ─────────────────────
+       -- THE decisive guard, and the only one of the three that is not
+       -- structurally redundant. `start_phone_assessment` (0044) binds
+       -- BOTH session ids AND moves the session `waiting -> in_progress` in a
+       -- single transaction — so for any row this sweep can see, the two
+       -- `not exists` checks below are already implied by `status = 'waiting'`
+       -- and fence nothing. Between admission and that bind there is a live
+       -- call on a session that still looks exactly like an orphan: the
+       -- attempt exists but its `session_id` is still null, and the candidate
+       -- may already be talking.
+       --
+       -- A session is only reapable while NOTHING is dialling this candidate.
+       -- Deliberately scoped to the CANDIDATE rather than to this session,
+       -- because the link a live call has to its session is precisely the one
+       -- that has not been written yet.
+       and not exists (
+         select 1
+           from screening_v2.phone_call_attempts a2
+           join screening_v2.phone_engagements e2 on e2.id = a2.engagement_id
+          where e2.candidate_id = s.candidate_id
+            and a2.state in ('admitted','ringing','answered_unclassified','human','machine')
+       )
+       -- NEVER DIALLED. Redundant today (see above) and kept deliberately: it
+       -- states the orphan's defining property, and it is the check that stays
+       -- correct if the bind is ever split from the status change.
        and not exists (
          select 1 from screening_v2.phone_call_attempts a
           where a.session_id = s.id
        )
-       -- NOT THE ENGAGEMENT'S CURRENT SESSION. `phone_engagements.session_id`
-       -- is written once by `start_phone_assessment` and never cleared, so a
-       -- live engagement pointing here is a screening in flight, not an
-       -- orphan.
+       -- NOT THE ENGAGEMENT'S CURRENT SESSION. Same note: redundant today,
+       -- retained as a statement of intent.
        and not exists (
          select 1 from screening_v2.phone_engagements e
           where e.session_id = s.id
@@ -364,7 +432,20 @@ begin
            ended_at        = coalesce(s.ended_at, p_now),
            updated_at      = p_now
      where s.id = v_row.session_id
-       and s.status = 'waiting';
+       and s.status = 'waiting'
+       -- RE-VERIFIED UNDER THE ROW LOCK, exactly as the reaper above does it.
+       -- The scan is a separate statement, and `for update of s` locks the
+       -- SESSION — it cannot fence an `admit_phone_attempt` that touches only
+       -- the attempt and engagement tables. Repeating the predicate here makes
+       -- the UPDATE itself the point of decision, so an admission that
+       -- committed while this loop was running is seen and the row is skipped.
+       and not exists (
+         select 1
+           from screening_v2.phone_call_attempts a2
+           join screening_v2.phone_engagements e2 on e2.id = a2.engagement_id
+          where e2.candidate_id = s.candidate_id
+            and a2.state in ('admitted','ringing','answered_unclassified','human','machine')
+       );
     get diagnostics v_updated = row_count;
 
     if v_updated = 1 then
@@ -394,4 +475,7 @@ comment on function screening_v2.sweep_phone_orphan_sessions(integer, integer, t
   '`ensureSession` leaves behind when admission refuses after the session row '
   'is created. Invisible to every other sweep, and it wedges the worker lease '
   'claimed against it until terminalized. Drives `expired`/`idle_timeout`, '
-  'which the scoring eligibility gate does NOT admit.';
+  'which the scoring eligibility gate does NOT admit. Never touches a session '
+  'whose candidate has a live attempt, re-verified under the row lock: between '
+  'admission and `start_phone_assessment` a real call sits on a session that '
+  'is still indistinguishable from an orphan.';

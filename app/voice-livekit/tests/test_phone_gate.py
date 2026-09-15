@@ -655,10 +655,31 @@ class TestWorkerOptions(unittest.TestCase):
         )
         threshold = options["load_threshold"]
         self.assertIsInstance(threshold, float)
-        # Strictly between 0 and 1: the SDK refuses >= 1 in prod, and <= 0 would
-        # make the machine permanently unavailable.
+        # Strictly between 0 and 1: the SDK warns at >= 1 in prod, and <= 0
+        # would make the machine permanently unavailable.
         self.assertGreater(threshold, 0.0)
         self.assertLess(threshold, 1.0)
+
+        # ── THE COUPLING THAT IS EASY TO BREAK FROM A HUNDRED LINES AWAY ──
+        # `_get_effective_load` prices a job that has been ACCEPTED but whose
+        # process has not launched yet at `load_threshold / num_idle_processes`
+        # — `active_jobs` is still empty at that moment, so the 0.0/1.0 signal
+        # below says nothing. With one idle process a single reservation scores
+        # exactly the threshold and the second dispatch is refused. With TWO it
+        # scores half, and the same machine accepts a second call before the
+        # first one appears — the precise failure this gate exists to prevent,
+        # reintroduced by a knob that is set for an unrelated latency reason.
+        idle = options["num_idle_processes"]
+        self.assertEqual(
+            idle, 1,
+            "the one-call gate's reserved-slot arithmetic assumes exactly one "
+            "idle process; raising it silently lets a machine take two calls",
+        )
+        self.assertGreaterEqual(
+            threshold / max(idle, 1), threshold,
+            "a reserved slot must price at or above the threshold, or a second "
+            "dispatch slips through the launch window",
+        )
 
     def test_the_BROWSER_worker_is_left_alone(self):
         """The browser lane shares this source file and must not inherit a
@@ -3481,7 +3502,15 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         async def _never_returns(*_a, **_kw):
             await asyncio.sleep(3600)
 
+        # The pre-answer waits are pinned to zero because the wall clock the
+        # wrapper uses is `ring + PHONE_GATE_MAX_SECONDS` (see
+        # `_phone_gate_wall_clock_seconds`), and this test is about the
+        # POST-answer budget. Leaving the production 45s ring in would make the
+        # bound 45.05s and the harness's own residency cap would fire first —
+        # the test would still go red, but for the wrong reason.
         with patch.object(agent_mod, "PHONE_GATE_MAX_SECONDS", 0.05), \
+             patch.object(agent_mod.phone, "phone_participant_wait_sec", lambda: 0.0), \
+             patch.object(agent_mod.phone, "phone_bounce_mode", lambda: False), \
              patch.object(phone, "run_phone_gate", _never_returns):
             result, client, _, delete, _, persistence_spy = await self._run_session(
                 answers=("Yes, that's fine.",), close_after=False,
@@ -3495,6 +3524,17 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persistence_spy.mock_calls, [])
         # And the leg is actually torn down rather than left holding a slot.
         delete.assert_awaited()
+
+        # ── THE PRE-CONSENT AUDIO IS DESTROYED ─────────────────────────
+        # The server egress starts at `call.answered`, before the candidate has
+        # been told anything, and ONLY a `PURGE_BEFORE_EVENTS` member destroys
+        # it. A timeout that posted nothing would leave the recording of
+        # somebody who was never told they were being recorded sitting in the
+        # bucket, and leave the engagement in `dialing` for the reaper to
+        # restore — so the same person is dialled again. The sibling
+        # participant-left terminal has posted this from the day it was
+        # written; the first draft of THIS branch shipped the half-fix.
+        self.assertIn("candidate.deferred_pre_disclosure", client.event_types)
 
     async def test_the_gate_bound_matches_the_API_lease_allowance(self):
         """The worker's gate budget and the API's lease allowance describe the
@@ -3526,6 +3566,36 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             "a bound far above the allowance lets the server reap first, which is"
             " the silent failure this bound exists to replace",
         )
+
+    def test_the_wall_clock_also_covers_the_RING(self):
+        """The bound and the allowance measure the POST-ANSWER stretch. The
+        coroutine they wrap does not.
+
+        `run_phone_gate`'s first await is `wait_for_participant()` — the ring —
+        and in bounce mode a further verified-answer wait follows it. Wrapping
+        the whole coroutine in the post-answer budget charged the ring against
+        it: a candidate picking up on ring 25 would have had 91s for a flow
+        this repo sizes at up to 106s, and one identity re-ask would cut off a
+        healthy call. The comparison in the test above is between two numbers
+        that describe the same stretch; THIS one checks that the timeout
+        actually handed to `asyncio.wait_for` describes the stretch it wraps.
+        """
+        with patch.object(agent_mod.phone, "phone_participant_wait_sec", lambda: 45.0), \
+             patch.object(agent_mod.phone, "phone_answer_timeout_sec", lambda: 90.0), \
+             patch.object(agent_mod.phone, "phone_bounce_mode", lambda: False):
+            direct = agent_mod._phone_gate_wall_clock_seconds()
+        self.assertAlmostEqual(direct, 45.0 + agent_mod.PHONE_GATE_MAX_SECONDS)
+
+        # Bounce mode adds its own pre-answer wait, and the gate owns that too.
+        with patch.object(agent_mod.phone, "phone_participant_wait_sec", lambda: 45.0), \
+             patch.object(agent_mod.phone, "phone_answer_timeout_sec", lambda: 90.0), \
+             patch.object(agent_mod.phone, "phone_bounce_mode", lambda: True):
+            bounce = agent_mod._phone_gate_wall_clock_seconds()
+        self.assertAlmostEqual(bounce, 45.0 + 90.0 + agent_mod.PHONE_GATE_MAX_SECONDS)
+
+        # The property that matters: a candidate who answers at the very LAST
+        # moment the ring allows still gets the whole post-answer budget.
+        self.assertGreaterEqual(direct - 45.0, agent_mod.PHONE_GATE_MAX_SECONDS)
 
     async def test_the_lease_is_re_based_ONCE_on_answer_and_not_beaten_again(self):
         """The narrowed successor to "nothing is heartbeaten before consent".

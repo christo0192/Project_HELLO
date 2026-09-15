@@ -1436,6 +1436,7 @@ describe('the health surface', () => {
           last_rolled: null,
           last_stranded: null,
           last_rec_stranded: null,
+          last_orphan_expired: null,
           // FALSE, not absent. A process that was deliberately not armed and
           // one whose arming THREW both report `enabled: false`; this boolean
           // is the only thing that separates them, so it must be present on
