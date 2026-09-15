@@ -1743,9 +1743,23 @@ _OPT_OUT_RE = re.compile(
     r"remove (?:my|this) number|take me off",
     re.IGNORECASE,
 )
+#: Checked BEFORE the affirmative, so anything matching here ends the call.
+#:
+#: THE `no problem` DEFECT. `^\s*(?:no|...)` matched the leading "no" of
+#: "No problem", "No issues" and "No worries" — three of the most ordinary
+#: Indian-English ways of saying YES — and classified a CONSENTING candidate as
+#: having refused. That is `_terminal_outcome(REFUSED)`: the call ends, with no
+#: re-ask and no recovery, and it looks identical to a genuine refusal in the
+#: data. The lookahead below is the whole fix; `no thanks` still refuses,
+#: because `thanks` is not in the exclusion list.
+#:
+#: The recording clause is also widened from the literal `don't record`, which
+#: missed the far commoner "I don't want to be recorded".
 _REFUSED_RE = re.compile(
-    r"do(?:n't| not) record|no recording|not (?:comfortable|okay|ok) with|"
-    r"^\s*(?:no|nope|no thanks|not interested)\b",
+    r"do(?:n't| not)\s+(?:want\s+(?:to\s+be\s+|me\s+to\s+be\s+)?)?record|"
+    r"no recording|not (?:comfortable|okay|ok) with|"
+    r"^\s*(?:no(?!\s+(?:problem|problems|probs|issue|issues|worries|"
+    r"objection|objections|doubt))|nope|no thanks|not interested)\b",
     re.IGNORECASE,
 )
 # Anchored deliberately. An affirmative has to BE the answer: matching "sure"
@@ -1774,6 +1788,17 @@ _AFFIRMATIVE_RE = re.compile(
     r"you\s+(?:can|may)|we\s+can|"
     r"i'?m\s+(?:here|ready|good)|i\s+am\s+(?:here|ready|good)|ready|"
     r"uh[\s-]*huh|mm[\s-]*hmm|mhm|"
+    # ── ADDED 2026-09-15 after a live double-ask ────────────────────────
+    # Fourteen of forty-eight natural ways to say yes returned None and
+    # produced the re-ask ("Sorry, I just need a yes or a no"). The candidate
+    # had consented; the vocabulary simply did not contain their word. These
+    # are the misses, each a complete answer to "is it okay to continue?".
+    r"al+\s*right|all\s+right|right|correct|perfect|understood|"
+    r"cool|great|good|no\s+(?:problem|problems|probs|issue|issues|worries|"
+    r"objection|objections)|not\s+an?\s+issue|"
+    r"it(?:'s| is)\s+(?:okay|ok|fine|alright)|"
+    r"that(?:'s| is)\s+(?:okay|ok|alright|right)|"
+    r"go\s+on|i\s+do\s*n[o']?t\s+mind|don'?t\s+mind|"
     r"haan|han|ji(?:\s+haan)?|theek(?:\s+hai)?)\b",
     re.IGNORECASE,
 )
@@ -1905,6 +1930,16 @@ async def _classify_phone_answer(
         if decision is not None:
             return decision
         if attempt + 1 < attempts:
+            # THE RE-ASK IS OTHERWISE INVISIBLE. The gate transcript commits
+            # exactly two rows — the LAST bot line and the LAST answer — so a
+            # first answer that failed to classify, and this re-ask itself,
+            # appear nowhere. Without this line there is no way to measure how
+            # often a consenting candidate is asked twice. Counts and a fixed
+            # category only, never the utterance (PII).
+            _log.info(
+                "unknown_event", error_type="phone_consent_reask",
+                error_category="unmatched" if responsive else "no_speech",
+            )
             await say(phone.PHONE_REASK_TEXT)
     # Fail closed to MACHINE — but make WHY visible. A line that WAS responsive
     # (the human spoke) yet still defaulted here is the 2026-09-02 signature: a

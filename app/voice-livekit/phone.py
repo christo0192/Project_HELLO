@@ -4260,9 +4260,11 @@ _SCHEDULE_REFUSAL_TEXT: dict[str, str] = {
         "That time has already gone by, so I can't set it up. Could you give me "
         "a time that's still ahead of us?"
     ),
+    # Same trap as `window_closed`: "a later time" reads as later TODAY, and
+    # today is always refused during a live call. Ask for the DAY explicitly.
     "lead_time_too_short": (
-        "I need at least five minutes to set that up safely. What later time "
-        "would work for you?"
+        "I need a bit more notice than that. What time on a later day would "
+        "work for you?"
     ),
     "slot_full": (
         "That time is already full. Could you choose another time?"
@@ -4275,9 +4277,15 @@ _SCHEDULE_REFUSAL_TEXT: dict[str, str] = {
         "That time is too close to midnight for a ten-minute call. Could you "
         "choose an earlier time?"
     ),
+    # "on a LATER DAY" is load-bearing, not politeness. Every same-IST-day slot
+    # is refused for the duration of this call (the in-progress attempt already
+    # occupies the day's ledger), so inviting a time merely "inside the window"
+    # is a trap the candidate cannot answer correctly: they comply, get
+    # `slot_not_yet_eligible`, and the call ends. That is the live 2026-09-15
+    # sequence — 9 PM refused, "pick a time inside that", 8 PM, hung up on.
     "window_closed": (
         "I can only set up calls between nine in the morning and nine at night. "
-        "Could you pick a time inside that?"
+        "What time on a later day would suit you?"
     ),
     # The engagement was released for TODAY when this call ended, so the
     # earliest the team can call back is tomorrow. Say that plainly rather than
@@ -4394,8 +4402,12 @@ _SCHEDULE_TERMINAL_REASON: dict[str, str] = {
     "slot_straddles_ist_midnight": (
         "That slot runs past midnight, so I can't book it."
     ),
-    "slot_not_yet_eligible": "I can't book another call for today.",
-    "slot_full": "That slot has just been taken.",
+    # NOT a repeat of the re-ask ("I can't book another call for today, but
+    # I can from tomorrow onwards"). Saying that clause twice, with the
+    # useful half removed the second time, sounds like a bot that lost the
+    # thread.
+    "slot_not_yet_eligible": "Today is already spoken for, I'm afraid.",
+    "slot_full": "That time is fully booked.",
     "daily_attempt_exists": "There's already a call booked for that day.",
 }
 
@@ -4754,6 +4766,24 @@ async def _propose_and_confirm(
             return CallbackDecision(
                 schedule_refusal_text(confirm_status), terminal=False,
             )
+        # THE RE-ASK IS SPENT ON THIS LEG TOO. This used to fall straight
+        # through to `_confirmation_failure_decision()`, which speaks the bare
+        # deferral AND halts `HALT_CALLBACK_RECOVERY` — an INFRASTRUCTURE
+        # reason for a refusal the candidate could have fixed by naming another
+        # day. Both were wrong, and it is the very defect this change fixes on
+        # the propose leg, one step later. `daily_attempt_exists` reaches the
+        # worker ONLY here, so without this its terminal wording is dead copy.
+        if confirm_status in _CALLBACK_RETRYABLE_REFUSALS:
+            _log.info(
+                "unknown_event", error_type="phone_callback_refused",
+                error_category=confirm_status, schema="confirm_deferred_explained",
+            )
+            return CallbackDecision(
+                schedule_terminal_deferral_text(confirm_status),
+                terminal=True,
+                terminal_reason=HALT_CANDIDATE_ENDED,
+            )
+
         # Validated but could not be confirmed (a race, a transport failure):
         # never claim a booking and never classify infrastructure as the
         # candidate ending the assessment.
