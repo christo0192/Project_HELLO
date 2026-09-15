@@ -11263,8 +11263,45 @@ _CALLBACK_VETO_PATTERNS: tuple[tuple[str, str], ...] = (
     ),
 )
 
+#: TURN-scoped vetoes. Everything in `_CALLBACK_VETO_PATTERNS` is about WHO is
+#: acting, which belongs to the clause it sits in. These are different: they
+#: are META-DISCOURSE — the candidate announcing that they are REPORTING
+#: speech rather than performing it — and that framing governs the whole turn.
+#:
+#: They exist because clause scoping, which is what stopped the gate throwing
+#: away a request made in the same breath as an answer, opened a hole in the
+#: other direction:
+#:
+#:   "Let me describe my objection handling. Call me back later is what I
+#:    hear most."            -> clause 2 alone looks exactly like a request
+#:
+#: A candidate ASKING to be rung back never says "objection", "brush-off", or
+#: "is what I hear", so keeping these turn-wide costs no recall.
+_CALLBACK_TURN_VETO_PATTERNS: tuple[tuple[str, str], ...] = (
+    # Naming the thing being described. `excuses` is PLURAL on purpose —
+    # "excuse me, can you call me back?" is a real request.
+    ("objection_vocabulary", r"\b(?:objections?|brush[-\s]?offs?|excuses)\b"),
+    # Post-posed reporting: the deferral phrase is the SUBJECT of the sentence
+    # rather than the thing being asked. `hypothetical_or_quoted` only catches
+    # the reporting verb BEFORE the quote ("they say now is not...").
+    (
+        "reported_speech_trailing",
+        r"\bis\s+what\s+(?:i|we)\s+(?:hear|get)\b|"
+        r"\bis\s+the\s+(?:usual|common|typical|standard|most\s+common)\b|"
+        r"\b(?:they|people|prospects?|parents?|clients?|customers?|leads?|"
+        r"students?|everyone|most\s+of\s+them)\s+(?:tell|tells|told)\s+"
+        r"(?:me|us)\b|"
+        r"\bi\s+(?:hear|get)\s+(?:every|all|a\s+lot|that|this)\b",
+    ),
+)
+
 _CALLBACK_DEFERRAL_RE = re.compile(
     "|".join(f"(?:{pattern})" for _name, pattern in _CALLBACK_DEFERRAL_PATTERNS),
+    re.IGNORECASE,
+)
+
+_CALLBACK_TURN_VETO_RE = re.compile(
+    "|".join(f"(?:{pattern})" for _name, pattern in _CALLBACK_TURN_VETO_PATTERNS),
     re.IGNORECASE,
 )
 
@@ -11323,6 +11360,11 @@ def callback_request_match(text: Any) -> str | None:
     """
     clean = str(text or "").strip()
     if not clean:
+        return None
+    # Meta-discourse governs the WHOLE turn, so it is checked before the turn
+    # is cut into clauses — otherwise the framing sentence and the sentence it
+    # frames end up judged apart, which is the hole clause scoping opened.
+    if _CALLBACK_TURN_VETO_RE.search(clean):
         return None
     for clause in _callback_clauses(clean):
         if _CALLBACK_VETO_RE.search(clause):

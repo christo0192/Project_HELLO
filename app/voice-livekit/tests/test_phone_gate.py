@@ -4960,6 +4960,18 @@ class TestNativePhoneArchitecture(unittest.TestCase):
                 "Our team schedules a callback whenever the parent asks for one.",
                 "They schedule the meeting and I just run the demo.",
             ],
+            "quoting_the_objection": [
+                # THE HOLE CLAUSE SCOPING OPENED. Judging each clause on its
+                # own is what stopped the gate throwing away a request made in
+                # the same breath as an answer — but it also means a framing
+                # sentence no longer protects the sentence it frames. Read
+                # alone, clause 2 of each of these IS a request. Three of them
+                # fired before `_CALLBACK_TURN_VETO_PATTERNS` was added.
+                "Let me describe my objection handling. Call me back later is what I hear most.",
+                "The most common brush-off is simple. I'm busy right now, they tell me.",
+                "I hear every excuse. I can't talk right now is the usual one.",
+                "That happens a lot with parents. Now is not a good time, they usually say.",
+            ],
             "topic_deflection": [
                 # These carry the WORDS of a deferral while deflecting a
                 # QUESTION. All four fired before the fifth review.
@@ -5233,6 +5245,43 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)), "duplicate branch name")
         veto_names = [name for name, _p in phone._CALLBACK_VETO_PATTERNS]
         self.assertEqual(len(veto_names), len(set(veto_names)), "duplicate veto name")
+
+        # The TURN tier is a separate list with a separate scope, and it is
+        # every bit as load-bearing: it is the only thing standing between
+        # clause scoping and a candidate who QUOTES the objection they hear
+        # ("Call me back later is what I hear most"). Names must be unique
+        # across BOTH tiers, or a log line naming one is ambiguous.
+        turn_names = [name for name, _p in phone._CALLBACK_TURN_VETO_PATTERNS]
+        self.assertTrue(turn_names, "the turn-scoped veto tier must not be empty")
+        self.assertEqual(len(turn_names), len(set(turn_names)), "duplicate turn veto")
+        self.assertEqual(
+            set(turn_names) & set(veto_names), set(),
+            "a name is reused across the two veto tiers",
+        )
+        # Each turn-scoped branch must be load-bearing on its own.
+        turn_examples = {
+            "objection_vocabulary":
+                "Let me describe my objection handling. Call me back later is what I hear most.",
+            "reported_speech_trailing":
+                "The most common brush-off is simple. I'm busy right now, they tell me.",
+        }
+        self.assertEqual(
+            sorted(turn_examples), sorted(turn_names),
+            "every turn-scoped veto needs an example proving it is needed",
+        )
+        for name, pattern in phone._CALLBACK_TURN_VETO_PATTERNS:
+            self.assertTrue(name and name.replace("_", "").isalnum(), name)
+            self.assertIsNotNone(
+                _re.search(pattern, turn_examples[name], _re.IGNORECASE),
+                f"turn veto {name!r} does not match its own example",
+            )
+        # And a polite opener must NOT be swallowed by it: "excuse me" is how
+        # people interrupt, which is why the vocabulary branch takes only the
+        # PLURAL noun.
+        self.assertTrue(
+            phone.is_callback_request("excuse me, can you call me back at 1 PM?"),
+            "'excuse me' is a polite opener, not a discussion of excuses",
+        )
 
         # EVERY branch must be load-bearing. Compiling each one proves nothing
         # — the union already compiled at import, so a malformed branch would
