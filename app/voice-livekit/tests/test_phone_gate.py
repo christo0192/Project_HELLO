@@ -13852,6 +13852,18 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
         self.assertIn("reach out", spoken2)
         self.assertEqual(getattr(agent, "_turn_policy"), "closing")
         self.assertEqual(client.confirm_calls, [])
+        # ...AND IT STILL SAYS WHY. Spending the re-ask is not a licence to go
+        # silent on the reason: on the live call (session 9f1a3d2e) the
+        # candidate offered 8 PM — a good time, refused only by the same-IST-day
+        # ban — and heard nothing but "our team will reach out". That is the
+        # original RCA complaint moved one step later.
+        # NOT `assertIn("today", ...)` — the bare deferral already ends
+        # "Thanks so much for your time today", so that assertion passes with
+        # the explanation removed. A mutation caught exactly that. Assert the
+        # REASON, which only the explained wording carries.
+        self.assertIn("can't book another call", spoken2)
+        # A question here would ask something and then hang up on the answer.
+        self.assertNotIn("?", spoken2)
 
     async def test_an_UNACTIONABLE_refusal_does_not_re_ask(self):
         """Re-asking is only kind when a different answer could work.
@@ -13876,6 +13888,52 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
                           types.SimpleNamespace(text_content="Tomorrow at 1 PM."), turn1)
         self.assertEqual(getattr(agent, "_turn_policy"), "closing")
         self.assertEqual(client.confirm_calls, [])
+
+    def test_a_SPENT_re_ask_still_says_why_before_signing_off(self):
+        """Every retryable refusal needs TERMINAL wording, not just a re-ask.
+
+        `_SCHEDULE_REFUSAL_TEXT` deliberately ends every line in a question,
+        because its only caller re-asks for another time. Reusing those lines
+        once the re-ask is spent would ask the candidate something and then
+        hang up on them — worse than the generic deferral it replaces. So each
+        retryable status also carries a reason worded for a call that is
+        ENDING.
+        """
+        for status in phone._CALLBACK_RETRYABLE_REFUSALS:
+            self.assertIn(
+                status, phone._SCHEDULE_TERMINAL_REASON,
+                f"retryable status {status!r} has no terminal reason, so a "
+                f"candidate who spends the re-ask on it hears only the generic "
+                f"deferral — the bug this exists to fix",
+            )
+            spoken = phone.schedule_terminal_deferral_text(status)
+            self.assertNotEqual(
+                spoken, phone.PHONE_CALLBACK_DEFERRAL_TEXT,
+                f"{status!r} fell back to the bare deferral",
+            )
+            self.assertNotIn(
+                "?", spoken,
+                f"{status!r} asks a question on a call that is ending",
+            )
+            self.assertIn("reach out", spoken, f"{status!r} loses the hand-off")
+            # A spoken line missing from `gate_copy_texts` is treated as a
+            # SCREENING turn, which pollutes latest_assistant[0], the conflict
+            # probe and the goodbye latch.
+            self.assertTrue(
+                phone.is_gate_copy(spoken),
+                f"the terminal wording for {status!r} is not gate copy, so the "
+                f"bot's own sign-off would look like a candidate answer",
+            )
+
+        # An unmapped status must never produce half a sentence.
+        self.assertEqual(
+            phone.schedule_terminal_deferral_text("no_such_status"),
+            phone.PHONE_CALLBACK_DEFERRAL_TEXT,
+        )
+        self.assertEqual(
+            phone.schedule_terminal_deferral_text(None),
+            phone.PHONE_CALLBACK_DEFERRAL_TEXT,
+        )
 
     def test_the_refusal_vocabulary_has_a_line_for_every_retryable_status(self):
         """A retryable status with no written line would speak the generic
@@ -14383,13 +14441,19 @@ class TestPhoneManifestTunables(unittest.TestCase):
         assert, so the floor is the one value with live evidence behind it —
         20, which the owner audibly heard break words. The sweep table lives
         in the fly.phone.toml comment next to the value.
+
+        35 is SHIPPED because it is the only value satisfying both constraints
+        the owner set: faster than 40, and no measured word breakage. 30 was
+        shipped briefly and retired the same day — it cracks a word on
+        number-heavy leads (this bot asks about compensation on every call) to
+        buy about five characters of latency.
         """
         env = self._phone_env()
         value = env.get("PHONE_TTS_FLUSH_MIN_CHARS")
         self.assertIsNotNone(
             value, "PHONE_TTS_FLUSH_MIN_CHARS must stay pinned in fly.phone.toml"
         )
-        self.assertEqual(value, "30")
+        self.assertEqual(value, "35")
         self.assertGreater(
             int(value), 20,
             "20 is the value the owner heard break words on a live call",
