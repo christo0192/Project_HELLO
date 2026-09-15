@@ -1766,9 +1766,20 @@ _REFUSED_RE = re.compile(
     r"do(?:n't| not)\s+(?:want\s+(?:to\s+be\s+|me\s+to\s+be\s+)?)?record|"
     r"(?:did|would|could)(?:n't| not)\s+(?:want\s+)?(?:to\s+be\s+)?record|"
     r"rather\s+(?:you\s+)?(?:did\s*n[o']?t|not)\b|"
-    r"\bnot\s+record(?:ed|ing)?\b|"
+    # The article matters: "not THE recording part" is the commonest way to
+    # accept the call and decline the recording in one breath.
+    r"\bnot\s+(?:the\s+|that\s+)?record(?:ed|ing)?\b|"
     r"no recording|not (?:comfortable|okay|ok) with|"
     r"\bnot\s+interested\b|\bi'?(?:ll| will)\s+pass\b|"
+    # Explicit declines, and every way of saying "not the recording" that
+    # does not use the verb `record`. A reviewer built a 47-string
+    # not-consent corpus and these were the misses.
+    r"\bdecline\b|\brefuse\b|\bno\s+thanks\b|"
+    r"\brather\s+not\b|\bdelete\s+it\b|\bobject\s+to\b|"
+    r"\bdo(?:n't| not)\s+tape\b|\bsave\s+the\s+audio\b|"
+    r"\bstop\s+the\s+record(?:ing)?\b|\bwithout\s+record(?:ing)?\b|"
+    r"\bavoid\s+record(?:ing)?\b|"
+    r"\bnot\s+comfortable\s+(?:being|with)\s+record(?:ed|ing)?\b|"
     # ── ANCHORED: a bare "no" only refuses when it OPENS the answer. The
     #    lookahead keeps "no problem/issues/worries" — ordinary ways of saying
     #    YES — from ending the call, while "no thanks" still refuses.
@@ -1807,13 +1818,46 @@ _AFFIRMATIVE_RE = re.compile(
     # produced the re-ask ("Sorry, I just need a yes or a no"). The candidate
     # had consented; the vocabulary simply did not contain their word. These
     # are the misses, each a complete answer to "is it okay to continue?".
-    r"al+\s*right|all\s+right|right|correct|perfect|understood|"
-    r"cool|great|good|no\s+(?:problem|problems|probs|issue|issues|worries|"
+    # `right`, `correct`, `good`, `great`, `cool`, `understood` were here and
+    # have been REMOVED. They acknowledge the sentence before the question
+    # ("This call is recorded...") rather than answering it, and they are bare
+    # prefixes of the commonest phone openings: "Good morning.", "Right now I
+    # am driving.", "Right, who is this?" all became CONSENT. An
+    # acknowledgement belongs in the re-ask bucket, not the recording one.
+    r"al+\s*right|all\s+right|perfect|"
+    r"no\s+(?:problem|problems|probs|issue|issues|worries|"
     r"objection|objections)|not\s+an?\s+issue|"
     r"it(?:'s| is)\s+(?:okay|ok|fine|alright)|"
     r"that(?:'s| is)\s+(?:okay|ok|alright|right)|"
     r"go\s+on|i\s+do\s*n[o']?t\s+mind|don'?t\s+mind|"
     r"haan|han|ji(?:\s+haan)?|theek(?:\s+hai)?)\b",
+    re.IGNORECASE,
+)
+
+
+#: NOT CONSENT, AND NOT A REFUSAL EITHER — send these back for the re-ask.
+#:
+#: The disclosure ends with a STATEMENT before its question ("This call is
+#: recorded so the hiring team can review it. Is it okay to continue?"), so the
+#: most natural reply is a backchannel acknowledging the statement, or a
+#: deferral, or a question back. None of them answers what was asked, and none
+#: of them is a refusal. `None` re-asks once, which is exactly what the re-ask
+#: exists for — and the new `phone_consent_reask` log line makes the rate
+#: visible for the first time.
+#:
+#: Checked AFTER the refusal branches and BEFORE the affirmative, because
+#: `_AFFIRMATIVE_RE` is `^`-anchored and stops at its first match: without this
+#: "Right, can I call you back?" and "Alright, let me call you back" were read
+#: as consent on the strength of their first word.
+_AMBIGUOUS_RE = re.compile(
+    r"\bcall\s+(?:you|me)\s+back\b|\bcall\s+back\b|"
+    r"\bhold\s+on\b|\bone\s+(?:second|sec|minute|min)\b|\bhang\s+on\b|"
+    r"\bwho\s+is\s+this\b|\bwho'?s\s+this\b|"
+    r"\bwhat\s+is\s+this\s+(?:about|regarding|for)\b|"
+    r"\bwhat'?s\s+this\s+(?:about|regarding|for)\b|"
+    r"\bleave\s+me\s+alone\b|\bnot\s+a\s+good\s+time\b|"
+    r"\bi'?m\s+(?:busy|driving)\b|\bi\s+am\s+(?:busy|driving)\b|"
+    r"\bin\s+a\s+meeting\b|\bmaybe\s+later\b|\bnot\s+now\b",
     re.IGNORECASE,
 )
 
@@ -1836,6 +1880,10 @@ def classify_answer_text(text: str) -> str | None:
         return phone.CLASSIFY_OPT_OUT
     if _REFUSED_RE.search(value):
         return phone.CLASSIFY_REFUSED
+    # Before the affirmative, deliberately: an `^`-anchored affirmative would
+    # otherwise accept "Right, can I call you back?" on its first word.
+    if _AMBIGUOUS_RE.search(value):
+        return None
     if _AFFIRMATIVE_RE.search(value):
         return phone.CLASSIFY_HUMAN
     return None

@@ -2385,15 +2385,32 @@ class TestAnswerClassifier(unittest.TestCase):
         These are complete, unambiguous answers to "is it okay to continue?".
         """
         for text in (
-            "Alright.", "All right.", "Right.", "Correct.", "Perfect.",
-            "Understood.", "It's okay.", "It's fine.", "That's alright.",
-            "Go on.", "I don't mind.", "Cool.", "Great.",
+            "Alright.", "All right.", "Perfect.", "It's okay.", "It's fine.",
+            "That's alright.", "Go on.", "I don't mind.", "No problem.",
+            "No issues.", "Not an issue.",
         ):
             with self.subTest(text=text):
                 self.assertEqual(
                     agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
                     f"{text!r} is a clear yes; returning None re-asks a "
                     f"candidate who already consented",
+                )
+
+        # DELIBERATELY NOT CONSENT. The disclosure ends with a STATEMENT
+        # before its question ("This call is recorded so the hiring team can
+        # review it. Is it okay to continue?"), so these acknowledge the
+        # statement rather than answering the question — and each is a bare
+        # prefix of a common phone opening ("Good morning.", "Right now I am
+        # driving.", "Right, who is this?"). They belong in the re-ask bucket;
+        # a re-ask costs one question, inferred consent records someone who
+        # never agreed.
+        for text in ("Right.", "Correct.", "Understood.", "Cool.", "Great.",
+                     "Good."):
+            with self.subTest(text=text):
+                self.assertIsNone(
+                    agent_mod.classify_answer_text(text),
+                    f"{text!r} acknowledges the disclosure; it must re-ask, "
+                    f"not grant consent",
                 )
 
     def test_an_affirmative_OPENER_never_infers_consent_that_was_refused(self):
@@ -2447,7 +2464,7 @@ class TestAnswerClassifier(unittest.TestCase):
             phone.CLASSIFY_WRONG_NUMBER,
         )
         # ...and an UNqualified affirmative is still consent.
-        for text in ("no problem", "right", "understood", "alright"):
+        for text in ("no problem", "no issues", "alright", "it's okay"):
             with self.subTest(text=text):
                 self.assertEqual(
                     agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
