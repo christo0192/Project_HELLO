@@ -350,6 +350,28 @@ class TestFixedFallbackCopy(unittest.TestCase):
             lowered = instruction.lower()
             self.assertIn("do not mention recording", lowered, instruction)
 
+    def test_the_opening_is_forbidden_a_time_of_day_greeting(self):
+        """The model cannot see a clock, and it is the FIRST thing said.
+
+        Live 2026-09-15 (session 9f1a3d2e): the bot opened "Hi there, good
+        morning!" at 17:48 IST. Told only to "greet them warmly", the model
+        reaches for "good morning" whatever the hour — and the calling window
+        is 09:00-21:00 IST, so a guess is wrong for most of it.
+
+        A plain greeting is correct at every hour, so the instruction forbids
+        the time-of-day form outright rather than trying to supply a clock.
+        """
+        instruction = phone.phone_identity_instruction(NAME).lower()
+        self.assertIn("do not use a time-of-day greeting", instruction)
+        for banned in ("good morning", "good afternoon", "good evening"):
+            self.assertIn(
+                banned, instruction,
+                f"the instruction must name {banned!r} explicitly — a general "
+                f"'no time greetings' rule is weaker than the literal phrase",
+            )
+        # ...and it must still ASK for a greeting, or the opening turns curt.
+        self.assertIn("greet", instruction)
+
     def test_the_reask_names_nobody(self):
         # It is spoken to a person who has just said they are NOT the candidate.
         # Naming her tells a parent, spouse or colleague that a recruiter is

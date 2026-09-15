@@ -2347,6 +2347,217 @@ class TestAnswerClassifier(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN)
 
+    def test_a_hum_on_the_line_cannot_stall_the_worker(self):
+        """Catastrophic backtracking in the filler alternation.
+
+        `_AFFIRMATIVE_RE`'s filler group holds `hmm+|mm+` inside a `{0,4}`
+        repetition, and both branches consume the same run of `m`s. Measured
+        before the fix: 0.6ms at "h"+18m, DOUBLING every ~4 characters — about
+        a second by 60 and minutes beyond. A hum on a PSTN line is exactly how
+        Sarvam produces such a run, and this classifier runs synchronously on
+        the worker event loop.
+
+        A length cap does not fix it (400 characters of `m` still hangs); the
+        run collapse does, and it is semantically free above three repeats.
+        """
+        import time
+
+        for n in (40, 2000, 50000):
+            text = "h" + "m" * n
+            started = time.perf_counter()
+            agent_mod.classify_answer_text(text)
+            elapsed = time.perf_counter() - started
+            self.assertLess(
+                elapsed, 0.5,
+                f"classifying a {n}-character hum took {elapsed:.2f}s — the "
+                f"filler alternation is backtracking and would stall a live "
+                f"call",
+            )
+
+        # ...and real speech is untouched by the collapse.
+        self.assertEqual(
+            agent_mod.classify_answer_text("hmm yes"), phone.CLASSIFY_HUMAN)
+        self.assertEqual(
+            agent_mod.classify_answer_text("mmhmm"), phone.CLASSIFY_HUMAN)
+        self.assertEqual(
+            agent_mod.classify_answer_text("haan"), phone.CLASSIFY_HUMAN)
+        # A collapsed run inside the FILLER group still reaches the affirmative
+        # after it — which is the part the collapse had to keep working.
+        self.assertEqual(
+            agent_mod.classify_answer_text("hmmmmmmmm yes"),
+            phone.CLASSIFY_HUMAN,
+        )
+        # NOT asserted: that "yeahhhhhhh" == "yeah". It does not, and the
+        # collapse does not change that — the affirmative alternation ends in
+        # `\b`, so any trailing repeat of the final letter blocks the match
+        # however short the run is. That is a PRE-EXISTING miss in the safe
+        # direction (a re-ask, never false consent), separate from this fix.
+        self.assertIsNone(agent_mod.classify_answer_text("yeahhhhhhh"))
+
+    def test_NO_PROBLEM_is_a_yes_and_must_never_end_the_call(self):
+        """The severest consent defect found so far. Live-reported 2026-09-15.
+
+        `_REFUSED_RE` began `^\\s*(?:no|nope|...)`, which matched the leading
+        "no" of "No problem", "No issues" and "No worries" — three of the most
+        ordinary Indian-English ways of saying YES. It is checked BEFORE the
+        affirmative branch, so a consenting candidate was classified REFUSED
+        and the call ENDED: no re-ask, no recovery, and indistinguishable from
+        a genuine refusal in the data afterwards.
+        """
+        for text in (
+            "No problem.", "No problem, go ahead.", "No issues.",
+            "No worries.", "No objection.", "Not an issue.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
+                    f"{text!r} means YES — classifying it as a refusal hangs "
+                    f"up on a candidate who consented",
+                )
+        # ...while a real refusal that merely starts the same way still refuses.
+        for text in ("No thanks.", "No, not interested.", "Nope."):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_REFUSED,
+                )
+
+    def test_the_answers_that_caused_a_DOUBLE_consent_ask(self):
+        """Owner heard the consent question twice on a live call.
+
+        The classifier is fully deterministic — pure regex, no model — so an
+        unmatched phrasing re-asks EVERY time for that candidate, and
+        `PHONE_REASK_TEXT` ("Sorry, I just need a yes or a no") is what they
+        hear. Fourteen of forty-eight natural ways to say yes returned None.
+
+        These are complete, unambiguous answers to "is it okay to continue?".
+        """
+        for text in (
+            "Alright.", "All right.", "Perfect.", "It's okay.", "It's fine.",
+            "That's alright.", "Go on.", "I don't mind.", "No problem.",
+            "No issues.", "Not an issue.",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
+                    f"{text!r} is a clear yes; returning None re-asks a "
+                    f"candidate who already consented",
+                )
+
+        # DELIBERATELY NOT CONSENT. The disclosure ends with a STATEMENT
+        # before its question ("This call is recorded so the hiring team can
+        # review it. Is it okay to continue?"), so these acknowledge the
+        # statement rather than answering the question — and each is a bare
+        # prefix of a common phone opening ("Good morning.", "Right now I am
+        # driving.", "Right, who is this?"). They belong in the re-ask bucket;
+        # a re-ask costs one question, inferred consent records someone who
+        # never agreed.
+        for text in ("Right.", "Correct.", "Understood.", "Cool.", "Great.",
+                     "Good."):
+            with self.subTest(text=text):
+                self.assertIsNone(
+                    agent_mod.classify_answer_text(text),
+                    f"{text!r} acknowledges the disclosure; it must re-ask, "
+                    f"not grant consent",
+                )
+
+    def test_an_affirmative_OPENER_never_infers_consent_that_was_refused(self):
+        """The worst failure this gate has, and the one widening invites.
+
+        `_AFFIRMATIVE_RE` is anchored and stops at its first match, so it
+        accepts any utterance that OPENS affirmatively no matter what follows.
+        Every word added to it widens that hole. Adding "no problem", "right"
+        and "understood" turned these four into CONSENT — i.e. the bot would
+        have recorded someone who had just declined:
+
+            "no problem, I'll pass"
+            "no problem but I'm not interested"
+            "understood, but I'm not interested"
+            "right, but I'd rather you didn't record this"
+
+        The fix is that the refusal clauses are UNANCHORED and run first, so a
+        refusal anywhere beats an affirmative opener. Any future widening of
+        the affirmative vocabulary must keep this test green.
+        """
+        for text in (
+            "yes but don't record",
+            "yes, but please don't record this",
+            "okay but no recording",
+            "sure, but I don't want to be recorded",
+            "right, but I'd rather you didn't record this",
+            "fine, as long as it's not recorded",
+            "alright but no recording please",
+            "correct, but I'm not comfortable with recording",
+            "no problem, but don't record me",
+            "of course, but no recording",
+            "perfect, but please don't record",
+            "understood, but I'm not interested",
+            "no problem, I'll pass",
+            "no problem but I'm not interested",
+        ):
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
+                    f"{text!r} REFUSES consent; reading it as granted would "
+                    f"record a candidate who declined",
+                )
+
+        # The stronger readings still win over a bare refusal.
+        self.assertEqual(
+            agent_mod.classify_answer_text("cool, but don't call me again"),
+            phone.CLASSIFY_OPT_OUT,
+        )
+        self.assertEqual(
+            agent_mod.classify_answer_text("sure, wrong number though"),
+            phone.CLASSIFY_WRONG_NUMBER,
+        )
+        # ...and an UNqualified affirmative is still consent.
+        for text in ("no problem", "no issues", "alright", "it's okay"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
+                )
+
+    def test_the_widening_did_not_let_a_REFUSAL_through_as_consent(self):
+        """The direction that matters legally: consent must not be inferred.
+
+        Widening the affirmative vocabulary is only safe while every refusal,
+        opt-out, wrong-number and machine marker still wins. The recording
+        clause is also widened here — it used to require the literal "don't
+        record" and missed "I don't want to be recorded".
+        """
+        cases = {
+            phone.CLASSIFY_REFUSED: (
+                "No.", "Nope.", "No thanks.", "Not interested.",
+                "No, don't record.", "Please don't record this.",
+                "I don't want to be recorded.",
+                "I do not want to be recorded.",
+                "No recording please.",
+                "I'm not comfortable with that.",
+                "Not okay with recording.",
+            ),
+            phone.CLASSIFY_OPT_OUT: (
+                "Don't call me again.", "Stop calling me.",
+                "Remove my number.", "Take me off your list.",
+            ),
+            phone.CLASSIFY_WRONG_NUMBER: (
+                "Wrong number.", "You've got the wrong person.",
+                "No one by that name here.",
+            ),
+            phone.CLASSIFY_MACHINE: (
+                "Please leave a message after the tone.",
+                "Press 1 to continue.",
+            ),
+        }
+        for want, texts in cases.items():
+            for text in texts:
+                with self.subTest(text=text, want=want):
+                    got = agent_mod.classify_answer_text(text)
+                    self.assertEqual(
+                        got, want,
+                        f"{text!r} classified {got!r}; consent must never be "
+                        f"inferred from a refusal",
+                    )
+
     def test_natural_affirmatives_that_used_to_fall_through(self):
         # The 2026-09-02 room-teardown regression: a cooperating human answered,
         # but real STT phrasing matched none of yes/yeah/sure/okay, fell through
@@ -2842,6 +3053,12 @@ class TestScheduleCallback(unittest.IsolatedAsyncioTestCase):
     async def test_tool_never_mentions_google_calendar_or_email(self):
         texts = [phone._SCHEDULE_CONFIRMED_TEXT, phone._SCHEDULE_REFUSAL_FALLBACK]
         texts.extend(phone._SCHEDULE_REFUSAL_TEXT.values())
+        # The TERMINAL wording of the same refusals. Omitting it let this guard
+        # cover a shrinking subset of the schedule copy: a review injected
+        # "Check your Google Calendar and email for the invite." into a line the
+        # bot actually speaks and the whole suite stayed green.
+        texts.extend(phone._SCHEDULE_TERMINAL_TEXT.values())
+        texts.append(phone.PHONE_CALLBACK_DEFERRAL_TEXT)
         for text in texts:
             with self.subTest(text=text):
                 lowered = text.lower()
@@ -13852,6 +14069,27 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
         self.assertIn("reach out", spoken2)
         self.assertEqual(getattr(agent, "_turn_policy"), "closing")
         self.assertEqual(client.confirm_calls, [])
+        # ...AND IT STILL SAYS WHY. Spending the re-ask is not a licence to go
+        # silent on the reason: on the live call (session 9f1a3d2e) the
+        # candidate offered 8 PM — a good time, refused only by the same-IST-day
+        # ban — and heard nothing but "our team will reach out". That is the
+        # original RCA complaint moved one step later.
+        # NOT `assertIn("today", ...)` — the bare deferral already ends
+        # "Thanks so much for your time today", so that assertion passes with
+        # the explanation removed. A mutation caught exactly that. Assert the
+        # REASON, which only the explained wording carries.
+        #
+        # The terminal reason is also deliberately NOT the re-ask's clause: a
+        # review found "I can't book another call for today" spoken twice, with
+        # the useful half ("but I can from tomorrow onwards") dropped the second
+        # time, sounded like a bot that had lost the thread.
+        self.assertIn("already spoken for", spoken2)
+        self.assertNotIn(
+            "can't book another call", spoken2,
+            "the terminal line is repeating the re-ask clause verbatim",
+        )
+        # A question here would ask something and then hang up on the answer.
+        self.assertNotIn("?", spoken2)
 
     async def test_an_UNACTIONABLE_refusal_does_not_re_ask(self):
         """Re-asking is only kind when a different answer could work.
@@ -13876,6 +14114,144 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
                           types.SimpleNamespace(text_content="Tomorrow at 1 PM."), turn1)
         self.assertEqual(getattr(agent, "_turn_policy"), "closing")
         self.assertEqual(client.confirm_calls, [])
+
+    def test_the_two_sign_offs_cannot_drift_apart(self):
+        """`_SCHEDULE_TERMINAL_TAIL` is a byte-copy of the deferral's tail.
+
+        Two separate literals saying the same thing is exactly what
+        `gate_copy_texts()` warns about one screen up: "Matched by exact text
+        because every member is a CONSTANT. A line that changes has to change
+        here too." Edit the deferral copy and the explained sign-off silently
+        says something different — with nothing going red. This is that guard.
+        """
+        self.assertTrue(
+            phone.PHONE_CALLBACK_DEFERRAL_TEXT.endswith(phone._SCHEDULE_TERMINAL_TAIL),
+            "the explained sign-off no longer matches the bare deferral's "
+            "tail — one of the two literals was edited alone",
+        )
+
+    def test_a_SPENT_re_ask_still_says_why_before_signing_off(self):
+        """Every retryable refusal needs TERMINAL wording, not just a re-ask.
+
+        `_SCHEDULE_REFUSAL_TEXT` deliberately ends every line in a question,
+        because its only caller re-asks for another time. Reusing those lines
+        once the re-ask is spent would ask the candidate something and then
+        hang up on them — worse than the generic deferral it replaces. So each
+        retryable status also carries a reason worded for a call that is
+        ENDING.
+        """
+        # A REFUSAL MUST NEVER SOUND LIKE A BOOKING. This is the single most
+        # important invariant here, and it was unprotected: a review mutated
+        # the shared tail to "I have booked you in and our team will reach
+        # out." and all 714 tests passed. It also caught the terminal wording
+        # for `daily_attempt_exists` claiming "there's already a call booked
+        # for that day" — an ATTEMPT-per-day limit, where no booking need
+        # exist. Content is asserted per status, not just tail properties.
+        expected_substring = {
+            "lead_time_too_short": "too soon",
+            "window_closed": "hours",
+            "slot_straddles_ist_midnight": "midnight",
+            "slot_not_yet_eligible": "already spoken for",
+            "slot_full": "fully booked",
+            "daily_attempt_exists": "same india-time day",
+        }
+        self.assertEqual(
+            sorted(expected_substring), sorted(phone._CALLBACK_RETRYABLE_REFUSALS),
+            "every retryable status needs a CONTENT assertion here; tail "
+            "properties alone pass even when the line says 'Bananas are purple'",
+        )
+
+        for status in phone._CALLBACK_RETRYABLE_REFUSALS:
+            self.assertIn(
+                status, phone._SCHEDULE_TERMINAL_REASON,
+                f"retryable status {status!r} has no terminal reason, so a "
+                f"candidate who spends the re-ask on it hears only the generic "
+                f"deferral — the bug this exists to fix",
+            )
+            reason = phone._SCHEDULE_TERMINAL_REASON[status].lower()
+            self.assertIn(
+                expected_substring[status], reason,
+                f"the terminal wording for {status!r} no longer states its "
+                f"actual reason: {reason!r}",
+            )
+            # No refusal may assert that a call exists.
+            for claim in ("booked you", "i have booked", "is booked",
+                          "call booked", "confirmed"):
+                self.assertNotIn(
+                    claim, reason,
+                    f"{status!r} is a REFUSAL and must not claim a booking",
+                )
+            spoken = phone.schedule_terminal_deferral_text(status)
+            self.assertNotEqual(
+                spoken, phone.PHONE_CALLBACK_DEFERRAL_TEXT,
+                f"{status!r} fell back to the bare deferral",
+            )
+            self.assertNotIn(
+                "?", spoken,
+                f"{status!r} asks a question on a call that is ending",
+            )
+            self.assertIn("reach out", spoken, f"{status!r} loses the hand-off")
+            # The shared tail is a hand-off, not a confirmation.
+            for claim in ("booked you", "i have booked", "is booked",
+                          "confirmed", "see you"):
+                self.assertNotIn(
+                    claim, spoken.lower(),
+                    f"the sign-off for {status!r} claims a booking that does "
+                    f"not exist — the exact defect this flow prevents",
+                )
+            # A spoken line missing from `gate_copy_texts` is treated as a
+            # SCREENING turn, which pollutes latest_assistant[0], the conflict
+            # probe and the goodbye latch.
+            self.assertTrue(
+                phone.is_gate_copy(spoken),
+                f"the terminal wording for {status!r} is not gate copy, so the "
+                f"bot's own sign-off would look like a candidate answer",
+            )
+
+        # An unmapped status must never produce half a sentence.
+        self.assertEqual(
+            phone.schedule_terminal_deferral_text("no_such_status"),
+            phone.PHONE_CALLBACK_DEFERRAL_TEXT,
+        )
+        self.assertEqual(
+            phone.schedule_terminal_deferral_text(None),
+            phone.PHONE_CALLBACK_DEFERRAL_TEXT,
+        )
+        # The lookup NORMALISES. Untested, a `.get(status, ...)` with no
+        # strip/lower survives, because the only caller pre-normalises — the
+        # helper reads stronger than it is.
+        self.assertEqual(
+            phone.schedule_terminal_deferral_text("  WINDOW_CLOSED  "),
+            phone.schedule_terminal_deferral_text("window_closed"),
+        )
+
+    def test_the_explained_terminal_keeps_the_CANDIDATE_halt_reason(self):
+        """"Same halt reason" was asserted in a comment, not in a test.
+
+        Swapping `HALT_CANDIDATE_ENDED` for `HALT_CALLBACK_RECOVERY` survived
+        the whole suite — and that swap silently converts a terminal that posts
+        `assessment.aborted` into one that posts NOTHING, because
+        `HALT_CALLBACK_RECOVERY` is in `RETRYABLE_HALTS`. The engagement is
+        then left un-terminalised and redialable.
+        """
+        self.assertIn(phone.HALT_CALLBACK_RECOVERY, phone.RETRYABLE_HALTS)
+        self.assertNotIn(phone.HALT_CANDIDATE_ENDED, phone.RETRYABLE_HALTS)
+
+        client = FakeEventClient()
+        resolved = "2026-09-05T05:30:00Z"
+        client.script_proposal(resolved, "slot_not_yet_eligible")
+        flow = phone.CallbackFlowState()
+        flow.phase = phone.CALLBACK_PHASE_AWAITING_RETIME
+        decision = asyncio.run(phone.run_callback_turn(
+            flow, client, _ATTEMPT_ID, "on 2026-09-05 at 11am",
+            datetime(2026, 9, 2, 6, 0, tzinfo=timezone.utc),
+        ))
+        self.assertTrue(decision.terminal)
+        self.assertEqual(
+            decision.terminal_reason, phone.HALT_CANDIDATE_ENDED,
+            "an explained refusal must still post the candidate-ended "
+            "terminal; a retryable halt posts nothing at all",
+        )
 
     def test_the_refusal_vocabulary_has_a_line_for_every_retryable_status(self):
         """A retryable status with no written line would speak the generic
@@ -14198,6 +14574,44 @@ class TestTheFlowCANNOTLoop(unittest.IsolatedAsyncioTestCase):
             "infrastructure failing is not the candidate ending the assessment",
         )
 
+    async def test_the_CONFIRM_leg_also_explains_a_spent_re_ask(self):
+        """The propose leg was fixed; the confirm leg still went silent.
+
+        A review found the new terminal branch sits AFTER the confirm leg's own
+        return, so a spent re-ask there fell through to
+        `_confirmation_failure_decision()` — the bare deferral, under
+        `HALT_CALLBACK_RECOVERY`, an INFRASTRUCTURE halt reason for a refusal
+        the candidate could have fixed by naming another day.
+
+        This path matters more than it looks: `daily_attempt_exists` is emitted
+        ONLY by confirm (`/callbacks/propose` never returns it), so without
+        this its terminal wording is unreachable copy.
+        """
+        client = FakeEventClient()
+        client.script_proposal(self.RESOLVED, "proposal_valid")
+        client.script_confirm(self.RESOLVED, False, "daily_attempt_exists")
+
+        # Enter already at AWAITING_RETIME so the one re-ask is spent.
+        flow = phone.CallbackFlowState()
+        flow.phase = phone.CALLBACK_PHASE_AWAITING_RETIME
+        decision = await phone.run_callback_turn(
+            flow, client, _ATTEMPT_ID, self.TIME_TEXT, self.NOW,
+        )
+
+        self.assertTrue(decision.terminal)
+        self.assertFalse(decision.booked, "a refusal must never look like a booking")
+        self.assertEqual(
+            decision.terminal_reason, phone.HALT_CANDIDATE_ENDED,
+            "a candidate-fixable refusal is not an infrastructure failure",
+        )
+        self.assertEqual(
+            decision.spoken,
+            phone.schedule_terminal_deferral_text("daily_attempt_exists"),
+            "the confirm leg still speaks the bare deferral",
+        )
+        self.assertNotEqual(decision.spoken, phone.PHONE_CALLBACK_DEFERRAL_TEXT)
+        self.assertEqual(flow.phase, phone.CALLBACK_PHASE_DONE)
+
     async def test_the_RETIME_phase_actually_proposes_the_second_time(self):
         """Kills: deleting the AWAITING_RETIME handler entirely.
 
@@ -14383,13 +14797,19 @@ class TestPhoneManifestTunables(unittest.TestCase):
         assert, so the floor is the one value with live evidence behind it —
         20, which the owner audibly heard break words. The sweep table lives
         in the fly.phone.toml comment next to the value.
+
+        35 is SHIPPED because it is the only value satisfying both constraints
+        the owner set: faster than 40, and no measured word breakage. 30 was
+        shipped briefly and retired the same day — it cracks a word on
+        number-heavy leads (this bot asks about compensation on every call) to
+        buy about five characters of latency.
         """
         env = self._phone_env()
         value = env.get("PHONE_TTS_FLUSH_MIN_CHARS")
         self.assertIsNotNone(
             value, "PHONE_TTS_FLUSH_MIN_CHARS must stay pinned in fly.phone.toml"
         )
-        self.assertEqual(value, "30")
+        self.assertEqual(value, "35")
         self.assertGreater(
             int(value), 20,
             "20 is the value the owner heard break words on a live call",

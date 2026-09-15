@@ -188,7 +188,14 @@ primary_region = "sin"
   #       why this [env] line still read 60 — the secret shadowed it, and the
   #       repo could not see the live value).
   #   30  owner-requested 2026-09-15 as the midpoint between "20 broke words"
-  #       and "40 feels laggy".
+  #       and "40 feels laggy". Shipped, then RETIRED the same day — the sweep
+  #       below put it one step short of safe. NOT retired for latency: an
+  #       earlier draft of this line claimed "a live call confirmed the lag
+  #       complaint was real", which cited no session and argued the wrong way
+  #       (a confirmed lag complaint would push the cap DOWN, not up).
+  #   35  owner-approved 2026-09-15 after the sweep. The lowest cap that broke
+  #       NO word on the corpus while still firing earlier than 40 — so it is
+  #       the only value satisfying both constraints that were set.
   #
   # MEASURED, so the next reader is not misled.
   #
@@ -199,7 +206,7 @@ primary_region = "sin"
   # `_A0_LEADING_SEGMENT_MAX_CHARS` (48) releases in a burst; that is WRONG for
   # a normal reply. The A0 gate releases at the first clause boundary OR 48
   # chars, and this bot is instructed to open by reacting ("Got it,", "Sure,",
-  # "Mm,"), so the real release is at 3-12 chars and 30 does fire ~10 dense
+  # "Mm,"), so the real release is at 3-12 chars and 35 does fire ~5 dense
   # characters before 40. Small, not nil.
   #
   # WORD BREAKAGE: there IS a word-boundary back-off, and it DECLINES when the
@@ -216,31 +223,44 @@ primary_region = "sin"
   #     cap   turns that hit the cap   of those, cracked a word
   #      20            12                        6
   #      28             9                        1
-  #      30             8                        1   <- SHIPPED
+  #      30             8                        1
   #      32             7                        1
-  #      35             5                        0   <- lowest clean value
+  #      35             5                        0   <- SHIPPED (lowest clean)
   #      40             3                        0   <- the value replaced
   #
-  # So 30 is one step better than 40 on latency and one step short of safe.
-  # 35 is the lowest cap that broke nothing on that corpus while still firing
-  # earlier than 40. 30 is shipped because the owner chose it explicitly after
-  # being told the risk was measured and real; if a cracked word is heard on
-  # the next call, "35" is the better first move and "40" is the full revert.
+  # 35 is shipped because it satisfies both constraints that were set: faster
+  # than 40, and no word breakage on the swept corpus. It is the LOWEST
+  # MEASURED clean value — not the only one. An earlier draft claimed "the
+  # only value", which is false: the sweep tested {20,28,30,32,35,40} and
+  # never tried 33 or 34, which would very likely also be clean and marginally
+  # faster. The weaker claim is the honest one.
+  #
+  # "No breakage" is CORPUS-SCOPED, not categorical. Brute-forcing long digit
+  # runs cracks words at 35 AND at 40 — the back-off declines whenever the
+  # head carries fewer than 14 alphabetic characters, so no cap in this range
+  # is crack-proof against arbitrary numbers:
+  #   "Mm, 1250000 plus 9876543210 compensation is what you are on today?"
+  #     35 -> "ompensatio|n is what"      40 -> also cracks
+  #
+  # 30 was tried first and is NOT recommended — it cracks on ordinary
+  # compensation leads for ~5 characters of latency. "40" remains the full
+  # revert if 35 is heard to break.
   #
   # The margin is spent by digits, and this bot asks about compensation on
-  # every call. Reproduced at 30, clean at 40:
+  # every call. THE CASE THAT RETIRED 30, clean at 35 and at 40:
   #   "Mm, 1250000 fixed plus 200000 variable is what you are on today?"
   #     30 -> back-off declines (head has 11 alpha < 14); cut lands "varia|ble"
+  #     35 -> cuts cleanly
   #     40 -> cuts cleanly after "variable is what "
-  # So expect a cracked word specifically on number-heavy leads. If you hear
-  # one, `PHONE_TTS_FLUSH_MIN_CHARS = "40"` here is the one-line revert.
+  # If a cracked word is ever heard at 35, `PHONE_TTS_FLUSH_MIN_CHARS = "40"`
+  # here is the one-line revert.
   #
   # DEPLOY NOTE (operator step): a stale Fly SECRET also named
   # PHONE_TTS_FLUSH_MIN_CHARS overrides this [env] value — it MUST be unset
   # (`fly secrets unset PHONE_TTS_FLUSH_MIN_CHARS -a <phone-app>`) at deploy or
   # this change silently does nothing. The live value was 40 via exactly such a
   # secret until 2026-09-15.
-  PHONE_TTS_FLUSH_MIN_CHARS = "30"
+  PHONE_TTS_FLUSH_MIN_CHARS = "35"
   # 0095 — PHONE_TTS_PACE is DELIBERATELY NOT SET HERE. The reader
   # (`phone_tts_pace()`, default 1.0) ships so the value can be applied as a
   # secret, but the value itself is unverified against `bulbul:v3`: the [0.5,
