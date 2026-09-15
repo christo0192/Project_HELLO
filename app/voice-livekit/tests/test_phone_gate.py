@@ -14093,6 +14093,27 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
         retryable status also carries a reason worded for a call that is
         ENDING.
         """
+        # A REFUSAL MUST NEVER SOUND LIKE A BOOKING. This is the single most
+        # important invariant here, and it was unprotected: a review mutated
+        # the shared tail to "I have booked you in and our team will reach
+        # out." and all 714 tests passed. It also caught the terminal wording
+        # for `daily_attempt_exists` claiming "there's already a call booked
+        # for that day" — an ATTEMPT-per-day limit, where no booking need
+        # exist. Content is asserted per status, not just tail properties.
+        expected_substring = {
+            "lead_time_too_short": "too soon",
+            "window_closed": "hours",
+            "slot_straddles_ist_midnight": "midnight",
+            "slot_not_yet_eligible": "already spoken for",
+            "slot_full": "fully booked",
+            "daily_attempt_exists": "same india-time day",
+        }
+        self.assertEqual(
+            sorted(expected_substring), sorted(phone._CALLBACK_RETRYABLE_REFUSALS),
+            "every retryable status needs a CONTENT assertion here; tail "
+            "properties alone pass even when the line says 'Bananas are purple'",
+        )
+
         for status in phone._CALLBACK_RETRYABLE_REFUSALS:
             self.assertIn(
                 status, phone._SCHEDULE_TERMINAL_REASON,
@@ -14100,6 +14121,19 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
                 f"candidate who spends the re-ask on it hears only the generic "
                 f"deferral — the bug this exists to fix",
             )
+            reason = phone._SCHEDULE_TERMINAL_REASON[status].lower()
+            self.assertIn(
+                expected_substring[status], reason,
+                f"the terminal wording for {status!r} no longer states its "
+                f"actual reason: {reason!r}",
+            )
+            # No refusal may assert that a call exists.
+            for claim in ("booked you", "i have booked", "is booked",
+                          "call booked", "confirmed"):
+                self.assertNotIn(
+                    claim, reason,
+                    f"{status!r} is a REFUSAL and must not claim a booking",
+                )
             spoken = phone.schedule_terminal_deferral_text(status)
             self.assertNotEqual(
                 spoken, phone.PHONE_CALLBACK_DEFERRAL_TEXT,
@@ -14110,6 +14144,14 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
                 f"{status!r} asks a question on a call that is ending",
             )
             self.assertIn("reach out", spoken, f"{status!r} loses the hand-off")
+            # The shared tail is a hand-off, not a confirmation.
+            for claim in ("booked you", "i have booked", "is booked",
+                          "confirmed", "see you"):
+                self.assertNotIn(
+                    claim, spoken.lower(),
+                    f"the sign-off for {status!r} claims a booking that does "
+                    f"not exist — the exact defect this flow prevents",
+                )
             # A spoken line missing from `gate_copy_texts` is treated as a
             # SCREENING turn, which pollutes latest_assistant[0], the conflict
             # probe and the goodbye latch.
@@ -14127,6 +14169,41 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             phone.schedule_terminal_deferral_text(None),
             phone.PHONE_CALLBACK_DEFERRAL_TEXT,
+        )
+        # The lookup NORMALISES. Untested, a `.get(status, ...)` with no
+        # strip/lower survives, because the only caller pre-normalises — the
+        # helper reads stronger than it is.
+        self.assertEqual(
+            phone.schedule_terminal_deferral_text("  WINDOW_CLOSED  "),
+            phone.schedule_terminal_deferral_text("window_closed"),
+        )
+
+    def test_the_explained_terminal_keeps_the_CANDIDATE_halt_reason(self):
+        """"Same halt reason" was asserted in a comment, not in a test.
+
+        Swapping `HALT_CANDIDATE_ENDED` for `HALT_CALLBACK_RECOVERY` survived
+        the whole suite — and that swap silently converts a terminal that posts
+        `assessment.aborted` into one that posts NOTHING, because
+        `HALT_CALLBACK_RECOVERY` is in `RETRYABLE_HALTS`. The engagement is
+        then left un-terminalised and redialable.
+        """
+        self.assertIn(phone.HALT_CALLBACK_RECOVERY, phone.RETRYABLE_HALTS)
+        self.assertNotIn(phone.HALT_CANDIDATE_ENDED, phone.RETRYABLE_HALTS)
+
+        client = FakeEventClient()
+        resolved = "2026-09-05T05:30:00Z"
+        client.script_proposal(resolved, "slot_not_yet_eligible")
+        flow = phone.CallbackFlowState()
+        flow.phase = phone.CALLBACK_PHASE_AWAITING_RETIME
+        decision = asyncio.run(phone.run_callback_turn(
+            flow, client, _ATTEMPT_ID, "on 2026-09-05 at 11am",
+            datetime(2026, 9, 2, 6, 0, tzinfo=timezone.utc),
+        ))
+        self.assertTrue(decision.terminal)
+        self.assertEqual(
+            decision.terminal_reason, phone.HALT_CANDIDATE_ENDED,
+            "an explained refusal must still post the candidate-ended "
+            "terminal; a retryable halt posts nothing at all",
         )
 
     def test_the_refusal_vocabulary_has_a_line_for_every_retryable_status(self):

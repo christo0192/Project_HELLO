@@ -578,6 +578,15 @@ def phone_identity_instruction(candidate_name: Any) -> str:
         "Do NOT say why you are calling and do NOT mention a job, an "
         "application, a role, a company they work for, or anything from their "
         "background — you have not yet confirmed who is on the line. "
+        # THE MODEL CANNOT SEE A CLOCK. Left free to "greet warmly" it reaches
+        # for "good morning" regardless of the hour: on the live 2026-09-15
+        # call it opened "Hi there, good morning!" at 17:48 IST. The calling
+        # window is 09:00-21:00 IST, so a wrong guess is not a corner case —
+        # it is wrong for most of the window, and it is the FIRST thing the
+        # candidate hears. A plain greeting is correct at every hour.
+        "Do NOT use a time-of-day greeting: no \"good morning\", \"good "
+        "afternoon\" or \"good evening\". You do not know the local time. "
+        "Open with a plain greeting such as \"Hi\" or \"Hello\". "
         "Ask EXACTLY ONE question and it MUST be that identity question — your "
         "reply MUST END with it so a simple yes or no answers it. "
         "Do NOT mention recording. Do NOT ask for permission or consent to "
@@ -4408,13 +4417,26 @@ _SCHEDULE_TERMINAL_REASON: dict[str, str] = {
     # thread.
     "slot_not_yet_eligible": "Today is already spoken for, I'm afraid.",
     "slot_full": "That time is fully booked.",
-    "daily_attempt_exists": "There's already a call booked for that day.",
+    # NOT "there's already a call booked for that day". `daily_attempt_exists`
+    # is an ATTEMPT-per-IST-day limit, not an appointment — the ended attempt
+    # keeps today's `ist_date`, and no booking need exist at all. The re-ask
+    # wording for this same status avoids the claim deliberately ("I can't
+    # arrange another call on that same India-time day"); the terminal wording
+    # must too. A refusal that sounds like a confirmation is the defect this
+    # whole flow exists to prevent.
+    "daily_attempt_exists": (
+        "I can't arrange another call on that same India-time day."
+    ),
 }
 
-#: Precomposed so every line the bot can speak is a literal `gate_copy_texts()`
-#: can contain. A spoken line missing from that set is treated as a SCREENING
-#: turn, which pollutes `latest_assistant[0]`, the conflict probe and the
-#: goodbye latch.
+#: Precomposed so THESE lines are literals `gate_copy_texts()` can contain. A
+#: spoken line missing from that set is treated as a SCREENING turn, which
+#: pollutes `latest_assistant[0]`, the conflict probe and the goodbye latch.
+#:
+#: NOT every line this flow speaks is gate copy, and an earlier version of this
+#: comment said otherwise. `_CALLBACK_ASK_TIME_TEXT` is not registered, and
+#: `_alternatives_offer_text` is composed at runtime so it structurally cannot
+#: be a literal. Both are pre-existing; neither is made worse here.
 _SCHEDULE_TERMINAL_TEXT: dict[str, str] = {
     status: f"{reason} {_SCHEDULE_TERMINAL_TAIL}"
     for status, reason in _SCHEDULE_TERMINAL_REASON.items()

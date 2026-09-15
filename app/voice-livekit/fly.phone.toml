@@ -228,11 +228,23 @@ primary_region = "sin"
   #      35             5                        0   <- SHIPPED (lowest clean)
   #      40             3                        0   <- the value replaced
   #
-  # 35 is shipped because it is the only value that satisfies both
-  # constraints the owner actually set: faster than 40, and no measured word
-  # breakage. 30 was tried first and is NOT recommended — it cracks a word on
-  # number-heavy leads for ~5 characters of latency. "40" remains the full
-  # revert if even 35 is heard to break.
+  # 35 is shipped because it satisfies both constraints that were set: faster
+  # than 40, and no word breakage on the swept corpus. It is the LOWEST
+  # MEASURED clean value — not the only one. An earlier draft claimed "the
+  # only value", which is false: the sweep tested {20,28,30,32,35,40} and
+  # never tried 33 or 34, which would very likely also be clean and marginally
+  # faster. The weaker claim is the honest one.
+  #
+  # "No breakage" is CORPUS-SCOPED, not categorical. Brute-forcing long digit
+  # runs cracks words at 35 AND at 40 — the back-off declines whenever the
+  # head carries fewer than 14 alphabetic characters, so no cap in this range
+  # is crack-proof against arbitrary numbers:
+  #   "Mm, 1250000 plus 9876543210 compensation is what you are on today?"
+  #     35 -> "ompensatio|n is what"      40 -> also cracks
+  #
+  # 30 was tried first and is NOT recommended — it cracks on ordinary
+  # compensation leads for ~5 characters of latency. "40" remains the full
+  # revert if 35 is heard to break.
   #
   # The margin is spent by digits, and this bot asks about compensation on
   # every call. THE CASE THAT RETIRED 30, clean at 35 and at 40:
