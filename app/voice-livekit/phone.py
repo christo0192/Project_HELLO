@@ -4694,9 +4694,14 @@ async def _propose_and_confirm(
             error_category=confirm_status or (confirm.error_category or _ERR_MALFORMED),
         )
         return _confirmation_failure_decision()
+    # ONE normalization for BOTH refusal branches below. They used to differ
+    # (raw here, lowercased there), so a case-variant status skipped the
+    # alternatives round and still hit the re-ask — offering the candidate a
+    # blind retry when the server had already computed the free slots.
+    status = str(outcome.status or "").strip().lower()
     alt_rank = _CALLBACK_PHASE_RANK[CALLBACK_PHASE_AWAITING_ALT_PICK]
     if (
-        outcome.status == "slot_full"
+        status == "slot_full"
         and outcome.alternatives
         and _callback_phase_rank(flow.phase) < alt_rank
     ):
@@ -4720,7 +4725,6 @@ async def _propose_and_confirm(
     # once per flow; a second refusal arrives already at `awaiting_retime`,
     # fails the rank test, and terminalizes. The flow stays forward-only and
     # its termination is still provable by inspection.
-    status = str(outcome.status or "").strip().lower()
     retime_rank = _CALLBACK_PHASE_RANK[CALLBACK_PHASE_AWAITING_RETIME]
     if (
         status in _CALLBACK_RETRYABLE_REFUSALS
@@ -4759,7 +4763,12 @@ async def run_callback_turn(
     a strictly later phase, and there is no phase that can return to an earlier
     one — now ENFORCED by `_callback_phase_rank` rather than asserted here.
     A candidate who never reaches a bookable time reaches the terminal deferral
-    within: initial parse → one clarification → one refusal re-ask → deferral.
+    within FOUR flow turns, which is the longest chain the ranks permit:
+    initial parse → one clarification → one refusal re-ask (`awaiting_retime`)
+    → one alternatives round (`awaiting_alt_pick`) → deferral. The alternatives
+    round is reachable AFTER the re-ask because it ranks strictly later, so
+    counting it out (as an earlier version of this docstring did) understates
+    the bound by one turn.
     """
     phase = flow.phase
 
@@ -11162,19 +11171,46 @@ _CALLBACK_VETO_RE = re.compile(
 )
 
 
-def is_callback_request(text: Any) -> bool:
-    """True when the candidate is asking US to end this call and ring back.
+def callback_request_match(text: Any) -> str | None:
+    """Return the NAME of the branch that heard a callback request, or None.
 
     Trigger THEN veto. The veto is what separates a request from a Sales
     Program Advisor describing the callbacks they make for a living, and it is
     the half that keeps a widened trigger from hanging up on an answer.
+
+    The name exists so a misfire is ATTRIBUTABLE. This gate ENDS the interview
+    when it fires, and the only evidence on the previous production incident
+    was a transcript that stopped — nothing said which of thirteen patterns
+    decided it. Logging the branch turns "the bot hung up on a good answer"
+    into a one-line diff. The names are compile-time literals, so nothing the
+    candidate said can reach a log through this.
+
+    Compiled alternations are matched a second time here, one branch at a
+    time, ONLY on a turn that already matched the combined pattern — so the
+    per-turn cost on the overwhelmingly common no-match path is unchanged.
     """
     clean = str(text or "").strip()
     if not clean:
-        return False
+        return None
     if _CALLBACK_VETO_RE.search(clean):
-        return False
-    return bool(_CALLBACK_DEFERRAL_RE.search(clean))
+        return None
+    if not _CALLBACK_DEFERRAL_RE.search(clean):
+        return None
+    for name, pattern in _CALLBACK_DEFERRAL_PATTERNS:
+        if re.search(pattern, clean, re.IGNORECASE):
+            return name
+    # The combined pattern matched but no single branch did. Structurally
+    # impossible (the combined pattern IS the alternation of these branches),
+    # but returning a name rather than None keeps the caller's contract:
+    # a request was heard, and the flow must still own the turn.
+    return "unattributed"
+
+
+def is_callback_request(text: Any) -> bool:
+    """True when the candidate is asking US to end this call and ring back."""
+    return callback_request_match(text) is not None
+
+
 _COMPANY_REVIEW_QUESTION_RE = re.compile(
     r"\b(?:glassdoor|google\s+reviews?|company\s+reviews?|bad\s+reviews?|"
     r"negative\s+reviews?|safe\s+to\s+work|workplace\s+reviews?)\b",

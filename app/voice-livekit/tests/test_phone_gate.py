@@ -4929,6 +4929,95 @@ class TestNativePhoneArchitecture(unittest.TestCase):
                     f"request, which ENDS the interview: {text!r}",
                 )
 
+    def test_the_false_positives_an_ADVERSARIAL_REVIEW_found_stay_dead(self):
+        r"""Every one of these hung up on a real answer in the first draft.
+
+        A reviewer enumerated the old pattern's language, ran it forwards and
+        backwards against the new one, and produced these. They are kept
+        verbatim — not paraphrased, not shortened — because each one killed a
+        SPECIFIC mechanism, and a paraphrase can stop exercising it:
+
+          * "can you call the prospect first"  — the object was OPTIONAL, so
+            the branch collapsed to "modal + call + anything".
+          * "I am not busy at all"             — the hedge slot was `\w+`,
+            which swallowed the NEGATION.
+          * "I am driving revenue"             — `driving` had no guard, and
+            "driving revenue/adoption/the motion" is this role's vocabulary.
+          * "I reschedule the call whenever"   — a PROCESS description, which
+            is what a Sales Program Advisor does for a living.
+
+        These are the answers the bot would have ended the interview on.
+        """
+        for text in [
+            # object was optional
+            "Can you call the prospect first and then update the CRM?",
+            "Could you call out the main challenge you faced?",
+            "Can we call it a day once the quota is hit?",
+            "Will you call them or should I?",
+            "Please call the number on the website for pricing.",
+            # negation swallowed by the hedge slot
+            "I am not busy at all, please go ahead.",
+            "I am not too busy to take this call.",
+            "I am rarely busy in the mornings.",
+            # unguarded unavailability verbs vs. sales vocabulary
+            "I am currently driving revenue for the north region.",
+            "I am driving the outbound motion for the team.",
+            "I am in a meeting cadence with my manager every Monday.",
+            # process description, not a request
+            "I reschedule the call whenever a prospect misses it.",
+            "Prospects can call me back or give me a call later if they prefer.",
+        ]:
+            self.assertNotEqual(
+                phone.candidate_turn_route(text), "callback_deferral",
+                f"REGRESSION: an adversarial review already caught this exact "
+                f"string ending the interview on a real answer: {text!r}",
+            )
+
+    def test_a_misfire_can_be_traced_to_the_BRANCH_that_caused_it(self):
+        """This gate ends the call, so a misfire must be attributable.
+
+        On the production incident the only evidence was a transcript that
+        stopped; nothing said which of thirteen patterns decided it. The
+        branch name is logged at both entry points in `agent.py`, so the
+        contract is: a heard request always names a branch, and that name is
+        one of the declared ones (never candidate speech, which is what makes
+        it safe to log).
+        """
+        declared = {name for name, _ in phone._CALLBACK_DEFERRAL_PATTERNS}
+        # The logger DROPS a value that fails `_SAFE_IDENT_RE`, silently. A
+        # branch named outside that charset would log nothing at all and the
+        # misfire would be exactly as untraceable as before.
+        for name in declared | {"unattributed"}:
+            self.assertRegex(name, r"^[a-zA-Z0-9_:.\-]{1,64}$")
+        for text in [
+            "can you call me back at 1pm today",
+            "I'm a bit busy right now, call me later",
+            "can we reschedule",
+        ]:
+            name = phone.callback_request_match(text)
+            self.assertIsNotNone(name, f"trigger stopped matching: {text!r}")
+            self.assertIn(
+                name, declared,
+                f"the reported branch {name!r} is not a declared branch — a "
+                f"log line naming it would be untraceable",
+            )
+        # A vetoed string reports nothing at all, so the two halves cannot
+        # drift into disagreeing about whether a request was heard.
+        self.assertIsNone(
+            phone.callback_request_match(
+                "My job is to schedule the call with the counsellor."
+            )
+        )
+        self.assertIsNone(phone.callback_request_match(""))
+        self.assertIsNone(phone.callback_request_match(None))
+        # The boolean gate is DERIVED from the name, not a second copy of the
+        # logic that could disagree with it.
+        for text in ["can you call me back tomorrow at 3pm", "tell me about the role"]:
+            self.assertEqual(
+                phone.is_callback_request(text),
+                phone.callback_request_match(text) is not None,
+            )
+
     def test_the_veto_is_what_makes_the_widening_safe(self):
         """The trigger alone is deliberately loose; the veto is the guard.
 
@@ -13407,6 +13496,76 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
                 f"{status!r} falls through to the generic line",
             )
 
+    def test_every_refusal_the_SERVER_can_speak_is_classified(self):
+        """The set was checked against our own text table and nothing else.
+
+        That is circular: both halves live in `phone.py`, so they agree by
+        construction and a status the SERVER adds is invisible to both. The
+        RCA bug was exactly a server refusal nobody had classified.
+
+        This reads the propose route and asserts every refusal it can actually
+        return is a DELIBERATE decision — either retryable (the candidate can
+        fix it by naming another time) or listed below as terminal-on-purpose.
+        Adding a refusal to the route without deciding which it is fails here.
+
+        Scoped to HTTP 200 bodies on purpose. A 4xx/5xx becomes a
+        `BusinessError`/`ProviderError` in `call_with_breaker`, so `_post`
+        returns a category string and the body is NEVER parsed — `status` is
+        unset and the flow takes the transport path. That is why
+        `invalid_request` (400) and `phone_callback_proposal_error` (503) are
+        not in either set: they cannot reach the classifier at all.
+        """
+        source = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "api" / "src" / "routes" / "phone-worker.ts"
+        ).read_text(encoding="utf-8")
+        start = source.index("router.post('/callbacks/propose'")
+        end = source.index("router.post('/callbacks/confirm'", start)
+        body = source[start:end]
+
+        # `res.json(...)` only — `res.status(4xx|5xx).json(...)` is excluded by
+        # the pattern, which is the HTTP-200 scoping described above.
+        served = set(re.findall(
+            r"return\s+res\.json\(\{\s*ok:\s*false,\s*status:\s*'([a-z_]+)'",
+            body,
+        ))
+        self.assertTrue(
+            served,
+            "no 200-refusals parsed out of the propose route — the route was "
+            "restructured and this test has gone vacuous",
+        )
+
+        # Refusals a different TIME cannot fix. Each needs a reason, because
+        # putting one here is a decision to end the call on it.
+        terminal_on_purpose = {
+            # The attempt row is gone or was never ours. Re-asking cannot help,
+            # and the worker has nothing to schedule against.
+            "unknown_attempt",
+            # Another dial is live on this engagement. A callback booked now
+            # would collide with the call already in progress.
+            "attempt_in_flight",
+        }
+
+        unclassified = served - phone._CALLBACK_RETRYABLE_REFUSALS - terminal_on_purpose
+        self.assertEqual(
+            unclassified, set(),
+            f"the propose route can refuse with {sorted(unclassified)}, which "
+            f"is in neither set — so the worker speaks the generic 'our team "
+            f"will reach out' and ENDS the interview on it. Decide: retryable "
+            f"(add a line to _SCHEDULE_REFUSAL_TEXT too) or terminal (say why "
+            f"above).",
+        )
+
+        # And the converse: a retryable status the route can no longer emit is
+        # dead weight that reads as coverage the code does not have.
+        from_confirm = {"daily_attempt_exists"}
+        stale = phone._CALLBACK_RETRYABLE_REFUSALS - served - from_confirm
+        self.assertEqual(
+            stale, set(),
+            f"{sorted(stale)} is marked retryable but the propose route never "
+            f"emits it, and it is not one of the confirm-leg statuses",
+        )
+
     def test_the_phase_ranks_make_the_flow_provably_finite(self):
         """The re-ask is the first edge that could have created a loop.
 
@@ -13639,6 +13798,29 @@ class TestPhoneManifestTunables(unittest.TestCase):
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         with open(os.path.join(here, "fly.phone.toml"), "rb") as fh:
             return tomllib.load(fh)["env"]
+
+    def test_the_tts_flush_cap_is_pinned_in_the_manifest(self):
+        """This value has been moved by ear and lived in a SECRET, invisible
+        to the repo — the `[env]` line said 60 while production ran 40.
+
+        Pinning it here is what makes a future change visible in review. The
+        band is asserted rather than just the number: below ~28 the
+        word-boundary back-off starts declining and the cap cuts mid-word
+        (the owner heard exactly that at 20), and 0 is a DISABLE sentinel that
+        silently reverts to waiting for a whole first sentence.
+        """
+        env = self._phone_env()
+        value = env.get("PHONE_TTS_FLUSH_MIN_CHARS")
+        self.assertIsNotNone(
+            value, "PHONE_TTS_FLUSH_MIN_CHARS must stay pinned in fly.phone.toml"
+        )
+        self.assertEqual(value, "30")
+        self.assertGreaterEqual(
+            int(value), 28,
+            "below ~28 the back-off declines and the first fragment cuts "
+            "mid-word — the regime the owner heard at 20",
+        )
+        self.assertLessEqual(int(value), 60)
 
     def test_sarvam_frames_restored_to_18_24(self):
         # FIX 1: 9/31 finalized STT segments after ~0.29s of silence, cutting

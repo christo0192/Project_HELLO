@@ -3993,6 +3993,11 @@ async def _run_native_phone_screening(
             closing.cancel_for_callback()
             pending_terminal_reason["value"] = None
             pending_terminal_speech_seq["value"] = None
+            _log.info(
+                "unknown_event", error_type="phone_callback_heard",
+                error_category=phone.callback_request_match(text) or "unattributed",
+                schema="closing",
+            )
             flow = phone.CallbackFlowState()
             callback_flow["state"] = flow
             decision = await phone.run_callback_turn(
@@ -4274,6 +4279,16 @@ async def _run_native_phone_screening(
                 # the bound. The flow is forward-only (phone.run_callback_turn),
                 # so it CANNOT loop; the confirm handshake that used to spin is
                 # gone. Gemini only speaks the decision's line; no tool is added.
+                #
+                # The BRANCH NAME is logged because this gate ends the
+                # interview. A widened trigger is only safe if a misfire can be
+                # traced to the pattern that caused it; the name is a
+                # compile-time literal, never candidate speech.
+                _log.info(
+                    "unknown_event", error_type="phone_callback_heard",
+                    error_category=phone.callback_request_match(text) or "unattributed",
+                    schema="screening",
+                )
                 flow = phone.CallbackFlowState()
                 callback_flow["state"] = flow
                 decision = await phone.run_callback_turn(

@@ -1142,6 +1142,9 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         duration_seconds: PHONE_VOICE_CALLBACK_DURATION_SECONDS,
       });
     } catch {
+      phoneWorkerLog.info('unknown_event', {
+        schema: 'callback_proposal', error_category: 'phone_callback_proposal_error',
+      });
       return res.status(503).json({ ok: false, status: 'phone_callback_proposal_error' });
     }
   });

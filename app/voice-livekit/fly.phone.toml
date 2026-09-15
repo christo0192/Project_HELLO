@@ -181,23 +181,42 @@ primary_region = "sin"
   # ── TUNING HISTORY, because this value has been moved by ear ──────────
   #   60  owner-approved 2026-09-07 (SE-call latency RCA); ~1.8s median
   #       reply->first-TTS block measured at the time.
-  #   20  tried during tuning: audible WORD BREAKAGE. The cap lands wherever it
-  #       lands, including mid-word (phone.py:12247), so a low cap cracks the
-  #       word at the fragment join.
+  #   20  tried during tuning: audible WORD BREAKAGE. See WORD BREAKAGE below
+  #       for the mechanism — there IS a word-boundary back-off, but it
+  #       DECLINES on a short lead, which is why a low cap still cracked words.
   #   40  settled on after that, and ran in production as a SECRET (which is
   #       why this [env] line still read 60 — the secret shadowed it, and the
   #       repo could not see the live value).
   #   30  owner-requested 2026-09-15 as the midpoint between "20 broke words"
   #       and "40 feels laggy".
   #
-  # MEASURED EXPECTATION, so the next reader is not misled: on session
-  # a57e6113 the headline turn latency was 2857ms median, of which ~996ms is
-  # end-of-speech detection and ~1003ms is LLM time-to-first-token. This cap
-  # sits downstream of `_A0_LEADING_SEGMENT_MAX_CHARS = 48` (phone.py:3365),
-  # which releases held chunks as a BURST — so any cap <= 48 is satisfied at
-  # the same instant and the timing gain from 40->30 is ~0. What DOES change is
-  # where the first fragment is cut, i.e. the word-breakage risk. Listen for a
-  # cracked word at the join before trusting this value.
+  # MEASURED, so the next reader is not misled.
+  #
+  # LATENCY: on session a57e6113 the headline turn latency was 2857ms median,
+  # of which ~996ms is end-of-speech detection and ~1003ms is LLM
+  # time-to-first-token. The flush sits inside the remaining ~12%. An earlier
+  # draft of this comment claimed the gain was exactly zero because
+  # `_A0_LEADING_SEGMENT_MAX_CHARS` (48) releases in a burst; that is WRONG for
+  # a normal reply. The A0 gate releases at the first clause boundary OR 48
+  # chars, and this bot is instructed to open by reacting ("Got it,", "Sure,",
+  # "Mm,"), so the real release is at 3-12 chars and 30 does fire ~10 dense
+  # characters before 40. Small, not nil.
+  #
+  # WORD BREAKAGE: there IS a word-boundary back-off, and it DECLINES when the
+  # head before the last space carries fewer than `_TTS_FIRST_FRAGMENT_MIN_CHARS`
+  # (14) alphabetic characters — deliberately, to avoid a tiny choppy
+  # synthesis. So the cap cuts mid-word exactly when the lead is short on
+  # LETTERS. A sweep over realistic replies puts the decline rate at zero from
+  # 28 upward, which is why 20 audibly broke words and 40 did not — and it puts
+  # 30 at the FIRST clean value, with no margin.
+  #
+  # The margin is spent by digits, and this bot asks about compensation on
+  # every call. Reproduced at 30, clean at 40:
+  #   "Mm, 1250000 fixed plus 200000 variable is what you are on today?"
+  #     30 -> back-off declines (head has 11 alpha < 14); cut lands "varia|ble"
+  #     40 -> cuts cleanly after "variable is what "
+  # So expect a cracked word specifically on number-heavy leads. If you hear
+  # one, `PHONE_TTS_FLUSH_MIN_CHARS = "40"` here is the one-line revert.
   #
   # DEPLOY NOTE (operator step): a stale Fly SECRET also named
   # PHONE_TTS_FLUSH_MIN_CHARS overrides this [env] value — it MUST be unset
