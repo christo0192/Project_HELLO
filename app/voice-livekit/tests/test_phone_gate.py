@@ -4694,6 +4694,25 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         self.assertIsNone(phone.candidate_turn_route(
             "I organize CRM callbacks and follow-up across multiple prospects."
         ))
+        self.assertEqual(
+            phone.parse_callback_time_ist(
+                "Can you schedule a call tomorrow at 10:00 AM?",
+                datetime(2026, 8, 31, 16, 47, tzinfo=timezone.utc),
+            ),
+            "2026-09-01T04:30:00Z",
+        )
+        self.assertEqual(phone.candidate_turn_route("Um"), "hesitation")
+        self.assertEqual(
+            phone.candidate_turn_route(
+                "Um, yeah, so when can I receive the next update and what are the working hours?"
+            ),
+            "candidate_question",
+        )
+        self.assertIsNone(phone.candidate_turn_route("I led the support team for four years."))
+        self.assertTrue(phone.is_company_review_question(
+            "I saw bad reviews on Glassdoor. Is it safe to work there?"
+        ))
+        self.assertIn("don't have verified context", phone.PHONE_COMPANY_REVIEW_RESPONSE)
 
     def test_the_THREE_ways_a_candidate_asked_to_be_called_back(self):
         """RCA 2026-09-15, session a57e6113 — the verbatim live utterances.
@@ -4742,17 +4761,17 @@ class TestNativePhoneArchitecture(unittest.TestCase):
             "give me a ring tomorrow",
             # rescheduling without a modal in front of it
             "lets reschedule",
-            "reschedule the call",
-            "reschedule this interview",
+            "can we reschedule",
+            "I need to reschedule",
             # "busy", hedged the way people actually hedge it
-            "I am busy",
             "I'm a bit busy right now",
             "I'm really busy at the moment",
-            "I'm kind of busy",
-            # can't talk, without the exact old suffixes
-            "I can't talk",
+            "I'm kind of busy right now",
+            # can't talk — a NOW marker is required, because without one
+            # "I can't speak Marathi" and "I can't talk about my employer's
+            # revenue" are both ordinary screening answers.
             "I cannot talk now",
-            "I can't do this right now",
+            "I can't talk at the moment",
             # "not a good time", without the literal "this is" lead-in
             "now is not a good time",
             "it is not a good time",
@@ -4783,44 +4802,156 @@ class TestNativePhoneArchitecture(unittest.TestCase):
     def test_a_SALES_answer_never_ends_the_interview(self):
         """The cost of a false positive here is a TERMINATED live interview.
 
-        This screening is for a Sales Program Advisor. The candidates talk
-        about callbacks, follow-ups, scheduling and being busy for a living —
-        every one of these is an ANSWER, and the widened trigger must not hear
-        any of them as a request to hang up.
+        `agent.py` routes every later turn into the callback flow once it
+        fires, and then raises StopResponse — there is no edge back to the
+        screening plan. So a misfire does not degrade the call, it ends it.
+
+        This screening is for a Sales Program Advisor. These candidates
+        describe callbacks, follow-ups, scheduling and being busy as their
+        actual job. Every string below is a realistic ANSWER, and an adversarial
+        review found that a first draft of the widened trigger fired on THIRTY
+        of them — including a candidate saying they were AVAILABLE.
+
+        Each group names the guard it probes, so a regression says which one
+        broke rather than just that something did.
+        """
+        cases = {
+            # the guard pinned since the pattern was first written
+            "original_pin": [
+                "I organize CRM callbacks and follow-up across multiple prospects.",
+            ],
+            # NEGATION — "not busy" is a POSITIVE availability answer. A
+            # wildcard hedge swallowed the "not" and hung up on it.
+            "negated_busy": [
+                "I'm not busy at all, I can start on Monday.",
+                "I am not busy right now, happy to continue.",
+                "I'm not busy right now so we can continue.",
+                "I am available any time, I'm not busy.",
+            ],
+            # "busy" describing the WORK, not this moment. The now-marker is
+            # what separates them.
+            "busy_without_now": [
+                "I'm busy in the mornings but afternoons are free.",
+                "I'm busy on weekends because that is when parents are free.",
+                "I am busy but I can absolutely take this call now.",
+                "I am busy from nine to six with the calling window.",
+                "I'm busy, with a pipeline of about fifty leads.",
+                "I'm busy with a pipeline of about fifty leads.",
+                "I am busy managing renewals and escalations.",
+                "I'm busy closing three deals this quarter.",
+            ],
+            # a modal + "call" with ANY object is not a request about this call
+            "call_with_other_object": [
+                "Can you call the prospect first or email them?",
+                "Can you call out the main KPIs you were measured on?",
+                "So could you call the lead twice a day in that process?",
+                "Will you call the shots on pricing in this role?",
+                "Can we call it a pipeline of about forty leads?",
+                "Would you call that a good conversion rate for outbound?",
+                "Can you please call my reference, he will confirm the numbers.",
+                "Could you call me Chris, everyone does.",
+                "sir can you call the counsellor also for this profile",
+            ],
+            # "driving" is a top-tier sales résumé verb
+            "unavailable_verb_as_resume_verb": [
+                "I'm driving revenue growth for the inside sales team.",
+                "I am driving the outbound motion end to end.",
+                "I'm currently driving adoption of the new CRM across the floor.",
+                "I am driving conversions up by about fifteen percent.",
+                "I'm in a meeting-heavy role, about six demos a day.",
+                "I'm on another call quality program as well, we score recordings.",
+            ],
+            # language fluency and NDA deflections — both routine here
+            "cannot_speak_without_now": [
+                "I can't speak Marathi but I'm fluent in Hindi and English.",
+                "I can't speak Tamil, but Hindi and English are fluent.",
+                "I cannot speak for the whole team, only my own numbers.",
+                "I can't talk about my current employer's revenue, it's confidential.",
+                "I can't talk numbers because of the NDA I signed.",
+                "I can't do this without a proper CRM, that was my main blocker.",
+            ],
+            # the objection-handling ANSWER for this exact role
+            "quoted_objection": [
+                "When a parent says now is not a good time, I ask when is better.",
+                "The prospect says it is not a good time, so I note it and follow up.",
+                "If a client says now is not a good time, I ask for a better slot.",
+            ],
+            # somebody ELSE is the actor
+            "third_person_actor": [
+                "Prospects call me back after a day or two if they are interested.",
+                "Parents usually call me after six in the evening, my best window.",
+                "They call me in a panic when the lead goes cold.",
+                "I leave a voicemail and most of them call me back.",
+                "Prospects usually call me back within a day.",
+                "I ask them to give me a call when they are free.",
+                "Leads give me a call after a couple of days sometimes.",
+            ],
+            # describing a process, including SINGULAR objects — an earlier
+            # corpus used only plurals and passed by luck.
+            "process_description": [
+                "If the prospect is busy I reschedule the call for a better time.",
+                "We reschedule the interview when the counsellor is on leave.",
+                "I schedule my callbacks in the CRM every morning.",
+                "I schedule a callback in the CRM every morning.",
+                "My follow-up cadence is a call back after two days.",
+                "My job is to schedule the call with the counsellor.",
+                "After the demo I book a meeting with the decision maker.",
+                "I arrange a meeting with the counsellor once the lead is qualified.",
+                "I set up an appointment in the calendar for them.",
+                "I book meetings for the sales team all day.",
+                "I set up appointments with prospects every week.",
+                "I arrange meetings between the prospect and the counsellor.",
+                "I track every callback and follow-up in the pipeline.",
+            ],
+            "past_tense": [
+                "I was driving to a client meeting when they called.",
+                "He was in a meeting so I called back later.",
+                "They said it was not a good time and I noted it.",
+            ],
+            "trigger_adjacent": [
+                "My last role involved a lot of scheduling.",
+                "I handle the follow-up process end to end.",
+                "We do a weekly call with the team.",
+                "The appointment setting was part of my job.",
+                "They call me at tennis practice on Sundays.",
+            ],
+        }
+        for guard, texts in cases.items():
+            for text in texts:
+                # NOT `assertIsNone`: several of these are genuine candidate
+                # questions ("Can you call out the main KPIs?") and routing
+                # them as `candidate_question` is correct. The only routing
+                # that ENDS the interview is `callback_deferral`, so that is
+                # what must never happen.
+                self.assertNotEqual(
+                    phone.candidate_turn_route(text), "callback_deferral",
+                    f"[{guard}] a sales ANSWER was heard as a hang-up "
+                    f"request, which ENDS the interview: {text!r}",
+                )
+
+    def test_the_veto_is_what_makes_the_widening_safe(self):
+        """The trigger alone is deliberately loose; the veto is the guard.
+
+        Stated explicitly so the two halves are not silently decoupled: these
+        strings DO match the trigger and MUST still be rejected overall. If
+        someone removes the veto, the trigger tests keep passing and only this
+        one fails — which is the point.
         """
         for text in [
-            # the guard that has been pinned since the pattern was written
-            "I organize CRM callbacks and follow-up across multiple prospects.",
-            # the rest of the sales vocabulary, as answers
-            "I schedule my callbacks in the CRM every morning.",
-            "My follow-up cadence is a call back after two days.",
-            "I book meetings for the sales team all day.",
-            "I set up appointments with prospects every week.",
-            "I arrange meetings between the prospect and the counsellor.",
-            "I leave a voicemail and most of them call me back.",
-            "Prospects usually call me back within a day.",
-            "I ask them to give me a call when they are free.",
-            "I track every callback and follow-up in the pipeline.",
-            # "busy" describing the WORK, not the moment
-            "I'm busy with a pipeline of about fifty leads.",
-            "I am busy managing renewals and escalations.",
-            "I'm busy handling inbound queries most of the day.",
-            "I am busy running the outbound motion for the team.",
-            "I'm busy closing three deals this quarter.",
-            "I'm busy chasing warm leads from the webinar.",
-            # past tense / third person
-            "I was driving to a client meeting when they called.",
-            "He was in a meeting so I called back later.",
-            "They said it was not a good time and I noted it.",
-            # ordinary answers containing trigger-adjacent words
-            "My last role involved a lot of scheduling.",
-            "I handle the follow-up process end to end.",
-            "We do a weekly call with the team.",
-            "The appointment setting was part of my job.",
+            "When a parent says now is not a good time, I ask when is better.",
+            "My job is to schedule the call with the counsellor.",
+            "I leave a voicemail and most of them call me back later.",
+            "After the demo I book a meeting with the decision maker.",
+            "If a client says now is not a good time, I ask for a better slot.",
         ]:
-            self.assertIsNone(
-                phone.candidate_turn_route(text),
-                f"a sales ANSWER was heard as a hang-up request: {text!r}",
+            self.assertIsNotNone(
+                phone._CALLBACK_DEFERRAL_RE.search(text),
+                f"this string is supposed to exercise the VETO, but the "
+                f"trigger no longer matches it — the test has gone vacuous: {text!r}",
+            )
+            self.assertFalse(
+                phone.is_callback_request(text),
+                f"the veto failed to reject: {text!r}",
             )
 
     def test_the_widened_trigger_still_matches_everything_the_OLD_one_did(self):
@@ -4901,29 +5032,51 @@ class TestNativePhoneArchitecture(unittest.TestCase):
         import re as _re
         names = [name for name, _p in phone._CALLBACK_DEFERRAL_PATTERNS]
         self.assertEqual(len(names), len(set(names)), "duplicate branch name")
-        self.assertGreaterEqual(len(names), 13)
+        veto_names = [name for name, _p in phone._CALLBACK_VETO_PATTERNS]
+        self.assertEqual(len(veto_names), len(set(veto_names)), "duplicate veto name")
+
+        # EVERY branch must be load-bearing. Compiling each one proves nothing
+        # — the union already compiled at import, so a malformed branch would
+        # have raised before this test ran. What matters is that no branch is
+        # dead weight shadowed by another, because a shadowed branch is a
+        # guard nobody is maintaining.
+        requests = [
+            "call me back later",                  # call_me_back_vague
+            "call me back at 1 PM",                # call_me_back_at_time
+            "can you call me back",                # call_me_back_addressed
+            "give me a call later",                # give_me_a_call
+            "could you reschedule",                # modal_call_back_or_reschedule
+            "let's reschedule",                    # reschedule_requested
+            "can you schedule a callback",         # modal_book_object
+            "book an appointment",                 # book_object
+            "I'm kind of busy right now",          # im_busy_now
+            "I can't talk right now",              # cannot_talk_now
+            "now is not a good time",              # not_a_good_time
+            "I'm driving",                         # unavailable_state
+            "can we talk later",                   # can_we_later
+        ]
+        legacy_verbatim = {"modal_call_back_or_reschedule", "modal_book_object"}
         for name, pattern in phone._CALLBACK_DEFERRAL_PATTERNS:
             self.assertTrue(name and name.replace("_", "").isalnum(), name)
-            _re.compile(pattern)  # raises if a branch is malformed
-        self.assertEqual(
-            phone.parse_callback_time_ist(
-                "Can you schedule a call tomorrow at 10:00 AM?",
-                datetime(2026, 8, 31, 16, 47, tzinfo=timezone.utc),
-            ),
-            "2026-09-01T04:30:00Z",
-        )
-        self.assertEqual(phone.candidate_turn_route("Um"), "hesitation")
-        self.assertEqual(
-            phone.candidate_turn_route(
-                "Um, yeah, so when can I receive the next update and what are the working hours?"
-            ),
-            "candidate_question",
-        )
-        self.assertIsNone(phone.candidate_turn_route("I led the support team for four years."))
-        self.assertTrue(phone.is_company_review_question(
-            "I saw bad reviews on Glassdoor. Is it safe to work there?"
-        ))
-        self.assertIn("don't have verified context", phone.PHONE_COMPANY_REVIEW_RESPONSE)
+            if name in legacy_verbatim:
+                # Kept byte-identical from the old pattern. Subsumed by a
+                # sibling, but deleting it would change legacy matching, which
+                # `test_the_widened_trigger_still_matches_everything_the_OLD_one_did`
+                # exists to prevent.
+                continue
+            others = "|".join(
+                f"(?:{p})" for n, p in phone._CALLBACK_DEFERRAL_PATTERNS if n != name
+            )
+            without = _re.compile(others, _re.IGNORECASE)
+            uniquely_needed = [
+                r for r in requests
+                if _re.search(pattern, r, _re.IGNORECASE) and not without.search(r)
+            ]
+            self.assertTrue(
+                uniquely_needed,
+                f"branch {name!r} is shadowed by the others — no request in the "
+                f"corpus needs it, so it is unmaintained dead weight",
+            )
 
     def test_generative_objective_authorization_and_compensation_slots(self):
         self.assertTrue(phone.phone_generated_reply_authorized(
@@ -13261,22 +13414,34 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
         the code checks, so every phase must have one and `done` must be last.
         """
         ranks = phone._CALLBACK_PHASE_RANK
-        for phase in (
+        # The FULL order, asserted as a strict total order. Asserting only
+        # "done is highest" and "clarify < retime" is not enough: an
+        # adversarial review showed that swapping RETIME and ALT_PICK passes
+        # both of those and then loops FOREVER, because the alternatives round
+        # and the re-ask would each be reachable from the other.
+        expected_order = [
             phone.CALLBACK_PHASE_AWAITING_TIME,
             phone.CALLBACK_PHASE_AWAITING_CLARIFY,
             phone.CALLBACK_PHASE_AWAITING_RETIME,
             phone.CALLBACK_PHASE_AWAITING_ALT_PICK,
             phone.CALLBACK_PHASE_DONE,
-        ):
+        ]
+        for phase in expected_order:
             self.assertIn(phase, ranks)
+        self.assertEqual(
+            [ranks[p] for p in expected_order],
+            sorted(ranks[p] for p in expected_order),
+            "the phase ranks are not in the declared order — every transition "
+            "in this flow is guarded by a rank comparison, so a reordering "
+            "makes the flow re-enterable and it will never terminate",
+        )
+        self.assertEqual(
+            len({ranks[p] for p in expected_order}), len(expected_order),
+            "two phases share a rank, so a guard comparing them cannot fire",
+        )
         self.assertEqual(
             max(ranks.values()), ranks[phone.CALLBACK_PHASE_DONE],
             "done must be the highest rank or the flow can leave a terminal phase",
-        )
-        self.assertLess(
-            ranks[phone.CALLBACK_PHASE_AWAITING_CLARIFY],
-            ranks[phone.CALLBACK_PHASE_AWAITING_RETIME],
-            "the re-ask must sit AFTER the clarification, or it can be entered twice",
         )
         # An unknown phase ranks terminal, so a corrupted state cannot loop.
         self.assertEqual(
