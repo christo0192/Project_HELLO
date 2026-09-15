@@ -21,6 +21,7 @@ import asyncio
 import inspect
 import json
 import os
+import pathlib
 import re
 import sys
 import types
@@ -208,6 +209,25 @@ _BROWSER_ROOM = "screening-5b2a34cb-a912-4c68-a2c2-79ccdc1dcdd1"
 
 
 _EPOCH = 3
+
+#: How long a harness-driven fake call may live before `_run_phone_session`'s
+#: residency watchdog ends it.
+#:
+#: This was 0.05 s, and at that value THE CAP decided outcomes rather than the
+#: code under test. A clean call took ~0.03 s, so any extra await in the call
+#: path — a lease renewal at answer, one more scheduling round — tipped the leg
+#: into `residency_timeout` and tests asserting a goodbye, a nudge ladder or a
+#: terminal verdict failed for a reason that had nothing to do with their
+#: subject. Production's default is 3600 s with a 60 s floor (`agent.py:202`),
+#: so 0.05 s was never modelling anything real; it was only "end the fake call
+#: quickly".
+#:
+#: One second keeps the suite fast (only a call that never ends on its own
+#: waits this long) while leaving two orders of magnitude of headroom, so the
+#: watchdog fires when a call genuinely hangs and not when it is merely slower
+#: than 50 ms. Tests that want the residency to win still patch it lower
+#: themselves.
+_HARNESS_RESIDENCY_SEC = 1.0
 
 
 def _dispatch_metadata(
@@ -618,6 +638,110 @@ class TestWorkerOptions(unittest.TestCase):
                     agent_mod.os.environ.pop("PHONE_AGENT_NAME", None)
                 agent_mod.build_worker_options()
         return dict(_OptionsRecorder.last)
+
+    def test_the_PHONE_worker_admits_one_call_at_a_time(self):
+        """`docs/design/phone-cost-and-scale-plan.md` §2.7 specifies one session
+        per worker. It was never implemented, and could not have been as
+        written: livekit-agents 1.6.4 has NO `max_jobs` on WorkerOptions.
+
+        `load_fnc` + `load_threshold` are the controls that exist, and both are
+        wired on the PHONE worker only. The threshold is PINNED rather than
+        left to the SDK default, because that default is infinite in dev mode
+        and `_is_available` short-circuits to True on an infinite threshold.
+        """
+        options = self._build("phone-screener")
+        self.assertIs(
+            options["load_fnc"], agent_mod._phone_one_call_per_machine_load
+        )
+        threshold = options["load_threshold"]
+        self.assertIsInstance(threshold, float)
+        # Strictly between 0 and 1: the SDK warns at >= 1 in prod, and <= 0
+        # would make the machine permanently unavailable.
+        self.assertGreater(threshold, 0.0)
+        self.assertLess(threshold, 1.0)
+
+        # ── THE COUPLING THAT IS EASY TO BREAK FROM A HUNDRED LINES AWAY ──
+        # `_get_effective_load` prices a job that has been ACCEPTED but whose
+        # process has not launched yet at `load_threshold / num_idle_processes`
+        # — `active_jobs` is still empty at that moment, so the 0.0/1.0 signal
+        # below says nothing. With one idle process a single reservation scores
+        # exactly the threshold and the second dispatch is refused. With TWO it
+        # scores half, and the same machine accepts a second call before the
+        # first one appears — the precise failure this gate exists to prevent,
+        # reintroduced by a knob that is set for an unrelated latency reason.
+        idle = options["num_idle_processes"]
+        self.assertEqual(
+            idle, 1,
+            "the one-call gate's reserved-slot arithmetic assumes exactly one "
+            "idle process; raising it silently lets a machine take two calls",
+        )
+        self.assertGreaterEqual(
+            threshold / max(idle, 1), threshold,
+            "a reserved slot must price at or above the threshold, or a second "
+            "dispatch slips through the launch window",
+        )
+
+    def test_the_BROWSER_worker_is_left_alone(self):
+        """The browser lane shares this source file and must not inherit a
+        phone concurrency policy: an unnamed worker keeps automatic dispatch and
+        every option it has always had."""
+        options = self._build(None)
+        self.assertNotIn("load_fnc", options)
+        self.assertNotIn("load_threshold", options)
+
+    def test_a_BUSY_machine_reports_itself_fully_loaded(self):
+        """The signal the SDK gates on.
+
+        `_answer_availability` refreshes the load and answers `available=False`
+        WITHOUT `terminate` when it is at or over threshold — which is exactly
+        "decline this dispatch, but let another worker take it". An idle
+        machine must report 0.0 or it would never take a call at all.
+        """
+        idle = types.SimpleNamespace(active_jobs=[])
+        busy = types.SimpleNamespace(active_jobs=[object()])
+        self.assertEqual(agent_mod._phone_one_call_per_machine_load(idle), 0.0)
+        self.assertEqual(agent_mod._phone_one_call_per_machine_load(busy), 1.0)
+        # And the reported load must actually cross the threshold the options
+        # pin, or the gate is decorative.
+        options = self._build("phone-screener")
+        self.assertLess(
+            agent_mod._phone_one_call_per_machine_load(idle), options["load_threshold"]
+        )
+        self.assertGreaterEqual(
+            agent_mod._phone_one_call_per_machine_load(busy), options["load_threshold"]
+        )
+
+    def test_a_machine_that_cannot_be_asked_reports_itself_BUSY(self):
+        """Fail closed. Refusing a dispatch costs one redial from the pool;
+        accepting a second call onto a saturated machine costs the conversation
+        already on it."""
+
+        class _Broken:
+            @property
+            def active_jobs(self):
+                raise RuntimeError("ipc gone")
+
+        self.assertEqual(agent_mod._phone_one_call_per_machine_load(_Broken()), 1.0)
+
+    def test_the_gate_is_NOT_built_on_entrypoint_state(self):
+        """The trap this replaced.
+
+        Every entrypoint runs in a FORKED job process (`JobExecutorType.PROCESS`
+        is the SDK default on Linux), while the availability answer is made in
+        the worker's MAIN process. A busy-flag set inside the entrypoint is
+        written in the child and is invisible to the parent, so a guard built
+        that way can never fire — and would have shipped looking like a fix.
+
+        Asserted structurally: no module-level job registry, and the phone
+        entrypoint adds nothing to one.
+        """
+        self.assertFalse(
+            hasattr(agent_mod, "_ACTIVE_PHONE_JOBS"),
+            "a parent-invisible job registry is back",
+        )
+        self.assertFalse(hasattr(agent_mod, "_phone_accept_one_job_at_a_time"))
+        options = self._build("phone-screener")
+        self.assertNotIn("request_fnc", options)
 
     def test_default_worker_has_no_agent_name(self):
         options = self._build(None)
@@ -3244,7 +3368,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
              patch.object(
                  agent_mod, "_phone_recording_permitted", new=recording_seam
              ), \
-             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", _HARNESS_RESIDENCY_SEC):
             task = asyncio.ensure_future(
                 agent_mod._run_phone_session(
                     ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
@@ -3339,14 +3463,25 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         engagement's previous state, so `assessment.aborted` would be untrue
         and ignored, and `assessment.completed` would be a lie.
         """
+        # TWO scripted refusals, not one. The lease is now re-based on the
+        # ANSWER (`rebase_lease_on_answer`), so the first scripted outcome is
+        # consumed by that renewal inside the gate; the periodic heartbeat's
+        # first beat takes the second. Scripting only one would have let the
+        # loop see the default `ok` and the conversation would carry on — the
+        # test would still pass its later assertions while no longer exercising
+        # a lost lease at all.
         client = FakeEventClient(heartbeats=[
+            phone.PhoneApiOutcome(False, phone.HEARTBEAT_LEASE_LOST_STATUS),
             phone.PhoneApiOutcome(False, phone.HEARTBEAT_LEASE_LOST_STATUS),
         ])
         result, client, recording, delete, session, persistence_spy = (
             await self._run_session(answers=("Yes, that's fine.",), client=client)
         )
         self.assertTrue(result.assessment_allowed)
-        self.assertEqual(client.heartbeats, [(_ATTEMPT_ID, _SESSION_ID, _EPOCH)])
+        self.assertEqual(
+            client.heartbeats,
+            [(_ATTEMPT_ID, _SESSION_ID, _EPOCH), (_ATTEMPT_ID, _SESSION_ID, _EPOCH)],
+        )
         self.assertNotIn("assessment.completed", client.event_types)
         self.assertNotIn("assessment.aborted", client.event_types)
         # The screening never even began, because the slot was already gone.
@@ -3355,14 +3490,177 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         # The leg is torn down rather than left on a slot it does not hold.
         delete.assert_awaited()
 
-    async def test_nothing_is_heartbeaten_before_the_gate_CONSENTS(self):
-        """A machine, a refusal or a silent line is not a conversation, and
-        renewing a lease for one would hold a fleet slot for nobody."""
+    async def test_a_WEDGED_gate_is_bounded_and_ends_the_leg(self):
+        """RCA 2026-09-10: the gate had no wall clock and every line it speaks
+        ends in an untimed playout await, so one wedge froze the call until the
+        server reaped the lease — twice, with candidates on the line.
+
+        A gate that overruns must now END with a named outcome rather than wait
+        for ever. The room is torn down; nothing is claimed about a screening
+        that never happened.
+        """
+        async def _never_returns(*_a, **_kw):
+            await asyncio.sleep(3600)
+
+        # The pre-answer waits are pinned to zero because the wall clock the
+        # wrapper uses is `ring + PHONE_GATE_MAX_SECONDS` (see
+        # `_phone_gate_wall_clock_seconds`), and this test is about the
+        # POST-answer budget. Leaving the production 45s ring in would make the
+        # bound 45.05s and the harness's own residency cap would fire first —
+        # the test would still go red, but for the wrong reason.
+        with patch.object(agent_mod, "PHONE_GATE_MAX_SECONDS", 0.05), \
+             patch.object(agent_mod.phone, "phone_participant_wait_sec", lambda: 0.0), \
+             patch.object(agent_mod.phone, "phone_bounce_mode", lambda: False), \
+             patch.object(phone, "run_phone_gate", _never_returns):
+            result, client, _, delete, _, persistence_spy = await self._run_session(
+                answers=("Yes, that's fine.",), close_after=False,
+            )
+
+        self.assertEqual(result.outcome, phone.GATE_TIMED_OUT)
+        self.assertFalse(result.assessment_allowed)
+        # Nothing is claimed about a conversation that never happened.
+        self.assertNotIn("assessment.completed", client.event_types)
+        self.assertEqual(client.assessment_calls, [])
+        self.assertEqual(persistence_spy.mock_calls, [])
+        # And the leg is actually torn down rather than left holding a slot.
+        delete.assert_awaited()
+
+        # ── THE PRE-CONSENT AUDIO IS DESTROYED ─────────────────────────
+        # The server egress starts at `call.answered`, before the candidate has
+        # been told anything, and ONLY a `PURGE_BEFORE_EVENTS` member destroys
+        # it. A timeout that posted nothing would leave the recording of
+        # somebody who was never told they were being recorded sitting in the
+        # bucket, and leave the engagement in `dialing` for the reaper to
+        # restore — so the same person is dialled again. The sibling
+        # participant-left terminal has posted this from the day it was
+        # written; the first draft of THIS branch shipped the half-fix.
+        self.assertIn("candidate.deferred_pre_disclosure", client.event_types)
+
+    async def test_the_gate_bound_matches_the_API_lease_allowance(self):
+        """The worker's gate budget and the API's lease allowance describe the
+        same stretch of a call, so they must not drift apart.
+
+        `PHONE_OPENING_GATE_SECONDS = 60 + PHONE_IDENTITY_TURN_SECONDS (46)` in
+        `app/api/src/lib/phone-screening/config.ts`. The worker's bound is that
+        number plus a small margin, so the WORKER times out first and produces a
+        diagnosable `gate_timed_out` instead of a silent server-side reap.
+        """
+        cfg = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "api" / "src" / "lib" / "phone-screening" / "config.ts"
+        ).read_text(encoding="utf-8")
+        identity = int(
+            re.search(r"PHONE_IDENTITY_TURN_SECONDS\s*=\s*(\d+)", cfg).group(1)
+        )
+        gate = re.search(
+            r"PHONE_OPENING_GATE_SECONDS\s*=\s*(\d+)\s*\+\s*PHONE_IDENTITY_TURN_SECONDS",
+            cfg,
+        )
+        api_allowance = int(gate.group(1)) + identity
+        self.assertGreater(
+            agent_mod.PHONE_GATE_MAX_SECONDS, api_allowance,
+            "the worker must outlast the API's allowance so IT reports the fault",
+        )
+        self.assertLessEqual(
+            agent_mod.PHONE_GATE_MAX_SECONDS, api_allowance + 30,
+            "a bound far above the allowance lets the server reap first, which is"
+            " the silent failure this bound exists to replace",
+        )
+
+    def test_the_wall_clock_also_covers_the_RING(self):
+        """The bound and the allowance measure the POST-ANSWER stretch. The
+        coroutine they wrap does not.
+
+        `run_phone_gate`'s first await is `wait_for_participant()` — the ring —
+        and in bounce mode a further verified-answer wait follows it. Wrapping
+        the whole coroutine in the post-answer budget charged the ring against
+        it: a candidate picking up on ring 25 would have had 91s for a flow
+        this repo sizes at up to 106s, and one identity re-ask would cut off a
+        healthy call. The comparison in the test above is between two numbers
+        that describe the same stretch; THIS one checks that the timeout
+        actually handed to `asyncio.wait_for` describes the stretch it wraps.
+        """
+        with patch.object(agent_mod.phone, "phone_participant_wait_sec", lambda: 45.0), \
+             patch.object(agent_mod.phone, "phone_answer_timeout_sec", lambda: 90.0), \
+             patch.object(agent_mod.phone, "phone_bounce_mode", lambda: False):
+            direct = agent_mod._phone_gate_wall_clock_seconds()
+        self.assertAlmostEqual(direct, 45.0 + agent_mod.PHONE_GATE_MAX_SECONDS)
+
+        # Bounce mode adds its own pre-answer wait, and the gate owns that too.
+        with patch.object(agent_mod.phone, "phone_participant_wait_sec", lambda: 45.0), \
+             patch.object(agent_mod.phone, "phone_answer_timeout_sec", lambda: 90.0), \
+             patch.object(agent_mod.phone, "phone_bounce_mode", lambda: True):
+            bounce = agent_mod._phone_gate_wall_clock_seconds()
+        self.assertAlmostEqual(bounce, 45.0 + 90.0 + agent_mod.PHONE_GATE_MAX_SECONDS)
+
+        # The property that matters: a candidate who answers at the very LAST
+        # moment the ring allows still gets the whole post-answer budget.
+        self.assertGreaterEqual(direct - 45.0, agent_mod.PHONE_GATE_MAX_SECONDS)
+
+    async def test_the_lease_is_re_based_ONCE_on_answer_and_not_beaten_again(self):
+        """The narrowed successor to "nothing is heartbeaten before consent".
+
+        RCA 2026-09-10. The old contract renewed nothing until consent, reasoning
+        that "a machine or a refusal is not a conversation, and renewing a lease
+        for one would hold a fleet slot for nobody". True of the SLOT — but the
+        lease is minted at ADMISSION, so a call that answered late (a cold
+        machine boot: 62.6 s on the Deepti leg) entered a 105 s gate with 117 s
+        left, and two answered calls were reaped mid-gate with people on the
+        line.
+
+        So exactly ONE renewal now happens, at `call.answered`, re-basing the
+        clock on the moment a human picked up. The slot argument still holds:
+        this is one renewal, not a loop — a machine pickup holds the slot for
+        the length of the gate and not a beat longer, and the periodic heartbeat
+        still starts only once the call is a consented conversation.
+        """
         result, client, *_ = await self._run_session(
             answers=("Please leave a message after the tone.",)
         )
         self.assertFalse(result.assessment_allowed)
+        # ONE beat — the answer re-base — naming this attempt/session/epoch.
+        self.assertEqual(client.heartbeats, [(_ATTEMPT_ID, _SESSION_ID, _EPOCH)])
+
+    async def test_the_re_base_makes_no_call_without_a_session_or_epoch(self):
+        """The fence guard, tested directly.
+
+        `heartbeat_phone_attempt_by_epoch` answers `lease_lost` to a null
+        session or epoch — it requires BOTH from the caller even though it
+        matches the attempt row on `session_id is null or session_id = p_…`.
+        So calling without them is a guaranteed-useless round trip on the
+        answer→disclosure path, which is the one stretch of a call where added
+        latency is silence the candidate hears.
+        """
+        client = FakeEventClient()
+        self.assertFalse(
+            await phone.rebase_lease_on_answer(client, _ATTEMPT_ID, None, _EPOCH)
+        )
+        self.assertFalse(
+            await phone.rebase_lease_on_answer(client, _ATTEMPT_ID, _SESSION_ID, None)
+        )
         self.assertEqual(client.heartbeats, [])
+        # And with both present it renews exactly once.
+        self.assertTrue(
+            await phone.rebase_lease_on_answer(
+                client, _ATTEMPT_ID, _SESSION_ID, _EPOCH
+            )
+        )
+        self.assertEqual(client.heartbeats, [(_ATTEMPT_ID, _SESSION_ID, _EPOCH)])
+
+    async def test_the_re_base_never_raises_into_the_call(self):
+        """Best effort means best effort: a throwing client must not kill a
+        call that is otherwise fine. The renewal is fired and not awaited on the
+        live path, so an exception here would surface as an unretrieved task
+        exception rather than anything anyone acts on."""
+        class _Boom(FakeEventClient):
+            async def heartbeat_attempt(self, *a, **kw):
+                raise RuntimeError("transport died")
+
+        self.assertFalse(
+            await phone.rebase_lease_on_answer(
+                _Boom(), _ATTEMPT_ID, _SESSION_ID, _EPOCH
+            )
+        )
 
     # ── Answer-first origination (Plivo bounce), wired through the session ─
 
@@ -3577,7 +3875,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
                  agent_mod, "_delete_livekit_room", new_callable=AsyncMock,
              ), \
              patch.object(agent_mod, "_phone_recording_permitted", new=recording_seam), \
-             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", _HARNESS_RESIDENCY_SEC):
             await asyncio.wait_for(
                 agent_mod._run_phone_session(
                     ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
@@ -4086,7 +4384,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
                  patch.object(agent_mod, "persistence", MagicMock()), \
                  patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
                  patch.object(agent_mod, "_phone_recording_permitted", new=recording_seam), \
-                 patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+                 patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", _HARNESS_RESIDENCY_SEC):
                 task = asyncio.ensure_future(
                     agent_mod._run_phone_session(
                         ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
@@ -5679,7 +5977,7 @@ class TestNumberNeverCarried(unittest.IsolatedAsyncioTestCase):
              patch.object(phone._log, "_emit", _capture), \
              patch.object(agent_mod, "AgentSession", _FakePhoneSession), \
              patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
-             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", _HARNESS_RESIDENCY_SEC):
             task = asyncio.ensure_future(
                 agent_mod._run_phone_session(
                     ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
@@ -5749,7 +6047,7 @@ class TestOpeningGenerationSeed(unittest.IsolatedAsyncioTestCase):
              patch.object(agent_mod, "persistence", MagicMock()), \
              patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
              patch.object(agent_mod, "_phone_recording_permitted", new=recording_seam), \
-             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", _HARNESS_RESIDENCY_SEC):
             await asyncio.wait_for(
                 agent_mod._run_phone_session(
                     ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
@@ -5793,7 +6091,7 @@ class TestOpeningGenerationSeed(unittest.IsolatedAsyncioTestCase):
              patch.object(agent_mod, "persistence", MagicMock()), \
              patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
              patch.object(agent_mod, "_phone_recording_permitted", new=recording_seam), \
-             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", _HARNESS_RESIDENCY_SEC):
             os.environ["PHONE_DETERMINISTIC_OPENER"] = "true"
             await asyncio.wait_for(
                 agent_mod._run_phone_session(
@@ -14995,7 +15293,7 @@ class TestUnsetEnvSelectsTheScriptedGate(unittest.IsolatedAsyncioTestCase):
                  agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
              patch.object(
                  agent_mod, "_phone_recording_permitted", new=recording_seam), \
-             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", _HARNESS_RESIDENCY_SEC):
             task = asyncio.ensure_future(agent_mod._run_phone_session(
                 ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
                 client=client, classifier=classifier))
@@ -15129,7 +15427,7 @@ class TestDroppedLegOnTheConversationalGate(unittest.IsolatedAsyncioTestCase):
                  agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
              patch.object(
                  agent_mod, "_phone_recording_permitted", new=recording_seam), \
-             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", 0.05):
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", _HARNESS_RESIDENCY_SEC):
             return await asyncio.wait_for(
                 agent_mod._run_phone_session(
                     ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,

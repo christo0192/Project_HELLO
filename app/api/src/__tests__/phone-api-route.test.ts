@@ -186,6 +186,7 @@ function fakeStores(over: Partial<PhoneStores> = {}): WriteSpy {
     heartbeatAttemptByEpoch: async () => ({ status: 'ok' as const }),
     sweepDayRolled: async () => ({ status: 'ok' as const, examined: 0, rolled: 0, skipped: 0 }),
     sweepSameDayRetry: async () => ({ status: 'ok' as const, examined: 0, released: 0, skipped: 0 }),
+    sweepOrphanSessions: async () => ({ status: 'ok' as const, examined: 0, expired: 0, skipped: 0 }),
     sweepStrandedSessions: async () => ({
       status: 'ok' as const, examined: 0, completed: 0, failed: 0, skipped: 0,
     }),
@@ -1160,6 +1161,7 @@ function fakeRuntime(over: {
       lastReconciled: null,
       lastRolled: null,
       lastSameDayReleased: null,
+      lastOrphanExpired: null,
       lastStranded: null,
       lastRecStranded: null,
       lastPartialFinalized: null,
@@ -1434,6 +1436,7 @@ describe('the health surface', () => {
           last_rolled: null,
           last_stranded: null,
           last_rec_stranded: null,
+          last_orphan_expired: null,
           // FALSE, not absent. A process that was deliberately not armed and
           // one whose arming THREW both report `enabled: false`; this boolean
           // is the only thing that separates them, so it must be present on

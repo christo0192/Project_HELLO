@@ -374,8 +374,10 @@ export async function dialPhoneAttempt(
     } else if (gate.status !== 'disabled') {
       // no_capacity | timeout | error — defer, and touch no carrier. No room
       // was provisioned (we gate BEFORE the dispatch), so there is no room name
-      // to report and no dispatch to undo. The service already released/stopped
-      // any machine it claimed for this attempt, so we do not release here.
+      // to report and no dispatch to undo. The service released any machine it
+      // could PROVE it still held for this attempt, so we do not release here.
+      // (It stops nothing it cannot prove — a claim that moved on belongs to
+      // whoever holds it now, and the reaper is the backstop for the rest.)
       //
       // ── Gap 5: SAME-IST-DAY RETRYABILITY ────────────────────────────────
       // Admission has ALREADY committed this attempt and charged the per-IST-day

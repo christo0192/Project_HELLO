@@ -7004,6 +7004,51 @@ select _policy_tests.assert(
   'without the partial unique index, ON CONFLICT cannot dedup a redelivered item'
 );
 
+-- ── 0096: the live-call protection RPCs ───────────────────────────────
+-- The posture loop above scans `phone\_%`, which does NOT match a name
+-- beginning `sweep_phone_`. Every sweep RPC in this schema has therefore been
+-- silently exempt from the definer / pinned-search_path / not-browser-executable
+-- checks since 0045. These assertions cover the one 0096 adds explicitly,
+-- following the precedent 0071 set immediately below for its own two.
+select _policy_tests.assert(
+  '0096: the orphan-session sweep is SECURITY DEFINER with a pinned search_path',
+  exists (
+    select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'sweep_phone_orphan_sessions'
+       and p.prosecdef
+       and p.proconfig is not null
+       and exists (
+         select 1 from unnest(p.proconfig) c where c like 'search_path=%'
+       )
+  ),
+  'a definer function without a pinned search_path is a privilege-escalation door'
+);
+
+select _policy_tests.assert(
+  '0096: the orphan-session sweep is service-role only',
+  not exists (
+    select 1 from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname in ('sweep_phone_orphan_sessions', 'phone_answered_reclaim_grace')
+       and (has_function_privilege('anon', p.oid, 'EXECUTE')
+         or has_function_privilege('authenticated', p.oid, 'EXECUTE'))
+  ),
+  'a browser role must never terminalize a session or read the reclaim grace'
+);
+
+select _policy_tests.assert(
+  '0096: the reclaim grace is positive, so the spare is real',
+  screening_v2.phone_answered_reclaim_grace() > interval '0 seconds',
+  'a zero grace would leave a connected call reclaimable at the instant its lease lapses'
+);
+
+select _policy_tests.assert(
+  '0096: the orphan sweep refuses a grace shorter than the retry ladder',
+  (screening_v2.sweep_phone_orphan_sessions(1, 1, now()) ->> 'limit') is not null,
+  'the sweep must answer a sanitized envelope even for an absurd request'
+);
+
 select _policy_tests.assert(
   '0071: the two new RPCs are service-role only',
   not exists (
@@ -8845,6 +8890,19 @@ begin
                                                    -- and granted only to
                                                    -- service_role.
                                                    'phone_same_day_retry_delay',
+                                                   -- 0096. How long a leg that
+                                                   -- ANSWERED is spared before
+                                                   -- the reclaim sweep may
+                                                   -- abandon it: the same pure
+                                                   -- constant as the eight
+                                                   -- above, `language sql
+                                                   -- immutable` with
+                                                   -- `set search_path =
+                                                   -- pg_catalog`, revoked from
+                                                   -- public/anon/authenticated
+                                                   -- and granted only to
+                                                   -- service_role.
+                                                   'phone_answered_reclaim_grace',
                                                    'prevent_phone_call_event_mutation',
                                                    'enforce_phone_engagement_transition',
                                                    'enforce_phone_appointment_window') then

@@ -1314,6 +1314,10 @@ describe('OpenAPI document integrity', () => {
       last_stranded: null,
       // 0071 / X5b: required and present in the disabled default shape too.
       last_rec_stranded: null,
+      // 0096: same — the orphan-session count is on every branch, because a
+      // non-zero value there is the phone pool being given back and an
+      // operator watching a multi-call run needs to see it.
+      last_orphan_expired: null,
       start_failed: false,
       sweeps_not_ok: [],
     };

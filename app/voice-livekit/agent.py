@@ -203,6 +203,114 @@ SESSION_MAX_RESIDENCY_SEC = _bounded_float_env(
     "SESSION_MAX_RESIDENCY_SEC", 3600.0, 60.0, 21600.0
 )
 
+# ── THE OPENING GATE GETS A WALL CLOCK ────────────────────────────────────
+# RCA 2026-09-10. `run_phone_gate` had NO time bound of any kind, and every
+# line it speaks ends in an untimed `await wait_for_playout()` — seventeen such
+# awaits on this path. A single wedged playout (the documented LiveKit SIP
+# outbound-track subscription wedge is bounded only in `speak_opening`, not on
+# the `say`/role-opening paths) therefore froze a call indefinitely, with the
+# candidate hearing dead air and nothing renewing the lease. Two answered calls
+# were reaped mid-gate that day with people on the line.
+#
+# Bounding the GATE bounds all seventeen at once, and does it with the honest
+# semantic: this stretch has a budget, and overrunning it is a fault to be
+# reported rather than a wait to be extended. The API sizes the concurrency
+# lease on exactly this number — `PHONE_OPENING_GATE_SECONDS = 60 +
+# PHONE_IDENTITY_TURN_SECONDS (46) = 106` in
+# `app/api/src/lib/phone-screening/config.ts:146` — so the two are deliberately
+# the same 106s, plus a small margin so the worker's own timeout fires FIRST
+# and produces a diagnosable `gate_timed_out` instead of a silent server-side
+# reap.
+#
+# ── IT MEASURES THE POST-ANSWER STRETCH, AND ONLY THAT ────────────────────
+# `PHONE_OPENING_GATE_SECONDS` is defined as the spend "from the moment
+# somebody answers", but `run_phone_gate`'s FIRST await is the ring — the
+# bounded `wait_for_participant()` (45s in production), and in bounce mode a
+# further verified-answer wait (90s). Wrapping the whole coroutine in a 116s
+# timeout therefore charged the ring against a budget sized for the
+# conversation: a candidate who picks up on ring 25 would have had 91s for a
+# flow this repo itself sizes at up to 106s, and one identity re-ask would cut
+# off a perfectly healthy call. The two numbers describe different stretches
+# and comparing them directly was the error.
+#
+# So the wall clock handed to `asyncio.wait_for` is this budget PLUS the
+# pre-answer waits, each of which is already separately bounded — see
+# `_phone_gate_wall_clock_seconds`. The knob keeps its meaning (how long the
+# conversation half of the gate may take) and the wrapper covers what it
+# actually wraps.
+#
+# Floor of 30s: below the classify wait (40s) the bound would cut off healthy
+# calls. Ceiling of 600s: a gate that has run ten minutes is wedged by
+# definition.
+PHONE_GATE_MAX_SECONDS = _bounded_float_env(
+    "PHONE_GATE_MAX_SECONDS", 116.0, 30.0, 600.0
+)
+
+
+def _phone_gate_wall_clock_seconds() -> float:
+    """The timeout for the WHOLE gate coroutine, ring included.
+
+    `PHONE_GATE_MAX_SECONDS` budgets the post-answer conversation. The gate
+    also owns the waits that precede the answer, and those are the ones whose
+    duration is set by the candidate rather than by us:
+
+      * `wait_for_participant()` — the ring, `PHONE_PARTICIPANT_WAIT_SEC`.
+      * in bounce mode only, the server-verified answer wait,
+        `PHONE_ANSWER_TIMEOUT_SEC`.
+
+    Both are ALREADY bounded, and a gate that overruns in either of them
+    returns cleanly on its own (`GATE_NO_PARTICIPANT`), so adding them here
+    does not weaken the wedge detection this bound exists for — it only stops
+    the bound firing on a call that simply rang for a while.
+    """
+    pre_answer = phone.phone_participant_wait_sec()
+    if phone.phone_bounce_mode():
+        pre_answer += phone.phone_answer_timeout_sec()
+    return pre_answer + PHONE_GATE_MAX_SECONDS
+
+
+async def _post_gate_purging_terminal(
+    events: Any, attempt_id: str, epoch: Any, origin: str,
+) -> bool:
+    """Post the terminal that DESTROYS the pre-consent recording. Never raises.
+
+    The server egress starts at `call.answered` — before the candidate has been
+    told anything — and only a `PURGE_BEFORE_EVENTS` member destroys that
+    audio. Every gate exit after the answer therefore owes one, and the two
+    that can happen without the gate reaching a verdict of its own (the leg
+    dropping mid-await, and the wall clock firing) both come here.
+
+    Shared rather than duplicated: this lane already shipped a `_post`
+    NameError once by writing the same terminal twice at two sites.
+
+    Posted DIRECTLY rather than through `_post_phone_event_with_retry`, which
+    does not forward `epoch` — every other terminal in this gate carries it,
+    and dropping it would change which staleness rules the server applies. One
+    bounded retry covers a transport blip; the post is idempotent by 0042's
+    deterministic event id.
+
+    `post_event` FAILS CLOSED by RETURNING a not-ok outcome rather than
+    raising, so catching exceptions alone would be a guard that could not fire.
+    An unapplied event means the recording was NOT purged — the one thing this
+    exists to guarantee — so it is logged rather than assumed.
+    """
+    applied = False
+    for _ in range(2):
+        try:
+            outcome = await events.post_event(
+                attempt_id, "candidate.deferred_pre_disclosure", epoch=epoch,
+            )
+            applied = phone.event_applied(outcome)
+        except Exception:  # noqa: BLE001 — a terminal must never re-raise
+            applied = False
+        if applied:
+            return True
+    _log.warn(
+        "unknown_event", error_type="phone_gate_outcome",
+        error_category=f"{origin}_terminal_not_applied",
+    )
+    return False
+
 
 def _int_env(name: str, default: int) -> int:
     raw = os.getenv(name)
@@ -1511,7 +1619,84 @@ def build_worker_options() -> WorkerOptions:
         # adds ONLY the prewarm hook and nothing else drifts.
         if _phone_worker_orchestrated():
             options["prewarm_fnc"] = _prewarm_post_machine_ready
+        # ── ONE CALL PER MACHINE ──────────────────────────────────────────
+        # `docs/design/phone-cost-and-scale-plan.md` §2.7 specifies "each
+        # worker runs max_jobs=1 … 1 session/worker keeps the VAD/EOU CPU path
+        # safe", and it was never implemented — `grep max_jobs` across this
+        # repo returns nothing.
+        #
+        # IT COULD NOT HAVE BEEN IMPLEMENTED AS WRITTEN. livekit-agents 1.6.4
+        # has no `max_jobs` on WorkerOptions (verified against the pinned
+        # wheel: the only concurrency controls are `load_threshold` and
+        # `num_idle_processes`). Passing it would raise TypeError and the
+        # worker would fail to boot — which is why the note above about not
+        # guessing kwargs against an unimportable SDK is worth keeping.
+        #
+        # `load_threshold` cannot do this job either. It gates on a 2.5s
+        # LAGGING CPU average, and at the moment a second dispatch arrives the
+        # first call is still RINGING — no audio pipeline, no VAD, no TTS — so
+        # measured load is ~0 and the second job is accepted unconditionally.
+        #
+        # `load_fnc` is the lever that actually exists AND runs in the right
+        # process. `request_fnc` looks like the obvious place for this and is a
+        # TRAP: it runs in the worker's MAIN process, while every entrypoint
+        # runs in its own forked job process (`JobExecutorType.PROCESS` is the
+        # default on Linux — worker.py:125-129). So any "am I busy" flag set
+        # inside the entrypoint is written in the CHILD and is invisible to the
+        # parent that answers the next dispatch. A guard built that way can
+        # never fire, and would have shipped looking exactly like a fix.
+        #
+        # `load_fnc` is called in the parent, with the worker itself
+        # (worker.py:1280-1289 passes `self` to any one-argument callable), and
+        # `Worker.active_jobs` is the parent's own view of the job processes it
+        # has launched. The SDK refreshes the load before EVERY availability
+        # answer (`_answer_availability` -> `_refresh_worker_load`) and answers
+        # `available=False` without `terminate` when it is over threshold —
+        # which is precisely "decline, but let another worker take it".
+        options["load_fnc"] = _phone_one_call_per_machine_load
+        # Pinned, not left to the default. The default is a ServerEnvOption
+        # whose DEV value is `math.inf`, and `_is_available` short-circuits to
+        # True on an infinite threshold — so in dev the gate would silently be
+        # off. A plain float applies in both modes. It must stay < 1 (the SDK
+        # refuses `>= 1` in prod) and > 0, and anything in that range works:
+        # the load signal below is 0.0 or 1.0, never in between.
+        options["load_threshold"] = 0.75
     return WorkerOptions(**options)
+
+
+#: How many phone calls one machine may conduct at once.
+#:
+#: ONE, per `docs/design/phone-cost-and-scale-plan.md` §2.7 ("1 session/worker
+#: keeps the VAD/EOU CPU path safe"). Ten simultaneous calls therefore means
+#: ten pool machines, not one machine taking ten jobs — stacking calls onto a
+#: machine is the failure this exists to prevent, not a fallback for a pool
+#: that is too small.
+PHONE_JOBS_PER_MACHINE = 1
+
+
+def _phone_one_call_per_machine_load(server: Any) -> float:
+    """Report a saturated machine as fully loaded. Runs in the PARENT process.
+
+    Deliberately NOT a CPU measurement. The SDK's default load function reads a
+    2.5-second lagging CPU average, and at the moment a second dispatch arrives
+    the first call is still RINGING — no audio pipeline, no VAD, no TTS — so
+    measured load is ~0 and the second job is accepted onto the same machine.
+    That is exactly how two simultaneous calls ended up sharing one box.
+
+    What the gate needs is a COUNT, and `Worker.active_jobs` is the parent's own
+    list of the job processes it has launched. Reading it costs nothing and
+    cannot lie about a child's state the way a module global would.
+
+    A machine that cannot be asked how busy it is reports itself BUSY: the SDK
+    swallows nothing here, and refusing a dispatch costs one redial from the
+    pool, while accepting a second call onto a saturated machine costs the
+    conversation that is already on it.
+    """
+    try:
+        active = len(server.active_jobs)
+    except Exception:  # pragma: no cover - defensive; the SDK owns this
+        return 1.0
+    return 1.0 if active >= PHONE_JOBS_PER_MACHINE else 0.0
 
 
 async def _wait_for_sip_participant(ctx: JobContext, timeout_sec: float) -> Any:
@@ -8479,7 +8664,34 @@ async def _run_phone_session(
     # skips every terminal, so no event posts, the pre-consent recording is
     # never purged and the engagement is left in `dialing` for the reaper.
     try:
-        result = await _run_gate()
+        # BOUNDED. See `PHONE_GATE_MAX_SECONDS`: every spoken line in the gate
+        # ends in an untimed playout await, so without this one wedge freezes
+        # the call for ever. On overrun the leg ends with a named outcome and
+        # falls through to the post-gate body, whose first check returns on
+        # `assessment_allowed=False` — inside the `try` whose `finally` closes
+        # the room and finishes the recording.
+        #
+        # The wall clock covers the RING too, because the gate does — see
+        # `_phone_gate_wall_clock_seconds`. Charging the ring against a
+        # conversation budget would cut off a candidate who simply took a few
+        # seconds to pick up.
+        _gate_wall_clock = _phone_gate_wall_clock_seconds()
+        result = await asyncio.wait_for(_run_gate(), timeout=_gate_wall_clock)
+    except asyncio.TimeoutError:
+        _log.warn(
+            "unknown_event", error_type="phone_gate_outcome",
+            schema=phone.GATE_TIMED_OUT,
+            duration_sec=_gate_wall_clock,
+        )
+        # PURGE THE PRE-CONSENT AUDIO. The egress starts at `call.answered`,
+        # before anybody has been told they are being recorded, and ONLY a
+        # `PURGE_BEFORE_EVENTS` member destroys it. The sibling
+        # `PhoneParticipantGone` branch below has posted this terminal from the
+        # day it was written, for exactly this reason; a timeout that posted
+        # nothing would leave that audio in the bucket and the engagement stuck
+        # in `dialing` — a worse outcome than the freeze it replaces.
+        await _post_gate_purging_terminal(events, attempt_id, epoch, "gate_timed_out")
+        result = phone.PhoneGateResult(phone.GATE_TIMED_OUT, events=[], spoken=[])
     except phone.PhoneParticipantGone:
         _log.info(
             "unknown_event", error_type="phone_gate_outcome",
@@ -8487,35 +8699,11 @@ async def _run_phone_session(
         )
         # Post the PURGING terminal before returning. Not crashing is only half
         # the fix: the egress starts at `call.answered`, and only a
-        # `PURGE_BEFORE_EVENTS` member destroys that audio. Best-effort — a
-        # failure here must not re-raise into the entrypoint, which is the very
-        # crash being removed.
-        # Posted DIRECTLY rather than through `_post_phone_event_with_retry`,
-        # which does not forward `epoch` — every other terminal in this gate
-        # carries it, and dropping it here would change which staleness rules
-        # the server applies. One bounded retry covers a transport blip; the
-        # post is idempotent by 0042's deterministic event id.
-        applied = False
-        for _ in range(2):
-            try:
-                outcome = await events.post_event(
-                    attempt_id, "candidate.deferred_pre_disclosure", epoch=epoch,
-                )
-                applied = phone.event_applied(outcome)
-            except Exception:  # noqa: BLE001
-                applied = False
-            if applied:
-                break
-        if not applied:
-            # `post_event` FAILS CLOSED by returning a not-ok outcome rather
-            # than raising, so catching exceptions alone was a guard that could
-            # not fire. An unapplied event means the pre-consent recording was
-            # NOT purged — the one thing this block exists to guarantee — so it
-            # has to be visible rather than assumed.
-            _log.warn(
-                "unknown_event", error_type="phone_gate_outcome",
-                error_category="participant_left_terminal_not_applied",
-            )
+        # `PURGE_BEFORE_EVENTS` member destroys that audio. Shared with the
+        # wall-clock exit above — see `_post_gate_purging_terminal`.
+        await _post_gate_purging_terminal(
+            events, attempt_id, epoch, "participant_left",
+        )
         result = phone.PhoneGateResult(
             phone.GATE_PARTICIPANT_LEFT, events=[], spoken=[],
         )
@@ -9032,6 +9220,11 @@ async def entrypoint(ctx: JobContext) -> None:
         return
 
     if _phone_agent_name():
+        # No job accounting here. The one-call-per-machine gate lives in
+        # `_phone_one_call_per_machine_load`, which runs in the worker's MAIN
+        # process; this entrypoint runs in a FORKED job process, so anything it
+        # recorded would be invisible to the process that answers the next
+        # dispatch.
         await _run_phone_entrypoint(ctx, room_identity)
         return
 

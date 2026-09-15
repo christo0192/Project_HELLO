@@ -3883,6 +3883,76 @@ class PhoneAssessmentResult:
 # given to somebody else.
 
 
+#: Strong references to in-flight lease re-base tasks. `asyncio` keeps only a
+#: WEAK reference to a running task, so a fire-and-forget renewal can be
+#: garbage-collected mid-await and silently never happen — the exact failure
+#: mode that makes "best effort" mean "never". Entries remove themselves on
+#: completion, so this holds at most one per live call.
+_lease_rebase_tasks: set[Any] = set()
+
+
+async def rebase_lease_on_answer(
+    client: PhoneEventClient,
+    attempt_id: str,
+    session_id: str | None,
+    epoch: int | None,
+) -> bool:
+    """Extend the attempt lease from the ANSWER instant. Returns True if renewed.
+
+    ── WHY THIS EXISTS (RCA 2026-09-10) ──────────────────────────────────
+    `admit_phone_attempt` mints the concurrency lease at ADMISSION, not at
+    answer. Everything between the two — the dial, the ring, and on a cold pool
+    the 30-odd seconds a Fly machine takes to boot — is spent out of the very
+    window that is supposed to cover the conversation.
+
+    On 2026-09-10 two calls were admitted in ONE due-loop pass at the same
+    microsecond. Both needed a machine; the second had to cold-boot, so that
+    candidate answered 62.6 s into a 180 s lease and began a gate whose own
+    documented allowance is 105 s with 117 s left. Both legs were reaped
+    `abandoned` at admission + exactly 180.000 s, with people on the line.
+
+    One renewal here re-bases the clock on the moment a human actually picked
+    up, which is the only instant from which the conversation's budget means
+    anything. It removes the cold-boot penalty entirely — and with it the
+    coupling that made CONCURRENCY the trigger, since needing a second machine
+    is exactly what makes an answer late.
+
+    BEST EFFORT, like the `call.answered` post it follows. A failure here must
+    never kill a call: the periodic heartbeat still starts later and the leg is
+    no worse off than before this existed. `lease_lost` is logged distinctly —
+    it means the slot was already gone before the first word, which is worth
+    seeing even though the gate cannot act on it yet.
+    """
+    if session_id is None or epoch is None:
+        # Nothing to name the fence with. `heartbeat_phone_attempt_by_epoch`
+        # answers `lease_lost` to a null session or epoch, so calling would be
+        # a guaranteed-useless round trip on the critical path.
+        return False
+    # The WHOLE body, not just the round trip. This runs as a detached task, so
+    # anything that escapes surfaces only as "Task exception was never
+    # retrieved" at loop teardown — and the two lines below reach into an
+    # outcome object and format a log record, neither of which is guaranteed
+    # total. A best-effort renewal that can still raise is not best-effort.
+    try:
+        outcome = await client.heartbeat_attempt(attempt_id, session_id, epoch=epoch)
+        if outcome.ok:
+            _log.info(
+                "unknown_event", error_type="phone_lease_rebase",
+                error_category="rebased_on_answer",
+            )
+            return True
+        _log.warn(
+            "unknown_event", error_type="phone_lease_rebase",
+            error_category=outcome.status or outcome.error_category or _ERR_MALFORMED,
+        )
+    except Exception:  # noqa: BLE001 — best effort, never fatal
+        _log.warn(
+            "unknown_event", error_type="phone_lease_rebase",
+            error_category=_ERR_TRANSPORT,
+        )
+    return False
+
+
 async def run_phone_heartbeat(
     *,
     attempt_id: str,
@@ -4644,6 +4714,14 @@ _OUTCOME_CLOSING: dict[str, str] = {
 
 GATE_NO_PARTICIPANT = "no_participant"
 GATE_PARTICIPANT_LEFT = "participant_left"
+#: The opening gate overran its wall clock (`PHONE_GATE_MAX_SECONDS`).
+#:
+#: Unreachable before 2026-09-14: the gate had no bound at all, so a wedged
+#: playout simply froze the call until the server reaped the lease — which on
+#: 2026-09-10 it did, twice, with candidates on the line. A gate that overruns
+#: is now a REPORTED fault rather than an indefinite wait, which is the whole
+#: difference between a diagnosable incident and dead air.
+GATE_TIMED_OUT = "gate_timed_out"
 
 
 class PhoneParticipantGone(Exception):
@@ -5485,6 +5563,38 @@ async def run_phone_gate(
                 "unknown_event", error_type="phone_call_answered_not_applied",
                 error_category="call_answered_unconfirmed",
             )
+
+        # RE-BASE THE LEASE ON THE ANSWER. The clock has been running since
+        # ADMISSION — through the dial, the ring, and any machine cold boot —
+        # so without this the conversation inherits whatever is left rather
+        # than its own budget. See `rebase_lease_on_answer`; this is what
+        # decouples a late answer (the signature of a cold pool, i.e. of
+        # CONCURRENCY) from a lease that expires mid-call.
+        #
+        # OUTSIDE the `if`, deliberately. The event post and the lease renewal
+        # are two independent round trips, and gating the renewal on the post
+        # made a single transport blip lose BOTH at once: no `answered_at`
+        # stamped (so `reclaim_phone_attempt_leases` grants no answered grace)
+        # AND no renewal (so the admission lease runs out on schedule) — the
+        # 2026-09-10 shape exactly, on the one call that most needed the fix.
+        # A human picked up; that is true whether or not the server heard about
+        # it, and it is the only fact this renewal depends on.
+        #
+        # FIRED, NOT AWAITED, and that is deliberate on two counts. This is the
+        # answer→disclosure path: every await here is silence the candidate
+        # hears before the bot says anything, and this lane has spent three PRs
+        # removing exactly that (#279, #289, #290). And the renewal is
+        # best-effort by construction — nothing downstream reads its result, so
+        # awaiting it buys nothing but dead air.
+        #
+        # The reference is held so the task cannot be garbage-collected
+        # mid-flight, and the gate's own teardown outlives it: the renewal is a
+        # single bounded HTTP round trip.
+        _rebase = asyncio.ensure_future(
+            rebase_lease_on_answer(client, attempt_id, session_id, epoch)
+        )
+        _lease_rebase_tasks.add(_rebase)
+        _rebase.add_done_callback(_lease_rebase_tasks.discard)
 
     # ── Durable consent short-circuit: a re-entry never re-asks ────────────
     # A worker deploy/crash mid-call re-dispatches this leg into a conversation

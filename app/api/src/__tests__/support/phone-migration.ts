@@ -36,6 +36,20 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+// 0096 re-declares reclaim_phone_attempt_leases IN FULL (0071's body plus the
+// answered-leg grace), so it must come FIRST — ahead of 0095 — or every
+// extractor reads 0071's superseded body and the new grace is invisible to the
+// drift tests. It also declares `sweep_phone_orphan_sessions` and
+// `phone_answered_reclaim_grace`, which no earlier migration mentions.
+export const MIGRATION_0096_PATH = fileURLToPath(
+  new URL(
+    '../../../../supabase/migrations/0096_phone_live_call_protection.sql',
+    import.meta.url,
+  ),
+);
+
+export const MIGRATION_0096 = readFileSync(MIGRATION_0096_PATH, 'utf8');
+
 // 0095 re-declares apply_phone_event, admit_phone_attempt and
 // finalize_phone_partial_sessions IN FULL (lifted verbatim from 0067, 0094 and
 // 0072 respectively, then patched), and declares the same-day retry sweep. It
@@ -222,6 +236,11 @@ export const MIGRATION_0092 = readFileSync(MIGRATION_0092_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0096 re-declares reclaim_phone_attempt_leases in full (0071's body plus
+    // the answered-leg grace), so it leads for the same reason every entry
+    // below leads: an extractor that reads a superseded body makes the drift
+    // tests blind to the change.
+    { name: '0096', sql: MIGRATION_0096 },
     // 0095 re-declares THREE functions in full — apply_phone_event (edges #27b,
     // #30, #31), admit_phone_attempt (the second dial of the IST day) and
     // finalize_phone_partial_sessions (a never-started call is not a completed
@@ -441,6 +460,12 @@ export const RPC_NAMES = [
   // constant helper, not a service-role RPC, and it returns an interval
   // rather than a status envelope.
   'sweep_phone_same_day_retry',
+  // 0096 — the reaper for a live `waiting` session that never got an attempt.
+  // `phone_answered_reclaim_grace()` is deliberately NOT listed, for the same
+  // reason `phone_max_daily_dials()` and `phone_same_day_retry_delay()` are
+  // not: it is a constant helper, not a service-role RPC, and it returns an
+  // interval rather than a status envelope.
+  'sweep_phone_orphan_sessions',
 ] as const;
 
 /**

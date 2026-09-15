@@ -146,6 +146,18 @@ export interface PhoneRuntimeSnapshot {
    * five-hour retry from a new day.
    */
   readonly lastSameDayReleased: number | null;
+  /**
+   * 0096. Orphan `waiting` sessions terminalized by the last pass.
+   *
+   * The shape nothing else could see: `ensureSession` writes the session row
+   * BEFORE admission runs, so a refused dial strands it with no attempt for
+   * ever — and a later dial that ADOPTS it claims a worker lease that only a
+   * terminal session can release. A non-zero number here is the pool being
+   * given back, so it is published separately rather than folded into
+   * `lastStranded` (an engagement pointing at an already-terminal session) or
+   * `lastPartialFinalized` (a call that ran and was not scored).
+   */
+  readonly lastOrphanExpired: number | null;
   /** 0045. Stranded engagements resolved — completed plus truthfully failed. */
   readonly lastStranded: number | null;
   /**
@@ -377,10 +389,13 @@ export function createPhoneRuntime(
   // not happen" must reach the health surface as different answers.
   const sweepNotOk: Record<string, boolean> = {
     reclaim: false, expire: false, reconcile: false, dayroll: false, stranded: false,
-    recstrand: false, partialfin: false, sameday: false,
+    recstrand: false, partialfin: false, sameday: false, orphansess: false,
   };
   let lastRolled: number | null = null;
   let lastSameDayReleased: number | null = null;
+  // 0096: orphan `waiting` sessions terminalized, each one a worker lease
+  // that can finally be released.
+  let lastOrphanExpired: number | null = null;
   let lastStranded: number | null = null;
   // 0071 / X5b: sessions driven terminal so a crashed call's recording could
   // finalize. Kept apart from `stranded` (0045), which resolves the opposite
@@ -449,6 +464,7 @@ export function createPhoneRuntime(
     sweepNotOk[sweep] = verdict === 'broken';
     if (sweep === 'dayroll') lastRolled = null;
     if (sweep === 'sameday') lastSameDayReleased = null;
+    if (sweep === 'orphansess') lastOrphanExpired = null;
     if (sweep === 'stranded') lastStranded = null;
     if (sweep === 'recstrand') lastRecStranded = null;
     if (sweep === 'partialfin') lastPartialFinalized = null;
@@ -858,6 +874,52 @@ export function createPhoneRuntime(
       },
     },
     {
+      // ── 0096: THE SESSION NOTHING ELSE COULD SEE ────────────────────
+      // `ensureSession` writes the `call_sessions` row BEFORE
+      // `admit_phone_attempt` runs, so every refused dial leaves a `waiting`
+      // session with NO attempt behind it, permanently. Every existing sweep
+      // is blind to that shape: `finalize_phone_partial_sessions` INNER-joins
+      // the attempts (no rows at all), `reclaim_phone_attempt_leases` scans
+      // attempts, `list_terminal_session_leases` needs a terminal session.
+      //
+      // Harmless until a later dial ADOPTS the row and claims a worker lease
+      // against it — then the lease can only be released by a terminal
+      // session that will never arrive, and the machine is out of the pool
+      // for ever. One did exactly that for four days in September 2026,
+      // holding half a two-machine fleet.
+      //
+      // Its own claim, so an operator can stop it alone during an incident.
+      // Expire cadence: the thing it watches for is fifteen minutes old
+      // before it is even eligible.
+      name: 'phone-orphansess',
+      intervalMs: runtimeConfig.expireMs,
+      tick: async () => {
+        const verdict = await claimed('orphansess');
+        if (!applyClaim('orphansess', verdict)) {
+          return verdict === 'theirs' ? HOLD_BASE_CADENCE : ALLOW_IDLE_BACKOFF;
+        }
+        // Defensive, as `phone-recstrand` is: a store double built before 0096
+        // has no such method, and an unguarded call would throw the whole tick
+        // — taking the loops that DO work down with it. Unlike that one this
+        // also RAISES the fault flag, because a production store missing a
+        // method its interface declares is a real defect and must not read as
+        // a healthy quiet sweep.
+        const sweep = stores.sweepOrphanSessions;
+        if (typeof sweep !== 'function') {
+          sweepNotOk.orphansess = true;
+          lastOrphanExpired = null;
+          return ALLOW_IDLE_BACKOFF;
+        }
+        const swept = await sweep({
+          limit: runtimeConfig.reclaimLimit,
+          now: new Date(),
+        });
+        sweepNotOk.orphansess = swept.status !== 'ok';
+        lastOrphanExpired = swept.status === 'ok' ? (swept.expired ?? 0) : null;
+        return swept.status === 'ok' ? HOLD_BASE_CADENCE : ALLOW_IDLE_BACKOFF;
+      },
+    },
+    {
       name: 'phone-stranded',
       intervalMs: runtimeConfig.expireMs,
       tick: async () => {
@@ -1115,6 +1177,7 @@ export function createPhoneRuntime(
       lastReconciled,
       lastRolled,
       lastSameDayReleased,
+      lastOrphanExpired,
       lastStranded,
       lastRecStranded,
       lastPartialFinalized,

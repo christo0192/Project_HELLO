@@ -12,13 +12,19 @@
  *       error — returns a NON-ready status, and the caller must not dial/admit
  *       on any of them. There is no code path that returns 'ready' without a
  *       ready lease read.
- *   I2  NEVER LEAK A STARTED MACHINE. Every failure exit of `ensureReadyWorker`
- *       after a successful claim runs a best-effort cleanup (stopMachine +
- *       release + reset) so a machine that was started but never confirmed
- *       ready does not sit `started` burning cost. `reapWorkers` is the
- *       independent backstop: it stops ANY non-stopped machine whose claimed
- *       session has no live LiveKit room beyond the grace window, even if every
- *       orchestration event was lost.
+ *   I2  NEVER LEAK A STARTED MACHINE — AND NEVER STOP SOMEBODY ELSE'S.
+ *       Every failure exit of `ensureReadyWorker` after a successful claim runs
+ *       a best-effort cleanup so a machine that was started but never confirmed
+ *       ready does not sit `started` burning cost. That cleanup acts ONLY on a
+ *       claim `release_voice_worker` proved was still ours (`draining`): the
+ *       stop and the reset are both unfenced, so running them on a claim that
+ *       has moved on ends a live call. The one exit that skips cleanup
+ *       entirely is the claim-lost branch, where the lease read already told us
+ *       the machine is not ours and the release CAS — which is NOT
+ *       epoch-fenced — could not tell us otherwise.
+ *       `reapWorkers` is the independent backstop: it stops ANY non-stopped
+ *       machine whose claimed session has no live LiveKit room beyond the grace
+ *       window, even if every orchestration event was lost.
  *
  * ── DISABLED BY DEFAULT ───────────────────────────────────────────────
  * The whole module is inert unless `env.workerOrchestration` is true. Each
@@ -73,26 +79,56 @@ export type RpcCaller = (
 ) => Promise<{ data: unknown; error: { message?: string } | null }>;
 
 /**
- * A bounded, read-only view of a machine's lease state — the readiness-poll
- * seam. It reads ONLY the `state` column of the lease for (app, machineId),
- * because that is the single fact the poll needs and the narrowest thing to
- * expose. There is no `get_voice_worker_lease` RPC in the committed substrate
- * (0079), so production reads the service-role-only `voice_worker_leases` table
+ * What the readiness poll reads back off a lease row.
+ *
+ * `state` ALONE is not enough, and reading only it was a real race. The poll
+ * runs for up to two minutes against a row that another actor can take away:
+ * the reaper releases a claim it judges dead, `claim_voice_worker` then hands
+ * the same machine to the NEXT session, and that session's worker posts its
+ * readiness ping. A poll watching only `state` sees `ready`, believes it, and
+ * dials a candidate into a machine that belongs to somebody else — where, since
+ * the worker now accepts one job at a time, the second dispatch is DECLINED and
+ * the candidate hears silence. That is reachable exactly when the pool is
+ * saturated, which is the load this whole change exists to survive.
+ *
+ * So the poll reads the claim's identity alongside its state and believes
+ * `ready` only while the row still carries THIS session at THIS epoch.
+ */
+export interface LeaseStateSnapshot {
+  /** The lifecycle state, or null when no row exists for (app, machineId). */
+  readonly state: string | null;
+  /** Who holds the lease right now. Null iff the machine is `stopped`. */
+  readonly claimedSessionId: string | null;
+  /** The fencing token of the CURRENT claim, not of ours. */
+  readonly epoch: number | null;
+}
+
+/**
+ * A bounded, read-only view of a machine's lease — the readiness-poll seam.
+ *
+ * It reads the three columns the poll must fence on and nothing else: the
+ * state, and the claim identity that says whether that state is still ours.
+ * There is no `get_voice_worker_lease` RPC in the committed substrate (0079),
+ * so production reads the service-role-only `voice_worker_leases` table
  * directly (RLS forces service_role); this seam keeps that read injectable and
- * keeps the rest of the service ignorant of the storage shape. Returns the
- * lease state string, or null when no row is found. Must reject rather than
- * invent on a transport failure.
+ * keeps the rest of the service ignorant of the storage shape. Must reject
+ * rather than invent on a transport failure.
  */
 export type LeaseStateReader = (input: {
   app: string;
   machineId: string;
-}) => Promise<string | null>;
+}) => Promise<LeaseStateSnapshot>;
 
 /**
  * A bounded, read-only LiveKit room-liveness check. `true` iff the named room
- * currently has at least one participant. The reaper treats a THROW as
- * "unknown" and SPARES the machine (never stops on an unproven-dead room), so
- * this must reject rather than invent on failure.
+ * currently has at least one participant.
+ *
+ * The reaper treats a THROW as "unknown" and SPARES the machine (never stops on
+ * an unproven-dead room), so this must reject rather than invent on failure —
+ * with ONE exception it must get right: a room that does not exist is not
+ * unknown, it is empty, and must answer `false`. Reporting a missing room as
+ * "unknown" makes the reaper spare that machine on every pass for ever, which
+ * is how a lease survives with a 32-hour-dead heartbeat while its machine burns.
  */
 export type RoomLivenessChecker = (roomName: string) => Promise<boolean>;
 
@@ -227,6 +263,31 @@ function envelope(
   return data as Record<string, unknown>;
 }
 
+/**
+ * True when a LiveKit room read failed because the room is GONE, not because
+ * the call failed.
+ *
+ * The server SDK raises a Twirp error carrying `code: 'not_found'` for a room
+ * that no longer exists; older/newer builds have surfaced the same condition as
+ * an HTTP 404 and as a message-only error. All three are checked, because the
+ * cost of missing one is the reaper sparing a dead machine for ever — the
+ * failure this classifier exists to end — while the cost of a false positive is
+ * bounded: the reaper then treats a live room as empty and stops a machine one
+ * grace window early, which `list_reapable_voice_workers` already requires to
+ * be past its heartbeat grace.
+ *
+ * Deliberately NARROW on the message: only the SDK's own wording for a missing
+ * room, never a substring that a transport failure could also produce.
+ */
+function isRoomNotFound(err: unknown): boolean {
+  if (err === null || typeof err !== 'object') return false;
+  const e = err as { code?: unknown; status?: unknown; statusCode?: unknown; message?: unknown };
+  if (typeof e.code === 'string' && e.code.toLowerCase() === 'not_found') return true;
+  if (e.status === 404 || e.statusCode === 404) return true;
+  return typeof e.message === 'string'
+    && /requested room does not exist/i.test(e.message);
+}
+
 /** A metadata-only sweep/lifecycle log line. Never a session id or a token. */
 function logEvent(kind: string, extra: Record<string, unknown> = {}): void {
   log.info('unknown_event', { error_category: `worker_orchestration_${kind}`, ...extra });
@@ -264,25 +325,55 @@ export function createWorkerOrchestrationService(
   };
 
   /**
-   * Best-effort teardown of a claim that never became a live session. Fail-OPEN
-   * on every step: the reaper is the backstop, so a transient Fly/DB error here
-   * must not throw out of the caller's failure path. Enforces I2.
+   * Give a claimed machine back — and ONLY a machine this session still holds.
+   *
+   * `release_voice_worker` is CAS'd on (app, machine_id, session); the two
+   * steps after it are not. `stopMachine` kills whatever is running on that
+   * machine and `reset_voice_worker` is documented "unconditional on
+   * session/epoch by design", so running them for a claim we no longer hold
+   * stops SOMEBODY ELSE'S live call and marks their lease free for a third
+   * session to claim.
+   *
+   * That is reachable: this runs on the failure exits of `ensureReadyWorker`,
+   * up to two minutes after the claim, and in between the reaper can stop and
+   * reset our machine (our session's room has no participants yet, so the
+   * liveness check cannot spare it) and the next dial can claim it. At a
+   * saturated pool, "the next dial" is always waiting.
+   *
+   * So the release is the AUTHORITY, not a formality: only a `draining` answer
+   * proves the claim was still ours, and only then do we stop anything.
+   * Anything else — `already_released`, an unexpected status, a transport
+   * throw — means we cannot prove ownership, and the machine is left to the
+   * reaper, which is the designed backstop for exactly this.
    */
   async function cleanupClaim(app: string, machineId: string, sessionId: string): Promise<void> {
+    let held = false;
     try {
-      await deps.rpc('release_voice_worker', {
-        p_app: app,
-        p_machine_id: machineId,
-        p_session_id: sessionId,
-        p_now: new Date(now()).toISOString(),
-      });
+      const released = envelope(
+        'release_voice_worker',
+        await deps.rpc('release_voice_worker', {
+          p_app: app,
+          p_machine_id: machineId,
+          p_session_id: sessionId,
+          p_now: new Date(now()).toISOString(),
+        }),
+      );
+      held = released.status === 'draining';
     } catch {
-      /* fail-open: reaper backstops */
+      /* fail-open: reaper backstops. `held` stays false — we stop nothing. */
+    }
+    if (!held) {
+      // Not ours (or unprovable). Stopping here would be the destructive act.
+      event('cleanup_not_held', { app });
+      return;
     }
     try {
       await deps.fly.stopMachine(app, machineId);
     } catch {
-      /* fail-open: reaper backstops */
+      // Could not stop it; do NOT reset a machine we did not confirm stopped —
+      // that would return a still-running machine to the claimable pool.
+      event('cleanup_stop_failed', { app });
+      return;
     }
     try {
       await deps.rpc('reset_voice_worker', {
@@ -363,20 +454,42 @@ export function createWorkerOrchestrationService(
     // not-ready-yet and simply retried within the budget.
     const deadline = now() + readyTimeoutMs;
     let observedReady = false;
+    let claimLost = false;
+
+    /**
+     * Believe a lease read only while the row is still OUR claim.
+     *
+     * A row carrying another session, or a HIGHER epoch, has been re-claimed
+     * out from under this poll and nothing on it is ours to act on — not even
+     * a `ready`. A row that has gone `stopped` (null session) is merely not
+     * ready yet from our side; the cleanup path handles it and the CAS in
+     * `release_voice_worker` makes a late release harmless. Reading `null`
+     * state (no row) is likewise just "not yet".
+     */
+    const verdict = (snap: LeaseStateSnapshot): 'ready' | 'lost' | 'waiting' => {
+      if (snap.claimedSessionId !== null && snap.claimedSessionId !== sessionId) return 'lost';
+      if (typeof snap.epoch === 'number' && snap.epoch > epoch) return 'lost';
+      // 'busy' can only be reached from 'ready' (mark_voice_worker_busy CAS),
+      // so observing it also satisfies "was confirmed ready".
+      return snap.state === 'ready' || snap.state === 'busy' ? 'ready' : 'waiting';
+    };
+
     // Read once immediately, then poll until the deadline.
     // (A first read before the initial sleep avoids waiting a full cadence when
     // the worker was already ready — e.g. a warm-standby machine.)
     for (;;) {
-      let state: string | null = null;
+      let seen: 'ready' | 'lost' | 'waiting' = 'waiting';
       try {
-        state = await deps.readLeaseState({ app, machineId });
+        seen = verdict(await deps.readLeaseState({ app, machineId }));
       } catch {
-        state = null; // transient; retry within budget
+        seen = 'waiting'; // transient; retry within budget
       }
-      if (state === 'ready' || state === 'busy') {
-        // 'busy' can only be reached from 'ready' (mark_voice_worker_busy CAS),
-        // so observing it also satisfies "was confirmed ready".
+      if (seen === 'ready') {
         observedReady = true;
+        break;
+      }
+      if (seen === 'lost') {
+        claimLost = true;
         break;
       }
       if (now() >= deadline) break;
@@ -385,8 +498,9 @@ export function createWorkerOrchestrationService(
         // One last read after the final sleep, so a ready that landed during
         // the sleep is not missed.
         try {
-          const s = await deps.readLeaseState({ app, machineId });
-          if (s === 'ready' || s === 'busy') observedReady = true;
+          const last = verdict(await deps.readLeaseState({ app, machineId }));
+          if (last === 'ready') observedReady = true;
+          if (last === 'lost') claimLost = true;
         } catch {
           /* keep observedReady false */
         }
@@ -394,8 +508,31 @@ export function createWorkerOrchestrationService(
       }
     }
 
+    if (claimLost) {
+      // ── 4a. Somebody else owns this machine now. ────────────────────
+      // Deliberately NOT a `ready`: the readiness we may have just seen is
+      // theirs.
+      //
+      // AND DELIBERATELY NO TEARDOWN. The obvious move — "cleanup is safe, the
+      // release CAS will answer `already_released`" — is WRONG for half the
+      // cases that get here. `release_voice_worker` (0079) matches on
+      // `(app, machine_id, claimed_session_id)` and NOT on epoch, so when the
+      // same session re-claimed the same machine at a higher epoch the row
+      // still matches ours: release answers `draining`, the teardown believes
+      // it holds the claim, and it stops the machine the NEWER claim just
+      // booted. (`claim_voice_worker` orders `by machine_id limit 1`, so a
+      // re-claim deterministically prefers the same machine — this is not a
+      // rare interleaving.)
+      //
+      // We could not prove ownership from the lease read, so we do not act on
+      // the lease at all. The machine belongs to whoever holds it now; if that
+      // claim is itself dead, the reaper is the thing designed to notice.
+      event('claim_lost', { app });
+      return { status: 'timeout' };
+    }
+
     if (!observedReady) {
-      // ── 4. Readiness timeout → clean up, return timeout (never ready). ─
+      // ── 4b. Readiness timeout → clean up, return timeout (never ready). ─
       event('ready_timeout', { app });
       await cleanupClaim(app, machineId, sessionId);
       return { status: 'timeout' };
@@ -417,36 +554,17 @@ export function createWorkerOrchestrationService(
   }): Promise<void> {
     if (!enabled) return;
     const { app, machineId, sessionId } = input;
-    // release → stop → reset, in that order, each fail-open. The order matters:
-    // release drops the claim (so the reaper won't fight us), stop halts the
-    // cost, reset returns the row to the stopped pool. A Fly error on stop does
-    // NOT abort the reset — the reaper will stop it later, and the pool row
-    // should still be reusable. Idempotent: release/reset are no-ops on an
-    // already-released/stopped row.
-    try {
-      await deps.rpc('release_voice_worker', {
-        p_app: app,
-        p_machine_id: machineId,
-        p_session_id: sessionId,
-        p_now: new Date(now()).toISOString(),
-      });
-    } catch {
-      /* fail-open */
-    }
-    try {
-      await deps.fly.stopMachine(app, machineId);
-    } catch {
-      /* fail-open: the reaper stops it later */
-    }
-    try {
-      await deps.rpc('reset_voice_worker', {
-        p_app: app,
-        p_machine_id: machineId,
-        p_now: new Date(now()).toISOString(),
-      });
-    } catch {
-      /* fail-open */
-    }
+    // release → stop → reset, in that order. The order matters: release drops
+    // the claim (so the reaper won't fight us), stop halts the cost, reset
+    // returns the row to the stopped pool.
+    //
+    // Routed through the SAME ownership proof the claim teardown uses, and for
+    // the same reason: `stopMachine` and `reset_voice_worker` are both
+    // unfenced, so running them for a claim that has moved on stops somebody
+    // else's live call. This path's window is shorter — the claim is seconds
+    // old, not two minutes — but "shorter" is not an argument for keeping the
+    // destructive version of a sequence we already have a safe version of.
+    await cleanupClaim(app, machineId, sessionId);
   }
 
   /**
@@ -634,9 +752,25 @@ export function createWorkerOrchestrationService(
       if (c.claimedSessionId !== null) {
         try {
           live = await deps.roomIsLive(roomNameForSession(c.claimedSessionId));
-        } catch {
-          // Unknown liveness — do not stop this machine this pass.
-          continue;
+        } catch (err) {
+          // ── A ROOM THAT IS GONE IS NOT "UNKNOWN" ──────────────────────
+          // The rule is never to stop on an UNPROVEN-dead room, and a
+          // `not_found` proves the opposite of unknown: the room has already
+          // been torn down, so nobody is in it. Reading that as unknown is how
+          // a lease survives with a 32-hour-dead heartbeat while its machine
+          // burns — the reaper asks about a room that no longer exists, gets a
+          // throw, and declines to act, on every pass, for ever. One such
+          // lease held half a two-machine pool for four days.
+          //
+          // Classified HERE rather than inside the checker so the rule holds
+          // for every injected `RoomLivenessChecker`, and so it is reachable
+          // from a test that does not need the LiveKit SDK.
+          if (!isRoomNotFound(err)) {
+            // Anything else really is unknown — a transport failure proves
+            // nothing about the room. Spare it this pass.
+            continue;
+          }
+          live = false;
         }
       }
       if (live) continue; // a live room is real work; leave it alone.
@@ -810,22 +944,42 @@ export function createDefaultWorkerOrchestrationService(
   const readLeaseState: LeaseStateReader = async ({ app, machineId }) => {
     const { data, error } = await client
       .from('voice_worker_leases')
-      .select('state')
+      .select('state, claimed_session_id, epoch')
       .eq('app', app)
       .eq('machine_id', machineId)
       .maybeSingle();
     if (error) throw new Error('lease_read_error');
-    const state = (data as { state?: unknown } | null)?.state;
-    return typeof state === 'string' ? state : null;
+    const row = data as {
+      state?: unknown;
+      claimed_session_id?: unknown;
+      epoch?: unknown;
+    } | null;
+    return {
+      state: typeof row?.state === 'string' ? row.state : null,
+      claimedSessionId:
+        typeof row?.claimed_session_id === 'string' ? row.claimed_session_id : null,
+      // `epoch` is a bigint; PostgREST hands bigints back as strings on some
+      // driver versions, so accept both and refuse to guess on anything else —
+      // an unparsed epoch must read as "no fence available", not as zero.
+      epoch: typeof row?.epoch === 'number'
+        ? row.epoch
+        : typeof row?.epoch === 'string' && /^\d+$/.test(row.epoch)
+          ? Number(row.epoch)
+          : null,
+    };
   };
 
   // The LiveKit RoomServiceClient is imported lazily on first use, so a
   // deployment that never reaps never loads the SDK. A room is LIVE iff it has
-  // at least one participant. `listParticipants` throws for a room that does
-  // not exist on some SDK versions — the reaper treats that throw as "unknown"
-  // and spares, so we translate a not-found into `false` (no participants =
-  // not live) only when the SDK returns cleanly; a genuine transport error
-  // still propagates.
+  // at least one participant.
+  //
+  // It REJECTS rather than inventing, including for a room that no longer
+  // exists — `listParticipants` throws `not_found` for that. The reaper
+  // classifies the rejection (see `isRoomNotFound` at its call site): a missing
+  // room is empty, anything else is genuinely unknown and spares the machine.
+  // An earlier comment here claimed this checker performed that translation
+  // itself. It did not, and it should not — putting the rule in the reaper
+  // makes it hold for every injected checker, not just this one.
   let roomClient: { listParticipants(room: string): Promise<Array<unknown>> } | undefined;
   const roomIsLive: RoomLivenessChecker = async (roomName) => {
     if (!roomClient) {

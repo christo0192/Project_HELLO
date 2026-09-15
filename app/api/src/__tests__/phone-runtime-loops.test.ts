@@ -134,6 +134,10 @@ const LOOP_KNOBS = {
   // `phone-dayroll`, and on the same EXPIRE cadence for the same reason: the
   // five-hour delay dominates, so detection latency is irrelevant.
   'phone-sameday': 'expireMs',
+  // 0096. The orphan-session reaper. EXPIRE cadence: the row is fifteen
+  // minutes old before it is even eligible, so detection latency is noise
+  // against the grace it waits out.
+  'phone-orphansess': 'expireMs',
 } as const satisfies Readonly<Record<string, keyof PhoneRuntimeConfig>>;
 
 const LOOP_NAMES = Object.keys(LOOP_KNOBS) as ReadonlyArray<keyof typeof LOOP_KNOBS>;
@@ -213,13 +217,15 @@ interface Counters {
   sameDaySweeps: number;
   /** 0072. Partial-finalize sweep passes. */
   partialFinalizeSweeps: number;
+  /** 0096. Orphan-session sweep passes that actually REACHED the store. */
+  orphanSessionSweeps: number;
 }
 
 function counters(): Counters {
   return {
     duePasses: 0, backlogReads: 0, reclaims: 0, expires: 0, claims: [],
     sweepClaims: [], dayRolls: 0, strandedSweeps: 0, recStrandedSweeps: 0, sameDaySweeps: 0,
-    partialFinalizeSweeps: 0,
+    partialFinalizeSweeps: 0, orphanSessionSweeps: 0,
   };
 }
 
@@ -286,6 +292,15 @@ function makeStores(
     async sweepSameDayRetry() {
       c.sameDaySweeps += 1;
       return { status: 'ok' as const, examined: 0, released: 0, skipped: 0 };
+    },
+    // 0096. Same reason, and the loop is DEFENSIVE about a missing method —
+    // which makes its absence worse, not better: the tick would take the
+    // claim, find no function, flag the sweep not-ok and return, and the
+    // `sweepClaims` assertion below would still pass while the sweep itself
+    // was never called once. The count is what proves it ran.
+    async sweepOrphanSessions() {
+      c.orphanSessionSweeps += 1;
+      return { status: 'ok' as const, examined: 0, expired: 0, skipped: 0 };
     },
     // 0072. Same reason as the sweeps above: the loop CALLS this, so a fake
     // missing it would leave the new loop uncovered. Returns no sessions by
@@ -771,6 +786,7 @@ function makeView(over: Partial<PhoneRuntimeView> = {}): PhoneRuntimeView {
     last_rolled: null,
     last_stranded: null,
     last_rec_stranded: null,
+    last_orphan_expired: null,
     sweeps_not_ok: [],
     start_failed: false,
     ...over,
@@ -795,6 +811,7 @@ describe('D. the health view', () => {
     last_rolled: null,
     last_stranded: null,
     last_rec_stranded: null,
+    last_orphan_expired: null,
       // No sweep has run, so none has failed. Empty, never a fabricated name.
       sweeps_not_ok: [],
       // Nothing tried to construct a runtime, so nothing failed to. THE ONE
@@ -864,6 +881,7 @@ describe('D. the health view', () => {
     last_rolled: null,
     last_stranded: null,
     last_rec_stranded: null,
+    last_orphan_expired: null,
       // No sweep has run, so none has failed. Empty, never a fabricated name.
       sweeps_not_ok: [],
       // Nothing tried to construct a runtime, so nothing failed to. THE ONE
@@ -1672,7 +1690,7 @@ describe('F. M-1 — a reconcile sweep that is NOT RUNNING is not a sweep that f
     const runtime = buildRuntime({ stores: makeStores(c), queue: makeEmptyQueue(c) });
     expect(Object.keys(runtime.snapshot().sweepNotOk).sort())
       // Sorted, so 0095's `sameday` sits between `recstrand` and `stranded`.
-      .toEqual(['dayroll', 'expire', 'partialfin', 'reclaim', 'reconcile', 'recstrand', 'sameday', 'stranded']);
+      .toEqual(['dayroll', 'expire', 'orphansess', 'partialfin', 'reclaim', 'reconcile', 'recstrand', 'sameday', 'stranded']);
   });
 });
 
@@ -1703,6 +1721,11 @@ describe('the day-roll and stranded sweeps run, and the claim gates them', () =>
     // is taken before the store call, so a sweep that claimed and then threw
     // would still show up in `sweepClaims`.
     expect(c.sameDaySweeps).toBeGreaterThan(0);
+    // 0096. Same reasoning, and it matters more here because this loop GUARDS
+    // its store call (`typeof sweep !== 'function'`): a fake without the
+    // method would claim, skip, flag not-ok and still satisfy the claim-name
+    // assertion below. Only the call count can tell "wired" from "running".
+    expect(c.orphanSessionSweeps).toBeGreaterThan(0);
     // Separate claim names: one sweep taking the other's claim would let a
     // single replica silently monopolise both. 0071 adds `recstrand`; 0072
     // adds `partialfin`.
@@ -1711,7 +1734,7 @@ describe('the day-roll and stranded sweeps run, and the claim gates them', () =>
       // its OWN name, not the day-roll's: the two sweeps ask different
       // questions (has a new day begun? / have five hours passed?) and
       // sharing a claim would let one starve the other.
-      new Set(['dayroll', 'stranded', 'recstrand', 'partialfin', 'sameday']),
+      new Set(['dayroll', 'stranded', 'recstrand', 'partialfin', 'sameday', 'orphansess']),
     );
   });
 

@@ -178,6 +178,23 @@ export interface SweepPhoneSameDayRetryResult {
   readonly skipped?: number;
 }
 
+/**
+ * 0096. Terminalizes a live `waiting` session that never got an attempt.
+ *
+ * `ensureSession` creates the `call_sessions` row BEFORE admission runs, so a
+ * refused dial leaves it behind for ever. One such row wedged a worker lease
+ * for four days in September 2026, holding half the phone pool, because no
+ * sweep could see it: the partial-finalize scan INNER-joins
+ * `phone_call_attempts` (there are none) and the lease reaper scans attempts.
+ */
+export interface SweepPhoneOrphanSessionsResult {
+  readonly status: OrUnknown<'ok'>;
+  readonly examined?: number;
+  /** Sessions driven `waiting -> expired`/`idle_timeout` by this pass. */
+  readonly expired?: number;
+  readonly skipped?: number;
+}
+
 export interface SweepPhoneStrandedSessionsResult {
   readonly status: OrUnknown<'ok'>;
   readonly examined?: number;
@@ -791,6 +808,19 @@ export interface PhoneStores {
     readonly limit?: number;
     readonly now: Date;
   }): Promise<SweepPhoneSameDayRetryResult>;
+
+  /**
+   * 0096. Reaps the orphan `waiting` sessions no other sweep can see.
+   *
+   * Deliberately NOT folded into `finalizePartialSessions`: that one asks "did
+   * a started call end without being scored?", this one asks "was a session
+   * ever used at all?", and neither can answer for the other.
+   */
+  sweepOrphanSessions(input: {
+    readonly limit?: number;
+    readonly graceSeconds?: number;
+    readonly now: Date;
+  }): Promise<SweepPhoneOrphanSessionsResult>;
 
   /** 0045. Resolves engagements left pointing at an already-ended session. */
   sweepStrandedSessions(input: {
