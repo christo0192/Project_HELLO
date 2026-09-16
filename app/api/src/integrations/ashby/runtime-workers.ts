@@ -713,9 +713,20 @@ export function buildAshbyHandlers(
           // to that makes a non-zero count actionable. The lookup is the same
           // cached set the filter uses, so it costs nothing.
           if (!stageInterest || typeof authoritativeStageId !== 'string') return;
-          void Promise.resolve(stageInterest(authoritativeStageId))
-            .then((authoritativeIsMapped) => {
-              if (authoritativeIsMapped !== true) return;
+          // BOTH halves are required, and asking only the second is the bug
+          // this replaced: a skip happens iff the HINT is unmapped, so without
+          // that half the warn fires hardest while the filter is failing open
+          // (the 5s backoff window answers `true` for everything) — precisely
+          // when no skip was possible and nothing could have been dropped.
+          // `stageInterest` is wrapped in the promise chain, not called as an
+          // argument, so a synchronous throw from a sync seam is caught here
+          // rather than escaping to the caller.
+          void Promise.resolve()
+            .then(async () => {
+              const hintWouldSkip = (await stageInterest(hintedStageId)) === false;
+              if (!hintWouldSkip) return;
+              const authoritativeIsMapped = (await stageInterest(authoritativeStageId)) === true;
+              if (!authoritativeIsMapped) return;
               logger.warn('unknown_event', {
                 error_category: 'ashby_stage_hint_would_have_skipped',
                 error_type: 'signal_prefilter',

@@ -440,8 +440,21 @@ export function createQueueRunner(options: QueueRunnerOptions): QueueRunnerHandl
       }
     }
 
-    // Spend the rotation only if it was actually used this tick.
-    if (firstPickOffered) firstPickCursor = (firstPick + 1) % queueCount;
+    // Spend the rotation only when the first-pick queue could actually have
+    // used it — it was admitted and had a free slot — or when the gate refused
+    // it outright (a refused queue cannot use a turn however long it holds one,
+    // and parking there pinned the cursor for the whole refusal).
+    //
+    // KNOWN RESIDUAL, deliberately not "fixed" here: `firstPickOffered` samples
+    // `active` at ONE instant, so a sibling that frees and re-takes the budget
+    // later in the same tick leaves this queue parked while the tick still made
+    // progress, and nothing bounds consecutive parks. Spending the turn in that
+    // case was tried and rejected: it moves the cursor PAST the queue that is
+    // being starved, pushing it later in the order and making the harm worse,
+    // and no test could express it as a desirable property. The real exposure
+    // is a long sibling job spanning tick boundaries, which no per-tick cap can
+    // bound; see the PR for the follow-up.
+if (firstPickOffered) firstPickCursor = (firstPick + 1) % queueCount;
 
     return processed;
   }

@@ -249,6 +249,58 @@ describe('createQueueRunner — a backlogged queue must not starve its siblings'
     expect(claims.filter((c) => c === 'q.sibling').length).toBeGreaterThanOrEqual(1);
   });
 
+  it('gives a slot that appeared BETWEEN the passes to the sibling, not back to first pick', async () => {
+    // The load-bearing detail of the leftover pass: it starts at the SIBLING,
+    // not at the queue that already took its share. A test where the sibling
+    // has work up front cannot see this — pass 1 serves it and the leftover
+    // pass never runs. Production's cascade is exactly this shape: a signal
+    // handler ENQUEUES an import job, so import work materialises after pass 1
+    // has already looked at (and found nothing in) the import queue.
+    const real = makeQueue();
+    await real.enqueue('q.first', { n: 1 });
+    await real.enqueue('q.first', { n: 2 });
+    await real.enqueue('q.sibling', { late: true });
+
+    // Hide the sibling's job from pass 1 only; reveal it to the leftover pass.
+    let siblingClaimCalls = 0;
+    const proxy = {
+      claim: async (name: string, opts: unknown) => {
+        if (name === 'q.sibling') {
+          siblingClaimCalls += 1;
+          if (siblingClaimCalls === 1) return null;  // pass 1: nothing yet
+        }
+        return (real as unknown as { claim: (n: string, o: unknown) => Promise<unknown> })
+          .claim(name, opts);
+      },
+      completeClaim: (...a: unknown[]) => (real as never as Record<string, (...x: unknown[]) => unknown>).completeClaim(...a),
+      failClaim: (...a: unknown[]) => (real as never as Record<string, (...x: unknown[]) => unknown>).failClaim(...a),
+      deferClaim: (...a: unknown[]) => (real as never as Record<string, (...x: unknown[]) => unknown>).deferClaim(...a),
+      heartbeat: (...a: unknown[]) => (real as never as Record<string, (...x: unknown[]) => unknown>).heartbeat(...a),
+    } as unknown as Queue;
+
+    const claims: string[] = [];
+    const held = gate();
+    const runner = createQueueRunner({
+      queue: proxy,
+      handlers: {
+        'q.first': async () => { await held.wait; },
+        'q.sibling': async () => { await held.wait; },
+      },
+      owner: 'w1', leaseSeconds: 30, pollMs: 1000, concurrency: 2,
+      onEvent: (e) => { if (e.kind === 'claimed') claims.push(e.queueName); },
+    });
+
+    await runner.tick();
+    await until(() => claims.length >= 2);
+    held.open();
+    await runner.stop();
+
+    // cap = 1, so pass 1 takes one q.first and finds q.sibling empty. The
+    // leftover slot must then go to q.sibling. Starting the leftover pass at
+    // offset 0 would hand it straight back to q.first.
+    expect(claims).toEqual(['q.first', 'q.sibling']);
+  });
+
   it('counts leftover-pass claims in the tick result, which drives the poll backoff', async () => {
     // `queueRunnerTick` returns `processed > 0`; a tick whose only claims came
     // from the leftover pass reporting 0 would let `nextPollDelayMs` back the

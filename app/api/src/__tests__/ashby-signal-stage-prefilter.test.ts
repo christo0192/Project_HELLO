@@ -409,6 +409,41 @@ describe('buildAshbyHandlers — the pre-filter is actually WIRED, and built onc
     expect(reads.n).toBe(1);
   });
 
+  it('runs the REAL mismatch observer, asking both halves of the question', async () => {
+    // Every other observer test injects its own callback, so the production
+    // one in buildAshbyHandlers could be deleted with the suite green — and it
+    // is the gate `config.ts` names for enabling the feature.
+    //
+    // A skip happens iff the HINT is unmapped. Asking only "is the
+    // authoritative stage mapped?" fires hardest while the filter is failing
+    // open (its backoff window answers true for everything), i.e. exactly when
+    // no skip was possible. Both halves must be asked.
+    const asked: string[] = [];
+    const handlers = buildAshbyHandlers(stubRuntime({ n: 0 }, { n: 0 }), {
+      stageInterest: (stageId) => { asked.push(stageId); return stageId === AI_STAGE; },
+      stagePrefilterEnabled: false,   // observer runs even with the skip off
+    });
+    // Hint says an unmapped stage; the stub client reports the AI stage.
+    await handlers[ASHBY_SIGNAL_QUEUE]!(signalJob(UNMAPPED_STAGE));
+    await new Promise((r) => setTimeout(r, 0));   // let the fire-and-forget settle
+
+    // Both halves consulted: the hint (would a skip have been taken?) and the
+    // authoritative stage (would it have dropped a screenable candidate?).
+    expect(asked).toContain(UNMAPPED_STAGE);
+    expect(asked).toContain(AI_STAGE);
+  });
+
+  it('does not run the observer when hint and authoritative agree', async () => {
+    const asked: string[] = [];
+    const handlers = buildAshbyHandlers(stubRuntime({ n: 0 }, { n: 0 }), {
+      stageInterest: (stageId) => { asked.push(stageId); return true; },
+      stagePrefilterEnabled: false,
+    });
+    await handlers[ASHBY_SIGNAL_QUEUE]!(signalJob(AI_STAGE));
+    await new Promise((r) => setTimeout(r, 0));
+    expect(asked).toEqual([]);
+  });
+
   it('registers all three Ashby queues, signal first — the starvation precondition', async () => {
     const handlers = buildAshbyHandlers(stubRuntime({ n: 0 }, { n: 0 }));
     // Documents WHY the runner fairness fix in this same change is required:
