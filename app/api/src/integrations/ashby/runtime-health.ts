@@ -374,6 +374,23 @@ export interface BacklogView {
   /** Resume ingestions stranded in `fetching` past the stuck window. */
   ingestionStuckFetching: number;
   /**
+   * Resume ingestions stranded in `scanning`, `extracting` or `structuring`
+   * past the stuck window (0097).
+   *
+   * These three are the states a DEAD PROCESS leaves behind, and before 0097
+   * they were the only ones with no counter — so the surface watched the two
+   * states that self-heal (`queued`, `fetching`) and was blind to the three
+   * that deadlock. Two résumés sat stuck in `scanning` on 2026-09-16 with
+   * /health reporting an ordinary backlog and nobody paged.
+   *
+   * Counted separately rather than folded into one number: `scanning` is a
+   * dead antivirus pass, `extracting` a dead parse, `structuring` a dead model
+   * structurer, and which one is climbing says which stage is dying.
+   */
+  ingestionStuckScanning: number;
+  ingestionStuckExtracting: number;
+  ingestionStuckStructuring: number;
+  /**
    * Resume ingestions rested in `failed_review` on a PARSE-class reason, on a
    * non-terminal link.
    *
@@ -415,7 +432,9 @@ const EMPTY_BACKLOG: BacklogView = {
   operationsPending: 0, operationsFailed: 0, operationsAwaitingDelivery: 0,
   operationsBlockedPrerequisite: 0, operationsBlockedFailedIngestion: 0,
   operationsFailedPrerequisite: 0,
-  ingestionStuckQueued: 0, ingestionStuckFetching: 0, ingestionFailedParse: 0,
+  ingestionStuckQueued: 0, ingestionStuckFetching: 0,
+  ingestionStuckScanning: 0, ingestionStuckExtracting: 0, ingestionStuckStructuring: 0,
+  ingestionFailedParse: 0,
   scannerDeferredJobs: 0, scannerDeferredOldestAgeSec: null,
   writebackPending: 0, reconcileNoProgressRuns: 0, reconcileLastSuccessAt: null,
 };
@@ -537,6 +556,9 @@ export async function readBacklog(
     operationsFailedPrerequisite: counter('failed_prerequisite'),
     ingestionStuckQueued: counter('ingestion_stuck_queued'),
     ingestionStuckFetching: counter('ingestion_stuck_fetching'),
+    ingestionStuckScanning: counter('ingestion_stuck_scanning'),
+    ingestionStuckExtracting: counter('ingestion_stuck_extracting'),
+    ingestionStuckStructuring: counter('ingestion_stuck_structuring'),
     ingestionFailedParse: counter('ingestion_failed_parse'),
     scannerDeferredJobs, scannerDeferredOldestAgeSec,
     reconcileNoProgressRuns: typeof cp?.no_progress_runs === 'number' ? cp.no_progress_runs : 0,
@@ -704,7 +726,14 @@ export function evaluateDegradation(input: {
   // A stranded ingestion is the failure shape the live canary produced, and it
   // had no health signal at all: the durable row sat in `queued` forever while
   // /health reported a perfectly ordinary backlog.
+  //
+  // 0097 adds the three MID-FLIGHT states to this sum. They belong in the same
+  // reason because the operator action is identical (a row is not moving), and
+  // leaving them out would have reproduced the original defect one level up:
+  // new counters that nothing ever degrades on are just a prettier silence.
   if (input.backlog.ingestionStuckQueued + input.backlog.ingestionStuckFetching
+      + input.backlog.ingestionStuckScanning + input.backlog.ingestionStuckExtracting
+      + input.backlog.ingestionStuckStructuring
       >= DEGRADE_THRESHOLDS.ingestionStuck) {
     reasons.push('ingestion_stuck');
   }

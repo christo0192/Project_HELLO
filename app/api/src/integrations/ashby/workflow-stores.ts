@@ -257,6 +257,27 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         attempts: typeof row?.attempts === 'number' ? row.attempts : undefined,
       };
     },
+    async resumeIngestionMidflight(
+      applicationLinkId,
+      reasonCode,
+    ): Promise<{ status: string; attempts?: number; fromState?: string }> {
+      // The ONLY door through which `structuring -> queued` is reachable, and
+      // the sanctioned one for `scanning`/`extracting` when the owning process
+      // died. The RPC re-checks the state server-side, refuses terminal
+      // applications, and charges the same 5-attempt requeue budget every
+      // other requeue does — this seam does not get to decide any of that.
+      const { data, error } = await client.rpc('resume_ashby_ingestion_midflight', {
+        p_application_link_id: applicationLinkId,
+        p_reason: reasonCode,
+      });
+      if (error) throw new Error('ashby_ingestion_midflight_resume_error');
+      const row = data as { attempts?: unknown; from_state?: unknown } | null;
+      return {
+        status: statusOf(data),
+        attempts: typeof row?.attempts === 'number' ? row.attempts : undefined,
+        fromState: typeof row?.from_state === 'string' ? row.from_state : undefined,
+      };
+    },
     async claimOperation(operationType, owner, leaseSeconds): Promise<OperationClaimRow | null> {
       const { data, error } = await client.rpc('claim_ashby_operation', {
         p_operation_type: operationType,

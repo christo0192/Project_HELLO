@@ -18,6 +18,7 @@
 
 import { describe, it, expect } from 'vitest';
 import { readBacklog, DEGRADE_THRESHOLDS, evaluateDegradation } from '../integrations/ashby/runtime-health.js';
+import type { BacklogView } from '../integrations/ashby/runtime-health.js';
 import {
   buildAshbyHandlers,
   ASHBY_INGESTION_QUEUE,
@@ -254,5 +255,70 @@ describe('worker → health seam: a deferred job is COUNTED as deferred', () => 
     }), Date.parse('2026-08-19T00:20:00.000Z'));
 
     expect(backlog.scannerDeferredJobs).toBe(0);
+  });
+});
+
+/**
+ * 0097 — the three mid-flight states became visible.
+ *
+ * Before 0097 the surface counted `queued` and `fetching` (which self-heal) and
+ * nothing else, so a row deadlocked in `scanning`/`extracting`/`structuring`
+ * was invisible to /health by construction — which is how two résumés sat stuck
+ * with nobody paged. These assert BOTH halves that can silently drift apart:
+ * the RPC key → field mapping, and that a non-zero count actually degrades. A
+ * counter nothing degrades on is just a prettier silence.
+ */
+describe('0097 - mid-flight stuck ingestions are counted and degrade', () => {
+  const EMPTY = {
+    job_queue: [], job_dlq: [], ashby_operations: [],
+    ashby_application_links: [], ashby_sync_checkpoints: [],
+  };
+
+  /** A zeroed backlog with exactly one counter raised to the degrade bound. */
+  function stuckBacklog(field: string): BacklogView {
+    return {
+      queuePending: 0, dlqDepth: 0, oldestPendingAgeSec: null,
+      operationsPending: 0, operationsFailed: 0, operationsAwaitingDelivery: 0,
+      operationsBlockedPrerequisite: 0, operationsBlockedFailedIngestion: 0,
+      operationsFailedPrerequisite: 0,
+      ingestionStuckQueued: 0, ingestionStuckFetching: 0,
+      ingestionStuckScanning: 0, ingestionStuckExtracting: 0, ingestionStuckStructuring: 0,
+      ingestionFailedParse: 0,
+      scannerDeferredJobs: 0, scannerDeferredOldestAgeSec: null,
+      writebackPending: 0, reconcileNoProgressRuns: 0, reconcileLastSuccessAt: null,
+      [field]: DEGRADE_THRESHOLDS.ingestionStuck,
+    } as BacklogView;
+  }
+
+  it.each([
+    ['ingestion_stuck_scanning', 'ingestionStuckScanning'],
+    ['ingestion_stuck_extracting', 'ingestionStuckExtracting'],
+    ['ingestion_stuck_structuring', 'ingestionStuckStructuring'],
+  ])('maps the %s RPC key onto %s', async (rpcKey, field) => {
+    // A typo on either side reads as a permanent 0 — the exact "guard that
+    // cannot fire" shape. Asserting the KEY, not just the field, is the point.
+    const backlog = await readBacklog(makeClient(EMPTY, { [rpcKey]: 3 }));
+    expect(backlog[field as keyof typeof backlog]).toBe(3);
+  });
+
+  it('a mid-flight key the RPC does not send reads as 0, not undefined', async () => {
+    const backlog = await readBacklog(makeClient(EMPTY, {}));
+    expect(backlog.ingestionStuckScanning).toBe(0);
+    expect(backlog.ingestionStuckExtracting).toBe(0);
+    expect(backlog.ingestionStuckStructuring).toBe(0);
+  });
+
+  it.each([
+    'ingestionStuckScanning',
+    'ingestionStuckExtracting',
+    'ingestionStuckStructuring',
+  ])('degrades on %s alone', (field) => {
+    const v = evaluateDegradation({
+      active: true,
+      scheduler: { registeredInThisProcess: false, running: false, loops: [] },
+      backlog: stuckBacklog(field),
+    });
+    expect(v.status).toBe('degraded');
+    expect(v.reasons).toContain('ingestion_stuck');
   });
 });

@@ -214,6 +214,33 @@ export interface RuntimeWorkflowStores extends WorkflowStores {
     applicationLinkId: string,
     reasonCode: string,
   ): Promise<{ status: string; attempts?: number }>;
+  /**
+   * Return an ingestion stranded in `scanning`, `extracting` or `structuring`
+   * to `queued` because the PROCESS THAT OWNED IT DIED — a deploy, a restart,
+   * an OOM — never because of anything learned about the document.
+   *
+   * A SEPARATE seam from `advanceIngestion` for the same reason
+   * `deferIngestionParse` is one: these three edges may only be taken by a
+   * caller that knows the previous run is gone. The generic path keeps
+   * refusing them, so a redelivered webhook cannot walk a live ingestion
+   * backwards mid-download.
+   *
+   * `queued` and `fetching` are deliberately NOT recoverable here — they
+   * already self-heal (`queued -> fetching` is legal, `fetching -> fetching`
+   * is an idempotent no-op), and accepting them would let one worker yank a
+   * healthy in-flight row out from under another.
+   *
+   * The 0032 five-attempt ceiling is NOT relaxed: this charges an attempt like
+   * every other requeue and answers `retry_exhausted` at the bound.
+   *
+   * Optional so existing fakes compile; the worker fails LOUDLY (a durable
+   * `failed_review`) when it is absent rather than silently completing a job
+   * whose row can never advance — which is the exact defect 0097 exists to fix.
+   */
+  resumeIngestionMidflight?(
+    applicationLinkId: string,
+    reasonCode: string,
+  ): Promise<{ status: string; attempts?: number; fromState?: string }>;
   /** Park a completed application as `writeback_pending` (audited, idempotent). */
   markWritebackPending(applicationLinkId: string, reason: string): Promise<{ status: string }>;
   /** Materialize/adopt the phone-primary engagement after resume readiness. */

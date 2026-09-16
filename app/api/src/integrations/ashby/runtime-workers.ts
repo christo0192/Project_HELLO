@@ -126,6 +126,55 @@ export const ASHBY_INGESTION_QUEUE = 'ashby.ingestion';
 export const TERMINAL_INGESTION_STATES: ReadonlySet<string> = new Set(['ready', 'cancelled']);
 
 /**
+ * The states a DEAD PROCESS can strand a row in (RCA 2026-09-16, 0097).
+ *
+ * A run that is killed between `onState('scanning')` and its verdict — a
+ * deploy, a restart, an OOM — leaves the durable row in one of these three.
+ * None of them can reach `fetching`, which is the handler's only entry
+ * transition, so before 0097 every subsequent retry died on
+ * `invalid_transition` and returned bare: the JOB was marked completed and the
+ * ROW was frozen for ever, with no failure reason and no health counter.
+ *
+ * `queued` and `fetching` are deliberately absent. They already self-heal —
+ * `queued -> fetching` is legal and `fetching -> fetching` is an idempotent
+ * no-op that answers ok — so a row there needs no rescue, and rescuing it
+ * anyway would let one worker yank a live download out from under another.
+ * That asymmetry is exactly why the pre-0097 health surface (which counted
+ * only `queued` and `fetching`) was blind to every row that could actually
+ * deadlock.
+ */
+export const MIDFLIGHT_INGESTION_STATES: ReadonlySet<string> = new Set([
+  'scanning', 'extracting', 'structuring',
+]);
+
+/** Reason passed to the audited mid-flight resume RPC. Never PII. */
+export const MIDFLIGHT_RESUME_REASON = 'ingestion_midflight_restart';
+
+/**
+ * Durable rest when a mid-flight row cannot be returned to `queued`.
+ *
+ * Distinct codes rather than one: `retry_exhausted` means the row has burned
+ * its 0032 budget dying mid-flight and wants a human, while a refusal or a
+ * missing seam means the RECOVERY PATH is broken, which is a different page.
+ */
+export const MIDFLIGHT_RESUME_EXHAUSTED_REASON = 'ingestion_midflight_exhausted';
+export const MIDFLIGHT_RESUME_REFUSED_REASON = 'ingestion_midflight_refused';
+export const MIDFLIGHT_RESUME_UNAVAILABLE_REASON = 'ingestion_midflight_unavailable';
+
+/**
+ * Durable rest when the `-> fetching` entry transition is refused.
+ *
+ * Before 0097 this path was a bare `return`, which is how a refused entry
+ * became a SILENTLY COMPLETED job. A cancelled application is the one benign
+ * case and stays silent (the row is terminal and there is genuinely no work);
+ * everything else is now written down.
+ */
+export const FETCHING_ENTRY_REFUSED_REASON = 'ingestion_entry_refused';
+
+/** Durable rest when a scanner-deferral requeue is refused for any other reason. */
+export const DEFER_REQUEUE_REFUSED_REASON = 'scan_defer_requeue_refused';
+
+/**
  * Default wait between scanner-readiness deferrals.
  *
  * freshclam's first successful update after a cold boot is a matter of tens of
@@ -508,6 +557,48 @@ export function buildAshbyHandlers(
       // row for every link including this one.
       if (!link.externalResumeFileHandle) return;
 
+      /** Record a durable, sanitized ingestion failure. Best effort. */
+      const failIngestion = async (reason: string): Promise<void> => {
+        try {
+          await runtime.stores.advanceIngestion(linkId, 'failed_review', { failedReason: reason });
+        } catch { /* the queue outcome below is the authoritative signal */ }
+      };
+
+      // ── Mid-flight rescue: a previous run of THIS job died in place ──────
+      // Declared before the scanner gate so the row is back at `queued` by the
+      // time the gate can defer — the gate's contract ("the ingestion row stays
+      // `queued`") is only true if we got it there first.
+      //
+      // Reaching here with a mid-flight state means no live worker owns the
+      // row: this job holds the only lease for this link, and the states in
+      // `MIDFLIGHT_INGESTION_STATES` are reachable solely from inside a run.
+      // So the owning process is gone, and the row must be walked back to
+      // `queued` or the `-> fetching` entry below is refused for ever.
+      if (current && MIDFLIGHT_INGESTION_STATES.has(current.state)) {
+        // No seam ⇒ no way to record the rescue ⇒ do not pretend to take one.
+        // Resting loudly beats the pre-0097 behaviour of completing the job and
+        // abandoning the row in silence.
+        if (!runtime.stores.resumeIngestionMidflight) {
+          await failIngestion(MIDFLIGHT_RESUME_UNAVAILABLE_REASON);
+          return;
+        }
+        const resumed = await runtime.stores.resumeIngestionMidflight(
+          linkId, MIDFLIGHT_RESUME_REASON,
+        );
+        if (resumed.status !== 'ok') {
+          // `blocked_terminal` is the one benign refusal: the application was
+          // withdrawn while the row sat stranded, so there is genuinely no work
+          // and nothing to rest. Everything else is written down.
+          if (resumed.status === 'blocked_terminal') return;
+          await failIngestion(
+            resumed.status === 'retry_exhausted'
+              ? MIDFLIGHT_RESUME_EXHAUSTED_REASON
+              : MIDFLIGHT_RESUME_REFUSED_REASON,
+          );
+          return;
+        }
+      }
+
       // ── Scanner readiness: the LAST free moment to decide not to start ──
       // Checked here, while the durable row is still `queued` and before ANY
       // provider call, because this is the only point at which "not yet" is
@@ -551,16 +642,21 @@ export function buildAshbyHandlers(
       // so the security rationale for late resolution is untouched.
       const started = await runtime.stores.advanceIngestion(linkId, 'fetching');
       if (started.status !== 'ok') {
-        // A concurrent cancel or an illegal transition: not our work to do.
+        // NEVER a bare return. This exact line — "not our work to do" — is how
+        // two résumés were lost on 2026-09-16: the row was `scanning`, the
+        // entry transition was refused as `invalid_transition`, and the job
+        // reported SUCCESS while the row stayed frozen with no reason recorded
+        // anywhere. The mid-flight rescue above now removes the cause; this
+        // records whatever is left so the next unknown refusal is visible on
+        // the FIRST occurrence instead of being inferred from a silent row.
+        //
+        // A concurrent cancel is the one benign case: the row is terminal, the
+        // application is gone, and there is genuinely nothing to rest.
+        const settled = await runtime.stores.readIngestion(linkId).catch(() => null);
+        if (settled && TERMINAL_INGESTION_STATES.has(settled.state)) return;
+        await failIngestion(FETCHING_ENTRY_REFUSED_REASON);
         return;
       }
-
-      /** Record a durable, sanitized ingestion failure. Best effort. */
-      const failIngestion = async (reason: string): Promise<void> => {
-        try {
-          await runtime.stores.advanceIngestion(linkId, 'failed_review', { failedReason: reason });
-        } catch { /* the queue outcome below is the authoritative signal */ }
-      };
 
       let built;
       try {
@@ -715,7 +811,17 @@ export function buildAshbyHandlers(
           // `retry_exhausted` (the 0032 ceiling) or a concurrent cancel. The
           // row cannot go back, so resting it loudly beats deferring a job
           // whose durable state can never advance again.
-          if (requeued.status === 'retry_exhausted') await failIngestion(DEFER_EXHAUSTED_REASON);
+          if (requeued.status === 'retry_exhausted') {
+            await failIngestion(DEFER_EXHAUSTED_REASON);
+            return;
+          }
+          // Every OTHER refusal used to return bare, leaving the row parked in
+          // `scanning` with the job reporting success — the same silent-loss
+          // shape 0097 exists to close. A cancelled application is the one
+          // benign case; anything else is written down.
+          const settled = await runtime.stores.readIngestion(linkId).catch(() => null);
+          if (settled && TERMINAL_INGESTION_STATES.has(settled.state)) return;
+          await failIngestion(DEFER_REQUEUE_REFUSED_REASON);
           return;
         }
         return {
