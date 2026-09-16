@@ -20,11 +20,8 @@
  * across this codebase). A structural type also makes it trivially stubbable.
  */
 export interface FunnelReader {
-  from(table: string): {
-    select(columns: string): {
-      gte(column: string, value: string): any;
-    };
-  };
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  from(table: string): any;
 }
 
 /**
@@ -61,6 +58,8 @@ export interface FunnelSummaryInput {
   from?: string;
   to?: string;
   roleId?: string;
+  /** Reported as `meta.refresh_window_days`; purely informational. */
+  refreshWindowDays?: number;
   /**
    * Drop the per-day latency percentiles from `series`.
    *
@@ -73,12 +72,50 @@ export interface FunnelSummaryInput {
   omitTimings?: boolean;
 }
 
+/**
+ * Facts the UI must NOT infer.
+ *
+ * Every guard in the dashboard that tried to deduce these from the numbers got
+ * it wrong for the configuration this system actually ships with — an empty
+ * date range looked identical to "never computed", and a mapping with a NULL
+ * `reference_check_stage_id` produced `hr_awaiting > 0`, which defeated the
+ * "unconfigured" check and rendered a structurally-unreachable "0 advanced /
+ * 0 not advanced" as measured fact. These are stated, not guessed.
+ */
+export interface FunnelMeta {
+  /**
+   * Any ENABLED mapping carries a `reference_check_stage_id`. False means HR
+   * disposition cannot be observed at all, so the HR cards must say
+   * "not tracked" rather than render zeros.
+   */
+  hr_tracking_configured: boolean;
+  /**
+   * False when 0098's columns are missing — i.e. the API shipped ahead of the
+   * migration. The HR and candidate-total figures are then absent, NOT zero,
+   * and the UI must suppress them instead of printing a fabricated 0.
+   */
+  schema_current: boolean;
+  /**
+   * When the ROLL-UP last ran, read from the table as a whole — not from the
+   * rows in this window. A quiet week returns no rows, and inferring freshness
+   * from that announced "never calculated" about a roll-up that ran an hour ago.
+   */
+  rollup_refreshed_at: string | null;
+  /**
+   * The trailing window each recompute reaches back over. Days older than this
+   * are frozen at their last recompute: HR disposition changes weeks after
+   * intake, so a longer range shows stale HR counts for its older portion.
+   */
+  refresh_window_days: number;
+}
+
 export interface FunnelSummary {
   range: { from: string; to: string };
   totals: Record<string, number>;
   conversions: Record<string, number | null>;
   series: Array<Record<string, unknown>>;
   refreshed_at: string | null;
+  meta: FunnelMeta;
 }
 
 /** Fields 0098 adds. Absent until that migration is applied. */
@@ -125,6 +162,53 @@ export async function loadFunnelSummary(
     return q;
   };
 
+  // ── The two facts the UI must not infer, started BEFORE the main read ──
+  // Both are independent of the window query and of each other, so they fly
+  // alongside it rather than adding two serial round-trips to every dashboard
+  // load. Each is bounded, and each degrades to the CONSERVATIVE answer — not
+  // configured / freshness unknown — never to a confident one, because a
+  // wrongly-confident `true` here would license the UI to print structural
+  // zeros as measurement.
+  const hrTrackingConfiguredP: Promise<boolean> = (async () => {
+    try {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      let mq: any = supabase
+        .from('ashby_job_mappings')
+        .select('external_job_id')
+        .eq('provider', 'ashby')
+        .eq('status', 'enabled')
+        .not('reference_check_stage_id', 'is', null)
+        .limit(1);
+      // Scoped to the filtered role: an org where ONE of ten roles is wired
+      // must not report the HR band as configured on the other nine.
+      if (input.roleId) mq = mq.eq('role_id', input.roleId);
+      const { data: mapRows, error: mapErr } = await mq;
+      return !mapErr && Array.isArray(mapRows) && mapRows.length > 0;
+    } catch {
+      return false;
+    }
+  })();
+
+  const rollupRefreshedAtP: Promise<string | null> = (async () => {
+    try {
+      // The whole table, not this window: an empty range says nothing about
+      // whether the roll-up has ever run, and reading freshness off the
+      // returned slice told a quiet week it had never been calculated.
+      const { data: freshRows, error: freshErr } = await supabase
+        .from('funnel_stage_daily')
+        .select('refreshed_at')
+        .order('refreshed_at', { ascending: false })
+        .limit(1);
+      if (!freshErr && Array.isArray(freshRows) && freshRows.length > 0) {
+        return (freshRows[0] as { refreshed_at?: string }).refreshed_at ?? null;
+      }
+      return null;
+    } catch {
+      return null;
+    }
+  })();
+
+  let schemaCurrent = true;
   let { data, error } = await run(SELECT_COLUMNS);
   // SCHEMA SKEW. The API image and the migration ship separately in this
   // project, and migrations are an operator-gated step that has lagged before.
@@ -134,6 +218,7 @@ export async function loadFunnelSummary(
   // to the 0090 column set and report the new fields as zero, which is exactly
   // what they are until the rollup is recomputed.
   if (error && isUndefinedColumn(error)) {
+    schemaCurrent = false;
     ({ data, error } = await run(SELECT_COLUMNS_LEGACY));
   }
   if (error) throw new Error('failed to load funnel summary');
@@ -147,6 +232,11 @@ export async function loadFunnelSummary(
     const ra = r.refreshed_at as string | null | undefined;
     if (ra && (!refreshedAt || ra > refreshedAt)) refreshedAt = ra;
   }
+
+  const [hrTrackingConfigured, rollupRefreshedAt] = await Promise.all([
+    hrTrackingConfiguredP,
+    rollupRefreshedAtP,
+  ]);
 
   const ratio = (num: number, den: number): number | null => (den > 0 ? num / den : null);
   const conversions = {
@@ -203,5 +293,17 @@ export async function loadFunnelSummary(
       return rest;
     });
 
-  return { range: { from, to }, totals, conversions, series, refreshed_at: refreshedAt };
+  return {
+    range: { from, to },
+    totals,
+    conversions,
+    series,
+    refreshed_at: refreshedAt,
+    meta: {
+      hr_tracking_configured: hrTrackingConfigured,
+      schema_current: schemaCurrent,
+      rollup_refreshed_at: rollupRefreshedAt,
+      refresh_window_days: input.refreshWindowDays ?? 30,
+    },
+  };
 }

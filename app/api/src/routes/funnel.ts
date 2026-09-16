@@ -26,6 +26,7 @@ import { requireRole } from '../lib/rbac.js';
 import { validateQuery } from '../lib/validation.js';
 import { funnelSummaryQuerySchema } from '../schemas/funnel.js';
 import { loadFunnelSummary } from '../lib/funnel/summary.js';
+import { env } from '../lib/env.js';
 
 export const funnelRouter = Router();
 
@@ -48,6 +49,7 @@ funnelRouter.get(
         // Per-day latency percentiles are not aggregated on a role-filtered
         // day and can describe a single candidate. Admin keeps them.
         omitTimings: true,
+        refreshWindowDays: env.funnelRollupWindowDays,
       });
       res.json(summary);
     } catch {

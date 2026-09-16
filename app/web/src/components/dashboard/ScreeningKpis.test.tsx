@@ -58,7 +58,7 @@ function totalsOf(overrides: Record<string, number> = {}) {
 
 function funnel(
   overrides: Record<string, number> = {},
-  opts: { series?: any[]; refreshedAt?: string | null } = {},
+  opts: { series?: any[]; refreshedAt?: string | null; meta?: any } = {},
 ) {
   const totals = totalsOf(overrides);
   return {
@@ -74,9 +74,17 @@ function funnel(
           : null,
     },
     series: opts.series ?? [],
-    // Default to a REAL timestamp: `null` means "never computed", which is its
-    // own state and must not be the silent default every test runs under.
     refreshed_at: opts.refreshedAt === undefined ? '2026-09-16T06:00:00Z' : opts.refreshedAt,
+    // The panel reads these instead of inferring state from the numbers.
+    // Default is a healthy, fully-configured tenant so a test that cares about
+    // a degraded state has to say so explicitly.
+    meta: {
+      hr_tracking_configured: true,
+      schema_current: true,
+      rollup_refreshed_at: '2026-09-16T06:00:00Z',
+      refresh_window_days: 30,
+      ...(opts.meta ?? {}),
+    },
   };
 }
 
@@ -128,20 +136,53 @@ describe('ScreeningKpis', () => {
     ).toBeInTheDocument();
   });
 
-  it('shows the HR band as unconfigured rather than as a wall of zeros', async () => {
-    // Nothing observable in Ashby: reference_check_stage_id is unwired. Zeros
-    // here would read as "the team rejected everyone and has an empty queue",
-    // off a configuration gap.
-    getScreeningFunnel.mockResolvedValue(funnel({ scored: 9, hr_unknown: 9 }));
+  it('hides the HR band when Ashby stage tracking is not configured', async () => {
+    // THE shape that defeated the previous guard: `reference_check_stage_id`
+    // is NULL (how 0090 ships it), so no HR DECISION is reachable — but
+    // candidates still sit in the screening stage, so `hr_awaiting > 0`.
+    // Inferring "configured" from "some state is non-zero" rendered
+    // "Advanced 0 / Not advanced 0" as measured fact. The API now says so.
+    getScreeningFunnel.mockResolvedValue(
+      funnel(
+        { scored: 9, hr_awaiting: 9 },
+        { meta: { hr_tracking_configured: false } },
+      ),
+    );
     renderKpis();
 
     expect(await screen.findByText(/Not tracked yet/i)).toBeInTheDocument();
     // The definitions list still documents the card; what must be absent is
-    // the CARD itself, showing a fabricated 0%.
+    // the CARD itself showing a fabricated 0%.
     const cards = screen.queryAllByText('Advance rate').filter((n) => !n.closest('details'));
     expect(cards).toHaveLength(0);
-    expect(screen.getByText(/9 screened candidates are waiting on that link/i))
-      .toBeInTheDocument();
+  });
+
+  it('hides candidate totals and the HR band when the server predates the migration', async () => {
+    // The 42703 fallback zero-fills 0098's columns. Rendering those zeros
+    // would put "Total candidates 0" beside "Candidates dialled 80" — a funnel
+    // narrower at the top than the middle — under a fresh timestamp.
+    getScreeningFunnel.mockResolvedValue(
+      funnel({ dialed: 80, connected: 20 }, { meta: { schema_current: false } }),
+    );
+    renderKpis();
+
+    expect(await screen.findByText(/older database version/i)).toBeInTheDocument();
+    const totals = screen.queryAllByText('Total candidates').filter((n) => !n.closest('details'));
+    expect(totals).toHaveLength(0);
+    const rates = screen.queryAllByText('Advance rate').filter((n) => !n.closest('details'));
+    expect(rates).toHaveLength(0);
+  });
+
+  it('does not call an EMPTY window "never calculated"', async () => {
+    // A quiet week returns no rows, so the window has no timestamp — but the
+    // roll-up ran an hour ago. Inferring freshness from the returned slice
+    // announced that a working system had never computed anything.
+    getScreeningFunnel.mockResolvedValue(
+      funnel({}, { refreshedAt: null, meta: { rollup_refreshed_at: '2026-09-16T06:00:00Z' } }),
+    );
+    renderKpis();
+    await screen.findAllByText('Total candidates');
+    expect(screen.queryAllByText(/have not been calculated yet/i)).toHaveLength(0);
   });
 
   it('computes the advance rate over decided candidates only', async () => {
@@ -215,18 +256,39 @@ describe('ScreeningKpis', () => {
 
   // ── States that must not look like data ───────────────────────────────
 
-  it('says so when the figures have never been calculated', async () => {
-    // All-zero with refreshed_at null is "not computed", not "nothing
-    // happened" — and those must not look identical.
-    getScreeningFunnel.mockResolvedValue(funnel({}, { refreshedAt: null }));
+  it('says so when the roll-up has genuinely never run', async () => {
+    getScreeningFunnel.mockResolvedValue(
+      funnel({}, { refreshedAt: null, meta: { rollup_refreshed_at: null } }),
+    );
     renderKpis();
-    expect(await screen.findByText(/have not been calculated yet/i)).toBeInTheDocument();
+    // Stated up top, not only inside the collapsed explanation block — a reader
+    // must not have to expand anything to learn the numbers are not real yet.
+    const banners = (await screen.findAllByText(/have not been calculated yet/i))
+      .filter((n) => !n.closest('details'));
+    expect(banners).toHaveLength(1);
   });
 
-  it('shows when the figures were last calculated, without expanding anything', async () => {
+  it('shows freshness OUTSIDE the collapsed explanation block', async () => {
+    // jsdom renders <details> children regardless of open state, so a bare
+    // text query passes even if the line is buried inside it — where a reader
+    // would never see it.
     getScreeningFunnel.mockResolvedValue(funnel({ candidates_total: 4 }));
     renderKpis();
-    expect(await screen.findByText(/last recalculated/i)).toBeInTheDocument();
+    const line = await screen.findByText(/last recalculated/i);
+    expect(line.closest('details')).toBeNull();
+  });
+
+  it('warns that older days stop being recalculated on a long range', async () => {
+    // HR disposition changes weeks after intake, but the roll-up only
+    // recomputes a trailing window, so a 90-day view shows frozen HR counts
+    // for its older portion.
+    getScreeningFunnel.mockResolvedValue(
+      funnel({ candidates_total: 4 }, { meta: { refresh_window_days: 30 } }),
+    );
+    renderKpis();
+    await screen.findAllByText('Total candidates');
+    fireEvent.click(screen.getByRole('button', { name: '90 days' }));
+    expect(await screen.findByText(/no longer recalculated/i)).toBeInTheDocument();
   });
 
   it('renders nothing at all for a role that cannot read screening metrics', async () => {
@@ -239,16 +301,26 @@ describe('ScreeningKpis', () => {
   });
 
   it('survives a payload that predates the new fields', async () => {
-    // Web and API deploy independently; an older API omits hr_*/candidates_total
-    // entirely. Reading .toLocaleString() off undefined would throw during
-    // render and take the whole dashboard page down with it.
+    // Web and API deploy independently; an older API omits `meta` and the
+    // hr_*/candidates_total totals entirely. Reading `.toLocaleString()` off
+    // undefined would throw during render and take the whole dashboard page
+    // down with it — and with no `meta` to read, every derived fact has to fall
+    // back to "unknown", never to a confident zero.
     const legacy = funnel({ dialed: 5, connected: 3 });
+    delete (legacy as Record<string, unknown>).meta;
     delete (legacy.totals as Record<string, unknown>).hr_awaiting;
     delete (legacy.totals as Record<string, unknown>).hr_unknown;
     delete (legacy.totals as Record<string, unknown>).candidates_total;
     getScreeningFunnel.mockResolvedValue(legacy);
     renderKpis();
+
     expect(await cardText('Candidates dialled')).toContain('5');
+    // No `meta` ⇒ HR state is unknown, so the band must not render decisions.
+    expect(await screen.findByText(/Not tracked yet/i)).toBeInTheDocument();
+    const rates = screen.queryAllByText('Advance rate').filter((n) => !n.closest('details'));
+    expect(rates).toHaveLength(0);
+    // …and an absent `meta` is not evidence that nothing was ever computed.
+    expect(screen.queryAllByText(/have not been calculated yet/i)).toHaveLength(0);
   });
 
   // ── Charts ────────────────────────────────────────────────────────────
@@ -309,6 +381,84 @@ describe('ScreeningKpis', () => {
     const groups = await screen.findAllByRole('group');
     const named = groups.map((g) => g.getAttribute('aria-labelledby')).filter(Boolean);
     expect(named.length).toBeGreaterThanOrEqual(3);
+  });
+
+  it('does not let a 403 poison a load that overtakes it', async () => {
+    // `forbidden` is deliberately terminal for the mount — the range and role
+    // controls are inside the suppressed subtree, so there is nothing to retry
+    // with, and a 403 here is a fact about the viewer's role. What must NOT
+    // happen is a 403 arriving late and blanking a panel that has already
+    // rendered real figures: without `setForbidden(false)` per attempt the flag
+    // is sticky, and the reverse order would take a working panel away.
+    getScreeningFunnel.mockRejectedValueOnce(new FakeApiError('Insufficient permissions', 403));
+    getScreeningFunnel.mockResolvedValue(funnel({ candidates_total: 6 }));
+
+    // Second mount = the state the user lands in after a refresh.
+    const first = renderKpis();
+    await waitFor(() => expect(first.container.querySelector('section')).toBeNull());
+    first.unmount();
+
+    renderKpis();
+    expect((await screen.findAllByText('Total candidates')).length).toBeGreaterThan(0);
+  });
+
+  it('ignores a slow response that lands after a newer one', async () => {
+    // Click 90 days, then 7 before it returns. Without the sequence guard the
+    // 90-day payload repaints the panel while the control and the explanation
+    // notes both still read "7 days" — 90 days of numbers under a 7-day label,
+    // with nothing on screen indicating anything went wrong.
+    let releaseSlow: (v: unknown) => void = () => {};
+    const slow = new Promise((r) => { releaseSlow = r; });
+
+    getScreeningFunnel.mockReset();
+    getScreeningFunnel
+      .mockImplementationOnce(() => slow.then(() => funnel({ candidates_total: 900 })))
+      .mockResolvedValue(funnel({ candidates_total: 7 }));
+
+    renderKpis();
+    await waitFor(() => expect(getScreeningFunnel).toHaveBeenCalledTimes(1));
+
+    fireEvent.click(screen.getByRole('button', { name: '7 days' }));
+    await waitFor(() => expect(getScreeningFunnel).toHaveBeenCalledTimes(2));
+    expect(await cardText('Total candidates')).toContain('7');
+
+    // …now let the stale one land, and give its continuation real ticks to run
+    // so "nothing happened" means the guard fired, not that the test finished
+    // before the promise chain did.
+    releaseSlow(null);
+    for (let i = 0; i < 5; i += 1) await Promise.resolve();
+    await new Promise((r) => setTimeout(r, 0));
+
+    const card = await cardText('Total candidates');
+    expect(card).toContain('7');
+    expect(card).not.toContain('900');
+  });
+
+  it('requests exactly the number of days the control names', async () => {
+    // `dayOffset(rangeDays - 1)` — an off-by-one here silently widens every
+    // window by a day and nothing else would notice.
+    renderKpis();
+    await waitFor(() => expect(getScreeningFunnel).toHaveBeenCalled());
+    fireEvent.click(screen.getByRole('button', { name: '7 days' }));
+    await waitFor(() => expect(getScreeningFunnel).toHaveBeenCalledTimes(2));
+
+    const { from, to } = getScreeningFunnel.mock.calls[1][0];
+    const days = Math.round(
+      (Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000,
+    ) + 1;
+    expect(days).toBe(7);
+  });
+
+  it('never prints a negative count when the underlying figures disagree', async () => {
+    // `answered_ge1` and `connected` are independent columns; a crashed job can
+    // record answers on an attempt whose `answered_at` was never written.
+    getScreeningFunnel.mockResolvedValue(
+      funnel({ dialed: 10, connected: 3, answered_ge1: 5 }),
+    );
+    renderKpis();
+    const card = await cardText('Connected, no answers');
+    expect(card).not.toContain('-');
+    expect(card).toContain('0');
   });
 
   it('explains the metrics on the page, not in a wiki', async () => {

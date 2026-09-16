@@ -4843,6 +4843,51 @@ paths:
                 $ref: '#/components/schemas/ErrorBody'
 
   # ── Funnel observability (0090 / PR2): derived funnel views + rollup ──
+  # The same aggregation is served twice, from ONE implementation
+  # (lib/funnel/summary.ts), at two privilege levels. Only the RBAC gate and the
+  # per-day timing percentiles differ — see the note on /api/funnel/summary.
+  /api/funnel/summary:
+    get:
+      tags: [funnel]
+      operationId: getScreeningFunnelSummary
+      summary: Screening funnel topline for the recruiter dashboard — totals, step conversions, per-day series, and the meta facts the UI must not infer. Counts and opaque ids only, no PII. Interviewer and above.
+      description: Same aggregation as /api/admin/funnel/summary from the same implementation, with ONE deliberate difference — the per-day latency percentiles are omitted, because they are not aggregated when a single rollup row contributes to a day (which a role filter guarantees), so on a day that role saw one candidate they are that individual's time-to-first-connect.
+      parameters:
+        - name: from
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: to
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: role_id
+          in: query
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Funnel summary. meta states whether HR stage tracking is configured, whether the server carries 0098's columns, when the roll-up last ran, and the trailing window it recomputes — each a fact the dashboard renders rather than deduces from the counts.
+          content:
+            application/json:
+              schema:
+                type: object
+        '400':
+          description: Invalid date or role filter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Below interviewer — denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
   /api/admin/funnel/summary:
     get:
       tags: [admin]

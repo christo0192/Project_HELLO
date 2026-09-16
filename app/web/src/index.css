@@ -300,7 +300,16 @@
 
 @keyframes fade-up {
   from { opacity: 0; transform: translateY(8px); }
-  to { opacity: 1; transform: translateY(0); }
+  /* `transform: none`, NOT `translateY(0)`. These animations run with
+     `animation-fill-mode: both`, so the final keyframe's declarations are
+     retained forever — and a retained `translateY(0)` is still a transform,
+     which makes the element a CONTAINING BLOCK for any `position: fixed`
+     descendant (CSS Transforms L1 §3). A modal rendered anywhere inside a
+     `.fade-up` / `.fade-up-stagger` subtree would then size and centre itself
+     against that element instead of the viewport — appearing thousands of
+     pixels down a tall column, while the body scroll lock prevents scrolling
+     to it. `none` is visually identical and carries no containing block. */
+  to { opacity: 1; transform: none; }
 }
 
 @media (prefers-reduced-motion: reduce) {

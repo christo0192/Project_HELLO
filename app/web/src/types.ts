@@ -840,12 +840,21 @@ export interface FunnelDailyRow extends FunnelSummaryTotals {
   p95_ttfc_sec: number | null;
 }
 
+/** Facts the dashboard must be TOLD, never infer. See lib/funnel/summary.ts. */
+export interface FunnelMeta {
+  hr_tracking_configured: boolean;
+  schema_current: boolean;
+  rollup_refreshed_at: string | null;
+  refresh_window_days: number;
+}
+
 export interface FunnelSummaryResponse {
   range: { from: string; to: string };
   totals: FunnelSummaryTotals;
   conversions: FunnelConversions;
   series: FunnelDailyRow[];
   refreshed_at: string | null;
+  meta?: FunnelMeta;
 }
 
 export interface FunnelFailureGroup {

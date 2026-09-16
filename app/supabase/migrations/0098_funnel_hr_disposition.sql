@@ -20,9 +20,17 @@
 --
 --   qualified     current stage = mapping.reference_check_stage_id
 --   awaiting      current stage = mapping.ai_screening_stage_id  (untouched)
---   disqualified  bot-decided, and HR has moved them to some OTHER stage
+--   disqualified  bot-decided, HR moved them elsewhere, AND we can prove it:
+--                 the link carries a stage and the mapping names both stages
+--   unknown       bot-decided but the Ashby stage is NOT observable — no link
+--                 at all (every recruiter-uploaded résumé), a link whose stage
+--                 has not synced, or a mapping still missing a stage id
 --   null          the bot has not produced an assessment yet, so there is
 --                 nothing for HR to have acted on
+--
+-- `unknown` is the whole reason this is safe. An `else 'disqualified'` would
+-- absorb all three of those cases and report them as HR rejections, which is
+-- the artefact this migration exists to remove, not create.
 --
 -- KNOWN LIMIT, stated so nobody mistakes it for precision: the link carries
 -- only the CURRENT stage, not a stage history. A candidate promoted BEYOND
@@ -246,16 +254,50 @@ $$;
 revoke all on function screening_v2.refresh_funnel_rollup(timestamptz, integer) from public;
 grant execute on function screening_v2.refresh_funnel_rollup(timestamptz, integer) to service_role;
 
--- ── 4. Recompute the WHOLE history, not just the refresh loop's window ────
+-- ── 4. Backfill the new columns on EVERY existing row ────────────────────
 -- `add column … default 0` stamped a literal zero onto every pre-existing row,
--- and `refresh_funnel_rollup` only ever deletes-and-reinserts a trailing
--- window (30 days by default). Without this, any range longer than that window
--- sums real historical `qualified`/`dialed` counts against `candidates_total =
--- 0` and `hr_* = 0`: a funnel whose top is smaller than its middle, and an HR
--- backlog that reads as "fully caught up" — both vouched for by a fresh
--- `refreshed_at`. Ten years covers every row this table can hold.
+-- and `refresh_funnel_rollup` only ever recomputes a trailing window (30 days
+-- by default). Without a backfill, any range longer than that window sums real
+-- historical `qualified`/`dialed` counts against `candidates_total = 0` and
+-- `hr_* = 0` — a funnel whose top is smaller than its middle, vouched for by a
+-- fresh `refreshed_at`.
 --
--- Safe to re-run: the function is delete-then-insert over the same window and
--- takes an advisory lock, so a concurrent refresh returns `busy` rather than
--- double-counting.
-select screening_v2.refresh_funnel_rollup(now(), 3650);
+-- An UPDATE, deliberately NOT `refresh_funnel_rollup(now(), 3650)`:
+--
+--   * That function is delete-then-recompute FROM THE LIVE OPERATIONAL VIEWS,
+--     and 0090 states the rollup's purpose is to "survive operational-table
+--     retention" — it is a snapshot meant to outlive pruned source rows. A
+--     ten-year rebuild would silently shrink every historical day whose source
+--     rows have since been purged, irreversibly, from inside a migration.
+--   * It takes an advisory lock and returns `{"status":"busy"}` if another
+--     refresh holds it. A bare `select` would discard that and commit green
+--     with the whole history still at zero — and this migration's own
+--     `alter table` (ACCESS EXCLUSIVE) is what opens the window for a
+--     scheduled refresh to grab the lock first.
+--
+-- This touches ONLY the five new columns, leaves every 0090 counter exactly as
+-- recorded, and cannot half-apply: it is one statement in the migration's
+-- transaction.
+with agg as (
+  -- Both views are one row per candidate over the same `candidates` rows, so
+  -- one join gives every new counter in a single pass.
+  select v.cohort_day,
+         v.role_id,
+         count(*)                                           as candidates_total,
+         count(*) filter (where h.hr_state = 'qualified')    as hr_qualified,
+         count(*) filter (where h.hr_state = 'disqualified') as hr_disqualified,
+         count(*) filter (where h.hr_state = 'awaiting')     as hr_awaiting,
+         count(*) filter (where h.hr_state = 'unknown')      as hr_unknown
+    from screening_v2.v_funnel_candidate v
+    left join screening_v2.v_funnel_hr_state h on h.candidate_id = v.candidate_id
+   group by 1, 2
+)
+update screening_v2.funnel_stage_daily f
+   set candidates_total = agg.candidates_total,
+       hr_qualified     = agg.hr_qualified,
+       hr_disqualified  = agg.hr_disqualified,
+       hr_awaiting      = agg.hr_awaiting,
+       hr_unknown       = agg.hr_unknown
+  from agg
+ where agg.cohort_day = f.cohort_day
+   and agg.role_id is not distinct from f.role_id;

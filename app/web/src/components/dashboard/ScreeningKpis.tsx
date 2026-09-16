@@ -131,6 +131,11 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
     const seq = ++requestSeq.current;
     setLoading(true);
     setError(null);
+    // Cleared per attempt. A 403 from an earlier, overtaken request must not
+    // survive into a load that then succeeds — the flag hides the whole panel,
+    // so a sticky one would take a working dashboard away on the strength of a
+    // response the guard below has already decided to discard.
+    setForbidden(false);
     try {
       const res = await api.getScreeningFunnel({
         from: dayOffset(rangeDays - 1),
@@ -196,20 +201,29 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
   }, [data]);
 
   /**
-   * The rollup has never been computed. Rendering eleven confident zeros here
-   * is the single worst thing this panel could do: "0 candidates" and "not
-   * calculated yet" look identical, and the reader has no way to tell.
+   * Everything below is TOLD to us, never deduced from the numbers. Three
+   * separate attempts to infer these from the payload were each wrong for the
+   * configuration this system actually ships with:
+   *
+   *  - `refreshed_at === null` was read as "never computed". It actually means
+   *    "no rows in this window", so a quiet week or an unused role announced
+   *    that a roll-up which ran an hour ago had never run.
+   *  - "no observable HR states" was read as "not configured". But a mapping
+   *    with the NULL-by-default `reference_check_stage_id` still produces
+   *    `hr_awaiting > 0`, which defeated the check and rendered a
+   *    structurally-unreachable "0 advanced / 0 not advanced" as measurement.
+   *  - Missing 0098 fields were zero-filled, making a pre-migration API
+   *    indistinguishable from a genuinely empty pipeline.
    */
-  const neverComputed = data !== null && data.refreshed_at === null;
-
-  /**
-   * HR stage tracking is not wired. When no screened candidate's Ashby stage
-   * is observable, the HR cards can only ever be zero — which would read as
-   * "the team rejected everyone and has an empty queue" off a configuration
-   * gap. Show the band as unconfigured instead of showing false zeros.
-   */
-  const hrObservable = !!t && (t.hr_qualified + t.hr_disqualified + t.hr_awaiting) > 0;
-  const hrUnconfigured = !!t && !hrObservable && t.hr_unknown > 0;
+  const meta = data?.meta;
+  // Absent meta = an API older than this field. Treat every fact as unknown
+  // and suppress rather than assert.
+  const schemaCurrent = meta?.schema_current !== false;
+  const hrConfigured = meta?.hr_tracking_configured === true;
+  const rollupRefreshedAt = meta?.rollup_refreshed_at ?? null;
+  const neverComputed = data !== null && !!meta && rollupRefreshedAt === null;
+  const hrUnavailable = data !== null && (!schemaCurrent || !hrConfigured || !meta);
+  const staleBeyondDays = meta?.refresh_window_days ?? null;
 
   /**
    * Derived counts. Each is a subtraction of two sums from the same rollup
@@ -258,9 +272,15 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
     [rateSeries],
   );
 
-  const stale = data?.refreshed_at ?? null;
-
-  // Not an error state — this role simply does not have screening metrics.
+  /**
+   * Not an error state — this role simply cannot read screening metrics, so the
+   * panel is absent rather than broken. Terminal for this mount by design: the
+   * range and role controls live INSIDE the suppressed subtree, so there is no
+   * affordance to retry with, and 403 here is a property of the viewer's role
+   * rather than a transient fault. `setForbidden(false)` on each load still
+   * matters — it keeps a single 403 from poisoning a later successful fetch on
+   * the same mount, e.g. one triggered by a role or range change that raced it.
+   */
   if (forbidden) return null;
 
   return (
@@ -330,22 +350,35 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
         </InlineNotice>
       )}
 
-      {!error && !neverComputed && data?.refreshed_at && (
+      {!error && !neverComputed && rollupRefreshedAt && (
         <p className="mt-2 text-[12px] text-ink-secondary">
-          Figures last recalculated {new Date(data.refreshed_at).toLocaleString()}. Candidates
-          are counted on the day they entered, so the most recent days are still filling in.
+          Figures last recalculated {new Date(rollupRefreshedAt).toLocaleString()}. Candidates
+          are counted on the day they entered, so the most recent days are still filling in —
+          the last day or two always looks lower than it will end up.
+          {staleBeyondDays !== null && rangeDays > staleBeyondDays
+            ? ` Days older than ${staleBeyondDays} are no longer recalculated, so team-decision figures for the earlier part of this range may lag.`
+            : ''}
         </p>
+      )}
+
+      {!error && !schemaCurrent && (
+        <InlineNotice tone="warning" className="mt-2">
+          This server is running an older database version, so candidate totals and
+          team-decision figures are unavailable. They are hidden rather than shown as zero.
+        </InlineNotice>
       )}
 
       {!error && (
         <>
           <KpiBand title="Reach" hint="Getting to the candidate.">
-            <KpiCard
-              label="Total candidates"
-              value={t?.candidates_total ?? 0}
-              hint="In this date range"
-              loading={loading}
-            />
+            {schemaCurrent && (
+              <KpiCard
+                label="Total candidates"
+                value={t?.candidates_total ?? 0}
+                hint="Everyone who entered in this range"
+                loading={loading}
+              />
+            )}
             <KpiCard
               label="Candidates dialled"
               value={t?.dialed ?? 0}
@@ -391,7 +424,11 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
 
           <KpiBand
             title="Conversation"
-            hint={`What happened once they answered. These three add up to the ${(t?.dialed ?? 0).toLocaleString()} candidates dialled.`}
+            hint={
+              loading || !t
+                ? 'What happened once they answered.'
+                : `What happened once they answered, across the ${t.dialed.toLocaleString()} candidates dialled.`
+            }
           >
             <KpiCard
               label="Answered questions"
@@ -418,7 +455,11 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
 
           <KpiBand
             title="Screening decision"
-            hint={`What the scorecard concluded for the ${(t?.scored ?? 0).toLocaleString()} candidates it screened.`}
+            hint={
+              loading || !t
+                ? 'What the automated scorecard concluded.'
+                : `What the scorecard concluded for the ${t.scored.toLocaleString()} candidates it screened.`
+            }
           >
             <KpiCard
               label="Bot qualified"
@@ -443,7 +484,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
             />
           </KpiBand>
 
-          {hrUnconfigured ? (
+          {hrUnavailable ? (
             <div className="mt-5">
               <div className="mb-2 flex items-baseline gap-2">
                 <h3 className="text-[13px] font-semibold uppercase tracking-wide text-ink-secondary">
@@ -451,13 +492,9 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                 </h3>
               </div>
               <InlineNotice tone="info">
-                Not tracked yet. Reporting what the team did after screening needs the
-                Reference check stage linked on the Ashby job. Until then these numbers
-                could only ever read zero, which is not the same as &ldquo;nobody was
-                advanced&rdquo;.
-                {t
-                  ? ` ${t.hr_unknown.toLocaleString()} screened ${t.hr_unknown === 1 ? 'candidate is' : 'candidates are'} waiting on that link.`
-                  : ''}
+                {schemaCurrent
+                  ? 'Not tracked yet. Reporting what the team did after screening needs the Reference check stage linked on the Ashby job. Until that exists these numbers could only ever read zero, which is not the same as “nobody was advanced”.'
+                  : 'Not available on this server version.'}
               </InlineNotice>
             </div>
           ) : (
@@ -509,7 +546,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
           <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-2">
             <ChartCard
               title="Daily connect rate"
-              description="Share of dialled candidates who picked up, by the day they entered the pipeline."
+              description="Share of dialled candidates who picked up, by the day they entered. Days with nobody dialled are left out rather than drawn as 0%, so the line can skip dates."
             >
               <LineChart
                 title="Daily connect rate"
@@ -521,7 +558,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
             </ChartCard>
             <ChartCard
               title="Screening outcomes"
-              description="Qualified and disqualified as a share of everyone the bot scored that day."
+              description="Share of the candidates screened that day. Days with nobody screened are left out rather than drawn as 0%, so the line can skip dates."
             >
               <div className="grid grid-cols-1 gap-2">
                 <LineChart
@@ -542,7 +579,10 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
             </ChartCard>
           </div>
 
-          <MetricNotes refreshedAt={stale} rangeDays={rangeDays} />
+          {/* The stated fact, not this window's timestamp. `data.refreshed_at`
+              is the newest row IN RANGE, so a quiet week made the closing note
+              announce that the figures had never been calculated. */}
+          <MetricNotes neverComputed={neverComputed} rangeDays={rangeDays} />
         </>
       )}
     </section>
@@ -600,16 +640,22 @@ function KpiBand({
  * moment they need the definition, and they will not go looking for it.
  */
 function MetricNotes({
-  refreshedAt,
+  neverComputed,
   rangeDays,
 }: {
-  refreshedAt: string | null;
+  /**
+   * Deliberately NOT derived from a timestamp here. A null `refreshed_at` means
+   * "we were not told", which covers an API too old to send `meta` as well as a
+   * roll-up that has genuinely never run — and only the second of those may be
+   * announced as such. The caller already knows which; this takes the answer.
+   */
+  neverComputed: boolean;
   rangeDays: number;
 }) {
   const rows: Array<[string, string]> = [
     [
       'Total candidates',
-      `Résumés that parsed into a candidate record in the last ${rangeDays} days. A candidate is counted on the day they ENTERED, so the most recent days are still filling in — someone who arrived this morning has not been called yet.`,
+      `Everyone who entered the pipeline in the last ${rangeDays} days, counted on the day they ENTERED. The most recent days are still filling in — someone who arrived this morning has not been called yet, so today's column always looks worse than it will end up.`,
     ],
     [
       'Total call attempts',
@@ -631,7 +677,7 @@ function MetricNotes({
     ],
     [
       'Connected, no answers',
-      'The call was answered but produced no usable answer to a screening question. This bucket is broader than a bad line: it also holds people who declined consent, opted out, hung up during the intro, and answering machines. Check the call outcomes before concluding it is a telephony problem.',
+      'The call was answered but produced no usable answer to a screening question. This bucket is broader than a bad line: it also holds people who declined consent, opted out, hung up during the intro, and answering machines. Check the call outcomes before concluding it is a telephony problem. It is calculated by subtraction, and is shown as 0 rather than a negative number if the two underlying counts ever disagree.',
     ],
     ['Never connected', 'We dialled and never reached a person across every attempt.'],
     [
@@ -684,9 +730,9 @@ function MetricNotes({
           ))}
         </dl>
         <p className="mt-4 text-[12px] text-ink-secondary">
-          {refreshedAt
-            ? 'Figures refresh periodically, so a call from the last few minutes may not be included yet.'
-            : 'These figures have not been calculated yet — every number above will read zero until the first roll-up runs.'}
+          {neverComputed
+            ? 'These figures have not been calculated yet — every number above will read zero until the first roll-up runs.'
+            : 'Figures refresh periodically, so a call from the last few minutes may not be included yet.'}
         </p>
       </details>
     </GlassPanel>

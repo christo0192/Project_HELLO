@@ -46,15 +46,21 @@ const EMPTY_FUNNEL = {
     scored: 0, qualified: 0, on_hold: 0, disqualified: 0, human_review: 0,
     reached_reference_check: 0, attempts_total: 0, connects_total: 0,
     total_call_seconds: 0, hr_qualified: 0, hr_disqualified: 0, hr_awaiting: 0,
-    candidates_total: 0,
+    hr_unknown: 0, candidates_total: 0,
   },
   conversions: {
     parse_to_dial: null, dial_to_connect: null, connect_to_consent: null,
     consent_to_answered: null, answered_to_scored: null, scored_to_qualified: null,
-    qualified_to_reference_check: null, hr_qualified_rate: null,
+    qualified_to_reference_check: null, hr_advance_rate: null,
   },
   series: [],
   refreshed_at: null,
+  meta: {
+    hr_tracking_configured: false,
+    schema_current: true,
+    rollup_refreshed_at: null,
+    refresh_window_days: 30,
+  },
 };
 
 vi.mock('../api', () => ({

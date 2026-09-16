@@ -13,6 +13,7 @@
 
 import { Router } from 'express';
 import { supabase } from '../lib/supabase.js';
+import { env } from '../lib/env.js';
 import { requireAdmin } from '../lib/rbac.js';
 import {
   loadFunnelSummary,
@@ -523,6 +524,10 @@ adminRouter.get('/funnel/summary', validateQuery(funnelSummaryQuerySchema), asyn
       from: req.query.from as string | undefined,
       to: req.query.to as string | undefined,
       roleId: req.query.role_id as string | undefined,
+      // Same fact as the interviewer route reports. Omitting it here would have
+      // this endpoint claim the default 30 regardless of how the loop is
+      // actually configured — a wrong stated fact, which is worse than none.
+      refreshWindowDays: env.funnelRollupWindowDays,
     });
     res.json(summary);
   } catch (error) {

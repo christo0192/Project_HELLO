@@ -311,14 +311,13 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
   // Captured explicitly rather than read from document.activeElement: Safari
   // and Firefox do not focus a button on mouse click, so the heuristic would
   // hand focus back to <body>. Mirrors `confirmTriggerRef` above.
-  const slotTriggerNewRef = useRef<HTMLButtonElement | null>(null);
-  const slotTriggerExistingRef = useRef<HTMLButtonElement | null>(null);
+  // ONE ref, because only ONE trigger is ever mounted: the two live in
+  // opposite arms of a single ternary. Selecting between two refs on a
+  // different predicate (`current?.appointment`) left `.current` null in the
+  // most ordinary state — a cycle requested with nothing booked yet — so focus
+  // returned nowhere, which is the exact failure the ref exists to prevent.
+  const slotTriggerRef = useRef<HTMLButtonElement | null>(null);
 
-  // `slotDialogOpen` outlives the branch that owns it: a refetch can turn the
-  // cycle terminal and unmount the dialog mid-task while the flag stays true,
-  // so a later re-screen would spring the modal open unbidden on a slot chosen
-  // minutes ago in a different context.
-  useEffect(() => () => { setSlotDialogOpen(false); setSelectedSlot(null); }, []);
   const [savingAppointment, setSavingAppointment] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
@@ -339,6 +338,20 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
   const current = data?.cycles.find((cycle) => cycle.cycle_number === data.current_cycle)
     ?? data?.cycles[0]
     ?? null;
+
+  // Close when booking stops being offered. A refetch can turn the cycle
+  // terminal while the dialog is open; leaving it up means confirming would
+  // POST a schedule for a cycle that no longer accepts one. Keyed on the same
+  // predicate that renders the triggers — an unmount-only cleanup would be a
+  // no-op on an already-dead component, which is not the case it guards.
+  const canSchedule = data
+    ? data.cycles.length === 0 || !current || current.terminal_at === null
+    : false;
+  useEffect(() => {
+    if (canSchedule) return;
+    setSlotDialogOpen(false);
+    setSelectedSlot(null);
+  }, [canSchedule]);
   const canRescreen = current != null
     && current.terminal_at != null
     && ["completed", "failed", "abandoned_no_answer", "cancelled", "wrong_number"].includes(current.state);
@@ -499,7 +512,7 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
           <SurfaceCard level="sunken" className="mt-4 p-3">
             <h3 className="text-[13px] font-medium text-ink-secondary">Schedule a slot</h3>
             <CandidateButton
-              ref={slotTriggerNewRef}
+              ref={slotTriggerRef}
               variant="primary"
               className="mt-3"
               onClick={() => setSlotDialogOpen(true)}
@@ -595,7 +608,7 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
               </div>
               <div className="mt-3 flex flex-wrap gap-2">
                 <CandidateButton
-                  ref={slotTriggerExistingRef}
+                  ref={slotTriggerRef}
                   variant="primary"
                   onClick={() => setSlotDialogOpen(true)}
                   // Without this, clicking "Cancel appointment" and then this
@@ -635,7 +648,7 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
       onClose={() => { setSlotDialogOpen(false); setSelectedSlot(null); }}
       title={current?.appointment ? "Move appointment" : "Book a slot"}
       confirmLabel={current?.appointment ? "Move appointment" : "Book slot"}
-      advisory={current?.appointment ? SLOT_ADVISORY_EXISTING : SLOT_ADVISORY_NEW}
+      advisory={(data?.cycles.length ?? 0) === 0 ? SLOT_ADVISORY_NEW : SLOT_ADVISORY_EXISTING}
       date={slotDate}
       onDateChange={(date) => { setSlotDate(date); setSelectedSlot(null); }}
       selected={selectedSlot}
@@ -643,7 +656,7 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
       onConfirm={() => void saveAppointment()}
       saving={savingAppointment}
       idPrefix={`${headingId}-slot`}
-      returnFocusRef={current?.appointment ? slotTriggerExistingRef : slotTriggerNewRef}
+      returnFocusRef={slotTriggerRef}
     />
     </>
   );

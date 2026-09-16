@@ -1099,7 +1099,12 @@ describe('OpenAPI document integrity', () => {
     // THREE suppression verbs (GET/POST/DELETE) — the do-not-call write path
     // `phone_suppressions` never had. Paths are counted by URL, not by verb,
     // so three routes move this guard by one. 130 + 1 = 131.
-    expect(Object.keys(paths).length).toBe(131);
+    // The recruiter dashboard adds ONE read — GET /api/funnel/summary, the
+    // interviewer-and-above twin of the admin funnel summary, served from the
+    // same implementation at a lower privilege with the per-day latency
+    // percentiles stripped. Its response body is INLINE (opaque object), like
+    // its admin twin, so the schema count below is unchanged. 131 + 1 = 132.
+    expect(Object.keys(paths).length).toBe(132);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas

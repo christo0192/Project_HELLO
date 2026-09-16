@@ -105,9 +105,10 @@ describe('PhoneSlotDialog', () => {
   });
 
   it('renders nothing at all when closed, and fetches nothing', () => {
-    render(<PhoneSlotDialog {...props()} />);
-    // Not merely hidden: an off-screen grid still costs a slots fetch and
-    // still sits in the accessibility tree.
+    const { container } = render(<PhoneSlotDialog {...props()} />);
+    // `queryByRole` alone would also pass for a dialog that merely has
+    // `hidden`/`display:none`, so it cannot support the UNMOUNTED claim.
+    expect(container.firstChild).toBeNull();
     expect(screen.queryByRole('dialog')).toBeNull();
     expect(getPhoneSlots).not.toHaveBeenCalled();
   });
@@ -142,14 +143,24 @@ describe('PhoneSlotDialog', () => {
     await waitFor(() => expect(document.activeElement).toBe(trigger));
   });
 
-  it('does not throw when the trigger unmounted while the dialog was open', async () => {
-    // After a successful booking the page refetches and the trigger's whole
-    // branch can disappear. focus() on a detached node silently strands focus.
-    const detached = document.createElement('button');
+  it('does not focus a trigger that has left the document', async () => {
+    // After a successful booking the page refetches and the trigger's branch
+    // can unmount. `focus()` on a detached node never throws — it silently
+    // does nothing — so "does not throw" proved nothing. This asserts the
+    // guard actually skipped it.
+    const detached = document.createElement('button');   // never appended
     const ref = { current: detached } as React.RefObject<HTMLElement | null>;
+    const sentinel = document.createElement('button');
+    document.body.appendChild(sentinel);
+
     const h = mountThenOpen({ returnFocusRef: ref });
     await screen.findByRole('dialog');
-    expect(() => h.close()).not.toThrow();
+    sentinel.focus();
+    h.close();
+
+    // Focus stayed where it was rather than being handed to a dead node.
+    await waitFor(() => expect(document.activeElement).toBe(sentinel));
+    expect(document.activeElement).not.toBe(detached);
   });
 
   it('traps Tab inside the dialog', async () => {
@@ -163,24 +174,36 @@ describe('PhoneSlotDialog', () => {
     mountThenOpen({ selected: SLOT });
     const dialog = await screen.findByRole('dialog');
 
-    const cancel = screen.getByRole('button', { name: 'Cancel' });
     const confirm = screen.getByRole('button', { name: 'Book slot' });
+    // jsdom does not move focus on Tab, so asserting "focus is still inside"
+    // passes whether or not the wrap fired. These assert the IDENTITY of the
+    // element the wrap chose, which is the only thing that distinguishes a
+    // working trap from a no-op.
+    const focusables = Array.from(
+      dialog.querySelectorAll<HTMLElement>(
+        'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      ),
+    );
+    const first = focusables[0]!;
+    const last = focusables[focusables.length - 1]!;
+    expect(last).toBe(confirm);
 
-    confirm.focus();
+    // Forward from the LAST element wraps to the first.
+    last.focus();
     fireEvent.keyDown(document, { key: 'Tab' });
-    expect(document.activeElement).not.toBe(outside);
-    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(first);
 
-    cancel.focus();
+    // Backward from the FIRST element wraps to the last.
+    first.focus();
     fireEvent.keyDown(document, { key: 'Tab', shiftKey: true });
-    expect(document.activeElement).not.toBe(outside);
-    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(last);
 
-    // Focus dragged outside entirely must be pulled back in, not allowed to
-    // continue through the page behind the backdrop.
+    // Focus dragged outside entirely is pulled back in, not allowed to continue
+    // through the page behind the backdrop — where "Confirm call" lives.
     outside.focus();
     fireEvent.keyDown(document, { key: 'Tab' });
-    expect(dialog.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(first);
+    expect(document.activeElement).not.toBe(outside);
   });
 
   it('keeps the capacity advisory as the dialog’s description', async () => {
@@ -224,12 +247,16 @@ describe('PhoneSlotDialog', () => {
     expect(h.onClose).not.toHaveBeenCalled();
   });
 
-  it('locks body scroll while open and restores it on close', async () => {
+  it('locks body scroll while open and restores the PREVIOUS value on close', async () => {
+    // Asserting only "not hidden" afterwards would pass for code that clears
+    // the property outright, trampling whatever the page had set.
+    document.body.style.overflow = 'scroll';
     const h = mountThenOpen();
     await screen.findByRole('dialog');
     expect(document.body.style.overflow).toBe('hidden');
     h.close();
-    await waitFor(() => expect(document.body.style.overflow).not.toBe('hidden'));
+    await waitFor(() => expect(document.body.style.overflow).toBe('scroll'));
+    document.body.style.overflow = '';
   });
 
   it('confirms only once a slot is chosen, and not twice', async () => {
