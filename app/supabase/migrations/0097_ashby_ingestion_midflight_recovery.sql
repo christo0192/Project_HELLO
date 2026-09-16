@@ -295,7 +295,19 @@ declare
     'ingestion_midflight_refused',
     'ingestion_midflight_unavailable',
     'ingestion_entry_refused',
-    'scan_defer_requeue_refused'
+    'scan_defer_requeue_refused',
+    -- The two branches that used to return BARE with the row already
+    -- `fetching` — a state NO audited door accepts, so the row needed a
+    -- hand-written UPDATE to move again. `link_missing` in particular is what
+    -- the port builder returns for `error || !data`, so a transient transport
+    -- failure and a deleted link are indistinguishable; machine-class is the
+    -- honest reading of both.
+    'ingestion_link_read_failed',
+    'ingestion_resume_handle_vanished',
+    -- The mid-flight wait outlived its wall clock: something kept touching the
+    -- row, so the rescue never got a stale one. Nothing was learned about the
+    -- document.
+    'ingestion_midflight_defer_deadline'
   ];
 begin
   select * into v_link

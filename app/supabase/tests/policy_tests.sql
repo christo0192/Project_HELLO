@@ -15282,10 +15282,11 @@ begin
     v_out->>'status' = 'retry_exhausted',
     coalesce(v_out::text, 'null'));
 
+  -- `audit_events` is APPEND-ONLY (a DELETE raises), so the audit row this
+  -- block created is deliberately left behind. It carries no candidate data —
+  -- only the synthetic link id — and every other audited-RPC test leaves its
+  -- trail the same way.
   delete from screening_v2.ashby_resume_ingestions where application_link_id = v_link;
-  delete from screening_v2.audit_events
-   where action = 'ashby_ingestion_midflight_resume'
-     and metadata->>'application_link_id' = v_link::text;
   delete from screening_v2.ashby_application_links where id = v_link;
 end;
 $$;

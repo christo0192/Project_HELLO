@@ -156,6 +156,30 @@ export const MIDFLIGHT_INGESTION_STATES: ReadonlySet<string> = new Set([
 ]);
 
 /**
+ * Mid-flight states that must be LEFT EXACTLY WHERE THEY ARE.
+ *
+ * `structuring` is stranded by the same dead process as the two above, but it
+ * is post-persist, so re-driving it walks into the 0084 CAS trap (see
+ * `MIDFLIGHT_INGESTION_STATES`). The design answer is to make it VISIBLE
+ * instead of fixing it automatically — `ingestion_stuck_structuring` counts it
+ * and degrades /health, and a human decides.
+ *
+ * That answer only works if the row actually STAYS in `structuring`. An
+ * earlier revision of this file left it out of both sets, so it fell through
+ * the entry-transition refusal below into `restOrEscalate` — and because
+ * `structuring -> failed_review` IS a legal edge, the rest landed. That was
+ * strictly worse than the bug being fixed: the row left `structuring` within
+ * one lease (~60-120s), roughly 780s BEFORE its 900s stuck window could open,
+ * so the counter built to make it visible could never fire; and it landed on
+ * `ingestion_entry_refused`, which this PR added to the audited recovery
+ * allowlist, so an operator could re-drive it straight into the trap the
+ * exclusion exists to prevent.
+ */
+export const UNRESCUABLE_MIDFLIGHT_STATES: ReadonlySet<string> = new Set([
+  'structuring',
+]);
+
+/**
  * How long to wait when the rescue refuses because the row was touched
  * recently — i.e. a live run may still own it.
  *
@@ -163,6 +187,26 @@ export const MIDFLIGHT_INGESTION_STATES: ReadonlySet<string> = new Set([
  * the scanner deferral so a strand costs the same cheap poll cadence.
  */
 export const DEFAULT_MIDFLIGHT_RECHECK_SECONDS = 45;
+
+/**
+ * Wall-clock bound on how long ONE job may keep waiting on `recently_active`.
+ *
+ * Both sibling deferrals (scanner, parse) carry a deadline derived from the
+ * job's own `createdAt`, and this one shipped without — which matters because
+ * a deferral never spends the job's failure budget (the queue refunds the
+ * attempt), so an unbounded wait is an unbounded number of cheap polls and a
+ * row nobody is paged about.
+ *
+ * One hour is ~4x the RPC's 900s staleness window: a row whose owner really
+ * died goes stale and is rescued inside ~945s, so reaching this bound means
+ * something is still touching the row — a live run that is stuck rather than
+ * dead. That is a human's problem, and it now rests loudly instead of
+ * polling for ever.
+ */
+export const DEFAULT_MIDFLIGHT_DEFER_DEADLINE_MS = 60 * 60_000;
+
+/** Durable rest when the mid-flight wait outlives its wall clock. */
+export const MIDFLIGHT_DEFER_DEADLINE_REASON = 'ingestion_midflight_defer_deadline';
 
 /** Reason passed to the audited mid-flight resume RPC. Never PII. */
 export const MIDFLIGHT_RESUME_REASON = 'ingestion_midflight_restart';
@@ -197,6 +241,19 @@ export const FETCHING_ENTRY_REFUSED_REASON = 'ingestion_entry_refused';
 
 /** Durable rest when a scanner-deferral requeue is refused for any other reason. */
 export const DEFER_REQUEUE_REFUSED_REASON = 'scan_defer_requeue_refused';
+
+/**
+ * Durable rest when the link read behind `buildIngestionPorts` came back empty.
+ *
+ * Machine-class on purpose: `runtime.ts` returns `link_missing` for
+ * `error || !data`, so a transient transport failure is indistinguishable from
+ * a genuinely deleted link. Treating it as a verdict would write off a live
+ * application over one failed select.
+ */
+export const LINK_READ_FAILED_REASON = 'ingestion_link_read_failed';
+
+/** Durable rest when the resume handle disappeared between two reads. */
+export const RESUME_HANDLE_VANISHED_REASON = 'ingestion_resume_handle_vanished';
 
 /**
  * Default wait between scanner-readiness deferrals.
@@ -438,6 +495,8 @@ export interface AshbyHandlerDeps {
   parseDeferDeadlineMs?: number;
   /** Delay before re-checking a row the rescue called `recently_active`. */
   midflightRecheckSeconds?: number;
+  /** Wall-clock bound on how long one job may keep waiting on the rescue. */
+  midflightDeferDeadlineMs?: number;
   /** Injectable clock for the deadline (tests). */
   nowMs?: () => number;
 }
@@ -466,6 +525,8 @@ export function buildAshbyHandlers(
   const parseDeferDeadlineMs = deps.parseDeferDeadlineMs ?? DEFAULT_PARSE_DEFER_DEADLINE_MS;
   const midflightRecheckSeconds =
     deps.midflightRecheckSeconds ?? DEFAULT_MIDFLIGHT_RECHECK_SECONDS;
+  const midflightDeferDeadlineMs =
+    deps.midflightDeferDeadlineMs ?? DEFAULT_MIDFLIGHT_DEFER_DEADLINE_MS;
   const nowMs = deps.nowMs ?? (() => Date.now());
   const gates = {
     enabled: true,
@@ -629,6 +690,12 @@ export function buildAshbyHandlers(
       // RPC decides on `updated_at` age under the row lock and answers
       // `recently_active` when a live run may still own the row — which is a
       // WAIT, never a failure.
+      // LEAVE IT. `structuring` is stranded but unsafe to re-drive, and the
+      // health counter is the whole signal — which only works if the row stays
+      // put. Returning here also spares a pointless scanner-gate call and the
+      // refused entry transition below.
+      if (current && UNRESCUABLE_MIDFLIGHT_STATES.has(current.state)) return;
+
       if (current && MIDFLIGHT_INGESTION_STATES.has(current.state)) {
         // No seam ⇒ no way to record the rescue ⇒ do not pretend to take one.
         // Resting loudly beats the pre-0097 behaviour of completing the job and
@@ -662,6 +729,15 @@ export function buildAshbyHandlers(
           // ingestion, and re-driving it would re-download the same résumé
           // under the worker that is already holding it.
           if (resumed.status === 'recently_active') {
+            // BOUND, shipped with the wait it bounds. Derived from the job's
+            // own creation so it resets with every enqueue and needs no
+            // counter. A deferral costs the job no attempt, so without this the
+            // wait is unbounded and invisible.
+            const waitedMs = Math.max(0, nowMs() - Date.parse(job.createdAt));
+            if (!Number.isFinite(waitedMs) || waitedMs > midflightDeferDeadlineMs) {
+              await restOrEscalate(MIDFLIGHT_DEFER_DEADLINE_REASON);
+              return;
+            }
             return {
               outcome: 'defer',
               reasonCode: MIDFLIGHT_RECENTLY_ACTIVE_REASON,
@@ -746,6 +822,11 @@ export function buildAshbyHandlers(
         // already carries a truthful reason; leaving it alone IS the record.
         if (settled?.state === 'failed_review') return;
 
+        // ...and the same for a row that reached `structuring` in the window:
+        // resting it would both kill its counter and make it re-drivable into
+        // the 0084 trap.
+        if (settled && UNRESCUABLE_MIDFLIGHT_STATES.has(settled.state)) return;
+
         // The row became mid-flight between the read at the top of this handler
         // and here — another worker started it inside our scanner-gate window.
         // Resting it would kill a live ingestion; waiting is correct.
@@ -791,10 +872,29 @@ export function buildAshbyHandlers(
         throw err;
       }
 
-      if (built.status === 'link_missing') return;
+      // THESE TWO USED TO RETURN BARE, AND THE ROW IS ALREADY `fetching`.
+      // That is the same silent-loss shape as the incident, one state over —
+      // and a worse one to be stranded in: NO audited RPC accepts `fetching`
+      // (`recover_ashby_ingestion_parse` and `reset_ashby_ingestion_attempts`
+      // both demand `failed_review`, `recover_ashby_model_degraded` demands
+      // `ready`, and the mid-flight rescue admits only scanning/extracting),
+      // so the row needed a hand-written DB write to move ever again.
+      //
+      // `link_missing` is NOT proof the link is gone: `runtime.ts` returns it
+      // for `error || !data`, so a transient PostgREST blip on one select —
+      // exactly the class of event an API restart produces — is reported
+      // identically to a deleted row. Resting it machine-class is the honest
+      // reading, and both codes are in the audited recovery allowlist so an
+      // operator can re-drive with one call.
+      if (built.status === 'link_missing') {
+        await failIngestion(LINK_READ_FAILED_REASON);
+        return;
+      }
       if (built.status === 'no_resume') {
         // The link claimed a handle a moment ago and now reports none. Not a
-        // provider failure; nothing to ingest.
+        // provider failure — but the row is mid-flight and must not be left
+        // there without a reason.
+        await failIngestion(RESUME_HANDLE_VANISHED_REASON);
         return;
       }
       if (built.status === 'url_unresolved') {
