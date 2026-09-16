@@ -12,7 +12,7 @@
  */
 
 /** Max accepted id length (parity with the DB id-column bounds). */
-const MAX_ID_LEN = 256;
+export const MAX_ID_LEN = 256;
 
 /** A safe external id: printable, no control chars, within bounds. */
 function safeId(value: unknown): string | undefined {

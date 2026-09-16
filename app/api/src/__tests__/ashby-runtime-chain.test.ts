@@ -137,6 +137,7 @@ function makeRuntime(w: ReturnType<typeof world>, over: Partial<AshbyRuntime> = 
       resumeHosts: [], signalPollMs: 5000, operationPollMs: 5000,
       reconcileIntervalMs: 900000, reclaimIntervalMs: 60000, leaseSeconds: 60,
       reconcileSweepIntervalMs: 10000, reconcileAnchorDisabled: false,
+      stagePrefilterEnabled: false,
       scannerDeferSeconds: 45, scannerReadinessTimeoutMs: 2000,
       scannerDeferDeadlineMs: 28_800_000,
       reconcileCaps: {

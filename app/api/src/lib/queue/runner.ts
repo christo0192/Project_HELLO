@@ -169,6 +169,12 @@ export function createQueueRunner(options: QueueRunnerOptions): QueueRunnerHandl
   const settling = new Set<Promise<void>>();
 
   /**
+   * Which queue gets FIRST pick on the next tick. Advanced once per tick so the
+   * privilege rotates; see the starvation note on `tick()`.
+   */
+  let firstPickCursor = 0;
+
+  /**
    * Process one claimed job to a terminal outcome under its lease. Never
    * throws: every failure path routes through `failClaim`, and a lost lease is
    * reported without committing anything.
@@ -259,29 +265,104 @@ export function createQueueRunner(options: QueueRunnerOptions): QueueRunnerHandl
     if (isStopped) return 0;
     let processed = 0;
 
-    for (const queueName of queueNames) {
-      // ── Admission gate (R-2) ────────────────────────────────────────────
-      // Asked ONCE per queue per tick, before any claim. A queue whose
-      // machine-local prerequisite is unmet is skipped entirely: its jobs are
-      // never claimed here, so waiting costs nothing and blocks no other
-      // queue in this runner.
-      if (options.shouldClaim) {
-        let admitted: boolean;
-        try {
-          admitted = await options.shouldClaim(queueName);
-        } catch {
-          // A gate that cannot answer has not granted permission.
-          admitted = false;
-        }
-        if (!admitted) {
-          emit({ kind: 'not_admitted', queueName });
-          continue;
-        }
-      }
+    // ── Fair first pick (starvation fix) ──────────────────────────────────
+    // Iterating `queueNames` in a FIXED order starves every queue but the
+    // first whenever that first queue is permanently backlogged. `active` is
+    // incremented at CLAIM and decremented only when the job SETTLES, and the
+    // loop deliberately does not await settlement — so a first queue that can
+    // always produce a job fills the whole concurrency budget, and by the time
+    // the loop reaches the second queue `active < concurrency` is already
+    // false. The later queues are then never CLAIMED from — their admission
+    // gate still ran, but not one claim, and so no `claimed` event and no
+    // error to alert on. Observed in production 2026-09-16, when an external
+    // bulk stage-move buried `ashby.signal` under thousands of jobs and
+    // `ashby.import`/`ashby.ingestion` — two jobs deep — went unclaimed
+    // indefinitely behind it.
+    //
+    // Two mechanisms restore fairness, and BOTH are needed:
+    //
+    //  (a) Rotating which queue is polled FIRST. The privilege is only spent
+    //      when it is actually USED — see `firstPickOffered` below. Advancing
+    //      the cursor unconditionally would let a tick that claimed nothing
+    //      (budget already full) or whose first-pick queue was refused by the
+    //      admission gate still burn a turn, so with a handler duration near a
+    //      multiple of the tick interval the same queue could win first pick
+    //      every time and the starvation would survive the "fix". Parking the
+    //      privilege until it is exercised makes the rotation a real bound.
+    //
+    //  (b) Capping what ONE queue may claim per tick when several are
+    //      registered. Rotation alone is winner-take-all: the first-pick queue
+    //      can still absorb the entire budget on its turn, which merely moves
+    //      the starvation around the rotation — and newly lets a queue of long
+    //      jobs (ingestion: download + scan + parse) block the short ones it
+    //      previously sat behind. Leaving one slot for a later queue means a
+    //      second queue is served on EVERY tick, not one tick in N.
+    //
+    // The budget itself, the admission gate and every per-queue path below are
+    // untouched; only which queue is offered the budget, and how much of it
+    // one queue may take in a single pass, change.
+    const queueCount = queueNames.length;
+    if (queueCount === 0) return 0;
+    const firstPick = firstPickCursor % queueCount;
+    // A single-queue runner must keep the whole budget, or this would halve
+    // the throughput of every runner that has nothing to be fair to.
+    const perQueueCap = queueCount === 1 ? concurrency : Math.max(1, concurrency - 1);
+    let firstPickOffered = false;
 
-      // Fill up to the concurrency budget, one claim at a time. A claim that
-      // returns null means the queue is empty — move to the next queue.
-      while (!isStopped && active < concurrency) {
+    // Admission verdicts are cached for this tick: the gate is asked ONCE per
+    // queue even though the queues are visited twice (reserve pass, then
+    // leftover pass). `shouldClaim` can do real work — production's checks
+    // malware-scanner readiness — so asking twice would double that cost.
+    const admittedThisTick = new Map<string, boolean>();
+    /** Queues whose claim threw this tick; the leftover pass must not retry them. */
+    const erroredThisTick = new Set<string>();
+
+    async function admits(queueName: string): Promise<boolean> {
+      if (!options.shouldClaim) return true;
+      const cached = admittedThisTick.get(queueName);
+      if (cached !== undefined) return cached;
+      let admitted: boolean;
+      try {
+        admitted = await options.shouldClaim(queueName);
+      } catch {
+        // A gate that cannot answer has not granted permission.
+        admitted = false;
+      }
+      admittedThisTick.set(queueName, admitted);
+      if (!admitted) emit({ kind: 'not_admitted', queueName });
+      return admitted;
+    }
+
+    for (let offset = 0; offset < queueCount; offset += 1) {
+      const queueName = queueNames[(firstPick + offset) % queueCount] as string;
+      // ── Admission gate (R-2) ────────────────────────────────────────────
+      // A queue whose machine-local prerequisite is unmet is skipped entirely:
+      // its jobs are never claimed here, so waiting costs nothing and blocks
+      // no other queue in this runner.
+      const admitted = await admits(queueName);
+
+      // Decide whether the rotation privilege was USED, before the `continue`
+      // below can skip past it.
+      //
+      // Parked only when this queue could have used the budget and there was
+      // none — that is the resonance case the privilege exists to survive.
+      //
+      // SPENT when the gate REFUSED it. A refused queue cannot consume a slot
+      // however long it holds first pick, so parking there pins the cursor for
+      // the whole refusal. `ashby.ingestion` is the only gated queue and its
+      // scanner outage is budgeted at eight hours (`scannerDeferDeadlineMs`),
+      // which would freeze the order at `[ingestion, signal, import]` and hand
+      // every contested slot back to the storm queue — the original incident,
+      // reconstructed by the fix meant to prevent it.
+      if (offset === 0 && (!admitted || active < concurrency)) firstPickOffered = true;
+
+      if (!admitted) continue;
+
+      // Fill up to the concurrency budget, one claim at a time, but never take
+      // more than this queue's share of a single tick (see `perQueueCap`). A
+      // claim that returns null means the queue is empty — move on.
+      let claimedHere = 0;
+      while (!isStopped && active < concurrency && claimedHere < perQueueCap) {
         let job: QueueJob<unknown> | null;
         try {
           job = await options.queue.claim(queueName, {
@@ -290,12 +371,14 @@ export function createQueueRunner(options: QueueRunnerOptions): QueueRunnerHandl
           });
         } catch {
           // A DB/transport error must not kill the loop or the other queues.
+          erroredThisTick.add(queueName);
           emit({ kind: 'poll_error', queueName, code: 'claim_error' });
           break;
         }
         if (!job || !job.leaseToken) break;
 
         active += 1;
+        claimedHere += 1;
         if (active > peak) peak = active;
         processed += 1;
         emit({ kind: 'claimed', queueName });
@@ -304,6 +387,74 @@ export function createQueueRunner(options: QueueRunnerOptions): QueueRunnerHandl
         settling.add(p);
       }
     }
+
+    // ── Leftover pass: the cap RESERVES, it must not THROTTLE ─────────────
+    // The pass above deliberately leaves a slot so a sibling queue is served
+    // every tick. But when the siblings are empty or gate-refused, that slot
+    // would simply go unused — and because a tick claims at most its budget
+    // and then returns, an unused slot is throughput permanently lost, not
+    // merely deferred. On the production cadence (`signalPollMs` 5s) capping
+    // the hot queue at one claim per tick would drain ~12 jobs/min, roughly
+    // HALF what it manages today: the "fix" would slow the storm down.
+    //
+    // So once every queue has had its reserved share, any budget still free is
+    // offered back in the same rotated order, uncapped. Fairness is unchanged
+    // — siblings were served first — while a queue that is alone in having
+    // work still gets the whole budget, exactly as before this change.
+    if (!isStopped && active < concurrency && perQueueCap < concurrency) {
+      // Starts at offset 1, NOT 0. The first-pick queue already took its share
+      // in pass 1; offering it the leftover first would let it consume a slot
+      // freed mid-tick that a sibling was reserved — including a slot freed by
+      // its OWN handler settling, which is how a parked turn gets spent without
+      // being spent. It also matters for the production cascade: a signal
+      // handler ENQUEUES an import job, so import work routinely appears
+      // between the two passes and must not lose that slot back to signal.
+      for (let step = 1; step <= queueCount; step += 1) {
+        if (isStopped || active >= concurrency) break;
+        const queueName = queueNames[(firstPick + step) % queueCount] as string;
+        // A queue whose claim already failed this tick is not retried: on a DB
+        // fault every claim throws, and retrying all of them would double both
+        // the load on a failing database and the `poll_error` rate an operator
+        // is reading at that moment.
+        if (erroredThisTick.has(queueName)) continue;
+        if (!(await admits(queueName))) continue;
+        while (!isStopped && active < concurrency) {
+          let job: QueueJob<unknown> | null;
+          try {
+            job = await options.queue.claim(queueName, {
+              leaseSeconds: options.leaseSeconds,
+              owner: options.owner,
+            });
+          } catch {
+            emit({ kind: 'poll_error', queueName, code: 'claim_error' });
+            break;
+          }
+          if (!job || !job.leaseToken) break;
+          active += 1;
+          if (active > peak) peak = active;
+          processed += 1;
+          emit({ kind: 'claimed', queueName });
+          const p = runJob(job, job.leaseToken).finally(() => { settling.delete(p); });
+          settling.add(p);
+        }
+      }
+    }
+
+    // Spend the rotation only when the first-pick queue could actually have
+    // used it — it was admitted and had a free slot — or when the gate refused
+    // it outright (a refused queue cannot use a turn however long it holds one,
+    // and parking there pinned the cursor for the whole refusal).
+    //
+    // KNOWN RESIDUAL, deliberately not "fixed" here: `firstPickOffered` samples
+    // `active` at ONE instant, so a sibling that frees and re-takes the budget
+    // later in the same tick leaves this queue parked while the tick still made
+    // progress, and nothing bounds consecutive parks. Spending the turn in that
+    // case was tried and rejected: it moves the cursor PAST the queue that is
+    // being starved, pushing it later in the order and making the harm worse,
+    // and no test could express it as a desirable property. The real exposure
+    // is a long sibling job spanning tick boundaries, which no per-tick cap can
+    // bound; see the PR for the follow-up.
+if (firstPickOffered) firstPickCursor = (firstPick + 1) % queueCount;
 
     return processed;
   }

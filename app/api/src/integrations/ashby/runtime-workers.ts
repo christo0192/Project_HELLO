@@ -50,7 +50,11 @@ import {
   scannerDeferReason,
   type ScannerGateVerdict,
 } from './scanner-readiness.js';
-import { runReconciliation, DEFAULT_CHECKPOINT_KEY } from './reconciliation.js';
+import {
+  runReconciliation,
+  DEFAULT_CHECKPOINT_KEY,
+  DEFAULT_MAX_ENABLED_MAPPINGS,
+} from './reconciliation.js';
 import type { ReconcileResult, ReconcileSkipCounts, ReconcileStop } from './reconciliation.js';
 import { runAshbyOperationPass } from './operation-worker.js';
 import { probeFeedbackFormDefinition, type FormDefinitionReader, type ProbeFeedbackForm } from './probe.js';
@@ -102,10 +106,144 @@ import type { PersistOutcome, StructuredResume } from './resume-ingestion.js';
 import type { WorkflowLinkRow } from './orchestration.js';
 import { MAX_FILE_HANDLE_LEN } from './client.js';
 import { isAshbyError, type AshbyErrorCategory } from './errors.js';
-import type { AshbySignalPayload } from './ports.js';
+import type { AshbySignalPayload, EnabledMappingLoader } from './ports.js';
 
 /** Queue name for the ephemeral resume ingestion of one application link. */
 export const ASHBY_INGESTION_QUEUE = 'ashby.ingestion';
+
+/**
+ * How long the stage-interest set is trusted before a re-read. Deliberately
+ * short: enabling a mapping must begin admitting its stage promptly, and the
+ * refresh is ONE bounded indexed query — never a provider call.
+ */
+export const STAGE_INTEREST_CACHE_MS = 60_000;
+
+/**
+ * Bound for the stage-interest read. DERIVED from reconciliation's bound, never
+ * a second literal: a filter bound BELOW it would report `truncated` for every
+ * read on a tenant reconciliation handles fine, and a permanently truncated
+ * read fails open AND refuses to cache — turning this optimisation into one
+ * extra uncached query per signal, i.e. a pure regression under exactly the
+ * storm it exists to absorb.
+ */
+export const STAGE_INTEREST_MAX_MAPPINGS = DEFAULT_MAX_ENABLED_MAPPINGS;
+
+/**
+ * Bound on the stage-interest read. Without it a stalled query would sit at the
+ * HEAD of the signal handler, ahead of the provider call, while the runner's
+ * heartbeat keeps renewing the job's lease — parking a concurrency slot with no
+ * reclaim, no DLQ and no event. Two of those take the whole runner down,
+ * including the queues the fairness fix in this same change protects.
+ */
+export const STAGE_INTEREST_READ_TIMEOUT_MS = 3_000;
+
+/**
+ * How long a FAILED read is remembered before another is attempted. Without
+ * this, a mapping-table outage makes every signal issue its own failing query
+ * on top of the provider read it then falls open to — amplification during the
+ * one incident where that is least affordable.
+ */
+export const STAGE_INTEREST_FAILURE_BACKOFF_MS = 5_000;
+
+/**
+ * Build the local pre-filter that answers "could any enabled mapping ever
+ * import an application sitting at this stage?" for {@link processAshbySignal}.
+ *
+ * Reconciliation already refuses to enqueue applications outside the enabled
+ * mappings — the comment on its `mappings` dep calls that omission "the
+ * tenant-wide signal storm this loop exists to avoid". The WEBHOOK path never
+ * got the same admission check, so an external bulk stage-move through an
+ * unmapped stage still bought one `application.info` round-trip per event.
+ * This closes that asymmetry using the same bounded loader.
+ *
+ * FAIL-OPEN IS THE WHOLE CONTRACT. Every uncertain condition — a read that
+ * throws, a truncated read, an empty set — answers `true`, which means "do the
+ * authoritative read anyway". A wrong `true` costs one provider call; a wrong
+ * `false` would skip a real candidate, so `false` is returned ONLY from a
+ * complete, untruncated, non-empty set that genuinely lacks the stage.
+ */
+export function createStageInterestFilter(deps: {
+  mappings: EnabledMappingLoader;
+  nowMs?: () => number;
+  cacheMs?: number;
+  maxMappings?: number;
+  timeoutMs?: number;
+  failureBackoffMs?: number;
+}): (stageId: string) => Promise<boolean> {
+  const nowMs = deps.nowMs ?? (() => Date.now());
+  const cacheMs = deps.cacheMs ?? STAGE_INTEREST_CACHE_MS;
+  const maxMappings = deps.maxMappings ?? STAGE_INTEREST_MAX_MAPPINGS;
+  const timeoutMs = deps.timeoutMs ?? STAGE_INTEREST_READ_TIMEOUT_MS;
+  const backoffMs = deps.failureBackoffMs ?? STAGE_INTEREST_FAILURE_BACKOFF_MS;
+
+  let cached: { stages: Set<string>; readAtMs: number } | null = null;
+  let failedUntilMs = 0;
+  // Single-flight: a burst of signals must not stampede the same refresh.
+  let inFlight: Promise<Set<string> | null> | null = null;
+
+  async function readStages(): Promise<Set<string> | null> {
+    // Bounded: an unbounded read here parks a concurrency slot (see
+    // STAGE_INTEREST_READ_TIMEOUT_MS). Losing the race fails open like any
+    // other unanswerable read.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<null>((resolve) => {
+      timer = setTimeout(() => resolve(null), timeoutMs);
+      if (typeof timer.unref === 'function') timer.unref();
+    });
+    try {
+      const loaded = await Promise.race([deps.mappings.listEnabled(maxMappings), timeout]);
+      // Timed out — indeterminate, not empty.
+      if (loaded === null) return null;
+      // A truncated read is a PARTIAL view: a stage missing from it may simply
+      // be in the unread remainder. Never cache it, never answer from it.
+      if (loaded.truncated) return null;
+      const stages = new Set<string>();
+      // `rows` absent is a malformed loader response, not an empty mapping set.
+      for (const row of loaded.rows ?? []) {
+        // A NULL/blank stage id must never enter the set: `has(undefined)` on a
+        // poisoned set would answer `false` for real stages.
+        if (typeof row?.aiScreeningStageId === 'string' && row.aiScreeningStageId.length > 0) {
+          stages.add(row.aiScreeningStageId);
+        }
+      }
+      // An empty set would make EVERY stage uninteresting on the strength of a
+      // read that may simply have raced a migration or a transient failure.
+      // Refuse to conclude anything from it.
+      if (stages.size === 0) return null;
+      return stages;
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
+  }
+
+  return async function isStageOfInterest(stageId: string): Promise<boolean> {
+    const now = nowMs();
+    if (cached && now - cached.readAtMs < cacheMs) {
+      return cached.stages.has(stageId);
+    }
+    // A recent failure is remembered just long enough to stop every signal in a
+    // storm from re-issuing the same failing query.
+    if (now < failedUntilMs) return true;
+
+    if (!inFlight) {
+      // Stamp the time the read STARTED, so a slow read cannot extend trust in
+      // pre-read data by its own duration.
+      const startedAtMs = now;
+      inFlight = readStages()
+        .then((stages) => {
+          if (stages === null) failedUntilMs = nowMs() + backoffMs;
+          else cached = { stages, readAtMs: startedAtMs };
+          return stages;
+        })
+        .catch(() => { failedUntilMs = nowMs() + backoffMs; return null; })
+        .finally(() => { inFlight = null; });
+    }
+    const stages = await inFlight;
+    // Could not build a trustworthy set — fail open.
+    if (stages === null) return true;
+    return stages.has(stageId);
+  };
+}
 
 /**
  * Ingestion states the GENERIC pipeline treats as settled: it must never
@@ -472,6 +610,15 @@ export interface AshbyHandlerDeps {
   midflightRecheckSeconds?: number;
   /** Injectable clock for the deadline (tests). */
   nowMs?: () => number;
+  /**
+   * Override the local stage pre-filter handed to {@link processAshbySignal}.
+   * Injected by tests; production builds one from the runtime's enabled-mapping
+   * loader. Leaving it undefined AND having no loader disables the fast path,
+   * which restores the exact pre-filter behaviour.
+   */
+  stageInterest?: (stageId: string) => Promise<boolean> | boolean;
+  /** Override the opt-in skip gate (tests). Production reads the env flag. */
+  stagePrefilterEnabled?: boolean;
 }
 
 /**
@@ -486,6 +633,23 @@ export function buildAshbyHandlers(
   // drive one handler against a minimal runtime stub, and a handler map must
   // not require a fully-populated tuning block to be constructed.
   const rc = runtime.runtimeConfig as Partial<AshbyRuntime['runtimeConfig']> | undefined;
+  // Same channel the runtime loop logs on, so a prefilter skip and a queue
+  // event sit side by side in one stream.
+  const logger = createLogger('ashby-runtime');
+  // Built ONCE per handler map so its 60s cache is shared across every signal
+  // job. Built per-job it would re-read on each one and defeat its own point.
+  // Omitted entirely when the runtime has no enabled-mapping loader (a
+  // minimal test stub), which leaves the pre-filter unwired and the signal
+  // path byte-identical to its previous behaviour.
+  // Built whenever a loader exists, because the MISMATCH OBSERVER needs it even
+  // while the skip itself is disabled — that is how the evidence for enabling
+  // the flag is gathered.
+  const stageInterest = deps.stageInterest
+    ?? (runtime.enabledMappings
+      ? createStageInterestFilter({ mappings: runtime.enabledMappings })
+      : undefined);
+  // The SKIP is opt-in and runtime-flippable; the observer is not gated.
+  const stagePrefilterEnabled = deps.stagePrefilterEnabled ?? rc?.stagePrefilterEnabled === true;
   const scannerGate = deps.scannerGate
     ?? (() => checkScannerReadiness({ timeoutMs: rc?.scannerReadinessTimeoutMs }));
   const scannerDeferSeconds = deps.scannerDeferSeconds
@@ -510,12 +674,17 @@ export function buildAshbyHandlers(
     // ── 1. Signal: re-read authoritative state, gate, and schedule an import ──
     [ASHBY_SIGNAL_QUEUE]: async (job) => {
       const payload = job.payload as AshbySignalPayload;
-      await processAshbySignal(payload, {
+      const signalResult = await processAshbySignal(payload, {
         client: runtime.client,
         mappings: runtime.mappings,
         receipts: runtime.receipts,
         // candidateDelete stays capability-gated OFF until a tenant probe.
         candidateDeleteEnabled: false,
+        // Local, fail-open pre-filter: spend no provider round-trip on a stage
+        // no enabled mapping names. Undefined here simply means no fast path.
+        ...(stageInterest && stagePrefilterEnabled
+          ? { isStageOfInterest: stageInterest }
+          : {}),
         onImportEligible: async ({ applicationId }) => {
           // Dedup by APPLICATION: a duplicate webhook, a redelivery, and a
           // reconciliation recovery all collapse onto one live import job.
@@ -525,7 +694,57 @@ export function buildAshbyHandlers(
             { dedupKey: importDedupKey(applicationId), maxAttempts: 5 },
           );
         },
+        // The ONLY place the hint is checked against authoritative truth. It
+        // runs only where the provider read was already paid for, so it is
+        // free — and without it a systematically wrong hint would be
+        // undetectable at any volume, forever, because the skip path never
+        // reads. A non-zero count here is the signal to defuse the fast path.
+        onStageHintObserved: ({ hintedStageId, authoritativeStageId }) => {
+          if (hintedStageId === authoritativeStageId) return;
+          // A bare hint≠authoritative comparison is NOISE, not evidence: any
+          // application that moved stages between webhook emission and job
+          // execution mismatches, and during a backlog — the state this whole
+          // change exists for — that is the COMMON case. A warn that fires
+          // constantly for benign reasons is not a tripwire.
+          //
+          // Only one mismatch class is dangerous: the authoritative stage IS
+          // one an enabled mapping names, so had the skip been taken on this
+          // hint it would have dropped a real, screenable candidate. Narrowing
+          // to that makes a non-zero count actionable. The lookup is the same
+          // cached set the filter uses, so it costs nothing.
+          if (!stageInterest || typeof authoritativeStageId !== 'string') return;
+          // BOTH halves are required, and asking only the second is the bug
+          // this replaced: a skip happens iff the HINT is unmapped, so without
+          // that half the warn fires hardest while the filter is failing open
+          // (the 5s backoff window answers `true` for everything) — precisely
+          // when no skip was possible and nothing could have been dropped.
+          // `stageInterest` is wrapped in the promise chain, not called as an
+          // argument, so a synchronous throw from a sync seam is caught here
+          // rather than escaping to the caller.
+          void Promise.resolve()
+            .then(async () => {
+              const hintWouldSkip = (await stageInterest(hintedStageId)) === false;
+              if (!hintWouldSkip) return;
+              const authoritativeIsMapped = (await stageInterest(authoritativeStageId)) === true;
+              if (!authoritativeIsMapped) return;
+              logger.warn('unknown_event', {
+                error_category: 'ashby_stage_hint_would_have_skipped',
+                error_type: 'signal_prefilter',
+              });
+            })
+            .catch(() => { /* observation must never fail a signal */ });
+        },
       });
+      // Metadata only — a sanitized decision code, never an identifier. The
+      // incident this change fixes was invisible precisely because a queue can
+      // complete jobs while doing nothing useful; a skip that logs nothing
+      // would repeat that.
+      if (signalResult.decision === 'stage_not_of_interest') {
+        logger.info('unknown_event', {
+          error_category: 'ashby_signal_prefilter_skipped',
+          error_type: signalResult.decision,
+        });
+      }
     },
 
     // ── 2. Import: link + invite operations + ingestion work item ────────────

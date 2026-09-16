@@ -240,6 +240,20 @@ export interface AshbyRuntimeConfig {
    * Safe by construction — not advancing is the conservative failure.
    */
   reconcileAnchorDisabled: boolean;
+  /**
+   * Opt IN to the local stage pre-filter that skips the `application.info`
+   * read for a stage no enabled mapping names.
+   *
+   * Default OFF. The filter's safety argument rests on the webhook payload's
+   * stage claim being the stage the application MOVED TO — a shape this
+   * codebase documents as tenant-verifiable rather than verified, and which
+   * nothing has yet confirmed for this tenant. `onStageHintObserved` collects
+   * that evidence on the authoritative path whether or not this flag is on, so
+   * one release of observation makes enabling it a measured decision instead
+   * of an assumption. Runtime-flippable precisely so unwiring it never needs a
+   * deploy.
+   */
+  stagePrefilterEnabled: boolean;
 }
 
 /** Clamp a raw env integer into [min,max]; any malformed value yields `def`. */
@@ -329,6 +343,8 @@ export function loadAshbyRuntimeConfig(
       ),
     },
     reconcileAnchorDisabled: source.ASHBY_RECONCILE_ANCHOR_DISABLED === 'true',
+    // Opt-in: absent or anything but 'true' leaves the pre-filter off.
+    stagePrefilterEnabled: source.ASHBY_STAGE_PREFILTER_ENABLED === 'true',
   };
 }
 
@@ -383,6 +399,7 @@ export function describeAshbyRuntime(
   scannerDeferDeadlineMs: number;
   reconcileSweepIntervalMs: number;
   reconcileAnchorDisabled: boolean;
+  stagePrefilterEnabled: boolean;
 } {
   return {
     runtimeEnabled: runtime.runtimeEnabled,
@@ -403,5 +420,6 @@ export function describeAshbyRuntime(
     scannerDeferDeadlineMs: runtime.scannerDeferDeadlineMs,
     reconcileSweepIntervalMs: runtime.reconcileSweepIntervalMs,
     reconcileAnchorDisabled: runtime.reconcileAnchorDisabled,
+    stagePrefilterEnabled: runtime.stagePrefilterEnabled,
   };
 }
