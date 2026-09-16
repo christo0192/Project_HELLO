@@ -79,6 +79,14 @@
 alter table screening_v2.ashby_application_links
   add column if not exists stage_synced_at timestamptz;
 
+-- Partial: until the stage sync lands the predicate matches no rows, so this is
+-- an empty index that answers "has anything been observed?" without touching the
+-- table — and it stays the right index afterwards. The probe runs on every
+-- dashboard load, for every interviewer.
+create index if not exists idx_ashby_links_stage_synced
+  on screening_v2.ashby_application_links (job_mapping_id)
+  where stage_synced_at is not null;
+
 comment on column screening_v2.ashby_application_links.stage_synced_at is
   'When external_stage_id was last confirmed against Ashby AFTER import. NULL '
   'means the column still holds the import-time constant (the AI screening '
@@ -233,6 +241,11 @@ comment on table screening_v2.funnel_rollup_runs is
   'window writes no rows, and rows outside the trailing window are never '
   're-stamped.';
 
+-- Required, not optional: policy_tests.sql asserts that EVERY table in
+-- screening_v2 has RLS enabled, and this would have been the only one of 66
+-- without it. No policy is defined, so the deny-by-default posture is exactly
+-- right — only the service role (which bypasses RLS) ever reads it.
+alter table screening_v2.funnel_rollup_runs enable row level security;
 revoke all on screening_v2.funnel_rollup_runs from anon, authenticated, public;
 grant select on screening_v2.funnel_rollup_runs to service_role;
 
@@ -337,8 +350,12 @@ begin
   -- that is the whole point. It is inside the same transaction as the rebuild,
   -- so it can never claim a run that was rolled back, and it is never reached
   -- on the `busy` path above, so it cannot claim a run that did not happen.
+  -- `now()`, NOT `p_now`. The parameter is caller-supplied and only defines the
+  -- WINDOW; stamping it as the run time lets any caller move the freshness the
+  -- dashboard reports. The test harness calls with `now() + 400 days` to reach
+  -- an empty window and would otherwise leave a freshness date next year.
   insert into screening_v2.funnel_rollup_runs (id, ran_at, window_start, rows_written)
-  values (1, p_now, v_window_start, v_rows)
+  values (1, now(), v_window_start, v_rows)
   on conflict (id) do update
     set ran_at = excluded.ran_at,
         window_start = excluded.window_start,

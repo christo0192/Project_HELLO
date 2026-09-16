@@ -390,12 +390,26 @@ export async function loadFunnelSummary(
       if (!input.omitTimings) return row;
       const { median_ttfc_sec: _m, p95_ttfc_sec: _p, ...rest } = row;
       // The percentiles were never the only per-INDIVIDUAL quantity here. On a
-      // day whose `candidates_total` is 1, `total_call_seconds` IS that
-      // person's call duration and `attempts_total` is how many times we rang
-      // them — and an interviewer can ask for any single role and any single
-      // day, so producing such a day is a URL, not an accident. Stripping the
+      // day that resolves to one person, `total_call_seconds` IS their call
+      // duration and `attempts_total` is how many times we rang them — and an
+      // interviewer can ask for any single role and any single day, so
+      // producing such a day is a URL, not an accident. Stripping the
       // percentiles while leaving these was a privacy control in name only.
-      if (Number(rest.candidates_total ?? 0) === 1) {
+      //
+      // THREE triggers, because `candidates_total === 1` alone is not the
+      // question:
+      //  * `!schemaCurrent` — the legacy column set has no `candidates_total`
+      //    at all, so it zero-fills and `=== 1` is never true. The strip was
+      //    inert in exactly the deploy window `schema_current` exists for.
+      //  * `<= 1` rather than `=== 1` — a purged candidate (DSAR) leaves the
+      //    frozen call counters behind with `candidates_total` back at 0, which
+      //    still resolves to one individual.
+      //  * `connects_total <= 1` — a day can hold several candidates of whom
+      //    only ONE had a valid phone, and then the call counters are that
+      //    person's however large `candidates_total` is.
+      const total = Number(rest.candidates_total ?? 0);
+      const connects = Number(rest.connects_total ?? 0);
+      if (!schemaCurrent || total <= 1 || connects <= 1) {
         const { total_call_seconds: _s, attempts_total: _a, connects_total: _c, ...coarse } = rest;
         return coarse;
       }

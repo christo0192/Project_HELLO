@@ -833,7 +833,15 @@ export interface FunnelConversions {
   hr_advance_rate: number | null;
 }
 
-export interface FunnelDailyRow extends FunnelSummaryTotals {
+/**
+ * One day of the funnel series.
+ *
+ * `/api/funnel/summary` REMOVES fields from these rows: the latency percentiles
+ * always, and the per-individual call counters on a day that resolves to a
+ * single candidate. Typing them as required let a future chart read
+ * `r.total_call_seconds`, compile clean, and plot `undefined`.
+ */
+export interface FunnelDailyRow extends Partial<FunnelSummaryTotals> {
   cohort_day: string;
   role_id: string | null;
   median_ttfc_sec: number | null;

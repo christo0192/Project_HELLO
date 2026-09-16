@@ -516,12 +516,47 @@ describe('loadFunnelSummary — figures', () => {
     expect(out.totals.total_call_seconds).toBe(412);
   });
 
-  it('keeps those counters on a day with more than one candidate', async () => {
+  it('keeps those counters on a day that resolves to several people', async () => {
+    // Several candidates AND several connects: no single person's call is
+    // recoverable from the row.
     const { reader } = healthy({
-      window: () => ok([row({ candidates_total: 4, total_call_seconds: 900 })]),
+      window: () => ok([row({ candidates_total: 4, connects_total: 5, total_call_seconds: 900 })]),
     });
     const out = await loadFunnelSummary(reader, { omitTimings: true, roleId: 'role-a' });
     expect(out.series[0]).toMatchObject({ total_call_seconds: 900 });
+  });
+
+  it('withholds them when several candidates but only ONE was reached', async () => {
+    // `candidates_total === 1` alone missed this: four candidates of whom one
+    // had a valid phone still makes the call counters that one person's.
+    const { reader } = healthy({
+      window: () => ok([row({ candidates_total: 4, connects_total: 1, total_call_seconds: 412 })]),
+    });
+    const out = await loadFunnelSummary(reader, { omitTimings: true, roleId: 'role-a' });
+    expect(out.series[0]).not.toHaveProperty('total_call_seconds');
+  });
+
+  it('withholds them on a pre-0098 server, where candidates_total is absent', async () => {
+    // THE case the `=== 1` predicate could never catch: the legacy column set
+    // has no `candidates_total`, so it zero-fills and the strip was inert in
+    // exactly the deploy window `schema_current` exists for.
+    const { reader } = makeReader({
+      window: (_q, nth) =>
+        nth === 1
+          ? fail('42703')
+          : ok([{
+              cohort_day: '2026-09-10', role_id: 'role-a',
+              dialed: 1, connected: 1, connects_total: 1, attempts_total: 2,
+              total_call_seconds: 412, median_ttfc_sec: 9, p95_ttfc_sec: 9,
+              refreshed_at: '2026-09-16T06:00:00Z',
+            }]),
+      freshness: () => ok([{ ran_at: '2026-09-16T06:00:00Z' }]),
+      mappings: () => ok([]),
+    });
+    const out = await loadFunnelSummary(reader, { omitTimings: true, roleId: 'role-a' });
+    expect(out.meta.schema_current).toBe(false);
+    expect(out.series[0]).not.toHaveProperty('total_call_seconds');
+    expect(out.series[0]).not.toHaveProperty('attempts_total');
   });
 
   it('nulls role_id on every series row', async () => {

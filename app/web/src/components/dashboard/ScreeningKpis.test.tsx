@@ -532,12 +532,14 @@ describe('ScreeningKpis', () => {
     expect(await cardText('Candidates dialled')).toContain('5');
   });
 
-  it('does not warn about frozen days on a range inside the refresh window', async () => {
-    // The threshold was unpinned in the other direction: `>` → `>=` fires the
-    // warning on the DEFAULT 30-day view for every user, forever, and the
-    // existing test (90 > 30) passes either way.
+  it('does not warn when the range EQUALS the refresh window', async () => {
+    // The boundary, and the only fixture that separates `>` from `>=`. The
+    // default range is 30 and the default window is 30: `30 > 30` is false,
+    // `30 >= 30` is true. A `>=` mutation fires this warning on the default
+    // view for every user, forever — and a fixture of 90 (as this test first
+    // used) is false under both, so it proved nothing.
     getScreeningFunnel.mockResolvedValue(
-      funnel({ candidates_total: 4 }, { meta: { refresh_window_days: 90 } }),
+      funnel({ candidates_total: 4 }, { meta: { refresh_window_days: 30 } }),
     );
     renderKpis();
     await cardText('Total candidates');
@@ -563,7 +565,80 @@ describe('ScreeningKpis', () => {
     // The banner claims "everything below will read zero" — printed above
     // figures that are plainly not zero.
     expect(screen.queryAllByText(/have not been calculated yet/i)).toHaveLength(0);
-    expect(screen.queryAllByText(/last recalculated/i)).toHaveLength(0);
+    // "Figures last recalculated <date>" specifically — the new "we could not
+    // check when these figures were last recalculated" line legitimately
+    // contains the same phrase, so a loose matcher rejects the right answer.
+    expect(screen.queryAllByText(/Figures last recalculated/i)).toHaveLength(0);
+    // …and "unknown" must not render as SILENCE. A reader cannot tell a failed
+    // check from a deliberate omission.
+    expect(await screen.findByText(/could not check when these figures/i)).toBeInTheDocument();
+  });
+
+  it('still warns about frozen days when freshness is unknown', async () => {
+    // The warning was nested inside the freshness paragraph, so a failed probe
+    // silently took it along — yet how far back the roll-up reaches has nothing
+    // to do with whether we could read when it last ran.
+    getScreeningFunnel.mockResolvedValue(
+      funnel({ candidates_total: 4 }, { meta: { rollup_freshness_known: false, refresh_window_days: 7 } }),
+    );
+    renderKpis();
+    await cardText('Total candidates');
+    expect(await screen.findByText(/Days older than 7 are no longer recalculated/i))
+      .toBeInTheDocument();
+  });
+
+  it('does not cry "never calculated" over figures that are plainly not zero', async () => {
+    // The heartbeat is written by the refresh, which 0098's backfill does not
+    // call — so a tenant whose roll-up has run for weeks has an empty heartbeat
+    // from the moment the migration lands until the next 15-minute pass. The
+    // banner would announce "everything below will read zero" above 4,812 dials.
+    getScreeningFunnel.mockResolvedValue(
+      funnel({ candidates_total: 4812, dialed: 4812 }, { meta: { rollup_refreshed_at: null } }),
+    );
+    renderKpis();
+    await cardText('Total candidates');
+    expect(screen.queryAllByText(/have not been calculated yet/i)).toHaveLength(0);
+  });
+
+  it('DOES say so when the figures are all zero and the roll-up never ran', async () => {
+    getScreeningFunnel.mockResolvedValue(funnel({}, { meta: { rollup_refreshed_at: null } }));
+    renderKpis();
+    const banners = (await screen.findAllByText(/have not been calculated yet/i))
+      .filter((n) => !n.closest('details'));
+    expect(banners).toHaveLength(1);
+  });
+
+  it('shows Total candidates while loading, not only after the response', async () => {
+    // `schema_current === true` fails closed — correct — but on the FIRST paint
+    // there is no `meta` at all, so the card disappeared until the response
+    // landed: a 4th card popping into a 3-card row, and loading rendered
+    // identically to a server too old to answer.
+    let release: (v: unknown) => void = () => {};
+    getScreeningFunnel.mockReset();
+    getScreeningFunnel.mockImplementation(
+      () => new Promise((r) => { release = r; }).then(() => funnel({ candidates_total: 9 })),
+    );
+    renderKpis();
+
+    expect((await screen.findAllByText('Total candidates')).filter((n) => !n.closest('details')))
+      .toHaveLength(1);
+    release(null);
+    expect(await cardText('Total candidates')).toContain('9');
+  });
+
+  it('suppresses a rate that exceeds its own denominator', async () => {
+    // `connected > dialed` is reachable when a carrier webhook lands for an
+    // attempt whose dial row was never written. "Connect rate 267%" beside
+    // "Candidates dialled 3" is not a number anyone should interpret, and
+    // clamping it to 100% would read as a real, perfect result.
+    getScreeningFunnel.mockResolvedValue(funnel({ dialed: 3, connected: 8 }));
+    renderKpis();
+    const card = await cardText('Connect rate');
+    expect(card).toContain('—');
+    expect(card).not.toContain('267');
+    expect(card).not.toContain('100%');
+    // …and the contradiction is named, not just hidden.
+    expect(await screen.findByText(/cannot be split cleanly/i)).toBeInTheDocument();
   });
 
   it('names every band group and resolves each label', async () => {

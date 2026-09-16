@@ -189,6 +189,47 @@ insert into screening_v2.ashby_application_links
   ('70000000-0000-0000-0000-000000000031', 'app_f1', 'stage_ai', '60000000-0000-0000-0000-000000000002', '20000000-0000-0000-0000-000000000031'),
   ('70000000-0000-0000-0000-000000000032', 'app_f2', 'stage_ai', '60000000-0000-0000-0000-000000000002', '20000000-0000-0000-0000-000000000032');
 
+-- ── MIXED LINKS: one observed, one never looked at ────────────────────────
+-- The `observable` gate fires on the candidate, but each stage clause must
+-- carry its OWN `stage_synced_at`. Without that, a candidate made "observable"
+-- by link A has their STAGE read off link B, which nobody ever confirmed —
+-- the same unproven inference relocated one line down. No other fixture mixes
+-- the two, so both per-clause guards were unfalsifiable until now.
+--
+-- G1: A is synced and sits at neither mapped stage (a real HR move); B is
+--     unsynced and happens to hold the reference-check stage id. Correct
+--     answer: disqualified. With the guard dropped: qualified.
+-- G2: the mirror — A synced at reference check, B unsynced at the screening
+--     stage. Correct: qualified. With the guard dropped: still qualified, but
+--     via `at_ai_screening` losing to precedence, so G1 is the load-bearing one.
+insert into screening_v2.candidates (id, role_id, phone_valid, parsed) values
+  ('20000000-0000-0000-0000-000000000041', '10000000-0000-0000-0000-000000000002', true, '{}'),
+  ('20000000-0000-0000-0000-000000000042', '10000000-0000-0000-0000-000000000002', true, '{}');
+insert into screening_v2.call_sessions (id, candidate_id, status) values
+  ('30000000-0000-0000-0000-000000000041', '20000000-0000-0000-0000-000000000041', 'completed'),
+  ('30000000-0000-0000-0000-000000000042', '20000000-0000-0000-0000-000000000042', 'completed');
+insert into screening_v2.assessments (session_id, candidate_id, recommendation, scoring_status) values
+  ('30000000-0000-0000-0000-000000000041', '20000000-0000-0000-0000-000000000041', 'advance', 'complete'),
+  ('30000000-0000-0000-0000-000000000042', '20000000-0000-0000-0000-000000000042', 'advance', 'complete');
+insert into screening_v2.ashby_application_links
+  (id, external_application_id, external_stage_id, job_mapping_id, candidate_id, stage_synced_at) values
+  ('70000000-0000-0000-0000-000000000041', 'app_g1a', 'stage_rejected', '60000000-0000-0000-0000-000000000002', '20000000-0000-0000-0000-000000000041', now()),
+  ('70000000-0000-0000-0000-000000000042', 'app_g1b', 'stage_ref2',     '60000000-0000-0000-0000-000000000002', '20000000-0000-0000-0000-000000000041', null),
+  ('70000000-0000-0000-0000-000000000043', 'app_g2a', 'stage_ref2',     '60000000-0000-0000-0000-000000000002', '20000000-0000-0000-0000-000000000042', now()),
+  ('70000000-0000-0000-0000-000000000044', 'app_g2b', 'stage_ai',       '60000000-0000-0000-0000-000000000002', '20000000-0000-0000-0000-000000000042', null);
+
+do $$
+declare t text;
+begin
+  select hr_state into t from screening_v2.v_funnel_hr_state where candidate_id = '20000000-0000-0000-0000-000000000041';
+  if t is distinct from 'disqualified' then
+    raise exception 'G1 MUST be disqualified, got % — the reference-check stage was read off a SECOND link that has never been confirmed, just because a different link made the candidate observable', t;
+  end if;
+  select hr_state into t from screening_v2.v_funnel_hr_state where candidate_id = '20000000-0000-0000-0000-000000000042';
+  if t is distinct from 'qualified' then raise exception 'G2 MUST be qualified, got %', t; end if;
+  raise notice 'MIXED-LINK ASSERTIONS PASSED';
+end $$;
+
 do $$
 declare t text;
 begin
@@ -263,14 +304,14 @@ begin
    order by cohort_day desc limit 1;
   if r is null then raise exception 'no rollup row for the fully-wired role'; end if;
 
-  if r.candidates_total <> 7 then raise exception 'role2 candidates_total 7, got %', r.candidates_total; end if;
-  if r.hr_qualified <> 1 then raise exception 'role2 hr_qualified 1 (D5), got %', r.hr_qualified; end if;
+  if r.candidates_total <> 9 then raise exception 'role2 candidates_total 9, got %', r.candidates_total; end if;
+  if r.hr_qualified <> 2 then raise exception 'role2 hr_qualified 2 (D5, G2), got %', r.hr_qualified; end if;
   if r.hr_awaiting <> 1 then raise exception 'role2 hr_awaiting 1 (D1 only — F1/F2 are NOT awaiting), got %', r.hr_awaiting; end if;
-  if r.hr_disqualified <> 1 then raise exception 'role2 hr_disqualified 1 (D2 only), got %', r.hr_disqualified; end if;
+  if r.hr_disqualified <> 2 then raise exception 'role2 hr_disqualified 2 (D2, G1), got %', r.hr_disqualified; end if;
   if r.hr_unknown <> 3 then raise exception 'role2 hr_unknown 3 (D3, F1, F2), got %', r.hr_unknown; end if;
   -- D4 has no assessment, so it is in candidates_total and in NO hr bucket.
-  if r.hr_qualified + r.hr_disqualified + r.hr_awaiting + r.hr_unknown <> 6 then
-    raise exception 'role2: the four hr buckets must sum to the 6 SCREENED candidates, got %',
+  if r.hr_qualified + r.hr_disqualified + r.hr_awaiting + r.hr_unknown <> 8 then
+    raise exception 'role2: the four hr buckets must sum to the 8 SCREENED candidates, got %',
       r.hr_qualified + r.hr_disqualified + r.hr_awaiting + r.hr_unknown;
   end if;
 
@@ -301,7 +342,7 @@ begin
 
   select * into r from screening_v2.funnel_stage_daily
    where role_id = '10000000-0000-0000-0000-000000000002' limit 1;
-  if r.hr_disqualified <> 1 or r.candidates_total <> 7 then
+  if r.hr_disqualified <> 2 or r.candidates_total <> 9 then
     raise exception 're-refresh changed the HR counts: hr_disqualified=%, candidates_total=%',
       r.hr_disqualified, r.candidates_total;
   end if;
@@ -323,10 +364,17 @@ begin
   v_before := r.ran_at;
 
   -- The load-bearing case: a window that matches NOTHING still counts as a run.
+  perform pg_sleep(0.01);
   perform screening_v2.refresh_funnel_rollup(now() + interval '400 days', 1);
   select * into r from screening_v2.funnel_rollup_runs where id = 1;
   if r.ran_at <= v_before then
     raise exception 'a refresh that wrote no rows MUST still stamp the heartbeat (was %, now %)', v_before, r.ran_at;
+  end if;
+  -- …with WALL CLOCK, not the caller's p_now. That call passed a timestamp 400
+  -- days ahead; stamping it would have the dashboard report a freshness date
+  -- next year, and any caller could move it at will.
+  if r.ran_at > now() + interval '1 minute' then
+    raise exception 'ran_at must be wall clock, not the p_now argument — got % for a call made with now() + 400 days', r.ran_at;
   end if;
   if r.rows_written <> 0 then
     raise exception 'expected 0 rows written for an empty window, got %', r.rows_written;

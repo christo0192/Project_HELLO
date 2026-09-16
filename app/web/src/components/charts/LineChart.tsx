@@ -89,7 +89,10 @@ export function LineChart({
         data: data.map((d) => d.label),
         axisLine: { show: false },
         axisTick: { show: false },
-        axisLabel: { color: palette.subtext, margin: 12 },
+        // `hideOverlap` so the axis drops labels cleanly rather than at a
+        // fixed interval: a discrete series is told to "check the dates", and
+        // that only helps if the dates it keeps are legible.
+        axisLabel: { color: palette.subtext, margin: 12, hideOverlap: true },
       },
       yAxis: {
         type: 'value',
@@ -115,7 +118,11 @@ export function LineChart({
           data: data.map((d) => d.value),
           smooth: discrete ? false : 0.35,
           symbol: 'circle',
-          symbolSize: 5,
+          // Markers restore the "discrete observations" reading a spliced axis
+          // destroys — but at 5px plus a 1.5px border they merge into a solid
+          // band once points are closer together than ~8px, which on a 90-day
+          // half-width chart is well before the series ends.
+          symbolSize: discrete && data.length > 45 ? 3 : 5,
           // `discrete` forces markers on however dense the series: hiding them
           // is only safe when consecutive points are consecutive periods.
           showSymbol: discrete || data.length <= 20,

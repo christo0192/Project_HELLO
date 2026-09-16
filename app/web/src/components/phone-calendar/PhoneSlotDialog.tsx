@@ -78,15 +78,14 @@ export interface PhoneSlotDialogProps {
 /**
  * Tabbable elements inside the panel, in document order.
  *
- * `:disabled` rather than `:not([disabled])` is load-bearing. The attribute
- * selector only sees a control's OWN attribute, and PhoneSlotPicker disables
- * its slots with `<fieldset disabled>` — those radios are genuinely
- * unfocusable but carry no attribute. While `saving`, the date input, Cancel
- * and Confirm all gain a real `disabled`, so the attribute-only list collapsed
- * to nothing but those radios; Tab then called `preventDefault()` and focused
- * an unfocusable element, i.e. Tab did nothing at all and focus could land on
- * `<body>` — a keyboard trap with no exit, exactly what the trap exists to
- * prevent.
+ * `:disabled` rather than `:not([disabled])` because the attribute selector
+ * only sees a control's OWN attribute, and a control disabled by an ancestor
+ * `<fieldset disabled>` carries none. Today PhoneSlotPicker sets `disabled` on
+ * both the fieldset AND each radio, so the two selectors agree — this is
+ * defence against the version of that component that stops doing so, not a fix
+ * for a live bug. `:disabled` is valid on every selector in the list: it simply
+ * never matches an `a[href]` or a `div[tabindex]`, and per spec it correctly
+ * spares controls inside a disabled fieldset's FIRST `<legend>`.
  *
  * Deliberately NOT filtered on `offsetParent !== null`: that is null for every
  * descendant of a `position: fixed` subtree — which is this entire dialog — and
@@ -197,8 +196,14 @@ export function PhoneSlotDialog({
         return;
       }
       if (items.length === 0) {
-        e.preventDefault();
-        panel.focus();
+        // Let Tab GO. This is reachable exactly while `saving`: the date input,
+        // every slot radio, Cancel and Confirm all carry a real `disabled`, so
+        // there is nothing left to cycle between. Escape is refused while
+        // saving and so is the backdrop, so swallowing Tab as well would close
+        // the last exit and leave a keyboard user sealed in a modal for the
+        // duration of a POST that has no client-side timeout — WCAG 2.1.2, and
+        // an unbounded trap if the request stalls. Nothing to trap means
+        // nothing to protect.
         return;
       }
       const first = items[0]!;
@@ -223,14 +228,16 @@ export function PhoneSlotDialog({
       /* Inline, because it must beat whatever the mount point applies. With no
          portal this overlay is a plain child of the page, and its actual parent
          on the candidate page is a `space-y-6` stack — whose sibling selector
-         (`> :not([hidden]) ~ :not([hidden])`, specificity 0,2,0) outranks any
+         (`> :not([hidden]) ~ :not([hidden])`, specificity 0,3,0) outranks any
          `mt-0` utility. That margin shrinks a `top:0; bottom:0; height:auto`
          box and shifts it down: the backdrop started 24px below the viewport
          top, leaving the app header un-dimmed and still clickable behind an
          `aria-modal` dialog — open the nav drawer from there and Escape then
-         closes the wrong thing. A fixed overlay must never inherit flow margins
-         from where it happens to be mounted. */
-      style={{ marginTop: 0, marginBottom: 0 }}
+         closes the wrong thing. All four sides, not just the block axis: a
+         `space-x-*` or `divide-x-*` parent moves a `left:0; right:0` box
+         exactly the same way. A fixed overlay must never inherit flow margins
+         from wherever it happens to be mounted. */
+      style={{ margin: 0 }}
     >
       {/* Backdrop. A plain div, not a button: a click-focusable control inside
           `aria-hidden` is an axe "needs review" and a nameless button one edit

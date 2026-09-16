@@ -68,6 +68,12 @@ function dayOffset(days: number): string {
  */
 function pct(num: number, den: number): number | null {
   if (!den || den <= 0) return null;
+  // A share cannot exceed its whole. `connected` and `dialed` come from
+  // different writers, so a missed dial row or a late carrier webhook can make
+  // it so — and "Connect rate 267%" beside "Candidates dialled 3" is not a
+  // number anyone should try to interpret. Unknown, not clamped to 100: a
+  // silent clamp would read as a real, perfect result.
+  if (num > den) return null;
   return Math.round((num / den) * 100);
 }
 
@@ -230,7 +236,24 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
   // above non-zero figures that had loaded perfectly well.
   const freshnessKnown = meta?.rollup_freshness_known === true;
   const rollupRefreshedAt = freshnessKnown ? (meta?.rollup_refreshed_at ?? null) : null;
-  const neverComputed = data !== null && freshnessKnown && rollupRefreshedAt === null;
+  /**
+   * "Never computed" is a claim about a system, and it is only safe to make
+   * when the figures agree with it. The heartbeat is written by
+   * `refresh_funnel_rollup`, which 0098's backfill deliberately does NOT call —
+   * so a tenant whose roll-up has been running for weeks has an EMPTY heartbeat
+   * from the moment 0098 is applied until the next 15-minute pass. Announcing
+   * "these figures have not been calculated yet, everything below will read
+   * zero" over `Candidates dialled 4,812` is the same lie this field was added
+   * to prevent, one level up. Requiring the numbers to actually be zero costs
+   * nothing and closes it.
+   */
+  const everythingZero = !t || Object.values(t).every((v) => v === 0);
+  const neverComputed =
+    data !== null && freshnessKnown && rollupRefreshedAt === null && everythingZero
+    // A server too old to have the columns has a better explanation available,
+    // and the two messages contradict each other: one says the figures will
+    // read zero, the other that they are hidden RATHER than shown as zero.
+    && schemaCurrent;
   const hrUnavailable = data !== null && (!schemaCurrent || !hrConfigured);
   const staleBeyondDays = meta?.refresh_window_days ?? null;
 
@@ -261,7 +284,8 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
    * questions 5" with the bucket that would reconcile them showing 0. Say so
    * rather than letting the clamp quietly hide it.
    */
-  const countsDisagree = !!t && t.answered_ge1 > t.connected;
+  const countsDisagree =
+    !!t && (t.answered_ge1 > t.connected || t.connected > t.dialed);
 
   /**
    * Rate series with the no-denominator days REMOVED rather than plotted as 0.
@@ -376,7 +400,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
       {!error && neverComputed && (
         <InlineNotice tone="warning" className="mt-4">
           These figures have not been calculated yet. Everything below will read
-          zero until the first nightly roll-up runs — that is not the same as
+          zero until the first roll-up runs — that is not the same as
           “nothing happened”.
         </InlineNotice>
       )}
@@ -386,9 +410,27 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
           Figures last recalculated {new Date(rollupRefreshedAt).toLocaleString()}. Candidates
           are counted on the day they entered, so the most recent days are still filling in —
           the last day or two always looks lower than it will end up.
-          {staleBeyondDays !== null && rangeDays > staleBeyondDays
-            ? ` Days older than ${staleBeyondDays} are no longer recalculated, so every figure for the earlier part of this range is frozen at its last update and will under-count activity that happened after it.`
-            : ''}
+        </p>
+      )}
+
+      {/* Deliberately OUTSIDE the freshness paragraph. It was nested inside it,
+          so a failed freshness probe silently took this warning with it — and
+          how far back the roll-up reaches has nothing to do with whether we
+          could read when it last ran. */}
+      {!error && data !== null && staleBeyondDays !== null && rangeDays > staleBeyondDays && (
+        <p className="mt-2 text-[12px] text-ink-secondary">
+          Days older than {staleBeyondDays} are no longer recalculated, so every figure for the
+          earlier part of this range is frozen at its last update and will under-count activity
+          that happened after it.
+        </p>
+      )}
+
+      {/* "Unknown" must not render as silence — the reader cannot tell it from
+          a deliberate omission. */}
+      {!error && data !== null && !freshnessKnown && (
+        <p className="mt-2 text-[12px] text-ink-secondary">
+          We could not check when these figures were last recalculated, so they may be older
+          than they look.
         </p>
       )}
 
@@ -407,7 +449,12 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                 KpiBand, leaving an empty grid cell that reads as a card which
                 failed to load — directly contradicting the notice above saying
                 the figure is hidden deliberately. KpiBand now drops it. */}
-            {schemaCurrent && (
+            {/* `data === null` is the FIRST LOAD, where `meta` is absent and
+                every derived flag is therefore false. Without it, `=== true`
+                removed this card until the response arrived — a 4th card
+                popping into a 3-card row, and loading made indistinguishable
+                from a server too old to answer. */}
+            {(data === null || schemaCurrent) && (
               <KpiCard
                 label="Total candidates"
                 value={t?.candidates_total ?? 0}
@@ -522,7 +569,11 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
             />
           </KpiBand>
 
-          {hrUnavailable ? (
+          {/* `data === null` included: `hr_tracking_configured` is false for
+              every tenant today, so without it EVERY load renders three
+              skeleton cards and then replaces them with this notice — the same
+              content-jump the DashboardPage role gate exists to avoid. */}
+          {data === null || hrUnavailable ? (
             <div className="mt-5">
               <div className="mb-2 flex flex-wrap items-baseline gap-x-2 gap-y-1">
                 <h3 className="text-[13px] font-semibold uppercase tracking-wide text-ink-secondary">
@@ -676,8 +727,13 @@ function KpiBand({
             producing a real grid cell with no content — which reads as a card
             that failed to load, not one withheld on purpose — and shifted the
             index keys of every sibling whenever the condition flipped. */}
+        {/* `toArray` assigns each child a stable key that survives a sibling
+            being dropped. Putting the INDEX back on the wrapper threw that
+            away: when `schema_current` flips mid-rollout every card shifts one
+            position, React re-keys them all, and each KpiCard remounts and
+            restarts its RollingNumber. */}
         {Children.toArray(children).map((child, i) => (
-          <RevealItem key={i}>{child}</RevealItem>
+          <RevealItem key={(child as React.ReactElement).key ?? i}>{child}</RevealItem>
         ))}
         </RevealGroup>
       </div>
@@ -785,7 +841,7 @@ function MetricNotes({
         </dl>
         <p className="mt-4 text-[12px] text-ink-secondary">
           {neverComputed
-            ? 'These figures have not been calculated yet — every number above will read zero until the first roll-up runs.'
+            ? 'These figures have not been calculated yet — every number above will read zero until the first refresh runs.'
             : 'Figures refresh periodically, so a call from the last few minutes may not be included yet.'}
         </p>
       </details>
