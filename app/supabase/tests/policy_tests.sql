@@ -15055,6 +15055,242 @@ end;
 $$;
 
 -- ═══════════════════════════════════════════════════════════════════════
+-- 0097 — resume_ashby_ingestion_midflight: the audited re-drive of a row
+--        a DEAD PROCESS stranded mid-flight.
+--
+-- RCA 2026-09-16: an API restart left two ingestions in `scanning`. The
+-- handler's only entry transition is `-> fetching`, which the trigger
+-- refuses from `scanning`, so every retry returned bare, the job was
+-- marked COMPLETED and the row froze for ever with no failure reason and
+-- no health counter. These pin the new door's admission rule, the
+-- liveness bound that stops it yanking a LIVE row backwards, and — most
+-- load-bearing — that `structuring` is NOT admitted, because it is
+-- post-persist and re-driving it walks into the 0084 CAS trap.
+-- ═══════════════════════════════════════════════════════════════════════
+
+select _policy_tests.assert(
+  'ashby 0097: resume_ashby_ingestion_midflight is service-role only and pins search_path',
+  (select count(*)
+     from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+    where n.nspname = 'screening_v2'
+      and p.proname = 'resume_ashby_ingestion_midflight'
+      and p.prosecdef
+      and array_to_string(coalesce(p.proconfig, '{}'), ',') like '%search_path%'
+      and not has_function_privilege('anon', p.oid, 'EXECUTE')
+      and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+      and has_function_privilege('service_role', p.oid, 'EXECUTE')
+  ) = 1,
+  'the mid-flight re-drive must be a service-role-only SECURITY DEFINER '
+  'with a pinned search_path'
+);
+
+-- THE LOAD-BEARING EXCLUSION. `structuring` runs AFTER persist has bound the
+-- candidate and `updateCandidateFromParse` is CAS-guarded on `resume_id is
+-- null`, so a re-drive from there discards the second parse and strands the
+-- candidate outside `recover_ashby_model_degraded` for ever. The trigger must
+-- therefore still have NO `structuring -> queued` edge, and the RPC must not
+-- accept the state.
+select _policy_tests.assert(
+  'ashby 0097: the trigger still refuses structuring -> queued',
+  (select position('''ready'',''failed_review'',''cancelled''' in replace(body, ' ', '')) > 0
+     from (select pg_get_functiondef(p.oid) as body
+             from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+            where n.nspname = 'screening_v2'
+              and p.proname = 'enforce_ashby_ingestion_transition') s),
+  'structuring is post-persist; adding a queued edge would reintroduce the '
+  '0084 CAS trap that leaves a candidate permanently non-dialable'
+);
+
+select _policy_tests.assert(
+  'ashby 0097: the rescue admits scanning and extracting ONLY',
+  (select position('array[''scanning'',''extracting'']' in replace(body, ' ', '')) > 0
+     from (select pg_get_functiondef(p.oid) as body
+             from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+            where n.nspname = 'screening_v2'
+              and p.proname = 'resume_ashby_ingestion_midflight') s),
+  'queued/fetching self-heal and structuring is unsafe; admitting any of them '
+  'would let one worker yank a healthy row out from under another'
+);
+
+-- THE LIVENESS BOUND. A queue lease is not a process: the runner keeps running
+-- a handler whose heartbeat failed and `reclaim_expired_jobs` requeues with no
+-- liveness proof, so a second worker can call this while the first is still
+-- downloading. Without the staleness precondition the rescue re-downloads a
+-- live candidate's resume under the worker that already holds it.
+select _policy_tests.assert(
+  'ashby 0097: the rescue refuses a row touched recently',
+  (select position('recently_active' in body) > 0
+      and position('p_min_stale_seconds' in body) > 0
+     from (select pg_get_functiondef(p.oid) as body
+             from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+            where n.nspname = 'screening_v2'
+              and p.proname = 'resume_ashby_ingestion_midflight') s),
+  'a mid-flight row with a recent updated_at may still belong to a live run'
+);
+
+select _policy_tests.assert(
+  'ashby 0097: the rescue charges the UNCHANGED 0032 attempts ceiling',
+  (select position('v_max_attemptsconstantinteger:=5' in replace(body, ' ', '')) > 0
+      and position('retry_exhausted' in body) > 0
+     from (select pg_get_functiondef(p.oid) as body
+             from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+            where n.nspname = 'screening_v2'
+              and p.proname = 'resume_ashby_ingestion_midflight') s),
+  'the rescue must spend the same budget every other requeue spends, or it '
+  'becomes an unbounded retry of one document'
+);
+
+select _policy_tests.assert(
+  'ashby 0097: the new audit action is permitted and nothing earlier was dropped',
+  (select pg_get_constraintdef(oid) from pg_constraint
+    where conname = 'chk_audit_action'
+      and conrelid = 'screening_v2.audit_events'::regclass)
+    like '%ashby_ingestion_midflight_resume%'
+  and (select bool_and(pg_get_constraintdef(c.oid) like ('%' || a || '%'))
+         from pg_constraint c,
+              unnest(array['invite_sent','grant_issued','recording_quarantined',
+                           'ashby_mapping_update','ashby_operation_retry',
+                           'ashby_invite_delivered','ashby_ingestion_attempts_reset',
+                           'ashby_ingestion_parse_recovery',
+                           'ashby_ingestion_legacy_bad_output_recovery',
+                           'ashby_ingestion_model_degraded_recovery',
+                           'phone_attempt_admitted','phone_callback_confirmed',
+                           'phone_suppression_released']) as a
+        where c.conname = 'chk_audit_action'
+          and c.conrelid = 'screening_v2.audit_events'::regclass),
+  'widening the audit allowlist must be additive — dropping any earlier action '
+  'would silently break every writer that uses it'
+);
+
+-- The mid-flight rest codes are MACHINE-class, so an operator must be able to
+-- recover a row that exhausted the rescue. Before 0097 none of them was in any
+-- allowlist, which made such a row permanently unrecoverable by every door.
+select _policy_tests.assert(
+  'ashby 0097: the mid-flight rest codes are operator-recoverable',
+  (select bool_and(position(code in body) > 0)
+     from (select pg_get_functiondef(p.oid) as body
+             from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+            where n.nspname = 'screening_v2'
+              and p.proname = 'recover_ashby_ingestion_parse') s,
+          unnest(array['ingestion_midflight_exhausted','ingestion_midflight_refused',
+                       'ingestion_midflight_unavailable','ingestion_entry_refused',
+                       'scan_defer_requeue_refused']) as code),
+  'a row that died mid-flight five times must not be unrecoverable by every '
+  'audited door at once'
+);
+
+-- ...and the widening must NOT have admitted a document VERDICT.
+select _policy_tests.assert(
+  'ashby 0097: no document verdict became recoverable',
+  (select bool_and(position(('''' || code || '''') in body) = 0)
+     from (select pg_get_functiondef(p.oid) as body
+             from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+            where n.nspname = 'screening_v2'
+              and p.proname = 'recover_ashby_ingestion_parse') s,
+          unnest(array['scan_infected','parse_extract_failed','parse_bad_output',
+                       'parse_no_output','parse_output_exceeded',
+                       'no_extractable_fields']) as code),
+  'retrying a verdict re-burns attempts on a file that will fail identically, '
+  'and for malware it means downloading it again'
+);
+
+select _policy_tests.assert(
+  'ashby 0097: the health surface counts every mid-flight state',
+  (select position('ingestion_stuck_scanning' in body) > 0
+      and position('ingestion_stuck_extracting' in body) > 0
+      and position('ingestion_stuck_structuring' in body) > 0
+     from (select pg_get_functiondef(p.oid) as body
+             from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+            where n.nspname = 'screening_v2'
+              and p.proname = 'ashby_prerequisite_backlog') s),
+  'the pre-0097 surface counted only the two states that self-heal; the three '
+  'that deadlock were invisible to /health by construction'
+);
+
+-- FUNCTIONAL: the rescue actually moves a stale row and refuses a fresh one.
+do $$
+declare
+  v_link uuid;
+  v_job  uuid;
+  v_out  jsonb;
+begin
+  insert into screening_v2.ashby_application_links
+    (provider, external_application_id, external_candidate_id, external_job_id,
+     external_stage_id, lifecycle)
+  values ('ashby', 'pol97-app', 'pol97-cand', 'pol97-job', 'pol97-stage', 'imported')
+  returning id into v_link;
+
+  -- Each case is SEEDED BY INSERT, never by UPDATE: the transition trigger is
+  -- BEFORE UPDATE, so re-pointing a row's state with an UPDATE would have to
+  -- take a legal edge (`queued -> scanning` is not one) and the setup would
+  -- fail before the assertion it exists to make.
+
+  -- A row stranded 2 hours ago in `scanning` is rescued.
+  insert into screening_v2.ashby_resume_ingestions
+    (application_link_id, provider, state, attempts, updated_at)
+  values (v_link, 'ashby', 'scanning', 0, now() - interval '2 hours');
+
+  v_out := screening_v2.resume_ashby_ingestion_midflight(v_link, 'pol97', 900, now());
+  perform _policy_tests.assert(
+    'ashby 0097 functional: a stale scanning row is re-driven to queued',
+    v_out->>'status' = 'ok' and v_out->>'state' = 'queued'
+      and (v_out->>'attempts')::int = 1,
+    coalesce(v_out::text, 'null'));
+
+  perform _policy_tests.assert(
+    'ashby 0097 functional: the re-drive leaves an audit row',
+    exists (select 1 from screening_v2.audit_events
+             where action = 'ashby_ingestion_midflight_resume'
+               and metadata->>'application_link_id' = v_link::text
+               and metadata->>'from_state' = 'scanning'),
+    'the rescue charges a retry budget and re-downloads a resume; it must be '
+    'attributable');
+
+  -- ...and a FRESH mid-flight row is refused, because a live run may own it.
+  delete from screening_v2.ashby_resume_ingestions where application_link_id = v_link;
+  insert into screening_v2.ashby_resume_ingestions
+    (application_link_id, provider, state, attempts, updated_at)
+  values (v_link, 'ashby', 'scanning', 0, now());
+
+  v_out := screening_v2.resume_ashby_ingestion_midflight(v_link, 'pol97', 900, now());
+  perform _policy_tests.assert(
+    'ashby 0097 functional: a freshly-touched row is refused as recently_active',
+    v_out->>'status' = 'recently_active',
+    coalesce(v_out::text, 'null'));
+
+  -- `structuring` is refused outright, however stale.
+  delete from screening_v2.ashby_resume_ingestions where application_link_id = v_link;
+  insert into screening_v2.ashby_resume_ingestions
+    (application_link_id, provider, state, attempts, updated_at)
+  values (v_link, 'ashby', 'structuring', 0, now() - interval '2 hours');
+
+  v_out := screening_v2.resume_ashby_ingestion_midflight(v_link, 'pol97', 900, now());
+  perform _policy_tests.assert(
+    'ashby 0097 functional: structuring is never re-driven',
+    v_out->>'status' = 'invalid_state' and v_out->>'state' = 'structuring',
+    coalesce(v_out::text, 'null'));
+
+  -- A row that burned the 0032 budget rests instead of looping.
+  delete from screening_v2.ashby_resume_ingestions where application_link_id = v_link;
+  insert into screening_v2.ashby_resume_ingestions
+    (application_link_id, provider, state, attempts, updated_at)
+  values (v_link, 'ashby', 'extracting', 5, now() - interval '2 hours');
+
+  v_out := screening_v2.resume_ashby_ingestion_midflight(v_link, 'pol97', 900, now());
+  perform _policy_tests.assert(
+    'ashby 0097 functional: the attempts ceiling is enforced',
+    v_out->>'status' = 'retry_exhausted',
+    coalesce(v_out::text, 'null'));
+
+  delete from screening_v2.ashby_resume_ingestions where application_link_id = v_link;
+  delete from screening_v2.audit_events
+   where action = 'ashby_ingestion_midflight_resume'
+     and metadata->>'application_link_id' = v_link::text;
+  delete from screening_v2.ashby_application_links where id = v_link;
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════
 

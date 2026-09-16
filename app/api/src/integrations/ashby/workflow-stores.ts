@@ -261,11 +261,16 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       applicationLinkId,
       reasonCode,
     ): Promise<{ status: string; attempts?: number; fromState?: string }> {
-      // The ONLY door through which `structuring -> queued` is reachable, and
-      // the sanctioned one for `scanning`/`extracting` when the owning process
-      // died. The RPC re-checks the state server-side, refuses terminal
-      // applications, and charges the same 5-attempt requeue budget every
-      // other requeue does — this seam does not get to decide any of that.
+      // The sanctioned door for `scanning`/`extracting -> queued` when the
+      // owning process died. The RPC re-checks the state server-side, REFUSES A
+      // ROW TOUCHED RECENTLY (`recently_active` — the lease is not the process,
+      // so a live run may still own it), refuses terminal applications, charges
+      // the same 5-attempt requeue budget every other requeue does, and writes
+      // an audit row. This seam does not get to decide any of that.
+      //
+      // `structuring` is deliberately NOT recoverable: it is post-persist, so a
+      // re-drive hits the 0084 CAS trap. It is counted on the health surface
+      // instead.
       const { data, error } = await client.rpc('resume_ashby_ingestion_midflight', {
         p_application_link_id: applicationLinkId,
         p_reason: reasonCode,

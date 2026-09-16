@@ -215,20 +215,31 @@ export interface RuntimeWorkflowStores extends WorkflowStores {
     reasonCode: string,
   ): Promise<{ status: string; attempts?: number }>;
   /**
-   * Return an ingestion stranded in `scanning`, `extracting` or `structuring`
-   * to `queued` because the PROCESS THAT OWNED IT DIED — a deploy, a restart,
-   * an OOM — never because of anything learned about the document.
+   * Return an ingestion stranded in `scanning` or `extracting` to `queued`
+   * because the PROCESS THAT OWNED IT DIED — a deploy, a restart, an OOM —
+   * never because of anything learned about the document.
    *
    * A SEPARATE seam from `advanceIngestion` for the same reason
-   * `deferIngestionParse` is one: these three edges may only be taken by a
-   * caller that knows the previous run is gone. The generic path keeps
-   * refusing them, so a redelivered webhook cannot walk a live ingestion
-   * backwards mid-download.
+   * `deferIngestionParse` is one: `extracting -> queued` is refused on the
+   * generic path (`parse_defer_only`), so a redelivered webhook cannot walk a
+   * live ingestion backwards mid-download.
    *
-   * `queued` and `fetching` are deliberately NOT recoverable here — they
-   * already self-heal (`queued -> fetching` is legal, `fetching -> fetching`
-   * is an idempotent no-op), and accepting them would let one worker yank a
-   * healthy in-flight row out from under another.
+   * `structuring` is deliberately NOT recoverable. It is POST-PERSIST, and
+   * `updateCandidateFromParse` is CAS-guarded on `.is('resume_id', null)`, so
+   * re-driving a row whose persist already bound the candidate discards the
+   * second parse and strands it outside `recover_ashby_model_degraded` for
+   * ever — the 0084 trap. The health surface counts it instead.
+   *
+   * `queued` and `fetching` are NOT recoverable here either — they already
+   * self-heal (`queued -> fetching` is legal, `fetching -> fetching` is an
+   * idempotent no-op), and accepting them would let one worker yank a healthy
+   * in-flight row out from under another.
+   *
+   * LIVENESS IS THE RPC'S DECISION. A queue lease is not a process: the runner
+   * keeps running a handler whose heartbeat failed, and `reclaim_expired_jobs`
+   * requeues with no liveness proof. The RPC answers `recently_active` for a
+   * row touched inside its staleness window, and the caller must treat that as
+   * a WAIT, never a failure.
    *
    * The 0032 five-attempt ceiling is NOT relaxed: this charges an attempt like
    * every other requeue and answers `retry_exhausted` at the bound.
