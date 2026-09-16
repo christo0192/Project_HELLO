@@ -1172,66 +1172,6 @@ def phone_tts_pace() -> float:
     return _bounded_float(os.getenv("PHONE_TTS_PACE"), 1.0, 0.5, 2.0)
 
 
-#: Silero's own default. Kept as a named constant so the docstrings below can
-#: state what is being moved AWAY from rather than describing a bare number.
-_SILERO_DEFAULT_ACTIVATION = 0.5
-_SILERO_DEFAULT_MIN_SPEECH_SEC = 0.05
-
-
-def phone_vad_activation_threshold() -> float:
-    """Speech probability at which Silero calls a frame SPEECH. Default 0.6.
-
-    OWNER REPORT (2026-09-16): "the stt picks up noises and words from the
-    background — if someone is talking at the back it's using that one."
-
-    `_build_phone_vad` constructed `inference.VAD(model="silero")` with EVERY
-    parameter defaulted, so the phone lane ran Silero's 0.5 — a threshold tuned
-    for close-mic capture, not for a phone in a room with other people in it. A
-    second voice two metres away is attenuated but still clears 0.5 on voiced
-    vowels, so it opened a speech segment and its words were transcribed as the
-    candidate's.
-
-    RAISING IT is the primary lever: the near-field speaker is many dB louder
-    than a background talker, so a modest lift separates them without touching
-    the near speaker at all. 0.6 is deliberately modest — the failure mode at
-    the top of this range is a QUIET candidate on a poor line going undetected
-    entirely, which is far worse than a little background bleed, so this is
-    tuned in small steps against live calls rather than set aggressively once.
-
-    The SDK derives `deactivation_threshold` as `max(activation - 0.15, 0.01)`
-    when it is not given, so raising this preserves the same hysteresis gap and
-    a segment still ends where it used to relative to its own start.
-
-    Clamped to [0.1, 0.95]: 0 would make every frame speech and 1.0 would make
-    none, and both are ways to take a phone call that never works. A malformed
-    value falls back to the default rather than raising, like every other
-    bounded reader here. PHONE ONLY — the browser lane is near-mic and keeps
-    the SDK default.
-    """
-    return _bounded_float(os.getenv("PHONE_VAD_ACTIVATION_THRESHOLD"), 0.6, 0.1, 0.95)
-
-
-def phone_vad_min_speech_sec() -> float:
-    """How long speech must persist before a turn opens. Default 0.20s.
-
-    The companion lever to the threshold above, and the one that kills
-    NON-SPEECH noise rather than background talk: Silero's default is 0.05s, so
-    a single 50 ms transient — a cough, a door, a keyboard, one syllable of
-    someone else's sentence — is enough to start a speech segment. Requiring
-    ~0.2 s of sustained speech discards those without touching a real answer,
-    because no candidate begins a reply with less than a syllable.
-
-    This does NOT clip the start of speech: `prefix_padding_duration` (0.5s,
-    left at its default) prepends audio from BEFORE the detected start, so the
-    first word survives the longer activation requirement.
-
-    Clamped to [0.0, 1.0]. Above ~0.4 s real one-word answers ("Yes.") start to
-    be dropped, which is why the ceiling is low and the default is well under
-    it. PHONE ONLY.
-    """
-    return _bounded_float(os.getenv("PHONE_VAD_MIN_SPEECH_SEC"), 0.20, 0.0, 1.0)
-
-
 def phone_tts_tail_peek_timeout_sec() -> float:
     """Bound on the numeric-protection read-ahead in the phone ``tts_node``.
 
