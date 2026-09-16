@@ -396,26 +396,33 @@ grant execute on function screening_v2.refresh_funnel_rollup(timestamptz, intege
 -- This touches ONLY the five new columns, leaves every 0090 counter exactly as
 -- recorded, and cannot half-apply: it is one statement in the migration's
 -- transaction.
-with agg as (
-  -- Both views are one row per candidate over the same `candidates` rows, so
-  -- one join gives every new counter in a single pass.
-  select v.cohort_day,
-         v.role_id,
-         count(*)                                           as candidates_total,
-         count(*) filter (where h.hr_state = 'qualified')    as hr_qualified,
-         count(*) filter (where h.hr_state = 'disqualified') as hr_disqualified,
-         count(*) filter (where h.hr_state = 'awaiting')     as hr_awaiting,
-         count(*) filter (where h.hr_state = 'unknown')      as hr_unknown
-    from screening_v2.v_funnel_candidate v
-    left join screening_v2.v_funnel_hr_state h on h.candidate_id = v.candidate_id
-   group by 1, 2
-)
+--
+-- Written as `update … from (subquery)` rather than `with agg as (…) update …`
+-- on purpose. scripts/migrate-rollback.test.mjs classifies each statement by its
+-- FIRST KEYWORD: a leading `with` is not `update`, so the CTE form fell past the
+-- DML branch into the destructive-DDL rules and turned the gate RED. The two
+-- forms are semantically identical, and a data statement that reads as a data
+-- statement is the honest shape — the alternative was teaching a safety gate to
+-- ignore a new prefix, which is the wrong direction entirely.
 update screening_v2.funnel_stage_daily f
    set candidates_total = agg.candidates_total,
        hr_qualified     = agg.hr_qualified,
        hr_disqualified  = agg.hr_disqualified,
        hr_awaiting      = agg.hr_awaiting,
        hr_unknown       = agg.hr_unknown
-  from agg
+  from (
+    -- Both views are one row per candidate over the same `candidates` rows, so
+    -- one join gives every new counter in a single pass.
+    select v.cohort_day,
+           v.role_id,
+           count(*)                                            as candidates_total,
+           count(*) filter (where h.hr_state = 'qualified')     as hr_qualified,
+           count(*) filter (where h.hr_state = 'disqualified')  as hr_disqualified,
+           count(*) filter (where h.hr_state = 'awaiting')      as hr_awaiting,
+           count(*) filter (where h.hr_state = 'unknown')       as hr_unknown
+      from screening_v2.v_funnel_candidate v
+      left join screening_v2.v_funnel_hr_state h on h.candidate_id = v.candidate_id
+     group by 1, 2
+  ) agg
  where agg.cohort_day = f.cohort_day
    and agg.role_id is not distinct from f.role_id;

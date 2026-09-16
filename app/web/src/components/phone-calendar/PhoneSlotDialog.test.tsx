@@ -314,9 +314,11 @@ describe('PhoneSlotDialog', () => {
     h.close();
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
 
-    h.onClose.mockClear();
+    // `props()` types onClose as `() => void`, so narrow to the spy it is.
+    const onClose = h.onClose as ReturnType<typeof vi.fn>;
+    onClose.mockClear();
     fireEvent.keyDown(document, { key: 'Escape' });
-    expect(h.onClose).not.toHaveBeenCalled();
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it('locks body scroll while open and restores the PREVIOUS value on close', async () => {
