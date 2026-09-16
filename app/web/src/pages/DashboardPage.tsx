@@ -56,6 +56,7 @@ import {
 } from '../components/design';
 import type { StatusTone } from '../components/design';
 import { DonutChart, LineChart } from '../components/charts';
+import { ScreeningKpis } from '../components/dashboard/ScreeningKpis';
 import {
   candidateStatusLabel,
   candidateStatusTone,
@@ -255,6 +256,11 @@ export function DashboardPage() {
           />
         </RevealItem>
       </RevealGroup>
+
+      {/* Screening scoreboard (0098 + /api/funnel/summary). Placed directly
+          under the intake KPIs: this is the block the HR head opens the page
+          for, so it sits above the operational queues rather than below. */}
+      <ScreeningKpis />
 
       {/* Editorial row — the funnel reads wide, the summaries stack beside it */}
       <div className="mt-6 grid grid-cols-1 items-start gap-6 lg:grid-cols-12">

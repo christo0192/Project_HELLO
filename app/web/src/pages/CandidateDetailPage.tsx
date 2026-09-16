@@ -40,7 +40,7 @@ import {
   sessionStatusLabel,
 } from "../components/talent";
 import { formatDateTime } from "../lib/datetime";
-import { PhoneSlotPicker, engagementStateTerm } from "../components/phone-calendar";
+import { PhoneSlotDialog, engagementStateTerm } from "../components/phone-calendar";
 import { istToday } from "../lib/ist-datetime";
 import type { IstDate } from "../lib/ist-datetime";
 import type { PhoneSlot } from "../types";
@@ -305,6 +305,9 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
   const [phone, setPhone] = useState("");
   const [slotDate, setSlotDate] = useState<IstDate>(() => istToday());
   const [selectedSlot, setSelectedSlot] = useState<PhoneSlot | null>(null);
+  // The slot grid is ~26 rows; it lives behind a button so the page stays
+  // about the candidate until someone actually decides to book.
+  const [slotDialogOpen, setSlotDialogOpen] = useState(false);
   const [savingAppointment, setSavingAppointment] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
@@ -386,6 +389,10 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
           : "Appointment booked. The call will still pass through normal admission gates.");
       }
       setSelectedSlot(null);
+      // Close only on success: a failed save must keep the dialog open with
+      // the grid in place, or the operator loses their context and has to
+      // rediscover the slot they were trying to book.
+      setSlotDialogOpen(false);
       load();
     } catch (e) {
       setMessage(e instanceof ApiError ? e.message : "The appointment could not be saved.");
@@ -477,27 +484,25 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
               </div>
             </div>
           )}
-          <SurfaceCard level="sunken" className="mt-4 p-3">
-            <h3 className="text-[13px] font-medium text-ink-secondary">Schedule a slot</h3>
-            <p className="mt-1 truncate text-xs text-ink-tertiary" title={SLOT_ADVISORY_NEW}>
-              {SLOT_ADVISORY_NEW}
-            </p>
-            <div className="mt-3 grid gap-x-4 gap-y-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
-              <div className="min-w-0">
-                <PhoneSlotPicker
-                  date={slotDate}
-                  onDateChange={(date) => { setSlotDate(date); setSelectedSlot(null); }}
-                  value={selectedSlot?.starts_at ?? null}
-                  onChange={setSelectedSlot}
-                  idPrefix={`${headingId}-slot`}
-                  disabled={savingAppointment}
-                />
-              </div>
-              <CandidateButton variant="primary" onClick={() => void saveAppointment()} loading={savingAppointment} disabled={!selectedSlot}>
-                Book slot
-              </CandidateButton>
-            </div>
-          </SurfaceCard>
+          <div className="mt-4">
+            <CandidateButton variant="secondary" onClick={() => setSlotDialogOpen(true)}>
+              Book a slot
+            </CandidateButton>
+            <PhoneSlotDialog
+              open={slotDialogOpen}
+              onClose={() => { setSlotDialogOpen(false); setSelectedSlot(null); }}
+              title="Book a slot"
+              confirmLabel="Book slot"
+              advisory={SLOT_ADVISORY_NEW}
+              date={slotDate}
+              onDateChange={(date) => { setSlotDate(date); setSelectedSlot(null); }}
+              selected={selectedSlot}
+              onSelect={setSelectedSlot}
+              onConfirm={() => void saveAppointment()}
+              saving={savingAppointment}
+              idPrefix={`${headingId}-slot`}
+            />
+          </div>
         </>
       ) : (
         <>
@@ -583,31 +588,30 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
                   </p>
                 )}
               </div>
-              <p className="mt-1 truncate text-xs text-ink-tertiary" title={SLOT_ADVISORY_EXISTING}>
-                {SLOT_ADVISORY_EXISTING}
-              </p>
-              <div className="mt-3 grid gap-x-4 gap-y-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
-                <div className="min-w-0">
-                  <PhoneSlotPicker
-                    date={slotDate}
-                    onDateChange={(date) => { setSlotDate(date); setSelectedSlot(null); }}
-                    value={selectedSlot?.starts_at ?? null}
-                    onChange={setSelectedSlot}
-                    idPrefix={`${headingId}-slot`}
-                    disabled={savingAppointment}
-                  />
-                </div>
-                <div className="flex flex-wrap gap-2 sm:flex-col sm:items-stretch">
-                  <CandidateButton variant="primary" onClick={() => void saveAppointment()} loading={savingAppointment} disabled={!selectedSlot}>
-                    {current?.appointment ? "Move appointment" : "Book slot"}
+              <div className="mt-3 flex flex-wrap gap-2">
+                <CandidateButton variant="primary" onClick={() => setSlotDialogOpen(true)}>
+                  {current?.appointment ? "Move appointment" : "Book a slot"}
+                </CandidateButton>
+                {current?.appointment && (
+                  <CandidateButton variant="secondary" onClick={() => void cancelAppointment()} loading={savingAppointment}>
+                    Cancel appointment
                   </CandidateButton>
-                  {current?.appointment && (
-                    <CandidateButton variant="secondary" onClick={() => void cancelAppointment()} loading={savingAppointment}>
-                      Cancel appointment
-                    </CandidateButton>
-                  )}
-                </div>
+                )}
               </div>
+              <PhoneSlotDialog
+                open={slotDialogOpen}
+                onClose={() => { setSlotDialogOpen(false); setSelectedSlot(null); }}
+                title={current?.appointment ? "Move appointment" : "Book a slot"}
+                confirmLabel={current?.appointment ? "Move appointment" : "Book slot"}
+                advisory={SLOT_ADVISORY_EXISTING}
+                date={slotDate}
+                onDateChange={(date) => { setSlotDate(date); setSelectedSlot(null); }}
+                selected={selectedSlot}
+                onSelect={setSelectedSlot}
+                onConfirm={() => void saveAppointment()}
+                saving={savingAppointment}
+                idPrefix={`${headingId}-slot`}
+              />
             </SurfaceCard>
           )}
         </>

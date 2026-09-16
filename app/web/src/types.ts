@@ -802,6 +802,17 @@ export interface FunnelSummaryTotals {
   attempts_total: number;
   connects_total: number;
   total_call_seconds: number;
+  /** HR disposition of bot-screened candidates (0098). */
+  hr_qualified: number;
+  hr_disqualified: number;
+  /**
+   * Bot-screened but still sitting in the AI screening stage — an HR BACKLOG,
+   * never a rejection. Kept separate so the rejection rate is not a function
+   * of how recently the bot ran.
+   */
+  hr_awaiting: number;
+  /** Candidates in the window. Every other cohort field is a FILTERED count. */
+  candidates_total: number;
 }
 
 export interface FunnelConversions {
@@ -812,6 +823,8 @@ export interface FunnelConversions {
   answered_to_scored: number | null;
   scored_to_qualified: number | null;
   qualified_to_reference_check: number | null;
+  /** Over candidates HR has ACTED on (qualified + disqualified), not all scored. */
+  hr_qualified_rate: number | null;
 }
 
 export interface FunnelDailyRow extends FunnelSummaryTotals {
