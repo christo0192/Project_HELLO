@@ -212,24 +212,56 @@ export async function loadFunnelSummary(
       //    regardless of status, so pausing a mapping made a populated HR band
       //    vanish behind "Not tracked yet" — an untrue explanation.
       //
-      // Reading the LINKS instead makes the probe and the view agree by
-      // construction: both require a synced link whose mapping names both
-      // stages. Today nothing writes `stage_synced_at`, so this is false and
-      // the band honestly says it is not tracked yet.
+      // Reading the LINKS makes the probe and the view agree by construction:
+      // both require a synced link whose mapping names both stages.
+      //
+      // TWO PLAIN QUERIES, not one clever one. The obvious single-query form
+      // embeds the mapping (`ashby_job_mappings!inner(...)`) and filters on it
+      // with dotted paths (`.eq('ashby_job_mappings.role_id', …)`). That is
+      // valid PostgREST, but it is an idiom used nowhere else in this codebase,
+      // and its failure mode here is the precise one this whole change exists
+      // to remove: a malformed embed ERRORS, the catch below turns it into a
+      // conservative `false`, and the HR band is "not configured" forever with
+      // nothing but a warn line to show for it. Two queries built from filters
+      // this codebase already proves in production is the cheaper bet.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      let lq: any = supabase
-        .from('ashby_application_links')
-        .select('id, ashby_job_mappings!inner(role_id, ai_screening_stage_id, reference_check_stage_id)')
-        .not('stage_synced_at', 'is', null)
-        .not('external_stage_id', 'is', null)
-        .not('ashby_job_mappings.ai_screening_stage_id', 'is', null)
-        .not('ashby_job_mappings.reference_check_stage_id', 'is', null)
-        .limit(1);
-      if (input.roleId) lq = lq.eq('ashby_job_mappings.role_id', input.roleId);
-      const { data: linkRows, error: linkErr } = await lq;
-      if (linkErr) {
+      let mq: any = supabase
+        .from('ashby_job_mappings')
+        .select('id')
+        .not('ai_screening_stage_id', 'is', null)
+        .not('reference_check_stage_id', 'is', null)
+        // Bounded. Only a false NEGATIVE is possible past this limit, and only
+        // if every synced link in the org lives on a fully-wired mapping beyond
+        // the first 200 — at which point the band under-reports rather than
+        // over-claims, which is the direction this code always errs in.
+        .limit(200);
+      // Scoped to the filtered role: several mappings legitimately share one
+      // role, so one wired job must not arm the band for candidates who all
+      // arrived through an unwired one.
+      if (input.roleId) mq = mq.eq('role_id', input.roleId);
+      const { data: mapRows, error: mapErr } = await mq;
+      if (mapErr) {
         // Distinguishable from "nothing observed": a broken probe must be
         // visible, not silently indistinguishable from an unconfigured tenant.
+        logger.warn('unknown_event', { error_category: 'funnel_hr_probe_error' });
+        return false;
+      }
+      const mappingIds = (Array.isArray(mapRows) ? mapRows : [])
+        .map((m) => (m as { id?: string }).id)
+        .filter((id): id is string => typeof id === 'string');
+      // No mapping names both stages ⇒ no HR decision is expressible at all.
+      // Skip the second round-trip rather than send `in.()`, which PostgREST
+      // rejects as malformed rather than treating as an empty set.
+      if (mappingIds.length === 0) return false;
+
+      const { data: linkRows, error: linkErr } = await supabase
+        .from('ashby_application_links')
+        .select('id')
+        .in('job_mapping_id', mappingIds)
+        .not('stage_synced_at', 'is', null)
+        .not('external_stage_id', 'is', null)
+        .limit(1);
+      if (linkErr) {
         logger.warn('unknown_event', { error_category: 'funnel_hr_probe_error' });
         return false;
       }

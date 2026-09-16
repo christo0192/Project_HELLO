@@ -30,10 +30,13 @@ type Handler = (q: Recorded, nth: number) => Result;
  * arrival order is an implementation detail, and a fake keyed on it would turn
  * a latency improvement into a fleet of unrelated test failures.
  */
-function kindOf(rec: Recorded): 'window' | 'freshness' | 'links' {
+function kindOf(rec: Recorded): 'window' | 'freshness' | 'links' | 'mappings' {
   if (rec.table === 'ashby_application_links') return 'links';
+  if (rec.table === 'ashby_job_mappings') return 'mappings';
   if (rec.table === 'funnel_rollup_runs') return 'freshness';
   if (rec.table === 'funnel_stage_daily') return 'window';
+  // THROW, never default. A silent fallback would serve one query's handler to
+  // another and quietly make half the suite assert against the wrong read.
   throw new Error(`unexpected table in funnel summary: ${rec.table}`);
 }
 
@@ -43,7 +46,9 @@ function kindOf(rec: Recorded): 'window' | 'freshness' | 'links' {
  * about WHICH query was issued (scoped by role, ordered across the whole table,
  * naming the legacy columns), not about what it returned.
  */
-function makeReader(handlers: Partial<Record<'window' | 'freshness' | 'links', Handler>>) {
+type Kind = 'window' | 'freshness' | 'links' | 'mappings';
+
+function makeReader(handlers: Partial<Record<Kind, Handler>>) {
   const calls: Recorded[] = [];
   const counts: Record<string, number> = {};
 
@@ -61,6 +66,7 @@ function makeReader(handlers: Partial<Record<'window' | 'freshness' | 'links', H
       gte: chain('gte'),
       lte: chain('lte'),
       not: chain('not'),
+      in: chain('in'),
       order: chain('order'),
       limit: chain('limit'),
       // Thenable: `await q` resolves through here, exactly as PostgREST does.
@@ -121,10 +127,11 @@ function row(over: Record<string, unknown> = {}) {
 }
 
 /** Default handlers: healthy tenant, HR tracking wired, roll-up has run. */
-function healthy(over: Partial<Record<'window' | 'freshness' | 'links', Handler>> = {}) {
+function healthy(over: Partial<Record<Kind, Handler>> = {}) {
   return makeReader({
     window: () => ok([row()]),
     freshness: () => ok([{ ran_at: '2026-09-16T06:00:00Z' }]),
+    mappings: () => ok([{ id: 'map-1' }]),
     links: () => ok([{ id: 'link-1' }]),
     ...over,
   });
@@ -195,6 +202,18 @@ describe('loadFunnelSummary — meta.rollup_refreshed_at', () => {
 });
 
 describe('loadFunnelSummary — meta.hr_tracking_configured', () => {
+  it('is false when no mapping names both stages', async () => {
+    // Nothing to observe: an HR decision is not expressible at all, so the
+    // link query must not even be issued.
+    const { reader, calls } = healthy({
+      window: () => ok([row({ scored: 9, hr_awaiting: 9 })]),
+      mappings: () => ok([]),
+    });
+    const out = await loadFunnelSummary(reader);
+    expect(out.meta.hr_tracking_configured).toBe(false);
+    expect(calls.find((c) => c.table === 'ashby_application_links')).toBeUndefined();
+  });
+
   it('is false when no link has had its stage observed since import', async () => {
     // Today's production shape, and the reason the probe reads LINKS rather
     // than mapping ids: `external_stage_id` is written once at import and is
@@ -215,20 +234,41 @@ describe('loadFunnelSummary — meta.hr_tracking_configured', () => {
     expect((await loadFunnelSummary(reader)).meta.hr_tracking_configured).toBe(true);
   });
 
-  it('requires a SYNCED stage on a mapping that names both stages', async () => {
+  it('requires a SYNCED stage, on a mapping that names both stages', async () => {
     // Each clause is load-bearing. Drop `stage_synced_at` and the probe answers
     // "an id is filled in", which is true of every tenant that follows the
     // activation runbook and true of ZERO observed stages — the exact state in
     // which the band would render "Advanced 0 / Not advanced 0" as measurement.
     const { reader, calls } = healthy();
     await loadFunnelSummary(reader);
+
+    const maps = calls.find((c) => c.table === 'ashby_job_mappings')!;
+    expect(maps.ops).toContainEqual(['not', 'ai_screening_stage_id', 'is', null]);
+    expect(maps.ops).toContainEqual(['not', 'reference_check_stage_id', 'is', null]);
+
     const probe = calls.find((c) => c.table === 'ashby_application_links')!;
     expect(probe.ops).toContainEqual(['not', 'stage_synced_at', 'is', null]);
     expect(probe.ops).toContainEqual(['not', 'external_stage_id', 'is', null]);
-    expect(probe.ops).toContainEqual(['not', 'ashby_job_mappings.ai_screening_stage_id', 'is', null]);
-    expect(probe.ops).toContainEqual(['not', 'ashby_job_mappings.reference_check_stage_id', 'is', null]);
+    // Restricted to the mappings the first query returned, not the whole table.
+    expect(probe.ops).toContainEqual(['in', 'job_mapping_id', ['map-1']]);
     // Bounded: this runs on every dashboard load.
     expect(probe.ops).toContainEqual(['limit', 1]);
+  });
+
+  it('filters only on columns each table actually owns', async () => {
+    // The single-query form embeds the mapping and filters it with dotted
+    // paths — an idiom used nowhere else here, whose failure mode is an error
+    // the catch turns into a permanent, silent "not configured".
+    const { reader, calls } = healthy();
+    await loadFunnelSummary(reader, { roleId: 'role-b' });
+    for (const c of calls) {
+      for (const [op, col] of c.ops) {
+        if (typeof col === 'string' && op !== 'order') {
+          expect(col, `${c.table}.${op} filters an embedded column`).not.toContain('.');
+        }
+      }
+      expect(c.columns).not.toContain('!inner');
+    }
   });
 
   it('scopes the probe to the filtered role', async () => {
@@ -238,16 +278,26 @@ describe('loadFunnelSummary — meta.hr_tracking_configured', () => {
     // org-wide, one wired role out of ten armed the whole dashboard.
     const { reader, calls } = healthy();
     await loadFunnelSummary(reader, { roleId: 'role-b' });
-    const probe = calls.find((c) => c.table === 'ashby_application_links')!;
-    expect(probe.ops).toContainEqual(['eq', 'ashby_job_mappings.role_id', 'role-b']);
+    const maps = calls.find((c) => c.table === 'ashby_job_mappings')!;
+    expect(maps.ops).toContainEqual(['eq', 'role_id', 'role-b']);
   });
 
-  it('degrades to "not configured" when the probe fails', async () => {
+  it('does not scope by role when no role filter was asked for', async () => {
+    const { reader, calls } = healthy();
+    await loadFunnelSummary(reader);
+    const maps = calls.find((c) => c.table === 'ashby_job_mappings')!;
+    expect(maps.ops.map(([op, col]) => `${op}:${col}`)).not.toContain('eq:role_id');
+  });
+
+  it('degrades to "not configured" when EITHER query fails', async () => {
     // Fails CLOSED: an unreadable table must hide the HR band, never license
-    // it to print zeros as fact.
-    const { reader } = healthy({ links: () => fail('42501') });
-    const out = await loadFunnelSummary(reader);
-    expect(out.meta.hr_tracking_configured).toBe(false);
+    // it to print zeros as fact. Both legs, because an early return on the
+    // first would otherwise go untested.
+    const a = healthy({ mappings: () => fail('42501') });
+    expect((await loadFunnelSummary(a.reader)).meta.hr_tracking_configured).toBe(false);
+
+    const b = healthy({ links: () => fail('42501') });
+    expect((await loadFunnelSummary(b.reader)).meta.hr_tracking_configured).toBe(false);
   });
 
   it('survives a probe that throws rather than returning an error', async () => {
