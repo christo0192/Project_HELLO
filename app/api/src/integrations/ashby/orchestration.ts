@@ -214,6 +214,44 @@ export interface RuntimeWorkflowStores extends WorkflowStores {
     applicationLinkId: string,
     reasonCode: string,
   ): Promise<{ status: string; attempts?: number }>;
+  /**
+   * Return an ingestion stranded in `scanning` or `extracting` to `queued`
+   * because the PROCESS THAT OWNED IT DIED — a deploy, a restart, an OOM —
+   * never because of anything learned about the document.
+   *
+   * A SEPARATE seam from `advanceIngestion` for the same reason
+   * `deferIngestionParse` is one: `extracting -> queued` is refused on the
+   * generic path (`parse_defer_only`), so a redelivered webhook cannot walk a
+   * live ingestion backwards mid-download.
+   *
+   * `structuring` is deliberately NOT recoverable. It is POST-PERSIST, and
+   * `updateCandidateFromParse` is CAS-guarded on `.is('resume_id', null)`, so
+   * re-driving a row whose persist already bound the candidate discards the
+   * second parse and strands it outside `recover_ashby_model_degraded` for
+   * ever — the 0084 trap. The health surface counts it instead.
+   *
+   * `queued` and `fetching` are NOT recoverable here either — they already
+   * self-heal (`queued -> fetching` is legal, `fetching -> fetching` is an
+   * idempotent no-op), and accepting them would let one worker yank a healthy
+   * in-flight row out from under another.
+   *
+   * LIVENESS IS THE RPC'S DECISION. A queue lease is not a process: the runner
+   * keeps running a handler whose heartbeat failed, and `reclaim_expired_jobs`
+   * requeues with no liveness proof. The RPC answers `recently_active` for a
+   * row touched inside its staleness window, and the caller must treat that as
+   * a WAIT, never a failure.
+   *
+   * The 0032 five-attempt ceiling is NOT relaxed: this charges an attempt like
+   * every other requeue and answers `retry_exhausted` at the bound.
+   *
+   * Optional so existing fakes compile; the worker fails LOUDLY (a durable
+   * `failed_review`) when it is absent rather than silently completing a job
+   * whose row can never advance — which is the exact defect 0097 exists to fix.
+   */
+  resumeIngestionMidflight?(
+    applicationLinkId: string,
+    reasonCode: string,
+  ): Promise<{ status: string; attempts?: number; fromState?: string }>;
   /** Park a completed application as `writeback_pending` (audited, idempotent). */
   markWritebackPending(applicationLinkId: string, reason: string): Promise<{ status: string }>;
   /** Materialize/adopt the phone-primary engagement after resume readiness. */

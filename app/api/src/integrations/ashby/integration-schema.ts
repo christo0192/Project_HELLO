@@ -55,8 +55,9 @@ export type OperationState = (typeof OPERATION_STATES)[number];
  * PARITY NOTE, read before trusting this map: the DB trigger has grown edges
  * beyond the original 0029 shape. 0037/0039 added
  * `fetching`/`scanning`/`extracting` -> `queued` (abandon-before-verdict and
- * parse-deferral requeues, driven only by their own RPCs) — those internal
- * mid-flight edges are deliberately NOT modelled here. 0084 added
+ * parse-deferral requeues, driven only by their own RPCs; 0097's mid-flight
+ * resume is a second sanctioned caller of the `scanning`/`extracting` pair) —
+ * those internal mid-flight edges are deliberately NOT modelled here. 0084 added
  * `ready -> queued` — the audited model-degraded re-drive
  * (`recover_ashby_model_degraded`) — and that one IS modelled, because
  * "ready is terminal" stopped being true: an earlier revision of this map

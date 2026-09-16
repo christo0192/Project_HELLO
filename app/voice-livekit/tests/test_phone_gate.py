@@ -14816,33 +14816,62 @@ class TestPhoneManifestTunables(unittest.TestCase):
         )
         self.assertLessEqual(int(value), 60)
 
-    def test_sarvam_frames_restored_to_18_24(self):
-        # FIX 1: 9/31 finalized STT segments after ~0.29s of silence, cutting
-        # words mid-clause ("frontend"->"Friends"). 18/24 restores a ~0.58s min
-        # fill. RED before the revert (values were "9"/"31").
+    def test_sarvam_retuned_for_background_speech_and_garbling(self):
+        # FIX 1 (2026-09-08): 9/31 finalized STT segments after ~0.29s of
+        # silence, cutting words mid-clause ("frontend"->"Friends"). 18/24
+        # restored a ~0.58s min fill.
+        #
+        # RETUNE (2026-09-16): the owner reported BOTH symptoms at 18/24 —
+        # background speech being transcribed AND residual garbling. The
+        # speech/silence DECISION boundary (previously unset at Sarvam's 0.45)
+        # is the lever for background speech; raising it also fills the
+        # negative-frame count faster, which is the garbling mechanism above.
+        # So COUNT rises in step: 576ms -> 704ms silence floor, and WINDOW
+        # rises with it to preserve the SAME 6-frame blip tolerance.
         env = self._phone_env()
-        self.assertEqual(env["PHONE_SARVAM_NEGATIVE_FRAMES_COUNT"], "18")
-        self.assertEqual(env["PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW"], "24")
+        self.assertEqual(env["PHONE_SARVAM_NEGATIVE_SPEECH_THRESHOLD"], "0.55")
+        self.assertEqual(env["PHONE_SARVAM_NEGATIVE_FRAMES_COUNT"], "22")
+        self.assertEqual(env["PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW"], "28")
+        # The tolerance is the INVARIANT, not either number on its own: moving
+        # COUNT without WINDOW silently narrows the in-clause blip allowance
+        # and re-opens the garbling this pairing exists to close.
+        self.assertEqual(
+            int(env["PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW"])
+            - int(env["PHONE_SARVAM_NEGATIVE_FRAMES_COUNT"]),
+            6,
+            "window - count is the non-silence tolerance; 18/24 and 22/28 both keep 6",
+        )
+        # And the floor must not regress below what the 9/31 revert bought.
+        self.assertGreaterEqual(int(env["PHONE_SARVAM_NEGATIVE_FRAMES_COUNT"]), 18)
 
-    def test_endpointing_max_raised_to_2_5_min_unchanged(self):
-        # PR2a: the built-in v1-mini EOU commits a COMPLETE answer at MIN
-        # regardless of MAX; MAX only bounds the wait on a genuinely-INCOMPLETE
-        # mid-thought pause. Raising MAX 1.0->2.5 (toward the browser default)
-        # lets a natural pause breathe without adding common-case latency. MIN
-        # stays 0.3. RED before the change (MAX was "1.0"). 2.5 is inside the
-        # reader clamp, whose ceiling was raised to [0.5, 3.0] to honour it.
+    def test_endpointing_max_lowered_to_1_0_min_unchanged(self):
+        # PR2a raised MAX 1.0->2.5: the built-in v1-mini EOU commits a COMPLETE
+        # answer at MIN regardless of MAX, so MAX only bounds the wait on a
+        # genuinely-INCOMPLETE mid-thought pause.
+        #
+        # OWNER RETUNE (2026-09-16): back to 1.0, decided against live calls.
+        # This manifest had said 2.5 while production ran a SECRET of the same
+        # name — the same shadowing trap as PHONE_TTS_FLUSH_MIN_CHARS — so this
+        # pin is now what production actually runs once the secret is unset.
+        # The trade is stated in the manifest: a lower MAX cuts in sooner on a
+        # real mid-thought pause. MIN stays 0.3, so the common case (a complete
+        # answer) is unchanged.
         env = self._phone_env()
-        self.assertEqual(env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"], "2.5")
+        self.assertEqual(env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"], "1.0")
         self.assertEqual(env["PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC"], "0.3")
         self.assertGreaterEqual(float(env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"]), 0.5)
         self.assertLessEqual(float(env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"]), 3.0)
-        # The manifest value must be HONOURED by the reader, not clamped down —
-        # this is the whole point of raising the clamp ceiling 2.0 -> 3.0.
+        # MAX must still exceed MIN, or the bound is nonsense.
+        self.assertGreater(
+            float(env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"]),
+            float(env["PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC"]),
+        )
+        # The manifest value must be HONOURED by the reader, not clamped.
         with patch.dict(os.environ, {
             "PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC":
                 env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"],
         }):
-            self.assertAlmostEqual(phone.phone_static_endpointing_max_delay(), 2.5)
+            self.assertAlmostEqual(phone.phone_static_endpointing_max_delay(), 1.0)
 
 
 class TestReasoningEffortTripwire(unittest.TestCase):

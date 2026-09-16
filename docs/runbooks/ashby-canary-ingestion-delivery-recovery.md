@@ -91,7 +91,31 @@ answer to "is this waiting or is it broken":
 select screening_v2.ashby_prerequisite_backlog(900);
 ```
 
-- `ingestion_stuck_queued` / `ingestion_stuck_fetching` — stranded ingestions.
+- `ingestion_stuck_queued` / `ingestion_stuck_fetching` — stranded ingestions in
+  the two states that SELF-HEAL. `queued -> fetching` is legal and
+  `fetching -> fetching` is an idempotent no-op, so a row here recovers on the
+  next job run; a persistent count means no job is running (check the scanner
+  gate, which refuses to CLAIM ingestion jobs while ClamAV freshness fails).
+- `ingestion_stuck_scanning` / `ingestion_stuck_extracting` (0097) — a process
+  died MID-FLIGHT. Neither state can reach `fetching`, which is the handler's
+  only entry transition, so before 0097 these rows were stalled indefinitely
+  with no reason and no counter. `resume_ashby_ingestion_midflight` now walks
+  them back to `queued` automatically once `updated_at` is 900s stale (the bound
+  exists so a LIVE run is never yanked backwards). A count that persists past
+  ~15 minutes means the rescue is being refused — the row has burned its
+  5-attempt budget, or the scanner gate is blocking the job claim.
+- `ingestion_stuck_structuring` (0097) — **ALWAYS needs a human. Nothing
+  auto-rescues this.** `structuring` runs AFTER `persist()` has bound the
+  candidate, and `updateCandidateFromParse` is CAS-guarded on
+  `resume_id is null`, so a re-drive silently DISCARDS the second parse and
+  leaves the candidate carrying the new `structurer_version` over the old phone
+  columns — permanently non-dialable and outside `recover_ashby_model_degraded`
+  for ever (the 0084 trap). **Do NOT requeue it**, and in particular do not
+  reach for `advance_ashby_ingestion(link, 'queued')`. Inspect the candidate
+  row first: if `resume_id` is already bound and the fields look right, the run
+  very likely completed its useful work and the row simply never reached
+  `ready` — prefer finishing it forward. Escalate rather than improvise; this
+  is the one strand 0097 deliberately leaves to judgement.
 - `pending_blocked` — invites WAITING on a prerequisite (the total).
 - `pending_blocked_failed_ingestion` — the **subset** of those that will never
   clear on their own, because the link's ingestion ended `failed_review` and only
@@ -101,10 +125,18 @@ select screening_v2.ashby_prerequisite_backlog(900);
 - `failed_prerequisite` — invites already killed by the ordering defect; this is
   the count step 4 reduces. Nothing new can enter it after `0035`.
 
-The same four counters surface on `GET /api/integrations/ashby/mission-control/health`
-under `backlog`, and a non-zero stuck count degrades the verdict with
-`ingestion_stuck`. Read the gates from `/health`, not from the metrics sink —
-the sink is a no-op in this deployment.
+All nine counters surface on `GET /api/integrations/ashby/mission-control/health`
+under `backlog`, and a non-zero stuck count in ANY of the five ingestion states
+degrades the verdict with `ingestion_stuck`. That one reason string is shared,
+so it does not tell you which state is affected — read the individual counters
+above before diagnosing. Read the gates from `/health`, not from the metrics
+sink — the sink is a no-op in this deployment.
+
+Expect a brief, self-clearing `ingestion_stuck` after any API restart that
+catches a résumé mid-flight: the threshold is 1, the stuck window is 900s, and
+the rescue fires at the same 900s mark — so the row becomes visible and
+rescuable at the same instant, and the reading clears within a poll or two.
+A count that does NOT clear is the real signal.
 
 ---
 

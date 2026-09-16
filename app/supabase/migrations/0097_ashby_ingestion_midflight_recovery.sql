@@ -1,0 +1,465 @@
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0097 — a resume interrupted mid-flight is not a resume that failed
+--
+-- RCA 2026-09-16. Four résumés arrived from Ashby in one bulk push. Two
+-- reached `ready`. Two are still sitting in `scanning`, with `failed_reason`
+-- NULL, `resume_intake_failures` EMPTY, and their queue jobs marked
+-- **completed**. Nothing will ever retry them and nothing pages anyone.
+--
+-- The mechanism, end to end:
+--
+--   1. The API restarted (a `fly secrets set` rolled the machine) while both
+--      ingestions were between `onState('scanning')` and the scan verdict. The
+--      in-flight work died; the durable rows stayed `scanning`.
+--   2. The queue re-ran each job. The handler's terminal guard is
+--      `{ready, cancelled}`, so `scanning` sails through it.
+--   3. The handler's first durable action is `advance_ashby_ingestion(...,
+--      'fetching')`. The transition trigger allows
+--      `scanning -> {extracting, failed_review, cancelled, queued}` — NOT
+--      `fetching`. The RPC caught the P0001 and returned `invalid_transition`.
+--   4. The handler read a non-ok status and `return`ed bare. Job: completed.
+--      Row: untouched. Forever.
+--
+-- Every retry repeats step 2-4 identically, so the row is unreachable by
+-- construction. `queued` and `fetching` are NOT affected, because
+-- `queued -> fetching` is legal and `fetching -> fetching` is a same-state
+-- no-op that returns ok. The two states that self-heal were the two the
+-- health surface already counted (`ingestion_stuck_queued`,
+-- `ingestion_stuck_fetching`) and the states that deadlock had no counter at
+-- all — the monitoring was the exact complement of the bug.
+--
+-- Bulk upload is what turns this from rare to routine: the vulnerable window
+-- is the time a row spends mid-flight, and one restart strands EVERY row then
+-- inside it.
+--
+-- ── WHAT THIS MIGRATION DELIBERATELY DOES **NOT** DO ────────────────────
+-- An earlier draft of this file also added a `structuring -> queued` edge and
+-- recreated `advance_ashby_ingestion` to refuse it. Adversarial review killed
+-- both, correctly:
+--
+--   * `structuring` is POST-PERSIST. `resume-ingestion.ts` orders
+--     `onState('structuring')` -> `persist()` -> `onState('ready')`, and
+--     `updateCandidateFromParse` is CAS-guarded on `.is('resume_id', null)`.
+--     Re-driving a row whose persist already bound the candidate therefore
+--     DISCARDS the second parse and lands `ready` carrying the second run's
+--     `structurer_version` over the first run's phone columns — after which
+--     `recover_ashby_model_degraded` answers `not_model_degraded` for ever.
+--     That is the precise trap 0084 exists to prevent, so the edge is not
+--     added and `structuring` is NOT rescued. It is COUNTED instead (§3), so
+--     a strand there is visible to an operator rather than silent.
+--     Its real residency is sub-second — the model structurer runs inside
+--     `extracting`, not here — so the exposure being traded away is tiny.
+--
+--   * `scanning` and `extracting` are both strictly PRE-persist, so neither
+--     carries that hazard, and BOTH edges to `queued` already exist (0037 and
+--     0039 respectively). No trigger change is needed at all, and
+--     `advance_ashby_ingestion` is left completely untouched — a partial
+--     redefinition of a SECURITY DEFINER function is how an unnoticed
+--     privilege or search_path drift ships.
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- ── 1. THE AUDITED MID-FLIGHT RESUME ────────────────────────────────────
+-- Walks a row that a dead process left in `scanning` or `extracting` back to
+-- `queued` so the ordinary pipeline re-drives it from the top.
+--
+-- Deliberately NOT a widening of `advance_ashby_ingestion`: that function is
+-- reachable from the generic worker path, and `extracting -> queued` is
+-- refused there on purpose (`parse_defer_only`). Only a caller that can
+-- justify the edge may take it.
+--
+-- LIVENESS IS PROVEN, NOT ASSUMED. The worker calling this holds the link's
+-- only queue job, but a job's LEASE is not the process: `ASHBY_LEASE_SECONDS`
+-- defaults to 60, the runner observes a lost heartbeat and deliberately keeps
+-- running the handler, and `reclaim_expired_jobs` requeues with no liveness
+-- proof. So a second worker can be inside this function while the first is
+-- still downloading. `p_min_stale_seconds` closes that: a row touched
+-- recently may still belong to a live run and is refused with
+-- `recently_active`, which the worker treats as "come back later", never as a
+-- failure. The default (900s) exceeds the worst realistic `extracting`
+-- residency — parser timeout ceiling 300s + model acquire 30s + the 42s
+-- circuit-open ladder + provider timeout — with roughly 2x margin.
+--
+-- THIS IS NOT THE ONLY DOOR, and an earlier revision of this header wrongly
+-- implied it was. `advance_ashby_ingestion` refuses `extracting -> queued`
+-- (`parse_defer_only`) and `ready -> queued` (`model_degraded_recovery_only`)
+-- on the generic path — but it does NOT refuse `scanning`, and `runImport`
+-- calls `advanceIngestion(linkId, 'queued')` unconditionally on every
+-- re-import (`orchestration.ts`). So a redelivered Ashby signal or a
+-- reconciliation re-observation ALREADY walks a `scanning` row back to
+-- `queued`, with no staleness check, no audit row and no rescue-specific
+-- ceiling. This RPC is the SAFE version of that edge, not the sole one.
+--
+-- The same fact corrects the RCA's severity framing above: a stranded row is
+-- not unreachable "forever", it is unreachable until the next re-observation —
+-- which may never come (the two incident rows sat for 2h42m because none did,
+-- and their queue jobs were already `completed`). Worth having, but the honest
+-- claim is "stalled indefinitely", not "frozen permanently".
+--
+-- The 0032 attempts ceiling is unchanged and enforced here too, so a row that
+-- keeps dying mid-flight stops being re-driven instead of looping for ever.
+--
+-- WHAT HAPPENS AT THE CEILING, stated plainly because an earlier revision of
+-- this comment claimed the opposite: the RPC answers `retry_exhausted` and the
+-- worker leaves the row WHERE IT IS — still `scanning`/`extracting`. It does
+-- NOT rest it in `failed_review`. That is the same trade the rest of this PR
+-- makes (see the worker's note on the removed rest codes): the row is counted
+-- by `ingestion_stuck_scanning`/`_extracting` and a human decides.
+--
+-- KNOWN OPERATIONAL GAP, not papered over: such a row cannot be moved by any
+-- audited RPC — `recover_ashby_ingestion_parse` and
+-- `reset_ashby_ingestion_attempts` both demand `failed_review`,
+-- `recover_ashby_model_degraded` demands `ready`, and the generic requeue hits
+-- the same ceiling. It takes raw SQL or a cancelled application. Closing that
+-- properly means resting it on a machine-class code AND widening the 0040
+-- allowlist — i.e. the loud-exit work this PR deliberately defers.
+--
+-- Nothing about a document is concluded by this call, so the row carries no
+-- failure reason forward.
+create or replace function screening_v2.resume_ashby_ingestion_midflight(
+  p_application_link_id uuid,
+  p_reason text,
+  p_min_stale_seconds integer default 900,
+  p_now timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  v_ing  screening_v2.ashby_resume_ingestions%rowtype;
+  v_link screening_v2.ashby_application_links%rowtype;
+  v_attempts integer;
+  v_age_seconds numeric;
+  v_max_attempts constant integer := 5;
+  -- Bounded like every other operator-supplied interval in this schema.
+  v_stale_seconds constant integer :=
+    least(greatest(coalesce(p_min_stale_seconds, 900), 1), 86400);
+  -- EXACTLY the states a dead run can strand that are also SAFE to re-drive.
+  -- `structuring` is excluded on purpose — see the header. `queued` and
+  -- `fetching` are excluded because they already self-heal, and admitting them
+  -- would let a healthy in-flight row be yanked backwards mid-download.
+  v_midflight_states constant text[] := array['scanning','extracting'];
+begin
+  if p_reason is null or length(btrim(p_reason)) = 0 then
+    return jsonb_build_object('status', 'invalid_reason');
+  end if;
+
+  select * into v_ing
+    from screening_v2.ashby_resume_ingestions
+   where application_link_id = p_application_link_id
+   for update;
+  if not found then
+    return jsonb_build_object('status', 'not_found');
+  end if;
+
+  if not (v_ing.state = any(v_midflight_states)) then
+    return jsonb_build_object('status', 'invalid_state', 'state', v_ing.state);
+  end if;
+
+  -- THE LIVENESS BOUND. Decided under the row lock taken above, so a live
+  -- worker's own transition cannot commit inside this window.
+  v_age_seconds := extract(epoch from (p_now - v_ing.updated_at));
+  if v_age_seconds < v_stale_seconds then
+    return jsonb_build_object('status', 'recently_active',
+                              'state', v_ing.state,
+                              'age_seconds', floor(v_age_seconds),
+                              'min_stale_seconds', v_stale_seconds);
+  end if;
+
+  select * into v_link
+    from screening_v2.ashby_application_links
+   where id = p_application_link_id;
+  if not found then
+    return jsonb_build_object('status', 'not_found');
+  end if;
+  -- Never requeue work for a withdrawn/deleted/cancelled application.
+  if v_link.terminal_state is not null then
+    return jsonb_build_object('status', 'blocked_terminal',
+                              'terminal_state', v_link.terminal_state);
+  end if;
+
+  -- The UNCHANGED 0032 ceiling.
+  if v_ing.attempts + 1 > v_max_attempts then
+    return jsonb_build_object('status', 'retry_exhausted',
+                              'state', v_ing.state,
+                              'attempts', v_ing.attempts,
+                              'max_attempts', v_max_attempts);
+  end if;
+
+  update screening_v2.ashby_resume_ingestions
+     set state = 'queued',
+         -- The row carries NO failure: the run died, which says nothing about
+         -- the document.
+         failed_reason = null,
+         attempts = attempts + 1,
+         updated_at = p_now
+   where application_link_id = p_application_link_id
+  returning attempts into v_attempts;
+
+  -- ATTRIBUTABLE. This charges a candidate's requeue budget and causes their
+  -- résumé to be downloaded again, so it leaves a trace like every other door
+  -- that does either. Opaque ids and stable codes only — no file handle, no
+  -- presigned URL, no candidate field.
+  insert into screening_v2.audit_events
+    (actor_id, actor_type, action, target_type, target_id, result, metadata)
+  values
+    ('00000000-0000-4000-8000-000000000001',
+     -- Automatic, not operator-driven: the worker observed a dead run.
+     'system',
+     'ashby_ingestion_midflight_resume', 'ashby_resume_ingestion',
+     v_ing.id::text, 'success',
+     jsonb_build_object('application_link_id', p_application_link_id,
+                        'from_state', v_ing.state,
+                        'reason', left(p_reason, 100),
+                        'age_seconds', floor(v_age_seconds),
+                        'attempts_before', v_ing.attempts,
+                        'attempts_after', v_attempts,
+                        'max_attempts', v_max_attempts));
+
+  return jsonb_build_object('status', 'ok',
+                            'state', 'queued',
+                            'from_state', v_ing.state,
+                            'attempts', v_attempts,
+                            'max_attempts', v_max_attempts);
+end;
+$$;
+
+revoke all on function screening_v2.resume_ashby_ingestion_midflight(uuid, text, integer, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.resume_ashby_ingestion_midflight(uuid, text, integer, timestamptz)
+  to service_role;
+
+comment on function screening_v2.resume_ashby_ingestion_midflight(uuid, text, integer, timestamptz) is
+  'Walks a resume ingestion stranded in scanning/extracting by a dead process back '
+  'to queued so the pipeline re-drives it. Refuses a row touched within '
+  'p_min_stale_seconds (a live run may still own it), refuses terminal '
+  'applications, honours the 0032 attempts ceiling, and writes an audit row. '
+  'structuring is deliberately NOT recoverable here: it is post-persist, so a '
+  're-drive would hit the 0084 CAS trap.';
+
+-- The new audit action has to be admitted by the 0007 CHECK, or the insert
+-- above aborts the whole rescue.
+--
+-- TWO-PHASE, matching 0014/0036/0039/0074/0084/0094 without exception. A plain
+-- `add constraint ... check (...)` holds ACCESS EXCLUSIVE for a full sequential
+-- scan of `audit_events` — the table EVERY audited RPC writes (phone admission,
+-- invite delivery, all four ingestion recoveries, logins) — so every audited
+-- write in the system blocks for the duration. `not valid` takes that lock only
+-- for the instant catalog update; `validate constraint` then scans under SHARE
+-- UPDATE EXCLUSIVE, which does not block INSERT. The table is small today
+-- (~3.3k rows), so this is a latent cost rather than a live one — but it is
+-- append-only and only grows, and 0014 names this "the sanctioned replaceable
+-- data-guard evolution pattern".
+alter table screening_v2.audit_events drop constraint if exists chk_audit_action;
+alter table screening_v2.audit_events add constraint chk_audit_action check (
+  action = any (array[
+    'invite_sent','invite_revoked','invite_consumed','grant_issued','grant_revoked',
+    'grant_consumed','screening_started','screening_completed','screening_failed',
+    'assessment_recorded','candidate_status_changed','candidate_consent_updated',
+    'session_created','session_updated','session_terminated','membership_created',
+    'membership_updated','membership_deactivated','role_created','role_updated',
+    'role_deactivated','export_requested','export_completed','login_success',
+    'login_failure','logout','config_changed','auth_login_success','auth_login_failure',
+    'auth_token_refresh','auth_logout','rbac_access_denied','rbac_ownership_denied',
+    'resource_create','resource_read','resource_update','resource_delete','resource_list',
+    'rate_limit_exceeded','audit_sink_failure','audit_configuration_error',
+    'recording_download','recording_upload','recording_integrity_verified',
+    'recording_quarantined','recording_revoked','recording_deleted',
+    'admin_session_override','admin_maintenance_toggle','admin_member_update',
+    'quota_override','notification_create','appeal_create','appeal_review',
+    'allowlist_linked','admin_allowlist_add','admin_allowlist_update',
+    'ashby_mapping_update','ashby_mapping_drift','ashby_application_cancel',
+    'ashby_operation_enqueue','ashby_operation_update','ashby_operation_retry',
+    'ashby_writeback_pending','ashby_invite_delivered','ashby_ingestion_attempts_reset',
+    'ashby_ingestion_parse_recovery','ashby_ingestion_legacy_bad_output_recovery',
+    'phone_attempt_admitted','phone_attempt_classified','phone_attempt_ended',
+    'phone_appointment_scheduled','phone_appointment_cancelled','phone_appointment_missed',
+    'phone_opt_out_recorded','phone_suppression_added','phone_recording_attached',
+    'phone_rescreen_requested','phone_number_reverified','phone_test_gate_armed',
+    'phone_test_gate_consumed','phone_callback_confirmed','phone_callback_recovery_required',
+    'ashby_ingestion_model_degraded_recovery','phone_suppression_released',
+    -- 0097
+    'ashby_ingestion_midflight_resume'
+  ])
+) not valid;
+alter table screening_v2.audit_events validate constraint chk_audit_action;
+
+-- `drop constraint` also drops its COMMENT, and 0074/0084/0094 each re-set it.
+-- Losing it silently retires the generation marker every reader uses to tell
+-- which migration last widened the vocabulary.
+comment on constraint chk_audit_action on screening_v2.audit_events is
+  'Closed audit vocabulary through 0097. Widen ONLY by re-creating this '
+  'constraint with the full list plus the new action(s), never by dropping '
+  'members — every writer of an existing action depends on it.';
+
+-- ── 2. NO ALLOWLIST WIDENING ────────────────────────────────────────────
+-- An earlier revision of this migration recreated `recover_ashby_ingestion_parse`
+-- to admit eight new machine-class rest codes, because the worker half wrote
+-- them. Three review rounds removed that worker half — writing a reason on a
+-- refused exit kept overwriting real verdicts (`scan_infected` among them),
+-- and the collision was found at four separate call sites.
+--
+-- With no new codes written, the allowlist needs no widening, and this
+-- migration no longer recreates that function at all. That is strictly safer:
+-- a full redefinition of a SECURITY DEFINER function is how an unnoticed
+-- privilege or search_path drift ships, and reviewers had to byte-diff it to
+-- prove nothing else had moved.
+
+-- ── 3. THE STATES THAT DEADLOCK NOW HAVE COUNTERS ───────────────────────
+-- The pre-0097 surface counted `queued` and `fetching` — the two states that
+-- recover unaided — and nothing else. A row stranded in `scanning`,
+-- `extracting` or `structuring` was invisible to /health by construction, and
+-- discoverable only by reading the table by hand. That is exactly how two
+-- résumés sat stuck with nobody paged.
+--
+-- `structuring` is counted even though §1 deliberately does NOT auto-rescue
+-- it: an operator seeing a non-zero count there is the ONLY signal that a row
+-- hit the one strand this migration leaves to a human, and the alternative is
+-- the silence we are here to remove.
+--
+-- Counters only; no identifier of any kind, and every existing key keeps its
+-- exact meaning. Nine now instead of six.
+create or replace function screening_v2.ashby_prerequisite_backlog(
+  p_stuck_after_seconds integer default 900,
+  p_now                 timestamptz default now()
+)
+returns jsonb
+language sql
+stable
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+  select jsonb_build_object(
+    'pending_blocked', (
+      select count(*)
+        from screening_v2.ashby_operations o
+        join screening_v2.ashby_application_links l on l.id = o.application_link_id
+       where o.provider = 'ashby'
+         and o.operation_type = 'invite_delivery'
+         and o.state = 'pending'
+         and l.terminal_state is null
+         and (
+           not exists (
+             select 1 from screening_v2.ashby_job_mappings m
+              where m.id = l.job_mapping_id and m.status = 'enabled'
+           )
+           or (
+             l.external_resume_file_handle is not null
+             and not exists (
+               select 1 from screening_v2.ashby_resume_ingestions i
+                where i.application_link_id = l.id and i.state = 'ready'
+             )
+           )
+         )
+    ),
+    -- The subset of `pending_blocked` that cannot clear without a human.
+    -- Deliberately NOT subtracted from `pending_blocked`: that stays the
+    -- honest total, and a consumer that wants "transiently waiting" computes
+    -- the difference rather than being handed a pre-baked number whose
+    -- derivation it cannot see.
+    'pending_blocked_failed_ingestion', (
+      select count(*)
+        from screening_v2.ashby_operations o
+        join screening_v2.ashby_application_links l on l.id = o.application_link_id
+       where o.provider = 'ashby'
+         and o.operation_type = 'invite_delivery'
+         and o.state = 'pending'
+         and l.terminal_state is null
+         and l.external_resume_file_handle is not null
+         and exists (
+           select 1 from screening_v2.ashby_resume_ingestions i
+            where i.application_link_id = l.id and i.state = 'failed_review'
+         )
+    ),
+    'failed_prerequisite', (
+      select count(*)
+        from screening_v2.ashby_operations o
+       where o.provider = 'ashby'
+         and o.operation_type = 'invite_delivery'
+         and o.state = 'failed'
+         and o.error_code in ('ingestion_not_ready','mapping_inactive')
+    ),
+    'ingestion_stuck_queued', (
+      select count(*)
+        from screening_v2.ashby_resume_ingestions i
+        join screening_v2.ashby_application_links l on l.id = i.application_link_id
+       where i.provider = 'ashby'
+         and i.state = 'queued'
+         and l.terminal_state is null
+         -- Only a RESUME-BACKED link can be stuck: a link with no handle
+         -- rests at `queued` by design and is not a fault.
+         and l.external_resume_file_handle is not null
+         and i.updated_at < p_now - make_interval(
+               secs => least(greatest(coalesce(p_stuck_after_seconds, 900), 1), 86400))
+    ),
+    'ingestion_stuck_fetching', (
+      select count(*)
+        from screening_v2.ashby_resume_ingestions i
+        join screening_v2.ashby_application_links l on l.id = i.application_link_id
+       where i.provider = 'ashby'
+         and i.state = 'fetching'
+         and l.terminal_state is null
+         and i.updated_at < p_now - make_interval(
+               secs => least(greatest(coalesce(p_stuck_after_seconds, 900), 1), 86400))
+    ),
+    -- 0097: the states a dead process strands a row in. A row cannot enter any
+    -- of them without a resume handle, so no handle predicate is needed (the
+    -- same reasoning `ingestion_stuck_fetching` already uses).
+    'ingestion_stuck_scanning', (
+      select count(*)
+        from screening_v2.ashby_resume_ingestions i
+        join screening_v2.ashby_application_links l on l.id = i.application_link_id
+       where i.provider = 'ashby'
+         and i.state = 'scanning'
+         and l.terminal_state is null
+         and i.updated_at < p_now - make_interval(
+               secs => least(greatest(coalesce(p_stuck_after_seconds, 900), 1), 86400))
+    ),
+    'ingestion_stuck_extracting', (
+      select count(*)
+        from screening_v2.ashby_resume_ingestions i
+        join screening_v2.ashby_application_links l on l.id = i.application_link_id
+       where i.provider = 'ashby'
+         and i.state = 'extracting'
+         and l.terminal_state is null
+         and i.updated_at < p_now - make_interval(
+               secs => least(greatest(coalesce(p_stuck_after_seconds, 900), 1), 86400))
+    ),
+    -- The one strand 0097 leaves to a human (see the header): counted so it is
+    -- never silent, never auto-rescued because the re-drive is unsafe here.
+    'ingestion_stuck_structuring', (
+      select count(*)
+        from screening_v2.ashby_resume_ingestions i
+        join screening_v2.ashby_application_links l on l.id = i.application_link_id
+       where i.provider = 'ashby'
+         and i.state = 'structuring'
+         and l.terminal_state is null
+         and i.updated_at < p_now - make_interval(
+               secs => least(greatest(coalesce(p_stuck_after_seconds, 900), 1), 86400))
+    ),
+    -- 0039: parse-class rests on a live application. Matches BOTH the legacy
+    -- generic `parse_error` and every sub-classified `parse_*` code, so a
+    -- pre-existing row is counted by the same number as a new one.
+    'ingestion_failed_parse', (
+      select count(*)
+        from screening_v2.ashby_resume_ingestions i
+        join screening_v2.ashby_application_links l on l.id = i.application_link_id
+       where i.provider = 'ashby'
+         and i.state = 'failed_review'
+         and l.terminal_state is null
+         and i.failed_reason like 'parse\_%'
+    )
+  );
+$$;
+
+revoke all on function screening_v2.ashby_prerequisite_backlog(integer, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.ashby_prerequisite_backlog(integer, timestamptz)
+  to service_role;
+
+comment on function screening_v2.ashby_prerequisite_backlog(integer, timestamptz) is
+  'Nine sanitized backlog counters for the Ashby health surface. 0097 added '
+  'ingestion_stuck_scanning/extracting/structuring — the states a dead process '
+  'strands a row in, which had no counter and were therefore invisible to '
+  '/health by construction.';

@@ -257,6 +257,32 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         attempts: typeof row?.attempts === 'number' ? row.attempts : undefined,
       };
     },
+    async resumeIngestionMidflight(
+      applicationLinkId,
+      reasonCode,
+    ): Promise<{ status: string; attempts?: number; fromState?: string }> {
+      // The sanctioned door for `scanning`/`extracting -> queued` when the
+      // owning process died. The RPC re-checks the state server-side, REFUSES A
+      // ROW TOUCHED RECENTLY (`recently_active` — the lease is not the process,
+      // so a live run may still own it), refuses terminal applications, charges
+      // the same 5-attempt requeue budget every other requeue does, and writes
+      // an audit row. This seam does not get to decide any of that.
+      //
+      // `structuring` is deliberately NOT recoverable: it is post-persist, so a
+      // re-drive hits the 0084 CAS trap. It is counted on the health surface
+      // instead.
+      const { data, error } = await client.rpc('resume_ashby_ingestion_midflight', {
+        p_application_link_id: applicationLinkId,
+        p_reason: reasonCode,
+      });
+      if (error) throw new Error('ashby_ingestion_midflight_resume_error');
+      const row = data as { attempts?: unknown; from_state?: unknown } | null;
+      return {
+        status: statusOf(data),
+        attempts: typeof row?.attempts === 'number' ? row.attempts : undefined,
+        fromState: typeof row?.from_state === 'string' ? row.from_state : undefined,
+      };
+    },
     async claimOperation(operationType, owner, leaseSeconds): Promise<OperationClaimRow | null> {
       const { data, error } = await client.rpc('claim_ashby_operation', {
         p_operation_type: operationType,
