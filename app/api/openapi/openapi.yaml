@@ -4868,13 +4868,20 @@ paths:
           required: false
           schema:
             type: string
+            format: uuid
       responses:
         '200':
-          description: Funnel summary. meta states whether HR stage tracking is configured, whether the server carries 0098's columns, when the roll-up last ran, and the trailing window it recomputes — each a fact the dashboard renders rather than deduces from the counts.
+          description: Funnel summary. meta states whether HR stage tracking is observable, whether the server carries 0098's columns, when the roll-up last RAN (from its heartbeat, not from the data), and the trailing window it recomputes — each a fact the dashboard renders rather than deduces from the counts.
           content:
             application/json:
               schema:
-                type: object
+                $ref: '#/components/schemas/FunnelSummaryBody'
+        '401':
+          description: Missing or invalid token.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
         '400':
           description: Invalid date or role filter.
           content:
@@ -6560,6 +6567,51 @@ components:
 
   schemas:
     # ── Common errors ────────────────────────────────────────────────
+    FunnelSummaryBody:
+      type: object
+      required: [range, totals, conversions, series, refreshed_at, meta]
+      properties:
+        range:
+          type: object
+          description: The window actually served, after clamping to the maximum span.
+        totals:
+          type: object
+          description: Summed counters over the window. Counts only.
+        conversions:
+          type: object
+          description: Derived ratios. Null where the denominator is zero — a rate with no denominator is unknown, not zero.
+        series:
+          type: array
+          description: One row per day. Latency percentiles are omitted on this route, as are the per-individual counters on a day that resolves to a single candidate.
+          items:
+            type: object
+        refreshed_at:
+          type: string
+          nullable: true
+          description: Newest refreshed_at among the rows IN THIS WINDOW. Null for an empty window, which says nothing about whether the roll-up has run — use meta.rollup_refreshed_at for that.
+        meta:
+          $ref: '#/components/schemas/FunnelMeta'
+    FunnelMeta:
+      type: object
+      description: Facts the dashboard renders rather than infers. Every attempt to deduce these from the counts was wrong for the configuration this system ships with.
+      required: [hr_tracking_configured, schema_current, rollup_refreshed_at, rollup_freshness_known, refresh_window_days]
+      properties:
+        hr_tracking_configured:
+          type: boolean
+          description: True only when some application link in scope has had its Ashby stage confirmed since import. False means HR disposition is not knowable, so the HR cards must say so rather than render zeros.
+        schema_current:
+          type: boolean
+          description: False when migration 0098's columns are missing — the API shipped ahead of the migration. The HR and candidate-total figures are then absent, not zero.
+        rollup_refreshed_at:
+          type: string
+          nullable: true
+          description: When the roll-up last RAN, from its heartbeat. Meaningful only when rollup_freshness_known is true; null then means it has genuinely never completed a pass.
+        rollup_freshness_known:
+          type: boolean
+          description: False when the freshness probe itself failed — "we could not find out", which must not be shown as "never calculated".
+        refresh_window_days:
+          type: integer
+          description: The trailing window each recompute reaches back over. Days older than this are frozen at their last recompute.
     ErrorBody:
       type: object
       required: [error]

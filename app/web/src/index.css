@@ -316,7 +316,14 @@
   *, *::before, *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
+    /* Zeroing the DURATION alone does not collapse a staggered reveal: with
+       `animation-fill-mode: both`, each `.fade-up-stagger > *:nth-child(n)`
+       still holds at `opacity: 0` for its whole DELAY (up to 240ms here, and
+       `.rows-reveal` the same). The motion is gone but the sequenced pop-in
+       remains — which is the part a motion-sensitive reader asked not to see. */
+    animation-delay: 0s !important;
     transition-duration: 0.01ms !important;
+    transition-delay: 0s !important;
     scroll-behavior: auto !important;
   }
   .glass-interactive:hover { transform: none; }

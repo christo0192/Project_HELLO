@@ -14,37 +14,78 @@
 -- drifts downward as the team works through the queue. It is exactly the kind
 -- of number that reads as an insight and is actually an artefact.
 --
--- This migration adds the third state explicitly. `hr_state` is derived from
--- the CURRENT Ashby stage on the application link, compared against the two
--- stage ids the job mapping already stores:
+-- This migration adds the third state explicitly, plus a fourth for the case
+-- that actually dominates today. `hr_state` compares the Ashby stage recorded
+-- on the application link against the two stage ids the job mapping stores —
+-- but ONLY where that stage has been confirmed since import (section 0):
 --
---   qualified     current stage = mapping.reference_check_stage_id
---   awaiting      current stage = mapping.ai_screening_stage_id  (untouched)
---   disqualified  bot-decided, HR moved them elsewhere, AND we can prove it:
---                 the link carries a stage and the mapping names both stages
---   unknown       bot-decided but the Ashby stage is NOT observable — no link
---                 at all (every recruiter-uploaded résumé), a link whose stage
---                 has not synced, or a mapping still missing a stage id
+--   qualified     confirmed stage = mapping.reference_check_stage_id
+--   awaiting      confirmed stage = mapping.ai_screening_stage_id (untouched)
+--   disqualified  bot-decided, the stage is CONFIRMED, and it is neither of the
+--                 mapped ones — the only case where "somewhere else" means a
+--                 human moved them
+--   unknown       bot-decided but the stage is NOT observable: no link at all
+--                 (every recruiter-uploaded résumé), a stage never confirmed
+--                 since import (today: every link in production), or a mapping
+--                 still missing a stage id
 --   null          the bot has not produced an assessment yet, so there is
 --                 nothing for HR to have acted on
 --
--- `unknown` is the whole reason this is safe. An `else 'disqualified'` would
--- absorb all three of those cases and report them as HR rejections, which is
--- the artefact this migration exists to remove, not create.
+-- `unknown` is the whole reason this is safe, and it gates all three of the
+-- others rather than only `disqualified`. An `else 'disqualified'` would report
+-- unobservable candidates as HR rejections; an ungated `awaiting` would report
+-- them as an HR backlog. Both are claims about a human decision we have not
+-- observed, and both are the artefact this migration exists to remove.
 --
 -- KNOWN LIMIT, stated so nobody mistakes it for precision: the link carries
--- only the CURRENT stage, not a stage history. A candidate promoted BEYOND
+-- only a current stage, not a stage history. A candidate promoted BEYOND
 -- reference check (offer, hired) therefore stops counting as `qualified` and
--- becomes `disqualified`. Fixing that needs stage-transition history, which
--- this system does not record. For the present pipeline — where Reference
--- Check is the last mapped stage — the distinction does not yet arise, and
--- the dashboard copy says "currently at" rather than "reached" so the number
--- is not read as cumulative.
+-- becomes `disqualified`, so once hiring starts the advance rate falls. The
+-- dashboard copy says so in the definition of "Not advanced" rather than
+-- leaving the reader to discover it. Fixing it properly needs stage-transition
+-- history, which this system does not record.
 --
 -- Deliberately a SEPARATE view rather than three more columns on
 -- `v_funnel_candidate`: that view is 130 lines and `create or replace` would
 -- mean restating all of it to append a column, which is pure transcription
 -- risk for no benefit. The rollup joins the two.
+
+-- ── 0. The precondition this whole migration rests on ────────────────────
+-- `ashby_application_links.external_stage_id` is written in EXACTLY one place
+-- (workflow-stores.ts `createLink`), at import, from `decision.stageId` — and
+-- signal-worker.ts refuses any signal whose stage is not the mapping's
+-- `ai_screening_stage_id`. So the column is not "the candidate's current
+-- stage": it is a constant, equal to the AI screening stage, for every link
+-- ever created. Nothing UPDATEs it; `applicationChangeStage` has no callers.
+-- Verified against production: all six links carry
+-- external_stage_id = ai_screening_stage_id.
+--
+-- That makes a naive reading of this column actively dangerous. Every scored
+-- Ashby candidate would evaluate as "still in AI screening" forever, so
+-- `qualified` and `disqualified` would be UNREACHABLE while `awaiting` claimed
+-- "HR has not opened this candidate yet" about someone rejected weeks ago —
+-- and the moment an operator performed the documented activation step (set
+-- `reference_check_stage_id`), the dashboard would stop saying "not tracked"
+-- and start presenting "Advanced 0 / Not advanced 0" as measurement.
+--
+-- So the states are gated on PROOF that a link's stage has been observed since
+-- import, not on an id being non-null. `stage_synced_at` is that proof. Nothing
+-- writes it yet, deliberately: the `candidateStageChange` webhook already
+-- ARRIVES and is already parsed (extractors.ts extracts the stage id), but the
+-- signal worker discards it as `stage_not_ai`. Persisting it changes which
+-- Ashby events create work, which is an import-pipeline decision that does not
+-- belong in a dashboard change. Until that lands, every HR state reads
+-- `unknown` and the dashboard says so in plain words.
+alter table screening_v2.ashby_application_links
+  add column if not exists stage_synced_at timestamptz;
+
+comment on column screening_v2.ashby_application_links.stage_synced_at is
+  'When external_stage_id was last confirmed against Ashby AFTER import. NULL '
+  'means the column still holds the import-time constant (the AI screening '
+  'stage) and the candidate''s real stage is UNKNOWN. Set this only from a '
+  'genuine stage observation — a candidateStageChange receipt or a '
+  'reconciliation read. Every HR disposition in v_funnel_hr_state is gated on '
+  'it, so writing it without a real observation makes the dashboard lie.';
 
 -- ── 1. The per-candidate HR disposition ──────────────────────────────────
 create or replace view screening_v2.v_funnel_hr_state
@@ -69,11 +110,22 @@ stage as (
   -- mapped stage" is indistinguishable from "we cannot see where they are",
   -- and the difference is the whole point of this migration.
   select l.candidate_id,
-         bool_or(jm.reference_check_stage_id is not null
+         -- Each clause carries its OWN `stage_synced_at`, per link. A candidate
+         -- may hold one synced link and one that has never been looked at;
+         -- reading a stage off the second because the first made the candidate
+         -- "observable" would be the same unproven inference in a new place.
+         bool_or(l.stage_synced_at is not null
+                 and jm.reference_check_stage_id is not null
                  and l.external_stage_id = jm.reference_check_stage_id) as at_reference_check,
-         bool_or(jm.ai_screening_stage_id is not null
+         bool_or(l.stage_synced_at is not null
+                 and jm.ai_screening_stage_id is not null
                  and l.external_stage_id = jm.ai_screening_stage_id)    as at_ai_screening,
-         bool_or(l.external_stage_id is not null
+         -- `stage_synced_at is not null` is the load-bearing clause. Without
+         -- it, `external_stage_id` is the import-time constant and "not at
+         -- either mapped stage" means "we have never looked", not "a human
+         -- moved them". See section 0.
+         bool_or(l.stage_synced_at is not null
+                 and l.external_stage_id is not null
                  and jm.ai_screening_stage_id is not null
                  and jm.reference_check_stage_id is not null)           as observable
     from screening_v2.ashby_application_links l
@@ -87,17 +139,25 @@ select c.id                     as candidate_id,
        case
          -- No assessment ⇒ the bot has not decided ⇒ HR owes nothing yet.
          when la.candidate_id is null                then null
+         -- UNOBSERVABLE FIRST, and it gates all three real states — not just
+         -- `disqualified`. If we have never confirmed this candidate's stage
+         -- since import, then "still in AI screening" is exactly as unproven as
+         -- "moved elsewhere": both are readings of a column that has not been
+         -- updated. Reporting `awaiting` here would claim an HR backlog that may
+         -- be an HR decision taken weeks ago.
+         when not coalesce(st.observable, false)     then 'unknown'
          when coalesce(st.at_reference_check, false) then 'qualified'
          when coalesce(st.at_ai_screening, false)    then 'awaiting'
-         -- ONLY here can "somewhere else" mean "a human moved them". An
-         -- `else 'disqualified'` would silently absorb: a candidate with no
-         -- Ashby link at all (every recruiter-uploaded résumé), a link whose
-         -- stage has not synced yet, and every job whose mapping still has a
-         -- NULL reference_check/ai_screening stage id — reporting each as an
-         -- HR rejection. That is precisely the artefact this migration was
-         -- written to remove, so the inference is gated on proof.
-         when coalesce(st.observable, false)         then 'disqualified'
-         else 'unknown'
+         -- Reached only when the stage IS observed and is neither mapped one,
+         -- which is the single case where "somewhere else" means "a human moved
+         -- them". An `else 'disqualified'` above the guard would absorb: a
+         -- candidate with no Ashby link at all (every recruiter-uploaded
+         -- résumé), a link whose stage has never been confirmed since import
+         -- (today: all of them), and every job whose mapping still has a NULL
+         -- reference_check/ai_screening stage id — reporting each as an HR
+         -- rejection. That is precisely the artefact this migration exists to
+         -- remove, so the inference is gated on proof, twice.
+         else 'disqualified'
        end                      as hr_state
   from screening_v2.candidates c
   left join latest_assessment la on la.candidate_id = c.id
@@ -146,6 +206,35 @@ comment on column screening_v2.funnel_stage_daily.hr_awaiting is
   'Bot-screened candidates still sitting in the AI screening stage — an HR '
   'backlog, NOT a rejection. Kept distinct so the rejection rate is not a '
   'function of how recently the bot ran.';
+
+-- ── 2b. A heartbeat, so freshness is not read off the DATA ───────────────
+-- `max(refreshed_at)` over funnel_stage_daily answers "when did a row last get
+-- written", which is not the same question as "when did the roll-up last run".
+-- `refresh_funnel_rollup` is DELETE-then-INSERT over a trailing window: a
+-- window that produces no rows commits having written nothing, and rows older
+-- than the window are never re-stamped. So a tenant with a month of no intake —
+-- a hiring freeze, entirely normal here — would have the loop running happily
+-- every 15 minutes while the dashboard reported "Figures last recalculated
+-- 15 June". That is the same defect the meta field was added to kill, one
+-- timescale up.
+--
+-- One row, upserted on every successful run.
+create table if not exists screening_v2.funnel_rollup_runs (
+  id           smallint primary key default 1,
+  ran_at       timestamptz not null default now(),
+  window_start date,
+  rows_written integer,
+  constraint chk_funnel_rollup_runs_singleton check (id = 1)
+);
+
+comment on table screening_v2.funnel_rollup_runs is
+  'Single-row heartbeat for refresh_funnel_rollup. Answers "when did the '
+  'roll-up last RUN", which a scan of funnel_stage_daily cannot: an empty '
+  'window writes no rows, and rows outside the trailing window are never '
+  're-stamped.';
+
+revoke all on screening_v2.funnel_rollup_runs from anon, authenticated, public;
+grant select on screening_v2.funnel_rollup_runs to service_role;
 
 -- ── 3. Teach the refresh to populate them ────────────────────────────────
 create or replace function screening_v2.refresh_funnel_rollup(
@@ -243,6 +332,18 @@ begin
    and hr.role_id is not distinct from coalesce(i.role_id, ch.role_id);
 
   get diagnostics v_rows = row_count;
+
+  -- Stamped on EVERY successful pass, including one that wrote zero rows —
+  -- that is the whole point. It is inside the same transaction as the rebuild,
+  -- so it can never claim a run that was rolled back, and it is never reached
+  -- on the `busy` path above, so it cannot claim a run that did not happen.
+  insert into screening_v2.funnel_rollup_runs (id, ran_at, window_start, rows_written)
+  values (1, p_now, v_window_start, v_rows)
+  on conflict (id) do update
+    set ran_at = excluded.ran_at,
+        window_start = excluded.window_start,
+        rows_written = excluded.rows_written;
+
   return jsonb_build_object(
     'status', 'ok',
     'rows', v_rows,

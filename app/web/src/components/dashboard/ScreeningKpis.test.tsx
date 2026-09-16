@@ -82,6 +82,7 @@ function funnel(
       hr_tracking_configured: true,
       schema_current: true,
       rollup_refreshed_at: '2026-09-16T06:00:00Z',
+      rollup_freshness_known: true,
       refresh_window_days: 30,
       ...(opts.meta ?? {}),
     },
@@ -123,14 +124,17 @@ describe('ScreeningKpis', () => {
   it('never counts an untouched candidate as a rejection', async () => {
     // 2 advanced, 1 not advanced, 7 not looked at yet. The 7 must not inflate
     // "Not advanced", or the rejection rate rises when screening speeds UP.
+    // Distinct values throughout: with `hr_disqualified: 1` next to
+    // `scored: 10`, `toContain('1')` matched the 1 in "10", so a card rendering
+    // ANY wrong value containing the digit 1 passed.
     getScreeningFunnel.mockResolvedValue(
-      funnel({ scored: 10, hr_qualified: 2, hr_disqualified: 1, hr_awaiting: 7 }),
+      funnel({ scored: 26, hr_qualified: 2, hr_disqualified: 4, hr_awaiting: 7 }),
     );
     renderKpis();
 
     const card = await cardText('Not advanced');
-    expect(card).toContain('1');
-    expect(card).not.toContain('8');
+    expect(card).toContain('4');
+    expect(card).not.toContain('11');   // 4 + 7, the folded-in version
     expect(
       await screen.findByText(/7 screened candidates are still waiting/i),
     ).toBeInTheDocument();
@@ -151,6 +155,9 @@ describe('ScreeningKpis', () => {
     renderKpis();
 
     expect(await screen.findByText(/Not tracked yet/i)).toBeInTheDocument();
+    // The cause must be the one an operator can act on — stage data not being
+    // kept up to date — not a database or server version.
+    expect(screen.queryAllByText(/older database version/i)).toHaveLength(0);
     // The definitions list still documents the card; what must be absent is
     // the CARD itself showing a fabricated 0%.
     const cards = screen.queryAllByText('Advance rate').filter((n) => !n.closest('details'));
@@ -315,10 +322,32 @@ describe('ScreeningKpis', () => {
     renderKpis();
 
     expect(await cardText('Candidates dialled')).toContain('5');
-    // No `meta` ⇒ HR state is unknown, so the band must not render decisions.
-    expect(await screen.findByText(/Not tracked yet/i)).toBeInTheDocument();
+
+    // FAIL CLOSED on every derived fact. `schemaCurrent` used to be
+    // `meta?.schema_current !== false`, which reads `undefined` as "the columns
+    // are present" — so the single deploy window this flag exists to survive
+    // was the one window in which it asserted the opposite, rendering
+    // "Total candidates 0" beside "Candidates dialled 5".
+    const totals = screen.queryAllByText('Total candidates').filter((n) => !n.closest('details'));
+    expect(totals).toHaveLength(0);
+
     const rates = screen.queryAllByText('Advance rate').filter((n) => !n.closest('details'));
     expect(rates).toHaveLength(0);
+
+    // And it must name the RIGHT cause. Telling the reader to go link a stage
+    // in Ashby sends them to fix a correctly-configured job; the actual problem
+    // is that the page is ahead of the server.
+    // TWO places say it: the panel-level notice explaining the missing totals,
+    // and the Team-decision band explaining its own absence. Both are needed —
+    // a reader who scrolls to the band should not have to find the banner.
+    expect(await screen.findAllByText(/newer than the server/i)).toHaveLength(2);
+    // …and not the "go wire up Ashby" message, which would send someone to fix
+    // a correctly-configured job. Filtered past the definitions list, which
+    // legitimately still documents the card.
+    expect(
+      screen.queryAllByText(/kept up to date here/i).filter((n) => !n.closest('details')),
+    ).toHaveLength(0);
+
     // …and an absent `meta` is not evidence that nothing was ever computed.
     expect(screen.queryAllByText(/have not been calculated yet/i)).toHaveLength(0);
   });
@@ -452,13 +481,102 @@ describe('ScreeningKpis', () => {
   it('never prints a negative count when the underlying figures disagree', async () => {
     // `answered_ge1` and `connected` are independent columns; a crashed job can
     // record answers on an attempt whose `answered_at` was never written.
+    // `dialed: 11`, not 10: '0' is a substring of '10', so the old fixture let
+    // a card rendering `dialed` pass the `toContain('0')` assertion.
     getScreeningFunnel.mockResolvedValue(
-      funnel({ dialed: 10, connected: 3, answered_ge1: 5 }),
+      funnel({ dialed: 11, connected: 3, answered_ge1: 5 }),
     );
     renderKpis();
     const card = await cardText('Connected, no answers');
     expect(card).not.toContain('-');
     expect(card).toContain('0');
+    expect(card).not.toContain('11');
+  });
+
+  it('clamps the OTHER subtraction too', async () => {
+    // `neverConnected = dialed - connected` is the same shape as the clamp
+    // above and had no fixture at all, so deleting its `Math.max` survived the
+    // whole suite. `connected > dialed` happens when a webhook lands for an
+    // attempt whose dial row was never written.
+    getScreeningFunnel.mockResolvedValue(funnel({ dialed: 3, connected: 8, answered_ge1: 8 }));
+    renderKpis();
+    const card = await cardText('Never connected');
+    expect(card).not.toContain('-');
+    expect(card).toContain('0');
+  });
+
+  it('says so when the two call counts contradict each other', async () => {
+    // Clamping `connectedNoAnswer` to 0 hides the arithmetic but not the
+    // contradiction: "Candidates reached 3" still sits above "Answered
+    // questions 8". Silence there asks the reader to believe both.
+    getScreeningFunnel.mockResolvedValue(funnel({ dialed: 11, connected: 3, answered_ge1: 8 }));
+    renderKpis();
+    expect(await screen.findByText(/cannot be split cleanly/i)).toBeInTheDocument();
+  });
+
+  it('does not cry contradiction on ordinary figures', async () => {
+    getScreeningFunnel.mockResolvedValue(funnel({ dialed: 11, connected: 8, answered_ge1: 3 }));
+    renderKpis();
+    await cardText('Candidates reached');
+    expect(screen.queryAllByText(/cannot be split cleanly/i)).toHaveLength(0);
+  });
+
+  it('survives a payload whose series is missing entirely', async () => {
+    // The `t` memo guards `totals`; nothing guarded `series`. `rows.map` on
+    // undefined throws during RENDER, taking the whole DashboardPage down —
+    // a worse outcome than the missing-fields case it sits beside.
+    const legacy = funnel({ dialed: 5 });
+    delete (legacy as Record<string, unknown>).series;
+    getScreeningFunnel.mockResolvedValue(legacy);
+    renderKpis();
+    expect(await cardText('Candidates dialled')).toContain('5');
+  });
+
+  it('does not warn about frozen days on a range inside the refresh window', async () => {
+    // The threshold was unpinned in the other direction: `>` → `>=` fires the
+    // warning on the DEFAULT 30-day view for every user, forever, and the
+    // existing test (90 > 30) passes either way.
+    getScreeningFunnel.mockResolvedValue(
+      funnel({ candidates_total: 4 }, { meta: { refresh_window_days: 90 } }),
+    );
+    renderKpis();
+    await cardText('Total candidates');
+    expect(screen.queryAllByText(/no longer recalculated/i)).toHaveLength(0);
+  });
+
+  it('warns using the window the SERVER reports, not a hardcoded 30', async () => {
+    getScreeningFunnel.mockResolvedValue(
+      funnel({ candidates_total: 4 }, { meta: { refresh_window_days: 7 } }),
+    );
+    renderKpis();
+    await cardText('Total candidates');
+    expect(await screen.findByText(/Days older than 7 are no longer recalculated/i))
+      .toBeInTheDocument();
+  });
+
+  it('treats a failed freshness probe as unknown, not as "never calculated"', async () => {
+    getScreeningFunnel.mockResolvedValue(
+      funnel({ candidates_total: 4, dialed: 3 }, { meta: { rollup_freshness_known: false } }),
+    );
+    renderKpis();
+    await cardText('Total candidates');
+    // The banner claims "everything below will read zero" — printed above
+    // figures that are plainly not zero.
+    expect(screen.queryAllByText(/have not been calculated yet/i)).toHaveLength(0);
+    expect(screen.queryAllByText(/last recalculated/i)).toHaveLength(0);
+  });
+
+  it('names every band group and resolves each label', async () => {
+    // `>= 3` against 5 actual groups let two bands lose their labelling, and
+    // an aria-labelledby pointing at a non-existent id passed too.
+    const { container } = renderKpis();
+    await cardText('Total candidates');
+    const groups = Array.from(container.querySelectorAll('[role="group"][aria-labelledby]'));
+    expect(groups).toHaveLength(5);
+    for (const g of groups) {
+      const id = g.getAttribute('aria-labelledby')!;
+      expect(document.getElementById(id), `dangling aria-labelledby: ${id}`).not.toBeNull();
+    }
   });
 
   it('explains the metrics on the page, not in a wiki', async () => {

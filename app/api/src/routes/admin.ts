@@ -623,6 +623,19 @@ adminRouter.post('/funnel/refresh', validateBody(funnelRefreshSchema), async (re
       p_window_days: req.body.window_days,
     });
     if (error) return next(new Error('failed to refresh funnel rollup'));
+    // `refresh_funnel_rollup` returns {"status":"busy"} and does NO work when
+    // it loses the advisory lock. Until the background loop was enabled the
+    // lock was never contended and this could not happen; now a pass runs every
+    // 15 minutes, so an operator clicking Refresh can land on one — and
+    // reporting `ok: true` would show a success toast for a recompute that
+    // never happened, which is the reason they clicked in the first place.
+    const status = (data as { status?: unknown } | null)?.status;
+    if (status === 'busy') {
+      return res.status(409).json({
+        ok: false,
+        error: 'A refresh is already running. Nothing was recomputed; try again shortly.',
+      });
+    }
     res.json({ ok: true, result: data });
   } catch (error) {
     next(error);

@@ -844,7 +844,10 @@ export interface FunnelDailyRow extends FunnelSummaryTotals {
 export interface FunnelMeta {
   hr_tracking_configured: boolean;
   schema_current: boolean;
+  /** Meaningful only when `rollup_freshness_known` is true. */
   rollup_refreshed_at: string | null;
+  /** False when the freshness probe failed — "unknown", not "never ran". */
+  rollup_freshness_known: boolean;
   refresh_window_days: number;
 }
 

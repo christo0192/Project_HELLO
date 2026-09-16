@@ -55,10 +55,17 @@ const EMPTY_FUNNEL = {
   },
   series: [],
   refreshed_at: null,
+  // A CONFIGURED, computed tenant. The previous fixture set
+  // `hr_tracking_configured: false` and `rollup_refreshed_at: null`, which put
+  // the shared dashboard permanently into a degraded state for every test in
+  // this file — and meant the axe run below never saw the HR band's three
+  // cards or its footnote, i.e. the newest markup was the markup a11y never
+  // checked.
   meta: {
-    hr_tracking_configured: false,
+    hr_tracking_configured: true,
     schema_current: true,
-    rollup_refreshed_at: null,
+    rollup_refreshed_at: '2026-09-16T06:00:00Z',
+    rollup_freshness_known: true,
     refresh_window_days: 30,
   },
 };

@@ -32,7 +32,7 @@
  * KpiCard/ChartCard/LineChart primitives — no bespoke chrome.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Children, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError } from '../../api';
 import type { FunnelDailyRow, FunnelSummaryResponse, Role } from '../../types';
 import {
@@ -218,11 +218,20 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
   const meta = data?.meta;
   // Absent meta = an API older than this field. Treat every fact as unknown
   // and suppress rather than assert.
-  const schemaCurrent = meta?.schema_current !== false;
+  // FAIL CLOSED, all of them. `meta?.schema_current !== false` read `undefined`
+  // — an API too old to send `meta` at all — as "the columns are present", so
+  // the one deploy window this flag exists to survive was the one window it
+  // asserted the opposite. The comment above already said "suppress rather than
+  // assert"; the operator did not.
+  const schemaCurrent = meta?.schema_current === true;
   const hrConfigured = meta?.hr_tracking_configured === true;
-  const rollupRefreshedAt = meta?.rollup_refreshed_at ?? null;
-  const neverComputed = data !== null && !!meta && rollupRefreshedAt === null;
-  const hrUnavailable = data !== null && (!schemaCurrent || !hrConfigured || !meta);
+  // Tri-state: a timestamp, `null` = never run, `unknown` = the probe failed.
+  // Announcing "never calculated" on a failed probe put that banner directly
+  // above non-zero figures that had loaded perfectly well.
+  const freshnessKnown = meta?.rollup_freshness_known === true;
+  const rollupRefreshedAt = freshnessKnown ? (meta?.rollup_refreshed_at ?? null) : null;
+  const neverComputed = data !== null && freshnessKnown && rollupRefreshedAt === null;
+  const hrUnavailable = data !== null && (!schemaCurrent || !hrConfigured);
   const staleBeyondDays = meta?.refresh_window_days ?? null;
 
   /**
@@ -244,6 +253,17 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
   }, [t]);
 
   /**
+   * `connected` (an attempt's `answered_at`) and `answered_ge1` (question
+   * dispositions) are written by two independent paths, so a crashed job or a
+   * missed carrier webhook can record answers for a call never marked answered.
+   * `connectedNoAnswer` clamps at 0 — but the two SOURCE cards still render, so
+   * the reader is left looking at "Candidates reached 3" above "Answered
+   * questions 5" with the bucket that would reconcile them showing 0. Say so
+   * rather than letting the clamp quietly hide it.
+   */
+  const countsDisagree = !!t && t.answered_ge1 > t.connected;
+
+  /**
    * Rate series with the no-denominator days REMOVED rather than plotted as 0.
    *
    * `?? 0` here was the panel's worst inconsistency: the cards refuse to print
@@ -253,10 +273,18 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
    * from every phone line failing. Dropping the point leaves a gap, which is
    * what "we cannot know" should look like.
    */
+  // `data.series` ABSENT, not empty: the same split-deploy window the `t` memo
+  // exists for. `rows.map` on undefined throws during render and takes the
+  // whole DashboardPage down, not just this panel.
+  const seriesRows = useMemo<FunnelDailyRow[]>(
+    () => (Array.isArray(data?.series) ? (data!.series as FunnelDailyRow[]) : []),
+    [data],
+  );
+
   const rateSeries = useCallback(
     (num: (row: FunnelDailyRow) => number, den: (row: FunnelDailyRow) => number) =>
-      (data ? buildRateSeries(data.series, num, den) : []),
-    [data],
+      buildRateSeries(seriesRows, num, den),
+    [seriesRows],
   );
 
   const connectSeries = useMemo(
@@ -321,7 +349,10 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                 aria-pressed={rangeDays === opt.days}
                 onClick={() => setRangeDays(opt.days)}
                 className={cx(
-                  'rounded-md px-3 py-1 text-[13px] font-medium transition-colors',
+                  // min-h-11 ≈ 44px: the touch target the rest of this codebase
+                  // enforces (PhoneSlotPicker, CandidateDetailPage). This panel
+                  // is glanced at on a phone more than anything else here.
+                  'min-h-11 rounded-md px-3 py-1 text-[13px] font-medium transition-colors',
                   rangeDays === opt.days
                     ? 'bg-accent-500 text-white shadow-sm'
                     : 'text-ink-secondary hover:text-ink',
@@ -356,21 +387,26 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
           are counted on the day they entered, so the most recent days are still filling in —
           the last day or two always looks lower than it will end up.
           {staleBeyondDays !== null && rangeDays > staleBeyondDays
-            ? ` Days older than ${staleBeyondDays} are no longer recalculated, so team-decision figures for the earlier part of this range may lag.`
+            ? ` Days older than ${staleBeyondDays} are no longer recalculated, so every figure for the earlier part of this range is frozen at its last update and will under-count activity that happened after it.`
             : ''}
         </p>
       )}
 
-      {!error && !schemaCurrent && (
+      {!error && data !== null && !schemaCurrent && (
         <InlineNotice tone="warning" className="mt-2">
-          This server is running an older database version, so candidate totals and
-          team-decision figures are unavailable. They are hidden rather than shown as zero.
+          {meta
+            ? 'This server is running an older database version, so candidate totals and team-decision figures are unavailable. They are hidden rather than shown as zero.'
+            : 'This page is newer than the server it is talking to, so candidate totals and team-decision figures are unavailable. They are hidden rather than shown as zero, and will appear once the update finishes rolling out.'}
         </InlineNotice>
       )}
 
       {!error && (
         <>
           <KpiBand title="Reach" hint="Getting to the candidate.">
+            {/* `false` here would still be mapped into a RevealItem by
+                KpiBand, leaving an empty grid cell that reads as a card which
+                failed to load — directly contradicting the notice above saying
+                the figure is hidden deliberately. KpiBand now drops it. */}
             {schemaCurrent && (
               <KpiCard
                 label="Total candidates"
@@ -388,7 +424,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
             <KpiCard
               label="Candidates reached"
               value={t?.connected ?? 0}
-              hint="A call was picked up"
+              hint="Picked up — a machine can look like this"
               loading={loading}
             />
             <KpiCard
@@ -427,7 +463,9 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
             hint={
               loading || !t
                 ? 'What happened once they answered.'
-                : `What happened once they answered, across the ${t.dialed.toLocaleString()} candidates dialled.`
+                : countsDisagree
+                  ? `More people answered a question than we recorded as reached, so the ${t.dialed.toLocaleString()} dialled cannot be split cleanly below. Treat this band as approximate.`
+                  : `What happened once they answered, across the ${t.dialed.toLocaleString()} candidates dialled.`
             }
           >
             <KpiCard
@@ -486,15 +524,17 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
 
           {hrUnavailable ? (
             <div className="mt-5">
-              <div className="mb-2 flex items-baseline gap-2">
+              <div className="mb-2 flex flex-wrap items-baseline gap-x-2 gap-y-1">
                 <h3 className="text-[13px] font-semibold uppercase tracking-wide text-ink-secondary">
                   Team decision
                 </h3>
               </div>
               <InlineNotice tone="info">
-                {schemaCurrent
-                  ? 'Not tracked yet. Reporting what the team did after screening needs the Reference check stage linked on the Ashby job. Until that exists these numbers could only ever read zero, which is not the same as “nobody was advanced”.'
-                  : 'Not available on this server version.'}
+                {!meta
+                  ? 'Not available yet — this page is newer than the server it is talking to. The figures will appear once the update finishes rolling out.'
+                  : !schemaCurrent
+                    ? 'Not available on this database version. These figures are hidden rather than shown as zero.'
+                    : 'Not tracked yet. Reporting what the team did after screening needs each candidate’s Ashby stage to be kept up to date here — today it is only recorded when they are first imported. Until that is connected these numbers could only ever read zero, which is not the same as “nobody was advanced”.'}
               </InlineNotice>
             </div>
           ) : (
@@ -502,7 +542,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
               title="Team decision"
               hint="What the team did with the screened candidates."
               footnote={
-                t
+                t && !loading
                   ? [
                       `${t.hr_awaiting.toLocaleString()} screened ${t.hr_awaiting === 1 ? 'candidate is' : 'candidates are'} still waiting for a first look \u2014 not counted as rejected.`,
                       t.hr_unknown > 0
@@ -546,7 +586,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
           <div className="mt-5 grid grid-cols-1 gap-4 lg:grid-cols-2">
             <ChartCard
               title="Daily connect rate"
-              description="Share of dialled candidates who picked up, by the day they entered. Days with nobody dialled are left out rather than drawn as 0%, so the line can skip dates."
+              description="Share of dialled candidates who picked up, by the day they entered. Days with nobody dialled are left out rather than drawn as 0%, so check the dates — neighbouring points are not always neighbouring days."
             >
               <LineChart
                 title="Daily connect rate"
@@ -554,11 +594,14 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                 unit="%"
                 isLoading={loading}
                 height={220}
+                discrete
+                emptyTitle="Nothing to plot yet"
+                emptyHint="No day in this range had anyone dialled."
               />
             </ChartCard>
             <ChartCard
               title="Screening outcomes"
-              description="Share of the candidates screened that day. Days with nobody screened are left out rather than drawn as 0%, so the line can skip dates."
+              description="Share of the candidates screened that day. Days with nobody screened are left out rather than drawn as 0%, so check the dates — neighbouring points are not always neighbouring days."
             >
               <div className="grid grid-cols-1 gap-2">
                 <LineChart
@@ -567,6 +610,9 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                   unit="%"
                   isLoading={loading}
                   height={100}
+                  discrete
+                  emptyTitle="Nothing to plot yet"
+                  emptyHint="No day in this range had anyone screened."
                 />
                 <LineChart
                   title="Disqualification rate"
@@ -574,6 +620,9 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                   unit="%"
                   isLoading={loading}
                   height={100}
+                  discrete
+                  emptyTitle="Nothing to plot yet"
+                  emptyHint="No day in this range had anyone screened."
                 />
               </div>
             </ChartCard>
@@ -611,7 +660,7 @@ function KpiBand({
   const bandId = `kpi-band-${title.toLowerCase().replace(/[^a-z]+/g, '-')}`;
   return (
     <div className="mt-5">
-      <div className="mb-2 flex items-baseline gap-2">
+      <div className="mb-2 flex flex-wrap items-baseline gap-x-2 gap-y-1">
         <h3
           id={bandId}
           className="text-[13px] font-semibold uppercase tracking-wide text-ink-secondary"
@@ -622,9 +671,14 @@ function KpiBand({
       </div>
       <div role="group" aria-labelledby={bandId}>
         <RevealGroup className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        {Array.isArray(children)
-          ? children.map((child, i) => <RevealItem key={i}>{child}</RevealItem>)
-          : children}
+        {/* `toArray` drops `false`/`null`/`undefined` and assigns stable keys.
+            Mapping the raw array wrapped a conditional `false` in a RevealItem,
+            producing a real grid cell with no content — which reads as a card
+            that failed to load, not one withheld on purpose — and shifted the
+            index keys of every sibling whenever the condition flipped. */}
+        {Children.toArray(children).map((child, i) => (
+          <RevealItem key={i}>{child}</RevealItem>
+        ))}
         </RevealGroup>
       </div>
       {footnote && <p className="mt-2 text-[12px] text-ink-secondary">{footnote}</p>}
@@ -655,11 +709,11 @@ function MetricNotes({
   const rows: Array<[string, string]> = [
     [
       'Total candidates',
-      `Everyone who entered the pipeline in the last ${rangeDays} days, counted on the day they ENTERED. The most recent days are still filling in — someone who arrived this morning has not been called yet, so today's column always looks worse than it will end up.`,
+      `Everyone who entered the pipeline in the last ${rangeDays} days, counted on the day they ENTERED. Days run midnight to midnight UTC — 5:30am IST — so somebody who arrived before 5:30am appears under the previous day. The most recent days are still filling in: someone who arrived this morning has not been called yet, so today's column always looks worse than it will end up.`,
     ],
     [
       'Total call attempts',
-      'Every dial we placed, including repeat attempts to the same person. Higher than connects by design.',
+      'Every dial placed to the people who ENTERED in this range — including dials placed long after they entered, and excluding dials placed during this range to people who entered earlier. Higher than connects by design, and it will not reconcile against a phone bill for the same dates.',
     ],
     [
       'Total connects',
@@ -698,11 +752,11 @@ function MetricNotes({
     ],
     [
       'Not advanced',
-      'Screened candidates the team has moved to some other stage. Only counted when we can actually see their Ashby stage, so an unconfigured job never lands here.',
+      'Screened candidates whose Ashby stage is now neither the screening stage nor Reference check. It is where they ARE, not proof of a decision — and it INCLUDES anyone promoted PAST Reference check, so somebody you hired is counted here rather than under “Advanced”. Only counted when their current stage is actually known to us, so an unconfigured job never lands here.',
     ],
     [
       'Still waiting for the team',
-      'Screened candidates still sitting in the AI screening stage, untouched. Deliberately NOT counted as rejected: if they were, the rejection rate would climb every time screening got faster.',
+      'Screened candidates whose Ashby stage is still the screening stage. Deliberately NOT counted as rejected: if they were, the rejection rate would climb every time screening got faster. Only counted when their current stage is actually known to us.',
     ],
     [
       'Advance rate',

@@ -1191,7 +1191,12 @@ describe('OpenAPI document integrity', () => {
     // id, a boolean and closed-vocabulary strings — never a number and never
     // a suppression digest, which the phone operator boundary refuses to
     // emit. 241 + 4 = 245.
-    expect(Object.keys(schemas).length).toBe(245);
+    // + FunnelSummaryBody and FunnelMeta. The funnel summary's 200 body was
+    //   documented as a bare `type: object`, which said nothing about `meta` —
+    //   the four stated facts the dashboard renders INSTEAD of inferring. An
+    //   undocumented contract that both sides must agree on exactly is the one
+    //   most worth writing down. 245 + 2 = 247.
+    expect(Object.keys(schemas).length).toBe(247);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.

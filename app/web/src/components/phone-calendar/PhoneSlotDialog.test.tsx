@@ -144,23 +144,39 @@ describe('PhoneSlotDialog', () => {
   });
 
   it('does not focus a trigger that has left the document', async () => {
-    // After a successful booking the page refetches and the trigger's branch
-    // can unmount. `focus()` on a detached node never throws — it silently
-    // does nothing — so "does not throw" proved nothing. This asserts the
-    // guard actually skipped it.
+    // jsdom's `focus()` is a NO-OP on a disconnected node — `isFocusableArea`
+    // rejects anything with `isConnected === false` — so asserting where focus
+    // ended up passes whether or not the guard exists. The only observable
+    // difference is whether `focus()` was CALLED, so spy on it.
     const detached = document.createElement('button');   // never appended
+    const spy = vi.spyOn(detached, 'focus');
     const ref = { current: detached } as React.RefObject<HTMLElement | null>;
-    const sentinel = document.createElement('button');
-    document.body.appendChild(sentinel);
 
     const h = mountThenOpen({ returnFocusRef: ref });
     await screen.findByRole('dialog');
-    sentinel.focus();
     h.close();
 
-    // Focus stayed where it was rather than being handed to a dead node.
-    await waitFor(() => expect(document.activeElement).toBe(sentinel));
-    expect(document.activeElement).not.toBe(detached);
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(spy).not.toHaveBeenCalled();
+  });
+
+  it('falls back to the main landmark when the trigger is gone', async () => {
+    // Skipping the dead node is not enough. Focus was inside the panel React
+    // has just removed, so the browser has already dropped it on <body> and the
+    // user's next Tab restarts from the skip link at the top of the page.
+    const main = document.createElement('main');
+    main.id = 'main-content';
+    main.tabIndex = -1;
+    document.body.appendChild(main);
+    const detached = document.createElement('button');
+    const ref = { current: detached } as React.RefObject<HTMLElement | null>;
+
+    const h = mountThenOpen({ returnFocusRef: ref });
+    await screen.findByRole('dialog');
+    h.close();
+
+    await waitFor(() => expect(document.activeElement).toBe(main));
+    main.remove();
   });
 
   it('traps Tab inside the dialog', async () => {
@@ -204,6 +220,28 @@ describe('PhoneSlotDialog', () => {
     fireEvent.keyDown(document, { key: 'Tab' });
     expect(document.activeElement).toBe(first);
     expect(document.activeElement).not.toBe(outside);
+
+    // …and it must LEAVE THE MIDDLE ALONE. Widening the condition to
+    // `if (!e.shiftKey)` still satisfies every assertion above, while sending
+    // every forward Tab back to the first control — the date input and the slot
+    // buttons become unreachable by keyboard after one press. The trap is only
+    // correct if it does nothing here.
+    // jsdom does not move focus on Tab, so the observable signal is whether the
+    // handler called preventDefault — i.e. whether it claimed the keystroke.
+    expect(focusables.length).toBeGreaterThan(2);
+    const middle = focusables[1]!;
+    expect(middle).not.toBe(first);
+    expect(middle).not.toBe(last);
+    middle.focus();
+    const ev = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true });
+    document.dispatchEvent(ev);
+    expect(ev.defaultPrevented, 'Tab from a middle element must not be hijacked').toBe(false);
+
+    // …while a wrap DOES claim it, so the assertion above is not vacuous.
+    last.focus();
+    const wrapEv = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true });
+    document.dispatchEvent(wrapEv);
+    expect(wrapEv.defaultPrevented).toBe(true);
   });
 
   it('keeps the capacity advisory as the dialog’s description', async () => {
@@ -244,6 +282,40 @@ describe('PhoneSlotDialog', () => {
     const dialog = await screen.findByRole('dialog');
     const backdrop = dialog.parentElement!.querySelector('[aria-hidden="true"]') as HTMLElement;
     fireEvent.click(backdrop);
+    expect(h.onClose).not.toHaveBeenCalled();
+  });
+
+  it('refuses Escape when saving is turned on WHILE OPEN', async () => {
+    // Mounting with `saving: true` closes the effect over the right value, so
+    // it passes even if `saving` is missing from the dependency array. In
+    // production the flag flips mid-flight, and a stale closure then sees
+    // `false` and dismisses the dialog during the POST — leaving the operator
+    // with no idea whether the slot was booked. Same class of bug the file's
+    // header says was fixed for `open`.
+    const h = mountThenOpen();
+    await screen.findByRole('dialog');
+
+    h.update({ saving: true });
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(h.onClose).not.toHaveBeenCalled();
+    expect(screen.getByRole('dialog')).toBeInTheDocument();
+
+    // …and Escape works again once the save finishes.
+    h.update({ saving: false });
+    fireEvent.keyDown(document, { key: 'Escape' });
+    expect(h.onClose).toHaveBeenCalled();
+  });
+
+  it('removes its document listener on close', async () => {
+    // One capture-phase document listener leaked per open. Nothing fired a key
+    // AFTER close to notice.
+    const h = mountThenOpen();
+    await screen.findByRole('dialog');
+    h.close();
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+
+    h.onClose.mockClear();
+    fireEvent.keyDown(document, { key: 'Escape' });
     expect(h.onClose).not.toHaveBeenCalled();
   });
 

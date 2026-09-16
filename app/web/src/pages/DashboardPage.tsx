@@ -259,8 +259,15 @@ export function DashboardPage() {
 
       {/* Screening scoreboard (0098 + /api/funnel/summary). Placed directly
           under the intake KPIs: this is the block the HR head opens the page
-          for, so it sits above the operational queues rather than below. */}
-      <ScreeningKpis />
+          for, so it sits above the operational queues rather than below.
+
+          Gated on role HERE, not only by the panel's own 403 handling. The
+          route is interviewer-and-above, so mounting it for a viewer renders
+          ~900px of skeleton cards and chart placeholders, waits for the 403,
+          then removes all of it — content jumping up under a cursor that may
+          already be mid-click. This page's contract (see the header) is that it
+          never makes a doomed call. */}
+      {me.role !== 'viewer' && <ScreeningKpis />}
 
       {/* Editorial row — the funnel reads wide, the summaries stack beside it */}
       <div className="mt-6 grid grid-cols-1 items-start gap-6 lg:grid-cols-12">

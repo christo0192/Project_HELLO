@@ -75,13 +75,35 @@ export interface PhoneSlotDialogProps {
   returnFocusRef?: React.RefObject<HTMLElement | null>;
 }
 
-/** Tabbable elements inside the panel, in document order. */
+/**
+ * Tabbable elements inside the panel, in document order.
+ *
+ * `:disabled` rather than `:not([disabled])` is load-bearing. The attribute
+ * selector only sees a control's OWN attribute, and PhoneSlotPicker disables
+ * its slots with `<fieldset disabled>` — those radios are genuinely
+ * unfocusable but carry no attribute. While `saving`, the date input, Cancel
+ * and Confirm all gain a real `disabled`, so the attribute-only list collapsed
+ * to nothing but those radios; Tab then called `preventDefault()` and focused
+ * an unfocusable element, i.e. Tab did nothing at all and focus could land on
+ * `<body>` — a keyboard trap with no exit, exactly what the trap exists to
+ * prevent.
+ *
+ * Deliberately NOT filtered on `offsetParent !== null`: that is null for every
+ * descendant of a `position: fixed` subtree — which is this entire dialog — and
+ * it is null for everything under jsdom, where there is no layout at all. It
+ * would have emptied this list in both the test environment and the browser.
+ */
 function tabbable(root: HTMLElement): HTMLElement[] {
   return Array.from(
     root.querySelectorAll<HTMLElement>(
-      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+      'a[href], button, input, select, textarea, [tabindex]:not([tabindex="-1"])',
     ),
-  ).filter((el) => !el.hasAttribute('hidden') && el.getAttribute('aria-hidden') !== 'true');
+  ).filter(
+    (el) =>
+      !el.matches(':disabled') &&
+      !el.hasAttribute('hidden') &&
+      el.getAttribute('aria-hidden') !== 'true',
+  );
 }
 
 export function PhoneSlotDialog({
@@ -100,8 +122,6 @@ export function PhoneSlotDialog({
   returnFocusRef,
 }: PhoneSlotDialogProps) {
   const panelRef = useRef<HTMLDivElement | null>(null);
-  // Rendered in place and always present: it is how the portal target is
-  // located, and it costs one empty, hidden node.
   const titleId = `${idPrefix}-dialog-title`;
   const descId = `${idPrefix}-dialog-desc`;
 
@@ -112,12 +132,20 @@ export function PhoneSlotDialog({
     // title that explains what is being booked.
     panelRef.current?.focus();
     return () => {
-      // Only return focus to something still in the document. After a
-      // successful booking the page refetches and the trigger's whole branch
-      // can unmount; calling focus() on a detached node silently leaves focus
-      // on <body>, which is the outcome this is here to prevent.
+      // After a successful booking the page refetches and the trigger's whole
+      // branch can unmount. `focus()` on a detached node is a silent no-op, so
+      // merely SKIPPING it is not enough: focus was inside the panel React has
+      // just removed, so the browser has already dropped it on <body> and the
+      // user's next Tab restarts from the skip link at the top of the document.
+      // Fall back to the main landmark, which carries tabIndex={-1} for exactly
+      // this purpose, so focus lands near the work instead of above the header.
       const el = returnFocusRef?.current;
-      if (el && document.contains(el)) el.focus();
+      if (el && document.contains(el)) {
+        el.focus();
+        return;
+      }
+      const main = document.getElementById('main-content');
+      if (main) main.focus();
     };
   }, [open, returnFocusRef]);
 
@@ -130,14 +158,14 @@ export function PhoneSlotDialog({
     return () => { document.body.style.overflow = previous; };
   }, [open]);
 
-  // Key handling lives on the DOCUMENT, not on a React `onKeyDown` prop.
-  //
-  // React attaches its listeners to the ROOT CONTAINER, and this dialog is
-  // portalled to `document.body` — outside that container. A synthetic
-  // `onKeyDown` on the wrapper therefore never fires for real keystrokes: Esc
-  // would not close, and the Tab trap would not trap. That is invisible in a
-  // test that fires synthetic events at the React tree and very visible to an
-  // operator, so the listener is native and scoped to the open dialog.
+  // Key handling lives on the DOCUMENT in the CAPTURE phase, not on a React
+  // `onKeyDown` prop. There is no portal here — see the header comment for why
+  // both portal strategies were tried and rejected — so a synthetic handler
+  // would in fact fire. Capture is used for a different reason: Escape and Tab
+  // must be decided before any ancestor handler sees them, and this dialog is
+  // rendered INSIDE the candidate page, whose own key handling would otherwise
+  // run first. Capture also guarantees the `saving` refusal cannot be
+  // overtaken. Do not "simplify" this to onKeyDown: the ordering is the point.
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent): void => {
@@ -190,7 +218,20 @@ export function PhoneSlotDialog({
   if (!open) return null;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-4"
+      /* Inline, because it must beat whatever the mount point applies. With no
+         portal this overlay is a plain child of the page, and its actual parent
+         on the candidate page is a `space-y-6` stack — whose sibling selector
+         (`> :not([hidden]) ~ :not([hidden])`, specificity 0,2,0) outranks any
+         `mt-0` utility. That margin shrinks a `top:0; bottom:0; height:auto`
+         box and shifts it down: the backdrop started 24px below the viewport
+         top, leaving the app header un-dimmed and still clickable behind an
+         `aria-modal` dialog — open the nav drawer from there and Escape then
+         closes the wrong thing. A fixed overlay must never inherit flow margins
+         from where it happens to be mounted. */
+      style={{ marginTop: 0, marginBottom: 0 }}
+    >
       {/* Backdrop. A plain div, not a button: a click-focusable control inside
           `aria-hidden` is an axe "needs review" and a nameless button one edit
           away from a violation. Esc and Cancel are the accessible exits. */}

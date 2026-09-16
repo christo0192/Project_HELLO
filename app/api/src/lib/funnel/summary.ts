@@ -13,6 +13,13 @@
  * construction — which is what makes the wider exposure safe.
  */
 
+import { createLogger } from '../logger.js';
+
+// The event-name union is closed and unknown names rewrite to 'unknown_event',
+// so the distinguishing detail travels in `error_category` — the same shape
+// lib/funnel/runtime.ts already uses for this subsystem.
+const logger = createLogger('funnel-summary');
+
 /**
  * Narrow structural seam instead of `SupabaseClient`: this module only ever
  * calls `.from(...).select(...)`, and importing the full generic couples it to
@@ -84,9 +91,17 @@ export interface FunnelSummaryInput {
  */
 export interface FunnelMeta {
   /**
-   * Any ENABLED mapping carries a `reference_check_stage_id`. False means HR
-   * disposition cannot be observed at all, so the HR cards must say
-   * "not tracked" rather than render zeros.
+   * True only when at least one Ashby application link in scope has had its
+   * stage OBSERVED since import (`stage_synced_at`) on a mapping that names
+   * both stages. False means HR disposition is not knowable at all, so the HR
+   * cards must say "not tracked" rather than render zeros.
+   *
+   * Deliberately NOT "someone filled in a stage id". `external_stage_id` is
+   * written once at import and is always the AI screening stage; nothing
+   * updates it. Keying this on the id alone meant that performing the
+   * documented activation step flipped the band on and rendered
+   * "Advanced 0 / Not advanced 0" — structurally unreachable numbers — as
+   * measurement, with the UI's own second-guessing switched off. See 0098 §0.
    */
   hr_tracking_configured: boolean;
   /**
@@ -96,11 +111,22 @@ export interface FunnelMeta {
    */
   schema_current: boolean;
   /**
-   * When the ROLL-UP last ran, read from the table as a whole — not from the
-   * rows in this window. A quiet week returns no rows, and inferring freshness
-   * from that announced "never calculated" about a roll-up that ran an hour ago.
+   * When the ROLL-UP last ran, read from its heartbeat — not from the rows in
+   * this window. A quiet week returns no rows, and inferring freshness from
+   * that announced "never calculated" about a roll-up that ran an hour ago.
+   *
+   * Meaningful ONLY when `rollup_freshness_known` is true.
    */
   rollup_refreshed_at: string | null;
+  /**
+   * False when the freshness probe itself failed. Without this, a transient
+   * error on a SEPARATE round-trip made a null indistinguishable from "never
+   * run", and the panel announced "these figures have not been calculated yet —
+   * everything below will read zero" directly above non-zero figures that had
+   * loaded perfectly well. `null` must mean "never run"; "we could not find
+   * out" needs its own answer.
+   */
+  rollup_freshness_known: boolean;
   /**
    * The trailing window each recompute reaches back over. Days older than this
    * are frozen at their last recompute: HR disposition changes weeks after
@@ -171,40 +197,81 @@ export async function loadFunnelSummary(
   // zeros as measurement.
   const hrTrackingConfiguredP: Promise<boolean> = (async () => {
     try {
+      // Asks the question the dashboard actually needs answered: "is there any
+      // candidate whose Ashby stage we have genuinely OBSERVED?" — not "has
+      // someone filled in a stage id".
+      //
+      // Three ways the id-only version got this wrong, all reachable today:
+      //  * `ashby_job_mappings` is unique on (provider, external_job_id), so
+      //    several mappings share one role. One wired mapping made the band
+      //    "configured" for candidates who all arrived through an UNWIRED one,
+      //    whose states can only be `unknown` — printing 0/0 as measurement.
+      //  * Unscoped (the default org-wide view), one wired role out of ten
+      //    armed the band for the whole dashboard.
+      //  * It filtered `status = 'enabled'` while the view joins mappings
+      //    regardless of status, so pausing a mapping made a populated HR band
+      //    vanish behind "Not tracked yet" — an untrue explanation.
+      //
+      // Reading the LINKS instead makes the probe and the view agree by
+      // construction: both require a synced link whose mapping names both
+      // stages. Today nothing writes `stage_synced_at`, so this is false and
+      // the band honestly says it is not tracked yet.
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      let mq: any = supabase
-        .from('ashby_job_mappings')
-        .select('external_job_id')
-        .eq('provider', 'ashby')
-        .eq('status', 'enabled')
-        .not('reference_check_stage_id', 'is', null)
+      let lq: any = supabase
+        .from('ashby_application_links')
+        .select('id, ashby_job_mappings!inner(role_id, ai_screening_stage_id, reference_check_stage_id)')
+        .not('stage_synced_at', 'is', null)
+        .not('external_stage_id', 'is', null)
+        .not('ashby_job_mappings.ai_screening_stage_id', 'is', null)
+        .not('ashby_job_mappings.reference_check_stage_id', 'is', null)
         .limit(1);
-      // Scoped to the filtered role: an org where ONE of ten roles is wired
-      // must not report the HR band as configured on the other nine.
-      if (input.roleId) mq = mq.eq('role_id', input.roleId);
-      const { data: mapRows, error: mapErr } = await mq;
-      return !mapErr && Array.isArray(mapRows) && mapRows.length > 0;
+      if (input.roleId) lq = lq.eq('ashby_job_mappings.role_id', input.roleId);
+      const { data: linkRows, error: linkErr } = await lq;
+      if (linkErr) {
+        // Distinguishable from "nothing observed": a broken probe must be
+        // visible, not silently indistinguishable from an unconfigured tenant.
+        logger.warn('unknown_event', { error_category: 'funnel_hr_probe_error' });
+        return false;
+      }
+      return Array.isArray(linkRows) && linkRows.length > 0;
     } catch {
+      // A THROW here is a programming error (wrong column, client API change),
+      // not a configuration state. Without this log it disappears into a
+      // conservative `false` and permanently hides a band with no signal.
+      logger.warn('unknown_event', { error_category: 'funnel_hr_probe_throw' });
       return false;
     }
   })();
 
-  const rollupRefreshedAtP: Promise<string | null> = (async () => {
+  const rollupRefreshedAtP: Promise<string | null | undefined> = (async () => {
     try {
-      // The whole table, not this window: an empty range says nothing about
-      // whether the roll-up has ever run, and reading freshness off the
-      // returned slice told a quiet week it had never been calculated.
+      // The roll-up's own HEARTBEAT (0098), not its data. Reading
+      // `max(refreshed_at)` over `funnel_stage_daily` answers "when was a row
+      // last written", which is a different question: the refresh is
+      // delete-then-insert over a trailing window, so a window that produces no
+      // rows writes nothing, and older rows are never re-stamped. A tenant with
+      // a month of no intake had a loop running every 15 minutes and a
+      // dashboard reporting a date from last quarter.
       const { data: freshRows, error: freshErr } = await supabase
-        .from('funnel_stage_daily')
-        .select('refreshed_at')
-        .order('refreshed_at', { ascending: false })
+        .from('funnel_rollup_runs')
+        .select('ran_at')
+        .eq('id', 1)
         .limit(1);
-      if (!freshErr && Array.isArray(freshRows) && freshRows.length > 0) {
-        return (freshRows[0] as { refreshed_at?: string }).refreshed_at ?? null;
+      if (freshErr) {
+        // 42P01 here means the heartbeat table is missing, i.e. 0098 is not
+        // applied — which `schema_current` already reports. Either way this is
+        // "we could not find out", never "it has never run".
+        logger.warn('unknown_event', { error_category: 'funnel_freshness_error' });
+        return undefined;
       }
+      if (Array.isArray(freshRows) && freshRows.length > 0) {
+        return (freshRows[0] as { ran_at?: string }).ran_at ?? null;
+      }
+      // Table present, no row: the roll-up genuinely has never completed a pass.
       return null;
     } catch {
-      return null;
+      logger.warn('unknown_event', { error_category: 'funnel_freshness_throw' });
+      return undefined;
     }
   })();
 
@@ -290,6 +357,16 @@ export async function loadFunnelSummary(
     .map(({ __n: _n, ...row }) => {
       if (!input.omitTimings) return row;
       const { median_ttfc_sec: _m, p95_ttfc_sec: _p, ...rest } = row;
+      // The percentiles were never the only per-INDIVIDUAL quantity here. On a
+      // day whose `candidates_total` is 1, `total_call_seconds` IS that
+      // person's call duration and `attempts_total` is how many times we rang
+      // them — and an interviewer can ask for any single role and any single
+      // day, so producing such a day is a URL, not an accident. Stripping the
+      // percentiles while leaving these was a privacy control in name only.
+      if (Number(rest.candidates_total ?? 0) === 1) {
+        const { total_call_seconds: _s, attempts_total: _a, connects_total: _c, ...coarse } = rest;
+        return coarse;
+      }
       return rest;
     });
 
@@ -302,7 +379,8 @@ export async function loadFunnelSummary(
     meta: {
       hr_tracking_configured: hrTrackingConfigured,
       schema_current: schemaCurrent,
-      rollup_refreshed_at: rollupRefreshedAt,
+      rollup_refreshed_at: rollupRefreshedAt ?? null,
+      rollup_freshness_known: rollupRefreshedAt !== undefined,
       refresh_window_days: input.refreshWindowDays ?? 30,
     },
   };
