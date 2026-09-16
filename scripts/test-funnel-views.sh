@@ -22,6 +22,11 @@ readonly IMAGE="${FUNNEL_TEST_PG_IMAGE:-pgvector/pgvector:pg17}"
 readonly CTR="funnel-views-test-pg-$$"
 readonly TESTS="app/supabase/tests"
 readonly MIG="app/supabase/migrations/0090_funnel_observability.sql"
+# 0098 layers the HR disposition view, the five HR columns and a ONE-SHOT
+# backfill on top of 0090. Nothing else in CI executes a line of it — migrations
+# reach the database through the owner's `supabase db push` — so without this
+# its first run would be against production.
+readonly MIG_HR="app/supabase/migrations/0098_funnel_hr_disposition.sql"
 
 log() { printf '[funnel-views] %s %s\n' "$(date -u +%H:%M:%S)" "$*"; }
 cleanup() { docker rm -f "$CTR" >/dev/null 2>&1 || true; }
@@ -41,6 +46,8 @@ docker exec "$CTR" pg_isready -U postgres -q || { log 'ERROR: postgres never bec
 docker cp "$TESTS/funnel_views_bootstrap.sql" "$CTR:/tmp/bootstrap.sql"
 docker cp "$MIG" "$CTR:/tmp/0090.sql"
 docker cp "$TESTS/funnel_views_assert.sql" "$CTR:/tmp/assert.sql"
+docker cp "$MIG_HR" "$CTR:/tmp/0098.sql"
+docker cp "$TESTS/funnel_hr_state_assert.sql" "$CTR:/tmp/assert_hr.sql"
 
 log 'bootstrapping faithful-minimal screening_v2 schema...'
 docker exec "$CTR" psql -U postgres -q -v ON_ERROR_STOP=1 -f /tmp/bootstrap.sql >/dev/null
@@ -49,4 +56,13 @@ docker exec "$CTR" psql -U postgres -q -v ON_ERROR_STOP=1 -f /tmp/0090.sql >/dev
 log 'running view + refresh_funnel_rollup assertions...'
 docker exec "$CTR" psql -U postgres -v ON_ERROR_STOP=1 -f /tmp/assert.sql
 
-log 'PASS — funnel views + refresh_funnel_rollup behaviour verified on real Postgres.'
+# ORDER MATTERS. 0090's assertions above leave real rows in funnel_stage_daily,
+# so 0098's one-shot backfill runs against a populated table exactly as it will
+# in production — which is the only way to observe it doing anything. Applying
+# 0098 to an empty database would make a backfill that matches nothing pass.
+log 'applying the real 0098 migration (adds the HR columns + runs its backfill)...'
+docker exec "$CTR" psql -U postgres -q -v ON_ERROR_STOP=1 -f /tmp/0098.sql >/dev/null
+log 'running HR-disposition + backfill assertions...'
+docker exec "$CTR" psql -U postgres -v ON_ERROR_STOP=1 -f /tmp/assert_hr.sql
+
+log 'PASS — funnel views, HR disposition, backfill and refresh_funnel_rollup verified on real Postgres.'
