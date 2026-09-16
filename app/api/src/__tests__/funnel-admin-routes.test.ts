@@ -26,12 +26,23 @@ function makeViewer(): AuthUser {
   return { id: 'user-view-0000-0000-000000000003', email: 'viewer@example.com', aal: 'aal1', active: true, appRole: 'viewer', orgId: null };
 }
 
-/** Chainable thenable covering select/gte/lte/eq/order/limit/range. */
+/**
+ * Chainable thenable covering the PostgREST verbs these routes use.
+ *
+ * `not` is in the list deliberately. It was missing, and `loadFunnelSummary`
+ * calls `.not(...)` on its meta probes — so every request in this suite threw
+ * `TypeError: mq.not is not a function` INSIDE the probe's `catch`, which
+ * swallowed it and returned the conservative `false`. The suite stayed green
+ * while nothing about the probes was exercised, and the failure mode it hid —
+ * a programming error silently turning into "HR tracking not configured,
+ * forever, with no log line" — is exactly the one the probes now log about.
+ * A missing verb here must surface as a failure, not as a plausible default.
+ */
 function chainable(value: unknown): any {
   const fn: any = () => chainable(value);
   fn.then = (resolve: (v: unknown) => unknown) => Promise.resolve(value).then(resolve);
   fn.catch = (reject: (e: unknown) => unknown) => Promise.resolve(value).catch(reject);
-  for (const m of ['select', 'eq', 'gte', 'lte', 'order', 'limit', 'range', 'from']) fn[m] = () => chainable(value);
+  for (const m of ['select', 'eq', 'gte', 'lte', 'not', 'order', 'limit', 'range', 'from']) fn[m] = () => chainable(value);
   return fn;
 }
 

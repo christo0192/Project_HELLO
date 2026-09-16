@@ -16,6 +16,7 @@ import { dsarRouter } from './routes/dsar.js';
 import { consentRouter } from './routes/consent.js';
 import { cspReportRouter } from './routes/csp.js';
 import { adminRouter } from './routes/admin.js';
+import { funnelRouter } from './routes/funnel.js';
 import { statusRouter } from './routes/status.js';
 import { meRouter } from './routes/me.js';
 import { notesRouter } from './routes/notes.js';
@@ -415,6 +416,9 @@ export function createApp(opts: CreateAppOptions = {}) {
   // global auth + viewer-read-only + rate-limit middleware; each router keeps
   // its own per-route role guards (admin/me enforce at the router boundary).
   app.use('/api/admin', adminRouter);
+  // Recruiter-facing funnel KPIs. Same aggregation as the admin route, gated
+  // at interviewer+ inside the router; the admin boundary stays absolute.
+  app.use('/api/funnel', funnelRouter);
   app.use('/api/status', statusRouter);
   app.use('/api/me', meRouter);
   app.use('/api/notes', notesRouter);

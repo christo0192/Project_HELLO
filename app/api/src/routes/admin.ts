@@ -13,7 +13,14 @@
 
 import { Router } from 'express';
 import { supabase } from '../lib/supabase.js';
+import { env } from '../lib/env.js';
 import { requireAdmin } from '../lib/rbac.js';
+import {
+  loadFunnelSummary,
+  funnelDayOffset,
+  funnelDayBefore,
+  FUNNEL_MAX_SPAN_DAYS,
+} from '../lib/funnel/summary.js';
 import { validateBody, validateParams, validateQuery } from '../lib/validation.js';
 import {
   adminAllowlistAddSchema,
@@ -500,26 +507,8 @@ adminRouter.patch(
 //  carry no PII by construction). Admin-gated at the router boundary above.
 // ════════════════════════════════════════════════════════════════════
 
-const FUNNEL_COUNT_FIELDS = [
-  'entered_parse', 'parsed_ok', 'needs_review', 'parse_failed',
-  'dialed', 'connected', 'consent_passed', 'consent_dropped', 'answered_ge1',
-  'scored', 'qualified', 'on_hold', 'disqualified', 'human_review', 'reached_reference_check',
-  'attempts_total', 'connects_total', 'total_call_seconds',
-] as const;
-
-/** YYYY-MM-DD `days` before today (UTC). */
-function funnelDayOffset(days: number): string {
-  return new Date(Date.now() - days * 86_400_000).toISOString().slice(0, 10);
-}
-
-/** YYYY-MM-DD `days` before the given YYYY-MM-DD (UTC). */
-function funnelDayBefore(ymd: string, days: number): string {
-  return new Date(Date.parse(`${ymd}T00:00:00Z`) - days * 86_400_000).toISOString().slice(0, 10);
-}
-
-// Defense-in-depth cap on the queryable span, so a hand-crafted from/to cannot
-// pull the whole rollup / failure history in one admin call.
-const FUNNEL_MAX_SPAN_DAYS = 400;
+// Funnel summary aggregation lives in lib/funnel/summary.ts so this route and
+// the interviewer-facing /api/funnel/summary cannot drift apart.
 
 /**
  * GET /api/admin/funnel/summary
@@ -531,73 +520,16 @@ const FUNNEL_MAX_SPAN_DAYS = 400;
  */
 adminRouter.get('/funnel/summary', validateQuery(funnelSummaryQuerySchema), async (req, res, next) => {
   try {
-    const to = (req.query.to as string | undefined) ?? funnelDayOffset(0);
-    const requestedFrom = (req.query.from as string | undefined) ?? funnelDayOffset(29);
-    const minFrom = funnelDayBefore(to, FUNNEL_MAX_SPAN_DAYS);
-    const from = requestedFrom < minFrom ? minFrom : requestedFrom;
-    const roleId = req.query.role_id as string | undefined;
-
-    let q = supabase
-      .from('funnel_stage_daily')
-      .select(
-        'cohort_day, role_id, entered_parse, parsed_ok, needs_review, parse_failed, dialed, connected, consent_passed, consent_dropped, answered_ge1, scored, qualified, on_hold, disqualified, human_review, reached_reference_check, attempts_total, connects_total, total_call_seconds, median_ttfc_sec, p95_ttfc_sec, refreshed_at',
-      )
-      .gte('cohort_day', from)
-      .lte('cohort_day', to)
-      .order('cohort_day', { ascending: true });
-    if (roleId) q = q.eq('role_id', roleId);
-    const { data, error } = await q;
-    if (error) return next(new Error('failed to load funnel summary'));
-
-    const rows = (data ?? []) as Array<Record<string, unknown>>;
-    const totals: Record<string, number> = {};
-    for (const f of FUNNEL_COUNT_FIELDS) totals[f] = 0;
-    let refreshedAt: string | null = null;
-    for (const r of rows) {
-      for (const f of FUNNEL_COUNT_FIELDS) totals[f] += Number(r[f] ?? 0);
-      const ra = r.refreshed_at as string | null | undefined;
-      if (ra && (!refreshedAt || ra > refreshedAt)) refreshedAt = ra;
-    }
-    const ratio = (num: number, den: number): number | null => (den > 0 ? num / den : null);
-    const conversions = {
-      parse_to_dial: ratio(totals.dialed, totals.parsed_ok),
-      dial_to_connect: ratio(totals.connected, totals.dialed),
-      connect_to_consent: ratio(totals.consent_passed, totals.connected),
-      consent_to_answered: ratio(totals.answered_ge1, totals.consent_passed),
-      answered_to_scored: ratio(totals.scored, totals.answered_ge1),
-      scored_to_qualified: ratio(totals.qualified, totals.scored),
-      qualified_to_reference_check: ratio(totals.reached_reference_check, totals.qualified),
-    };
-    // Aggregate the per-(day, role) rollup rows into a per-DAY trend, summing
-    // across roles when no role filter is applied, so a day is never
-    // double-plotted. Percentiles cannot be summed across roles, so they are
-    // carried only when a single row contributes to the day.
-    const byDay = new Map<string, Record<string, unknown> & { __n: number }>();
-    for (const r of rows) {
-      const day = r.cohort_day as string;
-      let agg = byDay.get(day);
-      if (!agg) {
-        agg = {
-          cohort_day: day,
-          role_id: null,
-          median_ttfc_sec: (r.median_ttfc_sec as number | null) ?? null,
-          p95_ttfc_sec: (r.p95_ttfc_sec as number | null) ?? null,
-          __n: 0,
-        };
-        for (const f of FUNNEL_COUNT_FIELDS) agg[f] = 0;
-        byDay.set(day, agg);
-      }
-      for (const f of FUNNEL_COUNT_FIELDS) (agg[f] as number) += Number(r[f] ?? 0);
-      agg.__n += 1;
-      if (agg.__n > 1) {
-        agg.median_ttfc_sec = null;
-        agg.p95_ttfc_sec = null;
-      }
-    }
-    const series = [...byDay.values()]
-      .sort((a, b) => ((a.cohort_day as string) < (b.cohort_day as string) ? -1 : 1))
-      .map(({ __n: _n, ...row }) => row);
-    res.json({ range: { from, to }, totals, conversions, series, refreshed_at: refreshedAt });
+    const summary = await loadFunnelSummary(supabase, {
+      from: req.query.from as string | undefined,
+      to: req.query.to as string | undefined,
+      roleId: req.query.role_id as string | undefined,
+      // Same fact as the interviewer route reports. Omitting it here would have
+      // this endpoint claim the default 30 regardless of how the loop is
+      // actually configured — a wrong stated fact, which is worse than none.
+      refreshWindowDays: env.funnelRollupWindowDays,
+    });
+    res.json(summary);
   } catch (error) {
     next(error);
   }
@@ -691,6 +623,19 @@ adminRouter.post('/funnel/refresh', validateBody(funnelRefreshSchema), async (re
       p_window_days: req.body.window_days,
     });
     if (error) return next(new Error('failed to refresh funnel rollup'));
+    // `refresh_funnel_rollup` returns {"status":"busy"} and does NO work when
+    // it loses the advisory lock. Until the background loop was enabled the
+    // lock was never contended and this could not happen; now a pass runs every
+    // 15 minutes, so an operator clicking Refresh can land on one — and
+    // reporting `ok: true` would show a success toast for a recompute that
+    // never happened, which is the reason they clicked in the first place.
+    const status = (data as { status?: unknown } | null)?.status;
+    if (status === 'busy') {
+      return res.status(409).json({
+        ok: false,
+        error: 'A refresh is already running. Nothing was recomputed; try again shortly.',
+      });
+    }
     res.json({ ok: true, result: data });
   } catch (error) {
     next(error);

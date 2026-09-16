@@ -38,10 +38,17 @@ const SUMMARY: FunnelSummaryResponse = {
     dialed: 6, connected: 4, consent_passed: 3, consent_dropped: 1, answered_ge1: 3,
     scored: 2, qualified: 1, on_hold: 1, disqualified: 0, human_review: 0, reached_reference_check: 1,
     attempts_total: 9, connects_total: 4, total_call_seconds: 600,
+    // 0098. `hr_tracking_configured` is false for this fixture's tenant, so the
+    // HR states are all `unknown` — which is what every tenant reads today.
+    hr_qualified: 0, hr_disqualified: 0, hr_awaiting: 0, hr_unknown: 2,
+    candidates_total: 10,
   },
   conversions: {
     parse_to_dial: 0.75, dial_to_connect: 0.6667, connect_to_consent: 0.75,
     consent_to_answered: 1, answered_to_scored: 0.6667, scored_to_qualified: 0.5, qualified_to_reference_check: 1,
+    // Null, not 0: nothing has been decided, and a 0% advance rate would be a
+    // lie of arithmetic.
+    hr_advance_rate: null,
   },
   series: [{ cohort_day: '2026-09-01', role_id: 'r1', median_ttfc_sec: 12, p95_ttfc_sec: 30,
     entered_parse: 10, parsed_ok: 8, needs_review: 1, parse_failed: 1, dialed: 6, connected: 4,

@@ -60,3 +60,5 @@ export {
   phoneErrorRequiresRefresh,
   isVersionConflict,
 } from './phoneErrors';
+export { PhoneSlotDialog } from './PhoneSlotDialog';
+export type { PhoneSlotDialogProps } from './PhoneSlotDialog';

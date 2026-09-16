@@ -40,7 +40,7 @@ import {
   sessionStatusLabel,
 } from "../components/talent";
 import { formatDateTime } from "../lib/datetime";
-import { PhoneSlotPicker, engagementStateTerm } from "../components/phone-calendar";
+import { PhoneSlotDialog, engagementStateTerm } from "../components/phone-calendar";
 import { istToday } from "../lib/ist-datetime";
 import type { IstDate } from "../lib/ist-datetime";
 import type { PhoneSlot } from "../types";
@@ -305,6 +305,19 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
   const [phone, setPhone] = useState("");
   const [slotDate, setSlotDate] = useState<IstDate>(() => istToday());
   const [selectedSlot, setSelectedSlot] = useState<PhoneSlot | null>(null);
+  // The slot grid is ~26 rows; it lives behind a button so the page stays
+  // about the candidate until someone actually decides to book.
+  const [slotDialogOpen, setSlotDialogOpen] = useState(false);
+  // Captured explicitly rather than read from document.activeElement: Safari
+  // and Firefox do not focus a button on mouse click, so the heuristic would
+  // hand focus back to <body>. Mirrors `confirmTriggerRef` above.
+  // ONE ref, because only ONE trigger is ever mounted: the two live in
+  // opposite arms of a single ternary. Selecting between two refs on a
+  // different predicate (`current?.appointment`) left `.current` null in the
+  // most ordinary state — a cycle requested with nothing booked yet — so focus
+  // returned nowhere, which is the exact failure the ref exists to prevent.
+  const slotTriggerRef = useRef<HTMLButtonElement | null>(null);
+
   const [savingAppointment, setSavingAppointment] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
@@ -325,6 +338,20 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
   const current = data?.cycles.find((cycle) => cycle.cycle_number === data.current_cycle)
     ?? data?.cycles[0]
     ?? null;
+
+  // Close when booking stops being offered. A refetch can turn the cycle
+  // terminal while the dialog is open; leaving it up means confirming would
+  // POST a schedule for a cycle that no longer accepts one. Keyed on the same
+  // predicate that renders the triggers — an unmount-only cleanup would be a
+  // no-op on an already-dead component, which is not the case it guards.
+  const canSchedule = data
+    ? data.cycles.length === 0 || !current || current.terminal_at === null
+    : false;
+  useEffect(() => {
+    if (canSchedule) return;
+    setSlotDialogOpen(false);
+    setSelectedSlot(null);
+  }, [canSchedule]);
   const canRescreen = current != null
     && current.terminal_at != null
     && ["completed", "failed", "abandoned_no_answer", "cancelled", "wrong_number"].includes(current.state);
@@ -386,6 +413,10 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
           : "Appointment booked. The call will still pass through normal admission gates.");
       }
       setSelectedSlot(null);
+      // Close only on success: a failed save must keep the dialog open with
+      // the grid in place, or the operator loses their context and has to
+      // rediscover the slot they were trying to book.
+      setSlotDialogOpen(false);
       load();
     } catch (e) {
       setMessage(e instanceof ApiError ? e.message : "The appointment could not be saved.");
@@ -430,6 +461,7 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
   }
 
   return (
+    <>
     <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
       <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
         Phone screening cycles
@@ -479,24 +511,15 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
           )}
           <SurfaceCard level="sunken" className="mt-4 p-3">
             <h3 className="text-[13px] font-medium text-ink-secondary">Schedule a slot</h3>
-            <p className="mt-1 truncate text-xs text-ink-tertiary" title={SLOT_ADVISORY_NEW}>
-              {SLOT_ADVISORY_NEW}
-            </p>
-            <div className="mt-3 grid gap-x-4 gap-y-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
-              <div className="min-w-0">
-                <PhoneSlotPicker
-                  date={slotDate}
-                  onDateChange={(date) => { setSlotDate(date); setSelectedSlot(null); }}
-                  value={selectedSlot?.starts_at ?? null}
-                  onChange={setSelectedSlot}
-                  idPrefix={`${headingId}-slot`}
-                  disabled={savingAppointment}
-                />
-              </div>
-              <CandidateButton variant="primary" onClick={() => void saveAppointment()} loading={savingAppointment} disabled={!selectedSlot}>
-                Book slot
-              </CandidateButton>
-            </div>
+            <CandidateButton
+              ref={slotTriggerRef}
+              variant="primary"
+              className="mt-3"
+              onClick={() => setSlotDialogOpen(true)}
+              disabled={savingAppointment}
+            >
+              Book a slot
+            </CandidateButton>
           </SurfaceCard>
         </>
       ) : (
@@ -583,30 +606,24 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
                   </p>
                 )}
               </div>
-              <p className="mt-1 truncate text-xs text-ink-tertiary" title={SLOT_ADVISORY_EXISTING}>
-                {SLOT_ADVISORY_EXISTING}
-              </p>
-              <div className="mt-3 grid gap-x-4 gap-y-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
-                <div className="min-w-0">
-                  <PhoneSlotPicker
-                    date={slotDate}
-                    onDateChange={(date) => { setSlotDate(date); setSelectedSlot(null); }}
-                    value={selectedSlot?.starts_at ?? null}
-                    onChange={setSelectedSlot}
-                    idPrefix={`${headingId}-slot`}
-                    disabled={savingAppointment}
-                  />
-                </div>
-                <div className="flex flex-wrap gap-2 sm:flex-col sm:items-stretch">
-                  <CandidateButton variant="primary" onClick={() => void saveAppointment()} loading={savingAppointment} disabled={!selectedSlot}>
-                    {current?.appointment ? "Move appointment" : "Book slot"}
+              <div className="mt-3 flex flex-wrap gap-2">
+                <CandidateButton
+                  ref={slotTriggerRef}
+                  variant="primary"
+                  onClick={() => setSlotDialogOpen(true)}
+                  // Without this, clicking "Cancel appointment" and then this
+                  // opens the dialog with `saving` already true — and every
+                  // exit (Esc, backdrop, Cancel) is gated on !saving, so the
+                  // operator is locked in until an unrelated request returns.
+                  disabled={savingAppointment}
+                >
+                  {current?.appointment ? "Move appointment" : "Book a slot"}
+                </CandidateButton>
+                {current?.appointment && (
+                  <CandidateButton variant="secondary" onClick={() => void cancelAppointment()} loading={savingAppointment}>
+                    Cancel appointment
                   </CandidateButton>
-                  {current?.appointment && (
-                    <CandidateButton variant="secondary" onClick={() => void cancelAppointment()} loading={savingAppointment}>
-                      Cancel appointment
-                    </CandidateButton>
-                  )}
-                </div>
+                )}
               </div>
             </SurfaceCard>
           )}
@@ -614,6 +631,34 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
       )}
       {message && <p role="status" className="mt-3 text-sm text-ink-secondary">{message}</p>}
     </SurfaceCard>
+
+    {/* ONE dialog for both branches, mounted OUTSIDE the SurfaceCard above.
+        `SurfaceCard level="base"` applies `.glass`, which sets
+        `backdrop-filter` and therefore becomes the containing block for any
+        `position: fixed` descendant — a "full-viewport" overlay declared
+        inside it would clamp to the card. Here it has no filtered ancestor,
+        so it covers the viewport with no portal and no event-scoping games.
+
+        The two call sites were mutually exclusive arms of one ternary and
+        already shared `slotDialogOpen`/`slotDate`/`selectedSlot`, so a single
+        instance is the same behaviour with one fewer way to render two
+        dialogs at once. */}
+    <PhoneSlotDialog
+      open={slotDialogOpen}
+      onClose={() => { setSlotDialogOpen(false); setSelectedSlot(null); }}
+      title={current?.appointment ? "Move appointment" : "Book a slot"}
+      confirmLabel={current?.appointment ? "Move appointment" : "Book slot"}
+      advisory={(data?.cycles.length ?? 0) === 0 ? SLOT_ADVISORY_NEW : SLOT_ADVISORY_EXISTING}
+      date={slotDate}
+      onDateChange={(date) => { setSlotDate(date); setSelectedSlot(null); }}
+      selected={selectedSlot}
+      onSelect={setSelectedSlot}
+      onConfirm={() => void saveAppointment()}
+      saving={savingAppointment}
+      idPrefix={`${headingId}-slot`}
+      returnFocusRef={slotTriggerRef}
+    />
+    </>
   );
 }
 

@@ -802,6 +802,20 @@ export interface FunnelSummaryTotals {
   attempts_total: number;
   connects_total: number;
   total_call_seconds: number;
+  /** HR disposition of bot-screened candidates (0098). */
+  hr_qualified: number;
+  hr_disqualified: number;
+  /**
+   * Bot-screened but still sitting in the AI screening stage — an HR BACKLOG,
+   * never a rejection. Kept separate so the rejection rate is not a function
+   * of how recently the bot ran.
+   */
+  hr_awaiting: number;
+  /** Bot-screened but their Ashby stage cannot be observed (unconfigured
+   *  mapping, unsynced stage, or no Ashby link). Never an HR rejection. */
+  hr_unknown: number;
+  /** Candidates in the window. Every other cohort field is a FILTERED count. */
+  candidates_total: number;
 }
 
 export interface FunnelConversions {
@@ -812,13 +826,37 @@ export interface FunnelConversions {
   answered_to_scored: number | null;
   scored_to_qualified: number | null;
   qualified_to_reference_check: number | null;
+  /**
+   * Share of the candidates HR DECIDED on that HR advanced. Not "agreement":
+   * it never compares HR's decision to the bot's recommendation.
+   */
+  hr_advance_rate: number | null;
 }
 
-export interface FunnelDailyRow extends FunnelSummaryTotals {
+/**
+ * One day of the funnel series.
+ *
+ * `/api/funnel/summary` REMOVES fields from these rows: the latency percentiles
+ * always, and the per-individual call counters on a day that resolves to a
+ * single candidate. Typing them as required let a future chart read
+ * `r.total_call_seconds`, compile clean, and plot `undefined`.
+ */
+export interface FunnelDailyRow extends Partial<FunnelSummaryTotals> {
   cohort_day: string;
   role_id: string | null;
   median_ttfc_sec: number | null;
   p95_ttfc_sec: number | null;
+}
+
+/** Facts the dashboard must be TOLD, never infer. See lib/funnel/summary.ts. */
+export interface FunnelMeta {
+  hr_tracking_configured: boolean;
+  schema_current: boolean;
+  /** Meaningful only when `rollup_freshness_known` is true. */
+  rollup_refreshed_at: string | null;
+  /** False when the freshness probe failed — "unknown", not "never ran". */
+  rollup_freshness_known: boolean;
+  refresh_window_days: number;
 }
 
 export interface FunnelSummaryResponse {
@@ -827,6 +865,7 @@ export interface FunnelSummaryResponse {
   conversions: FunnelConversions;
   series: FunnelDailyRow[];
   refreshed_at: string | null;
+  meta?: FunnelMeta;
 }
 
 export interface FunnelFailureGroup {

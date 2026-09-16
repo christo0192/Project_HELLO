@@ -27,6 +27,21 @@ export interface LineChartProps {
   height?: number;
   /** Show an inside dataZoom when there are more points than this. */
   zoomThreshold?: number;
+  /**
+   * Draw a marker on every point and stop smoothing the line.
+   *
+   * For a series whose x-axis has had days REMOVED — a rate that is undefined
+   * on days with no denominator — the default smoothed, symbol-less line is
+   * actively misleading: evenly-spaced points drawn as a continuous curve turn
+   * "20% in June, 60% in September, nothing in between" into a gentle climb
+   * across an apparently unbroken quarter. Markers restore the "these are
+   * discrete observations" reading that the spliced axis destroys.
+   */
+  discrete?: boolean;
+  /** Empty-state heading. Defaults to the sessions wording. */
+  emptyTitle?: string;
+  /** Empty-state body. Defaults to the sessions wording. */
+  emptyHint?: string;
   /** Overridden to 'svg' in tests (jsdom has no canvas). */
   renderer?: 'canvas' | 'svg';
 }
@@ -47,6 +62,9 @@ export function LineChart({
   className,
   height = 260,
   zoomThreshold = 14,
+  discrete = false,
+  emptyTitle = 'No sessions yet',
+  emptyHint = 'Sessions will appear here once screening starts.',
   renderer = 'canvas',
 }: LineChartProps) {
   const { theme } = useTheme();
@@ -60,7 +78,7 @@ export function LineChart({
     body = <ChartError message={error} onRetry={onRetry} />;
   } else if (data.length === 0) {
     body = (
-      <ChartEmpty title="No sessions yet" hint="Sessions will appear here once screening starts." />
+      <ChartEmpty title={emptyTitle} hint={emptyHint} />
     );
   } else {
     const option: EChartsOption = {
@@ -71,7 +89,10 @@ export function LineChart({
         data: data.map((d) => d.label),
         axisLine: { show: false },
         axisTick: { show: false },
-        axisLabel: { color: palette.subtext, margin: 12 },
+        // `hideOverlap` so the axis drops labels cleanly rather than at a
+        // fixed interval: a discrete series is told to "check the dates", and
+        // that only helps if the dates it keeps are legible.
+        axisLabel: { color: palette.subtext, margin: 12, hideOverlap: true },
       },
       yAxis: {
         type: 'value',
@@ -95,10 +116,16 @@ export function LineChart({
           type: 'line',
           name: title,
           data: data.map((d) => d.value),
-          smooth: 0.35,
+          smooth: discrete ? false : 0.35,
           symbol: 'circle',
-          symbolSize: 5,
-          showSymbol: data.length <= 20,
+          // Markers restore the "discrete observations" reading a spliced axis
+          // destroys — but at 5px plus a 1.5px border they merge into a solid
+          // band once points are closer together than ~8px, which on a 90-day
+          // half-width chart is well before the series ends.
+          symbolSize: discrete && data.length > 45 ? 3 : 5,
+          // `discrete` forces markers on however dense the series: hiding them
+          // is only safe when consecutive points are consecutive periods.
+          showSymbol: discrete || data.length <= 20,
           lineStyle: { width: 2 },
           itemStyle: { borderColor: '#ffffff', borderWidth: 1.5 },
           areaStyle: {

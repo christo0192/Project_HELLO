@@ -1099,7 +1099,12 @@ describe('OpenAPI document integrity', () => {
     // THREE suppression verbs (GET/POST/DELETE) — the do-not-call write path
     // `phone_suppressions` never had. Paths are counted by URL, not by verb,
     // so three routes move this guard by one. 130 + 1 = 131.
-    expect(Object.keys(paths).length).toBe(131);
+    // The recruiter dashboard adds ONE read — GET /api/funnel/summary, the
+    // interviewer-and-above twin of the admin funnel summary, served from the
+    // same implementation at a lower privilege with the per-day latency
+    // percentiles stripped. Its response body is INLINE (opaque object), like
+    // its admin twin, so the schema count below is unchanged. 131 + 1 = 132.
+    expect(Object.keys(paths).length).toBe(132);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1186,7 +1191,12 @@ describe('OpenAPI document integrity', () => {
     // id, a boolean and closed-vocabulary strings — never a number and never
     // a suppression digest, which the phone operator boundary refuses to
     // emit. 241 + 4 = 245.
-    expect(Object.keys(schemas).length).toBe(245);
+    // + FunnelSummaryBody and FunnelMeta. The funnel summary's 200 body was
+    //   documented as a bare `type: object`, which said nothing about `meta` —
+    //   the four stated facts the dashboard renders INSTEAD of inferring. An
+    //   undocumented contract that both sides must agree on exactly is the one
+    //   most worth writing down. 245 + 2 = 247.
+    expect(Object.keys(schemas).length).toBe(247);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.

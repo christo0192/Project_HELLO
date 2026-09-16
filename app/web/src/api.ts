@@ -441,6 +441,18 @@ export const api = {
       `/api/admin/sessions${status ? `?status=${encodeURIComponent(status)}` : ''}`,
     ),
   listAdminQuotas: () => request<QuotaPolicyListResponse>('/api/admin/quotas'),
+  /**
+   * Recruiter-facing funnel summary (interviewer+). Same aggregation as the
+   * admin read below — the dashboard KPIs must not be admin-only.
+   */
+  getScreeningFunnel: (params?: { from?: string; to?: string; role_id?: string }) => {
+    const qs = new URLSearchParams();
+    if (params?.from) qs.set('from', params.from);
+    if (params?.to) qs.set('to', params.to);
+    if (params?.role_id) qs.set('role_id', params.role_id);
+    const q = qs.toString();
+    return request<FunnelSummaryResponse>(`/api/funnel/summary${q ? `?${q}` : ''}`);
+  },
   // Funnel observability (0090 / PR2) — admin-gated reads of the derived
   // funnel views + stored rollup, plus an on-demand rollup recompute.
   getFunnelSummary: (params?: { from?: string; to?: string; role_id?: string }) => {

@@ -23,17 +23,61 @@ import {
   allowEchartsInitWarnings,
 } from '../components/design/__tests__/helpers';
 
-const { getMe, listCandidates, listNotificationIntents, getCandidatesSummary, getPhoneCalendar } = vi.hoisted(() => ({
+const {
+  getMe, listCandidates, listNotificationIntents, getCandidatesSummary, getPhoneCalendar,
+  getScreeningFunnel, listRoles,
+} = vi.hoisted(() => ({
   getMe: vi.fn(),
   listCandidates: vi.fn(),
   listNotificationIntents: vi.fn(),
   getCandidatesSummary: vi.fn(),
   getPhoneCalendar: vi.fn(),
+  getScreeningFunnel: vi.fn(),
+  listRoles: vi.fn(),
 }));
+
+/** Zeroed funnel payload: the scoreboard renders, nothing competes with the
+ *  page-level queries below, and no test here asserts on its numbers. */
+const EMPTY_FUNNEL = {
+  range: { from: '2026-08-18', to: '2026-09-16' },
+  totals: {
+    entered_parse: 0, parsed_ok: 0, needs_review: 0, parse_failed: 0,
+    dialed: 0, connected: 0, consent_passed: 0, consent_dropped: 0, answered_ge1: 0,
+    scored: 0, qualified: 0, on_hold: 0, disqualified: 0, human_review: 0,
+    reached_reference_check: 0, attempts_total: 0, connects_total: 0,
+    total_call_seconds: 0, hr_qualified: 0, hr_disqualified: 0, hr_awaiting: 0,
+    hr_unknown: 0, candidates_total: 0,
+  },
+  conversions: {
+    parse_to_dial: null, dial_to_connect: null, connect_to_consent: null,
+    consent_to_answered: null, answered_to_scored: null, scored_to_qualified: null,
+    qualified_to_reference_check: null, hr_advance_rate: null,
+  },
+  series: [],
+  refreshed_at: null,
+  // A CONFIGURED, computed tenant. The previous fixture set
+  // `hr_tracking_configured: false` and `rollup_refreshed_at: null`, which put
+  // the shared dashboard permanently into a degraded state for every test in
+  // this file — and meant the axe run below never saw the HR band's three
+  // cards or its footnote, i.e. the newest markup was the markup a11y never
+  // checked.
+  meta: {
+    hr_tracking_configured: true,
+    schema_current: true,
+    rollup_refreshed_at: '2026-09-16T06:00:00Z',
+    rollup_freshness_known: true,
+    refresh_window_days: 30,
+  },
+};
 
 vi.mock('../api', () => ({
   api: {
     getMe: (...args: any[]) => getMe(...args),
+    // The screening scoreboard loads these on mount. Unmocked they reject,
+    // which renders a SECOND "Try again" button and makes the page-level
+    // button queries below ambiguous.
+    getScreeningFunnel: (...args: any[]) => getScreeningFunnel(...args),
+    listRoles: (...args: any[]) => listRoles(...args),
     listCandidates: (...args: any[]) => listCandidates(...args),
     listNotificationIntents: (...args: any[]) => listNotificationIntents(...args),
     getCandidatesSummary: (...args: any[]) => getCandidatesSummary(...args),
@@ -120,6 +164,8 @@ describe('DashboardPage', () => {
     listNotificationIntents.mockResolvedValue({ intents: [] });
     getCandidatesSummary.mockResolvedValue(SUMMARY);
     getPhoneCalendar.mockResolvedValue(PHONE_CALENDAR);
+    getScreeningFunnel.mockResolvedValue(EMPTY_FUNNEL);
+    listRoles.mockResolvedValue([]);
   });
   afterEach(() => {
     vi.unstubAllGlobals();
