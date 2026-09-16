@@ -15090,9 +15090,17 @@ select _policy_tests.assert(
 -- candidate outside `recover_ashby_model_degraded` for ever. The trigger must
 -- therefore still have NO `structuring -> queued` edge, and the RPC must not
 -- accept the state.
+-- ANCHORED TO THE `structuring` BRANCH, and matching the CLOSING BRACKET.
+-- An earlier revision searched for the bare substring
+-- `'ready','failed_review','cancelled'` — which is still present after the
+-- exact mutation this assertion exists to forbid
+-- (`array['ready','failed_review','cancelled','queued']`), so the test the
+-- file calls "THE LOAD-BEARING EXCLUSION" could not fail for it.
 select _policy_tests.assert(
   'ashby 0097: the trigger still refuses structuring -> queued',
-  (select position('''ready'',''failed_review'',''cancelled''' in replace(body, ' ', '')) > 0
+  (select position(
+            'when''structuring''thenallowed:=array[''ready'',''failed_review'',''cancelled''];'
+            in replace(body, ' ', '')) > 0
      from (select pg_get_functiondef(p.oid) as body
              from pg_proc p join pg_namespace n on n.oid = p.pronamespace
             where n.nspname = 'screening_v2'

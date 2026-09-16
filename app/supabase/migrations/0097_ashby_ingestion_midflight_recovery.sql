@@ -79,6 +79,22 @@
 -- residency — parser timeout ceiling 300s + model acquire 30s + the 42s
 -- circuit-open ladder + provider timeout — with roughly 2x margin.
 --
+-- THIS IS NOT THE ONLY DOOR, and an earlier revision of this header wrongly
+-- implied it was. `advance_ashby_ingestion` refuses `extracting -> queued`
+-- (`parse_defer_only`) and `ready -> queued` (`model_degraded_recovery_only`)
+-- on the generic path — but it does NOT refuse `scanning`, and `runImport`
+-- calls `advanceIngestion(linkId, 'queued')` unconditionally on every
+-- re-import (`orchestration.ts`). So a redelivered Ashby signal or a
+-- reconciliation re-observation ALREADY walks a `scanning` row back to
+-- `queued`, with no staleness check, no audit row and no rescue-specific
+-- ceiling. This RPC is the SAFE version of that edge, not the sole one.
+--
+-- The same fact corrects the RCA's severity framing above: a stranded row is
+-- not unreachable "forever", it is unreachable until the next re-observation —
+-- which may never come (the two incident rows sat for 2h42m because none did,
+-- and their queue jobs were already `completed`). Worth having, but the honest
+-- claim is "stalled indefinitely", not "frozen permanently".
+--
 -- The 0032 attempts ceiling is unchanged and enforced here too, so a row that
 -- keeps dying mid-flight rests loudly in `failed_review` instead of looping.
 -- Nothing about a document is concluded by this call, so the row carries no
@@ -208,6 +224,17 @@ comment on function screening_v2.resume_ashby_ingestion_midflight(uuid, text, in
 
 -- The new audit action has to be admitted by the 0007 CHECK, or the insert
 -- above aborts the whole rescue.
+--
+-- TWO-PHASE, matching 0014/0036/0039/0074/0084/0094 without exception. A plain
+-- `add constraint ... check (...)` holds ACCESS EXCLUSIVE for a full sequential
+-- scan of `audit_events` — the table EVERY audited RPC writes (phone admission,
+-- invite delivery, all four ingestion recoveries, logins) — so every audited
+-- write in the system blocks for the duration. `not valid` takes that lock only
+-- for the instant catalog update; `validate constraint` then scans under SHARE
+-- UPDATE EXCLUSIVE, which does not block INSERT. The table is small today
+-- (~3.3k rows), so this is a latent cost rather than a live one — but it is
+-- append-only and only grows, and 0014 names this "the sanctioned replaceable
+-- data-guard evolution pattern".
 alter table screening_v2.audit_events drop constraint if exists chk_audit_action;
 alter table screening_v2.audit_events add constraint chk_audit_action check (
   action = any (array[
@@ -239,7 +266,16 @@ alter table screening_v2.audit_events add constraint chk_audit_action check (
     -- 0097
     'ashby_ingestion_midflight_resume'
   ])
-);
+) not valid;
+alter table screening_v2.audit_events validate constraint chk_audit_action;
+
+-- `drop constraint` also drops its COMMENT, and 0074/0084/0094 each re-set it.
+-- Losing it silently retires the generation marker every reader uses to tell
+-- which migration last widened the vocabulary.
+comment on constraint chk_audit_action on screening_v2.audit_events is
+  'Closed audit vocabulary through 0097. Widen ONLY by re-creating this '
+  'constraint with the full list plus the new action(s), never by dropping '
+  'members — every writer of an existing action depends on it.';
 
 -- ── 2. THE MID-FLIGHT REST CODES ARE RECOVERABLE ────────────────────────
 -- A row that dies mid-flight five times rests `failed_review` on one of the
@@ -253,8 +289,15 @@ alter table screening_v2.audit_events add constraint chk_audit_action check (
 --
 -- They qualify under this allowlist's own stated criterion: they describe OUR
 -- MACHINE (a process that died, a seam that was absent, a refusal from the
--- rescue itself), never the document. Byte-for-byte the 0040 body with five
--- elements appended and nothing else changed.
+-- rescue itself), never the document. The 0040 body with EIGHT elements
+-- appended; the explanatory comments inside the function body are not
+-- reproduced, so a reader comparing the two sees a comment delta as well.
+-- Behaviour is otherwise identical — signature, security definer, search_path,
+-- lock ordering, refusal order, the in-flight guard, the queue-admission block
+-- with its fail-closed re-select, the audit shape and the return shape are all
+-- unchanged. (An earlier revision of this comment said "five elements ... and
+-- nothing else changed", which was wrong on both counts — exactly the kind of
+-- claim that stops the next reviewer from checking.)
 create or replace function screening_v2.recover_ashby_ingestion_parse(
   p_application_link_id uuid,
   p_actor_id uuid,
