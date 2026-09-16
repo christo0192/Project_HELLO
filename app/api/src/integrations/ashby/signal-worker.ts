@@ -4,7 +4,20 @@
  * A webhook only tells us "something changed for application X". The worker
  * re-reads the authoritative `application.info`, then validates against the
  * active mapping's CURRENT per-job AI screening stage before deciding anything
- * (invariant 6). It never trusts the payload's stage/job claims.
+ * (invariant 6). No DECISION is ever taken from the payload's stage/job claims.
+ *
+ * ONE narrow exception, added 2026-09-16 and deliberately not a decision: the
+ * optional `isStageOfInterest` pre-filter may use the payload's stage as a HINT
+ * to skip the provider read when NO enabled mapping names that stage — see its
+ * doc on {@link SignalWorkerDeps}. It can only ever reach the same verdict the
+ * authoritative read would have reached for an unmapped stage, it is fail-open
+ * at every uncertain step, and its verdict is CONDITIONAL (non-terminal), so a
+ * later mapping change plus a forced resync still re-drives the application.
+ * The cost of the exception is real and bounded: if a stage-change webhook is
+ * LOST and a later signal for the same application hints an unmapped stage, the
+ * catch-up that the unconditional re-read used to provide now falls to
+ * reconciliation instead. `onStageHintObserved` exists to measure whether the
+ * hint is ever wrong; a non-zero mismatch count is the signal to unwire it.
  *
  * Decisions (this PR produces a SAFE decision only — it never creates a
  * candidate, invite, session, or any Ashby mutation; that is a later PR):
@@ -46,6 +59,7 @@
 import {
   extractApplicationInfo,
   CANDIDATE_STAGE_CHANGE_ACTION,
+  MAX_ID_LEN,
 } from './extractors.js';
 import type { AshbySignalPayload, EnqueueSpec, ReceiptStore } from './ports.js';
 import type { AshbyResult, OpaqueRecord } from './types.js';
@@ -97,7 +111,63 @@ export type SignalDecision =
   | 'skipped_no_application'
   | 'mapping_inactive'
   | 'stage_not_ai'
+  | 'stage_not_of_interest'
   | 'self_echo';
+
+/**
+ * Upper bound `stageDedupId` enforces on a receipt identity. An id at exactly
+ * this length may have been TRUNCATED, which would silently corrupt the stage
+ * segment — see {@link stageIdFromWebhookActionId}. DERIVED from the extractor's
+ * own bound so the two can never drift into accepting a truncated prefix.
+ */
+export const MAX_WEBHOOK_ACTION_ID_LEN = MAX_ID_LEN;
+
+/**
+ * Sentinel `stageDedupId` substitutes when the signal carried no stage at all.
+ * It is not a stage id and must never be matched against the mapping set.
+ */
+export const NO_STAGE_SENTINEL = 'nostage';
+
+/**
+ * The stage id embedded in a stage-change receipt identity (`stage:<app>:<stage>`).
+ *
+ * Returns null — meaning "no usable hint, do the authoritative read" — for
+ * anything that is not unambiguously a complete stage id. The bar is high on
+ * purpose: this value's ONLY job is to authorise skipping a provider read, so
+ * every failure mode here must degrade into doing more work, never less.
+ *
+ * Rejected, each for a reason that would otherwise yield a stage id matching no
+ * mapping and thus a WRONG skip:
+ *  - not a string, or not exactly `stage:<a>:<b>` with both parts non-empty;
+ *  - length exactly {@link MAX_WEBHOOK_ACTION_ID_LEN}: `stageDedupId` slices at
+ *    that bound, so the trailing stage segment may be a truncated prefix;
+ *  - the {@link NO_STAGE_SENTINEL} placeholder, which encodes "stage unknown" —
+ *    precisely the case that must consult the provider rather than skip.
+ */
+export function stageIdFromWebhookActionId(
+  webhookActionId: unknown,
+  expectedApplicationId?: unknown,
+): string | null {
+  if (typeof webhookActionId !== 'string') return null;
+  // A possibly-truncated id cannot be trusted to carry a whole stage segment.
+  if (webhookActionId.length >= MAX_WEBHOOK_ACTION_ID_LEN) return null;
+  const parts = webhookActionId.split(':');
+  if (parts.length !== 3) return null;
+  if (parts[0] !== 'stage') return null;
+  const applicationPart = parts[1] ?? '';
+  const stagePart = parts[2] ?? '';
+  if (applicationPart.length === 0 || stagePart.length === 0) return null;
+  if (stagePart === NO_STAGE_SENTINEL) return null;
+  // Defence in depth: an identity describing a DIFFERENT application than the
+  // payload carries is incoherent, and its stage segment says nothing about
+  // the application we are about to decide on. Both current producers build
+  // the two from one struct, so this should be unreachable — which is exactly
+  // why it must fail open rather than be assumed.
+  if (expectedApplicationId !== undefined && applicationPart !== expectedApplicationId) {
+    return null;
+  }
+  return stagePart;
+}
 
 export interface SignalResult {
   decision: SignalDecision;
@@ -131,6 +201,35 @@ export interface SignalWorkerDeps {
   candidateDeleteEnabled?: boolean;
   /** Detect a self-generated stage echo (our own write-back). Default: never. */
   isSelfEcho?: (input: { applicationId: string; stageId: string }) => Promise<boolean> | boolean;
+  /**
+   * Cheap, LOCAL pre-filter answering "could any enabled mapping ever import an
+   * application sitting at this stage?" — consulted BEFORE the authoritative
+   * `application.info` read, purely to avoid spending a provider round-trip on
+   * a stage no mapping names.
+   *
+   * This is the ONLY place the payload's stage claim is used, and it is used as
+   * a HINT, never as truth:
+   *   - Absent seam → behaviour is byte-identical to before (no fast path).
+   *   - Unparseable receipt identity → no fast path.
+   *   - A throw, or any inability to answer → treated as "of interest", so the
+   *     authoritative read still happens. It fails OPEN, always.
+   * The resulting verdict is CONDITIONAL (`stage_not_of_interest`): the receipt
+   * is left non-terminal exactly like `stage_not_ai`, so enabling a mapping
+   * later and forcing a full resync still re-drives the application (B2).
+   */
+  isStageOfInterest?: (stageId: string) => Promise<boolean> | boolean;
+  /**
+   * Observer invoked ONLY on the path that already paid for the authoritative
+   * read, reporting the payload's hinted stage alongside the real one. It is
+   * the sole way to learn whether the hint above is trustworthy: the skip path
+   * performs no read, so a systematically wrong hint is otherwise undetectable
+   * at any volume. Never throws into the caller — observation must not fail a
+   * signal. Metadata only; the ids are opaque provider strings.
+   */
+  onStageHintObserved?: (input: {
+    hintedStageId: string;
+    authoritativeStageId: string | undefined;
+  }) => void;
   /**
    * Scheduling seam invoked ONLY on the `import_eligible` verdict, before the
    * receipt is marked processed. Production binds it to a deterministic,
@@ -210,12 +309,61 @@ export async function processAshbySignal(
     return { decision: 'skipped_no_application' };
   }
 
+  // ── Local pre-filter: skip the provider read for a stage no mapping names ──
+  // An external bulk stage-move can deliver tens of thousands of stage changes
+  // for stages this tenant has never mapped. Each one previously cost a full
+  // `application.info` round-trip before the mapping check could reject it,
+  // which is what let one external burst saturate the runtime for hours.
+  //
+  // The skip is only ever taken when EVERY one of these holds: the seam is
+  // wired, the receipt identity parses to a stage id, and the seam answers a
+  // definite "no". Anything else — no seam, no parse, a throw, an
+  // indeterminate answer — falls through to the authoritative read below.
+  const hintedStageId = stageIdFromWebhookActionId(
+    payload.webhookActionId,
+    payload.externalApplicationId,
+  );
+  if (deps.isStageOfInterest) {
+    if (hintedStageId !== null) {
+      let ofInterest = true;
+      try {
+        const answer = await deps.isStageOfInterest(hintedStageId);
+        // ONLY a literal `false` grants a skip. Anything else — `undefined`,
+        // `null`, a non-boolean — is an inability to answer, and an inability
+        // to answer must cost a provider read, never a skipped candidate.
+        ofInterest = answer !== false;
+      } catch {
+        // A filter that cannot answer has not granted a skip.
+        ofInterest = true;
+      }
+      if (!ofInterest) {
+        // CONDITIONAL — no `mark`, so the receipt stays `received`. Identical
+        // to the `stage_not_ai` treatment below, and for the same reason: a
+        // human can map this stage tomorrow, and the stage-centric dedup
+        // identity would suppress the re-entry forever if terminalised (B2).
+        return {
+          decision: 'stage_not_of_interest',
+          applicationId: payload.externalApplicationId,
+          stageId: hintedStageId,
+        };
+      }
+    }
+  }
+
   // Re-read the authoritative application state — the payload is only a signal.
   const info = await deps.client.applicationInfo(payload.externalApplicationId);
   const view = extractApplicationInfo(info.results);
   const applicationId = view.applicationId ?? payload.externalApplicationId;
   const jobId = view.jobId;
   const stageId = view.currentStageId;
+
+  // Free evidence about the hint: this read already happened. Observation must
+  // never turn a healthy signal into a failure, so it is fully isolated.
+  if (deps.onStageHintObserved && hintedStageId !== null) {
+    try {
+      deps.onStageHintObserved({ hintedStageId, authoritativeStageId: stageId });
+    } catch { /* an observer must never break the worker */ }
+  }
 
   if (!jobId) {
     // CONDITIONAL — leave the receipt non-terminal (B2). Deliberately no mark.
