@@ -31,12 +31,8 @@ import {
   ASHBY_INGESTION_QUEUE,
   MIDFLIGHT_INGESTION_STATES,
   MIDFLIGHT_RESUME_REASON,
-  MIDFLIGHT_RESUME_EXHAUSTED_REASON,
-  MIDFLIGHT_RESUME_REFUSED_REASON,
-  MIDFLIGHT_RESUME_UNAVAILABLE_REASON,
   MIDFLIGHT_RECENTLY_ACTIVE_REASON,
   DEFAULT_MIDFLIGHT_RECHECK_SECONDS,
-  FETCHING_ENTRY_REFUSED_REASON,
 } from '../integrations/ashby/runtime-workers.js';
 import { PARSE_CLASSIFIER } from '../integrations/ashby/resume-ingestion.js';
 import { ParserError } from '../lib/resume-parser.js';
@@ -227,6 +223,16 @@ describe('a row a dead process left mid-flight is re-driven, not abandoned', () 
     });
     await run(world);
     expect(world.midflight).toEqual([]);
+    // The row is untouched and still countable.
+    expect(world.ingestion.state).toBe('structuring');
+    expect(world.transitions).toEqual([]);
+    // AND the handler returned at the guard rather than wandering on to a
+    // refused `-> fetching`. Without this the test passes with
+    // `UNRESCUABLE_MIDFLIGHT_STATES` deleted: nothing writes on either path in
+    // the narrowed design, so "the row survived" proves nothing about WHY.
+    // This is the guard's only observable effect — one skipped scanner-gate
+    // call and one avoided illegal transition.
+    expect(world.entryRefusals).toBe(0);
   });
 
   it('leaves a healthy queued row alone — no rescue, no extra attempt', async () => {
@@ -275,61 +281,67 @@ describe('a live run is never yanked backwards', () => {
   });
 });
 
-describe('a rescue that cannot happen is written down, never silent', () => {
-  it('rests loudly when the recovery seam is absent', async () => {
+describe('a rescue that cannot happen LEAVES THE ROW ALONE', () => {
+  // THE NARROWED CONTRACT. An earlier revision rested the row with a durable
+  // reason on every one of these paths. Three review rounds found the same
+  // defect at four sites: `failed_review -> failed_review` is a same-state
+  // no-op and `advance_ashby_ingestion` rewrites `failed_reason`
+  // UNCONDITIONALLY, so a row another worker had just rested `scan_infected`
+  // had its verdict replaced — after which the RPC's verdict refusal no longer
+  // matched and the pipeline would re-download and re-scan a known-infected
+  // file.
+  //
+  // So nothing is written. The row stays mid-flight, which is exactly what
+  // `ingestion_stuck_scanning` / `_extracting` count — the visibility the loud
+  // rest was reaching for, at none of the risk.
+  const REFUSALS: Array<[string, Partial<World>]> = [
+    ['the recovery seam is absent', { omitMidflightSeam: true }],
+    ['the row burned its retry budget', { midflightResult: { status: 'retry_exhausted' } }],
+    ['the row moved out from under us', { midflightResult: { status: 'invalid_state' } }],
+    ['the application went terminal', { midflightResult: { status: 'blocked_terminal' } }],
+    ['the seam throws', { midflightThrows: true }],
+  ];
+
+  it.each(REFUSALS)('writes nothing when %s', async (_label, over) => {
     const world = newWorld({
       ingestion: { state: 'scanning', attempts: 1, failedReason: null },
-      omitMidflightSeam: true,
+      ...over,
     });
     await run(world);
-    expect(world.ingestion.failedReason).toBe(MIDFLIGHT_RESUME_UNAVAILABLE_REASON);
+    expect(world.transitions).toEqual([]);
+    expect(world.ingestion.failedReason).toBeNull();
+    // ...and the row is still somewhere a health counter can see it.
+    expect(MIDFLIGHT_INGESTION_STATES.has(world.ingestion.state)).toBe(true);
   });
 
-  it('rests loudly when the row has burned its retry budget', async () => {
+  it('a throwing seam does not dead-letter the job either', async () => {
+    // Throwing would burn the job's budget and still end with the row
+    // stranded; returning lets the ordinary schedule try again.
     const world = newWorld({
-      ingestion: { state: 'scanning', attempts: 5, failedReason: null },
-      midflightResult: { status: 'retry_exhausted' },
+      ingestion: { state: 'scanning', attempts: 1, failedReason: null },
+      midflightThrows: true,
     });
-    await run(world);
-    expect(world.ingestion.failedReason).toBe(MIDFLIGHT_RESUME_EXHAUSTED_REASON);
+    await expect(run(world)).resolves.not.toThrow();
   });
 
-  it('rests loudly on any other refusal', async () => {
+  it('a verdict another worker wrote survives a refused rescue', async () => {
+    // The exact race round 3 named: `invalid_state` is what the RPC returns
+    // PRECISELY when the row moved — possibly onto a verdict.
     const world = newWorld({
       ingestion: { state: 'scanning', attempts: 1, failedReason: null },
       midflightResult: { status: 'invalid_state' },
     });
-    await run(world);
-    expect(world.ingestion.failedReason).toBe(MIDFLIGHT_RESUME_REFUSED_REASON);
-  });
-
-  it('stays silent ONLY when the application itself went terminal', async () => {
-    const world = newWorld({
-      ingestion: { state: 'scanning', attempts: 1, failedReason: null },
-      midflightResult: { status: 'blocked_terminal' },
-    });
-    await run(world);
-    expect(world.transitions).toEqual([]);
-  });
-
-  it('records the reason on the LAST attempt when the seam throws', async () => {
-    // A transport failure must not dead-letter with the row stranded and no
-    // reason — that is the original incident's durable symptom.
-    const world = newWorld({
-      ingestion: { state: 'scanning', attempts: 1, failedReason: null },
-      midflightThrows: true,
-    });
-    await expect(run(world, job({ attempts: 5, maxAttempts: 5 }))).rejects.toThrow();
-    expect(world.ingestion.failedReason).toBe(MIDFLIGHT_RESUME_UNAVAILABLE_REASON);
-  });
-
-  it('does NOT rest on an early attempt when the seam throws — it retries', async () => {
-    const world = newWorld({
-      ingestion: { state: 'scanning', attempts: 1, failedReason: null },
-      midflightThrows: true,
-    });
-    await expect(run(world, job({ attempts: 1, maxAttempts: 5 }))).rejects.toThrow();
-    expect(world.transitions).toEqual([]);
+    const runtime = runtimeFor(world);
+    const stores = (runtime as unknown as { stores: Record<string, unknown> }).stores;
+    const original = stores.resumeIngestionMidflight as (l: string, r: string) => Promise<unknown>;
+    stores.resumeIngestionMidflight = async (l: string, r: string) => {
+      const out = await original(l, r);
+      world.ingestion = { state: 'failed_review', attempts: 1, failedReason: 'scan_infected' };
+      return out;
+    };
+    await buildAshbyHandlers(runtime as never, { nowMs: () => NOW })[ASHBY_INGESTION_QUEUE]!(job());
+    expect(world.ingestion.failedReason).toBe('scan_infected');
+    expect(requeueRefused(world.ingestion.failedReason)).toBe(true);
   });
 });
 
@@ -374,70 +386,19 @@ describe('an already-rested row keeps its verdict — the laundering regression'
   );
 });
 
-describe('the rest primitive itself cannot fail quietly', () => {
-  it('THROWS when the rest could not land, instead of completing the job', async () => {
-    // `restOrEscalate`'s whole reason to exist is this branch: a rest that
-    // does not land and is not escalated is a job that reports success having
-    // neither done the work nor recorded why — the original defect. Without
-    // this test, deleting the `throw` leaves the suite green.
-    const world = newWorld({
-      ingestion: { state: 'scanning', attempts: 1, failedReason: null },
-      midflightResult: { status: 'invalid_state' },
-      restRefused: true,
-    });
-    await expect(run(world)).rejects.toThrow(/ashby_ingestion_rest_failed/);
-    expect(world.ingestion.failedReason).toBeNull();
-  });
-
-  it('FAILS CLOSED when the guarding read throws — it never writes on a guess', async () => {
-    // The read decides whether a live ingestion gets written off and whether a
-    // verdict survives. Collapsing a transport error to `null` (the old
-    // `.catch(() => null)`) would skip every guard and rest the row anyway.
-    const world = newWorld({
-      ingestion: { state: 'scanning', attempts: 1, failedReason: null },
-      midflightResult: { status: 'invalid_state' },
-      readThrows: true,
-    });
-    await expect(run(world)).rejects.toThrow(/ashby_ingestion_read_error/);
-    expect(world.transitions).toEqual([]);
-  });
-
-  it('leaves a verdict alone even when the refusal arrives from the RESCUE', async () => {
-    // `invalid_state` is what the RPC returns precisely when the row moved out
-    // from under us — including to `failed_review/scan_infected`. This is the
-    // path that wrote unguarded before the guard moved into the primitive.
-    const world = newWorld({
-      ingestion: { state: 'scanning', attempts: 1, failedReason: null },
-      midflightResult: { status: 'invalid_state' },
-    });
-    // The row is rested by "another worker" the moment the rescue is asked.
-    const runtime = runtimeFor(world);
-    const stores = (runtime as unknown as { stores: Record<string, unknown> }).stores;
-    const original = stores.resumeIngestionMidflight as (l: string, r: string) => Promise<unknown>;
-    stores.resumeIngestionMidflight = async (l: string, r: string) => {
-      const out = await original(l, r);
-      world.ingestion = { state: 'failed_review', attempts: 1, failedReason: 'scan_infected' };
-      return out;
-    };
-    await buildAshbyHandlers(runtime as never, { nowMs: () => NOW })[ASHBY_INGESTION_QUEUE]!(job());
-    expect(world.ingestion.failedReason).toBe('scan_infected');
-    expect(requeueRefused(world.ingestion.failedReason)).toBe(true);
-  });
-});
-
-describe('the entry transition never completes a job in silence again', () => {
-  it('records a reason when -> fetching is refused for an unknown cause', async () => {
-    // A row resting on a MACHINE-class reason carries no verdict to protect, so
-    // the refusal is recorded rather than swallowed. `materialize_failed` is in
-    // the audited recovery allowlist, so this is a legal, non-verdict rest.
+describe('the entry transition writes over nothing', () => {
+  it('leaves an already-rested row exactly as it found it', async () => {
+    // The row is `failed_review`, so `-> fetching` is refused. The handler
+    // returns without touching it — the reason it already carries is the
+    // truthful record, and this is the line at which four separate revisions
+    // of this PR overwrote one.
     const world = newWorld({
       ingestion: { state: 'failed_review', attempts: 1, failedReason: 'materialize_failed' },
     });
     await run(world);
-    // The row is already rested, so the handler leaves it exactly as it found
-    // it — the reason it carries is already truthful.
     expect(world.entryRefusals).toBe(1);
     expect(world.ingestion.failedReason).toBe('materialize_failed');
+    expect(world.transitions).toEqual([]);
   });
 
   it('stays silent when the row is already terminal — and proves the guard fired', async () => {

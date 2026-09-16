@@ -188,36 +188,9 @@ export const UNRESCUABLE_MIDFLIGHT_STATES: ReadonlySet<string> = new Set([
  */
 export const DEFAULT_MIDFLIGHT_RECHECK_SECONDS = 45;
 
-/**
- * Wall-clock bound on how long ONE job may keep waiting on `recently_active`.
- *
- * Both sibling deferrals (scanner, parse) carry a deadline derived from the
- * job's own `createdAt`, and this one shipped without — which matters because
- * a deferral never spends the job's failure budget (the queue refunds the
- * attempt), so an unbounded wait is an unbounded number of cheap polls and a
- * row nobody is paged about.
- *
- * One hour is ~4x the RPC's 900s staleness window: a row whose owner really
- * died goes stale and is rescued inside ~945s, so reaching this bound means
- * something is still touching the row — a live run that is stuck rather than
- * dead. That is a human's problem, and it now rests loudly instead of
- * polling for ever.
- */
-export const DEFAULT_MIDFLIGHT_DEFER_DEADLINE_MS = 60 * 60_000;
-
-/** Durable rest when the mid-flight wait outlives its wall clock. */
-export const MIDFLIGHT_DEFER_DEADLINE_REASON = 'ingestion_midflight_defer_deadline';
-
 /** Reason passed to the audited mid-flight resume RPC. Never PII. */
 export const MIDFLIGHT_RESUME_REASON = 'ingestion_midflight_restart';
 
-/**
- * Durable rest when a mid-flight row cannot be returned to `queued`.
- *
- * Distinct codes rather than one: `retry_exhausted` means the row has burned
- * its 0032 budget dying mid-flight and wants a human, while a refusal or a
- * missing seam means the RECOVERY PATH is broken, which is a different page.
- */
 /**
  * Deferral code when the rescue refuses because a live run may still own the
  * row. Distinct from every failure code: this is a WAIT, and conflating the
@@ -225,35 +198,26 @@ export const MIDFLIGHT_RESUME_REASON = 'ingestion_midflight_restart';
  */
 export const MIDFLIGHT_RECENTLY_ACTIVE_REASON = 'ingestion_midflight_recently_active';
 
-export const MIDFLIGHT_RESUME_EXHAUSTED_REASON = 'ingestion_midflight_exhausted';
-export const MIDFLIGHT_RESUME_REFUSED_REASON = 'ingestion_midflight_refused';
-export const MIDFLIGHT_RESUME_UNAVAILABLE_REASON = 'ingestion_midflight_unavailable';
-
-/**
- * Durable rest when the `-> fetching` entry transition is refused.
- *
- * Before 0097 this path was a bare `return`, which is how a refused entry
- * became a SILENTLY COMPLETED job. A cancelled application is the one benign
- * case and stays silent (the row is terminal and there is genuinely no work);
- * everything else is now written down.
- */
-export const FETCHING_ENTRY_REFUSED_REASON = 'ingestion_entry_refused';
-
-/** Durable rest when a scanner-deferral requeue is refused for any other reason. */
-export const DEFER_REQUEUE_REFUSED_REASON = 'scan_defer_requeue_refused';
-
-/**
- * Durable rest when the link read behind `buildIngestionPorts` came back empty.
- *
- * Machine-class on purpose: `runtime.ts` returns `link_missing` for
- * `error || !data`, so a transient transport failure is indistinguishable from
- * a genuinely deleted link. Treating it as a verdict would write off a live
- * application over one failed select.
- */
-export const LINK_READ_FAILED_REASON = 'ingestion_link_read_failed';
-
-/** Durable rest when the resume handle disappeared between two reads. */
-export const RESUME_HANDLE_VANISHED_REASON = 'ingestion_resume_handle_vanished';
+// ── DELIBERATELY NOT HERE: durable rest codes for every refused exit ─────────
+//
+// An earlier revision of this PR also made every silent exit in the ingestion
+// handler record a reason — the entry-transition refusal, the scanner-deferral
+// requeue refusal, `link_missing`, `no_resume`, and each way the rescue itself
+// can fail. Three review rounds killed it, and the same defect was found at
+// four separate sites: writing `failed_review` on a row that is ALREADY
+// `failed_review` is a same-state no-op the trigger waves through, and
+// `advance_ashby_ingestion` rewrites `failed_reason` UNCONDITIONALLY — so a
+// row resting on `scan_infected` had its verdict replaced by a machine-class
+// code, after which the RPC's verdict refusal no longer matched and the
+// pipeline would re-download and re-scan a file already judged infected.
+//
+// "Record every exit" and "never overwrite a verdict" are in direct tension,
+// and this PR lost that collision four times. The rows those paths would have
+// rested are now VISIBLE instead, through the three `ingestion_stuck_*`
+// counters below — which is most of what the loud exits were reaching for, at
+// none of the risk. Making the exits loud is legitimate follow-up work, but it
+// needs its own change designed around the verdict invariant from the start
+// rather than bolted onto this one under review pressure.
 
 /**
  * Default wait between scanner-readiness deferrals.
@@ -495,8 +459,6 @@ export interface AshbyHandlerDeps {
   parseDeferDeadlineMs?: number;
   /** Delay before re-checking a row the rescue called `recently_active`. */
   midflightRecheckSeconds?: number;
-  /** Wall-clock bound on how long one job may keep waiting on the rescue. */
-  midflightDeferDeadlineMs?: number;
   /** Injectable clock for the deadline (tests). */
   nowMs?: () => number;
 }
@@ -525,8 +487,6 @@ export function buildAshbyHandlers(
   const parseDeferDeadlineMs = deps.parseDeferDeadlineMs ?? DEFAULT_PARSE_DEFER_DEADLINE_MS;
   const midflightRecheckSeconds =
     deps.midflightRecheckSeconds ?? DEFAULT_MIDFLIGHT_RECHECK_SECONDS;
-  const midflightDeferDeadlineMs =
-    deps.midflightDeferDeadlineMs ?? DEFAULT_MIDFLIGHT_DEFER_DEADLINE_MS;
   const nowMs = deps.nowMs ?? (() => Date.now());
   const gates = {
     enabled: true,
@@ -646,57 +606,11 @@ export function buildAshbyHandlers(
       // row for every link including this one.
       if (!link.externalResumeFileHandle) return;
 
-      /**
-       * Record a durable, sanitized ingestion failure.
-       *
-       * Returns whether the rest actually LANDED. The old version swallowed
-       * throws and discarded the status, which made it a silent no-op from
-       * `queued`/`ready`/`cancelled` — `x -> failed_review` is illegal from all
-       * three and the RPC answers `invalid_transition` rather than throwing. A
-       * "never silent again" invariant whose enforcement primitive can fail
-       * silently is not an invariant, so callers on the new paths escalate
-       * instead of trusting it.
-       */
-      const failIngestion = async (reason: string): Promise<boolean> => {
+      /** Record a durable, sanitized ingestion failure. Best effort. */
+      const failIngestion = async (reason: string): Promise<void> => {
         try {
-          const out = await runtime.stores.advanceIngestion(
-            linkId, 'failed_review', { failedReason: reason },
-          );
-          return out.status === 'ok';
-        } catch { return false; }
-      };
-
-      /**
-       * Rest the row — but NEVER over a row that already says something true —
-       * and if the rest could not land, THROW so the queue retries and
-       * ultimately dead-letters. A job that completes having neither done the
-       * work nor recorded why is the original defect.
-       *
-       * THE GUARD LIVES HERE, not at the call sites. An earlier revision
-       * guarded only the two paths whose refusal came from `advanceIngestion`,
-       * and the rescue-refusal path (`invalid_state`, which the RPC returns
-       * PRECISELY when the row moved out from under us) wrote unguarded — so
-       * a row that another worker had just rested `failed_review/scan_infected`
-       * had its verdict replaced, which is the laundering bug in the code
-       * written to fix the laundering bug. Making the guard part of the
-       * primitive means a new call site cannot reintroduce it.
-       *
-       * The read FAILS CLOSED. `readIngestion` answers `null` for "no row" and
-       * THROWS on a transport error, so catching would collapse a failed read
-       * into "no opinion" and write on a guess. This read guards a security
-       * property; a throw here is a retry, which is the correct outcome.
-       */
-      const restOrEscalate = async (reason: string): Promise<void> => {
-        const settled = await runtime.stores.readIngestion(linkId);
-        // Already terminal: the application is gone, there is nothing to rest.
-        if (settled && TERMINAL_INGESTION_STATES.has(settled.state)) return;
-        // Already rested: the reason it carries is the truthful record, and
-        // overwriting it would launder a verdict into a requeueable code.
-        if (settled?.state === 'failed_review') return;
-        // Stranded but unsafe to touch: the health counter is the signal.
-        if (settled && UNRESCUABLE_MIDFLIGHT_STATES.has(settled.state)) return;
-        if (await failIngestion(reason)) return;
-        throw new Error(`ashby_ingestion_rest_failed_${reason}`);
+          await runtime.stores.advanceIngestion(linkId, 'failed_review', { failedReason: reason });
+        } catch { /* the queue outcome below is the authoritative signal */ }
       };
 
       // ── Mid-flight rescue: a previous run of THIS job died in place ──────
@@ -720,13 +634,10 @@ export function buildAshbyHandlers(
       if (current && UNRESCUABLE_MIDFLIGHT_STATES.has(current.state)) return;
 
       if (current && MIDFLIGHT_INGESTION_STATES.has(current.state)) {
-        // No seam ⇒ no way to record the rescue ⇒ do not pretend to take one.
-        // Resting loudly beats the pre-0097 behaviour of completing the job and
-        // abandoning the row in silence.
-        if (!runtime.stores.resumeIngestionMidflight) {
-          await restOrEscalate(MIDFLIGHT_RESUME_UNAVAILABLE_REASON);
-          return;
-        }
+        // No seam ⇒ no rescue. The row stays mid-flight and the counters see
+        // it; this branch is test-only in practice (the production store
+        // always provides the seam).
+        if (!runtime.stores.resumeIngestionMidflight) return;
         // A transport failure here must not dead-letter the job with the row
         // still stranded and no reason recorded — that is the original
         // incident's durable symptom. Mirror the `buildIngestionPorts` policy:
@@ -736,42 +647,43 @@ export function buildAshbyHandlers(
           resumed = await runtime.stores.resumeIngestionMidflight(
             linkId, MIDFLIGHT_RESUME_REASON,
           );
-        } catch (err) {
-          if (job.attempts >= job.maxAttempts) {
-            await failIngestion(MIDFLIGHT_RESUME_UNAVAILABLE_REASON);
-          }
-          throw err;
+        } catch {
+          // The rescue could not be ASKED. Leave the row exactly as it is and
+          // let the queue retry: it is still mid-flight, so the
+          // `ingestion_stuck_scanning`/`_extracting` counters see it, and
+          // writing a reason here is what laundered verdicts three rounds
+          // running.
+          return;
         }
         if (resumed.status !== 'ok') {
-          // `blocked_terminal` is the one benign refusal: the application was
-          // withdrawn while the row sat stranded, so there is genuinely no work
-          // and nothing to rest.
-          if (resumed.status === 'blocked_terminal') return;
           // `recently_active` means a live run may still own this row. Waiting
           // is the CORRECT outcome — resting it would kill a healthy
           // ingestion, and re-driving it would re-download the same résumé
           // under the worker that is already holding it.
+          //
+          // This wait is SELF-TERMINATING and needs no wall clock of its own:
+          // the RPC's refusal is `updated_at`-based, and a dead owner stops
+          // touching the row, so the age crosses `p_min_stale_seconds` (900s)
+          // and the very next poll rescues it. If something IS still touching
+          // it, the row is genuinely live and waiting is right. An earlier
+          // revision added a deadline anchored on `job.createdAt` — which
+          // `defer_job` never resets and which is shared with the scanner's
+          // 8-hour budget — so a backlogged job wrote off a live row on its
+          // FIRST check, having waited zero seconds.
           if (resumed.status === 'recently_active') {
-            // BOUND, shipped with the wait it bounds. Derived from the job's
-            // own creation so it resets with every enqueue and needs no
-            // counter. A deferral costs the job no attempt, so without this the
-            // wait is unbounded and invisible.
-            const waitedMs = Math.max(0, nowMs() - Date.parse(job.createdAt));
-            if (!Number.isFinite(waitedMs) || waitedMs > midflightDeferDeadlineMs) {
-              await restOrEscalate(MIDFLIGHT_DEFER_DEADLINE_REASON);
-              return;
-            }
             return {
               outcome: 'defer',
               reasonCode: MIDFLIGHT_RECENTLY_ACTIVE_REASON,
               delaySeconds: midflightRecheckSeconds,
             } satisfies QueueDeferDirective;
           }
-          await restOrEscalate(
-            resumed.status === 'retry_exhausted'
-              ? MIDFLIGHT_RESUME_EXHAUSTED_REASON
-              : MIDFLIGHT_RESUME_REFUSED_REASON,
-          );
+          // EVERY OTHER REFUSAL LEAVES THE ROW ALONE — `blocked_terminal`
+          // (the application was withdrawn), `retry_exhausted` (the row burned
+          // its 0032 budget dying mid-flight), `invalid_state` (it moved out
+          // from under us, possibly to a VERDICT another worker just wrote).
+          // The row stays mid-flight and the health counters report it; a
+          // human decides. That is deliberately less than "record why" — see
+          // the note beside the rest codes above for why this PR stops here.
           return;
         }
       }
@@ -819,35 +731,21 @@ export function buildAshbyHandlers(
       // so the security rationale for late resolution is untouched.
       const started = await runtime.stores.advanceIngestion(linkId, 'fetching');
       if (started.status !== 'ok') {
-        // NEVER a bare return. This exact line — "not our work to do" — is how
-        // two résumés were lost on 2026-09-16: the row was `scanning`, the
-        // entry transition was refused as `invalid_transition`, and the job
-        // reported SUCCESS while the row stayed frozen with no reason recorded
-        // anywhere. The mid-flight rescue above now removes the cause; this
-        // records whatever is left so the next unknown refusal is visible on
-        // the FIRST occurrence instead of being inferred from a silent row.
+        // THE LINE THE RCA BLAMES, and it stays as it was. Two résumés were
+        // lost because the row was `scanning`, this transition was refused as
+        // `invalid_transition`, and the handler returned here while the job
+        // reported success.
         //
-        // The terminal / already-rested / unsafe-to-touch cases are handled
-        // inside `restOrEscalate` so no call site can forget them. The one
-        // decision that cannot live there is the DEFERRAL below, because it
-        // returns a queue directive rather than resting.
-        //
-        // This read fails CLOSED for the same reason that one does: it decides
-        // whether a live ingestion gets written off.
-        const settled = await runtime.stores.readIngestion(linkId);
-
-        // The row became mid-flight between the read at the top of this handler
-        // and here — another worker started it inside our scanner-gate window.
-        // Resting it would kill a live ingestion; waiting is correct.
-        if (settled && MIDFLIGHT_INGESTION_STATES.has(settled.state)) {
-          return {
-            outcome: 'defer',
-            reasonCode: MIDFLIGHT_RECENTLY_ACTIVE_REASON,
-            delaySeconds: midflightRecheckSeconds,
-          } satisfies QueueDeferDirective;
-        }
-
-        await restOrEscalate(FETCHING_ENTRY_REFUSED_REASON);
+        // The CAUSE is fixed above — a mid-flight row is walked back to
+        // `queued` before we ever get here — and what remains stranded is now
+        // COUNTED (`ingestion_stuck_scanning`/`_extracting`/`_structuring`),
+        // so it is no longer invisible. Recording a reason here as well was
+        // tried and reverted: `failed_review -> failed_review` is a same-state
+        // no-op and the RPC rewrites `failed_reason` unconditionally, so this
+        // line overwrote real verdicts — including `scan_infected` — and made
+        // a known-infected résumé re-downloadable. Three review rounds found
+        // that defect at four sites. Visibility without a write is the
+        // trade this PR deliberately takes.
         return;
       }
 
@@ -881,29 +779,23 @@ export function buildAshbyHandlers(
         throw err;
       }
 
-      // THESE TWO USED TO RETURN BARE, AND THE ROW IS ALREADY `fetching`.
-      // That is the same silent-loss shape as the incident, one state over —
-      // and a worse one to be stranded in: NO audited RPC accepts `fetching`
-      // (`recover_ashby_ingestion_parse` and `reset_ashby_ingestion_attempts`
-      // both demand `failed_review`, `recover_ashby_model_degraded` demands
-      // `ready`, and the mid-flight rescue admits only scanning/extracting),
-      // so the row needed a hand-written DB write to move ever again.
+      // KNOWN GAP, LEFT AS IT WAS. Both of these return with the row already
+      // `fetching`, and `fetching` is a bad state to be stranded in — no
+      // audited RPC accepts it. `link_missing` is also not proof the link is
+      // gone: `runtime.ts` returns it for `error || !data`, so a transient
+      // blip reads identically to a deletion.
       //
-      // `link_missing` is NOT proof the link is gone: `runtime.ts` returns it
-      // for `error || !data`, so a transient PostgREST blip on one select —
-      // exactly the class of event an API restart produces — is reported
-      // identically to a deleted row. Resting it machine-class is the honest
-      // reading, and both codes are in the audited recovery allowlist so an
-      // operator can re-drive with one call.
-      if (built.status === 'link_missing') {
-        await failIngestion(LINK_READ_FAILED_REASON);
-        return;
-      }
+      // Resting them machine-class was tried and reverted with the rest of the
+      // loud-exit work: `failIngestion` here can overwrite a verdict another
+      // worker just wrote, which is the defect this PR spent three review
+      // rounds failing to contain. Fixing these two properly means solving
+      // "record without overwriting" once, for every exit — which is the
+      // follow-up, not this change. Noted here so the next reader finds the
+      // gap deliberately marked rather than silently present.
+      if (built.status === 'link_missing') return;
       if (built.status === 'no_resume') {
         // The link claimed a handle a moment ago and now reports none. Not a
-        // provider failure — but the row is mid-flight and must not be left
-        // there without a reason.
-        await failIngestion(RESUME_HANDLE_VANISHED_REASON);
+        // provider failure; nothing to ingest.
         return;
       }
       if (built.status === 'url_unresolved') {
@@ -1023,15 +915,11 @@ export function buildAshbyHandlers(
           // `retry_exhausted` (the 0032 ceiling) or a concurrent cancel. The
           // row cannot go back, so resting it loudly beats deferring a job
           // whose durable state can never advance again.
-          if (requeued.status === 'retry_exhausted') {
-            await failIngestion(DEFER_EXHAUSTED_REASON);
-            return;
-          }
-          // Every OTHER refusal used to return bare, leaving the row parked in
-          // `scanning` with the job reporting success — the same silent-loss
-          // shape 0097 exists to close. The terminal / already-rested /
-          // unsafe-to-touch cases are all handled inside `restOrEscalate`.
-          await restOrEscalate(DEFER_REQUEUE_REFUSED_REASON);
+          if (requeued.status === 'retry_exhausted') await failIngestion(DEFER_EXHAUSTED_REASON);
+          // Any OTHER refusal leaves the row parked in `scanning` — now
+          // COUNTED by `ingestion_stuck_scanning` rather than invisible.
+          // Recording a reason here belongs with the rest of the loud-exit
+          // work; see the note beside the rest codes at the top of this file.
           return;
         }
         return {

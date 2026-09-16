@@ -15170,37 +15170,11 @@ select _policy_tests.assert(
   'would silently break every writer that uses it'
 );
 
--- The mid-flight rest codes are MACHINE-class, so an operator must be able to
--- recover a row that exhausted the rescue. Before 0097 none of them was in any
--- allowlist, which made such a row permanently unrecoverable by every door.
-select _policy_tests.assert(
-  'ashby 0097: the mid-flight rest codes are operator-recoverable',
-  (select bool_and(position(code in body) > 0)
-     from (select pg_get_functiondef(p.oid) as body
-             from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-            where n.nspname = 'screening_v2'
-              and p.proname = 'recover_ashby_ingestion_parse') s,
-          unnest(array['ingestion_midflight_exhausted','ingestion_midflight_refused',
-                       'ingestion_midflight_unavailable','ingestion_entry_refused',
-                       'scan_defer_requeue_refused']) as code),
-  'a row that died mid-flight five times must not be unrecoverable by every '
-  'audited door at once'
-);
-
--- ...and the widening must NOT have admitted a document VERDICT.
-select _policy_tests.assert(
-  'ashby 0097: no document verdict became recoverable',
-  (select bool_and(position(('''' || code || '''') in body) = 0)
-     from (select pg_get_functiondef(p.oid) as body
-             from pg_proc p join pg_namespace n on n.oid = p.pronamespace
-            where n.nspname = 'screening_v2'
-              and p.proname = 'recover_ashby_ingestion_parse') s,
-          unnest(array['scan_infected','parse_extract_failed','parse_bad_output',
-                       'parse_no_output','parse_output_exceeded',
-                       'no_extractable_fields']) as code),
-  'retrying a verdict re-burns attempts on a file that will fail identically, '
-  'and for malware it means downloading it again'
-);
+-- NOTE: 0097 no longer widens `recover_ashby_ingestion_parse`. The worker half
+-- that wrote new machine-class rest codes was removed after three review
+-- rounds found it overwriting real verdicts, so there are no new codes to
+-- admit and that function is not recreated. The assertions that pinned the
+-- widening (and that no verdict slipped in with it) are gone with it.
 
 select _policy_tests.assert(
   'ashby 0097: the health surface counts every mid-flight state',
