@@ -261,6 +261,37 @@ primary_region = "sin"
   # this change silently does nothing. The live value was 40 via exactly such a
   # secret until 2026-09-15.
   PHONE_TTS_FLUSH_MIN_CHARS = "35"
+
+  # ── BACKGROUND NOISE / BACKGROUND SPEECH (owner report 2026-09-16) ──────
+  # "the stt picks up noises and words from the background — if someone is
+  # talking at the back it's using that one."
+  #
+  # `_build_phone_vad` passed NO parameters to `inference.VAD(model="silero")`,
+  # so the phone lane ran Silero's close-mic defaults (activation 0.5, min
+  # speech 0.05s) down a telephone line. A voice two metres away is attenuated
+  # but still clears 0.5 on voiced vowels, and a 50 ms transient — a cough, a
+  # door, one syllable of someone else's sentence — is enough to open a speech
+  # segment. Both are now explicit.
+  #
+  # ACTIVATION is the lever for background SPEECH: the near-field speaker is
+  # many dB louder, so a modest lift separates them. MIN SPEECH is the lever
+  # for background NOISE: it discards transients that are not speech at all.
+  #
+  # TUNE IN SMALL STEPS, against live calls. The failure mode at the top of the
+  # activation range is a QUIET candidate on a poor line going undetected
+  # entirely, which is far worse than a little bleed — so if a soft-spoken
+  # candidate is ever missed, LOWER this first. `0.5` / `0.05` is the exact
+  # pre-change behaviour and is the one-line revert.
+  #
+  # Not a barge-in change: `min_interruption_words` is untouched, and a HIGHER
+  # speech bar is the safe direction for the deferred barge-in work — it cannot
+  # reintroduce the false-barge-in config that truncated the 2026-09-10 call.
+  #
+  # Both are read via bounded readers (`phone.phone_vad_*`), so a malformed or
+  # out-of-range value falls back / clamps rather than failing a call. As with
+  # every key here, a Fly SECRET of the same name SHADOWS this value.
+  PHONE_VAD_ACTIVATION_THRESHOLD = "0.6"
+  PHONE_VAD_MIN_SPEECH_SEC = "0.20"
   # 0095 — PHONE_TTS_PACE is DELIBERATELY NOT SET HERE. The reader
   # (`phone_tts_pace()`, default 1.0) ships so the value can be applied as a
   # secret, but the value itself is unverified against `bulbul:v3`: the [0.5,

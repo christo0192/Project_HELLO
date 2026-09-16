@@ -2247,7 +2247,31 @@ def _observe_phone_vad(vad_model: Any, on_event: Callable[[Any], None] | None) -
 
 
 def _build_phone_vad(on_event: Callable[[Any], None] | None = None) -> Any:
-    """Construct the phone-owned Silero VAD, never relying on SDK defaults."""
+    """Construct the phone-owned Silero VAD, never relying on SDK defaults.
+
+    THE DOCSTRING USED TO BE HALF TRUE. Passing an explicit VAD instead of
+    letting the SDK pick one is what it meant, and that part held — but every
+    PARAMETER was still defaulted, so the phone lane ran Silero's close-mic
+    tuning (activation 0.5, min speech 0.05s) down a telephone line. Owner
+    report, 2026-09-16: a second person talking in the room was transcribed as
+    the candidate.
+
+    The two knobs that separate a near-field speaker from a room are now read
+    from the phone config (`phone.phone_vad_activation_threshold`,
+    `phone.phone_vad_min_speech_sec`) and passed explicitly, so the tuning is
+    visible here rather than inherited silently.
+
+    `prefix_padding_duration`, `min_silence_duration` and `max_buffered_speech`
+    are deliberately LEFT at their defaults. The first protects the start of an
+    answer (it back-dates the segment, which is what makes a longer activation
+    requirement safe); the second is the end-of-speech anchor the endpointing
+    stack is already tuned against and is not this change's business.
+
+    NOT a barge-in change. `min_interruption_words` is untouched, so the
+    deferred barge-in work is unaffected — and the direction here (a HIGHER
+    speech bar) is the safe one for it: it cannot reintroduce the
+    false-barge-in configuration that truncated the 2026-09-10 call.
+    """
     try:
         from livekit.agents import inference
     except ImportError:
@@ -2262,7 +2286,14 @@ def _build_phone_vad(on_event: Callable[[Any], None] | None = None) -> Any:
         if (os.getenv("PHONE_AGENT_NAME") or "").strip():
             raise RuntimeError("phone_explicit_vad_unavailable")
         return None
-    return _observe_phone_vad(factory(model="silero"), on_event)
+    return _observe_phone_vad(
+        factory(
+            model="silero",
+            activation_threshold=phone.phone_vad_activation_threshold(),
+            min_speech_duration=phone.phone_vad_min_speech_sec(),
+        ),
+        on_event,
+    )
 
 
 def _build_phone_interviewer_llm() -> Any:
