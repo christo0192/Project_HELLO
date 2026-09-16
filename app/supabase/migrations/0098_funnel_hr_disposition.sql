@@ -39,7 +39,8 @@
 -- risk for no benefit. The rollup joins the two.
 
 -- ── 1. The per-candidate HR disposition ──────────────────────────────────
-create or replace view screening_v2.v_funnel_hr_state as
+create or replace view screening_v2.v_funnel_hr_state
+with (security_invoker = true) as
 with latest_assessment as (
   -- One row per candidate: the newest assessment, matching how
   -- v_funnel_candidate picks `scored`/`qualified` so the two agree.
@@ -53,11 +54,20 @@ stage as (
   -- qualified > awaiting > disqualified: being at Reference Check anywhere is
   -- the strongest signal, and still sitting in the screening stage anywhere
   -- means there is still HR work outstanding.
+  --
+  -- `observable` is what makes `disqualified` safe to infer. It is true only
+  -- when this candidate has a link whose CURRENT stage is actually known AND
+  -- whose mapping has the two stage ids wired. Without it, "not at either
+  -- mapped stage" is indistinguishable from "we cannot see where they are",
+  -- and the difference is the whole point of this migration.
   select l.candidate_id,
          bool_or(jm.reference_check_stage_id is not null
                  and l.external_stage_id = jm.reference_check_stage_id) as at_reference_check,
          bool_or(jm.ai_screening_stage_id is not null
-                 and l.external_stage_id = jm.ai_screening_stage_id)    as at_ai_screening
+                 and l.external_stage_id = jm.ai_screening_stage_id)    as at_ai_screening,
+         bool_or(l.external_stage_id is not null
+                 and jm.ai_screening_stage_id is not null
+                 and jm.reference_check_stage_id is not null)           as observable
     from screening_v2.ashby_application_links l
     join screening_v2.ashby_job_mappings jm on jm.id = l.job_mapping_id
    where l.candidate_id is not null
@@ -68,20 +78,28 @@ select c.id                     as candidate_id,
        (c.created_at)::date     as cohort_day,
        case
          -- No assessment ⇒ the bot has not decided ⇒ HR owes nothing yet.
-         when la.candidate_id is null                       then null
-         when coalesce(st.at_reference_check, false)        then 'qualified'
-         when coalesce(st.at_ai_screening, false)           then 'awaiting'
-         -- Bot-decided and the candidate sits in neither mapped stage: HR
-         -- moved them. A candidate with no Ashby link at all also lands here,
-         -- which is correct — they are not waiting on HR in Ashby.
-         else 'disqualified'
+         when la.candidate_id is null                then null
+         when coalesce(st.at_reference_check, false) then 'qualified'
+         when coalesce(st.at_ai_screening, false)    then 'awaiting'
+         -- ONLY here can "somewhere else" mean "a human moved them". An
+         -- `else 'disqualified'` would silently absorb: a candidate with no
+         -- Ashby link at all (every recruiter-uploaded résumé), a link whose
+         -- stage has not synced yet, and every job whose mapping still has a
+         -- NULL reference_check/ai_screening stage id — reporting each as an
+         -- HR rejection. That is precisely the artefact this migration was
+         -- written to remove, so the inference is gated on proof.
+         when coalesce(st.observable, false)         then 'disqualified'
+         else 'unknown'
        end                      as hr_state
   from screening_v2.candidates c
   left join latest_assessment la on la.candidate_id = c.id
   left join stage st            on st.candidate_id = c.id;
 
 comment on view screening_v2.v_funnel_hr_state is
-  'Per-candidate HR disposition (qualified | awaiting | disqualified | null) '
+  'Per-candidate HR disposition (qualified | awaiting | disqualified | unknown '
+  '| null). `unknown` covers a candidate whose Ashby stage cannot be observed '
+  '— no link, an unsynced stage, or a mapping missing its stage ids — so an '
+  'unconfigured tenant never reads as a wall of HR rejections. '
   'derived from the CURRENT Ashby stage on the application link versus the job '
   'mapping''s reference_check/ai_screening stage ids. `awaiting` exists so an '
   'unopened candidate is never counted as an HR rejection. Null until the bot '
@@ -96,6 +114,9 @@ alter table screening_v2.funnel_stage_daily
   add column if not exists hr_qualified    integer not null default 0,
   add column if not exists hr_disqualified integer not null default 0,
   add column if not exists hr_awaiting     integer not null default 0,
+  -- Counted, not dropped: a state that exists in the view but nowhere in the
+  -- rollup is a state nobody can ever see is growing.
+  add column if not exists hr_unknown      integer not null default 0,
   -- The denominator the dashboard needs. Every existing cohort column is a
   -- FILTERED count (dialed, connected, scored…), so "how many candidates are
   -- in this window at all" was not answerable from the rollup — only by
@@ -111,7 +132,7 @@ alter table screening_v2.funnel_stage_daily
 alter table screening_v2.funnel_stage_daily
   add constraint chk_funnel_stage_daily_hr_nonneg
   check (hr_qualified >= 0 and hr_disqualified >= 0 and hr_awaiting >= 0
-         and candidates_total >= 0);
+         and hr_unknown >= 0 and candidates_total >= 0);
 
 comment on column screening_v2.funnel_stage_daily.hr_awaiting is
   'Bot-screened candidates still sitting in the AI screening stage — an HR '
@@ -144,7 +165,7 @@ begin
     dialed, connected, consent_passed, consent_dropped, answered_ge1,
     scored, qualified, on_hold, disqualified, human_review, reached_reference_check,
     attempts_total, connects_total, total_call_seconds, median_ttfc_sec, p95_ttfc_sec,
-    hr_qualified, hr_disqualified, hr_awaiting, candidates_total
+    hr_qualified, hr_disqualified, hr_awaiting, hr_unknown, candidates_total
   )
   with intake as (
     select (occurred_at)::date as day, role_id,
@@ -183,7 +204,8 @@ begin
     select cohort_day as day, role_id,
            count(*) filter (where hr_state = 'qualified')    as hr_qualified,
            count(*) filter (where hr_state = 'disqualified') as hr_disqualified,
-           count(*) filter (where hr_state = 'awaiting')     as hr_awaiting
+           count(*) filter (where hr_state = 'awaiting')     as hr_awaiting,
+           count(*) filter (where hr_state = 'unknown')      as hr_unknown
     from screening_v2.v_funnel_hr_state
     where cohort_day >= v_window_start
     group by 1, 2
@@ -201,7 +223,7 @@ begin
     coalesce(ch.attempts_total, 0), coalesce(ch.connects_total, 0),
     coalesce(ch.total_call_seconds, 0), ch.median_ttfc_sec, ch.p95_ttfc_sec,
     coalesce(hr.hr_qualified, 0), coalesce(hr.hr_disqualified, 0), coalesce(hr.hr_awaiting, 0),
-    coalesce(ch.candidates_total, 0)
+    coalesce(hr.hr_unknown, 0), coalesce(ch.candidates_total, 0)
   from intake i
   full outer join cohort ch
     on i.day = ch.day and i.role_id is not distinct from ch.role_id
@@ -223,3 +245,17 @@ $$;
 
 revoke all on function screening_v2.refresh_funnel_rollup(timestamptz, integer) from public;
 grant execute on function screening_v2.refresh_funnel_rollup(timestamptz, integer) to service_role;
+
+-- ── 4. Recompute the WHOLE history, not just the refresh loop's window ────
+-- `add column … default 0` stamped a literal zero onto every pre-existing row,
+-- and `refresh_funnel_rollup` only ever deletes-and-reinserts a trailing
+-- window (30 days by default). Without this, any range longer than that window
+-- sums real historical `qualified`/`dialed` counts against `candidates_total =
+-- 0` and `hr_* = 0`: a funnel whose top is smaller than its middle, and an HR
+-- backlog that reads as "fully caught up" — both vouched for by a fresh
+-- `refreshed_at`. Ten years covers every row this table can hold.
+--
+-- Safe to re-run: the function is delete-then-insert over the same window and
+-- takes an advisory lock, so a concurrent refresh returns `busy` rather than
+-- double-counting.
+select screening_v2.refresh_funnel_rollup(now(), 3650);

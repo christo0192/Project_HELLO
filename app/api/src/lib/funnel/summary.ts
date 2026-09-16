@@ -41,7 +41,7 @@ export const FUNNEL_COUNT_FIELDS = [
   'dialed', 'connected', 'consent_passed', 'consent_dropped', 'answered_ge1',
   'scored', 'qualified', 'on_hold', 'disqualified', 'human_review', 'reached_reference_check',
   'attempts_total', 'connects_total', 'total_call_seconds',
-  'hr_qualified', 'hr_disqualified', 'hr_awaiting', 'candidates_total',
+  'hr_qualified', 'hr_disqualified', 'hr_awaiting', 'hr_unknown', 'candidates_total',
 ] as const;
 
 /** Defence in depth: a hand-crafted from/to cannot pull the whole history. */
@@ -61,6 +61,16 @@ export interface FunnelSummaryInput {
   from?: string;
   to?: string;
   roleId?: string;
+  /**
+   * Drop the per-day latency percentiles from `series`.
+   *
+   * They are NOT aggregated when exactly one rollup row contributes to a day —
+   * which a `role_id` filter guarantees, because the grain is unique on
+   * (cohort_day, role_id). On a day where that role saw ONE candidate,
+   * `median_ttfc_sec` is that individual's time-to-first-connect. Fine for an
+   * admin; not something to widen to every interviewer.
+   */
+  omitTimings?: boolean;
 }
 
 export interface FunnelSummary {
@@ -71,7 +81,23 @@ export interface FunnelSummary {
   refreshed_at: string | null;
 }
 
+/** Fields 0098 adds. Absent until that migration is applied. */
+const FUNNEL_FIELDS_0098 = [
+  'hr_qualified', 'hr_disqualified', 'hr_awaiting', 'hr_unknown', 'candidates_total',
+] as const;
+
+const LEGACY_COUNT_FIELDS = FUNNEL_COUNT_FIELDS.filter(
+  (f) => !(FUNNEL_FIELDS_0098 as readonly string[]).includes(f),
+);
+
 const SELECT_COLUMNS = `cohort_day, role_id, ${FUNNEL_COUNT_FIELDS.join(', ')}, median_ttfc_sec, p95_ttfc_sec, refreshed_at`;
+const SELECT_COLUMNS_LEGACY = `cohort_day, role_id, ${LEGACY_COUNT_FIELDS.join(', ')}, median_ttfc_sec, p95_ttfc_sec, refreshed_at`;
+
+/** PostgREST surfaces an unknown column as 42703. */
+function isUndefinedColumn(error: unknown): boolean {
+  const code = (error as { code?: unknown } | null)?.code;
+  return code === '42703';
+}
 
 /**
  * Load the funnel summary for a window. Throws on a read failure so the caller
@@ -87,15 +113,29 @@ export async function loadFunnelSummary(
   const from = requestedFrom < minFrom ? minFrom : requestedFrom;
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  let q: any = supabase
-    .from('funnel_stage_daily')
-    .select(SELECT_COLUMNS)
-    .gte('cohort_day', from)
-    .lte('cohort_day', to)
-    .order('cohort_day', { ascending: true });
-  if (input.roleId) q = q.eq('role_id', input.roleId);
+  const run = async (columns: string): Promise<{ data: unknown; error: unknown }> => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let q: any = supabase
+      .from('funnel_stage_daily')
+      .select(columns)
+      .gte('cohort_day', from)
+      .lte('cohort_day', to)
+      .order('cohort_day', { ascending: true });
+    if (input.roleId) q = q.eq('role_id', input.roleId);
+    return q;
+  };
 
-  const { data, error } = await q;
+  let { data, error } = await run(SELECT_COLUMNS);
+  // SCHEMA SKEW. The API image and the migration ship separately in this
+  // project, and migrations are an operator-gated step that has lagged before.
+  // Naming 0098's columns unconditionally would make `GET
+  // /api/admin/funnel/summary` — a route that worked before this change — 500
+  // during that window, with a sanitized message giving no hint why. Fall back
+  // to the 0090 column set and report the new fields as zero, which is exactly
+  // what they are until the rollup is recomputed.
+  if (error && isUndefinedColumn(error)) {
+    ({ data, error } = await run(SELECT_COLUMNS_LEGACY));
+  }
   if (error) throw new Error('failed to load funnel summary');
 
   const rows = (data ?? []) as unknown as Array<Record<string, unknown>>;
@@ -117,11 +157,16 @@ export async function loadFunnelSummary(
     answered_to_scored: ratio(totals.scored, totals.answered_ge1),
     scored_to_qualified: ratio(totals.qualified, totals.scored),
     qualified_to_reference_check: ratio(totals.reached_reference_check, totals.qualified),
-    // HR decision rates are over candidates HR has actually ACTED on
-    // (qualified + disqualified), deliberately excluding `hr_awaiting`.
-    // Dividing by everything bot-screened would make the rate fall purely
-    // because the bot ran again this morning.
-    hr_qualified_rate: ratio(totals.hr_qualified, totals.hr_qualified + totals.hr_disqualified),
+    // Share of the candidates HR has actually DECIDED on that HR advanced.
+    // Excludes `hr_awaiting` (not looked at yet) and `hr_unknown` (stage not
+    // observable), so neither an untouched backlog nor an unconfigured mapping
+    // can move it.
+    //
+    // NOT named "agreement": nothing here compares HR's decision to the bot's
+    // recommendation. A team that advanced every candidate the bot REJECTED —
+    // maximal disagreement — would score 100%. `scored_to_qualified` and
+    // `qualified_to_reference_check` above are the bot-vs-outcome pair.
+    hr_advance_rate: ratio(totals.hr_qualified, totals.hr_qualified + totals.hr_disqualified),
   };
 
   // Aggregate the per-(day, role) rollup into a per-DAY trend, summing across
@@ -152,7 +197,11 @@ export async function loadFunnelSummary(
   }
   const series = [...byDay.values()]
     .sort((a, b) => ((a.cohort_day as string) < (b.cohort_day as string) ? -1 : 1))
-    .map(({ __n: _n, ...row }) => row);
+    .map(({ __n: _n, ...row }) => {
+      if (!input.omitTimings) return row;
+      const { median_ttfc_sec: _m, p95_ttfc_sec: _p, ...rest } = row;
+      return rest;
+    });
 
   return { range: { from, to }, totals, conversions, series, refreshed_at: refreshedAt };
 }

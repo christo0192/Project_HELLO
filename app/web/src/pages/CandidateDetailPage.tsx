@@ -308,6 +308,17 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
   // The slot grid is ~26 rows; it lives behind a button so the page stays
   // about the candidate until someone actually decides to book.
   const [slotDialogOpen, setSlotDialogOpen] = useState(false);
+  // Captured explicitly rather than read from document.activeElement: Safari
+  // and Firefox do not focus a button on mouse click, so the heuristic would
+  // hand focus back to <body>. Mirrors `confirmTriggerRef` above.
+  const slotTriggerNewRef = useRef<HTMLButtonElement | null>(null);
+  const slotTriggerExistingRef = useRef<HTMLButtonElement | null>(null);
+
+  // `slotDialogOpen` outlives the branch that owns it: a refetch can turn the
+  // cycle terminal and unmount the dialog mid-task while the flag stays true,
+  // so a later re-screen would spring the modal open unbidden on a slot chosen
+  // minutes ago in a different context.
+  useEffect(() => () => { setSlotDialogOpen(false); setSelectedSlot(null); }, []);
   const [savingAppointment, setSavingAppointment] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
@@ -437,6 +448,7 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
   }
 
   return (
+    <>
     <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
       <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
         Phone screening cycles
@@ -484,25 +496,18 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
               </div>
             </div>
           )}
-          <div className="mt-4">
-            <CandidateButton variant="secondary" onClick={() => setSlotDialogOpen(true)}>
+          <SurfaceCard level="sunken" className="mt-4 p-3">
+            <h3 className="text-[13px] font-medium text-ink-secondary">Schedule a slot</h3>
+            <CandidateButton
+              ref={slotTriggerNewRef}
+              variant="primary"
+              className="mt-3"
+              onClick={() => setSlotDialogOpen(true)}
+              disabled={savingAppointment}
+            >
               Book a slot
             </CandidateButton>
-            <PhoneSlotDialog
-              open={slotDialogOpen}
-              onClose={() => { setSlotDialogOpen(false); setSelectedSlot(null); }}
-              title="Book a slot"
-              confirmLabel="Book slot"
-              advisory={SLOT_ADVISORY_NEW}
-              date={slotDate}
-              onDateChange={(date) => { setSlotDate(date); setSelectedSlot(null); }}
-              selected={selectedSlot}
-              onSelect={setSelectedSlot}
-              onConfirm={() => void saveAppointment()}
-              saving={savingAppointment}
-              idPrefix={`${headingId}-slot`}
-            />
-          </div>
+          </SurfaceCard>
         </>
       ) : (
         <>
@@ -589,7 +594,16 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
                 )}
               </div>
               <div className="mt-3 flex flex-wrap gap-2">
-                <CandidateButton variant="primary" onClick={() => setSlotDialogOpen(true)}>
+                <CandidateButton
+                  ref={slotTriggerExistingRef}
+                  variant="primary"
+                  onClick={() => setSlotDialogOpen(true)}
+                  // Without this, clicking "Cancel appointment" and then this
+                  // opens the dialog with `saving` already true — and every
+                  // exit (Esc, backdrop, Cancel) is gated on !saving, so the
+                  // operator is locked in until an unrelated request returns.
+                  disabled={savingAppointment}
+                >
                   {current?.appointment ? "Move appointment" : "Book a slot"}
                 </CandidateButton>
                 {current?.appointment && (
@@ -598,26 +612,40 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
                   </CandidateButton>
                 )}
               </div>
-              <PhoneSlotDialog
-                open={slotDialogOpen}
-                onClose={() => { setSlotDialogOpen(false); setSelectedSlot(null); }}
-                title={current?.appointment ? "Move appointment" : "Book a slot"}
-                confirmLabel={current?.appointment ? "Move appointment" : "Book slot"}
-                advisory={SLOT_ADVISORY_EXISTING}
-                date={slotDate}
-                onDateChange={(date) => { setSlotDate(date); setSelectedSlot(null); }}
-                selected={selectedSlot}
-                onSelect={setSelectedSlot}
-                onConfirm={() => void saveAppointment()}
-                saving={savingAppointment}
-                idPrefix={`${headingId}-slot`}
-              />
             </SurfaceCard>
           )}
         </>
       )}
       {message && <p role="status" className="mt-3 text-sm text-ink-secondary">{message}</p>}
     </SurfaceCard>
+
+    {/* ONE dialog for both branches, mounted OUTSIDE the SurfaceCard above.
+        `SurfaceCard level="base"` applies `.glass`, which sets
+        `backdrop-filter` and therefore becomes the containing block for any
+        `position: fixed` descendant — a "full-viewport" overlay declared
+        inside it would clamp to the card. Here it has no filtered ancestor,
+        so it covers the viewport with no portal and no event-scoping games.
+
+        The two call sites were mutually exclusive arms of one ternary and
+        already shared `slotDialogOpen`/`slotDate`/`selectedSlot`, so a single
+        instance is the same behaviour with one fewer way to render two
+        dialogs at once. */}
+    <PhoneSlotDialog
+      open={slotDialogOpen}
+      onClose={() => { setSlotDialogOpen(false); setSelectedSlot(null); }}
+      title={current?.appointment ? "Move appointment" : "Book a slot"}
+      confirmLabel={current?.appointment ? "Move appointment" : "Book slot"}
+      advisory={current?.appointment ? SLOT_ADVISORY_EXISTING : SLOT_ADVISORY_NEW}
+      date={slotDate}
+      onDateChange={(date) => { setSlotDate(date); setSelectedSlot(null); }}
+      selected={selectedSlot}
+      onSelect={setSelectedSlot}
+      onConfirm={() => void saveAppointment()}
+      saving={savingAppointment}
+      idPrefix={`${headingId}-slot`}
+      returnFocusRef={current?.appointment ? slotTriggerExistingRef : slotTriggerNewRef}
+    />
+    </>
   );
 }
 

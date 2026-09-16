@@ -811,6 +811,9 @@ export interface FunnelSummaryTotals {
    * of how recently the bot ran.
    */
   hr_awaiting: number;
+  /** Bot-screened but their Ashby stage cannot be observed (unconfigured
+   *  mapping, unsynced stage, or no Ashby link). Never an HR rejection. */
+  hr_unknown: number;
   /** Candidates in the window. Every other cohort field is a FILTERED count. */
   candidates_total: number;
 }
@@ -823,8 +826,11 @@ export interface FunnelConversions {
   answered_to_scored: number | null;
   scored_to_qualified: number | null;
   qualified_to_reference_check: number | null;
-  /** Over candidates HR has ACTED on (qualified + disqualified), not all scored. */
-  hr_qualified_rate: number | null;
+  /**
+   * Share of the candidates HR DECIDED on that HR advanced. Not "agreement":
+   * it never compares HR's decision to the bot's recommendation.
+   */
+  hr_advance_rate: number | null;
 }
 
 export interface FunnelDailyRow extends FunnelSummaryTotals {

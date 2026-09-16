@@ -45,6 +45,9 @@ funnelRouter.get(
         from: req.query.from as string | undefined,
         to: req.query.to as string | undefined,
         roleId: req.query.role_id as string | undefined,
+        // Per-day latency percentiles are not aggregated on a role-filtered
+        // day and can describe a single candidate. Admin keeps them.
+        omitTimings: true,
       });
       res.json(summary);
     } catch {
