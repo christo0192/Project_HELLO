@@ -578,6 +578,15 @@ def phone_identity_instruction(candidate_name: Any) -> str:
         "Do NOT say why you are calling and do NOT mention a job, an "
         "application, a role, a company they work for, or anything from their "
         "background — you have not yet confirmed who is on the line. "
+        # THE MODEL CANNOT SEE A CLOCK. Left free to "greet warmly" it reaches
+        # for "good morning" regardless of the hour: on the live 2026-09-15
+        # call it opened "Hi there, good morning!" at 17:48 IST. The calling
+        # window is 09:00-21:00 IST, so a wrong guess is not a corner case —
+        # it is wrong for most of the window, and it is the FIRST thing the
+        # candidate hears. A plain greeting is correct at every hour.
+        "Do NOT use a time-of-day greeting: no \"good morning\", \"good "
+        "afternoon\" or \"good evening\". You do not know the local time. "
+        "Open with a plain greeting such as \"Hi\" or \"Hello\". "
         "Ask EXACTLY ONE question and it MUST be that identity question — your "
         "reply MUST END with it so a simple yes or no answers it. "
         "Do NOT mention recording. Do NOT ask for permission or consent to "
@@ -823,6 +832,9 @@ def gate_copy_texts() -> frozenset[str]:
         _SCHEDULE_CONFIRMED_TEXT,
         _SCHEDULE_REFUSAL_FALLBACK,
         *_SCHEDULE_REFUSAL_TEXT.values(),
+        # The terminal wording of the same refusals. Omitting these would make
+        # the bot's own sign-off look like a screening answer.
+        *_SCHEDULE_TERMINAL_TEXT.values(),
     ])
 
 
@@ -4257,9 +4269,11 @@ _SCHEDULE_REFUSAL_TEXT: dict[str, str] = {
         "That time has already gone by, so I can't set it up. Could you give me "
         "a time that's still ahead of us?"
     ),
+    # Same trap as `window_closed`: "a later time" reads as later TODAY, and
+    # today is always refused during a live call. Ask for the DAY explicitly.
     "lead_time_too_short": (
-        "I need at least five minutes to set that up safely. What later time "
-        "would work for you?"
+        "I need a bit more notice than that. What time on a later day would "
+        "work for you?"
     ),
     "slot_full": (
         "That time is already full. Could you choose another time?"
@@ -4272,9 +4286,15 @@ _SCHEDULE_REFUSAL_TEXT: dict[str, str] = {
         "That time is too close to midnight for a ten-minute call. Could you "
         "choose an earlier time?"
     ),
+    # "on a LATER DAY" is load-bearing, not politeness. Every same-IST-day slot
+    # is refused for the duration of this call (the in-progress attempt already
+    # occupies the day's ledger), so inviting a time merely "inside the window"
+    # is a trap the candidate cannot answer correctly: they comply, get
+    # `slot_not_yet_eligible`, and the call ends. That is the live 2026-09-15
+    # sequence — 9 PM refused, "pick a time inside that", 8 PM, hung up on.
     "window_closed": (
         "I can only set up calls between nine in the morning and nine at night. "
-        "Could you pick a time inside that?"
+        "What time on a later day would suit you?"
     ),
     # The engagement was released for TODAY when this call ended, so the
     # earliest the team can call back is tomorrow. Say that plainly rather than
@@ -4364,6 +4384,73 @@ def schedule_refusal_text(status: Any) -> str:
     """Spoken line for a refusal code. Never contains a confirmation."""
     key = str(status).strip().lower() if status is not None else ""
     return _SCHEDULE_REFUSAL_TEXT.get(key, _SCHEDULE_REFUSAL_FALLBACK)
+
+
+#: THE SAME REFUSALS, WORDED FOR A CALL THAT IS ENDING.
+#:
+#: `_SCHEDULE_REFUSAL_TEXT` above deliberately ends every line in a QUESTION,
+#: because its only caller re-asks for another time. Reusing those lines on the
+#: terminal path would ask the candidate a question and then hang up on them,
+#: which is worse than the generic deferral it was meant to replace — so the
+#: reason is restated here WITHOUT a question and joined to the sign-off.
+#:
+#: WHY THIS EXISTS (live call 2026-09-15, session 9f1a3d2e). The candidate
+#: asked for 9 PM: refused `window_closed`, explained, re-asked — correct. They
+#: then offered 8 PM, a perfectly good time refused only by the same-IST-day
+#: ban, and because the one re-ask was already spent they heard nothing but
+#: "our team will reach out". That is the ORIGINAL RCA complaint reappearing
+#: one step later, for a candidate who did nothing wrong.
+_SCHEDULE_TERMINAL_TAIL = (
+    "Our team will reach out to you to arrange another time that works "
+    "better. Thanks so much for your time today. Take care, bye."
+)
+
+_SCHEDULE_TERMINAL_REASON: dict[str, str] = {
+    "lead_time_too_short": "That's a little too soon for me to set up.",
+    "window_closed": "That's outside the hours I'm able to book.",
+    "slot_straddles_ist_midnight": (
+        "That slot runs past midnight, so I can't book it."
+    ),
+    # NOT a repeat of the re-ask ("I can't book another call for today, but
+    # I can from tomorrow onwards"). Saying that clause twice, with the
+    # useful half removed the second time, sounds like a bot that lost the
+    # thread.
+    "slot_not_yet_eligible": "Today is already spoken for, I'm afraid.",
+    "slot_full": "That time is fully booked.",
+    # NOT "there's already a call booked for that day". `daily_attempt_exists`
+    # is an ATTEMPT-per-IST-day limit, not an appointment — the ended attempt
+    # keeps today's `ist_date`, and no booking need exist at all. The re-ask
+    # wording for this same status avoids the claim deliberately ("I can't
+    # arrange another call on that same India-time day"); the terminal wording
+    # must too. A refusal that sounds like a confirmation is the defect this
+    # whole flow exists to prevent.
+    "daily_attempt_exists": (
+        "I can't arrange another call on that same India-time day."
+    ),
+}
+
+#: Precomposed so THESE lines are literals `gate_copy_texts()` can contain. A
+#: spoken line missing from that set is treated as a SCREENING turn, which
+#: pollutes `latest_assistant[0]`, the conflict probe and the goodbye latch.
+#:
+#: NOT every line this flow speaks is gate copy, and an earlier version of this
+#: comment said otherwise. `_CALLBACK_ASK_TIME_TEXT` is not registered, and
+#: `_alternatives_offer_text` is composed at runtime so it structurally cannot
+#: be a literal. Both are pre-existing; neither is made worse here.
+_SCHEDULE_TERMINAL_TEXT: dict[str, str] = {
+    status: f"{reason} {_SCHEDULE_TERMINAL_TAIL}"
+    for status, reason in _SCHEDULE_TERMINAL_REASON.items()
+}
+
+
+def schedule_terminal_deferral_text(status: Any) -> str:
+    """The sign-off for a refusal the candidate can no longer act on.
+
+    Falls back to the plain deferral for any status without a written reason,
+    so an unmapped code can never produce a half-sentence.
+    """
+    key = str(status).strip().lower() if status is not None else ""
+    return _SCHEDULE_TERMINAL_TEXT.get(key, PHONE_CALLBACK_DEFERRAL_TEXT)
 
 
 class ScheduleTurn:
@@ -4701,6 +4788,24 @@ async def _propose_and_confirm(
             return CallbackDecision(
                 schedule_refusal_text(confirm_status), terminal=False,
             )
+        # THE RE-ASK IS SPENT ON THIS LEG TOO. This used to fall straight
+        # through to `_confirmation_failure_decision()`, which speaks the bare
+        # deferral AND halts `HALT_CALLBACK_RECOVERY` — an INFRASTRUCTURE
+        # reason for a refusal the candidate could have fixed by naming another
+        # day. Both were wrong, and it is the very defect this change fixes on
+        # the propose leg, one step later. `daily_attempt_exists` reaches the
+        # worker ONLY here, so without this its terminal wording is dead copy.
+        if confirm_status in _CALLBACK_RETRYABLE_REFUSALS:
+            _log.info(
+                "unknown_event", error_type="phone_callback_refused",
+                error_category=confirm_status, schema="confirm_deferred_explained",
+            )
+            return CallbackDecision(
+                schedule_terminal_deferral_text(confirm_status),
+                terminal=True,
+                terminal_reason=HALT_CANDIDATE_ENDED,
+            )
+
         # Validated but could not be confirmed (a race, a transport failure):
         # never claim a booking and never classify infrastructure as the
         # candidate ending the assessment.
@@ -4752,8 +4857,28 @@ async def _propose_and_confirm(
         flow.phase = CALLBACK_PHASE_AWAITING_RETIME
         return CallbackDecision(schedule_refusal_text(status), terminal=False)
 
-    # Not actionable by the candidate, or the one re-ask is already spent.
-    # `status` is empty on a TRANSPORT failure (the client returns a
+    # ── THE RE-ASK IS SPENT, BUT THE CANDIDATE STILL DESERVES THE REASON ──
+    # A retryable status reaching here means the time was refused for something
+    # the candidate could have fixed — they simply have no turn left to fix it
+    # in. Ending on the bare "our team will reach out" is what the RCA was
+    # about; it just moves the silence one step later. Say why, then sign off.
+    #
+    # The bound is UNCHANGED: this is still terminal, still the same phase and
+    # the same halt reason. Only the words differ.
+    if status in _CALLBACK_RETRYABLE_REFUSALS:
+        _log.info(
+            "unknown_event", error_type="phone_callback_refused",
+            error_category=status, schema="deferred_explained",
+        )
+        flow.phase = CALLBACK_PHASE_DONE
+        return CallbackDecision(
+            schedule_terminal_deferral_text(status),
+            terminal=True,
+            terminal_reason=HALT_CANDIDATE_ENDED,
+        )
+
+    # Not actionable by the candidate at all (a transport failure, an unknown
+    # attempt). `status` is empty on a TRANSPORT failure (the client returns a
     # categorised outcome with `status` unset), so fall back to the category
     # rather than labelling every network blip "malformed_response".
     _log.info(

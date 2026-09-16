@@ -1727,6 +1727,11 @@ async def _wait_for_sip_participant(ctx: JobContext, timeout_sec: float) -> Any:
 # read as one of the five outcomes is a machine, because a machine gets no
 # assessment, no recording and no scorecard — the safe direction to be wrong in.
 
+#: Any character repeated four or more times, collapsed to three before the
+#: consent classifier runs. See `classify_answer_text` for why this exists —
+#: it is the bound that makes the filler alternation safe against a hum.
+_REPEATED_RUN_RE = re.compile(r"(.)\1{3,}", re.DOTALL)
+
 _MACHINE_RE = re.compile(
     r"leave (?:a )?(?:your )?message|after the (?:tone|beep)|voice\s?mail|"
     r"not available (?:right now|at the moment)|record your message|"
@@ -1743,9 +1748,48 @@ _OPT_OUT_RE = re.compile(
     r"remove (?:my|this) number|take me off",
     re.IGNORECASE,
 )
+#: Checked BEFORE the affirmative, so anything matching here ends the call.
+#:
+#: THE `no problem` DEFECT. `^\s*(?:no|...)` matched the leading "no" of
+#: "No problem", "No issues" and "No worries" — three of the most ordinary
+#: Indian-English ways of saying YES — and classified a CONSENTING candidate as
+#: having refused. That is `_terminal_outcome(REFUSED)`: the call ends, with no
+#: re-ask and no recovery, and it looks identical to a genuine refusal in the
+#: data. The lookahead below is the whole fix; `no thanks` still refuses,
+#: because `thanks` is not in the exclusion list.
+#:
+#: The recording clause is also widened from the literal `don't record`, which
+#: missed the far commoner "I don't want to be recorded".
 _REFUSED_RE = re.compile(
-    r"do(?:n't| not) record|no recording|not (?:comfortable|okay|ok) with|"
-    r"^\s*(?:no|nope|no thanks|not interested)\b",
+    # ── UNANCHORED CLAUSES: a refusal ANYWHERE beats an affirmative opener ──
+    # `_AFFIRMATIVE_RE` is anchored and stops at its first match, so it accepts
+    # an utterance that OPENS affirmatively no matter what follows. Widening
+    # its vocabulary therefore widens that hole: "no problem, I'll pass" and
+    # "right, but I'd rather you didn't record this" both became HUMAN, which
+    # is the worst failure this gate has — consent inferred where it was
+    # refused. These clauses run first and are deliberately not anchored.
+    r"do(?:n't| not)\s+(?:want\s+(?:to\s+be\s+|me\s+to\s+be\s+)?)?record|"
+    r"(?:did|would|could)(?:n't| not)\s+(?:want\s+)?(?:to\s+be\s+)?record|"
+    r"rather\s+(?:you\s+)?(?:did\s*n[o']?t|not)\b|"
+    # The article matters: "not THE recording part" is the commonest way to
+    # accept the call and decline the recording in one breath.
+    r"\bnot\s+(?:the\s+|that\s+)?record(?:ed|ing)?\b|"
+    r"no recording|not (?:comfortable|okay|ok) with|"
+    r"\bnot\s+interested\b|\bi'?(?:ll| will)\s+pass\b|"
+    # Explicit declines, and every way of saying "not the recording" that
+    # does not use the verb `record`. A reviewer built a 47-string
+    # not-consent corpus and these were the misses.
+    r"\bdecline\b|\brefuse\b|\bno\s+thanks\b|"
+    r"\brather\s+not\b|\bdelete\s+it\b|\bobject\s+to\b|"
+    r"\bdo(?:n't| not)\s+tape\b|\bsave\s+the\s+audio\b|"
+    r"\bstop\s+the\s+record(?:ing)?\b|\bwithout\s+record(?:ing)?\b|"
+    r"\bavoid\s+record(?:ing)?\b|"
+    r"\bnot\s+comfortable\s+(?:being|with)\s+record(?:ed|ing)?\b|"
+    # ── ANCHORED: a bare "no" only refuses when it OPENS the answer. The
+    #    lookahead keeps "no problem/issues/worries" — ordinary ways of saying
+    #    YES — from ending the call, while "no thanks" still refuses.
+    r"^\s*(?:no(?!\s+(?:problem|problems|probs|issue|issues|worries|"
+    r"objection|objections|doubt))|nope|no thanks)\b",
     re.IGNORECASE,
 )
 # Anchored deliberately. An affirmative has to BE the answer: matching "sure"
@@ -1774,7 +1818,51 @@ _AFFIRMATIVE_RE = re.compile(
     r"you\s+(?:can|may)|we\s+can|"
     r"i'?m\s+(?:here|ready|good)|i\s+am\s+(?:here|ready|good)|ready|"
     r"uh[\s-]*huh|mm[\s-]*hmm|mhm|"
+    # ── ADDED 2026-09-15 after a live double-ask ────────────────────────
+    # Fourteen of forty-eight natural ways to say yes returned None and
+    # produced the re-ask ("Sorry, I just need a yes or a no"). The candidate
+    # had consented; the vocabulary simply did not contain their word. These
+    # are the misses, each a complete answer to "is it okay to continue?".
+    # `right`, `correct`, `good`, `great`, `cool`, `understood` were here and
+    # have been REMOVED. They acknowledge the sentence before the question
+    # ("This call is recorded...") rather than answering it, and they are bare
+    # prefixes of the commonest phone openings: "Good morning.", "Right now I
+    # am driving.", "Right, who is this?" all became CONSENT. An
+    # acknowledgement belongs in the re-ask bucket, not the recording one.
+    r"al+\s*right|all\s+right|perfect|"
+    r"no\s+(?:problem|problems|probs|issue|issues|worries|"
+    r"objection|objections)|not\s+an?\s+issue|"
+    r"it(?:'s| is)\s+(?:okay|ok|fine|alright)|"
+    r"that(?:'s| is)\s+(?:okay|ok|alright|right)|"
+    r"go\s+on|i\s+do\s*n[o']?t\s+mind|don'?t\s+mind|"
     r"haan|han|ji(?:\s+haan)?|theek(?:\s+hai)?)\b",
+    re.IGNORECASE,
+)
+
+
+#: NOT CONSENT, AND NOT A REFUSAL EITHER — send these back for the re-ask.
+#:
+#: The disclosure ends with a STATEMENT before its question ("This call is
+#: recorded so the hiring team can review it. Is it okay to continue?"), so the
+#: most natural reply is a backchannel acknowledging the statement, or a
+#: deferral, or a question back. None of them answers what was asked, and none
+#: of them is a refusal. `None` re-asks once, which is exactly what the re-ask
+#: exists for — and the new `phone_consent_reask` log line makes the rate
+#: visible for the first time.
+#:
+#: Checked AFTER the refusal branches and BEFORE the affirmative, because
+#: `_AFFIRMATIVE_RE` is `^`-anchored and stops at its first match: without this
+#: "Right, can I call you back?" and "Alright, let me call you back" were read
+#: as consent on the strength of their first word.
+_AMBIGUOUS_RE = re.compile(
+    r"\bcall\s+(?:you|me)\s+back\b|\bcall\s+back\b|"
+    r"\bhold\s+on\b|\bone\s+(?:second|sec|minute|min)\b|\bhang\s+on\b|"
+    r"\bwho\s+is\s+this\b|\bwho'?s\s+this\b|"
+    r"\bwhat\s+is\s+this\s+(?:about|regarding|for)\b|"
+    r"\bwhat'?s\s+this\s+(?:about|regarding|for)\b|"
+    r"\bleave\s+me\s+alone\b|\bnot\s+a\s+good\s+time\b|"
+    r"\bi'?m\s+(?:busy|driving)\b|\bi\s+am\s+(?:busy|driving)\b|"
+    r"\bin\s+a\s+meeting\b|\bmaybe\s+later\b|\bnot\s+now\b",
     re.IGNORECASE,
 )
 
@@ -1789,6 +1877,22 @@ def classify_answer_text(text: str) -> str | None:
     value = (text or "").strip()
     if not value:
         return None
+    # COLLAPSE LONG CHARACTER RUNS BEFORE MATCHING.
+    #
+    # `_AFFIRMATIVE_RE`'s filler group contains `hmm+|mm+` inside a `{0,4}`
+    # repetition, and both branches can consume the same run of `m`s. That is
+    # textbook catastrophic backtracking: measured 0.6ms at "h"+18m, doubling
+    # every ~4 characters — about a second by 60, minutes beyond that. A hum on
+    # a PSTN line is exactly how Sarvam produces such a run, and this classifier
+    # runs SYNCHRONOUSLY on the worker event loop, so one hum would stall a
+    # live call (and, with the pool one-call-per-machine, that call only).
+    #
+    # A length cap does not fix it — 400 characters of `m` still hangs. Bounding
+    # the RUN does, and it is semantically free: no real answer depends on the
+    # fourth consecutive identical letter, and "yesss"/"haaan"/"mmmm" all keep
+    # their meaning. Linear, and it runs before every branch, so the
+    # machine/refusal patterns are protected too.
+    value = _REPEATED_RUN_RE.sub(r"\1\1\1", value)
     if _MACHINE_RE.search(value):
         return phone.CLASSIFY_MACHINE
     if _WRONG_NUMBER_RE.search(value):
@@ -1797,6 +1901,10 @@ def classify_answer_text(text: str) -> str | None:
         return phone.CLASSIFY_OPT_OUT
     if _REFUSED_RE.search(value):
         return phone.CLASSIFY_REFUSED
+    # Before the affirmative, deliberately: an `^`-anchored affirmative would
+    # otherwise accept "Right, can I call you back?" on its first word.
+    if _AMBIGUOUS_RE.search(value):
+        return None
     if _AFFIRMATIVE_RE.search(value):
         return phone.CLASSIFY_HUMAN
     return None
@@ -1905,6 +2013,16 @@ async def _classify_phone_answer(
         if decision is not None:
             return decision
         if attempt + 1 < attempts:
+            # THE RE-ASK IS OTHERWISE INVISIBLE. The gate transcript commits
+            # exactly two rows — the LAST bot line and the LAST answer — so a
+            # first answer that failed to classify, and this re-ask itself,
+            # appear nowhere. Without this line there is no way to measure how
+            # often a consenting candidate is asked twice. Counts and a fixed
+            # category only, never the utterance (PII).
+            _log.info(
+                "unknown_event", error_type="phone_consent_reask",
+                error_category="unmatched" if responsive else "no_speech",
+            )
             await say(phone.PHONE_REASK_TEXT)
     # Fail closed to MACHINE — but make WHY visible. A line that WAS responsive
     # (the human spoke) yet still defaulted here is the 2026-09-02 signature: a
