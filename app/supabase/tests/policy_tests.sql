@@ -15240,6 +15240,31 @@ begin
     v_out->>'status' = 'recently_active',
     coalesce(v_out::text, 'null'));
 
+  -- THE DEFAULT IS WHAT PRODUCTION USES. `workflow-stores.ts` calls this RPC
+  -- with TWO arguments, so `p_min_stale_seconds default 900` is the only value
+  -- that ever runs live — and every assertion above passes 900 explicitly, so
+  -- mutating the default to 1 would leave them all green while the liveness
+  -- bound was gone and the rescue yanked healthy in-flight rows backwards.
+  -- This drives the exact call shape production does.
+  v_out := screening_v2.resume_ashby_ingestion_midflight(v_link, 'pol97');
+  perform _policy_tests.assert(
+    'ashby 0097 functional: the DEFAULT staleness bound refuses a fresh row',
+    v_out->>'status' = 'recently_active',
+    coalesce(v_out::text, 'null'));
+
+  -- ...and the default still ADMITS a genuinely stale one, so the assertion
+  -- above cannot pass by the default having been raised to something absurd.
+  delete from screening_v2.ashby_resume_ingestions where application_link_id = v_link;
+  insert into screening_v2.ashby_resume_ingestions
+    (application_link_id, provider, state, attempts, updated_at)
+  values (v_link, 'ashby', 'extracting', 0, now() - interval '2 hours');
+
+  v_out := screening_v2.resume_ashby_ingestion_midflight(v_link, 'pol97');
+  perform _policy_tests.assert(
+    'ashby 0097 functional: the DEFAULT staleness bound admits a 2h-old row',
+    v_out->>'status' = 'ok' and v_out->>'from_state' = 'extracting',
+    coalesce(v_out::text, 'null'));
+
   -- `structuring` is refused outright, however stale.
   delete from screening_v2.ashby_resume_ingestions where application_link_id = v_link;
   insert into screening_v2.ashby_resume_ingestions

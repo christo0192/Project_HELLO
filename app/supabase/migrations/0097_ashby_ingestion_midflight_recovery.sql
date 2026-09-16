@@ -96,7 +96,23 @@
 -- claim is "stalled indefinitely", not "frozen permanently".
 --
 -- The 0032 attempts ceiling is unchanged and enforced here too, so a row that
--- keeps dying mid-flight rests loudly in `failed_review` instead of looping.
+-- keeps dying mid-flight stops being re-driven instead of looping for ever.
+--
+-- WHAT HAPPENS AT THE CEILING, stated plainly because an earlier revision of
+-- this comment claimed the opposite: the RPC answers `retry_exhausted` and the
+-- worker leaves the row WHERE IT IS — still `scanning`/`extracting`. It does
+-- NOT rest it in `failed_review`. That is the same trade the rest of this PR
+-- makes (see the worker's note on the removed rest codes): the row is counted
+-- by `ingestion_stuck_scanning`/`_extracting` and a human decides.
+--
+-- KNOWN OPERATIONAL GAP, not papered over: such a row cannot be moved by any
+-- audited RPC — `recover_ashby_ingestion_parse` and
+-- `reset_ashby_ingestion_attempts` both demand `failed_review`,
+-- `recover_ashby_model_degraded` demands `ready`, and the generic requeue hits
+-- the same ceiling. It takes raw SQL or a cancelled application. Closing that
+-- properly means resting it on a machine-class code AND widening the 0040
+-- allowlist — i.e. the loud-exit work this PR deliberately defers.
+--
 -- Nothing about a document is concluded by this call, so the row carries no
 -- failure reason forward.
 create or replace function screening_v2.resume_ashby_ingestion_midflight(

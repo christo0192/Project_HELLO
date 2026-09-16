@@ -133,8 +133,17 @@ export const TERMINAL_INGESTION_STATES: ReadonlySet<string> = new Set(['ready', 
  * restart, an OOM — leaves the durable row mid-flight. None of those states
  * can reach `fetching`, which is the handler's only entry transition, so
  * before 0097 every subsequent retry died on `invalid_transition` and returned
- * bare: the JOB was marked completed and the ROW was frozen for ever, with no
- * failure reason and no health counter.
+ * bare: the JOB was marked completed and the ROW was left with no failure
+ * reason and no health counter.
+ *
+ * NOT "frozen for ever" — `runImport` calls `advanceIngestion(linkId,'queued')`
+ * unconditionally on every re-import and `advance_ashby_ingestion` does not
+ * refuse `scanning`, so a redelivered signal recovers a `scanning` strand. It
+ * is `extracting` that was genuinely unreachable by every door (the generic
+ * path refuses it `parse_defer_only`, `defer_ashby_ingestion_parse` takes only
+ * two parse-availability reasons, and the operator recovery demands
+ * `failed_review`). The honest claim is "stalled until a re-observation that
+ * may never come" — the incident's own rows sat 2h42m because none came.
  *
  * `structuring` is a mid-flight state and is deliberately NOT here. It is
  * POST-PERSIST: `resume-ingestion.ts` runs `onState('structuring')` ->
@@ -164,16 +173,18 @@ export const MIDFLIGHT_INGESTION_STATES: ReadonlySet<string> = new Set([
  * instead of fixing it automatically — `ingestion_stuck_structuring` counts it
  * and degrades /health, and a human decides.
  *
- * That answer only works if the row actually STAYS in `structuring`. An
- * earlier revision of this file left it out of both sets, so it fell through
- * the entry-transition refusal below into `restOrEscalate` — and because
- * `structuring -> failed_review` IS a legal edge, the rest landed. That was
- * strictly worse than the bug being fixed: the row left `structuring` within
- * one lease (~60-120s), roughly 780s BEFORE its 900s stuck window could open,
- * so the counter built to make it visible could never fire; and it landed on
- * `ingestion_entry_refused`, which this PR added to the audited recovery
- * allowlist, so an operator could re-drive it straight into the trap the
- * exclusion exists to prevent.
+ * SCOPE, stated honestly: in the PR as it now stands nothing writes on the
+ * entry-refusal path either, so a `structuring` row stays put with or without
+ * this guard. Its only observable effect is skipping one scanner probe and one
+ * refused transition — which is exactly what its test asserts
+ * (`entryRefusals === 0`), because "the row survived" would prove nothing.
+ *
+ * It is kept because the WIDER version of this PR — which did rest the row
+ * here — demonstrated what happens without it: the row left `structuring`
+ * within one lease (~60-120s), roughly 780s BEFORE its 900s stuck window could
+ * open, so the counter built to make it visible could never fire. The guard is
+ * the thing that makes "count it, never touch it" true by construction rather
+ * than by the accident of no other path writing.
  */
 export const UNRESCUABLE_MIDFLIGHT_STATES: ReadonlySet<string> = new Set([
   'structuring',
@@ -638,10 +649,20 @@ export function buildAshbyHandlers(
         // it; this branch is test-only in practice (the production store
         // always provides the seam).
         if (!runtime.stores.resumeIngestionMidflight) return;
-        // A transport failure here must not dead-letter the job with the row
-        // still stranded and no reason recorded — that is the original
-        // incident's durable symptom. Mirror the `buildIngestionPorts` policy:
-        // retry, and on the LAST attempt write the reason down first.
+        // A transport failure leaves the row exactly as it is and completes
+        // the job. That is WEAKER than throwing (which would retry inside the
+        // job's budget and surface via `dlqDepth >= 1`) and it is a deliberate
+        // choice, not an oversight: the row is still mid-flight, so the new
+        // `ingestion_stuck_scanning`/`_extracting` counters see it, and the
+        // alternative this PR tried — writing a reason — is what overwrote
+        // real verdicts at four separate sites across three review rounds.
+        // Revisit when the loud-exit work lands with the verdict invariant
+        // designed in.
+        //
+        // (An earlier revision of this comment claimed the code retried and
+        // recorded the reason on the last attempt. It did neither — a comment
+        // describing a policy the code does not implement is worse than no
+        // comment, because it stops the next reader checking.)
         let resumed: { status: string };
         try {
           resumed = await runtime.stores.resumeIngestionMidflight(
