@@ -107,8 +107,40 @@ primary_region = "sin"
   # still governed by the local endpointing bounds below. DORMANT as the turn-gate
   # unless PHONE_TURN_DETECTION is flipped back to "stt". ENV-REVERTIBLE without a
   # code change (revert to 9/31 by resetting these two vars).
-  PHONE_SARVAM_NEGATIVE_FRAMES_COUNT = "18"
-  PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW = "24"
+  #
+  # ── BACKGROUND SPEECH + GARBLING RETUNE (owner report, 2026-09-16) ────────
+  # Two symptoms, ONE counter, pulling in opposite directions:
+  #   * "the stt picks up noises and words from the background"
+  #   * "the stt still garbled some conversation"
+  #
+  # NEGATIVE_SPEECH_THRESHOLD is the speech/silence DECISION boundary and was
+  # left UNSET (Sarvam default 0.45) by the A/B above — deliberately, because
+  # that A/B only moved the timing window. It is the lever for background
+  # SPEECH: a voice across the room is attenuated, so raising the bar stops it
+  # opening a segment. Raised 0.45 -> 0.55, a half-step on purpose.
+  #
+  # But raising it ALSO makes the candidate's own low-energy frames count as
+  # silence, so the negative-frame count fills FASTER and segments close
+  # sooner — which is the garbling mechanism the 9/31 revert above documents
+  # ("frontend" -> "Friends"). COUNT is therefore raised in step, 18 -> 22, so
+  # the silence floor goes 576ms -> 704ms and more than absorbs what the
+  # threshold took away. WINDOW moves 24 -> 28 to preserve the SAME 6-frame
+  # in-clause blip tolerance (window - count).
+  #
+  # Cost: ~4 frames x 32ms = ~128ms added to speech_end_to_final_transcript.
+  # In "local" turn mode Sarvam is not the turn-gate, so this is transcript
+  # CLOSE latency, and the SDK flushes + waits for the final rather than
+  # committing an empty turn (audio_recognition.py: `_run_eou_detection`
+  # returns early with no transcript, and `_commit_user_turn` pushes silence to
+  # flush) — so the extra wait cannot make the bot answer a half-heard
+  # sentence.
+  #
+  # IF GARBLING PERSISTS: raise COUNT further (and WINDOW with it), do NOT drop
+  # the threshold first — garbling is the worse symptom. If a soft candidate
+  # goes unheard: lower the threshold. Revert pair is 0.45-unset / 18 / 24.
+  PHONE_SARVAM_NEGATIVE_SPEECH_THRESHOLD = "0.55"
+  PHONE_SARVAM_NEGATIVE_FRAMES_COUNT = "22"
+  PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW = "28"
   SARVAM_TTS_MODEL = "bulbul:v3"
   SARVAM_TTS_VOICE = "simran"
   # Call G RCA (2026-09-08) — REVERTED "stt" -> "local". The X8 stt experiment
@@ -135,8 +167,41 @@ primary_region = "sin"
   # single answer fragmenting into several finals (the bot barging in on a
   # still-thinking candidate). MIN stays 0.3. Clamps: MIN in [0.3, 0.5], MAX in
   # [0.5, 3.0] (2.5 is well inside the reader clamp). Both env-revertible live.
+  # OWNER RETUNE 2026-09-16: MAX 2.5 -> 1.0. This manifest said 2.5 while
+  # production ran a SECRET of the same name the whole time — the owner had
+  # already moved it and the file never caught up, which is the same shadowing
+  # trap as PHONE_TTS_FLUSH_MIN_CHARS above. Reconciled here so the file is
+  # true again; see the DEPLOY NOTE at the end of this block.
+  #
+  # DIRECTION OF THE TRADE, stated because it reverses PR2a: a LOWER max makes
+  # the bot cut in sooner on a genuine mid-thought pause — that is what 1.0 ->
+  # 2.5 was raised to stop. It buys back snappier turn-taking on a clean end of
+  # speech only in the cases where the EOU judges the utterance INCOMPLETE;
+  # a complete answer still commits at MIN (0.3) regardless of MAX, so the
+  # common case is unchanged either way. Owner's call, made against live calls.
   PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC = "0.3"
-  PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC = "2.5"
+  PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC = "1.0"
+
+  # ═══ DEPLOY NOTE — FOUR SECRETS MUST BE UNSET, AND ONLY AFTER THE DEPLOY ═══
+  # These four values were tuned live, as Fly SECRETS, so they could be changed
+  # without a deploy while listening to a call:
+  #
+  #   PHONE_SARVAM_NEGATIVE_SPEECH_THRESHOLD   0.55
+  #   PHONE_SARVAM_NEGATIVE_FRAMES_COUNT       22
+  #   PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW      28
+  #   PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC   1.0
+  #
+  # A secret SHADOWS the `[env]` value of the same name, so until they are
+  # unset THIS FILE IS DOCUMENTATION, NOT CONFIGURATION — which is exactly the
+  # state that made the manifest lie about the endpointing max and about
+  # PHONE_TTS_FLUSH_MIN_CHARS before it.
+  #
+  # ORDER MATTERS, and getting it backwards silently reverts the tuning:
+  #   1. deploy this file (the `[env]` values land but stay shadowed);
+  #   2. THEN `fly secrets unset <name> -a project-hello-phone-voice` for each.
+  # Unsetting FIRST drops production back to the previous `[env]` numbers
+  # (0.45-unset / 18 / 24 / 2.5) until the deploy completes.
+  # ═════════════════════════════════════════════════════════════════════════
   # ── Coverage JUDGE provider (Call G, 2026-09-08) ─────────────────────────────
   # Point the off-speech-path coverage judge at DeepSeek V4-Flash with reasoning
   # DISABLED (owner request), replacing Gemini gemini-3.5-flash-lite. The judge

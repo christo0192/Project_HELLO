@@ -204,10 +204,21 @@ suppressed:
 
 1. `queue_not_draining` — `oldestPendingAgeSec > 900`;
 2. `scanner_<reason>` — attribution from the scanner view;
-3. `ingestion_stuck` — the durable row has been `queued` past the window.
+3. `ingestion_stuck` — the durable row has been `queued`, `fetching`,
+   `scanning`, `extracting` or `structuring` past the window (0097 added the
+   last three; see the ingestion-delivery-recovery runbook for which one means
+   what — they need different actions and one of them must not be requeued).
 
 `ingestion_stuck` is **not** suppressed when the scanner is the cause. It is
 loud and right, and the `scanner_*` reason beside it supplies the attribution.
+
+One interaction worth knowing: the scanner gate refuses to CLAIM an
+`ashby.ingestion` job at all while ClamAV freshness fails, and 0097's mid-flight
+rescue runs inside that same handler. So a broken scanner also blocks the
+rescue of rows stranded in `scanning`/`extracting` — even though the rescue
+itself is a pure database call needing no scanner. The counters still fire, so
+the strand is visible rather than silent, but do not expect it to self-heal
+until the scanner is healthy again.
 An admission gate that quietly hid work would be strictly worse than the
 loud-but-permanent failure it replaced.
 
