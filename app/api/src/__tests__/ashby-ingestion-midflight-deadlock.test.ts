@@ -89,6 +89,10 @@ interface World {
   midflightResult: { status: string; attempts?: number };
   omitMidflightSeam?: boolean;
   midflightThrows?: boolean;
+  /** Make every `-> failed_review` write refuse, so the rest cannot land. */
+  restRefused?: boolean;
+  /** Make `readIngestion` throw, as a transport error really does. */
+  readThrows?: boolean;
 }
 
 function newWorld(over: Partial<World> = {}): World {
@@ -106,8 +110,17 @@ function newWorld(over: Partial<World> = {}): World {
 function runtimeFor(world: World) {
   const stores: Record<string, unknown> = {
     readLink: async () => world.link,
-    readIngestion: async () => ({ ...world.ingestion }),
+    readIngestion: async () => {
+      // A real transport error THROWS (`ashby_ingestion_read_error`); `null` is
+      // the distinct "no row" answer. Modelling both is what makes the
+      // fail-closed assertion below possible at all.
+      if (world.readThrows) throw new Error('ashby_ingestion_read_error');
+      return { ...world.ingestion };
+    },
     advanceIngestion: async (_id: string, state: string, prov?: { failedReason?: string }) => {
+      if (world.restRefused && state === 'failed_review') {
+        return { status: 'invalid_transition' };
+      }
       const from = world.ingestion.state;
       if (from !== state && !(ALLOWED[from] ?? []).includes(state)) {
         if (state === 'fetching') world.entryRefusals += 1;
@@ -359,6 +372,57 @@ describe('an already-rested row keeps its verdict — the laundering regression'
       expect(world.ingestion.failedReason).toBe(verdict);
     },
   );
+});
+
+describe('the rest primitive itself cannot fail quietly', () => {
+  it('THROWS when the rest could not land, instead of completing the job', async () => {
+    // `restOrEscalate`'s whole reason to exist is this branch: a rest that
+    // does not land and is not escalated is a job that reports success having
+    // neither done the work nor recorded why — the original defect. Without
+    // this test, deleting the `throw` leaves the suite green.
+    const world = newWorld({
+      ingestion: { state: 'scanning', attempts: 1, failedReason: null },
+      midflightResult: { status: 'invalid_state' },
+      restRefused: true,
+    });
+    await expect(run(world)).rejects.toThrow(/ashby_ingestion_rest_failed/);
+    expect(world.ingestion.failedReason).toBeNull();
+  });
+
+  it('FAILS CLOSED when the guarding read throws — it never writes on a guess', async () => {
+    // The read decides whether a live ingestion gets written off and whether a
+    // verdict survives. Collapsing a transport error to `null` (the old
+    // `.catch(() => null)`) would skip every guard and rest the row anyway.
+    const world = newWorld({
+      ingestion: { state: 'scanning', attempts: 1, failedReason: null },
+      midflightResult: { status: 'invalid_state' },
+      readThrows: true,
+    });
+    await expect(run(world)).rejects.toThrow(/ashby_ingestion_read_error/);
+    expect(world.transitions).toEqual([]);
+  });
+
+  it('leaves a verdict alone even when the refusal arrives from the RESCUE', async () => {
+    // `invalid_state` is what the RPC returns precisely when the row moved out
+    // from under us — including to `failed_review/scan_infected`. This is the
+    // path that wrote unguarded before the guard moved into the primitive.
+    const world = newWorld({
+      ingestion: { state: 'scanning', attempts: 1, failedReason: null },
+      midflightResult: { status: 'invalid_state' },
+    });
+    // The row is rested by "another worker" the moment the rescue is asked.
+    const runtime = runtimeFor(world);
+    const stores = (runtime as unknown as { stores: Record<string, unknown> }).stores;
+    const original = stores.resumeIngestionMidflight as (l: string, r: string) => Promise<unknown>;
+    stores.resumeIngestionMidflight = async (l: string, r: string) => {
+      const out = await original(l, r);
+      world.ingestion = { state: 'failed_review', attempts: 1, failedReason: 'scan_infected' };
+      return out;
+    };
+    await buildAshbyHandlers(runtime as never, { nowMs: () => NOW })[ASHBY_INGESTION_QUEUE]!(job());
+    expect(world.ingestion.failedReason).toBe('scan_infected');
+    expect(requeueRefused(world.ingestion.failedReason)).toBe(true);
+  });
 });
 
 describe('the entry transition never completes a job in silence again', () => {

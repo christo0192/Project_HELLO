@@ -667,11 +667,34 @@ export function buildAshbyHandlers(
       };
 
       /**
-       * Rest the row, and if the rest could not land, THROW so the queue
-       * retries and ultimately dead-letters. A job that completes having
-       * neither done the work nor recorded why is the original defect.
+       * Rest the row — but NEVER over a row that already says something true —
+       * and if the rest could not land, THROW so the queue retries and
+       * ultimately dead-letters. A job that completes having neither done the
+       * work nor recorded why is the original defect.
+       *
+       * THE GUARD LIVES HERE, not at the call sites. An earlier revision
+       * guarded only the two paths whose refusal came from `advanceIngestion`,
+       * and the rescue-refusal path (`invalid_state`, which the RPC returns
+       * PRECISELY when the row moved out from under us) wrote unguarded — so
+       * a row that another worker had just rested `failed_review/scan_infected`
+       * had its verdict replaced, which is the laundering bug in the code
+       * written to fix the laundering bug. Making the guard part of the
+       * primitive means a new call site cannot reintroduce it.
+       *
+       * The read FAILS CLOSED. `readIngestion` answers `null` for "no row" and
+       * THROWS on a transport error, so catching would collapse a failed read
+       * into "no opinion" and write on a guess. This read guards a security
+       * property; a throw here is a retry, which is the correct outcome.
        */
       const restOrEscalate = async (reason: string): Promise<void> => {
+        const settled = await runtime.stores.readIngestion(linkId);
+        // Already terminal: the application is gone, there is nothing to rest.
+        if (settled && TERMINAL_INGESTION_STATES.has(settled.state)) return;
+        // Already rested: the reason it carries is the truthful record, and
+        // overwriting it would launder a verdict into a requeueable code.
+        if (settled?.state === 'failed_review') return;
+        // Stranded but unsafe to touch: the health counter is the signal.
+        if (settled && UNRESCUABLE_MIDFLIGHT_STATES.has(settled.state)) return;
         if (await failIngestion(reason)) return;
         throw new Error(`ashby_ingestion_rest_failed_${reason}`);
       };
@@ -803,29 +826,15 @@ export function buildAshbyHandlers(
         // anywhere. The mid-flight rescue above now removes the cause; this
         // records whatever is left so the next unknown refusal is visible on
         // the FIRST occurrence instead of being inferred from a silent row.
-        const settled = await runtime.stores.readIngestion(linkId).catch(() => null);
-
-        // A concurrent cancel is one benign case: the row is terminal, the
-        // application is gone, and there is genuinely nothing to rest.
-        if (settled && TERMINAL_INGESTION_STATES.has(settled.state)) return;
-
-        // AN ALREADY-RESTED ROW IS THE OTHER, AND IT MUST NOT BE OVERWRITTEN.
-        // `failed_review` is not terminal, `failed_review -> failed_review` is
-        // a same-state no-op the trigger waves through, and the RPC rewrites
-        // `failed_reason` UNCONDITIONALLY. Writing here would replace a
-        // VERDICT — `scan_infected`, `guard_*`, `parse_bad_output` — with a
-        // machine-class code, and `advance_ashby_ingestion`'s verdict refusal
-        // would then permit the requeue it exists to forbid: the pipeline
-        // would re-download and re-scan a file already judged infected. It
-        // would also drop the row out of `ingestion_failed_parse` and out of
-        // `recover_ashby_ingestion_parse`'s exact-match allowlist. The row
-        // already carries a truthful reason; leaving it alone IS the record.
-        if (settled?.state === 'failed_review') return;
-
-        // ...and the same for a row that reached `structuring` in the window:
-        // resting it would both kill its counter and make it re-drivable into
-        // the 0084 trap.
-        if (settled && UNRESCUABLE_MIDFLIGHT_STATES.has(settled.state)) return;
+        //
+        // The terminal / already-rested / unsafe-to-touch cases are handled
+        // inside `restOrEscalate` so no call site can forget them. The one
+        // decision that cannot live there is the DEFERRAL below, because it
+        // returns a queue directive rather than resting.
+        //
+        // This read fails CLOSED for the same reason that one does: it decides
+        // whether a live ingestion gets written off.
+        const settled = await runtime.stores.readIngestion(linkId);
 
         // The row became mid-flight between the read at the top of this handler
         // and here — another worker started it inside our scanner-gate window.
@@ -1020,13 +1029,8 @@ export function buildAshbyHandlers(
           }
           // Every OTHER refusal used to return bare, leaving the row parked in
           // `scanning` with the job reporting success — the same silent-loss
-          // shape 0097 exists to close. A cancelled application is one benign
-          // case; an already-rested row is the other, and overwriting its
-          // reason would launder a verdict into a requeueable code (see the
-          // entry-transition path above for the full argument).
-          const settled = await runtime.stores.readIngestion(linkId).catch(() => null);
-          if (settled && TERMINAL_INGESTION_STATES.has(settled.state)) return;
-          if (settled?.state === 'failed_review') return;
+          // shape 0097 exists to close. The terminal / already-rested /
+          // unsafe-to-touch cases are all handled inside `restOrEscalate`.
           await restOrEscalate(DEFER_REQUEUE_REFUSED_REASON);
           return;
         }
