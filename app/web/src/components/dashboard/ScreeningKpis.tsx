@@ -101,11 +101,18 @@ function dayLabel(ymd: string): string {
  */
 export function buildRateSeries(
   rows: FunnelDailyRow[],
-  num: (row: FunnelDailyRow) => number,
-  den: (row: FunnelDailyRow) => number,
+  num: (row: FunnelDailyRow) => number | undefined,
+  den: (row: FunnelDailyRow) => number | undefined,
 ): Array<{ label: string; value: number }> {
   return rows
-    .map((row) => ({ label: dayLabel(row.cohort_day), value: pct(num(row), den(row)) }))
+    .map((row) => ({
+      label: dayLabel(row.cohort_day),
+      // The accessors may return `undefined`: this route DELETES fields from a
+      // series row. An absent denominator falls to 0, which `pct` reports as
+      // unknown and the filter then drops — the same answer as a real zero
+      // denominator, and the right one.
+      value: pct(num(row) ?? 0, den(row) ?? 0),
+    }))
     .filter((p): p is { label: string; value: number } => p.value !== null);
 }
 
@@ -306,8 +313,10 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
   );
 
   const rateSeries = useCallback(
-    (num: (row: FunnelDailyRow) => number, den: (row: FunnelDailyRow) => number) =>
-      buildRateSeries(seriesRows, num, den),
+    (
+      num: (row: FunnelDailyRow) => number | undefined,
+      den: (row: FunnelDailyRow) => number | undefined,
+    ) => buildRateSeries(seriesRows, num, den),
     [seriesRows],
   );
 
