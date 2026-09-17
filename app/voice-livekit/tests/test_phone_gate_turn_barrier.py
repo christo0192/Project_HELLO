@@ -444,8 +444,8 @@ class TestInterruptionTuningIsSet(unittest.TestCase):
             # discarded, so a floor of 2 meant two words of backchannel could
             # cut the bot off. THREE and not four — four would also silence
             # "can you repeat" and would bank a short direct answer instead of
-            # delivering it. See tests/test_barge_in_bank.py for the transcript
-            # evidence and the second half of the repair.
+            # delivering it. See tests/test_barge_in_bank.py for the
+            # transcript evidence.
             ("PHONE_MIN_INTERRUPTION_WORDS",
              phone.phone_min_interruption_words, 3),
             ("PHONE_MIN_INTERRUPTION_DURATION_SEC",

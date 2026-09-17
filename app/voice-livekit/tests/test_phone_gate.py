@@ -2674,13 +2674,84 @@ class TestAnswerClassifier(unittest.TestCase):
                     "a consenting candidate would be hung up on")
 
     def test_the_emphatic_refusal_clause_still_refuses_no_and_never(self):
+        """`absolutely against it` is NOT here, and that is deliberate.
+
+        A clause for `against …` was added on 2026-09-17 and removed the same
+        day. Its negation guard has to be a lookbehind, lookbehinds in Python
+        are fixed-width, and a fixed-width lookbehind sees only the token
+        immediately before — so "not AT ALL against it" walked past it and
+        ended the call on twelve verified consenting turns. A veto that needs
+        whole-clause negation scope cannot live in a substring match.
+
+        So `absolutely against it` is a re-ask, exactly as it is on main. That
+        is a known gap, and it is the safe side of the trade.
+        """
         for text in (
             "absolutely no", "definitely no", "certainly never",
-            "absolutely never okay", "absolutely against it",
+            "absolutely never okay",
         ):
             with self.subTest(text=text):
                 self.assertEqual(
                     agent_mod.classify_answer_text(text), phone.CLASSIFY_REFUSED)
+
+    def test_an_intensified_negation_followed_by_a_yes_does_not_end_the_call(self):
+        """"Absolutely not, please carry on" means "absolutely no objection".
+
+        The clause-final branch of the polarity lookahead first accepted ANY
+        punctuation, so a comma followed by an explicit consent still ended the
+        call — six verified turns, all HUMAN on main. It now requires the END
+        of the turn.
+        """
+        for text in (
+            "absolutely not, please carry on", "absolutely not, go ahead",
+            "definitely not, it is fine with me", "certainly not! please continue",
+            "absolutely not. I'm happy to proceed",
+            "absolutely not, that's no problem at all",
+        ):
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_REFUSED,
+                    "a consenting candidate would be hung up on")
+
+    def test_an_adverb_between_the_negation_and_the_veto_never_ends_the_call(self):
+        """The regression class that killed the `against`/`un-` clauses."""
+        for text in (
+            "yes I'm not at all uncomfortable", "yes I am not at all against it",
+            "sure I am not really uncomfortable with that",
+            "okay I have nothing at all against the recording",
+            "okay I'm not in the least uncomfortable",
+            "yes I am not remotely against being recorded",
+            "sure I was never against it",
+            "yes I'm never uncomfortable with these things",
+            "absolutely nothing uncomfortable about it",
+            "yes I have no issue whatsoever against it",
+        ):
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_REFUSED,
+                    "a consenting candidate would be hung up on")
+
+    def test_an_uncontracted_do_not_mind_consents_like_the_contracted_one(self):
+        """`don't mind` was a head and `do not mind` was a conflict -> re-ask."""
+        for text in (
+            "I don't mind being recorded", "I do not mind being recorded",
+            "sure I do not mind the recording",
+            "yes I do not mind if you record it",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN)
+
+    def test_a_contracted_refusal_of_the_recording_is_never_consent(self):
+        """`\bn't\b` can never match inside "don't" — the alternative was dead."""
+        for text in (
+            "sure but I won't be recorded",
+            "yes but I can't agree to the recording",
+            "Absolutely not, I don't want this recorded",
+        ):
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN)
 
     def test_the_widened_frame_did_not_widen_the_backtracking_surface(self):
         """The filler run gained ~15 alternatives inside a `{0,4}` repetition.

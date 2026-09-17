@@ -1768,7 +1768,12 @@ _REFUSED_RE = re.compile(
     # "right, but I'd rather you didn't record this" both became HUMAN, which
     # is the worst failure this gate has — consent inferred where it was
     # refused. These clauses run first and are deliberately not anchored.
-    r"do(?:n't| not)\s+(?:want\s+(?:to\s+be\s+|me\s+to\s+be\s+)?)?record|"
+    # The object slot accepts a determiner: "I don't want THIS recorded" is as
+    # common as "I don't want to be recorded", and without it the only clause
+    # that refused that turn was the intensified-negation one — which correctly
+    # stopped firing once it was restricted to end-of-turn.
+    r"do(?:n't| not)\s+(?:want\s+(?:to\s+be\s+|me\s+to\s+be\s+|"
+    r"this\s+|that\s+|it\s+|any\s+|the\s+)?)?record|"
     r"(?:did|would|could)(?:n't| not)\s+(?:want\s+)?(?:to\s+be\s+)?record|"
     r"rather\s+(?:you\s+)?(?:did\s*n[o']?t|not)\b|"
     # The article matters: "not THE recording part" is the commonest way to
@@ -1827,7 +1832,12 @@ _REFUSED_RE = re.compile(
     # "certainly never" were false consents on main as well.
     r"\b(?:absolutely|definitely|certainly|totally|completely)\s+"
     r"(?:not|no|never)\b"
-    r"(?=\s*[.,;!?]|\s*$|\s+(?:okay|ok|fine|comfortable|interested|willing|"
+    # END OF TURN, not "any punctuation". The first version accepted
+    # `\s*[.,;!?]`, so "absolutely not, please carry on" — an ordinary
+    # Indian-English yes meaning "absolutely no objection" — ended the call.
+    # A trailing full stop still counts as the end; a comma followed by more
+    # words does not.
+    r"(?=\s*[.!?]*\s*$|\s+(?:okay|ok|fine|comfortable|interested|willing|"
     r"possible|acceptable|happening|allowed|going\s+to))|"
     # ── HINDI, because the affirmative vocabulary is bilingual ───────────
     # `bilkul`, `ji`, `haan` and `theek` are affirmative HEADS, so the same
@@ -1844,11 +1854,19 @@ _REFUSED_RE = re.compile(
     r"\b(?:bilkul|ji|haan|han|theek|thik)\s+(?:bhi\s+)?nah[ií]+n?\b|"
     r"^\s*nah[ií]+n?\b(?!.*\b(?:koi\s+baat|koi\s+(?:problem|dikkat|aitraaz)|"
     r"theek\s+hai|bilkul\s+theek))|"
-    # The non-negation forms of the same emphatic refusal, which the clause
-    # above cannot see because they carry no `not`/`no`/`never`.
-    r"(?<!not )(?<!n't )(?<!nothing )"
-    r"\bagainst\s+(?:it|this|that|the\s+record|being\s+record)|"
-    r"(?<!not )(?<!n't )\b(?:un(?:willing|comfortable))\b|"
+    # ── `against` AND `un(willing|comfortable)` ARE DELIBERATELY ABSENT ──
+    # Both were added here on 2026-09-17 and both are now removed. A fixed-
+    # width lookbehind sees only the IMMEDIATELY preceding token, so one adverb
+    # walked straight past it: "not AT ALL uncomfortable", "not REALLY against
+    # it", "nothing AT ALL against the recording" — 12 verified turns where a
+    # candidate said yes and got `disclosure.refused`, terminal, first turn, no
+    # re-ask. Every one of them is HUMAN on main.
+    #
+    # Python cannot express the guard these need (`(?<!\bnot\b(?:\s+\w+){0,3}\s)`
+    # is variable-width), and that is the tell: a veto that needs
+    # whole-clause negation scope does not belong in a pattern that matches a
+    # substring. "I am uncomfortable" is also a weak signal on its own — it is
+    # what a candidate says about a chair. It is not worth a hang-up.
     # ── ANCHORED: a bare "no" only refuses when it OPENS the answer. The
     #    lookahead keeps "no problem/issues/worries" — ordinary ways of saying
     #    YES — from ending the call, while "no thanks" still refuses.
@@ -2007,10 +2025,18 @@ _AMBIGUOUS_RE = re.compile(
 #: problem" are `no`/`not` beside a recording word and must NOT be downgraded.
 _RECORDING_TOKEN = r"(?:record(?:s|ed|er|ers|ing|ings)?|tape[ds]?|taping)"
 _RECORDING_NEGATOR = (
-    r"(?:no|not|n't|never|without|stop|stopped|avoid|delete|remove|off|"
-    r"cancel|disable|mat|nah[ií]+n?|band|bina)"
+    # The contractions are spelled out. `n't` alone can NEVER match inside
+    # `\b...\b`: there is no word boundary between the `o` of "don" and the
+    # `n` of "n't", so the alternative was dead and the coverage the comment
+    # claimed did not exist.
+    r"(?:no|not|never|without|stop|stopped|avoid|delete|remove|off|"
+    r"cancel|disable|mat|nah[ií]+n?|band|bina|"
+    r"(?:do|does|did|wo|ca|is|are|was|were|would|could|should|ai)n'?t)"
+    # `mind` and `dikkat` belong with the other positive nouns: "I do not mind
+    # being recorded" and "recording mein koi dikkat nahi" are consents, and
+    # without them the rule downgraded both to a re-ask.
     r"(?!\s+(?:an?\s+)?(?:objection|objections|problem|problems|issue|issues|"
-    r"worries|worry|doubt|trouble|concern|concerns|hassle))"
+    r"worries|worry|doubt|trouble|concern|concerns|hassle|mind|dikkat))"
 )
 _RECORDING_CONFLICT_RE = re.compile(
     rf"\b{_RECORDING_NEGATOR}\b(?:\W+\w+){{0,4}}\W+{_RECORDING_TOKEN}\b"

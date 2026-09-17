@@ -141,10 +141,9 @@ _KEY_TYPE_NUMBER: frozenset[str] = frozenset({
     "port",
     "turn_index",
     "duration_sec",
-    # FIX (2026-09-17): a bounded COUNT. Two call sites already passed
-    # `option_count=` — `phone_sarvam_vad_config` since 2026-09-12 and the new
-    # `phone_barge_in_bank_dropped` line — and the allowlist silently dropped
-    # both, so each shipped a comment describing a number that was never
+    # FIX (2026-09-17): a bounded COUNT. `phone_sarvam_vad_config` has passed
+    # `option_count=` since 2026-09-12 and the allowlist silently dropped it,
+    # so that line has always shipped a comment describing a number it never
     # emitted. Same failure the `rejection_reason`/`phase` note above records.
     "option_count",
 })

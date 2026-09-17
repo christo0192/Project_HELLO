@@ -1684,7 +1684,7 @@ def phone_min_interruption_words() -> int:
     barged-in and truncated, and 2026-09-12 (session ffab6c2a) cut off "Ah, got
     it" and "Perfect, so you could" with the candidate silent both times.
 
-    ── RAISED 2 -> 4 ON 2026-09-17, AND WHY THE OLD REASONING WAS WRONG ──
+    ── RAISED 2 -> 3 ON 2026-09-17, AND WHY THE OLD REASONING WAS WRONG ──
     The previous value was two, on the argument that "a single filler token
     ('um', 'oh') is exactly what a false trigger transcribes as", and that
     "nothing is lost by waiting for the second: the SDK keeps the audio and
@@ -1717,19 +1717,17 @@ def phone_min_interruption_words() -> int:
     repeat" (3), "wait wait wait" (3), "repeat that please" (3). Those are
     exactly the interruptions a candidate most needs when the line is bad.
 
-    Four also made things WORSE in a way three does not. A short DIRECT answer
-    — "Yes I am" (3) — would have been banked rather than delivered, and the
-    stale-bank repair below would then have been free to discard it. At three
-    it commits and interrupts, as it did before this change. The floor and the
-    bank repair have to be chosen together or the pair destroys answers that
-    neither would destroy alone.
+    Four also made things WORSE in a way three does not: a short DIRECT answer
+    — "Yes I am" (3) — would have been banked rather than delivered. At three
+    it commits and interrupts, as it did before this change.
 
     The upper bound is raised from 5 to 8 so an operator can go further without
     a deploy; 0 restores the SDK default (raw VAD energy), which is the
     2026-09-10 Praveetha failure and is a rollback lever only.
 
-    This is HALF the fix. The floor decides how big the bank must be; it does
-    not stop the bank surviving a silence. See `phone_barge_in_bank_max_age_sec`.
+    This is the WHOLE fix. An attempt to also bound how long the bank survives
+    was built three times and removed three times — see the block comment
+    above this function for why the cure was worse than the disease.
     """
     return _bounded_int_env(os.getenv("PHONE_MIN_INTERRUPTION_WORDS"), 3, 0, 8)
 

@@ -38,9 +38,6 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 import phone  # noqa: E402
 
 
-#: The SDK release whose `AudioRecognition` internals `phone.py` reaches into.
-#: Bumping the pin without re-reading those fields is the failure this guards.
-_VERIFIED_SDK_VERSION = "1.6.4"
 
 
 
