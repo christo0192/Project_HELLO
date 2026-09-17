@@ -440,8 +440,14 @@ class TestInterruptionTuningIsSet(unittest.TestCase):
 
     def test_the_defaults_require_words_and_are_rollbackable(self):
         for name, fn, default in (
+            # RAISED 2 -> 3 on 2026-09-17: a refused fragment is BANKED, not
+            # discarded, so a floor of 2 meant two words of backchannel could
+            # cut the bot off. THREE and not four — four would also silence
+            # "can you repeat" and would bank a short direct answer instead of
+            # delivering it. See tests/test_barge_in_bank.py for the
+            # transcript evidence.
             ("PHONE_MIN_INTERRUPTION_WORDS",
-             phone.phone_min_interruption_words, 2),
+             phone.phone_min_interruption_words, 3),
             ("PHONE_MIN_INTERRUPTION_DURATION_SEC",
              phone.phone_min_interruption_duration_sec, 0.8),
         ):

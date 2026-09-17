@@ -2347,6 +2347,428 @@ class TestAnswerClassifier(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN)
 
+    # ── 2026-09-17: the consent gate hung up on a consenting human ────────
+    #
+    # Rijo's call, `outcome_class = 'voicemail'`, ended 46 s in. He said "it's
+    # absolutely fine to continue". The head `fine` was already in the
+    # vocabulary; what defeated it was the two words in FRONT of it, because
+    # `_AFFIRMATIVE_RE` is `^`-anchored behind a CLOSED filler run. Widening
+    # vocabulary would not have fixed this and did not need to:
+    #
+    #     'absolutely fine to continue'       -> HUMAN   (before and after)
+    #     "it's absolutely fine to continue"  -> None     (before) / HUMAN (after)
+
+    #: 52 ordinary ways to say yes to "is it okay to continue?". Before this
+    #: change 21 of them returned None, which re-asks once and then classifies
+    #: MACHINE and ends the call. Each is a COMPLETE answer to the question —
+    #: not an acknowledgement of the sentence before it, which belongs in the
+    #: re-ask bucket and is why `right`/`good`/`cool` are deliberately absent.
+    CONSENT_YES_CORPUS = (
+        "it's absolutely fine to continue", "It is absolutely fine to continue",
+        "absolutely fine to continue", "that's absolutely fine", "it's absolutely fine",
+        "Yes, please go ahead", "Yeah sure, please continue", "You can continue",
+        "Please continue", "Yes you may proceed", "I'm okay with that",
+        "I am fine with that", "That is completely fine", "Completely fine",
+        "Totally fine", "It's totally okay", "Absolutely", "Absolutely yes",
+        "Sure, no problem at all", "No problem at all", "Not a problem",
+        "That's alright with me", "I have no objection", "I don't have any objection",
+        "I'm happy to continue", "Happy to proceed", "Yes that's fine with me",
+        "Fine by me", "Fair enough", "Sounds good to me", "Very much okay",
+        "Yes ma'am", "Yes please", "Please do", "Go ahead please", "Kindly proceed",
+        "Yes, kindly continue", "Ok fine", "Okay okay", "Yes yes yes", "Haan ji",
+        "Ji bilkul", "Bilkul", "Theek hai ji", "Yes, I'm comfortable",
+        "I'm comfortable with it", "No issues at all", "All good", "Yes go on",
+        "Carry on please", "Yes, understood, please continue", "Sure thing",
+    )
+
+    #: The counterweight, and the one that matters more. Consent inferred where
+    #: it was REFUSED is the worst failure this gate has, so every widening of
+    #: the affirmative frame is pinned against a corpus built to break it:
+    #: refusals that OPEN affirmatively, refusals that use the new filler
+    #: tokens as their own first word, deferrals, and opt-outs.
+    CONSENT_NOT_YES_CORPUS = (
+        "No", "Nope", "No thanks", "I'm not interested", "I am not interested",
+        "I'll pass", "absolutely not", "Absolutely not, I don't want this recorded",
+        "definitely not", "certainly not", "totally not okay",
+        "completely not comfortable", "I'm not comfortable with this",
+        "I'm not comfortable being recorded", "That's not okay", "I'm not sure",
+        "I would rather not", "Please don't record this", "No recording please",
+        "Don't call me again", "Stop calling me", "Remove my number",
+        "Take me off your list", "I object to being recorded", "I decline",
+        "I refuse", "Not the recording part", "No problem, but I'll pass",
+        "Right, but I'd rather you didn't record this", "Can you call me back",
+        "Who is this", "I'm driving", "I'm busy", "Not now", "Maybe later",
+        "Hold on", "One second", "Leave me alone", "What is this about",
+        "I am in a meeting", "This is not a good time", "I'm not okay with that",
+        "We are not interested",
+    )
+
+    def test_the_subject_pronoun_no_longer_defeats_the_head(self):
+        """The Rijo regression, reduced to the one word that decided it."""
+        for text in (
+            "it's absolutely fine to continue",
+            "It is absolutely fine to continue",
+            "that's absolutely fine",
+            "I'm okay with that",
+            "That is completely fine",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN)
+
+    def test_every_natural_yes_is_read_as_consent(self):
+        for text in self.CONSENT_YES_CORPUS:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
+                    "a consenting human would be re-asked and then hung up on")
+
+    def test_no_refusal_deferral_or_opt_out_is_ever_read_as_consent(self):
+        for text in self.CONSENT_NOT_YES_CORPUS:
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
+                    "consent inferred where it was not given")
+
+    def test_an_emphatic_refusal_is_refused_not_consented(self):
+        """`absolutely not` was CONSENT on main, and had been for months.
+
+        `absolutely`, `definitely` and `certainly` are affirmative HEADS, and
+        the affirmative is anchored and stops at its first match. Found while
+        widening the frame; it is a pre-existing false consent, not one this
+        change introduced.
+        """
+        for text in (
+            "absolutely not", "definitely not", "certainly not",
+            "totally not okay", "completely not comfortable",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_REFUSED)
+
+    #: "YES TO THE CALL, NO TO THE RECORDING" — the shape an ANCHORED
+    #: affirmative is structurally blind to, because it matches a PREFIX and
+    #: `classify_answer_text` returns on the first match. Three of these were
+    #: false consents on main; widening the affirmative frame in this PR added
+    #: three more before the `_REFUSED_RE` clauses landed. None may be HUMAN:
+    #: proceeding means RECORDING someone who refused recording in the same
+    #: breath.
+    SPLIT_CONSENT_CORPUS = (
+        "I'm comfortable but not with the recording",
+        "Happy to talk but not to be recorded",
+        "I'm happy to continue but not with recording",
+        "I'm comfortable with the call but not the recording",
+        "Happy to proceed but please don't record",
+        "All good but no recording",
+        "Fair enough but I don't want to be recorded",
+        "Sure but not with the recording",
+        "Yes but don't record me",
+        "Okay but no recording please",
+        "That's fine but not the recording",
+        "Absolutely but please switch off the recording",
+        "Fine, but delete the recording afterwards",
+        "I'm comfortable, but I object to the recording",
+        "Bilkul, but no recording",
+    )
+
+    #: The affirmative vocabulary is BILINGUAL, so the refusal vocabulary has
+    #: to be. `bilkul`, `ji`, `haan` and `theek` are heads, and `bilkul nahi`
+    #: is the standard Hindi for "absolutely not" — the very phrase this file
+    #: refuses in English. A negative corpus written in one language inherits
+    #: that language's blind spot, exactly as one written with a single
+    #: subject form does.
+    HINDI_REFUSAL_CORPUS = (
+        "bilkul nahi", "bilkul nahin", "bilkul bhi nahi", "ji nahi",
+        "theek nahi hai", "nahi", "nahin",
+        "bilkul nahi, mujhe record nahi karna",
+    )
+
+    #: The phrasings that defeated TWO rounds of enumerating refusal clauses
+    #: into `_REFUSED_RE`, and the reason `_RECORDING_CONFLICT_RE` exists. Each
+    #: pairs an affirmative PREFIX with a recording objection the refusal
+    #: vocabulary did not contain — passive ("not being recorded"), particle-
+    #: shifted ("turn the recorder off"), or Hindi prohibitive ("record mat
+    #: karo"). None may be CONSENT; `None` (re-ask) is the right answer.
+    SPLIT_CONSENT_OPEN_CLASS = (
+        "I'm okay with the call but not being recorded",
+        "we're fine with the interview but not being recorded",
+        "comfortable talking but not being recorded",
+        "happy to speak but not to be taped",
+        "fair enough but I'm not agreeing to the recording",
+        "all good but please stop recording",
+        "completely fine but please stop recording",
+        "perfectly fine but I'd prefer you not to record",
+        "quite okay but stop recording",
+        "kindly go ahead but stop recording",
+        "yes but turn the recorder off",
+        "bilkul lekin record mat karo",
+        "koi baat nahi lekin recording mat kijiye",
+        "haan lekin recording nahi",
+        "ji haan par recording mat kijiye",
+        "theek hai lekin recording nahi chahiye",
+    )
+
+    #: The counterweight to `_RECORDING_CONFLICT_RE`. Every one of these is a
+    #: negation sitting beside a recording word AND an ordinary YES. If the
+    #: conflict rule fires on these it downgrades real consents to a re-ask,
+    #: which is why the negator carries a positive-noun lookahead.
+    #: "recording is not a problem" is deliberately absent: it opens with
+    #: "recording", which is neither a filler nor a head, so `_AFFIRMATIVE_RE`
+    #: never matches it and the answer is a re-ask on main and here alike. It
+    #: is a gap in the affirmative FRAME, not something the conflict rule did.
+    RECORDING_MENTIONED_BUT_CONSENTING = (
+        "I have no objection to the recording",
+        "no problem with the recording",
+        "I have no issue with recording",
+        "no issues at all with the recording",
+    )
+
+    def test_a_yes_to_the_call_and_no_to_the_recording_is_never_consent(self):
+        for text in self.SPLIT_CONSENT_CORPUS:
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
+                    "would start recording someone who refused recording")
+
+    def test_the_open_class_of_split_consents_resolves_to_a_re_ask(self):
+        """The structural fix, and why it is not another refusal clause.
+
+        `_AFFIRMATIVE_RE` is anchored, so it matches a PREFIX and the
+        classifier returns on the first match — a refusal later in the turn is
+        invisible to it BY CONSTRUCTION. Two rounds of enumerating phrasings
+        into `_REFUSED_RE` each closed the cases they named and opened new ones
+        in the opposite direction, because a veto broad enough for an open
+        class is broad enough to catch its own negation.
+
+        `None` is the only verdict that is safe both ways: it neither records
+        someone who objected nor hangs up on someone who consented.
+        """
+        for text in self.SPLIT_CONSENT_OPEN_CLASS:
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
+                    "would start recording someone who refused recording")
+
+    def test_the_phrasings_only_the_conflict_rule_can_reach_are_re_asks(self):
+        """The subset `_REFUSED_RE` contains no clause for at all.
+
+        Hindi prohibitives and particle-shifted English are the open class the
+        enumeration could never finish. Nothing refuses them, so without the
+        conflict rule they are CONSENT; with it they are a re-ask.
+        """
+        for text in (
+            "bilkul lekin record mat karo",
+            "koi baat nahi lekin recording mat kijiye",
+            "haan lekin recording nahi",
+            "ji haan par recording mat kijiye",
+            "theek hai lekin recording nahi chahiye",
+            "yes but turn the recorder off",
+            "all good but please stop recording",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(agent_mod.classify_answer_text(text))
+
+    def test_the_conflict_rule_does_not_downgrade_an_ordinary_yes(self):
+        """A recording word beside a negation is not automatically a conflict.
+
+        "I have no objection to the recording" is the commonest way to say yes
+        to this question and contains both halves.
+        """
+        for text in self.RECORDING_MENTIONED_BUT_CONSENTING:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN)
+
+    def test_a_negated_negative_never_ends_the_call(self):
+        """"not against it" / "not uncomfortable" are CONSENT, not refusals.
+
+        The first repair added `against …` and `un(willing|comfortable)` as
+        bare vetoes with no negation scope, and an adversarial review measured
+        8 strict HUMAN-to-REFUSED regressions: an ordinary yes ended the call,
+        with no re-ask and indistinguishable from a real refusal in the data.
+        The lookbehinds are what make these safe; `None` is acceptable here,
+        `REFUSED` is not.
+        """
+        for text in (
+            "yes I have no objection I'm not against being recorded",
+            "sure I'm not against it at all",
+            "okay I have nothing against the recording",
+            "yes absolutely I am not against this",
+            "I have nothing against it go ahead",
+            "nothing against it please carry on",
+            "yes I'm comfortable not uncomfortable at all",
+            "sure I am not uncomfortable with that",
+            "yes that's fine I'm not unwilling at all",
+            "okay I'm not uncomfortable being recorded",
+            "I'm not uncomfortable with it",
+        ):
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_REFUSED,
+                    "a consenting candidate would be hung up on")
+
+    def test_an_intensified_yes_with_an_unlisted_noun_still_consents(self):
+        """The first lookahead was a CLOSED list over an OPEN class.
+
+        "definitely not a concern" / "certainly not a hassle" were HUMAN on
+        main and became terminal refusals. The lookahead is now polarity-based
+        — clause-final, or before a negative-polarity word — so the open class
+        of positive nouns no longer has to be enumerated.
+        """
+        for text in (
+            "definitely not a concern", "certainly not a hassle",
+            "absolutely not a dealbreaker", "absolutely not a hindrance",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN)
+
+    def test_a_leading_nahi_that_introduces_reassurance_is_not_a_refusal(self):
+        """Reduplicated "nahi nahi" is standard Hindi for "no no, it's fine"."""
+        for text in ("nahi nahi koi baat nahi", "nahi koi problem nahi hai",
+                     "nahi nahi bilkul theek hai"):
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_REFUSED)
+
+    def test_hindi_refusals_are_refusals(self):
+        for text in self.HINDI_REFUSAL_CORPUS:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_REFUSED)
+
+    def test_hindi_consents_survive_the_hindi_refusal_clause(self):
+        """The counterweight. `koi baat nahi` is "no problem at all" — a YES.
+
+        This is why the Hindi refusal clause is scoped to a NEGATED HEAD or a
+        LEADING `nahi`, and not to a bare `nahi` anywhere in the turn.
+        """
+        for text in ("Bilkul", "Ji bilkul", "Haan ji", "Theek hai ji",
+                     "koi baat nahi"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN)
+
+    def test_an_intensified_yes_is_not_turned_into_a_hang_up(self):
+        """The `absolutely not` clause needs its lookahead, and shipped without it.
+
+        "Absolutely not a problem" is an ordinary YES, and `CLASSIFY_REFUSED`
+        is TERMINAL — the closing line plays, there is no re-ask, and it is
+        indistinguishable from a real refusal in the data. Without the
+        lookahead this turned 8 of 11 intensified consents into a hung-up
+        call, and for `absolutely`/`definitely`/`certainly` that was a strict
+        regression from HUMAN.
+        """
+        for text in (
+            "absolutely not a problem", "definitely not an issue",
+            "certainly not a problem at all", "totally not a problem",
+            "completely not an issue", "absolutely not a big deal",
+            "it's definitely not a problem for me",
+            "absolutely not an issue, please go ahead",
+            "absolutely no problem", "definitely no issues",
+            "certainly no objection",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
+                    "a consenting candidate would be hung up on")
+
+    def test_the_emphatic_refusal_clause_still_refuses_no_and_never(self):
+        """`absolutely against it` is NOT here, and that is deliberate.
+
+        A clause for `against …` was added on 2026-09-17 and removed the same
+        day. Its negation guard has to be a lookbehind, lookbehinds in Python
+        are fixed-width, and a fixed-width lookbehind sees only the token
+        immediately before — so "not AT ALL against it" walked past it and
+        ended the call on twelve verified consenting turns. A veto that needs
+        whole-clause negation scope cannot live in a substring match.
+
+        So `absolutely against it` is a re-ask, exactly as it is on main. That
+        is a known gap, and it is the safe side of the trade.
+        """
+        for text in (
+            "absolutely no", "definitely no", "certainly never",
+            "absolutely never okay",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_REFUSED)
+
+    def test_an_intensified_negation_followed_by_a_yes_does_not_end_the_call(self):
+        """"Absolutely not, please carry on" means "absolutely no objection".
+
+        The clause-final branch of the polarity lookahead first accepted ANY
+        punctuation, so a comma followed by an explicit consent still ended the
+        call — six verified turns, all HUMAN on main. It now requires the END
+        of the turn.
+        """
+        for text in (
+            "absolutely not, please carry on", "absolutely not, go ahead",
+            "definitely not, it is fine with me", "certainly not! please continue",
+            "absolutely not. I'm happy to proceed",
+            "absolutely not, that's no problem at all",
+        ):
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_REFUSED,
+                    "a consenting candidate would be hung up on")
+
+    def test_an_adverb_between_the_negation_and_the_veto_never_ends_the_call(self):
+        """The regression class that killed the `against`/`un-` clauses."""
+        for text in (
+            "yes I'm not at all uncomfortable", "yes I am not at all against it",
+            "sure I am not really uncomfortable with that",
+            "okay I have nothing at all against the recording",
+            "okay I'm not in the least uncomfortable",
+            "yes I am not remotely against being recorded",
+            "sure I was never against it",
+            "yes I'm never uncomfortable with these things",
+            "absolutely nothing uncomfortable about it",
+            "yes I have no issue whatsoever against it",
+        ):
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_REFUSED,
+                    "a consenting candidate would be hung up on")
+
+    def test_an_uncontracted_do_not_mind_consents_like_the_contracted_one(self):
+        """`don't mind` was a head and `do not mind` was a conflict -> re-ask."""
+        for text in (
+            "I don't mind being recorded", "I do not mind being recorded",
+            "sure I do not mind the recording",
+            "yes I do not mind if you record it",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN)
+
+    def test_a_contracted_refusal_of_the_recording_is_never_consent(self):
+        """`\bn't\b` can never match inside "don't" — the alternative was dead."""
+        for text in (
+            "sure but I won't be recorded",
+            "yes but I can't agree to the recording",
+            "Absolutely not, I don't want this recorded",
+        ):
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN)
+
+    def test_the_widened_frame_did_not_widen_the_backtracking_surface(self):
+        """The filler run gained ~15 alternatives inside a `{0,4}` repetition.
+
+        Same hazard class as the `hmm+|mm+` defect below, measured the same
+        way: an input built to make every filler slot backtrack must still
+        classify in well under the budget, because this runs synchronously on
+        the worker event loop during a live call.
+        """
+        import time  # local import; the module has no top-level `time`
+
+        adversarial = "well " * 4 + "very much " * 8 + "m" * 60 + " zzzz"
+        started = time.perf_counter()
+        agent_mod.classify_answer_text(adversarial)
+        elapsed = time.perf_counter() - started
+        self.assertLess(elapsed, 0.5, f"classify took {elapsed:.3f}s")
+
     def test_a_hum_on_the_line_cannot_stall_the_worker(self):
         """Catastrophic backtracking in the filler alternation.
 

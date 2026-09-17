@@ -1684,13 +1684,52 @@ def phone_min_interruption_words() -> int:
     barged-in and truncated, and 2026-09-12 (session ffab6c2a) cut off "Ah, got
     it" and "Perfect, so you could" with the candidate silent both times.
 
-    Two words, not one, because a single filler token ("um", "oh") is exactly
-    what a false trigger transcribes as. Nothing is lost by waiting for the
-    second: the SDK keeps the audio and folds it into the next committed turn,
-    so a genuine interruption is DEFERRED to the end of the sentence, never
-    discarded. 0 restores the SDK default.
+    ── RAISED 2 -> 3 ON 2026-09-17, AND WHY THE OLD REASONING WAS WRONG ──
+    The previous value was two, on the argument that "a single filler token
+    ('um', 'oh') is exactly what a false trigger transcribes as", and that
+    "nothing is lost by waiting for the second: the SDK keeps the audio and
+    folds it into the next committed turn."
+
+    The second half of that is true and is precisely the problem. The SDK does
+    NOT discard a refused fragment — `AudioRecognition._audio_transcript` is
+    cleared only on the COMMITTED branch (`audio_recognition.py:1543-1574`), so
+    a fragment the word gate just refused is BANKED, and the next fragment is
+    appended to it (`:1076`). Both interruption paths then read that bank:
+    `agent_activity.py:2112-2124` (end-of-turn) and `:1803-1812` via
+    `current_transcript` (raw VAD energy). At a floor of two, the bank crosses
+    the threshold on the SECOND token — so the guard reads as "one word of
+    backchannel cannot cut the bot off, two can", and on an Indian phone
+    screen two words of backchannel is the NORM.
+
+    That is not hypothetical. 2026-09-17, Deepti (session f84e2e51): she
+    backchannelled "Sure" 965 ms after Q1 began, one more token arrived, the
+    committed turn reads "Sure Ee" — and Q1 is recorded `[interrupted
+    question]`, truncated mid-sentence. Her next three bot turns are all
+    `[interrupted question]`; she hung up 54 s in. The same call's sibling
+    (Neelu, 7562d48f) shows six truncated bot turns, each immediately after a
+    one- or two-word utterance: "Yes Okay", "Got Sure, sure, that works."
+
+    THREE, not four. Every truncation across both calls followed a ONE- OR
+    TWO-word utterance — "Sure Ee", "Yes Okay", "Yeah", "Got" — so three
+    already refuses the entire observed failure set, and each extra word costs
+    real interruptions. An adversarial review counted what a floor of four
+    silences, using the SDK's own tokenizer: "sorry, repeat that" (3), "can you
+    repeat" (3), "wait wait wait" (3), "repeat that please" (3). Those are
+    exactly the interruptions a candidate most needs when the line is bad.
+
+    Four also made things WORSE in a way three does not: a short DIRECT answer
+    — "Yes I am" (3) — would have been banked rather than delivered. At three
+    it commits and interrupts, as it did before this change.
+
+    The upper bound is raised from 5 to 8 so an operator can go further without
+    a deploy; 0 restores the SDK default (raw VAD energy), which is the
+    2026-09-10 Praveetha failure and is a rollback lever only.
+
+    This is the WHOLE fix. An attempt to also bound how long the bank survives
+    was built three times and removed three times — see the block comment
+    above this function for why the cure was worse than the disease.
     """
-    return _bounded_int_env(os.getenv("PHONE_MIN_INTERRUPTION_WORDS"), 2, 0, 5)
+    return _bounded_int_env(os.getenv("PHONE_MIN_INTERRUPTION_WORDS"), 3, 0, 8)
 
 
 def phone_min_interruption_duration_sec() -> float:
@@ -1701,6 +1740,43 @@ def phone_min_interruption_duration_sec() -> float:
     """
     return _bounded_float(
         os.getenv("PHONE_MIN_INTERRUPTION_DURATION_SEC"), 0.8, 0.2, 3.0)
+
+
+# ── THE REFUSED-BARGE-IN BANK: WHY THERE IS NO REPAIR HERE ────────────
+#
+# LiveKit does not DISCARD an utterance that is too short to interrupt. A
+# fragment the word floor refuses is BANKED in
+# `AudioRecognition._audio_transcript` (cleared only when a turn COMMITS, or by
+# `clear_user_turn()`), and the next fragment is appended to it. Both
+# interruption paths then read that bank. So three unrelated noises, spoken
+# minutes apart across three different questions, can still sum to a barge-in.
+#
+# THAT DEFECT IS REAL AND IS NOT FIXED HERE. It is recorded rather than
+# repaired, because three successive attempts to repair it each shipped a
+# WORSE failure than the one they fixed, and five adversarial reviews caught
+# each one:
+#
+#   1. drop the bank when it goes stale — destroyed "Yes I am", because the
+#      staleness clock is final-to-final on this deployment (Sarvam emits no
+#      interim or preflight event), so "stale" never meant "abandoned";
+#   2. drop it only when it is backchannel-only — still destroyed 10 of 10
+#      one- and two-word ANSWERS, because "yes", "haan ji", "fine", "right"
+#      are backchannels AND answers, and at any floor above 1 every one of
+#      them is below the floor and therefore in the bank;
+#   3. narrow the vocabulary to non-lexical fillers — safe, and then almost
+#      never fires, because a bank of pure "hmm"/"uh" is not what accumulates.
+#
+# The asymmetry that decides it: a false interruption TRUNCATES A QUESTION,
+# and the bot re-asks. A wrongly dropped bank DELETES AN ANSWER from the
+# transcript the scorer reads, silently, with no signal — and an answer
+# missing from a metric is `insufficient_evidence`, which skips the Ashby
+# write-back entirely. The recoverable failure is the one to keep.
+#
+# `phone_min_interruption_words` at 3 refuses every truncation observed in
+# production (all of them were one or two words). What remains unfixed is
+# accumulation to three or more, which has never been observed. Fixing it
+# properly needs a signal this SDK does not expose — whether a refused
+# fragment was ever ANSWERED — not another guess at its content.
 
 
 # ── P5: the heartbeat cadence envelope ────────────────────────────────

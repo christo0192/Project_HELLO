@@ -8,6 +8,7 @@ on:
       - 'scripts/*seed*'
       - 'scripts/supabase-*.sh'
       - 'scripts/test-funnel-views.sh'
+      - 'scripts/test-verify-phone-reason.sh'
       - 'scripts/test-scorecard-partial.sh'
       - 'scripts/test-scorecard-scale.sh'
       - 'scripts/phone-canary/**'
@@ -29,6 +30,7 @@ on:
       - 'scripts/*seed*'
       - 'scripts/supabase-*.sh'
       - 'scripts/test-funnel-views.sh'
+      - 'scripts/test-verify-phone-reason.sh'
       - 'scripts/test-scorecard-partial.sh'
       - 'scripts/test-scorecard-scale.sh'
       - 'scripts/phone-canary/**'
@@ -68,6 +70,17 @@ jobs:
       - uses: actions/checkout@v4
       - name: Funnel views + refresh RPC behavior (isolated real Postgres)
         run: bash scripts/test-funnel-views.sh
+
+  verify-phone-reason-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      # 0099 runs inside a SECURITY DEFINER function and writes to the table
+      # whose `updated_at` orders the dial queue. Without this job its first
+      # EXECUTION anywhere would be the owner's `supabase db push`.
+      - name: verify_candidate_phone stale-reason clear (isolated real Postgres)
+        run: bash scripts/test-verify-phone-reason.sh
 
   scorecard-partial-test:
     runs-on: ubuntu-latest

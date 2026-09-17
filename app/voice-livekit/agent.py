@@ -1768,7 +1768,12 @@ _REFUSED_RE = re.compile(
     # "right, but I'd rather you didn't record this" both became HUMAN, which
     # is the worst failure this gate has — consent inferred where it was
     # refused. These clauses run first and are deliberately not anchored.
-    r"do(?:n't| not)\s+(?:want\s+(?:to\s+be\s+|me\s+to\s+be\s+)?)?record|"
+    # The object slot accepts a determiner: "I don't want THIS recorded" is as
+    # common as "I don't want to be recorded", and without it the only clause
+    # that refused that turn was the intensified-negation one — which correctly
+    # stopped firing once it was restricted to end-of-turn.
+    r"do(?:n't| not)\s+(?:want\s+(?:to\s+be\s+|me\s+to\s+be\s+|"
+    r"this\s+|that\s+|it\s+|any\s+|the\s+)?)?record|"
     r"(?:did|would|could)(?:n't| not)\s+(?:want\s+)?(?:to\s+be\s+)?record|"
     r"rather\s+(?:you\s+)?(?:did\s*n[o']?t|not)\b|"
     # The article matters: "not THE recording part" is the commonest way to
@@ -1785,6 +1790,83 @@ _REFUSED_RE = re.compile(
     r"\bstop\s+the\s+record(?:ing)?\b|\bwithout\s+record(?:ing)?\b|"
     r"\bavoid\s+record(?:ing)?\b|"
     r"\bnot\s+comfortable\s+(?:being|with)\s+record(?:ed|ing)?\b|"
+    # ── "YES TO THE CALL, NO TO THE RECORDING" ───────────────────────────
+    # The single most dangerous shape this gate sees, and the one an ANCHORED
+    # affirmative is structurally blind to: `_AFFIRMATIVE_RE` matches a PREFIX
+    # and `classify_answer_text` returns on the first match, so any head at the
+    # start of the turn wins over a refusal that arrives three words later.
+    #
+    # The repo's own lesson — a veto and a trigger must share a scope. The
+    # trigger here is a prefix; the veto therefore has to scan the WHOLE turn,
+    # which is why these clauses are unanchored like the ones above.
+    #
+    # `\bnot\s+(?:the\s+|that\s+)?record…` already existed and was defeated by
+    # a single preposition: "not WITH the recording", "not TO BE recorded".
+    # Measured on main, this family produced three false consents ("Sure but
+    # not with the recording", "Absolutely but please switch off the
+    # recording", "Fine, but delete the recording afterwards"); widening the
+    # affirmative frame in this PR added three more before this clause landed.
+    r"\bnot\s+(?:with\s+|to\s+be\s+|being\s+|to\s+)?"
+    r"(?:the\s+|that\s+|this\s+)?record(?:ed|ing)?\b|"
+    r"\b(?:switch|turn|shut)\s+off\s+(?:the\s+|that\s+|this\s+)?"
+    r"record(?:er|ing)?\b|"
+    r"\bdelete\s+(?:the\s+|that\s+|this\s+|my\s+)?record(?:ing|ings)?\b|"
+    r"\bobject\s+to\s+(?:the\s+|being\s+|that\s+)?record(?:ed|ing)?\b|"
+    # ── ADDED 2026-09-17 ─────────────────────────────────────────────────
+    # An emphatic refusal OPENS with the emphasis, and every one of these
+    # words is an affirmative HEAD. `_AFFIRMATIVE_RE` is anchored and stops at
+    # its first match, so "absolutely not" was CONSENT — the exact failure the
+    # header of that pattern calls "the worst failure this gate has". Found
+    # while widening the affirmative vocabulary, not caused by it: this is a
+    # pre-existing false consent on main.
+    #
+    # THE LOOKAHEAD IS NOT OPTIONAL, and the first draft of this clause
+    # shipped without it. "Absolutely not a problem" and "definitely not an
+    # issue" are ordinary ways of saying YES, and this branch is TERMINAL —
+    # `disclosure.refused`, the closing line, no re-ask, no recovery, and
+    # indistinguishable from a real refusal in the data. Without the lookahead
+    # this clause turned 8 of 11 intensified consents into a hung-up call, and
+    # for `absolutely`/`definitely`/`certainly` that is a strict regression
+    # from HUMAN. Same device the bare-`no` branch below already uses, for the
+    # same reason. `no` and `never` are covered too: "absolutely no" and
+    # "certainly never" were false consents on main as well.
+    r"\b(?:absolutely|definitely|certainly|totally|completely)\s+"
+    r"(?:not|no|never)\b"
+    # END OF TURN, not "any punctuation". The first version accepted
+    # `\s*[.,;!?]`, so "absolutely not, please carry on" — an ordinary
+    # Indian-English yes meaning "absolutely no objection" — ended the call.
+    # A trailing full stop still counts as the end; a comma followed by more
+    # words does not.
+    r"(?=\s*[.!?]*\s*$|\s+(?:okay|ok|fine|comfortable|interested|willing|"
+    r"possible|acceptable|happening|allowed|going\s+to))|"
+    # ── HINDI, because the affirmative vocabulary is bilingual ───────────
+    # `bilkul`, `ji`, `haan` and `theek` are affirmative HEADS, so the same
+    # prefix-match hole exists in Hindi — and `bilkul nahi` is the standard
+    # Hindi for the very phrase the clause above refuses in English. The
+    # negative corpus this PR shipped was written entirely in English and was
+    # therefore structurally blind to it: a corpus written in one language
+    # inherits that language's blind spot, exactly as a corpus written with
+    # one subject form does.
+    #
+    # Scoped to a NEGATED HEAD or a leading `nahi`, deliberately not to a bare
+    # `nahi` anywhere in the turn: "koi baat nahi" ("no problem at all") is a
+    # consent, and an unscoped clause would end that call.
+    r"\b(?:bilkul|ji|haan|han|theek|thik)\s+(?:bhi\s+)?nah[ií]+n?\b|"
+    r"^\s*nah[ií]+n?\b(?!.*\b(?:koi\s+baat|koi\s+(?:problem|dikkat|aitraaz)|"
+    r"theek\s+hai|bilkul\s+theek))|"
+    # ── `against` AND `un(willing|comfortable)` ARE DELIBERATELY ABSENT ──
+    # Both were added here on 2026-09-17 and both are now removed. A fixed-
+    # width lookbehind sees only the IMMEDIATELY preceding token, so one adverb
+    # walked straight past it: "not AT ALL uncomfortable", "not REALLY against
+    # it", "nothing AT ALL against the recording" — 12 verified turns where a
+    # candidate said yes and got `disclosure.refused`, terminal, first turn, no
+    # re-ask. Every one of them is HUMAN on main.
+    #
+    # Python cannot express the guard these need (`(?<!\bnot\b(?:\s+\w+){0,3}\s)`
+    # is variable-width), and that is the tell: a veto that needs
+    # whole-clause negation scope does not belong in a pattern that matches a
+    # substring. "I am uncomfortable" is also a weak signal on its own — it is
+    # what a candidate says about a chair. It is not worth a hang-up.
     # ── ANCHORED: a bare "no" only refuses when it OPENS the answer. The
     #    lookahead keeps "no problem/issues/worries" — ordinary ways of saying
     #    YES — from ending the call, while "no thanks" still refuses.
@@ -1806,8 +1888,39 @@ _REFUSED_RE = re.compile(
 # does NOT begin with "no"/"not" (those anchor the refusal/opt-out branches
 # checked before this one), so widening cannot turn a refusal into consent.
 _AFFIRMATIVE_RE = re.compile(
+    # ── THE FILLER RUN. WIDENED 2026-09-17, AND WHY IT IS THE REAL DEFECT ──
+    # Rijo's 2026-09-17 call ended at the consent gate, recorded
+    # `outcome_class = 'voicemail'` — a live, consenting human classified as an
+    # answering machine and hung up on. He said "it's absolutely fine to
+    # continue".
+    #
+    # Read that against the vocabulary below and the bug is not a missing word:
+    #
+    #     'absolutely fine to continue'       -> HUMAN
+    #     "it's absolutely fine to continue"  -> None, re-ask, then MACHINE
+    #
+    # The head `fine` was always there. What was missing is the SUBJECT the
+    # sentence hangs off. This group is `^`-anchored and CLOSED, so an answer
+    # that opens with a pronoun and copula — or with an intensifier — cannot
+    # reach its own head no matter how affirmative that head is. A probe of 52
+    # ordinary ways to say yes rejected 21, and every single rejection was this
+    # shape: "I'm okay with that", "That is completely fine", "Totally fine",
+    # "Very much okay", "It's totally okay".
+    #
+    # So the fix is the FRAME, not the vocabulary. Widening it cannot turn a
+    # refusal into consent, because a refusal still has to get past
+    # `_OPT_OUT_RE`/`_REFUSED_RE`/`_AMBIGUOUS_RE` first, and none of these
+    # tokens is a head: "I'm not comfortable", "That's not okay" and "I'm not
+    # sure" consume a filler, find no head, and still answer None.
     r"^\s*(?:(?:well|um+|uh+|er+|ah+|oh|so|hi|hello|hey|hmm+|mm+|"
-    r"yeah|ok|okay|like|actually|i\s*mean|see)[\s,]*){0,4}"
+    r"yeah|ok|okay|like|actually|i\s*mean|see|"
+    # Subject + copula. `very\s+much` precedes `very` so the longer form wins.
+    r"it'?s|it\s+is|that'?s|that\s+is|this\s+is|"
+    r"i'?m|i\s+am|we'?re|we\s+are|"
+    # Intensifiers. `absolutely`/`definitely`/`certainly` are also heads; as
+    # fillers they simply let a head follow them ("absolutely fine").
+    r"completely|totally|perfectly|entirely|quite|very\s+much|very|really|"
+    r"absolutely|definitely|certainly|kindly|please)[\s,]*){0,4}"
     r"(?:yes|yeah|yea|yah|yep|yup|ya|yaa|"
     r"sure(?:\s+thing)?|okay|ok|"
     r"absolutely|definitely|certainly|of\s+course|"
@@ -1835,6 +1948,21 @@ _AFFIRMATIVE_RE = re.compile(
     r"it(?:'s| is)\s+(?:okay|ok|fine|alright)|"
     r"that(?:'s| is)\s+(?:okay|ok|alright|right)|"
     r"go\s+on|i\s+do\s*n[o']?t\s+mind|don'?t\s+mind|"
+    # ── ADDED 2026-09-17, the heads the frame alone could not reach ──────
+    # The remainder of the 21 rejected yeses. Each needs a head of its own
+    # because no widening of the filler run gets to it: "Fair enough" and
+    # "All good" have no affirmative token in them at all, and the objection
+    # forms carry their own subject.
+    r"comfortable|happy\s+to|fair\s+enough|all\s+good|bilkul|"
+    # "no problem at all" in Hindi. Safe beside the Hindi refusal clause
+    # above, which is scoped to a NEGATED HEAD or a LEADING `nahi` — neither
+    # of which this is.
+    r"koi\s+baat\s+nah[ií]+n?|"
+    r"not\s+a\s+problem|"
+    r"i\s+(?:have|'?ve\s+got)\s+no\s+"
+    r"(?:objection|objections|problem|problems|issue|issues)|"
+    r"i\s+do\s*n[o']?t\s+have\s+(?:any|an)\s+"
+    r"(?:objection|objections|problem|problems|issue|issues)|"
     r"haan|han|ji(?:\s+haan)?|theek(?:\s+hai)?)\b",
     re.IGNORECASE,
 )
@@ -1863,6 +1991,56 @@ _AMBIGUOUS_RE = re.compile(
     r"\bleave\s+me\s+alone\b|\bnot\s+a\s+good\s+time\b|"
     r"\bi'?m\s+(?:busy|driving)\b|\bi\s+am\s+(?:busy|driving)\b|"
     r"\bin\s+a\s+meeting\b|\bmaybe\s+later\b|\bnot\s+now\b",
+    re.IGNORECASE,
+)
+
+
+#: A RECORDING CONCERN anywhere in the turn, however it is phrased.
+#:
+#: ── WHY THIS EXISTS, AFTER TWO ROUNDS OF THE OTHER APPROACH ──────────────
+#: `_AFFIRMATIVE_RE` is `^`-anchored: it matches a PREFIX and
+#: `classify_answer_text` returns on the first match, so a refusal that arrives
+#: later in the same turn always loses. "Yes to the call, no to the recording"
+#: is therefore invisible to it BY CONSTRUCTION, and the only lever is
+#: `_REFUSED_RE`, which runs first.
+#:
+#: Two rounds of adversarial review were spent enumerating phrasings into
+#: `_REFUSED_RE`, and each round closed the cases it named and opened new ones
+#: in the OPPOSITE direction — "not against it" and "not uncomfortable" started
+#: ending the call on consenting people, because a veto broad enough to catch
+#: an open class is broad enough to catch its own negation. The enumeration was
+#: never going to terminate: English phrasings plus Hindi prohibitives
+#: ("record mat karo", "recording nahi") plus code-switching is an open class.
+#:
+#: So this is deliberately NOT another refusal clause. It is an AMBIGUITY
+#: detector, and it resolves to `None` — re-ask once. That is the only verdict
+#: that is safe in both directions: it neither records someone who objected
+#: (which `HUMAN` would) nor hangs up on someone who consented (which
+#: `REFUSED` would). A turn that mentions recording next to a negation is, at
+#: minimum, not the unambiguous yes this gate requires.
+#:
+#: The window is four intervening words, and the negator carries a lookahead
+#: for the POSITIVE nouns it is most often paired with, so ordinary consents
+#: survive: "I have no objection to the recording" and "recording is not a
+#: problem" are `no`/`not` beside a recording word and must NOT be downgraded.
+_RECORDING_TOKEN = r"(?:record(?:s|ed|er|ers|ing|ings)?|tape[ds]?|taping)"
+_RECORDING_NEGATOR = (
+    # The contractions are spelled out. `n't` alone can NEVER match inside
+    # `\b...\b`: there is no word boundary between the `o` of "don" and the
+    # `n` of "n't", so the alternative was dead and the coverage the comment
+    # claimed did not exist.
+    r"(?:no|not|never|without|stop|stopped|avoid|delete|remove|off|"
+    r"cancel|disable|mat|nah[ií]+n?|band|bina|"
+    r"(?:do|does|did|wo|ca|is|are|was|were|would|could|should|ai)n'?t)"
+    # `mind` and `dikkat` belong with the other positive nouns: "I do not mind
+    # being recorded" and "recording mein koi dikkat nahi" are consents, and
+    # without them the rule downgraded both to a re-ask.
+    r"(?!\s+(?:an?\s+)?(?:objection|objections|problem|problems|issue|issues|"
+    r"worries|worry|doubt|trouble|concern|concerns|hassle|mind|dikkat))"
+)
+_RECORDING_CONFLICT_RE = re.compile(
+    rf"\b{_RECORDING_NEGATOR}\b(?:\W+\w+){{0,4}}\W+{_RECORDING_TOKEN}\b"
+    rf"|\b{_RECORDING_TOKEN}\b(?:\W+\w+){{0,4}}\W+{_RECORDING_NEGATOR}\b",
     re.IGNORECASE,
 )
 
@@ -1906,6 +2084,12 @@ def classify_answer_text(text: str) -> str | None:
     if _AMBIGUOUS_RE.search(value):
         return None
     if _AFFIRMATIVE_RE.search(value):
+        # LAST, and only over a turn that already looks affirmative. A turn
+        # with no affirmative prefix cannot be a split consent, and running
+        # this over everything would downgrade plain refusals from REFUSED to
+        # a re-ask — which is why it sits here and not beside `_AMBIGUOUS_RE`.
+        if _RECORDING_CONFLICT_RE.search(value):
+            return None
         return phone.CLASSIFY_HUMAN
     return None
 

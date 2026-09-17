@@ -141,6 +141,11 @@ _KEY_TYPE_NUMBER: frozenset[str] = frozenset({
     "port",
     "turn_index",
     "duration_sec",
+    # FIX (2026-09-17): a bounded COUNT. `phone_sarvam_vad_config` has passed
+    # `option_count=` since 2026-09-12 and the allowlist silently dropped it,
+    # so that line has always shipped a comment describing a number it never
+    # emitted. Same failure the `rejection_reason`/`phase` note above records.
+    "option_count",
 })
 
 # Allowlisted keys for rapid key-allowlist check (union of string + number).
@@ -331,6 +336,10 @@ def _validate_numeric_field(key: str, val: Any) -> Optional[Any]:
         return val if (isinstance(val, int) and 100 <= val <= 599) else None
     if key == "turn_index":
         return val if (isinstance(val, int) and val >= 0) else None
+    if key == "option_count":
+        # A count of things, never a measurement. Bounded so a runaway cannot
+        # widen a log line without bound.
+        return val if (isinstance(val, int) and 0 <= val <= 100_000) else None
     if key == "duration_sec":
         # Must be finite, non-negative, and capped at 1e6 (about 11.5 days)
         return val if (isinstance(val, (int, float)) and 0 <= val <= 1_000_000) else None
