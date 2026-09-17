@@ -1801,9 +1801,8 @@ _REFUSED_RE = re.compile(
     # not with the recording", "Absolutely but please switch off the
     # recording", "Fine, but delete the recording afterwards"); widening the
     # affirmative frame in this PR added three more before this clause landed.
-    r"\bnot\s+(?:with\s+|for\s+|about\s+|on\s+|to\s+be\s+|"
-    r"gonna\s+be\s+|going\s+to\s+be\s+)?"
-    r"(?:the\s+|that\s+|this\s+|any\s+|my\s+|a\s+)?record(?:ed|ing)?\b|"
+    r"\bnot\s+(?:with\s+|to\s+be\s+|being\s+|to\s+)?"
+    r"(?:the\s+|that\s+|this\s+)?record(?:ed|ing)?\b|"
     r"\b(?:switch|turn|shut)\s+off\s+(?:the\s+|that\s+|this\s+)?"
     r"record(?:er|ing)?\b|"
     r"\bdelete\s+(?:the\s+|that\s+|this\s+|my\s+)?record(?:ing|ings)?\b|"
@@ -1828,8 +1827,8 @@ _REFUSED_RE = re.compile(
     # "certainly never" were false consents on main as well.
     r"\b(?:absolutely|definitely|certainly|totally|completely)\s+"
     r"(?:not|no|never)\b"
-    r"(?!\s+(?:an?\s+)?(?:problem|problems|probs|issue|issues|worries|worry|"
-    r"objection|objections|doubt|trouble|bother|big\s+deal|inconvenience))|"
+    r"(?=\s*[.,;!?]|\s*$|\s+(?:okay|ok|fine|comfortable|interested|willing|"
+    r"possible|acceptable|happening|allowed|going\s+to))|"
     # ── HINDI, because the affirmative vocabulary is bilingual ───────────
     # `bilkul`, `ji`, `haan` and `theek` are affirmative HEADS, so the same
     # prefix-match hole exists in Hindi — and `bilkul nahi` is the standard
@@ -1843,11 +1842,13 @@ _REFUSED_RE = re.compile(
     # `nahi` anywhere in the turn: "koi baat nahi" ("no problem at all") is a
     # consent, and an unscoped clause would end that call.
     r"\b(?:bilkul|ji|haan|han|theek|thik)\s+(?:bhi\s+)?nah[ií]+n?\b|"
-    r"^\s*nah[ií]+n?\b|"
+    r"^\s*nah[ií]+n?\b(?!.*\b(?:koi\s+baat|koi\s+(?:problem|dikkat|aitraaz)|"
+    r"theek\s+hai|bilkul\s+theek))|"
     # The non-negation forms of the same emphatic refusal, which the clause
     # above cannot see because they carry no `not`/`no`/`never`.
+    r"(?<!not )(?<!n't )(?<!nothing )"
     r"\bagainst\s+(?:it|this|that|the\s+record|being\s+record)|"
-    r"\b(?:un(?:willing|comfortable))\b|"
+    r"(?<!not )(?<!n't )\b(?:un(?:willing|comfortable))\b|"
     # ── ANCHORED: a bare "no" only refuses when it OPENS the answer. The
     #    lookahead keeps "no problem/issues/worries" — ordinary ways of saying
     #    YES — from ending the call, while "no thanks" still refuses.
@@ -1976,6 +1977,48 @@ _AMBIGUOUS_RE = re.compile(
 )
 
 
+#: A RECORDING CONCERN anywhere in the turn, however it is phrased.
+#:
+#: ── WHY THIS EXISTS, AFTER TWO ROUNDS OF THE OTHER APPROACH ──────────────
+#: `_AFFIRMATIVE_RE` is `^`-anchored: it matches a PREFIX and
+#: `classify_answer_text` returns on the first match, so a refusal that arrives
+#: later in the same turn always loses. "Yes to the call, no to the recording"
+#: is therefore invisible to it BY CONSTRUCTION, and the only lever is
+#: `_REFUSED_RE`, which runs first.
+#:
+#: Two rounds of adversarial review were spent enumerating phrasings into
+#: `_REFUSED_RE`, and each round closed the cases it named and opened new ones
+#: in the OPPOSITE direction — "not against it" and "not uncomfortable" started
+#: ending the call on consenting people, because a veto broad enough to catch
+#: an open class is broad enough to catch its own negation. The enumeration was
+#: never going to terminate: English phrasings plus Hindi prohibitives
+#: ("record mat karo", "recording nahi") plus code-switching is an open class.
+#:
+#: So this is deliberately NOT another refusal clause. It is an AMBIGUITY
+#: detector, and it resolves to `None` — re-ask once. That is the only verdict
+#: that is safe in both directions: it neither records someone who objected
+#: (which `HUMAN` would) nor hangs up on someone who consented (which
+#: `REFUSED` would). A turn that mentions recording next to a negation is, at
+#: minimum, not the unambiguous yes this gate requires.
+#:
+#: The window is four intervening words, and the negator carries a lookahead
+#: for the POSITIVE nouns it is most often paired with, so ordinary consents
+#: survive: "I have no objection to the recording" and "recording is not a
+#: problem" are `no`/`not` beside a recording word and must NOT be downgraded.
+_RECORDING_TOKEN = r"(?:record(?:s|ed|er|ers|ing|ings)?|tape[ds]?|taping)"
+_RECORDING_NEGATOR = (
+    r"(?:no|not|n't|never|without|stop|stopped|avoid|delete|remove|off|"
+    r"cancel|disable|mat|nah[ií]+n?|band|bina)"
+    r"(?!\s+(?:an?\s+)?(?:objection|objections|problem|problems|issue|issues|"
+    r"worries|worry|doubt|trouble|concern|concerns|hassle))"
+)
+_RECORDING_CONFLICT_RE = re.compile(
+    rf"\b{_RECORDING_NEGATOR}\b(?:\W+\w+){{0,4}}\W+{_RECORDING_TOKEN}\b"
+    rf"|\b{_RECORDING_TOKEN}\b(?:\W+\w+){{0,4}}\W+{_RECORDING_NEGATOR}\b",
+    re.IGNORECASE,
+)
+
+
 def classify_answer_text(text: str) -> str | None:
     """Map one spoken response to a gate outcome, or None if unreadable.
 
@@ -2015,6 +2058,12 @@ def classify_answer_text(text: str) -> str | None:
     if _AMBIGUOUS_RE.search(value):
         return None
     if _AFFIRMATIVE_RE.search(value):
+        # LAST, and only over a turn that already looks affirmative. A turn
+        # with no affirmative prefix cannot be a split consent, and running
+        # this over everything would downgrade plain refusals from REFUSED to
+        # a re-ask — which is why it sits here and not beside `_AMBIGUOUS_RE`.
+        if _RECORDING_CONFLICT_RE.search(value):
+            return None
         return phone.CLASSIFY_HUMAN
     return None
 
@@ -7854,40 +7903,7 @@ async def _run_phone_session(
     @session.on("user_input_transcribed")
     def _on_phone_transcript_activity(event):  # noqa: ANN001
         if str(getattr(event, "transcript", "") or "").strip():
-            # ── DROP A STALE, ALREADY-REFUSED BARGE-IN FRAGMENT ─────────
-            #
-            # THE ONLY CORRECT PLACE FOR THIS CALL. `AgentActivity`'s
-            # `on_final_transcript` / `on_interim_transcript` emit this event
-            # synchronously and THEN, in the same stack, call
-            # `_interrupt_by_audio_activity()` — which reads the bank we are
-            # about to clear. `AudioRecognition` appends the arriving text to
-            # the bank only after those methods return. So this runs after the
-            # SDK has decided there is text, and before anything has decided
-            # what that text may interrupt.
-            #
-            # Guarded, total, and deliberately not wrapped in a bare `except`:
-            # `drop_stale_barge_in_bank` verifies the SDK shape itself and does
-            # nothing when it does not match. A swallowed exception here would
-            # be a repair that silently stopped repairing.
-            # AFTER `candidate_activity.set()`, deliberately. The drop is
-            # still well ahead of the SDK's own interrupt check — that runs
-            # after this whole handler returns — but an unexpected raise here
-            # would otherwise also suppress the activity signal the silence
-            # and inactivity controllers depend on.
             candidate_activity.set()
-            _dropped = phone.drop_stale_barge_in_bank(
-                session,
-                now=time.time(),
-                max_age_sec=phone.phone_barge_in_bank_max_age_sec(),
-            )
-            if _dropped:
-                # Content-free: how many words went, never the words. The bank
-                # is candidate speech.
-                _log.info(
-                    "unknown_event", error_type="phone_barge_in_bank_dropped",
-                    error_category="stale_backchannel",
-                    option_count=len(_dropped.split()),
-                )
             if bool(getattr(event, "is_final", False)):
                 final_wall = time.time()
                 latency_state["final_transcript_wall"] = final_wall

@@ -2483,12 +2483,153 @@ class TestAnswerClassifier(unittest.TestCase):
         "bilkul nahi, mujhe record nahi karna",
     )
 
+    #: The phrasings that defeated TWO rounds of enumerating refusal clauses
+    #: into `_REFUSED_RE`, and the reason `_RECORDING_CONFLICT_RE` exists. Each
+    #: pairs an affirmative PREFIX with a recording objection the refusal
+    #: vocabulary did not contain — passive ("not being recorded"), particle-
+    #: shifted ("turn the recorder off"), or Hindi prohibitive ("record mat
+    #: karo"). None may be CONSENT; `None` (re-ask) is the right answer.
+    SPLIT_CONSENT_OPEN_CLASS = (
+        "I'm okay with the call but not being recorded",
+        "we're fine with the interview but not being recorded",
+        "comfortable talking but not being recorded",
+        "happy to speak but not to be taped",
+        "fair enough but I'm not agreeing to the recording",
+        "all good but please stop recording",
+        "completely fine but please stop recording",
+        "perfectly fine but I'd prefer you not to record",
+        "quite okay but stop recording",
+        "kindly go ahead but stop recording",
+        "yes but turn the recorder off",
+        "bilkul lekin record mat karo",
+        "koi baat nahi lekin recording mat kijiye",
+        "haan lekin recording nahi",
+        "ji haan par recording mat kijiye",
+        "theek hai lekin recording nahi chahiye",
+    )
+
+    #: The counterweight to `_RECORDING_CONFLICT_RE`. Every one of these is a
+    #: negation sitting beside a recording word AND an ordinary YES. If the
+    #: conflict rule fires on these it downgrades real consents to a re-ask,
+    #: which is why the negator carries a positive-noun lookahead.
+    #: "recording is not a problem" is deliberately absent: it opens with
+    #: "recording", which is neither a filler nor a head, so `_AFFIRMATIVE_RE`
+    #: never matches it and the answer is a re-ask on main and here alike. It
+    #: is a gap in the affirmative FRAME, not something the conflict rule did.
+    RECORDING_MENTIONED_BUT_CONSENTING = (
+        "I have no objection to the recording",
+        "no problem with the recording",
+        "I have no issue with recording",
+        "no issues at all with the recording",
+    )
+
     def test_a_yes_to_the_call_and_no_to_the_recording_is_never_consent(self):
         for text in self.SPLIT_CONSENT_CORPUS:
             with self.subTest(text=text):
                 self.assertNotEqual(
                     agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
                     "would start recording someone who refused recording")
+
+    def test_the_open_class_of_split_consents_resolves_to_a_re_ask(self):
+        """The structural fix, and why it is not another refusal clause.
+
+        `_AFFIRMATIVE_RE` is anchored, so it matches a PREFIX and the
+        classifier returns on the first match — a refusal later in the turn is
+        invisible to it BY CONSTRUCTION. Two rounds of enumerating phrasings
+        into `_REFUSED_RE` each closed the cases they named and opened new ones
+        in the opposite direction, because a veto broad enough for an open
+        class is broad enough to catch its own negation.
+
+        `None` is the only verdict that is safe both ways: it neither records
+        someone who objected nor hangs up on someone who consented.
+        """
+        for text in self.SPLIT_CONSENT_OPEN_CLASS:
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
+                    "would start recording someone who refused recording")
+
+    def test_the_phrasings_only_the_conflict_rule_can_reach_are_re_asks(self):
+        """The subset `_REFUSED_RE` contains no clause for at all.
+
+        Hindi prohibitives and particle-shifted English are the open class the
+        enumeration could never finish. Nothing refuses them, so without the
+        conflict rule they are CONSENT; with it they are a re-ask.
+        """
+        for text in (
+            "bilkul lekin record mat karo",
+            "koi baat nahi lekin recording mat kijiye",
+            "haan lekin recording nahi",
+            "ji haan par recording mat kijiye",
+            "theek hai lekin recording nahi chahiye",
+            "yes but turn the recorder off",
+            "all good but please stop recording",
+        ):
+            with self.subTest(text=text):
+                self.assertIsNone(agent_mod.classify_answer_text(text))
+
+    def test_the_conflict_rule_does_not_downgrade_an_ordinary_yes(self):
+        """A recording word beside a negation is not automatically a conflict.
+
+        "I have no objection to the recording" is the commonest way to say yes
+        to this question and contains both halves.
+        """
+        for text in self.RECORDING_MENTIONED_BUT_CONSENTING:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN)
+
+    def test_a_negated_negative_never_ends_the_call(self):
+        """"not against it" / "not uncomfortable" are CONSENT, not refusals.
+
+        The first repair added `against …` and `un(willing|comfortable)` as
+        bare vetoes with no negation scope, and an adversarial review measured
+        8 strict HUMAN-to-REFUSED regressions: an ordinary yes ended the call,
+        with no re-ask and indistinguishable from a real refusal in the data.
+        The lookbehinds are what make these safe; `None` is acceptable here,
+        `REFUSED` is not.
+        """
+        for text in (
+            "yes I have no objection I'm not against being recorded",
+            "sure I'm not against it at all",
+            "okay I have nothing against the recording",
+            "yes absolutely I am not against this",
+            "I have nothing against it go ahead",
+            "nothing against it please carry on",
+            "yes I'm comfortable not uncomfortable at all",
+            "sure I am not uncomfortable with that",
+            "yes that's fine I'm not unwilling at all",
+            "okay I'm not uncomfortable being recorded",
+            "I'm not uncomfortable with it",
+        ):
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_REFUSED,
+                    "a consenting candidate would be hung up on")
+
+    def test_an_intensified_yes_with_an_unlisted_noun_still_consents(self):
+        """The first lookahead was a CLOSED list over an OPEN class.
+
+        "definitely not a concern" / "certainly not a hassle" were HUMAN on
+        main and became terminal refusals. The lookahead is now polarity-based
+        — clause-final, or before a negative-polarity word — so the open class
+        of positive nouns no longer has to be enumerated.
+        """
+        for text in (
+            "definitely not a concern", "certainly not a hassle",
+            "absolutely not a dealbreaker", "absolutely not a hindrance",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN)
+
+    def test_a_leading_nahi_that_introduces_reassurance_is_not_a_refusal(self):
+        """Reduplicated "nahi nahi" is standard Hindi for "no no, it's fine"."""
+        for text in ("nahi nahi koi baat nahi", "nahi koi problem nahi hai",
+                     "nahi nahi bilkul theek hai"):
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_REFUSED)
 
     def test_hindi_refusals_are_refusals(self):
         for text in self.HINDI_REFUSAL_CORPUS:
