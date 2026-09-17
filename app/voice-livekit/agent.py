@@ -1785,6 +1785,14 @@ _REFUSED_RE = re.compile(
     r"\bstop\s+the\s+record(?:ing)?\b|\bwithout\s+record(?:ing)?\b|"
     r"\bavoid\s+record(?:ing)?\b|"
     r"\bnot\s+comfortable\s+(?:being|with)\s+record(?:ed|ing)?\b|"
+    # ── ADDED 2026-09-17 ─────────────────────────────────────────────────
+    # An emphatic refusal OPENS with the emphasis, and every one of these
+    # three words is an affirmative HEAD. `_AFFIRMATIVE_RE` is anchored and
+    # stops at its first match, so "absolutely not" was CONSENT — the exact
+    # failure the header of that pattern calls "the worst failure this gate
+    # has". Found while widening the affirmative vocabulary, not caused by
+    # it: this is a pre-existing false consent on main.
+    r"\b(?:absolutely|definitely|certainly|totally|completely)\s+not\b|"
     # ── ANCHORED: a bare "no" only refuses when it OPENS the answer. The
     #    lookahead keeps "no problem/issues/worries" — ordinary ways of saying
     #    YES — from ending the call, while "no thanks" still refuses.
@@ -1806,8 +1814,39 @@ _REFUSED_RE = re.compile(
 # does NOT begin with "no"/"not" (those anchor the refusal/opt-out branches
 # checked before this one), so widening cannot turn a refusal into consent.
 _AFFIRMATIVE_RE = re.compile(
+    # ── THE FILLER RUN. WIDENED 2026-09-17, AND WHY IT IS THE REAL DEFECT ──
+    # Rijo's 2026-09-17 call ended at the consent gate, recorded
+    # `outcome_class = 'voicemail'` — a live, consenting human classified as an
+    # answering machine and hung up on. He said "it's absolutely fine to
+    # continue".
+    #
+    # Read that against the vocabulary below and the bug is not a missing word:
+    #
+    #     'absolutely fine to continue'       -> HUMAN
+    #     "it's absolutely fine to continue"  -> None, re-ask, then MACHINE
+    #
+    # The head `fine` was always there. What was missing is the SUBJECT the
+    # sentence hangs off. This group is `^`-anchored and CLOSED, so an answer
+    # that opens with a pronoun and copula — or with an intensifier — cannot
+    # reach its own head no matter how affirmative that head is. A probe of 52
+    # ordinary ways to say yes rejected 21, and every single rejection was this
+    # shape: "I'm okay with that", "That is completely fine", "Totally fine",
+    # "Very much okay", "It's totally okay".
+    #
+    # So the fix is the FRAME, not the vocabulary. Widening it cannot turn a
+    # refusal into consent, because a refusal still has to get past
+    # `_OPT_OUT_RE`/`_REFUSED_RE`/`_AMBIGUOUS_RE` first, and none of these
+    # tokens is a head: "I'm not comfortable", "That's not okay" and "I'm not
+    # sure" consume a filler, find no head, and still answer None.
     r"^\s*(?:(?:well|um+|uh+|er+|ah+|oh|so|hi|hello|hey|hmm+|mm+|"
-    r"yeah|ok|okay|like|actually|i\s*mean|see)[\s,]*){0,4}"
+    r"yeah|ok|okay|like|actually|i\s*mean|see|"
+    # Subject + copula. `very\s+much` precedes `very` so the longer form wins.
+    r"it'?s|it\s+is|that'?s|that\s+is|this\s+is|"
+    r"i'?m|i\s+am|we'?re|we\s+are|"
+    # Intensifiers. `absolutely`/`definitely`/`certainly` are also heads; as
+    # fillers they simply let a head follow them ("absolutely fine").
+    r"completely|totally|perfectly|entirely|quite|very\s+much|very|really|"
+    r"absolutely|definitely|certainly|kindly|please)[\s,]*){0,4}"
     r"(?:yes|yeah|yea|yah|yep|yup|ya|yaa|"
     r"sure(?:\s+thing)?|okay|ok|"
     r"absolutely|definitely|certainly|of\s+course|"
@@ -1835,6 +1874,17 @@ _AFFIRMATIVE_RE = re.compile(
     r"it(?:'s| is)\s+(?:okay|ok|fine|alright)|"
     r"that(?:'s| is)\s+(?:okay|ok|alright|right)|"
     r"go\s+on|i\s+do\s*n[o']?t\s+mind|don'?t\s+mind|"
+    # ── ADDED 2026-09-17, the heads the frame alone could not reach ──────
+    # The remainder of the 21 rejected yeses. Each needs a head of its own
+    # because no widening of the filler run gets to it: "Fair enough" and
+    # "All good" have no affirmative token in them at all, and the objection
+    # forms carry their own subject.
+    r"comfortable|happy\s+to|fair\s+enough|all\s+good|bilkul|"
+    r"not\s+a\s+problem|"
+    r"i\s+(?:have|'?ve\s+got)\s+no\s+"
+    r"(?:objection|objections|problem|problems|issue|issues)|"
+    r"i\s+do\s*n[o']?t\s+have\s+(?:any|an)\s+"
+    r"(?:objection|objections|problem|problems|issue|issues)|"
     r"haan|han|ji(?:\s+haan)?|theek(?:\s+hai)?)\b",
     re.IGNORECASE,
 )
@@ -7745,6 +7795,34 @@ async def _run_phone_session(
     @session.on("user_input_transcribed")
     def _on_phone_transcript_activity(event):  # noqa: ANN001
         if str(getattr(event, "transcript", "") or "").strip():
+            # ── DROP A STALE, ALREADY-REFUSED BARGE-IN FRAGMENT ─────────
+            #
+            # THE ONLY CORRECT PLACE FOR THIS CALL. `AgentActivity`'s
+            # `on_final_transcript` / `on_interim_transcript` emit this event
+            # synchronously and THEN, in the same stack, call
+            # `_interrupt_by_audio_activity()` — which reads the bank we are
+            # about to clear. `AudioRecognition` appends the arriving text to
+            # the bank only after those methods return. So this runs after the
+            # SDK has decided there is text, and before anything has decided
+            # what that text may interrupt.
+            #
+            # Guarded, total, and deliberately not wrapped in a bare `except`:
+            # `drop_stale_barge_in_bank` verifies the SDK shape itself and does
+            # nothing when it does not match. A swallowed exception here would
+            # be a repair that silently stopped repairing.
+            _dropped = phone.drop_stale_barge_in_bank(
+                session,
+                now=time.time(),
+                max_age_sec=phone.phone_barge_in_bank_max_age_sec(),
+            )
+            if _dropped:
+                # Content-free: how many words went, never the words. The bank
+                # is candidate speech.
+                _log.info(
+                    "unknown_event", error_type="phone_barge_in_bank_dropped",
+                    error_category="stale",
+                    option_count=len(_dropped.split()),
+                )
             candidate_activity.set()
             if bool(getattr(event, "is_final", False)):
                 final_wall = time.time()

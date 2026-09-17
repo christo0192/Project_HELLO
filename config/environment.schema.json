@@ -268,6 +268,7 @@
         "PHONE_CLASSIFY_ANSWER_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_IDENTITY_ANSWER_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_MIN_INTERRUPTION_WORDS": { "requiredInProduction": false, "secret": false },
+        "PHONE_BARGE_IN_BANK_MAX_AGE_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_MIN_INTERRUPTION_DURATION_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_ANSWER_TIMEOUT_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_CANARY_ENABLED": { "requiredInProduction": false, "secret": false },

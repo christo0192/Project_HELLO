@@ -1684,13 +1684,44 @@ def phone_min_interruption_words() -> int:
     barged-in and truncated, and 2026-09-12 (session ffab6c2a) cut off "Ah, got
     it" and "Perfect, so you could" with the candidate silent both times.
 
-    Two words, not one, because a single filler token ("um", "oh") is exactly
-    what a false trigger transcribes as. Nothing is lost by waiting for the
-    second: the SDK keeps the audio and folds it into the next committed turn,
-    so a genuine interruption is DEFERRED to the end of the sentence, never
-    discarded. 0 restores the SDK default.
+    ── RAISED 2 -> 4 ON 2026-09-17, AND WHY THE OLD REASONING WAS WRONG ──
+    The previous value was two, on the argument that "a single filler token
+    ('um', 'oh') is exactly what a false trigger transcribes as", and that
+    "nothing is lost by waiting for the second: the SDK keeps the audio and
+    folds it into the next committed turn."
+
+    The second half of that is true and is precisely the problem. The SDK does
+    NOT discard a refused fragment — `AudioRecognition._audio_transcript` is
+    cleared only on the COMMITTED branch (`audio_recognition.py:1543-1574`), so
+    a fragment the word gate just refused is BANKED, and the next fragment is
+    appended to it (`:1076`). Both interruption paths then read that bank:
+    `agent_activity.py:2112-2124` (end-of-turn) and `:1803-1812` via
+    `current_transcript` (raw VAD energy). At a floor of two, the bank crosses
+    the threshold on the SECOND token — so the guard reads as "one word of
+    backchannel cannot cut the bot off, two can", and on an Indian phone
+    screen two words of backchannel is the NORM.
+
+    That is not hypothetical. 2026-09-17, Deepti (session f84e2e51): she
+    backchannelled "Sure" 965 ms after Q1 began, one more token arrived, the
+    committed turn reads "Sure Ee" — and Q1 is recorded `[interrupted
+    question]`, truncated mid-sentence. Her next three bot turns are all
+    `[interrupted question]`; she hung up 54 s in. The same call's sibling
+    (Neelu, 7562d48f) shows six truncated bot turns, each immediately after a
+    one- or two-word utterance: "Yes Okay", "Got Sure, sure, that works."
+
+    FOUR, not three, and not five. Every truncation across both calls followed
+    a one- or two-word utterance; the shortest utterance in either transcript
+    that is a GENUINE interruption — Neelu's "I want to understand about the
+    leads everything because" — is eight words. Four sits clear of the
+    backchannels with margin on both sides. The upper bound is raised from 5
+    to 8 so an operator can go further without a deploy; 0 restores the SDK
+    default (raw VAD energy), which is the 2026-09-10 Praveetha failure and is
+    a rollback lever only.
+
+    This is HALF the fix. The floor decides how big the bank must be; it does
+    not stop the bank surviving a silence. See `phone_barge_in_bank_max_age_sec`.
     """
-    return _bounded_int_env(os.getenv("PHONE_MIN_INTERRUPTION_WORDS"), 2, 0, 5)
+    return _bounded_int_env(os.getenv("PHONE_MIN_INTERRUPTION_WORDS"), 4, 0, 8)
 
 
 def phone_min_interruption_duration_sec() -> float:
@@ -1701,6 +1732,132 @@ def phone_min_interruption_duration_sec() -> float:
     """
     return _bounded_float(
         os.getenv("PHONE_MIN_INTERRUPTION_DURATION_SEC"), 0.8, 0.2, 3.0)
+
+
+def phone_barge_in_bank_max_age_sec() -> float:
+    """How long a REFUSED barge-in fragment may sit before it stops counting.
+
+    The word floor (`phone_min_interruption_words`) decides how many words a
+    barge-in needs. It does NOT decide how long the SDK may keep collecting
+    them, and the SDK's answer is "for ever": a fragment refused as too short
+    stays in `AudioRecognition._audio_transcript`, because that field is
+    cleared only on the COMMITTED branch. So three unrelated noises, spoken
+    minutes apart across three different bot questions, add up to a barge-in.
+
+    This bounds the collection window instead. A bank whose LAST TRANSCRIPT
+    ACTIVITY is older than this is not part of the utterance now arriving, so
+    it is dropped before the SDK can append to it.
+
+    ── WHY 3.0 IS SAFE, AND WHY THE STAMP IS THE RIGHT CLOCK ──
+    The stamp read is `_last_final_transcript_time`, which the SDK writes on
+    BOTH the final and the preflight branch — it is last transcript activity,
+    not last final. A candidate who is actually mid-utterance refreshes it with
+    every interim, so a live answer can never age out underneath them.
+
+    And only a REFUSED fragment can be in the bank at all: anything at or above
+    the word floor commits, and committing clears. Local endpointing tops out
+    at 1.0 s (`PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC`), so a 3-second silence
+    is three endpointing windows — the turn either committed long ago or was
+    refused. Dropping it discards at most three words nobody replied to.
+
+    0 disables the repair and restores the SDK's unbounded bank, which is the
+    2026-09-17 Deepti failure. It is a rollback lever, not a setting.
+    """
+    return _bounded_float(
+        os.getenv("PHONE_BARGE_IN_BANK_MAX_AGE_SEC"), 3.0, 0.0, 30.0)
+
+
+#: The `AudioRecognition` internals this repair reaches into, pinned to
+#: livekit-agents 1.6.4 (the exact production pin).
+#:
+#: THIS IS PRIVATE SDK STATE AND THAT IS DELIBERATE, because the two public
+#: doors are both worse. `clear_user_turn()` drops the bank but also runs
+#: `update_stt(None); update_stt(stt)`, which tears down and rebuilds the
+#: `_STTPipeline` — a fresh Sarvam websocket, mid-call, on a path that already
+#: has an STT-websocket-death RCA against it. `commit_user_turn()` routes back
+#: through `_run_eou_detection` -> `on_end_of_turn`, i.e. through the very word
+#: gate that refused the fragment, so it is not a reliable clear at all.
+#: Zeroing the four fields costs no I/O and touches nothing else.
+#:
+#: The names are ASSERTED against the installed SDK by
+#: `tests/test_barge_in_bank.py`, so a version bump that renames them fails CI
+#: instead of silently turning this repair into a no-op — the failure mode a
+#: `getattr`-guarded reach-in otherwise has by construction.
+_BARGE_IN_BANK_TEXT_FIELDS = (
+    "_audio_transcript",
+    "_audio_interim_transcript",
+    "_audio_preflight_transcript",
+)
+_BARGE_IN_BANK_STAMP_FIELD = "_last_final_transcript_time"
+_BARGE_IN_BANK_CONFIDENCE_FIELD = "_final_transcript_confidence"
+
+
+def barge_in_bank_recognition(session: Any) -> Any:
+    """The live ``AudioRecognition``, or None when the SDK shape does not match.
+
+    Every hop is guarded and the whole function is total: an SDK whose private
+    shape has moved yields None, and the caller then does nothing. A repair
+    that cannot verify what it is about to write must not write.
+    """
+    activity = getattr(session, "_activity", None)
+    if activity is None:
+        return None
+    recognition = getattr(activity, "_audio_recognition", None)
+    if recognition is None:
+        return None
+    required = (
+        *_BARGE_IN_BANK_TEXT_FIELDS,
+        _BARGE_IN_BANK_STAMP_FIELD,
+        _BARGE_IN_BANK_CONFIDENCE_FIELD,
+    )
+    for field in required:
+        if not hasattr(recognition, field):
+            return None
+    return recognition
+
+
+def drop_stale_barge_in_bank(
+    session: Any, *, now: float, max_age_sec: float,
+) -> str:
+    """Drop a refused barge-in fragment that has gone stale. Returns what went.
+
+    MUST be called from the `user_input_transcribed` handler and nowhere else.
+    That event is emitted by `AgentActivity.on_final_transcript` /
+    `on_interim_transcript` SYNCHRONOUSLY, and — this is the whole reason the
+    seam works — BEFORE those same two methods call
+    `_interrupt_by_audio_activity()`, and before `AudioRecognition` appends the
+    arriving text to the bank. So a drop here is seen by the interrupt check
+    that runs microseconds later, on the same event, in the same stack.
+
+    Returns "" when nothing was dropped, which is the overwhelmingly common
+    case; the returned text is for the log line and the tests, and is never
+    persisted.
+    """
+    if max_age_sec <= 0:
+        return ""
+    recognition = barge_in_bank_recognition(session)
+    if recognition is None:
+        return ""
+    banked = (getattr(recognition, "_audio_transcript", "") or "").strip()
+    if not banked:
+        return ""
+    stamp = getattr(recognition, _BARGE_IN_BANK_STAMP_FIELD, None)
+    # A bank with no stamp at all has no age, and an unaged bank is not
+    # provably stale. `isinstance(True, int)` is True, so bools are excluded
+    # explicitly rather than relying on the numeric check.
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+        return ""
+    if now - float(stamp) < max_age_sec:
+        return ""
+    for field in _BARGE_IN_BANK_TEXT_FIELDS:
+        setattr(recognition, field, "")
+    # The per-final confidences belong to the text just dropped; leaving them
+    # would skew the NEXT turn's `transcript_confidence` average with samples
+    # from an utterance that is no longer in it.
+    confidences = getattr(recognition, _BARGE_IN_BANK_CONFIDENCE_FIELD, None)
+    if isinstance(confidences, list):
+        confidences.clear()
+    return banked
 
 
 # ── P5: the heartbeat cadence envelope ────────────────────────────────

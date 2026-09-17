@@ -2347,6 +2347,121 @@ class TestAnswerClassifier(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertEqual(agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN)
 
+    # ── 2026-09-17: the consent gate hung up on a consenting human ────────
+    #
+    # Rijo's call, `outcome_class = 'voicemail'`, ended 46 s in. He said "it's
+    # absolutely fine to continue". The head `fine` was already in the
+    # vocabulary; what defeated it was the two words in FRONT of it, because
+    # `_AFFIRMATIVE_RE` is `^`-anchored behind a CLOSED filler run. Widening
+    # vocabulary would not have fixed this and did not need to:
+    #
+    #     'absolutely fine to continue'       -> HUMAN   (before and after)
+    #     "it's absolutely fine to continue"  -> None     (before) / HUMAN (after)
+
+    #: 52 ordinary ways to say yes to "is it okay to continue?". Before this
+    #: change 21 of them returned None, which re-asks once and then classifies
+    #: MACHINE and ends the call. Each is a COMPLETE answer to the question —
+    #: not an acknowledgement of the sentence before it, which belongs in the
+    #: re-ask bucket and is why `right`/`good`/`cool` are deliberately absent.
+    CONSENT_YES_CORPUS = (
+        "it's absolutely fine to continue", "It is absolutely fine to continue",
+        "absolutely fine to continue", "that's absolutely fine", "it's absolutely fine",
+        "Yes, please go ahead", "Yeah sure, please continue", "You can continue",
+        "Please continue", "Yes you may proceed", "I'm okay with that",
+        "I am fine with that", "That is completely fine", "Completely fine",
+        "Totally fine", "It's totally okay", "Absolutely", "Absolutely yes",
+        "Sure, no problem at all", "No problem at all", "Not a problem",
+        "That's alright with me", "I have no objection", "I don't have any objection",
+        "I'm happy to continue", "Happy to proceed", "Yes that's fine with me",
+        "Fine by me", "Fair enough", "Sounds good to me", "Very much okay",
+        "Yes ma'am", "Yes please", "Please do", "Go ahead please", "Kindly proceed",
+        "Yes, kindly continue", "Ok fine", "Okay okay", "Yes yes yes", "Haan ji",
+        "Ji bilkul", "Bilkul", "Theek hai ji", "Yes, I'm comfortable",
+        "I'm comfortable with it", "No issues at all", "All good", "Yes go on",
+        "Carry on please", "Yes, understood, please continue", "Sure thing",
+    )
+
+    #: The counterweight, and the one that matters more. Consent inferred where
+    #: it was REFUSED is the worst failure this gate has, so every widening of
+    #: the affirmative frame is pinned against a corpus built to break it:
+    #: refusals that OPEN affirmatively, refusals that use the new filler
+    #: tokens as their own first word, deferrals, and opt-outs.
+    CONSENT_NOT_YES_CORPUS = (
+        "No", "Nope", "No thanks", "I'm not interested", "I am not interested",
+        "I'll pass", "absolutely not", "Absolutely not, I don't want this recorded",
+        "definitely not", "certainly not", "totally not okay",
+        "completely not comfortable", "I'm not comfortable with this",
+        "I'm not comfortable being recorded", "That's not okay", "I'm not sure",
+        "I would rather not", "Please don't record this", "No recording please",
+        "Don't call me again", "Stop calling me", "Remove my number",
+        "Take me off your list", "I object to being recorded", "I decline",
+        "I refuse", "Not the recording part", "No problem, but I'll pass",
+        "Right, but I'd rather you didn't record this", "Can you call me back",
+        "Who is this", "I'm driving", "I'm busy", "Not now", "Maybe later",
+        "Hold on", "One second", "Leave me alone", "What is this about",
+        "I am in a meeting", "This is not a good time", "I'm not okay with that",
+        "We are not interested",
+    )
+
+    def test_the_subject_pronoun_no_longer_defeats_the_head(self):
+        """The Rijo regression, reduced to the one word that decided it."""
+        for text in (
+            "it's absolutely fine to continue",
+            "It is absolutely fine to continue",
+            "that's absolutely fine",
+            "I'm okay with that",
+            "That is completely fine",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN)
+
+    def test_every_natural_yes_is_read_as_consent(self):
+        for text in self.CONSENT_YES_CORPUS:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
+                    "a consenting human would be re-asked and then hung up on")
+
+    def test_no_refusal_deferral_or_opt_out_is_ever_read_as_consent(self):
+        for text in self.CONSENT_NOT_YES_CORPUS:
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
+                    "consent inferred where it was not given")
+
+    def test_an_emphatic_refusal_is_refused_not_consented(self):
+        """`absolutely not` was CONSENT on main, and had been for months.
+
+        `absolutely`, `definitely` and `certainly` are affirmative HEADS, and
+        the affirmative is anchored and stops at its first match. Found while
+        widening the frame; it is a pre-existing false consent, not one this
+        change introduced.
+        """
+        for text in (
+            "absolutely not", "definitely not", "certainly not",
+            "totally not okay", "completely not comfortable",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_REFUSED)
+
+    def test_the_widened_frame_did_not_widen_the_backtracking_surface(self):
+        """The filler run gained ~15 alternatives inside a `{0,4}` repetition.
+
+        Same hazard class as the `hmm+|mm+` defect below, measured the same
+        way: an input built to make every filler slot backtrack must still
+        classify in well under the budget, because this runs synchronously on
+        the worker event loop during a live call.
+        """
+        import time  # local import; the module has no top-level `time`
+
+        adversarial = "well " * 4 + "very much " * 8 + "m" * 60 + " zzzz"
+        started = time.perf_counter()
+        agent_mod.classify_answer_text(adversarial)
+        elapsed = time.perf_counter() - started
+        self.assertLess(elapsed, 0.5, f"classify took {elapsed:.3f}s")
+
     def test_a_hum_on_the_line_cannot_stall_the_worker(self):
         """Catastrophic backtracking in the filler alternation.
 
