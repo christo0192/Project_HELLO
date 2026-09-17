@@ -1,6 +1,11 @@
 -- Behavioural assertions for 0099 `verify_candidate_phone`, run against the
 -- REAL migration on a real Postgres. Every `raise exception` here is a red CI.
 --
+-- EVERY count assertion is `coalesce(..., -1)`, and that is load-bearing, not
+-- defensive. A bare `(v_result->>'key')::int <> N` on a MISSING key yields
+-- NULL, `if NULL` never fires, and an adversarial review proved it: removing
+-- `stale_phone_invalid_cleared` from the RETURN left all four assertions GREEN.
+--
 -- The five claims 0099's header makes, each tested by executing it:
 --   1. a stale `phone_invalid` is cleared on a non-terminal engagement;
 --   2. any OTHER reason survives untouched;
@@ -12,9 +17,6 @@
 --   5. it is idempotent — the second call clears 0.
 
 set search_path = screening_v2, pg_catalog;
-
-\set ACTOR '''00000000-0000-4000-8000-000000000001'''
-\set FROZEN '''2026-09-17T12:00:00Z'''
 
 -- ── Fixtures ──────────────────────────────────────────────────────────
 insert into screening_v2.candidates (id, phone_e164, phone_valid) values
@@ -55,7 +57,7 @@ begin
   if v_result->>'status' <> 'ok' then
     raise exception '0099/1: expected ok, got %', v_result;
   end if;
-  if (v_result->>'stale_phone_invalid_cleared')::int <> 1 then
+  if coalesce((v_result->>'stale_phone_invalid_cleared')::int, -1) <> 1 then
     raise exception '0099/1: expected 1 cleared, got %', v_result;
   end if;
 
@@ -103,7 +105,7 @@ begin
   v_result := screening_v2.verify_candidate_phone(
     '11111111-1111-4111-8111-111111111111', '+919731247881',
     '00000000-0000-4000-8000-000000000001', '2026-09-17T12:00:00Z');
-  if (v_result->>'stale_phone_invalid_cleared')::int <> 0 then
+  if coalesce((v_result->>'stale_phone_invalid_cleared')::int, -1) <> 0 then
     raise exception '0099/5: second call cleared %',
       v_result->>'stale_phone_invalid_cleared';
   end if;
@@ -118,7 +120,7 @@ begin
   v_result := screening_v2.verify_candidate_phone(
     '22222222-2222-4222-8222-222222222222', '+919731247882',
     '00000000-0000-4000-8000-000000000001', '2026-09-17T12:00:00Z');
-  if (v_result->>'stale_phone_invalid_cleared')::int <> 0 then
+  if coalesce((v_result->>'stale_phone_invalid_cleared')::int, -1) <> 0 then
     raise exception '0099/2: cleared a reason it does not own';
   end if;
   select state_reason into v_reason from screening_v2.phone_engagements
@@ -144,7 +146,7 @@ begin
       '0099/4: a candidate with a TERMINAL engagement could not be verified: %',
       v_result;
   end if;
-  if (v_result->>'stale_phone_invalid_cleared')::int <> 0 then
+  if coalesce((v_result->>'stale_phone_invalid_cleared')::int, -1) <> 0 then
     raise exception '0099/4: wrote to a terminal engagement';
   end if;
   select state_reason into v_reason from screening_v2.phone_engagements

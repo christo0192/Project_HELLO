@@ -1785,14 +1785,69 @@ _REFUSED_RE = re.compile(
     r"\bstop\s+the\s+record(?:ing)?\b|\bwithout\s+record(?:ing)?\b|"
     r"\bavoid\s+record(?:ing)?\b|"
     r"\bnot\s+comfortable\s+(?:being|with)\s+record(?:ed|ing)?\b|"
+    # ── "YES TO THE CALL, NO TO THE RECORDING" ───────────────────────────
+    # The single most dangerous shape this gate sees, and the one an ANCHORED
+    # affirmative is structurally blind to: `_AFFIRMATIVE_RE` matches a PREFIX
+    # and `classify_answer_text` returns on the first match, so any head at the
+    # start of the turn wins over a refusal that arrives three words later.
+    #
+    # The repo's own lesson — a veto and a trigger must share a scope. The
+    # trigger here is a prefix; the veto therefore has to scan the WHOLE turn,
+    # which is why these clauses are unanchored like the ones above.
+    #
+    # `\bnot\s+(?:the\s+|that\s+)?record…` already existed and was defeated by
+    # a single preposition: "not WITH the recording", "not TO BE recorded".
+    # Measured on main, this family produced three false consents ("Sure but
+    # not with the recording", "Absolutely but please switch off the
+    # recording", "Fine, but delete the recording afterwards"); widening the
+    # affirmative frame in this PR added three more before this clause landed.
+    r"\bnot\s+(?:with\s+|for\s+|about\s+|on\s+|to\s+be\s+|"
+    r"gonna\s+be\s+|going\s+to\s+be\s+)?"
+    r"(?:the\s+|that\s+|this\s+|any\s+|my\s+|a\s+)?record(?:ed|ing)?\b|"
+    r"\b(?:switch|turn|shut)\s+off\s+(?:the\s+|that\s+|this\s+)?"
+    r"record(?:er|ing)?\b|"
+    r"\bdelete\s+(?:the\s+|that\s+|this\s+|my\s+)?record(?:ing|ings)?\b|"
+    r"\bobject\s+to\s+(?:the\s+|being\s+|that\s+)?record(?:ed|ing)?\b|"
     # ── ADDED 2026-09-17 ─────────────────────────────────────────────────
     # An emphatic refusal OPENS with the emphasis, and every one of these
-    # three words is an affirmative HEAD. `_AFFIRMATIVE_RE` is anchored and
-    # stops at its first match, so "absolutely not" was CONSENT — the exact
-    # failure the header of that pattern calls "the worst failure this gate
-    # has". Found while widening the affirmative vocabulary, not caused by
-    # it: this is a pre-existing false consent on main.
-    r"\b(?:absolutely|definitely|certainly|totally|completely)\s+not\b|"
+    # words is an affirmative HEAD. `_AFFIRMATIVE_RE` is anchored and stops at
+    # its first match, so "absolutely not" was CONSENT — the exact failure the
+    # header of that pattern calls "the worst failure this gate has". Found
+    # while widening the affirmative vocabulary, not caused by it: this is a
+    # pre-existing false consent on main.
+    #
+    # THE LOOKAHEAD IS NOT OPTIONAL, and the first draft of this clause
+    # shipped without it. "Absolutely not a problem" and "definitely not an
+    # issue" are ordinary ways of saying YES, and this branch is TERMINAL —
+    # `disclosure.refused`, the closing line, no re-ask, no recovery, and
+    # indistinguishable from a real refusal in the data. Without the lookahead
+    # this clause turned 8 of 11 intensified consents into a hung-up call, and
+    # for `absolutely`/`definitely`/`certainly` that is a strict regression
+    # from HUMAN. Same device the bare-`no` branch below already uses, for the
+    # same reason. `no` and `never` are covered too: "absolutely no" and
+    # "certainly never" were false consents on main as well.
+    r"\b(?:absolutely|definitely|certainly|totally|completely)\s+"
+    r"(?:not|no|never)\b"
+    r"(?!\s+(?:an?\s+)?(?:problem|problems|probs|issue|issues|worries|worry|"
+    r"objection|objections|doubt|trouble|bother|big\s+deal|inconvenience))|"
+    # ── HINDI, because the affirmative vocabulary is bilingual ───────────
+    # `bilkul`, `ji`, `haan` and `theek` are affirmative HEADS, so the same
+    # prefix-match hole exists in Hindi — and `bilkul nahi` is the standard
+    # Hindi for the very phrase the clause above refuses in English. The
+    # negative corpus this PR shipped was written entirely in English and was
+    # therefore structurally blind to it: a corpus written in one language
+    # inherits that language's blind spot, exactly as a corpus written with
+    # one subject form does.
+    #
+    # Scoped to a NEGATED HEAD or a leading `nahi`, deliberately not to a bare
+    # `nahi` anywhere in the turn: "koi baat nahi" ("no problem at all") is a
+    # consent, and an unscoped clause would end that call.
+    r"\b(?:bilkul|ji|haan|han|theek|thik)\s+(?:bhi\s+)?nah[ií]+n?\b|"
+    r"^\s*nah[ií]+n?\b|"
+    # The non-negation forms of the same emphatic refusal, which the clause
+    # above cannot see because they carry no `not`/`no`/`never`.
+    r"\bagainst\s+(?:it|this|that|the\s+record|being\s+record)|"
+    r"\b(?:un(?:willing|comfortable))\b|"
     # ── ANCHORED: a bare "no" only refuses when it OPENS the answer. The
     #    lookahead keeps "no problem/issues/worries" — ordinary ways of saying
     #    YES — from ending the call, while "no thanks" still refuses.
@@ -1880,6 +1935,10 @@ _AFFIRMATIVE_RE = re.compile(
     # "All good" have no affirmative token in them at all, and the objection
     # forms carry their own subject.
     r"comfortable|happy\s+to|fair\s+enough|all\s+good|bilkul|"
+    # "no problem at all" in Hindi. Safe beside the Hindi refusal clause
+    # above, which is scoped to a NEGATED HEAD or a LEADING `nahi` — neither
+    # of which this is.
+    r"koi\s+baat\s+nah[ií]+n?|"
     r"not\s+a\s+problem|"
     r"i\s+(?:have|'?ve\s+got)\s+no\s+"
     r"(?:objection|objections|problem|problems|issue|issues)|"
@@ -7810,6 +7869,12 @@ async def _run_phone_session(
             # `drop_stale_barge_in_bank` verifies the SDK shape itself and does
             # nothing when it does not match. A swallowed exception here would
             # be a repair that silently stopped repairing.
+            # AFTER `candidate_activity.set()`, deliberately. The drop is
+            # still well ahead of the SDK's own interrupt check — that runs
+            # after this whole handler returns — but an unexpected raise here
+            # would otherwise also suppress the activity signal the silence
+            # and inactivity controllers depend on.
+            candidate_activity.set()
             _dropped = phone.drop_stale_barge_in_bank(
                 session,
                 now=time.time(),
@@ -7820,10 +7885,9 @@ async def _run_phone_session(
                 # is candidate speech.
                 _log.info(
                     "unknown_event", error_type="phone_barge_in_bank_dropped",
-                    error_category="stale",
+                    error_category="stale_backchannel",
                     option_count=len(_dropped.split()),
                 )
-            candidate_activity.set()
             if bool(getattr(event, "is_final", False)):
                 final_wall = time.time()
                 latency_state["final_transcript_wall"] = final_wall

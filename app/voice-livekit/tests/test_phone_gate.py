@@ -2446,6 +2446,101 @@ class TestAnswerClassifier(unittest.TestCase):
                 self.assertEqual(
                     agent_mod.classify_answer_text(text), phone.CLASSIFY_REFUSED)
 
+    #: "YES TO THE CALL, NO TO THE RECORDING" — the shape an ANCHORED
+    #: affirmative is structurally blind to, because it matches a PREFIX and
+    #: `classify_answer_text` returns on the first match. Three of these were
+    #: false consents on main; widening the affirmative frame in this PR added
+    #: three more before the `_REFUSED_RE` clauses landed. None may be HUMAN:
+    #: proceeding means RECORDING someone who refused recording in the same
+    #: breath.
+    SPLIT_CONSENT_CORPUS = (
+        "I'm comfortable but not with the recording",
+        "Happy to talk but not to be recorded",
+        "I'm happy to continue but not with recording",
+        "I'm comfortable with the call but not the recording",
+        "Happy to proceed but please don't record",
+        "All good but no recording",
+        "Fair enough but I don't want to be recorded",
+        "Sure but not with the recording",
+        "Yes but don't record me",
+        "Okay but no recording please",
+        "That's fine but not the recording",
+        "Absolutely but please switch off the recording",
+        "Fine, but delete the recording afterwards",
+        "I'm comfortable, but I object to the recording",
+        "Bilkul, but no recording",
+    )
+
+    #: The affirmative vocabulary is BILINGUAL, so the refusal vocabulary has
+    #: to be. `bilkul`, `ji`, `haan` and `theek` are heads, and `bilkul nahi`
+    #: is the standard Hindi for "absolutely not" — the very phrase this file
+    #: refuses in English. A negative corpus written in one language inherits
+    #: that language's blind spot, exactly as one written with a single
+    #: subject form does.
+    HINDI_REFUSAL_CORPUS = (
+        "bilkul nahi", "bilkul nahin", "bilkul bhi nahi", "ji nahi",
+        "theek nahi hai", "nahi", "nahin",
+        "bilkul nahi, mujhe record nahi karna",
+    )
+
+    def test_a_yes_to_the_call_and_no_to_the_recording_is_never_consent(self):
+        for text in self.SPLIT_CONSENT_CORPUS:
+            with self.subTest(text=text):
+                self.assertNotEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
+                    "would start recording someone who refused recording")
+
+    def test_hindi_refusals_are_refusals(self):
+        for text in self.HINDI_REFUSAL_CORPUS:
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_REFUSED)
+
+    def test_hindi_consents_survive_the_hindi_refusal_clause(self):
+        """The counterweight. `koi baat nahi` is "no problem at all" — a YES.
+
+        This is why the Hindi refusal clause is scoped to a NEGATED HEAD or a
+        LEADING `nahi`, and not to a bare `nahi` anywhere in the turn.
+        """
+        for text in ("Bilkul", "Ji bilkul", "Haan ji", "Theek hai ji",
+                     "koi baat nahi"):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN)
+
+    def test_an_intensified_yes_is_not_turned_into_a_hang_up(self):
+        """The `absolutely not` clause needs its lookahead, and shipped without it.
+
+        "Absolutely not a problem" is an ordinary YES, and `CLASSIFY_REFUSED`
+        is TERMINAL — the closing line plays, there is no re-ask, and it is
+        indistinguishable from a real refusal in the data. Without the
+        lookahead this turned 8 of 11 intensified consents into a hung-up
+        call, and for `absolutely`/`definitely`/`certainly` that was a strict
+        regression from HUMAN.
+        """
+        for text in (
+            "absolutely not a problem", "definitely not an issue",
+            "certainly not a problem at all", "totally not a problem",
+            "completely not an issue", "absolutely not a big deal",
+            "it's definitely not a problem for me",
+            "absolutely not an issue, please go ahead",
+            "absolutely no problem", "definitely no issues",
+            "certainly no objection",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_HUMAN,
+                    "a consenting candidate would be hung up on")
+
+    def test_the_emphatic_refusal_clause_still_refuses_no_and_never(self):
+        for text in (
+            "absolutely no", "definitely no", "certainly never",
+            "absolutely never okay", "absolutely against it",
+        ):
+            with self.subTest(text=text):
+                self.assertEqual(
+                    agent_mod.classify_answer_text(text), phone.CLASSIFY_REFUSED)
+
     def test_the_widened_frame_did_not_widen_the_backtracking_surface(self):
         """The filler run gained ~15 alternatives inside a `{0,4}` repetition.
 

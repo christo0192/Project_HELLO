@@ -13,12 +13,19 @@
 create schema if not exists screening_v2;
 set search_path = screening_v2, pg_catalog;
 
--- `sha256_hex` is STUBBED. 0099 does not change how a number is digested and
--- the digest is never asserted here; pgcrypto is not worth pulling in for a
--- value this test ignores. Labelled loudly so nobody reads a passing run as
--- evidence about hashing.
+-- `sha256_hex` is the REAL one, not a stub. An earlier draft used `md5` and
+-- justified it as "pgcrypto is not worth pulling in for a value this test
+-- ignores" — which was wrong twice: the image already ships pgcrypto, and the
+-- digest is NOT ignored, because production carries
+-- `chk_phone_verification_digest check (phone_sha256 ~ '^[a-f0-9]{64}$')`.
+-- md5 is 32 hex characters, so the stub made it impossible for this fixture to
+-- carry that constraint, and a 0099 that wrote a malformed digest would have
+-- passed here and failed in production.
+create extension if not exists pgcrypto;
 create or replace function screening_v2.sha256_hex(p_input text)
-returns text language sql immutable as $$ select md5($1) $$;
+returns text language sql immutable as $$
+  select encode(digest($1, 'sha256'), 'hex')
+$$;
 
 create table screening_v2.candidates (
   id          uuid primary key default gen_random_uuid(),
@@ -44,7 +51,10 @@ create table screening_v2.phone_number_verifications (
   phone_sha256 text not null,
   verified_by  uuid not null,
   verified_at  timestamptz not null,
-  created_at   timestamptz not null default now()
+  created_at   timestamptz not null default now(),
+  -- Production's constraint, verbatim (0057:86). Carried so a digest the
+  -- function writes is checked here rather than at `supabase db push`.
+  constraint chk_phone_verification_digest check (phone_sha256 ~ '^[a-f0-9]{64}$')
 );
 
 create table screening_v2.audit_events (
@@ -56,7 +66,15 @@ create table screening_v2.audit_events (
   target_id   text not null,
   result      text not null,
   metadata    jsonb,
-  created_at  timestamptz not null default now()
+  created_at  timestamptz not null default now(),
+  -- Production's actor-type constraint verbatim (0007:290), plus the ONE
+  -- action this function writes. Carried so a wrong actor_type or a renamed
+  -- action fails here instead of in production. The full 90-value action list
+  -- is not reproduced — only the value under test, which is the point.
+  constraint chk_audit_actor_type check (
+    actor_type in ('recruiter', 'system', 'candidate', 'api_key')
+  ),
+  constraint chk_audit_action_subset check (action = 'phone_number_reverified')
 );
 
 -- ── The transition trigger, verbatim from production ──────────────────

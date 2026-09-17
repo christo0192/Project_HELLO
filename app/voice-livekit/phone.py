@@ -1709,19 +1709,29 @@ def phone_min_interruption_words() -> int:
     (Neelu, 7562d48f) shows six truncated bot turns, each immediately after a
     one- or two-word utterance: "Yes Okay", "Got Sure, sure, that works."
 
-    FOUR, not three, and not five. Every truncation across both calls followed
-    a one- or two-word utterance; the shortest utterance in either transcript
-    that is a GENUINE interruption — Neelu's "I want to understand about the
-    leads everything because" — is eight words. Four sits clear of the
-    backchannels with margin on both sides. The upper bound is raised from 5
-    to 8 so an operator can go further without a deploy; 0 restores the SDK
-    default (raw VAD energy), which is the 2026-09-10 Praveetha failure and is
-    a rollback lever only.
+    THREE, not four. Every truncation across both calls followed a ONE- OR
+    TWO-word utterance — "Sure Ee", "Yes Okay", "Yeah", "Got" — so three
+    already refuses the entire observed failure set, and each extra word costs
+    real interruptions. An adversarial review counted what a floor of four
+    silences, using the SDK's own tokenizer: "sorry, repeat that" (3), "can you
+    repeat" (3), "wait wait wait" (3), "repeat that please" (3). Those are
+    exactly the interruptions a candidate most needs when the line is bad.
+
+    Four also made things WORSE in a way three does not. A short DIRECT answer
+    — "Yes I am" (3) — would have been banked rather than delivered, and the
+    stale-bank repair below would then have been free to discard it. At three
+    it commits and interrupts, as it did before this change. The floor and the
+    bank repair have to be chosen together or the pair destroys answers that
+    neither would destroy alone.
+
+    The upper bound is raised from 5 to 8 so an operator can go further without
+    a deploy; 0 restores the SDK default (raw VAD energy), which is the
+    2026-09-10 Praveetha failure and is a rollback lever only.
 
     This is HALF the fix. The floor decides how big the bank must be; it does
     not stop the bank surviving a silence. See `phone_barge_in_bank_max_age_sec`.
     """
-    return _bounded_int_env(os.getenv("PHONE_MIN_INTERRUPTION_WORDS"), 4, 0, 8)
+    return _bounded_int_env(os.getenv("PHONE_MIN_INTERRUPTION_WORDS"), 3, 0, 8)
 
 
 def phone_min_interruption_duration_sec() -> float:
@@ -1748,17 +1758,32 @@ def phone_barge_in_bank_max_age_sec() -> float:
     ACTIVITY is older than this is not part of the utterance now arriving, so
     it is dropped before the SDK can append to it.
 
-    ── WHY 3.0 IS SAFE, AND WHY THE STAMP IS THE RIGHT CLOCK ──
-    The stamp read is `_last_final_transcript_time`, which the SDK writes on
-    BOTH the final and the preflight branch — it is last transcript activity,
-    not last final. A candidate who is actually mid-utterance refreshes it with
-    every interim, so a live answer can never age out underneath them.
+    ── WHAT THE CLOCK ACTUALLY MEASURES. READ THIS BEFORE TUNING. ──
+    The stamp is `_last_final_transcript_time`. An earlier version of this
+    docstring claimed the SDK refreshes it "with every interim, so a live
+    answer can never age out underneath them". That is FALSE on this
+    deployment, in two steps, and an adversarial review caught it:
 
-    And only a REFUSED fragment can be in the bank at all: anything at or above
-    the word floor commits, and committing clears. Local endpointing tops out
-    at 1.0 s (`PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC`), so a 3-second silence
-    is three endpointing windows — the turn either committed long ago or was
-    refused. Dropping it discards at most three words nobody replied to.
+      * in the SDK, the stamp is written on the FINAL and PREFLIGHT branches
+        only — the plain INTERIM branch does not touch it;
+      * and `livekit-plugins-sarvam` 1.6.4 emits neither. Its stream produces
+        `FINAL_TRANSCRIPT` (plus START/END_OF_SPEECH) and nothing else, and
+        `agent.py` wires `sarvam.STT(...)` raw with no StreamAdapter.
+
+    So in production this window measures FINAL-to-FINAL: the silence PLUS the
+    whole duration of whatever the candidate says next. It is not a silence
+    timer, and nothing refreshes it mid-utterance.
+
+    That is why staleness is NOT sufficient on its own here, and why
+    `drop_stale_barge_in_bank` also requires the bank to be nothing but
+    BACKCHANNEL. Age alone would have let a short direct answer sitting in the
+    bank be discarded simply because the candidate's next sentence was long.
+
+    Endpointing is a bound on when the bank can be REFILLED, not on the age
+    measured here, and its operator ceiling is 3.0 s, not the 1.0 s an earlier
+    draft of this comment claimed (`phone_static_endpointing_max_delay` clamps
+    to [0.5, 3.0]; the manifest sets 1.0). Do not re-derive a safety argument
+    from the default alone.
 
     0 disables the repair and restores the SDK's unbounded bank, which is the
     2026-09-17 Deepti failure. It is a rollback lever, not a setting.
@@ -1767,11 +1792,49 @@ def phone_barge_in_bank_max_age_sec() -> float:
         os.getenv("PHONE_BARGE_IN_BANK_MAX_AGE_SEC"), 3.0, 0.0, 30.0)
 
 
+#: Tokens that carry no answer. A bank made ENTIRELY of these is a
+#: backchannel — the candidate acknowledging the bot mid-sentence — and is the
+#: only thing `drop_stale_barge_in_bank` is allowed to discard.
+#:
+#: The discriminator exists because the age check alone cannot tell "Sure Ee"
+#: from "Yes I am", and the clock it uses is final-to-final (see
+#: `phone_barge_in_bank_max_age_sec`), so "stale" does not imply "abandoned".
+#: Discarding a short DIRECT answer would lose the reply to a question the bot
+#: had just asked — trading a truncated question for a missing answer.
+#:
+#: Closed, and deliberately small. Anything not listed keeps the bank.
+_BACKCHANNEL_TOKEN_RE = re.compile(
+    r"^(?:sure|yeah|yea|yah|yep|yup|ya+|yes|ok|okay|k|"
+    r"hmm+|mm+|mhm|uh+|um+|ah+|oh+|eh+|ee+|huh|"
+    r"right|got|alright|all\s*right|fine|good|"
+    r"haan|han|ji|acha|accha|theek|thik|"
+    r"hi|hey|hello|so|and|well|the|a)$",
+    re.IGNORECASE,
+)
+
+
+def is_backchannel_only(text: str) -> bool:
+    """True when every token in `text` is a contentless acknowledgement.
+
+    Empty text is NOT backchannel — there is nothing to discard, and the
+    caller has its own empty check. A single unrecognised token anywhere makes
+    the whole bank content, which is the conservative direction: the cost of
+    keeping a backchannel is one deferred barge-in, the cost of discarding an
+    answer is a hole in the transcript the scorer reads.
+    """
+    tokens = [t.strip(".,!?;:'\"") for t in (text or "").split()]
+    tokens = [t for t in tokens if t]
+    if not tokens:
+        return False
+    return all(_BACKCHANNEL_TOKEN_RE.match(t) for t in tokens)
+
+
 #: The `AudioRecognition` internals this repair reaches into, pinned to
 #: livekit-agents 1.6.4 (the exact production pin).
 #:
 #: THIS IS PRIVATE SDK STATE AND THAT IS DELIBERATE, because the two public
-#: doors are both worse. `clear_user_turn()` drops the bank but also runs
+#: doors are both worse. (`clear_user_turn()` does also clear the bank — the
+#: point is what else it drags with it.) `clear_user_turn()` drops the bank but also runs
 #: `update_stt(None); update_stt(stt)`, which tears down and rebuilds the
 #: `_STTPipeline` — a fresh Sarvam websocket, mid-call, on a path that already
 #: has an STT-websocket-death RCA against it. `commit_user_turn()` routes back
@@ -1779,10 +1842,12 @@ def phone_barge_in_bank_max_age_sec() -> float:
 #: gate that refused the fragment, so it is not a reliable clear at all.
 #: Zeroing the four fields costs no I/O and touches nothing else.
 #:
-#: The names are ASSERTED against the installed SDK by
-#: `tests/test_barge_in_bank.py`, so a version bump that renames them fails CI
-#: instead of silently turning this repair into a no-op — the failure mode a
-#: `getattr`-guarded reach-in otherwise has by construction.
+#: CI does NOT install the livekit packages, so nothing can assert these names
+#: against the real class there. What CI DOES assert is the PIN:
+#: `tests/test_barge_in_bank.py` reads `requirements.txt` and goes red if
+#: `livekit-agents==1.6.4` moves, forcing a human to re-read these fields
+#: before the bump lands. The direct field check in the same file runs only
+#: where the real SDK is importable and skips otherwise.
 _BARGE_IN_BANK_TEXT_FIELDS = (
     "_audio_transcript",
     "_audio_interim_transcript",
@@ -1829,6 +1894,13 @@ def drop_stale_barge_in_bank(
     arriving text to the bank. So a drop here is seen by the interrupt check
     that runs microseconds later, on the same event, in the same stack.
 
+    TWO conditions, both required. The bank must be STALE, and it must be
+    BACKCHANNEL-ONLY. Staleness alone is not enough: the clock is final-to-
+    final on this deployment (see `phone_barge_in_bank_max_age_sec`), so a
+    short direct answer would age out merely because the candidate's next
+    sentence ran long, and discarding it would delete the reply to the
+    question the bot had just asked.
+
     Returns "" when nothing was dropped, which is the overwhelmingly common
     case; the returned text is for the log line and the tests, and is never
     persisted.
@@ -1840,6 +1912,8 @@ def drop_stale_barge_in_bank(
         return ""
     banked = (getattr(recognition, "_audio_transcript", "") or "").strip()
     if not banked:
+        return ""
+    if not is_backchannel_only(banked):
         return ""
     stamp = getattr(recognition, _BARGE_IN_BANK_STAMP_FIELD, None)
     # A bank with no stamp at all has no age, and an unaged bank is not
