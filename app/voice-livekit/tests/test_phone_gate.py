@@ -15266,20 +15266,32 @@ class TestPhoneManifestTunables(unittest.TestCase):
         # And the floor must not regress below what the 9/31 revert bought.
         self.assertGreaterEqual(int(env["PHONE_SARVAM_NEGATIVE_FRAMES_COUNT"]), 18)
 
-    def test_endpointing_max_lowered_to_1_0_min_unchanged(self):
+    def test_endpointing_max_is_1_25_min_unchanged(self):
         # PR2a raised MAX 1.0->2.5: the built-in v1-mini EOU commits a COMPLETE
         # answer at MIN regardless of MAX, so MAX only bounds the wait on a
         # genuinely-INCOMPLETE mid-thought pause.
         #
         # OWNER RETUNE (2026-09-16): back to 1.0, decided against live calls.
         # This manifest had said 2.5 while production ran a SECRET of the same
-        # name — the same shadowing trap as PHONE_TTS_FLUSH_MIN_CHARS — so this
-        # pin is now what production actually runs once the secret is unset.
-        # The trade is stated in the manifest: a lower MAX cuts in sooner on a
-        # real mid-thought pause. MIN stays 0.3, so the common case (a complete
-        # answer) is unchanged.
+        # name — the same shadowing trap as PHONE_TTS_FLUSH_MIN_CHARS.
+        #
+        # OWNER RETUNE (2026-09-17): 1.0 -> 1.25, against Tina's call (session
+        # fa7b9e0d, first on v192). `phone_session_progress` recorded 2 of 9
+        # questions `not_delivered` and 2 more `asked_unanswered`, with 7 of 18
+        # bot turns `[interrupted question]`.
+        #
+        # THIS IS NOT THE DEFECT #299 FIXED, and the pin exists to keep that
+        # straight. #299 raised the interruption WORD FLOOR 2->3 so a backchannel
+        # cannot truncate a question, and that held: Tina's interruptions are
+        # 4-11 words of substantive speech and pass the floor correctly. The
+        # failure is the other side of the turn — she pauses mid-thought, MAX
+        # expires, the bot takes the floor, she resumes, the question dies
+        # `not_delivered`. Only the pause budget can fix that.
+        #
+        # ALL FOUR live-tuning secrets are UNSET as of 2026-09-17 (verified via
+        # `fly secrets list`), so this pin is what production actually runs.
         env = self._phone_env()
-        self.assertEqual(env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"], "1.0")
+        self.assertEqual(env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"], "1.25")
         self.assertEqual(env["PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC"], "0.3")
         self.assertGreaterEqual(float(env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"]), 0.5)
         self.assertLessEqual(float(env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"]), 3.0)
@@ -15293,7 +15305,7 @@ class TestPhoneManifestTunables(unittest.TestCase):
             "PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC":
                 env["PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC"],
         }):
-            self.assertAlmostEqual(phone.phone_static_endpointing_max_delay(), 1.0)
+            self.assertAlmostEqual(phone.phone_static_endpointing_max_delay(), 1.25)
 
 
 class TestReasoningEffortTripwire(unittest.TestCase):
