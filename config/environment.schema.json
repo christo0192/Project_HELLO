@@ -213,6 +213,7 @@
         "PHONE_QUEUED_SCORING_HOLD_SEC": { "requiredInProduction": false, "secret": false },
         "PHONE_PATIENCE_GATE": { "requiredInProduction": false, "secret": false },
         "PHONE_ANSWER_GATE": { "requiredInProduction": false, "secret": false },
+        "PHONE_END_CALL_DETECT": { "requiredInProduction": false, "secret": false },
         "PHONE_ANSWER_GATE_MAX_REASKS": { "requiredInProduction": false, "secret": false },
         "PHONE_DELIVERY_GATE": { "requiredInProduction": false, "secret": false },
         "PHONE_CONFLICT_GATE": { "requiredInProduction": false, "secret": false },

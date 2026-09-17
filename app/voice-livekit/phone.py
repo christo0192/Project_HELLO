@@ -6495,16 +6495,295 @@ async def run_phone_gate(
 # ── The phone agent ───────────────────────────────────────────────────
 
 
-_END_CALL_RE = re.compile(
-    r"\b(?:disconnect|hang\s*up|end|stop)\s+(?:the\s+|this\s+)?call\b|"
-    r"\b(?:please\s+)?(?:disconnect|hang\s*up)\b",
+# ── "End this call" — the ACT, and then WHO is doing it ───────────────
+#
+# WHY THIS IS NOT ONE REGEX ANY MORE.
+#
+# A match here is TERMINAL and immediate: `agent.py` arms the compliance
+# closing, hangs up, and the screening is recorded as candidate-ended. No
+# confirmation, no remaining questions. That severity is right — someone who
+# says "please stop calling me" must be obeyed at once — but it means the
+# predicate has to be about a REQUEST, not about vocabulary.
+#
+# The shipped pattern was `\b(?:please\s+)?(?:disconnect|hang\s*up)\b`: the bare
+# word, anywhere in the turn, with no actor, no tense and no target. On
+# 2026-09-16 that ended a live screening at question 6 of 9 on this real
+# utterance (transcript_turns, 13:05:56Z):
+#
+#   "...taking CRM notes right after I disconnect the call with my candidate,
+#    then I will be actually missing out..."
+#
+# The candidate was describing their own CRM habit, which is exactly what the
+# Sales-advisor question asks for ("How do you organize your CRM notes,
+# callbacks, and follow-ups"). The recruiter and customer-success templates ask
+# structurally identical questions. The role's vocabulary and the kill switch's
+# vocabulary are the same words; only the GRAMMAR separates them.
+#
+# So: find the act, then ask who is doing it and whether it is real or narrated.
+#
+# BIAS, stated once. A missed request is a compliance failure — we keep calling
+# someone who asked us to stop. A false positive costs one call. Where the two
+# conflict this fires.
+
+# The act, unbound to any actor. `cut the call` is NEW: it is the most common
+# Indian-English phrasing and the shipped pattern could not match it at all, so
+# "please cut the call" was silently ignored for the life of this feature. That
+# false NEGATIVE on a consent control is the more serious of the two defects
+# fixed here.
+_END_CALL_ACT = (
+    r"(?:disconnect|hang\s*up|cut|end|stop|drop)\s+(?:the\s+|this\s+|my\s+)?call"
+    r"|(?:disconnect|hang\s*up)"
+)
+_END_CALL_ACT_RE = re.compile(_END_CALL_ACT, re.IGNORECASE)
+
+# ── TRIGGERS: the three shapes a real request takes ───────────────────
+# Imperative, optionally softened. "Please disconnect." / "Just cut the call."
+_END_CALL_IMPERATIVE_RE = re.compile(
+    r"(?:^|[.,;:!?]\s*|\b(?:please|just|now|so|ok(?:ay)?|kindly|then)\s+)"
+    r"(?:please\s+|just\s+|kindly\s+|now\s+)*"
+    r"(?:" + _END_CALL_ACT + r")\b",
+    re.IGNORECASE,
+)
+# Addressed to US. "Can you hang up?" / "You can disconnect now."
+_END_CALL_SECOND_PERSON_RE = re.compile(
+    r"\b(?:can|could|will|would|you\s+can|you\s+should|you\s+may|"
+    r"are\s+you\s+able\s+to)\s+(?:you\s+)?(?:please\s+|just\s+)?"
+    r"(?:" + _END_CALL_ACT + r")\b",
+    re.IGNORECASE,
+)
+# First person WITH a volitional modal. This is the whole distinction the old
+# pattern could not see: "I want to hang up" is a request, "I hang up" is a
+# description of a habit, and they differ only by the modal.
+_END_CALL_FIRST_PERSON_RE = re.compile(
+    r"\b(?:i|we)\s+"
+    # Optional future auxiliary, so "I WILL HAVE TO disconnect" is reachable.
+    # A bare `will` is deliberately NOT a trigger on its own: "I will
+    # disconnect and log it" is narration, while "I will have to disconnect"
+    # is a request, and the volitional phrase is what separates them.
+    r"(?:(?:will|would|shall)\s+)?"
+    r"(?:want\s+to|need\s+to|have\s+to|had\s+to|got\s+to|gotta|wanna|"
+    r"like\s+to|rather|am\s+going\s+to|are\s+going\s+to|going\s+to|must)\s+"
+    r"(?:" + _END_CALL_ACT + r")\b"
+    r"|\blet(?:\s+us|\s+me)\s+(?:" + _END_CALL_ACT + r")\b",
+    re.IGNORECASE,
+)
+# An imperative carrying an explicit politeness or urgency marker. This is the
+# ONLY imperative strong enough to escape an inherited hypothetical frame —
+# see the frame handling in `is_explicit_end_call_request`.
+_END_CALL_STRONG_IMPERATIVE_RE = re.compile(
+    r"\b(?:please|kindly)\s+(?:just\s+|now\s+)*(?:" + _END_CALL_ACT + r")\b"
+    r"|(?:" + _END_CALL_ACT + r")\s+(?:please|now|right\s+now|immediately)\b",
     re.IGNORECASE,
 )
 
+# ── VETOES, split by the scope each one naturally has ─────────────────
+# PR #293's lesson, paid for once already: a veto scoped WIDER than its trigger
+# goes deterministically deaf. "If they hang up, I disconnect" carries two
+# actors in two clauses, so actor framing is judged PER CLAUSE; "my process
+# is..." licenses every clause after it, so meta-discourse is judged PER TURN.
+
+# Somebody else is doing it, or it is being done TO someone.
+_END_CALL_OTHER_ACTOR_RE = re.compile(
+    r"\b(?:they|he|she|it|them|their|"
+    r"(?:the|a|an|this|that|each|every|any)\s+"
+    r"(?:customer|client|prospect|candidate|caller|lead|user|person|advisor|rep)|"
+    r"my\s+(?:manager|lead|team|advisor|rep|"
+    r"customers?|clients?|prospects?|candidates?|callers?|leads?)|"
+    r"(?:some|most|many|several|a\s+few|lots\s+of|plenty\s+of|people|folks|others)"
+    r"(?:\s+\w+){0,2})\b"
+    # "hang up ON someone" is always narration: a request takes no object.
+    r"|\b(?:hang|hung|hangs|hanging)\s*up\s+on\b",
+    re.IGNORECASE,
+)
+# The candidate's own habit: present-tense, no volitional modal.
+_END_CALL_HABITUAL_RE = re.compile(
+    r"\b(?:i|we)\s+(?:usually\s+|always\s+|never\s+|generally\s+|typically\s+|"
+    r"often\s+|sometimes\s+|normally\s+|then\s+|just\s+|also\s+|immediately\s+)*"
+    r"(?:" + _END_CALL_ACT + r")\b",
+    re.IGNORECASE,
+)
+# Hypothetical or sequenced — describing when it happens, not asking for it.
+_END_CALL_CONDITIONAL_RE = re.compile(
+    r"\b(?:if|when|whenever|whether|suppose|supposing|in\s+case|once|after|"
+    r"as\s+soon\s+as|before|unless|until|in\s+situations?\s+where|"
+    r"the\s+moment|every\s+time)\b",
+    re.IGNORECASE,
+)
+# Reported speech: quoting what somebody else said or asked for.
+_END_CALL_REPORTED_RE = re.compile(
+    r"\b(?:say|says|said|saying|tell|tells|told|telling|ask|asks|asked|asking|"
+    r"request|requests|requested|wants?\s+me\s+to|wanted\s+me\s+to)\b",
+    re.IGNORECASE,
+)
+# An explicit first-person subject. Needed because English ELIDES the subject
+# in a coordinated verb phrase — "I take notes and then hang up" means "...and
+# then I hang up" — and splitting on `and`/`then` severs it. Without carrying
+# the subject forward, the second half reads as a bare imperative and ends a
+# live call. That exact sentence is a textbook answer to the Sales-advisor CRM
+# question, so this is not a corner case.
+_END_CALL_FIRST_SUBJECT_RE = re.compile(r"\b(?:i|we)\b", re.IGNORECASE)
+
+# NO PAST-TENSE VETO. There was one, and it could not fire: `_END_CALL_ACT`
+# matches no past form, so "I hung up" and "He disconnected the call" never
+# reach a trigger in the first place — "disconnected" only matches as a
+# substring of the present form, and every trigger requires a `\b` immediately
+# after the verb, which "disconnect|ed" fails. A guard that cannot fire reads
+# as a protection and is not one, so it is absent rather than decorative. If a
+# past form is ever added to the act, the veto has to come back with it.
+# PER-TURN: the turn announces itself as a description of process.
+_END_CALL_META_TURN_RE = re.compile(
+    r"\b(?:my\s+(?:process|approach|routine|habit)|the\s+way\s+i|what\s+i\s+do|"
+    r"how\s+i\s+(?:handle|manage|deal)|in\s+my\s+(?:last|previous|current|old)\s+"
+    r"(?:role|job|company)|at\s+my\s+(?:last|previous|current|old)\s+"
+    r"(?:role|job|company)|for\s+example|for\s+instance|generally\s+speaking)\b",
+    re.IGNORECASE,
+)
+
+# Clause boundaries. Coordinators included because "I call them and I hang up"
+# is two clauses with one subject and the second must inherit nothing.
+_END_CALL_CLAUSE_SPLIT_RE = re.compile(
+    r"(?:[.,;:!?]+|\b(?:and|but|then|so|because|however|also|plus|while|whereas|"
+    r"although|though)\b)",
+    re.IGNORECASE,
+)
+
+# Contractions are expanded BEFORE matching rather than spelling every
+# apostrophe form into every subject pattern: "I'd like to hang up" is a
+# request and `\b(?:i|we)\s+` cannot see it, because the apostrophe is not a
+# space. One normalisation, not six alternations.
+_END_CALL_CONTRACTIONS = (
+    (re.compile(r"\b(i|we|you|they)\s*['’]\s*d\b", re.IGNORECASE), r"\1 would"),
+    (re.compile(r"\b(i)\s*['’]\s*m\b", re.IGNORECASE), r"\1 am"),
+    (re.compile(r"\b(we|you|they)\s*['’]\s*re\b", re.IGNORECASE), r"\1 are"),
+    (re.compile(r"\b(i|we|you|they|he|she)\s*['’]\s*ll\b", re.IGNORECASE), r"\1 will"),
+    (re.compile(r"\b(i|we|you|they)\s*['’]\s*ve\b", re.IGNORECASE), r"\1 have"),
+    (re.compile(r"\blet\s*['’]\s*s\b", re.IGNORECASE), "let us"),
+)
+
+# The 2026-09-16 shape, kept as a named constant so the regression case in the
+# tests and the reason in this file cannot drift apart.
+_END_CALL_MAX_CHARS = 2000
+
+
+def end_call_detection_disabled() -> bool:
+    """Operator kill switch for the end-call detector.
+
+    Exists because this predicate ENDS LIVE CALLS and had no way to disable it
+    without a deploy. Set `PHONE_END_CALL_DETECT=off` to stop honouring spoken
+    hang-up requests; every other terminal path (the LLM tool, opt-out, the
+    reaper) is unaffected.
+
+    OFF IS THE UNSAFE DIRECTION — it means a candidate asking to be left alone
+    is not obeyed by this route — so it is opt-in, exact-match, and nothing but
+    the literal string `off` disarms it.
+    """
+    return (os.getenv("PHONE_END_CALL_DETECT") or "").strip().lower() == "off"
+
 
 def is_explicit_end_call_request(text: Any) -> bool:
-    """Recognise an unambiguous request to end the current call only."""
-    return isinstance(text, str) and _END_CALL_RE.search(text) is not None
+    """Is the candidate asking US to end THIS call, right now?
+
+    Not "do the words appear". See the block comment above for why those are
+    different questions and what the difference cost on a live call.
+    """
+    if not isinstance(text, str):
+        return False
+    if end_call_detection_disabled():
+        return False
+    # Bounded before any scanning. Every pattern here is linear and the clause
+    # split is a single pass, but a transcript turn is attacker-adjacent input
+    # on the worker's hot path and an unbounded scan is a tail-latency risk we
+    # do not need to take.
+    candidate = text.strip()[:_END_CALL_MAX_CHARS]
+    if not candidate:
+        return False
+    for pattern, replacement in _END_CALL_CONTRACTIONS:
+        candidate = pattern.sub(replacement, candidate)
+
+    # PER-TURN veto, computed once.
+    meta_turn = _END_CALL_META_TURN_RE.search(candidate) is not None
+
+    # A hypothetical frame governs FORWARD, not just its own clause. "If
+    # needed, disconnect the call" splits into a frame clause carrying no verb
+    # and an imperative clause carrying no `if`, so a strictly per-clause
+    # conditional veto reads the second half as a live order. Same for "Every
+    # time a client goes quiet I call once and then hang up politely."
+    #
+    # It is NOT promoted all the way to turn scope either: "I usually hang up
+    # after taking notes, BUT PLEASE DISCONNECT NOW" opens a frame in its first
+    # clause and makes a real request in its second, and a turn-wide veto would
+    # silence it — a compliance failure. So the frame is inherited forward and
+    # an explicitly marked request breaks out of it.
+    frame_open = False
+    # The subject most recently established in this turn, inherited by any
+    # later clause that names none of its own. See _END_CALL_FIRST_SUBJECT_RE.
+    last_subject: str | None = None
+
+    for clause in _END_CALL_CLAUSE_SPLIT_RE.split(candidate):
+        clause = clause.strip()
+        if not clause:
+            continue
+        opens_frame = bool(
+            _END_CALL_CONDITIONAL_RE.search(clause)
+            or _END_CALL_REPORTED_RE.search(clause)
+        )
+        own_first = bool(_END_CALL_FIRST_SUBJECT_RE.search(clause))
+        own_other = bool(_END_CALL_OTHER_ACTOR_RE.search(clause))
+
+        if not _END_CALL_ACT_RE.search(clause):
+            # Carries no request, but still sets the frame and the subject for
+            # everything after it.
+            frame_open = frame_open or opens_frame
+            if own_first:
+                last_subject = "first"
+            elif own_other:
+                last_subject = "other"
+            continue
+
+        if opens_frame:
+            frame_open = True
+            if own_first:
+                last_subject = "first"
+            elif own_other:
+                last_subject = "other"
+            continue
+
+        # Whose act is it? An explicit subject in this clause wins; otherwise
+        # inherit, because the subject was elided by coordination.
+        subject = "first" if own_first else ("other" if own_other else last_subject)
+        if subject == "first":
+            last_subject = "first"
+        elif subject == "other":
+            last_subject = "other"
+
+        if subject == "other":
+            continue
+        # Volitional first person is checked BEFORE habitual, because
+        # "I want to hang up" also matches the habitual shape and the modal is
+        # what distinguishes them. Order is load-bearing, not incidental.
+        # It also outranks both the inherited frame and the inherited subject:
+        # "I need to hang up" is a request however the turn opened.
+        if _END_CALL_FIRST_PERSON_RE.search(clause):
+            return True
+        if _END_CALL_HABITUAL_RE.search(clause):
+            continue
+        if meta_turn:
+            continue
+        if _END_CALL_SECOND_PERSON_RE.search(clause):
+            return True
+
+        # A bare imperative is only a request when nothing frames it. Inside an
+        # inherited hypothetical ("if needed, disconnect") or attached to an
+        # inherited first-person subject ("I take notes and then hang up"), it
+        # is the continuation of a description, and only an explicitly marked
+        # request — "please", "now" — escapes.
+        if frame_open or subject == "first":
+            if _END_CALL_STRONG_IMPERATIVE_RE.search(clause):
+                return True
+            continue
+        if _END_CALL_IMPERATIVE_RE.search(clause):
+            return True
+    return False
 
 
 # Post-plan candidate Q&A is deliberately bounded. Three real questions is
