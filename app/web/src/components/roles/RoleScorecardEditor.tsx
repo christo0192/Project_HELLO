@@ -4,11 +4,26 @@
  * Shown beneath the role form for an EXISTING role (a new, unsaved role has no
  * id to attach a scorecard to). It reads the role's active immutable scorecard
  * (GET /scorecard), lets an owner attach library metrics, edit each metric's
- * per-role INSTRUCTION and DISPLAY ORDER, and drag a WEIGHT slider per metric.
- * Weights always total 100%: a slider drag pins one metric and redistributes
- * the remainder with the exact server math (mirrored client-side so the slider
- * is instant), and attaching/removing a metric re-splits the set evenly. Save
+ * per-role INSTRUCTION and DISPLAY ORDER, and TYPE a weight per metric. Save
  * writes a new immutable version (PUT /scorecard).
+ *
+ * WEIGHTS ARE TYPED, NOT DRAGGED (owner request 2026-09-18). The weight was a
+ * slider that auto-redistributed: pinning one metric silently rewrote every
+ * other one so the set always read 100%. That is tidy but it takes the decision
+ * away — an owner who wants 30/30/20/10/10 could not simply say so, and could
+ * not see a deliberate in-progress total.
+ *
+ * So a weight is now a number box and NOTHING is redistributed on edit. The
+ * consequence is the point: the set CAN sit at 97% or 104% while editing. So a
+ * running total says how far off 100% it is and Save stays blocked until it is
+ * exactly right, and that total is stated TWICE — in the section header and
+ * again beside Save, because a scorecard runs to 20 metrics and the header has
+ * scrolled away by the time the number matters.
+ *
+ * NOTHING rewrites a typed weight — not even attach or remove. A new metric
+ * takes whatever is left of 100%, a removed one just goes, and the running
+ * total reports whatever that leaves. The old even re-split on attach/remove
+ * was the same silent overwrite in a different costume.
  *
  * Role gating is UX-delegated to the API here (as elsewhere in this SPA — the
  * server enforces "interviewer owns own role, admin all" on every request);
@@ -34,14 +49,16 @@ import {
   InlineNotice,
   SectionHeader,
   SelectField,
-  Slider,
+  TextField,
   TextArea,
 } from '../design';
 import {
-  evenWeights,
+  SCORECARD_WEIGHT_TOTAL_BPS,
+  bpsToPercent,
+  everyWeightIsPositive,
   formatWeightPercent,
-  redistributeWeights,
   totalWeightBps,
+  weightDeltaBps,
   weightsAreComplete,
 } from '../../lib/scorecard-weights';
 
@@ -75,20 +92,63 @@ function renumber(metrics: EditorMetric[]): EditorMetric[] {
   return metrics.map((m, i) => ({ ...m, displayOrder: i }));
 }
 
+/**
+ * Is this box text a weight we are willing to COMMIT?
+ *
+ * Deliberately strict, and deliberately shared by the change and blur
+ * handlers: if the two disagreed about what counts as typed, a value could be
+ * committed on the way in and then treated as abandoned on the way out (or
+ * the reverse). Out of range is not committed — the box keeps showing it while
+ * the owner is still typing, and blur decides its fate.
+ */
+function isTypedPercent(raw: string): boolean {
+  if (raw.trim() === '') return false;
+  const pct = Number(raw);
+  return Number.isFinite(pct) && pct >= 0 && pct <= 100;
+}
+
 export function RoleScorecardEditor({ roleId }: { roleId: string }) {
   const [metrics, setMetrics] = useState<EditorMetric[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
   const [library, setLibrary] = useState<ScorecardMetricTemplate[] | null>(null);
   const [libraryForbidden, setLibraryForbidden] = useState(false);
   const [addSelection, setAddSelection] = useState('');
+  /**
+   * In-progress text per metric weight box, keyed by metric id.
+   *
+   * Only what the user is CURRENTLY typing lives here; the committed value is
+   * always `metric.weightBps`. Cleared on blur so the box re-formats from the
+   * committed number (and rounds to the 2dp the server stores).
+   *
+   * `restore` is the weight the metric held when this edit STARTED, and it is
+   * what makes an abandoned edit safe. Every in-range keystroke commits so the
+   * running total tracks live, which means typing "1000" (meaning 10.00)
+   * commits 1 → 10 → 100 on the way past before the final string is rejected
+   * for being over 100. Without `restore`, blurring there would leave the
+   * weight at 100% — a number the owner never chose. With it, a box that ends
+   * on anything unparseable or out of range goes back to where it started.
+   */
+  const [weightDrafts, setWeightDrafts] = useState<
+    Record<string, { text: string; restore: number }>
+  >({});
   const [saving, setSaving] = useState(false);
   const [message, setMessage] = useState<{ text: string; tone: 'ok' | 'error' } | null>(null);
   const newRowCounter = useRef(0);
 
-  const load = useCallback(() => {
+  /**
+   * Re-read the active scorecard.
+   *
+   * `keepMessage` exists because a successful save does `setMessage(ok)` and
+   * then reloads, and React batches both updates into ONE render — so clearing
+   * the message here threw away the confirmation before it could ever paint.
+   * The only visible result of an irreversible new-version write was the panel
+   * blinking through "Loading scorecard…", which is indistinguishable from
+   * nothing having happened.
+   */
+  const load = useCallback((keepMessage = false) => {
     setLoadError(null);
     setMetrics(null);
-    setMessage(null);
+    if (!keepMessage) setMessage(null);
     api
       .getRoleScorecard(roleId)
       .then((r) => {
@@ -127,7 +187,14 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
     return (
       <GlassPanel>
         <SectionHeader level={3} title="Scorecard" />
-        <InlineNotice tone="danger" role="alert" className="mt-4" action={<Button size="sm" onClick={load}>Try again</Button>}>
+        <InlineNotice tone="danger" role="alert" className="mt-4"           // `() => load()`, not `load`: as a bare handler React hands it the
+          // MouseEvent, which lands in `keepMessage` and is truthy — a retry
+          // would preserve a stale message instead of clearing it.
+          action={
+            <Button size="sm" onClick={() => load()}>
+              Try again
+            </Button>
+          }>
           {loadError}
         </InlineNotice>
       </GlassPanel>
@@ -144,12 +211,34 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
 
   const total = totalWeightBps(metrics);
   const complete = weightsAreComplete(metrics);
+  const delta = weightDeltaBps(metrics);
+  const allPositive = everyWeightIsPositive(metrics);
+  /**
+   * How far off 100% the set is, in words. Derived ONCE and used by all three
+   * places that state it — the header total, the total beside Save, and the
+   * refusal message — so they cannot word the same fact differently.
+   *
+   * Always a string (it reads "0% short" on a complete set) rather than null,
+   * so no caller can stringify a null into the UI; `complete` gates whether it
+   * is shown at all.
+   */
+  const offBy =
+    delta > 0 ? `${formatWeightPercent(delta)} over` : `${formatWeightPercent(-delta)} short`;
   const attachedLibIds = new Set(metrics.map((m) => m.libraryMetricId));
   const available = (library ?? []).filter((m) => !attachedLibIds.has(m.id));
   const atCap = metrics.length >= SCORECARD_MAX_METRICS;
 
-  function onSlider(id: string, percent: number) {
-    setMetrics((prev) => (prev ? redistributeWeights(prev, id, Math.round(percent * 100)) : prev));
+  /**
+   * Commit a typed weight for ONE metric. No redistribution: the owner's number
+   * is the owner's number, and the running total reports the consequence.
+   *
+   * `percent` is accepted at 2dp (the bps resolution), so 33.33 round-trips.
+   */
+  function onWeightPercent(id: string, percent: number) {
+    const bps = Math.round(percent * 100);
+    setMetrics((prev) =>
+      prev ? prev.map((m) => (m.id === id ? { ...m, weightBps: bps } : m)) : prev,
+    );
   }
 
   function onInstruction(id: string, value: string) {
@@ -170,12 +259,17 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
     });
   }
 
+  /**
+   * Remove a metric and leave every OTHER weight exactly as typed.
+   *
+   * This used to re-split the survivors evenly. Under typed weights that is
+   * the same sin the slider committed: an owner who set 40/30/20/10 and then
+   * removed the 10 would find the other three silently rewritten to
+   * 33.34/33.33/33.33. Now the set simply goes 10% short and the running
+   * total says so — which is what the running total is for.
+   */
   function removeMetric(id: string) {
-    setMetrics((prev) => {
-      if (!prev) return prev;
-      const kept = renumber(prev.filter((m) => m.id !== id));
-      return kept.length > 0 ? evenWeights(kept) : kept;
-    });
+    setMetrics((prev) => (prev ? renumber(prev.filter((m) => m.id !== id)) : prev));
   }
 
   function addMetric() {
@@ -195,11 +289,16 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
           name: lib.name,
           instruction: lib.default_instruction,
           rubric: lib.rubric,
-          weightBps: 0,
+          // The new metric takes WHAT IS LEFT, and no existing weight is
+          // touched. On a fresh scorecard that hands the first metric the
+          // whole 100%; on a complete set it gives the newcomer 0% and Save
+          // asks for a weight; on a set sitting at 80% it completes it. No
+          // path rewrites a number the owner typed.
+          weightBps: Math.max(0, SCORECARD_WEIGHT_TOTAL_BPS - totalWeightBps(base)),
           displayOrder: base.length,
         },
       ]);
-      return evenWeights(next);
+      return next;
     });
     setAddSelection('');
   }
@@ -212,7 +311,22 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
       return;
     }
     if (!complete) {
-      setMessage({ text: 'Weights must total 100% before saving.', tone: 'error' });
+      // Say WHICH WAY and BY HOW MUCH. "Weights must total 100%" leaves the
+      // owner to do the arithmetic the editor already did. Same `offBy` the
+      // two on-screen totals use, so the refusal cannot word it differently.
+      setMessage({
+        text: `Weights total ${formatWeightPercent(total)} — ${offBy}. They must total exactly 100% before saving.`,
+        tone: 'error',
+      });
+      return;
+    }
+    if (!allPositive) {
+      // Totals 100% but a metric sits at 0, which the server rejects. Reported
+      // separately so the message names the real problem.
+      setMessage({
+        text: 'Every metric needs a weight above 0%. Remove the metric instead if it should not count.',
+        tone: 'error',
+      });
       return;
     }
     const body: PutRoleScorecardInput = {
@@ -229,7 +343,7 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
     try {
       await api.putRoleScorecard(roleId, body);
       setMessage({ text: 'Scorecard saved as a new version.', tone: 'ok' });
-      load();
+      load(true);
     } catch (e) {
       setMessage({
         text: e instanceof ApiError ? e.message : 'Failed to save the scorecard.',
@@ -245,19 +359,47 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
       <SectionHeader
         level={3}
         title="Scorecard"
-        description="Attach metrics from the library, tune each metric's instruction, order and weight. Weights always total 100%."
+        description="Attach metrics from the library, then set each metric's instruction, order and weight. Weights must total exactly 100% to save."
         meta={
+          // THE RUNNING TOTAL IS THE SAFETY NET for typed weights. It states the
+          // total, and when that is not 100% it also states the direction and
+          // the size of the gap, so the owner never has to add five numbers by
+          // hand to find out why Save is refusing.
+          // Hidden entirely at zero metrics: "No metrics attached yet" is a
+          // legitimate state the panel describes in plain words, and a red
+          // "Total 0% - 100% short" over it is an alarm about nothing. The
+          // footer total already hides itself there.
+          metrics.length === 0 ? undefined : (
           <span
             className={`text-[13px] font-medium tabular-nums ${complete ? 'text-ink-tertiary' : 'text-error-text'}`}
             data-weight-total-bps={total}
+            data-weight-delta-bps={delta}
+            // The live region is PERMANENT, not toggled on when the total goes
+            // wrong. A region that appears at the same moment its content
+            // changes is not reliably announced — a screen reader has to be
+            // watching it beforehand. Keeping it mounted also means reaching
+            // 100% is announced, which is the confirmation a sighted owner
+            // gets from the colour.
+            role="status"
+            aria-live="polite"
           >
             Total {formatWeightPercent(total)}
+            {!complete && ` · ${offBy}`}
           </span>
+          )
         }
       />
 
       {message && (
-        <InlineNotice tone={message.tone === 'ok' ? 'success' : 'danger'} role="status" className="mt-4">
+        <InlineNotice
+          tone={message.tone === 'ok' ? 'success' : 'danger'}
+          // A save REFUSAL is inserted into the DOM at the same instant it
+          // needs announcing, and a polite `status` region created in that
+          // same moment is unreliable. `alert` is assertive and announces on
+          // insertion, which is exactly this case.
+          role={message.tone === 'ok' ? 'status' : 'alert'}
+          className="mt-4"
+        >
           {message.text}
         </InlineNotice>
       )}
@@ -329,23 +471,91 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
                 >
                   Weight
                 </span>
-                <Slider
-                  id={`metric-${m.id}-weight`}
-                  className="min-w-0 flex-1"
-                  value={Math.round(m.weightBps / 100)}
-                  min={1}
-                  max={metrics.length > 1 ? 99 : 100}
-                  step={1}
-                  onValueChange={(pct) => onSlider(m.id, pct)}
-                  aria-label={`Weight for ${m.name}`}
-                  aria-valuetext={formatWeightPercent(m.weightBps)}
-                />
-                <span
-                  className="w-16 shrink-0 text-right font-mono text-sm tabular-nums text-ink"
-                  data-metric-weight-bps={m.weightBps}
-                >
-                  {formatWeightPercent(m.weightBps)}
-                </span>
+                <div className="flex items-center gap-1.5">
+                  {/* The WRAPPER carries the width, not the input. `cx` is a
+                      plain joiner, not tailwind-merge, so a `w-24` on the
+                      input would sit alongside `controlClass`'s `w-full` and
+                      lose on stylesheet order — the box would silently render
+                      full-width. Sizing the wrapper and leaving the input
+                      `w-full` has no such collision. `w-28` because "100.00"
+                      in a mono face plus the native spin buttons does not fit
+                      in `w-24`. */}
+                  <div className="w-28 shrink-0">
+                  <TextField
+                    id={`metric-${m.id}-weight`}
+                    type="number"
+                    inputMode="decimal"
+                    size="sm"
+                    className="text-right font-mono tabular-nums"
+                    // 0 is ALLOWED to be typed even though the server rejects
+                    // it: blocking the keystroke would make clearing a field to
+                    // retype it impossible. `everyWeightIsPositive` catches it
+                    // at save with a message that says which problem it is.
+                    min={0}
+                    max={100}
+                    // 1, not 0.01. This is the ARROW-KEY step, and at 0.01 a
+                    // keyboard user needed 6,666 presses to go from 33.34 to
+                    // 100 — a straight regression from the slider, which
+                    // stepped by 1. Typing 2dp still works: `isTypedPercent`
+                    // never consults `step`, and nothing here reads native
+                    // validity, so a 33.33 "stepMismatch" has no effect.
+                    step={1}
+                    value={weightDrafts[m.id]?.text ?? String(bpsToPercent(m.weightBps))}
+                    aria-label={`Weight for ${m.name}`}
+                    aria-describedby={`metric-${m.id}-weight-unit`}
+                    onChange={(e) => {
+                      const raw = e.target.value;
+                      // The DRAFT is what the box shows while typing. Without it
+                      // a controlled numeric input fights the user: parsing
+                      // every keystroke turns "" into 0 and makes "33." or a
+                      // cleared field impossible to type through. The first
+                      // keystroke of an edit also records what to fall back to.
+                      setWeightDrafts((d) => ({
+                        ...d,
+                        [m.id]: { text: raw, restore: d[m.id]?.restore ?? m.weightBps },
+                      }));
+                      if (isTypedPercent(raw)) onWeightPercent(m.id, Number(raw));
+                    }}
+                    // A FOCUSED number input eats the scroll wheel and steps
+                    // its own value. On a 20-metric card an owner scrolls past
+                    // the box they just typed into and the weight silently
+                    // moves — the precise mistake the running total exists to
+                    // catch, introduced by the control itself. Blur instead,
+                    // so the wheel scrolls the page and the box settles on its
+                    // committed weight.
+                    onWheel={(e) => e.currentTarget.blur()}
+                    onBlur={(e) => {
+                      // An edit that ends on something we never committed —
+                      // empty, "33.", "1000" — is ABANDONED, not partially
+                      // applied: put the weight back where the edit found it.
+                      const draft = weightDrafts[m.id];
+                      if (draft && !isTypedPercent(e.target.value)) {
+                        setMetrics((prev) =>
+                          prev
+                            ? prev.map((x) =>
+                                x.id === m.id ? { ...x, weightBps: draft.restore } : x,
+                              )
+                            : prev,
+                        );
+                      }
+                      // Drop the draft so the box re-renders from the committed
+                      // bps, normalising "07" to "7" and 2dp-rounding the rest.
+                      setWeightDrafts((d) => {
+                        const next = { ...d };
+                        delete next[m.id];
+                        return next;
+                      });
+                    }}
+                  />
+                  </div>
+                  <span
+                    id={`metric-${m.id}-weight-unit`}
+                    className="text-[13px] text-ink-tertiary"
+                    data-metric-weight-bps={m.weightBps}
+                  >
+                    %
+                  </span>
+                </div>
               </div>
             </li>
           ))}
@@ -390,9 +600,23 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
           </div>
         )}
 
-        <Button variant="primary" onClick={save} loading={saving} disabled={metrics.length === 0}>
-          Save scorecard
-        </Button>
+        {/* The total sits WITH Save because that is where it is acted on; the
+            header states it too, for the at-a-glance read. */}
+        <div className="flex flex-wrap items-center justify-end gap-3">
+          {metrics.length > 0 && (
+            <span
+              className={`text-[13px] font-medium tabular-nums ${
+                complete ? 'text-ink-tertiary' : 'text-error-text'
+              }`}
+              data-weight-total-footer={total}
+            >
+              {complete ? 'Weights total 100%' : `Weights total ${formatWeightPercent(total)} — ${offBy}`}
+            </span>
+          )}
+          <Button variant="primary" onClick={save} loading={saving} disabled={metrics.length === 0}>
+            Save scorecard
+          </Button>
+        </div>
       </div>
     </GlassPanel>
   );
