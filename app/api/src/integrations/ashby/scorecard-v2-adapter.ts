@@ -18,16 +18,33 @@
  * workflow-stores.ts branch on `schema_version` and call this for v2 rows.
  *
  * SUMMARY — the recruiter-facing "why". Owner decision (#275): the Summary
- * field carries one line per metric — "<Name> — <score>/5: <rationale>" — so a
- * recruiter reading the Ashby card sees the reasoning, not just numbers. Each
- * rationale is bounded and control-stripped; the whole summary is bounded by
- * `buildScorecard` (2000 chars) and trimmed here on whole lines so no rationale
- * is cut mid-sentence. Metrics with insufficient evidence are listed as such.
- * The evidence refs (transcript turn ids) are NEVER copied.
+ * field carries one line per metric — "<Name> — <score>/<scaleMax>: <rationale>"
+ * — so a recruiter reading the Ashby card sees the reasoning, not just numbers.
+ * Each rationale is bounded and control-stripped; the whole summary is bounded
+ * by `buildScorecard` (2000 chars) and trimmed here on whole lines so no
+ * rationale is cut mid-sentence. The evidence refs (transcript turn ids) are
+ * NEVER copied.
  *
- * FAIL-CLOSED (mirrors buildScorecard's reason union): rather than invent an
- * overall for an evidence-incomplete assessment or emit a fabricated 0 for a
- * metric that was never scored, the adapter returns `{ blocked: <reason> }`.
+ * Metrics with insufficient evidence lead the summary as "<Name> — NOT SCORED
+ * (insufficient evidence): <reason>", ahead of the scored lines, so the trim
+ * can never drop the very notices a partial card exists to carry. The header
+ * states coverage ("across 4 of 5 metrics; 1 not scored") because the weighted
+ * score is renormalized over the scored metrics — 2.5/4 at 4-of-5 does not mean
+ * what 2.5/4 at 5-of-5 means.
+ *
+ * PARTIAL EVIDENCE PUBLISHES (owner decision 2026-09-18). A row that scored
+ * SOME metrics reaches Ashby: the scored ones become dimensions, the unscored
+ * ones are omitted from the score fields and named in the summary as NOT
+ * SCORED with the scorer's reason. Withholding them meant that in practice
+ * NOTHING was ever written back — `compensation_fit` needs the bot to state
+ * the role's salary range and `night_shift_fit` needs it to ask about night
+ * availability, and the call script does neither reliably, so no assessment
+ * ever reached `scoring_status = 'complete'`.
+ *
+ * STILL FAIL-CLOSED where it matters (mirrors buildScorecard's reason union):
+ * a fabricated 0 is never emitted for an unscored metric, and a row where NOT
+ * ONE metric scored has no weighted score and is blocked outright. The adapter
+ * returns `{ blocked: <reason> }` in those cases.
  */
 
 import {
@@ -106,14 +123,19 @@ export interface ScorecardSourceFromV2Options {
 /**
  * Fail-closed reasons, deliberately parallel to buildScorecard's:
  *   - `not_v2`               — the row is not a schema_version=2 assessment;
- *   - `incomplete_evidence`  — scoring_status !== 'complete' or the weighted 1–5
- *                              score is null/out-of-range (no overall may be
- *                              invented — matches the scorer nulling the weighted
- *                              score whenever any metric lacked evidence);
+ *   - `incomplete_evidence`  — the weighted score is null or out of range for the
+ *                              row's scale. Null means NOT ONE metric scored
+ *                              (`weightedScoreFor` renormalizes over the scored
+ *                              metrics and returns null only when there are
+ *                              none), so no overall may be invented. NOTE: since
+ *                              2026-09-18 a merely PARTIAL row is NOT blocked —
+ *                              only a wholly unscoreable one;
  *   - `no_dimensions`        — no metric survived to a scored dimension;
- *   - `invalid_recommendation` — a 'complete' row without a valid
+ *   - `invalid_recommendation` — a scoreable row without a valid
  *                              advance/hold/reject recommendation (data-integrity
  *                              guard; the adapter never defaults it silently).
+ *                              `human_review` accompanies a null weighted score
+ *                              and is already blocked above.
  */
 export type V2AdapterBlockReason =
   | 'not_v2'
@@ -182,8 +204,21 @@ export function buildV2RichSummary(
   lines: readonly string[],
   maxTotalLen: number = MAX_SUMMARY_TOTAL_LEN,
   scaleMax: number = SCORE_MAX,
+  coverage?: { readonly scored: number; readonly notScored: number },
 ): string {
-  const header = `AI phone screen — weighted ${formatWeighted(weighted)}/${scaleMax} across ${lines.length} metric${lines.length === 1 ? '' : 's'}.`;
+  // COVERAGE IS STATED, NOT IMPLIED. Since partial rows publish (see the gate
+  // in `scorecardSourceFromV2Assessment`), a reader in Ashby must be able to
+  // tell a 4-of-5 card from a 5-of-5 one WITHOUT counting the lines below —
+  // the weighted score is renormalized over the scored metrics, so 2.5/4 means
+  // something different at 4-of-5 than at 5-of-5 and must not read the same.
+  //
+  // `coverage` is optional so existing callers keep the historical header.
+  const total = coverage ? coverage.scored + coverage.notScored : lines.length;
+  const scored = coverage ? coverage.scored : lines.length;
+  const base = `AI phone screen — weighted ${formatWeighted(weighted)}/${scaleMax}`;
+  const header = coverage && coverage.notScored > 0
+    ? `${base} across ${scored} of ${total} metrics; ${coverage.notScored} not scored (listed below).`
+    : `${base} across ${scored} metric${scored === 1 ? '' : 's'}.`;
   let out = header;
   for (const line of lines) {
     const candidate = `${out}\n${line}`;
@@ -213,15 +248,41 @@ export function scorecardSourceFromV2Assessment(
     return { blocked: 'not_v2' };
   }
 
-  // 2. Fail closed on anything less than fully-evidenced. Since partial scoring
-  //    (0091) an 'incomplete_evidence' row MAY carry a provisional weighted score,
-  //    but that verdict is NOT authoritative for an Ashby writeback — a human must
-  //    confirm it first. So this gate keys on STATUS: only a 'complete' row flows
-  //    on; any non-'complete' status is blocked here (the weighted null/range check
-  //    below is then a defensive backstop, unreachable for a complete row).
-  if (row.scoring_status !== 'complete') {
-    return { blocked: 'incomplete_evidence' };
-  }
+  // 2. PARTIAL EVIDENCE IS PUBLISHED, NOT WITHHELD (owner decision 2026-09-18).
+  //
+  //    This gate used to be `row.scoring_status !== 'complete'` — only a fully
+  //    evidenced row could reach Ashby, on the reasoning that a partial verdict
+  //    "is NOT authoritative … a human must confirm it first".
+  //
+  //    THAT GATE HAD NEVER ONCE OPENED IN PRODUCTION. `ashby_operations` held
+  //    zero rows for the life of the system, across 8 assessments and 6
+  //    candidates, because `scoring_status = 'complete'` requires ALL FIVE
+  //    metrics evidenced and two of them cannot be evidenced by the call the
+  //    bot actually has:
+  //
+  //      * `compensation_fit` compares the candidate's number against the
+  //        ROLE'S STATED RANGE, and the bot never states it. Rijo gave both of
+  //        his numbers and still scored `insufficient_evidence`, the rationale
+  //        reading "the interviewer never stated the role's compensation range".
+  //      * `night_shift_fit` needs the bot to ask about night availability. On
+  //        Neelu's call it never asked.
+  //
+  //    So the gate was not protecting a rare edge case; it was suppressing
+  //    every screening the product has ever produced, silently — the store
+  //    returns `assessment_incomplete` to a caller that logs nothing.
+  //
+  //    A withheld scorecard is not a safer scorecard. It is an HR team with no
+  //    record at all of a completed screening. The unscored metrics are NOT
+  //    fabricated to fill the gap: step 4 below omits them from the Ashby score
+  //    fields entirely and names each one in the summary with the scorer's own
+  //    reason, so the reader sees exactly what was and was not assessed.
+  //
+  //    THE BAR IS NOW "AT LEAST ONE METRIC SCORED", enforced by the two checks
+  //    that follow rather than by status: a row where NOTHING scored has a null
+  //    `weighted_score_5` (see `weightedScoreFor` — it returns null only when no
+  //    metric had a score) and is blocked immediately below, and `no_dimensions`
+  //    backstops it. A null weighted score is also the only way `recommendation`
+  //    can be `human_review`, so that value still cannot reach Ashby.
   // The row's own rubric scale (0093). Absent → current scale.
   const scaleMax: ScoreScaleMax = isScoreScaleMax(row.score_scale_max) ? row.score_scale_max : SCORE_MAX;
   const weighted = row.weighted_score_5;
@@ -250,7 +311,22 @@ export function scorecardSourceFromV2Assessment(
   //    the recruiter knows it was considered. Evidence refs never cross.
   const metricResults = Array.isArray(row.metric_results) ? row.metric_results : [];
   const dimensions: NonNullable<ScorecardSource['dimensions']>[number][] = [];
-  const summaryLines: string[] = [];
+  // UNSCORED LINES ARE COLLECTED SEPARATELY AND EMITTED FIRST.
+  //
+  // `buildV2RichSummary` stops appending at MAX_SUMMARY_TOTAL_LEN, so ordering
+  // decides what survives a long card. The "not scored" notices are the whole
+  // point of publishing a partial scorecard — a reader must not be told the
+  // weighted score was renormalized over 4 of 5 metrics and then be unable to
+  // find which one is missing. Putting the exceptions ahead of the scored
+  // lines makes that guarantee ordering-independent rather than a bet on
+  // rationale lengths.
+  const scoredLines: string[] = [];
+  const unscoredLines: string[] = [];
+  // Counted in the LOOP, not derived from `dimensions.length`. Two things make
+  // that count wrong: the Role fit dimension is appended after the loop and is
+  // not a metric, and SCORECARD_MAX_METRICS can cap a scored metric out of the
+  // dimension list. Either would misreport coverage in the header.
+  let scoredMetricCount = 0;
   for (const raw of metricResults) {
     const entry = asObject(raw);
     if (!entry) continue;
@@ -259,9 +335,10 @@ export function scorecardSourceFromV2Assessment(
     const name = readMetricName(entry, key);
     const rationale = typeof entry.rationale === 'string' ? cleanText(entry.rationale, MAX_SUMMARY_RATIONALE_LEN) : '';
     if (entry.evidenceStatus !== 'scored' || !isScoreOnScale(entry.score, scaleMax)) {
-      summaryLines.push(`${name} — not scored (insufficient evidence)${rationale ? `: ${rationale}` : ''}`);
+      unscoredLines.push(`${name} — NOT SCORED (insufficient evidence)${rationale ? `: ${rationale}` : ''}`);
       continue;
     }
+    scoredMetricCount += 1;
     if (dimensions.length < SCORECARD_MAX_METRICS) {
       dimensions.push({
         key,
@@ -271,7 +348,7 @@ export function scorecardSourceFromV2Assessment(
         metricScaleMax: scaleMax,
       });
     }
-    summaryLines.push(`${name} — ${entry.score}/${scaleMax}${rationale ? `: ${rationale}` : ''}`);
+    scoredLines.push(`${name} — ${entry.score}/${scaleMax}${rationale ? `: ${rationale}` : ''}`);
   }
   if (dimensions.length === 0) return { blocked: 'no_dimensions' };
 
@@ -300,11 +377,20 @@ export function scorecardSourceFromV2Assessment(
   ) {
     const rounded = Math.round(roleFitScore);
     dimensions.push({ key: ROLE_FIT_DIMENSION.key, name: ROLE_FIT_DIMENSION.name, score: rounded });
-    summaryLines.push(`${ROLE_FIT_DIMENSION.name} — ${rounded}/10 (résumé vs role)`);
+    scoredLines.push(`${ROLE_FIT_DIMENSION.name} — ${rounded}/10 (résumé vs role)`);
   }
 
   // 5. Recruiter-facing summary, bounded on whole lines.
-  const summary = buildV2RichSummary(weighted, summaryLines, MAX_SUMMARY_TOTAL_LEN, scaleMax);
+  // Exceptions first (see the collection comment above), then the scored
+  // lines. Coverage counts METRICS ONLY — the Role fit line is a derived
+  // résumé signal appended to `scoredLines`, not one of the configured
+  // metrics, so counting it would overstate how much of the rubric was
+  // actually evidenced.
+  const summaryLines = [...unscoredLines, ...scoredLines];
+  const summary = buildV2RichSummary(
+    weighted, summaryLines, MAX_SUMMARY_TOTAL_LEN, scaleMax,
+    { scored: scoredMetricCount, notScored: unscoredLines.length },
+  );
 
   // 6. Provenance — same keys the v1 builder reads, all optional.
   const provenanceObj = asObject(row.provenance) ?? {};
