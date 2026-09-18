@@ -26,7 +26,18 @@ primary_region = "sin"
   DEEPSEEK_MODEL = "deepseek-v4-flash"
   DEEPSEEK_SCORING_MODEL = "deepseek-v4-pro"
   DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1/chat/completions"
+  # The SHARED budget: résumé parsing and every other v4-flash call. Left at
+  # 120s deliberately — a hung parse must not stall for minutes.
   DEEPSEEK_TIMEOUT_MS = "120000"
+  # SCORING ONLY (v4-pro). See `deepseekScoringTimeoutMs` in lib/env.ts for the
+  # measurements: every successful scoring run on 2026-09-17 took 133-206s, so
+  # the shared 120s timed out essentially every first attempt.
+  #
+  # A Fly SECRET of the same name was set live on 2026-09-17 as the immediate
+  # mitigation and SHADOWS this file. Unset it after this deploys, in that
+  # order — unsetting first drops production back to the old value until the
+  # release lands. `fly secrets list -a project-hello-api` is the check.
+  DEEPSEEK_SCORING_TIMEOUT_MS = "270000"
   DEEPSEEK_MAX_OUTPUT_BYTES = "5242880"
   # Parser/scoring reasoning bumped from model-default to "high"
   # (owner-approved 2026-09-07). The parse path is async with the 120s timeout

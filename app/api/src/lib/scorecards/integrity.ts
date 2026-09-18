@@ -224,6 +224,7 @@ export async function analyzeResumeIntegrity(
     (async (prompt: string): Promise<unknown> => {
       const { data } = await runClaudeJSONWithProvenance<unknown>(prompt, {
         model: env.deepseekScoringModel,
+        timeoutMs: env.deepseekScoringTimeoutMs,
       });
       return data;
     });
