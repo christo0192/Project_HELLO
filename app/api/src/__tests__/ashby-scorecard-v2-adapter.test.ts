@@ -5,8 +5,9 @@
  * overall taken from weighted_score_5 and the recommendation passed through;
  * the row's OWN rubric scale (`score_scale_max`: 4 since 0093, 5 for a
  * historical row, defaulted to 4 when the column is absent) governs projection,
- * range-checking and the summary text; an evidence-incomplete row fails closed
- * with NO invented overall; a null-score metric is omitted (never a fabricated
+ * range-checking and the summary text; a PARTIALLY evidenced row PUBLISHES
+ * (owner decision 2026-09-18) with its unscored metrics named in the summary,
+ * while a row where NOTHING scored still fails closed with no invented overall; a null-score metric is omitted (never a fabricated
  * 0); no metric name / rationale / evidence ref leaks into the produced source;
  * and the produced dimension keys, run through the REAL bindFeedbackForm,
  * submit only the keys the tenant binding maps and silently omit the rest.
@@ -26,6 +27,7 @@ import {
   HELLO_CHRISTY_SCORECARD_BINDING,
   isScorecardSafe,
   type ScorecardScale,
+  type ScorecardSource,
 } from '../integrations/ashby/scorecard.js';
 
 const SCALE: ScorecardScale = { min: 1, max: 4 };
@@ -158,6 +160,114 @@ describe('scorecardSourceFromV2Assessment — happy path', () => {
   });
 });
 
+describe('scorecardSourceFromV2Assessment — PARTIAL EVIDENCE PUBLISHES', () => {
+  // Owner decision 2026-09-18. Before this, the adapter blocked every row whose
+  // `scoring_status` was not 'complete'. In production that gate NEVER opened:
+  // `ashby_operations` held zero rows across 8 assessments and 6 candidates,
+  // because `compensation_fit` needs the bot to state the role's salary range
+  // and `night_shift_fit` needs it to ask about night availability, and the
+  // call script does neither reliably. These tests pin the new contract.
+
+  function partialRow() {
+    return v2Row({
+      scoring_status: 'incomplete_evidence',
+      weighted_score_5: 2.5,
+      recommendation: 'hold',
+      metric_results: [
+        metricResult('communication', 3),
+        metricResult('compensation_fit', null, {
+          name: 'Compensation fit',
+          rationale: "the interviewer never stated the role's compensation range",
+        }),
+      ],
+    });
+  }
+
+  it('PUBLISHES an incomplete_evidence row that scored at least one metric', () => {
+    const result = scorecardSourceFromV2Assessment(partialRow(), { reviewPath: REVIEW_PATH });
+    expect(isV2AdapterBlocked(result)).toBe(false);
+  });
+
+  it('omits the unscored metric from the Ashby score fields — never a fabricated 0', () => {
+    const result = scorecardSourceFromV2Assessment(
+      partialRow(), { reviewPath: REVIEW_PATH },
+    ) as ScorecardSource;
+    const keys = (result.dimensions ?? []).map((d) => d.key);
+    expect(keys).toContain('communication');
+    expect(keys).not.toContain('compensation_fit');
+  });
+
+  it('names the unscored metric in the summary with the scorer own reason', () => {
+    const result = scorecardSourceFromV2Assessment(
+      partialRow(), { reviewPath: REVIEW_PATH },
+    ) as ScorecardSource;
+    expect(result.summary).toContain(
+      "Compensation fit — NOT SCORED (insufficient evidence): the interviewer never stated the role's compensation range",
+    );
+  });
+
+  it('states coverage in the header, because the weighted score is renormalized', () => {
+    // 2.5/4 over 1 of 2 metrics does NOT mean what 2.5/4 over 2 of 2 means.
+    const result = scorecardSourceFromV2Assessment(
+      partialRow(), { reviewPath: REVIEW_PATH },
+    ) as ScorecardSource;
+    expect(result.summary).toContain('across 1 of 2 metrics; 1 not scored');
+  });
+
+  it('puts the NOT SCORED notices BEFORE the scored lines so a trim cannot drop them', () => {
+    const result = scorecardSourceFromV2Assessment(
+      partialRow(), { reviewPath: REVIEW_PATH },
+    ) as ScorecardSource;
+    const notScoredAt = result.summary.indexOf('NOT SCORED');
+    const scoredAt = result.summary.indexOf('Metric communication — 3/4');
+    expect(notScoredAt).toBeGreaterThan(-1);
+    expect(scoredAt).toBeGreaterThan(-1);
+    expect(notScoredAt).toBeLessThan(scoredAt);
+  });
+
+  it('coverage counts METRICS, not dimensions — Role fit must not inflate it', () => {
+    // Regression: the first cut used `dimensions.length`, which is evaluated
+    // AFTER the derived Role fit dimension is appended. Rijo's real card then
+    // read "across 5 of 6 metrics" when he has five metrics, four scored.
+    const result = scorecardSourceFromV2Assessment(
+      v2Row({
+        scoring_status: 'incomplete_evidence',
+        weighted_score_5: 2.25,
+        recommendation: 'reject',
+        role_fit: { score: 6 },
+        metric_results: [
+          metricResult('communication', 2),
+          metricResult('night_shift_fit', 2),
+          metricResult('profile_relevance', 3),
+          metricResult('stability', 3),
+          metricResult('compensation_fit', null),
+        ],
+      }),
+      { reviewPath: REVIEW_PATH },
+    ) as ScorecardSource;
+    expect(result.summary).toContain('across 4 of 5 metrics; 1 not scored');
+    expect(result.summary).not.toContain('of 6 metrics');
+    // Role fit still rides along as its own field.
+    expect((result.dimensions ?? []).map((d) => d.name)).toContain('Role fit');
+  });
+
+  it('STILL BLOCKS a row where not one metric scored', () => {
+    // `weightedScoreFor` returns null only when nothing scored, and that is the
+    // one case where no overall may be invented. It is also the only way
+    // `recommendation` can be 'human_review', so that never reaches Ashby.
+    const result = scorecardSourceFromV2Assessment(
+      v2Row({
+        scoring_status: 'incomplete_evidence',
+        weighted_score_5: null,
+        recommendation: 'human_review',
+        metric_results: [metricResult('communication', null), metricResult('compensation_fit', null)],
+      }),
+      { reviewPath: REVIEW_PATH },
+    );
+    expect(result).toEqual({ blocked: 'incomplete_evidence' });
+  });
+});
+
 describe('scorecardSourceFromV2Assessment — fail closed', () => {
   it('blocks an evidence-incomplete row without inventing an overall', () => {
     const result = scorecardSourceFromV2Assessment(
@@ -200,7 +310,7 @@ describe('scorecardSourceFromV2Assessment — fail closed', () => {
     // …but the english metric scored 5 is off the four-point scale and is
     // dropped rather than projected against a scale we cannot trust.
     expect(bogus.dimensions.map((d) => d.key)).toEqual(['communication']);
-    expect(bogus.summary).toContain('Metric english — not scored (insufficient evidence)');
+    expect(bogus.summary).toContain('Metric english — NOT SCORED (insufficient evidence)');
   });
 
   it('blocks a non-v2 row (schema_version != 2)', () => {
@@ -240,7 +350,7 @@ describe('scorecardSourceFromV2Assessment — omission & redaction', () => {
     ]);
     expect(result.dimensions.some((d) => d.key === 'motivation')).toBe(false);
     // …but the recruiter is TOLD it was considered and why it has no score.
-    expect(result.summary).toContain('Metric motivation — not scored (insufficient evidence): rationale for motivation');
+    expect(result.summary).toContain('Metric motivation — NOT SCORED (insufficient evidence): rationale for motivation');
   });
 
   it('never leaks evidence refs; rationale appears ONLY in the summary; the name only on its dimension', () => {
@@ -373,8 +483,9 @@ describe('a pre-0093 five-point row keeps its own scale end to end', () => {
       { key: 'communication', score: 8, name: 'Metric communication', metricScore: 3, metricScaleMax: 4 },
     ]);
     expect(untagged.overallScore).toBe(100); // weighted 4 on 1..4
-    expect(untagged.summary).toContain('weighted 4/4 across 2 metrics.');
-    expect(untagged.summary).toContain('Metric english — not scored (insufficient evidence)');
+    // Coverage is now explicit: 1 of 2 scored, 1 not.
+    expect(untagged.summary).toContain('weighted 4/4 across 1 of 2 metrics; 1 not scored');
+    expect(untagged.summary).toContain('Metric english — NOT SCORED (insufficient evidence)');
   });
 
   it('bucketing still applies when the form scale differs from the row rubric scale', () => {

@@ -453,7 +453,7 @@ describe('worker — a v2 scorecard auto-binds by name against the live form def
     expect(byPath.get(PATHS.overall)).toBe('3');
     expect(byPath.get(PATHS.summary)).toEqual({
       type: 'PlainText',
-      value: expect.stringContaining('Compensation fit — not scored (insufficient evidence)'),
+      value: expect.stringContaining('Compensation fit — NOT SCORED (insufficient evidence)'),
     });
     expect((byPath.get(PATHS.summary) as { value: string }).value).toContain('Profile relevance — 4/4');
     expect(byPath.get(PATHS.redFlags!)).toBe('- Unverifiable employer claim');
