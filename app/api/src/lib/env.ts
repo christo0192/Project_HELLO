@@ -5,6 +5,7 @@ import 'dotenv/config';
 const _contractVisibleEnvReads = [
   process.env.CLAUDE_TIMEOUT_MS,
   process.env.DEEPSEEK_TIMEOUT_MS,
+  process.env.DEEPSEEK_SCORING_TIMEOUT_MS,
   process.env.PORT,
   process.env.SHUTDOWN_GRACE_MS,
   process.env.BREAKER_FAILURE_THRESHOLD,
@@ -108,6 +109,31 @@ export const env = {
    */
   deepseekReasoningEffort: process.env.DEEPSEEK_REASONING_EFFORT ?? '',
   deepseekTimeoutMs: positiveInt('DEEPSEEK_TIMEOUT_MS', 120000, 1, 300000),
+  /**
+   * SCORING gets its own budget, because it is a different job on a different
+   * model. `DEEPSEEK_MODEL` is v4-flash and answers a parse in seconds;
+   * `DEEPSEEK_SCORING_MODEL` is v4-pro building a five-metric rubric with
+   * rationales and evidence refs over a whole transcript.
+   *
+   * MEASURED 2026-09-17, every successful scoring run that day: 133s, 162s,
+   * 167s, 174s, 191s, 206s. EVERY ONE exceeded the shared 120s default — even
+   * the 9-turn call took 133s, so the floor is the model, not the transcript.
+   * Scoring therefore timed out on essentially every first attempt and only
+   * landed when a retry happened to slip through; two calls burned 3 and 4 of
+   * their 5 attempts, and a 5th exhaustion loses the scorecard silently.
+   *
+   * 270s covers the slowest observed run with ~30% headroom. Raising the
+   * SHARED `DEEPSEEK_TIMEOUT_MS` would have worked too, and was the live
+   * mitigation on 2026-09-17 — but it also hands the résumé parser a 270s
+   * budget it never needs, turning a hung parse into a 4.5-minute stall.
+   *
+   * THE UPPER BOUND IS 300000 AND IS NOT ARBITRARY: `validateRuntimeOverrides`
+   * in lib/claude.ts THROWS on `timeoutMs > 300_000`. A wider clamp here would
+   * let an operator set 400000 and get a TypeError at call time — scoring
+   * crashing instead of waiting longer, which is the opposite of the intent.
+   * Keep these two numbers equal.
+   */
+  deepseekScoringTimeoutMs: positiveInt('DEEPSEEK_SCORING_TIMEOUT_MS', 270000, 1, 300000),
   deepseekMaxOutputBytes: positiveInt(
     'DEEPSEEK_MAX_OUTPUT_BYTES', 5 * 1024 * 1024, 1024, 100 * 1024 * 1024,
   ),

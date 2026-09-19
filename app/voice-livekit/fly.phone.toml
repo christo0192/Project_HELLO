@@ -179,11 +179,32 @@ primary_region = "sin"
   # speech only in the cases where the EOU judges the utterance INCOMPLETE;
   # a complete answer still commits at MIN (0.3) regardless of MAX, so the
   # common case is unchanged either way. Owner's call, made against live calls.
+  #
+  # OWNER RETUNE 2026-09-17: MAX 1.0 -> 1.25, against Tina's call
+  # (session fa7b9e0d, the first on v192). That call COMPLETED — 34 turns, notice
+  # period and CTC both captured — but `phone_session_progress` records 2 of 9
+  # questions as `not_delivered` and 2 more as `asked_unanswered`, and 7 of 18
+  # bot turns carry `[interrupted question]`.
+  #
+  # THIS IS NOT THE BARGE-IN DEFECT #299 FIXED, and the distinction is the whole
+  # reason for this change. #299 raised the interruption word floor 2 -> 3 so a
+  # BACKCHANNEL ("Sure", "Yes Okay") can no longer truncate a question — that
+  # held. Tina's interruptions are 4-11 WORDS of substantive speech, so they pass
+  # the floor correctly. What actually happened is the other side of the turn:
+  # she pauses mid-thought, MAX expires, the bot takes the floor and starts a
+  # question, she resumes, and the question dies `not_delivered`. A word floor
+  # cannot fix that; only the pause budget can.
+  #
+  # 1.25 and not 2.5: this is a deliberate small step back toward PR2a's value,
+  # not a revert of the 2026-09-16 owner retune. The cost is bounded and falls
+  # ONLY on turns the v1-mini EOU judges INCOMPLETE — a complete answer still
+  # commits at MIN (0.3). Re-measure `not_delivered` on the next call before
+  # moving further.
   PHONE_STATIC_ENDPOINTING_MIN_DELAY_SEC = "0.3"
-  PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC = "1.0"
+  PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC = "1.25"
 
-  # ═══ DEPLOY NOTE — FOUR SECRETS MUST BE UNSET, AND ONLY AFTER THE DEPLOY ═══
-  # These four values were tuned live, as Fly SECRETS, so they could be changed
+  # ═══ DEPLOY NOTE — RESOLVED 2026-09-17. THIS FILE IS CONFIGURATION AGAIN. ═══
+  # Four values were once tuned live as Fly SECRETS so they could be changed
   # without a deploy while listening to a call:
   #
   #   PHONE_SARVAM_NEGATIVE_SPEECH_THRESHOLD   0.55
@@ -191,16 +212,22 @@ primary_region = "sin"
   #   PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW      28
   #   PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC   1.0
   #
-  # A secret SHADOWS the `[env]` value of the same name, so until they are
-  # unset THIS FILE IS DOCUMENTATION, NOT CONFIGURATION — which is exactly the
-  # state that made the manifest lie about the endpointing max and about
-  # PHONE_TTS_FLUSH_MIN_CHARS before it.
+  # ALL FOUR ARE NOW UNSET — verified against
+  # `fly secrets list -a project-hello-phone-voice` on 2026-09-17, which returns
+  # no match for ENDPOINTING, SARVAM_NEGATIVE or FLUSH_MIN. So the `[env]`
+  # values above are what production actually runs, and editing this file is
+  # once again the way to change them.
   #
-  # ORDER MATTERS, and getting it backwards silently reverts the tuning:
+  # THE TRAP IS KEPT ON RECORD because it cost a wrong diagnosis twice: a secret
+  # SHADOWS the `[env]` value of the same name, so while one is set THIS FILE IS
+  # DOCUMENTATION, NOT CONFIGURATION. That is what made the manifest lie about
+  # the endpointing max, and about PHONE_TTS_FLUSH_MIN_CHARS before it.
+  #
+  # If any of them is ever set live again, ORDER MATTERS on the way back:
   #   1. deploy this file (the `[env]` values land but stay shadowed);
   #   2. THEN `fly secrets unset <name> -a project-hello-phone-voice` for each.
-  # Unsetting FIRST drops production back to the previous `[env]` numbers
-  # (0.45-unset / 18 / 24 / 2.5) until the deploy completes.
+  # Unsetting FIRST drops production to the previous `[env]` numbers until the
+  # deploy completes. AND CHECK `fly secrets list` BEFORE trusting this block.
   # ═════════════════════════════════════════════════════════════════════════
   # ── Coverage JUDGE provider (Call G, 2026-09-08) ─────────────────────────────
   # Point the off-speech-path coverage judge at DeepSeek V4-Flash with reasoning

@@ -442,7 +442,7 @@ async function runAssessmentImpl(
         resumeFacts,
         callTimestampIso,
       }),
-      { model: env.deepseekScoringModel },
+      { model: env.deepseekScoringModel, timeoutMs: env.deepseekScoringTimeoutMs },
     );
 
     // Recompute overall_score + recommendation in code (transparent, tunable).
