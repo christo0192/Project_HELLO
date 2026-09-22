@@ -254,9 +254,18 @@ async function expireStaleRoleDraft(ownerId: string, staleBefore: string): Promi
  * process that also serves live-call operations, and nothing else bounds how
  * often the button can be pressed — the UI's guard is per-component, so two
  * tabs, or a script holding a valid interviewer token, could start hundreds a
- * minute. `uq_role_drafts_owner_running` (0101) is what actually enforces it;
- * a SELECT-then-INSERT cannot, because a concurrent request sees the same
- * empty result.
+ * minute. `uq_role_drafts_owner_running` (0101) is what enforces it; a
+ * SELECT-then-INSERT cannot, because a concurrent request sees the same empty
+ * result.
+ *
+ * IT BOUNDS ROWS, NOT GENERATIONS, and the difference is worth stating.
+ * `cancelRoleDraft` frees the slot the instant it writes `status='cancelled'`,
+ * but `shouldCancel` is only read BETWEEN attempts — so the 240-300s call
+ * already in flight runs to completion and keeps billing. Start, cancel,
+ * start, cancel is therefore a way to hold several generations open at once,
+ * bounded only by the per-user rate limit. An idempotency window on start
+ * would close it; the constraint alone does not, and this comment used to
+ * claim otherwise.
  *
  * A live job for the SAME role is RETURNED — the caller asked to be drafting
  * and they now are, which is exactly what a second tab should see. A live job
@@ -315,10 +324,15 @@ export async function startRoleDraft(
       if (row.job_role.trim() === jobRole.trim()) return toJob(row);
       throw new RoleDraftBusyError(row.job_role);
     }
+    // NO ROW AT ALL is the third case, and it used to fall through to a 500.
+    // The conflicting job settled between the insert and this read — two tabs
+    // press Ask Hello, the first wins, and its draft fails on a provider 502
+    // before the second tab's read lands. Retrying is simply correct: the
+    // constraint that refused is no longer being violated.
     if (row) {
       await expireStaleRoleDraft(ownerId, new Date(now() - ROLE_DRAFT_STALE_MS).toISOString());
-      ({ data, error } = await insert());
     }
+    ({ data, error } = await insert());
   }
   if (error) throw error;
 

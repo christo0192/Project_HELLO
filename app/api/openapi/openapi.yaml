@@ -7666,6 +7666,11 @@ components:
       type: object
       required: [id, title, required_skills, screening_template, is_active, created_at]
       properties:
+        agent_name:
+          type: string
+          maxLength: 80
+          nullable: true
+          description: Operator-facing label for this role's screening agent. Never spoken to a candidate and never used for routing; shown on the role card so a field that can only be written is not also unverifiable.
         id:
           type: string
           format: uuid
@@ -7837,6 +7842,11 @@ components:
       type: object
       required: [id, candidate_id, role_id, mode, provider, status, started_at]
       properties:
+        candidate_words:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: Words the CANDIDATE said in this session. Null when no transcript was read - which is not the same claim as 0, and the UI shows nothing rather than accusing the candidate of silence. Not talk time; no per-speaker duration is stored anywhere.
         id:
           type: string
           format: uuid

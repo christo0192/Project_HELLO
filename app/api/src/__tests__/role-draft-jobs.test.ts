@@ -581,6 +581,31 @@ describe('the 23505 branch — where the index and the read disagree', () => {
     await settle();
   });
 
+  it('RETRIES when the conflicting row has VANISHED, rather than 500ing', async () => {
+    // The third case, and it used to fall through to `throw error` with the
+    // raw unique violation. Two tabs press Ask Hello; the first wins; its
+    // draft fails instantly on a provider 502 and the row settles before the
+    // second tab's recovery read lands. There is now nothing to conflict
+    // with, so the right answer is another insert — not a 500 carrying
+    // "duplicate key value violates unique constraint".
+    selectQueue = [[], []];          // nothing live, and nothing running either
+    insertErrors = [DUP];            // the first insert lost to a row now gone
+    const run = vi.fn().mockResolvedValue({ draft: DRAFT, attempts: 1, repaired: [] });
+
+    const job = await startRoleDraft(OWNER, 'Sales Advisor', {
+      run: run as never,
+      now: () => NOW,
+    });
+
+    expect(job.id).toBe('draft-1');
+    expect(calls.filter((c) => c.op === 'insert')).toHaveLength(2);
+    // Nothing was expired — there was nothing to expire.
+    expect(calls.some((c) => c.op === 'update' && c.payload?.error_reason === 'abandoned')).toBe(
+      false,
+    );
+    await settle();
+  });
+
   it('does not retry forever — one expiry, one retry', async () => {
     // If the second insert also fails the error is raised. A loop here would
     // spin against a constraint that is not going to change its mind.

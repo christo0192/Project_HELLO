@@ -1,7 +1,12 @@
 import { Router } from 'express';
 import { supabase } from '../lib/supabase.js';
 import { validateBody, validateParams } from '../lib/validation.js';
-import { createRoleSchema, updateRoleSchema, roleIdParamSchema } from '../schemas/roles.js';
+import {
+  createRoleSchema,
+  roleDraftSchema,
+  roleIdParamSchema,
+  updateRoleSchema,
+} from '../schemas/roles.js';
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
 import {
@@ -11,7 +16,6 @@ import {
   RoleDraftBusyError,
   startRoleDraft,
 } from '../lib/role-draft-jobs.js';
-import { roleDraftSchema } from '../schemas/roles.js';
 
 export const rolesRouter = Router();
 

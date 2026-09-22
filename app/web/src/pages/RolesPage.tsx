@@ -357,7 +357,7 @@ function RoleForm({
     <GlassPanel padding="lg">
       <SectionHeader
         title={role ? "Edit role" : "New role"}
-        description="The title, focus and questions below drive the screening conversation."
+        description="The job role, focus and questions below drive the screening conversation."
       />
       <form onSubmit={handleSubmit} className="mt-5 space-y-5">
         {/* ABOVE the job role, because it is what the operator calls this

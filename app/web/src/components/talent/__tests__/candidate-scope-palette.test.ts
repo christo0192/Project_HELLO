@@ -36,6 +36,12 @@ const CANDIDATE_SCOPE_SOURCES = [
   'src/components/talent/ResumeReviewBadge.tsx',
   'src/components/talent/CandidateScorecard.tsx',
   'src/components/talent/CandidateOverviewSections.tsx',
+  // Renders inside `.candidate-scope` via `CandidateHeader`'s `meta` slot, so
+  // it is subject to the same palette rules. The list is hand-written rather
+  // than discovered, which means a new file on the candidate surface sits
+  // OUTSIDE this guard until someone remembers — a reviewer caught exactly
+  // that for this one.
+  'src/components/talent/CandidateHeadlineFacts.tsx',
   'src/components/talent/AshbyWorkflowCard.tsx',
   'src/components/talent/TranscriptionSyncWorkspace.tsx',
   'src/components/talent/Tabs.tsx',
