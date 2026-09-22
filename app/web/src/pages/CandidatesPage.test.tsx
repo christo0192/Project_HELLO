@@ -266,6 +266,40 @@ describe('CandidatesPage', () => {
     expect(await within(table).findAllByText('Senior Frontend Engineer')).toHaveLength(3);
   });
 
+  it('says "—" when the roles request FAILS, never "Unknown role"', async () => {
+    // A failed fetch is not knowledge. `.finally(() => setRolesLoaded(true))`
+    // treated it as knowledge and put every row back to "Unknown role" — a
+    // positive claim that every candidate's role had been deleted. Nothing
+    // covered the rejection path, so re-adding `.finally` passed the suite.
+    mockApi.listRoles.mockRejectedValue(new Error('boom'));
+    renderPage();
+    await screen.findByText('Jane Doe');
+    const table = screen.getByRole('table');
+    expect(within(table).queryByText('Unknown role')).not.toBeInTheDocument();
+    expect(within(table).queryByText('Senior Frontend Engineer')).not.toBeInTheDocument();
+  });
+
+  it('MOVES FOCUS into the panel only from the far-away trigger', async () => {
+    // The mechanism has been rewritten twice (rAF-in-a-state-updater, then an
+    // effect) with no assertion either time. APG: a disclosure whose content
+    // follows the trigger must NOT steal focus; the empty-state button is
+    // hundreds of pixels below the panel, so it must.
+    mockApi.listCandidates.mockResolvedValue([]);
+    renderPage();
+    await screen.findByText('No candidates yet');
+
+    fireEvent.click(screen.getByRole('button', { name: 'Upload a resume' }));
+    const panel = await screen.findByRole('region', { name: 'Upload a resume' });
+    expect(panel).toHaveFocus();
+
+    // Close, then reopen from the HEADER button: focus must stay put.
+    fireEvent.click(screen.getByRole('button', { name: 'Upload a resume' }));
+    const header = screen.getByRole('button', { name: 'Upload resume' });
+    header.focus();
+    fireEvent.click(header);
+    expect(header).toHaveFocus();
+  });
+
   it('marks a role the roles list does not carry, instead of showing its uuid', async () => {
     // Reachable when a role is deleted, or filtered out of the caller's
     // scope. A raw uuid in the cell is worse than useless to a recruiter.

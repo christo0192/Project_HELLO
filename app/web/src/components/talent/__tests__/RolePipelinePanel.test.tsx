@@ -137,6 +137,9 @@ describe('RolePipelinePanel', () => {
     expect(screen.queryByText('Support')).not.toBeInTheDocument();
     const notice = await screen.findByText(/1 role could not be read/);
     expect(notice).toHaveAttribute('data-failed-roles', '1');
+    // Visible WITHOUT expanding: the reader has no reason to open a panel
+    // they do not know is incomplete.
+    expect(notice).toBeVisible();
   });
 
   it('still reports a failure when every SURVIVING role has no candidates', async () => {
@@ -149,7 +152,13 @@ describe('RolePipelinePanel', () => {
         : Promise.resolve({ totals: funnelTotals({ candidates_total: 0 }) }),
     );
     render(<RolePipelinePanel roles={ROLES} />);
-    expect(await screen.findByText(/1 role could not be read/)).toBeInTheDocument();
+    // VISIBLE, not merely present. `findByText` does not filter hidden
+    // content, so this passed while the notice sat inside the collapsed body
+    // — behind a toggle reading "Show 0 roles", which is the silence the
+    // counter exists to break.
+    expect(await screen.findByText(/1 role could not be read/)).toBeVisible();
+    // ...and no toggle is offered when there is nothing to expand.
+    expect(screen.queryByRole('button', { name: /^Show/ })).not.toBeInTheDocument();
   });
 
   it('SURVIVES a synchronous throw from the client', async () => {

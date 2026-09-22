@@ -41,11 +41,15 @@ const FILL: Record<PipelineTone, string> = {
   positive: 'var(--c-positive)',
   caution: 'var(--c-caution)',
   negative: 'var(--c-negative)',
-  // `--c-border`, NOT `--c-ink-secondary`. The latter is an INK token — dark
-  // in light mode — so "nobody has been dialled yet" drew as the heaviest
-  // block on the bar and read, at a glance, as a full worked pipeline. The
-  // emptiest bucket must not be the loudest.
-  neutral: 'var(--c-border)',
+  // MEASURED, after two wrong guesses in opposite directions.
+  // `--c-ink-secondary` (#334155) is an ink token: 8.90:1 on the track, so
+  // "nobody dialled yet" drew as the heaviest block and read as a full worked
+  // pipeline. `--c-border` (#dbe1ec) overshot the other way at 1.13:1 —
+  // one step from the empty track itself, and identical to the `unavailable`
+  // swatch, so the usually-dominant bucket became invisible.
+  // `--c-ink-muted` is 4.03:1 on the track and 4.68:1 on the surface: clear of
+  // the 3:1 floor a meaningful graphic needs (WCAG 1.4.11), without shouting.
+  neutral: 'var(--c-ink-muted)',
 };
 
 export interface PipelineSegment {

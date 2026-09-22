@@ -141,8 +141,8 @@ export function segmentsFor(totals: FunnelSummaryTotals): PipelineSegment[] {
     // sitting 20px above "Connected 6" (reached this stage) gave a recruiter
     // two defensible answers to one question from a single 40px block.
     { key: 'not_dialed', label: 'Awaiting first dial', value: total - dialed, tone: 'neutral' },
-    { key: 'no_answer', label: 'Dialled, never answered', value: dialed - connected, tone: 'caution' },
-    { key: 'connected', label: 'Answered, not screened', value: connected - scored, tone: 'accent' },
+    { key: 'no_answer', label: 'Called, no answer', value: dialed - connected, tone: 'caution' },
+    { key: 'connected', label: 'Spoke, not assessed', value: connected - scored, tone: 'accent' },
     { key: 'scored', label: 'Screening complete', value: scored, tone: 'positive' },
     {
       key: 'selected',
@@ -287,16 +287,37 @@ export function RolePipelinePanel({ roles, roleId }: RolePipelinePanelProps) {
         >
           Pipeline by role
         </h2>
-        <button
-          type="button"
-          aria-expanded={open}
-          aria-controls={bodyId}
-          onClick={() => setOpen((o) => !o)}
-          className="inline-flex min-h-11 items-center rounded-full px-3 text-[13px] font-medium text-[var(--c-accent)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
-        >
-          {open ? 'Hide' : `Show ${populated.length} ${populated.length === 1 ? 'role' : 'roles'}`}
-        </button>
+        {/* No toggle when there is nothing behind it. Reachable now that the
+            panel also renders for a failures-only outage: it used to offer
+            "Show 0 roles" over an empty body. */}
+        {populated.length > 0 && (
+          <button
+            type="button"
+            aria-expanded={open}
+            aria-controls={bodyId}
+            onClick={() => setOpen((o) => !o)}
+            className="inline-flex min-h-11 items-center rounded-full px-3 text-[13px] font-medium text-[var(--c-accent)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+          >
+            {open ? 'Hide' : `Show ${populated.length} ${populated.length === 1 ? 'role' : 'roles'}`}
+          </button>
+        )}
       </div>
+
+      {failedRoles > 0 && (
+        // OUTSIDE the disclosure body, deliberately. A chart that is MISSING
+        // roles must say so, and saying it behind a collapse that the reader
+        // has no reason to open is the same silence the counter exists to
+        // break — worse, it reads as "0 roles" on the toggle beside it.
+        <p
+          role="status"
+          className="mt-2 text-xs leading-5 text-[var(--c-caution)]"
+          data-failed-roles={failedRoles}
+        >
+          {failedRoles === 1
+            ? '1 role could not be read, so it is missing from this chart.'
+            : `${failedRoles} roles could not be read, so they are missing from this chart.`}
+        </p>
+      )}
 
       <div id={bodyId} hidden={!open}>
       <p className="mt-1 text-[13px] leading-5 text-[var(--c-ink-secondary)]">
@@ -325,20 +346,6 @@ export function RolePipelinePanel({ roles, roleId }: RolePipelinePanelProps) {
           </div>
         ))}
       </div>
-
-      {failedRoles > 0 && (
-        // A chart that is MISSING roles must say so. Silence here reads as
-        // "those roles have no pipeline".
-        <p
-          role="status"
-          className="mt-4 text-xs leading-5 text-[var(--c-caution)]"
-          data-failed-roles={failedRoles}
-        >
-          {failedRoles === 1
-            ? '1 role could not be read, so it is missing from this chart.'
-            : `${failedRoles} roles could not be read, so they are missing from this chart.`}
-        </p>
-      )}
 
       </div>
     </GlassPanel>

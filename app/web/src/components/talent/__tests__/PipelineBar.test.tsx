@@ -62,27 +62,33 @@ describe('segmentsFor — nested funnel stages become disjoint buckets', () => {
     expect(by.get('scored')).toBe(5);
   });
 
-  it('labels each bucket as a STOPPING POINT, sharing no word with the stage line', () => {
-    // "Connected 2" (this bucket) 20px above "connected 6" (reached this
-    // stage) gave two defensible answers to one question.
-    const labels = segmentsFor(funnelTotals({ candidates_total: 1 })).map((s) => s.label);
-    for (const label of labels) {
-      expect(label).not.toBe('Dialled');
-      expect(label).not.toBe('Connected');
-      expect(label).not.toBe('Screened');
+  it('never yields NaN from a NON-NUMERIC payload', () => {
+    // The values here must be ones `?? 0` CANNOT rescue. The first version of
+    // this test used `undefined` and `null`, which the pre-fix
+    // `Math.max(0, x ?? 0)` already coerced to 0 — so the guard it was written
+    // to defend could be deleted and the test stayed green.
+    for (const partial of [
+      { candidates_total: 10, dialed: NaN } as never,
+      { candidates_total: 10, connected: 'many' } as never,
+      { candidates_total: 10, scored: Infinity } as never,
+      { candidates_total: 10, dialed: undefined, connected: null } as never,
+    ]) {
+      const segs = segmentsFor(partial);
+      for (const seg of segs) expect(Number.isFinite(seg.value)).toBe(true);
+      const counted = segs.filter((x) => !x.unavailable);
+      expect(counted.reduce((n, x) => n + x.value, 0)).toBe(10);
     }
   });
 
-  it('never yields NaN from a partial or non-numeric payload', () => {
-    // `Math.max(0, NaN)` is NaN and poisons the whole chain: the role still
-    // passed the has-candidates filter, then drew no bar and four "NaN"
-    // figures.
-    const partial = { candidates_total: 10, dialed: undefined, connected: null } as never;
-    for (const seg of segmentsFor(partial)) {
-      expect(Number.isFinite(seg.value)).toBe(true);
+  it('shares no LABEL WORD between the buckets and the stage line', () => {
+    // Word-level, not exact-string. Asserting `!== 'Connected'` let
+    // "Connected, not screened" through, re-creating the very collision the
+    // check is named after.
+    const stageWords = new Set(['dialled', 'connected', 'screened']);
+    for (const seg of segmentsFor(funnelTotals({ candidates_total: 1 }))) {
+      const words = seg.label.toLowerCase().split(/[^a-z]+/).filter(Boolean);
+      for (const w of words) expect(stageWords.has(w)).toBe(false);
     }
-    const counted = segmentsFor(partial).filter((x) => !x.unavailable);
-    expect(counted.reduce((n, x) => n + x.value, 0)).toBe(10);
   });
 
   it('STILL SUMS TO THE COHORT WHEN A NESTED PAIR INVERTS', () => {
