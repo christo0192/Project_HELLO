@@ -71,6 +71,16 @@ function generatedQuestionIssue(text: string): string | null {
 }
 
 /** Attempts INCLUDING the first. 3 = one draft plus two repair rounds. */
+/**
+ * The smallest per-call budget this generator will accept.
+ *
+ * 240s, against 133-206s measured for v4-pro on 2026-09-17: above the slowest
+ * observed call with room for a slow day, and inside the 300000 ceiling
+ * `DEEPSEEK_TIMEOUT_MS` is validated to. It is a FLOOR, never a cap — a
+ * deployment that configures more keeps it.
+ */
+export const ROLE_DRAFT_MIN_TIMEOUT_MS = 240_000;
+
 export const ROLE_DRAFT_MAX_ATTEMPTS = 3;
 /** How many questions a draft aims for. */
 export const ROLE_DRAFT_QUESTION_COUNT = 6;
@@ -100,6 +110,13 @@ export class RoleDraftError extends Error {
     message: string,
     readonly reason: 'unusable_output' | 'unspeakable_questions' | 'cancelled',
     readonly detail?: readonly string[],
+    /**
+     * Attempts actually spent. Carried so the job row can record it: without
+     * it every failed job read `attempts: 0`, which made "burned the whole
+     * budget on a provider outage" indistinguishable from "stopped before the
+     * first call" — and those want opposite responses.
+     */
+    readonly attempts?: number,
   ) {
     super(message);
     this.name = 'RoleDraftError';
@@ -290,12 +307,24 @@ export async function generateRoleDraft(
     (async (prompt: string) => {
       const { data } = await runClaudeJSONWithProvenance<unknown>(prompt, {
         model: env.deepseekScoringModel,
-        // The SHARED DeepSeek budget, not a scoring-specific one: the
-        // dedicated `DEEPSEEK_SCORING_TIMEOUT_MS` knob lives in PR #300, which
-        // is deliberately unmerged. In production this is the 270s the owner
-        // set as a Fly secret, which is above every v4-pro duration measured
-        // on 2026-09-17 (133-206s).
-        timeoutMs: env.deepseekTimeoutMs,
+        // FLOORED, because the budget this reads is shared and its declared
+        // value is too small for this call.
+        //
+        // `DEEPSEEK_TIMEOUT_MS` defaults to 120000 (env.ts) and fly.toml
+        // checks in 120000 — both below every v4-pro duration measured on
+        // 2026-09-17 (133-206s). Production carries a larger value as a Fly
+        // secret, but a secret is not a guarantee: a new machine, a staging
+        // app, a local run, or one `fly secrets unset` puts 120s back, and
+        // then EVERY attempt times out. The operator would watch the phase
+        // label count "1 of 3 -> 2 of 3 -> 3 of 3" over six minutes, be told
+        // "Hello could not be reached", and the labels would be describing
+        // retries of a call that never had time to finish.
+        //
+        // The knob is also shared with the resume parser, so tuning it DOWN
+        // for parsing would silently kill role drafting. The dedicated
+        // `DEEPSEEK_SCORING_TIMEOUT_MS` lives in PR #300, deliberately
+        // unmerged; until it lands, this call states its own minimum.
+        timeoutMs: Math.max(env.deepseekTimeoutMs, ROLE_DRAFT_MIN_TIMEOUT_MS),
       });
       return data;
     });
@@ -319,7 +348,7 @@ export async function generateRoleDraft(
 
   for (let attempt = 1; attempt <= ROLE_DRAFT_MAX_ATTEMPTS; attempt += 1) {
     if (deps.shouldCancel && (await deps.shouldCancel())) {
-      throw new RoleDraftError('Hello was cancelled.', 'cancelled');
+      throw new RoleDraftError('Hello was cancelled.', 'cancelled', undefined, attempt - 1);
     }
     report(
       rejectedCount > 0
@@ -333,6 +362,16 @@ export async function generateRoleDraft(
           ? { phase: 'rereading', attempt, maxAttempts: ROLE_DRAFT_MAX_ATTEMPTS }
           : { phase: 'drafting', attempt, maxAttempts: ROLE_DRAFT_MAX_ATTEMPTS },
     );
+
+    // BOTH CAUSES ARE CLEARED PER ATTEMPT, and that is the fix for a wrong
+    // message rather than tidiness. `providerError` used to be cleared only
+    // after a SUCCESSFUL parse, so one transient 502 on attempt 1 followed by
+    // two unreadable responses still reported "Hello could not be reached" —
+    // sending the operator to retry a provider that was fine, when the real
+    // answer was that the model would not return usable JSON. Whatever is set
+    // when the loop exits now describes the attempt that actually ended it.
+    providerError = null;
+    lastShapeFailure = false;
 
     // A PROVIDER FAILURE COSTS ONE ATTEMPT, NOT THE WHOLE BUDGET.
     // `runClaudeJSONWithProvenance` throws on a timeout, a non-2xx, and on
@@ -362,9 +401,6 @@ export async function generateRoleDraft(
       ];
       continue;
     }
-    lastShapeFailure = false;
-    providerError = null;
-
     // THE SAME validator the save path runs, PLUS the two rules the prompt
     // states that it does not cover (see `generatedQuestionIssue`).
     const issues = validatePhoneQuestionTemplate(draft.screening_template);
@@ -405,17 +441,21 @@ export async function generateRoleDraft(
       'Hello could not be reached after several tries. Try again in a moment.',
       'unusable_output',
       [providerError instanceof Error ? providerError.message : String(providerError)],
+      ROLE_DRAFT_MAX_ATTEMPTS,
     );
   }
   if (lastShapeFailure) {
     throw new RoleDraftError(
       'Hello could not draft this role — the response was not usable.',
       'unusable_output',
+      undefined,
+      ROLE_DRAFT_MAX_ATTEMPTS,
     );
   }
   throw new RoleDraftError(
     'Hello drafted questions that the phone screener will not read aloud, and could not rephrase them.',
     'unspeakable_questions',
     failures,
+    ROLE_DRAFT_MAX_ATTEMPTS,
   );
 }

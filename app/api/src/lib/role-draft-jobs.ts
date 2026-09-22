@@ -19,6 +19,7 @@
  * and a best-effort background task the right shape here.
  */
 import { supabase } from './supabase.js';
+import { createLogger } from './logger.js';
 import {
   generateRoleDraft,
   RoleDraftError,
@@ -30,11 +31,24 @@ import {
  * A `running` row whose heartbeat is older than this belongs to a process that
  * died — a redeploy mid-draft, an OOM, a machine reaped by Fly.
  *
- * Generous on purpose: one v4-pro call can legitimately take 270s with no
- * phase change, so anything tighter would declare healthy jobs dead. Two full
- * call budgets plus slack.
+ * DERIVED, AND THE DERIVATION WAS WRONG BEFORE. The earlier value was ten
+ * minutes, justified as "two full call budgets plus slack". It was one.
+ * `runDeepseekJSON` retries the provider ITSELF when a response will not parse
+ * as JSON, and no phase is reported between those two calls — so the longest
+ * legitimate gap between heartbeats is `2 x timeoutMs`, not one budget.
+ *
+ * At the env ceiling (`DEEPSEEK_TIMEOUT_MS` is validated to at most 300000)
+ * that gap is 600000 — exactly the old constant. Any overhead at all pushed a
+ * HEALTHY job past it, and the client was told "Hello stopped partway
+ * through" about a draft that was still running, still billing, and would
+ * shortly succeed into a row nobody was reading any more.
+ *
+ * So: two full calls at the ceiling, plus two minutes. It is a bound on a
+ * dead process, and being late to declare one costs a spinner; being early
+ * costs a paid ten-minute draft.
  */
-export const ROLE_DRAFT_STALE_MS = 10 * 60 * 1000;
+export const ROLE_DRAFT_MAX_CALL_MS = 300_000;
+export const ROLE_DRAFT_STALE_MS = 2 * ROLE_DRAFT_MAX_CALL_MS + 120_000;
 
 export type RoleDraftJobStatus = 'running' | 'succeeded' | 'failed' | 'cancelled';
 
@@ -81,6 +95,44 @@ function toJob(row: Row): RoleDraftJob {
   };
 }
 
+const draftLogger = createLogger('role-draft');
+
+/**
+ * NEITHER OF THESE LOGS THE DRAFT ID OR THE ERROR TEXT, deliberately.
+ *
+ * `AllowedMeta` in `logger.ts` is a closed, PII-conscious key set, and the
+ * right response to it is to fit the vocabulary rather than widen it for a
+ * convenience feature. `error_category` says which write was lost and
+ * `error_type` says what kind of failure it was; that is enough to find the
+ * problem, and neither can carry a job title someone typed or a provider
+ * message that quotes one back.
+ */
+
+/**
+ * A dropped heartbeat is not cosmetic: `readRoleDraft` reads its absence as a
+ * dead worker, so losing these quietly turns a healthy ten-minute draft into
+ * "Hello stopped partway through". Logged rather than thrown, because failing
+ * a draft over a failed DESCRIPTION of it would be the worse trade.
+ */
+function onHeartbeatFailure(_id: string, err: unknown): void {
+  draftLogger.warn('db_error', {
+    error_category: 'role_draft_heartbeat_write',
+    error_type: err instanceof Error ? err.name : typeof err,
+  });
+}
+
+/**
+ * The terminal write carries the result of up to six provider calls. If it is
+ * lost the row stays `running`, goes stale, and is reported as `abandoned` —
+ * so this line is the only place that loss is visible at all.
+ */
+function onTerminalWriteFailure(_id: string, status: string, err: unknown): void {
+  draftLogger.error('db_error', {
+    error_category: `role_draft_terminal_write_${status}`,
+    error_type: err instanceof Error ? err.name : typeof err,
+  });
+}
+
 export interface RoleDraftRunnerDeps {
   /** Seam for tests; defaults to the real generator. */
   run?: typeof generateRoleDraft;
@@ -89,7 +141,48 @@ export interface RoleDraftRunnerDeps {
 }
 
 /**
+ * The caller's LIVE job, if they have one.
+ *
+ * This is what makes "a refresh picks the job back up" true rather than a
+ * comment. The browser holds the job id in component state and nothing else,
+ * so a reload, a navigation, or switching to another role in the list loses
+ * the only handle to a job that keeps running and keeps billing. Asking the
+ * server what it already has is the recovery: the row is the durable copy,
+ * which is the entire reason this stopped being a streamed response.
+ *
+ * A STALE row is not returned. It belongs to a dead worker, and handing it
+ * back would resume polling something that will never report again — and, far
+ * worse for `startRoleDraft` below, would refuse to start a new draft forever.
+ */
+export async function readActiveRoleDraft(
+  ownerId: string,
+  deps: RoleDraftRunnerDeps = {},
+): Promise<RoleDraftJob | null> {
+  const now = deps.now ?? Date.now;
+  const { data, error } = await supabase
+    .from('role_drafts')
+    .select('*')
+    .eq('owner_id', ownerId)
+    .eq('status', 'running')
+    .order('updated_at', { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  const row = (Array.isArray(data) ? data[0] : null) as Row | undefined;
+  if (!row) return null;
+  if (now() - Date.parse(row.updated_at) > ROLE_DRAFT_STALE_MS) return null;
+  return toJob(row);
+}
+
+/**
  * Create the job row and start the work. Returns as soon as the row exists.
+ *
+ * ONE LIVE JOB PER OWNER. Each start detaches up to six v4-pro calls into the
+ * process that also serves live-call operations, and nothing else bounds how
+ * often the button can be pressed — the UI's guard is per-component, so two
+ * tabs, or a script holding a valid interviewer token, could start hundreds a
+ * minute. An existing live job is RETURNED rather than refused: the caller
+ * asked to be drafting and they now are, which is also exactly what a second
+ * tab should see.
  *
  * The generation is deliberately NOT awaited: the caller is an HTTP request
  * that must answer in milliseconds. Its failures are captured into the row, so
@@ -102,6 +195,9 @@ export async function startRoleDraft(
   jobRole: string,
   deps: RoleDraftRunnerDeps = {},
 ): Promise<RoleDraftJob> {
+  const live = await readActiveRoleDraft(ownerId, deps);
+  if (live) return live;
+
   const { data, error } = await supabase
     .from('role_drafts')
     .insert({ owner_id: ownerId, job_role: jobRole, status: 'running' })
@@ -123,13 +219,26 @@ async function runDraft(id: string, jobRole: string, deps: RoleDraftRunnerDeps):
   try {
     const { draft, attempts, repaired } = await run(jobRole, {
       onProgress: (phase) => {
-        // Best-effort: a progress write that fails must not fail the draft it
-        // is only describing. `updated_at` doubles as the heartbeat.
+        // Best-effort for the DRAFT, load-bearing for the READER: this write
+        // is also the heartbeat, and a job whose heartbeat stops is reported
+        // as `abandoned`. Losing these silently turns a healthy ten-minute
+        // draft into "Hello stopped partway through".
+        //
+        // FENCED on `status = 'running'` because two PostgREST requests have
+        // no ordering guarantee: without it, a late `checking` write can land
+        // after the terminal write and leave a settled row advertising a
+        // phase it is no longer in.
         void supabase
           .from('role_drafts')
           .update({ phase, updated_at: new Date().toISOString() })
           .eq('id', id)
-          .then(undefined, () => undefined);
+          .eq('status', 'running')
+          .then(
+            ({ error }) => {
+              if (error) onHeartbeatFailure(id, error);
+            },
+            (err) => onHeartbeatFailure(id, err),
+          );
       },
       shouldCancel: async () => {
         const { data } = await supabase
@@ -141,7 +250,11 @@ async function runDraft(id: string, jobRole: string, deps: RoleDraftRunnerDeps):
       },
     });
 
-    await supabase
+    // The result of up to six provider calls and ten minutes of waiting. If
+    // this write is dropped the row stays `running` with a frozen heartbeat,
+    // and the operator is eventually told the draft was abandoned — about
+    // work that succeeded and is now unrecoverable. Worth knowing about.
+    const { error: writeError } = await supabase
       .from('role_drafts')
       .update({
         status: 'succeeded',
@@ -155,9 +268,10 @@ async function runDraft(id: string, jobRole: string, deps: RoleDraftRunnerDeps):
       // A cancelled job must not be resurrected by a result that arrived
       // afterwards.
       .eq('status', 'running');
+    if (writeError) onTerminalWriteFailure(id, 'succeeded', writeError);
   } catch (err) {
     const isDraftError = err instanceof RoleDraftError;
-    await supabase
+    const { error: writeError } = await supabase
       .from('role_drafts')
       .update({
         status: 'failed',
@@ -165,11 +279,16 @@ async function runDraft(id: string, jobRole: string, deps: RoleDraftRunnerDeps):
         error_message: isDraftError
           ? err.message
           : 'Hello could not be reached. Try again in a moment.',
+        // WRITTEN HERE TOO. Without it every failed job reports `attempts: 0`,
+        // so a job that burned the whole budget is indistinguishable from one
+        // that never got a call away — and those want opposite responses.
+        attempts: isDraftError ? (err.attempts ?? null) : null,
         phase: null,
         updated_at: new Date().toISOString(),
       })
       .eq('id', id)
       .eq('status', 'running');
+    if (writeError) onTerminalWriteFailure(id, 'failed', writeError);
   }
 }
 
@@ -187,7 +306,7 @@ export async function readRoleDraft(
   deps: RoleDraftRunnerDeps = {},
 ): Promise<RoleDraftJob | null> {
   const now = deps.now ?? Date.now;
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from('role_drafts')
     .select('*')
     .eq('id', id)
@@ -195,6 +314,10 @@ export async function readRoleDraft(
     // there is no reason for one recruiter to read another's.
     .eq('owner_id', ownerId)
     .maybeSingle();
+  // A DATABASE FAILURE IS NOT A MISSING DRAFT. Swallowing it here made the
+  // route answer 404 — documented as "no such draft for this caller" — for a
+  // pooler reset, which is a different thing and deserves a different answer.
+  if (error) throw error;
   if (!data) return null;
 
   const row = data as Row;

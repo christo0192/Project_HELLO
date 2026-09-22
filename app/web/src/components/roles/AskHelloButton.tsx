@@ -68,6 +68,50 @@ export function AskHelloButton({
   const cbs = useRef({ onDrafted, onError });
   cbs.current = { onDrafted, onError };
 
+  const buttonRef = useRef<HTMLButtonElement | null>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  /**
+   * Put focus back on the main button before Cancel unmounts.
+   *
+   * Only when focus is actually inside this component — stealing it from
+   * wherever the operator has moved on to would be its own bug.
+   */
+  const returnFocus = useCallback(() => {
+    if (typeof document === 'undefined') return;
+    const activeEl = document.activeElement;
+    if (activeEl && rootRef.current?.contains(activeEl)) buttonRef.current?.focus();
+  }, []);
+
+  /**
+   * PICK UP A JOB THAT IS ALREADY RUNNING.
+   *
+   * The job id lives in this component's state and nowhere else, so a reload,
+   * a navigation, or switching to another role in the list used to abandon a
+   * running draft: it kept billing, its result landed in a row no endpoint
+   * could name, and the operator's only move was to press the button again
+   * and start a second one. The row is the durable copy — this asks the
+   * server what is already in flight and resumes watching it.
+   *
+   * Guarded on `jobId` being null so it cannot stomp a job started in this
+   * same session, and `live` so a slow answer cannot write into a component
+   * that has since gone.
+   */
+  useEffect(() => {
+    let live = true;
+    void (async () => {
+      try {
+        const { active } = await api.getActiveRoleDraft();
+        if (live && active) setJobId((current) => current ?? active.id);
+      } catch {
+        // Nothing to recover, or the lookup failed. Either way the button is
+        // usable; this is a convenience, not a precondition.
+      }
+    })();
+    return () => {
+      live = false;
+    };
+  }, []);
+
   useEffect(() => {
     if (!running) return;
     const started = Date.now();
@@ -84,6 +128,11 @@ export function AskHelloButton({
 
     const settle = (job: RoleDraftJob) => {
       if (!live) return;
+      // FOCUS FIRST, because Cancel is about to unmount. If the keyboard user
+      // is standing on it when it disappears, focus falls to <body> and the
+      // next Tab restarts from the top of the page — the same failure the main
+      // button uses `aria-disabled` to avoid, reintroduced two elements away.
+      returnFocus();
       setJobId(null);
       setPhase(null);
       if (job.status === 'succeeded' && job.draft) {
@@ -144,19 +193,33 @@ export function AskHelloButton({
 
   const cancel = useCallback(async () => {
     const id = jobId;
+    // Cleared first, deliberately: the operator should not wait on the network
+    // to stop watching. Focus moves before the unmount for the same reason as
+    // in `settle` — Cancel is the element being removed.
+    returnFocus();
     setJobId(null);
     setPhase(null);
-    // Best effort, and deliberately after clearing local state: the operator
-    // should not wait on the network to stop watching.
-    if (id) await api.cancelRoleDraft(id).catch(() => undefined);
+    if (!id) return;
+    try {
+      await api.cancelRoleDraft(id);
+    } catch {
+      // NOT SWALLOWED. The headline claim is that Cancel stops the spending
+      // rather than the spinner, and a cancel that never reached the server
+      // stops only the spinner — v4-pro keeps running, for up to another ten
+      // minutes, and the operator has been told otherwise. Say so.
+      cbs.current.onError(
+        'Hello may not have stopped — the cancel did not reach the server. Reopen this form to check.',
+      );
+    }
   }, [jobId]);
 
   const idle = !jobRole.trim();
 
   return (
-    <div className={className}>
+    <div className={className} ref={rootRef}>
       <div className="flex flex-wrap items-center gap-2">
         <button
+          ref={buttonRef}
           type="button"
           onClick={start}
           // `aria-disabled`, not `disabled`: a disabled button loses focus the
@@ -165,9 +228,22 @@ export function AskHelloButton({
           aria-disabled={idle || running}
           aria-busy={running}
           data-ask-hello=""
-          className={`ask-hello relative inline-flex min-h-11 items-center gap-2 overflow-hidden rounded-full px-5 text-sm font-semibold text-white transition-opacity duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-[var(--c-accent)] ${
-            idle || running ? 'cursor-not-allowed opacity-60' : ''
-          }`}
+          // NO `opacity-60` HERE, and that is the whole point of this class
+          // list. CSS opacity composites the entire subtree, so fading the
+          // button fades the LABEL with it: white 14px semibold on the
+          // gradient measures 7.0-8.3:1, but at .6 over a white page it
+          // collapses to 2.82-3.05:1, and 2.39-2.53:1 under the sheen. That is
+          // a WCAG AA failure (14px semibold is not "large text", so the bar
+          // is 4.5:1) and it landed in the ONE state this whole feature exists
+          // to make legible — a ten-minute wait.
+          //
+          // Unavailability is carried by a flat measured fill instead, which
+          // leaves the white label alone. There is no shortage of signal
+          // either way: the label itself changes to "Asking Hello…", the glyph
+          // changes, Cancel appears, and the live region narrates the phase.
+          className={`ask-hello relative inline-flex min-h-11 items-center gap-2 overflow-hidden rounded-full px-5 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-[var(--c-accent)] ${
+            idle ? 'ask-hello--idle cursor-not-allowed' : ''
+          }${running ? ' cursor-progress' : ''}`}
         >
           <span aria-hidden="true" className="ask-hello__sheen" />
           <span aria-hidden="true" className="relative">

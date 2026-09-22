@@ -315,6 +315,184 @@ describe('generateRoleDraft — provider failures', () => {
   });
 });
 
+describe('generateRoleDraft — which failure the operator is told about', () => {
+  it('reports the LAST attempt\'s cause, not the first\'s', async () => {
+    // One transient 502 followed by two unreadable responses used to report
+    // "Hello could not be reached" — because `providerError` was cleared only
+    // after a SUCCESSFUL parse, so it outlived the attempt that set it. That
+    // sends the operator to retry a provider that is fine, when the real
+    // answer is that the model will not return usable JSON.
+    const infer = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('502 Bad Gateway'))
+      .mockResolvedValueOnce('not json at all')
+      .mockResolvedValueOnce('still not json');
+
+    const err = await generateRoleDraft('Any', { infer }).catch((e) => e);
+    expect(err).toBeInstanceOf(RoleDraftError);
+    expect(err.message).toContain('not usable');
+    expect(err.message).not.toContain('could not be reached');
+    // ...and the 502's text is not attached either, since it is not the cause.
+    expect(err.detail ?? []).not.toContainEqual(expect.stringContaining('502'));
+  });
+
+  it('still names a provider outage when THAT is what ended it', async () => {
+    // The other direction: clearing per attempt must not lose a real outage.
+    const infer = vi
+      .fn()
+      .mockResolvedValueOnce('not json at all')
+      .mockRejectedValueOnce(new Error('504 upstream timeout'))
+      .mockRejectedValueOnce(new Error('504 upstream timeout'));
+
+    await expect(generateRoleDraft('Any', { infer })).rejects.toMatchObject({
+      reason: 'unusable_output',
+      detail: [expect.stringContaining('504')],
+    });
+  });
+
+  it('records the BUDGET IT BURNED on the error itself', async () => {
+    // Without it every failed job reads `attempts: 0` in the row, which makes
+    // "spent the whole budget on an outage" indistinguishable from "stopped
+    // before the first call" — and those want opposite responses.
+    const infer = vi.fn().mockRejectedValue(new Error('504'));
+    const err = await generateRoleDraft('Any', { infer }).catch((e) => e);
+    expect(err.attempts).toBe(ROLE_DRAFT_MAX_ATTEMPTS);
+  });
+});
+
+describe('generateRoleDraft — the directive-opening rule, verb by verb', () => {
+  // A review reduced this regex to `/^\s*(?:ask)\b/i` and the whole suite
+  // stayed green: the fixtures asserted the shape of the RETURNED draft, never
+  // the rejection of a bad one, so eight of the nine verbs were decoration.
+  //
+  // These are the openings the phone worker's own gate refuses. A question it
+  // will not read aloud is a question the candidate is never asked, and the
+  // 2026-09-10 calls died one second after consent for exactly this.
+  const VERBS = [
+    'Ask',
+    'Probe',
+    'Explore',
+    'Cover',
+    'Check',
+    'Confirm',
+    'Discuss',
+    'Understand',
+    'Find',
+  ];
+
+  it.each(VERBS)('REJECTS EVERY DIRECTIVE OPENING — %s', async (verb) => {
+    const bad = goodDraft({
+      screening_template: [
+        q(`${verb} how they handled a difficult customer?`),
+        q('What does your current role involve day to day?'),
+        q('What made you look for a new position?'),
+      ],
+    });
+    const infer = vi
+      .fn()
+      .mockResolvedValueOnce(bad)
+      .mockResolvedValueOnce(goodDraft());
+
+    const { draft, repaired } = await generateRoleDraft('Any', { infer });
+    // It took a second pass, and the offending question is gone.
+    expect(infer).toHaveBeenCalledTimes(2);
+    expect(repaired.join(' ')).toContain(verb.toLowerCase());
+    expect(
+      draft.screening_template.some((entry) =>
+        entry.question.toLowerCase().startsWith(verb.toLowerCase()),
+      ),
+    ).toBe(false);
+  });
+
+  it('does NOT reject a question that merely contains the verb', async () => {
+    // The rule is about how a question OPENS. "What would you ask a hesitant
+    // buyer?" is a real screening question and must survive.
+    const infer = vi.fn().mockResolvedValueOnce(
+      goodDraft({
+        screening_template: [
+          q('What would you ask a hesitant buyer?'),
+          q('How do you confirm a customer is happy before closing?'),
+          q('What made you look for a new position?'),
+        ],
+      }),
+    );
+    const { repaired } = await generateRoleDraft('Any', { infer });
+    expect(infer).toHaveBeenCalledTimes(1);
+    expect(repaired).toEqual([]);
+  });
+});
+
+describe('generateRoleDraft — the clamps the SAVE PATH will enforce', () => {
+  // The clamps exist so a verbose model cannot produce a draft that renders
+  // fine and then 400s on Save — "the half-authored role this module promises
+  // never to produce", discovered by the operator minutes after a ten-minute
+  // wait. A review raised four of them at once and all 22 tests stayed green.
+  //
+  // Asserted against `createRoleSchema` itself rather than against literals,
+  // because the save path is the thing that actually has to accept the output.
+  const overLong = (n: number) => 'x'.repeat(n);
+
+  it('clamps the JD to something the save path accepts', async () => {
+    const infer = vi
+      .fn()
+      .mockResolvedValueOnce(goodDraft({ jd: overLong(250_000) }));
+    const { draft } = await generateRoleDraft('Any', { infer });
+    expect(() =>
+      createRoleSchema.parse({ title: 'Sales Advisor', ...draft }),
+    ).not.toThrow();
+  });
+
+  it('clamps the skill LIST and each skill', async () => {
+    const infer = vi.fn().mockResolvedValueOnce(
+      goodDraft({
+        required_skills: Array.from({ length: 5_000 }, (_, i) => `${overLong(500)}${i}`),
+      }),
+    );
+    const { draft } = await generateRoleDraft('Any', { infer });
+    expect(() =>
+      createRoleSchema.parse({ title: 'Sales Advisor', ...draft }),
+    ).not.toThrow();
+  });
+
+  it('clamps the question LIST', async () => {
+    const infer = vi.fn().mockResolvedValueOnce(
+      goodDraft({
+        screening_template: Array.from({ length: 5_000 }, (_, i) =>
+          q(`What did you do in situation number ${i}?`),
+        ),
+      }),
+    );
+    const { draft } = await generateRoleDraft('Any', { infer });
+    expect(() =>
+      createRoleSchema.parse({ title: 'Sales Advisor', ...draft }),
+    ).not.toThrow();
+  });
+
+  it('DROPS an over-long question rather than truncating it', async () => {
+    // Dropping is the right call and worth pinning as itself: a question cut
+    // off at 2000 characters is not a shorter question, it is a sentence that
+    // stops mid-word — and the phone worker would read it out. The remaining
+    // questions survive, so one runaway answer does not cost the whole draft.
+    const infer = vi.fn().mockResolvedValueOnce(
+      goodDraft({
+        screening_template: [
+          q(`What does your ${overLong(50_000)} role involve?`),
+          q('What does your current role involve day to day?'),
+          q('How do you handle an unhappy customer?'),
+          q('What made you look for a new position?'),
+        ],
+      }),
+    );
+    const { draft } = await generateRoleDraft('Any', { infer });
+    expect(infer).toHaveBeenCalledTimes(1);
+    expect(draft.screening_template).toHaveLength(3);
+    expect(draft.screening_template.every((entry) => entry.question.length < 2_000)).toBe(true);
+    expect(() =>
+      createRoleSchema.parse({ title: 'Sales Advisor', ...draft }),
+    ).not.toThrow();
+  });
+});
+
 describe('generateRoleDraft — the prompt states every rule the gate enforces', () => {
   it('warns about every banned WORD, and does so as a prohibition', async () => {
     // Asserting `prompt.toContain(word)` alone let the sentence be inverted to

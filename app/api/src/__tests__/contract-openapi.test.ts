@@ -1113,6 +1113,12 @@ describe('OpenAPI document integrity', () => {
     // stopped the reading while the generation carried on billing. It WRITES
     // NO ROLE — the draft goes to a human, and the existing save path
     // re-validates it. 132 + 3 = 135.
+    // The resume fix adds a FOURTH OPERATION but no fourth path: GET
+    // /api/roles/draft returns the caller's live job and shares the URL the
+    // POST already occupies. Paths are counted by URL, not by verb, so this
+    // number is deliberately unchanged at 135. (Writing it as a separate key
+    // is how the first attempt broke — two `/api/roles/draft:` blocks in the
+    // YAML, and the duplicate silently ate the POST.)
     expect(Object.keys(paths).length).toBe(135);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)

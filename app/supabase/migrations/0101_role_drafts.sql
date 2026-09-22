@@ -76,15 +76,32 @@ create table if not exists screening_v2.role_drafts (
   )
 );
 
--- The only read pattern: "my most recent draft for this job role", plus the
--- sweeper's "running and stale".
+-- Two reads, and both exist in the code.
+--
+-- `owner_recent` serves "my most recent draft", which is what lets a refresh
+-- pick a running job back up: the browser holds no id across a reload, so the
+-- client asks the server what it already has. Without it, a ten-minute job
+-- became unreachable the moment the form unmounted — still billing, its result
+-- written to a row nobody could name.
+--
+-- `owner_running` serves the admission check. `startRoleDraft` refuses to
+-- begin a second job while one is live, because each start detaches up to
+-- three v4-pro calls into the process that also serves live-call operations,
+-- and nothing else bounds how often the button can be pressed.
 create index if not exists idx_role_drafts_owner_recent
   on screening_v2.role_drafts (owner_id, created_at desc);
-create index if not exists idx_role_drafts_running
-  on screening_v2.role_drafts (updated_at) where status = 'running';
+create index if not exists idx_role_drafts_owner_running
+  on screening_v2.role_drafts (owner_id, updated_at desc) where status = 'running';
 
 alter table screening_v2.role_drafts enable row level security;
 revoke all on screening_v2.role_drafts from anon, authenticated, public;
+-- The house grant. `0001` sets `alter default privileges ... grant all on
+-- tables to service_role`, so this is belt-and-braces — but 0063, 0079, 0090
+-- and 0098 all state it explicitly rather than rely on a default that only
+-- applies to the role that happened to create the table, and the failure it
+-- guards against (permission denied on every Ask Hello call) is silent until
+-- someone presses the button.
+grant all privileges on screening_v2.role_drafts to service_role;
 
 comment on table screening_v2.role_drafts is
   'Ask Hello generation jobs. Disposable: the operator reviews a draft in the '

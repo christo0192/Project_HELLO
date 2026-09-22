@@ -363,20 +363,32 @@ body .text-red-700 { color: var(--error-text); }
 /* ── "Ask Hello" — the animated gradient on the role-drafting button ─────
    Decorative only: the button's label and its live region carry every fact.
 
-   THE STOPS ARE MEASURED, and the first set failed. White semibold on the old
-   teal (#398AA2) was 3.94:1 — under the 4.5:1 this text size needs — and the
-   sheen sweeping over it dropped that to 2.55:1. The label was legible, then
-   wasn't, then was, twenty times a minute: a contrast failure that ANIMATES,
-   which is worse than a static one because it reads as a rendering glitch.
-   Even the old accent stop fell to 3.04:1 under the sheen.
+   THE STOPS ARE MEASURED, AND TWO EARLIER SETS FAILED.
 
-   Measured for the shipped values, white text on each stop, base and under
-   the sheen:
-     #3B5488  7.47:1 / 5.25:1
-     #2B5F72  7.04:1 / 5.03:1
-     #574189  8.32:1 / 5.72:1
-   The sheen also dropped from 0.28 to 0.14 alpha, which is what keeps the
-   worst case above 4.5:1 rather than merely above 3:1.
+   First failure: white semibold on the old teal (#398AA2) was 3.94:1 — under
+   the 4.5:1 this text size needs — and the sheen sweeping over it dropped that
+   to 2.55:1. The label was legible, then wasn't, then was, twenty times a
+   minute: a contrast failure that ANIMATES, which reads as a rendering glitch.
+
+   Second failure, and the instructive one: the stops below were re-measured
+   and pass, but the BUTTON carried `opacity-60` while idle or running. CSS
+   opacity composites the whole subtree, so it faded the white label along with
+   the fill, and everything measured here was beside the point:
+
+     stop      opacity 1            opacity .6 over white
+     #3B5488   7.47:1 / 5.25:1      2.90:1 / 2.42:1
+     #2B5F72   7.04:1 / 5.03:1      2.82:1 / 2.39:1
+     #574189   8.32:1 / 5.72:1      3.05:1 / 2.53:1
+                     (base / under the 0.14 sheen)
+
+   Worse than the animation bug it replaced, and it applied for the entire ten
+   minutes the button spends saying "Asking Hello…" — the one state the whole
+   feature exists to make legible. The fade is gone; unavailability is a flat
+   measured fill (below) that leaves the label at full strength.
+
+   Sampled every 5% along all three ramps, the worst point anywhere on the
+   running button is 5.02:1 under the sheen (at #2d5e74). The sheen's 0.14
+   alpha is what keeps that above 4.5:1 rather than merely above 3:1.
 
    Two layers: a slow hue drift so the button is never flat, and a faster
    sheen. The sheen is its own layer rather than a background-position trick on
@@ -394,6 +406,22 @@ body .text-red-700 { color: var(--error-text); }
   animation: ask-hello-drift 9s linear infinite;
   box-shadow: 0 1px 2px rgb(15 23 42 / 0.18), inset 0 0 0 1px rgb(255 255 255 / 0.08);
 }
+
+/* NOT AVAILABLE YET — no job role to draft from.
+   A flat desaturated fill rather than a fade: #556070 is 6.38:1 against the
+   white label, so "you cannot press this" costs nothing in legibility. The
+   animation stops too, because a button that glows and cannot be pressed is
+   an invitation with no door. */
+.ask-hello--idle {
+  background-image: none;
+  background-color: #556070;
+  animation: none;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.08);
+}
+.ask-hello--idle .ask-hello__sheen {
+  display: none;
+}
+
 .ask-hello:hover:not([aria-disabled='true']) {
   box-shadow: 0 2px 10px rgb(59 84 136 / 0.45), inset 0 0 0 1px rgb(255 255 255 / 0.14);
 }

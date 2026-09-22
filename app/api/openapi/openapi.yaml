@@ -115,6 +115,29 @@ paths:
                 $ref: '#/components/schemas/ErrorBody'
 
   /api/roles/draft:
+    get:
+      tags: [roles]
+      operationId: getActiveRoleDraft
+      summary: The caller's live drafting job, if any (interviewer+)
+      description: What a reload asks. The client keeps the job id in component state and nowhere else, so without this a refresh abandoned a running job that kept billing and whose result no endpoint could name. A job whose worker died is NOT returned - it would resume a poll that never reports again.
+      responses:
+        '200':
+          description: The live job, or an explicit null. Having no draft running is a normal answer, not a missing resource.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [active]
+                properties:
+                  active:
+                    nullable: true
+                    allOf:
+                      - $ref: '#/components/schemas/RoleDraftJob'
+        '401':
+          description: Unauthenticated.
+        '403':
+          description: Insufficient role.
     post:
       tags: [roles]
       operationId: startRoleDraft
@@ -7616,7 +7639,7 @@ components:
           minimum: 0
         repaired:
           type: array
-          description: Ids of the questions the model had to rephrase before they passed the gate. Surfaced so a human reviews them rather than trusting them.
+          description: One line per question the model had to rephrase - the rule it broke and the offending text, not an id. Surfaced so a human reviews those questions rather than trusting them. Clients today use only the count.
           items:
             type: string
         error_reason:

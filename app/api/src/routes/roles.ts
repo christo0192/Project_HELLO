@@ -6,6 +6,7 @@ import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
 import {
   cancelRoleDraft,
+  readActiveRoleDraft,
   readRoleDraft,
   startRoleDraft,
 } from '../lib/role-draft-jobs.js';
@@ -88,6 +89,30 @@ rolesRouter.post(
     }
   },
 );
+
+/**
+ * The caller's LIVE drafting job, if they have one.
+ *
+ * This is what a reload asks. The browser keeps the job id in component state
+ * and nowhere else, so a refresh, a navigation, or switching to another role
+ * in the list loses the only handle to a job that keeps running and keeps
+ * billing — and the finished draft would land in a row nobody could name.
+ * The row is the durable copy, which is the whole reason this stopped being a
+ * streamed response; this endpoint is how the client gets back to it.
+ *
+ * Declared BEFORE `/draft/:id` for readability only — Express does not match
+ * a `:param` across a `/`, so the two cannot shadow each other.
+ */
+rolesRouter.get('/draft', requireRole('interviewer'), async (req, res, next) => {
+  try {
+    const job = await readActiveRoleDraft(req.authUser!.id);
+    // 200 with an explicit null rather than 404: "you have no draft running"
+    // is a normal answer to this question, not a missing resource.
+    res.json({ active: job });
+  } catch (err) {
+    next(err);
+  }
+});
 
 /** Poll a drafting job. A dead one reads as failed, never as still running. */
 rolesRouter.get(
