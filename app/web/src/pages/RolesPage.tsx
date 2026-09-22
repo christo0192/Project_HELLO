@@ -405,6 +405,13 @@ function RoleForm({
             setDraftError(message);
             setDraftNote(null);
           }}
+          // A reload leaves this field blank while a draft is still running.
+          // Filling it from the adopted job makes the screen true: the button
+          // says "Asking Hello…" and the field says what Hello is drafting.
+          onResumed={(resumedRole) => {
+            setTitle((current) => (current.trim() ? current : resumedRole));
+            setDraftNote(`Picked up the draft already running for "${resumedRole}".`);
+          }}
           onDrafted={(draft, repaired, draftedFor) => {
             // The job's OWN job role, not the field's current value: the field
             // stays editable while a draft runs, so a draft written for
@@ -414,8 +421,13 @@ function RoleForm({
             const hasWork = Boolean(
               jd.trim() || skillsText.trim() || questions.some((q) => q.question.trim()),
             );
+            // ASK ON A MISMATCH TOO, not only when there is work to lose. A
+            // fresh form has nothing to overwrite, so `hasWork` is false —
+            // and that is exactly the case where a draft for another role
+            // used to fill the form silently, with only an info notice after
+            // the fact.
             if (
-              hasWork &&
+              (hasWork || staleTitle) &&
               typeof window !== "undefined" &&
               !window.confirm(
                 `Hello finished drafting "${draftedFor}". Replace the job description, skills and questions now in this form?`,

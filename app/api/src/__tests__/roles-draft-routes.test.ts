@@ -20,10 +20,22 @@ vi.mock('../lib/supabase.js', () => ({
 
 /** Payloads handed to `.insert()`, so a route test can assert what it SENDS. */
 let inserted: Array<Record<string, unknown>> = [];
+/**
+ * Payloads handed to `.update()`.
+ *
+ * The recorder had no `update` method, so no route-level PATCH test existed
+ * and the PUT-side `agent_name` guard — the exact twin of the POST-side one
+ * three tests up — could be made unconditional with the whole suite green.
+ */
+let patched: Array<Record<string, unknown>> = [];
 function insertRecorder(): any {
   const self: any = {
     insert(payload: Record<string, unknown>) {
       inserted.push(payload);
+      return self;
+    },
+    update(payload: Record<string, unknown>) {
+      patched.push(payload);
       return self;
     },
     select: () => self,
@@ -38,8 +50,17 @@ function insertRecorder(): any {
   return self;
 }
 vi.mock('../lib/role-draft-jobs.js', async () => ({
-  // The real class, because the route branches on `instanceof`. A stub class
-  // here would make the 409 test pass while production 500s.
+  // The real class — but NOT, as an earlier comment here claimed, because a
+  // stub would let the 409 test pass while production 500s. It would not:
+  // the route imports `RoleDraftBusyError` from this same mocked module and
+  // the test throws `new jobs.RoleDraftBusyError(...)` from the same binding,
+  // so `instanceof` holds against whatever class the mock supplies. A review
+  // proved it by substituting a local class; 27/27 stayed green.
+  //
+  // It is kept because using the real class costs nothing and keeps the
+  // constructor signature honest, and the false sentence is replaced because
+  // a comment asserting a protection that does not exist is worse than no
+  // comment — the next reviewer trusts it instead of re-checking.
   RoleDraftBusyError: (await vi.importActual<typeof import('../lib/role-draft-jobs.js')>(
     '../lib/role-draft-jobs.js',
   )).RoleDraftBusyError,
@@ -104,6 +125,7 @@ beforeEach(() => {
   vi.mocked(recordAudit).mockReset().mockResolvedValue(undefined as never);
   vi.mocked(supabase.from).mockReset();
   inserted = [];
+  patched = [];
 });
 afterEach(() => vi.restoreAllMocks());
 
@@ -350,6 +372,49 @@ describe('POST /api/roles — what the insert actually carries', () => {
     });
     expect('agent_name' in inserted[0]).toBe(true);
     expect(inserted[0]?.agent_name).toBeNull();
+  });
+});
+
+describe('PUT /api/roles/:id — the untested twin of the insert guard', () => {
+  // The POST block above exists because a review mutation survived there.
+  // This one exists because the NEXT review found the identical conditional
+  // one screen further down, on PUT, with zero payload coverage — the
+  // recorder had no `update` method, so no test could reach it.
+  //
+  // Two production effects if it regresses: before `supabase db push` of
+  // 0100, every role EDIT 500s on PGRST204; after it, omitting the key
+  // silently nulls a role's agent name, contradicting the OpenAPI text this
+  // PR added ("Omit the key entirely to leave it untouched").
+
+  beforeEach(() => {
+    vi.mocked(supabase.from).mockImplementation(() => insertRecorder() as never);
+  });
+
+  it('OMITS agent_name when the caller did not send it', async () => {
+    const res = await request(app())
+      .put(`/api/roles/${DRAFT_ID}`)
+      .set(AUTH)
+      .send({ title: 'Sales Advisor' });
+    expect(res.status).toBeLessThan(400);
+    expect(patched).toHaveLength(1);
+    expect('agent_name' in patched[0]).toBe(false);
+  });
+
+  it('SENDS it when the caller did', async () => {
+    await request(app())
+      .put(`/api/roles/${DRAFT_ID}`)
+      .set(AUTH)
+      .send({ agent_name: 'Gopu' });
+    expect(patched[0]?.agent_name).toBe('Gopu');
+  });
+
+  it('sends NULL to clear it — an explicit blank is a real edit', async () => {
+    await request(app())
+      .put(`/api/roles/${DRAFT_ID}`)
+      .set(AUTH)
+      .send({ agent_name: '   ' });
+    expect('agent_name' in patched[0]).toBe(true);
+    expect(patched[0]?.agent_name).toBeNull();
   });
 });
 

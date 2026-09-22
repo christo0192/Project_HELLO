@@ -233,7 +233,7 @@ async function readRunningRow(ownerId: string): Promise<Row | null> {
  * wakes up between the read and this write cannot have its live job killed.
  */
 async function expireStaleRoleDraft(ownerId: string, staleBefore: string): Promise<void> {
-  await supabase
+  const { error } = await supabase
     .from('role_drafts')
     .update({
       status: 'failed',
@@ -245,6 +245,18 @@ async function expireStaleRoleDraft(ownerId: string, staleBefore: string): Promi
     .eq('owner_id', ownerId)
     .eq('status', 'running')
     .lt('updated_at', staleBefore);
+  // THE ONE WRITE WHOSE FAILURE REINSTATES THE LOCKOUT, and it was the only
+  // write in this module with no failure logger. If it is a no-op — a pooler
+  // reset, a permission denied — the retry insert hits 23505 again and the
+  // operator gets "Internal server error" on every press, with nothing
+  // anywhere naming the expiry as the cause. That is the diagnosis-by-SQL
+  // situation this function exists to end.
+  if (error) {
+    draftLogger.error('db_error', {
+      error_category: 'role_draft_expire_stale',
+      error_type: error instanceof Error ? error.name : typeof error,
+    });
+  }
 }
 
 /**
@@ -319,6 +331,11 @@ export async function startRoleDraft(
     //   a STALE row, which the read filters out and the index does not. That
     //   is the lockout case. The row is expired — writing down the verdict
     //   `readRoleDraft` already reports — and the insert is retried ONCE.
+    // THREE things can put a `running` row here, not two: a concurrent start
+    // that won; a stale row the read filters and the index does not; and
+    // nothing at all, when the blocking row settled between the failed insert
+    // and this read. The third used to fall through to a 500 carrying the raw
+    // unique violation at the one moment a retry would have worked.
     const row = await readRunningRow(ownerId);
     if (row && now() - Date.parse(row.updated_at) <= ROLE_DRAFT_STALE_MS) {
       if (row.job_role.trim() === jobRole.trim()) return toJob(row);
@@ -372,12 +389,21 @@ async function runDraft(id: string, jobRole: string, deps: RoleDraftRunnerDeps):
           );
       },
       shouldCancel: async () => {
-        // A FAILED READ IS NOT A "NO". It used to be: the error was dropped
-        // and a pooler blip answered "not cancelled", so a cancellation issued
-        // during that window was missed and the attempt ran anyway. Treated as
-        // unknown and retried on the next attempt boundary — the generator
-        // asks again before each one, so a single bad read costs at most one
-        // attempt instead of silently discarding the operator's decision.
+        // A FAILED READ ANSWERS "NOT CANCELLED", and that is the only safe
+        // answer — but the explicit check below changes NOTHING, and an
+        // earlier version of this comment claimed otherwise.
+        //
+        // `.single()` returns `{ data: null, error }` on failure, so
+        // `Boolean(null?.cancelled_at)` was already false; deleting the line
+        // is a no-op, which a review proved by deleting it. It is kept because
+        // it states the decision rather than leaving it to an optional-chain
+        // coincidence, and it would still hold if supabase-js ever returned
+        // stale data alongside an error.
+        //
+        // The decision itself: an unknown cannot be treated as "cancelled"
+        // without killing healthy jobs on a pooler blip. The generator asks
+        // again before every attempt, so one bad read costs at most one
+        // attempt of delay, not the operator's decision.
         const { data, error } = await supabase
           .from('role_drafts')
           .select('cancelled_at')
@@ -392,7 +418,7 @@ async function runDraft(id: string, jobRole: string, deps: RoleDraftRunnerDeps):
     // this write is dropped the row stays `running` with a frozen heartbeat,
     // and the operator is eventually told the draft was abandoned — about
     // work that succeeded and is now unrecoverable. Worth knowing about.
-    const { error: writeError } = await supabase
+    const { data: written, error: writeError } = await supabase
       .from('role_drafts')
       .update({
         status: 'succeeded',
@@ -405,8 +431,21 @@ async function runDraft(id: string, jobRole: string, deps: RoleDraftRunnerDeps):
       .eq('id', id)
       // A cancelled job must not be resurrected by a result that arrived
       // afterwards.
-      .eq('status', 'running');
+      .eq('status', 'running')
+      // SELECTED so zero rows is observable. The fence used to mean exactly
+      // one thing — the operator cancelled — and `expireStaleRoleDraft` gave
+      // it a second: a live job whose heartbeat writes were dropped can be
+      // expired by a concurrent start, and then ten minutes of paid output
+      // lands on a row that no longer matches. PostgREST reports that as
+      // success, so without this the loss is entirely silent.
+      .select('id');
     if (writeError) onTerminalWriteFailure(id, 'succeeded', writeError);
+    else if (Array.isArray(written) && written.length === 0) {
+      draftLogger.warn('db_error', {
+        error_category: 'role_draft_result_discarded',
+        error_type: 'no_running_row',
+      });
+    }
   } catch (err) {
     const isDraftError = err instanceof RoleDraftError;
     const { error: writeError } = await supabase

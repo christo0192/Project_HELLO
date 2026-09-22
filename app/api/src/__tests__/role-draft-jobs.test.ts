@@ -264,6 +264,23 @@ describe('startRoleDraft', () => {
     expect(finalWrite()?.payload?.attempts).toBe(3);
   });
 
+  it('OMITS the attempts key when there is no number — the column is NOT NULL', async () => {
+    // The other half of the test above, and the half that matters more.
+    // `attempts` is `integer not null default 0` (0101), so writing an
+    // explicit null makes the whole terminal write a 23502: it is rejected,
+    // the row stays `running` with a frozen heartbeat, and twelve minutes
+    // later the operator is told the draft was ABANDONED rather than that the
+    // provider could not be reached. Silent everywhere but one log line.
+    //
+    // A review restored `attempts: isDraftError ? (err.attempts ?? null) :
+    // null` and all 6,020 API tests stayed green, because only the PRESENT
+    // case was pinned.
+    const run = vi.fn().mockRejectedValue(new Error('socket hang up'));
+    await startRoleDraft(OWNER, 'Sales Advisor', { run: run as never });
+    await settle();
+    expect('attempts' in (finalWrite()?.payload ?? {})).toBe(false);
+  });
+
   it('does NOT leak a raw provider message to the operator', async () => {
     // An unexpected throw is not a sentence anyone should read. `RoleDraftError`
     // messages are written for a human; nothing else is.
@@ -651,6 +668,21 @@ describe('the 23505 branch — where the index and the read disagree', () => {
       startRoleDraft(OWNER, 'Data Engineer', { run: vi.fn() as never, now: () => NOW }),
     ).rejects.toBeInstanceOf(RoleDraftBusyError);
     expect(calls.some((c) => c.op === 'insert')).toBe(false);
+  });
+
+  it('keeps the STATUS filter on the recovery read', async () => {
+    // `readRunningRow` promises the owner's RUNNING row. Without the filter
+    // it can hand back a settled one — refusing a start with
+    // `RoleDraftBusyError` naming a role that finished an hour ago.
+    selectQueue = [[], [liveRow()]];
+    insertErrors = [DUP];
+    await startRoleDraft(OWNER, 'Sales Advisor', {
+      run: vi.fn() as never,
+      now: () => NOW,
+    });
+    const recoveryRead = calls.filter((c) => c.op === 'select').at(-1);
+    expect(recoveryRead?.filters).toContainEqual(['status', 'running']);
+    expect(recoveryRead?.filters).toContainEqual(['owner_id', OWNER]);
   });
 
   it('a NON-23505 insert failure is raised, not swallowed', async () => {

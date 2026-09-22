@@ -38,6 +38,13 @@ export interface AskHelloButtonProps {
   onError: (message: string) => void;
   /** True when the form holds content a draft would overwrite. */
   wouldOverwrite: () => boolean;
+  /**
+   * Called when a running job is ADOPTED on mount and the form's job role is
+   * blank — a reload, typically. The form fills the field from it, so what is
+   * on screen matches what is actually being drafted instead of showing an
+   * empty field above a button that says "Asking Hello…".
+   */
+  onResumed?: (jobRole: string) => void;
   className?: string;
 }
 
@@ -63,6 +70,7 @@ export function AskHelloButton({
   onDrafted,
   onError,
   wouldOverwrite,
+  onResumed,
   className,
 }: AskHelloButtonProps) {
   const [jobId, setJobId] = useState<string | null>(null);
@@ -73,19 +81,30 @@ export function AskHelloButton({
 
   // Latest callbacks, so the poll effect does not restart whenever the parent
   // re-renders with new closures — which would reset the interval every keystroke.
-  const cbs = useRef({ onDrafted, onError });
-  cbs.current = { onDrafted, onError };
+  const cbs = useRef({ onDrafted, onError, onResumed });
+  cbs.current = { onDrafted, onError, onResumed };
+  /**
+   * The CURRENT job role, for the mount effect.
+   *
+   * A ref rather than a dependency: adding `jobRole` to the resume effect
+   * would re-run the lookup on every keystroke.
+   */
+  const jobRoleRef = useRef(jobRole);
+  jobRoleRef.current = jobRole;
 
   const buttonRef = useRef<HTMLButtonElement | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   /**
    * When the job being watched actually began, for the elapsed counter.
    *
-   * Null while this component is the one that started it — then "now" is
-   * right. Set to the job's own start when a running job is ADOPTED after a
-   * refresh, so the counter reports the wait the operator has really had.
+   * STATE, not a ref. `running` flips true the moment the button is pressed,
+   * so the counter's effect runs before the server has answered — and a ref
+   * written afterwards cannot re-run it, leaving "0s elapsed" on a job that
+   * was already five minutes old. As state, the correction re-runs the effect.
+   *
+   * Null when this component started the job: "now" is right then.
    */
-  const resumedAtRef = useRef<number | null>(null);
+  const [resumeBase, setResumeBase] = useState<number | null>(null);
   /**
    * Put focus back on the main button before Cancel unmounts.
    *
@@ -118,9 +137,37 @@ export function AskHelloButton({
       try {
         const { active } = await api.getActiveRoleDraft();
         if (!live || !active) return;
+
+        // ADOPTION IS NOT UNCONDITIONAL, and that is the whole point.
+        //
+        // `readActiveRoleDraft` has no role filter — it answers "what is this
+        // operator drafting", not "is this form's role drafting". Adopting
+        // whatever it returns reached the exact end state the 409 on `start`
+        // was added to prevent, by the sibling path: leave a Sales Advisor
+        // draft running, reopen New role, and the button says "Asking Hello…"
+        // without being pressed. Type "Data Engineer", and when the draft
+        // lands a fresh form has nothing to overwrite — so the confirm never
+        // fires and a Sales Advisor script fills a form headed Data Engineer.
+        //
+        // Empty field: adopt, and hand the role back so the form can say what
+        // is actually running. That is the refresh case, where the field is
+        // blank because the page reloaded, not because nothing was asked for.
+        const current = jobRoleRef.current.trim();
+        const drafting = active.job_role.trim();
+        if (current && current !== drafting) {
+          // Different role. Do not adopt — the operator is looking at their
+          // own subject and must not have it replaced. Say why Ask Hello is
+          // about to refuse, in the same words the 409 uses.
+          cbs.current.onError(
+            `A draft for "${active.job_role}" is already running. Wait for it, or open that role to cancel it.`,
+          );
+          return;
+        }
+
         const startedAt = active.created_at ? Date.parse(active.created_at) : NaN;
-        resumedAtRef.current = Number.isFinite(startedAt) ? startedAt : null;
-        setJobId((current) => current ?? active.id);
+        setResumeBase(Number.isFinite(startedAt) ? startedAt : null);
+        setJobId((existing) => existing ?? active.id);
+        if (!current) cbs.current.onResumed?.(active.job_role);
       } catch {
         // Nothing to recover, or the lookup failed. Either way the button is
         // usable; this is a convenience, not a precondition.
@@ -138,11 +185,15 @@ export function AskHelloButton({
     // which is a worse lie than showing nothing: it says the wait has barely
     // begun at the moment it is nearly over. `startedAt` is null for a job
     // this component started (they coincide) and set when one is adopted.
-    const base = resumedAtRef.current ?? Date.now();
+    const base = resumeBase ?? Date.now();
     setElapsed(Math.max(0, Math.floor((Date.now() - base) / 1000)));
     const id = setInterval(() => setElapsed(Math.max(0, Math.floor((Date.now() - base) / 1000))), 1000);
     return () => clearInterval(id);
-  }, [running]);
+    // `resumeBase` IS A DEPENDENCY. `running` flips true the moment the button
+    // is pressed, so this effect runs before the server has answered; the
+    // correction that arrives afterwards has to re-run it, or the counter
+    // stays on the wrong clock for the whole draft.
+  }, [running, resumeBase]);
 
   // THE POLL. Tears itself down on unmount, so a job that finishes after the
   // form has gone cannot write into a component that is no longer there.
@@ -205,10 +256,18 @@ export function AskHelloButton({
     }
     setStarting(true);
     setPhase(null);
-    // Started here, so "now" is when the wait began.
-    resumedAtRef.current = null;
+    // Started here, so "now" is when the wait began — until the server says
+    // otherwise below.
+    setResumeBase(null);
     try {
       const job = await api.startRoleDraft(role);
+      // `startRoleDraft` RETURNS AN EXISTING JOB when one is already running
+      // for this role — a second tab, typically. Its clock started when that
+      // job did, not when this button was pressed, so the counter reads from
+      // `created_at` on this path too. Without it a second tab showed "3s
+      // elapsed" for a draft five minutes from finishing.
+      const startedAt = job.created_at ? Date.parse(job.created_at) : NaN;
+      setResumeBase(Number.isFinite(startedAt) ? startedAt : null);
       setJobId(job.id);
     } catch (err) {
       // A 409 carries a sentence written for a human — "A draft for

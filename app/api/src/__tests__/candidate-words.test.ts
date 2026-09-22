@@ -62,6 +62,10 @@ let scenario: Scenario;
 let ranges: Array<[number, number]>;
 /** The columns the turn query ordered by, in order. */
 let orders: string[];
+/** The column list the turn query asked for. */
+let selects: string[];
+/** The `.in()` filters the turn query applied, as [column, count]. */
+let ins: Array<[string, number]>;
 /**
  * OUTSIDE `chain`, deliberately. The route calls `supabase.from(...)` fresh on
  * every pass of the pagination loop, so a counter living inside the builder
@@ -74,9 +78,23 @@ let turnPage: number;
 function chain(table: string): any {
   const isTurns = table === 'transcript_turns';
   const self: any = {
-    select: () => self,
+    select(columns: string) {
+      // RECORDED, for the same reason `order` is. The stub used to discard
+      // this, so dropping `speaker` from the real query kept the file green
+      // — and in production every turn would fail `speaker !== 'candidate'`,
+      // making `candidate_words` 0 for every session that HAS a transcript.
+      // "0 words spoken" against every real candidate is exactly the
+      // accusation the null/zero distinction exists to prevent.
+      if (isTurns) selects.push(columns);
+      return self;
+    },
     eq: () => self,
-    in: () => self,
+    in(column: string, values: string[]) {
+      // Likewise: without the filter the turn query becomes an unfiltered
+      // scan of `transcript_turns` on every candidate detail page load.
+      if (isTurns) ins.push([column, values.length]);
+      return self;
+    },
     order(col: string) {
       // RECORDED, not discarded. The comment on the query justifies these two
       // `.order()` calls as what makes range pagination a TOTAL order — and
@@ -135,6 +153,8 @@ const get = () => request(app()).get(`/api/candidates/${CANDIDATE}`).set(AUTH);
 beforeEach(() => {
   ranges = [];
   orders = [];
+  selects = [];
+  ins = [];
   turnPage = 0;
   scenario = { sessions: [{ id: S1, duration_sec: 434 }], turnPages: [[]] };
   vi.mocked(supabase.from).mockImplementation((t: string) => chain(t) as never);
@@ -233,6 +253,31 @@ describe('candidate_words', () => {
     expect(res.body.sessions[0].candidate_words).toBe(502);
   });
 
+  it('ASKS FOR THE SPEAKER, which is the whole basis of the count', async () => {
+    // Drop `speaker` from the select and every turn is skipped by
+    // `speaker !== 'candidate'`, so a session with a full transcript reports
+    // 0 candidate words — a confident accusation built out of a typo.
+    scenario.turnPages = [[turn(S1, 'candidate', 'one')]];
+    await get();
+    expect(selects).toHaveLength(1);
+    expect(selects[0]).toContain('speaker');
+    expect(selects[0]).toContain('text');
+    expect(selects[0]).toContain('session_id');
+  });
+
+  it('SCOPES THE TURN QUERY to this candidate\'s sessions', async () => {
+    // Without the filter this is an unfiltered scan of `transcript_turns` on
+    // every candidate detail page load, and past 100,000 rows the count goes
+    // null for everyone.
+    scenario.sessions = [
+      { id: S1, duration_sec: 434 },
+      { id: S2, duration_sec: 120 },
+    ];
+    scenario.turnPages = [[turn(S1, 'candidate', 'one')]];
+    await get();
+    expect(ins).toEqual([['session_id', 2]]);
+  });
+
   it('ORDERS BY A TOTAL KEY, which is what makes the paging safe', async () => {
     // Range pagination over a non-total order can skip or repeat rows across
     // a page boundary. `(session_id, turn_index)` is unique, so ordering by
@@ -255,6 +300,17 @@ describe('candidate_words', () => {
     const res = await get();
     // The transcript exists, so 2 — not null.
     expect(res.body.sessions[0].candidate_words).toBe(2);
+  });
+
+  it('marks the count UNUSABLE rather than short when paging runs away', async () => {
+    // The second writer of `wordCountsUsable`, and the untested one. If the
+    // data ever outgrows the iteration cap, a short count is worse than no
+    // count — it renders as a precise number nobody can tell is wrong.
+    // Every page is full, so the loop never terminates naturally.
+    const full = Array.from({ length: 500 }, () => turn(S1, 'candidate', 'word'));
+    scenario.turnPages = Array.from({ length: 400 }, () => full);
+    const res = await get();
+    expect(res.body.sessions[0].candidate_words).toBeNull();
   });
 
   it('does not query turns at all when there are no sessions', async () => {

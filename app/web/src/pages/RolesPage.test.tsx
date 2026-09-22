@@ -292,6 +292,10 @@ describe('RolesPage', () => {
     // The field stays editable for the ten minutes a draft runs. Applying a
     // Sales Advisor draft under a heading that now says something else without
     // saying so is a silent lie about what is on screen.
+    //
+    // The mismatch now ALSO triggers the apply-time confirm, so this accepts
+    // it and then checks the note still names the role that was drafted.
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true);
     mockApi.listRoles.mockResolvedValue([]);
     mockApi.startRoleDraft.mockResolvedValue({ ...succeededJob(), status: 'running' });
     mockApi.getRoleDraft.mockResolvedValue(succeededJob({ job_role: 'Sales Advisr' }));
@@ -307,6 +311,29 @@ describe('RolesPage', () => {
         'Sales Advisr',
       ),
     );
+    confirmSpy.mockRestore();
+  });
+
+  it('ASKS BEFORE APPLYING a draft written for a different role, even on an empty form', async () => {
+    // A fresh form has nothing to overwrite, so the `hasWork` confirm never
+    // fired — which is exactly the case where a draft for another role filled
+    // the form silently. The mismatch is now its own reason to ask.
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(false);
+    mockApi.listRoles.mockResolvedValue([]);
+    mockApi.startRoleDraft.mockResolvedValue({ ...succeededJob(), status: 'running' });
+    mockApi.getRoleDraft.mockResolvedValue(succeededJob({ job_role: 'Sales Advisr' }));
+    render(<RolesPage />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: 'New role' }));
+
+    await user.type(screen.getByLabelText('Job role'), 'Sales Advisor');
+    await user.click(screen.getByRole('button', { name: /Ask Hello/ }));
+
+    await waitFor(() => expect(confirmSpy).toHaveBeenCalled());
+    expect(confirmSpy.mock.calls[0][0]).toContain('Sales Advisr');
+    // Declined, so nothing was written into the form.
+    expect(screen.getByLabelText('Job description')).toHaveValue('');
+    confirmSpy.mockRestore();
   });
 
   it('reports how many questions Hello had to rephrase', async () => {

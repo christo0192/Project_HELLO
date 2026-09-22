@@ -308,6 +308,63 @@ describe('AskHelloButton', () => {
     expect(mockApi.startRoleDraft).not.toHaveBeenCalled();
   });
 
+  it('REFUSES TO ADOPT a job for a different job role', async () => {
+    // The blocker. `readActiveRoleDraft` answers "what is this operator
+    // drafting", not "is THIS form's role drafting" — so adopting whatever it
+    // returns reached the exact end state the 409 on start was added to
+    // prevent, by the other path: leave a Sales Advisor draft running, reopen
+    // the form, type "Data Engineer", and the button says "Asking Hello…"
+    // about someone else's subject.
+    mockApi.getActiveRoleDraft.mockResolvedValue({
+      active: { ...running(), id: 'other-role', job_role: 'Sales Advisor' },
+    });
+    const { onError } = setup({ jobRole: 'Data Engineer' });
+
+    await waitFor(() => expect(onError).toHaveBeenCalled());
+    expect(onError.mock.calls[0][0]).toContain('Sales Advisor');
+    // Not adopted: no poll, and the button is still pressable.
+    expect(mockApi.getRoleDraft).not.toHaveBeenCalled();
+    expect(askHello()).not.toHaveAttribute('aria-disabled', 'true');
+  });
+
+  it('ADOPTS one for the SAME role', async () => {
+    mockApi.getActiveRoleDraft.mockResolvedValue({
+      active: { ...running(), id: 'same-role', job_role: 'Sales Advisor' },
+    });
+    mockApi.getRoleDraft.mockResolvedValue(running());
+    setup({ jobRole: 'Sales Advisor' });
+    await waitFor(() => expect(mockApi.getRoleDraft).toHaveBeenCalledWith('same-role'));
+  });
+
+  it('ADOPTS into an EMPTY field and hands the role back', async () => {
+    // The refresh case: the field is blank because the page reloaded, not
+    // because nothing was asked for. The form fills it from the job, so the
+    // screen stops showing an empty field above a button that says it is
+    // working.
+    mockApi.getActiveRoleDraft.mockResolvedValue({
+      active: { ...running(), id: 'after-reload', job_role: 'Sales Advisor' },
+    });
+    mockApi.getRoleDraft.mockResolvedValue(running());
+    const onResumed = vi.fn();
+    setup({ jobRole: '', onResumed });
+
+    await waitFor(() => expect(mockApi.getRoleDraft).toHaveBeenCalledWith('after-reload'));
+    expect(onResumed).toHaveBeenCalledWith('Sales Advisor');
+  });
+
+  it('counts elapsed from the job even when START returns an existing one', async () => {
+    // `startRoleDraft` hands back a live job for the same role — a second tab.
+    // Its clock began when that job did, not when this button was pressed.
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60_000).toISOString();
+    mockApi.startRoleDraft.mockResolvedValue({ ...running(), created_at: fiveMinutesAgo });
+    mockApi.getRoleDraft.mockResolvedValue(running());
+    setup();
+    await act(async () => askHello().click());
+    await waitFor(() => {
+      expect(document.querySelector('[data-ask-hello-elapsed]')?.textContent).toMatch(/5m/);
+    });
+  });
+
   it('counts elapsed from when the JOB started, not from the resume', async () => {
     // A five-minute-old draft reading "3s elapsed" is worse than no counter:
     // it says the wait has barely begun at the moment it is nearly over.
