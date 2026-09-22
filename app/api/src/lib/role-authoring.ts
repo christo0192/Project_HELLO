@@ -33,6 +33,7 @@ import { runClaudeJSONWithProvenance } from './claude.js';
 import {
   phoneQuestionIssueMessage,
   validatePhoneQuestionTemplate,
+  containsProseDirective,
 } from './phone-screening/question-validation.js';
 
 /**
@@ -249,6 +250,14 @@ function coerceDraft(raw: unknown): RoleDraft | null {
 
   const jd = typeof obj.jd === 'string' ? obj.jd.trim().slice(0, MAX_JD_CHARS) : '';
   if (!jd) return null;
+  // THE JD IS CHECKED TOO, narrowly. Every question the model writes goes
+  // through the phone gate, and until now the jd — the longest field, and the
+  // one that reaches the worker's system prompt — went through nothing but a
+  // length clamp. `containsProseDirective` is deliberately NOT `META_RE`: see
+  // its comment for why banning "developer" in a job description would be
+  // worse than the problem. It rejects an imperative aimed at a reader and
+  // structural markup, which is the shape of an injection attempt.
+  if (containsProseDirective(jd)) return null;
 
   const skills = Array.isArray(obj.required_skills)
     ? obj.required_skills

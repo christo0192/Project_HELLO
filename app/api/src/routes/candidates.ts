@@ -1001,13 +1001,29 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
   let wordCountsUsable = true;
 
   if (sessionIds.length > 0) {
-    // PAGINATED. PostgREST caps a response at `max-rows` (1000 by default) and
-    // signals it in no way the client can see — it simply returns fewer rows.
-    // A single seven-minute screen runs to dozens of turns and this query
-    // spans every session a candidate has, so the cap is reachable in ordinary
-    // use, and hitting it would undercount the most talkative candidates first.
-    const PAGE = 1000;
+    // PAGINATED, AND THE PAGE IS DELIBERATELY SMALLER THAN THE CAP.
+    //
+    // PostgREST truncates a response at `max_rows` and signals it in no way
+    // the client can see — it simply returns fewer rows. This loop stops when
+    // a page comes back short, so a PAGE equal to the cap is a trap: every
+    // page would come back short, the loop would stop after the first, and the
+    // count would be silently low for exactly the talkative candidates this
+    // figure exists to identify. `app/supabase/config.toml` sets max_rows to
+    // 1000, so 500 leaves the terminator meaningful with room for that value
+    // to be halved before anyone has to think about it again.
+    //
+    // A hard iteration cap sits underneath: if the data ever outgrows it, the
+    // count is marked unusable rather than reported short. A missing badge is
+    // recoverable; a confident wrong number is not.
+    const PAGE = 500;
+    const MAX_PAGES = 200;
+    let pages = 0;
     for (let from = 0; ; from += PAGE) {
+      if (pages >= MAX_PAGES) {
+        wordCountsUsable = false;
+        break;
+      }
+      pages += 1;
       const { data: turns, error } = await supabase
         .from('transcript_turns')
         .select('session_id, speaker, text')

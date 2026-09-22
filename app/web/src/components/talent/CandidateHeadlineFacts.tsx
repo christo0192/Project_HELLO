@@ -77,6 +77,11 @@ export function CandidateHeadlineFacts({
           data-candidate-role-title=""
           className="inline-flex items-center rounded-full bg-info-soft px-2.5 py-1 text-[13px] font-medium text-ink"
         >
+          {/* The other two pills caption themselves ("on the call", "words
+              spoken"); this one is bare text in a coloured capsule, so a
+              screen reader would hear "Sales Advisor" with nothing saying
+              what it is. `Tag` already uses this idiom with srPrefix. */}
+          <span className="sr-only">Role: </span>
           {roleTitle}
         </span>
       )}

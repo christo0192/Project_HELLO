@@ -319,7 +319,21 @@ function RoleForm({
       title: title.trim(),
       // Blank means unset, which the API stores as NULL — one representation,
       // matching the column's check constraint.
-      agent_name: agentName.trim() ? agentName.trim() : null,
+      // SENT ONLY WHEN IT MEANS SOMETHING, and that is a deploy-ordering
+      // guard rather than tidiness. `roles.agent_name` arrives in 0100, and
+      // the web app ships independently of `supabase db push` — until the
+      // migration lands, PostgREST rejects the unknown column (PGRST204) and
+      // the route 500s. Sending it unconditionally would therefore break ALL
+      // role creation and editing, including for the roles that never wanted
+      // an agent name, which is every existing one.
+      //
+      // Omitted when the box is blank and the role never had a value: the
+      // overwhelming majority of saves carry no key at all and keep working.
+      // A blank box on a role that HAS one is a real edit — "clear it" — so
+      // that still sends an explicit null and still needs the migration.
+      ...(agentName.trim() || role?.agent_name
+        ? { agent_name: agentName.trim() ? agentName.trim() : null }
+        : {}),
       jd: jd.trim(),
       required_skills,
       screening_template,
@@ -442,12 +456,25 @@ function RoleForm({
           </InlineNotice>
         )}
         {/* Said plainly, because a drafted role is NOT a saved role and the
-            form gives no other signal that a model wrote what is on screen. */}
-        {draftNote && (
-          <InlineNotice tone="info" role="status" className="mt-1">
-            {draftNote}
-          </InlineNotice>
-        )}
+            form gives no other signal that a model wrote what is on screen.
+
+            A PERMANENT region, not one mounted with its content: a live region
+            created at the same moment it gains text is not reliably announced,
+            and this is the sentence the operator waited ten minutes for. The
+            button's own status region is built the same way for the same
+            reason. */}
+        <p
+          role="status"
+          aria-live="polite"
+          data-role-draft-note=""
+          className="min-h-0"
+        >
+          {draftNote && (
+            <InlineNotice tone="info" className="mt-1">
+              {draftNote}
+            </InlineNotice>
+          )}
+        </p>
 
         <Field label="Job description" id="role-jd">
           {({ id }) => (
