@@ -267,11 +267,21 @@ describe('Ask Hello — the class list, where two of the three defects lived', (
     // `.candidate-scope`, which the Roles page does not apply. Off-scope the
     // custom property is invalid at computed-value time and Tailwind's
     // preflight default takes over at 1.84:1, against the 3:1 SC 1.4.11
-    // needs. Any `ring-[var(--c-*)]` here is the same bug wearing a different
-    // token name.
+    // needs. Any candidate-scoped ring token here is the same bug wearing a
+    // different name. (Written in prose deliberately: a glob-shaped
+    // arbitrary value in a comment is still a Tailwind candidate, and an
+    // asterisk inside one is what broke the production CSS build.)
     const cls = buttonClassName();
     expect(cls).toContain('focus-visible:ring-info');
-    expect(cls).not.toMatch(/ring-\[var\(--c-/);
+    // ASSEMBLED, not written as one literal. Tailwind's content globs include
+    // `src/**/*.{ts,tsx}`, tests included, and its extractor pulled the
+    // INCOMPLETE arbitrary value `ring-[var(--c-` straight out of this file's
+    // source and generated broken CSS from it — lightningcss then failed the
+    // production build with `Unexpected token Delim('*')`. The complete forms
+    // elsewhere in the codebase (`ring-[var(--c-accent)]`) are fine; a
+    // truncated one is not, and a regex is the one place you write one.
+    const scopedRingToken = new RegExp('ring-' + '\\[var\\(--c-');
+    expect(cls).not.toMatch(scopedRingToken);
   });
 
   it('keeps the label WHITE — every contrast figure above assumes it', () => {
