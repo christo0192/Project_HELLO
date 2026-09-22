@@ -161,6 +161,90 @@ describe('CandidateDetailPage', () => {
     expect(await screen.findByText('Candidate not found')).toBeInTheDocument();
   });
 
+  it('shows the ROLE and the CALL LENGTH on the left, not in the Live-call card', async () => {
+    // These two answer "who is this and did we actually talk to them". The
+    // length used to sit in the Live-call card on the far right, which is the
+    // last place a manager scanning the left column looks.
+    mockApi.listRoles.mockResolvedValue([{ id: 'role-1', title: 'Sales Advisor' }]);
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: { ...mockCandidateDetail.candidate, role_id: 'role-1' },
+      sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 434, candidate_words: 450 }],
+    });
+    renderDetailPage();
+
+    expect(await screen.findByText('Sales Advisor')).toBeInTheDocument();
+    expect(document.querySelector('[data-candidate-call-length]')?.textContent).toContain('7m 14s');
+    // Labelled for WHAT IT MEASURES. `duration_sec` is wall clock from session
+    // start to finalize — bot speech, candidate speech, ring and silence — so
+    // "candidate spoke for 7m 14s" would be a false claim about engagement.
+    expect(document.querySelector('[data-candidate-call-length]')?.textContent).toContain(
+      'on the call',
+    );
+    expect(document.querySelector('[data-candidate-call-length]')?.textContent).not.toMatch(
+      /spoke|talk/i,
+    );
+  });
+
+  it('shows the words the CANDIDATE said, which wall clock cannot give', async () => {
+    // The pair is the point: a long call with very few candidate words is a
+    // call where they could not get a word in. Praveetha's 2026-09-10 screen
+    // had 8 of 8 bot turns barged-in and truncated and a healthy-looking
+    // wall clock.
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 480, candidate_words: 12 }],
+    });
+    renderDetailPage();
+    await screen.findByText(/Profile/);
+    const words = document.querySelector('[data-candidate-words]');
+    expect(words?.textContent).toContain('12');
+    expect(words?.textContent).toContain('words spoken');
+  });
+
+  it('reports the LONGEST session, not the latest', async () => {
+    // A candidate can carry a cycle-2 rescreen plus a call that died at the
+    // consent gate after nine seconds. The most recent would report "0m 9s"
+    // for someone who completed a seven-minute screen.
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      sessions: [
+        { ...mockCandidateDetail.sessions[0], id: 's-new', duration_sec: 9, candidate_words: 3 },
+        { ...mockCandidateDetail.sessions[0], id: 's-old', duration_sec: 434, candidate_words: 450 },
+      ],
+    });
+    renderDetailPage();
+    await screen.findByText(/Profile/);
+    expect(document.querySelector('[data-candidate-call-length]')?.textContent).toContain('7m 14s');
+    // ...and the words come from THE SAME session, or the two figures
+    // describe different calls while sitting side by side.
+    expect(document.querySelector('[data-candidate-words]')?.textContent).toContain('450');
+  });
+
+  it('shows no call badge at all when nothing completed', async () => {
+    // Absent, not "0m 0s" — a zero-length call is a claim, and the wrong one.
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: null, candidate_words: 0 }],
+    });
+    renderDetailPage();
+    await screen.findByText(/Profile/);
+    expect(document.querySelector('[data-candidate-call-length]')).toBeNull();
+  });
+
+  it('does NOT claim a role it could not resolve', async () => {
+    // A wrong role on a candidate page is worse than no role.
+    mockApi.listRoles.mockResolvedValue([]);
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: { ...mockCandidateDetail.candidate, role_id: 'role-gone' },
+    });
+    renderDetailPage();
+    await screen.findByText(/Profile/);
+    expect(document.querySelector('[data-candidate-role-title]')).toBeNull();
+    expect(screen.queryByText('role-gone')).not.toBeInTheDocument();
+  });
+
   it('renders candidate profile', async () => {
     renderDetailPage();
     expect(await screen.findByText('Jane Doe')).toBeInTheDocument();
