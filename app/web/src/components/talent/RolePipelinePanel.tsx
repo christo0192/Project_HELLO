@@ -9,10 +9,15 @@
  * cohort. So each stage is differenced into the bucket a candidate is
  * actually sitting in:
  *
- *     Not dialled        = candidates_total - dialed
- *     Dialled, no answer = dialed    - connected
- *     Connected          = connected - scored
- *     Screened           = scored
+ *     Awaiting first dial = candidates_total - dialed
+ *     Called, no answer   = dialed    - connected
+ *     Spoke, not assessed = connected - scored
+ *     Screening complete  = scored
+ *
+ * Those labels deliberately share NO WORD with the cumulative stage line under
+ * the bar ("Reached: dialled N · connected N · screened N"). They did once,
+ * and "Connected 2" sitting twenty pixels above "connected 6" gave a recruiter
+ * two defensible answers to one question.
  *
  * Those partition the cohort, which is the only thing a stack may claim. The
  * stage TOTALS a recruiter asked to see are still legible: dialled is
@@ -166,7 +171,7 @@ export function segmentsFor(totals: FunnelSummaryTotals): PipelineSegment[] {
 function StageTotals({ totals }: { totals: FunnelSummaryTotals }) {
   const { total, dialed, connected, scored } = stageTotals(totals);
   return (
-    <span className="tabular-nums">
+    <span className="tabular-nums" data-stage-totals="">
       Reached: dialled{' '}
       <strong className="font-semibold text-[var(--c-ink)]">{dialed}</strong>
       {' · '}connected <strong className="font-semibold text-[var(--c-ink)]">{connected}</strong>
@@ -279,7 +284,10 @@ export function RolePipelinePanel({ roles, roleId }: RolePipelinePanelProps) {
           this panel is ~290px for one role and over 1100px for six, which put
           the candidate table — the page's subject — below the fold and made
           the page LONGER than before the change that was meant to declutter
-          it. The summary line carries the one number worth seeing closed. */}
+          it. Closed it shows only the heading and the count of roles behind
+          the toggle — anything that reports a PROBLEM (a partial outage) must
+          stay outside the body, because a reader has no reason to expand a
+          panel they do not know is incomplete. */}
       <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
         <h2
           id={headingId}
@@ -319,6 +327,10 @@ export function RolePipelinePanel({ roles, roleId }: RolePipelinePanelProps) {
         </p>
       )}
 
+      {/* Rendered only when something is behind it. In the failures-only
+          state there is no toggle, so a body here would be an `aria-controls`
+          target with no controller — inert markup no one can reach. */}
+      {populated.length > 0 && (
       <div id={bodyId} hidden={!open}>
       <p className="mt-1 text-[13px] leading-5 text-[var(--c-ink-secondary)]">
         Each bar is one role&rsquo;s candidates, split by how far they got &mdash; the parts add up
@@ -348,6 +360,7 @@ export function RolePipelinePanel({ roles, roleId }: RolePipelinePanelProps) {
       </div>
 
       </div>
+      )}
     </GlassPanel>
   );
 }

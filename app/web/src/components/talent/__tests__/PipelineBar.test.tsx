@@ -10,8 +10,35 @@
 
 import { render, screen, fireEvent, within } from '@testing-library/react';
 import { describe, it, expect, vi } from 'vitest';
+
+vi.mock('../../../api', () => ({
+  api: {
+    getScreeningFunnel: () =>
+      Promise.resolve({
+        totals: {
+          entered_parse: 0, parsed_ok: 0, needs_review: 0, parse_failed: 0,
+          dialed: 22, connected: 12, consent_passed: 0, consent_dropped: 0,
+          answered_ge1: 0, scored: 5, qualified: 0, on_hold: 0, disqualified: 0,
+          human_review: 0, reached_reference_check: 0, attempts_total: 0,
+          connects_total: 0, total_call_seconds: 0, hr_qualified: 0,
+          hr_disqualified: 0, hr_awaiting: 0, hr_unknown: 0, candidates_total: 30,
+        },
+      }),
+  },
+  ApiError: class extends Error {},
+}));
 import { PipelineBar } from '../PipelineBar';
-import { segmentsFor } from '../RolePipelinePanel';
+import { RolePipelinePanel, segmentsFor } from '../RolePipelinePanel';
+
+/** One populated role, purely so `StageTotals` renders and can be read. */
+const STAGE_PROBE_ROLE_ID = 'probe';
+const STAGE_PROBE_ROLE = {
+  id: STAGE_PROBE_ROLE_ID,
+  title: 'Probe',
+  jd: '',
+  required_skills: [],
+  screening_template: [],
+} as never;
 import { funnelTotals } from '../../../test/funnel';
 
 /**
@@ -80,14 +107,28 @@ describe('segmentsFor — nested funnel stages become disjoint buckets', () => {
     }
   });
 
-  it('shares no LABEL WORD between the buckets and the stage line', () => {
-    // Word-level, not exact-string. Asserting `!== 'Connected'` let
-    // "Connected, not screened" through, re-creating the very collision the
-    // check is named after.
-    const stageWords = new Set(['dialled', 'connected', 'screened']);
+  it('shares no LABEL WORD between the buckets and the RENDERED stage line', async () => {
+    // The stage words are read out of what `StageTotals` actually renders, not
+    // retyped here. A hardcoded `['dialled','connected','screened']` passes
+    // even after someone renames the stage line — change "Reached: dialled" to
+    // "Reached: called" and the bar reads "Called, no answer 10" directly above
+    // "Reached: called 22", the exact collision this guards, with the test
+    // still green. Asserting a lookup table never tests what reads it.
+    const { container } = render(
+      <RolePipelinePanel roles={[STAGE_PROBE_ROLE]} roleId={STAGE_PROBE_ROLE_ID} />,
+    );
+    fireEvent.click(await screen.findByRole('button', { name: /^Show 1 role/ }));
+    const stageLine = container.querySelector('[data-stage-totals]');
+    expect(stageLine, 'StageTotals must be rendered to derive its words').not.toBeNull();
+    const stageWords = new Set(
+      stageLine!.textContent!.toLowerCase().split(/[^a-z]+/).filter((w) => w.length > 3),
+    );
+    expect(stageWords.size).toBeGreaterThan(2);
+
     for (const seg of segmentsFor(funnelTotals({ candidates_total: 1 }))) {
-      const words = seg.label.toLowerCase().split(/[^a-z]+/).filter(Boolean);
-      for (const w of words) expect(stageWords.has(w)).toBe(false);
+      for (const w of seg.label.toLowerCase().split(/[^a-z]+/).filter(Boolean)) {
+        expect(stageWords.has(w), `bucket "${seg.label}" reuses stage word "${w}"`).toBe(false);
+      }
     }
   });
 
@@ -202,6 +243,22 @@ describe('PipelineBar', () => {
     expect(screen.queryByText('99')).not.toBeInTheDocument();
     // ...and it must not inflate the sum, or the remainder would vanish.
     expect(document.querySelector('[data-segment-value="__remainder"]')).toBeNull();
+  });
+
+  it('paints the neutral bucket in a MEASURED mid tone, not a border token', () => {
+    // This value has been wrong in both directions: `--c-ink-secondary` at
+    // 8.90:1 made the usually-dominant "not dialled" bucket the heaviest block
+    // on the bar, and `--c-border` at 1.13:1 made it invisible against its own
+    // track. `--c-ink-muted` is 4.03:1 on the track, clear of the 3:1 floor.
+    const { container } = render(
+      <PipelineBar
+        label="t"
+        total={4}
+        segments={[{ key: 'n', label: 'Neutral', value: 4, tone: 'neutral' }]}
+      />,
+    );
+    const fill = container.querySelector<HTMLElement>('[data-pipeline-track] > span');
+    expect(fill?.style.backgroundColor).toBe('var(--c-ink-muted)');
   });
 
   it('exposes the legend as a named list, since the bar is decorative', () => {

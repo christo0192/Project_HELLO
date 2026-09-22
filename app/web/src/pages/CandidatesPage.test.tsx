@@ -277,6 +277,9 @@ describe('CandidatesPage', () => {
     const table = screen.getByRole('table');
     expect(within(table).queryByText('Unknown role')).not.toBeInTheDocument();
     expect(within(table).queryByText('Senior Frontend Engineer')).not.toBeInTheDocument();
+    // POSITIVE too: two absences are also satisfied by a cell that renders
+    // nothing at all, which is not what "says —" claims.
+    expect(within(table).getAllByText('—').length).toBeGreaterThan(0);
   });
 
   it('MOVES FOCUS into the panel only from the far-away trigger', async () => {

@@ -137,9 +137,9 @@ describe('RolePipelinePanel', () => {
     expect(screen.queryByText('Support')).not.toBeInTheDocument();
     const notice = await screen.findByText(/1 role could not be read/);
     expect(notice).toHaveAttribute('data-failed-roles', '1');
-    // Visible WITHOUT expanding: the reader has no reason to open a panel
-    // they do not know is incomplete.
-    expect(notice).toBeVisible();
+    // Visibility is asserted by the sibling test below, which does NOT expand.
+    // Asserting it here — after `expand()` — would pass with the notice back
+    // inside the collapsed body, which is the defect it is meant to guard.
   });
 
   it('still reports a failure when every SURVIVING role has no candidates', async () => {
