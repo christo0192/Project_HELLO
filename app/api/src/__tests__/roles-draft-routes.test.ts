@@ -17,7 +17,12 @@ vi.mock('../lib/supabase.js', () => ({
   supabase: { from: vi.fn(), rpc: vi.fn() },
   RESUME_BUCKET: 'resumes_v2',
 }));
-vi.mock('../lib/role-draft-jobs.js', () => ({
+vi.mock('../lib/role-draft-jobs.js', async () => ({
+  // The real class, because the route branches on `instanceof`. A stub class
+  // here would make the 409 test pass while production 500s.
+  RoleDraftBusyError: (await vi.importActual<typeof import('../lib/role-draft-jobs.js')>(
+    '../lib/role-draft-jobs.js',
+  )).RoleDraftBusyError,
   startRoleDraft: vi.fn(),
   readRoleDraft: vi.fn(),
   readActiveRoleDraft: vi.fn(),
@@ -104,6 +109,29 @@ describe('POST /api/roles/draft', () => {
       .send({ job_role: 'Sales Advisor', owner_id: 'someone-else' });
     expect(res.status).toBe(400);
     expect(jobs.startRoleDraft).not.toHaveBeenCalled();
+  });
+
+  it('answers 409, not 500, when a DIFFERENT role is already drafting', async () => {
+    // One live draft per owner is a real constraint — each start detaches up
+    // to six v4-pro calls. The honest answer names the role holding it; the
+    // alternative that shipped briefly was handing back the other role's job,
+    // which put a Sales Advisor script into a form headed "Data Engineer".
+    vi.mocked(jobs.startRoleDraft).mockRejectedValue(new jobs.RoleDraftBusyError('Sales Advisor'));
+    const res = await request(app()).post('/api/roles/draft').set(AUTH).send({
+      job_role: 'Data Engineer',
+    });
+    expect(res.status).toBe(409);
+    expect(res.body.error.type).toBe('conflict');
+    expect(res.body.error.message).toContain('Sales Advisor');
+    expect(res.body.error.details.job_role).toBe('Sales Advisor');
+  });
+
+  it('still 500s on an ordinary failure — the 409 is not a catch-all', async () => {
+    vi.mocked(jobs.startRoleDraft).mockRejectedValue(new Error('connection failure'));
+    const res = await request(app()).post('/api/roles/draft').set(AUTH).send({
+      job_role: 'Data Engineer',
+    });
+    expect(res.status).toBe(500);
   });
 
   it('refuses a viewer', async () => {

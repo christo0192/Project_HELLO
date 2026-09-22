@@ -427,7 +427,16 @@ body .text-red-700 { color: var(--error-text); }
   display: none;
 }
 
-.ask-hello:hover:not([aria-disabled='true']) {
+/* `:not(:focus-visible)` is the whole point of this selector, not decoration.
+   `.ask-hello:hover:not([aria-disabled='true'])` is specificity (0,3,0) —
+   `:not()` contributes its argument — and Tailwind's
+   `.focus-visible\:ring-2:focus-visible` is (0,2,0). Specificity beats source
+   order, so a button that was BOTH hovered and focus-visible had its entire
+   ring box-shadow replaced by this glow: the 2px indicator vanished, leaving
+   something visually identical to the unfocused hover state. Reachable by any
+   keyboard user whose pointer happens to rest over the button — click into
+   "Job role", then Tab. */
+.ask-hello:hover:not([aria-disabled='true']):not(:focus-visible) {
   box-shadow: 0 2px 10px rgb(59 84 136 / 0.45), inset 0 0 0 1px rgb(255 255 255 / 0.14);
 }
 .ask-hello__sheen {

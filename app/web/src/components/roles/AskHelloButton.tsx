@@ -211,6 +211,9 @@ export function AskHelloButton({
       const job = await api.startRoleDraft(role);
       setJobId(job.id);
     } catch (err) {
+      // A 409 carries a sentence written for a human — "A draft for
+      // \"Sales Advisor\" is already running." — so it is shown as-is rather
+      // than flattened into a generic failure.
       cbs.current.onError(err instanceof Error ? err.message : 'Hello could not be started.');
     } finally {
       setStarting(false);

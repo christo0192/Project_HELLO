@@ -157,6 +157,12 @@ export interface RoleDraftRunnerDeps {
  * A STALE row is not returned. It belongs to a dead worker, and handing it
  * back would resume polling something that will never report again — and, far
  * worse for `startRoleDraft` below, would refuse to start a new draft forever.
+ *
+ * `uq_role_drafts_owner_running` does NOT share that view — to the index a
+ * stale row is simply `running` — so `startRoleDraft` reads through this
+ * filter with `readRunningRow` when the index disagrees, and expires the row.
+ * Without that, this function's own promise is broken by the constraint that
+ * was added to back it up.
  */
 export async function readActiveRoleDraft(
   ownerId: string,
@@ -178,15 +184,85 @@ export async function readActiveRoleDraft(
 }
 
 /**
+ * Raised when a live job exists for a DIFFERENT job role.
+ *
+ * Not an error the operator caused, and not one to paper over: substituting
+ * the other role's job — which is what returning it would do — put a Sales
+ * Advisor JD and six Sales Advisor questions into a form headed "Data
+ * Engineer". The route answers 409 and names the role actually running.
+ */
+export class RoleDraftBusyError extends Error {
+  constructor(readonly liveJobRole: string) {
+    super(`A draft for "${liveJobRole}" is already running.`);
+    this.name = 'RoleDraftBusyError';
+  }
+}
+
+/**
+ * The owner's `running` row EXACTLY AS THE DATABASE SEES IT — stale included.
+ *
+ * `readActiveRoleDraft` hides stale rows because a caller should not be told
+ * to keep watching a dead worker. `uq_role_drafts_owner_running` does not
+ * share that opinion: to the index a stale row is simply `running`, and it
+ * blocks the next insert.
+ *
+ * That disagreement is a LOCKOUT, and it is the one the staleness filter was
+ * written to prevent. A deploy mid-draft leaves the row `running` with a
+ * frozen heartbeat; the operator is told the draft was abandoned and to try
+ * again; the read says nothing is live, the insert hits 23505, and the retry
+ * read says nothing is live again. Every press, forever, with only manual SQL
+ * as the way out. So the 23505 path reads through the filter, not around it.
+ */
+async function readRunningRow(ownerId: string): Promise<Row | null> {
+  const { data, error } = await supabase
+    .from('role_drafts')
+    .select('*')
+    .eq('owner_id', ownerId)
+    .eq('status', 'running')
+    .order('updated_at', { ascending: false })
+    .limit(1);
+  if (error) throw error;
+  return (Array.isArray(data) ? (data[0] as Row) : null) ?? null;
+}
+
+/**
+ * Move a dead worker's row out of `running` so the next draft can start.
+ *
+ * The verdict `readRoleDraft` already reports at read time, finally written
+ * down. Fenced on `status = 'running'` and on the heartbeat, so a worker that
+ * wakes up between the read and this write cannot have its live job killed.
+ */
+async function expireStaleRoleDraft(ownerId: string, staleBefore: string): Promise<void> {
+  await supabase
+    .from('role_drafts')
+    .update({
+      status: 'failed',
+      error_reason: 'abandoned',
+      error_message: 'Hello stopped partway through. Try again.',
+      phase: null,
+      updated_at: new Date().toISOString(),
+    })
+    .eq('owner_id', ownerId)
+    .eq('status', 'running')
+    .lt('updated_at', staleBefore);
+}
+
+/**
  * Create the job row and start the work. Returns as soon as the row exists.
  *
  * ONE LIVE JOB PER OWNER. Each start detaches up to six v4-pro calls into the
  * process that also serves live-call operations, and nothing else bounds how
  * often the button can be pressed — the UI's guard is per-component, so two
  * tabs, or a script holding a valid interviewer token, could start hundreds a
- * minute. An existing live job is RETURNED rather than refused: the caller
- * asked to be drafting and they now are, which is also exactly what a second
- * tab should see.
+ * minute. `uq_role_drafts_owner_running` (0101) is what actually enforces it;
+ * a SELECT-then-INSERT cannot, because a concurrent request sees the same
+ * empty result.
+ *
+ * A live job for the SAME role is RETURNED — the caller asked to be drafting
+ * and they now are, which is exactly what a second tab should see. A live job
+ * for a DIFFERENT role raises `RoleDraftBusyError`, because silently handing
+ * back the other role's draft is how a Sales Advisor script ended up in a form
+ * headed "Data Engineer".
  *
  * The generation is deliberately NOT awaited: the caller is an HTTP request
  * that must answer in milliseconds. Its failures are captured into the row, so
@@ -209,26 +285,42 @@ export async function startRoleDraft(
   // to overwrite, so the confirm never fires and only an info notice mentions
   // it. A live job for a DIFFERENT role is left alone to finish; this one
   // starts its own.
+  const now = deps.now ?? Date.now;
   const live = await readActiveRoleDraft(ownerId, deps);
-  if (live && live.job_role.trim() === jobRole.trim()) return live;
-
-  const { data, error } = await supabase
-    .from('role_drafts')
-    .insert({ owner_id: ownerId, job_role: jobRole, status: 'running' })
-    .select()
-    .single();
-  if (error) {
-    // LOST THE RACE, NOT A FAILURE. `uq_role_drafts_owner_running` (0101) is
-    // what actually enforces one live job per owner — the SELECT above cannot,
-    // because a concurrent request sees the same empty result. A 23505 here
-    // means the other request won by microseconds, so the right answer is the
-    // job that now exists, exactly as if this call had arrived second.
-    if ((error as { code?: string }).code === '23505') {
-      const winner = await readActiveRoleDraft(ownerId, deps);
-      if (winner) return winner;
-    }
-    throw error;
+  if (live) {
+    if (live.job_role.trim() === jobRole.trim()) return live;
+    throw new RoleDraftBusyError(live.job_role);
   }
+
+  const insert = async () =>
+    supabase
+      .from('role_drafts')
+      .insert({ owner_id: ownerId, job_role: jobRole, status: 'running' })
+      .select()
+      .single();
+
+  let { data, error } = await insert();
+  if (error && (error as { code?: string }).code === '23505') {
+    // THE INDEX SAW SOMETHING THE READ DID NOT. Exactly two things can put a
+    // `running` row here after `readActiveRoleDraft` said there was none:
+    //
+    //   a CONCURRENT start that won by microseconds — the right answer is the
+    //   job that now exists, which is what arriving second should look like;
+    //
+    //   a STALE row, which the read filters out and the index does not. That
+    //   is the lockout case. The row is expired — writing down the verdict
+    //   `readRoleDraft` already reports — and the insert is retried ONCE.
+    const row = await readRunningRow(ownerId);
+    if (row && now() - Date.parse(row.updated_at) <= ROLE_DRAFT_STALE_MS) {
+      if (row.job_role.trim() === jobRole.trim()) return toJob(row);
+      throw new RoleDraftBusyError(row.job_role);
+    }
+    if (row) {
+      await expireStaleRoleDraft(ownerId, new Date(now() - ROLE_DRAFT_STALE_MS).toISOString());
+      ({ data, error } = await insert());
+    }
+  }
+  if (error) throw error;
 
   const row = data as Row;
   // Fire and forget, with every failure funnelled into the row.

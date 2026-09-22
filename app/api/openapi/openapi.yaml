@@ -169,6 +169,8 @@ paths:
           description: Unauthenticated.
         '403':
           description: Insufficient role.
+        '409':
+          description: A draft for a DIFFERENT job role is already running for this caller. One live draft per owner - each start detaches up to six v4-pro calls. `details.job_role` names the role holding it.
   /api/roles/draft/{id}:
     parameters:
       - name: id
@@ -7577,7 +7579,7 @@ components:
     RoleDraftJob:
       type: object
       additionalProperties: false
-      required: [id, job_role, status, phase, draft, attempts, repaired, error_reason, error_message, max_attempts]
+      required: [id, job_role, status, phase, draft, attempts, repaired, error_reason, error_message, max_attempts, created_at]
       properties:
         id:
           type: string
@@ -7653,6 +7655,12 @@ components:
         max_attempts:
           type: integer
           minimum: 1
+        created_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the job began. The client reads this on resume so the elapsed counter reports the wait the operator has actually had, rather than restarting at zero.
+
 
     Role:
       type: object

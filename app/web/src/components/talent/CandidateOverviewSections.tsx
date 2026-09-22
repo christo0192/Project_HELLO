@@ -161,8 +161,12 @@ function ResumeEvidence({ facts }: { facts?: CandidateResumeFacts | null }) {
       <dd className="text-sm leading-relaxed text-ink">{values.join(' · ')}</dd>
     </div>
   ) : null;
+  // `facts.summary` is NOT counted: it renders above the field list at the top
+  // of the card now, not in this section. Leaving it in the predicate gave a
+  // candidate whose parse yielded only a summary a "Resume evidence" heading
+  // and a rule above an empty list.
   const hasEvidence = recentLabel || prior.length || (facts.career_highlights?.length ?? 0) ||
-    (facts.education?.length ?? 0) || (facts.certifications?.length ?? 0) || facts.summary;
+    (facts.education?.length ?? 0) || (facts.certifications?.length ?? 0);
   if (!hasEvidence) return null;
   return (
     <div className="mt-5 border-t border-line pt-4">

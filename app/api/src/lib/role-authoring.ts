@@ -8,9 +8,17 @@
  * interviewer or recruiter**. That ban exists to stop prompt-injection reaching
  * the phone worker, and it is indifferent to intent: a perfectly ordinary
  * question for a Talent Acquisition role — "how do you keep an applicant
- * tracking system current?" — is rejected for the word *system*, and a sales
- * question about *sourcing developers* is rejected for *developers*. Those are
- * exactly the roles someone would most want to auto-author.
+ * tracking system current?" — is rejected for the word *system*, and "how do
+ * you source a developer for a niche role?" is rejected for *developer*.
+ * Those are exactly the roles someone would most want to auto-author.
+ *
+ * (The ban is `\b`-anchored and therefore singular-only: *developers* slips
+ * through where *developer* does not. Verified by execution rather than
+ * assumed — an earlier version of this comment used the plural as its example
+ * and was simply wrong. The inconsistency is a property of the validator, not
+ * of this module, and widening it is out of scope here: every word added to
+ * `META_RE` is a word the generator must then avoid, and a rule the prompt
+ * does not state is a rule that burns the whole attempt budget.)
  *
  * So a generator that wrote whatever the model returned would cheerfully
  * author a role whose questions fail at call time. That is not theoretical:

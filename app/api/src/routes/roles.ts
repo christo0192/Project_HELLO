@@ -8,6 +8,7 @@ import {
   cancelRoleDraft,
   readActiveRoleDraft,
   readRoleDraft,
+  RoleDraftBusyError,
   startRoleDraft,
 } from '../lib/role-draft-jobs.js';
 import { roleDraftSchema } from '../schemas/roles.js';
@@ -83,6 +84,19 @@ rolesRouter.post(
       }
       res.status(202).json(job);
     } catch (err) {
+      // A LIVE DRAFT FOR ANOTHER ROLE IS A CONFLICT, NOT A CRASH. One draft
+      // per owner is a real constraint, and the honest answer names the role
+      // that is holding it — handing back the other job instead is how a
+      // Sales Advisor script ended up in a form headed "Data Engineer".
+      if (err instanceof RoleDraftBusyError) {
+        return res.status(409).json({
+          error: {
+            type: 'conflict',
+            message: err.message,
+            details: { job_role: err.liveJobRole },
+          },
+        });
+      }
       next(err);
     }
   },
