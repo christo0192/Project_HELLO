@@ -15,6 +15,9 @@ import { mockCandidateDetail, mockSessionDetail } from '../test/helpers';
 
 const mockApi = {
   getCandidate: vi.fn(),
+  // The Profile card shows the role a candidate applied for, which the detail
+  // payload does not carry — the page resolves it from the roles list.
+  listRoles: vi.fn(),
   getMe: vi.fn(),
   getCandidatePhoneScreenings: vi.fn(),
   getPhoneSlots: vi.fn(),
@@ -50,6 +53,7 @@ const mockApi = {
 vi.mock('../api', () => ({
   api: {
     getCandidate: (...args: any[]) => mockApi.getCandidate(...args),
+    listRoles: (...args: any[]) => mockApi.listRoles(...args),
     getMe: (...args: any[]) => mockApi.getMe(...args),
     getCandidatePhoneScreenings: (...args: any[]) => mockApi.getCandidatePhoneScreenings(...args),
     getPhoneSlots: (...args: any[]) => mockApi.getPhoneSlots(...args),
@@ -119,6 +123,9 @@ function reviewTab() {
 
 describe('CandidateDetailPage', () => {
   beforeEach(() => {
+    // The Profile card resolves the role title from this; an empty list
+    // means the badge is simply absent, which no existing assertion reads.
+    mockApi.listRoles.mockResolvedValue([]);
     vi.clearAllMocks();
     mockApi.getCandidate.mockResolvedValue(mockCandidateDetail);
     mockApi.getMe.mockResolvedValue({ userId: 'u-admin', email: null, role: 'admin', active: true });

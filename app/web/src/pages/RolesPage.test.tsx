@@ -88,7 +88,7 @@ describe('RolesPage', () => {
     const btn = await screen.findByRole('button', { name: 'New role' });
     await userEvent.click(btn);
     expect(screen.getByText('New role')).toBeInTheDocument();
-    expect(screen.getByLabelText('Title')).toBeInTheDocument();
+    expect(screen.getByLabelText('Job role')).toBeInTheDocument();
     expect(screen.getByLabelText('Job description')).toBeInTheDocument();
     expect(screen.getByLabelText('Required skills')).toBeInTheDocument();
   });
@@ -100,10 +100,19 @@ describe('RolesPage', () => {
     const btn = await screen.findByRole('button', { name: 'New role' });
     await user.click(btn);
 
-    // Tab from the New role button to the form's Title field
+    // AGENT IS FIRST now — the operator's internal name for this screener
+    // sits above the job role, so it is the first field tab reaches.
     await user.tab();
-    const titleInput = screen.getByLabelText('Title');
+    expect(document.activeElement).toBe(screen.getByLabelText('Agent'));
+
+    // Then the job role (was "Title").
+    await user.tab();
+    const titleInput = screen.getByLabelText('Job role');
     expect(document.activeElement).toBe(titleInput);
+
+    // Ask Hello sits between them but is DISABLED with no job role to draft
+    // from, so it is not a tab stop — the form skips straight past it.
+    expect(screen.getByRole('button', { name: /Ask Hello/ })).toBeDisabled();
 
     // Tab to Job description
     await user.tab();
@@ -126,13 +135,13 @@ describe('RolesPage', () => {
     const btn = await screen.findByRole('button', { name: 'New role' });
     await user.click(btn);
 
-    await user.type(screen.getByLabelText('Title'), 'Engineer{Enter}');
+    await user.type(screen.getByLabelText('Job role'), 'Engineer{Enter}');
     expect(mockApi.createRole).toHaveBeenCalledWith(
       expect.objectContaining({ title: 'Engineer' }),
     );
   });
 
-  it('new role form validates required title', async () => {
+  it('new role form validates required job role', async () => {
     mockApi.listRoles.mockResolvedValue([]);
     mockApi.createRole.mockResolvedValue({ id: 'new-id' });
     render(<RolesPage />);
@@ -142,7 +151,7 @@ describe('RolesPage', () => {
     // Submit without title
     const submitBtn = screen.getByRole('button', { name: 'Create role' });
     await userEvent.click(submitBtn);
-    expect(screen.getByText('Title is required.')).toBeInTheDocument();
+    expect(screen.getByText('Job role is required.')).toBeInTheDocument();
   });
 
   it('has no axe violations in empty state', async () => {
