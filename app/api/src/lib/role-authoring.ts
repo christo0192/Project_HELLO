@@ -98,7 +98,7 @@ export interface RoleDraftResult {
 export class RoleDraftError extends Error {
   constructor(
     message: string,
-    readonly reason: 'unusable_output' | 'unspeakable_questions',
+    readonly reason: 'unusable_output' | 'unspeakable_questions' | 'cancelled',
     readonly detail?: readonly string[],
   ) {
     super(message);
@@ -140,6 +140,16 @@ export interface RoleDraftDeps {
    * must not fail the generation it is only describing.
    */
   onProgress?: (event: RoleDraftPhase) => void;
+  /**
+   * Checked BETWEEN attempts. Returning true stops the loop.
+   *
+   * This is what makes Cancel mean something: without it, cancelling only hid
+   * the UI while up to three v4-pro calls carried on billing. Checked between
+   * attempts rather than mid-call because the provider call is not
+   * interruptible — the most that can be saved is the attempts not yet begun,
+   * which is most of the cost.
+   */
+  shouldCancel?: () => Promise<boolean>;
 }
 
 /**
@@ -308,6 +318,9 @@ export async function generateRoleDraft(
   let rejectedCount = 0;
 
   for (let attempt = 1; attempt <= ROLE_DRAFT_MAX_ATTEMPTS; attempt += 1) {
+    if (deps.shouldCancel && (await deps.shouldCancel())) {
+      throw new RoleDraftError('Hello was cancelled.', 'cancelled');
+    }
     report(
       rejectedCount > 0
         ? {

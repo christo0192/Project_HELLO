@@ -232,6 +232,71 @@ describe('CandidateDetailPage', () => {
     expect(document.querySelector('[data-candidate-call-length]')).toBeNull();
   });
 
+  it('puts those badges UNDER THE CANDIDATE NAME, not in a card further down', async () => {
+    // The literal ask, and the reason the ask was made: the manager reads the
+    // name, then wants the role and whether a call happened. A badge that is
+    // correct but sits below the fold in the third card answers the question
+    // after it has stopped being asked. Asserting the DOM relationship,
+    // because "it renders somewhere" is what the previous placement satisfied.
+    mockApi.listRoles.mockResolvedValue([{ id: 'role-1', title: 'Sales Advisor' }]);
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: { ...mockCandidateDetail.candidate, role_id: 'role-1' },
+      sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 434, candidate_words: 450 }],
+    });
+    renderDetailPage();
+
+    // The role arrives on its own request, AFTER the name renders — waiting on
+    // the heading alone would assert against a half-filled header.
+    await screen.findByText('Sales Advisor');
+    const heading = screen.getByRole('heading', { level: 1, name: 'Jane Doe' });
+    const role = document.querySelector('[data-candidate-role-title]');
+    const length = document.querySelector('[data-candidate-call-length]');
+    expect(role).not.toBeNull();
+    expect(length).not.toBeNull();
+    // Same header block as the name...
+    expect(heading.parentElement?.contains(role!)).toBe(true);
+    // ...and AFTER it, not above.
+    expect(
+      heading.compareDocumentPosition(role!) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // ...and before the tab strip, so it is read without opening anything.
+    const tabs = screen.getByRole('tablist');
+    expect(
+      role!.compareDocumentPosition(tabs) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it('says NOTHING about words when the transcript was never read', async () => {
+    // null is not 0. "0 words spoken" is an accusation about the candidate;
+    // a missing transcript is a fact about us. The route returns null for the
+    // second case precisely so this badge can stay away.
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 434, candidate_words: null }],
+    });
+    renderDetailPage();
+    await screen.findByText(/Profile/);
+    // The call still happened, so its length is still shown...
+    expect(document.querySelector('[data-candidate-call-length]')).not.toBeNull();
+    // ...but nothing is claimed about what they said.
+    expect(document.querySelector('[data-candidate-words]')).toBeNull();
+  });
+
+  it('shows a REAL zero — a candidate who said nothing on a real call', async () => {
+    // The counterpart of the test above, and the reason null had to exist:
+    // without the distinction this case would be unreportable.
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 434, candidate_words: 0 }],
+    });
+    renderDetailPage();
+    await screen.findByText(/Profile/);
+    const words = document.querySelector('[data-candidate-words]');
+    expect(words?.textContent).toContain('0');
+    expect(words?.textContent).toContain('words spoken');
+  });
+
   it('does NOT claim a role it could not resolve', async () => {
     // A wrong role on a candidate page is worse than no role.
     mockApi.listRoles.mockResolvedValue([]);

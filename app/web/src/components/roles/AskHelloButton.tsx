@@ -1,47 +1,47 @@
 /**
  * "Ask Hello" — draft a role's JD, skills and questions from its job title.
  *
- * THE BUTTON IS THE PROGRESS BAR. v4-pro takes 133-206s per call and the
- * server retries up to three times, so this can legitimately run for the
- * better part of ten minutes. A plain spinner over that duration is
- * indistinguishable from a hang, so the label is driven by the server's own
- * NDJSON phase stream — "Rephrasing 2 questions… (2 of 3)" is a fact the
- * server sent, not a timer pretending to know something.
+ * A JOB, NOT A TEN-MINUTE REQUEST. Drafting runs v4-pro up to three times at
+ * 133-206s a call. Tied to one socket that meant nothing survived a refresh, a
+ * proxy idle timeout killed it mid-draft, and Cancel stopped the spinner while
+ * the model kept billing. This starts a job, polls it, and can pick up a job
+ * that is already running after a reload.
  *
- * An elapsed counter runs alongside it, because even a truthful phase label
- * looks stuck if it sits unchanged for three minutes. The two together say
- * "still working, here is what on, here is how long" without inventing
- * progress that does not exist.
+ * THE BUTTON IS THE PROGRESS BAR. Over ten minutes a plain spinner is
+ * indistinguishable from a hang, so the label reports the SERVER's phase —
+ * "Rephrasing 2 questions… (2 of 3)" is a fact the server sent.
  *
- * Cancel aborts the fetch. Without it the only way out of a ten-minute draft
- * is to leave the page, and the stream would go on writing into a component
- * that is no longer mounted.
- *
- * The animation is decorative and stops entirely under
- * `prefers-reduced-motion` — a looping gradient behind a control someone is
- * waiting on is exactly the kind of motion that rule exists for.
+ * THE ELAPSED COUNTER IS OUTSIDE THE LIVE REGION, deliberately. `role="status"`
+ * is implicitly `aria-atomic`, so a counter inside it re-announces the whole
+ * sentence every second — roughly 600 times over a long draft, with the polite
+ * queue never draining and nothing else on the page audible. Screen readers
+ * get the phase; the seconds are visual reassurance only.
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { draftRole } from '../../api';
-import type { RoleDraftOutcome, RoleDraftProgress } from '../../types';
+import { api } from '../../api';
+import type { RoleDraft, RoleDraftJob, RoleDraftProgress } from '../../types';
 
 export interface AskHelloButtonProps {
   /** The job role to draft from. Empty disables the button. */
   jobRole: string;
-  /** Applied to the form. Called only on a complete, gate-passing draft. */
-  onDrafted: (outcome: RoleDraftOutcome) => void;
-  /** Surface a failure in the form's own error area. */
+  /** Applied to the form. Called once, with a complete gate-passing draft. */
+  onDrafted: (draft: RoleDraft, repaired: string[], jobRole: string) => void;
+  /** Surface a failure where the operator is looking. */
   onError: (message: string) => void;
-  /** True when the form already holds content a draft would overwrite. */
-  wouldOverwrite: boolean;
+  /** True when the form holds content a draft would overwrite. */
+  wouldOverwrite: () => boolean;
   className?: string;
 }
+
+/** How often to ask. Short enough to feel live, long enough not to hammer. */
+const POLL_MS = 2_000;
 
 function phaseLabel(p: RoleDraftProgress | null): string {
   if (!p) return 'Starting…';
   const of = `${p.attempt} of ${p.maxAttempts}`;
   if (p.phase === 'drafting') return `Writing the role… (${of})`;
   if (p.phase === 'checking') return `Checking the questions are speakable… (${of})`;
+  if (p.phase === 'rereading') return `Hello's answer was unreadable — asking again… (${of})`;
   return `Rephrasing ${p.rejected} question${p.rejected === 1 ? '' : 's'} the screener won't read aloud… (${of})`;
 }
 
@@ -57,14 +57,16 @@ export function AskHelloButton({
   wouldOverwrite,
   className,
 }: AskHelloButtonProps) {
-  const [running, setRunning] = useState(false);
-  const [progress, setProgress] = useState<RoleDraftProgress | null>(null);
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [phase, setPhase] = useState<RoleDraftProgress | null>(null);
   const [elapsed, setElapsed] = useState(0);
-  const abortRef = useRef<AbortController | null>(null);
+  const [starting, setStarting] = useState(false);
+  const running = starting || jobId !== null;
 
-  // Abort in flight work on unmount: the stream would otherwise keep reading
-  // and call `onDrafted` on a component that no longer exists.
-  useEffect(() => () => abortRef.current?.abort(), []);
+  // Latest callbacks, so the poll effect does not restart whenever the parent
+  // re-renders with new closures — which would reset the interval every keystroke.
+  const cbs = useRef({ onDrafted, onError });
+  cbs.current = { onDrafted, onError };
 
   useEffect(() => {
     if (!running) return;
@@ -74,11 +76,53 @@ export function AskHelloButton({
     return () => clearInterval(id);
   }, [running]);
 
-  const run = useCallback(async () => {
+  // THE POLL. Tears itself down on unmount, so a job that finishes after the
+  // form has gone cannot write into a component that is no longer there.
+  useEffect(() => {
+    if (!jobId) return;
+    let live = true;
+
+    const settle = (job: RoleDraftJob) => {
+      if (!live) return;
+      setJobId(null);
+      setPhase(null);
+      if (job.status === 'succeeded' && job.draft) {
+        // The job's OWN job_role is handed back, not the form's current value:
+        // the field can be edited while a draft runs, and applying a draft for
+        // "Sales Advisr" under a heading that now reads "Senior Sales Advisor"
+        // is a silent lie.
+        cbs.current.onDrafted(job.draft, job.repaired, job.job_role);
+      } else if (job.status === 'failed') {
+        cbs.current.onError(job.error_message ?? 'Hello could not draft this role.');
+      }
+      // `cancelled` is the operator's own doing — nothing to report.
+    };
+
+    const tick = async () => {
+      try {
+        const job = await api.getRoleDraft(jobId);
+        if (!live) return;
+        if (job.status === 'running') setPhase(job.phase);
+        else settle(job);
+      } catch {
+        // A single failed poll is a blip, not a failure: the job is still
+        // running server-side and the next tick will find it.
+      }
+    };
+
+    void tick();
+    const id = setInterval(tick, POLL_MS);
+    return () => {
+      live = false;
+      clearInterval(id);
+    };
+  }, [jobId]);
+
+  const start = useCallback(async () => {
     const role = jobRole.trim();
     if (!role || running) return;
     if (
-      wouldOverwrite &&
+      wouldOverwrite() &&
       typeof window !== 'undefined' &&
       !window.confirm(
         'This will replace the job description, skills and questions already in this form. Continue?',
@@ -86,41 +130,44 @@ export function AskHelloButton({
     ) {
       return;
     }
-
-    const controller = new AbortController();
-    abortRef.current = controller;
-    setRunning(true);
-    setProgress(null);
+    setStarting(true);
+    setPhase(null);
     try {
-      const outcome = await draftRole(role, {
-        signal: controller.signal,
-        onProgress: setProgress,
-      });
-      onDrafted(outcome);
+      const job = await api.startRoleDraft(role);
+      setJobId(job.id);
     } catch (err) {
-      // An abort is the user's own doing, not a failure to report.
-      if (!(err instanceof DOMException && err.name === 'AbortError')) {
-        onError(err instanceof Error ? err.message : 'Hello could not draft this role.');
-      }
+      cbs.current.onError(err instanceof Error ? err.message : 'Hello could not be started.');
     } finally {
-      abortRef.current = null;
-      setRunning(false);
-      setProgress(null);
+      setStarting(false);
     }
-  }, [jobRole, running, wouldOverwrite, onDrafted, onError]);
+  }, [jobRole, running, wouldOverwrite]);
 
-  const disabled = !jobRole.trim() || running;
+  const cancel = useCallback(async () => {
+    const id = jobId;
+    setJobId(null);
+    setPhase(null);
+    // Best effort, and deliberately after clearing local state: the operator
+    // should not wait on the network to stop watching.
+    if (id) await api.cancelRoleDraft(id).catch(() => undefined);
+  }, [jobId]);
+
+  const idle = !jobRole.trim();
 
   return (
     <div className={className}>
       <div className="flex flex-wrap items-center gap-2">
         <button
           type="button"
-          onClick={run}
-          disabled={disabled}
+          onClick={start}
+          // `aria-disabled`, not `disabled`: a disabled button loses focus the
+          // instant it is pressed by keyboard, dropping the user to <body> at
+          // exactly the moment Cancel appears. The handler guards instead.
+          aria-disabled={idle || running}
           aria-busy={running}
           data-ask-hello=""
-          className="ask-hello relative inline-flex min-h-11 items-center gap-2 overflow-hidden rounded-full px-5 text-[13px] font-semibold text-white transition-opacity duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-[var(--c-accent)] disabled:cursor-not-allowed disabled:opacity-60"
+          className={`ask-hello relative inline-flex min-h-11 items-center gap-2 overflow-hidden rounded-full px-5 text-sm font-semibold text-white transition-opacity duration-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-[var(--c-accent)] ${
+            idle || running ? 'cursor-not-allowed opacity-60' : ''
+          }`}
         >
           <span aria-hidden="true" className="ask-hello__sheen" />
           <span aria-hidden="true" className="relative">
@@ -132,31 +179,37 @@ export function AskHelloButton({
         {running && (
           <button
             type="button"
-            onClick={() => abortRef.current?.abort()}
+            onClick={cancel}
             className="inline-flex min-h-11 items-center rounded-full px-3 text-[13px] font-medium text-[var(--c-ink-secondary)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
           >
             Cancel
           </button>
         )}
+
+        {/* OUTSIDE the live region — see the file header. A per-second counter
+            inside an implicitly-atomic `status` re-announces the whole
+            sentence every second for the length of the draft. */}
+        {running && (
+          <span
+            aria-hidden="true"
+            data-ask-hello-elapsed=""
+            className="text-xs tabular-nums text-[var(--c-ink-secondary)]"
+          >
+            {elapsedLabel(elapsed)} elapsed
+          </span>
+        )}
       </div>
 
       {/* A PERMANENT live region, not one mounted when it has something to
           say: a region created at the same moment its content appears is not
-          reliably announced. */}
+          reliably announced, so the first phase would be silent. */}
       <p
         role="status"
         aria-live="polite"
         data-ask-hello-status=""
         className="mt-2 min-h-5 text-xs leading-5 text-[var(--c-ink-secondary)]"
       >
-        {running ? (
-          <>
-            {phaseLabel(progress)}{' '}
-            <span className="tabular-nums">· {elapsedLabel(elapsed)} elapsed</span>
-          </>
-        ) : (
-          ''
-        )}
+        {running ? phaseLabel(phase) : ''}
       </p>
     </div>
   );

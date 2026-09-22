@@ -3,30 +3,56 @@
  *
  * The reason this component exists in the shape it does: a draft runs v4-pro
  * up to three times at 133-206s a call, so it can legitimately be working for
- * the better part of ten minutes. The tests below are mostly about that — that
- * the label tracks the SERVER's phase rather than a timer, that a user can get
- * out, and that a draft the server refused never reaches the form.
+ * the better part of ten minutes. It therefore starts a JOB and polls it,
+ * rather than holding a request open. The tests below are mostly about that
+ * wait — that the label tracks the SERVER's phase rather than a timer, that a
+ * user can get out, that a refused draft never reaches the form, and that a
+ * job which lands after the form has gone cannot write into a dead component.
  */
 import { render, screen, waitFor, act } from '@testing-library/react';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
-const mockApi = { draftRole: vi.fn() };
+const mockApi = {
+  startRoleDraft: vi.fn(),
+  getRoleDraft: vi.fn(),
+  cancelRoleDraft: vi.fn(),
+};
 vi.mock('../../../api', () => ({
-  draftRole: (...args: unknown[]) => mockApi.draftRole(...args),
+  api: {
+    startRoleDraft: (...a: unknown[]) => mockApi.startRoleDraft(...a),
+    getRoleDraft: (...a: unknown[]) => mockApi.getRoleDraft(...a),
+    cancelRoleDraft: (...a: unknown[]) => mockApi.cancelRoleDraft(...a),
+  },
   ApiError: class extends Error {},
 }));
 
 import { AskHelloButton } from '../AskHelloButton';
 
-const OUTCOME = {
-  draft: {
-    jd: 'A job description.',
-    required_skills: ['Sales'],
-    screening_template: [{ id: 'q1', question: 'What do you do?', weight: 1 }],
-  },
-  attempts: 1,
-  repaired: [],
+const DRAFT = {
+  jd: 'A job description.',
+  required_skills: ['Sales'],
+  screening_template: [{ id: 'q1', question: 'What do you do?', weight: 1 }],
 };
+
+/** A running job, optionally at a named phase. */
+function running(phase: unknown = null) {
+  return {
+    id: 'job-1',
+    job_role: 'Sales Advisor',
+    status: 'running',
+    phase,
+    draft: null,
+    attempts: 1,
+    repaired: [],
+    error_reason: null,
+    error_message: null,
+    max_attempts: 3,
+  };
+}
+
+function succeeded(over: Record<string, unknown> = {}) {
+  return { ...running(), status: 'succeeded', draft: DRAFT, ...over };
+}
 
 function setup(props: Partial<React.ComponentProps<typeof AskHelloButton>> = {}) {
   const onDrafted = vi.fn();
@@ -36,47 +62,78 @@ function setup(props: Partial<React.ComponentProps<typeof AskHelloButton>> = {})
       jobRole="Sales Advisor"
       onDrafted={onDrafted}
       onError={onError}
-      wouldOverwrite={false}
+      wouldOverwrite={() => false}
       {...props}
     />,
   );
   return { onDrafted, onError, ...view };
 }
 
+// The SAME button in both states. Its label changes to "Asking Hello…" while a
+// job runs, so a /Ask Hello/ matcher would stop finding it at exactly the
+// moment the tests care most about what it is doing.
+const askHello = () => screen.getByRole('button', { name: /Ask(ing)? Hello/ });
+
+/** One poll interval, flushing whatever the tick awaited. */
+async function poll() {
+  await act(async () => {
+    await vi.advanceTimersByTimeAsync(2_000);
+  });
+}
+
 describe('AskHelloButton', () => {
   beforeEach(() => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.clearAllMocks();
-    mockApi.draftRole.mockResolvedValue(OUTCOME);
+    mockApi.startRoleDraft.mockResolvedValue(running());
+    mockApi.getRoleDraft.mockResolvedValue(succeeded());
+    mockApi.cancelRoleDraft.mockResolvedValue({ cancelled: true });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
   });
 
-  it('is DISABLED without a job role — there is nothing to draft from', () => {
+  it('cannot be started without a job role — there is nothing to draft from', async () => {
     setup({ jobRole: '   ' });
-    expect(screen.getByRole('button', { name: /Ask Hello/ })).toBeDisabled();
+    // `aria-disabled`, NOT `disabled`: a disabled button loses keyboard focus
+    // the instant it is pressed, dropping the user to <body> exactly when
+    // Cancel appears. The handler is what refuses.
+    expect(askHello()).toHaveAttribute('aria-disabled', 'true');
+    await act(async () => askHello().click());
+    expect(mockApi.startRoleDraft).not.toHaveBeenCalled();
   });
 
-  it('hands the drafted role to the form', async () => {
+  it('hands the drafted role, the repairs AND THE JOB’S OWN job role to the form', async () => {
+    // The third argument is the point: the field stays editable for the ten
+    // minutes a draft runs, so the form cannot assume what it currently holds
+    // is what was drafted.
+    mockApi.getRoleDraft.mockResolvedValue(
+      succeeded({ job_role: 'Sales Advisr', repaired: ['q2'] }),
+    );
     const { onDrafted } = setup();
-    screen.getByRole('button', { name: /Ask Hello/ }).click();
-    await waitFor(() => expect(onDrafted).toHaveBeenCalledWith(OUTCOME));
+    await act(async () => askHello().click());
+    await waitFor(() =>
+      expect(onDrafted).toHaveBeenCalledWith(DRAFT, ['q2'], 'Sales Advisr'),
+    );
   });
 
   it('REPORTS THE SERVER’S PHASE, not a spinner', async () => {
-    // The whole reason the endpoint streams. A generic "Loading…" over ten
+    // The whole reason the job persists a phase. A generic "Loading…" over ten
     // minutes is indistinguishable from a hang.
-    let emit: (p: unknown) => void = () => {};
-    mockApi.draftRole.mockImplementation((_role: string, opts: { onProgress: (p: unknown) => void }) => {
-      emit = opts.onProgress;
-      return new Promise(() => {}); // never settles: we are testing the wait
-    });
+    mockApi.getRoleDraft.mockResolvedValue(
+      running({ phase: 'drafting', attempt: 1, maxAttempts: 3 }),
+    );
     setup();
-    screen.getByRole('button', { name: /Ask Hello/ }).click();
+    await act(async () => askHello().click());
 
     const status = await screen.findByRole('status');
-    act(() => emit({ phase: 'drafting', attempt: 1, maxAttempts: 3 }));
-    expect(status.textContent).toContain('Writing the role');
+    await waitFor(() => expect(status.textContent).toContain('Writing the role'));
     expect(status.textContent).toContain('1 of 3');
 
-    act(() => emit({ phase: 'repairing', attempt: 2, maxAttempts: 3, rejected: 2 }));
+    mockApi.getRoleDraft.mockResolvedValue(
+      running({ phase: 'repairing', attempt: 2, maxAttempts: 3, rejected: 2 }),
+    );
+    await poll();
     // Names WHAT is wrong and HOW MANY — "attempt 2" alone would not explain
     // why a draft is taking a second pass.
     expect(status.textContent).toContain('Rephrasing 2 questions');
@@ -84,76 +141,146 @@ describe('AskHelloButton', () => {
   });
 
   it('singularises one rejected question', async () => {
-    let emit: (p: unknown) => void = () => {};
-    mockApi.draftRole.mockImplementation((_r: string, o: { onProgress: (p: unknown) => void }) => {
-      emit = o.onProgress;
-      return new Promise(() => {});
-    });
+    mockApi.getRoleDraft.mockResolvedValue(
+      running({ phase: 'repairing', attempt: 2, maxAttempts: 3, rejected: 1 }),
+    );
     setup();
-    screen.getByRole('button', { name: /Ask Hello/ }).click();
+    await act(async () => askHello().click());
     const status = await screen.findByRole('status');
-    act(() => emit({ phase: 'repairing', attempt: 2, maxAttempts: 3, rejected: 1 }));
-    expect(status.textContent).toContain('Rephrasing 1 question the');
+    await waitFor(() => expect(status.textContent).toContain('Rephrasing 1 question the'));
   });
 
-  it('offers a CANCEL and aborts the request with it', async () => {
-    // Without this the only way out of a ten-minute draft is to leave the page.
-    let signal: AbortSignal | undefined;
-    mockApi.draftRole.mockImplementation((_r: string, o: { signal: AbortSignal }) => {
-      signal = o.signal;
-      return new Promise(() => {});
-    });
+  it('names the UNREADABLE-ANSWER retry as its own phase', async () => {
+    // A reread is not a repair: nothing was rejected, the model's reply could
+    // not be parsed at all. Reporting it as "rephrasing 0 questions" would be
+    // a lie about what is happening.
+    mockApi.getRoleDraft.mockResolvedValue(
+      running({ phase: 'rereading', attempt: 2, maxAttempts: 3 }),
+    );
     setup();
-    screen.getByRole('button', { name: /Ask Hello/ }).click();
+    await act(async () => askHello().click());
+    const status = await screen.findByRole('status');
+    await waitFor(() => expect(status.textContent).toContain('unreadable'));
+    expect(status.textContent).toContain('2 of 3');
+  });
+
+  it('keeps the elapsed counter OUT of the live region', async () => {
+    // `role="status"` is implicitly atomic, so a per-second counter inside it
+    // re-announces the whole sentence ~600 times over a long draft, with the
+    // polite queue never draining and nothing else on the page audible.
+    mockApi.getRoleDraft.mockResolvedValue(running());
+    setup();
+    await act(async () => askHello().click());
+    const status = await screen.findByRole('status');
+    const elapsed = document.querySelector('[data-ask-hello-elapsed]');
+    expect(elapsed).not.toBeNull();
+    expect(elapsed).toHaveAttribute('aria-hidden', 'true');
+    expect(status.contains(elapsed)).toBe(false);
+  });
+
+  it('offers a CANCEL, and it STOPS THE JOB rather than just the spinner', async () => {
+    // Aborting a fetch would leave v4-pro running and billing for ten minutes.
+    mockApi.getRoleDraft.mockResolvedValue(running());
+    setup();
+    await act(async () => askHello().click());
 
     const cancel = await screen.findByRole('button', { name: 'Cancel' });
-    cancel.click();
-    await waitFor(() => expect(signal?.aborted).toBe(true));
+    await act(async () => cancel.click());
+    await waitFor(() => expect(mockApi.cancelRoleDraft).toHaveBeenCalledWith('job-1'));
   });
 
-  it('does NOT report an abort as a failure', async () => {
+  it('does NOT report a cancellation as a failure', async () => {
     // The user's own doing is not an error to show them.
-    const abort = new DOMException('aborted', 'AbortError');
-    mockApi.draftRole.mockRejectedValue(abort);
+    mockApi.getRoleDraft.mockResolvedValue({ ...running(), status: 'cancelled' });
     const { onError, onDrafted } = setup();
-    screen.getByRole('button', { name: /Ask Hello/ }).click();
+    await act(async () => askHello().click());
     await waitFor(() =>
-      expect(screen.getByRole('button', { name: /Ask Hello/ })).not.toBeDisabled(),
+      expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument(),
     );
     expect(onError).not.toHaveBeenCalled();
     expect(onDrafted).not.toHaveBeenCalled();
   });
 
-  it('surfaces a real failure and applies NOTHING', async () => {
-    mockApi.draftRole.mockRejectedValue(new Error('could not phrase them'));
+  it('surfaces a failed job and applies NOTHING', async () => {
+    mockApi.getRoleDraft.mockResolvedValue({
+      ...running(),
+      status: 'failed',
+      error_message: 'could not phrase them',
+    });
     const { onError, onDrafted } = setup();
-    screen.getByRole('button', { name: /Ask Hello/ }).click();
+    await act(async () => askHello().click());
     await waitFor(() => expect(onError).toHaveBeenCalledWith('could not phrase them'));
     // A refused draft must never half-fill the form.
     expect(onDrafted).not.toHaveBeenCalled();
   });
 
+  it('SURVIVES A FAILED POLL — one blip is not a failed draft', async () => {
+    // The job is running server-side regardless of whether one GET landed.
+    // Treating a dropped poll as a failure would throw away a nine-minute run.
+    mockApi.getRoleDraft.mockRejectedValueOnce(new Error('network'));
+    mockApi.getRoleDraft.mockResolvedValue(succeeded());
+    const { onError, onDrafted } = setup();
+    await act(async () => askHello().click());
+    await poll();
+    await waitFor(() => expect(onDrafted).toHaveBeenCalled());
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it('STOPS POLLING once unmounted', async () => {
+    // A ten-minute job outlives the form. Without the teardown this keeps
+    // requesting forever and then writes into a component that is gone.
+    mockApi.getRoleDraft.mockResolvedValue(running());
+    const { unmount } = setup();
+    await act(async () => askHello().click());
+    await waitFor(() => expect(mockApi.getRoleDraft).toHaveBeenCalled());
+    unmount();
+    const after = mockApi.getRoleDraft.mock.calls.length;
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(mockApi.getRoleDraft.mock.calls.length).toBe(after);
+  });
+
   it('ASKS BEFORE OVERWRITING work already in the form', async () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(false);
-    const { onDrafted } = setup({ wouldOverwrite: true });
-    screen.getByRole('button', { name: /Ask Hello/ }).click();
+    const { onDrafted } = setup({ wouldOverwrite: () => true });
+    await act(async () => askHello().click());
 
     expect(confirm).toHaveBeenCalled();
-    await waitFor(() => expect(mockApi.draftRole).not.toHaveBeenCalled());
+    expect(mockApi.startRoleDraft).not.toHaveBeenCalled();
     expect(onDrafted).not.toHaveBeenCalled();
     confirm.mockRestore();
   });
 
   it('does not ask when there is nothing to lose', async () => {
     const confirm = vi.spyOn(window, 'confirm').mockReturnValue(true);
-    setup({ wouldOverwrite: false });
-    screen.getByRole('button', { name: /Ask Hello/ }).click();
-    await waitFor(() => expect(mockApi.draftRole).toHaveBeenCalled());
+    setup({ wouldOverwrite: () => false });
+    await act(async () => askHello().click());
+    await waitFor(() => expect(mockApi.startRoleDraft).toHaveBeenCalled());
     expect(confirm).not.toHaveBeenCalled();
     confirm.mockRestore();
   });
 
-  it('keeps the live region MOUNTED while idle', async () => {
+  it('does not start a SECOND job while one is running', async () => {
+    // Each start burns up to three v4-pro calls; a double click would double it.
+    mockApi.getRoleDraft.mockResolvedValue(running());
+    setup();
+    await act(async () => askHello().click());
+    await waitFor(() => expect(askHello()).toHaveAttribute('aria-disabled', 'true'));
+    await act(async () => askHello().click());
+    expect(mockApi.startRoleDraft).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports a start that never got off the ground', async () => {
+    mockApi.startRoleDraft.mockRejectedValue(new Error('Hello is not configured.'));
+    const { onError } = setup();
+    await act(async () => askHello().click());
+    await waitFor(() => expect(onError).toHaveBeenCalledWith('Hello is not configured.'));
+    // And the button comes back, rather than staying stuck at "Asking Hello…".
+    expect(askHello()).not.toHaveAttribute('aria-disabled', 'true');
+  });
+
+  it('keeps the live region MOUNTED while idle', () => {
     // A region created at the same moment its content appears is not reliably
     // announced — the first phase change would be silent.
     setup();

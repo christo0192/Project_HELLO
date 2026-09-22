@@ -5,10 +5,10 @@ import { createRoleSchema, updateRoleSchema, roleIdParamSchema } from '../schema
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
 import {
-  generateRoleDraft,
-  RoleDraftError,
-  ROLE_DRAFT_MAX_ATTEMPTS,
-} from '../lib/role-authoring.js';
+  cancelRoleDraft,
+  readRoleDraft,
+  startRoleDraft,
+} from '../lib/role-draft-jobs.js';
 import { roleDraftSchema } from '../schemas/roles.js';
 
 export const rolesRouter = Router();
@@ -50,75 +50,74 @@ rolesRouter.get('/:id', requireRole('viewer'), validateParams(roleIdParamSchema)
 });
 
 /**
- * Ask Hello — draft a role from a job title. STREAMS NDJSON.
+ * Ask Hello — START a drafting job. Answers immediately with its id.
  *
- * One JSON object per line: `{type:"progress",...}` as each phase begins, then
- * exactly one terminal `{type:"draft"}` or `{type:"error"}`.
+ * NOT a streamed ten-minute response. Drafting runs v4-pro up to three times
+ * at 133-206s a call, and tying that to one socket meant nothing survived a
+ * refresh, the stream sat silent for a whole model call between phases (so any
+ * proxy idle timeout reaped it mid-draft), and Cancel stopped the writes while
+ * the generation carried on billing. The work now outlives the request.
  *
- * WHY A STREAM AND NOT A PLAIN 200. v4-pro takes 133-206s per call and this
- * retries up to three times, so a single response can be silent for the better
- * part of ten minutes — indistinguishable from a hang. NDJSON over `fetch`
- * rather than SSE because `EventSource` cannot carry this API's Authorization
- * header, and inventing a second auth path for a progress bar would be a
- * security change disguised as a UX one.
- *
- * NOTHING IS WRITTEN. This endpoint returns a draft for the form to show; the
- * operator still presses Save, which re-validates everything through the same
- * schema. A generator that wrote directly would be a model authoring a live
- * screening script with no human in between.
+ * WRITES NO ROLE. The draft goes to the operator, who reviews it and presses
+ * Save — which re-validates everything through the same schema. A generator
+ * that wrote directly would be a model authoring a live screening script with
+ * no human in between.
  */
 rolesRouter.post(
   '/draft',
   requireRole('interviewer'),
   validateBody(roleDraftSchema),
-  async (req, res) => {
+  async (req, res, next) => {
     const { job_role: jobRole } = req.body as { job_role: string };
-
-    res.status(200);
-    res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
-    res.setHeader('Cache-Control', 'no-cache, no-transform');
-    // Fly's proxy and nginx both buffer by default, which would hold every
-    // progress line until the response ended — defeating the point.
-    res.setHeader('X-Accel-Buffering', 'no');
-    res.flushHeaders?.();
-
-    let clientGone = false;
-    res.on('close', () => {
-      clientGone = true;
-    });
-
-    const write = (payload: unknown) => {
-      if (clientGone) return;
-      res.write(`${JSON.stringify(payload)}\n`);
-    };
-
     try {
-      const { draft, attempts, repaired } = await generateRoleDraft(jobRole, {
-        onProgress: (event) => write({ type: 'progress', ...event }),
-      });
-      write({ type: 'draft', draft, attempts, repaired });
-    } catch (err) {
-      // A stream that has already sent 200 cannot change its status, so the
-      // failure is carried IN the stream and the client must read it there.
-      if (err instanceof RoleDraftError) {
-        write({
-          type: 'error',
-          reason: err.reason,
-          message: err.message,
-          detail: err.detail ?? [],
-          maxAttempts: ROLE_DRAFT_MAX_ATTEMPTS,
+      const job = await startRoleDraft(req.authUser!.id, jobRole);
+      // AUDITED, but not fail-closed. This writes no role, so a dead audit
+      // sink must not block it the way it blocks a mutation — but a
+      // privileged, model-invoking action whose output is one Save away from
+      // being spoken to a candidate needs a record of who asked for what.
+      try {
+        await recordAudit(req, 'resource.generate', 202, {
+          metadata: { draft_id: job.id, job_role: jobRole },
         });
-      } else {
-        write({
-          type: 'error',
-          reason: 'provider_unavailable',
-          message: 'Hello could not be reached. Try again in a moment.',
-          detail: [],
-          maxAttempts: ROLE_DRAFT_MAX_ATTEMPTS,
-        });
+      } catch {
+        /* the draft is not a mutation; an audit sink failure must not lose it */
       }
-    } finally {
-      if (!clientGone) res.end();
+      res.status(202).json(job);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+/** Poll a drafting job. A dead one reads as failed, never as still running. */
+rolesRouter.get(
+  '/draft/:id',
+  requireRole('interviewer'),
+  validateParams(roleIdParamSchema),
+  async (req, res, next) => {
+    try {
+      const job = await readRoleDraft(req.authUser!.id, req.params.id);
+      if (!job) return res.status(404).json({ error: 'Draft not found' });
+      res.json(job);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+/** Stop a running job. The generator reads this between attempts. */
+rolesRouter.post(
+  '/draft/:id/cancel',
+  requireRole('interviewer'),
+  validateParams(roleIdParamSchema),
+  async (req, res, next) => {
+    try {
+      const cancelled = await cancelRoleDraft(req.authUser!.id, req.params.id);
+      // Idempotent: cancelling a job that already finished is not an error,
+      // it is a race the operator cannot be blamed for.
+      res.json({ cancelled });
+    } catch (err) {
+      next(err);
     }
   },
 );

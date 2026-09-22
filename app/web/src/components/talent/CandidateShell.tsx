@@ -75,6 +75,15 @@ export interface CandidateHeaderProps {
   eyebrow?: string;
   title: string;
   description?: string;
+  /**
+   * Rendered directly UNDER the name, before the tabs.
+   *
+   * The facts a manager wants before anything else — which role, how long the
+   * call was — belong next to who the person is, not in a card further down
+   * the page. Kept a slot rather than typed props so the header stays a
+   * layout component.
+   */
+  meta?: ReactNode;
   actions?: ReactNode;
   /** Rule under the header — used by the standalone scoped shell. */
   divided?: boolean;
@@ -89,6 +98,7 @@ export function CandidateHeader({
   eyebrow,
   title,
   description,
+  meta,
   actions,
   divided = false,
 }: CandidateHeaderProps) {
@@ -113,6 +123,7 @@ export function CandidateHeader({
             {description}
           </p>
         )}
+        {meta && <div className="mt-2.5">{meta}</div>}
       </div>
       {actions && (
         <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div>

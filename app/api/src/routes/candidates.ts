@@ -982,16 +982,58 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
    * payload and fetching them per session would be one round trip per call.
    */
   const sessionIds = (sessions ?? []).map((s) => (s as { id: string }).id);
+  /** Candidate words per session. */
   const wordsBySession = new Map<string, number>();
+  /**
+   * Sessions that have ANY transcript row, whoever spoke.
+   *
+   * This is what separates "the candidate said nothing" from "we hold no
+   * transcript for this call". Both produce zero candidate turns, and only the
+   * first is a fact about the candidate — so a count is reported only for a
+   * session that demonstrably has a transcript.
+   */
+  const transcribedSessions = new Set<string>();
+  /**
+   * Cleared if the turn read fails. A partial count is WORSE than no count: it
+   * renders as a confident low number against a real candidate, and nothing on
+   * screen would say it came from a failed read.
+   */
+  let wordCountsUsable = true;
+
   if (sessionIds.length > 0) {
-    const { data: turns } = await supabase
-      .from('transcript_turns')
-      .select('session_id, text')
-      .in('session_id', sessionIds)
-      .eq('speaker', 'candidate');
-    for (const turn of (turns ?? []) as Array<{ session_id: string; text: string | null }>) {
-      const words = (turn.text ?? '').trim().split(/\s+/).filter(Boolean).length;
-      wordsBySession.set(turn.session_id, (wordsBySession.get(turn.session_id) ?? 0) + words);
+    // PAGINATED. PostgREST caps a response at `max-rows` (1000 by default) and
+    // signals it in no way the client can see — it simply returns fewer rows.
+    // A single seven-minute screen runs to dozens of turns and this query
+    // spans every session a candidate has, so the cap is reachable in ordinary
+    // use, and hitting it would undercount the most talkative candidates first.
+    const PAGE = 1000;
+    for (let from = 0; ; from += PAGE) {
+      const { data: turns, error } = await supabase
+        .from('transcript_turns')
+        .select('session_id, speaker, text')
+        .in('session_id', sessionIds)
+        // Ordered on the (session_id, turn_index) index this table already
+        // carries: pagination needs a TOTAL order to not skip or repeat rows,
+        // and the uuid primary key would give one only by sorting every match.
+        .order('session_id', { ascending: true })
+        .order('turn_index', { ascending: true })
+        .range(from, from + PAGE - 1);
+      if (error) {
+        wordCountsUsable = false;
+        break;
+      }
+      const rows = (turns ?? []) as Array<{
+        session_id: string;
+        speaker: string | null;
+        text: string | null;
+      }>;
+      for (const turn of rows) {
+        transcribedSessions.add(turn.session_id);
+        if (turn.speaker !== 'candidate') continue;
+        const words = (turn.text ?? '').trim().split(/\s+/).filter(Boolean).length;
+        wordsBySession.set(turn.session_id, (wordsBySession.get(turn.session_id) ?? 0) + words);
+      }
+      if (rows.length < PAGE) break;
     }
   }
 
@@ -1008,12 +1050,13 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
     candidate: redactCandidatePhone(candidate as Record<string, unknown>, req.authUser?.appRole),
     sessions: (sessions ?? []).map((session) => {
       const row = session as Record<string, unknown>;
-      return {
-        ...row,
-        // 0 is a REAL answer here — a candidate who said nothing. Absent only
-        // when the session has no transcript rows at all.
-        candidate_words: wordsBySession.get(row.id as string) ?? 0,
-      };
+      const id = row.id as string;
+      // NULL, not 0, when the number cannot be stood behind. 0 is a claim
+      // about the candidate — "they said nothing" — and is made only for a
+      // session that has a transcript, read in full.
+      const words =
+        wordCountsUsable && transcribedSessions.has(id) ? (wordsBySession.get(id) ?? 0) : null;
+      return { ...row, candidate_words: words };
     }),
     assessments: assessments ?? [],
   });

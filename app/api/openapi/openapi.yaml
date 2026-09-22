@@ -117,9 +117,9 @@ paths:
   /api/roles/draft:
     post:
       tags: [roles]
-      operationId: draftRole
-      summary: Draft a role's JD, skills and questions from its job title (interviewer+)
-      description: Streams NDJSON - one progress object per line, then a terminal draft or error. A stream because the model takes 133-206s per call and the server retries up to three times. WRITES NOTHING; every generated question is checked against the same phone-speakability gate the save path uses, and the endpoint fails rather than return a draft it could not make speakable.
+      operationId: startRoleDraft
+      summary: Start a job that drafts a role's JD, skills and questions from its job title (interviewer+)
+      description: Returns 202 as soon as the job row exists; the drafting itself runs on the server. A JOB rather than a response because the model takes 133-206s per call and the server retries up to three times, so the work outlives any one request. WRITES NO ROLE - every generated question is checked against the same phone-speakability gate the save path uses, and the finished draft goes to a human who presses Save.
       requestBody:
         required: true
         content:
@@ -134,18 +134,75 @@ paths:
                   minLength: 1
                   maxLength: 200
       responses:
-        '200':
-          description: NDJSON stream. A terminal error line is delivered with status 200 because the status is committed before generation begins.
+        '202':
+          description: Job accepted and running.
           content:
-            application/x-ndjson:
+            application/json:
               schema:
-                type: string
+                $ref: '#/components/schemas/RoleDraftJob'
         '400':
           description: Invalid body.
         '401':
           description: Unauthenticated.
         '403':
           description: Insufficient role.
+  /api/roles/draft/{id}:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [roles]
+      operationId: getRoleDraft
+      summary: Poll a drafting job (interviewer+; the caller must own it)
+      description: A job whose worker died reads as failed with reason `abandoned`, never as still running - a caller must never be left watching a spinner for work that stopped.
+      responses:
+        '200':
+          description: The job as it stands.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RoleDraftJob'
+        '401':
+          description: Unauthenticated.
+        '403':
+          description: Insufficient role.
+        '404':
+          description: No such draft for this caller.
+  /api/roles/draft/{id}/cancel:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [roles]
+      operationId: cancelRoleDraft
+      summary: Stop a running drafting job (interviewer+; the caller must own it)
+      description: Stops the model spending, not just the spinner - the generator reads the cancellation between attempts. Idempotent, because cancelling a job that has just finished is a race the operator cannot be blamed for.
+      responses:
+        '200':
+          description: Whether this call is what stopped it.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [cancelled]
+                properties:
+                  cancelled:
+                    type: boolean
+        '401':
+          description: Unauthenticated.
+        '403':
+          description: Insufficient role.
+        '404':
+          description: No such draft for this caller.
   /api/roles/{id}:
     parameters:
       - name: id
@@ -7493,6 +7550,89 @@ components:
         mandatory:
           type: boolean
       additionalProperties: true
+
+    RoleDraftJob:
+      type: object
+      additionalProperties: false
+      required: [id, job_role, status, phase, draft, attempts, repaired, error_reason, error_message, max_attempts]
+      properties:
+        id:
+          type: string
+          format: uuid
+        job_role:
+          type: string
+          description: The title this job was started FROM. Handed back so the form can say which role a draft belongs to - the field stays editable for the ten minutes a draft runs.
+        status:
+          type: string
+          enum: [running, succeeded, failed, cancelled]
+        phase:
+          nullable: true
+          description: Where the job is now, so a ten-minute wait reports progress rather than a spinner. Null before the first attempt and after the job settles.
+          type: object
+          additionalProperties: false
+          required: [phase, attempt, maxAttempts]
+          properties:
+            phase:
+              type: string
+              enum: [drafting, checking, repairing, rereading]
+            attempt:
+              type: integer
+              minimum: 1
+            maxAttempts:
+              type: integer
+              minimum: 1
+            rejected:
+              type: integer
+              minimum: 0
+              description: Present on `repairing` only - how many questions the speakability gate refused.
+        draft:
+          nullable: true
+          description: Present only on `succeeded`. Never partial - a draft that failed the gate is not returned at all.
+          type: object
+          additionalProperties: false
+          required: [jd, required_skills, screening_template]
+          properties:
+            jd:
+              type: string
+            required_skills:
+              type: array
+              items:
+                type: string
+            screening_template:
+              type: array
+              items:
+                type: object
+                additionalProperties: false
+                required: [id, question, weight]
+                properties:
+                  id:
+                    type: string
+                  question:
+                    type: string
+                  weight:
+                    type: integer
+        attempts:
+          type: integer
+          minimum: 0
+        repaired:
+          type: array
+          description: Ids of the questions the model had to rephrase before they passed the gate. Surfaced so a human reviews them rather than trusting them.
+          items:
+            type: string
+        error_reason:
+          type: string
+          nullable: true
+          description: >-
+            unusable_output and unspeakable_questions come from the generator,
+            provider_unavailable from any other failure reaching it, and
+            abandoned from a read of a job whose worker died.
+          enum: [unusable_output, unspeakable_questions, cancelled, provider_unavailable, abandoned]
+        error_message:
+          type: string
+          nullable: true
+        max_attempts:
+          type: integer
+          minimum: 1
 
     Role:
       type: object

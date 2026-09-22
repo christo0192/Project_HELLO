@@ -26,11 +26,32 @@ export interface Role {
   created_at: string;
 }
 
-/** One line of the Ask Hello progress stream. */
+/** Where an Ask Hello job currently is. */
 export type RoleDraftProgress =
   | { phase: 'drafting'; attempt: number; maxAttempts: number }
   | { phase: 'checking'; attempt: number; maxAttempts: number }
-  | { phase: 'repairing'; attempt: number; maxAttempts: number; rejected: number };
+  | { phase: 'repairing'; attempt: number; maxAttempts: number; rejected: number }
+  | { phase: 'rereading'; attempt: number; maxAttempts: number };
+
+/**
+ * An Ask Hello job.
+ *
+ * A JOB, not a request: drafting runs v4-pro up to three times at 133-206s a
+ * call, so the work outlives the HTTP call that starts it and a refresh picks
+ * it back up.
+ */
+export interface RoleDraftJob {
+  id: string;
+  job_role: string;
+  status: 'running' | 'succeeded' | 'failed' | 'cancelled';
+  phase: RoleDraftProgress | null;
+  draft: RoleDraft | null;
+  attempts: number;
+  repaired: string[];
+  error_reason: string | null;
+  error_message: string | null;
+  max_attempts: number;
+}
 
 export interface RoleDraft {
   jd: string;
@@ -172,8 +193,12 @@ export interface Session {
    * engagement signal, and one `duration_sec` cannot give: a call whose bot
    * turns were all barged-in and truncated has a long wall clock and very few
    * candidate words. Absent on payloads that predate this field.
+   *
+   * NULL when no transcript was read for the session — which is not the same
+   * claim as 0. Zero says the candidate said nothing; null says we do not
+   * know, and the badge is then absent rather than accusing them of silence.
    */
-  candidate_words?: number;
+  candidate_words?: number | null;
 }
 
 export type Speaker = "bot" | "candidate";

@@ -76,7 +76,10 @@ export function RolesPage() {
       <PageHeader
         eyebrow="Talent workspace"
         title="Roles"
-        description="Define the jobs candidates are screened for and the questions Gopu will ask."
+        // NOT "the questions Gopu will ask". Each role now names its own
+        // agent, and one hard-coded name in the page header contradicts every
+        // role that chose a different one.
+        description="Define the jobs candidates are screened for and the questions the screening agent will ask."
         actions={
           editing === null ? (
             <Button variant="primary" onClick={() => setEditing("new")}>
@@ -123,9 +126,23 @@ export function RolesPage() {
                   className="flex h-full flex-col gap-3"
                 >
                   <div className="flex items-start justify-between gap-3">
-                    <h2 className="min-w-0 truncate text-[15px] font-semibold tracking-[-0.01em] text-ink">
-                      {role.title}
-                    </h2>
+                    <div className="min-w-0">
+                      <h2 className="min-w-0 truncate text-[15px] font-semibold tracking-[-0.01em] text-ink">
+                        {role.title}
+                      </h2>
+                      {/* SHOWN, because a field you can only write is a field
+                          nobody can check. The agent name is how an operator
+                          tells two roles apart internally; it is never spoken
+                          to a candidate, and the label says so. */}
+                      {role.agent_name && (
+                        <p
+                          data-role-agent-name=""
+                          className="mt-0.5 truncate text-xs text-ink-tertiary"
+                        >
+                          Agent: {role.agent_name}
+                        </p>
+                      )}
+                    </div>
                     <StatusBadge tone={role.is_active ? "success" : "neutral"}>
                       {role.is_active ? "Active" : "Inactive"}
                     </StatusBadge>
@@ -245,6 +262,15 @@ function RoleForm({
   const [formError, setFormError] = useState<string | null>(null);
   /** Set after Ask Hello fills the form; cleared once the role is saved. */
   const [draftNote, setDraftNote] = useState<string | null>(null);
+  /**
+   * Ask Hello's own failures, kept SEPARATE from `formError`.
+   * `formError` renders beside the Save button, below the question list and
+   * the prompt preview — roughly 1200px down. After a ten-minute wait, that is
+   * off screen at exactly the moment an explanation is needed, and moving it
+   * up would put save errors far from Save. Two slots, each next to its own
+   * button.
+   */
+  const [draftError, setDraftError] = useState<string | null>(null);
 
   function updateQuestion(idx: number, patch: Partial<QuestionRow>) {
     setQuestions((prev) =>
@@ -354,31 +380,67 @@ function RoleForm({
         <AskHelloButton
           className="mt-1"
           jobRole={title}
-          wouldOverwrite={Boolean(
-            jd.trim() || skillsText.trim() || questions.some((q) => q.question.trim()),
-          )}
-          onError={setFormError}
-          onDrafted={(outcome) => {
-            setFormError(null);
-            setJd(outcome.draft.jd);
-            setSkillsText(outcome.draft.required_skills.join(", "));
+          // A FUNCTION, read when the draft LANDS, not when it starts. The
+          // confirm at t=0 cannot know what was typed during the eight minutes
+          // that followed, and a draft replacing hand-written questions is
+          // data loss.
+          wouldOverwrite={() =>
+            Boolean(jd.trim() || skillsText.trim() || questions.some((q) => q.question.trim()))
+          }
+          onError={(message) => {
+            setDraftError(message);
+            setDraftNote(null);
+          }}
+          onDrafted={(draft, repaired, draftedFor) => {
+            // The job's OWN job role, not the field's current value: the field
+            // stays editable while a draft runs, so a draft written for
+            // "Sales Advisr" can land under a heading that now reads something
+            // else. Say which one it was rather than pretending.
+            const staleTitle = draftedFor.trim() !== title.trim();
+            const hasWork = Boolean(
+              jd.trim() || skillsText.trim() || questions.some((q) => q.question.trim()),
+            );
+            if (
+              hasWork &&
+              typeof window !== "undefined" &&
+              !window.confirm(
+                `Hello finished drafting "${draftedFor}". Replace the job description, skills and questions now in this form?`,
+              )
+            ) {
+              setDraftNote(null);
+              return;
+            }
+
+            setDraftError(null);
+            setJd(draft.jd);
+            setSkillsText(draft.required_skills.join(", "));
             setQuestions(
-              outcome.draft.screening_template.map((q, i) => ({
+              draft.screening_template.map((q, i) => ({
                 id: q.id || `q${i + 1}`,
                 question: q.question,
                 weight: q.weight ?? 1,
               })),
             );
+            const rephrased =
+              repaired.length > 0
+                ? ` Hello rephrased ${repaired.length} question${
+                    repaired.length === 1 ? "" : "s"
+                  } the screener would not read aloud.`
+                : "";
             setDraftNote(
-              outcome.repaired.length > 0
-                ? `Hello rephrased ${outcome.repaired.length} question${
-                    outcome.repaired.length === 1 ? "" : "s"
-                  } the screener would not read aloud. Review them before saving.`
-                : "Hello drafted this role. Review it before saving.",
+              staleTitle
+                ? `Drafted for "${draftedFor}", which is not what the job role says now — check it before saving.${rephrased}`
+                : `Hello drafted this role. Review it before saving.${rephrased}`,
             );
           }}
         />
 
+        {/* Both notices sit HERE, beside the button that produced them. */}
+        {draftError && (
+          <InlineNotice tone="danger" role="alert" className="mt-1">
+            {draftError}
+          </InlineNotice>
+        )}
         {/* Said plainly, because a drafted role is NOT a saved role and the
             form gives no other signal that a model wrote what is on screen. */}
         {draftNote && (

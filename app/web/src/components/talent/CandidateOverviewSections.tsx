@@ -64,24 +64,6 @@ function boundList(bounded: boolean, label: string, maxHeight: string, list: Rea
 
 export interface CandidateProfileCardProps {
   candidate: CandidateDetail['candidate'];
-  /** The role this candidate applied for, resolved to its title. */
-  roleTitle?: string | null;
-  /**
-   * Length of the screening CALL, in seconds.
-   *
-   * NOT "how long the candidate spoke" — no per-speaker talk-time metric
-   * exists anywhere in this system. `sessions.duration_sec` is the whole call:
-   * the bot's speech, the candidate's, and the silence between. It is labelled
-   * for what it measures, because a figure captioned "candidate spoke for
-   * 7m 14s" would be read as engagement and is not that.
-   */
-  callSeconds?: number | null;
-  /**
-   * Words the candidate said on that call. Shown BESIDE the call length
-   * because the pair is the point: a long call with very few candidate words
-   * is a call where they could not get a word in.
-   */
-  candidateWords?: number | null;
   /** Optional trailing note (the full workspace explains its live actions). */
   footnote?: ReactNode;
   className?: string;
@@ -90,9 +72,6 @@ export interface CandidateProfileCardProps {
 /** Identity/profile card — phone, experience, status and parsed skills. */
 export function CandidateProfileCard({
   candidate,
-  roleTitle,
-  callSeconds,
-  candidateWords,
   footnote,
   className = 'p-4 sm:p-5 lg:col-span-1',
 }: CandidateProfileCardProps) {
@@ -105,45 +84,6 @@ export function CandidateProfileCard({
       <p className="mb-4 mt-0.5 text-[13px] text-ink-tertiary">
         Identity and skills as parsed from the resume.
       </p>
-      {/* ROLE AND CALL LENGTH FIRST, and visually separated from the
-          resume-parsed fields under them. These two answer "who is this and
-          did we actually talk to them"; phone, experience and skills are
-          detail you read after. The call length used to live in the Live-call
-          card on the far right of the page, which is the last place a manager
-          scanning the left column would look. */}
-      {(roleTitle || callSeconds != null) && (
-        <div className="mb-4 flex flex-wrap items-center gap-2">
-          {roleTitle && (
-            <span
-              data-candidate-role-title=""
-              className="inline-flex items-center rounded-full bg-info-soft px-2.5 py-1 text-[13px] font-medium text-ink"
-            >
-              {roleTitle}
-            </span>
-          )}
-          {callSeconds != null && (
-            <span
-              data-candidate-call-length=""
-              className="inline-flex items-center gap-1.5 rounded-full bg-success-soft px-2.5 py-1 text-[13px] font-semibold tabular-nums text-ink"
-            >
-              {formatDurationSec(callSeconds)}
-              {/* Says WHAT was measured. There is no per-speaker talk time in
-                  this system, so "on the call" is the honest caption. */}
-              <span className="font-normal text-ink-secondary">on the call</span>
-            </span>
-          )}
-          {candidateWords != null && (
-            <span
-              data-candidate-words=""
-              className="inline-flex items-center gap-1.5 rounded-full bg-info-soft px-2.5 py-1 text-[13px] font-semibold tabular-nums text-ink"
-            >
-              {candidateWords.toLocaleString()}
-              <span className="font-normal text-ink-secondary">words spoken</span>
-            </span>
-          )}
-        </div>
-      )}
-
       <dl className="space-y-3 text-sm">
         <Field label="Phone">
           {candidate.phone_e164 ? (

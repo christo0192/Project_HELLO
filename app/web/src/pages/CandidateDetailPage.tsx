@@ -39,6 +39,7 @@ import {
   candidateStatusTone,
   sessionStatusLabel,
 } from "../components/talent";
+import { CandidateHeadlineFacts } from "../components/talent/CandidateHeadlineFacts";
 import { formatDateTime } from "../lib/datetime";
 import { PhoneSlotDialog, engagementStateTerm } from "../components/phone-calendar";
 import { istToday } from "../lib/ist-datetime";
@@ -91,6 +92,38 @@ export function CandidateDetailPage() {
 
   useEffect(load, [load]);
 
+  /**
+   * The role this candidate applied for, resolved to its title.
+   *
+   * The detail payload carries `role_id` but not the title, and the route does
+   * not join roles. `null` until it resolves, and `null` when the id is not in
+   * the list — which is a real case, not only an error: an interviewer sees
+   * only roles they own, so a candidate on a colleague's role resolves to
+   * nothing. The badge is then simply absent, because a WRONG role on a
+   * candidate page is worse than no role at all.
+   */
+  const roleId = detail?.candidate.role_id ?? null;
+  const [roleTitle, setRoleTitle] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    if (!roleId) {
+      setRoleTitle(null);
+      return;
+    }
+    api
+      .listRoles()
+      .then((roles) => {
+        if (!live) return;
+        setRoleTitle(roles.find((r) => r.id === roleId)?.title ?? null);
+      })
+      .catch(() => {
+        if (live) setRoleTitle(null);
+      });
+    return () => {
+      live = false;
+    };
+  }, [roleId]);
+
   // Silent refresh: re-read the candidate (its session list feeds the Review
   // tab) without unmounting the page. Used when a live call completes.
   const refresh = useCallback(() => {
@@ -119,6 +152,22 @@ export function CandidateDetailPage() {
   const { candidate, sessions, assessments } = detail;
   const decisionBlocked = candidate.decision_use_blocked_at != null;
 
+  /**
+   * The LONGEST completed call, not the latest.
+   *
+   * A candidate can have several sessions — a cycle-2 rescreen, a call that
+   * died at the consent gate after nine seconds. Showing the most recent would
+   * report "0m 9s on the call" for someone who actually completed a seven
+   * minute screen; the longest is the one the scorecard was built from.
+   * `null` (never 0) when nothing completed, so the badge is absent rather
+   * than claiming a zero-length call.
+   */
+  const longestSession = sessions.reduce<(typeof sessions)[number] | null>((best, session) => {
+    const secs = session.duration_sec;
+    if (typeof secs !== "number" || !Number.isFinite(secs) || secs <= 0) return best;
+    return secs > (best?.duration_sec ?? -1) ? session : best;
+  }, null);
+
   return (
     <CandidateShell variant="inset">
       <Link
@@ -132,6 +181,19 @@ export function CandidateDetailPage() {
         eyebrow="Candidate"
         title={candidateDisplayName(candidate.name)}
         description={candidate.email ?? undefined}
+        // Directly under the name, above the tabs: which role, how long the
+        // call ran, how much the candidate said. The call length previously
+        // lived in the Live-call panel on the far right, and the role was not
+        // on this page at all.
+        meta={
+          <CandidateHeadlineFacts
+            roleTitle={roleTitle}
+            callSeconds={longestSession?.duration_sec ?? null}
+            // From THE SAME session as the length, or the two figures describe
+            // different calls while sitting side by side.
+            candidateWords={longestSession?.candidate_words ?? null}
+          />
+        }
         actions={
           <>
             <StatusBadge tone={candidateStatusTone(candidate.status)}>
@@ -191,58 +253,6 @@ function OverviewTab({
   phoneRole: MeResponse["role"];
   onSessionCompleted?: () => void;
 }) {
-  /**
-   * The role this candidate applied for, resolved to its title.
-   *
-   * The detail payload carries `role_id` but not the title, and the route does
-   * not join roles — so it is looked up the way the candidates list does it.
-   * `null` until it resolves, and `null` if the id is not in the list: the
-   * badge is simply absent rather than guessing, because a WRONG role on a
-   * candidate page is worse than no role at all.
-   */
-  const [roleTitle, setRoleTitle] = useState<string | null>(null);
-  useEffect(() => {
-    let live = true;
-    if (!candidate.role_id) {
-      setRoleTitle(null);
-      return;
-    }
-    api
-      .listRoles()
-      .then((roles) => {
-        if (!live) return;
-        setRoleTitle(roles.find((r) => r.id === candidate.role_id)?.title ?? null);
-      })
-      .catch(() => {
-        if (live) setRoleTitle(null);
-      });
-    return () => {
-      live = false;
-    };
-  }, [candidate.role_id]);
-
-  /**
-   * The LONGEST completed call, not the latest.
-   *
-   * A candidate can have several sessions — a cycle-2 rescreen, a call that
-   * died at the consent gate after nine seconds. Showing the most recent would
-   * report "0m 9s on the call" for someone who actually completed a seven
-   * minute screen; the longest is the one the scorecard was built from.
-   * `null` (never 0) when nothing completed, so the badge is absent rather
-   * than claiming a zero-length call.
-   */
-  const longestSession =
-    sessions.reduce<(typeof sessions)[number] | null>((best, session) => {
-      const secs = session.duration_sec;
-      if (typeof secs !== "number" || !Number.isFinite(secs) || secs <= 0) return best;
-      const bestSecs = best?.duration_sec ?? -1;
-      return secs > bestSecs ? session : best;
-    }, null);
-  const longestCallSeconds = longestSession?.duration_sec ?? null;
-  // From THE SAME session as the length, or the two figures describe
-  // different calls while sitting side by side.
-  const longestCallWords = longestSession?.candidate_words ?? null;
-
   return (
     // `fade-up-stagger` is the CSS-only reveal: candidate-scoped source may
     // not import a motion library, and this collapses with every other
@@ -254,15 +264,9 @@ function OverviewTab({
     // cards, the phone cycle, the Ashby pipeline, appeals — own the wide
     // column. Below `lg` this is one ordinary stack, reference first.
     <div className="fade-up-stagger grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-12 lg:items-start">
-      {/* Derived here rather than in the card, so the card stays a
-          presentational component and the rule for WHICH session counts is
-          visible next to the data it reads. */}
       <div className="order-2 space-y-4 lg:order-1 lg:col-span-4">
         <CandidateProfileCard
           candidate={candidate}
-          roleTitle={roleTitle}
-          callSeconds={longestCallSeconds}
-          candidateWords={longestCallWords}
           className="p-4 sm:p-5"
           footnote="Transcript, playback and scorecard sync back into the Review tab."
         />
