@@ -7622,10 +7622,7 @@ components:
         error_reason:
           type: string
           nullable: true
-          description: >-
-            unusable_output and unspeakable_questions come from the generator,
-            provider_unavailable from any other failure reaching it, and
-            abandoned from a read of a job whose worker died.
+          description: unusable_output and unspeakable_questions come from the generator, provider_unavailable from any other failure reaching it, and abandoned from a read of a job whose worker died.
           enum: [unusable_output, unspeakable_questions, cancelled, provider_unavailable, abandoned]
         error_message:
           type: string
