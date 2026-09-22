@@ -40,7 +40,30 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-const CSS = readFileSync(path.resolve(HERE, '../index.css'), 'utf8');
+
+/**
+ * `index.css` PLUS everything it `@import`s.
+ *
+ * Reading one file was a hole: appending `.ask-hello { opacity: .6 }` to
+ * `styles/candidate-palette.css`, which `index.css` imports on line 1, put
+ * the label back at 2.83:1 with this gate green. The cascade does not care
+ * which file a rule was written in.
+ */
+function loadCss(entry: string, seen = new Set<string>()): string {
+  const resolved = path.resolve(entry);
+  if (seen.has(resolved)) return '';
+  seen.add(resolved);
+  const src = readFileSync(resolved, 'utf8');
+  const dir = path.dirname(resolved);
+  const imported = [...src.matchAll(/@import\s+(?:url\()?['"]([^'"]+)['"]\)?\s*;/g)]
+    .map((m) => m[1])
+    .filter((spec) => spec.startsWith('.') || spec.startsWith('/'))
+    .map((spec) => loadCss(path.resolve(dir, spec), seen))
+    .join('\n');
+  return `${imported}\n${src}`;
+}
+
+const CSS = loadCss(path.resolve(HERE, '../index.css'));
 const BUTTON = readFileSync(
   path.resolve(HERE, '../components/roles/AskHelloButton.tsx'),
   'utf8',
@@ -58,7 +81,16 @@ function buttonClassName(): string {
   if (start < 0) throw new Error('could not find the Ask Hello button element');
   const open = BUTTON.indexOf('className={', start);
   if (open < 0) throw new Error('could not find the button className');
+  // THROWS rather than returning -1. `slice(open, -1)` is not an error: it
+  // returns everything from the className to the end of the file, so the
+  // CANCEL button's class list — which also carries `ring-info`,
+  // `ring-offset-2` and `ring-2` — satisfied every `toContain` below. Deleting
+  // the main button's focus ring entirely then passed. The delimiter is
+  // Prettier's output at this JSX depth, so a single nesting change would have
+  // done it, and the `length > 80` scaffolding guard catches an EMPTY match,
+  // never an over-long one.
   const end = BUTTON.indexOf('\n        >', open);
+  if (end < 0) throw new Error('could not find the end of the button className');
   return BUTTON.slice(open, end)
     .replace(/\/\*[\s\S]*?\*\//g, '')
     .replace(/\/\/[^\n]*/g, '');
@@ -102,8 +134,16 @@ const over = (under: string, colour: string, alpha: number) => mix(under, colour
  */
 function ruleBodies(selector: string): string[] {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // ANCHORED ON A BOUNDARY, not on the start of a line. Every rule nested in
+  // an at-rule is indented, so a `^`-anchored match never read the
+  // `@media (prefers-reduced-motion: reduce)` block at all — and that block
+  // contains a `.ask-hello` rule. Adding `opacity: .6` there hit every
+  // motion-sensitive reader at 2.83:1 with this gate green.
+  //
+  // `(?:^|[\s}])` still refuses to match `.ask-hello--idle` or a descendant
+  // selector, which is what the original `^` was protecting against.
   const found = [
-    ...CSS.matchAll(new RegExp(`^${escaped}\\s*\\{([^}]*)\\}`, 'gm')),
+    ...CSS.matchAll(new RegExp(`(?:^|[\\s}])${escaped}\\s*\\{([^}]*)\\}`, 'gm')),
   ].map((m) => m[1]);
   if (found.length === 0) throw new Error(`no rule for ${selector}`);
   return found;
@@ -224,7 +264,12 @@ describe('Ask Hello — the focus indicator survives hover', () => {
     const rules = [...CSS.matchAll(/^(\.ask-hello[^{\n]*)\{([^}]*)\}/gm)];
     for (const [, rawSelector, body] of rules) {
       const selector = rawSelector.trim();
-      const isStateful = /:hover|:active|:focus|\[aria-|\[data-/.test(selector);
+      // `:focus-visible` is EXCLUDED from the stateful set: a rule that styles
+      // the focus ring itself is the thing being protected, not a threat to
+      // it. Requiring `:not(:focus-visible)` there would reject the correct
+      // fix.
+      const isStateful =
+        /:hover|:active|\[aria-|\[data-/.test(selector) && !/:focus-visible/.test(selector);
       if (isStateful && /box-shadow/.test(body)) {
         expect(selector, `${selector} can erase the focus ring`).toContain(
           ':not(:focus-visible)',
@@ -254,7 +299,20 @@ describe('Ask Hello — the class list, where two of the three defects lived', (
     expect(cls.length).toBeGreaterThan(80);
   });
 
-  it('applies NO opacity utility — defect 1, which was never in the CSS', () => {
+  it('applies NO opacity utility ANYWHERE in the component', () => {
+    // Scoping this to the button element was a hole. `opacity-60` moved onto
+    // the label `<span className="relative">` fades exactly the same text —
+    // 2.91-3.19:1 under the sheen — and the button-element check saw nothing.
+    // CSS opacity composites a subtree; so does this assertion now.
+    //
+    // The file's own prose mentions `opacity-60` when explaining the history,
+    // so comments are stripped before matching: a false positive on a correct
+    // component is as useless as a false negative on a broken one.
+    const source = BUTTON.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+    expect(source).not.toMatch(/\bopacity-\d/);
+  });
+
+  it('applies NO opacity utility on the button element itself — defect 1 verbatim', () => {
     // `disabled:opacity-60` on this element faded the whole subtree, label
     // included: 2.82-3.05:1, and 2.39-2.53:1 under the sheen, for the entire
     // ten minutes the button spends saying "Asking Hello…". The stylesheet
@@ -294,5 +352,30 @@ describe('Ask Hello — the class list, where two of the three defects lived', (
     const cls = buttonClassName();
     expect(cls).toContain('focus-visible:ring-2');
     expect(cls).toContain('focus-visible:ring-offset-2');
+  });
+
+  it('the ring COLOUR clears 3:1 against the offset — a name is not a ratio', () => {
+    // Defect 2 was a CONTRAST failure and its guard was a spelling check.
+    // `ring-info` resolves through `--info-rgb`, and repointing that token at
+    // a paler existing palette value drops the ring to 2.56:1 against the
+    // white offset — SC 1.4.11 wants 3:1 — with every name-based assertion
+    // still green. So compute it.
+    const m = CSS.match(/--info-rgb:\s*(\d+)\s+(\d+)\s+(\d+)/);
+    expect(m, '--info-rgb must be declared for `ring-info` to resolve').not.toBeNull();
+    const hex =
+      '#' +
+      [1, 2, 3].map((i) => Number(m![i]).toString(16).padStart(2, '0')).join('');
+    // The ring offset is Tailwind's preflight default, white.
+    expect(contrast(hex, WHITE)).toBeGreaterThanOrEqual(3);
+  });
+
+  it('declares `--info-rgb` at :root, not only inside a scope', () => {
+    // The whole of defect 2: `--c-accent` exists only under
+    // `.candidate-scope`, which the Roles page does not apply, so the custom
+    // property was invalid at computed-value time and Tailwind's preflight
+    // default took over at 1.84:1.
+    const rootBlock = CSS.slice(CSS.indexOf(':root'), CSS.indexOf('--info-rgb') + 40);
+    expect(rootBlock).toContain('--info-rgb');
+    expect(rootBlock).not.toContain('.candidate-scope');
   });
 });

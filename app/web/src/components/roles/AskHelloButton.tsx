@@ -102,20 +102,28 @@ export function AskHelloButton({
   jobRoleRef.current = jobRole;
 
   /**
-   * Set when Cancel is pressed before `startRoleDraft` has answered.
+   * The start currently in flight, if any — one token PER PRESS.
    *
    * `running` is `starting || jobId !== null`, so Cancel renders the instant
-   * the button is pressed — but `cancel()` had nothing to cancel yet and bailed
-   * on `if (!id) return`, recording nothing. The POST then landed, `setJobId`
-   * fired unconditionally, the poll began, and the draft applied ten minutes
-   * later to a form where neither confirm fires. The operator pressed Cancel
-   * and got the exact behaviour this whole architecture exists to end: the
-   * spinner stopped, the model kept billing.
+   * the button is pressed. `cancel()` had nothing to cancel yet and bailed on
+   * `if (!id) return`, recording nothing: the POST landed, `setJobId` fired
+   * unconditionally, the poll began, and the draft applied ten minutes later
+   * to a form where neither confirm fires. The spinner stopped and the model
+   * kept billing, which is precisely what this architecture exists to end.
    *
-   * The POST is three round trips plus an awaited audit write, so the window
-   * is hundreds of milliseconds on a warm pooler and seconds on a cold one.
+   * A SINGLE component-wide flag did not survive the obvious follow-up. After
+   * Cancel the button is pressable again while the first POST is still out,
+   * and the next `start()` reset the flag — so the first POST's own closure
+   * read it as false and adopted the job the operator had cancelled. The
+   * operator most likely to press the button twice is exactly the one who
+   * just cancelled because nothing seemed to be happening.
+   *
+   * A token per start cannot be cleared by a later press: each closure asks
+   * about ITS OWN start and nobody else's. The POST is three round trips plus
+   * an awaited audit write, so this window is hundreds of milliseconds warm
+   * and seconds cold.
    */
-  const cancelRequestedRef = useRef(false);
+  const pendingStartRef = useRef<{ cancelled: boolean } | null>(null);
   const buttonRef = useRef<HTMLButtonElement | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   /**
@@ -188,12 +196,16 @@ export function AskHelloButton({
           // for the life of the form. They did not do anything wrong; there is
           // simply a draft in progress.
           //
-          // And it names a recovery that EXISTS. "Open that role to cancel it"
-          // was wrong for the feature's main path — a draft for a brand-new
-          // role has no saved role to open. The route back is a blank New role
-          // form, which the mount effect adopts.
+          // And it names a recovery that EXISTS, in full. "Open that role to
+          // cancel it" was wrong for the feature's main path — a draft for a
+          // brand-new role has no saved role to open. The route back is a
+          // blank New role form, which the mount effect adopts. It says
+          // "close this form" first because the New role button is hidden
+          // while any form is open (`RolesPage` renders it only when
+          // `editing === null`), so the obvious reading of the shorter
+          // sentence led to a button that is not on screen.
           cbs.current.onBusy?.(
-            `Hello is already drafting "${active.job_role}". Open a new role form and leave the job role blank to watch or cancel it.`,
+            `Hello is already drafting "${active.job_role}". Close this form and open a new role with the job role left blank to watch or cancel it.`,
           );
           return;
         }
@@ -297,7 +309,10 @@ export function AskHelloButton({
     }
     setStarting(true);
     setPhase(null);
-    cancelRequestedRef.current = false;
+    // This press's own token. A later press replaces the ref but never
+    // touches this object, so the closure below still sees its own answer.
+    const pending = { cancelled: false };
+    pendingStartRef.current = pending;
     // Started here, so "now" is when the wait began — until the server says
     // otherwise below.
     setResumeBase(null);
@@ -311,8 +326,7 @@ export function AskHelloButton({
       // CANCELLED WHILE WE WERE ASKING. The job exists now — the server made
       // it — so it has to be stopped rather than merely not watched. Adopting
       // it instead would ignore a decision the operator has already made.
-      if (cancelRequestedRef.current) {
-        cancelRequestedRef.current = false;
+      if (pending.cancelled) {
         await api.cancelRoleDraft(job.id).catch(() => {
           cbs.current.onError(
             'Hello may not have stopped — the cancel did not reach the server. Reopen this form to check.',
@@ -324,6 +338,10 @@ export function AskHelloButton({
       setResumeBase(Number.isFinite(startedAt) ? startedAt : null);
       setJobId(job.id);
     } catch (err) {
+      // NOT REPORTED IF THE OPERATOR ALREADY GAVE UP. They pressed Cancel;
+      // telling them the request they abandoned then failed is noise about a
+      // decision they had already made.
+      if (pending.cancelled) return;
       // A 409 carries a sentence written for a human — "A draft for
       // \"Sales Advisor\" is already running." — so it is shown as-is rather
       // than flattened into a generic failure.
@@ -335,21 +353,23 @@ export function AskHelloButton({
 
   const cancel = useCallback(async () => {
     const id = jobId;
+    // MARKED FIRST, and unconditionally. A start can be in flight even when a
+    // job id already exists — adopt a running draft on mount, then press Ask
+    // Hello before the lookup settles — and the old code only recorded the
+    // decision on the no-job branch. In that overlap Cancel appeared to do
+    // nothing at all: the label stayed "Asking Hello…", the button stayed
+    // mounted, and the start's job was adopted anyway.
+    if (pendingStartRef.current) pendingStartRef.current.cancelled = true;
     // Cleared first, deliberately: the operator should not wait on the network
     // to stop watching. Focus moves before the unmount for the same reason as
     // in `settle` — Cancel is the element being removed.
     returnFocus();
     setJobId(null);
     setPhase(null);
-    if (!id) {
-      // No job to cancel YET — the start POST is still in flight. Remember the
-      // decision so the response handler stops the job it is about to be
-      // handed, instead of adopting it. Without this the press did nothing at
-      // all and the draft landed ten minutes later unasked.
-      cancelRequestedRef.current = true;
-      setStarting(false);
-      return;
-    }
+    setStarting(false);
+    // No job to cancel YET — the start POST is still out, and the token above
+    // is what stops the job it is about to be handed.
+    if (!id) return;
     try {
       await api.cancelRoleDraft(id);
     } catch {

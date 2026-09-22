@@ -27,6 +27,15 @@ let calls: Call[] = [];
 let selectResult: unknown = null;
 let selectQueue: unknown[] = [];
 let selectError: unknown = null;
+/**
+ * Errors for successive READS, in order — `selectError` fails every one.
+ *
+ * A run makes several different reads (admission, cancellation check, the
+ * zero-row classification), and only one of them is usually the subject. A
+ * single global error fails the first read and the run never reaches the
+ * others, which is how the classification-read test first appeared to fail.
+ */
+let selectErrors: unknown[] = [];
 let updateResult: unknown[] = [{ id: 'draft-1' }];
 let updateError: unknown = null;
 /** Errors the next inserts should fail with, in order. */
@@ -58,7 +67,10 @@ function builder(call: Call): any {
         : { data: { id: 'draft-1', ...(call.payload ?? {}) }, error: null }
       : call.op === 'update'
         ? { data: updateResult, error: updateError }
-        : { data: nextRead(), error: selectError };
+        : {
+          data: nextRead(),
+          error: selectErrors.length > 0 ? selectErrors.shift() : selectError,
+        };
   const self: any = {
     eq(col: string, val: unknown) {
       call.filters.push([col, val]);
@@ -183,6 +195,7 @@ beforeEach(() => {
   selectResult = null;
   selectQueue = [];
   selectError = null;
+  selectErrors = [];
   // ONE ROW by default: a fenced update that matched its row. `[]` used to be
   // the default, which meant the zero-row warning fired on every terminal
   // write in the suite and nothing noticed.
@@ -832,6 +845,59 @@ describe('the writes that can be lost silently', () => {
     const classify = calls.filter((c) => c.op === 'select').at(-1);
     expect(classify?.selects).toContain('status');
     expect(classify?.filters).toContainEqual(['id', 'draft-1']);
+  });
+
+  it('stays QUIET when the zero rows were an ordinary cancellation', async () => {
+    // The branch is deletable in both directions and only its existence was
+    // asserted. Warning here is the false alarm it was added to suppress: the
+    // operator cancelled, and discarding the result is the correct response.
+    updateResult = [];
+    selectQueue = [[], { status: 'cancelled' }];
+    const run = vi.fn().mockResolvedValue({ draft: DRAFT, attempts: 1, repaired: [] });
+    await startRoleDraft(OWNER, 'Sales Advisor', { run: run as never });
+    await settle();
+    expect(
+      logged.some((l) => l.meta.error_category === 'role_draft_result_discarded'),
+    ).toBe(false);
+  });
+
+  it('WARNS when the row was expired out from under a live worker', async () => {
+    // The other direction, and the one that costs money: a live job whose
+    // heartbeats were dropped gets expired by a concurrent start, and ten
+    // minutes of paid v4-pro output lands on a row that no longer matches.
+    updateResult = [];
+    selectQueue = [[], { status: 'failed' }];
+    const run = vi.fn().mockResolvedValue({ draft: DRAFT, attempts: 1, repaired: [] });
+    await startRoleDraft(OWNER, 'Sales Advisor', { run: run as never });
+    await settle();
+    expect(
+      logged.some(
+        (l) =>
+          l.meta.error_category === 'role_draft_result_discarded' &&
+          l.meta.error_type === 'failed',
+      ),
+    ).toBe(true);
+  });
+
+  it('names a FAILED CLASSIFICATION READ as itself, not as a missing row', async () => {
+    // Nothing in this codebase deletes `role_drafts` rows, so `row_missing`
+    // named a cause that cannot occur while hiding the read that actually
+    // failed.
+    updateResult = [];
+    // Read 1 is the admission check and must succeed; read 2 is the
+    // classification and is the one under test.
+    selectQueue = [[], []];
+    selectErrors = [null, { code: '', message: 'fetch failed' }];
+    const run = vi.fn().mockResolvedValue({ draft: DRAFT, attempts: 1, repaired: [] });
+    await startRoleDraft(OWNER, 'Sales Advisor', { run: run as never }).catch(() => undefined);
+    await settle();
+    expect(
+      logged.some(
+        (l) =>
+          l.meta.error_category === 'role_draft_result_discarded' &&
+          l.meta.error_type === 'read_failed',
+      ),
+    ).toBe(true);
   });
 
   it('LOGS a failed expiry — the one failure that reinstates the lockout', async () => {

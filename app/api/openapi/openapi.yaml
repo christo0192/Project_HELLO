@@ -226,8 +226,6 @@ paths:
           description: Unauthenticated.
         '403':
           description: Insufficient role.
-        '404':
-          description: No such draft for this caller.
   /api/roles/{id}:
     parameters:
       - name: id

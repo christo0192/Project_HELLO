@@ -542,6 +542,111 @@ describe('AskHelloButton', () => {
     expect(onDrafted).not.toHaveBeenCalled();
   });
 
+  it('a SECOND PRESS does not void the first press\'s cancel', async () => {
+    // One component-wide flag did not survive this. After Cancel the button is
+    // pressable again while the first POST is still out, and the next start
+    // reset the flag — so the first POST's closure read it as false and
+    // adopted the job the operator had cancelled. The person most likely to
+    // press twice is exactly the one who just cancelled because nothing
+    // seemed to be happening.
+    let releaseFirst: (v: unknown) => void = () => {};
+    mockApi.startRoleDraft.mockReturnValueOnce(
+      new Promise((resolve) => {
+        releaseFirst = resolve;
+      }),
+    );
+    mockApi.startRoleDraft.mockResolvedValue({ ...running(), id: 'second' });
+    mockApi.getRoleDraft.mockResolvedValue(running());
+    setup();
+
+    await act(async () => askHello().click());
+    const cancel = await screen.findByRole('button', { name: 'Cancel' });
+    await act(async () => cancel.click());
+
+    // The operator tries again while the first request is still out.
+    await act(async () => askHello().click());
+    // ...and only now does the first one land.
+    await act(async () => {
+      releaseFirst({ ...running(), id: 'first' });
+    });
+
+    // The FIRST job is stopped — its own token said so — and the second is
+    // the one being watched.
+    await waitFor(() => expect(mockApi.cancelRoleDraft).toHaveBeenCalledWith('first'));
+    expect(mockApi.getRoleDraft).not.toHaveBeenCalledWith('first');
+    expect(mockApi.getRoleDraft).toHaveBeenCalledWith('second');
+  });
+
+  it('CANCELS BOTH when a resume lands while a start is still in flight', async () => {
+    // The real overlap, and the ordering matters: `start()` refuses while
+    // `running`, so a job id cannot already exist when the press happens. It
+    // arrives DURING the press — Ask Hello is pressed on a pre-filled form and
+    // the mount lookup then adopts a job for the same role.
+    //
+    // `cancel()` recorded the decision only on the no-job branch, so with a
+    // job id present the press looked ignored — label still "Asking Hello…",
+    // Cancel still mounted — and the start's job was adopted anyway.
+    let releaseStart: (v: unknown) => void = () => {};
+    let releaseResume: (v: unknown) => void = () => {};
+    mockApi.getActiveRoleDraft.mockReturnValue(
+      new Promise((resolve) => {
+        releaseResume = resolve;
+      }),
+    );
+    mockApi.startRoleDraft.mockReturnValue(
+      new Promise((resolve) => {
+        releaseStart = resolve;
+      }),
+    );
+    mockApi.getRoleDraft.mockResolvedValue(running());
+    setup({ jobRole: 'Sales Advisor' });
+
+    await act(async () => askHello().click());
+    // The resume lands mid-start: now a job id exists AND a start is out.
+    await act(async () => {
+      releaseResume({ active: { ...running(), id: 'adopted', job_role: 'Sales Advisor' } });
+    });
+    await waitFor(() => expect(mockApi.getRoleDraft).toHaveBeenCalledWith('adopted'));
+
+    const cancel = await screen.findByRole('button', { name: 'Cancel' });
+    await act(async () => cancel.click());
+
+    // The adopted job is stopped...
+    await waitFor(() => expect(mockApi.cancelRoleDraft).toHaveBeenCalledWith('adopted'));
+    // ...the press is VISIBLE rather than leaving "Asking Hello…" on screen...
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument(),
+    );
+
+    // ...and the job the in-flight start produces is stopped too, not adopted.
+    await act(async () => {
+      releaseStart({ ...running(), id: 'started-anyway' });
+    });
+    await waitFor(() => expect(mockApi.cancelRoleDraft).toHaveBeenCalledWith('started-anyway'));
+    expect(mockApi.getRoleDraft).not.toHaveBeenCalledWith('started-anyway');
+  });
+
+  it('does NOT report a start failure the operator already abandoned', async () => {
+    // They pressed Cancel. Telling them the request they gave up on then
+    // failed is noise about a decision already made.
+    let rejectStart: (e: unknown) => void = () => {};
+    mockApi.startRoleDraft.mockReturnValue(
+      new Promise((_resolve, reject) => {
+        rejectStart = reject;
+      }),
+    );
+    const { onError } = setup();
+
+    await act(async () => askHello().click());
+    const cancel = await screen.findByRole('button', { name: 'Cancel' });
+    await act(async () => cancel.click());
+    await act(async () => {
+      rejectStart(new Error('A draft for "Other" is already running.'));
+    });
+
+    expect(onError).not.toHaveBeenCalled();
+  });
+
   it('says so when that late cancel fails to reach the server', async () => {
     let releaseStart: (v: unknown) => void = () => {};
     mockApi.startRoleDraft.mockReturnValue(

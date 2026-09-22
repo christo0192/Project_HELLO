@@ -122,6 +122,13 @@ const draftLogger = createLogger('role-draft');
 function errorCode(err: unknown): string {
   const code = (err as { code?: unknown } | null)?.code;
   if (typeof code === 'string' && code) return code;
+  // A CLIENT-SIDE NETWORK FAILURE HAS NO CODE, deliberately: postgrest-js
+  // sets `code: ''` for fetch failures, DNS errors, aborts and
+  // headers-overflow, with a comment saying it does not populate code or hint
+  // for them. That is the class a ten-minute job most needs named — a pooler
+  // reset mid-draft is the likeliest way a heartbeat goes missing — so it is
+  // called what it is rather than folded into "unknown".
+  if (code === '') return 'network';
   if (err instanceof Error) return err.name;
   return 'unknown';
 }
@@ -463,13 +470,22 @@ async function runDraft(id: string, jobRole: string, deps: RoleDraftRunnerDeps):
       // dropped, in which case ten minutes of paid output has just been thrown
       // away and nobody would otherwise know. Reading the row is the only way
       // to tell, and this path is rare enough to afford it.
-      const { data: row } = await supabase
+      const { data: row, error: readError } = await supabase
         .from('role_drafts')
         .select('status')
         .eq('id', id)
         .maybeSingle();
       const status = (row as { status?: string } | null)?.status;
-      if (status !== 'cancelled') {
+      if (readError) {
+        // The read itself failed, so we cannot tell a cancel from a discard.
+        // Reporting `row_missing` here named a cause that CANNOT occur —
+        // nothing in this codebase deletes `role_drafts` rows — while hiding
+        // the failure that did.
+        draftLogger.warn('db_error', {
+          error_category: 'role_draft_result_discarded',
+          error_type: 'read_failed',
+        });
+      } else if (status !== 'cancelled') {
         draftLogger.warn('db_error', {
           error_category: 'role_draft_result_discarded',
           error_type: status ?? 'row_missing',

@@ -336,6 +336,38 @@ describe('RolesPage', () => {
     confirmSpy.mockRestore();
   });
 
+  it('renders a busy draft as a NOTE, not a red alert', async () => {
+    // This fires on MOUNT, so opening any role for editing while a draft runs
+    // used to raise a danger notice the operator never asked for and could
+    // not dismiss for the life of the form. Rewiring it back to `draftError`
+    // failed no test — the component test only asserts which callback fires,
+    // not what the page does with it.
+    mockApi.listRoles.mockResolvedValue([mockRole]);
+    mockApi.getActiveRoleDraft.mockResolvedValue({
+      active: {
+        ...succeededJob(),
+        id: 'other',
+        status: 'running',
+        job_role: 'Sales Advisor',
+      },
+    });
+    mockApi.getRoleDraft.mockResolvedValue({ ...succeededJob(), status: 'running' });
+    render(<RolesPage />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: 'Edit' }));
+
+    const note = await waitFor(() => {
+      const el = document.querySelector('[data-role-draft-note]');
+      expect(el?.textContent).toContain('Sales Advisor');
+      return el;
+    });
+    // A note, not an alert.
+    expect(note?.querySelector('[role="alert"]')).toBeNull();
+    // ...and it names the whole recovery, including closing this form — the
+    // "New role" button is hidden while a form is open.
+    expect(note?.textContent).toContain('Close this form');
+  });
+
   it('reports how many questions Hello had to rephrase', async () => {
     mockApi.listRoles.mockResolvedValue([]);
     mockApi.startRoleDraft.mockResolvedValue({ ...succeededJob(), status: 'running' });
