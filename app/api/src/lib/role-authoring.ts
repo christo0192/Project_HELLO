@@ -60,7 +60,10 @@ const DIRECTIVE_OPENING_RE =
  * passes despite being an instruction to an interviewer rather than something
  * to say to a candidate. Both were verified against the real regex.
  *
- * The prompt already TELLS the model both rules (":149-150"). Stating a rule
+ * The prompt already TELLS the model both rules — the "end with a question
+ * mark" and "NOT begin with any of" bullets in the question-rules block
+ * below. (Cited by content, not by line: the ":149-150" that stood here had
+ * never pointed at them in any commit of this file.) Stating a rule
  * and then not enforcing it is the worst of both: the model is free to ignore
  * it and the draft is returned as verified-clean.
  *

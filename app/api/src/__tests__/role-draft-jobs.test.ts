@@ -961,6 +961,33 @@ describe('the writes that can be lost silently', () => {
     expect(logged.some((l) => l.meta.error_type === '42501')).toBe(true);
     expect(logged.some((l) => l.meta.error_type === 'object')).toBe(false);
   });
+
+  it('names a CODELESS failure "network" — the class a ten-minute job most has', async () => {
+    // postgrest-js sets `code: ''` for fetch failures, DNS errors, aborts and
+    // headers-overflow, with a comment saying it does not populate code or
+    // hint for them. A pooler reset mid-draft is the likeliest way a
+    // heartbeat goes missing, so folding it into "unknown" loses exactly the
+    // signal that says the database went away rather than refused.
+    //
+    // This branch shipped untested. The nearest-looking test — the
+    // read-failure one below — feeds the same `{ code: '' }` but asserts
+    // `read_failed`, which is decided BEFORE `errorCode` is ever called, so
+    // `if (code === '') return 'network'` could be made unreachable with the
+    // whole file green. Reached here through the terminal write instead,
+    // which is the write whose loss costs the most.
+    updateError = { code: '', message: 'fetch failed' };
+    const run = vi.fn().mockResolvedValue({ draft: DRAFT, attempts: 1, repaired: [] });
+    await startRoleDraft(OWNER, 'Sales Advisor', { run: run as never });
+    await settle();
+    expect(
+      logged.some(
+        (l) =>
+          l.meta.error_category === 'role_draft_terminal_write_succeeded' &&
+          l.meta.error_type === 'network',
+      ),
+    ).toBe(true);
+    expect(logged.some((l) => l.meta.error_type === 'unknown')).toBe(false);
+  });
 });
 
 describe('a database failure is never reported as an absence', () => {

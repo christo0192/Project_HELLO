@@ -112,10 +112,18 @@ export function CandidateDetailPage() {
     }
     // GUARDED THE SAME WAY `getMe` is, twenty lines up, and for the same
     // reason: embedded candidate surfaces supply a host adapter with only the
-    // endpoints they need, and `listRoles` is not one of them. Calling a
-    // method that is not there throws inside an effect, which React escalates
-    // into unmounting the whole page — so a missing OPTIONAL lookup would take
-    // out the transcript, the scorecard and the appeal controls with it.
+    // endpoints they need, and `listRoles` is not one of them.
+    //
+    // WHAT ACTUALLY FIXED THE UNMOUNT WAS THE `Promise.resolve()` WRAPPER, not
+    // this check. Called bare, a missing method threw synchronously in the
+    // effect body, which React escalates into unmounting the whole page —
+    // transcript, scorecard and appeal controls with it. Inside the wrapper
+    // the same TypeError is an ordinary rejection the `.catch` below already
+    // absorbs, so removing this line changes no observable behaviour and no
+    // test pins it. It stays for symmetry with `getMe` and to keep "this
+    // adapter has no roles endpoint" from arriving down the same path as "the
+    // roles request failed" — and is stated as defence in depth rather than
+    // as a protection, because a comment claiming the latter would be false.
     Promise.resolve()
       .then(() => (typeof api.listRoles === "function" ? api.listRoles() : []))
       .then((roles) => {

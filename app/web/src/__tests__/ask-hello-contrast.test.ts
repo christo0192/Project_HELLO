@@ -140,8 +140,12 @@ function ruleBodies(selector: string): string[] {
   // contains a `.ask-hello` rule. Adding `opacity: .6` there hit every
   // motion-sensitive reader at 2.83:1 with this gate green.
   //
-  // `(?:^|[\s}])` still refuses to match `.ask-hello--idle` or a descendant
-  // selector, which is what the original `^` was protecting against.
+  // `(?:^|[\s}])` still refuses to match `.ask-hello--idle`, which is the
+  // mis-match the original `^` was protecting against. It DOES now match a
+  // descendant selector — `.candidate-scope .ask-hello` satisfies the `[\s]`
+  // — which is over-broad in the SAFE direction: every match is concatenated,
+  // so a descendant rule can only ADD declarations the guards then object to,
+  // never hide one. Both halves verified by execution, not assumed.
   const found = [
     ...CSS.matchAll(new RegExp(`(?:^|[\\s}])${escaped}\\s*\\{([^}]*)\\}`, 'gm')),
   ].map((m) => m[1]);
@@ -244,8 +248,10 @@ describe('Ask Hello — the focus indicator survives hover', () => {
     // is (0,3,0) and the Tailwind ring utility is (0,2,0), so without this the
     // hover glow replaces the ring's box-shadow entirely and the indicator
     // disappears for anyone whose pointer rests over a focused button.
-    const hoverSelectors = [...CSS.matchAll(/^(\.ask-hello:hover[^{]*)\{/gm)].map((m) =>
-      m[1].trim(),
+    // BOUNDARY-ANCHORED, for the reason `ruleBodies` is. `^` here meant a
+    // hover rule nested in ANY at-rule was invisible to this guard.
+    const hoverSelectors = [...CSS.matchAll(/(?:^|[\s}])(\.ask-hello:hover[^{]*)\{/g)].map(
+      (m) => m[1].trim(),
     );
     expect(hoverSelectors.length).toBeGreaterThan(0);
     for (const selector of hoverSelectors) {
@@ -261,7 +267,13 @@ describe('Ask Hello — the focus indicator survives hover', () => {
     // `:active` rule (0,3,0) would erase the ring and pass. Any `.ask-hello`
     // rule carrying a state and setting box-shadow has to exclude
     // `:focus-visible`, whatever the state is.
-    const rules = [...CSS.matchAll(/^(\.ask-hello[^{\n]*)\{([^}]*)\}/gm)];
+    // BOUNDARY-ANCHORED. While `ruleBodies` was widened this one was left on
+    // `^`, so defect 3 stayed reachable verbatim through a wrapper:
+    // `@media (min-width: 1px) { .ask-hello[aria-busy='true'] { box-shadow:
+    // none } }` is (0,2,0) at equal specificity and later source order, it
+    // erases the ring, and all sixteen tests here stayed green. Half-widening
+    // a guard is the shape of every repair this file has needed.
+    const rules = [...CSS.matchAll(/(?:^|[\s}])(\.ask-hello[^{\n]*)\{([^}]*)\}/g)];
     for (const [, rawSelector, body] of rules) {
       const selector = rawSelector.trim();
       // `:focus-visible` is EXCLUDED from the stateful set: a rule that styles
