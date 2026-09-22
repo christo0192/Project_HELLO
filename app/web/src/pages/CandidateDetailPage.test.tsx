@@ -297,6 +297,61 @@ describe('CandidateDetailPage', () => {
     expect(words?.textContent).toContain('words spoken');
   });
 
+  it('shows no call badge for a ZERO-length call either', async () => {
+    // `duration_sec: null` was the only case covered, and the `typeof ===
+    // "number"` half of the guard already rejects that — so `callSeconds > 0`
+    // was free. Zero is REACHABLE: `0024_recovery_audit_system_actor.sql`
+    // writes `greatest(0, floor(extract(epoch from (ended_at - started_at))))`.
+    // The badge would read "0m 0s on the call", which the component header
+    // explicitly forbids as a claim that is both precise and wrong.
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 0, candidate_words: 0 }],
+    });
+    renderDetailPage();
+    await screen.findByText(/Profile/);
+    expect(document.querySelector('[data-candidate-call-length]')).toBeNull();
+  });
+
+  it('SHOWS THE RESUME SUMMARY above the numbers, which is where it was asked for', async () => {
+    // The relocated summary had NO test anywhere: deleting the block left 303
+    // tests green, and since the same change removed it from Resume evidence,
+    // deleting it would make the summary vanish from the page entirely — the
+    // one field the owner asked to be promoted.
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: {
+        ...mockCandidateDetail.candidate,
+        parsed: { summary: 'Ten years selling enterprise software in India.' },
+      },
+    });
+    renderDetailPage();
+
+    const summary = await screen.findByText(/Ten years selling enterprise software/);
+    expect(summary).toBeInTheDocument();
+    // ...ABOVE the numbers. "Experience" is the figure it was asked to clear.
+    const experience = screen.getByText('Experience');
+    expect(
+      summary.compareDocumentPosition(experience) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // ...and NOT duplicated further down in Resume evidence.
+    expect(screen.getAllByText(/Ten years selling enterprise software/)).toHaveLength(1);
+  });
+
+  it('LABELS the role pill for a screen reader', async () => {
+    // The other two pills caption themselves ("on the call", "words spoken").
+    // This one is bare text in a coloured capsule, so without the prefix a
+    // screen reader hears "Sales Advisor" with nothing saying what it is.
+    mockApi.listRoles.mockResolvedValue([{ id: 'role-1', title: 'Sales Advisor' }]);
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: { ...mockCandidateDetail.candidate, role_id: 'role-1' },
+    });
+    renderDetailPage();
+    await screen.findByText('Sales Advisor');
+    expect(document.querySelector('[data-candidate-role-title]')?.textContent).toContain('Role:');
+  });
+
   it('does NOT claim a role it could not resolve', async () => {
     // A wrong role on a candidate page is worse than no role.
     mockApi.listRoles.mockResolvedValue([]);

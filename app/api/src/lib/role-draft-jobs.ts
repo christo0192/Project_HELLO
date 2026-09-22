@@ -107,10 +107,24 @@ const draftLogger = createLogger('role-draft');
  * `AllowedMeta` in `logger.ts` is a closed, PII-conscious key set, and the
  * right response to it is to fit the vocabulary rather than widen it for a
  * convenience feature. `error_category` says which write was lost and
- * `error_type` says what kind of failure it was; that is enough to find the
- * problem, and neither can carry a job title someone typed or a provider
- * message that quotes one back.
+ * `error_type` carries the POSTGRES ERROR CODE; neither can carry a job title
+ * someone typed or a provider message that quotes one back.
+ *
+ * THE CODE, not `err.name`. postgrest-js does not construct an `Error` on
+ * this path — `processResponse` assigns the parsed JSON body straight to
+ * `error` — so `err instanceof Error ? err.name : typeof err` evaluated to the
+ * literal string "object" for every database failure this module can have.
+ * The logs named which write was lost and never why. `23502`, `23505`,
+ * `42501` and `PGRST204` are each a different problem with a different fix,
+ * they are what the rest of this file already branches on, and they carry
+ * nothing sensitive.
  */
+function errorCode(err: unknown): string {
+  const code = (err as { code?: unknown } | null)?.code;
+  if (typeof code === 'string' && code) return code;
+  if (err instanceof Error) return err.name;
+  return 'unknown';
+}
 
 /**
  * A dropped heartbeat is not cosmetic: `readRoleDraft` reads its absence as a
@@ -121,7 +135,7 @@ const draftLogger = createLogger('role-draft');
 function onHeartbeatFailure(_id: string, err: unknown): void {
   draftLogger.warn('db_error', {
     error_category: 'role_draft_heartbeat_write',
-    error_type: err instanceof Error ? err.name : typeof err,
+    error_type: errorCode(err),
   });
 }
 
@@ -133,7 +147,7 @@ function onHeartbeatFailure(_id: string, err: unknown): void {
 function onTerminalWriteFailure(_id: string, status: string, err: unknown): void {
   draftLogger.error('db_error', {
     error_category: `role_draft_terminal_write_${status}`,
-    error_type: err instanceof Error ? err.name : typeof err,
+    error_type: errorCode(err),
   });
 }
 
@@ -254,7 +268,7 @@ async function expireStaleRoleDraft(ownerId: string, staleBefore: string): Promi
   if (error) {
     draftLogger.error('db_error', {
       error_category: 'role_draft_expire_stale',
-      error_type: error instanceof Error ? error.name : typeof error,
+      error_type: errorCode(error),
     });
   }
 }
@@ -441,10 +455,26 @@ async function runDraft(id: string, jobRole: string, deps: RoleDraftRunnerDeps):
       .select('id');
     if (writeError) onTerminalWriteFailure(id, 'succeeded', writeError);
     else if (Array.isArray(written) && written.length === 0) {
-      draftLogger.warn('db_error', {
-        error_category: 'role_draft_result_discarded',
-        error_type: 'no_running_row',
-      });
+      // ZERO ROWS HAS TWO CAUSES, and only one is a problem.
+      //
+      // The operator cancelled while the last attempt was finishing — normal,
+      // and discarding the result is the correct response to it. Or the row
+      // was expired out from under a live worker whose heartbeats were being
+      // dropped, in which case ten minutes of paid output has just been thrown
+      // away and nobody would otherwise know. Reading the row is the only way
+      // to tell, and this path is rare enough to afford it.
+      const { data: row } = await supabase
+        .from('role_drafts')
+        .select('status')
+        .eq('id', id)
+        .maybeSingle();
+      const status = (row as { status?: string } | null)?.status;
+      if (status !== 'cancelled') {
+        draftLogger.warn('db_error', {
+          error_category: 'role_draft_result_discarded',
+          error_type: status ?? 'row_missing',
+        });
+      }
     }
   } catch (err) {
     const isDraftError = err instanceof RoleDraftError;

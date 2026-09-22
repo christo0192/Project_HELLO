@@ -318,10 +318,18 @@ describe('AskHelloButton', () => {
     mockApi.getActiveRoleDraft.mockResolvedValue({
       active: { ...running(), id: 'other-role', job_role: 'Sales Advisor' },
     });
-    const { onError } = setup({ jobRole: 'Data Engineer' });
+    const onBusy = vi.fn();
+    const { onError } = setup({ jobRole: 'Data Engineer', onBusy });
 
-    await waitFor(() => expect(onError).toHaveBeenCalled());
-    expect(onError.mock.calls[0][0]).toContain('Sales Advisor');
+    await waitFor(() => expect(onBusy).toHaveBeenCalled());
+    expect(onBusy.mock.calls[0][0]).toContain('Sales Advisor');
+    // INFORMATION, not an error. This fires on mount, so opening any role for
+    // editing while a draft runs used to raise a red alert nobody asked for
+    // and nobody could dismiss.
+    expect(onError).not.toHaveBeenCalled();
+    // ...and it names a recovery that exists. "Open that role" does not, for
+    // a draft of a role that has never been saved.
+    expect(onBusy.mock.calls[0][0]).toContain('blank');
     // Not adopted: no poll, and the button is still pressable.
     expect(mockApi.getRoleDraft).not.toHaveBeenCalled();
     expect(askHello()).not.toHaveAttribute('aria-disabled', 'true');
@@ -432,6 +440,28 @@ describe('AskHelloButton', () => {
     expect(document.activeElement).not.toBe(document.body);
   });
 
+  it('RETURNS FOCUS when the draft SETTLES, not only when Cancel is pressed', async () => {
+    // Half of `returnFocus` was free: the existing test clicks Cancel, so it
+    // exercises `cancel()`. A keyboard user who waits the full ten minutes
+    // with focus resting on Cancel drops to <body> when the draft lands, and
+    // the next Tab restarts from the top of the page.
+    mockApi.getRoleDraft.mockResolvedValue(running());
+    setup();
+    await act(async () => askHello().click());
+    const cancel = await screen.findByRole('button', { name: 'Cancel' });
+    cancel.focus();
+    expect(document.activeElement).toBe(cancel);
+
+    // The job finishes on its own — nobody pressed anything.
+    mockApi.getRoleDraft.mockResolvedValue(succeeded());
+    await poll();
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument(),
+    );
+    expect(document.activeElement).toBe(askHello());
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
   it('does NOT steal focus from elsewhere on the page', async () => {
     // The guard on the other side: focus returns only when it is already
     // inside this component. An operator who tabbed on to the JD field must
@@ -476,6 +506,62 @@ describe('AskHelloButton', () => {
     });
     await poll();
     expect(mockApi.getRoleDraft).not.toHaveBeenCalledWith('from-server');
+  });
+
+  it('HONOURS A CANCEL PRESSED BEFORE THE JOB EXISTS', async () => {
+    // `running` is `starting || jobId !== null`, so Cancel renders the instant
+    // the button is pressed — but there was no job to cancel yet, so the press
+    // recorded nothing, the POST landed, the poll began, and the draft applied
+    // ten minutes later unasked. The start POST is three round trips plus an
+    // awaited audit write, so this window is real.
+    //
+    // It is verbatim the failure this architecture exists to end: the spinner
+    // stopped, the model kept billing.
+    let releaseStart: (v: unknown) => void = () => {};
+    mockApi.startRoleDraft.mockReturnValue(
+      new Promise((resolve) => {
+        releaseStart = resolve;
+      }),
+    );
+    mockApi.getRoleDraft.mockResolvedValue(succeeded());
+    const { onDrafted } = setup();
+
+    await act(async () => askHello().click());
+    const cancel = await screen.findByRole('button', { name: 'Cancel' });
+    await act(async () => cancel.click());
+
+    // The server answers after the operator has already given up.
+    await act(async () => {
+      releaseStart({ ...running(), id: 'too-late' });
+    });
+
+    // The job that now exists is STOPPED, not adopted...
+    await waitFor(() => expect(mockApi.cancelRoleDraft).toHaveBeenCalledWith('too-late'));
+    // ...never polled, and its draft never applied.
+    expect(mockApi.getRoleDraft).not.toHaveBeenCalled();
+    expect(onDrafted).not.toHaveBeenCalled();
+  });
+
+  it('says so when that late cancel fails to reach the server', async () => {
+    let releaseStart: (v: unknown) => void = () => {};
+    mockApi.startRoleDraft.mockReturnValue(
+      new Promise((resolve) => {
+        releaseStart = resolve;
+      }),
+    );
+    mockApi.cancelRoleDraft.mockRejectedValue(new Error('offline'));
+    const { onError } = setup();
+
+    await act(async () => askHello().click());
+    const cancel = await screen.findByRole('button', { name: 'Cancel' });
+    await act(async () => cancel.click());
+    await act(async () => {
+      releaseStart({ ...running(), id: 'too-late' });
+    });
+
+    await waitFor(() =>
+      expect(onError).toHaveBeenCalledWith(expect.stringContaining('may not have stopped')),
+    );
   });
 
   it('keeps the live region MOUNTED while idle', () => {

@@ -486,6 +486,32 @@ describe('generateRoleDraft — which failure the operator is told about', () =>
     expect(err.detail ?? []).not.toContainEqual(expect.stringContaining('502'));
   });
 
+  it('clears the SHAPE failure per attempt too, not just the provider one', async () => {
+    // Both halves of the reset are load-bearing and only one was pinned.
+    // Sequence: attempt 1 cannot be parsed at all, attempts 2 and 3 return
+    // well-formed drafts whose questions the phone gate refuses (the word
+    // "system" in an applicant-tracking question). With `lastShapeFailure`
+    // left set from attempt 1, the operator is told "the response was not
+    // usable" with no detail — instead of being told which questions could
+    // not be phrased, after a ten-minute wait.
+    const unspeakable = goodDraft({
+      screening_template: [
+        q('How do you keep an applicant tracking system current?'),
+        q('What does your current role involve day to day?'),
+        q('What made you look for a new position?'),
+      ],
+    });
+    const infer = vi
+      .fn()
+      .mockRejectedValueOnce(new BusinessError())
+      .mockResolvedValueOnce(unspeakable)
+      .mockResolvedValueOnce(unspeakable);
+
+    const err = await generateRoleDraft('Any', { infer }).catch((e) => e);
+    expect(err.reason).toBe('unspeakable_questions');
+    expect(err.detail?.join(' ')).toContain('applicant tracking system');
+  });
+
   it('still names a provider outage when THAT is what ended it', async () => {
     // The other direction: clearing per attempt must not lose a real outage.
     const infer = vi

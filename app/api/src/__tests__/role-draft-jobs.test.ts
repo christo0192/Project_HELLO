@@ -19,13 +19,15 @@ interface Call {
   op: 'insert' | 'update' | 'select';
   payload?: Record<string, unknown>;
   filters: Array<[string, unknown]>;
+  /** Column lists passed to `.select()` on this call. */
+  selects: string[];
 }
 let calls: Call[] = [];
 /** What the next terminal read resolves to, by op. */
 let selectResult: unknown = null;
 let selectQueue: unknown[] = [];
 let selectError: unknown = null;
-let updateResult: unknown[] = [];
+let updateResult: unknown[] = [{ id: 'draft-1' }];
 let updateError: unknown = null;
 /** Errors the next inserts should fail with, in order. */
 let insertErrors: unknown[] = [];
@@ -66,7 +68,12 @@ function builder(call: Call): any {
       call.filters.push([`${col}<`, val]);
       return self;
     },
-    select() {
+    select(columns?: string) {
+      // RECORDED. `select() { return self; }` discarded the column list on
+      // the UPDATE chain exactly as it used to discard `.order()` on the turn
+      // query — so deleting `.select('id')` from the terminal write, and the
+      // zero-row warning that depends on it, kept 73/73 green.
+      if (columns) call.selects.push(columns);
       return self;
     },
     order() {
@@ -83,22 +90,38 @@ function builder(call: Call): any {
   return self;
 }
 
+/** Every structured log line this module emitted. */
+let logged: Array<{ level: string; event: string; meta: Record<string, unknown> }> = [];
+vi.mock('../lib/logger.js', () => ({
+  createLogger: () => ({
+    debug: (event: string, meta: Record<string, unknown>) =>
+      logged.push({ level: 'debug', event, meta }),
+    info: (event: string, meta: Record<string, unknown>) =>
+      logged.push({ level: 'info', event, meta }),
+    warn: (event: string, meta: Record<string, unknown>) =>
+      logged.push({ level: 'warn', event, meta }),
+    error: (event: string, meta: Record<string, unknown>) =>
+      logged.push({ level: 'error', event, meta }),
+  }),
+}));
+
 vi.mock('../lib/supabase.js', () => ({
   supabase: {
     from(table: string) {
       return {
         insert(payload: Record<string, unknown>) {
-          const call: Call = { table, op: 'insert', payload, filters: [] };
+          const call: Call = { table, op: 'insert', payload, filters: [], selects: [] };
           calls.push(call);
           return builder(call);
         },
         update(payload: Record<string, unknown>) {
-          const call: Call = { table, op: 'update', payload, filters: [] };
+          const call: Call = { table, op: 'update', payload, filters: [], selects: [] };
           calls.push(call);
           return builder(call);
         },
-        select() {
-          const call: Call = { table, op: 'select', filters: [] };
+        select(columns?: string) {
+          const call: Call = { table, op: 'select', filters: [], selects: [] };
+          if (columns) call.selects.push(columns);
           calls.push(call);
           return builder(call);
         },
@@ -160,9 +183,13 @@ beforeEach(() => {
   selectResult = null;
   selectQueue = [];
   selectError = null;
-  updateResult = [];
+  // ONE ROW by default: a fenced update that matched its row. `[]` used to be
+  // the default, which meant the zero-row warning fired on every terminal
+  // write in the suite and nothing noticed.
+  updateResult = [{ id: 'draft-1' }];
   updateError = null;
   insertErrors = [];
+  logged = [];
   // The default for tests that are not about admission: nothing is running,
   // so `startRoleDraft` proceeds to insert.
   noActiveDraft();
@@ -594,7 +621,14 @@ describe('the 23505 branch — where the index and the read disagree', () => {
     expect(expiry?.filters).toContainEqual(['status', 'running']);
     // Fenced on the heartbeat too: a worker that wakes between the read and
     // this write must not have its live job killed.
-    expect(expiry?.filters.some(([k]) => k === 'updated_at<')).toBe(true);
+    // THE CUT-OFF VALUE, not merely the presence of a cut-off. Asserting only
+    // that `updated_at<` appears left the comparand free: replacing
+    // `now() - ROLE_DRAFT_STALE_MS` with `now()` makes the expiry match ANY
+    // running row, so a concurrent start can kill a live generation whose
+    // heartbeats were merely being dropped — and its finished draft then
+    // lands on the discarded branch. The fence is the whole protection.
+    const cutoff = expiry?.filters.find(([k]) => k === 'updated_at<')?.[1];
+    expect(Date.parse(String(cutoff))).toBe(NOW - ROLE_DRAFT_STALE_MS);
     await settle();
   });
 
@@ -768,6 +802,98 @@ describe('readRoleDraft', () => {
     };
     const job = await readRoleDraft(OWNER, 'draft-1', { now: () => now });
     expect(job?.repaired).toEqual([]);
+  });
+});
+
+describe('the writes that can be lost silently', () => {
+  // Both of these were added to make a silent loss visible, and both could be
+  // deleted with the suite green — the stub discarded the column list, and
+  // `updateResult` defaulted to `[]` so the warning fired on every write in
+  // the file and nothing noticed. The observability was itself unobserved.
+
+  it('SELECTS on the terminal write, so zero rows is detectable at all', async () => {
+    const run = vi.fn().mockResolvedValue({ draft: DRAFT, attempts: 1, repaired: [] });
+    await startRoleDraft(OWNER, 'Sales Advisor', { run: run as never });
+    await settle();
+    expect(finalWrite()?.selects).toContain('id');
+  });
+
+  it('LOOKS UP THE STATUS when the terminal write matched nothing', async () => {
+    // Zero rows has two causes and only one is a problem: the operator
+    // cancelled (normal), or a live worker's row was expired out from under
+    // it and ten minutes of paid output just vanished. Reading the row is the
+    // only way to tell them apart.
+    updateResult = [];
+    selectQueue = [[], { status: 'cancelled' }];
+    const run = vi.fn().mockResolvedValue({ draft: DRAFT, attempts: 1, repaired: [] });
+    await startRoleDraft(OWNER, 'Sales Advisor', { run: run as never });
+    await settle();
+    // The classification read happened, scoped to this draft.
+    const classify = calls.filter((c) => c.op === 'select').at(-1);
+    expect(classify?.selects).toContain('status');
+    expect(classify?.filters).toContainEqual(['id', 'draft-1']);
+  });
+
+  it('LOGS a failed expiry — the one failure that reinstates the lockout', async () => {
+    // If the expiry is a no-op the retry insert conflicts again and the
+    // operator gets "Internal server error" on every press, with nothing
+    // naming the expiry as the cause. This was the only write in the module
+    // whose error was discarded.
+    const now = Date.parse('2026-09-22T10:00:00Z');
+    selectQueue = [
+      [],
+      [
+        {
+          id: 'stale-1',
+          owner_id: OWNER,
+          job_role: 'Sales Advisor',
+          status: 'running',
+          phase: null,
+          draft: null,
+          attempts: 1,
+          repaired: [],
+          error_reason: null,
+          error_message: null,
+          cancelled_at: null,
+          updated_at: new Date(now - ROLE_DRAFT_STALE_MS - 1).toISOString(),
+        },
+      ],
+    ];
+    insertErrors = [{ code: '23505', message: 'duplicate key' }];
+    updateError = new Error('permission denied');
+
+    await startRoleDraft(OWNER, 'Sales Advisor', { run: vi.fn() as never, now: () => now });
+    await settle();
+
+    // The expiry was issued with its fences...
+    const expiry = calls.find(
+      (c) => c.op === 'update' && c.payload?.error_reason === 'abandoned',
+    );
+    expect(expiry).toBeDefined();
+    expect(expiry?.filters.some(([k]) => k === 'updated_at<')).toBe(true);
+    // ...and its failure was reported rather than discarded.
+    expect(
+      logged.some(
+        (l) => l.level === 'error' && l.meta.error_category === 'role_draft_expire_stale',
+      ),
+    ).toBe(true);
+  });
+
+  it('logs the POSTGRES CODE, not the literal string "object"', async () => {
+    // postgrest-js assigns the parsed JSON body straight to `error` and never
+    // constructs an Error on this path, so `err instanceof Error ? err.name :
+    // typeof err` evaluated to "object" for every database failure this
+    // module can have — naming which write was lost and never why. 23502,
+    // 23505, 42501 and PGRST204 are four different problems.
+    updateError = { code: '42501', message: 'permission denied' };
+    const run = vi.fn(async (_role: string, opts: any) => {
+      opts.onProgress({ phase: 'drafting', attempt: 1, maxAttempts: 3 });
+      return { draft: DRAFT, attempts: 1, repaired: [] };
+    });
+    await startRoleDraft(OWNER, 'Sales Advisor', { run: run as never });
+    await settle();
+    expect(logged.some((l) => l.meta.error_type === '42501')).toBe(true);
+    expect(logged.some((l) => l.meta.error_type === 'object')).toBe(false);
   });
 });
 

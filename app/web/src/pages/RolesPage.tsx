@@ -408,6 +408,11 @@ function RoleForm({
           // A reload leaves this field blank while a draft is still running.
           // Filling it from the adopted job makes the screen true: the button
           // says "Asking Hello…" and the field says what Hello is drafting.
+          // Information, not an error: nothing the operator did was wrong.
+          onBusy={(message) => {
+            setDraftNote(message);
+            setDraftError(null);
+          }}
           onResumed={(resumedRole) => {
             setTitle((current) => (current.trim() ? current : resumedRole));
             setDraftNote(`Picked up the draft already running for "${resumedRole}".`);
