@@ -367,8 +367,11 @@ body .text-red-700 { color: var(--error-text); }
 
    First failure: white semibold on the old teal (#398AA2) was 3.94:1 — under
    the 4.5:1 this text size needs — and the sheen sweeping over it dropped that
-   to 2.55:1. The label was legible, then wasn't, then was, twenty times a
-   minute: a contrast failure that ANIMATES, which reads as a rendering glitch.
+   to 2.55:1 AT THE SHEEN ALPHA IN FORCE THEN, which was 0.28. (At today's
+   0.14 the same stop computes to 3.17:1; quoting the figure without the alpha
+   made it look wrong when re-derived against the current value.) The label was
+   legible, then wasn't, then was, twenty times a minute: a contrast failure
+   that ANIMATES, which reads as a rendering glitch.
 
    Second failure, and the instructive one: the stops below were re-measured
    and pass, but the BUTTON carried `opacity-60` while idle or running. CSS
@@ -387,8 +390,10 @@ body .text-red-700 { color: var(--error-text); }
    measured fill (below) that leaves the label at full strength.
 
    Sampled every 5% along all three ramps, the worst point anywhere on the
-   running button is 5.02:1 under the sheen (at #2d5e74). The sheen's 0.14
-   alpha is what keeps that above 4.5:1 rather than merely above 3:1.
+   running button is 5.02:1 under the sheen — at #2d5e74, the sampled point
+   nearest the true minimum, which is the #2b5f72 stop itself at 5.03:1. The
+   sheen's 0.14 alpha is what keeps that above 4.5:1 rather than merely above
+   3:1.
 
    Two layers: a slow hue drift so the button is never flat, and a faster
    sheen. The sheen is its own layer rather than a background-position trick on

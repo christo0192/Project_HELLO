@@ -9,7 +9,7 @@
  *   - Keyboard and focus management
  */
 
-import { render, screen } from '@testing-library/react';
+import { render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { RolesPage } from './RolesPage';
@@ -19,6 +19,19 @@ const mockApi = {
   listRoles: vi.fn(),
   createRole: vi.fn(),
   updateRole: vi.fn(),
+  // The EDIT path mounts RoleScorecardEditor and AskHelloButton, which call
+  // these on mount. A partial adapter here does not fail loudly — it throws
+  // inside an effect, which React escalates into unmounting the page, and an
+  // absent method reads as "this feature is off" rather than as a broken
+  // mock. That is exactly how a dead endpoint survived a green suite earlier
+  // in this branch, so every method the page can reach is stubbed.
+  getRoleScorecard: vi.fn(),
+  listScorecardMetrics: vi.fn(),
+  putRoleScorecard: vi.fn(),
+  getActiveRoleDraft: vi.fn(),
+  startRoleDraft: vi.fn(),
+  getRoleDraft: vi.fn(),
+  cancelRoleDraft: vi.fn(),
 };
 
 vi.mock('../api', () => ({
@@ -26,6 +39,13 @@ vi.mock('../api', () => ({
     listRoles: (...args: any[]) => mockApi.listRoles(...args),
     createRole: (...args: any[]) => mockApi.createRole(...args),
     updateRole: (...args: any[]) => mockApi.updateRole(...args),
+    getRoleScorecard: (...args: any[]) => mockApi.getRoleScorecard(...args),
+    listScorecardMetrics: (...args: any[]) => mockApi.listScorecardMetrics(...args),
+    putRoleScorecard: (...args: any[]) => mockApi.putRoleScorecard(...args),
+    getActiveRoleDraft: (...args: any[]) => mockApi.getActiveRoleDraft(...args),
+    startRoleDraft: (...args: any[]) => mockApi.startRoleDraft(...args),
+    getRoleDraft: (...args: any[]) => mockApi.getRoleDraft(...args),
+    cancelRoleDraft: (...args: any[]) => mockApi.cancelRoleDraft(...args),
   },
   ApiError: class extends Error {
     status: number;
@@ -39,6 +59,11 @@ vi.mock('../api', () => ({
 describe('RolesPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    // Sensible defaults for everything the form mounts, so a test that is
+    // about saving does not have to know what else is on the page.
+    mockApi.getRoleScorecard.mockResolvedValue({ scorecard: { metrics: [] } });
+    mockApi.listScorecardMetrics.mockResolvedValue([]);
+    mockApi.getActiveRoleDraft.mockResolvedValue({ active: null });
   });
 
   it('shows loading state initially', () => {
@@ -148,6 +173,64 @@ describe('RolesPage', () => {
     expect(mockApi.createRole).toHaveBeenCalledWith(
       expect.objectContaining({ title: 'Engineer' }),
     );
+  });
+
+  it('OMITS agent_name entirely when the box was never touched', async () => {
+    // The deploy-order guard, and the thing it protects.
+    //
+    // `roles.agent_name` arrives in migration 0100, and the web app ships
+    // independently of `supabase db push`. Until the migration lands,
+    // PostgREST rejects the unknown column (PGRST204) and the route 500s — so
+    // sending the key on every save would break ALL role creation, including
+    // for the roles that never wanted an agent name, which is every existing
+    // one. The ordinary save must carry no such key at all.
+    mockApi.listRoles.mockResolvedValue([]);
+    mockApi.createRole.mockResolvedValue({ id: 'new-id-omit' });
+    render(<RolesPage />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: 'New role' }));
+
+    await user.type(screen.getByLabelText('Job role'), 'Engineer');
+    await user.click(screen.getByRole('button', { name: 'Create role' }));
+
+    await waitFor(() => expect(mockApi.createRole).toHaveBeenCalled());
+    const body = mockApi.createRole.mock.calls[0][0];
+    expect('agent_name' in body).toBe(false);
+  });
+
+  it('SENDS agent_name when the operator actually typed one', async () => {
+    // The other half: the guard must not swallow a real value.
+    mockApi.listRoles.mockResolvedValue([]);
+    mockApi.createRole.mockResolvedValue({ id: 'new-id-send' });
+    render(<RolesPage />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: 'New role' }));
+
+    await user.type(screen.getByLabelText('Agent'), 'Gopu');
+    await user.type(screen.getByLabelText('Job role'), 'Engineer');
+    await user.click(screen.getByRole('button', { name: 'Create role' }));
+
+    await waitFor(() => expect(mockApi.createRole).toHaveBeenCalled());
+    expect(mockApi.createRole.mock.calls[0][0].agent_name).toBe('Gopu');
+  });
+
+  it('SENDS an explicit null to CLEAR a name the role already had', async () => {
+    // Blanking a field that has a value is a real edit, not an absence, and
+    // must reach the server as one. This save does need 0100 — but it is the
+    // rare case, not every save.
+    mockApi.listRoles.mockResolvedValue([{ ...mockRole, agent_name: 'Gopu' }]);
+    mockApi.updateRole.mockResolvedValue({ ...mockRole, agent_name: null });
+    render(<RolesPage />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: 'Edit' }));
+
+    await user.clear(screen.getByLabelText('Agent'));
+    await user.click(screen.getByRole('button', { name: 'Save changes' }));
+
+    await waitFor(() => expect(mockApi.updateRole).toHaveBeenCalled());
+    const body = mockApi.updateRole.mock.calls[0][1];
+    expect('agent_name' in body).toBe(true);
+    expect(body.agent_name).toBeNull();
   });
 
   it('new role form validates required job role', async () => {

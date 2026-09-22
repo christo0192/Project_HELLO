@@ -256,9 +256,15 @@ describe('startRoleDraft', () => {
   });
 
   it('SURVIVES a generator that throws SYNCHRONOUSLY', async () => {
-    // Fire-and-forget without a guard is an unhandled rejection, and an
-    // unhandled rejection in Node 22 kills the process — this API also serves
-    // live calls, so that would drop screenings in progress.
+    // What this actually covers: `runDraft`'s own try/catch turns the throw
+    // into a `failed` row instead of a rejected promise.
+    //
+    // It does NOT cover the `.catch(() => {})` on the fire-and-forget call,
+    // which only fires if the TERMINAL WRITE itself rejects — and the stub
+    // here resolves every write. That guard is defence-in-depth against an
+    // unhandled rejection, which in Node 22 kills the process and would drop
+    // live screenings with it; a review confirmed removing it keeps this
+    // suite green. Said plainly rather than left implied by the test name.
     const run = vi.fn(() => {
       throw new Error('boom');
     });

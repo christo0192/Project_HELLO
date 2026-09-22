@@ -17,8 +17,10 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   generateRoleDraft,
+  roleDraftTimeoutMs,
   RoleDraftError,
   ROLE_DRAFT_MAX_ATTEMPTS,
+  ROLE_DRAFT_MIN_TIMEOUT_MS,
   ROLE_DRAFT_QUESTION_COUNT,
 } from '../lib/role-authoring.js';
 import { validatePhoneQuestion } from '../lib/phone-screening/question-validation.js';
@@ -312,6 +314,96 @@ describe('generateRoleDraft — provider failures', () => {
       detail: [expect.stringContaining('504')],
     });
     expect(infer).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe('generateRoleDraft — cancellation actually stops the spending', () => {
+  // THE LINK NOBODY TESTED. `cancelRoleDraft` writing `cancelled_at` was
+  // covered, and `runDraft` handing down a `shouldCancel` that reads it was
+  // covered — and a review then deleted the three lines in THIS function that
+  // call it, and all 97 role-drafting tests stayed green. The two links either
+  // side of the broken one were tested; the chain was not.
+  //
+  // With the check gone, Cancel stops the spinner while the remaining v4-pro
+  // attempts run to completion. That is the exact behaviour an earlier round
+  // blocked on, and the headline claim of the whole redesign.
+
+  it('DOES NOT CALL THE MODEL AT ALL when cancelled before the first attempt', async () => {
+    const infer = vi.fn();
+    const shouldCancel = vi.fn().mockResolvedValue(true);
+    await expect(generateRoleDraft('Any', { infer, shouldCancel })).rejects.toMatchObject({
+      reason: 'cancelled',
+    });
+    expect(shouldCancel).toHaveBeenCalled();
+    // The money, in one assertion.
+    expect(infer).not.toHaveBeenCalled();
+  });
+
+  it('STOPS BETWEEN ATTEMPTS once cancelled mid-run', async () => {
+    // The realistic case: the operator presses Cancel while attempt 1 is in
+    // flight. The attempt it is already paying for finishes; the next one
+    // never starts.
+    const infer = vi.fn().mockResolvedValue('not usable at all');
+    const shouldCancel = vi
+      .fn()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValue(true);
+
+    await expect(generateRoleDraft('Any', { infer, shouldCancel })).rejects.toMatchObject({
+      reason: 'cancelled',
+    });
+    // One attempt spent, two saved — not the full budget.
+    expect(infer).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports how much budget the cancellation saved', async () => {
+    const infer = vi.fn().mockResolvedValue('not usable at all');
+    const shouldCancel = vi.fn().mockResolvedValueOnce(false).mockResolvedValue(true);
+    const err = await generateRoleDraft('Any', { infer, shouldCancel }).catch((e) => e);
+    expect(err.attempts).toBe(1);
+  });
+
+  it('runs normally while NOT cancelled', async () => {
+    // The negative twin. A `shouldCancel` wired to always answer true would
+    // satisfy the tests above and stop every draft on its first attempt.
+    const infer = vi.fn().mockResolvedValue(goodDraft());
+    const shouldCancel = vi.fn().mockResolvedValue(false);
+    const { draft } = await generateRoleDraft('Any', { infer, shouldCancel });
+    expect(draft.screening_template).toHaveLength(3);
+    expect(infer).toHaveBeenCalledTimes(1);
+  });
+
+  it('works with no shouldCancel supplied at all', async () => {
+    const infer = vi.fn().mockResolvedValue(goodDraft());
+    await expect(generateRoleDraft('Any', { infer })).resolves.toBeTruthy();
+  });
+});
+
+describe('roleDraftTimeoutMs — the floor under a shared budget', () => {
+  // Extracted from the default `infer` closure precisely so it can be
+  // asserted. Inline, it was unreachable: every test injects `deps.infer`, so
+  // a review lowered the floor to 1000ms with the entire API suite green.
+
+  it('RAISES a budget that is too small for one v4-pro call', async () => {
+    // `DEEPSEEK_TIMEOUT_MS` defaults to 120000 and fly.toml checks in 120000,
+    // against 133-206s measured on 2026-09-17. Unfloored, every attempt times
+    // out and the feature fails 100% of the time wherever the Fly secret is
+    // not set.
+    expect(roleDraftTimeoutMs(120_000)).toBe(240_000);
+    expect(roleDraftTimeoutMs(1_000)).toBe(240_000);
+  });
+
+  it('LEAVES a larger configured budget alone — it is a floor, not a cap', async () => {
+    expect(roleDraftTimeoutMs(270_000)).toBe(270_000);
+    expect(roleDraftTimeoutMs(300_000)).toBe(300_000);
+  });
+
+  it('pins the floor itself at 240s', async () => {
+    // A literal against a literal, deliberately: asserting the constant
+    // against itself would pass at any value. 240s clears the slowest call
+    // measured (206s) with room, and sits inside the 300000 ceiling
+    // `DEEPSEEK_TIMEOUT_MS` is validated to.
+    expect(ROLE_DRAFT_MIN_TIMEOUT_MS).toBe(240_000);
   });
 });
 

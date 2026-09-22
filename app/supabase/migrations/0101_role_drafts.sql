@@ -92,8 +92,17 @@ create table if not exists screening_v2.role_drafts (
 -- button can be pressed.
 create index if not exists idx_role_drafts_owner_recent
   on screening_v2.role_drafts (owner_id, created_at desc);
-create index if not exists idx_role_drafts_owner_running
-  on screening_v2.role_drafts (owner_id, updated_at desc) where status = 'running';
+-- UNIQUE, not just an index. The admission check in `startRoleDraft` is a
+-- SELECT followed by an INSERT, and that pair does not exclude a concurrent
+-- one: two tabs posting at the same moment both see no live row and both
+-- insert, detaching two chains of up to six v4-pro calls into the process
+-- that also serves live-call operations. The comment above names that exact
+-- threat; a plain index does not answer it. The database does.
+--
+-- Partial on `status = 'running'`, so a settled or cancelled row never blocks
+-- the next draft — only a live one does, which is the rule being enforced.
+create unique index if not exists uq_role_drafts_owner_running
+  on screening_v2.role_drafts (owner_id) where status = 'running';
 
 alter table screening_v2.role_drafts enable row level security;
 revoke all on screening_v2.role_drafts from anon, authenticated, public;

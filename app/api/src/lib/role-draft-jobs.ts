@@ -217,7 +217,18 @@ export async function startRoleDraft(
     .insert({ owner_id: ownerId, job_role: jobRole, status: 'running' })
     .select()
     .single();
-  if (error) throw error;
+  if (error) {
+    // LOST THE RACE, NOT A FAILURE. `uq_role_drafts_owner_running` (0101) is
+    // what actually enforces one live job per owner — the SELECT above cannot,
+    // because a concurrent request sees the same empty result. A 23505 here
+    // means the other request won by microseconds, so the right answer is the
+    // job that now exists, exactly as if this call had arrived second.
+    if ((error as { code?: string }).code === '23505') {
+      const winner = await readActiveRoleDraft(ownerId, deps);
+      if (winner) return winner;
+    }
+    throw error;
+  }
 
   const row = data as Row;
   // Fire and forget, with every failure funnelled into the row.

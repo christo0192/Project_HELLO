@@ -82,6 +82,20 @@ function generatedQuestionIssue(text: string): string | null {
  */
 export const ROLE_DRAFT_MIN_TIMEOUT_MS = 240_000;
 
+/**
+ * The per-call budget this generator will actually use.
+ *
+ * A FUNCTION rather than an inline `Math.max`, so it can be tested. As an
+ * expression buried in the default `infer` closure it was unreachable from
+ * any test — every test injects `deps.infer` — and a review confirmed the
+ * floor could be lowered to 1000ms with the whole suite green. The floor is
+ * the only thing standing between a machine without the Fly secret and a
+ * feature that fails 100% of the time, so it is worth being able to assert.
+ */
+export function roleDraftTimeoutMs(configuredMs: number): number {
+  return Math.max(configuredMs, ROLE_DRAFT_MIN_TIMEOUT_MS);
+}
+
 export const ROLE_DRAFT_MAX_ATTEMPTS = 3;
 /** How many questions a draft aims for. */
 export const ROLE_DRAFT_QUESTION_COUNT = 6;
@@ -347,7 +361,7 @@ export async function generateRoleDraft(
         // for parsing would silently kill role drafting. The dedicated
         // `DEEPSEEK_SCORING_TIMEOUT_MS` lives in PR #300, deliberately
         // unmerged; until it lands, this call states its own minimum.
-        timeoutMs: Math.max(env.deepseekTimeoutMs, ROLE_DRAFT_MIN_TIMEOUT_MS),
+        timeoutMs: roleDraftTimeoutMs(env.deepseekTimeoutMs),
       });
       return data;
     });

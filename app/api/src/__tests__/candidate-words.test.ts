@@ -51,6 +51,8 @@ interface Scenario {
 let scenario: Scenario;
 /** Every `.range(from, to)` the turn query asked for. */
 let ranges: Array<[number, number]>;
+/** The columns the turn query ordered by, in order. */
+let orders: string[];
 /**
  * OUTSIDE `chain`, deliberately. The route calls `supabase.from(...)` fresh on
  * every pass of the pagination loop, so a counter living inside the builder
@@ -66,7 +68,13 @@ function chain(table: string): any {
     select: () => self,
     eq: () => self,
     in: () => self,
-    order: () => self,
+    order(col: string) {
+      // RECORDED, not discarded. The comment on the query justifies these two
+      // `.order()` calls as what makes range pagination a TOTAL order — and
+      // with the stub swallowing them, deleting both left this suite green.
+      if (isTurns) orders.push(col);
+      return self;
+    },
     single: () => Promise.resolve({ data: null, error: null }),
     maybeSingle: () =>
       Promise.resolve({
@@ -115,6 +123,7 @@ const get = () => request(app()).get(`/api/candidates/${CANDIDATE}`).set(AUTH);
 
 beforeEach(() => {
   ranges = [];
+  orders = [];
   turnPage = 0;
   scenario = { sessions: [{ id: S1, duration_sec: 434 }], turnPages: [[]] };
   vi.mocked(supabase.from).mockImplementation((t: string) => chain(t) as never);
@@ -195,6 +204,17 @@ describe('candidate_words', () => {
     expect(to - from + 1).toBeLessThan(1000);
     expect(ranges[1][0]).toBe(to + 1);
     expect(res.body.sessions[0].candidate_words).toBe(502);
+  });
+
+  it('ORDERS BY A TOTAL KEY, which is what makes the paging safe', async () => {
+    // Range pagination over a non-total order can skip or repeat rows across
+    // a page boundary. `(session_id, turn_index)` is unique, so ordering by
+    // both makes the sequence deterministic. Asserted because the stub used
+    // to swallow `.order()` entirely, and deleting both calls kept this file
+    // green while the comment above the query claimed they were load-bearing.
+    scenario.turnPages = [[turn(S1, 'candidate', 'one')]];
+    await get();
+    expect(orders).toEqual(['session_id', 'turn_index']);
   });
 
   it('ignores empty and whitespace-only turns', async () => {
