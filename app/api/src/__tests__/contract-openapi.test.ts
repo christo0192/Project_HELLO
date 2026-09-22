@@ -1104,7 +1104,12 @@ describe('OpenAPI document integrity', () => {
     // same implementation at a lower privilege with the per-day latency
     // percentiles stripped. Its response body is INLINE (opaque object), like
     // its admin twin, so the schema count below is unchanged. 131 + 1 = 132.
-    expect(Object.keys(paths).length).toBe(132);
+    // "Ask Hello" adds ONE path, POST /api/roles/draft, which drafts a role's
+    // JD, skills and questions from its job title. It streams NDJSON rather
+    // than returning a JSON body, so it carries no response schema and the
+    // schema count below is unchanged. It WRITES NOTHING — the draft goes to
+    // a human, and the existing role save path re-validates it. 132 + 1 = 133.
+    expect(Object.keys(paths).length).toBe(133);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
