@@ -110,9 +110,18 @@ describe('RolesPage', () => {
     const titleInput = screen.getByLabelText('Job role');
     expect(document.activeElement).toBe(titleInput);
 
-    // Ask Hello sits between them but is DISABLED with no job role to draft
-    // from, so it is not a tab stop — the form skips straight past it.
-    expect(screen.getByRole('button', { name: /Ask Hello/ })).toBeDisabled();
+    // Ask Hello sits between them and IS a tab stop, even with nothing to
+    // draft from. That is deliberate. It is `aria-disabled`, not `disabled`:
+    // a truly disabled button loses focus the instant it is pressed by
+    // keyboard, dropping the user to <body> at exactly the moment Cancel
+    // appears beside it. It announces itself as disabled and its handler
+    // refuses; the price is that keyboard users tab THROUGH it, which is the
+    // correct trade and is asserted here so nobody "fixes" it back.
+    await user.tab();
+    const askHello = screen.getByRole('button', { name: /Ask Hello/ });
+    expect(document.activeElement).toBe(askHello);
+    expect(askHello).toHaveAttribute('aria-disabled', 'true');
+    expect(askHello).not.toBeDisabled();
 
     // Tab to Job description
     await user.tab();

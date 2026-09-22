@@ -110,8 +110,14 @@ export function CandidateDetailPage() {
       setRoleTitle(null);
       return;
     }
-    api
-      .listRoles()
+    // GUARDED THE SAME WAY `getMe` is, twenty lines up, and for the same
+    // reason: embedded candidate surfaces supply a host adapter with only the
+    // endpoints they need, and `listRoles` is not one of them. Calling a
+    // method that is not there throws inside an effect, which React escalates
+    // into unmounting the whole page — so a missing OPTIONAL lookup would take
+    // out the transcript, the scorecard and the appeal controls with it.
+    Promise.resolve()
+      .then(() => (typeof api.listRoles === "function" ? api.listRoles() : []))
       .then((roles) => {
         if (!live) return;
         setRoleTitle(roles.find((r) => r.id === roleId)?.title ?? null);
