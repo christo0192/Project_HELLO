@@ -17,11 +17,13 @@ import { MemoryRouter } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { CandidatesPage } from './CandidatesPage';
 import { mockCandidate, mockRole } from '../test/helpers';
+import { EMPTY_FUNNEL_TOTALS } from '../test/funnel';
 
 const mockApi = {
   listRoles: vi.fn(),
   listCandidates: vi.fn(),
   uploadResume: vi.fn(),
+  getScreeningFunnel: vi.fn(),
 };
 
 vi.mock('../api', () => ({
@@ -29,6 +31,7 @@ vi.mock('../api', () => ({
     listRoles: (...args: any[]) => mockApi.listRoles(...args),
     listCandidates: (...args: any[]) => mockApi.listCandidates(...args),
     uploadResume: (...args: any[]) => mockApi.uploadResume(...args),
+    getScreeningFunnel: (...args: any[]) => mockApi.getScreeningFunnel(...args),
     startLiveKitScreening: vi.fn().mockRejectedValue(new Error('mock')),
   },
   ApiError: class extends Error {
@@ -115,6 +118,9 @@ describe('CandidatesPage — imported shell', () => {
     vi.clearAllMocks();
     mockApi.listRoles.mockResolvedValue([mockRole]);
     mockApi.listCandidates.mockResolvedValue(ALL);
+    // The per-role pipeline chart fans out one funnel call per role on mount;
+    // zeroed totals render nothing, so nothing else here moves.
+    mockApi.getScreeningFunnel.mockResolvedValue({ totals: EMPTY_FUNNEL_TOTALS });
   });
 
   it('renders the shell as a keyboard-reachable link with the exact neutral copy', async () => {

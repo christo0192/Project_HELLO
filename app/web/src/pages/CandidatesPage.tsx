@@ -14,14 +14,20 @@
  * fabricated identity, and carries the sanitized `resume_review` badge that
  * says how far its resume got — and nothing more.
  *
- * Surfaces: one glass panel per logical block — the upload form, the filter
- * bar, the table — floating on the shell ground. The list is paginated at ten
+ * Surfaces: one glass panel per logical block — the upload form (a disclosure,
+ * CLOSED by default since candidates arrive from Ashby rather than by hand),
+ * the per-role pipeline chart, the filter bar, the table — floating on the
+ * shell ground. In the filter bar THE BAR IS THE FILTER: its legend entries
+ * are the toggles, so there is one surface carrying both the figures and the
+ * controls rather than a chart stacked on top of a chip row saying the same
+ * numbers. The list is paginated at ten
  * rows so it never runs off the page, and the filter contract
  * (`parseCandidateFilters` / `buildCandidateSearch` / `matchesCandidateFilters`)
  * is untouched: the chips, the counts and "Clear all" drive the same URL.
  */
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
+import type { RefObject } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import type { Candidate, Role } from "../types";
@@ -46,7 +52,12 @@ import {
   Tr,
   usePagination,
 } from "../components/design";
-import { CandidateHeader, CandidateShell } from "../components/talent";
+import {
+  CandidateHeader,
+  CandidateShell,
+  PipelineBar,
+  RolePipelinePanel,
+} from "../components/talent";
 import {
   buildCandidateSearch,
   candidateNextAction,
@@ -65,6 +76,7 @@ import {
   RESUME_REVIEW_ORDER,
 } from "../components/talent";
 import type { StatusTone } from "../components/design/StatusBadge";
+import type { PipelineTone } from "../components/talent";
 
 /**
  * Filter pill. Multi-select toggles, so these stay `button`s carrying
@@ -92,10 +104,71 @@ const RECOMMENDATION_TONE: Record<string, StatusTone> = {
   reject: "danger",
 };
 
-// Statuses offered as quick toggles (consent_declined stays URL-only/terminal).
-const FILTERABLE_STATUSES = CANDIDATE_STATUS_ORDER.filter(
-  (s) => s !== "consent_declined",
-);
+/**
+ * Bar colour per status. Deliberately NOT the `StatusBadge` tone map: a badge
+ * colours one candidate's state, while a stack has to stay legible as six
+ * adjacent fills.
+ *
+ * Adjacent statuses must not share a tone. `new`+`queued` both neutral, and
+ * `screened`+`advanced` both positive, rendered as single indistinguishable
+ * runs — and since the swatch colour is the only thing linking legend to bar,
+ * no sighted user could tell which part was which. Colour vision is not the
+ * issue; injectivity is.
+ */
+const STATUS_BAR_TONE: Record<string, PipelineTone> = {
+  new: "neutral",
+  queued: "caution",
+  screening: "accent",
+  screened: "positive",
+  advanced: "positive",
+  rejected: "negative",
+  consent_declined: "negative",
+};
+
+const RECOMMENDATION_BAR_TONE: Record<string, PipelineTone> = {
+  advance: "positive",
+  hold: "caution",
+  reject: "negative",
+};
+
+/**
+ * The role a candidate's row belongs to.
+ *
+ * ONE role per row, because that is what the row IS: `candidates.role_id` is a
+ * single FK and a row is one Ashby APPLICATION, so a person who applied to two
+ * roles is two rows carrying one role each. Rendering a list here would imply
+ * a many-to-many the data cannot express, and would make the row's
+ * "Review & decide" ambiguous about which application it decides.
+ *
+ * Three distinct states, deliberately not collapsed into one:
+ *   - no role on the candidate          → "No role"
+ *   - roles not fetched yet, or failed  → "—"   (we do not know)
+ *   - fetched, and the id is absent     → "Unknown role" (deleted/out of scope)
+ * The middle case used to render as "Unknown role" for EVERY row whenever the
+ * candidates request won its race with the roles request — a confident claim
+ * that every candidate's role had been deleted.
+ */
+function RoleCell({
+  roleId,
+  title,
+  rolesLoaded,
+}: {
+  roleId: string | null;
+  title: string | undefined;
+  rolesLoaded: boolean;
+}) {
+  if (!roleId) {
+    return <span className="text-[var(--c-ink-secondary)]">No role</span>;
+  }
+  if (title) {
+    // No `data-` attribute carrying the raw uuid: it would confirm the id of a
+    // role the viewer may have no scope to see.
+    return <span className="text-[13px] text-[var(--c-ink)]">{title}</span>;
+  }
+  return (
+    <span className="text-[var(--c-ink-secondary)]">{rolesLoaded ? "Unknown role" : "—"}</span>
+  );
+}
 
 export function CandidatesPage() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -109,12 +182,45 @@ export function CandidatesPage() {
 
   const uploadPanelId = useId();
   /**
-   * Open by default. The panel is a disclosure — the header button owns its
-   * `aria-expanded` — but the upload form is the way a recruiter puts a
-   * candidate into an empty workspace, and the empty state points at it
-   * ("Upload a resume above"), so it may not start hidden.
+   * CLOSED by default (owner request 2026-09-22). Uploading a resume by hand
+   * is the rare path — candidates arrive from Ashby — and an always-open form
+   * pushed the pipeline itself below the fold, which is the thing a recruiter
+   * opens this page to read.
+   *
+   * It stays a real disclosure: the header button owns `aria-expanded`, and
+   * the empty state's "Upload a resume" is a button that OPENS the panel
+   * rather than prose pointing at a form that is not on screen.
    */
-  const [uploadOpen, setUploadOpen] = useState(true);
+  const [uploadOpen, setUploadOpen] = useState(false);
+  const uploadPanelRef = useRef<HTMLElement | null>(null);
+  /**
+   * Focus is moved ONLY for the far-away trigger.
+   *
+   * The empty state's button sits below the whole filter bar while the panel
+   * is mounted near the top, so opening from there without moving focus leaves
+   * a keyboard user shift-tabbing backwards past a dozen controls. The HEADER
+   * button sits directly above the panel, where APG is explicit that a
+   * disclosure should NOT move focus — doing so makes collapsing it again
+   * require tabbing back.
+   */
+  const [focusPanelOnOpen, setFocusPanelOnOpen] = useState(false);
+  const openUpload = useCallback((moveFocus: boolean) => {
+    setFocusPanelOnOpen(moveFocus);
+    setUploadOpen((open) => !open);
+  }, []);
+  /**
+   * An EFFECT, not a `requestAnimationFrame` inside the state updater.
+   *
+   * Updaters must be pure: React invokes them during render, replays them on
+   * rebase, and double-invokes them under StrictMode — each pass scheduling
+   * another frame that yanks focus back. rAF also fires BEFORE paint, so if
+   * the commit landed a frame later it focused a still-`hidden` element and
+   * silently did nothing. Effects run after commit, so the panel is visible
+   * and focusable by definition.
+   */
+  useEffect(() => {
+    if (uploadOpen && focusPanelOnOpen) uploadPanelRef.current?.focus();
+  }, [uploadOpen, focusPanelOnOpen]);
 
   // Generation counter: a slower earlier request must never overwrite the
   // rows of the filter the user is now looking at.
@@ -129,8 +235,30 @@ export function CandidatesPage() {
       .catch((e: ApiError) => { if (gen === loadGen.current) setError(e.message); });
   }, []);
 
+  /**
+   * `null` until the roles request settles, so the Role column can tell
+   * "not loaded yet" from "role not in the list".
+   *
+   * Previously this was `[]` in both cases and the two fetches race: whenever
+   * candidates arrived first (or `listRoles` failed), `roleTitleById` was
+   * empty and EVERY row rendered "Unknown role" — a positive claim that each
+   * candidate's role had been deleted. Harmless while roles only fed a
+   * dropdown; load-bearing now that a column asserts from it.
+   */
+  const [rolesLoaded, setRolesLoaded] = useState(false);
   useEffect(() => {
-    api.listRoles().then(setRoles).catch(() => setRoles([]));
+    api
+      .listRoles()
+      .then((rows) => {
+        setRoles(rows);
+        // ONLY on success. `.finally` here marked a FAILED fetch as loaded,
+        // which left `roles` empty with `rolesLoaded` true and put every row
+        // back to "Unknown role" — the precise claim ("every candidate's role
+        // was deleted") this state was added to prevent. A failure means we do
+        // not know, and "—" is what not knowing looks like.
+        setRolesLoaded(true);
+      })
+      .catch(() => setRoles([]));
   }, []);
 
   useEffect(() => {
@@ -227,6 +355,26 @@ export function CandidatesPage() {
     return counts;
   }, [candidates]);
 
+  /**
+   * How many loaded candidates carry a recommendation at all.
+   *
+   * The recommendation bar is measured against THIS, not the full list: an
+   * unscreened candidate has no recommendation, and counting them into the
+   * denominator would draw a mostly-empty bar that reads as "most candidates
+   * were not recommended" when it means "most have not been screened yet".
+   */
+  const assessedTotal = useMemo(
+    () => (candidates ?? []).filter((c) => Boolean(c.latest_recommendation)).length,
+    [candidates],
+  );
+
+  /** Role title by id, for the table's Role column. */
+  const roleTitleById = useMemo(() => {
+    const byId = new Map<string, string>();
+    for (const r of roles) byId.set(r.id, r.title);
+    return byId;
+  }, [roles]);
+
   // The facet is only meaningful where the signal exists. A deep link keeps
   // it visible so its own toggles stay reachable and removable.
   const showResumeFacet =
@@ -244,7 +392,8 @@ export function CandidatesPage() {
             variant="primary"
             aria-expanded={uploadOpen}
             aria-controls={uploadPanelId}
-            onClick={() => setUploadOpen((open) => !open)}
+            // No focus move: the panel is directly below this button.
+            onClick={() => openUpload(false)}
           >
             Upload resume
           </Button>
@@ -253,10 +402,17 @@ export function CandidatesPage() {
 
       <UploadPanel
         id={uploadPanelId}
+        panelRef={uploadPanelRef}
         open={uploadOpen}
         roles={roles}
         onUploaded={() => loadCandidates(roleId)}
       />
+
+      {/* Pipeline by role. Placed ABOVE the filter bar because it answers the
+          question the page is opened with ("how is each role doing"), and it
+          follows the page's role filter so drilling into one role narrows the
+          chart with it. */}
+      <RolePipelinePanel roles={roles} roleId={roleId} />
 
       {/* Filter bar — one panel, so the whole filter contract reads as a
           single control surface rather than four stacked rows. */}
@@ -295,56 +451,82 @@ export function CandidatesPage() {
           )}
         </div>
 
-        {/* Status toggles */}
-        <div className="mt-3 flex flex-wrap gap-2" role="group" aria-label="Filter by status">
-          {FILTERABLE_STATUSES.map((status) => {
-            const selected = filters.statuses.includes(status);
-            const count = statusCounts.get(status) ?? 0;
-            return (
-              <button
-                key={status}
-                type="button"
-                onClick={() => toggleStatus(status)}
-                aria-pressed={selected}
-                className={FILTER_PILL_CLASS(selected)}
-              >
-                {candidateStatusLabel(status)}
-                {candidates && (
-                  <span className={PILL_COUNT_CLASS(selected)}>{count}</span>
-                )}
-              </button>
-            );
-          })}
-        </div>
+        {/* THE BAR IS THE FILTER. It was briefly a chart ABOVE the chips,
+            which meant four rows of label+number where there had been two —
+            a legend is itself a row of chips. Now the legend entries are the
+            toggles: same `role="group"`, same `aria-pressed`, same 44px
+            targets, same URL contract, one surface.
 
-        {/* Recommendation toggles */}
-        <div
-          className="mt-2 flex flex-wrap items-center gap-2"
-          role="group"
-          aria-label="Filter by recommendation"
-        >
-          <span className="text-[13px] font-medium text-[var(--c-ink-secondary)]">
-            Recommendation:
-          </span>
-          {RECOMMENDATION_ORDER.map((rec) => {
-            const selected = filters.recommendations.includes(rec);
-            const count = recommendationCounts.get(rec) ?? 0;
-            return (
-              <button
-                key={rec}
-                type="button"
-                onClick={() => toggleRecommendation(rec)}
-                aria-pressed={selected}
-                className={FILTER_PILL_CLASS(selected)}
-              >
-                {recommendationLabel(rec)}
-                {candidates && (
-                  <span className={PILL_COUNT_CLASS(selected)}>{count}</span>
-                )}
-              </button>
-            );
-          })}
-        </div>
+            Segments come from the FULL CANDIDATE_STATUS_ORDER. The old pill
+            row justifiably omitted `consent_declined` (terminal, URL-only)
+            because pills are affordances; a bar that claims to partition the
+            whole list cannot, or those candidates silently become an unnamed
+            "Unaccounted" block — and for this product a consent refusal is
+            the outcome people most need to see. */}
+        {/* Rendered whenever candidates have loaded, empty list or not — the
+            same rule as the recommendation control below. Gating this one on
+            `length > 0` meant selecting a role with no candidates removed the
+            very toggle that had set the filter, leaving it un-pressable except
+            via the Active-filters chips. The pill row it replaced was
+            unconditional. */}
+        {candidates && (
+          <PipelineBar
+            className="mt-3"
+            label="Filter by status"
+            total={candidates.length}
+            onToggle={toggleStatus}
+            selectedKeys={filters.statuses}
+            segments={CANDIDATE_STATUS_ORDER.map((status) => ({
+              key: status,
+              label: candidateStatusLabel(status),
+              value: statusCounts.get(status) ?? 0,
+              tone: STATUS_BAR_TONE[status] ?? 'neutral',
+            }))}
+            footnote={
+              // The cohort is the LOADED set, which the role filter narrows
+              // server-side but the status filter does not. Said plainly,
+              // because the heading a few pixels above can read "1 of 3" and a
+              // picture under it is taken to be a picture of the 1.
+              active
+                ? `Across all ${candidates.length.toLocaleString()} loaded candidates${
+                    roleTitle ? ` in ${roleTitle}` : ''
+                  }, not the current filter.`
+                : undefined
+            }
+          />
+        )}
+
+        {/* Recommendation is a SEPARATE cohort: only assessed candidates
+            carry one, so it is measured against the assessed subtotal. Against
+            the whole list it would draw a mostly-empty bar implying the rest
+            were "not recommended" rather than "not yet screened". */}
+        {/* Rendered whenever candidates are loaded, NOT only when some carry a
+            recommendation. Gating on `assessedTotal > 0` made the
+            recommendation filter unreachable in a workspace with no
+            assessments yet — the pill row it replaced was always present. With
+            a zero total `PipelineBar` draws no track, so this degrades to
+            exactly that pill row and grows a bar once there is something to
+            chart. */}
+        {candidates && (
+          <PipelineBar
+            className="mt-3"
+            label="Filter by recommendation"
+            total={assessedTotal}
+            onToggle={toggleRecommendation}
+            selectedKeys={filters.recommendations}
+            segments={RECOMMENDATION_ORDER.map((rec) => ({
+              key: rec,
+              label: recommendationLabel(rec),
+              value: recommendationCounts.get(rec) ?? 0,
+              tone: RECOMMENDATION_BAR_TONE[rec] ?? 'neutral',
+            }))}
+            footnote={
+              assessedTotal > 0
+                ? `Of ${assessedTotal.toLocaleString()} with a recommendation.`
+                : undefined
+            }
+          />
+        )}
 
         {/* Resume-review toggles — additive facet over the sanitized enum the
             list already returns. Never mutates candidate status.
@@ -446,7 +628,26 @@ export function CandidatesPage() {
         {!error && candidates !== null && candidates.length === 0 && (
           <EmptyPanel
             title="No candidates yet"
-            hint="Upload a resume above to parse a candidate and add them here."
+            // The upload form is collapsed by default now, so prose telling a
+            // recruiter to "upload above" would point at something that is not
+            // on screen.
+            hint="Upload a resume to parse a candidate and add them here."
+            action={
+              <Button
+                variant="secondary"
+                size="sm"
+                aria-expanded={uploadOpen}
+                aria-controls={uploadPanelId}
+                // A real TOGGLE. One-way `setUploadOpen(true)` under a
+                // two-way `aria-expanded` is a control advertising a state it
+                // cannot change: once open it announced "expanded" and then
+                // did nothing when pressed (WCAG 4.1.2).
+                // Focus moves: this button is far below the panel.
+                onClick={() => openUpload(true)}
+              >
+                Upload a resume
+              </Button>
+            }
           />
         )}
         {!error &&
@@ -469,6 +670,7 @@ export function CandidatesPage() {
               <THead>
                 <Tr>
                   <Th>Name</Th>
+                  <Th>Role</Th>
                   <Th>Skills</Th>
                   <Th>Exp.</Th>
                   <Th>Status</Th>
@@ -493,6 +695,26 @@ export function CandidatesPage() {
                         {c.email && (
                           <p className="text-[13px] text-[var(--c-ink-secondary)]">{c.email}</p>
                         )}
+                      </Td>
+                      {/* ONE role per row, because that is what the row IS.
+
+                          `candidates.role_id` is a single FK and a row is one
+                          Ashby APPLICATION, so a person who applied to two
+                          roles is two rows carrying one role each — not one
+                          row carrying two. Rendering a list here would imply
+                          a many-to-many the data cannot express, and would
+                          make the row's "Review & decide" ambiguous about
+                          which application it decides.
+
+                          A role the roles list does not carry (filtered by
+                          scope, or deleted) falls back to a neutral marker
+                          rather than a blank cell or a raw uuid. */}
+                      <Td>
+                        <RoleCell
+                          roleId={c.role_id}
+                          title={c.role_id ? roleTitleById.get(c.role_id) : undefined}
+                          rolesLoaded={rolesLoaded}
+                        />
                       </Td>
                       <Td>
                         <div className="flex max-w-xs flex-wrap gap-1">
@@ -597,11 +819,14 @@ function FilterChip({
  */
 function UploadPanel({
   id,
+  panelRef,
   open,
   roles,
   onUploaded,
 }: {
   id: string;
+  /** Focus target: the empty state opens this panel from far below it. */
+  panelRef?: RefObject<HTMLElement | null>;
   open: boolean;
   roles: Role[];
   onUploaded: () => void;
@@ -636,9 +861,12 @@ function UploadPanel({
     <GlassPanel
       as="section"
       id={id}
+      ref={panelRef}
+      // -1: a programmatic focus target, never a tab stop of its own.
+      tabIndex={-1}
       hidden={!open}
       aria-labelledby={headingId}
-      className="mt-6"
+      className="mt-6 focus:outline-none focus-visible:shadow-[inset_0_0_0_2px_var(--c-accent)]"
     >
       <h2
         id={headingId}

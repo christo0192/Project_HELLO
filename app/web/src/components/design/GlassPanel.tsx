@@ -9,7 +9,7 @@
  * Hover lift for `interactive` panels is CSS (`.glass-interactive`) and
  * collapses under `prefers-reduced-motion`.
  */
-import type { ElementType, HTMLAttributes, ReactNode } from 'react';
+import type { ElementType, HTMLAttributes, ReactNode, Ref } from 'react';
 import { cx } from './cx';
 
 export type GlassLevel = 'raised' | 'strong' | 'sunken';
@@ -29,6 +29,13 @@ const paddingClass: Record<GlassPadding, string> = {
 };
 
 export interface GlassPanelProps extends HTMLAttributes<HTMLElement> {
+  /**
+   * Forwarded to the rendered element. Declared explicitly because
+   * `HTMLAttributes` does not carry `ref`; React 19 passes it to function
+   * components as an ordinary prop, and it already reaches the host element
+   * through the `...rest` spread below — only the type was missing.
+   */
+  ref?: Ref<HTMLElement>;
   as?: ElementType;
   level?: GlassLevel;
   padding?: GlassPadding;
