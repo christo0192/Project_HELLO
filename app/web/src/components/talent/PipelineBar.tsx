@@ -41,7 +41,11 @@ const FILL: Record<PipelineTone, string> = {
   positive: 'var(--c-positive)',
   caution: 'var(--c-caution)',
   negative: 'var(--c-negative)',
-  neutral: 'var(--c-ink-secondary)',
+  // `--c-border`, NOT `--c-ink-secondary`. The latter is an INK token — dark
+  // in light mode — so "nobody has been dialled yet" drew as the heaviest
+  // block on the bar and read, at a glance, as a full worked pipeline. The
+  // emptiest bucket must not be the loudest.
+  neutral: 'var(--c-border)',
 };
 
 export interface PipelineSegment {
@@ -153,6 +157,11 @@ export function PipelineBar({
                 className="h-2 w-2 shrink-0 rounded-full"
                 style={{
                   backgroundColor: s.unavailable ? 'var(--c-border)' : FILL[s.tone],
+                  // A ring in the pill's own text colour when pressed. The
+                  // selected pill is filled with `--c-accent`, against which
+                  // the accent swatch scores 1.00:1 — it disappeared exactly
+                  // when the recruiter clicked it to find its block in the bar.
+                  boxShadow: isOn ? '0 0 0 1.5px var(--c-data-label-inside)' : undefined,
                 }}
               />
               <span className={interactive ? undefined : 'text-[var(--c-ink-secondary)]'}>
@@ -183,8 +192,13 @@ export function PipelineBar({
               </button>
             );
           }
+          // A `span` inside the interactive shell, never an `li`: the shell is
+          // a `div role="group"` there, and an `li` outside a list is invalid
+          // markup that assistive tech reports as an orphan listitem. Reached
+          // by any unavailable segment on a filtering bar.
+          const Tag = interactive ? 'span' : 'li';
           return (
-            <li
+            <Tag
               key={s.key}
               className={
                 interactive
@@ -193,7 +207,7 @@ export function PipelineBar({
               }
             >
               {body}
-            </li>
+            </Tag>
           );
         })}
 

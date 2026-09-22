@@ -17,9 +17,10 @@
  * Surfaces: one glass panel per logical block — the upload form (a disclosure,
  * CLOSED by default since candidates arrive from Ashby rather than by hand),
  * the per-role pipeline chart, the filter bar, the table — floating on the
- * shell ground. The filter bar carries stacked bars ABOVE its pills: the bar
- * is what gets read, the pills stay the control surface, and neither tries to
- * be both. The list is paginated at ten
+ * shell ground. In the filter bar THE BAR IS THE FILTER: its legend entries
+ * are the toggles, so there is one surface carrying both the figures and the
+ * controls rather than a chart stacked on top of a chip row saying the same
+ * numbers. The list is paginated at ten
  * rows so it never runs off the page, and the filter contract
  * (`parseCandidateFilters` / `buildCandidateSearch` / `matchesCandidateFilters`)
  * is untouched: the chips, the counts and "Clear all" drive the same URL.
@@ -103,12 +104,6 @@ const RECOMMENDATION_TONE: Record<string, StatusTone> = {
   reject: "danger",
 };
 
-/**
- * Bar colour per status. Deliberately NOT the `StatusBadge` tone map: a badge
- * colours one candidate's state, while a stack has to stay legible as five
- * adjacent fills, so the pre-screen states share the neutral track and only
- * the outcomes take a hue.
- */
 /**
  * Bar colour per status. Deliberately NOT the `StatusBadge` tone map: a badge
  * colours one candidate's state, while a stack has to stay legible as six
@@ -199,25 +194,33 @@ export function CandidatesPage() {
   const [uploadOpen, setUploadOpen] = useState(false);
   const uploadPanelRef = useRef<HTMLElement | null>(null);
   /**
-   * Toggle the panel and, when opening, MOVE FOCUS INTO IT.
+   * Focus is moved ONLY for the far-away trigger.
    *
-   * The panel is mounted near the top of the page; the empty state's button is
-   * near the bottom. Without this a keyboard or screen-reader user activates
-   * the only call to action on an empty workspace, hears "expanded", and is
-   * left where they were — reaching the file input they just asked for means
-   * shift-tabbing backwards past the whole filter bar.
+   * The empty state's button sits below the whole filter bar while the panel
+   * is mounted near the top, so opening from there without moving focus leaves
+   * a keyboard user shift-tabbing backwards past a dozen controls. The HEADER
+   * button sits directly above the panel, where APG is explicit that a
+   * disclosure should NOT move focus — doing so makes collapsing it again
+   * require tabbing back.
    */
-  const openUpload = useCallback((next: (open: boolean) => boolean) => {
-    setUploadOpen((open) => {
-      const willOpen = next(open);
-      if (willOpen && !open) {
-        // After paint: the panel is `hidden` until this state lands, and a
-        // hidden element cannot take focus.
-        requestAnimationFrame(() => uploadPanelRef.current?.focus());
-      }
-      return willOpen;
-    });
+  const [focusPanelOnOpen, setFocusPanelOnOpen] = useState(false);
+  const openUpload = useCallback((moveFocus: boolean) => {
+    setFocusPanelOnOpen(moveFocus);
+    setUploadOpen((open) => !open);
   }, []);
+  /**
+   * An EFFECT, not a `requestAnimationFrame` inside the state updater.
+   *
+   * Updaters must be pure: React invokes them during render, replays them on
+   * rebase, and double-invokes them under StrictMode — each pass scheduling
+   * another frame that yanks focus back. rAF also fires BEFORE paint, so if
+   * the commit landed a frame later it focused a still-`hidden` element and
+   * silently did nothing. Effects run after commit, so the panel is visible
+   * and focusable by definition.
+   */
+  useEffect(() => {
+    if (uploadOpen && focusPanelOnOpen) uploadPanelRef.current?.focus();
+  }, [uploadOpen, focusPanelOnOpen]);
 
   // Generation counter: a slower earlier request must never overwrite the
   // rows of the filter the user is now looking at.
@@ -246,9 +249,16 @@ export function CandidatesPage() {
   useEffect(() => {
     api
       .listRoles()
-      .then(setRoles)
-      .catch(() => setRoles([]))
-      .finally(() => setRolesLoaded(true));
+      .then((rows) => {
+        setRoles(rows);
+        // ONLY on success. `.finally` here marked a FAILED fetch as loaded,
+        // which left `roles` empty with `rolesLoaded` true and put every row
+        // back to "Unknown role" — the precise claim ("every candidate's role
+        // was deleted") this state was added to prevent. A failure means we do
+        // not know, and "—" is what not knowing looks like.
+        setRolesLoaded(true);
+      })
+      .catch(() => setRoles([]));
   }, []);
 
   useEffect(() => {
@@ -382,7 +392,8 @@ export function CandidatesPage() {
             variant="primary"
             aria-expanded={uploadOpen}
             aria-controls={uploadPanelId}
-            onClick={() => openUpload((open) => !open)}
+            // No focus move: the panel is directly below this button.
+            onClick={() => openUpload(false)}
           >
             Upload resume
           </Button>
@@ -452,7 +463,13 @@ export function CandidatesPage() {
             whole list cannot, or those candidates silently become an unnamed
             "Unaccounted" block — and for this product a consent refusal is
             the outcome people most need to see. */}
-        {candidates && candidates.length > 0 && (
+        {/* Rendered whenever candidates have loaded, empty list or not — the
+            same rule as the recommendation control below. Gating this one on
+            `length > 0` meant selecting a role with no candidates removed the
+            very toggle that had set the filter, leaving it un-pressable except
+            via the Active-filters chips. The pill row it replaced was
+            unconditional. */}
+        {candidates && (
           <PipelineBar
             className="mt-3"
             label="Filter by status"
@@ -625,7 +642,8 @@ export function CandidatesPage() {
                 // two-way `aria-expanded` is a control advertising a state it
                 // cannot change: once open it announced "expanded" and then
                 // did nothing when pressed (WCAG 4.1.2).
-                onClick={() => openUpload((open) => !open)}
+                // Focus moves: this button is far below the panel.
+                onClick={() => openUpload(true)}
               >
                 Upload a resume
               </Button>
@@ -848,7 +866,7 @@ function UploadPanel({
       tabIndex={-1}
       hidden={!open}
       aria-labelledby={headingId}
-      className="mt-6 focus:outline-none"
+      className="mt-6 focus:outline-none focus-visible:shadow-[inset_0_0_0_2px_var(--c-accent)]"
     >
       <h2
         id={headingId}

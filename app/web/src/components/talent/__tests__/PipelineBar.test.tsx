@@ -47,14 +47,42 @@ describe('segmentsFor — nested funnel stages become disjoint buckets', () => {
   });
 
   it('puts each candidate in the bucket they actually stopped at', () => {
+    // FOUR DISTINCT VALUES, deliberately. The old fixture (10/8/6/4) produced
+    // 2, 2, 2, 4 — so permuting the bucket expressions was invisible, and a
+    // verified mutation swapping `not_dialed` with `connected` passed all 277
+    // tests. The sum-based assertions cannot catch it either: the telescoping
+    // identity holds for ANY arrangement of the four expressions.
     const segs = segmentsFor(
-      funnelTotals({ candidates_total: 10, dialed: 8, connected: 6, scored: 4 }),
+      funnelTotals({ candidates_total: 30, dialed: 22, connected: 12, scored: 5 }),
     );
     const by = new Map(segs.map((s) => [s.key, s.value]));
-    expect(by.get('not_dialed')).toBe(2); // 10 - 8
-    expect(by.get('no_answer')).toBe(2); //  8 - 6
-    expect(by.get('connected')).toBe(2); //  6 - 4
-    expect(by.get('scored')).toBe(4);
+    expect(by.get('not_dialed')).toBe(8); // 30 - 22
+    expect(by.get('no_answer')).toBe(10); // 22 - 12
+    expect(by.get('connected')).toBe(7); // 12 -  5
+    expect(by.get('scored')).toBe(5);
+  });
+
+  it('labels each bucket as a STOPPING POINT, sharing no word with the stage line', () => {
+    // "Connected 2" (this bucket) 20px above "connected 6" (reached this
+    // stage) gave two defensible answers to one question.
+    const labels = segmentsFor(funnelTotals({ candidates_total: 1 })).map((s) => s.label);
+    for (const label of labels) {
+      expect(label).not.toBe('Dialled');
+      expect(label).not.toBe('Connected');
+      expect(label).not.toBe('Screened');
+    }
+  });
+
+  it('never yields NaN from a partial or non-numeric payload', () => {
+    // `Math.max(0, NaN)` is NaN and poisons the whole chain: the role still
+    // passed the has-candidates filter, then drew no bar and four "NaN"
+    // figures.
+    const partial = { candidates_total: 10, dialed: undefined, connected: null } as never;
+    for (const seg of segmentsFor(partial)) {
+      expect(Number.isFinite(seg.value)).toBe(true);
+    }
+    const counted = segmentsFor(partial).filter((x) => !x.unavailable);
+    expect(counted.reduce((n, x) => n + x.value, 0)).toBe(10);
   });
 
   it('STILL SUMS TO THE COHORT WHEN A NESTED PAIR INVERTS', () => {
@@ -80,11 +108,15 @@ describe('segmentsFor — nested funnel stages become disjoint buckets', () => {
       for (const dialed of [0, 2, 5, 12]) {
         for (const connected of [0, 3, 5, 12]) {
           for (const scored of [0, 1, 7, 12]) {
-            const counted = segmentsFor(
-              funnelTotals({ candidates_total: total, dialed, connected, scored }),
-            ).filter((s) => !s.unavailable);
-            for (const s of counted) expect(s.value).toBeGreaterThanOrEqual(0);
-            expect(counted.reduce((n, s) => n + s.value, 0)).toBe(total);
+            const shape = { candidates_total: total, dialed, connected, scored };
+            const counted = segmentsFor(funnelTotals(shape)).filter((s) => !s.unavailable);
+            for (const s of counted) {
+              expect(s.value, JSON.stringify(shape)).toBeGreaterThanOrEqual(0);
+            }
+            expect(
+              counted.reduce((n, s) => n + s.value, 0),
+              JSON.stringify(shape),
+            ).toBe(total);
           }
         }
       }
@@ -195,9 +227,18 @@ describe('PipelineBar', () => {
     );
     expect(screen.getByText('Figures disagree, over by')).toBeInTheDocument();
     expect(container.querySelector('[data-segment-value="__overflow"]')?.textContent).toBe('2');
-    // The drawn widths stay in scale (7 is the denominator), never summing past 100%.
-    const sum = widths(container).reduce((a, b) => a + b, 0);
-    expect(sum).toBeLessThanOrEqual(100 + 1e-9);
+    // Scaled against the SUM (7), exactly — `toBeLessThanOrEqual(100)` was
+    // one-sided and a half-scale mutation passed it.
+    const drawn = widths(container);
+    expect(drawn).toHaveLength(2);
+    expect(drawn[0]).toBeCloseTo((3 / 7) * 100, 6);
+    expect(drawn[1]).toBeCloseTo((4 / 7) * 100, 6);
+    expect(drawn.reduce((a, b) => a + b, 0)).toBeCloseTo(100, 6);
+    // jsdom applies no CSS, so the flex behaviour this guards cannot be
+    // observed by layout here. The class is the only assertable proxy, and
+    // without it the browser silently squashes an over-sum into a full bar.
+    const track = container.querySelector('[data-pipeline-track]');
+    expect(track?.firstElementChild?.className).toContain('shrink-0');
   });
 
   it('makes the legend THE FILTER when onToggle is given', () => {
@@ -242,5 +283,10 @@ describe('PipelineBar', () => {
     const group = screen.getByRole('group', { name: 'Filter by status' });
     expect(within(group).queryByRole('button', { name: /Selected/ })).toBeNull();
     expect(screen.getByText('Not tracked yet')).toBeInTheDocument();
+    // ...and it is not an ORPHAN LISTITEM. The interactive shell is a
+    // `div role="group"`, so an `li` here is invalid markup that AT reports
+    // as a listitem outside any list.
+    expect(group.querySelector('li')).toBeNull();
+    expect(within(group).queryAllByRole('listitem')).toHaveLength(0);
   });
 });

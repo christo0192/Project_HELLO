@@ -348,11 +348,19 @@ describe('CandidatesPage', () => {
     expect(screen.queryByText(/with a recommendation\./)).not.toBeInTheDocument();
   });
 
-  it('draws no status control at all when the list is empty', async () => {
+  it('KEEPS the status filter reachable on an empty list', async () => {
+    // Was "draws no status control at all". Gating it on `length > 0` meant
+    // selecting a role with no candidates removed the very toggle that had set
+    // the filter, leaving it un-pressable except via the Active-filters chip —
+    // while the recommendation control beside it stayed. The pill row both
+    // replaced was unconditional.
     mockApi.listCandidates.mockResolvedValue([]);
     renderPage();
     await screen.findByText('No candidates yet');
-    expect(screen.queryByRole('group', { name: 'Filter by status' })).not.toBeInTheDocument();
+    const group = screen.getByRole('group', { name: 'Filter by status' });
+    expect(within(group).getByRole('button', { name: /Screened/i })).toBeInTheDocument();
+    // No track is drawn for an empty cohort, so it degrades to the pill row.
+    expect(document.querySelector('[data-pipeline-track]')).toBeNull();
   });
 
   it('THE BAR IS THE FILTER — one surface, and the URL contract survives', async () => {
@@ -385,6 +393,19 @@ describe('CandidatesPage', () => {
     renderPage('/candidates?status=screened');
     await screen.findByText('Screened Sam');
     expect(screen.getByText(/Across all 3 loaded candidates/)).toBeInTheDocument();
+
+    // The DENOMINATOR, not just the caption. With a filter active the loaded
+    // set is 3 and the visible set is 1, so measuring the bar against
+    // `visible.length` makes its own segments overflow their stated cohort —
+    // which surfaces as a "Figures disagree" entry. Asserting the caption
+    // alone let `total={visible.length}` pass, i.e. the bar silently became a
+    // picture of the filtered 1 that the caption denies.
+    const group = screen.getByRole('group', { name: 'Filter by status' });
+    expect(group.querySelector('[data-segment-value="__overflow"]')).toBeNull();
+    expect(screen.queryByText('Figures disagree, over by')).not.toBeInTheDocument();
+    // Every loaded candidate is still counted, filter or no filter.
+    expect(group.querySelector('[data-segment-value="new"]')?.textContent).toBe('1');
+    expect(group.querySelector('[data-segment-value="screened"]')?.textContent).toBe('1');
   });
 
   it('has no axe violations with candidates', async () => {

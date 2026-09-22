@@ -65,11 +65,21 @@ interface RoleTotals {
  * buckets telescope to exactly `total` for every possible input.
  */
 function clampChain(totals: FunnelSummaryTotals) {
-  const total = Math.max(0, totals.candidates_total ?? 0);
-  const dialed = Math.min(Math.max(0, totals.dialed ?? 0), total);
-  const connected = Math.min(Math.max(0, totals.connected ?? 0), dialed);
-  const scored = Math.min(Math.max(0, totals.scored ?? 0), connected);
+  // `count` first: `Math.max(0, NaN)` is NaN and `Math.min(NaN, x)` is NaN, so
+  // ONE non-numeric field from a partial payload poisoned the whole chain —
+  // the role still passed the "has candidates" filter, then rendered no bar at
+  // all and four legend figures reading "NaN".
+  const total = count(totals.candidates_total);
+  const dialed = Math.min(count(totals.dialed), total);
+  const connected = Math.min(count(totals.connected), dialed);
+  const scored = Math.min(count(totals.scored), connected);
   return { total, dialed, connected, scored };
+}
+
+/** A non-negative finite count, whatever the payload actually carried. */
+function count(value: number | undefined | null): number {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? n : 0;
 }
 
 /**
@@ -90,9 +100,10 @@ const MAX_PARALLEL_FUNNEL_READS = 6;
 /**
  * Map with bounded concurrency, preserving input order in the result.
  *
- * Never rejects: `work` is expected to absorb its own failures (this caller
- * catches to `null`), so the pool always settles and the panel can report how
- * many roles it could not read.
+ * NEVER REJECTS, and the try/catch is what guarantees it — `work` absorbing
+ * its own rejections is not enough, because a synchronous throw escapes
+ * before its `.catch` exists. The pool always settles so the caller can
+ * report how many items it could not read.
  */
 async function runPooled<T, R>(
   items: readonly T[],
@@ -105,7 +116,17 @@ async function runPooled<T, R>(
     for (;;) {
       const i = next++;
       if (i >= items.length) return;
-      out[i] = await work(items[i]);
+      try {
+        out[i] = await work(items[i]);
+      } catch {
+        // `work` absorbs its own REJECTIONS, but a synchronous throw (an
+        // undefined client method, an arg validator) happens before its
+        // `.catch` is attached. Unguarded it rejected this worker, then
+        // `Promise.all`, then the pool — and the panel, already switched to
+        // `rows = null`, rendered nothing for ever with an unhandled rejection
+        // in the console.
+        out[i] = null as R;
+      }
     }
   });
   await Promise.all(workers);
@@ -115,10 +136,14 @@ async function runPooled<T, R>(
 export function segmentsFor(totals: FunnelSummaryTotals): PipelineSegment[] {
   const { total, dialed, connected, scored } = clampChain(totals);
   return [
-    { key: 'not_dialed', label: 'Not dialled', value: total - dialed, tone: 'neutral' },
-    { key: 'no_answer', label: 'Dialled, no answer', value: dialed - connected, tone: 'caution' },
-    { key: 'connected', label: 'Connected', value: connected - scored, tone: 'accent' },
-    { key: 'scored', label: 'Screened', value: scored, tone: 'positive' },
+    // Labels say where a candidate STOPPED. They deliberately share no word
+    // with the cumulative stage line underneath: "Connected 2" (this bucket)
+    // sitting 20px above "Connected 6" (reached this stage) gave a recruiter
+    // two defensible answers to one question from a single 40px block.
+    { key: 'not_dialed', label: 'Awaiting first dial', value: total - dialed, tone: 'neutral' },
+    { key: 'no_answer', label: 'Dialled, never answered', value: dialed - connected, tone: 'caution' },
+    { key: 'connected', label: 'Answered, not screened', value: connected - scored, tone: 'accent' },
+    { key: 'scored', label: 'Screening complete', value: scored, tone: 'positive' },
     {
       key: 'selected',
       label: 'Selected',
@@ -142,9 +167,10 @@ function StageTotals({ totals }: { totals: FunnelSummaryTotals }) {
   const { total, dialed, connected, scored } = stageTotals(totals);
   return (
     <span className="tabular-nums">
-      Dialled <strong className="font-semibold text-[var(--c-ink)]">{dialed}</strong>
-      {' · '}Connected <strong className="font-semibold text-[var(--c-ink)]">{connected}</strong>
-      {' · '}Screened <strong className="font-semibold text-[var(--c-ink)]">{scored}</strong>
+      Reached: dialled{' '}
+      <strong className="font-semibold text-[var(--c-ink)]">{dialed}</strong>
+      {' · '}connected <strong className="font-semibold text-[var(--c-ink)]">{connected}</strong>
+      {' · '}screened <strong className="font-semibold text-[var(--c-ink)]">{scored}</strong>
       {' · '}of {total}
     </span>
   );
@@ -164,6 +190,9 @@ export function RolePipelinePanel({ roles, roleId }: RolePipelinePanelProps) {
    */
   const [failedRoles, setFailedRoles] = useState(0);
   const headingId = useId();
+  const bodyId = useId();
+  /** Collapsed by default: see the disclosure comment in the render. */
+  const [open, setOpen] = useState(false);
 
   const charted = useMemo(
     () => (roleId ? roles.filter((r) => r.id === roleId) : roles),
@@ -238,19 +267,43 @@ export function RolePipelinePanel({ roles, roleId }: RolePipelinePanelProps) {
       </InlineNotice>
     );
   }
-  if (populated.length === 0) return null;
+  // NOT `populated.length === 0` alone. A partial outage whose surviving roles
+  // happen to have no candidates would hide the entire panel — and silence
+  // here reads as "no role has a pipeline", the exact failure `failedRoles`
+  // was added to report.
+  if (populated.length === 0 && failedRoles === 0) return null;
 
   return (
     <GlassPanel as="section" aria-labelledby={headingId} padding="sm" className="mt-6">
-      <h2
-        id={headingId}
-        className="text-[15px] font-semibold tracking-[-0.01em] text-[var(--c-ink)]"
-      >
-        Pipeline by role
-      </h2>
+      {/* A DISCLOSURE, closed by default (owner request 2026-09-22). Expanded,
+          this panel is ~290px for one role and over 1100px for six, which put
+          the candidate table — the page's subject — below the fold and made
+          the page LONGER than before the change that was meant to declutter
+          it. The summary line carries the one number worth seeing closed. */}
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1">
+        <h2
+          id={headingId}
+          className="text-[15px] font-semibold tracking-[-0.01em] text-[var(--c-ink)]"
+        >
+          Pipeline by role
+        </h2>
+        <button
+          type="button"
+          aria-expanded={open}
+          aria-controls={bodyId}
+          onClick={() => setOpen((o) => !o)}
+          className="inline-flex min-h-11 items-center rounded-full px-3 text-[13px] font-medium text-[var(--c-accent)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+        >
+          {open ? 'Hide' : `Show ${populated.length} ${populated.length === 1 ? 'role' : 'roles'}`}
+        </button>
+      </div>
+
+      <div id={bodyId} hidden={!open}>
       <p className="mt-1 text-[13px] leading-5 text-[var(--c-ink-secondary)]">
-        Each bar is one role&rsquo;s candidates, split by how far they got. The parts add up to the
-        role&rsquo;s total, so nobody is counted twice.
+        Each bar is one role&rsquo;s candidates, split by how far they got &mdash; the parts add up
+        to the role&rsquo;s total, so nobody is counted twice. The line under each bar reads the
+        other way: how many REACHED each stage. &ldquo;Selected&rdquo; is not tracked yet, because
+        the stage a candidate sits in today is recorded once at import and never updated.
       </p>
 
       <div className="mt-4 flex flex-col gap-5">
@@ -287,11 +340,7 @@ export function RolePipelinePanel({ roles, roleId }: RolePipelinePanelProps) {
         </p>
       )}
 
-      <p className="mt-4 text-xs leading-5 text-[var(--c-ink-secondary)]">
-        &ldquo;Selected&rdquo; stays untracked until the Ashby stage sync lands — the stage a
-        candidate sits in today is recorded once at import and never updated, so no number here
-        could be trusted.
-      </p>
+      </div>
     </GlassPanel>
   );
 }
