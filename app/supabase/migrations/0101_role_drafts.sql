@@ -84,10 +84,12 @@ create table if not exists screening_v2.role_drafts (
 -- became unreachable the moment the form unmounted — still billing, its result
 -- written to a row nobody could name.
 --
--- `owner_running` serves the admission check. `startRoleDraft` refuses to
--- begin a second job while one is live, because each start detaches up to
--- three v4-pro calls into the process that also serves live-call operations,
--- and nothing else bounds how often the button can be pressed.
+-- `owner_running` serves the admission check. `startRoleDraft` does not begin
+-- a second job for the same job role while one is live — it RETURNS the live
+-- one, which is also what a second tab should see. Each start detaches up to
+-- six v4-pro calls (`runDeepseekJSON` retries once itself) into the process
+-- that also serves live-call operations, and nothing else bounds how often the
+-- button can be pressed.
 create index if not exists idx_role_drafts_owner_recent
   on screening_v2.role_drafts (owner_id, created_at desc);
 create index if not exists idx_role_drafts_owner_running

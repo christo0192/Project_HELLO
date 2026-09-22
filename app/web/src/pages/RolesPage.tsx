@@ -463,18 +463,21 @@ function RoleForm({
             and this is the sentence the operator waited ten minutes for. The
             button's own status region is built the same way for the same
             reason. */}
-        <p
-          role="status"
-          aria-live="polite"
-          data-role-draft-note=""
-          className="min-h-0"
-        >
+        <div role="status" aria-live="polite" data-role-draft-note="">
           {draftNote && (
-            <InlineNotice tone="info" className="mt-1">
+            // A <div>, not a <p>: InlineNotice renders a div, React refuses
+            // div-inside-p with a console.error, and this project's test
+            // harness FAILS the suite on an unexpected console.error. It
+            // stayed green only because no test exercised the draft-note path.
+            //
+            // `role="none"` because the wrapper above is the live region.
+            // InlineNotice defaults to `status`, and nesting one region inside
+            // another invites the same sentence being announced twice.
+            <InlineNotice tone="info" role="none" className="mt-1">
               {draftNote}
             </InlineNotice>
           )}
-        </p>
+        </div>
 
         <Field label="Job description" id="role-jd">
           {({ id }) => (

@@ -20,8 +20,9 @@ vi.mock('../lib/supabase.js', () => ({
 vi.mock('../lib/role-draft-jobs.js', () => ({
   startRoleDraft: vi.fn(),
   readRoleDraft: vi.fn(),
+  readActiveRoleDraft: vi.fn(),
   cancelRoleDraft: vi.fn(),
-  ROLE_DRAFT_STALE_MS: 600_000,
+  ROLE_DRAFT_STALE_MS: 720_000,
 }));
 vi.mock('../lib/audit.js', () => ({ recordAudit: vi.fn() }));
 
@@ -47,6 +48,7 @@ const JOB = {
   error_reason: null,
   error_message: null,
   max_attempts: 3,
+  created_at: '2026-09-22T10:00:00.000Z',
 };
 
 function makeUser(role: AuthUser['appRole']): AuthUser {
@@ -72,6 +74,7 @@ function app(role: AuthUser['appRole'] = 'interviewer') {
 beforeEach(() => {
   vi.mocked(jobs.startRoleDraft).mockReset().mockResolvedValue(JOB);
   vi.mocked(jobs.readRoleDraft).mockReset().mockResolvedValue(JOB);
+  vi.mocked(jobs.readActiveRoleDraft).mockReset().mockResolvedValue(null);
   vi.mocked(jobs.cancelRoleDraft).mockReset().mockResolvedValue(true);
   vi.mocked(recordAudit).mockReset().mockResolvedValue(undefined as never);
   vi.mocked(supabase.from).mockReset();
@@ -144,6 +147,57 @@ describe('POST /api/roles/draft', () => {
     });
     expect(res.status).toBe(202);
     expect(jobs.startRoleDraft).toHaveBeenCalled();
+  });
+});
+
+describe('GET /api/roles/draft', () => {
+  // THE ROUTE THAT WAS DEAD ON ARRIVAL.
+  //
+  // `GET '/:id'` was registered first, and `:id` matches ANY single segment —
+  // including the literal `draft`. So every call landed in the id route,
+  // `roleIdParamSchema` rejected "draft" as a non-uuid, and the caller got a
+  // 400. The client swallows a failed resume (it is a convenience, not a
+  // precondition), so the only symptom was a refresh that silently did not
+  // resume while the job kept billing.
+  //
+  // These tests go through the WHOLE router rather than the handler, because
+  // the handler was never the thing that was broken.
+
+  it('returns the live job', async () => {
+    vi.mocked(jobs.readActiveRoleDraft).mockResolvedValue(JOB);
+    const res = await request(app()).get('/api/roles/draft').set(AUTH);
+    expect(res.status).toBe(200);
+    expect(res.body.active?.id).toBe(DRAFT_ID);
+    expect(jobs.readActiveRoleDraft).toHaveBeenCalledWith(OWNER);
+  });
+
+  it('IS NOT SHADOWED by GET /api/roles/:id', async () => {
+    // The regression itself, named. A 400 here means the id route ate it.
+    vi.mocked(jobs.readActiveRoleDraft).mockResolvedValue(null);
+    const res = await request(app()).get('/api/roles/draft').set(AUTH);
+    expect(res.status).not.toBe(400);
+    expect(res.status).toBe(200);
+    expect(jobs.readActiveRoleDraft).toHaveBeenCalled();
+  });
+
+  it('answers 200 with an explicit null when nothing is running', async () => {
+    // Not 404. "You have no draft running" is a normal answer to this
+    // question, not a missing resource.
+    vi.mocked(jobs.readActiveRoleDraft).mockResolvedValue(null);
+    const res = await request(app()).get('/api/roles/draft').set(AUTH);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ active: null });
+  });
+
+  it('scopes the read to the authenticated user', async () => {
+    await request(app()).get('/api/roles/draft').set(AUTH);
+    expect(jobs.readActiveRoleDraft).toHaveBeenCalledWith(OWNER);
+  });
+
+  it('refuses a viewer', async () => {
+    const res = await request(app('viewer')).get('/api/roles/draft').set(AUTH);
+    expect(res.status).toBe(403);
+    expect(jobs.readActiveRoleDraft).not.toHaveBeenCalled();
   });
 });
 

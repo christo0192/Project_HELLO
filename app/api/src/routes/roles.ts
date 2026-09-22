@@ -32,23 +32,21 @@ rolesRouter.get('/', requireRole('viewer'), async (req, res, next) => {
   res.json(data);
 });
 
-// Get one role — viewer and above
-// Interviewer sees only own records; admin sees all
-rolesRouter.get('/:id', requireRole('viewer'), validateParams(roleIdParamSchema), async (req, res) => {
-  let q = supabase
-    .from('roles')
-    .select('*')
-    .eq('id', req.params.id);
-
-  // Interviewer: must own the record
-  if (req.authUser?.appRole === 'interviewer') {
-    q = q.eq('owner_id', req.authUser.id);
-  }
-
-  const { data, error } = await q.single();
-  if (error) return res.status(404).json({ error: 'Role not found' });
-  res.json(data);
-});
+// ── Ask Hello ────────────────────────────────────────────────────────────
+//
+// DECLARED BEFORE `GET '/:id'`, AND THAT IS LOAD-BEARING.
+//
+// Express matches in declaration order, and `/:id` matches ANY single
+// segment — including the literal `draft`. With the id route first,
+// `GET /api/roles/draft` never reached this handler at all: it landed in
+// `/:id`, `roleIdParamSchema` rejected `"draft"` as a non-uuid, and the
+// caller got a 400. The client swallows that (a failed resume is not worth
+// an error banner), so the symptom was a refresh that silently did not
+// resume, and a job that kept billing with nobody watching.
+//
+// An earlier comment here claimed the two could not collide because "Express
+// does not match a `:param` across a `/`". That is true of `/draft/:id`,
+// which is two segments — and irrelevant to `/draft`, which is one.
 
 /**
  * Ask Hello — START a drafting job. Answers immediately with its id.
@@ -147,6 +145,24 @@ rolesRouter.post(
   },
 );
 
+// Get one role — viewer and above
+// Interviewer sees only own records; admin sees all
+rolesRouter.get('/:id', requireRole('viewer'), validateParams(roleIdParamSchema), async (req, res) => {
+  let q = supabase
+    .from('roles')
+    .select('*')
+    .eq('id', req.params.id);
+
+  // Interviewer: must own the record
+  if (req.authUser?.appRole === 'interviewer') {
+    q = q.eq('owner_id', req.authUser.id);
+  }
+
+  const { data, error } = await q.single();
+  if (error) return res.status(404).json({ error: 'Role not found' });
+  res.json(data);
+});
+
 // Create role (with screening template) — interviewer and above
 // Stamps owner_id from the authenticated user
 rolesRouter.post('/', requireRole('interviewer'), validateBody(createRoleSchema), async (req, res, next) => {
@@ -159,8 +175,18 @@ rolesRouter.post('/', requireRole('interviewer'), validateBody(createRoleSchema)
     .insert({
       title,
       // Blank stores as NULL so "unset" has one representation, matching `jd`
-      // and the column's own check constraint.
-      agent_name: agent_name?.trim() ? agent_name.trim() : null,
+      // and the column's own check constraint — but the KEY IS OMITTED
+      // ENTIRELY when the client did not send the field.
+      //
+      // `agent_name?.trim() ? … : null` put the key in the payload on EVERY
+      // create, which defeated the client-side guard completely: if the API
+      // ships before `supabase db push` of 0100, PostgREST rejects the unknown
+      // column (PGRST204) and every role creation 500s — including for the
+      // roles that never wanted an agent name, which is all of them. The PATCH
+      // below was already conditional; this was not.
+      ...(agent_name === undefined
+        ? {}
+        : { agent_name: agent_name?.trim() ? agent_name.trim() : null }),
       jd: jd ?? null,
       required_skills: required_skills ?? [],
       screening_template: screening_template ?? [],

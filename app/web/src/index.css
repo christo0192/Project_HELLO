@@ -448,9 +448,12 @@ body .text-red-700 { color: var(--error-text); }
 }
 
 /* A looping gradient behind a control someone is WAITING on is exactly the
-   motion this rule exists for. The button keeps its colour and every label —
-   and `background-position: 0 0` lands on the #3b5488 stop, the highest
-   contrast of the three, so the static state is the most legible one. */
+   motion this rule exists for. The button keeps its colour and every label.
+   At `background-position: 0 0` with a 300% background, the visible third of
+   the ramp runs from #3b5488 to about the #2b5f72 stop — a floor of 7.04:1,
+   because the sheen is `opacity: 0` here and the 0.14 reduction never
+   applies. (An earlier version of this comment claimed position 0 showed only
+   the #3b5488 stop. It does not; the conclusion happened to survive.) */
 @media (prefers-reduced-motion: reduce) {
   .ask-hello {
     animation: none;

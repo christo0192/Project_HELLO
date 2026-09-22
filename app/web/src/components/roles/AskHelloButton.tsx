@@ -1,6 +1,14 @@
 /**
  * "Ask Hello" — draft a role's JD, skills and questions from its job title.
  *
+ * APP-SCOPE TOKENS ONLY. This briefly used `var(--c-accent)` and
+ * `var(--c-ink-secondary)`, which are declared under `.candidate-scope` — a
+ * class the Roles page does not apply. Off-scope, `--tw-ring-color:
+ * var(--c-accent)` is invalid at computed-value time and falls back to
+ * Tailwind's preflight default rgba(59,130,246,.5): 1.84:1 against the white
+ * ring offset, where SC 1.4.11 needs 3:1. A focus ring nobody can see is the
+ * same as no focus ring.
+ *
  * A JOB, NOT A TEN-MINUTE REQUEST. Drafting runs v4-pro up to three times at
  * 133-206s a call. Tied to one socket that meant nothing survived a refresh, a
  * proxy idle timeout killed it mid-draft, and Cancel stopped the spinner while
@@ -71,6 +79,14 @@ export function AskHelloButton({
   const buttonRef = useRef<HTMLButtonElement | null>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   /**
+   * When the job being watched actually began, for the elapsed counter.
+   *
+   * Null while this component is the one that started it — then "now" is
+   * right. Set to the job's own start when a running job is ADOPTED after a
+   * refresh, so the counter reports the wait the operator has really had.
+   */
+  const resumedAtRef = useRef<number | null>(null);
+  /**
    * Put focus back on the main button before Cancel unmounts.
    *
    * Only when focus is actually inside this component — stealing it from
@@ -101,7 +117,10 @@ export function AskHelloButton({
     void (async () => {
       try {
         const { active } = await api.getActiveRoleDraft();
-        if (live && active) setJobId((current) => current ?? active.id);
+        if (!live || !active) return;
+        const startedAt = active.created_at ? Date.parse(active.created_at) : NaN;
+        resumedAtRef.current = Number.isFinite(startedAt) ? startedAt : null;
+        setJobId((current) => current ?? active.id);
       } catch {
         // Nothing to recover, or the lookup failed. Either way the button is
         // usable; this is a convenience, not a precondition.
@@ -114,9 +133,14 @@ export function AskHelloButton({
 
   useEffect(() => {
     if (!running) return;
-    const started = Date.now();
-    setElapsed(0);
-    const id = setInterval(() => setElapsed(Math.floor((Date.now() - started) / 1000)), 1000);
+    // COUNTS FROM WHEN THE JOB STARTED, not from when this component started
+    // watching it. A resumed draft five minutes old used to read "3s elapsed",
+    // which is a worse lie than showing nothing: it says the wait has barely
+    // begun at the moment it is nearly over. `startedAt` is null for a job
+    // this component started (they coincide) and set when one is adopted.
+    const base = resumedAtRef.current ?? Date.now();
+    setElapsed(Math.max(0, Math.floor((Date.now() - base) / 1000)));
+    const id = setInterval(() => setElapsed(Math.max(0, Math.floor((Date.now() - base) / 1000))), 1000);
     return () => clearInterval(id);
   }, [running]);
 
@@ -181,6 +205,8 @@ export function AskHelloButton({
     }
     setStarting(true);
     setPhase(null);
+    // Started here, so "now" is when the wait began.
+    resumedAtRef.current = null;
     try {
       const job = await api.startRoleDraft(role);
       setJobId(job.id);
@@ -241,7 +267,7 @@ export function AskHelloButton({
           // leaves the white label alone. There is no shortage of signal
           // either way: the label itself changes to "Asking Hello…", the glyph
           // changes, Cancel appears, and the live region narrates the phase.
-          className={`ask-hello relative inline-flex min-h-11 items-center gap-2 overflow-hidden rounded-full px-5 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-[var(--c-accent)] ${
+          className={`ask-hello relative inline-flex min-h-11 items-center gap-2 overflow-hidden rounded-full px-5 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info ${
             idle ? 'ask-hello--idle cursor-not-allowed' : ''
           }${running ? ' cursor-progress' : ''}`}
         >
@@ -256,7 +282,7 @@ export function AskHelloButton({
           <button
             type="button"
             onClick={cancel}
-            className="inline-flex min-h-11 items-center rounded-full px-3 text-[13px] font-medium text-[var(--c-ink-secondary)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+            className="inline-flex min-h-11 items-center rounded-full px-3 text-[13px] font-medium text-ink-secondary underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info"
           >
             Cancel
           </button>
@@ -269,7 +295,7 @@ export function AskHelloButton({
           <span
             aria-hidden="true"
             data-ask-hello-elapsed=""
-            className="text-xs tabular-nums text-[var(--c-ink-secondary)]"
+            className="text-xs tabular-nums text-ink-secondary"
           >
             {elapsedLabel(elapsed)} elapsed
           </span>
@@ -283,7 +309,7 @@ export function AskHelloButton({
         role="status"
         aria-live="polite"
         data-ask-hello-status=""
-        className="mt-2 min-h-5 text-xs leading-5 text-[var(--c-ink-secondary)]"
+        className="mt-2 min-h-5 text-xs leading-5 text-ink-secondary"
       >
         {running ? phaseLabel(phase) : ''}
       </p>

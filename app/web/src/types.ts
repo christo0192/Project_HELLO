@@ -51,6 +51,15 @@ export interface RoleDraftJob {
   error_reason: string | null;
   error_message: string | null;
   max_attempts: number;
+  /**
+   * When the job began.
+   *
+   * Read on resume so the elapsed counter reports the wait the operator has
+   * actually had. Without it an adopted five-minute-old draft read "3s
+   * elapsed" — worse than showing nothing, because it says the wait has
+   * barely begun at the moment it is nearly over.
+   */
+  created_at: string | null;
 }
 
 export interface RoleDraft {

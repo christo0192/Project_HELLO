@@ -14,12 +14,19 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 const mockApi = {
   startRoleDraft: vi.fn(),
+  // MISSING FROM THIS MOCK FOR A WHOLE COMMIT, which is how a dead endpoint
+  // shipped. The component calls it on mount; with the key absent it was
+  // `undefined`, the resume effect threw a TypeError, and the deliberately
+  // empty catch that exists for "no draft to recover" swallowed it. Sixteen
+  // green tests, and the resume path never ran once.
+  getActiveRoleDraft: vi.fn(),
   getRoleDraft: vi.fn(),
   cancelRoleDraft: vi.fn(),
 };
 vi.mock('../../../api', () => ({
   api: {
     startRoleDraft: (...a: unknown[]) => mockApi.startRoleDraft(...a),
+    getActiveRoleDraft: (...a: unknown[]) => mockApi.getActiveRoleDraft(...a),
     getRoleDraft: (...a: unknown[]) => mockApi.getRoleDraft(...a),
     cancelRoleDraft: (...a: unknown[]) => mockApi.cancelRoleDraft(...a),
   },
@@ -47,6 +54,7 @@ function running(phase: unknown = null) {
     error_reason: null,
     error_message: null,
     max_attempts: 3,
+    created_at: new Date().toISOString(),
   };
 }
 
@@ -85,6 +93,7 @@ describe('AskHelloButton', () => {
   beforeEach(() => {
     vi.useFakeTimers({ shouldAdvanceTime: true });
     vi.clearAllMocks();
+    mockApi.getActiveRoleDraft.mockResolvedValue({ active: null });
     mockApi.startRoleDraft.mockResolvedValue(running());
     mockApi.getRoleDraft.mockResolvedValue(succeeded());
     mockApi.cancelRoleDraft.mockResolvedValue({ cancelled: true });
@@ -278,6 +287,74 @@ describe('AskHelloButton', () => {
     await waitFor(() => expect(onError).toHaveBeenCalledWith('Hello is not configured.'));
     // And the button comes back, rather than staying stuck at "Asking Hello…".
     expect(askHello()).not.toHaveAttribute('aria-disabled', 'true');
+  });
+
+  it('PICKS UP A JOB THAT IS ALREADY RUNNING', async () => {
+    // The whole reason the job is a row. Without this a refresh abandoned a
+    // running draft: it kept billing, its result landed in a row no endpoint
+    // could name, and the operator's only move was to start a second one.
+    mockApi.getActiveRoleDraft.mockResolvedValue({
+      active: { ...running({ phase: 'repairing', attempt: 2, maxAttempts: 3, rejected: 1 }), id: 'job-live' },
+    });
+    mockApi.getRoleDraft.mockResolvedValue(
+      running({ phase: 'repairing', attempt: 2, maxAttempts: 3, rejected: 1 }),
+    );
+    setup();
+
+    await waitFor(() => expect(mockApi.getRoleDraft).toHaveBeenCalledWith('job-live'));
+    const status = await screen.findByRole('status');
+    await waitFor(() => expect(status.textContent).toContain('Rephrasing 1 question'));
+    // ...and it did NOT start a new one.
+    expect(mockApi.startRoleDraft).not.toHaveBeenCalled();
+  });
+
+  it('counts elapsed from when the JOB started, not from the resume', async () => {
+    // A five-minute-old draft reading "3s elapsed" is worse than no counter:
+    // it says the wait has barely begun at the moment it is nearly over.
+    const fiveMinutesAgo = new Date(Date.now() - 5 * 60_000).toISOString();
+    mockApi.getActiveRoleDraft.mockResolvedValue({
+      active: { ...running(), id: 'job-live', created_at: fiveMinutesAgo },
+    });
+    mockApi.getRoleDraft.mockResolvedValue(running());
+    setup();
+
+    await waitFor(() => {
+      const el = document.querySelector('[data-ask-hello-elapsed]');
+      expect(el?.textContent).toMatch(/5m/);
+    });
+  });
+
+  it('does not resume when there is nothing running', async () => {
+    mockApi.getActiveRoleDraft.mockResolvedValue({ active: null });
+    setup();
+    await waitFor(() => expect(mockApi.getActiveRoleDraft).toHaveBeenCalled());
+    expect(mockApi.getRoleDraft).not.toHaveBeenCalled();
+    expect(askHello()).not.toHaveAttribute('aria-disabled', 'true');
+  });
+
+  it('survives a resume lookup that FAILS', async () => {
+    // A convenience, not a precondition: the button must still work.
+    mockApi.getActiveRoleDraft.mockRejectedValue(new Error('network'));
+    const { onError } = setup();
+    await waitFor(() => expect(mockApi.getActiveRoleDraft).toHaveBeenCalled());
+    expect(onError).not.toHaveBeenCalled();
+    await act(async () => askHello().click());
+    await waitFor(() => expect(mockApi.startRoleDraft).toHaveBeenCalled());
+  });
+
+  it('TELLS THE OPERATOR when a cancel did not reach the server', async () => {
+    // "Stops the spending, not just the spinner" holds only if the request
+    // lands. A swallowed failure means v4-pro runs on while the UI says it
+    // stopped.
+    mockApi.getRoleDraft.mockResolvedValue(running());
+    mockApi.cancelRoleDraft.mockRejectedValue(new Error('offline'));
+    const { onError } = setup();
+    await act(async () => askHello().click());
+    const cancel = await screen.findByRole('button', { name: 'Cancel' });
+    await act(async () => cancel.click());
+    await waitFor(() =>
+      expect(onError).toHaveBeenCalledWith(expect.stringContaining('may not have stopped')),
+    );
   });
 
   it('keeps the live region MOUNTED while idle', () => {

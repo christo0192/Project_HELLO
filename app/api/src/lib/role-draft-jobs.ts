@@ -63,6 +63,8 @@ export interface RoleDraftJob {
   error_reason: string | null;
   error_message: string | null;
   max_attempts: number;
+  /** When the job began. The client's elapsed counter reads this on resume. */
+  created_at: string | null;
 }
 
 interface Row {
@@ -78,6 +80,7 @@ interface Row {
   error_message: string | null;
   cancelled_at: string | null;
   updated_at: string;
+  created_at?: string;
 }
 
 function toJob(row: Row): RoleDraftJob {
@@ -92,6 +95,7 @@ function toJob(row: Row): RoleDraftJob {
     error_reason: row.error_reason,
     error_message: row.error_message,
     max_attempts: ROLE_DRAFT_MAX_ATTEMPTS,
+    created_at: row.created_at ?? null,
   };
 }
 
@@ -195,8 +199,18 @@ export async function startRoleDraft(
   jobRole: string,
   deps: RoleDraftRunnerDeps = {},
 ): Promise<RoleDraftJob> {
+  // ONE LIVE JOB, AND IT MUST BE FOR THIS JOB ROLE.
+  //
+  // Returning any live job regardless of what it was drafting put someone
+  // else's subject into this form: start "Sales Advisor", close the tab, open
+  // the form again, type "Data Engineer", press Ask Hello — and eight minutes
+  // later a Sales Advisor JD, skills and six Sales Advisor questions land in a
+  // form whose Job role says Data Engineer. On a fresh form there is nothing
+  // to overwrite, so the confirm never fires and only an info notice mentions
+  // it. A live job for a DIFFERENT role is left alone to finish; this one
+  // starts its own.
   const live = await readActiveRoleDraft(ownerId, deps);
-  if (live) return live;
+  if (live && live.job_role.trim() === jobRole.trim()) return live;
 
   const { data, error } = await supabase
     .from('role_drafts')
@@ -241,11 +255,18 @@ async function runDraft(id: string, jobRole: string, deps: RoleDraftRunnerDeps):
           );
       },
       shouldCancel: async () => {
-        const { data } = await supabase
+        // A FAILED READ IS NOT A "NO". It used to be: the error was dropped
+        // and a pooler blip answered "not cancelled", so a cancellation issued
+        // during that window was missed and the attempt ran anyway. Treated as
+        // unknown and retried on the next attempt boundary — the generator
+        // asks again before each one, so a single bad read costs at most one
+        // attempt instead of silently discarding the operator's decision.
+        const { data, error } = await supabase
           .from('role_drafts')
           .select('cancelled_at')
           .eq('id', id)
           .single();
+        if (error) return false;
         return Boolean((data as { cancelled_at: string | null } | null)?.cancelled_at);
       },
     });
@@ -279,10 +300,20 @@ async function runDraft(id: string, jobRole: string, deps: RoleDraftRunnerDeps):
         error_message: isDraftError
           ? err.message
           : 'Hello could not be reached. Try again in a moment.',
-        // WRITTEN HERE TOO. Without it every failed job reports `attempts: 0`,
-        // so a job that burned the whole budget is indistinguishable from one
-        // that never got a call away — and those want opposite responses.
-        attempts: isDraftError ? (err.attempts ?? null) : null,
+        // WRITTEN HERE TOO, and the KEY IS OMITTED when there is no number.
+        //
+        // Without it every failed job reported `attempts: 0`, so a job that
+        // burned the whole budget was indistinguishable from one that never
+        // got a call away. But `attempts` is `integer not null default 0`
+        // (0101), so writing an explicit null defeated the repair on exactly
+        // the branch it was written for: every non-`RoleDraftError` throw —
+        // the provider outages — produced a 23502 not_null_violation, the
+        // whole terminal write was rejected, the row stayed `running` with a
+        // frozen heartbeat, and the operator was eventually told the draft was
+        // ABANDONED rather than that the provider could not be reached.
+        ...(isDraftError && typeof err.attempts === 'number'
+          ? { attempts: err.attempts }
+          : {}),
         phase: null,
         updated_at: new Date().toISOString(),
       })
@@ -332,14 +363,24 @@ export async function readRoleDraft(
   return toJob(row);
 }
 
-/** Ask a running job to stop. The generator reads this between attempts. */
+/**
+ * Ask a running job to stop. The generator reads this between attempts.
+ *
+ * THROWS on a database failure rather than returning false. `false` means
+ * "there was no running job to cancel" — a race the operator cannot be blamed
+ * for and nothing to report. A pooler reset means the opposite: the job IS
+ * running, `cancelled_at` was never written, and v4-pro will keep spending.
+ * Collapsing the two left the client silently claiming it had stopped
+ * something it had not, which is the one thing this function exists to do.
+ */
 export async function cancelRoleDraft(ownerId: string, id: string): Promise<boolean> {
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from('role_drafts')
     .update({ status: 'cancelled', cancelled_at: new Date().toISOString() })
     .eq('id', id)
     .eq('owner_id', ownerId)
     .eq('status', 'running')
     .select('id');
+  if (error) throw error;
   return Array.isArray(data) && data.length > 0;
 }

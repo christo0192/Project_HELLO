@@ -30,10 +30,10 @@
  */
 import { env } from './env.js';
 import { runClaudeJSONWithProvenance } from './claude.js';
+import { BusinessError } from './provider-resilience.js';
 import {
   phoneQuestionIssueMessage,
   validatePhoneQuestionTemplate,
-  containsProseDirective,
 } from './phone-screening/question-validation.js';
 
 /**
@@ -250,14 +250,28 @@ function coerceDraft(raw: unknown): RoleDraft | null {
 
   const jd = typeof obj.jd === 'string' ? obj.jd.trim().slice(0, MAX_JD_CHARS) : '';
   if (!jd) return null;
-  // THE JD IS CHECKED TOO, narrowly. Every question the model writes goes
-  // through the phone gate, and until now the jd — the longest field, and the
-  // one that reaches the worker's system prompt — went through nothing but a
-  // length clamp. `containsProseDirective` is deliberately NOT `META_RE`: see
-  // its comment for why banning "developer" in a job description would be
-  // worse than the problem. It rejects an imperative aimed at a reader and
-  // structural markup, which is the shape of an injection attempt.
-  if (containsProseDirective(jd)) return null;
+  // THE JD IS NOT PATTERN-CHECKED, and that is a decision, not an oversight.
+  //
+  // A lexical gate was written here and then removed, because it was measured
+  // and it was worse than nothing: on ten realistic one-sentence JD bodies it
+  // rejected SIX — backend ("returns JSON payloads"), data ("CSV, XML and
+  // JSON feeds"), devops ("YAML pipeline definitions"), support ("read the
+  // ticket history"), sales ("never mention pricing before qualifying") and
+  // teaching ("read the curriculum") — and on eight plainly hostile strings
+  // it caught ZERO. It would have made drafting the engineering roles this
+  // feature is most wanted for impossible, while advertising a protection it
+  // did not provide.
+  //
+  // The decisive argument is not the hit rate, though. `createRoleSchema.jd`
+  // is `z.string().max(100_000)` with no content check at all, so the same
+  // interviewer can type any of those eight strings into the field by hand
+  // and press Save. A gate on the GENERATOR that the HUMAN path does not have
+  // protects nothing — it only moves where the text is typed.
+  //
+  // `roles.jd` reaching the phone worker's system prompt (`prompting.py:275`)
+  // is real and is tracked as its own work. It is a structural problem — the
+  // prompt concatenates where it should delimit — and no regex over free
+  // prose is the fix for it.
 
   const skills = Array.isArray(obj.required_skills)
     ? obj.required_skills
@@ -392,11 +406,29 @@ export async function generateRoleDraft(
     try {
       raw = await infer(buildPrompt(jobRole, failures));
     } catch (err) {
+      // UNPARSEABLE OUTPUT IS NOT AN OUTAGE, and the two arrive through the
+      // same throw. `runDeepseekJSON` retries once itself and then raises
+      // `BusinessError` when the reply still will not parse — a reachable,
+      // healthy provider that returned prose. Counting that as a provider
+      // failure told the operator "Hello could not be reached", sending them
+      // to retry something that was never down, and it is the COMMONEST
+      // failure of the two: a fenced ```json block or a sentence of preamble
+      // is enough to cause it.
+      if (err instanceof BusinessError) {
+        lastShapeFailure = true;
+        rejectedCount = 0;
+        failures = [
+          'The previous response could not be read as JSON. Return ONLY the raw JSON object, with no code fence, no preamble and no trailing prose.',
+        ];
+        continue;
+      }
       providerError = err;
       rejectedCount = 0;
-      failures = [
-        'The previous response could not be read at all. Return ONLY the raw JSON object, with no code fence, no preamble and no trailing prose.',
-      ];
+      // Says what actually happened. The old line claimed the response "could
+      // not be read at all", which on a timeout or a 502 is a description of
+      // an answer that never arrived — and it was fed into the next prompt,
+      // so the model was asked to fix output it had not produced.
+      failures = [];
       continue;
     }
     report({ phase: 'checking', attempt, maxAttempts: ROLE_DRAFT_MAX_ATTEMPTS });
