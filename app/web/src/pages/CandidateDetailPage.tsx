@@ -231,12 +231,17 @@ function OverviewTab({
    * `null` (never 0) when nothing completed, so the badge is absent rather
    * than claiming a zero-length call.
    */
-  const longestCallSeconds =
-    sessions.reduce<number | null>((best, session) => {
+  const longestSession =
+    sessions.reduce<(typeof sessions)[number] | null>((best, session) => {
       const secs = session.duration_sec;
       if (typeof secs !== "number" || !Number.isFinite(secs) || secs <= 0) return best;
-      return best == null || secs > best ? secs : best;
-    }, null) ?? null;
+      const bestSecs = best?.duration_sec ?? -1;
+      return secs > bestSecs ? session : best;
+    }, null);
+  const longestCallSeconds = longestSession?.duration_sec ?? null;
+  // From THE SAME session as the length, or the two figures describe
+  // different calls while sitting side by side.
+  const longestCallWords = longestSession?.candidate_words ?? null;
 
   return (
     // `fade-up-stagger` is the CSS-only reveal: candidate-scoped source may
@@ -257,6 +262,7 @@ function OverviewTab({
           candidate={candidate}
           roleTitle={roleTitle}
           callSeconds={longestCallSeconds}
+          candidateWords={longestCallWords}
           className="p-4 sm:p-5"
           footnote="Transcript, playback and scorecard sync back into the Review tab."
         />

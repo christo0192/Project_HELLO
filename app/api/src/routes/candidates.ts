@@ -962,6 +962,39 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
     .eq('candidate_id', req.params.id)
     .order('started_at', { ascending: false });
 
+  /**
+   * How many words the CANDIDATE said, per session.
+   *
+   * `duration_sec` is wall clock from session start to finalize
+   * (agent.py:9775) — the bot's speech, the candidate's, the ring and every
+   * silence. It is NOT talk time, and reading it as engagement inverts the
+   * truth on exactly the calls that matter: Praveetha's 2026-09-10 screen had
+   * 8 of 8 bot turns barged-in and truncated, and its wall clock reads as a
+   * long healthy conversation.
+   *
+   * Real talk time is not derivable from what is stored — `transcript_turns`
+   * carries a speaker and a persistence timestamp, no speech duration and no
+   * audio offsets, and the writes are batched so differencing `created_at`
+   * would look precise and be fiction. Words the candidate actually said are
+   * derivable, honest, and separate a talkative candidate from a silent one.
+   *
+   * Counted here rather than in the client because the turns are not in this
+   * payload and fetching them per session would be one round trip per call.
+   */
+  const sessionIds = (sessions ?? []).map((s) => (s as { id: string }).id);
+  const wordsBySession = new Map<string, number>();
+  if (sessionIds.length > 0) {
+    const { data: turns } = await supabase
+      .from('transcript_turns')
+      .select('session_id, text')
+      .in('session_id', sessionIds)
+      .eq('speaker', 'candidate');
+    for (const turn of (turns ?? []) as Array<{ session_id: string; text: string | null }>) {
+      const words = (turn.text ?? '').trim().split(/\s+/).filter(Boolean).length;
+      wordsBySession.set(turn.session_id, (wordsBySession.get(turn.session_id) ?? 0) + words);
+    }
+  }
+
   const { data: assessments } = await supabase
     .from('assessments')
     .select('*')
@@ -973,7 +1006,15 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
   // future column cannot be redacted in one route and forgotten in another.
   res.json({
     candidate: redactCandidatePhone(candidate as Record<string, unknown>, req.authUser?.appRole),
-    sessions: sessions ?? [],
+    sessions: (sessions ?? []).map((session) => {
+      const row = session as Record<string, unknown>;
+      return {
+        ...row,
+        // 0 is a REAL answer here — a candidate who said nothing. Absent only
+        // when the session has no transcript rows at all.
+        candidate_words: wordsBySession.get(row.id as string) ?? 0,
+      };
+    }),
     assessments: assessments ?? [],
   });
 });

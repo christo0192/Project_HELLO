@@ -76,6 +76,12 @@ export interface CandidateProfileCardProps {
    * 7m 14s" would be read as engagement and is not that.
    */
   callSeconds?: number | null;
+  /**
+   * Words the candidate said on that call. Shown BESIDE the call length
+   * because the pair is the point: a long call with very few candidate words
+   * is a call where they could not get a word in.
+   */
+  candidateWords?: number | null;
   /** Optional trailing note (the full workspace explains its live actions). */
   footnote?: ReactNode;
   className?: string;
@@ -86,6 +92,7 @@ export function CandidateProfileCard({
   candidate,
   roleTitle,
   callSeconds,
+  candidateWords,
   footnote,
   className = 'p-4 sm:p-5 lg:col-span-1',
 }: CandidateProfileCardProps) {
@@ -123,6 +130,15 @@ export function CandidateProfileCard({
               {/* Says WHAT was measured. There is no per-speaker talk time in
                   this system, so "on the call" is the honest caption. */}
               <span className="font-normal text-ink-secondary">on the call</span>
+            </span>
+          )}
+          {candidateWords != null && (
+            <span
+              data-candidate-words=""
+              className="inline-flex items-center gap-1.5 rounded-full bg-info-soft px-2.5 py-1 text-[13px] font-semibold tabular-nums text-ink"
+            >
+              {candidateWords.toLocaleString()}
+              <span className="font-normal text-ink-secondary">words spoken</span>
             </span>
           )}
         </div>

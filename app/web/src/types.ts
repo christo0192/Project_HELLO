@@ -165,6 +165,15 @@ export interface Session {
   started_at?: string | null;
   /** Call end instant (ISO), null while in progress. */
   ended_at?: string | null;
+  /**
+   * Words the CANDIDATE said in this session, from the transcript.
+   *
+   * Not talk time — no per-speaker duration is stored anywhere — but a real
+   * engagement signal, and one `duration_sec` cannot give: a call whose bot
+   * turns were all barged-in and truncated has a long wall clock and very few
+   * candidate words. Absent on payloads that predate this field.
+   */
+  candidate_words?: number;
 }
 
 export type Speaker = "bot" | "candidate";
