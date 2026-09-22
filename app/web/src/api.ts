@@ -98,6 +98,9 @@ import type {
   StatusTransitionResponse,
   TurnResult,
   UploadResumeResult,
+  RoleDraft,
+  RoleDraftOutcome,
+  RoleDraftProgress,
 } from './types';
 
 export { ApiError };
@@ -110,6 +113,104 @@ const BASE_URL = apiClient.BASE_URL;
  * token attachment as apiClient. Never stores the token; the CSV text is
  * returned to the caller which triggers a same-tab download.
  */
+/**
+ * Ask Hello — POST a job role and READ THE PROGRESS STREAM.
+ *
+ * The endpoint answers in NDJSON, one JSON object per line: `progress` events
+ * as each phase begins, then exactly one terminal `draft` or `error`. It is a
+ * stream rather than a plain 200 because v4-pro takes 133-206s per call and
+ * the server retries up to three times — a silent response can last the better
+ * part of ten minutes, which looks identical to a hang.
+ *
+ * Not `EventSource`: that cannot carry this API's Authorization header, and
+ * adding a token-in-query auth path to drive a progress bar would be a
+ * security change disguised as a UX one. `fetch` already sends the header.
+ *
+ * `signal` cancels the read AND the request, so a user who navigates away or
+ * presses Cancel is not left with a stream writing into a dead component.
+ */
+export async function draftRole(
+  jobRole: string,
+  opts: { onProgress?: (p: RoleDraftProgress) => void; signal?: AbortSignal } = {},
+): Promise<RoleDraftOutcome> {
+  let token: string | null = null;
+  try {
+    const result = await supabase.auth.getSession();
+    token = result?.data?.session?.access_token ?? null;
+  } catch {
+    token = null;
+  }
+  const res = await fetch(`${BASE_URL}/api/roles/draft`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    },
+    body: JSON.stringify({ job_role: jobRole }),
+    signal: opts.signal,
+  });
+  if (res.status === 401 && typeof window !== 'undefined') {
+    window.dispatchEvent(new CustomEvent('auth:unauthorized'));
+  }
+  if (!res.ok || !res.body) {
+    throw new ApiError(`${res.status} ${res.statusText}`, res.status);
+  }
+
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let outcome: RoleDraftOutcome | null = null;
+  let failure: ApiError | null = null;
+
+  /** One complete line. Partial lines stay in `buffer` until their newline. */
+  const consume = (line: string) => {
+    const text = line.trim();
+    if (!text) return;
+    let event: Record<string, unknown>;
+    try {
+      event = JSON.parse(text) as Record<string, unknown>;
+    } catch {
+      // A truncated or malformed line is not worth failing the whole draft
+      // over; the terminal event is what decides the outcome.
+      return;
+    }
+    if (event.type === 'progress') {
+      opts.onProgress?.(event as unknown as RoleDraftProgress);
+    } else if (event.type === 'draft') {
+      outcome = {
+        draft: event.draft as RoleDraft,
+        attempts: Number(event.attempts) || 1,
+        repaired: Array.isArray(event.repaired) ? (event.repaired as string[]) : [],
+      };
+    } else if (event.type === 'error') {
+      // The stream already sent 200, so a failure cannot be a status code —
+      // it arrives as data and has to be surfaced as an error here.
+      failure = new ApiError(String(event.message ?? 'Hello could not draft this role.'), 422);
+    }
+  };
+
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    let newline = buffer.indexOf('\n');
+    while (newline >= 0) {
+      consume(buffer.slice(0, newline));
+      buffer = buffer.slice(newline + 1);
+      newline = buffer.indexOf('\n');
+    }
+  }
+  consume(buffer);
+
+  if (failure) throw failure;
+  if (!outcome) {
+    // The stream ended with neither a draft nor an error: the connection died
+    // mid-flight. Saying so is better than resolving with nothing.
+    throw new ApiError('Hello stopped responding before it finished.', 504);
+  }
+  return outcome;
+}
+
 async function requestText(path: string, init?: RequestInit): Promise<string> {
   let token: string | null = null;
   try {

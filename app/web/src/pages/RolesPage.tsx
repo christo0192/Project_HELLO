@@ -20,6 +20,7 @@ import {
   usePagination,
 } from "../components/design";
 import { RoleScorecardEditor } from "../components/roles/RoleScorecardEditor";
+import { AskHelloButton } from "../components/roles/AskHelloButton";
 
 interface QuestionRow {
   id: string;
@@ -225,6 +226,7 @@ function RoleForm({
   onSaved: () => void;
 }) {
   const [title, setTitle] = useState(role?.title ?? "");
+  const [agentName, setAgentName] = useState(role?.agent_name ?? "");
   const [jd, setJd] = useState(role?.jd ?? "");
   const [interviewerInstructions, setInterviewerInstructions] = useState(
     role?.interviewer_instructions ?? "",
@@ -241,6 +243,8 @@ function RoleForm({
   );
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  /** Set after Ask Hello fills the form; cleared once the role is saved. */
+  const [draftNote, setDraftNote] = useState<string | null>(null);
 
   function updateQuestion(idx: number, patch: Partial<QuestionRow>) {
     setQuestions((prev) =>
@@ -261,7 +265,7 @@ function RoleForm({
     setFormError(null);
 
     if (!title.trim()) {
-      setFormError("Title is required.");
+      setFormError("Job role is required.");
       return;
     }
     const questionIssue = questions
@@ -287,6 +291,9 @@ function RoleForm({
 
     const body: RoleInput = {
       title: title.trim(),
+      // Blank means unset, which the API stores as NULL — one representation,
+      // matching the column's check constraint.
+      agent_name: agentName.trim() ? agentName.trim() : null,
       jd: jd.trim(),
       required_skills,
       screening_template,
@@ -313,7 +320,24 @@ function RoleForm({
         description="The title, focus and questions below drive the screening conversation."
       />
       <form onSubmit={handleSubmit} className="mt-5 space-y-5">
-        <Field label="Title" id="role-title">
+        {/* ABOVE the job role, because it is what the operator calls this
+            screener day to day. It is NEVER spoken: `title` is the job the
+            candidate applied for and remains the only name the phone worker
+            reads aloud. */}
+        <Field label="Agent" id="role-agent-name" hint="Your internal name for this screener. Never spoken to candidates.">
+          {({ id, describedBy }) => (
+            <TextField
+              id={id}
+              aria-describedby={describedBy}
+              value={agentName}
+              maxLength={80}
+              placeholder="e.g. Gopu"
+              onChange={(e) => setAgentName(e.target.value)}
+            />
+          )}
+        </Field>
+
+        <Field label="Job role" id="role-title">
           {({ id }) => (
             <TextField
               id={id}
@@ -323,6 +347,45 @@ function RoleForm({
             />
           )}
         </Field>
+
+        {/* Drafts the three fields below from the job role above. Placed
+            here, between the input it reads and the fields it writes, so the
+            direction is obvious. */}
+        <AskHelloButton
+          className="mt-1"
+          jobRole={title}
+          wouldOverwrite={Boolean(
+            jd.trim() || skillsText.trim() || questions.some((q) => q.question.trim()),
+          )}
+          onError={setFormError}
+          onDrafted={(outcome) => {
+            setFormError(null);
+            setJd(outcome.draft.jd);
+            setSkillsText(outcome.draft.required_skills.join(", "));
+            setQuestions(
+              outcome.draft.screening_template.map((q, i) => ({
+                id: q.id || `q${i + 1}`,
+                question: q.question,
+                weight: q.weight ?? 1,
+              })),
+            );
+            setDraftNote(
+              outcome.repaired.length > 0
+                ? `Hello rephrased ${outcome.repaired.length} question${
+                    outcome.repaired.length === 1 ? "" : "s"
+                  } the screener would not read aloud. Review them before saving.`
+                : "Hello drafted this role. Review it before saving.",
+            );
+          }}
+        />
+
+        {/* Said plainly, because a drafted role is NOT a saved role and the
+            form gives no other signal that a model wrote what is on screen. */}
+        {draftNote && (
+          <InlineNotice tone="info" role="status" className="mt-1">
+            {draftNote}
+          </InlineNotice>
+        )}
 
         <Field label="Job description" id="role-jd">
           {({ id }) => (

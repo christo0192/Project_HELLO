@@ -10,6 +10,14 @@ export interface ScreeningQuestion {
 export interface Role {
   id: string;
   title: string;
+  /**
+   * Operator-facing internal label for the screening agent (0100).
+   *
+   * NEVER spoken and never used for routing — `title` is the job the candidate
+   * applied for and remains the only name the phone worker reads aloud.
+   * Absent on payloads that predate the column.
+   */
+  agent_name?: string | null;
   jd: string;
   required_skills: string[];
   screening_template: ScreeningQuestion[];
@@ -18,8 +26,28 @@ export interface Role {
   created_at: string;
 }
 
+/** One line of the Ask Hello progress stream. */
+export type RoleDraftProgress =
+  | { phase: 'drafting'; attempt: number; maxAttempts: number }
+  | { phase: 'checking'; attempt: number; maxAttempts: number }
+  | { phase: 'repairing'; attempt: number; maxAttempts: number; rejected: number };
+
+export interface RoleDraft {
+  jd: string;
+  required_skills: string[];
+  screening_template: ScreeningQuestion[];
+}
+
+export interface RoleDraftOutcome {
+  draft: RoleDraft;
+  attempts: number;
+  /** Questions the model had to re-phrase to get past the phone gate. */
+  repaired: string[];
+}
+
 export interface RoleInput {
   title: string;
+  agent_name?: string | null;
   jd: string;
   required_skills: string[];
   screening_template: ScreeningQuestion[];
