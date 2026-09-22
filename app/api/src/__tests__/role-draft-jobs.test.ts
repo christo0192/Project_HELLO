@@ -714,6 +714,55 @@ describe('readRoleDraft', () => {
   });
 });
 
+describe('a database failure is never reported as an absence', () => {
+  // Three reads, one rule. A review deleted each `if (error) throw` in turn
+  // and the suite stayed green every time — `selectError` was declared and
+  // never used. Each collapse tells the caller something false:
+  //
+  //   readRoleDraft   -> 404 "no such draft" for a pooler reset
+  //   readActiveRoleDraft -> "nothing is running", so a refresh abandons a
+  //                          live job and the next start races the index
+  //   cancelRoleDraft -> `{cancelled:false}`, which the client reads as a
+  //                      lost race and says nothing, while v4-pro bills on
+
+  it('readRoleDraft THROWS rather than answering 404', async () => {
+    selectError = new Error('pooler reset');
+    await expect(readRoleDraft(OWNER, 'draft-1')).rejects.toThrow('pooler reset');
+  });
+
+  it('readActiveRoleDraft THROWS rather than answering "nothing running"', async () => {
+    selectError = new Error('pooler reset');
+    await expect(readActiveRoleDraft(OWNER)).rejects.toThrow('pooler reset');
+  });
+
+  it('cancelRoleDraft THROWS rather than answering "already finished"', async () => {
+    // `false` means "there was no running job" — a race nobody is to blame
+    // for. A failed write means the opposite: the job IS running and
+    // `cancelled_at` was never written.
+    updateError = new Error('pooler reset');
+    await expect(cancelRoleDraft(OWNER, 'draft-1')).rejects.toThrow('pooler reset');
+  });
+});
+
+describe('a settled row advertises no phase', () => {
+  it('clears `phase` on success', async () => {
+    // The contract says phase is null once the job settles. A settled row
+    // still carrying "checking" makes a finished job look busy to anything
+    // reading the table.
+    const run = vi.fn().mockResolvedValue({ draft: DRAFT, attempts: 1, repaired: [] });
+    await startRoleDraft(OWNER, 'Sales Advisor', { run: run as never });
+    await settle();
+    expect(finalWrite()?.payload).toHaveProperty('phase', null);
+  });
+
+  it('clears `phase` on failure too', async () => {
+    const run = vi.fn().mockRejectedValue(new Error('socket hang up'));
+    await startRoleDraft(OWNER, 'Sales Advisor', { run: run as never });
+    await settle();
+    expect(finalWrite()?.payload).toHaveProperty('phase', null);
+  });
+});
+
 describe('cancelRoleDraft', () => {
   it('cancels only a RUNNING job owned by the caller', async () => {
     updateResult = [{ id: 'draft-1' }];

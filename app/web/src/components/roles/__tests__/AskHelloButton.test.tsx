@@ -357,6 +357,70 @@ describe('AskHelloButton', () => {
     );
   });
 
+  it('RETURNS FOCUS to the button before Cancel unmounts', async () => {
+    // Cancel is the element being removed. A keyboard user standing on it
+    // when it disappears lands on <body>, and the next Tab restarts from the
+    // top of the page — the same failure `aria-disabled` avoids on the main
+    // button, reintroduced two elements away. A review deleted `returnFocus`
+    // and the suite stayed green.
+    mockApi.getRoleDraft.mockResolvedValue(running());
+    setup();
+    await act(async () => askHello().click());
+    const cancel = await screen.findByRole('button', { name: 'Cancel' });
+    cancel.focus();
+    expect(document.activeElement).toBe(cancel);
+
+    await act(async () => cancel.click());
+    await waitFor(() => expect(document.activeElement).toBe(askHello()));
+    expect(document.activeElement).not.toBe(document.body);
+  });
+
+  it('does NOT steal focus from elsewhere on the page', async () => {
+    // The guard on the other side: focus returns only when it is already
+    // inside this component. An operator who tabbed on to the JD field must
+    // not be yanked back when a draft settles.
+    mockApi.getRoleDraft.mockResolvedValue(running());
+    setup();
+    await act(async () => askHello().click());
+    await screen.findByRole('button', { name: 'Cancel' });
+
+    const outside = document.createElement('input');
+    document.body.appendChild(outside);
+    outside.focus();
+
+    mockApi.getRoleDraft.mockResolvedValue(succeeded());
+    await poll();
+    await waitFor(() =>
+      expect(screen.queryByRole('button', { name: 'Cancel' })).not.toBeInTheDocument(),
+    );
+    expect(document.activeElement).toBe(outside);
+    outside.remove();
+  });
+
+  it('a late resume does NOT stomp a job started locally', async () => {
+    // `setJobId(current => current ?? active.id)` rather than a bare set. The
+    // resume lookup and a click can race, and adopting the server's answer
+    // over a job this component just started would orphan the click.
+    let releaseResume: (v: unknown) => void = () => {};
+    mockApi.getActiveRoleDraft.mockReturnValue(
+      new Promise((resolve) => {
+        releaseResume = resolve;
+      }),
+    );
+    mockApi.startRoleDraft.mockResolvedValue({ ...running(), id: 'started-here' });
+    mockApi.getRoleDraft.mockResolvedValue(running());
+    setup();
+
+    await act(async () => askHello().click());
+    await waitFor(() => expect(mockApi.getRoleDraft).toHaveBeenCalledWith('started-here'));
+
+    await act(async () => {
+      releaseResume({ active: { ...running(), id: 'from-server' } });
+    });
+    await poll();
+    expect(mockApi.getRoleDraft).not.toHaveBeenCalledWith('from-server');
+  });
+
   it('keeps the live region MOUNTED while idle', () => {
     // A region created at the same moment its content appears is not reliably
     // announced — the first phase change would be silent.

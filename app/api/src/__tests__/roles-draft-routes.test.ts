@@ -17,6 +17,26 @@ vi.mock('../lib/supabase.js', () => ({
   supabase: { from: vi.fn(), rpc: vi.fn() },
   RESUME_BUCKET: 'resumes_v2',
 }));
+
+/** Payloads handed to `.insert()`, so a route test can assert what it SENDS. */
+let inserted: Array<Record<string, unknown>> = [];
+function insertRecorder(): any {
+  const self: any = {
+    insert(payload: Record<string, unknown>) {
+      inserted.push(payload);
+      return self;
+    },
+    select: () => self,
+    eq: () => self,
+    single: () =>
+      Promise.resolve({ data: { id: 'role-1', ...(inserted.at(-1) ?? {}) }, error: null }),
+    maybeSingle: () =>
+      Promise.resolve({ data: { id: 'role-1', ...(inserted.at(-1) ?? {}) }, error: null }),
+    then: (res: (v: unknown) => unknown) =>
+      Promise.resolve({ data: [{ id: 'role-1' }], error: null }).then(res),
+  };
+  return self;
+}
 vi.mock('../lib/role-draft-jobs.js', async () => ({
   // The real class, because the route branches on `instanceof`. A stub class
   // here would make the 409 test pass while production 500s.
@@ -83,6 +103,7 @@ beforeEach(() => {
   vi.mocked(jobs.cancelRoleDraft).mockReset().mockResolvedValue(true);
   vi.mocked(recordAudit).mockReset().mockResolvedValue(undefined as never);
   vi.mocked(supabase.from).mockReset();
+  inserted = [];
 });
 afterEach(() => vi.restoreAllMocks());
 
@@ -278,6 +299,57 @@ describe('POST /api/roles/draft/:id/cancel', () => {
   it('refuses a viewer', async () => {
     const res = await request(app('viewer')).post(`/api/roles/draft/${DRAFT_ID}/cancel`).set(AUTH);
     expect(res.status).toBe(403);
+  });
+});
+
+describe('POST /api/roles — what the insert actually carries', () => {
+  // A REVIEW MUTATION SURVIVED HERE. The web form goes to some trouble to omit
+  // `agent_name` when it was never touched — because `roles.agent_name` only
+  // exists after `supabase db push` of 0100, and PostgREST rejects an unknown
+  // column with PGRST204, which 500s EVERY role create until the migration
+  // lands. Making the route send it unconditionally kept the whole suite
+  // green, so the guard existed on one side only and nothing said so.
+  //
+  // These assert the PAYLOAD, not the response, because the payload is the
+  // thing the database sees.
+
+  beforeEach(() => {
+    vi.mocked(supabase.from).mockImplementation(() => insertRecorder() as never);
+  });
+
+  it('OMITS agent_name when the caller did not send it', async () => {
+    const res = await request(app()).post('/api/roles').set(AUTH).send({
+      title: 'Sales Advisor',
+      jd: 'Sell things.',
+      required_skills: ['Sales'],
+      screening_template: [{ id: 'q1', question: 'What do you sell?', weight: 1 }],
+    });
+    expect(res.status).toBeLessThan(400);
+    expect(inserted).toHaveLength(1);
+    expect('agent_name' in inserted[0]).toBe(false);
+  });
+
+  it('SENDS it when the caller did', async () => {
+    await request(app()).post('/api/roles').set(AUTH).send({
+      title: 'Sales Advisor',
+      agent_name: 'Gopu',
+      jd: 'Sell things.',
+      required_skills: ['Sales'],
+      screening_template: [{ id: 'q1', question: 'What do you sell?', weight: 1 }],
+    });
+    expect(inserted[0]?.agent_name).toBe('Gopu');
+  });
+
+  it('sends NULL for a blank one — "unset" has a single representation', async () => {
+    await request(app()).post('/api/roles').set(AUTH).send({
+      title: 'Sales Advisor',
+      agent_name: '   ',
+      jd: 'Sell things.',
+      required_skills: ['Sales'],
+      screening_template: [{ id: 'q1', question: 'What do you sell?', weight: 1 }],
+    });
+    expect('agent_name' in inserted[0]).toBe(true);
+    expect(inserted[0]?.agent_name).toBeNull();
   });
 });
 

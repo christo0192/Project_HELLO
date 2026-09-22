@@ -76,31 +76,27 @@ create table if not exists screening_v2.role_drafts (
   )
 );
 
--- Two reads, and both exist in the code.
+-- ONE INDEX, FOR THE ONE READ THAT EXISTS.
 --
--- `owner_recent` serves "my most recent draft", which is what lets a refresh
--- pick a running job back up: the browser holds no id across a reload, so the
--- client asks the server what it already has. Without it, a ten-minute job
--- became unreachable the moment the form unmounted — still billing, its result
--- written to a row nobody could name.
+-- An `(owner_id, created_at desc)` index shipped here first, justified as
+-- serving "my most recent draft". It served nothing: the only read that could
+-- use it filters `status = 'running'` and orders by `updated_at desc`, and
+-- nothing in the module orders by `created_at` at all. A dead index is write
+-- amplification on every insert plus a comment that misleads the next reader
+-- about which queries exist.
 --
--- `owner_running` serves the admission check. `startRoleDraft` does not begin
--- a second job for the same job role while one is live — it RETURNS the live
--- one, which is also what a second tab should see. Each start detaches up to
--- six v4-pro calls (`runDeepseekJSON` retries once itself) into the process
--- that also serves live-call operations, and nothing else bounds how often the
--- button can be pressed.
-create index if not exists idx_role_drafts_owner_recent
-  on screening_v2.role_drafts (owner_id, created_at desc);
--- UNIQUE, not just an index. The admission check in `startRoleDraft` is a
--- SELECT followed by an INSERT, and that pair does not exclude a concurrent
--- one: two tabs posting at the same moment both see no live row and both
--- insert, detaching two chains of up to six v4-pro calls into the process
--- that also serves live-call operations. The comment above names that exact
--- threat; a plain index does not answer it. The database does.
+-- What remains is UNIQUE, not merely an index, and that is load-bearing. The
+-- admission check in `startRoleDraft` is a SELECT followed by an INSERT, and
+-- that pair does not exclude a concurrent one: two tabs both see no live row
+-- and both insert, detaching two chains of up to six v4-pro calls into the
+-- process that also serves live-call operations. The database is what stops
+-- it. It also serves the ordered read, since a partial index on `owner_id`
+-- covers a lookup filtered to `status = 'running'`.
 --
 -- Partial on `status = 'running'`, so a settled or cancelled row never blocks
--- the next draft — only a live one does, which is the rule being enforced.
+-- the next draft. A STALE running row does block it — the index has no notion
+-- of staleness — which is why `startRoleDraft` reads through its own
+-- staleness filter on a 23505 and expires the dead row rather than failing.
 create unique index if not exists uq_role_drafts_owner_running
   on screening_v2.role_drafts (owner_id) where status = 'running';
 

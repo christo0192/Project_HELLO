@@ -9885,6 +9885,11 @@ components:
       type: object
       required: [title]
       properties:
+        agent_name:
+          type: string
+          maxLength: 80
+          nullable: true
+          description: Operator-facing label for this role's screening agent. NEVER spoken to a candidate and never used for routing. Omit the key entirely to leave it untouched; send null to clear it. A blank string is coerced to null.
         title:
           type: string
         jd:
@@ -9903,6 +9908,11 @@ components:
     UpdateRoleRequest:
       type: object
       properties:
+        agent_name:
+          type: string
+          maxLength: 80
+          nullable: true
+          description: Operator-facing label for this role's screening agent. NEVER spoken to a candidate and never used for routing. Omit the key entirely to leave it untouched; send null to clear it. A blank string is coerced to null.
         title:
           type: string
         jd:

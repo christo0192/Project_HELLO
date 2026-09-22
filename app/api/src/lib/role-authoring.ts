@@ -176,6 +176,16 @@ export interface RoleDraftDeps {
   /** Seam for tests; defaults to DeepSeek v4-pro. */
   infer?: (prompt: string) => Promise<unknown>;
   /**
+   * Seam for the PROVIDER CALL ITSELF, one level below `infer`.
+   *
+   * `infer` replaces the whole default closure, so a test that injects it
+   * never reaches the options that closure builds — and the timeout floor
+   * lives in exactly those options. A review disconnected the floor from the
+   * call site and every test stayed green. This is the seam that makes the
+   * wiring assertable without also faking the model.
+   */
+  runJson?: typeof runClaudeJSONWithProvenance;
+  /**
    * Called on every phase change. MUST NOT throw — a progress sink that fails
    * must not fail the generation it is only describing.
    */
@@ -350,7 +360,8 @@ export async function generateRoleDraft(
   const infer =
     deps.infer ??
     (async (prompt: string) => {
-      const { data } = await runClaudeJSONWithProvenance<unknown>(prompt, {
+      const run = deps.runJson ?? runClaudeJSONWithProvenance;
+      const { data } = await run<unknown>(prompt, {
         model: env.deepseekScoringModel,
         // FLOORED, because the budget this reads is shared and its declared
         // value is too small for this call.

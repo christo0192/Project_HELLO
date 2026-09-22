@@ -56,6 +56,32 @@ vi.mock('../api', () => ({
   },
 }));
 
+const DRAFTED = {
+  jd: 'Sell the product to enterprise buyers.',
+  required_skills: ['Sales', 'Negotiation'],
+  screening_template: [
+    { id: 'q1', question: 'What does your current role involve day to day?', weight: 1 },
+    { id: 'q2', question: 'How do you handle an unhappy customer?', weight: 1 },
+    { id: 'q3', question: 'What made you look for a new position?', weight: 1 },
+  ],
+};
+
+/** A settled job, as the poll returns it. */
+const succeededJob = (over: Record<string, unknown> = {}) => ({
+  id: 'job-1',
+  job_role: 'Sales Advisor',
+  status: 'succeeded',
+  phase: null,
+  draft: DRAFTED,
+  attempts: 1,
+  repaired: [],
+  error_reason: null,
+  error_message: null,
+  max_attempts: 3,
+  created_at: new Date().toISOString(),
+  ...over,
+});
+
 describe('RolesPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -231,6 +257,82 @@ describe('RolesPage', () => {
     const body = mockApi.updateRole.mock.calls[0][1];
     expect('agent_name' in body).toBe(true);
     expect(body.agent_name).toBeNull();
+  });
+
+  it('APPLIES A LANDED DRAFT to the form, and says so in a live region', async () => {
+    // NOTHING IN THIS FILE EVER COMPLETED A DRAFT before, so the entire
+    // `onDrafted` branch was uncovered — including the div-inside-<p> fix and
+    // the `role="none"` that stops two live regions nesting. The project's
+    // harness fails on an unexpected console.error, and React logs one for
+    // invalid nesting, so this test is also what would have caught that.
+    mockApi.listRoles.mockResolvedValue([]);
+    mockApi.startRoleDraft.mockResolvedValue({ ...succeededJob(), status: 'running' });
+    mockApi.getRoleDraft.mockResolvedValue(succeededJob());
+    render(<RolesPage />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: 'New role' }));
+
+    await user.type(screen.getByLabelText('Job role'), 'Sales Advisor');
+    await user.click(screen.getByRole('button', { name: /Ask Hello/ }));
+
+    await waitFor(() =>
+      expect(screen.getByLabelText('Job description')).toHaveValue(DRAFTED.jd),
+    );
+    expect(screen.getByLabelText(/Required skills/)).toHaveValue('Sales, Negotiation');
+
+    // Said in a region that was mounted before it had anything to say.
+    const note = document.querySelector('[data-role-draft-note]');
+    expect(note).not.toBeNull();
+    expect(note?.textContent).toContain('Review it before saving');
+    // ONE live region, not two nested.
+    expect(note?.querySelectorAll('[role="status"]').length).toBe(0);
+  });
+
+  it('NAMES THE ROLE a draft was actually written for when it no longer matches', async () => {
+    // The field stays editable for the ten minutes a draft runs. Applying a
+    // Sales Advisor draft under a heading that now says something else without
+    // saying so is a silent lie about what is on screen.
+    mockApi.listRoles.mockResolvedValue([]);
+    mockApi.startRoleDraft.mockResolvedValue({ ...succeededJob(), status: 'running' });
+    mockApi.getRoleDraft.mockResolvedValue(succeededJob({ job_role: 'Sales Advisr' }));
+    render(<RolesPage />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: 'New role' }));
+
+    await user.type(screen.getByLabelText('Job role'), 'Sales Advisor');
+    await user.click(screen.getByRole('button', { name: /Ask Hello/ }));
+
+    await waitFor(() =>
+      expect(document.querySelector('[data-role-draft-note]')?.textContent).toContain(
+        'Sales Advisr',
+      ),
+    );
+  });
+
+  it('reports how many questions Hello had to rephrase', async () => {
+    mockApi.listRoles.mockResolvedValue([]);
+    mockApi.startRoleDraft.mockResolvedValue({ ...succeededJob(), status: 'running' });
+    mockApi.getRoleDraft.mockResolvedValue(succeededJob({ repaired: ['q2 was a directive'] }));
+    render(<RolesPage />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole('button', { name: 'New role' }));
+
+    await user.type(screen.getByLabelText('Job role'), 'Sales Advisor');
+    await user.click(screen.getByRole('button', { name: /Ask Hello/ }));
+
+    await waitFor(() =>
+      expect(document.querySelector('[data-role-draft-note]')?.textContent).toContain(
+        'rephrased 1 question',
+      ),
+    );
+  });
+
+  it('shows the AGENT NAME on the role card — a write-only field is uncheckable', async () => {
+    mockApi.listRoles.mockResolvedValue([{ ...mockRole, agent_name: 'Gopu' }]);
+    render(<RolesPage />);
+    await waitFor(() =>
+      expect(document.querySelector('[data-role-agent-name]')?.textContent).toContain('Gopu'),
+    );
   });
 
   it('new role form validates required job role', async () => {

@@ -47,6 +47,15 @@ interface Scenario {
   /** Pages the turn query returns, in order. */
   turnPages: Array<Array<ReturnType<typeof turn>>>;
   turnError?: unknown;
+  /**
+   * Zero-based page index that fails instead of returning rows.
+   *
+   * Distinct from `turnError`, which fails EVERY page including the first.
+   * A first-page failure never reaches the partial-count problem, so it
+   * cannot exercise `wordCountsUsable` — which is how that flag came to be
+   * deletable with this file green.
+   */
+  failOnPage?: number;
 }
 let scenario: Scenario;
 /** Every `.range(from, to)` the turn query asked for. */
@@ -83,9 +92,11 @@ function chain(table: string): any {
       }),
     range(from: number, to: number) {
       ranges.push([from, to]);
+      const failing =
+        scenario.turnError ?? (scenario.failOnPage === turnPage ? new Error('pooler reset') : null);
       const rows = scenario.turnPages[turnPage] ?? [];
       turnPage += 1;
-      self.__result = { data: rows, error: scenario.turnError ?? null };
+      self.__result = failing ? { data: null, error: failing } : { data: rows, error: null };
       return self;
     },
     then(res: (v: unknown) => unknown, rej?: (e: unknown) => unknown) {
@@ -181,11 +192,27 @@ describe('candidate_words', () => {
     expect(res.body.sessions[0].candidate_words).toBeNull();
   });
 
-  it('reports NULL — not a short count — when the read fails', async () => {
-    // A partial count renders as a confident low number against a real
-    // candidate, and nothing on screen would say it came from a failed read.
+  it('reports NULL when the read fails on the FIRST page', async () => {
     scenario.turnPages = [[turn(S1, 'candidate', 'one two three')]];
     scenario.turnError = new Error('pooler reset');
+    const res = await get();
+    expect(res.body.sessions[0].candidate_words).toBeNull();
+  });
+
+  it('reports NULL when the read fails MID-PAGINATION — the case that needs the flag', async () => {
+    // THE TEST ABOVE DOES NOT COVER `wordCountsUsable`, and a review proved
+    // it: failing on page 1 means no row is ever processed, so the null it
+    // asserts comes from the has-a-transcript check, not from the flag.
+    // Deleting `wordCountsUsable = false` keeps that test green.
+    //
+    // This is the case the flag exists for. Page 1 lands with 500 real
+    // candidate words, page 2 errors. Without the flag the route answers 500
+    // — a confident, precise-looking undercount against a real candidate,
+    // with nothing on screen saying it came from a failed read. Exactly what
+    // the code comment promises never to do.
+    const full = Array.from({ length: 500 }, () => turn(S1, 'candidate', 'word'));
+    scenario.turnPages = [full];
+    scenario.failOnPage = 1;
     const res = await get();
     expect(res.body.sessions[0].candidate_words).toBeNull();
   });

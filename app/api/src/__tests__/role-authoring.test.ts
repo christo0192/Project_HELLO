@@ -24,6 +24,7 @@ import {
   ROLE_DRAFT_QUESTION_COUNT,
 } from '../lib/role-authoring.js';
 import { validatePhoneQuestion } from '../lib/phone-screening/question-validation.js';
+import { BusinessError } from '../lib/provider-resilience.js';
 import { createRoleSchema } from '../schemas/roles.js';
 
 /** A draft every gate accepts. At least MIN_QUESTIONS (3) entries. */
@@ -376,6 +377,63 @@ describe('generateRoleDraft — cancellation actually stops the spending', () =>
   it('works with no shouldCancel supplied at all', async () => {
     const infer = vi.fn().mockResolvedValue(goodDraft());
     await expect(generateRoleDraft('Any', { infer })).resolves.toBeTruthy();
+  });
+});
+
+describe('generateRoleDraft — an unreadable answer is not an outage', () => {
+  // `runDeepseekJSON` retries once itself and then raises `BusinessError` when
+  // the reply still will not parse — a reachable, healthy provider that
+  // returned prose, and the commonest failure of the two (a fenced ```json
+  // block or a sentence of preamble is enough).
+  //
+  // Counted as a provider failure it produced "Hello could not be reached",
+  // sending the operator to retry something that was never down. A review
+  // deleted the `instanceof BusinessError` branch and the whole suite stayed
+  // green, because nothing here imported the class.
+
+  it('reports UNUSABLE OUTPUT, not an unreachable provider', async () => {
+    const infer = vi.fn().mockRejectedValue(new BusinessError());
+    const err = await generateRoleDraft('Any', { infer }).catch((e) => e);
+    expect(err.message).toContain('not usable');
+    expect(err.message).not.toContain('could not be reached');
+  });
+
+  it('spends an attempt on it and asks again for raw JSON', async () => {
+    // Not the whole budget, and the retry says what was actually wrong.
+    const infer = vi
+      .fn()
+      .mockRejectedValueOnce(new BusinessError())
+      .mockResolvedValueOnce(goodDraft());
+    const { draft, attempts } = await generateRoleDraft('Any', { infer });
+    expect(attempts).toBe(2);
+    expect(draft.screening_template).toHaveLength(3);
+    const secondPrompt = infer.mock.calls[1][0] as string;
+    expect(secondPrompt).toContain('could not be read as JSON');
+  });
+
+  it('still calls a plain provider throw an outage', async () => {
+    // The other side of the branch. Collapsing both into one message is the
+    // bug; collapsing them the other way would be the same bug mirrored.
+    const infer = vi.fn().mockRejectedValue(new Error('504 upstream timeout'));
+    const err = await generateRoleDraft('Any', { infer }).catch((e) => e);
+    expect(err.message).toContain('could not be reached');
+  });
+});
+
+describe('generateRoleDraft — the floor reaches the provider call', () => {
+  it('PASSES THE FLOORED BUDGET, not the configured one', async () => {
+    // `roleDraftTimeoutMs` is tested as a function elsewhere. That is not the
+    // same as testing that the generator USES it: a review disconnected the
+    // call site — `timeoutMs: env.deepseekTimeoutMs` — and every test stayed
+    // green, because they all inject `deps.infer` and never reach the default
+    // closure. This one reaches it.
+    const calls: Array<Record<string, unknown>> = [];
+    const runner = vi.fn(async (_prompt: string, opts: Record<string, unknown>) => {
+      calls.push(opts);
+      return { data: goodDraft() };
+    });
+    await generateRoleDraft('Any', { runJson: runner as never });
+    expect(calls[0]?.timeoutMs).toBe(240_000);
   });
 });
 
