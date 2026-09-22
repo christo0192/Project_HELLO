@@ -35,6 +35,41 @@ import {
   validatePhoneQuestionTemplate,
 } from './phone-screening/question-validation.js';
 
+/**
+ * Openings the screening worker cannot speak — an instruction TO an
+ * interviewer, not a question FOR a candidate.
+ */
+const DIRECTIVE_OPENING_RE =
+  /^\s*(?:ask|probe|explore|cover|check|confirm|discuss|understand|find)\b/i;
+
+/**
+ * The generator's own check, STRICTER than `validatePhoneQuestion`.
+ *
+ * The shared validator's speakability test is an ALTERNATION — `/\?|\btell\b|
+ * \bdescribe\b|…/` — so "Describe your approach to handling objections." has
+ * no question mark and passes it clean, and "Ask about a deal you closed?"
+ * passes despite being an instruction to an interviewer rather than something
+ * to say to a candidate. Both were verified against the real regex.
+ *
+ * The prompt already TELLS the model both rules (":149-150"). Stating a rule
+ * and then not enforcing it is the worst of both: the model is free to ignore
+ * it and the draft is returned as verified-clean.
+ *
+ * Enforced HERE rather than by widening the shared validator on purpose. That
+ * validator also runs on every existing role's save path, and tightening it
+ * would retroactively make saved roles unsaveable — a much larger blast
+ * radius than one generator refusing to emit a shape it was told not to.
+ */
+function generatedQuestionIssue(text: string): string | null {
+  if (!text.trim().endsWith('?')) {
+    return 'must end with a question mark';
+  }
+  if (DIRECTIVE_OPENING_RE.test(text)) {
+    return 'must not begin with ask/probe/explore/cover/check/confirm/discuss/understand/find — it is spoken to the candidate, not to an interviewer';
+  }
+  return null;
+}
+
 /** Attempts INCLUDING the first. 3 = one draft plus two repair rounds. */
 export const ROLE_DRAFT_MAX_ATTEMPTS = 3;
 /** How many questions a draft aims for. */
@@ -86,9 +121,16 @@ export type RoleDraftPhase =
       phase: 'repairing';
       attempt: number;
       maxAttempts: number;
-      /** How many questions the phone gate refused. */
+      /** How many questions the phone gate refused. Always >= 1 here. */
       rejected: number;
-    };
+    }
+  /**
+   * The model's output was not usable AT ALL — unparseable, or missing a
+   * required key. A distinct phase because reporting it as `repairing` made
+   * the UI say "Rephrasing 1 question the screener won't read aloud" when no
+   * question had been examined and the model had returned prose.
+   */
+  | { phase: 'rereading'; attempt: number; maxAttempts: number };
 
 export interface RoleDraftDeps {
   /** Seam for tests; defaults to DeepSeek v4-pro. */
@@ -145,30 +187,51 @@ candidate by an automated caller, so each one must:
 - be one sentence a person can say naturally in under 12 seconds
 - ask the candidate about THEIR experience, not about the hiring process
 - NOT begin with any of: ask, probe, explore, cover, check, confirm, discuss, understand, find
-- NOT contain any of these words in any form, even innocently: ${BANNED_WORDS.join(', ')}
+- NOT contain any of these words: ${BANNED_WORDS.join(', ')}
+- NOT contain the words json, xml or yaml, any of [ ] { } < >, or backticks
+- NOT contain "must/should/do not" followed by "ask/say/tell/mention/reveal/ignore"
+- NOT contain "read/repeat/output/respond" followed by "the" or "this"
 
-That last rule is strict and is checked mechanically. If a natural phrasing
-needs a banned word, rephrase around it — for example say "applicant tracking
-tools" rather than "applicant tracking system", or "engineers" rather than
-"developers".
+Those rules are checked mechanically and are unforgiving. They reject ordinary
+phrasings, so work around them: say "applicant tracking tools" rather than
+"applicant tracking system", "engineers" rather than "developers", "config
+files" rather than "JSON or YAML", and "how do you go over the requirements"
+rather than "how do you read the requirements".
 
 Return the JSON object and nothing else.`;
 }
 
-/** Shape-check the model's output before it is trusted for anything. */
+/**
+ * Bounds copied from `createRoleSchema`, because a draft that passes here and
+ * then fails zod on Save is the half-authored role this module promises never
+ * to produce — discovered by the operator minutes after the wait.
+ */
+const MAX_JD_CHARS = 100_000;
+const MAX_SKILLS = 100;
+const MAX_SKILL_CHARS = 200;
+const MAX_QUESTIONS = 100;
+const MAX_QUESTION_CHARS = 2_000;
+const MAX_WEIGHT = 100;
+/** Below this, a "successful" draft is not a screening script. */
+const MIN_QUESTIONS = 3;
+
+/** Shape-check AND clamp the model's output before it is trusted for anything. */
 function coerceDraft(raw: unknown): RoleDraft | null {
   if (!raw || typeof raw !== 'object') return null;
   const obj = raw as Record<string, unknown>;
 
-  const jd = typeof obj.jd === 'string' ? obj.jd.trim() : '';
+  const jd = typeof obj.jd === 'string' ? obj.jd.trim().slice(0, MAX_JD_CHARS) : '';
   if (!jd) return null;
 
   const skills = Array.isArray(obj.required_skills)
     ? obj.required_skills
         .filter((s): s is string => typeof s === 'string')
-        .map((s) => s.trim())
+        // Truncated, not rejected: an over-long "skill" is a cosmetic fault,
+        // and failing the whole draft over one verbose string would waste the
+        // entire wait.
+        .map((s) => s.trim().slice(0, MAX_SKILL_CHARS))
         .filter(Boolean)
-        .slice(0, 100)
+        .slice(0, MAX_SKILLS)
     : [];
   if (skills.length === 0) return null;
 
@@ -177,18 +240,29 @@ function coerceDraft(raw: unknown): RoleDraft | null {
   rawQuestions.forEach((entry, i) => {
     const q = entry && typeof entry === 'object' ? (entry as Record<string, unknown>) : {};
     const text = typeof q.question === 'string' ? q.question.trim() : '';
-    if (!text) return;
-    const weight = typeof q.weight === 'number' && Number.isFinite(q.weight) && q.weight >= 0
-      ? q.weight
-      : 1;
+    if (!text || text.length > MAX_QUESTION_CHARS) return;
+    // Clamped to the schema's range. A model that weights in basis points or
+    // on a 0-1000 priority scale produced a draft that displayed fine and then
+    // 400'd on Save.
+    const rawWeight = Number(q.weight);
+    const weight =
+      Number.isFinite(rawWeight) && rawWeight >= 0 ? Math.min(rawWeight, MAX_WEIGHT) : 1;
     // Ids are OURS, never the model's: the save path rejects duplicate keys,
     // and a model that repeats "q1" would fail a gate for a reason that has
     // nothing to do with the question.
     questions.push({ id: `q${i + 1}`, question: text, weight });
   });
-  if (questions.length === 0) return null;
 
-  return { jd, required_skills: skills, screening_template: questions };
+  // A FLOOR, not just a non-empty check. A model that returns six entries of
+  // which five use the key "text" instead of "question" yielded a
+  // ONE-question draft that passed every gate and was offered as complete.
+  if (questions.length < MIN_QUESTIONS) return null;
+
+  return {
+    jd,
+    required_skills: skills,
+    screening_template: questions.slice(0, MAX_QUESTIONS),
+  };
 }
 
 /**
@@ -228,43 +302,98 @@ export async function generateRoleDraft(
   const repaired: string[] = [];
   let failures: string[] = [];
   let lastShapeFailure = false;
+  /** The last provider throw, so an exhausted budget can say what went wrong. */
+  let providerError: unknown = null;
+  /** Questions the LAST attempt rejected. 0 when the failure was not a question. */
+  let rejectedCount = 0;
 
   for (let attempt = 1; attempt <= ROLE_DRAFT_MAX_ATTEMPTS; attempt += 1) {
-    report({
-      phase: failures.length > 0 ? 'repairing' : 'drafting',
-      attempt,
-      maxAttempts: ROLE_DRAFT_MAX_ATTEMPTS,
-      ...(failures.length > 0 ? { rejected: failures.length } : {}),
-    } as RoleDraftPhase);
+    report(
+      rejectedCount > 0
+        ? {
+            phase: 'repairing',
+            attempt,
+            maxAttempts: ROLE_DRAFT_MAX_ATTEMPTS,
+            rejected: rejectedCount,
+          }
+        : failures.length > 0
+          ? { phase: 'rereading', attempt, maxAttempts: ROLE_DRAFT_MAX_ATTEMPTS }
+          : { phase: 'drafting', attempt, maxAttempts: ROLE_DRAFT_MAX_ATTEMPTS },
+    );
 
-    const raw = await infer(buildPrompt(jobRole, failures));
+    // A PROVIDER FAILURE COSTS ONE ATTEMPT, NOT THE WHOLE BUDGET.
+    // `runClaudeJSONWithProvenance` throws on a timeout, a non-2xx, and on
+    // unparseable JSON — the most common model failure of all, since a fenced
+    // ```json block or a sentence of preamble is enough. Unguarded, the first
+    // transient 502 escaped the loop entirely and surfaced as "Hello could not
+    // be reached" with two attempts unused, while advertising three.
+    let raw: unknown;
+    try {
+      raw = await infer(buildPrompt(jobRole, failures));
+    } catch (err) {
+      providerError = err;
+      rejectedCount = 0;
+      failures = [
+        'The previous response could not be read at all. Return ONLY the raw JSON object, with no code fence, no preamble and no trailing prose.',
+      ];
+      continue;
+    }
     report({ phase: 'checking', attempt, maxAttempts: ROLE_DRAFT_MAX_ATTEMPTS });
     const draft = coerceDraft(raw);
 
     if (!draft) {
       lastShapeFailure = true;
+      rejectedCount = 0;
       failures = [
         'The response was not a JSON object carrying a non-empty "jd", a non-empty "required_skills" array, and a non-empty "screening_template" array.',
       ];
       continue;
     }
     lastShapeFailure = false;
+    providerError = null;
 
-    // THE SAME validator the save path runs. Anything else would let a draft
-    // pass here and fail on write, or worse, on the call.
+    // THE SAME validator the save path runs, PLUS the two rules the prompt
+    // states that it does not cover (see `generatedQuestionIssue`).
     const issues = validatePhoneQuestionTemplate(draft.screening_template);
-    if (issues.size === 0) {
-      return { draft, attempts: attempt, repaired };
+    const shapeIssues = new Map<number, string>();
+    draft.screening_template.forEach((q, index) => {
+      const issue = generatedQuestionIssue(q.question);
+      if (issue) shapeIssues.set(index, issue);
+    });
+
+    if (issues.size === 0 && shapeIssues.size === 0) {
+      return { draft, attempts: attempt, repaired: [...new Set(repaired)] };
     }
 
-    failures = [...issues.entries()].map(([index, list]) => {
+    // Rebuilt per attempt, not appended: `repaired` used to accumulate every
+    // rejection from every pass, so 4 rejected then 3 rejected reported
+    // "rephrased 7 questions" beside a six-question draft.
+    const thisPass: string[] = [];
+    const indexes = new Set([...issues.keys(), ...shapeIssues.keys()]);
+    failures = [...indexes].sort((a, b) => a - b).map((index) => {
       const text = draft.screening_template[index]?.question ?? '';
-      const message = phoneQuestionIssueMessage(index, list);
-      repaired.push(`${message}: "${text}"`);
+      const list = issues.get(index);
+      const message = list
+        ? phoneQuestionIssueMessage(index, list)
+        : `Question ${index + 1} ${shapeIssues.get(index)}`;
+      thisPass.push(`${message}: "${text}"`);
       return `${message} — the offending text was: "${text}"`;
     });
+    repaired.length = 0;
+    repaired.push(...thisPass);
+    rejectedCount = thisPass.length;
   }
 
+  if (providerError) {
+    // Named, not swallowed into a generic message: a provider outage that
+    // burned all three attempts is a different problem from a model that
+    // would not phrase a question, and the operator can act on the difference.
+    throw new RoleDraftError(
+      'Hello could not be reached after several tries. Try again in a moment.',
+      'unusable_output',
+      [providerError instanceof Error ? providerError.message : String(providerError)],
+    );
+  }
   if (lastShapeFailure) {
     throw new RoleDraftError(
       'Hello could not draft this role — the response was not usable.',
