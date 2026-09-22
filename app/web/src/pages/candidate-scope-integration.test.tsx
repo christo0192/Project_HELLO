@@ -23,6 +23,7 @@ import { CandidateDetailPage } from './CandidateDetailPage';
 import { AshbyScopedReviewPage } from './AshbyScopedReviewPage';
 import { CANDIDATE_SCOPE_CLASS } from '../components/talent';
 import { mockCandidate, mockCandidateDetail, mockSessionDetail } from '../test/helpers';
+import { EMPTY_FUNNEL_TOTALS } from '../test/funnel';
 
 const LINK_ID = '11111111-1111-4111-8111-111111111111';
 
@@ -37,6 +38,8 @@ const mockApi = {
   getAshbyScopedReview: vi.fn(),
   listAshbyScopedReviewNotes: vi.fn(),
   getAshbyScopedReviewWorkflow: vi.fn(),
+  // See EMPTY_FUNNEL_TOTALS: the per-role pipeline chart calls this on mount.
+  getScreeningFunnel: vi.fn(),
 };
 
 class MockApiError extends Error {
@@ -92,6 +95,9 @@ beforeEach(() => {
   vi.clearAllMocks();
   mockApi.listRoles.mockResolvedValue([]);
   mockApi.listCandidates.mockResolvedValue([mockCandidate]);
+  // The per-role pipeline chart fans out one funnel call per role on
+  // mount; zeroed totals render nothing, so nothing else here moves.
+  mockApi.getScreeningFunnel.mockResolvedValue({ totals: EMPTY_FUNNEL_TOTALS });
   mockApi.getCandidate.mockResolvedValue(mockCandidateDetail);
   mockApi.getSession.mockResolvedValue(mockSessionDetail);
   mockApi.listNotes.mockResolvedValue({ notes: [] });

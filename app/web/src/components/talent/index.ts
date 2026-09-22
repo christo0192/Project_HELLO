@@ -1,4 +1,8 @@
 /** TA/HR workspace primitives (Lane 3 talent component set). */
+export { PipelineBar } from './PipelineBar';
+export type { PipelineBarProps, PipelineSegment, PipelineTone } from './PipelineBar';
+export { RolePipelinePanel } from './RolePipelinePanel';
+export type { RolePipelinePanelProps } from './RolePipelinePanel';
 export { Tabs } from './Tabs';
 export type { TabsProps, TabItem } from './Tabs';
 export { TranscriptList } from './TranscriptList';
