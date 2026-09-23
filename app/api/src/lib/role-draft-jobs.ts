@@ -19,6 +19,7 @@
  * and a best-effort background task the right shape here.
  */
 import { supabase } from './supabase.js';
+import { DEEPSEEK_TIMEOUT_CEILING_MS } from './env.js';
 import { createLogger } from './logger.js';
 import {
   generateRoleDraft,
@@ -47,7 +48,17 @@ import {
  * dead process, and being late to declare one costs a spinner; being early
  * costs a paid ten-minute draft.
  */
-export const ROLE_DRAFT_MAX_CALL_MS = 300_000;
+/**
+ * The longest a single provider call can take, which is the CEILING
+ * `DEEPSEEK_TIMEOUT_MS` is validated against in `env.ts` — not a number
+ * chosen here.
+ *
+ * `ROLE_DRAFT_STALE_MS` is derived from it, and the derivation is only sound
+ * while the two agree: raising the env ceiling alone would let a healthy
+ * worker exceed the stale window and be reaped mid-draft. That single edit
+ * kept 110 tests green, so the link is asserted rather than described.
+ */
+export const ROLE_DRAFT_MAX_CALL_MS = DEEPSEEK_TIMEOUT_CEILING_MS;
 export const ROLE_DRAFT_STALE_MS = 2 * ROLE_DRAFT_MAX_CALL_MS + 120_000;
 
 export type RoleDraftJobStatus = 'running' | 'succeeded' | 'failed' | 'cancelled';
@@ -371,6 +382,26 @@ export async function startRoleDraft(
       await expireStaleRoleDraft(ownerId, new Date(now() - ROLE_DRAFT_STALE_MS).toISOString());
     }
     ({ data, error } = await insert());
+    // A SECOND 23505 IS A CONFLICT, NOT A CRASH. Losing the race twice —
+    // another start landing between the expiry and this retry — used to
+    // `throw error` with the raw postgrest body, which is not an `Error`, so
+    // `finalErrorHandler` logged `error_category: 'UnknownError'` and answered
+    // 500 "internal server error". The operator was owed either the live job
+    // or a 409 naming it, and `23505` — the one code that says which condition
+    // occurred — was discarded one layer above the `errorCode()` helper this
+    // module added to stop exactly that.
+    if (error && (error as { code?: string }).code === '23505') {
+      const winner = await readRunningRow(ownerId);
+      if (winner) {
+        if (winner.job_role.trim() === jobRole.trim()) return toJob(winner);
+        throw new RoleDraftBusyError(winner.job_role);
+      }
+      draftLogger.warn('db_error', {
+        error_category: 'role_draft_start_conflict',
+        error_type: errorCode(error),
+      });
+      throw new RoleDraftBusyError(jobRole);
+    }
   }
   if (error) throw error;
 

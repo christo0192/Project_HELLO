@@ -7633,7 +7633,11 @@ components:
                   question:
                     type: string
                   weight:
-                    type: integer
+                    # NUMBER, not integer. `coerceDraft` accepts any finite
+                    # non-negative value (`Math.min(rawWeight, 100)`) and the
+                    # zod schema is `z.number().finite()`, so a model returning
+                    # 0.5 produced a response that violated this contract.
+                    type: number
         attempts:
           type: integer
           minimum: 0

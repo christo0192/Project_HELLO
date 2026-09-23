@@ -6,7 +6,7 @@
  * No provider secret is logged or returned in errors.
  */
 
-import { env } from './env.js';
+import { env, DEEPSEEK_TIMEOUT_CEILING_MS } from './env.js';
 import { createLogger } from './logger.js';
 import {
   BusinessError,
@@ -142,7 +142,16 @@ function validateRuntimeOverrides(opts: DeepseekOptions): void {
     if (typeof t !== 'number' || !Number.isFinite(t) || !Number.isInteger(t) || t < 0) {
       throw new TypeError('timeoutMs must be a non-negative integer');
     }
-    if (t > 300_000) throw new TypeError('timeoutMs must not exceed 300000');
+    // THE SAME CEILING `env.ts` validates against and `role-draft-jobs.ts`
+    // derives its stale window from. Three hand-copied `300_000`s with nothing
+    // linking them meant raising one alone left 110 tests green — and raising
+    // only the env ceiling would let a configured value past validation and
+    // then throw HERE, a TypeError rather than a BusinessError, so every Ask
+    // Hello attempt would land in the provider branch and the operator be told
+    // "Hello could not be reached" about a call that was never made.
+    if (t > DEEPSEEK_TIMEOUT_CEILING_MS) {
+      throw new TypeError(`timeoutMs must not exceed ${DEEPSEEK_TIMEOUT_CEILING_MS}`);
+    }
   }
   if (opts.maxOutputBytes !== undefined) {
     const b = opts.maxOutputBytes;

@@ -1,6 +1,37 @@
 /** Validation shared by role writes and phone admission boundaries. */
 
-const META_RE = /\b(?:system|developer|assistant|model|prompt|instruction|interviewer|recruiter)\b|\b(?:must|should|do not|don't)\s+(?:ask|say|tell|mention|reveal|ignore)|\b(?:read|repeat|output|respond)\s+(?:the|this)\b/i;
+/**
+ * The meta words this gate refuses, AS DATA.
+ *
+ * Exported because the Ask Hello prompt has to tell the model the same list,
+ * and a second hand-written copy of it drifted silently: a reviewer added one
+ * word to the regex and all 172 tests across five suites stayed green. The
+ * cost of that drift is not cosmetic — a rule the prompt does not state is a
+ * rule the model keeps breaking, so every attempt is rejected and the
+ * operator waits ten minutes to be told Hello could not phrase the questions.
+ *
+ * The old comment claimed "the list is checked against the real validator by
+ * a test, so the two cannot drift silently". Only one direction was checked.
+ * Deriving the regex from the array removes the direction that was missing
+ * instead of asserting it.
+ */
+export const PHONE_META_WORDS = [
+  'system',
+  'developer',
+  'assistant',
+  'model',
+  'prompt',
+  'instruction',
+  'interviewer',
+  'recruiter',
+] as const;
+
+const META_RE = new RegExp(
+  `\\b(?:${PHONE_META_WORDS.join('|')})\\b` +
+    "|\\b(?:must|should|do not|don't)\\s+(?:ask|say|tell|mention|reveal|ignore)" +
+    '|\\b(?:read|repeat|output|respond)\\s+(?:the|this)\\b',
+  'i',
+);
 const DIRECTIVE_MARKER_RE = /[\[\]{}<>]|```|\b(?:json|xml|yaml)\b/i;
 const QUESTION_RE = /\?|\b(?:tell|describe|walk|explain|what|how|why|when|where|which|could|can|have|did|would|are|do|is)\b/i;
 

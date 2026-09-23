@@ -42,6 +42,7 @@ import { BusinessError } from './provider-resilience.js';
 import {
   phoneQuestionIssueMessage,
   validatePhoneQuestionTemplate,
+  PHONE_META_WORDS,
 } from './phone-screening/question-validation.js';
 
 /**
@@ -206,22 +207,22 @@ export interface RoleDraftDeps {
 }
 
 /**
- * The banned words, spelled out FOR the model.
+ * The banned words, spelled out FOR the model — READ FROM THE GATE ITSELF.
  *
- * Kept as a literal list rather than derived from `META_RE`, because a regex
- * source is not something a model reliably reads — and the list is checked
- * against the real validator by a test, so the two cannot drift silently.
+ * This was a second hand-written copy, justified by "the list is checked
+ * against the real validator by a test, so the two cannot drift silently".
+ * That test only ran one way: it asserted each word here is refused by the
+ * validator, never that the validator refuses nothing else. Adding a word to
+ * `META_RE` kept 172 tests across five suites green, and the prompt would
+ * then never state the new rule — so v4-pro keeps emitting it, the template
+ * gate keeps refusing, and all three attempts (six v4-pro calls, ten minutes)
+ * burn before the operator is told Hello could not phrase the questions.
+ *
+ * A regex source is still not something a model reads reliably, which is why
+ * the words are spelled out in the prompt. They are now spelled out FROM the
+ * gate's own array rather than beside it.
  */
-const BANNED_WORDS = [
-  'system',
-  'developer',
-  'assistant',
-  'model',
-  'prompt',
-  'instruction',
-  'interviewer',
-  'recruiter',
-];
+const BANNED_WORDS = [...PHONE_META_WORDS];
 
 function buildPrompt(jobRole: string, priorFailures: readonly string[]): string {
   const repair =

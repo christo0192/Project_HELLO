@@ -324,6 +324,36 @@ export function createApp(opts: CreateAppOptions = {}) {
   };
 
   app.use('/api/roles', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'roles:', useUserKey: true }));
+  // ASK HELLO STARTS GET THEIR OWN, MUCH TIGHTER BUCKET.
+  //
+  // Every other model-invoking route here is strict — screening, assess,
+  // resumes — and this was the one that was not, while being the most
+  // expensive of them: one press detaches up to SIX DeepSeek v4-pro calls
+  // (3 attempts x the runner's own retry) each with a 240s floor.
+  //
+  // The per-owner row constraint does not bound this. `cancelRoleDraft` frees
+  // the slot the instant it writes `status='cancelled'`, but `shouldCancel`
+  // is only read BETWEEN attempts, so the call already in flight runs to
+  // completion and keeps billing — start, cancel, start holds generations
+  // open, and the shared `/api/roles` bucket allowed ~100 of those a minute.
+  // That matters beyond the bill: the DeepSeek runner is a module-level
+  // singleton whose circuit breaker is shared with resume parsing and v2
+  // scorecard scoring, in the process that also serves the phone worker. A
+  // draft storm drawing provider 429s opens that breaker for all three.
+  //
+  // MOUNTED ON THE POST, not with `app.use('/api/roles/draft', …)`. `app.use`
+  // is method-agnostic and prefix-matching, so that form would also throttle
+  // `GET /draft` and `GET /draft/:id` — and the client polls those every 2s
+  // (0.5 req/s) against a bucket that refills at a third of that. The
+  // limiter would then break the progress display it is protecting.
+  const roleDraftStartRateLimit: RateLimitConfig = {
+    limit: boundedInt(process.env.RATE_LIMIT_ROLE_DRAFT, 5, 1, 100_000),
+    windowSec: rateWindowSec,
+    maxKeys: 100_000,
+  };
+  app.post('/api/roles/draft', createRateLimitMiddleware({
+    config: roleDraftStartRateLimit, prefix: 'role-draft-start:', useUserKey: true,
+  }));
   app.use('/api/candidates', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'candidates:', useUserKey: true }));
   app.use('/api/screening', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'screening:', useUserKey: true }));
   app.use('/api/assess', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'assess:', useUserKey: true }));

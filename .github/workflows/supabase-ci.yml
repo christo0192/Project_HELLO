@@ -98,6 +98,14 @@ jobs:
       - name: Scorecard 0093 rubric rescale 1-5 to 1-4 (isolated real Postgres)
         run: bash scripts/test-scorecard-scale.sh
 
+  role-drafts-index-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Ask Hello 0101 one-live-job index (isolated real Postgres)
+        run: bash scripts/test-role-drafts-index.sh
+
   supabase-static-security:
     runs-on: ubuntu-latest
     steps:

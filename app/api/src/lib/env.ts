@@ -79,6 +79,17 @@ function positiveInt(name: string, defaultVal: number, min: number, max: number)
   return n;
 }
 
+/**
+ * The longest a single DeepSeek call may be configured to take.
+ *
+ * Exported because `ROLE_DRAFT_STALE_MS` is DERIVED from it — two provider
+ * calls plus slack — and the derivation is only sound while the two agree.
+ * Raising this number alone would let a healthy Ask Hello worker outlive the
+ * stale window and be reaped mid-draft, and that single edit kept 110 tests
+ * green while it was a bare literal in each file.
+ */
+export const DEEPSEEK_TIMEOUT_CEILING_MS = 300_000;
+
 export const env = {
   supabaseUrl: required('SUPABASE_URL'),
   supabaseServiceRoleKey: required('SUPABASE_SERVICE_ROLE_KEY'),
@@ -107,7 +118,9 @@ export const env = {
    * secret.
    */
   deepseekReasoningEffort: process.env.DEEPSEEK_REASONING_EFFORT ?? '',
-  deepseekTimeoutMs: positiveInt('DEEPSEEK_TIMEOUT_MS', 120000, 1, 300000),
+  deepseekTimeoutMs: positiveInt(
+    'DEEPSEEK_TIMEOUT_MS', 120000, 1, DEEPSEEK_TIMEOUT_CEILING_MS,
+  ),
   deepseekMaxOutputBytes: positiveInt(
     'DEEPSEEK_MAX_OUTPUT_BYTES', 5 * 1024 * 1024, 1024, 100 * 1024 * 1024,
   ),

@@ -23,7 +23,10 @@ import {
   ROLE_DRAFT_MIN_TIMEOUT_MS,
   ROLE_DRAFT_QUESTION_COUNT,
 } from '../lib/role-authoring.js';
-import { validatePhoneQuestion } from '../lib/phone-screening/question-validation.js';
+import {
+  validatePhoneQuestion,
+  PHONE_META_WORDS,
+} from '../lib/phone-screening/question-validation.js';
 import { BusinessError } from '../lib/provider-resilience.js';
 import { createRoleSchema } from '../schemas/roles.js';
 
@@ -719,7 +722,13 @@ describe('generateRoleDraft — the prompt states every rule the gate enforces',
     await generateRoleDraft('Any', { infer });
     const prompt = infer.mock.calls[0][0] as string;
 
-    const banned = ['system', 'developer', 'assistant', 'model', 'prompt', 'instruction', 'interviewer', 'recruiter'];
+    // DERIVED FROM THE GATE, not restated. A hand-written copy here made
+    // this test one-directional: it proved every word listed is refused, and
+    // never that the gate refuses nothing else. Adding a word to `META_RE`
+    // left all 172 tests across five suites green while the prompt went on
+    // omitting the rule.
+    const banned = [...PHONE_META_WORDS];
+    expect(banned.length).toBeGreaterThan(0);
     for (const word of banned) {
       // Banned by the REAL validator...
       expect(validatePhoneQuestion(`What is your ${word} experience?`)).toContain('directive');
@@ -728,6 +737,39 @@ describe('generateRoleDraft — the prompt states every rule the gate enforces',
     const line = prompt.split('\n').find((l) => l.includes('NOT contain any of these words'));
     expect(line).toBeDefined();
     for (const word of banned) expect(line).toContain(word);
+  });
+
+  it('a SHAPE failure clears the rejected COUNT, so the label follows the LAST failure', async () => {
+    // `rejectedCount = 0` in the unparseable-JSON branch could be deleted with
+    // 158 tests green. Without it: attempt 1 has two questions refused,
+    // attempt 2 returns prose, and attempt 3 is then announced as
+    // "Rephrasing 2 questions the screener won't read aloud… (3 of 3)" when
+    // no question was examined at all. That wrong label is exactly what the
+    // `rereading` phase was added to replace.
+    const refused = goodDraft({
+      screening_template: [
+        q('What is your system administration experience?'),
+        q('How do you source a developer for a niche role?'),
+        q('What made you look for a new position?'),
+      ],
+    });
+    const phases: Array<{ phase: string; attempt: number }> = [];
+    const infer = vi
+      .fn()
+      .mockResolvedValueOnce(refused)
+      .mockRejectedValueOnce(new BusinessError())
+      .mockResolvedValueOnce(goodDraft());
+    await generateRoleDraft('Any', {
+      infer,
+      onProgress: (e) => phases.push(e as { phase: string; attempt: number }),
+    });
+
+    // Attempt 2 IS a repair — two questions really were refused.
+    expect(phases.filter((p) => p.attempt === 2).map((p) => p.phase)).toContain('repairing');
+    // Attempt 3 follows a SHAPE failure, so it is a re-read, not a repair.
+    const third = phases.filter((p) => p.attempt === 3).map((p) => p.phase);
+    expect(third).toContain('rereading');
+    expect(third).not.toContain('repairing');
   });
 
   it('warns about the MARKUP and CLAUSE rules too, not just the words', async () => {

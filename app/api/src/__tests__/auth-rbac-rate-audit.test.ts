@@ -1150,3 +1150,67 @@ describe('HELLO access gate — middleware enforces allowlist on every request',
     expect(res.body.error.type).toBe('authorization_error');
   });
 });
+
+
+// ===================================================================
+//  ASK HELLO: THE SIX-CALL ENDPOINT NEEDS ITS OWN BUCKET
+// ===================================================================
+
+describe('POST /api/roles/draft is rate limited apart from the rest of /api/roles', () => {
+  const INTERVIEWER = 'user-int-0000-0000-000000000002';
+  const DRAFT_BUCKET = `role-draft-start:user:${INTERVIEWER}`;
+  const DRAFT_CONFIG = { limit: 5, windowSec: 60, maxKeys: 100_000 };
+
+  async function exhaustDraftBucket(): Promise<void> {
+    const { consumeToken } = await import('../lib/rate-limit.js');
+    for (let i = 0; i < DRAFT_CONFIG.limit; i += 1) {
+      consumeToken(DRAFT_BUCKET, DRAFT_CONFIG, Date.now());
+    }
+  }
+
+  beforeEach(() => {
+    setRateLimitStore(new MemoryRateLimitStore(1000));
+  });
+
+  it('REFUSES a start once the draft bucket is empty', async () => {
+    // One press detaches up to six DeepSeek v4-pro calls at a 240s floor, and
+    // the per-owner row constraint does not bound them: cancel frees the slot
+    // immediately while the in-flight call runs to completion. In the shared
+    // `/api/roles` bucket that was ~100 starts a minute from one token, and
+    // the provider runner is a process-wide singleton whose circuit breaker
+    // resume parsing and scorecard scoring also depend on.
+    await exhaustDraftBucket();
+    const app = createAuthedApp(makeInterviewer());
+    const res = await request(app)
+      .post('/api/roles/draft')
+      .set('Authorization', VALID_TOKEN)
+      .send({ job_role: 'Sales Advisor' });
+    expect(res.status).toBe(429);
+    expect(res.body.error.type).toBe('rate_limit_exceeded');
+    expect(res.headers['retry-after']).toBeDefined();
+  });
+
+  it('STILL SERVES THE POLL with that same bucket empty — the part `app.use` breaks', async () => {
+    // This is the assertion that pins the MOUNTING, not just the existence of
+    // a limiter. `app.use('/api/roles/draft', ...)` is method-agnostic and
+    // prefix-matching, so it would throttle `GET /draft/:id` too — and the
+    // client polls that every 2s, which is faster than a five-per-minute
+    // bucket refills. The limiter would then break the progress display it
+    // was added to protect, and the operator would watch the feature hang.
+    await exhaustDraftBucket();
+    const app = createAuthedApp(makeInterviewer());
+    const res = await request(app)
+      .get('/api/roles/draft/11111111-1111-4111-8111-111111111111')
+      .set('Authorization', VALID_TOKEN);
+    expect(res.status).not.toBe(429);
+  });
+
+  it('leaves the rest of the Roles API usable when the draft bucket is empty', async () => {
+    // Separate keys. A limiter added to bound provider spend must not take
+    // role listing and saving down with it.
+    await exhaustDraftBucket();
+    const app = createAuthedApp(makeInterviewer());
+    const res = await request(app).get('/api/roles').set('Authorization', VALID_TOKEN);
+    expect(res.status).not.toBe(429);
+  });
+});

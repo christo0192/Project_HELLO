@@ -671,17 +671,28 @@ describe('the 23505 branch — where the index and the read disagree', () => {
   });
 
   it('does not retry forever — one expiry, one retry', async () => {
-    // If the second insert also fails the error is raised. A loop here would
-    // spin against a constraint that is not going to change its mind.
+    // A loop here would spin against a constraint that is not going to change
+    // its mind, so the retry is bounded at exactly one. TWO inserts, no more.
+    //
+    // What it raises changed deliberately. This used to assert the raw
+    // postgrest body reached the caller — and that body is not an `Error`, so
+    // `finalErrorHandler` logged `UnknownError` and answered 500 "internal
+    // server error" for what is a plain conflict. A second 23505 with no
+    // readable winner still means someone else holds the slot, so it is
+    // reported as busy and the code is logged instead of thrown away.
     selectQueue = [
       [],
       [liveRow({ updated_at: new Date(NOW - ROLE_DRAFT_STALE_MS - 1).toISOString() })],
+      null,
     ];
     insertErrors = [DUP, DUP];
     await expect(
       startRoleDraft(OWNER, 'Sales Advisor', { run: vi.fn() as never, now: () => NOW }),
-    ).rejects.toMatchObject({ code: '23505' });
+    ).rejects.toBeInstanceOf(RoleDraftBusyError);
     expect(calls.filter((c) => c.op === 'insert')).toHaveLength(2);
+    expect(
+      logged.some((l) => l.meta.error_category === 'role_draft_start_conflict'),
+    ).toBe(true);
   });
 
   it('RETURNS THE WINNER when a concurrent start beat it by microseconds', async () => {
@@ -829,6 +840,67 @@ describe('the writes that can be lost silently', () => {
     await startRoleDraft(OWNER, 'Sales Advisor', { run: run as never });
     await settle();
     expect(finalWrite()?.selects).toContain('id');
+  });
+
+  it('LOSING THE RACE TWICE is a conflict, not an Internal Server Error', async () => {
+    // The retry insert can hit 23505 again — another start landing between
+    // the expiry and the retry. `throw error` handed the route the raw
+    // postgrest body, which is not an `Error`, so `finalErrorHandler` logged
+    // `UnknownError` and answered 500. The operator is owed the live job or a
+    // 409 naming it, and the Postgres code was thrown away one layer above
+    // the helper this module added to preserve it.
+    insertErrors = [{ code: '23505' }, { code: '23505' }];
+    // Reads, in order: admission (nothing running), the blocking row (stale,
+    // so it gets expired), then the winner of the retry race.
+    selectQueue = [
+      [],
+      { id: 'other', owner_id: OWNER, job_role: 'Data Engineer', status: 'running',
+        updated_at: new Date(Date.now() - ROLE_DRAFT_STALE_MS - 1000).toISOString() },
+      { id: 'winner', owner_id: OWNER, job_role: 'Data Engineer', status: 'running',
+        updated_at: new Date().toISOString() },
+    ];
+    const run = vi.fn().mockResolvedValue({ draft: DRAFT, attempts: 1, repaired: [] });
+    await expect(
+      startRoleDraft(OWNER, 'Sales Advisor', { run: run as never }),
+    ).rejects.toBeInstanceOf(RoleDraftBusyError);
+  });
+
+  it('a FAILED cancellation read is NOT a cancellation', async () => {
+    // `if (error) return false` was free: flipping it to `return true`
+    // survived 158 tests across five suites. The two tests that exist feed
+    // `cancelled_at` set and `cancelled_at` null; neither makes the READ
+    // fail, so the previous round proved the line is redundant and nobody
+    // proved the decision is right.
+    //
+    // It is not a small difference. Answering `true` on a dropped read makes
+    // `generateRoleDraft` throw `cancelled`, which `runDraft` writes as
+    // `status='failed', error_reason='cancelled'` — fenced on
+    // `status='running'`, which MATCHES, because nobody cancelled. The
+    // operator who never pressed Cancel is then told their ten-minute draft
+    // was cancelled, mid-flight, on a pooler blip.
+    selectErrors = [null, { code: '', message: 'fetch failed' }];
+    let answered: boolean | undefined;
+    const run = vi.fn(async (_role: string, opts: any) => {
+      answered = await opts.shouldCancel();
+      return { draft: DRAFT, attempts: 1, repaired: [] };
+    });
+    await startRoleDraft(OWNER, 'Sales Advisor', { run: run as never });
+    await settle();
+    expect(answered, 'an unreadable row is an unknown, not a cancellation').toBe(false);
+  });
+
+  it('SELECTS on the cancel write too, or `{cancelled}` is always a lie', async () => {
+    // The same defect one function over, and only the COMPILER was stopping
+    // it: dropping `.select('id')` from `cancelRoleDraft` left every test in
+    // this file green, because the stub returns `updateResult` for an update
+    // whether or not a column list was asked for. Real PostgREST answers a
+    // select-less update with 204 and `data: null`, so `Array.isArray(data)`
+    // would be false forever and the route would report `{cancelled: false}`
+    // on every successful cancellation — "you lost the race, the job already
+    // finished" — while the job carried on billing.
+    await cancelRoleDraft(OWNER, 'draft-1');
+    const write = calls.filter((c) => c.op === 'update').at(-1);
+    expect(write?.selects).toContain('id');
   });
 
   it('LOOKS UP THE STATUS when the terminal write matched nothing', async () => {
