@@ -142,6 +142,11 @@
           "secretSource": "managed-infisical-runtime"
         },
         {
+          "name": "RATE_LIMIT_ROLE_DRAFT",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
           "name": "RATE_LIMIT_IP",
           "secret": false,
           "secretSource": "managed-infisical-runtime"
