@@ -207,7 +207,10 @@ describe('when the recruiter edits the template while the job runs', () => {
     expect(outcome).toBe('template_moved');
     expect(store.writeReady).not.toHaveBeenCalled();
     // Not recorded as a failure either: nothing is wrong with this candidate,
-    // and a `failed` row would stop the next enqueue regenerating cleanly.
+    // and a `failed` row would misattribute a race to them — an operator
+    // reading the table would see a candidate whose résumé could not be
+    // written about, which is not what happened. (It would NOT block the next
+    // regeneration: `already_current` requires `status === 'ready'`.)
     expect(store.writeFailed).not.toHaveBeenCalled();
   });
 

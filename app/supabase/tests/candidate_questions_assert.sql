@@ -1,5 +1,5 @@
 -- =====================================================================
--- 0103 assertions — what each of the six calls actually gets.
+-- 0103 assertions — what each of the seven calls actually gets.
 --
 -- Executed against `start_phone_assessment` itself, with every migration
 -- applied. Nothing here reads the function's source or trusts a comment:
@@ -140,7 +140,7 @@ begin
   raise notice 'cqs103/norm: PASS';
 end $$;
 
--- ── Part 2: what each of the six calls actually gets ──────────────────
+-- ── Part 2: what each of the seven calls actually gets ────────────────
 do $$
 declare
   r          record;

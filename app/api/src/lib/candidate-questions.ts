@@ -161,7 +161,14 @@ const MAX_QUESTION_CHARS = 2_000;
 
 /**
  * Letters a hostile résumé might space or punctuate apart to slip a term past
- * a word-boundary match: `a a d h a a r`, `bank-account`, `card_number`.
+ * a word-boundary match: `a a d h a a r`, `bank-account`, `card_number`,
+ * `mother's maiden`.
+ *
+ * WHAT IT DOES NOT DO, stated because the first version of this comment
+ * implied otherwise: the de-spacer joins a run of single letters into one
+ * word, so it rescues SINGLE-WORD terms (`aadhaar`) and not multi-word ones —
+ * `b a n k  a c c o u n t` collapses to `bankaccount`, which no pattern here
+ * contains. That gap is the judge's to cover, like every other paraphrase.
  *
  * Applied ONLY to the credential prefilter, and only to compare against terms
  * that have no innocent reading. Normalising the whole question this
@@ -176,7 +183,11 @@ function collapseForCredentialMatch(text: string): string {
   );
   // Then treat any run of separators as a single space, so `bank-account`,
   // `bank_account` and `bank  account` all read the same.
-  return despaced.replace(/[\s._\-/]+/g, ' ');
+  //
+  // THE APOSTROPHE IS IN THE CLASS, and leaving it out made `mother's maiden`
+  // a DEAD term: the stored pattern is `mother ?s maiden`, so it matched only
+  // the apostrophe-less spelling nobody writes. Found by review.
+  return despaced.replace(/['\u2019\s._\-/]+/g, ' ');
 }
 
 /**

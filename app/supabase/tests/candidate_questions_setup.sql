@@ -1,5 +1,5 @@
 -- =====================================================================
--- 0103 fixture — six calls about to start, differing only in what the
+-- 0103 fixture — seven calls about to start, differing only in what the
 -- candidate's generated question set looks like.
 --
 -- `start_phone_assessment` is the most dangerous function in this system:
@@ -8,7 +8,7 @@
 -- verification worth having is EXECUTION against the real function with
 -- every migration applied.
 --
--- Six families under the `cqs103-` namespace, each a legitimate call at
+-- Seven families under the `cqs103-` namespace, each a legitimate call at
 -- the moment the worker asks for its plan:
 --
 --   ready      a valid generated set exists  → the plan is the CANDIDATE's,
@@ -23,6 +23,11 @@
 --   badrole    an invalid ROLE template and NO candidate set → still
 --              `invalid_role_template`. 0044 refuses rather than
 --              substituting defaults, and 0103 must not have softened it
+--   rescreen   a TERMINAL cycle-1 engagement carrying a ready set, and an
+--              ACTIVE cycle-2 engagement carrying none. The set is keyed on
+--              the ENGAGEMENT, so cycle two must get the ROLE template — a
+--              candidate-keyed or most-recent read puts cycle one's stale
+--              questions on a live call
 --
 -- Run:
 --   psql -v ON_ERROR_STOP=1 -f candidate_questions_setup.sql

@@ -200,6 +200,13 @@ describe('the credential prefilter — the cheap half of the injection gate', ()
       'What is your voter ID?',
       // Bare PAN, which the first list required a following word for.
       'Can you share your PAN details with me now?',
+      // A REQUEST VERB WITH NO POSSESSIVE. Every other string here carries
+      // `your`, so the entire verb alternative could be deleted green.
+      'Could you read out the account number on that statement?',
+      'Please spell out the IFSC for the branch?',
+      // And the apostrophe form, which was a DEAD term: the separator class
+      // did not include `'`, so only the spelling nobody writes matched.
+      "Tell me your mother's maiden name?",
       // HINGLISH POSSESSIVES. This is an Indian-market screen and the model is
       // free to answer in Hinglish; a guard that only knows "your" is deaf to
       // half of what it will be shown.
@@ -248,6 +255,28 @@ describe('the credential prefilter — the cheap half of the injection gate', ()
     const issue = refused('What is your bank account number?') ?? '';
     expect(issue.toLowerCase()).not.toContain('bank');
     expect(issue.toLowerCase()).not.toContain('account');
+  });
+
+  it('HAS KNOWN FALSE POSITIVES, and they are written down', () => {
+    // A review measured the rate at ~13% on naturally-written questions, down
+    // from 83%, and these are the shape that remains: a possessive sitting
+    // near a credential noun that is being used as SUBJECT MATTER rather than
+    // asked for. The prefilter cannot tell "your bank account opening funnel"
+    // from "your bank account number" without a grammar it does not have.
+    //
+    // RECORDED, NOT ASSERTED AS DESIRABLE. They are listed so the cost is
+    // visible and so anyone tightening the framing has a corpus to measure
+    // against; the consequence is one wasted slot and a retry, never a wrong
+    // question on a call.
+    const KNOWN_FALSE_POSITIVES = [
+      'What is the biggest risk you saw in your bank account opening funnel?',
+      'How did your team reduce OTP delivery failures on the Jio network?',
+      'What is the hardest part of reconciling IFSC codes across two core banking systems?',
+      'How did you cut fraud on your credit card portfolio at SBI?',
+    ];
+    for (const q of KNOWN_FALSE_POSITIVES) {
+      expect(looksLikeCredentialRequest(q), q).toBe(true);
+    }
   });
 
   it('IS NOT THE WHOLE GATE, and does not pretend to be', () => {
@@ -396,6 +425,33 @@ describe('splicing back into the template', () => {
     expect(after[4].question).toBe(before[4].question);
   });
 
+  it('REFUSES TO PUT THE SAME QUESTION IN TWO SLOTS', () => {
+    // `generateCandidateQuestions` cannot hand one over — its `taken` set
+    // blocks it — but this function is exported and
+    // `phone_normalize_question_plan` de-dupes on `id`, never on text, so a
+    // duplicate spliced here reaches the worker as a plan that asks the same
+    // thing twice. The repair added the guard and nothing tested it.
+    const before = template();
+    const after = spliceCandidateQuestions(before, {
+      profile_relevance: ['At Lumen Retail, what changed?', 'At Lumen Retail, what changed?'],
+      stability: [],
+    });
+    expect(after[1].question).toBe('At Lumen Retail, what changed?');
+    // The second slot keeps the role's own question rather than repeating.
+    expect(after[2].question).toBe(before[2].question);
+  });
+
+  it('refuses a duplicate of a FIXED question, and one that only normalises equal', () => {
+    const before = template();
+    const after = spliceCandidateQuestions(before, {
+      // Same sentence as the introduction, differing only in case and spacing.
+      profile_relevance: ['  TO START, COULD YOU TELL ME ABOUT YOURSELF?  ', 'A genuinely new question?'],
+      stability: [],
+    });
+    expect(after[1].question).toBe(before[1].question);
+    expect(after[2].question).toBe('A genuinely new question?');
+  });
+
   it('names exactly the two compartments that may vary', () => {
     expect([...VARIABLE_CATEGORIES]).toEqual(['profile_relevance', 'stability']);
   });
@@ -514,6 +570,76 @@ describe('generating, end to end', () => {
       reason: 'provider_error',
     });
     expect(infer).toHaveBeenCalledTimes(1);
+  });
+
+  it('RUNS THE JUDGE BY DEFAULT — its refusal must reach the caller', async () => {
+    // THE SURVIVOR THAT MATTERED. `const survived = new Set(await judge(...))`
+    // could be replaced with `new Set(submitted)` — deleting the entire
+    // security gate — with all 126 tests green, because every other generator
+    // test injects a permissive judge. A guard nothing can observe being
+    // removed is a guard that will eventually be removed.
+    //
+    // No `judge` dep here: the REAL `judgeCandidateQuestions` runs, its
+    // provider call fails (there is none), it fails closed, and the whole run
+    // must therefore report that nothing usable survived.
+    const infer = answer(GOOD_RELEVANCE, GOOD_STABILITY);
+    await expect(generateCandidateQuestions(base, { infer })).rejects.toMatchObject({
+      reason: 'unspeakable_questions',
+    });
+    // The generator still did its own work — this is the judge refusing, not
+    // the gates upstream of it.
+    expect(infer).toHaveBeenCalled();
+  });
+
+  it('KEEPS ONLY WHAT THE JUDGE ALLOWED, and reports the rest as refused', async () => {
+    const infer = answer(GOOD_RELEVANCE, GOOD_STABILITY);
+    // Allows the stability question and one relevance question.
+    const judge = (qs: readonly string[]) =>
+      Promise.resolve(qs.filter((q) => q !== GOOD_RELEVANCE[1]));
+    const result = await generateCandidateQuestions(base, { infer, judge });
+
+    expect(result.rewritten).toEqual({ profile_relevance: 1, stability: 1 });
+    const texts = result.questions.map((q) => q.question);
+    expect(texts).toContain(GOOD_RELEVANCE[0]);
+    expect(texts).not.toContain(GOOD_RELEVANCE[1]);
+    // The slot the judge emptied keeps the role's own question rather than
+    // being left blank or filled with the other compartment's.
+    expect(texts[2]).toBe(base.template[2].question);
+  });
+
+  it('is handed EVERY question at once, and only the generated ones', async () => {
+    const infer = answer(GOOD_RELEVANCE, GOOD_STABILITY);
+    const judge = vi.fn().mockImplementation((qs: readonly string[]) => Promise.resolve([...qs]));
+    await generateCandidateQuestions(base, { infer, judge });
+
+    expect(judge).toHaveBeenCalledTimes(1);
+    const submitted = judge.mock.calls[0][0] as string[];
+    expect([...submitted].sort()).toEqual([...GOOD_RELEVANCE, ...GOOD_STABILITY].sort());
+    // Never the fixed questions: they are the recruiter's, not the model's.
+    expect(submitted).not.toContain(base.template[0].question);
+  });
+
+  it('KEEPS EARLIER WORK when a LATER attempt hits a provider fault', async () => {
+    // Throwing unconditionally here discarded everything attempt 1 had already
+    // produced and validated — contradicting this module's own "partial
+    // success is success" rule, and making the candidate pay a second time to
+    // re-derive a question that was already in hand.
+    const infer = vi
+      .fn()
+      .mockResolvedValueOnce({ profile_relevance: [GOOD_RELEVANCE[0]], stability: [] })
+      .mockRejectedValueOnce(new Error('deepseek timeout'));
+    const result = await generateCandidateQuestions(base, { infer, judge: allowAll });
+
+    expect(infer).toHaveBeenCalledTimes(2);
+    expect(result.rewritten).toEqual({ profile_relevance: 1, stability: 0 });
+    expect(result.questions[1].question).toBe(GOOD_RELEVANCE[0]);
+  });
+
+  it('still reports a provider fault when the FIRST attempt fails with nothing kept', async () => {
+    const infer = vi.fn().mockRejectedValue(new Error('deepseek timeout'));
+    await expect(
+      generateCandidateQuestions(base, { infer, judge: allowAll }),
+    ).rejects.toMatchObject({ reason: 'provider_error' });
   });
 
   it('stops after the first attempt when the first attempt is enough', async () => {

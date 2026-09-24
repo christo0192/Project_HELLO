@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { supabase } from '../lib/supabase.js';
 import { templateFingerprint } from '../lib/candidate-questions.js';
+import { asCandidateTemplate } from '../lib/candidate-question-store.js';
 import { validateBody, validateParams } from '../lib/validation.js';
 import {
   createRoleSchema,
@@ -339,7 +340,14 @@ rolesRouter.put(
           .from('candidate_screening_questions')
           .delete()
           .eq('role_id', req.params.id)
-          .neq('template_hash', templateFingerprint(screening_template));
+          // THE SAME PROJECTION THE STORE FINGERPRINTS. The store hashes
+          // `asTemplate(row)`; hashing the raw request body here would make
+          // the two disagree the moment that projection normalises anything,
+          // and the `neq` would then delete every set including the one that
+          // already matches. It fails safe — the call falls back to the role
+          // template — but silently, and it would cost a provider call per
+          // candidate on every save.
+          .neq('template_hash', templateFingerprint(asCandidateTemplate(screening_template)));
       } catch {
         /* a stale candidate set is not worth failing a save over */
       }

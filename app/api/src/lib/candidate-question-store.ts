@@ -31,7 +31,16 @@ const TERMINAL_STATES = new Set([
   'cancelled',
 ]);
 
-function asTemplate(value: unknown): CandidateTemplateQuestion[] {
+/**
+ * Project a stored `screening_template` into the shape everything downstream
+ * reasons about.
+ *
+ * EXPORTED so the roles route can fingerprint over the SAME projection this
+ * store does. Two hashes of "the template" computed over different shapes are
+ * two different numbers, and the invalidation's `neq` would then delete the
+ * very set it is meant to keep.
+ */
+export function asCandidateTemplate(value: unknown): CandidateTemplateQuestion[] {
   if (!Array.isArray(value)) return [];
   const out: CandidateTemplateQuestion[] = [];
   for (const entry of value) {
@@ -153,7 +162,7 @@ export function createCandidateQuestionStore(
         roleTitle: typeof roleRow.title === 'string' ? roleRow.title : '',
         jd: typeof roleRow.jd === 'string' ? roleRow.jd : null,
         requiredSkills: asStringArray(roleRow.required_skills),
-        template: asTemplate(roleRow.screening_template),
+        template: asCandidateTemplate(roleRow.screening_template),
         resume,
         existing: existing
           ? {
@@ -178,7 +187,7 @@ export function createCandidateQuestionStore(
         .maybeSingle();
       if (error || !data) return null;
       return templateFingerprint(
-        asTemplate((data as Record<string, unknown>).screening_template),
+        asCandidateTemplate((data as Record<string, unknown>).screening_template),
       );
     },
 

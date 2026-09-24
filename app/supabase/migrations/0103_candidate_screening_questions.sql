@@ -42,7 +42,8 @@
 -- `phone_engagements.candidate_id` is ON DELETE RESTRICT (`0042`), so the
 -- candidate delete fails, the error is swallowed, and the request is marked
 -- fulfilled with the row still present. That is PRE-EXISTING — `0042` documents
--- the erasure order it needs and says outright that no caller implements it —
+-- the erasure order it needs and reports — already inaccurately, since
+-- `deleteDSAR` does delete `call_sessions` — that no caller implements it —
 -- and the cascade added here is exactly right FOR that order once it exists.
 -- But this table now holds résumé-derived personal data (employer names,
 -- tenure, achievements, inside `questions`), so the gap is worth more than a

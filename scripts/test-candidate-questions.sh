@@ -118,7 +118,7 @@ docker exec "$CTR" psql -U postgres -q -v ON_ERROR_STOP=1 \
 docker cp "$TESTS/candidate_questions_setup.sql" "$CTR:/tmp/setup.sql" >/dev/null
 docker cp "$TESTS/candidate_questions_assert.sql" "$CTR:/tmp/assert.sql" >/dev/null
 
-log 'seeding six calls, one per candidate-set state...'
+log 'seeding seven calls, one per candidate-set state...'
 docker exec "$CTR" psql -U postgres -q -v ON_ERROR_STOP=1 -f /tmp/setup.sql
 
 log 'asserting the preference, every fallback, and the refusal that must stay...'
