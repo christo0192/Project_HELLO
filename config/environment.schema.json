@@ -68,6 +68,7 @@
         "RATE_LIMIT_DEFAULT": { "requiredInProduction": false, "secret": false },
         "RATE_LIMIT_STRICT": { "requiredInProduction": false, "secret": false },
         "RATE_LIMIT_ROLE_DRAFT": { "requiredInProduction": false, "secret": false },
+        "CANDIDATE_QUESTIONS_ENABLED": { "requiredInProduction": false, "secret": false },
         "RATE_LIMIT_IP": { "requiredInProduction": false, "secret": false },
         "RATE_LIMIT_WINDOW_SEC": { "requiredInProduction": false, "secret": false },
         "TRUSTED_PROXY": { "requiredInProduction": false, "secret": false },

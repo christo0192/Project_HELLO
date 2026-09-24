@@ -1,5 +1,7 @@
 import { Router } from 'express';
 import { supabase } from '../lib/supabase.js';
+import { templateFingerprint } from '../lib/candidate-questions.js';
+import { asCandidateTemplate } from '../lib/candidate-question-store.js';
 import { validateBody, validateParams } from '../lib/validation.js';
 import {
   createRoleSchema,
@@ -312,6 +314,44 @@ rolesRouter.put(
     const { data, error } = await q.select().single();
     if (error) return next(error);
     if (!data) return res.status(404).json({ error: 'Role not found' });
+
+    // ── AN EDITED TEMPLATE RETIRES THE QUESTIONS GENERATED AROUND IT ──────
+    // A per-candidate set (`0103`) is the recruiter's template with the two
+    // résumé-driven compartments rewritten — so it EMBEDS the fixed questions
+    // as they stood when it was built. Leaving it in place after an edit would
+    // keep calling candidates with the wording the recruiter just changed,
+    // invisibly, for everyone already in the queue.
+    //
+    // DELETED RATHER THAN REGENERATED. An absent row means the call runs the
+    // role's own template, which is exactly the new intent, immediately and
+    // for every candidate. Regenerating instead would leave a window in which
+    // some candidates get the old wording and some the new — the state this
+    // is here to prevent — and would spend a provider call per candidate on a
+    // recruiter's typo fix.
+    //
+    // SCOPED TO A REAL CHANGE: only when the patch touched the template AND
+    // its fingerprint actually moved, so renaming a role or editing its JD
+    // costs nothing. BEST EFFORT: a failure here must not fail the save the
+    // operator just made, and its only consequence is a stale set, which the
+    // regeneration path then replaces on its own fingerprint check.
+    if (screening_template !== undefined) {
+      try {
+        await supabase
+          .from('candidate_screening_questions')
+          .delete()
+          .eq('role_id', req.params.id)
+          // THE SAME PROJECTION THE STORE FINGERPRINTS. The store hashes
+          // `asTemplate(row)`; hashing the raw request body here would make
+          // the two disagree the moment that projection normalises anything,
+          // and the `neq` would then delete every set including the one that
+          // already matches. It fails safe — the call falls back to the role
+          // template — but silently, and it would cost a provider call per
+          // candidate on every save.
+          .neq('template_hash', templateFingerprint(asCandidateTemplate(screening_template)));
+      } catch {
+        /* a stale candidate set is not worth failing a save over */
+      }
+    }
 
     // Audit: record resource update (fail-closed)
     try {

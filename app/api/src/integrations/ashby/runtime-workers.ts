@@ -30,6 +30,15 @@
  */
 
 import { createLogger } from '../../lib/logger.js';
+import {
+  CANDIDATE_QUESTIONS_QUEUE,
+  CANDIDATE_QUESTIONS_MAX_JOB_ATTEMPTS,
+  runCandidateQuestionsJob,
+  type CandidateQuestionsStore,
+} from '../../lib/candidate-question-jobs.js';
+import { createCandidateQuestionStore } from '../../lib/candidate-question-store.js';
+import { supabase } from '../../lib/supabase.js';
+import { env } from '../../lib/env.js';
 import { deriveCandidatePhone } from '../../lib/candidate-phone.js';
 import {
   createQueueRunner,
@@ -110,6 +119,31 @@ import type { AshbySignalPayload, EnabledMappingLoader } from './ports.js';
 
 /** Queue name for the ephemeral resume ingestion of one application link. */
 export const ASHBY_INGESTION_QUEUE = 'ashby.ingestion';
+
+/**
+ * Should a candidate admitted to phone screening get questions written about
+ * their own résumé?
+ *
+ * DEFAULT OFF, AND THE REASON IS THE RUNNER, NOT THE FEATURE. `createAshbyWorkers`
+ * gives every handler a SHARED budget of `concurrency: 2`, and the runner
+ * decrements `active` only when a job SETTLES — so a queue's in-flight count is
+ * unbounded even after PR #296's per-tick cap. A generation job holds one of
+ * those two slots for a provider call, and two of them in flight claim nothing
+ * from `ashby.signal`, `ashby.import` or `ashby.ingestion` until they finish.
+ * A review measured the dilution at −25% before any provider call and far worse
+ * once one is slow.
+ *
+ * So this ships as a CANARY the owner turns on, not a kill switch they might
+ * have to reach for. Turning it on is safe once the queue has its own runner or
+ * a per-queue in-flight cap; until then the owner decides when to spend the
+ * Ashby drain's headroom on it.
+ *
+ * `CANDIDATE_QUESTIONS_ENABLED=true` arms it. Anything else, including unset,
+ * leaves the enqueue unreached, so nothing is claimed, leased or billed.
+ */
+function candidateQuestionsEnabled(): boolean {
+  return process.env.CANDIDATE_QUESTIONS_ENABLED === 'true';
+}
 
 /**
  * How long the stage-interest set is trusted before a re-read. Deliberately
@@ -610,6 +644,12 @@ export interface AshbyHandlerDeps {
   midflightRecheckSeconds?: number;
   /** Injectable clock for the deadline (tests). */
   nowMs?: () => number;
+  /**
+   * The per-candidate question store. Production builds one over the runtime's
+   * service-role client; a test drives a fake and nothing here reaches a
+   * database by accident.
+   */
+  candidateQuestionStore?: CandidateQuestionsStore;
   /**
    * Override the local stage pre-filter handed to {@link processAshbySignal}.
    * Injected by tests; production builds one from the runtime's enabled-mapping
@@ -1185,8 +1225,101 @@ export function buildAshbyHandlers(
       if (result.status === 'done'
         && result.outcome.state === 'ready'
         && runtime.stores.ensurePhoneEngagement) {
-        await runtime.stores.ensurePhoneEngagement(linkId);
+        const engagement = await runtime.stores.ensurePhoneEngagement(linkId);
+
+        // ── AND ASK FOR THIS CANDIDATE'S OWN QUESTIONS ──────────────────
+        // HERE, because this is the first moment we know the person will
+        // actually be called — and it is comfortably before the due loop
+        // dials, which is the deadline that matters. Doing it at import
+        // would pay a provider call for every résumé that lands, most of
+        // which never reach a phone screen.
+        //
+        // ENQUEUED, NOT RUN. Generation is one call of up to two minutes;
+        // running it inline would hold this ingestion lease for that long on
+        // a drain that is tick-rate bound and has a starvation history. The
+        // queue owns the lease, the retry and the crash recovery.
+        //
+        // BEST EFFORT, AND SILENT ON FAILURE. Every outcome of this enqueue —
+        // including not happening at all — leaves the call running the role's
+        // own template. Letting an enqueue fault fail the INGESTION would
+        // trade a working import for a nicer question, which is the wrong way
+        // round.
+        // ── ONLY FOR A CANDIDATE WHO WILL ACTUALLY BE CALLED ────────────
+        // `ensure_ashby_phone_engagement` INSERTS the `pending_prereqs` row
+        // BEFORE it checks any prerequisite, then reports `phone_invalid`,
+        // `consent_evidence_missing`, `mapping_not_enabled` and the rest. So an
+        // engagement row exists, and is NOT terminal, for candidates with an
+        // unusable number or no consent evidence — and this module's whole cost
+        // argument ("the first moment we know the person will actually be
+        // called") was false while the status was discarded. Undialable rows
+        // are a material fraction of imports here.
+        //
+        // THE STATUS STRINGS ARE `0057`'s, READ FROM THE MIGRATION. The first
+        // draft of this guessed `ok`/`engagement_ready`/`already_exists`, none
+        // of which that function has ever returned — which would have left the
+        // enqueue unreachable and the whole feature quietly dead.
+        //   `eligible`              — admitted, due now
+        //   `scheduled_next_window` — admitted, due at the next calling window
+        //   `engagement_active`     — one already exists and is non-terminal,
+        //                             i.e. a redelivery for a candidate who
+        //                             passed these same checks earlier
+        // Everything else is a prerequisite failure over a row that exists but
+        // is not dialable.
+        const willBeCalled = engagement?.status === 'eligible'
+          || engagement?.status === 'scheduled_next_window'
+          || engagement?.status === 'engagement_active';
+        if (willBeCalled && candidateQuestionsEnabled()) {
+          try {
+            await runtime.queue.enqueue(
+              CANDIDATE_QUESTIONS_QUEUE,
+              { applicationLinkId: linkId },
+              {
+                // Keyed on the application, so a redelivery, a reconciliation
+                // recovery and a retried ingestion collapse onto one job.
+                dedupKey: `candidate-questions:${linkId}`,
+                maxAttempts: CANDIDATE_QUESTIONS_MAX_JOB_ATTEMPTS,
+              },
+            );
+          } catch (error) {
+            // Sanitized code only: no link id, no candidate, no provider
+            // message — a provider message can carry whatever it was handed.
+            logger.warn('unknown_event', {
+              error_category: 'candidate_questions_enqueue_failed',
+              error_type: 'ingestion_ready',
+            });
+          }
+        }
       }
+    },
+
+    // ── 4. Write this candidate's own profile-relevance and stability
+    //       questions, from their résumé ───────────────────────────────────
+    // The handler is a thin adapter: every decision — regenerate or not,
+    // retry or record — lives in `runCandidateQuestionsJob`, against an
+    // injectable store, so none of it needs a queue or a database to test.
+    //
+    // THE ONLY THROW IS A PROVIDER FAULT, which is the only failure the
+    // queue's retry can do anything about. A résumé this model cannot write a
+    // speakable question about fails the same way every time, so it is
+    // RECORDED and the job completes; re-running it would pay for the same
+    // answer twice and leave a job churning attempts over a call that is
+    // already correct.
+    [CANDIDATE_QUESTIONS_QUEUE]: async (job) => {
+      const payload = job.payload as { applicationLinkId?: string };
+      const linkId = payload?.applicationLinkId;
+      if (typeof linkId !== 'string' || linkId.length === 0) return;
+      // The SERVICE-ROLE client, not `runtime.client` — that one talks to
+      // Ashby. Reached through the process singleton the way every other store
+      // in this package does, with the seam above for tests.
+      const store = deps.candidateQuestionStore ?? createCandidateQuestionStore(supabase);
+      const outcome = await runCandidateQuestionsJob(
+        { applicationLinkId: linkId },
+        { store, model: env.deepseekScoringModel },
+      );
+      logger.info('unknown_event', {
+        error_category: 'candidate_questions_job',
+        error_type: outcome,
+      });
     },
   };
 }

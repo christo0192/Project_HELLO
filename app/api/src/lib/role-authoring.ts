@@ -75,7 +75,7 @@ const DIRECTIVE_OPENING_RE =
  * would retroactively make saved roles unsaveable — a much larger blast
  * radius than one generator refusing to emit a shape it was told not to.
  */
-function generatedQuestionIssue(text: string): string | null {
+export function generatedQuestionIssue(text: string): string | null {
   if (!text.trim().endsWith('?')) {
     return 'must end with a question mark';
   }
