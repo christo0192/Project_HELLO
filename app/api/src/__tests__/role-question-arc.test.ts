@@ -238,6 +238,34 @@ describe('generateRoleDraft wraps the model in that arc', () => {
     expect(new Set(texts).size).toBe(texts.length);
   });
 
+  it('DROPS a model question the arc already asks — including the SHIFT one', async () => {
+    // This PR added `ROLE_DRAFT_SHIFT_QUESTION` to `arcKeys`, and removing it
+    // again left all 6095 API tests green: the test above feeds back only the
+    // OPENER. The prompt's "do NOT ask about shifts or working hours" is a
+    // prompt rule, and this file's standing argument is that those hold only
+    // most of the time — when one is missed the duplicate is a template-level
+    // `duplicate_text` and `createRoleSchema` refuses the WHOLE role on Save.
+    const infer = vi.fn().mockResolvedValue({
+      jd: 'A job description with enough prose to be usable.',
+      required_skills: ['Sales'],
+      profile_relevance: [
+        { question: ROLE_DRAFT_SHIFT_QUESTION, weight: 1 },
+        ...modelQuestions.slice(0, 2).map((question) => ({ question, weight: 1 })),
+      ],
+      stability: [{ question: 'How long did you stay in your last two jobs?', weight: 1 }],
+    });
+    const { draft } = await generateRoleDraft('Sales Advisor', { infer });
+    const texts = draft.screening_template.map((q) => q.question);
+
+    expect(texts.filter((t) => t === ROLE_DRAFT_SHIFT_QUESTION)).toHaveLength(1);
+    expect(new Set(texts).size).toBe(texts.length);
+    // And it is still the arc's own copy, in the arc's own slot — dropping the
+    // model's duplicate must not cost the compartment its question.
+    expect(draft.screening_template.find((q) => q.category === 'shift_fit')?.question).toBe(
+      ROLE_DRAFT_SHIFT_QUESTION,
+    );
+  });
+
   it('MARKS THE ARC MANDATORY, or the worker is free to skip it', async () => {
     // `format_questions` (prompting.py:114) renders `[MUST ASK] ` only for a
     // question carrying this flag, inside a system prompt that says to cover
@@ -452,16 +480,57 @@ describe('the call runs in compartments', () => {
     // answer arrived in, so the model cannot mislabel it.
     const infer = vi.fn().mockResolvedValue({
       ...goodDraft(),
-      // The model even tries to claim otherwise; it is ignored.
+      // THE PLANTED VALUE MUST BE `stability`, and an earlier version of this
+      // test planted 'compensation' instead — which is INERT. `withArc` buckets
+      // on exactly one comparison, `q.category === 'stability'`, and overwrites
+      // the label from the bucket afterwards, so a planted 'compensation'
+      // changes nothing and the test passed even when the model's self-report
+      // was allowed to win. Proven by mutation: spreading the model object over
+      // the structural label kept all 30 tests green.
       profile_relevance: [
-        { question: 'What does your current role involve day to day?', weight: 1, category: 'compensation' },
+        { question: 'What does your current role involve day to day?', weight: 1, category: 'stability' },
         { question: 'How do you handle an unhappy customer?', weight: 1 },
       ],
+      stability: [{ question: 'How long did you stay in your last two jobs?', weight: 1 }],
     });
     const { draft } = await generateRoleDraft('Sales Advisor', { infer });
     const relevance = draft.screening_template.filter((q) => q.category === 'profile_relevance');
     expect(relevance).toHaveLength(ROLE_DRAFT_RELEVANCE_COUNT);
     expect(relevance[0].question).toBe('What does your current role involve day to day?');
+    // And the compartment the model tried to claim still holds the question
+    // that actually came back in the `stability` array — if the self-report
+    // won, this is the relevance question instead, and the genuine stability
+    // question is dropped entirely.
+    const stability = draft.screening_template.filter((q) => q.category === 'stability');
+    expect(stability).toHaveLength(ROLE_DRAFT_STABILITY_COUNT);
+    expect(stability[0].question).toBe('How long did you stay in your last two jobs?');
+  });
+
+  it('BOUNDS THE STABILITY COMPARTMENT TOO, not only relevance', async () => {
+    // The mirror of the flood test above, and it was missing: every flood
+    // fixture in this file filled `profile_relevance`, so nothing ever put
+    // more than one entry in `stability` and the `.slice()` bounding it could
+    // be DELETED with all 6095 API tests green. A model answering with forty
+    // stability questions then produced a 47-question call.
+    const infer = vi.fn().mockResolvedValue({
+      jd: 'A job description with enough prose to be usable.',
+      required_skills: ['Sales'],
+      profile_relevance: modelQuestions.slice(0, 2).map((question) => ({ question, weight: 1 })),
+      stability: Array.from({ length: 40 }, (_, i) => ({
+        question: `How long did you stay in the role before number ${i}?`,
+        weight: 1,
+      })),
+    });
+    const { draft } = await generateRoleDraft('Sales Advisor', { infer });
+
+    expect(draft.screening_template).toHaveLength(ROLE_DRAFT_TOTAL_QUESTIONS);
+    expect(
+      draft.screening_template.filter((q) => q.category === 'stability'),
+    ).toHaveLength(ROLE_DRAFT_STABILITY_COUNT);
+    // The surplus must come off the MIDDLE, never off the pay questions.
+    expect(
+      draft.screening_template.slice(-ROLE_DRAFT_CLOSING_QUESTIONS.length).map((q) => q.question),
+    ).toEqual([...ROLE_DRAFT_CLOSING_QUESTIONS]);
   });
 
   it('NEVER FILLS THE STABILITY SLOT with a relevance question', async () => {
@@ -503,6 +572,21 @@ describe('the call runs in compartments', () => {
     // question a recruiter most often leaves until after they already like
     // someone.
     expect(validatePhoneQuestion(ROLE_DRAFT_SHIFT_QUESTION)).toEqual([]);
+
+    // AND IT ASKS WHAT IT IS NAMED FOR. Speakability was the only assertion on
+    // the one question this work adds, so it could be replaced with "What is
+    // your current annual CTC in your present job?" — a pay question sitting in
+    // the shift compartment, asking CTC twice and never asking about nights —
+    // with every test in the repository still green. Every other fixed question
+    // here carries a meaning-level assertion; this restores the parity.
+    expect(ROLE_DRAFT_SHIFT_QUESTION.toLowerCase()).toMatch(/night|overnight|shift/);
+    // It must NOT read as a compensation objective: `phone_answer_covers_
+    // objective` keys on ctc/salary/compensation/package, and a shift question
+    // carrying one of those words with no `current`/`expected` slot would be
+    // treated as answered by anything at all and never asked.
+    expect(ROLE_DRAFT_SHIFT_QUESTION.toLowerCase()).not.toMatch(
+      /\b(?:ctc|salary|compensation|package)\b/,
+    );
   });
 
   it('the EXPECTED-CTC question asks for negotiating room and keeps its token', async () => {

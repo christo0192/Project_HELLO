@@ -40,6 +40,52 @@ export const SCREENING_CATEGORY_LABELS: Record<ScreeningCategory, string> = {
   compensation: 'Compensation and notice',
 };
 
+/**
+ * What a run of UNCATEGORISED questions is called, when it follows a
+ * compartment.
+ *
+ * Pressing "Add question" on a compartmented role appends a row with no
+ * category, and a role authored before compartments existed is nothing but
+ * such rows. The first case needs a break — leaving the new question under
+ * "Compensation and notice" would claim it belongs to a compartment it has
+ * nothing to do with — and the second needs no heading at all, which is why
+ * this is applied on the BOUNDARY rather than to every uncategorised row.
+ */
+export const UNCATEGORISED_SECTION_LABEL = 'Additional questions';
+
+/**
+ * The heading to show above a question, or null for "this row continues the
+ * run above it".
+ *
+ * Total over every input, including a `category` this build does not know.
+ * That case is real: the value arrives off the wire, and the response is CAST
+ * rather than parsed, so TypeScript cannot see a compartment the API has added
+ * and the form has not. Before this function the heading was gated on "the
+ * category changed" and the text was looked up separately, so an unknown
+ * compartment rendered an EMPTY `<h4>` — invisible on screen, an
+ * `empty-heading` violation to a screen reader, and a lie about where the
+ * boundary is.
+ *
+ * WHAT ACTUALLY PREVENTS THAT is returning null here and gating the heading on
+ * the RETURN VALUE at the call site. The `?? null` below is type honesty
+ * rather than a second guard — `SCREENING_CATEGORY_LABELS` is typed
+ * `Record<ScreeningCategory, string>`, so without it this function would
+ * promise `string | null` and hand back `undefined`. Removing it changes no
+ * rendered output, and saying otherwise would be the kind of comment this
+ * repository has been bitten by.
+ */
+export function sectionHeading(
+  category: ScreeningCategory | undefined,
+  priorCategory: ScreeningCategory | undefined,
+): string | null {
+  // Same run — including the all-uncategorised case, where both are undefined
+  // on every row and the form stays ungrouped exactly as it was before
+  // compartments existed.
+  if (category === priorCategory) return null;
+  if (category == null) return UNCATEGORISED_SECTION_LABEL;
+  return SCREENING_CATEGORY_LABELS[category] ?? null;
+}
+
 export interface Role {
   id: string;
   title: string;

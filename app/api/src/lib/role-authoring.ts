@@ -764,8 +764,15 @@ export async function generateRoleDraft(
     if (!draft) {
       lastShapeFailure = true;
       rejectedCount = 0;
+      // NAMES THE SHAPE THE PROMPT ASKS FOR, which is no longer a flat
+      // `screening_template`. This string is fed back verbatim as the repair
+      // instruction, so while it said "a non-empty screening_template array"
+      // it was telling the model to answer in the legacy flat shape — which
+      // `coerceDraft` accepts and labels ENTIRELY `profile_relevance`, leaving
+      // the stability compartment empty with nothing to show for it. A retry
+      // that obeys the repair line must land in the compartmented shape.
       failures = [
-        'The response was not a JSON object carrying a non-empty "jd", a non-empty "required_skills" array, and a non-empty "screening_template" array.',
+        'The response was not a JSON object carrying a non-empty "jd", a non-empty "required_skills" array, and the two question arrays "profile_relevance" and "stability".',
       ];
       continue;
     }

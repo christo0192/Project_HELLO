@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../api";
-import { SCREENING_CATEGORY_LABELS } from "../types";
+import { sectionHeading } from "../types";
 import type { Role, RoleInput, ScreeningCategory, ScreeningQuestion } from "../types";
 import {
   Button,
@@ -751,12 +751,27 @@ function RoleForm({
               // rows would silently re-order the conversation. The rows stay
               // exactly as they will be asked; the heading just says where one
               // compartment ends and the next begins.
-              const startsSection = q.category != null && q.category !== questions[idx - 1]?.category;
+              //
+              // THE LABEL IS LOOKED UP BEFORE THE HEADING IS DECIDED, because
+              // the category arrives off the wire and the lookup is typed as
+              // total but is not. A compartment this build does not know would
+              // otherwise render an EMPTY `<h4>` — invisible on screen, an
+              // `empty-heading` violation to a screen reader, and a lie about
+              // where the compartment boundary is. Unknown means unlabelled
+              // means no heading.
+              //
+              // The uncategorised TAIL gets its own break rather than falling
+              // under the previous heading. Pressing "Add question" on a
+              // compartmented role appends a row with no category, and sitting
+              // it silently under "Compensation and notice" would tell the
+              // recruiter their new question belongs to a compartment it has
+              // nothing to do with.
+              const label = sectionHeading(q.category, questions[idx - 1]?.category);
               return (
                 <div key={idx} className="space-y-3">
-                  {startsSection && (
+                  {label && (
                     <h4 className="pt-1 text-xs font-semibold uppercase tracking-wide text-ink-tertiary">
-                      {SCREENING_CATEGORY_LABELS[q.category!]}
+                      {label}
                     </h4>
                   )}
                 <div className="glass-sunken space-y-3 p-3">

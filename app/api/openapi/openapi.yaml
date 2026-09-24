@@ -7650,6 +7650,10 @@ components:
           type: string
         mandatory:
           type: boolean
+        category:
+          type: string
+          description: Which compartment of the screening call this question belongs to. Absent on every role authored before compartments existed - an uncategorised question is ungrouped, not invalid. The call order is the array order; this only names the boundaries.
+          enum: [introduction, profile_relevance, shift_fit, stability, compensation]
       additionalProperties: true
 
     RoleDraftJob:
@@ -7710,6 +7714,17 @@ components:
                     type: string
                   question:
                     type: string
+                  # DECLARED BECAUSE THIS COPY IS CLOSED. `ScreeningQuestion`
+                  # above is `additionalProperties: true`, so an undeclared key
+                  # is spec-legal there; this inline schema is not, and the
+                  # generator has emitted `mandatory` since the arc shipped and
+                  # `category` since the compartments did. The contract test
+                  # never drives a SUCCEEDED draft body, so nothing caught it.
+                  mandatory:
+                    type: boolean
+                  category:
+                    type: string
+                    enum: [introduction, profile_relevance, shift_fit, stability, compensation]
                   weight:
                     # NUMBER, not integer. `coerceDraft` accepts any finite
                     # non-negative value (`Math.min(rawWeight, 100)`) and the
