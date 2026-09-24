@@ -358,3 +358,123 @@ body .text-amber-700 { color: var(--warning-text); }
 body .bg-red-50 { background-color: var(--error-soft); }
 body .text-red-600,
 body .text-red-700 { color: var(--error-text); }
+
+
+/* ── "Ask Hello" — the animated gradient on the role-drafting button ─────
+   Decorative only: the button's label and its live region carry every fact.
+
+   THE STOPS ARE MEASURED, AND TWO EARLIER SETS FAILED.
+
+   First failure: white semibold on the old teal (#398AA2) was 3.94:1 — under
+   the 4.5:1 this text size needs — and the sheen sweeping over it dropped that
+   to 2.55:1 AT THE SHEEN ALPHA IN FORCE THEN, which was 0.28. (At today's
+   0.14 the same stop computes to 3.17:1; quoting the figure without the alpha
+   made it look wrong when re-derived against the current value.) The label was
+   legible, then wasn't, then was, twenty times a minute: a contrast failure
+   that ANIMATES, which reads as a rendering glitch.
+
+   Second failure, and the instructive one: the stops below were re-measured
+   and pass, but the BUTTON carried `opacity-60` while idle or running. CSS
+   opacity composites the whole subtree, so it faded the white label along with
+   the fill, and everything measured here was beside the point:
+
+     stop      opacity 1            opacity .6 over white
+     #3B5488   7.47:1 / 5.25:1      2.90:1 / 2.42:1
+     #2B5F72   7.04:1 / 5.03:1      2.82:1 / 2.39:1
+     #574189   8.32:1 / 5.72:1      3.05:1 / 2.53:1
+                     (base / under the 0.14 sheen)
+
+   Worse than the animation bug it replaced, and it applied for the entire ten
+   minutes the button spends saying "Asking Hello…" — the one state the whole
+   feature exists to make legible. The fade is gone; unavailability is a flat
+   measured fill (below) that leaves the label at full strength.
+
+   Sampled every 5% along all three ramps, the worst point anywhere on the
+   running button is 5.02:1 under the sheen — at #2d5e74, the sampled point
+   nearest the true minimum, which is the #2b5f72 stop itself at 5.03:1. The
+   sheen's 0.14 alpha is what keeps that above 4.5:1 rather than merely above
+   3:1.
+
+   Two layers: a slow hue drift so the button is never flat, and a faster
+   sheen. The sheen is its own layer rather than a background-position trick on
+   the button, so it composites without repainting the text under it. */
+.ask-hello {
+  background-image: linear-gradient(
+    110deg,
+    #3b5488 0%,
+    #2b5f72 28%,
+    #574189 55%,
+    #2b5f72 78%,
+    #3b5488 100%
+  );
+  background-size: 300% 100%;
+  animation: ask-hello-drift 9s linear infinite;
+  box-shadow: 0 1px 2px rgb(15 23 42 / 0.18), inset 0 0 0 1px rgb(255 255 255 / 0.08);
+}
+
+/* NOT AVAILABLE YET — no job role to draft from.
+   A flat desaturated fill rather than a fade: #556070 is 6.38:1 against the
+   white label, so "you cannot press this" costs nothing in legibility. The
+   animation stops too, because a button that glows and cannot be pressed is
+   an invitation with no door. */
+.ask-hello--idle {
+  background-image: none;
+  background-color: #556070;
+  animation: none;
+  box-shadow: inset 0 0 0 1px rgb(255 255 255 / 0.08);
+}
+.ask-hello--idle .ask-hello__sheen {
+  display: none;
+}
+
+/* `:not(:focus-visible)` is the whole point of this selector, not decoration.
+   `.ask-hello:hover:not([aria-disabled='true'])` is specificity (0,3,0) —
+   `:not()` contributes its argument — and Tailwind's
+   `.focus-visible\:ring-2:focus-visible` is (0,2,0). Specificity beats source
+   order, so a button that was BOTH hovered and focus-visible had its entire
+   ring box-shadow replaced by this glow: the 2px indicator vanished, leaving
+   something visually identical to the unfocused hover state. Reachable by any
+   keyboard user whose pointer happens to rest over the button — click into
+   "Job role", then Tab. */
+.ask-hello:hover:not([aria-disabled='true']):not(:focus-visible) {
+  box-shadow: 0 2px 10px rgb(59 84 136 / 0.45), inset 0 0 0 1px rgb(255 255 255 / 0.14);
+}
+.ask-hello__sheen {
+  position: absolute;
+  inset: 0;
+  background-image: linear-gradient(
+    100deg,
+    transparent 35%,
+    rgb(255 255 255 / 0.14) 50%,
+    transparent 65%
+  );
+  background-size: 220% 100%;
+  animation: ask-hello-sheen 2.8s ease-in-out infinite;
+  pointer-events: none;
+}
+@keyframes ask-hello-drift {
+  to { background-position: -300% 0; }
+}
+@keyframes ask-hello-sheen {
+  0%   { background-position: 140% 0; }
+  60%  { background-position: -40% 0; }
+  100% { background-position: -40% 0; }
+}
+
+/* A looping gradient behind a control someone is WAITING on is exactly the
+   motion this rule exists for. The button keeps its colour and every label.
+   At `background-position: 0 0` with a 300% background, the visible third of
+   the ramp runs from #3b5488 to about the #2b5f72 stop — a floor of 7.04:1,
+   because the sheen is `opacity: 0` here and the 0.14 reduction never
+   applies. (An earlier version of this comment claimed position 0 showed only
+   the #3b5488 stop. It does not; the conclusion happened to survive.) */
+@media (prefers-reduced-motion: reduce) {
+  .ask-hello {
+    animation: none;
+    background-position: 0 0;
+  }
+  .ask-hello__sheen {
+    animation: none;
+    opacity: 0;
+  }
+}

@@ -962,6 +962,114 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
     .eq('candidate_id', req.params.id)
     .order('started_at', { ascending: false });
 
+  /**
+   * How many words the CANDIDATE said, per session.
+   *
+   * `duration_sec` is wall clock from session start to finalize
+   * (agent.py:9775) — the bot's speech, the candidate's, the ring and every
+   * silence. It is NOT talk time, and reading it as engagement inverts the
+   * truth on exactly the calls that matter: Praveetha's 2026-09-10 screen had
+   * 8 of 8 bot turns barged-in and truncated, and its wall clock reads as a
+   * long healthy conversation.
+   *
+   * Real talk time is not derivable from what is stored. `transcript_turns`
+   * DOES carry a turn-start anchor — `turn_started_at_ms`, added by 0026 and
+   * used by the seekable transcript to derive `start_offset_sec` — so the
+   * earlier claim here of "no audio offsets" was wrong; the conclusion
+   * happened to survive its reason. What is missing is a speech-END anchor.
+   * Differencing consecutive starts would charge each answer with the
+   * endpointing pause that follows it (0.4-2.5s, a 50% error on a
+   * five-second answer), give the final turn nothing at all, and return null
+   * for every legacy row. `created_at` is worse still: the writes are batched,
+   * so differencing it would look precise and be fiction. Words the candidate actually said are
+   * derivable, honest, and separate a talkative candidate from a silent one.
+   *
+   * Counted here rather than in the client because the turns are not in this
+   * payload and fetching them per session would be one round trip per call.
+   */
+  const sessionIds = (sessions ?? []).map((s) => (s as { id: string }).id);
+  /** Candidate words per session. */
+  const wordsBySession = new Map<string, number>();
+  /**
+   * Sessions that have ANY transcript row, whoever spoke.
+   *
+   * This is what separates "the candidate said nothing" from "we hold no
+   * transcript for this call". Both produce zero candidate turns, and only the
+   * first is a fact about the candidate — so a count is reported only for a
+   * session that demonstrably has a transcript.
+   */
+  const transcribedSessions = new Set<string>();
+  /**
+   * Cleared if the turn read fails. A partial count is WORSE than no count: it
+   * renders as a confident low number against a real candidate, and nothing on
+   * screen would say it came from a failed read.
+   */
+  let wordCountsUsable = true;
+
+  if (sessionIds.length > 0) {
+    // PAGINATED, AND THE PAGE IS DELIBERATELY SMALLER THAN THE CAP.
+    //
+    // PostgREST truncates a response at `max_rows` and signals it in no way
+    // the client can see — it simply returns fewer rows. This loop stops when
+    // a page comes back short, so a PAGE equal to the cap is a trap: every
+    // page would come back short, the loop would stop after the first, and the
+    // count would be silently low for exactly the talkative candidates this
+    // figure exists to identify. `app/supabase/config.toml` sets max_rows to
+    // 1000, so 500 leaves the terminator meaningful with room for that value
+    // to be halved before anyone has to think about it again.
+    //
+    // A hard iteration cap sits underneath: if the data ever outgrows it, the
+    // count is marked unusable rather than reported short. A missing badge is
+    // recoverable; a confident wrong number is not.
+    const PAGE = 500;
+    const MAX_PAGES = 200;
+    let pages = 0;
+    for (let from = 0; ; from += PAGE) {
+      if (pages >= MAX_PAGES) {
+        wordCountsUsable = false;
+        break;
+      }
+      pages += 1;
+      const { data: turns, error } = await supabase
+        .from('transcript_turns')
+        .select('session_id, speaker, text, is_gate')
+        .in('session_id', sessionIds)
+        // CONSENT-GATE TURNS ARE NOT THE INTERVIEW. 0067 added `is_gate` to
+        // separate the identity-and-consent handshake from the screening
+        // itself, and the scorer excludes it. Counting "yes" and "yes, this
+        // is <name>" as words the candidate spoke put this badge on a
+        // different population from every other number on the page — most
+        // visibly on a call that DIED at the gate, where it would report a
+        // word count for an interview that never started.
+        //
+        // `is not true` rather than `= false`: the column is nullable and
+        // every row written before 0067 carries null.
+        .not('is_gate', 'is', true)
+        // Ordered on the (session_id, turn_index) index this table already
+        // carries: pagination needs a TOTAL order to not skip or repeat rows,
+        // and the uuid primary key would give one only by sorting every match.
+        .order('session_id', { ascending: true })
+        .order('turn_index', { ascending: true })
+        .range(from, from + PAGE - 1);
+      if (error) {
+        wordCountsUsable = false;
+        break;
+      }
+      const rows = (turns ?? []) as Array<{
+        session_id: string;
+        speaker: string | null;
+        text: string | null;
+      }>;
+      for (const turn of rows) {
+        transcribedSessions.add(turn.session_id);
+        if (turn.speaker !== 'candidate') continue;
+        const words = (turn.text ?? '').trim().split(/\s+/).filter(Boolean).length;
+        wordsBySession.set(turn.session_id, (wordsBySession.get(turn.session_id) ?? 0) + words);
+      }
+      if (rows.length < PAGE) break;
+    }
+  }
+
   const { data: assessments } = await supabase
     .from('assessments')
     .select('*')
@@ -973,7 +1081,16 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
   // future column cannot be redacted in one route and forgotten in another.
   res.json({
     candidate: redactCandidatePhone(candidate as Record<string, unknown>, req.authUser?.appRole),
-    sessions: sessions ?? [],
+    sessions: (sessions ?? []).map((session) => {
+      const row = session as Record<string, unknown>;
+      const id = row.id as string;
+      // NULL, not 0, when the number cannot be stood behind. 0 is a claim
+      // about the candidate — "they said nothing" — and is made only for a
+      // session that has a transcript, read in full.
+      const words =
+        wordCountsUsable && transcribedSessions.has(id) ? (wordsBySession.get(id) ?? 0) : null;
+      return { ...row, candidate_words: words };
+    }),
     assessments: assessments ?? [],
   });
 });

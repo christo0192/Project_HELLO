@@ -84,6 +84,20 @@ export function CandidateProfileCard({
       <p className="mb-4 mt-0.5 text-[13px] text-ink-tertiary">
         Identity and skills as parsed from the resume.
       </p>
+      {/* SUMMARY FIRST, ABOVE THE NUMBERS. The ask was to put it "above the
+          numbers and experience, because summary is the thing the manager
+          cares to see often". An earlier pass moved it only to the top of the
+          Resume-evidence list further down, which left it below Phone,
+          Experience, Status and Skills — i.e. below exactly the numbers it was
+          asked to clear. It sits above the whole field list now, and
+          `ResumeEvidence` no longer repeats it. */}
+      {candidate.parsed?.summary && (
+        <div data-candidate-summary="" className="mb-4">
+          <h3 className="mb-1 text-xs font-medium text-ink-secondary">Summary</h3>
+          <p className="text-sm leading-relaxed text-ink">{candidate.parsed.summary}</p>
+        </div>
+      )}
+
       <dl className="space-y-3 text-sm">
         <Field label="Phone">
           {candidate.phone_e164 ? (
@@ -147,19 +161,25 @@ function ResumeEvidence({ facts }: { facts?: CandidateResumeFacts | null }) {
       <dd className="text-sm leading-relaxed text-ink">{values.join(' · ')}</dd>
     </div>
   ) : null;
+  // `facts.summary` is NOT counted: it renders above the field list at the top
+  // of the card now, not in this section. Leaving it in the predicate gave a
+  // candidate whose parse yielded only a summary a "Resume evidence" heading
+  // and a rule above an empty list.
   const hasEvidence = recentLabel || prior.length || (facts.career_highlights?.length ?? 0) ||
-    (facts.education?.length ?? 0) || (facts.certifications?.length ?? 0) || facts.summary;
+    (facts.education?.length ?? 0) || (facts.certifications?.length ?? 0);
   if (!hasEvidence) return null;
   return (
     <div className="mt-5 border-t border-line pt-4">
       <h3 className="mb-3 text-[13px] font-medium text-ink-secondary">Resume evidence</h3>
       <dl className="space-y-3">
+        {/* Summary is NOT repeated here — it renders above the field list at
+            the top of this card, which is what "above the numbers and
+            experience" asked for. */}
         {recentLabel && <Field label="Latest role"><span className="text-right">{recentLabel}</span></Field>}
         {prior.length > 0 && <div><dt className="mb-1 text-xs font-medium text-ink-secondary">Previous roles</dt><dd className="space-y-1 text-sm text-ink">{prior.map((role, i) => <div key={`${role}-${i}`}>{role}</div>)}</dd></div>}
         {listSection('Career highlights', facts.career_highlights)}
         {listSection('Education', facts.education)}
         {listSection('Certifications', facts.certifications)}
-        {facts.summary && <div><dt className="mb-1 text-xs font-medium text-ink-secondary">Summary</dt><dd className="text-sm leading-relaxed text-ink">{facts.summary}</dd></div>}
       </dl>
     </div>
   );

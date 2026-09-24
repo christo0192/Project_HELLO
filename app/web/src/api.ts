@@ -98,6 +98,7 @@ import type {
   StatusTransitionResponse,
   TurnResult,
   UploadResumeResult,
+  RoleDraftJob,
 } from './types';
 
 export { ApiError };
@@ -162,6 +163,31 @@ export const api = {
 
   // Roles
   listRoles: () => request<Role[]>('/api/roles'),
+  /**
+   * Ask Hello — START a drafting job. Returns as soon as the row exists.
+   *
+   * Three short calls instead of one ten-minute stream: the work outlives the
+   * request, so a refresh picks it back up and a proxy idle timeout cannot
+   * destroy it.
+   */
+  startRoleDraft: (jobRole: string) =>
+    request<RoleDraftJob>('/api/roles/draft', {
+      method: 'POST',
+      body: JSON.stringify({ job_role: jobRole }),
+    }),
+  /**
+   * The caller's live drafting job, if any.
+   *
+   * What a reload asks. The job id lives in component state and nowhere else,
+   * so without this a refresh abandoned a running job that kept billing and
+   * whose result no endpoint could name.
+   */
+  getActiveRoleDraft: () =>
+    request<{ active: RoleDraftJob | null }>('/api/roles/draft'),
+  getRoleDraft: (id: string) => request<RoleDraftJob>(`/api/roles/draft/${id}`),
+  /** Stops the v4-pro spending, not just the spinner. */
+  cancelRoleDraft: (id: string) =>
+    request<{ cancelled: boolean }>(`/api/roles/draft/${id}/cancel`, { method: 'POST' }),
   getRole: (id: string) => request<Role>(`/api/roles/${id}`),
   createRole: (body: RoleInput) =>
     request<Role>('/api/roles', {

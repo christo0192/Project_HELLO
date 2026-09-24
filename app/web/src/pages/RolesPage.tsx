@@ -20,6 +20,7 @@ import {
   usePagination,
 } from "../components/design";
 import { RoleScorecardEditor } from "../components/roles/RoleScorecardEditor";
+import { AskHelloButton } from "../components/roles/AskHelloButton";
 
 interface QuestionRow {
   id: string;
@@ -75,7 +76,10 @@ export function RolesPage() {
       <PageHeader
         eyebrow="Talent workspace"
         title="Roles"
-        description="Define the jobs candidates are screened for and the questions Gopu will ask."
+        // NOT "the questions Gopu will ask". Each role now names its own
+        // agent, and one hard-coded name in the page header contradicts every
+        // role that chose a different one.
+        description="Define the jobs candidates are screened for and the questions the screening agent will ask."
         actions={
           editing === null ? (
             <Button variant="primary" onClick={() => setEditing("new")}>
@@ -122,9 +126,23 @@ export function RolesPage() {
                   className="flex h-full flex-col gap-3"
                 >
                   <div className="flex items-start justify-between gap-3">
-                    <h2 className="min-w-0 truncate text-[15px] font-semibold tracking-[-0.01em] text-ink">
-                      {role.title}
-                    </h2>
+                    <div className="min-w-0">
+                      <h2 className="min-w-0 truncate text-[15px] font-semibold tracking-[-0.01em] text-ink">
+                        {role.title}
+                      </h2>
+                      {/* SHOWN, because a field you can only write is a field
+                          nobody can check. The agent name is how an operator
+                          tells two roles apart internally; it is never spoken
+                          to a candidate, and the label says so. */}
+                      {role.agent_name && (
+                        <p
+                          data-role-agent-name=""
+                          className="mt-0.5 truncate text-xs text-ink-tertiary"
+                        >
+                          Agent: {role.agent_name}
+                        </p>
+                      )}
+                    </div>
                     <StatusBadge tone={role.is_active ? "success" : "neutral"}>
                       {role.is_active ? "Active" : "Inactive"}
                     </StatusBadge>
@@ -225,6 +243,7 @@ function RoleForm({
   onSaved: () => void;
 }) {
   const [title, setTitle] = useState(role?.title ?? "");
+  const [agentName, setAgentName] = useState(role?.agent_name ?? "");
   const [jd, setJd] = useState(role?.jd ?? "");
   const [interviewerInstructions, setInterviewerInstructions] = useState(
     role?.interviewer_instructions ?? "",
@@ -241,6 +260,17 @@ function RoleForm({
   );
   const [saving, setSaving] = useState(false);
   const [formError, setFormError] = useState<string | null>(null);
+  /** Set after Ask Hello fills the form; cleared once the role is saved. */
+  const [draftNote, setDraftNote] = useState<string | null>(null);
+  /**
+   * Ask Hello's own failures, kept SEPARATE from `formError`.
+   * `formError` renders beside the Save button, below the question list and
+   * the prompt preview — roughly 1200px down. After a ten-minute wait, that is
+   * off screen at exactly the moment an explanation is needed, and moving it
+   * up would put save errors far from Save. Two slots, each next to its own
+   * button.
+   */
+  const [draftError, setDraftError] = useState<string | null>(null);
 
   function updateQuestion(idx: number, patch: Partial<QuestionRow>) {
     setQuestions((prev) =>
@@ -261,7 +291,7 @@ function RoleForm({
     setFormError(null);
 
     if (!title.trim()) {
-      setFormError("Title is required.");
+      setFormError("Job role is required.");
       return;
     }
     const questionIssue = questions
@@ -287,6 +317,23 @@ function RoleForm({
 
     const body: RoleInput = {
       title: title.trim(),
+      // Blank means unset, which the API stores as NULL — one representation,
+      // matching the column's check constraint.
+      // SENT ONLY WHEN IT MEANS SOMETHING, and that is a deploy-ordering
+      // guard rather than tidiness. `roles.agent_name` arrives in 0100, and
+      // the web app ships independently of `supabase db push` — until the
+      // migration lands, PostgREST rejects the unknown column (PGRST204) and
+      // the route 500s. Sending it unconditionally would therefore break ALL
+      // role creation and editing, including for the roles that never wanted
+      // an agent name, which is every existing one.
+      //
+      // Omitted when the box is blank and the role never had a value: the
+      // overwhelming majority of saves carry no key at all and keep working.
+      // A blank box on a role that HAS one is a real edit — "clear it" — so
+      // that still sends an explicit null and still needs the migration.
+      ...(agentName.trim() || role?.agent_name
+        ? { agent_name: agentName.trim() ? agentName.trim() : null }
+        : {}),
       jd: jd.trim(),
       required_skills,
       screening_template,
@@ -310,10 +357,27 @@ function RoleForm({
     <GlassPanel padding="lg">
       <SectionHeader
         title={role ? "Edit role" : "New role"}
-        description="The title, focus and questions below drive the screening conversation."
+        description="The job role, focus and questions below drive the screening conversation."
       />
       <form onSubmit={handleSubmit} className="mt-5 space-y-5">
-        <Field label="Title" id="role-title">
+        {/* ABOVE the job role, because it is what the operator calls this
+            screener day to day. It is NEVER spoken: `title` is the job the
+            candidate applied for and remains the only name the phone worker
+            reads aloud. */}
+        <Field label="Agent" id="role-agent-name" hint="Your internal name for this screener. Never spoken to candidates.">
+          {({ id, describedBy }) => (
+            <TextField
+              id={id}
+              aria-describedby={describedBy}
+              value={agentName}
+              maxLength={80}
+              placeholder="e.g. Gopu"
+              onChange={(e) => setAgentName(e.target.value)}
+            />
+          )}
+        </Field>
+
+        <Field label="Job role" id="role-title">
           {({ id }) => (
             <TextField
               id={id}
@@ -323,6 +387,114 @@ function RoleForm({
             />
           )}
         </Field>
+
+        {/* Drafts the three fields below from the job role above. Placed
+            here, between the input it reads and the fields it writes, so the
+            direction is obvious. */}
+        <AskHelloButton
+          className="mt-1"
+          jobRole={title}
+          // A FUNCTION, read when the draft LANDS, not when it starts. The
+          // confirm at t=0 cannot know what was typed during the eight minutes
+          // that followed, and a draft replacing hand-written questions is
+          // data loss.
+          wouldOverwrite={() =>
+            Boolean(jd.trim() || skillsText.trim() || questions.some((q) => q.question.trim()))
+          }
+          onError={(message) => {
+            setDraftError(message);
+            setDraftNote(null);
+          }}
+          // A reload leaves this field blank while a draft is still running.
+          // Filling it from the adopted job makes the screen true: the button
+          // says "Asking Hello…" and the field says what Hello is drafting.
+          // Information, not an error: nothing the operator did was wrong.
+          onBusy={(message) => {
+            setDraftNote(message);
+            setDraftError(null);
+          }}
+          onResumed={(resumedRole) => {
+            setTitle((current) => (current.trim() ? current : resumedRole));
+            setDraftNote(`Picked up the draft already running for "${resumedRole}".`);
+          }}
+          onDrafted={(draft, repaired, draftedFor) => {
+            // The job's OWN job role, not the field's current value: the field
+            // stays editable while a draft runs, so a draft written for
+            // "Sales Advisr" can land under a heading that now reads something
+            // else. Say which one it was rather than pretending.
+            const staleTitle = draftedFor.trim() !== title.trim();
+            const hasWork = Boolean(
+              jd.trim() || skillsText.trim() || questions.some((q) => q.question.trim()),
+            );
+            // ASK ON A MISMATCH TOO, not only when there is work to lose. A
+            // fresh form has nothing to overwrite, so `hasWork` is false —
+            // and that is exactly the case where a draft for another role
+            // used to fill the form silently, with only an info notice after
+            // the fact.
+            if (
+              (hasWork || staleTitle) &&
+              typeof window !== "undefined" &&
+              !window.confirm(
+                `Hello finished drafting "${draftedFor}". Replace the job description, skills and questions now in this form?`,
+              )
+            ) {
+              setDraftNote(null);
+              return;
+            }
+
+            setDraftError(null);
+            setJd(draft.jd);
+            setSkillsText(draft.required_skills.join(", "));
+            setQuestions(
+              draft.screening_template.map((q, i) => ({
+                id: q.id || `q${i + 1}`,
+                question: q.question,
+                weight: q.weight ?? 1,
+              })),
+            );
+            const rephrased =
+              repaired.length > 0
+                ? ` Hello rephrased ${repaired.length} question${
+                    repaired.length === 1 ? "" : "s"
+                  } the screener would not read aloud.`
+                : "";
+            setDraftNote(
+              staleTitle
+                ? `Drafted for "${draftedFor}", which is not what the job role says now — check it before saving.${rephrased}`
+                : `Hello drafted this role. Review it before saving.${rephrased}`,
+            );
+          }}
+        />
+
+        {/* Both notices sit HERE, beside the button that produced them. */}
+        {draftError && (
+          <InlineNotice tone="danger" role="alert" className="mt-1">
+            {draftError}
+          </InlineNotice>
+        )}
+        {/* Said plainly, because a drafted role is NOT a saved role and the
+            form gives no other signal that a model wrote what is on screen.
+
+            A PERMANENT region, not one mounted with its content: a live region
+            created at the same moment it gains text is not reliably announced,
+            and this is the sentence the operator waited ten minutes for. The
+            button's own status region is built the same way for the same
+            reason. */}
+        <div role="status" aria-live="polite" data-role-draft-note="">
+          {draftNote && (
+            // A <div>, not a <p>: InlineNotice renders a div, React refuses
+            // div-inside-p with a console.error, and this project's test
+            // harness FAILS the suite on an unexpected console.error. It
+            // stayed green only because no test exercised the draft-note path.
+            //
+            // `role="none"` because the wrapper above is the live region.
+            // InlineNotice defaults to `status`, and nesting one region inside
+            // another invites the same sentence being announced twice.
+            <InlineNotice tone="info" role="none" className="mt-1">
+              {draftNote}
+            </InlineNotice>
+          )}
+        </div>
 
         <Field label="Job description" id="role-jd">
           {({ id }) => (

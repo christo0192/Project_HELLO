@@ -1104,7 +1104,22 @@ describe('OpenAPI document integrity', () => {
     // same implementation at a lower privilege with the per-day latency
     // percentiles stripped. Its response body is INLINE (opaque object), like
     // its admin twin, so the schema count below is unchanged. 131 + 1 = 132.
-    expect(Object.keys(paths).length).toBe(132);
+    // "Ask Hello" adds THREE paths: POST /api/roles/draft starts a job that
+    // drafts a role's JD, skills and questions from its job title, GET
+    // /api/roles/draft/{id} polls it, POST /api/roles/draft/{id}/cancel stops
+    // it. THREE rather than one because the model takes 133-206s a call and
+    // retries up to three times: tying that to a single response meant nothing
+    // survived a refresh, a proxy idle timeout reaped it mid-draft, and Cancel
+    // stopped the reading while the generation carried on billing. It WRITES
+    // NO ROLE — the draft goes to a human, and the existing save path
+    // re-validates it. 132 + 3 = 135.
+    // The resume fix adds a FOURTH OPERATION but no fourth path: GET
+    // /api/roles/draft returns the caller's live job and shares the URL the
+    // POST already occupies. Paths are counted by URL, not by verb, so this
+    // number is deliberately unchanged at 135. (Writing it as a separate key
+    // is how the first attempt broke — two `/api/roles/draft:` blocks in the
+    // YAML, and the duplicate silently ate the POST.)
+    expect(Object.keys(paths).length).toBe(135);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1196,7 +1211,13 @@ describe('OpenAPI document integrity', () => {
     //   the four stated facts the dashboard renders INSTEAD of inferring. An
     //   undocumented contract that both sides must agree on exactly is the one
     //   most worth writing down. 245 + 2 = 247.
-    expect(Object.keys(schemas).length).toBe(247);
+    // + RoleDraftJob, the Ask Hello job as the poll returns it. ONE schema for
+    //   three paths: start and poll both answer with the whole job, and cancel
+    //   answers {cancelled} inline. It is worth naming rather than leaving
+    //   `type: object` because `phase` is the contract that makes a ten-minute
+    //   wait legible — a client that guessed at it would report a spinner.
+    //   247 + 1 = 248.
+    expect(Object.keys(schemas).length).toBe(248);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.

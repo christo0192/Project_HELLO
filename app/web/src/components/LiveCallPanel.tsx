@@ -279,10 +279,10 @@ export function LiveCallPanel({
         <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-4">
           <div>
             <p className="text-sm font-medium text-gray-700">Call ended</p>
+            {/* The call length moved to the page header, under the candidate name, beside
+                the role, where a manager scanning the page actually looks.
+                Repeating it here would be two places to keep in step. */}
             <p className="text-xs text-gray-500">
-              {session?.duration_sec != null
-                ? `${Math.floor(session.duration_sec / 60)}m ${session.duration_sec % 60}s · `
-                : ""}
               Transcript, recording and scorecard are in the Review tab.
             </p>
           </div>

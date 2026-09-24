@@ -10,6 +10,14 @@ export interface ScreeningQuestion {
 export interface Role {
   id: string;
   title: string;
+  /**
+   * Operator-facing internal label for the screening agent (0100).
+   *
+   * NEVER spoken and never used for routing — `title` is the job the candidate
+   * applied for and remains the only name the phone worker reads aloud.
+   * Absent on payloads that predate the column.
+   */
+  agent_name?: string | null;
   jd: string;
   required_skills: string[];
   screening_template: ScreeningQuestion[];
@@ -18,8 +26,58 @@ export interface Role {
   created_at: string;
 }
 
+/** Where an Ask Hello job currently is. */
+export type RoleDraftProgress =
+  | { phase: 'drafting'; attempt: number; maxAttempts: number }
+  | { phase: 'checking'; attempt: number; maxAttempts: number }
+  | { phase: 'repairing'; attempt: number; maxAttempts: number; rejected: number }
+  | { phase: 'rereading'; attempt: number; maxAttempts: number };
+
+/**
+ * An Ask Hello job.
+ *
+ * A JOB, not a request: drafting runs v4-pro up to three times at 133-206s a
+ * call, so the work outlives the HTTP call that starts it and a refresh picks
+ * it back up.
+ */
+export interface RoleDraftJob {
+  id: string;
+  job_role: string;
+  status: 'running' | 'succeeded' | 'failed' | 'cancelled';
+  phase: RoleDraftProgress | null;
+  draft: RoleDraft | null;
+  attempts: number;
+  repaired: string[];
+  error_reason: string | null;
+  error_message: string | null;
+  max_attempts: number;
+  /**
+   * When the job began.
+   *
+   * Read on resume so the elapsed counter reports the wait the operator has
+   * actually had. Without it an adopted five-minute-old draft read "3s
+   * elapsed" — worse than showing nothing, because it says the wait has
+   * barely begun at the moment it is nearly over.
+   */
+  created_at: string | null;
+}
+
+export interface RoleDraft {
+  jd: string;
+  required_skills: string[];
+  screening_template: ScreeningQuestion[];
+}
+
+export interface RoleDraftOutcome {
+  draft: RoleDraft;
+  attempts: number;
+  /** Questions the model had to re-phrase to get past the phone gate. */
+  repaired: string[];
+}
+
 export interface RoleInput {
   title: string;
+  agent_name?: string | null;
   jd: string;
   required_skills: string[];
   screening_template: ScreeningQuestion[];
@@ -137,6 +195,19 @@ export interface Session {
   started_at?: string | null;
   /** Call end instant (ISO), null while in progress. */
   ended_at?: string | null;
+  /**
+   * Words the CANDIDATE said in this session, from the transcript.
+   *
+   * Not talk time — no per-speaker duration is stored anywhere — but a real
+   * engagement signal, and one `duration_sec` cannot give: a call whose bot
+   * turns were all barged-in and truncated has a long wall clock and very few
+   * candidate words. Absent on payloads that predate this field.
+   *
+   * NULL when no transcript was read for the session — which is not the same
+   * claim as 0. Zero says the candidate said nothing; null says we do not
+   * know, and the badge is then absent rather than accusing them of silence.
+   */
+  candidate_words?: number | null;
 }
 
 export type Speaker = "bot" | "candidate";

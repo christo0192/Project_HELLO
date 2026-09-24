@@ -39,6 +39,7 @@ import {
   candidateStatusTone,
   sessionStatusLabel,
 } from "../components/talent";
+import { CandidateHeadlineFacts } from "../components/talent/CandidateHeadlineFacts";
 import { formatDateTime } from "../lib/datetime";
 import { PhoneSlotDialog, engagementStateTerm } from "../components/phone-calendar";
 import { istToday } from "../lib/ist-datetime";
@@ -91,6 +92,52 @@ export function CandidateDetailPage() {
 
   useEffect(load, [load]);
 
+  /**
+   * The role this candidate applied for, resolved to its title.
+   *
+   * The detail payload carries `role_id` but not the title, and the route does
+   * not join roles. `null` until it resolves, and `null` when the id is not in
+   * the list — which is a real case, not only an error: an interviewer sees
+   * only roles they own, so a candidate on a colleague's role resolves to
+   * nothing. The badge is then simply absent, because a WRONG role on a
+   * candidate page is worse than no role at all.
+   */
+  const roleId = detail?.candidate.role_id ?? null;
+  const [roleTitle, setRoleTitle] = useState<string | null>(null);
+  useEffect(() => {
+    let live = true;
+    if (!roleId) {
+      setRoleTitle(null);
+      return;
+    }
+    // GUARDED THE SAME WAY `getMe` is, twenty lines up, and for the same
+    // reason: embedded candidate surfaces supply a host adapter with only the
+    // endpoints they need, and `listRoles` is not one of them.
+    //
+    // WHAT ACTUALLY FIXED THE UNMOUNT WAS THE `Promise.resolve()` WRAPPER, not
+    // this check. Called bare, a missing method threw synchronously in the
+    // effect body, which React escalates into unmounting the whole page —
+    // transcript, scorecard and appeal controls with it. Inside the wrapper
+    // the same TypeError is an ordinary rejection the `.catch` below already
+    // absorbs, so removing this line changes no observable behaviour and no
+    // test pins it. It stays for symmetry with `getMe` and to keep "this
+    // adapter has no roles endpoint" from arriving down the same path as "the
+    // roles request failed" — and is stated as defence in depth rather than
+    // as a protection, because a comment claiming the latter would be false.
+    Promise.resolve()
+      .then(() => (typeof api.listRoles === "function" ? api.listRoles() : []))
+      .then((roles) => {
+        if (!live) return;
+        setRoleTitle(roles.find((r) => r.id === roleId)?.title ?? null);
+      })
+      .catch(() => {
+        if (live) setRoleTitle(null);
+      });
+    return () => {
+      live = false;
+    };
+  }, [roleId]);
+
   // Silent refresh: re-read the candidate (its session list feeds the Review
   // tab) without unmounting the page. Used when a live call completes.
   const refresh = useCallback(() => {
@@ -119,6 +166,27 @@ export function CandidateDetailPage() {
   const { candidate, sessions, assessments } = detail;
   const decisionBlocked = candidate.decision_use_blocked_at != null;
 
+  /**
+   * The LONGEST call that RECORDED A DURATION, not the latest — and not
+   * "completed", which is what this line used to say. The reducer below
+   * filters on `duration_sec > 0` and never reads `status`, so a call that
+   * died at the consent gate (a documented production class) can be the
+   * session both this figure and the word count describe. Saying "completed"
+   * claimed a filter that is not there.
+   *
+   * A candidate can have several sessions — a cycle-2 rescreen, a call that
+   * died at the consent gate after nine seconds. Showing the most recent would
+   * report "0m 9s on the call" for someone who actually completed a seven
+   * minute screen; the longest is the one the scorecard was built from.
+   * `null` (never 0) when nothing completed, so the badge is absent rather
+   * than claiming a zero-length call.
+   */
+  const longestSession = sessions.reduce<(typeof sessions)[number] | null>((best, session) => {
+    const secs = session.duration_sec;
+    if (typeof secs !== "number" || !Number.isFinite(secs) || secs <= 0) return best;
+    return secs > (best?.duration_sec ?? -1) ? session : best;
+  }, null);
+
   return (
     <CandidateShell variant="inset">
       <Link
@@ -132,6 +200,19 @@ export function CandidateDetailPage() {
         eyebrow="Candidate"
         title={candidateDisplayName(candidate.name)}
         description={candidate.email ?? undefined}
+        // Directly under the name, above the tabs: which role, how long the
+        // call ran, how much the candidate said. The call length previously
+        // lived in the Live-call panel on the far right, and the role was not
+        // on this page at all.
+        meta={
+          <CandidateHeadlineFacts
+            roleTitle={roleTitle}
+            callSeconds={longestSession?.duration_sec ?? null}
+            // From THE SAME session as the length, or the two figures describe
+            // different calls while sitting side by side.
+            candidateWords={longestSession?.candidate_words ?? null}
+          />
+        }
         actions={
           <>
             <StatusBadge tone={candidateStatusTone(candidate.status)}>

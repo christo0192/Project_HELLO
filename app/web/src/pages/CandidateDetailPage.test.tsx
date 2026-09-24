@@ -15,6 +15,9 @@ import { mockCandidateDetail, mockSessionDetail } from '../test/helpers';
 
 const mockApi = {
   getCandidate: vi.fn(),
+  // The Profile card shows the role a candidate applied for, which the detail
+  // payload does not carry — the page resolves it from the roles list.
+  listRoles: vi.fn(),
   getMe: vi.fn(),
   getCandidatePhoneScreenings: vi.fn(),
   getPhoneSlots: vi.fn(),
@@ -50,6 +53,7 @@ const mockApi = {
 vi.mock('../api', () => ({
   api: {
     getCandidate: (...args: any[]) => mockApi.getCandidate(...args),
+    listRoles: (...args: any[]) => mockApi.listRoles(...args),
     getMe: (...args: any[]) => mockApi.getMe(...args),
     getCandidatePhoneScreenings: (...args: any[]) => mockApi.getCandidatePhoneScreenings(...args),
     getPhoneSlots: (...args: any[]) => mockApi.getPhoneSlots(...args),
@@ -119,6 +123,9 @@ function reviewTab() {
 
 describe('CandidateDetailPage', () => {
   beforeEach(() => {
+    // The Profile card resolves the role title from this; an empty list
+    // means the badge is simply absent, which no existing assertion reads.
+    mockApi.listRoles.mockResolvedValue([]);
     vi.clearAllMocks();
     mockApi.getCandidate.mockResolvedValue(mockCandidateDetail);
     mockApi.getMe.mockResolvedValue({ userId: 'u-admin', email: null, role: 'admin', active: true });
@@ -152,6 +159,210 @@ describe('CandidateDetailPage', () => {
     mockApi.getCandidate.mockRejectedValue({ message: 'Candidate not found' });
     renderDetailPage();
     expect(await screen.findByText('Candidate not found')).toBeInTheDocument();
+  });
+
+  it('shows the ROLE and the CALL LENGTH on the left, not in the Live-call card', async () => {
+    // These two answer "who is this and did we actually talk to them". The
+    // length used to sit in the Live-call card on the far right, which is the
+    // last place a manager scanning the left column looks.
+    mockApi.listRoles.mockResolvedValue([{ id: 'role-1', title: 'Sales Advisor' }]);
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: { ...mockCandidateDetail.candidate, role_id: 'role-1' },
+      sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 434, candidate_words: 450 }],
+    });
+    renderDetailPage();
+
+    expect(await screen.findByText('Sales Advisor')).toBeInTheDocument();
+    expect(document.querySelector('[data-candidate-call-length]')?.textContent).toContain('7m 14s');
+    // Labelled for WHAT IT MEASURES. `duration_sec` is wall clock from session
+    // start to finalize — bot speech, candidate speech, ring and silence — so
+    // "candidate spoke for 7m 14s" would be a false claim about engagement.
+    expect(document.querySelector('[data-candidate-call-length]')?.textContent).toContain(
+      'on the call',
+    );
+    expect(document.querySelector('[data-candidate-call-length]')?.textContent).not.toMatch(
+      /spoke|talk/i,
+    );
+  });
+
+  it('shows the words the CANDIDATE said, which wall clock cannot give', async () => {
+    // The pair is the point: a long call with very few candidate words is a
+    // call where they could not get a word in. Praveetha's 2026-09-10 screen
+    // had 8 of 8 bot turns barged-in and truncated and a healthy-looking
+    // wall clock.
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 480, candidate_words: 12 }],
+    });
+    renderDetailPage();
+    await screen.findByText(/Profile/);
+    const words = document.querySelector('[data-candidate-words]');
+    expect(words?.textContent).toContain('12');
+    expect(words?.textContent).toContain('words spoken');
+  });
+
+  it('reports the LONGEST session, not the latest', async () => {
+    // A candidate can carry a cycle-2 rescreen plus a call that died at the
+    // consent gate after nine seconds. The most recent would report "0m 9s"
+    // for someone who completed a seven-minute screen.
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      sessions: [
+        { ...mockCandidateDetail.sessions[0], id: 's-new', duration_sec: 9, candidate_words: 3 },
+        { ...mockCandidateDetail.sessions[0], id: 's-old', duration_sec: 434, candidate_words: 450 },
+      ],
+    });
+    renderDetailPage();
+    await screen.findByText(/Profile/);
+    expect(document.querySelector('[data-candidate-call-length]')?.textContent).toContain('7m 14s');
+    // ...and the words come from THE SAME session, or the two figures
+    // describe different calls while sitting side by side.
+    expect(document.querySelector('[data-candidate-words]')?.textContent).toContain('450');
+  });
+
+  it('shows no call badge at all when nothing completed', async () => {
+    // Absent, not "0m 0s" — a zero-length call is a claim, and the wrong one.
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: null, candidate_words: 0 }],
+    });
+    renderDetailPage();
+    await screen.findByText(/Profile/);
+    expect(document.querySelector('[data-candidate-call-length]')).toBeNull();
+  });
+
+  it('puts those badges UNDER THE CANDIDATE NAME, not in a card further down', async () => {
+    // The literal ask, and the reason the ask was made: the manager reads the
+    // name, then wants the role and whether a call happened. A badge that is
+    // correct but sits below the fold in the third card answers the question
+    // after it has stopped being asked. Asserting the DOM relationship,
+    // because "it renders somewhere" is what the previous placement satisfied.
+    mockApi.listRoles.mockResolvedValue([{ id: 'role-1', title: 'Sales Advisor' }]);
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: { ...mockCandidateDetail.candidate, role_id: 'role-1' },
+      sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 434, candidate_words: 450 }],
+    });
+    renderDetailPage();
+
+    // The role arrives on its own request, AFTER the name renders — waiting on
+    // the heading alone would assert against a half-filled header.
+    await screen.findByText('Sales Advisor');
+    const heading = screen.getByRole('heading', { level: 1, name: 'Jane Doe' });
+    const role = document.querySelector('[data-candidate-role-title]');
+    const length = document.querySelector('[data-candidate-call-length]');
+    expect(role).not.toBeNull();
+    expect(length).not.toBeNull();
+    // Same header block as the name...
+    expect(heading.parentElement?.contains(role!)).toBe(true);
+    // ...and AFTER it, not above.
+    expect(
+      heading.compareDocumentPosition(role!) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // ...and before the tab strip, so it is read without opening anything.
+    const tabs = screen.getByRole('tablist');
+    expect(
+      role!.compareDocumentPosition(tabs) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it('says NOTHING about words when the transcript was never read', async () => {
+    // null is not 0. "0 words spoken" is an accusation about the candidate;
+    // a missing transcript is a fact about us. The route returns null for the
+    // second case precisely so this badge can stay away.
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 434, candidate_words: null }],
+    });
+    renderDetailPage();
+    await screen.findByText(/Profile/);
+    // The call still happened, so its length is still shown...
+    expect(document.querySelector('[data-candidate-call-length]')).not.toBeNull();
+    // ...but nothing is claimed about what they said.
+    expect(document.querySelector('[data-candidate-words]')).toBeNull();
+  });
+
+  it('shows a REAL zero — a candidate who said nothing on a real call', async () => {
+    // The counterpart of the test above, and the reason null had to exist:
+    // without the distinction this case would be unreportable.
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 434, candidate_words: 0 }],
+    });
+    renderDetailPage();
+    await screen.findByText(/Profile/);
+    const words = document.querySelector('[data-candidate-words]');
+    expect(words?.textContent).toContain('0');
+    expect(words?.textContent).toContain('words spoken');
+  });
+
+  it('shows no call badge for a ZERO-length call either', async () => {
+    // `duration_sec: null` was the only case covered, and the `typeof ===
+    // "number"` half of the guard already rejects that — so `callSeconds > 0`
+    // was free. Zero is REACHABLE: `0024_recovery_audit_system_actor.sql`
+    // writes `greatest(0, floor(extract(epoch from (ended_at - started_at))))`.
+    // The badge would read "0m 0s on the call", which the component header
+    // explicitly forbids as a claim that is both precise and wrong.
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      sessions: [{ ...mockCandidateDetail.sessions[0], duration_sec: 0, candidate_words: 0 }],
+    });
+    renderDetailPage();
+    await screen.findByText(/Profile/);
+    expect(document.querySelector('[data-candidate-call-length]')).toBeNull();
+  });
+
+  it('SHOWS THE RESUME SUMMARY above the numbers, which is where it was asked for', async () => {
+    // The relocated summary had NO test anywhere: deleting the block left 303
+    // tests green, and since the same change removed it from Resume evidence,
+    // deleting it would make the summary vanish from the page entirely — the
+    // one field the owner asked to be promoted.
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: {
+        ...mockCandidateDetail.candidate,
+        parsed: { summary: 'Ten years selling enterprise software in India.' },
+      },
+    });
+    renderDetailPage();
+
+    const summary = await screen.findByText(/Ten years selling enterprise software/);
+    expect(summary).toBeInTheDocument();
+    // ...ABOVE the numbers. "Experience" is the figure it was asked to clear.
+    const experience = screen.getByText('Experience');
+    expect(
+      summary.compareDocumentPosition(experience) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    // ...and NOT duplicated further down in Resume evidence.
+    expect(screen.getAllByText(/Ten years selling enterprise software/)).toHaveLength(1);
+  });
+
+  it('LABELS the role pill for a screen reader', async () => {
+    // The other two pills caption themselves ("on the call", "words spoken").
+    // This one is bare text in a coloured capsule, so without the prefix a
+    // screen reader hears "Sales Advisor" with nothing saying what it is.
+    mockApi.listRoles.mockResolvedValue([{ id: 'role-1', title: 'Sales Advisor' }]);
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: { ...mockCandidateDetail.candidate, role_id: 'role-1' },
+    });
+    renderDetailPage();
+    await screen.findByText('Sales Advisor');
+    expect(document.querySelector('[data-candidate-role-title]')?.textContent).toContain('Role:');
+  });
+
+  it('does NOT claim a role it could not resolve', async () => {
+    // A wrong role on a candidate page is worse than no role.
+    mockApi.listRoles.mockResolvedValue([]);
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: { ...mockCandidateDetail.candidate, role_id: 'role-gone' },
+    });
+    renderDetailPage();
+    await screen.findByText(/Profile/);
+    expect(document.querySelector('[data-candidate-role-title]')).toBeNull();
+    expect(screen.queryByText('role-gone')).not.toBeInTheDocument();
   });
 
   it('renders candidate profile', async () => {

@@ -1,9 +1,21 @@
 import { Router } from 'express';
 import { supabase } from '../lib/supabase.js';
 import { validateBody, validateParams } from '../lib/validation.js';
-import { createRoleSchema, updateRoleSchema, roleIdParamSchema } from '../schemas/roles.js';
+import {
+  createRoleSchema,
+  roleDraftSchema,
+  roleIdParamSchema,
+  updateRoleSchema,
+} from '../schemas/roles.js';
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
+import {
+  cancelRoleDraft,
+  readActiveRoleDraft,
+  readRoleDraft,
+  RoleDraftBusyError,
+  startRoleDraft,
+} from '../lib/role-draft-jobs.js';
 
 export const rolesRouter = Router();
 
@@ -24,6 +36,132 @@ rolesRouter.get('/', requireRole('viewer'), async (req, res, next) => {
   if (error) return next(error);
   res.json(data);
 });
+
+// ── Ask Hello ────────────────────────────────────────────────────────────
+//
+// DECLARED BEFORE `GET '/:id'`, AND THAT IS LOAD-BEARING.
+//
+// Express matches in declaration order, and `/:id` matches ANY single
+// segment — including the literal `draft`. With the id route first,
+// `GET /api/roles/draft` never reached this handler at all: it landed in
+// `/:id`, `roleIdParamSchema` rejected `"draft"` as a non-uuid, and the
+// caller got a 400. The client swallows that (a failed resume is not worth
+// an error banner), so the symptom was a refresh that silently did not
+// resume, and a job that kept billing with nobody watching.
+//
+// An earlier comment here claimed the two could not collide because "Express
+// does not match a `:param` across a `/`". That is true of `/draft/:id`,
+// which is two segments — and irrelevant to `/draft`, which is one.
+
+/**
+ * Ask Hello — START a drafting job. Answers immediately with its id.
+ *
+ * NOT a streamed ten-minute response. Drafting runs v4-pro up to three times
+ * at 133-206s a call, and tying that to one socket meant nothing survived a
+ * refresh, the stream sat silent for a whole model call between phases (so any
+ * proxy idle timeout reaped it mid-draft), and Cancel stopped the writes while
+ * the generation carried on billing. The work now outlives the request.
+ *
+ * WRITES NO ROLE. The draft goes to the operator, who reviews it and presses
+ * Save — which re-validates everything through the same schema. A generator
+ * that wrote directly would be a model authoring a live screening script with
+ * no human in between.
+ */
+rolesRouter.post(
+  '/draft',
+  requireRole('interviewer'),
+  validateBody(roleDraftSchema),
+  async (req, res, next) => {
+    const { job_role: jobRole } = req.body as { job_role: string };
+    try {
+      const job = await startRoleDraft(req.authUser!.id, jobRole);
+      // AUDITED, but not fail-closed. This writes no role, so a dead audit
+      // sink must not block it the way it blocks a mutation — but a
+      // privileged, model-invoking action whose output is one Save away from
+      // being spoken to a candidate needs a record of who asked for what.
+      try {
+        await recordAudit(req, 'resource.generate', 202, {
+          metadata: { draft_id: job.id, job_role: jobRole },
+        });
+      } catch {
+        /* the draft is not a mutation; an audit sink failure must not lose it */
+      }
+      res.status(202).json(job);
+    } catch (err) {
+      // A LIVE DRAFT FOR ANOTHER ROLE IS A CONFLICT, NOT A CRASH. One draft
+      // per owner is a real constraint, and the honest answer names the role
+      // that is holding it — handing back the other job instead is how a
+      // Sales Advisor script ended up in a form headed "Data Engineer".
+      if (err instanceof RoleDraftBusyError) {
+        return res.status(409).json({
+          error: {
+            type: 'conflict',
+            message: err.message,
+            details: { job_role: err.liveJobRole },
+          },
+        });
+      }
+      next(err);
+    }
+  },
+);
+
+/**
+ * The caller's LIVE drafting job, if they have one.
+ *
+ * This is what a reload asks. The browser keeps the job id in component state
+ * and nowhere else, so a refresh, a navigation, or switching to another role
+ * in the list loses the only handle to a job that keeps running and keeps
+ * billing — and the finished draft would land in a row nobody could name.
+ * The row is the durable copy, which is the whole reason this stopped being a
+ * streamed response; this endpoint is how the client gets back to it.
+ *
+ * Declared BEFORE `/draft/:id` for readability only — Express does not match
+ * a `:param` across a `/`, so the two cannot shadow each other.
+ */
+rolesRouter.get('/draft', requireRole('interviewer'), async (req, res, next) => {
+  try {
+    const job = await readActiveRoleDraft(req.authUser!.id);
+    // 200 with an explicit null rather than 404: "you have no draft running"
+    // is a normal answer to this question, not a missing resource.
+    res.json({ active: job });
+  } catch (err) {
+    next(err);
+  }
+});
+
+/** Poll a drafting job. A dead one reads as failed, never as still running. */
+rolesRouter.get(
+  '/draft/:id',
+  requireRole('interviewer'),
+  validateParams(roleIdParamSchema),
+  async (req, res, next) => {
+    try {
+      const job = await readRoleDraft(req.authUser!.id, req.params.id);
+      if (!job) return res.status(404).json({ error: 'Draft not found' });
+      res.json(job);
+    } catch (err) {
+      next(err);
+    }
+  },
+);
+
+/** Stop a running job. The generator reads this between attempts. */
+rolesRouter.post(
+  '/draft/:id/cancel',
+  requireRole('interviewer'),
+  validateParams(roleIdParamSchema),
+  async (req, res, next) => {
+    try {
+      const cancelled = await cancelRoleDraft(req.authUser!.id, req.params.id);
+      // Idempotent: cancelling a job that already finished is not an error,
+      // it is a race the operator cannot be blamed for.
+      res.json({ cancelled });
+    } catch (err) {
+      next(err);
+    }
+  },
+);
 
 // Get one role — viewer and above
 // Interviewer sees only own records; admin sees all
@@ -46,13 +184,27 @@ rolesRouter.get('/:id', requireRole('viewer'), validateParams(roleIdParamSchema)
 // Create role (with screening template) — interviewer and above
 // Stamps owner_id from the authenticated user
 rolesRouter.post('/', requireRole('interviewer'), validateBody(createRoleSchema), async (req, res, next) => {
-  const { title, jd, required_skills, screening_template, interviewer_instructions } = req.body;
+  const { title, agent_name, jd, required_skills, screening_template, interviewer_instructions } =
+    req.body;
   const ownerId = req.authUser!.id;
 
   const { data, error } = await supabase
     .from('roles')
     .insert({
       title,
+      // Blank stores as NULL so "unset" has one representation, matching `jd`
+      // and the column's own check constraint — but the KEY IS OMITTED
+      // ENTIRELY when the client did not send the field.
+      //
+      // `agent_name?.trim() ? … : null` put the key in the payload on EVERY
+      // create, which defeated the client-side guard completely: if the API
+      // ships before `supabase db push` of 0100, PostgREST rejects the unknown
+      // column (PGRST204) and every role creation 500s — including for the
+      // roles that never wanted an agent name, which is all of them. The PATCH
+      // below was already conditional; this was not.
+      ...(agent_name === undefined
+        ? {}
+        : { agent_name: agent_name?.trim() ? agent_name.trim() : null }),
       jd: jd ?? null,
       required_skills: required_skills ?? [],
       screening_template: screening_template ?? [],
@@ -86,9 +238,11 @@ rolesRouter.put(
   validateParams(roleIdParamSchema),
   validateBody(updateRoleSchema),
   async (req, res, next) => {
-    const { title, jd, required_skills, screening_template, interviewer_instructions, is_active } = req.body;
+    const { title, agent_name, jd, required_skills, screening_template, interviewer_instructions, is_active } =
+      req.body;
     const patch: Record<string, unknown> = {};
     if (title !== undefined) patch.title = title;
+    if (agent_name !== undefined) patch.agent_name = agent_name?.trim() ? agent_name.trim() : null;
     if (jd !== undefined) patch.jd = jd;
     if (required_skills !== undefined) patch.required_skills = required_skills;
     if (screening_template !== undefined) patch.screening_template = screening_template;

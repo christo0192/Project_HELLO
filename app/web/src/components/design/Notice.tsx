@@ -33,8 +33,15 @@ const toneDot: Record<NoticeTone, string> = {
 export interface InlineNoticeProps {
   tone?: NoticeTone;
   children: ReactNode;
-  /** `alert` for errors, `status` (default) for confirmations. */
-  role?: 'status' | 'alert';
+  /**
+   * `alert` for errors, `status` (default) for confirmations.
+   *
+   * `'none'` when the notice sits INSIDE a live region that is already
+   * mounted — a region announces reliably only if it exists before it gains
+   * content, so a caller that needs that guarantee owns the region itself and
+   * this notice must not nest a second one inside it.
+   */
+  role?: 'status' | 'alert' | 'none';
   action?: ReactNode;
   className?: string;
 }
@@ -46,7 +53,7 @@ export function InlineNotice({ tone = 'info', children, role = 'status', action,
       variants={variants}
       initial="initial"
       animate="enter"
-      role={role}
+      role={role === 'none' ? undefined : role}
       className={cx(
         'flex flex-wrap items-center gap-3 rounded-[14px] px-3.5 py-2.5 text-sm text-ink',
         toneTint[tone],

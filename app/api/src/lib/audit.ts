@@ -38,6 +38,13 @@ export type AuditEvent =
   | 'rate_limit.exceeded'
   | 'audit.sink_failure'
   | 'audit.configuration_error'
+  /**
+   * A model was asked to author content a human may then publish — today,
+   * Ask Hello drafting a role's questions. Recorded because the output is one
+   * Save away from being spoken to a real candidate, so "who asked for what"
+   * has to be answerable afterwards. NOT fail-closed: it writes nothing.
+   */
+  | 'resource.generate'
   | 'recording.download'
   // REC-03/04/05 (L5, additive): browser upload + integrity lifecycle.
   // 'recording.deleted' lands now so the union is stable; L6 uses it.

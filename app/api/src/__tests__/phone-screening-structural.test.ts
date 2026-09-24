@@ -397,6 +397,17 @@ describe('2. no provider, no dialing, no network, no Ashby mutation', () => {
       // P-1 role admission uses the same pure question contract so malformed
       // candidate-facing templates cannot be written.
       'schemas/roles.ts',
+      // "Ask Hello" — the GENERATOR side of that same gate. A model now writes
+      // screening questions, and it reaches the domain core for the one reason
+      // `schemas/roles.ts` does: `validatePhoneQuestion` is the pure contract
+      // that decides whether a question can be read aloud to a candidate.
+      //
+      // Re-implementing it here is the failure this allowlist exists to catch.
+      // A second, looser copy of the speakability rules on the path a MODEL
+      // writes through is strictly worse than none: it would pass questions the
+      // save path then rejects, or worse, questions the worker refuses to read
+      // mid-call. It dials nothing and loops nowhere.
+      'lib/role-authoring.ts',
       // Post-call callback backstop. The assessment scorer, when the candidate
       // asked to be called back, books a `system_deferral` appointment through
       // the PURE `scheduleAppointment` write (and reads a live appointment to
