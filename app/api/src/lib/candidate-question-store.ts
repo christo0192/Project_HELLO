@@ -19,7 +19,7 @@ import type {
   CandidateQuestionsContext,
   CandidateQuestionsStore,
 } from './candidate-question-jobs.js';
-import type { CandidateTemplateQuestion } from './candidate-questions.js';
+import { templateFingerprint, type CandidateTemplateQuestion } from './candidate-questions.js';
 
 /** The engagement states after which no call will ever happen. */
 const TERMINAL_STATES = new Set([
@@ -74,10 +74,29 @@ export function createCandidateQuestionStore(
 ): CandidateQuestionsStore {
   return {
     async loadContext(applicationLinkId): Promise<CandidateQuestionsContext | null> {
+      // ── ONE APPLICATION CAN HOLD THREE ENGAGEMENTS ──────────────────
+      // `uq_phone_engagements_application` was DROPPED in `0057`, which
+      // replaced it with `unique (application_link_id, cycle_number)` for up
+      // to three rescreen cycles. A `maybeSingle()` over the link alone
+      // therefore returns PGRST116 — not the first row — the moment a
+      // candidate is rescreened, and the job would fail, retry, fail and
+      // dead-letter for exactly the population a fresh question set helps
+      // most. Found by review; the rest of this package already knew, which
+      // is why `ensure_ashby_phone_engagement` and `routes/candidates.ts`
+      // both order by cycle or filter on `terminal_at`.
+      //
+      // THE ACTIVE CYCLE, not the latest: `uq_phone_engagements_one_active_
+      // cycle` guarantees at most one non-terminal row per application, and
+      // that is the only one a call will ever read. Taking the newest row
+      // regardless could key the questions to a finished cycle-1 engagement
+      // that nothing will look at again.
       const { data: engagement, error: engagementError } = await client
         .from('phone_engagements')
         .select('id,role_id,candidate_id,state')
         .eq('application_link_id', applicationLinkId)
+        .is('terminal_at', null)
+        .order('cycle_number', { ascending: false })
+        .limit(1)
         .maybeSingle();
       if (engagementError) throw new Error('candidate_questions_engagement_read_error');
       if (!engagement) return null;
@@ -144,6 +163,23 @@ export function createCandidateQuestionStore(
             }
           : null,
       };
+    },
+
+    async currentTemplateFingerprint(roleId): Promise<string | null> {
+      // Re-read at write time, over the same projection `loadContext` used, so
+      // the two fingerprints are comparable by construction. NULL means the
+      // role is gone or unreadable — the caller treats that as "do not know"
+      // and writes anyway, because refusing on a transient read error would
+      // throw away a generation that is probably still correct.
+      const { data, error } = await client
+        .from('roles')
+        .select('screening_template')
+        .eq('id', roleId)
+        .maybeSingle();
+      if (error || !data) return null;
+      return templateFingerprint(
+        asTemplate((data as Record<string, unknown>).screening_template),
+      );
     },
 
     async writeReady(input): Promise<void> {

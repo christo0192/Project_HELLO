@@ -42,6 +42,7 @@ declare
   v_eng      uuid;
   v_sess     uuid;
   v_att      uuid;
+  v_prior    uuid;
   v_s        text;
   v_owner    constant uuid := '00000000-0000-4000-8000-0000000000ad';
   v_states   constant text[] := array['queued','fetching','scanning','extracting','structuring','ready'];
@@ -115,7 +116,7 @@ begin
   returning id into v_badrole;
 
   -- ── One call per scenario, each genuinely ready to be screened ──────
-  for v_s in select unnest(array['ready','absent','pending','failed','malformed','badrole']) loop
+  for v_s in select unnest(array['ready','absent','pending','failed','malformed','badrole','rescreen']) loop
     insert into screening_v2.candidates (role_id, name, email, phone_e164, phone_valid)
     values (case when v_s = 'badrole' then v_badrole else v_role end,
             'cqs103 ' || v_s, 'cqs103-' || v_s || '@example.test',
@@ -146,10 +147,31 @@ begin
     perform screening_v2.advance_ashby_ingestion(v_link, unnest, null, null, null, null)
       from unnest(v_states);
 
+    -- ── A PRIOR, TERMINAL CYCLE FOR THE RESCREEN FAMILY ───────────────
+    -- `0057` allows three cycles per application, and only one may be
+    -- non-terminal. Cycle 1 here is `cancelled` and carries a READY set whose
+    -- questions are unmistakable, so an implementation that reads the
+    -- candidate's set by anything other than THIS engagement is visible.
+    if v_s = 'rescreen' then
+      insert into screening_v2.phone_engagements
+        (application_link_id, candidate_id, role_id, cycle_number, state)
+      values (v_link, v_cand, v_role, 1, 'pending_prereqs')
+      returning id into v_prior;
+      update screening_v2.phone_engagements
+         set state = 'cancelled', terminal_at = now() where id = v_prior;
+      insert into screening_v2.candidate_screening_questions
+        (engagement_id, role_id, status, questions, template_hash, model, generated_at)
+      values (v_prior, v_role, 'ready',
+              jsonb_build_array(
+                jsonb_build_object('id','q1','question','STALE CYCLE ONE QUESTION, never ask this?','weight',1)),
+              'fnv1a32:00000003:1', 'deepseek', now());
+    end if;
+
     insert into screening_v2.phone_engagements
-      (application_link_id, candidate_id, role_id, state)
+      (application_link_id, candidate_id, role_id, cycle_number, state)
     values (v_link, v_cand,
             case when v_s = 'badrole' then v_badrole else v_role end,
+            case when v_s = 'rescreen' then 2 else 1 end,
             'pending_prereqs')
     returning id into v_eng;
 
@@ -189,8 +211,16 @@ begin
         (engagement_id, role_id, status, questions, template_hash, model, generated_at)
       values (v_eng, v_role, 'ready', v_candidate, 'fnv1a32:00000001:6', 'deepseek', now());
     elsif v_s = 'pending' then
-      insert into screening_v2.candidate_screening_questions (engagement_id, role_id, status)
-      values (v_eng, v_role, 'pending');
+      -- CARRYING QUESTIONS, deliberately. `chk_candidate_questions_ready`
+      -- constrains only `ready` rows, so a half-written `pending` row can hold
+      -- an array — and with every fixture's non-ready row left empty, dropping
+      -- the `status = 'ready'` filter from the plan builder changed nothing
+      -- and the harness stayed green. Now it does not.
+      insert into screening_v2.candidate_screening_questions
+        (engagement_id, role_id, status, questions)
+      values (v_eng, v_role, 'pending',
+              jsonb_build_array(
+                jsonb_build_object('id','q1','question','HALF-WRITTEN PENDING QUESTION, never ask this?','weight',1)));
     elsif v_s = 'failed' then
       insert into screening_v2.candidate_screening_questions
         (engagement_id, role_id, status, error_reason)

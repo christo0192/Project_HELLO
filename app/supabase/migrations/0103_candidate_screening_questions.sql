@@ -33,11 +33,24 @@
 --      asserting here.
 --
 -- KEYED ON THE ENGAGEMENT, not the candidate. An engagement is one screening
--- cycle. A rescreen (`0057`) opens a new one and therefore asks for a fresh
--- set rather than re-using questions written about a conversation that has
--- already happened, and the `on delete cascade` means a purged engagement
--- takes its generated questions with it — including through DSAR erasure,
--- which is why this table holds no candidate identifiers of its own.
+-- cycle, so a rescreen (`0057`) asks for a fresh set rather than re-using
+-- questions written about a conversation that has already happened.
+--
+-- THE CASCADE DOES NOT COMPLETE A DSAR ERASURE TODAY, and an earlier version
+-- of this comment said it did. A review executed the real path: `deleteDSAR`
+-- (`lib/dsar.ts`) never deletes `phone_engagements`, and
+-- `phone_engagements.candidate_id` is ON DELETE RESTRICT (`0042`), so the
+-- candidate delete fails, the error is swallowed, and the request is marked
+-- fulfilled with the row still present. That is PRE-EXISTING — `0042` documents
+-- the erasure order it needs and says outright that no caller implements it —
+-- and the cascade added here is exactly right FOR that order once it exists.
+-- But this table now holds résumé-derived personal data (employer names,
+-- tenure, achievements, inside `questions`), so the gap is worth more than a
+-- comment that quietly assumes it away. Tracked as owner follow-up, not fixed
+-- here: repairing DSAR is a larger change than this migration.
+--
+-- What IS true, and is asserted by the harness, is that deleting an engagement
+-- takes its generated questions with it.
 --
 -- THE FALLBACK IS ASYMMETRIC, ON PURPOSE. `0044` REFUSES to start a call on a
 -- malformed role template rather than substituting the defaults, because

@@ -21,6 +21,7 @@ vi.mock('../lib/supabase.js', () => ({
 }));
 
 const { createCandidateQuestionStore } = await import('../lib/candidate-question-store.js');
+const { templateFingerprint } = await import('../lib/candidate-questions.js');
 const { supabase } = await import('../lib/supabase.js');
 
 /** Every relation `0103` and its neighbours actually have. */
@@ -36,6 +37,10 @@ interface Call {
   op: 'select' | 'upsert';
   columns?: string;
   filters: Array<[string, unknown]>;
+  /** `.is(col, value)` — how the ACTIVE cycle is selected. */
+  nulls: Array<[string, unknown]>;
+  order?: [string, boolean];
+  limit?: number;
   payload?: Record<string, unknown>;
   options?: Record<string, unknown>;
 }
@@ -52,7 +57,7 @@ function chain(table: string): any {
         'the store asked for a table this schema has never had',
     );
   }
-  const call: Call = { table, op: 'select', filters: [] };
+  const call: Call = { table, op: 'select', filters: [], nulls: [] };
   calls.push(call);
   const result = {
     data: failOn === table ? null : (rows[table] ?? null),
@@ -71,6 +76,18 @@ function chain(table: string): any {
     },
     eq: (column: string, value: unknown) => {
       call.filters.push([column, value]);
+      return api;
+    },
+    is: (column: string, value: unknown) => {
+      call.nulls.push([column, value]);
+      return api;
+    },
+    order: (column: string, opts?: { ascending?: boolean }) => {
+      call.order = [column, opts?.ascending !== false];
+      return api;
+    },
+    limit: (n: number) => {
+      call.limit = n;
       return api;
     },
     maybeSingle: () => Promise.resolve(result),
@@ -114,14 +131,40 @@ describe('loadContext', () => {
     // résumé, which looks identical to an unparsed candidate.
     expect(calls[0].columns).toContain('candidate_id');
     expect(calls[0].columns).toContain('state');
+    expect(calls[0].columns).toContain('role_id');
     expect(calls[0].filters).toEqual([['application_link_id', 'link-1']]);
+    // EVERY read's filter is asserted, not just the first and last: a role read
+    // keyed on the engagement id, or a candidate read keyed on the role, both
+    // return null and look exactly like "this candidate has no résumé".
     expect(calls[1].columns).toContain('screening_template');
+    expect(calls[1].columns).toContain('jd');
+    expect(calls[1].columns).toContain('required_skills');
+    expect(calls[1].columns).toContain('title');
+    expect(calls[1].filters).toEqual([['id', 'role-1']]);
+    expect(calls[2].columns).toContain('parsed');
+    expect(calls[2].filters).toEqual([['id', 'cand-1']]);
     expect(calls[3].filters).toEqual([['engagement_id', 'eng-1']]);
   });
 
   it('reads the engagement ONCE — the candidate comes off the same row', async () => {
     await createCandidateQuestionStore(supabase as never).loadContext('link-1');
     expect(calls.filter((c) => c.table === 'phone_engagements')).toHaveLength(1);
+  });
+
+  it('SELECTS THE ACTIVE CYCLE — an application can hold three engagements', async () => {
+    // `uq_phone_engagements_application` was DROPPED in `0057`; the key is now
+    // `(application_link_id, cycle_number)` for up to three rescreens. Without
+    // the active-cycle filter, `maybeSingle()` over the link alone returns
+    // PGRST116 for every rescreened candidate — the job fails, retries, fails
+    // and dead-letters, and the feature is permanently dead for exactly the
+    // population a fresh set of questions helps most.
+    await createCandidateQuestionStore(supabase as never).loadContext('link-1');
+    const read = calls[0];
+    expect(read.nulls, 'the read must be scoped to the non-terminal cycle')
+      .toContainEqual(['terminal_at', null]);
+    expect(read.limit, 'the read must not assume one row').toBe(1);
+    // Newest cycle first, so the one active row is the one taken.
+    expect(read.order).toEqual(['cycle_number', false]);
   });
 
   it('projects the template, dropping rows that are not questions', async () => {
@@ -185,6 +228,30 @@ describe('loadContext', () => {
     await expect(
       createCandidateQuestionStore(supabase as never).loadContext('link-1'),
     ).rejects.toThrow(/role_read_error/);
+  });
+});
+
+describe('currentTemplateFingerprint', () => {
+  it('fingerprints the role template as it stands RIGHT NOW', async () => {
+    const fp = await createCandidateQuestionStore(supabase as never)
+      .currentTemplateFingerprint('role-1');
+    const read = calls.find((c) => c.table === 'roles');
+    expect(read?.filters).toEqual([['id', 'role-1']]);
+    expect(fp).toMatch(/^fnv1a32:[0-9a-f]{8}:2$/);
+    // Computed over the SAME projection `loadContext` uses, so the two
+    // fingerprints are comparable by construction rather than by coincidence.
+    const context = await createCandidateQuestionStore(supabase as never).loadContext('link-1');
+    expect(fp).toBe(templateFingerprint(context!.template));
+  });
+
+  it('answers NULL rather than a wrong hash when the role cannot be read', async () => {
+    // "Do not know" must not read as "changed": the caller writes anyway,
+    // because refusing on a transient read error throws away a generation that
+    // is almost certainly still correct.
+    failOn = 'roles';
+    expect(
+      await createCandidateQuestionStore(supabase as never).currentTemplateFingerprint('role-1'),
+    ).toBeNull();
   });
 });
 

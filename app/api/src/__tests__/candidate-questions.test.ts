@@ -10,18 +10,20 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   CandidateQuestionsError,
-  RESUME_UNKNOWN_FIELD_LIMIT,
+  RESUME_MIN_FIELDS,
   VARIABLE_CATEGORIES,
   buildCandidateQuestionsPrompt,
+  buildJudgePrompt,
   candidateQuestionIssue,
   generateCandidateQuestions,
+  judgeCandidateQuestions,
+  looksLikeCredentialRequest,
+  resumeSubstanceCount,
   spliceCandidateQuestions,
   templateFingerprint,
-  unknownResumeFieldCount,
   variableSlots,
   type CandidateTemplateQuestion,
 } from '../lib/candidate-questions.js';
-import { formatResumeFacts } from '../lib/prompts.js';
 
 /** A compartmented role template, exactly as `withArc` emits one. */
 function template(): CandidateTemplateQuestion[] {
@@ -106,29 +108,24 @@ describe('what the generator is allowed to touch', () => {
     expect(infer).not.toHaveBeenCalled();
   });
 
-  it('counts unknown fields on the RENDERED facts, and the limit leaves room for a real résumé', () => {
-    // A real résumé with no certifications, no education and no stated total
-    // still has to get through.
-    expect(unknownResumeFieldCount('- Name: unknown\n- Skills: unknown')).toBe(2);
-    // A real résumé listing no certifications, no education and no total-years
-    // figure still has to get through — measured against the REAL renderer,
-    // because the limit is a claim about what that renderer produces.
-    const sparse = {
-      name: 'Asha Menon',
-      current_role: 'Inside Sales Lead',
-      recent_role: { title: 'Inside Sales Lead', employer: 'Lumen Retail', period: '2023-2026', highlights: ['Grew pipeline'] },
-      prior_roles: [{ title: 'Account Executive', employer: 'Brightpath', period: '2021-2023', highlights: [] }],
-      skills: ['Outbound calling'],
-      career_highlights: ['President club 2025'],
-      summary: 'Five years in B2B inside sales.',
-    };
-    expect(unknownResumeFieldCount(formatResumeFacts(sparse))).toBeLessThan(
-      RESUME_UNKNOWN_FIELD_LIMIT,
-    );
-    // And a null parse is over it, which is the case the limit exists for.
-    expect(unknownResumeFieldCount(formatResumeFacts(null))).toBeGreaterThanOrEqual(
-      RESUME_UNKNOWN_FIELD_LIMIT,
-    );
+  it('REFUSES A RESUME WITH TOO LITTLE IN IT, counted on the PARSE', () => {
+    // Counted on the object, never on the rendered string: the first version
+    // counted the literal word "unknown" in the facts, so a résumé whose own
+    // bullets said "unknown-vendor spend" was refused as unparsed, and a
+    // résumé holding only a name and one skill was accepted.
+    expect(resumeSubstanceCount(null)).toBe(0);
+    expect(resumeSubstanceCount({})).toBe(0);
+    expect(resumeSubstanceCount({ name: 'Asha', skills: ['Outbound calling'] })).toBe(0);
+    // A real résumé, rich enough to write about.
+    expect(resumeSubstanceCount(resume())).toBeGreaterThanOrEqual(RESUME_MIN_FIELDS);
+    // And one whose text happens to contain the word that used to decide this.
+    expect(
+      resumeSubstanceCount({
+        ...resume(),
+        summary: 'Built an unknown-SKU reconciliation tool and an unknown-GSTIN detector.',
+        career_highlights: ['Cut unknown-vendor spend by 30%'],
+      }),
+    ).toBeGreaterThanOrEqual(RESUME_MIN_FIELDS);
   });
 });
 
@@ -154,86 +151,214 @@ describe('the gates on a generated question', () => {
       .toMatch(/question mark/);
   });
 
-  describe('THE RÉSUMÉ-INJECTION GATE — the one this feature makes necessary', () => {
-    // `META_RE` is an anti-prompt-injection gate, not a CONTENT gate: "What is
-    // your bank account number for payroll verification?" passes it clean. A
-    // résumé is attacker-controlled text that now steers what the bot asks the
-    // person who wrote it, so the topics have to be refused by name.
-    const forbidden = [
+  it('refuses a question the call already asks', () => {
+    const already = new Set(
+      template().map((q) => q.question.toLocaleLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()),
+    );
+    expect(candidateQuestionIssue('How do you handle an unhappy customer?', already))
+      .toMatch(/repeats/);
+  });
+});
+
+/**
+ * THIS CORPUS COMES FROM AN ADVERSARY, NOT FROM THE REGEX.
+ *
+ * Its first version was written by reading `SENSITIVE_ALWAYS_RE` and restating
+ * it as strings, which is why a review could delete 20 of its 27 alternatives
+ * with the suite green — and why it said nothing at all about the phrasings the
+ * regex happened not to contain. Every string below is one an adversarial
+ * reviewer ran against the real code: the "must refuse" set are questions they
+ * got PAST the old gate, and the "must allow" set are ordinary questions about
+ * real Indian résumés the old gate wrongly refused.
+ */
+describe('the credential prefilter — the cheap half of the injection gate', () => {
+  const taken = new Set<string>();
+  const refused = (q: string) => candidateQuestionIssue(q, taken);
+
+  describe('catches a credential ask however it is spelled', () => {
+    const CREDENTIALS = [
+      // Plain.
       'Could you confirm your bank account number for the payroll setup?',
-      'What is the one-time code you just received?',
-      'Could you read out your Aadhaar number for verification?',
+      'What is your UPI handle?',
+      'Could you share your Aadhaar number for verification?',
       'What is your PAN card number for our records?',
       'Can you share your passport number before we proceed?',
-      'What is your date of birth, for the background check?',
-      'Do you have any medical condition we should know about?',
-      'What is your marital status?',
-      'Which religion do you follow?',
       'Can you tell me your password for the portal?',
       'What is the CVV on the card you used?',
+      'What is the one-time code you just received?',
+      // PLURALS — the trailing `\b` let every one of these through before.
+      'Could you confirm your bank accounts for the payroll file?',
+      'Can you share your card numbers with me?',
+      'What are your account numbers?',
+      // HYPHENS AND UNDERSCORES.
+      'Could you confirm your bank-account details for our payroll file?',
+      'What is your card_number for the reimbursement?',
+      // SPACED-OUT LETTERS.
+      'Kya aap apna a a d h a a r number bata sakte hain?',
+      // INDIA-SPECIFIC IDENTIFIERS the first list never named.
+      'What is your UAN or PF number?',
+      'What is your voter ID?',
+      // Bare PAN, which the first list required a following word for.
+      'Can you share your PAN details with me now?',
+      // HINGLISH POSSESSIVES. This is an Indian-market screen and the model is
+      // free to answer in Hinglish; a guard that only knows "your" is deaf to
+      // half of what it will be shown.
+      'Aapka PAN kya hai?',
+      'Aapka bank account number bata dijiye?',
     ];
-    for (const question of forbidden) {
-      it(`refuses: ${question.slice(0, 40)}…`, () => {
-        expect(candidateQuestionIssue(question, taken)).toMatch(/must not raise/);
+    for (const q of CREDENTIALS) {
+      it(`refuses: ${q.slice(0, 46)}…`, () => {
+        expect(looksLikeCredentialRequest(q), q).toBe(true);
+        expect(refused(q), q).toMatch(/must never request/);
+      });
+    }
+  });
+
+  describe('does NOT refuse ordinary work on those same subjects', () => {
+    // These are the questions the feature exists to ask. A BFSI, health-tech,
+    // accessibility, govt-tech or insurance candidate has to be askable about
+    // their own work, or the gate burns both attempts on the candidates whose
+    // résumés are the most specific.
+    const LEGITIMATE = [
+      'You worked on a bank account opening journey at HDFC, so what was the drop-off?',
+      'You worked at a bank in your first role — what did you learn there?',
+      'You sold medical devices at Brightpath; how did you handle a sceptical surgeon?',
+      'You led the disability inclusion programme at Infosys, so what changed?',
+      'Which disability benefits can you explain to a new customer?',
+      'What medical history records did you handle at Apollo?',
+      'You built a mental health chatbot at Wysa, so what was the hardest part?',
+      'How many caste categories did the scholarship eligibility engine handle?',
+      'Your religion column in the KYC form was optional, so how did you enforce that?',
+      'How did you rebuild trust with the account after the credit hold?',
+      'What did running the accessibility programme at Lumen teach you?',
+      'How do you pin down a number when a buyer will not give you one?',
+      'What is your current notice period at Lumen Retail?',
+    ];
+    for (const q of LEGITIMATE) {
+      it(`allows: ${q.slice(0, 46)}…`, () => {
+        expect(looksLikeCredentialRequest(q), q).toBe(false);
+        expect(refused(q), q).toBeNull();
+      });
+    }
+  });
+
+  it('says nothing about WHICH term matched', () => {
+    // The reason is fed back into the next attempt's prompt; naming the term
+    // would hand the model the phrasing to route around.
+    const issue = refused('What is your bank account number?') ?? '';
+    expect(issue.toLowerCase()).not.toContain('bank');
+    expect(issue.toLowerCase()).not.toContain('account');
+  });
+
+  it('IS NOT THE WHOLE GATE, and does not pretend to be', () => {
+    // These are real bypasses of the prefilter — paraphrase, other languages,
+    // and hazard classes no term list names. They are here so the file states
+    // plainly what the prefilter cannot do, and so anyone who deletes the
+    // judge sees exactly what the judge was carrying.
+    const PREFILTER_CANNOT_CATCH = [
+      'Could you tell me the sixteen digits printed on the front of the card you use most often?',
+      'What is your birth date?',
+      'Which year were you born?',
+      'Which religion were you raised in?',
+      'Is there a disability that affects your typing speed?',
+      'Are you married?',
+      'Do you have any plans to start a family in the next two years?',
+      'Have you ever been arrested or convicted of a crime?',
+      'Are you legally allowed to work in India?',
+      'Which other companies have made you an offer, and what are they paying?',
+      'How old are you?',
+    ];
+    for (const q of PREFILTER_CANNOT_CATCH) {
+      expect(looksLikeCredentialRequest(q), q).toBe(false);
+    }
+  });
+});
+
+describe('the judge — the half that generalises', () => {
+  // WHAT IS TESTED HERE IS THE MECHANISM, NOT THE MODEL. Whether a judge
+  // correctly refuses "which year were you born" is a property of the model and
+  // the prompt, and no stub can establish it. What IS testable, and what the
+  // fail-closed posture rests on, is that nothing survives this function unless
+  // a well-formed verdict explicitly allowed it.
+  const QS = ['First question?', 'Second question?', 'Third question?'];
+
+  it('keeps only what an explicit verdict allowed, in input order', async () => {
+    const infer = vi.fn().mockResolvedValue({
+      verdicts: [
+        { index: 1, allowed: true },
+        { index: 2, allowed: false },
+        { index: 3, allowed: true },
+      ],
+    });
+    expect(await judgeCandidateQuestions(QS, { infer })).toEqual([
+      'First question?',
+      'Third question?',
+    ]);
+  });
+
+  describe('FAILS CLOSED on every uncertainty', () => {
+    const CLOSED: Array<[string, unknown]> = [
+      ['a missing verdict for a question', { verdicts: [{ index: 1, allowed: true }] }],
+      ['no verdicts key', { ok: true }],
+      ['verdicts not an array', { verdicts: 'yes' }],
+      ['a non-boolean allowed', { verdicts: QS.map((_q, i) => ({ index: i + 1, allowed: 'true' })) }],
+      ['an out-of-range index', { verdicts: [{ index: 9, allowed: true }] }],
+      ['a zero index', { verdicts: [{ index: 0, allowed: true }] }],
+      ['a fractional index', { verdicts: [{ index: 1.5, allowed: true }] }],
+      ['a null response', null],
+      ['a string response', 'allowed'],
+      ['an array response', [{ index: 1, allowed: true }]],
+    ];
+    for (const [label, response] of CLOSED) {
+      it(`drops everything on ${label}`, async () => {
+        const infer = vi.fn().mockResolvedValue(response);
+        const kept = await judgeCandidateQuestions(QS, { infer });
+        // Anything not explicitly allowed by a readable verdict is gone.
+        expect(kept.length).toBeLessThan(QS.length);
+        if (label === 'a missing verdict for a question') expect(kept).toEqual(['First question?']);
+        else expect(kept).toEqual([]);
       });
     }
 
-    it('says nothing about WHICH topic matched', () => {
-      // The reason is fed back into the next attempt's prompt. Naming the term
-      // would hand the model the phrasing to route around.
-      const issue = candidateQuestionIssue('What is your bank account number?', taken) ?? '';
-      expect(issue.toLowerCase()).not.toContain('bank');
-    });
-
-    it('does NOT refuse an ordinary question that merely sounds adjacent', () => {
-      // A deny-list that catches real questions is a deny-list that burns the
-      // attempt budget on honest candidates and then gets deleted. These are
-      // the near misses on real Indian résumés, and the first two are the ones
-      // that a single flat list containing the bare words `bank` and `medical`
-      // actually did refuse.
-      for (const ok of [
-        'You worked at a bank in your first role — what did you learn there?',
-        'You sold medical devices at Brightpath; how did you handle a sceptical surgeon?',
-        'What did running the accessibility programme at Lumen teach you?',
-        'How do you pin down a number when a buyer will not give you one?',
-        'What is your current notice period at Lumen Retail?',
-        'You have a health-tech background; what carried over into enterprise sales?',
-        'How did you rebuild trust with the account after the credit hold?',
-        'What made you pick a commerce degree over an engineering one?',
-      ]) {
-        expect(candidateQuestionIssue(ok, taken), ok).toBeNull();
-      }
-    });
-
-    it('catches the protected-attribute ask in BOTH subject forms', () => {
-      // A guard written around one phrasing inherits a blind spot in the
-      // other, and so does a corpus written the same way. These are the same
-      // questions asked two ways.
-      for (const bad of [
-        'What is your religion?',
-        'Do you have any religion-based scheduling needs?',
-        'What is your caste?',
-        'Do you belong to any caste category for the quota?',
-        'Do you have a disability we should plan around?',
-        'Is your disability going to affect the night shift?',
-        'Do you have any medical condition that limits travel?',
-        'Has your medical history affected your attendance?',
-        'Do you have any mental health concerns we should know about?',
-        // TERM FIRST, PRONOUN LAST — the order the first draft of the guard
-        // walked straight past.
-        'Which religion do you follow?',
-        'What caste are you from?',
-        'What medical condition do you have?',
-      ]) {
-        expect(candidateQuestionIssue(bad, taken), bad).toMatch(/must not raise/);
-      }
+    it('drops everything when the provider itself fails', async () => {
+      // The cost is a screen that uses the recruiter's own template — the
+      // cheapest failure available here, which is why this one may fail closed
+      // when the generator may not.
+      const infer = vi.fn().mockRejectedValue(new Error('judge timeout'));
+      expect(await judgeCandidateQuestions(QS, { infer })).toEqual([]);
     });
   });
 
-  it('refuses a question the call already asks', () => {
-    const already = new Set(template().map((q) => q.question.toLocaleLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()));
-    const issue = candidateQuestionIssue('How do you handle an unhappy customer?', already);
-    expect(issue).toMatch(/repeats/);
+  it('A REPEATED INDEX CANNOT OVERWRITE A REFUSAL WITH AN APPROVAL', async () => {
+    const infer = vi.fn().mockResolvedValue({
+      verdicts: [
+        { index: 1, allowed: false },
+        { index: 1, allowed: true },
+      ],
+    });
+    expect(await judgeCandidateQuestions(['First question?'], { infer })).toEqual([]);
+  });
+
+  it('spends no call on an empty list', async () => {
+    const infer = vi.fn();
+    expect(await judgeCandidateQuestions([], { infer })).toEqual([]);
+    expect(infer).not.toHaveBeenCalled();
+  });
+
+  it('the prompt states the positive rule AND the work-about-it exception', () => {
+    const prompt = buildJudgePrompt(['A question?']);
+    expect(prompt).toMatch(/ALLOWED only if/);
+    expect(prompt).toMatch(/candidate's own professional work/);
+    // The exception is what stops the judge reproducing the deny-list's own
+    // false positives on BFSI, health-tech and accessibility résumés.
+    expect(prompt).toMatch(/these are ALLOWED, and refusing them is a mistake/);
+    expect(prompt).toMatch(/disability inclusion programme/);
+    expect(prompt).toMatch(/bank account opening journey/);
+    // And the hazard classes the term list had no entry for.
+    for (const hazard of ['criminal record', 'union membership', 'immigration', 'age', 'voice sample']) {
+      expect(prompt.toLowerCase(), hazard).toContain(hazard.toLowerCase());
+    }
+    expect(prompt).toContain('1. A question?');
   });
 });
 
@@ -310,10 +435,17 @@ describe('generating, end to end', () => {
     template: template(),
     resume: resume(),
   };
+  /**
+   * A judge that allows everything, so these tests exercise the GENERATOR.
+   * The judge's own behaviour — and the fact that the real one refuses
+   * everything it cannot read — is tested in its own block above, and the
+   * composition is tested at the end of this one.
+   */
+  const allowAll = (qs: readonly string[]) => Promise.resolve([...qs]);
 
   it('writes both compartments and changes nothing else', async () => {
     const infer = answer(GOOD_RELEVANCE, GOOD_STABILITY);
-    const result = await generateCandidateQuestions(base, { infer });
+    const result = await generateCandidateQuestions(base, { infer, judge: allowAll });
 
     expect(result.rewritten).toEqual({ profile_relevance: 2, stability: 1 });
     expect(result.questions).toHaveLength(8);
@@ -328,7 +460,7 @@ describe('generating, end to end', () => {
       Array.from({ length: 40 }, (_, i) => `At Lumen Retail, what did you change in quarter ${i}?`),
       Array.from({ length: 40 }, (_, i) => `Why did you leave the role before number ${i}?`),
     );
-    const result = await generateCandidateQuestions(base, { infer });
+    const result = await generateCandidateQuestions(base, { infer, judge: allowAll });
     expect(result.questions).toHaveLength(base.template.length);
     expect(result.rewritten).toEqual({ profile_relevance: 2, stability: 1 });
   });
@@ -347,7 +479,7 @@ describe('generating, end to end', () => {
         profile_relevance: [GOOD_RELEVANCE[1]],
         stability: GOOD_STABILITY,
       });
-    const result = await generateCandidateQuestions(base, { infer });
+    const result = await generateCandidateQuestions(base, { infer, judge: allowAll });
 
     expect(infer).toHaveBeenCalledTimes(2);
     expect(result.rewritten).toEqual({ profile_relevance: 2, stability: 1 });
@@ -366,10 +498,10 @@ describe('generating, end to end', () => {
       profile_relevance: ['Probe their pipeline?', 'Describe the pipeline.'],
       stability: ['What is your Aadhaar number?'],
     });
-    await expect(generateCandidateQuestions(base, { infer })).rejects.toBeInstanceOf(
+    await expect(generateCandidateQuestions(base, { infer, judge: allowAll })).rejects.toBeInstanceOf(
       CandidateQuestionsError,
     );
-    await expect(generateCandidateQuestions(base, { infer })).rejects.toMatchObject({
+    await expect(generateCandidateQuestions(base, { infer, judge: allowAll })).rejects.toMatchObject({
       reason: 'unspeakable_questions',
     });
   });
@@ -378,7 +510,7 @@ describe('generating, end to end', () => {
     // The queue owns that retry; retrying inside the loop would double an
     // outage's cost on a shared worker.
     const infer = vi.fn().mockRejectedValue(new Error('deepseek timeout'));
-    await expect(generateCandidateQuestions(base, { infer })).rejects.toMatchObject({
+    await expect(generateCandidateQuestions(base, { infer, judge: allowAll })).rejects.toMatchObject({
       reason: 'provider_error',
     });
     expect(infer).toHaveBeenCalledTimes(1);
@@ -386,7 +518,7 @@ describe('generating, end to end', () => {
 
   it('stops after the first attempt when the first attempt is enough', async () => {
     const infer = answer(GOOD_RELEVANCE, GOOD_STABILITY);
-    await generateCandidateQuestions(base, { infer });
+    await generateCandidateQuestions(base, { infer, judge: allowAll });
     expect(infer).toHaveBeenCalledTimes(1);
   });
 });

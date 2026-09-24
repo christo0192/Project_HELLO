@@ -45,12 +45,12 @@
  *     recruiter/model/instruction text reaching the worker.
  *   * `META_RE` IS NOT A CONTENT GATE, and pretending otherwise is how this
  *     would go wrong. "What is your bank account number for payroll
- *     verification?" passes it clean. So this module adds
- *     `raisesSensitiveTopic` below — a narrow, two-tier deny-list for the
- *     things a screening call has no business asking, checked on the
- *     GENERATED text, not on the résumé. A résumé that talks its way into a
- *     plausible-sounding question still has to get that question past a list
- *     of the exact topics an attacker would want.
+ *     verification?" passes it clean. So this module adds two content gates of
+ *     its own, both on the GENERATED text rather than on the résumé: a narrow
+ *     credential prefilter, and a JUDGE pass that vets every question against
+ *     a positive specification. The long note above
+ *     `looksLikeCredentialRequest` records why a topic deny-list was tried,
+ *     measured, and replaced.
  *
  * A refusal here is never fatal: the caller records the failure and the call
  * runs the recruiter's own template, which is what every call did before this
@@ -113,62 +113,141 @@ export const CANDIDATE_QUESTIONS_TIMEOUT_MS = 120_000;
 const MAX_QUESTION_CHARS = 2_000;
 
 /**
- * Topics a first-round screening call has no business raising, checked against
- * the GENERATED question.
+ * ── WHY THERE IS NO LONGER A TOPIC DENY-LIST ────────────────────────────
  *
- * This is the one gate that exists specifically because the résumé is
- * attacker-controlled. `META_RE` is an ANTI-INJECTION gate, not a content one —
- * "What is your bank account number for payroll verification?" passes it clean
- * — so the topics have to be refused by name.
+ * There was one, in two tiers, and an adversarial review executed it: **44 of
+ * 44** hostile questions walked through, while **10 of 12** ordinary questions
+ * about real Indian résumés were refused. Both halves of that are structural,
+ * not a matter of missing rows:
  *
- * TWO TIERS, BECAUSE ONE WAS UNUSABLE. A single list containing the bare word
- * `bank` refuses "You worked at a bank in your first role — what did you learn
- * there?", and `medical` refuses every question about selling medical devices.
- * Those are ordinary questions about ordinary Indian résumés, and a deny-list
- * that eats them is a deny-list that burns the attempt budget on honest
- * candidates and then gets deleted.
+ *   * A term list cannot cover paraphrase. "the sixteen digits printed on the
+ *     front of the card", "what is your birth date", "which year were you
+ *     born", "aapka PAN kya hai", "a a d h a a r" and "bank-account" are the
+ *     same six asks the list already named, in words it did not.
+ *   * Plurals and hyphens walk past a trailing `\b` — `bank accounts`,
+ *     `card numbers`, `bank-account`.
+ *   * Whole hazard classes had no term at all: work authorisation, criminal
+ *     record, age, union membership, political affiliation, a competitor's
+ *     offer, "read this line aloud so we can capture a voice sample".
+ *   * And the false positives were the feature's own users: a BFSI candidate
+ *     cannot be asked about "a bank account opening journey at HDFC", an
+ *     accessibility lead cannot be asked about "the disability inclusion
+ *     programme", a health-tech candidate cannot be asked about "medical
+ *     history records". Those are the most relevant questions available.
  *
- *   ALWAYS — credentials and identifiers, which have no innocent reading as a
- *   question TO a candidate. `bank account`, not `bank`.
+ * Adding rows raises the false-positive rate faster than it closes the bypass
+ * set, so the gate needed a different SHAPE. What replaced it:
  *
- *   ABOUT THE CANDIDATE — protected characteristics, which are fine as
- *   subject matter ("your work on accessibility") and never fine as a
- *   question about the person. Refused only when the question actually asks
- *   the candidate about their own.
+ *   1. `looksLikeCredentialRequest` — a narrow, unambiguous prefilter for the
+ *      things that have no innocent reading, now tolerant of plurals, hyphens
+ *      and spaced-out letters. It is CHEAP and it is not the real gate; its
+ *      job is to catch the obvious for free and to keep working if the judge
+ *      is unavailable.
+ *   2. `judgeCandidateQuestions` — one provider call that vets the generated
+ *      questions against a POSITIVE specification: a question is allowed only
+ *      if it is about the candidate's professional work. That generalises to
+ *      paraphrase, to Hindi, and to hazard classes nobody enumerated, which a
+ *      term list cannot.
  *
- * The second tier's trigger is written with BOTH subject forms — "your X" and
- * "do you have X" — because a guard written around one phrasing inherits a
- * blind spot in the other, and so does a negative corpus written the same way.
+ * The judge sees only the generated QUESTIONS — short, already stripped of
+ * markup by `validatePhoneQuestionTemplate` — and never the résumé, so it is a
+ * far smaller injection surface than the generator it is checking.
+ *
+ * IT FAILS CLOSED. A judge that cannot be reached refuses the questions, and
+ * the call falls back to the recruiter's own template. That costs a
+ * personalised screen and nothing else, which is the cheapest failure
+ * available here — unlike the generator, where failing closed would end a call.
  */
-const SENSITIVE_ALWAYS_RE =
-  /\b(?:bank\s*(?:account|details|a\/?c)|account\s*number|ifsc|routing\s*number|swift\s*code|upi\s*id|card\s*number|cvv|pin\s*(?:number|code)|password|passcode|otp|one[-\s]?time\s*(?:code|password)|aadhaar|aadhar|pan\s*(?:card|number)|social\s*security|ssn|passport\s*number|voter\s*id|date\s*of\s*birth|dob|mother'?s\s*maiden|credit\s*score|sexual\s*orientation|marital\s*status|pregnan\w*)\b/i;
 
 /**
- * The protected characteristics, written ONCE.
+ * Letters a hostile résumé might space or punctuate apart to slip a term past
+ * a word-boundary match: `a a d h a a r`, `bank-account`, `card_number`.
  *
- * Both directions below are built from this string, because the trigger has to
- * be symmetric and a second hand-maintained copy is how the two halves drift
- * apart — with the half nobody wrote a test for being the one that stops
- * firing.
+ * Applied ONLY to the credential prefilter, and only to compare against terms
+ * that have no innocent reading. Normalising the whole question this
+ * aggressively for a term like `medical` is exactly how the old list started
+ * refusing "sold medical devices".
  */
-const PROTECTED_TERMS =
-  '(?:religion|religious\\s+belief|caste|disabilit\\w*|medical\\s*(?:condition|history)|health\\s*condition|mental\\s*health)';
+function collapseForCredentialMatch(text: string): string {
+  const lower = text.toLowerCase();
+  // Join single letters separated by spaces/punctuation: "a a d h a a r".
+  const despaced = lower.replace(/\b(?:[a-z][\s._-]+){2,}[a-z]\b/g, (run) =>
+    run.replace(/[\s._-]+/g, ''),
+  );
+  // Then treat any run of separators as a single space, so `bank-account`,
+  // `bank_account` and `bank  account` all read the same.
+  return despaced.replace(/[\s._\-/]+/g, ' ');
+}
 
 /**
- * ASKED IN BOTH WORD ORDERS. "What is your religion?" puts the pronoun first;
- * "Which religion do you follow?" puts it last, and a guard anchored only on
- * the first form walks straight past the second — which is exactly what the
- * first draft of this regex did, caught by its own negative corpus.
+ * Credentials, financial instruments and government identifiers.
+ *
+ * Deliberately NOT a list of protected characteristics. Those are legitimate
+ * SUBJECT MATTER on an Indian résumé (a caste-category eligibility engine, a
+ * disability inclusion programme, a mental-health chatbot, a KYC religion
+ * field) and only ever wrong as a question ABOUT the person — a distinction a
+ * term list cannot draw and the judge can.
+ *
+ * Plural-tolerant, and `pin` only ever with `number`/`code`: bare `pin`
+ * refused "How do you pin down a number when a buyer will not give you one?".
  */
-const SENSITIVE_ABOUT_CANDIDATE_RE = new RegExp(
-  `\\b(?:your|you|any)\\s+(?:\\w+\\s+){0,2}?${PROTECTED_TERMS}\\b`
-    + `|\\b${PROTECTED_TERMS}\\b(?:\\s+\\w+){0,3}\\s+(?:do|are|have|did|would|can)\\s+you\\b`,
+const CREDENTIAL_TERMS =
+  '(?:'
+  + 'bank (?:account|detail|a ?c)s?'
+  + '|account numbers?'
+  + '|ifsc|routing numbers?|swift codes?|upi (?:id|handle)s?'
+  + '|card numbers?|cvv|debit cards?|credit cards?'
+  + '|pin (?:numbers?|codes?)'
+  + '|passwords?|passcodes?|passphrases?|otps?|one ?time (?:code|password)s?'
+  + '|aadhaars?|aadhars?|pan(?: card| number)?s?|uan|pf numbers?'
+  + '|social security|ssn|passport numbers?|voter ids?'
+  + '|mother ?s maiden'
+  + ')';
+
+/**
+ * TUNED FOR PRECISION, NOT RECALL, and that is the design rather than a
+ * compromise.
+ *
+ * This is the free half of the gate; the judge is the gate. A prefilter that
+ * fires on the bare noun refuses "You worked on a bank account opening journey
+ * at HDFC, so what was the drop-off?" — the single most common description of
+ * BFSI product work in this market, and one of the best screening questions
+ * available for that candidate. A measured review found ten such refusals
+ * against twelve ordinary questions.
+ *
+ * So the term alone is not enough: the question has to ASK FOR the value,
+ * either possessively (`your`, and the Hinglish `aapka` / `apna` a screen in
+ * this market will meet) or through a request verb. Anything phrased around
+ * that — "Which bank accounts do you currently hold?" — passes here and is the
+ * judge's to refuse. The corpus records exactly which of those this cannot
+ * catch, so nobody mistakes the prefilter for the contract.
+ */
+const CREDENTIAL_RE = new RegExp(
+  [
+    // Possessive, including the Hinglish forms a screen in this market meets.
+    '\\b(?:your|yours|aapka|aapke|apna|apne)\\b',
+    // A request verb.
+    '\\b(?:share|confirm|provide|give|send|email|state|read out|tell me|spell out)\\b',
+    // Or a bare ask for the value. "What is the CVV on the card you used?" has
+    // no possessive and no verb, and is still unmistakably a request; "How did
+    // you scale the OTP service at Paytm?" is not, and neither form matches.
+    "\\bwhat(?:'s| is| are)? the\\b",
+  ]
+    .map((frame) => `${frame}(?:[\\s\\w-]{0,30}?)\\b${CREDENTIAL_TERMS}\\b`)
+    .join('|'),
   'i',
 );
 
-/** Does this question raise something a first-round screen must not? */
-export function raisesSensitiveTopic(text: string): boolean {
-  return SENSITIVE_ALWAYS_RE.test(text) || SENSITIVE_ABOUT_CANDIDATE_RE.test(text);
+/**
+ * The cheap half of the gate: does this read as a request FOR a credential or
+ * a government identifier?
+ *
+ * Exported so the corpus can exercise it directly. It is a PREFILTER, not the
+ * contract — `candidateQuestionIssue` is the contract, and the judge is what
+ * makes it hold.
+ */
+export function looksLikeCredentialRequest(text: string): boolean {
+  return CREDENTIAL_RE.test(collapseForCredentialMatch(text));
 }
 
 /** Why a whole run gave up. Stored on the row, for an operator, never shown. */
@@ -266,12 +345,25 @@ export function spliceCandidateQuestions(
 ): CandidateTemplateQuestion[] {
   const slots = variableSlots(template);
   const out = template.map((q) => ({ ...q }));
+  // ONE SLOT PER DISTINCT QUESTION. `generateCandidateQuestions` cannot hand
+  // over a duplicate — its `taken` set blocks one — but this function is
+  // exported and `phone_normalize_question_plan` de-dupes on `id`, never on
+  // text, so a duplicate spliced here would reach the worker as a plan that
+  // asks the same thing twice. Cheap to refuse, invisible if it happens.
+  const used = new Set(template.map((q) => normalizeSpokenQuestion(q.question)));
   for (const category of VARIABLE_CATEGORIES) {
     slots[category].forEach((templateIndex, slotIndex) => {
-      const text = generated[category][slotIndex];
-      if (typeof text === 'string' && text.trim().length > 0) {
-        out[templateIndex] = { ...out[templateIndex], question: text.trim() };
-      }
+      const text = (generated[category] ?? [])[slotIndex];
+      if (typeof text !== 'string') return;
+      const trimmed = text.trim();
+      if (trimmed.length === 0) return;
+      const key = normalizeSpokenQuestion(trimmed);
+      // The slot's own current text is what this would replace, so it must not
+      // count against itself.
+      used.delete(normalizeSpokenQuestion(out[templateIndex].question));
+      if (used.has(key)) return;
+      out[templateIndex] = { ...out[templateIndex], question: trimmed };
+      used.add(key);
     });
   }
   return out;
@@ -301,12 +393,12 @@ export function candidateQuestionIssue(
   }
   const shape = generatedQuestionIssue(text);
   if (shape) return shape;
-  if (raisesSensitiveTopic(text)) {
-    // The résumé-injection gate. Deliberately says nothing about WHICH topic
-    // matched: the reason is fed back into the next attempt's prompt, and
-    // naming the term there would be handing the model the phrasing to route
-    // around.
-    return 'asks about something a first-round screening call must not raise';
+  if (looksLikeCredentialRequest(text)) {
+    // The cheap half of the résumé-injection gate. Deliberately says nothing
+    // about WHICH term matched: the reason is fed back into the next attempt's
+    // prompt, and naming it would hand the model the phrasing to route around.
+    // The judge is the other half and runs over whatever survives this.
+    return 'asks for something a first-round screening call must never request';
   }
   if (taken.has(normalizeSpokenQuestion(text))) {
     return 'repeats a question the call already asks';
@@ -389,6 +481,12 @@ export interface CandidateQuestionsDeps {
   /** Injected in tests; production goes through the shared provider runner. */
   infer?: (prompt: string) => Promise<unknown>;
   runJson?: typeof runClaudeJSONWithProvenance;
+  /**
+   * The judge pass. Injected in tests so the corpus can drive the generator
+   * without a provider; production uses the real one, which fails closed.
+   */
+  judge?: (questions: readonly string[], deps: JudgeDeps) => Promise<string[]>;
+  judgeDeps?: JudgeDeps;
 }
 
 export interface CandidateQuestionsInput {
@@ -411,21 +509,52 @@ export interface CandidateQuestionsResult {
 }
 
 /**
- * How many of `formatResumeFacts`' ten fields may read "unknown" before there
- * is nothing left to write a question about.
+ * How much of a parse there has to be before a question is worth generating.
  *
- * `formatResumeFacts` is TOTAL — it renders every field, and a null parse
- * renders ten "unknown"s and a summary of "n/a". So an empty résumé produces a
- * perfectly well-formed prompt carrying no information, and the model would
- * answer it with generic questions that are WORSE than the role's own, at the
- * cost of a provider call. Eight leaves room for a real résumé that happens to
- * list no certifications, no education and no total-years figure.
+ * `formatResumeFacts` is TOTAL — it renders every field whatever the parse
+ * holds — so an empty résumé still produces a well-formed prompt carrying no
+ * information, and the model answers it with generic questions WORSE than the
+ * role's own, at the cost of a provider call.
  *
- * Counted on the rendered FACTS rather than on the parsed object, because a
- * parse can be non-null and empty, and because this is the string the model
- * actually sees.
+ * COUNTED ON THE PARSED OBJECT, NOT ON THE RENDERED STRING. The first version
+ * counted the literal word "unknown" in the rendered facts, which put a
+ * candidate-controlled string in charge of a candidate-independent decision.
+ * A review measured both ends of that: a résumé holding nothing but a name and
+ * one skill rendered seven "unknown"s and so RAN, while a rich analyst résumé
+ * whose bullets legitimately read "unknown-vendor spend" and "unknown-SKU
+ * reconciliation" rendered eight and was refused as `no_resume` — an operator-
+ * visible row that was simply a lie about the parse.
+ *
+ * Three is the floor because three is what a question can be built on: who
+ * they worked for, what they did there, and something specific about it.
  */
-export const RESUME_UNKNOWN_FIELD_LIMIT = 8;
+export const RESUME_MIN_FIELDS = 3;
+
+/**
+ * The résumé fields a question can actually be written from, as a count.
+ *
+ * `skills`, `certifications` and `education` are deliberately NOT here on
+ * their own: a list of skills supports a generic question about a skill, which
+ * is the thing the role template already does better. What earns a generated
+ * question is an EMPLOYER, a ROLE, a DATE RANGE or a specific claim.
+ */
+export function resumeSubstanceCount(resume: CandidateQuestionsInput['resume']): number {
+  const p = (resume ?? {}) as Record<string, unknown>;
+  const nonEmptyString = (v: unknown): boolean => typeof v === 'string' && v.trim().length > 0;
+  const nonEmptyArray = (v: unknown): boolean => Array.isArray(v) && v.length > 0;
+  const role = (p.recent_role ?? null) as Record<string, unknown> | null;
+
+  let count = 0;
+  if (nonEmptyString(role?.title) || nonEmptyString(p.current_role)) count += 1;
+  if (nonEmptyString(role?.employer)) count += 1;
+  if (nonEmptyString(role?.period)) count += 1;
+  if (nonEmptyArray(role?.highlights)) count += 1;
+  if (nonEmptyArray(p.prior_roles)) count += 1;
+  if (nonEmptyArray(p.career_highlights)) count += 1;
+  if (nonEmptyString(p.summary)) count += 1;
+  if (typeof p.experience_years === 'number' && p.experience_years > 0) count += 1;
+  return count;
+}
 
 function asStringArray(value: unknown): string[] {
   if (!Array.isArray(value)) return [];
@@ -434,10 +563,7 @@ function asStringArray(value: unknown): string[] {
     .filter((v) => v.length > 0);
 }
 
-/** How many of the résumé's fields came back unknown. */
-export function unknownResumeFieldCount(resumeFacts: string): number {
-  return (resumeFacts.match(/\bunknown\b/g) ?? []).length;
-}
+
 
 /** The repair block takes a list; the running issue is one joined string. */
 function failuresFrom(joined: string): string[] {
@@ -473,13 +599,13 @@ export async function generateCandidateQuestions(
     );
   }
 
-  const resumeFacts = formatResumeFacts(input.resume);
-  if (unknownResumeFieldCount(resumeFacts) >= RESUME_UNKNOWN_FIELD_LIMIT) {
+  if (resumeSubstanceCount(input.resume) < RESUME_MIN_FIELDS) {
     throw new CandidateQuestionsError(
       'the résumé carries too little to write a question about',
       'no_resume',
     );
   }
+  const resumeFacts = formatResumeFacts(input.resume);
 
   const infer =
     deps.infer ??
@@ -531,11 +657,21 @@ export async function generateCandidateQuestions(
       // A provider fault is not a bad question — there is nothing to feed back,
       // and retrying inside this loop would double an outage's cost on a shared
       // worker. The queue owns the retry.
-      throw new CandidateQuestionsError(
-        'the provider call for candidate questions failed',
-        'provider_error',
-        error instanceof Error ? error.message : null,
-      );
+      //
+      // BUT ONLY WHEN THERE IS NOTHING TO KEEP. Throwing here unconditionally
+      // discarded every question an earlier attempt had already produced and
+      // validated, contradicting this module's own "partial success is success"
+      // rule — and, because the job re-throws `provider_error` for the queue,
+      // it made the candidate pay a second time to re-derive a question that
+      // was already in hand.
+      if (kept.profile_relevance.length + kept.stability.length === 0) {
+        throw new CandidateQuestionsError(
+          'the provider call for candidate questions failed',
+          'provider_error',
+          error instanceof Error ? error.message : null,
+        );
+      }
+      break;
     }
 
     const obj = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
@@ -554,6 +690,22 @@ export async function generateCandidateQuestions(
     if (failures.length > 0) lastIssue = failures.join('; ');
   }
 
+  // ── THE JUDGE, over everything the cheap gates let through ───────────
+  // One call for all of them, against a POSITIVE specification, because a term
+  // list cannot cover paraphrase, another language, or a hazard class nobody
+  // enumerated. It fails closed: anything it does not explicitly allow is
+  // dropped, and a judge that cannot be reached drops everything.
+  const judge = deps.judge ?? judgeCandidateQuestions;
+  const submitted = [...kept.profile_relevance, ...kept.stability];
+  const survived = new Set(await judge(submitted, deps.judgeDeps ?? {}));
+  const refusedByJudge = submitted.length - survived.size;
+  for (const category of VARIABLE_CATEGORIES) {
+    kept[category] = kept[category].filter((q) => survived.has(q));
+  }
+  if (refusedByJudge > 0) {
+    lastIssue = `${refusedByJudge} question(s) were refused as not being about the candidate's own work`;
+  }
+
   if (kept.profile_relevance.length + kept.stability.length === 0) {
     throw new CandidateQuestionsError(
       'nothing the model wrote could be read aloud to a candidate',
@@ -570,4 +722,126 @@ export async function generateCandidateQuestions(
       stability: kept.stability.length,
     },
   };
+}
+
+/**
+ * The judge: one provider call that vets the generated questions against a
+ * POSITIVE specification.
+ *
+ * A term list refuses what it can name. This asks the opposite question — is
+ * every one of these questions about the candidate's professional work? — so
+ * it generalises to paraphrase ("the sixteen digits on the front of the
+ * card"), to Hindi ("aapka PAN kya hai"), and to hazard classes nobody
+ * enumerated (work authorisation, criminal record, age, a competitor's offer).
+ * Those were all measured bypasses of the deny-list this replaces.
+ *
+ * ONE CALL FOR ALL THREE QUESTIONS, not one each: the questions are short, the
+ * judgement is independent per question, and three round trips per candidate
+ * would triple the cost of the cheap half of this feature.
+ *
+ * IT FAILS CLOSED, which is only affordable because of where it sits. A judge
+ * that times out, errors, or answers in a shape this cannot read refuses
+ * everything — and the call then runs the recruiter's own template, exactly as
+ * it did before this feature existed. The generator cannot fail closed like
+ * that (it would end a call); the judge can, so it does.
+ *
+ * The judge sees ONLY the questions — short strings that
+ * `validatePhoneQuestionTemplate` has already stripped of markup — and never
+ * the résumé. That is a far smaller injection surface than the generator it is
+ * checking, which is the whole reason the check is worth making twice.
+ */
+export const JUDGE_TIMEOUT_MS = 45_000;
+
+/** What the judge decided about one question. */
+export interface JudgeVerdict {
+  /** Index into the array that was submitted. */
+  index: number;
+  allowed: boolean;
+}
+
+export interface JudgeDeps {
+  infer?: (prompt: string) => Promise<unknown>;
+  runJson?: typeof runClaudeJSONWithProvenance;
+}
+
+export function buildJudgePrompt(questions: readonly string[]): string {
+  return `You are checking questions an automated caller is about to read aloud to a job applicant in a first-round phone screen. Judge each one on its own.
+
+A question is ALLOWED only if ALL of these are true:
+- it asks about the candidate's own professional work: what they have done, built, sold, managed, decided or learned in a job, a project or their studies
+- it could be asked of that person by a recruiter, in public, without embarrassment
+- answering it requires no personal data of any kind
+
+A question is REFUSED if it does ANY of these, however it is phrased, in any language, and however reasonable the stated reason:
+- asks for a number, code, document or credential: bank or card details, an account, UPI, IFSC, a password, a one-time code, Aadhaar, PAN, UAN, PF, passport, voter ID, a national insurance or social security number, or a photo or scan of any of these
+- asks the candidate to read out, confirm or repeat any such value, or to say a sentence for a voice sample
+- asks about a protected or private characteristic OF THE CANDIDATE: religion, caste, community, disability or health, mental health, pregnancy or plans to have children, marital or relationship status, sexual orientation, age or date of birth, political views, union membership, criminal record, or immigration and work-authorisation status
+- asks for their home address, their family's details, or their credit history
+- asks what another company has offered them, or for a copy of an offer letter or payslip
+
+IMPORTANT — these are ALLOWED, and refusing them is a mistake:
+- a question about WORK a candidate did on any of those subjects. "You led the disability inclusion programme at Infosys, so what changed?", "You worked on a bank account opening journey at HDFC, so what was the drop-off?", "What medical history records did you handle at Apollo?", "How many caste categories did the scholarship eligibility engine model?" and "You built a mental health chatbot at Wysa, so what was the hardest part?" are all excellent screening questions. The subject matter is the candidate's JOB, not the candidate.
+- a question about their own notice period or current and expected salary. Those are asked separately on every call and are not private data here.
+
+Questions to judge:
+${questions.map((q, i) => `${i + 1}. ${q}`).join('\n')}
+
+Return ONLY a JSON object of the form:
+{ "verdicts": [ { "index": 1, "allowed": true }, { "index": 2, "allowed": false } ] }
+
+One entry per question, using the numbers above. No other keys, no explanation.`;
+}
+
+/**
+ * Vet the questions. Returns the subset the judge allowed, in input order.
+ *
+ * EVERY UNCERTAINTY RESOLVES TO REFUSED: a missing verdict, a duplicate index,
+ * an out-of-range index, a non-boolean `allowed`, a malformed response, a
+ * timeout, a provider error. There is no path through this function on which a
+ * question is kept because something could not be read.
+ */
+export async function judgeCandidateQuestions(
+  questions: readonly string[],
+  deps: JudgeDeps = {},
+): Promise<string[]> {
+  if (questions.length === 0) return [];
+
+  const infer =
+    deps.infer ??
+    (async (prompt: string) => {
+      const run = deps.runJson ?? runClaudeJSONWithProvenance;
+      const { data } = await run<unknown>(prompt, {
+        model: env.deepseekScoringModel,
+        timeoutMs: Math.min(env.deepseekTimeoutMs, JUDGE_TIMEOUT_MS),
+      });
+      return data;
+    });
+
+  let raw: unknown;
+  try {
+    raw = await infer(buildJudgePrompt(questions));
+  } catch {
+    // FAIL CLOSED. The cost is a screen that uses the recruiter's template.
+    return [];
+  }
+
+  const obj = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+  const verdicts = Array.isArray(obj.verdicts) ? obj.verdicts : null;
+  if (!verdicts) return [];
+
+  // Built as a map so a REPEATED index cannot let one verdict stand for two
+  // questions, and so a missing one stays missing rather than defaulting.
+  const allowed = new Map<number, boolean>();
+  for (const entry of verdicts) {
+    if (!entry || typeof entry !== 'object') continue;
+    const row = entry as Record<string, unknown>;
+    const index = typeof row.index === 'number' ? row.index : NaN;
+    if (!Number.isInteger(index) || index < 1 || index > questions.length) continue;
+    if (typeof row.allowed !== 'boolean') continue;
+    // First verdict wins; a second one for the same question is ignored rather
+    // than allowed to overwrite a refusal with an approval.
+    if (!allowed.has(index)) allowed.set(index, row.allowed);
+  }
+
+  return questions.filter((_q, i) => allowed.get(i + 1) === true);
 }

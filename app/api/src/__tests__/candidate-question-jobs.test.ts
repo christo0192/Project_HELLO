@@ -43,9 +43,16 @@ function context(over: Partial<CandidateQuestionsContext> = {}): CandidateQuesti
   };
 }
 
-function fakeStore(ctx: CandidateQuestionsContext | null) {
+function fakeStore(ctx: CandidateQuestionsContext | null, currentFingerprint?: string | null) {
   return {
     loadContext: vi.fn().mockResolvedValue(ctx),
+    // Defaults to "unchanged", so only the tests that are ABOUT the mid-job
+    // edit have to think about it.
+    currentTemplateFingerprint: vi
+      .fn()
+      .mockResolvedValue(
+        currentFingerprint === undefined ? templateFingerprint(template()) : currentFingerprint,
+      ),
     writeReady: vi.fn().mockResolvedValue(undefined),
     writeFailed: vi.fn().mockResolvedValue(undefined),
   } satisfies CandidateQuestionsStore & Record<string, unknown>;
@@ -132,7 +139,10 @@ describe('when there is work to do', () => {
   it('WRITES WHAT THE GENERATOR RETURNED, not what it was given', async () => {
     const rewritten = template();
     rewritten[1] = { ...rewritten[1], question: 'At Lumen Retail, what did you change to grow pipeline?' };
-    const store = fakeStore(context());
+    // The store reports the SAME fingerprint the generator computed, i.e. the
+    // recruiter did not touch the template while this ran. Without that the
+    // write is correctly discarded as `template_moved`, which is its own test.
+    const store = fakeStore(context(), 'fnv1a32:abcd1234:4');
     const generate = vi.fn().mockResolvedValue({
       questions: rewritten,
       fingerprint: 'fnv1a32:abcd1234:4',
@@ -177,6 +187,50 @@ describe('when there is work to do', () => {
     expect(input.requiredSkills).toEqual(['Outbound calling']);
     expect(input.template.map((q) => q.id)).toEqual(['q1', 'q2', 'q3', 'q4']);
     expect(input.resume).toEqual({ name: 'Asha' });
+  });
+});
+
+describe('when the recruiter edits the template while the job runs', () => {
+  it('DISCARDS the generation rather than storing a set that lies about it', async () => {
+    // Generation takes up to two minutes and waits in a queue before that, so
+    // the window is minutes. The PUT route's invalidation cannot help: an
+    // in-flight job has no row yet, so the delete is a no-op for it, and the
+    // write that lands afterwards stores questions built around the OLD
+    // template while claiming its fingerprint. `0103` prefers a `ready` row
+    // without comparing it to anything, so the call would run the wording the
+    // recruiter just changed — until some later edit happened to clear it.
+    const store = fakeStore(context(), 'fnv1a32:deadbeef:4');
+    const outcome = await runCandidateQuestionsJob(
+      { applicationLinkId: 'link-1' },
+      { store, model: 'deepseek', generate: generated() },
+    );
+    expect(outcome).toBe('template_moved');
+    expect(store.writeReady).not.toHaveBeenCalled();
+    // Not recorded as a failure either: nothing is wrong with this candidate,
+    // and a `failed` row would stop the next enqueue regenerating cleanly.
+    expect(store.writeFailed).not.toHaveBeenCalled();
+  });
+
+  it('WRITES when the template has not moved', async () => {
+    const store = fakeStore(context());
+    const outcome = await runCandidateQuestionsJob(
+      { applicationLinkId: 'link-1' },
+      { store, model: 'deepseek', generate: generated() },
+    );
+    expect(outcome).toBe('generated');
+    expect(store.writeReady).toHaveBeenCalledTimes(1);
+  });
+
+  it('WRITES when the template cannot be re-read — "do not know" is not "changed"', async () => {
+    // Refusing on a transient read error would throw away a generation that is
+    // almost certainly still correct, and cost another provider call to redo.
+    const store = fakeStore(context(), null);
+    const outcome = await runCandidateQuestionsJob(
+      { applicationLinkId: 'link-1' },
+      { store, model: 'deepseek', generate: generated() },
+    );
+    expect(outcome).toBe('generated');
+    expect(store.writeReady).toHaveBeenCalledTimes(1);
   });
 });
 

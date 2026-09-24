@@ -72,6 +72,12 @@ export interface CandidateQuestionsContext {
 
 export interface CandidateQuestionsStore {
   loadContext(applicationLinkId: string): Promise<CandidateQuestionsContext | null>;
+  /**
+   * The role's template fingerprint RIGHT NOW, re-read just before the write.
+   * Generation takes minutes; this is how a recruiter's edit during that
+   * window is noticed instead of being overwritten.
+   */
+  currentTemplateFingerprint(roleId: string): Promise<string | null>;
   writeReady(input: {
     engagementId: string;
     roleId: string | null;
@@ -111,7 +117,9 @@ export type CandidateQuestionsOutcome =
   /** Written. The next call for this engagement runs the candidate's screen. */
   | 'generated'
   /** Recorded as failed. The next call runs the role template, as before. */
-  | 'not_generated';
+  | 'not_generated'
+  /** The recruiter edited the template while this job ran; nothing written. */
+  | 'template_moved';
 
 /**
  * Generate this engagement's questions, once.
@@ -148,6 +156,30 @@ export async function runCandidateQuestionsJob(
       },
       deps.generateDeps ?? {},
     );
+    // ── THE TEMPLATE IS RE-READ BEFORE THE WRITE ────────────────────────
+    // Generation takes up to two minutes and the job waits in a queue before
+    // that, so a recruiter can save a new template inside the window. The PUT
+    // route deletes candidate sets that no longer match — but an IN-FLIGHT job
+    // has no row yet, so that delete is a no-op for it, and the write that
+    // lands afterwards stores questions built around the OLD template while
+    // claiming its fingerprint. `0103`'s plan builder prefers a `ready` row
+    // without comparing it to anything, so the call would run the wording the
+    // recruiter just changed — invisibly, and until some later edit happened
+    // to clear it.
+    //
+    // Checked rather than locked: the cost of losing this race is one wasted
+    // generation, and the next enqueue regenerates against the new template.
+    if (context.roleId) {
+      const now = await deps.store.currentTemplateFingerprint(context.roleId);
+      if (now !== null && now !== result.fingerprint) {
+        logger.info('unknown_event', {
+          error_category: 'candidate_questions_template_moved',
+          error_type: 'discarded',
+        });
+        return 'template_moved';
+      }
+    }
+
     await deps.store.writeReady({
       engagementId: context.engagementId,
       roleId: context.roleId,

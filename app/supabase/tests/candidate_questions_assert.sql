@@ -26,9 +26,14 @@ begin
   if jsonb_array_length(v) <> 2 then
     raise exception 'cqs103/norm: expected 2 questions, got %', jsonb_array_length(v);
   end if;
-  if v -> 0 ->> 'key' <> 'q1' or v -> 0 ->> 'text' <> 'First question?'
-     or (v -> 0 -> 'mandatory') <> 'true'::jsonb
-     or v -> 0 ->> 'hint' <> 'probe the numbers' then
+  -- `is distinct from`, NOT `<>`. A projection that drops `hint` altogether
+  -- makes `v -> 0 ->> 'hint'` NULL, and `NULL <> 'probe the numbers'` is NULL,
+  -- not TRUE — so the `if` never fired and the bot could lose every probe hint
+  -- with this assertion green. Found by mutation.
+  if v -> 0 ->> 'key' is distinct from 'q1'
+     or v -> 0 ->> 'text' is distinct from 'First question?'
+     or (v -> 0 -> 'mandatory') is distinct from 'true'::jsonb
+     or v -> 0 ->> 'hint' is distinct from 'probe the numbers' then
     raise exception 'cqs103/norm: first question projected wrong: %', v -> 0;
   end if;
   -- Whitespace trimmed, `mandatory` defaulted to false, `hint` null.
@@ -38,7 +43,7 @@ begin
   if (v -> 1 -> 'mandatory') <> 'false'::jsonb then
     raise exception 'cqs103/norm: mandatory did not default to false: %', v -> 1;
   end if;
-  if (v -> 1 -> 'hint') <> 'null'::jsonb then
+  if (v -> 1 -> 'hint') is distinct from 'null'::jsonb then
     raise exception 'cqs103/norm: absent hint was not null: %', v -> 1;
   end if;
 
@@ -87,6 +92,34 @@ begin
   if screening_v2.phone_normalize_question_plan(
        jsonb_build_array(jsonb_build_object('id','q1','question',repeat('x', 2001))) ) is not null then
     raise exception 'cqs103/norm: a 2001-character question was accepted'; end if;
+  -- ...and exactly 2000 is still accepted. Only the refusing side was asserted,
+  -- so tightening the bound to `>= 2000` — which would start refusing live role
+  -- templates — was invisible.
+  if screening_v2.phone_normalize_question_plan(
+       jsonb_build_array(jsonb_build_object('id','q1','question',repeat('x', 2000))) ) is null then
+    raise exception 'cqs103/norm: a 2000-character question was refused'; end if;
+  -- The hint bound, which had no assertion at all in either direction.
+  if screening_v2.phone_normalize_question_plan(
+       jsonb_build_array(jsonb_build_object('id','q1','question','Q?',
+                                            'follow_up_hint',repeat('h', 2000)))) is null then
+    raise exception 'cqs103/norm: a 2000-character hint was refused'; end if;
+  if screening_v2.phone_normalize_question_plan(
+       jsonb_build_array(jsonb_build_object('id','q1','question','Q?',
+                                            'follow_up_hint',repeat('h', 2001)))) is not null then
+    raise exception 'cqs103/norm: a 2001-character hint was accepted'; end if;
+  -- EVERY CHARACTER THE ID PATTERN ALLOWS. Only `has space` was tested as a
+  -- reject and nothing exercised an accept, so narrowing the class to
+  -- `[A-Za-z0-9_-]` — which would refuse a live template with a dotted id and
+  -- kill those calls outright — was invisible.
+  if screening_v2.phone_normalize_question_plan(
+       jsonb_build_array(jsonb_build_object('id','a.b:c-d_1','question','Q?'))) is null then
+    raise exception 'cqs103/norm: a dotted/colonned id was refused'; end if;
+  if screening_v2.phone_normalize_question_plan(
+       jsonb_build_array(jsonb_build_object('id',repeat('k',100),'question','Q?'))) is null then
+    raise exception 'cqs103/norm: a 100-character id was refused'; end if;
+  if screening_v2.phone_normalize_question_plan(
+       jsonb_build_array(jsonb_build_object('id',repeat('k',101),'question','Q?'))) is not null then
+    raise exception 'cqs103/norm: a 101-character id was accepted'; end if;
   if screening_v2.phone_normalize_question_plan(
        jsonb_build_array(jsonb_build_object('id','q1','question','Q?','mandatory','yes'))) is not null then
     raise exception 'cqs103/norm: a non-boolean mandatory was accepted'; end if;
@@ -163,6 +196,12 @@ begin
       raise exception 'cqs103/%: no plan was snapshotted', r.name;
     end if;
 
+    -- ── THE SET IS KEYED ON THE ENGAGEMENT, NOT THE CANDIDATE ─────────
+    -- `rescreen` holds a TERMINAL cycle-1 engagement carrying a ready set, and
+    -- an active cycle-2 engagement carrying none. Reading the candidate's set
+    -- by candidate, by role, or by "most recent" would put cycle one's stale
+    -- questions on this call. Every fixture used to have exactly one
+    -- engagement, so this — the design's headline claim — was untestable.
     v_expected := case when r.name = 'cqs103-ready-app'
                        then 'candidate_resume' else 'role_template' end;
     if v_plan.source <> v_expected then
@@ -202,19 +241,30 @@ begin
         raise exception 'cqs103/%: mandatory flags did not survive: %', r.name, v_plan.questions;
       end if;
     else
-      -- Absent, pending, failed and MALFORMED all get the recruiter's own
-      -- template — the screen the candidate would have had before 0103.
-      if v_plan.questions -> 1 ->> 'text' <> 'What does your current role involve day to day?' then
+      -- Absent, pending, failed, MALFORMED and the rescreen's fresh cycle all
+      -- get the recruiter's own template — the screen the candidate would have
+      -- had before 0103.
+      if v_plan.questions -> 1 ->> 'text' is distinct from 'What does your current role involve day to day?' then
         raise exception 'cqs103/%: expected the role template, got %',
           r.name, v_plan.questions -> 1 ->> 'text';
+      end if;
+      -- And explicitly NOT another engagement's questions, nor a half-written
+      -- row's. Both are storable states that the plan builder must never read.
+      if exists (select 1 from jsonb_array_elements(v_plan.questions) q
+                  where q ->> 'text' like 'STALE CYCLE ONE%') then
+        raise exception 'cqs103/%: a TERMINAL cycle''s questions reached this call', r.name;
+      end if;
+      if exists (select 1 from jsonb_array_elements(v_plan.questions) q
+                  where q ->> 'text' like 'HALF-WRITTEN PENDING%') then
+        raise exception 'cqs103/%: a non-ready row''s questions reached this call', r.name;
       end if;
     end if;
 
     raise notice 'cqs103/%: PASS (source=%)', r.name, v_plan.source;
   end loop;
 
-  if v_seen <> 6 then
-    raise exception 'cqs103: expected 6 calls, the join produced % — a scenario '
+  if v_seen <> 7 then
+    raise exception 'cqs103: expected 7 calls, the join produced % — a scenario '
                     'that never runs is a scenario that cannot fail', v_seen;
   end if;
 end $$;
@@ -222,8 +272,10 @@ end $$;
 -- ── Part 3: the constraints the table and the plan now carry ──────────
 do $$
 declare
-  v_eng uuid;
-  v_ok  boolean;
+  v_eng             uuid;
+  v_ok              boolean;
+  v_probe_session   uuid;
+  v_src             text;
 begin
   select e.id into v_eng
     from screening_v2.phone_engagements e
@@ -262,22 +314,42 @@ begin
     raise exception 'cqs103/chk: an undeclared status was accepted';
   end if;
 
-  -- `chk_phone_session_plans_source` accepts the new value AND still
-  -- refuses a typo, which is the only reason the constraint exists.
+  -- `chk_phone_session_plans_source` accepts the new value AND still refuses a
+  -- typo, which is the only reason the constraint exists.
+  --
+  -- ON A FRESH SESSION, AND CATCHING ONLY check_violation. The first version
+  -- inserted into a session that Part 2 had ALREADY written a plan for and
+  -- accepted `unique_violation` as success — so the primary-key collision
+  -- satisfied it whatever the CHECK said, and widening the constraint to
+  -- `source is not null` left it green. Found by mutation.
+  insert into screening_v2.call_sessions
+    (candidate_id, role_id, mode, provider, external_call_id, status, current_question_index)
+  select c.id, c.role_id, 'live', 'livekit', 'phone-cqs103-constraint-probe', 'created', 0
+    from screening_v2.candidates c
+   where c.email = 'cqs103-absent@example.test'
+  returning id into v_probe_session;
+
   v_ok := false;
   begin
     insert into screening_v2.phone_session_plans
       (session_id, engagement_id, source, questions, question_count)
-    select s.id, v_eng, 'candidate_resumes', '[{"key":"q1","text":"Q?"}]'::jsonb, 1
-      from screening_v2.call_sessions s
-      join screening_v2.candidates c on c.id = s.candidate_id
-     where c.email = 'cqs103-absent@example.test' limit 1;
+    values (v_probe_session, v_eng, 'candidate_resumes',
+            '[{"key":"q1","text":"Q?"}]'::jsonb, 1);
   exception when check_violation then v_ok := true;
-           when unique_violation then v_ok := true;
   end;
   if not v_ok then
     raise exception 'cqs103/chk: a misspelled plan source was accepted';
   end if;
+  -- And the three real values are all accepted, so the constraint was not
+  -- merely refusing everything.
+  for v_src in select unnest(array['role_template','default','candidate_resume']) loop
+    delete from screening_v2.phone_session_plans where session_id = v_probe_session;
+    insert into screening_v2.phone_session_plans
+      (session_id, engagement_id, source, questions, question_count)
+    values (v_probe_session, v_eng, v_src, '[{"key":"q1","text":"Q?"}]'::jsonb, 1);
+  end loop;
+  delete from screening_v2.phone_session_plans where session_id = v_probe_session;
+  delete from screening_v2.call_sessions where id = v_probe_session;
 
   raise notice 'cqs103/chk: PASS';
 end $$;
