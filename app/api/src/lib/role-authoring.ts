@@ -39,6 +39,7 @@
 import { env } from './env.js';
 import { runClaudeJSONWithProvenance } from './claude.js';
 import { BusinessError } from './provider-resilience.js';
+import { type ScreeningCategory } from '../schemas/roles.js';
 import {
   phoneQuestionIssueMessage,
   validatePhoneQuestionTemplate,
@@ -173,21 +174,68 @@ export const ROLE_DRAFT_OPENING_QUESTION =
  */
 export const ROLE_DRAFT_CLOSING_QUESTIONS = [
   'What is your current annual CTC, including any variable pay?',
-  'What is your expected annual CTC for your next role?',
+  'What is your expected annual CTC for your next role, and how much room is there to negotiate?',
   'What is your notice period, and how soon could you join if things move ahead?',
 ] as const;
 
-/** How many ROLE-SPECIFIC questions the model is asked to write. */
-export const ROLE_DRAFT_QUESTION_COUNT = 4;
+/**
+ * THE COMPARTMENTS A SCREENING CALL MOVES THROUGH.
+ *
+ * A screen is not a flat list of questions; it is a sequence of decisions, and
+ * each one disqualifies differently. Naming them does three things a flat list
+ * cannot: the form can group what the operator is editing, the call runs the
+ * compartments in order (the per-call plan preserves array order, so order IS
+ * the structure — no migration needed), and a later change can regenerate ONE
+ * compartment without touching the rest.
+ *
+ * ASSIGNED STRUCTURALLY, NEVER BY ASKING THE MODEL TO LABEL ITSELF. This file's
+ * standing argument is that a model follows a stated rule most of the time, and
+ * a mis-labelled compartment is invisible — it would look like a correct draft
+ * and quietly put a pay question in the middle of the screen. The generator is
+ * asked for each compartment SEPARATELY and the label comes from which request
+ * the answer came back to.
+ */
+export { SCREENING_CATEGORIES as ROLE_DRAFT_CATEGORIES } from '../schemas/roles.js';
 
-/** What the operator actually ends up with: opener + model's four + closers. */
+export type RoleDraftCategory = ScreeningCategory;
+
+/**
+ * Can this candidate actually work the hours the job runs on?
+ *
+ * FIXED, and asked of everyone. Interview Kickstart screens for roles aligned
+ * to US working hours from India, so "are you willing to work nights" is a
+ * hard qualifier that decides the call regardless of how strong the rest of it
+ * was — and it is the one a recruiter is most likely to forget to ask until
+ * after they have spent forty minutes liking someone.
+ */
+export const ROLE_DRAFT_SHIFT_QUESTION =
+  'This role runs on US hours, so the shift is overnight from India — how do you feel about working nights regularly?';
+
+/** How many PROFILE-RELEVANCE questions the model writes. */
+export const ROLE_DRAFT_RELEVANCE_COUNT = 2;
+/** How many STABILITY questions the model writes. */
+export const ROLE_DRAFT_STABILITY_COUNT = 1;
+
+/** Total the model is asked for, across both of its compartments. */
+export const ROLE_DRAFT_QUESTION_COUNT =
+  ROLE_DRAFT_RELEVANCE_COUNT + ROLE_DRAFT_STABILITY_COUNT;
+
+/** What the operator ends up with: intro + relevance + shift + stability + pay. */
 export const ROLE_DRAFT_TOTAL_QUESTIONS =
-  1 + ROLE_DRAFT_QUESTION_COUNT + ROLE_DRAFT_CLOSING_QUESTIONS.length;
+  1 + ROLE_DRAFT_RELEVANCE_COUNT + 1 + ROLE_DRAFT_STABILITY_COUNT
+  + ROLE_DRAFT_CLOSING_QUESTIONS.length;
 
 export interface RoleDraftQuestion {
   id: string;
   question: string;
   weight: number;
+  /**
+   * Which compartment of the screen this question belongs to.
+   *
+   * Optional because every role authored before this existed has none, and a
+   * question with no category is simply ungrouped rather than invalid.
+   */
+  category?: RoleDraftCategory;
   /**
    * Rendered as `[MUST ASK] ` in the phone worker's prompt
    * (`prompting.py:114`) and prioritised when the call runs long.
@@ -330,19 +378,33 @@ Return ONLY a JSON object with exactly these keys:
 {
   "jd": "a job description of 120-250 words, plain prose, no markdown, no bullet characters",
   "required_skills": ["6 to 10 short skill names, each 1-4 words"],
-  "screening_template": [
+  "profile_relevance": [
+    { "question": "...", "weight": 1 }
+  ],
+  "stability": [
     { "question": "...", "weight": 1 }
   ]
 }
 
-Write ${ROLE_DRAFT_QUESTION_COUNT} screening questions about THE WORK ITSELF.
+The screening call runs in compartments, and you are writing two of them.
+
+"profile_relevance": ${ROLE_DRAFT_RELEVANCE_COUNT} questions that decide whether this
+person can actually DO this job. Ask for specific evidence from their own
+experience — what they have built, sold, handled or owned — not for opinions
+or for what they would do hypothetically.
+
+"stability": ${ROLE_DRAFT_STABILITY_COUNT} question about how long they stay and why they
+move. Ask it as a question about their own history, not as a challenge.
+
+TWO SEPARATE ARRAYS, because each compartment is labelled by which one it came
+back in. Do not merge them and do not add other keys.
 
 The call already opens by asking the candidate to introduce themselves and
-describe their most recent role, and it already ends by asking their current
-CTC, their expected CTC, and their notice period. Those four are added for
-you — do NOT write an introduction question, and do NOT ask about salary, CTC,
-compensation, notice period or availability. Write the middle of the
-conversation: what this person has actually done, and how they did it.
+describe their most recent role; it asks separately about working night hours;
+and it ends with current CTC, expected CTC and notice period. Those five are
+added for you — do NOT write an introduction question, do NOT ask about shifts
+or working hours, and do NOT ask about salary, CTC, compensation, notice period
+or availability.
 
 They are READ ALOUD to a candidate by an automated caller, so each one must:
 - end with a question mark
@@ -385,14 +447,9 @@ function withArc(draft: RoleDraft): RoleDraft {
   // THE MIDDLE IS WHAT GIVES WAY. The opener and the three closers were asked
   // for as "has to" and "always", so they are kept and the model's surplus
   // questions are dropped from the end.
-  // BOUNDED BY WHAT WAS ASKED FOR, not only by the save ceiling. `room` alone
-  // is 96, so "write 4" was a prompt rule with nothing behind it — a model
-  // that wrote six (which is what it wrote last week) produced a ten-question
-  // form and a ten-question call against a ten-minute budget.
-  const room = Math.min(
-    ROLE_DRAFT_QUESTION_COUNT,
-    MAX_QUESTIONS - 1 - ROLE_DRAFT_CLOSING_QUESTIONS.length,
-  );
+  // Each compartment is bounded by its own count below, and the assembled
+  // list is clamped to `MAX_QUESTIONS` so a draft can never pass here and then
+  // fail `createRoleSchema` on Save.
   // DROP WHAT THE ARC ALREADY ASKS. The arc is spliced AFTER
   // `validatePhoneQuestionTemplate`, so a model question that normalises to an
   // arc question is invisible to the pre-arc check and fatal on Save —
@@ -401,30 +458,69 @@ function withArc(draft: RoleDraft): RoleDraft {
   // a salary question, but that is a prompt rule, and this file's own argument
   // is that prompt rules hold only most of the time.
   const arcKeys = new Set(
-    [ROLE_DRAFT_OPENING_QUESTION, ...ROLE_DRAFT_CLOSING_QUESTIONS].map(normalizeSpokenQuestion),
+    [
+      ROLE_DRAFT_OPENING_QUESTION,
+      ROLE_DRAFT_SHIFT_QUESTION,
+      ...ROLE_DRAFT_CLOSING_QUESTIONS,
+    ].map(normalizeSpokenQuestion),
   );
-  const model = draft.screening_template
-    .filter((q) => !arcKeys.has(normalizeSpokenQuestion(q.question)))
-    .slice(0, Math.max(0, room));
-  const texts = [
-    ROLE_DRAFT_OPENING_QUESTION,
-    ...model.map((q) => q.question),
-    ...ROLE_DRAFT_CLOSING_QUESTIONS,
-  ];
-  // The opener and closers carry weight 1: they are asked of every candidate
-  // for every role, so nothing about them discriminates between two people.
-  // The model's own weights survive for the role-specific middle.
-  const weights = [1, ...model.map((q) => q.weight), ...ROLE_DRAFT_CLOSING_QUESTIONS.map(() => 1)];
-  // The opener and the three closers are the ones the owner said "has to" and
-  // "always" about, so they are the ones the worker is told it MUST ask.
-  const lastModelIndex = model.length;
+  const usable = draft.screening_template.filter(
+    (q) => !arcKeys.has(normalizeSpokenQuestion(q.question)),
+  );
+  // EACH COMPARTMENT IS TAKEN FROM ITS OWN BUCKET, and each is bounded on its
+  // own. A model that writes five relevance questions and no stability one
+  // must not silently fill the stability slot with a relevance question — the
+  // compartment would be a lie, and the whole point of naming them is that a
+  // recruiter can trust what each one contains.
+  const relevance = usable
+    .filter((q) => q.category !== 'stability')
+    .slice(0, ROLE_DRAFT_RELEVANCE_COUNT);
+  const stability = usable
+    .filter((q) => q.category === 'stability')
+    .slice(0, ROLE_DRAFT_STABILITY_COUNT);
+
+  // IN CALL ORDER. The per-call plan preserves array order verbatim
+  // (`0044`'s builder copies the array as given), so this sequence IS the
+  // structure of the conversation — no migration required to compartmentalise
+  // it, and no new field for the worker to understand.
+  const sections: Array<{ question: string; weight: number; category: RoleDraftCategory; mandatory: boolean }> = [
+    { question: ROLE_DRAFT_OPENING_QUESTION, weight: 1, category: 'introduction' as const, mandatory: true },
+    ...relevance.map((q) => ({
+      question: q.question,
+      weight: q.weight,
+      category: 'profile_relevance' as const,
+      mandatory: false,
+    })),
+    { question: ROLE_DRAFT_SHIFT_QUESTION, weight: 1, category: 'shift_fit' as const, mandatory: true },
+    ...stability.map((q) => ({
+      question: q.question,
+      weight: q.weight,
+      category: 'stability' as const,
+      mandatory: false,
+    })),
+    ...ROLE_DRAFT_CLOSING_QUESTIONS.map((question) => ({
+      question,
+      weight: 1,
+      category: 'compensation' as const,
+      mandatory: true,
+    })),
+  ].slice(0, MAX_QUESTIONS);
+
+  // The fixed questions carry weight 1: they are asked of every candidate for
+  // every role, so nothing about them discriminates between two people. The
+  // model's own weights survive for the two compartments it wrote.
+  //
+  // MANDATORY is the fixed set: intro, shift fit and the three pay questions.
+  // Those are the ones that decide whether the pipeline moves at all, and
+  // `prompting.py` prioritises them when a call runs against its budget.
   return {
     ...draft,
-    screening_template: texts.map((question, i) => ({
+    screening_template: sections.map((section, i) => ({
       id: `q${i + 1}`,
-      question,
-      weight: weights[i] ?? 1,
-      mandatory: i === 0 || i > lastModelIndex,
+      question: section.question,
+      weight: section.weight,
+      mandatory: section.mandatory,
+      category: section.category,
     })),
   };
 }
@@ -444,6 +540,13 @@ const MAX_WEIGHT = 100;
 const MIN_QUESTIONS = 3;
 
 /** Shape-check AND clamp the model's output before it is trusted for anything. */
+/** One compartment's worth of raw model output, if it is an array at all. */
+function asQuestionArray(value: unknown): Array<Record<string, unknown>> {
+  return Array.isArray(value)
+    ? value.filter((v): v is Record<string, unknown> => Boolean(v) && typeof v === 'object')
+    : [];
+}
+
 function coerceDraft(raw: unknown): RoleDraft | null {
   if (!raw || typeof raw !== 'object') return null;
   const obj = raw as Record<string, unknown>;
@@ -485,7 +588,25 @@ function coerceDraft(raw: unknown): RoleDraft | null {
     : [];
   if (skills.length === 0) return null;
 
-  const rawQuestions = Array.isArray(obj.screening_template) ? obj.screening_template : [];
+  // TWO NAMED ARRAYS, with the OLD FLAT SHAPE as a fallback.
+  //
+  // The compartment a question belongs to is decided by which array it arrived
+  // in, so the label cannot be wrong in the way a self-reported `category`
+  // field could be. The fallback matters because the shape is the model's to
+  // get wrong: a run that answers with the old `screening_template` still
+  // produces a usable draft rather than failing the whole ten-minute wait, and
+  // those questions are treated as profile relevance, which is what a flat
+  // list of role questions has always been.
+  const named = [
+    ...asQuestionArray(obj.profile_relevance).map((q) => ({ ...q, category: 'profile_relevance' as const })),
+    ...asQuestionArray(obj.stability).map((q) => ({ ...q, category: 'stability' as const })),
+  ];
+  const rawQuestions = named.length > 0
+    ? named
+    : asQuestionArray(obj.screening_template).map((q) => ({
+      ...q,
+      category: 'profile_relevance' as const,
+    }));
   const questions: RoleDraftQuestion[] = [];
   rawQuestions.forEach((entry, i) => {
     const q = entry && typeof entry === 'object' ? (entry as Record<string, unknown>) : {};
@@ -500,7 +621,12 @@ function coerceDraft(raw: unknown): RoleDraft | null {
     // Ids are OURS, never the model's: the save path rejects duplicate keys,
     // and a model that repeats "q1" would fail a gate for a reason that has
     // nothing to do with the question.
-    questions.push({ id: `q${i + 1}`, question: text, weight });
+    questions.push({
+      id: `q${i + 1}`,
+      question: text,
+      weight,
+      category: (entry as { category?: RoleDraftCategory }).category,
+    });
   });
 
   // A FLOOR, not just a non-empty check. A model that returns six entries of
@@ -638,8 +764,15 @@ export async function generateRoleDraft(
     if (!draft) {
       lastShapeFailure = true;
       rejectedCount = 0;
+      // NAMES THE SHAPE THE PROMPT ASKS FOR, which is no longer a flat
+      // `screening_template`. This string is fed back verbatim as the repair
+      // instruction, so while it said "a non-empty screening_template array"
+      // it was telling the model to answer in the legacy flat shape — which
+      // `coerceDraft` accepts and labels ENTIRELY `profile_relevance`, leaving
+      // the stability compartment empty with nothing to show for it. A retry
+      // that obeys the repair line must land in the compartmented shape.
       failures = [
-        'The response was not a JSON object carrying a non-empty "jd", a non-empty "required_skills" array, and a non-empty "screening_template" array.',
+        'The response was not a JSON object carrying a non-empty "jd", a non-empty "required_skills" array, and the two question arrays "profile_relevance" and "stability".',
       ];
       continue;
     }

@@ -26,7 +26,13 @@ import {
   REPHRASE_MAX_ATTEMPTS,
   REPHRASE_TIMEOUT_MS,
 } from '../lib/role-authoring.js';
+import {
+  ROLE_DRAFT_SHIFT_QUESTION,
+  ROLE_DRAFT_RELEVANCE_COUNT,
+  ROLE_DRAFT_STABILITY_COUNT,
+} from '../lib/role-authoring.js';
 import { validatePhoneQuestion } from '../lib/phone-screening/question-validation.js';
+import { createRoleSchema } from '../schemas/roles.js';
 
 /** Four role-specific questions, all of which pass the gate. */
 const modelQuestions = [
@@ -40,7 +46,8 @@ function goodDraft() {
   return {
     jd: 'A job description with enough prose to be usable.',
     required_skills: ['Communication', 'Sales'],
-    screening_template: modelQuestions.map((question) => ({ question, weight: 1 })),
+    profile_relevance: modelQuestions.slice(0, 2).map((question) => ({ question, weight: 1 })),
+    stability: [{ question: modelQuestions[2], weight: 1 }],
   };
 }
 
@@ -136,8 +143,13 @@ describe('generateRoleDraft wraps the model in that arc', () => {
     expect(texts.slice(-ROLE_DRAFT_CLOSING_QUESTIONS.length)).toEqual([
       ...ROLE_DRAFT_CLOSING_QUESTIONS,
     ]);
-    // The model's own questions are the MIDDLE, in the order it wrote them.
-    expect(texts.slice(1, 1 + modelQuestions.length)).toEqual(modelQuestions);
+    // The model's questions are the two middle compartments, in the order it
+    // wrote them, with the fixed shift question sitting between them.
+    expect(texts.slice(1, 1 + ROLE_DRAFT_RELEVANCE_COUNT)).toEqual(
+      modelQuestions.slice(0, ROLE_DRAFT_RELEVANCE_COUNT),
+    );
+    expect(texts[1 + ROLE_DRAFT_RELEVANCE_COUNT]).toBe(ROLE_DRAFT_SHIFT_QUESTION);
+    expect(texts[2 + ROLE_DRAFT_RELEVANCE_COUNT]).toBe(modelQuestions[2]);
   });
 
   it('re-issues ids across the whole list, or the save path rejects it', async () => {
@@ -167,8 +179,11 @@ describe('generateRoleDraft wraps the model in that arc', () => {
     const infer = vi.fn().mockResolvedValue(goodDraft());
     await generateRoleDraft('Sales Advisor', { infer });
     const prompt = infer.mock.calls[0][0] as string;
-    expect(prompt).toContain(`Write ${ROLE_DRAFT_QUESTION_COUNT} screening questions`);
+    // NAMED COMPARTMENTS, and the counts it is held to.
+    expect(prompt).toContain(`"profile_relevance": ${ROLE_DRAFT_RELEVANCE_COUNT} questions`);
+    expect(prompt).toContain(`"stability": ${ROLE_DRAFT_STABILITY_COUNT} question`);
     expect(prompt).toMatch(/do NOT write an introduction question/i);
+    expect(prompt).toMatch(/do NOT ask about shifts\s+or working hours/i);
     expect(prompt).toMatch(/do NOT ask about salary, CTC/i);
   });
 
@@ -189,11 +204,14 @@ describe('generateRoleDraft wraps the model in that arc', () => {
     const { draft } = await generateRoleDraft('Sales Advisor', { infer });
     const texts = draft.screening_template.map((q) => q.question);
 
-    // BOUNDED BY WHAT WAS ASKED FOR. "Write 4" is a prompt rule with nothing
-    // behind it, and the model wrote six last week — which would have been a
-    // ten-question form and a ten-question call against a ten-minute budget.
-    expect(texts).toHaveLength(ROLE_DRAFT_TOTAL_QUESTIONS);
+    // BOUNDED PER COMPARTMENT. A count in the prompt is a rule with nothing
+    // behind it; the model wrote six last week. Flooding `profile_relevance`
+    // fills only that compartment — the stability slot stays EMPTY rather than
+    // being padded with relevance questions, so the total is one short of the
+    // full arc and every fixed question is still present and in order.
+    expect(texts.length).toBeLessThan(ROLE_DRAFT_TOTAL_QUESTIONS);
     expect(texts[0]).toBe(ROLE_DRAFT_OPENING_QUESTION);
+    expect(texts).toContain(ROLE_DRAFT_SHIFT_QUESTION);
     expect(texts.slice(-ROLE_DRAFT_CLOSING_QUESTIONS.length)).toEqual([
       ...ROLE_DRAFT_CLOSING_QUESTIONS,
     ]);
@@ -220,6 +238,34 @@ describe('generateRoleDraft wraps the model in that arc', () => {
     expect(new Set(texts).size).toBe(texts.length);
   });
 
+  it('DROPS a model question the arc already asks — including the SHIFT one', async () => {
+    // This PR added `ROLE_DRAFT_SHIFT_QUESTION` to `arcKeys`, and removing it
+    // again left all 6095 API tests green: the test above feeds back only the
+    // OPENER. The prompt's "do NOT ask about shifts or working hours" is a
+    // prompt rule, and this file's standing argument is that those hold only
+    // most of the time — when one is missed the duplicate is a template-level
+    // `duplicate_text` and `createRoleSchema` refuses the WHOLE role on Save.
+    const infer = vi.fn().mockResolvedValue({
+      jd: 'A job description with enough prose to be usable.',
+      required_skills: ['Sales'],
+      profile_relevance: [
+        { question: ROLE_DRAFT_SHIFT_QUESTION, weight: 1 },
+        ...modelQuestions.slice(0, 2).map((question) => ({ question, weight: 1 })),
+      ],
+      stability: [{ question: 'How long did you stay in your last two jobs?', weight: 1 }],
+    });
+    const { draft } = await generateRoleDraft('Sales Advisor', { infer });
+    const texts = draft.screening_template.map((q) => q.question);
+
+    expect(texts.filter((t) => t === ROLE_DRAFT_SHIFT_QUESTION)).toHaveLength(1);
+    expect(new Set(texts).size).toBe(texts.length);
+    // And it is still the arc's own copy, in the arc's own slot — dropping the
+    // model's duplicate must not cost the compartment its question.
+    expect(draft.screening_template.find((q) => q.category === 'shift_fit')?.question).toBe(
+      ROLE_DRAFT_SHIFT_QUESTION,
+    );
+  });
+
   it('MARKS THE ARC MANDATORY, or the worker is free to skip it', async () => {
     // `format_questions` (prompting.py:114) renders `[MUST ASK] ` only for a
     // question carrying this flag, inside a system prompt that says to cover
@@ -237,9 +283,16 @@ describe('generateRoleDraft wraps the model in that arc', () => {
     expect(flags.slice(-ROLE_DRAFT_CLOSING_QUESTIONS.length)).toEqual(
       ROLE_DRAFT_CLOSING_QUESTIONS.map(() => true),
     );
-    // The model's own questions are NOT mandatory — flagging everything would
-    // make the priority signal meaningless.
-    expect(flags.slice(1, 1 + modelQuestions.length)).toEqual(modelQuestions.map(() => false));
+    // The shift question is a hard qualifier, so it is mandatory too.
+    const shiftIndex = draft.screening_template.findIndex((q) => q.category === 'shift_fit');
+    expect(flags[shiftIndex]).toBe(true);
+    // The model's own compartments are NOT mandatory — flagging everything
+    // would make the priority signal meaningless.
+    for (const q of draft.screening_template) {
+      if (q.category === 'profile_relevance' || q.category === 'stability') {
+        expect(q.mandatory === true, q.question).toBe(false);
+      }
+    }
   });
 
   it('does NOT spend the repair budget on sentences the model never wrote', async () => {
@@ -251,9 +304,9 @@ describe('generateRoleDraft wraps the model in that arc', () => {
       .fn()
       .mockResolvedValueOnce({
         ...goodDraft(),
-        screening_template: [
+        profile_relevance: [
           { question: 'What is your system administration experience?', weight: 1 },
-          ...modelQuestions.slice(1).map((question) => ({ question, weight: 1 })),
+          { question: modelQuestions[1], weight: 1 },
         ],
       })
       .mockResolvedValueOnce(goodDraft());
@@ -397,5 +450,169 @@ describe('rephraseQuestion — the way out of an unforgiving gate', () => {
       .mockResolvedValueOnce({ question: 'Which deal that you closed are you proudest of?' });
     const out = await rephraseQuestion('deals', { infer });
     expect(out).toBe('Which deal that you closed are you proudest of?');
+  });
+});
+
+describe('the call runs in compartments', () => {
+  // ORDER IS THE STRUCTURE. `0044`'s plan builder copies `screening_template`
+  // verbatim, in order, so the sequence below IS how the conversation runs —
+  // no migration, and nothing new for the worker to understand.
+  it('assembles intro -> relevance -> shift -> stability -> pay', async () => {
+    const infer = vi.fn().mockResolvedValue(goodDraft());
+    const { draft } = await generateRoleDraft('Sales Advisor', { infer });
+    const categories = draft.screening_template.map((q) => q.category);
+
+    expect(categories).toEqual([
+      'introduction',
+      ...Array(ROLE_DRAFT_RELEVANCE_COUNT).fill('profile_relevance'),
+      'shift_fit',
+      ...Array(ROLE_DRAFT_STABILITY_COUNT).fill('stability'),
+      'compensation',
+      'compensation',
+      'compensation',
+    ]);
+  });
+
+  it('LABELS BY WHICH ARRAY IT CAME BACK IN, not by asking the model', async () => {
+    // A self-reported `category` field would be wrong in exactly the way that
+    // is invisible: a correct-looking draft with a pay question sitting in the
+    // middle of the screen. The compartment is decided by which request the
+    // answer arrived in, so the model cannot mislabel it.
+    const infer = vi.fn().mockResolvedValue({
+      ...goodDraft(),
+      // THE PLANTED VALUE MUST BE `stability`, and an earlier version of this
+      // test planted 'compensation' instead — which is INERT. `withArc` buckets
+      // on exactly one comparison, `q.category === 'stability'`, and overwrites
+      // the label from the bucket afterwards, so a planted 'compensation'
+      // changes nothing and the test passed even when the model's self-report
+      // was allowed to win. Proven by mutation: spreading the model object over
+      // the structural label kept all 30 tests green.
+      profile_relevance: [
+        { question: 'What does your current role involve day to day?', weight: 1, category: 'stability' },
+        { question: 'How do you handle an unhappy customer?', weight: 1 },
+      ],
+      stability: [{ question: 'How long did you stay in your last two jobs?', weight: 1 }],
+    });
+    const { draft } = await generateRoleDraft('Sales Advisor', { infer });
+    const relevance = draft.screening_template.filter((q) => q.category === 'profile_relevance');
+    expect(relevance).toHaveLength(ROLE_DRAFT_RELEVANCE_COUNT);
+    expect(relevance[0].question).toBe('What does your current role involve day to day?');
+    // And the compartment the model tried to claim still holds the question
+    // that actually came back in the `stability` array — if the self-report
+    // won, this is the relevance question instead, and the genuine stability
+    // question is dropped entirely.
+    const stability = draft.screening_template.filter((q) => q.category === 'stability');
+    expect(stability).toHaveLength(ROLE_DRAFT_STABILITY_COUNT);
+    expect(stability[0].question).toBe('How long did you stay in your last two jobs?');
+  });
+
+  it('BOUNDS THE STABILITY COMPARTMENT TOO, not only relevance', async () => {
+    // The mirror of the flood test above, and it was missing: every flood
+    // fixture in this file filled `profile_relevance`, so nothing ever put
+    // more than one entry in `stability` and the `.slice()` bounding it could
+    // be DELETED with all 6095 API tests green. A model answering with forty
+    // stability questions then produced a 47-question call.
+    const infer = vi.fn().mockResolvedValue({
+      jd: 'A job description with enough prose to be usable.',
+      required_skills: ['Sales'],
+      profile_relevance: modelQuestions.slice(0, 2).map((question) => ({ question, weight: 1 })),
+      stability: Array.from({ length: 40 }, (_, i) => ({
+        question: `How long did you stay in the role before number ${i}?`,
+        weight: 1,
+      })),
+    });
+    const { draft } = await generateRoleDraft('Sales Advisor', { infer });
+
+    expect(draft.screening_template).toHaveLength(ROLE_DRAFT_TOTAL_QUESTIONS);
+    expect(
+      draft.screening_template.filter((q) => q.category === 'stability'),
+    ).toHaveLength(ROLE_DRAFT_STABILITY_COUNT);
+    // The surplus must come off the MIDDLE, never off the pay questions.
+    expect(
+      draft.screening_template.slice(-ROLE_DRAFT_CLOSING_QUESTIONS.length).map((q) => q.question),
+    ).toEqual([...ROLE_DRAFT_CLOSING_QUESTIONS]);
+  });
+
+  it('NEVER FILLS THE STABILITY SLOT with a relevance question', async () => {
+    // A model that writes five relevance questions and no stability one must
+    // leave the compartment empty rather than have it quietly mean something
+    // else — the whole value of naming them is that a recruiter can trust what
+    // each one contains.
+    const infer = vi.fn().mockResolvedValue({
+      jd: 'A job description with enough prose to be usable.',
+      required_skills: ['Sales'],
+      profile_relevance: modelQuestions.map((question) => ({ question, weight: 1 })),
+      stability: [],
+    });
+    const { draft } = await generateRoleDraft('Sales Advisor', { infer });
+    expect(draft.screening_template.filter((q) => q.category === 'stability')).toHaveLength(0);
+    expect(
+      draft.screening_template.filter((q) => q.category === 'profile_relevance'),
+    ).toHaveLength(ROLE_DRAFT_RELEVANCE_COUNT);
+  });
+
+  it('ACCEPTS THE OLD FLAT SHAPE rather than wasting the whole wait', async () => {
+    // The response shape is the model's to get wrong. A run that answers with
+    // the old `screening_template` still produces a usable draft; those
+    // questions are profile relevance, which is what a flat list of role
+    // questions has always been.
+    const infer = vi.fn().mockResolvedValue({
+      jd: 'A job description with enough prose to be usable.',
+      required_skills: ['Sales'],
+      screening_template: modelQuestions.map((question) => ({ question, weight: 1 })),
+    });
+    const { draft } = await generateRoleDraft('Sales Advisor', { infer });
+    expect(draft.screening_template.some((q) => q.category === 'profile_relevance')).toBe(true);
+    expect(draft.screening_template[0].category).toBe('introduction');
+  });
+
+  it('the SHIFT question is speakable and is asked of everyone', () => {
+    // Fixed, and mandatory: a candidate who cannot work US hours is a no
+    // regardless of how strong the rest of the call was, and it is the
+    // question a recruiter most often leaves until after they already like
+    // someone.
+    expect(validatePhoneQuestion(ROLE_DRAFT_SHIFT_QUESTION)).toEqual([]);
+
+    // AND IT ASKS WHAT IT IS NAMED FOR. Speakability was the only assertion on
+    // the one question this work adds, so it could be replaced with "What is
+    // your current annual CTC in your present job?" — a pay question sitting in
+    // the shift compartment, asking CTC twice and never asking about nights —
+    // with every test in the repository still green. Every other fixed question
+    // here carries a meaning-level assertion; this restores the parity.
+    expect(ROLE_DRAFT_SHIFT_QUESTION.toLowerCase()).toMatch(/night|overnight|shift/);
+    // It must NOT read as a compensation objective: `phone_answer_covers_
+    // objective` keys on ctc/salary/compensation/package, and a shift question
+    // carrying one of those words with no `current`/`expected` slot would be
+    // treated as answered by anything at all and never asked.
+    expect(ROLE_DRAFT_SHIFT_QUESTION.toLowerCase()).not.toMatch(
+      /\b(?:ctc|salary|compensation|package)\b/,
+    );
+  });
+
+  it('the EXPECTED-CTC question asks for negotiating room and keeps its token', async () => {
+    // The owner asked for room to negotiate. The clause must not cost the
+    // `expected` token — without it `phone_answer_covers_objective` treats the
+    // question as answered by anything at all and it is never asked.
+    const expected = ROLE_DRAFT_CLOSING_QUESTIONS[1];
+    expect(expected).toMatch(/\bexpected\b/i);
+    expect(expected.toLowerCase()).toContain('negotiate');
+    expect(validatePhoneQuestion(expected)).toEqual([]);
+  });
+
+  it('the whole compartmented draft still passes the SAVE schema', async () => {
+    // `screeningQuestionSchema` is `.strict()`, so an unknown `category` would
+    // not be ignored — it would fail Save minutes after the operator waited.
+    const infer = vi.fn().mockResolvedValue(goodDraft());
+    const { draft } = await generateRoleDraft('Sales Advisor', { infer });
+    expect(() => createRoleSchema.parse({ title: 'Sales Advisor', ...draft })).not.toThrow();
+  });
+
+  it('every fixed compartment question is MANDATORY, and the model\'s are not', async () => {
+    const infer = vi.fn().mockResolvedValue(goodDraft());
+    const { draft } = await generateRoleDraft('Sales Advisor', { infer });
+    for (const q of draft.screening_template) {
+      const fixed = q.category === 'introduction' || q.category === 'shift_fit' || q.category === 'compensation';
+      expect(q.mandatory === true, `${q.category}: ${q.question}`).toBe(fixed);
+    }
   });
 });

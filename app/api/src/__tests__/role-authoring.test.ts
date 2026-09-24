@@ -22,6 +22,8 @@ import {
   ROLE_DRAFT_MAX_ATTEMPTS,
   ROLE_DRAFT_MIN_TIMEOUT_MS,
   ROLE_DRAFT_QUESTION_COUNT,
+  ROLE_DRAFT_RELEVANCE_COUNT,
+  ROLE_DRAFT_STABILITY_COUNT,
   ROLE_DRAFT_CLOSING_QUESTIONS,
 } from '../lib/role-authoring.js';
 import {
@@ -246,10 +248,17 @@ describe('generateRoleDraft — nothing unspeakable escapes', () => {
   it('asks for a stated number of questions', async () => {
     // Unasserted anywhere before, so `= 1` or deleting the sentence was green
     // and a one-question screening template shipped as a success.
-    expect(ROLE_DRAFT_QUESTION_COUNT).toBeGreaterThanOrEqual(4);
+    //
+    // PER COMPARTMENT NOW. The model writes two compartments rather than one
+    // flat list, so the prompt states a count for each — a single total would
+    // no longer say what it has to produce.
+    expect(ROLE_DRAFT_RELEVANCE_COUNT).toBeGreaterThanOrEqual(2);
+    expect(ROLE_DRAFT_STABILITY_COUNT).toBeGreaterThanOrEqual(1);
     const infer = vi.fn().mockResolvedValue(goodDraft());
     await generateRoleDraft('Any', { infer });
-    expect(infer.mock.calls[0][0]).toContain(`Write ${ROLE_DRAFT_QUESTION_COUNT} screening questions`);
+    const prompt = infer.mock.calls[0][0] as string;
+    expect(prompt).toContain(`"profile_relevance": ${ROLE_DRAFT_RELEVANCE_COUNT} questions`);
+    expect(prompt).toContain(`"stability": ${ROLE_DRAFT_STABILITY_COUNT} question`);
   });
 
   it('assigns its OWN question ids, never the model’s', async () => {

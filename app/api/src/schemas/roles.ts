@@ -2,6 +2,24 @@ import { z } from 'zod';
 import { idParamSchema } from './common.js';
 import { phoneQuestionIssueMessage, validatePhoneQuestionTemplate } from '../lib/phone-screening/question-validation.js';
 
+/**
+ * The compartments a screening call moves through, in call order.
+ *
+ * DECLARED HERE, at the boundary that validates them, and imported by the
+ * generator — not the other way round. `screeningQuestionSchema` is `.strict()`,
+ * so a category the schema does not know is not "ignored", it fails the whole
+ * Save minutes after the operator waited for the draft. One list, one place.
+ */
+export const SCREENING_CATEGORIES = [
+  'introduction',
+  'profile_relevance',
+  'shift_fit',
+  'stability',
+  'compensation',
+] as const;
+
+export type ScreeningCategory = (typeof SCREENING_CATEGORIES)[number];
+
 const screeningQuestionSchema = z
   .object({
     id: z.string().trim().min(1).max(100),
@@ -9,6 +27,9 @@ const screeningQuestionSchema = z
     weight: z.number().finite().nonnegative().max(100).optional(),
     follow_up_hint: z.string().trim().max(2_000).optional(),
     mandatory: z.boolean().optional(),
+    // OPTIONAL, because every role authored before compartments existed has
+    // none — an uncategorised question is ungrouped, not invalid.
+    category: z.enum(SCREENING_CATEGORIES).optional(),
   })
   .strict();
 

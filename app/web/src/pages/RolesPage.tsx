@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../api";
-import type { Role, RoleInput, ScreeningQuestion } from "../types";
+import { sectionHeading } from "../types";
+import type { Role, RoleInput, ScreeningCategory, ScreeningQuestion } from "../types";
 import {
   Button,
   EmptyPanel,
@@ -36,6 +37,8 @@ interface QuestionRow {
    * says to cover the bank "where relevant".
    */
   mandatory?: boolean;
+  /** Which compartment this question belongs to; absent on older roles. */
+  category?: ScreeningCategory;
 }
 
 function emptyQuestion(index: number): QuestionRow {
@@ -353,6 +356,7 @@ function RoleForm({
       id: q.id,
       question: q.question,
       weight: q.weight,
+      category: q.category,
       // CARRIED THROUGH THE EDIT ROUND TRIP. `PUT /api/roles/:id` replaces
       // `screening_template` wholesale, and this map is what it is rebuilt
       // from — so dropping the flag here meant opening a role to fix a typo
@@ -502,6 +506,7 @@ function RoleForm({
         // sending `mandatory: false` on every hand-written question would
         // write a claim the operator never made.
         ...(q.mandatory ? { mandatory: true } : {}),
+        ...(q.category ? { category: q.category } : {}),
       }));
 
     const body: RoleInput = {
@@ -640,6 +645,7 @@ function RoleForm({
                 question: q.question,
                 weight: q.weight ?? 1,
                 mandatory: q.mandatory === true,
+                category: q.category,
               })),
             );
             const rephrased =
@@ -739,8 +745,36 @@ function RoleForm({
           <div className="mt-3 space-y-3">
             {questions.map((q, idx) => {
               const issue = spokenQuestionIssue(q.question, questions, idx);
+              // A HEADING WHEN THE COMPARTMENT CHANGES, not a nested list.
+              // The order of this array IS the order of the call — the plan
+              // builder copies it verbatim — so grouping by re-ordering the
+              // rows would silently re-order the conversation. The rows stay
+              // exactly as they will be asked; the heading just says where one
+              // compartment ends and the next begins.
+              //
+              // THE LABEL IS LOOKED UP BEFORE THE HEADING IS DECIDED, because
+              // the category arrives off the wire and the lookup is typed as
+              // total but is not. A compartment this build does not know would
+              // otherwise render an EMPTY `<h4>` — invisible on screen, an
+              // `empty-heading` violation to a screen reader, and a lie about
+              // where the compartment boundary is. Unknown means unlabelled
+              // means no heading.
+              //
+              // The uncategorised TAIL gets its own break rather than falling
+              // under the previous heading. Pressing "Add question" on a
+              // compartmented role appends a row with no category, and sitting
+              // it silently under "Compensation and notice" would tell the
+              // recruiter their new question belongs to a compartment it has
+              // nothing to do with.
+              const label = sectionHeading(q.category, questions[idx - 1]?.category);
               return (
-                <div key={idx} className="glass-sunken space-y-3 p-3">
+                <div key={idx} className="space-y-3">
+                  {label && (
+                    <h4 className="pt-1 text-xs font-semibold uppercase tracking-wide text-ink-tertiary">
+                      {label}
+                    </h4>
+                  )}
+                <div className="glass-sunken space-y-3 p-3">
                   <div className="flex items-center justify-between gap-2">
                     <span className="font-mono text-[11px] text-ink-tertiary">
                       {q.id || `q${idx + 1}`}
@@ -843,6 +877,7 @@ function RoleForm({
                       )}
                     </Field>
                   </div>
+                </div>
                 </div>
               );
             })}
