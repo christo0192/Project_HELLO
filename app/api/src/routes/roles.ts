@@ -321,3 +321,130 @@ rolesRouter.put(
     res.json(data);
   },
 );
+
+/**
+ * Remove a role — by ARCHIVING it when anything depends on it, and only
+ * deleting outright when nothing does.
+ *
+ * WHY NOT A PLAIN DELETE. `screening_v2.roles` is referenced six ways, and the
+ * foreign keys disagree about what should happen:
+ *
+ *   candidates.role_id          on delete SET NULL
+ *   sessions.role_id            on delete SET NULL
+ *   assessments / phone rows    on delete SET NULL
+ *   role_scorecards             on delete CASCADE
+ *   ashby_job_mappings.role_id  on delete RESTRICT   (and NOT NULL)
+ *
+ * So a hard delete would silently detach every candidate who ever applied for
+ * this job from the job they applied for — the record would still exist and
+ * would no longer say what it was for — and it would cascade away the
+ * scorecard the historical assessments were scored against. That is not a
+ * delete, it is quiet history loss, and "poor product management" is the
+ * charge this endpoint is answering rather than earning.
+ *
+ * The rule, therefore:
+ *   - referenced by an Ashby mapping -> 409, name it, change nothing. The
+ *     database would refuse anyway (RESTRICT); answering with the reason is
+ *     more useful than surfacing a constraint error.
+ *   - referenced by candidates or sessions -> ARCHIVE (`is_active = false`).
+ *     It leaves the roles list, stops being offered anywhere new, and every
+ *     historical record still says which job it belonged to.
+ *   - referenced by nothing -> DELETE. A role created by mistake, or an Ask
+ *     Hello draft saved and thought better of, genuinely goes away.
+ *
+ * The response says which of the three happened, because "gone from the list"
+ * looks identical to the operator and the difference matters when they come
+ * back looking for it.
+ */
+rolesRouter.delete(
+  '/:id',
+  requireRole('interviewer'),
+  validateParams(roleIdParamSchema),
+  async (req, res, next) => {
+    const roleId = req.params.id;
+    const isInterviewer = req.authUser?.appRole === 'interviewer';
+
+    // OWNERSHIP FIRST, and as its own read. Every branch below has to be
+    // scoped to a role this caller may touch, and doing it once here keeps a
+    // later branch from forgetting.
+    let owned = supabase.from('roles').select('id').eq('id', roleId);
+    if (isInterviewer) owned = owned.eq('owner_id', req.authUser!.id);
+    const { data: role, error: roleError } = await owned.maybeSingle();
+    if (roleError) return next(roleError);
+    if (!role) return res.status(404).json({ error: 'Role not found' });
+
+    // An Ashby mapping is a hard stop in the database, so it is a hard stop
+    // here — with the reason spelled out rather than a 500 from a constraint.
+    const { count: mappingCount, error: mappingError } = await supabase
+      .from('ashby_job_mappings')
+      .select('id', { count: 'exact', head: true })
+      .eq('role_id', roleId);
+    if (mappingError) return next(mappingError);
+    if ((mappingCount ?? 0) > 0) {
+      return res.status(409).json({
+        error: {
+          type: 'conflict',
+          message:
+            'This role is mapped to an Ashby job. Remove the mapping in Ashby Mission Control first.',
+        },
+      });
+    }
+
+    const { count: candidateCount, error: candidateError } = await supabase
+      .from('candidates')
+      .select('id', { count: 'exact', head: true })
+      .eq('role_id', roleId);
+    if (candidateError) return next(candidateError);
+
+    const { count: sessionCount, error: sessionError } = await supabase
+      .from('sessions')
+      .select('id', { count: 'exact', head: true })
+      .eq('role_id', roleId);
+    if (sessionError) return next(sessionError);
+
+    const referenced = (candidateCount ?? 0) > 0 || (sessionCount ?? 0) > 0;
+
+    if (referenced) {
+      let archive = supabase.from('roles').update({ is_active: false }).eq('id', roleId);
+      if (isInterviewer) archive = archive.eq('owner_id', req.authUser!.id);
+      const { data, error } = await archive.select('id').maybeSingle();
+      if (error) return next(error);
+      if (!data) return res.status(404).json({ error: 'Role not found' });
+      try {
+        await recordAudit(req, 'resource.update', 200, {
+          metadata: { role_id: roleId, action: 'archive' },
+        });
+      } catch {
+        return res.status(500).json({
+          error: { type: 'internal_error', message: 'Internal server error' },
+        });
+      }
+      return res.json({
+        outcome: 'archived',
+        reason: 'candidates_or_sessions_exist',
+        candidates: candidateCount ?? 0,
+        sessions: sessionCount ?? 0,
+      });
+    }
+
+    let remove = supabase.from('roles').delete().eq('id', roleId);
+    if (isInterviewer) remove = remove.eq('owner_id', req.authUser!.id);
+    const { data: deleted, error: deleteError } = await remove.select('id').maybeSingle();
+    if (deleteError) return next(deleteError);
+    if (!deleted) return res.status(404).json({ error: 'Role not found' });
+
+    // AUDITED FAIL-CLOSED, like every other mutation here: a delete whose
+    // record was lost is the one an operator will most want to look up.
+    try {
+      await recordAudit(req, 'resource.delete', 200, {
+        metadata: { role_id: roleId },
+      });
+    } catch {
+      return res.status(500).json({
+        error: { type: 'internal_error', message: 'Internal server error' },
+      });
+    }
+
+    return res.json({ outcome: 'deleted' });
+  },
+);

@@ -65,8 +65,37 @@ describe('the fixed arc survives the real phone gate', () => {
     expect(ROLE_DRAFT_OPENING_QUESTION.toLowerCase()).toContain('recent role');
     const closers = ROLE_DRAFT_CLOSING_QUESTIONS.join(' ').toLowerCase();
     expect(closers).toContain('current annual ctc');
-    expect(closers).toContain('looking for');
+    expect(closers).toContain('expected annual ctc');
     expect(closers).toContain('notice period');
+  });
+
+  it('carries the TOKENS THE PHONE WORKER KEYS ON, not just the meaning', () => {
+    // THE WORDING IS COUPLED TO A PYTHON PREDICATE, and nothing in TypeScript
+    // makes that visible. `phone_answer_covers_objective` (phone.py:7793)
+    // treats any text containing ctc/salary/compensation/package as a
+    // compensation objective, then decides what an answer must contain by
+    // reading the OBJECTIVE's own words:
+    //
+    //     needs_current  = /\bcurrent\b/         needs_expected = /\bexpected|expectation/
+    //
+    // A compensation question with NEITHER word is "covered" by every answer,
+    // including an empty one. The second closer was first written "What annual
+    // CTC are you looking for in your next position?", and the contiguous
+    // forward-skip at agent.py:5586 therefore marked it answered off the back
+    // of the CURRENT-CTC reply and never asked it — on every call, for every
+    // role. Verified against the real predicate before and after.
+    //
+    // This test is the tripwire for that coupling. Rewording a closer is fine;
+    // dropping the token its consumer keys on is not.
+    const [current, expected, notice] = ROLE_DRAFT_CLOSING_QUESTIONS;
+    expect(current).toMatch(/\bcurrent\b/i);
+    expect(expected).toMatch(/\bexpected\b|\bexpectation/i);
+    // Both are compensation objectives to the worker, so both need their token.
+    for (const q of [current, expected]) {
+      expect(q).toMatch(/\b(?:ctc|salary|compensation|package)\b/i);
+    }
+    // The notice closer keys on a different branch entirely.
+    expect(notice).toMatch(/\b(?:notice period|available|availability|start)\b/i);
   });
 });
 
@@ -134,11 +163,57 @@ describe('generateRoleDraft wraps the model in that arc', () => {
     const { draft } = await generateRoleDraft('Sales Advisor', { infer });
     const texts = draft.screening_template.map((q) => q.question);
 
-    expect(texts.length).toBeLessThanOrEqual(100);
+    // BOUNDED BY WHAT WAS ASKED FOR. "Write 4" is a prompt rule with nothing
+    // behind it, and the model wrote six last week — which would have been a
+    // ten-question form and a ten-question call against a ten-minute budget.
+    expect(texts).toHaveLength(ROLE_DRAFT_TOTAL_QUESTIONS);
     expect(texts[0]).toBe(ROLE_DRAFT_OPENING_QUESTION);
     expect(texts.slice(-ROLE_DRAFT_CLOSING_QUESTIONS.length)).toEqual([
       ...ROLE_DRAFT_CLOSING_QUESTIONS,
     ]);
+  });
+
+  it('DROPS a model question the arc already asks', async () => {
+    // The arc is spliced after `validatePhoneQuestionTemplate`, so a model
+    // question that normalises to an arc question is invisible to the pre-arc
+    // check and fatal on Save — `duplicate_text` is a template-level issue and
+    // `createRoleSchema` refuses the whole role. The prompt tells the model not
+    // to write an introduction or a salary question; this file's own argument
+    // is that prompt rules hold only most of the time.
+    const infer = vi.fn().mockResolvedValue({
+      ...goodDraft(),
+      screening_template: [
+        { question: ROLE_DRAFT_OPENING_QUESTION, weight: 1 },
+        ...modelQuestions.slice(0, 3).map((question) => ({ question, weight: 1 })),
+      ],
+    });
+    const { draft } = await generateRoleDraft('Sales Advisor', { infer });
+    const texts = draft.screening_template.map((q) => q.question);
+
+    expect(texts.filter((t) => t === ROLE_DRAFT_OPENING_QUESTION)).toHaveLength(1);
+    expect(new Set(texts).size).toBe(texts.length);
+  });
+
+  it('MARKS THE ARC MANDATORY, or the worker is free to skip it', async () => {
+    // `format_questions` (prompting.py:114) renders `[MUST ASK] ` only for a
+    // question carrying this flag, inside a system prompt that says to cover
+    // the bank "where relevant", not to ask every question mechanically, and
+    // — when the call runs against its ten-minute budget — to "prioritize
+    // mandatory items". Without the flag the arc was form-deep: true of the
+    // draft, optional on the call. The no-template fallback plan already
+    // marks expected CTC and notice period mandatory, so an Ask Hello role
+    // was weaker than a role nobody had authored.
+    const infer = vi.fn().mockResolvedValue(goodDraft());
+    const { draft } = await generateRoleDraft('Sales Advisor', { infer });
+    const flags = draft.screening_template.map((q) => q.mandatory === true);
+
+    expect(flags[0]).toBe(true);
+    expect(flags.slice(-ROLE_DRAFT_CLOSING_QUESTIONS.length)).toEqual(
+      ROLE_DRAFT_CLOSING_QUESTIONS.map(() => true),
+    );
+    // The model's own questions are NOT mandatory — flagging everything would
+    // make the priority signal meaningless.
+    expect(flags.slice(1, 1 + modelQuestions.length)).toEqual(modelQuestions.map(() => false));
   });
 
   it('does NOT spend the repair budget on sentences the model never wrote', async () => {
@@ -192,7 +267,12 @@ describe('rephraseQuestion — the way out of an unforgiving gate', () => {
       question: 'What is your system administration experience?',
     });
     await expect(rephraseQuestion('anything', { infer })).rejects.toBeInstanceOf(RoleDraftError);
-    expect(infer).toHaveBeenCalledTimes(REPHRASE_MAX_ATTEMPTS);
+    // A LITERAL, not the constant. `toHaveBeenCalledTimes(REPHRASE_MAX_ATTEMPTS)`
+    // reads the same symbol the loop does, so raising the ceiling to 25 passed
+    // — and this route is SYNCHRONOUS, so the ceiling is the only thing between
+    // one press and an Express handler held for N provider calls.
+    expect(REPHRASE_MAX_ATTEMPTS).toBe(2);
+    expect(infer).toHaveBeenCalledTimes(2);
   });
 
   it('QUOTES THE FAILURE BACK on the retry, rather than asking again blind', async () => {

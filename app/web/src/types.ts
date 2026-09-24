@@ -5,6 +5,15 @@ export interface ScreeningQuestion {
   question: string;
   weight: number;
   follow_up_hint?: string;
+  /**
+   * Rendered as `[MUST ASK] ` in the phone worker's prompt and prioritised
+   * when a call runs against its ten-minute budget.
+   *
+   * The API schema has accepted this for as long as the worker has read it;
+   * the web types simply never carried it, so the form silently dropped the
+   * flag on every save.
+   */
+  mandatory?: boolean;
 }
 
 export interface Role {
@@ -73,6 +82,20 @@ export interface RoleDraftOutcome {
   attempts: number;
   /** Questions the model had to re-phrase to get past the phone gate. */
   repaired: string[];
+}
+
+/**
+ * What removing a role actually did.
+ *
+ * Three outcomes, not one: a role nothing references is deleted, a role with
+ * candidates or sessions is ARCHIVED so those records still say which job
+ * they belonged to, and a role mapped to an Ashby job is refused outright.
+ */
+export interface RoleDeleteResult {
+  outcome: 'deleted' | 'archived';
+  reason?: string;
+  candidates?: number;
+  sessions?: number;
 }
 
 export interface RoleInput {
@@ -1169,6 +1192,29 @@ export interface AshbyMcMapping {
   hasTaStage: boolean;
   label: string | null;
   updatedAt: string;
+}
+
+/**
+ * What creating a mapping needs. Mirrors `POST .../mission-control/mappings`.
+ *
+ * The TTL is deliberately absent: a DB CHECK fixes it at 24h and the route
+ * refuses an explicit disagreement rather than silently overriding it, so
+ * there is nothing for a form to offer.
+ */
+export interface AshbyMappingInput {
+  external_job_id: string;
+  role_id: string;
+  delivery_mode?: 'email' | 'manual' | 'both';
+  ai_screening_stage_id?: string | null;
+  ta_screening_stage_id?: string | null;
+  label?: string | null;
+}
+
+export interface AshbyMappingCreated {
+  ok: boolean;
+  id?: string;
+  status?: string;
+  error?: string;
 }
 
 export interface AshbyMcWorkflowOperation {

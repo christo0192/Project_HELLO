@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import type {
+  Role,
   AshbyMcMapping,
   AshbyMcWorkflow,
   AshbyFeedbackForm,
@@ -71,6 +72,25 @@ const WORKFLOW_SCROLL_AFTER = 6;
 
 export function AshbyMissionControlPage() {
   const [mappings, setMappings] = useState<AshbyMcMapping[]>([]);
+  /**
+   * Roles to point a new mapping at.
+   *
+   * A PICKER, not a uuid field. `role_id` is a uuid FK and the route rejects
+   * anything else with `invalid_role_id`; asking an admin to paste one from
+   * another tab is how you get a mapping pointed at the wrong role with no
+   * way to notice — the id never appears on screen again.
+   */
+  const [roles, setRoles] = useState<Role[]>([]);
+  const [showNewMapping, setShowNewMapping] = useState(false);
+  const [newMapping, setNewMapping] = useState({
+    external_job_id: '',
+    role_id: '',
+    ai_screening_stage_id: '',
+    ta_screening_stage_id: '',
+    label: '',
+  });
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
   const [workflows, setWorkflows] = useState<AshbyMcWorkflow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -109,6 +129,13 @@ export function AshbyMissionControlPage() {
     try {
       const [m, w] = await Promise.all([api.listAshbyMappings(), api.listAshbyWorkflows()]);
       setMappings(m.mappings);
+      // Best effort. A failure here costs the picker, not the page — the
+      // mapping list and its pause/resume actions are what this screen is
+      // for, and they do not need roles.
+      void api
+        .listRoles()
+        .then((r) => setRoles(r.filter((role) => role.is_active)))
+        .catch(() => setRoles([]));
       setWorkflows(w.workflows);
       setError(null);
     } catch (e) {
@@ -231,6 +258,49 @@ export function AshbyMissionControlPage() {
       setBusy(false);
     }
   }, []);
+
+  /**
+   * Create the mapping. It always lands PAUSED — enabling is the separate
+   * Resume action, which the database still gates on stage completeness and
+   * absence of drift.
+   */
+  const createMapping = useCallback(async () => {
+    if (creating) return;
+    setCreateError(null);
+    setCreating(true);
+    try {
+      const res = await api.createAshbyMapping({
+        external_job_id: newMapping.external_job_id.trim(),
+        role_id: newMapping.role_id,
+        // EMPTY BECOMES UNDEFINED, not "". The route validates every optional
+        // opaque id it is given and answers `invalid_stage_id` for a blank
+        // string, so sending one would refuse the whole mapping over a field
+        // the admin deliberately left for later.
+        ai_screening_stage_id: newMapping.ai_screening_stage_id.trim() || undefined,
+        ta_screening_stage_id: newMapping.ta_screening_stage_id.trim() || undefined,
+        label: newMapping.label.trim() || undefined,
+      });
+      if (!res.ok) {
+        setCreateError(mappingErrorCopy(res.error));
+        return;
+      }
+      setShowNewMapping(false);
+      setNewMapping({
+        external_job_id: '',
+        role_id: '',
+        ai_screening_stage_id: '',
+        ta_screening_stage_id: '',
+        label: '',
+      });
+      await load();
+    } catch (err) {
+      setCreateError(
+        err instanceof ApiError ? err.message : 'Could not create the mapping. Try again.',
+      );
+    } finally {
+      setCreating(false);
+    }
+  }, [creating, newMapping, load]);
 
   const mappingTone = (status: string): StatusTone =>
     status === 'enabled' ? 'success' : status === 'drift' ? 'danger' : 'warning';
@@ -401,7 +471,124 @@ export function AshbyMissionControlPage() {
                   <span className="text-[13px] text-ink-tertiary">{mappings.length}</span>
                 ) : undefined
               }
+              actions={
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => {
+                    setCreateError(null);
+                    setShowNewMapping((open) => !open);
+                  }}
+                  aria-expanded={showNewMapping}
+                >
+                  {showNewMapping ? 'Cancel' : 'Add mapping'}
+                </Button>
+              }
             />
+
+            {showNewMapping && (
+              <form
+                className="mt-4 rounded-control border border-glass-ring p-4"
+                onSubmit={(e) => {
+                  e.preventDefault();
+                  void createMapping();
+                }}
+              >
+                {/*
+                  * WHY THIS FORM EXISTS. The endpoint has been there since the
+                  * integration shipped and nothing called it, so pointing a new
+                  * Ashby job at a role meant a hand-rolled authenticated POST.
+                  * A new job title was therefore not self-serve: author the
+                  * role, then ask an engineer.
+                  */}
+                <p className="text-[13px] text-ink-secondary">
+                  Points an Ashby job at a HELLO role. Saves as <strong>paused</strong> — use
+                  Resume once the stage ids are in, which is also what the database checks.
+                </p>
+
+                <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                  <label className="flex flex-col gap-1">
+                    <span className="text-[13px] font-medium text-ink">Ashby job id</span>
+                    <TextField
+                      value={newMapping.external_job_id}
+                      onChange={(e) =>
+                        setNewMapping((m) => ({ ...m, external_job_id: e.target.value }))
+                      }
+                      placeholder="From the job URL in Ashby"
+                      required
+                    />
+                  </label>
+
+                  <label className="flex flex-col gap-1">
+                    <span className="text-[13px] font-medium text-ink">Role</span>
+                    <select
+                      className="h-10 rounded-control border border-glass-ring bg-surface px-3 text-sm text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface-secondary"
+                      value={newMapping.role_id}
+                      onChange={(e) => setNewMapping((m) => ({ ...m, role_id: e.target.value }))}
+                      required
+                    >
+                      <option value="">Choose a role…</option>
+                      {roles.map((role) => (
+                        <option key={role.id} value={role.id}>
+                          {role.agent_name ? `${role.title} — ${role.agent_name}` : role.title}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="flex flex-col gap-1">
+                    <span className="text-[13px] font-medium text-ink">
+                      AI screening stage id <span className="text-ink-tertiary">(optional)</span>
+                    </span>
+                    <TextField
+                      value={newMapping.ai_screening_stage_id}
+                      onChange={(e) =>
+                        setNewMapping((m) => ({ ...m, ai_screening_stage_id: e.target.value }))
+                      }
+                      placeholder="Needed before this can be enabled"
+                    />
+                  </label>
+
+                  <label className="flex flex-col gap-1">
+                    <span className="text-[13px] font-medium text-ink">
+                      TA screening stage id <span className="text-ink-tertiary">(optional)</span>
+                    </span>
+                    <TextField
+                      value={newMapping.ta_screening_stage_id}
+                      onChange={(e) =>
+                        setNewMapping((m) => ({ ...m, ta_screening_stage_id: e.target.value }))
+                      }
+                      placeholder="Needed before this can be enabled"
+                    />
+                  </label>
+
+                  <label className="flex flex-col gap-1 sm:col-span-2">
+                    <span className="text-[13px] font-medium text-ink">
+                      Label <span className="text-ink-tertiary">(optional, never sensitive)</span>
+                    </span>
+                    <TextField
+                      value={newMapping.label}
+                      onChange={(e) => setNewMapping((m) => ({ ...m, label: e.target.value }))}
+                      placeholder="A display tag, e.g. canary"
+                    />
+                  </label>
+                </div>
+
+                {createError && (
+                  <p role="alert" className="mt-3 text-[13px] text-danger">
+                    {createError}
+                  </p>
+                )}
+
+                <div className="mt-4 flex items-center gap-2">
+                  <Button type="submit" size="sm" loading={creating}>
+                    {creating ? 'Saving…' : 'Save mapping'}
+                  </Button>
+                  <span className="text-[13px] text-ink-tertiary">Saves paused.</span>
+                </div>
+              </form>
+            )}
             {loaded && mappings.length === 0 ? (
               <EmptyPanel compact className="mt-4" title="No mappings." />
             ) : (
@@ -606,6 +793,33 @@ function FeedbackFormSchema({ forms, truncated }: { forms: AshbyFeedbackForm[]; 
 }
 
 /** Sanitized API error code → HR-readable copy. Never echoes provider text. */
+/**
+ * The route's machine codes, in words an admin can act on.
+ *
+ * Each one names the FIELD at fault, because the form has five and a bare
+ * "invalid" leaves the admin re-checking all of them.
+ */
+function mappingErrorCopy(code: string | undefined): string {
+  switch (code) {
+    case 'invalid_external_job_id':
+      return 'That Ashby job id is not in the expected format. Copy it from the job URL in Ashby.';
+    case 'invalid_role_id':
+      return 'Choose a role for this job.';
+    case 'invalid_stage_id':
+      return 'One of the stage ids is not in the expected format. Leave it blank if you do not have it yet.';
+    case 'invalid_label':
+      return 'The label is too long.';
+    case 'invalid_delivery_mode':
+      return 'That delivery mode is not one this integration supports.';
+    case 'conflict':
+      return 'This Ashby job is already mapped. Edit the existing mapping instead of adding a second one.';
+    case 'mission_control_action_error':
+      return 'The mapping could not be saved. Try again.';
+    default:
+      return 'Could not create the mapping.';
+  }
+}
+
 function bindingErrorCopy(code: string | undefined): string {
   switch (code) {
     case 'integration_disabled':

@@ -1220,6 +1220,21 @@ describe('POST /api/roles/draft is rate limited apart from the rest of /api/role
     expect(res.headers['x-ratelimit-limit']).toBe('5');
   });
 
+  it('REPHRASE HAS ITS OWN BUCKET, not the loose shared one', async () => {
+    // Deleting the `app.post('/api/roles/questions/rephrase', …)` registration
+    // left 404 tests green: traffic silently fell back to the `/api/roles`
+    // default bucket, roughly five times looser than the strict one, on a
+    // model-invoking synchronous route. Nothing else in the suite inventories
+    // the limiters, so the header is what pins it.
+    const app = createAuthedApp(makeInterviewer());
+    const res = await request(app)
+      .post('/api/roles/questions/rephrase')
+      .set('Authorization', VALID_TOKEN)
+      .send({ question: 'What tools do you use?' });
+    // The STRICT limit (20), not the default (100).
+    expect(res.headers['x-ratelimit-limit']).toBe('20');
+  });
+
   it('leaves the rest of the Roles API usable when the draft bucket is empty', async () => {
     // Separate keys. A limiter added to bound provider spend must not take
     // role listing and saving down with it.

@@ -17,6 +17,8 @@ import type {
   AdminAllowlistListResponse,
   AdminAllowlistUpdateInput,
   AdminAllowlistUpdateResponse,
+  AshbyMappingInput,
+  AshbyMappingCreated,
   AshbyMcMappingsResponse,
   AshbyMcWorkflowsResponse,
   AshbyMcActionResponse,
@@ -70,6 +72,7 @@ import type {
   QuotaPolicyMutationResponse,
   RecordingDownloadResponse,
   Role,
+  RoleDeleteResult,
   RoleInput,
   PhoneAppointmentCancelInput,
   PhoneAppointmentCreateInput,
@@ -200,6 +203,15 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ question }),
     }),
+  /**
+   * Remove a role. ARCHIVES it when candidates or sessions reference it.
+   *
+   * The caller must tell the operator WHICH happened — "gone from the list"
+   * looks identical either way, and the difference decides whether they can
+   * expect to find it again.
+   */
+  deleteRole: (id: string) =>
+    request<RoleDeleteResult>(`/api/roles/${id}`, { method: 'DELETE' }),
   getRole: (id: string) => request<Role>(`/api/roles/${id}`),
   createRole: (body: RoleInput) =>
     request<Role>('/api/roles', {
@@ -560,6 +572,19 @@ export const api = {
     request<AshbyMcMappingsResponse>('/api/integrations/ashby/mission-control/mappings'),
   listAshbyWorkflows: () =>
     request<AshbyMcWorkflowsResponse>('/api/integrations/ashby/mission-control/workflows'),
+  /**
+   * Create (or update) an Ashby job -> role mapping. ALWAYS lands paused.
+   *
+   * The endpoint has existed since the integration shipped and nothing called
+   * it, so the only way to point a new Ashby job at a HELLO role was a hand
+   * -rolled authenticated POST. Enabling stays a separate action, still gated
+   * in the database on stage completeness and absence of drift.
+   */
+  createAshbyMapping: (body: AshbyMappingInput) =>
+    request<AshbyMappingCreated>('/api/integrations/ashby/mission-control/mappings', {
+      method: 'POST',
+      body: JSON.stringify(body),
+    }),
   pauseAshbyMapping: (id: string, reason?: string) =>
     request<AshbyMcActionResponse>(`/api/integrations/ashby/mission-control/mappings/${id}/pause`, {
       method: 'POST',
