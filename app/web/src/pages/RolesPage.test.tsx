@@ -457,8 +457,12 @@ describe('Rephrase — the way out of an unforgiving question gate', () => {
       .filter((el) => el.closest('[role="status"]') === null);
   }
 
-  async function openEditor() {
-    mockApi.listRoles.mockResolvedValue([mockRole]);
+  async function openEditor(role: typeof mockRole = mockRole) {
+    // PARAMETERISED. It used to hard-code `[mockRole]`, so a test that set up
+    // a different role immediately before calling it had that setup silently
+    // overwritten — which is how the three-row fixture below ended up running
+    // against two rows and failing to find its own third question.
+    mockApi.listRoles.mockResolvedValue([role]);
     // The edit form mounts RoleScorecardEditor too, and its effect calls both
     // of these. Left undefined they reject inside an effect, which unmounts
     // the page — and the button under test disappears for a reason that has
@@ -509,23 +513,21 @@ describe('Rephrase — the way out of an unforgiving question gate', () => {
     // and a naive `prev.map((q,i) => i === idx ? … : q)` is a harmless no-op
     // — the fixture passed with the guard deleted, which is the one thing a
     // regression test must not do.
-    mockApi.listRoles.mockResolvedValue([
-      {
-        ...mockRole,
-        screening_template: [
-          { id: 'q1', question: 'FIRST-original?', weight: 1 },
-          { id: 'q2', question: 'SECOND-original?', weight: 1 },
-          { id: 'q3', question: 'THIRD-original?', weight: 1 },
-        ],
-      },
-    ]);
+    const threeRows = {
+      ...mockRole,
+      screening_template: [
+        { id: 'q1', question: 'FIRST-original?', weight: 1 },
+        { id: 'q2', question: 'SECOND-original?', weight: 1 },
+        { id: 'q3', question: 'THIRD-original?', weight: 1 },
+      ],
+    };
     let release: (v: unknown) => void = () => {};
     mockApi.rephraseQuestion.mockReturnValue(
       new Promise((resolve) => {
         release = resolve;
       }),
     );
-    await openEditor();
+    await openEditor(threeRows);
 
     // Rephrase row 2, then delete row 1 while it is still out. Index 1 now
     // addresses what was row 3.
