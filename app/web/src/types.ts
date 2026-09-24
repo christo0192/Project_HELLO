@@ -14,7 +14,31 @@ export interface ScreeningQuestion {
    * flag on every save.
    */
   mandatory?: boolean;
+  /**
+   * Which compartment of the screening call this question belongs to.
+   *
+   * Optional: every role authored before compartments existed has none, and an
+   * uncategorised question is ungrouped rather than invalid.
+   */
+  category?: ScreeningCategory;
 }
+
+/** The compartments a screening call moves through, in call order. */
+export type ScreeningCategory =
+  | 'introduction'
+  | 'profile_relevance'
+  | 'shift_fit'
+  | 'stability'
+  | 'compensation';
+
+/** What each compartment is called on screen, and what it is for. */
+export const SCREENING_CATEGORY_LABELS: Record<ScreeningCategory, string> = {
+  introduction: 'Introduction',
+  profile_relevance: 'Profile relevance',
+  shift_fit: 'Shift fit',
+  stability: 'Stability',
+  compensation: 'Compensation and notice',
+};
 
 export interface Role {
   id: string;

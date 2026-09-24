@@ -816,3 +816,81 @@ describe('Removing a role', () => {
     ).toBeInTheDocument();
   });
 });
+
+describe('The screening call is shown in compartments', () => {
+  // The recruiter edits a list that IS the call, in order. Grouping by
+  // re-ordering the rows would silently re-order the conversation, so the rows
+  // stay exactly as they will be asked and a heading marks where each
+  // compartment begins.
+  const COMPARTMENTED = {
+    ...mockRole,
+    screening_template: [
+      { id: 'q1', question: 'Tell me about yourself and your recent role?', weight: 1, category: 'introduction' as const },
+      { id: 'q2', question: 'What does your current role involve day to day?', weight: 1, category: 'profile_relevance' as const },
+      { id: 'q3', question: 'How do you handle an unhappy customer?', weight: 1, category: 'profile_relevance' as const },
+      { id: 'q4', question: 'How do you feel about working nights regularly?', weight: 1, category: 'shift_fit' as const },
+      { id: 'q5', question: 'How long have you stayed in your recent positions?', weight: 1, category: 'stability' as const },
+      { id: 'q6', question: 'What is your current annual CTC?', weight: 1, category: 'compensation' as const },
+    ],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockApi.getRoleScorecard.mockResolvedValue({ scorecard: { metrics: [] } });
+    mockApi.listScorecardMetrics.mockResolvedValue([]);
+    mockApi.getActiveRoleDraft.mockResolvedValue({ active: null });
+    mockApi.listRoles.mockResolvedValue([COMPARTMENTED]);
+    mockApi.updateRole.mockResolvedValue(COMPARTMENTED);
+  });
+
+  it('HEADS each compartment, once', async () => {
+    render(<RolesPage />);
+    await userEvent.click(await screen.findByRole('button', { name: /edit/i }));
+    await screen.findByLabelText('Question 1');
+
+    for (const label of ['Introduction', 'Profile relevance', 'Shift fit', 'Stability', 'Compensation and notice']) {
+      expect(screen.getAllByText(label), label).toHaveLength(1);
+    }
+  });
+
+  it('KEEPS THE ROWS IN CALL ORDER, because the plan copies the array verbatim', async () => {
+    // `0044`'s builder materialises `screening_template` in order, so this
+    // list is the conversation. Sorting or bucketing the rows for display
+    // would change what the bot actually asks.
+    render(<RolesPage />);
+    await userEvent.click(await screen.findByRole('button', { name: /edit/i }));
+    await screen.findByLabelText('Question 1');
+
+    const values = [1, 2, 3, 4, 5, 6].map(
+      (n) => (screen.getByLabelText(`Question ${n}`) as HTMLInputElement).value,
+    );
+    expect(values).toEqual(COMPARTMENTED.screening_template.map((q) => q.question));
+  });
+
+  it('CARRIES the category through an edit, like `mandatory`', async () => {
+    // The PUT replaces `screening_template` wholesale, so a category dropped
+    // on load is a category deleted on save — the same defect `mandatory` had.
+    render(<RolesPage />);
+    await userEvent.click(await screen.findByRole('button', { name: /edit/i }));
+    await screen.findByLabelText('Question 1');
+    await userEvent.click(screen.getByRole('button', { name: /Save changes/i }));
+
+    await waitFor(() => expect(mockApi.updateRole).toHaveBeenCalled());
+    const body = mockApi.updateRole.mock.calls[0][1] as {
+      screening_template: Array<{ id: string; category?: string }>;
+    };
+    expect(body.screening_template.map((q) => q.category)).toEqual(
+      COMPARTMENTED.screening_template.map((q) => q.category),
+    );
+  });
+
+  it('renders an OLDER role with no categories at all', async () => {
+    // Every role authored before compartments existed has none. An
+    // uncategorised question is ungrouped, not broken.
+    mockApi.listRoles.mockResolvedValue([mockRole]);
+    render(<RolesPage />);
+    await userEvent.click(await screen.findByRole('button', { name: /edit/i }));
+    expect(await screen.findByLabelText('Question 1')).toBeInTheDocument();
+    expect(screen.queryByText('Profile relevance')).not.toBeInTheDocument();
+  });
+});
