@@ -8903,6 +8903,27 @@ begin
                                                    -- and granted only to
                                                    -- service_role.
                                                    'phone_answered_reclaim_grace',
+                                                   -- 0103. The template
+                                                   -- validator `0044` used to
+                                                   -- run inline, extracted so
+                                                   -- the role template and a
+                                                   -- per-candidate set are
+                                                   -- judged by one set of
+                                                   -- rules. A function of its
+                                                   -- ARGUMENT: it reads no
+                                                   -- table and needs no
+                                                   -- privilege, so DEFINER
+                                                   -- would grant it authority
+                                                   -- it has no use for.
+                                                   -- `language plpgsql
+                                                   -- immutable` with
+                                                   -- `set search_path =
+                                                   -- pg_catalog, screening_v2`,
+                                                   -- revoked from
+                                                   -- public/anon/authenticated
+                                                   -- and granted only to
+                                                   -- service_role.
+                                                   'phone_normalize_question_plan',
                                                    'prevent_phone_call_event_mutation',
                                                    'enforce_phone_engagement_transition',
                                                    'enforce_phone_appointment_window') then

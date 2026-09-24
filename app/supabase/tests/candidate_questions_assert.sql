@@ -279,9 +279,57 @@ begin
     raise exception 'cqs103/chk: a misspelled plan source was accepted';
   end if;
 
-  -- ON DELETE CASCADE: a purged engagement takes its generated questions
-  -- with it, which is what makes DSAR erasure complete without a sweeper.
   raise notice 'cqs103/chk: PASS';
+end $$;
+
+-- ── Part 3b: the exposure posture, asserted here as well as centrally ──
+-- `policy_tests.sql` carries the schema-wide versions of these. They are
+-- repeated beside the migration because that file runs in a different CI job
+-- with a different trigger, and the first EXECUTION of a wrong grant should
+-- not be a browser session reading another candidate's questions.
+do $$
+declare
+  v_oid oid;
+begin
+  if not exists (select 1 from pg_class c join pg_namespace n on n.oid = c.relnamespace
+                  where n.nspname = 'screening_v2'
+                    and c.relname = 'candidate_screening_questions'
+                    and c.relrowsecurity) then
+    raise exception 'cqs103/rls: row-level security is not enabled on the table';
+  end if;
+  -- RLS with a lingering grant is one policy away from being readable, so the
+  -- grants are the other half of the same control.
+  for v_oid in select c.oid from pg_class c join pg_namespace n on n.oid = c.relnamespace
+                where n.nspname = 'screening_v2'
+                  and c.relname = 'candidate_screening_questions' loop
+    if has_table_privilege('anon', v_oid, 'SELECT')
+       or has_table_privilege('authenticated', v_oid, 'SELECT') then
+      raise exception 'cqs103/rls: a browser role can read the table';
+    end if;
+    if not has_table_privilege('service_role', v_oid, 'SELECT') then
+      raise exception 'cqs103/rls: service_role cannot read the table it must write';
+    end if;
+  end loop;
+
+  select p.oid into v_oid from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+   where n.nspname = 'screening_v2' and p.proname = 'phone_normalize_question_plan';
+  if v_oid is null then
+    raise exception 'cqs103/rls: the helper does not exist';
+  end if;
+  if has_function_privilege('anon', v_oid, 'EXECUTE')
+     or has_function_privilege('authenticated', v_oid, 'EXECUTE') then
+    raise exception 'cqs103/rls: the helper is browser-executable';
+  end if;
+  if not has_function_privilege('service_role', v_oid, 'EXECUTE') then
+    raise exception 'cqs103/rls: service_role cannot execute the helper';
+  end if;
+  -- It pins its search_path, like every other function in this schema.
+  if not exists (select 1 from pg_proc p, unnest(p.proconfig) c
+                  where p.oid = v_oid and c like 'search_path=%') then
+    raise exception 'cqs103/rls: the helper does not pin search_path';
+  end if;
+
+  raise notice 'cqs103/rls: PASS';
 end $$;
 
 -- ── Part 4: the cascade, proven by deleting ───────────────────────────

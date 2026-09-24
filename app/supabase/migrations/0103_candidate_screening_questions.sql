@@ -126,6 +126,16 @@ begin
 end;
 $$;
 
+-- EXPOSURE, like every other pure `phone_*` helper in this schema. It is not
+-- SECURITY DEFINER because it touches no table and needs no privilege — it is
+-- a function of its argument. What it must not be is reachable from a browser
+-- session, so the default PUBLIC execute grant is revoked and only the role
+-- that calls it keeps one. `0042`'s posture test enforces both halves.
+revoke all on function screening_v2.phone_normalize_question_plan(jsonb)
+  from public, anon, authenticated;
+grant execute on function screening_v2.phone_normalize_question_plan(jsonb)
+  to service_role;
+
 comment on function screening_v2.phone_normalize_question_plan is
   'Validates a screening template and projects it into the worker''s '
   '{key,text,mandatory,hint} plan shape, or returns NULL if it is not a '
@@ -189,6 +199,12 @@ comment on table screening_v2.candidate_screening_questions is
   'template; an absent, unfinished or malformed row simply means the call '
   'runs the role template, which is what every call did before 0103.';
 
+-- RLS ON WITH ZERO POLICIES, which is this schema's posture for every table
+-- nothing browser-side may read: `service_role` bypasses row-level security,
+-- and anything else gets an empty result rather than an error. The grants below
+-- are the second half of the same control — a table with RLS on but a lingering
+-- `authenticated` grant is one policy away from being readable.
+alter table screening_v2.candidate_screening_questions enable row level security;
 revoke all on screening_v2.candidate_screening_questions from public, anon, authenticated;
 grant select, insert, update, delete
   on screening_v2.candidate_screening_questions to service_role;
