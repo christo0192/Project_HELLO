@@ -45,7 +45,13 @@ interface Scenario {
 }
 let scenario: Scenario;
 /** Every table a request touched, with the operation. */
-let touched: Array<{ table: string; op: string; filters: Array<[string, unknown]> }>;
+let touched: Array<{
+  table: string;
+  op: string;
+  filters: Array<[string, unknown]>;
+  /** What an update/delete actually WROTE. Recorded AND asserted — see below. */
+  payload?: Record<string, unknown>;
+}>;
 
 /**
  * The tables this route is allowed to read, and what each one answers.
@@ -68,7 +74,7 @@ function chain(table: string): any {
         `the route asked for a table this schema has never had`,
     );
   }
-  const call = { table, op: 'select', filters: [] as Array<[string, unknown]> };
+  const call: (typeof touched)[number] = { table, op: 'select', filters: [] };
   touched.push(call);
   const counts: Record<string, number> = {
     ashby_job_mappings: scenario.mappings,
@@ -87,7 +93,12 @@ function chain(table: string): any {
     },
     update(payload: Record<string, unknown>) {
       call.op = 'update';
-      self.__payload = payload;
+      // ON THE CALL, not on `self`. It used to land on the builder, which no
+      // assertion ever read — so `update({ is_active: false })` could become
+      // `{ is_active: true }`, silently UN-archiving a role, with the whole
+      // suite green. A mock that records something nothing reads is just a
+      // slower way of not testing it.
+      call.payload = payload;
       return self;
     },
     delete() {
@@ -157,6 +168,9 @@ describe('DELETE /api/roles/:id', () => {
     expect(res.body.candidates).toBe(12);
     const write = touched.find((t) => t.table === 'roles' && t.op === 'update');
     expect(write, 'it must UPDATE, never delete').toBeTruthy();
+    // AND WHAT IT WROTE. Asserting only that an update happened let the
+    // payload be inverted — archiving by setting `is_active: true`.
+    expect(write?.payload).toEqual({ is_active: false });
     expect(touched.some((t) => t.table === 'roles' && t.op === 'delete')).toBe(false);
   });
 
@@ -191,16 +205,31 @@ describe('DELETE /api/roles/:id', () => {
     expect(touched.some((t) => t.table === 'roles' && t.op !== 'select')).toBe(false);
   });
 
-  it('SCOPES THE OWNERSHIP READ to the caller for an interviewer', async () => {
+  it('SCOPES EVERY roles OPERATION to the caller for an interviewer', async () => {
+    // `.find()` returned the first roles entry — the ownership READ — so both
+    // write-side `.eq('owner_id', …)` guards could be deleted with the suite
+    // green. The read already 404s a non-owner, so those are defence in depth
+    // against a TOCTOU, which is exactly the kind of guard that rots unnoticed.
     await del('interviewer');
-    const read = touched.find((t) => t.table === 'roles');
-    expect(read?.filters).toContainEqual(['owner_id', OWNER]);
+    const roleOps = touched.filter((t) => t.table === 'roles');
+    expect(roleOps.length).toBeGreaterThan(1);
+    for (const op of roleOps) {
+      expect(op.filters, `${op.op} must be owner-scoped`).toContainEqual(['owner_id', OWNER]);
+    }
+  });
+
+  it('SCOPES THE ARCHIVE WRITE too', async () => {
+    scenario.candidates = 4;
+    await del('interviewer');
+    const write = touched.find((t) => t.table === 'roles' && t.op === 'update');
+    expect(write?.filters).toContainEqual(['owner_id', OWNER]);
   });
 
   it('does NOT scope an admin to their own roles', async () => {
     await del('admin');
-    const read = touched.find((t) => t.table === 'roles');
-    expect(read?.filters.some(([col]) => col === 'owner_id')).toBe(false);
+    for (const op of touched.filter((t) => t.table === 'roles')) {
+      expect(op.filters.some(([col]) => col === 'owner_id')).toBe(false);
+    }
   });
 
   it('404s a role the caller does not own, without touching anything', async () => {
@@ -220,6 +249,16 @@ describe('DELETE /api/roles/:id', () => {
     // failure rather than a prevented one — the same convention `POST /` and
     // `PUT /:id` use in this file. Worth pinning either way: a delete whose
     // record was lost is the one an operator will most want to look up.
+    vi.mocked(recordAudit).mockRejectedValue(new Error('sink down') as never);
+    const res = await del();
+    expect(res.status).toBe(500);
+  });
+
+  it('reports a dead audit sink on the ARCHIVE branch as well', async () => {
+    // The test above runs the default scenario, which takes the DELETE path,
+    // so the archive branch's own catch was never executed. Two branches, two
+    // audit writes, and only one of them was covered.
+    scenario.candidates = 7;
     vi.mocked(recordAudit).mockRejectedValue(new Error('sink down') as never);
     const res = await del();
     expect(res.status).toBe(500);

@@ -24,6 +24,7 @@ import {
   ROLE_DRAFT_QUESTION_COUNT,
   ROLE_DRAFT_TOTAL_QUESTIONS,
   REPHRASE_MAX_ATTEMPTS,
+  REPHRASE_TIMEOUT_MS,
 } from '../lib/role-authoring.js';
 import { validatePhoneQuestion } from '../lib/phone-screening/question-validation.js';
 
@@ -87,15 +88,40 @@ describe('the fixed arc survives the real phone gate', () => {
     //
     // This test is the tripwire for that coupling. Rewording a closer is fine;
     // dropping the token its consumer keys on is not.
-    const [current, expected, notice] = ROLE_DRAFT_CLOSING_QUESTIONS;
-    expect(current).toMatch(/\bcurrent\b/i);
-    expect(expected).toMatch(/\bexpected\b|\bexpectation/i);
-    // Both are compensation objectives to the worker, so both need their token.
-    for (const q of [current, expected]) {
-      expect(q).toMatch(/\b(?:ctc|salary|compensation|package)\b/i);
+    // A RULE OVER THE ARRAY, not three positional assertions. Destructuring
+    // `[current, expected, notice]` left anything at index >= 3 unchecked, so
+    // appending a fourth closer worded "What annual CTC are you looking for in
+    // your next position?" — the exact sentence this arc exists to remove —
+    // passed. Every count assertion moves with the array length, so nothing
+    // else objected either.
+    const compensation = /\b(?:ctc|salary|compensation|package)\b/i;
+    const current = /\bcurrent\b/i;
+    const expected = /\bexpected\b|\bexpectation/i;
+
+    let sawCurrent = false;
+    let sawExpected = false;
+    for (const q of ROLE_DRAFT_CLOSING_QUESTIONS) {
+      if (!compensation.test(q)) continue;
+      // EVERY compensation closer must say which side it asks about, or the
+      // worker treats it as answered by anything at all.
+      const hasCurrent = current.test(q);
+      const hasExpected = expected.test(q);
+      expect(
+        hasCurrent || hasExpected,
+        `"${q}" is a compensation objective carrying neither "current" nor "expected", so phone_answer_covers_objective returns true for ANY answer and it is never asked`,
+      ).toBe(true);
+      sawCurrent ||= hasCurrent;
+      sawExpected ||= hasExpected;
     }
-    // The notice closer keys on a different branch entirely.
-    expect(notice).toMatch(/\b(?:notice period|available|availability|start)\b/i);
+    expect(sawCurrent, 'a closer must ask for CURRENT CTC').toBe(true);
+    expect(sawExpected, 'a closer must ask for EXPECTED CTC').toBe(true);
+
+    // And one closer keys on the availability branch instead.
+    expect(
+      ROLE_DRAFT_CLOSING_QUESTIONS.some((q) =>
+        /\b(?:notice period|available|availability|start)\b/i.test(q),
+      ),
+    ).toBe(true);
   });
 });
 
@@ -335,6 +361,21 @@ describe('rephraseQuestion — the way out of an unforgiving gate', () => {
     });
     expect(out).toBe('Which tools do you use every day?');
     expect(infer).toHaveBeenCalledTimes(1);
+  });
+
+  it('CAPS THE PROVIDER BUDGET, because this route is synchronous', async () => {
+    // The cap lived only inside the default `infer` closure, and every other
+    // test injects `deps.infer` — so it was unreachable and deleting it left
+    // the suite green. Production reads the RAISED Fly secret (up to 300s),
+    // and two gate attempts x the runner's own retry against that is ~20
+    // minutes on an Express handler with no client abort. `runJson` is the
+    // seam that reaches it, the same shape `roleDraftTimeoutMs` uses.
+    const runJson = vi.fn().mockResolvedValue({
+      data: { question: 'Which tools do you use every day?' },
+    });
+    await rephraseQuestion('What is your system experience?', { runJson: runJson as never });
+    const opts = runJson.mock.calls[0][1] as { timeoutMs: number };
+    expect(opts.timeoutMs).toBeLessThanOrEqual(REPHRASE_TIMEOUT_MS);
   });
 
   it('rejects a response that is not a question object at all', async () => {

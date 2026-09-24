@@ -448,8 +448,12 @@ rolesRouter.delete(
     if (deleteError) return next(deleteError);
     if (!deleted) return res.status(404).json({ error: 'Role not found' });
 
-    // AUDITED FAIL-CLOSED, like every other mutation here: a delete whose
-    // record was lost is the one an operator will most want to look up.
+    // AUDITED, and the failure is LOUD rather than closed. The row is already
+    // gone by the time this runs, so a 500 here reports a lost audit record —
+    // it does not roll the delete back. That is byte-for-byte what `POST /`
+    // and `PUT /:id` in this file already do, and diverging for one verb would
+    // be its own inconsistency; the earlier wording said "fail-closed", which
+    // would have told a reader the write was undone.
     try {
       await recordAudit(req, 'resource.delete', 200, {
         metadata: { role_id: roleId },

@@ -502,11 +502,23 @@ describe('Rephrase — the way out of an unforgiving question gate', () => {
   });
 
   it('DISCARDS the rewrite when the row moved underneath it', async () => {
-    // The index is not an identity. Remove a row above the one being
-    // rephrased and index 4 addresses what used to be row 5 — a reviewer
-    // proved the rewrite of one question silently replacing a different one,
-    // with the original text simply gone and no error shown. Pruning an
-    // eight-row draft while a rephrase is out is the normal workflow.
+    // THREE ROWS, DELIBERATELY. The index is not an identity: remove a row
+    // above the one being rephrased and that index now addresses what used to
+    // be the row BELOW it, so the rewrite of one question silently replaces a
+    // different one. With only two rows the shifted index falls off the end
+    // and a naive `prev.map((q,i) => i === idx ? … : q)` is a harmless no-op
+    // — the fixture passed with the guard deleted, which is the one thing a
+    // regression test must not do.
+    mockApi.listRoles.mockResolvedValue([
+      {
+        ...mockRole,
+        screening_template: [
+          { id: 'q1', question: 'FIRST-original?', weight: 1 },
+          { id: 'q2', question: 'SECOND-original?', weight: 1 },
+          { id: 'q3', question: 'THIRD-original?', weight: 1 },
+        ],
+      },
+    ]);
     let release: (v: unknown) => void = () => {};
     mockApi.rephraseQuestion.mockReturnValue(
       new Promise((resolve) => {
@@ -514,17 +526,20 @@ describe('Rephrase — the way out of an unforgiving question gate', () => {
       }),
     );
     await openEditor();
-    const secondBefore = (screen.getByLabelText('Question 2') as HTMLInputElement).value;
 
+    // Rephrase row 2, then delete row 1 while it is still out. Index 1 now
+    // addresses what was row 3.
     await userEvent.click(screen.getByRole('button', { name: 'Rephrase question 2' }));
-    // Row 1 goes while row 2's rewrite is still out.
     await userEvent.click(screen.getByRole('button', { name: 'Remove question 1' }));
     await act(async () => {
       release({ question: 'A REWRITE THAT MUST NOT LAND?' });
     });
 
-    // Only one row left, and it is the one that used to be row 2 — unchanged.
-    expect((screen.getByLabelText('Question 1') as HTMLInputElement).value).toBe(secondBefore);
+    const values = [1, 2].map(
+      (n) => (screen.getByLabelText(`Question ${n}`) as HTMLInputElement).value,
+    );
+    // The two survivors are untouched, and nothing anywhere took the rewrite.
+    expect(values).toEqual(['SECOND-original?', 'THIRD-original?']);
     expect(screen.queryByDisplayValue('A REWRITE THAT MUST NOT LAND?')).not.toBeInTheDocument();
   });
 
@@ -659,6 +674,47 @@ describe('The [MUST ASK] flag survives an edit', () => {
     mockApi.getActiveRoleDraft.mockResolvedValue({ active: null });
     mockApi.listRoles.mockResolvedValue([ARC_ROLE]);
     mockApi.updateRole.mockResolvedValue(ARC_ROLE);
+  });
+
+  it('SURVIVES the Ask Hello draft -> form -> save path', async () => {
+    // The API half is pinned end to end; the FORM was the unguarded link, and
+    // no web test contained the string `mandatory` at all. Either the draft
+    // mapping or the save payload could drop it and the arc would quietly go
+    // back to being form-deep — the exact defect this work exists to fix.
+    mockApi.listRoles.mockResolvedValue([]);
+    mockApi.createRole.mockResolvedValue(mockRole);
+    mockApi.getActiveRoleDraft.mockResolvedValue({ active: null });
+    mockApi.startRoleDraft.mockResolvedValue(succeededJob());
+    mockApi.getRoleDraft.mockResolvedValue(
+      succeededJob({
+        draft: {
+          jd: 'Sell the product to enterprise buyers.',
+          required_skills: ['Sales'],
+          screening_template: [
+            { id: 'q1', question: 'Tell me about yourself and your recent role?', weight: 1, mandatory: true },
+            { id: 'q2', question: 'What does your current role involve day to day?', weight: 1 },
+            { id: 'q3', question: 'What is your current annual CTC, including any variable pay?', weight: 1, mandatory: true },
+          ],
+        },
+      }),
+    );
+    render(<RolesPage />);
+    await userEvent.click(await screen.findByRole('button', { name: 'New role' }));
+    await userEvent.type(screen.getByLabelText('Job role'), 'Sales Advisor');
+    await userEvent.click(screen.getByRole('button', { name: /Ask Hello/ }));
+    await waitFor(() =>
+      expect((screen.getByLabelText('Question 3') as HTMLInputElement).value).toMatch(/CTC/),
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: /Create role/i }));
+    await waitFor(() => expect(mockApi.createRole).toHaveBeenCalled());
+    const body = mockApi.createRole.mock.calls[0][0] as {
+      screening_template: Array<{ id: string; mandatory?: boolean }>;
+    };
+    expect(body.screening_template.filter((q) => q.mandatory === true).map((q) => q.id)).toEqual([
+      'q1',
+      'q3',
+    ]);
   });
 
   it('SAVES the flags back unchanged after an edit that never touched them', async () => {

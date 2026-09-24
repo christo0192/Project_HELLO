@@ -277,10 +277,12 @@ export function AshbyMissionControlPage() {
       await api.createAshbyMapping({
         external_job_id: newMapping.external_job_id.trim(),
         role_id: newMapping.role_id,
-        // EMPTY BECOMES UNDEFINED, not "". The route validates every optional
-        // opaque id it is given and answers `invalid_stage_id` for a blank
-        // string, so sending one would refuse the whole mapping over a field
-        // the admin deliberately left for later.
+        // EMPTY BECOMES UNDEFINED, not "". Cosmetic rather than load-bearing:
+        // `optionalOpaqueId` maps "" to null before any regex runs, so the
+        // route would accept a blank string too. (An earlier version of this
+        // comment claimed it answers `invalid_stage_id` for one. It does not —
+        // checked in the route.) Omitting the key is simply the honest way to
+        // say "the admin left this for later".
         ai_screening_stage_id: newMapping.ai_screening_stage_id.trim() || undefined,
         ta_screening_stage_id: newMapping.ta_screening_stage_id.trim() || undefined,
         label: newMapping.label.trim() || undefined,
