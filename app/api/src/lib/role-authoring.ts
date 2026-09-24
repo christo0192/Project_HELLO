@@ -109,8 +109,50 @@ export function roleDraftTimeoutMs(configuredMs: number): number {
 }
 
 export const ROLE_DRAFT_MAX_ATTEMPTS = 3;
-/** How many questions a draft aims for. */
-export const ROLE_DRAFT_QUESTION_COUNT = 6;
+
+/**
+ * THE SCREEN HAS A SHAPE, and it is not left to the model.
+ *
+ * A screening call that opens cold on a role-specific question is jarring, and
+ * one that ends without pay and notice leaves the recruiter to chase the two
+ * facts that decide whether the pipeline moves at all. The first live role
+ * authored with Ask Hello ("Sales v1 hiring") produced six perfectly speakable
+ * questions in no particular order and neither of those things.
+ *
+ * ASKED FOR AS "has to" AND "should always", SO THEY ARE FIXED TEXT rather
+ * than prompt rules. Earlier rounds established that the model complies with
+ * stated rules only most of the time — every generated question still goes
+ * through `validatePhoneQuestionTemplate`, and a rule that is merely REQUESTED
+ * costs a whole retry cycle when it is missed. These sentences are written
+ * once, checked by `roleArcQuestions()`'s own test against the real validator,
+ * and cannot drift.
+ *
+ * The operator can still edit or delete any of them in the form before saving;
+ * this is the default arc, not a lock.
+ */
+export const ROLE_DRAFT_OPENING_QUESTION =
+  'To start, could you tell me a little about yourself and walk me through your most recent role?';
+
+/**
+ * Pay and availability, always last.
+ *
+ * Last because they are the questions a candidate is most likely to bristle
+ * at, and asking them first sours everything after. Three separate questions
+ * rather than one compound one: "current CTC, expected CTC and notice period"
+ * in a single breath reliably gets one answer out of three back.
+ */
+export const ROLE_DRAFT_CLOSING_QUESTIONS = [
+  'What is your current annual CTC, including any variable pay?',
+  'What annual CTC are you looking for in your next position?',
+  'What is your notice period, and how soon could you join if things move ahead?',
+] as const;
+
+/** How many ROLE-SPECIFIC questions the model is asked to write. */
+export const ROLE_DRAFT_QUESTION_COUNT = 4;
+
+/** What the operator actually ends up with: opener + model's four + closers. */
+export const ROLE_DRAFT_TOTAL_QUESTIONS =
+  1 + ROLE_DRAFT_QUESTION_COUNT + ROLE_DRAFT_CLOSING_QUESTIONS.length;
 
 export interface RoleDraftQuestion {
   id: string;
@@ -245,8 +287,16 @@ Return ONLY a JSON object with exactly these keys:
   ]
 }
 
-Write ${ROLE_DRAFT_QUESTION_COUNT} screening questions. They are READ ALOUD to a
-candidate by an automated caller, so each one must:
+Write ${ROLE_DRAFT_QUESTION_COUNT} screening questions about THE WORK ITSELF.
+
+The call already opens by asking the candidate to introduce themselves and
+describe their most recent role, and it already ends by asking their current
+CTC, their expected CTC, and their notice period. Those four are added for
+you — do NOT write an introduction question, and do NOT ask about salary, CTC,
+compensation, notice period or availability. Write the middle of the
+conversation: what this person has actually done, and how they did it.
+
+They are READ ALOUD to a candidate by an automated caller, so each one must:
 - end with a question mark
 - be one sentence a person can say naturally in under 12 seconds
 - ask the candidate about THEIR experience, not about the hiring process
@@ -263,6 +313,49 @@ files" rather than "JSON or YAML", and "how do you go over the requirements"
 rather than "how do you read the requirements".
 
 Return the JSON object and nothing else.`;
+}
+
+/**
+ * The fixed opener and closers, wrapped around what the model wrote.
+ *
+ * APPLIED AFTER VALIDATION, not before. The model's questions are checked on
+ * their own, so a rejected attempt names only the sentence the model is
+ * actually being asked to fix — feeding it back the three CTC questions it
+ * never wrote would waste the repair budget explaining sentences that are
+ * already correct.
+ *
+ * Ids are re-issued across the whole list, because `validatePhoneQuestion`
+ * rejects duplicate keys and the model's four arrive as q1-q4.
+ */
+function withArc(draft: RoleDraft): RoleDraft {
+  // THE ARC COSTS FOUR SLOTS, and `coerceDraft` has already clamped to
+  // `MAX_QUESTIONS`. Splicing without re-clamping pushed a model that returned
+  // the ceiling to MAX_QUESTIONS + 4, which `createRoleSchema` then refuses —
+  // the "passes here, fails on Save after the operator waited minutes" failure
+  // this module exists to prevent. Caught by the existing clamp test.
+  //
+  // THE MIDDLE IS WHAT GIVES WAY. The opener and the three closers were asked
+  // for as "has to" and "always", so they are kept and the model's surplus
+  // questions are dropped from the end.
+  const room = MAX_QUESTIONS - 1 - ROLE_DRAFT_CLOSING_QUESTIONS.length;
+  const model = draft.screening_template.slice(0, Math.max(0, room));
+  const texts = [
+    ROLE_DRAFT_OPENING_QUESTION,
+    ...model.map((q) => q.question),
+    ...ROLE_DRAFT_CLOSING_QUESTIONS,
+  ];
+  // The opener and closers carry weight 1: they are asked of every candidate
+  // for every role, so nothing about them discriminates between two people.
+  // The model's own weights survive for the role-specific middle.
+  const weights = [1, ...model.map((q) => q.weight), ...ROLE_DRAFT_CLOSING_QUESTIONS.map(() => 1)];
+  return {
+    ...draft,
+    screening_template: texts.map((question, i) => ({
+      id: `q${i + 1}`,
+      question,
+      weight: weights[i] ?? 1,
+    })),
+  };
 }
 
 /**
@@ -489,7 +582,7 @@ export async function generateRoleDraft(
     });
 
     if (issues.size === 0 && shapeIssues.size === 0) {
-      return { draft, attempts: attempt, repaired: [...new Set(repaired)] };
+      return { draft: withArc(draft), attempts: attempt, repaired: [...new Set(repaired)] };
     }
 
     // Rebuilt per attempt, not appended: `repaired` used to accumulate every
@@ -535,5 +628,122 @@ export async function generateRoleDraft(
     'unspeakable_questions',
     failures,
     ROLE_DRAFT_MAX_ATTEMPTS,
+  );
+}
+
+
+/**
+ * Rephrase ONE question until the phone gate will read it aloud.
+ *
+ * WHY THIS EXISTS. `validatePhoneQuestion` is unforgiving and indifferent to
+ * intent: it bans the words *system*, *developer*, *assistant*, *model*,
+ * *prompt*, *instruction*, *interviewer* and *recruiter* anywhere in a
+ * question, so "how do you keep an applicant tracking system current?" is
+ * refused for the word *system*. An operator typing their own question hits
+ * that wall with no way over it — the form says the sentence is unusable and
+ * leaves them to guess which word offended. This turns that dead end into a
+ * button.
+ *
+ * NOT A JOB, unlike drafting. This returns one sentence of about fifteen
+ * words, so it answers inside a normal request rather than needing a row, a
+ * poll and a cancel. The point is that it feels instant beside the field it
+ * fixes.
+ *
+ * THE MODEL IS NEVER TRUSTED, only used. Its suggestion goes through the same
+ * `validatePhoneQuestion` and `generatedQuestionIssue` that the save path and
+ * the generator use; a suggestion that still fails is retried once with the
+ * specific failure quoted back, and a second failure is reported rather than
+ * returned. A "rephrase" that hands back another unusable sentence would be
+ * worse than the error message it replaced.
+ */
+export interface RephraseDeps {
+  /** Seam for tests; defaults to the real provider call. */
+  infer?: (prompt: string) => Promise<unknown>;
+  runJson?: typeof runClaudeJSONWithProvenance;
+}
+
+/** How many provider calls one press of Rephrase may cost. */
+export const REPHRASE_MAX_ATTEMPTS = 2;
+
+function buildRephrasePrompt(question: string, priorFailure: string | null): string {
+  const repair = priorFailure
+    ? `\nYOUR PREVIOUS SUGGESTION WAS REJECTED: ${priorFailure}\nFix exactly that and keep the meaning.\n`
+    : '';
+  return `Rewrite the screening question below so an automated caller can read it
+aloud to a job candidate. Keep what it is asking about; change only the wording.
+
+QUESTION: ${question}
+${repair}
+The rewritten question must:
+- end with a question mark
+- be one sentence a person can say naturally in under 12 seconds
+- ask the candidate about THEIR experience, not about the hiring process
+- NOT begin with any of: ask, probe, explore, cover, check, confirm, discuss, understand, find
+- NOT contain any of these words: ${BANNED_WORDS.join(', ')}
+- NOT contain the words json, xml or yaml, any of [ ] { } < >, or backticks
+- NOT contain "must/should/do not" followed by "ask/say/tell/mention/reveal/ignore"
+- NOT contain "read/repeat/output/respond" followed by "the" or "this"
+
+Those rules are checked mechanically. Work around them rather than arguing with
+them: say "applicant tracking tools" rather than "applicant tracking system",
+"engineers" rather than "developers", "config files" rather than "JSON or YAML".
+
+Return ONLY a JSON object: {"question": "..."}`;
+}
+
+export async function rephraseQuestion(
+  question: string,
+  deps: RephraseDeps = {},
+): Promise<string> {
+  const infer =
+    deps.infer ??
+    (async (prompt: string) => {
+      const run = deps.runJson ?? runClaudeJSONWithProvenance;
+      const { data } = await run<unknown>(prompt, {
+        model: env.deepseekScoringModel,
+        // NOT the draft's 240s floor. That floor exists because a full draft
+        // is three JD-sized generations; this is one short sentence, and a
+        // four-minute spinner on a button beside a text field would read as
+        // broken. The configured budget is enough and is not raised.
+        timeoutMs: env.deepseekTimeoutMs,
+      });
+      return data;
+    });
+
+  let priorFailure: string | null = null;
+  let lastIssue = 'the rewritten question still could not be read aloud';
+
+  for (let attempt = 1; attempt <= REPHRASE_MAX_ATTEMPTS; attempt += 1) {
+    const raw = await infer(buildRephrasePrompt(question, priorFailure));
+    const obj = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+    const text = typeof obj.question === 'string' ? obj.question.trim() : '';
+    if (!text || text.length > MAX_QUESTION_CHARS) {
+      priorFailure = 'the response was not a JSON object carrying a non-empty "question" string';
+      lastIssue = priorFailure;
+      continue;
+    }
+
+    // THE SAME TWO GATES the generator applies, in the same order.
+    const issues = validatePhoneQuestionTemplate([{ id: 'q1', question: text }]);
+    const list = issues.get(0);
+    if (list) {
+      priorFailure = phoneQuestionIssueMessage(0, list).replace(/^Question 1 /, 'it ');
+      lastIssue = priorFailure;
+      continue;
+    }
+    const shapeIssue = generatedQuestionIssue(text);
+    if (shapeIssue) {
+      priorFailure = `it ${shapeIssue}`;
+      lastIssue = priorFailure;
+      continue;
+    }
+    return text;
+  }
+
+  throw new RoleDraftError(
+    'Hello could not rephrase that question into something the screener will read aloud.',
+    'unspeakable_questions',
+    [lastIssue],
+    REPHRASE_MAX_ATTEMPTS,
   );
 }

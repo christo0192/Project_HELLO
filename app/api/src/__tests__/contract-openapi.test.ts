@@ -1119,7 +1119,11 @@ describe('OpenAPI document integrity', () => {
     // number is deliberately unchanged at 135. (Writing it as a separate key
     // is how the first attempt broke — two `/api/roles/draft:` blocks in the
     // YAML, and the duplicate silently ate the POST.)
-    expect(Object.keys(paths).length).toBe(135);
+    // Ask Hello's per-question Rephrase adds ONE recruiter-facing path —
+    // POST /api/roles/questions/rephrase. It is its own URL rather than a verb
+    // on /api/roles/draft because it is synchronous and question-scoped, where
+    // every /draft route is job-scoped. 135 + 1 = 136.
+    expect(Object.keys(paths).length).toBe(136);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas

@@ -4,6 +4,7 @@ import { validateBody, validateParams } from '../lib/validation.js';
 import {
   createRoleSchema,
   roleDraftSchema,
+  rephraseQuestionSchema,
   roleIdParamSchema,
   updateRoleSchema,
 } from '../schemas/roles.js';
@@ -16,6 +17,7 @@ import {
   RoleDraftBusyError,
   startRoleDraft,
 } from '../lib/role-draft-jobs.js';
+import { rephraseQuestion, RoleDraftError } from '../lib/role-authoring.js';
 
 export const rolesRouter = Router();
 
@@ -98,6 +100,48 @@ rolesRouter.post(
             type: 'conflict',
             message: err.message,
             details: { job_role: err.liveJobRole },
+          },
+        });
+      }
+      next(err);
+    }
+  },
+);
+
+/**
+ * Rewrite ONE question so the phone gate will read it aloud.
+ *
+ * SYNCHRONOUS, unlike `/draft`. One short sentence comes back in a single
+ * short generation, so there is no row, no poll and nothing to cancel — the
+ * button sits beside the field it fixes and behaves like it.
+ *
+ * 422, NOT 500, when the model cannot manage it. "Hello could not rephrase
+ * that" is a true statement about a working system; an Internal Server Error
+ * would send the operator to look for an outage that is not there.
+ */
+rolesRouter.post(
+  '/questions/rephrase',
+  requireRole('interviewer'),
+  validateBody(rephraseQuestionSchema),
+  async (req, res, next) => {
+    const { question } = req.body as { question: string };
+    try {
+      const rephrased = await rephraseQuestion(question);
+      try {
+        await recordAudit(req, 'resource.generate', 200, {
+          metadata: { action: 'question_rephrase' },
+        });
+      } catch {
+        /* as with /draft: this writes no role, so a dead sink must not lose it */
+      }
+      res.json({ question: rephrased });
+    } catch (err) {
+      if (err instanceof RoleDraftError) {
+        return res.status(422).json({
+          error: {
+            type: 'unprocessable_entity',
+            message: err.message,
+            details: { reason: err.reason },
           },
         });
       }

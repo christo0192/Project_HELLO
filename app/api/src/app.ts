@@ -354,6 +354,17 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.post('/api/roles/draft', createRateLimitMiddleware({
     config: roleDraftStartRateLimit, prefix: 'role-draft-start:', useUserKey: true,
   }));
+  // REPHRASE IS ALSO MODEL-INVOKING, but one short generation rather than six
+  // long ones, so it takes the STRICT bucket the other provider-backed routes
+  // use rather than a third one of its own. 20/window is roughly one press per
+  // question on a long template, which is the realistic ceiling for a button
+  // that sits beside a field. Mounted on the POST for the same reason the
+  // draft limiter is: `app.use` would catch nothing else here today, but the
+  // next `/api/roles/questions/...` read added beneath it would inherit a
+  // bucket sized for generations.
+  app.post('/api/roles/questions/rephrase', createRateLimitMiddleware({
+    config: strictRateLimit, prefix: 'role-rephrase:', useUserKey: true,
+  }));
   app.use('/api/candidates', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'candidates:', useUserKey: true }));
   app.use('/api/screening', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'screening:', useUserKey: true }));
   app.use('/api/assess', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'assess:', useUserKey: true }));

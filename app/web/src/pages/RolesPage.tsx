@@ -272,6 +272,42 @@ function RoleForm({
    */
   const [draftError, setDraftError] = useState<string | null>(null);
 
+  /**
+   * The question currently being rewritten, and what went wrong last time.
+   *
+   * Keyed by INDEX rather than a single boolean: the operator can press
+   * Rephrase on question 2 while question 5's suggestion is still in flight,
+   * and one shared flag would spin both buttons and let the slower answer
+   * overwrite the faster one's row.
+   */
+  const [rephrasingIdx, setRephrasingIdx] = useState<number | null>(null);
+  const [rephraseError, setRephraseError] = useState<{ idx: number; message: string } | null>(
+    null,
+  );
+
+  async function rephrase(idx: number) {
+    const text = questions[idx]?.question.trim();
+    if (!text || rephrasingIdx !== null) return;
+    setRephraseError(null);
+    setRephrasingIdx(idx);
+    try {
+      const { question } = await api.rephraseQuestion(text);
+      // WRITTEN BACK BY INDEX through the functional updater, not by closing
+      // over `questions`: the operator can add or remove a row while the call
+      // is out, and a stale snapshot would restore the row they deleted.
+      setQuestions((prev) => prev.map((q, i) => (i === idx ? { ...q, question } : q)));
+    } catch (err) {
+      // 422 is the model failing to phrase it, not an outage. Either way the
+      // operator's own text is left exactly as they typed it.
+      setRephraseError({
+        idx,
+        message: err instanceof ApiError ? err.message : 'Rephrase failed. Try again.',
+      });
+    } finally {
+      setRephrasingIdx(null);
+    }
+  }
+
   function updateQuestion(idx: number, patch: Partial<QuestionRow>) {
     setQuestions((prev) =>
       prev.map((q, i) => (i === idx ? { ...q, ...patch } : q)),
@@ -543,23 +579,49 @@ function RoleForm({
                     <span className="font-mono text-[11px] text-ink-tertiary">
                       {q.id || `q${idx + 1}`}
                     </span>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => removeQuestion(idx)}
-                      aria-label="Remove question"
-                      disabled={questions.length === 1}
-                    >
-                      Remove
-                    </Button>
+                    <div className="flex items-center gap-1">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => void rephrase(idx)}
+                        // NAMED FOR THE ROW, not just "Rephrase". A screen
+                        // reader moving through eight questions would
+                        // otherwise hear the same word eight times with
+                        // nothing to tell them apart.
+                        aria-label={`Rephrase question ${idx + 1}`}
+                        // Disabled while ANY rephrase is out, so two presses
+                        // cannot race to write the same list.
+                        disabled={rephrasingIdx !== null || !q.question.trim()}
+                      >
+                        {rephrasingIdx === idx ? "Rephrasing…" : "Rephrase"}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => removeQuestion(idx)}
+                        aria-label={`Remove question ${idx + 1}`}
+                        disabled={questions.length === 1}
+                      >
+                        Remove
+                      </Button>
+                    </div>
                   </div>
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
                     <Field
                       className="min-w-0 flex-1"
                       label={`Question ${idx + 1}`}
                       id={`role-question-${idx}`}
-                      error={issue ?? undefined}
+                      // The row's OWN failure wins over the static validation
+                      // message: "Hello could not rephrase that" is news, and
+                      // the gate complaint underneath it is what the operator
+                      // already knew.
+                      error={
+                        (rephraseError?.idx === idx ? rephraseError.message : null) ??
+                        issue ??
+                        undefined
+                      }
                     >
                       {({ id, describedBy, invalid }) => (
                         <TextField

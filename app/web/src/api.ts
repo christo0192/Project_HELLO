@@ -188,6 +188,18 @@ export const api = {
   /** Stops the v4-pro spending, not just the spinner. */
   cancelRoleDraft: (id: string) =>
     request<{ cancelled: boolean }>(`/api/roles/draft/${id}/cancel`, { method: 'POST' }),
+  /**
+   * Rewrite one question so the phone gate will read it aloud.
+   *
+   * Synchronous, unlike drafting: one short sentence, one short generation,
+   * no job row to poll. A 422 means the model tried twice and could not — the
+   * caller shows that message rather than treating it as an outage.
+   */
+  rephraseQuestion: (question: string) =>
+    request<{ question: string }>('/api/roles/questions/rephrase', {
+      method: 'POST',
+      body: JSON.stringify({ question }),
+    }),
   getRole: (id: string) => request<Role>(`/api/roles/${id}`),
   createRole: (body: RoleInput) =>
     request<Role>('/api/roles', {

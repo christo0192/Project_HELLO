@@ -32,6 +32,7 @@ const mockApi = {
   startRoleDraft: vi.fn(),
   getRoleDraft: vi.fn(),
   cancelRoleDraft: vi.fn(),
+  rephraseQuestion: vi.fn(),
 };
 
 vi.mock('../api', () => ({
@@ -46,6 +47,7 @@ vi.mock('../api', () => ({
     startRoleDraft: (...args: any[]) => mockApi.startRoleDraft(...args),
     getRoleDraft: (...args: any[]) => mockApi.getRoleDraft(...args),
     cancelRoleDraft: (...args: any[]) => mockApi.cancelRoleDraft(...args),
+    rephraseQuestion: (...args: any[]) => mockApi.rephraseQuestion(...args),
   },
   ApiError: class extends Error {
     status: number;
@@ -428,5 +430,78 @@ describe('RolesPage', () => {
     const btn = await screen.findByRole('button', { name: 'New role' });
     await userEvent.click(btn);
     await expect(container).toHaveNoViolations();
+  });
+});
+
+describe('Rephrase — the way out of an unforgiving question gate', () => {
+  // `validatePhoneQuestion` bans "system", "developer", "model" and five more
+  // words outright, so an operator typing the natural phrasing for a Talent
+  // Acquisition role hits a wall the form cannot help them over. These tests
+  // are about the button being a way THROUGH that wall rather than one more
+  // thing that fails quietly.
+  async function openEditor() {
+    mockApi.listRoles.mockResolvedValue([mockRole]);
+    // The edit form mounts RoleScorecardEditor too, and its effect calls both
+    // of these. Left undefined they reject inside an effect, which unmounts
+    // the page — and the button under test disappears for a reason that has
+    // nothing to do with rephrasing.
+    mockApi.getRoleScorecard.mockResolvedValue({ scorecard: { metrics: [] } });
+    mockApi.listScorecardMetrics.mockResolvedValue([]);
+    // The call LOG, not the implementation: `mockApi` is built once for the
+    // whole file, so the "must not be called" assertion below would otherwise
+    // see the click from the first test in this block and fail for a reason
+    // that is not about the code. Verified — that test passed alone and
+    // failed in the file.
+    mockApi.rephraseQuestion.mockClear();
+    render(<RolesPage />);
+    const edit = await screen.findByRole('button', { name: /edit/i });
+    await userEvent.click(edit);
+    return (await screen.findByLabelText('Question 1')) as HTMLInputElement;
+  }
+
+  it('REPLACES the question with the rewrite', async () => {
+    mockApi.rephraseQuestion.mockResolvedValue({
+      question: 'How do you keep your applicant tracking tools up to date?',
+    });
+    const field = await openEditor();
+    const before = field.value;
+
+    await userEvent.click(screen.getByRole('button', { name: 'Rephrase question 1' }));
+
+    await waitFor(() =>
+      expect((screen.getByLabelText('Question 1') as HTMLInputElement).value).toBe(
+        'How do you keep your applicant tracking tools up to date?',
+      ),
+    );
+    expect(mockApi.rephraseQuestion).toHaveBeenCalledWith(before);
+  });
+
+  it('LEAVES THE OPERATOR TEXT ALONE when the model cannot phrase it', async () => {
+    // The whole value of the button is that a failure costs nothing. Clearing
+    // the field, or writing a half-answer into it, would lose work the
+    // operator typed — for a feature whose entire promise is "fail proof".
+    mockApi.rephraseQuestion.mockRejectedValue(new Error('nope'));
+    const field = await openEditor();
+    const before = field.value;
+
+    await userEvent.click(screen.getByRole('button', { name: 'Rephrase question 1' }));
+
+    await waitFor(() => expect(screen.getByText(/rephrase failed/i)).toBeInTheDocument());
+    expect((screen.getByLabelText('Question 1') as HTMLInputElement).value).toBe(before);
+  });
+
+  it('names the ROW it belongs to, not just "Rephrase"', async () => {
+    // Eight questions means eight identical buttons to anyone navigating by
+    // control. The row number is the only thing telling them apart.
+    await openEditor();
+    expect(screen.getByRole('button', { name: 'Rephrase question 1' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Remove question 1' })).toBeInTheDocument();
+  });
+
+  it('does NOT offer to rephrase an empty question', async () => {
+    const field = await openEditor();
+    await userEvent.clear(field);
+    expect(screen.getByRole('button', { name: 'Rephrase question 1' })).toBeDisabled();
+    expect(mockApi.rephraseQuestion).not.toHaveBeenCalled();
   });
 });

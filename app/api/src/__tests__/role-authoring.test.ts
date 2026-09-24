@@ -22,6 +22,7 @@ import {
   ROLE_DRAFT_MAX_ATTEMPTS,
   ROLE_DRAFT_MIN_TIMEOUT_MS,
   ROLE_DRAFT_QUESTION_COUNT,
+  ROLE_DRAFT_CLOSING_QUESTIONS,
 } from '../lib/role-authoring.js';
 import {
   validatePhoneQuestion,
@@ -31,6 +32,20 @@ import { BusinessError } from '../lib/provider-resilience.js';
 import { createRoleSchema } from '../schemas/roles.js';
 
 /** A draft every gate accepts. At least MIN_QUESTIONS (3) entries. */
+/**
+ * The MODEL'S questions, with the fixed arc stripped off.
+ *
+ * `generateRoleDraft` now delivers a fixed opening question, the model's
+ * questions, then the three fixed CTC/notice closers. Every assertion in this
+ * file is about what the MODEL produced — weights it chose, ids we assigned,
+ * entries it malformed — so they read the middle rather than the whole list.
+ * Asserting on the whole list would make each of them fail the next time the
+ * arc changes, for a reason that has nothing to do with what they test.
+ */
+function middle(draft: { screening_template: Array<{ id: string; question: string; weight: number }> }) {
+  return draft.screening_template.slice(1, -ROLE_DRAFT_CLOSING_QUESTIONS.length);
+}
+
 function goodDraft(overrides: Record<string, unknown> = {}) {
   return {
     jd: 'A job description with enough prose to be usable.',
@@ -55,8 +70,8 @@ describe('generateRoleDraft — nothing unspeakable escapes', () => {
     expect(repaired).toEqual([]);
     expect(draft.jd).toBe('A job description with enough prose to be usable.');
     expect(draft.required_skills).toEqual(['Communication', 'Sales']);
-    expect(draft.screening_template).toHaveLength(3);
-    expect(draft.screening_template[0].weight).toBe(1);
+    expect(middle(draft)).toHaveLength(3);
+    expect(middle(draft)[0].weight).toBe(1);
     for (const entry of draft.screening_template) {
       expect(validatePhoneQuestion(entry.question)).toEqual([]);
     }
@@ -89,7 +104,7 @@ describe('generateRoleDraft — nothing unspeakable escapes', () => {
     // 9999 clamps DOWN to the schema's ceiling; a negative and a non-number
     // both fall back to the neutral 1 rather than to 0, because 0 means "this
     // metric does not count" and inventing that is a different claim.
-    expect(draft.screening_template.map((e) => e.weight)).toEqual([100, 1, 1]);
+    expect(middle(draft).map((e) => e.weight)).toEqual([100, 1, 1]);
     expect(draft.required_skills[1].length).toBe(200);
   });
 
@@ -248,7 +263,12 @@ describe('generateRoleDraft — nothing unspeakable escapes', () => {
       }),
     );
     const { draft } = await generateRoleDraft('Any', { infer });
-    expect(draft.screening_template.map((e) => e.id)).toEqual(['q1', 'q2', 'q3']);
+    // Ids are OURS across the WHOLE delivered list, arc included: the save
+    // path refuses duplicate keys, and the model's q1-q3 sit in the middle of
+    // seven questions now, so they are re-issued rather than passed through.
+    const ids = draft.screening_template.map((e) => e.id);
+    expect(ids).toEqual(ids.map((_, i) => `q${i + 1}`));
+    expect(new Set(ids).size).toBe(ids.length);
   });
 });
 
@@ -308,7 +328,7 @@ describe('generateRoleDraft — provider failures', () => {
 
     const { draft, attempts } = await generateRoleDraft('Any', { infer });
     expect(attempts).toBe(2);
-    expect(draft.screening_template).toHaveLength(3);
+    expect(middle(draft)).toHaveLength(3);
   });
 
   it('names the provider failure when it burns every attempt', async () => {
@@ -373,7 +393,7 @@ describe('generateRoleDraft — cancellation actually stops the spending', () =>
     const infer = vi.fn().mockResolvedValue(goodDraft());
     const shouldCancel = vi.fn().mockResolvedValue(false);
     const { draft } = await generateRoleDraft('Any', { infer, shouldCancel });
-    expect(draft.screening_template).toHaveLength(3);
+    expect(middle(draft)).toHaveLength(3);
     expect(infer).toHaveBeenCalledTimes(1);
   });
 
@@ -409,7 +429,7 @@ describe('generateRoleDraft — an unreadable answer is not an outage', () => {
       .mockResolvedValueOnce(goodDraft());
     const { draft, attempts } = await generateRoleDraft('Any', { infer });
     expect(attempts).toBe(2);
-    expect(draft.screening_template).toHaveLength(3);
+    expect(middle(draft)).toHaveLength(3);
     const secondPrompt = infer.mock.calls[1][0] as string;
     expect(secondPrompt).toContain('could not be read as JSON');
   });
@@ -704,7 +724,7 @@ describe('generateRoleDraft — the clamps the SAVE PATH will enforce', () => {
     );
     const { draft } = await generateRoleDraft('Any', { infer });
     expect(infer).toHaveBeenCalledTimes(1);
-    expect(draft.screening_template).toHaveLength(3);
+    expect(middle(draft)).toHaveLength(3);
     expect(draft.screening_template.every((entry) => entry.question.length < 2_000)).toBe(true);
     expect(() =>
       createRoleSchema.parse({ title: 'Sales Advisor', ...draft }),
@@ -847,6 +867,6 @@ describe('generateRoleDraft — progress reporting', () => {
         throw new Error('client went away');
       },
     });
-    expect(draft.screening_template).toHaveLength(3);
+    expect(middle(draft)).toHaveLength(3);
   });
 });
