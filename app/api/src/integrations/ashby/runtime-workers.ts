@@ -30,6 +30,15 @@
  */
 
 import { createLogger } from '../../lib/logger.js';
+import {
+  CANDIDATE_QUESTIONS_QUEUE,
+  CANDIDATE_QUESTIONS_MAX_JOB_ATTEMPTS,
+  runCandidateQuestionsJob,
+  type CandidateQuestionsStore,
+} from '../../lib/candidate-question-jobs.js';
+import { createCandidateQuestionStore } from '../../lib/candidate-question-store.js';
+import { supabase } from '../../lib/supabase.js';
+import { env } from '../../lib/env.js';
 import { deriveCandidatePhone } from '../../lib/candidate-phone.js';
 import {
   createQueueRunner,
@@ -110,6 +119,23 @@ import type { AshbySignalPayload, EnabledMappingLoader } from './ports.js';
 
 /** Queue name for the ephemeral resume ingestion of one application link. */
 export const ASHBY_INGESTION_QUEUE = 'ashby.ingestion';
+
+/**
+ * Should a candidate admitted to phone screening get questions written about
+ * their own résumé?
+ *
+ * A KILL SWITCH, not a rollout gate: the feature is on by default because its
+ * failure mode is already the old behaviour — `0103`'s plan builder falls back
+ * to the role template whenever a generated set is absent, unfinished or
+ * malformed, so a candidate never gets a worse screen than they would have got
+ * before it existed. What the switch is for is COST: one provider call per
+ * admitted candidate, sharing a circuit breaker with résumé parsing and
+ * scoring. Setting it to `false` stops the enqueue at source, so nothing is
+ * claimed, leased or billed.
+ */
+function candidateQuestionsEnabled(): boolean {
+  return process.env.CANDIDATE_QUESTIONS_ENABLED !== 'false';
+}
 
 /**
  * How long the stage-interest set is trusted before a re-read. Deliberately
@@ -610,6 +636,12 @@ export interface AshbyHandlerDeps {
   midflightRecheckSeconds?: number;
   /** Injectable clock for the deadline (tests). */
   nowMs?: () => number;
+  /**
+   * The per-candidate question store. Production builds one over the runtime's
+   * service-role client; a test drives a fake and nothing here reaches a
+   * database by accident.
+   */
+  candidateQuestionStore?: CandidateQuestionsStore;
   /**
    * Override the local stage pre-filter handed to {@link processAshbySignal}.
    * Injected by tests; production builds one from the runtime's enabled-mapping
@@ -1186,7 +1218,76 @@ export function buildAshbyHandlers(
         && result.outcome.state === 'ready'
         && runtime.stores.ensurePhoneEngagement) {
         await runtime.stores.ensurePhoneEngagement(linkId);
+
+        // ── AND ASK FOR THIS CANDIDATE'S OWN QUESTIONS ──────────────────
+        // HERE, because this is the first moment we know the person will
+        // actually be called — and it is comfortably before the due loop
+        // dials, which is the deadline that matters. Doing it at import
+        // would pay a provider call for every résumé that lands, most of
+        // which never reach a phone screen.
+        //
+        // ENQUEUED, NOT RUN. Generation is one call of up to two minutes;
+        // running it inline would hold this ingestion lease for that long on
+        // a drain that is tick-rate bound and has a starvation history. The
+        // queue owns the lease, the retry and the crash recovery.
+        //
+        // BEST EFFORT, AND SILENT ON FAILURE. Every outcome of this enqueue —
+        // including not happening at all — leaves the call running the role's
+        // own template. Letting an enqueue fault fail the INGESTION would
+        // trade a working import for a nicer question, which is the wrong way
+        // round.
+        if (candidateQuestionsEnabled()) {
+          try {
+            await runtime.queue.enqueue(
+              CANDIDATE_QUESTIONS_QUEUE,
+              { applicationLinkId: linkId },
+              {
+                // Keyed on the application, so a redelivery, a reconciliation
+                // recovery and a retried ingestion collapse onto one job.
+                dedupKey: `candidate-questions:${linkId}`,
+                maxAttempts: CANDIDATE_QUESTIONS_MAX_JOB_ATTEMPTS,
+              },
+            );
+          } catch (error) {
+            // Sanitized code only: no link id, no candidate, no provider
+            // message — a provider message can carry whatever it was handed.
+            logger.warn('unknown_event', {
+              error_category: 'candidate_questions_enqueue_failed',
+              error_type: 'ingestion_ready',
+            });
+          }
+        }
       }
+    },
+
+    // ── 4. Write this candidate's own profile-relevance and stability
+    //       questions, from their résumé ───────────────────────────────────
+    // The handler is a thin adapter: every decision — regenerate or not,
+    // retry or record — lives in `runCandidateQuestionsJob`, against an
+    // injectable store, so none of it needs a queue or a database to test.
+    //
+    // THE ONLY THROW IS A PROVIDER FAULT, which is the only failure the
+    // queue's retry can do anything about. A résumé this model cannot write a
+    // speakable question about fails the same way every time, so it is
+    // RECORDED and the job completes; re-running it would pay for the same
+    // answer twice and leave a job churning attempts over a call that is
+    // already correct.
+    [CANDIDATE_QUESTIONS_QUEUE]: async (job) => {
+      const payload = job.payload as { applicationLinkId?: string };
+      const linkId = payload?.applicationLinkId;
+      if (typeof linkId !== 'string' || linkId.length === 0) return;
+      // The SERVICE-ROLE client, not `runtime.client` — that one talks to
+      // Ashby. Reached through the process singleton the way every other store
+      // in this package does, with the seam above for tests.
+      const store = deps.candidateQuestionStore ?? createCandidateQuestionStore(supabase);
+      const outcome = await runCandidateQuestionsJob(
+        { applicationLinkId: linkId },
+        { store, model: env.deepseekScoringModel },
+      );
+      logger.info('unknown_event', {
+        error_category: 'candidate_questions_job',
+        error_type: outcome,
+      });
     },
   };
 }

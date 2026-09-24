@@ -408,6 +408,21 @@ describe('2. no provider, no dialing, no network, no Ashby mutation', () => {
       // save path then rejects, or worse, questions the worker refuses to read
       // mid-call. It dials nothing and loops nowhere.
       'lib/role-authoring.ts',
+      // The PER-CANDIDATE generator, for the same reason and with more at
+      // stake. `role-authoring.ts` writes questions from a job title; this one
+      // writes them from the candidate's own résumé — attacker-controlled text
+      // — into a question the bot then SAYS OUT LOUD to that same person. So
+      // it reaches the domain core for `validatePhoneQuestion`, the pure
+      // contract deciding whether a sentence can be read aloud at all, and
+      // layers its own topic deny-list ON TOP rather than instead.
+      //
+      // A second, looser copy of the speakability rules on the path a model
+      // writes through is exactly what this allowlist exists to catch: it would
+      // pass questions the save path then rejects, or questions the worker
+      // refuses mid-call. It dials nothing and loops nowhere — the queue
+      // handler that drives it lives in the Ashby package and does not import
+      // the core, which is why only this file is listed.
+      'lib/candidate-questions.ts',
       // Post-call callback backstop. The assessment scorer, when the candidate
       // asked to be called back, books a `system_deferral` appointment through
       // the PURE `scheduleAppointment` write (and reads a live appointment to
