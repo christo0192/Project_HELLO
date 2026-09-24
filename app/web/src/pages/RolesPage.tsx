@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../api";
 import type { Role, RoleInput, ScreeningQuestion } from "../types";
 import {
@@ -26,6 +26,16 @@ interface QuestionRow {
   id: string;
   question: string;
   weight: number;
+  /**
+   * Rendered as `[MUST ASK] ` in the phone worker's prompt and prioritised
+   * when the call runs long.
+   *
+   * CARRIED, NOT STRIPPED. The form used to drop this on the way to Save, so
+   * the arc's "always ask CTC and notice" was true of the draft and false of
+   * the call — the worker saw four ordinary bank entries inside a prompt that
+   * says to cover the bank "where relevant".
+   */
+  mandatory?: boolean;
 }
 
 function emptyQuestion(index: number): QuestionRow {
@@ -69,6 +79,60 @@ export function RolesPage() {
 
   useEffect(load, [load]);
 
+  /** The role currently being removed, so only its button says so. */
+  const [deletingId, setDeletingId] = useState<string | null>(null);
+  /** What the last removal did, in words. Cleared on the next one. */
+  const [removalNote, setRemovalNote] = useState<string | null>(null);
+
+  /**
+   * Remove a role, and tell the operator WHICH of the three things happened.
+   *
+   * The server deletes only a role nothing references; one with candidates or
+   * call sessions is ARCHIVED instead, so every historical record still says
+   * which job it belonged to, and one mapped to an Ashby job is refused.
+   *
+   * AN ARCHIVED CARD STAYS ON THIS PAGE, flipped to "Inactive" — `GET
+   * /api/roles` has no `is_active` filter. That is defensible, but it is not
+   * what a button labelled Delete leads anyone to expect, so the note says
+   * which of the three happened. An earlier version of this comment claimed
+   * the card goes away in every case; it does not, and a maintainer would
+   * have trusted it.
+   */
+  const removeRole = useCallback(
+    async (role: Role) => {
+      if (deletingId) return;
+      // CONFIRMED, because this is destructive and one click from a list.
+      // The wording promises only what the server will actually do.
+      if (
+        typeof window !== "undefined" &&
+        !window.confirm(
+          `Remove "${role.title}"? If candidates have already been screened for it, it is archived rather than deleted so their records keep the job they applied for.`,
+        )
+      ) {
+        return;
+      }
+      setRemovalNote(null);
+      setError(null);
+      setDeletingId(role.id);
+      try {
+        const result = await api.deleteRole(role.id);
+        setRemovalNote(
+          result.outcome === "archived"
+            ? `"${role.title}" was archived rather than deleted — ${result.candidates ?? 0} candidate${result.candidates === 1 ? "" : "s"} and ${result.sessions ?? 0} session${result.sessions === 1 ? "" : "s"} still reference it.`
+            : `"${role.title}" was deleted.`,
+        );
+        load();
+      } catch (e) {
+        // A 409 (mapped to an Ashby job) arrives here with the server's own
+        // sentence, which names what to do about it.
+        setError(e instanceof ApiError ? e.message : "Could not remove the role.");
+      } finally {
+        setDeletingId(null);
+      }
+    },
+    [deletingId, load],
+  );
+
   const pager = usePagination(roles ?? [], 10);
 
   return (
@@ -102,6 +166,16 @@ export function RolesPage() {
       )}
 
       {error && <ErrorPanel message={error} onRetry={load} />}
+
+      {removalNote && (
+        // `role="status"`, so the outcome is ANNOUNCED. Deleted and archived
+        // are told apart only by this sentence — the archived card stays on
+        // the page as "Inactive" and the deleted one goes — so someone who
+        // cannot see the grid has nothing else to go on.
+        <InlineNotice tone="info" role="status" className="mt-1">
+          {removalNote}
+        </InlineNotice>
+      )}
       {!error && roles === null && <LoadingPanel label="Loading roles…" />}
       {!error && roles !== null && roles.length === 0 && editing === null && (
         <EmptyPanel
@@ -166,14 +240,37 @@ export function RolesPage() {
                     <p className="text-[13px] text-ink-tertiary">
                       {role.screening_template.length} screening question{role.screening_template.length === 1 ? "" : "s"}
                     </p>
-                    <Button
-                      size="sm"
-                      variant="secondary"
-                      onClick={() => setEditing(role)}
-                      className="shrink-0"
-                    >
-                      Edit
-                    </Button>
+                    <div className="flex shrink-0 items-center gap-2">
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => setEditing(role)}
+                      >
+                        Edit
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        onClick={() => void removeRole(role)}
+                        // NAMED FOR THE ROLE, and the name FOLLOWS THE STATE.
+                        // A page of six cards means six identical "Delete"
+                        // controls to anyone navigating by control; the title
+                        // tells them apart and is the last thing they hear
+                        // before a destructive action. A static label while
+                        // the visible text becomes "Deleting…" is the SC 2.5.3
+                        // mismatch the Rephrase button two elements away was
+                        // just fixed for.
+                        aria-label={
+                          deletingId === role.id
+                            ? `Deleting role ${role.title}…`
+                            : `Delete role ${role.title}`
+                        }
+                        aria-busy={deletingId === role.id}
+                        aria-disabled={deletingId !== null}
+                      >
+                        {deletingId === role.id ? "Deleting…" : "Delete"}
+                      </Button>
+                    </div>
                   </div>
                 </GlassPanel>
               </RevealItem>
@@ -256,6 +353,13 @@ function RoleForm({
       id: q.id,
       question: q.question,
       weight: q.weight,
+      // CARRIED THROUGH THE EDIT ROUND TRIP. `PUT /api/roles/:id` replaces
+      // `screening_template` wholesale, and this map is what it is rebuilt
+      // from — so dropping the flag here meant opening a role to fix a typo
+      // in the JD and silently removing every `[MUST ASK]` from it on Save.
+      // The flag appears nowhere in the UI, so it was invisible and
+      // unrecoverable short of re-running a ten-minute draft.
+      mandatory: q.mandatory,
     })) ?? [emptyQuestion(1)],
   );
   const [saving, setSaving] = useState(false);
@@ -272,7 +376,88 @@ function RoleForm({
    */
   const [draftError, setDraftError] = useState<string | null>(null);
 
+  /**
+   * The question currently being rewritten, and what went wrong last time.
+   *
+   * The index, not a boolean, because the UI has to say WHICH row is busy —
+   * one shared flag would spin all eight buttons. It is not a concurrency
+   * mechanism: `rephrase()` returns early while another is in flight and
+   * every button is `aria-disabled` meanwhile, so exactly one request is ever
+   * out. (An earlier version of this comment claimed the opposite, and a
+   * maintainer reading it would go looking for a per-row queue that does not
+   * exist.)
+   */
+  const [rephrasingIdx, setRephrasingIdx] = useState<number | null>(null);
+  const [rephraseError, setRephraseError] = useState<{ idx: number; message: string } | null>(
+    null,
+  );
+  /** What the live region says. Empty between rephrases, so each one is new. */
+  const [rephraseStatus, setRephraseStatus] = useState("");
+  /**
+   * The live question list, readable synchronously.
+   *
+   * `setQuestions(prev => …)` does NOT run its updater when it is called —
+   * React schedules it — so deciding inside the updater whether the rewrite
+   * landed, and then reading that decision on the next line, reads a value
+   * that has not been computed yet. It was always `false`, so the success
+   * announcement never fired. The guard needs a synchronous read of the
+   * current list, which is what this is.
+   */
+  const questionsRef = useRef<QuestionRow[]>(questions);
+  questionsRef.current = questions;
+
+  async function rephrase(idx: number) {
+    // THE GUARD IS THE DISABLE. With `aria-disabled` the element stays
+    // focusable and clickable, so this is what actually stops a second press
+    // and an empty question — not decoration on top of a `disabled` attribute.
+    const text = questions[idx]?.question.trim();
+    if (!text || rephrasingIdx !== null) return;
+    setRephraseError(null);
+    setRephraseStatus(`Rephrasing question ${idx + 1}…`);
+    setRephrasingIdx(idx);
+    try {
+      const { question } = await api.rephraseQuestion(text);
+      // THE INDEX IS NOT AN IDENTITY. The functional updater kept a stale
+      // snapshot from restoring a deleted row, but it did nothing about the
+      // list RESHUFFLING: remove row 1 while row 4's rephrase is out and
+      // index 4 now addresses what used to be row 5, so the rewrite of one
+      // question silently overwrote a different one — proven by a reviewer,
+      // with the fifth question's text simply gone and no error shown.
+      //
+      // Neither Add nor Remove is disabled during a rephrase, and pruning an
+      // eight-row draft while one is out is the normal workflow. So the row
+      // is identified by WHAT WAS SENT: if the text at that index is no
+      // longer the text this call was made about, the answer is discarded.
+      const applied = questionsRef.current[idx]?.question.trim() === text;
+      if (applied) {
+        setQuestions((prev) =>
+          prev[idx]?.question.trim() === text
+            ? prev.map((q, i) => (i === idx ? { ...q, question } : q))
+            : prev,
+        );
+      }
+      setRephraseStatus(
+        applied
+          ? `Question ${idx + 1} rephrased.`
+          : `Question ${idx + 1} changed while Hello was rewriting it, so the rewrite was discarded.`,
+      );
+    } catch (err) {
+      // 422 is the model failing to phrase it, not an outage. Either way the
+      // operator's own text is left exactly as they typed it.
+      const message = err instanceof ApiError ? err.message : "Rephrase failed. Try again.";
+      setRephraseError({ idx, message });
+      setRephraseStatus(`Question ${idx + 1}: ${message}`);
+    } finally {
+      setRephrasingIdx(null);
+    }
+  }
+
   function updateQuestion(idx: number, patch: Partial<QuestionRow>) {
+    // A rephrase failure is about the text as it WAS. Editing the row answers
+    // it, and leaving the message up (it deliberately outranks the live gate
+    // message) hid whether the hand-written fix actually passed — the
+    // operator found out at Save, a long scroll away.
+    setRephraseError((prev) => (prev?.idx === idx ? null : prev));
     setQuestions((prev) =>
       prev.map((q, i) => (i === idx ? { ...q, ...patch } : q)),
     );
@@ -313,6 +498,10 @@ function RoleForm({
         id: q.id || `q${i + 1}`,
         question: q.question.trim(),
         weight: Number(q.weight) || 1,
+        // Only when set: `screeningQuestionSchema` has it optional, and
+        // sending `mandatory: false` on every hand-written question would
+        // write a claim the operator never made.
+        ...(q.mandatory ? { mandatory: true } : {}),
       }));
 
     const body: RoleInput = {
@@ -450,6 +639,7 @@ function RoleForm({
                 id: q.id || `q${i + 1}`,
                 question: q.question,
                 weight: q.weight ?? 1,
+                mandatory: q.mandatory === true,
               })),
             );
             const rephrased =
@@ -534,6 +724,18 @@ function RoleForm({
               </Button>
             }
           />
+          {/*
+            * PERMANENT, and outside the loop. Success silently rewrites an
+            * input's value — a screen reader says nothing at all about it,
+            * and the operator who pressed the button is the one person who
+            * needs to know it landed. A region mounted WITH its content is
+            * not reliably announced, which is why this is always present and
+            * only its text changes (the same conclusion `AskHelloButton`
+            * reached and documents).
+            */}
+          <p role="status" aria-live="polite" className="sr-only">
+            {rephraseStatus}
+          </p>
           <div className="mt-3 space-y-3">
             {questions.map((q, idx) => {
               const issue = spokenQuestionIssue(q.question, questions, idx);
@@ -543,23 +745,70 @@ function RoleForm({
                     <span className="font-mono text-[11px] text-ink-tertiary">
                       {q.id || `q${idx + 1}`}
                     </span>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      onClick={() => removeQuestion(idx)}
-                      aria-label="Remove question"
-                      disabled={questions.length === 1}
-                    >
-                      Remove
-                    </Button>
+                    <div className="flex items-center gap-1">
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => void rephrase(idx)}
+                        // `aria-disabled`, NOT `disabled`, and the handler
+                        // guards — the idiom `AskHelloButton` already uses
+                        // twice in this codebase, for the reason stated
+                        // there: a real `disabled` blurs the element the
+                        // instant it is pressed by keyboard, dropping the
+                        // user to <body> so the next Tab restarts from the
+                        // top of the page. jsdom does not reproduce that
+                        // blur, which is exactly why a test suite cannot be
+                        // the thing that catches it.
+                        //
+                        // Nothing is faded either. `disabled:opacity-50` put
+                        // the whole eight-button column at 2.56:1 the moment
+                        // one request went out, which reads as "the form
+                        // broke" rather than "one request is out" — and it
+                        // landed hardest on the one row whose label is the
+                        // only progress this feature shows.
+                        aria-disabled={rephrasingIdx !== null || !q.question.trim()}
+                        aria-busy={rephrasingIdx === idx}
+                        // THE STATE IS IN THE ACCESSIBLE NAME. A static
+                        // `aria-label` OVERRIDES the visible text, so
+                        // "Rephrasing…" was rendered on screen and invisible
+                        // to a screen reader — and the visible label was no
+                        // longer contained in the accessible name, which is
+                        // SC 2.5.3 (Label in Name) verbatim.
+                        aria-label={
+                          rephrasingIdx === idx
+                            ? `Rephrasing question ${idx + 1}…`
+                            : `Rephrase question ${idx + 1}`
+                        }
+                      >
+                        {rephrasingIdx === idx ? "Rephrasing…" : "Rephrase"}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        onClick={() => removeQuestion(idx)}
+                        aria-label={`Remove question ${idx + 1}`}
+                        disabled={questions.length === 1}
+                      >
+                        Remove
+                      </Button>
+                    </div>
                   </div>
                   <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
                     <Field
                       className="min-w-0 flex-1"
                       label={`Question ${idx + 1}`}
                       id={`role-question-${idx}`}
-                      error={issue ?? undefined}
+                      // The row's OWN failure wins over the static validation
+                      // message: "Hello could not rephrase that" is news, and
+                      // the gate complaint underneath it is what the operator
+                      // already knew.
+                      error={
+                        (rephraseError?.idx === idx ? rephraseError.message : null) ??
+                        issue ??
+                        undefined
+                      }
                     >
                       {({ id, describedBy, invalid }) => (
                         <TextField

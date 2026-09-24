@@ -42,6 +42,7 @@ import { BusinessError } from './provider-resilience.js';
 import {
   phoneQuestionIssueMessage,
   validatePhoneQuestionTemplate,
+  normalizeSpokenQuestion,
   PHONE_META_WORDS,
 } from './phone-screening/question-validation.js';
 
@@ -109,13 +110,102 @@ export function roleDraftTimeoutMs(configuredMs: number): number {
 }
 
 export const ROLE_DRAFT_MAX_ATTEMPTS = 3;
-/** How many questions a draft aims for. */
-export const ROLE_DRAFT_QUESTION_COUNT = 6;
+
+/**
+ * THE SCREEN HAS A SHAPE, and it is not left to the model.
+ *
+ * A screening call that opens cold on a role-specific question is jarring, and
+ * one that ends without pay and notice leaves the recruiter to chase the two
+ * facts that decide whether the pipeline moves at all. The first live role
+ * authored with Ask Hello ("Sales v1 hiring") produced six perfectly speakable
+ * questions in no particular order and neither of those things.
+ *
+ * ASKED FOR AS "has to" AND "should always", SO THEY ARE FIXED TEXT rather
+ * than prompt rules. Earlier rounds established that the model complies with
+ * stated rules only most of the time — every generated question still goes
+ * through `validatePhoneQuestionTemplate`, and a rule that is merely REQUESTED
+ * costs a whole retry cycle when it is missed. These sentences are written
+ * once, checked by `roleArcQuestions()`'s own test against the real validator,
+ * and cannot drift.
+ *
+ * The operator can still edit or delete any of them in the form before saving;
+ * this is the default arc, not a lock.
+ */
+export const ROLE_DRAFT_OPENING_QUESTION =
+  'To start, could you tell me a little about yourself and walk me through your most recent role?';
+
+/**
+ * THE WORDING IS LOAD-BEARING, and not only for how it sounds.
+ *
+ * The phone worker decides whether a question has already been answered with
+ * `phone_answer_covers_objective` (`phone.py:7793`). For anything it reads as
+ * a compensation objective — any text containing ctc/salary/compensation/
+ * package — it then keys on the OBJECTIVE's own words:
+ *
+ *     needs_current  = /\bcurrent\b/.test(objective)
+ *     needs_expected = /\bexpected|expectation/.test(objective)
+ *     return (!needs_current || slots.current) && (!needs_expected || slots.expected)
+ *
+ * A compensation question containing NEITHER word therefore returns true for
+ * every possible answer, including the empty string. This closer was first
+ * written "What annual CTC are you looking for in your next position?" — which
+ * says neither — so the contiguous forward-skip at `agent.py:5586` marked it
+ * covered off the back of the CURRENT-CTC answer and it was never spoken, on
+ * every call, for every role Ask Hello authors. The recruiter would then read
+ * a record saying expected CTC was covered and still have to chase it by hand:
+ * exactly the chore this arc exists to remove, now hidden behind a green row.
+ *
+ * Verified by executing the real predicate:
+ *   "…looking for in your next position?"  -> covers=True  for '' and for
+ *                                             "My current CTC is 12 LPA."
+ *   "…your expected annual CTC…"           -> covers=False for both
+ *
+ * So each closer carries the token its own consumer keys on — `current`,
+ * `expected`, `notice period` — and `role-question-arc.test.ts` asserts that
+ * coupling, because it is invisible from the TypeScript side. The system's own
+ * fallback plan (`0044_phone_assessment_resume.sql:381`) already used this
+ * vocabulary; the arc now matches it rather than departing from it.
+ *
+ * Last in the call because these are the questions a candidate is most likely
+ * to bristle at, and asking them first sours everything after. Three separate
+ * questions rather than one compound one: "current CTC, expected CTC and
+ * notice period" in a single breath reliably gets one answer out of three.
+ */
+export const ROLE_DRAFT_CLOSING_QUESTIONS = [
+  'What is your current annual CTC, including any variable pay?',
+  'What is your expected annual CTC for your next role?',
+  'What is your notice period, and how soon could you join if things move ahead?',
+] as const;
+
+/** How many ROLE-SPECIFIC questions the model is asked to write. */
+export const ROLE_DRAFT_QUESTION_COUNT = 4;
+
+/** What the operator actually ends up with: opener + model's four + closers. */
+export const ROLE_DRAFT_TOTAL_QUESTIONS =
+  1 + ROLE_DRAFT_QUESTION_COUNT + ROLE_DRAFT_CLOSING_QUESTIONS.length;
 
 export interface RoleDraftQuestion {
   id: string;
   question: string;
   weight: number;
+  /**
+   * Rendered as `[MUST ASK] ` in the phone worker's prompt
+   * (`prompting.py:114`) and prioritised when the call runs long.
+   *
+   * WITHOUT THIS THE ARC WAS FORM-DEEP. The four fixed sentences reached the
+   * worker as ordinary bank entries, inside a prompt that says "cover this
+   * question bank WHERE RELEVANT", "do not ask every question mechanically",
+   * and — for pay and notice specifically — "only when role-relevant". The
+   * arc had just grown the call from six questions to eight against a
+   * ten-minute budget whose stated remedy is to "prioritize mandatory items",
+   * of which there were none.
+   *
+   * `DEFAULT_QUESTIONS`, the fallback for a role with NO template at all,
+   * already marks expected CTC and notice period `[MUST ASK]`. So an Ask
+   * Hello-authored role was weaker on the owner's actual requirement than a
+   * role nobody had authored.
+   */
+  mandatory?: boolean;
 }
 
 export interface RoleDraft {
@@ -245,8 +335,16 @@ Return ONLY a JSON object with exactly these keys:
   ]
 }
 
-Write ${ROLE_DRAFT_QUESTION_COUNT} screening questions. They are READ ALOUD to a
-candidate by an automated caller, so each one must:
+Write ${ROLE_DRAFT_QUESTION_COUNT} screening questions about THE WORK ITSELF.
+
+The call already opens by asking the candidate to introduce themselves and
+describe their most recent role, and it already ends by asking their current
+CTC, their expected CTC, and their notice period. Those four are added for
+you — do NOT write an introduction question, and do NOT ask about salary, CTC,
+compensation, notice period or availability. Write the middle of the
+conversation: what this person has actually done, and how they did it.
+
+They are READ ALOUD to a candidate by an automated caller, so each one must:
 - end with a question mark
 - be one sentence a person can say naturally in under 12 seconds
 - ask the candidate about THEIR experience, not about the hiring process
@@ -263,6 +361,72 @@ files" rather than "JSON or YAML", and "how do you go over the requirements"
 rather than "how do you read the requirements".
 
 Return the JSON object and nothing else.`;
+}
+
+/**
+ * The fixed opener and closers, wrapped around what the model wrote.
+ *
+ * APPLIED AFTER VALIDATION, not before. The model's questions are checked on
+ * their own, so a rejected attempt names only the sentence the model is
+ * actually being asked to fix — feeding it back the three CTC questions it
+ * never wrote would waste the repair budget explaining sentences that are
+ * already correct.
+ *
+ * Ids are re-issued across the whole list, because `validatePhoneQuestion`
+ * rejects duplicate keys and the model's four arrive as q1-q4.
+ */
+function withArc(draft: RoleDraft): RoleDraft {
+  // THE ARC COSTS FOUR SLOTS, and `coerceDraft` has already clamped to
+  // `MAX_QUESTIONS`. Splicing without re-clamping pushed a model that returned
+  // the ceiling to MAX_QUESTIONS + 4, which `createRoleSchema` then refuses —
+  // the "passes here, fails on Save after the operator waited minutes" failure
+  // this module exists to prevent. Caught by the existing clamp test.
+  //
+  // THE MIDDLE IS WHAT GIVES WAY. The opener and the three closers were asked
+  // for as "has to" and "always", so they are kept and the model's surplus
+  // questions are dropped from the end.
+  // BOUNDED BY WHAT WAS ASKED FOR, not only by the save ceiling. `room` alone
+  // is 96, so "write 4" was a prompt rule with nothing behind it — a model
+  // that wrote six (which is what it wrote last week) produced a ten-question
+  // form and a ten-question call against a ten-minute budget.
+  const room = Math.min(
+    ROLE_DRAFT_QUESTION_COUNT,
+    MAX_QUESTIONS - 1 - ROLE_DRAFT_CLOSING_QUESTIONS.length,
+  );
+  // DROP WHAT THE ARC ALREADY ASKS. The arc is spliced AFTER
+  // `validatePhoneQuestionTemplate`, so a model question that normalises to an
+  // arc question is invisible to the pre-arc check and fatal on Save —
+  // `duplicate_text` is a template-level issue and `createRoleSchema` refuses
+  // the whole role. The prompt tells the model not to write an introduction or
+  // a salary question, but that is a prompt rule, and this file's own argument
+  // is that prompt rules hold only most of the time.
+  const arcKeys = new Set(
+    [ROLE_DRAFT_OPENING_QUESTION, ...ROLE_DRAFT_CLOSING_QUESTIONS].map(normalizeSpokenQuestion),
+  );
+  const model = draft.screening_template
+    .filter((q) => !arcKeys.has(normalizeSpokenQuestion(q.question)))
+    .slice(0, Math.max(0, room));
+  const texts = [
+    ROLE_DRAFT_OPENING_QUESTION,
+    ...model.map((q) => q.question),
+    ...ROLE_DRAFT_CLOSING_QUESTIONS,
+  ];
+  // The opener and closers carry weight 1: they are asked of every candidate
+  // for every role, so nothing about them discriminates between two people.
+  // The model's own weights survive for the role-specific middle.
+  const weights = [1, ...model.map((q) => q.weight), ...ROLE_DRAFT_CLOSING_QUESTIONS.map(() => 1)];
+  // The opener and the three closers are the ones the owner said "has to" and
+  // "always" about, so they are the ones the worker is told it MUST ask.
+  const lastModelIndex = model.length;
+  return {
+    ...draft,
+    screening_template: texts.map((question, i) => ({
+      id: `q${i + 1}`,
+      question,
+      weight: weights[i] ?? 1,
+      mandatory: i === 0 || i > lastModelIndex,
+    })),
+  };
 }
 
 /**
@@ -489,7 +653,7 @@ export async function generateRoleDraft(
     });
 
     if (issues.size === 0 && shapeIssues.size === 0) {
-      return { draft, attempts: attempt, repaired: [...new Set(repaired)] };
+      return { draft: withArc(draft), attempts: attempt, repaired: [...new Set(repaired)] };
     }
 
     // Rebuilt per attempt, not appended: `repaired` used to accumulate every
@@ -535,5 +699,214 @@ export async function generateRoleDraft(
     'unspeakable_questions',
     failures,
     ROLE_DRAFT_MAX_ATTEMPTS,
+  );
+}
+
+
+/**
+ * Rephrase ONE question until the phone gate will read it aloud.
+ *
+ * WHY THIS EXISTS. `validatePhoneQuestion` is unforgiving and indifferent to
+ * intent: it bans the words *system*, *developer*, *assistant*, *model*,
+ * *prompt*, *instruction*, *interviewer* and *recruiter* anywhere in a
+ * question, so "how do you keep an applicant tracking system current?" is
+ * refused for the word *system*. An operator typing their own question hits
+ * that wall with no way over it — the form says the sentence is unusable and
+ * leaves them to guess which word offended. This turns that dead end into a
+ * button.
+ *
+ * NOT A JOB, unlike drafting. This returns one sentence of about fifteen
+ * words, so it answers inside a normal request rather than needing a row, a
+ * poll and a cancel. The point is that it feels instant beside the field it
+ * fixes.
+ *
+ * THE MODEL IS NEVER TRUSTED, only used. Its suggestion goes through the same
+ * `validatePhoneQuestion` and `generatedQuestionIssue` that the save path and
+ * the generator use; a suggestion that still fails is retried once with the
+ * specific failure quoted back, and a second failure is reported rather than
+ * returned. A "rephrase" that hands back another unusable sentence would be
+ * worse than the error message it replaced.
+ */
+export interface RephraseDeps {
+  /** Seam for tests; defaults to the real provider call. */
+  infer?: (prompt: string) => Promise<unknown>;
+  runJson?: typeof runClaudeJSONWithProvenance;
+}
+
+/**
+ * How many GATE attempts one press of Rephrase may make.
+ *
+ * Not provider calls: `runDeepseekJSON` retries the whole call once itself
+ * when a reply will not parse, so a press costs up to FOUR generations. The
+ * `/draft` rate-limit comment in `app.ts` states its own arithmetic the same
+ * way ("3 attempts x the runner's own retry") and this used to contradict it.
+ */
+export const REPHRASE_MAX_ATTEMPTS = 2;
+
+/** One short sentence does not need minutes, and a spinner that long reads as broken. */
+export const REPHRASE_TIMEOUT_MS = 45_000;
+
+/**
+ * Tokens the PHONE WORKER reads out of the question itself.
+ *
+ * `phone_answer_covers_objective` (`phone.py:7793`) decides a compensation
+ * question is already answered by looking for `current` / `expected` IN THE
+ * QUESTION. A compensation question carrying neither is "covered" by every
+ * answer, including an empty one, so it is force-skipped on every call and
+ * recorded as asked. That is the bug this arc's own wording was fixed for.
+ *
+ * Rephrase could hand it straight back. "Keep what it is asking about; change
+ * only the wording" is a prompt instruction, and the post-gate only checks
+ * speakability — so one press on the expected-CTC closer could return "What
+ * annual CTC are you looking for…", which is verbatim the broken wording, and
+ * that role would silently stop asking the question forever. The owner called
+ * this button fail proof; for this failure class it was the opposite.
+ *
+ * So a rewrite must KEEP whichever of these the input carried. Checked here
+ * rather than only asked for in the prompt, for the reason this file states
+ * everywhere else: a rule that is merely requested holds most of the time.
+ */
+const COMPENSATION_RE = /\b(?:ctc|salary|compensation|package)\b/i;
+const COVERAGE_TOKENS: ReadonlyArray<{ label: string; re: RegExp }> = [
+  { label: 'current', re: /\bcurrent\b/i },
+  { label: 'expected', re: /\bexpected\b|\bexpectation/i },
+  { label: 'notice period', re: /\bnotice period\b/i },
+];
+
+/** Which coverage tokens this question depends on for the worker to ask it. */
+function requiredCoverageTokens(question: string): string[] {
+  const needed: string[] = [];
+  for (const { label, re } of COVERAGE_TOKENS) {
+    if (!re.test(question)) continue;
+    // `current` and `expected` only matter on a COMPENSATION objective — the
+    // worker's branch is gated on that first.
+    if (label !== 'notice period' && !COMPENSATION_RE.test(question)) continue;
+    needed.push(label);
+  }
+  return needed;
+}
+
+function buildRephrasePrompt(question: string, priorFailure: string | null): string {
+  const repair = priorFailure
+    ? `\nYOUR PREVIOUS SUGGESTION WAS REJECTED: ${priorFailure}\nFix exactly that and keep the meaning.\n`
+    : '';
+  const keep = requiredCoverageTokens(question);
+  const keepRule = keep.length
+    ? `\nTHE REWRITE MUST STILL CONTAIN ${keep
+        .map((w) => `"${w}"`)
+        .join(' and ')}. The automated caller decides whether this question has
+already been answered by looking for those exact words in the question itself,
+and a version without them is skipped and never asked.\n`
+    : '';
+  return `Rewrite the screening question below so an automated caller can read it
+aloud to a job candidate. Keep what it is asking about; change only the wording.
+
+QUESTION: ${question}
+${repair}${keepRule}
+The rewritten question must:
+- end with a question mark
+- be one sentence a person can say naturally in under 12 seconds
+- ask the candidate about THEIR experience, not about the hiring process
+- NOT begin with any of: ask, probe, explore, cover, check, confirm, discuss, understand, find
+- NOT contain any of these words: ${BANNED_WORDS.join(', ')}
+- NOT contain the words json, xml or yaml, any of [ ] { } < >, or backticks
+- NOT contain "must/should/do not" followed by "ask/say/tell/mention/reveal/ignore"
+- NOT contain "read/repeat/output/respond" followed by "the" or "this"
+
+Those rules are checked mechanically. Work around them rather than arguing with
+them: say "applicant tracking tools" rather than "applicant tracking system",
+"engineers" rather than "developers", "config files" rather than "JSON or YAML".
+
+Return ONLY a JSON object: {"question": "..."}`;
+}
+
+export async function rephraseQuestion(
+  question: string,
+  deps: RephraseDeps = {},
+): Promise<string> {
+  const infer =
+    deps.infer ??
+    (async (prompt: string) => {
+      const run = deps.runJson ?? runClaudeJSONWithProvenance;
+      const { data } = await run<unknown>(prompt, {
+        model: env.deepseekScoringModel,
+        // CAPPED, not merely un-raised. The earlier comment here said "the
+        // configured budget is enough and is not raised" — but the configured
+        // budget in production is the RAISED Fly secret (that is the whole
+        // reason `ROLE_DRAFT_MIN_TIMEOUT_MS` exists twenty lines up), and the
+        // ceiling is 300s. Two gate attempts x the runner's own retry against
+        // that is twenty minutes on a SYNCHRONOUS request, with no
+        // AbortController on the client and every Rephrase button inert
+        // meanwhile. A full draft is a job precisely because it is long; this
+        // is a button beside a text field and must behave like one.
+        timeoutMs: Math.min(env.deepseekTimeoutMs, REPHRASE_TIMEOUT_MS),
+      });
+      return data;
+    });
+
+  let priorFailure: string | null = null;
+  let lastIssue = 'the rewritten question still could not be read aloud';
+
+  for (let attempt = 1; attempt <= REPHRASE_MAX_ATTEMPTS; attempt += 1) {
+    const raw = await infer(buildRephrasePrompt(question, priorFailure));
+    const obj = raw && typeof raw === 'object' ? (raw as Record<string, unknown>) : {};
+    const text = typeof obj.question === 'string' ? obj.question.trim() : '';
+    if (!text || text.length > MAX_QUESTION_CHARS) {
+      priorFailure = 'the response was not a JSON object carrying a non-empty "question" string';
+      lastIssue = priorFailure;
+      continue;
+    }
+
+    // THE SAME TWO GATES the generator applies, in the same order.
+    const issues = validatePhoneQuestionTemplate([{ id: 'q1', question: text }]);
+    const list = issues.get(0);
+    if (list) {
+      priorFailure = phoneQuestionIssueMessage(0, list).replace(/^Question 1 /, 'it ');
+      // NAME THE WORD. The shared message for the banned-word case is "it
+      // contains recruiter/model instructions or markup" — which does not say
+      // WHICH word offended, so the retry for the failure this button exists
+      // for was close to a blind re-roll. (That message also contains two
+      // banned words itself, which is its own small comedy.) The other three
+      // issue shapes already come back specific.
+      const offenders = PHONE_META_WORDS.filter((word) =>
+        new RegExp(`\\b${word}\\b`, 'i').test(text),
+      );
+      if (offenders.length > 0) {
+        priorFailure = `it uses the word ${offenders.map((w) => `"${w}"`).join(' and ')}, which the screener refuses outright — say the same thing without it`;
+      }
+      lastIssue = priorFailure;
+      continue;
+    }
+    const shapeIssue = generatedQuestionIssue(text);
+    if (shapeIssue) {
+      priorFailure = `it ${shapeIssue}`;
+      lastIssue = priorFailure;
+      continue;
+    }
+
+    // THE COVERAGE TOKENS, enforced. Losing one does not make the question
+    // unspeakable — it makes the worker skip it while recording it as asked,
+    // which no speakability gate can see.
+    const required = requiredCoverageTokens(question);
+    const dropped = required.filter((label) => {
+      const rule = COVERAGE_TOKENS.find((t) => t.label === label);
+      return rule ? !rule.re.test(text) : false;
+    });
+    if (dropped.length > 0) {
+      priorFailure = `it dropped ${dropped
+        .map((w) => `"${w}"`)
+        .join(' and ')}, which the automated caller needs in the question itself`;
+      lastIssue = priorFailure;
+      continue;
+    }
+
+    return text;
+  }
+
+  throw new RoleDraftError(
+    'Hello could not rephrase that question into something the screener will read aloud.',
+    'unspeakable_questions',
+    [lastIssue],
+    REPHRASE_MAX_ATTEMPTS,
   );
 }

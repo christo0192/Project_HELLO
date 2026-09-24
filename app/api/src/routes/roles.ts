@@ -4,6 +4,7 @@ import { validateBody, validateParams } from '../lib/validation.js';
 import {
   createRoleSchema,
   roleDraftSchema,
+  rephraseQuestionSchema,
   roleIdParamSchema,
   updateRoleSchema,
 } from '../schemas/roles.js';
@@ -16,6 +17,7 @@ import {
   RoleDraftBusyError,
   startRoleDraft,
 } from '../lib/role-draft-jobs.js';
+import { rephraseQuestion, RoleDraftError } from '../lib/role-authoring.js';
 
 export const rolesRouter = Router();
 
@@ -98,6 +100,54 @@ rolesRouter.post(
             type: 'conflict',
             message: err.message,
             details: { job_role: err.liveJobRole },
+          },
+        });
+      }
+      next(err);
+    }
+  },
+);
+
+/**
+ * Rewrite ONE question so the phone gate will read it aloud.
+ *
+ * SYNCHRONOUS, unlike `/draft`. One short sentence comes back in a single
+ * short generation, so there is no row, no poll and nothing to cancel — the
+ * button sits beside the field it fixes and behaves like it.
+ *
+ * 422, NOT 500, when the model cannot manage it. "Hello could not rephrase
+ * that" is a true statement about a working system; an Internal Server Error
+ * would send the operator to look for an outage that is not there.
+ */
+rolesRouter.post(
+  '/questions/rephrase',
+  requireRole('interviewer'),
+  validateBody(rephraseQuestionSchema),
+  async (req, res, next) => {
+    const { question } = req.body as { question: string };
+    try {
+      const rephrased = await rephraseQuestion(question);
+      try {
+        await recordAudit(req, 'resource.generate', 200, {
+          metadata: { action: 'question_rephrase' },
+        });
+      } catch {
+        /* as with /draft: this writes no role, so a dead sink must not lose it */
+      }
+      res.json({ question: rephrased });
+    } catch (err) {
+      if (err instanceof RoleDraftError) {
+        // THE OFFENDING WORD TRAVELS. `rephraseQuestion` works out exactly
+        // which banned word the text uses, and dropping it here left a TA
+        // recruiter who wrote "applicant tracking system" with "Hello could
+        // not rephrase that" and no clue which word `META_RE` refuses — the
+        // wording trap this button exists for.
+        const detail = err.detail?.[0];
+        return res.status(422).json({
+          error: {
+            type: 'unprocessable_entity',
+            message: detail ? `${err.message} It says ${detail}.` : err.message,
+            details: { reason: err.reason },
           },
         });
       }
@@ -275,5 +325,145 @@ rolesRouter.put(
     }
 
     res.json(data);
+  },
+);
+
+/**
+ * Remove a role — by ARCHIVING it when anything depends on it, and only
+ * deleting outright when nothing does.
+ *
+ * WHY NOT A PLAIN DELETE. `screening_v2.roles` is referenced six ways, and the
+ * foreign keys disagree about what should happen:
+ *
+ *   candidates.role_id          on delete SET NULL
+ *   sessions.role_id            on delete SET NULL
+ *   assessments / phone rows    on delete SET NULL
+ *   role_scorecards             on delete CASCADE
+ *   ashby_job_mappings.role_id  on delete RESTRICT   (and NOT NULL)
+ *
+ * So a hard delete would silently detach every candidate who ever applied for
+ * this job from the job they applied for — the record would still exist and
+ * would no longer say what it was for — and it would cascade away the
+ * scorecard the historical assessments were scored against. That is not a
+ * delete, it is quiet history loss, and "poor product management" is the
+ * charge this endpoint is answering rather than earning.
+ *
+ * The rule, therefore:
+ *   - referenced by an Ashby mapping -> 409, name it, change nothing. The
+ *     database would refuse anyway (RESTRICT); answering with the reason is
+ *     more useful than surfacing a constraint error.
+ *   - referenced by candidates or call sessions -> ARCHIVE
+ *     (`is_active = false`). It is marked Inactive and stops being offered
+ *     anywhere new, and every historical record still says which job it
+ *     belonged to. It does NOT leave the roles list — `GET /api/roles` has no
+ *     `is_active` filter — so the response names the outcome and the client
+ *     is what tells the operator.
+ *   - referenced by nothing -> DELETE. A role created by mistake, or an Ask
+ *     Hello draft saved and thought better of, genuinely goes away.
+ *
+ * The response says which of the three happened, because "gone from the list"
+ * looks identical to the operator and the difference matters when they come
+ * back looking for it.
+ */
+rolesRouter.delete(
+  '/:id',
+  requireRole('interviewer'),
+  validateParams(roleIdParamSchema),
+  async (req, res, next) => {
+    const roleId = req.params.id;
+    const isInterviewer = req.authUser?.appRole === 'interviewer';
+
+    // OWNERSHIP FIRST, and as its own read. Every branch below has to be
+    // scoped to a role this caller may touch, and doing it once here keeps a
+    // later branch from forgetting.
+    let owned = supabase.from('roles').select('id').eq('id', roleId);
+    if (isInterviewer) owned = owned.eq('owner_id', req.authUser!.id);
+    const { data: role, error: roleError } = await owned.maybeSingle();
+    if (roleError) return next(roleError);
+    if (!role) return res.status(404).json({ error: 'Role not found' });
+
+    // An Ashby mapping is a hard stop in the database, so it is a hard stop
+    // here — with the reason spelled out rather than a 500 from a constraint.
+    const { count: mappingCount, error: mappingError } = await supabase
+      .from('ashby_job_mappings')
+      .select('id', { count: 'exact', head: true })
+      .eq('role_id', roleId);
+    if (mappingError) return next(mappingError);
+    if ((mappingCount ?? 0) > 0) {
+      return res.status(409).json({
+        error: {
+          type: 'conflict',
+          message:
+            'This role is mapped to an Ashby job. Remove the mapping in Ashby Mission Control first.',
+        },
+      });
+    }
+
+    const { count: candidateCount, error: candidateError } = await supabase
+      .from('candidates')
+      .select('id', { count: 'exact', head: true })
+      .eq('role_id', roleId);
+    if (candidateError) return next(candidateError);
+
+    // `call_sessions`, NOT `sessions`. There is no `screening_v2.sessions`;
+    // every other call site in this API says `call_sessions`, and this route
+    // was the only `from('sessions')` in it. PostgREST answers PGRST205, the
+    // error propagates, and EVERY delete and archive returned 500 — the
+    // feature was inert 100% of the time. The unit test pinned the same wrong
+    // name in its table map, which is precisely why CI was green.
+    const { count: sessionCount, error: sessionError } = await supabase
+      .from('call_sessions')
+      .select('id', { count: 'exact', head: true })
+      .eq('role_id', roleId);
+    if (sessionError) return next(sessionError);
+
+    const referenced = (candidateCount ?? 0) > 0 || (sessionCount ?? 0) > 0;
+
+    if (referenced) {
+      let archive = supabase.from('roles').update({ is_active: false }).eq('id', roleId);
+      if (isInterviewer) archive = archive.eq('owner_id', req.authUser!.id);
+      const { data, error } = await archive.select('id').maybeSingle();
+      if (error) return next(error);
+      if (!data) return res.status(404).json({ error: 'Role not found' });
+      try {
+        await recordAudit(req, 'resource.update', 200, {
+          metadata: { role_id: roleId, action: 'archive' },
+        });
+      } catch {
+        return res.status(500).json({
+          error: { type: 'internal_error', message: 'Internal server error' },
+        });
+      }
+      return res.json({
+        outcome: 'archived',
+        reason: 'candidates_or_sessions_exist',
+        candidates: candidateCount ?? 0,
+        sessions: sessionCount ?? 0,
+      });
+    }
+
+    let remove = supabase.from('roles').delete().eq('id', roleId);
+    if (isInterviewer) remove = remove.eq('owner_id', req.authUser!.id);
+    const { data: deleted, error: deleteError } = await remove.select('id').maybeSingle();
+    if (deleteError) return next(deleteError);
+    if (!deleted) return res.status(404).json({ error: 'Role not found' });
+
+    // AUDITED, and the failure is LOUD rather than closed. The row is already
+    // gone by the time this runs, so a 500 here reports a lost audit record —
+    // it does not roll the delete back. That is byte-for-byte what `POST /`
+    // and `PUT /:id` in this file already do, and diverging for one verb would
+    // be its own inconsistency; the earlier wording said "fail-closed", which
+    // would have told a reader the write was undone.
+    try {
+      await recordAudit(req, 'resource.delete', 200, {
+        metadata: { role_id: roleId },
+      });
+    } catch {
+      return res.status(500).json({
+        error: { type: 'internal_error', message: 'Internal server error' },
+      });
+    }
+
+    return res.json({ outcome: 'deleted' });
   },
 );

@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AshbyMissionControlPage } from './AshbyMissionControlPage';
+import { ApiError } from '../api';
 
 /**
  * The page header now carries a real <Link> back to Mission Control, so the
@@ -16,7 +17,7 @@ function renderPage() {
   );
 }
 
-const { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm, previewAshbyScorecardBinding } = vi.hoisted(() => ({
+const { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm, previewAshbyScorecardBinding, createAshbyMapping, listRoles } = vi.hoisted(() => ({
   listAshbyMappings: vi.fn(),
   listAshbyWorkflows: vi.fn(),
   pauseAshbyMapping: vi.fn(),
@@ -26,10 +27,12 @@ const { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMap
   deliverAshbyManualInvite: vi.fn(),
   discoverAshbyFeedbackForm: vi.fn(),
   previewAshbyScorecardBinding: vi.fn(),
+  createAshbyMapping: vi.fn(),
+  listRoles: vi.fn(),
 }));
 
 vi.mock('../api', () => ({
-  api: { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm, previewAshbyScorecardBinding },
+  api: { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm, previewAshbyScorecardBinding, createAshbyMapping, listRoles },
   ApiError: class ApiError extends Error {
     status: number;
     constructor(m: string, s: number) { super(m); this.status = s; }
@@ -43,6 +46,11 @@ const MAPPINGS = {
     { id: 'm2', externalJobId: 'job_2', status: 'drift', statusReason: 'stage_id_invalid', deliveryMode: 'manual', hasAiStage: true, hasTaStage: false, label: null, updatedAt: '2026-08-13T00:00:00Z' },
   ],
 };
+const ROLES = [
+  { id: '11111111-1111-4111-8111-111111111111', title: 'Sales Advisor', agent_name: 'Sales v1 hiring', jd: '', required_skills: [], screening_template: [], is_active: true, created_at: '2026-09-01T00:00:00Z' },
+  { id: '22222222-2222-4222-8222-222222222222', title: 'Retired Role', jd: '', required_skills: [], screening_template: [], is_active: false, created_at: '2026-09-01T00:00:00Z' },
+];
+
 const WORKFLOWS = {
   ok: true,
   workflows: [
@@ -54,6 +62,8 @@ describe('AshbyMissionControlPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     listAshbyMappings.mockResolvedValue(MAPPINGS);
+    listRoles.mockResolvedValue(ROLES);
+    createAshbyMapping.mockResolvedValue({ ok: true, id: 'm3', status: 'paused' });
     listAshbyWorkflows.mockResolvedValue(WORKFLOWS);
     pauseAshbyMapping.mockResolvedValue({ ok: true, status: 'paused' });
     resumeAshbyMapping.mockResolvedValue({ ok: true, status: 'enabled' });
@@ -117,6 +127,8 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     listAshbyMappings.mockResolvedValue(MAPPINGS);
+    listRoles.mockResolvedValue(ROLES);
+    createAshbyMapping.mockResolvedValue({ ok: true, id: 'm3', status: 'paused' });
     listAshbyWorkflows.mockResolvedValue(WORKFLOWS);
     deliverAshbyManualInvite.mockResolvedValue({
       ok: true,
@@ -295,6 +307,8 @@ describe('AshbyMissionControlPage — feedback-form schema discovery (read-only)
   beforeEach(() => {
     vi.clearAllMocks();
     listAshbyMappings.mockResolvedValue(MAPPINGS);
+    listRoles.mockResolvedValue(ROLES);
+    createAshbyMapping.mockResolvedValue({ ok: true, id: 'm3', status: 'paused' });
     listAshbyWorkflows.mockResolvedValue(WORKFLOWS);
     discoverAshbyFeedbackForm.mockResolvedValue(FORM_SCHEMA);
   });
@@ -456,6 +470,8 @@ describe('AshbyMissionControlPage — scorecard binding preview (read-only)', ()
   beforeEach(() => {
     vi.clearAllMocks();
     listAshbyMappings.mockResolvedValue(MAPPINGS);
+    listRoles.mockResolvedValue(ROLES);
+    createAshbyMapping.mockResolvedValue({ ok: true, id: 'm3', status: 'paused' });
     listAshbyWorkflows.mockResolvedValue(WORKFLOWS);
     previewAshbyScorecardBinding.mockResolvedValue(BINDING_PREVIEW);
   });
@@ -603,5 +619,105 @@ describe('AshbyMissionControlPage — scorecard binding preview (read-only)', ()
     await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
     await screen.findByText(/Scorecard binding preview — read-only/);
     await expect(container).toHaveNoViolations();
+  });
+});
+
+describe('Adding a job mapping', () => {
+  // ITS OWN RESET. Without this the block inherits whatever the previous
+  // describe's last test left on the shared mocks — which is how the first
+  // test here failed to find a mapping row that every other test could see.
+  beforeEach(() => {
+    vi.clearAllMocks();
+    listAshbyMappings.mockResolvedValue(MAPPINGS);
+    listAshbyWorkflows.mockResolvedValue(WORKFLOWS);
+    listRoles.mockResolvedValue(ROLES);
+    createAshbyMapping.mockResolvedValue({ ok: true, id: 'm3', status: 'paused' });
+  });
+
+  // WHY THIS EXISTS. `POST .../mission-control/mappings` shipped with the
+  // integration and nothing ever called it, so pointing a new Ashby job at a
+  // HELLO role required a hand-rolled authenticated POST. A new job title was
+  // not self-serve: author the role, then ask an engineer.
+  async function openForm() {
+    renderPage();
+    await screen.findByText('job_1');
+    await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
+  }
+
+  it('CREATES the mapping and reloads the list', async () => {
+    await openForm();
+    await userEvent.type(screen.getByLabelText(/Ashby job id/), 'job_new');
+    await userEvent.selectOptions(
+      screen.getByLabelText(/^Role$/),
+      '11111111-1111-4111-8111-111111111111',
+    );
+    await userEvent.click(screen.getByRole('button', { name: /Save mapping/ }));
+
+    await waitFor(() =>
+      expect(createAshbyMapping).toHaveBeenCalledWith({
+        external_job_id: 'job_new',
+        role_id: '11111111-1111-4111-8111-111111111111',
+        // BLANK OPTIONALS BECOME UNDEFINED, not "". The route validates every
+        // optional opaque id it is given and answers `invalid_stage_id` for
+        // an empty string, so sending one would refuse the whole mapping over
+        // a field the admin deliberately left for later.
+        ai_screening_stage_id: undefined,
+        ta_screening_stage_id: undefined,
+        label: undefined,
+      }),
+    );
+    // Reloaded, so the new row appears without a manual refresh.
+    await waitFor(() => expect(listAshbyMappings).toHaveBeenCalledTimes(2));
+  });
+
+  it('OFFERS ONLY ACTIVE ROLES', async () => {
+    // Mapping an Ashby job to a retired role produces a screening call
+    // against a script nobody maintains any more.
+    await openForm();
+    const select = screen.getByLabelText(/^Role$/) as HTMLSelectElement;
+    const labels = [...select.options].map((o) => o.textContent);
+    expect(labels).toContain('Sales Advisor — Sales v1 hiring');
+    expect(labels).not.toContain('Retired Role');
+  });
+
+  it("SHOWS THE ROUTE'S OWN REASON, naming the field at fault", async () => {
+    // The form has five fields; "invalid" alone leaves the admin re-checking
+    // all of them.
+    // THROWN, not resolved. `apiClient.request` throws `ApiError` on every
+    // non-2xx and this route only emits `ok:false` with 400/409/500, so a
+    // resolved `{ok:false}` is a shape the API layer cannot produce — the
+    // earlier version of this test pinned copy on a branch that never ran,
+    // while every real admin saw the raw machine code.
+    createAshbyMapping.mockRejectedValue(new ApiError('invalid_external_job_id', 400));
+    await openForm();
+    await userEvent.type(screen.getByLabelText(/Ashby job id/), 'not a job id');
+    await userEvent.selectOptions(
+      screen.getByLabelText(/^Role$/),
+      '11111111-1111-4111-8111-111111111111',
+    );
+    await userEvent.click(screen.getByRole('button', { name: /Save mapping/ }));
+
+    await waitFor(() =>
+      expect(screen.getByRole('alert')).toHaveTextContent(/Ashby job id is not in the expected format/),
+    );
+    // The form stays open with the admin's input intact — retyping five
+    // fields because one was wrong is the failure this replaces.
+    expect((screen.getByLabelText(/Ashby job id/) as HTMLInputElement).value).toBe('not a job id');
+  });
+
+  it('SAYS IT SAVES PAUSED, because enabling is a separate gated action', async () => {
+    // The database still refuses to enable a mapping without stage ids and
+    // without drift. An admin who assumes "saved" means "live" would wait for
+    // calls that never come.
+    await openForm();
+    expect(screen.getByText(/Saves paused\./)).toBeInTheDocument();
+  });
+
+  it('SURVIVES a roles lookup failure', async () => {
+    // The picker is a convenience; the mapping list and its pause/resume
+    // actions are what this page is for and must not disappear with it.
+    listRoles.mockRejectedValue(new Error('boom'));
+    renderPage();
+    expect(await screen.findByText('job_1')).toBeInTheDocument();
   });
 });

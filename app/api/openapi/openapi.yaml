@@ -114,6 +114,45 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
 
+  /api/roles/questions/rephrase:
+    post:
+      tags: [roles]
+      operationId: rephraseScreeningQuestion
+      summary: Rewrite one question so the phone gate will read it aloud (interviewer+)
+      description: Synchronous, unlike /api/roles/draft - one short sentence from one short generation, so there is no job row to poll and nothing to cancel. The suggestion is put through the same validatePhoneQuestion and directive-opening checks the save path and the generator use, retried once with the failure quoted back, and refused rather than returned if it still fails.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [question]
+              properties:
+                question:
+                  type: string
+                  minLength: 1
+                  maxLength: 2000
+      responses:
+        '200':
+          description: The rewritten question, already checked against the phone gate.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [question]
+                properties:
+                  question:
+                    type: string
+        '401':
+          description: Unauthenticated.
+        '403':
+          description: Insufficient role.
+        '422':
+          description: The model could not phrase it within the attempt budget. Not an outage - the operator's own text is left untouched.
+        '429':
+          description: Rate limited. This route is model-invoking and shares the strict per-user bucket.
   /api/roles/draft:
     get:
       tags: [roles]
@@ -227,6 +266,45 @@ paths:
         '403':
           description: Insufficient role.
   /api/roles/{id}:
+    delete:
+      tags: [roles]
+      operationId: deleteRole
+      summary: Remove a role - archives it when anything references it (interviewer+)
+      description: Deletes only a role nothing references. A role with candidates or sessions is ARCHIVED (is_active false) instead, because the foreign keys are ON DELETE SET NULL and a hard delete would silently detach every candidate from the job they applied for. A role mapped to an Ashby job is refused - that key is ON DELETE RESTRICT.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: What actually happened. The two outcomes look identical on the page, so the caller has to say which.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [outcome]
+                properties:
+                  outcome:
+                    type: string
+                    enum: [deleted, archived]
+                  reason:
+                    type: string
+                  candidates:
+                    type: integer
+                  sessions:
+                    type: integer
+        '401':
+          description: Unauthenticated.
+        '403':
+          description: Insufficient role.
+        '404':
+          description: No such role, or not one this caller owns.
+        '409':
+          description: Mapped to an Ashby job. Nothing was changed.
     parameters:
       - name: id
         in: path

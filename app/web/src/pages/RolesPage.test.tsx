@@ -9,11 +9,14 @@
  *   - Keyboard and focus management
  */
 
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, act } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { RolesPage } from './RolesPage';
 import { mockRole } from '../test/helpers';
+// The MOCKED class from the factory below — the same one `RolesPage`
+// catches, so `err instanceof ApiError` holds in the component.
+import { ApiError } from '../api';
 
 const mockApi = {
   listRoles: vi.fn(),
@@ -32,6 +35,8 @@ const mockApi = {
   startRoleDraft: vi.fn(),
   getRoleDraft: vi.fn(),
   cancelRoleDraft: vi.fn(),
+  rephraseQuestion: vi.fn(),
+  deleteRole: vi.fn(),
 };
 
 vi.mock('../api', () => ({
@@ -46,6 +51,8 @@ vi.mock('../api', () => ({
     startRoleDraft: (...args: any[]) => mockApi.startRoleDraft(...args),
     getRoleDraft: (...args: any[]) => mockApi.getRoleDraft(...args),
     cancelRoleDraft: (...args: any[]) => mockApi.cancelRoleDraft(...args),
+    rephraseQuestion: (...args: any[]) => mockApi.rephraseQuestion(...args),
+    deleteRole: (...args: any[]) => mockApi.deleteRole(...args),
   },
   ApiError: class extends Error {
     status: number;
@@ -428,5 +435,384 @@ describe('RolesPage', () => {
     const btn = await screen.findByRole('button', { name: 'New role' });
     await userEvent.click(btn);
     await expect(container).toHaveNoViolations();
+  });
+});
+
+describe('Rephrase — the way out of an unforgiving question gate', () => {
+  // `validatePhoneQuestion` bans "system", "developer", "model" and five more
+  // words outright, so an operator typing the natural phrasing for a Talent
+  // Acquisition role hits a wall the form cannot help them over. These tests
+  // are about the button being a way THROUGH that wall rather than one more
+  // thing that fails quietly.
+  /**
+   * The message on the ROW, not the one in the live region.
+   *
+   * Both deliberately carry the same text — the region exists because
+   * replacing an input's value announces nothing — so an unscoped
+   * `getByText` now matches twice.
+   */
+  function rowError(pattern: RegExp) {
+    return screen
+      .getAllByText(pattern)
+      .filter((el) => el.closest('[role="status"]') === null);
+  }
+
+  async function openEditor(role: typeof mockRole = mockRole) {
+    // PARAMETERISED. It used to hard-code `[mockRole]`, so a test that set up
+    // a different role immediately before calling it had that setup silently
+    // overwritten — which is how the three-row fixture below ended up running
+    // against two rows and failing to find its own third question.
+    mockApi.listRoles.mockResolvedValue([role]);
+    // The edit form mounts RoleScorecardEditor too, and its effect calls both
+    // of these. Left undefined they reject inside an effect, which unmounts
+    // the page — and the button under test disappears for a reason that has
+    // nothing to do with rephrasing.
+    mockApi.getRoleScorecard.mockResolvedValue({ scorecard: { metrics: [] } });
+    mockApi.listScorecardMetrics.mockResolvedValue([]);
+    // The call LOG, not the implementation: `mockApi` is built once for the
+    // whole file, so the "must not be called" assertion below would otherwise
+    // see the click from the first test in this block and fail for a reason
+    // that is not about the code. Verified — that test passed alone and
+    // failed in the file.
+    mockApi.rephraseQuestion.mockClear();
+    render(<RolesPage />);
+    const edit = await screen.findByRole('button', { name: /edit/i });
+    await userEvent.click(edit);
+    return (await screen.findByLabelText('Question 1')) as HTMLInputElement;
+  }
+
+  it('REPLACES the question with the rewrite', async () => {
+    mockApi.rephraseQuestion.mockResolvedValue({
+      question: 'How do you keep your applicant tracking tools up to date?',
+    });
+    const field = await openEditor();
+    const before = field.value;
+
+    await userEvent.click(screen.getByRole('button', { name: 'Rephrase question 1' }));
+
+    await waitFor(() =>
+      expect((screen.getByLabelText('Question 1') as HTMLInputElement).value).toBe(
+        'How do you keep your applicant tracking tools up to date?',
+      ),
+    );
+    expect(mockApi.rephraseQuestion).toHaveBeenCalledWith(before);
+    // AND ONLY THAT ROW. Replacing the updater with `prev.map((q) => ({...q,
+    // question }))` — one Rephrase overwriting every question in the role with
+    // the same sentence — left all 25 tests green, because nothing looked at
+    // the second row.
+    expect((screen.getByLabelText('Question 2') as HTMLInputElement).value).toBe(
+      mockRole.screening_template[1].question,
+    );
+  });
+
+  it('DISCARDS the rewrite when the row moved underneath it', async () => {
+    // THREE ROWS, DELIBERATELY. The index is not an identity: remove a row
+    // above the one being rephrased and that index now addresses what used to
+    // be the row BELOW it, so the rewrite of one question silently replaces a
+    // different one. With only two rows the shifted index falls off the end
+    // and a naive `prev.map((q,i) => i === idx ? … : q)` is a harmless no-op
+    // — the fixture passed with the guard deleted, which is the one thing a
+    // regression test must not do.
+    const threeRows = {
+      ...mockRole,
+      screening_template: [
+        { id: 'q1', question: 'FIRST-original?', weight: 1 },
+        { id: 'q2', question: 'SECOND-original?', weight: 1 },
+        { id: 'q3', question: 'THIRD-original?', weight: 1 },
+      ],
+    };
+    let release: (v: unknown) => void = () => {};
+    mockApi.rephraseQuestion.mockReturnValue(
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    );
+    await openEditor(threeRows);
+
+    // Rephrase row 2, then delete row 1 while it is still out. Index 1 now
+    // addresses what was row 3.
+    await userEvent.click(screen.getByRole('button', { name: 'Rephrase question 2' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Remove question 1' }));
+    await act(async () => {
+      release({ question: 'A REWRITE THAT MUST NOT LAND?' });
+    });
+
+    const values = [1, 2].map(
+      (n) => (screen.getByLabelText(`Question ${n}`) as HTMLInputElement).value,
+    );
+    // The two survivors are untouched, and nothing anywhere took the rewrite.
+    expect(values).toEqual(['SECOND-original?', 'THIRD-original?']);
+    expect(screen.queryByDisplayValue('A REWRITE THAT MUST NOT LAND?')).not.toBeInTheDocument();
+  });
+
+  it('FREES THE BUTTONS once the call settles, on success and on failure', async () => {
+    // Deleting `finally { setRephrasingIdx(null) }` left every Rephrase button
+    // in the form inert for the rest of the session, with the pressed row
+    // stuck reading "Rephrasing…", and 25/25 stayed green.
+    mockApi.rephraseQuestion.mockRejectedValueOnce(new Error('nope'));
+    await openEditor();
+    const button = screen.getByRole('button', { name: 'Rephrase question 1' });
+
+    await userEvent.click(button);
+    await waitFor(() => expect(rowError(/rephrase failed/i)).toHaveLength(1));
+
+    const after = screen.getByRole('button', { name: 'Rephrase question 1' });
+    expect(after).toHaveAttribute('aria-disabled', 'false');
+    expect(after).toHaveTextContent('Rephrase');
+  });
+
+  it("SHOWS THE SERVER'S OWN 422 MESSAGE, not a generic one", async () => {
+    // The route is built to say "Hello could not rephrase that question into
+    // something the screener will read aloud" rather than 500 — and the UI
+    // could throw that away for a flat "Rephrase failed" with the suite green,
+    // because the only error test rejected with a plain Error and exercised
+    // the fallback branch alone.
+    mockApi.rephraseQuestion.mockRejectedValue(
+      new ApiError('Hello could not rephrase that question.', 422),
+    );
+    await openEditor();
+    await userEvent.click(screen.getByRole('button', { name: 'Rephrase question 1' }));
+    await waitFor(() =>
+      expect(rowError(/Hello could not rephrase that question\./)).toHaveLength(1),
+    );
+  });
+
+  it('REFUSES A SECOND PRESS while one is in flight', async () => {
+    // The lock the code's own comment calls load-bearing. Deleting both halves
+    // — the early return and the aria-disabled — kept 25/25 green.
+    let release: (v: unknown) => void = () => {};
+    mockApi.rephraseQuestion.mockReturnValue(
+      new Promise((resolve) => {
+        release = resolve;
+      }),
+    );
+    await openEditor();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Rephrase question 1' }));
+    // The other row is inert, and says so to assistive tech rather than by
+    // going grey (a real `disabled` would blur the pressed element).
+    const other = screen.getByRole('button', { name: 'Rephrase question 2' });
+    expect(other).toHaveAttribute('aria-disabled', 'true');
+    await userEvent.click(other);
+    expect(mockApi.rephraseQuestion).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      release({ question: 'Fine?' });
+    });
+  });
+
+  it('ANNOUNCES the outcome, because replacing an input says nothing', async () => {
+    // A screen reader is told nothing at all when a field's value changes
+    // under it, and the operator who pressed the button is the one person who
+    // needs to know it landed.
+    mockApi.rephraseQuestion.mockResolvedValue({ question: 'A clean question?' });
+    await openEditor();
+    await userEvent.click(screen.getByRole('button', { name: 'Rephrase question 1' }));
+    // BY TEXT, not by role: the page carries more than one `role="status"`
+    // region (this one, and the role-removal note on the list), so an
+    // unscoped role query matches several.
+    await waitFor(() => expect(screen.getByText('Question 1 rephrased.')).toBeInTheDocument());
+  });
+
+  it('LEAVES THE OPERATOR TEXT ALONE when the model cannot phrase it', async () => {
+    // The whole value of the button is that a failure costs nothing. Clearing
+    // the field, or writing a half-answer into it, would lose work the
+    // operator typed — for a feature whose entire promise is "fail proof".
+    mockApi.rephraseQuestion.mockRejectedValue(new Error('nope'));
+    const field = await openEditor();
+    const before = field.value;
+
+    await userEvent.click(screen.getByRole('button', { name: 'Rephrase question 1' }));
+
+    await waitFor(() => expect(rowError(/rephrase failed/i)).toHaveLength(1));
+    expect((screen.getByLabelText('Question 1') as HTMLInputElement).value).toBe(before);
+  });
+
+  it('names the ROW it belongs to, not just "Rephrase"', async () => {
+    // Eight questions means eight identical buttons to anyone navigating by
+    // control. The row number is the only thing telling them apart.
+    await openEditor();
+    expect(screen.getByRole('button', { name: 'Rephrase question 1' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Remove question 1' })).toBeInTheDocument();
+  });
+
+  it('does NOT offer to rephrase an empty question', async () => {
+    const field = await openEditor();
+    await userEvent.clear(field);
+    // `aria-disabled`, not `disabled` — a real one blurs the element the
+    // instant a keyboard user presses it, dropping focus to <body>.
+    expect(screen.getByRole('button', { name: 'Rephrase question 1' })).toHaveAttribute(
+      'aria-disabled',
+      'true',
+    );
+    expect(mockApi.rephraseQuestion).not.toHaveBeenCalled();
+  });
+});
+
+describe('The [MUST ASK] flag survives an edit', () => {
+  // PROVEN BY A REVIEWER, ONE LINE OF CAUSE. The form rebuilt its question
+  // rows from the saved role WITHOUT `mandatory`, and `PUT /api/roles/:id`
+  // replaces `screening_template` wholesale — so opening an Ask Hello role to
+  // fix a typo in the JD and pressing Save silently stripped every
+  // `[MUST ASK]` from it.
+  //
+  // That flag is the only thing keeping CTC and notice period from being
+  // dropped when a call runs against its ten-minute budget, it appears nowhere
+  // in the UI, and recovering it meant re-running a ten-minute draft that
+  // overwrites the whole form.
+  const ARC_ROLE = {
+    ...mockRole,
+    screening_template: [
+      { id: 'q1', question: 'Tell me about yourself and your most recent role?', weight: 1, mandatory: true },
+      { id: 'q2', question: 'What does your current role involve day to day?', weight: 1 },
+      { id: 'q3', question: 'What is your current annual CTC, including any variable pay?', weight: 1, mandatory: true },
+    ],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockApi.getRoleScorecard.mockResolvedValue({ scorecard: { metrics: [] } });
+    mockApi.listScorecardMetrics.mockResolvedValue([]);
+    mockApi.getActiveRoleDraft.mockResolvedValue({ active: null });
+    mockApi.listRoles.mockResolvedValue([ARC_ROLE]);
+    mockApi.updateRole.mockResolvedValue(ARC_ROLE);
+  });
+
+  it('SURVIVES the Ask Hello draft -> form -> save path', async () => {
+    // The API half is pinned end to end; the FORM was the unguarded link, and
+    // no web test contained the string `mandatory` at all. Either the draft
+    // mapping or the save payload could drop it and the arc would quietly go
+    // back to being form-deep — the exact defect this work exists to fix.
+    mockApi.listRoles.mockResolvedValue([]);
+    mockApi.createRole.mockResolvedValue(mockRole);
+    mockApi.getActiveRoleDraft.mockResolvedValue({ active: null });
+    mockApi.startRoleDraft.mockResolvedValue(succeededJob());
+    mockApi.getRoleDraft.mockResolvedValue(
+      succeededJob({
+        draft: {
+          jd: 'Sell the product to enterprise buyers.',
+          required_skills: ['Sales'],
+          screening_template: [
+            { id: 'q1', question: 'Tell me about yourself and your recent role?', weight: 1, mandatory: true },
+            { id: 'q2', question: 'What does your current role involve day to day?', weight: 1 },
+            { id: 'q3', question: 'What is your current annual CTC, including any variable pay?', weight: 1, mandatory: true },
+          ],
+        },
+      }),
+    );
+    render(<RolesPage />);
+    await userEvent.click(await screen.findByRole('button', { name: 'New role' }));
+    await userEvent.type(screen.getByLabelText('Job role'), 'Sales Advisor');
+    await userEvent.click(screen.getByRole('button', { name: /Ask Hello/ }));
+    await waitFor(() =>
+      expect((screen.getByLabelText('Question 3') as HTMLInputElement).value).toMatch(/CTC/),
+    );
+
+    await userEvent.click(screen.getByRole('button', { name: /Create role/i }));
+    await waitFor(() => expect(mockApi.createRole).toHaveBeenCalled());
+    const body = mockApi.createRole.mock.calls[0][0] as {
+      screening_template: Array<{ id: string; mandatory?: boolean }>;
+    };
+    expect(body.screening_template.filter((q) => q.mandatory === true).map((q) => q.id)).toEqual([
+      'q1',
+      'q3',
+    ]);
+  });
+
+  it('SAVES the flags back unchanged after an edit that never touched them', async () => {
+    render(<RolesPage />);
+    await userEvent.click(await screen.findByRole('button', { name: /edit/i }));
+    await screen.findByLabelText('Question 1');
+    await userEvent.click(screen.getByRole('button', { name: /Save changes/i }));
+
+    await waitFor(() => expect(mockApi.updateRole).toHaveBeenCalled());
+    const body = mockApi.updateRole.mock.calls[0][1] as {
+      screening_template: Array<{ id: string; mandatory?: boolean }>;
+    };
+    expect(
+      body.screening_template.filter((q) => q.mandatory === true).map((q) => q.id),
+    ).toEqual(['q1', 'q3']);
+    // And a question that was never mandatory does not become so.
+    expect(body.screening_template.find((q) => q.id === 'q2')?.mandatory).toBeUndefined();
+  });
+});
+
+describe('Removing a role', () => {
+  // The page could add roles and never remove one. The gap matters more than
+  // it looks: `candidates.role_id` is ON DELETE SET NULL, so a naive delete
+  // detaches every screened candidate from the job they applied for — and an
+  // archived role stays on the page as "Inactive" while a deleted one goes,
+  // so the note is the only thing that says which happened.
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockApi.getRoleScorecard.mockResolvedValue({ scorecard: { metrics: [] } });
+    mockApi.listScorecardMetrics.mockResolvedValue([]);
+    mockApi.getActiveRoleDraft.mockResolvedValue({ active: null });
+    mockApi.listRoles.mockResolvedValue([mockRole]);
+    mockApi.deleteRole.mockResolvedValue({ outcome: 'deleted' });
+    vi.spyOn(window, 'confirm').mockReturnValue(true);
+  });
+
+  it('DELETES after a confirm, and reloads', async () => {
+    render(<RolesPage />);
+    const button = await screen.findByRole('button', {
+      name: `Delete role ${mockRole.title}`,
+    });
+    await userEvent.click(button);
+
+    await waitFor(() => expect(mockApi.deleteRole).toHaveBeenCalledWith(mockRole.id));
+    await waitFor(() => expect(mockApi.listRoles).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText(/was deleted/)).toBeInTheDocument();
+  });
+
+  it('DOES NOTHING when the confirm is declined', async () => {
+    // One click from a list, and destructive.
+    vi.spyOn(window, 'confirm').mockReturnValue(false);
+    render(<RolesPage />);
+    await userEvent.click(
+      await screen.findByRole('button', { name: `Delete role ${mockRole.title}` }),
+    );
+    expect(mockApi.deleteRole).not.toHaveBeenCalled();
+  });
+
+  it('SAYS SO when the role was ARCHIVED rather than deleted', async () => {
+    // The card goes away either way. An operator who is not told will go
+    // looking for a role that still exists, or assume history was destroyed
+    // when it was not.
+    mockApi.deleteRole.mockResolvedValue({
+      outcome: 'archived',
+      reason: 'candidates_or_sessions_exist',
+      candidates: 12,
+      sessions: 3,
+    });
+    render(<RolesPage />);
+    await userEvent.click(
+      await screen.findByRole('button', { name: `Delete role ${mockRole.title}` }),
+    );
+    const note = await screen.findByText(/archived rather than deleted/);
+    expect(note).toHaveTextContent(/12 candidates/);
+    expect(note).toHaveTextContent(/3 sessions/);
+  });
+
+  it("SHOWS THE SERVER'S REASON when the role is mapped to an Ashby job", async () => {
+    // A 409 names the screen where the mapping can be removed; a generic
+    // "could not delete" would leave the operator with nowhere to go.
+    mockApi.deleteRole.mockRejectedValue(
+      new ApiError('This role is mapped to an Ashby job. Remove the mapping in Ashby Mission Control first.', 409),
+    );
+    render(<RolesPage />);
+    await userEvent.click(
+      await screen.findByRole('button', { name: `Delete role ${mockRole.title}` }),
+    );
+    expect(await screen.findByText(/Ashby Mission Control/)).toBeInTheDocument();
+  });
+
+  it('names the ROLE, not just "Delete"', async () => {
+    // Six cards means six identical controls to anyone navigating by control,
+    // and this is the last thing they hear before a destructive action.
+    render(<RolesPage />);
+    expect(
+      await screen.findByRole('button', { name: `Delete role ${mockRole.title}` }),
+    ).toBeInTheDocument();
   });
 });

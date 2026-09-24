@@ -49,6 +49,16 @@ function insertRecorder(): any {
   };
   return self;
 }
+vi.mock('../lib/role-authoring.js', async () => {
+  const actual = await vi.importActual<typeof import('../lib/role-authoring.js')>(
+    '../lib/role-authoring.js',
+  );
+  // The REAL `RoleDraftError`, because the route branches on `instanceof` to
+  // decide 422-vs-500 and a stub class would let that branch be wrong while
+  // the test passed. Only the provider-calling function is replaced.
+  return { ...actual, rephraseQuestion: vi.fn() };
+});
+
 vi.mock('../lib/role-draft-jobs.js', async () => ({
   // The real class — but NOT, as an earlier comment here claimed, because a
   // stub would let the 409 test pass while production 500s. It would not:
@@ -74,6 +84,7 @@ vi.mock('../lib/audit.js', () => ({ recordAudit: vi.fn() }));
 
 const { rolesRouter } = await import('../routes/roles.js');
 const jobs = await import('../lib/role-draft-jobs.js');
+const authoring = await import('../lib/role-authoring.js');
 const { recordAudit } = await import('../lib/audit.js');
 const { supabase } = await import('../lib/supabase.js');
 const { createRoleSchema, updateRoleSchema } = await import('../schemas/roles.js');
@@ -469,5 +480,71 @@ describe('agent_name', () => {
     expect(updateRoleSchema.parse({ agent_name: null }).agent_name).toBeNull();
     expect(updateRoleSchema.parse({ agent_name: '  Hello  ' }).agent_name).toBe('Hello');
     expect('agent_name' in updateRoleSchema.parse({ title: 'x' })).toBe(false);
+  });
+});
+
+describe('POST /api/roles/questions/rephrase', () => {
+  // The module mock is created once for the file, so its call log carries
+  // across tests. The two "must not be called" assertions below are the point
+  // of their tests — a leaked count from the test above would make them pass
+  // for the wrong reason, or fail for one.
+  beforeEach(() => {
+    vi.mocked(authoring.rephraseQuestion).mockClear();
+  });
+
+  it('returns the rewritten question', async () => {
+    vi.mocked(authoring.rephraseQuestion).mockResolvedValue('What tools do you use daily?');
+    const res = await request(app())
+      .post('/api/roles/questions/rephrase')
+      .set(AUTH)
+      .send({ question: 'How do you keep the applicant tracking system current?' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ question: 'What tools do you use daily?' });
+  });
+
+  it('answers 422, not 500, when the model cannot phrase it', async () => {
+    // "Hello could not rephrase that" is a true statement about a working
+    // system. A 500 would send the operator looking for an outage that is not
+    // there, and their own text is still in the field either way.
+    vi.mocked(authoring.rephraseQuestion).mockRejectedValue(
+      new authoring.RoleDraftError('nope', 'unspeakable_questions'),
+    );
+    const res = await request(app())
+      .post('/api/roles/questions/rephrase')
+      .set(AUTH)
+      .send({ question: 'anything' });
+    expect(res.status).toBe(422);
+    expect(res.body.error.type).toBe('unprocessable_entity');
+  });
+
+  it('lets a REAL fault through as a 500 rather than mislabelling it', async () => {
+    // The 422 branch is `instanceof RoleDraftError`. Catching everything would
+    // report a dead provider, a DNS failure or a bug as "could not rephrase",
+    // and the operator would retry forever against something that is broken.
+    vi.mocked(authoring.rephraseQuestion).mockRejectedValue(new Error('pooler reset'));
+    const res = await request(app())
+      .post('/api/roles/questions/rephrase')
+      .set(AUTH)
+      .send({ question: 'anything' });
+    expect(res.status).toBe(500);
+  });
+
+  it('refuses a viewer', async () => {
+    vi.mocked(authoring.rephraseQuestion).mockResolvedValue('unused');
+    const res = await request(app('viewer'))
+      .post('/api/roles/questions/rephrase')
+      .set(AUTH)
+      .send({ question: 'anything' });
+    expect(res.status).toBe(403);
+    expect(authoring.rephraseQuestion).not.toHaveBeenCalled();
+  });
+
+  it('REFUSES AN EMPTY QUESTION BEFORE SPENDING A GENERATION', async () => {
+    const res = await request(app())
+      .post('/api/roles/questions/rephrase')
+      .set(AUTH)
+      .send({ question: '   ' });
+    expect(res.status).toBe(400);
+    expect(authoring.rephraseQuestion).not.toHaveBeenCalled();
   });
 });

@@ -23,6 +23,17 @@ export const roleDraftSchema = z
 
 export type RoleDraftInput = z.infer<typeof roleDraftSchema>;
 
+/**
+ * One question to rewrite. Bounded at 2000 to match `MAX_QUESTION_CHARS` in
+ * the authoring module — a longer string must be refused here rather than
+ * sent to the provider and refused after the spend.
+ */
+export const rephraseQuestionSchema = z
+  .object({ question: z.string().trim().min(1, 'question is required').max(2000) })
+  .strict();
+
+export type RephraseQuestionInput = z.infer<typeof rephraseQuestionSchema>;
+
 export const createRoleSchema = z
   .object({
     title: z.string().trim().min(1, 'title is required').max(200),
