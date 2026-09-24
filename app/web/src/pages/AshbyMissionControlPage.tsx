@@ -269,7 +269,12 @@ export function AshbyMissionControlPage() {
     setCreateError(null);
     setCreating(true);
     try {
-      const res = await api.createAshbyMapping({
+      // The return value is unused on purpose: success is the ABSENCE of a
+      // throw, since `apiClient.request` raises on every non-2xx. `npm run
+      // build` uses a stricter tsconfig than `test:typecheck` and refused the
+      // dead binding — the gate that catches this is the build, not the
+      // typecheck.
+      await api.createAshbyMapping({
         external_job_id: newMapping.external_job_id.trim(),
         role_id: newMapping.role_id,
         // EMPTY BECOMES UNDEFINED, not "". The route validates every optional
@@ -280,10 +285,12 @@ export function AshbyMissionControlPage() {
         ta_screening_stage_id: newMapping.ta_screening_stage_id.trim() || undefined,
         label: newMapping.label.trim() || undefined,
       });
-      if (!res.ok) {
-        setCreateError(mappingErrorCopy(res.error));
-        return;
-      }
+      // NO `!res.ok` BRANCH. `apiClient.request` throws `ApiError` on every
+      // non-2xx, and this route only ever emits `ok:false` with 400/409/500 —
+      // so that branch was unreachable and every admin saw the raw machine
+      // code (`invalid_external_job_id`) that `mappingErrorCopy` exists to
+      // translate. The test that "pinned" the copy mocked a resolved
+      // `{ok:false}`, a shape the API layer cannot produce, so it was vacuous.
       setShowNewMapping(false);
       setNewMapping({
         external_job_id: '',
@@ -294,8 +301,12 @@ export function AshbyMissionControlPage() {
       });
       await load();
     } catch (err) {
+      // The thrown message IS the route's machine code, so translate it here
+      // — this is the only path a failure actually takes.
       setCreateError(
-        err instanceof ApiError ? err.message : 'Could not create the mapping. Try again.',
+        err instanceof ApiError
+          ? mappingErrorCopy(err.message)
+          : 'Could not create the mapping. Try again.',
       );
     } finally {
       setCreating(false);
@@ -503,8 +514,10 @@ export function AshbyMissionControlPage() {
                   * role, then ask an engineer.
                   */}
                 <p className="text-[13px] text-ink-secondary">
-                  Points an Ashby job at a HELLO role. Saves as <strong>paused</strong> — use
-                  Resume once the stage ids are in, which is also what the database checks.
+                  Points an Ashby job at a HELLO role. Saves as <strong>paused</strong>;
+                  Resume enables it. <strong>Enter both stage ids now</strong> — the database
+                  refuses to enable a mapping without them, and this form cannot edit a
+                  mapping once it exists.
                 </p>
 
                 <div className="mt-3 grid gap-3 sm:grid-cols-2">
@@ -576,7 +589,12 @@ export function AshbyMissionControlPage() {
                 </div>
 
                 {createError && (
-                  <p role="alert" className="mt-3 text-[13px] text-danger">
+                  // `text-error-text`, not `text-danger`. Tailwind here defines
+                  // `error`, not `danger`, so `text-danger` compiles to nothing
+                  // and the message rendered as ordinary body ink — it read as
+                  // help text rather than a failure. `Field` already uses this
+                  // token for exactly this.
+                  <p role="alert" className="mt-3 text-[13px] text-error-text">
                     {createError}
                   </p>
                 )}

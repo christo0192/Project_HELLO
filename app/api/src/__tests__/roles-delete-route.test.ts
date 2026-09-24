@@ -2,7 +2,7 @@
  * DELETE /api/roles/:id — three outcomes, and why it is not one.
  *
  * `screening_v2.roles` is referenced six ways and the foreign keys disagree:
- * `candidates.role_id` and `sessions.role_id` are ON DELETE SET NULL,
+ * `candidates.role_id` and `call_sessions.role_id` are ON DELETE SET NULL,
  * `role_scorecards` is CASCADE, and `ashby_job_mappings.role_id` is NOT NULL
  * ON DELETE RESTRICT. So a plain delete would detach every candidate who ever
  * applied for a job from the job they applied for — the record survives and
@@ -47,13 +47,33 @@ let scenario: Scenario;
 /** Every table a request touched, with the operation. */
 let touched: Array<{ table: string; op: string; filters: Array<[string, unknown]> }>;
 
+/**
+ * The tables this route is allowed to read, and what each one answers.
+ *
+ * THE MAP THROWS ON ANYTHING ELSE, and that is the point. The first version
+ * returned `counts[table] ?? 0` — so when the route asked for `sessions`, a
+ * relation that does not exist (it is `call_sessions`), the mock cheerfully
+ * answered "0 rows" and every test passed while production answered 500 on
+ * every single delete. A reviewer found it; no test could have.
+ *
+ * PostgREST answers PGRST205 for an unknown relation, so the mock does the
+ * nearest thing available to it: it refuses loudly.
+ */
+const KNOWN_TABLES = ['roles', 'ashby_job_mappings', 'candidates', 'call_sessions'];
+
 function chain(table: string): any {
+  if (!KNOWN_TABLES.includes(table)) {
+    throw new Error(
+      `PGRST205: relation "screening_v2.${table}" does not exist — ` +
+        `the route asked for a table this schema has never had`,
+    );
+  }
   const call = { table, op: 'select', filters: [] as Array<[string, unknown]> };
   touched.push(call);
   const counts: Record<string, number> = {
     ashby_job_mappings: scenario.mappings,
     candidates: scenario.candidates,
-    sessions: scenario.sessions,
+    call_sessions: scenario.sessions,
   };
   const self: any = {
     select(_cols?: string, opts?: { count?: string; head?: boolean }) {
@@ -140,6 +160,17 @@ describe('DELETE /api/roles/:id', () => {
     expect(touched.some((t) => t.table === 'roles' && t.op === 'delete')).toBe(false);
   });
 
+  it('READS call_sessions, the table that actually exists', async () => {
+    // `from('sessions')` was the only one in the whole API and PostgREST
+    // answers PGRST205 for it, so every delete and archive returned 500 and
+    // the feature was inert 100% of the time. The mock above now refuses an
+    // unknown relation, which is what makes this assertion meaningful rather
+    // than decorative.
+    await del();
+    expect(touched.map((t) => t.table)).toContain('call_sessions');
+    expect(touched.map((t) => t.table)).not.toContain('sessions');
+  });
+
   it('ARCHIVES when only sessions reference it', async () => {
     // Sessions outlive candidates in some flows, and a call record that no
     // longer names its role is just as lossy.
@@ -184,10 +215,11 @@ describe('DELETE /api/roles/:id', () => {
     expect(res.status).toBe(403);
   });
 
-  it('FAILS CLOSED when the audit sink dies', async () => {
-    // A delete whose record was lost is the one an operator will most want to
-    // look up. Every other mutation on this router is fail-closed; this one
-    // must not be the exception.
+  it('REPORTS a dead audit sink rather than swallowing it', async () => {
+    // The row is already gone by the time the audit runs, so this is a loud
+    // failure rather than a prevented one — the same convention `POST /` and
+    // `PUT /:id` use in this file. Worth pinning either way: a delete whose
+    // record was lost is the one an operator will most want to look up.
     vi.mocked(recordAudit).mockRejectedValue(new Error('sink down') as never);
     const res = await del();
     expect(res.status).toBe(500);

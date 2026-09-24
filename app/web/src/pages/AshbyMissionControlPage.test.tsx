@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { AshbyMissionControlPage } from './AshbyMissionControlPage';
+import { ApiError } from '../api';
 
 /**
  * The page header now carries a real <Link> back to Mission Control, so the
@@ -682,7 +683,12 @@ describe('Adding a job mapping', () => {
   it("SHOWS THE ROUTE'S OWN REASON, naming the field at fault", async () => {
     // The form has five fields; "invalid" alone leaves the admin re-checking
     // all of them.
-    createAshbyMapping.mockResolvedValue({ ok: false, error: 'invalid_external_job_id' });
+    // THROWN, not resolved. `apiClient.request` throws `ApiError` on every
+    // non-2xx and this route only emits `ok:false` with 400/409/500, so a
+    // resolved `{ok:false}` is a shape the API layer cannot produce — the
+    // earlier version of this test pinned copy on a branch that never ran,
+    // while every real admin saw the raw machine code.
+    createAshbyMapping.mockRejectedValue(new ApiError('invalid_external_job_id', 400));
     await openForm();
     await userEvent.type(screen.getByLabelText(/Ashby job id/), 'not a job id');
     await userEvent.selectOptions(

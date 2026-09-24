@@ -88,11 +88,15 @@ export function RolesPage() {
    * Remove a role, and tell the operator WHICH of the three things happened.
    *
    * The server deletes only a role nothing references; one with candidates or
-   * sessions is ARCHIVED instead, so every historical record still says which
-   * job it belonged to, and one mapped to an Ashby job is refused. All three
-   * look identical on this page — the card goes away — so the difference has
-   * to be said out loud or the operator will go looking for a role that is
-   * archived, or assume a refusal worked.
+   * call sessions is ARCHIVED instead, so every historical record still says
+   * which job it belonged to, and one mapped to an Ashby job is refused.
+   *
+   * AN ARCHIVED CARD STAYS ON THIS PAGE, flipped to "Inactive" — `GET
+   * /api/roles` has no `is_active` filter. That is defensible, but it is not
+   * what a button labelled Delete leads anyone to expect, so the note says
+   * which of the three happened. An earlier version of this comment claimed
+   * the card goes away in every case; it does not, and a maintainer would
+   * have trusted it.
    */
   const removeRole = useCallback(
     async (role: Role) => {
@@ -164,9 +168,10 @@ export function RolesPage() {
       {error && <ErrorPanel message={error} onRetry={load} />}
 
       {removalNote && (
-        // `role="status"`, so the outcome is ANNOUNCED. The card simply
-        // disappears whether the role was deleted or archived, and an operator
-        // who cannot see the list has no other way to learn which happened.
+        // `role="status"`, so the outcome is ANNOUNCED. Deleted and archived
+        // are told apart only by this sentence — the archived card stays on
+        // the page as "Inactive" and the deleted one goes — so someone who
+        // cannot see the grid has nothing else to go on.
         <InlineNotice tone="info" role="status" className="mt-1">
           {removalNote}
         </InlineNotice>
@@ -247,12 +252,20 @@ export function RolesPage() {
                         size="sm"
                         variant="ghost"
                         onClick={() => void removeRole(role)}
-                        // NAMED FOR THE ROLE. A page of six cards means six
-                        // identical "Delete" controls to anyone navigating by
-                        // control; the title is what tells them apart, and it
-                        // is also the last thing they hear before a
-                        // destructive action.
-                        aria-label={`Delete role ${role.title}`}
+                        // NAMED FOR THE ROLE, and the name FOLLOWS THE STATE.
+                        // A page of six cards means six identical "Delete"
+                        // controls to anyone navigating by control; the title
+                        // tells them apart and is the last thing they hear
+                        // before a destructive action. A static label while
+                        // the visible text becomes "Deleting…" is the SC 2.5.3
+                        // mismatch the Rephrase button two elements away was
+                        // just fixed for.
+                        aria-label={
+                          deletingId === role.id
+                            ? `Deleting role ${role.title}…`
+                            : `Delete role ${role.title}`
+                        }
+                        aria-busy={deletingId === role.id}
                         aria-disabled={deletingId !== null}
                       >
                         {deletingId === role.id ? "Deleting…" : "Delete"}
@@ -340,6 +353,13 @@ function RoleForm({
       id: q.id,
       question: q.question,
       weight: q.weight,
+      // CARRIED THROUGH THE EDIT ROUND TRIP. `PUT /api/roles/:id` replaces
+      // `screening_template` wholesale, and this map is what it is rebuilt
+      // from — so dropping the flag here meant opening a role to fix a typo
+      // in the JD and silently removing every `[MUST ASK]` from it on Save.
+      // The flag appears nowhere in the UI, so it was invisible and
+      // unrecoverable short of re-running a ten-minute draft.
+      mandatory: q.mandatory,
     })) ?? [emptyQuestion(1)],
   );
   const [saving, setSaving] = useState(false);

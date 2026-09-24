@@ -632,11 +632,59 @@ describe('Rephrase — the way out of an unforgiving question gate', () => {
   });
 });
 
+describe('The [MUST ASK] flag survives an edit', () => {
+  // PROVEN BY A REVIEWER, ONE LINE OF CAUSE. The form rebuilt its question
+  // rows from the saved role WITHOUT `mandatory`, and `PUT /api/roles/:id`
+  // replaces `screening_template` wholesale — so opening an Ask Hello role to
+  // fix a typo in the JD and pressing Save silently stripped every
+  // `[MUST ASK]` from it.
+  //
+  // That flag is the only thing keeping CTC and notice period from being
+  // dropped when a call runs against its ten-minute budget, it appears nowhere
+  // in the UI, and recovering it meant re-running a ten-minute draft that
+  // overwrites the whole form.
+  const ARC_ROLE = {
+    ...mockRole,
+    screening_template: [
+      { id: 'q1', question: 'Tell me about yourself and your most recent role?', weight: 1, mandatory: true },
+      { id: 'q2', question: 'What does your current role involve day to day?', weight: 1 },
+      { id: 'q3', question: 'What is your current annual CTC, including any variable pay?', weight: 1, mandatory: true },
+    ],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockApi.getRoleScorecard.mockResolvedValue({ scorecard: { metrics: [] } });
+    mockApi.listScorecardMetrics.mockResolvedValue([]);
+    mockApi.getActiveRoleDraft.mockResolvedValue({ active: null });
+    mockApi.listRoles.mockResolvedValue([ARC_ROLE]);
+    mockApi.updateRole.mockResolvedValue(ARC_ROLE);
+  });
+
+  it('SAVES the flags back unchanged after an edit that never touched them', async () => {
+    render(<RolesPage />);
+    await userEvent.click(await screen.findByRole('button', { name: /edit/i }));
+    await screen.findByLabelText('Question 1');
+    await userEvent.click(screen.getByRole('button', { name: /Save changes/i }));
+
+    await waitFor(() => expect(mockApi.updateRole).toHaveBeenCalled());
+    const body = mockApi.updateRole.mock.calls[0][1] as {
+      screening_template: Array<{ id: string; mandatory?: boolean }>;
+    };
+    expect(
+      body.screening_template.filter((q) => q.mandatory === true).map((q) => q.id),
+    ).toEqual(['q1', 'q3']);
+    // And a question that was never mandatory does not become so.
+    expect(body.screening_template.find((q) => q.id === 'q2')?.mandatory).toBeUndefined();
+  });
+});
+
 describe('Removing a role', () => {
   // The page could add roles and never remove one. The gap matters more than
   // it looks: `candidates.role_id` is ON DELETE SET NULL, so a naive delete
-  // detaches every screened candidate from the job they applied for, and the
-  // card disappears identically either way.
+  // detaches every screened candidate from the job they applied for — and an
+  // archived role stays on the page as "Inactive" while a deleted one goes,
+  // so the note is the only thing that says which happened.
   beforeEach(() => {
     vi.clearAllMocks();
     mockApi.getRoleScorecard.mockResolvedValue({ scorecard: { metrics: [] } });

@@ -746,15 +746,63 @@ export const REPHRASE_MAX_ATTEMPTS = 2;
 /** One short sentence does not need minutes, and a spinner that long reads as broken. */
 export const REPHRASE_TIMEOUT_MS = 45_000;
 
+/**
+ * Tokens the PHONE WORKER reads out of the question itself.
+ *
+ * `phone_answer_covers_objective` (`phone.py:7793`) decides a compensation
+ * question is already answered by looking for `current` / `expected` IN THE
+ * QUESTION. A compensation question carrying neither is "covered" by every
+ * answer, including an empty one, so it is force-skipped on every call and
+ * recorded as asked. That is the bug this arc's own wording was fixed for.
+ *
+ * Rephrase could hand it straight back. "Keep what it is asking about; change
+ * only the wording" is a prompt instruction, and the post-gate only checks
+ * speakability — so one press on the expected-CTC closer could return "What
+ * annual CTC are you looking for…", which is verbatim the broken wording, and
+ * that role would silently stop asking the question forever. The owner called
+ * this button fail proof; for this failure class it was the opposite.
+ *
+ * So a rewrite must KEEP whichever of these the input carried. Checked here
+ * rather than only asked for in the prompt, for the reason this file states
+ * everywhere else: a rule that is merely requested holds most of the time.
+ */
+const COMPENSATION_RE = /\b(?:ctc|salary|compensation|package)\b/i;
+const COVERAGE_TOKENS: ReadonlyArray<{ label: string; re: RegExp }> = [
+  { label: 'current', re: /\bcurrent\b/i },
+  { label: 'expected', re: /\bexpected\b|\bexpectation/i },
+  { label: 'notice period', re: /\bnotice period\b/i },
+];
+
+/** Which coverage tokens this question depends on for the worker to ask it. */
+function requiredCoverageTokens(question: string): string[] {
+  const needed: string[] = [];
+  for (const { label, re } of COVERAGE_TOKENS) {
+    if (!re.test(question)) continue;
+    // `current` and `expected` only matter on a COMPENSATION objective — the
+    // worker's branch is gated on that first.
+    if (label !== 'notice period' && !COMPENSATION_RE.test(question)) continue;
+    needed.push(label);
+  }
+  return needed;
+}
+
 function buildRephrasePrompt(question: string, priorFailure: string | null): string {
   const repair = priorFailure
     ? `\nYOUR PREVIOUS SUGGESTION WAS REJECTED: ${priorFailure}\nFix exactly that and keep the meaning.\n`
+    : '';
+  const keep = requiredCoverageTokens(question);
+  const keepRule = keep.length
+    ? `\nTHE REWRITE MUST STILL CONTAIN ${keep
+        .map((w) => `"${w}"`)
+        .join(' and ')}. The automated caller decides whether this question has
+already been answered by looking for those exact words in the question itself,
+and a version without them is skipped and never asked.\n`
     : '';
   return `Rewrite the screening question below so an automated caller can read it
 aloud to a job candidate. Keep what it is asking about; change only the wording.
 
 QUESTION: ${question}
-${repair}
+${repair}${keepRule}
 The rewritten question must:
 - end with a question mark
 - be one sentence a person can say naturally in under 12 seconds
@@ -835,6 +883,23 @@ export async function rephraseQuestion(
       lastIssue = priorFailure;
       continue;
     }
+
+    // THE COVERAGE TOKENS, enforced. Losing one does not make the question
+    // unspeakable — it makes the worker skip it while recording it as asked,
+    // which no speakability gate can see.
+    const required = requiredCoverageTokens(question);
+    const dropped = required.filter((label) => {
+      const rule = COVERAGE_TOKENS.find((t) => t.label === label);
+      return rule ? !rule.re.test(text) : false;
+    });
+    if (dropped.length > 0) {
+      priorFailure = `it dropped ${dropped
+        .map((w) => `"${w}"`)
+        .join(' and ')}, which the automated caller needs in the question itself`;
+      lastIssue = priorFailure;
+      continue;
+    }
+
     return text;
   }
 

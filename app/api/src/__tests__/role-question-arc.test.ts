@@ -286,6 +286,57 @@ describe('rephraseQuestion — the way out of an unforgiving gate', () => {
     expect(retryPrompt).toContain('YOUR PREVIOUS SUGGESTION WAS REJECTED');
   });
 
+  it('REFUSES A REWRITE THAT DROPS "expected" — the P0 this arc was fixed for', async () => {
+    // The sharpest failure this button can have. "Keep the meaning" is a
+    // prompt instruction and the post-gate only checks speakability, so a
+    // rewrite of the expected-CTC closer could come back as "What annual CTC
+    // are you looking for in your next role?" — verbatim the wording that
+    // made `phone_answer_covers_objective` return true for ANY answer, so the
+    // question is force-skipped on every call and recorded as asked. Perfectly
+    // speakable, and silently destroys the thing this commit exists to fix.
+    const infer = vi
+      .fn()
+      .mockResolvedValueOnce({ question: 'What annual CTC are you looking for in your next role?' })
+      .mockResolvedValueOnce({ question: 'What is your expected annual CTC going forward?' });
+    const out = await rephraseQuestion(ROLE_DRAFT_CLOSING_QUESTIONS[1], { infer });
+
+    expect(out).toBe('What is your expected annual CTC going forward?');
+    expect(infer).toHaveBeenCalledTimes(2);
+    // And the retry says WHICH word went missing, rather than asking again blind.
+    expect(infer.mock.calls[1][0]).toMatch(/dropped "expected"/);
+  });
+
+  it('REFUSES a rewrite that drops "current"', async () => {
+    const infer = vi
+      .fn()
+      .mockResolvedValueOnce({ question: 'What annual CTC do you draw today, including variable pay?' })
+      .mockResolvedValueOnce({ question: 'What is your current annual CTC including variable pay?' });
+    const out = await rephraseQuestion(ROLE_DRAFT_CLOSING_QUESTIONS[0], { infer });
+    expect(out).toMatch(/\bcurrent\b/i);
+  });
+
+  it('REFUSES a rewrite that drops "notice period"', async () => {
+    // A different branch of the same predicate, and the same consequence.
+    const infer = vi
+      .fn()
+      .mockResolvedValueOnce({ question: 'How soon could you start if things move ahead?' })
+      .mockResolvedValueOnce({ question: 'What is your notice period, and when could you start?' });
+    const out = await rephraseQuestion(ROLE_DRAFT_CLOSING_QUESTIONS[2], { infer });
+    expect(out).toMatch(/notice period/i);
+  });
+
+  it('LEAVES AN ORDINARY QUESTION FREE to be reworded however', async () => {
+    // The constraint applies only where the worker actually reads the
+    // question for those words. A role-specific question carrying none of
+    // them must not be held to any of it.
+    const infer = vi.fn().mockResolvedValue({ question: 'Which tools do you use every day?' });
+    const out = await rephraseQuestion('How do you keep the applicant tracking system current?', {
+      infer,
+    });
+    expect(out).toBe('Which tools do you use every day?');
+    expect(infer).toHaveBeenCalledTimes(1);
+  });
+
   it('rejects a response that is not a question object at all', async () => {
     const infer = vi.fn().mockResolvedValue({ text: 'wrong key' });
     await expect(rephraseQuestion('anything', { infer })).rejects.toThrow(

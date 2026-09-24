@@ -137,10 +137,16 @@ rolesRouter.post(
       res.json({ question: rephrased });
     } catch (err) {
       if (err instanceof RoleDraftError) {
+        // THE OFFENDING WORD TRAVELS. `rephraseQuestion` works out exactly
+        // which banned word the text uses, and dropping it here left a TA
+        // recruiter who wrote "applicant tracking system" with "Hello could
+        // not rephrase that" and no clue which word `META_RE` refuses — the
+        // wording trap this button exists for.
+        const detail = err.detail?.[0];
         return res.status(422).json({
           error: {
             type: 'unprocessable_entity',
-            message: err.message,
+            message: detail ? `${err.message} It says ${detail}.` : err.message,
             details: { reason: err.reason },
           },
         });
@@ -346,9 +352,12 @@ rolesRouter.put(
  *   - referenced by an Ashby mapping -> 409, name it, change nothing. The
  *     database would refuse anyway (RESTRICT); answering with the reason is
  *     more useful than surfacing a constraint error.
- *   - referenced by candidates or sessions -> ARCHIVE (`is_active = false`).
- *     It leaves the roles list, stops being offered anywhere new, and every
- *     historical record still says which job it belonged to.
+ *   - referenced by candidates or call sessions -> ARCHIVE
+ *     (`is_active = false`). It is marked Inactive and stops being offered
+ *     anywhere new, and every historical record still says which job it
+ *     belonged to. It does NOT leave the roles list — `GET /api/roles` has no
+ *     `is_active` filter — so the response names the outcome and the client
+ *     is what tells the operator.
  *   - referenced by nothing -> DELETE. A role created by mistake, or an Ask
  *     Hello draft saved and thought better of, genuinely goes away.
  *
@@ -396,8 +405,14 @@ rolesRouter.delete(
       .eq('role_id', roleId);
     if (candidateError) return next(candidateError);
 
+    // `call_sessions`, NOT `sessions`. There is no `screening_v2.sessions`;
+    // every other call site in this API says `call_sessions`, and this route
+    // was the only `from('sessions')` in it. PostgREST answers PGRST205, the
+    // error propagates, and EVERY delete and archive returned 500 — the
+    // feature was inert 100% of the time. The unit test pinned the same wrong
+    // name in its table map, which is precisely why CI was green.
     const { count: sessionCount, error: sessionError } = await supabase
-      .from('sessions')
+      .from('call_sessions')
       .select('id', { count: 'exact', head: true })
       .eq('role_id', roleId);
     if (sessionError) return next(sessionError);
