@@ -246,9 +246,18 @@ export function AskHelloButton({
   useEffect(() => {
     if (!jobId) return;
     let live = true;
+    // SETTLES ONCE PER JOB, and `live` was not enough to guarantee it. `live`
+    // flips in this effect's CLEANUP, which React runs on its next commit —
+    // so two polls already in flight (any GET slower than the 2s interval
+    // puts them there) can both observe the terminal row and both enter
+    // `settle` in the same microtask drain, with `live` still true for both.
+    // `onDrafted` is documented "called once"; firing it twice re-opens the
+    // overwrite confirm on a form the first call has already filled.
+    let settled = false;
 
     const settle = (job: RoleDraftJob) => {
-      if (!live) return;
+      if (!live || settled) return;
+      settled = true;
       // FOCUS FIRST, because Cancel is about to unmount. If the keyboard user
       // is standing on it when it disappears, focus falls to <body> and the
       // next Tab restarts from the top of the page — the same failure the main

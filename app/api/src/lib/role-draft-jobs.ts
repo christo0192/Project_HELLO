@@ -391,16 +391,35 @@ export async function startRoleDraft(
     // occurred — was discarded one layer above the `errorCode()` helper this
     // module added to stop exactly that.
     if (error && (error as { code?: string }).code === '23505') {
+      // STALENESS APPLIES HERE TOO. `readRunningRow` is deliberately
+      // unfiltered — it is what the expiry path uses to see the row the index
+      // can see — so returning it directly would hand back a DEAD worker's
+      // job as though it were live, or refuse the operator in the name of a
+      // job nobody is running. `expireStaleRoleDraft` logs and swallows its
+      // failures, so that is a reachable state, not a hypothetical one.
       const winner = await readRunningRow(ownerId);
-      if (winner) {
+      const live = winner && now() - Date.parse(winner.updated_at) <= ROLE_DRAFT_STALE_MS;
+      if (winner && live) {
         if (winner.job_role.trim() === jobRole.trim()) return toJob(winner);
         throw new RoleDraftBusyError(winner.job_role);
       }
+      // NO LIVE WINNER. Losing the race twice while nothing is actually
+      // holding the slot means the expiry write is failing — the row is there
+      // and stale, or gone entirely, and either way a third insert is not
+      // obviously going to fare better than the second.
+      //
+      // An earlier comment here claimed "a second 23505 with no readable
+      // winner still means someone else holds the slot". It does not: the
+      // read one line above returned nothing. What is true is that this
+      // request cannot be served and the operator should be told to try
+      // again rather than shown an Internal Server Error, which is what the
+      // raw postgrest body produced. The log line is the part that says
+      // which of the two it was.
       draftLogger.warn('db_error', {
         error_category: 'role_draft_start_conflict',
         error_type: errorCode(error),
       });
-      throw new RoleDraftBusyError(jobRole);
+      throw new RoleDraftBusyError(winner?.job_role ?? jobRole);
     }
   }
   if (error) throw error;

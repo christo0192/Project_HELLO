@@ -542,6 +542,38 @@ describe('AskHelloButton', () => {
     expect(onDrafted).not.toHaveBeenCalled();
   });
 
+  it('SETTLES ONCE even when two polls observe the terminal row', async () => {
+    // `live` is not enough: it flips in the effect CLEANUP, which React runs
+    // on its next commit. Any GET slower than the 2s interval puts two polls
+    // in flight, and if both see the finished job they both enter `settle` in
+    // the same microtask drain with `live` still true for both.
+    //
+    // `onDrafted` is documented "called once". Firing it twice re-opens the
+    // overwrite confirm on a form the first call has already filled, so the
+    // operator is asked to approve replacing the draft with itself.
+    mockApi.startRoleDraft.mockResolvedValue(running());
+    const releases: Array<(v: unknown) => void> = [];
+    mockApi.getRoleDraft.mockImplementation(
+      () => new Promise((resolve) => releases.push(resolve)),
+    );
+    const { onDrafted } = setup();
+
+    await act(async () => askHello().click());
+    // Let the interval fire again so a SECOND poll is outstanding.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(2_000);
+    });
+    expect(releases.length).toBeGreaterThanOrEqual(2);
+
+    // Both land, both carrying the finished job.
+    const done = { ...running(), status: 'succeeded', draft: { jd: 'x' }, repaired: [] };
+    await act(async () => {
+      releases.forEach((release) => release(done));
+    });
+
+    expect(onDrafted).toHaveBeenCalledTimes(1);
+  });
+
   it('a SECOND PRESS does not void the first press\'s cancel', async () => {
     // One component-wide flag did not survive this. After Cancel the button is
     // pressable again while the first POST is still out, and the next start

@@ -64,6 +64,8 @@ let ranges: Array<[number, number]>;
 let orders: string[];
 /** The column list the turn query asked for. */
 let selects: string[];
+/** Every `.not(column, op, value)` the turn query applied, flattened. */
+let nots: string[] = [];
 /** The `.in()` filters the turn query applied, as [column, count]. */
 let ins: Array<[string, number]>;
 /**
@@ -89,6 +91,14 @@ function chain(table: string): any {
       return self;
     },
     eq: () => self,
+    not(column: string, operator: string, value: unknown) {
+      // RECORDED, like `select`, `in` and `order` before it. Without this the
+      // consent-gate exclusion could be deleted and the file stayed green —
+      // and a call that died AT the gate would then report a word count for
+      // an interview that never began.
+      if (isTurns) nots.push(`${column} ${operator} ${String(value)}`);
+      return self;
+    },
     in(column: string, values: string[]) {
       // Likewise: without the filter the turn query becomes an unfiltered
       // scan of `transcript_turns` on every candidate detail page load.
@@ -155,6 +165,7 @@ beforeEach(() => {
   orders = [];
   selects = [];
   ins = [];
+  nots = [];
   turnPage = 0;
   scenario = { sessions: [{ id: S1, duration_sec: 434 }], turnPages: [[]] };
   vi.mocked(supabase.from).mockImplementation((t: string) => chain(t) as never);
@@ -173,6 +184,20 @@ describe('candidate_words', () => {
     const res = await get();
     // 3 + 7 = 10 candidate words; the bot's twelve are not the candidate's.
     expect(res.body.sessions[0].candidate_words).toBe(10);
+  });
+
+  it('EXCLUDES the consent-gate turns, like the scorer does', async () => {
+    // 0067 added `is_gate` precisely to separate the identity-and-consent
+    // handshake from the screening, and `runAssessment` excludes it. Counting
+    // "yes" and "yes, this is Jane" put this badge on a different population
+    // from every other number on the page — and on a call that DIED at the
+    // gate it reported a word count for an interview that never started.
+    //
+    // `is not true`, not `= false`: the column is nullable and every row
+    // written before 0067 carries null.
+    await get();
+    expect(nots).toContain('is_gate is true');
+    expect(selects.join(' ')).toContain('is_gate');
   });
 
   it('attributes each session its OWN words', async () => {

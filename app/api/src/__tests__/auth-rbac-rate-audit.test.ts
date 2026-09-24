@@ -1205,6 +1205,21 @@ describe('POST /api/roles/draft is rate limited apart from the rest of /api/role
     expect(res.status).not.toBe(429);
   });
 
+  it('advertises the TIGHT limit, not merely a limit', async () => {
+    // Mounting and separation were pinned; the NUMBER was free. Because the
+    // bucket refills at `limit / windowSec` per elapsed millisecond, a default
+    // raised from 5 to ~50 still 429s inside the few milliseconds a supertest
+    // request takes, so the drain-then-expect-429 test above cannot tell them
+    // apart. The middleware sets `X-RateLimit-Limit` from the config it was
+    // built with, which can.
+    const app = createAuthedApp(makeInterviewer());
+    const res = await request(app)
+      .post('/api/roles/draft')
+      .set('Authorization', VALID_TOKEN)
+      .send({ job_role: 'Sales Advisor' });
+    expect(res.headers['x-ratelimit-limit']).toBe('5');
+  });
+
   it('leaves the rest of the Roles API usable when the draft bucket is empty', async () => {
     // Separate keys. A limiter added to bound provider spend must not take
     // role listing and saving down with it.

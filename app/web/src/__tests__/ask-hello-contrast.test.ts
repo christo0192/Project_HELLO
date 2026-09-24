@@ -151,7 +151,7 @@ function ruleBodies(selector: string): string[] {
   // so a descendant rule can only ADD declarations the guards then object to,
   // never hide one. Both halves verified by execution, not assumed.
   const found = [
-    ...CSS.matchAll(new RegExp(`(?:^|[\\s},])${escaped}\\s*\\{([^}]*)\\}`, 'gm')),
+    ...CSS.matchAll(new RegExp(`(?:^|[\\s},>+~])${escaped}\\s*\\{([^}]*)\\}`, 'gm')),
   ].map((m) => m[1]);
   if (found.length === 0) throw new Error(`no rule for ${selector}`);
   return found;
@@ -183,12 +183,34 @@ function ruleBody(selector: string): string {
  * count is checked against the raw colours as well as widened.
  */
 function gradientStops(): string[] {
-  const body = ruleBody('.ask-hello');
+  // SCOPED TO THE GRADIENT DECLARATION. The cross-check used to count
+  // `#[0-9a-f]{6}` across the whole rule body, which meant it could not see a
+  // stop written in ANY other colour syntax: `#fff 28%` and
+  // `rgb(245 245 245) 28%` were each dropped from `stops` while `rawColours`
+  // fell by the same one, so `stops.length === rawColours` still held. Four
+  // dark stops remained, `>= 3` still passed, the ramp was sampled without
+  // the pale stop in it — and the shipped label sat at 1.0:1. Counting had to
+  // move off the read form and onto EVERY colour token, inside the
+  // declaration that actually paints.
+  //
+  // Reading to the `;` rather than to a `)` on purpose: a nested `rgb(...)`
+  // would end a lazy paren match early and hide the very thing being counted.
+  const declaration = ruleBody('.ask-hello').match(
+    /background-image:\s*linear-gradient\(([\s\S]*?);/,
+  );
+  if (!declaration) throw new Error('no linear-gradient declaration on .ask-hello');
+  const body = declaration[1];
   const stops = [...body.matchAll(/#([0-9a-f]{6})\s+[\d.]+%/gi)].map((m) => `#${m[1]}`);
-  const rawColours = [...body.matchAll(/#[0-9a-f]{6}/gi)].length;
-  if (stops.length !== rawColours) {
+  // Any colour token at all — short hex, functional notation, or a bare
+  // keyword like `white`. The contrast maths below only knows 6-digit hex, so
+  // anything else is an unreadable stop and must fail LOUDLY, not silently.
+  const colourTokens = [
+    ...body.matchAll(/#[0-9a-f]{3,8}\b|\b(?:rgba?|hsla?|hwb|lab|lch|oklab|oklch|color)\(|\b(?:white|black|transparent|currentcolor)\b/gi),
+  ].length;
+  if (stops.length !== colourTokens) {
     throw new Error(
-      `gradient parser read ${stops.length} of ${rawColours} colours — a stop is being dropped`,
+      `gradient parser read ${stops.length} of ${colourTokens} colour tokens — ` +
+        'a stop is in a syntax this file cannot evaluate. Use 6-digit hex.',
     );
   }
   return stops;
@@ -361,7 +383,30 @@ describe('Ask Hello — label contrast, from the stylesheet', () => {
         const value = Number(fade[1]);
         expect(value === 0 || value === 1, `${selector} fades the label to ${value}`).toBe(true);
       }
-      expect(body, `${selector} recolours the label`).not.toMatch(/(?:^|[;{\s])color\s*:/);
+
+      // FADING IS NOT ONLY `opacity:`. `filter: opacity(.6)` composites the
+      // identical 2.82:1 result and has no colon after the word, so the
+      // declaration guard above never saw it. `mix-blend-mode` and
+      // `backdrop-filter` change the composite too. None of them has any
+      // business on this button, so none is allowed rather than parsed.
+      expect(body, `${selector} composites the label away`).not.toMatch(
+        /(?:^|[;{\s])(?:filter|backdrop-filter|mix-blend-mode)\s*:/,
+      );
+
+      // RECOLOURING IS NOT ONLY `color:`. `-webkit-text-fill-color` paints
+      // the glyphs in every Chromium and WebKit browser and evaded the old
+      // check because the character before `color` is `-`, not whitespace.
+      // So every `*color` property is examined and only the ones that cannot
+      // touch the label are let through — an allowlist, because the next
+      // vendor-prefixed text-colour property has not been invented yet.
+      const SAFE_COLOUR_PROPERTIES =
+        /^(?:background|border(?:-(?:top|right|bottom|left|block|inline)(?:-(?:start|end))?)?|outline|column-rule|caret|text-decoration|text-emphasis|accent|flood|lighting|stop|--tw-[a-z-]*)-color$/;
+      for (const [, property] of body.matchAll(/(?:^|[;{\s])([-a-z]*color)\s*:/gi)) {
+        expect(
+          SAFE_COLOUR_PROPERTIES.test(property.toLowerCase()),
+          `${selector} sets ${property}, which can repaint the label`,
+        ).toBe(true);
+      }
     }
   });
 
@@ -388,7 +433,7 @@ describe('Ask Hello — the focus indicator survives hover', () => {
     // disappears for anyone whose pointer rests over a focused button.
     // BOUNDARY-ANCHORED, for the reason `ruleBodies` is. `^` here meant a
     // hover rule nested in ANY at-rule was invisible to this guard.
-    const hoverSelectors = [...CSS.matchAll(/(?:^|[\s},])(\.ask-hello:hover[^{]*)\{/g)].map(
+    const hoverSelectors = [...CSS.matchAll(/(?:^|[\s},>+~])(\.ask-hello:hover[^{]*)\{/g)].map(
       (m) => m[1].trim(),
     );
     expect(hoverSelectors.length).toBeGreaterThan(0);
@@ -427,7 +472,11 @@ describe('Ask Hello — the focus indicator survives hover', () => {
     // produce — never matched at all, because the character before
     // `.ask-hello` was a comma and the prefix wanted whitespace or `}`. That
     // rule is (0,2,0), later in source order, unlayered: defect 3 verbatim.
-    const rules = [...CSS.matchAll(/(?:^|[\s},])(\.ask-hello[^{]*)\{([^}]*)\}/g)];
+    // COMBINATORS ARE BOUNDARY CHARACTERS. `,` was added when a comma with no
+    // space walked through; `.candidate-scope>.ask-hello:hover { box-shadow:
+    // none }` walked through the same hole one character over, because `>`
+    // was not in the class either. `+` and `~` are the remaining two.
+    const rules = [...CSS.matchAll(/(?:^|[\s},>+~])(\.ask-hello[^{]*)\{([^}]*)\}/g)];
     const parts = rules.flatMap(([, rawSelector, body]) =>
       rawSelector.split(',').map((one) => [one, body] as const),
     );

@@ -167,7 +167,12 @@ export function CandidateDetailPage() {
   const decisionBlocked = candidate.decision_use_blocked_at != null;
 
   /**
-   * The LONGEST completed call, not the latest.
+   * The LONGEST call that RECORDED A DURATION, not the latest — and not
+   * "completed", which is what this line used to say. The reducer below
+   * filters on `duration_sec > 0` and never reads `status`, so a call that
+   * died at the consent gate (a documented production class) can be the
+   * session both this figure and the word count describe. Saying "completed"
+   * claimed a filter that is not there.
    *
    * A candidate can have several sessions — a cycle-2 rescreen, a call that
    * died at the consent gate after nine seconds. Showing the most recent would

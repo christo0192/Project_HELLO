@@ -26,6 +26,17 @@ export const PHONE_META_WORDS = [
   'recruiter',
 ] as const;
 
+// EVERY WORD MUST BE REGEX-INERT. These are interpolated straight into a
+// `RegExp` that is built at MODULE LOAD of a file the route table imports, so
+// one future entry containing `(`, `+`, `[` or `.` either throws during import
+// — taking down the process that also serves the phone worker — or silently
+// changes what the gate means. Asserted here rather than left to review.
+for (const word of PHONE_META_WORDS) {
+  if (!/^[a-z]+$/.test(word)) {
+    throw new TypeError(`PHONE_META_WORDS entries must be plain lowercase letters: ${word}`);
+  }
+}
+
 const META_RE = new RegExp(
   `\\b(?:${PHONE_META_WORDS.join('|')})\\b` +
     "|\\b(?:must|should|do not|don't)\\s+(?:ask|say|tell|mention|reveal|ignore)" +

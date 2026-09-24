@@ -972,10 +972,16 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
    * 8 of 8 bot turns barged-in and truncated, and its wall clock reads as a
    * long healthy conversation.
    *
-   * Real talk time is not derivable from what is stored — `transcript_turns`
-   * carries a speaker and a persistence timestamp, no speech duration and no
-   * audio offsets, and the writes are batched so differencing `created_at`
-   * would look precise and be fiction. Words the candidate actually said are
+   * Real talk time is not derivable from what is stored. `transcript_turns`
+   * DOES carry a turn-start anchor — `turn_started_at_ms`, added by 0026 and
+   * used by the seekable transcript to derive `start_offset_sec` — so the
+   * earlier claim here of "no audio offsets" was wrong; the conclusion
+   * happened to survive its reason. What is missing is a speech-END anchor.
+   * Differencing consecutive starts would charge each answer with the
+   * endpointing pause that follows it (0.4-2.5s, a 50% error on a
+   * five-second answer), give the final turn nothing at all, and return null
+   * for every legacy row. `created_at` is worse still: the writes are batched,
+   * so differencing it would look precise and be fiction. Words the candidate actually said are
    * derivable, honest, and separate a talkative candidate from a silent one.
    *
    * Counted here rather than in the client because the turns are not in this
@@ -1026,8 +1032,19 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
       pages += 1;
       const { data: turns, error } = await supabase
         .from('transcript_turns')
-        .select('session_id, speaker, text')
+        .select('session_id, speaker, text, is_gate')
         .in('session_id', sessionIds)
+        // CONSENT-GATE TURNS ARE NOT THE INTERVIEW. 0067 added `is_gate` to
+        // separate the identity-and-consent handshake from the screening
+        // itself, and the scorer excludes it. Counting "yes" and "yes, this
+        // is <name>" as words the candidate spoke put this badge on a
+        // different population from every other number on the page — most
+        // visibly on a call that DIED at the gate, where it would report a
+        // word count for an interview that never started.
+        //
+        // `is not true` rather than `= false`: the column is nullable and
+        // every row written before 0067 carries null.
+        .not('is_gate', 'is', true)
         // Ordered on the (session_id, turn_index) index this table already
         // carries: pagination needs a TOTAL order to not skip or repeat rows,
         // and the uuid primary key would give one only by sorting every match.
