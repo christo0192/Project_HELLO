@@ -103,11 +103,18 @@ export const CANDIDATE_QUESTIONS_MAX_ATTEMPTS = 2;
  *
  * `roleDraftTimeoutMs` raises the budget to 240s because that generator writes
  * a whole role in one shot. This one writes three sentences from facts it is
- * handed, so it does not need the long budget — and unlike drafting it runs on
- * a shared queue worker, where a slow call holds a lease that other work is
- * waiting behind. Capped at the configured budget, never above 120s.
+ * handed, so it does not need the long budget.
+ *
+ * 60s, NOT THE 120s CEILING, and the reason is the SHARED CIRCUIT BREAKER
+ * rather than this module's own patience. `HALF_OPEN` admits exactly one probe
+ * process-wide (`lib/provider-resilience.ts`); if a generation call wins it,
+ * every other caller — including an Ashby résumé parse, whose fallback writes
+ * the candidate NON-DIALABLE — gets `circuit_open` until it settles. The probe
+ * hold is bounded by exactly this number. Measured generation is 8-30s on
+ * v4-pro, so 60s is generous for the work and half of what it was for the
+ * blast radius.
  */
-export const CANDIDATE_QUESTIONS_TIMEOUT_MS = 120_000;
+export const CANDIDATE_QUESTIONS_TIMEOUT_MS = 60_000;
 
 /** Same ceiling `screeningQuestionSchema` and `0044` both enforce. */
 const MAX_QUESTION_CHARS = 2_000;
@@ -624,6 +631,11 @@ export async function generateCandidateQuestions(
       const run = deps.runJson ?? runClaudeJSONWithProvenance;
       const { data } = await run<unknown>(prompt, {
         model: env.deepseekScoringModel,
+        // JSON MODE, as `resume-structurer.ts` already passes. `runDeepseekJSON`
+        // retries the provider once when a response will not parse, so a
+        // malformed answer costs a whole second call — and #281's parser RCA is
+        // the record of what free-form JSON output does at volume.
+        responseFormat: 'json_object',
         timeoutMs: Math.min(env.deepseekTimeoutMs, CANDIDATE_QUESTIONS_TIMEOUT_MS),
       });
       return data;
@@ -823,6 +835,7 @@ export async function judgeCandidateQuestions(
       const run = deps.runJson ?? runClaudeJSONWithProvenance;
       const { data } = await run<unknown>(prompt, {
         model: env.deepseekScoringModel,
+        responseFormat: 'json_object',
         timeoutMs: Math.min(env.deepseekTimeoutMs, JUDGE_TIMEOUT_MS),
       });
       return data;

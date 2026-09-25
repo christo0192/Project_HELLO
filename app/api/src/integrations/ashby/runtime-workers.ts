@@ -124,25 +124,39 @@ export const ASHBY_INGESTION_QUEUE = 'ashby.ingestion';
  * Should a candidate admitted to phone screening get questions written about
  * their own résumé?
  *
- * DEFAULT OFF, AND THE REASON IS THE RUNNER, NOT THE FEATURE. `createAshbyWorkers`
- * gives every handler a SHARED budget of `concurrency: 2`, and the runner
- * decrements `active` only when a job SETTLES — so a queue's in-flight count is
- * unbounded even after PR #296's per-tick cap. A generation job holds one of
- * those two slots for a provider call, and two of them in flight claim nothing
- * from `ashby.signal`, `ashby.import` or `ashby.ingestion` until they finish.
- * A review measured the dilution at −25% before any provider call and far worse
- * once one is slow.
+ * STILL A KILL SWITCH, but no longer a canary the owner has to justify.
  *
- * So this ships as a CANARY the owner turns on, not a kill switch they might
- * have to reach for. Turning it on is safe once the queue has its own runner or
- * a per-queue in-flight cap; until then the owner decides when to spend the
- * Ashby drain's headroom on it.
+ * It shipped DEFAULT OFF for one reason: `candidate.questions` shared the
+ * Ashby runner's budget of `concurrency: 2`, and that runner frees a slot only
+ * when a job SETTLES — so two generation jobs in flight stopped
+ * `ashby.signal`, `ashby.import` and `ashby.ingestion` claiming anything for
+ * the length of a provider call. That is now fixed at the root: the queue has
+ * its OWN runner with its own budget of 1 (see `createAshbyWorkers`), and the
+ * Ashby drain is unaffected by construction rather than by arithmetic.
  *
- * `CANDIDATE_QUESTIONS_ENABLED=true` arms it. Anything else, including unset,
- * leaves the enqueue unreached, so nothing is claimed, leased or billed.
+ * What the switch is for now is COST. At present volume that is about eight
+ * extra provider calls a day — `0094`'s own note is "4 dials on the busiest
+ * day" — and it is bounded above by the fleet cap of 50 dials per IST day. That
+ * number, not the runner split, is why ON is the right default.
+ *
+ * IT DOES NOT FAIL OPEN ON A TYPO, and getting that right took a second pass.
+ * The first version was `!== 'false'`, which INVERTED the safe direction: under
+ * the old `=== 'true'` every mistake — `TRUE`, `1`, a trailing newline — meant
+ * OFF, and under `!== 'false'` the values an operator actually types when they
+ * want it off (`FALSE`, `0`, `off`, `no`, `false\n`) all meant ON. This is the
+ * switch someone reaches for during a cost or quality incident; it must not
+ * need them to remember an exact lowercase spelling under pressure.
+ *
+ * WHAT IT DOES NOT DO, said plainly because the first draft of this comment
+ * claimed otherwise: it stops new ENQUEUES only. The handler stays registered
+ * and the runner keeps claiming, so jobs already on the queue still run, lease
+ * and bill after the flip. There is no in-flight cancellation here.
  */
+const DISABLED_VALUES = new Set(['false', '0', 'no', 'off']);
+
 function candidateQuestionsEnabled(): boolean {
-  return process.env.CANDIDATE_QUESTIONS_ENABLED === 'true';
+  const raw = (process.env.CANDIDATE_QUESTIONS_ENABLED ?? '').trim().toLowerCase();
+  return !DISABLED_VALUES.has(raw);
 }
 
 /**
@@ -1229,8 +1243,16 @@ export function buildAshbyHandlers(
 
         // ── AND ASK FOR THIS CANDIDATE'S OWN QUESTIONS ──────────────────
         // HERE, because this is the first moment we know the person will
-        // actually be called — and it is comfortably before the due loop
-        // dials, which is the deadline that matters. Doing it at import
+        // actually be called.
+        //
+        // THE DEADLINE IS NOT THE DIAL, and an earlier version of this comment
+        // said it was. `start_phone_assessment` snapshots the plan BEHIND the
+        // consent gate — it refuses until the engagement reaches `in_call` —
+        // so the real deadline is disclosure delivered on the first answered
+        // call, which is later and more forgiving. What is unforgiving is that
+        // the snapshot is `on conflict (session_id) do nothing` and an
+        // engagement binds exactly one session, so a set that arrives after
+        // that moment never reaches THAT conversation. Doing it at import
         // would pay a provider call for every résumé that lands, most of
         // which never reach a phone screen.
         //
@@ -1508,9 +1530,53 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
     return false;
   };
 
+  // ── TWO RUNNERS, AND THE REASON IS THE SHARED BUDGET ──────────────────
+  // `createQueueRunner` bounds IN-FLIGHT work with a single `active` counter
+  // across every handler it owns, decremented only when a job SETTLES. PR
+  // #296's per-tick cap fixed which queue is OFFERED the budget; it cannot
+  // bound how long one queue HOLDS it.
+  //
+  // A candidate-questions job holds its slot for a provider call — up to two
+  // generation attempts plus a judge pass. Sharing the Ashby budget of 2, two
+  // of them in flight meant `ashby.signal`, `ashby.import` and
+  // `ashby.ingestion` claimed NOTHING for the duration: a review measured the
+  // dilution at −25% before any provider call and far worse once one was slow.
+  // That is why the feature shipped default-OFF.
+  //
+  // Splitting the map is what makes it safe to turn on. The Ashby drain keeps
+  // both its slots; generation gets one of its own and can never take a
+  // second. The scheduler runs each loop on its own timer and a queue tick is
+  // bounded by the CLAIM, not by the handler, so neither runner's cadence can
+  // block the other's.
+  //
+  // THEY ARE NOT FULLY INDEPENDENT, and an earlier version of this comment
+  // claimed they were. Both bottom out in ONE process-wide DeepSeek runner
+  // holding ONE circuit breaker (`lib/deepseek.ts`'s `defaultRunner`), shared
+  // with résumé structuring, scoring and role drafting. Two consequences,
+  // named rather than assumed away:
+  //
+  //   * `HALF_OPEN` admits exactly one probe process-wide. A generation call
+  //     can now win it, and every other caller gets `circuit_open` until it
+  //     settles — which for an ingestion parse means the deterministic regex
+  //     fallback and a candidate written NON-DIALABLE. What bounds it is the
+  //     probe's duration, which is why `CANDIDATE_QUESTIONS_TIMEOUT_MS` is
+  //     60s and not the 120s ceiling: a generation writes three sentences from
+  //     facts it is handed and has no business holding that slot for two
+  //     minutes.
+  //   * A generation timeout counts toward the same consecutive-failure
+  //     budget. `concurrency: 1` serialises it, so reaching five needs ~5
+  //     minutes with no interleaved success from ANY caller — i.e. a real
+  //     outage, during which parsing is failing anyway.
+  //
+  // Both are degradation during a provider incident, and the ingestion path
+  // fails soft by design. Removing the coupling entirely means giving this
+  // queue its own breaker, which is a change to provider plumbing and wants
+  // its own review.
+  const { [CANDIDATE_QUESTIONS_QUEUE]: candidateQuestionsHandler, ...ashbyHandlers } = handlers;
+
   const runner = createQueueRunner({
     queue: runtime.queue,
-    handlers,
+    handlers: ashbyHandlers,
     owner,
     leaseSeconds: rc.leaseSeconds,
     concurrency: 2,
@@ -1522,6 +1588,29 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
     },
   });
 
+  // CONCURRENCY 1, not 2. One generation at a time is the whole point: the
+  // budget exists so a slow provider call cannot multiply, and this queue's
+  // work is never latency-critical — it only has to finish before the due loop
+  // dials, which is minutes away.
+  //
+  // Its own OWNER, so an expired lease is attributable to the runner that took
+  // it rather than to the Ashby drain. No `shouldClaim`: that gate is the
+  // resume scanner's readiness, which has nothing to say about writing a
+  // question.
+  const questionsRunner = createQueueRunner({
+    queue: runtime.queue,
+    handlers: candidateQuestionsHandler
+      ? { [CANDIDATE_QUESTIONS_QUEUE]: candidateQuestionsHandler }
+      : {},
+    owner: `${owner}-questions`,
+    leaseSeconds: rc.leaseSeconds,
+    concurrency: 1,
+    pollMs: rc.signalPollMs,
+    onEvent: (e) => {
+      logger.info('unknown_event', { error_category: `queue_${e.kind}`, error_type: e.queueName });
+    },
+  });
+
   const scheduler = createAshbyScheduler({
     ...(options.scheduler ?? {}),
     loops: [
@@ -1529,6 +1618,14 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
         name: 'signal',
         intervalMs: rc.signalPollMs,
         tick: queueRunnerTick(runner),
+      },
+      {
+        // Its own loop as well as its own runner: sharing the `signal` tick
+        // would make one runner's poll wait on the other's, which is the
+        // coupling this split exists to remove.
+        name: 'questions',
+        intervalMs: rc.signalPollMs,
+        tick: queueRunnerTick(questionsRunner),
       },
       {
         name: 'operation',
@@ -1703,16 +1800,19 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
     lastReconcilePass: () => lastReconcilePass,
     loopIntervalsMs: {
       signal: rc.signalPollMs,
+      questions: rc.signalPollMs,
       operation: rc.operationPollMs,
       reconcile: rc.reconcileIntervalMs,
       reclaim: rc.reclaimIntervalMs,
     },
     async tickAll() {
       await runner.tick();
+      await questionsRunner.tick();
     },
     async stop() {
       await scheduler.stop();
       await runner.stop();
+      await questionsRunner.stop();
       await runtime.shutdown();
     },
   };

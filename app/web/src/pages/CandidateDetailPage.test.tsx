@@ -577,11 +577,27 @@ describe('Ashby pipeline card on the Overview', () => {
   });
 
   it('renders no card at all for a candidate with no Ashby workflow', async () => {
+    // WAIT FOR THE ABSENCE, not for the request. `AshbyWorkflowCard` starts in
+    // `phase: 'loading'` and deliberately renders this heading in EVERY
+    // non-ready phase — it is one live region mounted once so a screen reader
+    // announces the content swap rather than the region's arrival. It only
+    // disappears when the fetch resolves to `phase: 'absent'` and the component
+    // returns null.
+    //
+    // So asserting absence right after the CALL was made asserted it during
+    // `loading`, when the heading is legitimately present. It passed whenever
+    // the microtask queue happened to flush first and failed when it did not —
+    // which is why it failed under `--coverage` (slower) while passing in the
+    // plain run of the same CI job, and why it twice turned `main` red.
     mockApi.getCandidateAshbyWorkflow.mockResolvedValue({ ok: true, workflow: null });
     renderDetailPage();
     await screen.findByText('Jane Doe');
+    // Still asserted: the card is absent because we ASKED and got nothing, not
+    // because nothing ever asked.
     await waitFor(() => expect(mockApi.getCandidateAshbyWorkflow).toHaveBeenCalledWith('candidate-1'));
-    expect(screen.queryByText('Ashby screening pipeline')).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByText('Ashby screening pipeline')).not.toBeInTheDocument(),
+    );
   });
 
   it('renders the read-only card for an Ashby-linked candidate, with no new controls', async () => {

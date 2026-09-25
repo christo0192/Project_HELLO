@@ -945,6 +945,32 @@ describe('The screening call is shown in compartments', () => {
     );
   });
 
+  it('TAGS EACH ROW WITH ITS TOPIC, not with the id', async () => {
+    // `q1`, `q2`, `q3` say only where a question sits. The ids are ours, minted
+    // by the generator, and a stakeholder reading the screen wants to know
+    // which topic it came from — which the compartment already records.
+    render(<RolesPage />);
+    await userEvent.click(await screen.findByRole('button', { name: /edit/i }));
+    await screen.findByLabelText('Question 1');
+
+    for (const tag of ['intro', 'relevance', 'shift', 'stability', 'pay']) {
+      expect(screen.getAllByText(tag).length, tag).toBeGreaterThan(0);
+    }
+    // And the ids are gone from that slot.
+    for (const id of ['q1', 'q2', 'q4']) {
+      expect(screen.queryByText(id), id).not.toBeInTheDocument();
+    }
+  });
+
+  it('keeps the id as the tag for a role that has no topics', async () => {
+    // An older role carries no category, and its id is all there is.
+    mockApi.listRoles.mockResolvedValue([mockRole]);
+    render(<RolesPage />);
+    await userEvent.click(await screen.findByRole('button', { name: /edit/i }));
+    await screen.findByLabelText('Question 1');
+    expect(screen.getByText(mockRole.screening_template[0].id)).toBeInTheDocument();
+  });
+
   it('renders an OLDER role with no categories at all', async () => {
     // Every role authored before compartments existed has none. An
     // uncategorised question is ungrouped, not broken.
