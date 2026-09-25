@@ -129,19 +129,31 @@ describe('the enqueue', () => {
     expect(candidateJobs()[0].options?.maxAttempts).toBe(2);
   });
 
-  describe('DEFAULT OFF — the runner shares two slots across every queue', () => {
-    it('does not enqueue when the flag is unset', async () => {
+  describe('THE KILL SWITCH — on by default, off only when asked', () => {
+    // It shipped default-OFF while `candidate.questions` shared the Ashby
+    // runner's budget of 2, because two generation jobs in flight stopped the
+    // drain claiming anything. That queue now has its OWN runner with a budget
+    // of 1, so the isolation is structural and the default is on.
+    it('ENQUEUES when the flag is unset', async () => {
       delete process.env.CANDIDATE_QUESTIONS_ENABLED;
+      await runIngestion();
+      expect(candidateJobs()).toHaveLength(1);
+    });
+
+    it('STOPS ONLY ON THE EXACT STRING "false"', async () => {
+      process.env.CANDIDATE_QUESTIONS_ENABLED = 'false';
       await runIngestion();
       expect(candidateJobs()).toHaveLength(0);
     });
 
-    it('does not enqueue on any value but "true"', async () => {
-      for (const value of ['false', '1', 'yes', 'TRUE', '']) {
+    it('treats every other value as on, rather than guessing', async () => {
+      // A typo must not silently disable a feature the operator believes is
+      // running — the failure that would be hardest to notice.
+      for (const value of ['true', 'TRUE', '1', 'yes', '']) {
         enqueued = [];
         process.env.CANDIDATE_QUESTIONS_ENABLED = value;
         await runIngestion();
-        expect(candidateJobs(), value).toHaveLength(0);
+        expect(candidateJobs(), value).toHaveLength(1);
       }
     });
   });

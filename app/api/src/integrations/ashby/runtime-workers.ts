@@ -124,25 +124,24 @@ export const ASHBY_INGESTION_QUEUE = 'ashby.ingestion';
  * Should a candidate admitted to phone screening get questions written about
  * their own résumé?
  *
- * DEFAULT OFF, AND THE REASON IS THE RUNNER, NOT THE FEATURE. `createAshbyWorkers`
- * gives every handler a SHARED budget of `concurrency: 2`, and the runner
- * decrements `active` only when a job SETTLES — so a queue's in-flight count is
- * unbounded even after PR #296's per-tick cap. A generation job holds one of
- * those two slots for a provider call, and two of them in flight claim nothing
- * from `ashby.signal`, `ashby.import` or `ashby.ingestion` until they finish.
- * A review measured the dilution at −25% before any provider call and far worse
- * once one is slow.
+ * STILL A KILL SWITCH, but no longer a canary the owner has to justify.
  *
- * So this ships as a CANARY the owner turns on, not a kill switch they might
- * have to reach for. Turning it on is safe once the queue has its own runner or
- * a per-queue in-flight cap; until then the owner decides when to spend the
- * Ashby drain's headroom on it.
+ * It shipped DEFAULT OFF for one reason: `candidate.questions` shared the
+ * Ashby runner's budget of `concurrency: 2`, and that runner frees a slot only
+ * when a job SETTLES — so two generation jobs in flight stopped
+ * `ashby.signal`, `ashby.import` and `ashby.ingestion` claiming anything for
+ * the length of a provider call. That is now fixed at the root: the queue has
+ * its OWN runner with its own budget of 1 (see `createAshbyWorkers`), and the
+ * Ashby drain is unaffected by construction rather than by arithmetic.
  *
- * `CANDIDATE_QUESTIONS_ENABLED=true` arms it. Anything else, including unset,
- * leaves the enqueue unreached, so nothing is claimed, leased or billed.
+ * What the switch is for now is COST — one generation call plus one judge call
+ * per admitted candidate, sharing a circuit breaker with résumé parsing and
+ * scoring. Setting it to `false` stops the enqueue at source, so nothing is
+ * claimed, leased or billed. It is read on every ingestion, so flipping the
+ * Fly secret takes effect without a redeploy.
  */
 function candidateQuestionsEnabled(): boolean {
-  return process.env.CANDIDATE_QUESTIONS_ENABLED === 'true';
+  return process.env.CANDIDATE_QUESTIONS_ENABLED !== 'false';
 }
 
 /**
@@ -1508,9 +1507,28 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
     return false;
   };
 
+  // ── TWO RUNNERS, AND THE REASON IS THE SHARED BUDGET ──────────────────
+  // `createQueueRunner` bounds IN-FLIGHT work with a single `active` counter
+  // across every handler it owns, decremented only when a job SETTLES. PR
+  // #296's per-tick cap fixed which queue is OFFERED the budget; it cannot
+  // bound how long one queue HOLDS it.
+  //
+  // A candidate-questions job holds its slot for a provider call — up to two
+  // generation attempts plus a judge pass. Sharing the Ashby budget of 2, two
+  // of them in flight meant `ashby.signal`, `ashby.import` and
+  // `ashby.ingestion` claimed NOTHING for the duration: a review measured the
+  // dilution at −25% before any provider call and far worse once one was slow.
+  // That is why the feature shipped default-OFF.
+  //
+  // Splitting the map is what makes it safe to turn on. The Ashby drain keeps
+  // both its slots and is byte-for-byte unaffected; generation gets one slot
+  // of its own and can never take a second. Nothing about either runner's
+  // behaviour depends on the other.
+  const { [CANDIDATE_QUESTIONS_QUEUE]: candidateQuestionsHandler, ...ashbyHandlers } = handlers;
+
   const runner = createQueueRunner({
     queue: runtime.queue,
-    handlers,
+    handlers: ashbyHandlers,
     owner,
     leaseSeconds: rc.leaseSeconds,
     concurrency: 2,
@@ -1522,6 +1540,29 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
     },
   });
 
+  // CONCURRENCY 1, not 2. One generation at a time is the whole point: the
+  // budget exists so a slow provider call cannot multiply, and this queue's
+  // work is never latency-critical — it only has to finish before the due loop
+  // dials, which is minutes away.
+  //
+  // Its own OWNER, so an expired lease is attributable to the runner that took
+  // it rather than to the Ashby drain. No `shouldClaim`: that gate is the
+  // resume scanner's readiness, which has nothing to say about writing a
+  // question.
+  const questionsRunner = createQueueRunner({
+    queue: runtime.queue,
+    handlers: candidateQuestionsHandler
+      ? { [CANDIDATE_QUESTIONS_QUEUE]: candidateQuestionsHandler }
+      : {},
+    owner: `${owner}-questions`,
+    leaseSeconds: rc.leaseSeconds,
+    concurrency: 1,
+    pollMs: rc.signalPollMs,
+    onEvent: (e) => {
+      logger.info('unknown_event', { error_category: `queue_${e.kind}`, error_type: e.queueName });
+    },
+  });
+
   const scheduler = createAshbyScheduler({
     ...(options.scheduler ?? {}),
     loops: [
@@ -1529,6 +1570,14 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
         name: 'signal',
         intervalMs: rc.signalPollMs,
         tick: queueRunnerTick(runner),
+      },
+      {
+        // Its own loop as well as its own runner: sharing the `signal` tick
+        // would make one runner's poll wait on the other's, which is the
+        // coupling this split exists to remove.
+        name: 'questions',
+        intervalMs: rc.signalPollMs,
+        tick: queueRunnerTick(questionsRunner),
       },
       {
         name: 'operation',
@@ -1703,16 +1752,19 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
     lastReconcilePass: () => lastReconcilePass,
     loopIntervalsMs: {
       signal: rc.signalPollMs,
+      questions: rc.signalPollMs,
       operation: rc.operationPollMs,
       reconcile: rc.reconcileIntervalMs,
       reclaim: rc.reclaimIntervalMs,
     },
     async tickAll() {
       await runner.tick();
+      await questionsRunner.tick();
     },
     async stop() {
       await scheduler.stop();
       await runner.stop();
+      await questionsRunner.stop();
       await runtime.shutdown();
     },
   };
