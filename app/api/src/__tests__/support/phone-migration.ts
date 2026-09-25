@@ -36,6 +36,34 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+// 0104 declares defer_phone_dial_for_questions — the dial grace that lets
+// per-candidate question generation finish before the plan is snapshotted.
+// A brand-new function no earlier migration mentions, so its position is not
+// load-bearing; it leads because newest-first is the rule this list follows.
+export const MIGRATION_0104_PATH = fileURLToPath(
+  new URL(
+    '../../../../supabase/migrations/0104_candidate_questions_dial_grace.sql',
+    import.meta.url,
+  ),
+);
+
+export const MIGRATION_0104 = readFileSync(MIGRATION_0104_PATH, 'utf8');
+
+// 0103 re-declares start_phone_assessment IN FULL (0044's body, with the
+// candidate's own questions preferred over the role template and the inline
+// validation loop lifted into phone_normalize_question_plan). It must therefore
+// outrank 0044, or every extractor reads 0044's superseded body and this file's
+// whole premise — that the newest declaration wins, as Postgres resolves it —
+// stops holding for the one function that decides what a live call asks.
+export const MIGRATION_0103_PATH = fileURLToPath(
+  new URL(
+    '../../../../supabase/migrations/0103_candidate_screening_questions.sql',
+    import.meta.url,
+  ),
+);
+
+export const MIGRATION_0103 = readFileSync(MIGRATION_0103_PATH, 'utf8');
+
 // 0096 re-declares reclaim_phone_attempt_leases IN FULL (0071's body plus the
 // answered-leg grace), so it must come FIRST — ahead of 0095 — or every
 // extractor reads 0071's superseded body and the new grace is invisible to the
@@ -236,6 +264,13 @@ export const MIGRATION_0092 = readFileSync(MIGRATION_0092_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0104 — the dial grace (defer_phone_dial_for_questions). New function,
+    // no predecessor to supersede.
+    { name: '0104', sql: MIGRATION_0104 },
+    // 0103 — start_phone_assessment IN FULL, so it must precede 0044. It also
+    // declares phone_normalize_question_plan, which no earlier migration
+    // mentions.
+    { name: '0103', sql: MIGRATION_0103 },
     // 0096 re-declares reclaim_phone_attempt_leases in full (0071's body plus
     // the answered-leg grace), so it leads for the same reason every entry
     // below leads: an extractor that reads a superseded body makes the drift
@@ -429,6 +464,15 @@ export const RPC_NAMES = [
   'sweep_phone_day_rolled',
   'sweep_phone_stranded_sessions',
   'claim_phone_sweep',
+  // 0104's defer_phone_dial_for_questions is deliberately NOT listed, for the
+  // same reason 0083's voice-worker pair is not: it is called from the ASHBY
+  // ingestion path (`workflow-stores.ts`), not through `phone-screening/
+  // stores.ts`, and this list is in bijection with that store layer — a name
+  // here with no wrapper there fails the sanitized-error test. Its sibling
+  // `ensure_ashby_phone_engagement`, which CREATES the engagement this one
+  // defers, is absent for exactly the same reason. 0104 is still registered in
+  // PHONE_MIGRATIONS above, so the corpus stays complete, and the SQL-side
+  // posture sweep in policy_tests.sql names it explicitly.
   // 0057 — explicit cycle door. PII-bearing number verification is
   // intentionally outside the phone-domain RPC contract.
   'request_phone_rescreen',

@@ -8853,7 +8853,15 @@ begin
                              -- the worst instance of exactly what the comment
                              -- above warns about.
                              'suppress_candidate_phone',
-                             'release_candidate_phone_suppression'))
+                             'release_candidate_phone_suppression',
+                             -- 0104: the dial grace. Verb-first like every
+                             -- other phone WRITE RPC, so it does not match
+                             -- `phone\_%` either. It moves the one column
+                             -- that decides WHEN a candidate is rung, which
+                             -- is also the column holding an out-of-hours
+                             -- candidate until the IST window opens — so an
+                             -- unchecked posture here is a 2am phone call.
+                             'defer_phone_dial_for_questions'))
   loop
     if not v_fn.prosecdef and v_fn.proname not in ('phone_ist_date','phone_ist_window_open',
                                                    'phone_ist_window_open_at',
@@ -8979,7 +8987,15 @@ begin
                              -- the worst instance of exactly what the comment
                              -- above warns about.
                              'suppress_candidate_phone',
-                             'release_candidate_phone_suppression'))
+                             'release_candidate_phone_suppression',
+                             -- 0104: the dial grace. Verb-first like every
+                             -- other phone WRITE RPC, so it does not match
+                             -- `phone\_%` either. It moves the one column
+                             -- that decides WHEN a candidate is rung, which
+                             -- is also the column holding an out-of-hours
+                             -- candidate until the IST window opens — so an
+                             -- unchecked posture here is a 2am phone call.
+                             'defer_phone_dial_for_questions'))
   loop
     -- Everything after the opening dollar-quote is the body; the
     -- signature (and therefore `p_now timestamptz default now()`) is

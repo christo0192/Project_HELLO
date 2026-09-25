@@ -17,6 +17,7 @@
 
 import { describe, it, expect } from 'vitest';
 import {
+  functionBody,
   MIGRATION_0082,
   PHONE_MIGRATIONS,
   PHONE_MIGRATIONS_TEXT,
@@ -64,11 +65,27 @@ describe('0082 per-call phone observability column', () => {
     const idx094 = PHONE_MIGRATIONS.findIndex((m) => m.name === '0094');
     const idx095 = PHONE_MIGRATIONS.findIndex((m) => m.name === '0095');
     const idx096 = PHONE_MIGRATIONS.findIndex((m) => m.name === '0096');
-    expect(idx096).toBe(0);
-    expect(idx095).toBe(1);
-    expect(idx094).toBe(2);
-    expect(idx092).toBe(3);
-    expect(idx086).toBe(4);
+    // ORDER, NOT POSITION. These were once pinned to absolute indices 0-4,
+    // which encoded "these five are the newest" — a fact that expires the next
+    // time a phone migration is registered, as 0103 and 0104 just did. The
+    // invariant the extractors actually depend on is that the list is sorted
+    // newest-first, so assert THAT, over every entry rather than eight picked
+    // ones: a misplacement anywhere is a superseded body read somewhere.
+    const names = PHONE_MIGRATIONS.map((m) => m.name);
+    expect(names).toEqual([...names].sort().reverse());
+    expect(new Set(names).size, 'a migration registered twice').toBe(names.length);
+    // PRESENT, not merely ordered. `findIndex` returns -1 for a missing entry
+    // and -1 is less than everything, so the comparisons below are all
+    // satisfied by DELETING 0096 — which sortedness does not catch either.
+    const registered = { idx096, idx095, idx094, idx092, idx086, idx085, idx083, idx082 };
+    for (const [label, idx] of Object.entries(registered)) {
+      expect(idx, `${label} is not registered at all`).toBeGreaterThan(-1);
+    }
+    // Spelled out for the four whose order this file's comment explains.
+    expect(idx096).toBeLessThan(idx095);
+    expect(idx095).toBeLessThan(idx094);
+    expect(idx094).toBeLessThan(idx092);
+    expect(idx092).toBeLessThan(idx086);
     expect(idx085).toBeGreaterThan(idx086);
     expect(PHONE_MIGRATIONS[idx082]).toEqual({ name: '0082', sql: MIGRATION_0082 });
     expect(idx083).toBeGreaterThan(idx085);
@@ -77,5 +94,21 @@ describe('0082 per-call phone observability column', () => {
     expect(PHONE_MIGRATIONS.every((m) => m.sql.length > 0)).toBe(true);
     // And its text is present in the concatenated corpus the extractors walk.
     expect(PHONE_MIGRATIONS_TEXT).toContain('call_sessions.observability');
+  });
+
+  it("RESOLVES start_phone_assessment TO 0103, not 0044's superseded body", () => {
+    // THE TRIPWIRE THE REGISTRATION NEVER HAD. 0103 re-declares
+    // `start_phone_assessment` IN FULL, so from #307 until it was registered
+    // in PHONE_MIGRATIONS every extractor read 0044's body — for the function
+    // whose output IS the conversation. Nothing caught it, because 0103 kept
+    // 0044's parameters and status vocabulary byte-for-byte: the contract
+    // suite cannot tell which body it read, and a sortedness check does not
+    // care whether an entry exists at all.
+    //
+    // So anchor on text only the NEW body has. Deleting the 0103 line from
+    // PHONE_MIGRATIONS now fails here instead of silently reverting.
+    const body = functionBody('start_phone_assessment');
+    expect(body).toContain('candidate_screening_questions');
+    expect(body).toContain('candidate_resume');
   });
 });

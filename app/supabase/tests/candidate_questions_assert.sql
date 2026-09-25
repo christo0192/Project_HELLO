@@ -437,4 +437,173 @@ begin
   raise notice 'cqs103/cascade: PASS';
 end $$;
 
+-- ── Part 5: 0104 — holding the dial, and never pulling it forward ─────
+-- THE SUBJECT IS AN `eligible` ENGAGEMENT, which is what production passes and
+-- the only state the RPC now accepts. An earlier draft asserted entirely
+-- against an `in_call` fixture — so a guard refusing exactly the production
+-- state would have passed every assertion here.
+do $$
+declare
+  v_eng     uuid;
+  v_busy    uuid;
+  v_before  timestamptz;
+  v_after   timestamptz;
+  v_res     jsonb;
+  -- 15:30 IST — comfortably inside the 09:00-21:00 window.
+  v_now     constant timestamptz := '2026-09-25T10:00:00Z'::timestamptz;
+  -- 20:58 IST. A 150s push from here lands at 21:00:30 IST, past the close.
+  v_edge    constant timestamptz := '2026-09-25T15:28:00Z'::timestamptz;
+begin
+  select e.id into v_eng
+    from screening_v2.phone_engagements e
+    join screening_v2.ashby_application_links l on l.id = e.application_link_id
+   where l.external_application_id = 'cqs104-dialgrace-app';
+  if v_eng is null then
+    raise exception 'cqs104: the eligible fixture is missing';
+  end if;
+  if (select state from screening_v2.phone_engagements where id = v_eng) <> 'eligible' then
+    raise exception 'cqs104: the fixture is not in the state production uses';
+  end if;
+
+  -- ── A candidate due NOW is pushed by the grace ─────────────────────
+  update screening_v2.phone_engagements set next_eligible_at = v_now where id = v_eng;
+  v_res := screening_v2.defer_phone_dial_for_questions(v_eng, 150, v_now);
+  if v_res ->> 'status' <> 'deferred' then
+    raise exception 'cqs104: expected deferred, got %', v_res;
+  end if;
+  select next_eligible_at into v_after from screening_v2.phone_engagements where id = v_eng;
+  if v_after <> v_now + interval '150 seconds' then
+    raise exception 'cqs104: expected a 150s push, got %', v_after;
+  end if;
+
+  -- ── THE SAFETY PROPERTY: it NEVER moves the dial earlier ───────────
+  -- `next_eligible_at` is also what holds a candidate imported outside the
+  -- IST calling window until the window opens. Writing `now + grace`
+  -- unconditionally would drag them forward and ring a phone at 2am.
+  v_before := v_now + interval '9 hours';
+  update screening_v2.phone_engagements set next_eligible_at = v_before where id = v_eng;
+  v_res := screening_v2.defer_phone_dial_for_questions(v_eng, 150, v_now);
+  if v_res ->> 'status' <> 'unchanged' then
+    raise exception 'cqs104: a windowed candidate was not left alone: %', v_res;
+  end if;
+  select next_eligible_at into v_after from screening_v2.phone_engagements where id = v_eng;
+  if v_after <> v_before then
+    raise exception 'cqs104: A WINDOWED CANDIDATE WAS PULLED FORWARD, % -> %', v_before, v_after;
+  end if;
+
+  -- A null timestamp is "due now", so it takes the grace rather than staying null.
+  update screening_v2.phone_engagements set next_eligible_at = null where id = v_eng;
+  v_res := screening_v2.defer_phone_dial_for_questions(v_eng, 150, v_now);
+  select next_eligible_at into v_after from screening_v2.phone_engagements where id = v_eng;
+  if v_after is distinct from v_now + interval '150 seconds' then
+    raise exception 'cqs104: a null next_eligible_at was not held: %', v_after;
+  end if;
+
+  -- ── NEVER PAST THE CLOSE OF THE CALLING WINDOW ─────────────────────
+  -- At 20:58 IST the push lands at 21:00:30 IST. Nothing re-normalises a
+  -- `next_eligible_at` sitting past the close, so the candidate would wait
+  -- until 09:00 the NEXT DAY — a twelve-hour delay bought with a 150-second
+  -- race. The RPC must decline and leave the row alone.
+  update screening_v2.phone_engagements set next_eligible_at = v_edge where id = v_eng;
+  v_res := screening_v2.defer_phone_dial_for_questions(v_eng, 150, v_edge);
+  if v_res ->> 'status' <> 'window_edge' then
+    raise exception 'cqs104: a push past the window close was allowed: %', v_res;
+  end if;
+  select next_eligible_at into v_after from screening_v2.phone_engagements where id = v_eng;
+  if v_after <> v_edge then
+    raise exception 'cqs104: the window-edge candidate was moved to %', v_after;
+  end if;
+  -- ...and the guard is a WINDOW test, not a blanket refusal: the same call
+  -- two hours earlier still defers.
+  update screening_v2.phone_engagements
+     set next_eligible_at = v_edge - interval '2 hours' where id = v_eng;
+  if screening_v2.defer_phone_dial_for_questions(v_eng, 150, v_edge - interval '2 hours')
+       ->> 'status' <> 'deferred' then
+    raise exception 'cqs104: the window guard refuses calls inside the window';
+  end if;
+
+  -- ── The refusals ───────────────────────────────────────────────────
+  update screening_v2.phone_engagements set next_eligible_at = v_now where id = v_eng;
+  if screening_v2.defer_phone_dial_for_questions(null, 150, v_now) ->> 'status'
+     <> 'unknown_engagement' then
+    raise exception 'cqs104: a null engagement was accepted'; end if;
+  if screening_v2.defer_phone_dial_for_questions(
+       '00000000-0000-4000-8000-00000000dead'::uuid, 150, v_now) ->> 'status'
+     <> 'unknown_engagement' then
+    raise exception 'cqs104: an unknown engagement was accepted'; end if;
+  -- A grace nobody meant is REFUSED, not clamped: silently accepting an hour
+  -- would park a candidate nobody could find.
+  for v_res in select screening_v2.defer_phone_dial_for_questions(v_eng, g, v_now)
+                 from unnest(array[-1, 601, 100000]) g loop
+    if v_res ->> 'status' <> 'invalid_grace' then
+      raise exception 'cqs104: an out-of-range grace was accepted: %', v_res;
+    end if;
+  end loop;
+  if screening_v2.defer_phone_dial_for_questions(v_eng, null, v_now) ->> 'status'
+     <> 'invalid_grace' then
+    raise exception 'cqs104: a null grace was accepted'; end if;
+  -- ...and the bounds themselves are accepted, so the check is a range and
+  -- not a refusal of everything.
+  update screening_v2.phone_engagements set next_eligible_at = v_now where id = v_eng;
+  if screening_v2.defer_phone_dial_for_questions(v_eng, 600, v_now) ->> 'status'
+     <> 'deferred' then
+    raise exception 'cqs104: the upper bound was refused'; end if;
+
+  -- ── ONLY AN ENGAGEMENT STILL WAITING FOR ITS FIRST DIAL ────────────
+  -- `engagement_active` (which the caller treats as dialable) also covers
+  -- `dialing`, `in_call` and `reconnecting`. For a reconnect the due time
+  -- lives on `updated_at`, not on this column, so moving it is meaningless;
+  -- for a call already underway it is far too late to matter. The 0103
+  -- fixtures are all walked to `in_call`, which makes one a perfect subject.
+  select e.id into v_busy
+    from screening_v2.phone_engagements e
+    join screening_v2.ashby_application_links l on l.id = e.application_link_id
+   where l.external_application_id = 'cqs103-absent-app';
+  update screening_v2.phone_engagements set next_eligible_at = v_now where id = v_busy;
+  v_res := screening_v2.defer_phone_dial_for_questions(v_busy, 150, v_now);
+  if v_res ->> 'status' <> 'engagement_not_waiting' then
+    raise exception 'cqs104: an in_call engagement was deferred: %', v_res;
+  end if;
+  if v_res ->> 'engagement_state' <> 'in_call' then
+    raise exception 'cqs104: the refusal does not say which state: %', v_res;
+  end if;
+  select next_eligible_at into v_after from screening_v2.phone_engagements where id = v_busy;
+  if v_after <> v_now then
+    raise exception 'cqs104: an in_call engagement had its dial moved to %', v_after;
+  end if;
+
+  -- `updated_at` IS THE RECONNECT DUE CLOCK and this function must never
+  -- touch it — a bump would push a candidate who was just cut off another
+  -- backoff away. Asserted on the row it DOES write.
+  update screening_v2.phone_engagements
+     set next_eligible_at = v_now, updated_at = v_now - interval '1 hour'
+   where id = v_eng;
+  if screening_v2.defer_phone_dial_for_questions(v_eng, 150, v_now) ->> 'status'
+     <> 'deferred' then
+    raise exception 'cqs104: the deferred precondition did not hold'; end if;
+  select updated_at into v_after from screening_v2.phone_engagements where id = v_eng;
+  if v_after <> v_now - interval '1 hour' then
+    raise exception 'cqs104: updated_at WAS MOVED to % (reconnect clock)', v_after;
+  end if;
+
+  -- ── A terminal engagement is immutable, and says so ────────────────
+  -- Done LAST on a fixture nothing else reads, so the shared rows stay usable
+  -- for whoever adds Part 6.
+  update screening_v2.phone_engagements set next_eligible_at = v_now where id = v_eng;
+  update screening_v2.phone_engagements
+     set state = 'cancelled', terminal_at = v_now where id = v_eng;
+  v_res := screening_v2.defer_phone_dial_for_questions(v_eng, 150, v_now);
+  if v_res ->> 'status' <> 'engagement_terminal' then
+    raise exception 'cqs104: a terminal engagement was deferred: %', v_res;
+  end if;
+
+  -- ── Exposure posture, like every other phone RPC ───────────────────
+  if has_function_privilege('anon', 'screening_v2.defer_phone_dial_for_questions(uuid,integer,timestamptz)', 'EXECUTE')
+     or has_function_privilege('authenticated', 'screening_v2.defer_phone_dial_for_questions(uuid,integer,timestamptz)', 'EXECUTE') then
+    raise exception 'cqs104: the RPC is browser-executable';
+  end if;
+
+  raise notice 'cqs104: PASS';
+end $$;
+
 select 'cqs103 ALL ASSERTIONS PASSED' as result;

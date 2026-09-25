@@ -245,6 +245,56 @@ begin
   end loop;
 end $$;
 
+-- ── 0104's OWN FIXTURE: an engagement still WAITING for its first dial ──
+-- Every scenario above is walked to `in_call`, because 0103 is about what a
+-- live call asks. 0104 is about what happens BEFORE the dial, and review
+-- caught Part 5 asserting entirely against an `in_call` row — the one state
+-- production never passes this RPC. `eligible` is what BOTH success branches
+-- of `ensure_ashby_phone_engagement` produce, so it is the only state the
+-- grace ever sees in production.
+do $$
+declare
+  v_role  uuid;
+  v_owner uuid;
+  v_cand  uuid;
+  v_map   uuid;
+  v_link  uuid;
+  v_eng   uuid;
+begin
+  select id into v_role from screening_v2.roles where title = 'cqs103 good role' limit 1;
+  if v_role is null then raise exception 'cqs104 fixture: the good role is missing'; end if;
+  select owner_id into v_owner from screening_v2.ashby_job_mappings
+   where external_job_id = 'cqs103-ready-job' limit 1;
+
+  insert into screening_v2.candidates (role_id, name, email, phone_e164, phone_valid)
+  values (v_role, 'cqs104 dialgrace', 'cqs104-dialgrace@example.test', '+919986700104', true)
+  returning id into v_cand;
+
+  insert into screening_v2.consent_records (candidate_id, status, consents, version)
+  values (v_cand, 'granted',
+          '{ai_interview,recording,purpose,data_processing,retention,rights}'
+            ::screening_v2.consent_type[], '2026-08-04.1');
+
+  insert into screening_v2.ashby_job_mappings
+    (external_job_id, role_id, owner_id, ai_screening_stage_id, ta_screening_stage_id,
+     status, delivery_mode)
+  values ('cqs104-dialgrace-job', v_role, v_owner, 'cqs104-ai', 'cqs104-ta', 'enabled', 'manual')
+  returning id into v_map;
+
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id,
+     external_resume_file_handle, candidate_id)
+  values ('cqs104-dialgrace-app', 'cqs104-dialgrace-job', v_map, repeat('h', 64), v_cand)
+  returning id into v_link;
+
+  insert into screening_v2.phone_engagements
+    (application_link_id, candidate_id, role_id, cycle_number, state)
+  values (v_link, v_cand, v_role, 1, 'pending_prereqs')
+  returning id into v_eng;
+  -- Left at `eligible`. NOT walked on to `dialing`.
+  update screening_v2.phone_engagements set state = 'eligible' where id = v_eng;
+end $$;
+
 -- A visible tally, so a silent seeding failure is not mistaken for a pass.
 select 'cqs103 seeded' as fixture,
        count(*) filter (where e.state = 'in_call') as calls_ready,
