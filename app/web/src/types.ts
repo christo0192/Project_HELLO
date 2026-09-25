@@ -41,6 +41,45 @@ export const SCREENING_CATEGORY_LABELS: Record<ScreeningCategory, string> = {
 };
 
 /**
+ * The short tag shown above each question row, in the slot that used to carry
+ * the raw id.
+ *
+ * `q1`, `q2`, `q3` told a recruiter nothing — the ids are ours, minted by the
+ * generator, and they say only where a question sits. What someone reviewing a
+ * screen wants to know at a glance is which topic it came from, which is
+ * exactly what the compartment already records.
+ *
+ * SHORTER THAN `SCREENING_CATEGORY_LABELS`, on purpose: this renders in an
+ * 11px monospace tag, where "Compensation and notice" would wrap and
+ * "profile_relevance" reads like a database column. The full label still heads
+ * the compartment above; this is the per-row reminder.
+ */
+export const SCREENING_CATEGORY_TAGS: Record<ScreeningCategory, string> = {
+  introduction: 'intro',
+  profile_relevance: 'relevance',
+  shift_fit: 'shift',
+  stability: 'stability',
+  compensation: 'pay',
+};
+
+/**
+ * The tag for one question row: its topic when it has one, and otherwise the
+ * id, which is all an older role has.
+ *
+ * Total over an unknown category for the same reason `sectionHeading` is: the
+ * value arrives off the wire and the response is cast, not parsed, so a
+ * compartment this build has not shipped must fall back rather than render
+ * `undefined`.
+ */
+export function questionTag(
+  category: ScreeningCategory | undefined,
+  id: string,
+  index: number,
+): string {
+  return (category && SCREENING_CATEGORY_TAGS[category]) || id || `q${index + 1}`;
+}
+
+/**
  * What a run of UNCATEGORISED questions is called, when it follows a
  * compartment.
  *

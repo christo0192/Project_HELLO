@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../api";
-import { sectionHeading } from "../types";
+import { questionTag, sectionHeading } from "../types";
 import type { Role, RoleInput, ScreeningCategory, ScreeningQuestion } from "../types";
 import {
   Button,
@@ -776,8 +776,14 @@ function RoleForm({
                   )}
                 <div className="glass-sunken space-y-3 p-3">
                   <div className="flex items-center justify-between gap-2">
-                    <span className="font-mono text-[11px] text-ink-tertiary">
-                      {q.id || `q${idx + 1}`}
+                    <span
+                      className="font-mono text-[11px] text-ink-tertiary"
+                      // The id is still worth having when there is no topic —
+                      // it is what an older role has — but it is a poor tag
+                      // for a human, so the topic wins when one exists.
+                      title={q.id || `q${idx + 1}`}
+                    >
+                      {questionTag(q.category, q.id, idx)}
                     </span>
                     <div className="flex items-center gap-1">
                       <Button

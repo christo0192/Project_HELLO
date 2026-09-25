@@ -28,7 +28,7 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { SCREENING_CATEGORY_LABELS } from '../types';
+import { SCREENING_CATEGORY_LABELS, SCREENING_CATEGORY_TAGS } from '../types';
 
 const API_SCHEMA = resolve(process.cwd(), '../api/src/schemas/roles.ts');
 
@@ -54,6 +54,24 @@ describe('the compartment vocabulary does not drift across packages', () => {
     // ORDER MATTERS and is asserted, not just membership: the array is written
     // in call order and read that way by anyone adding a compartment.
     expect(Object.keys(SCREENING_CATEGORY_LABELS)).toEqual(apiCategories());
+  });
+
+  it('gives EVERY compartment a row tag as well as a heading label', () => {
+    // Two maps over one vocabulary is two chances to forget one. A missing tag
+    // renders the raw id, which is exactly the thing the tag replaced.
+    expect(Object.keys(SCREENING_CATEGORY_TAGS)).toEqual(apiCategories());
+  });
+
+  it('keeps the row tag SHORT — it renders in an 11px monospace slot', () => {
+    for (const [category, tag] of Object.entries(SCREENING_CATEGORY_TAGS)) {
+      expect(tag.trim(), category).not.toBe('');
+      expect(tag.length, `${category}: "${tag}" is too long for the tag slot`)
+        .toBeLessThanOrEqual(12);
+      // Not a snake_case key: `profile_relevance` reads like a database column
+      // in a slot meant for a human. (`stability` is its own tag, and that is
+      // fine — the rule is about the SHAPE, not about differing from the key.)
+      expect(tag, category).not.toContain('_');
+    }
   });
 
   it('gives every compartment a non-empty human label', () => {
