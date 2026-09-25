@@ -154,6 +154,28 @@ export const ASHBY_INGESTION_QUEUE = 'ashby.ingestion';
  */
 const DISABLED_VALUES = new Set(['false', '0', 'no', 'off']);
 
+/**
+ * How long the dial is held so generation can finish, in seconds.
+ *
+ * WHAT IT COVERS, STATED HONESTLY. Generation is a claim (≤5s at the poll
+ * interval), a provider call bounded at 60s by `CANDIDATE_QUESTIONS_TIMEOUT_MS`,
+ * and a 45s judge — 110s worst case on the path that does not retry, against
+ * 20-65s typical.
+ *
+ * IT DOES NOT COVER A RETRIED GENERATION. A second attempt plus the judge is a
+ * 170s ceiling, and 150 is deliberately under it. That path is only reached
+ * when the first attempt's questions all fail a gate, and buying it would cost
+ * EVERY candidate another minute of dial latency for a case that already ends
+ * on the role template about as often as not.
+ *
+ * It buys reliability with dial latency, and that trade is the point: a
+ * candidate called 150 seconds later is not waiting by the phone, while a
+ * generation that lands one second after the plan is snapshotted is never used
+ * for that conversation at all — `on conflict (session_id) do nothing`, and an
+ * engagement binds exactly one session.
+ */
+const CANDIDATE_QUESTIONS_DIAL_GRACE_SECONDS = 150;
+
 function candidateQuestionsEnabled(): boolean {
   const raw = (process.env.CANDIDATE_QUESTIONS_ENABLED ?? '').trim().toLowerCase();
   return !DISABLED_VALUES.has(raw);
@@ -1302,9 +1324,31 @@ export function buildAshbyHandlers(
                 maxAttempts: CANDIDATE_QUESTIONS_MAX_JOB_ATTEMPTS,
               },
             );
+            // ── AND HOLD THE DIAL WHILE IT RUNS ─────────────────────
+            // Only after the enqueue SUCCEEDED: holding a call for work that
+            // was never queued is pure latency. `0104` moves the timestamp
+            // LATER and never earlier, so a candidate waiting for the IST
+            // window keeps that time.
+            //
+            // A ONE-TIME PUSH, NOT A WAIT-FOR-READY. If generation fails,
+            // dead-letters or never runs, the candidate is dialled after the
+            // grace on the role's own template — exactly as before any of this
+            // existed. Nothing here can strand a call.
+            if (engagement?.engagementId && runtime.stores.deferPhoneDialForQuestions) {
+              const held = await runtime.stores.deferPhoneDialForQuestions(
+                engagement.engagementId,
+                CANDIDATE_QUESTIONS_DIAL_GRACE_SECONDS,
+              );
+              logger.info('unknown_event', {
+                error_category: 'candidate_questions_dial_held',
+                error_type: held.status,
+              });
+            }
           } catch (error) {
             // Sanitized code only: no link id, no candidate, no provider
             // message — a provider message can carry whatever it was handed.
+            // A failed HOLD is the same class: the call simply races, which is
+            // the behaviour this feature shipped with.
             logger.warn('unknown_event', {
               error_category: 'candidate_questions_enqueue_failed',
               error_type: 'ingestion_ready',

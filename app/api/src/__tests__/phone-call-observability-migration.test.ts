@@ -64,11 +64,20 @@ describe('0082 per-call phone observability column', () => {
     const idx094 = PHONE_MIGRATIONS.findIndex((m) => m.name === '0094');
     const idx095 = PHONE_MIGRATIONS.findIndex((m) => m.name === '0095');
     const idx096 = PHONE_MIGRATIONS.findIndex((m) => m.name === '0096');
-    expect(idx096).toBe(0);
-    expect(idx095).toBe(1);
-    expect(idx094).toBe(2);
-    expect(idx092).toBe(3);
-    expect(idx086).toBe(4);
+    // ORDER, NOT POSITION. These were once pinned to absolute indices 0-4,
+    // which encoded "these five are the newest" — a fact that expires the next
+    // time a phone migration is registered, as 0103 and 0104 just did. The
+    // invariant the extractors actually depend on is that the list is sorted
+    // newest-first, so assert THAT, over every entry rather than eight picked
+    // ones: a misplacement anywhere is a superseded body read somewhere.
+    const names = PHONE_MIGRATIONS.map((m) => m.name);
+    expect(names).toEqual([...names].sort().reverse());
+    expect(new Set(names).size, 'a migration registered twice').toBe(names.length);
+    // Spelled out for the four whose order this file's comment explains.
+    expect(idx096).toBeLessThan(idx095);
+    expect(idx095).toBeLessThan(idx094);
+    expect(idx094).toBeLessThan(idx092);
+    expect(idx092).toBeLessThan(idx086);
     expect(idx085).toBeGreaterThan(idx086);
     expect(PHONE_MIGRATIONS[idx082]).toEqual({ name: '0082', sql: MIGRATION_0082 });
     expect(idx083).toBeGreaterThan(idx085);

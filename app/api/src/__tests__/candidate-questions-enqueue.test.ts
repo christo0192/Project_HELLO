@@ -29,6 +29,9 @@ interface Enqueued {
 let enqueued: Enqueued[];
 let engagementStatus: string;
 let enqueueThrows: boolean;
+/** Every `defer_phone_dial_for_questions` call the ingestion made. */
+let held: Array<{ engagementId: string; graceSeconds: number }>;
+let holdThrows: boolean;
 
 /** A runtime whose ingestion reaches `ready` and whose queue records. */
 function runtime() {
@@ -61,7 +64,15 @@ function runtime() {
         ingestion = { state, attempts: 0 };
         return { status: 'ok' };
       },
-      ensurePhoneEngagement: async () => ({ status: engagementStatus }),
+      ensurePhoneEngagement: async () => ({
+        status: engagementStatus,
+        engagementId: 'eng-1',
+      }),
+      deferPhoneDialForQuestions: async (engagementId: string, graceSeconds: number) => {
+        if (holdThrows) throw new Error('rpc unavailable');
+        held.push({ engagementId, graceSeconds });
+        return { status: 'deferred' };
+      },
     },
     buildIngestionPorts: async (input: { onState: (s: string, p?: unknown) => Promise<void> }) => ({
       status: 'ok' as const,
@@ -101,8 +112,10 @@ const ORIGINAL = process.env.CANDIDATE_QUESTIONS_ENABLED;
 
 beforeEach(() => {
   enqueued = [];
+  held = [];
   engagementStatus = 'eligible';
   enqueueThrows = false;
+  holdThrows = false;
   process.env.CANDIDATE_QUESTIONS_ENABLED = 'true';
 });
 afterEach(() => {
@@ -194,6 +207,60 @@ describe('the enqueue', () => {
         expect(candidateJobs()).toHaveLength(0);
       });
     }
+  });
+
+  describe('HOLDING THE DIAL so generation can finish', () => {
+    // The plan is snapshotted ONCE, behind the consent gate, and an engagement
+    // binds exactly one session. A generation that lands a second late is not
+    // late — it is never used for that conversation, silently. Without the
+    // hold the two race: dial needs 45-105s, generation 20-65s.
+    it('holds the dial for the engagement it just queued work for', async () => {
+      await runIngestion();
+      expect(held).toEqual([{ engagementId: 'eng-1', graceSeconds: 150 }]);
+    });
+
+    it('COVERS A FULL GENERATION AND ITS JUDGE, not just the typical path', async () => {
+      // The arithmetic, stated so nobody has to re-derive it: a claim (≤5s at
+      // the poll interval), one generation call bounded at 60s by
+      // `CANDIDATE_QUESTIONS_TIMEOUT_MS`, and a 45s judge — 5 + 60 + 45 = 110s
+      // worst case on the path that does not retry, against 20-65s typical.
+      //
+      // IT DOES NOT COVER A RETRIED GENERATION: 5 + 60 + 60 + 45 = 170s, and
+      // 150 is deliberately under it. That path is only reached when the first
+      // attempt's questions all fail a gate, and buying it would cost EVERY
+      // candidate another minute of dial latency for a case that already ends
+      // on the role template about as often as not.
+      await runIngestion();
+      expect(held[0].graceSeconds).toBeGreaterThanOrEqual(110);
+      expect(held[0].graceSeconds).toBeLessThanOrEqual(300);
+    });
+
+    it('does NOT hold when nothing was queued', async () => {
+      // Holding a call for work that was never enqueued is pure latency.
+      process.env.CANDIDATE_QUESTIONS_ENABLED = 'false';
+      await runIngestion();
+      expect(held).toEqual([]);
+    });
+
+    it('does NOT hold a candidate who will never be called', async () => {
+      engagementStatus = 'phone_invalid';
+      await runIngestion();
+      expect(held).toEqual([]);
+    });
+
+    it('does not hold when the enqueue itself failed', async () => {
+      enqueueThrows = true;
+      await runIngestion();
+      expect(held).toEqual([]);
+    });
+
+    it('A FAILED HOLD DOES NOT FAIL THE INGESTION', async () => {
+      // Losing the hold means the call races, which is the behaviour this
+      // feature shipped with — not a reason to fail an import.
+      holdThrows = true;
+      await expect(runIngestion()).resolves.not.toThrow();
+      expect(candidateJobs()).toHaveLength(1);
+    });
   });
 
   it('AN ENQUEUE FAULT DOES NOT FAIL THE INGESTION', async () => {

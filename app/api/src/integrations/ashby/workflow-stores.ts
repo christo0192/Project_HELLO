@@ -390,12 +390,30 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
       if (error) throw new Error('ashby_writeback_pending_error');
       return { status: statusOf(data) };
     },
-    async ensurePhoneEngagement(applicationLinkId): Promise<{ status: string }> {
+    async ensurePhoneEngagement(applicationLinkId): Promise<{
+      status: string;
+      engagementId?: string;
+    }> {
       const { data, error } = await client.rpc('ensure_ashby_phone_engagement', {
         p_application_link_id: applicationLinkId,
         p_now: new Date().toISOString(),
       });
       if (error) throw new Error('ashby_phone_engagement_error');
+      // `0057` returns `engagement_id` on every branch that has one. The
+      // caller needs it to defer the dial while question generation runs; it
+      // is an opaque identifier and never logged.
+      const row = (data ?? {}) as Record<string, unknown>;
+      const engagementId = typeof row.engagement_id === 'string' ? row.engagement_id : undefined;
+      return { status: statusOf(data), ...(engagementId ? { engagementId } : {}) };
+    },
+
+    async deferPhoneDialForQuestions(engagementId, graceSeconds): Promise<{ status: string }> {
+      const { data, error } = await client.rpc('defer_phone_dial_for_questions', {
+        p_engagement_id: engagementId,
+        p_grace_seconds: graceSeconds,
+        p_now: new Date().toISOString(),
+      });
+      if (error) throw new Error('phone_dial_defer_error');
       return { status: statusOf(data) };
     },
     async enqueueScorecardWrite(applicationLinkId, sessionId): Promise<{ status: string }> {

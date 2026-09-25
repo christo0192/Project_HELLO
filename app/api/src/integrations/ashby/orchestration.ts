@@ -255,7 +255,20 @@ export interface RuntimeWorkflowStores extends WorkflowStores {
   /** Park a completed application as `writeback_pending` (audited, idempotent). */
   markWritebackPending(applicationLinkId: string, reason: string): Promise<{ status: string }>;
   /** Materialize/adopt the phone-primary engagement after resume readiness. */
-  ensurePhoneEngagement?(applicationLinkId: string): Promise<{ status: string }>;
+  ensurePhoneEngagement?(applicationLinkId: string): Promise<{
+    status: string;
+    /** `0057` returns this on every branch that has an engagement. */
+    engagementId?: string;
+  }>;
+  /**
+   * Push a non-terminal engagement's `next_eligible_at` LATER, so per-candidate
+   * question generation can finish before the call plan is snapshotted.
+   * Optional: older injected stores omit it and the dial is simply not held.
+   */
+  deferPhoneDialForQuestions?(
+    engagementId: string,
+    graceSeconds: number,
+  ): Promise<{ status: string }>;
   /** Enqueue the verified scorecard sink after a durable assessment insert. */
   enqueueScorecardWrite?(applicationLinkId: string, sessionId: string): Promise<{ status: string }>;
   /**
