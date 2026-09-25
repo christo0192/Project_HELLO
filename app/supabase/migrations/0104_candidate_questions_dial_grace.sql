@@ -23,11 +23,33 @@
 -- else — the call happens on the role's own template, exactly as it did
 -- before any of this existed.
 --
--- `greatest`, AND THAT IS THE WHOLE SAFETY ARGUMENT. `next_eligible_at` is
+-- `greatest`, AND THAT IS HALF THE SAFETY ARGUMENT. `next_eligible_at` is
 -- also what holds a candidate imported outside the IST calling window until
 -- the window opens (`phone_next_window_open`). Writing `now + grace`
 -- unconditionally would drag that candidate forward and dial them at two in
 -- the morning. The value only ever moves LATER.
+--
+-- THE OTHER HALF IS THAT "LATER" IS NOT AUTOMATICALLY SAFE, and adversarial
+-- review found two ways it is not:
+--
+--   * ONLY AN ENGAGEMENT STILL WAITING FOR ITS FIRST DIAL. `eligible` is the
+--     state BOTH success paths of `ensure_ashby_phone_engagement` produce
+--     (`0057`: `eligible` and `scheduled_next_window` differ only in whether
+--     `next_eligible_at` is in the future), so it covers every candidate this
+--     feature exists for. Every other state is refused, because for a
+--     `reconnecting` engagement the due time lives on `updated_at` and NOT on
+--     `next_eligible_at` (`read.ts`: "`updated_at + backoff`, `next_eligible_at`
+--     does not carry it"). This function therefore writes NO `updated_at` at
+--     all: bumping it on a reconnect would push a candidate who was just cut
+--     off another backoff further away, which is the opposite of the point.
+--
+--   * NEVER PAST THE CLOSE OF THE CALLING WINDOW. At 20:58 IST a 150s push
+--     lands at 21:00:30, outside the window — and nothing anywhere
+--     re-normalises a `next_eligible_at` that sits past the close, so the
+--     candidate waits until 09:00 the NEXT DAY. Trading a 150-second race for
+--     a twelve-hour delay is not a trade. In that band the hold is pointless
+--     anyway: the plan is snapshotted at the consent gate, 45-105s after the
+--     dial, so generation already has its time.
 
 create or replace function screening_v2.defer_phone_dial_for_questions(
   p_engagement_id  uuid,
@@ -66,6 +88,15 @@ begin
                               'engagement_state', v_eng.state);
   end if;
 
+  -- STILL WAITING FOR ITS FIRST DIAL, or this does not apply. `dialing` and
+  -- `in_call` are already past the point the grace could help; `reconnecting`
+  -- is not scheduled by this column at all; a `scheduled` appointment was
+  -- booked for a time nobody asked us to move.
+  if v_eng.state <> 'eligible' then
+    return jsonb_build_object('status', 'engagement_not_waiting',
+                              'engagement_state', v_eng.state);
+  end if;
+
   -- ONLY EVER LATER. A candidate held for the next calling window keeps that
   -- time; one due now is pushed by the grace.
   v_next := greatest(coalesce(v_eng.next_eligible_at, p_now), p_now + make_interval(secs => p_grace_seconds));
@@ -75,15 +106,25 @@ begin
                               'next_eligible_at', v_eng.next_eligible_at);
   end if;
 
+  -- NEVER OUT OF THE CALLING WINDOW. Asked through the same predicate the
+  -- dialer uses, so the temporary 24/7 overrides (`0064`, `0085`) are honoured
+  -- automatically rather than re-derived here.
+  if not screening_v2.phone_ist_window_open(v_next) then
+    return jsonb_build_object('status', 'window_edge',
+                              'next_eligible_at', v_eng.next_eligible_at);
+  end if;
+
   -- `state` is untouched, so `enforce_phone_engagement_transition` takes its
-  -- same-state early return and no edge is exercised.
+  -- same-state early return and no edge is exercised. `updated_at` is
+  -- DELIBERATELY NOT WRITTEN — see the header: it is the reconnect due clock,
+  -- and this function has no business moving it.
   update screening_v2.phone_engagements
      set next_eligible_at = v_next,
-         updated_at       = p_now,
          version          = version + 1
    where id = v_eng.id;
 
-  return jsonb_build_object('status', 'deferred', 'next_eligible_at', v_next);
+  return jsonb_build_object('status', 'deferred', 'next_eligible_at', v_next,
+                            'engagement_state', v_eng.state);
 end;
 $$;
 

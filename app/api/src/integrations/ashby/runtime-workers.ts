@@ -168,13 +168,19 @@ const DISABLED_VALUES = new Set(['false', '0', 'no', 'off']);
  * EVERY candidate another minute of dial latency for a case that already ends
  * on the role template about as often as not.
  *
+ * WHAT IT DOES NOT ACCOUNT FOR: queue depth. The generation runner is
+ * `concurrency: 1`, so on a bulk import the Nth job starts after the N-1
+ * before it, while its grace was fixed at enqueue time. The grace makes one
+ * candidate's race reliable, not a backlog's — and a backlog still degrades to
+ * the role template, which is the same outcome as before this existed.
+ *
  * It buys reliability with dial latency, and that trade is the point: a
  * candidate called 150 seconds later is not waiting by the phone, while a
  * generation that lands one second after the plan is snapshotted is never used
  * for that conversation at all — `on conflict (session_id) do nothing`, and an
  * engagement binds exactly one session.
  */
-const CANDIDATE_QUESTIONS_DIAL_GRACE_SECONDS = 150;
+export const CANDIDATE_QUESTIONS_DIAL_GRACE_SECONDS = 150;
 
 function candidateQuestionsEnabled(): boolean {
   const raw = (process.env.CANDIDATE_QUESTIONS_ENABLED ?? '').trim().toLowerCase();
@@ -1304,9 +1310,17 @@ export function buildAshbyHandlers(
         // enqueue unreachable and the whole feature quietly dead.
         //   `eligible`              — admitted, due now
         //   `scheduled_next_window` — admitted, due at the next calling window
-        //   `engagement_active`     — one already exists and is non-terminal,
-        //                             i.e. a redelivery for a candidate who
-        //                             passed these same checks earlier
+        //   `engagement_active`     — one already exists and is non-terminal.
+        //                             USUALLY a redelivery for a candidate who
+        //                             passed these same checks earlier, but
+        //                             `0057` returns it for ANY state that is
+        //                             not `pending_prereqs`/`eligible` — so it
+        //                             also covers a candidate who is dialing,
+        //                             on the phone right now, or reconnecting.
+        //                             `0104` refuses to move the dial for all
+        //                             of those; the grace only applies to an
+        //                             engagement still waiting for its first
+        //                             dial.
         // Everything else is a prerequisite failure over a row that exists but
         // is not dialable.
         const willBeCalled = engagement?.status === 'eligible'
@@ -1334,21 +1348,56 @@ export function buildAshbyHandlers(
             // dead-letters or never runs, the candidate is dialled after the
             // grace on the role's own template — exactly as before any of this
             // existed. Nothing here can strand a call.
-            if (engagement?.engagementId && runtime.stores.deferPhoneDialForQuestions) {
-              const held = await runtime.stores.deferPhoneDialForQuestions(
-                engagement.engagementId,
-                CANDIDATE_QUESTIONS_DIAL_GRACE_SECONDS,
-              );
-              logger.info('unknown_event', {
-                error_category: 'candidate_questions_dial_held',
-                error_type: held.status,
+            //
+            // ITS OWN try/catch, AND A LOG ON EVERY PATH INCLUDING THE ONES
+            // THAT DO NOTHING. Three reviewers landed on the same hole: a hold
+            // that never happens is the race this feature exists to close, so
+            // "no hold" must never be silent. Sharing the enqueue's catch also
+            // reported a failed hold as `candidate_questions_enqueue_failed`,
+            // which is a lie about which half broke.
+            try {
+              if (!runtime.stores.deferPhoneDialForQuestions) {
+                logger.warn('unknown_event', {
+                  error_category: 'candidate_questions_dial_not_held',
+                  error_type: 'store_unavailable',
+                });
+              } else if (!engagement?.engagementId) {
+                // `0057` returns `engagement_id` on all three admitted
+                // branches, so this means the key or its mapping broke.
+                logger.warn('unknown_event', {
+                  error_category: 'candidate_questions_dial_not_held',
+                  error_type: 'engagement_id_missing',
+                });
+              } else {
+                const held = await runtime.stores.deferPhoneDialForQuestions(
+                  engagement.engagementId,
+                  CANDIDATE_QUESTIONS_DIAL_GRACE_SECONDS,
+                );
+                // `deferred` and `unchanged` are the two that mean the call
+                // will wait; every other status means it will NOT, so they are
+                // warnings rather than another line of info nobody reads.
+                const holdWorked = held.status === 'deferred' || held.status === 'unchanged';
+                const emit = holdWorked ? logger.info : logger.warn;
+                emit.call(logger, 'unknown_event', {
+                  error_category: holdWorked
+                    ? 'candidate_questions_dial_held'
+                    : 'candidate_questions_dial_not_held',
+                  error_type: held.status,
+                });
+              }
+            } catch {
+              // Losing the hold means the call races, which is the behaviour
+              // this feature shipped with — not a reason to fail an import.
+              logger.warn('unknown_event', {
+                error_category: 'candidate_questions_dial_not_held',
+                error_type: 'defer_failed',
               });
             }
           } catch (error) {
             // Sanitized code only: no link id, no candidate, no provider
             // message — a provider message can carry whatever it was handed.
-            // A failed HOLD is the same class: the call simply races, which is
-            // the behaviour this feature shipped with.
+            // A failed hold no longer lands here: it has its own catch above,
+            // so this category means what it says — nothing was queued.
             logger.warn('unknown_event', {
               error_category: 'candidate_questions_enqueue_failed',
               error_type: 'ingestion_ready',
