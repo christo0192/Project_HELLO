@@ -28,6 +28,7 @@
  * URL, hostname, secret, token, or candidate field ever appears.
  */
 
+import { CANDIDATE_QUESTIONS_QUEUE } from '../../lib/candidate-question-jobs.js';
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { AshbySchedulerHandle, SchedulerLoopHealth } from './scheduler.js';
 import { isLoopStale } from '../../lib/scheduler.js';
@@ -58,6 +59,12 @@ export const ASHBY_QUEUE_NAMES: readonly string[] = [
   ASHBY_SIGNAL_QUEUE,
   ASHBY_IMPORT_QUEUE,
   ASHBY_INGESTION_QUEUE,
+  // Generation runs on its OWN runner, but it is still a queue this worker
+  // owns — and turning a feature on by default while its backlog and its
+  // dead-letter depth are invisible is how a silently dead feature stays
+  // silent. Without this, a generation queue that dead-letters every job
+  // reports healthy: the loop is ticking, it just never succeeds.
+  CANDIDATE_QUESTIONS_QUEUE,
 ];
 
 // ── Process-local scheduler registry ─────────────────────────────────────────

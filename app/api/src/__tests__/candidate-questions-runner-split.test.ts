@@ -28,6 +28,35 @@ interface CapturedRunner {
 
 const captured: CapturedRunner[] = [];
 
+/**
+ * The scheduler's loop table — and this is the half that matters.
+ *
+ * `tickAll()` has ZERO production callers (`grep '\.tickAll()'` finds nothing
+ * outside `__tests__`); the real driver is the scheduler loop built here. An
+ * earlier version of this file asserted only `tickAll`, so DELETING the
+ * `questions` loop left 1829 tests green — and in production would have meant
+ * jobs enqueued for every admitted candidate and never claimed, growing
+ * unbounded, invisible to `reclaim_expired_jobs` (which scans `status='active'`
+ * only). Found by review.
+ */
+interface CapturedLoop {
+  name: string;
+  intervalMs: number;
+  tick: () => Promise<unknown>;
+}
+let loops: CapturedLoop[] = [];
+
+vi.mock('../integrations/ashby/scheduler.js', () => ({
+  createAshbyScheduler: (options: { loops: CapturedLoop[] }) => {
+    loops = options.loops;
+    return { start: vi.fn(), stop: vi.fn().mockResolvedValue(undefined), snapshot: vi.fn() };
+  },
+  queueRunnerTick: (runner: { tick: () => Promise<unknown> }) => async () => {
+    await runner.tick();
+    return false;
+  },
+}));
+
 vi.mock('../lib/queue/runner.js', () => ({
   createQueueRunner: (options: Record<string, unknown>) => {
     const handle: CapturedRunner = {
@@ -91,6 +120,7 @@ function build() {
 
 beforeEach(() => {
   captured.length = 0;
+  loops = [];
 });
 
 describe('the generation queue has its own runner', () => {
@@ -153,6 +183,46 @@ describe('the generation queue has its own runner', () => {
       await workers.stop();
       expect(ashby.stop).toHaveBeenCalledTimes(1);
       expect(questions.stop).toHaveBeenCalledTimes(1);
+    })();
+  });
+
+  it('IS ACTUALLY DRIVEN IN PRODUCTION — a scheduler loop of its own', async () => {
+    // THE ONE THAT WAS MISSING. Without this, deleting the loop, folding the
+    // questions tick into the `signal` loop, or slowing it to the reconcile
+    // cadence all pass. In production each of those is a feature that enqueues
+    // for every candidate and never runs.
+    build();
+    const [, questions] = captured;
+    const loop = loops.find((l) => l.name === 'questions');
+    expect(loop, 'no `questions` loop was registered with the scheduler').toBeDefined();
+
+    // It must drive THE QUESTIONS RUNNER, not some other one.
+    await loop!.tick();
+    expect(questions.tick).toHaveBeenCalledTimes(1);
+    expect(captured[0].tick, 'the questions loop must not drive the Ashby runner')
+      .not.toHaveBeenCalled();
+  });
+
+  it('polls on the SIGNAL cadence, not the reconcile one', () => {
+    // At the 15-minute reconcile cadence a generation would not finish before
+    // the call is planned, and the feature would look broken rather than slow.
+    build();
+    const loop = loops.find((l) => l.name === 'questions');
+    expect(loop?.intervalMs).toBe(5000);
+  });
+
+  it('LEAVES THE ASHBY LOOPS ALONE', () => {
+    // Its own loop, not a passenger on `signal` — the coupling the split exists
+    // to remove.
+    build();
+    const [ashby] = captured;
+    const signal = loops.find((l) => l.name === 'signal');
+    expect(signal).toBeDefined();
+    return (async () => {
+      await signal!.tick();
+      expect(ashby.tick).toHaveBeenCalledTimes(1);
+      expect(captured[1].tick, 'the signal loop must not drive generation')
+        .not.toHaveBeenCalled();
     })();
   });
 

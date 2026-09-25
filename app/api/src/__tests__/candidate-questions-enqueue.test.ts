@@ -140,16 +140,21 @@ describe('the enqueue', () => {
       expect(candidateJobs()).toHaveLength(1);
     });
 
-    it('STOPS ONLY ON THE EXACT STRING "false"', async () => {
-      process.env.CANDIDATE_QUESTIONS_ENABLED = 'false';
-      await runIngestion();
-      expect(candidateJobs()).toHaveLength(0);
+    it('STOPS ON EVERY SPELLING OF OFF AN OPERATOR ACTUALLY TYPES', async () => {
+      // THE SAFE DIRECTION INVERTED WHEN THE DEFAULT FLIPPED, and this is the
+      // corpus that holds the fix. Under the old `=== 'true'` every mistake
+      // meant OFF; under a naive `!== 'false'` these all meant ON — on the one
+      // switch someone reaches for during a cost or quality incident.
+      for (const value of ['false', 'FALSE', 'False', ' false ', '0', 'no', 'off', 'OFF']) {
+        enqueued = [];
+        process.env.CANDIDATE_QUESTIONS_ENABLED = value;
+        await runIngestion();
+        expect(candidateJobs(), value).toHaveLength(0);
+      }
     });
 
-    it('treats every other value as on, rather than guessing', async () => {
-      // A typo must not silently disable a feature the operator believes is
-      // running — the failure that would be hardest to notice.
-      for (const value of ['true', 'TRUE', '1', 'yes', '']) {
+    it('treats an affirmative or an unset value as on, rather than guessing', async () => {
+      for (const value of ['true', 'TRUE', '1', 'yes', '', '  ']) {
         enqueued = [];
         process.env.CANDIDATE_QUESTIONS_ENABLED = value;
         await runIngestion();

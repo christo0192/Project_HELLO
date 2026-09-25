@@ -134,14 +134,29 @@ export const ASHBY_INGESTION_QUEUE = 'ashby.ingestion';
  * its OWN runner with its own budget of 1 (see `createAshbyWorkers`), and the
  * Ashby drain is unaffected by construction rather than by arithmetic.
  *
- * What the switch is for now is COST — one generation call plus one judge call
- * per admitted candidate, sharing a circuit breaker with résumé parsing and
- * scoring. Setting it to `false` stops the enqueue at source, so nothing is
- * claimed, leased or billed. It is read on every ingestion, so flipping the
- * Fly secret takes effect without a redeploy.
+ * What the switch is for now is COST. At present volume that is about eight
+ * extra provider calls a day — `0094`'s own note is "4 dials on the busiest
+ * day" — and it is bounded above by the fleet cap of 50 dials per IST day. That
+ * number, not the runner split, is why ON is the right default.
+ *
+ * IT DOES NOT FAIL OPEN ON A TYPO, and getting that right took a second pass.
+ * The first version was `!== 'false'`, which INVERTED the safe direction: under
+ * the old `=== 'true'` every mistake — `TRUE`, `1`, a trailing newline — meant
+ * OFF, and under `!== 'false'` the values an operator actually types when they
+ * want it off (`FALSE`, `0`, `off`, `no`, `false\n`) all meant ON. This is the
+ * switch someone reaches for during a cost or quality incident; it must not
+ * need them to remember an exact lowercase spelling under pressure.
+ *
+ * WHAT IT DOES NOT DO, said plainly because the first draft of this comment
+ * claimed otherwise: it stops new ENQUEUES only. The handler stays registered
+ * and the runner keeps claiming, so jobs already on the queue still run, lease
+ * and bill after the flip. There is no in-flight cancellation here.
  */
+const DISABLED_VALUES = new Set(['false', '0', 'no', 'off']);
+
 function candidateQuestionsEnabled(): boolean {
-  return process.env.CANDIDATE_QUESTIONS_ENABLED !== 'false';
+  const raw = (process.env.CANDIDATE_QUESTIONS_ENABLED ?? '').trim().toLowerCase();
+  return !DISABLED_VALUES.has(raw);
 }
 
 /**
@@ -1228,8 +1243,16 @@ export function buildAshbyHandlers(
 
         // ── AND ASK FOR THIS CANDIDATE'S OWN QUESTIONS ──────────────────
         // HERE, because this is the first moment we know the person will
-        // actually be called — and it is comfortably before the due loop
-        // dials, which is the deadline that matters. Doing it at import
+        // actually be called.
+        //
+        // THE DEADLINE IS NOT THE DIAL, and an earlier version of this comment
+        // said it was. `start_phone_assessment` snapshots the plan BEHIND the
+        // consent gate — it refuses until the engagement reaches `in_call` —
+        // so the real deadline is disclosure delivered on the first answered
+        // call, which is later and more forgiving. What is unforgiving is that
+        // the snapshot is `on conflict (session_id) do nothing` and an
+        // engagement binds exactly one session, so a set that arrives after
+        // that moment never reaches THAT conversation. Doing it at import
         // would pay a provider call for every résumé that lands, most of
         // which never reach a phone screen.
         //
@@ -1521,9 +1544,34 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
   // That is why the feature shipped default-OFF.
   //
   // Splitting the map is what makes it safe to turn on. The Ashby drain keeps
-  // both its slots and is byte-for-byte unaffected; generation gets one slot
-  // of its own and can never take a second. Nothing about either runner's
-  // behaviour depends on the other.
+  // both its slots; generation gets one of its own and can never take a
+  // second. The scheduler runs each loop on its own timer and a queue tick is
+  // bounded by the CLAIM, not by the handler, so neither runner's cadence can
+  // block the other's.
+  //
+  // THEY ARE NOT FULLY INDEPENDENT, and an earlier version of this comment
+  // claimed they were. Both bottom out in ONE process-wide DeepSeek runner
+  // holding ONE circuit breaker (`lib/deepseek.ts`'s `defaultRunner`), shared
+  // with résumé structuring, scoring and role drafting. Two consequences,
+  // named rather than assumed away:
+  //
+  //   * `HALF_OPEN` admits exactly one probe process-wide. A generation call
+  //     can now win it, and every other caller gets `circuit_open` until it
+  //     settles — which for an ingestion parse means the deterministic regex
+  //     fallback and a candidate written NON-DIALABLE. What bounds it is the
+  //     probe's duration, which is why `CANDIDATE_QUESTIONS_TIMEOUT_MS` is
+  //     60s and not the 120s ceiling: a generation writes three sentences from
+  //     facts it is handed and has no business holding that slot for two
+  //     minutes.
+  //   * A generation timeout counts toward the same consecutive-failure
+  //     budget. `concurrency: 1` serialises it, so reaching five needs ~5
+  //     minutes with no interleaved success from ANY caller — i.e. a real
+  //     outage, during which parsing is failing anyway.
+  //
+  // Both are degradation during a provider incident, and the ingestion path
+  // fails soft by design. Removing the coupling entirely means giving this
+  // queue its own breaker, which is a change to provider plumbing and wants
+  // its own review.
   const { [CANDIDATE_QUESTIONS_QUEUE]: candidateQuestionsHandler, ...ashbyHandlers } = handlers;
 
   const runner = createQueueRunner({
