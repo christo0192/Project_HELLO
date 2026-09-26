@@ -50,6 +50,7 @@ import type {
   CandidateConsentTemplate,
   CandidatePreflightResult,
   CandidateDetail,
+  CandidatePhoneAttemptsResponse,
   CandidatesSummary,
   CandidateInviteExchangeResponse,
   CandidateInviteResult,
@@ -354,6 +355,12 @@ export const api = {
   // MIG-06: On-demand recruiter recording download URL
   getRecordingDownloadUrl: (sessionId: string) =>
     request<RecordingDownloadResponse>(`/api/recordings/${sessionId}/download`),
+  getAttemptRecordingDownloadUrl: (attemptId: string) =>
+    request<RecordingDownloadResponse>(`/api/recordings/attempts/${attemptId}/download`),
+  getCandidatePhoneAttempts: (candidateId: string, before?: string) =>
+    request<CandidatePhoneAttemptsResponse>(
+      `/api/candidates/${candidateId}/phone-attempts${before ? `?before=${encodeURIComponent(before)}` : ''}`,
+    ),
 
   // ── Consent routes (GOV-03/GOV-08/GOV-09/GOV-10) ─────────────────
 

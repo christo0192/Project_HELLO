@@ -604,6 +604,9 @@ describe('errors and malformed answers', () => {
         candidateId: 'c', now: NOW })],
       ['phone_suppression_state_error', () => stores.phoneSuppressionState!({
         candidateId: 'c' })],
+      // 0107's pre-consent evidence binding must also hide driver errors.
+      ['phone_bind_recording_session_error', () => stores.bindPhoneAttemptRecordingSession!({
+        attemptId: 'a', sessionId: 's', engagementId: 'e', now: NOW })],
     ];
     expect(attempts).toHaveLength(PHONE_RPC_NAMES.length);
     for (const [code, run] of attempts) {

@@ -9,8 +9,10 @@ import {
 } from 'livekit-server-sdk';
 import { env } from './env.js';
 import { supabase } from './supabase.js';
+import { phoneAttemptRecordingObjectKey } from './phone-screening/index.js';
 
 export type RecordingFinalizeStatus = 'ready' | 'fallback_required' | 'pending';
+export type AttemptRecordingFinalizeStatus = RecordingFinalizeStatus;
 
 interface EgressClientLike {
   startRoomCompositeEgress: EgressClient['startRoomCompositeEgress'];
@@ -417,6 +419,69 @@ export function isWorkerInbandEgressId(egressId: string): boolean {
 }
 
 /**
+ * Link the same verified bytes to the attempt row for the legacy LiveKit
+ * egress provider. The session finalizer remains the authority for the
+ * reusable session slot, but candidate history is attempt-scoped and must not
+ * infer readiness from that slot. This is deliberately a CAS with a reread:
+ * a concurrent worker/session finalizer may have completed the attempt first,
+ * and a parent lifecycle change must never be resurrected by this write.
+ */
+async function persistPhoneAttemptEvidence(
+  db: typeof supabase,
+  attemptId: string,
+  sessionId: string,
+  objectKey: string,
+  manifestKey: string,
+  sha256: string,
+  sizeBytes: number,
+  contentType: 'audio/ogg' | 'audio/mpeg',
+): Promise<void> {
+  const { data: parent, error: parentError } = await db
+    .from('call_sessions')
+    .select('recording_revoked_at,recording_quarantined,recording_deleted_at')
+    .eq('id', sessionId)
+    .maybeSingle();
+  if (parentError || !parent || parent.recording_revoked_at || parent.recording_deleted_at || parent.recording_quarantined === true) {
+    throw new Error('phone_attempt_parent_lifecycle_blocked');
+  }
+  const { data: linked, error: linkError } = await db
+    .from('phone_call_attempts')
+    .update({
+      recording_session_id: sessionId,
+      recording_sha256: sha256,
+      recording_size_bytes: sizeBytes,
+      recording_content_type: contentType,
+      recording_ready: true,
+      egress_status: 'complete',
+    })
+    .eq('id', attemptId)
+    .is('recording_ready', false)
+    .is('recording_quarantined', false)
+    .is('recording_deleted_at', null)
+    .select('id');
+  if (linkError) throw new Error('phone_attempt_evidence_link_failed');
+  if (linked && linked.length > 0) return;
+
+  const { data: reread, error: rereadError } = await db
+    .from('phone_call_attempts')
+    .select('recording_session_id,recording_object_key,recording_manifest_key,recording_sha256,recording_size_bytes,recording_content_type,recording_ready,recording_quarantined,recording_deleted_at')
+    .eq('id', attemptId)
+    .maybeSingle();
+  if (rereadError || !reread
+      || reread.recording_session_id !== sessionId
+      || reread.recording_object_key !== objectKey
+      || reread.recording_manifest_key !== manifestKey
+      || reread.recording_sha256 !== sha256
+      || reread.recording_size_bytes !== sizeBytes
+      || reread.recording_content_type !== contentType
+      || reread.recording_ready !== true
+      || reread.recording_quarantined === true
+      || reread.recording_deleted_at) {
+    throw new Error('phone_attempt_evidence_link_not_converged');
+  }
+}
+
+/**
  * Sniff the AUDIO container of a worker-uploaded object from its leading magic
  * bytes, so the finalizer records the recording's REAL content type instead of
  * assuming MP3.
@@ -442,6 +507,228 @@ export function sniffRecordingContentType(bytes: Buffer): 'audio/ogg' | 'audio/m
     return 'audio/ogg';
   }
   return 'audio/mpeg';
+}
+
+/**
+ * Attempt evidence has a stricter gate than the historical session finalizer.
+ * A non-empty object is not necessarily audio: require a known Ogg capture
+ * pattern, an ID3-tagged MP3, or an MPEG frame sync before marking it ready.
+ * The worker's reported digest, size and manifest are advisory; this function
+ * is deliberately based only on bytes read back from storage.
+ */
+export function verifiedPhoneContentType(bytes: Buffer): 'audio/ogg' | 'audio/mpeg' | null {
+  if (bytes.length >= 4 && bytes.subarray(0, 4).equals(Buffer.from('OggS'))) {
+    return 'audio/ogg';
+  }
+  if (bytes.length >= 4 && bytes.subarray(0, 3).equals(Buffer.from('ID3'))) {
+    return 'audio/mpeg';
+  }
+  if (bytes.length >= 2 && bytes[0] === 0xff && (bytes[1] & 0xe0) === 0xe0) {
+    return 'audio/mpeg';
+  }
+  return null;
+}
+
+export interface RecordingManifestExpectation {
+  objectKey: string;
+  contentType: 'audio/ogg' | 'audio/mpeg';
+  sha256: string;
+  sizeBytes: number;
+  egressId: string | null;
+}
+
+/**
+ * The manifest's durable identity is the object, container, digest, size and
+ * egress. Duration/finalized_at are optional enrichment written by the
+ * provider-aware finalizer, so two finalizers cannot reject the same verified
+ * bytes merely because one ran before provider timing was available.
+ */
+export function recordingManifestMatches(
+  bytes: Buffer,
+  expected: RecordingManifestExpectation,
+): boolean {
+  try {
+    const value = JSON.parse(bytes.toString('utf8')) as Record<string, unknown>;
+    return value.schema_version === 1
+      && value.object_key === expected.objectKey
+      && value.content_type === expected.contentType
+      && value.sha256 === expected.sha256
+      && value.size_bytes === expected.sizeBytes
+      && (value.egress_id ?? null) === expected.egressId
+      && (value.provider_duration_ms === undefined
+        || value.provider_duration_ms === null
+        || (typeof value.provider_duration_ms === 'number' && Number.isSafeInteger(value.provider_duration_ms)))
+      && (value.finalized_at === undefined
+        || value.finalized_at === null
+        || typeof value.finalized_at === 'string');
+  } catch {
+    return false;
+  }
+}
+
+function canonicalRecordingManifest(expected: RecordingManifestExpectation, enrichment: {
+  providerDurationMs?: number | null;
+  finalizedAt?: string | null;
+} = {}): Buffer {
+  return Buffer.from(JSON.stringify({
+    schema_version: 1,
+    object_key: expected.objectKey,
+    content_type: expected.contentType,
+    sha256: expected.sha256,
+    size_bytes: expected.sizeBytes,
+    provider_duration_ms: enrichment.providerDurationMs ?? null,
+    egress_id: expected.egressId,
+    finalized_at: enrichment.finalizedAt ?? null,
+  }));
+}
+
+/**
+ * Finalize one worker-uploaded attempt without requiring the reusable session
+ * recording slot to have been stamped. This is the gate-death path: the
+ * attempt key is authoritative, while the session remains reusable across
+ * legs and is intentionally not claimed by a pre-consent attempt.
+ */
+export async function finalizeWorkerInbandAttemptRecording(
+  attemptId: string,
+  deps: RecordingEgressDeps = {},
+  expectedSessionId?: string,
+): Promise<AttemptRecordingFinalizeStatus> {
+  const db = deps.db ?? supabase;
+  const { data: attempt, error } = await db
+    .from('phone_call_attempts')
+    .select('session_id,recording_session_id,recording_object_key, recording_manifest_key, recording_ready, recording_quarantined, recording_deleted_at, egress_id, egress_status')
+    .eq('id', attemptId)
+    .maybeSingle();
+  if (error || !attempt) throw new Error('phone recording attempt not found');
+  if (expectedSessionId !== undefined && attempt.recording_session_id !== expectedSessionId) return 'fallback_required';
+  if (attempt.recording_ready === true) {
+    if (attempt.recording_quarantined === true || attempt.recording_deleted_at || !attempt.recording_session_id) {
+      return 'fallback_required';
+    }
+    const { data: readyParent, error: readyParentError } = await db
+      .from('call_sessions')
+      .select('recording_revoked_at,recording_quarantined,recording_deleted_at')
+      .eq('id', attempt.recording_session_id)
+      .maybeSingle();
+    if (readyParentError || !readyParent || readyParent.recording_revoked_at
+      || readyParent.recording_deleted_at || readyParent.recording_quarantined === true) {
+      return 'fallback_required';
+    }
+    return 'ready';
+  }
+  if (attempt.recording_quarantined === true || attempt.recording_deleted_at) return 'fallback_required';
+  if (!attempt.recording_object_key || attempt.egress_status === 'failed') return 'fallback_required';
+  if (!attempt.recording_session_id) return 'fallback_required';
+
+  const { data: parentSession, error: parentError } = await db
+    .from('call_sessions')
+    .select('recording_revoked_at,recording_quarantined,recording_deleted_at')
+    .eq('id', attempt.recording_session_id)
+    .maybeSingle();
+  if (parentError || !parentSession) return 'fallback_required';
+  if (parentSession.recording_revoked_at || parentSession.recording_deleted_at || parentSession.recording_quarantined === true) {
+    return 'fallback_required';
+  }
+
+  const objectKey = String(attempt.recording_object_key);
+  const manifestKey = typeof attempt.recording_manifest_key === 'string'
+    ? attempt.recording_manifest_key
+    : null;
+  if (objectKey !== phoneAttemptRecordingObjectKey(attemptId)
+      || manifestKey !== `${objectKey}.json`) {
+    return 'fallback_required';
+  }
+
+  let downloaded: { data?: Blob | ArrayBuffer | Buffer | null; error?: { message?: string } | null };
+  try {
+    downloaded = await db.storage.from(env.recordingsBucket).download(objectKey);
+  } catch {
+    return 'pending';
+  }
+  if (downloaded.error || downloaded.data == null) return 'pending';
+
+  let bytes: Buffer;
+  try {
+    const data = downloaded.data;
+    bytes = Buffer.isBuffer(data)
+      ? data
+      : data instanceof ArrayBuffer
+        ? Buffer.from(data)
+        : Buffer.from(await data.arrayBuffer());
+  } catch {
+    return 'pending';
+  }
+  if (bytes.length === 0 || bytes.length > env.recordingMaxBytes) return 'fallback_required';
+  const contentType = verifiedPhoneContentType(bytes);
+  if (!contentType) return 'fallback_required';
+  const sha256 = createHash('sha256').update(bytes).digest('hex');
+  const manifestExpectation: RecordingManifestExpectation = {
+    objectKey,
+    contentType,
+    sha256,
+    sizeBytes: bytes.length,
+    egressId: typeof attempt.egress_id === 'string' ? attempt.egress_id : null,
+  };
+  const manifest = canonicalRecordingManifest(manifestExpectation);
+  const bucket = db.storage.from(env.recordingsBucket);
+  const uploaded = await bucket.upload(manifestKey, manifest, {
+    contentType: 'application/json',
+    upsert: false,
+  });
+  if (uploaded.error) {
+    let existing: { data?: Blob | ArrayBuffer | Buffer | null; error?: { message?: string } | null };
+    try {
+      existing = await bucket.download(manifestKey);
+    } catch {
+      return 'pending';
+    }
+    if (existing.error || existing.data == null) return 'pending';
+    try {
+      const existingBytes = Buffer.isBuffer(existing.data)
+        ? existing.data
+        : existing.data instanceof ArrayBuffer
+          ? Buffer.from(existing.data)
+          : Buffer.from(await existing.data.arrayBuffer());
+      if (!recordingManifestMatches(existingBytes, manifestExpectation)) return 'fallback_required';
+    } catch {
+      return 'pending';
+    }
+  }
+
+  const { data: linked, error: linkError } = await db
+    .from('phone_call_attempts')
+    .update({
+      recording_sha256: sha256,
+      recording_size_bytes: bytes.length,
+      recording_content_type: contentType,
+      recording_ready: true,
+      egress_status: 'complete',
+    })
+    .eq('id', attemptId)
+    .is('recording_ready', false)
+    .is('recording_quarantined', false)
+    .is('recording_deleted_at', null)
+    .select('id');
+  if (linkError) return 'pending';
+  if (linked && linked.length > 0) return 'ready';
+  const { data: reread, error: rereadError } = await db
+    .from('phone_call_attempts')
+    .select('recording_ready,recording_quarantined,recording_deleted_at,recording_session_id')
+    .eq('id', attemptId)
+    .maybeSingle();
+  if (rereadError || !reread) return 'fallback_required';
+  if (reread.recording_ready === true && reread.recording_quarantined !== true && !reread.recording_deleted_at) {
+    const { data: parentAfter, error: parentAfterError } = await db
+      .from('call_sessions')
+      .select('recording_revoked_at,recording_quarantined,recording_deleted_at')
+      .eq('id', reread.recording_session_id)
+      .maybeSingle();
+    if (!parentAfterError && parentAfter
+      && !parentAfter.recording_revoked_at
+      && !parentAfter.recording_deleted_at
+      && parentAfter.recording_quarantined !== true) return 'ready';
+  }
+  return 'fallback_required';
 }
 
 /**
@@ -491,10 +778,13 @@ export async function finalizeWorkerInbandRecording(
   // its object key is owned by the bound attempt, never guessed.
   const { data: session, error } = await db
     .from('call_sessions')
-    .select('recording_egress_id, recording_object_key, recording_provenance, recording_egress_status')
+    .select('recording_egress_id, recording_object_key, recording_provenance, recording_egress_status, recording_revoked_at, recording_quarantined, recording_deleted_at')
     .eq('id', sessionId)
     .single();
   if (error || !session) throw new Error('recording session not found');
+  if (session.recording_revoked_at || session.recording_deleted_at || session.recording_quarantined === true) {
+    return 'fallback_required';
+  }
   if (session.recording_object_key) return 'ready';
   if (!session.recording_egress_id) return 'fallback_required';
   // Latched failed — the worker reported the upload permanently lost (or the
@@ -505,8 +795,8 @@ export async function finalizeWorkerInbandRecording(
 
   const { data: attempt, error: attemptError } = await db
     .from('phone_call_attempts')
-    .select('recording_object_key, recording_manifest_key')
-    .eq('session_id', sessionId)
+    .select('id,recording_object_key, recording_manifest_key')
+    .or(`session_id.eq.${sessionId},recording_session_id.eq.${sessionId}`)
     .eq('egress_id', egressId)
     .not('recording_object_key', 'is', null)
     .order('created_at', { ascending: false })
@@ -627,33 +917,87 @@ export async function markWorkerRecordingFailed(
   const db = deps.db ?? supabase;
   const { data: session, error } = await db
     .from('call_sessions')
-    .select('recording_egress_id, recording_object_key')
+    .select('recording_egress_id, recording_object_key, recording_revoked_at, recording_quarantined, recording_deleted_at, recording_egress_status')
     .eq('id', sessionId)
     .single();
   if (error || !session) return 'session_not_found';
-  if (session.recording_object_key) return 'already_linked';
-  const egressId = session.recording_egress_id ? String(session.recording_egress_id) : '';
-  if (!isWorkerInbandEgressId(egressId)) return 'not_worker_inband';
-  // The synthetic egress id embeds the attempt that owns the CURRENT recording
-  // binding (workerRecordingEgressId). A stale attempt's late failure report
-  // must not latch a session a newer attempt has re-prepared — its upload may
-  // be converging right now (review find, 2026-09-03).
-  if (egressId !== `${WORKER_INBAND_EGRESS_ID_PREFIX}${attemptId}`) return 'attempt_mismatch';
-  const { data: latched, error: latchError } = await db.from('call_sessions')
-    .update({
-      recording_egress_status: 'failed',
-      // Bounded 0038 CHECK vocabulary: the worker (this pipeline's provider)
-      // reported the loss. The worker's finer-grained reason code is logged at
-      // the route, not persisted — the CHECK'd column stays closed.
-      recording_finalize_defer_reason: 'provider_error',
-    })
-    .eq('id', sessionId)
-    .is('recording_object_key', null)
+  // A parent lifecycle terminal state is inherited by every attempt. Do this
+  // before either CAS so a late worker report cannot resurrect evidence.
+  if (session.recording_revoked_at || session.recording_quarantined === true || session.recording_deleted_at) {
+    return 'already_linked';
+  }
+
+  // The attempt is the authority for this report. `recording_session_id` is
+  // the 0107 evidence-only binding; `session_id` is accepted only for legacy
+  // consenting attempts that predate that column. Never use the worker's
+  // supplied session id to create this binding.
+  const { data: attempt, error: attemptError } = await db
+    .from('phone_call_attempts')
+    .select('session_id,recording_session_id,egress_id,egress_status,recording_ready,recording_quarantined,recording_deleted_at')
+    .eq('id', attemptId)
+    .maybeSingle();
+  if (attemptError || !attempt) return 'not_worker_inband';
+  const boundSessionId = attempt.recording_session_id ?? attempt.session_id;
+  if (boundSessionId !== sessionId) return 'attempt_mismatch';
+  const attemptEgressId = typeof attempt.egress_id === 'string' ? attempt.egress_id : '';
+  if (attemptEgressId !== `${WORKER_INBAND_EGRESS_ID_PREFIX}${attemptId}`) return 'not_worker_inband';
+  if (attempt.recording_ready === true || attempt.recording_quarantined === true || attempt.recording_deleted_at) {
+    return 'already_linked';
+  }
+
+  // Latch the requested attempt independently. In particular, a supplementary
+  // attempt must not be hidden by a verified primary already on the parent.
+  const { data: latchedAttempt, error: latchAttemptError } = await db.from('phone_call_attempts')
+    .update({ egress_status: 'failed', recording_ready: false })
+    .eq('id', attemptId)
+    .eq('egress_id', attemptEgressId)
+    .is('recording_ready', false)
+    .is('recording_quarantined', false)
+    .is('recording_deleted_at', null)
+    .not('egress_status', 'in', '(complete,failed)')
     .select('id');
-  // The worker's report is one-shot (its recorder dies with the process), so a
-  // false success here would silently recreate the retry-to-exhaustion defect.
-  if (latchError) return 'latch_failed';
-  if (!latched || latched.length === 0) return 'already_linked';
+  if (latchAttemptError) return 'latch_failed';
+  if (!latchedAttempt || latchedAttempt.length === 0) {
+    // CAS=0 is not proof of success. Only report an already-latched/terminal
+    // state after a readback; an unknown race stays a hard failure.
+    const { data: current, error: currentError } = await db
+      .from('phone_call_attempts')
+      .select('egress_status,recording_ready,recording_quarantined,recording_deleted_at')
+      .eq('id', attemptId)
+      .maybeSingle();
+    if (!currentError && current && (current.recording_ready === true
+      || current.recording_quarantined === true
+      || current.recording_deleted_at
+      || current.egress_status === 'failed')) return 'already_linked';
+    return 'latch_failed';
+  }
+
+  // Only the attempt which owns the current, still-unstamped worker primary
+  // may transition the reusable session. Existing audio, another attempt's
+  // primary, and gate-death's null session slot all remain untouched.
+  if (session.recording_egress_id === attemptEgressId
+      && !session.recording_object_key
+      && !['complete', 'ready', 'failed'].includes(String(session.recording_egress_status ?? ''))) {
+    const { data: latchedSession, error: latchSessionError } = await db.from('call_sessions')
+      .update({
+        recording_egress_status: 'failed',
+        // Bounded 0038 CHECK vocabulary; the detailed worker reason is audit-only.
+        recording_finalize_defer_reason: 'provider_error',
+      })
+      .eq('id', sessionId)
+      .eq('recording_egress_id', attemptEgressId)
+      .is('recording_object_key', null)
+      .is('recording_revoked_at', null)
+      .is('recording_deleted_at', null)
+      .eq('recording_quarantined', false)
+      .select('id');
+    if (latchSessionError) return 'latch_failed';
+    if (!latchedSession || latchedSession.length === 0) {
+      // The attempt is truthfully failed, but the parent mutation did not
+      // prove its CAS. Do not claim a both-rows latch under an unknown race.
+      return 'latch_failed';
+    }
+  }
   return 'failed_latched';
 }
 
@@ -665,10 +1009,13 @@ export async function finalizeAuthoritativeRecording(
   const db = deps.db ?? supabase;
   const { data: session, error } = await db
     .from('call_sessions')
-    .select('recording_object_key, recording_provenance, recording_egress_id, recording_egress_status, mode')
+    .select('recording_object_key, recording_provenance, recording_egress_id, recording_egress_status, recording_revoked_at, recording_quarantined, recording_deleted_at, mode')
     .eq('id', sessionId)
     .single();
   if (error || !session) throw new Error('recording session not found');
+  if (session.recording_revoked_at || session.recording_deleted_at || session.recording_quarantined === true) {
+    return 'fallback_required';
+  }
   // ── PR A: the WORKER-INBAND branch ──────────────────────────────────
   // A session whose egress id was minted by the in-worker recorder (0051
   // stamp with the synthetic `EG_worker_` id) has NO LiveKit egress to stop or
@@ -710,6 +1057,7 @@ export async function finalizeAuthoritativeRecording(
   const egressId = String(session.recording_egress_id);
   let objectKey = egressObjectKey(sessionId);
   let manifestKey: string | null = null;
+  let phoneAttemptId: string | null = null;
   let contentType = 'audio/ogg';
 
   // Phone egress writes an attempt-scoped MP3. The session row stores the
@@ -719,7 +1067,7 @@ export async function finalizeAuthoritativeRecording(
   if (session.mode === 'live') {
     const { data: attempt, error: attemptError } = await db
       .from('phone_call_attempts')
-      .select('recording_object_key, recording_manifest_key')
+      .select('id,recording_object_key, recording_manifest_key')
       .eq('session_id', sessionId)
       .eq('egress_id', egressId)
       .not('recording_object_key', 'is', null)
@@ -728,6 +1076,7 @@ export async function finalizeAuthoritativeRecording(
       .maybeSingle();
     if (attemptError) throw new Error('phone recording binding read failed');
     if (!attempt?.recording_object_key) return defer('object_absent');
+    phoneAttemptId = typeof attempt.id === 'string' ? attempt.id : null;
     objectKey = String(attempt.recording_object_key);
     manifestKey = typeof attempt.recording_manifest_key === 'string'
       ? attempt.recording_manifest_key
@@ -796,18 +1145,19 @@ export async function finalizeAuthoritativeRecording(
     const endedMs = typeof manifestInfo.endedAt === 'bigint' && manifestInfo.endedAt > 0n
       ? Number(manifestInfo.endedAt / 1_000_000n)
       : null;
-    const manifest = Buffer.from(JSON.stringify({
-      schema_version: 1,
-      object_key: objectKey,
-      content_type: contentType,
+    const manifestExpectation: RecordingManifestExpectation = {
+      objectKey,
+      contentType: contentType as 'audio/ogg' | 'audio/mpeg',
       sha256,
-      size_bytes: bytes.length,
-      provider_duration_ms: Number.isSafeInteger(durationMs) ? durationMs : null,
-      egress_id: egressId,
-      finalized_at: Number.isSafeInteger(endedMs)
+      sizeBytes: bytes.length,
+      egressId,
+    };
+    const manifest = canonicalRecordingManifest(manifestExpectation, {
+      providerDurationMs: Number.isSafeInteger(durationMs) ? durationMs : null,
+      finalizedAt: Number.isSafeInteger(endedMs)
         ? new Date(endedMs as number).toISOString()
         : null,
-    }));
+    });
     const bucket = db.storage.from(env.recordingsBucket);
     const uploaded = await bucket.upload(manifestKey, manifest, {
       contentType: 'application/json',
@@ -817,7 +1167,7 @@ export async function finalizeAuthoritativeRecording(
       const existing = await bucket.download(manifestKey);
       if (existing.error || !existing.data) return defer('manifest_unwritable');
       const existingBytes = Buffer.from(await existing.data.arrayBuffer());
-      if (!existingBytes.equals(manifest)) return defer('manifest_unwritable');
+      if (!recordingManifestMatches(existingBytes, manifestExpectation)) return defer('manifest_unwritable');
     }
   }
 
@@ -841,7 +1191,12 @@ export async function finalizeAuthoritativeRecording(
   });
   if (rpcError) throw new Error('recording egress finalization failed');
   const rpcStatus = (rpcData as { status?: string } | null)?.status;
-  if (rpcStatus === 'already_authoritative') return 'ready';
+  if (rpcStatus === 'already_authoritative') {
+    if (session.mode === 'live' && phoneAttemptId !== null && manifestKey !== null) {
+      await persistPhoneAttemptEvidence(db, phoneAttemptId, sessionId, objectKey, manifestKey, sha256, bytes.length, contentType as 'audio/ogg' | 'audio/mpeg');
+    }
+    return 'ready';
+  }
   if (rpcStatus === 'provenance_conflict') {
     // Row has provenance that cannot be upgraded to livekit_egress.
     // If a key exists, it stays as-is (ready); otherwise pending.
@@ -850,7 +1205,12 @@ export async function finalizeAuthoritativeRecording(
       .select('recording_object_key')
       .eq('id', sessionId)
       .single();
-    if (current?.recording_object_key) return 'ready';
+    if (current?.recording_object_key) {
+      if (session.mode === 'live' && phoneAttemptId !== null && manifestKey !== null) {
+        await persistPhoneAttemptEvidence(db, phoneAttemptId, sessionId, objectKey, manifestKey, sha256, bytes.length, contentType as 'audio/ogg' | 'audio/mpeg');
+      }
+      return 'ready';
+    }
     return defer('provenance_conflict');
   }
   if (rpcStatus !== 'ok') {
@@ -884,5 +1244,8 @@ export async function finalizeAuthoritativeRecording(
     recording_finalize_defer_reason: null,
     recording_finalize_exhausted_at: null,
   }).eq('id', sessionId);
+  if (session.mode === 'live' && phoneAttemptId !== null && manifestKey !== null) {
+    await persistPhoneAttemptEvidence(db, phoneAttemptId, sessionId, objectKey, manifestKey, sha256, bytes.length, contentType as 'audio/ogg' | 'audio/mpeg');
+  }
   return 'ready';
 }

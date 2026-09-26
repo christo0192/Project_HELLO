@@ -29,7 +29,7 @@ import { supabase } from '../lib/supabase.js';
 import { env } from '../lib/env.js';
 import { validateBody, validateParams } from '../lib/validation.js';
 import { authErrorBody } from '../lib/auth.js';
-import { recordingDownloadParamSchema, recordingRevokeParamSchema, recordingRevokeBodySchema } from '../schemas/recordings.js';
+import { recordingDownloadParamSchema, recordingAttemptDownloadParamSchema, recordingRevokeParamSchema, recordingRevokeBodySchema } from '../schemas/recordings.js';
 import { recordAudit, auditAccessDenied } from '../lib/audit.js';
 import { requireRole } from '../lib/rbac.js';
 import { revokeRecording } from '../lib/retention.js';
@@ -40,7 +40,12 @@ import {
   RECORDING_INTEGRITY_SHA256_HEX_LENGTH,
 } from '../lib/recording-integrity.js';
 import { getCorrelationId } from '../lib/correlation.js';
-import { finalizeAuthoritativeRecording } from '../lib/recording-egress.js';
+import {
+  finalizeAuthoritativeRecording,
+  finalizeWorkerInbandAttemptRecording,
+  recordingManifestMatches,
+  verifiedPhoneContentType,
+} from '../lib/recording-egress.js';
 import { readRecordingHealth } from '../lib/recording/health.js';
 
 // ── LANE L6 (REC-01 buildable half) — pinned constants ──────────────
@@ -104,6 +109,71 @@ async function reverifyRecordingIntegrity(
 
 export const recordingsRouter = Router();
 
+/** Re-verify an attempt object before minting. A ready flag is necessary but
+ * not sufficient: the object is read back and compared to the server digest
+ * on every explicit download request. */
+async function reverifyAttemptIntegrity(attempt: {
+  recording_object_key: string;
+  recording_sha256: string | null;
+  recording_size_bytes: number | null;
+  recording_manifest_key: string;
+  recording_content_type: 'audio/ogg' | 'audio/mpeg';
+  egress_id: string | null;
+}): Promise<'ok' | 'storage_unavailable' | 'integrity_failed' | 'oversize'> {
+  const verified = await verifyRecordingBytes(
+    {
+      objectKey: attempt.recording_object_key,
+      expectedSha256: attempt.recording_sha256,
+      knownSizeBytes: attempt.recording_size_bytes,
+      maxBytes: env.recordingMaxBytes,
+    },
+    supabaseRecordingBytesStorage(env.recordingsBucket),
+  );
+  if (verified.ok) {
+    const { data: object, error: objectError } = await supabase.storage
+      .from(env.recordingsBucket)
+      .download(attempt.recording_object_key);
+    if (objectError || !object) return 'storage_unavailable';
+    try {
+      const objectBytes = Buffer.isBuffer(object)
+        ? object
+        : object instanceof ArrayBuffer
+          ? Buffer.from(object)
+          : Buffer.from(await object.arrayBuffer());
+      if (objectBytes.length === 0 || objectBytes.length > env.recordingMaxBytes
+        || verifiedPhoneContentType(objectBytes) !== attempt.recording_content_type) {
+        return 'integrity_failed';
+      }
+    } catch {
+      return 'integrity_failed';
+    }
+    const { data: manifest, error: manifestError } = await supabase.storage
+      .from(env.recordingsBucket)
+      .download(attempt.recording_manifest_key);
+    if (manifestError || !manifest) return 'storage_unavailable';
+    try {
+      const manifestBytes = Buffer.isBuffer(manifest)
+        ? manifest
+        : manifest instanceof ArrayBuffer
+          ? Buffer.from(manifest)
+          : Buffer.from(await manifest.arrayBuffer());
+      if (!recordingManifestMatches(manifestBytes, {
+        objectKey: attempt.recording_object_key,
+        contentType: attempt.recording_content_type,
+        sha256: attempt.recording_sha256 ?? '',
+        sizeBytes: attempt.recording_size_bytes ?? 0,
+        egressId: attempt.egress_id,
+      })) return 'integrity_failed';
+    } catch {
+      return 'integrity_failed';
+    }
+    return 'ok';
+  }
+  if (verified.reason === 'storage_download_failed') return 'storage_unavailable';
+  if (verified.reason === 'object_too_large') return 'oversize';
+  return 'integrity_failed';
+}
+
 // ── GET /api/recordings/health ───────────────────────────────────────
 // 0038: the operator surface for authoritative-recording convergence.
 //
@@ -129,6 +199,156 @@ recordingsRouter.get('/health', requireRole('admin'), async (_req, res, next) =>
     next(error);
   }
 });
+
+// ── GET /api/recordings/attempts/:attemptId/download ─────────────────
+// Attempt audio follows the session route's authorization exactly: active
+// admin/viewer may read any session; an interviewer must own the associated
+// call_session. Phone candidate ownership is intentionally NOT substituted —
+// phone sessions are commonly ownerless, and silently granting that access
+// would broaden the existing recording policy.
+recordingsRouter.get(
+  '/attempts/:attemptId/download',
+  validateParams(recordingAttemptDownloadParamSchema),
+  async (req, res, next) => {
+    try {
+      const user = req.authUser;
+      if (!user || !user.active) return res.status(403).json(authErrorBody(403));
+      const attemptId = req.params.attemptId;
+      const privileged = user.appRole === 'admin' || user.appRole === 'viewer';
+
+      const attemptResult = await supabase
+        .from('phone_call_attempts')
+        .select('id,session_id,recording_session_id,recording_object_key,recording_manifest_key,recording_sha256,recording_size_bytes,recording_content_type,recording_ready,recording_quarantined,recording_deleted_at,egress_id,egress_status')
+        .eq('id', attemptId)
+        .maybeSingle();
+      let attempt = attemptResult.data;
+      const attemptError = attemptResult.error;
+
+      // A non-privileged caller gets the same answer for missing and
+      // non-owned attempts, preventing existence probing.
+      if (attemptError || !attempt) {
+        if (!privileged) {
+          await auditAccessDenied(req, 'recording_access_denied').catch(() => {});
+          return res.status(403).json(authErrorBody(403));
+        }
+        return res.status(404).json({ error: { type: 'not_found', message: 'Recording not found' } });
+      }
+
+      const parentSessionId = attempt.session_id ?? attempt.recording_session_id;
+      if (!parentSessionId) {
+        if (!privileged) {
+          await auditAccessDenied(req, 'recording_access_denied').catch(() => {});
+          return res.status(403).json(authErrorBody(403));
+        }
+        return res.status(404).json({ error: { type: 'not_found', message: 'Recording not found' } });
+      }
+
+      const { data: session, error: sessionError } = await supabase
+        .from('call_sessions')
+        .select('owner_id,recording_quarantined,recording_revoked_at,recording_deleted_at')
+        .eq('id', parentSessionId)
+        .maybeSingle();
+      const ownsSession = user.appRole === 'interviewer'
+        && !!session?.owner_id
+        && session.owner_id === user.id;
+      if (!privileged && !ownsSession) {
+        await auditAccessDenied(req, 'recording_access_denied').catch(() => {});
+        return res.status(403).json(authErrorBody(403));
+      }
+      if (sessionError || !session) {
+        return res.status(404).json({ error: { type: 'not_found', message: 'Recording not found' } });
+      }
+
+      // Parent lifecycle gates are inherited. There is deliberately no new
+      // attempt-revocation UI in this scope.
+      if (session.recording_deleted_at) {
+        return res.status(404).json({ error: { type: 'not_found', message: 'Recording not found' } });
+      }
+      if (session.recording_quarantined === true || attempt.recording_quarantined === true) {
+        return res.status(409).json({
+          error: { type: 'recording_quarantined', message: 'Recording is quarantined' },
+        });
+      }
+      if (session.recording_revoked_at || attempt.recording_deleted_at) {
+        return res.status(403).json(authErrorBody(403));
+      }
+      if (!attempt.recording_ready || !attempt.recording_object_key
+          || !attempt.recording_manifest_key || !attempt.recording_sha256 || !attempt.recording_size_bytes
+          || !attempt.recording_content_type) {
+        // A gate-death worker clip has no session recording slot, so the
+        // session finalizer queue cannot retry it. An authenticated explicit
+        // download click is the bounded recovery path: it re-runs the same
+        // byte/magic/manifest verifier, never mints a URL on pending/failure,
+        // and then re-reads the row before continuing.
+        if (attempt.recording_object_key && attempt.recording_session_id
+            && typeof attempt.egress_id === 'string'
+            && attempt.egress_id.startsWith('EG_worker_')
+            && attempt.egress_status !== 'failed') {
+          const recovery = await finalizeWorkerInbandAttemptRecording(attemptId, {}, attempt.recording_session_id);
+          if (recovery === 'ready') {
+            const reread = await supabase
+              .from('phone_call_attempts')
+              .select('id,session_id,recording_session_id,recording_object_key,recording_manifest_key,recording_sha256,recording_size_bytes,recording_content_type,recording_ready,recording_quarantined,recording_deleted_at,egress_id,egress_status')
+              .eq('id', attemptId)
+              .maybeSingle();
+            if (reread.error || !reread.data) {
+              return res.status(500).json({ error: { type: 'internal_error', message: 'Failed to refresh recording integrity' } });
+            }
+            attempt = reread.data;
+          }
+        }
+        if (attempt.egress_status === 'failed') {
+          return res.status(404).json({ error: { type: 'not_found', message: 'Recording not found' } });
+        }
+      }
+      if (!attempt.recording_ready || !attempt.recording_object_key
+          || !attempt.recording_manifest_key || !attempt.recording_sha256 || !attempt.recording_size_bytes
+          || !attempt.recording_content_type) {
+        return attempt.recording_object_key
+          ? res.status(409).json({ error: { type: 'recording_processing', message: 'Recording is still processing. Try again shortly.' } })
+          : res.status(404).json({ error: { type: 'not_found', message: 'Recording not found' } });
+      }
+
+      const integrity = await reverifyAttemptIntegrity(attempt);
+      if (integrity === 'storage_unavailable') {
+        return res.status(500).json({ error: { type: 'internal_error', message: 'Failed to verify recording integrity' } });
+      }
+      if (integrity !== 'ok') {
+        const { error: quarantineError } = await supabase
+          .from('phone_call_attempts')
+          .update({ recording_quarantined: true })
+          .eq('id', attemptId)
+          .eq('recording_quarantined', false);
+        if (quarantineError) {
+          return res.status(500).json({ error: { type: 'internal_error', message: 'Failed to verify recording integrity' } });
+        }
+        await recordAudit(req, 'recording.quarantined', 409, {
+          metadata: { attempt_id: attemptId, reason: integrity === 'oversize' ? 'download_reverify_oversize' : 'download_reverify_mismatch' },
+        }).catch(() => {});
+        return res.status(409).json({
+          error: { type: 'recording_quarantined', message: 'Recording integrity verification failed' },
+        });
+      }
+
+      const extension = attempt.recording_content_type === 'audio/ogg' ? '.ogg' : '.mp3';
+      const ttlSec = env.recordingDownloadTtlSec;
+      const { data: signedData, error: signError } = await supabase.storage
+        .from(env.recordingsBucket)
+        .createSignedUrl(attempt.recording_object_key, ttlSec, {
+          download: `recording-attempt-${attemptId}${extension}`,
+        });
+      if (signError || !signedData?.signedUrl) {
+        return res.status(500).json({ error: { type: 'internal_error', message: 'Failed to generate download URL' } });
+      }
+      await recordAudit(req, 'recording.download', 200, {
+        metadata: { attempt_id: attemptId, requested_by: user.id, role: user.appRole, ttl_sec: ttlSec },
+      }).catch(() => {});
+      return res.json({ url: signedData.signedUrl, content_type: attempt.recording_content_type });
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
 
 // ── GET /api/recordings/:sessionId/download ──────────────────────────
 // MIG-06: Recruiter on-demand recording download.

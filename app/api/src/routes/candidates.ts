@@ -10,6 +10,7 @@ import {
   phoneVerificationBodySchema,
   phoneCandidateAppointmentCreateSchema,
   phoneCandidateAppointmentPatchSchema,
+  candidatePhoneAttemptsQuerySchema,
 } from '../schemas/candidates.js';
 import { phoneAppointmentCancelSchema } from '../schemas/phone-api.js';
 import { idParamSchema, uuidSchema } from '../schemas/common.js';
@@ -35,6 +36,37 @@ function rpcStatus(data: unknown): string {
   return data && typeof data === 'object' && 'status' in data
     ? String((data as { status?: unknown }).status)
     : 'unknown_status';
+}
+
+const PHONE_ATTEMPT_HISTORY_MAX = 50;
+
+type AttemptHistoryCursor = { admitted_at: string; id: string };
+
+function encodeAttemptHistoryCursor(cursor: AttemptHistoryCursor): string {
+  return Buffer.from(JSON.stringify(cursor), 'utf8').toString('base64url');
+}
+
+function decodeAttemptHistoryCursor(value: string | undefined): AttemptHistoryCursor | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(value, 'base64url').toString('utf8')) as Partial<AttemptHistoryCursor>;
+    if (typeof parsed.admitted_at !== 'string') return null;
+    const admittedAt = new Date(parsed.admitted_at);
+    // Cursors are produced by this route. Requiring the canonical UTC form
+    // prevents Date.parse-accepted text from being interpolated into a
+    // PostgREST filter as raw syntax.
+    if (!Number.isFinite(admittedAt.getTime()) || admittedAt.toISOString() !== parsed.admitted_at) return null;
+    if (typeof parsed.id !== 'string' || !uuidSchema.safeParse(parsed.id).success) return null;
+    return { admitted_at: admittedAt.toISOString(), id: parsed.id };
+  } catch {
+    return null;
+  }
+}
+
+function attemptDurationSeconds(answeredAt: string | null, endedAt: string | null): number | null {
+  if (!answeredAt || !endedAt) return null;
+  const duration = (Date.parse(endedAt) - Date.parse(answeredAt)) / 1000;
+  return Number.isFinite(duration) && duration >= 0 ? duration : null;
 }
 
 export const candidatesRouter = Router();
@@ -324,6 +356,207 @@ candidatesRouter.post(
       res.status(202).json({ ok: true, status: status === 'already_requested' ? 'already_requested' : 'requested' });
     } catch {
       res.status(503).json({ ok: false, error: 'phone_request_unavailable' });
+    }
+  },
+);
+
+/**
+ * Candidate-scoped phone attempt history. This is a separate read boundary
+ * from the legacy candidate detail payload: explicit columns prevent lease,
+ * provider, phone and storage metadata from crossing into the UI.
+ */
+candidatesRouter.get(
+  '/:id/phone-attempts',
+  requireRole('viewer'),
+  validateParams(candidateIdParamSchema),
+  validateQuery(candidatePhoneAttemptsQuerySchema),
+  async (req, res) => {
+    const user = req.authUser;
+    const candidateId = req.params.id;
+    if (!user || !(await candidateVisibleToRecruiter(candidateId, user))) {
+      return res.status(404).json({ error: 'Candidate not found' });
+    }
+    const query = req.query as unknown as { limit: number; before?: string };
+    const limit = Math.min(Math.max(Number(query.limit) || 25, 1), PHONE_ATTEMPT_HISTORY_MAX);
+    const cursor = decodeAttemptHistoryCursor(query.before);
+    if (query.before && !cursor) {
+      return res.status(400).json({ error: 'Invalid attempt history cursor' });
+    }
+
+    try {
+      // Fetch engagement ids in stable pages. A candidate can have more than
+      // the PostgREST default page size after rescreen cycles; truncating at
+      // 500 silently dropped older attempt legs from the history.
+      const engagementIds: string[] = [];
+      for (let offset = 0; ; offset += 500) {
+        const { data: engagements, error: engagementError } = await supabase
+          .from('phone_engagements')
+          .select('id')
+          .eq('candidate_id', candidateId)
+          .order('id', { ascending: true })
+          .range(offset, offset + 499);
+        if (engagementError) return res.status(503).json({ error: 'Phone attempt history unavailable' });
+        const page = (engagements ?? [])
+          .map((row) => (row as { id?: unknown }).id)
+          .filter((id): id is string => typeof id === 'string');
+        engagementIds.push(...page);
+        if (page.length < 500) break;
+      }
+      if (engagementIds.length === 0) return res.json({ attempts: [], next_cursor: null });
+
+      let attemptQuery = supabase
+        .from('phone_call_attempts')
+        .select('id,attempt_seq,admitted_at,answered_at,ended_at,state,outcome_class,session_id,recording_session_id,recording_object_key,recording_sha256,recording_size_bytes,recording_content_type,recording_ready,recording_quarantined,recording_deleted_at,egress_status')
+        .in('engagement_id', engagementIds)
+        .order('admitted_at', { ascending: false })
+        .order('id', { ascending: false })
+        .limit(limit + 1);
+      if (cursor) {
+        attemptQuery = attemptQuery.or(
+          `admitted_at.lt.${cursor.admitted_at},and(admitted_at.eq.${cursor.admitted_at},id.lt.${cursor.id})`,
+        );
+      }
+      const { data: rows, error: attemptError } = await attemptQuery;
+      if (attemptError) return res.status(503).json({ error: 'Phone attempt history unavailable' });
+      const allRows = (rows ?? []) as Array<{
+        id: string;
+        attempt_seq: number;
+        admitted_at: string;
+        answered_at: string | null;
+        ended_at: string | null;
+        state: string;
+        outcome_class: string | null;
+        session_id: string | null;
+        recording_session_id: string | null;
+        recording_object_key: string | null;
+        recording_sha256: string | null;
+        recording_size_bytes: number | null;
+        recording_content_type: string | null;
+        recording_ready: boolean;
+        recording_quarantined: boolean;
+        recording_deleted_at: string | null;
+        egress_status: string | null;
+      }>;
+      const hasNext = allRows.length > limit;
+      const shown = hasNext ? allRows.slice(0, limit) : allRows;
+      const sessionIds = [...new Set(shown.map((row) => row.session_id ?? row.recording_session_id).filter((id): id is string => !!id))];
+      const sessionLifecycle = new Map<string, {
+        ownerId: string | null;
+        revokedAt: string | null;
+        quarantined: boolean;
+        deletedAt: string | null;
+      }>();
+      if (sessionIds.length > 0) {
+        const { data: sessionRows, error: sessionError } = await supabase
+          .from('call_sessions')
+          .select('id,owner_id,recording_revoked_at,recording_quarantined,recording_deleted_at')
+          .in('id', sessionIds)
+          .limit(sessionIds.length);
+        if (sessionError) return res.status(503).json({ error: 'Phone attempt history unavailable' });
+        for (const session of sessionRows ?? []) {
+          const row = session as {
+            id?: unknown;
+            owner_id?: unknown;
+            recording_revoked_at?: unknown;
+            recording_quarantined?: unknown;
+            recording_deleted_at?: unknown;
+          };
+          if (typeof row.id === 'string') {
+            sessionLifecycle.set(row.id, {
+              ownerId: typeof row.owner_id === 'string' ? row.owner_id : null,
+              revokedAt: typeof row.recording_revoked_at === 'string' ? row.recording_revoked_at : null,
+              quarantined: row.recording_quarantined === true,
+              deletedAt: typeof row.recording_deleted_at === 'string' ? row.recording_deleted_at : null,
+            });
+          }
+        }
+      }
+
+      // The existing transcript route is deliberately admin-only. Only admins
+      // receive a link that the current route can actually open; other roles
+      // still get the complete attempt history without a false link.
+      const transcriptKind = new Map<string, 'none' | 'gate_only' | 'session'>();
+      if (user.appRole === 'admin' && sessionIds.length > 0) {
+        const sawTurn = new Set<string>();
+        const sawInterviewTurn = new Set<string>();
+        // The classification only needs one row of each kind. Per-session
+        // bounded probes avoid a 1,000-row cap misclassifying a long session
+        // when its interview turns occur after its gate turns.
+        const transcriptProbes = await Promise.all(sessionIds.map(async (sessionId) => {
+          const [anyTurns, interviewTurns] = await Promise.all([
+            supabase.from('transcript_turns').select('session_id').eq('session_id', sessionId).limit(1),
+            supabase.from('transcript_turns').select('session_id').eq('session_id', sessionId).eq('is_gate', false).limit(1),
+          ]);
+          return { sessionId, anyTurns, interviewTurns };
+        }));
+        for (const probe of transcriptProbes) {
+          if (probe.anyTurns.error || probe.interviewTurns.error) {
+            return res.status(503).json({ error: 'Phone attempt history unavailable' });
+          }
+          if ((probe.anyTurns.data ?? []).length > 0) sawTurn.add(probe.sessionId);
+          if ((probe.interviewTurns.data ?? []).length > 0) sawInterviewTurn.add(probe.sessionId);
+        }
+        for (const sessionId of sessionIds) {
+          transcriptKind.set(
+            sessionId,
+            !sawTurn.has(sessionId) ? 'none' : sawInterviewTurn.has(sessionId) ? 'session' : 'gate_only',
+          );
+        }
+      }
+
+      return res.json({
+        attempts: shown.map((row) => {
+          const evidenceSessionId = row.session_id ?? row.recording_session_id;
+          const kind = evidenceSessionId ? (transcriptKind.get(evidenceSessionId) ?? 'none') : 'none';
+          const parent = evidenceSessionId ? sessionLifecycle.get(evidenceSessionId) : undefined;
+          const interviewerCanReadSession = user.appRole !== 'interviewer'
+            || (parent !== undefined && parent.ownerId === user.id);
+          const parentLifecycleBlocked = parent === undefined
+            || Boolean(parent.revokedAt || parent.deletedAt || parent.quarantined);
+          const recordingState = !interviewerCanReadSession || parentLifecycleBlocked || row.recording_quarantined || row.recording_deleted_at || row.egress_status === 'failed'
+            ? 'unavailable'
+            : row.recording_ready && row.recording_object_key && row.recording_sha256
+                && row.recording_size_bytes && row.recording_content_type
+              ? 'ready'
+              : row.recording_object_key
+                ? 'processing'
+                : 'unavailable';
+          return {
+            id: row.id,
+            attempt_seq: row.attempt_seq,
+            admitted_at: row.admitted_at,
+            answered_at: row.answered_at,
+            ended_at: row.ended_at,
+            state: row.state,
+            outcome_class: row.outcome_class,
+            duration_sec: attemptDurationSeconds(row.answered_at, row.ended_at),
+            recording: {
+              state: recordingState,
+              reason: !interviewerCanReadSession
+                ? 'access_unavailable'
+                : row.egress_status === 'failed'
+                  ? 'recording_failed'
+                  : recordingState === 'unavailable' ? 'no_recording' : undefined,
+            },
+            transcript: user.appRole === 'admin' && evidenceSessionId && kind !== 'none'
+              ? {
+                  href: `/sessions/${evidenceSessionId}`,
+                  scope: 'session',
+                  kind: kind === 'gate_only' ? 'gate_only' : 'session',
+                  // This link is to the reusable SESSION transcript, never an
+                  // exact attempt transcript. The warning stays true even if
+                  // pagination happens to show only one leg for this session.
+                  shared_session: true,
+                }
+              : null,
+          };
+        }),
+        next_cursor: hasNext
+          ? encodeAttemptHistoryCursor({ admitted_at: shown[shown.length - 1].admitted_at, id: shown[shown.length - 1].id })
+          : null,
+      });
+    } catch {
+      return res.status(503).json({ error: 'Phone attempt history unavailable' });
     }
   },
 );

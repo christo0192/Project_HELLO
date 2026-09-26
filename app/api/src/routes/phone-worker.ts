@@ -84,6 +84,7 @@ import {
 } from '../integrations/livekit-phone-dial/worker-recording.js';
 import {
   finalizeAuthoritativeRecording,
+  finalizeWorkerInbandAttemptRecording,
   markWorkerRecordingFailed,
 } from '../lib/recording-egress.js';
 import { purgePhoneEngagementRecordings } from '../integrations/livekit-phone-dial/recording-purge.js';
@@ -474,7 +475,9 @@ const recordingCompleteSchema = z
 const recordingFailedSchema = z
   .object({
     attempt_id: z.string().regex(UUID_RE),
-    session_id: z.string().regex(UUID_RE),
+    // Gate-death attempts intentionally have no consent session_id. The
+    // server resolves their evidence-only recording_session_id below.
+    session_id: z.string().regex(UUID_RE).optional(),
     reason: z.string().regex(/^[a-z0-9_]{1,64}$/),
   })
   .strict();
@@ -491,6 +494,10 @@ export interface PhoneWorkerRouterDeps {
     /** Needed only to derive the room name when a recording is started. */
     sessionId?: string;
   } | null>;
+  /** Resolves the evidence parent for failure reports whose consent session is NULL. */
+  readonly resolveAttemptRecordingSession?: (attemptId: string) => Promise<string | null>;
+  /** Terminal stranger discard hook; only latches an unmaterialized gate artifact. */
+  readonly latchDiscardedRecording?: (attemptId: string) => Promise<void>;
   /**
    * Server-side association check for the worker's SESSION HINT (independent
    * review of the recording ordering fix): a hint is only a room-derivation
@@ -533,6 +540,7 @@ export interface PhoneWorkerRouterDeps {
     roomName: string;
     /** For the 0051 session-level egress stamp (the read path is session-keyed). */
     sessionId: string;
+    engagementState?: string | null;
     now: Date;
   }) => Promise<{ status: string; egressStarted: boolean }>;
   /**
@@ -558,6 +566,8 @@ export interface PhoneWorkerRouterDeps {
    * its worker branch on the synthetic `EG_worker_` egress id.
    */
   readonly finalizeRecording?: (sessionId: string) => Promise<'ready' | 'fallback_required' | 'pending'>;
+  /** 0107: finalizes attempt evidence without requiring a session slot. */
+  readonly finalizeAttemptRecording?: (attemptId: string, sessionId: string) => Promise<'ready' | 'fallback_required' | 'pending'>;
   /**
    * PR A — latches a worker-inband recording the worker reported PERMANENTLY
    * lost (`recording_egress_status='failed'`), so the finalizer stops retrying
@@ -972,6 +982,15 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
           now(),
           parsed.data.session_id ?? undefined,
         );
+      }
+
+      // A terminal wrong-number event is durable before this hook. Retry the
+      // latch on idempotent event redelivery too; do not acknowledge a failed
+      // latch as successful, or leave a prepared artifact processing forever.
+      if (parsed.data.event_type === 'candidate.wrong_number'
+          && result.status === 'applied'
+          && deps.latchDiscardedRecording !== undefined) {
+        await deps.latchDiscardedRecording(parsed.data.attempt_id);
       }
 
       // ── `ok` MEANS APPLIED. `ignored` IS NOT `ok`. ──────────────────
@@ -1949,7 +1968,39 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         return res.status(400).json({ ok: false, status: 'invalid_request' });
       }
       const finalize = deps.finalizeRecording ?? finalizeAuthoritativeRecording;
-      const status = await finalize(parsed.data.session_id);
+      let status: 'ready' | 'fallback_required' | 'pending';
+      if (deps.finalizeAttemptRecording) {
+        // Gate-death attempts deliberately do not stamp the reusable session
+        // slot. Finalize their own object first; the old session finalizer is a
+        // compatibility pass for consented calls only.
+        status = await deps.finalizeAttemptRecording(parsed.data.attempt_id, parsed.data.session_id);
+        if (status === 'ready') {
+          let sessionStatus: 'ready' | 'fallback_required' | 'pending' = 'fallback_required';
+          try {
+            sessionStatus = await finalize(parsed.data.session_id);
+          } catch {
+            return res.status(500).json({
+              ok: false,
+              status: 'session_recording_finalize_error',
+              attempt_status: 'ready',
+            });
+          }
+          if (sessionStatus === 'pending') {
+            return res.status(503).json({
+              ok: false,
+              status: 'session_recording_pending',
+              attempt_status: 'ready',
+            });
+          }
+          // fallback_required is the truthful, expected result for a gate
+          // clip whose consent-time session slot was never stamped. A normal
+          // consenting flow must return `ready` here; the status is retained
+          // so callers/tests can distinguish those two paths.
+          return res.json({ ok: true, status: 'ready', session_status: sessionStatus });
+        }
+      } else {
+        status = await finalize(parsed.data.session_id);
+      }
       // `ready` = linked and servable; `pending` = a bounded deferral (transient
       // storage) the finalize convergence will retry; `fallback_required` =
       // latched (oversize / no egress). All are forwarded truthfully.
@@ -1980,7 +2031,24 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         return res.status(400).json({ ok: false, status: 'invalid_request' });
       }
       const latch = deps.markRecordingFailed ?? markWorkerRecordingFailed;
-      const status = await latch(parsed.data.session_id, parsed.data.attempt_id);
+      let sessionId: string | null | undefined = parsed.data.session_id;
+      if (sessionId === undefined) {
+        sessionId = deps.resolveAttemptRecordingSession
+          ? await deps.resolveAttemptRecordingSession(parsed.data.attempt_id)
+          : await (async () => {
+            const { data, error } = await supabase
+              .from('phone_call_attempts')
+              .select('session_id,recording_session_id')
+              .eq('id', parsed.data.attempt_id)
+              .maybeSingle();
+            if (error || !data) return null;
+            return (data.session_id ?? data.recording_session_id) as string | null;
+          })();
+        if (sessionId == null) {
+          return res.json({ ok: false, status: 'session_not_found' });
+        }
+      }
+      const status = await latch(sessionId as string, parsed.data.attempt_id);
       // The worker's bounded reason code is observability, not state — the
       // persisted defer reason stays inside the 0038 CHECK vocabulary.
       phoneWorkerLog.warn('unknown_event', {
@@ -2087,6 +2155,7 @@ async function startRecordingForAttempt(
       attemptId,
       roomName: phoneRoomName(sessionId),
       sessionId,
+      engagementState: resolved.engagementState,
       now,
     });
     // The dialer package is console-free by structural pin, so the stamp
@@ -2126,6 +2195,28 @@ async function startRecordingForAttempt(
  *     safe, because recording LESS than we promised harms nobody, while
  *     recording more than promised is the failure this phase exists to prevent.
  */
+// A bound key is minted by prepare before any audio is uploaded. Keep the
+// production discard admission injectable so the bound-but-empty path is
+// regression-tested independently from the route's optional seam.
+export async function latchDiscardedWorkerRecording(
+  attemptId: string,
+  db: typeof supabase = supabase,
+  markFailed: typeof markWorkerRecordingFailed = markWorkerRecordingFailed,
+): Promise<void> {
+  const { data, error } = await db
+    .from('phone_call_attempts')
+    .select('recording_session_id,recording_ready,recording_quarantined,recording_deleted_at')
+    .eq('id', attemptId)
+    .maybeSingle();
+  if (error || !data || data.recording_ready === true
+      || data.recording_quarantined === true || data.recording_deleted_at || !data.recording_session_id) return;
+  const status = await markFailed(data.recording_session_id, attemptId, { db });
+  if (status === 'latch_failed' || status === 'session_not_found'
+      || status === 'attempt_mismatch' || status === 'not_worker_inband') {
+    throw new Error('phone_discard_recording_latch_failed');
+  }
+}
+
 export const phoneWorkerRouter = createPhoneWorkerRouter({
   // Explicit production wiring enables durable post-call scoring. Test routers
   // that intentionally inject only the legacy scoring seam remain synchronous.
@@ -2173,6 +2264,10 @@ export const phoneWorkerRouter = createPhoneWorkerRouter({
       sessionId: context.sessionId ?? undefined,
     };
   },
+  async latchDiscardedRecording(attemptId) {
+    if (env.recordingProvider !== 'worker') return;
+    await latchDiscardedWorkerRecording(attemptId);
+  },
   async purgeRecordings(input) {
     return purgePhoneEngagementRecordings(
       { engagementId: input.engagementId, now: input.now },
@@ -2197,6 +2292,9 @@ export const phoneWorkerRouter = createPhoneWorkerRouter({
           egress: await createPhoneEgressClient(),
           buildOutput: createPhoneEgressOutput,
         })
+    : undefined,
+  finalizeAttemptRecording: env.recordingProvider === 'worker'
+    ? async (attemptId, sessionId) => finalizeWorkerInbandAttemptRecording(attemptId, {}, sessionId)
     : undefined,
   // PR A. The presigned-PUT signer is supplied ONLY on the worker provider with
   // a configured storage destination; otherwise `/recording/prepare` refuses

@@ -736,6 +736,32 @@ export interface CandidateDetail {
   assessments: Assessment[];
 }
 
+export type PhoneAttemptRecordingState = 'ready' | 'processing' | 'unavailable';
+export type PhoneAttemptTranscriptKind = 'gate_only' | 'session';
+
+export interface CandidatePhoneAttempt {
+  id: string;
+  attempt_seq: number;
+  admitted_at: string;
+  answered_at: string | null;
+  ended_at: string | null;
+  state: string;
+  outcome_class: string | null;
+  duration_sec: number | null;
+  recording: { state: PhoneAttemptRecordingState; reason?: 'access_unavailable' | 'no_recording' | 'recording_failed' };
+  transcript: {
+    href: string;
+    scope: 'session';
+    kind: PhoneAttemptTranscriptKind;
+    shared_session: boolean;
+  } | null;
+}
+
+export interface CandidatePhoneAttemptsResponse {
+  attempts: CandidatePhoneAttempt[];
+  next_cursor: string | null;
+}
+
 export interface StartScreeningResult {
   session_id: string;
   message: string;
@@ -801,6 +827,7 @@ export interface SessionDetail {
 export interface RecordingDownloadResponse {
   /** Short-lived signed URL for the recording. Must not be cached/stored. */
   url: string;
+  content_type?: string;
 }
 
 export interface HealthResult {

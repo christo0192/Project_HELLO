@@ -104,6 +104,20 @@ describe('SessionDetailPage', () => {
     ).toBeInTheDocument();
   });
 
+  it('labels an all-gate session as pre-interview evidence, not a broken screening transcript', async () => {
+    getSession.mockResolvedValue({
+      ...completedSessionDetail,
+      transcript: [
+        { speaker: 'bot', text: 'This call may be recorded.', is_gate: true },
+        { speaker: 'candidate', text: 'I understand.', is_gate: true },
+      ],
+    });
+    renderPage();
+    expect(await screen.findByText('Pre-interview gate transcript')).toBeInTheDocument();
+    expect(screen.getByText(/before the interview/i)).toBeInTheDocument();
+    expect(screen.getByText(/No screening interview was recorded/i)).toBeInTheDocument();
+  });
+
   it('renders the scorecard when an assessment exists', async () => {
     getSession.mockResolvedValue(completedSessionDetail);
     renderPage();

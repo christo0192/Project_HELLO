@@ -1149,6 +1149,60 @@ paths:
               schema:
                 $ref: '#/components/schemas/SimpleError'
 
+  /api/candidates/{id}/phone-attempts:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+      - name: limit
+        in: query
+        required: false
+        schema:
+          type: integer
+          minimum: 1
+          maximum: 50
+          default: 25
+      - name: before
+        in: query
+        required: false
+        description: Opaque keyset cursor returned by the previous page.
+        schema:
+          type: string
+          maxLength: 256
+    get:
+      tags: [candidates, phone]
+      operationId: listCandidatePhoneAttempts
+      summary: List bounded phone-attempt evidence for a visible candidate
+      description: Returns stable keyset-paginated attempt facts and sanitized recording/transcript availability. It never returns provider identifiers, lease fields, phone data, object keys, manifests, signed URLs or transcript text. Transcript links are session-scoped because reconnect legs reuse a session; the existing admin-only transcript authorization is unchanged. Interviewers see recording access unavailable when the associated session is ownerless or not theirs.
+      responses:
+        '200':
+          description: Bounded phone-attempt history.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CandidatePhoneAttemptsResponse'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '404':
+          description: Candidate not found or not visible to this recruiter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '503':
+          description: The bounded history read was unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
   /api/candidates/{id}/phone-appointments:
     parameters:
       - name: id
@@ -4267,6 +4321,57 @@ paths:
                 $ref: '#/components/schemas/ErrorBody'
         '500':
           description: Signing failure or integrity re-verification storage failure (redacted stable error; never mints a URL).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
+  /api/recordings/attempts/{attemptId}/download:
+    parameters:
+      - name: attemptId
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    get:
+      tags: [recordings]
+      operationId: downloadAttemptRecording
+      summary: Mint a short-TTL signed URL for a verified attempt recording
+      description: Mirrors session recording authorization exactly — active admin/viewer may read any session, while an interviewer must own the associated call_session. Missing and non-owned attempts are uniformly denied to non-privileged callers. The parent session's revocation, quarantine and deletion gates are inherited, and the attempt must have server-verified ready metadata. Stored bytes are re-read and compared with the persisted digest before minting; no URL is minted on storage, size or integrity failure.
+      responses:
+        '200':
+          description: Short-TTL signed URL, minted only after explicit request.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordingDownloadResponse'
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: Inactive, non-privileged, non-owning interviewer, revoked parent, or ownerless interviewer access.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '404':
+          description: Missing, deleted, or unbound attempt/session.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '409':
+          description: Attempt is processing or quarantined.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '500':
+          description: Redacted storage verification or signing failure; no URL is minted.
           content:
             application/json:
               schema:
@@ -8758,8 +8863,8 @@ components:
 
     PhoneRecordingFailedRequest:
       type: object
-      required: [attempt_id, session_id, reason]
-      description: The worker reports a PERMANENTLY lost in-worker recording. reason is a bounded lowercase code (recorder_close_failed, transcode_failed, upload_failed) used for observability only - the persisted defer reason stays inside the 0038 CHECK vocabulary.
+      required: [attempt_id, reason]
+      description: The worker reports a PERMANENTLY lost in-worker recording. Gate-death attempts may omit session_id; the server resolves their evidence-only recording session binding. reason is a bounded lowercase code (recorder_close_failed, transcode_failed, upload_failed) used for observability only - the persisted defer reason stays inside the 0038 CHECK vocabulary.
       properties:
         attempt_id:
           type: string
@@ -8767,6 +8872,7 @@ components:
         session_id:
           type: string
           format: uuid
+          description: Consent-bound session id. Omit for a gate-death attempt whose consent session_id is NULL.
         reason:
           type: string
           pattern: '^[a-z0-9_]{1,64}$'
@@ -9507,6 +9613,88 @@ components:
       properties:
         url:
           type: string
+        content_type:
+          type: string
+          enum: [audio/ogg, audio/mpeg]
+          nullable: true
+      additionalProperties: false
+
+    CandidatePhoneAttemptsResponse:
+      type: object
+      required: [attempts, next_cursor]
+      properties:
+        attempts:
+          type: array
+          items:
+            $ref: '#/components/schemas/CandidatePhoneAttempt'
+        next_cursor:
+          type: string
+          nullable: true
+      additionalProperties: false
+
+    CandidatePhoneAttempt:
+      type: object
+      required: [id, attempt_seq, admitted_at, answered_at, ended_at, state, outcome_class, duration_sec, recording, transcript]
+      properties:
+        id:
+          type: string
+          format: uuid
+        attempt_seq:
+          type: integer
+          minimum: 1
+        admitted_at:
+          type: string
+          format: date-time
+        answered_at:
+          type: string
+          format: date-time
+          nullable: true
+        ended_at:
+          type: string
+          format: date-time
+          nullable: true
+        state:
+          type: string
+        outcome_class:
+          type: string
+          nullable: true
+        duration_sec:
+          type: number
+          nullable: true
+        recording:
+          $ref: '#/components/schemas/CandidatePhoneAttemptRecording'
+        transcript:
+          allOf:
+            - $ref: '#/components/schemas/CandidatePhoneAttemptTranscript'
+          nullable: true
+      additionalProperties: false
+
+    CandidatePhoneAttemptRecording:
+      type: object
+      required: [state]
+      properties:
+        state:
+          type: string
+          enum: [ready, processing, unavailable]
+        reason:
+          type: string
+          enum: [access_unavailable, no_recording, recording_failed]
+      additionalProperties: false
+
+    CandidatePhoneAttemptTranscript:
+      type: object
+      required: [href, scope, kind, shared_session]
+      properties:
+        href:
+          type: string
+        scope:
+          type: string
+          const: session
+        kind:
+          type: string
+          enum: [gate_only, session]
+        shared_session:
+          type: boolean
       additionalProperties: false
 
     # REC-05 (F2): recording revocation request/response.

@@ -62,6 +62,7 @@ export function SessionDetailPage() {
 
   const { session, transcript, assessment } = detail;
   const completed = session.status === 'completed';
+  const gateOnlyTranscript = transcript.length > 0 && transcript.every((line) => line.is_gate === true);
 
   return (
     <div className="space-y-6">
@@ -89,9 +90,14 @@ export function SessionDetailPage() {
         {/* Transcript */}
         <GlassPanel className="lg:col-span-7">
           <SectionHeader
-            title="Transcript"
+            title={gateOnlyTranscript ? 'Pre-interview gate transcript' : 'Transcript'}
             description={`${transcript.length} speaker turn${transcript.length === 1 ? '' : 's'}`}
           />
+          {gateOnlyTranscript && (
+            <p className="mt-3 rounded-lg border border-line bg-surface-secondary px-3 py-2 text-sm leading-5 text-ink-secondary">
+              This is the identity and recording-consent exchange before the interview. No screening interview was recorded in this session.
+            </p>
+          )}
           {/* `TranscriptList` already exposes a region named "Transcript";
               this scroll region needs a distinct name (axe landmark-unique). */}
           <ScrollArea maxHeight="34rem" label="Session transcript" className="mt-3">

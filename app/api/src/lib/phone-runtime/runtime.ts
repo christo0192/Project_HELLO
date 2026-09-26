@@ -291,6 +291,7 @@ export function createPhoneSessionPort(
         role_id: input.roleId,
         mode: PHONE_SESSION_MODE,
         provider: 'livekit',
+        phone_engagement_id: input.engagementId,
       });
       if (created.error !== null || created.data === null) return null;
 

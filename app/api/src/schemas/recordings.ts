@@ -12,6 +12,15 @@ export const recordingDownloadParamSchema = z
 
 export type RecordingDownloadParams = z.infer<typeof recordingDownloadParamSchema>;
 
+/** Attempt-scoped download parameters. */
+export const recordingAttemptDownloadParamSchema = z
+  .object({
+    attemptId: z.string().uuid('attemptId must be a valid UUID'),
+  })
+  .strict();
+
+export type RecordingAttemptDownloadParams = z.infer<typeof recordingAttemptDownloadParamSchema>;
+
 /**
  * REC-03: browser recording upload path-parameter schema (L5).
  * Mirrors the download param contract: sessionId must be a UUID.

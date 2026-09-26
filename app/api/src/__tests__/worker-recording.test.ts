@@ -12,7 +12,7 @@
  * never observed are two different bugs.
  *
  * The happy path proves the reuse: the SAME store methods run in the SAME order
- * (`listEngagementRecordings` → `attachAttemptRecording`), the synthetic
+ * (`listEngagementRecordings` → evidence bind → `attachAttemptRecording`), the synthetic
  * `EG_worker_` egress id is recorded and stamped, and an upload URL comes back.
  */
 
@@ -59,6 +59,7 @@ interface Harness {
   attach: ReturnType<typeof vi.fn>;
   finalize: ReturnType<typeof vi.fn>;
   stamp: ReturnType<typeof vi.fn>;
+  bind: ReturnType<typeof vi.fn>;
   createUploadUrl: ReturnType<typeof vi.fn>;
 }
 
@@ -72,6 +73,10 @@ function harness(opts: {
   const list = vi.fn(async () => {
     order.push('list');
     return (opts.list ?? { status: 'ok', artifacts: [] }) as never;
+  });
+  const bind = vi.fn(async () => {
+    order.push('bind');
+    return { status: 'ok', bound: true } as never;
   });
   const attach = vi.fn(async () => {
     order.push('attach');
@@ -95,6 +100,7 @@ function harness(opts: {
 
   const stores = {
     listEngagementRecordings: list,
+    bindPhoneAttemptRecordingSession: bind,
     attachAttemptRecording: attach,
     finalizeAttemptRecording: finalize,
     stampSessionEgress: stamp,
@@ -106,6 +112,7 @@ function harness(opts: {
     attach,
     finalize,
     stamp,
+    bind,
     createUploadUrl,
   };
 }
@@ -156,7 +163,7 @@ describe('prepareWorkerRecording — the consent gate governs the upload URL', (
       now: NOW,
     });
     // The gate ran BEFORE the URL was minted.
-    expect(order).toEqual(['list', 'attach', 'finalize', 'stamp', 'sign']);
+    expect(order).toEqual(['list', 'bind', 'attach', 'finalize', 'stamp', 'sign']);
   });
 
   it('is supplementary when an authoritative artifact already exists', async () => {
@@ -203,15 +210,14 @@ describe('prepareWorkerRecording — the consent gate governs the upload URL', (
     expect(h.createUploadUrl).not.toHaveBeenCalled();
   });
 
-  it('a duplicate attach re-mints the URL without re-attaching', async () => {
+  it('a duplicate attach re-mints and stamps at consent without re-attaching', async () => {
     const h = harness({ attach: { status: 'ok', duplicate: true } });
     const result = await prepareWorkerRecording(INPUT, h.deps);
     expect(result.status).toBe('already_prepared');
     expect(result.boundForUpload).toBe(true);
     expect(result.uploadUrl).toBe('https://storage.invalid/put/phone-object?token=abc');
-    // A duplicate does NOT re-record the egress id or re-stamp the session.
-    expect(h.finalize).not.toHaveBeenCalled();
-    expect(h.stamp).not.toHaveBeenCalled();
+    expect(h.finalize).toHaveBeenCalledTimes(1);
+    expect(h.stamp).toHaveBeenCalledTimes(1);
     expect(h.createUploadUrl).toHaveBeenCalledTimes(1);
   });
 
@@ -264,6 +270,30 @@ describe('0105 — prepare before consent binds the attempt but leaves the SESSI
     const h = harness();
     const result = await prepareWorkerRecording({ ...INPUT, engagementState: 'in_call' }, h.deps);
     expect(result.status).toBe('prepared');
+    expect(h.stamp).toHaveBeenCalledTimes(1);
+  });
+
+  it('reuses its own authoritative role on consent retry even when another attempt is authoritative', async () => {
+    const h = harness({
+      list: {
+        status: 'ok',
+        artifacts: [
+          authoritativeArtifact(),
+          {
+            attemptId: ATTEMPT,
+            role: 'authoritative',
+            objectKey: phoneAttemptRecordingObjectKey(ATTEMPT),
+            manifestKey: phoneAttemptRecordingManifestKey(ATTEMPT),
+            egressId: workerRecordingEgressId(ATTEMPT),
+            egressStatus: 'active',
+          },
+        ],
+      },
+      attach: { status: 'ok', duplicate: true },
+    });
+    const result = await prepareWorkerRecording(INPUT, h.deps);
+    expect(result.status).toBe('already_prepared');
+    expect(h.attach.mock.calls[0][0].role).toBe('authoritative');
     expect(h.stamp).toHaveBeenCalledTimes(1);
   });
 });

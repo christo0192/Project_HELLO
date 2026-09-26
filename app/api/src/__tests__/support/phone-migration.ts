@@ -49,6 +49,12 @@ export const MIGRATION_0105_PATH = fileURLToPath(
 
 export const MIGRATION_0105 = readFileSync(MIGRATION_0105_PATH, 'utf8');
 
+export const MIGRATION_0107_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0107_phone_attempt_evidence.sql', import.meta.url),
+);
+
+export const MIGRATION_0107 = readFileSync(MIGRATION_0107_PATH, 'utf8');
+
 // 0104 declares defer_phone_dial_for_questions — the dial grace that lets
 // per-candidate question generation finish before the plan is snapshotted.
 // A brand-new function no earlier migration mentions, so its position is not
@@ -277,6 +283,8 @@ export const MIGRATION_0092 = readFileSync(MIGRATION_0092_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0107 — evidence-only pre-consent session binding.
+    { name: '0107', sql: MIGRATION_0107 },
     // 0105 — commit_phone_item_turn IN FULL, so it must precede 0071.
     { name: '0105', sql: MIGRATION_0105 },
     // 0104 — the dial grace (defer_phone_dial_for_questions). New function,
@@ -469,6 +477,8 @@ export const RPC_NAMES = [
   'clear_phone_attempt_recordings',
   // 0051 — the session-level egress stamp.
   'stamp_phone_session_egress',
+  // 0107 — evidence-only pre-consent session binding.
+  'bind_phone_attempt_recording_session',
   // 0044.
   'start_phone_assessment',
   'get_phone_assessment_state',

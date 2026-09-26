@@ -20,7 +20,7 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import express from 'express';
 import request from 'supertest';
-import { createPhoneWorkerRouter, WORKER_PHONE_EVENTS, PURGE_BEFORE_EVENTS } from '../routes/phone-worker.js';
+import { createPhoneWorkerRouter, latchDiscardedWorkerRecording, WORKER_PHONE_EVENTS, PURGE_BEFORE_EVENTS } from '../routes/phone-worker.js';
 import {
   PHONE_APPOINTMENT_MAX_SECONDS,
   PHONE_APPOINTMENT_MIN_SECONDS,
@@ -35,6 +35,29 @@ import {
 } from '../lib/phone-screening/index.js';
 
 const ATTEMPT = 'aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+
+it('production stranger discard latches a prepared key without uploaded bytes', async () => {
+  const mark = vi.fn(async () => 'failed_latched' as const);
+  let selected = '';
+  const db = {
+    from: () => ({
+      select: (columns: string) => {
+        selected = columns;
+        return { eq: () => ({ maybeSingle: async () => ({
+          data: { recording_session_id: SESSION, recording_object_key: 'prepared-but-empty',
+            recording_ready: false, recording_quarantined: false, recording_deleted_at: null },
+          error: null,
+        }) }) };
+      },
+    }),
+  } as never;
+  await latchDiscardedWorkerRecording(ATTEMPT, db, mark as never);
+  expect(selected).not.toContain('recording_object_key');
+  expect(mark).toHaveBeenCalledWith(SESSION, ATTEMPT, { db });
+  mark.mockResolvedValueOnce('latch_failed' as never);
+  await expect(latchDiscardedWorkerRecording(ATTEMPT, db, mark as never))
+    .rejects.toThrow('phone_discard_recording_latch_failed');
+});
 const ENGAGEMENT = '11111111-2222-4333-8444-555555555555';
 const SESSION = '99999999-8888-4777-8666-555555555555';
 
@@ -71,6 +94,7 @@ interface Harness {
   startRecording: ReturnType<typeof vi.fn>;
   verifySessionHint: ReturnType<typeof vi.fn>;
   purgeRecordings: ReturnType<typeof vi.fn>;
+  latchDiscardedRecording: ReturnType<typeof vi.fn>;
   /** Every store method, so ANY database touch is observable. */
   storeCalls: () => number;
 }
@@ -97,6 +121,7 @@ function build(options: {
   /** Bounce answered-state read; absent = fail-closed (not answered). */
   readAnsweredState?: (attemptId: string) => Promise<{ answered: boolean; terminal: boolean }>;
   withAnsweredState?: boolean;
+  latchDiscardedRecording?: (attemptId: string) => Promise<void>;
 } = {}): Harness {
   const applyEvent = vi.fn(
     options.applyEvent ??
@@ -137,6 +162,7 @@ function build(options: {
     status: options.purgeStatus ?? 'purged',
     safeToAcknowledge: options.purgeSafe ?? true,
   }));
+  const latchDiscardedRecording = vi.fn(options.latchDiscardedRecording ?? (async () => undefined));
   const readStore = options.readStore ?? ({
     listAttemptsForEngagement: async () => [],
     listLiveAppointmentsByStart: async () => [],
@@ -165,6 +191,7 @@ function build(options: {
       // path proves a hint is unusable without one (fail-closed).
       verifySessionHint: options.withHintVerifier === true ? (verifySessionHint as never) : undefined,
       purgeRecordings: options.withPurge === true ? (purgeRecordings as never) : undefined,
+      latchDiscardedRecording: options.latchDiscardedRecording ? (latchDiscardedRecording as never) : undefined,
       readAnsweredState:
         options.withAnsweredState === true
           ? (options.readAnsweredState ?? (async () => ({ answered: true, terminal: false })))
@@ -184,6 +211,7 @@ function build(options: {
     startRecording,
     verifySessionHint,
     purgeRecordings,
+    latchDiscardedRecording,
     // EVERY store method, so a "no database work" assertion means it.
     storeCalls: () =>
       applyEvent.mock.calls.length
@@ -1390,6 +1418,27 @@ describe('NO worker event purges the recordings any more (0105)', () => {
   it('consent.failed does NOT purge — the purge is engagement-wide and it is not terminal', () => {
     expect(PURGE_BEFORE_EVENTS.has('consent.failed')).toBe(false);
     expect(WORKER_PHONE_EVENTS).toContain('consent.failed');
+  });
+
+  it('server-latches an unmaterialized stranger gate attempt after the terminal verdict', async () => {
+    const h = build({ latchDiscardedRecording: async () => undefined });
+    const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: 'candidate.wrong_number' });
+    expect(res.status).toBe(200);
+    expect(h.latchDiscardedRecording).toHaveBeenCalledWith(ATTEMPT);
+  });
+
+  it('does not acknowledge a failed stranger latch and retries it on duplicate delivery', async () => {
+    let failed = true;
+    const h = build({ latchDiscardedRecording: async () => {
+      if (failed) throw new Error('phone_discard_recording_latch_failed');
+    } });
+    const first = await post(h, '/events', { attempt_id: ATTEMPT, event_type: 'candidate.wrong_number' });
+    expect(first.status).toBe(500);
+    failed = false;
+    h.applyEvent.mockResolvedValue({ status: 'applied', applied: true, duplicate: true } as ApplyPhoneEventResult);
+    const retry = await post(h, '/events', { attempt_id: ATTEMPT, event_type: 'candidate.wrong_number' });
+    expect(retry.status).toBe(200);
+    expect(h.latchDiscardedRecording).toHaveBeenCalledTimes(2);
   });
 
   for (const event of RETAINED_GATE_EXITS) {

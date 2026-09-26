@@ -49,6 +49,7 @@ interface BuildOpts {
   attachStatus?: string;
   attachDuplicate?: boolean;
   finalizeStatus?: 'ready' | 'fallback_required' | 'pending';
+  finalizeAttemptStatus?: 'ready' | 'fallback_required' | 'pending';
   finalizeThrows?: boolean;
   markFailedStatus?: 'failed_latched' | 'already_linked' | 'not_worker_inband' | 'attempt_mismatch' | 'session_not_found' | 'latch_failed';
   markFailedThrows?: boolean;
@@ -60,21 +61,25 @@ interface BuildOpts {
     version: number;
     sessionId?: string;
   } | null>) | undefined;
+  resolveAttemptRecordingSession?: ((attemptId: string) => Promise<string | null>) | undefined;
 }
 
 function build(opts: BuildOpts = {}) {
   const list = vi.fn(async () => ({ status: 'ok', artifacts: [] }));
+  const bindPhoneAttemptRecordingSession = vi.fn(async () => ({ status: 'ok', bound: true }));
   const attach = vi.fn(async () => ({
     status: opts.attachStatus ?? 'ok',
     duplicate: opts.attachDuplicate ?? false,
   }));
-  const finalizeAttemptRecording = vi.fn(async (_input: { egressId?: string | null }) => ({ status: 'ok' }));
+  const storeFinalizeAttemptRecording = vi.fn(async (_input: { egressId?: string | null }) => ({ status: 'ok' }));
+  const finalizeAttemptRecording = vi.fn(async (_attemptId: string, _sessionId: string) => opts.finalizeAttemptStatus ?? opts.finalizeStatus ?? 'ready');
   const stampSessionEgress = vi.fn(async (_input: { egressId: string }) => ({ status: 'ok', duplicate: false }));
 
   const stores = {
     listEngagementRecordings: list,
+    bindPhoneAttemptRecordingSession,
     attachAttemptRecording: attach,
-    finalizeAttemptRecording,
+    finalizeAttemptRecording: storeFinalizeAttemptRecording,
     stampSessionEgress,
   } as unknown as PhoneStores;
 
@@ -105,12 +110,14 @@ function build(opts: BuildOpts = {}) {
       recordingProvider: opts.recordingProvider ?? 'egress',
       uploadSigner: opts.withSigner === false ? undefined : uploadSigner,
       finalizeRecording,
+      finalizeAttemptRecording,
       markRecordingFailed,
       resolveEngagement: opts.resolveEngagement,
+      resolveAttemptRecordingSession: opts.resolveAttemptRecordingSession,
     }),
   );
 
-  return { app, list, attach, finalizeAttemptRecording, stampSessionEgress, createUploadUrl, finalizeRecording, markRecordingFailed };
+  return { app, list, attach, finalizeAttemptRecording, storeFinalizeAttemptRecording, stampSessionEgress, bindPhoneAttemptRecordingSession, createUploadUrl, finalizeRecording, markRecordingFailed };
 }
 
 function authed(app: express.Express, path: string, body: object) {
@@ -179,7 +186,7 @@ describe('provider=worker prepare — reuses the consent gate', () => {
     expect(h.list).toHaveBeenCalledTimes(1);
     expect(h.attach).toHaveBeenCalledTimes(1);
     // Synthetic egress id recorded on the ATTEMPT...
-    expect(h.finalizeAttemptRecording.mock.calls[0][0].egressId).toBe(`EG_worker_${ATTEMPT}`);
+    expect(h.storeFinalizeAttemptRecording.mock.calls[0][0].egressId).toBe(`EG_worker_${ATTEMPT}`);
     // ...but the SESSION is NOT stamped: this prepare carries no engagement
     // state (no resolver wired), which 0105 treats as pre-consent. Sessions
     // are reused across attempts, so a pre-consent clip must not claim the
@@ -259,7 +266,7 @@ describe('provider=worker complete — drives the finalizer worker branch', () =
     const h = build({ recordingProvider: 'worker', finalizeStatus: 'ready' });
     const res = await authed(h.app, COMPLETE, COMPLETE_BODY);
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ ok: true, status: 'ready' });
+    expect(res.body).toEqual({ ok: true, status: 'ready', session_status: 'ready' });
     expect(h.finalizeRecording).toHaveBeenCalledWith(SESSION);
   });
 
@@ -276,11 +283,20 @@ describe('provider=worker complete — drives the finalizer worker branch', () =
     expect(res.body).toEqual({ ok: false, status: 'fallback_required' });
   });
 
+  it('keeps a gate clip ready while truthfully reporting that no reusable session slot was stamped', async () => {
+    const h = build({ recordingProvider: 'worker', finalizeAttemptStatus: 'ready', finalizeStatus: 'fallback_required' });
+    const res = await authed(h.app, COMPLETE, COMPLETE_BODY);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, status: 'ready', session_status: 'fallback_required' });
+    expect(h.finalizeAttemptRecording).toHaveBeenCalledTimes(1);
+    expect(h.finalizeRecording).toHaveBeenCalledWith(SESSION);
+  });
+
   it('a finalizer throw is a sanitized 500', async () => {
     const h = build({ recordingProvider: 'worker', finalizeThrows: true });
     const res = await authed(h.app, COMPLETE, COMPLETE_BODY);
     expect(res.status).toBe(500);
-    expect(res.body.status).toBe('phone_recording_complete_error');
+    expect(res.body.status).toBe('session_recording_finalize_error');
   });
 
   it('rejects a malformed sha256 with 400', async () => {
@@ -304,6 +320,16 @@ describe('provider=worker failed — latches a permanently lost recording', () =
     const res = await authed(h.app, FAILED, FAILED_BODY);
     expect(res.status).toBe(200);
     expect(res.body).toEqual({ ok: true, status: 'failed_latched' });
+    expect(h.markRecordingFailed).toHaveBeenCalledWith(SESSION, ATTEMPT);
+  });
+
+  it('accepts a gate-death failure without a consent session_id and resolves the evidence parent', async () => {
+    const resolveAttemptRecordingSession = vi.fn(async () => SESSION);
+    const h = build({ recordingProvider: 'worker', resolveAttemptRecordingSession });
+    const res = await authed(h.app, FAILED, { attempt_id: ATTEMPT, reason: 'upload_failed' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, status: 'failed_latched' });
+    expect(resolveAttemptRecordingSession).toHaveBeenCalledWith(ATTEMPT);
     expect(h.markRecordingFailed).toHaveBeenCalledWith(SESSION, ATTEMPT);
   });
 

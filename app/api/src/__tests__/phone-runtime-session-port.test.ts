@@ -443,6 +443,7 @@ describe('phone session port: minting provisions the room in the same CAS', () =
     // somewhere; see the note in the suite header.
     expect(fields.provider).toBe('livekit');
     expect(fields.candidate_id).toBe(CANDIDATE);
+    expect(fields.phone_engagement_id).toBe(ENGAGEMENT);
     expect(fields.role_id).toBe(ROLE);
   });
 
