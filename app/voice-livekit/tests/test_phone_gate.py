@@ -17876,4 +17876,3 @@ class TestItemTurnClientGateFlag(unittest.IsolatedAsyncioTestCase):
         self.assertIs(posts[0][1]["is_gate"], True)
         self.assertNotIn("is_gate", posts[1][1])
         self.assertEqual(posts[1][1]["turn_started_at_ms"], 1723000000123)
-
