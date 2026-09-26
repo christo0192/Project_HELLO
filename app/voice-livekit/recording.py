@@ -111,6 +111,20 @@ PHONE_AUDIO_NO_INPUT_WARN_SEC = _float_env("PHONE_AUDIO_NO_INPUT_WARN_SEC", 20.0
 # of boundary frames out of hundreds is fine; losing a large slice is not.
 _TRANSCODE_MAX_SKIPPED_FRACTION = 0.02  # allow up to 2% skipped, fail beyond
 
+# RecorderIO.aclose() waits for its encoder thread and may be the thing that
+# wedges a worker during shutdown.  This is deliberately a small local bound:
+# the caller owns the larger evidence-teardown budget and must still have time
+# to PUT an already-flushed OGG and report its manifest.
+RECORDER_CLOSE_TIMEOUT_SEC = 3.0
+
+
+def _consume_cancelled_task(task: asyncio.Task[Any]) -> None:
+    """Retrieve a detached close exception without awaiting its acknowledgement."""
+    try:
+        task.result()
+    except BaseException:
+        pass
+
 
 def recording_provider() -> str:
     """'worker' only when explicitly selected; anything else is 'egress'."""
@@ -749,8 +763,27 @@ class InWorkerRecorder:
         if not self._begun or self._failed or self._recorder is None or self._ogg_path is None:
             return None
         recording_at_close = bool(getattr(self._recorder, "recording", False))
+        close_completed = True
         try:
-            await self._recorder.aclose()
+            close_task = asyncio.create_task(self._recorder.aclose())
+            done, pending = await asyncio.wait(
+                {close_task}, timeout=RECORDER_CLOSE_TIMEOUT_SEC,
+            )
+            if pending:
+                # Do not wait for a cancellation-suppressing SDK/provider close.
+                # The OGG may already contain complete muxed packets; upload it
+                # as raw OGG, omit duration, and make the partial-close state
+                # visible.  We never claim a clean MP3/full-duration recording.
+                close_completed = False
+                self._finish_failure = "recorder_close_timeout"
+                close_task.cancel()
+                close_task.add_done_callback(_consume_cancelled_task)
+                logger.warning(
+                    "in_worker_recording_close_timed_out_ogg_only",
+                    extra={"object_key": self._object_key},
+                )
+            else:
+                close_task.result()
         except Exception:  # noqa: BLE001
             logger.warning(
                 "in_worker_recording_close_failed", extra={"object_key": self._object_key},
@@ -842,13 +875,27 @@ class InWorkerRecorder:
             body = ogg_body
             content_type = "audio/ogg"
             logger.info(
-                "in_worker_recording_uploaded_ogg",
+                "in_worker_recording_uploaded_ogg_close_timeout"
+                if not close_completed else "in_worker_recording_uploaded_ogg",
                 extra={
                     "object_key": self._object_key,
                     "size_bytes": len(ogg_body),
                     "content_type": "audio/ogg",
                 },
             )
+
+            if not close_completed:
+                # The file was flushed before the recorder close acknowledged;
+                # retain the raw evidence, but do not run transcode or invent a
+                # duration for bytes that may still be missing tail packets.
+                self._cleanup()
+                sha256 = hashlib.sha256(body).hexdigest()
+                return RecordingManifest(
+                    sha256=sha256,
+                    size_bytes=len(body),
+                    duration_ms=None,
+                    content_type=content_type,
+                )
 
             # ── BEST-EFFORT MP3 UPGRADE ─────────────────────────────────────
             # The OGG is now durable. Attempt OGG→MP3 and re-PUT the same key
@@ -951,14 +998,24 @@ class InWorkerRecorder:
         )
 
     async def discard(self) -> None:
-        """No-consent path: stop recording and delete the local file WITHOUT
-        uploading. Called instead of :meth:`finish` when consent was refused /
-        a machine answered / a pre-disclosure deferral occurred, so no audio of
-        a non-consenting call is ever retained or uploaded. Fail-open and
-        idempotent."""
+        """Wrong-number/identity-mismatch privacy path: stop recording and
+        delete the local file without uploading. Other gate exits retain audio
+        under the recorded-from-answer policy. Fail-open and idempotent."""
         if self._recorder is not None and self._begun and not self._failed:
             try:
-                await self._recorder.aclose()
+                close_task = asyncio.create_task(self._recorder.aclose())
+                done, pending = await asyncio.wait(
+                    {close_task}, timeout=RECORDER_CLOSE_TIMEOUT_SEC,
+                )
+                if pending:
+                    close_task.cancel()
+                    close_task.add_done_callback(_consume_cancelled_task)
+                    logger.warning(
+                        "in_worker_recording_discard_close_timed_out",
+                        extra={"object_key": self._object_key},
+                    )
+                else:
+                    close_task.result()
             except Exception:  # noqa: BLE001
                 pass
         self._failed = True  # a subsequent finish() becomes a no-op

@@ -5130,6 +5130,7 @@ _OUTCOME_CLOSING: dict[str, str] = {
 
 GATE_NO_PARTICIPANT = "no_participant"
 GATE_PARTICIPANT_LEFT = "participant_left"
+GATE_FAILED = "gate_failed"
 #: The opening gate overran its wall clock (`PHONE_GATE_MAX_SECONDS`).
 #:
 #: Unreachable before 2026-09-14: the gate had no bound at all, so a wedged
@@ -5792,6 +5793,9 @@ async def run_phone_gate(
     # The name on the application, used to address the candidate and as the
     # record side of the mismatch comparison.
     candidate_name: str | None = None,
+    # Content-free lifecycle facts used by the worker when an exception lands
+    # before PhoneGateResult can be returned.
+    gate_phase_out: Optional[dict[str, bool]] = None,
 ) -> PhoneGateResult:
     """Run the phone screening's opening, in the ONLY order that is safe.
 
@@ -5849,6 +5853,10 @@ async def run_phone_gate(
     #: `commit_phone_gate_turns` and its route both accept 1..6 rows.
     gate_turns: list[dict[str, Any]] = []
 
+    def _phase(name: str) -> None:
+        if gate_phase_out is not None:
+            gate_phase_out[name] = True
+
     async def _say(text: str) -> None:
         spoken.append(text)
         await say(text)
@@ -5868,11 +5876,18 @@ async def run_phone_gate(
         outcomes have never done so, and a caller that needs to commit does it
         explicitly before calling here.
         """
+        # Privacy disposition is content-free and must be latched before any
+        # terminal API call or courtesy speech can raise/cancel. The worker
+        # must discard even if the terminal post never returns a result.
+        if not_the_candidate or decision == CLASSIFY_WRONG_NUMBER:
+            _phase("not_the_candidate")
         event_type = _OUTCOME_EVENT.get(decision)
         if event_type is not None:
+            _phase(f"terminal_requested:{event_type}")
             outcome = await client.post_event(attempt_id, event_type, epoch=epoch)
             if event_applied(outcome):
                 events.append(event_type)
+                _phase("terminal_posted")
         closing = _OUTCOME_CLOSING.get(decision)
         if closing is not None:
             try:
@@ -6017,6 +6032,7 @@ async def run_phone_gate(
         )
         if event_applied(answered) or answered.duplicate:
             events.append("call.answered")
+            _phase("answered")
             # ── 0105: RECORD FROM THE ANSWER ────────────────────────────
             # Only once the server has the attempt in `answered_unclassified`
             # (that is what `call.answered` sets, and what
@@ -6104,6 +6120,7 @@ async def run_phone_gate(
         except Exception:  # noqa: BLE001
             durable = None
         if durable is not None and durable.ok and durable.gate_recorded:
+            _phase("consent_durable")
             _log.info(
                 "unknown_event", error_type="phone_gate_outcome",
                 schema="gate_resumed_consent",
@@ -6301,6 +6318,9 @@ async def run_phone_gate(
         )
 
     if identity_verdict == PHONE_IDENTITY_OTHER:
+        # Latch privacy before even the courtesy apology: its playout can
+        # fail on a disconnected leg before _terminal_outcome is reached.
+        _phase("not_the_candidate")
         # The wrong person, confirmed twice by two independent judgements on two
         # different utterances. Apologise and hang up.
         #
@@ -6524,6 +6544,7 @@ async def run_phone_gate(
         except Exception:  # noqa: BLE001 — a failed report must not also crash.
             outcome = None
         if outcome is None or not event_applied(outcome):
+            _phase("consent_failure")
             # Visible, not assumed. An unapplied post means the recording was
             # NOT purged and the engagement was NOT released, which is the one
             # thing this block exists to guarantee.
@@ -6531,6 +6552,8 @@ async def run_phone_gate(
                 "unknown_event", error_type="phone_gate_blocked",
                 error_category="consent_failed_not_applied",
             )
+        else:
+            _phase("terminal_posted")
 
     # New clients use the single atomic consent/start boundary. Legacy fakes
     # remain supported during rollout, but production's client always exposes
@@ -6543,6 +6566,7 @@ async def run_phone_gate(
         if not combined.ok:
             await _report_consent_failed("consent_start_failed")
             return PhoneGateResult(CLASSIFY_HUMAN, events=events, spoken=spoken)
+        _phase("consent_durable")
         events.extend(["classify.human", "disclosure.delivered"])
         # THE LATENCY MASK. The deterministic role-opening line (a USEFUL
         # sentence, not a throwaway bridge) is spoken as a background task so it
@@ -6636,6 +6660,7 @@ async def run_phone_gate(
         await _report_consent_failed("disclosure_not_recorded")
         return PhoneGateResult(CLASSIFY_HUMAN, events=events, spoken=spoken)
     events.append("disclosure.delivered")
+    _phase("consent_durable")
 
     if start_recording is not None:
         await start_recording()

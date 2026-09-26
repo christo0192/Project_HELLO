@@ -6,6 +6,7 @@ Sarvam STT/TTS + LiveKit Agents turn handling + direct streaming Gemini LLM.
 from __future__ import annotations
 
 import os
+import multiprocessing
 import re
 import time
 import asyncio
@@ -179,6 +180,80 @@ def _bounded_float_env(name: str, default: float, lo: float, hi: float) -> float
     if value != value:  # NaN
         return default
     return lo if value < lo else hi if value > hi else value
+
+
+# Phone evidence teardown has to finish before the LiveKit job-process grace
+# window reaches AgentSession.aclose().  These are total/sub-operation bounds,
+# not transport timeouts: a provider can accept cancellation and still keep an
+# awaiter blocked, so the coordinator waits on a task with asyncio.wait and
+# detaches it after the deadline instead of using asyncio.wait_for (which waits
+# for cancellation acknowledgement).
+PHONE_TEARDOWN_MAX_SECONDS = _bounded_float_env(
+    "PHONE_TEARDOWN_MAX_SECONDS", 25.0, 12.0, 55.0,
+)
+PHONE_TEARDOWN_STEP_SECONDS = _bounded_float_env(
+    "PHONE_TEARDOWN_STEP_SECONDS", 6.0, 1.0, 20.0,
+)
+PHONE_SHUTDOWN_WATCHDOG_SECONDS = _bounded_float_env(
+    "PHONE_SHUTDOWN_WATCHDOG_SECONDS", 8.0, 2.0, 20.0,
+)
+PHONE_TEARDOWN_TERMINAL_RESERVE_SECONDS = 6.0
+
+
+def _consume_detached_task(task: asyncio.Task[Any]) -> None:
+    """Retrieve a late task result without letting it become an exception log."""
+    try:
+        task.result()
+    except BaseException:
+        pass
+
+
+async def _bounded_await(
+    awaitable: Awaitable[Any], timeout: float, *, category: str,
+    deadline: float | None = None,
+) -> Any:
+    """Await an operation up to a hard wall-clock bound, cancellation-resistant.
+
+    ``asyncio.wait_for`` is intentionally not used here: it waits for the child
+    to acknowledge cancellation, so a provider that suppresses cancellation can
+    defeat the caller's deadline.  A detached child is safe for best-effort
+    cleanup because the durable work that matters is sequenced before the
+    operation using this helper.
+    """
+    task = asyncio.ensure_future(awaitable)
+    deadline = min(
+        time.monotonic() + max(0.0, timeout),
+        deadline if deadline is not None else float("inf"),
+    )
+    while not task.done():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            await asyncio.wait({task}, timeout=remaining)
+        except asyncio.CancelledError:
+            # The caller is already in teardown. Keep the cleanup owner alive
+            # long enough to attempt evidence settlement, but do not extend the
+            # wall-clock budget.
+            continue
+    if not task.done():
+        task.cancel()
+        task.add_done_callback(_consume_detached_task)
+        _log.warn(
+            "unknown_event", error_type="phone_teardown",
+            error_category=f"{category}_timeout",
+        )
+        return None
+    try:
+        return task.result()
+    except asyncio.CancelledError:
+        return None
+    except Exception:  # noqa: BLE001 — teardown is fail-open
+        _log.warn(
+            "unknown_event", error_type="phone_teardown",
+            error_category=f"{category}_failed",
+        )
+        return None
 
 
 # ── Bounded room residency (0038 / D-7) ───────────────────────────────
@@ -998,9 +1073,15 @@ async def _delete_livekit_room(room_name: str) -> None:
     """Delete the room so every participant receives a terminal disconnect."""
     client = livekit_api.LiveKitAPI()
     try:
-        await client.room.delete_room(livekit_api.DeleteRoomRequest(room=room_name))
+        await _bounded_await(
+            client.room.delete_room(livekit_api.DeleteRoomRequest(room=room_name)),
+            PHONE_TEARDOWN_STEP_SECONDS,
+            category="room_delete",
+        )
     finally:
-        await client.aclose()
+        await _bounded_await(
+            client.aclose(), PHONE_TEARDOWN_STEP_SECONDS, category="room_client_close",
+        )
 
 
 def _item_text(item: Any) -> str:
@@ -2956,6 +3037,9 @@ async def _run_native_phone_screening(
     # correct (speaking reads False = never defer).
     candidate_speaking: dict[str, bool] | None = None,
     candidate_speech_ended: asyncio.Event | None = None,
+    close_room: Callable[[], Awaitable[Any]] | None = None,
+    close_room_after_evidence: Callable[[], Awaitable[Any]] | None = None,
+    before_terminal: Callable[[], Awaitable[Any]] | None = None,
 ) -> phone.PhoneGateResult:
     """Run post-consent screening through LiveKit's native turn lifecycle.
 
@@ -2993,6 +3077,7 @@ async def _run_native_phone_screening(
         candidate_speaking = {"value": False}
     if candidate_speech_ended is None:
         candidate_speech_ended = asyncio.Event()
+    close_room_request = close_room or (lambda: _close_phone_room(room_name))
     finished = asyncio.Event()
     terminal_reason: dict[str, str] = {}
     # A terminal reply is only a proposal until its speech handle completes.
@@ -7362,16 +7447,24 @@ async def _run_native_phone_screening(
                 "unknown_event", error_type="phone_room_teardown",
                 error_category=_teardown_label(reason),
             )
-            await _close_phone_room(room_name)
+            await (
+                close_room_after_evidence()
+                if close_room_after_evidence is not None
+                else close_room_request()
+            )
             result.scoring_queue_owned = True
             return result
         if done is not None and done.ok and not done.adopted:
+            if before_terminal is not None:
+                await before_terminal()
             await _post_phone_event_with_retry(
                 events, attempt_id, "assessment.completed",
             )
         elif done is not None and done.status is not None:
             # A known non-score verdict is truthfully terminal. A transport
             # failure has no status and remains non-terminal for recovery.
+            if before_terminal is not None:
+                await before_terminal()
             await _post_phone_event_with_retry(
                 events, attempt_id, "assessment.aborted",
             )
@@ -7386,6 +7479,8 @@ async def _run_native_phone_screening(
         # call end with no terminal signal AND no log.
         phone.HALT_MALFORMED_EXCHANGE,
     }:
+        if before_terminal is not None:
+            await before_terminal()
         await events.post_event(attempt_id, "assessment.aborted")
     elif reason == "disconnect":
         # F4 — 'disconnect' stays NON-TERMINAL: the room/connection died
@@ -7423,6 +7518,8 @@ async def _run_native_phone_screening(
         # candidate `assessment.aborted` terminal event.
         pass
     else:
+        if before_terminal is not None:
+            await before_terminal()
         await events.post_event(attempt_id, "assessment.aborted")
     # F0c — NEVER SILENTLY DELETE A LIVE ROOM. `_close_phone_room` deletes the
     # LiveKit room via RoomService, which terminates every participant — and on
@@ -7457,7 +7554,7 @@ async def _run_native_phone_screening(
         "unknown_event", error_type="phone_room_teardown",
         error_category=_teardown_label(reason),
     )
-    await _close_phone_room(room_name)
+    await close_room_request()
     return result
 
 
@@ -7576,6 +7673,12 @@ async def _run_phone_session(
     # recording begins and cancelled in `_finish_recording`. A holder so the
     # nested begin/finish closures can share the single task handle.
     audio_health_holder: list[Any] = [None]  # [asyncio.Task | None]
+    # Answer-time prepare is intentionally fire-and-forget for call latency,
+    # but it must become part of teardown ownership once the gate settles.
+    # The settle flag is checked both before and after the API prepare await so
+    # a raced begin cannot start recording after a wrong-number discard.
+    recording_begin_tasks: set[asyncio.Task] = set()
+    recording_settle_started = False
 
     # ── 0071 / X4: PER-ITEM TRANSCRIPT DURABILITY IN THE PHONE PATH ────────
     # The browser path persists every turn as it happens; the phone path
@@ -7693,7 +7796,15 @@ async def _run_phone_session(
             t.add_done_callback(persist_tasks.discard)
         # Five seconds is generous for a handful of PostgREST round trips and
         # far short of anything a candidate would notice at a call's end.
-        await asyncio.wait(tasks, timeout=5.0)
+        _done, pending_tasks = await asyncio.wait(tasks, timeout=5.0)
+        if pending_tasks:
+            for task in pending_tasks:
+                task.cancel()
+                task.add_done_callback(_consume_detached_task)
+            _log.warn(
+                "unknown_event", error_type="phone_item_persist",
+                error_category="gate_flush_cancelled",
+            )
 
     def _drop_gate_transcript(reason: str) -> None:
         """0105: the gate concluded the speaker was NOT the candidate. Nothing
@@ -8806,7 +8917,12 @@ async def _run_phone_session(
         upload URL for teardown. Any failure degrades to no recording from this
         call site and never touches the consent decision. Byte-identical to
         before when the provider is not `worker`."""
+        current_task = asyncio.current_task()
+        if current_task is not None:
+            recording_begin_tasks.add(current_task)
         try:
+            if recording_settle_started:
+                return
             recorder = recorder_holder[0]
             if recording.recording_provider() != "worker" or recorder is None:
                 return
@@ -8829,6 +8945,11 @@ async def _run_phone_session(
             prepared = await recording_api.prepare_recording(attempt_id, sid)
             if not prepared:
                 return  # refusal / no binding ⇒ do NOT record
+            # Teardown may have started while prepare was in flight. Do not
+            # begin a recorder after settlement: that would leak a stranger's
+            # audio or leave an unowned encoder task behind.
+            if recording_settle_started:
+                return
             # FIX 4: the participant-arrival anchor is the closest wall-clock the
             # worker holds for "answered"; passing it lets begin() log the
             # recording START offset from answer (the observed ~28s head-gap).
@@ -8853,6 +8974,9 @@ async def _run_phone_session(
                 "unknown_event", error_type="phone_recording_begin",
                 error_category=f"begin_failed_{origin}"[:64],
             )
+        finally:
+            if current_task is not None:
+                recording_begin_tasks.discard(current_task)
 
     async def _phone_recording_begin_at_answer() -> None:
         """0105: capture starts the moment the server confirms `call.answered`.
@@ -9015,6 +9139,364 @@ async def _run_phone_session(
             hard_timeout_sec=phone.phone_classify_answer_timeout_sec(),
         )
 
+    recording_finish_lock = asyncio.Lock()
+    recording_finished = False
+    teardown_deadline: float | None = None
+
+    def _teardown_timeout(default: float) -> float:
+        if teardown_deadline is None:
+            return default
+        return max(0.0, min(default, teardown_deadline - time.monotonic()))
+
+    async def _finish_recording(deadline: float | None = None) -> None:
+        """The one recording owner, bounded and safe to call from every exit."""
+        nonlocal recording_finished, recording_settle_started
+        async with recording_finish_lock:
+            if recording_finished:
+                return
+            recording_finished = True
+            recording_settle_started = True
+
+            hb = audio_health_holder[0]
+            if hb is not None and not hb.done():
+                hb.cancel()
+                hb.add_done_callback(_consume_detached_task)
+            audio_health_holder[0] = None
+
+            recorder = recorder_holder[0]
+            upload_url = recorder_holder[1]
+            recorder_holder[0] = None
+            recorder_holder[1] = None
+            if recorder is None or upload_url is None or not recorder.active:
+                return
+            try:
+                manifest = await _bounded_await(
+                    recorder.finish(upload_url),
+                    _teardown_timeout(PHONE_TEARDOWN_STEP_SECONDS * 2),
+                    category="recording_finish", deadline=deadline,
+                )
+                sid = phone.session_id_from_room_name(room_name)
+                if manifest is None:
+                    # A detached recorder task may not have published its
+                    # provider-specific failure before this bounded await
+                    # returns. Never silently convert that timeout into a
+                    # successful/unknown recording state.
+                    failure = (
+                        getattr(recorder, "finish_failure", None)
+                        or "recording_finish_timeout"
+                    )
+                    if failure is not None and sid is not None:
+                        await _bounded_await(
+                            recording_api.fail_recording(
+                                attempt_id, sid, str(failure),
+                            ),
+                            PHONE_TEARDOWN_STEP_SECONDS,
+                            category="recording_failure_report", deadline=deadline,
+                        )
+                    return
+                if sid is None:
+                    return
+                await _bounded_await(
+                    recording_api.complete_recording(
+                        attempt_id, sid, manifest.sha256, manifest.size_bytes,
+                        manifest.duration_ms,
+                    ),
+                    _teardown_timeout(PHONE_TEARDOWN_STEP_SECONDS),
+                    category="recording_completion", deadline=deadline,
+                )
+            except Exception:  # noqa: BLE001 — recording is secondary
+                _log.warn(
+                    "unknown_event", error_type="phone_recording_finish",
+                    error_category="finish_failed",
+                )
+
+    room_close_requested = False
+
+    async def _request_room_close() -> None:
+        """Record intent; the coordinator performs the actual delete last."""
+        nonlocal room_close_requested
+        room_close_requested = True
+
+    teardown_task: asyncio.Task | None = None
+    gate_task_holder: list[asyncio.Task | None] = [None]
+    gate_done = asyncio.Event()
+    sdk_close_requested = False
+    room_closed = False
+
+    async def _close_room_after_evidence() -> None:
+        """Queued scoring closes PSTN before handing the lease to the hold."""
+        nonlocal room_closed
+        await _finish_recording()
+        if not room_closed:
+            await _bounded_await(
+                _close_phone_room(room_name), PHONE_TEARDOWN_STEP_SECONDS,
+                category="queued_room_teardown",
+            )
+            room_closed = True
+
+    async def _cancel_answer_begin_tasks(deadline: float | None = None) -> None:
+        pending = [task for task in tuple(recording_begin_tasks) if not task.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            await _bounded_await(
+                asyncio.gather(*pending, return_exceptions=True),
+                _teardown_timeout(PHONE_TEARDOWN_STEP_SECONDS),
+                category="recording_begin_drain", deadline=deadline,
+            )
+
+    async def _post_gate_failure_terminal(
+        gate_result: phone.PhoneGateResult | None,
+        failure: BaseException | None,
+        deadline: float | None = None,
+    ) -> None:
+        """Choose a truthful pre/post-consent gate terminal exactly once."""
+        if gate_result is None or "terminal_posted" in gate_lifecycle:
+            return
+        if isinstance(failure, asyncio.CancelledError):
+            # Cancellation is the reconnect/lease owner’s signal, not a
+            # completed interview and not a consent failure.
+            return
+        events_seen = set(getattr(gate_result, "events", []) or [])
+        if events_seen & {
+            "candidate.wrong_number", "candidate.opt_out", "disclosure.refused",
+            "classify.machine", "candidate.deferred_pre_disclosure",
+        }:
+            return
+        # Preserve a decision made BEFORE its terminal transport failed. In
+        # particular, retrying a known wrong number as consent.failed would
+        # make a stranger eligible for another call.
+        event_type = next((
+            event for event in (
+                "candidate.wrong_number", "candidate.opt_out",
+                "disclosure.refused", "classify.machine",
+                "candidate.deferred_pre_disclosure",
+            ) if gate_lifecycle.get(f"terminal_requested:{event}")
+        ), None)
+        if event_type is not None:
+            pass
+        elif gate_result.outcome in {
+            phone.GATE_TIMED_OUT, phone.GATE_PARTICIPANT_LEFT,
+        }:
+            event_type = (
+                "assessment.aborted" if gate_lifecycle.get("consent_durable")
+                else "candidate.deferred_pre_disclosure"
+            )
+        elif failure is not None:
+            event_type = (
+                "assessment.aborted"
+                if gate_lifecycle.get("consent_durable")
+                else "consent.failed"
+            )
+        if event_type is None:
+            if gate_lifecycle.get("consent_failure"):
+                event_type = "consent.failed"
+            else:
+                return
+        for _ in range(2):
+            outcome = await _bounded_await(
+                events.post_event(attempt_id, event_type, epoch=epoch),
+                _teardown_timeout(PHONE_TEARDOWN_STEP_SECONDS),
+                category="gate_terminal_post", deadline=deadline,
+            )
+            if outcome is not None and phone.event_applied(outcome):
+                gate_lifecycle["terminal_posted"] = True
+                return
+        _log.warn(
+            "unknown_event", error_type="phone_gate_outcome",
+            error_category="terminal_not_applied",
+        )
+
+    async def _teardown_impl(
+        gate_result: phone.PhoneGateResult | None,
+        failure: BaseException | None,
+    ) -> None:
+        """Single owner: settle evidence, then terminal, then room teardown."""
+        nonlocal recording_settle_started, teardown_deadline
+        deadline = teardown_deadline
+        recording_settle_started = True
+        # Cancellation requests are issued first, but their acknowledgement is
+        # not allowed to consume the evidence budget. The tracked tasks are
+        # drained only after the durable evidence path below.
+        for task in tuple(recording_begin_tasks):
+            if not task.done():
+                task.cancel()
+        _pt = _role_prerender_task[0]
+        if _pt is not None and not _pt.done():
+            _pt.cancel()
+
+        is_wrong_number = bool(
+            gate_lifecycle.get("not_the_candidate")
+            or (
+                gate_result is not None and (
+                    gate_result.outcome == phone.CLASSIFY_WRONG_NUMBER
+                    or getattr(gate_result, "not_the_candidate", False)
+                )
+            )
+        )
+        evidence_deadline = max(
+            time.monotonic(),
+            (deadline or time.monotonic()) - PHONE_TEARDOWN_TERMINAL_RESERVE_SECONDS,
+        )
+        if is_wrong_number:
+            _drop_gate_transcript("not_the_candidate")
+            recorder = recorder_holder[0]
+            recorder_holder[0] = None
+            recorder_holder[1] = None
+            if recorder is not None and recorder.active:
+                await _bounded_await(
+                    recorder.discard(), PHONE_TEARDOWN_STEP_SECONDS,
+                    category="recording_discard", deadline=evidence_deadline,
+                )
+            # No object will ever arrive after an intentional discard. Tell
+            # the attempt evidence path so the UI does not promise processing
+            # forever. Older APIs may refuse this unstamped gate attempt; that
+            # refusal must never cause an upload or change the privacy verdict.
+            sid = phone.session_id_from_room_name(room_name)
+            if sid is not None and recording.recording_provider() == "worker":
+                await _bounded_await(
+                    recording_api.fail_recording(
+                        attempt_id, sid, "discarded_not_the_candidate",
+                    ),
+                    PHONE_TEARDOWN_STEP_SECONDS,
+                    category="recording_discard_report", deadline=evidence_deadline,
+                )
+            _log.info(
+                "unknown_event", error_type="phone_recording_finish",
+                error_category="discarded_not_the_candidate",
+            )
+        else:
+            # Recording upload/API completion is first. Transcript settlement
+            # follows it and is still bounded by the same absolute deadline.
+            await _finish_recording(evidence_deadline)
+            await _bounded_await(
+                _flush_gate_transcript(), _teardown_timeout(PHONE_TEARDOWN_STEP_SECONDS),
+                category="gate_transcript_flush", deadline=evidence_deadline,
+            )
+        gate_persist_active[0] = False
+
+        # Durable evidence is deliberately before any terminal post or room
+        # delete. A close that wedges cannot erase the already-uploaded OGG.
+        await _post_gate_failure_terminal(gate_result, failure, deadline)
+
+        if persist_tasks:
+            pending = [task for task in tuple(persist_tasks) if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await _bounded_await(
+                    asyncio.gather(*pending, return_exceptions=True),
+                    _teardown_timeout(PHONE_TEARDOWN_STEP_SECONDS),
+                    category="transcript_drain", deadline=deadline,
+                )
+
+        # Lease loss still closes the SIP leg, preserving the existing lease
+        # safety behavior. It never posts a stale terminal; reconnect/lease
+        # ownership remains server-side. All ordinary gate exits and explicit
+        # post-gate closes have requested deletion through this coordinator.
+        if (
+            (gate_result is not None and not gate_result.assessment_allowed)
+            or room_close_requested
+        ) and not room_closed:
+            await _bounded_await(
+                _close_phone_room(room_name), _teardown_timeout(PHONE_TEARDOWN_STEP_SECONDS),
+                category="room_teardown", deadline=deadline,
+            )
+
+    async def _run_teardown(
+        gate_result: phone.PhoneGateResult | None,
+        failure: BaseException | None = None,
+    ) -> None:
+        nonlocal teardown_task, teardown_deadline
+        if teardown_task is None:
+            teardown_deadline = time.monotonic() + PHONE_TEARDOWN_MAX_SECONDS
+            teardown_task = asyncio.create_task(
+                _teardown_impl(gate_result, failure),
+            )
+        await _bounded_await(
+            teardown_task, PHONE_TEARDOWN_MAX_SECONDS,
+            category="total_teardown", deadline=teardown_deadline,
+        )
+
+    # LiveKit 1.6.4 invokes AgentSession.aclose() before JobContext shutdown
+    # callbacks. Guard the SDK's own close seam so evidence settlement is the
+    # first operation even when framework shutdown races this entrypoint. This
+    # is one shared coordinator, not a second recording finalizer.
+    if session is not None:
+        _sdk_aclose = getattr(session, "_aclose_impl", None)
+        _is_real_livekit = type(session).__module__.startswith("livekit.")
+        if not callable(_sdk_aclose):
+            if _is_real_livekit:
+                raise RuntimeError(
+                    "phone teardown requires LiveKit AgentSession._aclose_impl"
+                )
+        elif not getattr(session, "_phone_teardown_guarded", False):
+            async def _guarded_sdk_close(*args: Any, **kwargs: Any) -> Any:
+                nonlocal sdk_close_requested, result
+                sdk_close_requested = True
+                gate_task = gate_task_holder[0]
+                if gate_task is not None and not gate_task.done():
+                    gate_task.cancel()
+                    await _bounded_await(
+                        gate_done.wait(), PHONE_TEARDOWN_STEP_SECONDS,
+                        category="gate_close_coordination",
+                    )
+                    if not gate_done.is_set():
+                        # A gate/provider may suppress cancellation. Shutdown
+                        # must not wait its whole conversation budget or settle
+                        # once with no terminal disposition. Known identity and
+                        # consent facts are already in gate_lifecycle.
+                        result = phone.PhoneGateResult(
+                            phone.GATE_PARTICIPANT_LEFT, events=[], spoken=[],
+                        )
+                await _run_teardown(result, gate_error)
+                return await _bounded_await(
+                    _sdk_aclose(*args, **kwargs),
+                    PHONE_SHUTDOWN_WATCHDOG_SECONDS,
+                    category="sdk_session_close",
+                )
+
+            try:
+                setattr(session, "_aclose_impl", _guarded_sdk_close)
+                setattr(session, "_phone_teardown_guarded", True)
+            except Exception as exc:  # noqa: BLE001 — this bound is load-bearing
+                if _is_real_livekit:
+                    raise RuntimeError(
+                        "phone teardown could not guard AgentSession._aclose_impl"
+                    ) from exc
+
+    add_shutdown_callback = getattr(ctx, "add_shutdown_callback", None)
+    shutdown_watchdog_armed = False
+
+    def _arm_phone_job_watchdog() -> None:
+        nonlocal shutdown_watchdog_armed
+        # Never hard-exit the long-lived worker or a console/browser process.
+        # The pinned SDK runs each phone job in a multiprocessing child.
+        if (shutdown_watchdog_armed or not callable(add_shutdown_callback)
+                or multiprocessing.parent_process() is None):
+            return
+        shutdown_watchdog_armed = True
+
+        def _force_phone_job_exit() -> None:
+            _log.warn(
+                "unknown_event", error_type="phone_shutdown_watchdog",
+                error_category="forced_exit_after_teardown",
+            )
+            os._exit(0)
+
+        # Allow the bounded session close its budget, then one equal grace
+        # for SDK room/telemetry cleanup. Neither phase can postpone this timer.
+        asyncio.get_running_loop().call_later(
+            2 * PHONE_SHUTDOWN_WATCHDOG_SECONDS, _force_phone_job_exit,
+        )
+
+    if callable(add_shutdown_callback):
+        async def _phone_job_shutdown(_reason: str | None = None) -> None:
+            await _run_teardown(result, gate_error)
+            _arm_phone_job_watchdog()
+
+        add_shutdown_callback(_phone_job_shutdown)
+
     async def _run_gate() -> "phone.PhoneGateResult":
         return await phone.run_phone_gate(
             attempt_id=attempt_id,
@@ -9086,7 +9568,13 @@ async def _run_phone_session(
             speak_gate_line=_speak_gate_line,
             mark_question_asked=_mark_question_asked,
             candidate_name=getattr(instruction_state, "candidate_name", None),
+            gate_phase_out=gate_lifecycle,
         )
+
+    gate_lifecycle: dict[str, bool] = {}
+    gate_error: BaseException | None = None
+    gate_cancelled = False
+    result: phone.PhoneGateResult | None = None
 
     # ONE catch for every spoken line in the gate. `say` raises
     # `PhoneParticipantGone` when the AgentSession has already closed under it,
@@ -9114,41 +9602,69 @@ async def _run_phone_session(
         # conversation budget would cut off a candidate who simply took a few
         # seconds to pick up.
         _gate_wall_clock = _phone_gate_wall_clock_seconds()
-        result = await asyncio.wait_for(_run_gate(), timeout=_gate_wall_clock)
+        gate_task = asyncio.create_task(_run_gate())
+        gate_task_holder[0] = gate_task
+        try:
+            done, _pending = await asyncio.wait(
+                {gate_task}, timeout=_gate_wall_clock,
+            )
+        except asyncio.CancelledError:
+            gate_task.cancel()
+            gate_task.add_done_callback(_consume_detached_task)
+            raise
+        if not done:
+            gate_task.cancel()
+            gate_task.add_done_callback(_consume_detached_task)
+            raise asyncio.TimeoutError
+        result = gate_task.result()
     except asyncio.TimeoutError:
         _log.warn(
             "unknown_event", error_type="phone_gate_outcome",
             schema=phone.GATE_TIMED_OUT,
             duration_sec=_gate_wall_clock,
         )
-        # POST THE TERMINAL. The sibling `PhoneParticipantGone` branch below
-        # has posted it from the day it was written; a timeout that posted
-        # nothing would leave the engagement stuck in `dialing` for the reaper
-        # — a worse outcome than the freeze it replaces. (Until 0105 this also
-        # purged the pre-consent audio; the recording is now kept.)
-        await _post_gate_purging_terminal(events, attempt_id, epoch, "gate_timed_out")
         result = phone.PhoneGateResult(phone.GATE_TIMED_OUT, events=[], spoken=[])
     except phone.PhoneParticipantGone:
         _log.info(
             "unknown_event", error_type="phone_gate_outcome",
             schema=phone.GATE_PARTICIPANT_LEFT,
         )
-        # Post the terminal before returning. Not crashing is only half the
-        # fix: the engagement must leave `dialing`, or the reaper restores it
-        # and the candidate is dialled again. Shared with the wall-clock exit
-        # above — see `_post_gate_purging_terminal`.
-        await _post_gate_purging_terminal(
-            events, attempt_id, epoch, "participant_left",
-        )
         result = phone.PhoneGateResult(
             phone.GATE_PARTICIPANT_LEFT, events=[], spoken=[],
         )
+    except asyncio.CancelledError as exc:
+        if sdk_close_requested:
+            # SDK shutdown is the owner of this cancellation. Convert it to a
+            # truthful participant-left outcome so the outer coordinator still
+            # settles evidence and posts the appropriate pre-consent terminal.
+            result = phone.PhoneGateResult(
+                phone.GATE_PARTICIPANT_LEFT, events=[], spoken=[],
+            )
+        else:
+            gate_cancelled = True
+            gate_error = exc
+            raise
+    except Exception as exc:  # noqa: BLE001 — cleanup owns the durable outcome
+        gate_error = exc
+        _log.warn(
+            "unknown_event", error_type="phone_gate_outcome",
+            schema=phone.GATE_FAILED,
+            error_category="gate_exception",
+        )
+        result = phone.PhoneGateResult(phone.GATE_FAILED, events=[], spoken=[])
     finally:
         # The barrier belongs to the GATE's questions only. Left set, a screening
         # answer whose speech began before the last gate question would be
         # silently dropped, and the screening loop has its own
         # `latest_assistant_anchor` machinery for that job.
         _clear_question_anchor()
+        gate_done.set()
+        if gate_cancelled:
+            # This raise exits before the post-gate finally exists. Preserve
+            # evidence here while leaving terminal ownership to lease/recovery.
+            await _request_room_close()
+            await _run_teardown(result, gate_error)
+            _arm_phone_job_watchdog()
 
 
     # Review repair: cancel a still-running role pre-render once the gate has
@@ -9161,34 +9677,13 @@ async def _run_phone_session(
     if _pt is not None and not _pt.done():
         _pt.cancel()
 
-    # ── 0105: SETTLE THE GATE TRANSCRIPT AND THE RECORDING'S FATE ────────
-    # The gate has spoken. If it concluded the person on the line was NOT the
-    # candidate (a confirmed identity mismatch, or a wrong-number
-    # classification) nothing of theirs is kept: the buffered gate turns are
-    # dropped unsent and the recording is DISCARDED before the teardown below
-    # could upload it — the server no longer purges anything (PR #310 review:
-    # the one remaining purge could never complete against a worker-inband
-    # egress and left the engagement stuck in `dialing`). Every other exit
-    # flushes the buffer, so a call that died at the gate has its transcript.
-    if result.outcome == phone.CLASSIFY_WRONG_NUMBER or bool(
-        getattr(result, "not_the_candidate", False)
-    ):
-        _drop_gate_transcript("not_the_candidate")
-        _rec = recorder_holder[0]
-        if _rec is not None and _rec.active:
-            try:
-                await _rec.discard()
-            except Exception:  # noqa: BLE001 — recording is strictly secondary
-                _log.warn(
-                    "unknown_event", error_type="phone_recording_finish",
-                    error_category="discard_failed",
-                )
-            recorder_holder[1] = None
-            _log.info(
-                "unknown_event", error_type="phone_recording_finish",
-                error_category="discarded_not_the_candidate",
-            )
-    else:
+    if result is None:
+        result = phone.PhoneGateResult(phone.GATE_FAILED, events=[], spoken=[])
+    # The coordinator owns all non-assessment gate exits, including the
+    # wrong-number privacy discard. A consented human must flush the gate
+    # transcript here before entering screening; the coordinator settles it on
+    # every later exit. This keeps discard/finish ownership single-flight.
+    if result.assessment_allowed:
         try:
             await _flush_gate_transcript()
         except Exception:  # noqa: BLE001
@@ -9199,72 +9694,14 @@ async def _run_phone_session(
     # The gate phase is over: nothing after this line is ever flagged as it.
     gate_persist_active[0] = False
 
-    async def _finish_recording() -> None:
-        """PR A SEAM 3: the SINGLE common teardown for the recording.
-
-        Called from the `finally` below, so it covers EVERY terminal return of
-        the post-gate body — the adopt/recover/abort branches inside `_screen`,
-        the lease-halt cancel, the normal completion, and any exception path,
-        INCLUDING the early `assessment_allowed=False` return every gate exit
-        takes. Since 0105 a recording exists from `call.answered`, so that
-        early return is exactly the path a machine pickup, a refusal, a
-        deferral or a consent timeout uploads through: `finish()` — upload +
-        complete — is the one terminal, and the audio is kept whatever the
-        verdict was (owner decision, legal sign-off, 2026-09-26). `discard()`
-        is never the right call here. No-op unless a recording was begun AND an
-        upload URL was minted. Fail-open: nothing here can affect the screening
-        verdict, which has already been decided."""
-        # FIX 4: stop the audio-path health heartbeat before teardown. It also
-        # self-stops when recording goes inactive, but cancelling here is
-        # deterministic and covers the early-return branches below.
-        hb = audio_health_holder[0]
-        if hb is not None and not hb.done():
-            hb.cancel()
-            try:
-                await asyncio.gather(hb, return_exceptions=True)
-            except Exception:  # noqa: BLE001
-                pass
-            audio_health_holder[0] = None
-        recorder = recorder_holder[0]
-        upload_url = recorder_holder[1]
-        if recorder is None or upload_url is None or not recorder.active:
-            return
-        try:
-            manifest = await recorder.finish(upload_url)
-            sid = phone.session_id_from_room_name(room_name)
-            if manifest is None:
-                # A begun recording that could not be closed/transcoded/uploaded
-                # is PERMANENTLY gone (finish() already deleted the local files).
-                # Tell the server so it latches `recording_egress_status=failed`
-                # instead of retrying a never-uploaded object to exhaustion and
-                # showing "Recording is still processing" forever (live
-                # 2026-09-03, EG_worker_a6cc612d).
-                failure = getattr(recorder, "finish_failure", None)
-                if failure is not None and sid is not None:
-                    _log.warn(
-                        "unknown_event", error_type="phone_recording_finish",
-                        error_category=str(failure)[:64],
-                    )
-                    await recording_api.fail_recording(attempt_id, sid, str(failure))
-                return
-            if sid is None:
-                return
-            await recording_api.complete_recording(
-                attempt_id, sid, manifest.sha256, manifest.size_bytes,
-                manifest.duration_ms,
-            )
-        except Exception:  # noqa: BLE001 — recording is strictly secondary
-            _log.warn(
-                "unknown_event", error_type="phone_recording_finish",
-                error_category="finish_failed",
-            )
-
     try:
         if not result.assessment_allowed:
             # Machine, refusal, opt-out, wrong number, silent line: the attempt is
             # over. No scoring is triggered and no writeback is attempted, because
             # neither is reachable from here at all.
-            await _close_phone_room(room_name)
+            await _run_teardown(result, gate_error)
+            if gate_error is not None:
+                raise gate_error
             return result
 
         # ── 0044: the DURABLE screening ───────────────────────────────────
@@ -9278,7 +9715,7 @@ async def _run_phone_session(
                 "unknown_event", error_type="phone_assessment_unstarted",
                 error_category="session_unresolved",
             )
-            await _close_phone_room(room_name)
+            await _request_room_close()
             return result
 
         # ── P5: THE LEASE MUST OUTLIVE THE CONVERSATION ───────────────────
@@ -9370,8 +9807,9 @@ async def _run_phone_session(
                     # end worse than a failed one. The closing line is fixed copy and
                     # is not a transcript turn, so saying it records nothing.
                     await say(phone.PHONE_ASSESSMENT_CLOSING_TEXT)
+                    await _finish_recording()
                     await events.post_event(attempt_id, "assessment.completed")
-                    await _close_phone_room(room_name)
+                    await _request_room_close()
                     return result
 
                 # `session_not_active` WITHOUT a row is the other half: the session was
@@ -9388,8 +9826,9 @@ async def _run_phone_session(
                             error_category=recovered.status,
                         )
                         await say(phone.PHONE_ASSESSMENT_CLOSING_TEXT)
+                        await _finish_recording()
                         await events.post_event(attempt_id, "assessment.completed")
-                        await _close_phone_room(room_name)
+                        await _request_room_close()
                         return result
                     if phone.retryable_completion(recovered):
                         # Still no answer we can act on. Post NOTHING rather than
@@ -9398,12 +9837,15 @@ async def _run_phone_session(
                             "unknown_event", error_type="phone_assessment_halted_leg",
                             error_category=phone.HALT_SCORING,
                         )
-                        await _close_phone_room(room_name)
+                        await _request_room_close()
                         return result
                 # No plan and nothing to recover. The leg ends without claiming
                 # anything; `assessment.aborted` is the truthful terminal.
+                await _finish_recording()
                 await events.post_event(attempt_id, "assessment.aborted")
-                await _close_phone_room(room_name)
+                # Lease loss is intentionally non-terminal: leave the room for
+                # the server-owned reconnect path.
+                pass
                 return result
 
             # 0071 / X4: the session is `in_progress` and the plan is snapshotted,
@@ -9448,6 +9890,9 @@ async def _run_phone_session(
                 coverage_judge_enabled=coverage_judge_enabled,
                 candidate_speaking=candidate_speaking,
                 candidate_speech_ended=candidate_speech_ended,
+                close_room=_request_room_close,
+                close_room_after_evidence=_close_room_after_evidence,
+                before_terminal=_finish_recording,
             )
 
         heartbeat_task = asyncio.create_task(
@@ -9503,6 +9948,12 @@ async def _run_phone_session(
                     )
                     while time.monotonic() < hold_deadline:
                         await asyncio.sleep(phone.PHONE_QUEUED_SCORING_POLL_SEC)
+                        if lease_halt:
+                            _log.warn(
+                                "unknown_event", error_type="phone_scoring_hold",
+                                error_category="lease_lost_no_stale_terminal",
+                            )
+                            return screened
                         outcome = await events.post_event(
                             attempt_id, "assessment.completed",
                         )
@@ -9554,11 +10005,19 @@ async def _run_phone_session(
                     "unknown_event", error_type="phone_assessment_halted_leg",
                     error_category=reason,
                 )
-                await _close_phone_room(room_name)
+                await _request_room_close()
                 return result
+            except Exception as exc:  # noqa: BLE001 — finalizer owns truth
+                gate_error = exc
+                _log.warn(
+                    "unknown_event", error_type="phone_assessment_failed",
+                    error_category="post_consent_exception",
+                )
+                await _request_room_close()
+                raise
         finally:
             heartbeat_task.cancel()
-            await asyncio.gather(heartbeat_task, return_exceptions=True)
+            heartbeat_task.add_done_callback(_consume_detached_task)
             # 0071 / X4: drain any in-flight per-item transcript writes so a clean
             # end does not drop the last turn's persistence. Best-effort and
             # bounded: a wedged write must not stall teardown, and the boundary
@@ -9566,21 +10025,17 @@ async def _run_phone_session(
             if persist_tasks:
                 inflight = [t for t in persist_tasks if not t.done()]
                 if inflight:
-                    try:
-                        await asyncio.wait_for(
-                            asyncio.gather(*inflight, return_exceptions=True),
-                            timeout=PHONE_TERMINAL_REPLY_TIMEOUT_SEC,
-                        )
-                    except asyncio.TimeoutError:
-                        _log.warn(
-                            "unknown_event", error_type="phone_item_persist",
-                            error_category="item_persist_drain_timeout",
-                        )
+                    for task in inflight:
+                        task.cancel()
+                        task.add_done_callback(_consume_detached_task)
     finally:
-        # PR A SEAM 3: finish + complete the in-worker recording on EVERY
-        # terminal path of the post-gate body. No-op unless a recording was
-        # begun after consent; fail-open by construction.
-        await _finish_recording()
+        # One owner settles gate/post-gate evidence, then performs any requested
+        # room delete. It also runs when the caller cancels this task.
+        await _run_teardown(result, gate_error)
+        # Arm after the phone body (including queued scoring) and evidence
+        # settle, not only in the later SDK callback: SDK room/telemetry cleanup
+        # runs before that callback and may itself hang.
+        _arm_phone_job_watchdog()
 
 
 
