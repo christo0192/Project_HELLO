@@ -211,12 +211,12 @@ describe('runtime mapping resolvers', () => {
   it('resolves a mapping by job id with its status, AI stage, and delivery mode', async () => {
     const { client } = fakeSupabase({
       'ashby_job_mappings:select': {
-        data: { id: 'map_1', status: 'enabled', ai_screening_stage_id: 'stage_ai', delivery_mode: 'both' },
+        data: { id: 'map_1', status: 'enabled', ai_screening_stage_id: 'stage_ai', delivery_mode: 'both', activation_at: '2026-09-25T00:00:00Z', activation_epoch: 2, config_version: 3 },
         error: null,
       },
     });
     const r = await runtimeWith(client).resolveMappingByJobId('job_1');
-    expect(r).toEqual({ status: 'enabled', aiScreeningStageId: 'stage_ai', id: 'map_1', deliveryMode: 'both', screeningMode: 'browser_primary' });
+    expect(r).toEqual({ status: 'enabled', aiScreeningStageId: 'stage_ai', id: 'map_1', deliveryMode: 'both', screeningMode: 'browser_primary', activationAt: '2026-09-25T00:00:00Z', activationEpoch: 2, configVersion: 3 });
   });
 
   it('reports unknown for a job with no mapping rather than inventing one', async () => {

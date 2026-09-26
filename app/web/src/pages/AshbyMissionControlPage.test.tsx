@@ -17,7 +17,7 @@ function renderPage() {
   );
 }
 
-const { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm, previewAshbyScorecardBinding, createAshbyMapping, listRoles } = vi.hoisted(() => ({
+const { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm, previewAshbyScorecardBinding, previewAshbyBacklog, confirmAshbyBacklog, createAshbyMapping, listRoles } = vi.hoisted(() => ({
   listAshbyMappings: vi.fn(),
   listAshbyWorkflows: vi.fn(),
   pauseAshbyMapping: vi.fn(),
@@ -27,12 +27,14 @@ const { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMap
   deliverAshbyManualInvite: vi.fn(),
   discoverAshbyFeedbackForm: vi.fn(),
   previewAshbyScorecardBinding: vi.fn(),
+  previewAshbyBacklog: vi.fn(),
+  confirmAshbyBacklog: vi.fn(),
   createAshbyMapping: vi.fn(),
   listRoles: vi.fn(),
 }));
 
 vi.mock('../api', () => ({
-  api: { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm, previewAshbyScorecardBinding, createAshbyMapping, listRoles },
+  api: { listAshbyMappings, listAshbyWorkflows, pauseAshbyMapping, resumeAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm, previewAshbyScorecardBinding, previewAshbyBacklog, confirmAshbyBacklog, createAshbyMapping, listRoles },
   ApiError: class ApiError extends Error {
     status: number;
     constructor(m: string, s: number) { super(m); this.status = s; }
@@ -69,6 +71,8 @@ describe('AshbyMissionControlPage', () => {
     resumeAshbyMapping.mockResolvedValue({ ok: true, status: 'enabled' });
     cancelAshbyWorkflow.mockResolvedValue({ ok: true, cancelled_operations: 1, cancelled_ingestion: 1 });
     retryAshbyOperation.mockResolvedValue({ ok: true });
+    previewAshbyBacklog.mockResolvedValue({ ok: true, preview: { runId: 'run_1', mappingId: 'm1', expectedCount: 2, cap: 500, expiresAt: '2099-01-01T00:00:00.000Z', scope: { jobId: 'job_1', stageId: 'stage_ai' } } });
+    confirmAshbyBacklog.mockResolvedValue({ ok: true, status: 'ok', queued_count: 1 });
     deliverAshbyManualInvite.mockResolvedValue({
       ok: true,
       invite_id: 'inv_1',
@@ -114,6 +118,20 @@ describe('AshbyMissionControlPage', () => {
     listAshbyMappings.mockRejectedValue({ message: 'boom' });
     renderPage();
     expect(await screen.findByRole('alert')).toBeInTheDocument();
+  });
+
+  it('shows the bounded preview and requires a second explicit admin confirmation', async () => {
+    renderPage();
+    await screen.findByText('job_1');
+    await userEvent.click(screen.getAllByRole('button', { name: 'Preview existing backlog' })[0]);
+    expect(await screen.findByText(/snapshot expires/)).toBeInTheDocument();
+    expect(screen.getByText(/future stage entries only/)).toBeInTheDocument();
+    const confirm = screen.getByRole('button', { name: 'Confirm and import this snapshot' });
+    expect(confirm).toBeDisabled();
+    await userEvent.click(screen.getByRole('checkbox'));
+    expect(confirm).toBeEnabled();
+    await userEvent.click(confirm);
+    await waitFor(() => expect(confirmAshbyBacklog).toHaveBeenCalledWith('m1', 'run_1', 2));
   });
 
   it('has no axe violations', async () => {

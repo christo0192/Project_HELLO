@@ -3391,6 +3391,67 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AshbyMcError'
+  /api/integrations/ashby/mission-control/mappings/{id}/backlog/preview:
+    post:
+      tags: [ashby]
+      operationId: previewAshbyBacklog
+      summary: Preview a bounded existing Ashby backlog
+      description: Admin-only read of one enabled mapping's jobId-filtered application list. Validates every returned job and stage, counts before ingestion, and stores an expiring exact-id snapshot. Enabling remains future-stage-only by default; this endpoint imports nothing.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      responses:
+        '200':
+          description: Counted, expiring snapshot preview.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyBacklogPreviewResponse'
+        '409':
+          description: Mapping or safety bound rejected the preview.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AshbyMcError' }
+  /api/integrations/ashby/mission-control/mappings/{id}/backlog/confirm:
+    post:
+      tags: [ashby]
+      operationId: confirmAshbyBacklog
+      summary: Confirm one Ashby backlog snapshot
+      description: Admin-only second confirmation. Requires the run id and exact expected count; the server revalidates expiry, mapping config/generation, scope, and current enablement, then atomically creates or re-drives only the snapshot's stage-centric signals. Duplicate confirmation is idempotent.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [run_id, expected_count]
+              properties:
+                run_id: { type: string, format: uuid }
+                expected_count: { type: integer, minimum: 0, maximum: 500 }
+              additionalProperties: false
+      responses:
+        '200':
+          description: Snapshot queued or already confirmed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyBacklogConfirmResponse'
+        '409':
+          description: Snapshot expired, changed, or count mismatched.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AshbyMcError' }
   /api/integrations/ashby/mission-control/workflows/{id}/cancel:
     post:
       tags: [ashby]
@@ -6994,6 +7055,40 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/AshbyMcMapping'
+      additionalProperties: false
+
+    AshbyBacklogPreview:
+      type: object
+      required: [runId, mappingId, externalJobId, stageId, expectedCount, cap, expiresAt, configVersion, activationEpoch]
+      properties:
+        runId: { type: string, format: uuid }
+        mappingId: { type: string, format: uuid }
+        externalJobId: { type: string }
+        stageId: { type: string }
+        expectedCount: { type: integer, minimum: 0, maximum: 500 }
+        cap: { type: integer, minimum: 1, maximum: 500 }
+        expiresAt: { type: string, format: date-time }
+        configVersion: { type: integer, minimum: 1 }
+        activationEpoch: { type: integer, minimum: 0 }
+      additionalProperties: false
+
+    AshbyBacklogPreviewResponse:
+      type: object
+      required: [ok, preview]
+      properties:
+        ok: { type: boolean }
+        preview:
+          $ref: '#/components/schemas/AshbyBacklogPreview'
+      additionalProperties: false
+
+    AshbyBacklogConfirmResponse:
+      type: object
+      required: [ok, status]
+      properties:
+        ok: { type: boolean }
+        status: { type: string, enum: [ok, already_confirmed] }
+        run_id: { type: string, format: uuid }
+        queued_count: { type: integer, minimum: 0, maximum: 500 }
       additionalProperties: false
 
     AshbyIntegrationState:

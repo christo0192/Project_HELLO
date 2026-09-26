@@ -172,6 +172,7 @@ export interface ReconcileSkipView {
   noEnabledMapping: number;
   stageNotAi: number;
   ambiguousMapping: number;
+  preActivation?: number;
 }
 
 /**
@@ -289,6 +290,7 @@ export function publishReconcilePass(
       noEnabledMapping: safeCount(pass.skipped?.noEnabledMapping),
       stageNotAi: safeCount(pass.skipped?.stageNotAi),
       ambiguousMapping: safeCount(pass.skipped?.ambiguousMapping),
+      preActivation: safeCount(pass.skipped?.preActivation),
     },
     unclassified: safeCount(pass.unclassified),
     enabledMappings: safeCount(pass.enabledMappings),

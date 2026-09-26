@@ -67,6 +67,7 @@ import {
   INVITE_TTL_HOURS,
 } from '../lib/invite-token.js';
 import { env } from '../lib/env.js';
+import { createAshbyBacklogImportStore, MAX_SNAPSHOT_ITEMS, type BacklogImportStore } from '../integrations/ashby/backlog-import.js';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const TERMINAL_STATES = new Set(['withdrawn', 'deleted', 'manual_stage_cancel']);
@@ -106,6 +107,7 @@ function optionalOpaqueId(raw: unknown): string | null | false {
 
 export interface AshbyMissionControlDeps {
   store?: MissionControlStore;
+  backlogImport?: BacklogImportStore;
   /**
    * Injected read-only tenant reader for the stage probe. Production resolves
    * it from the runtime (null when the runtime gates are closed), so a disabled
@@ -147,7 +149,6 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     if (!cached) cached = createMissionControlStore(supabase as never);
     return cached;
   };
-
   // Lazily resolve the probe reader. When any gate is closed the factory
   // returns null, so no client is built and the probe route answers 503
   // without a network call. `undefined` in deps means "resolve from config";
@@ -170,6 +171,14 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
       probeClient = null;
     }
     return probeClient;
+  };
+  let backlogCached: BacklogImportStore | undefined = deps.backlogImport;
+  const backlog = (): BacklogImportStore => {
+    if (backlogCached) return backlogCached;
+    const reader = resolveProbeClient();
+    if (!reader) throw new Error('ashby_backlog_provider_unavailable');
+    backlogCached = createAshbyBacklogImportStore(supabase as never, reader);
+    return backlogCached;
   };
   const resolveProbeReader = (): Parameters<typeof probeJobStages>[1] | null => {
     if (deps.probeReader !== undefined) return deps.probeReader;
@@ -251,6 +260,46 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
 
   router.post('/mappings/:id/pause', requireRole('admin'), (req, res) => { void setStatus(req, res, 'paused'); });
   router.post('/mappings/:id/resume', requireRole('admin'), (req, res) => { void setStatus(req, res, 'enabled'); });
+
+  router.post('/mappings/:id/backlog/preview', requireRole('admin'), async (req: Request, res: Response) => {
+    const id = req.params.id;
+    if (!UUID_RE.test(id)) { res.status(400).json({ ok: false, error: 'invalid_mapping_id' }); return; }
+    const actorId = req.authUser?.id ?? null;
+    if (!actorId) { res.status(403).json({ ok: false, error: 'forbidden' }); return; }
+    try {
+      const preview = await backlog().preview(id, actorId);
+      await recordAudit(req, 'resource.read', 200, { metadata: { resource: 'ashby_backlog_preview', mapping_id: id, count: preview.expectedCount, cap: MAX_SNAPSHOT_ITEMS } });
+      res.json({ ok: true, preview });
+    } catch (err) {
+      const code = err instanceof Error ? err.message : 'ashby_backlog_preview_error';
+      const conflict = new Set(['mapping_not_enabled', 'mapping_incomplete', 'mapping_changed', 'ashby_backlog_cap_exceeded', 'ashby_backlog_page_cap']);
+      const missing = code === 'not_found';
+      res.status(missing ? 404 : conflict.has(code) ? 409 : 503).json({ ok: false, error: code });
+    }
+  });
+
+  router.post('/mappings/:id/backlog/confirm', requireRole('admin'), async (req: Request, res: Response) => {
+    const mappingId = req.params.id;
+    const runId = typeof req.body?.run_id === 'string' ? req.body.run_id : '';
+    const expectedCount = req.body?.expected_count;
+    if (!UUID_RE.test(mappingId) || !UUID_RE.test(runId)) { res.status(400).json({ ok: false, error: 'invalid_backlog_run' }); return; }
+    if (!Number.isSafeInteger(expectedCount) || expectedCount < 0 || expectedCount > MAX_SNAPSHOT_ITEMS) { res.status(400).json({ ok: false, error: 'invalid_expected_count' }); return; }
+    const actorId = req.authUser?.id ?? null;
+    if (!actorId) { res.status(403).json({ ok: false, error: 'forbidden' }); return; }
+    try {
+      const result = await backlog().confirm(mappingId, runId, expectedCount, actorId);
+      const status = result.status;
+      if (status === 'ok' || status === 'already_confirmed') {
+        await recordAudit(req, 'resource.update', 200, { metadata: { resource: 'ashby_backlog_import', mapping_id: mappingId, run_id: runId, count: expectedCount, status } });
+        res.json({ ok: true, status, ...(result.runId ? { run_id: result.runId } : {}), ...(result.queuedCount !== undefined ? { queued_count: result.queuedCount } : {}) });
+        return;
+      }
+      const codeStatus = status === 'not_found' ? 404 : status === 'expired' || status === 'count_mismatch' || status === 'mapping_changed' ? 409 : 503;
+      res.status(codeStatus).json({ ok: false, error: status });
+    } catch {
+      res.status(503).json({ ok: false, error: 'ashby_backlog_confirm_error' });
+    }
+  });
 
   router.post('/workflows/:id/cancel', requireRole('admin'), async (req: Request, res: Response) => {
     const id = req.params.id;

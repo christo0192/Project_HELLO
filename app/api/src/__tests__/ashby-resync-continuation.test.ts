@@ -447,6 +447,7 @@ describe('full-resync page-anchored continuation (0034)', () => {
     for (const r of runs) {
       expect(r.skipped).toEqual({
         noApplicationId: 0, noEnabledMapping: 0, stageNotAi: 0, ambiguousMapping: 0,
+        unclassified: 0, preActivation: 0,
       });
     }
     // Every run after the first began at an anchored cursor, never at page 1.

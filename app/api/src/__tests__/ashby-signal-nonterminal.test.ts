@@ -21,7 +21,11 @@ import {
   CANDIDATE_DELETE_ACTION,
   type SignalWorkerDeps,
 } from '../integrations/ashby/signal-worker.js';
-import { runReconciliation, type ApplicationLister } from '../integrations/ashby/reconciliation.js';
+import {
+  runReconciliation,
+  type ApplicationHistoryLister,
+  type ApplicationLister,
+} from '../integrations/ashby/reconciliation.js';
 import { stageDedupId, CANDIDATE_STAGE_CHANGE_ACTION } from '../integrations/ashby/extractors.js';
 import type {
   ReceiptStore, ReceiptOutcome, AshbySignalPayload,
@@ -209,19 +213,32 @@ function listOf(items: OpaqueRecord[]): ApplicationLister {
   };
 }
 
+function historyOf(enteredStageAt: string): ApplicationHistoryLister {
+  return {
+    async applicationListHistory<T = OpaqueRecord[]>(): Promise<AshbyResult<T>> {
+      return {
+        results: [{ stageId: AI, enteredStageAt, leftStageAt: null }] as unknown as T,
+        moreDataAvailable: false,
+      };
+    },
+  };
+}
+
 describe('B2 regression: enable-after-storm recovers the parked candidate', () => {
-  it('paused → observed → enabled → forced resync → EXACTLY ONE import', async () => {
+  it('paused → observed → timestamp fence → post-enable transition → EXACTLY ONE import', async () => {
     const receipts = new Outbox();
     const checkpoints = new Checkpoints();
     const corpus = [{ application: { id: APP, job: { id: JOB }, currentInterviewStage: { id: AI } } }];
     let enabled: EnabledMappingRow[] = [];
     let mappingStatus: 'paused' | 'enabled' = 'paused';
+    let enteredStageAt = '2026-09-24T00:00:00.000Z';
 
     const reconcile = () => runReconciliation({
       client: listOf(corpus),
       checkpoints,
       receipts,
       mappings: mappingLoader(enabled),
+      history: historyOf(enteredStageAt),
     });
 
     // Drain whatever reconciliation queued, through the real worker decision.
@@ -251,26 +268,34 @@ describe('B2 regression: enable-after-storm recovers the parked candidate', () =
     expect(receipts.rows.size).toBe(0);
     expect(await drainSignals()).toEqual([]);
 
-    // ── 2. The recruiter enables the mapping. Migration 0033 forces the
-    //       full resync in the same transaction as the status flip.
-    enabled = [{ externalJobId: JOB, aiScreeningStageId: AI }];
+    // ── 2. The recruiter enables the mapping. Existing stage entry is before
+    //       the activation fence and is deliberately not imported.
+    enabled = [{
+      externalJobId: JOB,
+      aiScreeningStageId: AI,
+      activationAt: '2026-09-25T00:00:00.000Z',
+      activationEpoch: 1,
+      configVersion: 1,
+    }];
     mappingStatus = 'enabled';
-    await checkpoints.requireFullResync('application.list', 'mapping_enabled');
-    expect(checkpoints.current?.status).toBe('full_resync_required');
 
-    // ── 3. The next pass is a FULL sweep and admits the parked application.
+    // ── 3. The next pass sees the parked application but admits nothing.
     const second = await reconcile();
-    expect(second.mode).toBe('full');
-    expect(second.admitted).toBe(1);
-    expect(receipts.enqueues).toBe(1);
+    expect(second.admitted).toBe(0);
+    expect(receipts.enqueues).toBe(0);
+    expect(await drainSignals()).toEqual([]);
 
-    // ── 4. The worker imports it — exactly once.
+    // ── 4. A genuinely post-enable stage transition is recoverable.
+    enteredStageAt = '2026-09-26T00:00:00.000Z';
+    const third = await reconcile();
+    expect(third.admitted).toBe(1);
+    expect(receipts.enqueues).toBe(1);
     expect(await drainSignals()).toEqual(['import_eligible']);
     expect(receipts.statusOf(stageDedupId(APP, AI))).toBe('processed');
 
     // ── 5. A further pass creates no duplicate work.
-    const third = await reconcile();
-    expect(third.admitted).toBe(1);
+    const fourth = await reconcile();
+    expect(fourth.admitted).toBe(1);
     expect(receipts.enqueues).toBe(1);   // terminal `processed` ⇒ no re-drive
   });
 
@@ -298,8 +323,7 @@ describe('B2 regression: enable-after-storm recovers the parked candidate', () =
     // The load-bearing assertion: NOT terminal, so the application is not lost.
     expect(receipts.statusOf(stageDedupId(APP, AI))).toBe('received');
 
-    // Re-enabled → forced resync → the same application is re-driven and imported.
-    await checkpoints.requireFullResync('application.list', 'mapping_enabled');
+    // Re-enabled → the same application is re-driven and imported.
     const r2 = await runReconciliation({
       client: listOf(corpus), checkpoints, receipts, mappings: mappingLoader(enabled),
     });

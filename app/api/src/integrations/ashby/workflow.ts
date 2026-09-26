@@ -19,6 +19,9 @@
 export interface MappingActivity {
   status: 'enabled' | 'paused' | 'drift' | 'unknown';
   aiScreeningStageId?: string | null;
+  activationAt?: string | null;
+  activationEpoch?: number;
+  configVersion?: number;
 }
 
 /** Authoritative fields re-read from application.info. */

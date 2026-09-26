@@ -25,6 +25,7 @@ import {
   type AshbyEnvelope,
   type AshbyResult,
   type ApplicationListParams,
+  type ApplicationHistoryParams,
   type FeedbackSubmitRequest,
   type FeedbackRequestCreateRequest,
   type OpaqueRecord,
@@ -135,6 +136,8 @@ export interface RequestOptions {
    * failures. Defaults to false (mutations fail closed).
    */
   idempotent?: boolean;
+  /** Internal caller deadline used to shorten the per-request timeout. */
+  deadlineAt?: number;
 }
 
 function defaultTransport(req: AshbyTransportRequest): Promise<AshbyTransportResponse> {
@@ -290,11 +293,18 @@ export class AshbyClient {
 
     let lastError: AshbyError | null = null;
 
+    const retryDelay = (delay: number) => options.deadlineAt === undefined
+      ? delay : Math.max(0, Math.min(delay, options.deadlineAt - Date.now()));
     for (let attempt = 1; attempt <= this.maxAttempts; attempt++) {
       const started = Date.now();
+      if (options.deadlineAt !== undefined && started >= options.deadlineAt) {
+        throw new AshbyError('timeout', { operation, attempt, retriable: true, code: 'deadline_exceeded' });
+      }
       let response: AshbyTransportResponse;
       try {
-        response = await this.send(url, serializedBody, this.timeoutMs);
+        const remaining = options.deadlineAt === undefined ? this.timeoutMs : options.deadlineAt - Date.now();
+        if (remaining <= 0) throw new AshbyError('timeout', { operation, attempt, retriable: false });
+        response = await this.send(url, serializedBody, Math.min(this.timeoutMs, remaining));
       } catch (err) {
         const category = (err as { name?: string })?.name === 'AbortError' ? 'timeout' : 'network';
         lastError = new AshbyError(category, { operation, attempt, retriable: true });
@@ -305,7 +315,7 @@ export class AshbyClient {
           throw new AshbyError(category, { operation, attempt, retriable: false });
         }
         if (attempt < this.maxAttempts) {
-          await this.sleep(this.backoffMs(attempt));
+          await this.sleep(retryDelay(this.backoffMs(attempt)));
           continue;
         }
         break;
@@ -335,7 +345,7 @@ export class AshbyClient {
             const retryAfter = status === 429
               ? parseRetryAfterMs(response.headers.get('retry-after'), this.maxRetryAfterMs)
               : null;
-            await this.sleep(retryAfter ?? this.backoffMs(attempt));
+            await this.sleep(retryDelay(retryAfter ?? this.backoffMs(attempt)));
             continue;
           }
           break;
@@ -368,6 +378,7 @@ export class AshbyClient {
       return {
         results: envelope.results as T,
         moreDataAvailable: envelope.moreDataAvailable === true,
+        moreDataAvailablePresent: typeof envelope.moreDataAvailable === 'boolean',
         nextCursor: typeof envelope.nextCursor === 'string' ? envelope.nextCursor : undefined,
         syncToken: typeof envelope.syncToken === 'string' ? envelope.syncToken : undefined,
       };
@@ -387,7 +398,7 @@ export class AshbyClient {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
-      return await this.transport({
+      const response = await this.transport({
         url,
         method: 'POST',
         headers: {
@@ -398,9 +409,22 @@ export class AshbyClient {
         body,
         signal: controller.signal,
       });
-    } finally {
+      return {
+        status: response.status,
+        ok: response.ok,
+        headers: response.headers,
+        async text() {
+          try { return await response.text(); }
+          finally { clearTimeout(timer); }
+        },
+      };
+    } catch (error) {
       clearTimeout(timer);
+      throw error;
     }
+    // The deadline covers response-body consumption as well as headers.
+    // Clearing it when fetch returns would let a stalled body hang history
+    // admission indefinitely despite the shared reconciliation budget.
   }
 
   /** Exponential backoff with full jitter, bounded by backoffMaxMs. */
@@ -441,7 +465,20 @@ export class AshbyClient {
       if (limit === 0) throw new AshbyError('invalid_request', { code: 'invalid_limit', operation: 'application.list' });
       body.limit = limit;
     }
+    if (params.jobId !== undefined) body.jobId = validateId('application.list', 'jobId', params.jobId);
     return this.request<T>('application.list', body);
+  }
+
+  /** Read the provider's per-application stage history. */
+  async applicationListHistory<T = OpaqueRecord[]>(params: ApplicationHistoryParams): Promise<AshbyResult<T>> {
+    const body: OpaqueRecord = { applicationId: validateId('application.listHistory', 'applicationId', params.applicationId) };
+    if (params.cursor !== undefined) body.cursor = validateId('application.listHistory', 'cursor', params.cursor);
+    if (params.limit !== undefined) {
+      const limit = boundedInt(params.limit, 0, 1, 500);
+      if (limit === 0) throw new AshbyError('invalid_request', { code: 'invalid_limit', operation: 'application.listHistory' });
+      body.limit = limit;
+    }
+    return this.request<T>('application.listHistory', body, { deadlineAt: params.deadlineAt });
   }
 
   /**

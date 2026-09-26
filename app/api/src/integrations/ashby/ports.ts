@@ -14,6 +14,9 @@ export interface AshbySignalPayload {
   action: string;
   /** Opaque external application id (never contact/resume data). May be absent. */
   externalApplicationId?: string;
+  /** Set only by the confirmed, DB-authorized mapping snapshot RPC. */
+  source?: 'webhook' | 'reconcile' | 'explicit_backlog';
+  explicitImportRunId?: string;
 }
 
 /**
@@ -62,7 +65,7 @@ export interface ReceiptStore {
   markStatus?(input: {
     webhookActionId: string;
     action: string;
-    status: 'processing' | 'processed' | 'failed' | 'ignored';
+    status: 'received' | 'processing' | 'processed' | 'failed' | 'ignored';
   }): Promise<void>;
 }
 
@@ -269,6 +272,9 @@ export interface CheckpointStore {
 export interface EnabledMappingRow {
   externalJobId: string;
   aiScreeningStageId: string;
+  activationAt?: string | null;
+  activationEpoch?: number;
+  configVersion?: number;
 }
 
 /**

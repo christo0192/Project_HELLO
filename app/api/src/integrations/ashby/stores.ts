@@ -61,12 +61,17 @@ export function createReceiptStore(client: SupabaseClient): ReceiptStore {
     async markStatus(input): Promise<void> {
       const patch: Record<string, unknown> = { status: input.status };
       if (input.status === 'processed') patch.processed_at = new Date().toISOString();
-      const { error } = await client
+      if (input.status === 'received') patch.processed_at = null;
+      let query = client
         .from('ashby_event_receipts')
         .update(patch)
         .eq('provider', 'ashby')
         .eq('webhook_action_id', input.webhookActionId)
         .eq('action', input.action);
+      // Reopen only a signal's processed handoff that import conditionally
+      // declined before creating a link. Never resurrect ignored/failed work.
+      if (input.status === 'received') query = query.eq('status', 'processed');
+      const { error } = await query;
       if (error) throw new Error('ashby_receipt_status_error');
     },
   };
@@ -259,19 +264,58 @@ export function createMappingResolver(client: SupabaseClient): MappingResolver {
     async resolveByJobId(jobId): Promise<MappingActivity> {
       const { data, error } = await client
         .from('ashby_job_mappings')
-        .select('status, ai_screening_stage_id')
+        .select('status, ai_screening_stage_id, activation_at, activation_epoch, config_version')
         .eq('provider', 'ashby')
         .eq('external_job_id', jobId)
         .maybeSingle();
       if (error) throw new Error('ashby_mapping_read_error');
       if (!data) return { status: 'unknown' };
-      const row = data as { status: string; ai_screening_stage_id: string | null };
+      const row = data as { status: string; ai_screening_stage_id: string | null; activation_at?: string | null; activation_epoch?: number; config_version?: number };
       const status: MappingActivity['status'] =
         row.status === 'enabled' || row.status === 'paused' || row.status === 'drift'
           ? row.status
           : 'unknown';
-      return { status, aiScreeningStageId: row.ai_screening_stage_id };
+      return {
+        status,
+        aiScreeningStageId: row.ai_screening_stage_id,
+        activationAt: row.activation_at ?? null,
+        activationEpoch: row.activation_epoch ?? 0,
+        configVersion: row.config_version ?? 0,
+      };
     },
+  };
+}
+
+/** Authoritative worker-time check for a confirmed mapping snapshot entry. */
+export function createExplicitImportAuthorizer(client: SupabaseClient): (input: {
+  runId: string;
+  applicationId: string;
+  jobId: string;
+  stageId: string;
+}) => Promise<boolean> {
+  return async (input) => {
+    const { data, error } = await client.rpc('authorize_ashby_snapshot_entry', {
+      p_run_id: input.runId,
+      p_application_id: input.applicationId,
+      p_job_id: input.jobId,
+      p_stage_id: input.stageId,
+    });
+    if (error) throw new Error('ashby_snapshot_authorization_error');
+    return (data as { authorized?: unknown } | null)?.authorized === true;
+  };
+}
+
+export function createSnapshotApplicationAuthorizer(client: SupabaseClient): (input: {
+  applicationId: string; jobId: string; stageId: string;
+}) => Promise<boolean> {
+  return async (input) => {
+    const { data, error } = await client.rpc('authorize_ashby_snapshot_application', {
+      p_application_id: input.applicationId,
+      p_job_id: input.jobId,
+      p_stage_id: input.stageId,
+    });
+    if (error) throw new Error('ashby_snapshot_application_authorization_error');
+    return (data as { authorized?: unknown } | null)?.authorized === true;
   };
 }
 
@@ -292,7 +336,7 @@ export function createEnabledMappingLoader(client: SupabaseClient): EnabledMappi
       const bound = Math.max(1, Math.min(Math.trunc(limit), 10_000));
       const { data, error } = await client
         .from('ashby_job_mappings')
-        .select('external_job_id, ai_screening_stage_id')
+        .select('external_job_id, ai_screening_stage_id, activation_at, activation_epoch, config_version')
         .eq('provider', 'ashby')
         .eq('status', 'enabled')
         .not('ai_screening_stage_id', 'is', null)
@@ -308,7 +352,13 @@ export function createEnabledMappingLoader(client: SupabaseClient): EnabledMappi
         const aiScreeningStageId =
           typeof r.ai_screening_stage_id === 'string' ? r.ai_screening_stage_id : '';
         if (!externalJobId || !aiScreeningStageId) continue;
-        rows.push({ externalJobId, aiScreeningStageId });
+        rows.push({
+          externalJobId,
+          aiScreeningStageId,
+          activationAt: typeof r.activation_at === 'string' ? r.activation_at : null,
+          activationEpoch: typeof r.activation_epoch === 'number' ? r.activation_epoch : 0,
+          configVersion: typeof r.config_version === 'number' ? r.config_version : 0,
+        });
       }
       return { rows, truncated };
     },

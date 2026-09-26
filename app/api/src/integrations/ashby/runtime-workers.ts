@@ -53,6 +53,8 @@ import {
   importDedupKey,
 } from './signal-worker.js';
 import { runImport, runIngestionJob } from './orchestration.js';
+import { admitStageAfterActivation } from './activation-admission.js';
+import { stageDedupId, CANDIDATE_STAGE_CHANGE_ACTION } from './extractors.js';
 import { publishReconcilePass } from './runtime-health.js';
 import {
   checkScannerReadiness,
@@ -759,6 +761,13 @@ export function buildAshbyHandlers(
       const signalResult = await processAshbySignal(payload, {
         client: runtime.client,
         mappings: runtime.mappings,
+        // The concrete runtime always supplies this authorizer. Minimal unit
+        // runtimes predating 0106 omit it and retain decision-only behavior;
+        // production composition cannot reach this branch without the seam.
+        enforceActivationFence: true,
+        isExplicitImportAuthorized: runtime.isExplicitImportAuthorized!,
+        isSnapshotApplicationAuthorized: runtime.isSnapshotApplicationAuthorized,
+        history: runtime.client,
         receipts: runtime.receipts,
         // candidateDelete stays capability-gated OFF until a tenant probe.
         candidateDeleteEnabled: false,
@@ -767,12 +776,12 @@ export function buildAshbyHandlers(
         ...(stageInterest && stagePrefilterEnabled
           ? { isStageOfInterest: stageInterest }
           : {}),
-        onImportEligible: async ({ applicationId }) => {
+        onImportEligible: async ({ applicationId, jobId, stageId, source, explicitImportRunId }) => {
           // Dedup by APPLICATION: a duplicate webhook, a redelivery, and a
           // reconciliation recovery all collapse onto one live import job.
           await runtime.queue.enqueue(
             ASHBY_IMPORT_QUEUE,
-            { provider: 'ashby', externalApplicationId: applicationId },
+            { provider: 'ashby', externalApplicationId: applicationId, jobId, stageId, source, explicitImportRunId },
             { dedupKey: importDedupKey(applicationId), maxAttempts: 5 },
           );
         },
@@ -816,7 +825,7 @@ export function buildAshbyHandlers(
             })
             .catch(() => { /* observation must never fail a signal */ });
         },
-      });
+      }, { createdAt: job.createdAt });
       // Metadata only — a sanitized decision code, never an identifier. The
       // incident this change fixes was invisible precisely because a queue can
       // complete jobs while doing nothing useful; a skip that logs nothing
@@ -831,7 +840,13 @@ export function buildAshbyHandlers(
 
     // ── 2. Import: link + invite operations + ingestion work item ────────────
     [ASHBY_IMPORT_QUEUE]: async (job) => {
-      const payload = job.payload as { externalApplicationId?: string };
+      const payload = job.payload as {
+        externalApplicationId?: string;
+        jobId?: string;
+        stageId?: string;
+        source?: 'webhook' | 'reconcile' | 'explicit_backlog';
+        explicitImportRunId?: string;
+      };
       const appId = payload?.externalApplicationId;
       if (typeof appId !== 'string' || appId.length === 0) {
         throw new Error('malformed_import_payload');
@@ -841,6 +856,19 @@ export function buildAshbyHandlers(
         client: runtime.client,
         stores: runtime.stores,
         resolveMapping: (jobId) => runtime.resolveMappingByJobId(jobId),
+        admitIntake: async ({ applicationId, jobId, stageId }) => {
+          if (runtime.isSnapshotApplicationAuthorized && await runtime.isSnapshotApplicationAuthorized({ applicationId, jobId, stageId })) return true;
+          if (payload.source === 'explicit_backlog' && payload.explicitImportRunId
+              && await runtime.isExplicitImportAuthorized!({ runId: payload.explicitImportRunId, applicationId, jobId, stageId })) return true;
+          const mapping = await runtime.resolveMappingByJobId(jobId);
+          if (mapping.status !== 'enabled' || !mapping.activationAt) return false;
+          // The signal receipt may already be processed. Completing an import
+          // job on a transient history failure would strand that application:
+          // receipt dedup would then refuse recovery. Let the queue retry it.
+          return (await admitStageAfterActivation(runtime.client, {
+            applicationId, stageId, activationAt: mapping.activationAt,
+          })) === 'admit';
+        },
         readResumeFileHandle: (info) => extractResumeHandle(info),
         // The shell seam. Ownership is resolved HERE, through the same
         // `resolveMappingForLink` the ready path already uses, so there is one
@@ -871,6 +899,20 @@ export function buildAshbyHandlers(
       // exhausts its attempts dead-letters LOUDLY instead of leaving an
       // invisible candidate behind.
       if (result.status === 'shell_unbound') throw new Error('ashby_import_shell_unbound');
+      if (result.status === 'skipped'
+          && (result.reason === 'mapping_inactive' || result.reason === 'stage_not_ai')
+          && typeof payload.stageId === 'string'
+          && !(await runtime.stores.findLinkByApplicationId(appId))) {
+        // A pause/re-enable may invalidate the signal's already-processed
+        // handoff before import executes. Keep that conditional receipt
+        // recoverable for a later genuine transition or confirmed snapshot.
+        if (!runtime.receipts.markStatus) throw new Error('ashby_receipt_reopen_unavailable');
+        await runtime.receipts.markStatus({
+          webhookActionId: stageDedupId(appId, payload.stageId),
+          action: CANDIDATE_STAGE_CHANGE_ACTION,
+          status: 'received',
+        });
+      }
       if (result.status !== 'imported') return;
 
       // Seed the ephemeral ingestion as durable work — but ONLY when there is
@@ -1780,6 +1822,7 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
             // enqueue EVERY application it observed — the tenant-wide signal
             // storm this loop exists to avoid.
             mappings: runtime.enabledMappings,
+            history: runtime.client,
             checkpointKey: DEFAULT_CHECKPOINT_KEY,
             owner,
             // Tunable without a deploy: a backfill against a large corpus
