@@ -237,10 +237,11 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
     admit_phone_test_attempt: [
       'p_test_gate_id', 'p_engagement_id', 'p_kind', 'p_lease_owner', 'p_lease_seconds', 'p_now',
     ],
-    // 0071.
+    // 0071; 0105 adds p_is_gate between the timing anchor and p_now, so the
+    // pre-consent exchange can be written per item and flagged as the gate.
     commit_phone_item_turn: [
       'p_session_id', 'p_speaker', 'p_text', 'p_source_item_id',
-      'p_turn_started_at_ms', 'p_now',
+      'p_turn_started_at_ms', 'p_is_gate', 'p_now',
     ],
     sweep_phone_stranded_recordings: [
       'p_limit', 'p_grace_seconds', 'p_now',

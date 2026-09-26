@@ -435,7 +435,8 @@ class FakeEventClient:
         return outcome
 
     async def commit_item_turn(
-        self, session_id, speaker, text, source_item_id, turn_started_at_ms=None
+        self, session_id, speaker, text, source_item_id, turn_started_at_ms=None,
+        *, is_gate=False,
     ):
         # Mirror the server's source_item_id dedup: a repeat converges on the
         # original row rather than appending a second.
@@ -448,6 +449,9 @@ class FakeEventClient:
             "text": text,
             "source_item_id": source_item_id,
             "turn_started_at_ms": turn_started_at_ms,
+            # 0105: the gate flag, recorded so a test can tell the pre-consent
+            # exchange from the scored turns exactly as the DB column does.
+            "is_gate": bool(is_gate),
         })
         return phone.PhoneApiOutcome(True, "applied", duplicate=False)
 
@@ -4400,15 +4404,64 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         # each with a distinct stable source_item_id. (The fake models the bot
         # items; the candidate reply hook does not emit a conversation item, so
         # the per-item candidate path is covered by the focused test below.)
-        self.assertGreaterEqual(len(client.item_turns), 2)
-        self.assertTrue(all(t["speaker"] == "bot" for t in client.item_turns))
+        scored = [t for t in client.item_turns if not t.get("is_gate")]
+        self.assertGreaterEqual(len(scored), 2)
+        self.assertTrue(all(t["speaker"] == "bot" for t in scored))
         keys = [t["source_item_id"] for t in client.item_turns]
         self.assertEqual(len(keys), len(set(keys)), "per-item keys must be unique")
-        self.assertTrue(all(k.startswith("phone-item-") for k in keys))
-        # None of the persisted per-item turns is gate copy — the writer is
-        # armed only for the SCORED phase.
-        self.assertTrue(
-            all(not phone.is_gate_copy(t["text"]) for t in client.item_turns))
+        self.assertTrue(all(k.startswith("phone-item-") for k in
+                            (t["source_item_id"] for t in scored)))
+        # None of the SCORED per-item turns is gate copy. (Since 0105 the gate
+        # copy IS persisted — as `is_gate=True` rows with their own key prefix —
+        # and the focused gate-transcript tests below assert that half.)
+        self.assertTrue(all(not phone.is_gate_copy(t["text"]) for t in scored))
+
+    async def test_0105_gate_turns_are_persisted_per_item_and_flagged(self):
+        """0105. The disclosure and every other gate-phase item is written the
+        moment it lands, flagged `is_gate=True`, under its own key prefix — and
+        the scored turns that follow consent stay `is_gate=False`. Before this,
+        the gate transcript had exactly one writer and it ran at consent, so a
+        call that died at the gate left NO transcript (all five on 2026-09-25).
+        """
+        result, client, *_ = await self._run_session(answers=("Yes, that's fine.",))
+        self.assertTrue(result.assessment_allowed)
+        gate = [t for t in client.item_turns if t.get("is_gate")]
+        scored = [t for t in client.item_turns if not t.get("is_gate")]
+        self.assertGreaterEqual(len(gate), 1, "the gate phase persisted nothing")
+        self.assertGreaterEqual(len(scored), 1)
+        # The disclosure itself is now a gate row. The opening that carries it
+        # may be the fixed line or a model-authored greeting that embeds the
+        # recording sentence verbatim, so assert the PROPERTY — the recording
+        # notice the candidate heard is on record — not one exact string.
+        self.assertTrue(any("recorded" in t["text"].lower() for t in gate),
+                        "the recording disclosure was not persisted as a gate row")
+        self.assertTrue(all(t["source_item_id"].startswith("phone-gate-item-") for t in gate))
+        self.assertTrue(all(t["source_item_id"].startswith("phone-item-") for t in scored))
+        # Nothing is flagged as the gate once the scored phase has armed.
+        first_scored_seq = min(int(t["source_item_id"].rsplit("-", 1)[1]) for t in scored)
+        self.assertTrue(all(int(t["source_item_id"].rsplit("-", 1)[1]) < first_scored_seq for t in gate),
+                        "a gate row was written after the scored phase armed")
+        # And the once-at-consent writer stood down: no `gate:` commit was posted.
+        self.assertFalse(any(k.startswith("gate:") for k in getattr(client, "committed_keys", [])))
+
+    async def test_0105_a_call_that_dies_at_the_gate_still_has_a_transcript(self):
+        """0105 — the case that motivated it. A machine verdict ends the call
+        before consent; before 0105 that left zero rows. Now the disclosure the
+        bot spoke is on record, flagged as the gate, with no scored turns.
+        """
+        # `classify_answer_text("")` is None, so the harness classifier falls
+        # through to CLASSIFY_MACHINE: the exact shape of Abhishek's call.
+        result, client, *_ = await self._run_session(answers=("",))
+        self.assertFalse(result.assessment_allowed)
+        self.assertEqual(result.outcome, phone.CLASSIFY_MACHINE)
+        gate = [t for t in client.item_turns if t.get("is_gate")]
+        scored = [t for t in client.item_turns if not t.get("is_gate")]
+        self.assertGreaterEqual(len(gate), 1, "a gate-death left no transcript")
+        # What the candidate actually heard before hanging up — the recording
+        # disclosure — is on record, flagged as the gate.
+        self.assertTrue(any("recorded" in t["text"].lower() for t in gate))
+        self.assertTrue(all(t["source_item_id"].startswith("phone-gate-item-") for t in gate))
+        self.assertEqual(scored, [])
 
     async def test_X4_N_items_persist_N_rows_with_ZERO_boundaries_and_dedup(self):
         """0071 / X4. The property `max+1`-at-boundary can never have: a
@@ -17647,3 +17700,180 @@ class TestDroppedLegOnTheConversationalGate(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── 0105: record from the answer; the gate writer stands down ──────────
+
+class TestRecordFromAnswer(unittest.IsolatedAsyncioTestCase):
+    """The recording begins the instant `call.answered` is confirmed — before a
+    word is spoken — on EVERY path the gate can take after an answer. The
+    consent-time `start_recording` keeps its contract untouched.
+    """
+
+    async def _gate(self, decision, *, participant=True, begin=None, per_item=False,
+                    post_answered=True, speak_opening=None, client=None):
+        recorder = Recorder()
+        client = client if client is not None else FakeEventClient()
+        consent_reply_out: list[str] = []
+
+        async def wait_for_participant():
+            recorder.order.append("participant_wait")
+            return _participant() if participant else None
+
+        async def classify():
+            recorder.order.append("classify")
+            if decision == phone.CLASSIFY_HUMAN:
+                consent_reply_out.append("Yes, that's fine.")
+            return decision
+
+        result = await phone.run_phone_gate(
+            attempt_id=_ATTEMPT_ID,
+            client=client,
+            wait_for_participant=wait_for_participant,
+            classify=classify,
+            say=recorder.say,
+            start_recording=recorder.start_recording,
+            begin_recording_at_answer=begin,
+            gate_turns_per_item=per_item,
+            post_call_answered=post_answered,
+            speak_opening=speak_opening,
+            consent_reply_out=consent_reply_out,
+            epoch=_EPOCH,
+            classify_timeout_sec=0.05,
+            session_id=_SESSION_ID,
+        )
+        return result, client, recorder
+
+    async def _speak_verified_opening(self):
+        return _VERIFIED_OPENING
+
+    def _begin(self, recorder_order, *, raise_=False):
+        calls = []
+
+        async def begin():
+            calls.append(1)
+            recorder_order.append("begin_at_answer")
+            if raise_:
+                raise RuntimeError("prepare exploded")
+        return begin, calls
+
+    async def test_begins_right_after_call_answered_and_BEFORE_the_first_word(self):
+        order: list = []
+        begin, calls = self._begin(order)
+        result, client, recorder = await self._gate(phone.CLASSIFY_HUMAN, begin=begin)
+        # `recorder.order` is the gate's own trail; splice the begin marker in
+        # by index so ordering is asserted against real speech, not a mock.
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(client.event_types[0], "call.answered")
+        first_say = next(i for i, o in enumerate(recorder.order) if o.startswith("say:"))
+        # The begin ran inside the gate between the answer post and the first
+        # spoken line: nothing was said before it.
+        self.assertEqual(recorder.order[:first_say].count("say:"), 0)
+        self.assertEqual(order, ["begin_at_answer"])
+        # The consent-time hook is UNCHANGED: still exactly once, still last.
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(recorder.recording_calls, 1)
+        self.assertEqual(recorder.order[-1], "recording")
+
+    async def test_begins_on_a_MACHINE_pickup_too(self):
+        # The whole point: a call that never consents is still recorded.
+        order: list = []
+        begin, calls = self._begin(order)
+        result, _client, recorder = await self._gate(phone.CLASSIFY_MACHINE, begin=begin)
+        self.assertEqual(result.outcome, phone.CLASSIFY_MACHINE)
+        self.assertFalse(result.assessment_allowed)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(recorder.recording_calls, 0)  # consent hook never fires here
+
+    async def test_begins_on_a_pre_disclosure_DEFERRAL_too(self):
+        order: list = []
+        begin, calls = self._begin(order)
+        result, _client, _recorder = await self._gate(
+            phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE, begin=begin)
+        self.assertFalse(result.assessment_allowed)
+        self.assertEqual(len(calls), 1)
+
+    async def test_no_participant_means_no_begin(self):
+        # Nothing answered: nothing to record, and `call.answered` never posts.
+        order: list = []
+        begin, calls = self._begin(order)
+        result, client, _recorder = await self._gate(phone.CLASSIFY_HUMAN, begin=begin,
+                                                     participant=False)
+        self.assertEqual(result.outcome, phone.GATE_NO_PARTICIPANT)
+        self.assertEqual(calls, [])
+        self.assertEqual(client.calls, [])
+
+    async def test_without_call_answered_there_is_no_begin(self):
+        # The attach gate needs `answered_unclassified`, which `call.answered`
+        # sets. A gate not posting it (legacy/test shape) must not try.
+        order: list = []
+        begin, calls = self._begin(order)
+        await self._gate(phone.CLASSIFY_HUMAN, begin=begin, post_answered=False)
+        self.assertEqual(calls, [])
+
+    async def test_a_begin_that_RAISES_never_touches_the_verdict(self):
+        order: list = []
+        begin, calls = self._begin(order, raise_=True)
+        result, client, recorder = await self._gate(phone.CLASSIFY_HUMAN, begin=begin)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(client.event_types, ["call.answered", "classify.human", "disclosure.delivered"])
+        # ...and the consent-time hook is the fallback that still ran.
+        self.assertEqual(recorder.recording_calls, 1)
+
+    async def test_absent_seam_is_byte_identical_to_before(self):
+        result, client, recorder = await self._gate(phone.CLASSIFY_HUMAN, begin=None)
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(recorder.recording_calls, 1)
+        self.assertEqual(client.event_types, ["call.answered", "classify.human", "disclosure.delivered"])
+
+    async def test_per_item_mode_stands_the_once_writer_down(self):
+        # With per-item gate rows, `commit_gate_turns` would answer
+        # `already_recorded` at best and duplicate a line at worst. Skipped —
+        # on the SAME path that, in legacy mode below, commits exactly once.
+        result, client, _rec = await self._gate(
+            phone.CLASSIFY_HUMAN, per_item=True,
+            speak_opening=self._speak_verified_opening,
+            client=_AtomicEventClient())
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(client.gate_commits, [])
+
+    async def test_legacy_mode_still_commits_the_gate_turns_once(self):
+        # The pre-0105 contract, unchanged when the seam is off: a captured
+        # opening and the consent reply are committed once, keyed gate:<session>.
+        result, client, _rec = await self._gate(
+            phone.CLASSIFY_HUMAN, per_item=False,
+            speak_opening=self._speak_verified_opening,
+            client=_AtomicEventClient())
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(len(client.gate_commits), 1)
+        self.assertEqual(client.gate_commits[0]["source_event_id"], f"gate:{_SESSION_ID}")
+
+
+class TestItemTurnClientGateFlag(unittest.IsolatedAsyncioTestCase):
+    async def test_is_gate_travels_only_when_true(self):
+        """0105. The gate flag is on the wire ONLY for a gate turn, so a scored
+        turn's body is byte-identical to 0071's and every existing route and
+        server test keeps its meaning."""
+        client = phone.PhoneEventClient()
+        posts: list = []
+
+        async def fake_post(path, body, hint):
+            posts.append((path, body))
+            return types.SimpleNamespace(
+                status_code=200,
+                json=lambda: {"ok": True, "status": "applied", "duplicate": False},
+            )
+
+        with patch.object(client, "_post", fake_post):
+            gate = await client.commit_item_turn(
+                "sid-1", "bot", phone.PHONE_DISCLOSURE_TEXT, "phone-gate-item-1",
+                is_gate=True)
+            scored = await client.commit_item_turn(
+                "sid-1", "candidate", "Three years.", "phone-item-2", 1723000000123)
+        self.assertTrue(gate.ok and scored.ok)
+        self.assertEqual(posts[0][0], phone.ITEM_TURN_PATH)
+        self.assertIs(posts[0][1]["is_gate"], True)
+        self.assertNotIn("is_gate", posts[1][1])
+        self.assertEqual(posts[1][1]["turn_started_at_ms"], 1723000000123)
+

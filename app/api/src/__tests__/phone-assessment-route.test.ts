@@ -554,8 +554,33 @@ describe('POST /assessment/item-turn — the per-item transcript writer', () => 
       text: 'About four years.',
       sourceItemId: 'phone-item-7',
       turnStartedAtMs: null,
+      // 0105: an unflagged item is a SCORED turn, said explicitly rather than
+      // left to the store or the DB default.
+      isGate: false,
       now: NOW,
     });
+  });
+
+  it('0105: is_gate:true reaches the store as isGate:true — the pre-consent transcript', async () => {
+    // The disclosure, the identity turn and the consent reply are written as
+    // they happen so a call that dies at the gate still has a transcript.
+    // Dropping this passthrough would silently file every gate line as a
+    // scored turn, feeding the consent chatter into the resume context.
+    const h = build();
+    const res = await post(h, '/assessment/item-turn', {
+      ...ITEM_BODY, source_item_id: 'phone-gate-item-1', is_gate: true,
+    });
+    expect(res.status).toBe(200);
+    expect(h.commitItemTurn).toHaveBeenCalledWith(
+      expect.objectContaining({ sourceItemId: 'phone-gate-item-1', isGate: true }),
+    );
+  });
+
+  it('0105: is_gate must be a boolean — a string is a flat 400', async () => {
+    const h = build();
+    const res = await post(h, '/assessment/item-turn', { ...ITEM_BODY, is_gate: 'true' });
+    expect(res.status).toBe(400);
+    expect(h.commitItemTurn).not.toHaveBeenCalled();
   });
 
   it('a duplicate delivery is 200 and carries duplicate:true', async () => {

@@ -1149,6 +1149,9 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
         p_text: input.text,
         p_source_item_id: input.sourceItemId,
         p_turn_started_at_ms: input.turnStartedAtMs ?? null,
+        // 0105. Sent explicitly rather than omitted-when-false so the wire
+        // shape is one shape, and the DB's default never has to be inferred.
+        p_is_gate: input.isGate === true,
         p_now: isoInstant(input.now),
       });
       if (error) throw new Error('phone_commit_item_turn_error');

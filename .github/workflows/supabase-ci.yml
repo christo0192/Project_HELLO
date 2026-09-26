@@ -12,6 +12,7 @@ on:
       - 'scripts/test-scorecard-partial.sh'
       - 'scripts/test-scorecard-scale.sh'
       - 'scripts/test-candidate-questions.sh'
+      - 'scripts/test-gate-transcript.sh'
       - 'scripts/phone-canary/**'
       - 'docs/runbooks/synthetic-*.md'
       - 'docs/runbooks/supabase-*.md'
@@ -35,6 +36,7 @@ on:
       - 'scripts/test-scorecard-partial.sh'
       - 'scripts/test-scorecard-scale.sh'
       - 'scripts/test-candidate-questions.sh'
+      - 'scripts/test-gate-transcript.sh'
       - 'scripts/phone-canary/**'
       - 'docs/runbooks/synthetic-*.md'
       - 'docs/runbooks/supabase-*.md'
@@ -119,6 +121,18 @@ jobs:
       # first EXECUTION anywhere would be a live candidate's phone ringing.
       - name: Per-candidate question plan 0103 (isolated real Postgres)
         run: bash scripts/test-candidate-questions.sh
+
+  gate-transcript-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      # 0105 lets the worker write the pre-consent transcript per item, before
+      # consent. 0070 derives the consent-skip signal from those very rows. The
+      # invariant that keeps that from being a consent bypass lives in two
+      # functions written a year apart, and only EXECUTION proves it holds.
+      - name: Per-item gate transcript 0105 (isolated real Postgres)
+        run: bash scripts/test-gate-transcript.sh
 
   supabase-static-security:
     runs-on: ubuntu-latest

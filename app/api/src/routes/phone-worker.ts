@@ -106,59 +106,38 @@ const phoneWorkerLog = createLogger('phone-worker');
  * was answered — and that charges a real candidate's anti-harassment budget.
  */
 /**
- * The events after which a recording may exist but MUST be destroyed before the
- * event posts. The posture since 0067 is "record from answer, keep only if
- * consented": the egress now starts at `call.answered`, BEFORE consent, so every
- * exit that ends the engagement without consent — a refusal, an opt-out, a wrong
- * number, a machine pickup, or a pre-disclosure deferral — must delete and
- * verify the pre-consent audio in the SAME step, before the terminal (or
- * deferral) event's transition and any suppression it carries commits.
+ * The events after which the engagement's recordings are destroyed before the
+ * event posts.
  *
- * The purge is idempotent and fails closed: an attempt that has recordings but
- * whose egress never finalized is still enumerated and cleared, and a purge that
+ * ── SINCE 0105 THIS IS ONE EVENT, AND THE HISTORY MATTERS ────────────
+ * The posture from 0067 to 0104 was "record from answer, keep only if
+ * consented": five non-consenting exits — a refusal, an opt-out, a wrong
+ * number, a machine pickup and a pre-disclosure deferral — each purged the
+ * pre-consent audio before acknowledging. On 2026-09-25 five real candidates
+ * were dialled and every call ended inside the gate; afterwards there was no
+ * audio and no transcript for any of them, and the team was blind to what the
+ * candidates had actually heard.
+ *
+ * The owner's decision, with legal sign-off (2026-09-26): the recording and
+ * the transcript persist from the start of the call regardless of whether
+ * consent is reached. So the four exits that are about the CANDIDATE's own
+ * consent no longer purge. They still post, still transition, still suppress
+ * where 0042 says they do — they simply leave the audio where it is.
+ *
+ * `candidate.wrong_number` stays. It is not about the candidate's consent at
+ * all: a stranger answered, and there is no diagnostic or business reason to
+ * keep a stranger's voice. It is the one member, and it is deliberately alone.
+ *
+ * `consent.failed` was never here (0095): the purge is ENGAGEMENT-wide, that
+ * event is non-terminal, and an earlier leg of the same engagement can hold a
+ * consented recording. That reasoning is now moot for the four removed events
+ * too, and stands for the one that remains.
+ *
+ * The purge itself is unchanged: idempotent, fails closed, and a purge that
  * cannot verify deletion leaves the request unacknowledged and retryable.
  */
 export const PURGE_BEFORE_EVENTS: ReadonlySet<string> = new Set([
-  'disclosure.refused',
-  'candidate.opt_out',
   'candidate.wrong_number',
-  // 0067: recordings may now exist pre-consent, so these two non-consenting
-  // exits must destroy them before the event posts, exactly like the refusals.
-  'classify.machine',
-  'candidate.deferred_pre_disclosure',
-  // ── `consent.failed` IS DELIBERATELY NOT HERE (0095) ──────────────────
-  //
-  // It was, and an adversarial review found it destroys consented audio.
-  //
-  // THE PURGE IS ENGAGEMENT-WIDE, not attempt-wide:
-  // `list_phone_engagement_recordings` (0043:1074) enumerates EVERY attempt of
-  // the engagement with a recording key, the purge deletes and verifies all of
-  // them, and `clear_phone_attempt_recordings` (0043:1141) then nulls the keys
-  // on all of them. That is safe for every member above because each of those
-  // is BOTH terminal and pre-consent, so no sibling attempt can be holding
-  // consented audio.
-  //
-  // `consent.failed` is neither. It is non-terminal (the engagement goes to
-  // `awaiting_retry`), so an engagement can carry an EARLIER attempt that
-  // reached consent and recorded a real screening. `run_phone_gate` normally
-  // short-circuits on a reconnect into an already-consented call
-  // (`phone.py` — `gate_recorded` returns early), which would make this
-  // unreachable — except that path "fails OPEN toward gating": any
-  // `fetch_durable_consent` error falls through and re-runs the full gate.
-  // A transport blip there, during exactly the kind of incident this event
-  // reports, re-runs the gate on a consented call, fails it, and deletes the
-  // first leg's recording of a screening that really happened. Irreversibly.
-  //
-  // Doing nothing here is NOT a regression: before 0095 these three exits
-  // posted no event and purged nothing, so pre-consent audio was retained
-  // exactly as it is now. The improvement is deferred, not the invariant.
-  //
-  // FOLLOW-UP (required, not optional): an ATTEMPT-scoped purge —
-  // `list_phone_attempt_recordings(p_attempt_id)` +
-  // `clear_phone_attempt_recordings(p_attempt_id)` — which lets this event
-  // destroy its own leg's audio without touching a sibling's. That is a new
-  // pair of RPCs on the destructive path and belongs in its own change, with
-  // its own review, not bolted onto this one.
 ]);
 
 export const WORKER_PHONE_EVENTS = [
@@ -439,6 +418,9 @@ const itemTurnSchema = z
     text: z.string().trim().min(1).max(8_000),
     source_item_id: z.string().trim().regex(/^[A-Za-z0-9_.:-]{1,200}$/),
     turn_started_at_ms: z.number().int().positive().lt(4_102_444_800_000).nullable().optional(),
+    // 0105. The worker sends `true` for the disclosure/identity/consent
+    // exchange so it is persisted as the gate transcript, as it happens.
+    is_gate: z.boolean().optional(),
   })
   .strict();
 
@@ -897,14 +879,14 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       if (!parsed.success) {
         return res.status(400).json({ ok: false, error: 'invalid_request' });
       }
-      // ── B-3: PURGE BEFORE ACKNOWLEDGING A REFUSAL ───────────────────
-      // `disclosure.refused`, `candidate.opt_out` and `candidate.wrong_number`
-      // are TERMINAL in 0042, and the terminal transition writes the
-      // suppression in the SAME transaction. Posting one of them before the
-      // audio is gone commits "this line is suppressed and this engagement is
-      // over" on top of a recording still sitting in the bucket — and it is
-      // invisible afterwards, because the engagement reads as correctly opted
-      // out.
+      // ── B-3: PURGE BEFORE ACKNOWLEDGING A WRONG NUMBER ──────────────
+      // Since 0105 this fires for `candidate.wrong_number` alone — see the
+      // note on `PURGE_BEFORE_EVENTS`. It is TERMINAL in 0042 and the terminal
+      // transition writes the suppression in the SAME transaction, so posting
+      // it before the audio is gone would commit "this line is suppressed and
+      // this engagement is over" on top of a stranger's recording still in the
+      // bucket — invisible afterwards, because the engagement reads as
+      // correctly closed.
       //
       // So the purge runs FIRST, and the event is posted only when the purge
       // says it is safe to acknowledge. A purge that could not verify deletion
@@ -1569,6 +1551,7 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         text: parsed.data.text,
         sourceItemId: parsed.data.source_item_id,
         turnStartedAtMs: parsed.data.turn_started_at_ms ?? null,
+        isGate: parsed.data.is_gate === true,
         now: now(),
       });
       if (result.status === 'applied') {
