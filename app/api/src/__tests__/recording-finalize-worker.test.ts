@@ -37,6 +37,7 @@ vi.mock('../lib/supabase.js', () => ({ supabase: {} }));
 
 import {
   finalizeAuthoritativeRecording,
+  finalizeWorkerInbandAttemptRecording,
   finalizeWorkerInbandRecording,
   isWorkerInbandEgressId,
   markWorkerRecordingFailed,
@@ -58,10 +59,12 @@ const MANIFEST_KEY = `${OBJECT_KEY}.json`;
 function fakeDb(opts: {
   callSessionRows: unknown[];
   phoneAttemptRow?: unknown;
+  parentSessionRow?: unknown;
   bytes?: Buffer;
   downloadError?: boolean;
   manifestUploadError?: boolean;
   existingManifestBytes?: Buffer | null;
+  updateRows?: unknown[];
 }) {
   const updates: Record<string, unknown>[] = [];
   const rpc = vi.fn().mockResolvedValue({ data: { status: 'ok' }, error: null });
@@ -79,16 +82,17 @@ function fakeDb(opts: {
       eq: vi.fn(() => chain),
       is: vi.fn(() => chain),
       not: vi.fn(() => chain),
+      or: vi.fn(() => chain),
       order: vi.fn(() => chain),
       limit: vi.fn(() => chain),
       single: vi.fn(async () => ({ data: opts.callSessionRows.shift() ?? null, error: null })),
       maybeSingle: vi.fn(async () => ({
-        data: table === 'phone_call_attempts' ? (opts.phoneAttemptRow ?? null) : null,
+        data: table === 'phone_call_attempts' ? (opts.phoneAttemptRow ?? null) : (opts.parentSessionRow ?? null),
         error: null,
       })),
       then: (resolve: (value: unknown) => void) => resolve(
         operation === 'update'
-          ? { data: [{ id: SESSION }], error: null }
+          ? { data: opts.updateRows ?? [{ id: SESSION }], error: null }
           : { data: [], error: null },
       ),
     };
@@ -331,6 +335,89 @@ describe('finalizeWorkerInbandRecording — no egress stop/poll', () => {
   });
 });
 
+describe('finalizeWorkerInbandAttemptRecording — 0107 attempt readiness', () => {
+  it('persists server-observed integrity metadata without touching a session slot', async () => {
+    const bytes = Buffer.concat([Buffer.from('ID3'), Buffer.from('verified attempt mp3')]);
+    const { db, updates, uploadCalls } = fakeDb({
+      callSessionRows: [],
+      phoneAttemptRow: {
+        recording_session_id: SESSION,
+        recording_object_key: OBJECT_KEY,
+        recording_manifest_key: MANIFEST_KEY,
+        recording_ready: false,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+        egress_id: WORKER_EGRESS_ID,
+        egress_status: 'active',
+      },
+      parentSessionRow: {
+        recording_revoked_at: null,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+      },
+      bytes,
+    });
+    await expect(finalizeWorkerInbandAttemptRecording(ATTEMPT, { db })).resolves.toBe('ready');
+    expect(uploadCalls).toHaveLength(1);
+    expect(updates).toContainEqual(expect.objectContaining({
+      recording_sha256: createHash('sha256').update(bytes).digest('hex'),
+      recording_size_bytes: bytes.length,
+      recording_content_type: 'audio/mpeg',
+      recording_ready: true,
+    }));
+  });
+
+  it('fails closed on bytes without a recognized audio magic header', async () => {
+    const { db, updates, uploadCalls } = fakeDb({
+      callSessionRows: [],
+      phoneAttemptRow: {
+        recording_session_id: SESSION,
+        recording_object_key: OBJECT_KEY,
+        recording_manifest_key: MANIFEST_KEY,
+        recording_ready: false,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+        egress_id: WORKER_EGRESS_ID,
+        egress_status: 'active',
+      },
+      parentSessionRow: {
+        recording_revoked_at: null,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+      },
+      bytes: Buffer.from('not audio'),
+    });
+    await expect(finalizeWorkerInbandAttemptRecording(ATTEMPT, { db })).resolves.toBe('fallback_required');
+    expect(uploadCalls).toHaveLength(0);
+    expect(updates).toHaveLength(0);
+  });
+
+  it('does not report ready when the recording_ready=false CAS updates zero rows', async () => {
+    const bytes = Buffer.concat([Buffer.from('ID3'), Buffer.from('race payload')]);
+    const { db } = fakeDb({
+      callSessionRows: [],
+      phoneAttemptRow: {
+        recording_session_id: SESSION,
+        recording_object_key: OBJECT_KEY,
+        recording_manifest_key: MANIFEST_KEY,
+        recording_ready: false,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+        egress_id: WORKER_EGRESS_ID,
+        egress_status: 'active',
+      },
+      parentSessionRow: {
+        recording_revoked_at: null,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+      },
+      bytes,
+      updateRows: [],
+    });
+    await expect(finalizeWorkerInbandAttemptRecording(ATTEMPT, { db })).resolves.toBe('fallback_required');
+  });
+});
+
 describe('worker-inband failure latching (live 2026-09-03, EG_worker_a6cc612d)', () => {
   // The worker's finish() failed silently, its local audio was already deleted,
   // and the finalizer retried the never-uploaded key to exhaustion while the
@@ -343,6 +430,14 @@ describe('worker-inband failure latching (live 2026-09-03, EG_worker_a6cc612d)',
       callSessionRows: [
         { recording_egress_id: WORKER_EGRESS_ID, recording_object_key: null },
       ],
+      phoneAttemptRow: {
+        session_id: SESSION,
+        recording_session_id: SESSION,
+        egress_id: WORKER_EGRESS_ID,
+        recording_ready: false,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+      },
     });
     const status = await markWorkerRecordingFailed(SESSION, ATTEMPT, { db });
     expect(status).toBe('failed_latched');
@@ -352,14 +447,37 @@ describe('worker-inband failure latching (live 2026-09-03, EG_worker_a6cc612d)',
     expect(latch!.recording_finalize_defer_reason).toBe('provider_error');
   });
 
-  it('markWorkerRecordingFailed never clobbers a linked recording', async () => {
+  it('latches a gate-death attempt independently when the reusable session slot is unclaimed', async () => {
+    const { db } = fakeDb({
+      callSessionRows: [{ recording_egress_id: null, recording_object_key: null }],
+      phoneAttemptRow: {
+        session_id: null,
+        recording_session_id: SESSION,
+        egress_id: WORKER_EGRESS_ID,
+        recording_ready: false,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+      },
+    });
+    await expect(markWorkerRecordingFailed(SESSION, ATTEMPT, { db })).resolves.toBe('failed_latched');
+  });
+
+  it('markWorkerRecordingFailed never clobbers a linked parent recording, but latches its attempt', async () => {
     const { db, updates } = fakeDb({
       callSessionRows: [
         { recording_egress_id: WORKER_EGRESS_ID, recording_object_key: OBJECT_KEY },
       ],
+      phoneAttemptRow: {
+        session_id: SESSION,
+        recording_session_id: SESSION,
+        egress_id: WORKER_EGRESS_ID,
+        recording_ready: false,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+      },
     });
-    expect(await markWorkerRecordingFailed(SESSION, ATTEMPT, { db })).toBe('already_linked');
-    expect(updates).toHaveLength(0);
+    expect(await markWorkerRecordingFailed(SESSION, ATTEMPT, { db })).toBe('failed_latched');
+    expect(updates).toEqual([{ egress_status: 'failed', recording_ready: false }]);
   });
 
   it('markWorkerRecordingFailed refuses a real (non-worker) egress id', async () => {
@@ -367,6 +485,14 @@ describe('worker-inband failure latching (live 2026-09-03, EG_worker_a6cc612d)',
       callSessionRows: [
         { recording_egress_id: 'EG_realegress123', recording_object_key: null },
       ],
+      phoneAttemptRow: {
+        session_id: SESSION,
+        recording_session_id: SESSION,
+        egress_id: 'EG_realegress123',
+        recording_ready: false,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+      },
     });
     expect(await markWorkerRecordingFailed(SESSION, ATTEMPT, { db })).toBe('not_worker_inband');
     expect(updates).toHaveLength(0);
@@ -439,8 +565,133 @@ describe('markWorkerRecordingFailed — attempt binding + truthful latch outcome
         // The session's CURRENT binding belongs to the newer attempt.
         { recording_egress_id: `EG_worker_${NEWER_ATTEMPT}`, recording_object_key: null },
       ],
+      phoneAttemptRow: {
+        session_id: SESSION,
+        recording_session_id: SESSION,
+        egress_id: WORKER_EGRESS_ID,
+        recording_ready: false,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+      },
+    });
+    expect(await markWorkerRecordingFailed(SESSION, ATTEMPT, { db })).toBe('failed_latched');
+    expect(updates).toEqual([{ egress_status: 'failed', recording_ready: false }]);
+  });
+
+  it('latches a null-session gate-death attempt without claiming the reusable session slot', async () => {
+    const { db, updates } = fakeDb({
+      callSessionRows: [{ recording_egress_id: null, recording_object_key: null }],
+      phoneAttemptRow: {
+        session_id: null,
+        recording_session_id: SESSION,
+        egress_id: WORKER_EGRESS_ID,
+        recording_ready: false,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+      },
+    });
+    expect(await markWorkerRecordingFailed(SESSION, ATTEMPT, { db })).toBe('failed_latched');
+    expect(updates).toEqual([{ egress_status: 'failed', recording_ready: false }]);
+  });
+
+  it('latches a consenting own-primary failure on both attempt and session', async () => {
+    const { db, updates } = fakeDb({
+      callSessionRows: [{ recording_egress_id: WORKER_EGRESS_ID, recording_object_key: null }],
+      phoneAttemptRow: {
+        session_id: SESSION,
+        recording_session_id: SESSION,
+        egress_id: WORKER_EGRESS_ID,
+        recording_ready: false,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+      },
+    });
+    expect(await markWorkerRecordingFailed(SESSION, ATTEMPT, { db })).toBe('failed_latched');
+    expect(updates).toEqual([
+      { egress_status: 'failed', recording_ready: false },
+      { recording_egress_status: 'failed', recording_finalize_defer_reason: 'provider_error' },
+    ]);
+  });
+
+  it('latches a supplementary failure without changing a verified parent audio object', async () => {
+    const { db, updates } = fakeDb({
+      callSessionRows: [{ recording_egress_id: `EG_worker_other-attempt`, recording_object_key: 'verified.mp3' }],
+      phoneAttemptRow: {
+        session_id: SESSION,
+        recording_session_id: SESSION,
+        egress_id: WORKER_EGRESS_ID,
+        recording_ready: false,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+      },
+    });
+    expect(await markWorkerRecordingFailed(SESSION, ATTEMPT, { db })).toBe('failed_latched');
+    expect(updates).toEqual([{ egress_status: 'failed', recording_ready: false }]);
+  });
+
+  it('rejects a binding mismatch before any latch', async () => {
+    const OTHER_SESSION = '77777777-6666-4777-8666-555555555555';
+    const { db, updates } = fakeDb({
+      callSessionRows: [{ recording_egress_id: WORKER_EGRESS_ID, recording_object_key: null }],
+      phoneAttemptRow: {
+        session_id: OTHER_SESSION,
+        recording_session_id: OTHER_SESSION,
+        egress_id: WORKER_EGRESS_ID,
+        recording_ready: false,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+      },
     });
     expect(await markWorkerRecordingFailed(SESSION, ATTEMPT, { db })).toBe('attempt_mismatch');
     expect(updates).toHaveLength(0);
+  });
+
+  it('does not overwrite an attempt that became ready before a late failure report', async () => {
+    const { db, updates } = fakeDb({
+      callSessionRows: [{ recording_egress_id: WORKER_EGRESS_ID, recording_object_key: OBJECT_KEY }],
+      phoneAttemptRow: {
+        session_id: SESSION,
+        recording_session_id: SESSION,
+        egress_id: WORKER_EGRESS_ID,
+        recording_ready: true,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+      },
+    });
+    expect(await markWorkerRecordingFailed(SESSION, ATTEMPT, { db })).toBe('already_linked');
+    expect(updates).toHaveLength(0);
+  });
+
+  it('does not claim success when the attempt CAS changes zero rows and readback is unknown', async () => {
+    const { db, updates } = fakeDb({
+      callSessionRows: [{ recording_egress_id: WORKER_EGRESS_ID, recording_object_key: null }],
+      phoneAttemptRow: {
+        session_id: SESSION,
+        recording_session_id: SESSION,
+        egress_id: WORKER_EGRESS_ID,
+        recording_ready: false,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+      },
+      updateRows: [],
+    });
+    expect(await markWorkerRecordingFailed(SESSION, ATTEMPT, { db })).toBe('latch_failed');
+    expect(updates).toEqual([{ egress_status: 'failed', recording_ready: false }]);
+  });
+
+  it('does not relabel a terminal parent status when a late report sees no object key', async () => {
+    const { db, updates } = fakeDb({
+      callSessionRows: [{ recording_egress_id: WORKER_EGRESS_ID, recording_object_key: null, recording_egress_status: 'complete' }],
+      phoneAttemptRow: {
+        session_id: SESSION,
+        recording_session_id: SESSION,
+        egress_id: WORKER_EGRESS_ID,
+        recording_ready: false,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+      },
+    });
+    expect(await markWorkerRecordingFailed(SESSION, ATTEMPT, { db })).toBe('failed_latched');
+    expect(updates).toEqual([{ egress_status: 'failed', recording_ready: false }]);
   });
 });

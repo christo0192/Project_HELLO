@@ -16,6 +16,7 @@ export type { SeekableTranscriptProps } from './SeekableTranscript';
 export {
   CandidateProfileCard,
   SessionsSummary,
+  PhoneAttemptHistory,
   NotesList,
   DecisionBlockedBanner,
   Field,

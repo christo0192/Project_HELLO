@@ -167,7 +167,8 @@ describe('1. every phone write goes through an RPC', () => {
     // 0096 added ONE: `sweep_phone_orphan_sessions`, the reaper for a
     // never-dialled `waiting` session — the only shape no existing sweep can
     // see, and the one that held a worker lease for four days.
-    expect(new Set(rpcCalls).size).toBe(37);
+    // 0107 adds the evidence-only pre-consent attempt/session binding RPC.
+    expect(new Set(rpcCalls).size).toBe(38);
     // The write seam reaches NO table, only RPCs.
     expect(writeBody, 'stores.ts uses a table accessor').not.toMatch(/\bclient\s*\.\s*from\s*\(/);
     // A type-only import of the client type is fine; a VALUE import is not.
@@ -382,6 +383,8 @@ describe('2. no provider, no dialing, no network, no Ashby mutation', () => {
       'lib/phone-runtime/due-loop.ts',
       'lib/phone-runtime/read.ts',
       'lib/phone-runtime/runtime.ts',
+      // 0107 derives the attempt object key from the same pure domain helper.
+      'lib/recording-egress.ts',
       // PR105 — Canary-1's operator CLI. It imports the domain core for ONE
       // reason: it builds a `PhoneScreeningConfig` IN PROCESS and calls
       // `isDialAllowedForDigest` on it, so the real permission gate is on the

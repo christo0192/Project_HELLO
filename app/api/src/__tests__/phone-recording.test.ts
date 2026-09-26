@@ -77,6 +77,7 @@ function harness(opts: {
     order.push('attach');
     return (opts.attach ?? { status: 'ok', duplicate: false }) as never;
   });
+  const bind = vi.fn(async () => ({ status: 'ok', bound: true }));
   const finalize = vi.fn(async () => {
     order.push('finalize');
     return { status: 'ok' } as never;
@@ -92,6 +93,7 @@ function harness(opts: {
 
   const stores = {
     listEngagementRecordings: list,
+    bindPhoneAttemptRecordingSession: bind,
     attachAttemptRecording: attach,
     finalizeAttemptRecording: finalize,
     stampSessionEgress: stamp,

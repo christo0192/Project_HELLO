@@ -34,12 +34,17 @@ import { isPublicRoute, PUBLIC_ROUTES } from '../lib/auth.js';
 import { setRateLimitStore, MemoryRateLimitStore } from '../lib/rate-limit.js';
 import { vi } from 'vitest';
 
-const { mockFinalizeAuthoritativeRecording } = vi.hoisted(() => ({
+const { mockFinalizeAuthoritativeRecording, mockFinalizeWorkerAttemptRecording } = vi.hoisted(() => ({
   mockFinalizeAuthoritativeRecording: vi.fn(),
+  mockFinalizeWorkerAttemptRecording: vi.fn(),
 }));
 vi.mock('../lib/recording-egress.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../lib/recording-egress.js')>();
-  return { ...actual, finalizeAuthoritativeRecording: mockFinalizeAuthoritativeRecording };
+  return {
+    ...actual,
+    finalizeAuthoritativeRecording: mockFinalizeAuthoritativeRecording,
+    finalizeWorkerInbandAttemptRecording: mockFinalizeWorkerAttemptRecording,
+  };
 });
 
 // ── Supabase mock (chainable query builder + storage) ────────────────
@@ -1854,5 +1859,210 @@ describe('POST /api/recordings/:sessionId/revoke (REC-05 F2 repair)', () => {
       .post(`/api/recordings/${VALID_SESSION}/revoke`)
       .send({});
     expect(res.status).toBe(401);
+  });
+});
+
+describe('GET /api/recordings/attempts/:attemptId/download (0107)', () => {
+  const ATTEMPT = '00000000-0000-4000-8000-000000000031';
+  const SESSION = '00000000-0000-4000-8000-000000000032';
+  const bytes = Buffer.concat([Buffer.from('ID3'), Buffer.from('synthetic-mp3')]);
+  const digest = createHash('sha256').update(bytes).digest('hex');
+
+  beforeEach(() => {
+    setRateLimitStore(new MemoryRateLimitStore(100_000));
+    mockFrom.mockReset();
+    mockDownload.mockReset();
+    mockCreateSignedUrl.mockReset();
+    mockFinalizeWorkerAttemptRecording.mockReset();
+    insertCalls = [];
+    updateCalls = [];
+    configureTables({});
+    mockDownload.mockImplementation((key: string) => key.endsWith('.json')
+      ? {
+          data: new Blob([JSON.stringify({
+            schema_version: 1,
+            object_key: `phone-${ATTEMPT}-egress.mp3`,
+            content_type: 'audio/mpeg',
+            sha256: digest,
+            size_bytes: bytes.length,
+            provider_duration_ms: null,
+            egress_id: null,
+            finalized_at: null,
+          })]),
+          error: null,
+        }
+      : { data: bytes, error: null });
+    mockCreateSignedUrl.mockResolvedValue({ data: { signedUrl: SIGNED_URL }, error: null });
+  });
+
+  function configureAttempt(overrides: Record<string, unknown> = {}, session: Record<string, unknown> = {}) {
+    configureTables({
+      phone_call_attempts: {
+        id: ATTEMPT,
+        session_id: SESSION,
+        recording_object_key: `phone-${ATTEMPT}-egress.mp3`,
+        recording_manifest_key: `phone-${ATTEMPT}-egress.mp3.json`,
+        recording_sha256: digest,
+        recording_size_bytes: bytes.length,
+        recording_content_type: 'audio/mpeg',
+        egress_id: null,
+        recording_ready: true,
+        recording_quarantined: false,
+        recording_deleted_at: null,
+        ...overrides,
+      },
+      call_sessions: {
+        owner_id: 'interviewer-1',
+        recording_quarantined: false,
+        recording_revoked_at: null,
+        recording_deleted_at: null,
+        ...session,
+      },
+    });
+  }
+
+  it('lets an active admin download verified attempt bytes without exposing metadata', async () => {
+    configureAttempt();
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ url: SIGNED_URL, content_type: 'audio/mpeg' });
+    expect(res.body).not.toHaveProperty('object_key');
+    expect(res.body).not.toHaveProperty('manifest_key');
+    expect(mockCreateSignedUrl).toHaveBeenCalledWith(
+      `phone-${ATTEMPT}-egress.mp3`,
+      expect.any(Number),
+      { download: `recording-attempt-${ATTEMPT}.mp3` },
+    );
+  });
+
+  it('mirrors session ownership and denies ownerless/non-owned interviewer access uniformly', async () => {
+    configureAttempt({}, { owner_id: null });
+    const app = createTestApp(authAs('interviewer', 'interviewer-1'));
+    const res = await request(app)
+      .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(403);
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+  });
+
+  it('allows an interviewer who owns the associated session', async () => {
+    configureAttempt();
+    const app = createTestApp(authAs('interviewer', 'interviewer-1'));
+    const res = await request(app)
+      .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(res.body.url).toBe(SIGNED_URL);
+  });
+
+  it('uses the evidence-only parent when consent session_id is still NULL', async () => {
+    configureAttempt({ session_id: null, recording_session_id: SESSION });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(res.body.url).toBe(SIGNED_URL);
+  });
+
+  it('keeps an old null-bound attempt unavailable rather than guessing a parent', async () => {
+    configureAttempt({ session_id: null, recording_session_id: null });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(404);
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+  });
+
+  it('denies inherited parent revocation and refuses unfinished artifacts without minting', async () => {
+    configureAttempt({ recording_ready: false });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const processing = await request(app)
+      .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(processing.status).toBe(409);
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+
+    configureAttempt({}, { recording_revoked_at: '2026-09-26T00:00:00.000Z' });
+    const revoked = await request(app)
+      .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(revoked.status).toBe(403);
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+  });
+
+  it('recovers a transient worker completion on the later authorized explicit click', async () => {
+    const workerEgressId = `EG_worker_${ATTEMPT}`;
+    const attemptRow: Record<string, unknown> = {
+      id: ATTEMPT,
+      session_id: null,
+      recording_session_id: SESSION,
+      recording_object_key: `phone-${ATTEMPT}-egress.mp3`,
+      recording_manifest_key: `phone-${ATTEMPT}-egress.mp3.json`,
+      recording_sha256: digest,
+      recording_size_bytes: bytes.length,
+      recording_content_type: 'audio/mpeg',
+      egress_id: workerEgressId,
+      egress_status: 'active',
+      recording_ready: false,
+      recording_quarantined: false,
+      recording_deleted_at: null,
+    };
+    configureTables({
+      phone_call_attempts: attemptRow,
+      call_sessions: {
+        owner_id: 'interviewer-1',
+        recording_quarantined: false,
+        recording_revoked_at: null,
+        recording_deleted_at: null,
+      },
+    });
+    mockDownload.mockImplementation((key: string) => key.endsWith('.json')
+      ? { data: new Blob([JSON.stringify({
+          schema_version: 1,
+          object_key: `phone-${ATTEMPT}-egress.mp3`,
+          content_type: 'audio/mpeg',
+          sha256: digest,
+          size_bytes: bytes.length,
+          provider_duration_ms: null,
+          egress_id: workerEgressId,
+          finalized_at: null,
+        })]), error: null }
+      : { data: bytes, error: null });
+    // This is the completion's transient/pending outcome. The next authorized
+    // click runs the same finalizer again, then rereads the CAS result.
+    mockFinalizeWorkerAttemptRecording.mockResolvedValueOnce('pending').mockImplementationOnce(async () => {
+      attemptRow.recording_ready = true;
+      attemptRow.egress_status = 'complete';
+      return 'ready';
+    });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const processing = await request(app)
+      .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(processing.status).toBe(409);
+
+    const recovered = await request(app)
+      .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(recovered.status).toBe(200);
+    expect(recovered.body).toEqual({ url: SIGNED_URL, content_type: 'audio/mpeg' });
+    expect(mockFinalizeWorkerAttemptRecording).toHaveBeenCalledTimes(2);
+  });
+
+  it('quarantines a digest mismatch and never mints a URL', async () => {
+    configureAttempt();
+    mockDownload.mockResolvedValue({ data: Buffer.concat([bytes, Buffer.from('tampered')]), error: null });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(409);
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+    expect(updateCalls).toContainEqual({ recording_quarantined: true });
   });
 });

@@ -124,9 +124,12 @@ export interface PrepareWorkerRecordingResult {
 async function decideRole(
   engagementId: string,
   stores: PhoneStores,
+  attemptId: string,
 ): Promise<PhoneRecordingRole | undefined> {
   const existing = await stores.listEngagementRecordings({ engagementId });
   if (existing.status !== 'ok' || existing.artifacts === undefined) return undefined;
+  const own = existing.artifacts.find((artifact) => artifact.attemptId === attemptId);
+  if (own !== undefined) return own.role;
   return existing.artifacts.some((a) => a.role === 'authoritative')
     ? 'supplementary'
     : 'authoritative';
@@ -152,10 +155,46 @@ export async function prepareWorkerRecording(
   const objectKey = phoneAttemptRecordingObjectKey(input.attemptId);
   const manifestKey = phoneAttemptRecordingManifestKey(input.attemptId);
 
-  const role = await decideRole(input.engagementId, deps.stores);
+  const role = await decideRole(input.engagementId, deps.stores, input.attemptId);
   if (role === undefined) {
     return { status: 'refused', refusal: 'role_undecidable', boundForUpload: false };
   }
+
+  // This pointer is evidence-only. It is not phone_call_attempts.session_id,
+  // does not activate an assessment, and does not claim the session recording
+  // slot. Production supplies the SQL validation RPC; fail closed if a caller
+  // has not wired that capability.
+  if (!deps.stores.bindPhoneAttemptRecordingSession) {
+    return { status: 'refused', refusal: 'evidence_binding_unavailable', boundForUpload: false };
+  }
+  const evidenceBinding = await deps.stores.bindPhoneAttemptRecordingSession({
+    attemptId: input.attemptId,
+    sessionId: input.sessionId,
+    engagementId: input.engagementId,
+    now: input.now,
+  });
+  if (evidenceBinding.status !== 'ok') {
+    return { status: 'refused', refusal: evidenceBinding.status, boundForUpload: false };
+  }
+
+  const egressId = workerRecordingEgressId(input.attemptId);
+  const stampAfterConsent = async (): Promise<{ sessionStamped?: boolean; stampStatus?: string }> => {
+    if (input.engagementState !== 'in_call') return { stampStatus: 'deferred_until_consent' };
+    try {
+      const stamped = await deps.stores.stampSessionEgress({
+        sessionId: input.sessionId,
+        attemptId: input.attemptId,
+        egressId,
+        now: input.now,
+      });
+      return {
+        sessionStamped: stamped.status === 'ok' || stamped.status === 'egress_already_bound',
+        stampStatus: stamped.status,
+      };
+    } catch {
+      return { sessionStamped: false, stampStatus: 'store_error' };
+    }
+  };
 
   // ── STEP 1. The gate. Nothing has an upload URL yet. ────────────────
   const attached = await deps.stores.attachAttemptRecording({
@@ -167,18 +206,28 @@ export async function prepareWorkerRecording(
   });
 
   if (attached.status === 'ok' && attached.duplicate === true) {
-    // The identical triple was already bound by an earlier prepare. Re-mint the
-    // upload URL so a retrying worker can still upload, but do not re-attach.
+    // Answer-time prepare may have attached first. Re-run the idempotent
+    // activation and consent-time stamp before re-minting, rather than
+    // returning before the in_call session stamp.
+    await deps.stores.finalizeAttemptRecording({
+      attemptId: input.attemptId,
+      egressStatus: 'active',
+      egressId,
+      now: input.now,
+    });
+    const stamp = await stampAfterConsent();
     const reMint = await deps.signer.createUploadUrl(objectKey);
     if (reMint === null) {
       return {
         status: 'upload_url_failed', role, objectKey, manifestKey,
+        sessionStamped: stamp.sessionStamped, stampStatus: stamp.stampStatus,
         boundForUpload: false,
       };
     }
     return {
       status: 'already_prepared', role, objectKey, manifestKey,
       uploadUrl: reMint.uploadUrl, boundForUpload: true,
+      sessionStamped: stamp.sessionStamped, stampStatus: stamp.stampStatus,
     };
   }
   if (attached.status !== 'ok') {
@@ -186,7 +235,6 @@ export async function prepareWorkerRecording(
   }
 
   // ── STEP 2. The binding exists. Record the synthetic egress id. ─────
-  const egressId = workerRecordingEgressId(input.attemptId);
   await deps.stores.finalizeAttemptRecording({
     attemptId: input.attemptId,
     egressStatus: 'active',
@@ -197,26 +245,7 @@ export async function prepareWorkerRecording(
   // ── STEP 3. Make the SESSION see it (0051), best-effort. ────────────
   // An unstamped recording is UNFINDABLE by the session-keyed read path; the
   // route caller logs a missed stamp loudly (this package is console-free).
-  let stampStatus: string;
-  if (input.engagementState !== 'in_call') {
-    // 0105: pre-consent. The ATTEMPT is bound (step 1) and will upload to
-    // its own key; the SESSION keeps its slot for the attempt that consents.
-    // The worker's consent-time prepare re-runs this function at `in_call`
-    // and stamps then.
-    stampStatus = 'deferred_until_consent';
-  } else {
-    try {
-      const stamped = await deps.stores.stampSessionEgress({
-        sessionId: input.sessionId,
-        attemptId: input.attemptId,
-        egressId,
-        now: input.now,
-      });
-      stampStatus = stamped.status;
-    } catch {
-      stampStatus = 'store_error';
-    }
-  }
+  const stamp = await stampAfterConsent();
 
   // ── STEP 4. Mint the presigned PUT the worker uploads to. ───────────
   const minted = await deps.signer.createUploadUrl(objectKey);
@@ -227,14 +256,14 @@ export async function prepareWorkerRecording(
     // binding — is impossible because step 1 ran first.
     return {
       status: 'upload_url_failed', role, objectKey, manifestKey,
-      sessionStamped: stampStatus === 'ok', stampStatus, boundForUpload: false,
+      sessionStamped: stamp.sessionStamped, stampStatus: stamp.stampStatus, boundForUpload: false,
     };
   }
 
   return {
     status: 'prepared', role, objectKey, manifestKey,
     uploadUrl: minted.uploadUrl,
-    sessionStamped: stampStatus === 'ok', stampStatus,
+    sessionStamped: stamp.sessionStamped, stampStatus: stamp.stampStatus,
     boundForUpload: true,
   };
 }

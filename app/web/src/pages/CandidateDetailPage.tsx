@@ -29,6 +29,7 @@ import {
   CandidateShell,
   DecisionBlockedBanner,
   NotesList,
+  PhoneAttemptHistory,
   SessionsSummary,
   Tabs,
   TranscriptionSyncWorkspace,
@@ -291,6 +292,8 @@ function OverviewTab({
         />
 
         <SessionsSummary sessions={sessions} />
+
+        <PhoneAttemptHistory candidateId={candidate.id} role={phoneRole} />
 
         <NotesSection candidateId={candidate.id} />
       </div>

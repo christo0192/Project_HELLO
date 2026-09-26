@@ -61,6 +61,14 @@ export interface RecruiterAuthGuard {
 
 export const candidateIdParamSchema = idParamSchema;
 
+/** Bounded keyset page for candidate phone-attempt evidence. */
+export const candidatePhoneAttemptsQuerySchema = z.object({
+  limit: z.coerce.number().int().min(1).max(50).default(25),
+  before: z.string().max(256).optional(),
+}).strict();
+
+export type CandidatePhoneAttemptsQuery = z.infer<typeof candidatePhoneAttemptsQuerySchema>;
+
 /** Explicit confirmation is required; the server still applies every phone gate. */
 export const manualPhoneCallBodySchema = z
   .object({ confirm: z.literal(true) })

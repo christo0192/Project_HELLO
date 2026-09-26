@@ -26,7 +26,7 @@
  * Pure declarations. No client, no I/O, no configuration.
  */
 
-/** The seventeen service-role RPCs 0042, 0043 and 0044 expose. */
+/** The eighteen service-role RPCs 0042, 0043, 0044 and 0107 expose. */
 export const PHONE_RPC_NAMES = [
   'admit_phone_attempt',
   'heartbeat_phone_attempt',
@@ -48,6 +48,8 @@ export const PHONE_RPC_NAMES = [
   // 0051 — the session-level egress stamp: makes phone recordings visible to
   // the 0038 finalize convergence and the recruiter download route.
   'stamp_phone_session_egress',
+  // 0107 — evidence-only pre-consent session binding.
+  'bind_phone_attempt_recording_session',
   // 0044 — the assessment-persistence RPCs. One binds and snapshots, one
   // reads, one appends a completed question boundary. None of them dials,
   // records, scores or completes anything.
@@ -148,6 +150,12 @@ export const PHONE_RPC_PARAMETERS: Readonly<Record<PhoneRpcName, readonly string
       'p_attempt_id',
       'p_egress_id',
       'p_egress_started_at_ms',
+      'p_now',
+    ],
+    bind_phone_attempt_recording_session: [
+      'p_attempt_id',
+      'p_session_id',
+      'p_engagement_id',
       'p_now',
     ],
     finalize_phone_attempt_recording: [
@@ -579,6 +587,28 @@ export const STAMP_PHONE_SESSION_EGRESS_STATUSES = [
 export type StampPhoneSessionEgressStatus =
   (typeof STAMP_PHONE_SESSION_EGRESS_STATUSES)[number];
 
+export const BIND_PHONE_ATTEMPT_RECORDING_SESSION_STATUSES = [
+  'ok',
+  'attempt_engagement_mismatch',
+  'attempt_not_answered',
+  'attempt_session_mismatch',
+  'engagement_terminal',
+  'invalid_request',
+  'not_answered',
+  'session_candidate_mismatch',
+  'session_engagement_mismatch',
+  'session_engagement_race',
+  'session_engagement_unbound',
+  'session_not_active',
+  'session_role_mismatch',
+  'session_room_mismatch',
+  'unknown_engagement',
+  'unknown_session',
+] as const;
+
+export type BindPhoneAttemptRecordingSessionStatus =
+  (typeof BIND_PHONE_ATTEMPT_RECORDING_SESSION_STATUSES)[number];
+
 export type AttachPhoneAttemptRecordingStatus =
   (typeof ATTACH_PHONE_ATTEMPT_RECORDING_STATUSES)[number];
 
@@ -777,6 +807,7 @@ export const PHONE_RPC_STATUSES: Readonly<Record<PhoneRpcName, readonly string[]
     phone_backlog: PHONE_BACKLOG_STATUSES,
     attach_phone_attempt_recording: ATTACH_PHONE_ATTEMPT_RECORDING_STATUSES,
     stamp_phone_session_egress: STAMP_PHONE_SESSION_EGRESS_STATUSES,
+    bind_phone_attempt_recording_session: BIND_PHONE_ATTEMPT_RECORDING_SESSION_STATUSES,
     finalize_phone_attempt_recording: FINALIZE_PHONE_ATTEMPT_RECORDING_STATUSES,
     list_phone_engagement_recordings: LIST_PHONE_ENGAGEMENT_RECORDINGS_STATUSES,
     clear_phone_attempt_recordings: CLEAR_PHONE_ATTEMPT_RECORDINGS_STATUSES,
@@ -879,7 +910,7 @@ export const PHONE_RPC_STATUS_UNION: readonly string[] = Object.freeze(
  * an earlier draft of it had `invalid_source` and `phone_absent` the wrong way
  * round, and the total was still right because the two errors cancelled.
  */
-export const PHONE_RPC_STATUS_COUNT = 114;
+export const PHONE_RPC_STATUS_COUNT = 124;
 
 /**
  * RESULT KEYS the API's behaviour DEPENDS on, per RPC.
@@ -919,6 +950,7 @@ export const PHONE_RPC_RESULT_KEYS: Readonly<Record<string, readonly string[]>> 
   clear_phone_attempt_recordings: ['cleared'],
   attach_phone_attempt_recording: ['attempt_id', 'role', 'duplicate'],
   stamp_phone_session_egress: ['duplicate'],
+  bind_phone_attempt_recording_session: ['attempt_id', 'session_id', 'engagement_id', 'bound'],
   finalize_phone_attempt_recording: ['attempt_id', 'egress_status', 'role'],
   // 0044. Every one of these is load-bearing for a decision the worker makes
   // on the wire. `next_key` and `cursor` decide which question is asked next;

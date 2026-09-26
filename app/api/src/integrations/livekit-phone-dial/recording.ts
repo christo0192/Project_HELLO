@@ -110,6 +110,8 @@ export interface StartPhoneRecordingInput {
    * dashboard truthfully said "Recording not found").
    */
   readonly sessionId: string;
+  /** Consent state at this event; only `in_call` may claim the reusable session slot. */
+  readonly engagementState?: string | null;
   readonly now: Date;
 }
 
@@ -134,12 +136,25 @@ export async function startPhoneAttemptRecording(
   const objectKey = phoneAttemptRecordingObjectKey(input.attemptId);
   const manifestKey = phoneAttemptRecordingManifestKey(input.attemptId);
 
-  const role = await decideRole(input.engagementId, deps.stores);
+  const role = await decideRole(input.engagementId, deps.stores, input.attemptId);
   if (role === undefined) {
     // We could not read what already exists, so we cannot tell whether this
     // attempt would be the authoritative one. Fail closed: an unreadable
     // enumeration is not evidence that nothing is there.
     return { status: 'refused', refusal: 'role_undecidable', egressStarted: false };
+  }
+
+  if (!deps.stores.bindPhoneAttemptRecordingSession) {
+    return { status: 'refused', refusal: 'evidence_binding_unavailable', egressStarted: false };
+  }
+  const evidenceBinding = await deps.stores.bindPhoneAttemptRecordingSession({
+    attemptId: input.attemptId,
+    sessionId: input.sessionId,
+    engagementId: input.engagementId,
+    now: input.now,
+  });
+  if (evidenceBinding.status !== 'ok') {
+    return { status: 'refused', refusal: evidenceBinding.status, egressStarted: false };
   }
 
   // ── STEP 1. The gate. Nothing has recorded anything yet. ────────────
@@ -153,7 +168,32 @@ export async function startPhoneAttemptRecording(
 
   if (attached.status === 'ok' && attached.duplicate === true) {
     // The identical triple was already bound. A retry of a call that already
-    // succeeded must not start a SECOND egress writing to the same key.
+    // succeeded must not start a SECOND egress writing to the same key. A
+    // consent-time retry still has to repair the session pointer after the
+    // answer-time prepare deliberately deferred it.
+    if (input.engagementState === 'in_call' || input.engagementState === undefined) {
+      const existing = await deps.stores.listEngagementRecordings({ engagementId: input.engagementId });
+      const egressId = existing.status === 'ok'
+        ? existing.artifacts?.find((artifact) => artifact.attemptId === input.attemptId)?.egressId
+        : undefined;
+      if (egressId) {
+        try {
+          const stamped = await deps.stores.stampSessionEgress({
+            sessionId: input.sessionId,
+            attemptId: input.attemptId,
+            egressId,
+            now: input.now,
+          });
+          return {
+            status: 'already_started', role, objectKey, manifestKey, egressStarted: false,
+            egressId, sessionStamped: stamped.status === 'ok' || stamped.status === 'egress_already_bound',
+            stampStatus: stamped.status,
+          };
+        } catch {
+          return { status: 'already_started', role, objectKey, manifestKey, egressStarted: false, sessionStamped: false, stampStatus: 'store_error' };
+        }
+      }
+    }
     return { status: 'already_started', role, objectKey, manifestKey, egressStarted: false };
   }
   if (attached.status !== 'ok') {
@@ -212,17 +252,21 @@ export async function startPhoneAttemptRecording(
   // one that must say it out loud: an unstamped recording is unfindable, and
   // silence is exactly how the first one stayed unfindable.
   let stampStatus: string;
-  try {
-    const stamped = await deps.stores.stampSessionEgress({
-      sessionId: input.sessionId,
-      attemptId: input.attemptId,
-      egressId,
-      egressStartedAtMs,
-      now: input.now,
-    });
-    stampStatus = stamped.status;
-  } catch {
-    stampStatus = 'store_error';
+  if (input.engagementState !== undefined && input.engagementState !== 'in_call') {
+    stampStatus = 'deferred_until_consent';
+  } else {
+    try {
+      const stamped = await deps.stores.stampSessionEgress({
+        sessionId: input.sessionId,
+        attemptId: input.attemptId,
+        egressId,
+        egressStartedAtMs,
+        now: input.now,
+      });
+      stampStatus = stamped.status;
+    } catch {
+      stampStatus = 'store_error';
+    }
   }
 
   return {
@@ -245,9 +289,12 @@ export async function startPhoneAttemptRecording(
 async function decideRole(
   engagementId: string,
   stores: PhoneStores,
+  attemptId: string,
 ): Promise<PhoneRecordingRole | undefined> {
   const existing = await stores.listEngagementRecordings({ engagementId });
   if (existing.status !== 'ok' || existing.artifacts === undefined) return undefined;
+  const own = existing.artifacts.find((artifact) => artifact.attemptId === attemptId);
+  if (own !== undefined) return own.role;
   return existing.artifacts.some((a) => a.role === 'authoritative')
     ? 'supplementary'
     : 'authoritative';

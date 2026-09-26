@@ -154,6 +154,8 @@ export interface SessionInsertFields {
   role_id: string | null;
   mode: 'browser' | 'live' | 'simulation';
   provider?: string;
+  /** 0107: authoritative phone engagement claim, before consent/session start. */
+  phone_engagement_id?: string;
   /** Validated model provenance for simulation sessions; omitted for LiveKit until worker claim. */
   provenance?: object;
 }
@@ -214,6 +216,9 @@ export async function createSession(
   }
   if (fields.provenance !== undefined) {
     payload.provenance = fields.provenance;
+  }
+  if (fields.phone_engagement_id !== undefined) {
+    payload.phone_engagement_id = fields.phone_engagement_id;
   }
 
   const { data, error } = await supabase

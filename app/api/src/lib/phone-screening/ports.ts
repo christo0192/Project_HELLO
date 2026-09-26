@@ -28,6 +28,7 @@ import type {
   ReleaseCandidatePhoneSuppressionStatus,
   PhoneSuppressionStateStatus,
   AttachPhoneAttemptRecordingStatus,
+  BindPhoneAttemptRecordingSessionStatus,
   FinalizePhoneAttemptRecordingStatus,
   ListPhoneEngagementRecordingsStatus,
   ClearPhoneAttemptRecordingsStatus,
@@ -508,6 +509,14 @@ export interface AttachPhoneAttemptRecordingResult {
   readonly attemptState?: string;
 }
 
+export interface BindPhoneAttemptRecordingSessionResult {
+  readonly status: BindPhoneAttemptRecordingSessionStatus | typeof PHONE_RPC_UNKNOWN_STATUS;
+  readonly attemptId?: string;
+  readonly sessionId?: string;
+  readonly engagementId?: string;
+  readonly bound?: boolean;
+}
+
 export interface StampPhoneSessionEgressResult {
   readonly status: StampPhoneSessionEgressStatus | typeof PHONE_RPC_UNKNOWN_STATUS;
   /** True when the SAME egress id was already stamped. Success, not a refusal. */
@@ -929,6 +938,13 @@ export interface PhoneStores {
   attachAttemptRecording(
     input: AttachPhoneAttemptRecordingInput,
   ): Promise<AttachPhoneAttemptRecordingResult>;
+  /** 0107. Evidence-only pre-consent session binding; does not start assessment. */
+  bindPhoneAttemptRecordingSession?(input: {
+    attemptId: string;
+    sessionId: string;
+    engagementId: string;
+    now: Date;
+  }): Promise<BindPhoneAttemptRecordingSessionResult>;
   finalizeAttemptRecording(input: {
     attemptId: string;
     egressStatus: 'active' | 'complete' | 'failed';

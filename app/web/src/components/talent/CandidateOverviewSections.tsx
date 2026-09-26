@@ -15,10 +15,11 @@
  * unscoped app, which the scoped route must not offer.
  */
 
-import { useId } from 'react';
+import { useCallback, useEffect, useId, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
-import type { CandidateDetail, CandidateResumeFacts, Note, Session } from '../../types';
+import type { CandidateDetail, CandidatePhoneAttempt, CandidateResumeFacts, MembershipRole, Note, Session } from '../../types';
+import { api } from '../../api';
 import { ScrollArea, StatusBadge } from '../design';
 import { SurfaceCard, Tag } from '../design/candidate';
 import {
@@ -52,6 +53,154 @@ export function Field({ label, children }: { label: string; children: ReactNode 
  */
 const SESSION_ROWS_BEFORE_SCROLL = 5;
 const NOTE_ROWS_BEFORE_SCROLL = 4;
+
+/**
+ * Per-dial evidence. The audio action deliberately mints a URL only from an
+ * explicit click; the history response contains state, never a signed URL.
+ */
+export function PhoneAttemptHistory({
+  candidateId,
+  role,
+}: {
+  candidateId: string;
+  role: MembershipRole;
+}) {
+  const headingId = useId();
+  const [attempts, setAttempts] = useState<CandidatePhoneAttempt[] | null>(null);
+  const [nextCursor, setNextCursor] = useState<string | null>(null);
+  const [error, setError] = useState(false);
+  const [loadingAudio, setLoadingAudio] = useState<string | null>(null);
+
+  const load = useCallback((before?: string, append = false) => {
+    setError(false);
+    // Candidate-scoped embedded hosts can provide a reduced API adapter. The
+    // production adapter always has this method; absence is a truthful empty
+    // state for those legacy hosts rather than a render failure.
+    if (typeof api.getCandidatePhoneAttempts !== 'function') {
+      setAttempts([]);
+      setNextCursor(null);
+      return;
+    }
+    api.getCandidatePhoneAttempts(candidateId, before)
+      .then((result) => {
+        setAttempts((current) => append && current ? [...current, ...result.attempts] : result.attempts);
+        setNextCursor(result.next_cursor);
+      })
+      .catch(() => {
+        setAttempts(null);
+        setError(true);
+      });
+  }, [candidateId]);
+
+  useEffect(load, [load]);
+
+  async function download(attemptId: string) {
+    if (typeof api.getAttemptRecordingDownloadUrl !== 'function') return;
+    setLoadingAudio(attemptId);
+    try {
+      const result = await api.getAttemptRecordingDownloadUrl(attemptId);
+      // The signed URL lives only for this user gesture. It is never placed in
+      // the history payload, application state, or a durable link.
+      window.open(result.url, '_blank', 'noopener,noreferrer');
+    } catch {
+      setError(true);
+    } finally {
+      setLoadingAudio(null);
+    }
+  }
+
+  return (
+    <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
+      <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
+        Call attempts
+      </h2>
+      <p className="mb-3 mt-0.5 text-[13px] text-ink-tertiary">
+        Every phone leg, including calls that ended before screening began.
+      </p>
+      {error ? (
+        <div className="flex flex-wrap items-center gap-2">
+          <p role="alert" className="text-sm text-ink-secondary">Attempt history unavailable.</p>
+          <button type="button" className="text-xs font-medium text-[var(--c-accent)] underline" onClick={() => load()}>Retry</button>
+        </div>
+      ) : attempts === null ? (
+        <p className="text-sm text-ink-tertiary">Loading attempt history…</p>
+      ) : attempts.length === 0 ? (
+        <p className="text-sm text-ink-secondary">No phone call attempts yet.</p>
+      ) : (
+        <ul className="divide-y divide-line">
+          {attempts.map((attempt) => (
+            <li key={attempt.id} className="py-3 text-sm">
+              <div className="flex flex-wrap items-start justify-between gap-2">
+                <div>
+                  <p className="font-medium text-ink">Attempt {attempt.attempt_seq}</p>
+                  <p className="text-[12px] text-ink-tertiary">
+                    {formatDateTime(attempt.admitted_at)} · {attempt.state}
+                    {attempt.outcome_class ? ` · ${attempt.outcome_class}` : ''}
+                    {attempt.duration_sec != null ? ` · ${Math.round(attempt.duration_sec)}s` : ''}
+                  </p>
+                </div>
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  {attempt.recording.state === 'ready' ? (
+                    <button
+                      type="button"
+                      className="text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+                      onClick={() => download(attempt.id)}
+                      disabled={loadingAudio === attempt.id}
+                    >
+                      {loadingAudio === attempt.id ? 'Preparing audio…' : 'Download audio'}
+                    </button>
+                  ) : attempt.recording.state === 'processing' ? (
+                    <span className="text-xs text-ink-tertiary">Recording processing</span>
+                  ) : (
+                    <span className="text-xs text-ink-tertiary">
+                      {attempt.recording.reason === 'access_unavailable'
+                        ? 'Recording access unavailable'
+                        : attempt.recording.reason === 'recording_failed'
+                          ? 'Recording unavailable (capture failed)'
+                          : 'No recording available'}
+                    </span>
+                  )}
+                  {attempt.transcript && (
+                    <Link
+                      to={attempt.transcript.href}
+                      className="text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+                    >
+                      {attempt.transcript.kind === 'gate_only' ? 'Pre-interview gate transcript' : 'Session transcript'}
+                    </Link>
+                  )}
+                </div>
+              </div>
+              {attempt.transcript?.kind === 'gate_only' && (
+                <p className="mt-1 text-[12px] text-ink-secondary">
+                  Gate-only evidence: identity and recording-consent exchange before the interview.
+                </p>
+              )}
+              {attempt.transcript?.shared_session && (
+                <p className="mt-1 text-[12px] text-ink-tertiary">
+                  This session transcript may include multiple call legs; it is not an attempt-only transcript.
+                </p>
+              )}
+              {role === 'interviewer' && attempt.recording.reason === 'access_unavailable' && (
+                <p className="mt-1 text-[12px] text-ink-tertiary">
+                  Audio access is available only when the associated session has an owner you own.
+                </p>
+              )}
+            </li>
+          ))}
+        </ul>
+      )}
+      {attempts && nextCursor && !error && (
+        <button
+          type="button"
+          className="mt-3 text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+          onClick={() => load(nextCursor, true)}
+        >
+          Load older attempts
+        </button>
+      )}
+    </SurfaceCard>
+  );
+}
 
 function boundList(bounded: boolean, label: string, maxHeight: string, list: ReactNode): ReactNode {
   if (!bounded) return list;

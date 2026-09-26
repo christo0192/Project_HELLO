@@ -47,6 +47,7 @@ import {
   type ReleaseCandidatePhoneSuppressionStatus,
   type PhoneSuppressionStateStatus,
   type AttachPhoneAttemptRecordingStatus,
+  type BindPhoneAttemptRecordingSessionStatus,
   StampPhoneSessionEgressStatus,
   type FinalizePhoneAttemptRecordingStatus,
   type ListPhoneEngagementRecordingsStatus,
@@ -86,6 +87,7 @@ import type {
   PhoneSuppressionStateResult,
   AttachPhoneAttemptRecordingInput,
   AttachPhoneAttemptRecordingResult,
+  BindPhoneAttemptRecordingSessionResult,
   StampPhoneSessionEgressResult,
   FinalizePhoneAttemptRecordingResult,
   ListPhoneEngagementRecordingsResult,
@@ -970,6 +972,27 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
           PHONE_ENGAGEMENT_STATES,
         ),
         attemptState: member<PhoneAttemptState>(row, 'attempt_state', PHONE_ATTEMPT_STATES),
+      };
+    },
+
+    async bindPhoneAttemptRecordingSession(input): Promise<BindPhoneAttemptRecordingSessionResult> {
+      const { data, error } = await client.rpc('bind_phone_attempt_recording_session', {
+        p_attempt_id: input.attemptId,
+        p_session_id: input.sessionId,
+        p_engagement_id: input.engagementId,
+        p_now: isoInstant(input.now),
+      });
+      if (error) throw new Error('phone_bind_recording_session_error');
+      const row = asRow(data);
+      return {
+        status: narrowPhoneRpcStatus<BindPhoneAttemptRecordingSessionStatus>(
+          'bind_phone_attempt_recording_session',
+          row,
+        ),
+        attemptId: str(row, 'attempt_id'),
+        sessionId: str(row, 'session_id'),
+        engagementId: str(row, 'engagement_id'),
+        bound: bool(row, 'bound'),
       };
     },
 
