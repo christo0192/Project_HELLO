@@ -107,38 +107,35 @@ const phoneWorkerLog = createLogger('phone-worker');
  */
 /**
  * The events after which the engagement's recordings are destroyed before the
- * event posts.
+ * event posts. SINCE 0105 THIS SET IS EMPTY, and the history is why.
  *
- * ── SINCE 0105 THIS IS ONE EVENT, AND THE HISTORY MATTERS ────────────
- * The posture from 0067 to 0104 was "record from answer, keep only if
- * consented": five non-consenting exits — a refusal, an opt-out, a wrong
- * number, a machine pickup and a pre-disclosure deferral — each purged the
- * pre-consent audio before acknowledging. On 2026-09-25 five real candidates
- * were dialled and every call ended inside the gate; afterwards there was no
- * audio and no transcript for any of them, and the team was blind to what the
- * candidates had actually heard.
+ * From 0067 to 0104 the posture was "record from answer, keep only if
+ * consented": five non-consenting exits purged the pre-consent audio before
+ * acknowledging. On 2026-09-25 five real candidates were dialled, every call
+ * ended inside the gate, and afterwards there was no audio and no transcript
+ * for any of them. The owner's decision, with legal sign-off (2026-09-26): the
+ * recording persists regardless of consent.
  *
- * The owner's decision, with legal sign-off (2026-09-26): the recording and
- * the transcript persist from the start of the call regardless of whether
- * consent is reached. So the four exits that are about the CANDIDATE's own
- * consent no longer purge. They still post, still transition, still suppress
- * where 0042 says they do — they simply leave the audio where it is.
+ * A first draft kept `candidate.wrong_number` here — a stranger answered, and
+ * their voice is not ours to keep. Adversarial review showed that on the
+ * worker provider that one purge could NEVER complete: the recording now
+ * begins at `call.answered`, so the attempt carries `egress_status='active'`
+ * with a SYNTHETIC `EG_worker_…` id LiveKit never issued; the purge's
+ * stop-the-egress branch cannot stop it, answers `egress_still_running`, the
+ * route 503s, the worker posts once, and the wrong-number terminal never
+ * lands — no suppression, engagement stuck in `dialing`, the stranger dialled
+ * again, and their audio uploaded anyway. So the stranger case moved to where
+ * it can actually be honoured: the WORKER discards the recording and the
+ * buffered gate transcript when the gate concludes the speaker was not the
+ * candidate (`PhoneGateResult.not_the_candidate`), before anything is
+ * uploaded. Nothing of a stranger's ever reaches the bucket.
  *
- * `candidate.wrong_number` stays. It is not about the candidate's consent at
- * all: a stranger answered, and there is no diagnostic or business reason to
- * keep a stranger's voice. It is the one member, and it is deliberately alone.
- *
- * `consent.failed` was never here (0095): the purge is ENGAGEMENT-wide, that
- * event is non-terminal, and an earlier leg of the same engagement can hold a
- * consented recording. That reasoning is now moot for the four removed events
- * too, and stands for the one that remains.
- *
- * The purge itself is unchanged: idempotent, fails closed, and a purge that
- * cannot verify deletion leaves the request unacknowledged and retryable.
+ * The set stays declared, the purge machinery stays wired, and the route
+ * branch stays in place: an admin-driven purge for a specific engagement is a
+ * plausible future member and the module's invariants are worth keeping. It
+ * is simply not triggered by any worker event today.
  */
-export const PURGE_BEFORE_EVENTS: ReadonlySet<string> = new Set([
-  'candidate.wrong_number',
-]);
+export const PURGE_BEFORE_EVENTS: ReadonlySet<string> = new Set<string>([]);
 
 export const WORKER_PHONE_EVENTS = [
   // Parity 2 (0067): a leg was answered. Stamps the attempt's answered_at and
@@ -879,14 +876,11 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       if (!parsed.success) {
         return res.status(400).json({ ok: false, error: 'invalid_request' });
       }
-      // ── B-3: PURGE BEFORE ACKNOWLEDGING A WRONG NUMBER ──────────────
-      // Since 0105 this fires for `candidate.wrong_number` alone — see the
-      // note on `PURGE_BEFORE_EVENTS`. It is TERMINAL in 0042 and the terminal
-      // transition writes the suppression in the SAME transaction, so posting
-      // it before the audio is gone would commit "this line is suppressed and
-      // this engagement is over" on top of a stranger's recording still in the
-      // bucket — invisible afterwards, because the engagement reads as
-      // correctly closed.
+      // ── B-3: PURGE BEFORE ACKNOWLEDGING ────────────────────────────
+      // Since 0105 `PURGE_BEFORE_EVENTS` is EMPTY, so this branch is inert for
+      // every worker event — see the note on the set. The ordering contract
+      // it implements (delete + verify, THEN the terminal whose transaction
+      // writes the suppression) is kept for a future admin-driven member.
       //
       // So the purge runs FIRST, and the event is posted only when the purge
       // says it is safe to acknowledge. A purge that could not verify deletion
@@ -1878,11 +1872,18 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       // FAIL-CLOSED: an omitted id that cannot be resolved (no resolver wired,
       // or an unknown attempt) binds nothing and is reported truthfully — never
       // fabricated.
+      // 0105: the engagement STATE travels too. Since recording begins at
+      // `call.answered`, prepare now runs pre-consent; `prepareWorkerRecording`
+      // stamps the SESSION's recording pointer only when the engagement is
+      // `in_call`, because sessions are reused across attempts and a
+      // pre-consent clip must not claim the slot the real screening needs.
+      // Resolved authoritatively from the attempt whether or not the worker
+      // sent an engagement id. Unknown state ⇒ not `in_call` ⇒ no stamp.
+      const resolved = deps.resolveEngagement
+        ? await deps.resolveEngagement(parsed.data.attempt_id)
+        : null;
       let engagementId = parsed.data.engagement_id;
       if (engagementId === undefined) {
-        const resolved = deps.resolveEngagement
-          ? await deps.resolveEngagement(parsed.data.attempt_id)
-          : null;
         if (!resolved) {
           return res.json({ ok: false, status: 'unknown_attempt' });
         }
@@ -1891,6 +1892,7 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       const result = await prepareWorkerRecording(
         {
           engagementId,
+          engagementState: resolved?.engagementState ?? null,
           attemptId: parsed.data.attempt_id,
           sessionId: parsed.data.session_id,
           now: now(),
@@ -1899,7 +1901,11 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       );
       // An unstamped recording is unfindable by the session-keyed read path;
       // say so out loud here (the dialer package is console-free by pin).
-      if (result.boundForUpload && result.sessionStamped !== true) {
+      if (
+        result.boundForUpload
+        && result.sessionStamped !== true
+        && result.stampStatus !== 'deferred_until_consent'
+      ) {
         phoneWorkerLog.warn('unknown_event', {
           schema: 'worker_recording_prepare',
           error_category: `session_egress_stamp_missed:${result.stampStatus ?? 'unknown'}`,

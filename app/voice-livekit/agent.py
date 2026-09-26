@@ -294,8 +294,8 @@ async def _post_gate_purging_terminal(
 
     `post_event` FAILS CLOSED by RETURNING a not-ok outcome rather than
     raising, so catching exceptions alone would be a guard that could not fire.
-    An unapplied event means the recording was NOT purged — the one thing this
-    exists to guarantee — so it is logged rather than assumed.
+    An unapplied event means the engagement was NOT moved off `dialing` — the
+    one thing this exists to guarantee — so it is logged rather than assumed.
     """
     applied = False
     for _ in range(2):
@@ -7597,6 +7597,13 @@ async def _run_phone_session(
     # has a transcript, while the resume context and the scorer keep ignoring
     # it exactly as they ignored 0067's once-written gate rows.
     gate_persist_active: list[bool] = [True]
+    # 0105, review repair: gate turns are BUFFERED here and persisted only once
+    # the gate has concluded the speaker is (or may be) the candidate. Until
+    # then these words may belong to a household member who answered — and a
+    # bystander's words filed as `candidate` under the candidate's session
+    # would have no erasure route (`transcript_turns` carries no candidate id,
+    # so the DSAR erase matches nothing). See `_flush_gate_transcript`.
+    gate_pending: list[tuple[str, str, int | None, int]] = []
     item_seq: list[int] = [0]
     persist_session_id = phone.session_id_from_room_name(room_name)
     persist_tasks: set[asyncio.Task] = set()
@@ -7658,6 +7665,44 @@ async def _run_phone_session(
             return
         persist_tasks.add(task)
         task.add_done_callback(persist_tasks.discard)
+
+    async def _flush_gate_transcript() -> None:
+        """0105: persist the buffered gate turns, AWAITED, best effort.
+
+        Two callers, one contract. The gate calls it at consent, right before
+        the once-at-consent writer, so that writer's existence guard sees the
+        per-item rows and answers `already_recorded`. The session calls it
+        after the gate returns for every exit that did NOT conclude the speaker
+        was a stranger — machine, deferral, refusal, timeout — so a call that
+        died at the gate still has its transcript. Idempotent: an empty buffer
+        is a no-op. Bounded: a persist that hangs cannot hold the call.
+        """
+        pending = list(gate_pending)
+        gate_pending.clear()
+        if not pending:
+            return
+        tasks: list[asyncio.Task] = []
+        for speaker, text, anchor_ms, seq in pending:
+            try:
+                tasks.append(asyncio.create_task(_persist_phone_item(
+                    speaker, text, anchor_ms, f"phone-gate-item-{seq}", True)))
+            except RuntimeError:
+                return
+        for t in tasks:
+            persist_tasks.add(t)
+            t.add_done_callback(persist_tasks.discard)
+        # Five seconds is generous for a handful of PostgREST round trips and
+        # far short of anything a candidate would notice at a call's end.
+        await asyncio.wait(tasks, timeout=5.0)
+
+    def _drop_gate_transcript(reason: str) -> None:
+        """0105: the gate concluded the speaker was NOT the candidate. Nothing
+        of theirs is persisted — the buffer is emptied unsent."""
+        gate_pending.clear()
+        _log.info(
+            "unknown_event", error_type="phone_gate_transcript_dropped",
+            error_category=reason,
+        )
 
     # Read the per-turn coordination mode ONCE at session start and log it, so
     # every later decision (provider speculation, `llm_node` policy, the commit
@@ -8065,13 +8110,12 @@ async def _run_phone_session(
                 _spawn_item_persist(
                     "candidate", text, _turn_anchor_ms(item), item_seq[0])
             elif gate_persist_active[0]:
-                # 0105: the candidate's own words in the gate — the consent
-                # reply, an identity answer, a "call me later" — persisted as
-                # they land and flagged as the gate.
+                # 0105: the speaker's words in the gate — the consent reply, an
+                # identity answer, a "call me later" — buffered, flagged as the
+                # gate, and persisted once the gate says whose they are.
                 item_seq[0] += 1
-                _spawn_item_persist(
-                    "candidate", text, _turn_anchor_ms(item), item_seq[0],
-                    is_gate=True)
+                gate_pending.append(
+                    ("candidate", text, _turn_anchor_ms(item), item_seq[0]))
             return
         # 0105: a bot item in the GATE phase — the disclosure, the identity
         # ask, the role line, a refusal closing — is persisted before the
@@ -8079,8 +8123,7 @@ async def _run_phone_session(
         # short-circuit stays: it protects the scored boundary, not the record.
         if gate_persist_active[0] and not assessment_persist_active[0]:
             item_seq[0] += 1
-            _spawn_item_persist("bot", text, _turn_anchor_ms(item), item_seq[0],
-                                is_gate=True)
+            gate_pending.append(("bot", text, _turn_anchor_ms(item), item_seq[0]))
         if phone.is_gate_copy(text):
             # FIXED COPY IS NOT A SCREENING TURN. The disclosure, the re-ask,
             # every refusal closing, the callback confirmations and the closing
@@ -8767,10 +8810,16 @@ async def _run_phone_session(
             recorder = recorder_holder[0]
             if recording.recording_provider() != "worker" or recorder is None:
                 return
-            if recorder.active and recorder_holder[1] is not None:
+            if recorder.active and recorder_holder[1] is not None and origin != "consent":
                 # Already capturing with an upload URL in hand — the answer-time
                 # begin did its job. Nothing to re-mint, nothing to restart.
                 return
+            # At CONSENT the engagement is `in_call`, and since 0105 the API
+            # stamps the SESSION's recording pointer only then (review finding:
+            # sessions are reused across attempts, so a pre-consent clip that
+            # stamped the session would claim the slot the real screening's
+            # recording needs). So the consent-time prepare always runs; it
+            # re-mints the same key and `begin()` is a no-op if already begun.
             sid = phone.session_id_from_room_name(room_name)
             if sid is None:
                 return
@@ -8974,10 +9023,10 @@ async def _run_phone_session(
             classify=classify,
             say=say,
             start_recording=_phone_recording_permitted_and_begin,
-            # 0105: record from the answer, and write the gate transcript per
-            # item (so the once-at-consent writer stands down).
+            # 0105: record from the answer; the gate flushes the buffered gate
+            # transcript before its once-at-consent writer runs.
             begin_recording_at_answer=_phone_recording_begin_at_answer,
-            gate_turns_per_item=True,
+            flush_gate_transcript=_flush_gate_transcript,
             set_endpointing_max=(
                 # Fixed-local endpointing only: max_endpointing_delay governs the tail
                 # there. Excluded in dynamic mode (opt-in, off by default) whose
@@ -9111,6 +9160,44 @@ async def _run_phone_session(
     _pt = _role_prerender_task[0]
     if _pt is not None and not _pt.done():
         _pt.cancel()
+
+    # ── 0105: SETTLE THE GATE TRANSCRIPT AND THE RECORDING'S FATE ────────
+    # The gate has spoken. If it concluded the person on the line was NOT the
+    # candidate (a confirmed identity mismatch, or a wrong-number
+    # classification) nothing of theirs is kept: the buffered gate turns are
+    # dropped unsent and the recording is DISCARDED before the teardown below
+    # could upload it — the server no longer purges anything (PR #310 review:
+    # the one remaining purge could never complete against a worker-inband
+    # egress and left the engagement stuck in `dialing`). Every other exit
+    # flushes the buffer, so a call that died at the gate has its transcript.
+    if result.outcome == phone.CLASSIFY_WRONG_NUMBER or bool(
+        getattr(result, "not_the_candidate", False)
+    ):
+        _drop_gate_transcript("not_the_candidate")
+        _rec = recorder_holder[0]
+        if _rec is not None and _rec.active:
+            try:
+                await _rec.discard()
+            except Exception:  # noqa: BLE001 — recording is strictly secondary
+                _log.warn(
+                    "unknown_event", error_type="phone_recording_finish",
+                    error_category="discard_failed",
+                )
+            recorder_holder[1] = None
+            _log.info(
+                "unknown_event", error_type="phone_recording_finish",
+                error_category="discarded_not_the_candidate",
+            )
+    else:
+        try:
+            await _flush_gate_transcript()
+        except Exception:  # noqa: BLE001
+            _log.warn(
+                "unknown_event", error_type="phone_item_persist",
+                error_category="gate_flush_failed",
+            )
+    # The gate phase is over: nothing after this line is ever flagged as it.
+    gate_persist_active[0] = False
 
     async def _finish_recording() -> None:
         """PR A SEAM 3: the SINGLE common teardown for the recording.

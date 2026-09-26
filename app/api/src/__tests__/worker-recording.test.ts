@@ -111,6 +111,8 @@ function harness(opts: {
 }
 
 const INPUT = {
+  // 0105: this fixture is the CONSENTED prepare (the state that stamps).
+  engagementState: 'in_call',
   engagementId: ENGAGEMENT,
   attemptId: ATTEMPT,
   sessionId: SESSION,
@@ -235,5 +237,33 @@ describe('prepareWorkerRecording — the consent gate governs the upload URL', (
     expect(result.stampStatus).toBe('store_error');
     // A failed stamp does NOT stop the upload URL from being minted.
     expect(result.uploadUrl).toBe('https://storage.invalid/put/phone-object?token=abc');
+  });
+});
+
+// ── 0105: the session pointer is stamped only at consent ──────────────────
+describe('0105 — prepare before consent binds the attempt but leaves the SESSION slot alone', () => {
+  it('a `dialing` engagement is bound and minted, and NOT stamped', async () => {
+    const h = harness();
+    const result = await prepareWorkerRecording({ ...INPUT, engagementState: 'dialing' }, h.deps);
+    expect(result.status).toBe('prepared');
+    expect(result.boundForUpload).toBe(true);
+    expect(h.attach).toHaveBeenCalledTimes(1);
+    expect(h.stamp).not.toHaveBeenCalled();
+    expect(result.sessionStamped).not.toBe(true);
+    expect(result.stampStatus).toBe('deferred_until_consent');
+  });
+
+  it('an UNKNOWN state is treated as pre-consent — never stamp on a guess', async () => {
+    const h = harness();
+    const result = await prepareWorkerRecording({ ...INPUT, engagementState: null }, h.deps);
+    expect(result.status).toBe('prepared');
+    expect(h.stamp).not.toHaveBeenCalled();
+  });
+
+  it('`in_call` stamps, exactly as before 0105', async () => {
+    const h = harness();
+    const result = await prepareWorkerRecording({ ...INPUT, engagementState: 'in_call' }, h.deps);
+    expect(result.status).toBe('prepared');
+    expect(h.stamp).toHaveBeenCalledTimes(1);
   });
 });

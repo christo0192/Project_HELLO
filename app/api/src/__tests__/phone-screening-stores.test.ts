@@ -791,14 +791,17 @@ describe('0105 — commitItemTurn forwards p_is_gate, and never infers it', () =
     });
   });
 
-  it('sends p_is_gate: false when the flag is omitted — the 0071 scored turn, one wire shape', async () => {
-    // Explicit false rather than an omitted key: the DB's default is never
-    // relied on, and a reviewer reading the RPC log sees the decision.
+  it('OMITS p_is_gate for a scored turn — the exact 0071 wire shape survives a DB-only rollback', async () => {
+    // Review finding: an always-present p_is_gate is PGRST202 against the old
+    // six-argument signature on EVERY write, scored turns included. Omitted
+    // when false, only gate writes fail in that window; the interview
+    // transcript keeps landing.
     const { client, calls } = fakeClient({ status: 'applied', applied: true, duplicate: false, turn_index: 3 });
     await createPhoneStores(client).commitItemTurn!({
       sessionId: 's', speaker: 'candidate', text: 'Three years.',
       sourceItemId: 'phone-item-4', turnStartedAtMs: 1723000000123, now: NOW_,
     });
-    expect(calls[0].args).toMatchObject({ p_is_gate: false, p_turn_started_at_ms: 1723000000123 });
+    expect(calls[0].args).not.toHaveProperty('p_is_gate');
+    expect(calls[0].args).toMatchObject({ p_turn_started_at_ms: 1723000000123 });
   });
 });

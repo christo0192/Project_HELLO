@@ -349,6 +349,14 @@ export interface TranscriptLine {
   text: string;
   /** Seconds from the authoritative recording start. null when timing data is unavailable (legacy, simulation). */
   start_offset_sec?: number | null;
+  /**
+   * 0105. TRUE for the pre-consent gate — the disclosure, the identity turn,
+   * the consent reply — which is now persisted as it happens so a call that
+   * died at the gate still has a transcript. The API returns it on every turn
+   * (`GET /api/screening/:id`); the list tags these so a consented transcript
+   * does not open with the consent exchange dressed as the interview.
+   */
+  is_gate?: boolean;
 }
 
 export interface EnglishScore {

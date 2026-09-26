@@ -123,13 +123,43 @@ begin
     raise exception 'gt105: the once-writer appended % rows past the per-item ones', v_n - 4;
   end if;
 
+  -- ── The transcript-gap detector sees THROUGH gate rows ──────────────
+  -- A call that died at the gate now has rows. If the detector counted them
+  -- it would go silent for exactly the population the 2026-09-25 incident
+  -- was about. Remove the scored rows so only the gate rows remain, close the
+  -- session, and it must still be reported as having no transcript.
+  delete from screening_v2.transcript_turns
+   where session_id = v_sess and coalesce(is_gate, false) = false;
+  -- The transition trigger allows waiting → in_progress → completed only.
+  update screening_v2.call_sessions set status = 'in_progress' where id = v_sess;
+  update screening_v2.call_sessions set status = 'completed' where id = v_sess;
+  if not exists (select 1 from screening_v2.sessions_without_transcripts() d
+                  where d.session_id = v_sess) then
+    raise exception 'gt105: a session with ONLY gate rows was not reported as missing its transcript';
+  end if;
+  -- ...and a single scored row is a transcript, so it drops off the report.
+  insert into screening_v2.transcript_turns
+    (session_id, turn_index, speaker, text, is_gate, created_at, source_item_id)
+  values (v_sess, 99, 'candidate', 'Three years in sales.', false, v_now, 'gt105-scored');
+  if exists (select 1 from screening_v2.sessions_without_transcripts() d
+              where d.session_id = v_sess) then
+    raise exception 'gt105: a session WITH a scored row was reported as missing its transcript';
+  end if;
+
   -- ── Still refuses a closed session (0071 unchanged) ────────────────
-  update screening_v2.call_sessions set status = 'expired' where id = v_sess;
   v_res := screening_v2.commit_phone_item_turn(
              p_session_id => v_sess, p_speaker => 'bot', p_text => 'too late',
              p_source_item_id => 'phone-gate-item-9', p_is_gate => true, p_now => v_now);
   if v_res ->> 'status' <> 'session_not_active' then
     raise exception 'gt105: a closed session accepted a write: %', v_res;
+  end if;
+
+  -- ── The attach RPC's live comment no longer describes the retired posture ──
+  if (select obj_description(p.oid, 'pg_proc')
+        from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+       where n.nspname = 'screening_v2' and p.proname = 'attach_phone_attempt_recording')
+     not ilike '%KEEP the recording regardless of consent%' then
+    raise exception 'gt105: attach_phone_attempt_recording still carries the retired "keep only if consented" comment';
   end if;
 
   -- ── Posture, like every other phone RPC ────────────────────────────

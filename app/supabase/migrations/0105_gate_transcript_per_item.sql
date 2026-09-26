@@ -58,6 +58,18 @@
 -- gate persistence is on, so the two writers never race to duplicate a line.
 -- The RPC stays for in-flight legs on the previous worker image.
 --
+-- ── TWO MORE THINGS THIS MIGRATION OWNS ────────────────────────────────
+-- 1. `attach_phone_attempt_recording`'s LIVE DB COMMENT still described the
+--    retired posture ("keep only if consented, purge on every non-consent
+--    exit"); `\df+` would keep reporting a policy that no longer exists. It is
+--    re-commented below. The function body is untouched.
+-- 2. `sessions_without_transcripts` (0011/0045), the reconciliation detector
+--    behind the critical `transcript_gap` issue, counted ANY transcript row.
+--    A call that dies at the gate now has gate rows, so the detector would go
+--    silent for exactly the population the 2026-09-25 incident was about. It
+--    is re-declared to count SCORED rows only — the same split every other
+--    reader already makes.
+--
 -- ── SIGNATURE CHANGE, DONE THE 0083 WAY ────────────────────────────────
 -- A defaulted parameter is a NEW overload to Postgres, and PostgREST cannot
 -- choose between two candidates that both accept the same named arguments.
@@ -180,3 +192,66 @@ comment on function screening_v2.commit_phone_item_turn(
   'consent exchange (0105) so it is kept even when the call dies at the '
   'gate, yet stays excluded from the resume context and the scorer. '
   'Service-role-only.';
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- The attach RPC's comment: the posture it describes is retired
+-- ═══════════════════════════════════════════════════════════════════════
+comment on function screening_v2.attach_phone_attempt_recording(
+  uuid, text, text, text, text, timestamptz) is
+  'Binds an attempt-scoped recording object and manifest. Posture since '
+  '0105: record from call.answered and KEEP the recording regardless of '
+  'consent (owner decision, legal sign-off 2026-09-26); a stranger''s '
+  'recording is discarded by the worker before upload, never purged '
+  'server-side. Admits a dialing engagement with an answered attempt (0067). '
+  'Service-role-only.';
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- sessions_without_transcripts — gate rows are not a transcript
+-- ═══════════════════════════════════════════════════════════════════════
+-- Byte-identical to 0045 except for the one predicate that makes the
+-- detector see through the gate rows 0105 introduces.
+create or replace function screening_v2.sessions_without_transcripts()
+returns table (
+  session_id        uuid,
+  candidate_id      uuid,
+  ended_at          timestamptz,
+  status            text
+)
+language sql
+stable
+set search_path = pg_catalog
+as $$
+  -- A phone session that ends `failed` on `assessment.aborted` legitimately
+  -- has no turns: the call was abandoned before the first question boundary
+  -- committed. Only a COMPLETED phone session owes a transcript. Non-phone
+  -- sessions keep both statuses, unchanged.
+  select
+    s.id,
+    s.candidate_id,
+    s.ended_at,
+    s.status
+  from screening_v2.call_sessions s
+  where s.status in ('completed','failed')
+    -- `is not distinct from`, NOT `=`. A browser session has a NULL
+    -- `external_call_id`, and `NULL = 'phone-...'` is NULL — so `not (false
+    -- and NULL)` is NULL and the row is filtered out by the WHERE. Written
+    -- with `=` this predicate silently excluded EVERY session with no
+    -- external call id, which is every browser session: a phone exemption
+    -- that quietly disabled the detector for the lane it was not about.
+    and not (
+      s.status = 'failed'
+      and s.external_call_id is not distinct from ('phone-' || s.id::text)
+    )
+    and not exists (
+      select 1
+      from screening_v2.transcript_turns t
+      where t.session_id = s.id
+        -- 0105: the consent gate is not the interview. A session whose only
+        -- rows are the disclosure and the consent reply has NO transcript of
+        -- a screening, and must still be reported as missing one.
+        and coalesce(t.is_gate, false) = false
+    );
+$$;
+
+revoke all on function screening_v2.sessions_without_transcripts() from anon, authenticated;
+grant execute on function screening_v2.sessions_without_transcripts() to service_role;

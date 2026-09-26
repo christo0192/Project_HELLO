@@ -40,7 +40,7 @@ import {
   RECORDING_INTEGRITY_SHA256_HEX_LENGTH,
 } from '../lib/recording-integrity.js';
 import { getCorrelationId } from '../lib/correlation.js';
-import { finalizeAuthoritativeRecording, isWorkerInbandEgressId } from '../lib/recording-egress.js';
+import { finalizeAuthoritativeRecording } from '../lib/recording-egress.js';
 import { readRecordingHealth } from '../lib/recording/health.js';
 
 // ── LANE L6 (REC-01 buildable half) — pinned constants ──────────────
@@ -208,22 +208,11 @@ recordingsRouter.get(
       // of returning a permanent false 404. This keeps Egress authoritative:
       // no browser upload is accepted and no URL is minted until the normal
       // finalizer has linked and integrity-stamped the object.
-      //
-      // 0105: a WORKER-INBAND recording is not gated on `completed`. Since
-      // recording starts at `call.answered` and is kept regardless of consent,
-      // a call that died at the gate leaves a `waiting`/`expired` session with
-      // a stamped egress id and an uploaded object; if the worker's own
-      // `/recording/complete` did not land, this backstop is the only way that
-      // object ever gets linked and served. The worker-inband finalizer has no
-      // session-status precondition of its own, so nothing is loosened below it.
       if (
         !session.recording_object_key
+        && session.status === 'completed'
         && session.recording_egress_id
         && session.recording_egress_status !== 'failed'
-        && (
-          session.status === 'completed'
-          || isWorkerInbandEgressId(String(session.recording_egress_id))
-        )
       ) {
         let finalization: Awaited<ReturnType<typeof finalizeAuthoritativeRecording>>;
         try {

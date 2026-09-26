@@ -1363,24 +1363,28 @@ describe('0067 — recording starts on an APPLIED call.answered', () => {
 // (2026-09-26): the recording persists whatever happens at consent. The four
 // exits that are about the CANDIDATE's own consent therefore no longer purge.
 //
-// `candidate.wrong_number` is the one that still does. It is not about
-// consent at all — a stranger answered — and there is no reason to keep a
-// stranger's voice. It is deliberately alone in the set.
+// A first draft kept `candidate.wrong_number` — a stranger answered. Review
+// showed that on the worker provider that purge could never complete (the
+// attempt carries an `active` SYNTHETIC egress the purge cannot stop), so the
+// terminal never posted and the stranger was dialled again with their audio
+// kept. The stranger case is now the WORKER's: it discards the recording and
+// the buffered gate transcript on a not-the-candidate verdict. The set is
+// EMPTY; the machinery stays for a future admin-driven member.
 //
-// `consent.failed` was never a member (0095): the purge is engagement-wide and
-// that event is non-terminal, so it could destroy a sibling leg's consented
-// audio. See the long note on PURGE_BEFORE_EVENTS in routes/phone-worker.ts.
-const PURGING_EXITS = ['candidate.wrong_number'] as const;
+// `consent.failed` was never a member (0095). See the long note on
+// PURGE_BEFORE_EVENTS in routes/phone-worker.ts.
+const PURGING_EXITS = [] as const;
 const RETAINED_GATE_EXITS = [
   'disclosure.refused',
   'candidate.opt_out',
+  'candidate.wrong_number',
   'classify.machine',
   'candidate.deferred_pre_disclosure',
 ] as const;
 
-describe('only a WRONG NUMBER purges the recordings before it is acknowledged', () => {
-  it('the purge set is exactly candidate.wrong_number', () => {
-    expect([...PURGE_BEFORE_EVENTS].sort()).toEqual([...PURGING_EXITS].sort());
+describe('NO worker event purges the recordings any more (0105)', () => {
+  it('the purge set is EMPTY', () => {
+    expect([...PURGE_BEFORE_EVENTS]).toEqual([...PURGING_EXITS]);
   });
 
   it('consent.failed does NOT purge — the purge is engagement-wide and it is not terminal', () => {
@@ -1453,34 +1457,38 @@ describe('only a WRONG NUMBER purges the recordings before it is acknowledged', 
   }
 
   for (const status of ['enumeration_failed', 'egress_still_running', 'delete_failed', 'clear_failed']) {
-    it(`does not acknowledge on ${status}`, async () => {
+    it(`a purge that would answer ${status} is never consulted — the wrong number still posts`, async () => {
+      // THE REVIEW FINDING, pinned: with recording from `call.answered`, the
+      // attempt carries an `active` synthetic egress, and the old purge
+      // answered exactly `egress_still_running` here — a 503, no terminal, no
+      // suppression, the stranger redialled. Now the event posts regardless.
       const h = build({ withPurge: true, purgeStatus: status, purgeSafe: false });
       const res = await post(h, '/events', {
         attempt_id: ATTEMPT,
         event_type: 'candidate.wrong_number',
       });
-      expect(res.status).toBe(503);
-      expect(h.applyEvent).not.toHaveBeenCalled();
+      expect(res.status).toBe(200);
+      expect(h.purgeRecordings).not.toHaveBeenCalled();
+      expect(h.applyEvent).toHaveBeenCalledTimes(1);
     });
   }
 
-  it('a purge that THROWS also posts nothing', async () => {
+  it('a purge that would THROW is never reached either', async () => {
     const h = build({ withPurge: true });
     h.purgeRecordings.mockRejectedValueOnce(new Error('storage exploded'));
     const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: 'candidate.wrong_number' });
 
-    expect(res.status).toBe(503);
-    expect(h.applyEvent).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(h.purgeRecordings).not.toHaveBeenCalled();
     expect(JSON.stringify(res.body)).not.toContain('exploded');
   });
 
-  it('an engagement that cannot be RESOLVED posts nothing', async () => {
-    // We cannot name what to purge, so we cannot claim it is gone.
+  it('an engagement that cannot be RESOLVED for a purge still posts (nothing is purged)', async () => {
     const h = build({ withPurge: true, engagementState: null });
     const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: 'candidate.wrong_number' });
 
-    expect(res.status).toBe(503);
-    expect(h.applyEvent).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(h.purgeRecordings).not.toHaveBeenCalled();
   });
 
   it('every OTHER worker event does not purge at all', async () => {

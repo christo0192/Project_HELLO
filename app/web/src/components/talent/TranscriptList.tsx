@@ -69,6 +69,7 @@ export function TranscriptList({
             >
               <span className="mb-0.5 px-1 text-[11px] font-medium uppercase tracking-wide text-ink-tertiary">
                 {presented.label}
+                {line.is_gate === true ? ' · consent' : ''}
               </span>
               <div
                 className={cx(

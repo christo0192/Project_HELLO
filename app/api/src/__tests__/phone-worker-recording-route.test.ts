@@ -178,9 +178,14 @@ describe('provider=worker prepare — reuses the consent gate', () => {
     // The SAME consent gate ran.
     expect(h.list).toHaveBeenCalledTimes(1);
     expect(h.attach).toHaveBeenCalledTimes(1);
-    // Synthetic egress id recorded + stamped.
+    // Synthetic egress id recorded on the ATTEMPT...
     expect(h.finalizeAttemptRecording.mock.calls[0][0].egressId).toBe(`EG_worker_${ATTEMPT}`);
-    expect(h.stampSessionEgress.mock.calls[0][0].egressId).toBe(`EG_worker_${ATTEMPT}`);
+    // ...but the SESSION is NOT stamped: this prepare carries no engagement
+    // state (no resolver wired), which 0105 treats as pre-consent. Sessions
+    // are reused across attempts, so a pre-consent clip must not claim the
+    // session's recording slot — the consent-time prepare, at `in_call`,
+    // stamps it. See `worker-recording.test.ts` for the state-driven halves.
+    expect(h.stampSessionEgress).not.toHaveBeenCalled();
   });
 
   it('a REFUSED attach yields NO upload_url and mints nothing', async () => {
