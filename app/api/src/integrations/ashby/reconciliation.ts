@@ -25,13 +25,12 @@
  * writes zero receipts, enqueues zero jobs, and issues zero `application.info`
  * calls.
  *
- * UNCLASSIFIABLE rows fail OPEN, not closed. A row carrying an application id
- * but no readable job or stage id means the provider's list shape is not what
- * these extractors assume — and silently dropping 100% of real work on a
- * schema change is a worse failure than the storm. Such rows are admitted and
- * counted separately, but bounded: exceeding `maxUnclassified` aborts the run
- * WITHOUT advancing the cursor and flags the stream `list_schema_unclassified`,
- * so schema drift is loud and bounded instead of silent in either direction.
+ * UNCLASSIFIABLE rows fail CLOSED. A row carrying an application id but no
+ * readable job or stage id cannot establish mapping scope, so it creates no
+ * receipt or queue job. Such rows are counted separately and bounded:
+ * exceeding `maxUnclassified` aborts the run WITHOUT advancing the cursor and
+ * flags the stream `list_schema_unclassified`, making schema drift loud and
+ * retryable rather than allowing an unscoped fan-out.
  *
  * A per-run ENQUEUE CIRCUIT BREAKER (`maxEnqueuePerRun`) caps how much durable
  * work one pass may create. Any future admission-logic error is then bounded at
@@ -45,14 +44,6 @@
  * `application.info` authoritatively and re-applies the mapping/stage gate
  * before anything is imported, so an admitted-but-stale row is still rejected
  * downstream. Admission can only ever produce LESS work, never more.
- *
- * Forced resync on enable (0033): enabling or resuming a complete mapping —
- * or repointing an enabled mapping's AI stage — flags the `application.list`
- * checkpoint `full_resync_required` in the SAME transaction as the mapping
- * write, so applications already sitting at the trigger stage are reconsidered
- * under the new mapping instead of being invisible behind an incremental
- * cursor. A `resyncEpoch` guard means a run that is already in flight cannot
- * clear that flag when it completes.
  *
  * PAGE-ANCHORED FULL-RESYNC CONTINUATION (0034). A forced full resync used to
  * have to drain in ONE run or the cursor never moved at all, because only the
@@ -107,6 +98,10 @@ import type {
   EnabledMappingRow,
 } from './ports.js';
 import type { AshbyResult, ApplicationListParams, OpaqueRecord } from './types.js';
+import { admitStageAfterActivation } from './activation-admission.js';
+export { admitStageAfterActivation } from './activation-admission.js';
+export type { ApplicationHistoryLister, HistoryAdmission } from './activation-admission.js';
+import type { ApplicationHistoryLister } from './activation-admission.js';
 
 /** 14-day provider sync-token expiry — an older token forces a full resync. */
 export const SYNC_TOKEN_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
@@ -228,6 +223,10 @@ export interface ReconcileSkipCounts {
   stageNotAi: number;
   /** The index held conflicting AI stages for that job id — refuse to guess. */
   ambiguousMapping: number;
+  /** Application id exists but provider job/stage identity is unreadable. */
+  unclassified?: number;
+  /** Mapping matched, but complete stage history proves entry pre-dates activation. */
+  preActivation?: number;
 }
 
 /**
@@ -288,7 +287,7 @@ export interface ReconcileResult {
   observed: number;
   /**
    * Applications that passed admission — a job+stage match against an enabled
-   * mapping, PLUS the fail-open unclassified rows (also counted separately).
+   * mapping. Unclassified rows are counted separately and are not admitted.
    */
   admitted: number;
   /**
@@ -301,8 +300,8 @@ export interface ReconcileResult {
    */
   skipped: ReconcileSkipCounts;
   /**
-   * Admitted rows whose job/stage id could not be read (fail-open). A non-zero
-   * value means the provider list shape may have drifted; exceeding
+   * Rows whose job/stage id could not be read. They never create work; a
+   * non-zero value means the provider list shape may have drifted. Exceeding
    * `maxUnclassified` aborts the run and flags the stream.
    */
   unclassified: number;
@@ -338,6 +337,8 @@ export interface ReconcileDeps {
    * supply it, and a loader that returns no rows admits nothing.
    */
   mappings: EnabledMappingLoader;
+  /** Provider history reader used for the activation fence. */
+  history?: ApplicationHistoryLister;
   checkpointKey?: string;
   caps?: ReconcileCaps;
   /** Monotonic clock in ms; inject for deterministic tests. */
@@ -347,7 +348,7 @@ export interface ReconcileDeps {
 }
 
 function emptySkips(): ReconcileSkipCounts {
-  return { noApplicationId: 0, noEnabledMapping: 0, stageNotAi: 0, ambiguousMapping: 0 };
+  return { noApplicationId: 0, noEnabledMapping: 0, stageNotAi: 0, ambiguousMapping: 0, unclassified: 0, preActivation: 0 };
 }
 
 function noProgress(): PartialProgress {
@@ -564,12 +565,40 @@ export function buildEnabledStageIndex(rows: readonly EnabledMappingRow[]): Map<
   return index;
 }
 
+export interface EnabledMappingAdmission {
+  stageId: string;
+  activationAt: string;
+  activationEpoch: number;
+  configVersion: number;
+}
+
+/** The stricter index used by timestamp admission. Invalid rows are omitted. */
+export function buildEnabledAdmissionIndex(rows: readonly EnabledMappingRow[]): Map<string, EnabledMappingAdmission | null> {
+  const index = new Map<string, EnabledMappingAdmission | null>();
+  for (const row of rows) {
+    const jobId = typeof row?.externalJobId === 'string' ? row.externalJobId : '';
+    const stageId = typeof row?.aiScreeningStageId === 'string' ? row.aiScreeningStageId : '';
+    const activationAt = typeof row?.activationAt === 'string' ? row.activationAt : '';
+    if (!jobId || !stageId || !activationAt || !Number.isFinite(Date.parse(activationAt))) continue;
+    const value = {
+      stageId,
+      activationAt,
+      activationEpoch: typeof row.activationEpoch === 'number' && Number.isSafeInteger(row.activationEpoch) ? row.activationEpoch : 0,
+      configVersion: typeof row.configVersion === 'number' && Number.isSafeInteger(row.configVersion) ? row.configVersion : 0,
+    };
+    if (!index.has(jobId)) { index.set(jobId, value); continue; }
+    const existing = index.get(jobId);
+    if (!existing || existing.stageId !== value.stageId || existing.activationEpoch !== value.activationEpoch) index.set(jobId, null);
+  }
+  return index;
+}
+
 /** The admission verdict for one observed application.list row. */
 export type AdmissionVerdict =
   /** Positively matched an enabled mapping's job + AI stage. */
   | { admit: true; classified: true; applicationId: string; jobId: string; stageId: string }
-  /** Application id readable, job/stage not — admitted fail-open, and counted. */
-  | { admit: true; classified: false; applicationId: string; stageId?: string }
+  /** Application id readable, job/stage not — fail-closed and counted. */
+  | { admit: false; reason: 'unclassified'; applicationId: string; stageId?: string }
   | { admit: false; reason: keyof ReconcileSkipCounts };
 
 /**
@@ -577,10 +606,8 @@ export type AdmissionVerdict =
  * every path returns an admission or a single sanitized skip reason.
  *
  * The list row's own claims are used as a RESTRICTIVE HINT: they can decline
- * work, never authorise it — the worker's authoritative `application.info`
- * re-read remains the only thing that authorises an import. The one exception
- * is the unclassified path, which admits precisely because the hint could not
- * be read and failing closed there would silently drop real work.
+ * work, never authorise it. Unclassified rows are fail-closed and bounded;
+ * they never create a receipt or queue job.
  */
 export function admitApplication(
   view: { applicationId?: string; jobId?: string; currentStageId?: string },
@@ -588,11 +615,11 @@ export function admitApplication(
 ): AdmissionVerdict {
   if (!view.applicationId) return { admit: false, reason: 'noApplicationId' };
 
-  // Unreadable job/stage ⇒ the provider list shape is not what we assume.
-  // Fail OPEN (the worker will decide authoritatively) but count it, so the
-  // caller can abort on a bounded amount of drift.
+  // Unreadable job/stage ⇒ provider shape drift. Never fail open through the
+  // queue: an authoritative worker read cannot safely recover a row whose
+  // mapping scope was never established.
   if (!view.jobId || !view.currentStageId) {
-    return { admit: true, classified: false, applicationId: view.applicationId, stageId: view.currentStageId };
+    return { admit: false, reason: 'unclassified', applicationId: view.applicationId, stageId: view.currentStageId };
   }
 
   if (!index.has(view.jobId)) return { admit: false, reason: 'noEnabledMapping' };
@@ -704,6 +731,7 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
   // auto-pause, or a stage-id edit is honoured on the very next pass.
   const loaded = await deps.mappings.listEnabled(maxEnabledMappings);
   const index = buildEnabledStageIndex(loaded.rows ?? []);
+  const admissionIndex = buildEnabledAdmissionIndex(loaded.rows ?? []);
   const mappingsLoaded = index.size;
   const mappingIndexTruncated = loaded.truncated === true;
 
@@ -880,18 +908,21 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
       // ADMISSION FIRST — before ANY receipt write or enqueue. A skipped row
       // costs one map lookup and leaves no durable trace whatsoever.
       const verdict = admitApplication(extractApplicationInfo(raw), index);
-      if (!verdict.admit) { skipped[verdict.reason] += 1; pageHandled += 1; continue; }
-
-      if (!verdict.classified) {
-        unclassified += 1;
-        if (unclassified > maxUnclassified) {
-          // Probable provider-schema drift. Abort LOUD and bounded: do not
-          // advance, and flag the stream so the next pass is a full sweep and
-          // an operator can see why.
-          unclassifiedAbort = true;
-          stop = 'unclassified_cap';
-          break;
+      if (!verdict.admit) {
+        if (verdict.reason === 'unclassified') {
+          unclassified += 1;
+          if (unclassified > maxUnclassified) {
+            unclassifiedAbort = true;
+            stop = 'unclassified_cap';
+            break;
+          }
+          skipped.unclassified = (skipped.unclassified ?? 0) + 1;
+          pageHandled += 1;
+          continue;
         }
+        skipped[verdict.reason] += 1;
+        pageHandled += 1;
+        continue;
       }
 
       // Circuit breaker. Without anchoring it stays a strict per-item ceiling
@@ -902,6 +933,24 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
       }
 
       admitted += 1;
+      const admission = verdict.classified ? admissionIndex.get(verdict.jobId) : undefined;
+      if (verdict.classified && deps.history) {
+        if (!admission) throw new Error('ashby_activation_guard_malformed');
+        const historyVerdict = await admitStageAfterActivation(deps.history, {
+          applicationId: verdict.applicationId,
+          stageId: verdict.stageId,
+          activationAt: admission.activationAt,
+          deadlineAt: startedAt + deadlineMs,
+          nowMs,
+        });
+        if (historyVerdict !== 'admit') {
+          admitted -= 1;
+          pageHandled += 1;
+          skipped.preActivation = (skipped.preActivation ?? 0) + 1;
+          counter('ashby_reconcile_pre_activation', 1);
+          continue;
+        }
+      }
       const dedupId = stageDedupId(verdict.applicationId, verdict.stageId);
       // Recover the signal INTO PROCESSING via the transactional outbox: record
       // the receipt AND ensure a live signal job exists (re-drive). A dropped
@@ -918,6 +967,7 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
           webhookActionId: dedupId,
           action: CANDIDATE_STAGE_CHANGE_ACTION,
           externalApplicationId: verdict.applicationId,
+          source: 'reconcile',
         }),
       });
       if (outcome.status === 'inserted') recovered += 1; else duplicates += 1;
@@ -1051,6 +1101,7 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
   counter('ashby_reconcile_skipped_stage', skipped.stageNotAi);
   counter('ashby_reconcile_skipped_ambiguous', skipped.ambiguousMapping);
   counter('ashby_reconcile_skipped_no_application', skipped.noApplicationId);
+  counter('ashby_reconcile_skipped_unclassified', skipped.unclassified ?? 0);
   if (mappingIndexTruncated) counter('ashby_reconcile_mapping_index_truncated', 1);
   if (canAnchor) {
     counter('ashby_reconcile_page_anchors', anchors, { stop });

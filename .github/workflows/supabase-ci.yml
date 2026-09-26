@@ -65,7 +65,18 @@ jobs:
       - name: Run migrations, policy tests, seed apply, rerun, SQL integration
         env:
           SUPABASE_CLI_VERSION: 2.110.0
-        run: bash scripts/supabase-test.sh
+        run: |
+          lock=/tmp/incident-supabase-test.lock
+          for i in $(seq 1 120); do
+            if mkdir "$lock" 2>/dev/null; then
+              trap 'rmdir "$lock" 2>/dev/null || true' EXIT
+              bash scripts/supabase-test.sh
+              exit $?
+            fi
+            sleep 1
+          done
+          echo 'Timed out waiting for /tmp/incident-supabase-test.lock' >&2
+          exit 1
 
   funnel-views-test:
     runs-on: ubuntu-latest

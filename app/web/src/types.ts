@@ -1311,6 +1311,32 @@ export interface AshbyMcMapping {
   updatedAt: string;
 }
 
+export interface AshbyBacklogPreview {
+  runId: string;
+  mappingId: string;
+  externalJobId: string;
+  stageId: string;
+  expectedCount: number;
+  cap: number;
+  expiresAt: string;
+  configVersion: number;
+  activationEpoch: number;
+}
+
+export interface AshbyBacklogPreviewResponse {
+  ok: boolean;
+  preview?: AshbyBacklogPreview;
+  error?: string;
+}
+
+export interface AshbyBacklogConfirmResponse {
+  ok: boolean;
+  status?: string;
+  run_id?: string;
+  queued_count?: number;
+  error?: string;
+}
+
 /**
  * What creating a mapping needs. Mirrors `POST .../mission-control/mappings`.
  *

@@ -216,27 +216,30 @@ describe('admission — one enabled mapping admits only the exact job + stage', 
     });
 
     expect(res.observed).toBe(7);
-    // 2 exact matches + 2 fail-open unclassified rows (no_job, no_stage).
-    expect(res.admitted).toBe(4);
+    // Only the two exact matches are eligible. Unclassified rows are
+    // fail-closed and counted for bounded schema-drift handling.
+    expect(res.admitted).toBe(2);
     expect(res.unclassified).toBe(2);
     expect(res.skipped).toEqual({
       noApplicationId: 1,
       noEnabledMapping: 1,    // job_paused
       stageNotAi: 1,          // stage_ta on the mapped job
       ambiguousMapping: 0,
+      unclassified: 2,
+      preActivation: 0,
     });
     // The counters are internally consistent — no row is double-counted or lost.
     const skips = Object.values(res.skipped).reduce((a, b) => a + b, 0);
     expect(res.admitted + skips).toBe(res.observed);
 
     // The two exact matches carry the SAME stage-centric identity the webhook
-    // uses; the unclassified pair is admitted for the worker to adjudicate.
-    expect(receipts.writes).toBe(4);
+    // uses; unclassified rows never create a receipt or job.
+    expect(receipts.writes).toBe(2);
     expect(receipts.seen).toContain(
       `${CANDIDATE_STAGE_CHANGE_ACTION}:${stageDedupId('app_hit_1', AI)}`);
     expect(receipts.seen).toContain(
       `${CANDIDATE_STAGE_CHANGE_ACTION}:${stageDedupId('app_hit_2', AI)}`);
-    expect(receipts.liveJobs.size).toBe(4);
+    expect(receipts.liveJobs.size).toBe(2);
   });
 
   it('refuses to guess when the index holds conflicting stages for one job', async () => {
@@ -521,11 +524,11 @@ describe('buildEnabledStageIndex / admitApplication', () => {
       { externalJobId: 'jx', aiScreeningStageId: 'b' },
     ]);
     expect(admitApplication({}, index)).toEqual({ admit: false, reason: 'noApplicationId' });
-    // Unreadable job/stage fails OPEN — the worker adjudicates authoritatively.
+    // Unreadable job/stage fails closed before receipt persistence.
     expect(admitApplication({ applicationId: 'a' }, index))
-      .toEqual({ admit: true, classified: false, applicationId: 'a', stageId: undefined });
+      .toEqual({ admit: false, reason: 'unclassified', applicationId: 'a', stageId: undefined });
     expect(admitApplication({ applicationId: 'a', jobId: 'j1' }, index))
-      .toEqual({ admit: true, classified: false, applicationId: 'a', stageId: undefined });
+      .toEqual({ admit: false, reason: 'unclassified', applicationId: 'a', stageId: undefined });
     expect(admitApplication({ applicationId: 'a', jobId: 'nope', currentStageId: 's1' }, index))
       .toEqual({ admit: false, reason: 'noEnabledMapping' });
     expect(admitApplication({ applicationId: 'a', jobId: 'j1', currentStageId: 'other' }, index))
@@ -574,11 +577,11 @@ describe('per-run enqueue circuit breaker', () => {
   });
 });
 
-describe('unclassifiable rows fail OPEN but bounded', () => {
+describe('unclassifiable rows fail CLOSED but bounded', () => {
   /** Rows carrying an application id only — the provider list shape drifted. */
   const drifted = Array.from({ length: 200 }, (_, i) => row(`app_${i}`));
 
-  it('admits a small number of unclassified rows rather than dropping real work', async () => {
+  it('drops unclassified rows rather than creating unscoped work', async () => {
     const receipts = new FakeReceipts();
     const res = await runReconciliation({
       client: scriptedLister([{ results: drifted.slice(0, 5), moreDataAvailable: false, syncToken: 'tok' }]),
@@ -587,8 +590,8 @@ describe('unclassifiable rows fail OPEN but bounded', () => {
       mappings: new FakeMappings([{ externalJobId: JOB, aiScreeningStageId: AI }]),
     });
     expect(res.unclassified).toBe(5);
-    expect(res.admitted).toBe(5);
-    expect(receipts.liveJobs.size).toBe(5);
+    expect(res.admitted).toBe(0);
+    expect(receipts.liveJobs.size).toBe(0);
     expect(res.stop).toBe('drained');
   });
 
@@ -633,7 +636,7 @@ describe('counter accounting', () => {
       row('a', { jobId: JOB, stageId: AI }),                 // admit
       row('b', { jobId: JOB, stageId: 'other' }),            // stageNotAi
       row('c', { jobId: 'nope', stageId: AI }),              // noEnabledMapping
-      row('d'),                                              // unclassified (admit)
+      row('d'),                                              // unclassified (skip)
       { application: {} } as OpaqueRecord,                    // noApplicationId
     ];
     const res = await runReconciliation({
@@ -645,7 +648,7 @@ describe('counter accounting', () => {
     const skips = Object.values(res.skipped).reduce((a, b) => a + b, 0);
     expect(res.stop).toBe('drained');
     expect(res.admitted + skips).toBe(res.observed);
-    expect(res.admitted).toBe(2);       // exact match + unclassified
+    expect(res.admitted).toBe(1);       // exact match only
     expect(res.unclassified).toBe(1);
   });
 
@@ -660,8 +663,8 @@ describe('counter accounting', () => {
     });
     const skips = Object.values(res.skipped).reduce((a, b) => a + b, 0);
     expect(res.stop).toBe('unclassified_cap');
-    // 5 admitted fail-open, the 6th tripped the bound and stopped the run.
-    expect(res.admitted).toBe(5);
+    // The first 5 are fail-closed skips; the 6th trips the bound.
+    expect(res.admitted).toBe(0);
     expect(res.unclassified).toBe(6);
     expect(res.observed).toBe(6);
     expect(res.admitted + skips).toBe(res.observed - 1);
@@ -680,7 +683,7 @@ describe('reconcile-pass publication to the health registry', () => {
     publishReconcilePass({
       stop: 'drained', mode: 'full',
       observed: 2_000, admitted: 0,
-      skipped: { noApplicationId: 0, noEnabledMapping: 2_000, stageNotAi: 0, ambiguousMapping: 0 },
+      skipped: { noApplicationId: 0, noEnabledMapping: 2_000, stageNotAi: 0, ambiguousMapping: 0, preActivation: 0 },
       unclassified: 0, enabledMappings: 0, mappingIndexTruncated: false,
       recovered: 0, duplicates: 0, enqueued: 0, advanced: true,
     }, '2026-08-18T00:00:00.000Z');
@@ -699,7 +702,7 @@ describe('reconcile-pass publication to the health registry', () => {
       // Hostile input the caller should never produce, but must not propagate.
       stop: 'drained; DROP TABLE', mode: 'FULL-mode',
       observed: -5, admitted: Number.NaN,
-      skipped: { noApplicationId: -1, noEnabledMapping: 1.9, stageNotAi: Infinity, ambiguousMapping: 3 },
+      skipped: { noApplicationId: -1, noEnabledMapping: 1.9, stageNotAi: Infinity, ambiguousMapping: 3, preActivation: 7 },
       unclassified: -0.5, enabledMappings: Number.NaN, mappingIndexTruncated: 'yes' as unknown as boolean,
       recovered: -2, duplicates: 4, enqueued: -9, advanced: 1 as unknown as boolean,
     }, '2026-08-18T00:00:00.000Z');

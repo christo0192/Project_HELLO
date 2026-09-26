@@ -336,11 +336,18 @@ function importRuntime(opts: {
     linkRef: () => link,
     runtime: {
       runtimeConfig: {},
-      client: reader(appAtAi),
+      client: {
+        applicationInfo: async () => ({ ok: true as const, status: 200, results: appAtAi }),
+        applicationListHistory: async () => ({
+          results: [{ stageId: AI_STAGE, enteredStageAt: '2026-09-26T00:00:00Z', leftStageAt: null }],
+          moreDataAvailable: false,
+        }),
+      },
       materialization: opts.store,
       resolveMappingByJobId: async () => ({
         id: 'map_1', status: 'enabled', aiScreeningStageId: AI_STAGE,
         taScreeningStageId: 'stage_ta', deliveryMode: 'manual',
+        activationAt: '2026-09-25T00:00:00Z', activationEpoch: 1, configVersion: 1,
       }),
       resolveMappingForLink: async () => (opts.mapping === undefined ? MAPPING : opts.mapping),
       stores: {
@@ -352,6 +359,8 @@ function importRuntime(opts: {
         readLink: async () => link,
         bindLinkResumeHandle: async () => {},
       },
+      isExplicitImportAuthorized: async () => false,
+      isSnapshotApplicationAuthorized: async () => false,
       queue: {
         enqueue: async (name: string) => { enqueues.push({ name }); return { id: 'q1' }; },
       },

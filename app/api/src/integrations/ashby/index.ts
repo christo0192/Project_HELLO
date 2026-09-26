@@ -52,6 +52,7 @@ export {
   resolveSyncMode,
   admitApplication,
   buildEnabledStageIndex,
+  admitStageAfterActivation,
   SYNC_TOKEN_MAX_AGE_MS,
   DEFAULT_CHECKPOINT_KEY,
   DEFAULT_MAX_ENABLED_MAPPINGS,
@@ -61,6 +62,7 @@ export {
   type ReconcileCaps,
   type AdmissionVerdict,
   type ApplicationLister,
+  type ApplicationHistoryLister,
 } from './reconciliation.js';
 export {
   processAshbySignal,
@@ -80,6 +82,8 @@ export {
   createCheckpointStore,
   createMappingResolver,
   createEnabledMappingLoader,
+  createExplicitImportAuthorizer,
+  createSnapshotApplicationAuthorizer,
   createAshbySignalQueue,
 } from './stores.js';
 export type {
@@ -102,6 +106,7 @@ export {
   type PaginatedList,
   type OpaqueRecord,
   type ApplicationListParams,
+  type ApplicationHistoryParams,
   type FeedbackSubmitRequest,
   type FeedbackRequestCreateRequest,
 } from './types.js';

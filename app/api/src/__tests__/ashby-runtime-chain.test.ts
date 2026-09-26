@@ -152,10 +152,16 @@ function makeRuntime(w: ReturnType<typeof world>, over: Partial<AshbyRuntime> = 
         results: { id: APP, job: { id: JOB }, currentInterviewStage: { id: AI } },
         moreDataAvailable: false,
       }),
+      applicationListHistory: async () => ({
+        results: [{ stageId: AI, enteredStageAt: '2026-08-18T00:00:00Z', leftStageAt: null }],
+        moreDataAvailable: false,
+      }),
     } as never,
     queue,
     stores: w.stores,
     receipts: { record: async () => ({ status: 'inserted', id: 'r', enqueued: true, workPending: true }) },
+    isExplicitImportAuthorized: async () => true,
+    isSnapshotApplicationAuthorized: async () => false,
     checkpoints: { get: async () => null, advance: async () => {}, requireFullResync: async () => {} },
     missionControl: {} as never,
     materialization: {
@@ -182,14 +188,14 @@ function makeRuntime(w: ReturnType<typeof world>, over: Partial<AshbyRuntime> = 
       findActiveInvite: async () => null,
       insertInvite: async (i) => { const id = `inv_${w.next()}`; w.invites.push({ id, digest: i.tokenDigest }); return { id }; },
     },
-    mappings: { resolveByJobId: async () => ({ status: 'enabled', aiScreeningStageId: AI }) },
+    mappings: { resolveByJobId: async () => ({ status: 'enabled', aiScreeningStageId: AI, activationAt: '2026-08-17T00:00:00Z' }) },
     enabledMappings: {
       async listEnabled() {
         return { rows: [{ externalJobId: JOB, aiScreeningStageId: AI }], truncated: false };
       },
     },
     urlPolicy: { allowlistEnabled: false, allowedHosts: [], allowedPorts: [443] },
-    resolveMappingByJobId: async () => ({ status: 'enabled', aiScreeningStageId: AI, id: 'map_1', deliveryMode: 'manual' }),
+    resolveMappingByJobId: async () => ({ status: 'enabled', aiScreeningStageId: AI, id: 'map_1', deliveryMode: 'manual', activationAt: '2026-08-17T00:00:00Z' }),
     resolveMappingForLink: async () => ({ id: 'map_1', roleId: ROLE, ownerId: OWNER, deliveryMode: 'manual' }),
     // No resume handle in this fixture ⇒ the ingestion job is a clean no-op.
     buildIngestionPorts: async () => ({ status: 'no_resume' as const }),

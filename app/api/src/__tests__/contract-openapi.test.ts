@@ -1123,7 +1123,9 @@ describe('OpenAPI document integrity', () => {
     // POST /api/roles/questions/rephrase. It is its own URL rather than a verb
     // on /api/roles/draft because it is synchronous and question-scoped, where
     // every /draft route is job-scoped. 135 + 1 = 136.
-    expect(Object.keys(paths).length).toBe(136);
+    // 0106 adds distinct admin-only preview and confirmation URLs for the
+    // explicit (never enable-triggered) mapping backlog import. 136 + 2 = 138.
+    expect(Object.keys(paths).length).toBe(138);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1221,7 +1223,9 @@ describe('OpenAPI document integrity', () => {
     //   `type: object` because `phase` is the contract that makes a ten-minute
     //   wait legible — a client that guessed at it would report a spinner.
     //   247 + 1 = 248.
-    expect(Object.keys(schemas).length).toBe(248);
+    // 0106 adds the bounded preview, confirmation, and response envelope
+    // schemas for the explicit Ashby mapping backlog action. 248 + 3 = 251.
+    expect(Object.keys(schemas).length).toBe(251);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.

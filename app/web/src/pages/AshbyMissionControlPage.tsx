@@ -8,6 +8,7 @@ import type {
   AshbyFeedbackForm,
   AshbyScorecardBindingPreview,
   AshbyScorecardBindingPreviewResponse,
+  AshbyBacklogPreview,
 } from '../types';
 import {
   Button,
@@ -124,6 +125,9 @@ export function AshbyMissionControlPage() {
     { mappingId: string; scoringPath: NonNullable<AshbyScorecardBindingPreviewResponse['scoringPath']>; preview: AshbyScorecardBindingPreview } | null
   >(null);
   const [bindingError, setBindingError] = useState<{ mappingId: string; message: string } | null>(null);
+  const [backlogPreview, setBacklogPreview] = useState<{ mappingId: string; preview: AshbyBacklogPreview } | null>(null);
+  const [backlogError, setBacklogError] = useState<{ mappingId: string; message: string } | null>(null);
+  const [backlogConfirmArmed, setBacklogConfirmArmed] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -258,6 +262,37 @@ export function AshbyMissionControlPage() {
       setBusy(false);
     }
   }, []);
+
+  const previewBacklog = useCallback(async (mappingId: string) => {
+    setBusy(true);
+    setBacklogError(null);
+    setBacklogPreview(null);
+    setBacklogConfirmArmed(false);
+    try {
+      const res = await api.previewAshbyBacklog(mappingId);
+      if (res.ok && res.preview) setBacklogPreview({ mappingId, preview: res.preview });
+      else setBacklogError({ mappingId, message: backlogErrorCopy(res.error) });
+    } catch (e) {
+      setBacklogError({ mappingId, message: e instanceof ApiError ? backlogErrorCopy(e.message) : 'Could not preview the existing backlog' });
+    } finally {
+      setBusy(false);
+    }
+  }, []);
+
+  const confirmBacklog = useCallback(async (mappingId: string, preview: AshbyBacklogPreview) => {
+    if (!backlogConfirmArmed) return;
+    setBusy(true);
+    setBacklogError(null);
+    try {
+      const res = await api.confirmAshbyBacklog(mappingId, preview.runId, preview.expectedCount);
+      if (!res.ok) setBacklogError({ mappingId, message: backlogErrorCopy(res.error ?? res.status) });
+      else { setBacklogPreview(null); setBacklogConfirmArmed(false); await load(); }
+    } catch (e) {
+      setBacklogError({ mappingId, message: e instanceof ApiError ? backlogErrorCopy(e.message) : 'Could not confirm the backlog import' });
+    } finally {
+      setBusy(false);
+    }
+  }, [backlogConfirmArmed, load]);
 
   /**
    * Create the mapping. It always lands PAUSED — enabling is the separate
@@ -654,6 +689,13 @@ export function AshbyMissionControlPage() {
                         >
                           Preview scorecard binding
                         </Button>
+                        <Button
+                          size="sm"
+                          disabled={busy || m.status !== 'enabled'}
+                          onClick={() => void previewBacklog(m.id)}
+                        >
+                          Preview existing backlog
+                        </Button>
                       </div>
                     </div>
 
@@ -679,6 +721,41 @@ export function AshbyMissionControlPage() {
                         preview={bindingPreview.preview}
                       />
                     )}
+
+                    {backlogError?.mappingId === m.id && (
+                      <InlineNotice tone="danger" role="alert" className="mt-3">
+                        {backlogError.message}
+                      </InlineNotice>
+                    )}
+
+                    {backlogPreview?.mappingId === m.id && (() => {
+                      const p = backlogPreview.preview;
+                      const expired = Date.parse(p.expiresAt) <= Date.now();
+                      const atCap = p.expectedCount >= p.cap;
+                      return (
+                        <div className="glass-sunken mt-3 p-3" role="region" aria-label="Backlog import preview">
+                          <p className="text-[13px] font-medium text-ink">
+                            {expired ? 'This preview has expired.' : `This snapshot contains ${p.expectedCount} existing application${p.expectedCount === 1 ? '' : 's'} from this job and stage.`}
+                          </p>
+                          <p className="mt-1 text-[13px] leading-5 text-ink-secondary">
+                            Default behavior is future stage entries only. Confirmation schedules only this exact snapshot; completed or already-deduplicated applications may be no-ops, and existing phone engagements are not cancelled by this policy. The snapshot expires {new Date(p.expiresAt).toLocaleString()} and is capped at {p.cap} applications.
+                          </p>
+                          {atCap && !expired && <p className="mt-2 text-[13px] text-warning-text">This preview is at the safety cap; narrow the mapping or ask an operator to review before importing.</p>}
+                          <label className="mt-3 flex items-start gap-2 text-[13px] text-ink-secondary">
+                            <input type="checkbox" checked={backlogConfirmArmed} disabled={busy || expired} onChange={(e) => setBacklogConfirmArmed(e.target.checked)} />
+                            <span>I understand this is an explicit provider-backed import and may create screening work.</span>
+                          </label>
+                          <div className="mt-3 flex items-center gap-2">
+                            <Button size="sm" disabled={busy || expired || !backlogConfirmArmed} onClick={() => void confirmBacklog(m.id, p)}>
+                              {busy ? 'Confirming…' : 'Confirm and import this snapshot'}
+                            </Button>
+                            <Button size="sm" variant="ghost" disabled={busy} onClick={() => { setBacklogPreview(null); setBacklogConfirmArmed(false); }}>
+                              Cancel
+                            </Button>
+                          </div>
+                        </div>
+                      );
+                    })()}
                   </li>
                 ))}
               </ul>
@@ -852,6 +929,20 @@ function bindingErrorCopy(code: string | undefined): string {
       return 'Ashby did not return the feedback form definition. Check the API key scopes (hiringProcessMetadataRead) and that the form still exists.';
     default:
       return 'Could not preview the scorecard binding';
+  }
+}
+
+function backlogErrorCopy(code: string | undefined): string {
+  switch (code) {
+    case 'mapping_not_enabled': return 'Enable this mapping first. Enabling remains future-stage-only unless you explicitly confirm a snapshot.';
+    case 'ashby_backlog_cap_exceeded': return 'The preview exceeds the safety cap. Narrow the mapping scope before importing.';
+    case 'ashby_backlog_page_cap': return 'Ashby returned too many pages for one preview. Nothing was imported; try again later or narrow the scope.';
+    case 'expired': return 'This preview expired. Run a new preview before confirming.';
+    case 'count_mismatch': return 'The count changed. Run a new preview; nothing outside its snapshot can be confirmed.';
+    case 'mapping_changed': return 'The mapping changed or was paused/repointed. Run a new preview.';
+    case 'already_confirmed': return 'This snapshot was already confirmed; no second import was created.';
+    case 'ashby_backlog_provider_unavailable': return 'The Ashby read-only provider connection is unavailable. Nothing was imported.';
+    default: return 'Could not preview or confirm the existing backlog. Nothing was imported.';
   }
 }
 

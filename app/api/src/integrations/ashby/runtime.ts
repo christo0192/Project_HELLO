@@ -32,7 +32,7 @@ import {
   type AshbyIntegrationConfig,
   type AshbyRuntimeConfig,
 } from './config.js';
-import { createReceiptStore, createCheckpointStore, createMappingResolver, createEnabledMappingLoader, createAshbySignalQueue } from './stores.js';
+import { createReceiptStore, createCheckpointStore, createMappingResolver, createEnabledMappingLoader, createAshbySignalQueue, createExplicitImportAuthorizer, createSnapshotApplicationAuthorizer } from './stores.js';
 import { createWorkflowStores, createMissionControlStore, type MissionControlStore } from './workflow-stores.js';
 import { createPinnedHttpsTransport } from './resume-transport.js';
 import { fetchEphemeralResume } from './resume-fetch.js';
@@ -130,6 +130,8 @@ export interface AshbyRuntime {
    * guard. Rebuilt every run; never cached across runs.
    */
   enabledMappings: EnabledMappingLoader;
+  isExplicitImportAuthorized?: (input: { runId: string; applicationId: string; jobId: string; stageId: string }) => Promise<boolean>;
+  isSnapshotApplicationAuthorized?: (input: { applicationId: string; jobId: string; stageId: string }) => Promise<boolean>;
   /** SSRF policy derived from config. `allowlistEnabled` false when empty. */
   urlPolicy: UrlPolicy;
   /** Full mapping config for the import decision (status + stage + mode). */
@@ -509,7 +511,7 @@ export function createAshbyRuntime(options: CreateAshbyRuntimeOptions): AshbyRun
   async function resolveMappingByJobId(externalJobId: string): Promise<ResolvedMapping> {
     const { data, error } = await supabase
       .from('ashby_job_mappings')
-      .select('id, status, ai_screening_stage_id, delivery_mode, screening_mode')
+      .select('id, status, ai_screening_stage_id, delivery_mode, screening_mode, activation_at, activation_epoch, config_version')
       .eq('provider', 'ashby')
       .eq('external_job_id', externalJobId)
       .maybeSingle();
@@ -527,6 +529,9 @@ export function createAshbyRuntime(options: CreateAshbyRuntimeOptions): AshbyRun
       id: String(r.id),
       deliveryMode: mode === 'email' || mode === 'both' ? (mode as 'email' | 'both') : 'manual',
       screeningMode: r.screening_mode === 'phone_primary' ? 'phone_primary' : 'browser_primary',
+      activationAt: typeof r.activation_at === 'string' ? r.activation_at : null,
+      activationEpoch: typeof r.activation_epoch === 'number' ? r.activation_epoch : 0,
+      configVersion: typeof r.config_version === 'number' ? r.config_version : 0,
     };
   }
 
@@ -700,6 +705,8 @@ export function createAshbyRuntime(options: CreateAshbyRuntimeOptions): AshbyRun
     receipts: createReceiptStore(supabase),
     checkpoints: createCheckpointStore(supabase),
     enabledMappings: createEnabledMappingLoader(supabase),
+    isExplicitImportAuthorized: createExplicitImportAuthorizer(supabase),
+    isSnapshotApplicationAuthorized: createSnapshotApplicationAuthorizer(supabase),
     missionControl: createMissionControlStore(supabase),
     materialization,
     urlPolicy,

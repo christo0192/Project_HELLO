@@ -113,6 +113,36 @@ describe('actions — admin only', () => {
     expect((await request(app).post('/mc/mappings/not-a-uuid/pause')).status).toBe(400);
     expect((await request(app).post(`/mc/workflows/${UUID}/cancel`).send({ terminal_state: 'bogus' })).status).toBe(400);
   });
+
+  it('previews and separately confirms an exact backlog snapshot', async () => {
+    const preview = vi.fn().mockResolvedValue({
+      runId: UUID, mappingId: UUID, expectedCount: 2, cap: 500,
+      expiresAt: '2099-01-01T00:00:00.000Z', scope: { jobId: 'job_1', stageId: 'stage_ai' },
+    });
+    const confirm = vi.fn().mockResolvedValue({ status: 'ok', runId: UUID, queuedCount: 1 });
+    const app = appWithDeps('admin', { store: fakeStore(), backlogImport: { preview, confirm } as never });
+    const p = await request(app).post(`/mc/mappings/${UUID}/backlog/preview`);
+    expect(p.status).toBe(200);
+    expect(p.body.preview.expectedCount).toBe(2);
+    expect(preview).toHaveBeenCalledWith(UUID, UUID);
+    const c = await request(app).post(`/mc/mappings/${UUID}/backlog/confirm`)
+      .send({ run_id: UUID, expected_count: 2 });
+    expect(c.status).toBe(200);
+    expect(c.body.queued_count).toBe(1);
+    expect(confirm).toHaveBeenCalledWith(UUID, UUID, 2, UUID);
+  });
+
+  it('keeps preview/confirmation admin-only and exposes safe conflict states', async () => {
+    const preview = vi.fn().mockRejectedValue(new Error('ashby_backlog_cap_exceeded'));
+    const confirm = vi.fn().mockResolvedValue({ status: 'count_mismatch' });
+    const deps = { store: fakeStore(), backlogImport: { preview, confirm } as never };
+    expect((await request(appWithDeps('interviewer', deps)).post(`/mc/mappings/${UUID}/backlog/preview`)).status).toBe(403);
+    const app = appWithDeps('admin', deps);
+    expect((await request(app).post(`/mc/mappings/${UUID}/backlog/preview`)).status).toBe(409);
+    const res = await request(app).post(`/mc/mappings/${UUID}/backlog/confirm`).send({ run_id: UUID, expected_count: 0 });
+    expect(res.status).toBe(409);
+    expect(res.body.error).toBe('count_mismatch');
+  });
 });
 
 // ═══════════════════════════════════════════════════════════════════════

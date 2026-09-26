@@ -3319,6 +3319,120 @@ begin
 end;
 $$;
 
+-- ── 0106: activation fence + explicit snapshot lifecycle ────────────────
+do $$
+declare
+  v_role uuid; v_actor uuid := gen_random_uuid(); v_map jsonb; v_mapid uuid;
+  v_preview jsonb; v_confirm jsonb; v_auth jsonb; v_config integer; v_old timestamptz := now() - interval '30 days';
+  v_rollout timestamptz := now();
+begin
+  select id into v_role from screening_v2.roles order by created_at limit 1;
+  v_map := screening_v2.upsert_ashby_job_mapping(
+    null::uuid, 'pol0106-job', v_role, 'pol0106-ai', 'pol0106-ta', null::text, null::text, null::text,
+    gen_random_uuid(), 'manual', 24, 'enabled', null::text, v_actor);
+  v_mapid := (v_map->>'id')::uuid;
+  select config_version into v_config from screening_v2.ashby_job_mappings where id = v_mapid;
+
+  -- Rollout initialization uses the rollout instant, never a cosmetic old
+  -- updated_at. This simulates an existing enabled mapping during 0106.
+  update screening_v2.ashby_job_mappings
+     set activation_at = null, updated_at = v_old where id = v_mapid;
+  update screening_v2.ashby_job_mappings
+     set activation_at = coalesce(activation_at, v_rollout) where id = v_mapid;
+  perform _policy_tests.assert('ashby 0106: existing enabled mapping fence is rollout-time, not updated_at',
+    (select activation_at > v_old from screening_v2.ashby_job_mappings where id = v_mapid),
+    'activation_at backdated to updated_at');
+
+  v_preview := screening_v2.create_ashby_snapshot_preview(
+    v_mapid, 'pol0106-job', 'pol0106-ai', v_config,
+    (select activation_epoch from screening_v2.ashby_job_mappings where id = v_mapid), v_actor,
+    jsonb_build_array(jsonb_build_object('applicationId','pol0106-app','jobId','pol0106-job','stageId','pol0106-ai')),
+    1, now() + interval '1 minute');
+  perform _policy_tests.assert('ashby 0106: preview stores an exact bounded snapshot',
+    v_preview->>'status' = 'ok', coalesce(v_preview::text, 'null'));
+
+  v_confirm := screening_v2.confirm_ashby_snapshot_import(
+    (v_preview->>'run_id')::uuid, v_mapid, 1, gen_random_uuid());
+  perform _policy_tests.assert('ashby 0106: only the preview actor may confirm',
+    v_confirm->>'status' = 'actor_mismatch'
+      and not exists (select 1 from screening_v2.job_queue where dedup_key like '%stage:pol0106-app:%'),
+    coalesce(v_confirm::text, 'null'));
+
+  -- A completed handoff can still lack a link after a conditional skip.
+  -- Snapshot confirmation MUST reopen it and create fresh live work.
+  insert into screening_v2.ashby_event_receipts(provider,webhook_action_id,action,status,processed_at)
+    values ('ashby','stage:pol0106-app:pol0106-ai','candidateStageChange','processed',now());
+  insert into screening_v2.job_queue(name,payload,status,dedup_key)
+    values ('ashby.signal','{}'::jsonb,'completed','ashby:signal:candidateStageChange:stage:pol0106-app:pol0106-ai');
+
+  v_confirm := screening_v2.confirm_ashby_snapshot_import(
+    (v_preview->>'run_id')::uuid, v_mapid, 1, v_actor);
+  perform _policy_tests.assert('ashby 0106: confirmation creates durable signal work and supported audit action',
+    v_confirm->>'status' = 'ok' and (v_confirm->>'queued_count')::integer = 1
+      and (select status = 'received' and processed_at is null from screening_v2.ashby_event_receipts
+           where webhook_action_id='stage:pol0106-app:pol0106-ai')
+      and (select count(*) = 1 from screening_v2.job_queue where dedup_key like '%stage:pol0106-app:%' and status = 'pending')
+      and (select count(*) = 1 from screening_v2.job_queue where dedup_key like '%stage:pol0106-app:%' and status = 'completed')
+      and exists (select 1 from screening_v2.audit_events where target_id = v_preview->>'run_id'
+                  and action = 'ashby_mapping_update' and metadata->>'action' = 'snapshot_confirm'),
+    coalesce(v_confirm::text, 'null'));
+
+  -- Existing live dedup work is NOT a newly enqueued job. Its processed
+  -- receipt still needs reopening, so that live job can do the handoff.
+  update screening_v2.ashby_event_receipts set status='processed', processed_at=now()
+   where webhook_action_id='stage:pol0106-app:pol0106-ai';
+  v_preview := screening_v2.create_ashby_snapshot_preview(
+    v_mapid, 'pol0106-job', 'pol0106-ai', v_config,
+    (select activation_epoch from screening_v2.ashby_job_mappings where id = v_mapid), v_actor,
+    jsonb_build_array(jsonb_build_object('applicationId','pol0106-app','jobId','pol0106-job','stageId','pol0106-ai')),
+    1, now() + interval '1 minute');
+  v_confirm := screening_v2.confirm_ashby_snapshot_import(
+    (v_preview->>'run_id')::uuid, v_mapid, 1, v_actor);
+  perform _policy_tests.assert('ashby 0106: live dedup is not counted as newly queued',
+    v_confirm->>'status'='ok' and (v_confirm->>'queued_count')::integer=0
+      and (select status='received' from screening_v2.ashby_event_receipts
+           where webhook_action_id='stage:pol0106-app:pol0106-ai')
+      and (select count(*)=1 from screening_v2.job_queue
+           where dedup_key='ashby:signal:candidateStageChange:stage:pol0106-app:pol0106-ai' and status='pending'),
+    coalesce(v_confirm::text,'null'));
+
+  -- Accepted work survives preview expiry, while the current mapping/generation
+  -- remains authoritative.
+  update screening_v2.ashby_mapping_snapshot_imports set expires_at = now() - interval '1 second'
+   where id = (v_preview->>'run_id')::uuid;
+  v_auth := screening_v2.authorize_ashby_snapshot_entry(
+    (v_preview->>'run_id')::uuid, 'pol0106-app', 'pol0106-job', 'pol0106-ai');
+  perform _policy_tests.assert('ashby 0106: queued confirmation survives preview expiry',
+    (v_auth->>'authorized')::boolean, coalesce(v_auth::text, 'null'));
+  v_auth := screening_v2.authorize_ashby_snapshot_application(
+    'pol0106-app', 'pol0106-job', 'pol0106-ai');
+  perform _policy_tests.assert('ashby 0106: application handoff is exact-scope',
+    (v_auth->>'authorized')::boolean
+      and not (screening_v2.authorize_ashby_snapshot_application(
+        'pol0106-other-app', 'pol0106-job', 'pol0106-ai')->>'authorized')::boolean,
+    coalesce(v_auth::text, 'null'));
+
+  v_confirm := screening_v2.confirm_ashby_snapshot_import(
+    (v_preview->>'run_id')::uuid, v_mapid, 1, v_actor);
+  perform _policy_tests.assert('ashby 0106: duplicate confirmation is idempotent',
+    v_confirm->>'status' = 'already_confirmed', coalesce(v_confirm::text, 'null'));
+
+  perform screening_v2.set_ashby_mapping_status(v_mapid, 'paused', '0106 test', v_actor);
+  v_auth := screening_v2.authorize_ashby_snapshot_entry(
+    (v_preview->>'run_id')::uuid, 'pol0106-app', 'pol0106-job', 'pol0106-ai');
+  perform _policy_tests.assert('ashby 0106: pause invalidates accepted snapshot authorization',
+    not (v_auth->>'authorized')::boolean, coalesce(v_auth::text, 'null'));
+
+  perform _policy_tests.assert('ashby 0106: audit action vocabulary remains valid',
+    (select count(*) > 0 from screening_v2.audit_events where target_id = v_preview->>'run_id'
+      and action = 'ashby_mapping_update'), 'snapshot confirmation audit missing');
+  delete from screening_v2.job_queue where dedup_key like 'ashby:signal:candidateStageChange:stage:pol0106-app:%';
+  delete from screening_v2.ashby_event_receipts where webhook_action_id = 'stage:pol0106-app:pol0106-ai';
+  delete from screening_v2.ashby_mapping_snapshot_imports where mapping_id = v_mapid;
+  delete from screening_v2.ashby_job_mappings where id = v_mapid;
+end;
+$$;
+
 -- ═══════════════════════════════════════════════════════════════════════
 -- HELLO dashboard access allowlist (0016) — normalized-email access gate
 -- ═══════════════════════════════════════════════════════════════════════
@@ -5233,27 +5347,26 @@ begin
       and v_cp.status = 'idle' and v_cp.resync_epoch = v_epoch,
     'paused create must not force a resync');
 
-  -- (b) ENABLING the mapping must force full_resync_required in the SAME
-  --     transaction, so applications already parked at the trigger stage are
-  --     reconsidered under the new mapping.
+  -- (b) ENABLING stamps a new activation fence; it does NOT force a global
+  --     provider resync. Explicit operator resync remains tested below.
   v_map := screening_v2.upsert_ashby_job_mapping(
     v_mapid, 'pol33-job', v_role, 'pol33_ai', 'pol33_ta', null::text, null::text, null::text,
     gen_random_uuid(), 'manual', 24, 'enabled', null::text, v_actor);
   select * into v_cp from screening_v2.ashby_sync_checkpoints
    where provider = 'ashby' and checkpoint_key = 'application.list';
-  perform _policy_tests.assert('ashby 0033: enabling a mapping forces a full resync',
-    (v_map->>'forced_full_resync')::boolean
-      and v_cp.status = 'full_resync_required'
-      and v_cp.sync_token is null
-      and v_cp.resync_epoch = v_epoch + 1,
-    'enable must force full_resync_required and bump the epoch');
+  perform _policy_tests.assert('ashby 0033: enabling stamps activation without global resync',
+    not (v_map->>'forced_full_resync')::boolean
+      and v_cp.status = 'idle'
+      and v_cp.resync_epoch = v_epoch
+      and (v_map->>'activation_epoch')::bigint = 1,
+    'enable must be future-only and leave the global checkpoint alone');
 
-  perform _policy_tests.assert('ashby 0033: the forced resync is audited on the mapping event',
+  perform _policy_tests.assert('ashby 0033: activation audit does not claim forced resync',
     exists (select 1 from screening_v2.audit_events
              where action = 'ashby_mapping_update'
                and target_id = v_mapid::text
-               and (metadata->>'forced_full_resync')::boolean),
-    'the mapping audit row must record the forced resync');
+               and not (metadata->>'forced_full_resync')::boolean),
+    'the mapping audit row must explicitly record no forced resync');
 
   -- (c) Re-saving the SAME enabled mapping with an unchanged AI stage must
   --     not force another resync (the same rows are already admitted).
@@ -5270,16 +5383,17 @@ begin
       and v_cp.status = 'idle' and v_cp.resync_epoch = v_epoch,
     'an unchanged AI stage must not force a resync');
 
-  -- (d) Repointing the AI stage of an ENABLED mapping opens new admission and
-  --     must force a resync.
+  -- (d) Repointing the AI stage opens a new activation generation without a
+  --     global resync.
   v_map := screening_v2.upsert_ashby_job_mapping(
     v_mapid, 'pol33-job', v_role, 'pol33_ai_v2', 'pol33_ta', null::text, null::text, null::text,
     gen_random_uuid(), 'manual', 24, 'enabled', null::text, v_actor);
   select * into v_cp from screening_v2.ashby_sync_checkpoints
    where provider = 'ashby' and checkpoint_key = 'application.list';
-  perform _policy_tests.assert('ashby 0033: repointing the AI stage forces a resync',
-    (v_map->>'forced_full_resync')::boolean and v_cp.status = 'full_resync_required',
-    'a new AI stage must force a resync');
+  perform _policy_tests.assert('ashby 0033: repointing the AI stage stamps activation',
+    not (v_map->>'forced_full_resync')::boolean and v_cp.status = 'idle'
+      and (v_map->>'activation_epoch')::bigint > 1,
+    'a new AI stage must stamp a new activation generation');
 
   -- (e) EPOCH GUARD: a run that read the checkpoint BEFORE the enable must not
   --     clear the forced resync when it finishes.
@@ -5363,26 +5477,24 @@ begin
     gen_random_uuid(), 'manual', 24, 'paused', null::text, v_actor);
   v_mapid := (v_map->>'id')::uuid;
 
-  -- Resume (paused → enabled) MUST force the backfill in the same transaction.
+  -- Resume (paused → enabled) stamps activation, without global backfill.
   v_res := screening_v2.set_ashby_mapping_status(v_mapid, 'enabled', null::text, v_actor);
   select * into v_cp from screening_v2.ashby_sync_checkpoints
    where provider = 'ashby' and checkpoint_key = 'application.list';
-  perform _policy_tests.assert('ashby 0033/B3: resume forces a full resync',
+  perform _policy_tests.assert('ashby 0033/B3: resume stamps activation without resync',
     v_res->>'status' = 'ok'
-      and (v_res->>'forced_full_resync')::boolean
-      and v_cp.status = 'full_resync_required'
-      and v_cp.full_resync_reason = 'mapping_enabled'
-      and v_cp.sync_token is null
-      and v_cp.resync_epoch = v_epoch + 1,
-    'POST /mappings/:id/resume must force the application.list backfill');
+      and not (v_res->>'forced_full_resync')::boolean
+      and v_cp.status = 'idle'
+      and (v_res->>'activation_epoch')::bigint = 1,
+    'POST /mappings/:id/resume must remain future-only');
 
-  perform _policy_tests.assert('ashby 0033/B3: the resume audit row records the forced resync',
+  perform _policy_tests.assert('ashby 0033/B3: the resume audit row records no forced resync',
     exists (select 1 from screening_v2.audit_events
              where action = 'ashby_mapping_update'
                and target_id = v_mapid::text
                and metadata->>'action' = 'set_status'
-               and (metadata->>'forced_full_resync')::boolean),
-    'the resume audit row must record forced_full_resync');
+               and not (metadata->>'forced_full_resync')::boolean),
+    'the resume audit row must record forced_full_resync=false');
 
   -- Re-enabling an already-enabled mapping forces nothing (same rows admitted).
   v_epoch := v_cp.resync_epoch;
@@ -5620,11 +5732,12 @@ begin
     v_res->>'status' = 'invalid_cursor',
     'got ' || coalesce(v_res->>'status', '<null>'));
 
-  -- (g) ENABLING A MAPPING MID-RUN invalidates the continuation, and the
-  --     in-flight run can no longer anchor into the new generation.
+  -- (g) An EXPLICIT operator resync mid-run invalidates the continuation, and
+  --     the in-flight run can no longer anchor into the new generation.
   v_map := screening_v2.upsert_ashby_job_mapping(
     null::uuid, 'pol34-job', v_role, 'pol34_ai', 'pol34_ta', null::text, null::text, null::text,
     gen_random_uuid(), 'manual', 24, 'enabled', null::text, v_actor);
+  v_res := screening_v2.mark_ashby_sync_full_resync('application.list', 'operator_explicit_resync');
   select * into v_cp from screening_v2.ashby_sync_checkpoints
    where provider = 'ashby' and checkpoint_key = 'application.list';
   perform _policy_tests.assert('ashby 0034: enabling a mapping invalidates the continuation',

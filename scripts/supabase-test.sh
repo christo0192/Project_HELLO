@@ -31,6 +31,7 @@ supabase_cli() {
 cleanup() {
   supabase_cli stop --no-backup >/dev/null 2>&1 || true
   rm -f "$RESULTS_FILE"
+  if declare -f rollout_cleanup >/dev/null 2>&1; then rollout_cleanup; fi
   # The 0040 race section registers its FIFO/result file here so an
   # interrupt mid-race cannot leak either.
   if declare -f pol40c_cleanup >/dev/null 2>&1; then pol40c_cleanup; fi
@@ -549,7 +550,30 @@ case "$HTTP_CODE" in
     log "ERROR: Expected custom-schema anon denial, received HTTP ${HTTP_CODE}."
     exit 1
     ;;
-esac
+  esac
+
+# ===================================================================
+# Ashby 0106: real local runtime acceptance + actual rollout execution.
+# The caller (CI or the local voice-validation wrapper) owns the shared
+# /tmp/incident-supabase-test.lock mkdir lock; this script deliberately does
+# not acquire it, avoiding a nested-lock deadlock.
+# ===================================================================
+SERVICE_KEY="$(supabase_cli status -o env 2>/dev/null \
+  | sed -n 's/^SERVICE_ROLE_KEY="\(.*\)"$/\1/p' | head -1)"
+[ -n "$SERVICE_KEY" ] || { log 'ERROR: Could not read the ephemeral local service-role key.'; exit 1; }
+log '0106: Installing existing API dev dependencies (npm ci; no package changes)...'
+npm ci --prefix app/api >/dev/null
+log '0106: Running real reconciliation/webhook acceptance harness (no workers/provider calls)...'
+SUPABASE_URL='http://127.0.0.1:54321' SUPABASE_SERVICE_ROLE_KEY="$SERVICE_KEY" \
+  npx --prefix app/api --no-install tsx app/api/scripts/ashby-0106-acceptance.ts
+
+log '0106: Reapplying actual migration in rollback transaction against simulated pre-0106 enabled row...'
+docker cp app/supabase/migrations/0106_ashby_activation_fence_and_snapshot_import.sql "$SUPABASE_DB_CONTAINER:/tmp/0106_ashby_activation_fence_and_snapshot_import.sql"
+docker cp app/supabase/tests/ashby_activation_rollout.sql "$SUPABASE_DB_CONTAINER:/tmp/ashby_activation_rollout.sql"
+docker exec "$SUPABASE_DB_CONTAINER" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  -v migration_file=/tmp/0106_ashby_activation_fence_and_snapshot_import.sql \
+  -f /tmp/ashby_activation_rollout.sql
+log '0106: PASS — actual migration reapplication fenced an old enabled row at rollout time; fixture rolled back.'
 
 # ===================================================================
 # GOV-06: First explicit seed re-apply (seed already applied by db reset

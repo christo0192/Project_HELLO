@@ -43,6 +43,8 @@ export type AshbyEnvelope<T> = AshbySuccessEnvelope<T> | AshbyErrorEnvelope;
 export interface AshbyResult<T> {
   results: T;
   moreDataAvailable: boolean;
+  /** True when the provider response explicitly supplied moreDataAvailable. */
+  moreDataAvailablePresent?: boolean;
   /** Opaque cursor; treat as a black box, never log. */
   nextCursor?: string;
   /** Opaque incremental sync token; treat as a black box, never log. */
@@ -65,6 +67,7 @@ export interface PaginatedList<T> {
 export type AshbyOperation =
   | 'application.info'
   | 'application.list'
+  | 'application.listHistory'
   | 'candidate.info'
   | 'file.info'
   | 'jobInterviewPlan.info'
@@ -89,6 +92,7 @@ export interface AshbyOperationSpec {
 export const ASHBY_OPERATIONS: Readonly<Record<AshbyOperation, AshbyOperationSpec>> = {
   'application.info':                  { path: '/application.info',                  mutation: false },
   'application.list':                  { path: '/application.list',                  mutation: false },
+  'application.listHistory':           { path: '/application.listHistory',           mutation: false },
   'candidate.info':                    { path: '/candidate.info',                    mutation: false },
   'file.info':                         { path: '/file.info',                         mutation: false },
   'jobInterviewPlan.info':             { path: '/jobInterviewPlan.info',             mutation: false },
@@ -113,8 +117,19 @@ export interface ApplicationListParams {
   syncToken?: string;
   /** Optional bounded page size hint (tenant-verifiable). */
   limit?: number;
+  /** Documented jobId filter; used only for mapping-scoped previews. */
+  jobId?: string;
   /** Tenant-verifiable additional request fields. */
   extra?: OpaqueRecord;
+}
+
+/** Per-application stage history, including the provider's stage-entry time. */
+export interface ApplicationHistoryParams {
+  applicationId: string;
+  cursor?: string;
+  limit?: number;
+  /** Internal wall-clock deadline; never sent to Ashby. */
+  deadlineAt?: number;
 }
 
 export interface FeedbackSubmitRequest {

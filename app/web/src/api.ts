@@ -595,6 +595,14 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({}),
     }),
+  previewAshbyBacklog: (id: string) =>
+    request<import('./types').AshbyBacklogPreviewResponse>(`/api/integrations/ashby/mission-control/mappings/${id}/backlog/preview`, {
+      method: 'POST', body: JSON.stringify({}),
+    }),
+  confirmAshbyBacklog: (id: string, runId: string, expectedCount: number) =>
+    request<import('./types').AshbyBacklogConfirmResponse>(`/api/integrations/ashby/mission-control/mappings/${id}/backlog/confirm`, {
+      method: 'POST', body: JSON.stringify({ run_id: runId, expected_count: expectedCount }),
+    }),
   cancelAshbyWorkflow: (id: string, terminalState: string, reason?: string) =>
     request<AshbyMcActionResponse>(`/api/integrations/ashby/mission-control/workflows/${id}/cancel`, {
       method: 'POST',

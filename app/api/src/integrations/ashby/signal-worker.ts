@@ -63,6 +63,7 @@ import {
 } from './extractors.js';
 import type { AshbySignalPayload, EnqueueSpec, ReceiptStore } from './ports.js';
 import type { AshbyResult, OpaqueRecord } from './types.js';
+import { admitStageAfterActivation, type ApplicationHistoryLister } from './activation-admission.js';
 import type { QueueJob, FailOutcome } from '../../lib/queue/types.js';
 
 /** Queue name for inbound Ashby webhook signals. */
@@ -86,12 +87,14 @@ export function buildSignalEnqueueSpec(signal: {
   webhookActionId: string;
   action: string;
   externalApplicationId?: string;
+  source?: 'webhook' | 'reconcile';
 }): EnqueueSpec {
   const payload: AshbySignalPayload = {
     provider: 'ashby',
     webhookActionId: signal.webhookActionId,
     action: signal.action,
     externalApplicationId: signal.externalApplicationId,
+    source: signal.source ?? 'webhook',
   };
   return {
     queueName: ASHBY_SIGNAL_QUEUE,
@@ -180,6 +183,9 @@ export interface SignalResult {
 export interface MappingActivity {
   status: 'enabled' | 'paused' | 'drift' | 'unknown';
   aiScreeningStageId?: string | null;
+  activationAt?: string | null;
+  activationEpoch?: number;
+  configVersion?: number;
 }
 
 export interface MappingResolver {
@@ -248,7 +254,21 @@ export interface SignalWorkerDeps {
     applicationId: string;
     jobId: string;
     stageId: string;
+    source?: AshbySignalPayload['source'];
+    explicitImportRunId?: string;
   }) => Promise<void> | void;
+  /** Verify an explicit snapshot entry against the durable run and mapping. */
+  isExplicitImportAuthorized?: (input: {
+    runId: string;
+    applicationId: string;
+    jobId: string;
+    stageId: string;
+  }) => Promise<boolean>;
+  isSnapshotApplicationAuthorized?: (input: { applicationId: string; jobId: string; stageId: string }) => Promise<boolean>;
+  /** Production composition turns this on; test-only decision seams may omit it. */
+  enforceActivationFence?: boolean;
+  /** Required by the production composition for every non-explicit signal. */
+  history?: ApplicationHistoryLister;
 }
 
 /** Queue name for application imports scheduled from an eligible signal. */
@@ -287,6 +307,7 @@ async function mark(
 export async function processAshbySignal(
   payload: AshbySignalPayload,
   deps: SignalWorkerDeps,
+  context: { createdAt?: string; deadlineAt?: number } = {},
 ): Promise<SignalResult> {
   // Only the stage-change action is a processing trigger. candidateDelete is
   // capability-gated; everything else (e.g. applicationUpdate) is redundant.
@@ -386,6 +407,30 @@ export async function processAshbySignal(
     return { decision: 'stage_not_ai', applicationId, jobId, stageId };
   }
 
+  if (deps.enforceActivationFence) {
+    const explicitRunId = payload.source === 'explicit_backlog' ? payload.explicitImportRunId : undefined;
+    let authorized = deps.isSnapshotApplicationAuthorized
+      ? await deps.isSnapshotApplicationAuthorized({ applicationId, jobId, stageId })
+      : false;
+    if (!authorized && explicitRunId && deps.isExplicitImportAuthorized) {
+      authorized = await deps.isExplicitImportAuthorized({ runId: explicitRunId, applicationId, jobId, stageId });
+    }
+    if (!authorized) {
+      const activationMs = typeof mapping.activationAt === 'string' ? Date.parse(mapping.activationAt) : Number.NaN;
+      if (!deps.history || !Number.isFinite(activationMs)) {
+        return { decision: 'mapping_inactive', applicationId, jobId, stageId };
+      }
+      // A stale snapshot payload is not a veto on a NEW, independently proven
+      // stage transition. Conversely provider failure is not a negative verdict:
+      // throw so the leased queue retries rather than silently completing it.
+      const verdict = await admitStageAfterActivation(deps.history, {
+        applicationId, stageId, activationAt: mapping.activationAt!,
+        deadlineAt: context.deadlineAt,
+      });
+      if (verdict !== 'admit') return { decision: 'mapping_inactive', applicationId, jobId, stageId };
+    }
+  }
+
   // Self-generated echo (our own write-back moved the stage) → dedup no-op.
   if (deps.isSelfEcho) {
     const echoed = await deps.isSelfEcho({ applicationId, stageId });
@@ -402,7 +447,10 @@ export async function processAshbySignal(
   // would then decline to re-enqueue. Scheduling first means a throw here
   // fails the leased job and the whole signal is retried.
   if (deps.onImportEligible) {
-    await deps.onImportEligible({ applicationId, jobId, stageId });
+    const scheduled: { applicationId: string; jobId: string; stageId: string; source?: AshbySignalPayload['source']; explicitImportRunId?: string } = { applicationId, jobId, stageId };
+    if (payload.source) scheduled.source = payload.source;
+    if (payload.explicitImportRunId) scheduled.explicitImportRunId = payload.explicitImportRunId;
+    await deps.onImportEligible(scheduled);
   }
   await mark(deps, payload, 'processed');
   return { decision: 'import_eligible', applicationId, jobId, stageId };
@@ -429,7 +477,9 @@ function readSignalPayload(raw: unknown): AshbySignalPayload | null {
   const webhookActionId = typeof r.webhookActionId === 'string' ? r.webhookActionId : null;
   if (!action || !webhookActionId) return null;
   const externalApplicationId = typeof r.externalApplicationId === 'string' ? r.externalApplicationId : undefined;
-  return { provider: 'ashby', action, webhookActionId, externalApplicationId };
+  const source = r.source === 'explicit_backlog' ? 'explicit_backlog' : undefined;
+  const explicitImportRunId = typeof r.explicitImportRunId === 'string' ? r.explicitImportRunId : undefined;
+  return { provider: 'ashby', action, webhookActionId, externalApplicationId, source, explicitImportRunId };
 }
 
 /**
@@ -455,7 +505,7 @@ export async function runClaimedAshbySignal(
 
   let result: SignalResult;
   try {
-    result = await processAshbySignal(payload, deps);
+    result = await processAshbySignal(payload, deps, { createdAt: job.createdAt });
   } catch (err) {
     const failure = await queue.failClaim(job.id, job.leaseToken, err instanceof Error ? err : String(err));
     return { claimed: true, committed: false, staleLease: failure === 'not_owned', failure };

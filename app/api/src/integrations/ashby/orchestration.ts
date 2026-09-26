@@ -361,6 +361,8 @@ export interface ImportDeps {
   stores: WorkflowStores;
   /** Resolve mapping activity + config for the re-read job id. */
   resolveMapping(jobId: string): Promise<ResolvedMapping>;
+  /** Authoritative intake fence, called before link/ingestion/materialization. */
+  admitIntake?: (input: { applicationId: string; jobId: string; stageId: string }) => Promise<boolean>;
   /** Read the app's resume file handle from the authoritative info (opaque). */
   readResumeFileHandle?(info: unknown): string | null;
   /**
@@ -405,6 +407,9 @@ export async function runImport(externalApplicationId: string, deps: ImportDeps)
 
   const decision = decideImport(view, mapping, existing?.terminalState ?? null);
   if (decision.action !== 'import') return { status: 'skipped', reason: decision.reason };
+  if (deps.admitIntake && !(await deps.admitIntake({
+    applicationId: decision.applicationId, jobId: decision.jobId, stageId: decision.stageId,
+  }))) return { status: 'skipped', reason: 'mapping_inactive' };
 
   // Application-id-only identity: reuse the existing non-terminal link or create one.
   // Ashby does not consistently include candidate-level attachments in
