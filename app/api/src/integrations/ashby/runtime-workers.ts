@@ -63,6 +63,7 @@ import {
 } from './scanner-readiness.js';
 import {
   runReconciliation,
+  historyAdmitter,
   DEFAULT_CHECKPOINT_KEY,
   DEFAULT_MAX_ENABLED_MAPPINGS,
 } from './reconciliation.js';
@@ -1822,7 +1823,10 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
             // enqueue EVERY application it observed — the tenant-wide signal
             // storm this loop exists to avoid.
             mappings: runtime.enabledMappings,
-            history: runtime.client,
+            // The activation fence, as a required decision rather than an
+            // optional reader: `ReconcileDeps.admitByHistory` has no default,
+            // so this cannot go missing without a compile error.
+            admitByHistory: historyAdmitter(runtime.client),
             checkpointKey: DEFAULT_CHECKPOINT_KEY,
             owner,
             // Tunable without a deploy: a backfill against a large corpus

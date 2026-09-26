@@ -334,6 +334,7 @@ function makeReader(over: Partial<PhoneRuntimeReader> = {}, c?: Counters): Phone
       return [];
     },
     async listDialableNumbers() { return new Map(); },
+    async findSessionForEngagement() { return null; },
     async findReusableSession() { return null; },
     // No session is owned and none is reusable by default: the default fixture
     // has no engagement carrying one, and a fake that answered otherwise would
@@ -1035,6 +1036,7 @@ describe('D. the health view', () => {
       // path), and the port refuses either unless the session is resumable,
       // carries its own derived room name, and is owned by nobody else.
       async readSessionForReuse() { return { status: 'waiting', roomVerified: true }; },
+      async findSessionForEngagement() { return null; },
       async findReusableSession() { return SENTINEL_SESSION; },
       async engagementOwningSession() { return null; },
     });

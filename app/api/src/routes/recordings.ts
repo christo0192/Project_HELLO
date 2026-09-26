@@ -109,6 +109,15 @@ async function reverifyRecordingIntegrity(
 
 export const recordingsRouter = Router();
 
+/** The verifier's answer, carrying the OBSERVED digest on a mismatch. The
+ * session route records expected-vs-actual as integrity evidence; without the
+ * actual value the attempt log could only say "something was wrong". */
+type AttemptIntegrityOutcome =
+  | { status: 'ok' }
+  | { status: 'storage_unavailable' }
+  | { status: 'oversize' }
+  | { status: 'integrity_failed'; actualSha256?: string };
+
 /** Re-verify an attempt object before minting. A ready flag is necessary but
  * not sufficient: the object is read back and compared to the server digest
  * on every explicit download request. */
@@ -119,7 +128,7 @@ async function reverifyAttemptIntegrity(attempt: {
   recording_manifest_key: string;
   recording_content_type: 'audio/ogg' | 'audio/mpeg';
   egress_id: string | null;
-}): Promise<'ok' | 'storage_unavailable' | 'integrity_failed' | 'oversize'> {
+}): Promise<AttemptIntegrityOutcome> {
   const verified = await verifyRecordingBytes(
     {
       objectKey: attempt.recording_object_key,
@@ -133,7 +142,7 @@ async function reverifyAttemptIntegrity(attempt: {
     const { data: object, error: objectError } = await supabase.storage
       .from(env.recordingsBucket)
       .download(attempt.recording_object_key);
-    if (objectError || !object) return 'storage_unavailable';
+    if (objectError || !object) return { status: 'storage_unavailable' };
     try {
       const objectBytes = Buffer.isBuffer(object)
         ? object
@@ -142,15 +151,15 @@ async function reverifyAttemptIntegrity(attempt: {
           : Buffer.from(await object.arrayBuffer());
       if (objectBytes.length === 0 || objectBytes.length > env.recordingMaxBytes
         || verifiedPhoneContentType(objectBytes) !== attempt.recording_content_type) {
-        return 'integrity_failed';
+        return { status: 'integrity_failed' };
       }
     } catch {
-      return 'integrity_failed';
+      return { status: 'integrity_failed' };
     }
     const { data: manifest, error: manifestError } = await supabase.storage
       .from(env.recordingsBucket)
       .download(attempt.recording_manifest_key);
-    if (manifestError || !manifest) return 'storage_unavailable';
+    if (manifestError || !manifest) return { status: 'storage_unavailable' };
     try {
       const manifestBytes = Buffer.isBuffer(manifest)
         ? manifest
@@ -163,15 +172,15 @@ async function reverifyAttemptIntegrity(attempt: {
         sha256: attempt.recording_sha256 ?? '',
         sizeBytes: attempt.recording_size_bytes ?? 0,
         egressId: attempt.egress_id,
-      })) return 'integrity_failed';
+      })) return { status: 'integrity_failed' };
     } catch {
-      return 'integrity_failed';
+      return { status: 'integrity_failed' };
     }
-    return 'ok';
+    return { status: 'ok' };
   }
-  if (verified.reason === 'storage_download_failed') return 'storage_unavailable';
-  if (verified.reason === 'object_too_large') return 'oversize';
-  return 'integrity_failed';
+  if (verified.reason === 'storage_download_failed') return { status: 'storage_unavailable' };
+  if (verified.reason === 'object_too_large') return { status: 'oversize' };
+  return { status: 'integrity_failed', actualSha256: verified.actualSha256 };
 }
 
 // ── GET /api/recordings/health ───────────────────────────────────────
@@ -310,21 +319,46 @@ recordingsRouter.get(
       }
 
       const integrity = await reverifyAttemptIntegrity(attempt);
-      if (integrity === 'storage_unavailable') {
+      if (integrity.status === 'storage_unavailable') {
         return res.status(500).json({ error: { type: 'internal_error', message: 'Failed to verify recording integrity' } });
       }
-      if (integrity !== 'ok') {
-        const { error: quarantineError } = await supabase
-          .from('phone_call_attempts')
-          .update({ recording_quarantined: true })
-          .eq('id', attemptId)
-          .eq('recording_quarantined', false);
-        if (quarantineError) {
+      if (integrity.status !== 'ok') {
+        // THROUGH THE RPC, NOT A BARE UPDATE. The previous flag-only write
+        // could never execute: control only reaches here with
+        // `recording_ready = true`, and 0107's
+        // `chk_phone_call_attempts_recording_ready` forbids ready+quarantined,
+        // so every integrity failure hit a 23514, returned 500, quarantined
+        // nothing and left the row still advertising a download. 0108 flips
+        // both flags under a row lock and appends exactly one
+        // `mismatch_quarantined` event, mirroring 0014's session-side RPC.
+        const reason = integrity.status === 'oversize'
+          ? 'download_reverify_oversize'
+          : 'download_reverify_mismatch';
+        const { data: quarantine, error: quarantineError } = await supabase.rpc(
+          'quarantine_phone_attempt_recording',
+          {
+            p_attempt_id: attemptId,
+            p_reason: reason,
+            p_expected_sha256: attempt.recording_sha256,
+            p_actual_sha256: integrity.status === 'integrity_failed'
+              ? integrity.actualSha256 ?? null
+              : null,
+            p_size_bytes: attempt.recording_size_bytes ?? null,
+            p_correlation_id: getCorrelationId() ?? null,
+          },
+        );
+        const quarantineStatus = (quarantine as { status?: string } | null)?.status;
+        if (quarantineError
+          || (quarantineStatus !== 'quarantined' && quarantineStatus !== 'already_quarantined')) {
+          // Containment failed. Report it as a failure rather than a 409 that
+          // implies the object is now contained.
           return res.status(500).json({ error: { type: 'internal_error', message: 'Failed to verify recording integrity' } });
         }
-        await recordAudit(req, 'recording.quarantined', 409, {
-          metadata: { attempt_id: attemptId, reason: integrity === 'oversize' ? 'download_reverify_oversize' : 'download_reverify_mismatch' },
-        }).catch(() => {});
+        if (quarantineStatus === 'quarantined') {
+          await recordAudit(req, 'recording.quarantined', 409, {
+            metadata: { attempt_id: attemptId, reason },
+          }).catch(() => {});
+        }
         return res.status(409).json({
           error: { type: 'recording_quarantined', message: 'Recording integrity verification failed' },
         });

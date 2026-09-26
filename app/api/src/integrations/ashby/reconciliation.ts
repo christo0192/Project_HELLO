@@ -227,6 +227,14 @@ export interface ReconcileSkipCounts {
   unclassified?: number;
   /** Mapping matched, but complete stage history proves entry pre-dates activation. */
   preActivation?: number;
+  /**
+   * The activation fence could not answer for this application — the provider
+   * failed, the history was ambiguous, or the mapping carries no usable
+   * activation instant. The application is NOT admitted and the sweep
+   * continues; a persistent non-zero count here means intake is degraded and
+   * is the signal to look at the provider, not at one candidate.
+   */
+  historyUnavailable?: number;
 }
 
 /**
@@ -337,8 +345,23 @@ export interface ReconcileDeps {
    * supply it, and a loader that returns no rows admits nothing.
    */
   mappings: EnabledMappingLoader;
-  /** Provider history reader used for the activation fence. */
-  history?: ApplicationHistoryLister;
+  /**
+   * THE ACTIVATION FENCE. Required, and it is the DECISION rather than the
+   * transport.
+   *
+   * It was `history?: ApplicationHistoryLister`, consulted as
+   * `if (verdict.classified && deps.history)` — so dropping one key from the
+   * composition root silently restored the 2026-09-25 behaviour (a full sweep
+   * of the corpus admitting every current stage-sitter with no age check),
+   * and an existing test deliberately called this function without it and
+   * asserted the import happened. A fence a one-line refactor can remove,
+   * with a green suite, is not a fence.
+   *
+   * Production passes `historyAdmitter(client)`. Tests that are not about the
+   * fence pass `async () => 'admit'` — explicitly, at the call site, where a
+   * reader can see the fence was waived.
+   */
+  admitByHistory: HistoryAdmitter;
   checkpointKey?: string;
   caps?: ReconcileCaps;
   /** Monotonic clock in ms; inject for deterministic tests. */
@@ -347,8 +370,27 @@ export interface ReconcileDeps {
   owner?: string;
 }
 
+/** One application's fence decision. Throws when it cannot be answered. */
+type HistoryAdmissionVerdict = 'admit' | 'not_after_activation';
+
+export type HistoryAdmitter = (input: {
+  applicationId: string;
+  stageId: string;
+  activationAt: string;
+  deadlineAt: number;
+  nowMs?: () => number;
+}) => Promise<HistoryAdmissionVerdict>;
+
+/** The production fence: prove the stage interval against provider history. */
+export function historyAdmitter(client: ApplicationHistoryLister): HistoryAdmitter {
+  return (input) => admitStageAfterActivation(client, input);
+}
+
 function emptySkips(): ReconcileSkipCounts {
-  return { noApplicationId: 0, noEnabledMapping: 0, stageNotAi: 0, ambiguousMapping: 0, unclassified: 0, preActivation: 0 };
+  return {
+    noApplicationId: 0, noEnabledMapping: 0, stageNotAi: 0, ambiguousMapping: 0,
+    unclassified: 0, preActivation: 0, historyUnavailable: 0,
+  };
 }
 
 function noProgress(): PartialProgress {
@@ -934,15 +976,43 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
 
       admitted += 1;
       const admission = verdict.classified ? admissionIndex.get(verdict.jobId) : undefined;
-      if (verdict.classified && deps.history) {
-        if (!admission) throw new Error('ashby_activation_guard_malformed');
-        const historyVerdict = await admitStageAfterActivation(deps.history, {
-          applicationId: verdict.applicationId,
-          stageId: verdict.stageId,
-          activationAt: admission.activationAt,
-          deadlineAt: startedAt + deadlineMs,
-          nowMs,
-        });
+      if (verdict.classified) {
+        if (!admission) {
+          // SCOPED TO THIS MAPPING, NOT THE RUN. This used to throw, so one
+          // enabled mapping with a NULL/unparseable `activation_at` aborted
+          // the entire reconcile tick for every other mapping — and the same
+          // condition is handled per-application in both of the other two
+          // paths. Fail closed for the offending job, keep sweeping.
+          admitted -= 1;
+          pageHandled += 1;
+          skipped.ambiguousMapping += 1;
+          counter('ashby_reconcile_activation_unknown', 1);
+          continue;
+        }
+        let historyVerdict: HistoryAdmissionVerdict;
+        try {
+          historyVerdict = await deps.admitByHistory({
+            applicationId: verdict.applicationId,
+            stageId: verdict.stageId,
+            activationAt: admission.activationAt,
+            deadlineAt: startedAt + deadlineMs,
+            nowMs,
+          });
+        } catch (error) {
+          // ONE BAD ROW MUST NOT WEDGE THE TENANT. This call sat inline with
+          // no try/catch: a provider 5xx, a rate limit, or one application
+          // whose history is permanently ambiguous (the candidate moved
+          // between the list read and the history read) propagated out of the
+          // page loop, failed the tick, and left the cursor unadvanced — so
+          // the next tick replayed the same page and hit the same row,
+          // forever. The application is NOT admitted (fail closed, it will be
+          // reconsidered on a later pass); the sweep continues.
+          admitted -= 1;
+          pageHandled += 1;
+          skipped.historyUnavailable = (skipped.historyUnavailable ?? 0) + 1;
+          counter('ashby_reconcile_history_unavailable', 1);
+          continue;
+        }
         if (historyVerdict !== 'admit') {
           admitted -= 1;
           pageHandled += 1;

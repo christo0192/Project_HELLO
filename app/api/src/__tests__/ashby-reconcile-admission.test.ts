@@ -44,6 +44,18 @@ import type {
 } from '../integrations/ashby/ports.js';
 import type { AshbyResult, OpaqueRecord } from '../integrations/ashby/types.js';
 
+// Since 0106 an ENABLED mapping always carries an activation instant (the
+// migration backfills every existing row), and reconciliation now fails closed
+// on one that does not — a mapping whose activation is unknown admits nobody,
+// scoped to that mapping rather than aborting the run. The loaders below stamp
+// a far-past default so a terse fixture row still represents a REAL enabled
+// mapping; tests that care about the instant set it explicitly.
+const FIXTURE_ACTIVATION_AT = '2000-01-01T00:00:00.000Z';
+function withActivation(rows: EnabledMappingRow[]): EnabledMappingRow[] {
+  return rows.map((r) => ({ activationAt: FIXTURE_ACTIVATION_AT, ...r }));
+}
+
+
 const JOB = 'job_enabled';
 const AI = 'stage_ai';
 
@@ -94,7 +106,7 @@ class FakeMappings implements EnabledMappingLoader {
   async listEnabled(limit: number): Promise<{ rows: EnabledMappingRow[]; truncated: boolean }> {
     this.calls += 1;
     this.lastLimit = limit;
-    return { rows: this.rows, truncated: this.truncated };
+    return { rows: withActivation(this.rows), truncated: this.truncated };
   }
 }
 
@@ -142,6 +154,8 @@ describe('admission — paused / absent mappings create no work at all', () => {
     // A paused mapping is simply absent from the enabled-mapping load.
     const mappings = new FakeMappings([]);
     const res = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([{ results: stormPage(), moreDataAvailable: false, syncToken: 'tok' }]),
       checkpoints, receipts, mappings, caps: { maxItems: 5_000 },
     });
@@ -165,6 +179,8 @@ describe('admission — paused / absent mappings create no work at all', () => {
   it('the same 2,000 applications with NO mappings at all ⇒ zero receipts, zero jobs', async () => {
     const receipts = new FakeReceipts();
     const res = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([{ results: stormPage(), moreDataAvailable: false, syncToken: 'tok' }]),
       checkpoints: new FakeCheckpoints(null),
       receipts,
@@ -179,6 +195,8 @@ describe('admission — paused / absent mappings create no work at all', () => {
   it('costs ONE bounded mapping load per run — not one lookup per application', async () => {
     const mappings = new FakeMappings([]);
     await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([
         { results: stormPage(), moreDataAvailable: true, nextCursor: 'c1' },
         { results: stormPage(), moreDataAvailable: false, syncToken: 'tok' },
@@ -209,6 +227,8 @@ describe('admission — one enabled mapping admits only the exact job + stage', 
   it('admits exactly the matching pair and skips everything else with reasons', async () => {
     const receipts = new FakeReceipts();
     const res = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([{ results: mixed, moreDataAvailable: false, syncToken: 'tok' }]),
       checkpoints: new FakeCheckpoints(null),
       receipts,
@@ -227,6 +247,7 @@ describe('admission — one enabled mapping admits only the exact job + stage', 
       ambiguousMapping: 0,
       unclassified: 2,
       preActivation: 0,
+      historyUnavailable: 0,
     });
     // The counters are internally consistent — no row is double-counted or lost.
     const skips = Object.values(res.skipped).reduce((a, b) => a + b, 0);
@@ -245,6 +266,8 @@ describe('admission — one enabled mapping admits only the exact job + stage', 
   it('refuses to guess when the index holds conflicting stages for one job', async () => {
     const receipts = new FakeReceipts();
     const res = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([{
         results: [row('a', { jobId: JOB, stageId: AI }), row('b', { jobId: JOB, stageId: 'other' })],
         moreDataAvailable: false, syncToken: 'tok',
@@ -265,6 +288,8 @@ describe('admission — one enabled mapping admits only the exact job + stage', 
     const mappings = new FakeMappings([{ externalJobId: JOB, aiScreeningStageId: AI }]);
     mappings.truncated = true;
     const res = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([{ results: [row('a', { jobId: JOB, stageId: AI })], moreDataAvailable: false }]),
       checkpoints: new FakeCheckpoints(null),
       receipts: new FakeReceipts(),
@@ -281,6 +306,8 @@ describe('admission ordering', () => {
   it('never touches the receipt store for a skipped row', async () => {
     const record = vi.fn();
     const res = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([{
         results: [
           row('a', { jobId: 'job_paused', stageId: AI }),
@@ -309,6 +336,8 @@ describe('admission — mapping state is re-read every run', () => {
       checkpoints: new FakeCheckpoints(null),
       receipts,
       mappings,
+    // Fence waived: this suite is not about activation admission.
+    admitByHistory: async () => 'admit' as const,
     });
 
     // Run 1 — mapping paused: nothing admitted.
@@ -341,6 +370,8 @@ describe('admission — mapping state is re-read every run', () => {
       tokenIssuedAt: new Date().toISOString(), lastSuccessAt: null, resyncEpoch: 7,
     });
     await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([{ results: [], moreDataAvailable: false, syncToken: 'tok2' }]),
       checkpoints,
       receipts: new FakeReceipts(),
@@ -356,6 +387,8 @@ describe('admission — mapping state is re-read every run', () => {
     });
     const receipts = new FakeReceipts();
     const res = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([{
         results: [row('app_backlog', { jobId: JOB, stageId: AI })],
         moreDataAvailable: false, syncToken: 'tok2',
@@ -377,6 +410,8 @@ describe('admission preserves recovery, idempotence, and the worker authority', 
   it('a duplicate webhook after an admitted recovery still converges to one job', async () => {
     const receipts = new FakeReceipts();
     await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([{ results: [row('app_c', { jobId: JOB, stageId: AI })], moreDataAvailable: false }]),
       checkpoints: new FakeCheckpoints(null),
       receipts,
@@ -397,6 +432,8 @@ describe('admission preserves recovery, idempotence, and the worker authority', 
   it('reconciliation issues NO application.info calls — the worker still owns that read', async () => {
     const applicationInfo = vi.fn();
     await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: {
         applicationList: async () => ({
           results: [row('a', { jobId: JOB, stageId: AI })] as unknown as OpaqueRecord[],
@@ -452,6 +489,8 @@ describe('admission does not weaken the run bounds', () => {
 
   it('counts SKIPPED rows against the item cap (paging stays bounded)', async () => {
     const res = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([{ results: bulk, moreDataAvailable: false }]),
       checkpoints: new FakeCheckpoints(null),
       receipts: new FakeReceipts(),
@@ -465,6 +504,8 @@ describe('admission does not weaken the run bounds', () => {
 
   it('stops on the page cap regardless of how much was admitted', async () => {
     const res = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([
         { results: bulk, moreDataAvailable: true, nextCursor: 'c1' },
         { results: bulk, moreDataAvailable: true, nextCursor: 'c2' },
@@ -482,6 +523,8 @@ describe('admission does not weaken the run bounds', () => {
   it('stops on the deadline regardless of admission', async () => {
     let t = 0;
     const res = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([
         { results: bulk, moreDataAvailable: true, nextCursor: 'c1' },
         { results: bulk, moreDataAvailable: true, nextCursor: 'c2' },
@@ -548,6 +591,8 @@ describe('per-run enqueue circuit breaker', () => {
     const checkpoints = new FakeCheckpoints(null);
     const many = Array.from({ length: 500 }, (_, i) => row(`app_${i}`, { jobId: JOB, stageId: AI }));
     const res = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([{ results: many, moreDataAvailable: false, syncToken: 'tok' }]),
       checkpoints, receipts,
       mappings: new FakeMappings([{ externalJobId: JOB, aiScreeningStageId: AI }]),
@@ -565,6 +610,8 @@ describe('per-run enqueue circuit breaker', () => {
     const receipts = new FakeReceipts();
     const many = Array.from({ length: 2_000 }, (_, i) => row(`app_${i}`, { jobId: JOB, stageId: AI }));
     const res = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([{ results: many, moreDataAvailable: false }]),
       checkpoints: new FakeCheckpoints(null),
       receipts,
@@ -584,6 +631,8 @@ describe('unclassifiable rows fail CLOSED but bounded', () => {
   it('drops unclassified rows rather than creating unscoped work', async () => {
     const receipts = new FakeReceipts();
     const res = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([{ results: drifted.slice(0, 5), moreDataAvailable: false, syncToken: 'tok' }]),
       checkpoints: new FakeCheckpoints(null),
       receipts,
@@ -598,6 +647,8 @@ describe('unclassifiable rows fail CLOSED but bounded', () => {
   it('aborts without advancing and flags the stream when drift exceeds the bound', async () => {
     const checkpoints = new FakeCheckpoints(null);
     const res = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([{ results: drifted, moreDataAvailable: false, syncToken: 'tok' }]),
       checkpoints,
       receipts: new FakeReceipts(),
@@ -613,6 +664,8 @@ describe('unclassifiable rows fail CLOSED but bounded', () => {
 
   it('a well-formed corpus never trips the drift abort', async () => {
     const res = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([{
         results: Array.from({ length: 300 }, (_, i) => row(`app_${i}`, { jobId: 'job_paused', stageId: AI })),
         moreDataAvailable: false, syncToken: 'tok',
@@ -640,6 +693,8 @@ describe('counter accounting', () => {
       { application: {} } as OpaqueRecord,                    // noApplicationId
     ];
     const res = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([{ results: mixed, moreDataAvailable: false, syncToken: 't' }]),
       checkpoints: new FakeCheckpoints(null),
       receipts: new FakeReceipts(),
@@ -655,6 +710,8 @@ describe('counter accounting', () => {
   it('on an aborted run the tripping row is observed but neither admitted nor skipped', async () => {
     const drifted = Array.from({ length: 20 }, (_, i) => row(`app_${i}`));
     const res = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: scriptedLister([{ results: drifted, moreDataAvailable: false }]),
       checkpoints: new FakeCheckpoints(null),
       receipts: new FakeReceipts(),

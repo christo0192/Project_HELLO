@@ -202,7 +202,8 @@ describe('GET /api/recordings/:sessionId/download', () => {
       if (fn === 'finalize_recording_upload') {
         return Promise.resolve({ data: { status: 'ok' }, error: null });
       }
-      if (fn === 'quarantine_recording') {
+      if (fn === 'quarantine_recording'
+          || fn === 'quarantine_phone_attempt_recording') {
         return Promise.resolve({ data: { status: 'quarantined' }, error: null });
       }
       return Promise.resolve({ data: null, error: { message: 'unknown rpc' } });
@@ -794,7 +795,8 @@ describe('POST /api/livekit/:sessionId/recording (hardened upload)', () => {
       if (fn === 'finalize_recording_upload') {
         return Promise.resolve({ data: { status: 'ok' }, error: null });
       }
-      if (fn === 'quarantine_recording') {
+      if (fn === 'quarantine_recording'
+          || fn === 'quarantine_phone_attempt_recording') {
         return Promise.resolve({ data: { status: 'quarantined' }, error: null });
       }
       return Promise.resolve({ data: null, error: { message: 'unknown rpc' } });
@@ -841,7 +843,8 @@ describe('POST /api/livekit/:sessionId/recording (hardened upload)', () => {
       if (fn === 'finalize_recording_upload') {
         return Promise.resolve({ data: { status: 'ok' }, error: null });
       }
-      if (fn === 'quarantine_recording') {
+      if (fn === 'quarantine_recording'
+          || fn === 'quarantine_phone_attempt_recording') {
         return Promise.resolve({ data: { status: 'quarantined' }, error: null });
       }
       return Promise.resolve({ data: null, error: { message: 'unknown rpc' } });
@@ -2063,6 +2066,56 @@ describe('GET /api/recordings/attempts/:attemptId/download (0107)', () => {
       .set('Authorization', AUTH_HEADER);
     expect(res.status).toBe(409);
     expect(mockCreateSignedUrl).not.toHaveBeenCalled();
-    expect(updateCalls).toContainEqual({ recording_quarantined: true });
+    // THROUGH THE RPC (0108). The previous assertion — that the code sent
+    // `{ recording_quarantined: true }` — is exactly what let the defect ship:
+    // the fake has no CHECK constraint, so it passed while every real
+    // execution hit `chk_phone_call_attempts_recording_ready` and 500'd.
+    // Here we pin the contract; the constraint itself is proven against a real
+    // Postgres in `app/supabase/tests/attempt_quarantine_assert.sql`.
+    expect(mockRpc).toHaveBeenCalledWith(
+      'quarantine_phone_attempt_recording',
+      expect.objectContaining({
+        p_attempt_id: ATTEMPT,
+        p_reason: 'download_reverify_mismatch',
+        p_actual_sha256: expect.stringMatching(/^[a-f0-9]{64}$/),
+      }),
+    );
+    // And NOT by a bare flag write, which is the shape that could not execute.
+    expect(updateCalls).not.toContainEqual({ recording_quarantined: true });
+  });
+
+  it('reports a FAILED quarantine as a failure, never as containment', async () => {
+    configureAttempt();
+    mockDownload.mockResolvedValue({ data: Buffer.concat([bytes, Buffer.from('tampered')]), error: null });
+    mockRpc.mockImplementation((fn: string) => {
+      if (fn === 'quarantine_phone_attempt_recording') {
+        return Promise.resolve({ data: null, error: { message: 'check violation' } });
+      }
+      return Promise.resolve({ data: { status: 'ok' }, error: null });
+    });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+      .set('Authorization', AUTH_HEADER);
+    // A 409 would tell the caller the object is contained. It is not.
+    expect(res.status).toBe(500);
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+  });
+
+  it('a repeat click reports containment without writing second evidence', async () => {
+    configureAttempt();
+    mockDownload.mockResolvedValue({ data: Buffer.concat([bytes, Buffer.from('tampered')]), error: null });
+    mockRpc.mockImplementation((fn: string) => {
+      if (fn === 'quarantine_phone_attempt_recording') {
+        return Promise.resolve({ data: { status: 'already_quarantined' }, error: null });
+      }
+      return Promise.resolve({ data: { status: 'ok' }, error: null });
+    });
+    const app = createTestApp(authAs('admin', 'admin-1'));
+    const res = await request(app)
+      .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+      .set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(409);
+    expect(mockCreateSignedUrl).not.toHaveBeenCalled();
   });
 });

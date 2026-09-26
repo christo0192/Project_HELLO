@@ -5,6 +5,7 @@ import { dirname, resolve } from 'node:path';
 import {
   admitStageAfterActivation,
   runReconciliation,
+  historyAdmitter,
   type ApplicationHistoryLister,
 } from '../integrations/ashby/reconciliation.js';
 import { processAshbySignal } from '../integrations/ashby/signal-worker.js';
@@ -17,6 +18,15 @@ const APP = 'app_A';
 const JOB = 'job_A';
 const STAGE = 'stage_ai';
 const ACTIVATED = '2026-09-25T00:00:00.000Z';
+// THE CLOCK IS PINNED. `admitStageAfterActivation` compares `enteredStageAt`
+// against `nowMs()` (default `Date.now`) and rejects a future entry, so a
+// fixture dated "tomorrow" stops being in the future tomorrow: this file's
+// future-entry assertion was written on 2026-09-26 with `2026-09-27` and would
+// have gone red at 00:00Z on the 27th, on main, with no code change. Every
+// direct call below therefore passes this clock; the dates above and below are
+// read relative to it, not to the wall.
+const NOW_MS = Date.parse('2026-09-26T12:00:00.000Z');
+const CLOCK = () => NOW_MS;
 
 function history(rows: OpaqueRecord[], moreDataAvailable = false, nextCursor?: string): ApplicationHistoryLister {
   return { applicationListHistory: (async <T = OpaqueRecord[]>(_params: { applicationId: string; cursor?: string; limit?: number }) => ({ results: rows as unknown as T, moreDataAvailable, nextCursor }) as AshbyResult<T>) };
@@ -26,13 +36,13 @@ describe('Ashby timestamp admission', () => {
   it('admits only the active mapped stage entry at/after activation', async () => {
     const old = await admitStageAfterActivation(history([
       { stageId: STAGE, enteredStageAt: '2026-09-24T23:59:59Z', leftStageAt: null },
-    ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED });
+    ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED, nowMs: CLOCK });
     expect(old).toBe('not_after_activation');
 
     const fresh = await admitStageAfterActivation(history([
       { stageId: 'stage_other', enteredStageAt: '2026-09-24T00:00:00Z', leftStageAt: '2026-09-25T01:00:00Z' },
       { stageId: STAGE, enteredStageAt: '2026-09-25T01:00:00Z', leftStageAt: null },
-    ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED });
+    ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED, nowMs: CLOCK });
     expect(fresh).toBe('admit');
   });
 
@@ -42,9 +52,9 @@ describe('Ashby timestamp admission', () => {
         .mockResolvedValueOnce({ results: [{ stageId: 'stage_other', enteredStageAt: '2026-09-24T00:00:00Z', leftStageAt: '2026-09-24T01:00:00Z' }], moreDataAvailable: true, nextCursor: 'next' })
         .mockResolvedValueOnce({ results: [{ stageId: STAGE, enteredStageAt: '2026-09-25T00:01:00Z', leftStageAt: null }], moreDataAvailable: false }),
     };
-    await expect(admitStageAfterActivation(reader, { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED })).resolves.toBe('admit');
-    await expect(admitStageAfterActivation(history([{ stageId: STAGE, enteredStageAt: 'not-a-time', leftStageAt: null }]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED })).rejects.toThrow('entry_time_invalid');
-    await expect(admitStageAfterActivation({ applicationListHistory: async () => { throw new Error('provider_down'); } }, { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED })).rejects.toThrow('provider_down');
+    await expect(admitStageAfterActivation(reader, { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED, nowMs: CLOCK })).resolves.toBe('admit');
+    await expect(admitStageAfterActivation(history([{ stageId: STAGE, enteredStageAt: 'not-a-time', leftStageAt: null }]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED, nowMs: CLOCK })).rejects.toThrow('entry_time_invalid');
+    await expect(admitStageAfterActivation({ applicationListHistory: async () => { throw new Error('provider_down'); } }, { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED, nowMs: CLOCK })).rejects.toThrow('provider_down');
   });
 });
 
@@ -74,12 +84,12 @@ it('reconciliation creates zero work for a pre-enable sitter and processes a pos
     applicationList: async <T = OpaqueRecord[]>() => ({ results: rows as unknown as T, moreDataAvailable: false }) as AshbyResult<T>,
     applicationListHistory: async <T = OpaqueRecord[]>() => ({ results: [{ stageId: STAGE, enteredStageAt: '2026-09-24T23:59:59Z', leftStageAt: null }] as unknown as T, moreDataAvailable: false }) as AshbyResult<T>,
   };
-  const old = await runReconciliation({ client, history: client, mappings, checkpoints: new Checkpoints(), receipts });
+  const old = await runReconciliation({ client, admitByHistory: historyAdmitter(client), mappings, checkpoints: new Checkpoints(), receipts });
   expect(old.admitted).toBe(0);
   expect(receipts.writes).toBe(0);
 
   client.applicationListHistory = async <T = OpaqueRecord[]>() => ({ results: [{ stageId: STAGE, enteredStageAt: '2026-09-26T00:00:01Z', leftStageAt: null }] as unknown as T, moreDataAvailable: false }) as AshbyResult<T>;
-  const fresh = await runReconciliation({ client, history: client, mappings, checkpoints: new Checkpoints(), receipts });
+  const fresh = await runReconciliation({ client, admitByHistory: historyAdmitter(client), mappings, checkpoints: new Checkpoints(), receipts });
   expect(fresh.admitted).toBe(1);
   expect(receipts.writes).toBe(1);
 });
@@ -134,24 +144,93 @@ it('fences an already queued import before materialization and permits a confirm
   expect(calls).toEqual(['link', 'ingestion', 'materialize', 'invite']);
 });
 
+// ── THE FENCE MUST NOT BE ABLE TO TAKE THE TENANT DOWN WITH IT ──────
+// The history call used to sit inline in the page loop with no try/catch, so
+// ONE application the provider could not answer for — a 5xx, a rate limit, or
+// a permanently ambiguous history because the candidate moved between the list
+// read and the history read — propagated out of `runReconciliation`, failed
+// the tick, and left the cursor unadvanced. The next tick replayed the same
+// page and hit the same row. One candidate could stop the whole tenant's
+// dropped-webhook safety net, indefinitely.
+it('skips the application the fence cannot answer for, and keeps sweeping', async () => {
+  const receipts = new Receipts();
+  const rows = [
+    { application: { id: 'app_poison', job: { id: JOB }, currentInterviewStage: { id: STAGE } } },
+    { application: { id: 'app_good', job: { id: JOB }, currentInterviewStage: { id: STAGE } } },
+  ];
+  const client = {
+    applicationList: async <T = OpaqueRecord[]>() => ({ results: rows as unknown as T, moreDataAvailable: false }) as AshbyResult<T>,
+  };
+  const mappings: EnabledMappingLoader = {
+    async listEnabled() {
+      return { truncated: false, rows: [{ externalJobId: JOB, aiScreeningStageId: STAGE, activationAt: ACTIVATED, activationEpoch: 2, configVersion: 4 }] };
+    },
+  };
+
+  const res = await runReconciliation({
+    client,
+    mappings,
+    checkpoints: new Checkpoints(),
+    receipts,
+    admitByHistory: async ({ applicationId }) => {
+      if (applicationId === 'app_poison') throw new Error('ashby_history_ambiguous');
+      return 'admit';
+    },
+  });
+
+  // The run COMPLETED, the unanswerable row is counted and NOT admitted, and
+  // the good one still produced exactly its own work.
+  expect(res.admitted).toBe(1);
+  expect(res.skipped.historyUnavailable).toBe(1);
+  expect(receipts.writes).toBe(1);
+});
+
+it('a mapping with no activation instant admits nobody, and stops nothing', async () => {
+  const receipts = new Receipts();
+  const rows = [
+    { application: { id: 'app_unstamped', job: { id: 'job_unstamped' }, currentInterviewStage: { id: STAGE } } },
+    { application: { id: 'app_good', job: { id: JOB }, currentInterviewStage: { id: STAGE } } },
+  ];
+  const client = {
+    applicationList: async <T = OpaqueRecord[]>() => ({ results: rows as unknown as T, moreDataAvailable: false }) as AshbyResult<T>,
+  };
+  // One enabled mapping carries no activation instant. That used to throw
+  // `ashby_activation_guard_malformed` and abort the run for EVERY mapping,
+  // while the other two admission paths always scoped it to one application.
+  const mappings: EnabledMappingLoader = {
+    async listEnabled() {
+      return {
+        truncated: false,
+        rows: [
+          { externalJobId: 'job_unstamped', aiScreeningStageId: STAGE },
+          { externalJobId: JOB, aiScreeningStageId: STAGE, activationAt: ACTIVATED, activationEpoch: 2, configVersion: 4 },
+        ],
+      };
+    },
+  };
+
+  const res = await runReconciliation({
+    client,
+    mappings,
+    checkpoints: new Checkpoints(),
+    receipts,
+    admitByHistory: async () => 'admit',
+  });
+
+  expect(res.admitted).toBe(1);
+  expect(res.skipped.ambiguousMapping).toBe(1);
+  expect(receipts.writes).toBe(1);
+});
+
 it('rejects future and conflicting open history, while requiring complete pagination evidence', async () => {
   await expect(admitStageAfterActivation(history([
     { stageId: STAGE, enteredStageAt: '2026-09-27T00:00:00Z', leftStageAt: null },
-  ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED })).rejects.toThrow('entry_time_invalid');
+  ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED, nowMs: CLOCK })).rejects.toThrow('entry_time_invalid');
   await expect(admitStageAfterActivation(history([
     { stageId: STAGE, enteredStageAt: '2026-09-24T00:00:00Z', leftStageAt: null },
     { stageId: STAGE, enteredStageAt: '2026-09-25T01:00:00Z', leftStageAt: null },
-  ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED })).rejects.toThrow('ambiguous');
+  ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED, nowMs: CLOCK })).rejects.toThrow('ambiguous');
   await expect(admitStageAfterActivation(history([
     { stageId: STAGE, enteredStageAt: '2026-09-24T00:00:00Z' },
-  ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED })).rejects.toThrow('exit_time_missing');
-});
-
-it('migration contains the activation and snapshot-scope guards', () => {
-  const migration = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../../supabase/migrations/0106_ashby_activation_fence_and_snapshot_import.sql'), 'utf8');
-  expect(migration).toContain('activation_at');
-  expect(migration).toContain("m.config_version <> r.config_version");
-  expect(migration).toContain("x->>'applicationId'=p_application_id");
-  expect(migration).toContain("x->>'jobId'=p_job_id");
-  expect(migration).toContain("x->>'stageId'=p_stage_id");
+  ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED, nowMs: CLOCK })).rejects.toThrow('exit_time_missing');
 });

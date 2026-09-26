@@ -23,6 +23,7 @@ import {
 } from '../integrations/ashby/signal-worker.js';
 import {
   runReconciliation,
+  historyAdmitter,
   type ApplicationHistoryLister,
   type ApplicationLister,
 } from '../integrations/ashby/reconciliation.js';
@@ -32,6 +33,18 @@ import type {
   EnabledMappingLoader, EnabledMappingRow, CheckpointStore, SyncCheckpoint,
 } from '../integrations/ashby/ports.js';
 import type { AshbyResult, OpaqueRecord } from '../integrations/ashby/types.js';
+
+// Since 0106 an ENABLED mapping always carries an activation instant (the
+// migration backfills every existing row), and reconciliation now fails closed
+// on one that does not — a mapping whose activation is unknown admits nobody,
+// scoped to that mapping rather than aborting the run. The loaders below stamp
+// a far-past default so a terse fixture row still represents a REAL enabled
+// mapping; tests that care about the instant set it explicitly.
+const FIXTURE_ACTIVATION_AT = '2000-01-01T00:00:00.000Z';
+function withActivation(rows: EnabledMappingRow[]): EnabledMappingRow[] {
+  return rows.map((r) => ({ activationAt: FIXTURE_ACTIVATION_AT, ...r }));
+}
+
 
 const APP = 'app_1';
 const JOB = 'job_1';
@@ -202,7 +215,7 @@ class Checkpoints implements CheckpointStore {
 }
 
 function mappingLoader(rows: EnabledMappingRow[]): EnabledMappingLoader {
-  return { async listEnabled() { return { rows, truncated: false }; } };
+  return { async listEnabled() { return { rows: withActivation(rows), truncated: false }; } };
 }
 
 function listOf(items: OpaqueRecord[]): ApplicationLister {
@@ -238,7 +251,7 @@ describe('B2 regression: enable-after-storm recovers the parked candidate', () =
       checkpoints,
       receipts,
       mappings: mappingLoader(enabled),
-      history: historyOf(enteredStageAt),
+      admitByHistory: historyAdmitter(historyOf(enteredStageAt)),
     });
 
     // Drain whatever reconciliation queued, through the real worker decision.
@@ -307,6 +320,8 @@ describe('B2 regression: enable-after-storm recovers the parked candidate', () =
 
     // Admitted while enabled…
     const r1 = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: listOf(corpus), checkpoints, receipts, mappings: mappingLoader(enabled),
     });
     expect(r1.admitted).toBe(1);
@@ -325,6 +340,8 @@ describe('B2 regression: enable-after-storm recovers the parked candidate', () =
 
     // Re-enabled → the same application is re-driven and imported.
     const r2 = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: listOf(corpus), checkpoints, receipts, mappings: mappingLoader(enabled),
     });
     expect(r2.admitted).toBe(1);

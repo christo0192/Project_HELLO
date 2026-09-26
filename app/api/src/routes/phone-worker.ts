@@ -185,6 +185,17 @@ const workerEventSchema = z
     // deriving the room to record, never written to any row (0044's bind at
     // /assessment/start remains the sole writer and re-verifies the binding).
     session_id: z.string().regex(UUID_RE).nullable().optional(),
+    // THE WORKER SAYS WHETHER IT DESTROYED THE AUDIO. The event type cannot
+    // answer this. A confirmed identity mismatch posts
+    // `candidate.wrong_number` when `PHONE_IDENTITY_MISMATCH_SUPPRESSES` is
+    // on, and `candidate.deferred_pre_disclosure` — the DEFAULT — when it is
+    // off; both discard. But an ORDINARY pre-disclosure deferral posts that
+    // same second event and its audio is deliberately KEPT (0105). Latching on
+    // the event type would therefore either miss the default discard (0107's
+    // behaviour: the attempt reported "processing" forever for a call whose
+    // audio was gone) or destroy evidence we promised to keep. Absent/false is
+    // the safe reading: keep the artifact.
+    recording_discarded: z.boolean().optional(),
   })
   .strict();
 
@@ -984,10 +995,18 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         );
       }
 
-      // A terminal wrong-number event is durable before this hook. Retry the
+      // A terminal identity event is durable before this hook. Retry the
       // latch on idempotent event redelivery too; do not acknowledge a failed
       // latch as successful, or leave a prepared artifact processing forever.
-      if (parsed.data.event_type === 'candidate.wrong_number'
+      //
+      // BOTH identity terminals, driven by the worker's flag. `wrong_number`
+      // stays unconditional because it is by definition a stranger and older
+      // workers do not send the flag; `recording_discarded` covers the DEFAULT
+      // path (`candidate.deferred_pre_disclosure` with `not_the_candidate`),
+      // which 0107 left unlatched.
+      const workerDiscarded = parsed.data.event_type === 'candidate.wrong_number'
+        || parsed.data.recording_discarded === true;
+      if (workerDiscarded
           && result.status === 'applied'
           && deps.latchDiscardedRecording !== undefined) {
         await deps.latchDiscardedRecording(parsed.data.attempt_id);

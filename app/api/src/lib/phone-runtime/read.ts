@@ -192,6 +192,20 @@ export interface PhoneRuntimeReader {
    * session precisely so every attempt of one conversation shares a transcript.
    */
   findReusableSession(input: { candidateId: string }): Promise<string | null>;
+  /**
+   * The session THIS engagement already minted, if it is still usable.
+   *
+   * 0107 gave `call_sessions` a `phone_engagement_id` and a partial UNIQUE
+   * index on it, and `ensureSession` stamps it on every insert. A candidate
+   * with two live engagements skips adoption by design (two SIP legs in one
+   * room is the thing that must never happen), so that engagement's SECOND
+   * pre-consent dial re-inserted the same value and hit the unique
+   * constraint: `ensureSession` returned null and the due loop skipped the
+   * engagement with `no_session`, silently, forever. Adopting by the
+   * engagement column — which is exact, unlike the candidate — is the answer
+   * the new column was always for.
+   */
+  findSessionForEngagement(input: { engagementId: string }): Promise<string | null>;
 
   /**
    * The engagement that already claims this session, or null.
@@ -605,6 +619,26 @@ export function createPhoneRuntimeReader(client: SupabaseClient): PhoneRuntimeRe
             : [],
         };
       },
+    },
+
+    async findSessionForEngagement(input): Promise<string | null> {
+      const { data, error } = await client
+        .from('call_sessions')
+        .select(REUSABLE_SESSION_COLUMNS)
+        .eq('phone_engagement_id', input.engagementId)
+        .eq('mode', PHONE_SESSION_MODE)
+        .in('status', REUSABLE_SESSION_STATUSES as unknown as string[])
+        .order('started_at', { ascending: false })
+        .limit(1);
+      if (error) throw new Error('phone_runtime_session_read_error');
+      const rows = Array.isArray(data) ? (data as Row[]) : [];
+      const row = rows[0];
+      if (row === undefined) return null;
+      const id = str(row, 'id');
+      if (id === undefined) return null;
+      // Same room-derivation proof as candidate adoption: a session that
+      // cannot start its assessment is not worth reusing.
+      return str(row, 'external_call_id') === phoneRoomName(id) ? id : null;
     },
 
     async findReusableSession(input): Promise<string | null> {

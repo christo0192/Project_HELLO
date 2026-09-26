@@ -60,6 +60,7 @@ type SessionReuse = { status: string; roomVerified: boolean } | null;
 interface ReaderCalls {
   readSessionForReuse: string[];
   findReusableSession: string[];
+  findSessionForEngagement: string[];
   engagementOwningSession: string[];
   countLiveEngagements: string[];
 }
@@ -81,10 +82,13 @@ function fakeReader(over: {
    * ordinary case, in which adoption is unambiguous and therefore allowed.
    */
   liveEngagements?: number;
+  /** The session THIS engagement already owns (0107 `phone_engagement_id`). */
+  ownSession?: string | null;
 } = {}): { reader: PhoneRuntimeReader; calls: ReaderCalls } {
   const calls: ReaderCalls = {
     readSessionForReuse: [],
     findReusableSession: [],
+    findSessionForEngagement: [],
     engagementOwningSession: [],
     countLiveEngagements: [],
   };
@@ -102,6 +106,10 @@ function fakeReader(over: {
     async countLiveEngagements(input) {
       calls.countLiveEngagements.push(input.candidateId);
       return over.liveEngagements ?? 1;
+    },
+    async findSessionForEngagement(input) {
+      calls.findSessionForEngagement.push(input.engagementId);
+      return over.ownSession ?? null;
     },
     async findReusableSession(input) {
       calls.findReusableSession.push(input.candidateId);
@@ -378,6 +386,51 @@ describe('phone session port: adoption is scoped to the engagement that asked', 
     expect(got).not.toBe(ADOPTED_SESSION);
     expect(got).toBe(NEW_SESSION);
     expect(calls.engagementOwningSession).toEqual([ADOPTED_SESSION]);
+    expect(w.calls.createSession).toHaveLength(1);
+  });
+
+  // ── THE REDIAL WEDGE (0107 + 0108) ────────────────────────────────
+  // 0107 put a partial UNIQUE index on `call_sessions.phone_engagement_id`
+  // and `ensureSession` stamps it on every mint. A candidate with two live
+  // engagements deliberately skips candidate-adoption (two SIP legs in one
+  // room is the thing that must never happen), so this engagement's SECOND
+  // pre-consent dial re-inserted the same engagement id, hit the unique
+  // constraint, and `ensureSession` returned null — the due loop then skipped
+  // the engagement with `no_session`, silently, on every subsequent pass.
+  //
+  // Adoption by the engagement column is exact, so it is safe even with
+  // several live engagements, and it is what the new column was always for.
+  it('re-dials with the session THIS engagement already owns, even with two live engagements', async () => {
+    const { reader, calls } = fakeReader({
+      ownSession: ADOPTED_SESSION,
+      liveEngagements: 2,
+      // Deliberately present, and deliberately not what we expect back: if
+      // the port fell through to candidate-adoption it would return this.
+      reusable: 'session-some-other-3',
+    });
+    const w = fakeWriter();
+    const port = createPhoneSessionPort(reader, w.writer);
+
+    const got = await port.ensureSession(ensureInput());
+
+    expect(got).toBe(ADOPTED_SESSION);
+    expect(calls.findSessionForEngagement).toEqual([ENGAGEMENT]);
+    // No mint, so no second row carrying this engagement id — which is the
+    // insert the unique index refuses.
+    expect(w.calls.createSession).toHaveLength(0);
+    // And no candidate-scoped adoption was even consulted.
+    expect(calls.findReusableSession).toHaveLength(0);
+  });
+
+  it('still mints when this engagement owns nothing yet', async () => {
+    const { reader, calls } = fakeReader({ ownSession: null, reusable: null });
+    const w = fakeWriter();
+    const port = createPhoneSessionPort(reader, w.writer);
+
+    const got = await port.ensureSession(ensureInput());
+
+    expect(got).toBe(NEW_SESSION);
+    expect(calls.findSessionForEngagement).toEqual([ENGAGEMENT]);
     expect(w.calls.createSession).toHaveLength(1);
   });
 

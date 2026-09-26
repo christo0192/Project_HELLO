@@ -24,6 +24,15 @@ import { runImport, type WorkflowStores, type ExistingLinkRow, type EnqueueResul
 import type { ReceiptStore, AshbySignalPayload } from '../integrations/ashby/ports.js';
 import type { AshbyResult } from '../integrations/ashby/types.js';
 
+// Since 0106 an ENABLED mapping always carries an activation instant, and
+// reconciliation fails closed on one that does not. Stamp a far-past default
+// so a terse fixture row still represents a REAL enabled mapping.
+const FIXTURE_ACTIVATION_AT = '2000-01-01T00:00:00.000Z';
+function withActivation<T extends object>(rows: T[]): T[] {
+  return rows.map((r) => ({ activationAt: FIXTURE_ACTIVATION_AT, ...r }));
+}
+
+
 const AI = 'stage_ai';
 const APP = 'app_1';
 const JOB = 'job_1';
@@ -37,7 +46,7 @@ const appInfo = { application: appObj };
  */
 const enabledMappings = {
   async listEnabled() {
-    return { rows: [{ externalJobId: JOB, aiScreeningStageId: AI }], truncated: false };
+    return { rows: withActivation([{ externalJobId: JOB, aiScreeningStageId: AI }]), truncated: false };
   },
 };
 
@@ -153,6 +162,8 @@ describe('reconciliation dropped-webhook recovery → exactly one import', () =>
 
     // Webhook was dropped: no receipt, no job. Reconciliation observes the app.
     const recon = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: { applicationList: (async () => ({ results: [appObj], moreDataAvailable: false })) as never },
       checkpoints: { get: async () => null, advance: async () => {}, requireFullResync: async () => {} },
       receipts: outbox,

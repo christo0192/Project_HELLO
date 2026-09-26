@@ -540,6 +540,7 @@ function harness(options: {
       }
       return out;
     },
+    async findSessionForEngagement() { return null; },
     async findReusableSession() {
       calls.findSession += 1;
       return null;
