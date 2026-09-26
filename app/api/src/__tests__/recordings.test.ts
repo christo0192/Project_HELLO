@@ -1877,6 +1877,18 @@ describe('GET /api/recordings/attempts/:attemptId/download (0107)', () => {
     mockDownload.mockReset();
     mockCreateSignedUrl.mockReset();
     mockFinalizeWorkerAttemptRecording.mockReset();
+    // THE RPC MOCK MUST BE RESET AND CONFIGURED HERE. It was neither, so these
+    // tests silently inherited an implementation from an earlier describe's
+    // `beforeEach` — the 0108 quarantine test passed in a full-file run and
+    // FAILED under `-t`, under `.only`, under sharding, or if the block above
+    // were edited. A test that only passes in company is not a test.
+    mockRpc.mockReset();
+    mockRpc.mockImplementation((fn: string) => {
+      if (fn === 'quarantine_phone_attempt_recording') {
+        return Promise.resolve({ data: { status: 'quarantined' }, error: null });
+      }
+      return Promise.resolve({ data: { status: 'ok' }, error: null });
+    });
     insertCalls = [];
     updateCalls = [];
     configureTables({});

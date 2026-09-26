@@ -173,6 +173,16 @@ export interface ReconcileSkipView {
   stageNotAi: number;
   ambiguousMapping: number;
   preActivation?: number;
+  /**
+   * The activation fence could not answer. A non-zero count means intake is
+   * DEGRADED — applications are being refused because the provider could not
+   * be asked, not because they failed the age check. It is published because
+   * the only other signal is `counter()`, whose sink is a no-op here: a
+   * number nobody can read is not observability.
+   */
+  historyUnavailable?: number;
+  /** An enabled mapping carries no usable activation instant (config fault). */
+  activationUnknown?: number;
 }
 
 /**
@@ -291,6 +301,8 @@ export function publishReconcilePass(
       stageNotAi: safeCount(pass.skipped?.stageNotAi),
       ambiguousMapping: safeCount(pass.skipped?.ambiguousMapping),
       preActivation: safeCount(pass.skipped?.preActivation),
+      historyUnavailable: safeCount(pass.skipped?.historyUnavailable),
+      activationUnknown: safeCount(pass.skipped?.activationUnknown),
     },
     unclassified: safeCount(pass.unclassified),
     enabledMappings: safeCount(pass.enabledMappings),

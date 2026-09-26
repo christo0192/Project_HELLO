@@ -248,6 +248,7 @@ describe('admission — one enabled mapping admits only the exact job + stage', 
       unclassified: 2,
       preActivation: 0,
       historyUnavailable: 0,
+      activationUnknown: 0,
     });
     // The counters are internally consistent — no row is double-counted or lost.
     const skips = Object.values(res.skipped).reduce((a, b) => a + b, 0);

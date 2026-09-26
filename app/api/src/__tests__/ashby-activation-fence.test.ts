@@ -185,6 +185,94 @@ it('skips the application the fence cannot answer for, and keeps sweeping', asyn
   expect(receipts.writes).toBe(1);
 });
 
+// ── A TRANSIENT FENCE FAILURE MUST NOT SKIP ANYONE ──────────────────
+// The first cut of this repair caught every fence error and carried on. That
+// looks safe — nobody is dialled — but `pageHandled` is what makes a page
+// ANCHORABLE, so a provider 5xx advanced the cursor past an application whose
+// webhook may have been dropped. Reconciliation is the ONLY mechanism that
+// recovers a dropped webhook, so "skipped once, never reconsidered" is silent
+// permanent loss. A retryable failure must leave the page unanchored.
+class RecordingCheckpoints implements CheckpointStore {
+  advances = 0;
+  async get(): Promise<SyncCheckpoint | null> { return null; }
+  async advance(): Promise<void> { this.advances += 1; }
+  async requireFullResync(): Promise<void> {}
+}
+
+it('a RETRYABLE fence failure stops the run and advances nothing', async () => {
+  const receipts = new Receipts();
+  const checkpoints = new RecordingCheckpoints();
+  const rows = [
+    { application: { id: 'app_a', job: { id: JOB }, currentInterviewStage: { id: STAGE } } },
+  ];
+  const client = {
+    applicationList: async <T = OpaqueRecord[]>() => ({
+      results: rows as unknown as T, moreDataAvailable: false, syncToken: 'tok',
+    }) as AshbyResult<T>,
+  };
+  const mappings: EnabledMappingLoader = {
+    async listEnabled() {
+      return { truncated: false, rows: [{ externalJobId: JOB, aiScreeningStageId: STAGE, activationAt: ACTIVATED, activationEpoch: 2, configVersion: 4 }] };
+    },
+  };
+
+  const res = await runReconciliation({
+    client,
+    mappings,
+    checkpoints,
+    receipts,
+    // A transport failure: asking again later may well succeed.
+    admitByHistory: async () => { throw new Error('provider_unavailable'); },
+  });
+
+  expect(res.stop).toBe('history_unavailable');
+  expect(res.admitted).toBe(0);
+  expect(res.skipped.historyUnavailable).toBe(1);
+  // THE ASSERTION THAT MATTERS: nothing was advanced, so the next tick sees
+  // this application again.
+  expect(res.advanced).toBe(false);
+  expect(checkpoints.advances).toBe(0);
+  expect(receipts.writes).toBe(0);
+});
+
+it('a DETERMINATE fence failure is skipped, and the sweep still completes', async () => {
+  const receipts = new Receipts();
+  const checkpoints = new RecordingCheckpoints();
+  const rows = [
+    { application: { id: 'app_poison', job: { id: JOB }, currentInterviewStage: { id: STAGE } } },
+    { application: { id: 'app_good', job: { id: JOB }, currentInterviewStage: { id: STAGE } } },
+  ];
+  const client = {
+    applicationList: async <T = OpaqueRecord[]>() => ({
+      results: rows as unknown as T, moreDataAvailable: false, syncToken: 'tok',
+    }) as AshbyResult<T>,
+  };
+  const mappings: EnabledMappingLoader = {
+    async listEnabled() {
+      return { truncated: false, rows: [{ externalJobId: JOB, aiScreeningStageId: STAGE, activationAt: ACTIVATED, activationEpoch: 2, configVersion: 4 }] };
+    },
+  };
+
+  const res = await runReconciliation({
+    client,
+    mappings,
+    checkpoints,
+    receipts,
+    admitByHistory: async ({ applicationId }) => {
+      // The provider ANSWERED; the answer is unusable. Asking again cannot
+      // help, so this one row must not hold the stream forever.
+      if (applicationId === 'app_poison') throw new Error('ashby_history_ambiguous');
+      return 'admit';
+    },
+  });
+
+  expect(res.stop).toBe('drained');
+  expect(res.admitted).toBe(1);
+  expect(res.skipped.historyUnavailable).toBe(1);
+  expect(res.advanced).toBe(true);
+  expect(receipts.writes).toBe(1);
+});
+
 it('a mapping with no activation instant admits nobody, and stops nothing', async () => {
   const receipts = new Receipts();
   const rows = [
@@ -218,7 +306,12 @@ it('a mapping with no activation instant admits nobody, and stops nothing', asyn
   });
 
   expect(res.admitted).toBe(1);
-  expect(res.skipped.ambiguousMapping).toBe(1);
+  // Its OWN bucket: "this mapping has no activation instant" is a config
+  // fault an operator fixes, and `ambiguousMapping` already means "two
+  // mappings disagree about the stage". Collapsing them makes the one signal
+  // that is published to the health surface unreadable.
+  expect(res.skipped.activationUnknown).toBe(1);
+  expect(res.skipped.ambiguousMapping).toBe(0);
   expect(receipts.writes).toBe(1);
 });
 

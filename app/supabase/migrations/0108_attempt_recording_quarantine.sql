@@ -1,6 +1,5 @@
 -- =====================================================================
--- 0108 — make the attempt-recording quarantine executable, and give the
--- integrity log somewhere to record it.
+-- 0108 — make the attempt-recording quarantine executable.
 --
 -- WHY THIS EXISTS
 -- ---------------
@@ -13,36 +12,46 @@
 -- attempt download route's integrity re-verify — wrote that flag ALONE, on a
 -- row it had already proven `recording_ready = true`. Every execution was
 -- therefore a guaranteed 23514 check violation: the route returned 500, the
--- row was never quarantined, no audit or integrity evidence was written, and
--- the candidate page kept offering a download button for an object whose bytes
--- no longer match their digest. The containment mechanism did not exist.
+-- row was never quarantined, no audit evidence was written, and the candidate
+-- page kept offering a download button for an object whose bytes no longer
+-- match their digest. The containment mechanism did not exist.
 --
 -- The session-side equivalent has been right since 0014: `quarantine_recording`
--- locks the row, CAS-checks the flag so evidence is written exactly once, flips
--- it, and appends a `mismatch_quarantined` row. This migration gives attempts
--- the same thing rather than patching the UPDATE at the call site, because the
--- flag flip and the evidence row must not be able to drift apart.
+-- locks the row, CAS-checks the flag so the deny is reported exactly once, and
+-- flips it. This gives attempts the same thing rather than patching the UPDATE
+-- at the call site, because the flag flip and the reason must not drift apart.
 -- =====================================================================
 
--- ── The integrity log can name an attempt ────────────────────────────
--- `session_id` stays NOT NULL: every integrity event is still anchored to a
--- session, and a gate-death attempt has `recording_session_id` (0107's
--- evidence-only binding) even when consent never bound `session_id`. The new
--- column says WHICH attempt's object the event is about, which the session
--- alone cannot express now that one reused session spans several attempts.
-alter table screening_v2.recording_integrity_events
-  add column if not exists attempt_id uuid
-    references screening_v2.phone_call_attempts(id) on delete cascade;
+-- ── Why the evidence lives HERE and not in recording_integrity_events ──
+-- The obvious move was to append a `mismatch_quarantined` row like 0014 does.
+-- It is a trap. 0014:557 declares
+--
+--     create unique index uq_v2_recording_integrity_events_mismatch_once
+--       on screening_v2.recording_integrity_events (session_id)
+--       where event_type = 'mismatch_quarantined';
+--
+-- keyed on the SESSION alone. Phone sessions are deliberately REUSED across
+-- attempts, so a second attempt's evidence row would raise 23505, abort the
+-- function, roll back the flag flip in the same transaction, and hand the
+-- route a 500 with nothing quarantined — the very defect this migration
+-- exists to remove, with a different SQLSTATE. Worse, an attempt-scoped row
+-- written first would then make 0014's own session-side `quarantine_recording`
+-- collide, breaking a path that works today.
+--
+-- Re-keying that index would mean dropping it, which the forward-only rollback
+-- gate refuses (and rightly: it is a live exactly-once guarantee). So the
+-- attempt carries its own reason column, mirroring `call_sessions`
+-- `recording_quarantine_reason`, and the route writes its `recording.quarantined`
+-- audit event as it already did.
+alter table screening_v2.phone_call_attempts
+  add column if not exists recording_quarantine_reason text;
 
-create index if not exists idx_recording_integrity_events_attempt
-  on screening_v2.recording_integrity_events (attempt_id)
-  where attempt_id is not null;
-
-comment on column screening_v2.recording_integrity_events.attempt_id is
-  '0108: the phone attempt whose object this event describes. NULL for the '
-  'session-scoped events 0014 already wrote. Set for attempt-scoped '
-  'quarantine, where one reused session spans several attempts and the '
-  'session id alone cannot say which recording failed verification.';
+comment on column screening_v2.phone_call_attempts.recording_quarantine_reason is
+  '0108: why this attempt''s recording was quarantined at download-time '
+  're-verification (digest mismatch, oversize). Mirrors '
+  '`call_sessions.recording_quarantine_reason`. Attempt-scoped evidence is NOT '
+  'written to recording_integrity_events: its exactly-once index is keyed on '
+  'session_id alone, and phone sessions are reused across attempts.';
 
 -- ── Quarantine an attempt's recording, atomically and exactly once ───
 create or replace function screening_v2.quarantine_phone_attempt_recording(
@@ -60,14 +69,15 @@ set search_path = pg_catalog, screening_v2
 as $$
 declare
   v_att record;
-  v_session_id uuid;
 begin
   if p_attempt_id is null then
     return jsonb_build_object('status', 'attempt_not_found');
   end if;
 
-  -- Serialise concurrent download clicks on the same attempt.
-  select id, session_id, recording_session_id, recording_quarantined
+  -- Serialise concurrent download clicks on the same attempt. A second click
+  -- BLOCKS here and re-reads only after the first commits, so it can never
+  -- observe an uncommitted `already_quarantined`.
+  select id, recording_quarantined, recording_deleted_at
     into v_att
     from screening_v2.phone_call_attempts
    where id = p_attempt_id
@@ -77,7 +87,14 @@ begin
     return jsonb_build_object('status', 'attempt_not_found');
   end if;
 
-  -- CAS: a second click writes no second piece of evidence.
+  -- An erased recording is already unreachable; do not resurrect a reason for
+  -- an object that no longer exists.
+  if v_att.recording_deleted_at is not null then
+    return jsonb_build_object('status', 'already_deleted');
+  end if;
+
+  -- CAS: the deny is reported once, and the reason of the FIRST detection is
+  -- the one kept.
   if coalesce(v_att.recording_quarantined, false) then
     return jsonb_build_object('status', 'already_quarantined');
   end if;
@@ -87,36 +104,29 @@ begin
   -- the candidate page from continuing to offer the object.
   update screening_v2.phone_call_attempts
      set recording_quarantined = true,
-         recording_ready = false
+         recording_ready = false,
+         recording_quarantine_reason = p_reason
    where id = p_attempt_id;
 
-  -- Evidence. The event is anchored to whichever session the attempt is bound
-  -- to; a pre-consent attempt has only the evidence-only pointer.
-  v_session_id := coalesce(v_att.session_id, v_att.recording_session_id);
-  if v_session_id is not null then
-    insert into screening_v2.recording_integrity_events
-      (session_id, attempt_id, event_type, sha256_expected, sha256_actual,
-       size_bytes, detail, correlation_id)
-    values
-      (v_session_id, p_attempt_id, 'mismatch_quarantined', p_expected_sha256,
-       p_actual_sha256, p_size_bytes, p_reason, p_correlation_id);
-    return jsonb_build_object('status', 'quarantined', 'evidence', true);
-  end if;
-
-  -- An attempt bound to no session at all cannot carry an integrity row
-  -- (`session_id` is NOT NULL by 0014). Containment still wins: the flags are
-  -- flipped and the caller is told the log entry was skipped, rather than the
-  -- whole quarantine failing for want of a log line.
-  return jsonb_build_object('status', 'quarantined', 'evidence', false);
+  return jsonb_build_object(
+    'status', 'quarantined',
+    -- Echoed so the caller can log what was compared without a second read.
+    -- Deliberately not persisted: the digests belong to the download attempt,
+    -- not to the row, and the route already audits them.
+    'expected_sha256', p_expected_sha256,
+    'actual_sha256', p_actual_sha256,
+    'size_bytes', p_size_bytes,
+    'correlation_id', p_correlation_id
+  );
 end;
 $$;
 
 comment on function screening_v2.quarantine_phone_attempt_recording(uuid, text, text, text, bigint, text) is
   '0108: attempt-scoped mirror of 0014 `quarantine_recording`. Flips '
-  'recording_quarantined AND clears recording_ready in one statement (0107''s '
+  'recording_quarantined AND clears recording_ready in ONE statement (0107''s '
   'chk_phone_call_attempts_recording_ready forbids ready+quarantined, which is '
-  'why the previous flag-only UPDATE could never execute), and appends exactly '
-  'one mismatch_quarantined integrity event under a row lock.';
+  'why the previous flag-only UPDATE could never execute), under a row lock, '
+  'with a CAS so a repeat click changes nothing.';
 
 revoke all on function screening_v2.quarantine_phone_attempt_recording(uuid, text, text, text, bigint, text)
   from public, anon, authenticated;
@@ -132,12 +142,10 @@ grant execute on function screening_v2.quarantine_phone_attempt_recording(uuid, 
 -- the worker had deliberately destroyed.
 --
 -- That is fixed in the API, not here: `latchDiscardedWorkerRecording` already
--- does exactly the right thing (CAS + readback through
--- `markWorkerRecordingFailed`), it was simply wired to one event type. The
--- event type cannot decide this on its own — an ORDINARY pre-disclosure
--- deferral posts the same event and its audio IS deliberately kept (0105) — so
--- the worker now states the discard explicitly and the route latches on that
--- flag. No new SQL is needed for it, and none is added: a second latch
--- function would have been a second thing to keep in step with the first.
+-- does the right thing (CAS + readback through `markWorkerRecordingFailed`),
+-- it was simply wired to one event type. The event type cannot decide it — an
+-- ORDINARY pre-disclosure deferral posts the same event and its audio IS
+-- deliberately kept (0105) — so the worker now states the discard explicitly
+-- and the route latches on that flag.
 
 notify pgrst, 'reload schema';

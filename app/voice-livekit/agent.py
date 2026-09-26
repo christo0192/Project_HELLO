@@ -1672,15 +1672,11 @@ def build_worker_options() -> WorkerOptions:
     # than entrypoint-grace + teardown + close, with room to spare; the
     # watchdog (PHONE_SHUTDOWN_WATCHDOG_SECONDS) still exits first on a genuine
     # wedge, so a longer parent grace costs nothing on the healthy path.
-    _shutdown_grace = _bounded_float_env(
-        "PHONE_SHUTDOWN_PROCESS_TIMEOUT", 60.0, 10.0, 120.0,
-    )
-    if _worker_options_accepts("shutdown_process_timeout"):
-        options["shutdown_process_timeout"] = _shutdown_grace
-    else:
-        _log.warn(
-            "unknown_event", error_type="phone_worker_options",
-            error_category="shutdown_process_timeout_unsupported",
+    # PHONE ONLY. `build_worker_options` promises the unnamed browser worker
+    # byte-identical options, and this key is about the phone teardown budget.
+    if _phone_agent_name() and _worker_options_accepts("shutdown_process_timeout"):
+        options["shutdown_process_timeout"] = _bounded_float_env(
+            "PHONE_SHUTDOWN_PROCESS_TIMEOUT", 90.0, 10.0, 120.0,
         )
     if browser_named:
         # The browser worker becomes NAMED + explicit-dispatch. Its prewarm
@@ -9172,7 +9168,10 @@ async def _run_phone_session(
             return default
         return max(0.0, min(default, teardown_deadline - time.monotonic()))
 
-    def _report_late_finish(task: "asyncio.Task[Any]", sid: str | None) -> None:
+    def _report_late_finish(
+        task: "asyncio.Task[Any]", sid: str | None,
+        late_failure: str | None = None,
+    ) -> None:
         """Report an upload that landed AFTER its budget expired.
 
         Without this the detached task's result was consumed and thrown away
@@ -9183,19 +9182,26 @@ async def _run_phone_session(
         """
         if sid is None:
             return
+        cancelled = False
         try:
-            if task.cancelled():
-                return
-            error = task.exception()
+            cancelled = task.cancelled()
+            error = None if cancelled else task.exception()
         except BaseException:  # noqa: BLE001 — a reporter must never raise
             return
-        manifest = None if error is not None else task.result()
+        # A CANCELLED detached upload is the loop shutting down underneath it.
+        # `recording.py finish()` cleans up its local files on that path, so
+        # the audio is gone — and reporting NOTHING would leave the attempt
+        # reporting "processing" forever, which is worse than the wrong-but-
+        # terminal state this replaced. Say so.
+        manifest = None if (cancelled or error is not None) else task.result()
 
         async def _post() -> None:
             try:
                 if manifest is None:
                     await recording_api.fail_recording(
-                        attempt_id, sid, "recording_finish_failed",
+                        attempt_id, sid,
+                        "recording_finish_cancelled" if cancelled
+                        else str(late_failure or "recording_finish_failed"),
                     )
                     return
                 await recording_api.complete_recording(
@@ -9266,7 +9272,9 @@ async def _run_phone_session(
                     # explicit-download recovery path can still complete — a
                     # recoverable state, unlike a deleted file.
                     finish_task.add_done_callback(
-                        lambda t: _report_late_finish(t, sid)
+                        lambda t: _report_late_finish(
+                            t, sid, getattr(recorder, "finish_failure", None),
+                        )
                     )
                     _log.warn(
                         "unknown_event", error_type="phone_teardown",
@@ -9334,37 +9342,6 @@ async def _run_phone_session(
             )
             room_closed = True
 
-    async def _settle_answer_begin_tasks(deadline: float | None = None) -> None:
-        """Let an in-flight `/recording/prepare` land before we settle evidence.
-
-        This used to be `_cancel_answer_begin_tasks`, and it had EXACTLY ONE
-        occurrence in the file: its own definition. Nothing called it, while a
-        comment in the teardown coordinator claimed the tasks were "drained
-        only after the durable evidence path" — they were cancelled outright
-        and never drained.
-
-        Cancelling them first is also the wrong order for the one thing that
-        matters here. Begin-at-answer FIRES `/recording/prepare` rather than
-        awaiting it (0105, to keep ~25s of silence out of the disclosure), and
-        that call is what mints the upload URL. Cancel it mid-flight on a very
-        short call — a hang-up seconds after answer, i.e. precisely the
-        population this evidence work exists for — and `_finish_recording`
-        finds no URL and uploads nothing. So: drain under a bound, then cancel
-        only what is genuinely wedged.
-        """
-        pending = [task for task in tuple(recording_begin_tasks) if not task.done()]
-        if not pending:
-            return
-        await _bounded_await(
-            asyncio.gather(*pending, return_exceptions=True),
-            _teardown_timeout(PHONE_TEARDOWN_STEP_SECONDS),
-            category="recording_begin_drain", deadline=deadline,
-        )
-        for task in pending:
-            if not task.done():
-                task.cancel()
-                task.add_done_callback(_consume_detached_task)
-
     async def _post_gate_failure_terminal(
         gate_result: phone.PhoneGateResult | None,
         failure: BaseException | None,
@@ -9413,9 +9390,20 @@ async def _run_phone_session(
                 event_type = "consent.failed"
             else:
                 return
+        # THE DISCARD FLAG TRAVELS WITH THE RETRY TOO. Without it this path
+        # silently reopened "processing forever": the first terminal post
+        # fails closed by RETURNING a non-applied outcome, so the gate carries
+        # on, teardown re-posts here — and on the DEFAULT identity-mismatch
+        # verdict (`candidate.deferred_pre_disclosure`) the server latches the
+        # discard only on the flag. A terminal that applies without it leaves
+        # the attempt pointing at audio the worker has already destroyed.
+        discarded = bool(gate_lifecycle.get("not_the_candidate"))
         for _ in range(2):
             outcome = await _bounded_await(
-                events.post_event(attempt_id, event_type, epoch=epoch),
+                events.post_event(
+                    attempt_id, event_type, epoch=epoch,
+                    recording_discarded=discarded,
+                ),
                 _teardown_timeout(PHONE_TEARDOWN_STEP_SECONDS),
                 category="gate_terminal_post", deadline=deadline,
             )
@@ -9435,11 +9423,17 @@ async def _run_phone_session(
         nonlocal recording_settle_started, teardown_deadline
         deadline = teardown_deadline
         recording_settle_started = True
-        # The begin-at-answer prepare is SETTLED FIRST, not cancelled first:
-        # it owns the upload URL, so killing it here is the difference between
-        # a gate-death call with audio and one without. Bounded, so a wedged
-        # prepare still cannot consume the evidence budget.
-        await _settle_answer_begin_tasks(deadline)
+        # The begin-at-answer prepare is cancelled, not drained. It owns the
+        # upload URL, so draining it looks attractive — but
+        # `recording_settle_started` is latched above and
+        # `_phone_recording_begin` re-checks it AFTER its prepare await, so a
+        # drained task returns without minting anything; and even if it did
+        # mint, `recorder.begin()` would start capture on a call that is over.
+        # There is no audio to rescue here, only budget to waste.
+        for task in tuple(recording_begin_tasks):
+            if not task.done():
+                task.cancel()
+                task.add_done_callback(_consume_detached_task)
         _pt = _role_prerender_task[0]
         if _pt is not None and not _pt.done():
             _pt.cancel()
@@ -9511,10 +9505,6 @@ async def _run_phone_session(
                     _teardown_timeout(PHONE_TEARDOWN_STEP_SECONDS),
                     category="transcript_drain", deadline=deadline,
                 )
-                for task in pending:
-                    if not task.done():
-                        task.cancel()
-                        task.add_done_callback(_consume_detached_task)
 
         # Lease loss still closes the SIP leg, preserving the existing lease
         # safety behavior. It never posts a stale terminal; reconnect/lease
@@ -10158,15 +10148,18 @@ async def _run_phone_session(
                     # stated purpose was to preserve it. The bound is what
                     # makes the drain safe; removing the wait is not the same
                     # as bounding it.
+                    # Bounded by the SHORTER of the reply timeout and the
+                    # teardown step, so restoring the drain cannot add ten
+                    # seconds in front of a teardown that has its own budget.
                     await _bounded_await(
                         asyncio.gather(*inflight, return_exceptions=True),
-                        PHONE_TERMINAL_REPLY_TIMEOUT_SEC,
+                        min(PHONE_TERMINAL_REPLY_TIMEOUT_SEC,
+                            PHONE_TEARDOWN_STEP_SECONDS),
                         category="transcript_drain",
                     )
-                    for task in inflight:
-                        if not task.done():
-                            task.cancel()
-                            task.add_done_callback(_consume_detached_task)
+                    # `_bounded_await` already cancels the gather (and with it
+                    # every child) when the bound expires; nothing further is
+                    # needed here.
     finally:
         # One owner settles gate/post-gate evidence, then performs any requested
         # room delete. It also runs when the caller cancels this task.

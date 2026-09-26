@@ -459,6 +459,7 @@ describe('full-resync page-anchored continuation (0034)', () => {
       expect(r.skipped).toEqual({
         noApplicationId: 0, noEnabledMapping: 0, stageNotAi: 0, ambiguousMapping: 0,
         unclassified: 0, preActivation: 0, historyUnavailable: 0,
+        activationUnknown: 0,
       });
     }
     // Every run after the first began at an anchored cursor, never at page 1.
