@@ -300,6 +300,7 @@ class FakeEventClient:
         answers=None,
     ) -> None:
         self.calls: list[tuple[str, str, dict]] = []
+        self.discard_flags: list[tuple[str, bool]] = []
         self.timeline: list[str] = []
         self.bookings: list[tuple[str, str, int]] = []
         self._outcomes = outcomes or {}
@@ -386,7 +387,13 @@ class FakeEventClient:
             outcome.next_heartbeat_seconds = phone.HEARTBEAT_FALLBACK_SEC
         return outcome
 
-    async def post_event(self, attempt_id, event_type, *, epoch=None, session_id=None):
+    async def post_event(self, attempt_id, event_type, *, epoch=None, session_id=None,
+                         recording_discarded=False):
+        # 0108: the worker states a DISCARD explicitly, because the event
+        # type cannot carry it — the default identity-mismatch terminal is
+        # the same event an ordinary deferral posts, and that one's audio is
+        # kept. Recorded so tests can assert which terminals claim it.
+        self.discard_flags.append((event_type, bool(recording_discarded)))
         self.timeline.append(f"event:{event_type}")
         self.calls.append((attempt_id, event_type, {"epoch": epoch, "session_id": session_id}))
         outcome = self._outcomes.get(event_type)
@@ -17599,7 +17606,13 @@ class _FlakyPurgeClient(FakeEventClient):
         super().__init__(*a, **kw)
         self.purge_posts = 0
 
-    async def post_event(self, attempt_id, event_type, *, epoch=None, session_id=None):
+    async def post_event(self, attempt_id, event_type, *, epoch=None, session_id=None,
+                         recording_discarded=False):
+        # 0108: the worker states a DISCARD explicitly, because the event
+        # type cannot carry it — the default identity-mismatch terminal is
+        # the same event an ordinary deferral posts, and that one's audio is
+        # kept. Recorded so tests can assert which terminals claim it.
+        self.discard_flags.append((event_type, bool(recording_discarded)))
         if event_type == "candidate.deferred_pre_disclosure":
             self.purge_posts += 1
             self.calls.append((attempt_id, event_type, {"epoch": epoch}))

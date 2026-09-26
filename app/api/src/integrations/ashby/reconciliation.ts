@@ -186,6 +186,14 @@ export type ReconcileStop =
   /** Too many unclassifiable rows — probable provider-schema drift. */
   | 'unclassified_cap'
   /**
+   * The activation fence could not answer for an application because the
+   * PROVIDER could not be reached (or ran out of the run's budget mid-page).
+   * The page is left UNANCHORED and nothing is advanced: a transient history
+   * failure must not skip an application forever, because reconciliation is
+   * the only thing that recovers a dropped webhook.
+   */
+  | 'history_unavailable'
+  /**
    * The durable page anchor could not be written (0034): a forced resync
    * bumped the epoch mid-run, or this runner no longer holds the stream's
    * single-flight lease. Fail closed — nothing further is processed and
@@ -227,6 +235,23 @@ export interface ReconcileSkipCounts {
   unclassified?: number;
   /** Mapping matched, but complete stage history proves entry pre-dates activation. */
   preActivation?: number;
+  /**
+   * The activation fence could not answer for this application: the provider
+   * failed, or its history was unusable. The application is NOT admitted. A
+   * retryable failure also stops the run with `history_unavailable` and leaves
+   * the page unanchored, so nothing is skipped silently; a determinate one is
+   * skipped, because asking again cannot change the answer. A persistent
+   * non-zero count is a signal to look at the provider, not at one candidate.
+   */
+  historyUnavailable?: number;
+  /**
+   * The application's job IS mapped and enabled, but that mapping carries no
+   * usable activation instant — so there is nothing to compare a stage entry
+   * against and the fence fails closed. This is a CONFIGURATION fault (0106
+   * backfills every enabled mapping), deliberately counted apart from
+   * `ambiguousMapping`, which means two mappings disagree about the stage.
+   */
+  activationUnknown?: number;
 }
 
 /**
@@ -337,8 +362,23 @@ export interface ReconcileDeps {
    * supply it, and a loader that returns no rows admits nothing.
    */
   mappings: EnabledMappingLoader;
-  /** Provider history reader used for the activation fence. */
-  history?: ApplicationHistoryLister;
+  /**
+   * THE ACTIVATION FENCE. Required, and it is the DECISION rather than the
+   * transport.
+   *
+   * It was `history?: ApplicationHistoryLister`, consulted as
+   * `if (verdict.classified && deps.history)` — so dropping one key from the
+   * composition root silently restored the 2026-09-25 behaviour (a full sweep
+   * of the corpus admitting every current stage-sitter with no age check),
+   * and an existing test deliberately called this function without it and
+   * asserted the import happened. A fence a one-line refactor can remove,
+   * with a green suite, is not a fence.
+   *
+   * Production passes `historyAdmitter(client)`. Tests that are not about the
+   * fence pass `async () => 'admit'` — explicitly, at the call site, where a
+   * reader can see the fence was waived.
+   */
+  admitByHistory: HistoryAdmitter;
   checkpointKey?: string;
   caps?: ReconcileCaps;
   /** Monotonic clock in ms; inject for deterministic tests. */
@@ -347,8 +387,55 @@ export interface ReconcileDeps {
   owner?: string;
 }
 
+/**
+ * Fence errors that are DETERMINATE for this application: asking again cannot
+ * change the answer, because the provider answered and the answer is unusable.
+ * Skipping such a row is the only way past it — the alternative is replaying
+ * the same page until a human intervenes. Everything else (transport, 5xx,
+ * rate limits, the run's own deadline) is RETRYABLE, and a retryable failure
+ * must leave the page unanchored so the application is reconsidered.
+ */
+const DETERMINATE_HISTORY_ERRORS: ReadonlySet<string> = new Set([
+  'ashby_history_ambiguous',
+  'ashby_history_row_malformed',
+  'ashby_history_results_malformed',
+  'ashby_history_stage_malformed',
+  'ashby_history_entry_time_malformed',
+  'ashby_history_entry_time_invalid',
+  'ashby_history_exit_time_missing',
+  'ashby_history_exit_time_malformed',
+  'ashby_history_exit_time_invalid',
+  'ashby_history_pagination_flag_missing',
+  'ashby_history_cursor_invalid',
+  'ashby_history_activation_time_invalid',
+]);
+
+function isDeterminateHistoryError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error ?? '');
+  return DETERMINATE_HISTORY_ERRORS.has(message);
+}
+
+/** One application's fence decision. Throws when it cannot be answered. */
+type HistoryAdmissionVerdict = 'admit' | 'not_after_activation';
+
+export type HistoryAdmitter = (input: {
+  applicationId: string;
+  stageId: string;
+  activationAt: string;
+  deadlineAt: number;
+  nowMs?: () => number;
+}) => Promise<HistoryAdmissionVerdict>;
+
+/** The production fence: prove the stage interval against provider history. */
+export function historyAdmitter(client: ApplicationHistoryLister): HistoryAdmitter {
+  return (input) => admitStageAfterActivation(client, input);
+}
+
 function emptySkips(): ReconcileSkipCounts {
-  return { noApplicationId: 0, noEnabledMapping: 0, stageNotAi: 0, ambiguousMapping: 0, unclassified: 0, preActivation: 0 };
+  return {
+    noApplicationId: 0, noEnabledMapping: 0, stageNotAi: 0, ambiguousMapping: 0,
+    unclassified: 0, preActivation: 0, historyUnavailable: 0, activationUnknown: 0,
+  };
 }
 
 function noProgress(): PartialProgress {
@@ -835,6 +922,9 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
   const skipped = emptySkips();
   let stop: ReconcileStop = 'drained';
   let unclassifiedAbort = false;
+  // Set when the fence could not be answered for a RETRYABLE reason. Like the
+  // other mid-page stops it suppresses the page anchor, so nothing is skipped.
+  let historyUnavailableStop = false;
   let enqueueCapHit = false;
   let anchorConflict = false;
   let sweepAbandoned = false;
@@ -934,15 +1024,55 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
 
       admitted += 1;
       const admission = verdict.classified ? admissionIndex.get(verdict.jobId) : undefined;
-      if (verdict.classified && deps.history) {
-        if (!admission) throw new Error('ashby_activation_guard_malformed');
-        const historyVerdict = await admitStageAfterActivation(deps.history, {
-          applicationId: verdict.applicationId,
-          stageId: verdict.stageId,
-          activationAt: admission.activationAt,
-          deadlineAt: startedAt + deadlineMs,
-          nowMs,
-        });
+      if (verdict.classified) {
+        if (!admission) {
+          // SCOPED TO THIS MAPPING, NOT THE RUN. This used to throw, so one
+          // enabled mapping with a NULL/unparseable `activation_at` aborted
+          // the entire reconcile tick for every other mapping — and the same
+          // condition is handled per-application in both of the other two
+          // paths. Fail closed for the offending job, keep sweeping.
+          admitted -= 1;
+          pageHandled += 1;
+          skipped.activationUnknown = (skipped.activationUnknown ?? 0) + 1;
+          counter('ashby_reconcile_activation_unknown', 1);
+          continue;
+        }
+        let historyVerdict: HistoryAdmissionVerdict;
+        try {
+          historyVerdict = await deps.admitByHistory({
+            applicationId: verdict.applicationId,
+            stageId: verdict.stageId,
+            activationAt: admission.activationAt,
+            deadlineAt: startedAt + deadlineMs,
+            nowMs,
+          });
+        } catch (error) {
+          // ONE BAD ROW MUST NOT WEDGE THE TENANT — AND MUST NOT BE LOST.
+          //
+          // This call used to sit inline with no try/catch, so one unanswerable
+          // application failed the whole tick and the next tick replayed the
+          // same page forever. But catching everything and carrying on is the
+          // opposite mistake: `pageHandled` is what makes a page ANCHORABLE, so
+          // a transient 5xx would advance the cursor past an application whose
+          // webhook may have been dropped — silent, permanent loss from the one
+          // mechanism that exists to recover it.
+          //
+          // So the two cases are separated. A DETERMINATE answer (the provider
+          // replied and the reply is unusable) is skipped and counted: asking
+          // again cannot help. Anything else — transport, 5xx, rate limit, or
+          // the run's own deadline landing mid-page — leaves this page
+          // unanchored and stops the run, which is retried on the next tick at
+          // no cost but a little latency.
+          admitted -= 1;
+          skipped.historyUnavailable = (skipped.historyUnavailable ?? 0) + 1;
+          counter('ashby_reconcile_history_unavailable', 1);
+          if (isDeterminateHistoryError(error)) {
+            pageHandled += 1;
+            continue;
+          }
+          historyUnavailableStop = true;
+          break;
+        }
         if (historyVerdict !== 'admit') {
           admitted -= 1;
           pageHandled += 1;
@@ -991,12 +1121,14 @@ export async function runReconciliation(deps: ReconcileDeps): Promise<ReconcileR
     // completion. Any mid-page stop leaves it UNANCHORED, so the next run
     // replays it whole — dedup-safe, and the only ordering in which no
     // application can be skipped.
-    const pageComplete = !unclassifiedAbort && !enqueueCapHit && !itemCapHit;
+    const pageComplete = !unclassifiedAbort && !enqueueCapHit && !itemCapHit
+      && !historyUnavailableStop;
     if (pageComplete) {
       handledPages += 1;
       handledItems += pageHandled;
     }
 
+    if (historyUnavailableStop) { stop = 'history_unavailable'; break; }
     if (unclassifiedAbort || enqueueCapHit) break;
     if (itemCapHit) { stop = 'item_cap'; break; }
     if (!page.moreDataAvailable || !page.nextCursor) { stop = 'drained'; break; }

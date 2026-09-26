@@ -21,6 +21,18 @@ import { describe, it, expect, vi } from 'vitest';
 import { runReconciliation, DEFAULT_CHECKPOINT_KEY } from '../integrations/ashby/reconciliation.js';
 import type { CheckpointStore, ReceiptStore, SyncCheckpoint } from '../integrations/ashby/ports.js';
 
+// Since 0106 an ENABLED mapping always carries an activation instant (the
+// migration backfills every existing row), and reconciliation now fails closed
+// on one that does not — a mapping whose activation is unknown admits nobody,
+// scoped to that mapping rather than aborting the run. The loaders below stamp
+// a far-past default so a terse fixture row still represents a REAL enabled
+// mapping; tests that care about the instant set it explicitly.
+const FIXTURE_ACTIVATION_AT = '2000-01-01T00:00:00.000Z';
+function withActivation<T extends object>(rows: T[]): T[] {
+  return rows.map((r) => ({ activationAt: FIXTURE_ACTIVATION_AT, ...r }));
+}
+
+
 /** An in-memory checkpoint store with a real single-flight lease. */
 function checkpointStore(initial: Partial<SyncCheckpoint> = {}) {
   const state: SyncCheckpoint = {
@@ -93,7 +105,7 @@ function lister(pages: number, perPage: number) {
 /** Admits the single (job, AI stage) pair every fixture page uses. */
 const enabledMappings = {
   async listEnabled() {
-    return { rows: [{ externalJobId: 'job_1', aiScreeningStageId: 'stage_ai' }], truncated: false };
+    return { rows: withActivation([{ externalJobId: 'job_1', aiScreeningStageId: 'stage_ai' }]), truncated: false };
   },
 };
 
@@ -102,6 +114,8 @@ describe('single-flight lease', () => {
     const cp = checkpointStore();
     const l = lister(1, 2);
     const r = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: l.client, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 'sched-1',
     });
     expect(r.stop).toBe('drained');
@@ -124,6 +138,8 @@ describe('single-flight lease', () => {
     };
 
     const first = runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: slowClient, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 'sched-1',
     });
     // Let the lease be taken.
@@ -131,6 +147,8 @@ describe('single-flight lease', () => {
     expect(cp.heldBy()).toBe('sched-1');
 
     const second = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: l.client, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 'sched-2',
     });
 
@@ -150,8 +168,12 @@ describe('single-flight lease', () => {
     const a = lister(1, 1);
     const b = lister(1, 1);
     const [ra, rb] = await Promise.all([
-      runReconciliation({ client: a.client, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 'A' }),
-      runReconciliation({ client: b.client, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 'B' }),
+      runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const, client: a.client, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 'A' }),
+      runReconciliation({
+    // Fence waived: this suite is not about activation admission.
+    admitByHistory: async () => 'admit' as const, client: b.client, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 'B' }),
     ]);
     const advanced = [ra, rb].filter((r) => r.advanced);
     const locked = [ra, rb].filter((r) => r.stop === 'locked');
@@ -164,6 +186,8 @@ describe('single-flight lease', () => {
     const cp = checkpointStore();
     const boom = { applicationList: async () => { throw new Error('provider_down'); } };
     await expect(runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: boom, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 'sched-1',
     })).rejects.toThrow('provider_down');
     // A stranded lease would wedge the stream until its deadline.
@@ -179,7 +203,9 @@ describe('single-flight lease', () => {
       async requireFullResync() {},
     };
     const l = lister(1, 1);
-    const r = await runReconciliation({ client: l.client, checkpoints: minimal, receipts: receipts(), mappings: enabledMappings });
+    const r = await runReconciliation({
+    // Fence waived: this suite is not about activation admission.
+    admitByHistory: async () => 'admit' as const, client: l.client, checkpoints: minimal, receipts: receipts(), mappings: enabledMappings });
     expect(r.stop).toBe('drained');
     expect(r.advanced).toBe(true);
   });
@@ -192,6 +218,8 @@ describe('no-progress visibility', () => {
     for (let i = 1; i <= 3; i++) {
       const l = lister(3, 10);
       const r = await runReconciliation({
+        // Fence waived: this suite is not about activation admission.
+        admitByHistory: async () => 'admit' as const,
         client: l.client, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 'sched-1',
         caps: { maxItems: 5 },
       });
@@ -208,6 +236,8 @@ describe('no-progress visibility', () => {
     const cp = checkpointStore();
     const capped = lister(3, 10);
     await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: capped.client, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 's',
       caps: { maxItems: 5 },
     });
@@ -215,6 +245,8 @@ describe('no-progress visibility', () => {
 
     const drained = lister(1, 2);
     const r = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: drained.client, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 's',
     });
     expect(r.advanced).toBe(true);
@@ -225,6 +257,8 @@ describe('no-progress visibility', () => {
     const cp = checkpointStore();
     const l = lister(5, 10);
     const r = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: l.client, checkpoints: cp.store, receipts: receipts(), mappings: enabledMappings, owner: 's',
       caps: { maxPages: 2 },
     });

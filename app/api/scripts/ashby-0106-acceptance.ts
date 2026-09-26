@@ -1,5 +1,5 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
-import { runReconciliation } from '../src/integrations/ashby/reconciliation.js';
+import { runReconciliation, historyAdmitter } from '../src/integrations/ashby/reconciliation.js';
 import { processAshbySignal, buildSignalEnqueueSpec, importDedupKey } from '../src/integrations/ashby/signal-worker.js';
 import { createCheckpointStore, createEnabledMappingLoader, createMappingResolver, createReceiptStore, createSnapshotApplicationAuthorizer, createAshbySignalQueue } from '../src/integrations/ashby/stores.js';
 import type { ApplicationHistoryLister } from '../src/integrations/ashby/activation-admission.js';
@@ -83,9 +83,9 @@ try {
   const receipts = createReceiptStore(runtimeDb);
   const checkpoints = createCheckpointStore(runtimeDb);
   const mappings = createEnabledMappingLoader(runtimeDb);
-  const full = await runReconciliation({ client: provider, history, checkpoints, receipts, mappings, checkpointKey, owner: `${prefix}reconcile`, caps: { maxPages: 2, maxItems: 10 } });
+  const full = await runReconciliation({ client: provider, admitByHistory: historyAdmitter(history), checkpoints, receipts, mappings, checkpointKey, owner: `${prefix}reconcile`, caps: { maxPages: 2, maxItems: 10 } });
   assert(full.mode === 'full' && full.observed === 2 && full.admitted === 0 && full.skipped.preActivation === 2 && full.recovered === 0 && full.enqueued === 0, `old full proof mismatch: ${JSON.stringify(full)}`);
-  const incremental = await runReconciliation({ client: provider, history, checkpoints, receipts, mappings, checkpointKey, owner: `${prefix}reconcile-2`, caps: { maxPages: 2, maxItems: 10 } });
+  const incremental = await runReconciliation({ client: provider, admitByHistory: historyAdmitter(history), checkpoints, receipts, mappings, checkpointKey, owner: `${prefix}reconcile-2`, caps: { maxPages: 2, maxItems: 10 } });
   assert(incremental.mode === 'incremental' && incremental.admitted === 0 && incremental.enqueued === 0, `old incremental proof mismatch: ${JSON.stringify(incremental)}`);
   assert(await count('ashby_event_receipts', 'webhook_action_id', `stage:${oldApps.a}:${stages.a}`) === 0, 'old A produced a receipt');
   assert(await count('ashby_event_receipts', 'webhook_action_id', `stage:${oldApps.b}:${stages.b}`) === 0, 'old B produced a receipt');
@@ -142,7 +142,7 @@ try {
   await one(db.schema('screening_v2').rpc('mark_ashby_sync_full_resync', {
     p_checkpoint_key: checkpointKey, p_reason: 'ts0106-local-test',
   }), 'local acceptance forced sweep');
-  const afterReenable = await runReconciliation({ client: provider, history, checkpoints, receipts, mappings, checkpointKey, owner: `${prefix}reconcile-3`, caps: { maxPages: 2, maxItems: 10 } });
+  const afterReenable = await runReconciliation({ client: provider, admitByHistory: historyAdmitter(history), checkpoints, receipts, mappings, checkpointKey, owner: `${prefix}reconcile-3`, caps: { maxPages: 2, maxItems: 10 } });
   assert(afterReenable.enqueued === 0 && afterReenable.recovered === 0 && (afterReenable.skipped.preActivation ?? 0) >= 2, `pause/re-enable reopened old backlog: ${JSON.stringify(afterReenable)}`);
   console.log(JSON.stringify({ pass: true, proof: { full, incremental, freshSignal: result.decision, explicitQueued: confirmed.queued_count, afterReenable }, counts: { oldReceipts: 0, oldJobs: 0, freshImportJobs: 1 } }));
 } finally {

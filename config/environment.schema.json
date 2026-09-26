@@ -192,6 +192,8 @@
         "PHONE_TEARDOWN_MAX_SECONDS": { "requiredInProduction": false, "secret": false },
         "PHONE_TEARDOWN_STEP_SECONDS": { "requiredInProduction": false, "secret": false },
         "PHONE_SHUTDOWN_WATCHDOG_SECONDS": { "requiredInProduction": false, "secret": false },
+        "PHONE_RECORDING_FINISH_SECONDS": { "requiredInProduction": false, "secret": false },
+        "PHONE_SHUTDOWN_PROCESS_TIMEOUT": { "requiredInProduction": false, "secret": false },
         "PHONE_BOUNCE_MODE": { "requiredInProduction": false, "secret": false },
         "PHONE_DETERMINISTIC_OPENER": { "requiredInProduction": false, "secret": false },
         "PHONE_GATE_FLOW": { "requiredInProduction": false, "secret": false },

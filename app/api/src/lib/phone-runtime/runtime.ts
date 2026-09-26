@@ -275,6 +275,16 @@ export function createPhoneSessionPort(
       // engagement B adopts it. So a candidate with more than one live
       // engagement adopts nothing and mints its own session. An extra row is
       // the cheap direction; two SIP legs in one room is not.
+      // THIS ENGAGEMENT'S OWN SESSION FIRST. Exact, so it is safe even with
+      // several live engagements — and required, because the 0107 unique
+      // index on `phone_engagement_id` makes a second `createSession` for the
+      // same engagement fail, which took the engagement out of the dial loop
+      // permanently and silently.
+      const mine = await reader.findSessionForEngagement({
+        engagementId: input.engagementId,
+      });
+      if (mine !== null) return mine;
+
       const liveEngagements = await reader.countLiveEngagements({
         candidateId: input.candidateId,
       });

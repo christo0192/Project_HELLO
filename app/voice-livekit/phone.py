@@ -2131,6 +2131,7 @@ class PhoneEventClient:
         *,
         epoch: int | None = None,
         session_id: str | None = None,
+        recording_discarded: bool = False,
     ) -> PhoneApiOutcome:
         """Post one worker event. Fails closed on anything but a confirmed 200.
 
@@ -2164,6 +2165,16 @@ class PhoneEventClient:
         # null key would say "I know it is null" rather than "I do not know".
         if session_id is not None and _UUID_RE.match(str(session_id).strip()):
             body["session_id"] = str(session_id).strip()
+        # THE DISCARD FLAG. Sent ONLY when this worker has destroyed the
+        # attempt's audio — a stranger answered, or the person on the line was
+        # confirmed not to be the candidate. The server cannot infer it from
+        # the event type: with `PHONE_IDENTITY_MISMATCH_SUPPRESSES` off (the
+        # DEFAULT) that verdict arrives as `candidate.deferred_pre_disclosure`,
+        # the very event an ORDINARY deferral posts — and an ordinary
+        # deferral's audio is deliberately KEPT (0105). Omitted when false so
+        # an older server, whose schema is `.strict()`, still accepts the post.
+        if recording_discarded:
+            body["recording_discarded"] = True
 
         response = await self._post(EVENTS_PATH, body, "event")
         if isinstance(response, str):
@@ -5879,12 +5890,22 @@ async def run_phone_gate(
         # Privacy disposition is content-free and must be latched before any
         # terminal API call or courtesy speech can raise/cancel. The worker
         # must discard even if the terminal post never returns a result.
-        if not_the_candidate or decision == CLASSIFY_WRONG_NUMBER:
+        discarded = bool(not_the_candidate or decision == CLASSIFY_WRONG_NUMBER)
+        if discarded:
             _phase("not_the_candidate")
         event_type = _OUTCOME_EVENT.get(decision)
         if event_type is not None:
             _phase(f"terminal_requested:{event_type}")
-            outcome = await client.post_event(attempt_id, event_type, epoch=epoch)
+            # `recording_discarded` travels WITH the terminal, because the
+            # server cannot read this verdict off the event type: with
+            # identity-mismatch suppression OFF (the default) this posts
+            # `candidate.deferred_pre_disclosure`, which an ordinary deferral
+            # — whose audio is KEPT — also posts. Without it the attempt sat
+            # at "processing" forever for a call whose audio we destroyed.
+            outcome = await client.post_event(
+                attempt_id, event_type, epoch=epoch,
+                recording_discarded=discarded,
+            )
             if event_applied(outcome):
                 events.append(event_type)
                 _phase("terminal_posted")

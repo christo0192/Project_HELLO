@@ -46,6 +46,15 @@ import type {
 import { stageDedupId, CANDIDATE_STAGE_CHANGE_ACTION } from '../integrations/ashby/extractors.js';
 import type { AshbyResult, ApplicationListParams, OpaqueRecord } from '../integrations/ashby/types.js';
 
+// Since 0106 an ENABLED mapping always carries an activation instant, and
+// reconciliation fails closed on one that does not. Stamp a far-past default
+// so a terse fixture row still represents a REAL enabled mapping.
+const FIXTURE_ACTIVATION_AT = '2000-01-01T00:00:00.000Z';
+function withActivation<T extends object>(rows: T[]): T[] {
+  return rows.map((r) => ({ activationAt: FIXTURE_ACTIVATION_AT, ...r }));
+}
+
+
 const JOB = 'job_enabled';
 const AI = 'stage_ai';
 const OWNER = 'runner-a';
@@ -293,7 +302,7 @@ class FakeReceipts implements ReceiptStore {
 class FakeMappings implements EnabledMappingLoader {
   constructor(public rows: EnabledMappingRow[] = []) {}
   async listEnabled(): Promise<{ rows: EnabledMappingRow[]; truncated: boolean }> {
-    return { rows: this.rows, truncated: false };
+    return { rows: withActivation(this.rows), truncated: false };
   }
 }
 
@@ -372,6 +381,8 @@ function deps(
 ) {
   return {
     client: provider, checkpoints, receipts, mappings,
+    // Fence waived: this suite is about cursors, anchors and continuation.
+    admitByHistory: async () => 'admit' as const,
     checkpointKey: KEY, owner: OWNER, nowMs: checkpoints.nowMs, ...extra,
     caps: { maxEnqueuePerRun: 2_000, ...extra.caps },
   };
@@ -447,7 +458,8 @@ describe('full-resync page-anchored continuation (0034)', () => {
     for (const r of runs) {
       expect(r.skipped).toEqual({
         noApplicationId: 0, noEnabledMapping: 0, stageNotAi: 0, ambiguousMapping: 0,
-        unclassified: 0, preActivation: 0,
+        unclassified: 0, preActivation: 0, historyUnavailable: 0,
+        activationUnknown: 0,
       });
     }
     // Every run after the first began at an anchored cursor, never at page 1.
@@ -497,6 +509,8 @@ describe('full-resync page-anchored continuation (0034)', () => {
     };
     const receipts = new FakeReceipts();
     const r = await runReconciliation({
+      // Fence waived: this suite is not about activation admission.
+      admitByHistory: async () => 'admit' as const,
       client: new FakeProvider(5_001), checkpoints: noAnchor, receipts,
       mappings: PAUSED, checkpointKey: KEY, owner: OWNER,
     });

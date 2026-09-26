@@ -640,7 +640,7 @@ class TestTerminalPostRetryStops(unittest.IsolatedAsyncioTestCase):
             self.outcomes = list(outcomes)
             self.calls = 0
 
-        async def post_event(self, attempt_id, event_type):
+        async def post_event(self, attempt_id, event_type, **_kw):
             self.calls += 1
             return self.outcomes[min(self.calls - 1, len(self.outcomes) - 1)]
 

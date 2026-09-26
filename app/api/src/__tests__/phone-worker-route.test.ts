@@ -1441,6 +1441,60 @@ describe('NO worker event purges the recordings any more (0105)', () => {
     expect(h.latchDiscardedRecording).toHaveBeenCalledTimes(2);
   });
 
+  // ── 0108: THE DEFAULT IDENTITY TERMINAL IS A DISCARD TOO ───────────
+  // `phone_identity_mismatch_suppresses()` defaults to NO, so a confirmed
+  // identity mismatch posts `candidate.deferred_pre_disclosure`, not
+  // `candidate.wrong_number`. 0107 latched only the latter, so on the DEFAULT
+  // path an attempt whose audio the worker had destroyed kept its prepared
+  // object key and reported "Recording processing" forever.
+  //
+  // The event type cannot decide it — an ORDINARY deferral posts the same
+  // event and its audio is deliberately KEPT — so the worker says so, and
+  // these two tests pin both directions of that flag.
+  it('latches a DISCARD reported on the default identity terminal', async () => {
+    const h = build({ latchDiscardedRecording: async () => undefined });
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'candidate.deferred_pre_disclosure',
+      recording_discarded: true,
+    });
+    expect(res.status).toBe(200);
+    expect(h.latchDiscardedRecording).toHaveBeenCalledWith(ATTEMPT);
+  });
+
+  it('does NOT latch an ordinary deferral, whose audio is kept', async () => {
+    const h = build({ latchDiscardedRecording: async () => undefined });
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'candidate.deferred_pre_disclosure',
+    });
+    expect(res.status).toBe(200);
+    expect(h.latchDiscardedRecording).not.toHaveBeenCalled();
+  });
+
+  it('a failed latch on the default terminal is not acknowledged either', async () => {
+    const h = build({ latchDiscardedRecording: async () => {
+      throw new Error('phone_discard_recording_latch_failed');
+    } });
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'candidate.deferred_pre_disclosure',
+      recording_discarded: true,
+    });
+    expect(res.status).toBe(500);
+  });
+
+  it('rejects a non-boolean discard flag rather than coercing it', async () => {
+    const h = build({ latchDiscardedRecording: async () => undefined });
+    const res = await post(h, '/events', {
+      attempt_id: ATTEMPT,
+      event_type: 'candidate.deferred_pre_disclosure',
+      recording_discarded: 'true',
+    });
+    expect(res.status).toBe(400);
+    expect(h.latchDiscardedRecording).not.toHaveBeenCalled();
+  });
+
   for (const event of RETAINED_GATE_EXITS) {
     it(`${event}: posts the event and touches NO recording (0105)`, async () => {
       // THE CHANGE, pinned positively per event rather than left to a set

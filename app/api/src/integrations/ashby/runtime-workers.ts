@@ -63,6 +63,7 @@ import {
 } from './scanner-readiness.js';
 import {
   runReconciliation,
+  historyAdmitter,
   DEFAULT_CHECKPOINT_KEY,
   DEFAULT_MAX_ENABLED_MAPPINGS,
 } from './reconciliation.js';
@@ -1822,7 +1823,10 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
             // enqueue EVERY application it observed — the tenant-wide signal
             // storm this loop exists to avoid.
             mappings: runtime.enabledMappings,
-            history: runtime.client,
+            // The activation fence, as a required decision rather than an
+            // optional reader: `ReconcileDeps.admitByHistory` has no default,
+            // so this cannot go missing without a compile error.
+            admitByHistory: historyAdmitter(runtime.client),
             checkpointKey: DEFAULT_CHECKPOINT_KEY,
             owner,
             // Tunable without a deploy: a backfill against a large corpus
@@ -1866,6 +1870,18 @@ export function createAshbyWorkers(options: AshbyWorkersOptions): AshbyWorkers {
             // A truncated index means enabled mappings exist that this pass
             // could not admit against — fail-loud, since the symptom (missing
             // imports) is otherwise silent.
+            // A degraded fence is an incident, not a statistic. Without
+            // this the only trace of "intake refused everyone because the
+            // provider was unreachable" was a metrics counter with a no-op
+            // sink — indistinguishable, from the outside, from a quiet day.
+            const historyUnavailable = r.skipped?.historyUnavailable ?? 0;
+            const activationUnknown = r.skipped?.activationUnknown ?? 0;
+            if (historyUnavailable > 0 || activationUnknown > 0) {
+              logger.warn('unknown_event', {
+                error_category: 'ashby_reconcile_admission_degraded',
+                error_type: r.stop,
+              });
+            }
             if (r.mappingIndexTruncated) {
               logger.warn('unknown_event', {
                 error_category: 'ashby_reconcile_mapping_index_truncated',

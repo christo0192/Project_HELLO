@@ -23,6 +23,18 @@ import type {
 } from '../integrations/ashby/ports.js';
 import type { AshbyResult, OpaqueRecord } from '../integrations/ashby/types.js';
 
+// Since 0106 an ENABLED mapping always carries an activation instant (the
+// migration backfills every existing row), and reconciliation now fails closed
+// on one that does not — a mapping whose activation is unknown admits nobody,
+// scoped to that mapping rather than aborting the run. The loaders below stamp
+// a far-past default so a terse fixture row still represents a REAL enabled
+// mapping; tests that care about the instant set it explicitly.
+const FIXTURE_ACTIVATION_AT = '2000-01-01T00:00:00.000Z';
+function withActivation(rows: EnabledMappingRow[]): EnabledMappingRow[] {
+  return rows.map((r) => ({ activationAt: FIXTURE_ACTIVATION_AT, ...r }));
+}
+
+
 /**
  * Transactional-outbox fake: dedups receipts on (action, id) and ensures one
  * live signal job per enqueue dedupKey (so reconciliation and the webhook
@@ -98,7 +110,7 @@ function enabledMappings(
     calls: 0,
     async listEnabled(): Promise<{ rows: EnabledMappingRow[]; truncated: boolean }> {
       loader.calls += 1;
-      return { rows, truncated };
+      return { rows: withActivation(rows), truncated };
     },
   };
   return loader;
@@ -140,7 +152,9 @@ describe('runReconciliation — recovery + checkpoint safety', () => {
     const lister = scriptedLister([
       { results: [app('app_1', 'stage_ai'), app('app_2', 'stage_ai')], moreDataAvailable: false, syncToken: 'sync_final' },
     ]);
-    const res = await runReconciliation({ client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES });
+    const res = await runReconciliation({
+    // Fence waived: this suite is not about activation admission.
+    admitByHistory: async () => 'admit' as const, client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES });
     expect(res.mode).toBe('full');
     expect(res.stop).toBe('drained');
     expect(res.items).toBe(2);
@@ -161,7 +175,9 @@ describe('runReconciliation — recovery + checkpoint safety', () => {
     const lister = scriptedLister([
       { results: [app('app_x', 'stage_ai')], moreDataAvailable: false, syncToken: 't' },
     ]);
-    const res = await runReconciliation({ client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES });
+    const res = await runReconciliation({
+    // Fence waived: this suite is not about activation admission.
+    admitByHistory: async () => 'admit' as const, client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES });
     expect(res.recovered).toBe(1);
     expect(res.enqueued).toBe(1);
     expect(receipts.liveJobs.size).toBe(1);
@@ -183,7 +199,9 @@ describe('runReconciliation — recovery + checkpoint safety', () => {
       { results: [app('b', 'stage_ai')], moreDataAvailable: true, nextCursor: 'c2' },
       { results: [app('c', 'stage_ai')], moreDataAvailable: false, syncToken: 'final' },
     ]);
-    const res = await runReconciliation({ client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES });
+    const res = await runReconciliation({
+    // Fence waived: this suite is not about activation admission.
+    admitByHistory: async () => 'admit' as const, client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES });
     expect(res.pages).toBe(3);
     expect(res.recovered).toBe(3);
     expect(res.advanced).toBe(true);
@@ -197,7 +215,9 @@ describe('runReconciliation — recovery + checkpoint safety', () => {
       { results: [app('a', 'stage_ai')], moreDataAvailable: true, nextCursor: 'c1' },
       { results: [app('b', 'stage_ai')], moreDataAvailable: true, nextCursor: 'c2' },
     ]);
-    const res = await runReconciliation({ client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES, caps: { maxPages: 1 } });
+    const res = await runReconciliation({
+    // Fence waived: this suite is not about activation admission.
+    admitByHistory: async () => 'admit' as const, client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES, caps: { maxPages: 1 } });
     expect(res.stop).toBe('page_cap');
     expect(res.advanced).toBe(false);
     expect(checkpoints.advances).toHaveLength(0);
@@ -209,7 +229,9 @@ describe('runReconciliation — recovery + checkpoint safety', () => {
     const lister = scriptedLister([
       { results: [app('a', 'stage_ai'), app('b', 'stage_ai'), app('c', 'stage_ai')], moreDataAvailable: false },
     ]);
-    const res = await runReconciliation({ client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES, caps: { maxItems: 2 } });
+    const res = await runReconciliation({
+    // Fence waived: this suite is not about activation admission.
+    admitByHistory: async () => 'admit' as const, client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES, caps: { maxItems: 2 } });
     expect(res.stop).toBe('item_cap');
     expect(res.advanced).toBe(false);
   });
@@ -222,7 +244,9 @@ describe('runReconciliation — recovery + checkpoint safety', () => {
       { results: [app('a', 'stage_ai')], moreDataAvailable: true, nextCursor: 'loop' },
       { results: [app('b', 'stage_ai')], moreDataAvailable: true, nextCursor: 'loop' },
     ]);
-    await expect(runReconciliation({ client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES })).rejects.toThrow(/cursor_loop/);
+    await expect(runReconciliation({
+    // Fence waived: this suite is not about activation admission.
+    admitByHistory: async () => 'admit' as const, client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES })).rejects.toThrow(/cursor_loop/);
     expect(checkpoints.advances).toHaveLength(0);
   });
 
@@ -239,7 +263,9 @@ describe('runReconciliation — recovery + checkpoint safety', () => {
         throw new Error('provider 500');
       },
     };
-    await expect(runReconciliation({ client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES })).rejects.toThrow('provider 500');
+    await expect(runReconciliation({
+    // Fence waived: this suite is not about activation admission.
+    admitByHistory: async () => 'admit' as const, client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES })).rejects.toThrow('provider 500');
     expect(checkpoints.advances).toHaveLength(0);
   });
 
@@ -252,7 +278,9 @@ describe('runReconciliation — recovery + checkpoint safety', () => {
       { results: [app('a', 'stage_ai')], moreDataAvailable: true, nextCursor: 'c1' },
       { results: [app('b', 'stage_ai')], moreDataAvailable: true, nextCursor: 'c2' },
     ]);
-    const res = await runReconciliation({ client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES, caps: { deadlineMs: 1000 }, nowMs });
+    const res = await runReconciliation({
+    // Fence waived: this suite is not about activation admission.
+    admitByHistory: async () => 'admit' as const, client: lister, checkpoints, receipts, mappings: ADMIT_ALL_TEST_STAGES, caps: { deadlineMs: 1000 }, nowMs });
     expect(res.stop).toBe('deadline');
     expect(res.advanced).toBe(false);
   });

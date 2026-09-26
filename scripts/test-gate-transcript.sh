@@ -125,4 +125,11 @@ docker exec "$CTR" psql -U postgres -q -v ON_ERROR_STOP=1 -f /tmp/setup.sql
 log 'asserting the writer, the overload, the once-writer, and the consent-skip invariant...'
 docker exec "$CTR" psql -U postgres -q -v ON_ERROR_STOP=1 -f /tmp/assert.sql
 
+# 0108 rides in the same container: it needs the same "every migration applied
+# to a real Postgres" fixture, and the defect it fixes — a write the CHECK
+# constraint refuses — is invisible to any Supabase fake.
+docker cp "$TESTS/attempt_quarantine_assert.sql" "$CTR:/tmp/quarantine.sql" >/dev/null
+log 'asserting the 0108 attempt-recording quarantine against the real CHECK...'
+docker exec "$CTR" psql -U postgres -q -v ON_ERROR_STOP=1 -f /tmp/quarantine.sql
+
 log 'PASS'

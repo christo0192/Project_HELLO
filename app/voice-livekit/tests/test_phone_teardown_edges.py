@@ -56,7 +56,14 @@ class _ExplodingTerminalClient(fixtures.FakeEventClient):
         self.event_type = event_type
 
     async def post_event(self, attempt_id, event_type, **kwargs):
+        # Record the discard flag BEFORE the transport blows up: the flag is
+        # what tells the server this attempt's audio was destroyed, and a
+        # terminal whose transport fails is exactly when we need to know the
+        # worker still asked for the latch.
         if event_type == self.event_type:
+            self.discard_flags.append(
+                (event_type, bool(kwargs.get("recording_discarded", False))),
+            )
             self.timeline.append(f"event:{event_type}:raised")
             raise RuntimeError("terminal transport failed")
         return await super().post_event(attempt_id, event_type, **kwargs)
@@ -156,7 +163,16 @@ class TestRealGateTeardownEdges(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recorder.discard_count, 1)
         self.assertEqual(recorder.finish_count, 0)
         self.assertEqual(client.item_turns, [])
-        self.assertFalse(any("recording" in item for item in client.timeline))
+        # 0108: the discard is REPORTED, not merely performed locally. Without
+        # the flag the server latched nothing on this terminal and the attempt
+        # reported "processing" forever. (The previous assertion here scanned
+        # `client.timeline` for "recording", a string the fakes never put in
+        # it — it could not fail.)
+        self.assertIn(
+            ("candidate.wrong_number", True),
+            client.discard_flags,
+            client.discard_flags,
+        )
 
     async def test_real_confirmed_identity_mismatch_terminal_failure_discards_once(self):
         result, client, recorder = await self._run_nonconsent(
@@ -168,6 +184,14 @@ class TestRealGateTeardownEdges(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(recorder.discard_count, 1)
         self.assertEqual(recorder.finish_count, 0)
         self.assertEqual(client.item_turns, [])
+        # THE DEFAULT IDENTITY TERMINAL. It posts the same event an ordinary
+        # deferral posts, so the flag is the only thing that tells the server
+        # this attempt's audio is gone.
+        self.assertIn(
+            ("candidate.deferred_pre_disclosure", True),
+            client.discard_flags,
+            client.discard_flags,
+        )
 
     async def test_sdk_close_while_gate_awaits_speech_settles_preconsent_once(self):
         fixtures._FakePhoneSession.instances = []

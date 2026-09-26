@@ -125,6 +125,147 @@ class TestPhoneEvidenceTeardown(unittest.IsolatedAsyncioTestCase):
             client.timeline,
         )
 
+    # ── THE UPLOAD IS NEVER CANCELLED FOR BEING SLOW ──────────────────
+    # A 12s cap on `recorder.finish()` shipped in #311. Inside that window sit
+    # the recorder close, a disk read, the OGG PUT, a PyAV transcode and the
+    # MP3 PUT — and `finish()`'s CancelledError handler runs `_cleanup()`,
+    # which DELETES the local OGG. A real 3.9 MB recording has already lost
+    # that race once (the RCA comment in agent.py). These two tests pin the
+    # replacement behaviour: detach, never cancel, and report what actually
+    # happened when it lands.
+    async def test_a_slow_upload_is_detached_not_cancelled_and_keeps_its_bytes(self):
+        client = fixtures.FakeEventClient()
+        started = asyncio.Event()
+        release = asyncio.Event()
+        state = {"cancelled": False, "uploaded": False}
+
+        class Recorder:
+            def __init__(self, _session):
+                self.active = False
+
+            def wire(self):
+                return True
+
+            async def begin(self, *_args, **_kwargs):
+                self.active = True
+                return True
+
+            async def finish(self, _url):
+                self.active = False
+                started.set()
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    # This is the branch that destroyed evidence: the real
+                    # `finish()` calls `_cleanup()` here and re-raises.
+                    state["cancelled"] = True
+                    raise
+                state["uploaded"] = True
+                return type("Manifest", (), {
+                    "sha256": "sha", "size_bytes": 3, "duration_ms": 7,
+                })()
+
+            async def audio_health_heartbeat(self):
+                await asyncio.Event().wait()
+
+        completed = asyncio.Event()
+
+        async def complete(*_args, **_kwargs):
+            client.timeline.append("recording.completed")
+            completed.set()
+
+        failed = AsyncMock()
+
+        async def gate(**kwargs):
+            await kwargs["wait_for_participant"]()
+            await kwargs["begin_recording_at_answer"]()
+            raise RuntimeError("gate provider failed")
+
+        with patch.object(phone, "run_phone_gate", gate), \
+             patch.object(agent, "PHONE_RECORDING_FINISH_SECONDS", 0.05), \
+             patch.object(agent.recording, "recording_provider", lambda: "worker"), \
+             patch.object(agent.recording, "InWorkerRecorder", Recorder), \
+             patch.object(agent.recording_api, "prepare_recording", AsyncMock(
+                 return_value={"object_key": "phone/test.ogg", "upload_url": "https://put"},
+             )), \
+             patch.object(agent.recording_api, "fail_recording", failed), \
+             patch.object(agent.recording_api, "complete_recording", complete):
+            with self.assertRaisesRegex(RuntimeError, "gate provider failed"):
+                await self._run_session(client=client, close_after=False)
+
+            # The budget expired long ago, and the upload is STILL RUNNING.
+            self.assertTrue(started.is_set())
+            self.assertFalse(state["cancelled"], "the slow upload was cancelled")
+            self.assertFalse(state["uploaded"])
+
+            # Nothing was reported as failed on a mere timeout — that is the
+            # claim that used to be made about an upload still in flight.
+            failed.assert_not_awaited()
+
+            # Let it land: the LATE result is honoured, not discarded.
+            release.set()
+            await asyncio.wait_for(completed.wait(), timeout=2.0)
+
+        self.assertTrue(state["uploaded"])
+        self.assertIn("recording.completed", client.timeline)
+        failed.assert_not_awaited()
+
+    async def test_a_late_upload_that_FAILS_is_reported_as_failed(self):
+        client = fixtures.FakeEventClient()
+        release = asyncio.Event()
+        reported = asyncio.Event()
+
+        class Recorder:
+            def __init__(self, _session):
+                self.active = False
+
+            def wire(self):
+                return True
+
+            async def begin(self, *_args, **_kwargs):
+                self.active = True
+                return True
+
+            async def finish(self, _url):
+                self.active = False
+                await release.wait()
+                raise RuntimeError("object store refused the PUT")
+
+            async def audio_health_heartbeat(self):
+                await asyncio.Event().wait()
+
+        async def failed(*args, **_kwargs):
+            client.timeline.append(f"recording.failed:{args[-1]}")
+            reported.set()
+            return True
+
+        complete = AsyncMock()
+
+        async def gate(**kwargs):
+            await kwargs["wait_for_participant"]()
+            await kwargs["begin_recording_at_answer"]()
+            raise RuntimeError("gate provider failed")
+
+        with patch.object(phone, "run_phone_gate", gate), \
+             patch.object(agent, "PHONE_RECORDING_FINISH_SECONDS", 0.05), \
+             patch.object(agent.recording, "recording_provider", lambda: "worker"), \
+             patch.object(agent.recording, "InWorkerRecorder", Recorder), \
+             patch.object(agent.recording_api, "prepare_recording", AsyncMock(
+                 return_value={"object_key": "phone/test.ogg", "upload_url": "https://put"},
+             )), \
+             patch.object(agent.recording_api, "fail_recording", failed), \
+             patch.object(agent.recording_api, "complete_recording", complete):
+            with self.assertRaisesRegex(RuntimeError, "gate provider failed"):
+                await self._run_session(client=client, close_after=False)
+            release.set()
+            await asyncio.wait_for(reported.wait(), timeout=2.0)
+
+        complete.assert_not_awaited()
+        self.assertTrue(
+            any(item.startswith("recording.failed:") for item in client.timeline),
+            client.timeline,
+        )
+
     async def test_post_consent_exception_posts_aborted_before_room_close(self):
         client = fixtures.FakeEventClient(start=RuntimeError("screen failed"))
         with self.assertRaisesRegex(RuntimeError, "screen failed"):
