@@ -399,6 +399,54 @@ class TestInWorkerRecorderLifecycle(unittest.TestCase):
         self.assertIsNone(_finish(r))
         self.assertEqual(r.finish_failure, "recorder_close_failed")
 
+    def test_synchronous_close_raise_still_cleans_up_and_discard_is_final(self):
+        r, _session, holder = _make()
+        r.wire()
+        _begin(r)
+
+        def broken_close():
+            raise RuntimeError("encoder_wedged_before_coroutine")
+
+        holder["recorder"].aclose = broken_close
+        self.assertIsNone(_finish(r))
+        self.assertEqual(r.finish_failure, "recorder_close_failed")
+        self.assertFalse(r._ogg_path.exists())
+
+        other, _session, holder = _make()
+        other.wire()
+        _begin(other)
+        holder["recorder"].aclose = broken_close
+        _run(other.discard())
+        self.assertFalse(other._ogg_path.exists())
+        self.assertTrue(other._failed)
+
+    def test_hanging_close_uploads_flushed_ogg_without_false_duration(self):
+        """A close that suppresses cancellation cannot erase already-flushed audio."""
+        uploaded = {}
+        r, _session, holder = _make(uploaded=uploaded)
+        r.wire()
+        _begin(r)
+
+        async def suppress_cancel():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                # Model the provider/SDK close that acknowledges cancellation
+                # only after its own cleanup. The finish path must not wait for
+                # that acknowledgement before shipping the OGG.
+                return None
+
+        holder["recorder"].aclose = suppress_cancel
+        with unittest.mock.patch.object(rec, "RECORDER_CLOSE_TIMEOUT_SEC", 0.01):
+            manifest = _finish(r)
+
+        self.assertIsNotNone(manifest)
+        self.assertEqual(manifest.content_type, "audio/ogg")
+        self.assertIsNone(manifest.duration_ms)
+        self.assertEqual(uploaded["content_type"], "audio/ogg")
+        self.assertEqual(uploaded["body"], b"OggS\x00fake-ogg-container-bytes")
+        self.assertEqual(r.finish_failure, "recorder_close_timeout")
+
     def test_finish_failure_is_none_on_success_and_when_never_begun(self):
         ok, _session, _holder = _make()
         ok.wire()
