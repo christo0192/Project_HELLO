@@ -1354,29 +1354,27 @@ describe('0067 — recording starts on an APPLIED call.answered', () => {
 // as correctly opted out.
 // ═══════════════════════════════════════════════════════════════════════
 
-// 0067: the purge set now also covers the two NON-consenting exits that can
-// have pre-consent audio — a machine pickup and a pre-disclosure deferral —
-// because the recording now starts at ANSWER, before consent. The behaviour is
-// identical to the refusals: destroy and verify before the event posts.
+// ── 0105: RECORD FROM ANSWER, KEEP REGARDLESS OF CONSENT ────────────────
+// From 0067 to 0104 the posture was "record from answer, keep only if
+// consented", and five non-consenting exits purged the pre-consent audio
+// before acknowledging. On 2026-09-25 five real candidates were dialled, every
+// call died inside the gate, and afterwards there was no audio and no
+// transcript for any of them. The owner's decision, with legal sign-off
+// (2026-09-26): the recording persists whatever happens at consent. The four
+// exits that are about the CANDIDATE's own consent therefore no longer purge.
 //
-// 0095 RENAMES this list, because the name had been wrong since 0067: the rule
-// was never "terminal". `candidate.deferred_pre_disclosure` lands on `eligible`
-// and has been in this set, non-terminal, for two migrations.
+// A first draft kept `candidate.wrong_number` — a stranger answered. Review
+// showed that on the worker provider that purge could never complete (the
+// attempt carries an `active` SYNTHETIC egress the purge cannot stop), so the
+// terminal never posted and the stranger was dialled again with their audio
+// kept. The stranger case is now the WORKER's: it discards the recording and
+// the buffered gate transcript on a not-the-candidate verdict. The set is
+// EMPTY; the machinery stays for a future admin-driven member.
 //
-// But the rule is not simply "consent was not obtained" either. THE PURGE IS
-// ENGAGEMENT-WIDE — `list_phone_engagement_recordings` enumerates every attempt
-// of the engagement and `clear_phone_attempt_recordings` nulls all their keys —
-// so a member must additionally guarantee that NO SIBLING ATTEMPT holds
-// consented audio. Every member below does, by being pre-consent AND ending the
-// engagement (or deferring it before any consented leg can exist).
-//
-// `consent.failed` was briefly added here and REMOVED after an adversarial
-// review: it is non-terminal, so its engagement can carry an earlier attempt
-// that consented and recorded a real screening, and the engagement-wide purge
-// would delete that recording irreversibly. See the long note on
-// PURGE_BEFORE_EVENTS in routes/phone-worker.ts. Restoring it requires an
-// attempt-scoped purge first.
-const NON_CONSENTING_EXITS = [
+// `consent.failed` was never a member (0095). See the long note on
+// PURGE_BEFORE_EVENTS in routes/phone-worker.ts.
+const PURGING_EXITS = [] as const;
+const RETAINED_GATE_EXITS = [
   'disclosure.refused',
   'candidate.opt_out',
   'candidate.wrong_number',
@@ -1384,22 +1382,47 @@ const NON_CONSENTING_EXITS = [
   'candidate.deferred_pre_disclosure',
 ] as const;
 
-describe('a non-consenting exit purges the recordings BEFORE it is acknowledged', () => {
-  it('the purge set is exactly the five non-consenting exits (record from answer, keep only if consented)', () => {
-    expect([...PURGE_BEFORE_EVENTS].sort()).toEqual([...NON_CONSENTING_EXITS].sort());
+describe('NO worker event purges the recordings any more (0105)', () => {
+  it('the purge set is EMPTY', () => {
+    expect([...PURGE_BEFORE_EVENTS]).toEqual([...PURGING_EXITS]);
   });
 
   it('consent.failed does NOT purge — the purge is engagement-wide and it is not terminal', () => {
-    // Pinned POSITIVELY rather than left to the set comparison above, because
-    // the reasoning is not recoverable from the list: this event DOES leave
-    // un-consented audio, and the only reason it must not purge is that the
-    // purge would reach a SIBLING attempt's consented recording.
     expect(PURGE_BEFORE_EVENTS.has('consent.failed')).toBe(false);
-    // It remains a legal worker event — it just does not purge.
     expect(WORKER_PHONE_EVENTS).toContain('consent.failed');
   });
 
-  for (const event of NON_CONSENTING_EXITS) {
+  for (const event of RETAINED_GATE_EXITS) {
+    it(`${event}: posts the event and touches NO recording (0105)`, async () => {
+      // THE CHANGE, pinned positively per event rather than left to a set
+      // diff: a candidate who hung up, declined, or was classed as a machine
+      // keeps their recording. Nothing is enumerated, nothing is deleted, the
+      // event simply posts.
+      const h = build({ withPurge: true });
+      h.applyEvent.mockResolvedValue(
+        { status: 'applied', applied: true, duplicate: false } as ApplyPhoneEventResult,
+      );
+
+      const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: event });
+
+      expect(res.status).toBe(200);
+      expect(h.purgeRecordings).not.toHaveBeenCalled();
+      expect(h.applyEvent).toHaveBeenCalledTimes(1);
+    });
+
+    it(`${event}: an UNSAFE purge outcome is irrelevant — the event still posts`, async () => {
+      // Before 0105 an unverifiable purge made these a 503. Now the purge is
+      // not consulted, so a broken purge dependency cannot hold a candidate's
+      // deferral or refusal hostage.
+      const h = build({ withPurge: true, purgeStatus: 'still_present', purgeSafe: false });
+      const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: event });
+
+      expect(res.status).toBe(200);
+      expect(h.purgeRecordings).not.toHaveBeenCalled();
+    });
+  }
+
+  for (const event of PURGING_EXITS) {
     it(`${event}: purges first, then posts the event`, async () => {
       const h = build({ withPurge: true });
       const order: string[] = [];
@@ -1420,9 +1443,10 @@ describe('a non-consenting exit purges the recordings BEFORE it is acknowledged'
     });
 
     it(`${event}: an UNSAFE purge posts NOTHING and stays retryable`, async () => {
-      // The whole point. If the deletion could not be verified, the terminal
-      // event — and the suppression that rides in its transaction — must not
-      // commit. A 503 is retryable; a 200 would be an acknowledgement.
+      // The whole point for the one member left. If the deletion could not be
+      // verified, the terminal event — and the suppression that rides in its
+      // transaction — must not commit. A 503 is retryable; a 200 would be an
+      // acknowledgement.
       const h = build({ withPurge: true, purgeStatus: 'still_present', purgeSafe: false });
       const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: event });
 
@@ -1433,34 +1457,38 @@ describe('a non-consenting exit purges the recordings BEFORE it is acknowledged'
   }
 
   for (const status of ['enumeration_failed', 'egress_still_running', 'delete_failed', 'clear_failed']) {
-    it(`does not acknowledge on ${status}`, async () => {
+    it(`a purge that would answer ${status} is never consulted — the wrong number still posts`, async () => {
+      // THE REVIEW FINDING, pinned: with recording from `call.answered`, the
+      // attempt carries an `active` synthetic egress, and the old purge
+      // answered exactly `egress_still_running` here — a 503, no terminal, no
+      // suppression, the stranger redialled. Now the event posts regardless.
       const h = build({ withPurge: true, purgeStatus: status, purgeSafe: false });
       const res = await post(h, '/events', {
         attempt_id: ATTEMPT,
-        event_type: 'candidate.opt_out',
+        event_type: 'candidate.wrong_number',
       });
-      expect(res.status).toBe(503);
-      expect(h.applyEvent).not.toHaveBeenCalled();
+      expect(res.status).toBe(200);
+      expect(h.purgeRecordings).not.toHaveBeenCalled();
+      expect(h.applyEvent).toHaveBeenCalledTimes(1);
     });
   }
 
-  it('a purge that THROWS also posts nothing', async () => {
+  it('a purge that would THROW is never reached either', async () => {
     const h = build({ withPurge: true });
     h.purgeRecordings.mockRejectedValueOnce(new Error('storage exploded'));
-    const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: 'candidate.opt_out' });
+    const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: 'candidate.wrong_number' });
 
-    expect(res.status).toBe(503);
-    expect(h.applyEvent).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(h.purgeRecordings).not.toHaveBeenCalled();
     expect(JSON.stringify(res.body)).not.toContain('exploded');
   });
 
-  it('an engagement that cannot be RESOLVED posts nothing', async () => {
-    // We cannot name what to purge, so we cannot claim it is gone.
+  it('an engagement that cannot be RESOLVED for a purge still posts (nothing is purged)', async () => {
     const h = build({ withPurge: true, engagementState: null });
-    const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: 'candidate.opt_out' });
+    const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: 'candidate.wrong_number' });
 
-    expect(res.status).toBe(503);
-    expect(h.applyEvent).not.toHaveBeenCalled();
+    expect(res.status).toBe(200);
+    expect(h.purgeRecordings).not.toHaveBeenCalled();
   });
 
   it('every OTHER worker event does not purge at all', async () => {
@@ -1469,7 +1497,7 @@ describe('a non-consenting exit purges the recordings BEFORE it is acknowledged'
     // it and nothing else. Deriving the complement from the list (rather than
     // from "is it terminal") is what keeps this honest now that the set
     // contains non-terminal members.
-    for (const event of WORKER_PHONE_EVENTS.filter((e) => !NON_CONSENTING_EXITS.includes(e as never))) {
+    for (const event of WORKER_PHONE_EVENTS.filter((e) => !PURGING_EXITS.includes(e as never))) {
       const h = build({ withPurge: true });
       const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: event });
       expect(res.status).toBe(200);

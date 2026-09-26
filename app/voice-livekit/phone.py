@@ -1363,29 +1363,28 @@ def phone_identity_mismatch_suppresses() -> bool:
     was a worse mistake than the one it was avoiding, for a reason that is only
     visible from the server:
 
-      * the egress starts at ``call.answered``, BEFORE consent (0067's "record
-        from answer, keep only if consented"), and the ONLY thing that destroys
-        that audio is the worker posting an event in ``PURGE_BEFORE_EVENTS``;
-      * ``candidate.wrong_number`` is in that set. Posting nothing left the
-        recording of a person who was never told they were being recorded, and
-        never consented, in the bucket permanently; and
-      * it also left the engagement in ``dialing``, so the lease reaper restored
-        it and the same wrong number was dialled again — repeat-calling the
-        person the suppression exists to stop calling.
+      * posting nothing left the engagement in ``dialing``, so the lease reaper
+        restored it and the same wrong number was dialled again — repeat-calling
+        the person the suppression exists to stop calling; and
+      * (until 0105) the recording of a person who never consented stayed in
+        the bucket, because only a ``PURGE_BEFORE_EVENTS`` member destroyed it.
+        Since 0105 the server purges nothing and the WORKER discards the
+        recording and the buffered gate turns on this verdict
+        (``PhoneGateResult.not_the_candidate``), so that half no longer depends
+        on which event posts.
 
-    So BOTH settings now post a real purging event, and the choice is only
-    whether a suppression is written:
+    So BOTH settings post a real terminal, and the choice is only whether a
+    suppression is written:
 
-      * OFF (DEFAULT) — ``candidate.deferred_pre_disclosure``: purges, ends the
-        attempt uncharged, no suppression, engagement defers to the next IST
-        day. A genuinely wrong number is tried again tomorrow.
-      * ON — ``candidate.wrong_number``: purges, ends the engagement, AND
-        writes the line-level suppression. Undoable only via the 0094 release
-        RPC.
+      * OFF (DEFAULT) — ``candidate.deferred_pre_disclosure``: ends the attempt
+        uncharged, no suppression, engagement defers to the next IST day. A
+        genuinely wrong number is tried again tomorrow.
+      * ON — ``candidate.wrong_number``: ends the engagement AND writes the
+        line-level suppression. Undoable only via the 0094 release RPC.
 
     WHY OFF IS THE DEFAULT, HAVING BRIEFLY BEEN ON. Once the deferral terminal
-    existed, the purge stopped being an argument for suppressing — both paths
-    destroy the pre-consent recording. What is left is the question of evidence,
+    existed, the recording stopped being an argument for suppressing — both
+    paths end the leg the same way. What is left is the question of evidence,
     and the evidence is weaker than it looks: the deterministic backstop that is
     supposed to stop a model ending a call on a name the record supports only
     fires when ``phone_extract_introduced_name`` can pull a name out, and that
@@ -2580,8 +2579,10 @@ class PhoneEventClient:
         text: str,
         source_item_id: str,
         turn_started_at_ms: Optional[int] = None,
+        *,
+        is_gate: bool = False,
     ) -> PhoneApiOutcome:
-        """Persist ONE assessment transcript turn AS IT HAPPENS (0071 / X4).
+        """Persist ONE transcript turn AS IT HAPPENS (0071 / X4; 0105 for the gate).
 
         Best-effort by contract: the durable boundary remains the resume
         authority, so a failure here only means resume re-reads that span from
@@ -2589,8 +2590,14 @@ class PhoneEventClient:
         server's own flag; a duplicate delivery (same ``source_item_id``)
         converges on the original row and is answered ``ok`` with
         ``duplicate=True``. The turn TEXT is never logged.
+
+        ``is_gate`` (0105) flags the pre-consent disclosure / identity / consent
+        exchange so it is persisted the moment it is spoken and kept even when
+        the call dies at the gate — the 2026-09-25 calls left no transcript at
+        all. Sent on the wire ONLY when true, so an assessment turn's body is
+        byte-identical to 0071's.
         """
-        body = {
+        body: dict[str, Any] = {
             "session_id": str(session_id),
             "speaker": str(speaker),
             "text": text,
@@ -2598,6 +2605,8 @@ class PhoneEventClient:
         }
         if turn_started_at_ms is not None:
             body["turn_started_at_ms"] = int(turn_started_at_ms)
+        if is_gate:
+            body["is_gate"] = True
         response = await self._post(ITEM_TURN_PATH, body, "item_turn")
         if isinstance(response, str):
             return PhoneApiOutcome(False, error_category=response)
@@ -5068,17 +5077,17 @@ CLASSIFY_WRONG_NUMBER = "wrong_number"
 #: call without either of the two things `wrong_number` does — and, critically,
 #: because ending one WITHOUT AN EVENT is not an option.
 #:
-#: The server has recorded from `call.answered` since 0067 ("record from answer,
-#: keep only if consented"), and the ONLY thing that destroys that pre-consent
-#: audio is the worker posting an event in `PURGE_BEFORE_EVENTS`
-#: (`phone-worker.ts`). A terminal that posts nothing therefore leaves the
-#: recording of somebody who was never told they were being recorded sitting in
-#: the bucket, AND leaves the engagement in `dialing` for the lease reaper to
-#: restore — so the same person is dialled again. An earlier draft of this
-#: change did exactly that while believing it was the safer option.
+#: The server recorded from `call.answered` from 0067 ("record from answer,
+#: keep only if consented") and, since 0105, KEEPS that audio regardless of
+#: consent (owner decision, legal sign-off, 2026-09-26) — only
+#: `candidate.wrong_number` still purges, because a stranger answered. So the
+#: reason a terminal must post is no longer the audio: a terminal that posts
+#: nothing leaves the engagement in `dialing` for the lease reaper to restore —
+#: so the same person is dialled again. An earlier draft of this change did
+#: exactly that while believing it was the safer option.
 #:
-#: `candidate.deferred_pre_disclosure` is in `PURGE_BEFORE_EVENTS`, is already
-#: in the worker's allowed vocabulary, and 0067 documents it as the member of
+#: `candidate.deferred_pre_disclosure` is already in the worker's allowed
+#: vocabulary, and 0067 documents it as the member of
 #: its branch "that is not a hangup: the candidate answered, said call me
 #: later, and asked for it BEFORE the disclosure" — the attempt ends, nothing is
 #: charged, the engagement leaves `dialing` for `eligible` and defers to the
@@ -5146,10 +5155,10 @@ class PhoneParticipantGone(Exception):
     its 8 s subscription wait, spoke, and crashed.
 
     The crash is the expensive part, not the hang-up. It skips every terminal
-    path, so NO event is posted — which means the pre-consent recording is
-    never purged (only a `PURGE_BEFORE_EVENTS` member destroys it) and the
-    engagement is left in `dialing` for the lease reaper. A dropped call is
-    ordinary; leaving unconsented audio behind because of one is not.
+    path, so NO event is posted — which means the engagement is left in
+    `dialing` for the lease reaper, and (since 0105 records from answer) the
+    recording's upload in the post-gate `finally` never runs either. A dropped
+    call is ordinary; losing its evidence and its outcome because of one is not.
 
     A dedicated type rather than catching `RuntimeError` broadly: the SDK
     raises that for several unrelated conditions, and swallowing all of them
@@ -5285,6 +5294,12 @@ def event_applied(outcome: PhoneApiOutcome) -> bool:
 
 
 class PhoneGateResult:
+    #: 0105. TRUE when the gate concluded the person on the line was NOT the
+    #: candidate — a confirmed identity mismatch (either flag setting) or a
+    #: `wrong_number` classification. The worker reads it to DROP the buffered
+    #: gate transcript and DISCARD the recording: a bystander's words filed
+    #: under the candidate's session have no erasure route (`transcript_turns`
+    #: carries no candidate id), and their voice was never ours to keep.
     """The gate's verdict.
 
     ``assessment_allowed`` and ``recording_allowed`` are both False on every
@@ -5294,6 +5309,7 @@ class PhoneGateResult:
     """
 
     __slots__ = (
+        "not_the_candidate",
         "outcome",
         "assessment_allowed",
         "recording_allowed",
@@ -5335,6 +5351,7 @@ class PhoneGateResult:
         # mid-scoring and the reclaim sweep marked a finished screening
         # `abandoned`). Not a constructor arg — only the coordinator sets it.
         self.scoring_queue_owned = False
+        self.not_the_candidate = False
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         return (
@@ -5681,6 +5698,23 @@ async def run_phone_gate(
     classify: Callable[[], Awaitable[str]],
     say: Callable[[str], Awaitable[Any]],
     start_recording: Optional[Callable[[], Awaitable[Any]]] = None,
+    # 0105: begin CAPTURE the instant `call.answered` is confirmed, before the
+    # disclosure is spoken, so the recording covers the whole call — including
+    # the consent exchange, and including a call that never gets past it. The
+    # owner's decision with legal sign-off (2026-09-26). `start_recording`
+    # keeps its consent-time contract: it still fires after
+    # `disclosure.delivered`, and on a worker that began at answer it is an
+    # idempotent no-op that only logs the permitted moment. Absent ⇒ the
+    # pre-0105 behaviour, byte-identical.
+    begin_recording_at_answer: Optional[Callable[[], Awaitable[Any]]] = None,
+    # 0105: the worker BUFFERS every gate turn as it lands (it may be a
+    # bystander's, see `agent.py` `_flush_gate_transcript`) and this is the
+    # awaitable that persists the buffer (`is_gate=true`). The once-at-consent
+    # writer below awaits it FIRST, so its existence guard sees the per-item
+    # rows and answers `already_recorded` instead of appending a second copy —
+    # and if the per-item path fails (an API that predates the flag answers
+    # 400) the once-writer still lands the last six turns. Absent ⇒ 0067.
+    flush_gate_transcript: Optional[Callable[[], Awaitable[Any]]] = None,
     epoch: int | None = None,
     classify_timeout_sec: float | None = None,
     session_id: str | None = None,
@@ -5821,6 +5855,7 @@ async def run_phone_gate(
 
     async def _terminal_outcome(
         decision: str, *, schema: str | None = None,
+        not_the_candidate: bool = False,
     ) -> PhoneGateResult:
         """Post the outcome event, speak its closing, and return the result.
 
@@ -5860,7 +5895,12 @@ async def run_phone_gate(
             "unknown_event", error_type="phone_gate_outcome",
             schema=schema or decision,
         )
-        return PhoneGateResult(decision, events=events, spoken=spoken)
+        result = PhoneGateResult(decision, events=events, spoken=spoken)
+        # A wrong-number classification IS the "not the candidate" verdict,
+        # whichever path produced it.
+        result.not_the_candidate = bool(
+            not_the_candidate or decision == CLASSIFY_WRONG_NUMBER)
+        return result
 
     async def _commit_gate_turns() -> None:
         """Persist the gate transcript once, best effort. Never fails the gate.
@@ -5869,6 +5909,18 @@ async def run_phone_gate(
         end the call at the identity turn — before the consent block that used
         to own this function even runs.
         """
+        # 0105: flush the per-item gate rows FIRST and AWAIT them, so the
+        # existence guard in `commit_phone_gate_turns` sees them and answers
+        # `already_recorded` rather than appending a second copy. Best effort:
+        # a flush that fails leaves this writer as the fallback it always was.
+        if flush_gate_transcript is not None:
+            try:
+                await flush_gate_transcript()
+            except Exception:  # noqa: BLE001
+                _log.warn(
+                    "unknown_event", error_type="phone_gate_turns_failed",
+                    error_category="per_item_flush_failed",
+                )
         committer = getattr(client, "commit_gate_turns", None)
         if not callable(committer) or session_id is None:
             return
@@ -5965,6 +6017,34 @@ async def run_phone_gate(
         )
         if event_applied(answered) or answered.duplicate:
             events.append("call.answered")
+            # ── 0105: RECORD FROM THE ANSWER ────────────────────────────
+            # Only once the server has the attempt in `answered_unclassified`
+            # (that is what `call.answered` sets, and what
+            # `attach_phone_attempt_recording` admits), and BEFORE a word is
+            # spoken. Best effort, every failure swallowed: a missed begin here
+            # degrades to the consent-time `start_recording`, i.e. to exactly
+            # the coverage every call had before this seam existed.
+            if begin_recording_at_answer is not None:
+                # FIRED, NOT AWAITED — like the lease re-base below, for the
+                # same reason: nothing on the answer→first-word path may wait
+                # on a network hop (#279/#289/#290). Prepare is one HTTP call
+                # over several Supabase round trips; awaiting it here was up to
+                # ~25s of silence before the disclosure — the shape the
+                # 2026-09-25 candidates hung up on. `begin()` is idempotent and
+                # the consent-time `start_recording` is the fallback if this
+                # task loses. Review finding, PR #310.
+                _begin_task = asyncio.ensure_future(begin_recording_at_answer())
+
+                def _begin_done(task: "asyncio.Future[Any]") -> None:
+                    try:
+                        task.result()
+                    except Exception:  # noqa: BLE001 — recording is strictly secondary
+                        _log.warn(
+                            "unknown_event", error_type="phone_recording_begin",
+                            error_category="begin_at_answer_failed",
+                        )
+
+                _begin_task.add_done_callback(_begin_done)
         else:
             _log.warn(
                 "unknown_event", error_type="phone_call_answered_not_applied",
@@ -6243,20 +6323,23 @@ async def run_phone_gate(
         # structured log (`phone_identity_verdict`), which is where the
         # operational evidence belongs; the transcript is not the audit log.
         if phone_identity_mismatch_suppresses():
-            # DEFAULT. `candidate.wrong_number` purges the pre-consent
-            # recording, ends the engagement, and writes the line-level
-            # suppression — all in the same transaction.
+            # `candidate.wrong_number` ends the engagement and writes the
+            # line-level suppression in the same transaction. Since 0105 the
+            # server purges nothing; the WORKER discards the recording and the
+            # buffered gate turns on this verdict (`not_the_candidate`).
             return await _terminal_outcome(
                 CLASSIFY_WRONG_NUMBER, schema="identity_mismatch_confirmed",
             )
-        # Opt-out: the same apology, but the DEFERRAL terminal, so the recording
-        # is still purged and the attempt still ends — just without the
-        # permanent line-level suppression. NEVER silence; see
+        # Opt-out: the same apology, but the DEFERRAL terminal, so the attempt
+        # still ends — just without the permanent line-level suppression. The
+        # recording and the gate turns are discarded by the worker either way
+        # (`not_the_candidate=True` below). NEVER silence; see
         # `phone_identity_mismatch_suppresses` for what posting nothing costs.
         await _say(PHONE_WRONG_NUMBER_TEXT)
         return await _terminal_outcome(
             CLASSIFY_DEFERRED_PRE_DISCLOSURE,
             schema="identity_mismatch_confirmed_unsuppressed",
+            not_the_candidate=True,
         )
 
     # The consent question is the next thing the candidate will hear, so its
@@ -6422,9 +6505,10 @@ async def run_phone_gate(
         without ever being asked a question, and could not be redialled without
         a human noticing.
 
-        `consent.failed` is in `PURGE_BEFORE_EVENTS`, so posting it destroys
-        that audio, and it lands the engagement on `awaiting_retry` rather than
-        a terminal state — the candidate is owed the call we failed to make.
+        `consent.failed` was never in `PURGE_BEFORE_EVENTS` (0095), and since
+        0105 the recording is kept regardless; posting it lands the engagement
+        on `awaiting_retry` rather than a terminal state — the candidate is
+        owed the call we failed to make.
 
         Never `disclosure.refused`: that is the candidate declining, it is
         terminal, and redialling someone who declined is an opt-out breach.

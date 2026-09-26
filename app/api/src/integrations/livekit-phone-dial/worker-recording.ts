@@ -78,6 +78,16 @@ export type WorkerRecordingPrepareStatus =
   (typeof WORKER_RECORDING_PREPARE_STATUSES)[number];
 
 export interface PrepareWorkerRecordingInput {
+  /**
+   * 0105. The engagement's state at prepare time. The SESSION pointer (0051
+   * stamp) is written only when this is `in_call` — i.e. consent was applied —
+   * because `call_sessions` are reused across attempts: a pre-consent clip
+   * that stamped the session would claim the slot, and the consented
+   * screening recorded on a later attempt would upload to a key nothing ever
+   * links (`finalizeAuthoritativeRecording` returns `ready` on the already
+   * linked key). Unknown/absent ⇒ treated as NOT `in_call`.
+   */
+  readonly engagementState?: string | null;
   readonly engagementId: string;
   readonly attemptId: string;
   readonly sessionId: string;
@@ -188,16 +198,24 @@ export async function prepareWorkerRecording(
   // An unstamped recording is UNFINDABLE by the session-keyed read path; the
   // route caller logs a missed stamp loudly (this package is console-free).
   let stampStatus: string;
-  try {
-    const stamped = await deps.stores.stampSessionEgress({
-      sessionId: input.sessionId,
-      attemptId: input.attemptId,
-      egressId,
-      now: input.now,
-    });
-    stampStatus = stamped.status;
-  } catch {
-    stampStatus = 'store_error';
+  if (input.engagementState !== 'in_call') {
+    // 0105: pre-consent. The ATTEMPT is bound (step 1) and will upload to
+    // its own key; the SESSION keeps its slot for the attempt that consents.
+    // The worker's consent-time prepare re-runs this function at `in_call`
+    // and stamps then.
+    stampStatus = 'deferred_until_consent';
+  } else {
+    try {
+      const stamped = await deps.stores.stampSessionEgress({
+        sessionId: input.sessionId,
+        attemptId: input.attemptId,
+        egressId,
+        now: input.now,
+      });
+      stampStatus = stamped.status;
+    } catch {
+      stampStatus = 'store_error';
+    }
   }
 
   // ── STEP 4. Mint the presigned PUT the worker uploads to. ───────────

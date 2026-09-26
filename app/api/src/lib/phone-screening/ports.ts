@@ -983,6 +983,12 @@ export interface PhoneStores {
     readonly text: string;
     readonly sourceItemId: string;
     readonly turnStartedAtMs?: number | null;
+    /**
+     * 0105. TRUE for the pre-consent disclosure/identity/consent exchange,
+     * written as it happens so a call that dies at the gate still has a
+     * transcript. Omitted/false = a scored assessment turn, exactly as 0071.
+     */
+    readonly isGate?: boolean;
     readonly now: Date;
   }): Promise<CommitPhoneItemTurnResult>;
   /** 0060; optional for legacy test doubles until P-3 adopts probes. */

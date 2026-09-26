@@ -1149,6 +1149,11 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
         p_text: input.text,
         p_source_item_id: input.sourceItemId,
         p_turn_started_at_ms: input.turnStartedAtMs ?? null,
+        // 0105. Sent ONLY for a gate turn. A scored turn keeps 0071's exact
+        // wire shape, so a DB-only rollback to the six-argument signature
+        // (PGRST202 on any unknown named argument) breaks gate writes alone —
+        // never the scored transcript this store existed for. Review finding.
+        ...(input.isGate === true ? { p_is_gate: true } : {}),
         p_now: isoInstant(input.now),
       });
       if (error) throw new Error('phone_commit_item_turn_error');

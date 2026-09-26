@@ -650,11 +650,13 @@ class TestGateIdentityFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("candidate.wrong_number", h.events)
         self.assertIn(phone.PHONE_WRONG_NUMBER_TEXT, h.spoken)
 
-    async def test_every_identity_terminal_posts_a_purging_event(self):
+    async def test_every_identity_terminal_posts_a_terminal_event(self):
         # Generalised, because "ends the call without posting anything" is the
-        # shape of the bug, not one instance of it. Every PURGE_BEFORE_EVENTS
-        # member destroys the pre-consent recording; a terminal outside that set
-        # silently keeps it.
+        # shape of the bug, not one instance of it. A terminal that posts
+        # nothing leaves the engagement in `dialing` for the reaper, and the
+        # same wrong number is dialled again. (Until 0105 these two events also
+        # purged the pre-consent audio; the worker now discards it itself on a
+        # not-the-candidate verdict, so what this asserts is the posting.)
         purging = {"candidate.wrong_number", "candidate.deferred_pre_disclosure"}
         for label, replies, verdicts, env in (
             ("mismatch/suppressing", ["No, this is Ravi.", "Wrong number."],
@@ -669,7 +671,7 @@ class TestGateIdentityFlow(unittest.IsolatedAsyncioTestCase):
                 await self._gate(h)
             self.assertTrue(
                 purging & set(h.events),
-                f"{label}: terminal posted no purging event ({h.events})",
+                f"{label}: terminal posted no terminal event ({h.events})",
             )
 
     async def test_no_transcript_is_persisted_before_consent(self):

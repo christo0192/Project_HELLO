@@ -770,3 +770,38 @@ describe('the suppression adapters exist and call their RPCs by name', () => {
   });
 
 });
+
+// ── 0105: the per-item writer carries the gate flag ──────────────────────
+describe('0105 — commitItemTurn forwards p_is_gate, and never infers it', () => {
+  const NOW_ = new Date('2026-09-26T10:00:00Z');
+
+  it('sends p_is_gate: true for a gate turn', async () => {
+    const { client, calls } = fakeClient({ status: 'applied', applied: true, duplicate: false, turn_index: 0 });
+    await createPhoneStores(client).commitItemTurn!({
+      sessionId: 's', speaker: 'bot',
+      text: 'Hi, this call is recorded. Is it okay to continue?',
+      sourceItemId: 'phone-gate-item-1', isGate: true, now: NOW_,
+    });
+    expect(calls[0].name).toBe('commit_phone_item_turn');
+    expect(calls[0].args).toEqual({
+      p_session_id: 's', p_speaker: 'bot',
+      p_text: 'Hi, this call is recorded. Is it okay to continue?',
+      p_source_item_id: 'phone-gate-item-1', p_turn_started_at_ms: null,
+      p_is_gate: true, p_now: NOW_.toISOString(),
+    });
+  });
+
+  it('OMITS p_is_gate for a scored turn — the exact 0071 wire shape survives a DB-only rollback', async () => {
+    // Review finding: an always-present p_is_gate is PGRST202 against the old
+    // six-argument signature on EVERY write, scored turns included. Omitted
+    // when false, only gate writes fail in that window; the interview
+    // transcript keeps landing.
+    const { client, calls } = fakeClient({ status: 'applied', applied: true, duplicate: false, turn_index: 3 });
+    await createPhoneStores(client).commitItemTurn!({
+      sessionId: 's', speaker: 'candidate', text: 'Three years.',
+      sourceItemId: 'phone-item-4', turnStartedAtMs: 1723000000123, now: NOW_,
+    });
+    expect(calls[0].args).not.toHaveProperty('p_is_gate');
+    expect(calls[0].args).toMatchObject({ p_turn_started_at_ms: 1723000000123 });
+  });
+});

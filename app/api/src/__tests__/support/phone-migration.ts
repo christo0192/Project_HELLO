@@ -36,6 +36,19 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+// 0105 re-declares commit_phone_item_turn IN FULL (0071's body plus
+// `p_is_gate`, and the 0071 signature dropped first). It must outrank 0071,
+// or the contract's parameter-order check reads the superseded six-argument
+// signature and the new flag is invisible to the drift tests.
+export const MIGRATION_0105_PATH = fileURLToPath(
+  new URL(
+    '../../../../supabase/migrations/0105_gate_transcript_per_item.sql',
+    import.meta.url,
+  ),
+);
+
+export const MIGRATION_0105 = readFileSync(MIGRATION_0105_PATH, 'utf8');
+
 // 0104 declares defer_phone_dial_for_questions — the dial grace that lets
 // per-candidate question generation finish before the plan is snapshotted.
 // A brand-new function no earlier migration mentions, so its position is not
@@ -264,6 +277,8 @@ export const MIGRATION_0092 = readFileSync(MIGRATION_0092_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0105 — commit_phone_item_turn IN FULL, so it must precede 0071.
+    { name: '0105', sql: MIGRATION_0105 },
     // 0104 — the dial grace (defer_phone_dial_for_questions). New function,
     // no predecessor to supersede.
     { name: '0104', sql: MIGRATION_0104 },
