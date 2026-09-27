@@ -7804,27 +7804,55 @@ async def _run_phone_session(
         gate_pending.clear()
         if not pending:
             return
-        tasks: list[asyncio.Task] = []
+        # ONE AT A TIME, IN SPOKEN ORDER.
+        #
+        # These used to be fired as concurrent tasks and awaited together. The
+        # writes then raced, and the server assigns `turn_index` by arrival —
+        # so the stored gate transcript came back SHUFFLED. The 2026-09-27
+        # owner test is the proof: eight turns written inside 15 ms, with the
+        # candidate's "Hello?" stored above the greeting that prompted it and
+        # the yes/no re-ask above the disclosure it was re-asking.
+        #
+        # That matters more here than anywhere else in the transcript. These
+        # rows exist to evidence WHAT WAS DISCLOSED AND WHEN THE CANDIDATE
+        # AGREED; order is the substance of that claim, and every read path
+        # (`routes/screening.ts`, `routes/candidates.ts`, `routes/export.ts`,
+        # `lib/dsar.ts`) sorts by `turn_index`. A record that cannot show the
+        # disclosure came before the yes does not support the thing it was
+        # built to support.
+        #
+        # Sequential writing costs a handful of round trips. It is not dead
+        # air: the consent-time caller runs underneath the spoken role-opening
+        # line (`phone.py`'s latency mask), and the settle-time caller runs
+        # after the call is over. The overall 5 s bound is preserved, checked
+        # between items rather than across a task set.
+        deadline = time.monotonic() + 5.0
         for speaker, text, anchor_ms, seq in pending:
+            if time.monotonic() >= deadline:
+                _log.warn(
+                    "unknown_event", error_type="phone_item_persist",
+                    error_category="gate_flush_budget_exhausted",
+                )
+                return
             try:
-                tasks.append(asyncio.create_task(_persist_phone_item(
-                    speaker, text, anchor_ms, f"phone-gate-item-{seq}", True)))
+                task = asyncio.create_task(_persist_phone_item(
+                    speaker, text, anchor_ms, f"phone-gate-item-{seq}", True))
             except RuntimeError:
                 return
-        for t in tasks:
-            persist_tasks.add(t)
-            t.add_done_callback(persist_tasks.discard)
-        # Five seconds is generous for a handful of PostgREST round trips and
-        # far short of anything a candidate would notice at a call's end.
-        _done, pending_tasks = await asyncio.wait(tasks, timeout=5.0)
-        if pending_tasks:
-            for task in pending_tasks:
+            persist_tasks.add(task)
+            task.add_done_callback(persist_tasks.discard)
+            # Awaited before the next one is created: the write ORDER is the
+            # speaking order, which is what `turn_index` records.
+            remaining = max(0.0, deadline - time.monotonic())
+            _done, still_running = await asyncio.wait({task}, timeout=remaining)
+            if still_running:
                 task.cancel()
                 task.add_done_callback(_consume_detached_task)
-            _log.warn(
-                "unknown_event", error_type="phone_item_persist",
-                error_category="gate_flush_cancelled",
-            )
+                _log.warn(
+                    "unknown_event", error_type="phone_item_persist",
+                    error_category="gate_flush_cancelled",
+                )
+                return
 
     def _drop_gate_transcript(reason: str) -> None:
         """0105: the gate concluded the speaker was NOT the candidate. Nothing

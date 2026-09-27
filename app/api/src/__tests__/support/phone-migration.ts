@@ -102,6 +102,18 @@ export const MIGRATION_0096 = readFileSync(MIGRATION_0096_PATH, 'utf8');
 // 0072 respectively, then patched), and declares the same-day retry sweep. It
 // must therefore be FIRST in PHONE_MIGRATIONS so `newestContaining` resolves
 // those four to this file rather than to a superseded body.
+export const MIGRATION_0109_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0109_hangup_is_not_a_crash.sql', import.meta.url),
+);
+
+export const MIGRATION_0109 = readFileSync(MIGRATION_0109_PATH, 'utf8');
+
+export const MIGRATION_0108_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0108_attempt_recording_quarantine.sql', import.meta.url),
+);
+
+export const MIGRATION_0108 = readFileSync(MIGRATION_0108_PATH, 'utf8');
+
 export const MIGRATION_0095_PATH = fileURLToPath(
   new URL(
     '../../../../supabase/migrations/0095_phone_call_outcome_hygiene.sql',
@@ -283,6 +295,13 @@ export const MIGRATION_0092 = readFileSync(MIGRATION_0092_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0109 — finalize_phone_partial_sessions IN FULL, so it must precede
+    // 0095. This is the registry's whole point: 0103 was once left out and
+    // `newestContaining` resolved `start_phone_assessment` to a SUPERSEDED
+    // body for two PRs, so every test exercised code production had replaced.
+    { name: '0109', sql: MIGRATION_0109 },
+    // 0108 — attempt-recording quarantine (new function, no predecessor).
+    { name: '0108', sql: MIGRATION_0108 },
     // 0107 — evidence-only pre-consent session binding.
     { name: '0107', sql: MIGRATION_0107 },
     // 0105 — commit_phone_item_turn IN FULL, so it must precede 0071.

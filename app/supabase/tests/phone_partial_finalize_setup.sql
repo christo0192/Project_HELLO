@@ -95,7 +95,7 @@ begin
   -- the one branch the stranded/crash fixtures do NOT exercise. 0072 MUST
   -- select it, drive it to completed/conversation_complete, and report
   -- disconnect_reason='worker_crash' (a lapsed lease in a live state).
-  for v_s in select unnest(array['stranded','control','crash','lease']) loop
+  for v_s in select unnest(array['stranded','control','crash','lease','hangup']) loop
     insert into screening_v2.candidates (role_id, name, email, phone_e164, phone_valid)
     values (v_role, 'pf72 ' || v_s, 'pf72-' || v_s || '@example.test',
             '+9199988' || lpad((abs(hashtext(v_s)) % 100000)::text, 5, '0'), true)
@@ -184,11 +184,11 @@ begin
        ended_at, lease_expires_at)
     values (v_eng, 1, 0, 'initial',
             case
-              when v_s = 'crash' then 'abandoned'
+              when v_s in ('crash','hangup') then 'abandoned'
               when v_s = 'lease' then 'human'
               else 'ended'
             end,
-            case when v_s in ('crash','lease') then null else 'disconnected' end,
+            case when v_s in ('crash','lease','hangup') then null else 'disconnected' end,
             '2026-08-24', 'eligible', v_sess,
             v_now - interval '1200 seconds', v_now - interval '1100 seconds',
             -- ended_at: NULL for the lease case (the attempt never terminalized).
@@ -202,8 +202,28 @@ begin
             case when v_s = 'lease' then v_now - interval '600 seconds'
                  else null end)
     returning id into v_att;
+
+    -- 0109: the HANGUP shape. Identical to `crash` in every column the old
+    -- classifier could see — `abandoned`, outcome NULL — and different in the
+    -- one that matters: the worker FINISHED. It uploaded its object, the
+    -- integrity check passed and the egress completed, which a killed process
+    -- cannot do. Written as an update because the object key is derived from
+    -- the attempt's own id and its format is constrained.
+    if v_s = 'hangup' then
+      update screening_v2.phone_call_attempts
+         set egress_id              = 'EG_worker_' || v_att::text,
+             egress_status          = 'complete',
+             recording_object_key   = 'phone-' || v_att::text || '-egress.ogg',
+             recording_manifest_key = 'phone-' || v_att::text || '-egress.ogg.json',
+             recording_role         = 'authoritative',
+             recording_sha256       = repeat('a', 64),
+             recording_size_bytes   = 4096,
+             recording_content_type = 'audio/ogg',
+             recording_ready        = true
+       where id = v_att;
+    end if;
   end loop;
 
-  raise notice 'pf72: stranded + control + crash engagements ready at %', v_now;
+  raise notice 'pf72: stranded + control + crash + lease + hangup engagements ready at %', v_now;
 end;
 $$;

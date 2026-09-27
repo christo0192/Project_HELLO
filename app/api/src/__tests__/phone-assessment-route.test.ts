@@ -124,6 +124,7 @@ interface Harness {
   commitItemTurn: ReturnType<typeof vi.fn>;
   completeSession: ReturnType<typeof vi.fn>;
   scoreSession: ReturnType<typeof vi.fn>;
+  markCandidateScreening: ReturnType<typeof vi.fn>;
   /** Every seam call, in the order it happened. THE ordering assertion. */
   order: string[];
 }
@@ -137,6 +138,8 @@ function build(options: {
   scoreThrows?: boolean;
   configSource?: NodeJS.ProcessEnv;
   storeThrows?: boolean;
+  /** The candidate-badge hook rejects, to prove it cannot fail the start. */
+  markThrows?: boolean;
 } = {}): Harness {
   const order: string[] = [];
   const startAssessment = vi.fn(async () => {
@@ -185,6 +188,13 @@ function build(options: {
     commitItemTurn,
   } as unknown as PhoneStores;
 
+  // The candidate badge hook. Records its calls and, when the test asks, fails
+  // — because a display update must never be able to fail an interview.
+  const markCandidateScreening = vi.fn(async (sessionId: string) => {
+    order.push(`mark:${sessionId}`);
+    if (options.markThrows) throw new Error('candidates table unavailable');
+  });
+
   const app = express();
   app.use(express.json());
   app.use(
@@ -194,13 +204,14 @@ function build(options: {
       completeSession: completeSession as never,
       scoreSession: scoreSession as never,
       configSource: options.configSource ?? ENABLED,
+      markCandidateScreening,
       now: () => NOW,
     }),
   );
 
   return {
     app, startAssessment, assessmentState, commitQuestionBoundary, commitItemTurn,
-    completeSession, scoreSession, order,
+    completeSession, scoreSession, order, markCandidateScreening,
   };
 }
 
@@ -299,6 +310,35 @@ describe('POST /assessment/start', () => {
     expect(h.startAssessment).toHaveBeenCalledWith({
       attemptId: ATTEMPT, sessionId: SESSION, now: NOW,
     });
+  });
+
+  // ── THE BADGE (2026-09-27) ────────────────────────────────────────
+  // The candidate status was written only by the browser paths, so a phone
+  // screening left it reading "Queued" from the first ring until the scorecard
+  // landed — eleven minutes, in the owner test, while the bot was audibly
+  // interviewing him.
+  it('marks the candidate as screening once the assessment really starts', async () => {
+    const h = build();
+    const res = await post(h, '/assessment/start', START_BODY);
+    expect(res.status).toBe(200);
+    expect(h.markCandidateScreening).toHaveBeenCalledWith(SESSION);
+    // AFTER the RPC: the badge may never claim a screening the database
+    // refused.
+    expect(h.order.indexOf('start')).toBeLessThan(h.order.indexOf(`mark:${SESSION}`));
+  });
+
+  it('does NOT mark the candidate when the start was refused', async () => {
+    const h = build({ start: state({ status: 'session_not_active' }) });
+    const res = await post(h, '/assessment/start', START_BODY);
+    expect(res.body.ok).toBe(false);
+    expect(h.markCandidateScreening).not.toHaveBeenCalled();
+  });
+
+  it('a failed badge update never fails the interview', async () => {
+    const h = build({ markThrows: true });
+    const res = await post(h, '/assessment/start', START_BODY);
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
   });
 
   it('forwards `already_scored`, which is the one refusal that means SUCCESS', async () => {

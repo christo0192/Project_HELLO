@@ -482,6 +482,26 @@ class FakeEventClient:
         return [call[1] for call in self.calls]
 
 
+class _SlowFirstWriteClient(FakeEventClient):
+    """Records item turns, delaying the FIRST one.
+
+    Concurrency bugs do not show up against a fake that answers immediately:
+    every ordering looks the same. Holding the first write back means a
+    concurrent flush necessarily records it LAST, so the assertion on arrival
+    order can actually fail.
+    """
+
+    def __init__(self, *a, **kw) -> None:
+        super().__init__(*a, **kw)
+        self._writes = 0
+
+    async def commit_item_turn(self, *args, **kwargs):
+        self._writes += 1
+        if self._writes == 1:
+            await asyncio.sleep(0.05)
+        return await super().commit_item_turn(*args, **kwargs)
+
+
 class FakeCtx:
     """JobContext stand-in with an inspectable room and connect() call."""
 
@@ -4441,6 +4461,48 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         # copy IS persisted — as `is_gate=True` rows with their own key prefix —
         # and the focused gate-transcript tests below assert that half.)
         self.assertTrue(all(not phone.is_gate_copy(t["text"]) for t in scored))
+
+    async def test_the_gate_transcript_is_written_in_the_order_it_was_SPOKEN(self):
+        """The stored order must be the spoken order.
+
+        These rows used to be written as concurrent tasks, so eight writes
+        raced and the server — which assigns `turn_index` by arrival — stored
+        them shuffled. The 2026-09-27 owner test is the evidence: the
+        candidate's "Hello?" was stored ABOVE the greeting that prompted it,
+        and the yes/no re-ask above the disclosure it was re-asking.
+
+        Order is the substance of what these rows are FOR. They exist to
+        evidence what was disclosed and when the candidate agreed, and every
+        read path sorts by `turn_index`, so a record that cannot show the
+        disclosure came before the yes does not support the claim it was built
+        to support.
+
+        A fake that answers instantly cannot reproduce arrival-order racing, so
+        this client makes the FIRST write the slowest — under the old
+        concurrent flush it would have landed last.
+        """
+        # Candidate-side gate turns as the SDK delivers them, so the gate has
+        # several items to order rather than just the disclosure.
+        _FakePhoneSession.default_gate_user_turns = ["Yes, this is me."]
+        self.addCleanup(
+            setattr, _FakePhoneSession, "default_gate_user_turns", [],
+        )
+        client = _SlowFirstWriteClient()
+        result, client, *_ = await self._run_session(
+            answers=("Yes, that's fine.",), client=client,
+        )
+        self.assertTrue(result.assessment_allowed)
+        gate = [t for t in client.item_turns if t.get("is_gate")]
+        self.assertGreaterEqual(len(gate), 2, "not enough gate rows to order")
+
+        # The item key carries the spoken ordinal. The ORDER THE SERVER SAW
+        # must match it, because that arrival order is what becomes
+        # `turn_index`.
+        seen = [int(t["source_item_id"].rsplit("-", 1)[1]) for t in gate]
+        self.assertEqual(
+            seen, sorted(seen),
+            f"gate turns reached the server out of spoken order: {seen}",
+        )
 
     async def test_0105_gate_turns_are_persisted_per_item_and_flagged(self):
         """0105. The disclosure and every other gate-phase item is written the
