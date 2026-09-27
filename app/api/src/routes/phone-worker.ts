@@ -1497,12 +1497,19 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
       // AFTER the RPC, so this can never assert a screening the database
       // refused; awaited but never fatal, matching the browser path's posture.
       if (deps.markCandidateScreening !== undefined) {
-        try {
-          await deps.markCandidateScreening(parsed.data.session_id);
-        } catch {
-          // Display only. A failure here is not a reason to fail the worker's
-          // start call, which is load-bearing for the interview itself.
-        }
+        // BOUNDED, not merely try/caught. `try` catches a rejection; it does
+        // not catch SLOWNESS — and this handler is what the worker calls
+        // before it asks the first question, so two round trips against a
+        // degraded `candidates` table would be heard as dead air on a live
+        // call. Past the deadline the call proceeds and the badge is simply
+        // late, which is the right trade for a display.
+        await Promise.race([
+          deps.markCandidateScreening(parsed.data.session_id).catch(() => {}),
+          new Promise<void>((resolve) => {
+            const t = setTimeout(resolve, CANDIDATE_BADGE_TIMEOUT_MS);
+            if (typeof t === 'object' && t !== null && 'unref' in t) t.unref();
+          }),
+        ]);
       }
       return res.json({ ok: true, status: 'ok', ...sanitizeAssessmentState(state) });
     } catch {
@@ -2260,11 +2267,23 @@ export async function latchDiscardedWorkerRecording(
 }
 
 /**
+ * How long the candidate-badge write may hold the assessment-start handler.
+ * Short on purpose: past this the interview proceeds and the badge is late.
+ */
+export const CANDIDATE_BADGE_TIMEOUT_MS = 1_500;
+
+/**
  * `queued` -> `screening` for the candidate behind a live phone session.
  *
  * CAS on the source status: a candidate who has already been `screened`,
  * `rejected` or `advanced` must never be dragged backwards by a re-dispatched
- * leg or a second screening, and `new` is not a state a call should overwrite.
+ * leg or a second screening.
+ *
+ * `new` is included alongside `queued` because the project's own transition
+ * table permits it (`schemas/notes.ts`: `new: ['queued','screening']`). Only
+ * Ashby intake writes `queued`, so excluding `new` would have left every
+ * manually-created candidate showing its pre-call status for the whole call —
+ * the exact bug, kept for one population.
  */
 export async function markPhoneCandidateScreening(
   sessionId: string,
@@ -2280,7 +2299,7 @@ export async function markPhoneCandidateScreening(
     .from('candidates')
     .update({ status: 'screening' })
     .eq('id', session.candidate_id)
-    .eq('status', 'queued');
+    .in('status', ['queued', 'new']);
 }
 
 export const phoneWorkerRouter = createPhoneWorkerRouter({

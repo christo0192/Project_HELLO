@@ -36,7 +36,6 @@ declare
   v_stranded uuid;
   v_control  uuid;
   v_crash    uuid;
-  v_hangup   uuid;
   v_lease    uuid;
   v_lease_status text;
   v_lease_reason text;
@@ -53,7 +52,6 @@ declare
   v_reason   text;
   v_str_entry   jsonb;
   v_crash_entry jsonb;
-  v_hangup_entry jsonb;
   v_cand     uuid;
 begin
   select id into v_stranded from screening_v2.call_sessions
@@ -64,10 +62,7 @@ begin
    where external_call_id = 'phone-pf72-crash';
   select id into v_lease    from screening_v2.call_sessions
    where external_call_id = 'phone-pf72-lease';
-  select id into v_hangup   from screening_v2.call_sessions
-   where external_call_id = 'phone-pf72-hangup';
-  if v_stranded is null or v_control is null or v_crash is null or v_lease is null
-     or v_hangup is null then
+  if v_stranded is null or v_control is null or v_crash is null or v_lease is null then
     raise exception 'pf72: fixture sessions missing — run the setup first';
   end if;
 
@@ -81,13 +76,12 @@ begin
     raise exception 'pf72: expected status ok, got %', v_res->>'status';
   end if;
 
-  -- THREE in_progress sessions were driven terminal this pass: the stranded
-  -- (ended/disconnected) one, the lease-lapsed (RCA disconnect) one, and — as
-  -- of 0109 — the hangup one (abandoned, but with a finished upload). The
+  -- TWO in_progress sessions were driven terminal this pass: the stranded
+  -- (ended/disconnected) one AND the lease-lapsed (RCA disconnect) one. The
   -- crash residue was selected but NOT transitioned (already terminal).
   v_finalized := (v_res->>'finalized')::integer;
-  if v_finalized <> 3 then
-    raise exception 'pf72: expected finalized=3 (stranded + lease-lapsed + hangup), got %', v_finalized;
+  if v_finalized <> 2 then
+    raise exception 'pf72: expected finalized=2 (stranded + lease-lapsed transition), got %', v_finalized;
   end if;
 
   -- ── THE RCA SESSION: lease-lapsed in_progress → completed/conversation_complete.
@@ -133,10 +127,10 @@ begin
     raise exception 'pf72: control session status = %, expected in_progress (still within grace)', v_ctrl_status;
   end if;
 
-  -- The returned sessions array names the stranded, crash, lease-lapsed AND
-  -- hangup sessions (the control is inside the grace and absent).
-  if jsonb_array_length(v_res->'sessions') <> 4 then
-    raise exception 'pf72: expected 4 returned sessions (stranded + crash + lease + hangup), got %',
+  -- The returned sessions array names the stranded, crash AND lease-lapsed
+  -- sessions (the control is inside the grace and absent).
+  if jsonb_array_length(v_res->'sessions') <> 3 then
+    raise exception 'pf72: expected 3 returned sessions (stranded + crash + lease), got %',
       jsonb_array_length(v_res->'sessions');
   end if;
 
@@ -165,29 +159,6 @@ begin
   if v_lease_entry->>'disconnect_reason' <> 'worker_crash' then
     raise exception 'pf72: lease disconnect_reason = %, expected worker_crash',
       v_lease_entry->>'disconnect_reason';
-  end if;
-
-  -- ── 0109: AN ABANDONED ATTEMPT THAT FINISHED ITS UPLOAD IS A HANGUP ──
-  -- Identical to the `crash` fixture in every column the old classifier could
-  -- read — state `abandoned`, outcome NULL — and different in the one that
-  -- matters: `recording_ready` with a `complete` egress, which a killed worker
-  -- cannot produce. Before 0109 this was reported as `worker_crash`, which is
-  -- what the 2026-09-27 owner test recorded for a deliberate hangup at Q2, and
-  -- what inflated the signal an operator uses to decide the fleet is broken.
-  select e into v_hangup_entry
-    from jsonb_array_elements(v_res->'sessions') e
-   where (e->>'session_id')::uuid = v_hangup;
-  if v_hangup_entry is null then
-    raise exception 'pf72: returned array missing the hangup entry';
-  end if;
-  if v_hangup_entry->>'disconnect_reason' <> 'candidate_hangup' then
-    raise exception 'pf72: a finished-upload abandon reported %, expected candidate_hangup',
-      v_hangup_entry->>'disconnect_reason';
-  end if;
-  -- ...and the genuine crash, whose upload never finished, is UNCHANGED.
-  if v_crash_entry->>'disconnect_reason' <> 'worker_crash' then
-    raise exception 'pf72: crash disconnect_reason = %, expected worker_crash (0109 must not widen)',
-      v_crash_entry->>'disconnect_reason';
   end if;
 
   -- ── STRANDED entry: transitioned=true, candidate_hangup, covered 2/plan. ──

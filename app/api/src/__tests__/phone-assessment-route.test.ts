@@ -25,6 +25,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import express from 'express';
 import request from 'supertest';
 import {
+  CANDIDATE_BADGE_TIMEOUT_MS,
   createPhoneWorkerRouter,
   sanitizeAssessmentState,
 } from '../routes/phone-worker.js';
@@ -140,6 +141,8 @@ function build(options: {
   storeThrows?: boolean;
   /** The candidate-badge hook rejects, to prove it cannot fail the start. */
   markThrows?: boolean;
+  /** The candidate-badge hook never settles, to prove it cannot stall it. */
+  markHangs?: boolean;
 } = {}): Harness {
   const order: string[] = [];
   const startAssessment = vi.fn(async () => {
@@ -193,6 +196,7 @@ function build(options: {
   const markCandidateScreening = vi.fn(async (sessionId: string) => {
     order.push(`mark:${sessionId}`);
     if (options.markThrows) throw new Error('candidates table unavailable');
+    if (options.markHangs) await new Promise(() => {});
   });
 
   const app = express();
@@ -339,6 +343,17 @@ describe('POST /assessment/start', () => {
     const res = await post(h, '/assessment/start', START_BODY);
     expect(res.status).toBe(200);
     expect(res.body.ok).toBe(true);
+  });
+
+  it('a SLOW badge update does not hold the first question', async () => {
+    // `try/catch` catches a rejection, not slowness — and this handler is what
+    // the worker calls before it speaks. A degraded candidates table must cost
+    // the badge, not the call.
+    const h = build({ markHangs: true });
+    const started = Date.now();
+    const res = await post(h, '/assessment/start', START_BODY);
+    expect(res.status).toBe(200);
+    expect(Date.now() - started).toBeLessThan(CANDIDATE_BADGE_TIMEOUT_MS + 1_000);
   });
 
   it('forwards `already_scored`, which is the one refusal that means SUCCESS', async () => {
