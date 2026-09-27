@@ -198,6 +198,15 @@ PHONE_SHUTDOWN_WATCHDOG_SECONDS = _bounded_float_env(
     "PHONE_SHUTDOWN_WATCHDOG_SECONDS", 8.0, 2.0, 20.0,
 )
 PHONE_TEARDOWN_TERMINAL_RESERVE_SECONDS = 6.0
+# The two gate-transcript flush budgets, named because they are not the same
+# risk. The CONSENT-time flush runs while the role-opening line is spoken — and
+# `_deliver_role_opening` says NOTHING when the role has no title, so on that
+# path the budget is audible silence before the first question. The SETTLE-time
+# flush runs after the call is over, where only completeness matters. Whatever
+# a flush cannot finish stays buffered for the next one, so the tighter bound
+# costs nothing but a later write.
+PHONE_GATE_FLUSH_CONSENT_SECONDS = 2.5
+PHONE_GATE_FLUSH_SETTLE_SECONDS = 5.0
 # THE UPLOAD IS NOT A CLEANUP STEP. Every other bounded operation here is
 # best-effort chatter whose loss costs nothing; `recorder.finish()` is the one
 # that carries the evidence, and it is the SLOWEST — inside it sit the recorder
@@ -7789,7 +7798,9 @@ async def _run_phone_session(
         persist_tasks.add(task)
         task.add_done_callback(persist_tasks.discard)
 
-    async def _flush_gate_transcript() -> None:
+    async def _flush_gate_transcript(
+        budget: float = PHONE_GATE_FLUSH_SETTLE_SECONDS,
+    ) -> None:
         """0105: persist the buffered gate turns, AWAITED, best effort.
 
         Two callers, one contract. The gate calls it at consent, right before
@@ -7801,30 +7812,89 @@ async def _run_phone_session(
         is a no-op. Bounded: a persist that hangs cannot hold the call.
         """
         pending = list(gate_pending)
-        gate_pending.clear()
         if not pending:
             return
-        tasks: list[asyncio.Task] = []
-        for speaker, text, anchor_ms, seq in pending:
-            try:
-                tasks.append(asyncio.create_task(_persist_phone_item(
-                    speaker, text, anchor_ms, f"phone-gate-item-{seq}", True)))
-            except RuntimeError:
-                return
-        for t in tasks:
-            persist_tasks.add(t)
-            t.add_done_callback(persist_tasks.discard)
-        # Five seconds is generous for a handful of PostgREST round trips and
-        # far short of anything a candidate would notice at a call's end.
-        _done, pending_tasks = await asyncio.wait(tasks, timeout=5.0)
-        if pending_tasks:
-            for task in pending_tasks:
-                task.cancel()
-                task.add_done_callback(_consume_detached_task)
+        # THE BUFFER IS NOT CLEARED UP FRONT. It used to be, and with the
+        # concurrent flush that was harmless — every write was already in
+        # flight. Sequenced, it became data loss: a budget that ran out, a
+        # cancelled write or a closing loop returned with turns i+1..N never
+        # ATTEMPTED and no longer buffered, so nothing could recover them.
+        # That is worse than the shuffling this ordering fix exists to
+        # prevent, because a shuffled record is still a record. Each turn is
+        # therefore removed only once it has been attempted, and whatever is
+        # left stays queued for the settle-time caller.
+        # ONE AT A TIME, IN SPOKEN ORDER.
+        #
+        # These used to be fired as concurrent tasks and awaited together. The
+        # writes then raced, and the server assigns `turn_index` by arrival —
+        # so the stored gate transcript came back SHUFFLED. The 2026-09-27
+        # owner test is the proof: eight turns written inside 15 ms, with the
+        # candidate's "Hello?" stored above the greeting that prompted it and
+        # the yes/no re-ask above the disclosure it was re-asking.
+        #
+        # That matters more here than anywhere else in the transcript. These
+        # rows exist to evidence WHAT WAS DISCLOSED AND WHEN THE CANDIDATE
+        # AGREED; order is the substance of that claim, and every read path
+        # (`routes/screening.ts`, `routes/candidates.ts`, `routes/export.ts`,
+        # `lib/dsar.ts`) sorts by `turn_index`. A record that cannot show the
+        # disclosure came before the yes does not support the thing it was
+        # built to support.
+        #
+        # Sequential writing costs a handful of round trips. It is not dead
+        # air: the consent-time caller runs underneath the spoken role-opening
+        # line (`phone.py`'s latency mask), and the settle-time caller runs
+        # after the call is over. The overall 5 s bound is preserved, checked
+        # between items rather than across a task set.
+        deadline = time.monotonic() + max(0.05, budget)
+        written = 0
+
+        def _leave_rest(category: str) -> None:
+            # Whatever was not attempted goes BACK on the buffer, and the log
+            # says how many — "the flush was slow" and "we abandoned four of
+            # the consent turns" must not read the same. (The structural test
+            # bans the word for the other sense of it in this function.)
+            leftover = pending[written:]
+            gate_pending[:] = leftover + [
+                item for item in gate_pending if item not in leftover
+            ]
             _log.warn(
                 "unknown_event", error_type="phone_item_persist",
-                error_category="gate_flush_cancelled",
+                error_category=category, option_count=len(leftover),
             )
+
+        for speaker, text, anchor_ms, seq in pending:
+            if time.monotonic() >= deadline:
+                _leave_rest("gate_flush_budget_exhausted")
+                return
+            try:
+                task = asyncio.create_task(_persist_phone_item(
+                    speaker, text, anchor_ms, f"phone-gate-item-{seq}", True))
+            except RuntimeError:
+                _leave_rest("gate_flush_loop_closing")
+                return
+            persist_tasks.add(task)
+            task.add_done_callback(persist_tasks.discard)
+            # Awaited before the next one is created: the write ORDER is the
+            # speaking order, which is what `turn_index` records. A per-item
+            # floor keeps the LAST item from being handed a zero timeout by a
+            # deadline that has just elapsed.
+            remaining = max(0.25, deadline - time.monotonic())
+            try:
+                _done, still_running = await asyncio.wait({task}, timeout=remaining)
+            except asyncio.CancelledError:
+                # The caller's own bound fired. The write is already in
+                # `persist_tasks`, so the teardown drain can still finish it;
+                # the rest goes back on the buffer.
+                _leave_rest("gate_flush_interrupted")
+                raise
+            if still_running:
+                task.cancel()
+                task.add_done_callback(_consume_detached_task)
+                _leave_rest("gate_flush_cancelled")
+                return
+            written += 1
+        # Everything attempted: drop exactly what was flushed.
+        gate_pending[:] = [item for item in gate_pending if item not in pending]
 
     def _drop_gate_transcript(reason: str) -> None:
         """0105: the gate concluded the speaker was NOT the candidate. Nothing
@@ -9624,7 +9694,14 @@ async def _run_phone_session(
             # 0105: record from the answer; the gate flushes the buffered gate
             # transcript before its once-at-consent writer runs.
             begin_recording_at_answer=_phone_recording_begin_at_answer,
-            flush_gate_transcript=_flush_gate_transcript,
+            # 2.5s, not the settle-time 5s: this one runs while the role
+            # opening is spoken, and `_deliver_role_opening` says NOTHING when
+            # the role has no title — on that path the flush is audible
+            # silence. Nothing is lost by the shorter bound: what does not fit
+            # stays buffered for the settle-time flush.
+            flush_gate_transcript=lambda: _flush_gate_transcript(
+                PHONE_GATE_FLUSH_CONSENT_SECONDS,
+            ),
             set_endpointing_max=(
                 # Fixed-local endpointing only: max_endpointing_delay governs the tail
                 # there. Excluded in dynamic mode (opt-in, off by default) whose

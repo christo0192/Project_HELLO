@@ -510,6 +510,17 @@ export interface PhoneWorkerRouterDeps {
   /** Terminal stranger discard hook; only latches an unmaterialized gate artifact. */
   readonly latchDiscardedRecording?: (attemptId: string) => Promise<void>;
   /**
+   * Move the candidate to `screening` when a PHONE assessment starts.
+   *
+   * The candidate badge was written by the browser paths only
+   * (`routes/livekit.ts`, `routes/screening.ts`), so a phone screening left it
+   * reading "Queued" from the first ring until the scorecard landed — which,
+   * for the 2026-09-27 owner test, meant it said "Queued" for eleven minutes
+   * while the bot was audibly interviewing him. Best-effort by design: the
+   * badge is a display, and no screening should fail because a label did.
+   */
+  readonly markCandidateScreening?: (sessionId: string) => Promise<void>;
+  /**
    * Server-side association check for the worker's SESSION HINT (independent
    * review of the recording ordering fix): a hint is only a room-derivation
    * fallback, and a stale, mismatched or hostile hint must not be able to
@@ -1481,6 +1492,25 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         // rest; this route decides nothing the database has already decided.
         return res.json({ ok: false, status: state.status });
       }
+      // The assessment is live: say so on the candidate, so the badge stops
+      // claiming the person is still queued while they are being interviewed.
+      // AFTER the RPC, so this can never assert a screening the database
+      // refused; awaited but never fatal, matching the browser path's posture.
+      if (deps.markCandidateScreening !== undefined) {
+        // BOUNDED, not merely try/caught. `try` catches a rejection; it does
+        // not catch SLOWNESS — and this handler is what the worker calls
+        // before it asks the first question, so two round trips against a
+        // degraded `candidates` table would be heard as dead air on a live
+        // call. Past the deadline the call proceeds and the badge is simply
+        // late, which is the right trade for a display.
+        await Promise.race([
+          deps.markCandidateScreening(parsed.data.session_id).catch(() => {}),
+          new Promise<void>((resolve) => {
+            const t = setTimeout(resolve, CANDIDATE_BADGE_TIMEOUT_MS);
+            if (typeof t === 'object' && t !== null && 'unref' in t) t.unref();
+          }),
+        ]);
+      }
       return res.json({ ok: true, status: 'ok', ...sanitizeAssessmentState(state) });
     } catch {
       return res.status(500).json({ ok: false, status: 'phone_assessment_error' });
@@ -2236,7 +2266,44 @@ export async function latchDiscardedWorkerRecording(
   }
 }
 
+/**
+ * How long the candidate-badge write may hold the assessment-start handler.
+ * Short on purpose: past this the interview proceeds and the badge is late.
+ */
+export const CANDIDATE_BADGE_TIMEOUT_MS = 1_500;
+
+/**
+ * `queued` -> `screening` for the candidate behind a live phone session.
+ *
+ * CAS on the source status: a candidate who has already been `screened`,
+ * `rejected` or `advanced` must never be dragged backwards by a re-dispatched
+ * leg or a second screening.
+ *
+ * `new` is included alongside `queued` because the project's own transition
+ * table permits it (`schemas/notes.ts`: `new: ['queued','screening']`). Only
+ * Ashby intake writes `queued`, so excluding `new` would have left every
+ * manually-created candidate showing its pre-call status for the whole call —
+ * the exact bug, kept for one population.
+ */
+export async function markPhoneCandidateScreening(
+  sessionId: string,
+  db: typeof supabase = supabase,
+): Promise<void> {
+  const { data: session, error } = await db
+    .from('call_sessions')
+    .select('candidate_id')
+    .eq('id', sessionId)
+    .maybeSingle();
+  if (error || !session?.candidate_id) return;
+  await db
+    .from('candidates')
+    .update({ status: 'screening' })
+    .eq('id', session.candidate_id)
+    .in('status', ['queued', 'new']);
+}
+
 export const phoneWorkerRouter = createPhoneWorkerRouter({
+  markCandidateScreening: (sessionId) => markPhoneCandidateScreening(sessionId),
   // Explicit production wiring enables durable post-call scoring. Test routers
   // that intentionally inject only the legacy scoring seam remain synchronous.
   assessmentQueue: new Queue(new PgAdapter(supabase as never), { defaultMaxAttempts: 5 }),
