@@ -15,13 +15,24 @@ import {
   RevealGroup,
   RevealItem,
   SectionHeader,
+  SlideOver,
   StatusBadge,
   TextArea,
   TextField,
   usePagination,
 } from "../components/design";
+import { buttonClass } from "../components/design";
 import { RoleScorecardEditor } from "../components/roles/RoleScorecardEditor";
 import { AskHelloButton } from "../components/roles/AskHelloButton";
+// The metric library lives in `mission-control/` and STAYS there. It depends on
+// `ConfirmButton` and `statusMeta` from that folder, so relocating it to
+// `roles/` would drag two more components across for a cosmetic win. Mission
+// Control no longer renders it; this page does.
+// Imported from the FILE, not the `mission-control` barrel: the barrel also
+// re-exports AccessSection and friends, and pulling it in would drag the whole
+// Mission Control graph into the Roles chunk for one panel.
+import { ScorebarSection } from "../components/mission-control/ScorebarSection";
+import { useAuth } from "../lib/auth";
 
 interface QuestionRow {
   id: string;
@@ -70,6 +81,17 @@ export function RolesPage() {
   const [roles, setRoles] = useState<Role[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [editing, setEditing] = useState<Role | "new" | null>(null);
+  const [scorebarOpen, setScorebarOpen] = useState(false);
+  // Focus returns HERE on close, and the caller owns it — `SlideOver` explains
+  // why `document.activeElement` is not good enough.
+  const scorebarTrigger = useRef<HTMLButtonElement | null>(null);
+  // ADMIN ONLY, and this is a real gate rather than decoration: every
+  // `/api/scorecards/metrics` route is `requireRole('admin')` server-side, so
+  // for anyone else the drawer would open onto a 403 and a save that cannot
+  // land. Hiding the trigger is the honest version of that fact, not a
+  // permission check we are inventing on the client.
+  const { role: viewerRole } = useAuth();
+  const canEditMetrics = viewerRole === "admin";
 
   const load = useCallback(() => {
     setError(null);
@@ -148,13 +170,43 @@ export function RolesPage() {
         // role that chose a different one.
         description="Define the jobs candidates are screened for and the questions the screening agent will ask."
         actions={
-          editing === null ? (
-            <Button variant="primary" onClick={() => setEditing("new")}>
-              New role
-            </Button>
+          canEditMetrics || editing === null ? (
+            <>
+              {canEditMetrics && (
+                // A plain button, not `<Button>`: that component does not
+                // forward a ref, and `buttonClass` is exported for exactly
+                // this — wearing the same clothes without being the component.
+                <button
+                  ref={scorebarTrigger}
+                  type="button"
+                  className={buttonClass("secondary", "md")}
+                  onClick={() => setScorebarOpen(true)}
+                  aria-haspopup="dialog"
+                  aria-expanded={scorebarOpen}
+                >
+                  Scorebar
+                </button>
+              )}
+              {editing === null && (
+                <Button variant="primary" onClick={() => setEditing("new")}>
+                  New role
+                </Button>
+              )}
+            </>
           ) : undefined
         }
       />
+
+      <SlideOver
+        open={scorebarOpen}
+        onClose={() => setScorebarOpen(false)}
+        idPrefix="scorebar"
+        title="Scorebar"
+        description="Reusable scoring metrics, shared by every role. Editing one publishes a new version; roles already using it keep the copy they saved."
+        returnFocusRef={scorebarTrigger}
+      >
+        <ScorebarSection />
+      </SlideOver>
 
       {editing !== null && (
         <RoleForm

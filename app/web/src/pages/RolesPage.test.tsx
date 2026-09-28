@@ -18,6 +18,17 @@ import { mockRole } from '../test/helpers';
 // catches, so `err instanceof ApiError` holds in the component.
 import { ApiError } from '../api';
 
+// The page reads the viewer's role to decide whether the Scorebar trigger
+// exists at all. Default to a NON-admin here so every pre-existing test sees
+// exactly the header it always saw; the admin-only tests opt in explicitly.
+let mockAuth: { role: string | null };
+
+vi.mock('../lib/auth', () => ({
+  useAuth: () => mockAuth,
+  ALLOWED_EMAIL_DOMAIN: 'interviewkickstart.com',
+  isCompanyEmail: () => true,
+}));
+
 const mockApi = {
   listRoles: vi.fn(),
   createRole: vi.fn(),
@@ -91,6 +102,7 @@ const succeededJob = (over: Record<string, unknown> = {}) => ({
 
 describe('RolesPage', () => {
   beforeEach(() => {
+    mockAuth = { role: 'interviewer' };
     vi.clearAllMocks();
     // Sensible defaults for everything the form mounts, so a test that is
     // about saving does not have to know what else is on the page.
@@ -979,5 +991,79 @@ describe('The screening call is shown in compartments', () => {
     await userEvent.click(await screen.findByRole('button', { name: /edit/i }));
     expect(await screen.findByLabelText('Question 1')).toBeInTheDocument();
     expect(screen.queryByText('Profile relevance')).not.toBeInTheDocument();
+  });
+});
+
+describe('Scorebar — the metric library moved here from Mission Control', () => {
+  // Every describe in this file resets its own mocks. Without it the call
+  // COUNTS leak across tests, which is exactly what the mount test below
+  // asserts on.
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockApi.getRoleScorecard.mockResolvedValue({ scorecard: { metrics: [] } });
+    mockApi.listScorecardMetrics.mockResolvedValue([]);
+    mockApi.getActiveRoleDraft.mockResolvedValue({ active: null });
+  });
+
+  const trigger = () => screen.queryByRole('button', { name: 'Scorebar' });
+
+  it('is INVISIBLE to a non-admin, because the API would refuse them anyway', async () => {
+    // Every `/api/scorecards/metrics` route is `requireRole('admin')`. A
+    // trigger shown to an interviewer opens a drawer onto a 403 and a save
+    // that cannot land, so the control does not exist for them at all.
+    mockAuth = { role: 'interviewer' };
+    mockApi.listRoles.mockResolvedValue([mockRole]);
+    render(<RolesPage />);
+    await screen.findByRole('button', { name: /edit/i });
+    expect(trigger()).toBeNull();
+  });
+
+  it('opens the drawer for an admin and closes it back onto the trigger', async () => {
+    mockAuth = { role: 'admin' };
+    mockApi.listRoles.mockResolvedValue([mockRole]);
+    mockApi.listScorecardMetrics.mockResolvedValue([]);
+    render(<RolesPage />);
+
+    const open = await screen.findByRole('button', { name: 'Scorebar' });
+    // The trigger says what it does before it is pressed.
+    expect(open).toHaveAttribute('aria-haspopup', 'dialog');
+    expect(open).toHaveAttribute('aria-expanded', 'false');
+    expect(screen.queryByRole('dialog')).toBeNull();
+
+    await userEvent.click(open);
+    const panel = await screen.findByRole('dialog');
+    expect(panel).toHaveAccessibleName('Scorebar');
+    expect(screen.getByRole('button', { name: 'Scorebar' })).toHaveAttribute(
+      'aria-expanded',
+      'true',
+    );
+
+    await userEvent.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(screen.getByRole('button', { name: 'Scorebar' })).toHaveFocus();
+  });
+
+  it('stays reachable WHILE editing a role — that is the whole point of the move', async () => {
+    // `New role` is hidden once the form is open. The metric library must not
+    // be, or an admin has to leave a half-written role to reach it.
+    mockAuth = { role: 'admin' };
+    mockApi.listRoles.mockResolvedValue([mockRole]);
+    render(<RolesPage />);
+    await userEvent.click(await screen.findByRole('button', { name: /edit/i }));
+    await screen.findByLabelText('Question 1');
+
+    expect(screen.queryByRole('button', { name: 'New role' })).toBeNull();
+    expect(trigger()).toBeInTheDocument();
+  });
+
+  it('does NOT mount the metric library until the drawer is opened', async () => {
+    // The drawer returns null while closed, so the panel's mount-time fetch
+    // does not run on every visit to this page.
+    mockAuth = { role: 'admin' };
+    mockApi.listRoles.mockResolvedValue([mockRole]);
+    mockApi.listScorecardMetrics.mockResolvedValue([]);
+    render(<RolesPage />);
+    await screen.findByRole('button', { name: 'Scorebar' });
+    expect(mockApi.listScorecardMetrics).not.toHaveBeenCalled();
   });
 });

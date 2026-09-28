@@ -19,6 +19,8 @@ export { ThemeToggle } from './ThemeToggle';
 export type { ThemeToggleProps } from './ThemeToggle';
 export { GlassPanel } from './GlassPanel';
 export type { GlassPanelProps, GlassLevel, GlassPadding } from './GlassPanel';
+export { SlideOver } from './SlideOver';
+export type { SlideOverProps } from './SlideOver';
 export { SectionHeader } from './SectionHeader';
 export type { SectionHeaderProps } from './SectionHeader';
 export { Button, ButtonSpinner, buttonClass } from './Button';
