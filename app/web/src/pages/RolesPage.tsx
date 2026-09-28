@@ -286,53 +286,6 @@ export function RolesPage() {
   );
 }
 
-function PromptPreview({
-  title,
-  jd,
-  skills,
-  instructions,
-  questions,
-}: {
-  title: string;
-  jd: string;
-  skills: string;
-  instructions: string;
-  questions: QuestionRow[];
-}) {
-  const questionLines = questions
-    .filter((q) => q.question.trim())
-    .map((q, i) => `${i + 1}. ${q.question.trim()}`);
-  const focus = jd.trim() || skills.trim() || "Use the role requirements provided by the recruiter.";
-  const prompt = [
-    `You are conducting a first-round screening interview for ${title.trim() || "this role"}.`,
-    "Interview conversationally, ask one question at a time, and adapt follow-ups to the candidate's answers.",
-    `Role focus: ${focus}`,
-    instructions.trim() ? `Recruiter guidance: ${instructions.trim()}` : "Recruiter guidance: none provided.",
-    "Flow: opening → relevant experience → role evidence → one realistic scenario → logistics → candidate questions → closing.",
-    questionLines.length ? `Recruiter questions:\n${questionLines.join("\n")}` : "Recruiter questions: none; generate role-specific questions from the focus.",
-    "Do not ask protected or sensitive questions, reveal scores, promise a hiring outcome, or invent company facts.",
-  ].join("\n\n");
-
-  return (
-    <div className="glass-sunken p-4">
-      <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-        <p className="text-[13px] font-medium text-ink-secondary">
-          Generated voice prompt preview
-        </p>
-        <span className="text-xs text-ink-tertiary">updates as you edit</span>
-      </div>
-      <pre
-        role="region"
-        aria-label="Generated voice prompt preview"
-        tabIndex={0}
-        className="max-h-72 overflow-auto whitespace-pre-wrap rounded-control bg-white/70 p-3 font-mono text-xs leading-5 text-ink-secondary focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
-      >
-        {prompt}
-      </pre>
-    </div>
-  );
-}
-
 function RoleForm({
   role,
   onCancel,
@@ -345,9 +298,9 @@ function RoleForm({
   const [title, setTitle] = useState(role?.title ?? "");
   const [agentName, setAgentName] = useState(role?.agent_name ?? "");
   const [jd, setJd] = useState(role?.jd ?? "");
-  const [interviewerInstructions, setInterviewerInstructions] = useState(
-    role?.interviewer_instructions ?? "",
-  );
+  // Read-only on this form since the textarea was removed: the value is
+  // still submitted, so an existing role keeps what it was saved with.
+  const [interviewerInstructions] = useState(role?.interviewer_instructions ?? "");
   const [skillsText, setSkillsText] = useState(
     role?.required_skills.join(", ") ?? "",
   );
@@ -786,10 +739,8 @@ function RoleForm({
                       {questionTag(q.category, q.id, idx)}
                     </span>
                     <div className="flex items-center gap-1">
-                      <Button
+                      <button
                         type="button"
-                        variant="ghost"
-                        size="sm"
                         onClick={() => void rephrase(idx)}
                         // `aria-disabled`, NOT `disabled`, and the handler
                         // guards — the idiom `AskHelloButton` already uses
@@ -820,9 +771,27 @@ function RoleForm({
                             ? `Rephrasing question ${idx + 1}…`
                             : `Rephrase question ${idx + 1}`
                         }
+                        // The Ask Hello pill, verbatim. Both buttons on this
+                        // form ask a model for words; looking alike is the
+                        // point. NO `opacity-*` in this list — see
+                        // `AskHelloButton` for the measurement: fading the
+                        // pill fades the white label with it and drops it
+                        // under 4.5:1, and the faded state here is exactly
+                        // the one the operator is waiting on.
+                        className={`ask-hello relative inline-flex min-h-11 items-center gap-2 overflow-hidden rounded-full px-5 text-sm font-semibold text-white focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info ${
+                          rephrasingIdx !== null || !q.question.trim()
+                            ? 'ask-hello--idle cursor-not-allowed'
+                            : ''
+                        }${rephrasingIdx === idx ? ' cursor-progress' : ''}`}
                       >
-                        {rephrasingIdx === idx ? "Rephrasing…" : "Rephrase"}
-                      </Button>
+                        <span aria-hidden="true" className="ask-hello__sheen" />
+                        <span aria-hidden="true" className="relative">
+                          {rephrasingIdx === idx ? '◐' : '✦'}
+                        </span>
+                        <span className="relative">
+                          {rephrasingIdx === idx ? "Rephrasing…" : "Rephrase"}
+                        </span>
+                      </button>
                       <Button
                         type="button"
                         variant="ghost"
@@ -835,7 +804,7 @@ function RoleForm({
                       </Button>
                     </div>
                   </div>
-                  <div className="flex flex-col gap-3 sm:flex-row sm:items-start">
+                  <div className="flex flex-col gap-3">
                     <Field
                       className="min-w-0 flex-1"
                       label={`Question ${idx + 1}`}
@@ -863,25 +832,6 @@ function RoleForm({
                         />
                       )}
                     </Field>
-                    <Field
-                      className="sm:w-24"
-                      label="Weight"
-                      id={`role-question-${idx}-weight`}
-                    >
-                      {({ id }) => (
-                        <TextField
-                          id={id}
-                          type="number"
-                          min={0}
-                          step={1}
-                          value={q.weight}
-                          onChange={(e) =>
-                            updateQuestion(idx, { weight: Number(e.target.value) })
-                          }
-                          title="Weight"
-                        />
-                      )}
-                    </Field>
                   </div>
                 </div>
                 </div>
@@ -889,31 +839,6 @@ function RoleForm({
             })}
           </div>
         </div>
-
-        <Field
-          label="Interviewer instructions"
-          id="role-instructions"
-          hint="This is included in the generated voice prompt and remains editable."
-        >
-          {({ id, describedBy }) => (
-            <TextArea
-              id={id}
-              aria-describedby={describedBy}
-              value={interviewerInstructions}
-              onChange={(e) => setInterviewerInstructions(e.target.value)}
-              rows={5}
-              placeholder="Optional guidance: what good evidence looks like, which probes to prioritize, and what the interviewer should avoid…"
-            />
-          )}
-        </Field>
-
-        <PromptPreview
-          title={title}
-          jd={jd}
-          skills={skillsText}
-          instructions={interviewerInstructions}
-          questions={questions}
-        />
 
         {formError && (
           <InlineNotice tone="danger" role="alert">
