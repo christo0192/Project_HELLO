@@ -478,3 +478,36 @@ body .text-red-700 { color: var(--error-text); }
     opacity: 0;
   }
 }
+
+/* SlideOver — the drawer travels in from the right edge.
+   `transform` and `opacity` only: both are compositor-driven, so opening the
+   drawer over a long roles list does not relayout the page behind the
+   backdrop. */
+@keyframes slide-over-in {
+  from {
+    transform: translateX(2rem);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+.slide-over-panel {
+  animation: slide-over-in 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* The drawer still APPEARS — only the travel is dropped, and the animation is
+   removed rather than merely paused. `animation: none` alone would be wrong
+   here: the `both` fill mode holds the FIRST keyframe, which would park the
+   panel 2rem off-target at `opacity: 0` — an invisible drawer for exactly the
+   users this rule exists to serve. The two resets below are what actually
+   put it in place. */
+@media (prefers-reduced-motion: reduce) {
+  .slide-over-panel {
+    animation: none;
+    transform: none;
+    opacity: 1;
+  }
+}

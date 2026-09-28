@@ -34,12 +34,15 @@ import {
   MissionControlSections,
   OverviewSection,
   QuotasSection,
-  ScorebarSection,
   SessionsSection,
 } from '../components/mission-control';
 import { CalendarIcon } from '../components/navigation';
 
-const SECTION_IDS = ['overview', 'access', 'sessions', 'quotas', 'scorebar', 'funnel', 'audit', 'maintenance'] as const;
+// `scorebar` is deliberately absent: the metric library moved to the Roles
+// page, where the person editing a role can reach it without changing pages.
+// An old `#scorebar` bookmark falls through `sectionFromHash` to `overview`
+// rather than 404-ing, which is the right failure for a deep link.
+const SECTION_IDS = ['overview', 'access', 'sessions', 'quotas', 'funnel', 'audit', 'maintenance'] as const;
 type SectionId = (typeof SECTION_IDS)[number];
 
 function sectionFromHash(hash: string): SectionId {
@@ -140,7 +143,6 @@ export function MissionControlPage() {
           { id: 'access', label: 'Access', render: () => <AccessSection /> },
           { id: 'sessions', label: 'Sessions', render: () => <SessionsSection /> },
           { id: 'quotas', label: 'Quotas', render: () => <QuotasSection /> },
-          { id: 'scorebar', label: 'Scorebar', render: () => <ScorebarSection /> },
           { id: 'funnel', label: 'Funnel', render: () => <FunnelSection /> },
           { id: 'audit', label: 'Audit', render: () => <AuditSection /> },
           { id: 'maintenance', label: 'Maintenance', render: () => <MaintenanceSection /> },
