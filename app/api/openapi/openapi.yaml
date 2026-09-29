@@ -532,6 +532,115 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
 
+  /api/scorecards/metrics/draft:
+    post:
+      tags: [scorecards]
+      operationId: draftScorecardMetric
+      summary: Ask Hello to draft a metric's scoring instruction and 1-4 rubric from its name and description (admin only)
+      description: Synchronous, like /api/roles/questions/rephrase - one short generation, retried once with the failure quoted back. The name and description are treated as untrusted data, fenced in the prompt. The answer is checked against the same length bounds the create route enforces and is never truncated. WRITES NOTHING - the draft goes back to the form, and the admin creates the metric through POST /api/scorecards/metrics. Model-invoking, so it takes the strict per-user rate-limit bucket.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [name]
+              properties:
+                name:
+                  type: string
+                  minLength: 1
+                  maxLength: 100
+                description:
+                  type: string
+                  nullable: true
+                  maxLength: 500
+      responses:
+        '200':
+          description: The drafted scoring instruction and four-level rubric, checked against the create route's bounds.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [default_instruction, rubric]
+                properties:
+                  default_instruction:
+                    type: string
+                    minLength: 1
+                    maxLength: 1000
+                  rubric:
+                    type: object
+                    additionalProperties: false
+                    description: Four-level rubric object; 1 Poor, 2 Average, 3 Good, 4 Excellent.
+                    required: ['1', '2', '3', '4']
+                    properties:
+                      '1':
+                        type: string
+                        minLength: 1
+                        maxLength: 500
+                      '2':
+                        type: string
+                        minLength: 1
+                        maxLength: 500
+                      '3':
+                        type: string
+                        minLength: 1
+                        maxLength: 500
+                      '4':
+                        type: string
+                        minLength: 1
+                        maxLength: 500
+        '400':
+          description: Request validation failed (empty or over-long name, over-long description, or an unknown field).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '401':
+          description: Unauthenticated.
+        '403':
+          description: Authenticated but not an admin (the metric library is admin-only).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthErrorBody'
+        '422':
+          description: Hello could not produce a usable draft. `error.details.reason` is one of invalid_output, output_too_long, timeout or provider_error, and `error.message` is operator-facing copy. Nothing was written.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [error]
+                properties:
+                  error:
+                    type: object
+                    additionalProperties: false
+                    required: [type, message, details]
+                    properties:
+                      type:
+                        type: string
+                        enum: [unprocessable_entity]
+                      message:
+                        type: string
+                      details:
+                        type: object
+                        additionalProperties: false
+                        required: [reason]
+                        properties:
+                          reason:
+                            type: string
+                            enum: [invalid_output, output_too_long, timeout, provider_error]
+        '429':
+          description: Rate limited. This route is model-invoking and takes the strict per-user bucket.
+        '500':
+          description: Internal error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+
   /api/scorecards/metrics/{id}:
     parameters:
       - name: id

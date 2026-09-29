@@ -100,6 +100,8 @@ import type {
   RedistributeWeightsResponse,
   RoleScorecardResponse,
   ScorecardMetricCreateInput,
+  ScorecardMetricDraft,
+  ScorecardMetricDraftInput,
   ScorecardMetricTemplate,
   ScorecardMetricUpdateInput,
   SessionDetail,
@@ -798,6 +800,18 @@ export const api = {
     request<ScorecardMetricTemplate>(`/api/scorecards/metrics/${encodeURIComponent(id)}/archive`, {
       method: 'POST',
       body: JSON.stringify({}),
+    }),
+  /**
+   * Ask Hello: draft a metric's scoring instruction and 1-4 rubric from its
+   * name and description. Synchronous, like `rephraseQuestion`, and it SAVES
+   * NOTHING — the caller fills the form and the admin still presses Create. A
+   * 422 carries operator-facing copy in its message; 429 means the strict
+   * model-invoking bucket is empty.
+   */
+  draftMetricRubric: (body: ScorecardMetricDraftInput) =>
+    request<ScorecardMetricDraft>('/api/scorecards/metrics/draft', {
+      method: 'POST',
+      body: JSON.stringify(body),
     }),
 
   getRoleScorecard: (roleId: string) =>

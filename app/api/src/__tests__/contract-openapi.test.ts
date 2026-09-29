@@ -1132,7 +1132,12 @@ describe('OpenAPI document integrity', () => {
     // 0109 adds ONE admin action — POST .../mission-control/mappings/{id}/
     // archive, Mission Control's "Delete", which archives a paused mapping
     // and keeps its history. 141 + 1 = 142.
-    expect(Object.keys(paths).length).toBe(142);
+    // Ask Hello on the Scorebar adds ONE admin path — POST
+    // /api/scorecards/metrics/draft, which drafts a metric's scoring
+    // instruction and 1-4 rubric from its name and description and writes
+    // nothing. Its bodies are documented inline, so the schema count below is
+    // unchanged. 142 + 1 = 143.
+    expect(Object.keys(paths).length).toBe(143);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas

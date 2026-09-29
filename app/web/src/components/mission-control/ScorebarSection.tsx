@@ -38,6 +38,7 @@ import {
   usePagination,
 } from '../design';
 import { ConfirmButton } from './ConfirmButton';
+import { MetricAskHello } from './MetricAskHello';
 import { stableMutationMessage } from './statusMeta';
 
 const SCORE_VALUES: ScoreValue[] = [1, 2, 3, 4];
@@ -147,6 +148,11 @@ export function ScorebarSection() {
   }
   function setDraftRubric(level: ScoreValue, value: string) {
     setDraft((prev) => ({ ...prev, rubric: { ...prev.rubric, [level]: value } }));
+  }
+  /** Ask Hello's draft fills the create form; nothing is saved. */
+  function applyHelloDraft(instruction: string, rubric: RubricDraft) {
+    setDraft((prev) => ({ ...prev, instruction, rubric: { ...rubric } }));
+    setCreateIssue(null);
   }
   function setEditField<K extends keyof MetricDraft>(key: K, value: MetricDraft[K]) {
     setEditDraft((prev) => ({ ...prev, [key]: value }));
@@ -358,6 +364,9 @@ export function ScorebarSection() {
             onField={setDraftField}
             onRubric={setDraftRubric}
             issue={createIssue}
+            instructionAction={
+              <MetricAskHello idPrefix="new-metric" draft={draft} onApply={applyHelloDraft} />
+            }
             footer={
               <Button variant="primary" onClick={createMetric}>
                 Create metric
@@ -377,6 +386,7 @@ function MetricFields({
   onRubric,
   issue,
   footer,
+  instructionAction,
 }: {
   idPrefix: string;
   draft: MetricDraft;
@@ -384,6 +394,8 @@ function MetricFields({
   onRubric: (level: ScoreValue, value: string) => void;
   issue: string | null;
   footer: React.ReactNode;
+  /** Right-aligned above the Scoring instruction — the CREATE form's Ask Hello only. */
+  instructionAction?: React.ReactNode;
 }) {
   return (
     <div className="glass-sunken space-y-4 rounded-[14px] p-4">
@@ -412,6 +424,8 @@ function MetricFields({
           )}
         </Field>
       </div>
+
+      {instructionAction && <div className="flex justify-end">{instructionAction}</div>}
 
       <Field
         label="Scoring instruction"

@@ -551,6 +551,22 @@ export interface ScorecardMetricUpdateInput {
   rubric?: ScorecardRubric;
 }
 
+/** Ask Hello on the Add-a-metric form: what the admin has typed so far. */
+export interface ScorecardMetricDraftInput {
+  name: string;
+  description: string | null;
+}
+
+/**
+ * Ask Hello's draft (POST /api/scorecards/metrics/draft). Already checked
+ * server-side against the create bounds; nothing is saved until the admin
+ * presses Create.
+ */
+export interface ScorecardMetricDraft {
+  default_instruction: string;
+  rubric: ScorecardRubric;
+}
+
 /** Immutable per-role metric snapshot (camelCase, as the role API returns it). */
 export interface RoleScorecardMetric {
   id: string;

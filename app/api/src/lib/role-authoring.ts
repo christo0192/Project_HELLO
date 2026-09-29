@@ -273,7 +273,17 @@ export interface RoleDraftResult {
 export class RoleDraftError extends Error {
   constructor(
     message: string,
-    readonly reason: 'unusable_output' | 'unspeakable_questions' | 'cancelled',
+    readonly reason:
+      | 'unusable_output'
+      | 'unspeakable_questions'
+      | 'cancelled'
+      // Ask Hello on the Scorebar's metric form (`scorecards/metric-draft.ts`).
+      // Shares this class so both "Hello could not" answers reach the client
+      // through the same 422 shape; role drafting never raises these.
+      | 'invalid_output'
+      | 'output_too_long'
+      | 'timeout'
+      | 'provider_error',
     readonly detail?: readonly string[],
     /**
      * Attempts actually spent. Carried so the job row can record it: without
