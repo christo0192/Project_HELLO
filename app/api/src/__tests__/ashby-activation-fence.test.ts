@@ -332,7 +332,10 @@ it('rejects future and conflicting open history, while requiring complete pagina
 // `application.listHistory` (6 × `job_dlq`, 5/5 attempts each), because the
 // row for the stage the application is IN carries no `leftStageAt` key at all.
 // Every fixture above writes `leftStageAt: null` explicitly, which is why CI
-// never saw it. These rows mirror the live shape, extra fields included.
+// never saw it. These rows RECONSTRUCT the inferred live shape (no payload was
+// captured): the current-stage row carries no `leftStageAt` key, closed rows
+// carry a string. If closed rows turn out to lack it too, the fence fails
+// closed with `ashby_history_ambiguous` (see the fail-closed cases below).
 function liveRow(stageId: string, enteredStageAt: string, leftStageAt?: string): OpaqueRecord {
   const row: OpaqueRecord = { id: `h_${stageId}_${enteredStageAt}`, stageId, title: 'Stage', enteredStageAt, stageNumber: 0, allowedActions: [] };
   if (leftStageAt !== undefined) row.leftStageAt = leftStageAt;

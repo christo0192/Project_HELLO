@@ -49,11 +49,15 @@ export async function admitStageAfterActivation(
       const entered = Date.parse(row.enteredStageAt);
       if (!Number.isFinite(entered) || entered > now) throw new Error('ashby_history_entry_time_invalid');
       // An ABSENT `leftStageAt` means "has not left". Ashby's published schema
-      // says the key is always present (null for the current stage), but the
-      // live API omits it on that row: treating absence as an error
-      // dead-lettered every fenced admission in production (2026-09-29). This
-      // cannot widen admission — the exactly-one-open-interval rule below still
-      // rejects any history where more than one row lacks an exit.
+      // says the key is always present (null for the current stage), yet in
+      // production every fenced admission dead-lettered with the old
+      // `exit_time_missing` error after a 200 from this call (2026-09-29).
+      // INFERRED, not captured: the live API drops the null key on the
+      // current-stage row. If closed rows lacked it too, those rows would
+      // count as open and the rule below throws `ashby_history_ambiguous` —
+      // still fail-closed, and that error code is how production would say so.
+      // This cannot widen admission: exactly one open interval, on the target
+      // stage, is still required.
       const left = Object.prototype.hasOwnProperty.call(row, 'leftStageAt') ? row.leftStageAt : null;
       if (left !== null && typeof left !== 'string') throw new Error('ashby_history_exit_time_malformed');
       const leftMs = left === null ? null : Date.parse(left);
