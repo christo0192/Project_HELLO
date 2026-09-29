@@ -1,17 +1,17 @@
 /**
  * Button — the shell's action control.
  *
- * Five variants, three sizes, press feedback via a CSS scale transition
+ * Six variants, three sizes, press feedback via a CSS scale transition
  * (collapses under reduced motion through the global media rule). Pure CSS
  * on purpose: buttons are the hottest primitive in the app and a motion
  * element per button made typed-input tests measurably slower in jsdom.
  * `buttonClass()` is exported so router `<Link>`s can wear the same clothes
  * without becoming buttons.
  */
-import type { ButtonHTMLAttributes, ReactNode } from 'react';
+import type { ButtonHTMLAttributes, ReactNode, Ref } from 'react';
 import { cx } from './cx';
 
-export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'go';
+export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'danger-quiet' | 'go';
 export type ButtonSize = 'sm' | 'md' | 'lg';
 
 const base =
@@ -40,6 +40,15 @@ const variants: Record<ButtonVariant, string> = {
      in global-palette.test.ts. */
   go:
     'bg-[var(--go)] text-white shadow-pill hover:bg-[var(--go-strong)] active:bg-[var(--go-strong)]',
+  /* A destructive action that is not the point of its surface — "Archive"
+     beside "Edit". Red text on the glass, filling only on hover; the filled
+     `danger` is kept for the confirmation step itself. The text token, not
+     the fill, because small text never uses `--error` directly (design
+     system rule 4). */
+  // The outline is the full `--error` (≈4.9:1 on white): a control boundary
+  // must clear 3:1 (design system rule 5), which a faint tint did not.
+  'danger-quiet':
+    'bg-white/70 text-error-text shadow-[inset_0_0_0_1px_var(--error)] hover:bg-error-soft',
 };
 
 const sizes: Record<ButtonSize, string> = {
@@ -59,6 +68,12 @@ export function buttonClass(
 }
 
 export interface ButtonProps extends Omit<ButtonHTMLAttributes<HTMLButtonElement>, 'children'> {
+  /**
+   * Reaches the native `<button>` (e.g. a focus-return target). React 19
+   * passes `ref` to a function component as an ordinary prop, so the `...rest`
+   * spread below forwards it; this line only lets the type checker see it.
+   */
+  ref?: Ref<HTMLButtonElement>;
   variant?: ButtonVariant;
   size?: ButtonSize;
   loading?: boolean;

@@ -44,11 +44,11 @@ import type {
 } from '../../types';
 import {
   Button,
+  Combobox,
   Field,
   GlassPanel,
   InlineNotice,
   SectionHeader,
-  SelectField,
   TextField,
   TextArea,
 } from '../design';
@@ -112,6 +112,7 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
   const [loadError, setLoadError] = useState<string | null>(null);
   const [library, setLibrary] = useState<ScorecardMetricTemplate[] | null>(null);
   const [libraryForbidden, setLibraryForbidden] = useState(false);
+  const [libraryFailed, setLibraryFailed] = useState(false);
   const [addSelection, setAddSelection] = useState('');
   /**
    * In-progress text per metric weight box, keyed by metric id.
@@ -162,6 +163,8 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
 
   const loadLibrary = useCallback(() => {
     setLibraryForbidden(false);
+    setLibraryFailed(false);
+    setLibrary(null);
     api
       .listScorecardMetrics()
       .then((rows) => setLibrary(rows))
@@ -171,10 +174,12 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
         // new ones is unavailable to them.
         if (e.status === 403) {
           setLibraryForbidden(true);
-          setLibrary([]);
         } else {
-          setLibrary([]);
+          // Said as a failure, with a retry — an empty picker reading "No more
+          // metrics to add" would be a false statement about the library.
+          setLibraryFailed(true);
         }
+        setLibrary([]);
       });
   }, []);
 
@@ -182,6 +187,27 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
     load();
     loadLibrary();
   }, [load, loadLibrary]);
+
+  /**
+   * "Try again" for the library. Its button unmounts the moment the read
+   * starts (the picker shows "Loading…"), so focus is parked on the picker's
+   * trigger once the read settles — never left on <body>.
+   */
+  const retryFocus = useRef(false);
+  const retryLibrary = useCallback(() => {
+    retryFocus.current = true;
+    loadLibrary();
+  }, [loadLibrary]);
+  useEffect(() => {
+    if (!retryFocus.current || library === null) return;
+    retryFocus.current = false;
+    const trigger = document.getElementById('scorecard-add-metric');
+    const target =
+      trigger && !(trigger as HTMLButtonElement).disabled
+        ? trigger
+        : document.querySelector<HTMLElement>('[data-scorecard-add] button:not(:disabled)');
+    target?.focus();
+  }, [library, libraryFailed]);
 
   if (loadError) {
     return (
@@ -570,33 +596,71 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
             weights, instructions and order of the metrics already attached.
           </p>
         ) : (
-          <div className="flex w-full flex-wrap items-end gap-2 sm:w-auto">
-            <Field label="Add a metric" id="scorecard-add-metric" className="min-w-52">
-              {({ id }) => (
-                <SelectField
-                  id={id}
-                  value={addSelection}
-                  onChange={(e) => setAddSelection(e.target.value)}
-                  disabled={atCap || available.length === 0}
+          // FIXED width, and the button on the TRIGGER's row: the list opens
+          // in flow below the trigger, so neither may depend on the list —
+          // a flex-grown column widened and the end-aligned button jumped.
+          <div data-scorecard-add="" className="flex w-full flex-col gap-1.5 sm:w-[26rem]">
+            <label
+              id="scorecard-add-metric-label"
+              htmlFor="scorecard-add-metric"
+              className="text-[13px] font-medium text-ink-secondary"
+            >
+              Add a metric
+            </label>
+            <div className="flex items-start gap-2">
+              {/* Searchable, with each metric's description under its name —
+                  a native select showed a bare name, and "which one was the
+                  evidence-of-impact one?" meant opening the Scorebar. */}
+              <Combobox
+                className="flex-1"
+                id="scorecard-add-metric"
+                labelId="scorecard-add-metric-label"
+                value={addSelection}
+                onChange={setAddSelection}
+                options={available.map((lib) => ({
+                  value: lib.id,
+                  label: lib.name,
+                  description: lib.description ?? undefined,
+                }))}
+                placeholder={
+                  library === null
+                    ? 'Loading the metric library…'
+                    : libraryFailed
+                      ? "Couldn't load the metric library"
+                      : atCap
+                        ? 'Maximum metrics reached'
+                        : available.length === 0
+                          ? 'No more metrics to add'
+                          : 'Choose a metric'
+                }
+                searchLabel="Search the metric library"
+                listLabel="Library metrics"
+                noun={['metric', 'metrics']}
+                noMatchText={(q) => `No metric matches “${q}”.`}
+                loading={library === null}
+                disabled={libraryFailed || atCap || available.length === 0}
+              />
+              {/* `h-10`: the trigger's height, so the two read as one row. */}
+              {/* Distinct `key`s: without them React reuses ONE <button> for
+                  both, and the retry's own node turns into a disabled Attach
+                  under the user's focus. After a retry, focus goes to the
+                  picker (see `retryLibrary`). */}
+              {libraryFailed ? (
+                <Button key="retry" variant="secondary" className="h-10 shrink-0" onClick={retryLibrary}>
+                  Try again
+                </Button>
+              ) : (
+                <Button
+                  key="attach"
+                  variant="secondary"
+                  className="h-10 shrink-0"
+                  onClick={addMetric}
+                  disabled={!addSelection}
                 >
-                  <option value="">
-                    {atCap
-                      ? 'Maximum metrics reached'
-                      : available.length === 0
-                        ? 'No more metrics to add'
-                        : 'Choose a metric…'}
-                  </option>
-                  {available.map((lib) => (
-                    <option key={lib.id} value={lib.id}>
-                      {lib.name}
-                    </option>
-                  ))}
-                </SelectField>
+                  Attach
+                </Button>
               )}
-            </Field>
-            <Button variant="secondary" onClick={addMetric} disabled={!addSelection}>
-              Attach
-            </Button>
+            </div>
           </div>
         )}
 

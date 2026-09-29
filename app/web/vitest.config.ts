@@ -1,4 +1,4 @@
-import { defineConfig } from 'vitest/config';
+import { configDefaults, defineConfig } from 'vitest/config';
 
 export default defineConfig({
   esbuild: {
@@ -11,6 +11,10 @@ export default defineConfig({
     restoreMocks: true,
     reporters: ['default'],
     include: ['src/**/*.test.{ts,tsx}'],
+    // Belt and braces: the Playwright harness lives in e2e/ and uses the
+    // `.e2e.ts` suffix, so `include` already misses it — this keeps it out
+    // even if `include` is ever widened.
+    exclude: [...configDefaults.exclude, 'e2e/**'],
     coverage: {
       provider: 'v8',
       reporter: ['text', 'json-summary'],

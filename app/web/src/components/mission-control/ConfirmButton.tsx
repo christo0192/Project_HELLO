@@ -13,7 +13,7 @@ import { motion } from 'motion/react';
 import { useId, useState } from 'react';
 import type { ReactNode } from 'react';
 import { usePanelVariants } from '../../lib/motion';
-import { Button, buttonClass } from '../design';
+import { Button, buttonClass, cx } from '../design';
 import type { ButtonVariant } from '../design';
 import type { MissionButtonVariant } from './buttonStyles';
 
@@ -34,6 +34,13 @@ export interface ConfirmButtonProps {
   cancelLabel?: string;
   disabled?: boolean;
   className?: string;
+  /**
+   * A quieter TRIGGER for an action that sits beside the main one (Archive
+   * next to Edit): standard height, and `danger` becomes the outlined
+   * `danger-quiet`. The confirmation step keeps the full-strength variant —
+   * the moment of commitment is where the weight belongs.
+   */
+  quiet?: boolean;
 }
 
 export function ConfirmButton({
@@ -45,6 +52,7 @@ export function ConfirmButton({
   cancelLabel = 'Cancel',
   disabled = false,
   className,
+  quiet = false,
 }: ConfirmButtonProps) {
   const rawId = useId();
   const confirmId = `confirm-${rawId.replace(/:/g, '-')}`;
@@ -65,10 +73,14 @@ export function ConfirmButton({
   }
 
   return (
-    <div className={className}>
+    // Quiet mode sits in a flex row of sibling actions. `contents` lets the
+    // trigger stay IN that row and the confirmation panel (`basis-full
+    // order-last`) drop to its own full-width line beneath it, so opening the
+    // confirmation never reshuffles the buttons around it.
+    <div className={cx(quiet && 'contents', className)}>
       <Button
-        size="lg"
-        variant={toButtonVariant(variant)}
+        size={quiet ? 'md' : 'lg'}
+        variant={quiet && variant === 'danger' ? 'danger-quiet' : toButtonVariant(variant)}
         onClick={() => setConfirming((open) => !open)}
         aria-expanded={confirming}
         aria-controls={confirming ? confirmId : undefined}
@@ -83,7 +95,10 @@ export function ConfirmButton({
           variants={panelVariants}
           initial="initial"
           animate="enter"
-          className="glass-sunken mt-3 rounded-[14px] p-4"
+          className={cx(
+            'glass-sunken rounded-[14px] p-4',
+            quiet ? 'order-last w-full basis-full' : 'mt-3',
+          )}
         >
           <p className="text-sm text-ink">{summary}</p>
           <div className="mt-3 flex flex-wrap items-center gap-2">

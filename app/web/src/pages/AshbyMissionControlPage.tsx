@@ -26,11 +26,11 @@ import {
   RevealItem,
   ScrollArea,
   SectionHeader,
-  SelectField,
+  Combobox,
   StatusBadge,
   TextField,
 } from '../components/design';
-import type { StatusTone } from '../components/design';
+import type { ComboboxOption, StatusTone } from '../components/design';
 
 /**
  * Ashby Mission Control — admin-gated HR surface for the Ashby screening
@@ -100,14 +100,6 @@ const PILL =
   'inline-flex items-center whitespace-nowrap rounded-full bg-ink/[0.05] px-2 py-0.5 text-xs text-ink-secondary';
 /** Above this many rows the workflow list scrolls instead of running down the page. */
 const WORKFLOW_SCROLL_AFTER = 6;
-/**
- * Extra classes for the add-mapping dialog's two `SelectField`s — the design
- * system's control, so the border clears WCAG 1.4.11 and the chevron and
- * height match every other select. `w-full min-w-0` because a native select
- * otherwise sizes itself to its LONGEST option, and one long job title would
- * push the dialog wider than a phone screen.
- */
-const DIALOG_SELECT = 'w-full min-w-0';
 /**
  * The note under a dialog picker. It is ALWAYS mounted, and focusable by
  * script only (`tabIndex={-1}`): when "Try again" is pressed the button that
@@ -211,10 +203,10 @@ export function AshbyMissionControlPage() {
    * set by the Try again click and nothing else, so an ordinary read — the
    * one on page load, or on open — never moves anyone's focus.
    */
-  const jobSelectRef = useRef<HTMLSelectElement | null>(null);
+  const jobSelectRef = useRef<HTMLButtonElement | null>(null);
   const jobNoteRef = useRef<HTMLDivElement | null>(null);
   const jobsRetryFocus = useRef(false);
-  const roleSelectRef = useRef<HTMLSelectElement | null>(null);
+  const roleSelectRef = useRef<HTMLButtonElement | null>(null);
   const roleNoteRef = useRef<HTMLDivElement | null>(null);
   const rolesRetryFocus = useRef(false);
   /**
@@ -429,7 +421,49 @@ export function AshbyMissionControlPage() {
     }));
   }, [jobs, jobNames, mappings]);
 
+  /**
+   * The picker's rows. `value` is the POSITION (see `draft`) — the combobox
+   * never renders it, and the job id never becomes one. A job that is
+   * already mapped is grouped last and tagged rather than hidden: dropping it
+   * would read as "Ashby has no such job" to an admin looking for it.
+   */
+  const jobPickerOptions = useMemo<ComboboxOption[]>(() => {
+    // ONE row format in the picker: the title, then "Opened <date>" on the
+    // second line — for every job, duplicate or not. Two jobs with the same
+    // title AND the same opening day are told apart by "· listing N" on that
+    // same line. (The saved label and the rows keep the one-line
+    // `jobDisplayNames` form; this is only how the list reads.)
+    const seen = new Map<string, number>();
+    return jobOptions.map((o, i) => {
+      const title = o.job.title?.trim() || 'Untitled job';
+      const opened = openedDate(o.job.openedAt);
+      const key = `${title}\u0000${opened ?? ''}`;
+      const n = (seen.get(key) ?? 0) + 1;
+      seen.set(key, n);
+      const parts = [opened ? `Opened ${opened}` : null, n > 1 ? `listing ${n}` : null].filter(Boolean);
+      const line = parts.join(' · ');
+      return {
+        value: String(i),
+        label: title,
+        description: line ? line.charAt(0).toUpperCase() + line.slice(1) : undefined,
+        disabled: o.mapped,
+        tag: o.mapped ? 'Mapped' : undefined,
+        group: o.mapped ? 'Already mapped' : undefined,
+      };
+    });
+  }, [jobOptions]);
+  const rolePickerOptions = useMemo<ComboboxOption[]>(
+    () =>
+      activeRoles.map((role) => ({
+        value: role.id,
+        label: role.title,
+        description: role.agent_name ? `Agent · ${role.agent_name}` : undefined,
+      })),
+    [activeRoles],
+  );
+
   const chosenJob = draft.jobKey === '' ? null : (jobOptions[Number(draft.jobKey)] ?? null);
+  const chosenRole = activeRoles.find((role) => role.id === draft.roleId) ?? null;
   const canSave = chosenJob !== null && !chosenJob.mapped && draft.roleId !== '';
   const noOpenJobs = jobsStatus === 'ready' && jobOptions.length === 0;
   const jobsClipped = jobsStatus === 'ready' && jobsTruncated;
@@ -463,10 +497,10 @@ export function AshbyMissionControlPage() {
           : `${activeRoles.length} active role${activeRoles.length === 1 ? '' : 's'}`;
 
   /**
-   * After a "Try again" read settles, focus goes to the select if it can
+   * After a "Try again" read settles, focus goes to the picker if it can
    * take it, else to the note's own control (Try again again, or the Roles
    * link), else the note itself. Effects, not code in the click handler:
-   * the select is only enabled once the render with the new list commits.
+   * the picker is only enabled once the render with the new list commits.
    */
   useEffect(() => {
     if (!jobsRetryFocus.current || jobsStatus === 'loading') return;
@@ -1225,7 +1259,7 @@ export function AshbyMissionControlPage() {
         onClose={closeDialog}
         idPrefix="ashby-mapping"
         title="Add job mapping"
-        description="Point a live Ashby job at a dashboard role. It saves paused — use Resume to turn it on."
+        description="Screen applicants for a live Ashby job with one of your roles. New mappings start paused."
         returnFocusRef={addMappingTrigger}
         busy={creating}
       >
@@ -1252,32 +1286,30 @@ export function AshbyMissionControlPage() {
           <p id="ashby-mapping-roles-live" role="status" className="sr-only">
             {rolesAnnouncement}
           </p>
-          <div className="flex min-w-0 flex-col gap-1">
-            <label htmlFor="ashby-mapping-job" className="text-[13px] font-medium text-ink">
+          <div className="flex min-w-0 flex-col gap-1.5">
+            <label
+              id="ashby-mapping-job-label"
+              htmlFor="ashby-mapping-job"
+              className="text-[13px] font-medium text-ink"
+            >
               Ashby job
             </label>
-            <SelectField
+            <Combobox
               id="ashby-mapping-job"
+              labelId="ashby-mapping-job-label"
               ref={jobSelectRef}
-              className={DIALOG_SELECT}
               value={draft.jobKey}
-              onChange={(e) => setDraft((d) => ({ ...d, jobKey: e.target.value }))}
+              onChange={(next) => setDraft((d) => ({ ...d, jobKey: next }))}
+              options={jobPickerOptions}
+              placeholder={jobsStatus === 'loading' ? 'Loading jobs from Ashby…' : jobsStatus === 'error' ? 'Jobs unavailable' : 'Choose a job'}
+              searchLabel="Search open jobs"
+              listLabel="Open Ashby jobs"
+              noun={['job', 'jobs']}
+              noMatchText={(q) => `No open job matches “${q}”.`}
+              loading={jobsStatus === 'loading'}
               disabled={creating || jobsStatus !== 'ready' || jobOptions.length === 0}
               aria-describedby={hasJobNote ? 'ashby-mapping-job-note' : undefined}
-              required
-            >
-              <option value="">
-                {jobsStatus === 'loading' ? 'Loading jobs from Ashby…' : 'Choose a job…'}
-              </option>
-              {jobsStatus === 'ready' &&
-                jobOptions.map((o, i) => (
-                  // `value` is the POSITION, never `o.job.id` — see `draft`.
-                  // The React `key` may be the id: keys never reach the DOM.
-                  <option key={o.job.id} value={String(i)} disabled={o.mapped}>
-                    {o.mapped ? `${o.label} — already mapped` : o.label}
-                  </option>
-                ))}
-            </SelectField>
+            />
             <div
               id="ashby-mapping-job-note"
               ref={jobNoteRef}
@@ -1324,28 +1356,30 @@ export function AshbyMissionControlPage() {
             </div>
           </div>
 
-          <div className="flex min-w-0 flex-col gap-1">
-            <label htmlFor="ashby-mapping-role" className="text-[13px] font-medium text-ink">
+          <div className="flex min-w-0 flex-col gap-1.5">
+            <label
+              id="ashby-mapping-role-label"
+              htmlFor="ashby-mapping-role"
+              className="text-[13px] font-medium text-ink"
+            >
               Role
             </label>
-            <SelectField
+            <Combobox
               id="ashby-mapping-role"
+              labelId="ashby-mapping-role-label"
               ref={roleSelectRef}
-              className={DIALOG_SELECT}
               value={draft.roleId}
-              onChange={(e) => setDraft((d) => ({ ...d, roleId: e.target.value }))}
+              onChange={(next) => setDraft((d) => ({ ...d, roleId: next }))}
+              options={rolePickerOptions}
+              placeholder={rolesStatus === 'loading' ? 'Loading roles…' : rolesStatus === 'error' ? 'Roles unavailable' : 'Choose a role'}
+              searchLabel="Search roles"
+              listLabel="Active roles"
+              noun={['role', 'roles']}
+              noMatchText={(q) => `No active role matches “${q}”.`}
+              loading={rolesStatus === 'loading'}
               disabled={creating || rolesStatus !== 'ready' || activeRoles.length === 0}
               aria-describedby={hasRoleNote ? 'ashby-mapping-role-note' : undefined}
-              required
-            >
-              <option value="">{rolesStatus === 'loading' ? 'Loading roles…' : 'Choose a role…'}</option>
-              {rolesStatus === 'ready' &&
-                activeRoles.map((role) => (
-                  <option key={role.id} value={role.id}>
-                    {role.agent_name ? `${role.title} — ${role.agent_name}` : role.title}
-                  </option>
-                ))}
-            </SelectField>
+            />
             <div
               id="ashby-mapping-role-note"
               ref={roleNoteRef}
@@ -1379,6 +1413,8 @@ export function AshbyMissionControlPage() {
               )}
             </div>
           </div>
+
+          <MappingPreview jobName={chosenJob?.label ?? null} roleName={chosenRole?.title ?? null} />
 
           {createError && (
             // `text-error-text`, not `text-danger`. Tailwind here defines
@@ -1620,11 +1656,29 @@ function jobsErrorCopy(err: unknown): { message: string; retryable: boolean } {
 }
 
 /**
- * Focus after a picker's "Try again" read settles: the select when it is
- * enabled; else the first live control in its note (Try again once more, or
- * the Roles-page link); else the note itself, which is focusable by script.
+ * What Save will create, said once — and only once both halves are chosen.
+ * An always-present preview of dashed "Job → Role" placeholders restated the
+ * pickers above it (and truncated to "R…" on a phone); a single sentence
+ * that names both choices in full is the useful part, and it wraps.
  */
-function focusAfterRetry(select: HTMLSelectElement | null, note: HTMLElement | null): void {
+function MappingPreview({ jobName, roleName }: { jobName: string | null; roleName: string | null }) {
+  if (!jobName || !roleName) return null;
+  return (
+    <p className="rounded-[12px] bg-ink/[0.035] px-3.5 py-2.5 text-[13px] leading-5 text-ink-secondary">
+      Applicants for <span className="font-medium text-ink">{jobName}</span> will be screened with
+      the <span className="font-medium text-ink">{roleName}</span> role&apos;s questions and
+      scorecard.
+    </p>
+  );
+}
+
+/**
+ * Focus after a picker's "Try again" read settles: the picker's trigger when
+ * it is enabled; else the first live control in its note (Try again once
+ * more, or the Roles-page link); else the note itself, which is focusable by
+ * script.
+ */
+function focusAfterRetry(select: HTMLButtonElement | null, note: HTMLElement | null): void {
   if (select && !select.disabled) {
     select.focus();
     return;
@@ -1690,12 +1744,17 @@ function jobDisplayNames(jobs: AshbyJob[]): string[] {
  * part of a duplicate job's name, and that name is SAVED as the mapping's
  * label — a viewer-local format would store "2 Jul" for an admin in India and
  * render "Jul 1" for one in the US, and the row would then show two dates.
+ *
+ * Built by hand, not with `toLocaleDateString`: ICU versions disagree on the
+ * short month (current ones print "Sept"), and a saved label must not depend
+ * on which browser saved it.
  */
+const SHORT_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 function openedDate(iso: string | null): string | null {
   if (!iso) return null;
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return null;
-  return date.toLocaleDateString('en-GB', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' });
+  return `${date.getUTCDate()} ${SHORT_MONTHS[date.getUTCMonth()]} ${date.getUTCFullYear()}`;
 }
 
 /** A job's display name (`jobDisplayNames`) and its bare title, by job id. */
@@ -1761,7 +1820,11 @@ function MappingSummary({
   const label = mapping.label?.trim() || null;
   const name = mappingName(mapping, jobNames, jobsPending);
   const title = jobNames?.get(mapping.externalJobId)?.title ?? null;
-  const showLabel = label !== null && label !== name && label !== title;
+  // A label saved before dates were hand-formatted may say "Sept" where the
+  // name now says "Sep" — the same date, so it is not a second line's worth.
+  const sameDate = (a: string | null) => (a ?? '').replace(/\bSept\b/g, 'Sep');
+  const showLabel =
+    label !== null && sameDate(label) !== sameDate(name) && sameDate(label) !== sameDate(title);
   return (
     <div className="flex min-w-0 flex-col gap-0.5">
       <div className="flex min-w-0 flex-wrap items-center gap-2">

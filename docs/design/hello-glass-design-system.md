@@ -31,11 +31,14 @@ The previous shell was a flat admin template: every block a 1px-bordered white r
 | `--glass-ring` | `rgba(15,23,42,.07)` | hairline around glass |
 | `--radius-card` / `--radius-control` | `20px` / `12px` | panels / inputs & buttons |
 
-Utility classes: `.glass`, `.glass-strong`, `.glass-rail`, `.glass-sunken`, `.glass-interactive`, `.hairline`, `.app-ground`, `.fade-up` (CSS-only reveal for motion-free scopes).
+Utility classes: `.glass`, `.glass-strong`, `.glass-rail`, `.glass-sunken`, `.glass-interactive`, `.hairline`, `.app-ground`, `.fade-up` (CSS-only reveal for motion-free scopes), `.glass-modal` (opaque modal material for `Dialog` and `SlideOver` — translucent glass over the dimmed backdrop read grey and failed small-text contrast).
 
 ## 3. Primitives (`src/components/design`)
 
-`GlassPanel` · `SectionHeader` · `Button` (`primary | secondary | ghost | danger`, `sm | md`) · `Switch` · `TextField` · `SelectField` · `Field` · `SegmentedControl` · `Pagination` + `usePagination` · `ScrollArea` · `InlineNotice` · `EmptyPanel` · `ErrorPanel` · `RevealGroup` / `RevealItem` · `PageTransition` · upgraded `KpiCard`, `ChartCard`, `Table`, `StatusBadge`, `PageHeader`.
+`GlassPanel` · `SectionHeader` · `Button` (`primary | secondary | ghost | danger | danger-quiet`, `sm | md | lg`) · `Switch` · `TextField` · `SelectField` · `Combobox` · `Field` · `SegmentedControl` · `Pagination` + `usePagination` · `ScrollArea` · `InlineNotice` · `EmptyPanel` · `ErrorPanel` · `RevealGroup` / `RevealItem` · `PageTransition` · `Dialog` / `SlideOver` (on `useModal`) · upgraded `KpiCard`, `ChartCard`, `Table`, `StatusBadge`, `PageHeader`.
+
+- **`Combobox`** — the picker for any list an admin must search or read a second line of (jobs, roles, library metrics). Opens INLINE (panels scroll and animate, so a floating popover would clip); APG "combobox with listbox popup" keyboard contract; Escape closes the list, not the modal around it; option values are never rendered. Use `SelectField` only for short, fixed, self-explanatory choices.
+- **`danger-quiet`** — a destructive action that is not the point of its surface ("Archive" beside "Edit", "Delete"/"Cancel" on list rows). The filled `danger` is for the confirmation step itself.
 
 Rules:
 1. Never nest glass in glass. Inside a `GlassPanel`, use `.glass-sunken` wells or plain rows.

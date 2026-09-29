@@ -1,0 +1,25 @@
+{
+  // The e2e harness runs in Node (Playwright) and in the browser via
+  // `page.evaluate`, so it gets its own program: DOM + Node types, and none of
+  // the app's `vite/client` ambient types. It reads `src/types.ts` for
+  // type-only imports; nothing in `src` depends on anything here.
+  // Checked by `npm run e2e:typecheck`; `tsc -b` (the build) never sees it.
+  "compilerOptions": {
+    "tsBuildInfoFile": "../node_modules/.tmp/tsconfig.e2e.tsbuildinfo",
+    "target": "es2023",
+    "lib": ["ES2023", "DOM", "DOM.Iterable"],
+    "module": "esnext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "skipLibCheck": true,
+    "strict": true,
+    "noEmit": true,
+    "verbatimModuleSyntax": true,
+    "moduleDetection": "force",
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "noFallthroughCasesInSwitch": true
+  },
+  "include": ["./**/*.ts"],
+  "exclude": [".artifacts"]
+}
