@@ -53,6 +53,18 @@ function renderOverview() {
   return render(wrapTheme(<OverviewSection />));
 }
 
+/**
+ * The cell of the headline strip holding the figure with this label: its
+ * label, number and context, and nothing of its neighbours. The six figures
+ * share one surface now, so a card-shaped `.closest('.glass')` would return
+ * all of them at once.
+ */
+function figureCell(label: string): HTMLElement {
+  const term = screen.getAllByText(label).find((el) => el.closest('dl > div'));
+  if (!term) throw new Error(`no headline figure labelled "${label}"`);
+  return term.closest('dl > div') as HTMLElement;
+}
+
 describe('OverviewSection', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -81,28 +93,19 @@ describe('OverviewSection', () => {
     // so the whole group is settled together with an explicit budget.
     const KPI_TIMEOUT = { timeout: 10_000 };
 
-    const sessionsCard = screen
-      .getAllByText('Sessions')
-      .find((el) => el.tagName === 'P')!
-      .closest('.glass') as HTMLElement;
     await waitFor(() => {
-      expect(within(sessionsCard).getByText('3')).toBeInTheDocument();
+      expect(within(figureCell('Sessions')).getByText('3')).toBeInTheDocument();
     }, KPI_TIMEOUT);
 
     await waitFor(() => {
-      const activeCard = screen.getByText('Active sessions').closest('.glass') as HTMLElement;
-      expect(within(activeCard).getByText('1')).toBeInTheDocument();
-
-      const linkedCard = screen.getByText('Linked access').closest('.glass') as HTMLElement;
-      expect(within(linkedCard).getByText('1')).toBeInTheDocument();
-
-      const quotaCard = screen.getByText('Quota policies enabled').closest('.glass') as HTMLElement;
-      expect(within(quotaCard).getByText('1')).toBeInTheDocument();
+      expect(within(figureCell('Active sessions')).getByText('1')).toBeInTheDocument();
+      expect(within(figureCell('Linked access')).getByText('1')).toBeInTheDocument();
+      expect(within(figureCell('Quota policies enabled')).getByText('1')).toBeInTheDocument();
 
       // Audit: 2 events in the last 24h within the 50-row page (a3 is old).
-      const auditCard = screen.getByText('Audit events · 24h').closest('.glass') as HTMLElement;
-      expect(within(auditCard).getByText('2')).toBeInTheDocument();
-      expect(within(auditCard).getByText('within the 50 most recent events')).toBeInTheDocument();
+      const audit = figureCell('Audit events · 24h');
+      expect(within(audit).getByText('2')).toBeInTheDocument();
+      expect(within(audit).getByText('Within the 50 most recent events')).toBeInTheDocument();
     }, KPI_TIMEOUT);
   });
 
@@ -116,9 +119,11 @@ describe('OverviewSection', () => {
   it('renders charts with sr-only data tables as the authoritative data', async () => {
     renderOverview();
     await screen.findByText('Session status mix');
+    // The status mix is a bar list now: a visible table, one row header per
+    // status, ranked by count.
     const statusTable = await screen.findByRole('table', { name: 'Session status data' });
-    expect(within(statusTable).getByRole('cell', { name: 'Completed' })).toBeInTheDocument();
-    expect(within(statusTable).getByRole('cell', { name: 'In progress' })).toBeInTheDocument();
+    expect(within(statusTable).getByRole('rowheader', { name: 'Completed' })).toBeInTheDocument();
+    expect(within(statusTable).getByRole('rowheader', { name: 'In progress' })).toBeInTheDocument();
 
     const activityTable = await screen.findByRole('table', { name: 'Sessions created per day data' });
     expect(within(activityTable).getAllByRole('row').length).toBeGreaterThan(1);
@@ -136,6 +141,26 @@ describe('OverviewSection', () => {
     expect(screen.queryByText(/% uptime|99\.\d+%/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/\$/)).not.toBeInTheDocument();
     expect(screen.queryByText(/deploying|rolling out/i)).not.toBeInTheDocument();
+    // Named once, in one line: five "Not available" pills gave five missing
+    // signals the weight of five present ones.
+    expect(screen.queryByText('Not available')).not.toBeInTheDocument();
+    expect(screen.getByText(/No API exposes them/)).toBeInTheDocument();
+  });
+
+  it('shows the headline figures as one strip, not a card each', async () => {
+    const { container } = renderOverview();
+    await screen.findByText('Service state');
+    const strip = screen.getByRole('group', { name: 'Operations at a glance' });
+    expect(within(strip).getAllByRole('term').map((t) => t.textContent)).toEqual([
+      'Service state',
+      'Sessions',
+      'Active sessions',
+      'Linked access',
+      'Quota policies enabled',
+      'Audit events · 24h',
+    ]);
+    expect(strip.querySelector('.glass')).toBeNull();
+    expect(container.querySelector('.uppercase')).toBeNull();
   });
 
   it('never renders email addresses on the overview surface', async () => {
@@ -153,18 +178,20 @@ describe('OverviewSection', () => {
     apiFns.listAdminQuotas.mockRejectedValue(new missionApi.ApiError('quotas down', 500));
     renderOverview();
     await screen.findByText('Session status mix');
-    expect(await screen.findByText(/Session status mix — sessions down/)).toBeInTheDocument();
-    expect(await screen.findByText(/Quota policy state — quotas down/)).toBeInTheDocument();
-    // KPI values for failed sources are never claimed — zero-filled 0 is
-    // scoped to the Sessions card (not a fabricated total).
-    const sessionsCard = screen.getByText('Sessions').closest('.glass') as HTMLElement;
-    expect(within(sessionsCard).getByText('0')).toBeInTheDocument();
+    expect(await screen.findByText(/Session status mix: sessions down/)).toBeInTheDocument();
+    expect(await screen.findByText(/Quota policy state: quotas down/)).toBeInTheDocument();
+    // A failed source's figure is never claimed: "—" and why, not a 0 it
+    // did not measure (it used to print "Sessions 0").
+    const sessions = figureCell('Sessions');
+    expect(within(sessions).getByText('—')).toBeInTheDocument();
+    expect(within(sessions).getByText('Could not load')).toBeInTheDocument();
+    expect(within(sessions).queryByText('0')).not.toBeInTheDocument();
   });
 
   it('recovers via the per-source retry', async () => {
     apiFns.listAdminSessions.mockRejectedValueOnce(new missionApi.ApiError('sessions down', 500));
     renderOverview();
-    await screen.findByText(/Session status mix — sessions down/);
+    await screen.findByText(/Session status mix: sessions down/);
     const retry = screen.getAllByRole('button', { name: /try again/i })[0];
     fireEvent.click(retry);
     expect(await screen.findByText('Session status mix')).toBeInTheDocument();

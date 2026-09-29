@@ -6,8 +6,8 @@ import { AshbyMissionControlPage } from './AshbyMissionControlPage';
 import { ApiError } from '../api';
 
 /**
- * The page header now carries a real <Link> back to Mission Control, so the
- * page needs a router context. Routing itself is not under test here.
+ * The page renders router <Link>s (Review screening, the Roles page), so it
+ * needs a router context. Routing itself is not under test here.
  */
 function renderPage() {
   return render(
@@ -58,6 +58,20 @@ async function openPicker(triggerName: RegExp): Promise<HTMLElement> {
 async function pick(triggerName: RegExp, optionName: string | RegExp): Promise<void> {
   const list = await openPicker(triggerName);
   await userEvent.click(within(list).getByRole('option', { name: optionName }));
+}
+
+/**
+ * A MAPPING ROW'S SECONDARY ACTIONS live in its "More" menu (an APG menu
+ * button named "More actions for <job>"); the row shows only the one action
+ * its state calls for. This opens the `index`th mapping row's menu and
+ * chooses an item by its accessible name. Workflow rows have menus too
+ * ("More actions for app_…"), so they are left out by name.
+ */
+const MAPPING_MORE = /^More actions for (?!app_)/;
+async function mappingAction(index: number, item: string | RegExp): Promise<void> {
+  const triggers = await screen.findAllByRole('button', { name: MAPPING_MORE });
+  await userEvent.click(triggers[index]);
+  await userEvent.click(within(screen.getByRole('menu')).getByRole('menuitem', { name: item }));
 }
 
 /** The listbox offers EXACTLY these options, in this order, by accessible name. */
@@ -164,10 +178,21 @@ describe('AshbyMissionControlPage', () => {
     renderPage();
     // The job by NAME — the row never renders the id it is keyed on.
     expect(await screen.findByText('Account Executive')).toBeInTheDocument();
-    expect(screen.getByText('drift')).toBeInTheDocument();
     expect(screen.getByText('app_1')).toBeInTheDocument();
-    // Enums are humanised for operators (raw value kept in `title`).
-    expect(screen.getByText(/Ingest · Failed review/)).toBeInTheDocument();
+    // Enums are humanised for operators, with explicit words where they
+    // matter; the raw value stays one hover away in a `title`.
+    expect(screen.getByText('Out of sync')).toHaveAttribute('title', 'drift');
+    expect(screen.getByText('Live')).toHaveAttribute('title', 'enabled');
+    expect(screen.getByText('Processing')).toHaveAttribute('title', 'processing');
+    expect(screen.getByText('Resume import: Needs manual review')).toHaveAttribute('title', 'failed_review');
+    expect(screen.getByText(/^Stage move: Failed/)).toHaveTextContent('Stage move: Failed (Transient x)');
+    expect(screen.getByText(/^Stage move: Failed/)).toHaveAttribute('title', 'stage_move: failed (transient_x)');
+    // A drift reason given as a code is words too.
+    expect(screen.getByText('A stage on this job no longer exists in Ashby')).toHaveAttribute('title', 'stage_id_invalid');
+    // No machine vocabulary as visible text.
+    for (const raw of ['drift', 'enabled', 'failed_review', 'stage_move', 'stage_id_invalid', 'transient_x']) {
+      expect(screen.queryByText(raw)).toBeNull();
+    }
     // No candidate PII / token / URL leaks in the rendered surface.
     const text = document.body.textContent ?? '';
     expect(text).not.toMatch(/\S+@\S+\.\S+/); // no email
@@ -213,12 +238,20 @@ describe('AshbyMissionControlPage', () => {
     }
   });
 
-  it('cancels a non-terminal workflow and retries a failed operation', async () => {
+  it('cancels a non-terminal workflow — after asking — and retries a failed operation', async () => {
     renderPage();
     await screen.findByText('app_1');
-    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    // Cancel is in the row's menu, never a filled red button on the row.
+    expect(screen.queryByRole('button', { name: /^Cancel/ })).toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: 'More actions for app_1' }));
+    await userEvent.click(screen.getByRole('menuitem', { name: 'Cancel screening' }));
+    const dialog = screen.getByRole('dialog', { name: 'Cancel this screening?' });
+    expect(cancelAshbyWorkflow).not.toHaveBeenCalled();
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel screening' }));
     await waitFor(() => expect(cancelAshbyWorkflow).toHaveBeenCalledWith('l1', 'manual_stage_cancel'));
-    await userEvent.click(screen.getByRole('button', { name: 'Retry' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    // Named for WHICH retry, starting with the visible word.
+    await userEvent.click(screen.getByRole('button', { name: 'Retry stage move' }));
     await waitFor(() => expect(retryAshbyOperation).toHaveBeenCalledWith('op1'));
   });
 
@@ -231,7 +264,7 @@ describe('AshbyMissionControlPage', () => {
   it('shows the bounded preview and requires a second explicit admin confirmation', async () => {
     renderPage();
     await screen.findByText('Account Executive');
-    await userEvent.click(screen.getAllByRole('button', { name: 'Preview existing backlog' })[0]);
+    await mappingAction(0, 'Preview existing backlog');
     expect(await screen.findByText(/snapshot expires/)).toBeInTheDocument();
     expect(screen.getByText(/future stage entries only/)).toBeInTheDocument();
     const confirm = screen.getByRole('button', { name: 'Confirm and import this snapshot' });
@@ -345,8 +378,10 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
     });
     renderPage();
     // The completion observer is best-effort by design; this badge is what
-    // makes a park that never landed visible instead of log-only.
-    expect(await screen.findByText(/screened: not parked/i)).toBeInTheDocument();
+    // makes a park that never landed visible instead of log-only — and the
+    // list's summary line counts it.
+    expect(await screen.findByText('Not queued for write-back')).toBeInTheDocument();
+    expect(screen.getByText(/\b1 not queued for write-back\b/)).toBeInTheDocument();
   });
 
   it('does not flag a screening that parked correctly', async () => {
@@ -356,7 +391,7 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
     });
     renderPage();
     expect(await screen.findByText('app_1')).toBeInTheDocument();
-    expect(screen.queryByText(/screened: not parked/i)).toBeNull();
+    expect(screen.queryByText('Not queued for write-back')).toBeNull();
   });
 
   it('does not flag a terminal application', async () => {
@@ -366,18 +401,35 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
     });
     renderPage();
     expect(await screen.findByText('app_1')).toBeInTheDocument();
-    expect(screen.queryByText(/screened: not parked/i)).toBeNull();
+    expect(screen.queryByText('Not queued for write-back')).toBeNull();
   });
 
-  it('disables delivery for a terminal application', async () => {
+  it('offers NO delivery (and no cancel) for a terminal application — its status says why', async () => {
     listAshbyWorkflows.mockResolvedValue({
       ok: true,
       workflows: [{ ...WORKFLOWS.workflows[0], terminalState: 'withdrawn' }],
     });
     renderPage();
-    const button = await screen.findByRole('button', { name: /get invite link/i });
-    expect(button).toBeDisabled();
+    expect(await screen.findByText('Withdrawn')).toHaveAttribute('title', 'withdrawn');
+    expect(screen.queryByRole('button', { name: /invite link/i })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'More actions for app_1' })).toBeNull();
     expect(deliverAshbyManualInvite).not.toHaveBeenCalled();
+  });
+
+  it('a completed screening leads with Review screening; the invite moves into More', async () => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [{ ...WORKFLOWS.workflows[0], lifecycle: 'writeback_pending', sessionStatus: 'completed', sessionId: 'sess-1' }],
+    });
+    renderPage();
+    const review = await screen.findByRole('link', { name: 'Review screening' });
+    expect(review).toHaveAttribute('href', '/sessions/sess-1');
+    expect(screen.queryByRole('button', { name: /invite link/i })).toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: 'More actions for app_1' }));
+    const items = within(screen.getByRole('menu')).getAllByRole('menuitem');
+    expect(items.map((i) => i.textContent)).toEqual(['Get invite link', 'Cancel screening']);
+    await userEvent.click(items[0]);
+    await waitFor(() => expect(deliverAshbyManualInvite).toHaveBeenCalledWith('l1'));
   });
 });
 
@@ -443,8 +495,7 @@ describe('AshbyMissionControlPage — feedback-form schema discovery (read-only)
 
   it('renders ids, labels, types, required flags and the scale for the chosen job', async () => {
     renderPage();
-    const buttons = await screen.findAllByRole('button', { name: /discover feedback form/i });
-    await userEvent.click(buttons[0]);
+    await mappingAction(0, /discover feedback form/i);
 
     await waitFor(() => expect(discoverAshbyFeedbackForm).toHaveBeenCalledWith('job_1'));
     expect(discoverAshbyFeedbackForm).toHaveBeenCalledTimes(1);
@@ -466,7 +517,7 @@ describe('AshbyMissionControlPage — feedback-form schema discovery (read-only)
 
   it('labels the surface read-only and unverified and never claims a binding', async () => {
     renderPage();
-    await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
+    await mappingAction(0, /discover feedback form/i);
     await screen.findByText(/form id: form_1/);
 
     const text = document.body.textContent ?? '';
@@ -483,7 +534,7 @@ describe('AshbyMissionControlPage — feedback-form schema discovery (read-only)
 
   it('renders no candidate PII, token, or URL — structure only', async () => {
     renderPage();
-    await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
+    await mappingAction(0, /discover feedback form/i);
     await screen.findByText(/form id: form_1/);
 
     const text = document.body.textContent ?? '';
@@ -494,7 +545,7 @@ describe('AshbyMissionControlPage — feedback-form schema discovery (read-only)
   it('says plainly when the plan names no form at all', async () => {
     discoverAshbyFeedbackForm.mockResolvedValue({ ok: true, forms: [], empty: true, truncated: false });
     renderPage();
-    await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
+    await mappingAction(0, /discover feedback form/i);
     expect(await screen.findByText(/no feedback form is named/i)).toBeInTheDocument();
   });
 
@@ -516,7 +567,7 @@ describe('AshbyMissionControlPage — feedback-form schema discovery (read-only)
       }],
     });
     renderPage();
-    await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
+    await mappingAction(0, /discover feedback form/i);
     expect(await screen.findByText(/only\s+its id could be read/i)).toBeInTheDocument();
     expect(document.body.textContent ?? '').toMatch(/not a claim that the form has no fields/i);
   });
@@ -524,14 +575,14 @@ describe('AshbyMissionControlPage — feedback-form schema discovery (read-only)
   it('warns when a safety bound clipped the result', async () => {
     discoverAshbyFeedbackForm.mockResolvedValue({ ...FORM_SCHEMA, truncated: true });
     renderPage();
-    await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
+    await mappingAction(0, /discover feedback form/i);
     expect(await screen.findByText(/truncated by a safety bound/i)).toBeInTheDocument();
   });
 
   it('surfaces a sanitized API error without rendering a schema', async () => {
     discoverAshbyFeedbackForm.mockResolvedValue({ ok: false, error: 'probe_unavailable' });
     renderPage();
-    await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
+    await mappingAction(0, /discover feedback form/i);
     expect(await screen.findByText('probe_unavailable')).toBeInTheDocument();
     expect(screen.queryByText(/form id:/)).not.toBeInTheDocument();
   });
@@ -539,25 +590,24 @@ describe('AshbyMissionControlPage — feedback-form schema discovery (read-only)
   it('surfaces a thrown API error as an alert', async () => {
     discoverAshbyFeedbackForm.mockRejectedValue({ message: 'network down' });
     renderPage();
-    await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
+    await mappingAction(0, /discover feedback form/i);
     expect(await screen.findByRole('alert')).toBeInTheDocument();
     expect(screen.queryByText(/form id:/)).not.toBeInTheDocument();
   });
 
   it('shows the schema for one mapping at a time', async () => {
     renderPage();
-    const buttons = await screen.findAllByRole('button', { name: /discover feedback form/i });
-    await userEvent.click(buttons[0]);
+    await mappingAction(0, /discover feedback form/i);
     await screen.findByText(/form id: form_1/);
     discoverAshbyFeedbackForm.mockResolvedValue({ ok: true, forms: [], empty: true, truncated: false });
-    await userEvent.click(buttons[1]);
+    await mappingAction(1, /discover feedback form/i);
     await waitFor(() => expect(discoverAshbyFeedbackForm).toHaveBeenLastCalledWith('job_2'));
     expect(screen.queryByText(/form id: form_1/)).not.toBeInTheDocument();
   });
 
   it('has no axe violations with a schema rendered', async () => {
     const { container } = renderPage();
-    await userEvent.click((await screen.findAllByRole('button', { name: /discover feedback form/i }))[0]);
+    await mappingAction(0, /discover feedback form/i);
     await screen.findByText(/form id: form_1/);
     await expect(container).toHaveNoViolations();
   });
@@ -607,8 +657,7 @@ describe('AshbyMissionControlPage — scorecard binding preview (read-only)', ()
 
   it('shows each metric, its field and scale, and the exact fix for an unbound one', async () => {
     renderPage();
-    const buttons = await screen.findAllByRole('button', { name: /preview scorecard binding/i });
-    await userEvent.click(buttons[0]);
+    await mappingAction(0, /preview scorecard binding/i);
     await waitFor(() => expect(previewAshbyScorecardBinding).toHaveBeenCalledWith('m1'));
     expect(previewAshbyScorecardBinding).toHaveBeenCalledTimes(1);
 
@@ -646,7 +695,7 @@ describe('AshbyMissionControlPage — scorecard binding preview (read-only)', ()
       },
     });
     renderPage();
-    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+    await mappingAction(0, /preview scorecard binding/i);
     expect((await screen.findByTestId('binding-readiness')).textContent)
       .toMatch(/2 of 4 metric\(s\) would be omitted from the Ashby card\./);
   });
@@ -663,7 +712,7 @@ describe('AshbyMissionControlPage — scorecard binding preview (read-only)', ()
       },
     });
     renderPage();
-    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+    await mappingAction(0, /preview scorecard binding/i);
     const verdict = (await screen.findByTestId('binding-readiness')).textContent ?? '';
     expect(verdict).toMatch(/Cannot be checked — this read returned no field schema/);
     // It must not claim metrics would be dropped: the worker retries instead.
@@ -685,20 +734,20 @@ describe('AshbyMissionControlPage — scorecard binding preview (read-only)', ()
       },
     });
     renderPage();
-    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+    await mappingAction(0, /preview scorecard binding/i);
     expect((await screen.findByTestId('binding-readiness')).textContent).toMatch(/^Ready — every metric/);
   });
 
   it('explains the v1 legacy path and a role-less mapping instead of an empty table', async () => {
     previewAshbyScorecardBinding.mockResolvedValue({ ...BINDING_PREVIEW, scoringPath: 'v1_legacy', preview: { ...BINDING_PREVIEW.preview, metrics: [], ready: false } });
     renderPage();
-    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+    await mappingAction(0, /preview scorecard binding/i);
     expect(await screen.findByText(/no active dashboard scorecard/i)).toBeInTheDocument();
     expect(screen.queryByTestId('binding-readiness')).not.toBeInTheDocument();
     expect(screen.queryByText(/Metrics \(bound by name\)/)).not.toBeInTheDocument();
 
     previewAshbyScorecardBinding.mockResolvedValue({ ...BINDING_PREVIEW, scoringPath: 'no_role', preview: { ...BINDING_PREVIEW.preview, metrics: [], ready: false } });
-    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[1]);
+    await mappingAction(1, /preview scorecard binding/i);
     expect(await screen.findByText(/has no dashboard role/i)).toBeInTheDocument();
   });
 
@@ -715,7 +764,7 @@ describe('AshbyMissionControlPage — scorecard binding preview (read-only)', ()
       },
     });
     renderPage();
-    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+    await mappingAction(0, /preview scorecard binding/i);
     expect(await screen.findByText(/archived in Ashby.*fail closed/i)).toBeInTheDocument();
     // The headline must name the archived form, not blame a fixed field.
     const verdict = screen.getByTestId('binding-readiness').textContent ?? '';
@@ -732,20 +781,20 @@ describe('AshbyMissionControlPage — scorecard binding preview (read-only)', ()
     ] as const) {
       previewAshbyScorecardBinding.mockResolvedValue({ ok: false, error: code });
       const view = renderPage();
-      await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+      await mappingAction(0, /preview scorecard binding/i);
       const alert = await screen.findByRole('alert');
       expect(alert.textContent).toMatch(fragment);
       view.unmount();
     }
     previewAshbyScorecardBinding.mockRejectedValue({ message: 'network down' });
     renderPage();
-    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+    await mappingAction(0, /preview scorecard binding/i);
     expect((await screen.findByRole('alert')).textContent).toMatch(/could not preview/i);
   });
 
   it('has no axe violations with a preview rendered', async () => {
     const { container } = renderPage();
-    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+    await mappingAction(0, /preview scorecard binding/i);
     await screen.findByText(/Scorecard binding preview — read-only/);
     await expect(container).toHaveNoViolations();
   });
@@ -777,7 +826,7 @@ describe('Adding a job mapping', () => {
   async function openDialog() {
     renderPage();
     // m2's status badge: on screen whatever job list a test supplies.
-    await screen.findByText('drift');
+    await screen.findByText('Out of sync');
     await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
     const dialog = screen.getByRole('dialog', { name: 'Add job mapping' });
     await waitFor(() => expect(jobPicker()).toBeEnabled());
@@ -1444,7 +1493,7 @@ describe('Mapping rows name the job — never its id', () => {
     listAshbyJobs.mockRejectedValue(new ApiError('probe_unavailable', 502));
     renderPage();
     expect(await screen.findAllByText('Ashby job (name unavailable)')).toHaveLength(2);
-    expect(screen.getByText('drift')).toBeInTheDocument();
+    expect(screen.getByText('Out of sync')).toBeInTheDocument();
     // The failure is the DIALOG's to explain, when someone opens it; the
     // page itself raises no alarm over a convenience.
     expect(screen.queryByRole('alert')).toBeNull();
@@ -1484,51 +1533,69 @@ describe('Deleting a job mapping', () => {
 
   /** The row that names `job`. Call it only while no dialog repeats the name. */
   const row = (job: string) => screen.getByText(job).closest('li')!;
-  const deleteButton = (job: string) => within(row(job)).getByRole('button', { name: 'Delete' });
+  /** The row's "More" menu button — where Delete lives, and where focus returns. */
+  const moreOf = (job: string) => within(row(job)).getByRole('button', { name: `More actions for ${job}` });
+  /** Opens the row's menu and returns its Delete item. */
+  async function deleteItem(job: string): Promise<HTMLElement> {
+    await userEvent.click(moreOf(job));
+    return within(screen.getByRole('menu')).getByRole('menuitem', { name: 'Delete' });
+  }
 
   async function openConfirm(job = 'Customer Success Lead') {
     renderPage();
     await screen.findByText(job);
-    await userEvent.click(deleteButton(job));
+    await userEvent.click(await deleteItem(job));
     return screen.getByRole('dialog', { name: 'Delete this mapping?' });
   }
 
-  it('DISABLES Delete on an enabled mapping and says why — on the page, and as its description', async () => {
+  it('DISABLES Delete on an enabled mapping and says why — in words, as its description', async () => {
     renderPage();
     await screen.findByText('Account Executive');
-    const del = deleteButton('Account Executive');
-    expect(del).toBeDisabled();
-    expect(del).toHaveAttribute('title', HINT);
-    // A disabled button is out of the tab order, so the tooltip alone would
-    // never reach a keyboard user: the reason is visible text, tied to the
-    // button for a screen reader.
+    const del = await deleteItem('Account Executive');
+    // A menu item stays FOCUSABLE while disabled (APG), so the arrow keys
+    // reach it and the reason is read with it — unlike a disabled button,
+    // which leaves the tab order and could only say why in a tooltip.
+    expect(del).toHaveAttribute('aria-disabled', 'true');
+    expect(del).toHaveAccessibleName('Delete');
     expect(del).toHaveAccessibleDescription(HINT);
     // Rendered text, not a screen-reader-only span. (`toBeVisible` cannot
     // be used here: the page's reveal motion starts at opacity 0 in jsdom.)
-    const hint = within(row('Account Executive')).getByText(HINT);
-    // The description must come FROM that line. Asserting the text alone
-    // would pass on the `title` fallback with the link gone.
+    const hint = within(del).getByText(HINT);
+    // The description must come FROM that line.
     expect(hint.id).not.toBe('');
     expect(del).toHaveAttribute('aria-describedby', hint.id);
     expect(hint).not.toHaveClass('sr-only');
     expect(hint).not.toHaveAttribute('aria-hidden');
     expect(hint).not.toHaveAttribute('hidden');
-    // Only the enabled row carries it.
-    expect(screen.getAllByText(HINT)).toHaveLength(1);
+    // Choosing it anyway does nothing.
+    await userEvent.click(del);
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(archiveAshbyMapping).not.toHaveBeenCalled();
+    await userEvent.keyboard('{Escape}');
+    // Only the enabled row's Delete carries it.
+    for (const job of ['Customer Success Lead', 'Night Shift Advisor']) {
+      expect(await deleteItem(job)).not.toHaveAccessibleDescription();
+      await userEvent.keyboard('{Escape}');
+    }
   });
 
-  it('ENABLES Delete on a paused mapping and on a drifted one, as the LAST action in the row', async () => {
+  it('ENABLES Delete on a paused mapping and on a drifted one, as the LAST, set-apart item of its menu', async () => {
     renderPage();
     await screen.findByText('Customer Success Lead');
     for (const job of ['Customer Success Lead', 'Night Shift Advisor']) {
-      const del = deleteButton(job);
-      expect(del).toBeEnabled();
-      expect(del).not.toHaveAttribute('title');
+      const del = await deleteItem(job);
+      expect(del).not.toHaveAttribute('aria-disabled');
       expect(del).not.toHaveAccessibleDescription();
       expect(del).toHaveAttribute('aria-haspopup', 'dialog');
-      const actions = within(row(job)).getAllByRole('button');
-      expect(actions[actions.length - 1]).toBe(del);
-      expect(within(row(job)).queryByText(HINT)).toBeNull();
+      const menu = screen.getByRole('menu');
+      const items = within(menu).getAllByRole('menuitem');
+      expect(items[items.length - 1]).toBe(del);
+      // A hairline sets the destructive item apart from the reads above it.
+      expect(within(menu).getByRole('separator').nextElementSibling).toBe(del);
+      await userEvent.keyboard('{Escape}');
+      expect(moreOf(job)).toHaveFocus();
+      // No filled red control on the row: Delete is not a row button at all.
+      expect(within(row(job)).queryByRole('button', { name: 'Delete' })).toBeNull();
     }
   });
 
@@ -1557,7 +1624,7 @@ describe('Deleting a job mapping', () => {
     await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
 
     await screen.findByText('Ashby job (name unavailable)');
-    await userEvent.click(deleteButton('Ashby job (name unavailable)'));
+    await userEvent.click(await deleteItem('Ashby job (name unavailable)'));
     dialog = screen.getByRole('dialog', { name: 'Delete this mapping?' });
     expect(dialog).toHaveAccessibleDescription('Ashby job (name unavailable)');
     expect(dialog.innerHTML).not.toMatch(/job_gone|map_gone/);
@@ -1583,20 +1650,21 @@ describe('Deleting a job mapping', () => {
     expect(screen.getByRole('button', { name: 'Add mapping' })).toHaveFocus();
   });
 
-  it("Cancel and Escape archive nothing, and focus returns to THAT row's Delete button", async () => {
+  it("Cancel and Escape archive nothing, and focus returns to THAT row's More button", async () => {
     const dialog = await openConfirm();
     await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
     expect(screen.queryByRole('dialog')).toBeNull();
-    expect(deleteButton('Customer Success Lead')).toHaveFocus();
+    // The menu item that opened the dialog is gone; its menu's button is not.
+    expect(moreOf('Customer Success Lead')).toHaveFocus();
 
     // Another row, closed with Escape: focus goes back to ITS button.
-    await userEvent.click(deleteButton('Night Shift Advisor'));
+    await userEvent.click(await deleteItem('Night Shift Advisor'));
     expect(screen.getByRole('dialog', { name: 'Delete this mapping?' })).toHaveAccessibleDescription(
       'Night Shift Advisor',
     );
     await userEvent.keyboard('{Escape}');
     expect(screen.queryByRole('dialog')).toBeNull();
-    expect(deleteButton('Night Shift Advisor')).toHaveFocus();
+    expect(moreOf('Night Shift Advisor')).toHaveFocus();
 
     expect(archiveAshbyMapping).not.toHaveBeenCalled();
     expect(listAshbyMappings).toHaveBeenCalledTimes(1);
@@ -1620,11 +1688,15 @@ describe('Deleting a job mapping', () => {
     expect(within(dialog).getByRole('button', { name: 'Delete mapping' })).toBeDisabled();
 
     await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel' }));
-    // The row now tells the truth, and Pause — the advice — is live.
-    expect(deleteButton('Customer Success Lead')).toBeDisabled();
+    // The row stayed, so focus goes back to its More button.
+    expect(moreOf('Customer Success Lead')).toHaveFocus();
+    // The row now tells the truth: Live, Pause — the advice — is its action,
+    // and its Delete is off, saying why.
+    expect(within(row('Customer Success Lead')).getByText('Live')).toBeInTheDocument();
     expect(within(row('Customer Success Lead')).getByRole('button', { name: 'Pause' })).toBeEnabled();
-    // Its Delete is disabled and cannot take focus; the list's own control does.
-    expect(screen.getByRole('button', { name: 'Add mapping' })).toHaveFocus();
+    const del = await deleteItem('Customer Success Lead');
+    expect(del).toHaveAttribute('aria-disabled', 'true');
+    expect(del).toHaveAccessibleDescription(HINT);
   });
 
   it('404 not_found: says it was already removed, reloads, and keeps naming the job', async () => {
@@ -1727,14 +1799,15 @@ describe('Deleting a job mapping', () => {
     await waitFor(() => expect(region()).toHaveTextContent('Mapping deleted.'));
 
     // The next action — any action — clears it.
-    await userEvent.click(within(row('Night Shift Advisor')).getByRole('button', { name: 'Discover feedback form' }));
+    await userEvent.click(moreOf('Night Shift Advisor'));
+    await userEvent.click(screen.getByRole('menuitem', { name: 'Discover feedback form' }));
     expect(region()).toHaveTextContent('');
   });
 
   it('has no axe violations with the confirmation open', async () => {
     const { container } = renderPage();
     await screen.findByText('Customer Success Lead');
-    await userEvent.click(deleteButton('Customer Success Lead'));
+    await userEvent.click(await deleteItem('Customer Success Lead'));
     screen.getByRole('dialog', { name: 'Delete this mapping?' });
     await expect(container).toHaveNoViolations();
   });
@@ -1896,8 +1969,9 @@ describe('One name per job — rows, picker and Delete agree, same-titled jobs a
     await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
 
     await userEvent.click(
-      within(screen.getByText(CLOSED).closest('li')!).getByRole('button', { name: 'Delete' }),
+      within(screen.getByText(CLOSED).closest('li')!).getByRole('button', { name: `More actions for ${CLOSED}` }),
     );
+    await userEvent.click(screen.getByRole('menuitem', { name: 'Delete' }));
     expect(screen.getByRole('dialog', { name: 'Delete this mapping?' })).toHaveAccessibleDescription(CLOSED);
   });
 
@@ -2015,7 +2089,7 @@ describe('Scorecard binding — a mapping NOT linked to the verified form', () =
 
   async function preview() {
     renderPage();
-    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+    await mappingAction(0, /preview scorecard binding/i);
     await screen.findByText(/Scorecard binding preview — read-only/);
   }
 
@@ -2047,5 +2121,224 @@ describe('Scorecard binding — a mapping NOT linked to the verified form', () =
     await preview();
     expect(screen.queryByText(NOT_LINKED)).toBeNull();
     expect(screen.getByTestId('binding-readiness').textContent).toMatch(/^Ready — every metric/);
+  });
+});
+
+describe('A mapping row shows ONE action — the one its state calls for', () => {
+  // One row per state: Live (m1), Out of sync with a missing TA stage (m2),
+  // Paused and complete (job_3), Paused and missing a stage (job_4).
+  const base = MAPPINGS.mappings[0];
+  const ROWS = {
+    ok: true,
+    mappings: [
+      ...MAPPINGS.mappings,
+      { ...base, id: 'm3', externalJobId: 'job_3', status: 'paused', statusReason: 'Paused while the question bank is reviewed' },
+      { ...base, id: 'm4', externalJobId: 'job_4', status: 'paused', hasAiStage: false },
+    ],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    listAshbyMappings.mockResolvedValue(ROWS);
+    listAshbyWorkflows.mockResolvedValue(WORKFLOWS);
+    listRoles.mockResolvedValue(ROLES);
+    listAshbyJobs.mockResolvedValue(JOBS);
+    pauseAshbyMapping.mockResolvedValue({ ok: true, status: 'paused' });
+    resumeAshbyMapping.mockResolvedValue({ ok: true, status: 'enabled' });
+  });
+
+  const rowOf = (job: string) => screen.getByText(job).closest('li')!;
+  const rowButtons = (job: string) =>
+    within(rowOf(job))
+      .getAllByRole('button')
+      .map((b) => b.textContent);
+
+  it('Live and Out of sync offer Pause; Paused offers Resume; everything else is in More', async () => {
+    renderPage();
+    await screen.findByText('Account Executive');
+    expect(rowButtons('Account Executive')).toEqual(['Pause', 'More']);
+    // The database refuses to resume an out-of-sync mapping outright, so
+    // Resume is not offered there at all.
+    expect(rowButtons('Night Shift Advisor')).toEqual(['Pause', 'More']);
+    expect(rowButtons('Customer Success Lead')).toEqual(['Resume', 'More']);
+    expect(rowButtons('Draft Role')).toEqual(['Resume', 'More']);
+    // The status, in words, beside each.
+    expect(within(rowOf('Account Executive')).getByText('Live')).toBeInTheDocument();
+    expect(within(rowOf('Night Shift Advisor')).getByText('Out of sync')).toBeInTheDocument();
+    expect(within(rowOf('Customer Success Lead')).getByText('Paused')).toBeInTheDocument();
+    // A reason given as a sentence is shown as written.
+    expect(within(rowOf('Customer Success Lead')).getByText('Paused while the question bank is reviewed')).toBeInTheDocument();
+    // The menu holds the three reads and Delete, in that order.
+    await userEvent.click(within(rowOf('Account Executive')).getByRole('button', { name: 'More actions for Account Executive' }));
+    expect(within(screen.getByRole('menu')).getAllByRole('menuitem').map((i) => i.firstChild?.textContent)).toEqual([
+      'Discover feedback form',
+      'Preview scorecard binding',
+      'Preview existing backlog',
+      'Delete',
+    ]);
+  });
+
+  it('a paused mapping missing a stage cannot be resumed, and says which stage, as Resume\'s description', async () => {
+    renderPage();
+    await screen.findByText('Draft Role');
+    const resume = within(rowOf('Draft Role')).getByRole('button', { name: 'Resume' });
+    expect(resume).toBeDisabled();
+    expect(resume).toHaveAccessibleDescription('The AI screening stage is missing in Ashby');
+    const note = within(rowOf('Draft Role')).getByText('The AI screening stage is missing in Ashby');
+    expect(resume).toHaveAttribute('aria-describedby', note.id);
+    // The out-of-sync row says which stage it lacks too; its Pause stays on.
+    expect(within(rowOf('Night Shift Advisor')).getByText('The TA stage is missing in Ashby')).toBeInTheDocument();
+    expect(within(rowOf('Night Shift Advisor')).getByRole('button', { name: 'Pause' })).toBeEnabled();
+    // A complete paused mapping resumes.
+    await userEvent.click(within(rowOf('Customer Success Lead')).getByRole('button', { name: 'Resume' }));
+    await waitFor(() => expect(resumeAshbyMapping).toHaveBeenCalledWith('m3'));
+  });
+
+  it('only a LIVE mapping offers its backlog; the others say why in the menu', async () => {
+    renderPage();
+    await screen.findByText('Customer Success Lead');
+    await userEvent.click(within(rowOf('Customer Success Lead')).getByRole('button', { name: /^More actions for/ }));
+    const backlog = screen.getByRole('menuitem', { name: 'Preview existing backlog' });
+    expect(backlog).toHaveAttribute('aria-disabled', 'true');
+    expect(backlog).toHaveAccessibleDescription('Available once this mapping is live');
+  });
+
+  it('after Pause, focus returns to the SAME button — now saying Resume — not <body>', async () => {
+    let settle: (value: unknown) => void = () => {};
+    pauseAshbyMapping.mockReturnValue(new Promise((resolve) => { settle = resolve; }));
+    listAshbyMappings
+      .mockResolvedValueOnce(ROWS)
+      .mockResolvedValue({ ...ROWS, mappings: ROWS.mappings.map((m) => (m.id === 'm1' ? { ...m, status: 'paused' } : m)) });
+    renderPage();
+    await screen.findByText('Account Executive');
+    const button = within(rowOf('Account Executive')).getByRole('button', { name: 'Pause' });
+    await userEvent.click(button);
+    // What a real browser does to a focused control the moment it is disabled.
+    dropFocusToBody();
+    await act(async () => settle({ ok: true, status: 'paused' }));
+    await waitFor(() => expect(button).toHaveTextContent('Resume'));
+    await waitFor(() => expect(button).toHaveFocus());
+  });
+
+  it('says what needs a look above each list, in one sentence', async () => {
+    renderPage();
+    await screen.findByText('Account Executive');
+    expect(screen.getByText('1 live, 2 paused and 1 out of sync.')).toBeInTheDocument();
+    expect(screen.getByText('1 with a failed operation and 1 with a resume to review.')).toBeInTheDocument();
+  });
+
+  it('has no axe violations with a row menu open', async () => {
+    const { container } = renderPage();
+    await screen.findByText('Account Executive');
+    await userEvent.click(within(rowOf('Account Executive')).getByRole('button', { name: /^More actions for/ }));
+    await userEvent.keyboard('{End}');
+    await expect(container).toHaveNoViolations();
+  });
+});
+
+describe('Cancelling a screening asks first', () => {
+  const CONSEQUENCES =
+    "Screening stops for this application. Any invite, scorecard write-back or stage move still " +
+    "waiting is cancelled, and it can't be restarted from here.";
+  const TERMINAL = { ok: true, workflows: [{ ...WORKFLOWS.workflows[0], lifecycle: 'cancelled', terminalState: 'manual_stage_cancel' }] };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    listAshbyMappings.mockResolvedValue(MAPPINGS);
+    listAshbyWorkflows.mockResolvedValue(WORKFLOWS);
+    listRoles.mockResolvedValue(ROLES);
+    listAshbyJobs.mockResolvedValue(JOBS);
+    cancelAshbyWorkflow.mockResolvedValue({ ok: true, cancelled_operations: 1, cancelled_ingestion: 1 });
+  });
+
+  const more = () => screen.getByRole('button', { name: 'More actions for app_1' });
+
+  async function openCancel(): Promise<HTMLElement> {
+    renderPage();
+    await screen.findByText('app_1');
+    await userEvent.click(more());
+    const item = screen.getByRole('menuitem', { name: 'Cancel screening' });
+    expect(item).toHaveAttribute('aria-haspopup', 'dialog');
+    await userEvent.click(item);
+    return screen.getByRole('dialog', { name: 'Cancel this screening?' });
+  }
+
+  it('names the application, says what happens, and puts the red fill only on its confirm button', async () => {
+    const dialog = await openCancel();
+    expect(dialog).toHaveAttribute('aria-modal', 'true');
+    expect(dialog).toHaveAccessibleDescription('app_1');
+    expect(dialog).toHaveTextContent(CONSEQUENCES);
+    expect(within(dialog).getByRole('button', { name: 'Cancel screening' })).toHaveAttribute('data-dialog-primary');
+    expect(cancelAshbyWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('Keep screening and Escape cancel nothing, and focus returns to the row\'s More button', async () => {
+    const dialog = await openCancel();
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Keep screening' }));
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(more()).toHaveFocus();
+
+    await userEvent.click(more());
+    await userEvent.click(screen.getByRole('menuitem', { name: 'Cancel screening' }));
+    await userEvent.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog')).toBeNull();
+    expect(more()).toHaveFocus();
+    expect(cancelAshbyWorkflow).not.toHaveBeenCalled();
+  });
+
+  it('confirming cancels, reloads, confirms on the page, and puts focus on the now-closed row', async () => {
+    listAshbyWorkflows.mockResolvedValueOnce(WORKFLOWS).mockResolvedValue(TERMINAL);
+    const dialog = await openCancel();
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel screening' }));
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(cancelAshbyWorkflow).toHaveBeenCalledWith('l1', 'manual_stage_cancel');
+    // Reloaded BEFORE closing: the row is closed and has no menu any more…
+    expect(screen.getByText('Cancelled by an admin')).toHaveAttribute('title', 'manual_stage_cancel');
+    expect(screen.queryByRole('button', { name: 'More actions for app_1' })).toBeNull();
+    // …so focus is on the row itself, not on <body>.
+    expect(screen.getByText('app_1')).toHaveFocus();
+    expect(document.getElementById('ashby-mapping-confirmation')).toHaveTextContent('Screening cancelled.');
+  });
+
+  it('already closed elsewhere: says so inside the dialog, refreshes, and turns the confirm off', async () => {
+    cancelAshbyWorkflow.mockRejectedValue(new ApiError('already_terminal', 409));
+    listAshbyWorkflows.mockResolvedValueOnce(WORKFLOWS).mockResolvedValue(TERMINAL);
+    const dialog = await openCancel();
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Cancel screening' }));
+    await waitFor(() =>
+      expect(within(dialog).getByRole('alert')).toHaveTextContent(
+        'This application was already closed. The list has been refreshed.',
+      ),
+    );
+    expect(listAshbyWorkflows).toHaveBeenCalledTimes(2);
+    expect(within(dialog).getByRole('button', { name: 'Cancel screening' })).toBeDisabled();
+    expect(dialog).not.toHaveTextContent('already_terminal');
+    // Its More button left with the reload; focus goes to the row.
+    await userEvent.keyboard('{Escape}');
+    expect(screen.getByText('app_1')).toHaveFocus();
+  });
+
+  it('anything else says "Try again", reloads nothing, and trying again works', async () => {
+    cancelAshbyWorkflow.mockRejectedValueOnce(new ApiError('mission_control_action_error', 500));
+    const dialog = await openCancel();
+    const confirm = () => within(dialog).getByRole('button', { name: 'Cancel screening' });
+    await userEvent.click(confirm());
+    await waitFor(() =>
+      expect(within(dialog).getByRole('alert')).toHaveTextContent('Could not cancel this screening. Try again.'),
+    );
+    expect(listAshbyWorkflows).toHaveBeenCalledTimes(1);
+    expect(confirm()).toBeEnabled();
+    await userEvent.click(confirm());
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    expect(cancelAshbyWorkflow).toHaveBeenCalledTimes(2);
+  });
+
+  it('has no axe violations with the confirmation open', async () => {
+    const { container } = renderPage();
+    await screen.findByText('app_1');
+    await userEvent.click(more());
+    await userEvent.click(screen.getByRole('menuitem', { name: 'Cancel screening' }));
+    screen.getByRole('dialog', { name: 'Cancel this screening?' });
+    await expect(container).toHaveNoViolations();
   });
 });

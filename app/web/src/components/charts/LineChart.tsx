@@ -9,16 +9,22 @@ import { EChart } from './EChart';
 import { ChartReveal } from './reveal';
 import { ChartEmpty, ChartError } from './states';
 import { chartTheme } from './theme';
+import { buildLineSeries } from './series';
+import type { LineChartDatum, LineChartSeries } from './series';
 
-export interface LineChartDatum {
-  label: string;
-  value: number;
-}
+export type { LineChartDatum, LineChartSeries } from './series';
 
 export interface LineChartProps {
   title: string;
   description?: string;
-  data: LineChartDatum[];
+  /** The single series. Ignored when `series` is given. */
+  data?: LineChartDatum[];
+  /**
+   * Several series on one axis (e.g. qualified and disqualified rates over
+   * the same days). A day missing from one series is a GAP in that line,
+   * never a zero.
+   */
+  series?: LineChartSeries[];
   unit?: string;
   isLoading?: boolean;
   error?: string | null;
@@ -28,14 +34,13 @@ export interface LineChartProps {
   /** Show an inside dataZoom when there are more points than this. */
   zoomThreshold?: number;
   /**
-   * Draw a marker on every point and stop smoothing the line.
+   * Draw a marker on every point, however dense the series.
    *
-   * For a series whose x-axis has had days REMOVED — a rate that is undefined
-   * on days with no denominator — the default smoothed, symbol-less line is
-   * actively misleading: evenly-spaced points drawn as a continuous curve turn
-   * "20% in June, 60% in September, nothing in between" into a gentle climb
-   * across an apparently unbroken quarter. Markers restore the "these are
-   * discrete observations" reading that the spliced axis destroys.
+   * For a series whose x-axis has had days REMOVED (a rate that is undefined
+   * on days with no denominator), a symbol-less line turns "20% in June, 60%
+   * in September, nothing in between" into an apparently unbroken climb.
+   * Markers restore the "these are discrete observations" reading that the
+   * spliced axis destroys.
    */
   discrete?: boolean;
   /** Empty-state heading. Defaults to the sessions wording. */
@@ -47,14 +52,23 @@ export interface LineChartProps {
 }
 
 /**
- * Sessions-over-time line chart with an inside dataZoom for dense series.
- * Always pairs the canvas with an sr-only data table (no Canvas keyboard
- * claims — see EChart).
+ * Line chart for counts and rates over days, with an inside dataZoom for
+ * dense series. Always pairs the canvas with an sr-only data table (no
+ * canvas keyboard claims, see EChart).
+ *
+ * STRAIGHT SEGMENTS, ALWAYS. A spline (`smooth`) invents values between the
+ * points it passes through: the dashboard's "candidates added" curve dipped
+ * below 1 between two days that each had exactly 1, and Mission Control's
+ * session curve swung under zero. A count of people has no value between
+ * two days, and a rate has no value on a day that was dropped. A straight
+ * segment only claims "this changed to that", which is all the data says,
+ * and it cannot overshoot either endpoint.
  */
 export function LineChart({
   title,
   description,
-  data,
+  data = [],
+  series: seriesProp,
   unit = 'sessions',
   isLoading = false,
   error = null,
@@ -71,104 +85,111 @@ export function LineChart({
   const reduced = useReducedMotion();
   const { palette, base } = chartTheme(theme, reduced);
 
+  const series: LineChartSeries[] = seriesProp ?? [{ name: title, data }];
+  const multi = series.length > 1;
+  const { labels, lines } = buildLineSeries(series, { discrete, colors: palette.colors });
+  const isPercent = unit === '%';
+  const formatValue = (v: number | null | undefined) =>
+    v == null ? 'No data' : isPercent ? `${v}%` : v.toLocaleString();
+
   let body: ReactNode;
   if (isLoading) {
     body = <ChartSkeleton />;
   } else if (error) {
     body = <ChartError message={error} onRetry={onRetry} />;
-  } else if (data.length === 0) {
-    body = (
-      <ChartEmpty title={emptyTitle} hint={emptyHint} />
-    );
+  } else if (labels.length === 0) {
+    body = <ChartEmpty title={emptyTitle} hint={emptyHint} />;
   } else {
     const option: EChartsOption = {
       ...base,
       xAxis: {
         type: 'category',
         boundaryGap: false,
-        data: data.map((d) => d.label),
+        data: labels,
         axisLine: { show: false },
         axisTick: { show: false },
-        // `hideOverlap` so the axis drops labels cleanly rather than at a
-        // fixed interval: a discrete series is told to "check the dates", and
-        // that only helps if the dates it keeps are legible.
+        // `hideOverlap` drops labels cleanly rather than at a fixed interval:
+        // a discrete series is read by its dates, so the ones it keeps must
+        // be legible.
         axisLabel: { color: palette.subtext, margin: 12, hideOverlap: true },
       },
       yAxis: {
         type: 'value',
         axisLine: { show: false },
-        axisLabel: { color: palette.subtext },
+        axisLabel: {
+          color: palette.subtext,
+          formatter: isPercent ? '{value}%' : undefined,
+        },
         splitLine: { lineStyle: { color: palette.splitLine } },
         minInterval: 1,
+        min: 0,
+        // A rate is out of 100. Letting the axis stop at the data's max made
+        // a flat 30% look like a chart-filling swing.
+        max: isPercent ? 100 : undefined,
       },
       grid: {
         left: 8,
-        right: 8,
+        right: 12,
         top: 16,
         bottom: 8,
         // echarts 6: containLabel is deprecated; outerBoundsMode is equivalent.
         outerBoundsMode: 'same',
         outerBoundsContain: 'axisLabel',
       },
-      tooltip: { trigger: 'axis' },
-      series: [
-        {
-          type: 'line',
-          name: title,
-          data: data.map((d) => d.value),
-          smooth: discrete ? false : 0.35,
-          symbol: 'circle',
-          // Markers restore the "discrete observations" reading a spliced axis
-          // destroys — but at 5px plus a 1.5px border they merge into a solid
-          // band once points are closer together than ~8px, which on a 90-day
-          // half-width chart is well before the series ends.
-          symbolSize: discrete && data.length > 45 ? 3 : 5,
-          // `discrete` forces markers on however dense the series: hiding them
-          // is only safe when consecutive points are consecutive periods.
-          showSymbol: discrete || data.length <= 20,
-          lineStyle: { width: 2 },
-          itemStyle: { borderColor: '#ffffff', borderWidth: 1.5 },
-          areaStyle: {
-            // Soft accent wash fading to transparent — reads as depth, not fill.
-            color: {
-              type: 'linear',
-              x: 0,
-              y: 0,
-              x2: 0,
-              y2: 1,
-              colorStops: [
-                { offset: 0, color: 'rgba(78, 107, 166, 0.22)' },
-                { offset: 1, color: 'rgba(78, 107, 166, 0)' },
-              ],
-            },
-          },
-          emphasis: { focus: 'series' },
-        },
-      ],
+      tooltip: {
+        trigger: 'axis',
+        valueFormatter: (v) => formatValue(typeof v === 'number' ? v : null),
+      },
+      series: lines,
       dataZoom:
-        data.length > zoomThreshold
-          ? [{ type: 'inside', start: 0, end: 100 }]
-          : undefined,
+        labels.length > zoomThreshold ? [{ type: 'inside', start: 0, end: 100 }] : undefined,
     };
+    // Block layout, not a flex column: the chart measures its container's
+    // width when the window resizes, and a flex item with no content width
+    // of its own collapsed to a few pixels during a full-page capture.
     body = (
-      <ChartReveal epoch={data.length} className="h-full">
-        <EChart option={option} ariaLabel={title} height={height} renderer={renderer} />
-      </ChartReveal>
+      <>
+        {multi && (
+          <ul className="mb-2 flex flex-wrap gap-x-4 gap-y-1" aria-hidden="true">
+            {series.map((s, index) => (
+              <li key={s.name} className="flex items-center gap-1.5 text-xs text-ink-secondary">
+                <span
+                  className="h-0.5 w-3 rounded-full"
+                  style={{ backgroundColor: s.color ?? palette.colors[index % palette.colors.length] }}
+                />
+                {s.name}
+              </li>
+            ))}
+          </ul>
+        )}
+        <ChartReveal epoch={labels.length}>
+          <EChart option={option} ariaLabel={title} height={height} renderer={renderer} />
+        </ChartReveal>
+      </>
     );
   }
 
+  const valueHeader = unit === '%' ? 'Percent' : unit.charAt(0).toUpperCase() + unit.slice(1);
   return (
     <figure className={cx('h-full', className)}>
       <figcaption className="sr-only">
         {title}
-        {description ? ` — ${description}` : ''}
+        {description ? `. ${description}` : ''}
       </figcaption>
       {body}
-      {!isLoading && !error && data.length > 0 && (
+      {!isLoading && !error && labels.length > 0 && (
         <ChartDataTable
           caption={`${title} data`}
-          headers={['Date', unit.charAt(0).toUpperCase() + unit.slice(1)]}
-          rows={data.map((d) => ({ cells: [d.label, d.value] }))}
+          headers={['Date', ...(multi ? series.map((s) => s.name) : [valueHeader])]}
+          rows={labels.map((label) => ({
+            cells: [
+              label,
+              ...series.map((s) => {
+                const hit = s.data.find((d) => d.label === label);
+                return hit ? (isPercent ? `${hit.value}%` : hit.value) : 'No data';
+              }),
+            ],
+          }))}
         />
       )}
     </figure>

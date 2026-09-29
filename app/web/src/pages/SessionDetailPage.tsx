@@ -1,27 +1,38 @@
 /**
- * HELLO Session Detail — read-only post-session view (Lane 3).
+ * HELLO Session Detail — the read-only record of one screening (Lane 3).
  *
  * Uses the existing `GET /api/screening/:id` contract
  * (`SessionDetail = { session, transcript, assessment }`):
  *
+ *   - Scorecard: rendered from the returned `assessment` via <Scorecard>,
+ *     which handles both generations (legacy dimensions and role-scorecard
+ *     v2). It comes first: the verdict is what a recruiter opened this for.
  *   - Transcript: speaker turns only — the API contract has no timestamps,
  *     so none are fabricated.
- *   - Scorecard: rendered from the returned `assessment` via <Scorecard>.
  *   - Recording: authorized short-lived player/download via
  *     `GET /api/recordings/:id/download` — fetched ONLY on an explicit click,
  *     refreshed on expiry, errors handled inline. The signed URL appears in
  *     the DOM only as the media href while active and is never logged.
  *
+ * NAMING. The page is named by what it is (whose screening, for which role),
+ * never by its id. The session payload carries only `candidate_id` and
+ * `role_id`, so the page also reads the candidate (for the name) and the
+ * role (for the title). Both reads are enrichment: if either fails, the page
+ * still renders, named from what it does know. The session id stays one
+ * hover away in the details list, shortened, for support.
+ *
  * There is deliberately NO composer here: this is a review view, not a
  * live-screening console.
  */
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { ReactNode } from 'react';
 import { Link, useParams } from 'react-router-dom';
 import { api, ApiError } from '../api';
-import type { SessionDetail } from '../types';
+import type { Session, SessionDetail } from '../types';
 import {
   buttonClass,
+  EmptyPanel,
   ErrorPanel,
   GlassPanel,
   LoadingPanel,
@@ -37,106 +48,163 @@ import {
   sessionStatusTone,
 } from '../components/talent';
 import { Scorecard } from '../components/Scorecard';
-import { formatDateTime } from '../lib/datetime';
+import { BackIcon } from '../components/session/BackIcon';
+import { formatSessionWhen } from '../components/session/format';
+import { shortId } from '../lib/humanize';
 import { sessionModeLabel } from '../lib/session-mode';
+
+/** What the page knows about the session beyond its own payload. */
+interface SessionContext {
+  candidateName: string | null;
+  roleTitle: string | null;
+}
+
+function nonBlank(value: unknown): string | null {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+/**
+ * Read the candidate's name and the role's title. Never rejects: each read
+ * is settled on its own, and a failure only means the page names itself
+ * from less. (`Promise.resolve().then` so a synchronous throw is caught too.)
+ */
+async function readContext(session: Session): Promise<SessionContext> {
+  const [candidate, role] = await Promise.allSettled([
+    session.candidate_id
+      ? Promise.resolve().then(() => api.getCandidate(session.candidate_id))
+      : Promise.resolve(null),
+    session.role_id
+      ? Promise.resolve().then(() => api.getRole(session.role_id as string))
+      : Promise.resolve(null),
+  ]);
+  return {
+    candidateName: candidate.status === 'fulfilled' ? nonBlank(candidate.value?.candidate?.name) : null,
+    roleTitle: role.status === 'fulfilled' ? nonBlank(role.value?.title) : null,
+  };
+}
+
+/** "Meera Iyer’s screening", else the role, else the mode. Never an id. */
+function pageTitle(session: Session, context: SessionContext): string {
+  if (context.candidateName) return `${context.candidateName}’s screening`;
+  if (context.roleTitle) return `${context.roleTitle} screening`;
+  const mode = sessionModeLabel(session.mode);
+  return mode === 'Screening' ? 'Screening' : `${mode} screening`;
+}
+
+/** Role · mode · when, leaving out whatever the title already says or is unknown. */
+function pageMeta(session: Session, context: SessionContext): string {
+  const mode = sessionModeLabel(session.mode);
+  return [
+    context.candidateName ? context.roleTitle : null,
+    mode === 'Screening' ? null : mode,
+    formatSessionWhen(session.started_at ?? session.created_at),
+  ]
+    .filter(Boolean)
+    .join(' · ');
+}
 
 export function SessionDetailPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
   const [detail, setDetail] = useState<SessionDetail | null>(null);
+  const [context, setContext] = useState<SessionContext | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // A retry (or a new id) supersedes any read still in flight.
+  const generation = useRef(0);
 
   const load = useCallback(() => {
     if (!sessionId) return;
+    const current = ++generation.current;
     setError(null);
     setDetail(null);
+    setContext(null);
     api
       .getSession(sessionId)
-      .then(setDetail)
-      .catch((e: ApiError) => setError(e.message));
+      .then(async (data) => {
+        const ctx = await readContext(data.session);
+        if (current !== generation.current) return;
+        // One commit: the heading renders once, already named, instead of
+        // flashing a fallback title and then swapping it.
+        setDetail(data);
+        setContext(ctx);
+      })
+      .catch((e: ApiError) => {
+        if (current !== generation.current) return;
+        setError(e?.message || 'Failed to load the session.');
+      });
   }, [sessionId]);
 
   useEffect(load, [load]);
 
   if (error) return <ErrorPanel message={error} onRetry={load} />;
-  if (!detail) return <LoadingPanel label="Loading session…" />;
+  if (!detail || !context) return <LoadingPanel label="Loading session…" />;
 
   const { session, transcript, assessment } = detail;
   const completed = session.status === 'completed';
   const gateOnlyTranscript = transcript.length > 0 && transcript.every((line) => line.is_gate === true);
+  const meta = pageMeta(session, context);
+  const words = typeof session.candidate_words === 'number' ? session.candidate_words : null;
 
   return (
     <div className="space-y-6">
       <PageHeader
-        eyebrow="Session"
-        title={`Session ${session.id.slice(0, 8)}`}
-        description={`${sessionModeLabel(session.mode)} screening · created ${formatDateTime(session.created_at)}`}
+        title={pageTitle(session, context)}
+        description={meta || undefined}
         actions={
-          <Link
-            to={`/candidates/${session.candidate_id}`}
-            className={buttonClass('secondary', 'sm')}
-          >
-            ← Back to candidate
+          <Link to={`/candidates/${session.candidate_id}`} className={buttonClass('ghost', 'md', '-ml-3 sm:-mr-3 sm:ml-0')}>
+            <BackIcon />
+            Back to candidate
           </Link>
         }
       />
 
-      <p className="glass-sunken px-4 py-3 text-[13px] leading-5 text-ink-secondary">
-        This is a read-only view of the completed session. Transcript and
-        scorecard are final; recordings are served through short-lived links
-        created on request.
-      </p>
-
-      <div className="grid grid-cols-1 gap-6 lg:grid-cols-12">
-        {/* Transcript */}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-12 lg:items-start">
+        {/* Scorecard: the verdict first, then the evidence it rests on. */}
         <GlassPanel className="lg:col-span-7">
-          <SectionHeader
-            title={gateOnlyTranscript ? 'Pre-interview gate transcript' : 'Transcript'}
-            description={`${transcript.length} speaker turn${transcript.length === 1 ? '' : 's'}`}
-          />
-          {gateOnlyTranscript && (
-            <p className="mt-3 rounded-lg border border-line bg-surface-secondary px-3 py-2 text-sm leading-5 text-ink-secondary">
-              This is the identity and recording-consent exchange before the interview. No screening interview was recorded in this session.
-            </p>
-          )}
-          {/* `TranscriptList` already exposes a region named "Transcript";
-              this scroll region needs a distinct name (axe landmark-unique). */}
-          <ScrollArea maxHeight="34rem" label="Session transcript" className="mt-3">
-            <TranscriptList transcript={transcript} />
-          </ScrollArea>
+          <SectionHeader title="Scorecard" />
+          <div className="mt-5">
+            {assessment ? (
+              <Scorecard assessment={assessment} />
+            ) : (
+              <EmptyPanel
+                compact
+                title="No scorecard yet"
+                hint={
+                  completed
+                    ? 'Scoring may still be running. Check back in a minute.'
+                    : 'This session has not completed, so it has not been scored.'
+                }
+              />
+            )}
+          </div>
         </GlassPanel>
 
         <div className="space-y-6 lg:col-span-5">
-          {/* Session meta */}
+          {/* Details + recording: one surface, one logical group (the call).
+              The recording control brings its own bordered well, so no
+              extra hairline above it. */}
           <GlassPanel>
-            <SectionHeader title="Session details" />
-            <dl className="mt-4 grid grid-cols-[auto_1fr] gap-x-4 gap-y-3 text-sm">
-              <MetaField label="Status">
+            <SectionHeader title="Details" />
+            <dl className="mt-2 divide-y divide-glass-ring">
+              <DetailRow label="Status">
                 <StatusBadge tone={sessionStatusTone(session.status)}>
                   {sessionStatusLabel(session.status)}
                 </StatusBadge>
-              </MetaField>
-              <MetaField label="Mode">
-                {sessionModeLabel(session.mode)}
-              </MetaField>
-              <MetaField label="Duration">
-                {formatDurationSec(session.duration_sec)}
-              </MetaField>
-              <MetaField label="Started">
-                {formatDateTime(session.started_at ?? session.created_at)}
-              </MetaField>
-              <dt className="text-[13px] text-ink-tertiary">Session ID</dt>
-              <dd className="break-all text-right font-mono text-xs text-ink-secondary">
-                {session.id}
-              </dd>
+              </DetailRow>
+              {session.duration_sec != null && (
+                <DetailRow label="Duration">{formatDurationSec(session.duration_sec)}</DetailRow>
+              )}
+              {words != null && (
+                <DetailRow label="Candidate words">{words.toLocaleString('en-IN')}</DetailRow>
+              )}
+              <DetailRow label="Reference">
+                <span title={session.id} className="font-mono text-[13px] text-ink-secondary">
+                  {shortId(session.id)}
+                </span>
+              </DetailRow>
             </dl>
-          </GlassPanel>
-
-          {/* Recording — authorized on-demand access */}
-          <GlassPanel>
-            <SectionHeader title="Recording" />
             <div className="mt-4">
               {completed ? (
-                <RecordingCard sessionId={session.id} title="Session recording" />
+                <RecordingCard sessionId={session.id} title="Recording" />
               ) : (
                 <p className="text-sm text-ink-tertiary">
                   Recording access is available once the session completes.
@@ -144,43 +212,35 @@ export function SessionDetailPage() {
               )}
             </div>
           </GlassPanel>
-        </div>
-      </div>
 
-      <div className="mt-6">
-      {/* Scorecard */}
-      <GlassPanel>
-        <SectionHeader title="Scorecard" />
-        <div className="mt-4">
-          {assessment ? (
-            <Scorecard assessment={assessment} />
-          ) : completed ? (
-            <p className="glass-sunken px-4 py-8 text-center text-sm text-ink-secondary">
-              No scorecard yet — assessment generation may still be running.
-            </p>
-          ) : (
-            <p className="glass-sunken px-4 py-8 text-center text-sm text-ink-secondary">
-              No scorecard — the session has not completed.
-            </p>
-          )}
+          <GlassPanel>
+            <SectionHeader
+              title={gateOnlyTranscript ? 'Pre-interview gate transcript' : 'Transcript'}
+              description={`${transcript.length} speaker turn${transcript.length === 1 ? '' : 's'}`}
+            />
+            {gateOnlyTranscript && (
+              <p className="glass-sunken mt-3 px-3.5 py-2.5 text-[13px] leading-5 text-ink-secondary">
+                This is the identity and recording-consent exchange before the interview. No screening
+                interview was recorded in this session.
+              </p>
+            )}
+            {/* `TranscriptList` already exposes a region named "Transcript";
+                this scroll region needs a distinct name (axe landmark-unique). */}
+            <ScrollArea maxHeight="32rem" label="Session transcript" className="mt-2">
+              <TranscriptList transcript={transcript} />
+            </ScrollArea>
+          </GlassPanel>
         </div>
-      </GlassPanel>
       </div>
     </div>
   );
 }
 
-function MetaField({
-  label,
-  children,
-}: {
-  label: string;
-  children: React.ReactNode;
-}) {
+function DetailRow({ label, children }: { label: string; children: ReactNode }) {
   return (
-    <>
+    <div className="flex min-h-11 items-center justify-between gap-4 py-2">
       <dt className="text-[13px] text-ink-tertiary">{label}</dt>
-      <dd className="text-right text-sm text-ink">{children}</dd>
-    </>
+      <dd className="text-right text-sm tabular-nums text-ink">{children}</dd>
+    </div>
   );
 }

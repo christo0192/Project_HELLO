@@ -217,13 +217,18 @@ describe('DashboardPage', () => {
     ).toHaveAttribute('href', candidatesHref({ statuses: ['screened'] }));
   });
 
-  it('derives the funnel donut + data table from candidate statuses', async () => {
+  it('derives the stage bars (a captioned table) from candidate statuses', async () => {
     getMe.mockResolvedValue(VIEWER_ME);
     renderDashboard();
-    const table = await screen.findByRole('table', { name: 'Screening funnel data' });
-    expect(within(table).getByRole('cell', { name: 'New' })).toBeInTheDocument();
-    expect(within(table).getByRole('cell', { name: 'Screened' })).toBeInTheDocument();
-    expect(within(table).getByRole('cell', { name: 'Advanced' })).toBeInTheDocument();
+    const table = await screen.findByRole('table', { name: 'Pipeline by stage data' });
+    // Pipeline order, not size order, with the count and share on each row.
+    expect(within(table).getAllByRole('rowheader').map((h) => h.textContent)).toEqual([
+      'New',
+      'Screening',
+      'Screened',
+      'Advanced',
+    ]);
+    expect(within(table).getAllByRole('row')[1]).toHaveTextContent('New125%');
   });
 
   it('drills down when a KPI link is clicked (URL filter applied)', async () => {
@@ -243,17 +248,18 @@ describe('DashboardPage', () => {
     expect(legendLink).toHaveAttribute('href', candidatesHref({ statuses: ['new'] }));
   });
 
-  it('shows completion and outcome links', async () => {
+  it('shows completion and the outcome drill-down links', async () => {
     getMe.mockResolvedValue(VIEWER_ME);
     renderDashboard();
     // 1 decided (advanced) of 4 considered = 25%
     expect(await screen.findByText(/1 of 4 decided/i)).toBeInTheDocument();
+    expect(screen.getByText('25% complete')).toBeInTheDocument();
     expect(
-      screen.getByRole('link', { name: /advanced candidates/i }),
+      screen.getByRole('link', { name: /^Advanced: 1 \(25%\)\. View these candidates/ }),
     ).toHaveAttribute('href', candidatesHref({ statuses: ['advanced'] }));
-    expect(
-      screen.getByRole('link', { name: /rejected candidates/i }),
-    ).toHaveAttribute('href', candidatesHref({ statuses: ['rejected'] }));
+    // A stage with nobody in it is not drawn as an empty bar with a link to
+    // an empty list; it is simply absent.
+    expect(screen.queryByRole('link', { name: /^Rejected:/ })).not.toBeInTheDocument();
   });
 
   it('renders the average score linking to the assessed cohort', async () => {
@@ -281,8 +287,10 @@ describe('DashboardPage', () => {
     getMe.mockResolvedValue(VIEWER_ME);
     renderDashboard();
     const table = await screen.findByRole('table', { name: 'Recommendation distribution data' });
-    expect(within(table).getByRole('cell', { name: 'Advance' })).toBeInTheDocument();
-    expect(within(table).getByRole('cell', { name: 'Reject' })).toBeInTheDocument();
+    expect(within(table).getByRole('rowheader', { name: /Advance/ })).toBeInTheDocument();
+    expect(within(table).getByRole('rowheader', { name: /Reject/ })).toBeInTheDocument();
+    // "Hold: 0" is not drawn: only recommendations somebody actually got.
+    expect(within(table).queryByRole('rowheader', { name: /Hold/ })).not.toBeInTheDocument();
     const advanceLink = screen.getByRole('link', { name: /Advance:.*View these candidates/i });
     expect(advanceLink).toHaveAttribute('href', candidatesHref({ recommendations: ['advance'] }));
     fireEvent.click(advanceLink);
@@ -306,7 +314,7 @@ describe('DashboardPage', () => {
     const queue = screen.getByRole('region', { name: 'Action queue' });
     const reviewLink = within(queue).getByRole('link', { name: 'Jane Doe' });
     expect(reviewLink).toHaveAttribute('href', '/candidates/c1');
-    expect(within(queue).getByText('consent verified')).toBeInTheDocument();
+    expect(within(queue).getByText('Consent verified')).toBeInTheDocument();
     expect(within(queue).getByText('Workspace-wide')).toBeInTheDocument();
   });
 
@@ -337,6 +345,41 @@ describe('DashboardPage', () => {
     expect(screen.getAllByText(/will appear here/).length).toBeGreaterThan(0);
   });
 
+  it('leads with the four pipeline figures on one surface, in the order work happens', async () => {
+    getMe.mockResolvedValue(VIEWER_ME);
+    renderDashboard();
+    const hero = await screen.findByRole('group', { name: 'Pipeline' });
+    expect(within(hero).getAllByRole('link').map((l) => l.getAttribute('aria-label'))).toEqual([
+      '4 candidates in pipeline. View all candidates.',
+      '1 candidates awaiting screening. View them.',
+      '1 candidates in screening. View them.',
+      '1 candidates awaiting a decision. Review them.',
+    ]);
+    // No card per number.
+    expect(hero.querySelector('.glass')).toBeNull();
+  });
+
+  it('shows appointment states in words and times as "d MMM, HH:mm IST"', async () => {
+    const soon = new Date(Date.now() + 2 * 3_600_000).toISOString();
+    getPhoneCalendar.mockResolvedValue({
+      ...PHONE_CALENDAR,
+      count: 1,
+      appointments: [
+        { id: 'a1', engagement_id: 'e1', starts_at: soon, ends_at: soon, ist_date: '2026-06-05', ist_start: null, ist_end: null, status: 'scheduled', source: 'recruiter', confirmed_at: null, cancel_reason: null, version: 1, created_at: soon, updated_at: soon, engagement_state: null, role_id: null, candidate: { id: 'c1', name: 'Jane Doe' } },
+      ],
+    });
+    renderDashboard();
+    const list = await screen.findByRole('list', { name: 'Next phone appointments' });
+    expect(within(list).getByText('Scheduled')).toHaveAttribute('title', 'scheduled');
+    expect(within(list).getByText(/^\d{1,2} [A-Z][a-z]{2}( \d{4})?, \d{2}:\d{2} IST$/)).toBeInTheDocument();
+  });
+
+  it('never uses an uppercase eyebrow', async () => {
+    const { container } = renderDashboard();
+    await screen.findByText('Recent candidates');
+    expect(container.querySelector('.uppercase')).toBeNull();
+  });
+
   it('has no axe violations on a populated interviewer view', async () => {
     getMe.mockResolvedValue(INTERVIEWER_ME);
     listNotificationIntents.mockResolvedValue({ intents: INTENTS });
@@ -352,7 +395,7 @@ describe('DashboardPage', () => {
     expect(await screen.findByText('Recent candidates')).toBeInTheDocument();
     expect(document.documentElement.classList.contains('dark')).toBe(true);
     expect(
-      screen.getByRole('table', { name: 'Screening funnel data' }),
+      screen.getByRole('table', { name: 'Pipeline by stage data' }),
     ).toBeInTheDocument();
   });
 });

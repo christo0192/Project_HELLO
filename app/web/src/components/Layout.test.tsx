@@ -104,7 +104,7 @@ describe('Layout shell', () => {
     expect(logo?.getAttribute('class')).not.toMatch(/invert/i);
     const { getByText } = within(aside as HTMLElement);
     expect(getByText('HELLO')).toBeInTheDocument();
-    expect(getByText(/Talent Workspace & Mission Control/i)).toBeInTheDocument();
+    expect(getByText('Recruiting workspace')).toBeInTheDocument();
   });
 
   it('renders Workspace nav: Dashboard, Candidates, Roles', () => {
@@ -235,9 +235,41 @@ describe('Layout shell', () => {
     expect(screen.getByRole('button', { name: 'Sign out' })).toBeInTheDocument();
   });
 
-  it('renders the light-first workspace context', () => {
+  /*
+    M007/S05: the top bar held a lone "Recruiter workspace" pill and, on
+    desktop, a copy of the page's own <h1>. It is now a mobile-only bar that
+    names the page beside the brand; desktop has the sidebar and the <h1>.
+  */
+  it('renders no decorative workspace pill', () => {
     renderLayout();
-    expect(screen.getByText('Recruiter workspace')).toBeInTheDocument();
+    expect(screen.queryByText('Recruiter workspace')).not.toBeInTheDocument();
+  });
+
+  it('keeps the top bar to small screens, naming the current page there', () => {
+    renderLayout('/phone-calendar');
+    const bar = document.querySelector('header');
+    expect(bar).not.toBeNull();
+    expect(bar?.className).toMatch(/(^|\s)lg:hidden(\s|$)/);
+    expect(within(bar as HTMLElement).getByRole('button', { name: 'Open navigation menu' })).toBeInTheDocument();
+    // The visible name is a duplicate of the announcer below, so it is
+    // hidden from assistive technology rather than read twice.
+    const visible = within(bar as HTMLElement).getByText('Phone calendar');
+    expect(visible).toHaveAttribute('aria-hidden', 'true');
+  });
+
+  it('announces the page name politely at every width, and on navigation', async () => {
+    const user = userEvent.setup();
+    renderLayout('/dashboard');
+    const announcer = document.querySelector('[aria-live="polite"]');
+    expect(announcer).not.toBeNull();
+    expect(announcer?.className).toContain('sr-only');
+    // Not inside the mobile-only bar, so desktop keeps its announcements.
+    expect(announcer?.closest('header')).toBeNull();
+    expect(announcer?.textContent).toBe('Dashboard');
+
+    await user.click(screen.getByRole('button', { name: 'Open navigation menu' }));
+    await user.click(screen.getByRole('link', { name: /^Roles$/ }));
+    await waitFor(() => expect(announcer?.textContent).toBe('Roles'));
   });
 });
 

@@ -66,6 +66,11 @@ describe('roles', () => {
   it('lets an admin read and offers the write controls', async () => {
     renderPage();
     expect(await screen.findByRole('table')).toBeInTheDocument();
+    // Booking is the page header's one primary action, a disclosure: offered
+    // to an admin from the start, its form opened on demand.
+    const book = screen.getByRole('button', { name: 'Book a screening' });
+    expect(book).toHaveAttribute('aria-expanded', 'false');
+    await userEvent.click(book);
     expect(
       screen.getByRole('heading', { name: 'Book a phone screening' }),
     ).toBeInTheDocument();

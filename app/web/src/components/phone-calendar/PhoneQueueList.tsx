@@ -13,6 +13,11 @@
  * column by construction, so on a narrow viewport it is the default rather
  * than a degraded fallback.
  *
+ * ── ONE SURFACE, HAIRLINES BETWEEN ROWS ───────────────────────────────
+ * Each day is a group of rows on the panel itself, separated by hairlines —
+ * not a stack of floating white cards. A list reads as a list; the selected
+ * row is the only one lifted onto a white chip.
+ *
  * ── BOUNDED, NOT ENDLESS ──────────────────────────────────────────────
  * A full week can run far past the fold, so the list lives in a focusable,
  * labelled `ScrollArea` and each IST day keeps a sticky label while its own
@@ -44,7 +49,7 @@ export function PhoneQueueList({
 
   return (
     <GlassPanel padding="none" className="overflow-hidden">
-      <ScrollArea maxHeight="40rem" label="Queue" className="px-4 sm:px-5">
+      <ScrollArea maxHeight="40rem" label="Queue" className="px-2 sm:px-3">
         <div>
           {groups.map((group) => {
             const heading =
@@ -52,31 +57,32 @@ export function PhoneQueueList({
                 ? 'Outside this week'
                 : formatIstLongDayLabel(group.date);
             return (
-              <section key={group.date ?? 'outside'} className="mb-5 last:mb-0">
+              <section key={group.date ?? 'outside'} className="mb-4 last:mb-0">
                 {/*
                   Sticky so the day a row belongs to stays on screen while its
                   appointments scroll. The backdrop is opaque enough that the
-                  chips passing underneath never show through the label.
+                  rows passing underneath never show through the label.
                 */}
-                <h2 className="sticky top-0 z-10 -mx-1 mb-2 flex flex-wrap items-baseline gap-2 rounded-[10px] bg-white/80 px-1 py-1 text-[13px] font-medium text-ink backdrop-blur-sm">
+                <h3 className="sticky top-0 z-10 mb-1 flex flex-wrap items-baseline gap-x-2 rounded-[10px] bg-white/85 px-3 py-1.5 text-label font-semibold text-ink backdrop-blur-sm">
                   {heading}
                   {group.date === today && (
-                    <span className="text-xs font-medium text-info">Today</span>
+                    <span className="text-meta font-medium text-info">Today</span>
                   )}
-                  <span className="text-xs font-normal text-ink-tertiary">
+                  <span className="text-meta font-normal tabular-nums text-ink-tertiary">
                     {group.items.length === 1
                       ? '1 appointment'
                       : `${group.items.length} appointments`}
                   </span>
-                </h2>
-                <RevealGroup as="ul" className="flex flex-col gap-2">
+                </h3>
+                <RevealGroup as="ul" className="flex flex-col divide-y divide-[var(--glass-ring)]">
                   {group.items.map((appt) => (
-                    <RevealItem as="li" key={appt.id}>
+                    <RevealItem as="li" key={appt.id} className="py-1">
                       <PhoneAppointmentButton
                         appointment={appt}
                         selected={appt.id === selectedId}
                         onSelect={onSelect}
                         showDate={group.date === null}
+                        layout="row"
                       />
                     </RevealItem>
                   ))}

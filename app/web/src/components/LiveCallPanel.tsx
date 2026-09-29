@@ -302,10 +302,10 @@ export function LiveCallPanel({
         </div>
       ) : !session ? (
         <div className="flex flex-col items-center justify-center gap-1 px-4 py-12 text-center">
-          <p className="text-sm font-medium text-gray-700">No active call</p>
-          <p className="text-xs text-gray-500">
-            Click Start Screening to begin.
-          </p>
+          <p className="text-sm font-medium text-ink">No call in progress</p>
+          {/* There is no "Start screening" button on this page; the panel
+              fills itself when a screening starts. */}
+          <p className="text-xs text-ink-tertiary">The transcript appears here when a screening starts.</p>
         </div>
       ) : (
         <div
@@ -353,18 +353,21 @@ export function LiveCallPanel({
               </span>
               <div className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-tr-sm bg-accent-600 px-3.5 py-2 text-sm italic leading-relaxed text-white opacity-70">
                 {interim}
-                <span className="ml-1.5 inline-flex items-end gap-0.5 align-middle">
+                {/* "Still listening" dots: a soft staggered opacity wave,
+                    not a bounce. Opacity only, eased in and out; static
+                    under reduced motion (`motion-safe:`). Decorative: the
+                    interim words themselves are the content. */}
+                <span aria-hidden="true" className="ml-1.5 inline-flex items-center gap-0.5 align-middle">
                   <span
-                    className="inline-block h-1 w-1 animate-bounce rounded-full bg-white opacity-80"
-                    style={{ animationDelay: "0ms" }}
+                    className="inline-block h-1 w-1 rounded-full bg-white opacity-80 motion-safe:animate-[pulse_1.2s_ease-in-out_infinite]"
                   />
                   <span
-                    className="inline-block h-1 w-1 animate-bounce rounded-full bg-white opacity-80"
-                    style={{ animationDelay: "150ms" }}
+                    className="inline-block h-1 w-1 rounded-full bg-white opacity-80 motion-safe:animate-[pulse_1.2s_ease-in-out_infinite]"
+                    style={{ animationDelay: "200ms" }}
                   />
                   <span
-                    className="inline-block h-1 w-1 animate-bounce rounded-full bg-white opacity-80"
-                    style={{ animationDelay: "300ms" }}
+                    className="inline-block h-1 w-1 rounded-full bg-white opacity-80 motion-safe:animate-[pulse_1.2s_ease-in-out_infinite]"
+                    style={{ animationDelay: "400ms" }}
                   />
                 </span>
               </div>

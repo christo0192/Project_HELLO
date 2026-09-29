@@ -130,8 +130,8 @@ describe('AshbyWorkflowCard — accessible, colour-independent status', () => {
     expect(screen.getByText('Pending')).toBeInTheDocument();
     expect(screen.getByText('Ashby scorecard')).toBeInTheDocument();
     expect(screen.getByText('Failed')).toBeInTheDocument();
-    // Sanitized error code, shown verbatim.
-    expect(screen.getByText('provider_5xx')).toBeInTheDocument();
+    // Sanitized error code, in words, with the exact code one hover away.
+    expect(screen.getByText('Ashby server error')).toHaveAttribute('title', 'provider_5xx');
     // The section is labelled by its heading and is a live region.
     expect(screen.getByRole('region', { name: 'Ashby screening pipeline' })).toBeInTheDocument();
     expect(screen.getByRole('status')).toBeInTheDocument();
@@ -171,7 +171,7 @@ describe('AshbyWorkflowCard — accessible, colour-independent status', () => {
     expect(screen.getByText('Cancelled')).toBeInTheDocument();
   });
 
-  it('falls through to the raw value for an unknown state rather than inventing a label', () => {
+  it("falls through to the raw value's own words for an unknown state rather than inventing a label", () => {
     render(
       <AshbyWorkflowCardView
         workflow={{
@@ -182,9 +182,9 @@ describe('AshbyWorkflowCard — accessible, colour-independent status', () => {
         }}
       />,
     );
-    expect(screen.getByText('some_future_state')).toBeInTheDocument();
-    expect(screen.getByText('some_future_ingestion')).toBeInTheDocument();
-    expect(screen.getByText('some_future_op')).toBeInTheDocument();
+    expect(screen.getByText('Some future state')).toBeInTheDocument();
+    expect(screen.getByText('Some future ingestion')).toBeInTheDocument();
+    expect(screen.getByText('Some future op')).toBeInTheDocument();
   });
 
   it('suppresses an error code that is not a sanitized stable code', () => {

@@ -2,6 +2,8 @@
  * LiveCallPanel accessibility tests.
  */
 
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { render, screen } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { LiveCallPanel } from './LiveCallPanel';
@@ -46,12 +48,23 @@ describe('LiveCallPanel', () => {
     expect(screen.getByText('Live call')).toBeInTheDocument();
   });
 
-  it('shows "No active call" empty state', () => {
+  it('shows the "No call in progress" empty state', () => {
     render(<LiveCallPanel candidateId="candidate-1" candidateName="Jane Doe" />);
-    expect(screen.getByText('No active call')).toBeInTheDocument();
+    expect(screen.getByText('No call in progress')).toBeInTheDocument();
     expect(
-      screen.getByText('Click Start Screening to begin.'),
+      screen.getByText('The transcript appears here when a screening starts.'),
     ).toBeInTheDocument();
+  });
+
+  it('animates its "still listening" dots with a calm opacity pulse, never a bounce', () => {
+    // The interim bubble only appears mid-call over a realtime channel, so
+    // the motion contract is pinned on the source: no bounce anywhere, and
+    // the pulse is gated on motion-safe so reduced motion leaves it static.
+    const source = readFileSync(resolve(__dirname, 'LiveCallPanel.tsx'), 'utf8');
+    expect(source).not.toMatch(/animate-bounce/);
+    const pulses = source.match(/motion-safe:animate-\[pulse_[^\]]*\]/g) ?? [];
+    expect(pulses).toHaveLength(3);
+    expect(source).not.toMatch(/(?<!motion-safe:)animate-\[pulse/);
   });
 
   it('has no axe violations in empty state', async () => {

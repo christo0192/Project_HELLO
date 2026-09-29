@@ -1,6 +1,14 @@
 /**
  * SectionHeader — the one heading row used inside panels and above
  * tables: title (h2/h3), one-sentence description, optional actions.
+ *
+ * Type: the title sits on the SECTION step of the scale (15/20, 600,
+ * -0.01em) at both levels. `level` is document outline, not size: an h2 on
+ * the ground and an h3 inside a panel read at the same weight, and the page
+ * title (28/34) is the only step above them. The description is the label
+ * step (13/20) in tertiary ink; `meta` (a count, a badge) sits on the title's
+ * baseline in tabular figures so "24" and "240" do not jitter as data loads.
+ *
  * Sentence case, no eyebrows, no uppercase tracking.
  */
 import type { ReactNode } from 'react';
@@ -36,17 +44,18 @@ export function SectionHeader({
       )}
     >
       <div className="min-w-0">
-        <div className="flex flex-wrap items-center gap-2">
-          <Heading
-            id={id}
-            className="text-[15px] font-semibold tracking-[-0.01em] text-ink"
-          >
+        {/* Baseline, not centre: a count or a badge beside the title lines up
+            with the title's letters rather than floating at its mid-height. */}
+        <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+          <Heading id={id} className="text-section text-ink">
             {title}
           </Heading>
-          {meta}
+          {meta != null && meta !== false && (
+            <span className="text-label tabular-nums text-ink-tertiary">{meta}</span>
+          )}
         </div>
         {description && (
-          <p className="mt-0.5 max-w-2xl text-[13px] leading-5 text-ink-tertiary">
+          <p className="mt-0.5 max-w-2xl text-pretty text-label text-ink-tertiary">
             {description}
           </p>
         )}

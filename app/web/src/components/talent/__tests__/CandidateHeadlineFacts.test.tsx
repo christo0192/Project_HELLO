@@ -15,7 +15,7 @@
  * badge reading "0m 0s on the call" is a real possibility, and it is a claim
  * that is both precise and wrong.
  */
-import { render, screen } from '@testing-library/react';
+import { render } from '@testing-library/react';
 import { describe, it, expect } from 'vitest';
 import { CandidateHeadlineFacts } from '../CandidateHeadlineFacts';
 

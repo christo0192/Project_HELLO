@@ -13,7 +13,8 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { ThemeProvider } from '../../lib/theme';
-import { ScreeningKpis, buildRateSeries } from './ScreeningKpis';
+import { ScreeningKpis } from './ScreeningKpis';
+import { buildRateSeries } from './rates';
 import {
   stubMatchMedia,
   stubResizeObserver,
@@ -90,14 +91,22 @@ function funnel(
 }
 
 /**
- * Text of the KPI CARD with this label. The explanation list reuses the same
+ * Text of the ONE FIGURE with this label: its label, number and context line,
+ * and nothing of its neighbours. The explanation list reuses the same
  * wording, so a bare text query matches twice.
+ *
+ * The figures are cells of a description list (`dl > div`: term = label,
+ * definition = number). Scoping to the cell matters: the scoreboard row holds
+ * three or four figures, and a helper that returned the whole row would let
+ * `toContain('4')` pass on a neighbour's number.
  */
 async function cardText(label: string): Promise<string> {
   await screen.findAllByText(label);
   const node = screen.getAllByText(label).find((n) => !n.closest('details'));
-  if (!node) throw new Error(`no KPI card labelled "${label}"`);
-  return node.closest('div')?.parentElement?.textContent ?? '';
+  if (!node) throw new Error(`no figure labelled "${label}"`);
+  const cell = node.closest('dl > div');
+  if (!cell) throw new Error(`"${label}" is not inside a figure cell`);
+  return cell.textContent ?? '';
 }
 
 function renderKpis() {
@@ -174,7 +183,7 @@ describe('ScreeningKpis', () => {
     renderKpis();
 
     expect(await screen.findByText(/older database version/i)).toBeInTheDocument();
-    const totals = screen.queryAllByText('Total candidates').filter((n) => !n.closest('details'));
+    const totals = screen.queryAllByText('Candidates').filter((n) => !n.closest('details'));
     expect(totals).toHaveLength(0);
     const rates = screen.queryAllByText('Advance rate').filter((n) => !n.closest('details'));
     expect(rates).toHaveLength(0);
@@ -188,7 +197,7 @@ describe('ScreeningKpis', () => {
       funnel({}, { refreshedAt: null, meta: { rollup_refreshed_at: '2026-09-16T06:00:00Z' } }),
     );
     renderKpis();
-    await screen.findAllByText('Total candidates');
+    await screen.findAllByText('Candidates');
     expect(screen.queryAllByText(/have not been calculated yet/i)).toHaveLength(0);
   });
 
@@ -236,9 +245,9 @@ describe('ScreeningKpis', () => {
       funnel({ dialed: 80, connected: 20, attempts_total: 250, connects_total: 60 }),
     );
     renderKpis();
-    expect(await cardText('Candidates dialled')).toContain('80');
-    expect(await cardText('Candidates reached')).toContain('20');
-    expect(await cardText('Total call attempts')).toContain('250');
+    expect(await cardText('Dialled')).toContain('80');
+    expect(await cardText('Reached')).toContain('20');
+    expect(await cardText('Call attempts')).toContain('250');
   });
 
   // ── Derived counts ────────────────────────────────────────────────────
@@ -248,8 +257,8 @@ describe('ScreeningKpis', () => {
       funnel({ dialed: 31, connected: 17, answered_ge1: 12 }),
     );
     renderKpis();
-    expect(await cardText('Connected, no answers')).toContain('5');  // 17 − 12
-    expect(await cardText('Never connected')).toContain('14');       // 31 − 17
+    expect(await cardText('No answers')).toContain('5');  // 17 − 12
+    expect(await cardText('Never reached')).toContain('14');       // 31 − 17
   });
 
   it('surfaces hold and no-recommendation as one reviewable bucket', async () => {
@@ -293,7 +302,7 @@ describe('ScreeningKpis', () => {
       funnel({ candidates_total: 4 }, { meta: { refresh_window_days: 30 } }),
     );
     renderKpis();
-    await screen.findAllByText('Total candidates');
+    await screen.findAllByText('Candidates');
     fireEvent.click(screen.getByRole('button', { name: '90 days' }));
     expect(await screen.findByText(/no longer recalculated/i)).toBeInTheDocument();
   });
@@ -321,14 +330,14 @@ describe('ScreeningKpis', () => {
     getScreeningFunnel.mockResolvedValue(legacy);
     renderKpis();
 
-    expect(await cardText('Candidates dialled')).toContain('5');
+    expect(await cardText('Dialled')).toContain('5');
 
     // FAIL CLOSED on every derived fact. `schemaCurrent` used to be
     // `meta?.schema_current !== false`, which reads `undefined` as "the columns
     // are present" — so the single deploy window this flag exists to survive
     // was the one window in which it asserted the opposite, rendering
     // "Total candidates 0" beside "Candidates dialled 5".
-    const totals = screen.queryAllByText('Total candidates').filter((n) => !n.closest('details'));
+    const totals = screen.queryAllByText('Candidates').filter((n) => !n.closest('details'));
     expect(totals).toHaveLength(0);
 
     const rates = screen.queryAllByText('Advance rate').filter((n) => !n.closest('details'));
@@ -480,7 +489,7 @@ describe('ScreeningKpis', () => {
     first.unmount();
 
     renderKpis();
-    expect((await screen.findAllByText('Total candidates')).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText('Candidates')).length).toBeGreaterThan(0);
   });
 
   it('ignores a slow response that lands after a newer one', async () => {
@@ -501,7 +510,7 @@ describe('ScreeningKpis', () => {
 
     fireEvent.click(screen.getByRole('button', { name: '7 days' }));
     await waitFor(() => expect(getScreeningFunnel).toHaveBeenCalledTimes(2));
-    expect(await cardText('Total candidates')).toContain('7');
+    expect(await cardText('Candidates')).toContain('7');
 
     // …now let the stale one land, and give its continuation real ticks to run
     // so "nothing happened" means the guard fired, not that the test finished
@@ -510,7 +519,7 @@ describe('ScreeningKpis', () => {
     for (let i = 0; i < 5; i += 1) await Promise.resolve();
     await new Promise((r) => setTimeout(r, 0));
 
-    const card = await cardText('Total candidates');
+    const card = await cardText('Candidates');
     expect(card).toContain('7');
     expect(card).not.toContain('900');
   });
@@ -539,7 +548,7 @@ describe('ScreeningKpis', () => {
       funnel({ dialed: 11, connected: 3, answered_ge1: 5 }),
     );
     renderKpis();
-    const card = await cardText('Connected, no answers');
+    const card = await cardText('No answers');
     expect(card).not.toContain('-');
     expect(card).toContain('0');
     expect(card).not.toContain('11');
@@ -552,7 +561,7 @@ describe('ScreeningKpis', () => {
     // attempt whose dial row was never written.
     getScreeningFunnel.mockResolvedValue(funnel({ dialed: 3, connected: 8, answered_ge1: 8 }));
     renderKpis();
-    const card = await cardText('Never connected');
+    const card = await cardText('Never reached');
     expect(card).not.toContain('-');
     expect(card).toContain('0');
   });
@@ -569,7 +578,7 @@ describe('ScreeningKpis', () => {
   it('does not cry contradiction on ordinary figures', async () => {
     getScreeningFunnel.mockResolvedValue(funnel({ dialed: 11, connected: 8, answered_ge1: 3 }));
     renderKpis();
-    await cardText('Candidates reached');
+    await cardText('Reached');
     expect(screen.queryAllByText(/cannot be split cleanly/i)).toHaveLength(0);
   });
 
@@ -581,7 +590,7 @@ describe('ScreeningKpis', () => {
     delete (legacy as Record<string, unknown>).series;
     getScreeningFunnel.mockResolvedValue(legacy);
     renderKpis();
-    expect(await cardText('Candidates dialled')).toContain('5');
+    expect(await cardText('Dialled')).toContain('5');
   });
 
   it('does not warn when the range EQUALS the refresh window', async () => {
@@ -594,7 +603,7 @@ describe('ScreeningKpis', () => {
       funnel({ candidates_total: 4 }, { meta: { refresh_window_days: 30 } }),
     );
     renderKpis();
-    await cardText('Total candidates');
+    await cardText('Candidates');
     expect(screen.queryAllByText(/no longer recalculated/i)).toHaveLength(0);
   });
 
@@ -603,7 +612,7 @@ describe('ScreeningKpis', () => {
       funnel({ candidates_total: 4 }, { meta: { refresh_window_days: 7 } }),
     );
     renderKpis();
-    await cardText('Total candidates');
+    await cardText('Candidates');
     expect(await screen.findByText(/Days older than 7 are no longer recalculated/i))
       .toBeInTheDocument();
   });
@@ -613,7 +622,7 @@ describe('ScreeningKpis', () => {
       funnel({ candidates_total: 4, dialed: 3 }, { meta: { rollup_freshness_known: false } }),
     );
     renderKpis();
-    await cardText('Total candidates');
+    await cardText('Candidates');
     // The banner claims "everything below will read zero" — printed above
     // figures that are plainly not zero.
     expect(screen.queryAllByText(/have not been calculated yet/i)).toHaveLength(0);
@@ -634,7 +643,7 @@ describe('ScreeningKpis', () => {
       funnel({ candidates_total: 4 }, { meta: { rollup_freshness_known: false, refresh_window_days: 7 } }),
     );
     renderKpis();
-    await cardText('Total candidates');
+    await cardText('Candidates');
     expect(await screen.findByText(/Days older than 7 are no longer recalculated/i))
       .toBeInTheDocument();
   });
@@ -648,7 +657,7 @@ describe('ScreeningKpis', () => {
       funnel({ candidates_total: 4812, dialed: 4812 }, { meta: { rollup_refreshed_at: null } }),
     );
     renderKpis();
-    await cardText('Total candidates');
+    await cardText('Candidates');
     expect(screen.queryAllByText(/have not been calculated yet/i)).toHaveLength(0);
   });
 
@@ -672,10 +681,10 @@ describe('ScreeningKpis', () => {
     );
     renderKpis();
 
-    expect((await screen.findAllByText('Total candidates')).filter((n) => !n.closest('details')))
+    expect((await screen.findAllByText('Candidates')).filter((n) => !n.closest('details')))
       .toHaveLength(1);
     release(null);
-    expect(await cardText('Total candidates')).toContain('9');
+    expect(await cardText('Candidates')).toContain('9');
   });
 
   it('suppresses a rate that exceeds its own denominator', async () => {
@@ -697,7 +706,7 @@ describe('ScreeningKpis', () => {
     // `>= 3` against 5 actual groups let two bands lose their labelling, and
     // an aria-labelledby pointing at a non-existent id passed too.
     const { container } = renderKpis();
-    await cardText('Total candidates');
+    await cardText('Candidates');
     const groups = Array.from(container.querySelectorAll('[role="group"][aria-labelledby]'));
     expect(groups).toHaveLength(5);
     for (const g of groups) {
@@ -717,6 +726,56 @@ describe('ScreeningKpis', () => {
     expect(screen.getByText(/NOT a measure of agreement/i)).toBeInTheDocument();
   });
 
+  // ── Presentation contracts (S05 redesign) ─────────────────────────────
+
+  it('prints the rate formulas with a real division sign, never an escape sequence', async () => {
+    // The advance-rate hint was a JSX ATTRIBUTE string, and JSX attribute
+    // strings do not process escapes: the page printed the six characters of
+    // a unicode escape where the division sign belonged, in front of an HR head.
+    getScreeningFunnel.mockResolvedValue(funnel({ hr_qualified: 2, hr_disqualified: 1, dialed: 8, connected: 4 }));
+    const { container } = renderKpis();
+    const advance = await cardText('Advance rate');
+    expect(advance).toContain('Advanced ÷ decided');
+    expect(advance).not.toContain('\\u00f7');
+    expect(await cardText('Connect rate')).toContain('Reached ÷ dialled');
+    // Nowhere on the panel, including the definitions.
+    expect(container.textContent).not.toMatch(/\\u[0-9a-f]{4}/i);
+  });
+
+  it('names every row in sentence case, never an uppercase eyebrow', async () => {
+    const { container } = renderKpis();
+    await cardText('Candidates');
+    expect(container.querySelector('.uppercase')).toBeNull();
+    const headings = Array.from(container.querySelectorAll('h3')).map((h) => h.textContent);
+    expect(headings).toEqual(
+      expect.arrayContaining(['Reach', 'Call volume', 'Conversation', 'Screening decision', 'Team decision']),
+    );
+  });
+
+  it('labels chart days "d MMM", the one date format every chart on the page uses', () => {
+    // The screening charts said "18 Aug" (locale-dependent, "Sept" in en-IN)
+    // while the intake chart beside them said "09/03".
+    const series = buildRateSeries(
+      [{ cohort_day: '2026-09-03', dialed: 4, connected: 2 }] as any[],
+      (r) => r.connected,
+      (r) => r.dialed,
+    );
+    expect(series).toEqual([{ label: '3 Sep', value: 50 }]);
+  });
+
+  it('keeps each figure in its own cell of a description list', async () => {
+    // One surface, figures divided by hairlines: a screen reader hears
+    // "Reach, group", then term and definition pairs, not loose numbers.
+    getScreeningFunnel.mockResolvedValue(funnel({ dialed: 31, connected: 17 }));
+    const { container } = renderKpis();
+    await cardText('Dialled');
+    const reach = screen.getByRole('group', { name: 'Reach' });
+    const terms = Array.from(reach.querySelectorAll('dt')).map((dt) => dt.textContent);
+    expect(terms).toEqual(['Candidates', 'Dialled', 'Reached', 'Connect rate']);
+    // No card per number any more.
+    expect(container.querySelectorAll('[role="group"] .glass')).toHaveLength(0);
+  });
+
   it('degrades to a retryable error instead of a blank panel', async () => {
     getScreeningFunnel.mockRejectedValue(new FakeApiError('boom', 500));
     renderKpis();
@@ -724,6 +783,6 @@ describe('ScreeningKpis', () => {
 
     getScreeningFunnel.mockResolvedValue(funnel({ candidates_total: 3 }));
     fireEvent.click(screen.getByRole('button', { name: /try again/i }));
-    expect((await screen.findAllByText('Total candidates')).length).toBeGreaterThan(0);
+    expect((await screen.findAllByText('Candidates')).length).toBeGreaterThan(0);
   });
 });

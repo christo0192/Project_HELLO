@@ -1,6 +1,9 @@
 import { useCallback, useEffect, useId, useRef, useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import type { ReactNode, RefObject } from "react";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
+import { supabase } from "../lib/supabase";
+import { cx } from "../components/design/cx";
 import type {
   AppealRow,
   CandidateDetail,
@@ -40,9 +43,18 @@ import {
   candidateStatusTone,
   sessionStatusLabel,
 } from "../components/talent";
+import {
+  appealCategoryLabel,
+  appealStatusLabel,
+  isAppealPending,
+} from "../components/talent/status";
 import { CandidateHeadlineFacts } from "../components/talent/CandidateHeadlineFacts";
 import { formatDateTime } from "../lib/datetime";
-import { PhoneSlotDialog, engagementStateTerm } from "../components/phone-calendar";
+import {
+  PhoneSlotDialog,
+  appointmentStatusTerm,
+  engagementStateTerm,
+} from "../components/phone-calendar";
 import { istToday } from "../lib/ist-datetime";
 import type { IstDate } from "../lib/ist-datetime";
 import type { PhoneSlot } from "../types";
@@ -62,13 +74,69 @@ import type { PhoneSlot } from "../types";
  * LiveKit invite + live call panel, ownership-scoped CSV export, append-only
  * notes, appeals + fragment-only grant links, on-demand (never auto-fetched)
  * short-lived recording playback.
+ *
+ * THE HEADER carries who this is (name, status, role, the call facts) and ONE
+ * primary action for the candidate's state, chosen from what the page
+ * already offers rather than invented:
+ *   - a screening to read   → "Review screening" opens the Review tab
+ *   - nothing screened yet  → "Call candidate" opens the phone card's own
+ *                             confirmation step (same request, same gates)
+ *   - otherwise             → no primary; the status says what is happening
+ * Export is the secondary beside it.
+ *
+ * The open tab is in the URL (`?tab=review`), so the Candidates table's
+ * "Review & decide" lands on the Review tab and a reload keeps the place.
  */
+
+type CandidateTab = "overview" | "review";
 
 export function CandidateDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [detail, setDetail] = useState<CandidateDetail | null>(null);
   const [me, setMe] = useState<MeResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tab: CandidateTab = searchParams.get("tab") === "review" ? "review" : "overview";
+  const selectTab = useCallback(
+    (next: string) => {
+      setSearchParams(
+        (prev) => {
+          const params = new URLSearchParams(prev);
+          if (next === "review") params.set("tab", "review");
+          else params.delete("tab");
+          return params;
+        },
+        // Switching tabs is not a navigation: Back leaves the candidate.
+        { replace: true },
+      );
+    },
+    [setSearchParams],
+  );
+
+  // The header's "Review screening" selects the tab AND moves focus onto it,
+  // so a keyboard user is where the content changed rather than stranded on
+  // a button that just vanished (it is hidden while Review is open).
+  //
+  // Keyed on the TAB, not on the click: the router applies a search-param
+  // change in its own (transition) render, so focusing on the click's render
+  // would land on the tab that was still selected.
+  const tabsRef = useRef<HTMLDivElement | null>(null);
+  const [pendingTabFocus, setPendingTabFocus] = useState<CandidateTab | null>(null);
+  useEffect(() => {
+    if (pendingTabFocus === null || pendingTabFocus !== tab) return;
+    tabsRef.current
+      ?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
+      ?.focus();
+    setPendingTabFocus(null);
+  }, [pendingTabFocus, tab]);
+
+  // "Call candidate" in the header drives the phone card's confirmation. The
+  // card knows whether a first call can be requested (phone enabled, no cycle
+  // yet); it reports that up so the header never offers a call it cannot make.
+  const [callAvailable, setCallAvailable] = useState(false);
+  const [callRequest, setCallRequest] = useState(0);
+  const headerCallRef = useRef<HTMLButtonElement | null>(null);
 
   const load = useCallback(() => {
     if (!id) return;
@@ -188,47 +256,93 @@ export function CandidateDetailPage() {
     return secs > (best?.duration_sec ?? -1) ? session : best;
   }, null);
 
+  /**
+   * Something to review: a completed session (its transcript and recording)
+   * or an assessment. The Review tab renders either; without both it only
+   * says there is nothing yet, which is not worth a primary action.
+   */
+  const reviewable =
+    assessments.length > 0 || sessions.some((session) => session.status === "completed");
+
+  let primaryAction: ReactNode = null;
+  if (reviewable) {
+    // Hidden while the Review tab is open: there it would do nothing.
+    if (tab !== "review") {
+      primaryAction = (
+        <CandidateButton
+          variant="primary"
+          onClick={() => {
+            selectTab("review");
+            setPendingTabFocus("review");
+          }}
+        >
+          Review screening
+        </CandidateButton>
+      );
+    }
+  } else if (callAvailable) {
+    primaryAction = (
+      <CandidateButton
+        ref={headerCallRef}
+        variant="primary"
+        onClick={() => {
+          // The confirmation lives in the phone card on the Overview.
+          selectTab("overview");
+          setCallRequest((n) => n + 1);
+        }}
+      >
+        Call candidate
+      </CandidateButton>
+    );
+  }
+
   return (
     <CandidateShell variant="inset">
       <Link
         to="/candidates"
-        className="mb-4 inline-flex min-h-11 items-center gap-1 text-sm text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+        className="mb-3 inline-flex min-h-11 items-center gap-1 text-sm text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
       >
         ← Back to candidates
       </Link>
 
       <CandidateHeader
-        eyebrow="Candidate"
         title={candidateDisplayName(candidate.name)}
         description={candidate.email ?? undefined}
-        // Directly under the name, above the tabs: which role, how long the
-        // call ran, how much the candidate said. The call length previously
-        // lived in the Live-call panel on the far right, and the role was not
-        // on this page at all.
+        // Directly under the name, above the tabs: where the candidate is
+        // (status, in its token colour), which role, how long the call ran,
+        // how much the candidate said. The status used to sit in the action
+        // row beside the buttons, where it read as one more control.
         meta={
-          <CandidateHeadlineFacts
-            roleTitle={roleTitle}
-            callSeconds={longestSession?.duration_sec ?? null}
-            // From THE SAME session as the length, or the two figures describe
-            // different calls while sitting side by side.
-            candidateWords={longestSession?.candidate_words ?? null}
-          />
+          <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
+            <StatusBadge tone={candidateStatusTone(candidate.status)}>
+              <span title={`Status: ${candidate.status}`}>
+                {candidateStatusLabel(candidate.status)}
+              </span>
+            </StatusBadge>
+            <CandidateHeadlineFacts
+              roleTitle={roleTitle}
+              callSeconds={longestSession?.duration_sec ?? null}
+              // From THE SAME session as the length, or the two figures
+              // describe different calls while sitting side by side.
+              candidateWords={longestSession?.candidate_words ?? null}
+            />
+          </div>
         }
         actions={
           <>
-            <StatusBadge tone={candidateStatusTone(candidate.status)}>
-              {candidateStatusLabel(candidate.status)}
-            </StatusBadge>
             <CsvExportButton candidateId={candidate.id} />
+            {primaryAction}
           </>
         }
       />
 
       {decisionBlocked && <DecisionBlockedBanner />}
 
-      <div className="mt-4">
+      <div ref={tabsRef} className="mt-6">
         <Tabs
           ariaLabel="Candidate sections"
+          selectedId={tab}
+          onSelect={selectTab}
           items={[
             {
               id: "overview",
@@ -239,6 +353,10 @@ export function CandidateDetailPage() {
                   sessions={sessions}
                   phoneRole={me.role}
                   onSessionCompleted={refresh}
+                  callInHeader={!reviewable}
+                  callRequest={callRequest}
+                  headerCallRef={headerCallRef}
+                  onCallAvailableChange={setCallAvailable}
                 />
               ),
             },
@@ -260,6 +378,66 @@ export function CandidateDetailPage() {
   );
 }
 
+/* ── Live call relevance ────────────────────────────────────────────── */
+
+/**
+ * Session statuses that mean a call is set up or running: an invite waiting
+ * for the candidate (`created`, `waiting`) or a conversation in progress.
+ * `call_sessions.status` vocabulary: status.ts.
+ */
+const LIVE_SESSION_STATUSES: ReadonlySet<string> = new Set(["created", "waiting", "in_progress"]);
+
+/**
+ * Should the Live call panel be on the page at all?
+ *
+ * The panel used to be permanent, so every candidate page carried a large
+ * "No active call" box beside the invite card, including for candidates
+ * screened weeks ago. It is only worth its space while a call is live or
+ * has just happened here, so it mounts when:
+ *   1. the candidate's sessions already include a live one, or
+ *   2. a NEW session is inserted for this candidate while the page is open
+ *      (an invite created from this page, or the dialler placing the call).
+ *
+ * (2) is the panel's own "auto-activate on a new session" behaviour, kept by
+ * watching the same Realtime INSERT it subscribes to, on a channel of our
+ * own (a shared topic name would let one `removeChannel` tear down the
+ * other's subscription). Once mounted it STAYS mounted for this page view:
+ * the "Call ended / Scoring the conversation" state after a call, and the
+ * refresh it triggers, are the panel's behaviour when a call exists.
+ */
+function useLiveCallRelevant(
+  candidateId: string,
+  sessions: CandidateDetail["sessions"],
+): boolean {
+  const payloadLive = sessions.some((session) => LIVE_SESSION_STATUSES.has(session.status));
+  const [latched, setLatched] = useState(false);
+
+  useEffect(() => {
+    if (payloadLive) setLatched(true);
+  }, [payloadLive]);
+
+  useEffect(() => {
+    const channel = supabase
+      .channel(`candidate-live-watch:${candidateId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "screening_v2",
+          table: "call_sessions",
+          filter: `candidate_id=eq.${candidateId}`,
+        },
+        () => setLatched(true),
+      )
+      .subscribe();
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [candidateId]);
+
+  return payloadLive || latched;
+}
+
 /* ── Overview tab ───────────────────────────────────────────────────── */
 
 function OverviewTab({
@@ -267,12 +445,21 @@ function OverviewTab({
   sessions,
   phoneRole,
   onSessionCompleted,
+  callInHeader,
+  callRequest,
+  headerCallRef,
+  onCallAvailableChange,
 }: {
   candidate: CandidateDetail["candidate"];
   sessions: CandidateDetail["sessions"];
   phoneRole: MeResponse["role"];
   onSessionCompleted?: () => void;
+  callInHeader: boolean;
+  callRequest: number;
+  headerCallRef: RefObject<HTMLButtonElement | null>;
+  onCallAvailableChange: (available: boolean) => void;
 }) {
+  const liveCallRelevant = useLiveCallRelevant(candidate.id, sessions);
   return (
     // `fade-up-stagger` is the CSS-only reveal: candidate-scoped source may
     // not import a motion library, and this collapses with every other
@@ -285,11 +472,7 @@ function OverviewTab({
     // column. Below `lg` this is one ordinary stack, reference first.
     <div className="fade-up-stagger grid grid-cols-1 gap-4 sm:gap-6 lg:grid-cols-12 lg:items-start">
       <div className="order-2 space-y-4 lg:order-1 lg:col-span-4">
-        <CandidateProfileCard
-          candidate={candidate}
-          className="p-4 sm:p-5"
-          footnote="Transcript, playback and scorecard sync back into the Review tab."
-        />
+        <CandidateProfileCard candidate={candidate} className="p-4 sm:p-5" />
 
         <SessionsSummary sessions={sessions} />
 
@@ -299,28 +482,42 @@ function OverviewTab({
       </div>
 
       <div className="order-1 space-y-4 sm:space-y-6 lg:order-2 lg:col-span-8">
-        {/* Both call cards are frozen components. They are placed side by
-            side and stretched to a common height by their wrappers, so the
-            large "No active call" body no longer stacks below a card that
-            has already ended. Neither component is modified. */}
-        <div className="grid gap-4 sm:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] sm:items-start">
+        {/* Both call cards are frozen components; neither is modified. The
+            Live call panel joins the invite card only while a call is live
+            or has just happened on this page (useLiveCallRelevant); the rest
+            of the time the invite card has the row to itself. */}
+        <div
+          className={cx(
+            "grid gap-4",
+            liveCallRelevant && "sm:grid-cols-[minmax(0,3fr)_minmax(0,2fr)] sm:items-start",
+          )}
+        >
           <div className="min-w-0">
             <LiveKitCallCard
               candidateId={candidate.id}
               candidateName={candidate.name}
             />
           </div>
-          <div className="min-w-0">
-            <LiveCallPanel
-              candidateId={candidate.id}
-              candidateName={candidate.name || undefined}
-              onSessionCompleted={onSessionCompleted}
-            />
-          </div>
+          {liveCallRelevant && (
+            <div className="min-w-0">
+              <LiveCallPanel
+                candidateId={candidate.id}
+                candidateName={candidate.name || undefined}
+                onSessionCompleted={onSessionCompleted}
+              />
+            </div>
+          )}
         </div>
 
         {phoneRole !== "viewer" && (
-          <PhoneCycleCard candidateId={candidate.id} admin={phoneRole === "admin"} />
+          <PhoneCycleCard
+            candidateId={candidate.id}
+            admin={phoneRole === "admin"}
+            callInHeader={callInHeader}
+            callRequest={callRequest}
+            headerCallRef={headerCallRef}
+            onCallAvailableChange={onCallAvailableChange}
+          />
         )}
 
         {/* Read-only Ashby pipeline status. Renders nothing for a candidate
@@ -359,7 +556,28 @@ const RESCREEN_REASONS: Array<{ value: PhoneRescreenReason; label: string }> = [
   { value: "quality_review", label: "Quality review" },
 ];
 
-function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: boolean }) {
+function PhoneCycleCard({
+  candidateId,
+  admin,
+  callInHeader = false,
+  callRequest = 0,
+  headerCallRef,
+  onCallAvailableChange,
+}: {
+  candidateId: string;
+  admin: boolean;
+  /**
+   * The page header is offering "Call candidate" (nothing to review yet), so
+   * this card does not repeat the button: one call action on the page.
+   */
+  callInHeader?: boolean;
+  /** Incremented by the header's "Call candidate": open the confirmation. */
+  callRequest?: number;
+  /** The header button, so a cancelled confirmation returns focus to it. */
+  headerCallRef?: RefObject<HTMLButtonElement | null>;
+  /** Whether a first call can be requested right now (enabled, no cycle). */
+  onCallAvailableChange?: (available: boolean) => void;
+}) {
   const headingId = useId();
   const [data, setData] = useState<PhoneScreeningsResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -367,6 +585,13 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
   const [confirming, setConfirming] = useState(false);
   const confirmTriggerRef = useRef<HTMLButtonElement | null>(null);
   const confirmDialogRef = useRef<HTMLDivElement | null>(null);
+  // Whichever control opened the confirmation (this card's trigger or the
+  // header's), so Escape and Cancel hand focus back to the same place.
+  const confirmReturnRef = useRef<HTMLElement | null>(null);
+  const closeConfirm = useCallback(() => {
+    setConfirming(false);
+    (confirmReturnRef.current ?? confirmTriggerRef.current)?.focus();
+  }, []);
   // A non-modal inline dialog still owes keyboard users the basics: focus
   // moves in when it opens, Escape closes it, and focus returns to the
   // control that opened it.
@@ -377,13 +602,12 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         event.preventDefault();
-        setConfirming(false);
-        confirmTriggerRef.current?.focus();
+        closeConfirm();
       }
     };
     dialog?.addEventListener("keydown", onKeyDown);
     return () => dialog?.removeEventListener("keydown", onKeyDown);
-  }, [confirming]);
+  }, [confirming, closeConfirm]);
   const [requesting, setRequesting] = useState(false);
   const [verifying, setVerifying] = useState(false);
   const [phone, setPhone] = useState("");
@@ -440,6 +664,30 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
     && current.terminal_at != null
     && ["completed", "failed", "abandoned_no_answer", "cancelled", "wrong_number"].includes(current.state);
   const requiresVerification = current?.state === "wrong_number";
+
+  // A first call can be requested: the deployment is on and no cycle exists.
+  const callAvailable = data !== null && data.enabled && data.cycles.length === 0;
+  useEffect(() => {
+    onCallAvailableChange?.(callAvailable);
+  }, [callAvailable, onCallAvailableChange]);
+  const showCardCallTrigger = !(callInHeader && callAvailable);
+
+  // The header's "Call candidate" opens THIS card's confirmation step. The
+  // ref starts at the current count so mounting never opens it by itself.
+  const handledCallRequest = useRef(callRequest);
+  useEffect(() => {
+    if (callRequest === handledCallRequest.current) return;
+    handledCallRequest.current = callRequest;
+    if (!callAvailable) return;
+    confirmReturnRef.current = headerCallRef?.current ?? null;
+    setMessage(null);
+    if (confirming) {
+      // Already open: just bring focus back into it.
+      confirmDialogRef.current?.querySelector<HTMLElement>("button")?.focus();
+    } else {
+      setConfirming(true);
+    }
+  }, [callRequest, callAvailable, confirming, headerCallRef]);
 
   async function requestInitialCall() {
     setRequesting(true);
@@ -551,23 +799,48 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
         Phone screening cycles
       </h2>
       <p className="mt-0.5 text-[13px] text-ink-tertiary">
-        A request never dials on its own — every call still passes the normal admission gates.
+        A request never dials on its own. Every call still passes the admission gates.
       </p>
       {error ? (
-        <div className="mt-2 flex flex-wrap items-center gap-2">
+        <div className="mt-3 flex flex-wrap items-center gap-2">
           <p role="alert" className="text-sm text-ink-secondary">Phone cycle history unavailable.</p>
-          <CandidateButton variant="secondary" onClick={load}>Retry</CandidateButton>
+          <CandidateButton variant="secondary" size="md" onClick={load}>Retry</CandidateButton>
         </div>
       ) : data === null ? (
-        <p className="mt-2 text-sm text-ink-tertiary">Loading cycle history…</p>
+        <p className="mt-3 text-sm text-ink-tertiary">Loading cycle history…</p>
       ) : !data.enabled ? (
-        <p className="mt-2 text-sm text-ink-secondary">Phone screening is turned off.</p>
+        <p className="mt-3 text-sm text-ink-secondary">Phone screening is turned off.</p>
       ) : data.cycles.length === 0 ? (
         <>
-          <p className="mt-2 text-sm text-ink-secondary">No phone screening cycle has been created.</p>
-          <CandidateButton ref={confirmTriggerRef} className="mt-3" variant="primary" onClick={() => { setMessage(null); setConfirming(true); }} disabled={requesting}>
-            Call candidate
-          </CandidateButton>
+          <p className="mt-3 text-sm text-ink-secondary">No phone screening yet.</p>
+          {/* One row: the call (primary, unless the page header is already
+              offering it) and booking a slot for later (secondary). Booking
+              used to be a second primary button alone in its own tinted
+              well, which gave this card two equal-weight calls to action. */}
+          <div className="mt-3 flex flex-wrap gap-2">
+            {showCardCallTrigger && (
+              <CandidateButton
+                ref={confirmTriggerRef}
+                variant="primary"
+                onClick={() => {
+                  confirmReturnRef.current = confirmTriggerRef.current;
+                  setMessage(null);
+                  setConfirming(true);
+                }}
+                disabled={requesting}
+              >
+                Call candidate
+              </CandidateButton>
+            )}
+            <CandidateButton
+              ref={slotTriggerRef}
+              variant="secondary"
+              onClick={() => setSlotDialogOpen(true)}
+              disabled={savingAppointment}
+            >
+              Book a slot
+            </CandidateButton>
+          </div>
           {confirming && (
             <div
               ref={confirmDialogRef}
@@ -587,24 +860,12 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
                 <CandidateButton variant="primary" onClick={() => void requestInitialCall()} loading={requesting}>
                   Confirm call
                 </CandidateButton>
-                <CandidateButton variant="secondary" onClick={() => { setConfirming(false); confirmTriggerRef.current?.focus(); }} disabled={requesting}>
+                <CandidateButton variant="secondary" onClick={closeConfirm} disabled={requesting}>
                   Cancel
                 </CandidateButton>
               </div>
             </div>
           )}
-          <SurfaceCard level="sunken" className="mt-4 p-3">
-            <h3 className="text-[13px] font-medium text-ink-secondary">Schedule a slot</h3>
-            <CandidateButton
-              ref={slotTriggerRef}
-              variant="primary"
-              className="mt-3"
-              onClick={() => setSlotDialogOpen(true)}
-              disabled={savingAppointment}
-            >
-              Book a slot
-            </CandidateButton>
-          </SurfaceCard>
         </>
       ) : (
         <>
@@ -619,18 +880,28 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
                 </div>
                 <p className="mt-1 text-xs text-ink-tertiary">
                   {cycle.has_assessment ? "Assessment recorded" : cycle.has_session ? "Session recorded" : "No session yet"}
-                  {cycle.appointment ? ` · ${cycle.appointment.status ?? "appointment"}` : ""}
+                  {cycle.appointment && (
+                    // The appointment's status in words ("Appointment
+                    // fulfilled"), with the stored value one hover away.
+                    <span title={cycle.appointment.status ?? undefined}>
+                      {` · ${
+                        cycle.appointment.status
+                          ? `Appointment ${appointmentStatusTerm(cycle.appointment.status).label.toLowerCase()}`
+                          : "Appointment"
+                      }`}
+                    </span>
+                  )}
                 </p>
               </li>
             ))}
           </ul>
 
           {current?.state === "opted_out" ? (
-            <p className="mt-3 text-sm text-warning">
+            <p className="mt-3 text-sm text-warning-text">
               Re-screening is unavailable because the candidate opted out. Renewed consent requires separate governance.
             </p>
           ) : canRescreen && requiresVerification && !admin ? (
-            <p className="mt-3 text-sm text-warning">An administrator must verify a replacement number before this cycle can be re-screened.</p>
+            <p className="mt-3 text-sm text-warning-text">An administrator must verify a replacement number before this cycle can be re-screened.</p>
           ) : canRescreen && requiresVerification && admin ? (
             <SurfaceCard level="sunken" className="mt-4 p-3">
               <div className="grid gap-x-3 gap-y-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
@@ -703,8 +974,10 @@ function PhoneCycleCard({ candidateId, admin }: { candidateId: string; admin: bo
                 >
                   {current?.appointment ? "Move appointment" : "Book a slot"}
                 </CandidateButton>
+                {/* Destructive, and not the point of this row: quiet until
+                    hovered, never a second filled button beside "Move". */}
                 {current?.appointment && (
-                  <CandidateButton variant="secondary" onClick={() => void cancelAppointment()} loading={savingAppointment}>
+                  <CandidateButton variant="danger-quiet" onClick={() => void cancelAppointment()} loading={savingAppointment}>
                     Cancel appointment
                   </CandidateButton>
                 )}
@@ -856,7 +1129,7 @@ function AppealsSection({
       const link = `${window.location.origin}/appeal#${res.appeal_grant_token}`;
       setGrantLink(link);
       setMsg(
-        `Grant issued — expires ${formatDateTime(res.expires_at)}. ` +
+        `Grant issued. It expires ${formatDateTime(res.expires_at)}. ` +
           "Send this one-time link to the candidate.",
       );
     } catch (e) {
@@ -875,7 +1148,7 @@ function AppealsSection({
         Open and resolved appeals for this candidate.
       </p>
       {err ? (
-        <p className="text-sm text-error">{err}</p>
+        <p className="text-sm text-error-text">{err}</p>
       ) : appeals === null ? (
         <p className="text-sm text-ink-tertiary">Loading appeals…</p>
       ) : appeals.length === 0 ? (
@@ -885,16 +1158,24 @@ function AppealsSection({
           {appeals.map((a) => (
             <li key={a.id} className="py-2 text-sm">
               <div className="flex items-center justify-between gap-2">
-                <p className="font-medium text-ink">{a.category}</p>
+                <p className="font-medium text-ink" title={`Category: ${a.category}`}>
+                  {appealCategoryLabel(a.category)}
+                </p>
+                {/* Words, not the stored enum ("Under review", never
+                    `under_review`). Pending appeals take the accent tint
+                    (something to act on), a grant the positive one, a
+                    denial stays neutral: it is resolved, not a success. */}
                 <Tag
                   tone={
-                    a.status === "open" || a.status === "under_review"
+                    isAppealPending(a.status)
                       ? "accent"
-                      : "positive"
+                      : a.status === "granted"
+                        ? "positive"
+                        : "neutral"
                   }
                   srPrefix="Appeal status:"
                 >
-                  {a.status}
+                  <span title={a.status}>{appealStatusLabel(a.status)}</span>
                 </Tag>
               </div>
               <p className="mt-0.5 max-w-prose whitespace-pre-wrap leading-relaxed text-ink-secondary">
@@ -911,12 +1192,12 @@ function AppealsSection({
       <SurfaceCard level="sunken" className="mt-4 p-3">
         <h3 className="text-[13px] font-medium text-ink">Issue appeal grant</h3>
         <p className="mt-0.5 text-xs leading-snug text-ink-tertiary">
-          A one-time fragment link the candidate opens at /appeal. Explicit
-          expiry is required (1–72 hours); the plaintext is shown only once.
+          Creates a one-time link the candidate opens to file an appeal. The
+          link is shown once and expires after the hours you set.
         </p>
         {/* One row: choose the session, state the expiry, issue. Same ids,
             same labels, same call. */}
-        <div className="mt-3 grid gap-x-3 gap-y-2 sm:grid-cols-[minmax(0,1fr)_11rem_auto] sm:items-end">
+        <div className="mt-3 grid gap-x-3 gap-y-2 sm:grid-cols-[minmax(0,1fr)_8rem_auto] sm:items-end">
           <div className="min-w-0">
             <label htmlFor="appeal-session" className="block text-[13px] font-medium text-ink-secondary">
               Session
@@ -927,12 +1208,14 @@ function AppealsSection({
               onChange={(e) => setSelectedSession(e.target.value)}
               className="mt-1 block w-full"
             >
+              {/* Named by when it happened and how it ended, never by a uuid
+                  prefix (the option VALUE is still the id). */}
               {sessions.length === 0 ? (
                 <option value="">No sessions</option>
               ) : (
                 sessions.map((s) => (
                   <option key={s.id} value={s.id}>
-                    {s.id.slice(0, 8)} ({sessionStatusLabel(s.status)})
+                    {formatDateTime(s.created_at)} · {sessionStatusLabel(s.status)}
                   </option>
                 ))
               )}
@@ -940,7 +1223,7 @@ function AppealsSection({
           </div>
           <div className="min-w-0">
             <label htmlFor="appeal-expiry" className="block text-[13px] font-medium text-ink-secondary">
-              Expires in (hours, 1–72)
+              Hours valid (1–72)
             </label>
             <CandidateInput
               id="appeal-expiry"
@@ -966,9 +1249,9 @@ function AppealsSection({
           <div className="mt-2 rounded-control border border-[var(--c-border)] bg-[var(--c-surface)] p-3">
             <p className="text-xs font-semibold text-ink-secondary">One-time link (shown once)</p>
             <code className="block break-all text-xs text-ink-secondary">{grantLink}</code>
-            <p className="mt-1 max-w-prose text-[11px] leading-relaxed text-ink-tertiary">
-              Contains a secret token in the fragment — share it only with the
-              candidate. It is never stored by the app.
+            <p className="mt-1 max-w-prose text-xs leading-relaxed text-ink-tertiary">
+              Contains a secret token. Share it only with the candidate; the
+              app never stores it.
             </p>
           </div>
         )}
@@ -1004,17 +1287,21 @@ function CsvExportButton({ candidateId }: { candidateId: string }) {
     }
   }
 
+  // Secondary beside the header's primary. The label says what the file IS
+  // (a CSV) in two words; what is in it is the tooltip, not a sentence on a
+  // button (it used to read "Export screening data (scorecard + transcript)").
   return (
-    <div>
+    <div className="flex flex-col items-start gap-1">
       <CandidateButton
         variant="secondary"
         onClick={() => void download()}
         loading={busy}
+        title="Download the scorecard and transcript as a CSV file"
       >
-        Export screening data (scorecard + transcript)
+        Export CSV
       </CandidateButton>
       {err && (
-        <p className="mt-1 rounded bg-[var(--c-surface)] px-2 py-1 text-xs text-error">
+        <p role="alert" className="max-w-xs text-xs text-error-text">
           {err}
         </p>
       )}

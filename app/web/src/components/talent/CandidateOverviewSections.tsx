@@ -23,6 +23,8 @@ import { api } from '../../api';
 import { ScrollArea, StatusBadge } from '../design';
 import { SurfaceCard, Tag } from '../design/candidate';
 import {
+  attemptOutcomeLabel,
+  attemptRawStatus,
   candidateStatusLabel,
   candidateStatusTone,
   formatDurationSec,
@@ -30,7 +32,12 @@ import {
   sessionStatusTone,
 } from './status';
 import { formatDateTime } from '../../lib/datetime';
+import { formatPhone } from '../../lib/humanize';
 import { sessionModeLabel } from '../../lib/session-mode';
+
+/** The quiet inline action style shared by every row link/button here. */
+const ROW_ACTION =
+  'rounded-sm text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)] disabled:cursor-wait disabled:opacity-60';
 
 /** One label/value row inside the profile definition list. */
 export function Field({ label, children }: { label: string; children: ReactNode }) {
@@ -120,7 +127,7 @@ export function PhoneAttemptHistory({
       {error ? (
         <div className="flex flex-wrap items-center gap-2">
           <p role="alert" className="text-sm text-ink-secondary">Attempt history unavailable.</p>
-          <button type="button" className="text-xs font-medium text-[var(--c-accent)] underline" onClick={() => load()}>Retry</button>
+          <button type="button" className={ROW_ACTION} onClick={() => load()}>Retry</button>
         </div>
       ) : attempts === null ? (
         <p className="text-sm text-ink-tertiary">Loading attempt history…</p>
@@ -130,20 +137,34 @@ export function PhoneAttemptHistory({
         <ul className="divide-y divide-line">
           {attempts.map((attempt) => (
             <li key={attempt.id} className="py-3 text-sm">
-              <div className="flex flex-wrap items-start justify-between gap-2">
-                <div>
-                  <p className="font-medium text-ink">Attempt {attempt.attempt_seq}</p>
-                  <p className="text-[12px] text-ink-tertiary">
-                    {formatDateTime(attempt.admitted_at)} · {attempt.state}
-                    {attempt.outcome_class ? ` · ${attempt.outcome_class}` : ''}
-                    {attempt.duration_sec != null ? ` · ${Math.round(attempt.duration_sec)}s` : ''}
+              <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-1">
+                <div className="min-w-0">
+                  {/* The OUTCOME in a recruiter's words, beside the attempt
+                      number, because it is what they act on ("No answer",
+                      "Hung up before the recording notice"). The machine
+                      pair stays one hover away for an operator to quote. */}
+                  <p className="text-ink">
+                    <span className="font-medium">Attempt {attempt.attempt_seq}</span>
+                    <span aria-hidden="true" className="text-ink-tertiary"> · </span>
+                    <span
+                      className="text-ink-secondary"
+                      title={attemptRawStatus(attempt.outcome_class, attempt.state)}
+                    >
+                      {attemptOutcomeLabel(attempt.outcome_class, attempt.state)}
+                    </span>
+                  </p>
+                  <p className="text-[12px] tabular-nums text-ink-tertiary">
+                    {formatDateTime(attempt.admitted_at)}
+                    {attempt.duration_sec != null && attempt.duration_sec > 0
+                      ? ` · ${formatDurationSec(attempt.duration_sec)}`
+                      : ''}
                   </p>
                 </div>
-                <div className="flex flex-wrap items-center justify-end gap-2">
+                <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1">
                   {attempt.recording.state === 'ready' ? (
                     <button
                       type="button"
-                      className="text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+                      className={ROW_ACTION}
                       onClick={() => download(attempt.id)}
                       disabled={loadingAudio === attempt.id}
                     >
@@ -163,7 +184,7 @@ export function PhoneAttemptHistory({
                   {attempt.transcript && (
                     <Link
                       to={attempt.transcript.href}
-                      className="text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+                      className={ROW_ACTION}
                     >
                       {attempt.transcript.kind === 'gate_only' ? 'Pre-interview gate transcript' : 'Session transcript'}
                     </Link>
@@ -192,7 +213,7 @@ export function PhoneAttemptHistory({
       {attempts && nextCursor && !error && (
         <button
           type="button"
-          className="mt-3 text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+          className={`mt-3 ${ROW_ACTION}`}
           onClick={() => load(nextCursor, true)}
         >
           Load older attempts
@@ -251,10 +272,14 @@ export function CandidateProfileCard({
         <Field label="Phone">
           {candidate.phone_e164 ? (
             <span className="flex items-center gap-1.5">
-              {candidate.phone_e164}
+              {/* Grouped the way people read a number aloud; the stored E.164
+                  value stays one hover away for an operator to paste. */}
+              <span className="whitespace-nowrap tabular-nums" title={candidate.phone_e164}>
+                {formatPhone(candidate.phone_e164)}
+              </span>
               {!candidate.phone_valid && (
                 <Tag tone="negative" srPrefix="Phone number:">
-                  invalid
+                  Invalid
                 </Tag>
               )}
             </span>
@@ -320,7 +345,7 @@ function ResumeEvidence({ facts }: { facts?: CandidateResumeFacts | null }) {
   return (
     <div className="mt-5 border-t border-line pt-4">
       <h3 className="mb-3 text-[13px] font-medium text-ink-secondary">Resume evidence</h3>
-      <dl className="space-y-3">
+      <dl className="space-y-3 text-sm">
         {/* Summary is NOT repeated here — it renders above the field list at
             the top of this card, which is what "above the numbers and
             experience" asked for. */}
@@ -354,12 +379,9 @@ export function SessionsSummary({
   const headingId = useId();
   return (
     <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
-      <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
+      <h2 id={headingId} className="mb-3 text-[15px] font-semibold tracking-tight text-ink">
         Screening sessions
       </h2>
-      <p className="mb-3 mt-0.5 text-[13px] text-ink-tertiary">
-        One row per screening session, as returned by the API.
-      </p>
       {sessions.length === 0 ? (
         <p className="text-sm text-ink-secondary">{emptyLabel}</p>
       ) : (
@@ -368,14 +390,18 @@ export function SessionsSummary({
           'Screening session list',
           '18rem',
           <ul className="divide-y divide-line">
-            {sessions.map((s) => (
+            {sessions.map((s, index) => (
               <li
                 key={s.id}
                 className="flex flex-wrap items-center justify-between gap-x-3 gap-y-1 py-2 text-sm"
               >
                 <div className="min-w-0">
-                  <p className="truncate font-medium text-ink">
-                    Session {s.id.slice(0, 8)}
+                  {/* Numbered in the order they happened (the list arrives
+                      newest first), never by id: a uuid prefix as the row's
+                      name is a database leaking onto the page. The id stays
+                      in `title` for support. */}
+                  <p className="truncate font-medium text-ink" title={`Session id ${s.id}`}>
+                    Session {sessions.length - index}
                     {s.mode && (
                       <span className="ml-2 text-[12px] font-normal text-ink-tertiary">
                         {sessionModeLabel(s.mode).toLowerCase()}
@@ -392,11 +418,9 @@ export function SessionsSummary({
                     {sessionStatusLabel(s.status)}
                   </StatusBadge>
                   {linkToSession && (
-                    <Link
-                      to={`/sessions/${s.id}`}
-                      className="text-xs font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
-                    >
+                    <Link to={`/sessions/${s.id}`} className={ROW_ACTION}>
                       View details
+                      <span className="sr-only"> for session {sessions.length - index}</span>
                     </Link>
                   )}
                 </div>
@@ -417,7 +441,7 @@ export interface NotesListProps {
 
 /** Append-only recruiter notes, read-only. */
 export function NotesList({ notes, error = null }: NotesListProps) {
-  if (error) return <p className="text-sm text-error">{error}</p>;
+  if (error) return <p className="text-sm text-error-text">{error}</p>;
   if (notes === null) return <p className="text-sm text-ink-tertiary">Loading notes…</p>;
   if (notes.length === 0) return <p className="text-sm text-ink-secondary">No notes yet.</p>;
   return boundList(
@@ -442,7 +466,7 @@ export function DecisionBlockedBanner() {
       role="alert"
       className="mb-5 mt-4 rounded-card border border-warning bg-warning-soft p-4"
     >
-      <p className="text-sm font-semibold text-warning">
+      <p className="text-sm font-semibold text-warning-text">
         Decision use is paused — open appeal
       </p>
       <p className="mt-1 text-sm text-ink-secondary">

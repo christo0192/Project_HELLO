@@ -1,6 +1,8 @@
 import { useState } from 'react';
 import { api, ApiError } from '../api';
-import { Button, Card } from './ui';
+import { Button, controlClass, cx } from './design';
+import { SurfaceCard } from './design/candidate';
+import { formatDateTime } from '../lib/datetime';
 
 /** Recruiter control: create the room, then issue a one-time candidate invite. */
 export function LiveKitCallCard({
@@ -43,34 +45,45 @@ export function LiveKitCallCard({
   }
 
   return (
-    <Card className="p-5">
-      <div className="flex items-start justify-between gap-3">
-        <div>
-          <h2 className="text-sm font-semibold text-gray-900">LiveKit voice screening</h2>
-          <p className="mt-0.5 text-xs text-gray-500">
+    <SurfaceCard as="section" labelledBy="browser-screening-title" className="p-4 sm:p-5">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          {/* Named for what the recruiter does, not the vendor behind it. */}
+          <h2 id="browser-screening-title" className="text-section text-ink">
+            Browser voice screening
+          </h2>
+          <p className="mt-1 text-label text-ink-secondary">
             Create a one-time invite for {candidateName || 'this candidate'}.
           </p>
         </div>
-        <Button onClick={createInvite} loading={busy} className="shrink-0">
-          Create Invite
+        <Button variant="secondary" onClick={createInvite} loading={busy} className="shrink-0">
+          Create invite
         </Button>
       </div>
       {inviteUrl && (
-        <div className="mt-3 space-y-2">
-          <label className="block text-xs font-medium text-gray-700" htmlFor="candidate-invite-url">
+        <div className="mt-4 space-y-2">
+          <label className="block text-label font-medium text-ink" htmlFor="candidate-invite-url">
             Candidate invite (shown once)
           </label>
-          <input
-            id="candidate-invite-url"
-            readOnly
-            value={inviteUrl}
-            className="w-full rounded border border-gray-300 px-2 py-1 text-xs"
-          />
-          <Button onClick={copyInvite}>Copy Invite</Button>
-          {expiresAt && <p className="text-xs text-gray-500">Expires {new Date(expiresAt).toLocaleString()}.</p>}
+          <div className="flex flex-wrap gap-2">
+            <input
+              id="candidate-invite-url"
+              readOnly
+              value={inviteUrl}
+              className={cx(controlClass, 'min-w-0 flex-1 font-mono text-xs')}
+            />
+            <Button onClick={copyInvite}>Copy invite</Button>
+          </div>
+          {expiresAt && (
+            <p className="text-meta text-ink-tertiary">Expires {formatDateTime(expiresAt)}.</p>
+          )}
         </div>
       )}
-      {error && <p className="mt-3 text-sm text-red-600">{error}</p>}
-    </Card>
+      {error && (
+        <p role="alert" className="mt-3 text-sm text-error-text">
+          {error}
+        </p>
+      )}
+    </SurfaceCard>
   );
 }

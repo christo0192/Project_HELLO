@@ -53,7 +53,9 @@ export function Tag({ tone = 'neutral', srPrefix, block = false, className, chil
   return (
     <span
       className={cx(
-        'text-xs font-medium ring-1 ring-inset',
+        // Meta step (12/16, medium), sentence case, tabular figures (a tag
+        // can carry a count or a year: "5 yrs", "2024").
+        'text-meta font-medium tabular-nums ring-1 ring-inset',
         block
           ? 'block rounded-lg px-2.5 py-1.5 leading-snug'
           : 'inline-flex items-center rounded-full px-2.5 py-0.5',

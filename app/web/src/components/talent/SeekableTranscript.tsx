@@ -7,8 +7,8 @@
  *   minting the URL and queuing the seek if needed.
  * - Untimed turns (start_offset_sec == null) are rendered non-interactive
  *   with a clear "no timing data" label.
- * - The active turn receives aria-current="true", a left border accent,
- *   and a screen-reader announcement via aria-live.
+ * - The active turn receives aria-current="true", a stronger tint with a
+ *   leading accent dot, and a screen-reader announcement via aria-live.
  * - Keyboard: Tab moves between buttons; Enter/Space activates seek.
  * - Respects prefers-reduced-motion for scroll-into-view.
  */
@@ -122,7 +122,7 @@ export function SeekableTranscript({
         )}
         {anyUntimed && anyTimed && (
           <p className="mb-3 rounded-md bg-[var(--c-border-light)] px-3 py-2 text-xs text-[var(--c-ink-secondary)]">
-            Some turns lack timing data and cannot be used for playback — they are shown below without a timestamp.
+            Some turns were saved without timing, so they cannot start playback. They are shown without a timestamp.
           </p>
         )}
         <ul className="space-y-1" role="list">
@@ -132,12 +132,15 @@ export function SeekableTranscript({
             const presented = presentTranscriptTurn(turn.speaker, turn.text);
             const speaker = presented.label;
             // Speaker is legible without colour: the label is always written
-            // out. The tint only makes the alternation scannable. The bot
-            // tint is the page ground and the candidate tint the card fill,
-            // which are DIFFERENT tokens from the accent tint the active turn
-            // takes — so an active bot turn is never the same fill as an
-            // inactive one, and the 2px accent rule reads as a change of
-            // state rather than a change of speaker.
+            // out. The tint only makes the alternation scannable: the bot
+            // tint is the page ground, the candidate tint the card fill.
+            //
+            // THE ACTIVE TURN is marked by a stronger tint (the hairline
+            // token, a step darker than the hover tint) PLUS a leading
+            // "playing" dot and an accent timestamp, so it never depends on a
+            // one-step fill difference alone. It used to carry a 2px accent
+            // rule down its left edge: a side-stripe, which the design system
+            // bans outright.
             const speakerTint =
               turn.speaker === 'bot'
                 ? 'bg-[var(--c-bg)]'
@@ -153,18 +156,34 @@ export function SeekableTranscript({
                     aria-current={active ? 'true' : undefined}
                     aria-label={`Turn ${index + 1}: ${speaker}. At ${formatOffset(turn.start_offset_sec!)}. Click to play from here.`}
                     className={cx(
-                      'w-full min-h-[44px] rounded-md px-3 py-2.5 text-left transition-colors',
+                      'w-full min-h-[44px] rounded-md px-3 py-2.5 text-left transition-colors duration-150 ease-out',
                       'focus:outline-none focus:ring-2 focus:ring-[var(--c-accent)] focus:ring-inset',
                       active
-                        ? 'border-l-2 border-[var(--c-accent)] bg-[var(--c-accent-light)]'
-                        : cx('border-l-2 border-transparent', speakerTint, 'hover:bg-[var(--c-accent-light)]'),
+                        ? 'bg-[var(--c-border)]'
+                        : cx(speakerTint, 'hover:bg-[var(--c-border-light)]'),
                     )}
                   >
                     <span className="flex items-baseline justify-between gap-2">
-                      <span className="text-xs font-medium text-[var(--c-ink-secondary)]">
+                      <span className="flex items-center gap-1.5 text-xs font-medium text-[var(--c-ink-secondary)]">
+                        {active && (
+                          <span
+                            aria-hidden="true"
+                            data-active-turn-marker=""
+                            className="h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--c-accent)]"
+                          />
+                        )}
                         {speaker}
                       </span>
-                      <span className="text-xs tabular-nums text-[var(--c-ink-secondary)]">
+                      <span
+                        className={cx(
+                          'text-xs tabular-nums',
+                          // Ink, not the accent: accent on the active tint
+                          // is ~4:1, short of AA for 12px text.
+                          active
+                            ? 'font-semibold text-[var(--c-ink)]'
+                            : 'text-[var(--c-ink-secondary)]',
+                        )}
+                      >
                         {formatOffset(turn.start_offset_sec!)}
                       </span>
                     </span>
@@ -179,10 +198,7 @@ export function SeekableTranscript({
             return (
               <li key={index}>
                 <div
-                  className={cx(
-                    'min-h-[44px] rounded-md border-l-2 border-transparent px-3 py-2.5',
-                    speakerTint,
-                  )}
+                  className={cx('min-h-[44px] rounded-md px-3 py-2.5', speakerTint)}
                   aria-label={`Turn ${index + 1}: ${speaker}. Timing data not available.`}
                 >
                   <span className="flex items-baseline justify-between gap-2">

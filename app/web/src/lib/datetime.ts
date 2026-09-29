@@ -58,7 +58,13 @@ export function formatDateTime(
   const date = toValidDate(value);
   if (!date) return NOT_AVAILABLE;
   try {
-    return new Intl.DateTimeFormat(undefined, opts).format(date);
+    // Current ICU writes September as "Sept" in en-GB/en-IN; every other
+    // short month is three letters, and the charts' fixed month table says
+    // "Sep". One spelling per page, whichever formatter drew it.
+    return new Intl.DateTimeFormat(undefined, opts)
+      .formatToParts(date)
+      .map((part) => (part.type === 'month' && part.value === 'Sept' ? 'Sep' : part.value))
+      .join('');
   } catch {
     // Extremely defensive: Intl should not throw for a valid Date.
     return NOT_AVAILABLE;

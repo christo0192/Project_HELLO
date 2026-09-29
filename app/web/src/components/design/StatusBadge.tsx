@@ -31,7 +31,11 @@ export interface StatusBadgeProps {
   dot?: boolean;
 }
 
-/** Small semantic status pill — restrained, text-first. */
+/**
+ * Small semantic status pill — restrained, text-first. Meta step of the type
+ * scale (12/16, medium), sentence case, tabular figures so a count inside a
+ * badge ("Quota 92%") holds its width as it changes.
+ */
 export function StatusBadge({
   tone = 'neutral',
   children,
@@ -42,7 +46,7 @@ export function StatusBadge({
     <span
       data-status-badge={tone}
       className={cx(
-        'inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2 py-0.5 text-xs font-medium',
+        'inline-flex items-center gap-1.5 whitespace-nowrap rounded-full px-2 py-0.5 text-meta font-medium tabular-nums',
         toneStyles[tone],
         className,
       )}

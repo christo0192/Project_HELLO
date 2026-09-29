@@ -61,23 +61,46 @@ export default {
         'glass-ring': 'var(--glass-ring)',
         'glass-ring-strong': 'var(--glass-ring-strong)',
       },
+      // IBM Plex Sans / Plex Mono, self-hosted and imported in src/main.tsx. The
+      // system stack stays behind them only for the moment before the woff2
+      // arrives (`font-display: swap`) — never as a design choice.
       fontFamily: {
         sans: [
+          '"IBM Plex Sans Variable"',
           'ui-sans-serif',
           'system-ui',
           '-apple-system',
-          'Segoe UI',
+          '"Segoe UI"',
           'Roboto',
-          'Helvetica Neue',
+          '"Helvetica Neue"',
           'Arial',
           'sans-serif',
         ],
+        mono: [
+          '"IBM Plex Mono"',
+          'ui-monospace',
+          'SFMono-Regular',
+          'Menlo',
+          'Consolas',
+          '"Liberation Mono"',
+          'monospace',
+        ],
       },
+      // The type scale (docs/design/hello-glass-design-system.md §3). Six
+      // steps carry the whole UI; weight and ink do the rest of the work.
+      //   text-title    28/34 600  page title (h1)
+      //   text-stat     30/36 600  hero figure — pair with `tabular-nums`
+      //   text-section  15/20 600  section / panel title (h2, h3)
+      //   text-sm       14/20      body (Tailwind's own step)
+      //   text-label    13/20      labels (+ font-medium), descriptions
+      //   text-meta     12/16      table headers, badges, captions
+      // Sentence case at every step: nothing here is uppercase or tracked open.
       fontSize: {
-        // Display sizes with the tight tracking the shell uses for titles
-        // and headline figures.
         title: ['1.75rem', { lineHeight: '2.125rem', letterSpacing: '-0.02em', fontWeight: '600' }],
         stat: ['1.875rem', { lineHeight: '2.25rem', letterSpacing: '-0.02em', fontWeight: '600' }],
+        section: ['0.9375rem', { lineHeight: '1.25rem', letterSpacing: '-0.01em', fontWeight: '600' }],
+        label: ['0.8125rem', { lineHeight: '1.25rem' }],
+        meta: ['0.75rem', { lineHeight: '1rem' }],
       },
       borderRadius: {
         card: 'var(--radius-card)',

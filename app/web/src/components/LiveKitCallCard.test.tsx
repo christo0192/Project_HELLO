@@ -40,7 +40,7 @@ describe('LiveKitCallCard', () => {
     render(
       <LiveKitCallCard candidateId="candidate-1" candidateName="Jane Doe" />,
     );
-    expect(screen.getByText('LiveKit voice screening')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { name: 'Browser voice screening' })).toBeInTheDocument();
   });
 
   it('shows candidate name in description', () => {
@@ -54,11 +54,11 @@ describe('LiveKitCallCard', () => {
     ).toBeInTheDocument();
   });
 
-  it('renders "Create Invite" button in idle state', () => {
+  it('renders "Create invite" button in idle state', () => {
     render(
       <LiveKitCallCard candidateId="candidate-1" candidateName="Jane Doe" />,
     );
-    const btn = screen.getByRole('button', { name: 'Create Invite' });
+    const btn = screen.getByRole('button', { name: 'Create invite' });
     expect(btn).toBeInTheDocument();
   });
 

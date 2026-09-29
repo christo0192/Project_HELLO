@@ -30,7 +30,14 @@ import { fileURLToPath } from 'node:url';
 import { expect, type Page, type TestInfo } from '@playwright/test';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
-export const ARTIFACTS_DIR = path.resolve(HERE, '..', '.artifacts');
+/**
+ * Every artifact of a run. `E2E_ARTIFACTS` moves it, so two runs side by side
+ * (two worktrees' agents, a shots run beside a check run) never overwrite each
+ * other's report or screenshots.
+ */
+export const ARTIFACTS_DIR = process.env.E2E_ARTIFACTS
+  ? path.resolve(process.env.E2E_ARTIFACTS)
+  : path.resolve(HERE, '..', '.artifacts');
 const AXE_DIR = path.join(ARTIFACTS_DIR, 'axe');
 
 /** Mirrors `runAxe` in src/test/setup.ts, minus the jsdom-only exclusions. */

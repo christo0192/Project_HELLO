@@ -52,7 +52,7 @@
  * codes rather than a passthrough of whatever a failure carried.
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useSearchParams } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import type {
@@ -79,6 +79,7 @@ import {
   PhoneBookingPanel,
   PhoneFilterBar,
   PhoneQueueList,
+  PhoneWeekNav,
   PhoneWeekTable,
   buildPhoneCalendarSearch,
   matchesPhoneFilters,
@@ -194,6 +195,13 @@ export function PhoneCalendarPage() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [message, setMessage] = useState<Message | null>(null);
   const [rolesState, setRolesState] = useState<RolesState>({ status: 'loading' });
+  const [bookingOpen, setBookingOpen] = useState(false);
+
+  /** The header's "Book a screening" button: focus returns here on close. */
+  const bookButtonRef = useRef<HTMLButtonElement | null>(null);
+  /** The views' container: the chip of a closed detail is found inside it. */
+  const contentRef = useRef<HTMLDivElement | null>(null);
+  const bookingPanelId = `phone-booking-${useId().replace(/:/g, '-')}`;
 
   /**
    * The live region is mounted for the whole life of the page and starts
@@ -372,6 +380,36 @@ export function PhoneCalendarPage() {
   const selected = visible.find((appt) => appt.id === selectedId) ?? null;
 
   /**
+   * A chip is a toggle (`aria-pressed`): pressing the selected one again
+   * un-presses it and closes its detail, which is what the state it announces
+   * promises.
+   */
+  const toggleSelected = useCallback((id: string) => {
+    setSelectedId((current) => (current === id ? null : id));
+  }, []);
+
+  /**
+   * Closing the detail from its own Close button. Focus goes back to the
+   * chip that opened it BEFORE the detail unmounts, so the focused button
+   * disappearing never drops a keyboard user onto <body>.
+   */
+  const closeDetail = useCallback(() => {
+    const id = selectedId;
+    if (id) {
+      const chip = Array.from(
+        contentRef.current?.querySelectorAll<HTMLElement>('[data-appointment-id]') ?? [],
+      ).find((el) => el.dataset.appointmentId === id);
+      chip?.focus();
+    }
+    setSelectedId(null);
+  }, [selectedId]);
+
+  const closeBooking = useCallback(() => {
+    setBookingOpen(false);
+    bookButtonRef.current?.focus();
+  }, []);
+
+  /**
    * The one place a mutation becomes a response.
    *
    * Success and failure both end with the calendar re-read and a message in
@@ -464,8 +502,6 @@ export function PhoneCalendarPage() {
     addIstDays(weekStart, 6),
   )}`;
 
-  const showAside = Boolean(selected) || canWrite;
-
   const agentChoices: PhoneAgentChoices =
     rolesState.status === 'ready'
       ? { status: 'ready', options: agentOptions }
@@ -473,48 +509,62 @@ export function PhoneCalendarPage() {
         ? { status: 'unavailable', requested: parsedFilters.agent !== null }
         : { status: 'loading' };
 
+  const ready = !loadError && data !== null && data.enabled;
+
+  /**
+   * Where the selected appointment's detail goes. In the week grid it opens
+   * INLINE, as a row under the band that holds it (see `PhoneWeekTable`) —
+   * except on a phone, where the grid scrolls sideways and a row inside it
+   * would scroll away with it, so the detail follows the grid instead. The
+   * queue is a single column, so its detail sits beside it on a wide screen
+   * and after it on a narrow one.
+   */
+  const inlineDetail = !narrow;
+  const detailProps = selected
+    ? {
+        appointment: selected,
+        canWrite,
+        onReschedule: handleReschedule,
+        onCancel: handleCancel,
+        today,
+        onClose: closeDetail,
+      }
+    : null;
+
   return (
     <div>
       <PageHeader
         eyebrow="Operations"
         title="Phone calendar"
-        description="Internal phone screening schedule, in India Standard Time. Calls are placed within the approved calling window, every day of the week."
+        description="Phone screenings in India Standard Time. Calls go out only within the approved calling window."
         actions={
-          <>
-            <Button size="lg" variant="secondary" onClick={reload}>
-              Refresh
+          canWrite ? (
+            // The page's one primary action. It discloses the booking form
+            // directly below the header, so focus stays here when it opens.
+            <Button
+              ref={bookButtonRef}
+              size="lg"
+              variant="primary"
+              aria-expanded={bookingOpen}
+              aria-controls={bookingOpen ? bookingPanelId : undefined}
+              onClick={() => setBookingOpen((open) => !open)}
+            >
+              Book a screening
             </Button>
-            <nav aria-label="Week" className="flex flex-wrap items-center gap-2">
-              <Button
-                size="lg"
-                variant="secondary"
-                onClick={() =>
-                  applyFilters({ ...filters, weekStart: addIstDays(weekStart, -7) })
-                }
-              >
-                Previous week
-              </Button>
-              <Button
-                size="lg"
-                variant="secondary"
-                onClick={() => applyFilters({ ...filters, weekStart: today })}
-              >
-                This week
-              </Button>
-              <Button
-                size="lg"
-                variant="secondary"
-                onClick={() =>
-                  applyFilters({ ...filters, weekStart: addIstDays(weekStart, 7) })
-                }
-              >
-                Next week
-              </Button>
-              <p className="text-[13px] font-medium text-ink-secondary">{weekLabel} IST</p>
-            </nav>
-          </>
+          ) : undefined
         }
       />
+
+      {canWrite && bookingOpen && (
+        <div className="mt-6">
+          <PhoneBookingPanel
+            id={bookingPanelId}
+            onCreate={handleCreate}
+            onClose={closeBooking}
+            today={today}
+          />
+        </div>
+      )}
 
       {/*
         The live region. It is visible AND announced: one element, so a
@@ -541,7 +591,51 @@ export function PhoneCalendarPage() {
         {message?.text ?? ''}
       </div>
 
+      {/*
+        The toolbar is rendered in every state past the role gate, so the week
+        controls never unmount while a new week loads — a keyboard user
+        pressing "Next week" twice keeps focus on it. Only the filter band
+        waits for rows to filter.
+      */}
       <div className="mt-6">
+        <PhoneFilterBar
+          header={
+            <PhoneWeekNav
+              weekStart={weekStart}
+              today={today}
+              onPrevious={() =>
+                applyFilters({ ...filters, weekStart: addIstDays(weekStart, -7) })
+              }
+              onThisWeek={() => applyFilters({ ...filters, weekStart: today })}
+              onNext={() => applyFilters({ ...filters, weekStart: addIstDays(weekStart, 7) })}
+              onRefresh={reload}
+            />
+          }
+          showFilters={ready}
+          statusFacets={statusFacets}
+          stateFacets={stateFacets}
+          filters={filters}
+          view={view}
+          agents={agentChoices}
+          onAgentChange={(agent) => applyFilters({ ...filters, agent })}
+          onViewChange={(next) => {
+            // An explicit choice must always land in the URL — the
+            // builder omits defaults, and on a narrow viewport the
+            // default is "queue", so "week" would otherwise be a no-op.
+            const params = buildPhoneCalendarSearch({ ...filters, view: next });
+            params.set('view', next);
+            setSearchParams(params);
+          }}
+          onToggle={(dimension, value) =>
+            applyFilters(togglePhoneFacet(filters, dimension, value))
+          }
+          onClear={() =>
+            applyFilters({ ...filters, agent: null, statuses: [], states: [] })
+          }
+        />
+      </div>
+
+      <div ref={contentRef}>
         {loadError && <ErrorPanel message={loadError} onRetry={reload} />}
 
         {!loadError && data === null && (
@@ -555,7 +649,7 @@ export function PhoneCalendarPage() {
           announced, and a second one would talk over it.
         */}
         {!loadError && data !== null && refreshing && (
-          <p aria-hidden="true" className="mb-3 text-[13px] text-ink-tertiary">
+          <p aria-hidden="true" className="mb-3 text-label text-ink-tertiary">
             Refreshing…
           </p>
         )}
@@ -567,7 +661,7 @@ export function PhoneCalendarPage() {
           </Banner>
         )}
 
-        {!loadError && data && data.enabled && (
+        {ready && (
           <>
             {data.truncated && (
               <Banner tone="warning" className="mb-5">
@@ -577,104 +671,88 @@ export function PhoneCalendarPage() {
               </Banner>
             )}
 
-            <PhoneFilterBar
-              statusFacets={statusFacets}
-              stateFacets={stateFacets}
-              filters={filters}
-              view={view}
-              agents={agentChoices}
-              onAgentChange={(agent) => applyFilters({ ...filters, agent })}
-              onViewChange={(next) => {
-                // An explicit choice must always land in the URL — the
-                // builder omits defaults, and on a narrow viewport the
-                // default is "queue", so "week" would otherwise be a no-op.
-                const params = buildPhoneCalendarSearch({ ...filters, view: next });
-                params.set('view', next);
-                setSearchParams(params);
-              }}
-              onToggle={(dimension, value) =>
-                applyFilters(togglePhoneFacet(filters, dimension, value))
-              }
-              onClear={() =>
-                applyFilters({ ...filters, agent: null, statuses: [], states: [] })
-              }
-            />
-
-            {/*
-              The week on the left, the inspector on the right. On a narrow
-              viewport the inspector simply follows the list, so nothing is
-              hidden behind a disclosure the operator has to find.
-            */}
-            <div
-              className={cx(
-                'grid grid-cols-1 gap-5',
-                showAside && 'lg:grid-cols-[minmax(0,1fr)_24rem] lg:items-start',
-              )}
-            >
-              <div className="min-w-0">
-                {appointments.length === 0 ? (
-                  <GlassPanel padding="sm">
-                    <EmptyPanel
-                      title="No phone screenings this week"
-                      hint={`Nothing is scheduled between ${weekLabel} IST.`}
-                    />
-                  </GlassPanel>
-                ) : agentRows.length === 0 ? (
-                  <GlassPanel padding="sm">
-                    <EmptyPanel
-                      title="No calls for this agent this week"
-                      hint={otherAgentsHint(appointments, weekLabel)}
-                    />
-                  </GlassPanel>
-                ) : visible.length === 0 ? (
-                  <GlassPanel padding="sm">
-                    <EmptyPanel
-                      title="No appointments match these filters"
-                      hint={`This week has ${agentRows.length} ${
-                        agentRows.length === 1 ? 'appointment' : 'appointments'
-                      }${
-                        filters.agent === null ? '' : ' for this agent'
-                      }, none of which match the filters above.`}
-                    />
-                  </GlassPanel>
-                ) : view === 'week' ? (
-                  <PhoneWeekTable
-                    weekDates={weekDates}
-                    appointments={visible}
-                    window={data.window}
-                    selectedId={selectedId}
-                    onSelect={setSelectedId}
-                    today={today}
-                  />
+            {appointments.length === 0 ? (
+              <GlassPanel padding="sm">
+                <EmptyPanel
+                  title="No phone screenings this week"
+                  hint={`Nothing is scheduled between ${weekLabel} IST.`}
+                />
+              </GlassPanel>
+            ) : agentRows.length === 0 ? (
+              <GlassPanel padding="sm">
+                <EmptyPanel
+                  title="No calls for this agent this week"
+                  hint={otherAgentsHint(appointments, weekLabel)}
+                />
+              </GlassPanel>
+            ) : visible.length === 0 ? (
+              <GlassPanel padding="sm">
+                <EmptyPanel
+                  title="No appointments match these filters"
+                  hint={`This week has ${agentRows.length} ${
+                    agentRows.length === 1 ? 'appointment' : 'appointments'
+                  }${
+                    filters.agent === null ? '' : ' for this agent'
+                  }, none of which match the filters above.`}
+                />
+              </GlassPanel>
+            ) : view === 'week' ? (
+              <>
+                {/*
+                  The grid takes the full content width: seven days at 1280px
+                  and up, with nothing beside it.
+                */}
+                <PhoneWeekTable
+                  weekDates={weekDates}
+                  appointments={visible}
+                  window={data.window}
+                  selectedId={selectedId}
+                  onSelect={toggleSelected}
+                  today={today}
+                  detail={
+                    inlineDetail && detailProps ? (
+                      <PhoneAppointmentDetail
+                        key={detailProps.appointment.id}
+                        variant="inline"
+                        {...detailProps}
+                      />
+                    ) : undefined
+                  }
+                />
+                {!inlineDetail && detailProps && (
+                  <div className="mt-5">
+                    <PhoneAppointmentDetail key={detailProps.appointment.id} {...detailProps} />
+                  </div>
+                )}
+              </>
+            ) : (
+              /*
+                The queue is one column of rows, so it does not need the full
+                width: on a wide screen the detail sits beside it (sticky, so
+                it stays in view while the list scrolls), and on a narrow one
+                it follows the list.
+              */
+              <div className="grid grid-cols-1 gap-5 lg:grid-cols-[minmax(0,1fr)_24rem] lg:items-start">
+                <PhoneQueueList
+                  weekDates={weekDates}
+                  appointments={visible}
+                  selectedId={selectedId}
+                  onSelect={toggleSelected}
+                  today={today}
+                />
+                {detailProps ? (
+                  <aside className="min-w-0 lg:sticky lg:top-6">
+                    <PhoneAppointmentDetail key={detailProps.appointment.id} {...detailProps} />
+                  </aside>
                 ) : (
-                  <PhoneQueueList
-                    weekDates={weekDates}
-                    appointments={visible}
-                    selectedId={selectedId}
-                    onSelect={setSelectedId}
-                    today={today}
-                  />
+                  <p className="glass-sunken hidden px-5 py-4 text-label text-ink-secondary lg:block">
+                    {canWrite
+                      ? 'Select an appointment to see its details, reschedule it or cancel it.'
+                      : 'Select an appointment to see its details.'}
+                  </p>
                 )}
               </div>
-
-              {showAside && (
-                <aside className="flex min-w-0 flex-col gap-5 lg:sticky lg:top-20">
-                  {selected && (
-                    <PhoneAppointmentDetail
-                      key={selected.id}
-                      appointment={selected}
-                      canWrite={canWrite}
-                      onReschedule={handleReschedule}
-                      onCancel={handleCancel}
-                      today={today}
-                    />
-                  )}
-                  {canWrite && (
-                    <PhoneBookingPanel onCreate={handleCreate} today={today} />
-                  )}
-                </aside>
-              )}
-            </div>
+            )}
           </>
         )}
       </div>

@@ -38,7 +38,7 @@ export function TranscriptList({
   } else if (error) {
     body = (
       <div role="alert" className="rounded-lg border border-error/30 bg-error-soft p-3">
-        <p className="text-sm text-error">{error}</p>
+        <p className="text-sm text-error-text">{error}</p>
         {onRetry && (
           <button
             type="button"
@@ -67,16 +67,21 @@ export function TranscriptList({
               key={index}
               className={cx('flex flex-col', isBot ? 'items-start' : 'items-end')}
             >
-              <span className="mb-0.5 px-1 text-[11px] font-medium uppercase tracking-wide text-ink-tertiary">
+              {/* Speaker label in sentence case at the meta step. It was an
+                  uppercase, letter-spaced eyebrow, which the design system
+                  bans; the words are what identify the speaker. */}
+              <span className="mb-0.5 px-1 text-xs font-medium text-ink-tertiary">
                 {presented.label}
                 {line.is_gate === true ? ' · consent' : ''}
               </span>
               <div
                 className={cx(
                   'max-w-[85%] whitespace-pre-wrap rounded-2xl px-3.5 py-2 text-sm leading-relaxed sm:max-w-[75%]',
+                  // The accent fill for the candidate (white on #4e6ba6 is
+                  // 5.6:1), not the retired IK brand scale.
                   isBot
                     ? 'rounded-tl-sm bg-surface-tertiary text-ink'
-                    : 'rounded-tr-sm bg-brand-600 text-white',
+                    : 'rounded-tr-sm bg-info text-white',
                 )}
               >
                 {presented.text}

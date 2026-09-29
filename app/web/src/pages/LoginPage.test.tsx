@@ -70,7 +70,7 @@ describe('LoginPage', () => {
   it('renders the sign-in form with HELLO branding and company-only messaging', () => {
     renderLoginPage();
     expect(screen.getByText('HELLO')).toBeInTheDocument();
-    expect(screen.getByText(/Talent Workspace & Mission Control/)).toBeInTheDocument();
+    expect(screen.getByText('Recruiting workspace')).toBeInTheDocument();
     expect(screen.getByText('Recruiter sign-in')).toBeInTheDocument();
     expect(screen.getByLabelText('Email')).toBeInTheDocument();
     expect(screen.getByLabelText('Password')).toBeInTheDocument();

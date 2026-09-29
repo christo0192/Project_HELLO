@@ -13,7 +13,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { ThemeProvider } from '../../../lib/theme';
 import {
   LineChart,
-  DonutChart,
+  buildLineSeries,
   RadarChart,
   GaugeChart,
   EChart,
@@ -34,12 +34,6 @@ const lineData = [
   { label: 'Mon', value: 3 },
   { label: 'Tue', value: 5 },
   { label: 'Wed', value: 2 },
-];
-
-const donutData = [
-  { label: 'screening', value: 6 },
-  { label: 'completed', value: 3 },
-  { label: 'rejected', value: 1 },
 ];
 
 const radarData = [
@@ -86,7 +80,8 @@ describe('chart test environment', () => {
     const table = screen.getByRole('table', { name: 'Sessions data' });
     expect(screen.getByRole('columnheader', { name: 'Date' })).toBeInTheDocument();
     expect(screen.getByRole('cell', { name: 'Tue' })).toBeInTheDocument();
-    expect(table).toHaveClass('sr-only');
+    // Hidden by a wrapper: `sr-only` on a <table> box does not clip its rows.
+    expect(table.closest('.sr-only')).not.toBeNull();
   });
 });
 
@@ -136,7 +131,8 @@ describe('LineChart', () => {
     );
     expect(screen.getByRole('img', { name: 'Sessions over time' })).toBeInTheDocument();
     const table = screen.getByRole('table', { name: 'Sessions over time data' });
-    expect(table).toHaveClass('sr-only');
+    // Hidden by a wrapper: `sr-only` on a <table> box does not clip its rows.
+    expect(table.closest('.sr-only')).not.toBeNull();
     expect(screen.getByRole('cell', { name: 'Tue' })).toBeInTheDocument();
     expect(screen.getByRole('cell', { name: '5' })).toBeInTheDocument();
     await expect(container).toHaveNoViolations();
@@ -163,7 +159,7 @@ describe('LineChart', () => {
   });
 });
 
-describe('DonutChart', () => {
+describe('LineChart truthfulness', () => {
   beforeEach(() => {
     stubResizeObserver();
     stubCanvasContext();
@@ -173,36 +169,55 @@ describe('DonutChart', () => {
     vi.unstubAllGlobals();
   });
 
-  it('shows empty state with no candidates', () => {
-    render(wrap(<DonutChart title="Status" data={[]} height={120} />));
-    expect(screen.getByText('No candidates')).toBeInTheDocument();
-  });
-
-  it('renders a native legend and sr-only table with data', async () => {
-    allowEchartsInitWarnings();
-    const { container } = render(
-      wrap(<DonutChart title="Candidate status" data={donutData} height={120} renderer="svg" />),
+  it('draws straight segments, never a spline that invents values between points', () => {
+    // A spline through 2, 1, 1, 2 dips below 1 between the two 1s: a count of
+    // people that never happened. Straight segments cannot overshoot.
+    const { lines } = buildLineSeries(
+      [{ name: 'Added', data: [{ label: '1 Sep', value: 2 }, { label: '2 Sep', value: 1 }, { label: '3 Sep', value: 1 }] }],
+      { colors: ['#4E6BA6'] },
     );
-    const legendButtons = screen.getAllByRole('button');
-    expect(legendButtons).toHaveLength(donutData.length);
-    expect(screen.getByRole('button', { name: /screening/ })).toBeInTheDocument();
-    const table = screen.getByRole('table', { name: 'Candidate status data' });
-    expect(table).toHaveClass('sr-only');
-    expect(screen.getByRole('cell', { name: 'rejected' })).toBeInTheDocument();
-    await expect(container).toHaveNoViolations();
+    expect(lines).toHaveLength(1);
+    expect(lines.every((line) => line.smooth === false)).toBe(true);
   });
 
-  it('legend hover sets aria-pressed (hover-dim contract)', () => {
+  it('leaves a gap, not a zero, for a day one series does not have', () => {
+    const { labels, lines } = buildLineSeries(
+      [
+        { name: 'Qualified', data: [{ label: '1 Sep', value: 40 }, { label: '3 Sep', value: 20 }] },
+        { name: 'Disqualified', data: [{ label: '1 Sep', value: 10 }, { label: '2 Sep', value: 30 }, { label: '3 Sep', value: 5 }] },
+      ],
+      { colors: ['#398AA2', '#B45A72'] },
+    );
+    // The day only the second series has sits between its neighbours.
+    expect(labels).toEqual(['1 Sep', '2 Sep', '3 Sep']);
+    const qualified = lines[0].data as Array<number | null>;
+    expect(qualified[labels.indexOf('2 Sep')]).toBeNull();
+    expect(lines.every((line) => line.connectNulls === false)).toBe(true);
+  });
+
+  it('pairs a multi-series chart with one table column per series', () => {
     allowEchartsInitWarnings();
     render(
-      wrap(<DonutChart title="Candidate status" data={donutData} height={120} renderer="svg" />),
+      wrap(
+        <LineChart
+          title="Screening outcomes"
+          unit="%"
+          series={[
+            { name: 'Qualified', data: [{ label: '1 Sep', value: 40 }] },
+            { name: 'Disqualified', data: [{ label: '1 Sep', value: 10 }, { label: '2 Sep', value: 30 }] },
+          ]}
+          height={120}
+          renderer="svg"
+        />,
+      ),
     );
-    const button = screen.getByRole('button', { name: /screening/ });
-    expect(button).toHaveAttribute('aria-pressed', 'false');
-    fireEvent.mouseEnter(button);
-    expect(button).toHaveAttribute('aria-pressed', 'true');
-    fireEvent.mouseLeave(button);
-    expect(button).toHaveAttribute('aria-pressed', 'false');
+    const table = screen.getByRole('table', { name: 'Screening outcomes data' });
+    expect(screen.getByRole('columnheader', { name: 'Qualified' })).toBeInTheDocument();
+    expect(screen.getByRole('columnheader', { name: 'Disqualified' })).toBeInTheDocument();
+    // A percent reads as one; a missing day reads as missing, not "0%".
+    expect(screen.getByRole('cell', { name: '40%' })).toBeInTheDocument();
+    expect(screen.getByRole('cell', { name: 'No data' })).toBeInTheDocument();
+    expect(table.textContent).not.toContain('0%No');
   });
 });
 
@@ -261,7 +276,8 @@ describe('RadarChart', () => {
     );
     expect(screen.getByRole('img', { name: 'Skill scorecard' })).toBeInTheDocument();
     const table = screen.getByRole('table', { name: 'Skill scorecard data' });
-    expect(table).toHaveClass('sr-only');
+    // Hidden by a wrapper: `sr-only` on a <table> box does not clip its rows.
+    expect(table.closest('.sr-only')).not.toBeNull();
     expect(screen.getByRole('cell', { name: 'Communication' })).toBeInTheDocument();
   });
 });
@@ -298,7 +314,8 @@ describe('GaugeChart', () => {
     );
     expect(screen.getByRole('img', { name: /Quota utilization/ })).toBeInTheDocument();
     const table = screen.getByRole('table', { name: 'Quota utilization data' });
-    expect(table).toHaveClass('sr-only');
+    // Hidden by a wrapper: `sr-only` on a <table> box does not clip its rows.
+    expect(table.closest('.sr-only')).not.toBeNull();
     expect(screen.getByRole('cell', { name: '78%' })).toBeInTheDocument();
   });
 });

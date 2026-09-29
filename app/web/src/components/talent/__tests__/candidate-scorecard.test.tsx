@@ -22,6 +22,7 @@ import {
 } from '../CandidateScorecard';
 import { CandidateShell } from '../CandidateShell';
 import type { Assessment } from '../../../types';
+import { humanizeEnum } from '../../../lib/humanize';
 
 /** Deliberately maximal: every optional branch of `Assessment` is present. */
 const FULL: Assessment = {
@@ -118,7 +119,8 @@ function expectedValues(a: Assessment): string[] {
   return [
     String(Math.round(a.overall_score)),
     a.summary,
-    a.tone.sentiment,
+    // Enum values are shown humanized ("Neutral", "Low") on both cards.
+    humanizeEnum(a.tone.sentiment),
     a.tone.notes,
     `${a.tone.clarity}/10`,
     `${a.tone.confidence}/10`,
@@ -136,7 +138,7 @@ function expectedValues(a: Assessment): string[] {
     e.notes,
     `${e.grammar}/10`,
     `${e.coherence}/10`,
-    c.filler_usage!.level,
+    humanizeEnum(c.filler_usage!.level),
     c.filler_usage!.notes,
     ...c.filler_usage!.examples,
     c.native_language_usage!.notes,
@@ -147,7 +149,7 @@ function expectedValues(a: Assessment): string[] {
     conflict.resume_says,
     conflict.candidate_said,
     conflict.note,
-    'unresolved',
+    'Unresolved',
   ];
 }
 
@@ -190,9 +192,12 @@ describe('CandidateScorecard field parity vs the legacy Scorecard', () => {
     expect(values.length).toBeGreaterThanOrEqual(30);
     const { container } = render(<Scorecard assessment={FULL} />);
     const text = normalize(container.textContent ?? '');
+    // Case-insensitive for the VALUES: both cards humanize enums in the view
+    // ("neutral" → "Neutral"), and what parity protects is that the value
+    // is on screen at all, not its capitalisation.
     for (const value of values) {
-      expect(text, `legacy card is missing ${JSON.stringify(value)}`).toContain(
-        normalize(value),
+      expect(text.toLowerCase(), `legacy card is missing ${JSON.stringify(value)}`).toContain(
+        normalize(value).toLowerCase(),
       );
     }
     for (const label of REQUIRED_LABELS) {
@@ -204,8 +209,8 @@ describe('CandidateScorecard field parity vs the legacy Scorecard', () => {
     const { container } = render(<CandidateScorecard assessment={FULL} />);
     const text = normalize(container.textContent ?? '');
     for (const value of expectedValues(FULL)) {
-      expect(text, `candidate card lost ${JSON.stringify(value)}`).toContain(
-        normalize(value),
+      expect(text.toLowerCase(), `candidate card lost ${JSON.stringify(value)}`).toContain(
+        normalize(value).toLowerCase(),
       );
     }
     for (const label of REQUIRED_LABELS) {
@@ -259,7 +264,7 @@ describe('CandidateScorecard field parity vs the legacy Scorecard', () => {
     expect(screen.getByText('From raw.')).toBeInTheDocument();
     expect(screen.getByText('Raw motivation.')).toBeInTheDocument();
     expect(screen.getByText('Raw topic')).toBeInTheDocument();
-    expect(screen.getByText('resolved')).toBeInTheDocument();
+    expect(screen.getByText('Resolved')).toBeInTheDocument();
   });
 
   it('rounds the overall score exactly as the legacy card does', () => {

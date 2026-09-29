@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   NOT_AVAILABLE,
   toValidDate,
@@ -95,5 +95,24 @@ describe('formatRelative', () => {
     const out = formatRelative(inTwoDays, now);
     expect(out).not.toMatch(/ago/);
     expect(out).toMatch(/2/);
+  });
+});
+
+describe('month spelling', () => {
+  afterEach(() => vi.restoreAllMocks());
+
+  it("writes September as Sep, never the en-GB/en-IN Sept of current ICU", () => {
+    const parts: Intl.DateTimeFormatPart[] = [
+      { type: 'day', value: '16' },
+      { type: 'literal', value: ' ' },
+      { type: 'month', value: 'Sept' },
+      { type: 'literal', value: ' ' },
+      { type: 'year', value: '2026' },
+    ];
+    // A regular function: the formatter is constructed with `new`.
+    vi.spyOn(Intl, 'DateTimeFormat').mockImplementation(function () {
+      return { formatToParts: () => parts } as unknown as Intl.DateTimeFormat;
+    });
+    expect(formatDate('2026-09-16T10:00:00Z')).toBe('16 Sep 2026');
   });
 });

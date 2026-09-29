@@ -172,7 +172,7 @@ export function RolesPage() {
         // NOT "the questions Gopu will ask". Each role now names its own
         // agent, and one hard-coded name in the page header contradicts every
         // role that chose a different one.
-        description="Define the jobs candidates are screened for and the questions the screening agent will ask."
+        description="The jobs candidates are screened for, and the questions the screening agent asks."
         actions={
           canEditMetrics || editing === null ? (
             <>
@@ -798,7 +798,7 @@ function RoleForm({
               return (
                 <div key={idx} className="space-y-3">
                   {label && (
-                    <h4 className="pt-1 text-xs font-semibold uppercase tracking-wide text-ink-tertiary">
+                    <h4 className="pt-1 text-[13px] font-semibold leading-5 text-ink-secondary">
                       {label}
                     </h4>
                   )}

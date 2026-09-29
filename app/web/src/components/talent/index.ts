@@ -55,7 +55,6 @@ export {
   formatDurationSec,
   candidateStatusCounts,
   sessionStatusCounts,
-  sessionsPerDay,
 } from './status';
 export {
   CANDIDATE_STATUS_ORDER,

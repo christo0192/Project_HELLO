@@ -42,7 +42,10 @@ export function Field({ label, hint, error, children, id, className, inline }: F
   const describedBy = [hint ? hintId : null, error ? errorId : null].filter(Boolean).join(' ') || undefined;
   return (
     <div className={cx(inline ? 'flex items-center gap-3' : 'flex flex-col gap-1.5', className)}>
-      <label htmlFor={controlId} className="text-[13px] font-medium text-ink-secondary">
+      {/* Label step (13/20, medium, secondary ink), sentence case. Hints and
+          errors are the meta size with a prose line height (12/20): they can
+          run to two lines, where 16px leading crowds. */}
+      <label htmlFor={controlId} className="text-label font-medium text-ink-secondary">
         {label}
       </label>
       {children({ id: controlId, describedBy, invalid: Boolean(error) })}

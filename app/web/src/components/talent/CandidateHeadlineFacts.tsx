@@ -12,6 +12,7 @@
  * is worse than no role, and "0m 0s" or "0 words" read as facts about the
  * candidate when they are really facts about our data.
  */
+import type { ReactNode } from 'react';
 import { formatDurationSec } from './status';
 
 export interface CandidateHeadlineFactsProps {
@@ -36,27 +37,34 @@ export interface CandidateHeadlineFactsProps {
   candidateWords?: number | null;
 }
 
-/** Shared shape; tone is the only thing that varies. */
-function Pill({
-  tone,
+/**
+ * One fact: the FIGURE in the ink at weight 600, its caption in secondary
+ * ink. Plain text on the page ground, not a tinted capsule: three coloured
+ * pills under a name read as chips to click, and colour carried no meaning
+ * here anyway (role, length and words are not states).
+ */
+function Fact({
   attr,
   value,
   caption,
 }: {
-  tone: 'info' | 'success';
   attr: string;
   value: string;
   caption?: string;
 }) {
   return (
-    <span
-      {...{ [attr]: '' }}
-      className={`inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-[13px] font-semibold tabular-nums text-ink ${
-        tone === 'success' ? 'bg-success-soft' : 'bg-info-soft'
-      }`}
-    >
-      {value}
-      {caption && <span className="font-normal text-ink-secondary">{caption}</span>}
+    <span {...{ [attr]: '' }} className="whitespace-nowrap">
+      <span className="font-semibold tabular-nums text-ink">{value}</span>
+      {caption && <span className="text-ink-secondary"> {caption}</span>}
+    </span>
+  );
+}
+
+/** A hairline dot between facts; decorative, so hidden from AT. */
+function Sep() {
+  return (
+    <span aria-hidden="true" className="text-ink-tertiary">
+      ·
     </span>
   );
 }
@@ -70,39 +78,44 @@ export function CandidateHeadlineFacts({
   const hasWords = typeof candidateWords === 'number' && Number.isFinite(candidateWords);
   if (!roleTitle && !hasCall && !hasWords) return null;
 
+  const facts: ReactNode[] = [];
+  if (roleTitle) {
+    facts.push(
+      <span key="role" data-candidate-role-title="" className="font-medium text-ink">
+        {/* The other two facts caption themselves ("on the call", "words
+            spoken"); a bare role title would be heard as "Sales Advisor"
+            with nothing saying what it is. `Tag` uses this idiom too. */}
+        <span className="sr-only">Role: </span>
+        {roleTitle}
+      </span>,
+    );
+  }
+  if (hasCall) {
+    facts.push(
+      <Fact
+        key="call"
+        attr="data-candidate-call-length"
+        value={formatDurationSec(callSeconds as number)}
+        // Says WHAT was measured. There is no per-speaker talk time in this
+        // system, so "on the call" is the honest caption.
+        caption="on the call"
+      />,
+    );
+  }
+  if (hasWords) {
+    facts.push(
+      <Fact
+        key="words"
+        attr="data-candidate-words"
+        value={(candidateWords as number).toLocaleString()}
+        caption={candidateWords === 1 ? 'word spoken' : 'words spoken'}
+      />,
+    );
+  }
+
   return (
-    <div className="flex flex-wrap items-center gap-2">
-      {roleTitle && (
-        <span
-          data-candidate-role-title=""
-          className="inline-flex items-center rounded-full bg-info-soft px-2.5 py-1 text-[13px] font-medium text-ink"
-        >
-          {/* The other two pills caption themselves ("on the call", "words
-              spoken"); this one is bare text in a coloured capsule, so a
-              screen reader would hear "Sales Advisor" with nothing saying
-              what it is. `Tag` already uses this idiom with srPrefix. */}
-          <span className="sr-only">Role: </span>
-          {roleTitle}
-        </span>
-      )}
-      {hasCall && (
-        <Pill
-          tone="success"
-          attr="data-candidate-call-length"
-          value={formatDurationSec(callSeconds as number)}
-          // Says WHAT was measured. There is no per-speaker talk time in this
-          // system, so "on the call" is the honest caption.
-          caption="on the call"
-        />
-      )}
-      {hasWords && (
-        <Pill
-          tone="info"
-          attr="data-candidate-words"
-          value={(candidateWords as number).toLocaleString()}
-          caption={candidateWords === 1 ? 'word spoken' : 'words spoken'}
-        />
-      )}
-    </div>
+    <span className="inline-flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px] leading-5">
+      {facts.flatMap((fact, i) => (i === 0 ? [fact] : [<Sep key={`sep-${i}`} />, fact]))}
+    </span>
   );
 }

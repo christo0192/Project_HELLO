@@ -7,14 +7,21 @@
  *   "Workspace"; Operations for admins/interviewers — Ashby Mission Control
  *   and Mission Control stay admin-only, the phone calendar is for both
  *   roles.
- * - Material: a frosted rail (sidebar) and a frosted top bar float on a
+ * - Material: a frosted rail (sidebar) and, on mobile, a frosted top bar float on a
  *   softly lit ground (`.app-ground`). Both collapse to opaque surfaces under
  *   `prefers-reduced-transparency` or without `backdrop-filter`.
  * - Responsive: desktop fixed sidebar (lg+); mobile off-canvas drawer with
  *   backdrop, Escape-to-close, `inert` when closed (out of tab order and
  *   the accessibility tree), focus moved into the drawer on open and
  *   returned to the toggle on close.
- * - Topbar: mobile menu toggle, current page name, workspace label.
+ * - Top bar: MOBILE ONLY — menu toggle, brand, and the current page's name
+ *   (the one thing a phone user cannot otherwise see once the sidebar is
+ *   folded away). On desktop the sidebar already names the product and marks
+ *   the current page, and every page opens with its own `<h1>`, so a desktop
+ *   top bar could only repeat one of them; it is not rendered there.
+ * - Route announcement: a visually hidden polite live region carries the
+ *   page name at every width, so a screen-reader user still hears where a
+ *   navigation landed even though no visible bar holds the name on desktop.
  * - Skip link + `#main-content` target (WCAG 2.4.1).
  * - Lazy route chunks suspend inside `<Suspense>` with a small loading
  *   fallback (route components are React.lazy in App.tsx); each route
@@ -356,8 +363,24 @@ export function Layout() {
       {/* While the mobile drawer is open the page behind it is inert, so
           Tab cannot escape the drawer and assistive tech reads only it. */}
       <div className="flex min-w-0 flex-1 flex-col" inert={drawerOpen && !isDesktop ? true : undefined}>
+        {/*
+          The route announcer. Visually hidden at every width and never
+          duplicated by a live copy elsewhere: the page name changes here on
+          each navigation and is read politely, after whatever the user is
+          currently hearing.
+        */}
+        <p className="sr-only" aria-live="polite" aria-atomic="true">
+          {pageTitle}
+        </p>
+
+        {/*
+          Mobile top bar. The page name is shown next to the brand so a phone
+          user always knows where they are with the sidebar folded away; it is
+          `aria-hidden` because the announcer above already speaks it, and a
+          second readable copy would be read twice in a row.
+        */}
         <header
-          className={`sticky top-0 z-20 flex h-14 items-center gap-3 border-b border-glass-ring bg-[var(--glass-bg-strong)] px-4 backdrop-blur-xl transition-shadow duration-300 sm:px-8 ${
+          className={`sticky top-0 z-20 flex h-14 items-center gap-3 border-b border-glass-ring bg-[var(--glass-bg-strong)] px-4 backdrop-blur-xl transition-shadow duration-300 sm:px-8 lg:hidden ${
             scrolled ? 'shadow-[0_8px_24px_-16px_rgba(15,23,42,0.22)]' : ''
           }`}
         >
@@ -366,16 +389,17 @@ export function Layout() {
             onToggle={() => setDrawerOpen((open) => !open)}
             ref={menuButtonRef}
           />
-          <div className="lg:hidden">
+          {/* The brand keeps its width; a long page name truncates instead. */}
+          <div className="shrink-0">
             <Brand compact />
           </div>
-          <p className="hidden truncate text-sm font-medium text-ink-secondary lg:block" aria-live="polite">
+          <span aria-hidden="true" className="h-5 w-px shrink-0 bg-[var(--glass-ring-strong)]" />
+          <p
+            aria-hidden="true"
+            className="min-w-0 truncate text-sm font-medium text-ink-secondary"
+          >
             {pageTitle}
           </p>
-          <div className="flex-1" />
-          <span className="hidden rounded-full bg-white/70 px-3 py-1 text-xs font-medium text-ink-tertiary shadow-[inset_0_0_0_1px_var(--glass-ring)] sm:inline">
-            Recruiter workspace
-          </span>
         </header>
 
         <main
@@ -383,7 +407,7 @@ export function Layout() {
           tabIndex={-1}
           className="flex-1 outline-none"
         >
-          <div className="mx-auto max-w-page px-4 py-6 sm:px-8 sm:py-8">
+          <div className="mx-auto max-w-page px-4 py-6 sm:px-8 sm:py-8 lg:pt-10">
             <ErrorBoundary resetKey={location.pathname}>
               <Suspense fallback={<LoadingPanel />}>
                 <PageTransition key={location.pathname}>
