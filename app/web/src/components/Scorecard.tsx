@@ -78,7 +78,7 @@ function ScoreBar({ label, value }: { label: string; value: unknown }) {
   const shown = Math.round(safe * 10) / 10;
   return (
     <div>
-      <div className="flex items-baseline justify-between gap-3 text-[13px] leading-5">
+      <div className="flex items-baseline justify-between gap-3 text-label">
         <span className="text-ink-secondary">{label}</span>
         <span className="font-semibold tabular-nums text-ink">{`${shown}/10`}</span>
       </div>
@@ -137,7 +137,7 @@ function Part({ title, aside, children }: { title: string; aside?: ReactNode; ch
   return (
     <>
       <div className="mb-2.5 flex items-center justify-between gap-3">
-        <h4 className="text-[13px] font-semibold text-ink">{title}</h4>
+        <h4 className="text-label font-semibold text-ink">{title}</h4>
         {aside}
       </div>
       <div className="space-y-3">{children}</div>
@@ -178,9 +178,9 @@ function PartGrid({ cells }: { cells: PartCell[] }) {
 function ChipGroup({ label, items, tone }: { label: string; items: string[]; tone: StatusTone }) {
   return (
     <div>
-      <p className="mb-1.5 text-[13px] font-medium text-ink-secondary">{label}</p>
+      <p className="mb-1.5 text-label font-medium text-ink-secondary">{label}</p>
       {items.length === 0 ? (
-        <p className="text-[13px] text-ink-tertiary">None</p>
+        <p className="text-label text-ink-tertiary">None</p>
       ) : (
         <div className="flex flex-wrap gap-1.5">
           {items.map((item, i) => (
@@ -215,11 +215,11 @@ function signalCell(key: string, label: string, signal: unknown): PartCell | nul
       >
         <ScoreBar label="Impact" value={signal.impact_score} />
         {examples.length > 0 && (
-          <p className="text-[13px] leading-5 text-ink-secondary">
+          <p className="text-label text-ink-secondary">
             <span className="font-medium text-ink">Examples:</span> {examples.join(', ')}
           </p>
         )}
-        {notes && <p className="max-w-prose text-[13px] leading-5 text-ink-tertiary">{notes}</p>}
+        {notes && <p className="max-w-prose text-label text-ink-tertiary">{notes}</p>}
       </Part>
     ),
   };
@@ -269,7 +269,7 @@ function LegacyScorecard({ assessment, layout }: { assessment: Assessment; layou
                 <ScoreBar label="Coherence" value={english.coherence} />
               </Bars>
               {text(english.notes) && (
-                <p className="max-w-prose text-[13px] leading-5 text-ink-tertiary">{text(english.notes)}</p>
+                <p className="max-w-prose text-label text-ink-tertiary">{text(english.notes)}</p>
               )}
             </Part>
           ),
@@ -325,7 +325,7 @@ function LegacyScorecard({ assessment, layout }: { assessment: Assessment; layou
               <ScoreBar label="Professionalism" value={tone.professionalism} />
             </Bars>
             {sentiment && (
-              <div className="flex items-center gap-3 text-[13px]">
+              <div className="flex items-center gap-3 text-label">
                 <span className="text-ink-secondary">Sentiment</span>
                 <StatusBadge dot={false}>{humanizeEnum(sentiment)}</StatusBadge>
               </div>
@@ -374,18 +374,18 @@ function LegacyScorecard({ assessment, layout }: { assessment: Assessment; layou
                 return (
                   <li key={i} className="py-3 first:pt-0 last:pb-0">
                     <div className="flex items-start justify-between gap-3">
-                      <p className="text-[13px] font-semibold text-ink">{text(c.topic) || 'Conflict'}</p>
+                      <p className="text-label font-semibold text-ink">{text(c.topic) || 'Conflict'}</p>
                       <StatusBadge tone={resolved ? 'success' : 'warning'}>
                         {resolved ? 'Resolved' : 'Unresolved'}
                       </StatusBadge>
                     </div>
-                    <dl className="mt-1.5 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[13px] leading-5">
+                    <dl className="mt-1.5 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-label">
                       <dt className="text-ink-tertiary">Resume:</dt>
                       <dd className="text-ink-secondary">{text(c.resume_says) || 'Not stated'}</dd>
                       <dt className="text-ink-tertiary">Said on call:</dt>
                       <dd className="text-ink-secondary">{text(c.candidate_said) || 'Not stated'}</dd>
                     </dl>
-                    {note && <p className="mt-1.5 max-w-prose text-[13px] leading-5 text-ink-tertiary">{note}</p>}
+                    {note && <p className="mt-1.5 max-w-prose text-label text-ink-tertiary">{note}</p>}
                   </li>
                 );
               })}

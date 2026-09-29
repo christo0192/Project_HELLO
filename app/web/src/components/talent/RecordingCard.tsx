@@ -7,6 +7,12 @@
  * - Short-TTL expiry is handled with a "Refresh link" action that mints a
  *   fresh URL; stale responses are ignored via a generation counter.
  * - Errors are shown inline with a retry path.
+ *
+ * NOT A CARD, despite the name. It sits inside the session page's Details
+ * panel, and a bordered white box there was a card inside a glass panel,
+ * which the design system rules out (no glass-in-glass). It is a section of
+ * that panel instead: a hairline above it, the same `--glass-ring` hairline
+ * that separates the Details rows, and no fill or border of its own.
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -68,13 +74,15 @@ export function RecordingCard({
   }, [sessionId]);
 
   return (
-    <div className={cx('rounded-lg border border-line bg-surface p-3', className)}>
+    // A plain div, not a labelled <section>: that would add a "region"
+    // landmark per recording to a page whose panels already have headings.
+    <div className={cx('border-t border-glass-ring pt-4', className)}>
       {/* Sentence case at the label step. This was an uppercase, tracked
           eyebrow, which the design system forbids everywhere. */}
-      <h3 className="text-[13px] font-medium text-ink-secondary">{title}</h3>
-      <p className="mt-1 text-xs text-ink-tertiary">
-        A short-lived link is created only when you request playback and
-        expires automatically. Object keys and signed URLs are never exposed.
+      <h3 className="text-label font-medium text-ink-secondary">{title}</h3>
+      <p className="mt-1 text-meta text-ink-tertiary">
+        The recording link is created when you press Load recording and
+        expires on its own.
       </p>
 
       {!url && (
@@ -106,14 +114,14 @@ export function RecordingCard({
             <a
               href={url}
               download
-              className="text-xs font-medium text-info underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
+              className="text-meta font-medium text-info underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
             >
               Download file
             </a>
             <button
               type="button"
               onClick={fetchUrl}
-              className="text-xs font-medium text-ink-secondary underline-offset-2 hover:text-ink hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
+              className="text-meta font-medium text-ink-secondary underline-offset-2 hover:text-ink hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
             >
               Refresh link
             </button>

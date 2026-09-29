@@ -126,7 +126,7 @@ export function BarList({
   }
 
   return (
-    <table className={cx('w-full table-fixed border-collapse text-[13px] leading-5', className)}>
+    <table className={cx('w-full table-fixed border-collapse text-label', className)}>
       <caption className="sr-only">{title} data</caption>
       <colgroup>
         <col />

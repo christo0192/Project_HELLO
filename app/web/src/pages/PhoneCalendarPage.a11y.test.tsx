@@ -339,6 +339,33 @@ describe('palette — every colour utility resolves to a real token', () => {
     expect(appt.className).toMatch(/focus-visible:ring-2/);
     expect(appt.className).toMatch(/focus-visible:ring-brand-500/);
   });
+
+  it('never draws "selected" and "focused" the same way', async () => {
+    // Both were a 2px #4E6BA6 ring, so a keyboard operator could not tell the
+    // chip they were on from the chip that was open. jsdom does no painting,
+    // so the classes that make the two looks different are what is pinned.
+    renderPage();
+    await screen.findByRole('table');
+    await userEvent.click(screen.getByRole('button', { name: /ATS-4417/ }));
+    await screen.findByRole('region', { name: 'Selected appointment' });
+
+    for (const name of [/ATS-4417/, /ATS-9002/]) {
+      const chip = screen.getByRole('button', { name });
+      // Focus: a ring detached from the chip by a gap.
+      expect(chip.className).toMatch(/(^|\s)focus-visible:ring-offset-2(\s|$)/);
+    }
+    const selected = screen.getByRole('button', { name: /ATS-4417/ });
+    expect(selected).toHaveAttribute('aria-pressed', 'true');
+    // Selection: a tint and a 1px ring on the edge, never the focus ring's 2px.
+    const plain = selected.className.split(/\s+/).filter((c) => !c.includes(':'));
+    expect(plain).toContain('bg-info-soft');
+    expect(plain).toContain('ring-1');
+    expect(plain).not.toContain('ring-2');
+
+    const other = screen.getByRole('button', { name: /ATS-9002/ });
+    expect(other).toHaveAttribute('aria-pressed', 'false');
+    expect(other.className.split(/\s+/)).not.toContain('bg-info-soft');
+  });
 });
 
 describe('status is never conveyed by colour alone', () => {

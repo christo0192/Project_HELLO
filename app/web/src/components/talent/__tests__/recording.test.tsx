@@ -73,6 +73,28 @@ describe('RecordingCard', () => {
     expect(await screen.findByText('link expired')).toBeInTheDocument();
   });
 
+  it('is a hairline-separated section of its host panel, not a bordered card inside it', () => {
+    // It renders inside the session page's Details GlassPanel; a bordered
+    // white box there was glass-in-glass.
+    const { container } = render(<RecordingCard sessionId="s1" />);
+    const root = container.firstElementChild as HTMLElement;
+    const classes = root.className.split(/\s+/);
+    expect(classes).toContain('border-t');
+    expect(classes).not.toContain('border');
+    expect(classes.some((c) => c.startsWith('bg-'))).toBe(false);
+    expect(classes.some((c) => c.startsWith('rounded'))).toBe(false);
+  });
+
+  it('explains the link in plain words, with no storage vocabulary', () => {
+    const { container } = render(<RecordingCard sessionId="s1" />);
+    expect(
+      screen.getByText(
+        'The recording link is created when you press Load recording and expires on its own.',
+      ),
+    ).toBeInTheDocument();
+    expect(container.textContent).not.toMatch(/object key|signed url/i);
+  });
+
   it('is axe-clean', async () => {
     getRecordingDownloadUrl.mockResolvedValue({ url: 'https://x.invalid/rec' });
     const { container } = render(<RecordingCard sessionId="s1" />);

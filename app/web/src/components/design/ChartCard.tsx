@@ -24,7 +24,14 @@ export interface ChartCardProps {
   footer?: ReactNode;
 }
 
-/** One glass panel for a chart or breakdown, with the shared header row. */
+/**
+ * One glass panel for a chart or breakdown, with the shared header row.
+ *
+ * `h-full`: chart cards sit side by side as peers, and a row of them should
+ * share one bottom edge. In a stretching grid row the card fills the row's
+ * height and the body (`flex-1`) takes the slack, so the footer stays at the
+ * bottom; anywhere without a definite height it is simply its content's.
+ */
 export function ChartCard({
   title,
   description,
@@ -37,7 +44,7 @@ export function ChartCard({
   footer,
 }: ChartCardProps) {
   return (
-    <GlassPanel as="section" aria-label={title} className={cx('flex flex-col', className)}>
+    <GlassPanel as="section" aria-label={title} className={cx('flex h-full flex-col', className)}>
       <SectionHeader
         title={title}
         description={description}
@@ -49,7 +56,7 @@ export function ChartCard({
       <div className="flex-1" style={minHeight ? { minHeight } : undefined}>
         {children}
       </div>
-      {footer && <div className="mt-4 text-[12px] leading-4 text-ink-tertiary">{footer}</div>}
+      {footer && <div className="mt-4 text-meta text-ink-tertiary">{footer}</div>}
     </GlassPanel>
   );
 }

@@ -116,3 +116,12 @@ describe('month spelling', () => {
     expect(formatDate('2026-09-16T10:00:00Z')).toBe('16 Sep 2026');
   });
 });
+
+describe('one clock', () => {
+  it('writes day-month order and a 24-hour time whatever the browser locale', () => {
+    // 2026-09-16T15:44Z; the hour depends on the runner's zone, the shape does not.
+    const out = formatDateTime('2026-09-16T15:44:00Z');
+    expect(out).toMatch(/^\d{1,2} Sep 2026, \d{2}:\d{2}$/);
+    expect(out).not.toMatch(/am|pm|AM|PM/);
+  });
+});

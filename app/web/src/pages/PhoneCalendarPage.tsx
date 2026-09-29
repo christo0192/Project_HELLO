@@ -196,6 +196,20 @@ export function PhoneCalendarPage() {
   const [message, setMessage] = useState<Message | null>(null);
   const [rolesState, setRolesState] = useState<RolesState>({ status: 'loading' });
   const [bookingOpen, setBookingOpen] = useState(false);
+  /**
+   * Whether phone screening was ON at the last calendar read that answered.
+   * `null` until one has.
+   *
+   * Booking is offered only when this is `true`. The flag is deployment-wide,
+   * not per week, so it is kept across a week change (where `data` is blanked
+   * while the next week loads) rather than making "Book a screening" blink
+   * out and back, and closing a half-filled form, on every "Next week". A read
+   * that FAILS leaves it as it was: the failure says nothing about the flag,
+   * and the booking POST stays authoritative either way. A read that says
+   * `enabled: false` withdraws booking at once, because every POST would come
+   * back 503 `phone_screening_disabled` while the banner says so.
+   */
+  const [screeningOn, setScreeningOn] = useState<boolean | null>(null);
 
   /** The header's "Book a screening" button: focus returns here on close. */
   const bookButtonRef = useRef<HTMLButtonElement | null>(null);
@@ -324,6 +338,7 @@ export function PhoneCalendarPage() {
       .then((res) => {
         if (!live) return;
         setData(res);
+        setScreeningOn(res.enabled);
         setRefreshing(false);
       })
       .catch((e: ApiError) => {
@@ -512,6 +527,16 @@ export function PhoneCalendarPage() {
   const ready = !loadError && data !== null && data.enabled;
 
   /**
+   * "Book a screening" and its form. Admin only, as before, AND only once a
+   * read has said phone screening is on: the banner below tells the operator
+   * nothing can be booked while it is off, so the page must not then open a
+   * form whose every submit is refused. (Before the booking form moved up
+   * under the header it lived inside the enabled-only subtree, which is what
+   * enforced this.) See `screeningOn` for why this is not simply `ready`.
+   */
+  const canBook = canWrite && screeningOn === true;
+
+  /**
    * Where the selected appointment's detail goes. In the week grid it opens
    * INLINE, as a row under the band that holds it (see `PhoneWeekTable`) —
    * except on a phone, where the grid scrolls sideways and a row inside it
@@ -538,7 +563,7 @@ export function PhoneCalendarPage() {
         title="Phone calendar"
         description="Phone screenings in India Standard Time. Calls go out only within the approved calling window."
         actions={
-          canWrite ? (
+          canBook ? (
             // The page's one primary action. It discloses the booking form
             // directly below the header, so focus stays here when it opens.
             <Button
@@ -555,7 +580,7 @@ export function PhoneCalendarPage() {
         }
       />
 
-      {canWrite && bookingOpen && (
+      {canBook && bookingOpen && (
         <div className="mt-6">
           <PhoneBookingPanel
             id={bookingPanelId}

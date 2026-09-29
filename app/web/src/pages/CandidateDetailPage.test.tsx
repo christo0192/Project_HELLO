@@ -6,6 +6,7 @@
  * block suppression, notes, appeals, CSV export, axe.
  */
 
+import { StrictMode } from 'react';
 import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
@@ -84,21 +85,46 @@ vi.mock('../api', () => ({
 }));
 
 /**
- * Realtime handlers by channel name, so a test can deliver the INSERT that a
- * new call session produces. Hoisted: `vi.mock` factories run before imports.
+ * A realtime client that behaves like realtime-js where it matters here, so a
+ * test can deliver the INSERT a new call session produces:
+ *   - `channel(topic)` returns the channel ALREADY registered under that
+ *     topic, if there is one (RealtimeClient.channel does exactly this);
+ *   - `removeChannel` starts a leave and does NOT unregister the channel —
+ *     the real client only drops it once the leave round-trip completes, and
+ *     in a test that round-trip never happens;
+ *   - a leaving channel delivers nothing.
+ * Hoisted: `vi.mock` factories run before imports.
  */
+interface MockChannel {
+  topic: string;
+  leaving: boolean;
+  handlers: Array<(payload: unknown) => void>;
+  on: (type: string, filter: unknown, handler: (payload: unknown) => void) => MockChannel;
+  subscribe: () => MockChannel;
+}
 const realtime = vi.hoisted(() => ({
-  handlers: new Map<string, Array<(payload: unknown) => void>>(),
+  channels: new Map<string, MockChannel>(),
+  /** Every topic `channel()` was asked for, in order. */
+  requested: [] as string[],
+  reset() {
+    this.channels.clear();
+    this.requested.length = 0;
+  },
 }));
 
 vi.mock('../lib/supabase', () => {
-  const makeChannel = (name: string) => {
-    const channel: any = {};
-    channel.on = (_type: string, _filter: unknown, handler: (payload: unknown) => void) => {
-      realtime.handlers.set(name, [...(realtime.handlers.get(name) ?? []), handler]);
-      return channel;
+  const makeChannel = (topic: string): MockChannel => {
+    const channel: MockChannel = {
+      topic,
+      leaving: false,
+      handlers: [],
+      on: (_type, _filter, handler) => {
+        channel.handlers.push(handler);
+        return channel;
+      },
+      // realtime-js returns the channel itself, and callers keep THAT.
+      subscribe: () => channel,
     };
-    channel.subscribe = () => 'mock-sub';
     return channel;
   };
   const makeQuery = () => {
@@ -112,11 +138,39 @@ vi.mock('../lib/supabase', () => {
   return {
     supabase: {
       from: () => makeQuery(),
-      channel: (name: string) => makeChannel(name),
-      removeChannel: () => {},
+      channel: (topic: string) => {
+        realtime.requested.push(topic);
+        const existing = realtime.channels.get(topic);
+        if (existing) return existing;
+        const created = makeChannel(topic);
+        realtime.channels.set(topic, created);
+        return created;
+      },
+      removeChannel: (channel: MockChannel) => {
+        channel.leaving = true;
+        return Promise.resolve('ok');
+      },
     },
   };
 });
+
+/** Every live-watch topic requested for a candidate, oldest first. */
+function liveWatchTopics(candidateId: string): string[] {
+  return realtime.requested.filter((topic) =>
+    topic.startsWith(`candidate-live-watch:${candidateId}`),
+  );
+}
+
+/** Deliver a call-session INSERT to every live-watch channel that is not leaving. */
+function insertCallSession(candidateId: string, row: Record<string, unknown>) {
+  act(() => {
+    for (const channel of realtime.channels.values()) {
+      if (channel.leaving) continue;
+      if (!channel.topic.startsWith(`candidate-live-watch:${candidateId}`)) continue;
+      channel.handlers.forEach((handler) => handler({ new: row }));
+    }
+  });
+}
 
 function renderDetailPage(id = 'candidate-1', search = '') {
   return render(
@@ -444,17 +498,42 @@ describe('CandidateDetailPage', () => {
   it('mounts the Live call panel when a NEW session is inserted while the page is open', async () => {
     // The panel's own "auto-activate on a new session" behaviour: an invite
     // created here, or the dialler placing the call, inserts a call session.
-    realtime.handlers.clear();
+    realtime.reset();
     renderDetailPage();
     await screen.findByText('Browser voice screening');
     expect(screen.queryByText('Live call')).not.toBeInTheDocument();
     // The subscription is made in an effect, which can flush after the text
     // above appears: wait for it rather than racing it.
-    const key = 'candidate-live-watch:candidate-1';
-    await waitFor(() => expect(realtime.handlers.get(key)?.length).toBeGreaterThan(0));
-    act(() => {
-      realtime.handlers.get(key)!.forEach((handler) => handler({ new: { id: 's-new', status: 'created' } }));
-    });
+    await waitFor(() => expect(liveWatchTopics('candidate-1').length).toBeGreaterThan(0));
+    insertCallSession('candidate-1', { id: 's-new', status: 'created' });
+    expect(await screen.findByText('Live call')).toBeInTheDocument();
+  });
+
+  it('gives every live-watch subscription its own topic, so a fast remount still hears the INSERT', async () => {
+    // realtime-js `channel(topic)` returns the channel already registered
+    // under that topic, and `removeChannel` unregisters it only after the
+    // leave round-trip. With one fixed topic, StrictMode's mount, unmount,
+    // mount handed the second subscription the first one's LEAVING channel,
+    // and the watch never fired.
+    realtime.reset();
+    render(
+      <StrictMode>
+        <MemoryRouter initialEntries={['/candidates/candidate-1']}>
+          <Routes>
+            <Route path="/candidates/:id" element={<CandidateDetailPage />} />
+          </Routes>
+        </MemoryRouter>
+      </StrictMode>,
+    );
+    await screen.findByText('Browser voice screening');
+    // StrictMode runs the effect, its cleanup, and the effect again.
+    await waitFor(() => expect(liveWatchTopics('candidate-1').length).toBeGreaterThanOrEqual(2));
+    const topics = liveWatchTopics('candidate-1');
+    expect(new Set(topics).size).toBe(topics.length);
+    expect(realtime.channels.get(topics[0])?.leaving).toBe(true);
+
+    // The surviving subscription hears the insert.
+    insertCallSession('candidate-1', { id: 's-new', status: 'created' });
     expect(await screen.findByText('Live call')).toBeInTheDocument();
   });
 
@@ -666,6 +745,80 @@ describe('Candidate header: one primary action for the state', () => {
     await user.keyboard('{Escape}');
     expect(screen.queryByRole('dialog', { name: 'Confirm phone screening' })).not.toBeInTheDocument();
     expect(header).toHaveFocus();
+  });
+
+  it('moves focus into the call confirmation even when "Call candidate" is pressed from ?tab=review', async () => {
+    // A "Review & decide" deep link can land on the Review tab of a candidate
+    // with nothing to review, so the header offers "Call candidate" there.
+    // The confirmation lives on the Overview, and the tab switch is a router
+    // transition that commits AFTER the click's render: opening the
+    // confirmation in that render focused a button inside a still-`hidden`
+    // panel, which a browser refuses, leaving focus on the header button.
+    //
+    // jsdom does not implement that refusal (it focuses anything focusable,
+    // rendered or not), so this test adds it: focus() inside a `hidden`
+    // subtree is a no-op, as it is in every browser.
+    const realFocus = HTMLElement.prototype.focus;
+    const focusSpy = vi
+      .spyOn(HTMLElement.prototype, 'focus')
+      .mockImplementation(function (this: HTMLElement, options?: FocusOptions) {
+        if (this.closest('[hidden]')) return;
+        realFocus.call(this, options);
+      });
+    try {
+      const user = userEvent.setup();
+      mockApi.getCandidate.mockResolvedValue({ ...mockCandidateDetail, sessions: [], assessments: [] });
+      renderDetailPage('candidate-1', '?tab=review');
+      const header = await screen.findByRole('button', { name: 'Call candidate' });
+      expect(reviewTab()).toHaveAttribute('aria-selected', 'true');
+
+      await user.click(header);
+
+      expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true');
+      const dialog = await screen.findByRole('dialog', { name: 'Confirm phone screening' });
+      await waitFor(() =>
+        expect(within(dialog).getByRole('button', { name: 'Confirm call' })).toHaveFocus(),
+      );
+      expect(mockApi.requestCandidatePhoneCall).not.toHaveBeenCalled();
+
+      // Escape still hands focus back to the header button that opened it.
+      await user.keyboard('{Escape}');
+      expect(header).toHaveFocus();
+    } finally {
+      focusSpy.mockRestore();
+    }
+  });
+
+  it('keeps "Request re-screen" secondary: the header owns the one filled action', async () => {
+    mockApi.getCandidatePhoneScreenings.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      current_cycle: 1,
+      cycles: [{
+        cycle_number: 1,
+        state: 'completed',
+        state_reason: null,
+        version: 2,
+        no_answer_attempts: 0,
+        no_answer_limit: 3,
+        reconnects_used: 0,
+        provider_failures: 0,
+        next_eligible_at: null,
+        last_attempt_at: null,
+        terminal_at: '2026-08-27T10:00:00Z',
+        created_at: '2026-08-27T09:00:00Z',
+        updated_at: '2026-08-27T10:00:00Z',
+        has_session: true,
+        has_assessment: true,
+        appointment: null,
+      }],
+    });
+    renderDetailPage();
+    const rescreen = await screen.findByRole('button', { name: 'Request re-screen' });
+    const primary = screen.getByRole('button', { name: 'Review screening' });
+    // `bg-info` is the filled primary's paint (Button.tsx `variants.primary`).
+    expect(primary.className.split(/\s+/)).toContain('bg-info');
+    expect(rescreen.className.split(/\s+/)).not.toContain('bg-info');
   });
 
   it('offers no primary at all when there is nothing to review and no call to make', async () => {

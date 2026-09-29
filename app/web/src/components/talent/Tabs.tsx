@@ -124,7 +124,7 @@ export function Tabs({
               onClick={() => setActiveIndex(index)}
               onKeyDown={(event) => onKeyDown(event, index)}
               className={cx(
-                'h-9 shrink-0 rounded-[10px] px-4 text-[13px] font-medium',
+                'h-9 shrink-0 rounded-[10px] px-4 text-label font-medium',
                 'transition-[background-color,color,box-shadow] duration-200 ease-out',
                 'focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--c-bg)]',
                 selected

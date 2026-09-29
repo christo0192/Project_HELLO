@@ -163,6 +163,25 @@ describe('OverviewSection', () => {
     expect(container.querySelector('.uppercase')).toBeNull();
   });
 
+  it('gives the two chart cards in each row one bottom edge', async () => {
+    // `items-start` left each 2×2 row ragged: a short bar list beside a
+    // 200px line chart. The row stretches and each card fills it.
+    renderOverview();
+    await screen.findByText('Session status mix');
+    const rows = [
+      ['Session status mix', 'Session activity'],
+      ['Access entries', 'Quota policy state'],
+    ];
+    for (const [left, right] of rows) {
+      const a = screen.getByRole('region', { name: left });
+      const b = screen.getByRole('region', { name: right });
+      expect(a.parentElement).toBe(b.parentElement);
+      expect(a.parentElement).not.toHaveClass('items-start');
+      expect(a).toHaveClass('h-full');
+      expect(b).toHaveClass('h-full');
+    }
+  });
+
   it('never renders email addresses on the overview surface', async () => {
     renderOverview();
     await screen.findByText('Access entries');

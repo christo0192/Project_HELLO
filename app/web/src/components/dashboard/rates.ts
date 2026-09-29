@@ -52,4 +52,3 @@ export function buildRateSeries(
     }))
     .filter((p): p is { label: string; value: number } => p.value !== null);
 }
-

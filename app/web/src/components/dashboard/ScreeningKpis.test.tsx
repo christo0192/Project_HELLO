@@ -257,7 +257,7 @@ describe('ScreeningKpis', () => {
       funnel({ dialed: 31, connected: 17, answered_ge1: 12 }),
     );
     renderKpis();
-    expect(await cardText('No answers')).toContain('5');  // 17 − 12
+    expect(await cardText('Reached, no answers')).toContain('5');  // 17 − 12
     expect(await cardText('Never reached')).toContain('14');       // 31 − 17
   });
 
@@ -548,7 +548,7 @@ describe('ScreeningKpis', () => {
       funnel({ dialed: 11, connected: 3, answered_ge1: 5 }),
     );
     renderKpis();
-    const card = await cardText('No answers');
+    const card = await cardText('Reached, no answers');
     expect(card).not.toContain('-');
     expect(card).toContain('0');
     expect(card).not.toContain('11');
@@ -774,6 +774,55 @@ describe('ScreeningKpis', () => {
     expect(terms).toEqual(['Candidates', 'Dialled', 'Reached', 'Connect rate']);
     // No card per number any more.
     expect(container.querySelectorAll('[role="group"] .glass')).toHaveLength(0);
+  });
+
+  it('names the call buckets so they cannot be read as their opposites', async () => {
+    // "No answers" sat one letter from the candidate page's call outcome
+    // "No answer" (NOT picked up), and "Answered" reads as "picked up the
+    // phone". Each bucket's context line says what it actually counts.
+    getScreeningFunnel.mockResolvedValue(funnel({ dialed: 31, connected: 17, answered_ge1: 12 }));
+    renderKpis();
+    await cardText('Dialled');
+    const terms = (name: string) =>
+      Array.from(screen.getByRole('group', { name }).querySelectorAll('dt')).map((dt) => dt.textContent);
+    expect(terms('Conversation')).toEqual(['Answered questions', 'Reached, no answers', 'Never reached']);
+    expect(await cardText('Reached, no answers')).toContain('Picked up, gave no usable answer');
+    expect(await cardText('Never reached')).toContain('Dialled, never picked up');
+    // No figure is labelled with the bare call-outcome words.
+    const labels = Array.from(document.querySelectorAll('[role="group"] dt')).map((dt) => dt.textContent);
+    expect(labels).not.toContain('Answered');
+    expect(labels).not.toContain('No answers');
+  });
+
+  it('marks the screening verdict as the bot’s, apart from the team’s decision', async () => {
+    getScreeningFunnel.mockResolvedValue(funnel({ scored: 30, qualified: 11, disqualified: 12 }));
+    renderKpis();
+    await cardText('Dialled');
+    const terms = Array.from(
+      screen.getByRole('group', { name: 'Screening decision' }).querySelectorAll('dt'),
+    ).map((dt) => dt.textContent);
+    expect(terms).toEqual(['Bot qualified', 'Bot disqualified', 'Needs review']);
+    expect(await cardText('Bot qualified')).toContain('11');
+    expect(await cardText('Bot disqualified')).toContain('12');
+  });
+
+  it('says in plain words what "Reached" counts', async () => {
+    getScreeningFunnel.mockResolvedValue(funnel({ dialed: 31, connected: 17 }));
+    renderKpis();
+    const card = await cardText('Reached');
+    expect(card).toContain('Picked up, may be voicemail');
+    expect(card).not.toMatch(/machines can count/i);
+  });
+
+  it('survives a payload with no conversions block', async () => {
+    // The split-deploy window again: `conversions.hr_advance_rate` on an
+    // absent block threw during render and took the whole dashboard down.
+    const legacy = funnel({ dialed: 5, hr_qualified: 2, hr_disqualified: 1 }) as Record<string, unknown>;
+    delete legacy.conversions;
+    getScreeningFunnel.mockResolvedValue(legacy);
+    renderKpis();
+    expect(await cardText('Dialled')).toContain('5');
+    expect(await cardText('Advance rate')).toContain('—');
   });
 
   it('degrades to a retryable error instead of a blank panel', async () => {

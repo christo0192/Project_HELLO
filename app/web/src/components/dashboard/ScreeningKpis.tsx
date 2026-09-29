@@ -40,7 +40,7 @@ import { ErrorPanel, GlassPanel, InlineNotice, SectionHeader, controlClass, cx }
 import { MetricStrip } from '../design/MetricStrip';
 import type { MetricItem } from '../design/MetricStrip';
 import { LineChart } from '../charts';
-import { formatDayTime } from '../charts/dates';
+import { formatDayLabel, formatDayTime } from '../charts/dates';
 import { buildRateSeries, pct, pctLabel } from './rates';
 import { uniqueAgentLabels } from '../../lib/role-label';
 
@@ -261,12 +261,23 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
     [data],
   );
 
+  // Each point keeps the day it was labelled from, so a two-line chart
+  // merges its axis on the date rather than on "3 Sep" (see `unionLabels`).
+  const dayOfLabel = useMemo(
+    () => new Map(seriesRows.map((row) => [formatDayLabel(row.cohort_day), row.cohort_day])),
+    [seriesRows],
+  );
+
   const rateSeries = useCallback(
     (
       num: (row: FunnelDailyRow) => number | undefined,
       den: (row: FunnelDailyRow) => number | undefined,
-    ) => buildRateSeries(seriesRows, num, den),
-    [seriesRows],
+    ) =>
+      buildRateSeries(seriesRows, num, den).map((point) => ({
+        ...point,
+        date: dayOfLabel.get(point.label),
+      })),
+    [seriesRows, dayOfLabel],
   );
 
   const connectSeries = useMemo(
@@ -313,7 +324,9 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
     {
       label: 'Reached',
       value: count(t?.connected),
-      context: 'Machines can count',
+      // `connected` is "a call was answered", and an answering machine
+      // answers too, so this is an upper bound. Say that in the reader's words.
+      context: 'Picked up, may be voicemail',
       loading,
     },
     {
@@ -328,7 +341,9 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
     },
   ];
 
-  const advanceRate = data?.conversions.hr_advance_rate;
+  // `conversions` ABSENT, not null: the same split-deploy window as `t` and
+  // `seriesRows`. A bare `.hr_advance_rate` on undefined throws during render.
+  const advanceRate = data?.conversions?.hr_advance_rate;
 
   return (
     <section className={cx('mt-8', className)} aria-labelledby="screening-kpis-heading">
@@ -345,7 +360,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
               <select
                 value={roleId}
                 onChange={(e) => setRoleId(e.target.value)}
-                className={cx(controlClass, 'control-select h-11 text-[13px]')}
+                className={cx(controlClass, 'control-select h-11 text-label')}
               >
                 <option value="">All agents</option>
                 {roles.map((r) => (
@@ -366,7 +381,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                 className={cx(
                   // 44px on a phone: this panel is glanced at on a phone more
                   // than anything else here. 36px once there is a pointer.
-                  'min-h-11 rounded-[9px] px-3 text-[13px] font-medium transition-[background-color,color,box-shadow] duration-150 ease-out sm:min-h-9',
+                  'min-h-11 rounded-[9px] px-3 text-label font-medium transition-[background-color,color,box-shadow] duration-150 ease-out sm:min-h-9',
                   'focus:outline-none focus-visible:ring-2 focus-visible:ring-info',
                   rangeDays === opt.days
                     ? 'bg-white text-ink shadow-pill'
@@ -401,7 +416,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
           vanished whenever the probe failed, though how far back the roll-up
           reaches has nothing to do with whether we could read when it ran. */}
       {!error && data !== null && (
-        <p className="mt-3 text-[12px] leading-5 text-ink-secondary">
+        <p className="mt-3 text-meta leading-5 text-ink-secondary">
           {!neverComputed && refreshedLabel && (
             <span>
               Figures last recalculated {refreshedLabel}. The last day or two are still filling in.{' '}
@@ -469,15 +484,31 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                     ? 'What happened on the call.'
                     : `What happened, for the ${t.dialed.toLocaleString()} dialled.`
                 }
+                // Three buckets that add up to "Dialled", named on the Reach
+                // row's own word so they read as its split: Reached = answered
+                // questions + reached, no answers. Not "Answered" / "No
+                // answers": the candidate page's call outcomes use "Answered"
+                // for a picked-up call and "No answer" for one that was NOT,
+                // so a bare "No answers" here read as its opposite.
                 items={[
-                  { label: 'Answered', value: count(t?.answered_ge1), context: 'Gave a real answer', loading },
                   {
-                    label: 'No answers',
-                    value: count(derived?.connectedNoAnswer),
-                    context: 'Picked up only',
+                    label: 'Answered questions',
+                    value: count(t?.answered_ge1),
+                    context: 'Gave at least one usable answer',
                     loading,
                   },
-                  { label: 'Never reached', value: count(derived?.neverConnected), context: 'Never picked up', loading },
+                  {
+                    label: 'Reached, no answers',
+                    value: count(derived?.connectedNoAnswer),
+                    context: 'Picked up, gave no usable answer',
+                    loading,
+                  },
+                  {
+                    label: 'Never reached',
+                    value: count(derived?.neverConnected),
+                    context: 'Dialled, never picked up',
+                    loading,
+                  },
                 ]}
                 className={ROW}
               >
@@ -500,9 +531,24 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                     ? 'What the scorecard concluded.'
                     : `Scorecard verdicts, for ${t.scored.toLocaleString()} screened.`
                 }
+                // "Bot": these are the automated verdict, and the team's own
+                // "Advanced" sits in the next row. Unmarked, the two read as
+                // one decision counted twice.
                 items={[
-                  { label: 'Qualified', value: count(t?.qualified), tone: 'success', loading },
-                  { label: 'Disqualified', value: count(t?.disqualified), tone: 'danger', loading },
+                  {
+                    label: 'Bot qualified',
+                    value: count(t?.qualified),
+                    tone: 'success',
+                    context: 'Recommended to advance',
+                    loading,
+                  },
+                  {
+                    label: 'Bot disqualified',
+                    value: count(t?.disqualified),
+                    tone: 'danger',
+                    context: 'Recommended to reject',
+                    loading,
+                  },
                   { label: 'Needs review', value: count(derived?.needsReview), tone: 'warning', context: 'On hold or no verdict', loading },
                 ]}
                 className={ROW}
@@ -514,7 +560,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                   same content-jump the DashboardPage role gate exists to avoid. */}
               {data === null || hrUnavailable ? (
                 <div className={cx(ROW, 'lg:grid lg:grid-cols-[9rem_minmax(0,1fr)] lg:gap-x-5')}>
-                  <h3 className="mb-2 text-[13px] font-semibold leading-5 text-ink lg:mb-0 lg:pt-3">
+                  <h3 className="mb-2 text-label font-semibold leading-5 text-ink lg:mb-0 lg:pt-3">
                     Team decision
                   </h3>
                   <InlineNotice tone="info" className="lg:my-2">
@@ -583,12 +629,12 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
             <h3 id="screening-trends-heading" className="text-[15px] font-semibold tracking-[-0.01em] text-ink">
               By day
             </h3>
-            <p className="mt-0.5 text-[13px] leading-5 text-ink-tertiary">
+            <p className="mt-0.5 text-label text-ink-tertiary">
               By the day each candidate entered.
             </p>
             <div className="mt-4 space-y-5">
               <div>
-                <h4 className="mb-1 text-[13px] font-medium text-ink-secondary">Connect rate</h4>
+                <h4 className="mb-1 text-label font-medium text-ink-secondary">Connect rate</h4>
                 <LineChart
                   title="Daily connect rate"
                   data={connectSeries}
@@ -601,12 +647,12 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                 />
               </div>
               <div className="border-t border-glass-ring pt-4">
-                <h4 className="mb-1 text-[13px] font-medium text-ink-secondary">Screening outcomes</h4>
+                <h4 className="mb-1 text-label font-medium text-ink-secondary">Screening outcomes</h4>
                 <LineChart
                   title="Screening outcomes"
                   series={[
-                    { name: 'Qualified', data: qualifiedSeries, color: QUALIFIED_COLOUR },
-                    { name: 'Disqualified', data: disqualifiedSeries, color: DISQUALIFIED_COLOUR },
+                    { name: 'Bot qualified', data: qualifiedSeries, color: QUALIFIED_COLOUR },
+                    { name: 'Bot disqualified', data: disqualifiedSeries, color: DISQUALIFIED_COLOUR },
                   ]}
                   unit="%"
                   isLoading={loading}
@@ -617,7 +663,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
                 />
               </div>
             </div>
-            <p className="mt-4 text-[12px] leading-4 text-ink-tertiary">
+            <p className="mt-4 text-meta text-ink-tertiary">
               Days with nobody dialled or screened are left out rather than drawn as 0%, so
               neighbouring points are not always neighbouring days.
             </p>
@@ -672,16 +718,16 @@ function MetricNotes({
       'Candidates we reached ÷ candidates we dialled. Shown as “—” when nobody was dialled yet, because a rate with no denominator is unknown rather than zero.',
     ],
     [
-      'Answered',
+      'Answered questions',
       'Reached a person and got at least one usable answer to a screening question.',
     ],
     [
-      'No answers',
+      'Reached, no answers',
       'The call was answered but produced no usable answer to a screening question. This bucket is broader than a bad line: it also holds people who declined consent, opted out, hung up during the intro, and answering machines. Check the call outcomes before concluding it is a telephony problem. It is calculated by subtraction, and is shown as 0 rather than a negative number if the two underlying counts ever disagree.',
     ],
     ['Never reached', 'We dialled and never reached a person across every attempt.'],
-    ['Qualified', 'The automated scorecard recommended advancing this candidate.'],
-    ['Disqualified', 'The automated scorecard recommended rejecting this candidate.'],
+    ['Bot qualified', 'The automated scorecard recommended advancing this candidate.'],
+    ['Bot disqualified', 'The automated scorecard recommended rejecting this candidate.'],
     [
       'Needs review',
       'The scorecard put the candidate on hold, or could not produce a recommendation at all. These need a human: they are neither qualified nor rejected.',
@@ -712,7 +758,7 @@ function MetricNotes({
     <details className="group border-t border-glass-ring">
       <summary
         className={cx(
-          'flex min-h-11 cursor-pointer list-none items-center justify-between gap-3 px-4 text-[13px] font-medium text-ink sm:px-5',
+          'flex min-h-11 cursor-pointer list-none items-center justify-between gap-3 px-4 text-label font-medium text-ink sm:px-5',
           'transition-colors duration-150 ease-out hover:bg-ink/[0.025] focus:outline-none focus-visible:shadow-[inset_0_0_0_2px_var(--info)]',
           '[&::-webkit-details-marker]:hidden',
         )}
@@ -732,7 +778,7 @@ function MetricNotes({
         </svg>
       </summary>
       <div className="disclosure-body px-4 pb-5 sm:px-5">
-        <p className="max-w-prose text-[13px] leading-5 text-ink-secondary">
+        <p className="max-w-prose text-label text-ink-secondary">
           Every figure is a direct count from screening records; nothing is estimated. A candidate
           is counted on the day they entered the pipeline, so moving the date range changes which
           people are included, not how they were measured.
@@ -740,12 +786,12 @@ function MetricNotes({
         <dl className="mt-4 grid grid-cols-1 gap-x-8 gap-y-3 md:grid-cols-2">
           {rows.map(([term, def]) => (
             <div key={term}>
-              <dt className="text-[13px] font-medium text-ink">{term}</dt>
-              <dd className="mt-0.5 text-[13px] leading-5 text-ink-secondary">{def}</dd>
+              <dt className="text-label font-medium text-ink">{term}</dt>
+              <dd className="mt-0.5 text-label text-ink-secondary">{def}</dd>
             </div>
           ))}
         </dl>
-        <p className="mt-4 text-[12px] leading-4 text-ink-secondary">
+        <p className="mt-4 text-meta text-ink-secondary">
           {neverComputed
             ? 'These figures have not been calculated yet: every number above reads zero until the first refresh runs.'
             : 'Figures refresh periodically, so a call from the last few minutes may not be included yet.'}

@@ -64,8 +64,16 @@ export function InlineNotice({ tone = 'info', children, role = 'status', action,
         className,
       )}
     >
-      <span aria-hidden="true" className={cx('h-2 w-2 shrink-0 rounded-full', toneDot[tone])} />
-      <span className="min-w-0 flex-1">{children}</span>
+      {/* The dot belongs to the FIRST LINE, not the paragraph: `items-start`
+          with the dot nudged to that line's centre ((20px line − 8px dot) / 2),
+          the same rule as `MetricStrip`'s toned labels. Centred on the whole
+          block, a four-line notice floated its dot beside the second line.
+          The dot and message are one group so the row can still centre an
+          action against them, and a one-line notice looks exactly as before. */}
+      <span className="flex min-w-0 flex-1 items-start gap-3">
+        <span aria-hidden="true" className={cx('mt-1.5 h-2 w-2 shrink-0 rounded-full', toneDot[tone])} />
+        <span className="min-w-0 flex-1">{children}</span>
+      </span>
       {action}
     </motion.div>
   );

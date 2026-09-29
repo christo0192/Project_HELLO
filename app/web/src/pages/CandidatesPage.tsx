@@ -89,7 +89,7 @@ import { roleAgentName } from "../lib/role-label";
  */
 const FILTER_PILL_CLASS = (selected: boolean) =>
   [
-    "inline-flex min-h-11 items-center gap-1.5 rounded-full px-3 text-[13px] font-medium transition-colors duration-200",
+    "inline-flex min-h-11 items-center gap-1.5 rounded-full px-3 text-label font-medium transition-colors duration-200",
     "focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]",
     selected
       ? "bg-[var(--c-accent)] text-[var(--c-data-label-inside)] shadow-pill"
@@ -146,7 +146,7 @@ const RECOMMENDATION_BAR_TONE: Record<string, PipelineTone> = {
 function AgentCell({ role }: { role: Role | undefined }) {
   const name = role ? roleAgentName(role) : null;
   if (name) {
-    return <span className="text-[13px] text-[var(--c-ink)]">{name}</span>;
+    return <span className="text-label text-[var(--c-ink)]">{name}</span>;
   }
   return <span className="text-[var(--c-ink-secondary)]">—</span>;
 }
@@ -183,7 +183,7 @@ function RoleCell({
   if (title) {
     // No `data-` attribute carrying the raw uuid: it would confirm the id of a
     // role the viewer may have no scope to see.
-    return <span className="text-[13px] text-[var(--c-ink)]">{title}</span>;
+    return <span className="text-label text-[var(--c-ink)]">{title}</span>;
   }
   return (
     <span className="text-[var(--c-ink-secondary)]">{rolesLoaded ? "Unknown role" : "—"}</span>
@@ -206,7 +206,7 @@ function SkillsCell({ skills }: { skills: string[] }) {
   const more = skills.length - shown.length;
   return (
     <span
-      className="flex w-[8.5rem] items-baseline gap-1.5 text-[13px]"
+      className="flex w-[8.5rem] items-baseline gap-1.5 text-label"
       title={skills.join(", ")}
     >
       <span className="min-w-0 truncate text-[var(--c-ink)]">{shown.join(", ")}</span>
@@ -651,7 +651,7 @@ export function CandidatesPage() {
           role="group"
           aria-label="Filter by resume review"
         >
-          <span className="text-[13px] font-medium text-[var(--c-ink-secondary)]">
+          <span className="text-label font-medium text-[var(--c-ink-secondary)]">
             Resume:
           </span>
           {RESUME_REVIEW_ORDER.map((value) => {
@@ -677,7 +677,7 @@ export function CandidatesPage() {
 
         {/* Active-filter summary */}
         {active && (
-          <div className="mt-3 flex flex-wrap items-center gap-2 text-[13px] text-[var(--c-ink-secondary)]">
+          <div className="mt-3 flex flex-wrap items-center gap-2 text-label text-[var(--c-ink-secondary)]">
             <span className="font-medium">Active filters:</span>
             {roleTitle && (
               <FilterChip
@@ -820,7 +820,7 @@ export function CandidatesPage() {
                         </Link>
                         {c.email && (
                           <p
-                            className="w-[10rem] truncate text-[13px] text-[var(--c-ink-secondary)]"
+                            className="w-[10rem] truncate text-label text-[var(--c-ink-secondary)]"
                             title={c.email}
                           >
                             {c.email}
@@ -1001,7 +1001,7 @@ function UploadPanel({
       >
         Upload a resume
       </h2>
-      <p className="mt-0.5 text-[13px] leading-5 text-[var(--c-ink-secondary)]">
+      <p className="mt-0.5 text-label text-[var(--c-ink-secondary)]">
         PDF or DOCX. Parsing runs an LLM and can take 10–20 seconds.
       </p>
 

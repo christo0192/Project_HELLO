@@ -114,29 +114,42 @@ export function CandidateDetailPage() {
     [setSearchParams],
   );
 
-  // The header's "Review screening" selects the tab AND moves focus onto it,
-  // so a keyboard user is where the content changed rather than stranded on
-  // a button that just vanished (it is hidden while Review is open).
-  //
-  // Keyed on the TAB, not on the click: the router applies a search-param
-  // change in its own (transition) render, so focusing on the click's render
-  // would land on the tab that was still selected.
-  const tabsRef = useRef<HTMLDivElement | null>(null);
-  const [pendingTabFocus, setPendingTabFocus] = useState<CandidateTab | null>(null);
-  useEffect(() => {
-    if (pendingTabFocus === null || pendingTabFocus !== tab) return;
-    tabsRef.current
-      ?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
-      ?.focus();
-    setPendingTabFocus(null);
-  }, [pendingTabFocus, tab]);
-
   // "Call candidate" in the header drives the phone card's confirmation. The
   // card knows whether a first call can be requested (phone enabled, no cycle
   // yet); it reports that up so the header never offers a call it cannot make.
   const [callAvailable, setCallAvailable] = useState(false);
   const [callRequest, setCallRequest] = useState(0);
   const headerCallRef = useRef<HTMLButtonElement | null>(null);
+
+  // A header action that changes tab, and then has to put focus somewhere IN
+  // the tab it opened:
+  //   - "Review screening" focuses the Review tab itself, so a keyboard user
+  //     is where the content changed rather than stranded on a button that
+  //     just vanished (it is hidden while Review is open);
+  //   - "Call candidate" opens the phone card's confirmation on the Overview,
+  //     which moves focus into the confirmation.
+  //
+  // Both are keyed on the TAB BEING SHOWN, not on the click: the router
+  // applies a search-param change in its own (transition) render, after the
+  // click's render has committed. Acting in the click's render would focus
+  // the tab that was still selected, or, from `?tab=review`, focus a button
+  // inside the Overview panel while that panel is still `hidden`, where a
+  // browser refuses focus and leaves it on the header button.
+  const tabsRef = useRef<HTMLDivElement | null>(null);
+  const [pendingTabAction, setPendingTabAction] = useState<
+    { tab: CandidateTab; then: "focus-tab" | "open-call" } | null
+  >(null);
+  useEffect(() => {
+    if (pendingTabAction === null || pendingTabAction.tab !== tab) return;
+    if (pendingTabAction.then === "focus-tab") {
+      tabsRef.current
+        ?.querySelector<HTMLElement>('[role="tab"][aria-selected="true"]')
+        ?.focus();
+    } else {
+      setCallRequest((n) => n + 1);
+    }
+    setPendingTabAction(null);
+  }, [pendingTabAction, tab]);
 
   const load = useCallback(() => {
     if (!id) return;
@@ -273,7 +286,7 @@ export function CandidateDetailPage() {
           variant="primary"
           onClick={() => {
             selectTab("review");
-            setPendingTabFocus("review");
+            setPendingTabAction({ tab: "review", then: "focus-tab" });
           }}
         >
           Review screening
@@ -286,9 +299,10 @@ export function CandidateDetailPage() {
         ref={headerCallRef}
         variant="primary"
         onClick={() => {
-          // The confirmation lives in the phone card on the Overview.
+          // The confirmation lives in the phone card on the Overview, and is
+          // opened once that tab is actually showing (see pendingTabAction).
           selectTab("overview");
-          setCallRequest((n) => n + 1);
+          setPendingTabAction({ tab: "overview", then: "open-call" });
         }}
       >
         Call candidate
@@ -404,7 +418,18 @@ const LIVE_SESSION_STATUSES: ReadonlySet<string> = new Set(["created", "waiting"
  * other's subscription). Once mounted it STAYS mounted for this page view:
  * the "Call ended / Scoring the conversation" state after a call, and the
  * refresh it triggers, are the panel's behaviour when a call exists.
+ *
+ * EVERY SUBSCRIPTION GETS ITS OWN TOPIC. realtime-js `channel(topic)` hands
+ * back the EXISTING channel when one with that topic is still registered, and
+ * `removeChannel` only unregisters it once the leave round-trip finishes. So
+ * on a fast remount (StrictMode's mount, unmount, mount in development, or
+ * leaving and re-entering the page) the second effect got the first effect's
+ * channel while it was still leaving, subscribed to a dying channel, and the
+ * watch never fired. A per-subscription sequence number makes each topic
+ * new. The table, schema and filter are unchanged; the watch stays read-only.
  */
+let liveWatchSeq = 0;
+
 function useLiveCallRelevant(
   candidateId: string,
   sessions: CandidateDetail["sessions"],
@@ -417,8 +442,9 @@ function useLiveCallRelevant(
   }, [payloadLive]);
 
   useEffect(() => {
+    liveWatchSeq += 1;
     const channel = supabase
-      .channel(`candidate-live-watch:${candidateId}`)
+      .channel(`candidate-live-watch:${candidateId}:${liveWatchSeq}`)
       .on(
         "postgres_changes",
         {
@@ -798,7 +824,7 @@ function PhoneCycleCard({
       <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
         Phone screening cycles
       </h2>
-      <p className="mt-0.5 text-[13px] text-ink-tertiary">
+      <p className="mt-0.5 text-label text-ink-tertiary">
         A request never dials on its own. Every call still passes the admission gates.
       </p>
       {error ? (
@@ -852,7 +878,7 @@ function PhoneCycleCard({
               // the well itself.
               className="glass-sunken mt-4 p-4"
             >
-              <h3 id={`${headingId}-confirm`} className="text-[13px] font-medium text-ink">Confirm phone screening</h3>
+              <h3 id={`${headingId}-confirm`} className="text-label font-medium text-ink">Confirm phone screening</h3>
               <p className="mt-1 text-sm text-ink-secondary">
                 Request one phone screening for this candidate? The system will call only if every safety gate passes.
               </p>
@@ -906,7 +932,7 @@ function PhoneCycleCard({
             <SurfaceCard level="sunken" className="mt-4 p-3">
               <div className="grid gap-x-3 gap-y-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
                 <div className="min-w-0">
-                  <label htmlFor={`${headingId}-phone`} className="block text-[13px] font-medium text-ink-secondary">
+                  <label htmlFor={`${headingId}-phone`} className="block text-label font-medium text-ink-secondary">
                     Verify replacement Indian mobile
                   </label>
                   <CandidateInput
@@ -928,7 +954,7 @@ function PhoneCycleCard({
             <SurfaceCard level="sunken" className="mt-4 p-3">
               <div className="grid gap-x-3 gap-y-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
                 <div className="min-w-0">
-                  <label htmlFor={`${headingId}-reason`} className="block text-[13px] font-medium text-ink-secondary">
+                  <label htmlFor={`${headingId}-reason`} className="block text-label font-medium text-ink-secondary">
                     Reason for new cycle
                   </label>
                   <CandidateSelect
@@ -940,7 +966,10 @@ function PhoneCycleCard({
                     {RESCREEN_REASONS.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
                   </CandidateSelect>
                 </div>
-                <CandidateButton variant="primary" onClick={() => void requestRescreen()} loading={requesting}>
+                {/* Secondary: the page header owns the one filled action
+                    (after a completed cycle that is "Review screening"), so a
+                    second filled button here would compete with it. */}
+                <CandidateButton variant="secondary" onClick={() => void requestRescreen()} loading={requesting}>
                   Request re-screen
                 </CandidateButton>
               </div>
@@ -952,11 +981,11 @@ function PhoneCycleCard({
           {(!current || current.terminal_at === null) && (
             <SurfaceCard level="sunken" className="mt-4 p-3">
               <div className="flex flex-wrap items-baseline justify-between gap-x-4 gap-y-1">
-                <h3 className="text-[13px] font-medium text-ink-secondary">
+                <h3 className="text-label font-medium text-ink-secondary">
                   {current?.appointment ? "Move appointment" : "Schedule a slot"}
                 </h3>
                 {current?.appointment && (
-                  <p className="text-[13px] text-ink-secondary">
+                  <p className="text-label text-ink-secondary">
                     Current slot: {current.appointment.starts_at ? formatDateTime(current.appointment.starts_at) : "time unavailable"}
                   </p>
                 )}
@@ -964,7 +993,8 @@ function PhoneCycleCard({
               <div className="mt-3 flex flex-wrap gap-2">
                 <CandidateButton
                   ref={slotTriggerRef}
-                  variant="primary"
+                  // Secondary: the header owns the page's one primary action.
+                  variant="secondary"
                   onClick={() => setSlotDialogOpen(true)}
                   // Without this, clicking "Cancel appointment" and then this
                   // opens the dialog with `saving` already true — and every
@@ -1059,7 +1089,7 @@ function NotesSection({ candidateId }: { candidateId: string }) {
       <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
         Notes
       </h2>
-      <p className="mb-3 mt-0.5 text-[13px] text-ink-tertiary">
+      <p className="mb-3 mt-0.5 text-label text-ink-tertiary">
         Recruiter notes, appended in order.
       </p>
       <SurfaceCard level="sunken" className="p-3">
@@ -1144,7 +1174,7 @@ function AppealsSection({
       <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
         Appeals
       </h2>
-      <p className="mb-3 mt-0.5 text-[13px] text-ink-tertiary">
+      <p className="mb-3 mt-0.5 text-label text-ink-tertiary">
         Open and resolved appeals for this candidate.
       </p>
       {err ? (
@@ -1190,7 +1220,7 @@ function AppealsSection({
       )}
 
       <SurfaceCard level="sunken" className="mt-4 p-3">
-        <h3 className="text-[13px] font-medium text-ink">Issue appeal grant</h3>
+        <h3 className="text-label font-medium text-ink">Issue appeal grant</h3>
         <p className="mt-0.5 text-xs leading-snug text-ink-tertiary">
           Creates a one-time link the candidate opens to file an appeal. The
           link is shown once and expires after the hours you set.
@@ -1199,7 +1229,7 @@ function AppealsSection({
             same labels, same call. */}
         <div className="mt-3 grid gap-x-3 gap-y-2 sm:grid-cols-[minmax(0,1fr)_8rem_auto] sm:items-end">
           <div className="min-w-0">
-            <label htmlFor="appeal-session" className="block text-[13px] font-medium text-ink-secondary">
+            <label htmlFor="appeal-session" className="block text-label font-medium text-ink-secondary">
               Session
             </label>
             <CandidateSelect
@@ -1222,7 +1252,7 @@ function AppealsSection({
             </CandidateSelect>
           </div>
           <div className="min-w-0">
-            <label htmlFor="appeal-expiry" className="block text-[13px] font-medium text-ink-secondary">
+            <label htmlFor="appeal-expiry" className="block text-label font-medium text-ink-secondary">
               Hours valid (1–72)
             </label>
             <CandidateInput

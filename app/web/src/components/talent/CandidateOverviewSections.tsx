@@ -121,7 +121,7 @@ export function PhoneAttemptHistory({
       <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
         Call attempts
       </h2>
-      <p className="mb-3 mt-0.5 text-[13px] text-ink-tertiary">
+      <p className="mb-3 mt-0.5 text-label text-ink-tertiary">
         Every phone leg, including calls that ended before screening began.
       </p>
       {error ? (
@@ -153,7 +153,7 @@ export function PhoneAttemptHistory({
                       {attemptOutcomeLabel(attempt.outcome_class, attempt.state)}
                     </span>
                   </p>
-                  <p className="text-[12px] tabular-nums text-ink-tertiary">
+                  <p className="text-meta tabular-nums text-ink-tertiary">
                     {formatDateTime(attempt.admitted_at)}
                     {attempt.duration_sec != null && attempt.duration_sec > 0
                       ? ` · ${formatDurationSec(attempt.duration_sec)}`
@@ -192,17 +192,17 @@ export function PhoneAttemptHistory({
                 </div>
               </div>
               {attempt.transcript?.kind === 'gate_only' && (
-                <p className="mt-1 text-[12px] text-ink-secondary">
+                <p className="mt-1 text-meta text-ink-secondary">
                   Gate-only evidence: identity and recording-consent exchange before the interview.
                 </p>
               )}
               {attempt.transcript?.shared_session && (
-                <p className="mt-1 text-[12px] text-ink-tertiary">
+                <p className="mt-1 text-meta text-ink-tertiary">
                   This session transcript may include multiple call legs; it is not an attempt-only transcript.
                 </p>
               )}
               {role === 'interviewer' && attempt.recording.reason === 'access_unavailable' && (
-                <p className="mt-1 text-[12px] text-ink-tertiary">
+                <p className="mt-1 text-meta text-ink-tertiary">
                   Audio access is available only when the associated session has an owner you own.
                 </p>
               )}
@@ -251,7 +251,7 @@ export function CandidateProfileCard({
       <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
         Profile
       </h2>
-      <p className="mb-4 mt-0.5 text-[13px] text-ink-tertiary">
+      <p className="mb-4 mt-0.5 text-label text-ink-tertiary">
         Identity and skills as parsed from the resume.
       </p>
       {/* SUMMARY FIRST, ABOVE THE NUMBERS. The ask was to put it "above the
@@ -314,7 +314,7 @@ export function CandidateProfileCard({
       </dl>
       <ResumeEvidence facts={candidate.parsed} />
       {footnote && (
-        <p className="mt-4 text-[13px] leading-snug text-ink-tertiary">{footnote}</p>
+        <p className="mt-4 text-label leading-snug text-ink-tertiary">{footnote}</p>
       )}
     </SurfaceCard>
   );
@@ -344,7 +344,7 @@ function ResumeEvidence({ facts }: { facts?: CandidateResumeFacts | null }) {
   if (!hasEvidence) return null;
   return (
     <div className="mt-5 border-t border-line pt-4">
-      <h3 className="mb-3 text-[13px] font-medium text-ink-secondary">Resume evidence</h3>
+      <h3 className="mb-3 text-label font-medium text-ink-secondary">Resume evidence</h3>
       <dl className="space-y-3 text-sm">
         {/* Summary is NOT repeated here — it renders above the field list at
             the top of this card, which is what "above the numbers and
@@ -403,12 +403,12 @@ export function SessionsSummary({
                   <p className="truncate font-medium text-ink" title={`Session id ${s.id}`}>
                     Session {sessions.length - index}
                     {s.mode && (
-                      <span className="ml-2 text-[12px] font-normal text-ink-tertiary">
+                      <span className="ml-2 text-meta font-normal text-ink-tertiary">
                         {sessionModeLabel(s.mode).toLowerCase()}
                       </span>
                     )}
                   </p>
-                  <p className="text-[12px] text-ink-tertiary">
+                  <p className="text-meta text-ink-tertiary">
                     {formatDateTime(s.created_at)}
                     {s.duration_sec ? ` · ${formatDurationSec(s.duration_sec)}` : ''}
                   </p>
@@ -452,7 +452,7 @@ export function NotesList({ notes, error = null }: NotesListProps) {
       {notes.map((n) => (
         <li key={n.id} className="py-2 text-sm">
           <p className="whitespace-pre-wrap text-ink">{n.note}</p>
-          <p className="mt-0.5 text-[12px] text-ink-tertiary">{formatDateTime(n.created_at)}</p>
+          <p className="mt-0.5 text-meta text-ink-tertiary">{formatDateTime(n.created_at)}</p>
         </li>
       ))}
     </ul>,

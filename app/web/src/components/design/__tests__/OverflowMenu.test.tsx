@@ -346,6 +346,42 @@ describe('OverflowMenu — where it renders', () => {
     expect(menu.style.top).toBe(`${top - 6 - 200}px`);
   });
 
+  it("measures its containing block without its own entrance animation, so it opens where it stays", async () => {
+    // The browser, faked: a containing block at (20, 50) — a dialog mid-
+    // transform — and the `combobox-panel` entrance holding the menu at
+    // translateY(-4px). `getBoundingClientRect` includes that transform, so a
+    // menu measured off ITSELF opened 4px low and jumped on the first scroll.
+    const block = { top: 50, left: 20 };
+    vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+      const el = this as HTMLElement;
+      if (el.getAttribute('role') === 'menu') {
+        return rect({
+          top: block.top + (parseFloat(el.style.top) || 0) - 4,
+          left: block.left + (parseFloat(el.style.left) || 0),
+          width: 0,
+          height: 0,
+        });
+      }
+      if (el.hasAttribute('data-overflow-origin')) return rect({ ...block, width: 0, height: 0 });
+      // One spy for every element (a second `spyOn` on the trigger would
+      // return this same mock and overwrite it), so the trigger is here too.
+      if (el.getAttribute('aria-haspopup') === 'menu') return rect({ top: 100, left: 900, width: 80, height: 36 });
+      return rect({ top: 0, left: 0, width: 0, height: 0 });
+    });
+    render(<Harness />);
+    await userEvent.click(trigger());
+    const menu = screen.getByRole('menu');
+    // Viewport target (100 + 36 + 6, 980) less the containing block, and
+    // nothing for the animation.
+    expect(menu.style.top).toBe(`${142 - block.top}px`);
+    expect(menu.style.left).toBe(`${980 - block.left}px`);
+
+    // The first scroll re-places it on the same spot: no jump.
+    fireEvent.scroll(window);
+    expect(menu.style.top).toBe(`${142 - block.top}px`);
+    expect(menu.style.left).toBe(`${980 - block.left}px`);
+  });
+
   it('has no axe violations while open', async () => {
     render(
       <main>

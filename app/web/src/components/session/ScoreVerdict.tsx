@@ -60,13 +60,13 @@ export function ScoreVerdict({ overall, recommendation, summary, detail, childre
             <p className="text-[15px] font-semibold leading-8 text-ink">Not scored</p>
           ) : (
             <p className="flex items-baseline gap-1.5">
-              <span className="text-[32px] font-semibold leading-none tracking-[-0.02em] tabular-nums text-ink">
+              <span className="text-stat leading-none tabular-nums text-ink">
                 {score}
               </span>
               <span className="text-sm tabular-nums text-ink-tertiary">/ 100</span>
             </p>
           )}
-          <p className="mt-2 text-[13px] font-medium leading-5 text-ink-secondary">
+          <p className="mt-2 text-label font-medium leading-5 text-ink-secondary">
             Overall score
             {detail}
           </p>
@@ -75,7 +75,7 @@ export function ScoreVerdict({ overall, recommendation, summary, detail, childre
           <span
             data-recommendation={reco.tone}
             className={cx(
-              'inline-flex items-center gap-2 whitespace-nowrap rounded-full px-3 py-1 text-[13px] font-semibold',
+              'inline-flex items-center gap-2 whitespace-nowrap rounded-full px-3 py-1 text-label font-semibold',
               PILL_TONE[reco.tone],
             )}
           >

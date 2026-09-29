@@ -162,7 +162,7 @@ function Group({
         <Heading
           level={headingLevel}
           id={headingId}
-          className="text-[13px] font-medium text-[var(--c-ink)]"
+          className="text-label font-medium text-[var(--c-ink)]"
         >
           {title}
         </Heading>

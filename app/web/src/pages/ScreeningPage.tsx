@@ -193,7 +193,7 @@ function Bubble({ speaker, text }: TranscriptLine) {
   return (
     <div className={`flex ${isBot ? "justify-start" : "justify-end"}`}>
       <div className={`max-w-[70%] ${isBot ? "" : "text-right"}`}>
-        <p className="mb-1 px-1 text-[11px] font-medium text-ink-tertiary">
+        <p className="mb-1 px-1 text-meta font-medium text-ink-tertiary">
           {isBot ? "Gopu" : "Candidate"}
         </p>
         <div
@@ -214,7 +214,7 @@ function TypingIndicator() {
   return (
     <div className="flex justify-start">
       <div className="max-w-[70%]">
-        <p className="mb-1 px-1 text-[11px] font-medium text-ink-tertiary">
+        <p className="mb-1 px-1 text-meta font-medium text-ink-tertiary">
           Gopu
         </p>
         {/* A soft opacity wave across the three dots (opacity only, eased

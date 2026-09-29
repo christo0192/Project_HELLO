@@ -70,7 +70,7 @@ export interface TextFieldProps extends Omit<InputHTMLAttributes<HTMLInputElemen
 export function TextField({ className, size = 'md', ...rest }: TextFieldProps) {
   return (
     <input
-      className={cx(controlClass, size === 'sm' ? 'h-8 text-[13px]' : 'h-9', className)}
+      className={cx(controlClass, size === 'sm' ? 'h-8 text-label' : 'h-9', className)}
       {...rest}
     />
   );
@@ -94,7 +94,7 @@ export interface SelectFieldProps extends Omit<SelectHTMLAttributes<HTMLSelectEl
 export function SelectField({ className, size = 'md', children, ...rest }: SelectFieldProps) {
   return (
     <select
-      className={cx(controlClass, 'control-select', size === 'sm' ? 'h-8 text-[13px]' : 'h-9', className)}
+      className={cx(controlClass, 'control-select', size === 'sm' ? 'h-8 text-label' : 'h-9', className)}
       {...rest}
     >
       {children}

@@ -1121,7 +1121,7 @@ export function AshbyMissionControlPage() {
                     else workflowAnchors.current.delete(w.applicationLinkId);
                   }}
                   tabIndex={-1}
-                  className="rounded-sm font-mono text-[13px] font-medium text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
+                  className="rounded-sm font-mono text-label font-medium text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
                 >
                   {w.externalApplicationId}
                 </span>
@@ -1147,7 +1147,7 @@ export function AshbyMissionControlPage() {
                 )}
               </div>
               {(w.ingestionState || w.operations.length > 0) && (
-                <ul className="mt-1.5 flex flex-wrap items-center gap-x-5 gap-y-1.5 text-[13px] leading-5 text-ink-secondary">
+                <ul className="mt-1.5 flex flex-wrap items-center gap-x-5 gap-y-1.5 text-label text-ink-secondary">
                   {w.ingestionState && (
                     <li
                       title={w.ingestionState}
@@ -1229,7 +1229,7 @@ export function AshbyMissionControlPage() {
                 */}
                 <label
                   htmlFor={`invite-${w.applicationLinkId}`}
-                  className="block text-[13px] font-medium text-ink-secondary"
+                  className="block text-label font-medium text-ink-secondary"
                 >
                   Candidate link, shown once. Expires {formatWhen(invite.expiresAt)}
                 </label>
@@ -1245,7 +1245,7 @@ export function AshbyMissionControlPage() {
                     {copied ? 'Copied' : 'Copy'}
                   </Button>
                 </div>
-                <p className="mt-2 text-[13px] leading-5 text-ink-tertiary">
+                <p className="mt-2 text-label text-ink-tertiary">
                   Send it to the candidate yourself. It isn&apos;t stored and can&apos;t be shown
                   again; reissuing revokes it and makes a new one.
                 </p>
@@ -1294,7 +1294,7 @@ export function AshbyMissionControlPage() {
               title="Job mappings"
               meta={
                 loaded ? (
-                  <span className="text-[13px] tabular-nums text-ink-tertiary">{mappings.length}</span>
+                  <span className="text-label tabular-nums text-ink-tertiary">{mappings.length}</span>
                 ) : undefined
               }
               description={mappingSummary ?? undefined}
@@ -1461,14 +1461,14 @@ export function AshbyMissionControlPage() {
                             const atCap = p.expectedCount >= p.cap;
                             return (
                               <div className="glass-sunken p-4" role="region" aria-label="Backlog import preview">
-                                <p className="text-[13px] font-medium text-ink">
+                                <p className="text-label font-medium text-ink">
                                   {expired ? 'This preview has expired.' : `This snapshot contains ${p.expectedCount} existing application${p.expectedCount === 1 ? '' : 's'} from this job and stage.`}
                                 </p>
-                                <p className="mt-1 text-[13px] leading-5 text-ink-secondary">
+                                <p className="mt-1 text-label text-ink-secondary">
                                   Default behavior is future stage entries only. Confirmation schedules only this exact snapshot; completed or already-deduplicated applications may be no-ops, and existing phone engagements are not cancelled by this policy. The snapshot expires {formatWhen(p.expiresAt)} and is capped at {p.cap} applications.
                                 </p>
-                                {atCap && !expired && <p className="mt-2 text-[13px] text-warning-text">This preview is at the safety cap; narrow the mapping or ask an operator to review before importing.</p>}
-                                <label className="mt-3 flex items-start gap-2 text-[13px] text-ink-secondary">
+                                {atCap && !expired && <p className="mt-2 text-label text-warning-text">This preview is at the safety cap; narrow the mapping or ask an operator to review before importing.</p>}
+                                <label className="mt-3 flex items-start gap-2 text-label text-ink-secondary">
                                   <input type="checkbox" checked={backlogConfirmArmed} disabled={busy || expired} onChange={(e) => setBacklogConfirmArmed(e.target.checked)} />
                                   <span>I understand this is an explicit provider-backed import and may create screening work.</span>
                                 </label>
@@ -1500,7 +1500,7 @@ export function AshbyMissionControlPage() {
               title="Application workflows"
               meta={
                 loaded ? (
-                  <span className="text-[13px] tabular-nums text-ink-tertiary">{workflows.length}</span>
+                  <span className="text-label tabular-nums text-ink-tertiary">{workflows.length}</span>
                 ) : undefined
               }
               description={workflowSummary ?? undefined}
@@ -1563,7 +1563,7 @@ export function AshbyMissionControlPage() {
             <label
               id="ashby-mapping-job-label"
               htmlFor="ashby-mapping-job"
-              className="text-[13px] font-medium text-ink"
+              className="text-label font-medium text-ink"
             >
               Ashby job
             </label>
@@ -1624,7 +1624,7 @@ export function AshbyMissionControlPage() {
               {jobsHidden && (
                 // The same reason as the cut above: an admin looking for a
                 // confidential job must not conclude Ashby has none.
-                <p className="text-[13px] text-ink-tertiary">{CONFIDENTIAL_WITHHELD}</p>
+                <p className="text-label text-ink-tertiary">{CONFIDENTIAL_WITHHELD}</p>
               )}
             </div>
           </div>
@@ -1633,7 +1633,7 @@ export function AshbyMissionControlPage() {
             <label
               id="ashby-mapping-role-label"
               htmlFor="ashby-mapping-role"
-              className="text-[13px] font-medium text-ink"
+              className="text-label font-medium text-ink"
             >
               Role
             </label>
@@ -1695,7 +1695,7 @@ export function AshbyMissionControlPage() {
             // and the message rendered as ordinary body ink — it read as
             // help text rather than a failure. `Field` already uses this
             // token for exactly this.
-            <p role="alert" className="text-[13px] text-error-text">
+            <p role="alert" className="text-label text-error-text">
               {createError}
             </p>
           )}
@@ -1736,7 +1736,7 @@ export function AshbyMissionControlPage() {
           <p className="text-sm leading-6 text-ink-secondary">{DELETE_CONSEQUENCES}</p>
 
           {deleteError && (
-            <p role="alert" className="text-[13px] text-error-text">
+            <p role="alert" className="text-label text-error-text">
               {deleteError.message}
             </p>
           )}
@@ -1775,7 +1775,7 @@ export function AshbyMissionControlPage() {
           <p className="text-sm leading-6 text-ink-secondary">{CANCEL_CONSEQUENCES}</p>
 
           {cancelError && (
-            <p role="alert" className="text-[13px] text-error-text">
+            <p role="alert" className="text-label text-error-text">
               {cancelError.message}
             </p>
           )}
@@ -1824,7 +1824,7 @@ function FeedbackFormSchema({ forms, truncated }: { forms: AshbyFeedbackForm[]; 
         </InlineNotice>
       )}
       {forms.length === 0 ? (
-        <p className="mt-3 text-[13px] text-ink-secondary">
+        <p className="mt-3 text-label text-ink-secondary">
           No feedback form is named in this job&apos;s interview plan.
         </p>
       ) : (
@@ -1835,35 +1835,35 @@ function FeedbackFormSchema({ forms, truncated }: { forms: AshbyFeedbackForm[]; 
               className="border-t border-glass-ring pt-3 first:border-0 first:pt-0 [&+li]:mt-3"
             >
               <p className="text-sm font-medium text-ink">{f.title ?? 'Untitled form'}</p>
-              <p className="font-mono text-[13px] text-ink-secondary">form id: {f.formDefinitionId}</p>
+              <p className="font-mono text-label text-ink-secondary">form id: {f.formDefinitionId}</p>
               {(f.stageTitle || f.stageId) && (
-                <p className="text-[13px] text-ink-tertiary">
+                <p className="text-label text-ink-tertiary">
                   stage: {f.stageTitle ?? 'untitled'}
                   {f.stageId ? ` (${f.stageId})` : ''}
                 </p>
               )}
               {(f.interviewTitle || f.interviewId) && (
-                <p className="text-[13px] text-ink-tertiary">
+                <p className="text-label text-ink-tertiary">
                   interview: {f.interviewTitle ?? 'untitled'}
                   {f.interviewId ? ` (${f.interviewId})` : ''}
                 </p>
               )}
               {!f.schemaAvailable ? (
-                <p className="mt-2 text-[13px] leading-5 text-warning-text">
+                <p className="mt-2 text-label text-warning-text">
                   Field-level schema is not available from the interview plan for this form — only
                   its id could be read. This is not a claim that the form has no fields.
                 </p>
               ) : (
                 <>
-                  <p className="mt-2 text-[13px] text-ink-tertiary">{f.fieldCount} field(s)</p>
+                  <p className="mt-2 text-label text-ink-tertiary">{f.fieldCount} field(s)</p>
                   {f.sections.map((sec, si) => (
                     <div key={sec.id ?? `section-${si}`} className="mt-2">
-                      <p className="text-[13px] font-medium text-ink-secondary">
+                      <p className="text-label font-medium text-ink-secondary">
                         {sec.title ?? 'Untitled section'}
                       </p>
                       <ul className="mt-1 space-y-1">
                         {sec.fields.map((field) => (
-                          <li key={field.id} className="text-[13px] leading-5 text-ink-secondary">
+                          <li key={field.id} className="text-label text-ink-secondary">
                             <span className="font-mono">{field.id}</span>
                             {' — '}
                             {field.title ?? 'untitled'}
@@ -1976,7 +1976,7 @@ function jobsErrorCopy(err: unknown): { message: string; retryable: boolean } {
 function MappingPreview({ jobName, roleName }: { jobName: string | null; roleName: string | null }) {
   if (!jobName || !roleName) return null;
   return (
-    <p className="rounded-[12px] bg-ink/[0.035] px-3.5 py-2.5 text-[13px] leading-5 text-ink-secondary">
+    <p className="rounded-[12px] bg-ink/[0.035] px-3.5 py-2.5 text-label text-ink-secondary">
       Applicants for <span className="font-medium text-ink">{jobName}</span> will be screened with
       the <span className="font-medium text-ink">{roleName}</span> role&apos;s questions and
       scorecard.
@@ -2172,7 +2172,7 @@ function MappingSummary({
   return (
     <div className="col-start-1 row-start-1 flex min-w-0 flex-col gap-0.5">
       <span className="min-w-0 break-words text-sm font-medium leading-5 text-ink">{name}</span>
-      <div className="flex min-w-0 flex-col text-[13px] leading-5 sm:flex-row sm:flex-wrap sm:items-baseline sm:gap-x-2">
+      <div className="flex min-w-0 flex-col text-label sm:flex-row sm:flex-wrap sm:items-baseline sm:gap-x-2">
         <p className="min-w-0 break-words text-ink-secondary">{roleLine(mapping, rolesById, rolesPending)}</p>
         {reason && (
           <>
@@ -2191,7 +2191,7 @@ function MappingSummary({
           </>
         )}
       </div>
-      {showLabel && <p className="min-w-0 break-words text-[13px] leading-5 text-ink-tertiary">{label}</p>}
+      {showLabel && <p className="min-w-0 break-words text-label text-ink-tertiary">{label}</p>}
     </div>
   );
 }
@@ -2360,7 +2360,7 @@ function ScorecardBindingPreviewPanel({
         title="Scorecard binding preview — read-only"
         description="What a v2 scorecard write would bind on the verified form, by metric name. Nothing is written or bound by viewing this."
       />
-      <p className="mt-2 text-[13px] text-ink-secondary">
+      <p className="mt-2 text-label text-ink-secondary">
         {preview.formTitle ?? 'Untitled form'}{' '}
         <span className="font-mono text-ink-tertiary">form id: {preview.formDefinitionId}</span>
       </p>
@@ -2406,10 +2406,10 @@ function ScorecardBindingPreviewPanel({
         </p>
       )}
 
-      <p className="mt-3 text-[13px] font-medium text-ink-secondary">Fixed fields (verified binding)</p>
+      <p className="mt-3 text-label font-medium text-ink-secondary">Fixed fields (verified binding)</p>
       <ul className="mt-1 space-y-1">
         {preview.fixedFields.map((f) => (
-          <li key={f.name} className="text-[13px] leading-5 text-ink-secondary">
+          <li key={f.name} className="text-label text-ink-secondary">
             {FIXED_FIELD_LABEL[f.name]}
             {' — '}
             <span className="font-mono">[{f.path}]</span>
@@ -2433,13 +2433,13 @@ function ScorecardBindingPreviewPanel({
 
       {scoringPath === 'v2_autobind' && (
         <>
-          <p className="mt-3 text-[13px] font-medium text-ink-secondary">Metrics (bound by name)</p>
+          <p className="mt-3 text-label font-medium text-ink-secondary">Metrics (bound by name)</p>
           {preview.metrics.length === 0 ? (
-            <p className="mt-1 text-[13px] text-ink-tertiary">The active scorecard has no metrics.</p>
+            <p className="mt-1 text-label text-ink-tertiary">The active scorecard has no metrics.</p>
           ) : (
             <ul className="mt-1 space-y-1">
               {preview.metrics.map((m) => (
-                <li key={m.key} className="text-[13px] leading-5 text-ink-secondary">
+                <li key={m.key} className="text-label text-ink-secondary">
                   <span className="text-ink">{m.name}</span>
                   {m.status === 'bound' ? (
                     <>
@@ -2459,7 +2459,7 @@ function ScorecardBindingPreviewPanel({
       )}
 
       {preview.unusedScoreFields.length > 0 && (
-        <p className="mt-3 text-[13px] text-ink-tertiary">
+        <p className="mt-3 text-label text-ink-tertiary">
           Score fields no metric claims (left empty on the card):{' '}
           {preview.unusedScoreFields.map((u) => u.title ?? u.fieldId).join(', ')}
         </p>

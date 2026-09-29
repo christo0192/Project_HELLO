@@ -95,7 +95,8 @@ const DOT: Record<MetricTone, string> = {
 };
 
 const FIGURE: Record<MetricStripSize, string> = {
-  hero: 'text-[32px] leading-10 tracking-[-0.025em]',
+  // The scale's hero step (30/36, -0.02em): one size for every page's lead figure.
+  hero: 'text-stat',
   default: 'text-2xl leading-8 tracking-[-0.02em]',
   compact: 'text-xl leading-7 tracking-[-0.015em]',
 };
@@ -194,11 +195,11 @@ export function MetricStrip({
       )}
     >
       <div className={cx(hideLabel ? 'sr-only' : layout === 'aside' ? 'mb-1 lg:mb-0 lg:pt-3' : 'mb-1')}>
-        <Heading id={headingId} className="text-[13px] font-semibold leading-5 text-ink">
+        <Heading id={headingId} className="text-label font-semibold leading-5 text-ink">
           {label}
         </Heading>
         {description && (
-          <p id={descId} className="mt-0.5 max-w-prose text-[12px] leading-4 text-ink-tertiary">
+          <p id={descId} className="mt-0.5 max-w-prose text-meta text-ink-tertiary">
             {description}
           </p>
         )}
@@ -208,12 +209,16 @@ export function MetricStrip({
         <div className={cx('overflow-hidden', bleed && (threeUp ? BLEED_THREE_UP : BLEED)[size])}>
           {linked ? (
             <ul role="list" className={gridClass} style={gridStyle}>
-              {items.map((item) => (
+              {items.map((item, i) => (
                 <li key={item.key ?? item.label} className={cx(CELL_RULES, SUBGRID)}>
                   {item.href ? (
                     <Link
                       to={item.href}
                       aria-label={item.ariaLabel ?? defaultName(item)}
+                      // The name is "label: figure" (it starts with the
+                      // visible label, WCAG 2.5.3); the context line under
+                      // the figure is its description, not dropped.
+                      aria-describedby={item.context && !item.loading ? `${headingId}-c${i}` : undefined}
                       className={cx(
                         'group/metric transition-colors duration-150 ease-out',
                         SUBGRID,
@@ -221,7 +226,7 @@ export function MetricStrip({
                         pad,
                       )}
                     >
-                      <MetricBody item={item} size={size} linked />
+                      <MetricBody item={item} size={size} linked contextId={`${headingId}-c${i}`} />
                     </Link>
                   ) : (
                     <div className={cx(SUBGRID, pad)}>
@@ -241,7 +246,7 @@ export function MetricStrip({
             </dl>
           )}
         </div>
-        {footnote && <p className="mt-2 text-[12px] leading-4 text-ink-tertiary">{footnote}</p>}
+        {footnote && <p className="mt-2 text-meta text-ink-tertiary">{footnote}</p>}
         {children}
       </div>
     </div>
@@ -262,11 +267,14 @@ function MetricBody({
   size,
   asTerms = false,
   linked = false,
+  contextId,
 }: {
   item: MetricItem;
   size: MetricStripSize;
   asTerms?: boolean;
   linked?: boolean;
+  /** Id for the context line, so a drill-down link can use it as its description. */
+  contextId?: string;
 }) {
   const Term = asTerms ? 'dt' : 'p';
   const Def = asTerms ? 'dd' : 'p';
@@ -283,7 +291,7 @@ function MetricBody({
     <>
       {/* `items-start` + a nudged dot: a wrapped label keeps its dot on the
           first line instead of floating between the two. */}
-      <Term className="flex min-w-0 items-start gap-1.5 self-start text-[13px] font-medium leading-5 text-ink-secondary">
+      <Term className="flex min-w-0 items-start gap-1.5 self-start text-label font-medium leading-5 text-ink-secondary">
         {item.tone && (
           <span aria-hidden="true" className={cx('mt-[7px] h-1.5 w-1.5 shrink-0 rounded-full', DOT[item.tone])} />
         )}
@@ -310,17 +318,26 @@ function MetricBody({
             />
             <span className="sr-only">Loading</span>
           </>
+        ) : item.value === '—' ? (
+          // A figure that could not be read is a dash on screen and words
+          // to a screen reader, never a silent glyph.
+          <>
+            <span aria-hidden="true">—</span>
+            <span className="sr-only">Not available</span>
+          </>
         ) : (
           <>
             {figure}
             {item.unit && (
-              <span className="ml-1 text-[13px] font-normal tracking-normal text-ink-tertiary">{item.unit}</span>
+              <span className="ml-1 text-label font-normal tracking-normal text-ink-tertiary">{item.unit}</span>
             )}
           </>
         )}
       </Def>
       {item.context && !item.loading && (
-        <Def className="mt-0.5 text-[12px] leading-4 text-ink-tertiary">{item.context}</Def>
+        <Def id={contextId} className="mt-0.5 text-meta text-ink-tertiary">
+          {item.context}
+        </Def>
       )}
     </>
   );

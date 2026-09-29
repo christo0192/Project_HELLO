@@ -180,8 +180,7 @@ export function SessionDetailPage() {
 
         <div className="space-y-6 lg:col-span-5">
           {/* Details + recording: one surface, one logical group (the call).
-              The recording control brings its own bordered well, so no
-              extra hairline above it. */}
+              The recording section brings its own hairline above it. */}
           <GlassPanel>
             <SectionHeader title="Details" />
             <dl className="mt-2 divide-y divide-glass-ring">
@@ -197,7 +196,7 @@ export function SessionDetailPage() {
                 <DetailRow label="Candidate words">{words.toLocaleString('en-IN')}</DetailRow>
               )}
               <DetailRow label="Reference">
-                <span title={session.id} className="font-mono text-[13px] text-ink-secondary">
+                <span title={session.id} className="font-mono text-label text-ink-secondary">
                   {shortId(session.id)}
                 </span>
               </DetailRow>
@@ -219,7 +218,7 @@ export function SessionDetailPage() {
               description={`${transcript.length} speaker turn${transcript.length === 1 ? '' : 's'}`}
             />
             {gateOnlyTranscript && (
-              <p className="glass-sunken mt-3 px-3.5 py-2.5 text-[13px] leading-5 text-ink-secondary">
+              <p className="glass-sunken mt-3 px-3.5 py-2.5 text-label text-ink-secondary">
                 This is the identity and recording-consent exchange before the interview. No screening
                 interview was recorded in this session.
               </p>
@@ -239,7 +238,7 @@ export function SessionDetailPage() {
 function DetailRow({ label, children }: { label: string; children: ReactNode }) {
   return (
     <div className="flex min-h-11 items-center justify-between gap-4 py-2">
-      <dt className="text-[13px] text-ink-tertiary">{label}</dt>
+      <dt className="text-label text-ink-tertiary">{label}</dt>
       <dd className="text-right text-sm tabular-nums text-ink">{children}</dd>
     </div>
   );

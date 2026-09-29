@@ -159,7 +159,7 @@ export function OverviewSection() {
         description="Live figures from the audited admin API."
         meta={
           updated ? (
-            <span className="text-[13px] tabular-nums text-ink-tertiary">Updated {updated}</span>
+            <span className="text-label tabular-nums text-ink-tertiary">Updated {updated}</span>
           ) : undefined
         }
         actions={
@@ -180,7 +180,7 @@ export function OverviewSection() {
               value: status.error ? (
                 <span className="text-sm font-medium tracking-normal text-ink-secondary">Not available</span>
               ) : statusData ? (
-                <StatusBadge tone={maintenance.tone} className="px-2.5 py-1 text-[13px]">
+                <StatusBadge tone={maintenance.tone} className="px-2.5 py-1 text-label">
                   {maintenance.label}
                 </StatusBadge>
               ) : (
@@ -218,8 +218,10 @@ export function OverviewSection() {
         />
       </GlassPanel>
 
-      {/* Charts, bounded by the returned session data */}
-      <div className="grid grid-cols-1 items-start gap-6 lg:grid-cols-2">
+      {/* Charts, bounded by the returned session data. Rows STRETCH (no
+          `items-start`): the two cards in a row are peers and share a bottom
+          edge; `ChartCard` fills the row and its body takes the slack. */}
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         <ChartCard
           title="Session status mix"
           description={`${sessionsData.length} sessions in the admin view, largest first.`}
@@ -258,7 +260,7 @@ export function OverviewSection() {
       </div>
 
       {/* Access + quotas summary (no emails anywhere in Overview) */}
-      <div className="grid grid-cols-1 items-start gap-6 lg:grid-cols-2">
+      <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
         <ChartCard
           title="Access entries"
           description="Allowlist state. No email addresses are shown here."
@@ -296,7 +298,7 @@ export function OverviewSection() {
           description="Enabled policies enforce session limits; disabled ones do not."
           meta={
             quotas.data && quotasData.length > 0 ? (
-              <span className="text-[13px] tabular-nums text-ink-tertiary">{quotasData.length} configured</span>
+              <span className="text-label tabular-nums text-ink-tertiary">{quotasData.length} configured</span>
             ) : undefined
           }
         >
@@ -329,7 +331,7 @@ export function OverviewSection() {
       {/* Truthful "not available", once. It used to be a panel of five
           identical "X · Not available" pills, which gave five missing
           signals the visual weight of five present ones. */}
-      <p className="text-[13px] leading-5 text-ink-tertiary">
+      <p className="text-label text-ink-tertiary">
         <span className="font-medium text-ink-secondary">Operational areas without source data</span>
         {': '}
         {NOT_AVAILABLE.map((item, index) => (

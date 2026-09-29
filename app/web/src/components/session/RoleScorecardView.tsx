@@ -82,7 +82,7 @@ function MetricRow({
         </div>
         {score != null ? (
           <p className="flex items-center gap-2.5 whitespace-nowrap">
-            <span className="text-[13px] font-semibold text-ink">{scoreLabel(score, scaleMax)}</span>
+            <span className="text-label font-semibold text-ink">{scoreLabel(score, scaleMax)}</span>
             <ScorePips level={score} max={scaleMax} />
             <span aria-hidden="true" className="text-xs tabular-nums text-ink-tertiary">
               {score}/{scaleMax}
@@ -105,7 +105,7 @@ function MetricRow({
               <p className="text-xs font-medium text-ink-secondary">Evidence</p>
               <ul className="mt-1 space-y-1">
                 {refs.map((ref, i) => (
-                  <li key={i} className="max-w-prose text-[13px] leading-5 text-ink-tertiary">
+                  <li key={i} className="max-w-prose text-label text-ink-tertiary">
                     “{ref}”
                   </li>
                 ))}
@@ -183,7 +183,7 @@ export function RoleScorecardBody({
 
       <div>
         <div className="flex items-baseline justify-between gap-3 border-b border-glass-ring pb-2.5">
-          <h3 id={metricsId} className="text-[13px] font-semibold text-ink">
+          <h3 id={metricsId} className="text-label font-semibold text-ink">
             Metrics
           </h3>
           {total > 0 && (

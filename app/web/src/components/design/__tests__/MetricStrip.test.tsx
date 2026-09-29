@@ -101,4 +101,24 @@ describe('MetricStrip', () => {
     );
     await expect(container).toHaveNoViolations();
   });
+
+  it('names a drill-down by its visible label and describes it with the context line', () => {
+    stubMatchMedia(true, '(prefers-reduced-motion: reduce)');
+    render(
+      <MemoryRouter>
+        <MetricStrip
+          label="Pipeline"
+          items={[{ label: 'Awaiting decision', value: '6', context: 'Screened, ready to review', href: '/candidates?status=screened' }]}
+        />
+      </MemoryRouter>,
+    );
+    const link = screen.getByRole('link', { name: 'Awaiting decision: 6' });
+    expect(link).toHaveAccessibleDescription('Screened, ready to review');
+  });
+
+  it('says "Not available" for a figure that could not be read, never a silent dash', () => {
+    stubMatchMedia(true, '(prefers-reduced-motion: reduce)');
+    render(<MetricStrip label="Overview" items={[{ label: 'Sessions', value: '—' }]} />);
+    expect(screen.getByText('Not available')).toHaveClass('sr-only');
+  });
 });

@@ -114,7 +114,7 @@ export function CandidateHeadlineFacts({
   }
 
   return (
-    <span className="inline-flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px] leading-5">
+    <span className="inline-flex flex-wrap items-center gap-x-2 gap-y-1 text-label">
       {facts.flatMap((fact, i) => (i === 0 ? [fact] : [<Sep key={`sep-${i}`} />, fact]))}
     </span>
   );

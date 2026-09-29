@@ -30,6 +30,19 @@
  * by `aria-pressed` and by a ring, not by a fill an operator has to compare
  * against its neighbours.
  *
+ * ── SELECTED AND FOCUSED ARE TWO DIFFERENT LOOKS ──────────────────────
+ * Both used to be a 2px #4E6BA6 ring, so a keyboard operator could not tell
+ * the chip they were ON from the chip that was OPEN. Now:
+ *   selected — the accent tint fill and a 1px accent ring hugging the edge
+ *              (#4E6BA6 on white is ~5.3:1, over the 3:1 a state boundary
+ *              needs). The tint alone is too faint to carry the state; the
+ *              ring does, and the fill is what survives the focus ring.
+ *   focused  — a 2px accent ring standing 2px OFF the chip on a white gap
+ *              (`ring-offset-2`), the same detached ring every `Button` in
+ *              the app wears. A focused, selected chip therefore shows the
+ *              tint AND the detached ring, and reads as both.
+ *
+
  * ── TOUCH TARGET ──────────────────────────────────────────────────────
  * `min-h-[44px]` keeps the control at the 44×44 CSS-pixel floor on touch
  * (WCAG 2.5.5), which a text-sized chip would otherwise miss by half. The
@@ -84,8 +97,13 @@ export function PhoneAppointmentButton({
   const shared = cx(
     'w-full min-h-[44px] text-left',
     'transition-[box-shadow,background-color] duration-200 ease-soft',
+    // Detached from the chip by a white gap, so focus never looks like the
+    // hugging 1px ring that means "selected" (see the header comment).
     'focus:outline-none focus-visible:ring-2 focus-visible:ring-brand-500',
+    'focus-visible:ring-offset-2 focus-visible:ring-offset-surface',
   );
+  /** Tint + a 1px ring on the edge: the "this one is open" look. */
+  const selectedLook = 'bg-info-soft ring-1 ring-info';
 
   if (layout === 'row') {
     return (
@@ -98,7 +116,7 @@ export function PhoneAppointmentButton({
         className={cx(
           shared,
           'flex items-center gap-3 rounded-[10px] px-3 py-2',
-          selected ? 'bg-white shadow-pill ring-2 ring-info' : 'hover:bg-white/70',
+          selected ? selectedLook : 'hover:bg-white/70',
         )}
       >
         <span
@@ -134,10 +152,14 @@ export function PhoneAppointmentButton({
       className={cx(
         shared,
         'flex flex-col items-start gap-1 rounded-[10px] px-2 py-1.5',
-        withdrawn
-          ? 'bg-white/55 shadow-[inset_0_0_0_1px_var(--glass-ring)]'
-          : 'bg-white shadow-pill',
-        selected ? 'ring-2 ring-info' : 'hover:bg-white hover:shadow-card-hover',
+        // One fill per state, never two fill classes on one element: which of
+        // two `bg-*` utilities wins is decided by stylesheet order, not by the
+        // order they are written here.
+        selected
+          ? selectedLook
+          : withdrawn
+            ? 'bg-white/55 shadow-[inset_0_0_0_1px_var(--glass-ring)] hover:bg-white hover:shadow-card-hover'
+            : 'bg-white shadow-pill hover:shadow-card-hover',
       )}
     >
       <span aria-hidden="true" className="text-meta font-medium tabular-nums text-ink-tertiary">

@@ -630,7 +630,7 @@ function MetricRow({
               <span className="truncate text-[15px] font-semibold tracking-[-0.01em] text-ink">
                 {metric.name}
               </span>
-              <span className="shrink-0 rounded-full bg-ink/[0.06] px-1.5 py-px text-[11px] font-medium tabular-nums text-ink-secondary">
+              <span className="shrink-0 rounded-full bg-ink/[0.06] px-1.5 py-px text-meta font-medium tabular-nums text-ink-secondary">
                 v{metric.version}
               </span>
             </span>
@@ -940,7 +940,7 @@ function CharCount({ value, max }: { value: string; max: number }) {
   return (
     <span
       aria-hidden="true"
-      className={cx('shrink-0 text-[11px] tabular-nums', near ? 'text-warning-text' : 'text-ink-tertiary')}
+      className={cx('shrink-0 text-meta tabular-nums', near ? 'text-warning-text' : 'text-ink-tertiary')}
     >
       {value.length}/{max}
     </span>

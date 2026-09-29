@@ -147,6 +147,8 @@ export function OverflowMenu({
 
   const triggerRef = useRef<HTMLButtonElement | null>(null);
   const menuRef = useRef<HTMLDivElement | null>(null);
+  /** Zero-size, never animated: where (0, 0) is for the menu. See `place`. */
+  const originRef = useRef<HTMLSpanElement | null>(null);
   const itemRefs = useRef<Array<HTMLDivElement | null>>([]);
   const typeahead = useRef({ text: '', at: 0 });
 
@@ -186,24 +188,31 @@ export function OverflowMenu({
    *
    * The containing-block offset: `fixed` coordinates are relative to the
    * viewport UNLESS an ancestor is a containing block, in which case they are
-   * relative to that ancestor. Comparing where the menu IS with what its
-   * style SAYS measures that offset whichever case applies, so the same
-   * arithmetic is right in both.
+   * relative to that ancestor. The `origin` probe, a fixed box at (0, 0) in
+   * the same parent, lands exactly where that offset is, whichever case
+   * applies, so the same arithmetic is right in both.
+   *
+   * WHY A PROBE and not the menu itself: the menu opens with the
+   * `combobox-panel` entrance, which holds `translateY(-4px)` at its first
+   * frame, and `getBoundingClientRect` includes transforms. Measured off the
+   * menu, the offset absorbed those 4px and the menu opened 4px low, then
+   * jumped on the first scroll. For the same reason the width is the layout
+   * width (`offsetWidth`), which no transform touches.
    */
   const place = useCallback(() => {
     const trigger = triggerRef.current;
     const menu = menuRef.current;
     if (!trigger || !menu) return;
     const t = trigger.getBoundingClientRect();
-    const now = menu.getBoundingClientRect();
-    const offsetX = now.left - (parseFloat(menu.style.left) || 0);
-    const offsetY = now.top - (parseFloat(menu.style.top) || 0);
+    const origin = originRef.current?.getBoundingClientRect();
+    const offsetX = origin?.left ?? 0;
+    const offsetY = origin?.top ?? 0;
     const vw = document.documentElement.clientWidth || window.innerWidth;
     const vh = window.innerHeight;
 
     // The menu's full height, whatever `max-height` a previous pass set.
     const natural = menu.scrollHeight;
-    const width = now.width;
+    const width = menu.offsetWidth;
     const below = vh - t.bottom - GAP - EDGE;
     const above = t.top - GAP - EDGE;
     const up = natural > below && above > below;
@@ -391,8 +400,7 @@ export function OverflowMenu({
       role="menu"
       aria-labelledby={triggerId}
       onKeyDown={onMenuKey}
-      // Placed by `place()` before the first paint; (0, 0) is the start
-      // point its offset measurement needs.
+      // Placed by `place()` before the first paint.
       style={{ position: 'fixed', top: 0, left: 0 }}
       className={cx(
         // The modal material — opaque, hairline, pop shadow — at a menu's
@@ -458,6 +466,20 @@ export function OverflowMenu({
     </div>
   ) : null;
 
+  // The containing-block probe `place()` measures: rendered beside the menu,
+  // so it shares the menu's containing block, and it is never transformed.
+  const floating = menu ? (
+    <>
+      <span
+        ref={originRef}
+        aria-hidden="true"
+        data-overflow-origin=""
+        style={{ position: 'fixed', top: 0, left: 0, width: 0, height: 0, pointerEvents: 'none' }}
+      />
+      {menu}
+    </>
+  ) : null;
+
   return (
     <>
       <button
@@ -494,7 +516,7 @@ export function OverflowMenu({
           <path d="m6 9 6 6 6-6" />
         </svg>
       </button>
-      {menu && (openState?.host ? createPortal(menu, openState.host) : menu)}
+      {floating && (openState?.host ? createPortal(floating, openState.host) : floating)}
     </>
   );
 }

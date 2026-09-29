@@ -9,6 +9,13 @@ import type { LineSeriesOption } from 'echarts';
 export interface LineChartDatum {
   label: string;
   value: number;
+  /**
+   * The calendar day the point stands for, `YYYY-MM-DD`. A multi-series
+   * chart builds its axis from this, not from `label`: "3 Sep" carries no
+   * year and does not sort, so two series' days can only be merged in the
+   * right order by the date they were labelled from.
+   */
+  date?: string;
 }
 
 /** One line of a multi-series chart. Labels are matched across series. */
@@ -20,24 +27,51 @@ export interface LineChartSeries {
 }
 
 /**
- * Every series' labels, in time order. Each series is already in order, so a
- * label new to the union is inserted straight after the label that precedes
- * it in its own series: a day only the second series has lands between its
- * neighbours, not at the end of the axis.
+ * Every series' labels, in time order.
+ *
+ * With a `date` on every point, the union is sorted by it. Merging by order
+ * alone cannot be right in general: `[1 Sep, 3 Sep]` and `[2 Sep, 3 Sep]`
+ * say only that 1 and 2 both come before 3, not which comes first, and the
+ * old merge answered "2 Sep, 1 Sep, 3 Sep".
+ *
+ * Without dates (a caller that has only labels), each series is still taken
+ * to be in order: a new label goes straight after the label before it in its
+ * own series, or, when it LEADS its series, straight before the next of its
+ * series' labels the union already has. That places the case above
+ * correctly; a label no other series shares goes at the end.
  */
 export function unionLabels(series: LineChartSeries[]): string[] {
+  const points = series.flatMap((s) => s.data);
+  if (points.length > 0 && points.every((d) => typeof d.date === 'string' && d.date !== '')) {
+    const dateOf = new Map<string, string>();
+    for (const d of points) if (!dateOf.has(d.label)) dateOf.set(d.label, d.date as string);
+    // ISO days sort as strings. Stable, so two labels on one day keep the
+    // order they first appeared in.
+    return [...dateOf.keys()].sort((a, b) => {
+      const x = dateOf.get(a) as string;
+      const y = dateOf.get(b) as string;
+      return x < y ? -1 : x > y ? 1 : 0;
+    });
+  }
+
   const out: string[] = [];
   for (const s of series) {
     let cursor = -1;
-    for (const d of s.data) {
+    s.data.forEach((d, i) => {
       const at = out.indexOf(d.label);
-      if (at === -1) {
-        out.splice(cursor + 1, 0, d.label);
-        cursor += 1;
-      } else {
+      if (at !== -1) {
         cursor = at;
+        return;
       }
-    }
+      let insertAt = cursor + 1;
+      if (cursor === -1) {
+        // Nothing of this series placed yet: anchor on what follows instead.
+        const next = s.data.slice(i + 1).find((later) => out.includes(later.label));
+        insertAt = next ? out.indexOf(next.label) : out.length;
+      }
+      out.splice(insertAt, 0, d.label);
+      cursor = insertAt;
+    });
   }
   return out;
 }
@@ -107,4 +141,3 @@ export function shareLabel(value: number, total: number): string {
   if (value > 0 && pct < 0.5) return '<1%';
   return `${Math.round(pct)}%`;
 }
-

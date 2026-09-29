@@ -572,7 +572,7 @@ function ComboboxRow({
         )}
       </span>
       {option.tag && (
-        <span className="shrink-0 rounded-full bg-ink/[0.06] px-2 py-0.5 text-[11px] font-medium text-ink-secondary">
+        <span className="shrink-0 rounded-full bg-ink/[0.06] px-2 py-0.5 text-meta font-medium text-ink-secondary">
           {option.tag}
         </span>
       )}

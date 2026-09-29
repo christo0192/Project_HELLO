@@ -458,6 +458,37 @@ describe('capacity semantics', () => {
     expect(warning.textContent).toMatch(/optimistic/i);
   });
 
+  it('offers no booking at all while the calendar read says phone screening is off', async () => {
+    // Regression: the booking form moved up under the header and was gated
+    // on the role alone, so it opened under a banner saying nothing can be
+    // booked, and every submit came back 503 `phone_screening_disabled`.
+    apiFns.getPhoneCalendar.mockResolvedValue(
+      calendarResponse({ enabled: false, appointments: [], count: 0 }),
+    );
+    renderPage();
+    await screen.findByText(/Phone screening is turned off/);
+
+    expect(screen.queryByRole('button', { name: 'Book a screening' })).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('Candidate')).not.toBeInTheDocument();
+    // The form's own reads never start either.
+    expect(apiFns.getPhoneSlots).not.toHaveBeenCalled();
+    expect(apiFns.scheduleCandidatePhoneAppointment).not.toHaveBeenCalled();
+  });
+
+  it('keeps "Book a screening" through a week change instead of blinking it out', async () => {
+    renderPage();
+    await screen.findByRole('table');
+    const book = screen.getByRole('button', { name: 'Book a screening' });
+
+    // The next week's read never settles: the page is mid-load.
+    apiFns.getPhoneCalendar.mockReturnValue(new Promise(() => {}));
+    await userEvent.click(screen.getByRole('button', { name: 'Next week' }));
+    await screen.findByText('Loading the phone calendar…');
+
+    // The flag is deployment-wide, so the last read's answer still holds.
+    expect(screen.getByRole('button', { name: 'Book a screening' })).toBe(book);
+  });
+
   it('offers no slots at all while the feature is disabled', async () => {
     apiFns.getPhoneSlots.mockResolvedValue(
       slotsResponse({ enabled: false, slots: [], max_concurrent: null }),

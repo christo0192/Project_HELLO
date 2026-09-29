@@ -63,6 +63,12 @@ import {
   recommendationLabel,
   RECOMMENDATION_ORDER,
 } from '../components/talent';
+// The vocabulary module only (not the calendar's barrel): the phone schedule
+// names and colours each status exactly as the calendar does.
+import {
+  appointmentStatusTerm,
+  isLiveAppointment,
+} from '../components/phone-calendar/phoneVocabulary';
 import { humanizeEnum } from '../lib/humanize';
 import { addIstDays, IST_TIME_ZONE, istDayStartUtcIso, istToday } from '../lib/ist-datetime';
 import type { PhoneCalendarResponse } from '../types';
@@ -71,11 +77,6 @@ const INTENT_KIND_META: Record<string, { title: string; tone: StatusTone }> = {
   assessment_ready: { title: 'Screening ready for review', tone: 'info' },
   appeal_resolved: { title: 'Appeal resolved, review the outcome', tone: 'success' },
   quota_warning: { title: 'Session quota nearing its limit', tone: 'warning' },
-};
-
-const APPOINTMENT_LABELS: Record<string, string> = {
-  scheduled: 'Scheduled',
-  confirmed: 'Confirmed',
 };
 
 /** A recommendation's own meaning, so its bar is coloured by it. */
@@ -190,7 +191,10 @@ export function DashboardPage() {
       <PageHeader
         eyebrow="Talent workspace"
         title="Dashboard"
-        description="Your pipeline from live data. Every figure opens the matching candidates."
+        // Only what is true: the pipeline figures and the stage and
+        // recommendation bars are links; the screening report, the intake
+        // chart and the phone counts are not.
+        description="Your pipeline from live data. The pipeline figures and bars open the matching candidates."
         actions={
           <>
             <Button variant="secondary" onClick={load}>
@@ -226,34 +230,33 @@ export function DashboardPage() {
               value: total.toLocaleString(),
               context: 'In the pipeline',
               href: candidatesHref(),
-              ariaLabel: `${total} candidates in pipeline. View all candidates.`,
             },
             {
               label: 'Awaiting screening',
               value: awaiting.toLocaleString(),
               context: 'New, not yet screened',
               href: candidatesHref({ statuses: ['new'] }),
-              ariaLabel: `${awaiting} candidates awaiting screening. View them.`,
             },
             {
               label: 'In screening',
               value: inScreening.toLocaleString(),
               context: 'Queued or on a call',
               href: candidatesHref({ statuses: ['queued', 'screening'] }),
-              ariaLabel: `${inScreening} candidates in screening. View them.`,
             },
             {
               label: 'Awaiting decision',
               value: awaitingDecision.toLocaleString(),
               context: 'Screened, ready to review',
               href: candidatesHref({ statuses: ['screened'] }),
-              ariaLabel: `${awaitingDecision} candidates awaiting a decision. Review them.`,
             },
           ]}
         />
       </GlassPanel>
 
-      <div className="mt-6 grid grid-cols-1 items-start gap-6 lg:grid-cols-3">
+      {/* Peers in a row share one bottom edge: the grid stretches each
+          panel to the row's height (`ChartCard` is `h-full`), where
+          `items-start` left three ragged bottoms. */}
+      <div className="mt-6 grid grid-cols-1 gap-6 lg:grid-cols-3">
         <ChartCard
           title="Pipeline by stage"
           meta={<CompletionMeta completionPct={completionPct} />}
@@ -301,7 +304,8 @@ export function DashboardPage() {
           doomed call. */}
       {me.role !== 'viewer' && <ScreeningKpis />}
 
-      <div className="mt-8 grid grid-cols-1 items-start gap-6 lg:grid-cols-2 xl:grid-cols-3">
+      {/* The same equal-height row as the charts above. */}
+      <div className="mt-8 grid grid-cols-1 gap-6 lg:grid-cols-2 xl:grid-cols-3">
         <RecentCandidates candidates={candidates} />
         <ActionQueue
           intents={intents}
@@ -346,7 +350,7 @@ function CompletionMeta({ completionPct }: { completionPct: number }) {
   const r = 6;
   const c = 2 * Math.PI * r;
   return (
-    <span className="inline-flex items-center gap-1.5 rounded-full bg-ink/[0.05] py-0.5 pl-1 pr-2 text-[12px] font-medium tabular-nums text-ink-secondary">
+    <span className="inline-flex items-center gap-1.5 rounded-full bg-ink/[0.05] py-0.5 pl-1 pr-2 text-meta font-medium tabular-nums text-ink-secondary">
       <svg aria-hidden="true" viewBox="0 0 16 16" className="h-4 w-4 -rotate-90">
         <circle cx="8" cy="8" r={r} fill="none" strokeWidth="2.5" className="stroke-ink/[0.1]" />
         <circle
@@ -409,21 +413,21 @@ function AssessmentsPanel({
             }
             className="group -mx-2 block rounded-[12px] px-2 py-1.5 transition-colors duration-150 ease-out hover:bg-ink/[0.025] focus:outline-none focus-visible:shadow-[inset_0_0_0_2px_var(--info)]"
           >
-            <p className="text-[13px] font-medium text-ink-secondary">Average score</p>
+            <p className="text-label font-medium text-ink-secondary">Average score</p>
             {hasAvg ? (
               <p className="mt-1 text-2xl font-semibold leading-8 tracking-[-0.02em] tabular-nums text-ink">
                 {summary.average_score}
-                <span className="ml-1 text-[13px] font-normal tracking-normal text-ink-tertiary">
+                <span className="ml-1 text-label font-normal tracking-normal text-ink-tertiary">
                   / 100 across {summary.assessed_count} assessed
                 </span>
               </p>
             ) : (
-              <p className="mt-1 text-[13px] text-ink-tertiary">No assessments yet</p>
+              <p className="mt-1 text-label text-ink-tertiary">No assessments yet</p>
             )}
           </Link>
 
           <div className="mt-3 border-t border-glass-ring pt-3">
-            <h3 className="mb-1 text-[13px] font-medium text-ink-secondary">Recommendation</h3>
+            <h3 className="mb-1 text-label font-medium text-ink-secondary">Recommendation</h3>
             {assessedTotal === 0 ? (
               <EmptyPanel
                 compact
@@ -455,12 +459,12 @@ function RecentCandidates({ candidates }: { candidates: Candidate[] }) {
   const recent = candidates.slice(0, RECENT_LIMIT);
 
   return (
-    <GlassPanel as="section" aria-label="Recent candidates">
+    <GlassPanel as="section" aria-label="Recent candidates" className="h-full">
       <SectionHeader
         title="Recent candidates"
         meta={
           candidates.length > 0 ? (
-            <span className="text-[13px] tabular-nums text-ink-tertiary">{candidates.length} total</span>
+            <span className="text-label tabular-nums text-ink-tertiary">{candidates.length} total</span>
           ) : undefined
         }
         actions={
@@ -498,7 +502,7 @@ function RecentCandidates({ candidates }: { candidates: Candidate[] }) {
                     {candidate.name || 'Unnamed'}
                   </Link>
                   {meta.length > 0 && (
-                    <p className="truncate text-[13px] tabular-nums text-ink-tertiary">{meta.join(' · ')}</p>
+                    <p className="truncate text-label tabular-nums text-ink-tertiary">{meta.join(' · ')}</p>
                   )}
                 </div>
                 <StatusBadge tone={candidateStatusTone(candidate.status)} className="shrink-0">
@@ -561,7 +565,7 @@ function ActionQueue({
                   </span>
                 )}
               </p>
-              <span className="shrink-0 text-[12px] tabular-nums text-ink-tertiary">
+              <span className="shrink-0 text-meta tabular-nums text-ink-tertiary">
                 {formatDayTime(intent.created_at) ?? 'Time unavailable'}
               </span>
             </div>
@@ -582,7 +586,7 @@ function ActionQueue({
   );
 
   return (
-    <GlassPanel as="section" aria-label="Action queue">
+    <GlassPanel as="section" aria-label="Action queue" className="h-full">
       <SectionHeader title="Prioritized work" className="mb-2" />
       {viewer ? (
         <p className="py-6 text-center text-sm text-ink-tertiary">
@@ -614,16 +618,26 @@ function PhoneScheduleCard({
   data: PhoneCalendarResponse | null;
   error: string | null;
 }) {
-  const live = data?.appointments.filter(
-    (appointment) => appointment.status === 'scheduled' || appointment.status === 'confirmed',
-  ) ?? [];
+  const appointments = data?.appointments ?? [];
+  const live = appointments.filter((appointment) => isLiveAppointment(appointment.status));
   const now = Date.now();
   const upcoming = live.filter((appointment) => Date.parse(appointment.starts_at) >= now);
   const overdue = live.filter((appointment) => Date.parse(appointment.starts_at) < now);
   const next = upcoming.slice(0, 3);
 
+  /**
+   * The API returns at most 200 rows, earliest first, and says `truncated`
+   * when the week held more. Every count here is then a floor, not a total,
+   * and says so ("200+"). Overdue rows come first, so that count stays exact
+   * unless even the last row loaded is already in the past.
+   */
+  const truncated = data?.truncated === true;
+  const lastLoaded = appointments.length > 0 ? appointments[appointments.length - 1] : undefined;
+  const overdueCut = truncated && lastLoaded !== undefined && Date.parse(lastLoaded.starts_at) < now;
+  const atLeast = (n: number, floor: boolean) => (floor ? `${n}+` : String(n));
+
   return (
-    <GlassPanel as="section" aria-labelledby="phone-schedule-heading">
+    <GlassPanel as="section" aria-labelledby="phone-schedule-heading" className="h-full">
       <SectionHeader
         id="phone-schedule-heading"
         title="Phone schedule"
@@ -655,42 +669,47 @@ function PhoneScheduleCard({
               columns={3}
               bleed
               items={[
-                { label: 'Upcoming', value: String(upcoming.length) },
-                { label: 'Overdue', value: String(overdue.length), attention: overdue.length > 0 },
-                { label: 'All', value: String(data.count), context: 'Any status' },
+                { label: 'Upcoming', value: atLeast(upcoming.length, truncated) },
+                {
+                  label: 'Overdue',
+                  value: atLeast(overdue.length, overdueCut),
+                  attention: overdue.length > 0,
+                },
+                { label: 'All', value: atLeast(data.count, truncated), context: 'Any status' },
               ]}
             />
-          {data.truncated && (
+          {truncated && (
             <InlineNotice tone="warning" className="mt-3">
-              The schedule is larger than this summary window; open the calendar for the full
-              bounded view.
+              More appointments than this summary loads. A figure with + is at least that many;
+              the calendar has the full week.
             </InlineNotice>
           )}
           {next.length > 0 ? (
             <ul role="list" className="mt-2 divide-y divide-glass-ring border-t border-glass-ring" aria-label="Next phone appointments">
-              {next.map((appointment) => (
-                <li
-                  key={appointment.id}
-                  className="flex items-center justify-between gap-3 py-2.5 text-sm"
-                >
-                  <div className="min-w-0">
-                    <p className="truncate font-medium text-ink">
-                      {appointment.candidate?.name ?? 'Candidate'}
-                    </p>
-                    <p className="text-[13px] tabular-nums text-ink-tertiary">
-                      {(() => {
-                        const when = formatDayTime(appointment.starts_at, { timeZone: IST_TIME_ZONE });
-                        return when ? `${when} IST` : 'Time unavailable';
-                      })()}
-                    </p>
-                  </div>
-                  <StatusBadge tone="info" className="shrink-0">
-                    <span title={appointment.status}>
-                      {humanizeEnum(appointment.status, APPOINTMENT_LABELS)}
-                    </span>
-                  </StatusBadge>
-                </li>
-              ))}
+              {next.map((appointment) => {
+                const when = formatDayTime(appointment.starts_at, { timeZone: IST_TIME_ZONE });
+                // The calendar's own word and colour for each status, so a
+                // confirmed call reads the same here as on the calendar.
+                const status = appointmentStatusTerm(appointment.status);
+                return (
+                  <li
+                    key={appointment.id}
+                    className="flex items-center justify-between gap-3 py-2.5 text-sm"
+                  >
+                    <div className="min-w-0">
+                      <p className="truncate font-medium text-ink">
+                        {appointment.candidate?.name ?? 'Candidate'}
+                      </p>
+                      <p className="text-label tabular-nums text-ink-tertiary">
+                        {when ? `${when} IST` : 'Time unavailable'}
+                      </p>
+                    </div>
+                    <StatusBadge tone={status.tone} className="shrink-0">
+                      <span title={appointment.status}>{status.label}</span>
+                    </StatusBadge>
+                  </li>
+                );
+              })}
             </ul>
           ) : (
             <p className="mt-3 text-sm text-ink-secondary">

@@ -414,15 +414,16 @@ describe('RolesPage', () => {
     );
   });
 
-  it('leads the role card with the AGENT NAME, and puts the job underneath', async () => {
+  it('leads the role row with the AGENT NAME, and puts the job underneath', async () => {
     // Owner request: agent on top, role name below — the two swapped.
+    // An h3: the list's own heading ("All roles") is the h2 above the rows.
     mockApi.listRoles.mockResolvedValue([{ ...mockRole, agent_name: '  Gopu  ' }]);
     render(<RolesPage />);
-    const heading = await screen.findByRole('heading', { level: 2, name: 'Gopu' });
+    const heading = await screen.findByRole('heading', { level: 3, name: 'Gopu' });
     expect(heading).toBeInTheDocument();
-    // The job title is no longer a heading of its own...
+    // The job title is no longer a heading of its own, at any level...
     expect(
-      screen.queryByRole('heading', { level: 2, name: mockRole.title }),
+      screen.queryByRole('heading', { name: mockRole.title }),
     ).not.toBeInTheDocument();
     // ...it is the secondary line, labelled so nobody mistakes it for the agent.
     const secondary = document.querySelector('[data-role-title-secondary]');
@@ -433,14 +434,14 @@ describe('RolesPage', () => {
     expect(screen.queryByText(/^Agent:/)).not.toBeInTheDocument();
   });
 
-  it('lets a TRUNCATED card heading be read in full — the title carries all of it', async () => {
+  it('lets a TRUNCATED row heading be read in full — the title carries all of it', async () => {
     // Both lines are `truncate`d; an 80-character agent name ends in an
     // ellipsis with no other way to see the rest.
     const longAgent = 'A'.repeat(40) + ' screening agent for the enterprise sales team!';
     const longTitle = 'Senior Enterprise Account Executive, Strategic Accounts (EMEA and APAC)';
     mockApi.listRoles.mockResolvedValue([{ ...mockRole, title: longTitle, agent_name: `  ${longAgent} ` }]);
     render(<RolesPage />);
-    const heading = await screen.findByRole('heading', { level: 2, name: longAgent });
+    const heading = await screen.findByRole('heading', { level: 3, name: longAgent });
     expect(heading).toHaveClass('truncate');
     expect(heading).toHaveAttribute('title', longAgent);
     // The accessible name is still the (untruncated) content, unchanged.
@@ -454,7 +455,7 @@ describe('RolesPage', () => {
   it('titles a title-only heading with the job title', async () => {
     mockApi.listRoles.mockResolvedValue([{ ...mockRole, agent_name: null }]);
     render(<RolesPage />);
-    const heading = await screen.findByRole('heading', { level: 2, name: mockRole.title });
+    const heading = await screen.findByRole('heading', { level: 3, name: mockRole.title });
     expect(heading).toHaveAttribute('title', mockRole.title);
   });
 
@@ -466,7 +467,7 @@ describe('RolesPage', () => {
     mockApi.listRoles.mockResolvedValue([{ ...mockRole, agent_name }]);
     render(<RolesPage />);
     expect(
-      await screen.findByRole('heading', { level: 2, name: mockRole.title }),
+      await screen.findByRole('heading', { level: 3, name: mockRole.title }),
     ).toBeInTheDocument();
     // The heading already IS the job; a "Role: …" line under it would say it twice.
     expect(document.querySelector('[data-role-title-secondary]')).toBeNull();
@@ -506,6 +507,169 @@ describe('RolesPage', () => {
     const { container } = render(<RolesPage />);
     const btn = await screen.findByRole('button', { name: 'New role' });
     await userEvent.click(btn);
+    await expect(container).toHaveNoViolations();
+  });
+});
+
+describe('The role list — one surface of rows, not a card wall', () => {
+  // The Roles page was a 3×2 grid of identical glass cards: the same pill,
+  // chips and button pair repeated, descriptions cut mid-sentence. Design rule
+  // 9 ("a strip, not a card wall") puts the roles in ONE panel as a list with
+  // hairlines between rows. These pin the list's semantics and the facts each
+  // row owes the operator, not its classes.
+  beforeEach(() => {
+    mockAuth = { role: 'interviewer' };
+    vi.clearAllMocks();
+    mockApi.getRoleScorecard.mockResolvedValue({ scorecard: { metrics: [] } });
+    mockApi.listScorecardMetrics.mockResolvedValue([]);
+    mockApi.getActiveRoleDraft.mockResolvedValue({ active: null });
+  });
+
+  const role = (n: number, over: Partial<typeof mockRole> & { agent_name?: string | null } = {}) => ({
+    ...mockRole,
+    id: `role-${n}`,
+    title: `Role number ${n}`,
+    ...over,
+  });
+
+  it('renders ONE list, named by its heading, with one item per role', async () => {
+    mockApi.listRoles.mockResolvedValue([role(1), role(2, { is_active: false }), role(3)]);
+    render(<RolesPage />);
+    const list = await screen.findByRole('list', { name: 'All roles' });
+    // Only the rows are items: the skills are text, not a nested chip list.
+    expect(within(list).getAllByRole('listitem')).toHaveLength(3);
+    // The outline: the page's h1, the list's h2, one h3 per role.
+    expect(screen.getByRole('heading', { level: 2, name: 'All roles' })).toBeInTheDocument();
+    expect(within(list).getAllByRole('heading', { level: 3 }).map((h) => h.textContent)).toEqual([
+      'Role number 1',
+      'Role number 2',
+      'Role number 3',
+    ]);
+  });
+
+  it.each([
+    [[role(1), role(2), role(3, { is_active: false })], '3 roles, 2 active'],
+    [[role(1)], '1 role, 1 active'],
+    [[role(1, { is_active: false }), role(2, { is_active: false })], '2 roles, none active'],
+  ])('summarises the list in one line under its heading (%#)', async (roles, summary) => {
+    mockApi.listRoles.mockResolvedValue(roles);
+    render(<RolesPage />);
+    expect(await screen.findByText(summary)).toBeInTheDocument();
+  });
+
+  it('counts EVERY role in the summary, not just the visible page, and pages only past ten', async () => {
+    // Eleven roles: the first page shows ten, the summary still says eleven,
+    // and paging appears because there is now a second page.
+    const eleven = Array.from({ length: 11 }, (_, i) => role(i + 1));
+    mockApi.listRoles.mockResolvedValue(eleven);
+    render(<RolesPage />);
+    const list = await screen.findByRole('list', { name: 'All roles' });
+    expect(within(list).getAllByRole('listitem')).toHaveLength(10);
+    expect(screen.getByText('11 roles, 11 active')).toBeInTheDocument();
+    expect(screen.getByRole('navigation', { name: 'roles pagination' })).toBeInTheDocument();
+  });
+
+  it('shows NO paging controls when every role fits on one page', async () => {
+    // "Showing 1–6 of 6 roles" with disabled arrows was a second way of
+    // saying what the summary already says.
+    mockApi.listRoles.mockResolvedValue([role(1), role(2)]);
+    render(<RolesPage />);
+    await screen.findByRole('list', { name: 'All roles' });
+    expect(screen.queryByRole('navigation', { name: 'roles pagination' })).toBeNull();
+  });
+
+  it('says the state in WORDS on every row', async () => {
+    mockApi.listRoles.mockResolvedValue([role(1), role(2, { is_active: false })]);
+    render(<RolesPage />);
+    const [live, retired] = within(await screen.findByRole('list', { name: 'All roles' })).getAllByRole('listitem');
+    expect(within(live).getByText('Active')).toBeInTheDocument();
+    expect(within(retired).getByText('Inactive')).toBeInTheDocument();
+  });
+
+  it('never cuts the description without a way to read it: two lines on screen, all of it in the title', async () => {
+    const jd =
+      'Own the services behind a live interview-preparation platform: design APIs in Go and TypeScript, run PostgreSQL at scale and keep p99 latency honest. You will pair with product on roadmap trade-offs.';
+    mockApi.listRoles.mockResolvedValue([role(1, { jd })]);
+    render(<RolesPage />);
+    const description = await screen.findByText(jd);
+    expect(description).toHaveClass('line-clamp-2');
+    expect(description).toHaveAttribute('title', jd);
+  });
+
+  it('renders no empty description line for a role without one', async () => {
+    mockApi.listRoles.mockResolvedValue([role(1, { jd: '   ' })]);
+    render(<RolesPage />);
+    const [row] = within(await screen.findByRole('list', { name: 'All roles' })).getAllByRole('listitem');
+    expect(row.querySelector('.line-clamp-2')).toBeNull();
+  });
+
+  it('folds skills past three into "+N", and still says every one to a screen reader', async () => {
+    mockApi.listRoles.mockResolvedValue([
+      role(1, { required_skills: ['Go', 'PostgreSQL', 'Kubernetes', 'gRPC', 'System design'] }),
+    ]);
+    render(<RolesPage />);
+    const [row] = within(await screen.findByRole('list', { name: 'All roles' })).getAllByRole('listitem');
+    // On screen: three names and a count.
+    expect(within(row).getByText(/Go, PostgreSQL, Kubernetes/)).toBeInTheDocument();
+    const more = row.querySelector('[data-role-skills-more]') as HTMLElement;
+    expect(more).toHaveTextContent('+2');
+    // The folded ones are one hover away for a mouse...
+    expect(more).toHaveAttribute('title', 'gRPC, System design');
+    // ...and the count is hidden from assistive tech, which hears the names
+    // themselves instead, so nothing is read twice or lost.
+    expect(more).toHaveAttribute('aria-hidden', 'true');
+    expect(row.textContent).toContain('gRPC, System design');
+  });
+
+  it('shows every skill, and no "+N", when there are three or fewer', async () => {
+    mockApi.listRoles.mockResolvedValue([role(1)]);
+    render(<RolesPage />);
+    const [row] = within(await screen.findByRole('list', { name: 'All roles' })).getAllByRole('listitem');
+    expect(within(row).getByText(/React, TypeScript, CSS/)).toBeInTheDocument();
+    expect(row.querySelector('[data-role-skills-more]')).toBeNull();
+  });
+
+  it('keeps Delete QUIET on the row: red ink and outline, never a filled red button', async () => {
+    // Design rule 10: the filled `danger` is for the confirmation step only.
+    // The confirmation here is the browser's own `confirm`, pinned elsewhere.
+    mockApi.listRoles.mockResolvedValue([role(1)]);
+    render(<RolesPage />);
+    const del = await screen.findByRole('button', { name: 'Delete role Role number 1' });
+    expect(del).toHaveClass('text-error-text');
+    expect(del).not.toHaveClass('bg-error');
+  });
+
+  it('describes each Edit by its row heading, so six Edit buttons can be told apart', async () => {
+    // The NAME stays "Edit" (what is on screen); the row's heading is the
+    // description a screen reader adds when navigating by control.
+    mockApi.listRoles.mockResolvedValue([role(1, { agent_name: 'Gopu' }), role(2)]);
+    render(<RolesPage />);
+    const edits = await screen.findAllByRole('button', { name: 'Edit' });
+    expect(edits[0]).toHaveAccessibleDescription('Gopu');
+    expect(edits[1]).toHaveAccessibleDescription('Role number 2');
+  });
+
+  it('keeps the TAB ORDER row by row: Edit, then Delete, then the next row', async () => {
+    mockApi.listRoles.mockResolvedValue([role(1), role(2)]);
+    render(<RolesPage />);
+    const user = userEvent.setup();
+    const [firstEdit, secondEdit] = await screen.findAllByRole('button', { name: 'Edit' });
+    firstEdit.focus();
+    await user.tab();
+    expect(screen.getByRole('button', { name: 'Delete role Role number 1' })).toHaveFocus();
+    await user.tab();
+    expect(secondEdit).toHaveFocus();
+    await user.tab();
+    expect(screen.getByRole('button', { name: 'Delete role Role number 2' })).toHaveFocus();
+  });
+
+  it('has no axe violations with an active and an inactive row', async () => {
+    mockApi.listRoles.mockResolvedValue([
+      role(1, { agent_name: 'Gopu', required_skills: ['Go', 'PostgreSQL', 'Kubernetes', 'gRPC'] }),
+      role(2, { is_active: false }),
+    ]);
+    const { container } = render(<RolesPage />);
+    await screen.findByRole('list', { name: 'All roles' });
     await expect(container).toHaveNoViolations();
   });
 });

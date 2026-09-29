@@ -111,7 +111,7 @@ export function CandidateHeader({
     >
       <div className="min-w-0">
         {eyebrow && (
-          <p className="mb-1 text-[13px] font-medium text-[var(--c-ink-secondary)]">
+          <p className="mb-1 text-label font-medium text-[var(--c-ink-secondary)]">
             {eyebrow}
           </p>
         )}
