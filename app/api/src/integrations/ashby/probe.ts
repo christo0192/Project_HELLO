@@ -4,7 +4,9 @@
  * An Ashby mapping can only ever be enabled once it carries both the AI and TA
  * screening stage ids (a DB CHECK enforces that). Those ids are tenant data
  * that nobody can type from memory, and there was no way to discover them
- * without direct SQL. This is that discovery step.
+ * without direct SQL. This is that discovery step. The same holds for the job
+ * id a mapping is keyed on: the job directory read ({@link probeJobDirectory})
+ * lets an admin pick a job by name instead of pasting an opaque id.
  *
  * READ-ONLY BY CONSTRUCTION, not by convention:
  *  - `PROBE_READ_OPERATIONS` is an explicit allowlist, and `assertReadOnly`
@@ -15,20 +17,24 @@
  *  - There is no caller-controlled URL: the path comes from the fixed
  *    operation registry and the origin is the allowlisted Ashby origin.
  *
- * SANITIZATION: only opaque stage/interview ids and short display titles cross
- * this boundary. Candidate names, emails, phone numbers, resume handles,
- * feedback content, and raw provider bodies are never read or returned.
+ * SANITIZATION: only opaque stage/interview/job ids, short display titles, and
+ * a job's closed-vocabulary status and open date cross this boundary.
+ * Candidate names, emails (including the hiring-team emails a job carries),
+ * phone numbers, resume handles, feedback content, and raw provider bodies are
+ * never read or returned.
  */
 
-import { ASHBY_OPERATIONS, type AshbyOperation, type OpaqueRecord } from './types.js';
+import { ASHBY_OPERATIONS, type AshbyOperation, type JobListParams, type OpaqueRecord } from './types.js';
 
 /**
  * The ONLY operations the probe may perform. Every one is `mutation: false`.
  * `feedbackFormDefinition.info` returns a form's STRUCTURE (sections, fields,
  * types, scales) and no submitted feedback — it is what makes the scorecard
- * auto-binder and the Mission Control binding preview possible.
+ * auto-binder and the Mission Control binding preview possible. `job.list` is
+ * the job directory behind the "Add mapping" picker; the probe copies four
+ * named fields off each job and nothing else (see {@link probeJobDirectory}).
  */
-export const PROBE_READ_OPERATIONS = ['jobInterviewPlan.info', 'feedbackFormDefinition.info'] as const;
+export const PROBE_READ_OPERATIONS = ['jobInterviewPlan.info', 'feedbackFormDefinition.info', 'job.list'] as const;
 export type ProbeReadOperation = (typeof PROBE_READ_OPERATIONS)[number];
 
 /**
@@ -558,4 +564,169 @@ export async function probeFeedbackFormDefinition(
   assertReadOnly('feedbackFormDefinition.info');
   const res = await reader.feedbackFormDefinitionInfo(feedbackFormDefinitionId);
   return extractFormDefinition(res.results);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  Job directory
+//
+//  WHY: a mapping is keyed on Ashby's opaque job id, and asking an admin to
+//  paste one invites a typo that maps the wrong job. The Mission Control
+//  "Add mapping" picker lists jobs BY NAME instead; this is its source.
+//
+//  SCOPE — one allowlisted READ (`job.list`), paged and bounded. A job in that
+//  payload carries far more than a picker needs: its `hiringTeam` (people's
+//  names and emails), `customFields`, locations, compensation. None of it is
+//  read. Each entry is rebuilt from four named keys, so a sibling the provider
+//  adds later is unreachable, not merely filtered.
+//
+//  CONFIDENTIAL JOBS ARE WITHHELD. Ashby restricts a confidential job — whose
+//  title alone can disclose a reorg or a replacement hire — to the users it
+//  was explicitly shared with. The API key reads straight through that
+//  restriction and every admin of this app can open the picker, so listing
+//  the job here would WIDEN the audience Ashby deliberately narrowed.
+//  POST /mappings still accepts any valid job id; this surface simply never
+//  advertises a confidential one.
+//
+//  PARTIAL IS NOT FAILURE. A bound (pages, items), a repeated cursor, or a
+//  "more data" page with no cursor stops the walk with `truncated: true` and
+//  returns what was read — an admin still gets a usable picker, and the flag
+//  lets the UI say the list is incomplete. A provider error, by contrast,
+//  propagates: the route answers 502 rather than presenting an empty
+//  directory as the truth.
+// ════════════════════════════════════════════════════════════════════════════
+
+/** Ashby's job lifecycle vocabulary. Any other value is reported as `null`. */
+export type ProbeJobStatus = 'Draft' | 'Open' | 'Closed' | 'Archived';
+
+/** One sanitized directory entry: four fields, each copied by name. */
+export interface ProbeJob {
+  /** Opaque Ashby job id — what a mapping's `external_job_id` stores. */
+  id: string;
+  title: string | null;
+  status: ProbeJobStatus | null;
+  /** ISO-8601, or `null` when the payload carried no parseable date. */
+  openedAt: string | null;
+}
+
+export interface ProbeJobDirectory {
+  /** Sorted by title (case/accent-insensitive); untitled jobs last. */
+  jobs: ProbeJob[];
+  /** True when the walk stopped before the provider said it was done. */
+  truncated: boolean;
+}
+
+/** Reader seam for one `job.list` page — satisfied by AshbyClient. */
+export interface JobListReader {
+  jobList<T = OpaqueRecord[]>(params?: JobListParams): Promise<{
+    results: T;
+    moreDataAvailable: boolean;
+    nextCursor?: string;
+  }>;
+}
+
+const JOB_PAGE_SIZE = 100;
+const MAX_JOB_PAGES = 20;
+const MAX_JOBS = 2000;
+/** An ISO-8601 timestamp is ~30 chars; anything far longer is not a date. */
+const MAX_DATE_LEN = 64;
+const JOB_STATUSES: ReadonlySet<string> = new Set<ProbeJobStatus>(['Draft', 'Open', 'Closed', 'Archived']);
+
+function jobStatus(raw: unknown): ProbeJobStatus | null {
+  return typeof raw === 'string' && JOB_STATUSES.has(raw) ? (raw as ProbeJobStatus) : null;
+}
+
+/** A parseable date string, normalised to ISO-8601. Never a guess. */
+function isoDate(raw: unknown): string | null {
+  if (typeof raw !== 'string' || raw.length === 0 || raw.length > MAX_DATE_LEN) return null;
+  const ms = Date.parse(raw);
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+}
+
+/**
+ * Whether a job must be withheld. An explicit `true` withholds; so does a flag
+ * that is present but not `false` — a restriction this code cannot read is
+ * treated as a restriction. Only an absent flag or an explicit `false` lists
+ * the job.
+ */
+function isConfidential(raw: unknown): boolean {
+  return raw !== undefined && raw !== false;
+}
+
+/** Caps may only TIGHTEN a bound (tests); they can never widen one. */
+function tightenCap(raw: number | undefined, ceiling: number): number {
+  return typeof raw === 'number' && Number.isInteger(raw) && raw >= 1 ? Math.min(raw, ceiling) : ceiling;
+}
+
+/** Title order, case- and accent-insensitive; untitled last; id breaks ties. */
+function byTitle(a: ProbeJob, b: ProbeJob): number {
+  if (a.title !== null && b.title !== null) {
+    const order = a.title.localeCompare(b.title, 'en', { sensitivity: 'base' });
+    if (order !== 0) return order;
+  } else if (a.title !== b.title) {
+    return a.title === null ? 1 : -1;
+  }
+  return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
+}
+
+/**
+ * List the tenant's job directory for the mapping picker. Pages `job.list`
+ * with no filter (whether the endpoint honours one is unverified), keeps only
+ * id/title/status/openedAt per job, withholds confidential jobs, and dedupes
+ * by id. Never writes anything, anywhere.
+ */
+export async function probeJobDirectory(
+  reader: JobListReader,
+  caps: { maxPages?: number; maxItems?: number } = {},
+): Promise<ProbeJobDirectory> {
+  assertReadOnly('job.list');
+  const maxPages = tightenCap(caps.maxPages, MAX_JOB_PAGES);
+  const maxItems = tightenCap(caps.maxItems, MAX_JOBS);
+
+  const jobs = new Map<string, ProbeJob>();
+  // An id seen confidential ONCE stays withheld, even if a later page (the
+  // directory can shift under a paged read) shows it without the flag.
+  const withheld = new Set<string>();
+  const seenCursors = new Set<string>();
+  let cursor: string | undefined;
+  let truncated = false;
+
+  for (let page = 1; ; page += 1) {
+    const res = await reader.jobList(
+      cursor === undefined ? { limit: JOB_PAGE_SIZE } : { cursor, limit: JOB_PAGE_SIZE },
+    );
+    const items: unknown[] = Array.isArray(res.results) ? res.results : [];
+    for (const item of items) {
+      if (item === null || typeof item !== 'object' || Array.isArray(item)) continue;
+      const rec = item as Record<string, unknown>;
+      const id = typeof rec.id === 'string' && ID_RE.test(rec.id) ? rec.id : null;
+      if (id === null) continue;
+      if (isConfidential(rec.confidential)) {
+        withheld.add(id);
+        jobs.delete(id);
+        continue;
+      }
+      if (withheld.has(id) || jobs.has(id)) continue;
+      if (jobs.size >= maxItems) { truncated = true; break; }
+      jobs.set(id, {
+        id,
+        title: sanitizeTitle(rec.title),
+        status: jobStatus(rec.status),
+        openedAt: isoDate(rec.openedAt),
+      });
+    }
+    if (truncated || !res.moreDataAvailable) break;
+
+    // The provider says there is more. Anything that stops us now leaves the
+    // directory partial, and the flag says so.
+    const next = res.nextCursor;
+    if (typeof next !== 'string' || next.length === 0
+        || seenCursors.has(next) || page >= maxPages || jobs.size >= maxItems) {
+      truncated = true;
+      break;
+    }
+    seenCursors.add(next);
+    cursor = next;
+  }
+
+  return { jobs: [...jobs.values()].sort(byTitle), truncated };
 }

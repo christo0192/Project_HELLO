@@ -38,9 +38,17 @@ makes **no** claim of tenant validation or live Ashby connectivity.
 ## Endpoints (for tenant probing only)
 
 `application.info`, `application.list`, `candidate.info`, `file.info`,
-`jobInterviewPlan.info`, `feedbackFormDefinition.info`,
+`jobInterviewPlan.info`, `feedbackFormDefinition.info`, `job.list`,
 `applicationFeedback.list`, `applicationFeedbackRequest.create`,
 `applicationFeedback.submit`, and `application.changeStage`.
+
+`job.list` (read; needs the `jobsRead` permission) is the job directory behind
+the Mission Control "Add mapping" picker (`GET …/mission-control/jobs`). The
+`jobList` helper sends no status filter — whether the endpoint honours one is
+unverified — so the probe pages the whole directory (bounded at 20 pages /
+2000 jobs) and copies only each job's id, title, status and `openedAt`.
+Confidential jobs are withheld, and `hiringTeam` (people's emails),
+`customFields` and every other job field are never read.
 
 `feedbackFormDefinition.info` (read; needs the `hiringProcessMetadataRead`
 scope) returns one form's STRUCTURE — sections, fields, types, paths, and

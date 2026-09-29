@@ -498,14 +498,36 @@ body .text-red-700 { color: var(--error-text); }
   animation: slide-over-in 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
-/* The drawer still APPEARS — only the travel is dropped, and the animation is
-   removed rather than merely paused. `animation: none` alone would be wrong
-   here: the `both` fill mode holds the FIRST keyframe, which would park the
-   panel 2rem off-target at `opacity: 0` — an invisible drawer for exactly the
-   users this rule exists to serve. The two resets below are what actually
-   put it in place. */
+/* Dialog — the centred panel settles in: a short fade and a slight scale,
+   again `transform` and `opacity` only. Shorter than the drawer because it
+   travels no distance. The final keyframe is `transform: none`, not
+   `scale(1)`, for the reason `fade-up` gives above: under `both` fill mode a
+   retained transform makes the panel a containing block for any
+   `position: fixed` descendant. */
+@keyframes dialog-in {
+  from {
+    transform: scale(0.97);
+    opacity: 0;
+  }
+  to {
+    transform: none;
+    opacity: 1;
+  }
+}
+
+.dialog-panel {
+  animation: dialog-in 160ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* The drawer and the dialog still APPEAR — only the motion is dropped, and
+   the animation is removed rather than merely paused. `animation: none` alone
+   would be wrong here: the `both` fill mode holds the FIRST keyframe, which
+   would park the panel off-target (2rem aside, or scaled down) at
+   `opacity: 0` — an invisible modal for exactly the users this rule exists to
+   serve. The two resets below are what actually put it in place. */
 @media (prefers-reduced-motion: reduce) {
-  .slide-over-panel {
+  .slide-over-panel,
+  .dialog-panel {
     animation: none;
     transform: none;
     opacity: 1;

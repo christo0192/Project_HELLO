@@ -641,11 +641,33 @@ export interface MissionControlInviteIssue {
   revokedInvites?: number;
 }
 
+/**
+ * Outcome of archiving ("deleting") a mapping (0109). `ok` covers a repeat
+ * archive too (`alreadyArchived: true`); `mapping_enabled` means pause first.
+ * Open-ended because the RPC owns the vocabulary (e.g. `actor_required`).
+ */
+export interface MissionControlArchiveResult {
+  status: 'ok' | 'mapping_enabled' | 'not_found' | (string & {});
+  alreadyArchived?: boolean;
+}
+
 export interface MissionControlStore {
+  /** Live (non-archived) mappings only — an archived mapping is "deleted". */
   listMappings(limit: number): Promise<MissionControlMapping[]>;
   listWorkflows(limit: number): Promise<MissionControlWorkflow[]>;
-  /** Create/update a mapping. Always lands `paused`; never enables. */
-  upsertMapping(input: MissionControlMappingUpsert): Promise<{ status: string; id?: string }>;
+  /**
+   * Create/update a mapping. Always lands `paused`; never enables. A create
+   * for a job whose mapping was archived restores that row (0109) and reports
+   * `restored: true` with the same id.
+   */
+  upsertMapping(input: MissionControlMappingUpsert): Promise<{ status: string; id?: string; restored?: boolean }>;
+  /**
+   * "Delete" a mapping from Mission Control by ARCHIVING it (0109). The row and
+   * every candidate link to it are kept; it only stops being listed and can
+   * never be enabled again. Refusing an enabled mapping, the idempotent repeat
+   * and the audit row are all decided inside the RPC.
+   */
+  archiveMapping(mappingId: string, actorId: string): Promise<MissionControlArchiveResult>;
   /**
    * Atomically revoke every prior active invite for the application's session
    * and issue exactly one new one, storing ONLY the supplied digest. The
@@ -738,6 +760,13 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
         .from('ashby_job_mappings')
         .select('id, external_job_id, status, status_reason, delivery_mode, ai_screening_stage_id, ta_screening_stage_id, label, updated_at')
         .eq('provider', 'ashby')
+        // An archived mapping is what Mission Control calls "deleted" (0109).
+        // The row is kept on purpose — candidate links, funnel attribution
+        // and backlog-import history still point at it — so hiding it from
+        // this list is the whole of the delete as far as a user can see. It
+        // is filtered HERE, in the query, so the limit counts only live rows
+        // and no caller can forget to drop it.
+        .is('archived_at', null)
         .order('updated_at', { ascending: false })
         .limit(limit);
       if (error) throw new Error('ashby_mc_mappings_error');
@@ -917,7 +946,31 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
         p_actor_id: input.actorId,
       });
       if (error) throw new Error('ashby_mc_upsert_mapping_error');
-      return { status: statusOf(data), id: (data as { id?: string } | null)?.id };
+      const row = data as { id?: string; restored?: unknown } | null;
+      return {
+        status: statusOf(data),
+        id: row?.id,
+        // 0109: a create for a job whose mapping was archived brings that same
+        // row back (paused) rather than inserting a second one.
+        ...(typeof row?.restored === 'boolean' ? { restored: row.restored } : {}),
+      };
+    },
+    async archiveMapping(mappingId, actorId) {
+      // 0109. "Delete" is an ARCHIVE, never a row delete: a hard delete would
+      // null the mapping out of every candidate link it imported (ON DELETE
+      // SET NULL) or be refused outright by the backlog-import FK. Refusing an
+      // enabled mapping, the idempotent repeat and the audit row are all
+      // decided inside the RPC. Nothing here can widen it.
+      const { data, error } = await client.rpc('archive_ashby_job_mapping', {
+        p_mapping_id: mappingId,
+        p_actor_id: actorId,
+      });
+      if (error) throw new Error('ashby_mc_archive_mapping_error');
+      const already = (data as { already_archived?: unknown } | null)?.already_archived;
+      return {
+        status: statusOf(data),
+        ...(typeof already === 'boolean' ? { alreadyArchived: already } : {}),
+      };
     },
   };
 }

@@ -10,15 +10,21 @@
  * sanitized codes only; NEVER candidate PII, invite tokens, presigned URLs,
  * transcripts, or recordings):
  *   GET  /mappings                 — job mappings incl. paused/drift + completeness
+ *                                    (archived — i.e. deleted — mappings excluded)
  *   GET  /workflows                — application workflows incl. pending/expired/
  *                                    failed_review/cancelled/withdrawn/delivery/
  *                                    writeback states
  *   POST /mappings/:id/pause       — admin: pause a mapping
  *   POST /mappings/:id/resume      — admin: resume (enable) a complete, non-drift mapping
+ *   POST /mappings/:id/archive     — admin: "delete" a PAUSED mapping by archiving
+ *                                    it (0109); history kept, enabled → 409
  *   POST /workflows/:id/cancel     — admin: atomic terminal cancellation
  *   POST /operations/:id/retry     — admin: retry a failed safe operation
  *   POST /ingestions/:linkId/retry — admin: bounded, audited retry of ONE
  *                                    parse-class failed_review ingestion
+ *   GET  /jobs                     — admin: read-only job directory for the
+ *                                    "Add mapping" picker (id/title/status/
+ *                                    openedAt only; confidential jobs withheld)
  *   GET  /jobs/:externalJobId/stages         — admin: read-only stage discovery
  *   GET  /jobs/:externalJobId/feedback-form  — admin: read-only feedback-form
  *                                    SCHEMA discovery (ids/labels/types/scales;
@@ -44,8 +50,11 @@ import {
   probeJobStages,
   probeJobFeedbackForms,
   probeFeedbackFormDefinition,
+  probeJobDirectory,
   type FormDefinitionReader,
+  type JobListReader,
 } from '../integrations/ashby/probe.js';
+import { HELLO_CHRISTY_SCREENING_STAGE_ID } from '../integrations/ashby/screening-stage.js';
 import { createAshbyProbeClient } from '../integrations/ashby/runtime.js';
 import { HELLO_CHRISTY_SCORECARD_BINDING } from '../integrations/ashby/scorecard.js';
 import { previewScorecardBinding, withRoleFit, type MetricToBind } from '../integrations/ashby/scorecard-autobind.js';
@@ -121,6 +130,12 @@ export interface AshbyMissionControlDeps {
    */
   formDefinitionReader?: FormDefinitionReader | null;
   /**
+   * Injected read-only reader for the job directory (`job.list`) behind the
+   * "Add mapping" picker. Production uses the same gated probe client; an
+   * explicit `null` means "disabled" (tests), and so does `probeReader: null`.
+   */
+  jobListReader?: JobListReader | null;
+  /**
    * Injected role/metric lookups for the binding preview (tests). Production
    * reads the mapping's role and the role's ACTIVE scorecard version.
    */
@@ -194,6 +209,14 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     if (deps.probeReader === null) return null;
     return resolveProbeClient();
   };
+  // The job directory reads through that same gated client, and the same
+  // `probeReader: null` seam closes it — a disabled integration can never
+  // have a real client built behind the picker.
+  const resolveJobListReader = (): JobListReader | null => {
+    if (deps.jobListReader !== undefined) return deps.jobListReader;
+    if (deps.probeReader === null) return null;
+    return resolveProbeClient();
+  };
   const scorecardPreview = deps.scorecardPreview ?? {
     async readMappingRoleId(mappingId: string): Promise<string | null | undefined> {
       const { data, error } = await supabase
@@ -260,6 +283,39 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
 
   router.post('/mappings/:id/pause', requireRole('admin'), (req, res) => { void setStatus(req, res, 'paused'); });
   router.post('/mappings/:id/resume', requireRole('admin'), (req, res) => { void setStatus(req, res, 'enabled'); });
+
+  // "Delete" a mapping (owner decision 2026-09-29). It ARCHIVES: the row and
+  // every candidate's link to it are kept, it drops out of GET /mappings, and
+  // it can never be enabled again (0109). An ENABLED mapping is refused with
+  // 409 `mapping_enabled` — pause first — so live screening is never switched
+  // off by one click. A repeat is idempotent (200, already_archived: true).
+  // Adding the same Ashby job again through POST /mappings restores the row,
+  // paused. Viewers are already refused non-GET verbs by the global
+  // viewer-read-only middleware, exactly as for /pause.
+  router.post('/mappings/:id/archive', requireRole('admin'), async (req: Request, res: Response) => {
+    const id = req.params.id;
+    if (!UUID_RE.test(id)) { res.status(400).json({ ok: false, error: 'invalid_mapping_id' }); return; }
+    const actorId = req.authUser?.id ?? null;
+    if (!actorId) { res.status(403).json({ ok: false, error: 'forbidden' }); return; }
+    try {
+      const result = await store().archiveMapping(id, actorId);
+      if (result.status === 'ok') {
+        const alreadyArchived = result.alreadyArchived === true;
+        // The RPC already wrote its own audit_events row in the same
+        // transaction; this is the request-level trail. Opaque id only.
+        await recordAudit(req, 'resource.delete', 200, {
+          metadata: { resource: 'ashby_mapping', mapping_id: id, already_archived: alreadyArchived },
+        });
+        res.json({ ok: true, already_archived: alreadyArchived });
+        return;
+      }
+      if (result.status === 'not_found') { res.status(404).json({ ok: false, error: 'not_found' }); return; }
+      // mapping_enabled (pause first) and any other RPC refusal → 409 with its code.
+      res.status(409).json({ ok: false, error: result.status });
+    } catch {
+      res.status(500).json({ ok: false, error: 'mission_control_action_error' });
+    }
+  });
 
   router.post('/mappings/:id/backlog/preview', requireRole('admin'), async (req: Request, res: Response) => {
     const id = req.params.id;
@@ -436,6 +492,18 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     if (ai === false || ta === false || form === false || interview === false || attribution === false) {
       res.status(400).json({ ok: false, error: 'invalid_stage_id' }); return;
     }
+    // OWNER DECISION 2026-09-29 (integrations/ashby/screening-stage.ts): the
+    // bot screens in ONE Ashby stage, so the "Add mapping" form no longer asks
+    // for stage ids and a NEW mapping that names none gets the Hello Christy
+    // stage as both its AI and its TA stage (TA only feeds the enable-time
+    // completeness gate — nothing moves a candidate into it). An explicit
+    // valid id is still honoured; an invalid one has already 400'd above.
+    // CREATE ONLY: on an update a missing id must keep the mapping's current
+    // stage (the RPC coalesces null to it), never have this constant written
+    // silently over a stage an admin chose.
+    const isCreate = id === null;
+    const aiStage = ai === null && isCreate ? HELLO_CHRISTY_SCREENING_STAGE_ID : ai;
+    const taStage = ta === null && isCreate ? HELLO_CHRISTY_SCREENING_STAGE_ID : ta;
     const rawLabel = body.label;
     if (rawLabel !== undefined && rawLabel !== null
         && (typeof rawLabel !== 'string' || rawLabel.length > MAX_LABEL_LEN)) {
@@ -449,8 +517,8 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
         roleId,
         ownerId,
         deliveryMode: deliveryMode as 'email' | 'manual' | 'both',
-        aiScreeningStageId: ai,
-        taScreeningStageId: ta,
+        aiScreeningStageId: aiStage,
+        taScreeningStageId: taStage,
         feedbackFormId: form,
         interviewId: interview,
         attributionUserId: attribution,
@@ -467,6 +535,39 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
       res.status(409).json({ ok: false, error: result.status });
     } catch {
       res.status(500).json({ ok: false, error: 'mission_control_action_error' });
+    }
+  });
+
+  // ── Read-only Ashby job directory (admin) ─────────────────────────────────
+  // The source of the "Add mapping" picker: live jobs by NAME, so an admin
+  // never pastes an opaque job id. One allowlisted READ (`job.list`), paged
+  // and bounded, returning id/title/status/openedAt per job with confidential
+  // jobs withheld (see probeJobDirectory). It writes nothing — the admin still
+  // creates the mapping through POST /mappings. `truncated` means a bound
+  // stopped the walk and the list is partial, not that the read failed.
+  //
+  // Registered ahead of the `/jobs/:externalJobId/...` probes. Order is not
+  // what keeps them apart — Express matches `/jobs` exactly and every
+  // job-scoped probe path has two further segments — but reading the literal
+  // path first makes that plain.
+  router.get('/jobs', requireRole('admin'), async (req: Request, res: Response) => {
+    const reader = resolveJobListReader();
+    if (!reader) {
+      // Runtime gates closed → no client is constructed and no call is made.
+      res.status(503).json({ ok: false, error: 'integration_disabled' }); return;
+    }
+    try {
+      const result = await probeJobDirectory(reader);
+      // COUNTS only. A job id is tenant configuration and a job title can
+      // itself be sensitive; neither belongs in an audit row or a log.
+      await recordAudit(req, 'resource.read', 200, {
+        metadata: { resource: 'ashby_jobs', count: result.jobs.length, truncated: result.truncated },
+      });
+      res.json({ ok: true, jobs: result.jobs, truncated: result.truncated });
+    } catch {
+      // A tenant 401/403 (e.g. a key without `jobsRead`) or an unparseable
+      // body is a sanitized capability failure. Never echo the provider body.
+      res.status(502).json({ ok: false, error: 'probe_unavailable' });
     }
   });
 

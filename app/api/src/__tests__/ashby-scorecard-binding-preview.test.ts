@@ -114,6 +114,7 @@ function fakeStore(): MissionControlStore {
     cancelApplication: async () => ({ status: 'ok', cancelledOperations: 0, cancelledIngestion: 0 }),
     retryOperation: async () => ({ status: 'ok' }), retryIngestionParse: async () => ({ status: 'ok' }),
     retryLegacyBadOutput: async () => ({ status: 'ok' }), retryModelDegraded: async () => ({ status: 'ok' }),
+    archiveMapping: async () => ({ status: 'ok', alreadyArchived: false }),
     upsertMapping: async () => ({ status: 'ok', id: MAPPING_ID }),
     reissueManualInvite: async () => ({ status: 'ok', inviteId: MAPPING_ID, revokedInvites: 0 }),
   } as unknown as MissionControlStore;

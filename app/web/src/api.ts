@@ -19,9 +19,11 @@ import type {
   AdminAllowlistUpdateResponse,
   AshbyMappingInput,
   AshbyMappingCreated,
+  AshbyJobsResponse,
   AshbyMcMappingsResponse,
   AshbyMcWorkflowsResponse,
   AshbyMcActionResponse,
+  AshbyMcArchiveResponse,
   AshbyManualInviteResponse,
   AshbyFeedbackFormResponse,
   AshbyScorecardBindingPreviewResponse,
@@ -580,6 +582,14 @@ export const api = {
   listAshbyWorkflows: () =>
     request<AshbyMcWorkflowsResponse>('/api/integrations/ashby/mission-control/workflows'),
   /**
+   * The live Ashby job list (admin-gated server side): every status,
+   * confidential jobs already removed. The add-mapping dialog offers only the
+   * `Open` ones; the mapping rows use all of them to name a job instead of
+   * showing its id. A live provider read, so callers treat it as best effort.
+   */
+  listAshbyJobs: () =>
+    request<AshbyJobsResponse>('/api/integrations/ashby/mission-control/jobs'),
+  /**
    * Create (or update) an Ashby job -> role mapping. ALWAYS lands paused.
    *
    * The endpoint has existed since the integration shipped and nothing called
@@ -599,6 +609,17 @@ export const api = {
     }),
   resumeAshbyMapping: (id: string) =>
     request<AshbyMcActionResponse>(`/api/integrations/ashby/mission-control/mappings/${id}/resume`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+  /**
+   * "Delete" a mapping: the route ARCHIVES it — gone from the list, history
+   * kept, and re-adding the same job later restores it paused. The database
+   * refuses an ENABLED mapping (`mapping_enabled`, 409); pause it first.
+   * Every refusal throws `ApiError` with the route's code as its message.
+   */
+  archiveAshbyMapping: (id: string) =>
+    request<AshbyMcArchiveResponse>(`/api/integrations/ashby/mission-control/mappings/${id}/archive`, {
       method: 'POST',
       body: JSON.stringify({}),
     }),

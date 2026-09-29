@@ -1,8 +1,9 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import type {
   Role,
+  AshbyJob,
   AshbyMcMapping,
   AshbyMcWorkflow,
   AshbyFeedbackForm,
@@ -13,6 +14,7 @@ import type {
 import {
   Button,
   buttonClass,
+  Dialog,
   EmptyPanel,
   GlassPanel,
   InlineNotice,
@@ -35,6 +37,27 @@ import type { StatusTone } from '../components/design';
  * hand-off. All LIST data is sanitized by the API: no candidate PII, invite
  * tokens, presigned URLs, or transcripts. The APIs are authoritative; this UI
  * is admin-gated for UX only.
+ *
+ * ADDING A MAPPING: `Add mapping` opens a dialog with exactly two pickers — a
+ * live OPEN Ashby job, shown by name, and an active dashboard role. There is
+ * no stage field and no free-text label: the route fixes the screening stage
+ * on create, and the label is simply the job's own title. A new mapping saves
+ * PAUSED; Resume stays the separate, database-gated switch.
+ *
+ * DELETING A MAPPING: `Delete` ARCHIVES it. The row leaves this list, but the
+ * calls, scores and history of every candidate it screened are kept, and
+ * adding the same job again later brings the mapping back, paused. The
+ * database refuses to archive an ENABLED mapping, so the button stays disabled
+ * until the mapping is paused and says why in words, and it always asks
+ * first, in a dialog that names the job.
+ *
+ * JOB NAMES, NEVER JOB IDS: an Ashby job id means nothing to the person
+ * reading this page, and typing one by hand is how a mapping lands on the
+ * wrong job with nothing on screen to show it. Rows name each job from the
+ * live job list (falling back to the title saved as its label), and the
+ * picker's option values are list positions, so no job id is rendered
+ * anywhere — not as text, not in an option `value`, not in a `title` tooltip.
+ * The ids stay inside handlers, where the API needs them.
  *
  * INVITE HANDLING: `Get invite link` calls the admin-only delivery endpoint,
  * which returns a one-time candidate URL. That URL is held in component state
@@ -70,6 +93,29 @@ const PILL =
   'inline-flex items-center whitespace-nowrap rounded-full bg-ink/[0.05] px-2 py-0.5 text-xs text-ink-secondary';
 /** Above this many rows the workflow list scrolls instead of running down the page. */
 const WORKFLOW_SCROLL_AFTER = 6;
+/**
+ * The add-mapping dialog's native selects. `w-full min-w-0` because a native
+ * select otherwise sizes itself to its LONGEST option, and one long job title
+ * would push the dialog wider than a phone screen.
+ */
+const SELECT =
+  'h-10 w-full min-w-0 rounded-control border border-glass-ring bg-surface px-3 text-sm text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface-secondary disabled:cursor-not-allowed disabled:opacity-60';
+/**
+ * The route's cap on a mapping `label` (its `MAX_LABEL_LEN`, counted in UTF-16
+ * units like `String.length`). A longer job title would be refused whole as
+ * `invalid_label`, so it is cut here instead.
+ */
+const MAX_MAPPING_LABEL = 120;
+/**
+ * Why an ENABLED mapping's Delete is disabled — the button's `title` and the
+ * visible line under its row's actions, one string so the two cannot drift.
+ */
+const PAUSE_BEFORE_DELETE = 'Pause this mapping before deleting it';
+/**
+ * The `id` of that line, by the row's list POSITION — like the picker's
+ * option values, so no id of any kind is written into the markup.
+ */
+const deleteHintId = (row: number): string => `ashby-mapping-delete-hint-${row}`;
 
 export function AshbyMissionControlPage() {
   const [mappings, setMappings] = useState<AshbyMcMapping[]>([]);
@@ -82,16 +128,61 @@ export function AshbyMissionControlPage() {
    * way to notice — the id never appears on screen again.
    */
   const [roles, setRoles] = useState<Role[]>([]);
-  const [showNewMapping, setShowNewMapping] = useState(false);
-  const [newMapping, setNewMapping] = useState({
-    external_job_id: '',
-    role_id: '',
-    ai_screening_stage_id: '',
-    ta_screening_stage_id: '',
-    label: '',
-  });
+  /**
+   * The live Ashby job list — every status, for naming mapping rows; the
+   * dialog's picker narrows it to `Open`. `null` until the first read lands,
+   * which is what lets a row say it is still loading rather than claim the
+   * name is unavailable while Ashby is merely slow to answer.
+   */
+  const [jobs, setJobs] = useState<AshbyJob[] | null>(null);
+  const [jobsStatus, setJobsStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [jobsError, setJobsError] = useState<string | null>(null);
+  const [jobsTruncated, setJobsTruncated] = useState(false);
+  /**
+   * Only the LATEST jobs read may land. The page-load read and the one the
+   * dialog fires on open can overlap, and an older failure must not
+   * overwrite a newer list — or an older list a newer failure.
+   */
+  const jobsRequest = useRef(0);
+  const [dialogOpen, setDialogOpen] = useState(false);
+  /** Focus returns here when the dialog closes; `useModal` says why the caller owns it. */
+  const addMappingTrigger = useRef<HTMLButtonElement | null>(null);
+  /**
+   * `jobKey` is a POSITION in the picker's current list, not a job id — that
+   * is what keeps the id out of the DOM. A position only means something
+   * against the list it was picked from, so every jobs read clears it.
+   */
+  const [draft, setDraft] = useState({ jobKey: '', roleId: '' });
   const [creating, setCreating] = useState(false);
   const [createError, setCreateError] = useState<string | null>(null);
+  /**
+   * The mapping the Delete confirmation is about. A SNAPSHOT of the row, not
+   * an id looked up in `mappings`: a reload after `not_found` drops the row
+   * from the list, and the open dialog must go on naming the job it asked
+   * about.
+   */
+  const [deleteTarget, setDeleteTarget] = useState<AshbyMcMapping | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  /**
+   * `retryable: false` when pressing Delete again cannot succeed — the
+   * mapping is already gone, or is enabled — so the confirm button turns off
+   * and Cancel is the way out.
+   */
+  const [deleteError, setDeleteError] = useState<{ message: string; retryable: boolean } | null>(
+    null,
+  );
+  /**
+   * Where focus goes when the Delete confirmation closes.
+   *
+   * ONE ref, pointed at the clicked Delete button from its own click handler
+   * (`e.currentTarget`) — not a ref per row. `Button` does not forward refs,
+   * so a per-row ref map would mean hand-rolling six plain `<button>`s per
+   * row; and the click is the one moment that knows exactly which row's
+   * button opened the dialog. `useModal` reads the ref at CLOSE, so
+   * `closeDeleteDialog` re-points it first whenever that button can no
+   * longer take focus.
+   */
+  const deleteReturnFocus = useRef<HTMLElement | null>(null);
   const [workflows, setWorkflows] = useState<AshbyMcWorkflow[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -152,6 +243,79 @@ export function AshbyMissionControlPage() {
   useEffect(() => {
     void load();
   }, [load]);
+
+  /**
+   * Read the live job list. Best effort, like roles: a failure costs the job
+   * names and the picker, never the page. It runs on page load for the row
+   * names, and again every time the dialog opens because the list is LIVE —
+   * a job opened in Ashby a minute ago should be pickable without a reload.
+   * Deliberately not part of `load()`: that runs after every row action, and
+   * a pause should not cost a provider read.
+   */
+  const loadJobs = useCallback(async () => {
+    const ticket = ++jobsRequest.current;
+    setJobsStatus('loading');
+    setJobsError(null);
+    setDraft((d) => ({ ...d, jobKey: '' }));
+    try {
+      const res = await api.listAshbyJobs();
+      if (ticket !== jobsRequest.current) return;
+      setJobs(res.jobs ?? []);
+      setJobsTruncated(res.truncated === true);
+      setJobsStatus('ready');
+    } catch (e) {
+      if (ticket !== jobsRequest.current) return;
+      setJobsError(jobsErrorCopy(e));
+      setJobsStatus('error');
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadJobs();
+  }, [loadJobs]);
+
+  /** Row names: every job with a usable title, whatever its status. */
+  const jobTitles = useMemo(() => {
+    if (jobs === null) return null;
+    const titles = new Map<string, string>();
+    for (const job of jobs) {
+      const title = job.title?.trim();
+      if (title) titles.set(job.id, title);
+    }
+    return titles;
+  }, [jobs]);
+  /** The first jobs read is still in flight — "unavailable" would be a false alarm. */
+  const jobsPending = jobTitles === null && jobsStatus === 'loading';
+
+  /**
+   * The picker: OPEN jobs only, in the API's title order, each labelled
+   * uniquely without an id. A job that is already mapped stays LISTED but
+   * disabled — dropping it would read as "Ashby has no such job" to an admin
+   * looking for it.
+   */
+  const jobOptions = useMemo(() => {
+    const open = (jobs ?? []).filter((job) => job.status === 'Open');
+    const labels = jobOptionLabels(open);
+    const mapped = new Set(mappings.map((m) => m.externalJobId));
+    return open.map((job, i) => ({ job, label: labels[i], mapped: mapped.has(job.id) }));
+  }, [jobs, mappings]);
+
+  const chosenJob = draft.jobKey === '' ? null : (jobOptions[Number(draft.jobKey)] ?? null);
+  const canSave = chosenJob !== null && !chosenJob.mapped && draft.roleId !== '';
+  const noOpenJobs = jobsStatus === 'ready' && jobOptions.length === 0;
+  const jobsClipped = jobsStatus === 'ready' && jobsTruncated;
+  /** Whatever sits under the job picker also DESCRIBES it, for a screen reader. */
+  const hasJobNote = jobsStatus === 'error' || noOpenJobs || jobsClipped;
+
+  /** Each opening is a fresh form over a fresh read of the job list. */
+  const openDialog = useCallback(() => {
+    setDraft({ jobKey: '', roleId: '' });
+    setCreateError(null);
+    setDialogOpen(true);
+    void loadJobs();
+  }, [loadJobs]);
+
+  const closeDialog = useCallback(() => setDialogOpen(false), []);
 
   const run = useCallback(
     async (action: () => Promise<{ ok: boolean; error?: string }>) => {
@@ -300,27 +464,26 @@ export function AshbyMissionControlPage() {
    * absence of drift.
    */
   const createMapping = useCallback(async () => {
-    if (creating) return;
+    if (creating || !chosenJob || chosenJob.mapped || !draft.roleId) return;
     setCreateError(null);
     setCreating(true);
     try {
+      // The job's own title becomes the label — trimmed, cut to the route's
+      // cap, and OMITTED when Ashby gave the job no title. It is what a row
+      // falls back to when the live job list cannot be read.
+      const label = chosenJob.job.title?.trim().slice(0, MAX_MAPPING_LABEL).trim();
       // The return value is unused on purpose: success is the ABSENCE of a
       // throw, since `apiClient.request` raises on every non-2xx. `npm run
       // build` uses a stricter tsconfig than `test:typecheck` and refused the
       // dead binding — the gate that catches this is the build, not the
       // typecheck.
       await api.createAshbyMapping({
-        external_job_id: newMapping.external_job_id.trim(),
-        role_id: newMapping.role_id,
-        // EMPTY BECOMES UNDEFINED, not "". Cosmetic rather than load-bearing:
-        // `optionalOpaqueId` maps "" to null before any regex runs, so the
-        // route would accept a blank string too. (An earlier version of this
-        // comment claimed it answers `invalid_stage_id` for one. It does not —
-        // checked in the route.) Omitting the key is simply the honest way to
-        // say "the admin left this for later".
-        ai_screening_stage_id: newMapping.ai_screening_stage_id.trim() || undefined,
-        ta_screening_stage_id: newMapping.ta_screening_stage_id.trim() || undefined,
-        label: newMapping.label.trim() || undefined,
+        external_job_id: chosenJob.job.id,
+        role_id: draft.roleId,
+        // NO STAGE KEYS, not even as `undefined`. The route defaults both
+        // stage ids on create to the fixed screening stage; the admin has no
+        // stage to choose, so the request has none to carry.
+        ...(label ? { label } : {}),
       });
       // NO `!res.ok` BRANCH. `apiClient.request` throws `ApiError` on every
       // non-2xx, and this route only ever emits `ok:false` with 400/409/500 —
@@ -328,18 +491,13 @@ export function AshbyMissionControlPage() {
       // code (`invalid_external_job_id`) that `mappingErrorCopy` exists to
       // translate. The test that "pinned" the copy mocked a resolved
       // `{ok:false}`, a shape the API layer cannot produce, so it was vacuous.
-      setShowNewMapping(false);
-      setNewMapping({
-        external_job_id: '',
-        role_id: '',
-        ai_screening_stage_id: '',
-        ta_screening_stage_id: '',
-        label: '',
-      });
+      setDialogOpen(false);
+      setDraft({ jobKey: '', roleId: '' });
       await load();
     } catch (err) {
       // The thrown message IS the route's machine code, so translate it here
-      // — this is the only path a failure actually takes.
+      // — this is the only path a failure actually takes. The dialog stays
+      // open with both choices intact, and the reason renders inside it.
       setCreateError(
         err instanceof ApiError
           ? mappingErrorCopy(err.message)
@@ -348,7 +506,64 @@ export function AshbyMissionControlPage() {
     } finally {
       setCreating(false);
     }
-  }, [creating, newMapping, load]);
+  }, [creating, chosenJob, draft.roleId, load]);
+
+  const openDeleteDialog = useCallback((mapping: AshbyMcMapping, trigger: HTMLElement) => {
+    deleteReturnFocus.current = trigger;
+    setDeleteError(null);
+    setDeleteTarget(mapping);
+  }, []);
+
+  /**
+   * Cancel, Close, Escape and the backdrop all land here. Focus goes back to
+   * the row's Delete button when that button can take it. When it cannot —
+   * the row is gone after a reload, or the reload found the mapping enabled
+   * and its Delete is now disabled — `focus()` would fail SILENTLY and strand
+   * the keyboard user on `<body>`, so focus goes to this section's own `Add
+   * mapping` control instead: the nearest stable thing in the same list.
+   */
+  const closeDeleteDialog = useCallback(() => {
+    const trigger = deleteReturnFocus.current;
+    if (!trigger || !document.contains(trigger) || trigger.matches(':disabled')) {
+      deleteReturnFocus.current = addMappingTrigger.current;
+    }
+    setDeleteTarget(null);
+  }, []);
+
+  /**
+   * Archive the mapping ("Delete"). Success is the ABSENCE of a throw, as with
+   * create: the route answers 200 `{ ok, already_archived }` and throws
+   * `ApiError` — its message the route's code — on everything else. A repeat
+   * (`already_archived`) is the outcome the admin asked for, so it is
+   * success too.
+   */
+  const deleteMapping = useCallback(async () => {
+    if (!deleteTarget || deleting) return;
+    setDeleteError(null);
+    setDeleting(true);
+    try {
+      await api.archiveAshbyMapping(deleteTarget.id);
+      // The row is about to leave the list, so its button cannot take focus
+      // back; say where focus goes rather than let it fall to `<body>`.
+      deleteReturnFocus.current = addMappingTrigger.current;
+      setDeleteTarget(null);
+      await load();
+    } catch (err) {
+      const code = err instanceof ApiError ? err.message : undefined;
+      // Either code means the list on screen is WRONG about this row: it is
+      // already gone, or it is enabled after all. Reload so the page tells
+      // the truth — for `mapping_enabled` that is what turns this row's Pause
+      // back on, since a row still showing "paused" has Pause disabled and no
+      // way to follow the advice below. It reloads BEFORE the reason shows,
+      // while the dialog is still busy, so the list is settled by the time
+      // anything can close the dialog and pick a place to return focus.
+      const stale = code === 'not_found' || code === 'mapping_enabled';
+      if (stale) await load();
+      setDeleteError({ message: deleteErrorCopy(code), retryable: !stale });
+    } finally {
+      setDeleting(false);
+    }
+  }, [deleteTarget, deleting, load]);
 
   const mappingTone = (status: string): StatusTone =>
     status === 'enabled' ? 'success' : status === 'drift' ? 'danger' : 'warning';
@@ -520,182 +735,112 @@ export function AshbyMissionControlPage() {
                 ) : undefined
               }
               actions={
-                <Button
+                // A plain button, not `<Button>`: that component does not
+                // forward a ref, and the dialog returns focus HERE on close.
+                <button
+                  ref={addMappingTrigger}
                   type="button"
-                  variant="ghost"
-                  size="sm"
-                  onClick={() => {
-                    setCreateError(null);
-                    setShowNewMapping((open) => !open);
-                  }}
-                  aria-expanded={showNewMapping}
+                  className={buttonClass('ghost', 'sm')}
+                  onClick={openDialog}
+                  aria-haspopup="dialog"
                 >
-                  {showNewMapping ? 'Cancel' : 'Add mapping'}
-                </Button>
+                  Add mapping
+                </button>
               }
             />
 
-            {showNewMapping && (
-              <form
-                className="mt-4 rounded-control border border-glass-ring p-4"
-                onSubmit={(e) => {
-                  e.preventDefault();
-                  void createMapping();
-                }}
-              >
-                {/*
-                  * WHY THIS FORM EXISTS. The endpoint has been there since the
-                  * integration shipped and nothing called it, so pointing a new
-                  * Ashby job at a role meant a hand-rolled authenticated POST.
-                  * A new job title was therefore not self-serve: author the
-                  * role, then ask an engineer.
-                  */}
-                <p className="text-[13px] text-ink-secondary">
-                  Points an Ashby job at a HELLO role. Saves as <strong>paused</strong>;
-                  Resume enables it. <strong>Enter both stage ids now</strong> — the database
-                  refuses to enable a mapping without them, and this form cannot edit a
-                  mapping once it exists.
-                </p>
-
-                <div className="mt-3 grid gap-3 sm:grid-cols-2">
-                  <label className="flex flex-col gap-1">
-                    <span className="text-[13px] font-medium text-ink">Ashby job id</span>
-                    <TextField
-                      value={newMapping.external_job_id}
-                      onChange={(e) =>
-                        setNewMapping((m) => ({ ...m, external_job_id: e.target.value }))
-                      }
-                      placeholder="From the job URL in Ashby"
-                      required
-                    />
-                  </label>
-
-                  <label className="flex flex-col gap-1">
-                    <span className="text-[13px] font-medium text-ink">Role</span>
-                    <select
-                      className="h-10 rounded-control border border-glass-ring bg-surface px-3 text-sm text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface-secondary"
-                      value={newMapping.role_id}
-                      onChange={(e) => setNewMapping((m) => ({ ...m, role_id: e.target.value }))}
-                      required
-                    >
-                      <option value="">Choose a role…</option>
-                      {roles.map((role) => (
-                        <option key={role.id} value={role.id}>
-                          {role.agent_name ? `${role.title} — ${role.agent_name}` : role.title}
-                        </option>
-                      ))}
-                    </select>
-                  </label>
-
-                  <label className="flex flex-col gap-1">
-                    <span className="text-[13px] font-medium text-ink">
-                      AI screening stage id <span className="text-ink-tertiary">(optional)</span>
-                    </span>
-                    <TextField
-                      value={newMapping.ai_screening_stage_id}
-                      onChange={(e) =>
-                        setNewMapping((m) => ({ ...m, ai_screening_stage_id: e.target.value }))
-                      }
-                      placeholder="Needed before this can be enabled"
-                    />
-                  </label>
-
-                  <label className="flex flex-col gap-1">
-                    <span className="text-[13px] font-medium text-ink">
-                      TA screening stage id <span className="text-ink-tertiary">(optional)</span>
-                    </span>
-                    <TextField
-                      value={newMapping.ta_screening_stage_id}
-                      onChange={(e) =>
-                        setNewMapping((m) => ({ ...m, ta_screening_stage_id: e.target.value }))
-                      }
-                      placeholder="Needed before this can be enabled"
-                    />
-                  </label>
-
-                  <label className="flex flex-col gap-1 sm:col-span-2">
-                    <span className="text-[13px] font-medium text-ink">
-                      Label <span className="text-ink-tertiary">(optional, never sensitive)</span>
-                    </span>
-                    <TextField
-                      value={newMapping.label}
-                      onChange={(e) => setNewMapping((m) => ({ ...m, label: e.target.value }))}
-                      placeholder="A display tag, e.g. canary"
-                    />
-                  </label>
-                </div>
-
-                {createError && (
-                  // `text-error-text`, not `text-danger`. Tailwind here defines
-                  // `error`, not `danger`, so `text-danger` compiles to nothing
-                  // and the message rendered as ordinary body ink — it read as
-                  // help text rather than a failure. `Field` already uses this
-                  // token for exactly this.
-                  <p role="alert" className="mt-3 text-[13px] text-error-text">
-                    {createError}
-                  </p>
-                )}
-
-                <div className="mt-4 flex items-center gap-2">
-                  <Button type="submit" size="sm" loading={creating}>
-                    {creating ? 'Saving…' : 'Save mapping'}
-                  </Button>
-                  <span className="text-[13px] text-ink-tertiary">Saves paused.</span>
-                </div>
-              </form>
-            )}
             {loaded && mappings.length === 0 ? (
               <EmptyPanel compact className="mt-4" title="No mappings." />
             ) : (
               <ul className="mt-2">
-                {mappings.map((m) => (
+                {mappings.map((m, i) => (
                   <li key={m.id} className={ROW}>
                     <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
                       <div className="flex min-w-0 flex-wrap items-center gap-2">
-                        <span className="font-mono text-[13px] text-ink">{m.externalJobId}</span>
-                        {m.label && <span className="text-sm text-ink-secondary">{m.label}</span>}
+                        <MappingName mapping={m} jobTitles={jobTitles} jobsPending={jobsPending} />
                         <StatusBadge tone={mappingTone(m.status)}>{m.status}</StatusBadge>
                         {!(m.hasAiStage && m.hasTaStage) && <StatusBadge>incomplete</StatusBadge>}
                         {m.statusReason && (
                           <span className="text-[13px] text-ink-tertiary">{m.statusReason}</span>
                         )}
                       </div>
-                      <div className="flex shrink-0 flex-wrap items-center gap-2">
-                        <Button
-                          size="sm"
-                          disabled={busy || m.status === 'paused'}
-                          onClick={() => run(() => api.pauseAshbyMapping(m.id))}
-                        >
-                          Pause
-                        </Button>
-                        <Button
-                          size="sm"
-                          disabled={busy || m.status === 'enabled' || !(m.hasAiStage && m.hasTaStage)}
-                          onClick={() => run(() => api.resumeAshbyMapping(m.id))}
-                        >
-                          Resume
-                        </Button>
-                        <Button
-                          size="sm"
-                          disabled={busy}
-                          onClick={() => void discoverForm(m.externalJobId)}
-                        >
-                          Discover feedback form
-                        </Button>
-                        <Button
-                          size="sm"
-                          disabled={busy}
-                          onClick={() => void previewBinding(m.id)}
-                        >
-                          Preview scorecard binding
-                        </Button>
-                        <Button
-                          size="sm"
-                          disabled={busy || m.status !== 'enabled'}
-                          onClick={() => void previewBacklog(m.id)}
-                        >
-                          Preview existing backlog
-                        </Button>
+                      {/* The same wrapper on EVERY row, hint or not, so a
+                          status change never remounts the buttons — the
+                          Delete button the dialog returns focus to must be
+                          the node that is still on the page. */}
+                      <div className="flex shrink-0 flex-col items-end gap-1">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <Button
+                            size="sm"
+                            disabled={busy || m.status === 'paused'}
+                            onClick={() => run(() => api.pauseAshbyMapping(m.id))}
+                          >
+                            Pause
+                          </Button>
+                          <Button
+                            size="sm"
+                            disabled={busy || m.status === 'enabled' || !(m.hasAiStage && m.hasTaStage)}
+                            onClick={() => run(() => api.resumeAshbyMapping(m.id))}
+                          >
+                            Resume
+                          </Button>
+                          <Button
+                            size="sm"
+                            disabled={busy}
+                            onClick={() => void discoverForm(m.externalJobId)}
+                          >
+                            Discover feedback form
+                          </Button>
+                          <Button
+                            size="sm"
+                            disabled={busy}
+                            onClick={() => void previewBinding(m.id)}
+                          >
+                            Preview scorecard binding
+                          </Button>
+                          <Button
+                            size="sm"
+                            disabled={busy || m.status !== 'enabled'}
+                            onClick={() => void previewBacklog(m.id)}
+                          >
+                            Preview existing backlog
+                          </Button>
+                          {/*
+                            HOW A DISABLED DELETE SAYS WHY. A `title` alone
+                            reaches almost nobody: a `disabled` button is out
+                            of the tab order, so a keyboard user never lands on
+                            it and never sees the tooltip; touch has no hover;
+                            and screen readers announce `title` unevenly. Text
+                            on the page reaches everyone, so an ENABLED row
+                            gets one short line under its actions, and
+                            `aria-describedby` ties that line to the button —
+                            a screen reader that browses onto the disabled
+                            control hears the reason with it. The `title`
+                            stays for a mouse hover.
+                            Not `aria-disabled` (focusable but inert): that
+                            puts a dead stop in the tab order of every enabled
+                            row, where Pause and Resume beside it are plainly
+                            `disabled` — one row, one convention. The line
+                            shows on enabled rows ONLY, so it costs a paused
+                            list nothing.
+                          */}
+                          <Button
+                            variant="danger"
+                            size="sm"
+                            disabled={busy || m.status === 'enabled'}
+                            title={m.status === 'enabled' ? PAUSE_BEFORE_DELETE : undefined}
+                            aria-describedby={m.status === 'enabled' ? deleteHintId(i) : undefined}
+                            aria-haspopup="dialog"
+                            onClick={(e) => openDeleteDialog(m, e.currentTarget)}
+                          >
+                            Delete
+                          </Button>
+                        </div>
+                        {m.status === 'enabled' && (
+                          <p id={deleteHintId(i)} className="text-[13px] text-ink-tertiary">
+                            {PAUSE_BEFORE_DELETE}
+                          </p>
+                        )}
                       </div>
                     </div>
 
@@ -786,6 +931,176 @@ export function AshbyMissionControlPage() {
           </GlassPanel>
         </RevealItem>
       </RevealGroup>
+
+      {/* OUTSIDE the RevealGroup, at the page root, on purpose: a revealed
+          item can carry a transform while it animates, and a transformed
+          ancestor is the containing block for a `position: fixed` overlay —
+          the dialog would centre on the panel instead of the viewport. */}
+      <Dialog
+        open={dialogOpen}
+        onClose={closeDialog}
+        idPrefix="ashby-mapping"
+        title="Add job mapping"
+        description="Point a live Ashby job at a dashboard role. It saves paused — use Resume to turn it on."
+        returnFocusRef={addMappingTrigger}
+        busy={creating}
+      >
+        <form
+          className="flex flex-col gap-4"
+          onSubmit={(e) => {
+            e.preventDefault();
+            void createMapping();
+          }}
+        >
+          {/*
+            * WHY THIS DIALOG EXISTS. The endpoint shipped with the integration
+            * and nothing called it, so pointing a new Ashby job at a role
+            * meant a hand-rolled authenticated POST. The first form that
+            * replaced that asked for a typed job id and two stage ids; this
+            * asks for two choices, both made by name.
+            */}
+          <div className="flex min-w-0 flex-col gap-1">
+            <label htmlFor="ashby-mapping-job" className="text-[13px] font-medium text-ink">
+              Ashby job
+            </label>
+            <select
+              id="ashby-mapping-job"
+              className={SELECT}
+              value={draft.jobKey}
+              onChange={(e) => setDraft((d) => ({ ...d, jobKey: e.target.value }))}
+              disabled={creating || jobsStatus !== 'ready' || jobOptions.length === 0}
+              aria-describedby={hasJobNote ? 'ashby-mapping-job-note' : undefined}
+              required
+            >
+              <option value="">
+                {jobsStatus === 'loading' ? 'Loading jobs from Ashby…' : 'Choose a job…'}
+              </option>
+              {jobsStatus === 'ready' &&
+                jobOptions.map((o, i) => (
+                  // `value` is the POSITION, never `o.job.id` — see `draft`.
+                  // The React `key` may be the id: keys never reach the DOM.
+                  <option key={o.job.id} value={String(i)} disabled={o.mapped}>
+                    {o.mapped ? `${o.label} — already mapped` : o.label}
+                  </option>
+                ))}
+            </select>
+            {hasJobNote && (
+              <div id="ashby-mapping-job-note" className="mt-1 flex flex-col gap-2">
+                {jobsStatus === 'error' && (
+                  <InlineNotice
+                    tone="danger"
+                    role="alert"
+                    action={
+                      <Button size="sm" onClick={() => void loadJobs()}>
+                        Try again
+                      </Button>
+                    }
+                  >
+                    {jobsError}
+                  </InlineNotice>
+                )}
+                {noOpenJobs && (
+                  <InlineNotice tone="neutral">There are no open jobs in Ashby right now.</InlineNotice>
+                )}
+                {jobsClipped && (
+                  // Say it rather than let a short list pass for the whole
+                  // of Ashby: the one job an admin came for may be past the
+                  // cut, and nothing else on screen would show it.
+                  <InlineNotice tone="warning">
+                    Ashby returned more jobs than this list can show. If a job is missing, ask an
+                    engineer.
+                  </InlineNotice>
+                )}
+              </div>
+            )}
+          </div>
+
+          <div className="flex min-w-0 flex-col gap-1">
+            <label htmlFor="ashby-mapping-role" className="text-[13px] font-medium text-ink">
+              Role
+            </label>
+            <select
+              id="ashby-mapping-role"
+              className={SELECT}
+              value={draft.roleId}
+              onChange={(e) => setDraft((d) => ({ ...d, roleId: e.target.value }))}
+              disabled={creating}
+              required
+            >
+              <option value="">Choose a role…</option>
+              {roles.map((role) => (
+                <option key={role.id} value={role.id}>
+                  {role.agent_name ? `${role.title} — ${role.agent_name}` : role.title}
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {createError && (
+            // `text-error-text`, not `text-danger`. Tailwind here defines
+            // `error`, not `danger`, so `text-danger` compiles to nothing
+            // and the message rendered as ordinary body ink — it read as
+            // help text rather than a failure. `Field` already uses this
+            // token for exactly this.
+            <p role="alert" className="text-[13px] text-error-text">
+              {createError}
+            </p>
+          )}
+
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <Button variant="ghost" onClick={closeDialog} disabled={creating}>
+              Cancel
+            </Button>
+            <Button type="submit" variant="primary" loading={creating} disabled={!canSave}>
+              {creating ? 'Saving…' : 'Save mapping'}
+            </Button>
+          </div>
+        </form>
+      </Dialog>
+
+      {/* Also at the page root, for the same reason as the dialog above.
+          The job's NAME is the dialog's `description`: it renders straight
+          under the title, and it is what a screen reader announces with the
+          title when the dialog opens — "which mapping?" answered before
+          anything else. The same naming rule as the row, so the dialog
+          never names the job differently from the row it came from. */}
+      <Dialog
+        open={deleteTarget !== null}
+        onClose={closeDeleteDialog}
+        idPrefix="ashby-mapping-delete"
+        title="Delete this mapping?"
+        description={deleteTarget ? mappingName(deleteTarget, jobTitles, jobsPending) : undefined}
+        returnFocusRef={deleteReturnFocus}
+        busy={deleting}
+      >
+        <div className="flex flex-col gap-4">
+          <p className="text-sm leading-6 text-ink-secondary">
+            It stops screening for good and disappears from this list. Candidates already screened —
+            their calls, scores and history — are kept. Adding this job again later brings the
+            mapping back, paused.
+          </p>
+
+          {deleteError && (
+            <p role="alert" className="text-[13px] text-error-text">
+              {deleteError.message}
+            </p>
+          )}
+
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <Button variant="ghost" onClick={closeDeleteDialog} disabled={deleting}>
+              Cancel
+            </Button>
+            <Button
+              variant="danger"
+              loading={deleting}
+              disabled={deleteError?.retryable === false}
+              onClick={() => void deleteMapping()}
+            >
+              {deleting ? 'Deleting…' : 'Delete mapping'}
+            </Button>
+          </div>
+        </div>
+      </Dialog>
     </div>
   );
 }
@@ -893,28 +1208,139 @@ function FeedbackFormSchema({ forms, truncated }: { forms: AshbyFeedbackForm[]; 
 /**
  * The route's machine codes, in words an admin can act on.
  *
- * Each one names the FIELD at fault, because the form has five and a bare
- * "invalid" leaves the admin re-checking all of them.
+ * The dialog has two pickers and nothing typed, so a code either points at
+ * one of the two choices or at something the admin cannot fix from here —
+ * and then the copy says who can, rather than inviting a retry that will
+ * fail the same way. No stage or label field is named: there is none.
  */
 function mappingErrorCopy(code: string | undefined): string {
   switch (code) {
     case 'invalid_external_job_id':
-      return 'That Ashby job id is not in the expected format. Copy it from the job URL in Ashby.';
+      return 'That job could not be used. Pick it again from the list.';
     case 'invalid_role_id':
       return 'Choose a role for this job.';
     case 'invalid_stage_id':
-      return 'One of the stage ids is not in the expected format. Leave it blank if you do not have it yet.';
+      return 'The screening stage for this job could not be set. Ask an engineer to check the Ashby setup.';
     case 'invalid_label':
-      return 'The label is too long.';
+      return "This job's name could not be saved with the mapping. Ask an engineer.";
     case 'invalid_delivery_mode':
       return 'That delivery mode is not one this integration supports.';
     case 'conflict':
-      return 'This Ashby job is already mapped. Edit the existing mapping instead of adding a second one.';
+      return 'This Ashby job is already mapped.';
     case 'mission_control_action_error':
       return 'The mapping could not be saved. Try again.';
     default:
       return 'Could not create the mapping.';
   }
+}
+
+/**
+ * The archive route's machine codes, in words. `mapping_enabled` and
+ * `not_found` each name something the admin can act on — pause it first, or
+ * nothing left to do. Everything else (a server error, a dropped connection)
+ * is worth one more try.
+ */
+function deleteErrorCopy(code: string | undefined): string {
+  switch (code) {
+    case 'mapping_enabled':
+      return 'Pause this mapping first, then delete it.';
+    case 'not_found':
+      return 'This mapping was already removed.';
+    default:
+      return 'Could not delete the mapping. Try again.';
+  }
+}
+
+/** The jobs read's failure, in words. `ApiError.message` IS the route's code. */
+function jobsErrorCopy(err: unknown): string {
+  if (err instanceof ApiError) {
+    if (err.message === 'integration_disabled') {
+      return "The Ashby integration is turned off, so jobs can't be listed.";
+    }
+    if (err.status === 403) return 'Only admins can list Ashby jobs.';
+  }
+  return "Couldn't load jobs from Ashby.";
+}
+
+/**
+ * Picker labels for the OPEN jobs, unique WITHOUT an id.
+ *
+ * Ashby allows two open jobs with one title — the same role hiring in two
+ * cities, or a re-opened req — and two identical options leave an admin
+ * choosing blind. So duplicates first gain the date each opened, which is
+ * the difference a recruiter actually knows; any still identical (no date,
+ * or opened the same day) are numbered ` (2)`, ` (3)` in list order. The id
+ * would be unique too, but it is the one thing this page never shows.
+ */
+function jobOptionLabels(jobs: AshbyJob[]): string[] {
+  const titles = jobs.map((job) => job.title?.trim() || 'Untitled job');
+  const perTitle = new Map<string, number>();
+  for (const title of titles) perTitle.set(title, (perTitle.get(title) ?? 0) + 1);
+  const dated = titles.map((title, i) => {
+    if (perTitle.get(title) === 1) return title;
+    const opened = openedDate(jobs[i].openedAt);
+    return opened ? `${title} — opened ${opened}` : title;
+  });
+  const seen = new Map<string, number>();
+  return dated.map((label) => {
+    const n = (seen.get(label) ?? 0) + 1;
+    seen.set(label, n);
+    return n === 1 ? label : `${label} (${n})`;
+  });
+}
+
+/** The viewer's own date format, or null when Ashby's value is missing or unparseable. */
+function openedDate(iso: string | null): string | null {
+  if (!iso) return null;
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return null;
+  return date.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+}
+
+/**
+ * A mapping's job, by NAME — the ONE rule, shared by the row and the Delete
+ * confirmation. The live job list first — it tracks a rename in Ashby — then
+ * the label saved at creation (the job's title then), then an honest
+ * placeholder. `externalJobId` is read as a lookup key and never returned.
+ */
+function mappingName(
+  mapping: AshbyMcMapping,
+  jobTitles: Map<string, string> | null,
+  jobsPending: boolean,
+): string {
+  return (
+    jobTitles?.get(mapping.externalJobId) ??
+    (mapping.label?.trim() || null) ??
+    (jobsPending ? 'Loading job name…' : 'Ashby job (name unavailable)')
+  );
+}
+
+/**
+ * A mapping row's job, by NAME (see `mappingName`). The label shows as a
+ * second line only when it says something the name does not: an older
+ * mapping's hand-typed tag, or the title from before a rename. Nothing here
+ * renders `externalJobId` — not as text, not as a tooltip.
+ */
+function MappingName({
+  mapping,
+  jobTitles,
+  jobsPending,
+}: {
+  mapping: AshbyMcMapping;
+  jobTitles: Map<string, string> | null;
+  /** The first jobs read is still in flight — "unavailable" would be a false alarm. */
+  jobsPending: boolean;
+}) {
+  const label = mapping.label?.trim() || null;
+  const name = mappingName(mapping, jobTitles, jobsPending);
+  return (
+    <>
+      <span className="min-w-0 break-words text-sm font-medium text-ink">{name}</span>
+      {label && label !== name && (
+        <span className="min-w-0 break-words text-sm text-ink-secondary">{label}</span>
+      )}
+    </>
+  );
 }
 
 function bindingErrorCopy(code: string | undefined): string {

@@ -389,10 +389,11 @@ rolesRouter.put(
  * charge this endpoint is answering rather than earning.
  *
  * The rule, therefore:
- *   - referenced by an Ashby mapping -> 409, name it, change nothing. The
+ *   - referenced by a LIVE Ashby mapping -> 409, name it, change nothing. The
  *     database would refuse anyway (RESTRICT); answering with the reason is
  *     more useful than surfacing a constraint error.
- *   - referenced by candidates or call sessions -> ARCHIVE
+ *   - referenced by candidates, call sessions, or a DELETED (archived, 0109)
+ *     Ashby mapping -> ARCHIVE
  *     (`is_active = false`). It is marked Inactive and stops being offered
  *     anywhere new, and every historical record still says which job it
  *     belonged to. It does NOT leave the roles list — `GET /api/roles` has no
@@ -424,10 +425,18 @@ rolesRouter.delete(
 
     // An Ashby mapping is a hard stop in the database, so it is a hard stop
     // here — with the reason spelled out rather than a 500 from a constraint.
+    //
+    // Only a LIVE mapping, though. One deleted in Ashby Mission Control is
+    // archived, not gone (0109): it still holds this role for every candidate
+    // that came through it, so RESTRICT still refuses a hard delete. Sending
+    // the operator back to Mission Control would point at a mapping that is
+    // no longer on that screen, so an archived mapping counts as history
+    // below and the role archives like any other referenced role.
     const { count: mappingCount, error: mappingError } = await supabase
       .from('ashby_job_mappings')
       .select('id', { count: 'exact', head: true })
-      .eq('role_id', roleId);
+      .eq('role_id', roleId)
+      .is('archived_at', null);
     if (mappingError) return next(mappingError);
     if ((mappingCount ?? 0) > 0) {
       return res.status(409).json({
@@ -457,7 +466,17 @@ rolesRouter.delete(
       .eq('role_id', roleId);
     if (sessionError) return next(sessionError);
 
-    const referenced = (candidateCount ?? 0) > 0 || (sessionCount ?? 0) > 0;
+    const { count: archivedMappingCount, error: archivedMappingError } = await supabase
+      .from('ashby_job_mappings')
+      .select('id', { count: 'exact', head: true })
+      .eq('role_id', roleId)
+      .not('archived_at', 'is', null);
+    if (archivedMappingError) return next(archivedMappingError);
+
+    const historyOnlyInMappings =
+      (candidateCount ?? 0) === 0 && (sessionCount ?? 0) === 0 && (archivedMappingCount ?? 0) > 0;
+    const referenced =
+      (candidateCount ?? 0) > 0 || (sessionCount ?? 0) > 0 || (archivedMappingCount ?? 0) > 0;
 
     if (referenced) {
       let archive = supabase.from('roles').update({ is_active: false }).eq('id', roleId);
@@ -476,9 +495,10 @@ rolesRouter.delete(
       }
       return res.json({
         outcome: 'archived',
-        reason: 'candidates_or_sessions_exist',
+        reason: historyOnlyInMappings ? 'deleted_ashby_mapping_exists' : 'candidates_or_sessions_exist',
         candidates: candidateCount ?? 0,
         sessions: sessionCount ?? 0,
+        deleted_ashby_mappings: archivedMappingCount ?? 0,
       });
     }
 

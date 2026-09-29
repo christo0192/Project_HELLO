@@ -21,6 +21,8 @@ export { GlassPanel } from './GlassPanel';
 export type { GlassPanelProps, GlassLevel, GlassPadding } from './GlassPanel';
 export { SlideOver } from './SlideOver';
 export type { SlideOverProps } from './SlideOver';
+export { Dialog } from './Dialog';
+export type { DialogProps } from './Dialog';
 export { SectionHeader } from './SectionHeader';
 export type { SectionHeaderProps } from './SectionHeader';
 export { Button, ButtonSpinner, buttonClass } from './Button';

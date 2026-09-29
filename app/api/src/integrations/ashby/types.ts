@@ -72,6 +72,7 @@ export type AshbyOperation =
   | 'file.info'
   | 'jobInterviewPlan.info'
   | 'feedbackFormDefinition.info'
+  | 'job.list'
   | 'applicationFeedback.list'
   | 'applicationFeedbackRequest.create'
   | 'applicationFeedback.submit'
@@ -100,7 +101,12 @@ export const ASHBY_OPERATIONS: Readonly<Record<AshbyOperation, AshbyOperationSpe
   // auto-binder and the Mission Control binding preview; never returns any
   // submitted feedback content.
   'feedbackFormDefinition.info':       { path: '/feedbackFormDefinition.info',       mutation: false },
-  'applicationFeedback.list':          { path: '/applicationFeedback.list',          mutation: false },
+  // Job DIRECTORY for the Mission Control "Add mapping" picker (permission
+  // `jobsRead`). The probe copies only id, title, status and openedAt off each
+  // job; the payload's `hiringTeam` (people's emails), `customFields` and the
+  // rest never cross the probe boundary.
+  'job.list':                          { path: '/job.list',                          mutation: false },
+  'applicationFeedback.list':         { path: '/applicationFeedback.list',          mutation: false },
   'applicationFeedbackRequest.create': { path: '/applicationFeedbackRequest.create', mutation: true },
   'applicationFeedback.submit':        { path: '/applicationFeedback.submit',        mutation: true },
   'application.changeStage':           { path: '/application.changeStage',           mutation: true },
@@ -119,6 +125,23 @@ export interface ApplicationListParams {
   limit?: number;
   /** Documented jobId filter; used only for mapping-scoped previews. */
   jobId?: string;
+  /** Tenant-verifiable additional request fields. */
+  extra?: OpaqueRecord;
+}
+
+/**
+ * `job.list` paging. Deliberately NO status filter: whether the endpoint
+ * accepts one is not verified against a tenant, and an unrecognised filter
+ * could be ignored silently (listing everything) or rejected (listing
+ * nothing). Callers page the whole directory and filter what they read.
+ */
+export interface JobListParams {
+  /** Opaque cursor from a prior page. */
+  cursor?: string;
+  /** Opaque incremental sync token. */
+  syncToken?: string;
+  /** Optional bounded page size hint (1..500). */
+  limit?: number;
   /** Tenant-verifiable additional request fields. */
   extra?: OpaqueRecord;
 }

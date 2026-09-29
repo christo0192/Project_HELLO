@@ -471,3 +471,74 @@ describe('createMissionControlStore — stranded-completion visibility', () => {
     expect(calls.some((c) => c.table === 'call_sessions')).toBe(false);
   });
 });
+
+describe('createMissionControlStore — "delete" is an archive (0109)', () => {
+  const MAPPING = '33333333-3333-4333-8333-333333333333';
+  const ACTOR = '44444444-4444-4444-8444-444444444444';
+
+  /** A client with only `rpc`, resolving to one fixed answer. */
+  function rpcClient(answer: { data: unknown; error: unknown }) {
+    const rpc = vi.fn(async (_fn: string, _args: Record<string, unknown>) => answer);
+    return { client: { rpc } as never, rpc };
+  }
+
+  it('lists only live mappings — the archived-row filter is in the query itself', async () => {
+    const { client, calls } = fakeSupabase({
+      ashby_job_mappings: {
+        data: [{
+          id: MAPPING, external_job_id: 'job_1', status: 'paused', status_reason: null, delivery_mode: 'manual',
+          ai_screening_stage_id: 'stage_ai', ta_screening_stage_id: null, label: null, updated_at: '2026-09-29T00:00:00Z',
+        }],
+        error: null,
+      },
+    });
+    const rows = await createMissionControlStore(client).listMappings(50);
+    const read = calls.find((c) => c.table === 'ashby_job_mappings')!;
+    expect(read.op).toBe('select');
+    expect(read.filters).toContainEqual(['is', 'archived_at', null]);
+    expect(read.filters).toContainEqual(['eq', 'provider', 'ashby']);
+    // The archive columns are a filter, not a projection: nothing new is read out.
+    expect(read.columns).not.toContain('archived');
+    expect(rows).toEqual([{
+      id: MAPPING, externalJobId: 'job_1', status: 'paused', statusReason: null, deliveryMode: 'manual',
+      hasAiStage: true, hasTaStage: false, label: null, updatedAt: '2026-09-29T00:00:00Z',
+    }]);
+  });
+
+  it('archives through the 0109 RPC with the mapping and the acting admin', async () => {
+    const { client, rpc } = rpcClient({ data: { status: 'ok', already_archived: false }, error: null });
+    const out = await createMissionControlStore(client).archiveMapping(MAPPING, ACTOR);
+    expect(out).toEqual({ status: 'ok', alreadyArchived: false });
+    expect(rpc).toHaveBeenCalledTimes(1);
+    expect(rpc).toHaveBeenCalledWith('archive_ashby_job_mapping', { p_mapping_id: MAPPING, p_actor_id: ACTOR });
+  });
+
+  it('carries the idempotent repeat through as alreadyArchived: true', async () => {
+    const { client } = rpcClient({ data: { status: 'ok', already_archived: true }, error: null });
+    expect(await createMissionControlStore(client).archiveMapping(MAPPING, ACTOR))
+      .toEqual({ status: 'ok', alreadyArchived: true });
+  });
+
+  it('passes each refusal code through without inventing an alreadyArchived flag', async () => {
+    for (const status of ['mapping_enabled', 'not_found', 'actor_required']) {
+      const { client } = rpcClient({ data: { status }, error: null });
+      expect(await createMissionControlStore(client).archiveMapping(MAPPING, ACTOR), status).toEqual({ status });
+    }
+    const { client } = rpcClient({ data: null, error: null });
+    expect(await createMissionControlStore(client).archiveMapping(MAPPING, ACTOR)).toEqual({ status: 'error' });
+  });
+
+  it('throws a sanitized code when the RPC errors — never the database text', async () => {
+    const { client } = rpcClient({ data: null, error: { message: 'pg: function missing at 10.0.0.5' } });
+    const err = await createMissionControlStore(client).archiveMapping(MAPPING, ACTOR).then(() => null, (e: Error) => e);
+    expect(err?.message).toBe('ashby_mc_archive_mapping_error');
+  });
+
+  it('carries the RPC\'s `restored` flag through upsertMapping when a create brings an archived mapping back', async () => {
+    const { client } = rpcClient({ data: { status: 'ok', id: MAPPING, created: false, restored: true }, error: null });
+    const out = await createMissionControlStore(client).upsertMapping({
+      externalJobId: 'job_1', roleId: ACTOR, ownerId: ACTOR, deliveryMode: 'manual', actorId: ACTOR,
+    });
+    expect(out).toEqual({ status: 'ok', id: MAPPING, restored: true });
+  });
+});

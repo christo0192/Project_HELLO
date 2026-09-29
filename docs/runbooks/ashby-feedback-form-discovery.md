@@ -46,11 +46,14 @@ GET /jobs/{externalJobId}/feedback-form   (admin)
         └── extractFeedbackForms(results)             ← pure, no I/O
 ```
 
-`PROBE_READ_OPERATIONS` is `['jobInterviewPlan.info', 'feedbackFormDefinition.info']`
+`PROBE_READ_OPERATIONS` is `['jobInterviewPlan.info', 'feedbackFormDefinition.info', 'job.list']`
 — the second was added for issue #275 so the scorecard auto-binder and the
 `Preview scorecard binding` control can read ONE form's definition directly
 (`probeFeedbackFormDefinition` / `extractFormDefinition`; see
-`docs/runbooks/ashby-scorecard-fields.md`). `assertReadOnly` rejects every
+`docs/runbooks/ashby-scorecard-fields.md`). The third is the job directory
+behind the "Add mapping" picker (`probeJobDirectory`, `GET /jobs`); it reads
+job ids/titles/status/open dates only and never touches a form or feedback.
+`assertReadOnly` rejects every
 mutating registry entry and every non-allowlisted read, so the module has no
 write seam to misuse.
 

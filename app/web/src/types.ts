@@ -1370,6 +1370,11 @@ export interface AshbyBacklogConfirmResponse {
  * The TTL is deliberately absent: a DB CHECK fixes it at 24h and the route
  * refuses an explicit disagreement rather than silently overriding it, so
  * there is nothing for a form to offer.
+ *
+ * The stage ids and `label` are optional, and the dashboard sends NONE of the
+ * stage ids: the route defaults both on create to the fixed screening stage,
+ * so there is no stage for an admin to choose — or to get wrong. `label` is
+ * the job's title, for display when the live job list is unavailable.
  */
 export interface AshbyMappingInput {
   external_job_id: string;
@@ -1384,6 +1389,31 @@ export interface AshbyMappingCreated {
   ok: boolean;
   id?: string;
   status?: string;
+  error?: string;
+}
+
+/**
+ * One job from the live Ashby job list (`GET .../mission-control/jobs`).
+ *
+ * The id is an OPAQUE key for the API and never for a person: the dashboard
+ * shows a job by `title` only. `null` fields are ones Ashby did not supply.
+ */
+export interface AshbyJob {
+  id: string;
+  title: string | null;
+  status: 'Draft' | 'Open' | 'Closed' | 'Archived' | null;
+  /** ISO timestamp. Used only to tell two same-titled jobs apart. */
+  openedAt: string | null;
+}
+
+/**
+ * Every status, confidential jobs already removed, sorted by title.
+ * `truncated` means Ashby held more jobs than the route will page through.
+ */
+export interface AshbyJobsResponse {
+  ok: boolean;
+  jobs?: AshbyJob[];
+  truncated?: boolean;
   error?: string;
 }
 
@@ -1586,6 +1616,18 @@ export interface AshbyMcActionResponse {
   error?: string;
   cancelled_operations?: number;
   cancelled_ingestion?: number;
+}
+
+/**
+ * `POST .../mission-control/mappings/:id/archive` — "Delete" in the UI. The
+ * row is ARCHIVED, not dropped: it leaves the mapping list, its history stays.
+ * `already_archived` is true on a repeat, which is still a success. Every
+ * refusal (`not_found`, `mapping_enabled`, …) arrives as a thrown `ApiError`
+ * whose message is the route's code, never as a resolved `ok: false`.
+ */
+export interface AshbyMcArchiveResponse {
+  ok: boolean;
+  already_archived?: boolean;
 }
 
 // ── P7: internal phone screening calendar (sanitized operator projection) ──
