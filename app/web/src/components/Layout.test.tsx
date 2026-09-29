@@ -5,8 +5,9 @@
  *   - Landmarks (aside, nav, main) + skip link (WCAG 2.4.1)
  *   - Brand: authorized IK logo on neutral plate + HELLO wordmark
  *   - Navigation: Workspace (Dashboard/Candidates/Roles) + admin-only
- *     Mission Control under Operations
- *   - Role gating: non-admins never see Mission Control
+ *     Ashby Mission Control (directly above) and Mission Control under
+ *     Operations
+ *   - Role gating: non-admins never see either Mission Control
  *   - API health status display (online / maintenance / offline)
  *   - Auth state: user email + role chip + sign-out
  *   - Theme toggle presence (requires ThemeProvider)
@@ -21,7 +22,7 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { ThemeProvider } from '../lib/theme';
-import { Layout } from './Layout';
+import { Layout, pageTitleFor } from './Layout';
 
 vi.mock('../api', () => ({
   api: {
@@ -113,27 +114,65 @@ describe('Layout shell', () => {
     expect(screen.getByRole('link', { name: /^Roles$/ })).toBeInTheDocument();
   });
 
+  // Exact names throughout: "Ashby Mission Control" also contains "Mission
+  // Control", so a loose /Mission Control/ would match both links and could
+  // never tell one from the other.
+  const MISSION_CONTROL = { name: /^Mission Control$/ };
+  const ASHBY_MISSION_CONTROL = { name: /^Ashby Mission Control$/ };
+
   it('renders Mission Control under Operations for admins only', () => {
     renderLayout();
-    expect(screen.getByRole('link', { name: /Mission Control/i })).toBeInTheDocument();
+    expect(screen.getByRole('link', MISSION_CONTROL)).toHaveAttribute('href', '/mission-control');
     expect(screen.getByText('Operations')).toBeInTheDocument();
   });
 
   it('never renders Mission Control for non-admins', () => {
     setAuth({ role: 'interviewer' });
     renderLayout();
-    expect(screen.queryByRole('link', { name: /Mission Control/i })).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', MISSION_CONTROL)).not.toBeInTheDocument();
+  });
+
+  it('renders Ashby Mission Control under Operations for an admin, pointing at its route', () => {
+    renderLayout();
+    const operations = screen.getByRole('group', { name: 'Operations' });
+    const link = within(operations).getByRole('link', ASHBY_MISSION_CONTROL);
+    expect(link).toHaveAttribute('href', '/ashby-mission-control');
+    // Same decorative-icon contract as every other nav item.
+    const svg = link.querySelector('svg');
+    expect(svg).toHaveAttribute('aria-hidden', 'true');
+    expect(svg).toHaveAttribute('stroke', 'currentColor');
+  });
+
+  it('orders Ashby Mission Control directly above Mission Control', () => {
+    renderLayout();
+    const operations = screen.getByRole('group', { name: 'Operations' });
+    const names = within(operations)
+      .getAllByRole('link')
+      .map((link) => link.textContent);
+    expect(names).toEqual(['Ashby Mission Control', 'Mission Control', 'Phone calendar']);
+  });
+
+  it('marks Ashby Mission Control active on its own route, and not Mission Control', () => {
+    renderLayout('/ashby-mission-control');
+    expect(screen.getByRole('link', ASHBY_MISSION_CONTROL)).toHaveAttribute('aria-current', 'page');
+    expect(screen.getByRole('link', MISSION_CONTROL)).not.toHaveAttribute('aria-current');
+  });
+
+  it('titles the top bar "Ashby Mission Control" on its route', () => {
+    expect(pageTitleFor('/ashby-mission-control')).toBe('Ashby Mission Control');
+    expect(pageTitleFor('/mission-control')).toBe('Mission Control');
   });
 
   /*
     The Operations GROUP is no longer admin-only, because the phone calendar
     inside it is readable by interviewers — that is the API's rule
     ("interviewer or above may read, admin may write"), and the nav mirrors
-    it. Mission Control's own visibility is unchanged and is still asserted
-    above: its route is `requireRole="admin"`, so offering an interviewer a
-    link that redirects to /unauthorized would be worse than not showing it.
+    it. Mission Control's and Ashby Mission Control's own visibility is
+    admin-only: both routes are `requireRole="admin"`, so offering an
+    interviewer a link that redirects to /unauthorized would be worse than
+    not showing it.
   */
-  it('renders Operations with the phone calendar for an interviewer, and no Mission Control', () => {
+  it('renders Operations with the phone calendar for an interviewer, and neither Mission Control', () => {
     setAuth({ role: 'interviewer' });
     renderLayout();
     expect(screen.getByText('Operations')).toBeInTheDocument();
@@ -141,15 +180,15 @@ describe('Layout shell', () => {
       'href',
       '/phone-calendar',
     );
+    expect(screen.queryByRole('link', MISSION_CONTROL)).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', ASHBY_MISSION_CONTROL)).not.toBeInTheDocument();
     expect(screen.queryByRole('link', { name: /Mission Control/i })).not.toBeInTheDocument();
   });
 
   it('renders the phone calendar alongside Mission Control for an admin', () => {
     renderLayout();
     const operations = screen.getByRole('group', { name: 'Operations' });
-    expect(
-      within(operations).getByRole('link', { name: /Mission Control/i }),
-    ).toBeInTheDocument();
+    expect(within(operations).getByRole('link', MISSION_CONTROL)).toBeInTheDocument();
     expect(
       within(operations).getByRole('link', { name: /Phone calendar/i }),
     ).toBeInTheDocument();

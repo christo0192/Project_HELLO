@@ -22,6 +22,7 @@ export { ScorebarSection } from './ScorebarSection';
 export { FunnelSection } from './FunnelSection';
 export { AuditSection } from './AuditSection';
 export { MaintenanceSection } from './MaintenanceSection';
+export { OperatorHaltControl } from './OperatorHaltControl';
 export {
   allowlistEntryState,
   allowlistStateLabel,
