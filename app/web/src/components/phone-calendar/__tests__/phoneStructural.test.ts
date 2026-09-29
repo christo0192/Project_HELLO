@@ -212,6 +212,17 @@ describe('no direct network access', () => {
       'listCandidates',
       'scheduleCandidatePhoneAppointment',
       'getMe',
+      // The Agent picker's names (M006/T04) — a GET, and the one non-phone
+      // read here besides `getMe`/`listCandidates`. Allowed deliberately
+      // rather than having the phone API return role names: the calendar
+      // carries only each call's bare `role_id`, so the phone projection
+      // gains no text; `/api/roles` is already role-scoped server-side (an
+      // interviewer sees only roles they own), so the picker never names a
+      // role the operator could not otherwise see; and it lists EVERY agent
+      // the operator can see, not only those with a call in the loaded week.
+      // The page issues it once per mount, never for a viewer, and a failure
+      // only hides the picker.
+      'listRoles',
     ]);
     // Whitespace is permitted around the dot: the page writes several of
     // these as `api\n  .getMe()`, and a pattern that missed those would
@@ -232,6 +243,7 @@ describe('no direct network access', () => {
       'getPhoneCalendar',
       'getPhoneSlots',
       'listCandidates',
+      'listRoles',
       'reschedulePhoneAppointment',
       'scheduleCandidatePhoneAppointment',
     ]);

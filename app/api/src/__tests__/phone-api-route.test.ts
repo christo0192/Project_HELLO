@@ -46,6 +46,8 @@ const UUID_A = '11111111-1111-4111-8111-111111111111';
 const UUID_E = '22222222-2222-4222-8222-222222222222';
 const UUID_C = '33333333-3333-4333-8333-333333333333';
 const UUID_OTHER = '44444444-4444-4444-8444-444444444444';
+/** The role (agent pipeline) the fixture engagement was opened for. */
+const UUID_R = '66666666-6666-4666-8666-666666666666';
 
 /** Injected clock. Every assertion that depends on "now" pins it here. */
 const NOW = new Date('2026-08-23T18:31:00Z');
@@ -68,6 +70,7 @@ const APPOINTMENT: PhoneAppointmentRow = {
 const ENGAGEMENT: PhoneEngagementRow = {
   id: UUID_E,
   candidateId: UUID_C,
+  roleId: UUID_R,
   state: 'scheduled',
   stateReason: null,
   epoch: 0,
@@ -599,6 +602,7 @@ describe('the calendar projection', () => {
     expect(row.ist_end).toBe('09:30');
     expect(row.source).toBe('hr_manual');
     expect(row.engagement_state).toBe('scheduled');
+    expect(row.role_id).toBe(UUID_R);
     expect(row.version).toBe(3);
     // Always null: nothing in 0042 writes it, and the field is reported rather
     // than dropped so the residual stays visible.
@@ -617,6 +621,43 @@ describe('the calendar projection', () => {
       .get(`/api/phone/calendar${RANGE}`);
     expect(res.body.appointments[0].engagement_state).toBeNull();
     expect(res.body.appointments[0].candidate).toBeNull();
+    // The role is an engagement fact, so the same torn read nulls it too —
+    // never a guess, and never borrowed from some other row.
+    expect(res.body.appointments[0].role_id).toBeNull();
+  });
+
+  it('carries the ENGAGEMENT role of each call, per row, in the same three queries', async () => {
+    // The agent filter keys on this. Two engagements of one candidate in two
+    // pipelines must each report their OWN role — the role is stamped on the
+    // engagement when its cycle opens, and a candidate's current role is not
+    // what a call already booked belongs to. The candidate block stays
+    // exactly the four documented fields: the role is not smuggled into it.
+    const ROLE_B = '77777777-7777-4777-8777-777777777777';
+    const a1 = { ...APPOINTMENT, id: 'a1', engagementId: 'e1' };
+    const a2 = { ...APPOINTMENT, id: 'a2', engagementId: 'e2' };
+    const a3 = { ...APPOINTMENT, id: 'a3', engagementId: 'e3' };
+    const read = fakeReadStore({
+      listAppointmentsByStart: async () => [a1, a2, a3],
+      listEngagementsByIds: async () => [
+        { ...ENGAGEMENT, id: 'e1', roleId: UUID_R },
+        { ...ENGAGEMENT, id: 'e2', roleId: ROLE_B },
+        // The FK is `on delete set null`: an engagement with no role.
+        { ...ENGAGEMENT, id: 'e3', roleId: null },
+      ],
+    });
+    const res = await request(appWith('interviewer', { readStore: read.store }))
+      .get(`/api/phone/calendar${RANGE}`);
+    expect(res.status).toBe(200);
+    expect(res.body.appointments.map((r: { id: string; role_id: unknown }) => [r.id, r.role_id]))
+      .toEqual([['a1', UUID_R], ['a2', ROLE_B], ['a3', null]]);
+    for (const row of res.body.appointments) {
+      expect(Object.keys(row.candidate).sort()).toEqual(['id', 'name', 'reference', 'status']);
+    }
+    expect(read.calls).toEqual([
+      'listAppointmentsByStart',
+      'listEngagementsByIds',
+      'listCandidatesByIds',
+    ]);
   });
 
   it('turns a read failure into a stable code, never a driver message', async () => {

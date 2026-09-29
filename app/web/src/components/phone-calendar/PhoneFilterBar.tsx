@@ -2,25 +2,43 @@
  * The calendar toolbar: how the week is read, and which rows are shown.
  *
  * Everything here is a toggle over data that is ALREADY loaded. Switching
- * view or toggling a facet rewrites the query string and re-filters rows in
- * memory — no request is issued, which a test pins.
+ * view, picking an agent or toggling a facet rewrites the query string and
+ * re-filters rows in memory — no request is issued, which a test pins.
  *
- * Every control carries `aria-pressed`, so its on/off state is announced and
- * is never conveyed by fill colour alone, and every control is at least 44px
- * tall for touch (`Button size="lg"`).
+ * Every toggle carries `aria-pressed`, so its on/off state is announced and
+ * is never conveyed by fill colour alone; the agent picker is a native,
+ * labelled `<select>`. Every control is at least 44px tall for touch.
  *
  * Zero-count facets are hidden, except an active one; see `phoneFacets` for
  * why that exception exists.
  */
 
+import { useId } from 'react';
 import { hasActivePhoneFilters } from './phoneCalendarFilters';
 import type {
+  PhoneAgentOption,
   PhoneCalendarFilters,
   PhoneCalendarView,
   PhoneFacet,
 } from './phoneCalendarFilters';
-import { Button, GlassPanel } from '../design';
+import { Button, GlassPanel, SelectField } from '../design';
 import { appointmentStatusTerm, engagementStateTerm } from './phoneVocabulary';
+
+/**
+ * What the Agent picker can offer.
+ *
+ *   `loading`     — the roles read is in flight: a disabled picker holds the
+ *                   place, so the toolbar does not jump when it settles.
+ *   `unavailable` — the roles read failed. No picker and no error wall: the
+ *                   calendar is whole without it. `requested` is true only
+ *                   when the URL asked for an agent, which is the one case
+ *                   worth a word — the view is wider than the link asked for.
+ *   `ready`       — one option per role the operator can see.
+ */
+export type PhoneAgentChoices =
+  | { status: 'loading' }
+  | { status: 'unavailable'; requested: boolean }
+  | { status: 'ready'; options: PhoneAgentOption[] };
 
 export interface PhoneFilterBarProps {
   statusFacets: PhoneFacet[];
@@ -28,13 +46,68 @@ export interface PhoneFilterBarProps {
   filters: PhoneCalendarFilters;
   /** The view actually in effect (a narrow viewport may default it). */
   view: PhoneCalendarView;
+  agents: PhoneAgentChoices;
   onViewChange: (view: PhoneCalendarView) => void;
+  /** `null` selects "All agents". */
+  onAgentChange: (agent: string | null) => void;
   onToggle: (dimension: 'status' | 'state', value: string) => void;
   onClear: () => void;
 }
 
 /** The one label style in this toolbar: sentence case, 13px, tertiary ink. */
 const legendClass = 'text-[13px] font-medium text-ink-tertiary';
+
+function AgentPicker({
+  agents,
+  value,
+  onChange,
+}: {
+  agents: PhoneAgentChoices;
+  value: string | null;
+  onChange: (agent: string | null) => void;
+}) {
+  const rawId = useId();
+  const id = `phone-agent-${rawId.replace(/:/g, '-')}`;
+
+  if (agents.status === 'unavailable') {
+    return agents.requested ? (
+      <p className="max-w-xs self-end text-[13px] leading-5 text-ink-tertiary">
+        Agents could not be loaded, so calls for every agent are shown.
+      </p>
+    ) : null;
+  }
+  // An operator who can see no role has nothing to choose between.
+  if (agents.status === 'ready' && agents.options.length === 0) return null;
+
+  const loading = agents.status === 'loading';
+  return (
+    <div className="flex min-w-0 flex-col">
+      <label htmlFor={id} className={legendClass}>
+        Agent
+      </label>
+      <SelectField
+        id={id}
+        value={loading ? '' : (value ?? '')}
+        disabled={loading}
+        onChange={(event) => onChange(event.target.value === '' ? null : event.target.value)}
+        className="mt-2 min-h-[44px] sm:w-60"
+      >
+        {agents.status === 'loading' ? (
+          <option value="">Loading agents…</option>
+        ) : (
+          <>
+            <option value="">All agents</option>
+            {agents.options.map((option) => (
+              <option key={option.id} value={option.id}>
+                {option.label}
+              </option>
+            ))}
+          </>
+        )}
+      </SelectField>
+    </div>
+  );
+}
 
 function FacetGroup({
   legend,
@@ -78,7 +151,9 @@ export function PhoneFilterBar({
   stateFacets,
   filters,
   view,
+  agents,
   onViewChange,
+  onAgentChange,
   onToggle,
   onClear,
 }: PhoneFilterBarProps) {
@@ -115,6 +190,8 @@ export function PhoneFilterBar({
           </Button>
         </div>
       </fieldset>
+
+      <AgentPicker agents={agents} value={filters.agent} onChange={onAgentChange} />
 
       <FacetGroup
         legend="Appointment"

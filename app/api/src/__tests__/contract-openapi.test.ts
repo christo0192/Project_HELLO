@@ -2894,6 +2894,7 @@ describe('phone operator API bodies match the documented schemas', () => {
     const engagement = {
       id: PHONE_ENGAGEMENT,
       candidateId: PHONE_CANDIDATE,
+      roleId: '00000000-0000-4000-8000-0000000000f1',
       state: 'scheduled' as const,
       stateReason: null,
       epoch: 0,
@@ -3009,6 +3010,9 @@ describe('phone operator API bodies match the documented schemas', () => {
       const calendar = await request(phoneApp)
         .get('/api/phone/calendar?from=2026-08-24T00:00:00Z&to=2026-08-25T00:00:00Z');
       expect(calendar.body.appointments).toHaveLength(1);
+      // The agent filter's key is really in the validated row, non-null, so
+      // its `format: uuid` was checked rather than skipped as null.
+      expect(calendar.body.appointments[0].role_id).toBe('00000000-0000-4000-8000-0000000000f1');
       const slots = await request(phoneApp).get('/api/phone/calendar/slots?date=2026-08-24');
       expect(slots.body.slots.length).toBeGreaterThan(0);
       const detail = await request(phoneApp).get(`/api/phone/engagements/${PHONE_ENGAGEMENT}`);

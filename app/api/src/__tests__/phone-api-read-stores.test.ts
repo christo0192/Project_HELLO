@@ -77,6 +77,7 @@ const APPOINTMENT = {
 const ENGAGEMENT = {
   id: 'e1',
   candidate_id: 'c1',
+  role_id: 'r1',
   state: 'scheduled',
   state_reason: null,
   epoch: 0,
@@ -332,6 +333,36 @@ describe('rows are narrowed, and a driver error is sanitized', () => {
     const { client } = fakeClient([{ data: [{ ...APPOINTMENT, cancel_reason: 'hr cancelled' }] }]);
     await expect(createPhoneReadStore(client as never).getAppointment('a1'))
       .rejects.toThrow('phone_reason_code_invalid');
+  });
+
+  it('reads the engagement role for the agent filter, and nothing else new', async () => {
+    // `role_id` is read because the calendar's agent filter shows it. The
+    // other unread engagement links stay unread: nothing shows them.
+    const { client, queries } = fakeClient([{ data: [ENGAGEMENT] }, { data: [ENGAGEMENT] }]);
+    const store = createPhoneReadStore(client as never);
+    const [listed] = await store.listEngagementsByIds(['e1']);
+    const single = await store.getEngagement('e1');
+    expect(listed.roleId).toBe('r1');
+    expect(single!.roleId).toBe('r1');
+    for (const q of queries) {
+      expect(q.table).toBe('phone_engagements');
+      const columns = q.columns.split(',');
+      expect(columns).toContain('role_id');
+      for (const unread of ['application_link_id', 'session_id', 'consent_record_id']) {
+        expect(columns, `phone_engagements selects ${unread}`).not.toContain(unread);
+      }
+    }
+  });
+
+  it('reads a missing or non-string engagement role as null, not as drift', async () => {
+    // Nullable in 0042 (`on delete set null`): no role is a legitimate answer.
+    const { client } = fakeClient([
+      { data: [{ ...ENGAGEMENT, role_id: null }] },
+      { data: [{ ...ENGAGEMENT, role_id: 42 }] },
+    ]);
+    const store = createPhoneReadStore(client as never);
+    expect((await store.getEngagement('e1'))!.roleId).toBeNull();
+    expect((await store.getEngagement('e1'))!.roleId).toBeNull();
   });
 
   it('refuses a row carrying a state outside the 0042 vocabulary', async () => {

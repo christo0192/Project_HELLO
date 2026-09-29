@@ -73,6 +73,13 @@ export interface PhoneAppointmentRow {
 export interface PhoneEngagementRow {
   readonly id: string;
   readonly candidateId: string;
+  /**
+   * The role (screening agent pipeline) this engagement was opened for,
+   * stamped from the candidate's role when the engagement row is created
+   * (0047/0057). Null when the engagement carries none (the FK is
+   * `on delete set null`).
+   */
+  readonly roleId: string | null;
   readonly state: PhoneEngagementState;
   readonly stateReason: string | null;
   readonly epoch: number;

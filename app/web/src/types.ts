@@ -1754,6 +1754,13 @@ export interface PhoneCalendarAppointment {
   updated_at: string;
   /** Null only on a torn read between the batched queries, never as a guess. */
   engagement_state: PhoneEngagementState | null;
+  /**
+   * The role (screening agent pipeline) this call belongs to — the
+   * engagement's role, stamped when its cycle opened, not the candidate's
+   * current one. A bare id: names come from `api.listRoles()`. Null on a torn
+   * read, or when the engagement carries no role.
+   */
+  role_id: string | null;
   candidate: PhoneCandidateRef | null;
 }
 

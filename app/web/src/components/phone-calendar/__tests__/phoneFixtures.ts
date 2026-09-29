@@ -21,6 +21,7 @@ import type {
   PhoneSlot,
   PhoneSlotsResponse,
   PhoneWindow,
+  Role,
 } from '../../../types';
 
 const hoisted = vi.hoisted(() => {
@@ -42,6 +43,7 @@ const hoisted = vi.hoisted(() => {
     createPhoneAppointment: vi.fn(),
     reschedulePhoneAppointment: vi.fn(),
     cancelPhoneAppointment: vi.fn(),
+    listRoles: vi.fn(),
   };
 
   const api = {
@@ -53,6 +55,7 @@ const hoisted = vi.hoisted(() => {
     createPhoneAppointment: fns.createPhoneAppointment,
     reschedulePhoneAppointment: fns.reschedulePhoneAppointment,
     cancelPhoneAppointment: fns.cancelPhoneAppointment,
+    listRoles: fns.listRoles,
   };
 
   return { api, fns, ApiError };
@@ -100,6 +103,39 @@ export const PHONE_BOOKING_CANDIDATES: Candidate[] = [{
   created_at: '2026-08-20T10:00:00Z',
 }];
 
+// ── Roles (the Agent picker) ─────────────────────────────────────────
+
+/** Role ids are uuid-shaped, because the `agent` URL parameter only admits that shape. */
+export const ROLE_SALES = 'aaaaaaaa-0000-4000-8000-000000000001';
+export const ROLE_DATA = 'aaaaaaaa-0000-4000-8000-000000000002';
+export const ROLE_DATA_TWIN = 'aaaaaaaa-0000-4000-8000-000000000003';
+/** A well-formed id that names no role this operator can see. */
+export const ROLE_UNKNOWN = 'aaaaaaaa-0000-4000-8000-0000000000ff';
+
+export function role(over: Partial<Role> & Pick<Role, 'id' | 'title'>): Role {
+  return {
+    agent_name: null,
+    jd: 'Synthetic job description.',
+    required_skills: [],
+    screening_template: [],
+    is_active: true,
+    created_at: '2026-08-01T10:00:00Z',
+    ...over,
+  };
+}
+
+/**
+ * What `api.listRoles()` answers by default, in API order. Chosen to exercise
+ * every labelling rule: an agent name (`Zara`, which sorts LAST although it is
+ * listed first), a title fallback, and a second role with the same title and
+ * a blank agent name, which must be told apart as `Data Analyst (2)`.
+ */
+export const PHONE_ROLES: Role[] = [
+  role({ id: ROLE_SALES, title: 'Sales Advisor', agent_name: 'Zara' }),
+  role({ id: ROLE_DATA, title: 'Data Analyst', agent_name: null }),
+  role({ id: ROLE_DATA_TWIN, title: 'Data Analyst', agent_name: '   ' }),
+];
+
 // ── The approved calling window ──────────────────────────────────────
 
 export const WINDOW: PhoneWindow = {
@@ -139,6 +175,7 @@ export function appointment(
     created_at: '2026-08-20T10:00:00Z',
     updated_at: '2026-08-20T10:00:00Z',
     engagement_state: 'scheduled',
+    role_id: ROLE_SALES,
     candidate: {
       id: 'cand-1',
       name: 'Asha Rao',
