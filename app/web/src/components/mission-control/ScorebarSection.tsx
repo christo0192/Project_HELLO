@@ -69,6 +69,8 @@ interface DraftIssue {
 }
 
 const PAGE_SIZE = 10;
+/** "Try again" on the notice shown when a reload after a write fails. */
+const RELOAD_RETRY_ID = 'scorebar-reload-retry';
 const EMPTY_RUBRIC: RubricDraft = { 1: '', 2: '', 3: '', 4: '' };
 const EMPTY_DRAFT: MetricDraft = {
   name: '',
@@ -159,7 +161,6 @@ export function ScorebarSection() {
   const [draft, setDraft] = useState<MetricDraft>(EMPTY_DRAFT);
   const [createIssues, setCreateIssues] = useState<DraftIssue[]>([]);
   const [creating, setCreating] = useState(false);
-  const [createdCount, setCreatedCount] = useState(0); // resets Ask Hello's status with the form
 
   /** The one metric whose details are open. Editing implies open. */
   const [openId, setOpenId] = useState<string | null>(null);
@@ -183,16 +184,19 @@ export function ScorebarSection() {
   /**
    * Read the library. The FIRST read shows the loader; every later one keeps
    * the list on screen (marked busy), so a reload never unmounts the control
-   * that has focus or scrolls the drawer back to the top.
+   * that has focus or scrolls the drawer back to the top. Resolves to the
+   * rows, or null when the read failed (the stale list stays, with a notice).
    */
-  const load = useCallback(async (initial = false) => {
+  const load = useCallback(async (initial = false): Promise<ScorecardMetricTemplate[] | null> => {
     setLoadError(null);
     if (!initial) setRefreshing(true);
     try {
       const rows = await api.listScorecardMetrics();
       setMetrics(rows);
+      return rows;
     } catch (e) {
       setLoadError(e instanceof ApiError ? e.message : 'Failed to load scorecard metrics.');
+      return null;
     } finally {
       setRefreshing(false);
     }
@@ -208,12 +212,16 @@ export function ScorebarSection() {
   useEffect(() => {
     const target = pendingFocus.current;
     if (!target) return;
-    const el =
+    let el =
       target.kind === 'id'
         ? document.getElementById(target.id)
         : target.kind === 'row'
           ? rowHeader(target.metricId)
           : newMetricButton.current;
+    // A row is only ever targeted after the list it belongs to has rendered,
+    // so a miss means it is not on the page shown. Never leave the target
+    // armed — it would fire whenever that row next appeared.
+    if (!el && target.kind === 'row') el = newMetricButton.current;
     if (!el) return;
     pendingFocus.current = null;
     el.focus();
@@ -249,10 +257,31 @@ export function ScorebarSection() {
     setMessage(null);
     pendingFocus.current = { kind: 'id', id: 'new-metric-name' };
   }
+  /** Cancel means discard: the next "New metric" starts from an empty form. */
   function closeCreate() {
     setCreateOpen(false);
+    setDraft(EMPTY_DRAFT);
     setCreateIssues([]);
     pendingFocus.current = { kind: 'new' };
+  }
+
+  /**
+   * The focus move a write makes AFTER its reload. It yields to anything the
+   * admin did during the wait: it lands only if focus is still on the control
+   * that started the write, or was dropped to <body> when that control
+   * disabled or unmounted. (Typing in a form opened meanwhile, or an Ask
+   * Hello dialog, keeps focus.)
+   */
+  function focusAfterReload(startedOn: Element | null, target: NonNullable<typeof pendingFocus.current>) {
+    const now = document.activeElement;
+    if (!now || now === document.body || now === startedOn || !now.isConnected) {
+      pendingFocus.current = target;
+    }
+  }
+  /** Page the list to the metric's row — the list is sorted by name, so a new or renamed one can land anywhere. */
+  function showRow(rows: ScorecardMetricTemplate[], metricId: string) {
+    const at = rows.findIndex((m) => m.id === metricId);
+    if (at >= 0) page.setPage(Math.floor(at / PAGE_SIZE) + 1);
   }
 
   async function createMetric() {
@@ -264,17 +293,23 @@ export function ScorebarSection() {
     }
     setMessage(null);
     setCreating(true);
+    const startedOn = document.activeElement;
     try {
       const created = await api.createScorecardMetric(draftToBody(draft));
-      setDraft({ name: '', description: '', instruction: '', rubric: { ...EMPTY_RUBRIC } });
-      setCreatedCount((n) => n + 1);
+      // The panel unmounts, and Ask Hello's status goes with it.
+      setDraft(EMPTY_DRAFT);
       setCreateOpen(false);
       setMessage({ text: `Metric “${created.name}” created.`, tone: 'ok' });
-      await load();
-      // Land on the new metric's row — proof it exists, and the natural next
-      // step (open it, check it) is one key away.
-      pendingFocus.current = { kind: 'row', metricId: created.id };
-      setOpenId(created.id);
+      const rows = await load();
+      if (rows) {
+        // Land on the new metric's row — proof it exists, and the natural
+        // next step (open it, check it) is one key away.
+        showRow(rows, created.id);
+        setOpenId(created.id);
+        focusAfterReload(startedOn, { kind: 'row', metricId: created.id });
+      } else {
+        focusAfterReload(startedOn, { kind: 'id', id: RELOAD_RETRY_ID });
+      }
     } catch (e) {
       setMessage({
         text: stableMutationMessage(
@@ -315,12 +350,18 @@ export function ScorebarSection() {
     }
     setMessage(null);
     setSaving(true);
+    const startedOn = document.activeElement;
     try {
       await api.updateScorecardMetric(metric.id, draftToBody(editDraft));
       setEditId(null);
       setMessage({ text: `Metric “${editDraft.name.trim()}” updated.`, tone: 'ok' });
-      await load();
-      pendingFocus.current = { kind: 'row', metricId: metric.id };
+      const rows = await load();
+      if (rows) {
+        showRow(rows, metric.id); // a rename can move it
+        focusAfterReload(startedOn, { kind: 'row', metricId: metric.id });
+      } else {
+        focusAfterReload(startedOn, { kind: 'id', id: RELOAD_RETRY_ID });
+      }
     } catch (e) {
       setMessage({
         text: stableMutationMessage(
@@ -342,13 +383,21 @@ export function ScorebarSection() {
     const list = metrics ?? [];
     const at = list.findIndex((m) => m.id === metric.id);
     const neighbour = list[at + 1] ?? list[at - 1] ?? null;
+    const startedOn = document.activeElement;
     try {
       await api.archiveScorecardMetric(metric.id);
       if (editId === metric.id) setEditId(null);
       if (openId === metric.id) setOpenId(null);
       setMessage({ text: `Metric “${metric.name}” archived.`, tone: 'ok' });
-      await load();
-      pendingFocus.current = neighbour ? { kind: 'row', metricId: neighbour.id } : { kind: 'new' };
+      const rows = await load();
+      focusAfterReload(
+        startedOn,
+        !rows
+          ? { kind: 'id', id: RELOAD_RETRY_ID }
+          : neighbour
+            ? { kind: 'row', metricId: neighbour.id }
+            : { kind: 'new' },
+      );
     } catch (e) {
       setMessage({
         text: stableMutationMessage(
@@ -372,6 +421,8 @@ export function ScorebarSection() {
           ref={newMetricButton}
           variant="primary"
           onClick={() => (createOpen ? closeCreate() : openCreate())}
+          // Like Cancel: a create in flight finishes against the open form.
+          disabled={creating}
           aria-expanded={createOpen}
           aria-controls="new-metric-panel"
           icon={<PlusIcon />}
@@ -388,6 +439,23 @@ export function ScorebarSection() {
           </InlineNotice>
         )}
       </div>
+
+      {/* The list stays (it is the last good read), but never silently: a
+          write that landed and a list that did not refresh must not look
+          like a finished job. */}
+      {loadError && (
+        <InlineNotice
+          tone="danger"
+          role="alert"
+          action={
+            <Button id={RELOAD_RETRY_ID} size="md" onClick={() => void load()}>
+              Try again
+            </Button>
+          }
+        >
+          This list could not be refreshed, so it may be out of date.
+        </InlineNotice>
+      )}
 
       {createOpen && (
         <section
@@ -412,7 +480,9 @@ export function ScorebarSection() {
             // Ask Hello drafts the instruction AND the rubric from the name, so
             // it sits above both. The create form only; editing has none.
             instructionAction={
-              <MetricAskHello idPrefix="new-metric" draft={draft} onApply={applyHelloDraft} resetKey={createdCount} />
+              // No `resetKey`: Create and Cancel both unmount this panel, and a
+              // fresh mount is the reset.
+              <MetricAskHello idPrefix="new-metric" draft={draft} onApply={applyHelloDraft} />
             }
             footer={
               <>

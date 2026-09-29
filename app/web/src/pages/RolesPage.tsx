@@ -177,9 +177,8 @@ export function RolesPage() {
           canEditMetrics || editing === null ? (
             <>
               {canEditMetrics && (
-                // A plain button, not `<Button>`: that component does not
-                // forward a ref, and `buttonClass` is exported for exactly
-                // this — wearing the same clothes without being the component.
+                // A plain button wearing `buttonClass`. (`<Button>` takes a
+                // `ref` too now; this one predates that and is equivalent.)
                 <button
                   ref={scorebarTrigger}
                   type="button"

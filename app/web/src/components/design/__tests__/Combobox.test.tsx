@@ -6,7 +6,7 @@
  * exist because the picker lives INSIDE modals: Escape closes the list and
  * not the dialog around it, and Enter never submits the surrounding form.
  */
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { useState } from 'react';
 import { describe, it, expect, vi } from 'vitest';
@@ -247,6 +247,20 @@ describe('Combobox', () => {
     // A SECOND Escape, with the list closed, is the dialog's again.
     await user.keyboard('{Escape}');
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('INSIDE A DIALOG, an Escape that ends an IME composition closes neither the list nor the dialog', async () => {
+    const user = userEvent.setup();
+    const onClose = vi.fn();
+    render(
+      <Dialog open onClose={onClose} title="Add job mapping" idPrefix="t">
+        <Harness />
+      </Dialog>,
+    );
+    await user.click(trigger());
+    fireEvent.keyDown(screen.getByRole('combobox'), { key: 'Escape', isComposing: true });
+    expect(screen.getByRole('listbox')).toBeInTheDocument();
+    expect(onClose).not.toHaveBeenCalled();
   });
 
   it('INSIDE A FORM, Enter picks the option and never submits', async () => {

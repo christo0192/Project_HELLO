@@ -25,17 +25,18 @@
  *     both states: a static name over a visible label that changed to
  *     "Hello is drafting…" would put the label outside the name.
  *   - Text the admin already wrote is never replaced without asking — and the
- *     centred `Dialog` that asks is PORTALLED to <body>. This button lives
- *     inside a `.glass` panel, and `.glass` sets `backdrop-filter`, which makes
- *     that panel the containing block for every `position: fixed` descendant:
- *     rendered in place, the "full-screen" overlay would be clipped to the
- *     form card, leaving the rest of the page live behind an `aria-modal`.
+ *     centred `Dialog` that asks is PORTALLED to <body>. Any ancestor with a
+ *     `backdrop-filter` or a `transform` (a `.glass` card, the Scorebar
+ *     drawer while it slides in) becomes the containing block for every
+ *     `position: fixed` descendant: rendered in place, the "full-screen"
+ *     overlay would be clipped to that ancestor, leaving the rest of the page
+ *     live behind an `aria-modal`.
  *   - A draft that comes back after the form CHANGED is discarded, not
  *     applied: the answer is about the name it was asked for, and applying it
  *     would overwrite whatever was typed during the wait. (RolesPage's
  *     Rephrase learned the same lesson the hard way.) So is one that comes
- *     back after this component UNMOUNTED — the host's list reload swaps the
- *     form out and back — because an unmounted instance can no longer see
+ *     back after this component UNMOUNTED — the host closes the form on
+ *     Cancel and on Create — because an unmounted instance can no longer see
  *     edits, and its "unchanged" check would be comparing against a stale
  *     form.
  *   - The status line and error describe the form AS IT IS. When the host

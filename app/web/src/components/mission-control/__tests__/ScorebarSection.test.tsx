@@ -359,4 +359,122 @@ describe('ScorebarSection', () => {
       screen.getByText('Add a name and Hello can draft the instruction and rubric.'),
     ).toBeInTheDocument();
   });
+  it('a reload that fails after a write says so, keeps the list, and focuses Try again', async () => {
+    api.listScorecardMetrics.mockResolvedValueOnce([COMMUNICATION]);
+    render(<ScorebarSection />);
+    const user = userEvent.setup();
+    await openCreate(user);
+    await user.type(screen.getByLabelText('Name'), 'Technical depth');
+    await user.type(screen.getByLabelText('Scoring instruction'), 'Assess depth.');
+    await fillRubric(user);
+    api.listScorecardMetrics.mockRejectedValueOnce(new Error('network'));
+    await user.click(screen.getByRole('button', { name: 'Create metric' }));
+
+    expect(await screen.findByText('Metric “Technical depth” created.')).toBeInTheDocument();
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent('This list could not be refreshed, so it may be out of date.');
+    // The last good list stays on screen.
+    expect(screen.getByRole('button', { name: 'Communication v3' })).toBeInTheDocument();
+    const retry = within(alert).getByRole('button', { name: 'Try again' });
+    await waitFor(() => expect(retry).toHaveFocus());
+
+    api.listScorecardMetrics.mockResolvedValueOnce([COMMUNICATION]);
+    await user.click(retry);
+    await waitFor(() => expect(screen.queryByRole('alert')).not.toBeInTheDocument());
+  });
+
+  it('lands on a new metric that sorts onto another page', async () => {
+    const tens = Array.from({ length: 10 }, (_, i) => ({
+      ...COMMUNICATION,
+      id: `m${i}`,
+      key: `k${i}`,
+      name: `Metric ${String.fromCharCode(65 + i)}`,
+      version: 1,
+    }));
+    const zeta = { ...COMMUNICATION, id: 'metric-1', key: 'zeta', name: 'Zeta', version: 1 };
+    api.listScorecardMetrics.mockResolvedValueOnce(tens);
+    api.createScorecardMetric.mockResolvedValue(zeta);
+    render(<ScorebarSection />);
+    const user = userEvent.setup();
+    await openCreate(user);
+    await user.type(screen.getByLabelText('Name'), 'Zeta');
+    await user.type(screen.getByLabelText('Scoring instruction'), 'Assess.');
+    await fillRubric(user);
+    api.listScorecardMetrics.mockResolvedValueOnce([...tens, zeta]);
+    await user.click(screen.getByRole('button', { name: 'Create metric' }));
+
+    const row = await screen.findByRole('button', { name: 'Zeta v1' });
+    await waitFor(() => expect(row).toHaveFocus());
+    expect(row).toHaveAttribute('aria-expanded', 'true');
+  });
+
+  it("a write's focus move yields to focus the admin took during the reload", async () => {
+    api.listScorecardMetrics.mockResolvedValueOnce([COMMUNICATION]);
+    render(<ScorebarSection />);
+    const user = userEvent.setup();
+    await openCreate(user);
+    await user.type(screen.getByLabelText('Name'), 'Technical depth');
+    await user.type(screen.getByLabelText('Scoring instruction'), 'Assess depth.');
+    await fillRubric(user);
+    let release: (v: unknown) => void = () => {};
+    api.listScorecardMetrics.mockReturnValueOnce(new Promise((r) => { release = r; }));
+    await user.click(screen.getByRole('button', { name: 'Create metric' }));
+    await screen.findByText('Metric “Technical depth” created.');
+
+    // Mid-reload, the admin moves on to another row.
+    const other = screen.getByRole('button', { name: 'Communication v3' });
+    await user.click(other);
+    expect(other).toHaveFocus();
+    release([COMMUNICATION, { ...COMMUNICATION, id: 'metric-1', key: 'technical_depth', name: 'Technical depth', version: 1 }]);
+    await screen.findByRole('button', { name: 'Technical depth v1' });
+    expect(other).toHaveFocus();
+  });
+
+  it('holds "New metric" while a create is in flight', async () => {
+    render(<ScorebarSection />);
+    const user = userEvent.setup();
+    await openCreate(user);
+    await user.type(screen.getByLabelText('Name'), 'Technical depth');
+    await user.type(screen.getByLabelText('Scoring instruction'), 'Assess depth.');
+    await fillRubric(user);
+    let resolve: (v: unknown) => void = () => {};
+    api.createScorecardMetric.mockReturnValueOnce(new Promise((r) => { resolve = r; }));
+    await user.click(screen.getByRole('button', { name: 'Create metric' }));
+    expect(screen.getByRole('button', { name: 'New metric' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Cancel' })).toBeDisabled();
+    resolve({ ...COMMUNICATION, id: 'metric-1', name: 'Technical depth', version: 1 });
+    await waitFor(() => expect(screen.getByRole('button', { name: 'New metric' })).toBeEnabled());
+  });
+
+  it('Cancel discards the draft — "New metric" opens an empty form', async () => {
+    render(<ScorebarSection />);
+    const user = userEvent.setup();
+    await openCreate(user);
+    await user.type(screen.getByLabelText('Name'), 'Half-typed');
+    await user.type(screen.getByLabelText('1 Poor'), 'Something');
+    await user.click(screen.getByRole('button', { name: 'Cancel' }));
+    await openCreate(user);
+    expect(screen.getByLabelText('Name')).toHaveValue('');
+    expect(screen.getByLabelText('1 Poor')).toHaveValue('');
+  });
+
+  it("Hello's draft clears the problems it answers", async () => {
+    api.draftMetricRubric.mockResolvedValue({
+      default_instruction: 'Look for concrete examples of ownership.',
+      rubric: { 1: 'No example.', 2: 'A vague claim.', 3: 'A specific example.', 4: 'Several examples.' },
+    });
+    render(<ScorebarSection />);
+    const user = userEvent.setup();
+    await openCreate(user);
+    await user.type(screen.getByLabelText('Name'), 'Ownership');
+    await user.click(screen.getByRole('button', { name: 'Create metric' }));
+    expect(await screen.findByText('A scoring instruction is required.')).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: /^Ask Hello/ }));
+    await waitFor(() =>
+      expect(screen.queryByText('A scoring instruction is required.')).not.toBeInTheDocument(),
+    );
+    expect(screen.queryByText('Rubric level 1 (Poor) is required.')).not.toBeInTheDocument();
+    expect(screen.getByLabelText('Scoring instruction')).not.toHaveAttribute('aria-invalid');
+  });
 });

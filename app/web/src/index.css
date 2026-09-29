@@ -502,13 +502,17 @@ body .text-red-700 { color: var(--error-text); }
    `transform` and `opacity` only: both are compositor-driven, so opening the
    drawer over a long roles list does not relayout the page behind the
    backdrop. */
+/* Ends at `transform: none`, not `translateX(0)`: under `both` fill mode a
+   retained transform makes the panel the containing block for every
+   `position: fixed` descendant, so a dialog opened in place inside the
+   drawer would be clipped to it (see `dialog-in` below). */
 @keyframes slide-over-in {
   from {
     transform: translateX(2rem);
     opacity: 0;
   }
   to {
-    transform: translateX(0);
+    transform: none;
     opacity: 1;
   }
 }

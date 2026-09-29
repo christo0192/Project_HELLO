@@ -66,7 +66,10 @@ export function usePagination<T>(
     from,
     to,
     items,
-    setPage: (next) => setPageState(Math.min(pageCount, Math.max(1, next))),
+    // No upper clamp here: `pageCount` in this closure can be a render old
+    // (paging to a row that the same update adds). `safePage` and the clamp
+    // effect above bound it against the rows actually rendered.
+    setPage: (next) => setPageState(Math.max(1, next)),
     setPageSize: (size) => {
       setPageSizeState(size);
       setPageState(1);

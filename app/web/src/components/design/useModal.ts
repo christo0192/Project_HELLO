@@ -210,6 +210,9 @@ export function useModal({
       if (!panel) return;
 
       if (e.key === 'Escape') {
+        // An Escape that cancels an IME composition belongs to the input
+        // method, not to the modal (a Combobox search field inside a dialog).
+        if (e.isComposing) return;
         // Claimed even when refused: a busy dialog on top must not let the
         // Escape through to the modal underneath it.
         handledKeyEvents.add(e);
