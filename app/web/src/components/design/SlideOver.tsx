@@ -84,17 +84,25 @@ export function SlideOver({
         aria-describedby={description ? descId : undefined}
         tabIndex={-1}
         className={cx(
-          'slide-over-panel glass relative z-10 flex h-full w-full max-w-2xl flex-col',
-          'overflow-y-auto p-5 shadow-xl outline-none',
+          // `glass-modal`, not `glass`: see its note in index.css — the
+          // translucent panel read grey over the dimmed page and failed
+          // small-text contrast.
+          'slide-over-panel glass-modal relative z-10 flex h-full w-full max-w-2xl flex-col',
+          'overflow-y-auto p-5 outline-none sm:p-6',
         )}
       >
-        <div className="mb-4 flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <h2 id={titleId} className="text-heading text-ink">
+        <div className="mb-5 flex items-start justify-between gap-3">
+          <div className="min-w-0 pt-1">
+            {/* Explicit type, not `text-heading` — that class was never
+                defined, so the drawer's title rendered as plain body text. */}
+            <h2
+              id={titleId}
+              className="text-[17px] font-semibold leading-6 tracking-[-0.01em] text-ink"
+            >
               {title}
             </h2>
             {description && (
-              <p id={descId} className="mt-1 text-[13px] text-ink-secondary">
+              <p id={descId} className="mt-1 max-w-prose text-[13px] leading-5 text-ink-secondary">
                 {description}
               </p>
             )}
@@ -107,9 +115,22 @@ export function SlideOver({
             // LOOKS closable is worse than one that plainly is not. Escape and
             // the backdrop are refused on the same condition.
             disabled={busy}
-            className="inline-flex min-h-11 shrink-0 items-center rounded-full px-3 text-[13px] font-medium text-ink-secondary underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info disabled:cursor-not-allowed disabled:opacity-50"
+            // An icon, so the NAME is spelled out: "Close" is what a screen
+            // reader says and what every caller and test looks it up by.
+            aria-label="Close"
+            className="-mr-1.5 -mt-1 inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-ink-tertiary transition-colors duration-150 hover:bg-ink/[0.06] hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-info disabled:cursor-not-allowed disabled:opacity-50"
           >
-            Close
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth={2}
+              strokeLinecap="round"
+              aria-hidden="true"
+              className="h-[18px] w-[18px]"
+            >
+              <path d="M6 6l12 12M18 6 6 18" />
+            </svg>
           </button>
         </div>
         {children}

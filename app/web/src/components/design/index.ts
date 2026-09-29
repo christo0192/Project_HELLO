@@ -23,6 +23,8 @@ export { SlideOver } from './SlideOver';
 export type { SlideOverProps } from './SlideOver';
 export { Dialog } from './Dialog';
 export type { DialogProps } from './Dialog';
+export { Combobox } from './Combobox';
+export type { ComboboxProps, ComboboxOption } from './Combobox';
 export { SectionHeader } from './SectionHeader';
 export type { SectionHeaderProps } from './SectionHeader';
 export { Button, ButtonSpinner, buttonClass } from './Button';

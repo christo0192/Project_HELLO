@@ -35,6 +35,38 @@ function startsWith(text: string): RegExp {
   return new RegExp(`^${text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`);
 }
 
+/**
+ * THE DIALOG'S PICKERS. Each is a `Combobox`: a trigger BUTTON named by its
+ * visible label AND its current value ("Ashby job Choose a job", "Role Sales
+ * Advisor Agent · Sales v1 hiring"), which opens an inline listbox. An
+ * option's accessible name is its label, then its description, then its tag.
+ * Option VALUES are never rendered, so a test can only pick by what an admin
+ * sees — which is the point.
+ */
+const JOB_PICKER = /^Ashby job\b/;
+const ROLE_PICKER = /^Role\b/;
+const jobPicker = () => screen.getByRole('button', { name: JOB_PICKER });
+const rolePicker = () => screen.getByRole('button', { name: ROLE_PICKER });
+
+/** Clicks a picker's trigger and returns the listbox it opened. */
+async function openPicker(triggerName: RegExp): Promise<HTMLElement> {
+  await userEvent.click(screen.getByRole('button', { name: triggerName }));
+  return screen.getByRole('listbox');
+}
+
+/** Opens a picker and clicks the option with this accessible name. */
+async function pick(triggerName: RegExp, optionName: string | RegExp): Promise<void> {
+  const list = await openPicker(triggerName);
+  await userEvent.click(within(list).getByRole('option', { name: optionName }));
+}
+
+/** The listbox offers EXACTLY these options, in this order, by accessible name. */
+function expectOptions(list: HTMLElement, names: Array<string | RegExp>): void {
+  const options = within(list).getAllByRole('option');
+  expect(options).toHaveLength(names.length);
+  options.forEach((option, i) => expect(option).toHaveAccessibleName(names[i]));
+}
+
 const { listAshbyMappings, listAshbyWorkflows, listAshbyJobs, pauseAshbyMapping, resumeAshbyMapping, archiveAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm, previewAshbyScorecardBinding, previewAshbyBacklog, confirmAshbyBacklog, createAshbyMapping, listRoles } = vi.hoisted(() => ({
   listAshbyMappings: vi.fn(),
   archiveAshbyMapping: vi.fn(),
@@ -737,10 +769,9 @@ describe('Adding a job mapping', () => {
   // admin to TYPE an Ashby job id and two stage ids. The dialog asks for two
   // choices, both made by name.
   const SALES_ROLE = '11111111-1111-4111-8111-111111111111';
-  const jobSelect = () => screen.getByLabelText('Ashby job') as HTMLSelectElement;
-  const roleSelect = () => screen.getByLabelText(/^Role$/) as HTMLSelectElement;
-  const optionTexts = (select: HTMLSelectElement) =>
-    [...select.options].map((o) => o.textContent ?? '');
+  /** The fixture's one pickable job and one active role, as the options name them. */
+  const FREE_JOB = 'Customer Success Lead Opened 1 Aug 2026';
+  const SALES_OPTION = 'Sales Advisor Agent · Sales v1 hiring';
 
   /** Opens the dialog and waits for the read it fires on open to land. */
   async function openDialog() {
@@ -749,15 +780,15 @@ describe('Adding a job mapping', () => {
     await screen.findByText('drift');
     await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
     const dialog = screen.getByRole('dialog', { name: 'Add job mapping' });
-    await waitFor(() => expect(jobSelect()).toBeEnabled());
+    await waitFor(() => expect(jobPicker()).toBeEnabled());
     return dialog;
   }
 
-  async function chooseAndSave(jobLabel: string) {
-    await userEvent.selectOptions(jobSelect(), jobLabel);
+  async function chooseAndSave(jobOption: string | RegExp) {
+    await pick(JOB_PICKER, jobOption);
     // Roles are re-read on every open too; wait for that read to land.
-    await waitFor(() => expect(roleSelect()).toBeEnabled());
-    await userEvent.selectOptions(roleSelect(), SALES_ROLE);
+    await waitFor(() => expect(rolePicker()).toBeEnabled());
+    await pick(ROLE_PICKER, startsWith('Sales Advisor'));
     await userEvent.click(screen.getByRole('button', { name: /Save mapping/ }));
   }
 
@@ -771,11 +802,21 @@ describe('Adding a job mapping', () => {
     const dialog = screen.getByRole('dialog', { name: 'Add job mapping' });
     expect(dialog).toHaveAttribute('aria-modal', 'true');
     // Enabling is a separate, database-gated action; an admin who assumes
-    // "saved" means "live" would wait for calls that never come.
-    expect(dialog).toHaveAccessibleDescription(/saves paused — use Resume to turn it on/);
+    // "saved" means "live" would wait for calls that never come. The dialog
+    // says so in its DESCRIPTION — what a screen reader announces on open.
+    expect(dialog).toHaveAccessibleDescription(
+      'Screen applicants for a live Ashby job with one of your roles. New mappings start paused.',
+    );
     // Two choices, no free text: no job id, no stage id, no label to type.
-    expect(within(dialog).getAllByRole('combobox')).toHaveLength(2);
+    // Each picker is a listbox trigger, not a field.
+    const pickers = within(dialog)
+      .getAllByRole('button')
+      .filter((button) => button.getAttribute('aria-haspopup') === 'listbox');
+    expect(pickers).toHaveLength(2);
+    expect(pickers[0]).toHaveAccessibleName(JOB_PICKER);
+    expect(pickers[1]).toHaveAccessibleName(ROLE_PICKER);
     expect(within(dialog).queryAllByRole('textbox')).toHaveLength(0);
+    expect(dialog.querySelectorAll('input, textarea, select, [contenteditable]')).toHaveLength(0);
     expect(within(dialog).queryByText(/stage/i)).toBeNull();
     // The list is LIVE: read on page load AND again on open.
     await waitFor(() => expect(listAshbyJobs).toHaveBeenCalledTimes(2));
@@ -783,17 +824,25 @@ describe('Adding a job mapping', () => {
 
   it('offers only OPEN jobs, by title, and never renders a job id', async () => {
     const dialog = await openDialog();
-    expect(optionTexts(jobSelect())).toEqual([
-      'Choose a job…',
-      'Account Executive — already mapped',
-      'Customer Success Lead',
-    ]);
-    // Not in the text, not in an option's value, not in a title tooltip —
-    // nowhere in the dialog's markup at all.
-    for (const option of jobSelect().options) {
-      expect(option.value).not.toMatch(/job_/);
-      expect(option.textContent).not.toMatch(/job_/);
+    expect(jobPicker()).toHaveAccessibleName('Ashby job Choose a job');
+    const list = await openPicker(JOB_PICKER);
+    // No job id — not in the text, not in an option's value, not in a title
+    // tooltip or an ARIA attribute — nowhere in the page's markup with every
+    // option rendered. Checked FIRST, so it stands on its own and does not
+    // hinge on the option names asserted below.
+    const ids = JOBS.jobs.map((job) => job.id);
+    for (const id of ids) expect(document.body.innerHTML).not.toContain(id);
+    expect(list).toHaveAccessibleName('Open Ashby jobs');
+    // The two Open jobs, the pickable one first; Draft, Closed and Archived
+    // jobs are not offered at all.
+    expectOptions(list, [FREE_JOB, 'Account Executive Opened 1 Jul 2026 Mapped']);
+    for (const title of ['Draft Role', 'Night Shift Advisor', 'Old Archived Role']) {
+      expect(within(list).queryByRole('option', { name: startsWith(title) })).toBeNull();
     }
+    // …nor once a job is chosen and the trigger and preview name it.
+    await userEvent.click(within(list).getByRole('option', { name: FREE_JOB }));
+    expect(jobPicker()).toHaveAccessibleName(`Ashby job ${FREE_JOB}`);
+    for (const id of ids) expect(document.body.innerHTML).not.toContain(id);
     expect(dialog.innerHTML).not.toMatch(/job_\d/);
   });
 
@@ -801,14 +850,21 @@ describe('Adding a job mapping', () => {
     // Dropping it would read as "Ashby has no such job" to an admin looking
     // for it; disabling says why it cannot be picked.
     await openDialog();
-    const options = [...jobSelect().options];
-    const mapped = options.find((o) => o.textContent === 'Account Executive — already mapped')!;
-    const free = options.find((o) => o.textContent === 'Customer Success Lead')!;
-    expect(mapped.disabled).toBe(true);
-    expect(free.disabled).toBe(false);
+    const list = await openPicker(JOB_PICKER);
+    const group = within(list).getByRole('group', { name: 'Already mapped' });
+    const mapped = within(group).getByRole('option', { name: startsWith('Account Executive') });
+    const free = within(list).getByRole('option', { name: FREE_JOB });
+    expect(mapped).toHaveAttribute('aria-disabled', 'true');
+    expect(mapped).toHaveTextContent('Mapped');
+    expect(free).not.toHaveAttribute('aria-disabled');
+    expect(within(group).queryByRole('option', { name: FREE_JOB })).toBeNull();
+    // A click on it chooses nothing: the list stays open, nothing is picked.
+    await userEvent.click(mapped);
+    expect(screen.getByRole('listbox')).toBe(list);
+    expect(jobPicker()).toHaveAccessibleName('Ashby job Choose a job');
   });
 
-  it('tells same-titled jobs apart by opening date, then by number — never by id', async () => {
+  it('tells same-titled jobs apart by an "Opened" line, then a listing number — never by id', async () => {
     listAshbyJobs.mockResolvedValue({
       ok: true,
       truncated: false,
@@ -822,32 +878,54 @@ describe('Adding a job mapping', () => {
       ],
     });
     await openDialog();
-    const labels = optionTexts(jobSelect()).slice(1);
+    const list = await openPicker(JOB_PICKER);
+    // ONE row format for every job: the title, then an "Opened" line.
+    const labels = [
+      'Support Agent Opened 1 Jun 2026',
+      'Support Agent Opened 15 Jul 2026',
+      // Same title AND same day: a listing number on the same line.
+      'Support Agent Opened 15 Jul 2026 · listing 2',
+      // No title (blank counts as none) and no date: numbered too.
+      'Untitled job',
+      'Untitled job Listing 2',
+    ];
+    expectOptions(list, labels);
     expect(new Set(labels).size).toBe(labels.length);
-    expect(labels[0]).toMatch(/^Support Agent — opened \S/);
-    expect(labels[1]).toMatch(/^Support Agent — opened \S/);
-    expect(labels[1]).not.toBe(labels[0]);
-    // Same title AND same day: numbered, in list order.
-    expect(labels[2]).toBe(`${labels[1]} (2)`);
-    // No title (blank counts as none) and no date: numbered too.
-    expect(labels[3]).toBe('Untitled job');
-    expect(labels[4]).toBe('Untitled job (2)');
-    for (const label of labels) expect(label).not.toMatch(/ash_/);
+    expect(document.body.innerHTML).not.toMatch(/ash_/);
   });
 
   it('keeps Save disabled until BOTH a job and a role are chosen', async () => {
     await openDialog();
     const save = screen.getByRole('button', { name: /Save mapping/ });
     expect(save).toBeDisabled();
-    await userEvent.selectOptions(jobSelect(), 'Customer Success Lead');
+    await pick(JOB_PICKER, FREE_JOB);
     expect(save).toBeDisabled();
-    await userEvent.selectOptions(roleSelect(), SALES_ROLE);
+    await waitFor(() => expect(rolePicker()).toBeEnabled());
+    await pick(ROLE_PICKER, SALES_OPTION);
     expect(save).toBeEnabled();
+  });
+
+  it('says what Save will create — by NAME, once both are chosen, and not before', async () => {
+    const dialog = await openDialog();
+    const summary = () => within(dialog).queryByText(/^Applicants for/);
+    // Nothing (or half) chosen: no placeholder preview restating the pickers.
+    expect(summary()).toBeNull();
+    await pick(JOB_PICKER, FREE_JOB);
+    expect(summary()).toBeNull();
+
+    await waitFor(() => expect(rolePicker()).toBeEnabled());
+    await pick(ROLE_PICKER, SALES_OPTION);
+    // The job's NAME and the role's TITLE — not the "Opened" line or the
+    // agent, and never an id or uuid.
+    expect(summary()).toHaveTextContent(
+      "Applicants for Customer Success Lead will be screened with the Sales Advisor role's questions and scorecard.",
+    );
+    expect(summary()!.innerHTML).not.toMatch(/job_\d|11111111-/);
   });
 
   it('SENDS exactly { external_job_id, role_id, label } — no stage keys — then closes and reloads', async () => {
     await openDialog();
-    await chooseAndSave('Customer Success Lead');
+    await chooseAndSave(FREE_JOB);
 
     await waitFor(() => expect(createAshbyMapping).toHaveBeenCalledTimes(1));
     const body = createAshbyMapping.mock.calls[0][0];
@@ -886,7 +964,7 @@ describe('Adding a job mapping', () => {
 
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
     await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
-    await waitFor(() => expect(jobSelect()).toBeEnabled());
+    await waitFor(() => expect(jobPicker()).toBeEnabled());
     await chooseAndSave('Untitled job');
     await waitFor(() => expect(createAshbyMapping).toHaveBeenCalledTimes(2));
     expect(Object.keys(createAshbyMapping.mock.calls[1][0]).sort()).toEqual([
@@ -901,7 +979,7 @@ describe('Adding a job mapping', () => {
     // resolved `{ok:false}` is a shape the API layer cannot produce.
     createAshbyMapping.mockRejectedValue(new ApiError('invalid_external_job_id', 400));
     const dialog = await openDialog();
-    await chooseAndSave('Customer Success Lead');
+    await chooseAndSave(FREE_JOB);
 
     await waitFor(() =>
       expect(within(dialog).getByRole('alert')).toHaveTextContent(
@@ -909,8 +987,9 @@ describe('Adding a job mapping', () => {
       ),
     );
     expect(screen.getByRole('dialog')).toBe(dialog);
-    expect(jobSelect().selectedOptions[0].textContent).toBe('Customer Success Lead');
-    expect(roleSelect().value).toBe(SALES_ROLE);
+    // Both triggers still name their choice.
+    expect(jobPicker()).toHaveAccessibleName(`Ashby job ${FREE_JOB}`);
+    expect(rolePicker()).toHaveAccessibleName(`Role ${SALES_OPTION}`);
     // Nothing on screen is known to be stale, so nothing is re-read.
     expect(listAshbyMappings).toHaveBeenCalledTimes(1);
     expect(listAshbyJobs).toHaveBeenCalledTimes(2);
@@ -931,7 +1010,7 @@ describe('Adding a job mapping', () => {
     };
     listAshbyMappings.mockResolvedValueOnce(MAPPINGS).mockResolvedValue(TAKEN);
     const dialog = await openDialog();
-    await chooseAndSave('Customer Success Lead');
+    await chooseAndSave(FREE_JOB);
 
     await waitFor(() =>
       expect(within(dialog).getByRole('alert')).toHaveTextContent(
@@ -943,17 +1022,23 @@ describe('Adding a job mapping', () => {
     expect(listAshbyMappings).toHaveBeenCalledTimes(2);
     expect(listAshbyJobs).toHaveBeenCalledTimes(3);
     expect(screen.getByRole('dialog')).toBe(dialog);
-    // The refreshed picker shows the job as taken, and the stale choice is gone.
-    expect(optionTexts(jobSelect())).toContain('Customer Success Lead — already mapped');
-    expect(jobSelect().value).toBe('');
-    expect(roleSelect().value).toBe(SALES_ROLE);
+    // The stale choice is gone, the role choice is kept, and Save is off.
+    expect(jobPicker()).toHaveAccessibleName('Ashby job Choose a job');
+    expect(rolePicker()).toHaveAccessibleName(`Role ${SALES_OPTION}`);
     expect(screen.getByRole('button', { name: /Save mapping/ })).toBeDisabled();
+    // The refreshed picker shows the job as taken: listed, grouped, disabled.
+    const list = await openPicker(JOB_PICKER);
+    const taken = within(within(list).getByRole('group', { name: 'Already mapped' })).getByRole(
+      'option',
+      { name: `${FREE_JOB} Mapped` },
+    );
+    expect(taken).toHaveAttribute('aria-disabled', 'true');
   });
 
   it('409 archived — says the mapping was deleted meanwhile, and refreshes', async () => {
     createAshbyMapping.mockRejectedValue(new ApiError('archived', 409));
     const dialog = await openDialog();
-    await chooseAndSave('Customer Success Lead');
+    await chooseAndSave(FREE_JOB);
     await waitFor(() =>
       expect(within(dialog).getByRole('alert')).toHaveTextContent(
         "This mapping was deleted while you were working, so it can't be changed.",
@@ -969,7 +1054,7 @@ describe('Adding a job mapping', () => {
     let settle: (value: unknown) => void = () => {};
     createAshbyMapping.mockReturnValue(new Promise((resolve) => { settle = resolve; }));
     const dialog = await openDialog();
-    await chooseAndSave('Customer Success Lead');
+    await chooseAndSave(FREE_JOB);
 
     await userEvent.keyboard('{Escape}');
     expect(screen.getByRole('dialog')).toBe(dialog);
@@ -986,8 +1071,13 @@ describe('Adding a job mapping', () => {
     renderPage();
     await screen.findByText('Account Executive');
     await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
-    expect(jobSelect()).toBeDisabled();
-    expect(optionTexts(jobSelect())).toEqual(['Loading jobs from Ashby…']);
+    // Off, busy, and saying why — the placeholder is the whole of its name.
+    expect(jobPicker()).toBeDisabled();
+    expect(jobPicker()).toHaveAttribute('aria-busy', 'true');
+    expect(jobPicker()).toHaveAccessibleName('Ashby job Loading jobs from Ashby…');
+    // Nothing to choose from yet: it will not open.
+    await userEvent.click(jobPicker());
+    expect(screen.queryByRole('listbox')).toBeNull();
     // The rows keep the names they already had.
     expect(screen.getByText('Account Executive')).toBeInTheDocument();
   });
@@ -1009,10 +1099,10 @@ describe('Adding a job mapping', () => {
       await waitFor(() => expect(jobsLive()).toHaveTextContent(copy));
       // …and shown under the picker, which it describes.
       expect(jobNote()).toHaveTextContent(copy);
-      expect(jobSelect()).toBeDisabled();
+      expect(jobPicker()).toBeDisabled();
       // The whole note describes the picker — the reason, then (when there
       // is one) the Try again that follows it.
-      expect(jobSelect()).toHaveAccessibleDescription(startsWith(copy));
+      expect(jobPicker()).toHaveAccessibleDescription(startsWith(copy));
       // A switched-off integration or a missing permission fails the same
       // way every time: a Try again button would promise otherwise.
       expect(within(jobNote()).queryAllByRole('button', { name: 'Try again' })).toHaveLength(
@@ -1038,13 +1128,18 @@ describe('Adding a job mapping', () => {
     expect(jobsLive()).toHaveTextContent('Loading jobs from Ashby…');
 
     await act(async () => answer(JOBS));
-    await waitFor(() => expect(jobSelect()).toBeEnabled());
+    await waitFor(() => expect(jobPicker()).toBeEnabled());
     expect(listAshbyJobs).toHaveBeenCalledTimes(1);
-    expect(optionTexts(jobSelect())).toContain('Customer Success Lead');
-    expect(jobSelect()).toHaveFocus();
+    // Focus is on the picker's TRIGGER, closed — asserted before opening it,
+    // which moves focus into its search field.
+    expect(jobPicker()).toHaveFocus();
+    expect(jobPicker()).toHaveAttribute('aria-expanded', 'false');
     // job_1 and job_3 are the Open ones.
     expect(jobsLive()).toHaveTextContent('2 open jobs');
     expect(within(jobNote()).queryByRole('button', { name: 'Try again' })).toBeNull();
+    // …and the list it now opens is the one just read.
+    const list = await openPicker(JOB_PICKER);
+    expect(within(list).getByRole('option', { name: FREE_JOB })).toBeInTheDocument();
   });
 
   it('a "Try again" that fails AGAIN leaves focus on Try again, not on <body>', async () => {
@@ -1064,7 +1159,7 @@ describe('Adding a job mapping', () => {
     listAshbyJobs.mockResolvedValue({ ...JOBS, jobs: JOBS.jobs.filter((job) => job.status !== 'Open') });
     await userEvent.click(retry);
     await waitFor(() => expect(jobNote()).toHaveTextContent('There are no open jobs in Ashby right now.'));
-    expect(jobSelect()).toBeDisabled();
+    expect(jobPicker()).toBeDisabled();
     expect(jobNote()).toHaveFocus();
   });
 
@@ -1093,9 +1188,9 @@ describe('Adding a job mapping', () => {
     const view = renderPage();
     await screen.findByText('Account Executive');
     await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
-    await waitFor(() => expect(jobSelect()).toBeEnabled());
+    await waitFor(() => expect(jobPicker()).toBeEnabled());
     expect(within(jobNote()).getByText("Confidential jobs aren't listed here.")).toBeInTheDocument();
-    expect(jobSelect()).toHaveAccessibleDescription("Confidential jobs aren't listed here.");
+    expect(jobPicker()).toHaveAccessibleDescription("Confidential jobs aren't listed here.");
     // A count only — never which jobs.
     expect(jobNote()).not.toHaveTextContent(/2/);
     view.unmount();
@@ -1104,9 +1199,9 @@ describe('Adding a job mapping', () => {
     renderPage();
     await screen.findByText('Account Executive');
     await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
-    await waitFor(() => expect(jobSelect()).toBeEnabled());
+    await waitFor(() => expect(jobPicker()).toBeEnabled());
     expect(screen.queryByText("Confidential jobs aren't listed here.")).toBeNull();
-    expect(jobSelect()).not.toHaveAccessibleDescription();
+    expect(jobPicker()).not.toHaveAccessibleDescription();
   });
 
   it('WARNS when the job list may be incomplete (a bound OR a slow Ashby cut it)', async () => {
@@ -1131,16 +1226,19 @@ describe('Adding a job mapping', () => {
       expect(within(jobNote()).getByText('There are no open jobs in Ashby right now.')).toBeInTheDocument(),
     );
     expect(jobsLive()).toHaveTextContent('There are no open jobs in Ashby right now.');
-    expect(jobSelect()).toBeDisabled();
+    expect(jobPicker()).toBeDisabled();
   });
 
   it('OFFERS ONLY ACTIVE ROLES', async () => {
     // Mapping an Ashby job to a retired role produces a screening call
     // against a script nobody maintains any more.
     await openDialog();
-    const labels = optionTexts(roleSelect());
-    expect(labels).toContain('Sales Advisor — Sales v1 hiring');
-    expect(labels).not.toContain('Retired Role');
+    await waitFor(() => expect(rolePicker()).toBeEnabled());
+    const list = await openPicker(ROLE_PICKER);
+    expect(list).toHaveAccessibleName('Active roles');
+    // By title, with the agent it runs on as the second line.
+    expectOptions(list, [SALES_OPTION]);
+    expect(within(list).queryByRole('option', { name: /Retired Role/ })).toBeNull();
   });
 
   it('SURVIVES a roles lookup failure', async () => {
@@ -1167,7 +1265,12 @@ describe('Adding a job mapping', () => {
       ]);
       await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
       await waitFor(() => expect(listRoles).toHaveBeenCalledTimes(opens));
-      await waitFor(() => expect(optionTexts(roleSelect())).toContain(`New Role ${opens}`));
+      // The picker stays off (loading) until THIS read lands, so the list it
+      // opens is the fresh one.
+      await waitFor(() => expect(rolePicker()).toBeEnabled());
+      const list = await openPicker(ROLE_PICKER);
+      // No agent: the title alone names it.
+      expect(within(list).getByRole('option', { name: `New Role ${opens}` })).toBeInTheDocument();
       await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
     }
   });
@@ -1177,8 +1280,11 @@ describe('Adding a job mapping', () => {
     renderPage();
     await screen.findByText('Account Executive');
     await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
-    expect(roleSelect()).toBeDisabled();
-    expect(optionTexts(roleSelect())).toEqual(['Loading roles…']);
+    expect(rolePicker()).toBeDisabled();
+    expect(rolePicker()).toHaveAttribute('aria-busy', 'true');
+    expect(rolePicker()).toHaveAccessibleName('Role Loading roles…');
+    await userEvent.click(rolePicker());
+    expect(screen.queryByRole('listbox')).toBeNull();
     expect(rolesLive()).toHaveTextContent('Loading roles…');
   });
 
@@ -1189,15 +1295,17 @@ describe('Adding a job mapping', () => {
     await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
     await waitFor(() => expect(roleNote()).toHaveTextContent("Couldn't load roles."));
     expect(rolesLive()).toHaveTextContent("Couldn't load roles.");
-    expect(roleSelect()).toBeDisabled();
-    expect(roleSelect()).toHaveAccessibleDescription(startsWith("Couldn't load roles."));
+    expect(rolePicker()).toBeDisabled();
+    expect(rolePicker()).toHaveAccessibleDescription(startsWith("Couldn't load roles."));
 
     listRoles.mockResolvedValue(ROLES);
     await userEvent.click(within(roleNote()).getByRole('button', { name: 'Try again' }));
-    await waitFor(() => expect(roleSelect()).toBeEnabled());
-    expect(roleSelect()).toHaveFocus();
-    expect(optionTexts(roleSelect())).toContain('Sales Advisor — Sales v1 hiring');
+    await waitFor(() => expect(rolePicker()).toBeEnabled());
+    // Focus on the closed trigger first; opening it moves focus to its search.
+    expect(rolePicker()).toHaveFocus();
     expect(rolesLive()).toHaveTextContent('1 active role');
+    const list = await openPicker(ROLE_PICKER);
+    expect(within(list).getByRole('option', { name: SALES_OPTION })).toBeInTheDocument();
   });
 
   it('with NO active roles, says so and links to the Roles page', async () => {
@@ -1211,18 +1319,33 @@ describe('Adding a job mapping', () => {
       ),
     );
     expect(within(roleNote()).getByRole('link', { name: 'Roles page' })).toHaveAttribute('href', '/roles');
-    expect(roleSelect()).toBeDisabled();
+    expect(rolePicker()).toBeDisabled();
     expect(rolesLive()).toHaveTextContent('There are no active roles yet.');
     expect(screen.getByRole('button', { name: /Save mapping/ })).toBeDisabled();
     await expect(container).toHaveNoViolations();
   });
 
-  it('both pickers are the design-system select, full width and free to shrink', async () => {
+  it('both pickers are the design-system Combobox — listbox triggers, full width and free to shrink', async () => {
     await openDialog();
-    for (const select of [jobSelect(), roleSelect()]) {
-      // `control-select` is SelectField's own class: its chevron, and the
-      // `controlClass` border that clears WCAG 1.4.11.
-      expect(select).toHaveClass('control-select', 'w-full', 'min-w-0');
+    await waitFor(() => expect(rolePicker()).toBeEnabled());
+    for (const [trigger, id] of [
+      [jobPicker(), 'ashby-mapping-job'],
+      [rolePicker(), 'ashby-mapping-role'],
+    ] as const) {
+      // A BUTTON that pops up a listbox — not a native select, whose list is
+      // the operating system's — and one that can never submit the form.
+      expect(trigger.tagName).toBe('BUTTON');
+      expect(trigger).toHaveAttribute('type', 'button');
+      expect(trigger).toHaveAttribute('aria-haspopup', 'listbox');
+      expect(trigger).toHaveAttribute('aria-expanded', 'false');
+      // Its visible <label> still points at it by the old id.
+      expect(trigger).toHaveAttribute('id', id);
+      expect(document.querySelector(`label[for="${id}"]`)).not.toBeNull();
+      // Full width, and free to shrink inside the dialog's column — the
+      // trigger AND the control's own wrapper, since a flex item's minimum
+      // width is its content's.
+      expect(trigger).toHaveClass('w-full', 'min-w-0');
+      expect(trigger.parentElement).toHaveClass('min-w-0');
     }
   });
 
@@ -1236,7 +1359,7 @@ describe('Adding a job mapping', () => {
     let fail: (reason: unknown) => void = () => {};
     createAshbyMapping.mockReturnValue(new Promise((_, reject) => { fail = reject; }));
     await openDialog();
-    await chooseAndSave('Customer Success Lead');
+    await chooseAndSave(FREE_JOB);
     dropFocusToBody();
 
     await act(async () => fail(new ApiError('mission_control_action_error', 500)));
@@ -1247,12 +1370,12 @@ describe('Adding a job mapping', () => {
     let fail: (reason: unknown) => void = () => {};
     createAshbyMapping.mockReturnValue(new Promise((_, reject) => { fail = reject; }));
     await openDialog();
-    await chooseAndSave('Customer Success Lead');
+    await chooseAndSave(FREE_JOB);
     dropFocusToBody();
 
     // A conflict re-reads the job list, which clears the choice: Save is off.
     await act(async () => fail(new ApiError('conflict', 409)));
-    await waitFor(() => expect(jobSelect()).toHaveFocus());
+    await waitFor(() => expect(jobPicker()).toHaveFocus());
     expect(screen.getByRole('button', { name: /Save mapping/ })).toBeDisabled();
   });
 
@@ -1260,7 +1383,7 @@ describe('Adding a job mapping', () => {
     const { container } = renderPage();
     await screen.findByText('Account Executive');
     await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
-    await waitFor(() => expect(jobSelect()).toBeEnabled());
+    await waitFor(() => expect(jobPicker()).toBeEnabled());
     await expect(container).toHaveNoViolations();
   });
 });
@@ -1634,12 +1757,10 @@ describe('Saving a mapping confirms it on the page', () => {
     await screen.findByText('Account Executive');
     expect(region()).toHaveAttribute('role', 'status');
     await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
-    const job = screen.getByLabelText('Ashby job') as HTMLSelectElement;
-    await waitFor(() => expect(job).toBeEnabled());
-    await userEvent.selectOptions(job, 'Customer Success Lead');
-    const role = screen.getByLabelText(/^Role$/) as HTMLSelectElement;
-    await waitFor(() => expect(role).toBeEnabled());
-    await userEvent.selectOptions(role, '11111111-1111-4111-8111-111111111111');
+    await waitFor(() => expect(jobPicker()).toBeEnabled());
+    await pick(JOB_PICKER, startsWith('Customer Success Lead'));
+    await waitFor(() => expect(rolePicker()).toBeEnabled());
+    await pick(ROLE_PICKER, startsWith('Sales Advisor'));
     await userEvent.click(screen.getByRole('button', { name: /Save mapping/ }));
 
     await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
@@ -1659,12 +1780,10 @@ describe('Saving a mapping confirms it on the page', () => {
     renderPage();
     await screen.findByText('Account Executive');
     await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
-    const job = screen.getByLabelText('Ashby job') as HTMLSelectElement;
-    await waitFor(() => expect(job).toBeEnabled());
-    await userEvent.selectOptions(job, 'Customer Success Lead');
-    const role = screen.getByLabelText(/^Role$/) as HTMLSelectElement;
-    await waitFor(() => expect(role).toBeEnabled());
-    await userEvent.selectOptions(role, '11111111-1111-4111-8111-111111111111');
+    await waitFor(() => expect(jobPicker()).toBeEnabled());
+    await pick(JOB_PICKER, startsWith('Customer Success Lead'));
+    await waitFor(() => expect(rolePicker()).toBeEnabled());
+    await pick(ROLE_PICKER, startsWith('Sales Advisor'));
     await userEvent.click(screen.getByRole('button', { name: /Save mapping/ }));
     await within(screen.getByRole('dialog')).findByRole('alert');
     expect(document.getElementById('ashby-mapping-confirmation')).toHaveTextContent('');
@@ -1759,18 +1878,21 @@ describe('One name per job — rows, picker and Delete agree, same-titled jobs a
     expect(document.body.innerHTML).not.toMatch(/job_twin/);
   });
 
-  it('the picker and the Delete confirmation use the SAME names as the rows', async () => {
+  it('the picker tells the twins apart by their opening DATE; the Delete confirmation uses the row name', async () => {
     renderPage();
     await screen.findByText(OLD);
     await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
-    const job = screen.getByLabelText('Ashby job') as HTMLSelectElement;
-    await waitFor(() => expect(job).toBeEnabled());
-    // The closed twin is not offered, but it still dates the open ones.
-    expect([...job.options].map((o) => o.textContent)).toEqual([
-      'Choose a job…',
-      `${OLD} — already mapped`,
-      NEW,
-    ]);
+    await waitFor(() => expect(jobPicker()).toBeEnabled());
+    // The closed twin is not offered. The mapped twin is listed last, under
+    // "Already mapped", tagged and disabled. Each carries the SAME date the
+    // row name does, on its "Opened" line.
+    const list = await openPicker(JOB_PICKER);
+    expectOptions(list, ['Support Agent Opened 20 Aug 2026', 'Support Agent Opened 1 Jun 2026 Mapped']);
+    expect(within(list).getByRole('option', { name: 'Support Agent Opened 1 Jun 2026 Mapped' })).toHaveAttribute(
+      'aria-disabled',
+      'true',
+    );
+    expect(within(list).queryByRole('option', { name: /15 Jul 2026/ })).toBeNull();
     await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
 
     await userEvent.click(
@@ -1783,12 +1905,12 @@ describe('One name per job — rows, picker and Delete agree, same-titled jobs a
     renderPage();
     await screen.findByText(OLD);
     await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
-    const job = screen.getByLabelText('Ashby job') as HTMLSelectElement;
-    await waitFor(() => expect(job).toBeEnabled());
-    await userEvent.selectOptions(job, NEW);
-    const role = screen.getByLabelText(/^Role$/) as HTMLSelectElement;
-    await waitFor(() => expect(role).toBeEnabled());
-    await userEvent.selectOptions(role, '11111111-1111-4111-8111-111111111111');
+    await waitFor(() => expect(jobPicker()).toBeEnabled());
+    await pick(JOB_PICKER, 'Support Agent Opened 20 Aug 2026');
+    // The trigger names the choice as the picker did: title, then the date.
+    expect(jobPicker()).toHaveAccessibleName('Ashby job Support Agent Opened 20 Aug 2026');
+    await waitFor(() => expect(rolePicker()).toBeEnabled());
+    await pick(ROLE_PICKER, startsWith('Sales Advisor'));
     await userEvent.click(screen.getByRole('button', { name: /Save mapping/ }));
     await waitFor(() => expect(createAshbyMapping).toHaveBeenCalledTimes(1));
     expect(createAshbyMapping.mock.calls[0][0]).toEqual({

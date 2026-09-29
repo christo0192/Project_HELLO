@@ -11,7 +11,10 @@
     "test": "vitest run",
     "test:coverage": "vitest run --coverage",
     "test:watch": "vitest",
-    "test:typecheck": "tsc -p tsconfig.test.json --noEmit"
+    "test:typecheck": "tsc -p tsconfig.test.json --noEmit",
+    "e2e": "playwright test --config e2e/playwright.config.ts --grep-invert @shots",
+    "e2e:shots": "playwright test --config e2e/playwright.config.ts --grep @shots",
+    "e2e:typecheck": "tsc -p e2e/tsconfig.json"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.108.2",
@@ -24,6 +27,7 @@
     "react-router-dom": "^7.18.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
     "@testing-library/jest-dom": "^6.6.3",
     "@testing-library/react": "^16.2.0",
     "@testing-library/user-event": "^14.6.1",

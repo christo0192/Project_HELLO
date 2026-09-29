@@ -68,7 +68,11 @@ export function Dialog({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center p-4 sm:p-6"
+      // TOP-anchored, not centred: content that grows while the dialog is
+      // open (a picker's list unfolding) extends DOWNWARD. Centred, the whole
+      // panel re-centred on every change and the control just clicked slid
+      // out from under the pointer.
+      className="fixed inset-0 z-50 flex items-start justify-center p-4 sm:p-6 sm:pt-[10vh]"
       style={{ margin: 0 }}
     >
       {/* Backdrop. A plain div, not a button — same reasoning as SlideOver:
@@ -89,17 +93,24 @@ export function Dialog({
         aria-describedby={description ? descId : undefined}
         tabIndex={-1}
         className={cx(
-          'dialog-panel glass relative z-10 flex max-h-full w-full min-w-0 max-w-lg flex-col',
-          'overflow-y-auto overscroll-contain p-5 shadow-xl outline-none',
+          // `glass-modal` (index.css): near-white, because translucent glass
+          // over the dimmed backdrop reads grey and fails small-text contrast.
+          'dialog-panel glass-modal relative z-10 flex max-h-full w-full min-w-0 max-w-lg flex-col',
+          // No `shadow-xl`: it overrode the modal material's own pop shadow,
+          // so Dialog and SlideOver would have cast different shadows.
+          'overflow-y-auto overscroll-contain p-5 outline-none sm:p-6',
         )}
       >
-        <div className="mb-4 flex items-start justify-between gap-3">
-          <div className="min-w-0">
-            <h2 id={titleId} className="break-words text-heading text-ink">
+        <div className="mb-5 flex items-start justify-between gap-3">
+          <div className="min-w-0 pt-1">
+            <h2
+              id={titleId}
+              className="break-words text-[17px] font-semibold leading-6 tracking-[-0.01em] text-ink"
+            >
               {title}
             </h2>
             {description && (
-              <p id={descId} className="mt-1 text-[13px] text-ink-secondary">
+              <p id={descId} className="mt-1 text-[13px] leading-5 text-ink-secondary">
                 {description}
               </p>
             )}
@@ -111,9 +122,22 @@ export function Dialog({
             // closable is worse than one that plainly is not. Escape and the
             // backdrop are refused on the same condition.
             disabled={busy}
-            className="inline-flex min-h-11 shrink-0 items-center rounded-full px-3 text-[13px] font-medium text-ink-secondary underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-offset-2 focus-visible:ring-info disabled:cursor-not-allowed disabled:opacity-50"
+            // An icon, so the NAME is spelled out: "Close" is what a screen
+            // reader says and what every test and caller looks it up by.
+            aria-label="Close"
+            className="-mr-1.5 -mt-1 inline-flex h-11 w-11 shrink-0 items-center justify-center rounded-full text-ink-tertiary transition-colors duration-150 hover:bg-ink/[0.06] hover:text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-info disabled:cursor-not-allowed disabled:opacity-50"
           >
-            Close
+            <svg
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth={2}
+              strokeLinecap="round"
+              aria-hidden="true"
+              className="h-[18px] w-[18px]"
+            >
+              <path d="M6 6l12 12M18 6 6 18" />
+            </svg>
           </button>
         </div>
         {children}

@@ -8,7 +8,7 @@
  * the amount — until the owner has made it total exactly 100%.
  */
 
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
@@ -100,6 +100,24 @@ const LIBRARY = [
   },
 ];
 
+/**
+ * THE "Add a metric" PICKER is a `Combobox`: a trigger BUTTON named by its
+ * label and its current value ("Add a metric Choose a metric"), which opens an
+ * inline listbox of library metrics. Option values (library ids) are never
+ * rendered, so a test picks the way an owner does — by name.
+ */
+const ADD_METRIC = /^Add a metric\b/;
+
+/** Opens a picker once it can be used, and clicks the option with this name. */
+async function pick(triggerName: RegExp, optionName: string | RegExp): Promise<void> {
+  const trigger = await screen.findByRole('button', { name: triggerName });
+  // The library loads beside the scorecard; the picker is off until it lands.
+  await waitFor(() => expect(trigger).toBeEnabled());
+  await userEvent.click(trigger);
+  const list = screen.getByRole('listbox');
+  await userEvent.click(within(list).getByRole('option', { name: optionName }));
+}
+
 describe('RoleScorecardEditor', () => {
   beforeEach(() => {
     // MUST come first. Without it these hoisted `vi.fn()`s keep their call
@@ -108,7 +126,7 @@ describe('RoleScorecardEditor', () => {
     // whose truth depends on where it sits in the file.
     vi.clearAllMocks();
     api.getRoleScorecard.mockResolvedValue({ scorecard: SCORECARD });
-    // A NON-EMPTY library. With `[]` the add-select is disabled and Attach is
+    // A NON-EMPTY library. With `[]` the add picker is disabled and Attach is
     // permanently `disabled={!addSelection}`, so every attach path — and the
     // weight arithmetic that goes with it — is unreachable by the suite.
     api.listScorecardMetrics.mockResolvedValue(LIBRARY);
@@ -116,9 +134,10 @@ describe('RoleScorecardEditor', () => {
   });
 
   async function attachOwnership() {
-    await userEvent.selectOptions(
-      await screen.findByLabelText('Add a metric'),
-      'lib-9',
+    await pick(ADD_METRIC, 'Ownership');
+    // Chosen: the trigger names it, and Attach is live.
+    expect(screen.getByRole('button', { name: ADD_METRIC })).toHaveAccessibleName(
+      'Add a metric Ownership',
     );
     await userEvent.click(screen.getByRole('button', { name: 'Attach' }));
   }
@@ -535,5 +554,26 @@ describe('RoleScorecardEditor', () => {
     expect(document.querySelector('[data-weight-total-bps]')).toBeNull();
     expect(document.querySelector('[data-weight-total-footer]')).toBeNull();
     expect(screen.queryByText(/short/)).not.toBeInTheDocument();
+  });
+
+  it('says the LIBRARY failed to load — never "No more metrics to add" — and Try again re-reads it', async () => {
+    // A failed read used to leave an empty picker claiming there was nothing
+    // left to add: a false statement about the library, with no way out.
+    api.listScorecardMetrics.mockRejectedValueOnce(Object.assign(new Error('boom'), { status: 500 }));
+    render(<RoleScorecardEditor roleId="r1" />);
+    const trigger = await screen.findByRole('button', { name: /Add a metric Couldn't load the metric library/ });
+    expect(trigger).toBeDisabled();
+    expect(screen.queryByText('No more metrics to add')).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    expect(api.listScorecardMetrics).toHaveBeenCalledTimes(2);
+    expect(await screen.findByRole('button', { name: /Add a metric Choose a metric/ })).toBeEnabled();
+  });
+
+  it('shows the library as LOADING while it is read, not as empty', async () => {
+    api.listScorecardMetrics.mockReturnValueOnce(new Promise(() => {}));
+    render(<RoleScorecardEditor roleId="r1" />);
+    const trigger = await screen.findByRole('button', { name: /Add a metric Loading the metric library/ });
+    expect(trigger).toHaveAttribute('aria-busy', 'true');
   });
 });
