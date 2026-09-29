@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useId, useRef, useState } from "react";
 import { api, ApiError } from "../api";
 import { questionTag, sectionHeading } from "../types";
 import type { Role, RoleInput, ScreeningCategory, ScreeningQuestion } from "../types";
@@ -10,15 +10,16 @@ import {
   GlassPanel,
   InlineNotice,
   LoadingPanel,
+  PAGE_SIZES,
   PageHeader,
   Pagination,
   RevealGroup,
   RevealItem,
   SectionHeader,
   SlideOver,
-  StatusBadge,
   TextArea,
   TextField,
+  cx,
   usePagination,
 } from "../components/design";
 import { buttonClass } from "../components/design";
@@ -76,6 +77,34 @@ function spokenQuestionIssue(question: string, allQuestions: QuestionRow[], inde
 
 function spokenQuestionIssueKey(value: string): string {
   return value.toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, " ").trim().replace(/\s+/g, " ");
+}
+
+/** The list's heading; the `<ul>` is named by it. One list per page. */
+const ROLES_LIST_HEADING = "roles-list-heading";
+
+/**
+ * How many skills a row names before the rest fold into "+N". Three fit the
+ * facts column on one or two lines; the full list is one hover away and is
+ * read out in full to a screen reader.
+ */
+const SKILLS_SHOWN = 3;
+
+/**
+ * Row controls: 36px at a desk (design rule 5), a 44px target under a finger
+ * or at phone width. Both, because a narrow desktop window has a mouse and a
+ * tablet in landscape does not.
+ */
+const ROW_CONTROL = "max-sm:h-11 [@media(pointer:coarse)]:h-11";
+
+/**
+ * The list's one-line summary: "6 roles, 5 active". Counts EVERY role, not
+ * the visible page. An archived role stays listed as Inactive (see
+ * `removeRole`), so the two numbers are what an operator needs to trust that
+ * a removal landed the way the note says.
+ */
+function rolesSummary(roles: Role[]): string {
+  const active = roles.filter((role) => role.is_active).length;
+  return `${roles.length} ${roles.length === 1 ? "role" : "roles"}, ${active === 0 ? "none" : active} active`;
 }
 
 export function RolesPage() {
@@ -172,7 +201,7 @@ export function RolesPage() {
         // NOT "the questions Gopu will ask". Each role now names its own
         // agent, and one hard-coded name in the page header contradicts every
         // role that chose a different one.
-        description="Define the jobs candidates are screened for and the questions the screening agent will ask."
+        description="The jobs candidates are screened for, and the questions the screening agent asks."
         actions={
           canEditMetrics || editing === null ? (
             <>
@@ -248,116 +277,228 @@ export function RolesPage() {
       )}
 
       {roles && roles.length > 0 && (
-        <div>
-          <RevealGroup className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-3">
-            {pager.items.map((role) => (
-              <RevealItem key={role.id} as="article" className="h-full">
-                <GlassPanel
-                  interactive
-                  padding="sm"
-                  className="flex h-full flex-col gap-3"
-                >
-                  <div className="flex items-start justify-between gap-3">
-                    <div className="min-w-0">
-                      {/* AGENT FIRST, job second (owner request). The agent
-                          name is how an operator tells two roles apart day to
-                          day, so it is the heading; a role without one falls
-                          back to its title, so the heading is never blank. The
-                          agent name is never spoken to a candidate — `title`
-                          stays the only name the phone worker says.
-
-                          `title` carries the FULL text: `truncate` cuts an
-                          80-character agent name to an ellipsis, and without
-                          it a sighted operator had no way to read the rest.
-                          The heading's accessible name is still its content,
-                          which was never truncated. */}
-                      <h2
-                        title={agentLabel(role)}
-                        className="min-w-0 truncate text-[15px] font-semibold tracking-[-0.01em] text-ink"
-                      >
-                        {agentLabel(role)}
-                      </h2>
-                      {/* The job, underneath — only when the heading is NOT
-                          already the job. Repeating the title under itself
-                          would be noise, not information. Truncated too, so
-                          it carries its full text the same way. */}
-                      {roleAgentName(role) && (
-                        <p
-                          data-role-title-secondary=""
-                          title={`Role: ${role.title}`}
-                          className="mt-0.5 truncate text-xs text-ink-tertiary"
-                        >
-                          Role: {role.title}
-                        </p>
-                      )}
-                    </div>
-                    <StatusBadge tone={role.is_active ? "success" : "neutral"}>
-                      {role.is_active ? "Active" : "Inactive"}
-                    </StatusBadge>
-                  </div>
-                  <p className="line-clamp-2 text-sm leading-6 text-ink-secondary">
-                    {role.jd}
-                  </p>
-                  {role.required_skills.length > 0 && (
-                    <ul className="flex flex-wrap gap-1.5">
-                      {role.required_skills.map((s) => (
-                        <li
-                          key={s}
-                          className="rounded-full bg-ink/[0.05] px-2 py-0.5 text-xs font-medium text-ink-secondary"
-                        >
-                          {s}
-                        </li>
-                      ))}
-                    </ul>
-                  )}
-                  <div className="mt-auto flex items-end justify-between gap-3 pt-1">
-                    <p className="text-[13px] text-ink-tertiary">
-                      {role.screening_template.length} screening question{role.screening_template.length === 1 ? "" : "s"}
-                    </p>
-                    <div className="flex shrink-0 items-center gap-2">
-                      <Button
-                        size="sm"
-                        variant="secondary"
-                        onClick={() => setEditing(role)}
-                      >
-                        Edit
-                      </Button>
-                      <Button
-                        size="sm"
-                        variant="ghost"
-                        onClick={() => void removeRole(role)}
-                        // NAMED FOR THE ROLE, and the name FOLLOWS THE STATE.
-                        // A page of six cards means six identical "Delete"
-                        // controls to anyone navigating by control; the title
-                        // tells them apart and is the last thing they hear
-                        // before a destructive action. A static label while
-                        // the visible text becomes "Deleting…" is the SC 2.5.3
-                        // mismatch the Rephrase button two elements away was
-                        // just fixed for.
-                        //
-                        // The name LEADS WITH WHAT THE CARD'S HEADING SAYS
-                        // (the agent), then the job in brackets, so a screen
-                        // reader hears the same name a sighted operator sees.
-                        aria-label={
-                          deletingId === role.id
-                            ? `Deleting role ${agentWithRoleLabel(role)}…`
-                            : `Delete role ${agentWithRoleLabel(role)}`
-                        }
-                        aria-busy={deletingId === role.id}
-                        aria-disabled={deletingId !== null}
-                      >
-                        {deletingId === role.id ? "Deleting…" : "Delete"}
-                      </Button>
-                    </div>
-                  </div>
-                </GlassPanel>
-              </RevealItem>
-            ))}
-          </RevealGroup>
-          <Pagination state={pager} noun="roles" />
-        </div>
+        // ONE SURFACE, ROWS SPLIT BY HAIRLINES (design rule 9). This was a
+        // 3×2 wall of identical glass cards, each repeating the same pill,
+        // chips and button pair, with the description cut mid-sentence. A
+        // role is scanned, compared and acted on, which is a list's job.
+        <RevealGroup>
+          <RevealItem>
+            <GlassPanel>
+              <SectionHeader
+                id={ROLES_LIST_HEADING}
+                title="All roles"
+                // Said once here, so nobody counts the rows to learn it.
+                description={rolesSummary(roles)}
+              />
+              <ul
+                // `role="list"`: Safari drops list semantics from a list
+                // styled without markers, and "list, 6 items" is how a screen
+                // reader user learns the size of what follows.
+                role="list"
+                aria-labelledby={ROLES_LIST_HEADING}
+                className="mt-2 divide-y divide-glass-ring"
+              >
+                {pager.items.map((role) => (
+                  <RoleRow
+                    key={role.id}
+                    role={role}
+                    deleting={deletingId === role.id}
+                    anyDeleting={deletingId !== null}
+                    onEdit={() => setEditing(role)}
+                    onDelete={() => void removeRole(role)}
+                  />
+                ))}
+              </ul>
+              {/* Paging controls only when there is more than one page's
+                  worth at the smallest size. "Showing 1–6 of 6 roles" with
+                  disabled arrows was a second way of saying the summary. */}
+              {pager.total > PAGE_SIZES[0] && (
+                <Pagination
+                  state={pager}
+                  noun="roles"
+                  className="mt-4 border-t border-glass-ring"
+                />
+              )}
+            </GlassPanel>
+          </RevealItem>
+        </RevealGroup>
       )}
     </div>
+  );
+}
+
+/**
+ * One role on the list: who it is, what it asks, whether it is live, and the
+ * two things an operator can do to it.
+ *
+ * FOUR COLUMNS AT A DESK, so the facts, the states and the buttons line up
+ * down the list and can be scanned. Every row is its own grid, which is why
+ * the status column is a fixed width rather than `auto`: an "Inactive" row
+ * would otherwise sit out of line with its "Active" neighbours. Below `xl`
+ * the facts drop under the description; on a phone the buttons take a line of
+ * their own.
+ *
+ * DOM ORDER IS READING ORDER: name, job, description, state, facts, then Edit
+ * and Delete. Only placement classes move things on screen, and nothing
+ * focusable moves, so Tab still reaches Edit then Delete, row by row, as it
+ * did on the cards.
+ */
+function RoleRow({
+  role,
+  deleting,
+  anyDeleting,
+  onEdit,
+  onDelete,
+}: {
+  role: Role;
+  /** This row's removal is in flight. */
+  deleting: boolean;
+  /** Some row's removal is in flight; every Delete refuses meanwhile. */
+  anyDeleting: boolean;
+  onEdit: () => void;
+  onDelete: () => void;
+}) {
+  const headingId = useId();
+  const label = agentLabel(role);
+  const jd = role.jd.trim();
+  const questions = role.screening_template.length;
+  const skills = role.required_skills;
+  const shownSkills = skills.slice(0, SKILLS_SHOWN);
+  const foldedSkills = skills.slice(SKILLS_SHOWN);
+
+  return (
+    <li
+      data-role-row={role.id}
+      className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-6 gap-y-3 py-4 last:pb-0 md:grid-cols-[minmax(0,1fr)_5.5rem_auto] xl:grid-cols-[minmax(0,1fr)_14rem_5.5rem_auto]"
+    >
+      <div className="col-start-1 row-start-1 min-w-0">
+        {/* AGENT FIRST, job second (owner request). The agent name is how an
+            operator tells two roles apart day to day, so it is the heading; a
+            role without one falls back to its title, so the heading is never
+            blank. The agent name is never spoken to a candidate: `title`
+            stays the only name the phone worker says.
+
+            `title` carries the FULL text: `truncate` cuts an 80-character
+            agent name to an ellipsis, and without it a sighted operator had
+            no way to read the rest. The heading's accessible name is still
+            its content, which was never truncated. An h3: the list's own
+            heading ("All roles") is the h2 above it. */}
+        <h3 id={headingId} title={label} className="truncate text-section text-ink">
+          {label}
+        </h3>
+        {/* The job, underneath, only when the heading is NOT already the job.
+            Repeating the title under itself would be noise, not information.
+            Truncated too, so it carries its full text the same way. */}
+        {roleAgentName(role) && (
+          <p
+            data-role-title-secondary=""
+            title={`Role: ${role.title}`}
+            className="truncate text-label font-medium text-ink-secondary"
+          >
+            Role: {role.title}
+          </p>
+        )}
+        {jd && (
+          // Two lines, then an ellipsis, with the whole text one hover away.
+          // The clamp is visual only: a screen reader reads all of it. Capped
+          // at a reading measure so a wide screen does not stretch it into
+          // one 150-character line.
+          <p title={jd} className="mt-1 line-clamp-2 max-w-[72ch] text-label text-ink-tertiary">
+            {jd}
+          </p>
+        )}
+      </div>
+
+      {/* The state in words, in the state's colour. A dot and a word rather
+          than a pill: on a list the column already says "this is the status",
+          and six tinted pills were half of what made the cards read as a
+          template. */}
+      <p
+        className={cx(
+          "col-start-2 row-start-1 flex items-center gap-1.5 justify-self-end whitespace-nowrap text-label font-medium md:justify-self-start xl:col-start-3",
+          role.is_active ? "text-success-text" : "text-ink-tertiary",
+        )}
+      >
+        <span
+          aria-hidden="true"
+          className={cx("h-1.5 w-1.5 shrink-0 rounded-full", role.is_active ? "bg-success" : "bg-ink-muted")}
+        />
+        {role.is_active ? "Active" : "Inactive"}
+      </p>
+
+      <div className="col-span-2 row-start-2 flex min-w-0 flex-col text-label md:col-span-1 md:col-start-1 xl:col-start-2 xl:row-start-1">
+        <p className="tabular-nums text-ink-secondary">
+          {questions} screening question{questions === 1 ? "" : "s"}
+        </p>
+        {skills.length > 0 && (
+          // The first few skills, then "+N". The folded ones are in the `+N`
+          // tooltip for a mouse and spoken in full to a screen reader; the
+          // tooltip itself is hidden from assistive tech so the list is not
+          // read twice.
+          <p className="text-ink-tertiary">
+            <span className="sr-only">Skills: </span>
+            {shownSkills.join(", ")}
+            {foldedSkills.length > 0 && (
+              <>
+                {/* A no-break space: "+1" never wraps onto a line alone. */}
+                {" "}
+                <span
+                  aria-hidden="true"
+                  title={foldedSkills.join(", ")}
+                  data-role-skills-more=""
+                  className="cursor-help font-medium tabular-nums text-ink-secondary"
+                >
+                  +{foldedSkills.length}
+                </span>
+                <span className="sr-only">, {foldedSkills.join(", ")}</span>
+              </>
+            )}
+          </p>
+        )}
+      </div>
+
+      {/* `min-w-0`, NOT `shrink-0`, and `flex-wrap`: on a phone this line is
+          the row's full width and must never be wider than the screen. At a
+          desk the buttons are nudged up so their centre sits on the heading's
+          line rather than below it. */}
+      <div className="col-span-2 row-start-3 flex min-w-0 flex-wrap items-center gap-2 md:col-span-1 md:col-start-3 md:row-start-1 md:-mt-2 md:justify-end xl:col-start-4">
+        <Button
+          variant="secondary"
+          className={ROW_CONTROL}
+          onClick={onEdit}
+          // The NAME stays "Edit", matching what is on screen; the row's
+          // heading is the description, so navigating by control still says
+          // which role six identical Edit buttons belong to.
+          aria-describedby={headingId}
+        >
+          Edit
+        </Button>
+        <Button
+          // Quiet until the confirmation (design rule 10): red ink and a red
+          // outline on the row, never a filled red button on every one.
+          variant="danger-quiet"
+          className={ROW_CONTROL}
+          onClick={onDelete}
+          // NAMED FOR THE ROLE, and the name FOLLOWS THE STATE. A page of six
+          // rows means six identical "Delete" controls to anyone navigating
+          // by control; the name tells them apart and is the last thing they
+          // hear before a destructive action. A static label while the
+          // visible text becomes "Deleting…" is the SC 2.5.3 mismatch the
+          // Rephrase button was fixed for.
+          //
+          // The name LEADS WITH WHAT THE ROW'S HEADING SAYS (the agent), then
+          // the job in brackets, so a screen reader hears the same name a
+          // sighted operator sees.
+          aria-label={
+            deleting ? `Deleting role ${agentWithRoleLabel(role)}…` : `Delete role ${agentWithRoleLabel(role)}`
+          }
+          aria-busy={deleting}
+          aria-disabled={anyDeleting}
+        >
+          {deleting ? "Deleting…" : "Delete"}
+        </Button>
+      </div>
+    </li>
   );
 }
 
@@ -798,14 +939,14 @@ function RoleForm({
               return (
                 <div key={idx} className="space-y-3">
                   {label && (
-                    <h4 className="pt-1 text-xs font-semibold uppercase tracking-wide text-ink-tertiary">
+                    <h4 className="pt-1 text-label font-semibold leading-5 text-ink-secondary">
                       {label}
                     </h4>
                   )}
                 <div className="glass-sunken space-y-3 p-3">
                   <div className="flex items-center justify-between gap-2">
                     <span
-                      className="font-mono text-[11px] text-ink-tertiary"
+                      className="font-mono text-meta text-ink-tertiary"
                       // The id is still worth having when there is no topic —
                       // it is what an older role has — but it is a poor tag
                       // for a human, so the topic wins when one exists.

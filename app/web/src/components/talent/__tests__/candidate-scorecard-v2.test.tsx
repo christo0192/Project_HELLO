@@ -255,10 +255,15 @@ describe('CandidateScorecardV2', () => {
     );
     expect(screen.getByText('Technical depth')).toBeInTheDocument();
     expect(screen.getByText('Leadership')).toBeInTheDocument();
-    // Scores carry their four-level SCORE_LABELS word (4 → Excellent, 2 → Average).
-    expect(screen.getByText('Score · Excellent')).toBeInTheDocument();
-    expect(screen.getByText('Score · Average')).toBeInTheDocument();
-    expect(screen.queryByText('Score · Below average')).not.toBeInTheDocument();
+    // Scores carry their four-level SCORE_LABELS word (4 → Excellent, 2 → Average)
+    // and a spoken reading on the assessment's own scale.
+    expect(screen.getByText('Excellent')).toBeInTheDocument();
+    expect(screen.getByText('Average')).toBeInTheDocument();
+    expect(screen.getByText('4 out of 4')).toBeInTheDocument();
+    expect(screen.getByText('2 out of 4')).toBeInTheDocument();
+    expect(screen.queryByText('Below average')).not.toBeInTheDocument();
+    // One surface, one list: no card per metric.
+    expect(screen.getByRole('list', { name: 'Metrics' }).children).toHaveLength(2);
     // Verbose rationale.
     expect(
       screen.getByText('Explained the trade-offs clearly and in depth.'),
@@ -266,8 +271,8 @@ describe('CandidateScorecardV2', () => {
     // Weighted overall.
     expect(screen.getByText('/ 100')).toBeInTheDocument();
     expect(screen.getAllByText('63').length).toBeGreaterThan(0);
-    expect(screen.getByText(/3\.50/)).toBeInTheDocument();
-    expect(screen.getByText('/ 4 weighted')).toBeInTheDocument();
+    expect(screen.getByText('3.50')).toBeInTheDocument();
+    expect(screen.getByText(/of 4 on the rubric/)).toBeInTheDocument();
     expect(screen.getByText('Hold')).toBeInTheDocument();
   });
 
@@ -278,8 +283,12 @@ describe('CandidateScorecardV2', () => {
       </CandidateShell>,
     );
     expect(screen.getByText('Insufficient evidence')).toBeInTheDocument();
-    expect(screen.getByText('Incomplete evidence')).toBeInTheDocument();
-    expect(screen.getByText('—')).toBeInTheDocument();
+    // No figure is invented: the overall reads "Not scored", never 0.
+    expect(screen.getByText('Not scored')).toBeInTheDocument();
+    expect(screen.queryByText('/ 100')).not.toBeInTheDocument();
+    expect(
+      screen.getByText('No metric had enough evidence to score. This screening needs a human review.'),
+    ).toBeInTheDocument();
     expect(screen.getByText('Needs human review')).toBeInTheDocument();
   });
 
@@ -289,19 +298,18 @@ describe('CandidateScorecardV2', () => {
         <CandidateScorecardV2 scorecard={readScorecardAssessmentV2(V2_PARTIAL)!} />
       </CandidateShell>,
     );
-    // The overall number is shown (NOT the blank "—"), with its recommendation.
-    expect(screen.queryByText('—')).not.toBeInTheDocument();
+    // The overall number is shown (NOT "Not scored"), with its recommendation.
+    expect(screen.queryByText('Not scored')).not.toBeInTheDocument();
     expect(screen.getAllByText('50').length).toBeGreaterThan(0);
-    expect(screen.getByText(/3\.00/)).toBeInTheDocument();
+    expect(screen.getByText('3.00')).toBeInTheDocument();
     expect(screen.getByText('Hold')).toBeInTheDocument();
-    // It is flagged PROVISIONAL, not "Incomplete evidence".
-    expect(screen.getByText('Provisional score')).toBeInTheDocument();
-    expect(screen.queryByText('Incomplete evidence')).not.toBeInTheDocument();
-    // The coverage caveat names the scored/total split (2 of 3 here).
-    expect(screen.getByText(/Provisional score from 2 of 3 metrics/)).toBeInTheDocument();
+    // It is flagged PROVISIONAL, and the caveat names the scored/total split
+    // (2 of 3 here), not the no-evidence message.
+    expect(screen.getByText(/Provisional: scored from 2 of 3 metrics/)).toBeInTheDocument();
+    expect(screen.queryByText(/No metric had enough evidence/)).not.toBeInTheDocument();
     // The scored metrics carry their real SCORE_LABELS word; the unevidenced one is flagged.
     expect(screen.getByText('Insufficient evidence')).toBeInTheDocument();
-    expect(screen.getAllByText('Score · Good').length).toBe(2); // score 3 → SCORE_LABELS[3]
+    expect(screen.getAllByText('Good').length).toBe(2); // score 3 → SCORE_LABELS[3]
   });
 });
 
@@ -378,19 +386,17 @@ describe('scoreScaleMax — four-level rubric vs historical 1–5 rows', () => {
         <CandidateScorecardV2 scorecard={readScorecardAssessmentV2(V2_HISTORICAL)!} />
       </CandidateShell>,
     );
-    // Weighted line reads "/ 5 weighted", not "/ 4".
-    expect(screen.getByText(/3\.80/)).toBeInTheDocument();
-    expect(screen.getByText('/ 5 weighted')).toBeInTheDocument();
-    expect(screen.queryByText('/ 4 weighted')).not.toBeInTheDocument();
-    // A score of 5 is "Excellent" on the legacy scale and the meter runs to 5.
-    const top = screen.getByRole('meter', { name: 'Score · Excellent' });
-    expect(top).toHaveAttribute('aria-valuenow', '5');
-    expect(top).toHaveAttribute('aria-valuemax', '5');
+    // The weighted line reads "of 5", not "of 4".
+    expect(screen.getByText('3.80')).toBeInTheDocument();
+    expect(screen.getByText(/of 5 on the rubric/)).toBeInTheDocument();
+    expect(screen.queryByText(/of 4 on the rubric/)).not.toBeInTheDocument();
+    // A score of 5 is "Excellent" on the legacy scale, read out of 5.
+    expect(screen.getByText('Excellent')).toBeInTheDocument();
+    expect(screen.getByText('5 out of 5')).toBeInTheDocument();
     // A score of 2 keeps its legacy "Below average" word (NOT the new "Average").
-    const low = screen.getByRole('meter', { name: 'Score · Below average' });
-    expect(low).toHaveAttribute('aria-valuenow', '2');
-    expect(low).toHaveAttribute('aria-valuemax', '5');
-    expect(screen.queryByText('Score · Average')).not.toBeInTheDocument();
+    expect(screen.getByText('Below average')).toBeInTheDocument();
+    expect(screen.getByText('2 out of 5')).toBeInTheDocument();
+    expect(screen.queryByText('Average')).not.toBeInTheDocument();
   });
 
   it('renders a new assessment on the 1–4 scale with the four-level labels', () => {
@@ -399,13 +405,12 @@ describe('scoreScaleMax — four-level rubric vs historical 1–5 rows', () => {
         <CandidateScorecardV2 scorecard={readScorecardAssessmentV2(V2_COMPLETE)!} />
       </CandidateShell>,
     );
-    expect(screen.getByText('/ 4 weighted')).toBeInTheDocument();
-    expect(screen.queryByText('/ 5 weighted')).not.toBeInTheDocument();
-    // A score of 4 is "Excellent" on the new scale and the meter runs to 4.
-    const top = screen.getByRole('meter', { name: 'Score · Excellent' });
-    expect(top).toHaveAttribute('aria-valuenow', '4');
-    expect(top).toHaveAttribute('aria-valuemax', '4');
-    expect(screen.queryByText('Score · Below average')).not.toBeInTheDocument();
+    expect(screen.getByText(/of 4 on the rubric/)).toBeInTheDocument();
+    expect(screen.queryByText(/of 5 on the rubric/)).not.toBeInTheDocument();
+    // A score of 4 is "Excellent" on the new scale, read out of 4.
+    expect(screen.getByText('Excellent')).toBeInTheDocument();
+    expect(screen.getByText('4 out of 4')).toBeInTheDocument();
+    expect(screen.queryByText('Below average')).not.toBeInTheDocument();
   });
 });
 

@@ -9,6 +9,7 @@ import {
   IST_TIME_ZONE,
   addIstDays,
   formatIstBandLabel,
+  formatIstDateTime,
   formatIstDayLabel,
   formatIstLongDayLabel,
   formatIstTime,
@@ -141,6 +142,9 @@ describe('display formatters', () => {
 
   it('labels days and bands legibly', () => {
     expect(formatIstDayLabel('2026-08-26')).toBe('Wed 26 Aug');
+    // en-GB ICU writes "Sept"; the app says "Sep" everywhere.
+    expect(formatIstDayLabel('2026-09-16')).toBe('Wed 16 Sep');
+    expect(formatIstDateTime('2026-09-16T05:14:00Z')).toMatch(/^16 Sep 2026, 10:44 IST$/);
     expect(formatIstLongDayLabel('2026-08-26')).toBe('Wednesday, 26 August 2026');
     // "to", not an en dash: a dash is announced as a pause or not at all.
     expect(formatIstBandLabel(9, 10)).toBe('09:00 to 10:00 IST');

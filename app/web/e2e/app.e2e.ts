@@ -281,7 +281,8 @@ test.describe('key states', () => {
 
   test('Ashby Mission Control shows every mapping state', async ({ app, page }) => {
     await app.goto('/ashby-mission-control');
-    for (const status of ['enabled', 'paused', 'drift']) {
+    // In words (enabled / paused / drift on the wire).
+    for (const status of ['Live', 'Paused', 'Out of sync']) {
       await expect(page.getByText(status, { exact: true }).first()).toBeVisible();
     }
     app.expectHealthy();

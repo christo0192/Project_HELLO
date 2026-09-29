@@ -6,7 +6,8 @@
  * block suppression, notes, appeals, CSV export, axe.
  */
 
-import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
+import { StrictMode } from 'react';
+import { act, render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -83,11 +84,47 @@ vi.mock('../api', () => ({
   },
 }));
 
+/**
+ * A realtime client that behaves like realtime-js where it matters here, so a
+ * test can deliver the INSERT a new call session produces:
+ *   - `channel(topic)` returns the channel ALREADY registered under that
+ *     topic, if there is one (RealtimeClient.channel does exactly this);
+ *   - `removeChannel` starts a leave and does NOT unregister the channel —
+ *     the real client only drops it once the leave round-trip completes, and
+ *     in a test that round-trip never happens;
+ *   - a leaving channel delivers nothing.
+ * Hoisted: `vi.mock` factories run before imports.
+ */
+interface MockChannel {
+  topic: string;
+  leaving: boolean;
+  handlers: Array<(payload: unknown) => void>;
+  on: (type: string, filter: unknown, handler: (payload: unknown) => void) => MockChannel;
+  subscribe: () => MockChannel;
+}
+const realtime = vi.hoisted(() => ({
+  channels: new Map<string, MockChannel>(),
+  /** Every topic `channel()` was asked for, in order. */
+  requested: [] as string[],
+  reset() {
+    this.channels.clear();
+    this.requested.length = 0;
+  },
+}));
+
 vi.mock('../lib/supabase', () => {
-  const makeChannel = () => {
-    const channel: any = {};
-    channel.on = () => channel;
-    channel.subscribe = () => 'mock-sub';
+  const makeChannel = (topic: string): MockChannel => {
+    const channel: MockChannel = {
+      topic,
+      leaving: false,
+      handlers: [],
+      on: (_type, _filter, handler) => {
+        channel.handlers.push(handler);
+        return channel;
+      },
+      // realtime-js returns the channel itself, and callers keep THAT.
+      subscribe: () => channel,
+    };
     return channel;
   };
   const makeQuery = () => {
@@ -101,15 +138,43 @@ vi.mock('../lib/supabase', () => {
   return {
     supabase: {
       from: () => makeQuery(),
-      channel: () => makeChannel(),
-      removeChannel: () => {},
+      channel: (topic: string) => {
+        realtime.requested.push(topic);
+        const existing = realtime.channels.get(topic);
+        if (existing) return existing;
+        const created = makeChannel(topic);
+        realtime.channels.set(topic, created);
+        return created;
+      },
+      removeChannel: (channel: MockChannel) => {
+        channel.leaving = true;
+        return Promise.resolve('ok');
+      },
     },
   };
 });
 
-function renderDetailPage(id = 'candidate-1') {
+/** Every live-watch topic requested for a candidate, oldest first. */
+function liveWatchTopics(candidateId: string): string[] {
+  return realtime.requested.filter((topic) =>
+    topic.startsWith(`candidate-live-watch:${candidateId}`),
+  );
+}
+
+/** Deliver a call-session INSERT to every live-watch channel that is not leaving. */
+function insertCallSession(candidateId: string, row: Record<string, unknown>) {
+  act(() => {
+    for (const channel of realtime.channels.values()) {
+      if (channel.leaving) continue;
+      if (!channel.topic.startsWith(`candidate-live-watch:${candidateId}`)) continue;
+      channel.handlers.forEach((handler) => handler({ new: row }));
+    }
+  });
+}
+
+function renderDetailPage(id = 'candidate-1', search = '') {
   return render(
-    <MemoryRouter initialEntries={[`/candidates/${id}`]}>
+    <MemoryRouter initialEntries={[`/candidates/${id}${search}`]}>
       <Routes>
         <Route path="/candidates/:id" element={<CandidateDetailPage />} />
       </Routes>
@@ -412,10 +477,64 @@ describe('CandidateDetailPage', () => {
     expect(await screen.findByText('← Back to candidates')).toBeInTheDocument();
   });
 
-  it('renders LiveKit voice screening + Live call panel', async () => {
+  it('renders the browser voice screening card but NO empty Live call panel when no call is live', async () => {
+    // The panel was permanent: every candidate page carried a large "No
+    // active call" box, including candidates screened weeks ago.
     renderDetailPage();
-    expect(await screen.findByText('LiveKit voice screening')).toBeInTheDocument();
-    expect(screen.getByText('Live call')).toBeInTheDocument();
+    expect(await screen.findByText('Browser voice screening')).toBeInTheDocument();
+    expect(screen.queryByText('Live call')).not.toBeInTheDocument();
+    expect(screen.queryByText('No call in progress')).not.toBeInTheDocument();
+  });
+
+  it('shows the Live call panel while a session is live', async () => {
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      sessions: [{ ...mockCandidateDetail.sessions[0], id: 's-live', status: 'in_progress', duration_sec: null }],
+    });
+    renderDetailPage();
+    expect(await screen.findByText('Live call')).toBeInTheDocument();
+  });
+
+  it('mounts the Live call panel when a NEW session is inserted while the page is open', async () => {
+    // The panel's own "auto-activate on a new session" behaviour: an invite
+    // created here, or the dialler placing the call, inserts a call session.
+    realtime.reset();
+    renderDetailPage();
+    await screen.findByText('Browser voice screening');
+    expect(screen.queryByText('Live call')).not.toBeInTheDocument();
+    // The subscription is made in an effect, which can flush after the text
+    // above appears: wait for it rather than racing it.
+    await waitFor(() => expect(liveWatchTopics('candidate-1').length).toBeGreaterThan(0));
+    insertCallSession('candidate-1', { id: 's-new', status: 'created' });
+    expect(await screen.findByText('Live call')).toBeInTheDocument();
+  });
+
+  it('gives every live-watch subscription its own topic, so a fast remount still hears the INSERT', async () => {
+    // realtime-js `channel(topic)` returns the channel already registered
+    // under that topic, and `removeChannel` unregisters it only after the
+    // leave round-trip. With one fixed topic, StrictMode's mount, unmount,
+    // mount handed the second subscription the first one's LEAVING channel,
+    // and the watch never fired.
+    realtime.reset();
+    render(
+      <StrictMode>
+        <MemoryRouter initialEntries={['/candidates/candidate-1']}>
+          <Routes>
+            <Route path="/candidates/:id" element={<CandidateDetailPage />} />
+          </Routes>
+        </MemoryRouter>
+      </StrictMode>,
+    );
+    await screen.findByText('Browser voice screening');
+    // StrictMode runs the effect, its cleanup, and the effect again.
+    await waitFor(() => expect(liveWatchTopics('candidate-1').length).toBeGreaterThanOrEqual(2));
+    const topics = liveWatchTopics('candidate-1');
+    expect(new Set(topics).size).toBe(topics.length);
+    expect(realtime.channels.get(topics[0])?.leaving).toBe(true);
+
+    // The surviving subscription hears the insert.
+    insertCallSession('candidate-1', { id: 's-new', status: 'created' });
+    expect(await screen.findByText('Live call')).toBeInTheDocument();
   });
 
   it('requires confirmation before requesting a phone screening', async () => {
@@ -547,9 +666,7 @@ describe('CandidateDetailPage', () => {
       const createObjSpy = vi.spyOn(URL, 'createObjectURL').mockImplementation(() => 'blob:mock');
       const revokeSpy = vi.spyOn(URL, 'revokeObjectURL').mockImplementation(() => {});
       renderDetailPage();
-      const btn = await screen.findByRole('button', {
-        name: 'Export screening data (scorecard + transcript)',
-      });
+      const btn = await screen.findByRole('button', { name: 'Export CSV' });
       fireEvent.click(btn);
       await waitFor(() => expect(mockApi.exportCsv).toHaveBeenCalledWith('candidate-1'));
       await waitFor(() => expect(createObjSpy).toHaveBeenCalled());
@@ -568,6 +685,225 @@ describe('CandidateDetailPage', () => {
       expect(await screen.findByText(/\/appeal#/)).toBeInTheDocument();
       expect(screen.queryByText(/\/appeal\?/)).not.toBeInTheDocument();
     });
+  });
+});
+
+describe('Candidate header: one primary action for the state', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockApi.listRoles.mockResolvedValue([]);
+    mockApi.getCandidate.mockResolvedValue(mockCandidateDetail);
+    mockApi.getMe.mockResolvedValue({ userId: 'u-admin', email: null, role: 'admin', active: true });
+    mockApi.getCandidatePhoneScreenings.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      cycles: [],
+      current_cycle: null,
+    });
+    mockApi.getSession.mockResolvedValue(mockSessionDetail);
+    mockApi.listAppeals.mockResolvedValue({ appeals: [] });
+  });
+
+  it('offers "Review screening" when there is a screening to read, and it opens the Review tab', async () => {
+    const user = userEvent.setup();
+    renderDetailPage();
+    const primary = await screen.findByRole('button', { name: 'Review screening' });
+    // Export is the only other header action, and it is not a primary.
+    expect(screen.getByRole('button', { name: 'Export CSV' })).toBeInTheDocument();
+    await user.click(primary);
+    const review = reviewTab();
+    expect(review).toHaveAttribute('aria-selected', 'true');
+    // Focus follows the change instead of being stranded on a vanished button.
+    await waitFor(() => expect(review).toHaveFocus());
+    expect(screen.queryByRole('button', { name: 'Review screening' })).not.toBeInTheDocument();
+  });
+
+  it('opens on the Review tab from ?tab=review (the table "Review & decide" link)', async () => {
+    renderDetailPage('candidate-1', '?tab=review');
+    await screen.findByText('Jane Doe');
+    expect(reviewTab()).toHaveAttribute('aria-selected', 'true');
+    expect(screen.queryByRole('button', { name: 'Review screening' })).not.toBeInTheDocument();
+  });
+
+  it('offers "Call candidate" when nothing is screened yet, once on the page, through the same confirmation', async () => {
+    const user = userEvent.setup();
+    mockApi.getCandidate.mockResolvedValue({ ...mockCandidateDetail, sessions: [], assessments: [] });
+    renderDetailPage();
+    const header = await screen.findByRole('button', { name: 'Call candidate' });
+    // The phone card does not repeat it: one call action on the page.
+    expect(screen.getAllByRole('button', { name: 'Call candidate' })).toHaveLength(1);
+    expect(screen.queryByRole('button', { name: 'Review screening' })).not.toBeInTheDocument();
+
+    await user.click(header);
+    const dialog = await screen.findByRole('dialog', { name: 'Confirm phone screening' });
+    await waitFor(() =>
+      expect(within(dialog).getByRole('button', { name: 'Confirm call' })).toHaveFocus(),
+    );
+    expect(mockApi.requestCandidatePhoneCall).not.toHaveBeenCalled();
+
+    // Escape closes it and hands focus back to the control that opened it.
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog', { name: 'Confirm phone screening' })).not.toBeInTheDocument();
+    expect(header).toHaveFocus();
+  });
+
+  it('moves focus into the call confirmation even when "Call candidate" is pressed from ?tab=review', async () => {
+    // A "Review & decide" deep link can land on the Review tab of a candidate
+    // with nothing to review, so the header offers "Call candidate" there.
+    // The confirmation lives on the Overview, and the tab switch is a router
+    // transition that commits AFTER the click's render: opening the
+    // confirmation in that render focused a button inside a still-`hidden`
+    // panel, which a browser refuses, leaving focus on the header button.
+    //
+    // jsdom does not implement that refusal (it focuses anything focusable,
+    // rendered or not), so this test adds it: focus() inside a `hidden`
+    // subtree is a no-op, as it is in every browser.
+    const realFocus = HTMLElement.prototype.focus;
+    const focusSpy = vi
+      .spyOn(HTMLElement.prototype, 'focus')
+      .mockImplementation(function (this: HTMLElement, options?: FocusOptions) {
+        if (this.closest('[hidden]')) return;
+        realFocus.call(this, options);
+      });
+    try {
+      const user = userEvent.setup();
+      mockApi.getCandidate.mockResolvedValue({ ...mockCandidateDetail, sessions: [], assessments: [] });
+      renderDetailPage('candidate-1', '?tab=review');
+      const header = await screen.findByRole('button', { name: 'Call candidate' });
+      expect(reviewTab()).toHaveAttribute('aria-selected', 'true');
+
+      await user.click(header);
+
+      expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true');
+      const dialog = await screen.findByRole('dialog', { name: 'Confirm phone screening' });
+      await waitFor(() =>
+        expect(within(dialog).getByRole('button', { name: 'Confirm call' })).toHaveFocus(),
+      );
+      expect(mockApi.requestCandidatePhoneCall).not.toHaveBeenCalled();
+
+      // Escape still hands focus back to the header button that opened it.
+      await user.keyboard('{Escape}');
+      expect(header).toHaveFocus();
+    } finally {
+      focusSpy.mockRestore();
+    }
+  });
+
+  it('keeps "Request re-screen" secondary: the header owns the one filled action', async () => {
+    mockApi.getCandidatePhoneScreenings.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      current_cycle: 1,
+      cycles: [{
+        cycle_number: 1,
+        state: 'completed',
+        state_reason: null,
+        version: 2,
+        no_answer_attempts: 0,
+        no_answer_limit: 3,
+        reconnects_used: 0,
+        provider_failures: 0,
+        next_eligible_at: null,
+        last_attempt_at: null,
+        terminal_at: '2026-08-27T10:00:00Z',
+        created_at: '2026-08-27T09:00:00Z',
+        updated_at: '2026-08-27T10:00:00Z',
+        has_session: true,
+        has_assessment: true,
+        appointment: null,
+      }],
+    });
+    renderDetailPage();
+    const rescreen = await screen.findByRole('button', { name: 'Request re-screen' });
+    const primary = screen.getByRole('button', { name: 'Review screening' });
+    // `bg-info` is the filled primary's paint (Button.tsx `variants.primary`).
+    expect(primary.className.split(/\s+/)).toContain('bg-info');
+    expect(rescreen.className.split(/\s+/)).not.toContain('bg-info');
+  });
+
+  it('offers no primary at all when there is nothing to review and no call to make', async () => {
+    mockApi.getCandidate.mockResolvedValue({ ...mockCandidateDetail, sessions: [], assessments: [] });
+    mockApi.getCandidatePhoneScreenings.mockResolvedValue({
+      ok: true,
+      enabled: false,
+      cycles: [],
+      current_cycle: null,
+    });
+    renderDetailPage();
+    await screen.findByText('Phone screening is turned off.');
+    expect(screen.queryByRole('button', { name: 'Call candidate' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Review screening' })).not.toBeInTheDocument();
+  });
+
+  it('shows the status in words beside the name', async () => {
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: { ...mockCandidateDetail.candidate, status: 'consent_declined' },
+    });
+    renderDetailPage();
+    const heading = await screen.findByRole('heading', { level: 1, name: 'Jane Doe' });
+    const header = heading.parentElement!;
+    expect(within(header).getByText('Consent declined')).toHaveAttribute(
+      'title',
+      'Status: consent_declined',
+    );
+  });
+});
+
+describe('Human words for machine values', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockApi.listRoles.mockResolvedValue([]);
+    mockApi.getCandidate.mockResolvedValue(mockCandidateDetail);
+    mockApi.getMe.mockResolvedValue({ userId: 'u-admin', email: null, role: 'admin', active: true });
+    mockApi.getCandidatePhoneScreenings.mockResolvedValue({
+      ok: true,
+      enabled: true,
+      cycles: [],
+      current_cycle: null,
+    });
+    mockApi.getSession.mockResolvedValue(mockSessionDetail);
+  });
+
+  it('names appeals and their states in words, keeping the stored value in title', async () => {
+    mockApi.listAppeals.mockResolvedValue({
+      appeals: [{
+        id: 'ap1',
+        candidate_id: 'candidate-1',
+        session_id: 'session-1',
+        assessment_id: null,
+        category: 'recording',
+        description: 'Please disregard the first call.',
+        status: 'under_review',
+        created_at: '2026-09-16T04:30:00Z',
+        updated_at: '2026-09-16T05:00:00Z',
+      }],
+    });
+    renderDetailPage();
+    const state = await screen.findByText('Under review');
+    expect(state).toHaveAttribute('title', 'under_review');
+    expect(screen.getByText('Recording appeal')).toBeInTheDocument();
+    expect(screen.queryByText('under_review')).not.toBeInTheDocument();
+  });
+
+  it('formats the phone number, with the E.164 value one hover away', async () => {
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: { ...mockCandidateDetail.candidate, phone_e164: '+919876543210' },
+    });
+    renderDetailPage();
+    const phone = await screen.findByText('+91 98765 43210');
+    expect(phone).toHaveAttribute('title', '+919876543210');
+    expect(screen.queryByText('+919876543210')).not.toBeInTheDocument();
+  });
+
+  it('names appeal-grant sessions by when they happened, never by an id prefix', async () => {
+    renderDetailPage();
+    const select = await screen.findByRole('combobox', { name: 'Session' });
+    const option = within(select).getAllByRole('option')[0];
+    expect(option).toHaveValue('session-1');
+    expect(option.textContent).not.toContain('session-');
+    expect(option.textContent).toContain('Completed');
   });
 });
 

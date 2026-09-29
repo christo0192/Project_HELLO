@@ -175,6 +175,15 @@ function formatter(options: Intl.DateTimeFormatOptions): Intl.DateTimeFormat {
  */
 const timeFormatter = formatter({ hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
 const dayFormatter = formatter({ weekday: 'short', day: '2-digit', month: 'short' });
+
+/**
+ * en-GB ICU abbreviates September as "Sept" (every other month is three
+ * letters); the rest of the app, and the charts' fixed month table, say
+ * "Sep". One spelling on every page.
+ */
+function shortSep(text: string): string {
+  return text.replace(/\bSept\b/g, 'Sep');
+}
 const longDayFormatter = formatter({
   weekday: 'long',
   day: 'numeric',
@@ -193,11 +202,13 @@ export function formatIstTime(utcIso: string): string {
 export function formatIstDateTime(utcIso: string): string {
   const ms = instantMs(utcIso);
   if (ms === null) return 'time unavailable';
-  return `${new Intl.DateTimeFormat('en-GB', {
-    timeZone: IST_TIME_ZONE,
-    dateStyle: 'medium',
-    timeStyle: 'short',
-  }).format(new Date(ms))} IST`;
+  return `${shortSep(
+    new Intl.DateTimeFormat('en-GB', {
+      timeZone: IST_TIME_ZONE,
+      dateStyle: 'medium',
+      timeStyle: 'short',
+    }).format(new Date(ms)),
+  )} IST`;
 }
 
 /** `14:30–15:00 IST` across two instants. */
@@ -213,7 +224,7 @@ export function formatIstTimeRange(startIso: string, endIso: string): string {
 /** `Mon 24 Aug` for an IST calendar date. */
 export function formatIstDayLabel(date: IstDate): string {
   if (!isIstDate(date)) return 'date unavailable';
-  return dayFormatter.format(new Date(istDayStartUtcIso(date)));
+  return shortSep(dayFormatter.format(new Date(istDayStartUtcIso(date))));
 }
 
 /** `Monday, 24 August 2026` — the unabbreviated name, for column headers. */

@@ -33,7 +33,7 @@ describe('Brand', () => {
     expect(img).toBeInTheDocument();
     expect(img?.getAttribute('class')).not.toMatch(/invert/i);
     expect(screen.getByText('HELLO')).toBeInTheDocument();
-    expect(screen.getByText(/Talent Workspace & Mission Control/i)).toBeInTheDocument();
+    expect(screen.getByText('Recruiting workspace')).toBeInTheDocument();
   });
 });
 

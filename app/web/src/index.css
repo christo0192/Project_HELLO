@@ -110,15 +110,26 @@
     height: 100%;
   }
 
+  /* IBM Plex Sans, self-hosted (src/main.tsx). Same stack as Tailwind's
+     `fontFamily.sans`, so preflight's `html` rule and this one agree.
+
+     No `font-feature-settings`. The old `'cv11', 'ss01'` are Inter's
+     character variants; on a system stack they switch on whatever those
+     slots happen to mean in the local face, which is how the pager's "10"
+     came out with an odd alternate zero (M007 review). Plex's default
+     glyphs are the design, and its figures are already tabular (every
+     digit one width); `tabular-nums` stays on tables, figures and counts so
+     the intent survives a change of face. */
   body {
     margin: 0;
     background-color: var(--surface-secondary);
     color: var(--ink);
-    font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto,
-      'Helvetica Neue', Arial, sans-serif;
+    font-family: 'IBM Plex Sans Variable', ui-sans-serif, system-ui, -apple-system,
+      'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+    font-kerning: normal;
     -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
     text-rendering: optimizeLegibility;
-    font-feature-settings: 'cv11', 'ss01';
   }
 
   :focus-visible {
@@ -296,6 +307,14 @@
     background-repeat: no-repeat;
     background-position: right 0.65rem center;
     background-size: 16px 16px;
+  }
+  /* The chevron's gutter. `select.` for specificity: `SelectField` also
+     carries the control's `px-3`, a UTILITY, and utilities beat this
+     components layer, so a bare `.control-select` padding lost and the value
+     ran under the chevron. In the 76px "Rows" select that put the chevron
+     across the "0" of "10", which is the pager glyph the M007 review saw as a
+     font artefact. */
+  select.control-select {
     padding-right: 2.25rem;
   }
 
@@ -350,25 +369,38 @@
 
 /* Compatibility bridge for pages still carrying stock Tailwind utility
    names. Candidate-scoped selectors are more specific and retain their exact
-   palette values while the remaining routes converge on the same tokens. */
-body .bg-gray-50,
-body .bg-gray-100 { background-color: var(--surface-secondary); }
-body .bg-gray-200,
-body .border-gray-200,
-body .border-gray-300 { border-color: var(--line); }
+   palette values while the remaining routes converge on the same tokens.
+
+   Two groups, kept apart on purpose. NEUTRALS map to the ink and ground
+   tokens. TINTS map to a tone's soft ground and are paired only with that
+   tone's `*-text` ink. The legacy greys can still land on a tint in old
+   markup; each resolves to an ink that clears AA there (tertiary ink is the
+   weakest: 4.80:1 on the info tint, 4.87 on error, 4.91 on success, 5.28 on
+   warning), so no grey here can wash out on colour. */
+
+/* Neutrals: ink, ground, hairline. */
 body .text-gray-400,
 body .text-gray-500 { color: var(--ink-tertiary); }
 body .text-gray-600,
 body .text-gray-700,
 body .text-gray-800 { color: var(--ink-secondary); }
 body .text-gray-900 { color: var(--ink); }
+body .bg-gray-50,
+body .bg-gray-100 { background-color: var(--surface-secondary); }
+body .bg-gray-200 { background-color: var(--line); }
+body .border-gray-200,
+body .border-gray-300 { border-color: var(--line); }
+
+/* Tints, each with its own tone ink. Blue and indigo are the info tone (they
+   used to fall through to the teal success tint, which read as the wrong
+   state). */
 body .bg-blue-50,
-body .bg-indigo-50,
-body .bg-emerald-50 { background-color: var(--success-soft); }
+body .bg-indigo-50 { background-color: var(--info-soft); }
 body .text-blue-600,
 body .text-blue-700,
 body .text-indigo-600,
 body .text-indigo-700 { color: var(--info); }
+body .bg-emerald-50 { background-color: var(--success-soft); }
 body .text-emerald-600,
 body .text-emerald-700 { color: var(--success-text); }
 body .bg-amber-50 { background-color: var(--warning-soft); }

@@ -44,7 +44,8 @@ export function chartTheme(theme: Theme, reducedMotion: boolean): ChartTheme {
     color: palette.colors,
     textStyle: {
       color: palette.text,
-      fontFamily: 'ui-sans-serif, system-ui, -apple-system, sans-serif',
+      // The app face first, so axis labels match the figures beside them.
+      fontFamily: "'IBM Plex Sans Variable', ui-sans-serif, system-ui, -apple-system, sans-serif",
       fontSize: 12,
     },
     tooltip: {

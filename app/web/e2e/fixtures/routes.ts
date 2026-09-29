@@ -55,29 +55,6 @@ export interface KnownDefect {
 /** What `ErrorBoundary` (src/components/ErrorBoundary.tsx) renders in its `role="alert"`. */
 export const ERROR_BOUNDARY_TEXT = 'Something went wrong loading this page';
 
-/**
- * APP DEFECT found by this harness (not a harness gap): `SessionDetailPage`
- * and `ScreeningPage` hand every assessment to the legacy `<Scorecard>`,
- * which reads v1 fields (`tone.notes`, `role_fit.notes`). A role-scorecard v2
- * assessment carries none of them on the wire (see `Assessment` in
- * src/types.ts), so opening a v2-scored session crashes the route into the
- * error boundary ("Something went wrong loading this page"). Ashby Mission
- * Control's "Review screening" link and the phone-attempt transcript link
- * both land here.
- *
- * REMOVE `knownIssue: APP_DEFECT_V2_SCORECARD` from both routes below (and
- * this constant) when the v2 session crash is fixed — a follow-up PR fixes
- * it. Until then the pinned test is green only while the page fails in
- * exactly this way; once it is fixed, the pinned test turns red on purpose.
- */
-const APP_DEFECT_V2_SCORECARD: KnownDefect = {
-  reason: 'App defect: legacy <Scorecard> crashes on a v2 assessment (TypeError reading "notes") — /sessions/:id and /screening/:id',
-  // React logs a caught render error as ONE console.error carrying the error,
-  // its stack and "The above error occurred in the <Scorecard> component".
-  // Both halves are required, so a `notes` crash elsewhere does not match.
-  consoleError: /TypeError: Cannot read properties of undefined \(reading 'notes'\)[\s\S]*The above error occurred in the <Scorecard> component/,
-};
-
 export const ROUTES: RouteCase[] = [
   { name: 'root-redirect', path: '/', heading: 'Dashboard', landmark: 'Recent candidates', finalPath: /\/dashboard$/ },
   { name: 'dashboard', path: '/dashboard', heading: 'Dashboard', landmark: 'Recent candidates' },
@@ -85,23 +62,12 @@ export const ROUTES: RouteCase[] = [
   { name: 'candidates-filtered', path: '/candidates?status=screened', heading: 'Candidates', landmark: 'Diego Ferreira' },
   { name: 'candidate-detail', path: `/candidates/${STAR_CANDIDATE_ID}`, heading: 'Meera Iyer', landmark: 'Screening cycle 1' },
   { name: 'candidate-detail-legacy', path: `/candidates/${LEGACY_CANDIDATE_ID}`, heading: 'Rohan Deshpande', landmark: 'Moved to technical round.' },
-  { name: 'session-legacy', path: `/sessions/${LEGACY_SESSION_ID}`, heading: `Session ${LEGACY_SESSION_ID.slice(0, 8)}`, landmark: 'Overall score' },
-  {
-    name: 'session-v2',
-    path: `/sessions/${V2_SESSION_ID}`,
-    heading: `Session ${V2_SESSION_ID.slice(0, 8)}`,
-    landmark: 'Session details',
-    knownIssue: APP_DEFECT_V2_SCORECARD,
-  },
-  {
-    name: 'screening-console',
-    path: `/screening/${V2_SESSION_ID}`,
-    heading: 'Screening with Gopu',
-    landmark: /walk me through your current role/i,
-    knownIssue: APP_DEFECT_V2_SCORECARD,
-  },
-  // The same two screens over a legacy (v1) session render fine, which pins
-  // the defect above to the assessment generation, not to the routes.
+  // Named by whose screening it is (the candidate's name), never by the
+  // session id. Legacy (v1) and role-scorecard (v2) assessments both render:
+  // the landmark proves the scorecard itself arrived, not just the shell.
+  { name: 'session-legacy', path: `/sessions/${LEGACY_SESSION_ID}`, heading: 'Rohan Deshpande’s screening', landmark: 'Overall score' },
+  { name: 'session-v2', path: `/sessions/${V2_SESSION_ID}`, heading: 'Meera Iyer’s screening', landmark: 'Technical depth' },
+  { name: 'screening-console', path: `/screening/${V2_SESSION_ID}`, heading: 'Screening with Gopu', landmark: /walk me through your current role/i },
   { name: 'screening-console-legacy', path: `/screening/${LEGACY_SESSION_ID}`, heading: 'Screening with Gopu', landmark: /walk me through your current role/i },
   { name: 'roles', path: '/roles', heading: 'Roles', landmark: 'Senior Backend Engineer' },
   { name: 'phone-calendar', path: '/phone-calendar', heading: 'Phone calendar', landmark: /Meera Iyer|Ananya Chaudhary/ },

@@ -79,10 +79,22 @@ export function EChart({
     instance.setOption(themedRef.current, true);
     readyRef.current?.(instance);
 
-    const resize = () => instance.resize();
+    // Resize with the CONTAINER, not only the window (a panel can change width
+    // without the window moving), and never into a sliver. A box a few pixels
+    // wide is a transient mid-layout measurement (a full-page capture resizing
+    // the viewport produced one); drawing into it left the whole series
+    // squeezed into a vertical line until the next resize. The last good size
+    // is kept instead, and the next real size redraws.
+    const resize = () => {
+      if (node.clientWidth < 48 || node.clientHeight < 32) return;
+      instance.resize();
+    };
     window.addEventListener('resize', resize);
+    const observer = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(resize);
+    observer?.observe(node);
     return () => {
       window.removeEventListener('resize', resize);
+      observer?.disconnect();
       instance.dispose();
       instanceRef.current = null;
     };

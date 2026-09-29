@@ -6,11 +6,13 @@
  *   - call_sessions.status: created | waiting | in_progress | completed |
  *                           failed | cancelled | expired
  *
- * Unknown statuses are rendered with their raw value and a neutral tone —
- * never invented labels.
+ * Unknown statuses are rendered through `humanizeEnum` ("custom_state" →
+ * "Custom state") with a neutral tone: the same words, never an invented
+ * label. Callers keep the raw value in `title` where an operator may quote it.
  */
 
 import type { StatusTone } from '../design/StatusBadge';
+import { humanizeEnum } from '../../lib/humanize';
 
 /** Human label for a candidate status (fallback: the raw value). */
 export function candidateStatusLabel(status: string | null | undefined): string {
@@ -31,7 +33,7 @@ export function candidateStatusLabel(status: string | null | undefined): string 
     case 'consent_declined':
       return 'Consent declined';
     default:
-      return (status ?? 'new').trim() || 'New';
+      return humanizeEnum((status ?? 'new').trim()) || 'New';
   }
 }
 
@@ -75,8 +77,109 @@ export function sessionStatusLabel(status: string | null | undefined): string {
     case 'deleted':
       return 'Deleted';
     default:
-      return status ?? '—';
+      return humanizeEnum(status) || '—';
   }
+}
+
+/* ── Phone call attempts ─────────────────────────────────────────────
+ *
+ * The words a recruiter reads for one dial. The vocabularies are the closed
+ * CHECK allowlists on `phone_call_attempts` (0042, extended by 0043 and 0095;
+ * mirrored in app/api/src/lib/phone-screening/vocabulary.ts). The OUTCOME is
+ * what a recruiter acts on, so it is the word shown; the attempt STATE is
+ * only shown while no outcome has been recorded yet (a dial in flight).
+ */
+
+const ATTEMPT_OUTCOME_LABELS: Readonly<Record<string, string>> = {
+  completed: 'Screening completed',
+  // A conversation that started and then dropped. Carries a reconnect grant.
+  disconnected: 'Dropped mid-call',
+  no_answer: 'No answer',
+  busy: 'Line busy',
+  voicemail: 'Voicemail',
+  // The candidate refused. Terminal: they are never dialled again.
+  declined: 'Declined',
+  wrong_number: 'Wrong number',
+  opt_out: 'Opted out',
+  // The carrier refused the call before it rang (sip originate rejected).
+  provider_error: "Couldn't connect",
+  window_closed: 'Calling window closed',
+  cancelled: 'Cancelled',
+  // 0043: answered, then hung up BEFORE the recording notice was delivered.
+  // There was no conversation yet, so this is not "dropped mid-call".
+  abandoned_pre_disclosure: 'Hung up before the recording notice',
+  // 0095: OUR consent gate failed (malformed RPC, classifier error). Not the
+  // candidate declining: they are owed the call and it is retried.
+  consent_failed: 'Consent check failed on our side',
+  // Values the offline e2e fixtures use for the same situations. Harmless in
+  // production (the allowlist never produces them) and they keep the fixture
+  // screenshots in plain words. `dropped_at_gate` is a call that ended at the
+  // identity / recording-consent gate, before screening questions began.
+  answered: 'Answered',
+  dropped_at_gate: 'Dropped at the consent check',
+};
+
+const ATTEMPT_STATE_LABELS: Readonly<Record<string, string>> = {
+  admitted: 'Dialling',
+  ringing: 'Ringing',
+  answered_unclassified: 'Answered',
+  human: 'Answered',
+  machine: 'Answering machine',
+  ended: 'Ended',
+  abandoned: 'Not placed',
+  completed: 'Completed',
+};
+
+/** What happened on one dial, in a recruiter's words (humanized floor). */
+export function attemptOutcomeLabel(
+  outcome: string | null | undefined,
+  state: string | null | undefined,
+): string {
+  if (outcome) return humanizeEnum(outcome, ATTEMPT_OUTCOME_LABELS);
+  return humanizeEnum(state, ATTEMPT_STATE_LABELS) || 'Unknown';
+}
+
+/** The raw pair, for `title`: what an operator quotes to engineering. */
+export function attemptRawStatus(
+  outcome: string | null | undefined,
+  state: string | null | undefined,
+): string {
+  return [state ? `state: ${state}` : null, outcome ? `outcome: ${outcome}` : null]
+    .filter(Boolean)
+    .join(' · ');
+}
+
+/* ── Appeals ─────────────────────────────────────────────────────────
+ * `appeal_requests.status` (0015): open → under_review → granted | denied.
+ * `category` is the candidate's own choice on the appeal form.
+ */
+
+const APPEAL_STATUS_LABELS: Readonly<Record<string, string>> = {
+  open: 'Open',
+  under_review: 'Under review',
+  granted: 'Granted',
+  denied: 'Denied',
+};
+
+export function appealStatusLabel(status: string | null | undefined): string {
+  return humanizeEnum(status, APPEAL_STATUS_LABELS) || 'Unknown';
+}
+
+/** Still awaiting a decision, i.e. something a recruiter has to act on. */
+export function isAppealPending(status: string | null | undefined): boolean {
+  return status === 'open' || status === 'under_review';
+}
+
+const APPEAL_CATEGORY_LABELS: Readonly<Record<string, string>> = {
+  scoring: 'Scoring appeal',
+  recording: 'Recording appeal',
+  accessibility: 'Accessibility appeal',
+  other: 'Appeal',
+};
+
+export function appealCategoryLabel(category: string | null | undefined): string {
+  if (!category) return 'Appeal';
+  return APPEAL_CATEGORY_LABELS[category] ?? `${humanizeEnum(category)} appeal`;
 }
 
 export function sessionStatusTone(status: string | null | undefined): StatusTone {
@@ -133,32 +236,4 @@ export function sessionStatusCounts(
   return [...counts.entries()]
     .map(([status, value]) => ({ label: sessionStatusLabel(status), value }))
     .sort((a, b) => b.value - a.value);
-}
-
-/**
- * Sessions started per day over the last `days` days (UTC dates), zero-filled
- * for days with no sessions. Zero-fill is truthful: those days had none.
- */
-export function sessionsPerDay(
-  sessions: ReadonlyArray<{ created_at: string }>,
-  days = 14,
-): Array<{ label: string; value: number }> {
-  const buckets = new Map<string, number>();
-  const today = new Date();
-  today.setUTCHours(0, 0, 0, 0);
-  for (let offset = days - 1; offset >= 0; offset -= 1) {
-    const day = new Date(today);
-    day.setUTCDate(day.getUTCDate() - offset);
-    buckets.set(day.toISOString().slice(0, 10), 0);
-  }
-  for (const session of sessions) {
-    const created = new Date(session.created_at);
-    if (Number.isNaN(created.getTime())) continue;
-    const key = created.toISOString().slice(0, 10);
-    if (buckets.has(key)) buckets.set(key, (buckets.get(key) ?? 0) + 1);
-  }
-  return [...buckets.entries()].map(([iso, value]) => {
-    const [, month, day] = iso.split('-');
-    return { label: `${month}/${day}`, value };
-  });
 }

@@ -58,7 +58,19 @@ export function formatDateTime(
   const date = toValidDate(value);
   if (!date) return NOT_AVAILABLE;
   try {
-    return new Intl.DateTimeFormat(undefined, opts).format(date);
+    // ONE CLOCK: en-GB day-month order and a 24-hour clock for every viewer,
+    // matching the session pages, the charts and the phone calendar. Left to
+    // the browser locale, an en-IN viewer got "10:44 am" here and "10:44" on
+    // the next page. The time zone is still the viewer's own.
+    //
+    // Current ICU writes September as "Sept" in en-GB/en-IN; every other
+    // short month is three letters, and the charts' fixed month table says
+    // "Sep". One spelling per page, whichever formatter drew it.
+    const clock: Intl.DateTimeFormatOptions = opts.hour ? { hourCycle: opts.hourCycle ?? 'h23' } : {};
+    return new Intl.DateTimeFormat('en-GB', { ...opts, ...clock })
+      .formatToParts(date)
+      .map((part) => (part.type === 'month' && part.value === 'Sept' ? 'Sep' : part.value))
+      .join('');
   } catch {
     // Extremely defensive: Intl should not throw for a valid Date.
     return NOT_AVAILABLE;

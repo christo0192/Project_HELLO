@@ -496,12 +496,16 @@ function QuotaPoliciesSection({
                 {p.max_cost_units ?? '∞'} · units/session: {p.cost_units_per_session ?? '—'} ·
                 warning: {p.warning_percentage == null ? 'off' : `${p.warning_percentage}%`}
               </span>
+              {/* Approved tokens only: the `*-text` ink on its own soft tint
+                  (enabled), the secondary ink on a faint ink tint (disabled).
+                  Grey-on-colour and stock palettes read as washed out and
+                  fail small-text contrast. */}
               <span
-                className={`rounded px-1.5 py-0.5 text-xs ${
-                  p.enabled ? 'bg-emerald-100 text-emerald-800' : 'bg-gray-100 text-gray-500'
+                className={`rounded px-1.5 py-0.5 text-xs font-medium ${
+                  p.enabled ? 'bg-success-soft text-success-text' : 'bg-ink/[0.06] text-ink-secondary'
                 }`}
               >
-                {p.enabled ? 'enabled' : 'disabled'}
+                {p.enabled ? 'Enabled' : 'Disabled'}
               </span>
               <Button
                 variant="secondary"

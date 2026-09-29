@@ -1,5 +1,4 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import type {
@@ -31,6 +30,12 @@ import {
   TextField,
 } from '../components/design';
 import type { ComboboxOption, StatusTone } from '../components/design';
+// By path, not through the design index: the menu is new in this change and
+// the index is shared with work in flight elsewhere.
+import { OverflowMenu } from '../components/design/OverflowMenu';
+import type { OverflowMenuItem } from '../components/design/OverflowMenu';
+import { humanizeEnum } from '../lib/humanize';
+import { ASHBY_ERROR_CODE_LABELS } from '../lib/ashby-labels';
 
 /**
  * Ashby Mission Control — admin-gated HR surface for the Ashby screening
@@ -48,12 +53,25 @@ import type { ComboboxOption, StatusTone } from '../components/design';
  * form) on create, and the label is simply the job's display name. A new
  * mapping saves PAUSED; Resume stays the separate, database-gated switch.
  *
+ * A ROW SHOWS ONE ACTION. Each mapping row is its job's name, the role it
+ * screens with and a status in words (Live / Paused / Out of sync), plus the
+ * one action that state calls for: Pause for a live or out-of-sync mapping,
+ * Resume for a paused one. Everything else — the three read-only lookups and
+ * Delete — waits in the row's "More" menu. Six equal buttons per row, with a
+ * filled red one at the end, was the "generated admin template" look; the
+ * red fill now appears only in the dialog that confirms a deletion.
+ *
  * DELETING A MAPPING: `Delete` ARCHIVES it. The row leaves this list and is
  * frozen — the calls, scores and history of every candidate it screened are
  * kept. Adding the same job again later creates a NEW mapping, paused; the
  * deleted one never comes back. The database refuses to archive an ENABLED
- * mapping, so the button stays disabled until the mapping is paused and says
- * why in words, and it always asks first, in a dialog that names the job.
+ * mapping, so the menu item stays disabled until the mapping is paused and
+ * says why in words under its label, and it always asks first, in a dialog
+ * that names the job.
+ *
+ * CANCELLING A SCREENING is the workflow rows' destructive action, and it
+ * asks first too: it cannot be undone from here, and it used to fire on one
+ * click of a filled red button beside "Get invite link".
  *
  * JOB NAMES, NEVER JOB IDS: an Ashby job id means nothing to the person
  * reading this page, and typing one by hand is how a mapping lands on the
@@ -83,21 +101,72 @@ import type { ComboboxOption, StatusTone } from '../components/design';
  * component state only and are never logged or sent to analytics.
  */
 
-/** Row separator inside a glass panel — a hairline, never a card border. */
-const ROW = 'border-b border-glass-ring py-3 last:border-0';
-/** Small neutral pill for ingestion / operation state. */
-/**
- * Operator-facing form of a backend enum: underscores become spaces and the
- * first letter is capitalised. The raw value is kept in a `title` so the
- * exact vocabulary the API used stays one hover away.
- */
-function humanize(value: string): string {
-  const spaced = value.replace(/_/g, ' ').trim();
-  return spaced.charAt(0).toUpperCase() + spaced.slice(1);
-}
+/** A list inside a glass panel: one surface, rows split by hairlines — never cards. */
+const LIST = 'divide-y divide-glass-ring';
+/** Row controls are 36px at a desk and a 44px target under a finger. */
+const TOUCH = '[@media(pointer:coarse)]:h-11';
 
-const PILL =
-  'inline-flex items-center whitespace-nowrap rounded-full bg-ink/[0.05] px-2 py-0.5 text-xs text-ink-secondary';
+/*
+ * THE WORDS FOR MACHINE STATES. Every state an admin reads on this page goes
+ * through one of these maps (via `humanizeEnum`, whose sentence-case fallback
+ * covers a value the API adds later), and the raw value rides along in a
+ * `title`, so an operator quoting it to an engineer is one hover away from
+ * the exact vocabulary. Explicit words where they matter: "drift" is not a
+ * word an HR admin uses, "Out of sync" is.
+ */
+const MAPPING_STATUS: Record<string, { label: string; tone: StatusTone }> = {
+  enabled: { label: 'Live', tone: 'success' },
+  paused: { label: 'Paused', tone: 'warning' },
+  drift: { label: 'Out of sync', tone: 'danger' },
+};
+/** A mapping's paused / out-of-sync reason, when the API gives a code rather than a sentence. */
+const STATUS_REASON_LABELS: Record<string, string> = {
+  stage_id_invalid: 'A stage on this job no longer exists in Ashby',
+};
+const LIFECYCLE: Record<string, { label: string; tone: StatusTone }> = {
+  imported: { label: 'Imported', tone: 'neutral' },
+  processing: { label: 'Processing', tone: 'neutral' },
+  ready: { label: 'Ready to screen', tone: 'neutral' },
+  completed: { label: 'Screening complete', tone: 'success' },
+  writeback_pending: { label: 'Writing back to Ashby', tone: 'info' },
+  cancelled: { label: 'Cancelled', tone: 'neutral' },
+};
+/**
+ * Why a workflow stopped for good. Neutral, not red: a withdrawn applicant is
+ * not an error, and red on every closed row is the alarm the review flagged.
+ */
+const TERMINAL_LABELS: Record<string, string> = {
+  withdrawn: 'Withdrawn',
+  deleted: 'Deleted in Ashby',
+  manual_stage_cancel: 'Cancelled by an admin',
+};
+/** Resume import (the "ingestion" pipeline) — named so it cannot be read as the Resume ACTION. */
+const INGESTION_LABELS: Record<string, string> = {
+  queued: 'Queued',
+  fetching: 'Fetching',
+  scanning: 'Scanning',
+  extracting: 'Extracting text',
+  structuring: 'Structuring',
+  ready: 'Ready',
+  failed_review: 'Needs manual review',
+  cancelled: 'Cancelled',
+};
+const OPERATION_LABELS: Record<string, string> = {
+  invite_delivery: 'Invite',
+  scorecard_write: 'Scorecard write-back',
+  stage_move: 'Stage move',
+};
+const OPERATION_STATE_LABELS: Record<string, string> = {
+  pending: 'Pending',
+  running: 'In progress',
+  succeeded: 'Done',
+  failed: 'Failed',
+  blocked: 'Blocked',
+  cancelled: 'Cancelled',
+};
+/** A failed operation's sanitized code; `humanizeEnum` covers the rest. */
+const ERROR_CODE_LABELS = ASHBY_ERROR_CODE_LABELS;
+
 /** Above this many rows the workflow list scrolls instead of running down the page. */
 const WORKFLOW_SCROLL_AFTER = 6;
 /**
@@ -108,9 +177,10 @@ const WORKFLOW_SCROLL_AFTER = 6;
  */
 const PICKER_NOTE =
   'flex flex-col gap-2 rounded-[14px] focus:outline-none focus-visible:ring-2 focus-visible:ring-info';
-/** The page-level confirmations after a save or a delete. */
+/** The page-level confirmations after a save, a delete or a cancel. */
 const MAPPING_ADDED = "Mapping added. It's paused — use Resume to turn it on.";
 const MAPPING_DELETED = 'Mapping deleted.';
+const SCREENING_CANCELLED = 'Screening cancelled.';
 /**
  * Picker-state copy, each said once on screen and once in a live region —
  * one constant per sentence so the two can never drift apart.
@@ -142,15 +212,22 @@ const DELETE_CONSEQUENCES =
  */
 const MAX_MAPPING_LABEL = 120;
 /**
- * Why an ENABLED mapping's Delete is disabled — the button's `title` and the
- * visible line under its row's actions, one string so the two cannot drift.
+ * Why an item in a row's More menu cannot be chosen. Shown under the item's
+ * label and read as its description, never only as a hover tooltip: a menu
+ * item is reached by the arrow keys, so the reason reaches everyone.
  */
 const PAUSE_BEFORE_DELETE = 'Pause this mapping before deleting it';
+const BACKLOG_NEEDS_LIVE = 'Available once this mapping is live';
+/** What Cancel screening does, said before it is done. */
+const CANCEL_CONSEQUENCES =
+  "Screening stops for this application. Any invite, scorecard write-back or stage move still " +
+  "waiting is cancelled, and it can't be restarted from here.";
 /**
- * The `id` of that line, by the row's list POSITION — like the picker's
- * option values, so no id of any kind is written into the markup.
+ * The `id` of a row's missing-stage line, which also describes its disabled
+ * Resume — by list POSITION, like the picker's option values, so no id of any
+ * kind is written into the markup.
  */
-const deleteHintId = (row: number): string => `ashby-mapping-delete-hint-${row}`;
+const missingStageId = (row: number): string => `ashby-mapping-missing-${row}`;
 
 export function AshbyMissionControlPage() {
   const [mappings, setMappings] = useState<AshbyMcMapping[]>([]);
@@ -251,13 +328,13 @@ export function AshbyMissionControlPage() {
     null,
   );
   /**
-   * Where focus goes when the Delete confirmation closes.
+   * Where focus goes when the Delete confirmation closes: the More button of
+   * the row it came from.
    *
-   * ONE ref, pointed at the clicked Delete button from its own click handler
-   * (`e.currentTarget`) — not a ref per row. `Button` does not forward refs,
-   * so a per-row ref map would mean hand-rolling six plain `<button>`s per
-   * row; and the click is the one moment that knows exactly which row's
-   * button opened the dialog. `useModal` reads the ref at CLOSE, so
+   * ONE ref, pointed at that button by the menu itself (`onSelect` hands
+   * over its trigger) — not a ref per row: choosing the item is the one
+   * moment that knows exactly which row's menu opened the dialog, and the
+   * menu item itself is gone by then. `useModal` reads the ref at CLOSE, so
    * `closeDeleteDialog` re-points it first whenever that button can no
    * longer take focus.
    */
@@ -304,6 +381,29 @@ export function AshbyMissionControlPage() {
   const [backlogPreview, setBacklogPreview] = useState<{ mappingId: string; preview: AshbyBacklogPreview } | null>(null);
   const [backlogError, setBacklogError] = useState<{ mappingId: string; message: string } | null>(null);
   const [backlogConfirmArmed, setBacklogConfirmArmed] = useState(false);
+  /**
+   * The workflow the Cancel confirmation is about. A SNAPSHOT, like
+   * `deleteTarget`, so the open dialog keeps naming the application after a
+   * reload changes the list under it.
+   */
+  const [cancelTarget, setCancelTarget] = useState<AshbyMcWorkflow | null>(null);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState<{ message: string; retryable: boolean } | null>(
+    null,
+  );
+  /** The row's More button — re-pointed at close when it can no longer take focus. */
+  const cancelReturnFocus = useRef<HTMLElement | null>(null);
+  const cancelBodyRef = useRef<HTMLDivElement | null>(null);
+  const refocusAfterCancel = useRef(false);
+  /**
+   * Each workflow row's application id, focusable by script only. A
+   * cancelled application's row turns terminal and loses its More button,
+   * so focus after the confirmation lands HERE, on the row it was about,
+   * instead of on `<body>`.
+   */
+  const workflowAnchors = useRef(new Map<string, HTMLElement>());
+  /** The Pause / Resume button whose request is running (see `rowAction`). */
+  const rowActionFocus = useRef<HTMLButtonElement | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -798,9 +898,8 @@ export function AshbyMissionControlPage() {
 
   /**
    * Cancel, Close, Escape and the backdrop all land here. Focus goes back to
-   * the row's Delete button when that button can take it. When it cannot —
-   * the row is gone after a reload, or the reload found the mapping enabled
-   * and its Delete is now disabled — `focus()` would fail SILENTLY and strand
+   * the row's More button when that button can take it. When it cannot —
+   * the row is gone after a reload — `focus()` would fail SILENTLY and strand
    * the keyboard user on `<body>`, so focus goes to this section's own `Add
    * mapping` control instead: the nearest stable thing in the same list.
    */
@@ -860,160 +959,312 @@ export function AshbyMissionControlPage() {
     restoreFocus(deleteBodyRef.current);
   }, [deleting]);
 
-  const mappingTone = (status: string): StatusTone =>
-    status === 'enabled' ? 'success' : status === 'drift' ? 'danger' : 'warning';
+  /**
+   * A row's Pause / Resume. `busy` disables the button for the length of the
+   * request, and a real browser drops focus to `<body>` the moment it does;
+   * the button itself survives the reload (only its label may change), so
+   * the effect below puts focus back on it once the request settles.
+   */
+  const rowAction = useCallback(
+    (button: HTMLButtonElement, action: () => Promise<{ ok: boolean; error?: string }>) => {
+      rowActionFocus.current = button;
+      void run(action);
+    },
+    [run],
+  );
+
+  useEffect(() => {
+    if (busy) return;
+    const button = rowActionFocus.current;
+    rowActionFocus.current = null;
+    if (!button || !button.isConnected || button.disabled) return;
+    const active = document.activeElement;
+    if (active === null || active === document.body) button.focus();
+  }, [busy]);
+
+  const openCancelDialog = useCallback((workflow: AshbyMcWorkflow, trigger: HTMLElement) => {
+    setSuccess(null);
+    refocusAfterCancel.current = false;
+    cancelReturnFocus.current = trigger;
+    setCancelError(null);
+    setCancelTarget(workflow);
+  }, []);
+
+  /**
+   * Keep screening, Close, Escape and the backdrop all land here. Focus goes
+   * back to the row's More button when it can take it; when it cannot (the
+   * reload found the application closed, so the row has no menu any more),
+   * to the row's application id; failing that, `useModal` falls back to
+   * `main` rather than `<body>`.
+   */
+  const closeCancelDialog = useCallback(() => {
+    const trigger = cancelReturnFocus.current;
+    if (!trigger || !document.contains(trigger) || trigger.matches(':disabled')) {
+      const anchor = cancelTarget ? workflowAnchors.current.get(cancelTarget.applicationLinkId) : undefined;
+      cancelReturnFocus.current = anchor && document.contains(anchor) ? anchor : null;
+    }
+    setCancelTarget(null);
+  }, [cancelTarget]);
+
+  /**
+   * Cancel one application's screening. Success is the absence of a throw
+   * AND of `ok: false`. On success the list is reloaded BEFORE the dialog
+   * closes: the row turns terminal and its More button leaves, so focus is
+   * pointed at the row itself first. `already_terminal` and `not_found`
+   * mean the row on screen is stale; reload so the page tells the truth, and
+   * turn the confirm button off, since pressing it again cannot succeed.
+   */
+  const cancelWorkflow = useCallback(async () => {
+    if (!cancelTarget || cancelling) return;
+    const linkId = cancelTarget.applicationLinkId;
+    setCancelError(null);
+    setCancelling(true);
+    try {
+      let code: string | null = null;
+      try {
+        const res = await api.cancelAshbyWorkflow(linkId, 'manual_stage_cancel');
+        if (!res.ok) code = res.error ?? 'unknown';
+      } catch (err) {
+        code = err instanceof ApiError ? err.message : 'unknown';
+      }
+      if (code === null) {
+        await load();
+        cancelReturnFocus.current = workflowAnchors.current.get(linkId) ?? null;
+        setCancelTarget(null);
+        setSuccess(SCREENING_CANCELLED);
+        return;
+      }
+      const stale = code === 'already_terminal' || code === 'not_found';
+      if (stale) await load();
+      setCancelError({ message: cancelErrorCopy(code), retryable: !stale });
+      refocusAfterCancel.current = true;
+    } finally {
+      setCancelling(false);
+    }
+  }, [cancelTarget, cancelling, load]);
+
+  /** After a FAILED cancel settles: the same focus rule as a failed delete. */
+  useEffect(() => {
+    if (cancelling || !refocusAfterCancel.current) return;
+    refocusAfterCancel.current = false;
+    restoreFocus(cancelBodyRef.current);
+  }, [cancelling]);
+
+  /* What needs a look, said once above each list instead of left for the
+     reader to count down the rows. */
+  const mappingSummary = loaded
+    ? sentence([
+        [mappings.filter((m) => m.status === 'enabled').length, 'live'],
+        [mappings.filter((m) => m.status === 'paused').length, 'paused'],
+        [mappings.filter((m) => m.status === 'drift').length, 'out of sync'],
+      ])
+    : null;
+  const workflowSummary = loaded
+    ? sentence([
+        [workflows.filter((w) => w.operations.some((op) => op.state === 'failed')).length, 'with a failed operation'],
+        [workflows.filter(notQueuedForWriteback).length, 'not queued for write-back'],
+        [workflows.filter((w) => w.ingestionState === 'failed_review').length, 'with a resume to review'],
+      ])
+    : null;
 
   const workflowRows = (
-    <ul>
-      {workflows.map((w) => (
-        <li key={w.applicationLinkId} className={ROW}>
-          <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
-            <div className="flex min-w-0 flex-wrap items-center gap-2">
-              <span className="font-mono text-[13px] text-ink">{w.externalApplicationId}</span>
-              <StatusBadge
-                tone={
-                  w.terminalState != null
-                    ? 'danger'
-                    : w.lifecycle === 'writeback_pending'
-                      ? 'info'
-                      : 'neutral'
-                }
-              >
-                <span title={w.lifecycle}>{humanize(w.lifecycle)}</span>
-              </StatusBadge>
-              {w.terminalState && (
-                <StatusBadge tone="danger">
-                  <span title={w.terminalState}>{humanize(w.terminalState)}</span>
-                </StatusBadge>
-              )}
-              {w.ingestionState && (
-                <span className={PILL} title={w.ingestionState}>
-                  Ingest · {humanize(w.ingestionState)}
-                </span>
-              )}
-              {/* A completed screening whose link never reached
-                  `writeback_pending` is a completion park that did not
-                  land. The observer is best-effort by design (it must
-                  never discard a scored assessment), so this is where that
-                  case becomes visible instead of living only in a log. */}
-              {w.sessionStatus === 'completed'
-                && w.terminalState == null
-                && w.lifecycle !== 'writeback_pending' && (
-                <StatusBadge tone="warning">screened: not parked</StatusBadge>
-              )}
-            </div>
-            {/* `min-w-0`, NOT `shrink-0`: a flex item that may not shrink
-                keeps its one-line width even after wrapping onto its own
-                line, and on a 360px phone that line is wider than the screen
-                — the page scrolled sideways. Allowed to shrink, the group
-                wraps its buttons instead. Same rule on the mapping rows. */}
-            <div className="flex min-w-0 flex-wrap items-center gap-2" data-testid="row-actions">
-              {w.sessionId && w.sessionStatus === 'completed' && (
-                <a
-                  href={`/sessions/${encodeURIComponent(w.sessionId)}`}
-                  className={buttonClass('secondary', 'sm')}
+    <ul className={LIST}>
+      {workflows.map((w) => {
+        const terminal = w.terminalState != null;
+        // A finished screening's row offers its review first; reissuing an
+        // invite after a completed call is the rare case, so it waits in More.
+        const reviewable = Boolean(w.sessionId) && w.sessionStatus === 'completed';
+        const inviteLabel = w.operations.some(
+          (op) => op.type === 'invite_delivery' && op.state === 'succeeded',
+        )
+          ? 'Reissue invite link'
+          : 'Get invite link';
+        const lifecycle = LIFECYCLE[w.lifecycle] ?? { label: humanizeEnum(w.lifecycle), tone: 'neutral' };
+        // A closed application has nothing left to do except, perhaps, be
+        // reviewed: no invite, no cancel, and so no menu at all.
+        const menuItems: OverflowMenuItem[] = terminal
+          ? []
+          : [
+              ...(reviewable
+                ? [
+                    {
+                      key: 'invite',
+                      label: inviteLabel,
+                      disabled: busy,
+                      onSelect: () => void deliverInvite(w.applicationLinkId),
+                    },
+                  ]
+                : []),
+              {
+                key: 'cancel',
+                label: 'Cancel screening',
+                tone: 'danger',
+                haspopup: 'dialog',
+                disabled: busy,
+                onSelect: (trigger) => openCancelDialog(w, trigger),
+              },
+            ];
+        const hasActions = reviewable || !terminal;
+        return (
+          <li
+            key={w.applicationLinkId}
+            className="grid grid-cols-1 gap-x-6 gap-y-3 py-4 first:pt-3 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center"
+          >
+            <div className="min-w-0">
+              <div className="flex min-w-0 flex-wrap items-center gap-x-2.5 gap-y-1.5">
+                {/* The application's only name on this page. Focusable by
+                    script only: where focus goes once a cancel closes the
+                    row's menu for good. */}
+                <span
+                  ref={(node) => {
+                    if (node) workflowAnchors.current.set(w.applicationLinkId, node);
+                    else workflowAnchors.current.delete(w.applicationLinkId);
+                  }}
+                  tabIndex={-1}
+                  className="rounded-sm font-mono text-label font-medium text-ink focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
                 >
-                  Review screening
-                </a>
-              )}
-              <Button
-                size="sm"
-                disabled={busy || w.terminalState != null}
-                onClick={() => void deliverInvite(w.applicationLinkId)}
-              >
-                {w.operations.some(
-                  (op) => op.type === 'invite_delivery' && op.state === 'succeeded',
-                )
-                  ? 'Reissue invite link'
-                  : 'Get invite link'}
-              </Button>
-              <Button
-                variant="danger"
-                size="sm"
-                disabled={busy || w.terminalState != null}
-                onClick={() => run(() => api.cancelAshbyWorkflow(w.applicationLinkId, 'manual_stage_cancel'))}
-              >
-                Cancel
-              </Button>
-            </div>
-          </div>
-
-          {inviteError?.linkId === w.applicationLinkId && (
-            <InlineNotice tone="danger" role="alert" className="mt-3">
-              {inviteError.message}
-            </InlineNotice>
-          )}
-
-          {invite?.linkId === w.applicationLinkId && (
-            <div className="glass-sunken mt-3 p-3">
-              {/*
-                The one-time candidate link. It lives in component state only —
-                it is not stored, not logged, and the token sits in the URL
-                fragment so it never reaches a server or an access log.
-              */}
-              <label
-                htmlFor={`invite-${w.applicationLinkId}`}
-                className="block text-[13px] font-medium text-ink-secondary"
-              >
-                Candidate link — shown once, expires{' '}
-                {new Date(invite.expiresAt).toLocaleString()}
-              </label>
-              <div className="mt-2 flex items-center gap-2">
-                <TextField
-                  id={`invite-${w.applicationLinkId}`}
-                  size="sm"
-                  readOnly
-                  value={invite.joinUrl}
-                  onFocus={(e) => e.currentTarget.select()}
-                  className="font-mono"
-                />
-                <Button size="sm" className="shrink-0" onClick={() => void copyInvite()}>
-                  {copied ? 'Copied' : 'Copy'}
-                </Button>
+                  {w.externalApplicationId}
+                </span>
+                <StatusBadge tone={lifecycle.tone}>
+                  <span title={w.lifecycle}>{lifecycle.label}</span>
+                </StatusBadge>
+                {w.terminalState && (
+                  <StatusBadge tone="neutral">
+                    <span title={w.terminalState}>{humanizeEnum(w.terminalState, TERMINAL_LABELS)}</span>
+                  </StatusBadge>
+                )}
+                {/* A completed screening whose link never reached
+                    `writeback_pending` is a completion park that did not
+                    land. The observer is best-effort by design (it must
+                    never discard a scored assessment), so this is where that
+                    case becomes visible instead of living only in a log. */}
+                {notQueuedForWriteback(w) && (
+                  <StatusBadge tone="warning">
+                    <span title="The screening finished, but the workflow never reached writeback_pending, so its scorecard will not be written to Ashby.">
+                      Not queued for write-back
+                    </span>
+                  </StatusBadge>
+                )}
               </div>
-              <p className="mt-2 text-[13px] leading-5 text-ink-tertiary">
-                Send this to the candidate yourself. It is not stored anywhere and cannot be
-                shown again — reissue to get a new one, which revokes this link.
-              </p>
-            </div>
-          )}
-          {w.operations.length > 0 && (
-            <ul className="mt-2 flex flex-wrap items-center gap-2">
-              {w.operations.map((op) => (
-                <li key={op.id} className="flex items-center gap-1.5">
-                  <span className={PILL} title={`${op.type}:${op.state}`}>
-                    {humanize(op.type)} · {humanize(op.state)}
-                    {op.errorCode ? ` (${op.errorCode})` : ''}
-                  </span>
-                  {op.state === 'failed' && (
-                    <Button
-                      size="sm"
-                      disabled={busy}
-                      onClick={() => run(() => api.retryAshbyOperation(op.id))}
+              {(w.ingestionState || w.operations.length > 0) && (
+                <ul className="mt-1.5 flex flex-wrap items-center gap-x-5 gap-y-1.5 text-label text-ink-secondary">
+                  {w.ingestionState && (
+                    <li
+                      title={w.ingestionState}
+                      className={w.ingestionState === 'failed_review' ? 'text-warning-text' : undefined}
                     >
-                      Retry
-                    </Button>
+                      Resume import: {humanizeEnum(w.ingestionState, INGESTION_LABELS)}
+                    </li>
                   )}
-                </li>
-              ))}
-            </ul>
-          )}
-        </li>
-      ))}
+                  {w.operations.map((op) => {
+                    const type = humanizeEnum(op.type, OPERATION_LABELS);
+                    const failed = op.state === 'failed';
+                    return (
+                      <li key={op.id} className="flex items-center gap-2">
+                        <span
+                          title={`${op.type}: ${op.state}${op.errorCode ? ` (${op.errorCode})` : ''}`}
+                          className={failed ? 'text-error-text' : undefined}
+                        >
+                          {type}: {humanizeEnum(op.state, OPERATION_STATE_LABELS)}
+                          {op.errorCode ? ` (${humanizeEnum(op.errorCode, ERROR_CODE_LABELS)})` : ''}
+                        </span>
+                        {failed && (
+                          <Button
+                            className={TOUCH}
+                            disabled={busy}
+                            // Starts with the visible word; says WHICH retry.
+                            aria-label={`Retry ${type.toLowerCase()}`}
+                            onClick={() => run(() => api.retryAshbyOperation(op.id))}
+                          >
+                            Retry
+                          </Button>
+                        )}
+                      </li>
+                    );
+                  })}
+                </ul>
+              )}
+            </div>
+
+            {hasActions && (
+              // `min-w-0`, NOT `shrink-0`: a flex item that may not shrink
+              // keeps its one-line width even after wrapping onto its own
+              // line, and on a 360px phone that line is wider than the
+              // screen. Same rule on the mapping rows.
+              <div className="flex min-w-0 flex-wrap items-center gap-2 sm:justify-end" data-testid="row-actions">
+                {reviewable ? (
+                  <Link
+                    to={`/sessions/${encodeURIComponent(w.sessionId ?? '')}`}
+                    className={buttonClass('secondary', 'md', TOUCH)}
+                  >
+                    Review screening
+                  </Link>
+                ) : (
+                  <Button
+                    className={TOUCH}
+                    disabled={busy}
+                    onClick={() => void deliverInvite(w.applicationLinkId)}
+                  >
+                    {inviteLabel}
+                  </Button>
+                )}
+                {menuItems.length > 0 && (
+                  <OverflowMenu label={`More actions for ${w.externalApplicationId}`} items={menuItems} />
+                )}
+              </div>
+            )}
+
+            {inviteError?.linkId === w.applicationLinkId && (
+              <InlineNotice tone="danger" role="alert" className="sm:col-span-2">
+                {inviteError.message}
+              </InlineNotice>
+            )}
+
+            {invite?.linkId === w.applicationLinkId && (
+              <div className="glass-sunken p-3 sm:col-span-2 sm:p-4">
+                {/*
+                  The one-time candidate link. It lives in component state only —
+                  it is not stored, not logged, and the token sits in the URL
+                  fragment so it never reaches a server or an access log.
+                */}
+                <label
+                  htmlFor={`invite-${w.applicationLinkId}`}
+                  className="block text-label font-medium text-ink-secondary"
+                >
+                  Candidate link, shown once. Expires {formatWhen(invite.expiresAt)}
+                </label>
+                <div className="mt-2 flex items-center gap-2">
+                  <TextField
+                    id={`invite-${w.applicationLinkId}`}
+                    readOnly
+                    value={invite.joinUrl}
+                    onFocus={(e) => e.currentTarget.select()}
+                    className="font-mono"
+                  />
+                  <Button className={cx('shrink-0', TOUCH)} onClick={() => void copyInvite()}>
+                    {copied ? 'Copied' : 'Copy'}
+                  </Button>
+                </div>
+                <p className="mt-2 text-label text-ink-tertiary">
+                  Send it to the candidate yourself. It isn&apos;t stored and can&apos;t be shown
+                  again; reissuing revokes it and makes a new one.
+                </p>
+              </div>
+            )}
+          </li>
+        );
+      })}
     </ul>
   );
 
   return (
     <div>
+      {/* No eyebrow and no header buttons: the sidebar already says where
+          this page sits, and the page's one primary action — Add mapping —
+          belongs to the list it adds to. */}
       <PageHeader
-        eyebrow="Operations"
         title="Ashby Mission Control"
-        description="Screening-workflow health and controls. Data is sanitized — no candidate PII or tokens."
-        actions={
-          <Link to="/mission-control" className={buttonClass('secondary', 'sm')}>
-            Mission Control
-          </Link>
-        }
+        description="The Ashby jobs HELLO screens, and each application's progress. Candidate details never appear here."
       />
 
       {!loaded && <LoadingPanel />}
@@ -1022,10 +1273,11 @@ export function AshbyMissionControlPage() {
           {error}
         </InlineNotice>
       )}
-      {/* ALWAYS mounted, empty until a save or a delete succeeds: a status
-          region that already exists announces its new text; one that mounts
-          WITH its text may not. The notice inside carries no role of its own
-          (`none`), or the confirmation would be announced twice. */}
+      {/* ALWAYS mounted, empty until a save, a delete or a cancel succeeds:
+          a status region that already exists announces its new text; one
+          that mounts WITH its text may not. The notice inside carries no
+          role of its own (`none`), or the confirmation would be announced
+          twice. */}
       <div role="status" id="ashby-mapping-confirmation" className={success ? 'mt-6' : undefined}>
         {success && (
           <InlineNotice tone="success" role="none">
@@ -1042,185 +1294,200 @@ export function AshbyMissionControlPage() {
               title="Job mappings"
               meta={
                 loaded ? (
-                  <span className="text-[13px] text-ink-tertiary">{mappings.length}</span>
+                  <span className="text-label tabular-nums text-ink-tertiary">{mappings.length}</span>
                 ) : undefined
               }
+              description={mappingSummary ?? undefined}
               actions={
-                // A plain button, not `<Button>`: that component does not
-                // forward a ref, and the dialog returns focus HERE on close.
-                <button
+                // THE page's one primary action. `Button` passes `ref`
+                // through to the `<button>`; the dialog returns focus here.
+                <Button
                   ref={addMappingTrigger}
-                  type="button"
-                  className={buttonClass('ghost', 'sm')}
+                  variant="primary"
+                  className={TOUCH}
+                  icon={<PlusIcon />}
                   onClick={openDialog}
                   aria-haspopup="dialog"
                 >
                   Add mapping
-                </button>
+                </Button>
               }
             />
 
             {loaded && mappings.length === 0 ? (
-              <EmptyPanel compact className="mt-4" title="No mappings." />
+              <EmptyPanel
+                compact
+                className="mt-4"
+                title="No jobs are mapped yet."
+                hint="Add a mapping to screen an Ashby job's applicants with one of your roles."
+              />
             ) : (
-              <ul className="mt-2">
-                {mappings.map((m, i) => (
-                  <li key={m.id} className={ROW}>
-                    <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2">
+              <ul className={cx('mt-2', LIST)}>
+                {mappings.map((m, i) => {
+                  const status = MAPPING_STATUS[m.status] ?? {
+                    label: humanizeEnum(m.status),
+                    tone: 'neutral' as StatusTone,
+                  };
+                  const name = mappingName(m, jobNames, jobsPending);
+                  const live = m.status === 'enabled';
+                  const missing = missingStages(m);
+                  // ONE visible action for the row's state. A live mapping,
+                  // or an out-of-sync one, can only be PAUSED — the database
+                  // refuses to resume an out-of-sync mapping outright
+                  // (`drifted_cannot_enable`), so offering Resume there
+                  // would only invite an error. A paused one can be resumed
+                  // once both of its Ashby stages exist; until then Resume
+                  // stays visible, off, and described by the line that says
+                  // which stage is missing.
+                  const pausing = m.status !== 'paused';
+                  const resumeBlocked = !pausing && missing !== null;
+                  const menuItems: OverflowMenuItem[] = [
+                    {
+                      key: 'form',
+                      label: 'Discover feedback form',
+                      disabled: busy,
+                      onSelect: () => void discoverForm(m.externalJobId),
+                    },
+                    {
+                      key: 'binding',
+                      label: 'Preview scorecard binding',
+                      disabled: busy,
+                      onSelect: () => void previewBinding(m.id),
+                    },
+                    {
+                      key: 'backlog',
+                      label: 'Preview existing backlog',
+                      disabled: busy || !live,
+                      disabledReason: live ? undefined : BACKLOG_NEEDS_LIVE,
+                      onSelect: () => void previewBacklog(m.id),
+                    },
+                    {
+                      // Quiet until it matters: error ink in a menu, the
+                      // filled red only on the dialog's confirm button.
+                      key: 'delete',
+                      label: 'Delete',
+                      tone: 'danger',
+                      haspopup: 'dialog',
+                      disabled: busy || live,
+                      disabledReason: live ? PAUSE_BEFORE_DELETE : undefined,
+                      onSelect: (trigger) => openDeleteDialog(m, trigger),
+                    },
+                  ];
+                  return (
+                    <li
+                      key={m.id}
+                      className="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-6 gap-y-3 py-4 sm:grid-cols-[minmax(0,1fr)_7.5rem_auto] sm:items-center"
+                    >
                       <MappingSummary
                         mapping={m}
+                        name={name}
                         jobNames={jobNames}
-                        jobsPending={jobsPending}
                         rolesById={rolesById}
                         rolesPending={rolesPending}
-                      >
-                        <StatusBadge tone={mappingTone(m.status)}>{m.status}</StatusBadge>
-                        {!(m.hasAiStage && m.hasTaStage) && <StatusBadge>incomplete</StatusBadge>}
-                        {m.statusReason && (
-                          <span className="text-[13px] text-ink-tertiary">{m.statusReason}</span>
-                        )}
-                      </MappingSummary>
-                      {/* The same wrapper on EVERY row, hint or not, so a
-                          status change never remounts the buttons — the
-                          Delete button the dialog returns focus to must be
-                          the node that is still on the page. `min-w-0`, not
-                          `shrink-0`: see the workflow rows. */}
-                      <div className="flex min-w-0 flex-col items-end gap-1" data-testid="row-actions">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <Button
-                            size="sm"
-                            disabled={busy || m.status === 'paused'}
-                            onClick={() => run(() => api.pauseAshbyMapping(m.id))}
-                          >
-                            Pause
-                          </Button>
-                          <Button
-                            size="sm"
-                            disabled={busy || m.status === 'enabled' || !(m.hasAiStage && m.hasTaStage)}
-                            onClick={() => run(() => api.resumeAshbyMapping(m.id))}
-                          >
-                            Resume
-                          </Button>
-                          <Button
-                            size="sm"
-                            disabled={busy}
-                            onClick={() => void discoverForm(m.externalJobId)}
-                          >
-                            Discover feedback form
-                          </Button>
-                          <Button
-                            size="sm"
-                            disabled={busy}
-                            onClick={() => void previewBinding(m.id)}
-                          >
-                            Preview scorecard binding
-                          </Button>
-                          <Button
-                            size="sm"
-                            disabled={busy || m.status !== 'enabled'}
-                            onClick={() => void previewBacklog(m.id)}
-                          >
-                            Preview existing backlog
-                          </Button>
-                          {/*
-                            HOW A DISABLED DELETE SAYS WHY. A `title` alone
-                            reaches almost nobody: a `disabled` button is out
-                            of the tab order, so a keyboard user never lands on
-                            it and never sees the tooltip; touch has no hover;
-                            and screen readers announce `title` unevenly. Text
-                            on the page reaches everyone, so an ENABLED row
-                            gets one short line under its actions, and
-                            `aria-describedby` ties that line to the button —
-                            a screen reader that browses onto the disabled
-                            control hears the reason with it. The `title`
-                            stays for a mouse hover.
-                            Not `aria-disabled` (focusable but inert): that
-                            puts a dead stop in the tab order of every enabled
-                            row, where Pause and Resume beside it are plainly
-                            `disabled` — one row, one convention. The line
-                            shows on enabled rows ONLY, so it costs a paused
-                            list nothing.
-                          */}
-                          <Button
-                            variant="danger"
-                            size="sm"
-                            disabled={busy || m.status === 'enabled'}
-                            title={m.status === 'enabled' ? PAUSE_BEFORE_DELETE : undefined}
-                            aria-describedby={m.status === 'enabled' ? deleteHintId(i) : undefined}
-                            aria-haspopup="dialog"
-                            onClick={(e) => openDeleteDialog(m, e.currentTarget)}
-                          >
-                            Delete
-                          </Button>
-                        </div>
-                        {m.status === 'enabled' && (
-                          <p id={deleteHintId(i)} className="text-[13px] text-ink-tertiary">
-                            {PAUSE_BEFORE_DELETE}
-                          </p>
-                        )}
-                      </div>
-                    </div>
-
-                    {formError?.jobId === m.externalJobId && (
-                      <InlineNotice tone="danger" role="alert" className="mt-3">
-                        {formError.message}
-                      </InlineNotice>
-                    )}
-
-                    {formSchema?.jobId === m.externalJobId && (
-                      <FeedbackFormSchema forms={formSchema.forms} truncated={formSchema.truncated} />
-                    )}
-
-                    {bindingError?.mappingId === m.id && (
-                      <InlineNotice tone="danger" role="alert" className="mt-3">
-                        {bindingError.message}
-                      </InlineNotice>
-                    )}
-
-                    {bindingPreview?.mappingId === m.id && (
-                      <ScorecardBindingPreviewPanel
-                        scoringPath={bindingPreview.scoringPath}
-                        preview={bindingPreview.preview}
-                        mappingFormBound={bindingPreview.mappingFormBound}
+                        missing={missing}
+                        missingId={missingStageId(i)}
                       />
-                    )}
+                      {/* A column of its own at desk width, so the states
+                          line up down the list and can be scanned. */}
+                      <div className="col-start-2 row-start-1 justify-self-end sm:justify-self-start">
+                        <StatusBadge tone={status.tone}>
+                          <span title={m.status}>{status.label}</span>
+                        </StatusBadge>
+                      </div>
+                      {/* The same wrapper on EVERY row, so a status change
+                          never remounts the controls — the More button the
+                          Delete dialog returns focus to must be the node that
+                          is still on the page. `min-w-0`, not `shrink-0`: see
+                          the workflow rows. */}
+                      <div
+                        className="col-span-2 flex min-w-0 flex-wrap items-center gap-2 sm:col-span-1 sm:col-start-3 sm:row-start-1 sm:justify-end"
+                        data-testid="row-actions"
+                      >
+                        <Button
+                          className={cx('min-w-[5.5rem]', TOUCH)}
+                          disabled={busy || resumeBlocked}
+                          aria-describedby={resumeBlocked ? missingStageId(i) : undefined}
+                          onClick={(e) =>
+                            rowAction(e.currentTarget, () =>
+                              pausing ? api.pauseAshbyMapping(m.id) : api.resumeAshbyMapping(m.id),
+                            )
+                          }
+                        >
+                          {pausing ? 'Pause' : 'Resume'}
+                        </Button>
+                        <OverflowMenu label={`More actions for ${name}`} items={menuItems} />
+                      </div>
 
-                    {backlogError?.mappingId === m.id && (
-                      <InlineNotice tone="danger" role="alert" className="mt-3">
-                        {backlogError.message}
-                      </InlineNotice>
-                    )}
+                      {(formError?.jobId === m.externalJobId ||
+                        formSchema?.jobId === m.externalJobId ||
+                        bindingError?.mappingId === m.id ||
+                        bindingPreview?.mappingId === m.id ||
+                        backlogError?.mappingId === m.id ||
+                        backlogPreview?.mappingId === m.id) && (
+                        <div className="col-span-full flex min-w-0 flex-col gap-3">
+                          {formError?.jobId === m.externalJobId && (
+                            <InlineNotice tone="danger" role="alert">
+                              {formError.message}
+                            </InlineNotice>
+                          )}
 
-                    {backlogPreview?.mappingId === m.id && (() => {
-                      const p = backlogPreview.preview;
-                      const expired = Date.parse(p.expiresAt) <= Date.now();
-                      const atCap = p.expectedCount >= p.cap;
-                      return (
-                        <div className="glass-sunken mt-3 p-3" role="region" aria-label="Backlog import preview">
-                          <p className="text-[13px] font-medium text-ink">
-                            {expired ? 'This preview has expired.' : `This snapshot contains ${p.expectedCount} existing application${p.expectedCount === 1 ? '' : 's'} from this job and stage.`}
-                          </p>
-                          <p className="mt-1 text-[13px] leading-5 text-ink-secondary">
-                            Default behavior is future stage entries only. Confirmation schedules only this exact snapshot; completed or already-deduplicated applications may be no-ops, and existing phone engagements are not cancelled by this policy. The snapshot expires {new Date(p.expiresAt).toLocaleString()} and is capped at {p.cap} applications.
-                          </p>
-                          {atCap && !expired && <p className="mt-2 text-[13px] text-warning-text">This preview is at the safety cap; narrow the mapping or ask an operator to review before importing.</p>}
-                          <label className="mt-3 flex items-start gap-2 text-[13px] text-ink-secondary">
-                            <input type="checkbox" checked={backlogConfirmArmed} disabled={busy || expired} onChange={(e) => setBacklogConfirmArmed(e.target.checked)} />
-                            <span>I understand this is an explicit provider-backed import and may create screening work.</span>
-                          </label>
-                          <div className="mt-3 flex items-center gap-2">
-                            <Button size="sm" disabled={busy || expired || !backlogConfirmArmed} onClick={() => void confirmBacklog(m.id, p)}>
-                              {busy ? 'Confirming…' : 'Confirm and import this snapshot'}
-                            </Button>
-                            <Button size="sm" variant="ghost" disabled={busy} onClick={() => { setBacklogPreview(null); setBacklogConfirmArmed(false); }}>
-                              Cancel
-                            </Button>
-                          </div>
+                          {formSchema?.jobId === m.externalJobId && (
+                            <FeedbackFormSchema forms={formSchema.forms} truncated={formSchema.truncated} />
+                          )}
+
+                          {bindingError?.mappingId === m.id && (
+                            <InlineNotice tone="danger" role="alert">
+                              {bindingError.message}
+                            </InlineNotice>
+                          )}
+
+                          {bindingPreview?.mappingId === m.id && (
+                            <ScorecardBindingPreviewPanel
+                              scoringPath={bindingPreview.scoringPath}
+                              preview={bindingPreview.preview}
+                              mappingFormBound={bindingPreview.mappingFormBound}
+                            />
+                          )}
+
+                          {backlogError?.mappingId === m.id && (
+                            <InlineNotice tone="danger" role="alert">
+                              {backlogError.message}
+                            </InlineNotice>
+                          )}
+
+                          {backlogPreview?.mappingId === m.id && (() => {
+                            const p = backlogPreview.preview;
+                            const expired = Date.parse(p.expiresAt) <= Date.now();
+                            const atCap = p.expectedCount >= p.cap;
+                            return (
+                              <div className="glass-sunken p-4" role="region" aria-label="Backlog import preview">
+                                <p className="text-label font-medium text-ink">
+                                  {expired ? 'This preview has expired.' : `This snapshot contains ${p.expectedCount} existing application${p.expectedCount === 1 ? '' : 's'} from this job and stage.`}
+                                </p>
+                                <p className="mt-1 text-label text-ink-secondary">
+                                  Default behavior is future stage entries only. Confirmation schedules only this exact snapshot; completed or already-deduplicated applications may be no-ops, and existing phone engagements are not cancelled by this policy. The snapshot expires {formatWhen(p.expiresAt)} and is capped at {p.cap} applications.
+                                </p>
+                                {atCap && !expired && <p className="mt-2 text-label text-warning-text">This preview is at the safety cap; narrow the mapping or ask an operator to review before importing.</p>}
+                                <label className="mt-3 flex items-start gap-2 text-label text-ink-secondary">
+                                  <input type="checkbox" checked={backlogConfirmArmed} disabled={busy || expired} onChange={(e) => setBacklogConfirmArmed(e.target.checked)} />
+                                  <span>I understand this is an explicit provider-backed import and may create screening work.</span>
+                                </label>
+                                <div className="mt-3 flex flex-wrap items-center gap-2">
+                                  <Button className={TOUCH} disabled={busy || expired || !backlogConfirmArmed} onClick={() => void confirmBacklog(m.id, p)}>
+                                    {busy ? 'Confirming…' : 'Confirm and import this snapshot'}
+                                  </Button>
+                                  <Button variant="ghost" className={TOUCH} disabled={busy} onClick={() => { setBacklogPreview(null); setBacklogConfirmArmed(false); }}>
+                                    Cancel
+                                  </Button>
+                                </div>
+                              </div>
+                            );
+                          })()}
                         </div>
-                      );
-                    })()}
-                  </li>
-                ))}
+                      )}
+                    </li>
+                  );
+                })}
               </ul>
             )}
           </GlassPanel>
@@ -1233,18 +1500,24 @@ export function AshbyMissionControlPage() {
               title="Application workflows"
               meta={
                 loaded ? (
-                  <span className="text-[13px] text-ink-tertiary">{workflows.length}</span>
+                  <span className="text-label tabular-nums text-ink-tertiary">{workflows.length}</span>
                 ) : undefined
               }
+              description={workflowSummary ?? undefined}
             />
             {loaded && workflows.length === 0 ? (
-              <EmptyPanel compact className="mt-4" title="No workflows." />
+              <EmptyPanel
+                compact
+                className="mt-4"
+                title="No applications yet."
+                hint="Applicants for a live mapping appear here once Ashby sends them."
+              />
             ) : workflows.length > WORKFLOW_SCROLL_AFTER ? (
               <ScrollArea maxHeight="36rem" label="Application workflows" className="mt-1">
                 {workflowRows}
               </ScrollArea>
             ) : (
-              <div className="mt-2">{workflowRows}</div>
+              <div className="mt-1">{workflowRows}</div>
             )}
           </GlassPanel>
         </RevealItem>
@@ -1290,7 +1563,7 @@ export function AshbyMissionControlPage() {
             <label
               id="ashby-mapping-job-label"
               htmlFor="ashby-mapping-job"
-              className="text-[13px] font-medium text-ink"
+              className="text-label font-medium text-ink"
             >
               Ashby job
             </label>
@@ -1351,7 +1624,7 @@ export function AshbyMissionControlPage() {
               {jobsHidden && (
                 // The same reason as the cut above: an admin looking for a
                 // confidential job must not conclude Ashby has none.
-                <p className="text-[13px] text-ink-tertiary">{CONFIDENTIAL_WITHHELD}</p>
+                <p className="text-label text-ink-tertiary">{CONFIDENTIAL_WITHHELD}</p>
               )}
             </div>
           </div>
@@ -1360,7 +1633,7 @@ export function AshbyMissionControlPage() {
             <label
               id="ashby-mapping-role-label"
               htmlFor="ashby-mapping-role"
-              className="text-[13px] font-medium text-ink"
+              className="text-label font-medium text-ink"
             >
               Role
             </label>
@@ -1422,7 +1695,7 @@ export function AshbyMissionControlPage() {
             // and the message rendered as ordinary body ink — it read as
             // help text rather than a failure. `Field` already uses this
             // token for exactly this.
-            <p role="alert" className="text-[13px] text-error-text">
+            <p role="alert" className="text-label text-error-text">
               {createError}
             </p>
           )}
@@ -1463,7 +1736,7 @@ export function AshbyMissionControlPage() {
           <p className="text-sm leading-6 text-ink-secondary">{DELETE_CONSEQUENCES}</p>
 
           {deleteError && (
-            <p role="alert" className="text-[13px] text-error-text">
+            <p role="alert" className="text-label text-error-text">
               {deleteError.message}
             </p>
           )}
@@ -1480,6 +1753,45 @@ export function AshbyMissionControlPage() {
               data-dialog-primary=""
             >
               {deleting ? 'Deleting…' : 'Delete mapping'}
+            </Button>
+          </div>
+        </div>
+      </Dialog>
+
+      {/* Also at the page root. The application id is the only name this
+          page has for an application (the list carries no candidate
+          details), so it is the dialog's description, as the job's name is
+          Delete's: "which one?" answered with the title. */}
+      <Dialog
+        open={cancelTarget !== null}
+        onClose={closeCancelDialog}
+        idPrefix="ashby-workflow-cancel"
+        title="Cancel this screening?"
+        description={cancelTarget?.externalApplicationId}
+        returnFocusRef={cancelReturnFocus}
+        busy={cancelling}
+      >
+        <div ref={cancelBodyRef} className="flex flex-col gap-4">
+          <p className="text-sm leading-6 text-ink-secondary">{CANCEL_CONSEQUENCES}</p>
+
+          {cancelError && (
+            <p role="alert" className="text-label text-error-text">
+              {cancelError.message}
+            </p>
+          )}
+
+          <div className="flex flex-wrap items-center justify-end gap-2">
+            <Button variant="ghost" onClick={closeCancelDialog} disabled={cancelling}>
+              Keep screening
+            </Button>
+            <Button
+              variant="danger"
+              loading={cancelling}
+              disabled={cancelError?.retryable === false}
+              onClick={() => void cancelWorkflow()}
+              data-dialog-primary=""
+            >
+              {cancelling ? 'Cancelling…' : 'Cancel screening'}
             </Button>
           </div>
         </div>
@@ -1512,7 +1824,7 @@ function FeedbackFormSchema({ forms, truncated }: { forms: AshbyFeedbackForm[]; 
         </InlineNotice>
       )}
       {forms.length === 0 ? (
-        <p className="mt-3 text-[13px] text-ink-secondary">
+        <p className="mt-3 text-label text-ink-secondary">
           No feedback form is named in this job&apos;s interview plan.
         </p>
       ) : (
@@ -1523,35 +1835,35 @@ function FeedbackFormSchema({ forms, truncated }: { forms: AshbyFeedbackForm[]; 
               className="border-t border-glass-ring pt-3 first:border-0 first:pt-0 [&+li]:mt-3"
             >
               <p className="text-sm font-medium text-ink">{f.title ?? 'Untitled form'}</p>
-              <p className="font-mono text-[13px] text-ink-secondary">form id: {f.formDefinitionId}</p>
+              <p className="font-mono text-label text-ink-secondary">form id: {f.formDefinitionId}</p>
               {(f.stageTitle || f.stageId) && (
-                <p className="text-[13px] text-ink-tertiary">
+                <p className="text-label text-ink-tertiary">
                   stage: {f.stageTitle ?? 'untitled'}
                   {f.stageId ? ` (${f.stageId})` : ''}
                 </p>
               )}
               {(f.interviewTitle || f.interviewId) && (
-                <p className="text-[13px] text-ink-tertiary">
+                <p className="text-label text-ink-tertiary">
                   interview: {f.interviewTitle ?? 'untitled'}
                   {f.interviewId ? ` (${f.interviewId})` : ''}
                 </p>
               )}
               {!f.schemaAvailable ? (
-                <p className="mt-2 text-[13px] leading-5 text-warning-text">
+                <p className="mt-2 text-label text-warning-text">
                   Field-level schema is not available from the interview plan for this form — only
                   its id could be read. This is not a claim that the form has no fields.
                 </p>
               ) : (
                 <>
-                  <p className="mt-2 text-[13px] text-ink-tertiary">{f.fieldCount} field(s)</p>
+                  <p className="mt-2 text-label text-ink-tertiary">{f.fieldCount} field(s)</p>
                   {f.sections.map((sec, si) => (
                     <div key={sec.id ?? `section-${si}`} className="mt-2">
-                      <p className="text-[13px] font-medium text-ink-secondary">
+                      <p className="text-label font-medium text-ink-secondary">
                         {sec.title ?? 'Untitled section'}
                       </p>
                       <ul className="mt-1 space-y-1">
                         {sec.fields.map((field) => (
-                          <li key={field.id} className="text-[13px] leading-5 text-ink-secondary">
+                          <li key={field.id} className="text-label text-ink-secondary">
                             <span className="font-mono">{field.id}</span>
                             {' — '}
                             {field.title ?? 'untitled'}
@@ -1664,7 +1976,7 @@ function jobsErrorCopy(err: unknown): { message: string; retryable: boolean } {
 function MappingPreview({ jobName, roleName }: { jobName: string | null; roleName: string | null }) {
   if (!jobName || !roleName) return null;
   return (
-    <p className="rounded-[12px] bg-ink/[0.035] px-3.5 py-2.5 text-[13px] leading-5 text-ink-secondary">
+    <p className="rounded-[12px] bg-ink/[0.035] px-3.5 py-2.5 text-label text-ink-secondary">
       Applicants for <span className="font-medium text-ink">{jobName}</span> will be screened with
       the <span className="font-medium text-ink">{roleName}</span> role&apos;s questions and
       scorecard.
@@ -1775,7 +2087,7 @@ function mappingName(mapping: AshbyMcMapping, jobNames: JobNames | null, jobsPen
 }
 
 /**
- * The role a mapping screens for, as a row's second line. Resolved against
+ * The role a mapping screens for, on the row's second line. Resolved against
  * EVERY role, so a mapping on a since-retired role still names it. `none`
  * when the mapping carries no role at all; `unavailable` when it names one
  * the roles read did not return (or the read failed). The uuid itself is a
@@ -1793,49 +2105,151 @@ function roleLine(
 }
 
 /**
+ * Which of the mapping's two Ashby stages is missing, in words, or null when
+ * both exist. A mapping without both cannot be resumed; this is the line
+ * that says why.
+ */
+function missingStages(mapping: AshbyMcMapping): string | null {
+  if (mapping.hasAiStage && mapping.hasTaStage) return null;
+  if (!mapping.hasAiStage && !mapping.hasTaStage) return 'Both Ashby stages are missing';
+  return mapping.hasAiStage ? 'The TA stage is missing in Ashby' : 'The AI screening stage is missing in Ashby';
+}
+
+/**
+ * A mapping's paused / out-of-sync reason for display. The column holds a
+ * sanitized reason that is sometimes a sentence and sometimes a code; a code
+ * becomes words, a sentence is shown as written.
+ */
+function reasonText(reason: string): string {
+  const trimmed = reason.trim();
+  return /^[a-z0-9_.:-]+$/.test(trimmed) ? humanizeEnum(trimmed, STATUS_REASON_LABELS) : trimmed;
+}
+
+/**
  * A mapping row's text, STACKED — never run together on one line: the job's
- * name (primary, with the row's badges beside it), then the role it screens
- * for, then the saved label, but only when the label says something neither
- * the name nor the job's own title already says (an older mapping's hand
- * -typed tag, or the name from before a rename). Nothing here renders
- * `externalJobId` or `roleId` — not as text, not as an attribute.
+ * name (primary), then a quiet line with the role it screens for and, when
+ * there is one, why it is paused or out of sync and which stage is missing;
+ * then the saved label, but only when it says something neither the name
+ * nor the job's own title already says (an older mapping's hand-typed tag,
+ * or the name from before a rename). Nothing here renders `externalJobId` or
+ * `roleId` — not as text, not as an attribute.
  */
 function MappingSummary({
   mapping,
+  name,
   jobNames,
-  jobsPending,
   rolesById,
   rolesPending,
-  children,
+  missing,
+  missingId,
 }: {
   mapping: AshbyMcMapping;
+  /** The shared display name (`mappingName`). */
+  name: string;
   jobNames: JobNames | null;
-  /** The first jobs read is still in flight — "unavailable" would be a false alarm. */
-  jobsPending: boolean;
   rolesById: Map<string, Role> | null;
   rolesPending: boolean;
-  /** Badges, shown beside the name. */
-  children?: ReactNode;
+  /** `missingStages(mapping)`. */
+  missing: string | null;
+  /** The missing-stage line's id: it also describes a disabled Resume. */
+  missingId: string;
 }) {
   const label = mapping.label?.trim() || null;
-  const name = mappingName(mapping, jobNames, jobsPending);
   const title = jobNames?.get(mapping.externalJobId)?.title ?? null;
   // A label saved before dates were hand-formatted may say "Sept" where the
   // name now says "Sep" — the same date, so it is not a second line's worth.
   const sameDate = (a: string | null) => (a ?? '').replace(/\bSept\b/g, 'Sep');
   const showLabel =
     label !== null && sameDate(label) !== sameDate(name) && sameDate(label) !== sameDate(title);
+  const reason = mapping.statusReason?.trim() ? mapping.statusReason.trim() : null;
+  // Separators only where the facts share a line (desk width). On a phone
+  // each fact takes its own line, where a dot would be left dangling.
+  const dot = (
+    <span aria-hidden="true" className="hidden text-ink-muted sm:inline">
+      ·
+    </span>
+  );
   return (
-    <div className="flex min-w-0 flex-col gap-0.5">
-      <div className="flex min-w-0 flex-wrap items-center gap-2">
-        <span className="min-w-0 break-words text-sm font-medium text-ink">{name}</span>
-        {children}
+    <div className="col-start-1 row-start-1 flex min-w-0 flex-col gap-0.5">
+      <span className="min-w-0 break-words text-sm font-medium leading-5 text-ink">{name}</span>
+      <div className="flex min-w-0 flex-col text-label sm:flex-row sm:flex-wrap sm:items-baseline sm:gap-x-2">
+        <p className="min-w-0 break-words text-ink-secondary">{roleLine(mapping, rolesById, rolesPending)}</p>
+        {reason && (
+          <>
+            {dot}
+            <p className="min-w-0 break-words text-ink-tertiary" title={reason}>
+              {reasonText(reason)}
+            </p>
+          </>
+        )}
+        {missing && (
+          <>
+            {dot}
+            <p id={missingId} className="min-w-0 break-words text-warning-text">
+              {missing}
+            </p>
+          </>
+        )}
       </div>
-      <p className="min-w-0 break-words text-[13px] text-ink-secondary">
-        {roleLine(mapping, rolesById, rolesPending)}
-      </p>
-      {showLabel && <p className="min-w-0 break-words text-[13px] text-ink-tertiary">{label}</p>}
+      {showLabel && <p className="min-w-0 break-words text-label text-ink-tertiary">{label}</p>}
     </div>
+  );
+}
+
+/**
+ * A completed screening whose workflow never reached `writeback_pending`:
+ * the completion park did not land, so no scorecard will reach Ashby.
+ */
+function notQueuedForWriteback(w: AshbyMcWorkflow): boolean {
+  return w.sessionStatus === 'completed' && w.terminalState == null && w.lifecycle !== 'writeback_pending';
+}
+
+/**
+ * Counts as one sentence — "1 live, 1 paused and 1 out of sync." — leaving
+ * out whatever is zero; null when everything is.
+ */
+function sentence(parts: Array<[number, string]>): string | null {
+  const said = parts.filter(([n]) => n > 0).map(([n, words]) => `${n} ${words}`);
+  if (said.length === 0) return null;
+  const last = said.pop()!;
+  return `${said.length > 0 ? `${said.join(', ')} and ` : ''}${last}.`;
+}
+
+/**
+ * The page's one date-and-time format: "18 Aug, 14:05" this year, "18 Aug
+ * 2027, 14:05" otherwise, in the viewer's time zone. Built by hand for the
+ * same reason as `openedDate`: ICU versions disagree on "Sep" and "Sept".
+ */
+function formatWhen(iso: string): string {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return 'at an unknown time';
+  const year = date.getFullYear() === new Date().getFullYear() ? '' : ` ${date.getFullYear()}`;
+  const hh = String(date.getHours()).padStart(2, '0');
+  const mm = String(date.getMinutes()).padStart(2, '0');
+  return `${date.getDate()} ${SHORT_MONTHS[date.getMonth()]}${year}, ${hh}:${mm}`;
+}
+
+/**
+ * The cancel route's machine codes, in words. The two stale-row codes say
+ * the list was refreshed (the handler reloads before this shows); anything
+ * else is worth one more try.
+ */
+function cancelErrorCopy(code: string): string {
+  switch (code) {
+    case 'already_terminal':
+      return 'This application was already closed. The list has been refreshed.';
+    case 'not_found':
+      return 'This application is no longer listed. The list has been refreshed.';
+    default:
+      return 'Could not cancel this screening. Try again.';
+  }
+}
+
+function PlusIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2.25} strokeLinecap="round" aria-hidden="true" className="h-4 w-4">
+      <path d="M12 5v14M5 12h14" />
+    </svg>
   );
 }
 
@@ -1946,7 +2360,7 @@ function ScorecardBindingPreviewPanel({
         title="Scorecard binding preview — read-only"
         description="What a v2 scorecard write would bind on the verified form, by metric name. Nothing is written or bound by viewing this."
       />
-      <p className="mt-2 text-[13px] text-ink-secondary">
+      <p className="mt-2 text-label text-ink-secondary">
         {preview.formTitle ?? 'Untitled form'}{' '}
         <span className="font-mono text-ink-tertiary">form id: {preview.formDefinitionId}</span>
       </p>
@@ -1992,10 +2406,10 @@ function ScorecardBindingPreviewPanel({
         </p>
       )}
 
-      <p className="mt-3 text-[13px] font-medium text-ink-secondary">Fixed fields (verified binding)</p>
+      <p className="mt-3 text-label font-medium text-ink-secondary">Fixed fields (verified binding)</p>
       <ul className="mt-1 space-y-1">
         {preview.fixedFields.map((f) => (
-          <li key={f.name} className="text-[13px] leading-5 text-ink-secondary">
+          <li key={f.name} className="text-label text-ink-secondary">
             {FIXED_FIELD_LABEL[f.name]}
             {' — '}
             <span className="font-mono">[{f.path}]</span>
@@ -2019,13 +2433,13 @@ function ScorecardBindingPreviewPanel({
 
       {scoringPath === 'v2_autobind' && (
         <>
-          <p className="mt-3 text-[13px] font-medium text-ink-secondary">Metrics (bound by name)</p>
+          <p className="mt-3 text-label font-medium text-ink-secondary">Metrics (bound by name)</p>
           {preview.metrics.length === 0 ? (
-            <p className="mt-1 text-[13px] text-ink-tertiary">The active scorecard has no metrics.</p>
+            <p className="mt-1 text-label text-ink-tertiary">The active scorecard has no metrics.</p>
           ) : (
             <ul className="mt-1 space-y-1">
               {preview.metrics.map((m) => (
-                <li key={m.key} className="text-[13px] leading-5 text-ink-secondary">
+                <li key={m.key} className="text-label text-ink-secondary">
                   <span className="text-ink">{m.name}</span>
                   {m.status === 'bound' ? (
                     <>
@@ -2045,7 +2459,7 @@ function ScorecardBindingPreviewPanel({
       )}
 
       {preview.unusedScoreFields.length > 0 && (
-        <p className="mt-3 text-[13px] text-ink-tertiary">
+        <p className="mt-3 text-label text-ink-tertiary">
           Score fields no metric claims (left empty on the card):{' '}
           {preview.unusedScoreFields.map((u) => u.title ?? u.fieldId).join(', ')}
         </p>

@@ -41,6 +41,12 @@ export interface ConfirmButtonProps {
    * the moment of commitment is where the weight belongs.
    */
   quiet?: boolean;
+  /**
+   * Trigger height. Defaults to `md` when quiet (it sits beside `md`
+   * siblings) and `lg` otherwise; pass `lg` for a quiet trigger on a
+   * touch-first surface (the 44px target rule).
+   */
+  triggerSize?: 'md' | 'lg';
 }
 
 export function ConfirmButton({
@@ -53,6 +59,7 @@ export function ConfirmButton({
   disabled = false,
   className,
   quiet = false,
+  triggerSize,
 }: ConfirmButtonProps) {
   const rawId = useId();
   const confirmId = `confirm-${rawId.replace(/:/g, '-')}`;
@@ -79,7 +86,7 @@ export function ConfirmButton({
     // confirmation never reshuffles the buttons around it.
     <div className={cx(quiet && 'contents', className)}>
       <Button
-        size={quiet ? 'md' : 'lg'}
+        size={triggerSize ?? (quiet ? 'md' : 'lg')}
         variant={quiet && variant === 'danger' ? 'danger-quiet' : toButtonVariant(variant)}
         onClick={() => setConfirming((open) => !open)}
         aria-expanded={confirming}

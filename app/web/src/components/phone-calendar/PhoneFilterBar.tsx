@@ -1,9 +1,18 @@
 /**
- * The calendar toolbar: how the week is read, and which rows are shown.
+ * The calendar toolbar: which week, how it is read, and which rows are shown.
  *
- * Everything here is a toggle over data that is ALREADY loaded. Switching
- * view, picking an agent or toggling a facet rewrites the query string and
- * re-filters rows in memory — no request is issued, which a test pins.
+ * Everything here except the week is a toggle over data that is ALREADY
+ * loaded. Switching view, picking an agent or toggling a facet rewrites the
+ * query string and re-filters rows in memory — no request is issued, which a
+ * test pins.
+ *
+ * ── ONE SURFACE, TWO BANDS ────────────────────────────────────────────
+ * One glass panel split by a hairline. The top band is the calendar's own
+ * header: the week (supplied by the page as `header`, since changing it is a
+ * read) and the view switch. The bottom band is the filters. Nothing here is a
+ * card inside a card, and nothing is louder than it needs to be: the view
+ * switch is a sunken segmented pair, the facets are quiet pills, and the one
+ * filled accent on the page belongs to the page's primary action.
  *
  * Every toggle carries `aria-pressed`, so its on/off state is announced and
  * is never conveyed by fill colour alone; the agent picker is a native,
@@ -13,7 +22,7 @@
  * why that exception exists.
  */
 
-import { useId } from 'react';
+import { useId, type ReactNode } from 'react';
 import { hasActivePhoneFilters } from './phoneCalendarFilters';
 import type {
   PhoneAgentOption,
@@ -21,7 +30,7 @@ import type {
   PhoneCalendarView,
   PhoneFacet,
 } from './phoneCalendarFilters';
-import { Button, GlassPanel, SelectField } from '../design';
+import { Button, GlassPanel, SelectField, cx } from '../design';
 import { appointmentStatusTerm, engagementStateTerm } from './phoneVocabulary';
 
 /**
@@ -52,10 +61,43 @@ export interface PhoneFilterBarProps {
   onAgentChange: (agent: string | null) => void;
   onToggle: (dimension: 'status' | 'state', value: string) => void;
   onClear: () => void;
+  /** The top band's leading content: the week and its navigation. */
+  header?: ReactNode;
+  /**
+   * False while there are no rows to filter (loading, an error, the feature
+   * off): the top band stays, so the week controls never unmount under a
+   * keyboard user, and the filter band waits.
+   */
+  showFilters?: boolean;
 }
 
 /** The one label style in this toolbar: sentence case, 13px, tertiary ink. */
-const legendClass = 'text-[13px] font-medium text-ink-tertiary';
+const legendClass = 'text-label font-medium text-ink-tertiary';
+
+/**
+ * A facet toggle: a quiet pill, the same shape and weight as the candidate
+ * list's filter pills, so a filter reads as a filter and not as an action.
+ */
+function pillClass(active: boolean): string {
+  return cx(
+    'inline-flex min-h-[44px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-full px-3.5 text-label font-medium',
+    'transition-[color,background-color,box-shadow] duration-200 ease-soft',
+    'focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface-secondary',
+    active
+      ? 'bg-info text-white shadow-pill'
+      : 'bg-white/70 text-ink-secondary shadow-[inset_0_0_0_1px_var(--glass-ring-strong)] hover:bg-white hover:text-ink',
+  );
+}
+
+/** One half of the view switch: a segment in a sunken well, lifted when on. */
+function segmentClass(active: boolean): string {
+  return cx(
+    'inline-flex min-h-[44px] items-center rounded-[10px] px-4 text-label font-medium',
+    'transition-[color,background-color,box-shadow] duration-200 ease-soft',
+    'focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-1',
+    active ? 'bg-white text-ink shadow-pill' : 'text-ink-secondary hover:text-ink',
+  );
+}
 
 function AgentPicker({
   agents,
@@ -71,7 +113,7 @@ function AgentPicker({
 
   if (agents.status === 'unavailable') {
     return agents.requested ? (
-      <p className="max-w-xs self-end text-[13px] leading-5 text-ink-tertiary">
+      <p className="max-w-xs self-end text-label text-ink-tertiary">
         Agents could not be loaded, so calls for every agent are shown.
       </p>
     ) : null;
@@ -90,7 +132,7 @@ function AgentPicker({
         value={loading ? '' : (value ?? '')}
         disabled={loading}
         onChange={(event) => onChange(event.target.value === '' ? null : event.target.value)}
-        className="mt-2 min-h-[44px] sm:w-60"
+        className="mt-2 min-h-[44px] sm:w-56"
       >
         {agents.status === 'loading' ? (
           <option value="">Loading agents…</option>
@@ -124,22 +166,28 @@ function FacetGroup({
 }) {
   if (facets.length === 0) return null;
   return (
-    <fieldset className="min-w-0">
+    <fieldset className="min-w-0 max-sm:w-full">
       <legend className={legendClass}>{legend}</legend>
-      <div className="mt-2 flex flex-wrap gap-2">
+      {/*
+        On a phone, one swipeable row per group instead of four wrapped rows:
+        thirteen pills stacked were ~570px of toolbar before the first call.
+        The row bleeds to the panel edge so the cut-off pill reads as "more",
+        and it is an ordinary scroll box — its pills are the focus stops.
+      */}
+      <div className="mt-2 flex gap-2 max-sm:-mx-4 max-sm:overflow-x-auto max-sm:px-4 max-sm:pb-1 sm:flex-wrap">
         {facets.map((facet) => (
-          <Button
+          <button
             key={facet.value}
-            size="lg"
-            variant={facet.active ? 'primary' : 'secondary'}
+            type="button"
             aria-pressed={facet.active}
             onClick={() => onToggle(dimension, facet.value)}
+            className={pillClass(facet.active)}
           >
             {labelFor(facet.value)}
-            <span className={facet.active ? 'text-white' : 'text-ink-tertiary'}>
+            <span className={cx('tabular-nums', facet.active ? 'text-white' : 'text-ink-tertiary')}>
               {facet.count}
             </span>
-          </Button>
+          </button>
         ))}
       </div>
     </fieldset>
@@ -156,66 +204,68 @@ export function PhoneFilterBar({
   onAgentChange,
   onToggle,
   onClear,
+  header,
+  showFilters = true,
 }: PhoneFilterBarProps) {
   const anyActive = hasActivePhoneFilters(filters);
 
   return (
-    <GlassPanel
-      padding="sm"
-      className="mb-5 flex flex-col gap-5 sm:flex-row sm:flex-wrap sm:items-start sm:gap-x-8"
-    >
-      <fieldset className="min-w-0">
-        <legend className={legendClass}>View</legend>
-        {/*
-          A sunken well holding two toggles rather than a `SegmentedControl`:
-          the segmented pill is 32px tall, and every control on this surface
-          has to clear the 44px touch target.
-        */}
-        <div className="glass-sunken mt-2 inline-flex gap-1 rounded-control p-1">
+    <GlassPanel padding="none" className="mb-5 divide-y divide-[var(--glass-ring)]">
+      <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-3 px-4 py-3 sm:px-5">
+        <div className="min-w-0">{header}</div>
+        <fieldset className="min-w-0">
+          {/* The two options name themselves; the legend is for the group. */}
+          <legend className="sr-only">View</legend>
+          <div className="glass-sunken inline-flex gap-1 rounded-control p-1">
+            <button
+              type="button"
+              aria-pressed={view === 'week'}
+              onClick={() => onViewChange('week')}
+              className={segmentClass(view === 'week')}
+            >
+              Week grid
+            </button>
+            <button
+              type="button"
+              aria-pressed={view === 'queue'}
+              onClick={() => onViewChange('queue')}
+              className={segmentClass(view === 'queue')}
+            >
+              Queue
+            </button>
+          </div>
+        </fieldset>
+      </div>
+
+      {showFilters && (
+      <div className="flex flex-col gap-4 px-4 py-4 sm:flex-row sm:flex-wrap sm:items-start sm:gap-x-8 sm:px-5">
+        <AgentPicker agents={agents} value={filters.agent} onChange={onAgentChange} />
+
+        <FacetGroup
+          legend="Appointment"
+          facets={statusFacets}
+          dimension="status"
+          labelFor={(v) => appointmentStatusTerm(v).label}
+          onToggle={onToggle}
+        />
+        <FacetGroup
+          legend="Engagement"
+          facets={stateFacets}
+          dimension="state"
+          labelFor={(v) => engagementStateTerm(v).label}
+          onToggle={onToggle}
+        />
+        {anyActive && (
           <Button
             size="lg"
-            variant={view === 'week' ? 'primary' : 'ghost'}
-            aria-pressed={view === 'week'}
-            onClick={() => onViewChange('week')}
+            variant="ghost"
+            onClick={onClear}
+            className="self-start sm:ml-auto sm:self-end"
           >
-            Week grid
+            Clear filters
           </Button>
-          <Button
-            size="lg"
-            variant={view === 'queue' ? 'primary' : 'ghost'}
-            aria-pressed={view === 'queue'}
-            onClick={() => onViewChange('queue')}
-          >
-            Queue
-          </Button>
-        </div>
-      </fieldset>
-
-      <AgentPicker agents={agents} value={filters.agent} onChange={onAgentChange} />
-
-      <FacetGroup
-        legend="Appointment"
-        facets={statusFacets}
-        dimension="status"
-        labelFor={(v) => appointmentStatusTerm(v).label}
-        onToggle={onToggle}
-      />
-      <FacetGroup
-        legend="Engagement"
-        facets={stateFacets}
-        dimension="state"
-        labelFor={(v) => engagementStateTerm(v).label}
-        onToggle={onToggle}
-      />
-      {anyActive && (
-        <Button
-          size="lg"
-          variant="ghost"
-          onClick={onClear}
-          className="self-end sm:ml-auto"
-        >
-          Clear filters
-        </Button>
+        )}
+      </div>
       )}
     </GlassPanel>
   );

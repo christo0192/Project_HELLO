@@ -111,22 +111,24 @@ export function CandidateHeader({
     >
       <div className="min-w-0">
         {eyebrow && (
-          <p className="text-[13px] font-medium text-[var(--c-ink-secondary)]">
+          <p className="mb-1 text-label font-medium text-[var(--c-ink-secondary)]">
             {eyebrow}
           </p>
         )}
-        <h1 className="mt-1 truncate text-[1.75rem] font-semibold tracking-[-0.02em] text-[var(--c-ink)]">
-          {title}
-        </h1>
+        {/* Wraps, never truncates. A name cut to "Rohan Deshpa…" or a page
+            description cut mid-word ("…through screen…") was one of the
+            review's tells; `break-words` keeps a long unbroken name inside
+            the column at 390px instead. */}
+        <h1 className="break-words text-title text-[var(--c-ink)]">{title}</h1>
         {description && (
-          <p className="mt-1 max-w-prose truncate text-sm text-[var(--c-ink-secondary)]">
+          <p className="mt-1 max-w-[70ch] text-pretty break-words text-sm text-[var(--c-ink-secondary)]">
             {description}
           </p>
         )}
-        {meta && <div className="mt-2.5">{meta}</div>}
+        {meta && <div className="mt-3">{meta}</div>}
       </div>
       {actions && (
-        <div className="flex shrink-0 flex-wrap items-center gap-2">{actions}</div>
+        <div className="flex shrink-0 flex-wrap items-center gap-2 sm:pt-1">{actions}</div>
       )}
     </div>
   );

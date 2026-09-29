@@ -66,6 +66,26 @@ describe('SeekableTranscript', () => {
     expect(buttons[2]).not.toHaveAttribute('aria-current');
   });
 
+  it('marks the active turn with a tint and a leading dot, never a side stripe', () => {
+    const { container } = render(
+      <SeekableTranscript
+        transcript={TIMED}
+        activeTurnIndex={1}
+        onSeek={vi.fn()}
+        recordingReady={true}
+      />,
+    );
+    const buttons = screen.getAllByRole('button');
+    // The marker is decorative (aria-current carries the state) and only on
+    // the active turn.
+    const markers = container.querySelectorAll('[data-active-turn-marker]');
+    expect(markers).toHaveLength(1);
+    expect(buttons[1].contains(markers[0])).toBe(true);
+    expect(markers[0]).toHaveAttribute('aria-hidden', 'true');
+    // Side-stripe borders are banned by the design system.
+    expect(container.innerHTML).not.toMatch(/border-[lr]-\d/);
+  });
+
   it('renders untimed turns as non-interactive divs (not buttons)', () => {
     render(
       <SeekableTranscript

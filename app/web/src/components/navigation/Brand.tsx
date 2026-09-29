@@ -33,9 +33,9 @@ export function Brand({ compact = false }: BrandProps) {
           HELLO
         </p>
         {!compact && (
-          <p className="truncate text-[11px] font-medium text-ink-tertiary">
-            Talent Workspace &amp; Mission Control
-          </p>
+          // Short enough to never truncate in the 248px rail: the full name
+          // ("Talent Workspace & Mission Control") was cut to "Mission Co…".
+          <p className="truncate text-meta font-medium text-ink-tertiary">Recruiting workspace</p>
         )}
       </div>
     </div>

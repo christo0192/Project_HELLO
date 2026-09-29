@@ -44,6 +44,7 @@ import type { ReactNode } from 'react';
 import type { Assessment, Recommendation } from '../../types';
 import { Meter, SurfaceCard, Tag } from '../design/candidate';
 import { cx } from '../design/cx';
+import { humanizeEnum } from '../../lib/humanize';
 
 /** Fixed rubric weights — the same values the legacy card printed. */
 export const SECTION_WEIGHTS = {
@@ -161,7 +162,7 @@ function Group({
         <Heading
           level={headingLevel}
           id={headingId}
-          className="text-[13px] font-medium text-[var(--c-ink)]"
+          className="text-label font-medium text-[var(--c-ink)]"
         >
           {title}
         </Heading>
@@ -261,8 +262,10 @@ function SignalBlock({
     <SurfaceCard level="sunken" className="p-3">
       <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs">
         <span className="font-medium text-[var(--c-ink-secondary)]">{label}</span>
+        {/* "Low", not the stored `low`: machine values are humanized in the
+            view, the same words the legacy card now shows. */}
         <Tag tone={tone} srPrefix={`${label} level:`}>
-          {signal.level}
+          {humanizeEnum(signal.level)}
         </Tag>
       </div>
       <Meter label="Impact" value={signal.impact_score} />
@@ -449,7 +452,7 @@ export function CandidateScorecard({
             <Meter label="Confidence" value={tone.confidence} />
             <Meter label="Professionalism" value={tone.professionalism} />
             <LabelledRow label="Sentiment">
-              <Tag srPrefix="Sentiment:">{tone.sentiment}</Tag>
+              <Tag srPrefix="Sentiment:">{humanizeEnum(tone.sentiment)}</Tag>
             </LabelledRow>
           </Group>
 
@@ -650,7 +653,7 @@ export function CandidateScorecardNarrative({
                       tone={c.resolved ? 'positive' : 'caution'}
                       srPrefix="Status:"
                     >
-                      {c.resolved ? 'resolved' : 'unresolved'}
+                      {c.resolved ? 'Resolved' : 'Unresolved'}
                     </Tag>
                   </div>
                   <p

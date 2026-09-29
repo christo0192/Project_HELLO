@@ -545,3 +545,72 @@ describe('CandidatesPage', () => {
     await expect(container).toHaveNoViolations();
   });
 });
+
+describe('CandidatesPage table columns', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockApi.listRoles.mockResolvedValue([mockRole]);
+    mockApi.listCandidates.mockResolvedValue(CANDIDATES);
+    mockApi.getScreeningFunnel.mockResolvedValue({ totals: EMPTY_FUNNEL_TOTALS });
+  });
+
+  /** The row whose name link is `name`. */
+  function rowOf(name: string): HTMLElement {
+    const link = within(screen.getByRole('table')).getByRole('link', { name });
+    return link.closest('tr') as HTMLElement;
+  }
+
+  it('makes the next action a link-button to where the step happens', async () => {
+    renderPage();
+    await screen.findByText('Jane Doe');
+    // A decision opens the Review tab directly; a screening opens the
+    // candidate, where the call and invite controls live.
+    const review = within(rowOf('Screened Sam')).getByRole('link', {
+      name: /^Review & decide\s*, Screened Sam$/,
+    });
+    expect(review).toHaveAttribute('href', '/candidates/c-screened?tab=review');
+    const start = within(rowOf('Jane Doe')).getByRole('link', {
+      name: /^Start screening\s*, Jane Doe$/,
+    });
+    expect(start).toHaveAttribute('href', '/candidates/candidate-1');
+    // A real control: the shell's secondary button at the 36px floor.
+    expect(start.className).toContain('min-h-9');
+  });
+
+  it('shows a dash, not a second copy of the status, when there is nothing to do', async () => {
+    renderPage();
+    await screen.findByText('Screening Sara');
+    const row = rowOf('Screening Sara');
+    // Only the name links out of a waiting row.
+    expect(within(row).getAllByRole('link')).toHaveLength(1);
+    const cells = row.querySelectorAll('td');
+    const next = cells[cells.length - 1];
+    expect(next.textContent).toContain('—');
+    // The words stay for screen readers and on hover.
+    expect(next.querySelector('[title]')).toHaveAttribute('title', 'Screening in progress');
+  });
+
+  it('never wraps the experience, status, recommendation or next-action cells', async () => {
+    renderPage();
+    await screen.findByText('Jane Doe');
+    const table = screen.getByRole('table');
+    const headers = Array.from(table.querySelectorAll('thead th')).map((th) => th.textContent);
+    const cells = rowOf('Screened Sam').querySelectorAll('td');
+    for (const column of ['Exp.', 'Status', 'Recommendation', 'Next action']) {
+      expect(cells[headers.indexOf(column)].className, column).toContain('whitespace-nowrap');
+    }
+  });
+
+  it('truncates email and skills only with the full value in title', async () => {
+    mockApi.listCandidates.mockResolvedValue([
+      { ...mockCandidate, skills: ['React', 'TypeScript', 'Node.js', 'GraphQL'] },
+    ]);
+    renderPage();
+    await screen.findByText('Jane Doe');
+    const row = rowOf('Jane Doe');
+    expect(within(row).getByText('jane@example.com')).toHaveAttribute('title', 'jane@example.com');
+    expect(within(row).getByTitle('React, TypeScript, Node.js, GraphQL')).toHaveTextContent(
+      'React, TypeScript+2',
+    );
+  });
+});

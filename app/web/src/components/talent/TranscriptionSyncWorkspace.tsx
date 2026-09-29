@@ -51,7 +51,7 @@ import {
   sessionStatusTone,
 } from './status';
 import { formatDateTime } from '../../lib/datetime';
-import { isLiveVoiceMode, sessionModeLabel } from '../../lib/session-mode';
+import { sessionModeLabel } from '../../lib/session-mode';
 
 export interface TranscriptionSyncWorkspaceProps {
   sessions: Session[];
@@ -382,8 +382,10 @@ export function TranscriptionSyncWorkspace({
   return (
     <div className="space-y-4 sm:space-y-6">
       {/* Session selector + context */}
-      <SurfaceCard className="flex flex-col gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
-        <div className="flex flex-wrap items-center gap-3">
+      <SurfaceCard className="flex flex-col items-start gap-3 p-4 sm:flex-row sm:items-center sm:justify-between">
+        {/* `min-w-0` + a full-width select below `sm`: a native select sizes
+            to its longest option, which at 390px ran past the card edge. */}
+        <div className="flex w-full min-w-0 flex-wrap items-center gap-3 sm:w-auto">
           <label
             htmlFor="sync-session-select"
             className="text-sm font-medium text-[var(--c-ink)]"
@@ -394,28 +396,29 @@ export function TranscriptionSyncWorkspace({
             id="sync-session-select"
             value={selectedSessionId ?? ''}
             onChange={handleSessionChange}
+            className="w-full min-w-0 max-w-full sm:w-auto"
           >
+            {/* Named by WHEN and WHAT KIND, never by a uuid prefix: two
+                sessions on one day are told apart by their time and length. */}
             {selectableSessions.map((s) => (
               <option key={s.id} value={s.id}>
-                {formatDateTime(s.created_at, { month: 'short', day: 'numeric', year: 'numeric' })}
-                {' — '}
-                {s.id.slice(0, 8)}
-                {isLiveVoiceMode(s.mode) ? ' (live)' : ''}
+                {[
+                  formatDateTime(s.created_at),
+                  sessionModeLabel(s.mode),
+                  s.duration_sec ? formatDurationSec(s.duration_sec) : null,
+                ]
+                  .filter(Boolean)
+                  .join(' · ')}
               </option>
             ))}
           </CandidateSelect>
         </div>
+        {/* Only the status: date, kind and length are already the selected
+            option's own words, one control to the left. */}
         {contextSession && (
-          <div className="flex flex-wrap items-center gap-2 text-xs text-[var(--c-ink-secondary)]">
-            <StatusBadge tone={sessionStatusTone(contextSession.status)}>
-              {sessionStatusLabel(contextSession.status)}
-            </StatusBadge>
-            <span>{sessionModeLabel(contextSession.mode)}</span>
-            <span aria-hidden>·</span>
-            <span>{formatDurationSec(contextSession.duration_sec)}</span>
-            <span aria-hidden>·</span>
-            <span>{formatDateTime(contextSession.created_at)}</span>
-          </div>
+          <StatusBadge tone={sessionStatusTone(contextSession.status)}>
+            {sessionStatusLabel(contextSession.status)}
+          </StatusBadge>
         )}
       </SurfaceCard>
 
@@ -474,8 +477,8 @@ function ScorecardBlock({
         <CandidateScorecard assessment={assessment} narrative="none" roleFit="none" />
       ) : (
         <p className="max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
-          No scorecard for this session yet — complete a screening to generate
-          one.
+          No scorecard for this session yet. One is generated when a screening
+          completes.
         </p>
       )}
     </section>

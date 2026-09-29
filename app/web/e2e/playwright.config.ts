@@ -14,11 +14,12 @@ import { createServer } from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { defineConfig, devices } from '@playwright/test';
+import { ARTIFACTS_DIR } from './fixtures/axe';
 import { E2E_LOCALE, E2E_TIMEZONE, viteEnv } from './fixtures/env';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const WEB_ROOT = path.resolve(HERE, '..');
-const ARTIFACTS = path.join(HERE, '.artifacts');
+const ARTIFACTS = ARTIFACTS_DIR;
 
 /** Ask the OS for a free port (bind to 0, read it back, release it). */
 function freePort(): Promise<number> {

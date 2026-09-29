@@ -7,7 +7,11 @@ import {
   formatDurationSec,
   candidateStatusCounts,
   sessionStatusCounts,
-  sessionsPerDay,
+  attemptOutcomeLabel,
+  attemptRawStatus,
+  appealStatusLabel,
+  appealCategoryLabel,
+  isAppealPending,
 } from '../status';
 
 describe('candidateStatusLabel', () => {
@@ -20,8 +24,10 @@ describe('candidateStatusLabel', () => {
     expect(candidateStatusLabel('rejected')).toBe('Rejected');
   });
 
-  it('falls back to the raw value for unknown statuses (never invents)', () => {
-    expect(candidateStatusLabel('custom_state')).toBe('custom_state');
+  it('falls back to the humanized raw value for unknown statuses (never invents)', () => {
+    // The same words in sentence case, never a guessed label: an operator
+    // still recognises the stored value, and the page keeps it in `title`.
+    expect(candidateStatusLabel('custom_state')).toBe('Custom state');
     expect(candidateStatusLabel(null)).toBe('New');
     expect(candidateStatusLabel(undefined)).toBe('New');
     expect(candidateStatusLabel('  ')).toBe('New');
@@ -53,7 +59,8 @@ describe('sessionStatusLabel / tone', () => {
     expect(sessionStatusLabel('failed')).toBe('Failed');
     expect(sessionStatusLabel('cancelled')).toBe('Cancelled');
     expect(sessionStatusLabel('expired')).toBe('Expired');
-    expect(sessionStatusLabel('weird')).toBe('weird');
+    expect(sessionStatusLabel('weird')).toBe('Weird');
+    expect(sessionStatusLabel('some_new_state')).toBe('Some new state');
     expect(sessionStatusLabel(null)).toBe('—');
   });
 
@@ -122,22 +129,67 @@ describe('sessionStatusCounts', () => {
   });
 });
 
-describe('sessionsPerDay', () => {
-  it('zero-fills a fixed window and labels dates m/d', () => {
-    // Reference date is “today” (UTC) — the newest bucket carries the sessions.
-    const today = new Date();
-    today.setUTCHours(0, 0, 0, 0);
-    const iso = today.toISOString();
-    const data = sessionsPerDay([{ created_at: iso }, { created_at: iso }], 3);
-    expect(data).toHaveLength(3);
-    expect(data[data.length - 1].value).toBe(2);
-    expect(data[data.length - 1].label).toMatch(/^\d{2}\/\d{2}$/);
-    expect(data.slice(0, 2).every((d) => d.value === 0)).toBe(true);
+describe('attemptOutcomeLabel', () => {
+  it("names every outcome in the closed allowlist in a recruiter's words", () => {
+    // 0042 + 0043 + 0095 `chk_phone_call_attempts_outcome`, in full: no
+    // member may fall through to a raw snake_case enum.
+    const allowlist = [
+      'completed', 'disconnected', 'no_answer', 'busy', 'voicemail', 'declined',
+      'wrong_number', 'opt_out', 'provider_error', 'window_closed', 'cancelled',
+      'abandoned_pre_disclosure', 'consent_failed',
+    ];
+    for (const outcome of allowlist) {
+      const label = attemptOutcomeLabel(outcome, 'ended');
+      expect(label, outcome).not.toMatch(/_/);
+      expect(label.charAt(0), outcome).toBe(label.charAt(0).toUpperCase());
+    }
+    expect(attemptOutcomeLabel('no_answer', 'ended')).toBe('No answer');
+    expect(attemptOutcomeLabel('provider_error', 'ended')).toBe("Couldn't connect");
   });
 
-  it('ignores malformed dates without fabricating counts', () => {
-    const data = sessionsPerDay([{ created_at: 'not-a-date' }], 2);
-    expect(data).toHaveLength(2);
-    expect(data.every((d) => d.value === 0)).toBe(true);
+  it('keeps the two consent-gate outcomes apart', () => {
+    // The candidate hanging up before the recording notice is not OUR gate
+    // failing, and neither is the candidate declining (0095).
+    const hungUp = attemptOutcomeLabel('abandoned_pre_disclosure', 'ended');
+    const ourFault = attemptOutcomeLabel('consent_failed', 'ended');
+    const declined = attemptOutcomeLabel('declined', 'ended');
+    expect(new Set([hungUp, ourFault, declined]).size).toBe(3);
+    expect(ourFault).toMatch(/our side/);
+  });
+
+  it('describes the fixture gate drop as a consent-check drop, not "Dropped at gate"', () => {
+    expect(attemptOutcomeLabel('dropped_at_gate', 'completed')).toBe('Dropped at the consent check');
+  });
+
+  it('falls back to the attempt state while no outcome is recorded, then to humanizeEnum', () => {
+    expect(attemptOutcomeLabel(null, 'ringing')).toBe('Ringing');
+    expect(attemptOutcomeLabel(null, 'answered_unclassified')).toBe('Answered');
+    expect(attemptOutcomeLabel('brand_new_outcome', 'ended')).toBe('Brand new outcome');
+    expect(attemptOutcomeLabel(null, null)).toBe('Unknown');
+  });
+
+  it('keeps the raw pair for an operator tooltip', () => {
+    expect(attemptRawStatus('no_answer', 'ended')).toBe('state: ended · outcome: no_answer');
+    expect(attemptRawStatus(null, 'ringing')).toBe('state: ringing');
+  });
+});
+
+describe('appeal vocabulary', () => {
+  it('labels the four appeal statuses (0015) and flags the pending two', () => {
+    expect(appealStatusLabel('open')).toBe('Open');
+    expect(appealStatusLabel('under_review')).toBe('Under review');
+    expect(appealStatusLabel('granted')).toBe('Granted');
+    expect(appealStatusLabel('denied')).toBe('Denied');
+    expect(isAppealPending('open')).toBe(true);
+    expect(isAppealPending('under_review')).toBe(true);
+    expect(isAppealPending('granted')).toBe(false);
+    expect(isAppealPending('denied')).toBe(false);
+  });
+
+  it('names the appeal by its category', () => {
+    expect(appealCategoryLabel('recording')).toBe('Recording appeal');
+    expect(appealCategoryLabel('other')).toBe('Appeal');
+    expect(appealCategoryLabel('data_access')).toBe('Data access appeal');
+    expect(appealCategoryLabel(null)).toBe('Appeal');
   });
 });

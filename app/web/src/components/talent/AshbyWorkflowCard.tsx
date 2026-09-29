@@ -36,6 +36,8 @@ import { StatusBadge, type StatusTone } from '../design';
 import { SurfaceCard } from '../design/candidate';
 import { formatDateTime } from '../../lib/datetime';
 import { sessionStatusLabel, sessionStatusTone } from './status';
+import { humanizeEnum } from '../../lib/humanize';
+import { ASHBY_ERROR_CODE_LABELS } from '../../lib/ashby-labels';
 
 /** Which scope the card reads through. Both resolve to the same projection. */
 export type AshbyWorkflowSource =
@@ -65,7 +67,7 @@ function ashbyLifecycleLabel(lifecycle: string): string {
     case 'cancelled':
       return 'Cancelled';
     default:
-      return lifecycle;
+      return humanizeEnum(lifecycle);
   }
 }
 
@@ -95,7 +97,7 @@ function ashbyTerminalStateLabel(terminalState: string): string {
     case 'manual_stage_cancel':
       return 'Cancelled by an administrator';
     default:
-      return terminalState;
+      return humanizeEnum(terminalState);
   }
 }
 
@@ -118,7 +120,7 @@ function ashbyIngestionLabel(state: string): string {
     case 'cancelled':
       return 'Cancelled';
     default:
-      return state;
+      return humanizeEnum(state);
   }
 }
 
@@ -148,7 +150,7 @@ function ashbyOperationLabel(type: AshbyCandidateWorkflowOperation['type']): str
     case 'scorecard_write':
       return 'Ashby scorecard';
     default:
-      return type;
+      return humanizeEnum(type);
   }
 }
 
@@ -167,7 +169,7 @@ function ashbyOperationStateLabel(state: string): string {
     case 'cancelled':
       return 'Cancelled';
     default:
-      return state;
+      return humanizeEnum(state);
   }
 }
 
@@ -243,8 +245,9 @@ export function AshbyWorkflowCardView({ workflow }: AshbyWorkflowCardViewProps) 
                   {ashbyOperationStateLabel(op.state)}
                 </StatusBadge>
                 {code && (
-                  <p className="mt-1 text-xs text-ink-tertiary">
-                    Error code: <code className="break-all">{code}</code>
+                  // In words; the exact code stays one hover away for support.
+                  <p className="mt-1 text-xs text-ink-tertiary" title={code}>
+                    {humanizeEnum(code, ASHBY_ERROR_CODE_LABELS)}
                   </p>
                 )}
               </dd>

@@ -1,8 +1,10 @@
 /**
  * SessionDetailPage — read-only post-session view:
- * loading/error/retry, transcript speaker labels + empty state, scorecard
- * presence/absence (truthful), on-demand signed-URL recording lifecycle,
- * and axe compliance.
+ * loading/error/retry, a humane header (named by the candidate and role,
+ * never by the session UUID, with graceful fallbacks when those reads
+ * fail), transcript speaker labels + empty state, scorecard presence/absence
+ * (truthful) for both assessment generations, on-demand signed-URL recording
+ * lifecycle, and axe compliance.
  */
 import { render, screen, fireEvent, act } from '@testing-library/react';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
@@ -12,11 +14,15 @@ import { mockAssessment, mockTranscript } from '../test/helpers';
 
 const getSession = vi.fn();
 const getRecordingDownloadUrl = vi.fn();
+const getCandidate = vi.fn();
+const getRole = vi.fn();
 
 vi.mock('../api', () => ({
   api: {
     getSession: (...args: any[]) => getSession(...args),
     getRecordingDownloadUrl: (...args: any[]) => getRecordingDownloadUrl(...args),
+    getCandidate: (...args: any[]) => getCandidate(...args),
+    getRole: (...args: any[]) => getRole(...args),
   },
   ApiError: class extends Error {
     status: number;
@@ -35,6 +41,7 @@ const completedSessionDetail = {
     status: 'completed',
     mode: 'simulation',
     duration_sec: 360,
+    candidate_words: 1234,
     created_at: '2026-06-01T00:00:00Z',
   },
   transcript: mockTranscript,
@@ -51,9 +58,53 @@ function renderPage(sessionId = '550e8400-e29b-41d4-a716-446655440000') {
   );
 }
 
+/** A v2 (role-scorecard) row as the wire carries it: no v1 dimension fields. */
+const v2Assessment = {
+  id: 'a-v2',
+  schema_version: 2,
+  scoring_status: 'complete',
+  weighted_score_5: 3.5,
+  score_scale_max: 4,
+  overall_score: 86,
+  recommendation: 'advance',
+  summary: 'Specific, well-evidenced answers.',
+  raw: {
+    schemaVersion: 2,
+    status: 'complete',
+    scoreScaleMax: 4,
+    weightedScore5: 3.5,
+    overallScore: 86,
+    recommendation: 'advance',
+    metricResults: [
+      {
+        configMetricId: 'm1',
+        score: 4,
+        evidenceStatus: 'scored',
+        rationale: 'Reasoned about failure modes.',
+        evidenceRefs: [],
+        metric: { id: 'm1', name: 'Technical depth', weightBps: 6000, rubric: {} },
+      },
+      {
+        configMetricId: 'm2',
+        score: 3,
+        evidenceStatus: 'scored',
+        rationale: 'Clear and structured.',
+        evidenceRefs: [],
+        metric: { id: 'm2', name: 'Communication clarity', weightBps: 4000, rubric: {} },
+      },
+    ],
+  },
+};
+
 describe('SessionDetailPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    getCandidate.mockResolvedValue({
+      candidate: { id: 'candidate-1', name: 'Jane Doe' },
+      sessions: [],
+      assessments: [],
+    });
+    getRole.mockResolvedValue({ id: 'role-1', title: 'Frontend Engineer' });
   });
 
   it('shows loading state initially', () => {
@@ -74,13 +125,58 @@ describe('SessionDetailPage', () => {
   it('renders read-only session meta and back link to the candidate', async () => {
     getSession.mockResolvedValue(completedSessionDetail);
     renderPage();
-    expect(await screen.findByText('← Back to candidate')).toBeInTheDocument();
-    const back = screen.getByRole('link', { name: '← Back to candidate' });
+    const back = await screen.findByRole('link', { name: 'Back to candidate' });
     expect(back).toHaveAttribute('href', '/candidates/candidate-1');
-    expect(screen.getByText('Session 550e8400')).toBeInTheDocument();
     expect(screen.getByText('6m 0s')).toBeInTheDocument(); // duration_sec 360
+    expect(screen.getByText('1,234')).toBeInTheDocument(); // candidate_words
     // Read-only: no composer exists.
     expect(screen.queryByPlaceholderText(/candidate's answer/i)).not.toBeInTheDocument();
+  });
+
+  it('names the page by the candidate and role, never by the session UUID', async () => {
+    getSession.mockResolvedValue(completedSessionDetail);
+    renderPage();
+    expect(
+      await screen.findByRole('heading', { level: 1, name: 'Jane Doe’s screening' }),
+    ).toBeInTheDocument();
+    expect(getCandidate).toHaveBeenCalledWith('candidate-1');
+    expect(getRole).toHaveBeenCalledWith('role-1');
+    // Role, humanized mode and a d MMM date as the meta line.
+    expect(
+      screen.getByText(/^Frontend Engineer · Simulation · (31 May|1 Jun)( 2026)?, \d{2}:\d{2}$/),
+    ).toBeInTheDocument();
+    // The id is a quiet reference with the full value one hover away.
+    const ref = screen.getByText('550e8400');
+    expect(ref).toHaveAttribute('title', '550e8400-e29b-41d4-a716-446655440000');
+    expect(screen.queryByText('550e8400-e29b-41d4-a716-446655440000')).not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /550e8400/ })).not.toBeInTheDocument();
+  });
+
+  it('falls back to the role, then the mode, when the enrichment reads fail', async () => {
+    getSession.mockResolvedValue(completedSessionDetail);
+    getCandidate.mockRejectedValue(new Error('forbidden'));
+    const { unmount } = renderPage();
+    expect(
+      await screen.findByRole('heading', { level: 1, name: 'Frontend Engineer screening' }),
+    ).toBeInTheDocument();
+    unmount();
+
+    getRole.mockRejectedValue(new Error('gone'));
+    renderPage();
+    expect(
+      await screen.findByRole('heading', { level: 1, name: 'Simulation screening' }),
+    ).toBeInTheDocument();
+    // The page itself still renders in full.
+    expect(screen.getByText('Scorecard')).toBeInTheDocument();
+  });
+
+  it('treats a blank candidate name as unknown', async () => {
+    getSession.mockResolvedValue(completedSessionDetail);
+    getCandidate.mockResolvedValue({ candidate: { id: 'candidate-1', name: '   ' } });
+    renderPage();
+    expect(
+      await screen.findByRole('heading', { level: 1, name: 'Frontend Engineer screening' }),
+    ).toBeInTheDocument();
   });
 
   it('renders the transcript with speaker labels (no timestamps fabricated)', async () => {
@@ -126,15 +222,25 @@ describe('SessionDetailPage', () => {
     expect(screen.getByText('Advance')).toBeInTheDocument();
   });
 
+  it('renders a role-scorecard (v2) assessment instead of crashing', async () => {
+    getSession.mockResolvedValue({ ...completedSessionDetail, assessment: v2Assessment });
+    renderPage();
+    expect(await screen.findByText('Scorecard')).toBeInTheDocument();
+    expect(screen.getByText('86')).toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 4, name: 'Technical depth' })).toBeInTheDocument();
+    expect(screen.getByText('Excellent')).toBeInTheDocument();
+    expect(screen.getByText('Good')).toBeInTheDocument();
+    expect(screen.getByText('Weight 60%')).toBeInTheDocument();
+  });
+
   it('shows a truthful no-scorecard state when completed without an assessment', async () => {
     getSession.mockResolvedValue({
       ...completedSessionDetail,
       assessment: null,
     });
     renderPage();
-    expect(
-      await screen.findByText(/No scorecard yet — assessment generation may still be running/i),
-    ).toBeInTheDocument();
+    expect(await screen.findByText('No scorecard yet')).toBeInTheDocument();
+    expect(screen.getByText(/Scoring may still be running/i)).toBeInTheDocument();
   });
 
   it('shows a no-scorecard state when the session has not completed', async () => {
@@ -144,9 +250,8 @@ describe('SessionDetailPage', () => {
       assessment: null,
     });
     renderPage();
-    expect(
-      await screen.findByText(/No scorecard — the session has not completed/i),
-    ).toBeInTheDocument();
+    expect(await screen.findByText('No scorecard yet')).toBeInTheDocument();
+    expect(screen.getByText(/has not completed, so it has not been scored/i)).toBeInTheDocument();
   });
 
   it('gates recording access behind an explicit click', async () => {
@@ -230,6 +335,13 @@ describe('SessionDetailPage', () => {
     getRecordingDownloadUrl.mockResolvedValue({ url: 'https://x.invalid/rec' });
     const { container } = renderPage();
     await screen.findByText('Scorecard');
+    await expect(container).toHaveNoViolations();
+  });
+
+  it('has no axe violations with a v2 assessment', async () => {
+    getSession.mockResolvedValue({ ...completedSessionDetail, assessment: v2Assessment });
+    const { container } = renderPage();
+    await screen.findByText('Technical depth');
     await expect(container).toHaveNoViolations();
   });
 });

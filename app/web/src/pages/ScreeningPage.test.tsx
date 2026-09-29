@@ -5,7 +5,8 @@
  *   - Loading state
  *   - Transcript rendering with bot/candidate bubbles
  *   - Composer textarea and send button
- *   - Completed state with assessment
+ *   - Completed state with assessment (legacy v1 and role-scorecard v2)
+ *   - Calm "thinking" indicator (no bounce), with its status text
  *   - axe structural rule compliance
  *   - Keyboard interactions (Enter to send)
  */
@@ -78,7 +79,19 @@ describe('ScreeningPage', () => {
     renderScreeningPage();
 
     expect(await screen.findByText('Screening with Gopu')).toBeInTheDocument();
-    expect(screen.getByText('← Back to candidates')).toBeInTheDocument();
+    expect(screen.getByRole('link', { name: 'Back to candidates' })).toHaveAttribute('href', '/candidates');
+  });
+
+  it('links back to the session\'s own candidate when it names one', async () => {
+    mockApi.getSession.mockResolvedValue({
+      session: { id: 's1', status: 'in_progress', candidate_id: 'c-42' },
+      transcript: [],
+      assessment: null,
+    });
+    renderScreeningPage();
+
+    const back = await screen.findByRole('link', { name: 'Back to candidate' });
+    expect(back).toHaveAttribute('href', '/candidates/c-42');
   });
 
   it('renders empty transcript state', async () => {
@@ -161,11 +174,73 @@ describe('ScreeningPage', () => {
     });
     renderScreeningPage();
 
-    // 'Screening complete' appears twice: in subtitle and in composer area
-    const completedTexts = await screen.findAllByText('Screening complete');
-    expect(completedTexts.length).toBe(2);
+    // Said once, where the composer was; the header points at the result.
+    expect(await screen.findByText('Screening complete')).toBeInTheDocument();
+    expect(screen.getByText('Complete. The assessment is below.')).toBeInTheDocument();
     expect(screen.getByText('Assessment')).toBeInTheDocument();
     expect(screen.getByText('78')).toBeInTheDocument();
+  });
+
+  it('renders a role-scorecard (v2) assessment instead of crashing', async () => {
+    mockApi.getSession.mockResolvedValue({
+      session: { id: 's1', status: 'completed' },
+      transcript: mockTranscript,
+      assessment: {
+        schema_version: 2,
+        overall_score: 64,
+        recommendation: 'hold',
+        summary: 'Mixed evidence.',
+        score_scale_max: 4,
+        raw: {
+          schemaVersion: 2,
+          status: 'complete',
+          scoreScaleMax: 4,
+          overallScore: 64,
+          weightedScore5: 2.6,
+          recommendation: 'hold',
+          metricResults: [
+            {
+              configMetricId: 'm1',
+              score: 3,
+              evidenceStatus: 'scored',
+              rationale: 'Structured answers.',
+              evidenceRefs: [],
+              metric: { id: 'm1', name: 'Problem solving', weightBps: 10000, rubric: {} },
+            },
+          ],
+        },
+      },
+    });
+    renderScreeningPage();
+
+    expect(await screen.findByText('Problem solving')).toBeInTheDocument();
+    expect(screen.getByText('64')).toBeInTheDocument();
+    expect(screen.getByText('Hold')).toBeInTheDocument();
+    expect(screen.getByText('Good')).toBeInTheDocument();
+  });
+
+  it('shows a calm, accessible thinking indicator while a turn is in flight', async () => {
+    mockApi.getSession.mockResolvedValue({
+      session: { id: 's1', status: 'in_progress' },
+      transcript: [],
+      assessment: null,
+    });
+    mockApi.turn.mockReturnValue(new Promise(() => {}));
+    renderScreeningPage();
+
+    const textarea = await screen.findByLabelText('Candidate answer');
+    await userEvent.type(textarea, 'Five years of React.{Enter}');
+
+    const label = await screen.findByText('Gopu is thinking…');
+    const status = label.closest('[role="status"]') as HTMLElement;
+    expect(status).not.toBeNull();
+    const dots = status.querySelectorAll('[aria-hidden="true"]');
+    expect(dots).toHaveLength(3);
+    for (const dot of dots) {
+      // Opacity pulse only, and only when motion is allowed: no bounce.
+      expect(dot.className).not.toMatch(/animate-bounce/);
+      expect(dot.className).toMatch(/motion-safe:animate-\[pulse_/);
+    }
   });
 
   it('has no axe violations in active state', async () => {
@@ -186,7 +261,7 @@ describe('ScreeningPage', () => {
       assessment: mockAssessment,
     });
     const { container } = renderScreeningPage();
-    await screen.findAllByText('Screening complete');
+    await screen.findByText('Screening complete');
     await expect(container).toHaveNoViolations();
   });
 });

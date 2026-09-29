@@ -1,5 +1,5 @@
 /**
- * Design primitives: Skeleton, KpiCard, Table, PageHeader, StatusBadge,
+ * Design primitives: Skeleton, Table, PageHeader, StatusBadge,
  * ChartCard, ThemeToggle — rendering, semantics, axe.
  */
 import { render, screen } from '@testing-library/react';
@@ -10,7 +10,6 @@ import {
   Skeleton,
   SkeletonText,
   ChartSkeleton,
-  KpiCard,
   Table,
   THead,
   TBody,
@@ -46,58 +45,6 @@ describe('Skeleton family', () => {
   it('renders a deterministic ChartSkeleton bar set', () => {
     render(<ChartSkeleton bars={8} />);
     expect(document.querySelectorAll('.skeleton').length).toBeGreaterThanOrEqual(8);
-  });
-});
-
-describe('KpiCard', () => {
-  it('renders label, value, unit, hint and delta', () => {
-    stubMatchMedia(true, '(prefers-reduced-motion: reduce)');
-    render(
-      <KpiCard
-        label="Total candidates"
-        value={128}
-        unit="candidates"
-        hint="vs last week"
-        delta={12.5}
-      />,
-    );
-    expect(screen.getByText('Total candidates')).toBeInTheDocument();
-    expect(screen.getByText('128')).toBeInTheDocument();
-    expect(screen.getByText('candidates')).toBeInTheDocument();
-    expect(screen.getByText('+12.5%')).toBeInTheDocument();
-    expect(screen.getByText('vs last week')).toBeInTheDocument();
-  });
-
-  it('supports custom value formatting', () => {
-    stubMatchMedia(true, '(prefers-reduced-motion: reduce)');
-    render(<KpiCard label="Avg score" value={81.4} formatValue={(v) => `${v.toFixed(1)}%`} />);
-    expect(screen.getByText('81.4%')).toBeInTheDocument();
-  });
-
-  it('shows a skeleton while loading and no value', () => {
-    render(<KpiCard label="Total" value={5} loading />);
-    expect(document.querySelector('.skeleton')).toBeInTheDocument();
-    expect(screen.queryByText('5')).not.toBeInTheDocument();
-  });
-
-  it('renders negative and zero deltas', () => {
-    const { rerender } = render(<KpiCard label="A" value={1} delta={-3.2} />);
-    expect(screen.getByText('-3.2%')).toBeInTheDocument();
-    rerender(<KpiCard label="A" value={1} delta={0} />);
-    expect(screen.getByText('0.0%')).toBeInTheDocument();
-  });
-
-  it('has no axe violations', async () => {
-    render(
-      <KpiCard
-        label="Sessions today"
-        value={9}
-        unit="sessions"
-        hint="updated just now"
-        delta={4}
-      />,
-    );
-    await expect(screen.getByText('Sessions today').closest('div')!).toHaveNoViolations();
   });
 });
 

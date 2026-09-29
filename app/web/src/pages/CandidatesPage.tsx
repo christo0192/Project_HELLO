@@ -32,9 +32,10 @@ import { Link, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import type { Candidate, Role } from "../types";
 import type { CandidateFilters } from "../components/talent";
-import { CandidateButton, Tag } from "../components/design/candidate";
+import { CandidateButton } from "../components/design/candidate";
 import {
   Button,
+  buttonClass,
   EmptyPanel,
   ErrorPanel,
   Field,
@@ -88,7 +89,7 @@ import { roleAgentName } from "../lib/role-label";
  */
 const FILTER_PILL_CLASS = (selected: boolean) =>
   [
-    "inline-flex min-h-11 items-center gap-1.5 rounded-full px-3 text-[13px] font-medium transition-colors duration-200",
+    "inline-flex min-h-11 items-center gap-1.5 rounded-full px-3 text-label font-medium transition-colors duration-200",
     "focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]",
     selected
       ? "bg-[var(--c-accent)] text-[var(--c-data-label-inside)] shadow-pill"
@@ -145,7 +146,7 @@ const RECOMMENDATION_BAR_TONE: Record<string, PipelineTone> = {
 function AgentCell({ role }: { role: Role | undefined }) {
   const name = role ? roleAgentName(role) : null;
   if (name) {
-    return <span className="text-[13px] text-[var(--c-ink)]">{name}</span>;
+    return <span className="text-label text-[var(--c-ink)]">{name}</span>;
   }
   return <span className="text-[var(--c-ink-secondary)]">—</span>;
 }
@@ -182,10 +183,99 @@ function RoleCell({
   if (title) {
     // No `data-` attribute carrying the raw uuid: it would confirm the id of a
     // role the viewer may have no scope to see.
-    return <span className="text-[13px] text-[var(--c-ink)]">{title}</span>;
+    return <span className="text-label text-[var(--c-ink)]">{title}</span>;
   }
   return (
     <span className="text-[var(--c-ink-secondary)]">{rolesLoaded ? "Unknown role" : "—"}</span>
+  );
+}
+
+/**
+ * Skills as ONE quiet line of text, not a wrap of outlined chips.
+ *
+ * Four chips per row broke onto two lines on most rows and made the skills
+ * the loudest thing in a table whose job is status and next step. The first
+ * two read as a list; the rest are a count; the whole list is the `title`
+ * and, in full, on the candidate's profile, so the ellipsis hides nothing.
+ */
+function SkillsCell({ skills }: { skills: string[] }) {
+  if (skills.length === 0) {
+    return <span className="text-[var(--c-ink-secondary)]">—</span>;
+  }
+  const shown = skills.slice(0, 2);
+  const more = skills.length - shown.length;
+  return (
+    <span
+      className="flex w-[8.5rem] items-baseline gap-1.5 text-label"
+      title={skills.join(", ")}
+    >
+      <span className="min-w-0 truncate text-[var(--c-ink)]">{shown.join(", ")}</span>
+      {more > 0 && (
+        <span className="shrink-0 tabular-nums text-[var(--c-ink-secondary)]">+{more}</span>
+      )}
+    </span>
+  );
+}
+
+/**
+ * Twelve-pixel cell padding instead of the table's default sixteen, with the
+ * outer edges kept at sixteen so the first column still lines up with the
+ * filter panel above. Eight columns at sixteen a side spent 256px on gutters,
+ * which is exactly what pushed the next-action column off a 1440px screen.
+ * A descendant selector, so it wins over the cell's own padding without
+ * touching the shared `Table`.
+ */
+const TABLE_DENSITY =
+  "[&_td]:px-3 [&_th]:px-3 [&_td:first-child]:pl-4 [&_th:first-child]:pl-4 [&_td:last-child]:pr-4 [&_th:last-child]:pr-4";
+
+/**
+ * The next step as something to CLICK when there is one, and a dash when
+ * there is not.
+ *
+ * An actionable step ("Start screening", "Review & decide") is a link styled
+ * as a secondary button, to the page where the step happens: the Review tab
+ * for a decision, the candidate's Overview (where the call and invite live)
+ * for a screening. Every other state is waiting on the system ("Queued for
+ * screening") or settled ("Rejected"), which the Status column beside it
+ * already says; repeating it here made this a column of grey sentences
+ * around the few buttons that matter. The words stay for screen readers and
+ * on hover.
+ *
+ * The link's accessible name carries the candidate ("Review & decide, Meera
+ * Iyer"): a column of identical "Review & decide" links is ambiguous out of
+ * the row's context, which is how a screen reader's links list presents it.
+ */
+function NextActionCell({
+  candidateId,
+  candidateName,
+  status,
+  next,
+}: {
+  candidateId: string;
+  candidateName: string;
+  status: string | null | undefined;
+  next: { label: string; emphasis: boolean };
+}) {
+  if (next.emphasis) {
+    const isReview = normalizeStatus(status) === "screened";
+    return (
+      <Link
+        to={`/candidates/${candidateId}${isReview ? "?tab=review" : ""}`}
+        // The compact size with a 36px floor (`min-h-9`, the design
+        // system's control minimum): the md size's wider padding alone would
+        // push this column, and so the table, past a 1440px layout.
+        className={buttonClass("secondary", "sm", "min-h-9")}
+      >
+        <span>{next.label}</span>
+        <span className="sr-only">, {candidateName}</span>
+      </Link>
+    );
+  }
+  return (
+    <span className="text-[var(--c-ink-secondary)]" title={next.label}>
+      <span aria-hidden="true">—</span>
+      <span className="sr-only">{next.label}</span>
+    </span>
   );
 }
 
@@ -561,7 +651,7 @@ export function CandidatesPage() {
           role="group"
           aria-label="Filter by resume review"
         >
-          <span className="text-[13px] font-medium text-[var(--c-ink-secondary)]">
+          <span className="text-label font-medium text-[var(--c-ink-secondary)]">
             Resume:
           </span>
           {RESUME_REVIEW_ORDER.map((value) => {
@@ -587,7 +677,7 @@ export function CandidatesPage() {
 
         {/* Active-filter summary */}
         {active && (
-          <div className="mt-3 flex flex-wrap items-center gap-2 text-[13px] text-[var(--c-ink-secondary)]">
+          <div className="mt-3 flex flex-wrap items-center gap-2 text-label text-[var(--c-ink-secondary)]">
             <span className="font-medium">Active filters:</span>
             {roleTitle && (
               <FilterChip
@@ -685,17 +775,31 @@ export function CandidatesPage() {
 
         {!error && visible.length > 0 && (
           <>
-            <Table caption="Candidates in your pipeline">
+            {/* COLUMN WIDTHS. Every cell states the width it needs, so the
+                table's own min-content width is a real layout rather than
+                whatever the browser squeezes out of eight auto columns: at
+                1440px it fits the column exactly, and below that (a 390px
+                phone) it keeps these widths and scrolls sideways INSIDE the
+                table's own container, never the page.
+                  - Exp., Status, Recommendation and Next action never wrap
+                    ("7 / yr" and a badge broken over two lines were the
+                    review's complaint).
+                  - Agent and Role may wrap, to two lines at most, at a
+                    minimum width that fits a two-word title per line.
+                  - Email and Skills truncate with the full value in
+                    `title`: both are shown in full on the profile, so the
+                    ellipsis never hides anything unreachable. */}
+            <Table caption="Candidates in your pipeline" className={TABLE_DENSITY}>
               <THead>
                 <Tr>
                   <Th>Name</Th>
                   <Th>Agent</Th>
                   <Th>Role</Th>
                   <Th>Skills</Th>
-                  <Th>Exp.</Th>
+                  <Th className="whitespace-nowrap text-right">Exp.</Th>
                   <Th>Status</Th>
                   <Th>Recommendation</Th>
-                  <Th>Next action</Th>
+                  <Th className="whitespace-nowrap">Next action</Th>
                 </Tr>
               </THead>
               {/* Rows reveal in sequence; the class collapses under
@@ -704,23 +808,29 @@ export function CandidatesPage() {
                 {page.items.map((c) => {
                   const next = candidateNextAction(c.status);
                   const role = c.role_id ? roleById.get(c.role_id) : undefined;
+                  const displayName = candidateDisplayName(c.name);
                   return (
                     <Tr key={c.id}>
-                      <Td>
+                      <Td className="py-2">
                         <Link
                           to={`/candidates/${c.id}`}
                           className="font-medium text-[var(--c-accent)] underline-offset-2 hover:underline focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
                         >
-                          {candidateDisplayName(c.name)}
+                          {displayName}
                         </Link>
                         {c.email && (
-                          <p className="text-[13px] text-[var(--c-ink-secondary)]">{c.email}</p>
+                          <p
+                            className="w-[10rem] truncate text-label text-[var(--c-ink-secondary)]"
+                            title={c.email}
+                          >
+                            {c.email}
+                          </p>
                         )}
                       </Td>
                       {/* The role's AGENT, left of the role itself. Looked up
                           from the same roles list — no extra request — and
                           "—" whenever there is no agent name to show. */}
-                      <Td>
+                      <Td className="min-w-[8rem]">
                         <AgentCell role={role} />
                       </Td>
                       {/* ONE role per row, because that is what the row IS.
@@ -736,7 +846,7 @@ export function CandidatesPage() {
                           A role the roles list does not carry (filtered by
                           scope, or deleted) falls back to a neutral marker
                           rather than a blank cell or a raw uuid. */}
-                      <Td>
+                      <Td className="min-w-[8.5rem]">
                         <RoleCell
                           roleId={c.role_id}
                           title={role?.title}
@@ -744,36 +854,29 @@ export function CandidatesPage() {
                         />
                       </Td>
                       <Td>
-                        <div className="flex max-w-xs flex-wrap gap-1">
-                          {c.skills.slice(0, 4).map((s) => (
-                            <Tag key={s}>{s}</Tag>
-                          ))}
-                          {c.skills.length > 4 && (
-                            <span className="text-xs text-[var(--c-ink-secondary)]">
-                              +{c.skills.length - 4}
-                            </span>
-                          )}
-                          {c.skills.length === 0 && (
-                            <span className="text-[var(--c-ink-secondary)]">—</span>
-                          )}
-                        </div>
+                        <SkillsCell skills={c.skills} />
                       </Td>
-                      <Td className="tabular-nums text-[var(--c-ink-secondary)]">
+                      <Td className="whitespace-nowrap text-right tabular-nums text-[var(--c-ink-secondary)]">
                         {c.experience_years != null
                           ? `${c.experience_years} yr`
                           : "—"}
                       </Td>
-                      <Td>
-                        <div className="flex flex-wrap items-center gap-1.5">
+                      <Td className="whitespace-nowrap">
+                        {/* Stacked, not wrapped: a status and a resume badge
+                            side by side would force the column wide, and a
+                            flex-wrap broke them at arbitrary points. */}
+                        <div className="flex flex-col items-start gap-1">
                           <StatusBadge tone={candidateStatusTone(c.status)}>
-                            {candidateStatusLabel(c.status)}
+                            <span title={`Status: ${c.status}`}>
+                              {candidateStatusLabel(c.status)}
+                            </span>
                           </StatusBadge>
                           {/* Additive only: the candidate's own status is
                               unchanged and still first. */}
                           <ResumeReviewBadge value={c.resume_review} />
                         </div>
                       </Td>
-                      <Td>
+                      <Td className="whitespace-nowrap">
                         {c.latest_recommendation ? (
                           <span className="inline-flex items-center gap-1.5">
                             <StatusBadge
@@ -791,16 +894,13 @@ export function CandidatesPage() {
                           <span className="text-[var(--c-ink-secondary)]">—</span>
                         )}
                       </Td>
-                      <Td>
-                        <span
-                          className={
-                            next.emphasis
-                              ? "text-sm font-medium text-[var(--c-accent)]"
-                              : "text-sm text-[var(--c-ink-secondary)]"
-                          }
-                        >
-                          {next.label}
-                        </span>
+                      <Td className="whitespace-nowrap">
+                        <NextActionCell
+                          candidateId={c.id}
+                          candidateName={displayName}
+                          status={c.status}
+                          next={next}
+                        />
                       </Td>
                     </Tr>
                   );
@@ -901,7 +1001,7 @@ function UploadPanel({
       >
         Upload a resume
       </h2>
-      <p className="mt-0.5 text-[13px] leading-5 text-[var(--c-ink-secondary)]">
+      <p className="mt-0.5 text-label text-[var(--c-ink-secondary)]">
         PDF or DOCX. Parsing runs an LLM and can take 10–20 seconds.
       </p>
 

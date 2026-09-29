@@ -34,6 +34,15 @@ export interface TabsProps {
   /** Accessible name for the tablist (announced by screen readers). */
   ariaLabel: string;
   defaultIndex?: number;
+  /**
+   * Controlled selection, by item id. Lets the host select a tab from
+   * elsewhere on the page — the candidate header's "Review screening" opens
+   * the Review tab — and remember it in the URL. Omit for the ordinary
+   * uncontrolled tabs; an id that matches no item falls back to that state.
+   */
+  selectedId?: string;
+  /** Called with the item id whenever the user selects a tab. */
+  onSelect?: (id: string) => void;
   className?: string;
 }
 
@@ -41,19 +50,29 @@ export function Tabs({
   items,
   ariaLabel,
   defaultIndex = 0,
+  selectedId,
+  onSelect,
   className,
 }: TabsProps) {
   const rawId = useId();
   const baseId = rawId.replace(/:/g, '-');
   const count = items.length;
-  const [activeIndex, setActiveIndex] = useState(
+  const [uncontrolledIndex, setUncontrolledIndex] = useState(
     Math.min(Math.max(defaultIndex, 0), count - 1),
   );
+  const controlledIndex =
+    selectedId === undefined ? -1 : items.findIndex((item) => item.id === selectedId);
+  const activeIndex = controlledIndex >= 0 ? controlledIndex : uncontrolledIndex;
 
   if (count === 0) return null;
 
   const tabId = (index: number) => `${baseId}-tab-${items[index].id}`;
   const panelId = (index: number) => `${baseId}-panel-${items[index].id}`;
+
+  function setActiveIndex(index: number) {
+    setUncontrolledIndex(index);
+    onSelect?.(items[index].id);
+  }
 
   function selectAndFocus(index: number) {
     const next = (index + count) % count;
@@ -105,7 +124,7 @@ export function Tabs({
               onClick={() => setActiveIndex(index)}
               onKeyDown={(event) => onKeyDown(event, index)}
               className={cx(
-                'h-9 shrink-0 rounded-[10px] px-4 text-[13px] font-medium',
+                'h-9 shrink-0 rounded-[10px] px-4 text-label font-medium',
                 'transition-[background-color,color,box-shadow] duration-200 ease-out',
                 'focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--c-bg)]',
                 selected

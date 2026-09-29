@@ -3,6 +3,7 @@ import { Link, useParams } from "react-router-dom";
 import { api, ApiError } from "../api";
 import type { Assessment, TranscriptLine } from "../types";
 import { Scorecard } from "../components/Scorecard";
+import { BackIcon } from "../components/session/BackIcon";
 import {
   Button,
   buttonClass,
@@ -20,6 +21,7 @@ export function ScreeningPage() {
   const { sessionId } = useParams<{ sessionId: string }>();
   const [transcript, setTranscript] = useState<TranscriptLine[] | null>(null);
   const [assessment, setAssessment] = useState<Assessment | null>(null);
+  const [candidateId, setCandidateId] = useState<string | null>(null);
   const [done, setDone] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
 
@@ -38,6 +40,7 @@ export function ScreeningPage() {
       .then((data) => {
         setTranscript(data.transcript);
         setAssessment(data.assessment);
+        setCandidateId(data.session?.candidate_id || null);
         setDone(Boolean(data.assessment) || data.session.status === "completed");
       })
       .catch((e: ApiError) => setLoadError(e.message));
@@ -102,13 +105,20 @@ export function ScreeningPage() {
         eyebrow="Screening console"
         title="Screening with Gopu"
         description={
-          done
-            ? "Screening complete"
-            : "Type the candidate's spoken answers and send"
+          !done
+            ? "Type the candidate's spoken answers and send"
+            : assessment
+              ? "Complete. The assessment is below."
+              : "Complete. The assessment is not ready yet."
         }
         actions={
-          <Link to="/candidates" className={buttonClass("secondary", "sm")}>
-            ← Back to candidates
+          // Back to THIS candidate when the session names one; the list otherwise.
+          <Link
+            to={candidateId ? `/candidates/${candidateId}` : "/candidates"}
+            className={buttonClass("ghost", "md", "-ml-3 sm:-mr-3 sm:ml-0")}
+          >
+            <BackIcon />
+            {candidateId ? "Back to candidate" : "Back to candidates"}
           </Link>
         }
       />
@@ -169,8 +179,8 @@ export function ScreeningPage() {
       {done && assessment && (
         <GlassPanel>
           <SectionHeader title="Assessment" />
-          <div className="mt-4">
-            <Scorecard assessment={assessment} />
+          <div className="mt-5">
+            <Scorecard assessment={assessment} layout="split" />
           </div>
         </GlassPanel>
       )}
@@ -183,7 +193,7 @@ function Bubble({ speaker, text }: TranscriptLine) {
   return (
     <div className={`flex ${isBot ? "justify-start" : "justify-end"}`}>
       <div className={`max-w-[70%] ${isBot ? "" : "text-right"}`}>
-        <p className="mb-1 px-1 text-[11px] font-medium text-ink-tertiary">
+        <p className="mb-1 px-1 text-meta font-medium text-ink-tertiary">
           {isBot ? "Gopu" : "Candidate"}
         </p>
         <div
@@ -204,24 +214,29 @@ function TypingIndicator() {
   return (
     <div className="flex justify-start">
       <div className="max-w-[70%]">
-        <p className="mb-1 px-1 text-[11px] font-medium text-ink-tertiary">
+        <p className="mb-1 px-1 text-meta font-medium text-ink-tertiary">
           Gopu
         </p>
+        {/* A soft opacity wave across the three dots (opacity only, eased
+            in and out, staggered) instead of the old bounce: it says
+            "working" without jumping. `motion-safe:` leaves the dots
+            static under reduced motion; the sr-only text is the real
+            status either way. */}
         <div
           role="status"
           className="glass-sunken flex items-center gap-1.5 px-4 py-3.5"
         >
           <span
             aria-hidden="true"
-            className="h-1.5 w-1.5 animate-bounce rounded-full bg-ink-muted"
+            className="h-1.5 w-1.5 rounded-full bg-ink-muted motion-safe:animate-[pulse_1.2s_ease-in-out_infinite]"
           />
           <span
             aria-hidden="true"
-            className="h-1.5 w-1.5 animate-bounce rounded-full bg-ink-muted [animation-delay:150ms]"
+            className="h-1.5 w-1.5 rounded-full bg-ink-muted motion-safe:animate-[pulse_1.2s_ease-in-out_infinite] [animation-delay:200ms]"
           />
           <span
             aria-hidden="true"
-            className="h-1.5 w-1.5 animate-bounce rounded-full bg-ink-muted [animation-delay:300ms]"
+            className="h-1.5 w-1.5 rounded-full bg-ink-muted motion-safe:animate-[pulse_1.2s_ease-in-out_infinite] [animation-delay:400ms]"
           />
           <span className="sr-only">Gopu is thinking…</span>
         </div>

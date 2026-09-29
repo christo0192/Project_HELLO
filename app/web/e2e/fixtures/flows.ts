@@ -138,6 +138,59 @@ export const KEY_STATES: KeyState[] = [
     },
   },
   {
+    // A mapping row's "More" menu, OPEN: portalled out of its panel into
+    // <main>, so axe sees a menu, its items, a disabled item's reason and
+    // the separator where they really render.
+    name: 'ashby-mission-control-row-menu',
+    fullPage: false,
+    async run(app) {
+      await app.goto('/ashby-mission-control');
+      // The Job mappings list comes before the workflows: the first "More"
+      // is a mapping row's. Matched by the name's visible start (WCAG 2.5.3).
+      const trigger = app.page.getByRole('button', { name: /^More actions for / }).first();
+      await trigger.click();
+      await expect(trigger).toHaveAttribute('aria-expanded', 'true');
+      const menu = app.page.getByRole('menu');
+      await expect(menu).toBeVisible();
+      await expect(menu.getByRole('menuitem').first()).toBeFocused();
+      return menu;
+    },
+  },
+  {
+    // The week grid's inline detail row (a selected appointment opens under
+    // its band; on a phone, after the grid). Roles and names only: the
+    // calendar's markup is being restyled.
+    name: 'phone-calendar-appointment-detail',
+    fullPage: true,
+    async run(app) {
+      await app.goto('/phone-calendar');
+      // A live appointment, so the detail offers its reschedule and cancel
+      // controls too. Its name is the calendar's spoken sentence.
+      await app.page
+        .getByRole('button', { name: /, appointment (scheduled|confirmed), engagement / })
+        .first()
+        .click();
+      const detail = app.page.getByRole('region', { name: 'Selected appointment' });
+      await expect(detail).toBeVisible();
+      await app.settle();
+      return detail;
+    },
+  },
+  {
+    name: 'phone-calendar-booking-panel',
+    fullPage: true,
+    async run(app) {
+      await app.goto('/phone-calendar');
+      const book = app.page.getByRole('button', { name: 'Book a screening', exact: true });
+      await book.click();
+      await expect(book).toHaveAttribute('aria-expanded', 'true');
+      const panel = app.page.getByRole('region', { name: 'Book a phone screening' });
+      await expect(panel).toBeVisible();
+      await app.settle();
+      return panel;
+    },
+  },
+  {
     name: 'roles-scorebar-add-metric',
     fullPage: false,
     async run(app) {

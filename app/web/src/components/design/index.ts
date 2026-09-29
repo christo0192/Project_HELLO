@@ -5,8 +5,6 @@ export type {
   SkeletonTextProps,
   ChartSkeletonProps,
 } from './Skeleton';
-export { KpiCard } from './KpiCard';
-export type { KpiCardProps, KpiTone } from './KpiCard';
 export { Table, THead, TBody, TFoot, Tr, Th, Td } from './Table';
 export type { TableProps } from './Table';
 export { PageHeader } from './PageHeader';
@@ -25,6 +23,10 @@ export { Dialog } from './Dialog';
 export type { DialogProps } from './Dialog';
 export { Combobox } from './Combobox';
 export type { ComboboxProps, ComboboxOption } from './Combobox';
+export { MetricStrip } from './MetricStrip';
+export type { MetricStripProps, MetricItem, MetricTone, MetricStripSize } from './MetricStrip';
+export { OverflowMenu } from './OverflowMenu';
+export type { OverflowMenuProps, OverflowMenuItem } from './OverflowMenu';
 export { SectionHeader } from './SectionHeader';
 export type { SectionHeaderProps } from './SectionHeader';
 export { Button, ButtonSpinner, buttonClass } from './Button';

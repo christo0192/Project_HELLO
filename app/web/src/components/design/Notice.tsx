@@ -5,6 +5,10 @@
  * always uses the ink; hue lives in the dot and tint).
  * `EmptyPanel` / `ErrorPanel` — quiet, centred states that sit inside a
  * glass panel without adding another card.
+ *
+ * Type: messages are body (14/20); an empty state's title is body-medium and
+ * its hint the label step (13/20, tertiary). Centred copy wraps with
+ * `text-pretty` so a two-line hint never strands one word on its last line.
  */
 import { motion } from 'motion/react';
 import type { ReactNode } from 'react';
@@ -60,8 +64,16 @@ export function InlineNotice({ tone = 'info', children, role = 'status', action,
         className,
       )}
     >
-      <span aria-hidden="true" className={cx('h-2 w-2 shrink-0 rounded-full', toneDot[tone])} />
-      <span className="min-w-0 flex-1">{children}</span>
+      {/* The dot belongs to the FIRST LINE, not the paragraph: `items-start`
+          with the dot nudged to that line's centre ((20px line − 8px dot) / 2),
+          the same rule as `MetricStrip`'s toned labels. Centred on the whole
+          block, a four-line notice floated its dot beside the second line.
+          The dot and message are one group so the row can still centre an
+          action against them, and a one-line notice looks exactly as before. */}
+      <span className="flex min-w-0 flex-1 items-start gap-3">
+        <span aria-hidden="true" className={cx('mt-1.5 h-2 w-2 shrink-0 rounded-full', toneDot[tone])} />
+        <span className="min-w-0 flex-1">{children}</span>
+      </span>
       {action}
     </motion.div>
   );
@@ -92,7 +104,7 @@ export function EmptyPanel({ title, hint, action, icon, compact = false, classNa
         </span>
       )}
       <p className="text-sm font-medium text-ink">{title}</p>
-      {hint && <p className="mt-1 max-w-sm text-[13px] leading-5 text-ink-tertiary">{hint}</p>}
+      {hint && <p className="mt-1 max-w-sm text-pretty text-label text-ink-tertiary">{hint}</p>}
       {action && <div className="mt-4">{action}</div>}
     </div>
   );
@@ -117,7 +129,7 @@ export function ErrorPanel({ message, onRetry, retryLabel = 'Try again', compact
       )}
     >
       <span aria-hidden="true" className="mb-3 h-2 w-2 rounded-full bg-error" />
-      <p className="max-w-md text-sm text-ink">{message}</p>
+      <p className="max-w-md text-pretty text-sm text-ink">{message}</p>
       {onRetry && (
         <Button variant="secondary" size="sm" onClick={onRetry} className="mt-4">
           {retryLabel}

@@ -302,10 +302,10 @@ export function LiveCallPanel({
         </div>
       ) : !session ? (
         <div className="flex flex-col items-center justify-center gap-1 px-4 py-12 text-center">
-          <p className="text-sm font-medium text-gray-700">No active call</p>
-          <p className="text-xs text-gray-500">
-            Click Start Screening to begin.
-          </p>
+          <p className="text-sm font-medium text-ink">No call in progress</p>
+          {/* There is no "Start screening" button on this page; the panel
+              fills itself when a screening starts. */}
+          <p className="text-xs text-ink-tertiary">The transcript appears here when a screening starts.</p>
         </div>
       ) : (
         <div
@@ -328,7 +328,7 @@ export function LiveCallPanel({
                   key={turn.id}
                   className={`flex flex-col ${isBot ? "items-start" : "items-end"}`}
                 >
-                  <span className="mb-0.5 px-1 text-[11px] font-medium text-gray-400">
+                  <span className="mb-0.5 px-1 text-meta font-medium text-gray-400">
                     {presented.plannedEvidence
                       ? presented.label
                       : isBot ? "Christy" : candidateName || "Candidate"}
@@ -348,23 +348,38 @@ export function LiveCallPanel({
           )}
           {interim !== "" && isLive && (
             <div className="flex flex-col items-end">
-              <span className="mb-0.5 px-1 text-[11px] font-medium text-gray-400">
+              <span className="mb-0.5 px-1 text-meta font-medium text-gray-400">
                 {candidateName || "Candidate"}
               </span>
-              <div className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-tr-sm bg-accent-600 px-3.5 py-2 text-sm italic leading-relaxed text-white opacity-70">
+              {/* Words still being transcribed. They used to be the final
+                  bubble's white-on-accent at 70% opacity, which fades the
+                  white label into its own fill (~2.95:1, under the 4.5:1
+                  body text needs). "Not final yet" is now said by SHAPE and
+                  STYLE instead of by fading: the accent's soft tint at full
+                  opacity with full ink text (well over 10:1), a dashed accent
+                  edge where the final bubble is solid, italics, and the
+                  listening dots. */}
+              <div
+                data-interim=""
+                className="max-w-[85%] whitespace-pre-wrap rounded-2xl rounded-tr-sm border border-dashed border-info/60 bg-info-soft px-3.5 py-2 text-sm italic leading-relaxed text-ink"
+              >
                 {interim}
-                <span className="ml-1.5 inline-flex items-end gap-0.5 align-middle">
+                {/* "Still listening" dots: a soft staggered opacity wave,
+                    not a bounce. Opacity only, eased in and out; static
+                    under reduced motion (`motion-safe:`). Decorative: the
+                    interim words themselves are the content. They take the
+                    text colour, so they follow the ink. */}
+                <span aria-hidden="true" className="ml-1.5 inline-flex items-center gap-0.5 align-middle">
                   <span
-                    className="inline-block h-1 w-1 animate-bounce rounded-full bg-white opacity-80"
-                    style={{ animationDelay: "0ms" }}
+                    className="inline-block h-1 w-1 rounded-full bg-current opacity-70 motion-safe:animate-[pulse_1.2s_ease-in-out_infinite]"
                   />
                   <span
-                    className="inline-block h-1 w-1 animate-bounce rounded-full bg-white opacity-80"
-                    style={{ animationDelay: "150ms" }}
+                    className="inline-block h-1 w-1 rounded-full bg-current opacity-70 motion-safe:animate-[pulse_1.2s_ease-in-out_infinite]"
+                    style={{ animationDelay: "200ms" }}
                   />
                   <span
-                    className="inline-block h-1 w-1 animate-bounce rounded-full bg-white opacity-80"
-                    style={{ animationDelay: "300ms" }}
+                    className="inline-block h-1 w-1 rounded-full bg-current opacity-70 motion-safe:animate-[pulse_1.2s_ease-in-out_infinite]"
+                    style={{ animationDelay: "400ms" }}
                   />
                 </span>
               </div>

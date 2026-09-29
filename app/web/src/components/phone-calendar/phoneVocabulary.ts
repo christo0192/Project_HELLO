@@ -191,6 +191,27 @@ export function candidateReferenceText(
 }
 
 /**
+ * The same candidate, split for VISIBLE display: who (the name, the thing a
+ * recruiter recognises at a glance) and, separately, the ATS reference that
+ * backs it up. `candidateReferenceText` stays the one sentence that is SPOKEN
+ * (accessible names, headings read aloud); this pair only decides which half
+ * leads on screen, so a narrow calendar cell shows "Meera Iyer" rather than an
+ * ellipsis cut through "ASHBY-10428 — Me…".
+ *
+ * The same refusals apply: with no name the reference leads, with neither the
+ * text says so, and the internal candidate id is never substituted.
+ */
+export function candidateDisplay(
+  candidate: PhoneCalendarAppointment['candidate'],
+): { primary: string; reference: string | null } {
+  if (!candidate) return { primary: 'Candidate unavailable', reference: null };
+  const { reference, name } = candidate;
+  if (name) return { primary: name, reference: reference || null };
+  if (reference) return { primary: reference, reference: null };
+  return { primary: 'Candidate reference unavailable', reference: null };
+}
+
+/**
  * The accessible name of an appointment control.
  *
  * It carries, in this order: who the call is with, when it is in IST, what

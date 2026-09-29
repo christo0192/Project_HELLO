@@ -67,8 +67,11 @@
 .candidate-brand { display: flex; align-items: center; gap: 12px; color: var(--c-ink); }
 .candidate-brand img { width: 42px; height: 42px; object-fit: contain; border-radius: 13px; background: #fff; padding: 5px; box-shadow: 0 5px 16px rgb(52 65 88 / 0.12); }
 .candidate-brand b { font-size: 15px; letter-spacing: -0.02em; }
-.candidate-brand span { display: block; color: var(--c-ink-muted); font-size: 11px; margin-top: 2px; }
-.candidate-eyebrow { color: var(--c-accent); font-size: 11px; font-weight: 750; letter-spacing: .12em; text-transform: uppercase; }
+.candidate-brand span { display: block; color: var(--c-ink-muted); font-size: 12px; line-height: 16px; margin-top: 2px; }
+/* The step / state label above each heading ("Step 2 of 4 · Consent",
+   "Live interview"). Sentence case at the label step of the type scale: no
+   uppercase, no open tracking. The accent carries it, not the letter-spacing. */
+.candidate-eyebrow { color: var(--c-accent); font-size: 13px; line-height: 20px; font-weight: 600; }
 .candidate-muted { color: var(--c-ink-secondary); line-height: 1.6; }
 .candidate-field-label { display: block; margin: 25px 0 8px; color: var(--c-ink-secondary); font-size: 13px; font-weight: 700; }
 .candidate-select { width: 100%; min-height: 52px; padding: 0 16px; border: 1px solid var(--c-control-border); border-radius: 15px; background: rgb(255 255 255 / .76); color: var(--c-ink); font: inherit; }
@@ -76,13 +79,17 @@
 .candidate-meter-card { margin-top: 16px; padding: 22px; border-radius: 22px; background: rgb(244 246 251 / .78); text-align: center; }
 .candidate-instruction { margin: 0; font-size: 15px; font-weight: 650; }
 .candidate-level-meter { display: flex; align-items: end; justify-content: center; gap: 5px; height: 54px; margin: 20px auto 12px; }
-.candidate-level-meter i { width: 9px; height: 28px; border-radius: 5px; background: var(--c-border); transition: height 80ms ease, background-color 80ms ease; }
-.candidate-level-meter i:nth-child(3n) { height: 38px; }
-.candidate-level-meter i[data-on="true"] { height: 48px; background: var(--c-positive); }
+/* Every bar is laid out at full height once; the level is drawn with
+   `scaleY` from the baseline (28px and 38px resting, 48px lit). The meter
+   re-renders on every audio frame, and a `height` transition re-ran layout for
+   all 18 bars each time; a transform stays on the compositor. */
+.candidate-level-meter i { width: 9px; height: 48px; border-radius: 5px; background: var(--c-border); transform: scaleY(.5834); transform-origin: 50% 100%; transition: transform 80ms ease-out, background-color 80ms ease-out; }
+.candidate-level-meter i:nth-child(3n) { transform: scaleY(.7917); }
+.candidate-level-meter i[data-on="true"] { transform: none; background: var(--c-positive); }
 .candidate-meter-status { margin: 0; color: var(--c-ink-muted); font-size: 12px; }
 .candidate-check-list { display: grid; gap: 8px; margin: 20px 0; }
 .candidate-check-list > div { display: grid; grid-template-columns: 32px 1fr auto; align-items: center; gap: 10px; padding: 12px 14px; border: 1px solid var(--c-border); border-radius: 15px; background: rgb(255 255 255 / .56); font-size: 13px; }
-.candidate-check-list span { color: var(--c-ink-muted); font-size: 11px; }
+.candidate-check-list span { color: var(--c-ink-muted); font-size: 12px; font-variant-numeric: tabular-nums; }
 .candidate-check-list em { color: var(--c-ink-muted); font-size: 12px; font-style: normal; }
 .candidate-check-list [data-state="active"] { border-color: var(--c-accent); box-shadow: 0 0 0 3px rgb(78 107 166 / .12); }
 .candidate-check-list [data-state="passed"] em { color: var(--c-positive); font-weight: 700; }
@@ -95,7 +102,7 @@
 .candidate-back:focus-visible { outline: 3px solid rgb(78 107 166 / .38); outline-offset: 3px; }
 .candidate-fallback-cta { max-width: 700px; margin: 100px auto 0; display: flex; }
 .candidate-back { border: 0; background: transparent; color: var(--c-accent); font: inherit; font-size: 13px; font-weight: 700; cursor: pointer; }
-.candidate-privacy-note { margin: 16px 0 0; color: var(--c-ink-muted); font-size: 11px; text-align: center; }
+.candidate-privacy-note { margin: 16px 0 0; color: var(--c-ink-muted); font-size: 12px; line-height: 16px; text-align: center; }
 .candidate-error { margin: 14px 0; font-size: 13px; line-height: 1.5; }
 .candidate-consent { padding: 34px; }
 .candidate-consent h1, .candidate-readiness h1 { margin: 8px 0; font-size: clamp(28px, 5vw, 42px); letter-spacing: -.045em; line-height: 1.06; }
@@ -120,7 +127,9 @@
 .candidate-interview__captions h2 { margin: 0; font-size: 17px; letter-spacing: -.02em; }
 .candidate-caption-list { flex: 1; overflow: auto; margin-top: 18px; padding-right: 4px; }
 .candidate-caption { margin: 0 0 18px; color: var(--c-ink-secondary); font-size: 16px; line-height: 1.55; }
-.candidate-caption small { display: block; margin-bottom: 4px; color: var(--c-accent); font-size: 10px; font-weight: 800; letter-spacing: .1em; text-transform: uppercase; }
+/* Who is speaking ("Interviewer" / "Speaking"): a sentence-case label at the
+   meta step, not a 10px uppercase tracked tag. */
+.candidate-caption small { display: block; margin-bottom: 2px; color: var(--c-accent); font-size: 12px; line-height: 16px; font-weight: 600; }
 .candidate-aura { --speech-level: 0; position: relative; display: grid; width: min(70vw, 440px); aspect-ratio: 1; place-items: center; }
 .candidate-aura__halo { position: absolute; border-radius: 50%; pointer-events: none; transform: scale(calc(1 + var(--speech-level) * .05)); transition: transform 260ms ease-out, opacity 320ms ease-out; }
 .candidate-aura__halo--outer { width: 100%; height: 100%; border: 1px solid rgb(78 107 166 / calc(.07 + var(--speech-level) * .1)); box-shadow: 0 0 65px rgb(78 107 166 / calc(.04 + var(--speech-level) * .1)); opacity: calc(.2 + var(--speech-level) * .32); }

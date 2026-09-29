@@ -19,9 +19,8 @@ import type {
   SelectHTMLAttributes,
 } from 'react';
 import { cx } from './cx';
-
-const FOCUS_RING =
-  'focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)] focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--c-bg)]';
+import { buttonClass, ButtonSpinner } from './Button';
+import type { ButtonSize } from './Button';
 
 /* ── Spinner ─────────────────────────────────────────────────────── */
 
@@ -53,20 +52,31 @@ export function CandidateSpinner({ className }: { className?: string }) {
 
 /* ── Button ──────────────────────────────────────────────────────── */
 
-export type CandidateButtonVariant = 'primary' | 'secondary' | 'ghost';
-
-const buttonStyles: Record<CandidateButtonVariant, string> = {
-  primary:
-    'bg-[var(--c-accent)] text-[var(--c-data-label-inside)] hover:brightness-95',
-  secondary:
-    'border border-[var(--c-control-border)] bg-[var(--c-surface)] text-[var(--c-ink-secondary)] hover:bg-[var(--c-border-light)]',
-  ghost:
-    'text-[var(--c-ink-secondary)] hover:bg-[var(--c-border-light)] hover:text-[var(--c-ink)]',
-};
+/**
+ * The SAME four variants as the shell's `Button`, and the same classes.
+ *
+ * This used to be its own button: `rounded-lg` where the shell uses the 12px
+ * control radius, a `brightness()` hover that dims the white label along with
+ * the fill, a bordered white "secondary" that read as a form field. Beside
+ * the shell's buttons (and the frozen LiveKit card) the candidate page ended
+ * up showing four button styles at once. One vocabulary now: `buttonClass` is
+ * the source of truth, and this wrapper only adds what the candidate surfaces
+ * need on top — a `loading` state and a 44px default.
+ *
+ * `danger-quiet` is the destructive action that is not the point of its
+ * surface ("Cancel appointment" beside "Move appointment"); the filled
+ * `danger` belongs to a confirmation step, which no candidate surface has.
+ */
+export type CandidateButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger-quiet';
 
 export interface CandidateButtonProps
   extends ButtonHTMLAttributes<HTMLButtonElement> {
   variant?: CandidateButtonVariant;
+  /**
+   * `lg` (44px, the default) for write controls and anything that sits in a
+   * row with a 44px field; `md` (36px) for toolbar and header actions.
+   */
+  size?: ButtonSize;
   loading?: boolean;
   /** React 19 ref-as-prop, so hosts can return focus to the trigger. */
   ref?: Ref<HTMLButtonElement>;
@@ -74,28 +84,27 @@ export interface CandidateButtonProps
 
 export function CandidateButton({
   variant = 'primary',
+  size = 'lg',
   loading,
   className,
   children,
   disabled,
   ref,
+  type = 'button',
   ...rest
 }: CandidateButtonProps) {
   return (
     <button
       ref={ref}
-      className={cx(
-        // 44px minimum target height (WCAG 2.5.8 / 2.5.5 AAA-friendly).
-        'inline-flex min-h-11 items-center justify-center gap-2 rounded-lg px-4 py-2 text-sm font-medium transition-colors',
-        FOCUS_RING,
-        'disabled:cursor-not-allowed disabled:opacity-60',
-        buttonStyles[variant],
-        className,
-      )}
+      type={type}
+      className={buttonClass(variant, size, className)}
       disabled={disabled || loading}
+      aria-busy={loading || undefined}
       {...rest}
     >
-      {loading && <CandidateSpinner className="h-4 w-4" />}
+      {/* Decorative: `aria-busy` carries the state, and a `role="status"`
+          spinner inside a button would add a second, nameless live region. */}
+      {loading && <ButtonSpinner />}
       {children}
     </button>
   );
@@ -108,9 +117,12 @@ export function CandidateButton({
  * caller passes — Tailwind orders utilities by its own scale, not by the
  * class string — so the override would be silently inert. Callers state the
  * width they want.
+ *
+ * The 12px control radius, the same as the buttons beside these fields: a
+ * field and its button in one row used to disagree (8px vs 12px corners).
  */
 const fieldBase = cx(
-  'min-h-11 rounded-lg border border-[var(--c-control-border)] bg-[var(--c-surface)] px-3 py-2 text-sm',
+  'min-h-11 rounded-control border border-[var(--c-control-border)] bg-[var(--c-surface)] px-3 py-2 text-sm',
   'text-[var(--c-ink)] placeholder:text-[var(--c-ink-secondary)]',
   'focus:border-[var(--c-accent)] focus:outline-none focus:ring-1 focus:ring-[var(--c-accent)]',
   'disabled:bg-[var(--c-border-light)]',

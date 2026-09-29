@@ -253,7 +253,7 @@ describe('Ashby pipeline card in the scoped review Overview', () => {
     // Wait for the resolved card, not the identically-headed loading state.
     expect(await screen.findByText('Writing results back to Ashby')).toBeInTheDocument();
     expect(mockApi.getAshbyScopedReviewWorkflow).toHaveBeenCalledWith(LINK_ID);
-    expect(screen.getByText('provider_5xx')).toBeInTheDocument();
+    expect(screen.getByText('Ashby server error')).toHaveAttribute('title', 'provider_5xx');
 
     // No new access and no new navigation: the card adds no control or link.
     const region = screen.getByRole('region', { name: 'Ashby screening pipeline' });

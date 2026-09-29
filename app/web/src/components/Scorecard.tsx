@@ -1,101 +1,190 @@
-import type { Assessment, Recommendation } from "../types";
-import { GlassPanel, StatusBadge } from "./design";
-import type { StatusTone } from "./design";
+/**
+ * Scorecard — a screening's assessment on the session and screening pages.
+ *
+ * Two generations of assessment reach these pages, and this component picks:
+ *
+ *   - schema v2 (role scorecards) → `RoleScorecardView`. A v2 row carries NO
+ *     legacy dimension fields on the wire; reading `tone.notes` off one used
+ *     to throw and take the whole route into the error boundary.
+ *   - legacy v1 (fixed dimensions: communication, motivation, tone, role
+ *     fit) → rendered here.
+ *
+ * Every read below is defensive: a block that is missing or malformed is
+ * left out (or says why), never thrown on, and a missing number is never
+ * drawn as zero. Machine values (`positive`, `moderate`) are humanized.
+ *
+ * LAYOUT. No surface of its own: the host page's panel is the surface
+ * (design rule 1, no glass in glass). The verdict comes first; the four
+ * dimensions follow as one list separated by hairlines, each with its fixed
+ * weight as a data label, not baked into the heading text. Communication's
+ * sub-parts (English, speech signals) sit in one sunken grid under it, so
+ * they read as part of that dimension rather than as dimensions of their
+ * own. Bars fill in the accent for every reading: several of them (filler
+ * "impact") are better when LOW, so a red/amber/green fill keyed to the
+ * value painted a good result as an alarm. The number is the reading.
+ *
+ * `layout="split"` is for a full-width host (the screening console): from
+ * `lg` up each dimension puts its heading in a left column and its readings
+ * in a right one, instead of stretching one column across ~1100px.
+ */
 
-/** Legacy chip tones → design badge tones. */
-const BADGE_TONE: Record<string, StatusTone> = {
-  green: "success",
-  amber: "warning",
-  red: "danger",
-  accent: "info",
-  neutral: "neutral",
-};
+import type { ReactNode } from 'react';
+import { isAssessmentV2 } from '../types';
+import type { Assessment } from '../types';
+import { humanizeEnum } from '../lib/humanize';
+import { cx, StatusBadge } from './design';
+import type { StatusTone } from './design';
+import { RoleScorecardView } from './session/RoleScorecardView';
+import { ScoreVerdict } from './session/ScoreVerdict';
+import { finiteNumber, isRecord } from './session/scorecard-read';
+import type { ScorecardLayout } from './session/scorecard-read';
 
-const recoConfig: Record<
-  Recommendation,
-  { label: string; className: string }
-> = {
-  advance: {
-    label: "Advance",
-    className: "bg-success-soft text-success-text",
-  },
-  hold: {
-    label: "Hold",
-    className: "bg-warning-soft text-warning-text",
-  },
-  reject: {
-    label: "Reject",
-    className: "bg-error-soft text-error-text",
-  },
-};
+type Loose = Record<string, unknown>;
 
-function scoreColor(score: number): string {
-  if (score >= 75) return "text-success-text";
-  if (score >= 50) return "text-warning-text";
-  return "text-error-text";
+/** The block itself, else the same block from `raw`, else null. */
+function block(primary: unknown, fallback: unknown): Loose | null {
+  if (isRecord(primary)) return primary;
+  return isRecord(fallback) ? fallback : null;
 }
 
-function barColor(value: number): string {
-  if (value >= 7) return "bg-success";
-  if (value >= 5) return "bg-warning";
-  return "bg-error";
+function text(value: unknown): string {
+  return typeof value === 'string' ? value.trim() : '';
 }
 
-function MetricBar({ label, value }: { label: string; value: number }) {
-  const safe = Math.max(0, Math.min(10, Number(value) || 0));
-  const pct = safe * 10;
+function strings(value: unknown): string[] {
+  return Array.isArray(value) ? value.map(text).filter(Boolean) : [];
+}
+
+/** Fixed weights of the legacy rubric, shown as data labels. */
+const WEIGHT = {
+  communication: '50%',
+  motivation: '20%',
+  tone: '10%',
+  role_fit: '20%',
+} as const;
+
+const SIGNAL_TONE: Record<string, StatusTone> = {
+  none: 'success',
+  low: 'success',
+  moderate: 'warning',
+  high: 'danger',
+};
+
+/** A 0–10 reading with its bar. Renders nothing when there is no number to show. */
+function ScoreBar({ label, value }: { label: string; value: unknown }) {
+  const n = finiteNumber(value);
+  if (n == null) return null;
+  const safe = Math.max(0, Math.min(10, n));
+  const shown = Math.round(safe * 10) / 10;
   return (
     <div>
-      <div className="mb-1 flex items-center justify-between text-xs">
+      <div className="flex items-baseline justify-between gap-3 text-label">
         <span className="text-ink-secondary">{label}</span>
-        <span className="font-medium text-ink">{safe}/10</span>
+        <span className="font-semibold tabular-nums text-ink">{`${shown}/10`}</span>
       </div>
-      <div className="h-1.5 w-full overflow-hidden rounded-full bg-ink/[0.06]">
-        <div
-          className={`h-full rounded-full ${barColor(safe)}`}
-          style={{ width: `${pct}%` }}
-        />
+      <div aria-hidden="true" className="mt-1.5 h-1 overflow-hidden rounded-full bg-ink/[0.07]">
+        <div className="h-full rounded-full bg-info" style={{ width: `${safe * 10}%` }} />
       </div>
     </div>
   );
 }
 
-function Section({
+/** Readings two to a row, so every bar is the same length wherever it appears. */
+function Bars({ children }: { children: ReactNode }) {
+  return <div className="grid grid-cols-1 gap-x-8 gap-y-3 sm:grid-cols-2">{children}</div>;
+}
+
+function Prose({ children }: { children: string }) {
+  if (!children) return null;
+  return <p className="max-w-prose text-sm leading-6 text-ink-secondary">{children}</p>;
+}
+
+/** One dimension: heading + weight, then its readings. */
+function Dimension({
   title,
+  weight,
+  split,
   children,
-  notes,
 }: {
   title: string;
-  children: React.ReactNode;
-  notes?: string;
+  weight?: string;
+  split: boolean;
+  children: ReactNode;
 }) {
   return (
-    <div className="glass-sunken p-4">
-      <h3 className="mb-3 text-sm font-semibold text-ink">{title}</h3>
-      <div className="space-y-3">{children}</div>
-      {notes && <p className="mt-3 text-xs leading-relaxed text-ink-tertiary">{notes}</p>}
+    <div
+      className={cx(
+        'py-5 last:pb-0',
+        split && 'lg:grid lg:grid-cols-[13rem_minmax(0,1fr)] lg:gap-x-10',
+      )}
+    >
+      <div
+        className={cx(
+          'flex items-baseline justify-between gap-3',
+          split && 'lg:flex-col lg:items-start lg:justify-start lg:gap-0.5',
+        )}
+      >
+        <h3 className="text-sm font-semibold text-ink">{title}</h3>
+        {weight && <span className="text-xs tabular-nums text-ink-tertiary">{`Weight ${weight}`}</span>}
+      </div>
+      <div className={cx('mt-3 space-y-4', split && 'lg:mt-0')}>{children}</div>
     </div>
   );
 }
 
-function ChipGroup({
-  label,
-  items,
-  tone,
-}: {
-  label: string;
-  items: string[];
-  tone: "green" | "amber" | "red";
-}) {
+/** A sub-part of a dimension (English, a speech signal): a small heading over its readings. */
+function Part({ title, aside, children }: { title: string; aside?: ReactNode; children: ReactNode }) {
+  return (
+    <>
+      <div className="mb-2.5 flex items-center justify-between gap-3">
+        <h4 className="text-label font-semibold text-ink">{title}</h4>
+        {aside}
+      </div>
+      <div className="space-y-3">{children}</div>
+    </>
+  );
+}
+
+interface PartCell {
+  key: string;
+  /** Spans both columns (English carries four readings). */
+  wide: boolean;
+  node: ReactNode;
+}
+
+/**
+ * The sub-parts as ONE sunken object divided by hairlines (`gap-px` over a
+ * faint ink ground, the Scorebar rubric's construction), never floating
+ * cards. A lone half-width cell spans the row so no empty ground shows.
+ */
+function PartGrid({ cells }: { cells: PartCell[] }) {
+  if (cells.length === 0) return null;
+  const halves = cells.filter((c) => !c.wide);
+  const stretch = halves.length % 2 === 1 ? halves[halves.length - 1].key : null;
+  return (
+    <div className="grid grid-cols-1 gap-px overflow-hidden rounded-[14px] bg-ink/[0.07] sm:grid-cols-2">
+      {cells.map((c) => (
+        <div
+          key={c.key}
+          className={cx('bg-white/70 px-4 py-3.5', (c.wide || c.key === stretch) && 'sm:col-span-2')}
+        >
+          {c.node}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ChipGroup({ label, items, tone }: { label: string; items: string[]; tone: StatusTone }) {
   return (
     <div>
-      <p className="mb-1.5 text-xs font-medium text-ink-secondary">{label}</p>
+      <p className="mb-1.5 text-label font-medium text-ink-secondary">{label}</p>
       {items.length === 0 ? (
-        <p className="text-xs text-ink-tertiary">None</p>
+        <p className="text-label text-ink-tertiary">None</p>
       ) : (
         <div className="flex flex-wrap gap-1.5">
-          {items.map((item) => (
-            <StatusBadge dot={false} key={item} tone={BADGE_TONE[tone]}>
+          {items.map((item, i) => (
+            <StatusBadge dot={false} key={`${i}-${item}`} tone={tone}>
               {item}
             </StatusBadge>
           ))}
@@ -105,201 +194,219 @@ function ChipGroup({
   );
 }
 
-function SignalBlock({
-  label,
-  signal,
-}: {
-  label: string;
-  signal?: {
-    level: string;
-    examples: string[];
-    impact_score: number;
-    notes: string;
+function signalCell(key: string, label: string, signal: unknown): PartCell | null {
+  if (!isRecord(signal)) return null;
+  const level = text(signal.level);
+  const examples = strings(signal.examples);
+  const notes = text(signal.notes);
+  return {
+    key,
+    wide: false,
+    node: (
+      <Part
+        title={label}
+        aside={
+          level ? (
+            <StatusBadge dot={false} tone={SIGNAL_TONE[level] ?? 'neutral'}>
+              {humanizeEnum(level)}
+            </StatusBadge>
+          ) : null
+        }
+      >
+        <ScoreBar label="Impact" value={signal.impact_score} />
+        {examples.length > 0 && (
+          <p className="text-label text-ink-secondary">
+            <span className="font-medium text-ink">Examples:</span> {examples.join(', ')}
+          </p>
+        )}
+        {notes && <p className="max-w-prose text-label text-ink-tertiary">{notes}</p>}
+      </Part>
+    ),
   };
-}) {
-  if (!signal) return null;
-  const tone =
-    signal.level === "none" || signal.level === "low"
-      ? "green"
-      : signal.level === "moderate"
-        ? "amber"
-        : "red";
+}
+
+function LegacyScorecard({ assessment, layout }: { assessment: Assessment; layout: ScorecardLayout }) {
+  const split = layout === 'split';
+  const row = assessment as unknown as Loose;
+  const raw = isRecord(row.raw) ? row.raw : {};
+
+  const communication = block(row.communication, raw.communication);
+  const english = block(communication?.english_proficiency, row.english);
+  const motivation = block(row.motivation, raw.motivation);
+  const tone = block(row.tone, raw.tone);
+  const roleFit = block(row.role_fit, raw.role_fit);
+  const conflictsSource = Array.isArray(row.resume_conflicts)
+    ? row.resume_conflicts
+    : Array.isArray(raw.resume_conflicts)
+      ? raw.resume_conflicts
+      : [];
+  const conflicts = conflictsSource.filter(isRecord);
+
+  const sentiment = text(tone?.sentiment);
+  const band = text(english?.band);
+  const hasDimension = Boolean(communication || motivation || tone || roleFit);
+
+  const parts = [
+    english
+      ? {
+          key: 'english',
+          wide: true,
+          node: (
+            <Part
+              title="English band"
+              aside={
+                band ? (
+                  <StatusBadge dot={false} tone="info">
+                    {band}
+                  </StatusBadge>
+                ) : null
+              }
+            >
+              <Bars>
+                <ScoreBar label="Grammar" value={english.grammar} />
+                <ScoreBar label="Vocabulary" value={english.vocabulary} />
+                <ScoreBar label="Fluency" value={english.fluency} />
+                <ScoreBar label="Coherence" value={english.coherence} />
+              </Bars>
+              {text(english.notes) && (
+                <p className="max-w-prose text-label text-ink-tertiary">{text(english.notes)}</p>
+              )}
+            </Part>
+          ),
+        }
+      : null,
+    signalCell('filler', 'Filler usage', communication?.filler_usage),
+    signalCell('native', 'Native-language usage', communication?.native_language_usage),
+  ].filter((cell): cell is PartCell => cell !== null);
 
   return (
-    <div className="rounded-[12px] bg-white/70 p-3">
-      <div className="mb-2 flex items-center justify-between gap-3 text-xs">
-        <span className="font-medium text-ink-secondary">{label}</span>
-        <StatusBadge dot={false} tone={BADGE_TONE[tone]}>{signal.level}</StatusBadge>
+    <div>
+      <ScoreVerdict overall={row.overall_score} recommendation={row.recommendation} summary={row.summary} />
+
+      <div className="mt-6 divide-y divide-glass-ring border-t border-glass-ring">
+        {hasDimension && (
+          <Dimension title="Communication" weight={WEIGHT.communication} split={split}>
+            {communication ? (
+              <>
+                <Bars>
+                  <ScoreBar label="Score" value={communication.score} />
+                  <ScoreBar label="Clarity" value={communication.clarity} />
+                  <ScoreBar label="Structure" value={communication.structure} />
+                  <ScoreBar label="Listening" value={communication.listening} />
+                  <ScoreBar label="Rapport" value={communication.rapport} />
+                </Bars>
+                <Prose>{text(communication.notes)}</Prose>
+              </>
+            ) : (
+              <Prose>No candidate responses are available to assess communication.</Prose>
+            )}
+            <PartGrid cells={parts} />
+          </Dimension>
+        )}
+
+        {hasDimension && (
+          <Dimension title="Motivation" weight={WEIGHT.motivation} split={split}>
+            {motivation && finiteNumber(motivation.score) != null && (
+              <Bars>
+                <ScoreBar label="Score" value={motivation.score} />
+              </Bars>
+            )}
+            <Prose>
+              {text(motivation?.notes) || 'No candidate responses are available to assess motivation.'}
+            </Prose>
+          </Dimension>
+        )}
+
+        {tone && (
+          <Dimension title="Tone" weight={WEIGHT.tone} split={split}>
+            <Bars>
+              <ScoreBar label="Clarity" value={tone.clarity} />
+              <ScoreBar label="Confidence" value={tone.confidence} />
+              <ScoreBar label="Professionalism" value={tone.professionalism} />
+            </Bars>
+            {sentiment && (
+              <div className="flex items-center gap-3 text-label">
+                <span className="text-ink-secondary">Sentiment</span>
+                <StatusBadge dot={false}>{humanizeEnum(sentiment)}</StatusBadge>
+              </div>
+            )}
+            <Prose>{text(tone.notes)}</Prose>
+          </Dimension>
+        )}
+
+        {roleFit && (
+          <Dimension title="Role fit" weight={WEIGHT.role_fit} split={split}>
+            {finiteNumber(roleFit.score) != null && (
+              <Bars>
+                <ScoreBar label="Fit score" value={roleFit.score} />
+              </Bars>
+            )}
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+              <ChipGroup label="Matched skills" items={strings(roleFit.matched_skills)} tone="success" />
+              <ChipGroup label="Gaps" items={strings(roleFit.gaps)} tone="warning" />
+              <ChipGroup label="Red flags" items={strings(roleFit.red_flags)} tone="danger" />
+            </div>
+            <Prose>{text(roleFit.notes)}</Prose>
+          </Dimension>
+        )}
+
+        {!hasDimension && (
+          <p className="py-5 text-sm text-ink-secondary">This assessment carries no dimension scores.</p>
+        )}
+
+        {conflicts.length > 0 && (
+          <div
+            className={cx(
+              'py-5 last:pb-0',
+              split && 'lg:grid lg:grid-cols-[13rem_minmax(0,1fr)] lg:gap-x-10',
+            )}
+          >
+            <div className="flex items-center gap-2 self-start">
+              <h3 className="text-sm font-semibold text-ink">Resume conflicts</h3>
+              <span className="rounded-full bg-warning-soft px-2 py-0.5 text-xs font-medium tabular-nums text-warning-text">
+                {conflicts.length}
+              </span>
+            </div>
+            <ul className={cx('mt-2 divide-y divide-glass-ring', split && 'lg:mt-0')}>
+              {conflicts.map((c, i) => {
+                const resolved = c.resolved === true;
+                const note = text(c.note);
+                return (
+                  <li key={i} className="py-3 first:pt-0 last:pb-0">
+                    <div className="flex items-start justify-between gap-3">
+                      <p className="text-label font-semibold text-ink">{text(c.topic) || 'Conflict'}</p>
+                      <StatusBadge tone={resolved ? 'success' : 'warning'}>
+                        {resolved ? 'Resolved' : 'Unresolved'}
+                      </StatusBadge>
+                    </div>
+                    <dl className="mt-1.5 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-label">
+                      <dt className="text-ink-tertiary">Resume:</dt>
+                      <dd className="text-ink-secondary">{text(c.resume_says) || 'Not stated'}</dd>
+                      <dt className="text-ink-tertiary">Said on call:</dt>
+                      <dd className="text-ink-secondary">{text(c.candidate_said) || 'Not stated'}</dd>
+                    </dl>
+                    {note && <p className="mt-1.5 max-w-prose text-label text-ink-tertiary">{note}</p>}
+                  </li>
+                );
+              })}
+            </ul>
+          </div>
+        )}
       </div>
-      <MetricBar label="Impact" value={signal.impact_score} />
-      {signal.examples.length > 0 && (
-        <p className="mt-2 text-xs text-ink-tertiary">
-          <span className="font-medium">Examples:</span>{" "}
-          {signal.examples.join(", ")}
-        </p>
-      )}
-      {signal.notes && (
-        <p className="mt-1 text-xs leading-relaxed text-ink-tertiary">
-          {signal.notes}
-        </p>
-      )}
     </div>
   );
 }
 
-export function Scorecard({ assessment }: { assessment: Assessment }) {
-  const raw = assessment.raw ?? {};
-  const { tone, role_fit, overall_score, recommendation, summary } = assessment;
-  const communication = assessment.communication ?? raw.communication;
-  const english = communication?.english_proficiency ?? assessment.english;
-  const motivation = assessment.motivation ?? raw.motivation;
-  const conflicts = assessment.resume_conflicts ?? raw.resume_conflicts ?? [];
-  const reco = recoConfig[recommendation] ?? recoConfig.hold;
+export interface ScorecardProps {
+  assessment: Assessment;
+  /** `split` for a full-width host: heading column + readings column from `lg` up. */
+  layout?: ScorecardLayout;
+}
 
-  return (
-    <GlassPanel level="sunken" padding="none" className="overflow-hidden rounded-[16px]">
-      <div className="flex items-center justify-between gap-4 border-b border-glass-ring p-5">
-        <div className="flex items-baseline gap-2">
-          <span className={`text-4xl font-bold ${scoreColor(overall_score)}`}>
-            {Math.round(overall_score)}
-          </span>
-          <span className="text-sm text-ink-tertiary">/ 100</span>
-          <span className="ml-2 text-sm text-ink-tertiary">Overall score</span>
-        </div>
-        <span
-          className={`rounded-full px-3 py-1 text-sm font-semibold ${reco.className}`}
-        >
-          {reco.label}
-        </span>
-      </div>
-
-      <div className="grid grid-cols-1 gap-4 p-5 md:grid-cols-3">
-        <Section
-          title="Communication - 50%"
-          notes={
-            communication?.notes ??
-            "No candidate responses are available to assess communication."
-          }
-        >
-          <MetricBar label="Score" value={communication?.score ?? 0} />
-          {communication?.clarity != null && (
-            <MetricBar label="Clarity" value={communication.clarity} />
-          )}
-          {communication?.structure != null && (
-            <MetricBar label="Structure" value={communication.structure} />
-          )}
-          {communication?.listening != null && (
-            <MetricBar label="Listening" value={communication.listening} />
-          )}
-          {communication?.rapport != null && (
-            <MetricBar label="Rapport" value={communication.rapport} />
-          )}
-          {english && (
-            <div className="rounded-[12px] bg-white/70 p-3">
-              <div className="mb-2 flex items-center justify-between text-xs">
-                <span className="font-medium text-ink-secondary">English band</span>
-                <StatusBadge dot={false} tone="info">{english.band}</StatusBadge>
-              </div>
-              <MetricBar label="Grammar" value={english.grammar} />
-              <MetricBar label="Vocabulary" value={english.vocabulary} />
-              <MetricBar label="Fluency" value={english.fluency} />
-              <MetricBar label="Coherence" value={english.coherence} />
-              {english.notes && (
-                <p className="mt-2 text-xs leading-relaxed text-ink-tertiary">
-                  {english.notes}
-                </p>
-              )}
-            </div>
-          )}
-          <SignalBlock
-            label="Filler usage"
-            signal={communication?.filler_usage}
-          />
-          <SignalBlock
-            label="Native-language usage"
-            signal={communication?.native_language_usage}
-          />
-        </Section>
-
-        <Section
-          title="Motivation - 20%"
-          notes={
-            motivation?.notes ??
-            "No candidate responses are available to assess motivation."
-          }
-        >
-          <MetricBar label="Score" value={motivation?.score ?? 0} />
-        </Section>
-
-        <Section title="Tone - 10%" notes={tone.notes}>
-          <MetricBar label="Clarity" value={tone.clarity} />
-          <MetricBar label="Confidence" value={tone.confidence} />
-          <MetricBar label="Professionalism" value={tone.professionalism} />
-          <div className="flex items-center justify-between text-xs">
-            <span className="text-ink-secondary">Sentiment</span>
-            <StatusBadge dot={false}>{tone.sentiment}</StatusBadge>
-          </div>
-        </Section>
-
-        <Section title="Role fit - 20%" notes={role_fit.notes}>
-          <MetricBar label="Fit score" value={role_fit.score} />
-          <ChipGroup
-            label="Matched skills"
-            items={role_fit.matched_skills}
-            tone="green"
-          />
-          <ChipGroup label="Gaps" items={role_fit.gaps} tone="amber" />
-          <ChipGroup
-            label="Red flags"
-            items={role_fit.red_flags}
-            tone="red"
-          />
-        </Section>
-      </div>
-
-      {conflicts.length > 0 && (
-        <div className="border-t border-glass-ring p-5">
-          <h3 className="mb-3 flex items-center gap-2 text-sm font-semibold text-ink">
-            Resume conflicts
-            <span className="rounded-full bg-warning-soft px-2 py-0.5 text-xs font-medium text-warning-text">
-              {conflicts.length}
-            </span>
-          </h3>
-          <div className="space-y-3">
-            {conflicts.map((c, i) => (
-              <div
-                key={i}
-                className={`rounded-lg border p-3 ${
-                  c.resolved
-                    ? "border-glass-ring bg-white/60"
-                    : "border-warning bg-warning-soft"
-                }`}
-              >
-                <div className="mb-1 flex items-center justify-between">
-                  <span className="text-xs font-semibold text-ink">{c.topic}</span>
-                  <StatusBadge tone={c.resolved ? "success" : "warning"}>
-                    {c.resolved ? "resolved" : "unresolved"}
-                  </StatusBadge>
-                </div>
-                <p className="text-xs text-ink-secondary">
-                  <span className="font-medium">Resume:</span> {c.resume_says}
-                </p>
-                <p className="text-xs text-ink-secondary">
-                  <span className="font-medium">Said on call:</span> {c.candidate_said}
-                </p>
-                {c.note && <p className="mt-1 text-xs italic text-ink-tertiary">{c.note}</p>}
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {summary && (
-        <div className="border-t border-glass-ring p-5">
-          <h3 className="mb-1.5 text-sm font-semibold text-ink">Summary</h3>
-          <p className="text-sm leading-relaxed text-ink-secondary">{summary}</p>
-        </div>
-      )}
-    </GlassPanel>
-  );
+export function Scorecard({ assessment, layout = 'stacked' }: ScorecardProps) {
+  if (!isRecord(assessment)) {
+    return <p className="text-sm text-ink-secondary">This scorecard could not be read.</p>;
+  }
+  if (isAssessmentV2(assessment)) return <RoleScorecardView assessment={assessment} layout={layout} />;
+  return <LegacyScorecard assessment={assessment} layout={layout} />;
 }

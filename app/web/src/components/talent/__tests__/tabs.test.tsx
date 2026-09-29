@@ -5,7 +5,7 @@
  */
 import { render, screen, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { Tabs } from '../Tabs';
 
 const items = [
@@ -115,5 +115,31 @@ describe('Tabs', () => {
   it('is axe-clean', async () => {
     const { container } = renderTabs();
     await expect(container).toHaveNoViolations();
+  });
+});
+
+describe('Tabs (controlled)', () => {
+  it('follows selectedId and reports user selection through onSelect', async () => {
+    const user = userEvent.setup();
+    const onSelect = vi.fn();
+    const { rerender } = render(
+      <Tabs items={items} ariaLabel="Candidate sections" selectedId="sessions" onSelect={onSelect} />,
+    );
+    expect(screen.getByRole('tab', { name: 'Sessions' })).toHaveAttribute('aria-selected', 'true');
+
+    await user.click(screen.getByRole('tab', { name: 'Recordings' }));
+    expect(onSelect).toHaveBeenCalledWith('recordings');
+
+    // The host owns the selection: until it passes the new id, it stands.
+    rerender(
+      <Tabs items={items} ariaLabel="Candidate sections" selectedId="recordings" onSelect={onSelect} />,
+    );
+    expect(screen.getByRole('tab', { name: 'Recordings' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('tabpanel', { name: 'Recordings' })).not.toHaveAttribute('hidden');
+  });
+
+  it('falls back to its own state for an id that matches no tab', () => {
+    render(<Tabs items={items} ariaLabel="Candidate sections" selectedId="nope" />);
+    expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true');
   });
 });

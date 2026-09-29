@@ -63,7 +63,11 @@ export function SegmentedControl<T extends string>({
                 'relative shrink-0 whitespace-nowrap rounded-[10px] font-medium transition-colors duration-200 ease-soft',
                 'focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-1',
                 'disabled:cursor-not-allowed disabled:opacity-40',
-                size === 'sm' ? 'h-7 px-2.5 text-xs' : 'h-8 px-3 text-[13px]',
+                // Type scale: meta (12/16) for the compact control, label
+                // (13/20) otherwise; medium weight either way.
+                // md segments meet the 36px control rule on their own, not
+                // only with the track's padding around them.
+                size === 'sm' ? 'h-7 px-2.5 text-meta' : 'h-9 px-3 text-label',
                 selected ? 'text-ink' : 'text-ink-secondary hover:text-ink',
               )}
             >
