@@ -348,6 +348,36 @@ describe('the adapters call the RPCs by name, with the declared keys', () => {
       .toStrictEqual({ status: 'halt_unreadable', wasHalted: undefined });
   });
 
+  it('setHalt surfaces 0110\'s reason IN FORCE, narrowed to the closed vocabulary', async () => {
+    // A pause requested during a legal hold: the store must hand back the
+    // reason the substrate says is in force, not the one it was asked for.
+    const escalatedAway = fakeClient({
+      status: 'ok', already_halted: true, halt_reason: 'legal_hold', reason_escalated: false,
+    });
+    expect(await createPhoneStores(escalatedAway.client)
+      .setHalt({ reason: 'operator_pause', now: NOW }))
+      .toStrictEqual({
+        status: 'ok', alreadyHalted: true, haltReason: 'legal_hold', reasonEscalated: false,
+      });
+
+    const escalated = fakeClient({
+      status: 'ok', already_halted: true, halt_reason: 'emergency_stop', reason_escalated: true,
+    });
+    expect(await createPhoneStores(escalated.client)
+      .setHalt({ reason: 'emergency_stop', now: NOW }))
+      .toMatchObject({ haltReason: 'emergency_stop', reasonEscalated: true });
+
+    // Outside the vocabulary, or not a string, or absent (a pre-0110 body):
+    // DROPPED. The route must then report "not known", never guess.
+    for (const halt_reason of ['halt_unreadable', 'LEGAL_HOLD', 7, null, undefined]) {
+      const drift = fakeClient({ status: 'ok', already_halted: true, halt_reason });
+      const out = await createPhoneStores(drift.client)
+        .setHalt({ reason: 'operator_pause', now: NOW });
+      expect(out.haltReason, String(halt_reason)).toBeUndefined();
+      expect(out.status).toBe('ok');
+    }
+  });
+
   it('the backlog projection maps every nested count', async () => {
     const { client } = fakeClient({
       status: 'ok',

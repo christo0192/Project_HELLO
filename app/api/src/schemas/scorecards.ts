@@ -67,6 +67,20 @@ export const updateMetricSchema = z
 
 export type UpdateMetricInput = z.infer<typeof updateMetricSchema>;
 
+/**
+ * Ask Hello's metric draft: the two fields the admin has typed so far. The
+ * bounds are the create schema's own, so a draft can only be asked for a
+ * metric that could then be created under that name and description.
+ */
+export const draftMetricSchema = z
+  .object({
+    name: z.string().trim().min(1).max(SCORECARD_MAX_NAME_LENGTH),
+    description: z.string().trim().max(SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH).nullable().optional(),
+  })
+  .strict();
+
+export type DraftMetricInput = z.infer<typeof draftMetricSchema>;
+
 export const metricIdParamSchema = z.object({ id: uuidSchema }).strict();
 
 // ── Role scorecard (interviewer owns own role, admin all) ────────────────

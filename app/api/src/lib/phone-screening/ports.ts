@@ -396,6 +396,16 @@ export interface SetPhoneHaltResult {
   readonly status: OrUnknown<SetPhoneHaltStatus>;
   /** True when a halt was ALREADY in force; the original instant is preserved. */
   readonly alreadyHalted?: boolean;
+  /**
+   * 0110: the reason IN FORCE after the call — the most restrictive of the
+   * stored and requested reasons while halted, never simply the one sent.
+   * Absent when the substrate did not report one inside the closed
+   * vocabulary (a pre-0110 database, or drift); callers must not substitute
+   * the requested reason for it.
+   */
+  readonly haltReason?: PhoneHaltReason;
+  /** 0110: true when this call replaced a weaker reason already in force. */
+  readonly reasonEscalated?: boolean;
 }
 
 export interface ClearPhoneHaltResult {

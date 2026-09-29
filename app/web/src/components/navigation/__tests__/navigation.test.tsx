@@ -5,6 +5,8 @@
  * - NavLinkItem: link, icon, active state (aria-current) + onNavigate
  * - NavGroup: labelled group for sectioned navigation
  * - Brand: logo plate + wordmark, never inverted
+ * - IntegrationIcon (Ashby Mission Control): same SVG contract as its siblings
+ *   (Layout.test.tsx covers where the link sits and who sees it)
  */
 
 import { render, screen } from '@testing-library/react';
@@ -12,7 +14,7 @@ import userEvent from '@testing-library/user-event';
 import { MemoryRouter } from 'react-router-dom';
 import { describe, it, expect, vi } from 'vitest';
 import { Brand, NavGroup, NavLinkItem, SkipLink } from '../index';
-import { DashboardIcon } from '../icons';
+import { DashboardIcon, IntegrationIcon, ShieldIcon } from '../icons';
 
 describe('SkipLink', () => {
   it('targets #main-content and is sr-only until focused', () => {
@@ -96,5 +98,45 @@ describe('NavLinkItem', () => {
     );
     await userEvent.click(screen.getByRole('link', { name: 'Candidates' }));
     expect(onNavigate).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('IntegrationIcon', () => {
+  /** The presentational attributes every icon in the set shares. */
+  const CONTRACT = [
+    'viewBox',
+    'fill',
+    'stroke',
+    'stroke-width',
+    'stroke-linecap',
+    'stroke-linejoin',
+    'aria-hidden',
+    'focusable',
+  ] as const;
+
+  it('follows the icon set conventions exactly, attribute for attribute', () => {
+    const { container } = render(
+      <>
+        <IntegrationIcon className="h-4 w-4" />
+        <ShieldIcon className="h-4 w-4" />
+      </>,
+    );
+    const [integration, shield] = Array.from(container.querySelectorAll('svg'));
+    for (const attr of CONTRACT) {
+      expect(integration.getAttribute(attr), attr).toBe(shield.getAttribute(attr));
+    }
+    // And the values themselves, so the comparison cannot pass by both
+    // icons drifting together.
+    expect(integration).toHaveAttribute('viewBox', '0 0 24 24');
+    expect(integration).toHaveAttribute('stroke', 'currentColor');
+    expect(integration).toHaveAttribute('stroke-width', '2');
+    expect(integration).toHaveAttribute('aria-hidden', 'true');
+    expect(integration).toHaveAttribute('class', 'h-4 w-4');
+  });
+
+  it('draws linked nodes: three nodes and two connectors', () => {
+    const { container } = render(<IntegrationIcon />);
+    expect(container.querySelectorAll('circle')).toHaveLength(3);
+    expect(container.querySelectorAll('path')).toHaveLength(2);
   });
 });

@@ -581,6 +581,12 @@ docker exec "$SUPABASE_DB_CONTAINER" psql -U postgres -d postgres -v ON_ERROR_ST
   -f /tmp/ashby_mapping_archive.sql
 log '0109: PASS — archive kept history on the frozen row, re-add created a new live row, uniqueness held over live rows; fixture rolled back.'
 
+log '0110: Executing phone halt reason precedence (escalate to the most restrictive reason, never downgrade, keep the original instant)...'
+docker cp app/supabase/tests/phone_halt_precedence.sql "$SUPABASE_DB_CONTAINER:/tmp/phone_halt_precedence.sql"
+docker exec "$SUPABASE_DB_CONTAINER" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+  -f /tmp/phone_halt_precedence.sql
+log '0110: PASS — every ordered reason pair resolved to the stronger reason, the halt instant held, the owner-test gate refused an escalated halt; fixture rolled back.'
+
 # ===================================================================
 # GOV-06: First explicit seed re-apply (seed already applied by db reset
 # via config.toml), then full rerun to prove idempotency, then SQL tests

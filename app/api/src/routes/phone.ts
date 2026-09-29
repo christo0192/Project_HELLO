@@ -402,6 +402,18 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
             // FK cascades, so this is a torn read, not a missing relationship —
             // reported as null rather than guessed at.
             engagement_state: engagement?.state ?? null,
+            // The agent (role) pipeline this call belongs to — the web
+            // calendar's agent filter keys on it. Deliberately the ENGAGEMENT's
+            // role, not `candidates.role_id`: the engagement's role is stamped
+            // when the cycle opens and stays with the call, while the
+            // candidate's role is current state that can move after the call
+            // was booked (0047 then flags the old engagement
+            // `identity_mismatch` rather than re-homing it). It sits beside
+            // `engagement_state` because it is an engagement fact, not a
+            // candidate one. Null on the same torn read, or when the
+            // engagement carries no role; a bare id — labels come from the
+            // operator's own role-scoped `/api/roles` read.
+            role_id: engagement?.roleId ?? null,
             candidate: candidateBlock(
               engagement ? candidateById.get(engagement.candidateId) : undefined,
             ),
@@ -1058,23 +1070,41 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
           return;
         }
         // FAIL CLOSED on a missing field. `set_phone_halt` always returns
-        // `already_halted`, but if it ever did not, defaulting to false would
-        // make the compensating clear below lift a halt this call did NOT
-        // cause — turning somebody else's stop into a go on the strength of
-        // our own audit failure. Unknown therefore means "not ours".
+        // `already_halted`; if it ever did not, "unknown" is reported as "a
+        // halt was already in force" — the reading that claims the least
+        // about what THIS call changed.
         const alreadyHalted = result.alreadyHalted ?? true;
+        // THE REASON IN FORCE, as the substrate reports it — never the one
+        // requested. Since 0110 a stronger reason escalates the halt and a
+        // weaker one changes nothing, so an admin who asks for
+        // `operator_pause` during a `legal_hold` must be told `legal_hold`.
+        // Echoing the request would say "only a pause is up" about a legal
+        // hold. A substrate that did not report it (pre-0110, or drift)
+        // answers null — "not known" — rather than a guess.
+        const reasonInForce = result.haltReason ?? null;
         // NO compensation. See `auditOrFail` — lifting a kill switch because
         // our own audit sink failed is a fail-open on the one control that
-        // exists to stop calls, the halt is already durably audited by 0042's
-        // own row, and another admin may already be relying on the stop.
+        // exists to stop calls, the halt is already durably audited by
+        // `set_phone_halt`'s own row, and another admin may already be relying
+        // on the stop.
         const ok = await auditOrFail(req, res, 'resource.update', 200, {
           resource: 'phone_control',
           action: 'halt_set',
+          // `reason` keeps its historical meaning (what was REQUESTED), matching
+          // the `reason` key of set_phone_halt's own audit row.
           reason,
+          reason_in_force: reasonInForce,
+          reason_escalated: result.reasonEscalated ?? null,
           already_halted: alreadyHalted,
         });
         if (!ok) return;
-        res.json({ ok: true, halted: true, already_halted: alreadyHalted, reason });
+        res.json({
+          ok: true,
+          halted: true,
+          already_halted: alreadyHalted,
+          reason: reasonInForce,
+          requested_reason: reason,
+        });
       } catch {
         res.status(500).json({ ok: false, error: 'phone_action_error' });
       }
@@ -1101,14 +1131,21 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
    * that every one of those attempts is AUDITED and rate-limited — guessing
    * leaves a trail instead of being free.
    *
+   * Since 0110 the reason on the row is the MOST RESTRICTIVE one raised while
+   * the halt has been in force, not the first. A legal hold raised during an
+   * operator pause therefore makes an `operator_pause` clear a 409 here, and
+   * Mission Control's Resume (which only ever names `operator_pause`) cannot
+   * lift it.
+   *
    * RESIDUAL — this is time-of-check-to-time-of-use. `phone_control` carries no
-   * version column, so between the control read and `clear_phone_halt` another
-   * admin can raise a halt this route never verified, and the compensating
-   * re-halt would then install the reason THIS caller supplied (0042
-   * `coalesce`s onto a row that is clear by then). Closing it would need a CAS
-   * on the control row, i.e. a migration. The exposure is bounded in the SAFE
-   * direction: the compensation re-raises a stop, and the worst outcome is a
-   * halt carrying a stale but real reason.
+   * version column and `clear_phone_halt` takes no expected reason, so a halt
+   * ESCALATED between the control read below and `clear_phone_halt` (a
+   * window of one round trip) is lifted along with the reason this route
+   * verified. Closing it needs a compare-and-clear in SQL, i.e. a signature
+   * change to `clear_phone_halt`. The compensating re-halt on an audit
+   * failure is the safe direction under 0110: `set_phone_halt` escalates, so
+   * if a stronger halt landed after our clear, re-halting with the verified
+   * reason cannot downgrade it.
    */
   router.post(
     '/halt/clear',

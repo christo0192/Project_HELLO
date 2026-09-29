@@ -1,7 +1,7 @@
 /**
  * Button — the shell's action control.
  *
- * Four variants, three sizes, press feedback via a CSS scale transition
+ * Five variants, three sizes, press feedback via a CSS scale transition
  * (collapses under reduced motion through the global media rule). Pure CSS
  * on purpose: buttons are the hottest primitive in the app and a motion
  * element per button made typed-input tests measurably slower in jsdom.
@@ -11,7 +11,7 @@
 import type { ButtonHTMLAttributes, ReactNode } from 'react';
 import { cx } from './cx';
 
-export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger';
+export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'go';
 export type ButtonSize = 'sm' | 'md' | 'lg';
 
 const base =
@@ -28,6 +28,18 @@ const variants: Record<ButtonVariant, string> = {
     'text-ink-secondary hover:bg-ink/[0.05] hover:text-ink',
   danger:
     'bg-error text-white shadow-pill hover:bg-[#a54e66] active:bg-[#98475e]',
+  /* GREEN, for "Resume calling" only. The owner asked on 2026-09-29 for the
+     resume button to read as green; no approved token was green (the
+     `--success` family is teal-cyan, hue ~193°, and read as blue), so
+     `--go` / `--go-strong` were added to the palette for this one action.
+     White on `--go` is 5.23:1 and on `--go-strong` 6.14:1, both over the
+     4.5:1 a 14px label needs. Hover and press change the FILL only — never a
+     `brightness()` filter, which dims the white label along with the fill and
+     so LOWERS contrast — and `background-color` is already in the base
+     transition, so the hover eases instead of snapping. Contrast is pinned
+     in global-palette.test.ts. */
+  go:
+    'bg-[var(--go)] text-white shadow-pill hover:bg-[var(--go-strong)] active:bg-[var(--go-strong)]',
 };
 
 const sizes: Record<ButtonSize, string> = {

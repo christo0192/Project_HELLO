@@ -1132,7 +1132,12 @@ describe('OpenAPI document integrity', () => {
     // 0109 adds ONE admin action — POST .../mission-control/mappings/{id}/
     // archive, Mission Control's "Delete", which archives a paused mapping
     // and keeps its history. 141 + 1 = 142.
-    expect(Object.keys(paths).length).toBe(142);
+    // Ask Hello on the Scorebar adds ONE admin path — POST
+    // /api/scorecards/metrics/draft, which drafts a metric's scoring
+    // instruction and 1-4 rubric from its name and description and writes
+    // nothing. Its bodies are documented inline, so the schema count below is
+    // unchanged. 142 + 1 = 143.
+    expect(Object.keys(paths).length).toBe(143);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -2894,6 +2899,7 @@ describe('phone operator API bodies match the documented schemas', () => {
     const engagement = {
       id: PHONE_ENGAGEMENT,
       candidateId: PHONE_CANDIDATE,
+      roleId: '00000000-0000-4000-8000-0000000000f1',
       state: 'scheduled' as const,
       stateReason: null,
       epoch: 0,
@@ -2963,7 +2969,9 @@ describe('phone operator API bodies match the documented schemas', () => {
         status: 'ok', appointmentId: PHONE_APPOINTMENT, version: 4,
       }),
       expireAppointments: async () => ({ status: 'ok' }),
-      setHalt: async () => ({ status: 'ok', alreadyHalted: false }),
+      setHalt: async () => ({
+        status: 'ok', alreadyHalted: false, haltReason: 'operator_pause', reasonEscalated: false,
+      }),
       clearHalt: async () => ({ status: 'ok', wasHalted: true }),
       backlog: async () => ({
         status: 'ok',
@@ -3009,6 +3017,9 @@ describe('phone operator API bodies match the documented schemas', () => {
       const calendar = await request(phoneApp)
         .get('/api/phone/calendar?from=2026-08-24T00:00:00Z&to=2026-08-25T00:00:00Z');
       expect(calendar.body.appointments).toHaveLength(1);
+      // The agent filter's key is really in the validated row, non-null, so
+      // its `format: uuid` was checked rather than skipped as null.
+      expect(calendar.body.appointments[0].role_id).toBe('00000000-0000-4000-8000-0000000000f1');
       const slots = await request(phoneApp).get('/api/phone/calendar/slots?date=2026-08-24');
       expect(slots.body.slots.length).toBeGreaterThan(0);
       const detail = await request(phoneApp).get(`/api/phone/engagements/${PHONE_ENGAGEMENT}`);
@@ -3057,8 +3068,18 @@ describe('phone operator API bodies match the documented schemas', () => {
     // vacuous. An undocumented key and a wrong type must both be caught.
     const good = {
       ok: true, halted: true, already_halted: false, reason: 'operator_pause',
+      requested_reason: 'operator_pause',
     };
     expect(validateNamed(good, 'PhoneHaltResponse', spec)).toEqual([]);
+    // 0110: `reason` is the reason IN FORCE and may be null ("not reported");
+    // `requested_reason` is required and closed.
+    expect(validateNamed({ ...good, reason: null }, 'PhoneHaltResponse', spec)).toEqual([]);
+    expect(validateNamed({ ...good, reason: 'legal_hold' }, 'PhoneHaltResponse', spec)).toEqual([]);
+    const { requested_reason: requested, ...noRequested } = good;
+    expect(requested).toBe('operator_pause');
+    expect(validateNamed(noRequested, 'PhoneHaltResponse', spec).length).toBeGreaterThan(0);
+    expect(validateNamed({ ...good, requested_reason: 'because' }, 'PhoneHaltResponse', spec).length)
+      .toBeGreaterThan(0);
     expect(validateNamed({ ...good, surprise: 1 }, 'PhoneHaltResponse', spec).length)
       .toBeGreaterThan(0);
     expect(validateNamed({ ...good, halted: 'yes' }, 'PhoneHaltResponse', spec).length)

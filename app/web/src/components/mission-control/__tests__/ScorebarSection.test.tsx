@@ -17,6 +17,7 @@ const { api } = vi.hoisted(() => ({
     createScorecardMetric: vi.fn(),
     updateScorecardMetric: vi.fn(),
     archiveScorecardMetric: vi.fn(),
+    draftMetricRubric: vi.fn(),
   },
 }));
 
@@ -151,5 +152,84 @@ describe('ScorebarSection', () => {
     expect(row.getByText('4 · Excellent')).toBeInTheDocument();
     expect(screen.queryByText('5 · Excellent')).not.toBeInTheDocument();
     expect(screen.queryByText('2 · Below average')).not.toBeInTheDocument();
+  });
+
+  // Ask Hello's behaviour is covered in MetricAskHello.test.tsx; these two pin
+  // only the wiring into this form.
+  it('puts Ask Hello on the create form only — the edit form carries none', async () => {
+    api.listScorecardMetrics.mockResolvedValue([
+      {
+        id: 'm1',
+        key: 'communication',
+        name: 'Communication',
+        description: null,
+        default_instruction: 'Judge clarity.',
+        rubric: { 1: 'a', 2: 'b', 3: 'c', 4: 'd' },
+        archived_at: null,
+        version: 1,
+      },
+    ]);
+    render(<ScorebarSection />);
+    const user = userEvent.setup();
+    await screen.findByText('Communication');
+    await user.click(screen.getByRole('button', { name: 'Edit' }));
+    const row = document.querySelector('[data-metric-row="m1"]') as HTMLElement;
+    expect(within(row).getByLabelText('Name')).toHaveValue('Communication');
+    expect(row.querySelector('[data-ask-hello]')).toBeNull();
+    expect(document.querySelectorAll('[data-ask-hello]')).toHaveLength(1);
+    expect(screen.getByRole('button', { name: /^Ask Hello/ })).toBeInTheDocument();
+  });
+
+  it("fills the create form's instruction and four rubric levels from Hello's draft, and creates nothing", async () => {
+    api.createScorecardMetric.mockClear();
+    api.draftMetricRubric.mockResolvedValue({
+      default_instruction: 'Look for concrete examples of ownership.',
+      rubric: { 1: 'No example.', 2: 'A vague claim.', 3: 'A specific example.', 4: 'Several examples.' },
+    });
+    render(<ScorebarSection />);
+    await screen.findByText('Add a metric');
+    const user = userEvent.setup();
+
+    await user.type(screen.getByLabelText('Name'), 'Ownership');
+    await user.click(screen.getByRole('button', { name: /^Ask Hello/ }));
+
+    await waitFor(() =>
+      expect(screen.getByLabelText('Scoring instruction')).toHaveValue(
+        'Look for concrete examples of ownership.',
+      ),
+    );
+    expect(screen.getByLabelText('1 · Poor')).toHaveValue('No example.');
+    expect(screen.getByLabelText('2 · Average')).toHaveValue('A vague claim.');
+    expect(screen.getByLabelText('3 · Good')).toHaveValue('A specific example.');
+    expect(screen.getByLabelText('4 · Excellent')).toHaveValue('Several examples.');
+    expect(api.draftMetricRubric).toHaveBeenCalledWith({ name: 'Ownership', description: null });
+    expect(api.createScorecardMetric).not.toHaveBeenCalled();
+  });
+
+  it('after Create, the emptied form no longer says Hello drafted it', async () => {
+    // The form resets on a successful Create; Ask Hello's "review before
+    // creating" line is about text that is gone, and must go with it rather
+    // than sit beside "Add a name and Hello can draft…".
+    api.draftMetricRubric.mockResolvedValue({
+      default_instruction: 'Look for concrete examples of ownership.',
+      rubric: { 1: 'No example.', 2: 'A vague claim.', 3: 'A specific example.', 4: 'Several examples.' },
+    });
+    render(<ScorebarSection />);
+    await screen.findByText('Add a metric');
+    const user = userEvent.setup();
+    const drafted = 'Hello drafted the scoring instruction and rubric — review before creating.';
+
+    await user.type(screen.getByLabelText('Name'), 'Ownership');
+    await user.click(screen.getByRole('button', { name: /^Ask Hello/ }));
+    expect(await screen.findByText(drafted)).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Create metric' }));
+    expect(await screen.findByText('Metric “Technical depth” created.')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByLabelText('Name')).toHaveValue(''));
+
+    expect(screen.queryByText(drafted)).not.toBeInTheDocument();
+    expect(
+      screen.getByText('Add a name and Hello can draft the instruction and rubric.'),
+    ).toBeInTheDocument();
   });
 });

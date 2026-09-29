@@ -28,6 +28,7 @@ import {
   slot,
   slotsResponse,
   PHONE_BOOKING_CANDIDATES,
+  PHONE_ROLES,
 } from '../components/phone-calendar/__tests__/phoneFixtures';
 import { stubMatchMedia } from '../components/design/__tests__/helpers';
 
@@ -50,6 +51,7 @@ beforeEach(() => {
   apiFns.getPhoneCalendar.mockResolvedValue(calendarResponse());
   apiFns.getPhoneSlots.mockResolvedValue(slotsResponse());
   apiFns.listCandidates.mockResolvedValue(PHONE_BOOKING_CANDIDATES);
+  apiFns.listRoles.mockResolvedValue(PHONE_ROLES);
   apiFns.scheduleCandidatePhoneAppointment.mockResolvedValue({
     ok: true,
     appointment_id: 'new-1',

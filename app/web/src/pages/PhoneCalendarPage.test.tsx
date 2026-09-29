@@ -8,13 +8,18 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { MemoryRouter } from 'react-router-dom';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import {
   ADMIN_ME,
   INTERVIEWER_ME,
   MockApiError,
   VIEWER_ME,
   PHONE_BOOKING_CANDIDATES,
+  PHONE_ROLES,
+  ROLE_DATA,
+  ROLE_DATA_TWIN,
+  ROLE_SALES,
+  ROLE_UNKNOWN,
   apiFns,
   appointment,
   calendarResponse,
@@ -49,6 +54,7 @@ beforeEach(() => {
   apiFns.getPhoneCalendar.mockResolvedValue(calendarResponse());
   apiFns.getPhoneSlots.mockResolvedValue(slotsResponse());
   apiFns.listCandidates.mockResolvedValue(PHONE_BOOKING_CANDIDATES);
+  apiFns.listRoles.mockResolvedValue(PHONE_ROLES);
   stubMatchMedia(false, '(max-width: 639px)');
 });
 
@@ -549,8 +555,9 @@ describe('no sensitive identifiers', () => {
 
   it('keeps the URL to closed vocabularies and a validated date', async () => {
     // The acceptance names the URL explicitly. Every parameter this page can
-    // write is either a validated IST date or a member of a closed
-    // vocabulary, so no free text — and nothing sensitive — can reach it.
+    // write is either a validated IST date, a member of a closed vocabulary,
+    // or (`agent`) a value that must have a role id's uuid SHAPE, so no free
+    // text — and nothing sensitive — can reach it.
     renderPage();
     await screen.findByRole('table');
 
@@ -567,7 +574,7 @@ describe('no sensitive identifiers', () => {
     const rendered = document.body.innerHTML;
     expect(rendered).not.toMatch(/engagement_id=|candidate=|phone=|email=/i);
     for (const key of [...search.keys()]) {
-      expect(['week', 'view', 'status', 'state']).toContain(key);
+      expect(['week', 'view', 'agent', 'status', 'state']).toContain(key);
     }
   });
 });
@@ -604,5 +611,308 @@ describe('candidate callback confirmation evidence', () => {
       screen.getByText(/more appointments than one read returns/),
     ).toBeInTheDocument();
     expect(await screen.findByText(/lower bound/i)).toBeInTheDocument();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+//  The agent (role) filter
+// ══════════════════════════════════════════════════════════════════════
+
+describe('agent filter', () => {
+  const ref = (reference: string) => ({
+    id: `cand-${reference}`,
+    name: null,
+    status: 'screening',
+    reference,
+  });
+
+  /**
+   * Two calls for `Zara` (the Sales Advisor role), two for `Data Analyst`, and
+   * one whose engagement carries no role. Nobody has a call for the second
+   * `Data Analyst` role this week — it must still be offered.
+   */
+  const AGENT_WEEK = calendarResponse({
+    appointments: [
+      appointment({ id: 's1', role_id: ROLE_SALES, status: 'scheduled', starts_at: '2026-08-26T03:30:00Z', candidate: ref('ATS-1001') }),
+      appointment({ id: 's2', role_id: ROLE_SALES, status: 'missed', starts_at: '2026-08-26T04:30:00Z', candidate: ref('ATS-1002') }),
+      appointment({ id: 'd1', role_id: ROLE_DATA, status: 'missed', starts_at: '2026-08-27T05:30:00Z', candidate: ref('ATS-2001') }),
+      appointment({ id: 'd2', role_id: ROLE_DATA, status: 'fulfilled', engagement_state: 'completed', starts_at: '2026-08-27T06:30:00Z', candidate: ref('ATS-2002') }),
+      appointment({ id: 'n1', role_id: null, status: 'scheduled', starts_at: '2026-08-28T07:30:00Z', candidate: ref('ATS-3001') }),
+    ],
+  });
+
+  /** The page, plus a probe that prints the router's query string. */
+  function renderWithUrl(search: string) {
+    function LocationProbe() {
+      return <output data-testid="url">{useLocation().search}</output>;
+    }
+    return render(
+      <MemoryRouter initialEntries={[`/phone-calendar${search}`]}>
+        <PhoneCalendarPage />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+  }
+
+  const url = () => new URLSearchParams(screen.getByTestId('url').textContent ?? '');
+
+  /** The Agent picker, once the roles have loaded and it is usable. */
+  async function agentPicker(): Promise<HTMLSelectElement> {
+    const select = (await screen.findByRole('combobox', { name: 'Agent' })) as HTMLSelectElement;
+    await waitFor(() => expect(select).toBeEnabled());
+    return select;
+  }
+
+  const shownRefs = () =>
+    screen
+      .queryAllByRole('button', { name: /ATS-\d{4}/ })
+      .map((b) => /ATS-\d{4}/.exec(b.getAttribute('aria-label') ?? '')?.[0])
+      .sort();
+
+  const chip = (group: string, label: RegExp) =>
+    within(screen.getByRole('group', { name: group })).queryByRole('button', { name: label });
+
+  beforeEach(() => {
+    apiFns.getPhoneCalendar.mockResolvedValue(AGENT_WEEK);
+  });
+
+  it('offers every agent the operator can see, by agent name else title, sorted', async () => {
+    renderWithUrl(WEEK_QS);
+    const select = await agentPicker();
+    expect([...select.options].map((o) => o.textContent)).toEqual([
+      'All agents',
+      'Data Analyst',
+      // Same title, blank agent name: told apart, never two identical options.
+      'Data Analyst · 2',
+      // The agent name, not the role title `Sales Advisor`.
+      'Zara',
+    ]);
+    expect([...select.options].map((o) => o.value)).toEqual([
+      '',
+      ROLE_DATA,
+      ROLE_DATA_TWIN,
+      ROLE_SALES,
+    ]);
+    // Every role is offered, including one with no call this week.
+    expect(select.value).toBe('');
+    expect(screen.queryByText('Sales Advisor')).not.toBeInTheDocument();
+  });
+
+  it('reads the roles once, alongside the calendar, and not again per week', async () => {
+    renderWithUrl(WEEK_QS);
+    await agentPicker();
+    expect(apiFns.listRoles).toHaveBeenCalledTimes(1);
+    expect(apiFns.getPhoneCalendar).toHaveBeenCalledTimes(1);
+
+    await userEvent.click(screen.getByRole('button', { name: 'Next week' }));
+    await waitFor(() => expect(apiFns.getPhoneCalendar).toHaveBeenCalledTimes(2));
+    expect(apiFns.listRoles).toHaveBeenCalledTimes(1);
+  });
+
+  it('narrows the WEEK GRID to one agent and issues no request', async () => {
+    renderWithUrl(WEEK_QS);
+    await screen.findByRole('table');
+    const select = await agentPicker();
+    expect(shownRefs()).toEqual(['ATS-1001', 'ATS-1002', 'ATS-2001', 'ATS-2002', 'ATS-3001']);
+
+    const before = totalApiCalls();
+    await userEvent.selectOptions(select, 'Zara');
+
+    await waitFor(() => expect(shownRefs()).toEqual(['ATS-1001', 'ATS-1002']));
+    expect(screen.getByRole('table')).toBeInTheDocument();
+    expect(select.value).toBe(ROLE_SALES);
+    expect(url().get('agent')).toBe(ROLE_SALES);
+    // Client-side, like every other filter: one read per week, still.
+    expect(totalApiCalls()).toBe(before);
+    expect(apiFns.getPhoneCalendar).toHaveBeenCalledTimes(1);
+  });
+
+  it('narrows the QUEUE too, straight from a deep link', async () => {
+    renderWithUrl(`${WEEK_QS}&view=queue&agent=${ROLE_DATA}`);
+    expect(
+      await screen.findByRole('heading', { name: /Thursday, 27 August 2026/ }),
+    ).toBeInTheDocument();
+    await agentPicker();
+    await waitFor(() => expect(shownRefs()).toEqual(['ATS-2001', 'ATS-2002']));
+    // Wednesday's and Friday's calls belong to other agents, so their day
+    // groups are gone rather than rendered empty.
+    expect(screen.queryByRole('heading', { name: /Wednesday, 26 August 2026/ }))
+      .not.toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /Friday, 28 August 2026/ }))
+      .not.toBeInTheDocument();
+    expect(screen.queryByRole('table')).not.toBeInTheDocument();
+  });
+
+  it('keeps the chip counts to the selected agent, as the other filters do', async () => {
+    renderWithUrl(WEEK_QS);
+    await screen.findByRole('table');
+    const select = await agentPicker();
+    expect(chip('Appointment', /^Missed/)).toHaveTextContent(/^Missed\s*2$/);
+    expect(chip('Appointment', /^Fulfilled/)).toHaveTextContent(/^Fulfilled\s*1$/);
+
+    await userEvent.selectOptions(select, 'Zara');
+    await waitFor(() => expect(chip('Appointment', /^Missed/)).toHaveTextContent(/^Missed\s*1$/));
+    expect(chip('Appointment', /^Scheduled/)).toHaveTextContent(/^Scheduled\s*1$/);
+    // Zara has no fulfilled call, so that chip is not offered at all.
+    expect(chip('Appointment', /^Fulfilled/)).not.toBeInTheDocument();
+    expect(chip('Engagement', /^Completed/)).not.toBeInTheDocument();
+
+    // And a status chip narrows WITHIN the agent, never across agents.
+    await userEvent.click(chip('Appointment', /^Missed/)!);
+    await waitFor(() => expect(shownRefs()).toEqual(['ATS-1002']));
+    expect(url().get('agent')).toBe(ROLE_SALES);
+    expect(url().get('status')).toBe('missed');
+  });
+
+  it('says plainly when the agent has no calls this week', async () => {
+    renderWithUrl(WEEK_QS);
+    await screen.findByRole('table');
+    const select = await agentPicker();
+    await userEvent.selectOptions(select, 'Data Analyst · 2');
+
+    expect(await screen.findByText('No calls for this agent this week')).toBeInTheDocument();
+    // Four calls belong to other agents; the fifth has NO role and is nobody's,
+    // so it is not counted as another agent's — it is named on its own.
+    expect(
+      screen.getByText(/^Other agents have 4 calls between .+ IST, and 1 call has no agent\. Choose All agents to see them\.$/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Other agents have 5 calls/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('table')).not.toBeInTheDocument();
+    expect(screen.queryByText('No appointments match these filters')).not.toBeInTheDocument();
+    // The control doing the filtering is still on screen, and still says so.
+    expect(select.value).toBe(ROLE_DATA_TWIN);
+
+    // Clearing the filters brings every agent back.
+    await userEvent.click(screen.getByRole('button', { name: 'Clear filters' }));
+    await waitFor(() => expect(shownRefs()).toHaveLength(5));
+    expect(select.value).toBe('');
+    expect(url().has('agent')).toBe(false);
+  });
+
+  it('says only "other agents" when every call this week has an agent', async () => {
+    apiFns.getPhoneCalendar.mockResolvedValue(
+      calendarResponse({
+        appointments: AGENT_WEEK.appointments.filter((appt) => appt.role_id !== null),
+      }),
+    );
+    renderWithUrl(`${WEEK_QS}&agent=${ROLE_DATA_TWIN}`);
+    expect(await screen.findByText('No calls for this agent this week')).toBeInTheDocument();
+    expect(
+      screen.getByText(/^Other agents have 4 calls between .+ IST\. Choose All agents to see them\.$/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/no agent/)).not.toBeInTheDocument();
+  });
+
+  it('never credits a role-less call to "other agents" when it is the only kind there is', async () => {
+    apiFns.getPhoneCalendar.mockResolvedValue(
+      calendarResponse({
+        appointments: AGENT_WEEK.appointments.filter((appt) => appt.role_id === null),
+      }),
+    );
+    renderWithUrl(`${WEEK_QS}&agent=${ROLE_DATA_TWIN}`);
+    expect(await screen.findByText('No calls for this agent this week')).toBeInTheDocument();
+    expect(
+      screen.getByText(/^1 call between .+ IST has no agent\. Choose All agents to see it\.$/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Other agents/)).not.toBeInTheDocument();
+  });
+
+  it('switches back to every agent with "All agents"', async () => {
+    renderWithUrl(`${WEEK_QS}&agent=${ROLE_SALES}`);
+    const select = await agentPicker();
+    await waitFor(() => expect(shownRefs()).toEqual(['ATS-1001', 'ATS-1002']));
+    await userEvent.selectOptions(select, 'All agents');
+    await waitFor(() => expect(shownRefs()).toHaveLength(5));
+    expect(url().has('agent')).toBe(false);
+  });
+
+  it('falls back to "All agents" for a link naming a role the operator cannot see', async () => {
+    renderWithUrl(`${WEEK_QS}&agent=${ROLE_UNKNOWN}`);
+    const select = await agentPicker();
+    // The week, not an empty grid filtered by something no control shows.
+    await waitFor(() => expect(shownRefs()).toHaveLength(5));
+    expect(select.value).toBe('');
+    expect(screen.queryByText('No calls for this agent this week')).not.toBeInTheDocument();
+
+    // The stale id leaves the URL at the operator's next click.
+    await userEvent.click(chip('Appointment', /^Missed/)!);
+    await waitFor(() => expect(url().get('status')).toBe('missed'));
+    expect(url().has('agent')).toBe(false);
+  });
+
+  it('ignores an agent parameter that is not a role id at all', async () => {
+    renderWithUrl(`${WEEK_QS}&agent=${encodeURIComponent('Zara')}`);
+    const select = await agentPicker();
+    await waitFor(() => expect(shownRefs()).toHaveLength(5));
+    expect(select.value).toBe('');
+  });
+
+  it('applies a deep-linked agent while the roles are still loading', async () => {
+    // A valid link shows its agent's calls from the first paint; the picker
+    // holds its place, disabled, until the names arrive.
+    apiFns.listRoles.mockReturnValue(new Promise(() => {}));
+    renderWithUrl(`${WEEK_QS}&agent=${ROLE_SALES}`);
+    await screen.findByRole('table');
+    expect(shownRefs()).toEqual(['ATS-1001', 'ATS-1002']);
+    const select = screen.getByRole('combobox', { name: 'Agent' });
+    expect(select).toBeDisabled();
+    expect(select).toHaveTextContent('Loading agents…');
+  });
+
+  it('keeps the calendar whole when the roles cannot be read', async () => {
+    apiFns.listRoles.mockRejectedValue(new MockApiError('roles_read_error', 500));
+    renderWithUrl(WEEK_QS);
+    await screen.findByRole('table');
+    await waitFor(() => expect(apiFns.listRoles).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.queryByRole('combobox', { name: 'Agent' })).not.toBeInTheDocument(),
+    );
+    // Every call, every other filter, no error wall, and no retry loop.
+    expect(shownRefs()).toHaveLength(5);
+    expect(screen.getByRole('group', { name: 'Appointment' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Try again' })).not.toBeInTheDocument();
+    expect(screen.queryByText(/could not be loaded/)).not.toBeInTheDocument();
+    expect(apiFns.getPhoneCalendar).toHaveBeenCalledTimes(1);
+
+    // The calendar still works: a filter still narrows.
+    await userEvent.click(chip('Appointment', /^Missed/)!);
+    await waitFor(() => expect(shownRefs()).toEqual(['ATS-1002', 'ATS-2001']));
+  });
+
+  it('says why a deep-linked agent is not applied when the roles cannot be read', async () => {
+    apiFns.listRoles.mockRejectedValue(new MockApiError('roles_read_error', 500));
+    renderWithUrl(`${WEEK_QS}&agent=${ROLE_SALES}`);
+    expect(
+      await screen.findByText('Agents could not be loaded, so calls for every agent are shown.'),
+    ).toBeInTheDocument();
+    expect(shownRefs()).toHaveLength(5);
+    expect(screen.queryByRole('combobox', { name: 'Agent' })).not.toBeInTheDocument();
+  });
+
+  it('shows no picker to an operator who can see no role', async () => {
+    apiFns.listRoles.mockResolvedValue([]);
+    renderWithUrl(WEEK_QS);
+    await screen.findByRole('table');
+    await waitFor(() => expect(apiFns.listRoles).toHaveBeenCalledTimes(1));
+    await waitFor(() =>
+      expect(screen.queryByRole('combobox', { name: 'Agent' })).not.toBeInTheDocument(),
+    );
+    expect(shownRefs()).toHaveLength(5);
+  });
+
+  it('gives an interviewer the picker too — reading is not writing', async () => {
+    apiFns.getMe.mockResolvedValue(INTERVIEWER_ME);
+    renderWithUrl(WEEK_QS);
+    const select = await agentPicker();
+    await userEvent.selectOptions(select, 'Data Analyst');
+    await waitFor(() => expect(shownRefs()).toEqual(['ATS-2001', 'ATS-2002']));
+  });
+
+  it('never asks for roles on behalf of a viewer', async () => {
+    apiFns.getMe.mockResolvedValue(VIEWER_ME);
+    renderWithUrl(WEEK_QS);
+    expect(await screen.findByText('Not available to your role')).toBeInTheDocument();
+    await waitFor(() => expect(apiFns.getMe).toHaveBeenCalledTimes(1));
+    expect(apiFns.listRoles).not.toHaveBeenCalled();
   });
 });

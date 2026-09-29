@@ -425,7 +425,10 @@ export async function runPhoneDuePass(
   // ── THE HALT, FIRST, AND FAIL CLOSED ────────────────────────────────
   // A control row we cannot read is a stop, not a go. A candidate test gate
   // is the only narrowly-scoped exception, and it is valid only while the
-  // named global halt is the ordinary operator pause.
+  // named global halt is the ordinary operator pause. That test is sound only
+  // because 0110 makes `halt_reason` the MOST RESTRICTIVE reason raised while
+  // halted: before it, a legal hold raised during a pause left
+  // `operator_pause` on the row and this gate dialled straight through it.
   let testGate = null as Awaited<ReturnType<NonNullable<PhoneRuntimeReader['activeTestGate']>>>;
   try {
     testGate = deps.reader.activeTestGate

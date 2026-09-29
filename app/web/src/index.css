@@ -39,6 +39,13 @@
     --error-soft: #f7edf0;
     --info: #4e6ba6;
     --info-soft: #eaeef6;
+    /* "Go" green — the fill of the "Resume calling" button and nothing else.
+       Added at the owner's request of 2026-09-29 ("resume button must read as
+       green"): no approved token was green (`--success` is teal, hue ~193°,
+       and read as blue). A FILL for white text only: white on --go 5.23:1,
+       on --go-strong (hover/press) 6.14:1. Hue ~146°. */
+    --go: #2f7a4f;
+    --go-strong: #2a6e47;
     /* rgb triples for alpha-capable Tailwind tokens (same values as above). */
     --ink-rgb: 15 23 42;
     --ink-muted-rgb: 107 115 145;

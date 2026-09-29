@@ -636,3 +636,77 @@ describe('Ask Hello — the class list, where two of the three defects lived', (
     expect(rootBlock).not.toContain('.candidate-scope');
   });
 });
+
+/**
+ * THE SCOREBAR'S ASK HELLO wears the same pill, so it carries the same three
+ * risks — and this file only ever read `AskHelloButton.tsx`. The stylesheet
+ * maths above covers every `.ask-hello` element; what it cannot see is a
+ * utility in THIS component's class list, which is exactly where defects 1
+ * and 2 lived. So the class-list guards run here too.
+ */
+describe('Ask Hello — the Scorebar metric button (MetricAskHello)', () => {
+  const SOURCE = readFileSync(
+    path.resolve(HERE, '../components/mission-control/MetricAskHello.tsx'),
+    'utf8',
+  );
+  // Comments stripped for the reason given at `buttonClassName`.
+  const CODE = SOURCE.replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');
+
+  /**
+   * The `className={…}` expression of the `data-ask-hello` element, found by
+   * BRACE MATCHING rather than by a Prettier-depth delimiter: this component's
+   * expression is a template literal with a nested `${…}`, and throwing on a
+   * missing close is the same guard `buttonClassName` needed.
+   */
+  function metricClassName(): string {
+    const start = CODE.indexOf('data-ask-hello=""');
+    if (start < 0) throw new Error('could not find the metric Ask Hello button element');
+    const open = CODE.indexOf('className={', start);
+    if (open < 0) throw new Error('could not find the metric button className');
+    let depth = 0;
+    for (let i = open + 'className='.length; i < CODE.length; i += 1) {
+      if (CODE[i] === '{') depth += 1;
+      if (CODE[i] === '}') {
+        depth -= 1;
+        if (depth === 0) return CODE.slice(open, i + 1);
+      }
+    }
+    throw new Error('could not find the end of the metric button className');
+  }
+
+  /** Whole tokens, so `text-white/60` is not mistaken for `text-white`. */
+  function metricTokens(): string[] {
+    return metricClassName()
+      .split(/[\s`'"{}$?:()]+/)
+      .filter(Boolean);
+  }
+
+  it('finds the button and its className at all', () => {
+    const cls = metricClassName();
+    expect(cls).toContain('ask-hello');
+    expect(cls.length).toBeGreaterThan(80);
+  });
+
+  it('applies NO opacity utility anywhere in the component', () => {
+    expect(CODE).not.toMatch(/\bopacity-\d/);
+  });
+
+  it('keeps the white label, the app-scope ring and a visible focus ring', () => {
+    // `split` on `:` would cut `focus-visible:ring-info` in two, so the ring
+    // utilities are checked on the raw expression with a word boundary.
+    const cls = metricClassName();
+    expect(metricTokens()).toContain('text-white');
+    expect(cls).toMatch(/(?:^|\s)focus-visible:ring-info(?=\s|$|`|')/);
+    expect(cls).toMatch(/(?:^|\s)focus-visible:ring-2(?=\s|$|`|')/);
+    expect(cls).toMatch(/(?:^|\s)focus-visible:ring-offset-2(?=\s|$|`|')/);
+    expect(cls).not.toMatch(new RegExp('ring-' + '\\[var\\(--c-'));
+  });
+
+  it('carries NO ALPHA MODIFIER on the utilities the contrast figures assume', () => {
+    expect(CODE).not.toMatch(/(?:text-white|ring-info|ring-offset-white)\/\d/);
+  });
+
+  it('shows "unavailable" with the MEASURED idle fill, not a fade', () => {
+    expect(metricTokens()).toContain('ask-hello--idle');
+  });
+});

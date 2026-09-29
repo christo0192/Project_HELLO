@@ -77,6 +77,7 @@ import {
 } from "../components/talent";
 import type { StatusTone } from "../components/design/StatusBadge";
 import type { PipelineTone } from "../components/talent";
+import { roleAgentName } from "../lib/role-label";
 
 /**
  * Filter pill. Multi-select toggles, so these stay `button`s carrying
@@ -130,6 +131,24 @@ const RECOMMENDATION_BAR_TONE: Record<string, PipelineTone> = {
   hold: "caution",
   reject: "negative",
 };
+
+/**
+ * The agent screening this candidate's role — the operator-facing name, never
+ * spoken to the candidate. Sits immediately left of the Role column.
+ *
+ * ONE neutral marker for every "no agent to show" case: the candidate has no
+ * role, the role has no agent name, the roles request has not landed, or the
+ * role is not in the viewer's list. The Role column beside it already tells
+ * those states apart; repeating "No role" / "Unknown role" here would say the
+ * same thing twice in one row.
+ */
+function AgentCell({ role }: { role: Role | undefined }) {
+  const name = role ? roleAgentName(role) : null;
+  if (name) {
+    return <span className="text-[13px] text-[var(--c-ink)]">{name}</span>;
+  }
+  return <span className="text-[var(--c-ink-secondary)]">—</span>;
+}
 
 /**
  * The role a candidate's row belongs to.
@@ -240,7 +259,7 @@ export function CandidatesPage() {
    * "not loaded yet" from "role not in the list".
    *
    * Previously this was `[]` in both cases and the two fetches race: whenever
-   * candidates arrived first (or `listRoles` failed), `roleTitleById` was
+   * candidates arrived first (or `listRoles` failed), `roleById` was
    * empty and EVERY row rendered "Unknown role" — a positive claim that each
    * candidate's role had been deleted. Harmless while roles only fed a
    * dropdown; load-bearing now that a column asserts from it.
@@ -368,10 +387,10 @@ export function CandidatesPage() {
     [candidates],
   );
 
-  /** Role title by id, for the table's Role column. */
-  const roleTitleById = useMemo(() => {
-    const byId = new Map<string, string>();
-    for (const r of roles) byId.set(r.id, r.title);
+  /** Role by id, for the table's Agent and Role columns. */
+  const roleById = useMemo(() => {
+    const byId = new Map<string, Role>();
+    for (const r of roles) byId.set(r.id, r);
     return byId;
   }, [roles]);
 
@@ -670,6 +689,7 @@ export function CandidatesPage() {
               <THead>
                 <Tr>
                   <Th>Name</Th>
+                  <Th>Agent</Th>
                   <Th>Role</Th>
                   <Th>Skills</Th>
                   <Th>Exp.</Th>
@@ -683,6 +703,7 @@ export function CandidatesPage() {
               <TBody className="fade-up-stagger">
                 {page.items.map((c) => {
                   const next = candidateNextAction(c.status);
+                  const role = c.role_id ? roleById.get(c.role_id) : undefined;
                   return (
                     <Tr key={c.id}>
                       <Td>
@@ -695,6 +716,12 @@ export function CandidatesPage() {
                         {c.email && (
                           <p className="text-[13px] text-[var(--c-ink-secondary)]">{c.email}</p>
                         )}
+                      </Td>
+                      {/* The role's AGENT, left of the role itself. Looked up
+                          from the same roles list — no extra request — and
+                          "—" whenever there is no agent name to show. */}
+                      <Td>
+                        <AgentCell role={role} />
                       </Td>
                       {/* ONE role per row, because that is what the row IS.
 
@@ -712,7 +739,7 @@ export function CandidatesPage() {
                       <Td>
                         <RoleCell
                           roleId={c.role_id}
-                          title={c.role_id ? roleTitleById.get(c.role_id) : undefined}
+                          title={role?.title}
                           rolesLoaded={rolesLoaded}
                         />
                       </Td>

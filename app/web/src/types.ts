@@ -551,6 +551,22 @@ export interface ScorecardMetricUpdateInput {
   rubric?: ScorecardRubric;
 }
 
+/** Ask Hello on the Add-a-metric form: what the admin has typed so far. */
+export interface ScorecardMetricDraftInput {
+  name: string;
+  description: string | null;
+}
+
+/**
+ * Ask Hello's draft (POST /api/scorecards/metrics/draft). Already checked
+ * server-side against the create bounds; nothing is saved until the admin
+ * presses Create.
+ */
+export interface ScorecardMetricDraft {
+  default_instruction: string;
+  rubric: ScorecardRubric;
+}
+
 /** Immutable per-role metric snapshot (camelCase, as the role API returns it). */
 export interface RoleScorecardMetric {
   id: string;
@@ -1754,6 +1770,13 @@ export interface PhoneCalendarAppointment {
   updated_at: string;
   /** Null only on a torn read between the batched queries, never as a guess. */
   engagement_state: PhoneEngagementState | null;
+  /**
+   * The role (screening agent pipeline) this call belongs to — the
+   * engagement's role, stamped when its cycle opened, not the candidate's
+   * current one. A bare id: names come from `api.listRoles()`. Null on a torn
+   * read, or when the engagement carries no role.
+   */
+  role_id: string | null;
   candidate: PhoneCandidateRef | null;
 }
 
@@ -1933,4 +1956,81 @@ export interface PhoneVerificationInput {
 
 export interface PhoneVerificationResponse {
   ok: boolean;
+}
+
+// ── The phone admission kill switch (the operator halt) ─────────────────
+//
+// `GET /api/phone/health`, `POST /api/phone/halt` and
+// `POST /api/phone/halt/clear` (routes/phone.ts), typed from the OpenAPI
+// schemas `PhoneHealthResponse`, `PhoneAdmissionState`, `PhoneHaltBody`,
+// `PhoneHaltResponse` and `PhoneHaltClearResponse`.
+
+/**
+ * `set_phone_halt`'s reason allowlist (0042, and `PhoneHaltBody.reason`).
+ * `operator_pause` is the everyday pause an admin raises and lifts from
+ * Mission Control; the other four are incident stops cleared by runbook.
+ */
+export type PhoneHaltReason =
+  | 'operator_pause'
+  | 'provider_incident'
+  | 'cost_control'
+  | 'legal_hold'
+  | 'emergency_stop';
+
+/**
+ * The kill switch as the health surface reports it. A MISSING control
+ * singleton reads `control_present: false` and `halted: true` — the API fails
+ * closed and so must every reader. `halt_reason` is a plain string on the
+ * wire (the schema publishes no enum for it), so it is typed as one and
+ * narrowed where it is read rather than trusted to be a `PhoneHaltReason`.
+ */
+export interface PhoneAdmissionState {
+  control_present: boolean;
+  halted: boolean;
+  halt_reason: string | null;
+}
+
+/**
+ * The part of `GET /api/phone/health` this UI reads. The response carries
+ * more blocks (config, window, concurrency, backlog counts, runtime); they
+ * are left out rather than typed loosely. `admission` is null whenever the
+ * surface could not describe the switch: phone screening disabled, or the
+ * backlog unreadable.
+ */
+export interface PhoneHealthResponse {
+  ok: boolean;
+  enabled: boolean;
+  status: 'ok' | 'degraded' | 'disabled';
+  reasons: string[];
+  admission: PhoneAdmissionState | null;
+}
+
+/**
+ * Body of both halt routes. On `/halt/clear` the reason must NAME the halt
+ * currently in force, or the API answers 409 `halt_reason_mismatch`.
+ */
+export interface PhoneHaltInput {
+  reason: PhoneHaltReason;
+}
+
+export interface PhoneHaltResponse {
+  ok: boolean;
+  halted: boolean;
+  /**
+   * A halt was already in force. Since 0110 the reason in force is the MOST
+   * restrictive one requested (emergency_stop > legal_hold > provider_incident
+   * > cost_control > operator_pause); the original halt instant is kept.
+   */
+  already_halted: boolean;
+  /** The reason IN FORCE after the call (null only if the database did not report one). */
+  reason: string | null;
+  /** The reason this request asked for — differs from `reason` when a stronger halt was already in force. */
+  requested_reason?: string;
+}
+
+export interface PhoneHaltClearResponse {
+  ok: boolean;
+  halted: boolean;
+  was_halted: boolean;
+  previous_reason: string | null;
 }

@@ -400,9 +400,61 @@ describe('ScreeningKpis', () => {
     renderKpis();
     await waitFor(() => expect(getScreeningFunnel).toHaveBeenCalled());
 
-    fireEvent.change(await screen.findByRole('combobox'), { target: { value: 'role-1' } });
+    fireEvent.change(await screen.findByRole('combobox', { name: 'Filter by agent' }), {
+      target: { value: 'role-1' },
+    });
     await waitFor(() => expect(getScreeningFunnel).toHaveBeenCalledTimes(2));
     expect(getScreeningFunnel.mock.calls[1][0].role_id).toBe('role-1');
+  });
+
+  it('names the filter by AGENT: "All agents", then each agent name, labelled for assistive tech', async () => {
+    listRoles.mockResolvedValue([
+      { id: 'r1', title: 'Sales Program Advisor', agent_name: '  Gopu ' },
+      { id: 'r2', title: 'Customer Support', agent_name: 'Meera' },
+    ]);
+    renderKpis();
+    const select = await screen.findByRole('combobox', { name: 'Filter by agent' });
+    const options = Array.from((select as HTMLSelectElement).options);
+    expect(options.map((o) => o.textContent)).toEqual(['All agents', 'Gopu', 'Meera']);
+    // Display only: the values are still the role ids the endpoint filters on.
+    expect(options.map((o) => o.value)).toEqual(['', 'r1', 'r2']);
+    expect(screen.queryByText('All roles')).not.toBeInTheDocument();
+    // The job titles are not in the picker at all.
+    expect(screen.queryByRole('option', { name: /Sales Program Advisor/ })).not.toBeInTheDocument();
+  });
+
+  it('falls back to the TITLE for a role with no agent name, and tells duplicates apart', async () => {
+    // Production today: two roles titled "Sales Program Advisor", neither with
+    // an agent name. Two identical options meaning different things is a
+    // picker nobody can use correctly. A shared AGENT name says which role;
+    // a shared bare title can only be numbered, after a middle dot.
+    listRoles.mockResolvedValue([
+      { id: 'r1', title: 'Sales Program Advisor', agent_name: null },
+      { id: 'r2', title: 'Sales Program Advisor' },
+      { id: 'r3', title: 'Support', agent_name: '   ' },
+      { id: 'r4', title: 'Ops', agent_name: 'Gopu' },
+      { id: 'r5', title: 'Finance', agent_name: 'Gopu' },
+    ]);
+    renderKpis();
+    const select = (await screen.findByRole('combobox', {
+      name: 'Filter by agent',
+    })) as HTMLSelectElement;
+    const options = Array.from(select.options);
+    expect(options.map((o) => o.textContent)).toEqual([
+      'All agents',
+      'Sales Program Advisor',
+      'Sales Program Advisor · 2',
+      'Support',
+      'Gopu (Ops)',
+      'Gopu (Finance)',
+    ]);
+    expect(options.map((o) => o.value)).toEqual(['', 'r1', 'r2', 'r3', 'r4', 'r5']);
+
+    // Picking the SECOND duplicate filters on the second role, not the first.
+    await waitFor(() => expect(getScreeningFunnel).toHaveBeenCalled());
+    fireEvent.change(select, { target: { value: 'r2' } });
+    await waitFor(() => expect(getScreeningFunnel).toHaveBeenCalledTimes(2));
+    expect(getScreeningFunnel.mock.calls[1][0].role_id).toBe('r2');
   });
 
   it('groups each band for assistive tech, not just visually', async () => {

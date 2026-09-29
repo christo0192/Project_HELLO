@@ -106,7 +106,7 @@ node scripts/phone-canary/canary0.test.mjs
 | `disconnect_then_reconnect_same_session` | a mid-call drop grants exactly one reconnect; 120 s later the reconnect is admitted, lands back in `in_call`, resumes the **same session at the same cursor**, and `reconnects_used` is **not** refilled. |
 | `three_no_answer_ist_days_then_terminal` | three no-answers across three distinct IST days (rolled by the production sweep) exhaust the budget into `abandoned_no_answer`; a fourth admission is refused `engagement_terminal`; and a second cold call on one IST day is refused. |
 | `appointment_lifecycle` | book, supersede under `p_expected_version` (`version_conflict`), fulfil at the dial, expire into `missed` and back to `eligible`; plus the shape refusals. |
-| `halt_admission_fail_closed` | halt refuses admission; a second halt preserves the **original** reason; clearing restores service; and a **missing control singleton** reads as halted everywhere — admission, `phone_backlog`, and `clear_phone_halt`, which refuses to invent a cleared row. |
+| `halt_admission_fail_closed` | halt refuses admission; a second, **stronger** halt escalates the reason in force while keeping the **original** instant, and a weaker one changes nothing (§5, precedence); clearing restores service; and a **missing control singleton** reads as halted everywhere — admission, `phone_backlog`, and `clear_phone_halt`, which refuses to invent a cleared row. |
 | `attempt_lease_heartbeat_and_reclaim` | the heartbeat extends the lease **beyond** its original end; a stale dispatch epoch is still accepted (the `>=` fence) and a future one is not; an un-renewed lease is reclaimed to `abandoned` **charging no budget**; a post-reclaim heartbeat answers `lease_lost`. |
 | `cross_engagement_candidate_guard` | one candidate with two engagements: guard A refuses a second call while one is in flight, guard B refuses a second cold call the same IST day, and the next IST day is admitted — a pace, not a latch. |
 | `halt_race` (runner-driven) | a halt raised **while an admission is already blocked on the admission lock** still refuses that admission, and no attempt row is written. |
@@ -192,6 +192,54 @@ node scripts/phone-canary/halt-drill.mjs clear --expect-reason operator_pause --
 Reasons: `operator_pause`, `provider_incident`, `cost_control`, `legal_hold`,
 `emergency_stop` — the five `0042` allows, drift-checked against the migration.
 
+### Reason precedence (0110)
+
+A halt carries **one** reason, and since `0110` it is the **most restrictive**
+reason raised while the halt has been in force — not the first one:
+
+```text
+emergency_stop  >  legal_hold  >  provider_incident  >  cost_control  >  operator_pause
+```
+
+| `set_phone_halt` while halted with… | requested | reason in force after | `reason_escalated` | `halt_actor_id` |
+|---|---|---|---|---|
+| `operator_pause` | `legal_hold` | `legal_hold` | `true` | the escalating actor |
+| `legal_hold` | `operator_pause` | `legal_hold` | `false` | unchanged |
+| `cost_control` | `provider_incident` | `provider_incident` | `true` | the escalating actor |
+| `provider_incident` | `cost_control` | `provider_incident` | `false` | unchanged |
+| anything | `emergency_stop` | `emergency_stop` | `true` unless already `emergency_stop` | the escalating actor |
+| any reason | the same reason | unchanged | `false` | unchanged |
+
+* **`halted_at` never moves** while a halt is in force, so "how long has dialing
+  been frozen" still measures the real outage.
+* An escalation re-attributes the halt to the escalating actor (the system actor
+  when none is given, exactly as an anonymous halt is attributed). A weaker or
+  equal request changes nothing on the row.
+* Not halted → the requested reason is recorded, exactly as before `0110`.
+* The RPC returns `{status, already_halted, halt_reason, reason_escalated}`,
+  where `halt_reason` is the reason **in force after the call**. Its own
+  `audit_events` row keeps `reason` = the requested reason and adds
+  `previous_reason`, `reason_in_force` and `reason_escalated`.
+* `POST /api/phone/halt` answers `reason` = the reason **in force** (from the
+  RPC, `null` only if the database predates `0110`) and `requested_reason` = what
+  was asked. A pause requested during a legal hold answers `reason: legal_hold`.
+
+**Why it matters.** Before `0110` the first reason stuck: a `legal_hold` raised
+during an `operator_pause` reached `audit_events` and nowhere else, the control
+row still said `operator_pause`, and Mission Control's **Resume calling**
+button — offered only while the reason in force is `operator_pause` — lifted
+the legal hold with the pause. Now the row says `legal_hold`, Resume is not
+offered, and `/halt/clear` with `operator_pause` answers `409
+halt_reason_mismatch`. Clearing still lifts the **whole** halt, so clear a
+stronger stop only when **every** reason raised during it is resolved.
+
+**The owner-test gate** bypasses only `operator_pause`
+([`phone-owner-test-gate.md`](phone-owner-test-gate.md)). Because a stronger
+reason now replaces the pause on the row, a stop raised *after* the pause also
+refuses the gate — `arm_phone_test_gate` answers `test_gate_halt_not_permitted`
+and an already-armed gate cannot dial (`admit_phone_test_attempt` and the due
+pass read the same column).
+
 ### Production mode
 
 ```bash
@@ -221,7 +269,17 @@ own `audit_events` rows.
 protects it with a row lock. So the precondition is the `(halted, reason)` pair
 read immediately before acting, and for `clear` the server enforces the same
 thing (`halt_reason_mismatch`). It is a check against carelessness and it is
-time-of-check-to-time-of-use; the exposure is bounded in the safe direction.
+time-of-check-to-time-of-use. For `halt` the exposure is bounded in the safe
+direction — since `0110` a halt can only escalate. For `clear` it is **not**: a
+stronger halt that lands in the one round trip between the read and
+`clear_phone_halt` is lifted with the reason you named. After any clear,
+`probe` again and confirm nobody raised a stop in that window.
+
+`halt` prints `requested_reason` and `halt_reason_in_force` (production: the
+API's `requested_reason` and `reason`; local: the control row after the call),
+and locally also `reason_escalated`. If the reason in force is not the one you
+asked for, a stronger halt was already up — clearing requires naming **that**
+reason.
 
 **This mode has never been executed against production and must not be until
 TEL-07's dual-control approval exists.**
@@ -364,6 +422,11 @@ no gap list.
 * **`appointment_exists` shadows every slot-shape refusal**, so shape probes
   need their own engagement.
 * **The halt drill's "expected version" is not a lock** — see §5.
+* **A clear can lift an escalation it never saw.** `clear_phone_halt` takes no
+  expected reason, so a stronger halt raised in the one round trip between
+  `/halt/clear`'s control read and the clear is lifted too. Closing it needs a
+  compare-and-clear in SQL (a `clear_phone_halt` signature change). Probe after
+  every clear.
 * **Production halt mode is untested against production**, by constraint.
 * **No leader election.** `claim_phone_sweep` is a claim and can lapse while its
   holder works; every sweep behind it is idempotent, which is what makes that

@@ -9,7 +9,7 @@
  *   - Keyboard and focus management
  */
 
-import { render, screen, waitFor, act } from '@testing-library/react';
+import { render, screen, waitFor, act, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { RolesPage } from './RolesPage';
@@ -48,6 +48,11 @@ const mockApi = {
   cancelRoleDraft: vi.fn(),
   rephraseQuestion: vi.fn(),
   deleteRole: vi.fn(),
+  // The Scorebar drawer's metric library (admin only).
+  draftMetricRubric: vi.fn(),
+  createScorecardMetric: vi.fn(),
+  updateScorecardMetric: vi.fn(),
+  archiveScorecardMetric: vi.fn(),
 };
 
 vi.mock('../api', () => ({
@@ -64,6 +69,10 @@ vi.mock('../api', () => ({
     cancelRoleDraft: (...args: any[]) => mockApi.cancelRoleDraft(...args),
     rephraseQuestion: (...args: any[]) => mockApi.rephraseQuestion(...args),
     deleteRole: (...args: any[]) => mockApi.deleteRole(...args),
+    draftMetricRubric: (...args: any[]) => mockApi.draftMetricRubric(...args),
+    createScorecardMetric: (...args: any[]) => mockApi.createScorecardMetric(...args),
+    updateScorecardMetric: (...args: any[]) => mockApi.updateScorecardMetric(...args),
+    archiveScorecardMetric: (...args: any[]) => mockApi.archiveScorecardMetric(...args),
   },
   ApiError: class extends Error {
     status: number;
@@ -405,12 +414,63 @@ describe('RolesPage', () => {
     );
   });
 
-  it('shows the AGENT NAME on the role card — a write-only field is uncheckable', async () => {
-    mockApi.listRoles.mockResolvedValue([{ ...mockRole, agent_name: 'Gopu' }]);
+  it('leads the role card with the AGENT NAME, and puts the job underneath', async () => {
+    // Owner request: agent on top, role name below — the two swapped.
+    mockApi.listRoles.mockResolvedValue([{ ...mockRole, agent_name: '  Gopu  ' }]);
     render(<RolesPage />);
-    await waitFor(() =>
-      expect(document.querySelector('[data-role-agent-name]')?.textContent).toContain('Gopu'),
-    );
+    const heading = await screen.findByRole('heading', { level: 2, name: 'Gopu' });
+    expect(heading).toBeInTheDocument();
+    // The job title is no longer a heading of its own...
+    expect(
+      screen.queryByRole('heading', { level: 2, name: mockRole.title }),
+    ).not.toBeInTheDocument();
+    // ...it is the secondary line, labelled so nobody mistakes it for the agent.
+    const secondary = document.querySelector('[data-role-title-secondary]');
+    expect(secondary?.textContent).toBe(`Role: ${mockRole.title}`);
+    // Sits in the same block as the heading, directly below it.
+    expect(heading.nextElementSibling).toBe(secondary);
+    // The old "Agent: …" line is gone, not shown twice.
+    expect(screen.queryByText(/^Agent:/)).not.toBeInTheDocument();
+  });
+
+  it('lets a TRUNCATED card heading be read in full — the title carries all of it', async () => {
+    // Both lines are `truncate`d; an 80-character agent name ends in an
+    // ellipsis with no other way to see the rest.
+    const longAgent = 'A'.repeat(40) + ' screening agent for the enterprise sales team!';
+    const longTitle = 'Senior Enterprise Account Executive, Strategic Accounts (EMEA and APAC)';
+    mockApi.listRoles.mockResolvedValue([{ ...mockRole, title: longTitle, agent_name: `  ${longAgent} ` }]);
+    render(<RolesPage />);
+    const heading = await screen.findByRole('heading', { level: 2, name: longAgent });
+    expect(heading).toHaveClass('truncate');
+    expect(heading).toHaveAttribute('title', longAgent);
+    // The accessible name is still the (untruncated) content, unchanged.
+    expect(heading).toHaveAccessibleName(longAgent);
+
+    const secondary = document.querySelector('[data-role-title-secondary]') as HTMLElement;
+    expect(secondary).toHaveClass('truncate');
+    expect(secondary).toHaveAttribute('title', `Role: ${longTitle}`);
+  });
+
+  it('titles a title-only heading with the job title', async () => {
+    mockApi.listRoles.mockResolvedValue([{ ...mockRole, agent_name: null }]);
+    render(<RolesPage />);
+    const heading = await screen.findByRole('heading', { level: 2, name: mockRole.title });
+    expect(heading).toHaveAttribute('title', mockRole.title);
+  });
+
+  it.each([
+    ['no agent name', undefined],
+    ['a null agent name', null],
+    ['a blank agent name', '   '],
+  ])('falls back to the job TITLE as the heading for %s, without repeating it', async (_label, agent_name) => {
+    mockApi.listRoles.mockResolvedValue([{ ...mockRole, agent_name }]);
+    render(<RolesPage />);
+    expect(
+      await screen.findByRole('heading', { level: 2, name: mockRole.title }),
+    ).toBeInTheDocument();
+    // The heading already IS the job; a "Role: …" line under it would say it twice.
+    expect(document.querySelector('[data-role-title-secondary]')).toBeNull();
+    expect(screen.queryByText(/^Role:/)).not.toBeInTheDocument();
   });
 
   it('new role form validates required job role', async () => {
@@ -837,6 +897,22 @@ describe('Removing a role', () => {
       await screen.findByRole('button', { name: `Delete role ${mockRole.title}` }),
     ).toBeInTheDocument();
   });
+
+  it('names the AGENT first when the card leads with one — the name a screen reader hears matches the heading', async () => {
+    mockApi.listRoles.mockResolvedValue([{ ...mockRole, agent_name: 'Gopu' }]);
+    render(<RolesPage />);
+    const button = await screen.findByRole('button', {
+      name: `Delete role Gopu (${mockRole.title})`,
+    });
+    await userEvent.click(button);
+    // The confirm and the outcome note name the same card the same way.
+    expect(window.confirm).toHaveBeenCalledWith(
+      expect.stringContaining(`Remove "Gopu (${mockRole.title})"?`),
+    );
+    expect(
+      await screen.findByText(`"Gopu (${mockRole.title})" was deleted.`),
+    ).toBeInTheDocument();
+  });
 });
 
 describe('The screening call is shown in compartments', () => {
@@ -1054,6 +1130,59 @@ describe('Scorebar — the metric library moved here from Mission Control', () =
 
     expect(screen.queryByRole('button', { name: 'New role' })).toBeNull();
     expect(trigger()).toBeInTheDocument();
+  });
+
+  it("a dialog ON TOP of the drawer keeps Escape and Tab to itself — the drawer and the admin's typing survive", async () => {
+    // The Scorebar is a SlideOver; Ask Hello's "Replace what you've written?"
+    // is a Dialog portalled on top of it. Both listen for keys on the
+    // document. Before the modal stack, one Escape closed BOTH — unmounting
+    // the create form and losing the metric being typed — and the two Tab
+    // traps pinned focus to the dialog's first control, so "Replace with
+    // Hello's draft" could not be reached by keyboard at all.
+    mockAuth = { role: 'admin' };
+    mockApi.listRoles.mockResolvedValue([mockRole]);
+    mockApi.listScorecardMetrics.mockResolvedValue([]);
+    render(<RolesPage />);
+
+    await userEvent.click(await screen.findByRole('button', { name: 'Scorebar' }));
+    const drawer = await screen.findByRole('dialog', { name: 'Scorebar' });
+    await within(drawer).findByText('Add a metric');
+    await userEvent.type(within(drawer).getByLabelText('Name'), 'Ownership');
+    await userEvent.type(within(drawer).getByLabelText('Scoring instruction'), 'My own instruction.');
+    await userEvent.type(within(drawer).getByLabelText('1 · Poor'), 'No example.');
+
+    // Existing text, so Ask Hello asks before replacing it.
+    await userEvent.click(within(drawer).getByRole('button', { name: /^Ask Hello/ }));
+    const confirm = await screen.findByRole('dialog', { name: "Replace what you've written?" });
+    expect(confirm).toHaveFocus();
+
+    // Tab walks the dialog's own controls, all the way to the one that matters.
+    await userEvent.tab();
+    expect(within(confirm).getByRole('button', { name: 'Close' })).toHaveFocus();
+    await userEvent.tab();
+    expect(within(confirm).getByRole('button', { name: 'Keep my text' })).toHaveFocus();
+    await userEvent.tab();
+    expect(
+      within(confirm).getByRole('button', { name: "Replace with Hello's draft" }),
+    ).toHaveFocus();
+
+    // Escape closes ONLY the dialog.
+    await userEvent.keyboard('{Escape}');
+    expect(
+      screen.queryByRole('dialog', { name: "Replace what you've written?" }),
+    ).not.toBeInTheDocument();
+    const stillOpen = screen.getByRole('dialog', { name: 'Scorebar' });
+    expect(within(stillOpen).getByLabelText('Name')).toHaveValue('Ownership');
+    expect(within(stillOpen).getByLabelText('Scoring instruction')).toHaveValue('My own instruction.');
+    expect(within(stillOpen).getByLabelText('1 · Poor')).toHaveValue('No example.');
+    expect(mockApi.draftMetricRubric).not.toHaveBeenCalled();
+    // Focus is back on the button that opened the dialog, inside the drawer.
+    expect(within(stillOpen).getByRole('button', { name: /^Ask Hello/ })).toHaveFocus();
+
+    // And the drawer has Escape back once the dialog is gone.
+    await userEvent.keyboard('{Escape}');
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Scorebar' })).toHaveFocus();
   });
 
   it('does NOT mount the metric library until the drawer is opened', async () => {

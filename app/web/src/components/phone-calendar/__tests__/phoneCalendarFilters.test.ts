@@ -14,10 +14,20 @@ import {
   hasActivePhoneFilters,
   matchesPhoneFilters,
   parsePhoneCalendarFilters,
+  phoneAgentOptions,
   phoneFacets,
+  resolvePhoneAgentFilter,
   togglePhoneFacet,
 } from '../phoneCalendarFilters';
-import { appointment } from './phoneFixtures';
+import {
+  PHONE_ROLES,
+  ROLE_DATA,
+  ROLE_DATA_TWIN,
+  ROLE_SALES,
+  ROLE_UNKNOWN,
+  appointment,
+  role,
+} from './phoneFixtures';
 
 const TODAY = '2026-08-26'; // a Wednesday
 const MONDAY = '2026-08-24';
@@ -33,6 +43,7 @@ describe('parsing', () => {
     expect(f.view).toBe('week');
     expect(f.statuses).toEqual([]);
     expect(f.states).toEqual([]);
+    expect(f.agent).toBeNull();
   });
 
   it('normalizes any day of a week to that week s Monday', () => {
@@ -65,9 +76,45 @@ describe('parsing', () => {
   });
 });
 
+describe('the agent parameter', () => {
+  it('reads a role id', () => {
+    expect(parse(`agent=${ROLE_SALES}`).agent).toBe(ROLE_SALES);
+  });
+
+  it('normalizes case and surrounding space, so one role has one URL', () => {
+    expect(parse(`agent=${encodeURIComponent(` ${ROLE_SALES.toUpperCase()} `)}`).agent)
+      .toBe(ROLE_SALES);
+  });
+
+  it('drops anything that is not the SHAPE of a role id — never echoed as free text', () => {
+    // "All agents", not a filter matching nothing: a mistyped link shows the week.
+    for (const bad of [
+      'nonsense',
+      'Sales Advisor',
+      '<script>alert(1)</script>',
+      `${ROLE_SALES}x`,
+      ROLE_SALES.slice(0, -1),
+      `${ROLE_SALES},${ROLE_DATA}`,
+      '',
+    ]) {
+      const f = parse(`agent=${encodeURIComponent(bad)}`);
+      expect(f.agent, bad).toBeNull();
+      expect(buildPhoneCalendarSearch(f).has('agent'), bad).toBe(false);
+    }
+  });
+
+  it('is written back when set and omitted when it is "All agents"', () => {
+    expect(buildPhoneCalendarSearch(parse(`agent=${ROLE_DATA}`)).get('agent')).toBe(ROLE_DATA);
+    expect(buildPhoneCalendarSearch(parse('')).has('agent')).toBe(false);
+  });
+});
+
 describe('building', () => {
   it('round-trips through the URL', () => {
-    const f = parse('week=2026-08-24&view=queue&status=scheduled,missed&state=eligible');
+    const f = parse(
+      `week=2026-08-24&view=queue&agent=${ROLE_DATA}&status=scheduled,missed&state=eligible`,
+    );
+    expect(f.agent).toBe(ROLE_DATA);
     const qs = buildPhoneCalendarSearch(f).toString();
     expect(parsePhoneCalendarFilters(new URLSearchParams(qs), TODAY)).toEqual(f);
   });
@@ -95,6 +142,25 @@ describe('matching', () => {
     expect(matchesPhoneFilters(appt, parse('state=failed'))).toBe(true);
     expect(matchesPhoneFilters(appt, parse('state=eligible'))).toBe(false);
     expect(matchesPhoneFilters(appt, parse('status=missed&state=eligible'))).toBe(false);
+  });
+
+  it('filters on the call s agent (role) pipeline', () => {
+    const sales = appointment({ role_id: ROLE_SALES });
+    expect(matchesPhoneFilters(sales, parse(`agent=${ROLE_SALES}`))).toBe(true);
+    expect(matchesPhoneFilters(sales, parse(`agent=${ROLE_DATA}`))).toBe(false);
+    // And it composes with the other dimensions rather than replacing them.
+    const missedSales = appointment({ role_id: ROLE_SALES, status: 'missed' });
+    expect(matchesPhoneFilters(missedSales, parse(`agent=${ROLE_SALES}&status=missed`))).toBe(true);
+    expect(matchesPhoneFilters(missedSales, parse(`agent=${ROLE_SALES}&status=scheduled`)))
+      .toBe(false);
+  });
+
+  it('never lets a row with no role satisfy an agent filter', () => {
+    // A torn read, or an engagement with no role: claiming a match would name
+    // a pipeline the API did not report. "All agents" still shows it.
+    const roleless = appointment({ role_id: null });
+    expect(matchesPhoneFilters(roleless, parse(`agent=${ROLE_SALES}`))).toBe(false);
+    expect(matchesPhoneFilters(roleless, parse(''))).toBe(true);
   });
 
   it('never lets a torn read satisfy a state filter', () => {
@@ -150,6 +216,36 @@ describe('facets', () => {
     expect(narrowed.find((f) => f.value === 'scheduled')).toBeUndefined();
   });
 
+  it('counts every facet within the selected agent only', () => {
+    // The chips must describe what is on screen: with an agent selected,
+    // "Missed 1" means one missed call FOR THAT AGENT, not for the week.
+    const mixed = [
+      appointment({ id: 's1', role_id: ROLE_SALES, status: 'scheduled', engagement_state: 'scheduled' }),
+      appointment({ id: 's2', role_id: ROLE_SALES, status: 'missed', engagement_state: 'failed' }),
+      appointment({ id: 'd1', role_id: ROLE_DATA, status: 'missed', engagement_state: 'failed' }),
+      appointment({ id: 'd2', role_id: ROLE_DATA, status: 'missed', engagement_state: 'failed' }),
+      appointment({ id: 'd3', role_id: ROLE_DATA, status: 'fulfilled', engagement_state: 'completed' }),
+    ];
+    const all = phoneFacets(mixed, PHONE_STATUS_ORDER, 'status', parse(''));
+    expect(all.find((f) => f.value === 'missed')?.count).toBe(3);
+
+    const sales = parse(`agent=${ROLE_SALES}`);
+    const statuses = phoneFacets(mixed, PHONE_STATUS_ORDER, 'status', sales);
+    expect(statuses.map((f) => [f.value, f.count])).toEqual([['scheduled', 1], ['missed', 1]]);
+    const states = phoneFacets(mixed, PHONE_STATE_ORDER, 'state', sales);
+    expect(states.map((f) => [f.value, f.count])).toEqual([['scheduled', 1], ['failed', 1]]);
+
+    // A status chip's count still ignores the status selection itself, but
+    // never the agent.
+    const both = phoneFacets(
+      mixed,
+      PHONE_STATUS_ORDER,
+      'status',
+      parse(`agent=${ROLE_DATA}&status=missed`),
+    );
+    expect(both.map((f) => [f.value, f.count])).toEqual([['fulfilled', 1], ['missed', 2]]);
+  });
+
   it('excludes torn reads from state counts', () => {
     const withTorn = [...rows, appointment({ id: 'd', engagement_state: null })];
     const facets = phoneFacets(withTorn, PHONE_STATE_ORDER, 'state', parse(''));
@@ -160,10 +256,11 @@ describe('facets', () => {
 
 describe('toggling', () => {
   it('adds and removes a value while preserving every other dimension', () => {
-    const base = parse('week=2026-08-24&view=queue&state=eligible');
+    const base = parse(`week=2026-08-24&view=queue&agent=${ROLE_SALES}&state=eligible`);
     const on = togglePhoneFacet(base, 'status', 'missed');
     expect(on.statuses).toEqual(['missed']);
     expect(on.states).toEqual(['eligible']);
+    expect(on.agent).toBe(ROLE_SALES);
     expect(on.view).toBe('queue');
     expect(on.weekStart).toBe(MONDAY);
 
@@ -185,5 +282,74 @@ describe('hasActivePhoneFilters', () => {
     expect(hasActivePhoneFilters(parse('week=2026-08-24&view=queue'))).toBe(false);
     expect(hasActivePhoneFilters(parse('status=missed'))).toBe(true);
     expect(hasActivePhoneFilters(parse('state=eligible'))).toBe(true);
+    expect(hasActivePhoneFilters(parse(`agent=${ROLE_SALES}`))).toBe(true);
+  });
+});
+
+describe('resolving the agent against the roles the operator can see', () => {
+  const KNOWN: ReadonlySet<string> = new Set([ROLE_SALES, ROLE_DATA]);
+
+  it('keeps an agent that names a visible role', () => {
+    const f = parse(`agent=${ROLE_SALES}&status=missed`);
+    expect(resolvePhoneAgentFilter(f, KNOWN)).toEqual(f);
+  });
+
+  it('falls back to "All agents" for a well-formed id that names no visible role', () => {
+    // A stale link, or one sent by an admin to an interviewer who does not
+    // own that role: the week, not an empty grid with no visible cause.
+    const f = parse(`agent=${ROLE_UNKNOWN}&status=missed`);
+    const resolved = resolvePhoneAgentFilter(f, KNOWN);
+    expect(resolved.agent).toBeNull();
+    // Only the agent is dropped.
+    expect(resolved.statuses).toEqual(['missed']);
+    expect(resolved.weekStart).toBe(MONDAY);
+  });
+
+  it('drops the agent when the roles could not be read, because there is no picker', () => {
+    const f = parse(`agent=${ROLE_SALES}`);
+    expect(resolvePhoneAgentFilter(f, 'unavailable').agent).toBeNull();
+  });
+
+  it('keeps the requested agent while the roles are still loading', () => {
+    const f = parse(`agent=${ROLE_UNKNOWN}`);
+    expect(resolvePhoneAgentFilter(f, 'loading').agent).toBe(ROLE_UNKNOWN);
+  });
+
+  it('leaves "All agents" alone whatever the roster says', () => {
+    for (const roster of ['loading', 'unavailable', KNOWN] as const) {
+      expect(resolvePhoneAgentFilter(parse(''), roster).agent).toBeNull();
+    }
+  });
+});
+
+describe('agent picker options', () => {
+  it('labels by agent name, falls back to the title, and tells duplicates apart', () => {
+    const options = phoneAgentOptions(PHONE_ROLES);
+    expect(options).toEqual([
+      { id: ROLE_DATA, label: 'Data Analyst' },
+      // Same title, blank agent name: never two identical options.
+      { id: ROLE_DATA_TWIN, label: 'Data Analyst · 2' },
+      // The agent name wins over the title `Sales Advisor`.
+      { id: ROLE_SALES, label: 'Zara' },
+    ]);
+  });
+
+  it('sorts by the label the operator reads, not by API order', () => {
+    const options = phoneAgentOptions([
+      role({ id: 'r-3', title: 'zeta role' }),
+      role({ id: 'r-1', title: 'Beta role' }),
+      role({ id: 'r-2', title: 'alpha role', agent_name: 'Agent 10' }),
+      role({ id: 'r-4', title: 'x', agent_name: 'Agent 9' }),
+    ]);
+    expect(options.map((o) => o.label)).toEqual([
+      'Agent 9',
+      'Agent 10',
+      'Beta role',
+      'zeta role',
+    ]);
+  });
+
+  it('offers nothing for an operator who can see no role', () => {
+    expect(phoneAgentOptions([])).toEqual([]);
   });
 });

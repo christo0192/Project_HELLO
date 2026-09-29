@@ -3,10 +3,12 @@
  *
  * Covers: non-admin truthful gate with ZERO admin API calls, admin renders
  * the six sections, lazy section mounting (unvisited sections never fetch),
- * keyboard subnav, dark + reduced-motion render, axe, and the Ashby Mission
- * Control navigation card.
+ * keyboard subnav, dark + reduced-motion render, axe, and the header: the
+ * operator halt control, which replaced the Ashby Mission Control and Phone
+ * calendar quick links (both now live in the sidebar only). The control's own
+ * behaviour is covered in mission-control/__tests__/OperatorHaltControl.test.
  */
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import type { ReactNode } from 'react';
 import { readFileSync } from 'node:fs';
@@ -20,6 +22,13 @@ import { MissionControlPage } from './MissionControlPage';
 vi.mock('../api', () => ({
   api: missionApi.api,
   ApiError: missionApi.ApiError,
+}));
+
+// The halt control re-checks the role itself (defence in depth), through the
+// auth context the real app provides.
+const authState = vi.hoisted(() => ({ role: 'admin' as 'admin' | 'interviewer' | 'viewer' | null }));
+vi.mock('../lib/auth', () => ({
+  useAuth: () => ({ role: authState.role }),
 }));
 
 const ADMIN_ME = {
@@ -40,6 +49,22 @@ const OK_STATUS = {
   status: 'ok' as const,
   maintenance: { enabled: false, reason: null, updated_at: null },
   updated_at: '2026-01-01T00:00:00Z',
+};
+
+/** `GET /api/phone/health` with the switch readable and calling live. */
+const LIVE_HEALTH = {
+  ok: true,
+  enabled: true,
+  status: 'ok' as const,
+  reasons: [],
+  admission: { control_present: true, halted: false, halt_reason: null },
+};
+
+const PAUSED_HEALTH = {
+  ...LIVE_HEALTH,
+  status: 'degraded' as const,
+  reasons: ['admission_halted'],
+  admission: { control_present: true, halted: true, halt_reason: 'operator_pause' },
 };
 
 function wrap(ui: ReactNode) {
@@ -65,6 +90,8 @@ describe('MissionControlPage', () => {
     apiFns.listAdminAllowlist.mockResolvedValue({ entries: [] });
     apiFns.listAdminQuotas.mockResolvedValue({ policies: [] });
     apiFns.listAdminAudit.mockResolvedValue({ audit: [] });
+    apiFns.getPhoneHealth.mockResolvedValue(LIVE_HEALTH);
+    authState.role = 'admin';
   });
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -99,6 +126,11 @@ describe('MissionControlPage', () => {
     expect(apiFns.listAdminAudit).not.toHaveBeenCalled();
     expect(apiFns.toggleMaintenance).not.toHaveBeenCalled();
     expect(apiFns.overrideSession).not.toHaveBeenCalled();
+    // Nor the operator halt: no read of the switch, no way to move it.
+    expect(apiFns.getPhoneHealth).not.toHaveBeenCalled();
+    expect(apiFns.setPhoneHalt).not.toHaveBeenCalled();
+    expect(apiFns.clearPhoneHalt).not.toHaveBeenCalled();
+    expect(screen.queryByText('Checking calling status…')).not.toBeInTheDocument();
   });
 
   it('renders all six Mission Control sections in the sub-navigation', async () => {
@@ -168,6 +200,7 @@ describe('MissionControlPage', () => {
     forceDarkMode();
     const { container } = renderPage();
     await screen.findByRole('tablist', { name: 'Mission Control sections' });
+    await screen.findByRole('button', { name: 'Halt all calling' });
     expect(screen.getByRole('tab', { name: 'Overview' })).toBeInTheDocument();
     await expect(container).toHaveNoViolations();
   });
@@ -175,6 +208,14 @@ describe('MissionControlPage', () => {
   it('has no axe violations in light mode', async () => {
     const { container } = renderPage();
     await screen.findByRole('tablist', { name: 'Mission Control sections' });
+    await screen.findByRole('button', { name: 'Halt all calling' });
+    await expect(container).toHaveNoViolations();
+  });
+
+  it('has no axe violations with the halt confirmation open', async () => {
+    const { container } = renderPage();
+    fireEvent.click(await screen.findByRole('button', { name: 'Halt all calling' }));
+    await screen.findByRole('dialog', { name: 'Halt all calling?' });
     await expect(container).toHaveNoViolations();
   });
 });
@@ -186,22 +227,27 @@ function withinTablist(tablist: HTMLElement, label: string) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Ashby Mission Control navigation card
+// The header: operator halt in, quick links out
 //
-// The destination route existed but nothing linked to it — the only way in
-// was to type the URL. These pin the link's semantics, its exact internal
-// target, and that adding it disturbed nothing else on the page.
+// The two quick links (Ashby Mission Control, Phone calendar) were removed
+// from the header; both destinations are in the sidebar's Operations group
+// (Layout.test.tsx pins that). Their place on the right of the header is
+// taken by the global operator halt.
 // ═══════════════════════════════════════════════════════════════════════
 
-describe('Ashby Mission Control navigation card', () => {
+describe('Mission Control header', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     chartStubs();
     forceLightMode();
+    authState.role = 'admin';
     apiFns.getMe.mockResolvedValue(ADMIN_ME);
     apiFns.status.mockResolvedValue(OK_STATUS);
     apiFns.listAdminSessions.mockResolvedValue({ sessions: [] });
     apiFns.listAdminAllowlist.mockResolvedValue({ entries: [] });
+    apiFns.listAdminQuotas.mockResolvedValue({ policies: [] });
+    apiFns.listAdminAudit.mockResolvedValue({ audit: [] });
+    apiFns.getPhoneHealth.mockResolvedValue(LIVE_HEALTH);
   });
   afterEach(() => { vi.clearAllMocks(); });
 
@@ -214,75 +260,77 @@ describe('Ashby Mission Control navigation card', () => {
       </MemoryRouter>,
     );
 
-  const findCard = () => screen.findByRole('link', { name: /Ashby Mission Control/i });
+  /** The page header block: the element holding the page's h1. */
+  const header = () =>
+    screen.getByRole('heading', { level: 1, name: 'Mission Control' }).closest('div')!.parentElement!;
 
-  it('is a visible LINK with an accessible name containing "Ashby Mission Control"', async () => {
-    renderAdmin();
-    expect(await findCard()).toBeVisible();
+  it('no longer renders the Ashby Mission Control or Phone calendar quick links', async () => {
+    const { container } = renderAdmin();
+    await screen.findByRole('button', { name: 'Halt all calling' });
+
+    expect(screen.queryByRole('link', { name: /Ashby Mission Control/i })).toBeNull();
+    expect(screen.queryByRole('link', { name: /Phone calendar/i })).toBeNull();
+    // Not merely renamed: nothing on the page points at either route.
+    expect(container.querySelector('a[href="/ashby-mission-control"]')).toBeNull();
+    expect(container.querySelector('a[href="/phone-calendar"]')).toBeNull();
+    expect(screen.queryByText(/Ashby Mission Control/)).toBeNull();
+    expect(within(header()).queryAllByRole('link')).toEqual([]);
   });
 
-  it('points at the internal route and nothing external', async () => {
+  it('renders the operator halt on the right of the page header, above the tabs', async () => {
     renderAdmin();
-    const link = await findCard();
+    const button = await screen.findByRole('button', { name: 'Halt all calling' });
+    expect(header()).toContainElement(button);
+    expect(within(header()).getByText('Calling: on')).toBeInTheDocument();
 
-    // Exact internal target — a relative path, never an absolute URL.
-    expect(link).toHaveAttribute('href', '/ashby-mission-control');
-    const href = link.getAttribute('href') ?? '';
-    expect(href.startsWith('/')).toBe(true);
-    expect(href).not.toMatch(/^https?:/);
-    expect(href).not.toMatch(/^\/\//);          // no protocol-relative escape
-    // A plain internal link: no new tab, no opener hazard, no download.
-    expect(link).not.toHaveAttribute('target');
-    expect(link).not.toHaveAttribute('rel');
-    expect(link).not.toHaveAttribute('download');
+    const tablist = screen.getByRole('tablist', { name: 'Mission Control sections' });
+    expect(button.compareDocumentPosition(tablist) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
   });
 
-  it('is keyboard reachable — a real anchor, focusable without a tabindex hack', async () => {
+  it('reads the switch exactly once on mount and writes nothing', async () => {
     renderAdmin();
-    const link = await findCard();
-
-    expect(link.tagName).toBe('A');
-    expect(link).not.toHaveAttribute('tabindex');
-    link.focus();
-    expect(link).toHaveFocus();
-  });
-
-  it('adds NO network request of its own', async () => {
-    renderAdmin();
-    const link = await findCard();
-
-    // Whatever the page already fetches for its own sections, the CARD adds
-    // nothing: interacting with it issues no further call.
-    const before = Object.values(apiFns).reduce((n, fn) => n + fn.mock.calls.length, 0);
-    link.focus();
-    fireEvent.mouseOver(link);
-    const after = Object.values(apiFns).reduce((n, fn) => n + fn.mock.calls.length, 0);
-    expect(after).toBe(before);
+    await screen.findByRole('button', { name: 'Halt all calling' });
+    await waitFor(() => expect(apiFns.getPhoneHealth).toHaveBeenCalledTimes(1));
+    expect(apiFns.setPhoneHalt).not.toHaveBeenCalled();
+    expect(apiFns.clearPhoneHalt).not.toHaveBeenCalled();
   });
 
   it('leaves every existing section tab in place', async () => {
     renderAdmin();
-    await findCard();
-
+    await screen.findByRole('button', { name: 'Halt all calling' });
     for (const label of ['Overview', 'Access', 'Sessions', 'Quotas', 'Audit', 'Maintenance']) {
       expect(screen.getByRole('tab', { name: label })).toBeInTheDocument();
     }
   });
 
-  it('uses only colour tokens that exist in the Tailwind theme', async () => {
+  it('is NOT shown to a non-admin, who still sees the truthful gate', async () => {
+    apiFns.getMe.mockResolvedValue(VIEWER_ME);
+    renderAdmin();
+    expect(await screen.findByText(/Admin access required/i)).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: /calling/i })).toBeNull();
+    expect(apiFns.getPhoneHealth).not.toHaveBeenCalled();
+  });
+
+  it('is not rendered when the auth context disagrees with /me (defence in depth)', async () => {
+    authState.role = 'interviewer';
+    renderAdmin();
+    await screen.findByRole('tablist', { name: 'Mission Control sections' });
+    expect(screen.queryByRole('button', { name: /calling/i })).toBeNull();
+    expect(screen.queryByText('Checking calling status…')).toBeNull();
+    expect(apiFns.getPhoneHealth).not.toHaveBeenCalled();
+  });
+
+  it('uses only colour tokens that exist in the Tailwind theme, in both states', async () => {
     // Nothing else in this repo can catch a dead Tailwind class on this page:
     // the candidate palette guard is correctly scoped away from Mission
     // Control, Tailwind drops an unknown colour key WITHOUT erroring, neither
     // tsc nor the linter can see inside a class string, and axe cannot compute
-    // colour under jsdom. So an `ink-primary` typo shipped a focus ring with no
-    // colour of its own, falling back to Tailwind's default light blue — on the
-    // most accessibility-relevant state of a brand-new control.
-    //
-    // This resolves every colour utility on the card against the real theme.
-    // `__dirname` + resolve, matching the repo's existing palette guard.
+    // colour under jsdom. So an `ink-primary` typo once shipped a focus ring
+    // with no colour of its own. This resolves every colour utility on the
+    // halt control — red and green states, and each open dialog — against the
+    // real theme. `__dirname` + resolve, matching the repo's palette guard.
     const config = readFileSync(resolve(__dirname, '../../tailwind.config.js'), 'utf8');
 
-    // The colour FAMILIES the theme defines, and the full token names.
     const colorsBlock = config.slice(config.indexOf('colors:'));
     const tokens = new Set<string>();
     const families = new Set<string>();
@@ -292,156 +340,62 @@ describe('Ashby Mission Control navigation card', () => {
       tokens.add(key);
       families.add(key.split('-')[0]);
     }
-    // Nested numeric scales (brand-500, accent-500, …).
     for (const fam of ['brand', 'accent']) {
       for (const n of [50, 100, 200, 300, 400, 500, 600, 700, 800, 900, 950]) {
         tokens.add(`${fam}-${n}`);
       }
     }
-    // Sanity: the extraction actually found the theme, so a silent parse
-    // failure cannot turn this test into a no-op that passes on anything.
+    // Sanity: the extraction found the theme, including the token the red
+    // halt button is painted with.
     expect(tokens.has('ink')).toBe(true);
-    expect(tokens.has('brand-500')).toBe(true);
-    expect(tokens.has('ink-primary')).toBe(false);   // the class that broke
+    expect(tokens.has('error')).toBe(true);
+    expect(tokens.has('ink-primary')).toBe(false);
 
+    // The green resume button is painted with ARBITRARY values —
+    // `bg-[var(--go)]` — which the theme lookup above cannot see and Tailwind
+    // emits even when the variable does not exist (the fill is then simply
+    // transparent). So every `var(--x)` a class names must be DECLARED in the
+    // global token file.
+    const indexCss = readFileSync(resolve(__dirname, '../index.css'), 'utf8');
+    const declared = (name: string) => new RegExp(`^\\s*${name}:`, 'm').test(indexCss);
+    expect(declared('--go')).toBe(true);
+    expect(declared('--go-missing')).toBe(false);
+
+    const offendersIn = (root: Element): string[] => {
+      const offenders: string[] = [];
+      const classNames = [root, ...Array.from(root.querySelectorAll('*'))].flatMap((el) =>
+        Array.from(el.classList),
+      );
+      for (const cls of classNames) {
+        const variable = /\[var\((--[\w-]+)\)\]/.exec(cls);
+        if (variable && !declared(variable[1])) offenders.push(cls);
+        const bare = cls.slice(cls.lastIndexOf(':') + 1);
+        const m = /^(?:text|bg|border|ring|from|via|to|fill|stroke|divide|outline|shadow)-(.+)$/.exec(bare);
+        if (!m) continue;
+        const token = m[1];
+        if (!families.has(token.split('-')[0])) continue;
+        if (!tokens.has(token)) offenders.push(cls);
+      }
+      return offenders;
+    };
+    const control = () => document.querySelector('[data-operator-halt]')!;
+
+    // Live: the red button, and the halt dialog.
+    const { unmount } = renderAdmin();
+    fireEvent.click(await screen.findByRole('button', { name: 'Halt all calling' }));
+    await screen.findByRole('dialog', { name: 'Halt all calling?' });
+    expect(offendersIn(control())).toEqual([]);
+    unmount();
+
+    // Paused: the green button, and the resume dialog.
+    apiFns.getPhoneHealth.mockResolvedValue(PAUSED_HEALTH);
     renderAdmin();
-    const link = await findCard();
-    const classNames = [link, ...Array.from(link.querySelectorAll('*'))]
-      .flatMap((el) => Array.from(el.classList));
-
-    const offenders: string[] = [];
-    for (const cls of classNames) {
-      // Strip any variant prefix (hover:, focus-visible:, sm:, …).
-      const bare = cls.slice(cls.lastIndexOf(':') + 1);
-      const m = /^(?:text|bg|border|ring|from|via|to|fill|stroke|divide|outline|shadow)-(.+)$/.exec(bare);
-      if (!m) continue;
-      const token = m[1];
-      // Only judge tokens whose ROOT is a theme colour family — this skips
-      // `text-sm`, `border-2`, `shadow-card` and other non-colour utilities.
-      if (!families.has(token.split('-')[0])) continue;
-      if (!tokens.has(token)) offenders.push(cls);
-    }
-
-    expect(offenders, `unresolvable colour classes: ${offenders.join(', ')}`).toEqual([]);
-  });
-
-  it('gives the focus ring a real colour, matching its siblings', async () => {
-    renderAdmin();
-    const link = await findCard();
-
-    // A ring width with no ring colour renders in Tailwind's default blue.
-    // The glass shell's shared focus ring is the accent token `ring-info`
-    // (the same ring every design-system control uses).
-    expect(link.className).toContain('focus-visible:ring-2');
-    expect(link.className).toContain('focus-visible:ring-info');
-    expect(link.className).not.toContain('ink-primary');
-  });
-
-  it('is NOT shown to a non-admin, who still sees the truthful gate', async () => {
-    apiFns.getMe.mockResolvedValue(VIEWER_ME);
-    renderAdmin();
-
-    expect(await screen.findByText(/Admin access required/i)).toBeInTheDocument();
-    expect(screen.queryByRole('link', { name: /Ashby Mission Control/i })).toBeNull();
-  });
-});
-
-/**
- * The phone calendar card. Mirrors the Ashby card's contract above — a real
- * internal link, keyboard reachable, adding no request — and additionally
- * asserts that adding it did not disturb the card or the tabs that were
- * already there.
- */
-describe('Phone calendar navigation card', () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-    chartStubs();
-    forceLightMode();
-    apiFns.getMe.mockResolvedValue(ADMIN_ME);
-    apiFns.status.mockResolvedValue(OK_STATUS);
-    apiFns.listAdminSessions.mockResolvedValue({ sessions: [] });
-    apiFns.listAdminAllowlist.mockResolvedValue({ entries: [] });
-  });
-  afterEach(() => { vi.clearAllMocks(); });
-
-  const renderAdmin = () =>
-    render(
-      <MemoryRouter>
-        <ThemeProvider>
-          <MissionControlPage />
-        </ThemeProvider>
-      </MemoryRouter>,
-    );
-
-  const findCard = () => screen.findByRole('link', { name: /Phone calendar/i });
-
-  it('is a visible LINK with an accessible name containing "Phone calendar"', async () => {
-    renderAdmin();
-    expect(await findCard()).toBeVisible();
-  });
-
-  it('points at the internal route and nothing external', async () => {
-    renderAdmin();
-    const link = await findCard();
-
-    expect(link).toHaveAttribute('href', '/phone-calendar');
-    const href = link.getAttribute('href') ?? '';
-    expect(href.startsWith('/')).toBe(true);
-    expect(href).not.toMatch(/^https?:/);
-    expect(href).not.toMatch(/^\/\//);
-    expect(link).not.toHaveAttribute('target');
-    expect(link).not.toHaveAttribute('rel');
-    expect(link).not.toHaveAttribute('download');
-  });
-
-  it('is keyboard reachable — a real anchor, focusable without a tabindex hack', async () => {
-    renderAdmin();
-    const link = await findCard();
-    expect(link.tagName).toBe('A');
-    expect(link).not.toHaveAttribute('tabindex');
-    link.focus();
-    expect(link).toHaveFocus();
-  });
-
-  it('adds NO network request of its own', async () => {
-    renderAdmin();
-    const link = await findCard();
-    const before = Object.values(apiFns).reduce((n, fn) => n + fn.mock.calls.length, 0);
-    link.focus();
-    fireEvent.mouseOver(link);
-    const after = Object.values(apiFns).reduce((n, fn) => n + fn.mock.calls.length, 0);
-    expect(after).toBe(before);
-  });
-
-  it('gives the focus ring a real colour, matching its siblings', async () => {
-    renderAdmin();
-    const link = await findCard();
-    expect(link.className).toContain('focus-visible:ring-2');
-    expect(link.className).toContain('focus-visible:ring-info');
-    expect(link.className).not.toContain('ink-primary');
-  });
-
-  it('leaves the Ashby card and every existing section tab in place', async () => {
-    renderAdmin();
-    await findCard();
-
-    // The card that was already here is untouched.
-    expect(
-      await screen.findByRole('link', { name: /Ashby Mission Control/i }),
-    ).toHaveAttribute('href', '/ashby-mission-control');
-
-    // And the tabs, whose lazy mounting the cards must not disturb.
-    for (const label of ['Overview', 'Access', 'Sessions', 'Quotas', 'Audit', 'Maintenance']) {
-      expect(screen.getByRole('tab', { name: label })).toBeInTheDocument();
-    }
-  });
-
-  it('renders above the tablist, so it cannot disturb tab state', async () => {
-    renderAdmin();
-    const link = await findCard();
-    const tablist = await screen.findByRole('tablist', { name: 'Mission Control sections' });
-    // DOCUMENT_POSITION_FOLLOWING: the tablist comes after the card.
-    expect(link.compareDocumentPosition(tablist) & Node.DOCUMENT_POSITION_FOLLOWING)
-      .toBeTruthy();
+    const resume = await screen.findByRole('button', { name: 'Resume calling' });
+    // Non-vacuous: the green fill IS an arbitrary `var()` class, so the
+    // declared-variable check above really runs against it.
+    expect(resume).toHaveClass('bg-[var(--go)]');
+    fireEvent.click(resume);
+    await screen.findByRole('dialog', { name: 'Resume calling?' });
+    expect(offendersIn(control())).toEqual([]);
   });
 });

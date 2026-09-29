@@ -404,6 +404,16 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api/status', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'status:', useUserKey: true }));
   app.use('/api/notes', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'notes:', useUserKey: true }));
   app.use('/api/scorecards', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'scorecards:', useUserKey: true }));
+  // ASK HELLO ON THE METRIC FORM is model-invoking like Rephrase — one short
+  // generation, retried once — so it takes the same STRICT bucket under its
+  // own prefix, mounted on the POST for Rephrase's reason: `app.use` would
+  // also catch every library read and edit beneath `/api/scorecards/metrics`.
+  // AFTER the default bucket above, as Rephrase is after `/api/roles`'s: both
+  // apply, and the one registered last writes the `X-RateLimit-*` headers the
+  // client sees, which must describe the tighter one.
+  app.post('/api/scorecards/metrics/draft', createRateLimitMiddleware({
+    config: strictRateLimit, prefix: 'scorecard-metric-draft:', useUserKey: true,
+  }));
   app.use('/api/candidate-consent', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'candidate-consent:', useUserKey: true }));
   app.use('/api/notifications', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'notifications:', useUserKey: true }));
   app.use('/api/export', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'export:', useUserKey: true }));

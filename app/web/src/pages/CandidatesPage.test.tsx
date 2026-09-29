@@ -65,6 +65,24 @@ function renderPage(entry = '/candidates', ui: ReactNode = <CandidatesPage />) {
   return render(<MemoryRouter initialEntries={[entry]}>{ui}</MemoryRouter>);
 }
 
+/**
+ * Each row's cell under the column headed `name`, keyed by the candidate's
+ * name. POSITIONAL on purpose: the Agent and Role columns can both show "—",
+ * so an unscoped text query cannot tell which column said it.
+ */
+function columnByCandidate(name: string): Map<string, string> {
+  const table = screen.getByRole('table');
+  const headers = Array.from(table.querySelectorAll('thead th')).map((th) => th.textContent);
+  const index = headers.indexOf(name);
+  if (index < 0) throw new Error(`no "${name}" column in [${headers.join(', ')}]`);
+  const out = new Map<string, string>();
+  for (const row of Array.from(table.querySelectorAll('tbody tr'))) {
+    const candidate = row.querySelector('a')?.textContent ?? '';
+    out.set(candidate, row.querySelectorAll('td')[index]?.textContent ?? '');
+  }
+  return out;
+}
+
 describe('CandidatesPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -260,7 +278,9 @@ describe('CandidatesPage', () => {
     await screen.findByText('Jane Doe');
     const table = screen.getByRole('table');
     expect(within(table).queryByText('Unknown role')).not.toBeInTheDocument();
-    expect(within(table).getAllByText('—').length).toBeGreaterThan(0);
+    // Scoped to the ROLE column: the Agent column says "—" too, and would
+    // satisfy an unscoped query on its own.
+    expect([...columnByCandidate('Role').values()]).toEqual(['—', '—', '—']);
 
     releaseRoles([mockRole]);
     expect(await within(table).findAllByText('Senior Frontend Engineer')).toHaveLength(3);
@@ -278,8 +298,75 @@ describe('CandidatesPage', () => {
     expect(within(table).queryByText('Unknown role')).not.toBeInTheDocument();
     expect(within(table).queryByText('Senior Frontend Engineer')).not.toBeInTheDocument();
     // POSITIVE too: two absences are also satisfied by a cell that renders
-    // nothing at all, which is not what "says —" claims.
-    expect(within(table).getAllByText('—').length).toBeGreaterThan(0);
+    // nothing at all, which is not what "says —" claims. Scoped to the ROLE
+    // column, because the Agent column's own "—" would otherwise satisfy it.
+    expect([...columnByCandidate('Role').values()]).toEqual(['—', '—', '—']);
+  });
+
+  // ── Agent column ──────────────────────────────────────────────────────
+
+  it('puts an AGENT column immediately LEFT of Role', async () => {
+    renderPage();
+    await screen.findByText('Jane Doe');
+    const headers = within(screen.getByRole('table'))
+      .getAllByRole('columnheader')
+      .map((h) => h.textContent);
+    expect(screen.getByRole('columnheader', { name: 'Agent' })).toBeInTheDocument();
+    expect(headers.indexOf('Agent')).toBe(headers.indexOf('Role') - 1);
+    expect(headers.slice(0, 3)).toEqual(['Name', 'Agent', 'Role']);
+  });
+
+  it("shows each candidate's AGENT name, and \"—\" whenever there is none to show", async () => {
+    mockApi.listRoles.mockResolvedValue([
+      { ...mockRole, agent_name: '  Gopu  ' },
+      { ...mockRole, id: 'role-2', title: 'Backend Engineer', agent_name: 'Meera' },
+      { ...mockRole, id: 'role-3', title: 'QA Analyst', agent_name: null },
+      { ...mockRole, id: 'role-4', title: 'Support Lead', agent_name: '   ' },
+    ]);
+    mockApi.listCandidates.mockResolvedValue([
+      CANDIDATES[0], // role-1 → Gopu
+      { ...CANDIDATES[1], role_id: 'role-2' }, // → Meera
+      { ...CANDIDATES[2], role_id: 'role-3' }, // null agent name
+      { ...mockCandidate, id: 'c-blank', name: 'Blank Bea', role_id: 'role-4' }, // blank
+      { ...mockCandidate, id: 'c-none', name: 'Roleless Rui', role_id: null }, // no role
+      { ...mockCandidate, id: 'c-gone', name: 'Gone Gil', role_id: 'role-gone' }, // not in list
+    ]);
+    renderPage();
+    await screen.findByText('Jane Doe');
+    await within(screen.getByRole('table')).findByText('Gopu');
+
+    expect(Object.fromEntries(columnByCandidate('Agent'))).toEqual({
+      'Jane Doe': 'Gopu',
+      'Screened Sam': 'Meera',
+      'Screening Sara': '—',
+      'Blank Bea': '—',
+      'Roleless Rui': '—',
+      'Gone Gil': '—',
+    });
+    // The Role column is exactly what it was: the TITLE, never the agent.
+    expect(Object.fromEntries(columnByCandidate('Role'))).toEqual({
+      'Jane Doe': 'Senior Frontend Engineer',
+      'Screened Sam': 'Backend Engineer',
+      'Screening Sara': 'QA Analyst',
+      'Blank Bea': 'Support Lead',
+      'Roleless Rui': 'No role',
+      'Gone Gil': 'Unknown role',
+    });
+  });
+
+  it('says "—" in the Agent column until the roles request lands, then the name', async () => {
+    let releaseRoles: (r: unknown) => void = () => {};
+    mockApi.listRoles.mockReturnValue(
+      new Promise((res) => {
+        releaseRoles = res;
+      }),
+    );
+    renderPage();
+    await screen.findByText('Jane Doe');
+    expect([...columnByCandidate('Agent').values()]).toEqual(['—', '—', '—']);
+
+    releaseRoles([{ ...mockRole, agent_name: 'Gopu' }]);
+    expect(await within(screen.getByRole('table')).findAllByText('Gopu')).toHaveLength(3);
   });
 
   it('MOVES FOCUS into the panel only from the far-away trigger', async () => {

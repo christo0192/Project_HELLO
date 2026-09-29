@@ -38,6 +38,7 @@ import {
   usePagination,
 } from '../design';
 import { ConfirmButton } from './ConfirmButton';
+import { MetricAskHello } from './MetricAskHello';
 import { stableMutationMessage } from './statusMeta';
 
 const SCORE_VALUES: ScoreValue[] = [1, 2, 3, 4];
@@ -116,6 +117,7 @@ export function ScorebarSection() {
 
   const [draft, setDraft] = useState<MetricDraft>(EMPTY_DRAFT);
   const [createIssue, setCreateIssue] = useState<string | null>(null);
+  const [createdCount, setCreatedCount] = useState(0); // resets Ask Hello's status with the form
   const [editId, setEditId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<MetricDraft>(EMPTY_DRAFT);
   const [editIssue, setEditIssue] = useState<string | null>(null);
@@ -148,6 +150,11 @@ export function ScorebarSection() {
   function setDraftRubric(level: ScoreValue, value: string) {
     setDraft((prev) => ({ ...prev, rubric: { ...prev.rubric, [level]: value } }));
   }
+  /** Ask Hello's draft fills the create form; nothing is saved. */
+  function applyHelloDraft(instruction: string, rubric: RubricDraft) {
+    setDraft((prev) => ({ ...prev, instruction, rubric: { ...rubric } }));
+    setCreateIssue(null);
+  }
   function setEditField<K extends keyof MetricDraft>(key: K, value: MetricDraft[K]) {
     setEditDraft((prev) => ({ ...prev, [key]: value }));
   }
@@ -163,6 +170,7 @@ export function ScorebarSection() {
     try {
       const created = await api.createScorecardMetric(draftToBody(draft));
       setDraft({ name: '', description: '', instruction: '', rubric: { ...EMPTY_RUBRIC } });
+      setCreatedCount((n) => n + 1);
       setMessage({ text: `Metric “${created.name}” created.`, tone: 'ok' });
       await load();
     } catch (e) {
@@ -358,6 +366,9 @@ export function ScorebarSection() {
             onField={setDraftField}
             onRubric={setDraftRubric}
             issue={createIssue}
+            instructionAction={
+              <MetricAskHello idPrefix="new-metric" draft={draft} onApply={applyHelloDraft} resetKey={createdCount} />
+            }
             footer={
               <Button variant="primary" onClick={createMetric}>
                 Create metric
@@ -377,6 +388,7 @@ function MetricFields({
   onRubric,
   issue,
   footer,
+  instructionAction,
 }: {
   idPrefix: string;
   draft: MetricDraft;
@@ -384,6 +396,8 @@ function MetricFields({
   onRubric: (level: ScoreValue, value: string) => void;
   issue: string | null;
   footer: React.ReactNode;
+  /** Right-aligned above the Scoring instruction — the CREATE form's Ask Hello only. */
+  instructionAction?: React.ReactNode;
 }) {
   return (
     <div className="glass-sunken space-y-4 rounded-[14px] p-4">
@@ -412,6 +426,8 @@ function MetricFields({
           )}
         </Field>
       </div>
+
+      {instructionAction && <div className="flex justify-end">{instructionAction}</div>}
 
       <Field
         label="Scoring instruction"

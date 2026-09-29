@@ -46,6 +46,8 @@ const UUID_A = '11111111-1111-4111-8111-111111111111';
 const UUID_E = '22222222-2222-4222-8222-222222222222';
 const UUID_C = '33333333-3333-4333-8333-333333333333';
 const UUID_OTHER = '44444444-4444-4444-8444-444444444444';
+/** The role (agent pipeline) the fixture engagement was opened for. */
+const UUID_R = '66666666-6666-4666-8666-666666666666';
 
 /** Injected clock. Every assertion that depends on "now" pins it here. */
 const NOW = new Date('2026-08-23T18:31:00Z');
@@ -68,6 +70,7 @@ const APPOINTMENT: PhoneAppointmentRow = {
 const ENGAGEMENT: PhoneEngagementRow = {
   id: UUID_E,
   candidateId: UUID_C,
+  roleId: UUID_R,
   state: 'scheduled',
   stateReason: null,
   epoch: 0,
@@ -599,6 +602,7 @@ describe('the calendar projection', () => {
     expect(row.ist_end).toBe('09:30');
     expect(row.source).toBe('hr_manual');
     expect(row.engagement_state).toBe('scheduled');
+    expect(row.role_id).toBe(UUID_R);
     expect(row.version).toBe(3);
     // Always null: nothing in 0042 writes it, and the field is reported rather
     // than dropped so the residual stays visible.
@@ -617,6 +621,43 @@ describe('the calendar projection', () => {
       .get(`/api/phone/calendar${RANGE}`);
     expect(res.body.appointments[0].engagement_state).toBeNull();
     expect(res.body.appointments[0].candidate).toBeNull();
+    // The role is an engagement fact, so the same torn read nulls it too —
+    // never a guess, and never borrowed from some other row.
+    expect(res.body.appointments[0].role_id).toBeNull();
+  });
+
+  it('carries the ENGAGEMENT role of each call, per row, in the same three queries', async () => {
+    // The agent filter keys on this. Two engagements of one candidate in two
+    // pipelines must each report their OWN role — the role is stamped on the
+    // engagement when its cycle opens, and a candidate's current role is not
+    // what a call already booked belongs to. The candidate block stays
+    // exactly the four documented fields: the role is not smuggled into it.
+    const ROLE_B = '77777777-7777-4777-8777-777777777777';
+    const a1 = { ...APPOINTMENT, id: 'a1', engagementId: 'e1' };
+    const a2 = { ...APPOINTMENT, id: 'a2', engagementId: 'e2' };
+    const a3 = { ...APPOINTMENT, id: 'a3', engagementId: 'e3' };
+    const read = fakeReadStore({
+      listAppointmentsByStart: async () => [a1, a2, a3],
+      listEngagementsByIds: async () => [
+        { ...ENGAGEMENT, id: 'e1', roleId: UUID_R },
+        { ...ENGAGEMENT, id: 'e2', roleId: ROLE_B },
+        // The FK is `on delete set null`: an engagement with no role.
+        { ...ENGAGEMENT, id: 'e3', roleId: null },
+      ],
+    });
+    const res = await request(appWith('interviewer', { readStore: read.store }))
+      .get(`/api/phone/calendar${RANGE}`);
+    expect(res.status).toBe(200);
+    expect(res.body.appointments.map((r: { id: string; role_id: unknown }) => [r.id, r.role_id]))
+      .toEqual([['a1', UUID_R], ['a2', ROLE_B], ['a3', null]]);
+    for (const row of res.body.appointments) {
+      expect(Object.keys(row.candidate).sort()).toEqual(['id', 'name', 'reference', 'status']);
+    }
+    expect(read.calls).toEqual([
+      'listAppointmentsByStart',
+      'listEngagementsByIds',
+      'listCandidatesByIds',
+    ]);
   });
 
   it('turns a read failure into a stable code, never a driver message', async () => {
@@ -1573,14 +1614,83 @@ describe('the health surface', () => {
 
 describe('halt', () => {
   it('delegates to set_phone_halt and reports whether it was already in force', async () => {
-    const write = fakeStores({ setHalt: async () => ({ status: 'ok', alreadyHalted: true }) });
+    const write = fakeStores({
+      setHalt: async () => ({
+        status: 'ok', alreadyHalted: true, haltReason: 'provider_incident', reasonEscalated: false,
+      }),
+    });
     const res = await request(appWith('admin', { stores: write.store }))
       .post('/api/phone/halt').send({ reason: 'provider_incident' });
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
-      ok: true, halted: true, already_halted: true, reason: 'provider_incident',
+      ok: true,
+      halted: true,
+      already_halted: true,
+      reason: 'provider_incident',
+      requested_reason: 'provider_incident',
     });
     expect((write.calls[0].input as Record<string, unknown>).reason).toBe('provider_incident');
+  });
+
+  it('reports the reason IN FORCE, not the one requested: a pause during a legal hold says legal_hold', async () => {
+    // 0110: a weaker request changes nothing. Echoing the request here would
+    // tell the admin that only a pause is up while a legal hold stands — the
+    // exact misreading that let Resume lift a legal hold.
+    const write = fakeStores({
+      setHalt: async () => ({
+        status: 'ok', alreadyHalted: true, haltReason: 'legal_hold', reasonEscalated: false,
+      }),
+    });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt').send({ reason: 'operator_pause' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      ok: true,
+      halted: true,
+      already_halted: true,
+      reason: 'legal_hold',
+      requested_reason: 'operator_pause',
+    });
+    expect(audited).toHaveLength(1);
+    expect(audited[0].metadata).toEqual({
+      resource: 'phone_control',
+      action: 'halt_set',
+      reason: 'operator_pause',
+      reason_in_force: 'legal_hold',
+      reason_escalated: false,
+      already_halted: true,
+    });
+  });
+
+  it('an ESCALATION reports the stronger reason now in force, and audits it as escalated', async () => {
+    const write = fakeStores({
+      setHalt: async () => ({
+        status: 'ok', alreadyHalted: true, haltReason: 'legal_hold', reasonEscalated: true,
+      }),
+    });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt').send({ reason: 'legal_hold' });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      already_halted: true, reason: 'legal_hold', requested_reason: 'legal_hold',
+    });
+    expect(audited[0].metadata).toMatchObject({
+      reason: 'legal_hold', reason_in_force: 'legal_hold', reason_escalated: true,
+    });
+  });
+
+  it('a substrate that does not report the reason in force answers null — never the requested reason', async () => {
+    // A pre-0110 database, or drift the store narrowed away. "Not known" is
+    // true; the requested reason would be a guess, and possibly the weaker one.
+    const write = fakeStores({ setHalt: async () => ({ status: 'ok', alreadyHalted: true }) });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt').send({ reason: 'operator_pause' });
+    expect(res.status).toBe(200);
+    expect(res.body.reason).toBeNull();
+    expect(res.body.requested_reason).toBe('operator_pause');
+    expect(audited[0].metadata).toMatchObject({
+      reason: 'operator_pause', reason_in_force: null, reason_escalated: null,
+    });
   });
 
   it('NEVER lifts the halt when the audit write fails — the stop stands', async () => {

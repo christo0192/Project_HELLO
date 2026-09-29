@@ -4,7 +4,8 @@
  * Every export here is local to the phone calendar surface. Nothing in this
  * folder is imported by another feature, and nothing here reaches into one:
  * the only shared code it consumes is the design system, the mission-control
- * confirmation primitive and the IST datetime helper.
+ * confirmation primitive, the IST datetime helper and the role-label helper
+ * (the Agent picker's names).
  */
 export { PhoneWeekTable } from './PhoneWeekTable';
 export type { PhoneWeekTableProps } from './PhoneWeekTable';
@@ -27,7 +28,7 @@ export type { PhoneBookingPanelProps } from './PhoneBookingPanel';
 export { PhoneSlotPicker } from './PhoneSlotPicker';
 export type { PhoneSlotPickerProps } from './PhoneSlotPicker';
 export { PhoneFilterBar } from './PhoneFilterBar';
-export type { PhoneFilterBarProps } from './PhoneFilterBar';
+export type { PhoneAgentChoices, PhoneFilterBarProps } from './PhoneFilterBar';
 export {
   PHONE_STATUS_ORDER,
   PHONE_STATE_ORDER,
@@ -35,10 +36,14 @@ export {
   buildPhoneCalendarSearch,
   hasActivePhoneFilters,
   matchesPhoneFilters,
+  phoneAgentOptions,
   phoneFacets,
+  resolvePhoneAgentFilter,
   togglePhoneFacet,
 } from './phoneCalendarFilters';
 export type {
+  PhoneAgentOption,
+  PhoneAgentRoster,
   PhoneCalendarFilters,
   PhoneCalendarView,
   PhoneFacet,

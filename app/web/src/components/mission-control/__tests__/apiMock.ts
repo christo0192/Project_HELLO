@@ -33,6 +33,10 @@ const hoisted = vi.hoisted(() => {
     listAdminAudit: vi.fn(),
     toggleMaintenance: vi.fn(),
     overrideSession: vi.fn(),
+    // The operator halt in the page header (OperatorHaltControl).
+    getPhoneHealth: vi.fn(),
+    setPhoneHalt: vi.fn(),
+    clearPhoneHalt: vi.fn(),
   };
 
   const api = {
@@ -48,6 +52,9 @@ const hoisted = vi.hoisted(() => {
     listAdminAudit: fns.listAdminAudit,
     toggleMaintenance: fns.toggleMaintenance,
     overrideSession: fns.overrideSession,
+    getPhoneHealth: fns.getPhoneHealth,
+    setPhoneHalt: fns.setPhoneHalt,
+    clearPhoneHalt: fns.clearPhoneHalt,
   };
 
   return { api, fns, ApiError };

@@ -85,6 +85,10 @@ import type {
   PhoneCancelResponse,
   PhoneCandidateAppointmentCreateInput,
   PhoneCandidateAppointmentPatchInput,
+  PhoneHaltClearResponse,
+  PhoneHaltInput,
+  PhoneHaltResponse,
+  PhoneHealthResponse,
   PhoneRescreenInput,
   PhoneRescreenResponse,
   PhoneScreeningsResponse,
@@ -96,6 +100,8 @@ import type {
   RedistributeWeightsResponse,
   RoleScorecardResponse,
   ScorecardMetricCreateInput,
+  ScorecardMetricDraft,
+  ScorecardMetricDraftInput,
   ScorecardMetricTemplate,
   ScorecardMetricUpdateInput,
   SessionDetail,
@@ -751,6 +757,27 @@ export const api = {
       { method: 'DELETE', body: JSON.stringify(input) },
     ),
 
+  // ── The phone admission kill switch (operator halt) ──────────────
+  // Health is interviewer or above; both writes are admin-only, and the API
+  // re-checks the role on every request. Health answers 200 even when the
+  // phone lane is degraded or disabled — `admission` is then null — so a
+  // caller must read the BODY, not the status, to know whether the switch
+  // could be described. `clearPhoneHalt` must send the reason currently in
+  // force; any other answers 409 `halt_reason_mismatch`.
+  getPhoneHealth: () => request<PhoneHealthResponse>('/api/phone/health'),
+
+  setPhoneHalt: (input: PhoneHaltInput) =>
+    request<PhoneHaltResponse>('/api/phone/halt', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
+  clearPhoneHalt: (input: PhoneHaltInput) =>
+    request<PhoneHaltClearResponse>('/api/phone/halt/clear', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+
   // ── Scorecards (Phase 3) ─────────────────────────────────────────
   // Metric LIBRARY ("Scorebar") is admin-only server-side; GET returns a bare
   // array of snake_case rows. Role scorecard reads need interviewer+ (owner of
@@ -773,6 +800,18 @@ export const api = {
     request<ScorecardMetricTemplate>(`/api/scorecards/metrics/${encodeURIComponent(id)}/archive`, {
       method: 'POST',
       body: JSON.stringify({}),
+    }),
+  /**
+   * Ask Hello: draft a metric's scoring instruction and 1-4 rubric from its
+   * name and description. Synchronous, like `rephraseQuestion`, and it SAVES
+   * NOTHING — the caller fills the form and the admin still presses Create. A
+   * 422 carries operator-facing copy in its message; 429 means the strict
+   * model-invoking bucket is empty.
+   */
+  draftMetricRubric: (body: ScorecardMetricDraftInput) =>
+    request<ScorecardMetricDraft>('/api/scorecards/metrics/draft', {
+      method: 'POST',
+      body: JSON.stringify(body),
     }),
 
   getRoleScorecard: (roleId: string) =>

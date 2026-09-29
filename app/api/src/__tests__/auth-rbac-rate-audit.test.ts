@@ -1235,6 +1235,29 @@ describe('POST /api/roles/draft is rate limited apart from the rest of /api/role
     expect(res.headers['x-ratelimit-limit']).toBe('20');
   });
 
+  it('SCOREBAR ASK HELLO HAS THE STRICT BUCKET too, and only on its POST', async () => {
+    // The same hole as Rephrase: without its own `app.post(...)` registration
+    // the model-invoking metric draft silently falls back to the loose
+    // `/api/scorecards` bucket. A blank name keeps this from ever reaching the
+    // generator — the limiter runs, and sets its header, before validation.
+    const app = createAuthedApp(makeAdmin());
+    const res = await request(app)
+      .post('/api/scorecards/metrics/draft')
+      .set('Authorization', VALID_TOKEN)
+      .send({ name: '   ' });
+    expect(res.status).toBe(400);
+    expect(res.headers['x-ratelimit-limit']).toBe('20');
+    // And the library edit beside it keeps the default bucket — an `app.use`
+    // mount would have tightened every metric read and edit as well. (An
+    // empty PATCH body is refused before the database is touched.)
+    const edit = await request(app)
+      .patch('/api/scorecards/metrics/00000000-0000-4000-8000-0000000000b1')
+      .set('Authorization', VALID_TOKEN)
+      .send({});
+    expect(edit.status).toBe(400);
+    expect(edit.headers['x-ratelimit-limit']).toBe('100');
+  });
+
   it('leaves the rest of the Roles API usable when the draft bucket is empty', async () => {
     // Separate keys. A limiter added to bound provider spend must not take
     // role listing and saving down with it.

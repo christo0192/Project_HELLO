@@ -134,3 +134,25 @@ export function CalendarIcon({ className }: IconProps) {
     </svg>
   );
 }
+
+/**
+ * Linked nodes — an integration: Ashby Mission Control, where the Ashby
+ * connection is operated.
+ *
+ * Two nodes on the left joined to one on the right, so it reads as "things
+ * connected" rather than as a share or a network diagram. The connectors stop
+ * at each circle's edge instead of running to its centre, which keeps the
+ * strokes from doubling up inside the nodes at 16px. Decorative and
+ * `aria-hidden` like every sibling; the nav item's text is its name.
+ */
+export function IntegrationIcon({ className }: IconProps) {
+  return (
+    <svg {...base(className)}>
+      <circle cx="6" cy="6" r="3" />
+      <circle cx="6" cy="18" r="3" />
+      <circle cx="18" cy="12" r="3" />
+      <path d="M8.7 7.3 15.3 10.7" />
+      <path d="M8.7 16.7 15.3 13.3" />
+    </svg>
+  );
+}

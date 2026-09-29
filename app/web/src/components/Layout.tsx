@@ -4,8 +4,9 @@
  * - Brand: authorized IK logo on a neutral plate (never CSS-inverted) +
  *   "HELLO" wordmark.
  * - Navigation: TA/HR daily items (Dashboard · Candidates · Roles) under
- *   "Workspace"; Operations for admins/interviewers — Mission Control stays
- *   admin-only, the phone calendar is for both roles.
+ *   "Workspace"; Operations for admins/interviewers — Ashby Mission Control
+ *   and Mission Control stay admin-only, the phone calendar is for both
+ *   roles.
  * - Material: a frosted rail (sidebar) and a frosted top bar float on a
  *   softly lit ground (`.app-ground`). Both collapse to opaque surfaces under
  *   `prefers-reduced-transparency` or without `backdrop-filter`.
@@ -33,6 +34,7 @@ import {
   CalendarIcon,
   CloseIcon,
   DashboardIcon,
+  IntegrationIcon,
   LogOutIcon,
   MobileMenuButton,
   NavGroup,
@@ -267,22 +269,32 @@ export function Layout() {
 
             {/*
               Operations. The GROUP is shown to admins and interviewers, but
-              each link keeps its own visibility rule — Mission Control stays
-              admin-only exactly as before, because its route is still
+              each link keeps its own visibility rule — Ashby Mission Control
+              and Mission Control are admin-only, because both routes are
               `requireRole="admin"` and offering an interviewer a link that
               redirects to /unauthorized would be a worse experience than not
-              showing it. The phone calendar is added for both roles, matching
-              the API's "interviewer or above may read" rule.
+              showing it. The phone calendar is shown to both roles, matching
+              the API's "interviewer or above may read" rule. Ashby Mission
+              Control sits directly above Mission Control; it used to be
+              reachable only from a quick link in the Mission Control header.
             */}
             {(role === 'admin' || role === 'interviewer') && (
               <NavGroup label="Operations">
                 {role === 'admin' && (
-                  <NavLinkItem
-                    to="/mission-control"
-                    label="Mission Control"
-                    icon={<ShieldIcon className="h-4 w-4" />}
-                    onNavigate={closeDrawer}
-                  />
+                  <>
+                    <NavLinkItem
+                      to="/ashby-mission-control"
+                      label="Ashby Mission Control"
+                      icon={<IntegrationIcon className="h-4 w-4" />}
+                      onNavigate={closeDrawer}
+                    />
+                    <NavLinkItem
+                      to="/mission-control"
+                      label="Mission Control"
+                      icon={<ShieldIcon className="h-4 w-4" />}
+                      onNavigate={closeDrawer}
+                    />
+                  </>
                 )}
                 <NavLinkItem
                   to="/phone-calendar"

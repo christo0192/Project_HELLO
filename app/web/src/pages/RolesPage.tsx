@@ -33,6 +33,7 @@ import { AskHelloButton } from "../components/roles/AskHelloButton";
 // Mission Control graph into the Roles chunk for one panel.
 import { ScorebarSection } from "../components/mission-control/ScorebarSection";
 import { useAuth } from "../lib/auth";
+import { agentLabel, agentWithRoleLabel, roleAgentName } from "../lib/role-label";
 
 interface QuestionRow {
   id: string;
@@ -128,10 +129,13 @@ export function RolesPage() {
       if (deletingId) return;
       // CONFIRMED, because this is destructive and one click from a list.
       // The wording promises only what the server will actually do.
+      // Named as the card is — agent first, job in brackets — so the dialog
+      // and the note both point at the card the operator just pressed.
+      const name = agentWithRoleLabel(role);
       if (
         typeof window !== "undefined" &&
         !window.confirm(
-          `Remove "${role.title}"? If candidates have already been screened for it, it is archived rather than deleted so their records keep the job they applied for.`,
+          `Remove "${name}"? If candidates have already been screened for it, it is archived rather than deleted so their records keep the job they applied for.`,
         )
       ) {
         return;
@@ -143,8 +147,8 @@ export function RolesPage() {
         const result = await api.deleteRole(role.id);
         setRemovalNote(
           result.outcome === "archived"
-            ? `"${role.title}" was archived rather than deleted — ${result.candidates ?? 0} candidate${result.candidates === 1 ? "" : "s"} and ${result.sessions ?? 0} session${result.sessions === 1 ? "" : "s"} still reference it.`
-            : `"${role.title}" was deleted.`,
+            ? `"${name}" was archived rather than deleted — ${result.candidates ?? 0} candidate${result.candidates === 1 ? "" : "s"} and ${result.sessions ?? 0} session${result.sessions === 1 ? "" : "s"} still reference it.`
+            : `"${name}" was deleted.`,
         );
         load();
       } catch (e) {
@@ -256,19 +260,35 @@ export function RolesPage() {
                 >
                   <div className="flex items-start justify-between gap-3">
                     <div className="min-w-0">
-                      <h2 className="min-w-0 truncate text-[15px] font-semibold tracking-[-0.01em] text-ink">
-                        {role.title}
+                      {/* AGENT FIRST, job second (owner request). The agent
+                          name is how an operator tells two roles apart day to
+                          day, so it is the heading; a role without one falls
+                          back to its title, so the heading is never blank. The
+                          agent name is never spoken to a candidate — `title`
+                          stays the only name the phone worker says.
+
+                          `title` carries the FULL text: `truncate` cuts an
+                          80-character agent name to an ellipsis, and without
+                          it a sighted operator had no way to read the rest.
+                          The heading's accessible name is still its content,
+                          which was never truncated. */}
+                      <h2
+                        title={agentLabel(role)}
+                        className="min-w-0 truncate text-[15px] font-semibold tracking-[-0.01em] text-ink"
+                      >
+                        {agentLabel(role)}
                       </h2>
-                      {/* SHOWN, because a field you can only write is a field
-                          nobody can check. The agent name is how an operator
-                          tells two roles apart internally; it is never spoken
-                          to a candidate, and the label says so. */}
-                      {role.agent_name && (
+                      {/* The job, underneath — only when the heading is NOT
+                          already the job. Repeating the title under itself
+                          would be noise, not information. Truncated too, so
+                          it carries its full text the same way. */}
+                      {roleAgentName(role) && (
                         <p
-                          data-role-agent-name=""
+                          data-role-title-secondary=""
+                          title={`Role: ${role.title}`}
                           className="mt-0.5 truncate text-xs text-ink-tertiary"
                         >
-                          Agent: {role.agent_name}
+                          Role: {role.title}
                         </p>
                       )}
                     </div>
@@ -315,10 +335,14 @@ export function RolesPage() {
                         // the visible text becomes "Deleting…" is the SC 2.5.3
                         // mismatch the Rephrase button two elements away was
                         // just fixed for.
+                        //
+                        // The name LEADS WITH WHAT THE CARD'S HEADING SAYS
+                        // (the agent), then the job in brackets, so a screen
+                        // reader hears the same name a sighted operator sees.
                         aria-label={
                           deletingId === role.id
-                            ? `Deleting role ${role.title}…`
-                            : `Delete role ${role.title}`
+                            ? `Deleting role ${agentWithRoleLabel(role)}…`
+                            : `Delete role ${agentWithRoleLabel(role)}`
                         }
                         aria-busy={deletingId === role.id}
                         aria-disabled={deletingId !== null}

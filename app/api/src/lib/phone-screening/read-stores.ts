@@ -62,8 +62,6 @@ import {
 const APPOINTMENT_COLUMNS =
   'id,engagement_id,starts_at,ends_at,ist_date,status,source,confirmed_at,cancel_reason,version,created_at,updated_at';
 
-/** `phone_engagements`. `application_link_id`, `role_id`, `session_id` and
- *  `consent_record_id` are not read: none of them is shown anywhere. */
 /**
  * The attempt->engagement bridge, read by the internal worker surface. Two
  * DECLARED lists rather than inline selects, because a structural test admits
@@ -80,8 +78,20 @@ const ATTEMPT_LINK_COLUMNS = 'id,engagement_id';
  */
 const ENGAGEMENT_LINK_COLUMNS = 'id,state,version,session_id';
 
+/**
+ * `phone_engagements`. A column is read only when something shows or uses it.
+ * `application_link_id`, `session_id` and `consent_record_id` are still not
+ * read here: none of them is shown anywhere (`application_link_id` is also on
+ * the structural suite's forbidden list).
+ *
+ * `role_id` IS read (M006/T04), because the calendar's agent filter now uses
+ * it: it is the role — the screening agent's pipeline — the engagement was
+ * opened for. It is a `screening_v2.roles` key, not a contact, provider or
+ * operator identifier, and it is projected as a bare id; the role's names are
+ * resolved by the operator's own role-scoped `/api/roles` read, never here.
+ */
 const ENGAGEMENT_COLUMNS =
-  'id,candidate_id,state,state_reason,epoch,version,no_answer_attempts,reconnects_used,provider_failures,next_eligible_at,last_attempt_at,terminal_at,created_at,updated_at';
+  'id,candidate_id,role_id,state,state_reason,epoch,version,no_answer_attempts,reconnects_used,provider_failures,next_eligible_at,last_attempt_at,terminal_at,created_at,updated_at';
 
 /**
  * `phone_call_attempts`, minus every provider-bearing column. `sip_call_id`,
@@ -222,6 +232,9 @@ function mapEngagement(row: Row): PhoneEngagementRow {
   return {
     id,
     candidateId,
+    // Nullable in 0042 (`on delete set null`), so a missing role is a
+    // legitimate answer rather than drift.
+    roleId: nullableStr(row, 'role_id'),
     state,
     stateReason: reasonCode(row, 'state_reason'),
     epoch,
