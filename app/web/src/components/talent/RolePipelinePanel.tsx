@@ -40,6 +40,7 @@ import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { api } from '../../api';
 import type { FunnelSummaryTotals, Role } from '../../types';
 import { GlassPanel, InlineNotice } from '../design';
+import { agentWithRoleLabel } from '../../lib/role-label';
 import { PipelineBar } from './PipelineBar';
 import type { PipelineSegment } from './PipelineBar';
 
@@ -343,14 +344,19 @@ export function RolePipelinePanel({ roles, roleId }: RolePipelinePanelProps) {
         {populated.map(({ role, totals }) => (
           <div key={role.id} data-role-pipeline={role.id}>
             <div className="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1">
-              <h3 className="text-sm font-medium text-[var(--c-ink)]">{role.title}</h3>
+              {/* AGENT FIRST, the job in brackets (owner request); a role
+                  without an agent name is its title alone. The bar's legend
+                  below is named the same way, so both say one thing. */}
+              <h3 className="text-sm font-medium text-[var(--c-ink)]">
+                {agentWithRoleLabel(role)}
+              </h3>
               <span className="text-[13px] tabular-nums text-[var(--c-ink-secondary)]">
                 {totals.candidates_total.toLocaleString()} in pipeline
               </span>
             </div>
             <PipelineBar
               className="mt-2"
-              label={`Pipeline for ${role.title}`}
+              label={`Pipeline for ${agentWithRoleLabel(role)}`}
               total={stageTotals(totals).total}
               segments={segmentsFor(totals)}
               footnote={<StageTotals totals={totals} />}

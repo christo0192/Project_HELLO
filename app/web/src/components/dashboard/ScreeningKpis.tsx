@@ -47,6 +47,7 @@ import {
   cx,
 } from '../design';
 import { LineChart } from '../charts';
+import { uniqueAgentLabels } from '../../lib/role-label';
 
 /** Selectable trailing windows. 30 is the default the endpoint already uses. */
 const RANGE_OPTIONS = [
@@ -129,6 +130,11 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
   // in and this never fires.
   const [loadedRoles, setLoadedRoles] = useState<Role[]>([]);
   const roles = rolesProp ?? loadedRoles;
+  // The filter NAMES each role by its agent (owner request), falling back to
+  // the title for a role without one. Two roles can share a label — two
+  // "Sales Program Advisor"s exist today — so exact duplicates are numbered;
+  // the option VALUE stays the role id, so the filter itself never changes.
+  const agentLabels = useMemo(() => uniqueAgentLabels(roles), [roles]);
   const [roleId, setRoleId] = useState<string>('');
   const [data, setData] = useState<FunnelSummaryResponse | null>(null);
   const [loading, setLoading] = useState(true);
@@ -355,16 +361,16 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
         <div className="flex flex-wrap items-center gap-2">
           {roles.length > 0 && (
             <label className="flex items-center gap-2 text-[13px] text-ink-secondary">
-              <span className="sr-only">Filter by role</span>
+              <span className="sr-only">Filter by agent</span>
               <select
                 value={roleId}
                 onChange={(e) => setRoleId(e.target.value)}
                 className="glass-sunken rounded-lg px-3 py-1.5 text-[13px] text-ink"
               >
-                <option value="">All roles</option>
+                <option value="">All agents</option>
                 {roles.map((r) => (
                   <option key={r.id} value={r.id}>
-                    {r.title}
+                    {agentLabels.get(r.id) ?? r.title}
                   </option>
                 ))}
               </select>

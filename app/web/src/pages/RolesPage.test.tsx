@@ -405,12 +405,38 @@ describe('RolesPage', () => {
     );
   });
 
-  it('shows the AGENT NAME on the role card — a write-only field is uncheckable', async () => {
-    mockApi.listRoles.mockResolvedValue([{ ...mockRole, agent_name: 'Gopu' }]);
+  it('leads the role card with the AGENT NAME, and puts the job underneath', async () => {
+    // Owner request: agent on top, role name below — the two swapped.
+    mockApi.listRoles.mockResolvedValue([{ ...mockRole, agent_name: '  Gopu  ' }]);
     render(<RolesPage />);
-    await waitFor(() =>
-      expect(document.querySelector('[data-role-agent-name]')?.textContent).toContain('Gopu'),
-    );
+    const heading = await screen.findByRole('heading', { level: 2, name: 'Gopu' });
+    expect(heading).toBeInTheDocument();
+    // The job title is no longer a heading of its own...
+    expect(
+      screen.queryByRole('heading', { level: 2, name: mockRole.title }),
+    ).not.toBeInTheDocument();
+    // ...it is the secondary line, labelled so nobody mistakes it for the agent.
+    const secondary = document.querySelector('[data-role-title-secondary]');
+    expect(secondary?.textContent).toBe(`Role: ${mockRole.title}`);
+    // Sits in the same block as the heading, directly below it.
+    expect(heading.nextElementSibling).toBe(secondary);
+    // The old "Agent: …" line is gone, not shown twice.
+    expect(screen.queryByText(/^Agent:/)).not.toBeInTheDocument();
+  });
+
+  it.each([
+    ['no agent name', undefined],
+    ['a null agent name', null],
+    ['a blank agent name', '   '],
+  ])('falls back to the job TITLE as the heading for %s, without repeating it', async (_label, agent_name) => {
+    mockApi.listRoles.mockResolvedValue([{ ...mockRole, agent_name }]);
+    render(<RolesPage />);
+    expect(
+      await screen.findByRole('heading', { level: 2, name: mockRole.title }),
+    ).toBeInTheDocument();
+    // The heading already IS the job; a "Role: …" line under it would say it twice.
+    expect(document.querySelector('[data-role-title-secondary]')).toBeNull();
+    expect(screen.queryByText(/^Role:/)).not.toBeInTheDocument();
   });
 
   it('new role form validates required job role', async () => {
@@ -835,6 +861,22 @@ describe('Removing a role', () => {
     render(<RolesPage />);
     expect(
       await screen.findByRole('button', { name: `Delete role ${mockRole.title}` }),
+    ).toBeInTheDocument();
+  });
+
+  it('names the AGENT first when the card leads with one — the name a screen reader hears matches the heading', async () => {
+    mockApi.listRoles.mockResolvedValue([{ ...mockRole, agent_name: 'Gopu' }]);
+    render(<RolesPage />);
+    const button = await screen.findByRole('button', {
+      name: `Delete role Gopu (${mockRole.title})`,
+    });
+    await userEvent.click(button);
+    // The confirm and the outcome note name the same card the same way.
+    expect(window.confirm).toHaveBeenCalledWith(
+      expect.stringContaining(`Remove "Gopu (${mockRole.title})"?`),
+    );
+    expect(
+      await screen.findByText(`"Gopu (${mockRole.title})" was deleted.`),
     ).toBeInTheDocument();
   });
 });

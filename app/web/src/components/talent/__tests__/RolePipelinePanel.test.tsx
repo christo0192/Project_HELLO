@@ -21,8 +21,8 @@ vi.mock('../../../api', () => ({
 import { RolePipelinePanel } from '../RolePipelinePanel';
 import { funnelTotals } from '../../../test/funnel';
 
-const ROLE = (id: string, title: string) =>
-  ({ id, title, jd: '', required_skills: [], screening_template: [] }) as never;
+const ROLE = (id: string, title: string, agent_name?: string | null) =>
+  ({ id, title, agent_name, jd: '', required_skills: [], screening_template: [] }) as never;
 
 const ROLES = [ROLE('r1', 'Sales'), ROLE('r2', 'Support')];
 
@@ -275,5 +275,35 @@ describe('RolePipelinePanel', () => {
     // Selected is present but carries the caveat, never a figure.
     expect(within(legend).getByText('Not tracked yet')).toBeInTheDocument();
     expect(legend.querySelector('[data-segment-value="selected"]')).toBeNull();
+  });
+
+  it('leads each role with its AGENT name, the job in brackets — heading and legend alike', async () => {
+    // Owner request: agent name primary, role name in brackets.
+    mockApi.getScreeningFunnel.mockImplementation(() =>
+      Promise.resolve({ totals: funnelTotals({ candidates_total: 3, dialed: 1 }) }),
+    );
+    render(
+      <RolePipelinePanel
+        roles={[
+          ROLE('r1', 'Sales', '  Gopu  '),
+          ROLE('r2', 'Support', null),
+          ROLE('r3', 'Ops', '   '),
+          ROLE('r4', 'Finance'),
+        ]}
+      />,
+    );
+    await expand();
+
+    expect(screen.getByRole('heading', { level: 3, name: 'Gopu (Sales)' })).toBeVisible();
+    expect(screen.getByRole('list', { name: 'Pipeline for Gopu (Sales)' })).toBeInTheDocument();
+    // The bare title is no longer the heading when an agent exists.
+    expect(screen.queryByRole('heading', { level: 3, name: 'Sales' })).not.toBeInTheDocument();
+
+    // No agent name (null, blank, or absent) → the title alone, never "()".
+    for (const title of ['Support', 'Ops', 'Finance']) {
+      expect(screen.getByRole('heading', { level: 3, name: title })).toBeVisible();
+      expect(screen.getByRole('list', { name: `Pipeline for ${title}` })).toBeInTheDocument();
+    }
+    expect(screen.queryByText(/\(\s*\)/)).not.toBeInTheDocument();
   });
 });
