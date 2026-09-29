@@ -211,6 +211,7 @@ describe('probeJobDirectory — copies id/title/status/openedAt ONLY', () => {
       jobs: [{ id: 'job_1', title: 'Senior Engineer', status: 'Open', openedAt: '2026-09-01T10:00:00.000Z' }],
       truncated: false,
       withheld: 0,
+      timedOut: false,
     });
     expect(Object.keys(r.jobs[0]).sort()).toEqual(['id', 'openedAt', 'status', 'title']);
     const serialized = JSON.stringify(r);
@@ -378,7 +379,7 @@ describe('probeJobDirectory — copies id/title/status/openedAt ONLY', () => {
 
   it('reads a non-array results payload as an empty page, not a guess', async () => {
     const { reader } = pagedReader([{ results: { jobs: [listed({ id: 'j1', title: 'Nested' })] } }]);
-    expect(await probeJobDirectory(reader)).toEqual({ jobs: [], truncated: false, withheld: 0 });
+    expect(await probeJobDirectory(reader)).toEqual({ jobs: [], truncated: false, withheld: 0, timedOut: false });
   });
 
   it('touches no member of the client other than jobList', async () => {
@@ -417,6 +418,16 @@ describe('sanitizeTitle — what a job (or stage) title may carry', () => {
   it('turns a title made only of zero-width / format characters into null, not an empty-looking entry', async () => {
     expect(await titleOf(cp(0x200b, 0x200c, 0x200d, 0x2060, 0xfeff))).toBeNull();
     expect(await titleOf(`  ${cp(0x200b)}  ${cp(0x00ad)} `)).toBeNull();
+  });
+
+  it('REMOVES the zero-width joiners inside a word instead of splitting it with a space', async () => {
+    // Persian "mi-khaham" is written with a ZWNJ between its parts; a space
+    // there would turn one word into two. Same for an emoji ZWJ sequence.
+    expect(await titleOf(`می${cp(0x200c)}خواهم`)).toBe('میخواهم');
+    expect(await titleOf(`Dev${cp(0x200d)}Ops Lead`)).toBe('DevOps Lead');
+    // Two titles differing only by a joiner come out identical, so the
+    // picker's duplicate disambiguation can see them.
+    expect(await titleOf(`Sales${cp(0x200c)} Advisor`)).toBe(await titleOf('Sales Advisor'));
   });
 
   it('replaces C0, DEL and C1 controls and the Unicode line/paragraph separators with a space', async () => {
@@ -507,6 +518,8 @@ describe('probeJobDirectory — bounded pagination', () => {
     expect(jobList).toHaveBeenCalledTimes(20);
     expect(r.jobs).toHaveLength(40);
     expect(r.truncated).toBe(true);
+    // A BOUND clipped it, not the clock: the route may cache this walk.
+    expect(r.timedOut).toBe(false);
   });
 
   it('stops at the 2000-job cap with truncated:true, even when a provider over-fills pages', async () => {
@@ -578,6 +591,8 @@ describe('probeJobDirectory — one ~20 s deadline for the whole walk', () => {
     expect(s.jobList).toHaveBeenCalledTimes(3);
     expect(r.jobs.map((j) => j.id)).toEqual(['job_1', 'job_2', 'job_3']);
     expect(r.truncated).toBe(true);
+    // The CLOCK clipped it: the route must not cache this walk.
+    expect(r.timedOut).toBe(true);
   });
 
   it('turns a page that FAILS on the deadline into a truncated partial when earlier pages were read', async () => {
@@ -590,7 +605,7 @@ describe('probeJobDirectory — one ~20 s deadline for the whole walk', () => {
         throw Object.assign(new Error('ashby_timeout'), { code: 'deadline_exceeded' });
       });
     const r = await probeJobDirectory({ jobList } as never, { now: () => t });
-    expect(r).toEqual({ jobs: [{ id: 'job_1', title: 'One', status: null, openedAt: null }], truncated: true, withheld: 0 });
+    expect(r).toEqual({ jobs: [{ id: 'job_1', title: 'One', status: null, openedAt: null }], truncated: true, withheld: 0, timedOut: true });
   });
 
   it('treats any failure once the clock is past the deadline as the deadline (a cut-short request surfaces as a timeout first)', async () => {
@@ -600,6 +615,7 @@ describe('probeJobDirectory — one ~20 s deadline for the whole walk', () => {
       .mockImplementationOnce(async () => { t += 25_000; throw new Error('ashby_retry_exhausted'); });
     const r = await probeJobDirectory({ jobList } as never, { now: () => t });
     expect(r.truncated).toBe(true);
+    expect(r.timedOut).toBe(true);
     expect(r.jobs).toHaveLength(1);
   });
 

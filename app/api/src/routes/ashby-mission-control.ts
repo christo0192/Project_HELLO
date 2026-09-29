@@ -263,7 +263,10 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
   // limit, once per admin, concurrently. The directory is tenant-wide (no
   // per-admin filter), so one walk can serve everyone for a short window:
   //  * single-flight — concurrent requests share the ONE in-flight walk;
-  //  * a successful walk (partial ones included) is reused for 60 s;
+  //  * a successful walk is reused for 60 s — including one a page/item bound
+  //    clipped, since re-walking would clip it the same way;
+  //  * a walk the DEADLINE cut short is served but never cached: a slow minute
+  //    at Ashby must not hide jobs from every admin for the whole window;
   //  * a FAILED walk is never cached — the next request simply tries again.
   // The audit row stays per request, cache hit or not.
   const now = deps.now ?? Date.now;
@@ -278,7 +281,7 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     }
     if (directoryInFlight) return directoryInFlight;
     const flight = probeJobDirectory(reader, { now }).then((value) => {
-      directoryCache = { at: now(), value };
+      if (!value.timedOut) directoryCache = { at: now(), value };
       return value;
     });
     directoryInFlight = flight;

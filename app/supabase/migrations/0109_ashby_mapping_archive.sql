@@ -40,7 +40,9 @@
 -- Fail fast rather than queue: every statement below takes a table lock on a
 -- table phone admission and webhooks read constantly. A long-held lock should
 -- fail this deploy (it retries cleanly), not stall live screening behind it.
-set lock_timeout = '10s';
+-- LOCAL: scoped to this migration's transaction, so it can never persist on
+-- a pooled connection and change lock behaviour for anything after it.
+set local lock_timeout = '10s';
 
 alter table screening_v2.ashby_job_mappings
   add column if not exists archived_at timestamptz,

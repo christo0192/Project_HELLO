@@ -88,24 +88,35 @@ const ID_RE = /^[A-Za-z0-9_.:-]{1,256}$/;
  *  - U+2028 LINE / U+2029 PARAGRAPH SEPARATOR, which break a line in a log
  *    or a UI exactly as a newline does;
  *  - every Unicode FORMAT character (`\p{Cf}`): bidi embeddings, overrides
- *    and isolates (U+202A–U+202E, U+2066–U+2069), zero-width space/joiners
- *    (U+200B–U+200D), word joiner, BOM, soft hyphen, … All invisible, and
+ *    and isolates (U+202A–U+202E, U+2066–U+2069), zero-width space (U+200B),
+ *    word joiner, BOM, soft hyphen, … (the two joiners are handled by
+ *    TITLE_JOINER_RE below, before this runs). All invisible, and
  *    the bidi ones make a title RENDER as different text from what it is —
  *    an admin picks a job by name, so the name must be the one it looks like.
  */
 const TITLE_UNSAFE_RE = /[\u0000-\u001F\u007F-\u009F\u2028\u2029\p{Cf}]+/gu;
+/**
+ * ZERO WIDTH NON-JOINER / JOINER are the exception: they sit INSIDE a word in
+ * Indic and Persian scripts and inside emoji sequences, so turning one into a
+ * space splits a real word in two. They are removed outright instead \u2014 still
+ * invisible-free, and two titles that differ only by them become identical,
+ * which is what lets duplicate-title disambiguation see them.
+ */
+const TITLE_JOINER_RE = /[\u200c\u200d]/g;
 
 /**
  * Sanitize a tenant-controlled display title: NFC-normalize (one spelling per
- * look), replace unsafe characters with a space, collapse space runs, trim,
- * and only THEN bound, so the bound counts visible text. A title made of
- * nothing but invisible characters is `null`, not an empty-looking entry.
- * Shared by every probe surface (stages, forms, fields, jobs).
+ * look), drop joiners, replace other unsafe characters with a space, collapse
+ * space runs, trim, and only THEN bound, so the bound counts visible text. A
+ * title made of nothing but invisible characters is `null`, not an
+ * empty-looking entry. Shared by every probe surface (stages, forms, fields,
+ * jobs).
  */
 function sanitizeTitle(raw: unknown): string | null {
   if (typeof raw !== 'string') return null;
   const cleaned = raw
     .normalize('NFC')
+    .replace(TITLE_JOINER_RE, '')
     .replace(TITLE_UNSAFE_RE, ' ')
     .replace(/ {2,}/g, ' ')
     .trim();
@@ -649,6 +660,13 @@ export interface ProbeJobDirectory {
    * explicitly `confidential: false`. A count only — never an id or title.
    */
   withheld: number;
+  /**
+   * True when the overall deadline — not a page/item bound — cut the walk
+   * short. Internal: the route does not cache such a walk, because a slow
+   * minute at Ashby is not a property of the directory and must not hide
+   * jobs from every admin for the whole cache window.
+   */
+  timedOut: boolean;
 }
 
 /** Reader seam for one `job.list` page — satisfied by AshbyClient. */
@@ -753,6 +771,7 @@ export async function probeJobDirectory(
   const seenCursors = new Set<string>();
   let cursor: string | undefined;
   let truncated = false;
+  let timedOut = false;
   let pagesRead = 0;
 
   for (let page = 1; ; page += 1) {
@@ -761,6 +780,7 @@ export async function probeJobDirectory(
     if (now() >= deadlineAt) {
       if (pagesRead === 0) throw new Error('ashby_job_directory_deadline');
       truncated = true;
+      timedOut = true;
       break;
     }
     let res: Awaited<ReturnType<JobListReader['jobList']>>;
@@ -773,6 +793,7 @@ export async function probeJobDirectory(
     } catch (err) {
       if (pagesRead > 0 && isDeadlineHit(err, now(), deadlineAt)) {
         truncated = true;
+        timedOut = true;
         break;
       }
       throw err;
@@ -812,5 +833,5 @@ export async function probeJobDirectory(
     cursor = next;
   }
 
-  return { jobs: [...jobs.values()].sort(byTitle), truncated, withheld: withheld.size };
+  return { jobs: [...jobs.values()].sort(byTitle), truncated, withheld: withheld.size, timedOut };
 }

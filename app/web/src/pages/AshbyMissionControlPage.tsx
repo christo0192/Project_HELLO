@@ -131,11 +131,18 @@ const NO_ACTIVE_ROLES_HINT = 'Create one on the Roles page first.';
 /**
  * What Delete does, said before it is done. An archive, not a pause: it
  * cannot be undone, and adding the job again starts a NEW mapping.
+ *
+ * The middle sentence is the one an admin would otherwise learn the hard way.
+ * A candidate's workflow stays attached to the mapping it was imported under
+ * (0109 freezes that row so its history is never re-pointed), so anyone that
+ * mapping imported but had not screened yet is not picked up by a re-added
+ * mapping — only new applicants are.
  */
 const DELETE_CONSEQUENCES =
   "It won't screen anyone again and disappears from this list. Candidates already screened — " +
-  'their calls, scores and history — are kept. You can add this job again later as a new, ' +
-  'paused mapping.';
+  'their calls, scores and history — are kept. Candidates it imported but has not screened ' +
+  "yet won't be screened. You can add this job again later as a new, paused mapping for new " +
+  'applicants.';
 /**
  * The route's cap on a mapping `label` (its `MAX_LABEL_LEN`, counted in UTF-16
  * units like `String.length`). A longer job title would be refused whole as
@@ -518,7 +525,17 @@ export function AshbyMissionControlPage() {
         else setError(null);
         await load();
       } catch (e) {
-        setError(e instanceof ApiError ? e.message : 'Action failed');
+        // `archived`: the mapping was deleted in another tab or by another
+        // admin, so this row is stale. Say so in words and refresh — leaving
+        // the row on screen would invite the same click again.
+        if (e instanceof ApiError && e.message === 'archived') {
+          // Refresh FIRST: a successful `load()` clears the page error, so
+          // setting the message before it would erase it.
+          await load();
+          setError('This mapping was deleted elsewhere. The list has been refreshed.');
+        } else {
+          setError(e instanceof ApiError ? e.message : 'Action failed');
+        }
       } finally {
         setBusy(false);
       }
@@ -1295,8 +1312,8 @@ export function AshbyMissionControlPage() {
                 // of Ashby: the one job an admin came for may be past the
                 // cut, and nothing else on screen would show it.
                 <InlineNotice tone="warning" role="none">
-                  Ashby returned more jobs than this list can show. If a job is missing, ask an
-                  engineer.
+                  This list may be incomplete — Ashby was slow or has more jobs than it can
+                  show. If a job is missing, close this and try again in a minute.
                 </InlineNotice>
               )}
               {jobsHidden && (
@@ -1667,12 +1684,18 @@ function jobDisplayNames(jobs: AshbyJob[]): string[] {
   });
 }
 
-/** The viewer's own date format, or null when Ashby's value is missing or unparseable. */
+/**
+ * The opening date as "2 Jul 2026", or null when Ashby's value is missing or
+ * unparseable. FIXED locale and UTC, not the viewer's: this string becomes
+ * part of a duplicate job's name, and that name is SAVED as the mapping's
+ * label — a viewer-local format would store "2 Jul" for an admin in India and
+ * render "Jul 1" for one in the US, and the row would then show two dates.
+ */
 function openedDate(iso: string | null): string | null {
   if (!iso) return null;
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return null;
-  return date.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  return date.toLocaleDateString('en-GB', { year: 'numeric', month: 'short', day: 'numeric', timeZone: 'UTC' });
 }
 
 /** A job's display name (`jobDisplayNames`) and its bare title, by job id. */

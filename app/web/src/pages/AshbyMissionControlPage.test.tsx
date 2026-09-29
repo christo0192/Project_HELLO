@@ -151,6 +151,36 @@ describe('AshbyMissionControlPage', () => {
     expect(listAshbyMappings).toHaveBeenCalledTimes(2); // initial + reload
   });
 
+  it('says a mapping deleted ELSEWHERE in words and refreshes the stale row', async () => {
+    // The API really answers 409 `archived` (0109) for a pause/resume of a
+    // mapping another tab or admin deleted. The raw code is not copy, and the
+    // stale row must go so the same click is not offered again.
+    pauseAshbyMapping.mockRejectedValue(new ApiError('archived', 409));
+    renderPage();
+    await screen.findByText('Account Executive');
+    await userEvent.click(screen.getAllByRole('button', { name: 'Pause' })[0]);
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      'This mapping was deleted elsewhere. The list has been refreshed.',
+    );
+    expect(screen.queryByText('archived')).not.toBeInTheDocument();
+    expect(listAshbyMappings).toHaveBeenCalledTimes(2); // initial + refresh
+  });
+
+  it('asks the API for every mapping (the route maximum), so none reads as unmapped', async () => {
+    // Asserted on the real client, not the mock: the page's "already mapped"
+    // marking is only as complete as this list.
+    const real = await vi.importActual<typeof import('../api')>('../api');
+    const fetchSpy = vi.spyOn(globalThis, 'fetch').mockResolvedValue(
+      new Response(JSON.stringify({ ok: true, mappings: [] }), { status: 200, headers: { 'Content-Type': 'application/json' } }),
+    );
+    try {
+      await real.api.listAshbyMappings();
+      expect(String(fetchSpy.mock.calls[0]?.[0])).toContain('/mission-control/mappings?limit=200');
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
   it('cancels a non-terminal workflow and retries a failed operation', async () => {
     renderPage();
     await screen.findByText('app_1');
@@ -1079,12 +1109,12 @@ describe('Adding a job mapping', () => {
     expect(jobSelect()).not.toHaveAccessibleDescription();
   });
 
-  it('WARNS when Ashby returned more jobs than the list can show', async () => {
+  it('WARNS when the job list may be incomplete (a bound OR a slow Ashby cut it)', async () => {
     listAshbyJobs.mockResolvedValue({ ...JOBS, truncated: true });
     await openDialog();
     expect(
       screen.getByText(
-        'Ashby returned more jobs than this list can show. If a job is missing, ask an engineer.',
+        'This list may be incomplete — Ashby was slow or has more jobs than it can show. If a job is missing, close this and try again in a minute.',
       ),
     ).toBeInTheDocument();
   });
@@ -1312,11 +1342,13 @@ describe('Deleting a job mapping', () => {
   const THREE = { ok: true, mappings: [...MAPPINGS.mappings, PAUSED] };
   const HINT = 'Pause this mapping before deleting it';
   // A deleted mapping is FROZEN: re-adding the job makes a NEW mapping, so
-  // the copy must not promise the old one "comes back".
+  // the copy must not promise the old one "comes back" — nor that the
+  // candidates it imported but never screened will be picked up by the new one.
   const CONSEQUENCES =
     "It won't screen anyone again and disappears from this list. Candidates already screened — " +
-    'their calls, scores and history — are kept. You can add this job again later as a new, ' +
-    'paused mapping.';
+    'their calls, scores and history — are kept. Candidates it imported but has not screened ' +
+    "yet won't be screened. You can add this job again later as a new, paused mapping for new " +
+    'applicants.';
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -1689,11 +1721,13 @@ describe('One name per job — rows, picker and Delete agree, same-titled jobs a
       { id: 'job_twin_new', title: 'Support Agent', status: 'Open', openedAt: '2026-08-20T12:00:00Z' },
     ],
   };
-  const day = (iso: string) =>
-    new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
-  const OLD = `Support Agent — opened ${day('2026-06-01T12:00:00Z')}`;
-  const CLOSED = `Support Agent — opened ${day('2026-07-15T12:00:00Z')}`;
-  const NEW = `Support Agent — opened ${day('2026-08-20T12:00:00Z')}`;
+  // LITERAL dates, not the test runner's locale: the disambiguated name is
+  // SAVED as the mapping label, so it must read the same for every admin
+  // (fixed en-GB, UTC) — a viewer-local format stored one day and rendered
+  // another.
+  const OLD = 'Support Agent — opened 1 Jun 2026';
+  const CLOSED = 'Support Agent — opened 15 Jul 2026';
+  const NEW = 'Support Agent — opened 20 Aug 2026';
   const base = MAPPINGS.mappings[0];
   const TWIN_MAPPINGS = {
     ok: true,

@@ -1066,6 +1066,29 @@ describe('GET /jobs — one shared, briefly cached walk (provider-call amplifica
     // Pages start at 0 s, 8 s and 16 s; the fourth would start at 24 s.
     expect(jobList).toHaveBeenCalledTimes(3);
     expect(res.body.jobs).toHaveLength(3);
+    // Internal — the walk's `timedOut` never reaches the response.
+    expect(res.body).not.toHaveProperty('timedOut');
+  });
+
+  it('serves a DEADLINE-cut walk but never caches it — the next request walks again', async () => {
+    // A slow minute at Ashby is not a property of the directory. Caching the
+    // partial list would hide the missing jobs from every admin for 60 s.
+    const clock = fakeClock();
+    let page = 0;
+    const jobList = vi.fn(async () => {
+      clock.advance(8_000);
+      page += 1;
+      return { results: [{ id: `job_${page}`, title: `Job ${page}`, confidential: false }], moreDataAvailable: true, nextCursor: `c${page}` };
+    });
+    const app = appWithDeps('admin', { store: fakeStore(), jobListReader: { jobList } as never, now: clock.now });
+    const first = await request(app).get('/mc/jobs');
+    expect(first.body.truncated).toBe(true);
+    expect(jobList).toHaveBeenCalledTimes(3);
+
+    clock.advance(1_000); // well inside the 60 s window
+    const second = await request(app).get('/mc/jobs');
+    expect(second.status).toBe(200);
+    expect(jobList).toHaveBeenCalledTimes(6);
   });
 
   it('answers 502 when the deadline runs out before the first page arrives', async () => {
