@@ -25,11 +25,15 @@ import type {
   Note,
   PhoneAppointmentWriteResponse,
   PhoneCalendarResponse,
+  PhoneHaltClearResponse,
+  PhoneHaltResponse,
+  PhoneHealthResponse,
   PhoneSlotsResponse,
   Recommendation,
   Role,
   RoleDraftJob,
   RoleScorecardMetric,
+  ScorecardMetricDraft,
   ScorecardMetricTemplate,
 } from '../../src/types';
 import { ADMIN_USER_ID, PHONE_WINDOW, SCOPED_REVIEW_LINK_ID, STAR_CANDIDATE_ID, funnelSummary, phoneSlots, type Dataset } from './data';
@@ -350,9 +354,21 @@ const ROUTES: Array<[string, string, Handler]> = [
   ['POST', '/api/phone/appointments', () => ok(phoneWrite())],
   ['PATCH', '/api/phone/appointments/:id', () => ok(phoneWrite())],
   ['DELETE', '/api/phone/appointments/:id', ({ params }) => ok({ ok: true, appointment_id: params.id, version: 3, already_cancelled: false })],
+  // Mission Control's halt control. Dialling is live in the fixture, so the
+  // control shows its resting "pause" state; the writes echo a clean toggle.
+  ['GET', '/api/phone/health', () => ok({ ok: true, enabled: true, status: 'ok', reasons: [], admission: { control_present: true, halted: false, halt_reason: null } } satisfies PhoneHealthResponse)],
+  ['POST', '/api/phone/halt', () => ok({ ok: true, halted: true, already_halted: false, reason: 'operator_pause', requested_reason: 'operator_pause' } satisfies PhoneHaltResponse)],
+  ['POST', '/api/phone/halt/clear', () => ok({ ok: true, halted: false, was_halted: true, previous_reason: 'operator_pause' } satisfies PhoneHaltClearResponse)],
 
   // ── Scorecards: metric library ("Scorebar") + role scorecards ──────
   ['GET', '/api/scorecards/metrics', (_r, db) => ok(db.metrics)],
+  ['POST', '/api/scorecards/metrics/draft', ({ body }) => {
+    const name = String(body?.name ?? 'this metric').toLowerCase();
+    return ok({
+      default_instruction: `Look for specific, first-hand evidence of ${name} in the answers.`,
+      rubric: { 1: 'No relevant evidence.', 2: 'A general claim without an example.', 3: 'One specific example.', 4: 'Several specific examples with outcomes.' },
+    } satisfies ScorecardMetricDraft);
+  }],
   ['POST', '/api/scorecards/metrics', ({ body }, db) => {
     const name = String(body?.name ?? 'New metric');
     const metric: ScorecardMetricTemplate = { id: mintId(), key: String(body?.key ?? name.toLowerCase().replace(/[^a-z0-9]+/g, '_')), name, description: (body?.description as string | null) ?? null, default_instruction: String(body?.default_instruction ?? ''), rubric: body?.rubric as ScorecardMetricTemplate['rubric'], archived_at: null, version: 1, created_at: nowIso(), updated_at: nowIso(), created_by: ADMIN_USER_ID };

@@ -1146,10 +1146,12 @@ describe('Scorebar — the metric library moved here from Mission Control', () =
 
     await userEvent.click(await screen.findByRole('button', { name: 'Scorebar' }));
     const drawer = await screen.findByRole('dialog', { name: 'Scorebar' });
-    await within(drawer).findByText('Add a metric');
+    // The create form opens on demand, from the library's own toolbar.
+    await userEvent.click(await within(drawer).findByRole('button', { name: 'New metric' }));
+    await within(drawer).findByRole('region', { name: 'Add a metric' });
     await userEvent.type(within(drawer).getByLabelText('Name'), 'Ownership');
     await userEvent.type(within(drawer).getByLabelText('Scoring instruction'), 'My own instruction.');
-    await userEvent.type(within(drawer).getByLabelText('1 · Poor'), 'No example.');
+    await userEvent.type(within(drawer).getByLabelText('1 Poor'), 'No example.');
 
     // Existing text, so Ask Hello asks before replacing it.
     await userEvent.click(within(drawer).getByRole('button', { name: /^Ask Hello/ }));
@@ -1174,7 +1176,7 @@ describe('Scorebar — the metric library moved here from Mission Control', () =
     const stillOpen = screen.getByRole('dialog', { name: 'Scorebar' });
     expect(within(stillOpen).getByLabelText('Name')).toHaveValue('Ownership');
     expect(within(stillOpen).getByLabelText('Scoring instruction')).toHaveValue('My own instruction.');
-    expect(within(stillOpen).getByLabelText('1 · Poor')).toHaveValue('No example.');
+    expect(within(stillOpen).getByLabelText('1 Poor')).toHaveValue('No example.');
     expect(mockApi.draftMetricRubric).not.toHaveBeenCalled();
     // Focus is back on the button that opened the dialog, inside the drawer.
     expect(within(stillOpen).getByRole('button', { name: /^Ask Hello/ })).toHaveFocus();
