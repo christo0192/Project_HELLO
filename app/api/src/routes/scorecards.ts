@@ -37,9 +37,12 @@ import {
   ScorecardValidationError,
 } from '../lib/scorecards/domain.js';
 import type { RoleScorecardMetric, RoleScorecardVersion } from '../lib/scorecards/contracts.js';
+import { draftMetricRubric } from '../lib/scorecards/metric-draft.js';
+import { RoleDraftError } from '../lib/role-authoring.js';
 import {
   METRIC_KEY_RE,
   createMetricSchema,
+  draftMetricSchema,
   metricIdParamSchema,
   putRoleScorecardSchema,
   redistributeSchema,
@@ -171,6 +174,55 @@ scorecardsRouter.post('/metrics', requireRole('admin'), validateBody(createMetri
   }
   res.status(201).json(data);
 });
+
+// POST /metrics/draft — Ask Hello: draft a scoring instruction and a 1..4
+// rubric from the name and description the admin has typed so far.
+//
+// DECLARED BEFORE every `/metrics/:id` route. None of today's collide (PATCH
+// is another verb, `/:id/archive` another depth), but the next POST
+// `/metrics/:id` added below would otherwise swallow the literal `draft` and
+// 400 it as a non-uuid — the exact bug `/api/roles/draft` shipped with.
+//
+// WRITES NOTHING to the library. The draft goes back to the form; the admin
+// reviews it and creates the metric through POST /metrics, which re-validates
+// every field. Synchronous, like Rephrase, and 422 — not 500 — when the model
+// could not produce a usable draft: "Hello could not" is a true statement
+// about a working system. The audit is best-effort for the same reason.
+scorecardsRouter.post(
+  '/metrics/draft',
+  requireRole('admin'),
+  validateBody(draftMetricSchema),
+  async (req, res, next) => {
+    const body = req.body as import('../schemas/scorecards.js').DraftMetricInput;
+    try {
+      const drafted = await draftMetricRubric({
+        name: body.name,
+        description: body.description ?? null,
+      });
+      try {
+        await recordAudit(req, 'resource.generate', 200, {
+          // The name, as /api/roles/draft records its job role: the output is
+          // one Create away from steering every score on this metric.
+          metadata: { action: 'scorecard_metric_draft', metric_name: body.name },
+        });
+      } catch {
+        /* writes nothing, so a dead audit sink must not lose the draft */
+      }
+      res.json(drafted);
+    } catch (err) {
+      if (err instanceof RoleDraftError) {
+        return res.status(422).json({
+          error: {
+            type: 'unprocessable_entity',
+            message: err.message,
+            details: { reason: err.reason },
+          },
+        });
+      }
+      next(err);
+    }
+  },
+);
 
 // PATCH /metrics/:id — edit template fields in place and bump its version.
 // Library edits DO NOT touch existing role snapshots: those were copied at
