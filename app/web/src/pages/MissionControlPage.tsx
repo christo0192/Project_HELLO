@@ -11,12 +11,16 @@
  * section is mirrored into the URL hash (`#sessions`) so a section is
  * shareable and survives a refresh; unknown hashes fall back to Overview.
  *
+ * Header: the global operator halt (`OperatorHaltControl`) on the right. It
+ * replaced two quick links (Ashby Mission Control, Phone calendar); both
+ * surfaces are in the sidebar's Operations group.
+ *
  * Role gate: non-admin operators see a truthful "admin access required"
  * panel and NO admin API calls are made (403-free by construction).
  */
 
 import { useCallback, useEffect, useState } from 'react';
-import { Link, useLocation, useNavigate } from 'react-router-dom';
+import { useLocation, useNavigate } from 'react-router-dom';
 import { api, ApiError } from '../api';
 import type { MeResponse } from '../types';
 import {
@@ -32,11 +36,11 @@ import {
   MaintenanceSection,
   FunnelSection,
   MissionControlSections,
+  OperatorHaltControl,
   OverviewSection,
   QuotasSection,
   SessionsSection,
 } from '../components/mission-control';
-import { CalendarIcon } from '../components/navigation';
 
 // `scorebar` is deliberately absent: the metric library moved to the Roles
 // page, where the person editing a role can reach it without changing pages.
@@ -107,29 +111,12 @@ export function MissionControlPage() {
         title="Mission Control"
         description="Every control here writes through the audited admin API. Nothing is estimated."
         actions={
-          <>
-            {/*
-              Quick links to the two sibling operator surfaces. Real <Link>s
-              (keyboard reachable, open-in-new-tab friendly), rendered ABOVE
-              the section tabs so they never disturb tab state or lazy
-              mounting. Permissions are unchanged: both routes already sit
-              inside the same admin-gated route group.
-            */}
-            <Link to="/ashby-mission-control" className={quickLinkClass}>
-              <span aria-hidden="true" className="flex h-5 w-5 items-center justify-center rounded-md bg-info-soft text-[10px] font-semibold text-info">
-                AS
-              </span>
-              Ashby Mission Control
-              <ArrowIcon />
-            </Link>
-            <Link to="/phone-calendar" className={quickLinkClass}>
-              <span aria-hidden="true" className="flex h-5 w-5 items-center justify-center rounded-md bg-info-soft text-info">
-                <CalendarIcon className="h-3.5 w-3.5" />
-              </span>
-              Phone calendar
-              <ArrowIcon />
-            </Link>
-          </>
+          /*
+            The global operator halt: red to halt, green to resume an operator
+            pause, neither while the switch cannot be read. Rendered ABOVE the
+            section tabs so it never disturbs tab state or lazy mounting.
+          */
+          <OperatorHaltControl />
         }
       />
 
@@ -149,16 +136,5 @@ export function MissionControlPage() {
         ]}
       />
     </div>
-  );
-}
-
-const quickLinkClass =
-  'inline-flex h-9 items-center gap-2 rounded-control bg-white/70 pl-2 pr-3 text-[13px] font-medium text-ink shadow-[inset_0_0_0_1px_var(--glass-ring-strong)] transition-[background-color,box-shadow,transform] duration-200 ease-soft hover:-translate-y-px hover:bg-white hover:shadow-pill focus:outline-none focus-visible:ring-2 focus-visible:ring-info focus-visible:ring-offset-2 focus-visible:ring-offset-surface-secondary';
-
-function ArrowIcon() {
-  return (
-    <svg aria-hidden="true" viewBox="0 0 24 24" className="h-3.5 w-3.5 text-ink-tertiary" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <path d="M7 17 17 7M8 7h9v9" />
-    </svg>
   );
 }

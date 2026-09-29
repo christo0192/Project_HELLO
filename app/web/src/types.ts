@@ -1941,3 +1941,73 @@ export interface PhoneVerificationInput {
 export interface PhoneVerificationResponse {
   ok: boolean;
 }
+
+// ── The phone admission kill switch (the operator halt) ─────────────────
+//
+// `GET /api/phone/health`, `POST /api/phone/halt` and
+// `POST /api/phone/halt/clear` (routes/phone.ts), typed from the OpenAPI
+// schemas `PhoneHealthResponse`, `PhoneAdmissionState`, `PhoneHaltBody`,
+// `PhoneHaltResponse` and `PhoneHaltClearResponse`.
+
+/**
+ * `set_phone_halt`'s reason allowlist (0042, and `PhoneHaltBody.reason`).
+ * `operator_pause` is the everyday pause an admin raises and lifts from
+ * Mission Control; the other four are incident stops cleared by runbook.
+ */
+export type PhoneHaltReason =
+  | 'operator_pause'
+  | 'provider_incident'
+  | 'cost_control'
+  | 'legal_hold'
+  | 'emergency_stop';
+
+/**
+ * The kill switch as the health surface reports it. A MISSING control
+ * singleton reads `control_present: false` and `halted: true` — the API fails
+ * closed and so must every reader. `halt_reason` is a plain string on the
+ * wire (the schema publishes no enum for it), so it is typed as one and
+ * narrowed where it is read rather than trusted to be a `PhoneHaltReason`.
+ */
+export interface PhoneAdmissionState {
+  control_present: boolean;
+  halted: boolean;
+  halt_reason: string | null;
+}
+
+/**
+ * The part of `GET /api/phone/health` this UI reads. The response carries
+ * more blocks (config, window, concurrency, backlog counts, runtime); they
+ * are left out rather than typed loosely. `admission` is null whenever the
+ * surface could not describe the switch: phone screening disabled, or the
+ * backlog unreadable.
+ */
+export interface PhoneHealthResponse {
+  ok: boolean;
+  enabled: boolean;
+  status: 'ok' | 'degraded' | 'disabled';
+  reasons: string[];
+  admission: PhoneAdmissionState | null;
+}
+
+/**
+ * Body of both halt routes. On `/halt/clear` the reason must NAME the halt
+ * currently in force, or the API answers 409 `halt_reason_mismatch`.
+ */
+export interface PhoneHaltInput {
+  reason: PhoneHaltReason;
+}
+
+export interface PhoneHaltResponse {
+  ok: boolean;
+  halted: boolean;
+  /** A halt was already in force; 0042 kept ITS reason, not the one sent. */
+  already_halted: boolean;
+  reason: string;
+}
+
+export interface PhoneHaltClearResponse {
+  ok: boolean;
+  halted: boolean;
+  was_halted: boolean;
+  previous_reason: string | null;
+}

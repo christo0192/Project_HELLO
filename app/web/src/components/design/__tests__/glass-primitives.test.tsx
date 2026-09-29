@@ -134,6 +134,10 @@ describe('buttonClass', () => {
     expect(buttonClass('primary')).toContain('bg-info');
     expect(buttonClass('ghost')).toContain('text-ink-secondary');
     expect(buttonClass('danger')).toContain('bg-error');
+    // The TEXT token as a fill: white on `--success` itself is under 4.5:1.
+    expect(buttonClass('success')).toContain('bg-success-text');
+    expect(buttonClass('success')).toContain('text-white');
+    expect(buttonClass('success')).not.toMatch(/\bbg-success\b(?!-)/);
   });
 });
 

@@ -1,7 +1,7 @@
 /**
  * Button — the shell's action control.
  *
- * Four variants, three sizes, press feedback via a CSS scale transition
+ * Five variants, three sizes, press feedback via a CSS scale transition
  * (collapses under reduced motion through the global media rule). Pure CSS
  * on purpose: buttons are the hottest primitive in the app and a motion
  * element per button made typed-input tests measurably slower in jsdom.
@@ -11,7 +11,7 @@
 import type { ButtonHTMLAttributes, ReactNode } from 'react';
 import { cx } from './cx';
 
-export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger';
+export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger' | 'success';
 export type ButtonSize = 'sm' | 'md' | 'lg';
 
 const base =
@@ -28,6 +28,12 @@ const variants: Record<ButtonVariant, string> = {
     'text-ink-secondary hover:bg-ink/[0.05] hover:text-ink',
   danger:
     'bg-error text-white shadow-pill hover:bg-[#a54e66] active:bg-[#98475e]',
+  /* The fill is the success TEXT token, not `bg-success`: white on the
+     `--success` hue is 3.9:1, under the 4.5:1 a 14px label needs, while
+     `--success-text` exists precisely to clear 4.5:1 against white (5.3:1).
+     Hover and press only darken it, so contrast never drops below rest. */
+  success:
+    'bg-success-text text-white shadow-pill hover:brightness-95 active:brightness-90',
 };
 
 const sizes: Record<ButtonSize, string> = {
