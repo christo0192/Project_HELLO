@@ -1,34 +1,41 @@
 /**
  * URL-addressable contract for the phone calendar.
  *
- * Four dimensions live in the query string so an operator can bookmark a
+ * Five dimensions live in the query string so an operator can bookmark a
  * week, send a colleague "the missed calls on this date", and use browser
  * back/forward without losing their place:
  *
  *   `week`   — the IST date of the Monday the grid starts on.
  *   `view`   — `week` (the grid) or `queue` (the chronological list).
+ *   `agent`  — one role id: only calls in that agent's (role's) pipeline.
  *   `status` — comma-separated appointment statuses.
  *   `state`  — comma-separated engagement states.
  *
  * ── FILTERING ADDS NO REQUESTS ────────────────────────────────────────
  * `week` is the only dimension the API knows about: it decides the `from`/`to`
- * bounds of the ONE calendar read. `view`, `status` and `state` are applied
- * client-side over the rows that read already returned. Changing them re-runs
- * no effect and issues no request — a test pins that, because a filter that
- * quietly refetches is how a list view becomes an N+1.
+ * bounds of the ONE calendar read. `view`, `agent`, `status` and `state` are
+ * applied client-side over the rows that read already returned. Changing them
+ * re-runs no effect and issues no request — a test pins that, because a
+ * filter that quietly refetches is how a list view becomes an N+1.
  *
  * ── UNKNOWN VALUES ARE DROPPED, NOT ECHOED ────────────────────────────
  * A hand-edited `?status=nonsense` parses to "no status filter" rather than
  * to a filter matching nothing. An operator who mistypes a link should see
- * the week, not an empty grid that looks like an outage.
+ * the week, not an empty grid that looks like an outage. `agent` follows the
+ * same rule twice: a value that is not a role id's SHAPE is dropped at parse
+ * (so no free text reaches the URL), and a well-formed id that names no role
+ * this operator can see is dropped by `resolvePhoneAgentFilter` once the
+ * roles have loaded.
  */
 
 import type {
   PhoneAppointmentStatus,
   PhoneCalendarAppointment,
   PhoneEngagementState,
+  Role,
 } from '../../types';
 import { isIstDate, istWeekStart, type IstDate } from '../../lib/ist-datetime';
+import { uniqueAgentLabels } from '../../lib/role-label';
 
 /** Appointment statuses, in the order the filter offers them. */
 export const PHONE_STATUS_ORDER = [
@@ -60,12 +67,21 @@ export const PHONE_STATE_ORDER = [
 const STATUS_SET = new Set<string>(PHONE_STATUS_ORDER);
 const STATE_SET = new Set<string>(PHONE_STATE_ORDER);
 
+/**
+ * The SHAPE of a role id (a Postgres uuid). Checked before anything else looks
+ * at the value, so the `agent` parameter is a closed shape like every other
+ * parameter here — never free text echoed back into a link.
+ */
+const ROLE_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
 export type PhoneCalendarView = 'week' | 'queue';
 
 export interface PhoneCalendarFilters {
   /** The Monday the grid starts on, IST. Never null — see `parse`. */
   weekStart: IstDate;
   view: PhoneCalendarView;
+  /** The selected agent's role id (null = all agents). */
+  agent: string | null;
   /** Selected appointment statuses (empty = all). */
   statuses: string[];
   /** Selected engagement states (empty = all). */
@@ -101,9 +117,11 @@ export function parsePhoneCalendarFilters(
   const rawWeek = params.get('week');
   const anchor = rawWeek && isIstDate(rawWeek) ? rawWeek : today;
   const rawView = params.get('view');
+  const rawAgent = params.get('agent')?.trim().toLowerCase() ?? '';
   return {
     weekStart: istWeekStart(anchor),
     view: rawView === 'queue' ? 'queue' : 'week',
+    agent: ROLE_ID.test(rawAgent) ? rawAgent : null,
     statuses: parseCsv(params.get('status'), PHONE_STATUS_ORDER, STATUS_SET),
     states: parseCsv(params.get('state'), PHONE_STATE_ORDER, STATE_SET),
   };
@@ -120,6 +138,7 @@ export function buildPhoneCalendarSearch(filters: PhoneCalendarFilters): URLSear
   const params = new URLSearchParams();
   params.set('week', filters.weekStart);
   if (filters.view === 'queue') params.set('view', 'queue');
+  if (filters.agent !== null) params.set('agent', filters.agent);
   if (filters.statuses.length > 0) params.set('status', filters.statuses.join(','));
   if (filters.states.length > 0) params.set('state', filters.states.join(','));
   return params;
@@ -127,7 +146,7 @@ export function buildPhoneCalendarSearch(filters: PhoneCalendarFilters): URLSear
 
 /** True when any dimension other than the week is narrowing the view. */
 export function hasActivePhoneFilters(filters: PhoneCalendarFilters): boolean {
-  return filters.statuses.length > 0 || filters.states.length > 0;
+  return filters.agent !== null || filters.statuses.length > 0 || filters.states.length > 0;
 }
 
 /** Client-side predicate over an already-loaded row. */
@@ -135,6 +154,10 @@ export function matchesPhoneFilters(
   appt: PhoneCalendarAppointment,
   filters: PhoneCalendarFilters,
 ): boolean {
+  // A row whose role is unknown (a torn read, or an engagement with no role)
+  // cannot satisfy an agent filter, for the same reason as the state rule
+  // below: matching it would claim a pipeline the API did not report.
+  if (filters.agent !== null && appt.role_id !== filters.agent) return false;
   if (filters.statuses.length > 0 && !filters.statuses.includes(appt.status)) {
     return false;
   }
@@ -211,4 +234,66 @@ export function togglePhoneFacet(
     : [...current, value];
   const order = dimension === 'status' ? PHONE_STATUS_ORDER : PHONE_STATE_ORDER;
   return { ...filters, [key]: order.filter((v) => next.includes(v)) };
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  The agent dimension
+// ══════════════════════════════════════════════════════════════════════
+
+/**
+ * What is known about the roles the `agent` parameter can name.
+ *
+ *   `'loading'`     — the roles read has not settled yet.
+ *   `'unavailable'` — it failed; the calendar carries on without the filter.
+ *   a set of ids    — every role this operator can see.
+ */
+export type PhoneAgentRoster = 'loading' | 'unavailable' | ReadonlySet<string>;
+
+/**
+ * The filters with the `agent` dimension resolved against the roster.
+ *
+ * ── A FILTER IS NEVER APPLIED WITHOUT ITS CONTROL ─────────────────────
+ * Once the roles are known, a deep-linked agent is kept only if it names one
+ * of them. A stale or foreign id falls back to "All agents" — the week, not
+ * an empty grid narrowed by a filter the dropdown cannot show or switch off.
+ * If the roles cannot be read at all there is no dropdown, so the agent
+ * filter is dropped for the same reason.
+ *
+ * While the roles are still LOADING the requested agent is kept: a valid link
+ * (the ordinary case) then shows its agent's calls from the first paint
+ * instead of flashing the whole week and narrowing a moment later.
+ */
+export function resolvePhoneAgentFilter(
+  filters: PhoneCalendarFilters,
+  roster: PhoneAgentRoster,
+): PhoneCalendarFilters {
+  if (filters.agent === null || roster === 'loading') return filters;
+  if (roster !== 'unavailable' && roster.has(filters.agent)) return filters;
+  return { ...filters, agent: null };
+}
+
+/** One option of the agent dropdown. */
+export interface PhoneAgentOption {
+  /** The role id — what the filter and the URL carry. */
+  id: string;
+  /** The agent name, else the role title; duplicates are suffixed ` (2)`. */
+  label: string;
+}
+
+/**
+ * The agent dropdown's options: every role the operator can see, labelled by
+ * `uniqueAgentLabels` (so two roles never show the same text) and sorted by
+ * that label. The id breaks any tie so the order is stable.
+ */
+export function phoneAgentOptions(
+  roles: ReadonlyArray<Pick<Role, 'id' | 'title' | 'agent_name'>>,
+): PhoneAgentOption[] {
+  const labels = uniqueAgentLabels(roles);
+  return roles
+    .map((role) => ({ id: role.id, label: labels.get(role.id) ?? role.title }))
+    .sort(
+      (a, b) =>
+        a.label.localeCompare(b.label, undefined, { sensitivity: 'base', numeric: true }) ||
+        (a.id < b.id ? -1 : a.id > b.id ? 1 : 0),
+    );
 }

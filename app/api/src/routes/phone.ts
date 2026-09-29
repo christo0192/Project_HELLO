@@ -402,6 +402,18 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
             // FK cascades, so this is a torn read, not a missing relationship —
             // reported as null rather than guessed at.
             engagement_state: engagement?.state ?? null,
+            // The agent (role) pipeline this call belongs to — the web
+            // calendar's agent filter keys on it. Deliberately the ENGAGEMENT's
+            // role, not `candidates.role_id`: the engagement's role is stamped
+            // when the cycle opens and stays with the call, while the
+            // candidate's role is current state that can move after the call
+            // was booked (0047 then flags the old engagement
+            // `identity_mismatch` rather than re-homing it). It sits beside
+            // `engagement_state` because it is an engagement fact, not a
+            // candidate one. Null on the same torn read, or when the
+            // engagement carries no role; a bare id — labels come from the
+            // operator's own role-scoped `/api/roles` read.
+            role_id: engagement?.roleId ?? null,
             candidate: candidateBlock(
               engagement ? candidateById.get(engagement.candidateId) : undefined,
             ),

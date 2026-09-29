@@ -11528,9 +11528,9 @@ components:
       additionalProperties: false
 
     PhoneCalendarAppointment:
-      description: A calendar row — one appointment plus the engagement state and candidate reference it belongs to. engagement_state and candidate are null only on a torn read between the batched queries, never as a guess.
+      description: A calendar row — one appointment plus the engagement state, the engagement's role and the candidate reference it belongs to. engagement_state and candidate are null only on a torn read between the batched queries, never as a guess.
       type: object
-      required: [id, engagement_id, starts_at, ends_at, ist_date, ist_start, ist_end, status, source, confirmed_at, cancel_reason, version, created_at, updated_at, engagement_state, candidate]
+      required: [id, engagement_id, starts_at, ends_at, ist_date, ist_start, ist_end, status, source, confirmed_at, cancel_reason, version, created_at, updated_at, engagement_state, role_id, candidate]
       properties:
         id:
           type: string
@@ -11577,6 +11577,11 @@ components:
           type: string
           nullable: true
           enum: [pending_prereqs, eligible, scheduled, dialing, in_call, reconnecting, awaiting_retry, completed, abandoned_no_answer, opted_out, wrong_number, failed, cancelled]
+        role_id:
+          description: The role (screening agent pipeline) this call belongs to — phone_engagements.role_id, stamped when the engagement opened, not the candidate's current role. A bare id; the operator resolves its names through GET /api/roles. Null on a torn read, or when the engagement carries no role.
+          type: string
+          format: uuid
+          nullable: true
         candidate:
           nullable: true
           allOf:

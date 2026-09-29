@@ -22,6 +22,8 @@ import {
   phoneApi,
   slotsResponse,
   PHONE_BOOKING_CANDIDATES,
+  PHONE_ROLES,
+  ROLE_DATA,
 } from '../components/phone-calendar/__tests__/phoneFixtures';
 import { stubMatchMedia } from '../components/design/__tests__/helpers';
 
@@ -68,6 +70,7 @@ beforeEach(() => {
   apiFns.getPhoneCalendar.mockResolvedValue(BUSY_WEEK);
   apiFns.getPhoneSlots.mockResolvedValue(slotsResponse());
   apiFns.listCandidates.mockResolvedValue(PHONE_BOOKING_CANDIDATES);
+  apiFns.listRoles.mockResolvedValue(PHONE_ROLES);
   stubMatchMedia(false, '(max-width: 639px)');
 });
 
@@ -113,6 +116,39 @@ describe('axe — no WCAG A/AA violations', () => {
     const { container } = renderPage();
     await screen.findByText('Not available to your role');
     await expect(container).toHaveNoViolations();
+  });
+
+  it('with the Agent picker narrowing the week to one agent', async () => {
+    const { container } = renderPage();
+    await screen.findByRole('table');
+    const select = await screen.findByRole('combobox', { name: 'Agent' });
+    await waitFor(() => expect(select).toBeEnabled());
+    // A native <select> with a real <label>: its name is "Agent", not a
+    // placeholder option's text.
+    expect(select).toHaveAccessibleName('Agent');
+    await userEvent.selectOptions(select, 'Zara');
+    await expect(container).toHaveNoViolations();
+  });
+
+  it('on the no-calls-for-this-agent state', async () => {
+    // Every BUSY_WEEK call is Zara's, so the Data Analyst agent has none.
+    const { container } = renderPage(`?week=2026-08-24&agent=${ROLE_DATA}`);
+    await screen.findByText('No calls for this agent this week');
+    await expect(container).toHaveNoViolations();
+  });
+
+  it('while the agents are loading, and when they cannot be read', async () => {
+    apiFns.listRoles.mockReturnValue(new Promise(() => {}));
+    const loading = renderPage();
+    await screen.findByRole('table');
+    expect(screen.getByRole('combobox', { name: 'Agent' })).toBeDisabled();
+    await expect(loading.container).toHaveNoViolations();
+    loading.unmount();
+
+    apiFns.listRoles.mockRejectedValue(new Error('roles_read_error'));
+    const failed = renderPage(`?week=2026-08-24&agent=${ROLE_DATA}`);
+    await screen.findByText(/Agents could not be loaded/);
+    await expect(failed.container).toHaveNoViolations();
   });
 
   it('on the empty, disabled and error states', async () => {

@@ -28,6 +28,15 @@
  * returned. Switching view or toggling a filter issues no request; a test
  * pins the call count.
  *
+ * ── THE AGENT FILTER ──────────────────────────────────────────────────
+ * Each row carries the role id of the pipeline its call belongs to, and the
+ * Agent picker narrows to one role, client-side like every other filter. The
+ * picker's NAMES come from one `api.listRoles()` read per mount, issued in
+ * parallel with the calendar read: the API's own role scoping decides which
+ * agents an operator can pick, and every one of them is offered, not only
+ * those with a call this week. That read is optional — if it fails the
+ * picker is simply absent and the calendar is untouched.
+ *
  * ── NOTHING IS APPLIED OPTIMISTICALLY ─────────────────────────────────
  * Every mutation awaits the real API call and is followed by a re-read. The
  * calendar never shows a change the substrate has not accepted — on this
@@ -52,6 +61,7 @@ import type {
   PhoneCandidateAppointmentCreateInput,
   PhoneAppointmentPatchInput,
   PhoneCalendarResponse,
+  Role,
 } from '../types';
 import {
   Button,
@@ -73,10 +83,14 @@ import {
   buildPhoneCalendarSearch,
   matchesPhoneFilters,
   parsePhoneCalendarFilters,
+  phoneAgentOptions,
   phoneErrorMessage,
   phoneErrorRequiresRefresh,
   phoneFacets,
+  resolvePhoneAgentFilter,
   togglePhoneFacet,
+  type PhoneAgentChoices,
+  type PhoneAgentRoster,
 } from '../components/phone-calendar';
 import { useNarrowViewport } from '../components/phone-calendar/useNarrowViewport';
 import {
@@ -91,6 +105,12 @@ interface Message {
   text: string;
   tone: 'ok' | 'error';
 }
+
+/** The optional roles read behind the Agent picker. */
+type RolesState =
+  | { status: 'loading' }
+  | { status: 'ready'; roles: Role[] }
+  | { status: 'failed' };
 
 /**
  * A tinted, announced banner.
@@ -143,6 +163,7 @@ export function PhoneCalendarPage() {
   const [refreshing, setRefreshing] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [message, setMessage] = useState<Message | null>(null);
+  const [rolesState, setRolesState] = useState<RolesState>({ status: 'loading' });
 
   /**
    * The live region is mounted for the whole life of the page and starts
@@ -165,9 +186,30 @@ export function PhoneCalendarPage() {
   // default week under the operator mid-interaction.
   const [today] = useState(() => istToday());
 
-  const filters = parsePhoneCalendarFilters(searchParams, today);
+  const parsedFilters = parsePhoneCalendarFilters(searchParams, today);
+  const { weekStart } = parsedFilters;
+
+  const agentOptions = useMemo(
+    () => (rolesState.status === 'ready' ? phoneAgentOptions(rolesState.roles) : []),
+    [rolesState],
+  );
+  const agentRoster = useMemo<PhoneAgentRoster>(
+    () =>
+      rolesState.status === 'ready'
+        ? new Set(agentOptions.map((option) => option.id))
+        : rolesState.status === 'failed'
+          ? 'unavailable'
+          : 'loading',
+    [rolesState, agentOptions],
+  );
+
+  // The filters actually in force: the URL's, with a deep-linked agent kept
+  // only while it names a role this operator can see (see
+  // `resolvePhoneAgentFilter`). Every control writes FROM these, so a stale
+  // agent id leaves the URL at the operator's next click rather than lingering
+  // as a filter nobody can see.
+  const filters = resolvePhoneAgentFilter(parsedFilters, agentRoster);
   const filterKey = buildPhoneCalendarSearch(filters).toString();
-  const { weekStart } = filters;
 
   /**
    * On a narrow viewport the queue is the default, because a seven-column
@@ -191,6 +233,25 @@ export function PhoneCalendarPage() {
   }, []);
 
   useEffect(loadMe, [loadMe]);
+
+  // The Agent picker's names. Issued alongside the calendar read (both effects
+  // run on the commit that first makes `canRead` true), never by a viewer, and
+  // never allowed to break the page: a failure only removes the picker.
+  useEffect(() => {
+    if (!canRead) return;
+    let live = true;
+    api
+      .listRoles()
+      .then((roles) => {
+        if (live) setRolesState({ status: 'ready', roles: Array.isArray(roles) ? roles : [] });
+      })
+      .catch(() => {
+        if (live) setRolesState({ status: 'failed' });
+      });
+    return () => {
+      live = false;
+    };
+  }, [canRead]);
 
   useEffect(() => {
     // A viewer never asks the phone API anything.
@@ -250,6 +311,14 @@ export function PhoneCalendarPage() {
   );
 
   const appointments = useMemo(() => data?.appointments ?? [], [data]);
+  /** This week's rows in the selected agent's pipeline — every row for "All agents". */
+  const agentRows = useMemo(
+    () =>
+      filters.agent === null
+        ? appointments
+        : appointments.filter((appt) => appt.role_id === filters.agent),
+    [appointments, filters.agent],
+  );
   const visible = useMemo(
     () => appointments.filter((appt) => matchesPhoneFilters(appt, filters)),
     // `filterKey` is the dep rather than `filters`, which is a fresh object
@@ -367,6 +436,13 @@ export function PhoneCalendarPage() {
 
   const showAside = Boolean(selected) || canWrite;
 
+  const agentChoices: PhoneAgentChoices =
+    rolesState.status === 'ready'
+      ? { status: 'ready', options: agentOptions }
+      : rolesState.status === 'failed'
+        ? { status: 'unavailable', requested: parsedFilters.agent !== null }
+        : { status: 'loading' };
+
   return (
     <div>
       <PageHeader
@@ -476,6 +552,8 @@ export function PhoneCalendarPage() {
               stateFacets={stateFacets}
               filters={filters}
               view={view}
+              agents={agentChoices}
+              onAgentChange={(agent) => applyFilters({ ...filters, agent })}
               onViewChange={(next) => {
                 // An explicit choice must always land in the URL — the
                 // builder omits defaults, and on a narrow viewport the
@@ -487,7 +565,9 @@ export function PhoneCalendarPage() {
               onToggle={(dimension, value) =>
                 applyFilters(togglePhoneFacet(filters, dimension, value))
               }
-              onClear={() => applyFilters({ ...filters, statuses: [], states: [] })}
+              onClear={() =>
+                applyFilters({ ...filters, agent: null, statuses: [], states: [] })
+              }
             />
 
             {/*
@@ -509,12 +589,23 @@ export function PhoneCalendarPage() {
                       hint={`Nothing is scheduled between ${weekLabel} IST.`}
                     />
                   </GlassPanel>
+                ) : agentRows.length === 0 ? (
+                  <GlassPanel padding="sm">
+                    <EmptyPanel
+                      title="No calls for this agent this week"
+                      hint={`Other agents have ${appointments.length} ${
+                        appointments.length === 1 ? 'call' : 'calls'
+                      } between ${weekLabel} IST. Choose All agents to see them.`}
+                    />
+                  </GlassPanel>
                 ) : visible.length === 0 ? (
                   <GlassPanel padding="sm">
                     <EmptyPanel
                       title="No appointments match these filters"
-                      hint={`This week has ${appointments.length} ${
-                        appointments.length === 1 ? 'appointment' : 'appointments'
+                      hint={`This week has ${agentRows.length} ${
+                        agentRows.length === 1 ? 'appointment' : 'appointments'
+                      }${
+                        filters.agent === null ? '' : ' for this agent'
                       }, none of which match the filters above.`}
                     />
                   </GlassPanel>
