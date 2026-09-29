@@ -152,6 +152,36 @@ function Banner({
   );
 }
 
+/**
+ * The hint under "No calls for this agent this week" — shown only when an
+ * agent is picked and none of the week's rows are theirs.
+ *
+ * A row with no role (`role_id: null` — a torn read, or an engagement that
+ * carries none) belongs to NO agent. Counting it as "other agents'" sent the
+ * operator looking through the picker for an agent that does not exist, so it
+ * is counted, and named, on its own.
+ */
+function otherAgentsHint(
+  appointments: ReadonlyArray<{ role_id: string | null }>,
+  weekLabel: string,
+): string {
+  const calls = (n: number) => `${n} ${n === 1 ? 'call' : 'calls'}`;
+  const others = appointments.filter((appt) => appt.role_id !== null).length;
+  const unassigned = appointments.length - others;
+  const seeThem = `Choose All agents to see ${appointments.length === 1 ? 'it' : 'them'}.`;
+  if (unassigned === 0) {
+    return `Other agents have ${calls(others)} between ${weekLabel} IST. ${seeThem}`;
+  }
+  if (others === 0) {
+    return `${calls(unassigned)} between ${weekLabel} IST ${
+      unassigned === 1 ? 'has' : 'have'
+    } no agent. ${seeThem}`;
+  }
+  return `Other agents have ${calls(others)} between ${weekLabel} IST, and ${calls(
+    unassigned,
+  )} ${unassigned === 1 ? 'has' : 'have'} no agent. ${seeThem}`;
+}
+
 export function PhoneCalendarPage() {
   const [me, setMe] = useState<MeResponse | null>(null);
   const [meError, setMeError] = useState<string | null>(null);
@@ -593,9 +623,7 @@ export function PhoneCalendarPage() {
                   <GlassPanel padding="sm">
                     <EmptyPanel
                       title="No calls for this agent this week"
-                      hint={`Other agents have ${appointments.length} ${
-                        appointments.length === 1 ? 'call' : 'calls'
-                      } between ${weekLabel} IST. Choose All agents to see them.`}
+                      hint={otherAgentsHint(appointments, weekLabel)}
                     />
                   </GlassPanel>
                 ) : visible.length === 0 ? (

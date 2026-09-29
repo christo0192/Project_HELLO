@@ -46,9 +46,19 @@
  *
  * It is a check against CARELESSNESS and it is **time-of-check-to-time-of-use**
  * — the residual `routes/phone.ts` already documents. Do not describe it as a
- * lock. The exposure is bounded in the safe direction: the failure mode is a
- * halt that carries a stale but real reason, never a dialer that resumes
- * unnoticed.
+ * lock. For `halt` the exposure is bounded in the safe direction: since 0110 a
+ * halt can only ESCALATE the reason in force, never downgrade it. For `clear`
+ * it is not: a stronger halt raised in the round trip between the read and
+ * `clear_phone_halt` is lifted with the reason that was named. Probe again
+ * after every clear.
+ *
+ * ── REASON PRECEDENCE (0110) ─────────────────────────────────────────
+ * While halted, the reason in force is the MOST RESTRICTIVE one raised:
+ * emergency_stop > legal_hold > provider_incident > cost_control >
+ * operator_pause. `halt --expect-halted true` with a stronger reason escalates
+ * an existing halt; a weaker one changes nothing. So `halt` prints the reason
+ * IN FORCE after the call next to the one requested, and `clear` must name the
+ * reason in force — which is the strongest one, not the first.
  *
  * USAGE
  *   node scripts/phone-canary/halt-drill.mjs probe
@@ -281,6 +291,10 @@ async function callProduction(apiBase, token, pathname, body) {
     halted: payload !== null && typeof payload.halted === 'boolean' ? payload.halted : null,
     alreadyHalted: payload !== null && typeof payload.already_halted === 'boolean'
       ? payload.already_halted : null,
+    // 0110: the reason IN FORCE after the call, which a stronger halt already
+    // up can make different from the one requested.
+    reasonInForce: payload !== null && typeof payload.reason === 'string'
+      && CODE.test(payload.reason) ? payload.reason : null,
     wasHalted: payload !== null && typeof payload.was_halted === 'boolean'
       ? payload.was_halted : null,
     error: payload !== null && typeof payload.error === 'string' && CODE.test(payload.error)
@@ -340,6 +354,11 @@ async function runHalt(args, token) {
     const after = readControl(args.container);
     say('halted', after.halted);
     say('admission_fail_closed', !after.controlPresent || after.halted);
+    // 0110: the reason in force is the most restrictive one raised, so it can
+    // differ from the one requested. Clearing must name THIS one.
+    say('requested_reason', args.reason);
+    say('halt_reason_in_force', after.reason);
+    say('reason_escalated', before.halted && after.reason !== before.reason);
     // Evidence: a durable audit row appeared. A halt that left no trace is
     // not a halt anybody can review afterwards.
     const auditAfter = auditCount(args.container, 'phone_admission_halt_set');
@@ -355,6 +374,8 @@ async function runHalt(args, token) {
   say('http_ok', result.ok);
   say('halted', result.halted === null ? 'unprintable' : result.halted);
   say('already_halted', result.alreadyHalted === null ? 'unprintable' : result.alreadyHalted);
+  say('requested_reason', args.reason);
+  say('halt_reason_in_force', result.reasonInForce ?? 'unprintable');
   say('error', result.error ?? 'none');
   say('mutated', result.ok);
   say('clear_is_a_separate_invocation', true);

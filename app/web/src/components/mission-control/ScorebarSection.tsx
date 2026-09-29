@@ -117,6 +117,7 @@ export function ScorebarSection() {
 
   const [draft, setDraft] = useState<MetricDraft>(EMPTY_DRAFT);
   const [createIssue, setCreateIssue] = useState<string | null>(null);
+  const [createdCount, setCreatedCount] = useState(0); // resets Ask Hello's status with the form
   const [editId, setEditId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState<MetricDraft>(EMPTY_DRAFT);
   const [editIssue, setEditIssue] = useState<string | null>(null);
@@ -169,6 +170,7 @@ export function ScorebarSection() {
     try {
       const created = await api.createScorecardMetric(draftToBody(draft));
       setDraft({ name: '', description: '', instruction: '', rubric: { ...EMPTY_RUBRIC } });
+      setCreatedCount((n) => n + 1);
       setMessage({ text: `Metric “${created.name}” created.`, tone: 'ok' });
       await load();
     } catch (e) {
@@ -365,7 +367,7 @@ export function ScorebarSection() {
             onRubric={setDraftRubric}
             issue={createIssue}
             instructionAction={
-              <MetricAskHello idPrefix="new-metric" draft={draft} onApply={applyHelloDraft} />
+              <MetricAskHello idPrefix="new-metric" draft={draft} onApply={applyHelloDraft} resetKey={createdCount} />
             }
             footer={
               <Button variant="primary" onClick={createMetric}>

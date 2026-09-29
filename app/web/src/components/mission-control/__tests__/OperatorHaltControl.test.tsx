@@ -4,25 +4,34 @@
  *
  * Covers: the neutral loading state; every "unavailable" cause (failed read,
  * phone lane disabled, backlog unreadable, missing control row) with Retry and
- * NEITHER colour; red when live; green only for `operator_pause`; no action
- * for the four incident reasons; the confirmed halt and resume flows (right
- * endpoint, right reason, re-read, polite announcement, focus); Cancel and
- * Escape doing nothing; the in-flight lock; the 409 "changed elsewhere" path;
- * plain-English error copy with no raw codes; the admin-only render; and a
- * drift guard tying the reason labels to the API's published vocabulary.
+ * NEITHER colour; red when on; green (the `go` fill) only for
+ * `operator_pause`; NEUTRAL state text beside the button, never a red/green
+ * chip; no action for the four incident reasons; the confirmed halt and
+ * resume flows (right endpoint, right reason, re-read, polite announcement,
+ * focus); Cancel and Escape doing nothing; the in-flight lock; the 409
+ * "changed elsewhere" path; focus that never falls to <body> (after Retry,
+ * after a dialog closes into a locked halt, after a background re-read);
+ * re-reading on window focus / tab visible, throttled and never mid-flight;
+ * the "Checked HH:MM IST" line and Refresh; plain-English copy with no raw
+ * codes and no over-claims; the admin-only render; and a drift guard tying
+ * the reason labels to the API's published vocabulary.
  */
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { missionApi, apiFns } from './apiMock';
 import { OperatorHaltControl } from '../OperatorHaltControl';
 import {
   HALT_REASON_LABELS,
+  RECHECK_MIN_INTERVAL_MS,
   haltFailureMessage,
+  haltStateLine,
+  haltSuccessMessage,
   haltViewFrom,
   isHaltConflict,
+  lockedHaltNote,
 } from '../operatorHalt';
 
 vi.mock('../../../api', () => ({
@@ -86,13 +95,43 @@ const liveRegion = () => {
   return region as HTMLElement;
 };
 
-/** Any button painted with the danger (red) or success (green) fill. */
+/** The class the green "Resume calling" fill is painted with. */
+const GO_FILL = 'bg-[var(--go)]';
+
+/** Any button painted with the danger (red) or go (green) fill. */
 const colouredButtons = () =>
   Array.from(document.querySelectorAll('button')).filter(
-    (b) => b.classList.contains('bg-error') || b.classList.contains('bg-success-text'),
+    (b) => b.classList.contains('bg-error') || b.classList.contains(GO_FILL),
   );
 
+/**
+ * Anything in the control OTHER than a button that carries a status colour:
+ * a tone chip, tinted text or a tinted ground. The state text must be neutral
+ * — colour belongs to the action button alone. (The live region's error tone
+ * is excluded: it is empty unless a write failed.)
+ */
+const tonedNonButtons = () =>
+  Array.from(document.querySelectorAll('[data-operator-halt] *')).filter(
+    (el) =>
+      el.tagName !== 'BUTTON' &&
+      !el.closest('button') &&
+      el.getAttribute('aria-live') === null &&
+      (el.hasAttribute('data-status-badge') ||
+        /(?:^|\s)(?:bg|text)-(?:error|success|warning)(?:-soft|-text)?(?:\s|$)|var\(--go/.test(
+          el.getAttribute('class') ?? '',
+        )),
+  );
+
+/** Every button in the document, by accessible name. */
+const buttonNames = () =>
+  screen.queryAllByRole('button').map((b) => b.getAttribute('aria-label') ?? b.textContent);
+
 beforeEach(() => {
+  // `mockReset`, not only `clearAllMocks`: a `mockResolvedValueOnce` queue a
+  // failing test left unconsumed must not leak into the next test.
+  apiFns.getPhoneHealth.mockReset();
+  apiFns.setPhoneHalt.mockReset();
+  apiFns.clearPhoneHalt.mockReset();
   vi.clearAllMocks();
   auth.role = 'admin';
   apiFns.getPhoneHealth.mockResolvedValue(LIVE);
@@ -121,7 +160,8 @@ describe('reading the switch', () => {
 
     expect(screen.getByText('Checking calling status…')).toBeInTheDocument();
     expect(screen.queryAllByRole('button')).toEqual([]);
-    expect(screen.queryByText(/Calling is (live|halted)/)).toBeNull();
+    expect(screen.queryByText(/^Calling: /)).toBeNull();
+    expect(screen.queryByText(/^Checked /)).toBeNull();
     expect(colouredButtons()).toEqual([]);
   });
 
@@ -137,11 +177,11 @@ describe('reading the switch', () => {
 
     expect(await screen.findByText('Calling status unavailable')).toBeInTheDocument();
     expect(screen.getByText(detail)).toBeInTheDocument();
-    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Halt all calling' })).toBeNull();
-    expect(screen.queryByRole('button', { name: 'Resume calling' })).toBeNull();
+    // Retry is the ONLY control: no Refresh beside a Retry that does the same.
+    expect(buttonNames()).toEqual(['Retry']);
     expect(colouredButtons()).toEqual([]);
-    expect(screen.queryByText(/Calling is (live|halted)/)).toBeNull();
+    expect(tonedNonButtons()).toEqual([]);
+    expect(screen.queryByText(/^Calling: /)).toBeNull();
   });
 
   it('re-reads on Retry, through the loading state, and then shows the real state', async () => {
@@ -160,25 +200,35 @@ describe('reading the switch', () => {
     expect(apiFns.setPhoneHalt).not.toHaveBeenCalled();
   });
 
-  it('is RED "Halt all calling" when calling is live, with the state in text beside it', async () => {
+  it('is RED "Halt all calling" when calling is on, with NEUTRAL state text beside it', async () => {
     render(<OperatorHaltControl />);
     const button = await screen.findByRole('button', { name: 'Halt all calling' });
 
     expect(button).toHaveClass('bg-error', 'text-white');
-    expect(button).not.toHaveClass('bg-success-text');
+    expect(button).not.toHaveClass(GO_FILL);
     expect(button).toHaveAttribute('aria-haspopup', 'dialog');
-    expect(screen.getByText('Calling is live')).toBeInTheDocument();
+    expect(screen.getByText('Calling: on')).toBeInTheDocument();
+    // "live" reads as "a call is in progress"; the state is about the switch.
+    expect(document.querySelector('[data-operator-halt]')).not.toHaveTextContent(/\blive\b/i);
+    // Red appears ONCE — on the button. No teal/green chip sits beside it.
+    expect(tonedNonButtons()).toEqual([]);
+    expect(screen.getByText('Calling: on')).toHaveClass('text-ink');
     expect(screen.queryByRole('button', { name: 'Resume calling' })).toBeNull();
   });
 
-  it('is GREEN "Resume calling" when halted by an operator pause, with the state in text', async () => {
+  it('is GREEN "Resume calling" when halted by an operator pause, with NEUTRAL state text', async () => {
     apiFns.getPhoneHealth.mockResolvedValue(PAUSED);
     render(<OperatorHaltControl />);
     const button = await screen.findByRole('button', { name: 'Resume calling' });
 
-    expect(button).toHaveClass('bg-success-text', 'text-white');
+    // The `go` fill (#2f7a4f, hue ~146°) — NOT the teal success token, which
+    // read as blue. Contrast and hue are pinned in global-palette.test.ts.
+    expect(button).toHaveClass(GO_FILL, 'text-white');
     expect(button).not.toHaveClass('bg-error');
-    expect(screen.getByText('Calling is halted')).toBeInTheDocument();
+    expect(button).not.toHaveClass('bg-success-text');
+    expect(screen.getByText('Calling: paused by an operator')).toBeInTheDocument();
+    // Green appears ONCE — on the button. No red chip sits beside it.
+    expect(tonedNonButtons()).toEqual([]);
     expect(screen.queryByRole('button', { name: 'Halt all calling' })).toBeNull();
   });
 
@@ -187,21 +237,28 @@ describe('reading the switch', () => {
     ['legal_hold', 'legal hold'],
     ['cost_control', 'cost control'],
     ['provider_incident', 'provider incident'],
-  ])('offers NO action when halted for %s — status and runbook only', async (reason, label) => {
+  ])('offers NO action when halted for %s — status, where it is cleared, and Refresh', async (reason, label) => {
     apiFns.getPhoneHealth.mockResolvedValue(haltedFor(reason));
     render(<OperatorHaltControl />);
 
-    expect(await screen.findByText(`Calling halted — ${label}`)).toBeInTheDocument();
-    expect(screen.getByText(/can only be cleared through the phone halt runbook/)).toBeInTheDocument();
-    expect(screen.queryAllByRole('button')).toEqual([]);
+    expect(await screen.findByText(`Calling: halted — ${label}`)).toBeInTheDocument();
+    expect(
+      screen.getByText(`This halt (${label}) is cleared through the phone halt runbook, not from here.`),
+    ).toBeInTheDocument();
+    // The server does not enforce "runbook only"; the copy must not claim it.
+    expect(document.body).not.toHaveTextContent(/can only be cleared|cannot be lifted/);
+    // Refresh is the only button: nothing halts or resumes.
+    expect(buttonNames()).toEqual(['Refresh calling status']);
+    expect(colouredButtons()).toEqual([]);
+    expect(tonedNonButtons()).toEqual([]);
     expect(screen.queryByText(reason)).toBeNull();
   });
 
   it('describes an unrecognised halt reason as such, and still offers no action', async () => {
     apiFns.getPhoneHealth.mockResolvedValue(haltedFor('constructor'));
     render(<OperatorHaltControl />);
-    expect(await screen.findByText('Calling halted — unrecognised reason')).toBeInTheDocument();
-    expect(screen.queryAllByRole('button')).toEqual([]);
+    expect(await screen.findByText('Calling: halted — unrecognised reason')).toBeInTheDocument();
+    expect(buttonNames()).toEqual(['Refresh calling status']);
   });
 
   it('renders nothing, and reads nothing, for a non-admin', () => {
@@ -235,7 +292,7 @@ describe('halting', () => {
     expect(apiFns.setPhoneHalt).not.toHaveBeenCalled();
 
     // The copy is truthful about what a halt does and does not stop.
-    expect(dialog).toHaveAccessibleDescription('No new calls will start until an admin resumes calling.');
+    expect(dialog).toHaveAccessibleDescription('The bot will stop starting new calls.');
     expect(within(dialog).getByText(/no first calls, retries, reconnects or scheduled calls will start/)).toBeInTheDocument();
     expect(within(dialog).getByText('Calls already in progress are not cut off. They carry on until they end.')).toBeInTheDocument();
 
@@ -252,7 +309,7 @@ describe('halting', () => {
     );
 
     const resume = screen.getByRole('button', { name: 'Resume calling' });
-    expect(screen.getByText('Calling is halted')).toBeInTheDocument();
+    expect(screen.getByText('Calling: paused by an operator')).toBeInTheDocument();
     expect(liveRegion()).toHaveTextContent('Calling halted.');
     await waitFor(() => expect(resume).toHaveFocus());
   });
@@ -348,7 +405,7 @@ describe('halting', () => {
 });
 
 describe('resuming', () => {
-  it('confirms first, then sends the CURRENT reason to /halt/clear, re-reads and announces', async () => {
+  it('confirms first, then sends the CURRENT reason to /halt/clear, re-reads and announces only what is certain', async () => {
     const user = userEvent.setup();
     apiFns.getPhoneHealth.mockResolvedValueOnce(PAUSED).mockResolvedValueOnce(LIVE);
     render(<OperatorHaltControl />);
@@ -359,6 +416,8 @@ describe('resuming', () => {
     expect(
       within(dialog).getByText(/Every eligible candidate may be dialled as soon as the scheduler next runs/),
     ).toBeInTheDocument();
+    // The confirm is green too — the same `go` fill as the trigger.
+    expect(within(dialog).getByRole('button', { name: 'Yes, resume calling' })).toHaveClass(GO_FILL);
 
     await user.click(within(dialog).getByRole('button', { name: 'Yes, resume calling' }));
 
@@ -370,9 +429,26 @@ describe('resuming', () => {
 
     const halt = screen.getByRole('button', { name: 'Halt all calling' });
     expect(halt).toHaveClass('bg-error');
-    expect(screen.getByText('Calling is live')).toBeInTheDocument();
-    expect(liveRegion()).toHaveTextContent('Calling resumed.');
+    expect(screen.getByText('Calling: on')).toBeInTheDocument();
+    // The server confirmed the pause was LIFTED. Whether dialling restarted is
+    // not something the health read can see (a test call an admin has set up
+    // freezes the ordinary lane), so it is not announced.
+    expect(liveRegion()).toHaveTextContent('The operator pause was lifted.');
+    expect(liveRegion()).not.toHaveTextContent(/Calling resumed/);
     await waitFor(() => expect(halt).toHaveFocus());
+  });
+
+  it('says nothing changed when there was no halt to lift', async () => {
+    const user = userEvent.setup();
+    apiFns.getPhoneHealth.mockResolvedValueOnce(PAUSED).mockResolvedValueOnce(LIVE);
+    apiFns.clearPhoneHalt.mockResolvedValue({ ok: true, halted: false, was_halted: false, previous_reason: null });
+    render(<OperatorHaltControl />);
+
+    await user.click(await screen.findByRole('button', { name: 'Resume calling' }));
+    await user.click(screen.getByRole('button', { name: 'Yes, resume calling' }));
+    await waitFor(() =>
+      expect(liveRegion()).toHaveTextContent('Calling was not halted, so nothing changed.'),
+    );
   });
 
   it('Cancel on the resume dialog does nothing', async () => {
@@ -388,10 +464,10 @@ describe('resuming', () => {
     expect(screen.getByRole('button', { name: 'Resume calling' })).toBeInTheDocument();
   });
 
-  it('on 409 halt_reason_mismatch re-reads and says the status changed elsewhere', async () => {
+  it('on 409 halt_reason_mismatch re-reads, says the status changed elsewhere, and focuses the locked state', async () => {
     const user = userEvent.setup();
-    // Between the read and the press, someone else swapped the pause for an
-    // emergency stop.
+    // Between the read and the press, someone else escalated the pause to an
+    // emergency stop (0110 keeps the most restrictive reason).
     apiFns.getPhoneHealth
       .mockResolvedValueOnce(PAUSED)
       .mockResolvedValueOnce(haltedFor('emergency_stop'));
@@ -407,9 +483,17 @@ describe('resuming', () => {
       ),
     );
     expect(apiFns.getPhoneHealth).toHaveBeenCalledTimes(2);
-    expect(screen.getByText('Calling halted — emergency stop')).toBeInTheDocument();
+    expect(screen.getByText('Calling: halted — emergency stop')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Resume calling' })).toBeNull();
     expect(document.body).not.toHaveTextContent('halt_reason_mismatch');
+
+    // There is no control to return to, so focus lands on the state text that
+    // explains why — never on <body>.
+    const locked = document.querySelector('[data-halt-locked]') as HTMLElement;
+    expect(locked).toHaveAttribute('tabindex', '-1');
+    expect(locked).toHaveTextContent('Calling: halted — emergency stop');
+    await waitFor(() => expect(locked).toHaveFocus());
+    expect(document.activeElement).not.toBe(document.body);
   });
 
   it('lands on "unavailable" (not a guess) when the re-read after an action fails', async () => {
@@ -423,9 +507,272 @@ describe('resuming', () => {
     await user.click(screen.getByRole('button', { name: 'Yes, resume calling' }));
 
     expect(await screen.findByText('Calling status unavailable')).toBeInTheDocument();
-    expect(liveRegion()).toHaveTextContent('Calling resumed.');
+    expect(liveRegion()).toHaveTextContent('The operator pause was lifted.');
     expect(colouredButtons()).toEqual([]);
     await waitFor(() => expect(screen.getByRole('button', { name: 'Retry' })).toHaveFocus());
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Focus never falls to <body>
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('focus after Retry', () => {
+  it('holds focus on the loading text, then hands it to the new state’s button', async () => {
+    const user = userEvent.setup();
+    apiFns.getPhoneHealth.mockRejectedValueOnce(new ApiError('phone_read_error', 500));
+    const second = deferred<typeof LIVE>();
+    apiFns.getPhoneHealth.mockReturnValueOnce(second.promise);
+    render(<OperatorHaltControl />);
+
+    await user.click(await screen.findByRole('button', { name: 'Retry' }));
+    // Retry has unmounted; focus did not drop to <body>.
+    const loading = screen.getByText('Checking calling status…');
+    await waitFor(() => expect(loading).toHaveFocus());
+    expect(loading).toHaveAttribute('tabindex', '-1');
+
+    second.resolve(LIVE);
+    const halt = await screen.findByRole('button', { name: 'Halt all calling' });
+    await waitFor(() => expect(halt).toHaveFocus());
+  });
+
+  it('lands on the NEW Retry when the retried read fails again', async () => {
+    const user = userEvent.setup();
+    apiFns.getPhoneHealth.mockRejectedValue(new ApiError('phone_read_error', 500));
+    render(<OperatorHaltControl />);
+
+    const first = await screen.findByRole('button', { name: 'Retry' });
+    await user.click(first);
+    await waitFor(() => expect(apiFns.getPhoneHealth).toHaveBeenCalledTimes(2));
+    const again = await screen.findByRole('button', { name: 'Retry' });
+    await waitFor(() => expect(again).toHaveFocus());
+  });
+
+  it('lands on the locked state text when the retried read finds a halt with no control', async () => {
+    const user = userEvent.setup();
+    apiFns.getPhoneHealth
+      .mockRejectedValueOnce(new ApiError('phone_read_error', 500))
+      .mockResolvedValueOnce(haltedFor('legal_hold'));
+    render(<OperatorHaltControl />);
+
+    await user.click(await screen.findByRole('button', { name: 'Retry' }));
+    await screen.findByText('Calling: halted — legal hold');
+    const locked = document.querySelector('[data-halt-locked]') as HTMLElement;
+    await waitFor(() => expect(locked).toHaveFocus());
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Staying current: window focus / tab visible, throttled; Checked; Refresh
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('re-reading when the admin comes back', () => {
+  // Only `Date` is faked: promises, userEvent and waitFor keep real timers.
+  const T0 = new Date('2026-09-30T09:00:00Z'); // 14:30 IST
+  let visibility: DocumentVisibilityState = 'visible';
+
+  const returnToTab = () => {
+    visibility = 'visible';
+    fireEvent(document, new Event('visibilitychange'));
+    fireEvent.focus(window);
+  };
+  const advance = (ms: number) => vi.setSystemTime(new Date(Date.now() + ms));
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(T0);
+    visibility = 'visible';
+    Object.defineProperty(document, 'visibilityState', {
+      configurable: true,
+      get: () => visibility,
+    });
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    // Drop the own-property override; the prototype getter is back.
+    delete (document as unknown as { visibilityState?: unknown }).visibilityState;
+  });
+
+  it('shows when the switch was last checked, in IST', async () => {
+    render(<OperatorHaltControl />);
+    await screen.findByRole('button', { name: 'Halt all calling' });
+    expect(screen.getByText('Checked 14:30 IST')).toBeInTheDocument();
+  });
+
+  it('re-reads ONCE on return (visibilitychange + focus), and only after the throttle', async () => {
+    render(<OperatorHaltControl />);
+    await screen.findByRole('button', { name: 'Halt all calling' });
+    expect(apiFns.getPhoneHealth).toHaveBeenCalledTimes(1);
+
+    // Too soon after the mount read: nothing.
+    advance(RECHECK_MIN_INTERVAL_MS - 1_000);
+    returnToTab();
+    expect(apiFns.getPhoneHealth).toHaveBeenCalledTimes(1);
+
+    // Past the throttle: both events fire, ONE read.
+    advance(2_000);
+    returnToTab();
+    expect(apiFns.getPhoneHealth).toHaveBeenCalledTimes(2);
+    await waitFor(() => expect(screen.queryByText('Checking…')).toBeNull());
+
+    // And the throttle restarts from that read.
+    advance(5_000);
+    returnToTab();
+    expect(apiFns.getPhoneHealth).toHaveBeenCalledTimes(2);
+
+    advance(RECHECK_MIN_INTERVAL_MS);
+    returnToTab();
+    expect(apiFns.getPhoneHealth).toHaveBeenCalledTimes(3);
+    await waitFor(() => expect(screen.queryByText('Checking…')).toBeNull());
+  });
+
+  it('does not read when the tab is being hidden', async () => {
+    render(<OperatorHaltControl />);
+    await screen.findByRole('button', { name: 'Halt all calling' });
+    advance(RECHECK_MIN_INTERVAL_MS * 2);
+    visibility = 'hidden';
+    fireEvent(document, new Event('visibilitychange'));
+    expect(apiFns.getPhoneHealth).toHaveBeenCalledTimes(1);
+  });
+
+  it('never re-reads while a dialog is open', async () => {
+    const user = userEvent.setup();
+    render(<OperatorHaltControl />);
+    await user.click(await screen.findByRole('button', { name: 'Halt all calling' }));
+    expect(screen.getByRole('dialog', { name: 'Halt all calling?' })).toBeInTheDocument();
+
+    advance(RECHECK_MIN_INTERVAL_MS * 2);
+    returnToTab();
+    expect(apiFns.getPhoneHealth).toHaveBeenCalledTimes(1);
+  });
+
+  it('never re-reads while a read is already in flight', async () => {
+    const first = deferred<typeof LIVE>();
+    apiFns.getPhoneHealth.mockReturnValueOnce(first.promise);
+    render(<OperatorHaltControl />);
+    expect(apiFns.getPhoneHealth).toHaveBeenCalledTimes(1);
+
+    advance(RECHECK_MIN_INTERVAL_MS * 2);
+    returnToTab();
+    expect(apiFns.getPhoneHealth).toHaveBeenCalledTimes(1);
+
+    first.resolve(LIVE);
+    await screen.findByRole('button', { name: 'Halt all calling' });
+  });
+
+  it('shows a change made elsewhere without a loading flash, and moves focus off the vanished button', async () => {
+    render(<OperatorHaltControl />);
+    const halt = await screen.findByRole('button', { name: 'Halt all calling' });
+    halt.focus();
+
+    // Someone else paused calling while the admin was away.
+    apiFns.getPhoneHealth.mockResolvedValue(PAUSED);
+    advance(RECHECK_MIN_INTERVAL_MS + 60_000); // 14:31 IST
+    returnToTab();
+    // The old picture stays up while the read is in flight.
+    expect(screen.queryByText('Checking calling status…')).toBeNull();
+    expect(screen.getByText('Checking…')).toBeInTheDocument();
+
+    const resume = await screen.findByRole('button', { name: 'Resume calling' });
+    expect(halt).not.toBeInTheDocument();
+    await waitFor(() => expect(resume).toHaveFocus());
+    expect(screen.getByText('Checked 14:31 IST')).toBeInTheDocument();
+    // A background check is silent.
+    expect(liveRegion()).toBeEmptyDOMElement();
+  });
+
+  it('does not steal focus from elsewhere on the page when the state changes', async () => {
+    render(
+      <>
+        <button type="button">Elsewhere</button>
+        <OperatorHaltControl />
+      </>,
+    );
+    await screen.findByRole('button', { name: 'Halt all calling' });
+    const elsewhere = screen.getByRole('button', { name: 'Elsewhere' });
+    elsewhere.focus();
+
+    apiFns.getPhoneHealth.mockResolvedValue(PAUSED);
+    advance(RECHECK_MIN_INTERVAL_MS);
+    returnToTab();
+    await screen.findByRole('button', { name: 'Resume calling' });
+    expect(elsewhere).toHaveFocus();
+  });
+});
+
+describe('Refresh', () => {
+  const T0 = new Date('2026-09-30T09:00:00Z'); // 14:30 IST
+
+  beforeEach(() => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(T0);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it('re-reads on demand — not bound by the throttle — and announces what it found', async () => {
+    const user = userEvent.setup();
+    render(<OperatorHaltControl />);
+    await screen.findByRole('button', { name: 'Halt all calling' });
+
+    vi.setSystemTime(new Date('2026-09-30T09:05:00Z')); // 14:35 IST
+    apiFns.getPhoneHealth.mockResolvedValue(haltedFor('legal_hold'));
+    await user.click(screen.getByRole('button', { name: 'Refresh calling status' }));
+
+    expect(await screen.findByText('Calling: halted — legal hold')).toBeInTheDocument();
+    expect(apiFns.getPhoneHealth).toHaveBeenCalledTimes(2);
+    expect(screen.getByText('Checked 14:35 IST')).toBeInTheDocument();
+    expect(liveRegion()).toHaveTextContent('Calling: halted — legal hold (checked 14:35 IST).');
+    // Refresh survived the change of state, so focus stays on it.
+    expect(screen.getByRole('button', { name: 'Refresh calling status' })).toHaveFocus();
+  });
+
+  it('is not bound by the throttle: presses within a second of each other all read', async () => {
+    const user = userEvent.setup();
+    render(<OperatorHaltControl />);
+    await screen.findByRole('button', { name: 'Halt all calling' });
+
+    // The clock does not move at all: far inside RECHECK_MIN_INTERVAL_MS.
+    const refresh = screen.getByRole('button', { name: 'Refresh calling status' });
+    await user.click(refresh);
+    await waitFor(() => expect(apiFns.getPhoneHealth).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect(refresh).not.toHaveAttribute('aria-disabled'));
+    await user.click(refresh);
+    await waitFor(() => expect(apiFns.getPhoneHealth).toHaveBeenCalledTimes(3));
+  });
+
+  it('says "Checking…" and ignores further presses while its read is in flight', async () => {
+    const user = userEvent.setup();
+    render(<OperatorHaltControl />);
+    await screen.findByRole('button', { name: 'Halt all calling' });
+
+    const pending = deferred<typeof LIVE>();
+    apiFns.getPhoneHealth.mockReturnValueOnce(pending.promise);
+    const refresh = screen.getByRole('button', { name: 'Refresh calling status' });
+    await user.click(refresh);
+
+    expect(screen.getByText('Checking…')).toBeInTheDocument();
+    expect(refresh).toHaveAttribute('aria-disabled', 'true');
+    await user.click(refresh);
+    expect(apiFns.getPhoneHealth).toHaveBeenCalledTimes(2);
+
+    pending.resolve(LIVE);
+    await waitFor(() => expect(screen.getByText('Checked 14:30 IST')).toBeInTheDocument());
+    expect(refresh).not.toHaveAttribute('aria-disabled');
+  });
+
+  it('hands focus to Retry when a refresh finds the switch unreadable', async () => {
+    const user = userEvent.setup();
+    render(<OperatorHaltControl />);
+    await screen.findByRole('button', { name: 'Halt all calling' });
+
+    apiFns.getPhoneHealth.mockRejectedValue(new ApiError('phone_read_error', 500));
+    await user.click(screen.getByRole('button', { name: 'Refresh calling status' }));
+
+    const retry = await screen.findByRole('button', { name: 'Retry' });
+    expect(screen.queryByRole('button', { name: 'Refresh calling status' })).toBeNull();
+    await waitFor(() => expect(retry).toHaveFocus());
   });
 });
 
@@ -446,6 +793,47 @@ describe('haltViewFrom', () => {
     expect(
       haltViewFrom(health({ control_present: false, halted: true, halt_reason: 'operator_pause' })).kind,
     ).toBe('unavailable');
+  });
+});
+
+describe('copy', () => {
+  it('names each state neutrally, and never as "live"', () => {
+    expect(haltStateLine({ kind: 'live' })).toBe('Calling: on');
+    expect(haltStateLine({ kind: 'paused' })).toBe('Calling: paused by an operator');
+    expect(haltStateLine({ kind: 'locked', reason: 'legal_hold' })).toBe('Calling: halted — legal hold');
+    expect(haltStateLine({ kind: 'locked', reason: null })).toBe('Calling: halted — unrecognised reason');
+    expect(haltStateLine({ kind: 'unavailable', detail: 'x' })).toBe('Calling status unavailable');
+  });
+
+  it('says where a locked halt is cleared without claiming the server enforces it', () => {
+    const note = lockedHaltNote('emergency_stop');
+    expect(note).toBe('This halt (emergency stop) is cleared through the phone halt runbook, not from here.');
+    expect(note).not.toMatch(/only|cannot/);
+  });
+
+  it('announces a resume as the pause being lifted, never as calls restarting', () => {
+    expect(haltSuccessMessage('halt', true)).toBe('Calling halted.');
+    expect(haltSuccessMessage('halt', false)).toBe('Calling was already halted.');
+    expect(haltSuccessMessage('resume', true)).toBe('The operator pause was lifted.');
+    expect(haltSuccessMessage('resume', false)).toBe('Calling was not halted, so nothing changed.');
+    expect(haltSuccessMessage('resume', true)).not.toMatch(/resumed|live|dial/i);
+  });
+
+  it('the halt dialog is accurate and plain: no "only here", no "arms"', async () => {
+    const user = userEvent.setup();
+    render(<OperatorHaltControl />);
+    await user.click(await screen.findByRole('button', { name: 'Halt all calling' }));
+    const dialog = screen.getByRole('dialog', { name: 'Halt all calling?' });
+
+    expect(
+      within(dialog).getByText('Nothing restarts on its own. No new calls will start until calling is resumed.'),
+    ).toBeInTheDocument();
+    expect(
+      within(dialog).getByText('The one exception is a single test call an admin has set up.'),
+    ).toBeInTheDocument();
+    // The runbook CLI can lift a halt too, so the dialog must not say only
+    // this button can; and "arms" is internal jargon.
+    expect(dialog).not.toHaveTextContent(/presses|“Resume calling” here|\barms?\b/);
   });
 });
 

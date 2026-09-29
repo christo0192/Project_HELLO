@@ -2016,9 +2016,16 @@ export interface PhoneHaltInput {
 export interface PhoneHaltResponse {
   ok: boolean;
   halted: boolean;
-  /** A halt was already in force; 0042 kept ITS reason, not the one sent. */
+  /**
+   * A halt was already in force. Since 0110 the reason in force is the MOST
+   * restrictive one requested (emergency_stop > legal_hold > provider_incident
+   * > cost_control > operator_pause); the original halt instant is kept.
+   */
   already_halted: boolean;
-  reason: string;
+  /** The reason IN FORCE after the call (null only if the database did not report one). */
+  reason: string | null;
+  /** The reason this request asked for — differs from `reason` when a stronger halt was already in force. */
+  requested_reason?: string;
 }
 
 export interface PhoneHaltClearResponse {

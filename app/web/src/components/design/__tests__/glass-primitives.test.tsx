@@ -134,10 +134,25 @@ describe('buttonClass', () => {
     expect(buttonClass('primary')).toContain('bg-info');
     expect(buttonClass('ghost')).toContain('text-ink-secondary');
     expect(buttonClass('danger')).toContain('bg-error');
-    // The TEXT token as a fill: white on `--success` itself is under 4.5:1.
-    expect(buttonClass('success')).toContain('bg-success-text');
-    expect(buttonClass('success')).toContain('text-white');
-    expect(buttonClass('success')).not.toMatch(/\bbg-success\b(?!-)/);
+    // The "Resume calling" green: the `--go` fill with a white label. Not the
+    // teal `--success` family, which read as blue (owner, 2026-09-29).
+    const go = buttonClass('go');
+    expect(go).toContain('bg-[var(--go)]');
+    expect(go).toContain('text-white');
+    expect(go).not.toMatch(/\bbg-success/);
+  });
+
+  it('darkens the go fill on hover/press by colour, never by a filter', () => {
+    const go = buttonClass('go').split(/\s+/);
+    expect(go).toContain('hover:bg-[var(--go-strong)]');
+    expect(go).toContain('active:bg-[var(--go-strong)]');
+    // A brightness()/filter would dim the white label too, lowering contrast,
+    // and it is not in the base transition, so it would also snap.
+    expect(go.filter((c) => /brightness|filter/.test(c))).toEqual([]);
+    // The fill change eases: background-color is a transitioned property.
+    const transition = go.find((c) => c.startsWith('transition-['));
+    expect(transition).toBeDefined();
+    expect(transition).toContain('background-color');
   });
 });
 

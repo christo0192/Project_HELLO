@@ -328,7 +328,7 @@ describe('agent picker options', () => {
     expect(options).toEqual([
       { id: ROLE_DATA, label: 'Data Analyst' },
       // Same title, blank agent name: never two identical options.
-      { id: ROLE_DATA_TWIN, label: 'Data Analyst (2)' },
+      { id: ROLE_DATA_TWIN, label: 'Data Analyst · 2' },
       // The agent name wins over the title `Sales Advisor`.
       { id: ROLE_SALES, label: 'Zara' },
     ]);

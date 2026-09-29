@@ -281,7 +281,7 @@ describe('Mission Control header', () => {
     renderAdmin();
     const button = await screen.findByRole('button', { name: 'Halt all calling' });
     expect(header()).toContainElement(button);
-    expect(within(header()).getByText('Calling is live')).toBeInTheDocument();
+    expect(within(header()).getByText('Calling: on')).toBeInTheDocument();
 
     const tablist = screen.getByRole('tablist', { name: 'Mission Control sections' });
     expect(button.compareDocumentPosition(tablist) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
@@ -345,12 +345,21 @@ describe('Mission Control header', () => {
         tokens.add(`${fam}-${n}`);
       }
     }
-    // Sanity: the extraction found the theme, including the two tokens the
-    // halt buttons are painted with.
+    // Sanity: the extraction found the theme, including the token the red
+    // halt button is painted with.
     expect(tokens.has('ink')).toBe(true);
     expect(tokens.has('error')).toBe(true);
-    expect(tokens.has('success-text')).toBe(true);
     expect(tokens.has('ink-primary')).toBe(false);
+
+    // The green resume button is painted with ARBITRARY values —
+    // `bg-[var(--go)]` — which the theme lookup above cannot see and Tailwind
+    // emits even when the variable does not exist (the fill is then simply
+    // transparent). So every `var(--x)` a class names must be DECLARED in the
+    // global token file.
+    const indexCss = readFileSync(resolve(__dirname, '../index.css'), 'utf8');
+    const declared = (name: string) => new RegExp(`^\\s*${name}:`, 'm').test(indexCss);
+    expect(declared('--go')).toBe(true);
+    expect(declared('--go-missing')).toBe(false);
 
     const offendersIn = (root: Element): string[] => {
       const offenders: string[] = [];
@@ -358,6 +367,8 @@ describe('Mission Control header', () => {
         Array.from(el.classList),
       );
       for (const cls of classNames) {
+        const variable = /\[var\((--[\w-]+)\)\]/.exec(cls);
+        if (variable && !declared(variable[1])) offenders.push(cls);
         const bare = cls.slice(cls.lastIndexOf(':') + 1);
         const m = /^(?:text|bg|border|ring|from|via|to|fill|stroke|divide|outline|shadow)-(.+)$/.exec(bare);
         if (!m) continue;
@@ -379,7 +390,11 @@ describe('Mission Control header', () => {
     // Paused: the green button, and the resume dialog.
     apiFns.getPhoneHealth.mockResolvedValue(PAUSED_HEALTH);
     renderAdmin();
-    fireEvent.click(await screen.findByRole('button', { name: 'Resume calling' }));
+    const resume = await screen.findByRole('button', { name: 'Resume calling' });
+    // Non-vacuous: the green fill IS an arbitrary `var()` class, so the
+    // declared-variable check above really runs against it.
+    expect(resume).toHaveClass('bg-[var(--go)]');
+    fireEvent.click(resume);
     await screen.findByRole('dialog', { name: 'Resume calling?' });
     expect(offendersIn(control())).toEqual([]);
   });

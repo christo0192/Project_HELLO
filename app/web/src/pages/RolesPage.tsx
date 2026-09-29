@@ -265,16 +265,27 @@ export function RolesPage() {
                           day, so it is the heading; a role without one falls
                           back to its title, so the heading is never blank. The
                           agent name is never spoken to a candidate — `title`
-                          stays the only name the phone worker says. */}
-                      <h2 className="min-w-0 truncate text-[15px] font-semibold tracking-[-0.01em] text-ink">
+                          stays the only name the phone worker says.
+
+                          `title` carries the FULL text: `truncate` cuts an
+                          80-character agent name to an ellipsis, and without
+                          it a sighted operator had no way to read the rest.
+                          The heading's accessible name is still its content,
+                          which was never truncated. */}
+                      <h2
+                        title={agentLabel(role)}
+                        className="min-w-0 truncate text-[15px] font-semibold tracking-[-0.01em] text-ink"
+                      >
                         {agentLabel(role)}
                       </h2>
                       {/* The job, underneath — only when the heading is NOT
                           already the job. Repeating the title under itself
-                          would be noise, not information. */}
+                          would be noise, not information. Truncated too, so
+                          it carries its full text the same way. */}
                       {roleAgentName(role) && (
                         <p
                           data-role-title-secondary=""
+                          title={`Role: ${role.title}`}
                           className="mt-0.5 truncate text-xs text-ink-tertiary"
                         >
                           Role: {role.title}

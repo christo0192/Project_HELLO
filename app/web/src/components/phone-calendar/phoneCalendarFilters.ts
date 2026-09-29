@@ -276,7 +276,7 @@ export function resolvePhoneAgentFilter(
 export interface PhoneAgentOption {
   /** The role id — what the filter and the URL carry. */
   id: string;
-  /** The agent name, else the role title; duplicates are suffixed ` (2)`. */
+  /** The agent name, else the role title; clashes are resolved by `uniqueAgentLabels`. */
   label: string;
 }
 

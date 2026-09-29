@@ -14,11 +14,16 @@
  *     while Hello drafts, after the fill, and after the replace dialog closes
  *     (its return-focus ref is this button). One place, every time.
  *   - Nothing fades. Unavailable is the measured flat `ask-hello--idle` fill;
- *     busy keeps the gradient and changes the glyph and the label. See
- *     `AskHelloButton` and `ask-hello-contrast.test.ts` for why opacity is
- *     banned here.
- *   - The state is in the ACCESSIBLE NAME, and the visible label is contained
- *     in it (SC 2.5.3): "Ask Hello" / "Hello is drafting…".
+ *     busy keeps the gradient and changes the glyph. See `AskHelloButton` and
+ *     `ask-hello-contrast.test.ts` for why opacity is banned here.
+ *   - The button's NAME AND LABEL NEVER CHANGE. Busy is said ONCE, by the
+ *     status line beside the button — visible, and the polite live region —
+ *     plus `aria-busy` and the ◐ glyph. An earlier version also swapped the
+ *     focused button's `aria-label` to the same sentence, so a screen reader
+ *     read the busy state twice (name change on the focused control, then the
+ *     live region). A stable visible "Ask Hello" also keeps SC 2.5.3 true in
+ *     both states: a static name over a visible label that changed to
+ *     "Hello is drafting…" would put the label outside the name.
  *   - Text the admin already wrote is never replaced without asking — and the
  *     centred `Dialog` that asks is PORTALLED to <body>. This button lives
  *     inside a `.glass` panel, and `.glass` sets `backdrop-filter`, which makes
@@ -28,10 +33,17 @@
  *   - A draft that comes back after the form CHANGED is discarded, not
  *     applied: the answer is about the name it was asked for, and applying it
  *     would overwrite whatever was typed during the wait. (RolesPage's
- *     Rephrase learned the same lesson the hard way.)
+ *     Rephrase learned the same lesson the hard way.) So is one that comes
+ *     back after this component UNMOUNTED — the host's list reload swaps the
+ *     form out and back — because an unmounted instance can no longer see
+ *     edits, and its "unchanged" check would be comparing against a stale
+ *     form.
+ *   - The status line and error describe the form AS IT IS. When the host
+ *     resets the form (after Create), it bumps `resetKey` and both clear, so
+ *     an empty form never says "Hello drafted… review before creating".
  */
 
-import { useId, useRef, useState } from 'react';
+import { useEffect, useId, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { api, ApiError } from '../../api';
 import type { ScoreValue, ScorecardMetricDraft } from '../../types';
@@ -53,6 +65,11 @@ export interface MetricAskHelloProps {
   draft: MetricAskHelloDraft;
   /** Fill the scoring instruction and all four rubric levels. */
   onApply: (instruction: string, rubric: Record<ScoreValue, string>) => void;
+  /**
+   * Change it when the host RESETS the form (after a successful Create): the
+   * status line and any error are about text that is gone, so both clear.
+   */
+  resetKey?: number;
 }
 
 export const ASK_HELLO_DRAFTED =
@@ -100,12 +117,29 @@ function isCompleteDraft(value: unknown): value is ScorecardMetricDraft {
   });
 }
 
-export function MetricAskHello({ idPrefix, draft, onApply }: MetricAskHelloProps) {
+export function MetricAskHello({ idPrefix, draft, onApply, resetKey = 0 }: MetricAskHelloProps) {
   const [drafting, setDrafting] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
   const [status, setStatus] = useState('');
   const [error, setError] = useState<string | null>(null);
   const buttonRef = useRef<HTMLButtonElement>(null);
+  // The form was reset: what the status line and error describe is gone.
+  // Adjusted DURING render (React's pattern for resetting state on a prop
+  // change), so the stale sentence is never painted next to the empty form.
+  const [seenResetKey, setSeenResetKey] = useState(resetKey);
+  if (resetKey !== seenResetKey) {
+    setSeenResetKey(resetKey);
+    setStatus('');
+    setError(null);
+  }
+  /** False once unmounted: a draft landing after that is never applied. */
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => {
+      mounted.current = false;
+    };
+  }, []);
   /**
    * The live form, readable after the await. The closure's `draft` is the one
    * from the render that STARTED the request, so comparing against it would
@@ -132,6 +166,9 @@ export function MetricAskHello({ idPrefix, draft, onApply }: MetricAskHelloProps
         name: asked.name.trim(),
         description: asked.description.trim() ? asked.description.trim() : null,
       });
+      // `latest` stopped following the form at unmount, so "unchanged" below
+      // would be a comparison against a stale copy. Drop it silently.
+      if (!mounted.current) return;
       if (!isCompleteDraft(result)) {
         setError(ASK_HELLO_FAILED);
         return;
@@ -178,10 +215,11 @@ export function MetricAskHello({ idPrefix, draft, onApply }: MetricAskHelloProps
       <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-2">
         <div className="min-w-0 flex-1 text-[13px] leading-5">
           {/* Mounted from the first render, so it announces reliably. The
-              drafting line is for screen readers only — the button's own
-              label already says it on screen. */}
+              ONLY place the busy state is put into words — on screen and to
+              a screen reader alike — because the button's name and label
+              stay "Ask Hello" throughout (see the header). */}
           <p aria-live="polite" data-ask-hello-status="" className="text-ink-secondary">
-            {drafting ? <span className="sr-only">{ASK_HELLO_DRAFTING}</span> : status}
+            {drafting ? ASK_HELLO_DRAFTING : status}
           </p>
           {!nameReady && !drafting && (
             <p id={hintId} className="text-ink-tertiary">
@@ -196,9 +234,9 @@ export function MetricAskHello({ idPrefix, draft, onApply }: MetricAskHelloProps
           aria-disabled={!nameReady || drafting}
           aria-busy={drafting}
           aria-describedby={!nameReady && !drafting ? hintId : undefined}
-          aria-label={
-            drafting ? ASK_HELLO_DRAFTING : 'Ask Hello to draft the scoring instruction and rubric'
-          }
+          // STABLE. Swapping it while busy made the focused button announce
+          // the same sentence the live region was already announcing.
+          aria-label="Ask Hello to draft the scoring instruction and rubric"
           data-ask-hello=""
           // The Ask Hello pill, verbatim — NO `opacity-*` anywhere in this
           // component (ask-hello-contrast.test.ts reads this class list).
@@ -210,7 +248,7 @@ export function MetricAskHello({ idPrefix, draft, onApply }: MetricAskHelloProps
           <span aria-hidden="true" className="relative">
             {drafting ? '◐' : '✦'}
           </span>
-          <span className="relative">{drafting ? 'Hello is drafting…' : 'Ask Hello'}</span>
+          <span className="relative">Ask Hello</span>
         </button>
       </div>
 

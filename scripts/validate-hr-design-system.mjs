@@ -10,6 +10,10 @@ const approved = [
   '#f4f6fb', '#ffffff', '#dbe1ec', '#eaeef6',
   '#0f172a', '#334155', '#6b7391', '#4e6ba6',
   '#398aa2', '#1e7590', '#b45a72', '#a16207',
+  // `--go` / `--go-strong`: the "Resume calling" green, added at the owner's
+  // request of 2026-09-29 ("resume button must read as green") — nothing in
+  // the palette above is green. A fill for white text only (5.23:1 / 6.14:1).
+  '#2f7a4f', '#2a6e47',
 ];
 const missing = approved.filter((value) => !css.includes(value));
 if (missing.length) {

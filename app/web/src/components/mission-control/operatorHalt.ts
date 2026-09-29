@@ -17,6 +17,18 @@
  * missing control row as HALTED (fail closed), so presenting any of these as
  * "live" would be false, and presenting them as a resumable pause would
  * invite an admin to "resume" a stop nobody can describe.
+ *
+ * ── WHAT THIS CANNOT SEE: A TEST CALL AN ADMIN HAS SET UP ─────────────
+ * An admin can set up a single test call for one candidate (a
+ * `phone_test_gates` row). The due loop lets that one call dial WHILE an
+ * operator pause is in force, and FREEZES the ordinary lane if the halt is
+ * cleared while the test call is still set up (api
+ * `lib/phone-runtime/due-loop.ts`, the halt block). `GET /api/phone/health`
+ * does not report that at all — not in `admission`, not in `reasons`
+ * (api `routes/phone.ts`, `handleHealth`) — so this control cannot tell
+ * "on" from "on, but frozen behind a test call". Its copy therefore claims
+ * only what the switch itself says: a resume announces that the pause was
+ * LIFTED, never that dialling has restarted.
  */
 
 import { ApiError } from '../../api';
@@ -82,6 +94,55 @@ export function haltViewFrom(health: PhoneHealthResponse): HaltView {
   }
   return { kind: 'unavailable', detail: SWITCH_UNREADABLE };
 }
+
+/**
+ * The state, in words, beside the action button. NEUTRAL in tone on purpose:
+ * colour belongs to the one action button (red halts, green resumes), and a
+ * red or green chip beside it put both colours on screen in both states.
+ * "on", not "live" — "live" reads as "a call is in progress".
+ */
+export function haltStateLine(view: HaltView): string {
+  switch (view.kind) {
+    case 'live':
+      return 'Calling: on';
+    case 'paused':
+      return 'Calling: paused by an operator';
+    case 'locked':
+      return `Calling: halted — ${haltReasonLabel(view.reason)}`;
+    case 'unavailable':
+      return 'Calling status unavailable';
+  }
+}
+
+/**
+ * Why a locked halt offers no button. It names where the halt IS cleared
+ * without claiming the server enforces that: `/halt/clear` accepts any reason
+ * that names the halt in force; only this control declines to send one.
+ */
+export function lockedHaltNote(reason: string | null): string {
+  return `This halt (${haltReasonLabel(reason)}) is cleared through the phone halt runbook, not from here.`;
+}
+
+/**
+ * What a SUCCESSFUL write announces. A resume says the pause was lifted —
+ * the one thing the server confirmed — not that calls have restarted: a test
+ * call an admin has set up freezes the ordinary lane, and the health read
+ * cannot see one (see the header).
+ */
+export function haltSuccessMessage(action: HaltAction, changed: boolean): string {
+  if (action === 'halt') return changed ? 'Calling halted.' : 'Calling was already halted.';
+  return changed
+    ? 'The operator pause was lifted.'
+    : 'Calling was not halted, so nothing changed.';
+}
+
+/**
+ * The least time between two AUTOMATIC re-reads (window focus, tab shown).
+ * Returning to the tab fires both `visibilitychange` and `focus`; this, and
+ * the in-flight guard, make that one read. Retry and Refresh are not bound
+ * by it — an explicit press always reads.
+ */
+export const RECHECK_MIN_INTERVAL_MS = 15_000;
 
 /** Why a READ of the switch failed, as the line under "Calling status unavailable". */
 export function readFailureDetail(error: unknown): string {

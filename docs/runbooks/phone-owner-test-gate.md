@@ -16,7 +16,10 @@ candidates to a dial.
   not read for dialing while the gate is active.
 - The global `operator_pause` remains raised. The gate is the only permitted
   exception. `emergency_stop`, `provider_incident`, `legal_hold` and
-  `cost_control` remain absolute refusals.
+  `cost_control` remain absolute refusals — including when one is raised
+  *after* the pause: since `0110` a stronger reason replaces the pause on the
+  control row (see `phone-canary-and-halt.md` §5, precedence), so arming is
+  refused `test_gate_halt_not_permitted` and an armed gate cannot dial.
 - Consent, number validity, allowlist, IST window, fleet capacity, leases,
   recording and all ordinary admission checks still apply.
 - A gate expiry or failed admission does not create permission to retry the

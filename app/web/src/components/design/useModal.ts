@@ -23,7 +23,27 @@
  *   - Body scroll lock, so a wheel gesture over the backdrop does not scroll
  *     the page behind the modal.
  *   - Key handling on the DOCUMENT in the CAPTURE phase. Escape and Tab must
- *     be decided before any ancestor handler sees them.
+ *     be decided before any ancestor handler sees them. It stays on
+ *     `document`, not `window`, on purpose: a control inside a modal that owns
+ *     Escape for itself (an open listbox) listens on WINDOW capture and stops
+ *     propagation, so it runs first and closes only itself.
+ *   - A module-level STACK of open modals, because modals NEST: the Scorebar
+ *     is a `SlideOver`, and Ask Hello's "Replace what you've written?" is a
+ *     `Dialog` opened on top of it. Every open modal has its own document
+ *     listener, and `stopPropagation` cannot silence a sibling listener on
+ *     the same node — so without the stack one Escape closed BOTH (unmounting
+ *     the form underneath and losing what the admin typed), and two Tab traps
+ *     fought, pinning focus to the dialog's first control. Now only the
+ *     TOPMOST open modal acts on Escape and Tab; the rest return early. No
+ *     propagation is stopped globally, so the ordering above still holds.
+ *     Removal is by identity, not a pop, so modals may close in any order;
+ *     the scroll lock is held while ANY modal is open and the page's own
+ *     value comes back only when the last one closes.
+ *
+ *     Known limit: order is OPEN order. Two nested modals mounted open in the
+ *     same commit register child-first (React runs child effects first), so
+ *     the parent would sit on top. No caller does that — an inner modal opens
+ *     from a control inside the outer one.
  *
  * What does NOT live here: the overlay markup. The inline `margin: 0`, the
  * `aria-hidden` backdrop, the `role="dialog"` panel and its Close control are
@@ -32,7 +52,59 @@
  * panel, which must carry `tabIndex={-1}` to be focusable.
  */
 
-import { useEffect, useRef, type RefObject } from 'react';
+import { useEffect, useRef, useState, type RefObject } from 'react';
+
+/** One open modal. Its identity is the stack key; the ref finds its panel. */
+interface ModalEntry {
+  panelRef: RefObject<HTMLDivElement | null>;
+}
+
+/** Open modals, bottom to top, in the order they opened. */
+const openModals: ModalEntry[] = [];
+
+/** `body.style.overflow` as it was before the FIRST modal opened. */
+let overflowBeforeLock = '';
+
+/**
+ * Key events a modal has already acted on. The topmost modal's `onClose` can
+ * unmount it SYNCHRONOUSLY (a `flushSync`), and a lower modal whose listener
+ * happens to run later in the same dispatch would then find itself on top and
+ * close too. Marking the event makes one keypress one action, whatever the
+ * listener order. A WeakSet, so a handled event is never kept alive.
+ */
+const handledKeyEvents = new WeakSet<Event>();
+
+function openModal(entry: ModalEntry): void {
+  if (openModals.length === 0) {
+    overflowBeforeLock = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+  }
+  openModals.push(entry);
+}
+
+/** By identity, not a pop: an outer modal can unmount before an inner one. */
+function closeModal(entry: ModalEntry): void {
+  const index = openModals.lastIndexOf(entry);
+  if (index === -1) return;
+  openModals.splice(index, 1);
+  if (openModals.length === 0) {
+    document.body.style.overflow = overflowBeforeLock;
+    overflowBeforeLock = '';
+  }
+}
+
+function isTopModal(entry: ModalEntry): boolean {
+  return openModals[openModals.length - 1] === entry;
+}
+
+/** The panel of the highest open modal OTHER than `entry`, if any. */
+function panelBelow(entry: ModalEntry): HTMLDivElement | null {
+  for (let i = openModals.length - 1; i >= 0; i -= 1) {
+    const other = openModals[i]!;
+    if (other !== entry && other.panelRef.current) return other.panelRef.current;
+  }
+  return null;
+}
 
 /**
  * Tabbable elements inside the panel, in document order.
@@ -84,6 +156,9 @@ export function useModal({
   busy = false,
 }: UseModalOptions): RefObject<HTMLDivElement | null> {
   const panelRef = useRef<HTMLDivElement | null>(null);
+  // This modal's stack entry: one object for the component's whole life, so
+  // its identity is stable across renders and re-opens.
+  const [entry] = useState<ModalEntry>(() => ({ panelRef }));
 
   useEffect(() => {
     if (!open) return;
@@ -103,33 +178,48 @@ export function useModal({
         el.focus();
         return;
       }
+      // A modal still open underneath is where the user IS — `main` sits
+      // behind its backdrop, and the next Tab would only be pulled back.
+      const below = panelBelow(entry);
+      if (below) {
+        below.focus();
+        return;
+      }
       const main = document.querySelector<HTMLElement>('main');
       if (main) main.focus();
     };
-  }, [open, returnFocusRef]);
+  }, [open, returnFocusRef, entry]);
 
+  // Join the stack on open, leave it on close or unmount. The scroll lock
+  // rides on the stack (see `openModal`), so nesting cannot unlock the page
+  // early or leave it locked after the last modal has gone.
   useEffect(() => {
     if (!open) return;
-    const previous = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    return () => {
-      document.body.style.overflow = previous;
-    };
-  }, [open]);
+    openModal(entry);
+    return () => closeModal(entry);
+  }, [open, entry]);
 
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent): void => {
+      // ONLY THE TOPMOST MODAL ACTS. Every open modal has a listener on the
+      // same node, so this early return is what keeps one Escape from closing
+      // the drawer underneath a dialog, and two Tab traps from fighting.
+      if (handledKeyEvents.has(e) || !isTopModal(entry)) return;
       const panel = panelRef.current;
       if (!panel) return;
 
       if (e.key === 'Escape') {
+        // Claimed even when refused: a busy dialog on top must not let the
+        // Escape through to the modal underneath it.
+        handledKeyEvents.add(e);
         if (busy) return;
         e.stopPropagation();
         onClose();
         return;
       }
       if (e.key !== 'Tab') return;
+      handledKeyEvents.add(e);
 
       const items = tabbable(panel);
       const active = document.activeElement as HTMLElement | null;
@@ -162,7 +252,7 @@ export function useModal({
     };
     document.addEventListener('keydown', onKey, true);
     return () => document.removeEventListener('keydown', onKey, true);
-  }, [open, busy, onClose]);
+  }, [open, busy, onClose, entry]);
 
   return panelRef;
 }

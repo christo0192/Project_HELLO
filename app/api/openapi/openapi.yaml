@@ -537,7 +537,7 @@ paths:
       tags: [scorecards]
       operationId: draftScorecardMetric
       summary: Ask Hello to draft a metric's scoring instruction and 1-4 rubric from its name and description (admin only)
-      description: Synchronous, like /api/roles/questions/rephrase - one short generation, retried once with the failure quoted back. The name and description are treated as untrusted data, fenced in the prompt. The answer is checked against the same length bounds the create route enforces and is never truncated. WRITES NOTHING - the draft goes back to the form, and the admin creates the metric through POST /api/scorecards/metrics. Model-invoking, so it takes the strict per-user rate-limit bucket.
+      description: Synchronous, like /api/roles/questions/rephrase. AT MOST TWO provider calls per request, worst case - one generation through the non-retrying text runner (the JSON is parsed by the route's generator, not by a runner that silently re-asks), and one retry with the failure quoted back only when the answer was unparseable or failed the checks; a timeout or provider failure is not retried. The name and description are treated as untrusted data, fenced in the prompt. The answer is sanitized before it is checked - C0/C1 control, bidi and zero-width characters are stripped and every whitespace run, newlines included, becomes one space, because the instruction is later laid out unfenced in the scoring prompt - and is then checked against the same length bounds the create route enforces and never truncated. Every press is audited as resource.generate, a refused one with outcome failed and its reason code; the audit is best-effort and never changes the response. WRITES NOTHING - the draft goes back to the form, and the admin creates the metric through POST /api/scorecards/metrics. Model-invoking, so it takes the strict per-user rate-limit bucket.
       requestBody:
         required: true
         content:
@@ -6796,7 +6796,7 @@ paths:
       tags: [phone]
       operationId: setPhoneHalt
       summary: Raise the phone admission kill switch
-      description: Admin only. Delegates to set_phone_halt. An explicit reason from the 0042 vocabulary is required. Repeated halts PRESERVE the original instant, reason and actor, and already_halted says so. The audit is fail-closed — if the sink fails, the halt this call CAUSED is rolled back and the response is 500 with rolled_back true; a halt that was already in force is not rolled back, because our call changed nothing and lifting it would undo somebody else's decision.
+      description: Admin only. Delegates to set_phone_halt. An explicit reason from the 0042 vocabulary is required. A repeated halt PRESERVES the original instant (already_halted says one was in force), and since 0110 the reason in force ESCALATES to the most restrictive one requested — emergency_stop > legal_hold > provider_incident > cost_control > operator_pause — and is never downgraded; an escalation re-attributes the halt to the escalating actor, and a weaker or equal request changes nothing. The response reason is the reason IN FORCE after the call, as the substrate reports it, and requested_reason echoes the request, so a pause requested during a legal hold answers reason legal_hold. The route's audit write is still fail-closed in the RESPONSE but NEVER rolls the halt back — lifting a kill switch because our own audit sink failed would fail open on the control that stops calls, and set_phone_halt has already written its own audit_events row in the same transaction as the halt. So an audit-sink failure answers 500 phone_audit_write_failed with rolled_back false, and the halt stays in force; re-read GET /api/phone/health.
       security:
         - bearerAuth: []
       requestBody:
@@ -6825,7 +6825,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneApiError'
         '500':
-          description: phone_rpc_unknown_status, phone_action_error or phone_audit_write_failed with rolled_back.
+          description: phone_rpc_unknown_status, phone_action_error, or phone_audit_write_failed with rolled_back false — the halt is NEVER rolled back on an audit failure and stays in force.
           content:
             application/json:
               schema:
@@ -6859,7 +6859,7 @@ paths:
       tags: [phone]
       operationId: clearPhoneHalt
       summary: Lower the phone admission kill switch
-      description: Admin only. The reason on the body must NAME the halt currently in force, verified against the control row before anything is cleared. 0042 defines no separate resume vocabulary and this API does not invent one; requiring the existing reason makes the field a genuine interlock and gives the audit-failure path a reason it verified rather than guessed. A control singleton that cannot be read is never cleared — 0042 reads a missing row as halted and refuses to invent a cleared one, and so does this route. On audit failure the halt is re-raised with that verified reason.
+      description: Admin only. The reason on the body must NAME the halt currently in force, verified against the control row before anything is cleared. 0042 defines no separate resume vocabulary and this API does not invent one; requiring the existing reason makes the field a genuine interlock and gives the audit-failure path a reason it verified rather than guessed. A control singleton that cannot be read is never cleared — 0042 reads a missing row as halted and refuses to invent a cleared one, and so does this route. On audit failure the halt is re-raised with that verified reason. Since 0110 the reason in force is the MOST RESTRICTIVE one raised while the halt has been in force (see POST /api/phone/halt), so a legal hold raised during an operator pause must be cleared by naming legal_hold; naming operator_pause answers 409 halt_reason_mismatch.
       security:
         - bearerAuth: []
       requestBody:
@@ -12421,17 +12421,23 @@ components:
 
     PhoneHaltResponse:
       type: object
-      required: [ok, halted, already_halted, reason]
+      required: [ok, halted, already_halted, reason, requested_reason]
       properties:
         ok:
           type: boolean
         halted:
           type: boolean
         already_halted:
-          description: True when a halt was ALREADY in force. 0042 preserves the original instant, reason and actor across repeated halts.
+          description: True when a halt was ALREADY in force. The original halt instant is preserved across repeated halts; the reason and actor change only when a stronger reason escalates the halt (0110).
           type: boolean
         reason:
+          description: The reason IN FORCE after the call, as set_phone_halt reports it — the most restrictive reason raised while the halt has been in force, which is not necessarily requested_reason. Null only when the substrate did not report one in the closed vocabulary (a database without 0110); read GET /api/phone/health in that case, and never assume the requested reason.
           type: string
+          nullable: true
+        requested_reason:
+          description: The reason this request asked for, echoed. Differs from reason when a stronger halt was already in force.
+          type: string
+          enum: [operator_pause, provider_incident, cost_control, legal_hold, emergency_stop]
       additionalProperties: false
 
     PhoneHaltClearResponse:

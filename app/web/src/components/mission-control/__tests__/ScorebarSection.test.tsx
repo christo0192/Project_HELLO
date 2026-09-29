@@ -205,4 +205,31 @@ describe('ScorebarSection', () => {
     expect(api.draftMetricRubric).toHaveBeenCalledWith({ name: 'Ownership', description: null });
     expect(api.createScorecardMetric).not.toHaveBeenCalled();
   });
+
+  it('after Create, the emptied form no longer says Hello drafted it', async () => {
+    // The form resets on a successful Create; Ask Hello's "review before
+    // creating" line is about text that is gone, and must go with it rather
+    // than sit beside "Add a name and Hello can draft…".
+    api.draftMetricRubric.mockResolvedValue({
+      default_instruction: 'Look for concrete examples of ownership.',
+      rubric: { 1: 'No example.', 2: 'A vague claim.', 3: 'A specific example.', 4: 'Several examples.' },
+    });
+    render(<ScorebarSection />);
+    await screen.findByText('Add a metric');
+    const user = userEvent.setup();
+    const drafted = 'Hello drafted the scoring instruction and rubric — review before creating.';
+
+    await user.type(screen.getByLabelText('Name'), 'Ownership');
+    await user.click(screen.getByRole('button', { name: /^Ask Hello/ }));
+    expect(await screen.findByText(drafted)).toBeInTheDocument();
+
+    await user.click(screen.getByRole('button', { name: 'Create metric' }));
+    expect(await screen.findByText('Metric “Technical depth” created.')).toBeInTheDocument();
+    await waitFor(() => expect(screen.getByLabelText('Name')).toHaveValue(''));
+
+    expect(screen.queryByText(drafted)).not.toBeInTheDocument();
+    expect(
+      screen.getByText('Add a name and Hello can draft the instruction and rubric.'),
+    ).toBeInTheDocument();
+  });
 });

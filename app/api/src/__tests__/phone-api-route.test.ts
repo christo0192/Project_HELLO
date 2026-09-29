@@ -1614,14 +1614,83 @@ describe('the health surface', () => {
 
 describe('halt', () => {
   it('delegates to set_phone_halt and reports whether it was already in force', async () => {
-    const write = fakeStores({ setHalt: async () => ({ status: 'ok', alreadyHalted: true }) });
+    const write = fakeStores({
+      setHalt: async () => ({
+        status: 'ok', alreadyHalted: true, haltReason: 'provider_incident', reasonEscalated: false,
+      }),
+    });
     const res = await request(appWith('admin', { stores: write.store }))
       .post('/api/phone/halt').send({ reason: 'provider_incident' });
     expect(res.status).toBe(200);
     expect(res.body).toEqual({
-      ok: true, halted: true, already_halted: true, reason: 'provider_incident',
+      ok: true,
+      halted: true,
+      already_halted: true,
+      reason: 'provider_incident',
+      requested_reason: 'provider_incident',
     });
     expect((write.calls[0].input as Record<string, unknown>).reason).toBe('provider_incident');
+  });
+
+  it('reports the reason IN FORCE, not the one requested: a pause during a legal hold says legal_hold', async () => {
+    // 0110: a weaker request changes nothing. Echoing the request here would
+    // tell the admin that only a pause is up while a legal hold stands — the
+    // exact misreading that let Resume lift a legal hold.
+    const write = fakeStores({
+      setHalt: async () => ({
+        status: 'ok', alreadyHalted: true, haltReason: 'legal_hold', reasonEscalated: false,
+      }),
+    });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt').send({ reason: 'operator_pause' });
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      ok: true,
+      halted: true,
+      already_halted: true,
+      reason: 'legal_hold',
+      requested_reason: 'operator_pause',
+    });
+    expect(audited).toHaveLength(1);
+    expect(audited[0].metadata).toEqual({
+      resource: 'phone_control',
+      action: 'halt_set',
+      reason: 'operator_pause',
+      reason_in_force: 'legal_hold',
+      reason_escalated: false,
+      already_halted: true,
+    });
+  });
+
+  it('an ESCALATION reports the stronger reason now in force, and audits it as escalated', async () => {
+    const write = fakeStores({
+      setHalt: async () => ({
+        status: 'ok', alreadyHalted: true, haltReason: 'legal_hold', reasonEscalated: true,
+      }),
+    });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt').send({ reason: 'legal_hold' });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({
+      already_halted: true, reason: 'legal_hold', requested_reason: 'legal_hold',
+    });
+    expect(audited[0].metadata).toMatchObject({
+      reason: 'legal_hold', reason_in_force: 'legal_hold', reason_escalated: true,
+    });
+  });
+
+  it('a substrate that does not report the reason in force answers null — never the requested reason', async () => {
+    // A pre-0110 database, or drift the store narrowed away. "Not known" is
+    // true; the requested reason would be a guess, and possibly the weaker one.
+    const write = fakeStores({ setHalt: async () => ({ status: 'ok', alreadyHalted: true }) });
+    const res = await request(appWith('admin', { stores: write.store }))
+      .post('/api/phone/halt').send({ reason: 'operator_pause' });
+    expect(res.status).toBe(200);
+    expect(res.body.reason).toBeNull();
+    expect(res.body.requested_reason).toBe('operator_pause');
+    expect(audited[0].metadata).toMatchObject({
+      reason: 'operator_pause', reason_in_force: null, reason_escalated: null,
+    });
   });
 
   it('NEVER lifts the halt when the audit write fails — the stop stands', async () => {

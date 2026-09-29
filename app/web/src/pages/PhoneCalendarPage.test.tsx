@@ -683,7 +683,7 @@ describe('agent filter', () => {
       'All agents',
       'Data Analyst',
       // Same title, blank agent name: told apart, never two identical options.
-      'Data Analyst (2)',
+      'Data Analyst · 2',
       // The agent name, not the role title `Sales Advisor`.
       'Zara',
     ]);
@@ -768,10 +768,15 @@ describe('agent filter', () => {
     renderWithUrl(WEEK_QS);
     await screen.findByRole('table');
     const select = await agentPicker();
-    await userEvent.selectOptions(select, 'Data Analyst (2)');
+    await userEvent.selectOptions(select, 'Data Analyst · 2');
 
     expect(await screen.findByText('No calls for this agent this week')).toBeInTheDocument();
-    expect(screen.getByText(/Other agents have 5 calls/)).toBeInTheDocument();
+    // Four calls belong to other agents; the fifth has NO role and is nobody's,
+    // so it is not counted as another agent's — it is named on its own.
+    expect(
+      screen.getByText(/^Other agents have 4 calls between .+ IST, and 1 call has no agent\. Choose All agents to see them\.$/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Other agents have 5 calls/)).not.toBeInTheDocument();
     expect(screen.queryByRole('table')).not.toBeInTheDocument();
     expect(screen.queryByText('No appointments match these filters')).not.toBeInTheDocument();
     // The control doing the filtering is still on screen, and still says so.
@@ -782,6 +787,34 @@ describe('agent filter', () => {
     await waitFor(() => expect(shownRefs()).toHaveLength(5));
     expect(select.value).toBe('');
     expect(url().has('agent')).toBe(false);
+  });
+
+  it('says only "other agents" when every call this week has an agent', async () => {
+    apiFns.getPhoneCalendar.mockResolvedValue(
+      calendarResponse({
+        appointments: AGENT_WEEK.appointments.filter((appt) => appt.role_id !== null),
+      }),
+    );
+    renderWithUrl(`${WEEK_QS}&agent=${ROLE_DATA_TWIN}`);
+    expect(await screen.findByText('No calls for this agent this week')).toBeInTheDocument();
+    expect(
+      screen.getByText(/^Other agents have 4 calls between .+ IST\. Choose All agents to see them\.$/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/no agent/)).not.toBeInTheDocument();
+  });
+
+  it('never credits a role-less call to "other agents" when it is the only kind there is', async () => {
+    apiFns.getPhoneCalendar.mockResolvedValue(
+      calendarResponse({
+        appointments: AGENT_WEEK.appointments.filter((appt) => appt.role_id === null),
+      }),
+    );
+    renderWithUrl(`${WEEK_QS}&agent=${ROLE_DATA_TWIN}`);
+    expect(await screen.findByText('No calls for this agent this week')).toBeInTheDocument();
+    expect(
+      screen.getByText(/^1 call between .+ IST has no agent\. Choose All agents to see it\.$/),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/Other agents/)).not.toBeInTheDocument();
   });
 
   it('switches back to every agent with "All agents"', async () => {

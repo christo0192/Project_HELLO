@@ -2969,7 +2969,9 @@ describe('phone operator API bodies match the documented schemas', () => {
         status: 'ok', appointmentId: PHONE_APPOINTMENT, version: 4,
       }),
       expireAppointments: async () => ({ status: 'ok' }),
-      setHalt: async () => ({ status: 'ok', alreadyHalted: false }),
+      setHalt: async () => ({
+        status: 'ok', alreadyHalted: false, haltReason: 'operator_pause', reasonEscalated: false,
+      }),
       clearHalt: async () => ({ status: 'ok', wasHalted: true }),
       backlog: async () => ({
         status: 'ok',
@@ -3066,8 +3068,18 @@ describe('phone operator API bodies match the documented schemas', () => {
     // vacuous. An undocumented key and a wrong type must both be caught.
     const good = {
       ok: true, halted: true, already_halted: false, reason: 'operator_pause',
+      requested_reason: 'operator_pause',
     };
     expect(validateNamed(good, 'PhoneHaltResponse', spec)).toEqual([]);
+    // 0110: `reason` is the reason IN FORCE and may be null ("not reported");
+    // `requested_reason` is required and closed.
+    expect(validateNamed({ ...good, reason: null }, 'PhoneHaltResponse', spec)).toEqual([]);
+    expect(validateNamed({ ...good, reason: 'legal_hold' }, 'PhoneHaltResponse', spec)).toEqual([]);
+    const { requested_reason: requested, ...noRequested } = good;
+    expect(requested).toBe('operator_pause');
+    expect(validateNamed(noRequested, 'PhoneHaltResponse', spec).length).toBeGreaterThan(0);
+    expect(validateNamed({ ...good, requested_reason: 'because' }, 'PhoneHaltResponse', spec).length)
+      .toBeGreaterThan(0);
     expect(validateNamed({ ...good, surprise: 1 }, 'PhoneHaltResponse', spec).length)
       .toBeGreaterThan(0);
     expect(validateNamed({ ...good, halted: 'yes' }, 'PhoneHaltResponse', spec).length)

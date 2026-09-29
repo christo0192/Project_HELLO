@@ -939,7 +939,13 @@ export const PHONE_RPC_RESULT_KEYS: Readonly<Record<string, readonly string[]>> 
     'superseded_appointment_id',
   ],
   cancel_phone_appointment: ['appointment_id', 'version'],
-  set_phone_halt: ['already_halted'],
+  // 0110. `halt_reason` is the reason IN FORCE after the call — the most
+  // restrictive one requested while halted, never the first one. It is
+  // load-bearing in the fail-open direction: `/halt` reports it to the
+  // operator, and a response that echoed the REQUESTED reason instead would
+  // tell an admin who pressed "pause" during a legal hold that only a pause is
+  // in force.
+  set_phone_halt: ['already_halted', 'halt_reason', 'reason_escalated'],
   clear_phone_halt: ['was_halted'],
   admit_phone_attempt: ['attempt_id', 'lease_token', 'lease_expires_at'],
   apply_phone_event: ['applied', 'ignored_reason', 'event_id', 'duplicate'],

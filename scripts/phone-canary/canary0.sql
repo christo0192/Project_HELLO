@@ -844,17 +844,33 @@ begin
   perform _phone_canary.chk(s, 'halt_was_not_already_up',
                             (r->>'already_halted')::boolean is false, 'halt');
 
-  -- A second halt does not overwrite the first. That is precisely why
-  -- clearing has to NAME the reason in force: the reason on the row is
-  -- the one the first operator gave, not the last.
+  -- A second, STRONGER halt escalates the reason in force (0110) and keeps
+  -- the original instant. The reason on the row is the MOST RESTRICTIVE one
+  -- raised while halted — never the first one — which is precisely why
+  -- clearing has to NAME it: a cost-control stop raised during a pause must
+  -- not be lifted by somebody resuming "the pause".
   r := screening_v2.set_phone_halt('cost_control', null, t + interval '1 minute');
-  perform _phone_canary.chk(s, 'second_halt_is_a_noop',
+  perform _phone_canary.chk(s, 'second_halt_reports_already_halted',
                             (r->>'already_halted')::boolean is true, 'halt');
-  perform _phone_canary.chk(s, 'original_halt_reason_preserved',
+  perform _phone_canary.chk(s, 'stronger_halt_escalates_the_reason',
     (select halt_reason from screening_v2.phone_control where control_key = 'default')
-      = 'operator_pause',
+      = 'cost_control'
+      and r->>'halt_reason' = 'cost_control'
+      and (r->>'reason_escalated')::boolean is true,
     _phone_canary.code((select halt_reason from screening_v2.phone_control
                          where control_key = 'default')));
+  perform _phone_canary.chk(s, 'original_halt_instant_preserved',
+    (select halted_at from screening_v2.phone_control where control_key = 'default') = t,
+    'halt');
+
+  -- A WEAKER halt changes nothing: a pause never downgrades a stronger stop.
+  r := screening_v2.set_phone_halt('operator_pause', null, t + interval '90 seconds');
+  perform _phone_canary.chk(s, 'weaker_halt_is_a_noop',
+    (select halt_reason from screening_v2.phone_control where control_key = 'default')
+      = 'cost_control'
+      and r->>'halt_reason' = 'cost_control'
+      and (r->>'reason_escalated')::boolean is false,
+    _phone_canary.code(r->>'halt_reason'));
 
   r := screening_v2.admit_phone_attempt(eng, 'initial', 'canary0', 180,
                                         t + interval '2 minutes');

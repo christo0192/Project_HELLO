@@ -21,21 +21,35 @@
  * keeps the value on one line (a typed newline cannot start a fake heading),
  * and the sentinel means a typed "[END …]" cannot close the block early.
  *
- * THE MODEL IS NEVER TRUSTED, only used. Its answer must carry all five
- * strings, non-empty after trimming, distinct across the four levels, and
- * within the SAME hard limits the create route enforces
- * (`SCORECARD_MAX_INSTRUCTION_LENGTH`, `SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH`).
- * The prompt asks for well under those limits so a normal answer has headroom.
- * An answer that fails is retried once with the failure quoted back, and a
- * second failure is REPORTED (a `RoleDraftError` with a stable reason code),
- * never truncated or returned in part — a clipped rubric level reads as a
- * complete sentence that says less than it should.
+ * THE MODEL IS NEVER TRUSTED, only used. Its answer is first SANITIZED —
+ * control, bidi and zero-width characters stripped, every whitespace run
+ * (newlines included) collapsed to one space — because the instruction is later
+ * laid out UNFENCED in the scoring prompt, where a multi-line instruction could
+ * impersonate prompt structure and an invisible character could hide text from
+ * the admin who reviews it. It must then carry all five strings, non-empty,
+ * distinct across the four levels, and within the SAME hard limits the create
+ * route enforces (`SCORECARD_MAX_INSTRUCTION_LENGTH`,
+ * `SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH`). The prompt asks for well under
+ * those limits so a normal answer has headroom. An answer that fails is
+ * retried once with the failure quoted back, and a second failure is REPORTED
+ * (a `RoleDraftError` with a stable reason code), never truncated or returned
+ * in part — a clipped rubric level reads as a complete sentence that says less
+ * than it should.
+ *
+ * AT MOST TWO PROVIDER CALLS PER PRESS, worst case. Each attempt makes exactly
+ * ONE call through the NON-retrying text runner and parses the JSON here. The
+ * JSON runner (`runClaudeJSON*`) is deliberately not used: it silently re-asks
+ * once on an unparseable answer and then throws `BusinessError`, so a second
+ * attempt on top of it made up to FOUR 45-second calls from one button. Parsing
+ * locally also lets the one retry quote the parse failure back to the model,
+ * where the runner's blind re-ask sent the identical prompt.
  */
 
 import { randomBytes } from 'node:crypto';
 import { env } from '../env.js';
-import { runClaudeJSONWithProvenance } from '../claude.js';
+import { runClaude } from '../claude.js';
 import { DeepseekError } from '../deepseek.js';
+import { extractStructuredJson } from '../prompts.js';
 import { BusinessError, ProviderError, isProviderFailure } from '../provider-resilience.js';
 import { RoleDraftError } from '../role-authoring.js';
 import {
@@ -44,7 +58,10 @@ import {
   SCORE_LABELS,
 } from './contracts.js';
 
-/** Gate attempts per press. As with Rephrase, not provider calls — see there. */
+/**
+ * Attempts per press — and, because each attempt is exactly one call through
+ * the non-retrying runner, the worst-case number of PROVIDER CALLS per press.
+ */
 export const METRIC_DRAFT_MAX_ATTEMPTS = 2;
 
 /** Per provider call. A button beside a form field must not sit for minutes. */
@@ -71,10 +88,17 @@ export interface MetricRubricDraft {
 }
 
 export interface MetricDraftDeps {
-  /** Seam for tests; replaces the whole provider call. */
+  /**
+   * Seam for tests; replaces the whole provider call AND the parse — it
+   * resolves to the parsed answer. One call of it is one attempt.
+   */
   infer?: (prompt: string) => Promise<unknown>;
-  /** Seam one level below `infer`, so the call options stay assertable. */
-  runJson?: typeof runClaudeJSONWithProvenance;
+  /**
+   * Seam one level below `infer`: the raw-text runner, so the call options and
+   * the provider-call count stay assertable. It must make ONE provider call per
+   * invocation — pass a JSON runner here and the call cap is gone.
+   */
+  runText?: typeof runClaude;
   /** The fence sentinel. Random per attempt in production; tests pin it. */
   sentinel?: () => string;
 }
@@ -155,11 +179,45 @@ type Verdict =
   | { ok: false; reason: 'invalid_output' | 'output_too_long'; issue: string };
 
 /**
+ * Characters REMOVED outright: C0 controls other than the whitespace ones
+ * (U+0000–U+0008, U+000E–U+001F), DEL, C1 controls other than NEL
+ * (U+0080–U+0084, U+0086–U+009F), the bidi controls (U+061C, U+200E, U+200F,
+ * U+202A–U+202E, U+2066–U+2069) and the zero-width characters (U+200B–U+200D,
+ * U+2060, U+FEFF). None of them is visible to the admin reviewing the draft;
+ * each can make the text the scorer reads differ from the text the admin saw.
+ */
+const DRAFT_INVISIBLE_CHARS =
+  /[\u0000-\u0008\u000E-\u001F\u007F-\u0084\u0086-\u009F\u061C\u200B-\u200F\u202A-\u202E\u2060\u2066-\u2069\uFEFF]/g;
+
+/**
+ * Whitespace runs collapsed to ONE space: everything `\s` matches (tab,
+ * newline, CR, VT, FF, NBSP, U+2028/U+2029 and the other Unicode spaces) plus
+ * NEL (U+0085), which is a line break in all but name. Treated as a separator,
+ * not stripped, so two words a newline divided do not fuse into one.
+ */
+const DRAFT_WHITESPACE_RUN = /[\s\u0085]+/g;
+
+/**
+ * Sanitize one drafted string. Strip first, then collapse — the other order
+ * would turn "a \u200B b" into a double space — then trim.
+ *
+ * WHY THE INSTRUCTION LOSES ITS LINE BREAKS TOO. `default_instruction` is later
+ * laid out UNFENCED in the scoring prompt, so a drafted instruction spanning
+ * lines could open what reads as a new prompt section ("SCORING RULES: …").
+ * One line of plain text cannot. This is structure-only: it does not judge
+ * what the words say (a deny-list cannot gate generated text).
+ */
+export function sanitizeMetricDraftText(value: string): string {
+  return value.replace(DRAFT_INVISIBLE_CHARS, '').replace(DRAFT_WHITESPACE_RUN, ' ').trim();
+}
+
+/**
  * Check one model answer against the create route's own bounds.
  *
- * Rubric levels are whitespace-collapsed (the form renders each as a one-line
- * input, which would silently drop a newline anyway); the instruction keeps its
- * line breaks. Nothing is ever shortened: an over-long string is a failure.
+ * Every string is SANITIZED first (`sanitizeMetricDraftText`), and the
+ * emptiness, distinctness and length checks run on the sanitized text — the
+ * text that would actually be saved. Nothing is ever shortened: an over-long
+ * string is a failure.
  */
 export function validateMetricDraft(raw: unknown): Verdict {
   const invalid = (issue: string): Verdict => ({ ok: false, reason: 'invalid_output', issue });
@@ -170,7 +228,9 @@ export function validateMetricDraft(raw: unknown): Verdict {
   }
   const obj = raw as Record<string, unknown>;
   const instruction =
-    typeof obj.default_instruction === 'string' ? obj.default_instruction.trim() : '';
+    typeof obj.default_instruction === 'string'
+      ? sanitizeMetricDraftText(obj.default_instruction)
+      : '';
   if (!instruction) return invalid('"default_instruction" was missing or empty');
 
   const rubricRaw = obj.rubric;
@@ -187,7 +247,7 @@ export function validateMetricDraft(raw: unknown): Verdict {
   const rubric = {} as Record<MetricDraftLevel, string>;
   for (const level of METRIC_DRAFT_LEVELS) {
     const value = (rubricRaw as Record<string, unknown>)[level];
-    const text = typeof value === 'string' ? value.replace(/\s+/g, ' ').trim() : '';
+    const text = typeof value === 'string' ? sanitizeMetricDraftText(value) : '';
     if (!text) {
       return invalid(`rubric level "${level}" (${SCORE_LABELS[level]}) was missing or empty`);
     }
@@ -217,7 +277,9 @@ export function validateMetricDraft(raw: unknown): Verdict {
 /**
  * What a provider-call throw means here.
  *  - `unreadable`: a healthy provider returned text that is not the JSON asked
- *    for — worth one more attempt with the problem stated.
+ *    for (our own parse failure, surfaced as `BusinessError`, or JSON mode's
+ *    `empty_content`) — worth one more attempt with the problem stated. Each
+ *    such attempt was ONE provider call, so retrying it stays within the cap.
  *  - `timeout` / `provider`: nothing came back. NOT retried: a second 45s wait
  *    on a synchronous request is worse than an honest "try again", and the
  *    runner's circuit breaker is shared with resume parsing and scoring.
@@ -258,18 +320,26 @@ export async function draftMetricRubric(
   const infer =
     deps.infer ??
     (async (prompt: string) => {
-      const run = deps.runJson ?? runClaudeJSONWithProvenance;
-      const { data } = await run<unknown>(prompt, {
+      // THE TEXT RUNNER, NOT THE JSON RUNNER: exactly one provider call per
+      // attempt. See the file header for why that is the call cap.
+      const run = deps.runText ?? runClaude;
+      const text = await run(prompt, {
         model: env.deepseekScoringModel,
         // JSON mode, as candidate-questions and the resume structurer pass: the
-        // prompt names JSON, and a malformed answer otherwise costs a whole
-        // second provider call inside the runner.
+        // prompt names JSON, and the provider then constrains the answer to one
+        // JSON object, so an unparseable answer is the exception.
         responseFormat: 'json_object',
         // CAPPED, for Rephrase's reason: the configured budget is the raised
         // Fly secret, sized for role drafting, not for a button.
         timeoutMs: Math.min(env.deepseekTimeoutMs, METRIC_DRAFT_TIMEOUT_MS),
       });
-      return data;
+      try {
+        // The same fence/prose tolerance the JSON runner applies.
+        return JSON.parse(extractStructuredJson(text)) as unknown;
+      } catch {
+        // Classified `unreadable` below: retried once, with the problem stated.
+        throw new BusinessError();
+      }
     });
   const makeSentinel = deps.sentinel ?? defaultSentinel;
 

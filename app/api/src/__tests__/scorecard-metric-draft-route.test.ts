@@ -220,3 +220,82 @@ describe('POST /api/scorecards/metrics/draft — "Hello could not"', () => {
     expectNothingWritten();
   });
 });
+
+describe('POST /api/scorecards/metrics/draft — a FAILED press is audited too, best-effort', () => {
+  for (const reason of ['invalid_output', 'output_too_long', 'timeout', 'provider_error'] as const) {
+    it(`audits a 422 (${reason}) as resource.generate, in the success shape plus outcome and reason`, async () => {
+      vi.mocked(drafting.draftMetricRubric).mockRejectedValue(
+        new RoleDraftError(drafting.METRIC_DRAFT_MESSAGES[reason], reason, ['internal detail']),
+      );
+      const res = await request(app()).post(PATH).set(AUTH).send({ name: 'Ownership' });
+      expect(res.status).toBe(422);
+      expect(recordAudit).toHaveBeenCalledTimes(1);
+      expect(recordAudit).toHaveBeenCalledWith(
+        expect.anything(),
+        'resource.generate',
+        422,
+        {
+          metadata: {
+            action: 'scorecard_metric_draft',
+            metric_name: 'Ownership',
+            outcome: 'failed',
+            reason,
+          },
+        },
+      );
+      // The provider/model detail stays out of the audit row as well.
+      expect(JSON.stringify(vi.mocked(recordAudit).mock.calls.map((c) => c.slice(1)))).not.toContain('internal detail');
+    });
+  }
+
+  it('audits a 500 with the stable reason internal_error — never the fault\'s own message', async () => {
+    vi.mocked(drafting.draftMetricRubric).mockRejectedValue(new Error('pooler reset at 10.0.0.7'));
+    const res = await request(app()).post(PATH).set(AUTH).send({ name: 'Ownership' });
+    expect(res.status).toBe(500);
+    expect(recordAudit).toHaveBeenCalledWith(
+      expect.anything(),
+      'resource.generate',
+      500,
+      {
+        metadata: {
+          action: 'scorecard_metric_draft',
+          metric_name: 'Ownership',
+          outcome: 'failed',
+          reason: 'internal_error',
+        },
+      },
+    );
+    expect(JSON.stringify(vi.mocked(recordAudit).mock.calls.map((c) => c.slice(1)))).not.toContain('pooler reset');
+  });
+
+  it('a dead audit sink does not change a 422: same status, same body', async () => {
+    vi.mocked(recordAudit).mockRejectedValue(new Error('audit sink down'));
+    vi.mocked(drafting.draftMetricRubric).mockRejectedValue(
+      new RoleDraftError(drafting.METRIC_DRAFT_MESSAGES.timeout, 'timeout'),
+    );
+    const res = await request(app()).post(PATH).set(AUTH).send({ name: 'Ownership' });
+    expect(res.status).toBe(422);
+    expect(res.body).toEqual({
+      error: {
+        type: 'unprocessable_entity',
+        message: drafting.METRIC_DRAFT_MESSAGES.timeout,
+        details: { reason: 'timeout' },
+      },
+    });
+    expect(recordAudit).toHaveBeenCalledTimes(1);
+  });
+
+  it('a dead audit sink does not turn a 500 into anything else', async () => {
+    vi.mocked(recordAudit).mockRejectedValue(new Error('audit sink down'));
+    vi.mocked(drafting.draftMetricRubric).mockRejectedValue(new Error('pooler reset'));
+    const res = await request(app()).post(PATH).set(AUTH).send({ name: 'Ownership' });
+    expect(res.status).toBe(500);
+    expect(recordAudit).toHaveBeenCalledTimes(1);
+  });
+
+  it('a successful press is audited ONCE, with no failure fields', async () => {
+    await request(app()).post(PATH).set(AUTH).send({ name: 'Ownership' });
+    expect(recordAudit).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(recordAudit).mock.calls[0][2]).toBe(200);
+  });
+});

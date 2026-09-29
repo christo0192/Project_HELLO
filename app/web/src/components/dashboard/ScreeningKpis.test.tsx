@@ -423,10 +423,11 @@ describe('ScreeningKpis', () => {
     expect(screen.queryByRole('option', { name: /Sales Program Advisor/ })).not.toBeInTheDocument();
   });
 
-  it('falls back to the TITLE for a role with no agent name, and numbers exact duplicates', async () => {
+  it('falls back to the TITLE for a role with no agent name, and tells duplicates apart', async () => {
     // Production today: two roles titled "Sales Program Advisor", neither with
     // an agent name. Two identical options meaning different things is a
-    // picker nobody can use correctly.
+    // picker nobody can use correctly. A shared AGENT name says which role;
+    // a shared bare title can only be numbered, after a middle dot.
     listRoles.mockResolvedValue([
       { id: 'r1', title: 'Sales Program Advisor', agent_name: null },
       { id: 'r2', title: 'Sales Program Advisor' },
@@ -442,10 +443,10 @@ describe('ScreeningKpis', () => {
     expect(options.map((o) => o.textContent)).toEqual([
       'All agents',
       'Sales Program Advisor',
-      'Sales Program Advisor (2)',
+      'Sales Program Advisor · 2',
       'Support',
-      'Gopu',
-      'Gopu (2)',
+      'Gopu (Ops)',
+      'Gopu (Finance)',
     ]);
     expect(options.map((o) => o.value)).toEqual(['', 'r1', 'r2', 'r3', 'r4', 'r5']);
 

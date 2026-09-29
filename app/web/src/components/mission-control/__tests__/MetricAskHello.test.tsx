@@ -7,9 +7,11 @@
  *   - inert until the name has a non-space character (aria-disabled, no-op);
  *   - sends the trimmed name and description (a blank description as null);
  *   - on success hands all five strings to `onApply` and announces it;
- *   - busy in place, focus stays on the button;
+ *   - busy in place, focus stays on the button, and busy is SAID ONCE (the
+ *     button's name never changes; the live region carries it);
  *   - asks before replacing text the admin already wrote (confirm + cancel);
- *   - discards a draft that returns after the form changed;
+ *   - discards a draft that returns after the form changed, or after unmount;
+ *   - clears its status and error when the host resets the form (resetKey);
  *   - errors inline, in plain English;
  *   - never saves anything (its only API call is the draft).
  * The wiring into ScorebarSection is pinned in ScorebarSection.test.tsx.
@@ -53,7 +55,7 @@ const HELLO_DRAFT = {
 };
 
 const ASK_NAME = /^Ask Hello to draft the scoring instruction and rubric$/;
-const BUSY_NAME = /^Hello is drafting the scoring instruction and rubric…$/;
+const DRAFTING = 'Hello is drafting the scoring instruction and rubric…';
 const DRAFTED = 'Hello drafted the scoring instruction and rubric — review before creating.';
 const REPLACE_TITLE = "Replace what you've written?";
 const REPLACE_CONFIRM = "Replace with Hello's draft";
@@ -77,9 +79,17 @@ function renderAsk(draft: MetricAskHelloDraft) {
     onApply,
     user: userEvent.setup(),
     /** The admin typed: the host re-renders with the new form state. */
-    retype: (next: MetricAskHelloDraft) =>
-      utils.rerender(<MetricAskHello idPrefix="t" draft={next} onApply={onApply} />),
+    retype: (next: MetricAskHelloDraft, resetKey?: number) =>
+      utils.rerender(
+        <MetricAskHello idPrefix="t" draft={next} onApply={onApply} resetKey={resetKey} />,
+      ),
   };
+}
+
+/** Drafting has started: the button reports busy (its name does not change). */
+async function waitForBusy() {
+  await waitFor(() => expect(askButton()).toHaveAttribute('aria-busy', 'true'));
+  return askButton();
 }
 
 function deferred<T>() {
@@ -174,22 +184,43 @@ describe('MetricAskHello — drafting', () => {
     const { user, onApply } = renderAsk(form({ name: 'Ownership' }));
     await user.click(askButton());
 
-    const busy = await screen.findByRole('button', { name: BUSY_NAME });
-    expect(busy).toHaveAttribute('aria-busy', 'true');
+    const busy = await waitForBusy();
     expect(busy).toHaveAttribute('aria-disabled', 'true');
-    expect(busy).toHaveTextContent('Hello is drafting…');
     expect(busy).toHaveTextContent('◐');
-    // The live region narrates it for a screen reader.
-    expect(liveRegion()).toHaveTextContent('Hello is drafting the scoring instruction and rubric…');
+    // The status line says it — on screen AND to a screen reader.
+    expect(liveRegion()).toHaveTextContent(DRAFTING);
 
     await user.click(busy);
     expect(api.draftMetricRubric).toHaveBeenCalledTimes(1);
 
     await act(async () => pending.resolve(HELLO_DRAFT));
-    const idle = await screen.findByRole('button', { name: ASK_NAME });
-    expect(idle).toHaveAttribute('aria-busy', 'false');
-    expect(idle).toHaveTextContent('✦');
+    await waitFor(() => expect(askButton()).toHaveAttribute('aria-busy', 'false'));
+    expect(askButton()).toHaveTextContent('✦');
     expect(onApply).toHaveBeenCalledTimes(1);
+  });
+
+  it('says "busy" ONCE: the name and label never change, only the live region speaks', async () => {
+    // A focused control whose name changes is re-announced; the old busy
+    // `aria-label` equalled the live-region sentence, so it was read twice.
+    const pending = deferred<typeof HELLO_DRAFT>();
+    api.draftMetricRubric.mockReturnValue(pending.promise);
+    const { user } = renderAsk(form({ name: 'Ownership' }));
+    askButton().focus();
+    await user.keyboard('{Enter}');
+
+    const busy = await waitForBusy();
+    // Same accessible name, same visible label (so SC 2.5.3 holds while busy).
+    expect(busy).toHaveAccessibleName(ASK_NAME);
+    expect(busy).toHaveTextContent(/^◐\s*Ask Hello$/);
+    expect(busy).toHaveFocus();
+    // The sentence exists in exactly one place: the visible live region.
+    const said = screen.getAllByText(DRAFTING);
+    expect(said).toHaveLength(1);
+    expect(said[0]).toBe(liveRegion());
+    expect(liveRegion()).toHaveAttribute('aria-live', 'polite');
+    expect(liveRegion().querySelector('.sr-only')).toBeNull();
+
+    await act(async () => pending.resolve(HELLO_DRAFT));
   });
 
   it('keeps keyboard focus on the button through the draft and the fill', async () => {
@@ -198,7 +229,7 @@ describe('MetricAskHello — drafting', () => {
     const { user } = renderAsk(form({ name: 'Ownership' }));
     askButton().focus();
     await user.keyboard('{Enter}');
-    expect(await screen.findByRole('button', { name: BUSY_NAME })).toHaveFocus();
+    expect(await waitForBusy()).toHaveFocus();
     await act(async () => pending.resolve(HELLO_DRAFT));
     await screen.findByText(DRAFTED);
     expect(askButton()).toHaveFocus();
@@ -209,13 +240,63 @@ describe('MetricAskHello — drafting', () => {
     api.draftMetricRubric.mockReturnValue(pending.promise);
     const { user, onApply, retype } = renderAsk(form({ name: 'Ownership' }));
     await user.click(askButton());
-    await screen.findByRole('button', { name: BUSY_NAME });
+    await waitForBusy();
     retype(form({ name: 'Ownership', instruction: 'Typed during the wait.' }));
     await act(async () => pending.resolve(HELLO_DRAFT));
     expect(liveRegion()).toHaveTextContent(
       'The form changed while Hello was drafting, so the draft was not applied.',
     );
     expect(onApply).not.toHaveBeenCalled();
+  });
+
+  it('applies nothing when the draft lands after it UNMOUNTED — it can no longer see the form', async () => {
+    // The host's list reload swaps the form out and back. The old instance's
+    // copy of the form froze at unmount, so "unchanged" would be a lie about
+    // whatever the admin typed into the new one.
+    const pending = deferred<typeof HELLO_DRAFT>();
+    api.draftMetricRubric.mockReturnValue(pending.promise);
+    const { user, onApply, unmount } = renderAsk(form({ name: 'Ownership' }));
+    await user.click(askButton());
+    await waitForBusy();
+    unmount();
+    await act(async () => pending.resolve(HELLO_DRAFT));
+    expect(onApply).not.toHaveBeenCalled();
+  });
+});
+
+describe('MetricAskHello — the host resets the form (resetKey)', () => {
+  it('clears "Hello drafted…" so an empty form does not claim a draft it no longer has', async () => {
+    const { user, retype } = renderAsk(form({ name: 'Ownership' }));
+    await user.click(askButton());
+    await screen.findByText(DRAFTED);
+
+    // The admin pressed Create: the host empties the form and bumps the key.
+    retype(form(), 1);
+
+    expect(liveRegion()).toHaveTextContent(/^$/);
+    expect(screen.queryByText(DRAFTED)).not.toBeInTheDocument();
+    // Only the empty-form hint remains, with nothing contradicting it.
+    expect(
+      screen.getByText('Add a name and Hello can draft the instruction and rubric.'),
+    ).toBeInTheDocument();
+  });
+
+  it('clears an error too', async () => {
+    api.draftMetricRubric.mockRejectedValue(new ApiError('Too many requests', 429));
+    const { user, retype } = renderAsk(form({ name: 'Ownership' }));
+    await user.click(askButton());
+    await screen.findByRole('alert');
+
+    retype(form(), 1);
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+  });
+
+  it('keeps the status on an ordinary re-render — only a NEW key resets', async () => {
+    const { user, retype } = renderAsk(form({ name: 'Ownership' }));
+    await user.click(askButton());
+    await screen.findByText(DRAFTED);
+    retype(form({ name: 'Ownership' }), 0);
+    expect(liveRegion()).toHaveTextContent(DRAFTED);
   });
 });
 

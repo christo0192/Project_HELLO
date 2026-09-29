@@ -122,6 +122,7 @@ import {
   PHONE_ATTEMPT_STATES,
   PHONE_ENGAGEMENT_STATES,
   PHONE_EVENT_IGNORED_REASONS,
+  PHONE_HALT_REASONS,
   PHONE_RECORDING_ROLES,
   PHONE_SUPPRESSION_REASONS,
   PHONE_SUPPRESSION_SOURCES,
@@ -129,6 +130,7 @@ import {
   type PhoneAttemptState,
   type PhoneEngagementState,
   type PhoneEventIgnoredReason,
+  type PhoneHaltReason,
   type PhoneRecordingRole,
   type PhoneSuppressionReason,
   type PhoneSuppressionSource,
@@ -203,7 +205,7 @@ function member<T extends string>(
   return typeof v === 'string' && allowed.includes(v) ? (v as T) : undefined;
 }
 
-// The four closed vocabularies `member()` narrows against are IMPORTED, never
+// The closed vocabularies `member()` narrows against are IMPORTED, never
 // re-declared. A hand-copied second list here would be the exact drift the
 // lane exists to prevent, and it would fail SILENTLY: `member()` drops a value
 // it does not recognise, so a missing state would make the field vanish from
@@ -817,6 +819,10 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
       return {
         status: narrowPhoneRpcStatus<SetPhoneHaltStatus>('set_phone_halt', row),
         alreadyHalted: bool(row, 'already_halted'),
+        // 0110. Narrowed against the closed reason vocabulary: a value outside
+        // it is dropped (absent), never passed on as though it were a reason.
+        haltReason: member<PhoneHaltReason>(row, 'halt_reason', PHONE_HALT_REASONS),
+        reasonEscalated: bool(row, 'reason_escalated'),
       };
     },
 

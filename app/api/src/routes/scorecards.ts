@@ -188,6 +188,31 @@ scorecardsRouter.post('/metrics', requireRole('admin'), validateBody(createMetri
 // every field. Synchronous, like Rephrase, and 422 — not 500 — when the model
 // could not produce a usable draft: "Hello could not" is a true statement
 // about a working system. The audit is best-effort for the same reason.
+//
+// A FAILED press is audited too, in the same shape plus `outcome` and the
+// stable `reason` code: it still spent up to two model calls on the admin's
+// behalf, and "who kept pressing Ask Hello on what" must be answerable. Same
+// best-effort rule — an audit failure never changes the response.
+async function auditMetricDraftFailure(
+  req: import('express').Request,
+  statusCode: 422 | 500,
+  metricName: string,
+  reason: string,
+): Promise<void> {
+  try {
+    await recordAudit(req, 'resource.generate', statusCode, {
+      metadata: {
+        action: 'scorecard_metric_draft',
+        metric_name: metricName,
+        outcome: 'failed',
+        reason,
+      },
+    });
+  } catch {
+    /* best-effort: the response is decided by the draft, never by the sink */
+  }
+}
+
 scorecardsRouter.post(
   '/metrics/draft',
   requireRole('admin'),
@@ -210,6 +235,14 @@ scorecardsRouter.post(
       }
       res.json(drafted);
     } catch (err) {
+      // `internal_error`, not the error's own text: a fault message can carry
+      // anything, and the reason code is what a reviewer filters on.
+      await auditMetricDraftFailure(
+        req,
+        err instanceof RoleDraftError ? 422 : 500,
+        body.name,
+        err instanceof RoleDraftError ? err.reason : 'internal_error',
+      );
       if (err instanceof RoleDraftError) {
         return res.status(422).json({
           error: {

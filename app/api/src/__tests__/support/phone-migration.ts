@@ -97,6 +97,17 @@ export const MIGRATION_0096_PATH = fileURLToPath(
 
 export const MIGRATION_0096 = readFileSync(MIGRATION_0096_PATH, 'utf8');
 
+// 0110 re-declares set_phone_halt IN FULL (the reason in force escalates to the
+// most restrictive one requested and is never downgraded). It must outrank
+// 0042, or every extractor — the reason allowlist, the status vocabulary and
+// the RESULT keys (`halt_reason`, `reason_escalated`) — reads 0042's
+// superseded first-reason-wins body.
+export const MIGRATION_0110_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0110_phone_halt_reason_precedence.sql', import.meta.url),
+);
+
+export const MIGRATION_0110 = readFileSync(MIGRATION_0110_PATH, 'utf8');
+
 // 0108 declares the attempt-recording quarantine RPC. It supersedes nothing,
 // so its position is free — but it belongs in the corpus, because a test that
 // applies PHONE_MIGRATIONS and then calls the RPC must find it.
@@ -292,6 +303,9 @@ export const MIGRATION_0092 = readFileSync(MIGRATION_0092_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0110 — set_phone_halt IN FULL (halt reason precedence), so it must
+    // precede 0042.
+    { name: '0110', sql: MIGRATION_0110 },
     // 0108 — attempt-recording quarantine (new function, no predecessor).
     // Registered because the registry is the thing that decides WHICH body a
     // test sees: 0103 was once left out and `newestContaining` resolved
