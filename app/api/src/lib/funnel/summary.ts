@@ -202,8 +202,9 @@ export async function loadFunnelSummary(
       // someone filled in a stage id".
       //
       // Three ways the id-only version got this wrong, all reachable today:
-      //  * `ashby_job_mappings` is unique on (provider, external_job_id), so
-      //    several mappings share one role. One wired mapping made the band
+      //  * `ashby_job_mappings` holds one LIVE row per (provider,
+      //    external_job_id) — plus any archived ones (0109) — so several
+      //    mappings share one role. One wired mapping made the band
       //    "configured" for candidates who all arrived through an UNWIRED one,
       //    whose states can only be `unknown` — printing 0/0 as measurement.
       //  * Unscoped (the default org-wide view), one wired role out of ten

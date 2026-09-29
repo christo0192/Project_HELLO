@@ -37,7 +37,10 @@ const ROLE = '11111111-1111-4111-8111-111111111111';
 interface Scenario {
   /** The ownership read. `null` = not found / not owned. */
   role: { id: string } | null;
+  /** LIVE mappings (`archived_at is null`). */
   mappings: number;
+  /** Mappings deleted in Mission Control — archived rows (0109), still holding the role. */
+  archivedMappings?: number;
   candidates: number;
   sessions: number;
   /** Rows the update/delete write reports back. */
@@ -76,19 +79,39 @@ function chain(table: string): any {
   }
   const call: (typeof touched)[number] = { table, op: 'select', filters: [] };
   touched.push(call);
-  const counts: Record<string, number> = {
-    ashby_job_mappings: scenario.mappings,
-    candidates: scenario.candidates,
-    call_sessions: scenario.sessions,
+  /**
+   * Resolved when the query is AWAITED, after every filter is on it. An
+   * UNFILTERED mapping count answers live + archived, because that is what
+   * the table really holds — so a route that forgot `.is('archived_at', null)`
+   * would see the deleted mapping and wrongly refuse.
+   */
+  const countFor = (): number => {
+    if (table === 'ashby_job_mappings') {
+      const has = (key: string) => call.filters.some(([col]) => col === key);
+      if (has('archived_at not is')) return scenario.archivedMappings ?? 0;
+      if (has('archived_at is')) return scenario.mappings;
+      return scenario.mappings + (scenario.archivedMappings ?? 0);
+    }
+    if (table === 'candidates') return scenario.candidates;
+    if (table === 'call_sessions') return scenario.sessions;
+    return 0;
   };
   const self: any = {
     select(_cols?: string, opts?: { count?: string; head?: boolean }) {
       // A HEAD+count read is the reference check; anything else is a row read.
-      if (opts?.count) self.__count = counts[table] ?? 0;
+      if (opts?.count) self.__counted = true;
       return self;
     },
     eq(col: string, val: unknown) {
       call.filters.push([col, val]);
+      return self;
+    },
+    is(col: string, val: unknown) {
+      call.filters.push([`${col} is`, val]);
+      return self;
+    },
+    not(col: string, op: string, val: unknown) {
+      call.filters.push([`${col} not ${op}`, val]);
       return self;
     },
     update(payload: Record<string, unknown>) {
@@ -116,7 +139,7 @@ function chain(table: string): any {
         error: null,
       }),
     then: (res: (v: unknown) => unknown) =>
-      Promise.resolve({ count: self.__count ?? 0, data: [], error: null }).then(res),
+      Promise.resolve({ count: self.__counted ? countFor() : 0, data: [], error: null }).then(res),
   };
   return self;
 }
@@ -203,6 +226,38 @@ describe('DELETE /api/roles/:id', () => {
     expect(res.status).toBe(409);
     expect(res.body.error.message).toMatch(/Ashby Mission Control/);
     expect(touched.some((t) => t.table === 'roles' && t.op !== 'select')).toBe(false);
+  });
+
+  it('ARCHIVES — does not refuse — when only a DELETED Ashby mapping references it', async () => {
+    // Deleting a mapping in Mission Control archives it (0109); the row stays
+    // and RESTRICT still blocks a hard delete. Answering "remove the mapping
+    // in Ashby Mission Control first" would send the operator to a screen
+    // where there is nothing left to remove.
+    scenario.archivedMappings = 1;
+    const res = await del();
+    expect(res.status).toBe(200);
+    expect(res.body.outcome).toBe('archived');
+    expect(res.body.reason).toBe('deleted_ashby_mapping_exists');
+    expect(res.body.deleted_ashby_mappings).toBe(1);
+    const write = touched.find((t) => t.table === 'roles' && t.op === 'update');
+    expect(write?.payload).toEqual({ is_active: false });
+    expect(touched.some((t) => t.table === 'roles' && t.op === 'delete')).toBe(false);
+  });
+
+  it('still REFUSES a live mapping when a deleted one exists as well', async () => {
+    scenario.mappings = 1;
+    scenario.archivedMappings = 2;
+    const res = await del();
+    expect(res.status).toBe(409);
+    expect(touched.some((t) => t.table === 'roles' && t.op !== 'select')).toBe(false);
+  });
+
+  it('keeps the candidates reason when candidates AND a deleted mapping reference it', async () => {
+    scenario.candidates = 5;
+    scenario.archivedMappings = 1;
+    const res = await del();
+    expect(res.body.outcome).toBe('archived');
+    expect(res.body.reason).toBe('candidates_or_sessions_exist');
   });
 
   it('SCOPES EVERY roles OPERATION to the caller for an interviewer', async () => {

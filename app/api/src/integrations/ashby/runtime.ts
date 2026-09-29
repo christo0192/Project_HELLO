@@ -514,6 +514,14 @@ export function createAshbyRuntime(options: CreateAshbyRuntimeOptions): AshbyRun
       .select('id, status, ai_screening_stage_id, delivery_mode, screening_mode, activation_at, activation_epoch, config_version')
       .eq('provider', 'ashby')
       .eq('external_job_id', externalJobId)
+      // LIVE rows only (0109). An archived ("deleted") mapping keeps its row,
+      // and re-adding the job inserts a NEW one, so a job can own an archived
+      // row beside its live one — uniqueness is over live rows alone (partial
+      // index uq_ashby_job_mappings_live_job). Unfiltered, `maybeSingle`
+      // errors on the pair (failing every import for a re-added job), and a
+      // job whose only row is archived would resolve to that frozen row
+      // instead of to "no mapping".
+      .is('archived_at', null)
       .maybeSingle();
     if (error) throw new Error('ashby_mapping_read_error');
     if (!data) return { status: 'unknown', id: null, deliveryMode: 'manual' };

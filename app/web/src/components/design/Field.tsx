@@ -8,6 +8,7 @@ import { useId } from 'react';
 import type {
   InputHTMLAttributes,
   ReactNode,
+  Ref,
   SelectHTMLAttributes,
   TextareaHTMLAttributes,
 } from 'react';
@@ -78,6 +79,13 @@ export function TextArea({ className, ...rest }: TextareaHTMLAttributes<HTMLText
 
 export interface SelectFieldProps extends Omit<SelectHTMLAttributes<HTMLSelectElement>, 'size'> {
   size?: 'sm' | 'md';
+  /**
+   * Reaches the native `<select>`. React 19 passes `ref` to a function
+   * component as an ordinary prop, so the `...rest` spread below forwards it
+   * with no `forwardRef` — this line only lets the type checker see it. For
+   * a caller that must move focus onto the control (say, after a retry).
+   */
+  ref?: Ref<HTMLSelectElement>;
 }
 
 export function SelectField({ className, size = 'md', children, ...rest }: SelectFieldProps) {

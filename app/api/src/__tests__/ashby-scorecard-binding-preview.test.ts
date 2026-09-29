@@ -114,6 +114,7 @@ function fakeStore(): MissionControlStore {
     cancelApplication: async () => ({ status: 'ok', cancelledOperations: 0, cancelledIngestion: 0 }),
     retryOperation: async () => ({ status: 'ok' }), retryIngestionParse: async () => ({ status: 'ok' }),
     retryLegacyBadOutput: async () => ({ status: 'ok' }), retryModelDegraded: async () => ({ status: 'ok' }),
+    archiveMapping: async () => ({ status: 'ok', alreadyArchived: false }),
     upsertMapping: async () => ({ status: 'ok', id: MAPPING_ID }),
     reissueManualInvite: async () => ({ status: 'ok', inviteId: MAPPING_ID, revokedInvites: 0 }),
   } as unknown as MissionControlStore;
@@ -146,7 +147,9 @@ function previewDeps(over: Partial<NonNullable<Parameters<typeof createAshbyMiss
     feedbackFormDefinitionInfo: vi.fn(async (id: string) => { calls.push(`feedbackFormDefinitionInfo:${id}`); return { results: DEFINITION_PAYLOAD }; }),
   };
   const scorecardPreview = {
-    readMappingRoleId: async (id: string) => { calls.push(`readMappingRoleId:${id}`); return ROLE_ID; },
+    // Default: a mapping bound to the verified form — what a dialog-created
+    // mapping now gets on create.
+    readMapping: async (id: string) => { calls.push(`readMapping:${id}`); return { roleId: ROLE_ID as string | null, feedbackFormId: FORM_ID as string | null }; },
     loadMetrics: async (roleId: string) => { calls.push(`loadMetrics:${roleId}`); return METRICS; },
     ...over,
   };
@@ -164,6 +167,7 @@ describe('GET /mappings/:id/scorecard-binding — read-only binding preview', ()
       expect(res.status).toBe(200);
       expect(res.body.ok).toBe(true);
       expect(res.body.scoringPath).toBe('v2_autobind');
+      expect(res.body.mappingFormBound).toBe(true);
       expect(res.body.preview).toMatchObject({ formDefinitionId: FORM_ID, schemaAvailable: true, archived: false, formMatchesBinding: true, ready: false });
       expect(res.body.preview.metrics).toEqual([
         { key: 'profile_relevance', name: 'Profile relevance', status: 'bound', fieldPath: 'path-pr', scale: { min: 1, max: 5 } },
@@ -172,13 +176,13 @@ describe('GET /mappings/:id/scorecard-binding — read-only binding preview', ()
         // The derived Role fit row is always previewed for a v2 role (#282 signal on the kept v1 field).
         { key: 'role_fit', name: 'Role fit', status: 'no_field', fieldPath: null, scale: null },
       ]);
-      expect(d.calls).toEqual([`readMappingRoleId:${MAPPING_ID}`, `loadMetrics:${ROLE_ID}`, `feedbackFormDefinitionInfo:${FORM_ID}`]);
+      expect(d.calls).toEqual([`readMapping:${MAPPING_ID}`, `loadMetrics:${ROLE_ID}`, `feedbackFormDefinitionInfo:${FORM_ID}`]);
       // Structure only: no submitted value, no provider body echo.
       expect(JSON.stringify(res.body)).not.toMatch(/ANSWER-MUST-NOT-SURFACE|submittedValue|isArchived|organizationId/);
       // Audit carries counts only — never a path, title, or metric name.
       const row = audits.find((a) => (a.metadata as Record<string, unknown> | undefined)?.resource === 'ashby_scorecard_binding_preview');
       expect(row).toBeDefined();
-      expect(row!.metadata).toEqual({ resource: 'ashby_scorecard_binding_preview', scoring_path: 'v2_autobind', metric_count: 4, bound_count: 2, ready: false });
+      expect(row!.metadata).toEqual({ resource: 'ashby_scorecard_binding_preview', scoring_path: 'v2_autobind', metric_count: 4, bound_count: 2, ready: false, mapping_form_bound: true });
       expect(JSON.stringify(row)).not.toMatch(/path-pr|Profile relevance|Stability/);
     } finally {
       setAuditSink(sink);
@@ -193,7 +197,7 @@ describe('GET /mappings/:id/scorecard-binding — read-only binding preview', ()
     expect(r1.body.preview.metrics).toEqual([]);
     expect(r1.body.preview.fixedFields.every((f: { status: string }) => f.status === 'present')).toBe(true);
 
-    const roleless = previewDeps({ readMappingRoleId: async () => null });
+    const roleless = previewDeps({ readMapping: async () => ({ roleId: null, feedbackFormId: FORM_ID }) });
     const r2 = await request(appWith('admin', roleless)).get(`/mc/mappings/${MAPPING_ID}/scorecard-binding`);
     expect(r2.status).toBe(200);
     expect(r2.body.scoringPath).toBe('no_role');
@@ -201,8 +205,49 @@ describe('GET /mappings/:id/scorecard-binding — read-only binding preview', ()
     expect(roleless.calls).toEqual([`feedbackFormDefinitionInfo:${FORM_ID}`]);
   });
 
+  describe('mappingFormBound — the scorecard writer only writes for the verified form', () => {
+    it('is true when the mapping names exactly the verified Hello Christy form', async () => {
+      const res = await request(appWith('admin', previewDeps())).get(`/mc/mappings/${MAPPING_ID}/scorecard-binding`);
+      expect(res.status).toBe(200);
+      expect(res.body.mappingFormBound).toBe(true);
+    });
+
+    it('is false when the mapping names a different form — whatever the preview itself says', async () => {
+      const d = previewDeps({ readMapping: async () => ({ roleId: ROLE_ID, feedbackFormId: 'some-other-form' }) });
+      const res = await request(appWith('admin', d)).get(`/mc/mappings/${MAPPING_ID}/scorecard-binding`);
+      expect(res.status).toBe(200);
+      expect(res.body.mappingFormBound).toBe(false);
+      // The preview is of the VERIFIED form either way; it is the mapping that
+      // is unbound, so the flag is carried beside the preview, not inside it.
+      expect(res.body.scoringPath).toBe('v2_autobind');
+      expect(res.body.preview.formMatchesBinding).toBe(true);
+    });
+
+    it('is false when the mapping names no form at all (a pre-default, dialog-created mapping)', async () => {
+      const d = previewDeps({ readMapping: async () => ({ roleId: ROLE_ID, feedbackFormId: null }) });
+      const res = await request(appWith('admin', d)).get(`/mc/mappings/${MAPPING_ID}/scorecard-binding`);
+      expect(res.status).toBe(200);
+      expect(res.body.mappingFormBound).toBe(false);
+    });
+
+    it('is audited as a boolean, never as the form id', async () => {
+      const sink = getAuditSink();
+      const audits: AuditEntry[] = [];
+      setAuditSink(async (e) => { audits.push(e); });
+      try {
+        const d = previewDeps({ readMapping: async () => ({ roleId: ROLE_ID, feedbackFormId: 'some-other-form' }) });
+        expect((await request(appWith('admin', d)).get(`/mc/mappings/${MAPPING_ID}/scorecard-binding`)).status).toBe(200);
+      } finally {
+        setAuditSink(sink);
+      }
+      const row = audits.find((a) => (a.metadata as Record<string, unknown> | undefined)?.resource === 'ashby_scorecard_binding_preview');
+      expect((row!.metadata as Record<string, unknown>).mapping_form_bound).toBe(false);
+      expect(JSON.stringify(row)).not.toContain('some-other-form');
+    });
+  });
+
   it('answers 404 for an unknown mapping without touching the provider', async () => {
-    const d = previewDeps({ readMappingRoleId: async () => undefined });
+    const d = previewDeps({ readMapping: async () => undefined });
     const res = await request(appWith('admin', d)).get(`/mc/mappings/${MAPPING_ID}/scorecard-binding`);
     expect(res.status).toBe(404);
     expect(res.body.error).toBe('mapping_not_found');
@@ -232,7 +277,7 @@ describe('GET /mappings/:id/scorecard-binding — read-only binding preview', ()
   });
 
   it('reports a table read failure as a sanitized 500', async () => {
-    const d = previewDeps({ readMappingRoleId: async () => { throw new Error('pg down'); } });
+    const d = previewDeps({ readMapping: async () => { throw new Error('pg down'); } });
     const res = await request(appWith('admin', d)).get(`/mc/mappings/${MAPPING_ID}/scorecard-binding`);
     expect(res.status).toBe(500);
     expect(res.body.error).toBe('mission_control_read_error');

@@ -380,6 +380,66 @@ describe('endpoint helpers', () => {
     expect(calls).toHaveLength(0);
   });
 
+  it('job.list posts to the fixed path with only the paging fields — never a status filter', async () => {
+    const { client, calls } = makeClient([ok([]), ok([])]);
+    await client.jobList();
+    await client.jobList({ cursor: 'cur_1', syncToken: 'sync_1', limit: 100 });
+
+    expect(calls[0].url).toBe('https://api.ashbyhq.com/job.list');
+    expect(JSON.parse(calls[0].body)).toEqual({});
+    expect(JSON.parse(calls[1].body)).toEqual({ cursor: 'cur_1', syncToken: 'sync_1', limit: 100 });
+    for (const call of calls) {
+      expect(JSON.parse(call.body)).not.toHaveProperty('status');
+      expect(call.url).not.toContain('cur_1');
+    }
+  });
+
+  it('job.list validates the cursor and the limit before any transport call', async () => {
+    const { client, calls } = makeClient([ok([])]);
+    await expect(client.jobList({ cursor: '' })).rejects.toMatchObject({ code: 'invalid_id', operation: 'job.list' });
+    await expect(client.jobList({ cursor: 'c\u0001' })).rejects.toMatchObject({ code: 'id_control_char' });
+    await expect(client.jobList({ cursor: 'c'.repeat(300) })).rejects.toMatchObject({ code: 'id_too_long' });
+    await expect(client.jobList({ limit: 1.5 })).rejects.toMatchObject({ code: 'invalid_limit', operation: 'job.list' });
+    await expect(client.jobList({ limit: Number.NaN })).rejects.toMatchObject({ code: 'invalid_limit' });
+    expect(calls).toHaveLength(0);
+
+    // An over-large limit is clamped to the documented bound, not forwarded.
+    const clamped = makeClient([ok([])]);
+    await clamped.client.jobList({ limit: 9999 });
+    expect(JSON.parse(clamped.calls[0].body)).toEqual({ limit: 500 });
+  });
+
+  it('job.list surfaces the pagination primitives for the directory walk', async () => {
+    const { client } = makeClient([ok([{ id: 'job_1' }], { moreDataAvailable: true, nextCursor: 'next_1' })]);
+    const r = await client.jobList({ limit: 100 });
+    expect(r.results).toEqual([{ id: 'job_1' }]);
+    expect(r.moreDataAvailable).toBe(true);
+    expect(r.nextCursor).toBe('next_1');
+  });
+
+  it('job.list honours the walk deadline exactly as application.listHistory does — and never sends it', async () => {
+    // A live deadline: the request goes out, and the deadline is not in the body.
+    const live = makeClient([ok([])]);
+    await live.client.jobList({ limit: 100, deadlineAt: Date.now() + 60_000 });
+    expect(live.calls).toHaveLength(1);
+    expect(JSON.parse(live.calls[0].body)).toEqual({ limit: 100 });
+
+    // A spent deadline: refused before any transport call, with the stable code.
+    const spent = makeClient([ok([])]);
+    await expect(spent.client.jobList({ limit: 100, deadlineAt: Date.now() - 1 }))
+      .rejects.toMatchObject({ category: 'timeout', code: 'deadline_exceeded', operation: 'job.list' });
+    expect(spent.calls).toHaveLength(0);
+
+    // A deadline that runs out mid-retry stops the retry loop instead of
+    // spending the whole attempt budget.
+    const retrying = makeClient([res(503, 'busy'), ok([])], {
+      sleep: async () => { await new Promise((r) => setTimeout(r, 25)); },
+    });
+    await expect(retrying.client.jobList({ limit: 100, deadlineAt: Date.now() + 10 }))
+      .rejects.toMatchObject({ code: 'deadline_exceeded' });
+    expect(retrying.calls).toHaveLength(1);
+  });
+
   it('changeStage validates both ids and posts to the fixed path', async () => {
     const { client, calls } = makeClient([ok({ moved: true })]);
     await client.applicationChangeStage('app_1', 'stage_2');

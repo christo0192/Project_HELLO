@@ -333,8 +333,20 @@ function analyzeMigrations(files) {
             migration.startsWith('0057_phone_rescreen_cycles') &&
             cname === 'uq_phone_engagements_application' &&
             /TST-15 SANCTION/.test(sql);
+          // 0109 narrows the table-wide one-mapping-per-job UNIQUE to a partial
+          // unique index over LIVE (non-archived) rows, created in the same
+          // migration BEFORE this drop, so a deleted job can be re-added as a
+          // new row without reviving and re-pointing its history. Exact and
+          // migration-local, like 0057.
+          const sanctionedLiveJobUniqueness =
+            migration.startsWith('0109_ashby_mapping_archive') &&
+            cname === 'uq_ashby_job_mappings_provider_job' &&
+            /TST-15 SANCTION/.test(sql) &&
+            /create\s+unique\s+index\s+if\s+not\s+exists\s+uq_ashby_job_mappings_live_job[\s\S]*?where\s+archived_at\s+is\s+null/i.test(sql);
           if (sanctionedCycleEvolution) {
             ok(migration, stmt, "REPLACEABLE_DROP_CONSTRAINT", "0057 cycle evolution replaces the legacy application-wide UNIQUE after backfill");
+          } else if (sanctionedLiveJobUniqueness) {
+            ok(migration, stmt, "REPLACEABLE_DROP_CONSTRAINT", "0109 narrows one-mapping-per-job to LIVE rows via a partial unique index created first");
           } else if (!guarded) {
             red(migration, stmt, "DESTRUCTIVE_DROP_CONSTRAINT_UNGUARDED", `DROP CONSTRAINT '${cname}' without IF EXISTS; no reverse SQL`);
           } else if (ctype === "unique" || ctype === "primary_key" || ctype === "foreign_key" || ctype === "exclude") {

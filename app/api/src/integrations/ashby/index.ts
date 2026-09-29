@@ -107,6 +107,7 @@ export {
   type OpaqueRecord,
   type ApplicationListParams,
   type ApplicationHistoryParams,
+  type JobListParams,
   type FeedbackSubmitRequest,
   type FeedbackRequestCreateRequest,
 } from './types.js';
@@ -302,12 +303,18 @@ export {
 } from './materialize.js';
 export {
   probeJobStages,
+  probeJobDirectory,
   extractStages,
   assertReadOnly,
   PROBE_READ_OPERATIONS,
   type ProbeStage,
   type ProbeResult,
+  type ProbeJob,
+  type ProbeJobStatus,
+  type ProbeJobDirectory,
+  type JobListReader,
 } from './probe.js';
+export { HELLO_CHRISTY_SCREENING_STAGE_ID } from './screening-stage.js';
 export { ASHBY_IMPORT_QUEUE, importDedupKey } from './signal-worker.js';
 export type { RuntimeWorkflowStores, WorkflowLinkRow } from './orchestration.js';
 export type { MissionControlMappingUpsert } from './workflow-stores.js';

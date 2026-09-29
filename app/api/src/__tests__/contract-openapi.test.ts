@@ -1126,7 +1126,13 @@ describe('OpenAPI document integrity', () => {
     // 0106 adds distinct admin-only preview and confirmation URLs for the
     // explicit mapping backlog import. 136 + 2 = 138.
     // 0107 adds candidate attempt-history and attempt-download URLs: 140.
-    expect(Object.keys(paths).length).toBe(140);
+    // The Add-mapping picker adds ONE admin read — GET .../mission-control/jobs,
+    // the read-only Ashby job directory (job.list; id/title/status/openedAt
+    // only, confidential jobs withheld). 140 + 1 = 141.
+    // 0109 adds ONE admin action — POST .../mission-control/mappings/{id}/
+    // archive, Mission Control's "Delete", which archives a paused mapping
+    // and keeps its history. 141 + 1 = 142.
+    expect(Object.keys(paths).length).toBe(142);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas
@@ -1228,7 +1234,14 @@ describe('OpenAPI document integrity', () => {
     // schemas for the explicit Ashby mapping backlog action. 248 + 3 = 251.
     // 0107 adds the candidate-attempt response and three nested projections.
     // 251 + 4 = 255.
-    expect(Object.keys(schemas).length).toBe(255);
+    // The job directory adds TWO: AshbyJob (the four copied fields) and its
+    // AshbyJobDirectoryResponse envelope, both additionalProperties:false.
+    // 255 + 2 = 257.
+    // 0109's archive action adds ONE: AshbyMcArchiveResponse, {ok,
+    // already_archived}, additionalProperties:false. It is not a reuse of
+    // AshbyMcActionResponse because that one requires a `status` this route
+    // has no honest value for. 257 + 1 = 258.
+    expect(Object.keys(schemas).length).toBe(258);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.

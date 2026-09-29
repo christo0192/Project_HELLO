@@ -19,6 +19,7 @@ import {
 } from '../integrations/ashby/runtime.js';
 import { loadAshbyConfig, loadAshbyRuntimeConfig } from '../integrations/ashby/config.js';
 import { createMissionControlStore } from '../integrations/ashby/workflow-stores.js';
+import { createMappingResolver } from '../integrations/ashby/stores.js';
 
 const APIKEY = 'SENTINEL_APIKEY_aaaaaaaaaaaaaaaaaaaa';
 const SECRET = 'SENTINEL_SECRET_bbbbbbbbbbbbbbbbbbbb';
@@ -209,7 +210,7 @@ describe('runtime mapping resolvers', () => {
   }
 
   it('resolves a mapping by job id with its status, AI stage, and delivery mode', async () => {
-    const { client } = fakeSupabase({
+    const { client, calls } = fakeSupabase({
       'ashby_job_mappings:select': {
         data: { id: 'map_1', status: 'enabled', ai_screening_stage_id: 'stage_ai', delivery_mode: 'both', activation_at: '2026-09-25T00:00:00Z', activation_epoch: 2, config_version: 3 },
         error: null,
@@ -217,6 +218,14 @@ describe('runtime mapping resolvers', () => {
     });
     const r = await runtimeWith(client).resolveMappingByJobId('job_1');
     expect(r).toEqual({ status: 'enabled', aiScreeningStageId: 'stage_ai', id: 'map_1', deliveryMode: 'both', screeningMode: 'browser_primary', activationAt: '2026-09-25T00:00:00Z', activationEpoch: 2, configVersion: 3 });
+    // 0109: a job can own an archived row beside its live one, so the read
+    // must be scoped to the LIVE row — otherwise maybeSingle sees two rows.
+    const read = calls.find((c) => c.table === 'ashby_job_mappings')!;
+    expect(read.filters).toEqual([
+      ['eq', 'provider', 'ashby'],
+      ['eq', 'external_job_id', 'job_1'],
+      ['is', 'archived_at', null],
+    ]);
   });
 
   it('reports unknown for a job with no mapping rather than inventing one', async () => {
@@ -469,5 +478,154 @@ describe('createMissionControlStore — stranded-completion visibility', () => {
     const rows = await createMissionControlStore(client).listWorkflows(50);
     expect(rows[0].sessionStatus).toBeNull();
     expect(calls.some((c) => c.table === 'call_sessions')).toBe(false);
+  });
+});
+
+describe('createMissionControlStore — "delete" is an archive (0109)', () => {
+  const MAPPING = '33333333-3333-4333-8333-333333333333';
+  const ACTOR = '44444444-4444-4444-8444-444444444444';
+  const ROLE = '55555555-5555-4555-8555-555555555555';
+
+  /** A client with only `rpc`, resolving to one fixed answer. */
+  function rpcClient(answer: { data: unknown; error: unknown }) {
+    const rpc = vi.fn(async (_fn: string, _args: Record<string, unknown>) => answer);
+    return { client: { rpc } as never, rpc };
+  }
+
+  it('lists only live mappings — the archived-row filter is in the query itself', async () => {
+    const { client, calls } = fakeSupabase({
+      ashby_job_mappings: {
+        data: [{
+          id: MAPPING, external_job_id: 'job_1', status: 'paused', status_reason: null, delivery_mode: 'manual',
+          ai_screening_stage_id: 'stage_ai', ta_screening_stage_id: null, label: null, role_id: ROLE, updated_at: '2026-09-29T00:00:00Z',
+        }],
+        error: null,
+      },
+    });
+    const rows = await createMissionControlStore(client).listMappings(50);
+    const read = calls.find((c) => c.table === 'ashby_job_mappings')!;
+    expect(read.op).toBe('select');
+    expect(read.filters).toContainEqual(['is', 'archived_at', null]);
+    expect(read.filters).toContainEqual(['eq', 'provider', 'ashby']);
+    // The archive columns are a filter, not a projection: nothing new is read out.
+    expect(read.columns).not.toContain('archived');
+    // The role IS projected — Mission Control names the role a job screens for.
+    expect(read.columns!.split(',').map((c) => c.trim())).toContain('role_id');
+    expect(rows).toEqual([{
+      id: MAPPING, externalJobId: 'job_1', status: 'paused', statusReason: null, deliveryMode: 'manual',
+      hasAiStage: true, hasTaStage: false, label: null, roleId: ROLE, updatedAt: '2026-09-29T00:00:00Z',
+    }]);
+  });
+
+  it('reports roleId as null for a missing or non-uuid role, never a guess', async () => {
+    const base = {
+      id: MAPPING, external_job_id: 'job_1', status: 'paused', status_reason: null, delivery_mode: 'manual',
+      ai_screening_stage_id: null, ta_screening_stage_id: null, label: null, updated_at: '2026-09-29T00:00:00Z',
+    };
+    const { client } = fakeSupabase({
+      ashby_job_mappings: { data: [{ ...base, role_id: null }, { ...base, role_id: 'not-a-uuid' }, { ...base }], error: null },
+    });
+    const rows = await createMissionControlStore(client).listMappings(50);
+    expect(rows.map((r) => r.roleId)).toEqual([null, null, null]);
+  });
+
+  it('archives through the 0109 RPC with the mapping and the acting admin', async () => {
+    const { client, rpc } = rpcClient({ data: { status: 'ok', already_archived: false }, error: null });
+    const out = await createMissionControlStore(client).archiveMapping(MAPPING, ACTOR);
+    expect(out).toEqual({ status: 'ok', alreadyArchived: false });
+    expect(rpc).toHaveBeenCalledTimes(1);
+    expect(rpc).toHaveBeenCalledWith('archive_ashby_job_mapping', { p_mapping_id: MAPPING, p_actor_id: ACTOR });
+  });
+
+  it('carries the idempotent repeat through as alreadyArchived: true', async () => {
+    const { client } = rpcClient({ data: { status: 'ok', already_archived: true }, error: null });
+    expect(await createMissionControlStore(client).archiveMapping(MAPPING, ACTOR))
+      .toEqual({ status: 'ok', alreadyArchived: true });
+  });
+
+  it('passes each refusal code through without inventing an alreadyArchived flag', async () => {
+    for (const status of ['mapping_enabled', 'not_found', 'actor_required']) {
+      const { client } = rpcClient({ data: { status }, error: null });
+      expect(await createMissionControlStore(client).archiveMapping(MAPPING, ACTOR), status).toEqual({ status });
+    }
+    const { client } = rpcClient({ data: null, error: null });
+    expect(await createMissionControlStore(client).archiveMapping(MAPPING, ACTOR)).toEqual({ status: 'error' });
+  });
+
+  it('throws a sanitized code when the RPC errors — never the database text', async () => {
+    const { client } = rpcClient({ data: null, error: { message: 'pg: function missing at 10.0.0.5' } });
+    const err = await createMissionControlStore(client).archiveMapping(MAPPING, ACTOR).then(() => null, (e: Error) => e);
+    expect(err?.message).toBe('ashby_mc_archive_mapping_error');
+  });
+
+  describe('upsertMapping — re-adding a deleted job creates a NEW row', () => {
+    const INPUT = { externalJobId: 'job_1', roleId: ROLE, ownerId: ACTOR, deliveryMode: 'manual' as const, actorId: ACTOR };
+
+    it('returns the new id and nothing else — there is no `restored` passthrough', async () => {
+      // Even if a stale RPC body carried `restored`, it is not surfaced.
+      const { client } = rpcClient({ data: { status: 'ok', id: MAPPING, created: true, restored: true }, error: null });
+      expect(await createMissionControlStore(client).upsertMapping(INPUT)).toEqual({ status: 'ok', id: MAPPING });
+    });
+
+    it('maps a Postgres unique violation (23505: the job already has a LIVE mapping) to `conflict` instead of throwing', async () => {
+      const { client, rpc } = rpcClient({
+        data: null,
+        error: { code: '23505', message: 'duplicate key value violates unique constraint "uq_ashby_job_mappings_live_job"', details: 'Key (provider, external_job_id)=(ashby, job_1) already exists.' },
+      });
+      const out = await createMissionControlStore(client).upsertMapping(INPUT);
+      expect(out).toEqual({ status: 'conflict' });
+      // Nothing from the database error rides along.
+      expect(JSON.stringify(out)).not.toMatch(/duplicate|uq_ashby|job_1/);
+      expect(rpc).toHaveBeenCalledTimes(1);
+    });
+
+    it('passes the RPC\'s `archived` refusal (an update addressed to a deleted mapping) straight through', async () => {
+      const { client } = rpcClient({ data: { status: 'archived' }, error: null });
+      expect(await createMissionControlStore(client).upsertMapping({ ...INPUT, id: MAPPING })).toEqual({ status: 'archived', id: undefined });
+    });
+
+    it('still throws a sanitized code for every OTHER database error', async () => {
+      const errors: Array<{ code?: string; message: string }> = [
+        { code: '23503', message: 'insert or update violates foreign key constraint' },
+        { code: '42883', message: 'function does not exist' },
+        { message: 'no code at all' },
+      ];
+      for (const error of errors) {
+        const { client } = rpcClient({ data: null, error });
+        const err = await createMissionControlStore(client).upsertMapping(INPUT).then(() => null, (e: Error) => e);
+        expect(err?.message, String(error.code)).toBe('ashby_mc_upsert_mapping_error');
+      }
+    });
+  });
+});
+
+describe('createMappingResolver (signal worker) — live rows only (0109)', () => {
+  it('scopes the by-job-id read to the LIVE mapping and reports its activity', async () => {
+    const { client, calls } = fakeSupabase({
+      'ashby_job_mappings:select': {
+        data: { status: 'enabled', ai_screening_stage_id: 'stage_ai', activation_at: '2026-09-25T00:00:00Z', activation_epoch: 2, config_version: 3 },
+        error: null,
+      },
+    });
+    const r = await createMappingResolver(client).resolveByJobId('job_1');
+    expect(r).toEqual({ status: 'enabled', aiScreeningStageId: 'stage_ai', activationAt: '2026-09-25T00:00:00Z', activationEpoch: 2, configVersion: 3 });
+    // A re-added job owns an archived row beside its live one; without the
+    // archived_at filter maybeSingle would see both.
+    const read = calls.find((c) => c.table === 'ashby_job_mappings')!;
+    expect(read.filters).toEqual([
+      ['eq', 'provider', 'ashby'],
+      ['eq', 'external_job_id', 'job_1'],
+      ['is', 'archived_at', null],
+    ]);
+  });
+
+  it('reports unknown when the job has no LIVE mapping (e.g. its only one was deleted)', async () => {
+    const { client } = fakeSupabase({ 'ashby_job_mappings:select': { data: null, error: null } });
+    expect(await createMappingResolver(client).resolveByJobId('job_1')).toEqual({ status: 'unknown' });
+  });
+
+  it('throws a sanitized code when the read fails', async () => {
+    const { client } = fakeSupabase({ 'ashby_job_mappings:select': { data: null, error: { message: 'JSON object requested, multiple (or no) rows returned' } } });
+    await expect(createMappingResolver(client).resolveByJobId('job_1')).rejects.toThrow('ashby_mapping_read_error');
   });
 });

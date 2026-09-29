@@ -267,6 +267,14 @@ export function createMappingResolver(client: SupabaseClient): MappingResolver {
         .select('status, ai_screening_stage_id, activation_at, activation_epoch, config_version')
         .eq('provider', 'ashby')
         .eq('external_job_id', jobId)
+        // LIVE rows only (0109). "Delete" archives a mapping, and re-adding
+        // the job inserts a NEW row, so one job can own an archived row beside
+        // its live one — uniqueness is over live rows alone (partial index
+        // uq_ashby_job_mappings_live_job). Without this filter `maybeSingle`
+        // errors on the two rows, failing every signal for a re-added job, and
+        // a job whose only row is archived resolves to that frozen row instead
+        // of to "no mapping".
+        .is('archived_at', null)
         .maybeSingle();
       if (error) throw new Error('ashby_mapping_read_error');
       if (!data) return { status: 'unknown' };

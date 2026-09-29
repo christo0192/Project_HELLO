@@ -11,14 +11,17 @@ import express, { type Request, type Response, type NextFunction } from 'express
 import request from 'supertest';
 import { createAshbyMissionControlRouter } from '../routes/ashby-mission-control.js';
 import { setAuditSink, getAuditSink, type AuditEntry } from '../lib/audit.js';
+import { viewerReadOnly } from '../lib/rbac.js';
 import type { MissionControlStore } from '../integrations/ashby/workflow-stores.js';
+import { HELLO_CHRISTY_SCORECARD_BINDING } from '../integrations/ashby/scorecard.js';
 
 const UUID = '11111111-1111-4111-8111-111111111111';
+const ROLE_UUID = '66666666-6666-4666-8666-666666666666';
 
 function fakeStore(over: Partial<MissionControlStore> = {}): MissionControlStore {
   return {
     listMappings: async () => [
-      { id: UUID, externalJobId: 'job_1', status: 'drift', statusReason: 'stage_id_invalid', deliveryMode: 'both', hasAiStage: true, hasTaStage: false, label: null, updatedAt: '2026-08-13T00:00:00Z' },
+      { id: UUID, externalJobId: 'job_1', status: 'drift', statusReason: 'stage_id_invalid', deliveryMode: 'both', hasAiStage: true, hasTaStage: false, label: null, roleId: ROLE_UUID, updatedAt: '2026-08-13T00:00:00Z' },
     ],
     listWorkflows: async () => [
       { applicationLinkId: UUID, externalApplicationId: 'app_1', externalJobId: 'job_1', lifecycle: 'processing', terminalState: null, ingestionState: 'failed_review', operations: [{ id: 'op_1', type: 'stage_move', state: 'failed', errorCode: 'transient_x' }], sessionStatus: 'in_progress', updatedAt: '2026-08-13T00:00:00Z' },
@@ -29,6 +32,7 @@ function fakeStore(over: Partial<MissionControlStore> = {}): MissionControlStore
     retryIngestionParse: async () => ({ status: 'ok' }),
     retryLegacyBadOutput: async () => ({ status: 'ok' }),
     retryModelDegraded: async () => ({ status: 'ok' }),
+    archiveMapping: async () => ({ status: 'ok', alreadyArchived: false }),
     upsertMapping: async () => ({ status: 'ok', id: UUID }),
     reissueManualInvite: async () => ({ status: 'ok', inviteId: UUID, revokedInvites: 0 }),
     ...over,
@@ -53,6 +57,8 @@ describe('reads — interviewer+ only', () => {
     expect(m.status).toBe(200);
     expect(m.body.mappings[0]).not.toHaveProperty('email');
     expect(m.body.mappings[0].status).toBe('drift');
+    // The mapping's role travels with it so the page can name the role.
+    expect(m.body.mappings[0].roleId).toBe(ROLE_UUID);
     const w = await request(app).get('/mc/workflows');
     expect(w.status).toBe(200);
     expect(w.body.workflows[0].ingestionState).toBe('failed_review');
@@ -608,6 +614,496 @@ describe('POST /mappings — always paused, never enables', () => {
   });
 });
 
+describe('POST /mappings — create-time Hello Christy stage default (owner decision 2026-09-29)', () => {
+  // Pinned as a literal, not imported: a change to the constant must be a
+  // deliberate edit here too, never a silent re-point of every new mapping.
+  const HELLO_CHRISTY_STAGE = '2358dbcc-394f-45d5-90e4-2bc9af468740';
+  const base = { external_job_id: 'job_1', role_id: UUID, delivery_mode: 'manual' };
+
+  function recordingStore() {
+    const seen: Array<Record<string, unknown>> = [];
+    const store = fakeStore({
+      upsertMapping: async (input) => { seen.push(input as never); return { status: 'ok', id: UUID }; },
+    });
+    return { store, seen };
+  }
+
+  it('a new mapping with no stage ids gets the Hello Christy stage as BOTH its AI and TA stage', async () => {
+    const { store, seen } = recordingStore();
+    const res = await request(appWithDeps('admin', { store, probeReader: null })).post('/mc/mappings').send(base);
+    expect(res.status).toBe(201);
+    expect(res.body.status).toBe('paused');
+    expect(seen).toHaveLength(1);
+    expect(seen[0].id).toBeNull();
+    expect(seen[0].aiScreeningStageId).toBe(HELLO_CHRISTY_STAGE);
+    expect(seen[0].taScreeningStageId).toBe(HELLO_CHRISTY_STAGE);
+  });
+
+  it('treats an empty or null stage id on create as absent', async () => {
+    const { store, seen } = recordingStore();
+    const app = appWithDeps('admin', { store, probeReader: null });
+    await request(app).post('/mc/mappings').send({ ...base, ai_screening_stage_id: '', ta_screening_stage_id: null });
+    expect(seen[0].aiScreeningStageId).toBe(HELLO_CHRISTY_STAGE);
+    expect(seen[0].taScreeningStageId).toBe(HELLO_CHRISTY_STAGE);
+  });
+
+  it('still honours explicit valid stage ids on create, each independently', async () => {
+    const { store, seen } = recordingStore();
+    const app = appWithDeps('admin', { store, probeReader: null });
+    await request(app).post('/mc/mappings').send({ ...base, ai_screening_stage_id: 'stage_ai', ta_screening_stage_id: 'stage_ta' });
+    await request(app).post('/mc/mappings').send({ ...base, ai_screening_stage_id: 'stage_ai' });
+    expect(seen[0]).toMatchObject({ aiScreeningStageId: 'stage_ai', taScreeningStageId: 'stage_ta' });
+    expect(seen[1]).toMatchObject({ aiScreeningStageId: 'stage_ai', taScreeningStageId: HELLO_CHRISTY_STAGE });
+  });
+
+  it('never defaults on UPDATE — absent ids pass through as null so the RPC keeps the current stages', async () => {
+    const { store, seen } = recordingStore();
+    const res = await request(appWithDeps('admin', { store, probeReader: null }))
+      .post('/mc/mappings').send({ ...base, id: UUID });
+    expect(res.status).toBe(201);
+    expect(seen[0].id).toBe(UUID);
+    expect(seen[0].aiScreeningStageId).toBeNull();
+    expect(seen[0].taScreeningStageId).toBeNull();
+    expect(JSON.stringify(seen)).not.toContain(HELLO_CHRISTY_STAGE);
+  });
+
+  it('still rejects an invalid stage id rather than defaulting over it', async () => {
+    const { store, seen } = recordingStore();
+    const app = appWithDeps('admin', { store, probeReader: null });
+    for (const body of [
+      { ...base, ta_screening_stage_id: 'bad id with spaces' },
+      { ...base, ai_screening_stage_id: 42 },
+    ]) {
+      const res = await request(app).post('/mc/mappings').send(body);
+      expect(res.status).toBe(400);
+      expect(res.body.error).toBe('invalid_stage_id');
+    }
+    expect(seen).toHaveLength(0);
+  });
+});
+
+describe('POST /mappings — create-time Hello Christy feedback-form default', () => {
+  // Pinned as a literal, not imported: the scorecard writer (enqueueScorecardWrite)
+  // refuses every write unless feedback_form_id is EXACTLY this verified form,
+  // so a silent change here must be a deliberate edit of this test too.
+  const HELLO_CHRISTY_FORM = '1c9a92c0-c18f-4bf1-898f-c29e71d7d303';
+  const base = { external_job_id: 'job_1', role_id: UUID, delivery_mode: 'manual' };
+
+  function recordingStore() {
+    const seen: Array<Record<string, unknown>> = [];
+    const store = fakeStore({
+      upsertMapping: async (input) => { seen.push(input as never); return { status: 'ok', id: UUID }; },
+    });
+    return { store, seen };
+  }
+
+  it('a new mapping that names no form gets the verified Hello Christy form, so its scorecards can be written', async () => {
+    expect(HELLO_CHRISTY_SCORECARD_BINDING.verified).toBe(true);
+    expect(HELLO_CHRISTY_SCORECARD_BINDING.formDefinitionId).toBe(HELLO_CHRISTY_FORM);
+    const { store, seen } = recordingStore();
+    const app = appWithDeps('admin', { store, probeReader: null });
+    await request(app).post('/mc/mappings').send(base);
+    await request(app).post('/mc/mappings').send({ ...base, feedback_form_id: '' });
+    await request(app).post('/mc/mappings').send({ ...base, feedback_form_id: null });
+    expect(seen).toHaveLength(3);
+    for (const input of seen) expect(input.feedbackFormId).toBe(HELLO_CHRISTY_FORM);
+  });
+
+  it('honours an explicit valid form id on create', async () => {
+    const { store, seen } = recordingStore();
+    await request(appWithDeps('admin', { store, probeReader: null }))
+      .post('/mc/mappings').send({ ...base, feedback_form_id: 'form_other' });
+    expect(seen[0].feedbackFormId).toBe('form_other');
+  });
+
+  it('never defaults on UPDATE — an absent form id passes through as null', async () => {
+    const { store, seen } = recordingStore();
+    const res = await request(appWithDeps('admin', { store, probeReader: null }))
+      .post('/mc/mappings').send({ ...base, id: UUID });
+    expect(res.status).toBe(201);
+    expect(seen[0].feedbackFormId).toBeNull();
+    expect(JSON.stringify(seen)).not.toContain(HELLO_CHRISTY_FORM);
+  });
+
+  it('does not default while the binding is unverified', async () => {
+    const binding = HELLO_CHRISTY_SCORECARD_BINDING as { verified: boolean };
+    const { store, seen } = recordingStore();
+    binding.verified = false;
+    try {
+      await request(appWithDeps('admin', { store, probeReader: null })).post('/mc/mappings').send(base);
+    } finally {
+      binding.verified = true;
+    }
+    expect(seen[0].feedbackFormId).toBeNull();
+  });
+
+  it('rejects an invalid form id rather than defaulting over it', async () => {
+    const { store, seen } = recordingStore();
+    const res = await request(appWithDeps('admin', { store, probeReader: null }))
+      .post('/mc/mappings').send({ ...base, feedback_form_id: 'bad id with spaces' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('invalid_stage_id');
+    expect(seen).toHaveLength(0);
+  });
+});
+
+describe('POST /mappings — 0109 refusals surface as 409 with their code', () => {
+  const body = { external_job_id: 'job_1', role_id: UUID, delivery_mode: 'manual' };
+
+  it('answers 409 conflict when a create collides with a job that already has a live mapping', async () => {
+    // `conflict` is what the store now returns for the unique violation
+    // (see the store test in ashby-runtime-adapters.test.ts).
+    const upsertMapping = vi.fn(async () => ({ status: 'conflict' }));
+    const res = await request(appWithDeps('admin', { store: fakeStore({ upsertMapping }), probeReader: null }))
+      .post('/mc/mappings').send(body);
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ ok: false, error: 'conflict' });
+    expect(upsertMapping).toHaveBeenCalledTimes(1);
+  });
+
+  it('answers 409 archived when an update is addressed to a deleted mapping', async () => {
+    const upsertMapping = vi.fn(async () => ({ status: 'archived' }));
+    const res = await request(appWithDeps('admin', { store: fakeStore({ upsertMapping }), probeReader: null }))
+      .post('/mc/mappings').send({ ...body, id: UUID });
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ ok: false, error: 'archived' });
+  });
+
+  it('audits nothing for a refusal', async () => {
+    const entries: AuditEntry[] = [];
+    const previous = getAuditSink();
+    setAuditSink(async (entry) => { entries.push(entry); });
+    try {
+      const res = await request(appWithDeps('admin', {
+        store: fakeStore({ upsertMapping: async () => ({ status: 'conflict' }) }), probeReader: null,
+      })).post('/mc/mappings').send(body);
+      expect(res.status).toBe(409);
+    } finally {
+      setAuditSink(previous);
+    }
+    expect(entries).toHaveLength(0);
+  });
+});
+
+describe('GET /jobs — read-only job directory for the Add-mapping picker', () => {
+  const DIRECTORY = [
+    {
+      id: 'job_open',
+      title: 'Senior Engineer',
+      status: 'Open',
+      openedAt: '2026-09-01T10:00:00Z',
+      confidential: false,
+      hiringTeam: [{ email: 'recruiter@example.invalid', firstName: 'Leaky' }],
+      customFields: [{ title: 'Comp band', value: 'secret-comp-band' }],
+    },
+    { id: 'job_closed', title: 'Analyst', status: 'Closed', openedAt: null, confidential: false },
+    { id: 'job_secret', title: 'Replacement for the CFO', status: 'Open', confidential: true },
+    // No flag at all: fail-closed, so withheld too.
+    { id: 'job_unflagged', title: 'Quiet reorg lead', status: 'Open' },
+  ];
+
+  function directoryReader(results: unknown = DIRECTORY) {
+    return { jobList: vi.fn(async () => ({ results, moreDataAvailable: false })) };
+  }
+
+  it('returns the sanitized directory to an admin — four fields per job, confidential withheld and counted', async () => {
+    const jobListReader = directoryReader();
+    const res = await request(appWithDeps('admin', { store: fakeStore(), jobListReader: jobListReader as never }))
+      .get('/mc/jobs');
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({
+      ok: true,
+      jobs: [
+        { id: 'job_closed', title: 'Analyst', status: 'Closed', openedAt: null },
+        { id: 'job_open', title: 'Senior Engineer', status: 'Open', openedAt: '2026-09-01T10:00:00.000Z' },
+      ],
+      truncated: false,
+      // job_secret (flagged) and job_unflagged (no flag — fail-closed).
+      withheld: 2,
+    });
+    const body = JSON.stringify(res.body);
+    for (const leak of ['recruiter@example.invalid', 'Leaky', 'secret-comp-band', 'job_secret', 'Replacement for the CFO', 'job_unflagged', 'Quiet reorg lead']) {
+      expect(body, `response must not carry ${leak}`).not.toContain(leak);
+    }
+    expect(jobListReader.jobList).toHaveBeenCalledTimes(1);
+  });
+
+  it('passes a partial walk through as truncated rather than failing', async () => {
+    const jobListReader = {
+      jobList: vi.fn(async () => ({ results: [{ id: 'job_1', title: 'A', confidential: false }], moreDataAvailable: true, nextCursor: 'loop' })),
+    };
+    const res = await request(appWithDeps('admin', { store: fakeStore(), jobListReader: jobListReader as never }))
+      .get('/mc/jobs');
+    expect(res.status).toBe(200);
+    expect(res.body.truncated).toBe(true);
+    expect(res.body.jobs).toHaveLength(1);
+  });
+
+  it('is admin-only, and a refused caller never reaches the provider', async () => {
+    const jobListReader = directoryReader();
+    const deps = { store: fakeStore(), jobListReader: jobListReader as never };
+    for (const role of ['interviewer', 'viewer', null]) {
+      expect((await request(appWithDeps(role, deps)).get('/mc/jobs')).status, String(role)).toBe(403);
+    }
+    expect(jobListReader.jobList).not.toHaveBeenCalled();
+  });
+
+  it('answers 503 on the `probeReader: null` disabled seam — no client built, no network touched', async () => {
+    // Config gates OPEN on purpose: if the null seam did not also close this
+    // reader, a real client would be built from this env. The stubbed fetch
+    // then proves no request left the process either way.
+    const fetchSpy = vi.fn(async () => { throw new Error('network must not be touched'); });
+    vi.stubGlobal('fetch', fetchSpy);
+    try {
+      const res = await request(appWithDeps('admin', { store: fakeStore(), probeReader: null, configSource: activeEnv() }))
+        .get('/mc/jobs');
+      expect(res.status).toBe(503);
+      expect(res.body).toEqual({ ok: false, error: 'integration_disabled' });
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it('answers 503 when the reader is explicitly disabled', async () => {
+    const res = await request(appWithDeps('admin', { store: fakeStore(), jobListReader: null }))
+      .get('/mc/jobs');
+    expect(res.status).toBe(503);
+    expect(res.body.error).toBe('integration_disabled');
+  });
+
+  it('reports a provider failure as a sanitized 502 that echoes no provider text', async () => {
+    const jobListReader = { jobList: async () => { throw new Error('403 Forbidden: tenant xyz lacks jobsRead'); } };
+    const res = await request(appWithDeps('admin', { store: fakeStore(), jobListReader: jobListReader as never }))
+      .get('/mc/jobs');
+    expect(res.status).toBe(502);
+    expect(res.body).toEqual({ ok: false, error: 'probe_unavailable' });
+    expect(JSON.stringify(res.body)).not.toContain('tenant xyz');
+  });
+
+  it('audits COUNTS only — never a job id or title', async () => {
+    const entries: AuditEntry[] = [];
+    const previous = getAuditSink();
+    setAuditSink(async (entry) => { entries.push(entry); });
+    try {
+      const res = await request(appWithDeps('admin', { store: fakeStore(), jobListReader: directoryReader() as never }))
+        .get('/mc/jobs');
+      expect(res.status).toBe(200);
+    } finally {
+      setAuditSink(previous);
+    }
+    expect(entries).toHaveLength(1);
+    expect(entries[0].metadata).toEqual({ resource: 'ashby_jobs', count: 2, truncated: false, withheld: 2 });
+    const audited = JSON.stringify(entries[0]);
+    for (const value of ['job_open', 'job_closed', 'job_secret', 'job_unflagged', 'Senior Engineer', 'Analyst', 'Replacement for the CFO', 'Quiet reorg lead']) {
+      expect(audited, `audit must not carry ${value}`).not.toContain(value);
+    }
+  });
+
+  it('is a GET-only surface — no mutating verb is mounted on the path', async () => {
+    const app = appWithDeps('admin', { store: fakeStore(), jobListReader: directoryReader() as never });
+    for (const verb of ['post', 'put', 'patch', 'delete'] as const) {
+      const res = await request(app)[verb]('/mc/jobs').send({});
+      expect(res.status, `${verb} must not be routable`).toBe(404);
+    }
+  });
+
+  it('does not collide with the job-scoped probes', async () => {
+    const jobListReader = directoryReader();
+    const probeReader = { jobInterviewPlanInfo: vi.fn(async () => ({ results: { interviewStages: [{ id: 'stage_ai', title: 'AI' }] } })) };
+    const app = appWithDeps('admin', { store: fakeStore(), jobListReader: jobListReader as never, probeReader: probeReader as never });
+
+    const directory = await request(app).get('/mc/jobs');
+    expect(directory.status).toBe(200);
+    expect(directory.body).toHaveProperty('jobs');
+    expect(probeReader.jobInterviewPlanInfo).not.toHaveBeenCalled();
+
+    const stages = await request(app).get('/mc/jobs/job_open/stages');
+    expect(stages.status).toBe(200);
+    expect(stages.body.stages).toEqual([{ id: 'stage_ai', title: 'AI' }]);
+    expect(jobListReader.jobList).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('GET /jobs — one shared, briefly cached walk (provider-call amplification)', () => {
+  const ONE_JOB = [{ id: 'job_1', title: 'Engineer', status: 'Open', confidential: false }];
+
+  /** A fake wall clock the router and the probe both read. */
+  function fakeClock(start = 1_700_000_000_000) {
+    let t = start;
+    return { now: () => t, advance: (ms: number) => { t += ms; } };
+  }
+
+  function captureAudits() {
+    const entries: AuditEntry[] = [];
+    const previous = getAuditSink();
+    setAuditSink(async (entry) => { entries.push(entry); });
+    return { entries, restore: () => setAuditSink(previous) };
+  }
+
+  it('serves a request inside the 60 s TTL from the cache — one walk, but one audit row per request', async () => {
+    const clock = fakeClock();
+    const jobList = vi.fn(async () => ({ results: ONE_JOB, moreDataAvailable: false }));
+    const audits = captureAudits();
+    try {
+      const app = appWithDeps('admin', { store: fakeStore(), jobListReader: { jobList } as never, now: clock.now });
+      const first = await request(app).get('/mc/jobs');
+      clock.advance(59_999);
+      const second = await request(app).get('/mc/jobs');
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+      expect(second.body).toEqual(first.body);
+      expect(jobList).toHaveBeenCalledTimes(1);
+    } finally {
+      audits.restore();
+    }
+    const directoryAudits = audits.entries.filter((e) => (e.metadata as Record<string, unknown>)?.resource === 'ashby_jobs');
+    expect(directoryAudits).toHaveLength(2);
+  });
+
+  it('walks the provider again once the TTL has passed', async () => {
+    const clock = fakeClock();
+    const jobList = vi.fn()
+      .mockResolvedValueOnce({ results: ONE_JOB, moreDataAvailable: false })
+      .mockResolvedValueOnce({ results: [...ONE_JOB, { id: 'job_2', title: 'Analyst', confidential: false }], moreDataAvailable: false });
+    const app = appWithDeps('admin', { store: fakeStore(), jobListReader: { jobList } as never, now: clock.now });
+    const first = await request(app).get('/mc/jobs');
+    clock.advance(60_000);
+    const second = await request(app).get('/mc/jobs');
+    expect(jobList).toHaveBeenCalledTimes(2);
+    expect(first.body.jobs).toHaveLength(1);
+    expect(second.body.jobs.map((j: { id: string }) => j.id)).toEqual(['job_2', 'job_1']);
+  });
+
+  it('never caches a failed walk — the very next request reaches the provider again', async () => {
+    const clock = fakeClock();
+    const jobList = vi.fn()
+      .mockRejectedValueOnce(new Error('503 upstream'))
+      .mockResolvedValueOnce({ results: ONE_JOB, moreDataAvailable: false });
+    const app = appWithDeps('admin', { store: fakeStore(), jobListReader: { jobList } as never, now: clock.now });
+    const failed = await request(app).get('/mc/jobs');
+    expect(failed.status).toBe(502);
+    expect(failed.body).toEqual({ ok: false, error: 'probe_unavailable' });
+    const retried = await request(app).get('/mc/jobs');
+    expect(retried.status).toBe(200);
+    expect(retried.body.jobs).toHaveLength(1);
+    expect(jobList).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * An app whose outer middleware counts requests AFTER `next()` returns.
+   * Express dispatches synchronously, so by then the route handler has run up
+   * to its first `await` — i.e. it has either started the walk or joined the
+   * one in flight.
+   */
+  function countingApp(deps: Parameters<typeof createAshbyMissionControlRouter>[0]) {
+    const state = { joined: 0 };
+    const app = express();
+    app.use(express.json());
+    app.use((req: Request, _res: Response, next: NextFunction) => {
+      (req as unknown as { authUser: unknown }).authUser = { id: UUID, appRole: 'admin' };
+      next();
+      state.joined += 1;
+    });
+    app.use('/mc', createAshbyMissionControlRouter(deps));
+    return { app, state };
+  }
+
+  it('shares ONE in-flight walk between concurrent requests (single-flight)', async () => {
+    const clock = fakeClock();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const jobList = vi.fn(async () => { await gate; return { results: ONE_JOB, moreDataAvailable: false }; });
+    const { app, state } = countingApp({ store: fakeStore(), jobListReader: { jobList } as never, now: clock.now });
+
+    const all = Promise.all([request(app).get('/mc/jobs'), request(app).get('/mc/jobs'), request(app).get('/mc/jobs')]);
+    await vi.waitFor(() => expect(state.joined).toBe(3));
+    expect(jobList).toHaveBeenCalledTimes(1);
+    release();
+    const responses = await all;
+    for (const res of responses) {
+      expect(res.status).toBe(200);
+      expect(res.body.jobs).toEqual([{ id: 'job_1', title: 'Engineer', status: 'Open', openedAt: null }]);
+    }
+    expect(jobList).toHaveBeenCalledTimes(1);
+  });
+
+  it('hands a failed shared walk to every waiter as 502, then lets the next request start afresh', async () => {
+    const clock = fakeClock();
+    let fail!: (err: Error) => void;
+    const gate = new Promise<never>((_resolve, reject) => { fail = reject; });
+    const jobList = vi.fn()
+      .mockImplementationOnce(async () => gate)
+      .mockResolvedValueOnce({ results: ONE_JOB, moreDataAvailable: false });
+    const { app, state } = countingApp({ store: fakeStore(), jobListReader: { jobList } as never, now: clock.now });
+
+    const both = Promise.all([request(app).get('/mc/jobs'), request(app).get('/mc/jobs')]);
+    await vi.waitFor(() => expect(state.joined).toBe(2));
+    fail(new Error('403 Forbidden: tenant xyz'));
+    const [a, b] = await both;
+    expect([a.status, b.status]).toEqual([502, 502]);
+    expect(JSON.stringify([a.body, b.body])).not.toContain('tenant xyz');
+    expect(jobList).toHaveBeenCalledTimes(1);
+
+    const after = await request(app).get('/mc/jobs');
+    expect(after.status).toBe(200);
+    expect(jobList).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds the whole walk by a ~20 s deadline: partial + truncated once a page is in hand', async () => {
+    const clock = fakeClock();
+    // Every page takes 8 s of (fake) wall time; the directory never ends.
+    let page = 0;
+    const jobList = vi.fn(async () => {
+      clock.advance(8_000);
+      page += 1;
+      return { results: [{ id: `job_${page}`, title: `Job ${page}`, confidential: false }], moreDataAvailable: true, nextCursor: `c${page}` };
+    });
+    const res = await request(appWithDeps('admin', { store: fakeStore(), jobListReader: { jobList } as never, now: clock.now }))
+      .get('/mc/jobs');
+    expect(res.status).toBe(200);
+    expect(res.body.truncated).toBe(true);
+    // Pages start at 0 s, 8 s and 16 s; the fourth would start at 24 s.
+    expect(jobList).toHaveBeenCalledTimes(3);
+    expect(res.body.jobs).toHaveLength(3);
+    // Internal — the walk's `timedOut` never reaches the response.
+    expect(res.body).not.toHaveProperty('timedOut');
+  });
+
+  it('serves a DEADLINE-cut walk but never caches it — the next request walks again', async () => {
+    // A slow minute at Ashby is not a property of the directory. Caching the
+    // partial list would hide the missing jobs from every admin for 60 s.
+    const clock = fakeClock();
+    let page = 0;
+    const jobList = vi.fn(async () => {
+      clock.advance(8_000);
+      page += 1;
+      return { results: [{ id: `job_${page}`, title: `Job ${page}`, confidential: false }], moreDataAvailable: true, nextCursor: `c${page}` };
+    });
+    const app = appWithDeps('admin', { store: fakeStore(), jobListReader: { jobList } as never, now: clock.now });
+    const first = await request(app).get('/mc/jobs');
+    expect(first.body.truncated).toBe(true);
+    expect(jobList).toHaveBeenCalledTimes(3);
+
+    clock.advance(1_000); // well inside the 60 s window
+    const second = await request(app).get('/mc/jobs');
+    expect(second.status).toBe(200);
+    expect(jobList).toHaveBeenCalledTimes(6);
+  });
+
+  it('answers 502 when the deadline runs out before the first page arrives', async () => {
+    const clock = fakeClock();
+    const jobList = vi.fn(async () => {
+      clock.advance(21_000);
+      throw Object.assign(new Error('ashby_timeout'), { code: 'deadline_exceeded' });
+    });
+    const res = await request(appWithDeps('admin', { store: fakeStore(), jobListReader: { jobList } as never, now: clock.now }))
+      .get('/mc/jobs');
+    expect(res.status).toBe(502);
+    expect(res.body).toEqual({ ok: false, error: 'probe_unavailable' });
+  });
+});
+
 describe('GET /jobs/:externalJobId/stages — read-only probe', () => {
   it('returns sanitized stages for an admin', async () => {
     const probeReader = {
@@ -869,5 +1365,152 @@ describe('retry — audited RPC statuses map to HTTP', () => {
     const store = fakeStore({ retryOperation: async (_id, actorId) => { actors.push(actorId); return { status: 'ok' }; } });
     await request(appWithDeps('admin', { store, probeReader: null })).post(`/mc/operations/${UUID}/retry`);
     expect(actors).toEqual([UUID]);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// POST /mappings/:id/archive — Mission Control's "Delete" (0109)
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('POST /mappings/:id/archive — delete keeps history, pause first', () => {
+  const PATH = `/mc/mappings/${UUID}/archive`;
+
+  function archiveSpy(result: Awaited<ReturnType<MissionControlStore['archiveMapping']>>) {
+    return vi.fn(async (_id: string, _actor: string) => result);
+  }
+
+  it('archives a paused mapping for an admin and passes the acting admin to the RPC', async () => {
+    const archiveMapping = archiveSpy({ status: 'ok', alreadyArchived: false });
+    const res = await request(appWithDeps('admin', { store: fakeStore({ archiveMapping }), probeReader: null })).post(PATH);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, already_archived: false });
+    expect(archiveMapping).toHaveBeenCalledTimes(1);
+    expect(archiveMapping).toHaveBeenCalledWith(UUID, UUID);
+  });
+
+  it('answers a repeat delete as success, flagged already_archived', async () => {
+    const archiveMapping = archiveSpy({ status: 'ok', alreadyArchived: true });
+    const res = await request(appWithDeps('admin', { store: fakeStore({ archiveMapping }), probeReader: null })).post(PATH);
+    expect(res.status).toBe(200);
+    expect(res.body).toEqual({ ok: true, already_archived: true });
+  });
+
+  it('refuses an enabled mapping with 409 mapping_enabled — pause first', async () => {
+    const archiveMapping = archiveSpy({ status: 'mapping_enabled' });
+    const res = await request(appWithDeps('admin', { store: fakeStore({ archiveMapping }), probeReader: null })).post(PATH);
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ ok: false, error: 'mapping_enabled' });
+  });
+
+  it('answers 404 for an unknown mapping', async () => {
+    const archiveMapping = archiveSpy({ status: 'not_found' });
+    const res = await request(appWithDeps('admin', { store: fakeStore({ archiveMapping }), probeReader: null })).post(PATH);
+    expect(res.status).toBe(404);
+    expect(res.body).toEqual({ ok: false, error: 'not_found' });
+  });
+
+  it('passes any other RPC refusal through as 409 with its code', async () => {
+    const archiveMapping = archiveSpy({ status: 'actor_required' });
+    const res = await request(appWithDeps('admin', { store: fakeStore({ archiveMapping }), probeReader: null })).post(PATH);
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ ok: false, error: 'actor_required' });
+  });
+
+  it('answers a sanitized 500 when the store throws, echoing nothing it said', async () => {
+    const archiveMapping = vi.fn(async () => { throw new Error('pg: permission denied for 10.0.0.5 archive_ashby_job_mapping'); });
+    const res = await request(appWithDeps('admin', { store: fakeStore({ archiveMapping }), probeReader: null })).post(PATH);
+    expect(res.status).toBe(500);
+    expect(res.body).toEqual({ ok: false, error: 'mission_control_action_error' });
+    expect(JSON.stringify(res.body)).not.toMatch(/pg:|10\.0\.0\.5|permission/);
+  });
+
+  it('rejects a malformed id with 400 before touching the store', async () => {
+    const archiveMapping = archiveSpy({ status: 'ok', alreadyArchived: false });
+    const res = await request(appWithDeps('admin', { store: fakeStore({ archiveMapping }), probeReader: null }))
+      .post('/mc/mappings/not-a-uuid/archive');
+    expect(res.status).toBe(400);
+    expect(res.body).toEqual({ ok: false, error: 'invalid_mapping_id' });
+    expect(archiveMapping).not.toHaveBeenCalled();
+  });
+
+  it('is admin-only — interviewer, viewer and anonymous callers never reach the store', async () => {
+    const archiveMapping = archiveSpy({ status: 'ok', alreadyArchived: false });
+    const deps = { store: fakeStore({ archiveMapping }), probeReader: null };
+    for (const role of ['interviewer', 'viewer', null]) {
+      expect((await request(appWithDeps(role, deps)).post(PATH)).status, String(role)).toBe(403);
+    }
+    expect(archiveMapping).not.toHaveBeenCalled();
+  });
+
+  it('refuses an admin session with no acting user id (nothing to attribute the delete to)', async () => {
+    const archiveMapping = archiveSpy({ status: 'ok', alreadyArchived: false });
+    const app = express();
+    app.use(express.json());
+    app.use((req: Request, _res: Response, next: NextFunction) => {
+      (req as unknown as { authUser: unknown }).authUser = { appRole: 'admin' };
+      next();
+    });
+    app.use('/mc', createAshbyMissionControlRouter({ store: fakeStore({ archiveMapping }), probeReader: null }));
+    const res = await request(app).post(PATH);
+    expect(res.status).toBe(403);
+    expect(res.body).toEqual({ ok: false, error: 'forbidden' });
+    expect(archiveMapping).not.toHaveBeenCalled();
+  });
+
+  it('is blocked for a viewer by the global read-only guard exactly as /pause is', async () => {
+    // Mirrors app.ts: auth → viewerReadOnly → router. The guard answers before
+    // the route's own requireRole('admin') is ever consulted.
+    const archiveMapping = archiveSpy({ status: 'ok', alreadyArchived: false });
+    const setMappingStatus = vi.fn(async () => ({ status: 'ok' }));
+    const app = express();
+    app.use(express.json());
+    app.use((req: Request, _res: Response, next: NextFunction) => {
+      (req as unknown as { authUser: unknown }).authUser = { id: UUID, appRole: 'viewer' };
+      next();
+    });
+    app.use(viewerReadOnly);
+    app.use('/mc', createAshbyMissionControlRouter({ store: fakeStore({ archiveMapping, setMappingStatus }), probeReader: null }));
+    const pause = await request(app).post(`/mc/mappings/${UUID}/pause`);
+    const archive = await request(app).post(PATH);
+    expect(archive.status).toBe(403);
+    expect(archive.status).toBe(pause.status);
+    expect(archive.body).toEqual(pause.body);
+    expect(archiveMapping).not.toHaveBeenCalled();
+    expect(setMappingStatus).not.toHaveBeenCalled();
+  });
+
+  it('audits resource.delete with the opaque mapping id on success, and nothing on a refusal', async () => {
+    // A realistic hex id: the shared all-digit fixture's last segment
+    // ("111111111111") is itself redacted by the audit lib's 10+-digit
+    // phone-number rule, which would hide what this test is checking.
+    const MAPPING_ID = '5f0c1e2d-3b4a-4c5d-8e6f-7a8b9c0d1e2f';
+    const entries: AuditEntry[] = [];
+    const previous = getAuditSink();
+    setAuditSink(async (entry) => { entries.push(entry); });
+    try {
+      const ok = await request(appWithDeps('admin', {
+        store: fakeStore({ archiveMapping: archiveSpy({ status: 'ok', alreadyArchived: false }) }), probeReader: null,
+      })).post(`/mc/mappings/${MAPPING_ID}/archive`);
+      expect(ok.status).toBe(200);
+      const refused = await request(appWithDeps('admin', {
+        store: fakeStore({ archiveMapping: archiveSpy({ status: 'mapping_enabled' }) }), probeReader: null,
+      })).post(`/mc/mappings/${MAPPING_ID}/archive`);
+      expect(refused.status).toBe(409);
+    } finally {
+      setAuditSink(previous);
+    }
+    expect(entries).toHaveLength(1);
+    expect(entries[0].event).toBe('resource.delete');
+    expect(entries[0].statusCode).toBe(200);
+    expect(entries[0].metadata).toEqual({ resource: 'ashby_mapping', mapping_id: MAPPING_ID, already_archived: false });
+  });
+
+  it('an archived mapping can no longer be paused or resumed — the RPC answers `archived`, surfaced as 409', async () => {
+    const app = appWithDeps('admin', { store: fakeStore({ setMappingStatus: async () => ({ status: 'archived' }) }), probeReader: null });
+    for (const action of ['pause', 'resume']) {
+      const res = await request(app).post(`/mc/mappings/${UUID}/${action}`);
+      expect(res.status, action).toBe(409);
+      expect(res.body, action).toEqual({ ok: false, error: 'archived' });
+    }
   });
 });

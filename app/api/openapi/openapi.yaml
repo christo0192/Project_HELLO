@@ -270,7 +270,7 @@ paths:
       tags: [roles]
       operationId: deleteRole
       summary: Remove a role - archives it when anything references it (interviewer+)
-      description: Deletes only a role nothing references. A role with candidates or sessions is ARCHIVED (is_active false) instead, because the foreign keys are ON DELETE SET NULL and a hard delete would silently detach every candidate from the job they applied for. A role mapped to an Ashby job is refused - that key is ON DELETE RESTRICT.
+      description: Deletes only a role nothing references. A role with candidates or sessions is ARCHIVED (is_active false) instead, because the foreign keys are ON DELETE SET NULL and a hard delete would silently detach every candidate from the job they applied for. A role mapped to a LIVE Ashby job is refused - that key is ON DELETE RESTRICT. A role held only by a mapping deleted in Ashby Mission Control (archived, still RESTRICT) is archived, reason deleted_ashby_mapping_exists.
       parameters:
         - name: id
           in: path
@@ -293,9 +293,12 @@ paths:
                     enum: [deleted, archived]
                   reason:
                     type: string
+                    enum: [candidates_or_sessions_exist, deleted_ashby_mapping_exists]
                   candidates:
                     type: integer
                   sessions:
+                    type: integer
+                  deleted_ashby_mappings:
                     type: integer
         '401':
           description: Unauthenticated.
@@ -304,7 +307,7 @@ paths:
         '404':
           description: No such role, or not one this caller owns.
         '409':
-          description: Mapped to an Ashby job. Nothing was changed.
+          description: Mapped to a live Ashby job. Nothing was changed.
     parameters:
       - name: id
         in: path
@@ -3224,7 +3227,7 @@ paths:
       tags: [ashby]
       operationId: listAshbyMappings
       summary: List Ashby job mappings for Mission Control
-      description: Sanitized job-mapping projections (status incl. paused/drift, delivery mode, completeness) for HR/admin review. Interviewer role or above. No PII or tokens.
+      description: Sanitized job-mapping projections (status incl. paused/drift, delivery mode, completeness, and the mapping's role id) for HR/admin review. Archived (deleted) mappings are excluded — see POST /mappings/{id}/archive. Interviewer role or above. No PII or tokens.
       security:
         - bearerAuth: []
       parameters:
@@ -3245,7 +3248,7 @@ paths:
       tags: [ashby]
       operationId: upsertAshbyMapping
       summary: Create or update an Ashby job mapping (always paused)
-      description: Admin-only. ALWAYS writes the mapping in the `paused` state — this endpoint can never enable one. Enabling remains the separate POST /mappings/{id}/resume action, which the database still gates on stage completeness and absence of drift. invite_ttl_hours is fixed at 24 by a DB CHECK; supplying any other value is rejected.
+      description: Admin-only. ALWAYS writes the mapping in the `paused` state — this endpoint can never enable one. Enabling remains the separate POST /mappings/{id}/resume action, which the database still gates on stage completeness and absence of drift. invite_ttl_hours is fixed at 24 by a DB CHECK; supplying any other value is rejected. On CREATE only (no `id`), an absent or empty ai_screening_stage_id or ta_screening_stage_id defaults to the Hello Christy screening stage 2358dbcc-394f-45d5-90e4-2bc9af468740 (owner decision 2026-09-29 — the one stage the bot screens in, used as both the AI and the TA stage; the TA stage only feeds the enable-time completeness gate). An explicit valid id is honoured and an invalid one is rejected with 400 invalid_stage_id. On UPDATE an absent stage id keeps the mapping's current one and is never defaulted. The same CREATE-only rule applies to feedback_form_id — an absent or empty value defaults to the verified Hello Christy scorecard form 1c9a92c0-c18f-4bf1-898f-c29e71d7d303 (only while that binding is verified), because the scorecard writer refuses to write back for a mapping bound to any other form; an explicit valid id is honoured, and on UPDATE it is never defaulted (unlike the stage ids it is stored as given, so an update must restate it). One LIVE mapping per Ashby job — a create for a job that already has a live mapping answers 409 conflict. Re-adding a job whose mapping was deleted (archived) creates a NEW paused mapping; the archived one is never revived, and an update addressed to it answers 409 archived.
       security:
         - bearerAuth: []
       requestBody:
@@ -3261,6 +3264,26 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AshbyMappingUpsertResponse'
+        '400':
+          description: Invalid input (invalid_external_job_id, invalid_role_id, invalid_delivery_mode, invalid_invite_ttl_hours, invalid_stage_id, invalid_mapping_id, invalid_label).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '403':
+          description: Insufficient role (admin required) or no acting user.
+        '409':
+          description: The mapping was refused. `conflict` — a create for an Ashby job that already has a LIVE mapping (someone else mapped it first; refresh). `archived` — an update addressed to a deleted (archived) mapping, which is frozen. Any other RPC refusal is passed through with its code (for example not_found).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '500':
+          description: The upsert could not be completed. Sanitized (mission_control_action_error).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
   /api/integrations/ashby/mission-control/health:
     get:
       tags: [ashby]
@@ -3276,6 +3299,35 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/AshbyRuntimeHealthResponse'
+  /api/integrations/ashby/mission-control/jobs:
+    get:
+      tags: [ashby]
+      operationId: listAshbyJobDirectory
+      summary: Read-only Ashby job directory for the Add-mapping picker
+      description: Admin-only. Pages the allowlisted READ operation job.list with no provider-side filter, bounded at 20 pages, 2000 jobs and an overall ~20 s deadline for the whole walk, and returns ONLY each job's opaque id, a bounded display title, its status and its openedAt. Hiring-team members and emails, custom fields and every other provider field are never read. Confidential jobs are withheld FAIL-CLOSED — a job is listed only when the provider says, literally, confidential false; true, null, any other value or an absent flag withholds it — because Ashby restricts who may see a confidential job and this surface must not widen that audience. `withheld` counts the distinct jobs so withheld (a count only). `truncated` is true when a bound (including the deadline, once at least one page was read), a repeated cursor, or a more-data page with no cursor stopped the walk; the list is then partial, not failed. One walk is shared by concurrent requests and a successful result is reused for 60 seconds; a failed walk is never cached. Writes nothing, and the audit row (one per request, cache hit or not) carries counts only (never a job id or title). 503 when the integration is disabled (no client is constructed and no call is made); 502 when the provider read fails or the deadline runs out before any page arrives, without echoing the provider body.
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Sanitized job directory, sorted by title (case-insensitive, untitled last).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyJobDirectoryResponse'
+        '403':
+          description: Insufficient role (admin required).
+        '502':
+          description: The provider read failed (for example an API key without jobsRead). Sanitized, never the provider text.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '503':
+          description: Integration disabled — no client is constructed and no provider call is made.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
   /api/integrations/ashby/mission-control/jobs/{externalJobId}/stages:
     get:
       tags: [ashby]
@@ -3325,7 +3377,7 @@ paths:
       tags: [ashby]
       operationId: previewAshbyScorecardBinding
       summary: Read-only preview of the v2 scorecard binding for a mapping's role
-      description: Admin-only. Reads the verified feedback form's definition (feedbackFormDefinition.info) plus the mapping's role and its active scorecard metrics, and reports which metrics would bind to a Score field by title, which would not and why, and whether the four fixed fields are still present with their verified types. Structure and metric names only — no feedback content, no candidate data. Nothing is written, bound, or submitted. 404 when the mapping is unknown, 503 when the integration is disabled, 502 when the provider read fails.
+      description: Admin-only. Reads the verified feedback form's definition (feedbackFormDefinition.info) plus the mapping's role, its feedback form id and the role's active scorecard metrics, and reports which metrics would bind to a Score field by title, which would not and why, and whether the four fixed fields are still present with their verified types. `mappingFormBound` says whether the MAPPING itself names the verified form — the scorecard writer writes nothing for a mapping that does not, whatever the preview of the form says. Structure and metric names only — no feedback content, no candidate data. Nothing is written, bound, or submitted. 404 when the mapping is unknown, 503 when the integration is disabled, 502 when the provider read fails.
       security:
         - bearerAuth: []
       parameters:
@@ -3400,7 +3452,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/AshbyMcError'
         '409':
-          description: Action rejected by the mapping gate.
+          description: Action rejected by the mapping gate (for example archived — a deleted mapping is frozen).
           content:
             application/json:
               schema:
@@ -3440,7 +3492,55 @@ paths:
               schema:
                 $ref: '#/components/schemas/AshbyMcError'
         '409':
-          description: Cannot enable an incomplete or drifted mapping.
+          description: Cannot enable an incomplete, drifted or archived (deleted) mapping.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+  /api/integrations/ashby/mission-control/mappings/{id}/archive:
+    post:
+      tags: [ashby]
+      operationId: archiveAshbyMapping
+      summary: Delete (archive) a paused Ashby job mapping
+      description: Admin-only. "Delete" ARCHIVES the mapping — the row and every candidate's link to it are kept (screening history, scores and funnel attribution stay intact); it drops out of GET /mappings and can never be enabled again. An enabled mapping is refused with 409 mapping_enabled (pause it first). A repeat is idempotent and answers 200 with already_archived true. An archived mapping is frozen — pause, resume and update all answer 409 archived. Adding the same Ashby job again through POST /mappings creates a NEW paused mapping; the archived one stays as it was, with the history it ran under. Audited and race-safe inside the RPC.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Mapping archived (or was already archived).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcArchiveResponse'
+        '400':
+          description: Invalid mapping id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '403':
+          description: Insufficient role (admin required) or no acting user.
+        '404':
+          description: Mapping not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '409':
+          description: The mapping is enabled (error mapping_enabled — pause it first), or the RPC refused the archive with another code.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AshbyMcError'
+        '500':
+          description: The archive could not be completed. Sanitized (mission_control_action_error).
           content:
             application/json:
               schema:
@@ -7123,7 +7223,7 @@ components:
 
     AshbyMcMapping:
       type: object
-      required: [id, externalJobId, status, deliveryMode, hasAiStage, hasTaStage, updatedAt]
+      required: [id, externalJobId, status, deliveryMode, hasAiStage, hasTaStage, roleId, updatedAt]
       properties:
         id:
           type: string
@@ -7145,6 +7245,11 @@ components:
         label:
           type: string
           nullable: true
+        roleId:
+          type: string
+          format: uuid
+          nullable: true
+          description: The mapping's role (an internal id, never tenant data); null when the row names none. May refer to a role that has since been deactivated.
         updatedAt:
           type: string
           format: date-time
@@ -7385,6 +7490,48 @@ components:
           type: boolean
       additionalProperties: false
 
+    AshbyJob:
+      type: object
+      description: One sanitized job-directory entry. Exactly these four fields are copied off a provider job; nothing else is read.
+      required: [id, title, status, openedAt]
+      properties:
+        id:
+          type: string
+          description: Opaque Ashby job id — the value a mapping's external_job_id stores.
+        title:
+          type: string
+          nullable: true
+          description: NFC-normalized; C0/C1 controls, DEL, U+2028/U+2029 and every Unicode format character (bidi overrides/isolates, zero-width characters) replaced with a space, space runs collapsed, trimmed, then bounded to 120 characters. Null when nothing visible remains.
+        status:
+          type: string
+          nullable: true
+          enum: [Draft, Open, Closed, Archived, null]
+          description: Ashby's job lifecycle. Any other provider value is reported as null.
+        openedAt:
+          type: string
+          format: date-time
+          nullable: true
+      additionalProperties: false
+
+    AshbyJobDirectoryResponse:
+      type: object
+      required: [ok, jobs, truncated, withheld]
+      properties:
+        ok:
+          type: boolean
+        jobs:
+          type: array
+          items:
+            $ref: '#/components/schemas/AshbyJob'
+        truncated:
+          type: boolean
+          description: True when a safety bound (pages, items, the overall deadline) or a repeated cursor stopped the walk — the list is partial, not failed.
+        withheld:
+          type: integer
+          minimum: 0
+          description: How many DISTINCT jobs the walk saw and withheld because they were not explicitly non-confidential (confidential true, any non-false value, or no flag). A count only — never an id or title.
+      additionalProperties: false
+
     AshbyFormOption:
       type: object
       description: One selectable value of a rating/select field — the scale, never an answer.
@@ -7583,7 +7730,7 @@ components:
 
     AshbyScorecardBindingPreviewResponse:
       type: object
-      required: [ok, scoringPath, preview]
+      required: [ok, scoringPath, mappingFormBound, preview]
       properties:
         ok:
           type: boolean
@@ -7591,6 +7738,9 @@ components:
           type: string
           enum: [v2_autobind, v1_legacy, no_role]
           description: v2_autobind = role has an active dashboard scorecard; v1_legacy = fixed v1 binding is used; no_role = mapping carries no role.
+        mappingFormBound:
+          type: boolean
+          description: True only when the mapping's feedback_form_id is exactly the verified Hello Christy form id. When false, no scorecard is ever written to Ashby for this mapping, whatever `preview.ready` says.
         preview:
           $ref: '#/components/schemas/AshbyScorecardBindingPreview'
       additionalProperties: false
@@ -7616,12 +7766,15 @@ components:
         ai_screening_stage_id:
           type: string
           nullable: true
+          description: Opaque Ashby stage id. On create, absent or empty defaults to the Hello Christy screening stage; on update, absent keeps the current stage.
         ta_screening_stage_id:
           type: string
           nullable: true
+          description: Opaque Ashby stage id. On create, absent or empty defaults to the Hello Christy screening stage; on update, absent keeps the current stage.
         feedback_form_id:
           type: string
           nullable: true
+          description: Opaque Ashby feedback-form definition id. On create, absent or empty defaults to the verified Hello Christy scorecard form (only while that binding is verified) — the scorecard writer writes back only for that form. On update it is never defaulted and is stored as given, so an update that omits it clears the mapping's form.
         interview_id:
           type: string
           nullable: true
@@ -7803,6 +7956,17 @@ components:
           type: boolean
         status:
           type: string
+      additionalProperties: false
+
+    AshbyMcArchiveResponse:
+      type: object
+      required: [ok, already_archived]
+      properties:
+        ok:
+          type: boolean
+        already_archived:
+          description: True when the mapping was already archived — a repeat delete is idempotent, not an error.
+          type: boolean
       additionalProperties: false
 
     AshbyMcCancelResponse:

@@ -19,9 +19,11 @@ import type {
   AdminAllowlistUpdateResponse,
   AshbyMappingInput,
   AshbyMappingCreated,
+  AshbyJobsResponse,
   AshbyMcMappingsResponse,
   AshbyMcWorkflowsResponse,
   AshbyMcActionResponse,
+  AshbyMcArchiveResponse,
   AshbyManualInviteResponse,
   AshbyFeedbackFormResponse,
   AshbyScorecardBindingPreviewResponse,
@@ -575,10 +577,21 @@ export const api = {
     }),
 
   // ── Ashby Mission Control ────────────────────────────────────────
+  // `limit=200` — the route's maximum. Its default is 50, and the Add-mapping
+  // picker marks a job "already mapped" only if its mapping is in this list;
+  // a mapping past a short page would read as free and 409 on save.
   listAshbyMappings: () =>
-    request<AshbyMcMappingsResponse>('/api/integrations/ashby/mission-control/mappings'),
+    request<AshbyMcMappingsResponse>('/api/integrations/ashby/mission-control/mappings?limit=200'),
   listAshbyWorkflows: () =>
     request<AshbyMcWorkflowsResponse>('/api/integrations/ashby/mission-control/workflows'),
+  /**
+   * The live Ashby job list (admin-gated server side): every status,
+   * confidential jobs already removed. The add-mapping dialog offers only the
+   * `Open` ones; the mapping rows use all of them to name a job instead of
+   * showing its id. A live provider read, so callers treat it as best effort.
+   */
+  listAshbyJobs: () =>
+    request<AshbyJobsResponse>('/api/integrations/ashby/mission-control/jobs'),
   /**
    * Create (or update) an Ashby job -> role mapping. ALWAYS lands paused.
    *
@@ -586,6 +599,10 @@ export const api = {
    * it, so the only way to point a new Ashby job at a HELLO role was a hand
    * -rolled authenticated POST. Enabling stays a separate action, still gated
    * in the database on stage completeness and absence of drift.
+   *
+   * Refusals THROW `ApiError` with the route's code as the message — among
+   * them 409 `conflict` (the job already has a live mapping) and 409
+   * `archived` (an update addressed to a deleted mapping).
    */
   createAshbyMapping: (body: AshbyMappingInput) =>
     request<AshbyMappingCreated>('/api/integrations/ashby/mission-control/mappings', {
@@ -599,6 +616,18 @@ export const api = {
     }),
   resumeAshbyMapping: (id: string) =>
     request<AshbyMcActionResponse>(`/api/integrations/ashby/mission-control/mappings/${id}/resume`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    }),
+  /**
+   * "Delete" a mapping: the route ARCHIVES it — gone from the list, history
+   * kept and frozen. Adding the same job again later creates a NEW mapping,
+   * paused; the archived one is never brought back. The database
+   * refuses an ENABLED mapping (`mapping_enabled`, 409); pause it first.
+   * Every refusal throws `ApiError` with the route's code as its message.
+   */
+  archiveAshbyMapping: (id: string) =>
+    request<AshbyMcArchiveResponse>(`/api/integrations/ashby/mission-control/mappings/${id}/archive`, {
       method: 'POST',
       body: JSON.stringify({}),
     }),

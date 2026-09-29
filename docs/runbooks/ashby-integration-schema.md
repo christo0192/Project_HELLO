@@ -15,7 +15,7 @@ revoked; no anon/authenticated/public policy):
 
 | Table | Purpose | Identity / key |
 |-------|---------|----------------|
-| `ashby_job_mappings` | Paused-by-default per-job mapping | unique `(provider, external_job_id)` |
+| `ashby_job_mappings` | Paused-by-default per-job mapping; "Delete" archives (0109) | unique `(provider, external_job_id)` over LIVE rows (`WHERE archived_at IS NULL`, 0109) |
 | `ashby_application_links` | Application-centric workflow identity | unique `(provider, external_application_id)` |
 | `ashby_event_receipts` | Sanitized webhook/event receipts | unique `(provider, webhook_action_id, action)` |
 | `ashby_resume_ingestions` | Ephemeral ingestion state machine | unique `(application_link_id)` |
