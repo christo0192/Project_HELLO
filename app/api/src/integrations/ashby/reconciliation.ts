@@ -402,7 +402,6 @@ const DETERMINATE_HISTORY_ERRORS: ReadonlySet<string> = new Set([
   'ashby_history_stage_malformed',
   'ashby_history_entry_time_malformed',
   'ashby_history_entry_time_invalid',
-  'ashby_history_exit_time_missing',
   'ashby_history_exit_time_malformed',
   'ashby_history_exit_time_invalid',
   'ashby_history_pagination_flag_missing',

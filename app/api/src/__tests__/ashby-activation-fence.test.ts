@@ -323,7 +323,109 @@ it('rejects future and conflicting open history, while requiring complete pagina
     { stageId: STAGE, enteredStageAt: '2026-09-24T00:00:00Z', leftStageAt: null },
     { stageId: STAGE, enteredStageAt: '2026-09-25T01:00:00Z', leftStageAt: null },
   ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED, nowMs: CLOCK })).rejects.toThrow('ambiguous');
-  await expect(admitStageAfterActivation(history([
-    { stageId: STAGE, enteredStageAt: '2026-09-24T00:00:00Z' },
-  ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED, nowMs: CLOCK })).rejects.toThrow('exit_time_missing');
+});
+
+// ── THE LIVE ASHBY ROW SHAPE: `leftStageAt` IS OMITTED, NOT NULL ────
+// Ashby's published schema says `leftStageAt` is always present and `null` for
+// the current stage. Production disagrees: on 2026-09-29 every fenced admission
+// dead-lettered with `ashby_history_exit_time_missing` after a 200 from
+// `application.listHistory` (6 × `job_dlq`, 5/5 attempts each), because the
+// row for the stage the application is IN carries no `leftStageAt` key at all.
+// Every fixture above writes `leftStageAt: null` explicitly, which is why CI
+// never saw it. These rows RECONSTRUCT the inferred live shape (no payload was
+// captured): the current-stage row carries no `leftStageAt` key, closed rows
+// carry a string. If closed rows turn out to lack it too, the fence fails
+// closed with `ashby_history_ambiguous` (see the fail-closed cases below).
+function liveRow(stageId: string, enteredStageAt: string, leftStageAt?: string): OpaqueRecord {
+  const row: OpaqueRecord = { id: `h_${stageId}_${enteredStageAt}`, stageId, title: 'Stage', enteredStageAt, stageNumber: 0, allowedActions: [] };
+  if (leftStageAt !== undefined) row.leftStageAt = leftStageAt;
+  return row;
+}
+
+describe('Ashby history with the current stage row missing leftStageAt', () => {
+  it('admits a post-activation entry whose open row omits the key', async () => {
+    await expect(admitStageAfterActivation(history([
+      liveRow('stage_review', '2026-09-24T00:00:00Z', '2026-09-25T01:00:00Z'),
+      liveRow(STAGE, '2026-09-25T01:00:00Z'),
+    ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED, nowMs: CLOCK })).resolves.toBe('admit');
+  });
+
+  it('still refuses a pre-activation sitter whose open row omits the key', async () => {
+    await expect(admitStageAfterActivation(history([
+      liveRow(STAGE, '2026-09-24T23:59:59Z'),
+    ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED, nowMs: CLOCK })).resolves.toBe('not_after_activation');
+  });
+
+  it('a re-entry is judged by the OPEN interval, not an earlier closed one', async () => {
+    // In the stage before activation, out, then back in afterwards: admit.
+    await expect(admitStageAfterActivation(history([
+      liveRow(STAGE, '2026-09-24T00:00:00Z', '2026-09-24T01:00:00Z'),
+      liveRow('stage_out', '2026-09-24T01:00:00Z', '2026-09-25T02:00:00Z'),
+      liveRow(STAGE, '2026-09-25T02:00:00Z'),
+    ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED, nowMs: CLOCK })).resolves.toBe('admit');
+  });
+
+  it('stays fail-closed: two rows without an exit are ambiguous', async () => {
+    await expect(admitStageAfterActivation(history([
+      liveRow('stage_review', '2026-09-24T00:00:00Z'),
+      liveRow(STAGE, '2026-09-25T01:00:00Z'),
+    ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED, nowMs: CLOCK })).rejects.toThrow('ambiguous');
+    // An omitted key and an explicit null count the same way.
+    await expect(admitStageAfterActivation(history([
+      liveRow(STAGE, '2026-09-25T01:00:00Z'),
+      { stageId: 'stage_review', enteredStageAt: '2026-09-24T00:00:00Z', leftStageAt: null },
+    ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED, nowMs: CLOCK })).rejects.toThrow('ambiguous');
+  });
+
+  it('stays fail-closed: the only open row being ANOTHER stage admits nobody', async () => {
+    await expect(admitStageAfterActivation(history([
+      liveRow(STAGE, '2026-09-25T01:00:00Z', '2026-09-25T02:00:00Z'),
+      liveRow('stage_review', '2026-09-25T02:00:00Z'),
+    ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED, nowMs: CLOCK })).rejects.toThrow('ambiguous');
+  });
+
+  it('a PRESENT exit that is not a string or null is still malformed', async () => {
+    await expect(admitStageAfterActivation(history([
+      { stageId: STAGE, enteredStageAt: '2026-09-25T01:00:00Z', leftStageAt: 12345 },
+    ]), { applicationId: APP, stageId: STAGE, activationAt: ACTIVATED, nowMs: CLOCK })).rejects.toThrow('exit_time_malformed');
+  });
+
+  // The path that actually dead-lettered in production: the signal worker.
+  it('the signal worker imports an application whose live history omits the key', async () => {
+    const deps = {
+      ...signalDeps(),
+      history: history([
+        liveRow('stage_review', '2026-09-24T00:00:00Z', '2026-09-25T23:00:00Z'),
+        liveRow(STAGE, '2026-09-26T00:00:00Z'),
+      ]),
+    };
+    const res = await processAshbySignal(
+      { provider: 'ashby', action: CANDIDATE_STAGE_CHANGE_ACTION, webhookActionId: 'stage:app_A:stage_ai', externalApplicationId: APP },
+      deps,
+      { createdAt: '2026-09-26T00:00:00Z' },
+    );
+    expect(res.decision).toBe('import_eligible');
+  });
+
+  // And the reconciler, which classified the same throw as DETERMINATE and
+  // skipped the application for good.
+  it('reconciliation admits an application whose live history omits the key', async () => {
+    const receipts = new Receipts();
+    const rows = [{ application: { id: APP, job: { id: JOB }, currentInterviewStage: { id: STAGE } } }];
+    const client = {
+      applicationList: async <T = OpaqueRecord[]>() => ({ results: rows as unknown as T, moreDataAvailable: false }) as AshbyResult<T>,
+      applicationListHistory: async <T = OpaqueRecord[]>() => ({
+        results: [liveRow(STAGE, '2026-09-26T00:00:01Z')] as unknown as T, moreDataAvailable: false,
+      }) as AshbyResult<T>,
+    };
+    const mappings: EnabledMappingLoader = {
+      async listEnabled() {
+        return { truncated: false, rows: [{ externalJobId: JOB, aiScreeningStageId: STAGE, activationAt: ACTIVATED, activationEpoch: 2, configVersion: 4 }] };
+      },
+    };
+    const res = await runReconciliation({ client, admitByHistory: historyAdmitter(client), mappings, checkpoints: new Checkpoints(), receipts });
+    expect(res.admitted).toBe(1);
+    expect(res.skipped.historyUnavailable).toBe(0);
+    expect(receipts.writes).toBe(1);
+  });
 });
