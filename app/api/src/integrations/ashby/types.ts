@@ -144,6 +144,11 @@ export interface JobListParams {
   limit?: number;
   /** Tenant-verifiable additional request fields. */
   extra?: OpaqueRecord;
+  /**
+   * Internal wall-clock deadline (epoch ms) for the caller's WHOLE walk; it
+   * shortens this page's timeout and retries. Never sent to Ashby.
+   */
+  deadlineAt?: number;
 }
 
 /** Per-application stage history, including the provider's stage-entry time. */

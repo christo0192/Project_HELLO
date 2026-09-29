@@ -142,6 +142,15 @@ interface JobPage {
 }
 
 /**
+ * A job that says, literally, `confidential: false` — the ONLY shape the
+ * directory lists (fail-closed). Fixtures spell the flag out through this so
+ * every listed job visibly carries it.
+ */
+function listed<T extends Record<string, unknown>>(job: T): T & { confidential: false } {
+  return { ...job, confidential: false };
+}
+
+/**
  * A `job.list` recorder that answers the scripted pages in order and FAILS the
  * test if asked for a page it was not given — a runaway walk is a bug, not a
  * silently repeated last page.
@@ -162,10 +171,15 @@ function endlessReader(pageSize: number) {
   let n = 0;
   const jobList = vi.fn(async () => {
     const page = n++;
-    const results = Array.from({ length: pageSize }, (_, i) => ({ id: `job_${page}_${i}`, title: `Job ${page}-${i}`, status: 'Open' }));
+    const results = Array.from({ length: pageSize }, (_, i) => listed({ id: `job_${page}_${i}`, title: `Job ${page}-${i}`, status: 'Open' }));
     return { results, moreDataAvailable: true, nextCursor: `cursor_${page}` };
   });
   return { reader: { jobList } as never, jobList };
+}
+
+/** The params of each recorded call, minus the (timing-dependent) deadline. */
+function withoutDeadline(calls: Array<Record<string, unknown>>) {
+  return calls.map(({ deadlineAt: _deadline, ...rest }) => rest);
 }
 
 describe('job.list is an allowlisted, non-mutating probe read', () => {
@@ -196,6 +210,7 @@ describe('probeJobDirectory — copies id/title/status/openedAt ONLY', () => {
     expect(r).toEqual({
       jobs: [{ id: 'job_1', title: 'Senior Engineer', status: 'Open', openedAt: '2026-09-01T10:00:00.000Z' }],
       truncated: false,
+      withheld: 0,
     });
     expect(Object.keys(r.jobs[0]).sort()).toEqual(['id', 'openedAt', 'status', 'title']);
     const serialized = JSON.stringify(r);
@@ -204,23 +219,38 @@ describe('probeJobDirectory — copies id/title/status/openedAt ONLY', () => {
     }
   });
 
-  it('withholds confidential jobs, and treats an unreadable flag as confidential', async () => {
+  it('lists a job ONLY when it is literally `confidential: false` — every other flag, and NO flag, withholds (fail-closed)', async () => {
     const { reader } = pagedReader([{
       results: [
         { id: 'job_secret', title: 'Replacement for the CFO', status: 'Open', confidential: true },
-        { id: 'job_string', title: 'String flag', status: 'Open', confidential: 'true' },
+        { id: 'job_string', title: 'String flag', status: 'Open', confidential: 'false' },
         { id: 'job_null', title: 'Null flag', status: 'Open', confidential: null },
+        { id: 'job_zero', title: 'Zero flag', status: 'Open', confidential: 0 },
+        { id: 'job_absent', title: 'Flag key absent', status: 'Open' },
         { id: 'job_public', title: 'Public role', status: 'Open', confidential: false },
-        { id: 'job_unflagged', title: 'Unflagged role', status: 'Open' },
       ],
     }]);
     const r = await probeJobDirectory(reader);
 
-    expect(r.jobs.map((j) => j.id)).toEqual(['job_public', 'job_unflagged']);
-    expect(JSON.stringify(r)).not.toContain('Replacement for the CFO');
+    expect(r.jobs.map((j) => j.id)).toEqual(['job_public']);
+    expect(r.withheld).toBe(5);
+    const serialized = JSON.stringify(r);
+    for (const leak of ['Replacement for the CFO', 'job_absent', 'Flag key absent', 'job_secret']) {
+      expect(serialized, `must not carry ${leak}`).not.toContain(leak);
+    }
   });
 
-  it('keeps an id withheld once it has been seen confidential, in either page order', async () => {
+  it('counts withheld jobs by DISTINCT id — a job seen on two pages is one', async () => {
+    const { reader } = pagedReader([
+      { results: [{ id: 'job_a', title: 'A', confidential: true }, { id: 'job_b', title: 'B' }], moreDataAvailable: true, nextCursor: 'c1' },
+      { results: [{ id: 'job_a', title: 'A', confidential: true }, { id: 'job_b', title: 'B' }, listed({ id: 'job_c', title: 'C' })] },
+    ]);
+    const r = await probeJobDirectory(reader);
+    expect(r.jobs.map((j) => j.id)).toEqual(['job_c']);
+    expect(r.withheld).toBe(2);
+  });
+
+  it('keeps an id withheld once it has been seen withheld, in either page order', async () => {
     const { reader } = pagedReader([
       {
         results: [
@@ -234,43 +264,46 @@ describe('probeJobDirectory — copies id/title/status/openedAt ONLY', () => {
         results: [
           { id: 'job_a', title: 'A', confidential: false },
           { id: 'job_b', title: 'B', confidential: true },
-          { id: 'job_c', title: 'C' },
+          listed({ id: 'job_c', title: 'C' }),
         ],
       },
     ]);
     const r = await probeJobDirectory(reader);
     expect(r.jobs.map((j) => j.id)).toEqual(['job_c']);
+    expect(r.withheld).toBe(2);
   });
 
   it('skips items whose id is not opaque-id shaped, and non-object items', async () => {
     const { reader } = pagedReader([{
       results: [
-        { id: 'has space', title: 'x' },
-        { id: '', title: 'x' },
-        { id: 'x'.repeat(300), title: 'x' },
-        { id: 42, title: 'x' },
-        { title: 'no id at all' },
+        listed({ id: 'has space', title: 'x' }),
+        listed({ id: '', title: 'x' }),
+        listed({ id: 'x'.repeat(300), title: 'x' }),
+        listed({ id: 42, title: 'x' }),
+        listed({ title: 'no id at all' }),
         null,
         'job_as_string',
         ['job_in_array'],
-        { id: 'job_ok', title: 'Kept' },
+        listed({ id: 'job_ok', title: 'Kept' }),
       ],
     }]);
     const r = await probeJobDirectory(reader);
     expect(r.jobs).toEqual([{ id: 'job_ok', title: 'Kept', status: null, openedAt: null }]);
+    // An item with no usable id is not a job at all — it is not counted as withheld.
+    expect(r.withheld).toBe(0);
   });
 
   it('coerces status to the four-value enum, anything else to null', async () => {
     const { reader } = pagedReader([{
       results: [
-        { id: 'j1', title: 'a', status: 'Draft' },
-        { id: 'j2', title: 'b', status: 'Open' },
-        { id: 'j3', title: 'c', status: 'Closed' },
-        { id: 'j4', title: 'd', status: 'Archived' },
-        { id: 'j5', title: 'e', status: 'open' },
-        { id: 'j6', title: 'f', status: 'Paused' },
-        { id: 'j7', title: 'g', status: 1 },
-        { id: 'j8', title: 'h' },
+        listed({ id: 'j1', title: 'a', status: 'Draft' }),
+        listed({ id: 'j2', title: 'b', status: 'Open' }),
+        listed({ id: 'j3', title: 'c', status: 'Closed' }),
+        listed({ id: 'j4', title: 'd', status: 'Archived' }),
+        listed({ id: 'j5', title: 'e', status: 'open' }),
+        listed({ id: 'j6', title: 'f', status: 'Paused' }),
+        listed({ id: 'j7', title: 'g', status: 1 }),
+        listed({ id: 'j8', title: 'h' }),
       ],
     }]);
     const r = await probeJobDirectory(reader);
@@ -280,13 +313,13 @@ describe('probeJobDirectory — copies id/title/status/openedAt ONLY', () => {
   it('normalises a parseable openedAt to ISO-8601 and never guesses one', async () => {
     const { reader } = pagedReader([{
       results: [
-        { id: 'j1', title: 'a', openedAt: '2026-09-01T10:00:00Z' },
-        { id: 'j2', title: 'b', openedAt: '2026-09-01' },
-        { id: 'j3', title: 'c', openedAt: 'not a date' },
-        { id: 'j4', title: 'd', openedAt: 1_756_720_800_000 },
-        { id: 'j5', title: 'e', openedAt: '' },
-        { id: 'j6', title: 'f', openedAt: '2026-09-01T10:00:00Z' + ' '.repeat(80) },
-        { id: 'j7', title: 'g' },
+        listed({ id: 'j1', title: 'a', openedAt: '2026-09-01T10:00:00Z' }),
+        listed({ id: 'j2', title: 'b', openedAt: '2026-09-01' }),
+        listed({ id: 'j3', title: 'c', openedAt: 'not a date' }),
+        listed({ id: 'j4', title: 'd', openedAt: 1_756_720_800_000 }),
+        listed({ id: 'j5', title: 'e', openedAt: '' }),
+        listed({ id: 'j6', title: 'f', openedAt: '2026-09-01T10:00:00Z' + ' '.repeat(80) }),
+        listed({ id: 'j7', title: 'g' }),
       ],
     }]);
     const r = await probeJobDirectory(reader);
@@ -298,9 +331,9 @@ describe('probeJobDirectory — copies id/title/status/openedAt ONLY', () => {
   it('strips control characters from and bounds the title', async () => {
     const { reader } = pagedReader([{
       results: [
-        { id: 'j1', title: 'Bot\u0007Engin\u0000eer' },
-        { id: 'j2', title: 'x'.repeat(500) },
-        { id: 'j3', title: 42 },
+        listed({ id: 'j1', title: 'Bot\u0007Engin\u0000eer' }),
+        listed({ id: 'j2', title: 'x'.repeat(500) }),
+        listed({ id: 'j3', title: 42 }),
       ],
     }]);
     const r = await probeJobDirectory(reader);
@@ -313,13 +346,13 @@ describe('probeJobDirectory — copies id/title/status/openedAt ONLY', () => {
   it('sorts by title case/accent-insensitively, untitled last, id breaking ties', async () => {
     const { reader } = pagedReader([{
       results: [
-        { id: 'j_zeta', title: 'Zeta' },
-        { id: 'j_none', title: null },
-        { id: 'j_b', title: 'beta' },
-        { id: 'j_alpha2', title: 'ALPHA' },
-        { id: 'j_eclair', title: 'Éclair' },
-        { id: 'j_alpha1', title: 'alpha' },
-        { id: 'j_blank', title: '   ' },
+        listed({ id: 'j_zeta', title: 'Zeta' }),
+        listed({ id: 'j_none', title: null }),
+        listed({ id: 'j_b', title: 'beta' }),
+        listed({ id: 'j_alpha2', title: 'ALPHA' }),
+        listed({ id: 'j_eclair', title: 'Éclair' }),
+        listed({ id: 'j_alpha1', title: 'alpha' }),
+        listed({ id: 'j_blank', title: '   ' }),
       ],
     }]);
     const r = await probeJobDirectory(reader);
@@ -328,8 +361,8 @@ describe('probeJobDirectory — copies id/title/status/openedAt ONLY', () => {
 
   it('de-duplicates by id within and across pages — the first sighting wins', async () => {
     const { reader } = pagedReader([
-      { results: [{ id: 'j1', title: 'First' }, { id: 'j1', title: 'Second' }], moreDataAvailable: true, nextCursor: 'c1' },
-      { results: [{ id: 'j1', title: 'Third' }, { id: 'j2', title: 'Other' }] },
+      { results: [listed({ id: 'j1', title: 'First' }), listed({ id: 'j1', title: 'Second' })], moreDataAvailable: true, nextCursor: 'c1' },
+      { results: [listed({ id: 'j1', title: 'Third' }), listed({ id: 'j2', title: 'Other' })] },
     ]);
     const r = await probeJobDirectory(reader);
     expect(r.jobs).toEqual([
@@ -344,13 +377,13 @@ describe('probeJobDirectory — copies id/title/status/openedAt ONLY', () => {
   });
 
   it('reads a non-array results payload as an empty page, not a guess', async () => {
-    const { reader } = pagedReader([{ results: { jobs: [{ id: 'j1', title: 'Nested' }] } }]);
-    expect(await probeJobDirectory(reader)).toEqual({ jobs: [], truncated: false });
+    const { reader } = pagedReader([{ results: { jobs: [listed({ id: 'j1', title: 'Nested' })] } }]);
+    expect(await probeJobDirectory(reader)).toEqual({ jobs: [], truncated: false, withheld: 0 });
   });
 
   it('touches no member of the client other than jobList', async () => {
     const touched: string[] = [];
-    const reader = new Proxy({ jobList: async () => ({ results: [{ id: 'j1', title: 'x' }], moreDataAvailable: false }) } as Record<string, unknown>, {
+    const reader = new Proxy({ jobList: async () => ({ results: [listed({ id: 'j1', title: 'x' })], moreDataAvailable: false }) } as Record<string, unknown>, {
       get(target, prop: string) {
         touched.push(String(prop));
         if (prop in target) return target[prop];
@@ -362,16 +395,74 @@ describe('probeJobDirectory — copies id/title/status/openedAt ONLY', () => {
   });
 });
 
+describe('sanitizeTitle — what a job (or stage) title may carry', () => {
+  /** Run one title through the directory probe and return what it became. */
+  async function titleOf(raw: unknown): Promise<string | null> {
+    const { reader } = pagedReader([{ results: [listed({ id: 'j1', title: raw })] }]);
+    return (await probeJobDirectory(reader)).jobs[0].title;
+  }
+  const cp = (...codes: number[]) => String.fromCodePoint(...codes);
+
+  it('neutralises a bidi-override spoof, so the title reads as the text it really is', async () => {
+    // U+202E RIGHT-TO-LEFT OVERRIDE would render "Engineer" + a reversed tail,
+    // making one job look like another in the picker.
+    const spoof = `Engineer${cp(0x202e)}reganaM tceles`;
+    expect(await titleOf(spoof)).toBe('Engineer reganaM tceles');
+    // Embeddings, overrides and isolates alike.
+    for (const code of [0x202a, 0x202b, 0x202c, 0x202d, 0x202e, 0x2066, 0x2067, 0x2068, 0x2069, 0x200e, 0x200f]) {
+      expect(await titleOf(`A${cp(code)}B`), `U+${code.toString(16)}`).toBe('A B');
+    }
+  });
+
+  it('turns a title made only of zero-width / format characters into null, not an empty-looking entry', async () => {
+    expect(await titleOf(cp(0x200b, 0x200c, 0x200d, 0x2060, 0xfeff))).toBeNull();
+    expect(await titleOf(`  ${cp(0x200b)}  ${cp(0x00ad)} `)).toBeNull();
+  });
+
+  it('replaces C0, DEL and C1 controls and the Unicode line/paragraph separators with a space', async () => {
+    expect(await titleOf(`A${cp(0x0085)}B`)).toBe('A B');           // NEL (C1)
+    expect(await titleOf(`A${cp(0x009b)}B`)).toBe('A B');           // CSI (C1)
+    expect(await titleOf(`A${cp(0x007f)}B`)).toBe('A B');           // DEL
+    expect(await titleOf(`A${cp(0x2028)}B${cp(0x2029)}C`)).toBe('A B C');
+    expect(await titleOf('A\tB\nC\rD')).toBe('A B C D');
+  });
+
+  it('collapses runs of spaces left by the replacement, and trims', async () => {
+    expect(await titleOf(`  Senior ${cp(0x200b)} ${cp(0x202e)}  Engineer  `)).toBe('Senior Engineer');
+  });
+
+  it('NFC-normalizes, so one look has one spelling', async () => {
+    const decomposed = `Cafe${cp(0x0301)} Manager`;            // e + COMBINING ACUTE
+    const title = await titleOf(decomposed);
+    expect(title).toBe(`Caf${cp(0x00e9)} Manager`);
+    expect(title!.length).toBe(12);
+  });
+
+  it('bounds AFTER cleaning, and never ends on half a surrogate pair', async () => {
+    // 200 zero-width characters then a real title: the bound counts visible text.
+    expect(await titleOf(`${cp(0x200b).repeat(200)}Engineer`)).toBe('Engineer');
+    // 119 ASCII + an astral character straddling the 120 cut.
+    const straddle = await titleOf(`${'x'.repeat(119)}${cp(0x1f600)}tail`);
+    expect(straddle).toBe('x'.repeat(119));
+    expect(straddle!.length).toBeLessThanOrEqual(120);
+  });
+
+  it('is the same sanitizer the stage probe uses', () => {
+    const [stage] = extractStages({ stages: [{ id: 's1', title: `Bot${cp(0x202e)}Screen${cp(0x200b)}` }] });
+    expect(stage.title).toBe('Bot Screen');
+  });
+});
+
 describe('probeJobDirectory — bounded pagination', () => {
   it('follows cursors with a fixed page size and sends no status filter', async () => {
     const { reader, calls } = pagedReader([
-      { results: [{ id: 'j1', title: 'a' }], moreDataAvailable: true, nextCursor: 'c1' },
-      { results: [{ id: 'j2', title: 'b' }], moreDataAvailable: true, nextCursor: 'c2' },
-      { results: [{ id: 'j3', title: 'c' }], moreDataAvailable: false },
+      { results: [listed({ id: 'j1', title: 'a' })], moreDataAvailable: true, nextCursor: 'c1' },
+      { results: [listed({ id: 'j2', title: 'b' })], moreDataAvailable: true, nextCursor: 'c2' },
+      { results: [listed({ id: 'j3', title: 'c' })], moreDataAvailable: false },
     ]);
     const r = await probeJobDirectory(reader);
 
-    expect(calls).toEqual([{ limit: 100 }, { cursor: 'c1', limit: 100 }, { cursor: 'c2', limit: 100 }]);
+    expect(withoutDeadline(calls)).toEqual([{ limit: 100 }, { cursor: 'c1', limit: 100 }, { cursor: 'c2', limit: 100 }]);
     for (const call of calls) {
       expect(call).not.toHaveProperty('status');
       expect(call).not.toHaveProperty('extra');
@@ -382,7 +473,7 @@ describe('probeJobDirectory — bounded pagination', () => {
 
   it('stops on moreDataAvailable:false even when a cursor is present', async () => {
     const { reader, calls } = pagedReader([
-      { results: [{ id: 'j1', title: 'a' }], moreDataAvailable: false, nextCursor: 'dangling' },
+      { results: [listed({ id: 'j1', title: 'a' })], moreDataAvailable: false, nextCursor: 'dangling' },
     ]);
     const r = await probeJobDirectory(reader);
     expect(calls).toHaveLength(1);
@@ -391,8 +482,8 @@ describe('probeJobDirectory — bounded pagination', () => {
 
   it('reports truncated — not an error — on a repeated cursor, keeping what it read', async () => {
     const { reader, calls } = pagedReader([
-      { results: [{ id: 'j1', title: 'a' }], moreDataAvailable: true, nextCursor: 'loop' },
-      { results: [{ id: 'j2', title: 'b' }], moreDataAvailable: true, nextCursor: 'loop' },
+      { results: [listed({ id: 'j1', title: 'a' })], moreDataAvailable: true, nextCursor: 'loop' },
+      { results: [listed({ id: 'j2', title: 'b' })], moreDataAvailable: true, nextCursor: 'loop' },
     ]);
     const r = await probeJobDirectory(reader);
     expect(calls).toHaveLength(2);
@@ -402,7 +493,7 @@ describe('probeJobDirectory — bounded pagination', () => {
 
   it('reports truncated when a page says there is more but gives no cursor', async () => {
     const { reader, calls } = pagedReader([
-      { results: [{ id: 'j1', title: 'a' }], moreDataAvailable: true },
+      { results: [listed({ id: 'j1', title: 'a' })], moreDataAvailable: true },
     ]);
     const r = await probeJobDirectory(reader);
     expect(calls).toHaveLength(1);
@@ -448,11 +539,104 @@ describe('probeJobDirectory — bounded pagination', () => {
 
   it('is NOT truncated when the item cap is filled exactly by the final page', async () => {
     const { reader } = pagedReader([
-      { results: [{ id: 'j1', title: 'a' }, { id: 'j2', title: 'b' }, { id: 'j3', title: 'c' }], moreDataAvailable: false },
+      { results: [listed({ id: 'j1', title: 'a' }), listed({ id: 'j2', title: 'b' }), listed({ id: 'j3', title: 'c' })], moreDataAvailable: false },
     ]);
     const r = await probeJobDirectory(reader, { maxItems: 3 });
     expect(r.jobs).toHaveLength(3);
     expect(r.truncated).toBe(false);
+  });
+});
+
+describe('probeJobDirectory — one ~20 s deadline for the whole walk', () => {
+  const START = 1_700_000_000_000;
+
+  /** A fake wall clock; each page read costs `pageMs` of it. */
+  function slowEndless(pageMs: number) {
+    let t = START;
+    let n = 0;
+    const calls: Array<Record<string, unknown>> = [];
+    const jobList = vi.fn(async (params?: Record<string, unknown>) => {
+      calls.push({ ...(params ?? {}) });
+      t += pageMs;
+      n += 1;
+      return { results: [listed({ id: `job_${n}`, title: `Job ${n}` })], moreDataAvailable: true, nextCursor: `c${n}` };
+    });
+    return { reader: { jobList } as never, jobList, calls, now: () => t, advance: (ms: number) => { t += ms; } };
+  }
+
+  it('threads ONE deadline — start + 20 s — to every page read (the client never sends it to Ashby)', async () => {
+    const s = slowEndless(1);
+    await probeJobDirectory(s.reader, { now: s.now, maxPages: 3 });
+    expect(s.calls).toHaveLength(3);
+    for (const call of s.calls) expect(call.deadlineAt).toBe(START + 20_000);
+  });
+
+  it('stops with the pages it has, flagged truncated, once the deadline has passed', async () => {
+    const s = slowEndless(8_000);
+    const r = await probeJobDirectory(s.reader, { now: s.now });
+    // Pages start at 0 s, 8 s and 16 s; a fourth would start at 24 s.
+    expect(s.jobList).toHaveBeenCalledTimes(3);
+    expect(r.jobs.map((j) => j.id)).toEqual(['job_1', 'job_2', 'job_3']);
+    expect(r.truncated).toBe(true);
+  });
+
+  it('turns a page that FAILS on the deadline into a truncated partial when earlier pages were read', async () => {
+    let t = START;
+    const jobList = vi.fn()
+      .mockImplementationOnce(async () => { t += 5_000; return { results: [listed({ id: 'job_1', title: 'One' })], moreDataAvailable: true, nextCursor: 'c1' }; })
+      .mockImplementationOnce(async () => {
+        t += 16_000;
+        // The client's own code for a spent deadline.
+        throw Object.assign(new Error('ashby_timeout'), { code: 'deadline_exceeded' });
+      });
+    const r = await probeJobDirectory({ jobList } as never, { now: () => t });
+    expect(r).toEqual({ jobs: [{ id: 'job_1', title: 'One', status: null, openedAt: null }], truncated: true, withheld: 0 });
+  });
+
+  it('treats any failure once the clock is past the deadline as the deadline (a cut-short request surfaces as a timeout first)', async () => {
+    let t = START;
+    const jobList = vi.fn()
+      .mockImplementationOnce(async () => { t += 1_000; return { results: [listed({ id: 'job_1', title: 'One' })], moreDataAvailable: true, nextCursor: 'c1' }; })
+      .mockImplementationOnce(async () => { t += 25_000; throw new Error('ashby_retry_exhausted'); });
+    const r = await probeJobDirectory({ jobList } as never, { now: () => t });
+    expect(r.truncated).toBe(true);
+    expect(r.jobs).toHaveLength(1);
+  });
+
+  it('still propagates a failure BEFORE the deadline, even with pages in hand', async () => {
+    let t = START;
+    const jobList = vi.fn()
+      .mockImplementationOnce(async () => { t += 1_000; return { results: [listed({ id: 'job_1', title: 'One' })], moreDataAvailable: true, nextCursor: 'c1' }; })
+      .mockImplementationOnce(async () => { t += 1_000; throw new Error('403 forbidden'); });
+    await expect(probeJobDirectory({ jobList } as never, { now: () => t })).rejects.toThrow('403 forbidden');
+  });
+
+  it('throws — never an empty "complete" directory — when the deadline runs out before ANY page arrives', async () => {
+    let t = START;
+    const jobList = vi.fn(async () => {
+      t += 21_000;
+      throw Object.assign(new Error('ashby_timeout'), { code: 'deadline_exceeded' });
+    });
+    await expect(probeJobDirectory({ jobList } as never, { now: () => t })).rejects.toThrow('ashby_timeout');
+    expect(jobList).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets a caller tighten the deadline but never widen it', async () => {
+    const tight = slowEndless(1_000);
+    const t = await probeJobDirectory(tight.reader, { now: tight.now, deadlineAt: START + 2_500 });
+    expect(tight.jobList).toHaveBeenCalledTimes(3);
+    expect(t.truncated).toBe(true);
+    expect(tight.calls[0].deadlineAt).toBe(START + 2_500);
+
+    const wide = slowEndless(1);
+    await probeJobDirectory(wide.reader, { now: wide.now, deadlineAt: START + 10 * 60_000, maxPages: 1 });
+    expect(wide.calls[0].deadlineAt).toBe(START + 20_000);
+  });
+
+  it('refuses to start at all when handed a deadline already in the past', async () => {
+    const s = slowEndless(1);
+    await expect(probeJobDirectory(s.reader, { now: s.now, deadlineAt: START - 1 })).rejects.toThrow('ashby_job_directory_deadline');
+    expect(s.jobList).not.toHaveBeenCalled();
   });
 });
 

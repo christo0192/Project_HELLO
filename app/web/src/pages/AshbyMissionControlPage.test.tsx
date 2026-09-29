@@ -17,6 +17,24 @@ function renderPage() {
   );
 }
 
+/**
+ * What a real browser does to a focused control the moment it is disabled:
+ * focus falls to `<body>`. jsdom keeps it on the disabled control — and its
+ * `blur()` is a no-op there — so a test that needs the browser's behaviour
+ * does it by hand, while the request hangs.
+ */
+function dropFocusToBody(): void {
+  document.body.tabIndex = -1;
+  document.body.focus();
+  document.body.removeAttribute('tabindex');
+  expect(document.body).toHaveFocus();
+}
+
+/** A pattern matching text that BEGINS with `text`, taken literally. */
+function startsWith(text: string): RegExp {
+  return new RegExp(`^${text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`);
+}
+
 const { listAshbyMappings, listAshbyWorkflows, listAshbyJobs, pauseAshbyMapping, resumeAshbyMapping, archiveAshbyMapping, cancelAshbyWorkflow, retryAshbyOperation, deliverAshbyManualInvite, discoverAshbyFeedbackForm, previewAshbyScorecardBinding, previewAshbyBacklog, confirmAshbyBacklog, createAshbyMapping, listRoles } = vi.hoisted(() => ({
   listAshbyMappings: vi.fn(),
   archiveAshbyMapping: vi.fn(),
@@ -43,11 +61,15 @@ vi.mock('../api', () => ({
   },
 }));
 
+/**
+ * `roleId` as the route now returns it: m1 screens for the active Sales
+ * Advisor role, m2 for a role retired since — which a row must still name.
+ */
 const MAPPINGS = {
   ok: true,
   mappings: [
-    { id: 'm1', externalJobId: 'job_1', status: 'enabled', statusReason: null, deliveryMode: 'both', hasAiStage: true, hasTaStage: true, label: null, updatedAt: '2026-08-13T00:00:00Z' },
-    { id: 'm2', externalJobId: 'job_2', status: 'drift', statusReason: 'stage_id_invalid', deliveryMode: 'manual', hasAiStage: true, hasTaStage: false, label: null, updatedAt: '2026-08-13T00:00:00Z' },
+    { id: 'm1', externalJobId: 'job_1', status: 'enabled', statusReason: null, deliveryMode: 'both', hasAiStage: true, hasTaStage: true, label: null, roleId: '11111111-1111-4111-8111-111111111111', updatedAt: '2026-08-13T00:00:00Z' },
+    { id: 'm2', externalJobId: 'job_2', status: 'drift', statusReason: 'stage_id_invalid', deliveryMode: 'manual', hasAiStage: true, hasTaStage: false, label: null, roleId: '22222222-2222-4222-8222-222222222222', updatedAt: '2026-08-13T00:00:00Z' },
   ],
 };
 const ROLES = [
@@ -703,6 +725,8 @@ describe('Adding a job mapping', () => {
 
   async function chooseAndSave(jobLabel: string) {
     await userEvent.selectOptions(jobSelect(), jobLabel);
+    // Roles are re-read on every open too; wait for that read to land.
+    await waitFor(() => expect(roleSelect()).toBeEnabled());
     await userEvent.selectOptions(roleSelect(), SALES_ROLE);
     await userEvent.click(screen.getByRole('button', { name: /Save mapping/ }));
   }
@@ -845,24 +869,70 @@ describe('Adding a job mapping', () => {
     // THROWN, not resolved. `apiClient.request` throws `ApiError` on every
     // non-2xx and this route only emits `ok:false` with 400/409/500, so a
     // resolved `{ok:false}` is a shape the API layer cannot produce.
-    createAshbyMapping.mockRejectedValue(new ApiError('conflict', 409));
+    createAshbyMapping.mockRejectedValue(new ApiError('invalid_external_job_id', 400));
     const dialog = await openDialog();
     await chooseAndSave('Customer Success Lead');
 
-    await waitFor(() =>
-      expect(within(dialog).getByRole('alert')).toHaveTextContent('This Ashby job is already mapped.'),
-    );
-    expect(screen.getByRole('dialog')).toBe(dialog);
-    expect(jobSelect().selectedOptions[0].textContent).toBe('Customer Success Lead');
-    expect(roleSelect().value).toBe(SALES_ROLE);
-
-    createAshbyMapping.mockRejectedValue(new ApiError('invalid_external_job_id', 400));
-    await userEvent.click(screen.getByRole('button', { name: /Save mapping/ }));
     await waitFor(() =>
       expect(within(dialog).getByRole('alert')).toHaveTextContent(
         'That job could not be used. Pick it again from the list.',
       ),
     );
+    expect(screen.getByRole('dialog')).toBe(dialog);
+    expect(jobSelect().selectedOptions[0].textContent).toBe('Customer Success Lead');
+    expect(roleSelect().value).toBe(SALES_ROLE);
+    // Nothing on screen is known to be stale, so nothing is re-read.
+    expect(listAshbyMappings).toHaveBeenCalledTimes(1);
+    expect(listAshbyJobs).toHaveBeenCalledTimes(2);
+    expect(dialog).not.toHaveTextContent('invalid_external_job_id');
+  });
+
+  it('409 conflict — the job was JUST mapped elsewhere: says so, and really refreshes both lists', async () => {
+    // What the API now emits for a create on a job that already has a LIVE
+    // mapping: a Postgres unique violation, surfaced as 409 `conflict`.
+    createAshbyMapping.mockRejectedValue(new ApiError('conflict', 409));
+    // Someone else's mapping for job_3 is on the server by the time we look.
+    const TAKEN = {
+      ok: true,
+      mappings: [
+        ...MAPPINGS.mappings,
+        { ...MAPPINGS.mappings[0], id: 'm_other', externalJobId: 'job_3', status: 'paused' },
+      ],
+    };
+    listAshbyMappings.mockResolvedValueOnce(MAPPINGS).mockResolvedValue(TAKEN);
+    const dialog = await openDialog();
+    await chooseAndSave('Customer Success Lead');
+
+    await waitFor(() =>
+      expect(within(dialog).getByRole('alert')).toHaveTextContent(
+        'This job was just mapped by someone else. The list has been refreshed.',
+      ),
+    );
+    // "has been refreshed" is TRUE: the mapping list and the job list were
+    // both read again (page load + open + this refresh = 3 job reads).
+    expect(listAshbyMappings).toHaveBeenCalledTimes(2);
+    expect(listAshbyJobs).toHaveBeenCalledTimes(3);
+    expect(screen.getByRole('dialog')).toBe(dialog);
+    // The refreshed picker shows the job as taken, and the stale choice is gone.
+    expect(optionTexts(jobSelect())).toContain('Customer Success Lead — already mapped');
+    expect(jobSelect().value).toBe('');
+    expect(roleSelect().value).toBe(SALES_ROLE);
+    expect(screen.getByRole('button', { name: /Save mapping/ })).toBeDisabled();
+  });
+
+  it('409 archived — says the mapping was deleted meanwhile, and refreshes', async () => {
+    createAshbyMapping.mockRejectedValue(new ApiError('archived', 409));
+    const dialog = await openDialog();
+    await chooseAndSave('Customer Success Lead');
+    await waitFor(() =>
+      expect(within(dialog).getByRole('alert')).toHaveTextContent(
+        "This mapping was deleted while you were working, so it can't be changed.",
+      ),
+    );
+    expect(within(dialog).getByRole('alert')).toHaveTextContent(/new, paused mapping/);
+    expect(listAshbyMappings).toHaveBeenCalledTimes(2);
+    expect(listAshbyJobs).toHaveBeenCalledTimes(3);
+    expect(dialog).not.toHaveTextContent(/\barchived\b/);
   });
 
   it('REFUSES to close while the save is in flight', async () => {
@@ -892,34 +962,121 @@ describe('Adding a job mapping', () => {
     expect(screen.getByText('Account Executive')).toBeInTheDocument();
   });
 
-  it('says WHY the jobs could not be listed, and "Try again" reads them again', async () => {
-    for (const [err, copy] of [
-      [new ApiError('integration_disabled', 503), "The Ashby integration is turned off, so jobs can't be listed."],
-      [new ApiError('forbidden', 403), 'Only admins can list Ashby jobs.'],
-      [new ApiError('probe_unavailable', 502), "Couldn't load jobs from Ashby."],
+  const jobsLive = () => document.getElementById('ashby-mapping-jobs-live')!;
+  const jobNote = () => document.getElementById('ashby-mapping-job-note')!;
+
+  it('says WHY the jobs could not be listed — and offers "Try again" ONLY when trying again can help', async () => {
+    for (const [err, copy, retryable] of [
+      [new ApiError('integration_disabled', 503), "The Ashby integration is turned off, so jobs can't be listed.", false],
+      [new ApiError('forbidden', 403), 'Only admins can list Ashby jobs.', false],
+      [new ApiError('probe_unavailable', 502), "Couldn't load jobs from Ashby.", true],
+      [new Error('network down'), "Couldn't load jobs from Ashby.", true],
     ] as const) {
       listAshbyJobs.mockRejectedValue(err);
       const view = renderPage();
       await userEvent.click(await screen.findByRole('button', { name: 'Add mapping' }));
-      const dialog = screen.getByRole('dialog', { name: 'Add job mapping' });
-      expect(await within(dialog).findByRole('alert')).toHaveTextContent(copy);
+      // Announced by the dialog's persistent polite region…
+      await waitFor(() => expect(jobsLive()).toHaveTextContent(copy));
+      // …and shown under the picker, which it describes.
+      expect(jobNote()).toHaveTextContent(copy);
       expect(jobSelect()).toBeDisabled();
+      // The whole note describes the picker — the reason, then (when there
+      // is one) the Try again that follows it.
+      expect(jobSelect()).toHaveAccessibleDescription(startsWith(copy));
+      // A switched-off integration or a missing permission fails the same
+      // way every time: a Try again button would promise otherwise.
+      expect(within(jobNote()).queryAllByRole('button', { name: 'Try again' })).toHaveLength(
+        retryable ? 1 : 0,
+      );
       view.unmount();
     }
+  });
 
+  it('"Try again" reads the jobs again and moves focus to the job picker once it is usable', async () => {
     listAshbyJobs.mockRejectedValue(new Error('network down'));
     renderPage();
     await userEvent.click(await screen.findByRole('button', { name: 'Add mapping' }));
-    const dialog = screen.getByRole('dialog', { name: 'Add job mapping' });
-    expect(await within(dialog).findByRole('alert')).toHaveTextContent("Couldn't load jobs from Ashby.");
+    const retry = await within(jobNote()).findByRole('button', { name: 'Try again' });
 
     listAshbyJobs.mockClear();
-    listAshbyJobs.mockResolvedValue(JOBS);
-    await userEvent.click(within(dialog).getByRole('button', { name: 'Try again' }));
+    let answer: (value: unknown) => void = () => {};
+    listAshbyJobs.mockReturnValue(new Promise((resolve) => { answer = resolve; }));
+    await userEvent.click(retry);
+    // In flight: the button left with its notice, so focus waits on the
+    // note — not on <body> — and the region says what is happening.
+    expect(jobNote()).toHaveFocus();
+    expect(jobsLive()).toHaveTextContent('Loading jobs from Ashby…');
+
+    await act(async () => answer(JOBS));
     await waitFor(() => expect(jobSelect()).toBeEnabled());
     expect(listAshbyJobs).toHaveBeenCalledTimes(1);
     expect(optionTexts(jobSelect())).toContain('Customer Success Lead');
-    expect(within(dialog).queryByRole('alert')).toBeNull();
+    expect(jobSelect()).toHaveFocus();
+    // job_1 and job_3 are the Open ones.
+    expect(jobsLive()).toHaveTextContent('2 open jobs');
+    expect(within(jobNote()).queryByRole('button', { name: 'Try again' })).toBeNull();
+  });
+
+  it('a "Try again" that fails AGAIN leaves focus on Try again, not on <body>', async () => {
+    listAshbyJobs.mockRejectedValue(new ApiError('probe_unavailable', 502));
+    renderPage();
+    await userEvent.click(await screen.findByRole('button', { name: 'Add mapping' }));
+    await userEvent.click(await within(jobNote()).findByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(within(jobNote()).getByRole('button', { name: 'Try again' })).toHaveFocus());
+    expect(jobsLive()).toHaveTextContent("Couldn't load jobs from Ashby.");
+  });
+
+  it('a "Try again" that finds NO open jobs puts focus on the note that says so', async () => {
+    listAshbyJobs.mockRejectedValue(new Error('network down'));
+    renderPage();
+    await userEvent.click(await screen.findByRole('button', { name: 'Add mapping' }));
+    const retry = await within(jobNote()).findByRole('button', { name: 'Try again' });
+    listAshbyJobs.mockResolvedValue({ ...JOBS, jobs: JOBS.jobs.filter((job) => job.status !== 'Open') });
+    await userEvent.click(retry);
+    await waitFor(() => expect(jobNote()).toHaveTextContent('There are no open jobs in Ashby right now.'));
+    expect(jobSelect()).toBeDisabled();
+    expect(jobNote()).toHaveFocus();
+  });
+
+  it('announces the job list in a PERSISTENT polite region: loading, then how many', async () => {
+    let answer: (value: unknown) => void = () => {};
+    listAshbyJobs.mockResolvedValueOnce(JOBS).mockReturnValueOnce(new Promise((resolve) => { answer = resolve; }));
+    renderPage();
+    await screen.findByText('Account Executive');
+    await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
+    const region = jobsLive();
+    expect(region).toHaveAttribute('role', 'status');
+    expect(region).toHaveClass('sr-only');
+    expect(region).toHaveTextContent('Loading jobs from Ashby…');
+    await act(async () => answer(JOBS));
+    // The SAME node, now carrying the count — a region that already exists
+    // is what gets announced reliably.
+    await waitFor(() => expect(jobsLive()).toHaveTextContent('2 open jobs'));
+    expect(jobsLive()).toBe(region);
+    // No visible notice doubles as a second live region.
+    expect(within(jobNote()).queryAllByRole('status')).toHaveLength(0);
+    expect(within(jobNote()).queryAllByRole('alert')).toHaveLength(0);
+  });
+
+  it("says so when Ashby WITHHELD confidential jobs — and only then", async () => {
+    listAshbyJobs.mockResolvedValue({ ...JOBS, withheld: 2 });
+    const view = renderPage();
+    await screen.findByText('Account Executive');
+    await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
+    await waitFor(() => expect(jobSelect()).toBeEnabled());
+    expect(within(jobNote()).getByText("Confidential jobs aren't listed here.")).toBeInTheDocument();
+    expect(jobSelect()).toHaveAccessibleDescription("Confidential jobs aren't listed here.");
+    // A count only — never which jobs.
+    expect(jobNote()).not.toHaveTextContent(/2/);
+    view.unmount();
+
+    listAshbyJobs.mockResolvedValue({ ...JOBS, withheld: 0 });
+    renderPage();
+    await screen.findByText('Account Executive');
+    await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
+    await waitFor(() => expect(jobSelect()).toBeEnabled());
+    expect(screen.queryByText("Confidential jobs aren't listed here.")).toBeNull();
+    expect(jobSelect()).not.toHaveAccessibleDescription();
   });
 
   it('WARNS when Ashby returned more jobs than the list can show', async () => {
@@ -940,7 +1097,10 @@ describe('Adding a job mapping', () => {
     renderPage();
     await screen.findByText('Night Shift Advisor');
     await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
-    expect(await screen.findByText('There are no open jobs in Ashby right now.')).toBeInTheDocument();
+    await waitFor(() =>
+      expect(within(jobNote()).getByText('There are no open jobs in Ashby right now.')).toBeInTheDocument(),
+    );
+    expect(jobsLive()).toHaveTextContent('There are no open jobs in Ashby right now.');
     expect(jobSelect()).toBeDisabled();
   });
 
@@ -959,6 +1119,111 @@ describe('Adding a job mapping', () => {
     listRoles.mockRejectedValue(new Error('boom'));
     renderPage();
     expect(await screen.findByText('Account Executive')).toBeInTheDocument();
+  });
+
+  // ── Roles in the dialog ──────────────────────────────────────────────
+  const rolesLive = () => document.getElementById('ashby-mapping-roles-live')!;
+  const roleNote = () => document.getElementById('ashby-mapping-role-note')!;
+
+  it('re-reads the roles EVERY time the dialog opens', async () => {
+    renderPage();
+    await screen.findByText('Account Executive');
+    await waitFor(() => expect(listRoles).toHaveBeenCalledTimes(1));
+    for (const opens of [2, 3]) {
+      // A role created on the Roles page since: pickable without a reload.
+      listRoles.mockResolvedValue([
+        ...ROLES,
+        { ...ROLES[0], id: `33333333-3333-4333-8333-33333333333${opens}`, title: `New Role ${opens}`, agent_name: undefined },
+      ]);
+      await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
+      await waitFor(() => expect(listRoles).toHaveBeenCalledTimes(opens));
+      await waitFor(() => expect(optionTexts(roleSelect())).toContain(`New Role ${opens}`));
+      await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
+    }
+  });
+
+  it('shows a LOADING role picker while the roles are being read', async () => {
+    listRoles.mockResolvedValueOnce(ROLES).mockReturnValueOnce(new Promise(() => {}));
+    renderPage();
+    await screen.findByText('Account Executive');
+    await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
+    expect(roleSelect()).toBeDisabled();
+    expect(optionTexts(roleSelect())).toEqual(['Loading roles…']);
+    expect(rolesLive()).toHaveTextContent('Loading roles…');
+  });
+
+  it('a roles read that fails says so, and "Try again" reads them again and focuses the picker', async () => {
+    listRoles.mockResolvedValueOnce(ROLES).mockRejectedValueOnce(new Error('boom'));
+    renderPage();
+    await screen.findByText('Account Executive');
+    await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
+    await waitFor(() => expect(roleNote()).toHaveTextContent("Couldn't load roles."));
+    expect(rolesLive()).toHaveTextContent("Couldn't load roles.");
+    expect(roleSelect()).toBeDisabled();
+    expect(roleSelect()).toHaveAccessibleDescription(startsWith("Couldn't load roles."));
+
+    listRoles.mockResolvedValue(ROLES);
+    await userEvent.click(within(roleNote()).getByRole('button', { name: 'Try again' }));
+    await waitFor(() => expect(roleSelect()).toBeEnabled());
+    expect(roleSelect()).toHaveFocus();
+    expect(optionTexts(roleSelect())).toContain('Sales Advisor — Sales v1 hiring');
+    expect(rolesLive()).toHaveTextContent('1 active role');
+  });
+
+  it('with NO active roles, says so and links to the Roles page', async () => {
+    listRoles.mockResolvedValue(ROLES.filter((role) => !role.is_active));
+    const { container } = renderPage();
+    await screen.findByText('Account Executive');
+    await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
+    await waitFor(() =>
+      expect(roleNote()).toHaveTextContent(
+        'There are no active roles yet. Create one on the Roles page first.',
+      ),
+    );
+    expect(within(roleNote()).getByRole('link', { name: 'Roles page' })).toHaveAttribute('href', '/roles');
+    expect(roleSelect()).toBeDisabled();
+    expect(rolesLive()).toHaveTextContent('There are no active roles yet.');
+    expect(screen.getByRole('button', { name: /Save mapping/ })).toBeDisabled();
+    await expect(container).toHaveNoViolations();
+  });
+
+  it('both pickers are the design-system select, full width and free to shrink', async () => {
+    await openDialog();
+    for (const select of [jobSelect(), roleSelect()]) {
+      // `control-select` is SelectField's own class: its chevron, and the
+      // `controlClass` border that clears WCAG 1.4.11.
+      expect(select).toHaveClass('control-select', 'w-full', 'min-w-0');
+    }
+  });
+
+  // ── Focus after a failed request ─────────────────────────────────────
+  // While a request is in flight every control is disabled, and a real
+  // browser moves focus off a control the moment it is disabled — to <body>.
+  // jsdom does not, so each test does that by hand (`dropFocusToBody`) while the
+  // request hangs; the page must then put focus back itself.
+
+  it('a FAILED save puts focus back on Save — never leaves it on <body>', async () => {
+    let fail: (reason: unknown) => void = () => {};
+    createAshbyMapping.mockReturnValue(new Promise((_, reject) => { fail = reject; }));
+    await openDialog();
+    await chooseAndSave('Customer Success Lead');
+    dropFocusToBody();
+
+    await act(async () => fail(new ApiError('mission_control_action_error', 500)));
+    await waitFor(() => expect(screen.getByRole('button', { name: /Save mapping/ })).toHaveFocus());
+  });
+
+  it('a failed save whose refresh DISABLES Save puts focus on the first control that can take it', async () => {
+    let fail: (reason: unknown) => void = () => {};
+    createAshbyMapping.mockReturnValue(new Promise((_, reject) => { fail = reject; }));
+    await openDialog();
+    await chooseAndSave('Customer Success Lead');
+    dropFocusToBody();
+
+    // A conflict re-reads the job list, which clears the choice: Save is off.
+    await act(async () => fail(new ApiError('conflict', 409)));
+    await waitFor(() => expect(jobSelect()).toHaveFocus());
+    expect(screen.getByRole('button', { name: /Save mapping/ })).toBeDisabled();
   });
 
   it('has no axe violations with the dialog open', async () => {
@@ -1046,10 +1311,12 @@ describe('Deleting a job mapping', () => {
   };
   const THREE = { ok: true, mappings: [...MAPPINGS.mappings, PAUSED] };
   const HINT = 'Pause this mapping before deleting it';
+  // A deleted mapping is FROZEN: re-adding the job makes a NEW mapping, so
+  // the copy must not promise the old one "comes back".
   const CONSEQUENCES =
-    'It stops screening for good and disappears from this list. Candidates already screened — ' +
-    'their calls, scores and history — are kept. Adding this job again later brings the ' +
-    'mapping back, paused.';
+    "It won't screen anyone again and disappears from this list. Candidates already screened — " +
+    'their calls, scores and history — are kept. You can add this job again later as a new, ' +
+    'paused mapping.';
 
   beforeEach(() => {
     vi.clearAllMocks();
@@ -1116,6 +1383,7 @@ describe('Deleting a job mapping', () => {
     // The name is the dialog's description: announced with its title on open.
     expect(dialog).toHaveAccessibleDescription('Customer Success Lead');
     expect(dialog).toHaveTextContent(CONSEQUENCES);
+    expect(dialog).not.toHaveTextContent(/brings? the mapping back|restor/i);
     // Not the Ashby job id, not the mapping id — nowhere in the markup.
     expect(dialog.innerHTML).not.toMatch(/job_\d|map_paused/);
     expect(archiveAshbyMapping).not.toHaveBeenCalled();
@@ -1266,11 +1534,362 @@ describe('Deleting a job mapping', () => {
     await waitFor(() => expect(listAshbyMappings).toHaveBeenCalledTimes(2));
   });
 
+  it('a FAILED delete that can be retried puts focus back on "Delete mapping" — not on <body>', async () => {
+    let fail: (reason: unknown) => void = () => {};
+    archiveAshbyMapping.mockReturnValue(new Promise((_, reject) => { fail = reject; }));
+    const dialog = await openConfirm();
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Delete mapping' }));
+    // What a real browser does to a focused control that becomes disabled.
+    dropFocusToBody();
+
+    await act(async () => fail(new ApiError('mission_control_action_error', 500)));
+    await waitFor(() =>
+      expect(within(dialog).getByRole('button', { name: 'Delete mapping' })).toHaveFocus(),
+    );
+  });
+
+  it('a failed delete that CANNOT be retried puts focus on Cancel, the first control that can take it', async () => {
+    let fail: (reason: unknown) => void = () => {};
+    archiveAshbyMapping.mockReturnValue(new Promise((_, reject) => { fail = reject; }));
+    listAshbyMappings.mockResolvedValueOnce(THREE).mockResolvedValue(MAPPINGS);
+    const dialog = await openConfirm();
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Delete mapping' }));
+    dropFocusToBody();
+
+    await act(async () => fail(new ApiError('not_found', 404)));
+    await waitFor(() => expect(within(dialog).getByRole('button', { name: 'Cancel' })).toHaveFocus());
+    expect(within(dialog).getByRole('button', { name: 'Delete mapping' })).toBeDisabled();
+  });
+
+  it('confirms a delete on the page, in a status region, until the next action', async () => {
+    listAshbyMappings.mockResolvedValueOnce(THREE).mockResolvedValue(MAPPINGS);
+    const region = () => document.getElementById('ashby-mapping-confirmation')!;
+    const dialog = await openConfirm();
+    // Mounted (and empty) BEFORE there is anything to say.
+    expect(region()).toHaveAttribute('role', 'status');
+    expect(region()).toHaveTextContent('');
+    await userEvent.click(within(dialog).getByRole('button', { name: 'Delete mapping' }));
+    await waitFor(() => expect(region()).toHaveTextContent('Mapping deleted.'));
+
+    // The next action — any action — clears it.
+    await userEvent.click(within(row('Night Shift Advisor')).getByRole('button', { name: 'Discover feedback form' }));
+    expect(region()).toHaveTextContent('');
+  });
+
   it('has no axe violations with the confirmation open', async () => {
     const { container } = renderPage();
     await screen.findByText('Customer Success Lead');
     await userEvent.click(deleteButton('Customer Success Lead'));
     screen.getByRole('dialog', { name: 'Delete this mapping?' });
     await expect(container).toHaveNoViolations();
+  });
+});
+
+describe('Saving a mapping confirms it on the page', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    listAshbyMappings.mockResolvedValue(MAPPINGS);
+    listAshbyWorkflows.mockResolvedValue(WORKFLOWS);
+    listRoles.mockResolvedValue(ROLES);
+    listAshbyJobs.mockResolvedValue(JOBS);
+    createAshbyMapping.mockResolvedValue({ ok: true, id: 'm3', status: 'paused' });
+    pauseAshbyMapping.mockResolvedValue({ ok: true, status: 'paused' });
+  });
+
+  it('says "Mapping added" — and that it is paused — then clears on the next action', async () => {
+    const region = () => document.getElementById('ashby-mapping-confirmation')!;
+    renderPage();
+    await screen.findByText('Account Executive');
+    expect(region()).toHaveAttribute('role', 'status');
+    await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
+    const job = screen.getByLabelText('Ashby job') as HTMLSelectElement;
+    await waitFor(() => expect(job).toBeEnabled());
+    await userEvent.selectOptions(job, 'Customer Success Lead');
+    const role = screen.getByLabelText(/^Role$/) as HTMLSelectElement;
+    await waitFor(() => expect(role).toBeEnabled());
+    await userEvent.selectOptions(role, '11111111-1111-4111-8111-111111111111');
+    await userEvent.click(screen.getByRole('button', { name: /Save mapping/ }));
+
+    await waitFor(() => expect(screen.queryByRole('dialog')).toBeNull());
+    await waitFor(() =>
+      expect(region()).toHaveTextContent("Mapping added. It's paused — use Resume to turn it on."),
+    );
+    // No second live role inside the region: announced once.
+    expect(within(region()).queryAllByRole('status')).toHaveLength(0);
+
+    await userEvent.click(screen.getAllByRole('button', { name: 'Pause' })[0]);
+    expect(region()).toHaveTextContent('');
+    await waitFor(() => expect(pauseAshbyMapping).toHaveBeenCalledWith('m1'));
+  });
+
+  it('a FAILED save confirms nothing', async () => {
+    createAshbyMapping.mockRejectedValue(new ApiError('mission_control_action_error', 500));
+    renderPage();
+    await screen.findByText('Account Executive');
+    await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
+    const job = screen.getByLabelText('Ashby job') as HTMLSelectElement;
+    await waitFor(() => expect(job).toBeEnabled());
+    await userEvent.selectOptions(job, 'Customer Success Lead');
+    const role = screen.getByLabelText(/^Role$/) as HTMLSelectElement;
+    await waitFor(() => expect(role).toBeEnabled());
+    await userEvent.selectOptions(role, '11111111-1111-4111-8111-111111111111');
+    await userEvent.click(screen.getByRole('button', { name: /Save mapping/ }));
+    await within(screen.getByRole('dialog')).findByRole('alert');
+    expect(document.getElementById('ashby-mapping-confirmation')).toHaveTextContent('');
+  });
+});
+
+describe('Phone layout — no sideways scroll at 360px', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    listAshbyMappings.mockResolvedValue(MAPPINGS);
+    listAshbyWorkflows.mockResolvedValue(WORKFLOWS);
+    listRoles.mockResolvedValue(ROLES);
+    listAshbyJobs.mockResolvedValue(JOBS);
+  });
+
+  // jsdom has no layout, so this pins the CLASS that makes the layout work.
+  // A `shrink-0` action group keeps its one-line width even after wrapping
+  // onto its own line — six buttons wide, far past a 360px screen — so the
+  // whole page scrolled sideways. `min-w-0` lets it shrink and wrap.
+  it('lets every row action group shrink and wrap — nothing between a button and its row is shrink-0', async () => {
+    renderPage();
+    await screen.findByText('app_1');
+    const groups = screen.getAllByTestId('row-actions');
+    // Two mapping rows and one workflow row.
+    expect(groups).toHaveLength(3);
+    for (const group of groups) {
+      expect(group).toHaveClass('min-w-0');
+      expect(group).not.toHaveClass('shrink-0');
+      const buttons = within(group).getAllByRole('button');
+      expect(buttons.length).toBeGreaterThan(0);
+      for (const button of buttons) {
+        // Still WRAPPING: the buttons' own row keeps `flex-wrap`.
+        expect(button.parentElement).toHaveClass('flex-wrap');
+        for (let el = button.parentElement; el && el.tagName !== 'LI'; el = el.parentElement) {
+          expect(el).not.toHaveClass('shrink-0');
+        }
+      }
+    }
+  });
+});
+
+describe('One name per job — rows, picker and Delete agree, same-titled jobs apart', () => {
+  // Three jobs share a title: an OPEN one mapped long ago, a CLOSED one that
+  // is also mapped, and a newer OPEN one nobody has mapped yet. The naming
+  // rule runs over the WHOLE list, so the closed twin is what gives the two
+  // open ones their dates — the picker and the rows must agree on that.
+  const TWINS = {
+    ok: true,
+    truncated: false,
+    jobs: [
+      // Noon UTC, so the calendar day is the same in every test timezone.
+      { id: 'job_twin_old', title: 'Support Agent', status: 'Open', openedAt: '2026-06-01T12:00:00Z' },
+      { id: 'job_twin_closed', title: 'Support Agent', status: 'Closed', openedAt: '2026-07-15T12:00:00Z' },
+      { id: 'job_twin_new', title: 'Support Agent', status: 'Open', openedAt: '2026-08-20T12:00:00Z' },
+    ],
+  };
+  const day = (iso: string) =>
+    new Date(iso).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
+  const OLD = `Support Agent — opened ${day('2026-06-01T12:00:00Z')}`;
+  const CLOSED = `Support Agent — opened ${day('2026-07-15T12:00:00Z')}`;
+  const NEW = `Support Agent — opened ${day('2026-08-20T12:00:00Z')}`;
+  const base = MAPPINGS.mappings[0];
+  const TWIN_MAPPINGS = {
+    ok: true,
+    mappings: [
+      // Saved before disambiguation: its label is the bare title, which says
+      // nothing the name does not — so it is not repeated as a line.
+      { ...base, id: 'map_old', externalJobId: 'job_twin_old', status: 'paused', label: 'Support Agent' },
+      { ...base, id: 'map_closed', externalJobId: 'job_twin_closed', status: 'paused', label: null },
+    ],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    listAshbyMappings.mockResolvedValue(TWIN_MAPPINGS);
+    listAshbyWorkflows.mockResolvedValue(WORKFLOWS);
+    listRoles.mockResolvedValue(ROLES);
+    listAshbyJobs.mockResolvedValue(TWINS);
+    createAshbyMapping.mockResolvedValue({ ok: true, id: 'm9', status: 'paused' });
+    archiveAshbyMapping.mockResolvedValue({ ok: true, already_archived: false });
+  });
+
+  it('names two same-titled mapped jobs DIFFERENTLY in their rows — by date, never by id', async () => {
+    renderPage();
+    expect(await screen.findByText(OLD)).toBeInTheDocument();
+    expect(screen.getByText(CLOSED)).toBeInTheDocument();
+    expect(OLD).not.toBe(CLOSED);
+    // The bare title is never shown on its own: it would name both rows.
+    expect(screen.queryByText('Support Agent')).toBeNull();
+    expect(document.body.innerHTML).not.toMatch(/job_twin/);
+  });
+
+  it('the picker and the Delete confirmation use the SAME names as the rows', async () => {
+    renderPage();
+    await screen.findByText(OLD);
+    await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
+    const job = screen.getByLabelText('Ashby job') as HTMLSelectElement;
+    await waitFor(() => expect(job).toBeEnabled());
+    // The closed twin is not offered, but it still dates the open ones.
+    expect([...job.options].map((o) => o.textContent)).toEqual([
+      'Choose a job…',
+      `${OLD} — already mapped`,
+      NEW,
+    ]);
+    await userEvent.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
+
+    await userEvent.click(
+      within(screen.getByText(CLOSED).closest('li')!).getByRole('button', { name: 'Delete' }),
+    );
+    expect(screen.getByRole('dialog', { name: 'Delete this mapping?' })).toHaveAccessibleDescription(CLOSED);
+  });
+
+  it('saves the DISAMBIGUATED name as the label', async () => {
+    renderPage();
+    await screen.findByText(OLD);
+    await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
+    const job = screen.getByLabelText('Ashby job') as HTMLSelectElement;
+    await waitFor(() => expect(job).toBeEnabled());
+    await userEvent.selectOptions(job, NEW);
+    const role = screen.getByLabelText(/^Role$/) as HTMLSelectElement;
+    await waitFor(() => expect(role).toBeEnabled());
+    await userEvent.selectOptions(role, '11111111-1111-4111-8111-111111111111');
+    await userEvent.click(screen.getByRole('button', { name: /Save mapping/ }));
+    await waitFor(() => expect(createAshbyMapping).toHaveBeenCalledTimes(1));
+    expect(createAshbyMapping.mock.calls[0][0]).toEqual({
+      external_job_id: 'job_twin_new',
+      role_id: '11111111-1111-4111-8111-111111111111',
+      label: NEW,
+    });
+  });
+});
+
+describe('Mapping rows name the ROLE — by title, stacked under the job', () => {
+  const SALES = '11111111-1111-4111-8111-111111111111';
+  const RETIRED = '22222222-2222-4222-8222-222222222222';
+  const GONE = '33333333-3333-4333-8333-333333333333';
+  const base = MAPPINGS.mappings[0];
+  const ROWS = {
+    ok: true,
+    mappings: [
+      { ...base, id: 'm1', externalJobId: 'job_1', roleId: SALES, label: null },
+      // A role retired since: still named — resolved against ALL roles.
+      { ...base, id: 'm2', externalJobId: 'job_2', status: 'paused', roleId: RETIRED, label: null },
+      // A role the read did not return, and a hand-typed tag worth showing.
+      { ...base, id: 'm3', externalJobId: 'job_3', status: 'paused', roleId: GONE, label: 'canary' },
+      // No role at all; label = the job's own title, so not repeated.
+      { ...base, id: 'm4', externalJobId: 'job_4', status: 'paused', roleId: null, label: 'Draft Role' },
+    ],
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    listAshbyMappings.mockResolvedValue(ROWS);
+    listAshbyWorkflows.mockResolvedValue(WORKFLOWS);
+    listRoles.mockResolvedValue(ROLES);
+    listAshbyJobs.mockResolvedValue(JOBS);
+  });
+
+  const rowOf = (job: string) => screen.getByText(job).closest('li')!;
+
+  it("shows each row's role on its OWN line, and the label only when it adds something", async () => {
+    renderPage();
+    await screen.findByText('Role: Sales Advisor');
+    expect(within(rowOf('Account Executive')).getByText('Role: Sales Advisor')).toBeInTheDocument();
+    expect(within(rowOf('Night Shift Advisor')).getByText('Role: Retired Role')).toBeInTheDocument();
+    expect(within(rowOf('Customer Success Lead')).getByText('Role: unavailable')).toBeInTheDocument();
+    expect(within(rowOf('Draft Role')).getByText('Role: none')).toBeInTheDocument();
+
+    // STACKED, not run together: name, role and label are separate lines.
+    const csl = rowOf('Customer Success Lead');
+    const name = within(csl).getByText('Customer Success Lead');
+    const roleText = within(csl).getByText('Role: unavailable');
+    const label = within(csl).getByText('canary');
+    expect(new Set([name, roleText, label]).size).toBe(3);
+    expect(roleText.tagName).toBe('P');
+    expect(label.tagName).toBe('P');
+    expect(name.compareDocumentPosition(roleText) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(roleText.compareDocumentPosition(label) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+
+    // A label that is just the job's title again is not repeated.
+    expect(within(rowOf('Draft Role')).getAllByText('Draft Role')).toHaveLength(1);
+    // No role uuid, no job id, anywhere in the markup.
+    expect(document.body.innerHTML).not.toMatch(/11111111-|22222222-|33333333-|job_\d/);
+  });
+
+  it('says the role is LOADING, not unavailable, while the first roles read is in flight', async () => {
+    listRoles.mockReturnValue(new Promise(() => {}));
+    renderPage();
+    await screen.findByText('Account Executive');
+    expect(screen.getAllByText('Role: loading…').length).toBeGreaterThan(0);
+    expect(screen.queryByText('Role: unavailable')).toBeNull();
+  });
+
+  it('says "unavailable" when the roles cannot be read — and the page stays', async () => {
+    listRoles.mockRejectedValue(new Error('boom'));
+    renderPage();
+    await screen.findByText('Account Executive');
+    await waitFor(() => expect(screen.getAllByText('Role: unavailable')).toHaveLength(3));
+    expect(screen.getByText('Role: none')).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+});
+
+describe('Scorecard binding — a mapping NOT linked to the verified form', () => {
+  const ALL_GOOD = {
+    ...BINDING_PREVIEW,
+    preview: {
+      ...BINDING_PREVIEW.preview,
+      fixedFields: BINDING_PREVIEW.preview.fixedFields.map((f) => ({ ...f, status: 'present', actualType: f.expectedType ?? 'ValueSelect' })),
+      metrics: BINDING_PREVIEW.preview.metrics.slice(0, 2),
+      ready: true,
+    },
+  };
+  const NOT_LINKED =
+    "This mapping isn't linked to the Hello Christy scorecard form, so no scorecard will be written to Ashby.";
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    listAshbyMappings.mockResolvedValue(MAPPINGS);
+    listAshbyWorkflows.mockResolvedValue(WORKFLOWS);
+    listRoles.mockResolvedValue(ROLES);
+    listAshbyJobs.mockResolvedValue(JOBS);
+  });
+
+  async function preview() {
+    renderPage();
+    await userEvent.click((await screen.findAllByRole('button', { name: /preview scorecard binding/i }))[0]);
+    await screen.findByText(/Scorecard binding preview — read-only/);
+  }
+
+  it('warns ABOVE the verdict, and never says "Ready", even when every field binds', async () => {
+    previewAshbyScorecardBinding.mockResolvedValue({ ...ALL_GOOD, mappingFormBound: false });
+    await preview();
+    const notice = screen.getByText(NOT_LINKED);
+    const verdict = screen.getByTestId('binding-readiness');
+    expect(notice.compareDocumentPosition(verdict) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(verdict.textContent).not.toMatch(/Ready/);
+    expect(verdict.textContent).toMatch(/^Not ready — this mapping isn't linked to the Hello Christy scorecard form/);
+  });
+
+  it('warns on the v1 legacy path too — the writer refuses there as well', async () => {
+    previewAshbyScorecardBinding.mockResolvedValue({ ...ALL_GOOD, scoringPath: 'v1_legacy', mappingFormBound: false });
+    await preview();
+    expect(screen.getByText(NOT_LINKED)).toBeInTheDocument();
+  });
+
+  it('says nothing of the kind when the mapping IS linked, or when the API did not say', async () => {
+    previewAshbyScorecardBinding.mockResolvedValue({ ...ALL_GOOD, mappingFormBound: true });
+    await preview();
+    expect(screen.queryByText(NOT_LINKED)).toBeNull();
+    expect(screen.getByTestId('binding-readiness').textContent).toMatch(/^Ready — every metric/);
+  });
+
+  it('an API that omits the flag is "unknown", not "not linked"', async () => {
+    previewAshbyScorecardBinding.mockResolvedValue(ALL_GOOD);
+    await preview();
+    expect(screen.queryByText(NOT_LINKED)).toBeNull();
+    expect(screen.getByTestId('binding-readiness').textContent).toMatch(/^Ready — every metric/);
   });
 });

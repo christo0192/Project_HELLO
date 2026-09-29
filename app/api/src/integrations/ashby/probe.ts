@@ -82,12 +82,38 @@ const MAX_STAGES = 100;
 const MAX_TITLE_LEN = 120;
 const ID_RE = /^[A-Za-z0-9_.:-]{1,256}$/;
 
+/**
+ * What a display title may not carry. Each run becomes ONE space:
+ *  - C0 controls, DEL and the C1 controls (U+0000–U+001F, U+007F–U+009F);
+ *  - U+2028 LINE / U+2029 PARAGRAPH SEPARATOR, which break a line in a log
+ *    or a UI exactly as a newline does;
+ *  - every Unicode FORMAT character (`\p{Cf}`): bidi embeddings, overrides
+ *    and isolates (U+202A–U+202E, U+2066–U+2069), zero-width space/joiners
+ *    (U+200B–U+200D), word joiner, BOM, soft hyphen, … All invisible, and
+ *    the bidi ones make a title RENDER as different text from what it is —
+ *    an admin picks a job by name, so the name must be the one it looks like.
+ */
+const TITLE_UNSAFE_RE = /[\u0000-\u001F\u007F-\u009F\u2028\u2029\p{Cf}]+/gu;
+
+/**
+ * Sanitize a tenant-controlled display title: NFC-normalize (one spelling per
+ * look), replace unsafe characters with a space, collapse space runs, trim,
+ * and only THEN bound, so the bound counts visible text. A title made of
+ * nothing but invisible characters is `null`, not an empty-looking entry.
+ * Shared by every probe surface (stages, forms, fields, jobs).
+ */
 function sanitizeTitle(raw: unknown): string | null {
   if (typeof raw !== 'string') return null;
-  // Strip control characters and bound the length; a tenant-controlled string
-  // must never reach a response or a log unbounded.
-  const cleaned = raw.replace(/[\u0000-\u001F\u007F]/g, ' ').trim().slice(0, MAX_TITLE_LEN);
-  return cleaned.length > 0 ? cleaned : null;
+  const cleaned = raw
+    .normalize('NFC')
+    .replace(TITLE_UNSAFE_RE, ' ')
+    .replace(/ {2,}/g, ' ')
+    .trim();
+  // A tenant-controlled string must never reach a response or a log
+  // unbounded. The cut may land inside a surrogate pair; drop the orphaned
+  // high half rather than emit half a character.
+  const bounded = cleaned.slice(0, MAX_TITLE_LEN).replace(/[\uD800-\uDBFF]$/, '').trimEnd();
+  return bounded.length > 0 ? bounded : null;
 }
 
 /**
@@ -579,20 +605,25 @@ export async function probeFeedbackFormDefinition(
 //  read. Each entry is rebuilt from four named keys, so a sibling the provider
 //  adds later is unreachable, not merely filtered.
 //
-//  CONFIDENTIAL JOBS ARE WITHHELD. Ashby restricts a confidential job — whose
-//  title alone can disclose a reorg or a replacement hire — to the users it
-//  was explicitly shared with. The API key reads straight through that
-//  restriction and every admin of this app can open the picker, so listing
-//  the job here would WIDEN the audience Ashby deliberately narrowed.
-//  POST /mappings still accepts any valid job id; this surface simply never
-//  advertises a confidential one.
+//  CONFIDENTIAL JOBS ARE WITHHELD — FAIL-CLOSED. Ashby restricts a
+//  confidential job — whose title alone can disclose a reorg or a replacement
+//  hire — to the users it was explicitly shared with. The API key reads
+//  straight through that restriction and every admin of this app can open the
+//  picker, so listing the job here would WIDEN the audience Ashby deliberately
+//  narrowed. A job is therefore listed ONLY when its payload says, literally,
+//  `confidential: false`; true, null, a string, or no flag at all withholds it
+//  (a payload that does not say "not confidential" is not trusted to mean it).
+//  Withheld jobs are COUNTED (distinct ids, nothing else) so the UI can say
+//  some jobs are not shown. POST /mappings still accepts any valid job id;
+//  this surface simply never advertises a withheld one.
 //
-//  PARTIAL IS NOT FAILURE. A bound (pages, items), a repeated cursor, or a
-//  "more data" page with no cursor stops the walk with `truncated: true` and
-//  returns what was read — an admin still gets a usable picker, and the flag
-//  lets the UI say the list is incomplete. A provider error, by contrast,
-//  propagates: the route answers 502 rather than presenting an empty
-//  directory as the truth.
+//  PARTIAL IS NOT FAILURE. A bound (pages, items, the overall deadline), a
+//  repeated cursor, or a "more data" page with no cursor stops the walk with
+//  `truncated: true` and returns what was read — an admin still gets a usable
+//  picker, and the flag lets the UI say the list is incomplete. A provider
+//  error, by contrast, propagates (as does a deadline hit before ANY page
+//  arrived): the route answers 502 rather than presenting an empty directory
+//  as the truth.
 // ════════════════════════════════════════════════════════════════════════════
 
 /** Ashby's job lifecycle vocabulary. Any other value is reported as `null`. */
@@ -613,6 +644,11 @@ export interface ProbeJobDirectory {
   jobs: ProbeJob[];
   /** True when the walk stopped before the provider said it was done. */
   truncated: boolean;
+  /**
+   * How many DISTINCT jobs the walk saw and withheld because they were not
+   * explicitly `confidential: false`. A count only — never an id or title.
+   */
+  withheld: number;
 }
 
 /** Reader seam for one `job.list` page — satisfied by AshbyClient. */
@@ -627,6 +663,13 @@ export interface JobListReader {
 const JOB_PAGE_SIZE = 100;
 const MAX_JOB_PAGES = 20;
 const MAX_JOBS = 2000;
+/**
+ * Overall budget for ONE directory walk, every page and retry included. Each
+ * page already has its own client timeout; this bounds the sum, so a slow
+ * tenant cannot hold an admin's request (and a shared in-flight walk) for
+ * 20 pages × timeout × retries.
+ */
+const JOB_DIRECTORY_DEADLINE_MS = 20_000;
 /** An ISO-8601 timestamp is ~30 chars; anything far longer is not a date. */
 const MAX_DATE_LEN = 64;
 const JOB_STATUSES: ReadonlySet<string> = new Set<ProbeJobStatus>(['Draft', 'Open', 'Closed', 'Archived']);
@@ -643,18 +686,28 @@ function isoDate(raw: unknown): string | null {
 }
 
 /**
- * Whether a job must be withheld. An explicit `true` withholds; so does a flag
- * that is present but not `false` — a restriction this code cannot read is
- * treated as a restriction. Only an absent flag or an explicit `false` lists
- * the job.
+ * Whether a job may be LISTED. Fail-closed: only a literal `false` lists it.
+ * `true`, `null`, `"false"`, any other value, and an ABSENT flag all withhold
+ * — a restriction this code cannot positively read as "none" is treated as a
+ * restriction.
  */
-function isConfidential(raw: unknown): boolean {
-  return raw !== undefined && raw !== false;
+function isListable(confidential: unknown): boolean {
+  return confidential === false;
 }
 
 /** Caps may only TIGHTEN a bound (tests); they can never widen one. */
 function tightenCap(raw: number | undefined, ceiling: number): number {
   return typeof raw === 'number' && Number.isInteger(raw) && raw >= 1 ? Math.min(raw, ceiling) : ceiling;
+}
+
+/**
+ * Whether a failed page read was the walk's deadline running out: the
+ * client's own `deadline_exceeded`, or any failure once the clock is past the
+ * deadline (a request cut short by the shortened timeout surfaces as a
+ * timeout or network error first).
+ */
+function isDeadlineHit(err: unknown, now: number, deadlineAt: number): boolean {
+  return (err as { code?: unknown } | null)?.code === 'deadline_exceeded' || now >= deadlineAt;
 }
 
 /** Title order, case- and accent-insensitive; untitled last; id breaks ties. */
@@ -671,36 +724,67 @@ function byTitle(a: ProbeJob, b: ProbeJob): number {
 /**
  * List the tenant's job directory for the mapping picker. Pages `job.list`
  * with no filter (whether the endpoint honours one is unverified), keeps only
- * id/title/status/openedAt per job, withholds confidential jobs, and dedupes
- * by id. Never writes anything, anywhere.
+ * id/title/status/openedAt per job, withholds (and counts) every job not
+ * explicitly non-confidential, and dedupes by id. Never writes anything,
+ * anywhere.
+ *
+ * `caps` may only TIGHTEN a bound: pages, items, and `deadlineAt` (epoch ms,
+ * capped at {@link JOB_DIRECTORY_DEADLINE_MS} from the start). `now` is the
+ * wall clock — injectable for tests; with a real client it must be epoch ms,
+ * because the client compares the threaded `deadlineAt` against `Date.now()`.
  */
 export async function probeJobDirectory(
   reader: JobListReader,
-  caps: { maxPages?: number; maxItems?: number } = {},
+  caps: { maxPages?: number; maxItems?: number; deadlineAt?: number; now?: () => number } = {},
 ): Promise<ProbeJobDirectory> {
   assertReadOnly('job.list');
   const maxPages = tightenCap(caps.maxPages, MAX_JOB_PAGES);
   const maxItems = tightenCap(caps.maxItems, MAX_JOBS);
+  const now = caps.now ?? Date.now;
+  const ownDeadline = now() + JOB_DIRECTORY_DEADLINE_MS;
+  const deadlineAt = typeof caps.deadlineAt === 'number' && Number.isFinite(caps.deadlineAt)
+    ? Math.min(caps.deadlineAt, ownDeadline)
+    : ownDeadline;
 
   const jobs = new Map<string, ProbeJob>();
-  // An id seen confidential ONCE stays withheld, even if a later page (the
-  // directory can shift under a paged read) shows it without the flag.
+  // An id seen withheld ONCE stays withheld, even if a later page (the
+  // directory can shift under a paged read) shows it as `confidential: false`.
   const withheld = new Set<string>();
   const seenCursors = new Set<string>();
   let cursor: string | undefined;
   let truncated = false;
+  let pagesRead = 0;
 
   for (let page = 1; ; page += 1) {
-    const res = await reader.jobList(
-      cursor === undefined ? { limit: JOB_PAGE_SIZE } : { cursor, limit: JOB_PAGE_SIZE },
-    );
+    // ONE budget for the whole walk. Out of time with pages in hand → the
+    // partial list, flagged; out of time with nothing → a failure (502).
+    if (now() >= deadlineAt) {
+      if (pagesRead === 0) throw new Error('ashby_job_directory_deadline');
+      truncated = true;
+      break;
+    }
+    let res: Awaited<ReturnType<JobListReader['jobList']>>;
+    try {
+      res = await reader.jobList(
+        cursor === undefined
+          ? { limit: JOB_PAGE_SIZE, deadlineAt }
+          : { cursor, limit: JOB_PAGE_SIZE, deadlineAt },
+      );
+    } catch (err) {
+      if (pagesRead > 0 && isDeadlineHit(err, now(), deadlineAt)) {
+        truncated = true;
+        break;
+      }
+      throw err;
+    }
+    pagesRead += 1;
     const items: unknown[] = Array.isArray(res.results) ? res.results : [];
     for (const item of items) {
       if (item === null || typeof item !== 'object' || Array.isArray(item)) continue;
       const rec = item as Record<string, unknown>;
       const id = typeof rec.id === 'string' && ID_RE.test(rec.id) ? rec.id : null;
       if (id === null) continue;
-      if (isConfidential(rec.confidential)) {
+      if (!isListable(rec.confidential)) {
         withheld.add(id);
         jobs.delete(id);
         continue;
@@ -728,5 +812,5 @@ export async function probeJobDirectory(
     cursor = next;
   }
 
-  return { jobs: [...jobs.values()].sort(byTitle), truncated };
+  return { jobs: [...jobs.values()].sort(byTitle), truncated, withheld: withheld.size };
 }

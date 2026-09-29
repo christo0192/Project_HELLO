@@ -13,13 +13,15 @@ import { createAshbyMissionControlRouter } from '../routes/ashby-mission-control
 import { setAuditSink, getAuditSink, type AuditEntry } from '../lib/audit.js';
 import { viewerReadOnly } from '../lib/rbac.js';
 import type { MissionControlStore } from '../integrations/ashby/workflow-stores.js';
+import { HELLO_CHRISTY_SCORECARD_BINDING } from '../integrations/ashby/scorecard.js';
 
 const UUID = '11111111-1111-4111-8111-111111111111';
+const ROLE_UUID = '66666666-6666-4666-8666-666666666666';
 
 function fakeStore(over: Partial<MissionControlStore> = {}): MissionControlStore {
   return {
     listMappings: async () => [
-      { id: UUID, externalJobId: 'job_1', status: 'drift', statusReason: 'stage_id_invalid', deliveryMode: 'both', hasAiStage: true, hasTaStage: false, label: null, updatedAt: '2026-08-13T00:00:00Z' },
+      { id: UUID, externalJobId: 'job_1', status: 'drift', statusReason: 'stage_id_invalid', deliveryMode: 'both', hasAiStage: true, hasTaStage: false, label: null, roleId: ROLE_UUID, updatedAt: '2026-08-13T00:00:00Z' },
     ],
     listWorkflows: async () => [
       { applicationLinkId: UUID, externalApplicationId: 'app_1', externalJobId: 'job_1', lifecycle: 'processing', terminalState: null, ingestionState: 'failed_review', operations: [{ id: 'op_1', type: 'stage_move', state: 'failed', errorCode: 'transient_x' }], sessionStatus: 'in_progress', updatedAt: '2026-08-13T00:00:00Z' },
@@ -55,6 +57,8 @@ describe('reads — interviewer+ only', () => {
     expect(m.status).toBe(200);
     expect(m.body.mappings[0]).not.toHaveProperty('email');
     expect(m.body.mappings[0].status).toBe('drift');
+    // The mapping's role travels with it so the page can name the role.
+    expect(m.body.mappings[0].roleId).toBe(ROLE_UUID);
     const w = await request(app).get('/mc/workflows');
     expect(w.status).toBe(200);
     expect(w.body.workflows[0].ingestionState).toBe('failed_review');
@@ -678,6 +682,109 @@ describe('POST /mappings — create-time Hello Christy stage default (owner deci
   });
 });
 
+describe('POST /mappings — create-time Hello Christy feedback-form default', () => {
+  // Pinned as a literal, not imported: the scorecard writer (enqueueScorecardWrite)
+  // refuses every write unless feedback_form_id is EXACTLY this verified form,
+  // so a silent change here must be a deliberate edit of this test too.
+  const HELLO_CHRISTY_FORM = '1c9a92c0-c18f-4bf1-898f-c29e71d7d303';
+  const base = { external_job_id: 'job_1', role_id: UUID, delivery_mode: 'manual' };
+
+  function recordingStore() {
+    const seen: Array<Record<string, unknown>> = [];
+    const store = fakeStore({
+      upsertMapping: async (input) => { seen.push(input as never); return { status: 'ok', id: UUID }; },
+    });
+    return { store, seen };
+  }
+
+  it('a new mapping that names no form gets the verified Hello Christy form, so its scorecards can be written', async () => {
+    expect(HELLO_CHRISTY_SCORECARD_BINDING.verified).toBe(true);
+    expect(HELLO_CHRISTY_SCORECARD_BINDING.formDefinitionId).toBe(HELLO_CHRISTY_FORM);
+    const { store, seen } = recordingStore();
+    const app = appWithDeps('admin', { store, probeReader: null });
+    await request(app).post('/mc/mappings').send(base);
+    await request(app).post('/mc/mappings').send({ ...base, feedback_form_id: '' });
+    await request(app).post('/mc/mappings').send({ ...base, feedback_form_id: null });
+    expect(seen).toHaveLength(3);
+    for (const input of seen) expect(input.feedbackFormId).toBe(HELLO_CHRISTY_FORM);
+  });
+
+  it('honours an explicit valid form id on create', async () => {
+    const { store, seen } = recordingStore();
+    await request(appWithDeps('admin', { store, probeReader: null }))
+      .post('/mc/mappings').send({ ...base, feedback_form_id: 'form_other' });
+    expect(seen[0].feedbackFormId).toBe('form_other');
+  });
+
+  it('never defaults on UPDATE — an absent form id passes through as null', async () => {
+    const { store, seen } = recordingStore();
+    const res = await request(appWithDeps('admin', { store, probeReader: null }))
+      .post('/mc/mappings').send({ ...base, id: UUID });
+    expect(res.status).toBe(201);
+    expect(seen[0].feedbackFormId).toBeNull();
+    expect(JSON.stringify(seen)).not.toContain(HELLO_CHRISTY_FORM);
+  });
+
+  it('does not default while the binding is unverified', async () => {
+    const binding = HELLO_CHRISTY_SCORECARD_BINDING as { verified: boolean };
+    const { store, seen } = recordingStore();
+    binding.verified = false;
+    try {
+      await request(appWithDeps('admin', { store, probeReader: null })).post('/mc/mappings').send(base);
+    } finally {
+      binding.verified = true;
+    }
+    expect(seen[0].feedbackFormId).toBeNull();
+  });
+
+  it('rejects an invalid form id rather than defaulting over it', async () => {
+    const { store, seen } = recordingStore();
+    const res = await request(appWithDeps('admin', { store, probeReader: null }))
+      .post('/mc/mappings').send({ ...base, feedback_form_id: 'bad id with spaces' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toBe('invalid_stage_id');
+    expect(seen).toHaveLength(0);
+  });
+});
+
+describe('POST /mappings — 0109 refusals surface as 409 with their code', () => {
+  const body = { external_job_id: 'job_1', role_id: UUID, delivery_mode: 'manual' };
+
+  it('answers 409 conflict when a create collides with a job that already has a live mapping', async () => {
+    // `conflict` is what the store now returns for the unique violation
+    // (see the store test in ashby-runtime-adapters.test.ts).
+    const upsertMapping = vi.fn(async () => ({ status: 'conflict' }));
+    const res = await request(appWithDeps('admin', { store: fakeStore({ upsertMapping }), probeReader: null }))
+      .post('/mc/mappings').send(body);
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ ok: false, error: 'conflict' });
+    expect(upsertMapping).toHaveBeenCalledTimes(1);
+  });
+
+  it('answers 409 archived when an update is addressed to a deleted mapping', async () => {
+    const upsertMapping = vi.fn(async () => ({ status: 'archived' }));
+    const res = await request(appWithDeps('admin', { store: fakeStore({ upsertMapping }), probeReader: null }))
+      .post('/mc/mappings').send({ ...body, id: UUID });
+    expect(res.status).toBe(409);
+    expect(res.body).toEqual({ ok: false, error: 'archived' });
+  });
+
+  it('audits nothing for a refusal', async () => {
+    const entries: AuditEntry[] = [];
+    const previous = getAuditSink();
+    setAuditSink(async (entry) => { entries.push(entry); });
+    try {
+      const res = await request(appWithDeps('admin', {
+        store: fakeStore({ upsertMapping: async () => ({ status: 'conflict' }) }), probeReader: null,
+      })).post('/mc/mappings').send(body);
+      expect(res.status).toBe(409);
+    } finally {
+      setAuditSink(previous);
+    }
+    expect(entries).toHaveLength(0);
+  });
+});
+
 describe('GET /jobs — read-only job directory for the Add-mapping picker', () => {
   const DIRECTORY = [
     {
@@ -689,15 +796,17 @@ describe('GET /jobs — read-only job directory for the Add-mapping picker', () 
       hiringTeam: [{ email: 'recruiter@example.invalid', firstName: 'Leaky' }],
       customFields: [{ title: 'Comp band', value: 'secret-comp-band' }],
     },
-    { id: 'job_closed', title: 'Analyst', status: 'Closed', openedAt: null },
+    { id: 'job_closed', title: 'Analyst', status: 'Closed', openedAt: null, confidential: false },
     { id: 'job_secret', title: 'Replacement for the CFO', status: 'Open', confidential: true },
+    // No flag at all: fail-closed, so withheld too.
+    { id: 'job_unflagged', title: 'Quiet reorg lead', status: 'Open' },
   ];
 
   function directoryReader(results: unknown = DIRECTORY) {
     return { jobList: vi.fn(async () => ({ results, moreDataAvailable: false })) };
   }
 
-  it('returns the sanitized directory to an admin — four fields per job, confidential withheld', async () => {
+  it('returns the sanitized directory to an admin — four fields per job, confidential withheld and counted', async () => {
     const jobListReader = directoryReader();
     const res = await request(appWithDeps('admin', { store: fakeStore(), jobListReader: jobListReader as never }))
       .get('/mc/jobs');
@@ -709,9 +818,11 @@ describe('GET /jobs — read-only job directory for the Add-mapping picker', () 
         { id: 'job_open', title: 'Senior Engineer', status: 'Open', openedAt: '2026-09-01T10:00:00.000Z' },
       ],
       truncated: false,
+      // job_secret (flagged) and job_unflagged (no flag — fail-closed).
+      withheld: 2,
     });
     const body = JSON.stringify(res.body);
-    for (const leak of ['recruiter@example.invalid', 'Leaky', 'secret-comp-band', 'job_secret', 'Replacement for the CFO']) {
+    for (const leak of ['recruiter@example.invalid', 'Leaky', 'secret-comp-band', 'job_secret', 'Replacement for the CFO', 'job_unflagged', 'Quiet reorg lead']) {
       expect(body, `response must not carry ${leak}`).not.toContain(leak);
     }
     expect(jobListReader.jobList).toHaveBeenCalledTimes(1);
@@ -719,7 +830,7 @@ describe('GET /jobs — read-only job directory for the Add-mapping picker', () 
 
   it('passes a partial walk through as truncated rather than failing', async () => {
     const jobListReader = {
-      jobList: vi.fn(async () => ({ results: [{ id: 'job_1', title: 'A' }], moreDataAvailable: true, nextCursor: 'loop' })),
+      jobList: vi.fn(async () => ({ results: [{ id: 'job_1', title: 'A', confidential: false }], moreDataAvailable: true, nextCursor: 'loop' })),
     };
     const res = await request(appWithDeps('admin', { store: fakeStore(), jobListReader: jobListReader as never }))
       .get('/mc/jobs');
@@ -782,9 +893,9 @@ describe('GET /jobs — read-only job directory for the Add-mapping picker', () 
       setAuditSink(previous);
     }
     expect(entries).toHaveLength(1);
-    expect(entries[0].metadata).toEqual({ resource: 'ashby_jobs', count: 2, truncated: false });
+    expect(entries[0].metadata).toEqual({ resource: 'ashby_jobs', count: 2, truncated: false, withheld: 2 });
     const audited = JSON.stringify(entries[0]);
-    for (const value of ['job_open', 'job_closed', 'job_secret', 'Senior Engineer', 'Analyst', 'Replacement for the CFO']) {
+    for (const value of ['job_open', 'job_closed', 'job_secret', 'job_unflagged', 'Senior Engineer', 'Analyst', 'Replacement for the CFO', 'Quiet reorg lead']) {
       expect(audited, `audit must not carry ${value}`).not.toContain(value);
     }
   });
@@ -811,6 +922,162 @@ describe('GET /jobs — read-only job directory for the Add-mapping picker', () 
     expect(stages.status).toBe(200);
     expect(stages.body.stages).toEqual([{ id: 'stage_ai', title: 'AI' }]);
     expect(jobListReader.jobList).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('GET /jobs — one shared, briefly cached walk (provider-call amplification)', () => {
+  const ONE_JOB = [{ id: 'job_1', title: 'Engineer', status: 'Open', confidential: false }];
+
+  /** A fake wall clock the router and the probe both read. */
+  function fakeClock(start = 1_700_000_000_000) {
+    let t = start;
+    return { now: () => t, advance: (ms: number) => { t += ms; } };
+  }
+
+  function captureAudits() {
+    const entries: AuditEntry[] = [];
+    const previous = getAuditSink();
+    setAuditSink(async (entry) => { entries.push(entry); });
+    return { entries, restore: () => setAuditSink(previous) };
+  }
+
+  it('serves a request inside the 60 s TTL from the cache — one walk, but one audit row per request', async () => {
+    const clock = fakeClock();
+    const jobList = vi.fn(async () => ({ results: ONE_JOB, moreDataAvailable: false }));
+    const audits = captureAudits();
+    try {
+      const app = appWithDeps('admin', { store: fakeStore(), jobListReader: { jobList } as never, now: clock.now });
+      const first = await request(app).get('/mc/jobs');
+      clock.advance(59_999);
+      const second = await request(app).get('/mc/jobs');
+      expect(first.status).toBe(200);
+      expect(second.status).toBe(200);
+      expect(second.body).toEqual(first.body);
+      expect(jobList).toHaveBeenCalledTimes(1);
+    } finally {
+      audits.restore();
+    }
+    const directoryAudits = audits.entries.filter((e) => (e.metadata as Record<string, unknown>)?.resource === 'ashby_jobs');
+    expect(directoryAudits).toHaveLength(2);
+  });
+
+  it('walks the provider again once the TTL has passed', async () => {
+    const clock = fakeClock();
+    const jobList = vi.fn()
+      .mockResolvedValueOnce({ results: ONE_JOB, moreDataAvailable: false })
+      .mockResolvedValueOnce({ results: [...ONE_JOB, { id: 'job_2', title: 'Analyst', confidential: false }], moreDataAvailable: false });
+    const app = appWithDeps('admin', { store: fakeStore(), jobListReader: { jobList } as never, now: clock.now });
+    const first = await request(app).get('/mc/jobs');
+    clock.advance(60_000);
+    const second = await request(app).get('/mc/jobs');
+    expect(jobList).toHaveBeenCalledTimes(2);
+    expect(first.body.jobs).toHaveLength(1);
+    expect(second.body.jobs.map((j: { id: string }) => j.id)).toEqual(['job_2', 'job_1']);
+  });
+
+  it('never caches a failed walk — the very next request reaches the provider again', async () => {
+    const clock = fakeClock();
+    const jobList = vi.fn()
+      .mockRejectedValueOnce(new Error('503 upstream'))
+      .mockResolvedValueOnce({ results: ONE_JOB, moreDataAvailable: false });
+    const app = appWithDeps('admin', { store: fakeStore(), jobListReader: { jobList } as never, now: clock.now });
+    const failed = await request(app).get('/mc/jobs');
+    expect(failed.status).toBe(502);
+    expect(failed.body).toEqual({ ok: false, error: 'probe_unavailable' });
+    const retried = await request(app).get('/mc/jobs');
+    expect(retried.status).toBe(200);
+    expect(retried.body.jobs).toHaveLength(1);
+    expect(jobList).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * An app whose outer middleware counts requests AFTER `next()` returns.
+   * Express dispatches synchronously, so by then the route handler has run up
+   * to its first `await` — i.e. it has either started the walk or joined the
+   * one in flight.
+   */
+  function countingApp(deps: Parameters<typeof createAshbyMissionControlRouter>[0]) {
+    const state = { joined: 0 };
+    const app = express();
+    app.use(express.json());
+    app.use((req: Request, _res: Response, next: NextFunction) => {
+      (req as unknown as { authUser: unknown }).authUser = { id: UUID, appRole: 'admin' };
+      next();
+      state.joined += 1;
+    });
+    app.use('/mc', createAshbyMissionControlRouter(deps));
+    return { app, state };
+  }
+
+  it('shares ONE in-flight walk between concurrent requests (single-flight)', async () => {
+    const clock = fakeClock();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const jobList = vi.fn(async () => { await gate; return { results: ONE_JOB, moreDataAvailable: false }; });
+    const { app, state } = countingApp({ store: fakeStore(), jobListReader: { jobList } as never, now: clock.now });
+
+    const all = Promise.all([request(app).get('/mc/jobs'), request(app).get('/mc/jobs'), request(app).get('/mc/jobs')]);
+    await vi.waitFor(() => expect(state.joined).toBe(3));
+    expect(jobList).toHaveBeenCalledTimes(1);
+    release();
+    const responses = await all;
+    for (const res of responses) {
+      expect(res.status).toBe(200);
+      expect(res.body.jobs).toEqual([{ id: 'job_1', title: 'Engineer', status: 'Open', openedAt: null }]);
+    }
+    expect(jobList).toHaveBeenCalledTimes(1);
+  });
+
+  it('hands a failed shared walk to every waiter as 502, then lets the next request start afresh', async () => {
+    const clock = fakeClock();
+    let fail!: (err: Error) => void;
+    const gate = new Promise<never>((_resolve, reject) => { fail = reject; });
+    const jobList = vi.fn()
+      .mockImplementationOnce(async () => gate)
+      .mockResolvedValueOnce({ results: ONE_JOB, moreDataAvailable: false });
+    const { app, state } = countingApp({ store: fakeStore(), jobListReader: { jobList } as never, now: clock.now });
+
+    const both = Promise.all([request(app).get('/mc/jobs'), request(app).get('/mc/jobs')]);
+    await vi.waitFor(() => expect(state.joined).toBe(2));
+    fail(new Error('403 Forbidden: tenant xyz'));
+    const [a, b] = await both;
+    expect([a.status, b.status]).toEqual([502, 502]);
+    expect(JSON.stringify([a.body, b.body])).not.toContain('tenant xyz');
+    expect(jobList).toHaveBeenCalledTimes(1);
+
+    const after = await request(app).get('/mc/jobs');
+    expect(after.status).toBe(200);
+    expect(jobList).toHaveBeenCalledTimes(2);
+  });
+
+  it('bounds the whole walk by a ~20 s deadline: partial + truncated once a page is in hand', async () => {
+    const clock = fakeClock();
+    // Every page takes 8 s of (fake) wall time; the directory never ends.
+    let page = 0;
+    const jobList = vi.fn(async () => {
+      clock.advance(8_000);
+      page += 1;
+      return { results: [{ id: `job_${page}`, title: `Job ${page}`, confidential: false }], moreDataAvailable: true, nextCursor: `c${page}` };
+    });
+    const res = await request(appWithDeps('admin', { store: fakeStore(), jobListReader: { jobList } as never, now: clock.now }))
+      .get('/mc/jobs');
+    expect(res.status).toBe(200);
+    expect(res.body.truncated).toBe(true);
+    // Pages start at 0 s, 8 s and 16 s; the fourth would start at 24 s.
+    expect(jobList).toHaveBeenCalledTimes(3);
+    expect(res.body.jobs).toHaveLength(3);
+  });
+
+  it('answers 502 when the deadline runs out before the first page arrives', async () => {
+    const clock = fakeClock();
+    const jobList = vi.fn(async () => {
+      clock.advance(21_000);
+      throw Object.assign(new Error('ashby_timeout'), { code: 'deadline_exceeded' });
+    });
+    const res = await request(appWithDeps('admin', { store: fakeStore(), jobListReader: { jobList } as never, now: clock.now }))
+      .get('/mc/jobs');
+    expect(res.status).toBe(502);
+    expect(res.body).toEqual({ ok: false, error: 'probe_unavailable' });
   });
 });
 

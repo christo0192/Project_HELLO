@@ -473,7 +473,9 @@ export class AshbyClient {
   /**
    * One page of the tenant's job directory. Sends no status filter of its own
    * (see {@link JobListParams}); the directory probe pages everything and
-   * decides what to show from what it reads.
+   * decides what to show from what it reads. `deadlineAt` is the probe's
+   * budget for the whole walk, threaded exactly as `applicationListHistory`
+   * threads its own — internal only, never part of the request body.
    */
   async jobList<T = OpaqueRecord[]>(params: JobListParams = {}): Promise<AshbyResult<T>> {
     const body: OpaqueRecord = { ...(params.extra ?? {}) };
@@ -484,7 +486,7 @@ export class AshbyClient {
       if (limit === 0) throw new AshbyError('invalid_request', { code: 'invalid_limit', operation: 'job.list' });
       body.limit = limit;
     }
-    return this.request<T>('job.list', body);
+    return this.request<T>('job.list', body, { deadlineAt: params.deadlineAt });
   }
 
   /** Read the provider's per-application stage history. */

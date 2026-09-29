@@ -5,7 +5,7 @@
  * LoadingPanel, Reveal wrappers and StatusBadge — semantics, keyboard,
  * state and axe.
  */
-import { useMemo, useState } from 'react';
+import { createRef, useMemo, useState } from 'react';
 import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, it, expect, afterEach, vi } from 'vitest';
@@ -366,6 +366,23 @@ describe('Field / TextField / SelectField / TextArea', () => {
     expect(select).toHaveClass('control-select');
     await user.selectOptions(select, 'reject');
     expect(select.value).toBe('reject');
+  });
+
+  it('hands its ref to the native select, so a caller can move focus onto it', () => {
+    const ref = createRef<HTMLSelectElement>();
+    render(
+      <Field label="Job">
+        {(ids) => (
+          <SelectField id={ids.id} ref={ref}>
+            <option value="a">A</option>
+          </SelectField>
+        )}
+      </Field>,
+    );
+    const select = screen.getByLabelText<HTMLSelectElement>('Job');
+    expect(ref.current).toBe(select);
+    ref.current!.focus();
+    expect(select).toHaveFocus();
   });
 
   it('renders a labelled textarea that accepts typing', async () => {

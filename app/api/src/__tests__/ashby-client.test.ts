@@ -417,6 +417,29 @@ describe('endpoint helpers', () => {
     expect(r.nextCursor).toBe('next_1');
   });
 
+  it('job.list honours the walk deadline exactly as application.listHistory does — and never sends it', async () => {
+    // A live deadline: the request goes out, and the deadline is not in the body.
+    const live = makeClient([ok([])]);
+    await live.client.jobList({ limit: 100, deadlineAt: Date.now() + 60_000 });
+    expect(live.calls).toHaveLength(1);
+    expect(JSON.parse(live.calls[0].body)).toEqual({ limit: 100 });
+
+    // A spent deadline: refused before any transport call, with the stable code.
+    const spent = makeClient([ok([])]);
+    await expect(spent.client.jobList({ limit: 100, deadlineAt: Date.now() - 1 }))
+      .rejects.toMatchObject({ category: 'timeout', code: 'deadline_exceeded', operation: 'job.list' });
+    expect(spent.calls).toHaveLength(0);
+
+    // A deadline that runs out mid-retry stops the retry loop instead of
+    // spending the whole attempt budget.
+    const retrying = makeClient([res(503, 'busy'), ok([])], {
+      sleep: async () => { await new Promise((r) => setTimeout(r, 25)); },
+    });
+    await expect(retrying.client.jobList({ limit: 100, deadlineAt: Date.now() + 10 }))
+      .rejects.toMatchObject({ code: 'deadline_exceeded' });
+    expect(retrying.calls).toHaveLength(1);
+  });
+
   it('changeStage validates both ids and posts to the fixed path', async () => {
     const { client, calls } = makeClient([ok({ moved: true })]);
     await client.applicationChangeStage('app_1', 'stage_2');

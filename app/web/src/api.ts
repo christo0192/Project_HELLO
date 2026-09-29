@@ -596,6 +596,10 @@ export const api = {
    * it, so the only way to point a new Ashby job at a HELLO role was a hand
    * -rolled authenticated POST. Enabling stays a separate action, still gated
    * in the database on stage completeness and absence of drift.
+   *
+   * Refusals THROW `ApiError` with the route's code as the message — among
+   * them 409 `conflict` (the job already has a live mapping) and 409
+   * `archived` (an update addressed to a deleted mapping).
    */
   createAshbyMapping: (body: AshbyMappingInput) =>
     request<AshbyMappingCreated>('/api/integrations/ashby/mission-control/mappings', {
@@ -614,7 +618,8 @@ export const api = {
     }),
   /**
    * "Delete" a mapping: the route ARCHIVES it — gone from the list, history
-   * kept, and re-adding the same job later restores it paused. The database
+   * kept and frozen. Adding the same job again later creates a NEW mapping,
+   * paused; the archived one is never brought back. The database
    * refuses an ENABLED mapping (`mapping_enabled`, 409); pause it first.
    * Every refusal throws `ApiError` with the route's code as its message.
    */

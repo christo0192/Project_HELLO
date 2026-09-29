@@ -575,11 +575,11 @@ docker exec "$SUPABASE_DB_CONTAINER" psql -U postgres -d postgres -v ON_ERROR_ST
   -f /tmp/ashby_activation_rollout.sql
 log '0106: PASS — actual migration reapplication fenced an old enabled row at rollout time; fixture rolled back.'
 
-log '0109: Executing mapping archive rules (refuse enabled, keep history, never re-enable, restore on re-add)...'
+log '0109: Executing mapping archive rules (refuse enabled, keep history, frozen, re-add creates a new row)...'
 docker cp app/supabase/tests/ashby_mapping_archive.sql "$SUPABASE_DB_CONTAINER:/tmp/ashby_mapping_archive.sql"
 docker exec "$SUPABASE_DB_CONTAINER" psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
   -f /tmp/ashby_mapping_archive.sql
-log '0109: PASS — archive kept history linked, could not be enabled, and re-add restored the row; fixture rolled back.'
+log '0109: PASS — archive kept history on the frozen row, re-add created a new live row, uniqueness held over live rows; fixture rolled back.'
 
 # ===================================================================
 # GOV-06: First explicit seed re-apply (seed already applied by db reset

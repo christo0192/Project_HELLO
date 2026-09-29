@@ -1335,6 +1335,12 @@ export interface AshbyMcMapping {
   hasAiStage: boolean;
   hasTaStage: boolean;
   label: string | null;
+  /**
+   * The dashboard role this mapping screens for (a role uuid), or null when
+   * it has none. A LOOKUP KEY: the page shows the role's title, never this.
+   * Optional only so an older API that omits it reads as "unknown".
+   */
+  roleId?: string | null;
   updatedAt: string;
 }
 
@@ -1409,11 +1415,14 @@ export interface AshbyJob {
 /**
  * Every status, confidential jobs already removed, sorted by title.
  * `truncated` means Ashby held more jobs than the route will page through.
+ * `withheld` counts the distinct jobs left out because they are confidential
+ * (or not marked non-confidential) — a number only, never which ones.
  */
 export interface AshbyJobsResponse {
   ok: boolean;
   jobs?: AshbyJob[];
   truncated?: boolean;
+  withheld?: number;
   error?: string;
 }
 
@@ -1607,6 +1616,13 @@ export interface AshbyScorecardBindingPreviewResponse {
    */
   scoringPath?: 'v2_autobind' | 'v1_legacy' | 'no_role';
   preview?: AshbyScorecardBindingPreview;
+  /**
+   * Whether THIS MAPPING's feedback form is the verified Hello Christy form.
+   * The scorecard writer refuses every write for a mapping whose form is
+   * anything else, so `false` means no scorecard reaches Ashby whatever the
+   * preview below says. Absent from an older API: unknown, not false.
+   */
+  mappingFormBound?: boolean;
   error?: string;
 }
 

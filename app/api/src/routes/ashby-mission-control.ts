@@ -24,7 +24,8 @@
  *                                    parse-class failed_review ingestion
  *   GET  /jobs                     — admin: read-only job directory for the
  *                                    "Add mapping" picker (id/title/status/
- *                                    openedAt only; confidential jobs withheld)
+ *                                    openedAt only; confidential jobs withheld
+ *                                    and counted; single-flight + 60 s cache)
  *   GET  /jobs/:externalJobId/stages         — admin: read-only stage discovery
  *   GET  /jobs/:externalJobId/feedback-form  — admin: read-only feedback-form
  *                                    SCHEMA discovery (ids/labels/types/scales;
@@ -53,6 +54,7 @@ import {
   probeJobDirectory,
   type FormDefinitionReader,
   type JobListReader,
+  type ProbeJobDirectory,
 } from '../integrations/ashby/probe.js';
 import { HELLO_CHRISTY_SCREENING_STAGE_ID } from '../integrations/ashby/screening-stage.js';
 import { createAshbyProbeClient } from '../integrations/ashby/runtime.js';
@@ -106,6 +108,8 @@ function sanitizedReason(raw: unknown): string | null {
 const DELIVERY_MODES = new Set(['email', 'manual', 'both']);
 const OPAQUE_ID_RE = /^[A-Za-z0-9_.:-]{1,256}$/;
 const MAX_LABEL_LEN = 120;
+/** How long one successful job-directory walk serves every admin. */
+const JOB_DIRECTORY_TTL_MS = 60_000;
 
 /** Validate an optional opaque tenant id. `null` when absent, `false` when bad. */
 function optionalOpaqueId(raw: unknown): string | null | false {
@@ -136,15 +140,26 @@ export interface AshbyMissionControlDeps {
    */
   jobListReader?: JobListReader | null;
   /**
-   * Injected role/metric lookups for the binding preview (tests). Production
-   * reads the mapping's role and the role's ACTIVE scorecard version.
+   * Injected mapping/metric lookups for the binding preview (tests).
+   * Production reads the mapping's role and feedback form in one row read,
+   * and the role's ACTIVE scorecard version.
    */
   scorecardPreview?: {
-    /** `undefined` = mapping not found; `null` = mapping has no role. */
-    readMappingRoleId(mappingId: string): Promise<string | null | undefined>;
+    /**
+     * `undefined` = mapping not found. `roleId: null` = the mapping has no
+     * role; `feedbackFormId: null` = it names no feedback form.
+     */
+    readMapping(mappingId: string): Promise<{ roleId: string | null; feedbackFormId: string | null } | undefined>;
     /** `null` = the role has no active v2 scorecard (v1 legacy path). */
     loadMetrics(roleId: string): Promise<MetricToBind[] | null>;
   };
+  /**
+   * Wall clock in epoch milliseconds (tests inject a fake). Drives the job
+   * directory's cache TTL and the directory walk's overall deadline — which
+   * a real Ashby client compares against `Date.now()`, so a fake clock is
+   * only meaningful with a fake reader.
+   */
+  now?: () => number;
   /** Injected last-reconciliation-pass snapshot for deterministic health tests. */
   reconcilePass?: () => ReturnType<typeof snapshotReconcilePass>;
   /** Injected config sources for deterministic health tests. */
@@ -218,23 +233,61 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     return resolveProbeClient();
   };
   const scorecardPreview = deps.scorecardPreview ?? {
-    async readMappingRoleId(mappingId: string): Promise<string | null | undefined> {
+    async readMapping(mappingId: string): Promise<{ roleId: string | null; feedbackFormId: string | null } | undefined> {
       const { data, error } = await supabase
         .from('ashby_job_mappings')
-        .select('role_id')
+        .select('role_id, feedback_form_id')
         .eq('id', mappingId)
         .eq('provider', 'ashby')
         .maybeSingle();
       if (error) throw new Error('ashby_mc_mapping_role_error');
       if (!data) return undefined;
-      const roleId = (data as { role_id?: string | null }).role_id ?? null;
-      return typeof roleId === 'string' && UUID_RE.test(roleId) ? roleId : null;
+      const row = data as { role_id?: unknown; feedback_form_id?: unknown };
+      return {
+        roleId: typeof row.role_id === 'string' && UUID_RE.test(row.role_id) ? row.role_id : null,
+        feedbackFormId: typeof row.feedback_form_id === 'string' && row.feedback_form_id.length > 0
+          ? row.feedback_form_id
+          : null,
+      };
     },
     async loadMetrics(roleId: string): Promise<MetricToBind[] | null> {
       const version = await loadActiveRoleScorecard(supabase as never, roleId);
       if (!version) return null;
       return version.metrics.map((m) => ({ key: m.key, name: m.name }));
     },
+  };
+
+  // ── Job-directory cache (one per router) ──────────────────────────────────
+  // Every open of the "Add mapping" dialog — and every "Try again" — would
+  // otherwise re-walk up to 20 pages of `job.list` against the tenant's rate
+  // limit, once per admin, concurrently. The directory is tenant-wide (no
+  // per-admin filter), so one walk can serve everyone for a short window:
+  //  * single-flight — concurrent requests share the ONE in-flight walk;
+  //  * a successful walk (partial ones included) is reused for 60 s;
+  //  * a FAILED walk is never cached — the next request simply tries again.
+  // The audit row stays per request, cache hit or not.
+  const now = deps.now ?? Date.now;
+  let directoryCache: { at: number; value: ProbeJobDirectory } | null = null;
+  let directoryInFlight: Promise<ProbeJobDirectory> | null = null;
+  const readJobDirectory = (reader: JobListReader): Promise<ProbeJobDirectory> => {
+    if (directoryCache) {
+      const age = now() - directoryCache.at;
+      // A clock that stepped backwards expires the entry rather than
+      // stretching it.
+      if (age >= 0 && age < JOB_DIRECTORY_TTL_MS) return Promise.resolve(directoryCache.value);
+    }
+    if (directoryInFlight) return directoryInFlight;
+    const flight = probeJobDirectory(reader, { now }).then((value) => {
+      directoryCache = { at: now(), value };
+      return value;
+    });
+    directoryInFlight = flight;
+    // Clear the slot on either outcome. Its own rejection is observed by the
+    // requests awaiting `flight`; this derived chain swallows it so it is
+    // never reported as unhandled.
+    const release = (): void => { if (directoryInFlight === flight) directoryInFlight = null; };
+    flight.then(release, release);
+    return flight;
   };
 
   // ── Reads (interviewer+) ──────────────────────────────────────────────────
@@ -289,8 +342,9 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
   // it can never be enabled again (0109). An ENABLED mapping is refused with
   // 409 `mapping_enabled` — pause first — so live screening is never switched
   // off by one click. A repeat is idempotent (200, already_archived: true).
-  // Adding the same Ashby job again through POST /mappings restores the row,
-  // paused. Viewers are already refused non-GET verbs by the global
+  // Adding the same Ashby job again through POST /mappings creates a NEW,
+  // paused mapping; the archived one stays frozen with the history it ran
+  // under. Viewers are already refused non-GET verbs by the global
   // viewer-read-only middleware, exactly as for /pause.
   router.post('/mappings/:id/archive', requireRole('admin'), async (req: Request, res: Response) => {
     const id = req.params.id;
@@ -504,6 +558,19 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     const isCreate = id === null;
     const aiStage = ai === null && isCreate ? HELLO_CHRISTY_SCREENING_STAGE_ID : ai;
     const taStage = ta === null && isCreate ? HELLO_CHRISTY_SCREENING_STAGE_ID : ta;
+    // The same create-only rule for the feedback form. The scorecard writer
+    // (enqueueScorecardWrite in workflow-stores.ts) refuses every write unless
+    // the mapping's feedback_form_id is EXACTLY the verified Hello Christy
+    // form, so a dialog-created mapping without it would screen candidates
+    // and never write one scorecard back to Ashby. Only a VERIFIED binding is
+    // ever defaulted in; an explicit valid id is honoured. On UPDATE nothing
+    // is defaulted: the value is passed as given — and note the RPC does NOT
+    // coalesce this column as it does the stage ids, so an update that omits
+    // it clears the stored form.
+    const formDefault = HELLO_CHRISTY_SCORECARD_BINDING.verified
+      ? HELLO_CHRISTY_SCORECARD_BINDING.formDefinitionId ?? null
+      : null;
+    const feedbackForm = form === null && isCreate ? formDefault : form;
     const rawLabel = body.label;
     if (rawLabel !== undefined && rawLabel !== null
         && (typeof rawLabel !== 'string' || rawLabel.length > MAX_LABEL_LEN)) {
@@ -519,7 +586,7 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
         deliveryMode: deliveryMode as 'email' | 'manual' | 'both',
         aiScreeningStageId: aiStage,
         taScreeningStageId: taStage,
-        feedbackFormId: form,
+        feedbackFormId: feedbackForm,
         interviewId: interview,
         attributionUserId: attribution,
         label: typeof rawLabel === 'string' ? rawLabel : null,
@@ -532,6 +599,9 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
         res.status(201).json({ ok: true, id: result.id, status: 'paused' });
         return;
       }
+      // Every refusal is a 409 with its code — notably `conflict` (a create
+      // for a job that already has a LIVE mapping; the store maps the unique
+      // violation) and `archived` (an update addressed to a deleted mapping).
       res.status(409).json({ ok: false, error: result.status });
     } catch {
       res.status(500).json({ ok: false, error: 'mission_control_action_error' });
@@ -541,10 +611,13 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
   // ── Read-only Ashby job directory (admin) ─────────────────────────────────
   // The source of the "Add mapping" picker: live jobs by NAME, so an admin
   // never pastes an opaque job id. One allowlisted READ (`job.list`), paged
-  // and bounded, returning id/title/status/openedAt per job with confidential
-  // jobs withheld (see probeJobDirectory). It writes nothing — the admin still
+  // and bounded — pages, items and a ~20 s overall deadline — returning
+  // id/title/status/openedAt per job. Confidential jobs are withheld FAIL-
+  // CLOSED (only an explicit `confidential: false` is listed) and counted in
+  // `withheld` (see probeJobDirectory). It writes nothing — the admin still
   // creates the mapping through POST /mappings. `truncated` means a bound
-  // stopped the walk and the list is partial, not that the read failed.
+  // stopped the walk and the list is partial, not that the read failed. The
+  // walk is shared and briefly cached per router (see readJobDirectory).
   //
   // Registered ahead of the `/jobs/:externalJobId/...` probes. Order is not
   // what keeps them apart — Express matches `/jobs` exactly and every
@@ -557,16 +630,17 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
       res.status(503).json({ ok: false, error: 'integration_disabled' }); return;
     }
     try {
-      const result = await probeJobDirectory(reader);
+      const result = await readJobDirectory(reader);
       // COUNTS only. A job id is tenant configuration and a job title can
       // itself be sensitive; neither belongs in an audit row or a log.
       await recordAudit(req, 'resource.read', 200, {
-        metadata: { resource: 'ashby_jobs', count: result.jobs.length, truncated: result.truncated },
+        metadata: { resource: 'ashby_jobs', count: result.jobs.length, truncated: result.truncated, withheld: result.withheld },
       });
-      res.json({ ok: true, jobs: result.jobs, truncated: result.truncated });
+      res.json({ ok: true, jobs: result.jobs, truncated: result.truncated, withheld: result.withheld });
     } catch {
-      // A tenant 401/403 (e.g. a key without `jobsRead`) or an unparseable
-      // body is a sanitized capability failure. Never echo the provider body.
+      // A tenant 401/403 (e.g. a key without `jobsRead`), an unparseable
+      // body, or a deadline hit before any page arrived is a sanitized
+      // capability failure. Never echo the provider body.
       res.status(502).json({ ok: false, error: 'probe_unavailable' });
     }
   });
@@ -661,11 +735,18 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
       res.status(409).json({ ok: false, error: 'binding_unverified' }); return;
     }
 
-    let roleId: string | null | undefined;
+    let roleId: string | null;
+    let mappingFormBound: boolean;
     let metrics: MetricToBind[] | null;
     try {
-      roleId = await scorecardPreview.readMappingRoleId(id);
-      if (roleId === undefined) { res.status(404).json({ ok: false, error: 'mapping_not_found' }); return; }
+      const mapping = await scorecardPreview.readMapping(id);
+      if (mapping === undefined) { res.status(404).json({ ok: false, error: 'mapping_not_found' }); return; }
+      roleId = mapping.roleId;
+      // The scorecard writer refuses every write for a mapping whose
+      // feedback_form_id is not exactly the verified form (see
+      // enqueueScorecardWrite). A preview that said "ready" for such a
+      // mapping would be a promise the writer never keeps, so say it here.
+      mappingFormBound = mapping.feedbackFormId === formDefinitionId;
       metrics = roleId ? await scorecardPreview.loadMetrics(roleId) : null;
     } catch {
       res.status(500).json({ ok: false, error: 'mission_control_read_error' }); return;
@@ -690,9 +771,10 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
           metric_count: preview.metrics.length,
           bound_count: preview.metrics.filter((m) => m.status === 'bound').length,
           ready: preview.ready,
+          mapping_form_bound: mappingFormBound,
         },
       });
-      res.json({ ok: true, scoringPath, preview });
+      res.json({ ok: true, scoringPath, mappingFormBound, preview });
     } catch {
       // A tenant 401/403/404 or an unparseable body is a sanitized capability
       // failure. Never echo the provider body.
