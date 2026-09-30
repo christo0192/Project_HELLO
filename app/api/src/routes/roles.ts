@@ -443,7 +443,7 @@ rolesRouter.delete(
         error: {
           type: 'conflict',
           message:
-            'This role is mapped to an Ashby job. Remove the mapping in Ashby Mission Control first.',
+            'This agent is mapped to an Ashby job. Remove the mapping in Ashby Live Jobs first.',
         },
       });
     }

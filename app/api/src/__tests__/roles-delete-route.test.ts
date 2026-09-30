@@ -224,7 +224,9 @@ describe('DELETE /api/roles/:id', () => {
     scenario.mappings = 1;
     const res = await del();
     expect(res.status).toBe(409);
-    expect(res.body.error.message).toMatch(/Ashby Mission Control/);
+    // Names the screen by its user-facing name (renamed from "Ashby Mission Control").
+    expect(res.body.error.message).toMatch(/Ashby Live Jobs/);
+    expect(res.body.error.message).not.toMatch(/Mission Control/);
     expect(touched.some((t) => t.table === 'roles' && t.op !== 'select')).toBe(false);
   });
 
