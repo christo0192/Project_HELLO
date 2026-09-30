@@ -30,6 +30,11 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 import type { RefObject } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
+import {
+  roleFilterOptions,
+  shouldResetRoleFilter,
+  useMappedRoleIds,
+} from "../lib/mapped-roles";
 import type { Candidate, Role } from "../types";
 import type { CandidateFilters } from "../components/talent";
 import { CandidateButton } from "../components/design/candidate";
@@ -413,6 +418,23 @@ export function CandidatesPage() {
     [applyFilters],
   );
 
+  // The role filter lists only roles with an Ashby job mapping (live, paused
+  // or drift), by role title (owner decision, M008), or every role when the
+  // mappings cannot be read. A role in the URL that is not offered falls back
+  // to "All roles": REPLACING the history entry, so Back does not return to a
+  // filter the control cannot show.
+  const mappedRoles = useMappedRoleIds();
+  const roleOptions = useMemo(
+    () => roleFilterOptions(roles, mappedRoles, roleId),
+    [roles, mappedRoles, roleId],
+  );
+  const resetRole = shouldResetRoleFilter(roleId, mappedRoles, rolesLoaded, roleOptions);
+  useEffect(() => {
+    if (!resetRole) return;
+    setSearchParams(buildCandidateSearch({ ...filters, roleId: null }), { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resetRole, filterKey, setSearchParams]);
+
   const clearFilters = useCallback(() => {
     setSearchParams(new URLSearchParams());
   }, [setSearchParams]);
@@ -550,9 +572,9 @@ export function CandidatesPage() {
                 className="w-full"
               >
                 <option value="">All roles</option>
-                {roles.map((r) => (
-                  <option key={r.id} value={r.id}>
-                    {r.title}
+                {roleOptions.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.label}
                   </option>
                 ))}
               </SelectField>

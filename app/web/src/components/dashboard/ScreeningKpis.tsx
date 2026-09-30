@@ -42,7 +42,7 @@ import type { MetricItem } from '../design/MetricStrip';
 import { LineChart } from '../charts';
 import { formatDayLabel, formatDayTime } from '../charts/dates';
 import { buildRateSeries, pct, pctLabel } from './rates';
-import { uniqueAgentLabels } from '../../lib/role-label';
+import { roleFilterOptions, shouldResetRoleFilter, useMappedRoleIds } from '../../lib/mapped-roles';
 
 /** Selectable trailing windows. 30 is the default the endpoint already uses. */
 const RANGE_OPTIONS = [
@@ -75,12 +75,25 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
   // in and this never fires.
   const [loadedRoles, setLoadedRoles] = useState<Role[]>([]);
   const roles = rolesProp ?? loadedRoles;
-  // The filter NAMES each role by its agent (owner request), falling back to
-  // the title for a role without one. Two roles can share a label (two
-  // "Sales Program Advisor"s exist today), so exact duplicates are numbered;
-  // the option VALUE stays the role id, so the filter itself never changes.
-  const agentLabels = useMemo(() => uniqueAgentLabels(roles), [roles]);
+  const [rolesLoadedFromApi, setRolesLoadedFromApi] = useState(false);
+  const rolesLoaded = rolesProp !== undefined || rolesLoadedFromApi;
   const [roleId, setRoleId] = useState<string>('');
+  // The filter is ROLE-wise (owner decision, M008): it lists only the roles
+  // with an Ashby job mapping (live, paused or drift), each named by its
+  // role title, with same-titled roles told apart (see `uniqueRoleLabels`).
+  // If the mappings cannot be read it lists every role instead. The option
+  // VALUE stays the role id, so the filter itself never changes.
+  const mappedRoles = useMappedRoleIds();
+  const roleOptions = useMemo(
+    () => roleFilterOptions(roles, mappedRoles, roleId),
+    [roles, mappedRoles, roleId],
+  );
+  // A selection that is not (or no longer) offered falls back to "All roles"
+  // rather than filtering on a role the control cannot show.
+  const resetRole = shouldResetRoleFilter(roleId, mappedRoles, rolesLoaded, roleOptions);
+  useEffect(() => {
+    if (resetRole) setRoleId('');
+  }, [resetRole]);
   const [data, setData] = useState<FunnelSummaryResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -138,7 +151,11 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
     let cancelled = false;
     void api
       .listRoles()
-      .then((rs) => { if (!cancelled) setLoadedRoles(rs); })
+      .then((rs) => {
+        if (cancelled) return;
+        setLoadedRoles(rs);
+        setRolesLoadedFromApi(true);
+      })
       // A missing role filter is a degraded control, never a broken panel.
       .catch(() => { if (!cancelled) setLoadedRoles([]); });
     return () => { cancelled = true; };
@@ -356,16 +373,16 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
         <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
           {roles.length > 0 && (
             <label className="block w-full sm:w-56">
-              <span className="sr-only">Filter by agent</span>
+              <span className="sr-only">Filter by role</span>
               <select
                 value={roleId}
                 onChange={(e) => setRoleId(e.target.value)}
                 className={cx(controlClass, 'control-select h-11 text-label')}
               >
-                <option value="">All agents</option>
-                {roles.map((r) => (
-                  <option key={r.id} value={r.id}>
-                    {agentLabels.get(r.id) ?? r.title}
+                <option value="">All roles</option>
+                {roleOptions.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.label}
                   </option>
                 ))}
               </select>

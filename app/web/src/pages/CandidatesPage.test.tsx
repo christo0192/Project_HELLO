@@ -6,8 +6,8 @@
  * keyboard/axe.
  */
 
-import { render, screen, fireEvent, within } from '@testing-library/react';
-import { MemoryRouter } from 'react-router-dom';
+import { render, screen, fireEvent, within, waitFor } from '@testing-library/react';
+import { MemoryRouter, useLocation } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import type { ReactNode } from 'react';
 import { CandidatesPage } from './CandidatesPage';
@@ -20,6 +20,8 @@ const mockApi = {
   uploadResume: vi.fn(),
   // See EMPTY_FUNNEL_TOTALS: the per-role pipeline chart calls this on mount.
   getScreeningFunnel: vi.fn(),
+  // The role filter lists only roles with an Ashby mapping (any status).
+  listAshbyMappings: vi.fn(),
 };
 
 vi.mock('../api', () => ({
@@ -28,6 +30,7 @@ vi.mock('../api', () => ({
     listCandidates: (...args: any[]) => mockApi.listCandidates(...args),
     uploadResume: (...args: any[]) => mockApi.uploadResume(...args),
     getScreeningFunnel: (...args: any[]) => mockApi.getScreeningFunnel(...args),
+    listAshbyMappings: (...args: any[]) => mockApi.listAshbyMappings(...args),
     startLiveKitScreening: vi.fn().mockRejectedValue(new Error('mock')),
   },
   ApiError: class extends Error {
@@ -65,6 +68,38 @@ function renderPage(entry = '/candidates', ui: ReactNode = <CandidatesPage />) {
   return render(<MemoryRouter initialEntries={[entry]}>{ui}</MemoryRouter>);
 }
 
+/** Any API failure: the mappings read treats every error the same way. */
+class FakeApiError extends Error {
+  status: number;
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
+/** An Ashby job mapping for `roleId`; any status counts as mapped. */
+function mapping(roleId: string | null, status: 'enabled' | 'paused' | 'drift' = 'enabled') {
+  return {
+    id: `m-${roleId ?? 'none'}-${status}`, externalJobId: `job-${roleId ?? 'none'}`, status,
+    statusReason: null, deliveryMode: 'email', hasAiStage: true, hasTaStage: true,
+    label: null, roleId, updatedAt: '2026-09-16T06:00:00Z',
+  };
+}
+
+function LocationProbe() {
+  return <output data-testid="location">{useLocation().search}</output>;
+}
+
+/** The page plus a readout of the current query string. */
+function withLocation(): ReactNode {
+  return (
+    <>
+      <CandidatesPage />
+      <LocationProbe />
+    </>
+  );
+}
+
 /**
  * Each row's cell under the column headed `name`, keyed by the candidate's
  * name. POSITIONAL on purpose: the Agent and Role columns can both show "—",
@@ -87,6 +122,7 @@ describe('CandidatesPage', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockApi.listRoles.mockResolvedValue([mockRole]);
+    mockApi.listAshbyMappings.mockResolvedValue({ ok: true, mappings: [mapping(mockRole.id)] });
     mockApi.listCandidates.mockResolvedValue(CANDIDATES);
     mockApi.getScreeningFunnel.mockResolvedValue({ totals: EMPTY_FUNNEL_TOTALS });
   });
@@ -159,6 +195,133 @@ describe('CandidatesPage', () => {
     renderPage();
     expect(await screen.findByLabelText('Filter by role')).toBeInTheDocument();
     expect(screen.getByText('All roles')).toBeInTheDocument();
+  });
+
+  // ── Role filter: mapped roles only (M008) ─────────────────────────────
+
+  it('lists a LIVE role and a PAUSED-only role, never an UNMAPPED one — by title, sorted, values = ids', async () => {
+    mockApi.listRoles.mockResolvedValue([
+      { ...mockRole, agent_name: 'Gopu' }, // role-1, Senior Frontend Engineer
+      { ...mockRole, id: 'role-2', title: 'Backend Engineer' },
+      { ...mockRole, id: 'role-3', title: 'Paused Role' },
+      { ...mockRole, id: 'role-4', title: 'Drifted Role' },
+      { ...mockRole, id: 'role-5', title: 'Unmapped Role' },
+    ]);
+    mockApi.listAshbyMappings.mockResolvedValue({
+      ok: true,
+      mappings: [
+        mapping('role-1'), // live
+        mapping('role-2'), // live
+        mapping('role-3', 'paused'), // paused-only
+        mapping('role-4', 'drift'),
+        mapping(null),
+      ],
+    });
+    renderPage();
+    const select = (await screen.findByLabelText('Filter by role')) as HTMLSelectElement;
+    await within(select).findByRole('option', { name: 'Paused Role' });
+    const options = Array.from(select.options);
+    expect(options.map((o) => o.textContent)).toEqual([
+      'All roles',
+      'Backend Engineer',
+      'Drifted Role',
+      'Paused Role',
+      'Senior Frontend Engineer',
+    ]);
+    expect(options.map((o) => o.value)).toEqual(['', 'role-2', 'role-4', 'role-3', 'role-1']);
+    expect(within(select).queryByRole('option', { name: 'Unmapped Role' })).not.toBeInTheDocument();
+  });
+
+  it('tells same-titled mapped roles apart as "Title — Agent", then by number', async () => {
+    mockApi.listRoles.mockResolvedValue([
+      { ...mockRole, id: 'r1', title: 'Sales Program Advisor', agent_name: 'Gopu' },
+      { ...mockRole, id: 'r2', title: 'Sales Program Advisor', agent_name: 'Meera' },
+      { ...mockRole, id: 'r3', title: 'Support', agent_name: null },
+      { ...mockRole, id: 'r4', title: 'Support' },
+    ]);
+    mockApi.listAshbyMappings.mockResolvedValue({
+      ok: true,
+      mappings: [mapping('r1'), mapping('r2', 'paused'), mapping('r3', 'drift'), mapping('r4')],
+    });
+    renderPage();
+    const select = (await screen.findByLabelText('Filter by role')) as HTMLSelectElement;
+    await within(select).findByRole('option', { name: 'Support' });
+    expect(Array.from(select.options).map((o) => [o.textContent, o.value])).toEqual([
+      ['All roles', ''],
+      ['Sales Program Advisor — Gopu', 'r1'],
+      ['Sales Program Advisor — Meera', 'r2'],
+      ['Support', 'r3'],
+      ['Support · 2', 'r4'],
+    ]);
+
+    // Picking an option still filters on the role ID.
+    fireEvent.change(select, { target: { value: 'r4' } });
+    await waitFor(() => expect(mockApi.listCandidates).toHaveBeenLastCalledWith('r4'));
+  });
+
+  it.each([
+    ['403', () => new FakeApiError('forbidden', 403)],
+    ['503', () => new FakeApiError('ashby_disabled', 503)],
+    ['network', () => new TypeError('Failed to fetch')],
+  ])('falls back to EVERY role when the mappings read fails (%s)', async (_why, makeError) => {
+    mockApi.listRoles.mockResolvedValue([
+      mockRole,
+      { ...mockRole, id: 'role-2', title: 'Backend Engineer' },
+    ]);
+    mockApi.listAshbyMappings.mockRejectedValue(makeError());
+    renderPage();
+    const select = (await screen.findByLabelText('Filter by role')) as HTMLSelectElement;
+    await within(select).findByRole('option', { name: 'Backend Engineer' });
+    expect(Array.from(select.options).map((o) => o.textContent)).toEqual([
+      'All roles',
+      'Backend Engineer',
+      'Senior Frontend Engineer',
+    ]);
+  });
+
+  it('falls back to "All roles" when the URL selects a role with no mapping', async () => {
+    mockApi.listRoles.mockResolvedValue([
+      mockRole,
+      { ...mockRole, id: 'role-2', title: 'Backend Engineer' },
+    ]);
+    mockApi.listAshbyMappings.mockResolvedValue({
+      ok: true,
+      mappings: [mapping('role-1'), mapping(null, 'paused')],
+    });
+    renderPage('/candidates?role=role-2&status=screened', withLocation());
+    const select = (await screen.findByLabelText('Filter by role')) as HTMLSelectElement;
+    await waitFor(() => expect(screen.getByTestId('location').textContent).toBe('?status=screened'));
+    expect(select.value).toBe('');
+    // The list re-reads unscoped; the other filters survive.
+    await waitFor(() => expect(mockApi.listCandidates).toHaveBeenLastCalledWith(undefined));
+    expect(screen.queryByText('Role: Backend Engineer')).not.toBeInTheDocument();
+  });
+
+  it('keeps a URL role whose only mapping is PAUSED', async () => {
+    mockApi.listRoles.mockResolvedValue([
+      mockRole,
+      { ...mockRole, id: 'role-2', title: 'Backend Engineer' },
+    ]);
+    mockApi.listAshbyMappings.mockResolvedValue({ ok: true, mappings: [mapping('role-2', 'paused')] });
+    renderPage('/candidates?role=role-2', withLocation());
+    const select = (await screen.findByLabelText('Filter by role')) as HTMLSelectElement;
+    await within(select).findByRole('option', { name: 'Backend Engineer' });
+    expect(select.value).toBe('role-2');
+    expect(screen.getByTestId('location').textContent).toBe('?role=role-2');
+    expect(mockApi.listCandidates).toHaveBeenLastCalledWith('role-2');
+  });
+
+  it('keeps a URL role when the mappings read fails — a failed read is not a verdict', async () => {
+    mockApi.listRoles.mockResolvedValue([
+      mockRole,
+      { ...mockRole, id: 'role-2', title: 'Backend Engineer' },
+    ]);
+    mockApi.listAshbyMappings.mockRejectedValue(new FakeApiError('forbidden', 403));
+    renderPage('/candidates?role=role-2', withLocation());
+    const select = (await screen.findByLabelText('Filter by role')) as HTMLSelectElement;
+    await within(select).findByRole('option', { name: 'Backend Engineer' });
+    expect(select.value).toBe('role-2');
+    expect(screen.getByTestId('location').textContent).toBe('?role=role-2');
   });
 
   it('applies a status filter from the URL (deep link)', async () => {
@@ -550,6 +713,7 @@ describe('CandidatesPage table columns', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mockApi.listRoles.mockResolvedValue([mockRole]);
+    mockApi.listAshbyMappings.mockResolvedValue({ ok: true, mappings: [mapping(mockRole.id)] });
     mockApi.listCandidates.mockResolvedValue(CANDIDATES);
     mockApi.getScreeningFunnel.mockResolvedValue({ totals: EMPTY_FUNNEL_TOTALS });
   });
