@@ -153,6 +153,9 @@ describe('AshbyWorkflowCard — accessible, colour-independent status', () => {
     expect(screen.queryAllByRole('textbox')).toHaveLength(0);
     expect(document.querySelectorAll('button, a, input, select, textarea')).toHaveLength(0);
     expect(document.body.textContent).toMatch(/read-only status/i);
+    // Points at the page by its current name (renamed from "Ashby Mission Control").
+    expect(document.body.textContent).toContain('Screening actions live in Ashby Live Jobs.');
+    expect(document.body.textContent).not.toMatch(/Ashby Mission Control/);
   });
 
   it('has no axe violations', async () => {

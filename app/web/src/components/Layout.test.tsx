@@ -4,8 +4,8 @@
  * Covers:
  *   - Landmarks (aside, nav, main) + skip link (WCAG 2.4.1)
  *   - Brand: authorized IK logo on neutral plate + HELLO wordmark
- *   - Navigation: Workspace (Dashboard/Candidates/Roles) + admin-only
- *     Ashby Mission Control (directly above) and Mission Control under
+ *   - Navigation: Workspace (Dashboard/Candidates/Agents) + admin-only
+ *     Ashby Live Jobs (directly above) and Mission Control under
  *     Operations
  *   - Role gating: non-admins never see either Mission Control
  *   - API health status display (online / maintenance / offline)
@@ -107,18 +107,23 @@ describe('Layout shell', () => {
     expect(getByText('Recruiting workspace')).toBeInTheDocument();
   });
 
-  it('renders Workspace nav: Dashboard, Candidates, Roles', () => {
+  it('renders Workspace nav: Dashboard, Candidates, Agents', () => {
     renderLayout();
     expect(screen.getByRole('link', { name: /^Dashboard$/ })).toBeInTheDocument();
     expect(screen.getByRole('link', { name: /^Candidates$/ })).toBeInTheDocument();
-    expect(screen.getByRole('link', { name: /^Roles$/ })).toBeInTheDocument();
+    // Renamed from "Roles" (owner request); the route stays /roles.
+    expect(screen.getByRole('link', { name: /^Agents$/ })).toHaveAttribute('href', '/roles');
+    expect(screen.queryByRole('link', { name: /^Roles$/ })).toBeNull();
   });
 
-  // Exact names throughout: "Ashby Mission Control" also contains "Mission
-  // Control", so a loose /Mission Control/ would match both links and could
-  // never tell one from the other.
+  it('titles the top bar "Agents" on /roles', () => {
+    expect(pageTitleFor('/roles')).toBe('Agents');
+  });
+
+  // Exact names throughout, so the Ashby link ("Ashby Live Jobs", formerly
+  // "Ashby Mission Control") and Mission Control can never be confused.
   const MISSION_CONTROL = { name: /^Mission Control$/ };
-  const ASHBY_MISSION_CONTROL = { name: /^Ashby Mission Control$/ };
+  const ASHBY_MISSION_CONTROL = { name: /^Ashby Live Jobs$/ };
 
   it('renders Mission Control under Operations for admins only', () => {
     renderLayout();
@@ -132,7 +137,7 @@ describe('Layout shell', () => {
     expect(screen.queryByRole('link', MISSION_CONTROL)).not.toBeInTheDocument();
   });
 
-  it('renders Ashby Mission Control under Operations for an admin, pointing at its route', () => {
+  it('renders Ashby Live Jobs under Operations for an admin, pointing at its route', () => {
     renderLayout();
     const operations = screen.getByRole('group', { name: 'Operations' });
     const link = within(operations).getByRole('link', ASHBY_MISSION_CONTROL);
@@ -143,23 +148,23 @@ describe('Layout shell', () => {
     expect(svg).toHaveAttribute('stroke', 'currentColor');
   });
 
-  it('orders Ashby Mission Control directly above Mission Control', () => {
+  it('orders Ashby Live Jobs directly above Mission Control', () => {
     renderLayout();
     const operations = screen.getByRole('group', { name: 'Operations' });
     const names = within(operations)
       .getAllByRole('link')
       .map((link) => link.textContent);
-    expect(names).toEqual(['Ashby Mission Control', 'Mission Control', 'Phone calendar']);
+    expect(names).toEqual(['Ashby Live Jobs', 'Mission Control', 'Phone calendar']);
   });
 
-  it('marks Ashby Mission Control active on its own route, and not Mission Control', () => {
+  it('marks Ashby Live Jobs active on its own route, and not Mission Control', () => {
     renderLayout('/ashby-mission-control');
     expect(screen.getByRole('link', ASHBY_MISSION_CONTROL)).toHaveAttribute('aria-current', 'page');
     expect(screen.getByRole('link', MISSION_CONTROL)).not.toHaveAttribute('aria-current');
   });
 
-  it('titles the top bar "Ashby Mission Control" on its route', () => {
-    expect(pageTitleFor('/ashby-mission-control')).toBe('Ashby Mission Control');
+  it('titles the top bar "Ashby Live Jobs" on its route', () => {
+    expect(pageTitleFor('/ashby-mission-control')).toBe('Ashby Live Jobs');
     expect(pageTitleFor('/mission-control')).toBe('Mission Control');
   });
 
@@ -167,7 +172,7 @@ describe('Layout shell', () => {
     The Operations GROUP is no longer admin-only, because the phone calendar
     inside it is readable by interviewers — that is the API's rule
     ("interviewer or above may read, admin may write"), and the nav mirrors
-    it. Mission Control's and Ashby Mission Control's own visibility is
+    it. Mission Control's and Ashby Live Jobs' own visibility is
     admin-only: both routes are `requireRole="admin"`, so offering an
     interviewer a link that redirects to /unauthorized would be worse than
     not showing it.
@@ -268,8 +273,8 @@ describe('Layout shell', () => {
     expect(announcer?.textContent).toBe('Dashboard');
 
     await user.click(screen.getByRole('button', { name: 'Open navigation menu' }));
-    await user.click(screen.getByRole('link', { name: /^Roles$/ }));
-    await waitFor(() => expect(announcer?.textContent).toBe('Roles'));
+    await user.click(screen.getByRole('link', { name: /^Agents$/ }));
+    await waitFor(() => expect(announcer?.textContent).toBe('Agents'));
   });
 });
 

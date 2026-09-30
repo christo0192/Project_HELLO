@@ -104,7 +104,7 @@ const ROW_CONTROL = "max-sm:h-11 [@media(pointer:coarse)]:h-11";
  */
 function rolesSummary(roles: Role[]): string {
   const active = roles.filter((role) => role.is_active).length;
-  return `${roles.length} ${roles.length === 1 ? "role" : "roles"}, ${active === 0 ? "none" : active} active`;
+  return `${roles.length} ${roles.length === 1 ? "agent" : "agents"}, ${active === 0 ? "none" : active} active`;
 }
 
 export function RolesPage() {
@@ -183,7 +183,7 @@ export function RolesPage() {
       } catch (e) {
         // A 409 (mapped to an Ashby job) arrives here with the server's own
         // sentence, which names what to do about it.
-        setError(e instanceof ApiError ? e.message : "Could not remove the role.");
+        setError(e instanceof ApiError ? e.message : "Could not remove the agent.");
       } finally {
         setDeletingId(null);
       }
@@ -197,11 +197,11 @@ export function RolesPage() {
     <div className="space-y-6">
       <PageHeader
         eyebrow="Talent workspace"
-        title="Roles"
+        title="Agents"
         // NOT "the questions Gopu will ask". Each role now names its own
         // agent, and one hard-coded name in the page header contradicts every
         // role that chose a different one.
-        description="The jobs candidates are screened for, and the questions the screening agent asks."
+        description="Each agent screens candidates for one job, using the questions it asks."
         actions={
           canEditMetrics || editing === null ? (
             <>
@@ -221,7 +221,7 @@ export function RolesPage() {
               )}
               {editing === null && (
                 <Button variant="primary" onClick={() => setEditing("new")}>
-                  New role
+                  New agent
                 </Button>
               )}
             </>
@@ -234,7 +234,7 @@ export function RolesPage() {
         onClose={() => setScorebarOpen(false)}
         idPrefix="scorebar"
         title="Scorebar"
-        description="Reusable scoring metrics, shared by every role. Editing one publishes a new version; roles already using it keep the copy they saved."
+        description="Reusable scoring metrics, shared by every agent. Editing one publishes a new version; agents already using it keep the copy they saved."
         returnFocusRef={scorebarTrigger}
       >
         <ScorebarSection />
@@ -263,14 +263,14 @@ export function RolesPage() {
           {removalNote}
         </InlineNotice>
       )}
-      {!error && roles === null && <LoadingPanel label="Loading roles…" />}
+      {!error && roles === null && <LoadingPanel label="Loading agents…" />}
       {!error && roles !== null && roles.length === 0 && editing === null && (
         <EmptyPanel
-          title="No roles yet"
-          hint="Create your first role to start screening candidates against it."
+          title="No agents yet"
+          hint="Create your first agent to start screening candidates."
           action={
             <Button variant="primary" onClick={() => setEditing("new")}>
-              New role
+              New agent
             </Button>
           }
         />
@@ -286,7 +286,7 @@ export function RolesPage() {
             <GlassPanel>
               <SectionHeader
                 id={ROLES_LIST_HEADING}
-                title="All roles"
+                title="All agents"
                 // Said once here, so nobody counts the rows to learn it.
                 description={rolesSummary(roles)}
               />
@@ -310,12 +310,12 @@ export function RolesPage() {
                 ))}
               </ul>
               {/* Paging controls only when there is more than one page's
-                  worth at the smallest size. "Showing 1–6 of 6 roles" with
+                  worth at the smallest size. "Showing 1–6 of 6 agents" with
                   disabled arrows was a second way of saying the summary. */}
               {pager.total > PAGE_SIZES[0] && (
                 <Pagination
                   state={pager}
-                  noun="roles"
+                  noun="agents"
                   className="mt-4 border-t border-glass-ring"
                 />
               )}
@@ -382,7 +382,7 @@ function RoleRow({
             agent name to an ellipsis, and without it a sighted operator had
             no way to read the rest. The heading's accessible name is still
             its content, which was never truncated. An h3: the list's own
-            heading ("All roles") is the h2 above it. */}
+            heading ("All agents") is the h2 above it. */}
         <h3 id={headingId} title={label} className="truncate text-section text-ink">
           {label}
         </h3>
@@ -490,7 +490,7 @@ function RoleRow({
           // the job in brackets, so a screen reader hears the same name a
           // sighted operator sees.
           aria-label={
-            deleting ? `Deleting role ${agentWithRoleLabel(role)}…` : `Delete role ${agentWithRoleLabel(role)}`
+            deleting ? `Deleting agent ${agentWithRoleLabel(role)}…` : `Delete agent ${agentWithRoleLabel(role)}`
           }
           aria-busy={deleting}
           aria-disabled={anyDeleting}
@@ -719,7 +719,7 @@ function RoleForm({
     <div className="space-y-6">
     <GlassPanel padding="lg">
       <SectionHeader
-        title={role ? "Edit role" : "New role"}
+        title={role ? "Edit agent" : "New agent"}
         description="The job role, focus and questions below drive the screening conversation."
       />
       <form onSubmit={handleSubmit} className="mt-5 space-y-5">
@@ -826,7 +826,7 @@ function RoleForm({
             setDraftNote(
               staleTitle
                 ? `Drafted for "${draftedFor}", which is not what the job role says now — check it before saving.${rephrased}`
-                : `Hello drafted this role. Review it before saving.${rephrased}`,
+                : `Hello drafted this agent. Review it before saving.${rephrased}`,
             );
           }}
         />
@@ -1064,7 +1064,7 @@ function RoleForm({
 
         <div className="flex flex-wrap gap-2 pt-1">
           <Button type="submit" variant="primary" loading={saving}>
-            {role ? "Save changes" : "Create role"}
+            {role ? "Save changes" : "Create agent"}
           </Button>
           <Button type="button" variant="secondary" onClick={onCancel}>
             Cancel

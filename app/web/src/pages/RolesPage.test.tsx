@@ -4,7 +4,7 @@
  * Covers:
  *   - Empty state (no roles)
  *   - Roles list rendering
- *   - New role / Edit role form
+ *   - New agent / Edit agent form
  *   - axe structural rule compliance
  *   - Keyboard and focus management
  */
@@ -123,16 +123,45 @@ describe('RolesPage', () => {
   it('shows loading state initially', () => {
     mockApi.listRoles.mockReturnValue(new Promise(() => {})); // never resolves
     render(<RolesPage />);
-    expect(screen.getByText('Loading roles…')).toBeInTheDocument();
+    expect(screen.getByText('Loading agents…')).toBeInTheDocument();
+  });
+
+  it('titles the page "Agents" (renamed from "Roles"), in agent terms throughout the header and list', async () => {
+    // Owner request: stakeholders no longer call these "roles". The route
+    // stays /roles; only the words change.
+    mockApi.listRoles.mockResolvedValue([mockRole]);
+    render(<RolesPage />);
+    expect(await screen.findByRole('heading', { level: 1, name: 'Agents' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: 'Roles' })).toBeNull();
+    expect(
+      screen.getByText('Each agent screens candidates for one job, using the questions it asks.'),
+    ).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { level: 2, name: 'All agents' })).toBeInTheDocument();
+    expect(screen.getByText('1 agent, 1 active')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'New agent' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'New role' })).toBeNull();
+  });
+
+  it('names the form in agent terms: "New agent" / "Create agent", and "Edit agent"', async () => {
+    mockApi.listRoles.mockResolvedValue([mockRole]);
+    render(<RolesPage />);
+    await userEvent.click(await screen.findByRole('button', { name: 'New agent' }));
+    expect(screen.getByRole('heading', { name: 'New agent' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Create agent' })).toBeInTheDocument();
+    // The job-title FIELD keeps its job wording — it is the job, not the entity.
+    expect(screen.getByLabelText('Job role')).toBeInTheDocument();
+    await userEvent.click(screen.getByRole('button', { name: 'Cancel' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'Edit' }));
+    expect(screen.getByRole('heading', { name: 'Edit agent' })).toBeInTheDocument();
   });
 
   it('shows empty state when no roles', async () => {
     mockApi.listRoles.mockResolvedValue([]);
     render(<RolesPage />);
-    expect(await screen.findByText('No roles yet')).toBeInTheDocument();
+    expect(await screen.findByText('No agents yet')).toBeInTheDocument();
     expect(
       screen.getByText(
-        'Create your first role to start screening candidates against it.',
+        'Create your first agent to start screening candidates.',
       ),
     ).toBeInTheDocument();
   });
@@ -155,18 +184,18 @@ describe('RolesPage', () => {
     expect(screen.getByText('2 screening questions')).toBeInTheDocument();
   });
 
-  it('shows "New role" button when no role editing', async () => {
+  it('shows "New agent" button when no role editing', async () => {
     mockApi.listRoles.mockResolvedValue([]);
     render(<RolesPage />);
-    expect(await screen.findByRole('button', { name: 'New role' })).toBeInTheDocument();
+    expect(await screen.findByRole('button', { name: 'New agent' })).toBeInTheDocument();
   });
 
   it('opens new role form on button click', async () => {
     mockApi.listRoles.mockResolvedValue([]);
     render(<RolesPage />);
-    const btn = await screen.findByRole('button', { name: 'New role' });
+    const btn = await screen.findByRole('button', { name: 'New agent' });
     await userEvent.click(btn);
-    expect(screen.getByText('New role')).toBeInTheDocument();
+    expect(screen.getByText('New agent')).toBeInTheDocument();
     expect(screen.getByLabelText('Job role')).toBeInTheDocument();
     expect(screen.getByLabelText('Job description')).toBeInTheDocument();
     expect(screen.getByLabelText('Required skills')).toBeInTheDocument();
@@ -176,7 +205,7 @@ describe('RolesPage', () => {
     mockApi.listRoles.mockResolvedValue([]);
     render(<RolesPage />);
     const user = userEvent.setup();
-    const btn = await screen.findByRole('button', { name: 'New role' });
+    const btn = await screen.findByRole('button', { name: 'New agent' });
     await user.click(btn);
 
     // AGENT IS FIRST now — the operator's internal name for this screener
@@ -220,7 +249,7 @@ describe('RolesPage', () => {
     mockApi.createRole.mockResolvedValue({ id: 'new-id-enter' });
     render(<RolesPage />);
     const user = userEvent.setup();
-    const btn = await screen.findByRole('button', { name: 'New role' });
+    const btn = await screen.findByRole('button', { name: 'New agent' });
     await user.click(btn);
 
     await user.type(screen.getByLabelText('Job role'), 'Engineer{Enter}');
@@ -242,10 +271,10 @@ describe('RolesPage', () => {
     mockApi.createRole.mockResolvedValue({ id: 'new-id-omit' });
     render(<RolesPage />);
     const user = userEvent.setup();
-    await user.click(await screen.findByRole('button', { name: 'New role' }));
+    await user.click(await screen.findByRole('button', { name: 'New agent' }));
 
     await user.type(screen.getByLabelText('Job role'), 'Engineer');
-    await user.click(screen.getByRole('button', { name: 'Create role' }));
+    await user.click(screen.getByRole('button', { name: 'Create agent' }));
 
     await waitFor(() => expect(mockApi.createRole).toHaveBeenCalled());
     const body = mockApi.createRole.mock.calls[0][0];
@@ -258,11 +287,11 @@ describe('RolesPage', () => {
     mockApi.createRole.mockResolvedValue({ id: 'new-id-send' });
     render(<RolesPage />);
     const user = userEvent.setup();
-    await user.click(await screen.findByRole('button', { name: 'New role' }));
+    await user.click(await screen.findByRole('button', { name: 'New agent' }));
 
     await user.type(screen.getByLabelText('Agent'), 'Gopu');
     await user.type(screen.getByLabelText('Job role'), 'Engineer');
-    await user.click(screen.getByRole('button', { name: 'Create role' }));
+    await user.click(screen.getByRole('button', { name: 'Create agent' }));
 
     await waitFor(() => expect(mockApi.createRole).toHaveBeenCalled());
     expect(mockApi.createRole.mock.calls[0][0].agent_name).toBe('Gopu');
@@ -298,7 +327,7 @@ describe('RolesPage', () => {
     mockApi.getRoleDraft.mockResolvedValue(succeededJob());
     render(<RolesPage />);
     const user = userEvent.setup();
-    await user.click(await screen.findByRole('button', { name: 'New role' }));
+    await user.click(await screen.findByRole('button', { name: 'New agent' }));
 
     await user.type(screen.getByLabelText('Job role'), 'Sales Advisor');
     await user.click(screen.getByRole('button', { name: /Ask Hello/ }));
@@ -329,7 +358,7 @@ describe('RolesPage', () => {
     mockApi.getRoleDraft.mockResolvedValue(succeededJob({ job_role: 'Sales Advisr' }));
     render(<RolesPage />);
     const user = userEvent.setup();
-    await user.click(await screen.findByRole('button', { name: 'New role' }));
+    await user.click(await screen.findByRole('button', { name: 'New agent' }));
 
     await user.type(screen.getByLabelText('Job role'), 'Sales Advisor');
     await user.click(screen.getByRole('button', { name: /Ask Hello/ }));
@@ -352,7 +381,7 @@ describe('RolesPage', () => {
     mockApi.getRoleDraft.mockResolvedValue(succeededJob({ job_role: 'Sales Advisr' }));
     render(<RolesPage />);
     const user = userEvent.setup();
-    await user.click(await screen.findByRole('button', { name: 'New role' }));
+    await user.click(await screen.findByRole('button', { name: 'New agent' }));
 
     await user.type(screen.getByLabelText('Job role'), 'Sales Advisor');
     await user.click(screen.getByRole('button', { name: /Ask Hello/ }));
@@ -392,7 +421,7 @@ describe('RolesPage', () => {
     // A note, not an alert.
     expect(note?.querySelector('[role="alert"]')).toBeNull();
     // ...and it names the whole recovery, including closing this form — the
-    // "New role" button is hidden while a form is open.
+    // "New agent" button is hidden while a form is open.
     expect(note?.textContent).toContain('Close this form');
   });
 
@@ -402,7 +431,7 @@ describe('RolesPage', () => {
     mockApi.getRoleDraft.mockResolvedValue(succeededJob({ repaired: ['q2 was a directive'] }));
     render(<RolesPage />);
     const user = userEvent.setup();
-    await user.click(await screen.findByRole('button', { name: 'New role' }));
+    await user.click(await screen.findByRole('button', { name: 'New agent' }));
 
     await user.type(screen.getByLabelText('Job role'), 'Sales Advisor');
     await user.click(screen.getByRole('button', { name: /Ask Hello/ }));
@@ -416,7 +445,7 @@ describe('RolesPage', () => {
 
   it('leads the role row with the AGENT NAME, and puts the job underneath', async () => {
     // Owner request: agent on top, role name below — the two swapped.
-    // An h3: the list's own heading ("All roles") is the h2 above the rows.
+    // An h3: the list's own heading ("All agents") is the h2 above the rows.
     mockApi.listRoles.mockResolvedValue([{ ...mockRole, agent_name: '  Gopu  ' }]);
     render(<RolesPage />);
     const heading = await screen.findByRole('heading', { level: 3, name: 'Gopu' });
@@ -478,11 +507,11 @@ describe('RolesPage', () => {
     mockApi.listRoles.mockResolvedValue([]);
     mockApi.createRole.mockResolvedValue({ id: 'new-id' });
     render(<RolesPage />);
-    const btn = await screen.findByRole('button', { name: 'New role' });
+    const btn = await screen.findByRole('button', { name: 'New agent' });
     await userEvent.click(btn);
 
     // Submit without title
-    const submitBtn = screen.getByRole('button', { name: 'Create role' });
+    const submitBtn = screen.getByRole('button', { name: 'Create agent' });
     await userEvent.click(submitBtn);
     expect(screen.getByText('Job role is required.')).toBeInTheDocument();
   });
@@ -491,7 +520,7 @@ describe('RolesPage', () => {
     mockApi.listRoles.mockResolvedValue([]);
     const { container } = render(<RolesPage />);
     // Wait for loading to finish
-    await screen.findByText('No roles yet');
+    await screen.findByText('No agents yet');
     await expect(container).toHaveNoViolations();
   });
 
@@ -505,7 +534,7 @@ describe('RolesPage', () => {
   it('has no axe violations in form view', async () => {
     mockApi.listRoles.mockResolvedValue([]);
     const { container } = render(<RolesPage />);
-    const btn = await screen.findByRole('button', { name: 'New role' });
+    const btn = await screen.findByRole('button', { name: 'New agent' });
     await userEvent.click(btn);
     await expect(container).toHaveNoViolations();
   });
@@ -535,11 +564,11 @@ describe('The role list — one surface of rows, not a card wall', () => {
   it('renders ONE list, named by its heading, with one item per role', async () => {
     mockApi.listRoles.mockResolvedValue([role(1), role(2, { is_active: false }), role(3)]);
     render(<RolesPage />);
-    const list = await screen.findByRole('list', { name: 'All roles' });
+    const list = await screen.findByRole('list', { name: 'All agents' });
     // Only the rows are items: the skills are text, not a nested chip list.
     expect(within(list).getAllByRole('listitem')).toHaveLength(3);
     // The outline: the page's h1, the list's h2, one h3 per role.
-    expect(screen.getByRole('heading', { level: 2, name: 'All roles' })).toBeInTheDocument();
+    expect(screen.getByRole('heading', { level: 2, name: 'All agents' })).toBeInTheDocument();
     expect(within(list).getAllByRole('heading', { level: 3 }).map((h) => h.textContent)).toEqual([
       'Role number 1',
       'Role number 2',
@@ -548,9 +577,9 @@ describe('The role list — one surface of rows, not a card wall', () => {
   });
 
   it.each([
-    [[role(1), role(2), role(3, { is_active: false })], '3 roles, 2 active'],
-    [[role(1)], '1 role, 1 active'],
-    [[role(1, { is_active: false }), role(2, { is_active: false })], '2 roles, none active'],
+    [[role(1), role(2), role(3, { is_active: false })], '3 agents, 2 active'],
+    [[role(1)], '1 agent, 1 active'],
+    [[role(1, { is_active: false }), role(2, { is_active: false })], '2 agents, none active'],
   ])('summarises the list in one line under its heading (%#)', async (roles, summary) => {
     mockApi.listRoles.mockResolvedValue(roles);
     render(<RolesPage />);
@@ -563,25 +592,25 @@ describe('The role list — one surface of rows, not a card wall', () => {
     const eleven = Array.from({ length: 11 }, (_, i) => role(i + 1));
     mockApi.listRoles.mockResolvedValue(eleven);
     render(<RolesPage />);
-    const list = await screen.findByRole('list', { name: 'All roles' });
+    const list = await screen.findByRole('list', { name: 'All agents' });
     expect(within(list).getAllByRole('listitem')).toHaveLength(10);
-    expect(screen.getByText('11 roles, 11 active')).toBeInTheDocument();
-    expect(screen.getByRole('navigation', { name: 'roles pagination' })).toBeInTheDocument();
+    expect(screen.getByText('11 agents, 11 active')).toBeInTheDocument();
+    expect(screen.getByRole('navigation', { name: 'agents pagination' })).toBeInTheDocument();
   });
 
   it('shows NO paging controls when every role fits on one page', async () => {
-    // "Showing 1–6 of 6 roles" with disabled arrows was a second way of
+    // "Showing 1–6 of 6 agents" with disabled arrows was a second way of
     // saying what the summary already says.
     mockApi.listRoles.mockResolvedValue([role(1), role(2)]);
     render(<RolesPage />);
-    await screen.findByRole('list', { name: 'All roles' });
-    expect(screen.queryByRole('navigation', { name: 'roles pagination' })).toBeNull();
+    await screen.findByRole('list', { name: 'All agents' });
+    expect(screen.queryByRole('navigation', { name: 'agents pagination' })).toBeNull();
   });
 
   it('says the state in WORDS on every row', async () => {
     mockApi.listRoles.mockResolvedValue([role(1), role(2, { is_active: false })]);
     render(<RolesPage />);
-    const [live, retired] = within(await screen.findByRole('list', { name: 'All roles' })).getAllByRole('listitem');
+    const [live, retired] = within(await screen.findByRole('list', { name: 'All agents' })).getAllByRole('listitem');
     expect(within(live).getByText('Active')).toBeInTheDocument();
     expect(within(retired).getByText('Inactive')).toBeInTheDocument();
   });
@@ -599,7 +628,7 @@ describe('The role list — one surface of rows, not a card wall', () => {
   it('renders no empty description line for a role without one', async () => {
     mockApi.listRoles.mockResolvedValue([role(1, { jd: '   ' })]);
     render(<RolesPage />);
-    const [row] = within(await screen.findByRole('list', { name: 'All roles' })).getAllByRole('listitem');
+    const [row] = within(await screen.findByRole('list', { name: 'All agents' })).getAllByRole('listitem');
     expect(row.querySelector('.line-clamp-2')).toBeNull();
   });
 
@@ -608,7 +637,7 @@ describe('The role list — one surface of rows, not a card wall', () => {
       role(1, { required_skills: ['Go', 'PostgreSQL', 'Kubernetes', 'gRPC', 'System design'] }),
     ]);
     render(<RolesPage />);
-    const [row] = within(await screen.findByRole('list', { name: 'All roles' })).getAllByRole('listitem');
+    const [row] = within(await screen.findByRole('list', { name: 'All agents' })).getAllByRole('listitem');
     // On screen: three names and a count.
     expect(within(row).getByText(/Go, PostgreSQL, Kubernetes/)).toBeInTheDocument();
     const more = row.querySelector('[data-role-skills-more]') as HTMLElement;
@@ -624,7 +653,7 @@ describe('The role list — one surface of rows, not a card wall', () => {
   it('shows every skill, and no "+N", when there are three or fewer', async () => {
     mockApi.listRoles.mockResolvedValue([role(1)]);
     render(<RolesPage />);
-    const [row] = within(await screen.findByRole('list', { name: 'All roles' })).getAllByRole('listitem');
+    const [row] = within(await screen.findByRole('list', { name: 'All agents' })).getAllByRole('listitem');
     expect(within(row).getByText(/React, TypeScript, CSS/)).toBeInTheDocument();
     expect(row.querySelector('[data-role-skills-more]')).toBeNull();
   });
@@ -634,7 +663,7 @@ describe('The role list — one surface of rows, not a card wall', () => {
     // The confirmation here is the browser's own `confirm`, pinned elsewhere.
     mockApi.listRoles.mockResolvedValue([role(1)]);
     render(<RolesPage />);
-    const del = await screen.findByRole('button', { name: 'Delete role Role number 1' });
+    const del = await screen.findByRole('button', { name: 'Delete agent Role number 1' });
     expect(del).toHaveClass('text-error-text');
     expect(del).not.toHaveClass('bg-error');
   });
@@ -656,11 +685,11 @@ describe('The role list — one surface of rows, not a card wall', () => {
     const [firstEdit, secondEdit] = await screen.findAllByRole('button', { name: 'Edit' });
     firstEdit.focus();
     await user.tab();
-    expect(screen.getByRole('button', { name: 'Delete role Role number 1' })).toHaveFocus();
+    expect(screen.getByRole('button', { name: 'Delete agent Role number 1' })).toHaveFocus();
     await user.tab();
     expect(secondEdit).toHaveFocus();
     await user.tab();
-    expect(screen.getByRole('button', { name: 'Delete role Role number 2' })).toHaveFocus();
+    expect(screen.getByRole('button', { name: 'Delete agent Role number 2' })).toHaveFocus();
   });
 
   it('has no axe violations with an active and an inactive row', async () => {
@@ -669,7 +698,7 @@ describe('The role list — one surface of rows, not a card wall', () => {
       role(2, { is_active: false }),
     ]);
     const { container } = render(<RolesPage />);
-    await screen.findByRole('list', { name: 'All roles' });
+    await screen.findByRole('list', { name: 'All agents' });
     await expect(container).toHaveNoViolations();
   });
 });
@@ -937,14 +966,14 @@ describe('The [MUST ASK] flag survives an edit', () => {
       }),
     );
     render(<RolesPage />);
-    await userEvent.click(await screen.findByRole('button', { name: 'New role' }));
+    await userEvent.click(await screen.findByRole('button', { name: 'New agent' }));
     await userEvent.type(screen.getByLabelText('Job role'), 'Sales Advisor');
     await userEvent.click(screen.getByRole('button', { name: /Ask Hello/ }));
     await waitFor(() =>
       expect((screen.getByLabelText('Question 3') as HTMLInputElement).value).toMatch(/CTC/),
     );
 
-    await userEvent.click(screen.getByRole('button', { name: /Create role/i }));
+    await userEvent.click(screen.getByRole('button', { name: /Create agent/i }));
     await waitFor(() => expect(mockApi.createRole).toHaveBeenCalled());
     const body = mockApi.createRole.mock.calls[0][0] as {
       screening_template: Array<{ id: string; mandatory?: boolean; category?: string }>;
@@ -1002,7 +1031,7 @@ describe('Removing a role', () => {
   it('DELETES after a confirm, and reloads', async () => {
     render(<RolesPage />);
     const button = await screen.findByRole('button', {
-      name: `Delete role ${mockRole.title}`,
+      name: `Delete agent ${mockRole.title}`,
     });
     await userEvent.click(button);
 
@@ -1016,7 +1045,7 @@ describe('Removing a role', () => {
     vi.spyOn(window, 'confirm').mockReturnValue(false);
     render(<RolesPage />);
     await userEvent.click(
-      await screen.findByRole('button', { name: `Delete role ${mockRole.title}` }),
+      await screen.findByRole('button', { name: `Delete agent ${mockRole.title}` }),
     );
     expect(mockApi.deleteRole).not.toHaveBeenCalled();
   });
@@ -1033,7 +1062,7 @@ describe('Removing a role', () => {
     });
     render(<RolesPage />);
     await userEvent.click(
-      await screen.findByRole('button', { name: `Delete role ${mockRole.title}` }),
+      await screen.findByRole('button', { name: `Delete agent ${mockRole.title}` }),
     );
     const note = await screen.findByText(/archived rather than deleted/);
     expect(note).toHaveTextContent(/12 candidates/);
@@ -1048,7 +1077,7 @@ describe('Removing a role', () => {
     );
     render(<RolesPage />);
     await userEvent.click(
-      await screen.findByRole('button', { name: `Delete role ${mockRole.title}` }),
+      await screen.findByRole('button', { name: `Delete agent ${mockRole.title}` }),
     );
     expect(await screen.findByText(/Ashby Mission Control/)).toBeInTheDocument();
   });
@@ -1058,7 +1087,7 @@ describe('Removing a role', () => {
     // and this is the last thing they hear before a destructive action.
     render(<RolesPage />);
     expect(
-      await screen.findByRole('button', { name: `Delete role ${mockRole.title}` }),
+      await screen.findByRole('button', { name: `Delete agent ${mockRole.title}` }),
     ).toBeInTheDocument();
   });
 
@@ -1066,7 +1095,7 @@ describe('Removing a role', () => {
     mockApi.listRoles.mockResolvedValue([{ ...mockRole, agent_name: 'Gopu' }]);
     render(<RolesPage />);
     const button = await screen.findByRole('button', {
-      name: `Delete role Gopu (${mockRole.title})`,
+      name: `Delete agent Gopu (${mockRole.title})`,
     });
     await userEvent.click(button);
     // The confirm and the outcome note name the same card the same way.
@@ -1284,7 +1313,7 @@ describe('Scorebar — the metric library moved here from Mission Control', () =
   });
 
   it('stays reachable WHILE editing a role — that is the whole point of the move', async () => {
-    // `New role` is hidden once the form is open. The metric library must not
+    // `New agent` is hidden once the form is open. The metric library must not
     // be, or an admin has to leave a half-written role to reach it.
     mockAuth = { role: 'admin' };
     mockApi.listRoles.mockResolvedValue([mockRole]);
@@ -1292,7 +1321,7 @@ describe('Scorebar — the metric library moved here from Mission Control', () =
     await userEvent.click(await screen.findByRole('button', { name: /edit/i }));
     await screen.findByLabelText('Question 1');
 
-    expect(screen.queryByRole('button', { name: 'New role' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'New agent' })).toBeNull();
     expect(trigger()).toBeInTheDocument();
   });
 

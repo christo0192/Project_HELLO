@@ -217,7 +217,7 @@ test.describe('harness self-checks', () => {
 
   test('the fabricated session is an admin whose calls carry the bearer token', async ({ app, page }) => {
     await app.goto('/mission-control');
-    await expect(page.getByRole('link', { name: 'Ashby Mission Control' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Ashby Live Jobs' })).toBeVisible();
 
     // The seeded token claims admin…
     const claims = await page.evaluate(() => {
@@ -279,7 +279,7 @@ test.describe('key states', () => {
     app.expectHealthy();
   });
 
-  test('Ashby Mission Control shows every mapping state', async ({ app, page }) => {
+  test('Ashby Live Jobs shows every mapping state', async ({ app, page }) => {
     await app.goto('/ashby-mission-control');
     // In words (enabled / paused / drift on the wire).
     for (const status of ['Live', 'Paused', 'Out of sync']) {

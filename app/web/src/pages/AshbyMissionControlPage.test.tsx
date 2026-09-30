@@ -174,6 +174,14 @@ describe('AshbyMissionControlPage', () => {
     });
   });
 
+  it('titles the page "Ashby Live Jobs" (renamed from "Ashby Mission Control")', async () => {
+    renderPage();
+    // Exact name: the owner retired "Ashby Mission Control" for this page.
+    expect(await screen.findByRole('heading', { level: 1, name: 'Ashby Live Jobs' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /Ashby Mission Control/ })).toBeNull();
+    await screen.findByText('Account Executive');
+  });
+
   it('renders sanitized mappings + workflows (no PII/tokens)', async () => {
     renderPage();
     // The job by NAME — the row never renders the id it is keyed on.

@@ -199,13 +199,13 @@ export function AskHelloButton({
           // And it names a recovery that EXISTS, in full. "Open that role to
           // cancel it" was wrong for the feature's main path — a draft for a
           // brand-new role has no saved role to open. The route back is a
-          // blank New role form, which the mount effect adopts. It says
-          // "close this form" first because the New role button is hidden
+          // blank New agent form, which the mount effect adopts. It says
+          // "close this form" first because the New agent button is hidden
           // while any form is open (`RolesPage` renders it only when
           // `editing === null`), so the obvious reading of the shorter
           // sentence led to a button that is not on screen.
           cbs.current.onBusy?.(
-            `Hello is already drafting "${active.job_role}". Close this form and open a new role with the job role left blank to watch or cancel it.`,
+            `Hello is already drafting "${active.job_role}". Close this form and open a new agent with the job role left blank to watch or cancel it.`,
           );
           return;
         }

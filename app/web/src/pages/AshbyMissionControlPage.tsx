@@ -1263,7 +1263,7 @@ export function AshbyMissionControlPage() {
           this page sits, and the page's one primary action — Add mapping —
           belongs to the list it adds to. */}
       <PageHeader
-        title="Ashby Mission Control"
+        title="Ashby Live Jobs"
         description="The Ashby jobs HELLO screens, and each application's progress. Candidate details never appear here."
       />
 
