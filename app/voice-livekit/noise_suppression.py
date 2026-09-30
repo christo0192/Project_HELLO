@@ -38,12 +38,24 @@ from typing import Any, Callable, Optional
 
 logger = logging.getLogger("voice-livekit.noise_suppression")
 
+# Same LOG VISIBILITY trap as recording.py (live 2026-09-03): a bare logger
+# propagating to a root handler the worker never configures never reaches
+# `fly logs`, and these lines (unavailable / failed / summary) are the only
+# evidence of whether a call was actually denoised. Dedicated stdout handler;
+# propagation off so a configured root cannot double-print.
+if not logger.handlers:
+    _handler = logging.StreamHandler(sys.stdout)
+    _handler.setFormatter(logging.Formatter("%(name)s %(levelname)s %(message)s"))
+    logger.addHandler(_handler)
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
 PHONE_INPUT_SAMPLE_RATE = 48000
 # RNNoise only speaks 10 ms @ 48 kHz. A library reporting anything else is a
 # build we have not validated, so it is refused rather than guessed at.
 RNNOISE_FRAME_SIZE = 480
 
-_OFF_VALUES = frozenset({"off", "false", "0", "none", "disabled"})
+_OFF_VALUES = frozenset({"off", "false", "0", "no", "none", "disable", "disabled"})
 _unknown_mode_warned = False
 
 
@@ -189,7 +201,10 @@ def _get_processor_class() -> type:
         frame, and RoomIO's AGC runs on what we return, so the output frame has
         EXACTLY the input's rate/channels/length. Frames of any length are
         re-chunked to 480 via an input FIFO; the output FIFO is primed with 480
-        zeros, so the output is the denoised input delayed by a constant 10 ms.
+        zeros, so the output is the denoised input delayed by a constant 10 ms
+        of FIFO — plus RNNoise's own ~20 ms lookahead, ~30 ms end to end
+        (measured by cross-correlation on a real call; a uniform shift, not
+        jitter, so endpointing is unaffected beyond that constant).
         """
 
         def __init__(self, backend: Any = None) -> None:
