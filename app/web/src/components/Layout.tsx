@@ -3,8 +3,8 @@
  *
  * - Brand: authorized IK logo on a neutral plate (never CSS-inverted) +
  *   "HELLO" wordmark.
- * - Navigation: TA/HR daily items (Dashboard · Candidates · Roles) under
- *   "Workspace"; Operations for admins/interviewers — Ashby Mission Control
+ * - Navigation: TA/HR daily items (Dashboard · Candidates · Agents) under
+ *   "Workspace"; Operations for admins/interviewers — Ashby Live Jobs
  *   and Mission Control stay admin-only, the phone calendar is for both
  *   roles.
  * - Material: a frosted rail (sidebar) and, on mobile, a frosted top bar float on a
@@ -104,9 +104,9 @@ const PAGE_TITLES: Array<[RegExp, string]> = [
   [/^\/candidates/, 'Candidates'],
   [/^\/sessions\//, 'Session'],
   [/^\/screening\//, 'Screening'],
-  [/^\/roles/, 'Roles'],
+  [/^\/roles/, 'Agents'],
   [/^\/phone-calendar/, 'Phone calendar'],
-  [/^\/ashby-mission-control/, 'Ashby Mission Control'],
+  [/^\/ashby-mission-control/, 'Ashby Live Jobs'],
   [/^\/ashby\/review/, 'Ashby review'],
   [/^\/mission-control/, 'Mission Control'],
 ];
@@ -268,7 +268,7 @@ export function Layout() {
               />
               <NavLinkItem
                 to="/roles"
-                label="Roles"
+                label="Agents"
                 icon={<BriefcaseIcon className="h-4 w-4" />}
                 onNavigate={closeDrawer}
               />
@@ -276,13 +276,13 @@ export function Layout() {
 
             {/*
               Operations. The GROUP is shown to admins and interviewers, but
-              each link keeps its own visibility rule — Ashby Mission Control
+              each link keeps its own visibility rule — Ashby Live Jobs
               and Mission Control are admin-only, because both routes are
               `requireRole="admin"` and offering an interviewer a link that
               redirects to /unauthorized would be a worse experience than not
               showing it. The phone calendar is shown to both roles, matching
-              the API's "interviewer or above may read" rule. Ashby Mission
-              Control sits directly above Mission Control; it used to be
+              the API's "interviewer or above may read" rule. Ashby Live Jobs
+              sits directly above Mission Control; it used to be
               reachable only from a quick link in the Mission Control header.
             */}
             {(role === 'admin' || role === 'interviewer') && (
@@ -291,7 +291,7 @@ export function Layout() {
                   <>
                     <NavLinkItem
                       to="/ashby-mission-control"
-                      label="Ashby Mission Control"
+                      label="Ashby Live Jobs"
                       icon={<IntegrationIcon className="h-4 w-4" />}
                       onNavigate={closeDrawer}
                     />

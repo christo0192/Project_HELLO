@@ -62,7 +62,7 @@ const POLL_MS = 2_000;
 function phaseLabel(p: RoleDraftProgress | null): string {
   if (!p) return 'Starting…';
   const of = `${p.attempt} of ${p.maxAttempts}`;
-  if (p.phase === 'drafting') return `Writing the role… (${of})`;
+  if (p.phase === 'drafting') return `Writing the agent… (${of})`;
   if (p.phase === 'checking') return `Checking the questions are speakable… (${of})`;
   if (p.phase === 'rereading') return `Hello's answer was unreadable — asking again… (${of})`;
   return `Rephrasing ${p.rejected} question${p.rejected === 1 ? '' : 's'} the screener won't read aloud… (${of})`;
@@ -199,13 +199,13 @@ export function AskHelloButton({
           // And it names a recovery that EXISTS, in full. "Open that role to
           // cancel it" was wrong for the feature's main path — a draft for a
           // brand-new role has no saved role to open. The route back is a
-          // blank New role form, which the mount effect adopts. It says
-          // "close this form" first because the New role button is hidden
+          // blank New agent form, which the mount effect adopts. It says
+          // "close this form" first because the New agent button is hidden
           // while any form is open (`RolesPage` renders it only when
           // `editing === null`), so the obvious reading of the shorter
           // sentence led to a button that is not on screen.
           cbs.current.onBusy?.(
-            `Hello is already drafting "${active.job_role}". Close this form and open a new role with the job role left blank to watch or cancel it.`,
+            `Hello is already drafting "${active.job_role}". Close this form and open a new agent with the job role left blank to watch or cancel it.`,
           );
           return;
         }
@@ -272,7 +272,7 @@ export function AskHelloButton({
         // is a silent lie.
         cbs.current.onDrafted(job.draft, job.repaired, job.job_role);
       } else if (job.status === 'failed') {
-        cbs.current.onError(job.error_message ?? 'Hello could not draft this role.');
+        cbs.current.onError(job.error_message ?? 'Hello could not draft this agent.');
       }
       // `cancelled` is the operator's own doing — nothing to report.
     };

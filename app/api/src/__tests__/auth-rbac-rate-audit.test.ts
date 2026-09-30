@@ -104,6 +104,8 @@ function chainable(value: any): any {
   fn.then = (resolve: (v: any) => any) => Promise.resolve(value).then(resolve);
   fn.catch = (reject: (e: any) => any) => Promise.resolve(value).catch(reject);
   fn.eq = () => chainable(value);
+  fn.is = () => chainable(value);
+  fn.in = () => chainable(value);
   fn.order = () => chainable(value);
   fn.limit = () => chainable(value);
   fn.select = () => chainable(value);

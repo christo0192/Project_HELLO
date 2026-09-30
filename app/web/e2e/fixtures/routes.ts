@@ -69,7 +69,7 @@ export const ROUTES: RouteCase[] = [
   { name: 'session-v2', path: `/sessions/${V2_SESSION_ID}`, heading: 'Meera Iyer’s screening', landmark: 'Technical depth' },
   { name: 'screening-console', path: `/screening/${V2_SESSION_ID}`, heading: 'Screening with Gopu', landmark: /walk me through your current role/i },
   { name: 'screening-console-legacy', path: `/screening/${LEGACY_SESSION_ID}`, heading: 'Screening with Gopu', landmark: /walk me through your current role/i },
-  { name: 'roles', path: '/roles', heading: 'Roles', landmark: 'Senior Backend Engineer' },
+  { name: 'roles', path: '/roles', heading: 'Agents', landmark: 'Senior Backend Engineer' },
   { name: 'phone-calendar', path: '/phone-calendar', heading: 'Phone calendar', landmark: /Meera Iyer|Ananya Chaudhary/ },
   { name: 'mission-control', path: '/mission-control', heading: 'Mission Control', landmark: 'Session status mix' },
   { name: 'mission-control-access', path: '/mission-control#access', heading: 'Mission Control', landmark: 'hiring.lead@example.com' },
@@ -79,6 +79,6 @@ export const ROUTES: RouteCase[] = [
   { name: 'mission-control-audit', path: '/mission-control#audit', heading: 'Mission Control', landmark: 'Audit log' },
   { name: 'mission-control-maintenance', path: '/mission-control#maintenance', heading: 'Mission Control', landmark: 'Change maintenance mode' },
   { name: 'admin-redirect', path: '/admin', heading: 'Mission Control', landmark: 'Session status mix', finalPath: /\/mission-control$/ },
-  { name: 'ashby-mission-control', path: '/ashby-mission-control', heading: 'Ashby Mission Control', landmark: 'Application workflows' },
+  { name: 'ashby-mission-control', path: '/ashby-mission-control', heading: 'Ashby Live Jobs', landmark: 'Application workflows' },
   { name: 'ashby-scoped-review', path: `/ashby/review/${SCOPED_REVIEW_LINK_ID}`, heading: 'Meera Iyer', landmark: 'Ashby screening pipeline' },
 ];

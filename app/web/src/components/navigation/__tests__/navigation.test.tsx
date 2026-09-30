@@ -5,7 +5,7 @@
  * - NavLinkItem: link, icon, active state (aria-current) + onNavigate
  * - NavGroup: labelled group for sectioned navigation
  * - Brand: logo plate + wordmark, never inverted
- * - IntegrationIcon (Ashby Mission Control): same SVG contract as its siblings
+ * - IntegrationIcon (Ashby Live Jobs): same SVG contract as its siblings
  *   (Layout.test.tsx covers where the link sits and who sees it)
  */
 

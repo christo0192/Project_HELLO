@@ -25,9 +25,10 @@ import {
 // The class must be hoisted WITH the spies: `vi.mock` is lifted above every
 // top-level declaration, so a plain `class` here is still in its temporal dead
 // zone when the factory runs.
-const { getScreeningFunnel, listRoles, FakeApiError } = vi.hoisted(() => ({
+const { getScreeningFunnel, listRoles, listAshbyMappings, FakeApiError } = vi.hoisted(() => ({
   getScreeningFunnel: vi.fn(),
   listRoles: vi.fn(),
+  listAshbyMappings: vi.fn(),
   FakeApiError: class extends Error {
     status: number;
     constructor(m: string, s: number) {
@@ -41,6 +42,9 @@ vi.mock('../../api', () => ({
   api: {
     getScreeningFunnel: (...args: any[]) => getScreeningFunnel(...args),
     listRoles: (...args: any[]) => listRoles(...args),
+    // Not used by the panel any more (the role filter reads
+    // `has_ashby_mapping` off the roles); a spy so tests can prove it.
+    listAshbyMappings: (...args: any[]) => listAshbyMappings(...args),
   },
   ApiError: FakeApiError,
 }));
@@ -405,65 +409,162 @@ describe('ScreeningKpis', () => {
   });
 
   it('passes the selected role through to the request', async () => {
-    listRoles.mockResolvedValue([{ id: 'role-1', title: 'Sales Program Advisor' }]);
+    listRoles.mockResolvedValue([{ id: 'role-1', title: 'Sales Program Advisor', has_ashby_mapping: true }]);
     renderKpis();
     await waitFor(() => expect(getScreeningFunnel).toHaveBeenCalled());
 
-    fireEvent.change(await screen.findByRole('combobox', { name: 'Filter by agent' }), {
-      target: { value: 'role-1' },
-    });
+    const select = await screen.findByRole('combobox', { name: 'Filter by role' });
+    await screen.findByRole('option', { name: 'Sales Program Advisor' });
+    fireEvent.change(select, { target: { value: 'role-1' } });
     await waitFor(() => expect(getScreeningFunnel).toHaveBeenCalledTimes(2));
     expect(getScreeningFunnel.mock.calls[1][0].role_id).toBe('role-1');
   });
 
-  it('names the filter by AGENT: "All agents", then each agent name, labelled for assistive tech', async () => {
+  // The SERVER flags each role `has_ashby_mapping`: true for any non-archived
+  // mapping, live, paused or drift alike. The panel reads it off the roles.
+  it('lists every role flagged MAPPED by role title, under "All roles"; never one flagged false', async () => {
     listRoles.mockResolvedValue([
-      { id: 'r1', title: 'Sales Program Advisor', agent_name: '  Gopu ' },
-      { id: 'r2', title: 'Customer Support', agent_name: 'Meera' },
+      { id: 'r1', title: 'Sales Program Advisor', agent_name: 'Gopu', has_ashby_mapping: true }, // live
+      { id: 'r2', title: 'Customer Support', agent_name: 'Meera', has_ashby_mapping: true }, // paused-only
+      { id: 'r3', title: 'Data Analyst', has_ashby_mapping: true }, // drift
+      { id: 'r4', title: 'Backend Engineer', has_ashby_mapping: true }, // two mappings, one option
+      { id: 'r5', title: 'Unmapped Role', has_ashby_mapping: false },
     ]);
     renderKpis();
-    const select = await screen.findByRole('combobox', { name: 'Filter by agent' });
-    const options = Array.from((select as HTMLSelectElement).options);
-    expect(options.map((o) => o.textContent)).toEqual(['All agents', 'Gopu', 'Meera']);
+    const select = (await screen.findByRole('combobox', { name: 'Filter by role' })) as HTMLSelectElement;
+    await screen.findByRole('option', { name: 'Backend Engineer' });
+    const options = Array.from(select.options);
+    // Sorted by label; the role TITLE, never the agent name.
+    expect(options.map((o) => o.textContent)).toEqual([
+      'All roles',
+      'Backend Engineer',
+      'Customer Support',
+      'Data Analyst',
+      'Sales Program Advisor',
+    ]);
     // Display only: the values are still the role ids the endpoint filters on.
-    expect(options.map((o) => o.value)).toEqual(['', 'r1', 'r2']);
-    expect(screen.queryByText('All roles')).not.toBeInTheDocument();
-    // The job titles are not in the picker at all.
-    expect(screen.queryByRole('option', { name: /Sales Program Advisor/ })).not.toBeInTheDocument();
+    expect(options.map((o) => o.value)).toEqual(['', 'r4', 'r2', 'r3', 'r1']);
+    // A role flagged unmapped is not offered.
+    expect(screen.queryByRole('option', { name: 'Unmapped Role' })).not.toBeInTheDocument();
+    expect(screen.queryByText('All agents')).not.toBeInTheDocument();
+    expect(screen.queryByRole('option', { name: /Gopu/ })).not.toBeInTheDocument();
+    // The flag comes with the roles: no mappings request of its own.
+    expect(listAshbyMappings).not.toHaveBeenCalled();
   });
 
-  it('falls back to the TITLE for a role with no agent name, and tells duplicates apart', async () => {
-    // Production today: two roles titled "Sales Program Advisor", neither with
-    // an agent name. Two identical options meaning different things is a
-    // picker nobody can use correctly. A shared AGENT name says which role;
-    // a shared bare title can only be numbered, after a middle dot.
+  it('tells same-titled mapped roles apart as "Title — Agent", then by number', async () => {
+    // Production today: two roles titled "Sales Program Advisor". Two
+    // identical options meaning different things is a picker nobody can use
+    // correctly. An agent name says which role; a bare title can only be
+    // numbered. A clash with a role that is NOT listed (unmapped) is no clash.
     listRoles.mockResolvedValue([
-      { id: 'r1', title: 'Sales Program Advisor', agent_name: null },
-      { id: 'r2', title: 'Sales Program Advisor' },
-      { id: 'r3', title: 'Support', agent_name: '   ' },
-      { id: 'r4', title: 'Ops', agent_name: 'Gopu' },
-      { id: 'r5', title: 'Finance', agent_name: 'Gopu' },
+      { id: 'r1', title: 'Sales Program Advisor', agent_name: '  Gopu ', has_ashby_mapping: true },
+      { id: 'r2', title: 'Sales Program Advisor', agent_name: 'Meera', has_ashby_mapping: true },
+      { id: 'r3', title: 'Support', agent_name: null, has_ashby_mapping: true },
+      { id: 'r4', title: 'Support', agent_name: '   ', has_ashby_mapping: true },
+      { id: 'r5', title: 'Ops', agent_name: 'Nova', has_ashby_mapping: true },
+      // r6 has no mapping at all.
+      { id: 'r6', title: 'Ops', agent_name: 'Other', has_ashby_mapping: false },
     ]);
     renderKpis();
-    const select = (await screen.findByRole('combobox', {
-      name: 'Filter by agent',
-    })) as HTMLSelectElement;
+    const select = (await screen.findByRole('combobox', { name: 'Filter by role' })) as HTMLSelectElement;
+    await screen.findByRole('option', { name: 'Ops' });
     const options = Array.from(select.options);
     expect(options.map((o) => o.textContent)).toEqual([
-      'All agents',
-      'Sales Program Advisor',
-      'Sales Program Advisor · 2',
+      'All roles',
+      'Ops',
+      'Sales Program Advisor — Gopu',
+      'Sales Program Advisor — Meera',
       'Support',
-      'Gopu (Ops)',
-      'Gopu (Finance)',
+      'Support · 2',
     ]);
-    expect(options.map((o) => o.value)).toEqual(['', 'r1', 'r2', 'r3', 'r4', 'r5']);
+    expect(options.map((o) => o.value)).toEqual(['', 'r5', 'r1', 'r2', 'r3', 'r4']);
 
     // Picking the SECOND duplicate filters on the second role, not the first.
     await waitFor(() => expect(getScreeningFunnel).toHaveBeenCalled());
-    fireEvent.change(select, { target: { value: 'r2' } });
+    fireEvent.change(select, { target: { value: 'r4' } });
     await waitFor(() => expect(getScreeningFunnel).toHaveBeenCalledTimes(2));
-    expect(getScreeningFunnel.mock.calls[1][0].role_id).toBe('r2');
+    expect(getScreeningFunnel.mock.calls[1][0].role_id).toBe('r4');
+  });
+
+  it('falls back to EVERY role when the roles carry no flag (an API older than it)', async () => {
+    listRoles.mockResolvedValue([
+      { id: 'r1', title: 'Sales Program Advisor' },
+      { id: 'r2', title: 'Customer Support' },
+    ]);
+    renderKpis();
+    const select = (await screen.findByRole('combobox', { name: 'Filter by role' })) as HTMLSelectElement;
+    await screen.findByRole('option', { name: 'Customer Support' });
+    expect(Array.from(select.options).map((o) => o.textContent)).toEqual([
+      'All roles',
+      'Customer Support',
+      'Sales Program Advisor',
+    ]);
+    expect(Array.from(select.options).map((o) => o.value)).toEqual(['', 'r2', 'r1']);
+  });
+
+  it('hides the role filter when no role is mapped (no lonely "All roles")', async () => {
+    render(
+      <ThemeProvider>
+        <ScreeningKpis
+          roles={[
+            { id: 'r1', title: 'Sales Program Advisor', has_ashby_mapping: false },
+            { id: 'r2', title: 'Customer Support', has_ashby_mapping: false },
+          ] as any[]}
+        />
+      </ThemeProvider>,
+    );
+    await waitFor(() => expect(getScreeningFunnel).toHaveBeenCalled());
+    // The range control renders in the same row, so the row is there.
+    await screen.findByRole('button', { name: '7 days' });
+    expect(screen.queryByRole('combobox', { name: 'Filter by role' })).not.toBeInTheDocument();
+    expect(screen.queryByText('All roles')).not.toBeInTheDocument();
+  });
+
+  it('shows no role control until the roles load, then only the mapped ones', async () => {
+    let release: (v: unknown) => void = () => {};
+    listRoles.mockReturnValue(new Promise((resolve) => { release = resolve; }));
+    renderKpis();
+    await screen.findByRole('button', { name: '7 days' });
+    expect(screen.queryByRole('combobox', { name: 'Filter by role' })).not.toBeInTheDocument();
+
+    release([
+      { id: 'r1', title: 'Sales Program Advisor', has_ashby_mapping: false },
+      { id: 'r2', title: 'Customer Support', has_ashby_mapping: true },
+    ]);
+    const select = (await screen.findByRole('combobox', { name: 'Filter by role' })) as HTMLSelectElement;
+    expect(Array.from(select.options).map((o) => o.textContent)).toEqual(['All roles', 'Customer Support']);
+    expect(listAshbyMappings).not.toHaveBeenCalled();
+  });
+
+  it('drops a selection that is no longer offered back to "All roles"', async () => {
+    const roles = [
+      { id: 'r1', title: 'Sales Program Advisor', has_ashby_mapping: true },
+      { id: 'r2', title: 'Customer Support', has_ashby_mapping: true },
+    ] as any[];
+    const view = render(
+      <ThemeProvider>
+        <ScreeningKpis roles={roles} />
+      </ThemeProvider>,
+    );
+    const select = (await screen.findByRole('combobox', { name: 'Filter by role' })) as HTMLSelectElement;
+    await screen.findByRole('option', { name: 'Sales Program Advisor' });
+    fireEvent.change(select, { target: { value: 'r1' } });
+    await waitFor(() =>
+      expect(getScreeningFunnel.mock.calls.some((c) => c[0].role_id === 'r1')).toBe(true),
+    );
+    const before = getScreeningFunnel.mock.calls.length;
+
+    // r1 loses its mapping (the caller's roles changed): the filter must not
+    // keep filtering on a role it can no longer show.
+    view.rerender(
+      <ThemeProvider>
+        <ScreeningKpis roles={[{ ...roles[0], has_ashby_mapping: false }, roles[1]]} />
+      </ThemeProvider>,
+    );
+    await waitFor(() => expect(select.value).toBe(''));
+    await waitFor(() => expect(getScreeningFunnel.mock.calls.length).toBeGreaterThan(before));
+    expect(getScreeningFunnel.mock.calls.at(-1)![0].role_id).toBeUndefined();
   });
 
   it('groups each band for assistive tech, not just visually', async () => {

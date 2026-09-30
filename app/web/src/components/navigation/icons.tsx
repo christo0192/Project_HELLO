@@ -136,7 +136,7 @@ export function CalendarIcon({ className }: IconProps) {
 }
 
 /**
- * Linked nodes — an integration: Ashby Mission Control, where the Ashby
+ * Linked nodes — an integration: Ashby Live Jobs, where the Ashby
  * connection is operated.
  *
  * Two nodes on the left joined to one on the right, so it reads as "things

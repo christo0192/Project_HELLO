@@ -278,7 +278,7 @@ export function AshbyWorkflowCardView({ workflow }: AshbyWorkflowCardViewProps) 
         </p>
       )}
       <p className="mt-1 text-xs text-ink-tertiary">
-        Read-only status. Screening actions live in Ashby Mission Control.
+        Read-only status. Screening actions live in Ashby Live Jobs.
       </p>
     </>
   );

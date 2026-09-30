@@ -217,7 +217,7 @@ test.describe('harness self-checks', () => {
 
   test('the fabricated session is an admin whose calls carry the bearer token', async ({ app, page }) => {
     await app.goto('/mission-control');
-    await expect(page.getByRole('link', { name: 'Ashby Mission Control' })).toBeVisible();
+    await expect(page.getByRole('link', { name: 'Ashby Live Jobs' })).toBeVisible();
 
     // The seeded token claims admin…
     const claims = await page.evaluate(() => {
@@ -279,7 +279,28 @@ test.describe('key states', () => {
     app.expectHealthy();
   });
 
-  test('Ashby Mission Control shows every mapping state', async ({ app, page }) => {
+  test('role filters list only Ashby-mapped roles, by title, with no mappings read', async ({ app, page }) => {
+    // The seed maps three roles (live, paused, drift) and leaves three
+    // unmapped; the roles route flags each (fixtures/api-router.ts).
+    const MAPPED = ['Data Analyst', 'Frontend Engineer', 'Senior Backend Engineer'];
+    const UNMAPPED = ['Site Reliability Engineer', 'Customer Success Associate', 'QA Automation Engineer'];
+    const mappingsReads = () =>
+      app.calls.filter((c) => c.method === 'GET' && new URL(c.url).pathname.endsWith('/mission-control/mappings'));
+
+    for (const path of ['/dashboard', '/candidates']) {
+      await app.goto(path);
+      const filter = page.getByLabel('Filter by role').first();
+      await expect(filter).toBeVisible();
+      await expect(filter.locator('option')).toHaveText(['All roles', ...MAPPED]);
+      for (const title of UNMAPPED) {
+        await expect(filter.locator('option', { hasText: title })).toHaveCount(0);
+      }
+    }
+    expect(mappingsReads(), 'the role filters read the flag off /api/roles, not the mappings list').toEqual([]);
+    app.expectHealthy();
+  });
+
+  test('Ashby Live Jobs shows every mapping state', async ({ app, page }) => {
     await app.goto('/ashby-mission-control');
     // In words (enabled / paused / drift on the wire).
     for (const status of ['Live', 'Paused', 'Out of sync']) {

@@ -1246,7 +1246,9 @@ describe('OpenAPI document integrity', () => {
     // already_archived}, additionalProperties:false. It is not a reuse of
     // AshbyMcActionResponse because that one requires a `status` this route
     // has no honest value for. 257 + 1 = 258.
-    expect(Object.keys(schemas).length).toBe(258);
+    // M008 adds ONE: RoleListItem, the Role plus the list-only
+    // has_ashby_mapping flag the role filters read. 258 + 1 = 259.
+    expect(Object.keys(schemas).length).toBe(259);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -1641,13 +1643,20 @@ describe('live handler shapes match documented schemas', () => {
     expect(validateResponseBody(res.body, 'HealthResponse', spec)).toEqual([]);
   });
 
-  it('GET /api/roles → Role[]', async () => {
-    configureTables({ roles: ok([mockRole]) });
+  it('GET /api/roles → RoleListItem[] (Role + has_ashby_mapping)', async () => {
+    configureTables({
+      roles: ok([mockRole]),
+      ashby_job_mappings: ok([{ role_id: mockRole.id }]),
+    });
     const app = createContractApp();
     const res = await request(app).get('/api/roles').set('Authorization', AUTH_HEADER);
     expect(res.status).toBe(200);
     expect(res.body).toHaveLength(1);
-    expect(validateNamed(res.body[0], 'Role', spec)).toEqual([]);
+    expect(res.body[0].has_ashby_mapping).toBe(true);
+    expect(validateNamed(res.body[0], 'RoleListItem', spec)).toEqual([]);
+    // The flag is REQUIRED on the list item: a row without it must not validate.
+    const { has_ashby_mapping: _flag, ...withoutFlag } = res.body[0];
+    expect(validateNamed(withoutFlag, 'RoleListItem', spec)).not.toEqual([]);
   });
 
   it('GET /api/roles/{id} → Role', async () => {

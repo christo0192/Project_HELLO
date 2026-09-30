@@ -174,6 +174,14 @@ describe('AshbyMissionControlPage', () => {
     });
   });
 
+  it('titles the page "Ashby Live Jobs" (renamed from "Ashby Mission Control")', async () => {
+    renderPage();
+    // Exact name: the owner retired "Ashby Mission Control" for this page.
+    expect(await screen.findByRole('heading', { level: 1, name: 'Ashby Live Jobs' })).toBeInTheDocument();
+    expect(screen.queryByRole('heading', { name: /Ashby Mission Control/ })).toBeNull();
+    await screen.findByText('Account Executive');
+  });
+
   it('renders sanitized mappings + workflows (no PII/tokens)', async () => {
     renderPage();
     // The job by NAME — the row never renders the id it is keyed on.
@@ -1357,19 +1365,19 @@ describe('Adding a job mapping', () => {
     expect(within(list).getByRole('option', { name: SALES_OPTION })).toBeInTheDocument();
   });
 
-  it('with NO active roles, says so and links to the Roles page', async () => {
+  it('with NO active agents, says so and links to the Agents page', async () => {
     listRoles.mockResolvedValue(ROLES.filter((role) => !role.is_active));
     const { container } = renderPage();
     await screen.findByText('Account Executive');
     await userEvent.click(screen.getByRole('button', { name: 'Add mapping' }));
     await waitFor(() =>
       expect(roleNote()).toHaveTextContent(
-        'There are no active roles yet. Create one on the Roles page first.',
+        'There are no active agents yet. Create one on the Agents page first.',
       ),
     );
-    expect(within(roleNote()).getByRole('link', { name: 'Roles page' })).toHaveAttribute('href', '/roles');
+    expect(within(roleNote()).getByRole('link', { name: 'Agents page' })).toHaveAttribute('href', '/roles');
     expect(rolePicker()).toBeDisabled();
-    expect(rolesLive()).toHaveTextContent('There are no active roles yet.');
+    expect(rolesLive()).toHaveTextContent('There are no active agents yet. Create one on the Agents page first.');
     expect(screen.getByRole('button', { name: /Save mapping/ })).toBeDisabled();
     await expect(container).toHaveNoViolations();
   });

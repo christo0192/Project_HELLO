@@ -142,6 +142,14 @@ export interface Role {
   interviewer_instructions?: string;
   is_active: boolean;
   created_at: string;
+  /**
+   * M008, list route only (`GET /api/roles`): true iff a non-archived Ashby
+   * job mapping names this role, in any status (live, paused or drift). The
+   * Dashboard and Candidates role filters list only roles where it is true.
+   * Absent on single-role reads and on an API older than the field, in which
+   * case the filters list every role (see `lib/mapped-roles.ts`).
+   */
+  has_ashby_mapping?: boolean;
 }
 
 /** Where an Ask Hello job currently is. */

@@ -30,6 +30,10 @@ import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react"
 import type { RefObject } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api, ApiError } from "../api";
+import {
+  roleFilterOptions,
+  shouldResetRoleFilter,
+} from "../lib/mapped-roles";
 import type { Candidate, Role } from "../types";
 import type { CandidateFilters } from "../components/talent";
 import { CandidateButton } from "../components/design/candidate";
@@ -413,6 +417,21 @@ export function CandidatesPage() {
     [applyFilters],
   );
 
+  // The role filter lists only the roles the server flags `has_ashby_mapping`
+  // (a live, paused or drift Ashby job mapping), by role title (owner
+  // decision, M008), or every role on an API older than the flag. A role in
+  // the URL that is not offered falls back to "All roles" once the roles have
+  // loaded: REPLACING the history entry, so Back does not return to a filter
+  // the control cannot show. No listed roles hides the control, as on the
+  // Dashboard.
+  const roleOptions = useMemo(() => roleFilterOptions(roles), [roles]);
+  const resetRole = shouldResetRoleFilter(roleId, rolesLoaded, roleOptions);
+  useEffect(() => {
+    if (!resetRole) return;
+    setSearchParams(buildCandidateSearch({ ...filters, roleId: null }), { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [resetRole, filterKey, setSearchParams]);
+
   const clearFilters = useCallback(() => {
     setSearchParams(new URLSearchParams());
   }, [setSearchParams]);
@@ -537,7 +556,7 @@ export function CandidatesPage() {
               </span>
             )}
           </h2>
-          {roles.length > 0 && (
+          {roleOptions.length > 0 && (
             <div className="w-full sm:w-56">
               <label htmlFor="role-filter" className="sr-only">
                 Filter by role
@@ -550,9 +569,9 @@ export function CandidatesPage() {
                 className="w-full"
               >
                 <option value="">All roles</option>
-                {roles.map((r) => (
-                  <option key={r.id} value={r.id}>
-                    {r.title}
+                {roleOptions.map((option) => (
+                  <option key={option.id} value={option.id}>
+                    {option.label}
                   </option>
                 ))}
               </SelectField>

@@ -57,11 +57,57 @@ export function uniqueAgentLabels<T extends NamedRole & { id: string }>(
   roles: readonly T[],
 ): Map<string, string> {
   const baseCounts = countBy(roles, agentLabel);
-  const named = roles.map((role) => ({
-    id: role.id,
-    label: (baseCounts.get(agentLabel(role)) ?? 0) > 1 ? agentWithRoleLabel(role) : agentLabel(role),
-  }));
+  return numberDuplicates(
+    roles.map((role) => ({
+      id: role.id,
+      label: (baseCounts.get(agentLabel(role)) ?? 0) > 1 ? agentWithRoleLabel(role) : agentLabel(role),
+    })),
+  );
+}
 
+/** Between a role title and its agent name when two titles clash. An em dash, title first. */
+const TITLE_AGENT_SEPARATOR = ' — ';
+
+/** `Title — Agent` when the role has an agent name, otherwise the title alone. */
+export function roleWithAgentLabel(role: NamedRole): string {
+  const agent = roleAgentName(role);
+  const title = role.title.trim();
+  return agent ? `${title}${TITLE_AGENT_SEPARATOR}${agent}` : title;
+}
+
+/**
+ * The ROLE TITLE for every role, keyed by id — the name a role filter shows
+ * (the same name a live Ashby job mapping shows as "Role: …"). Made
+ * distinguishable wherever two would read the same, in two steps, each only
+ * where needed:
+ *
+ *   1. Roles that share a title are told apart by their agent name, title
+ *      first: `Sales — Gopu`, `Sales — Meera`. A role without an agent name
+ *      keeps its bare title.
+ *   2. Whatever still reads the same — two same-titled roles with no agent
+ *      name, or with the same one — is numbered in list order after a middle
+ *      dot: `Sales`, `Sales · 2`.
+ *
+ * Display only: callers keep the role id as the option value.
+ */
+export function uniqueRoleLabels<T extends NamedRole & { id: string }>(
+  roles: readonly T[],
+): Map<string, string> {
+  const titleCounts = countBy(roles, (role) => role.title.trim());
+  return numberDuplicates(
+    roles.map((role) => ({
+      id: role.id,
+      label: (titleCounts.get(role.title.trim()) ?? 0) > 1 ? roleWithAgentLabel(role) : role.title.trim(),
+    })),
+  );
+}
+
+/**
+ * Numbers every repeat of a label in list order (`X`, `X · 2`, …), never
+ * handing out a number some other entry already reads as, so the result is
+ * unique whatever the inputs are.
+ */
+function numberDuplicates(named: ReadonlyArray<{ id: string; label: string }>): Map<string, string> {
   const taken = new Set(named.map((entry) => entry.label));
   const seen = new Map<string, number>();
   const labels = new Map<string, string>();

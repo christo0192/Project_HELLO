@@ -23,8 +23,21 @@ import { rephraseQuestion, RoleDraftError } from '../lib/role-authoring.js';
 
 export const rolesRouter = Router();
 
+/** Role ids per `ashby_job_mappings` read on the list route. */
+const ROLE_MAPPING_BATCH = 100;
+
 // List roles — viewer and above
 // Interviewer sees only own records; admin sees all
+//
+// Every row carries `has_ashby_mapping` (M008): true iff at least one
+// NON-ARCHIVED `ashby_job_mappings` row names the role, in any status
+// (enabled, paused, drift). The role filters on the Dashboard and Candidates
+// list only mapped roles, and they read it HERE rather than from the
+// Mission Control mappings list, which is interviewer+ (a viewer got 403 and
+// saw every role), capped at 200 newest rows (older mapped roles vanished),
+// and audited (every page load wrote a `resource.list` row). One extra read
+// for the whole page, never one per role, and no audit write: this is the
+// same unaudited viewer read it always was.
 rolesRouter.get('/', requireRole('viewer'), async (req, res, next) => {
   let q = supabase
     .from('roles')
@@ -38,7 +51,28 @@ rolesRouter.get('/', requireRole('viewer'), async (req, res, next) => {
 
   const { data, error } = await q;
   if (error) return next(error);
-  res.json(data);
+
+  const rows = (Array.isArray(data) ? data : []) as Array<Record<string, unknown> & { id: string }>;
+  const ids = rows.map((row) => row.id).filter((id): id is string => typeof id === 'string');
+  const mapped = new Set<string>();
+  try {
+    // Batched only so an admin with hundreds of roles never builds an
+    // `in.(…)` URL a proxy refuses; a normal page is one read.
+    for (let start = 0; start < ids.length; start += ROLE_MAPPING_BATCH) {
+      const { data: mappings, error: mappingError } = await supabase
+        .from('ashby_job_mappings')
+        .select('role_id')
+        .is('archived_at', null)
+        .in('role_id', ids.slice(start, start + ROLE_MAPPING_BATCH));
+      if (mappingError) return next(mappingError);
+      for (const mapping of (mappings ?? []) as Array<{ role_id?: unknown }>) {
+        if (typeof mapping.role_id === 'string') mapped.add(mapping.role_id);
+      }
+    }
+  } catch (err) {
+    return next(err);
+  }
+  res.json(rows.map((row) => ({ ...row, has_ashby_mapping: mapped.has(row.id) })));
 });
 
 // ── Ask Hello ────────────────────────────────────────────────────────────
@@ -443,7 +477,7 @@ rolesRouter.delete(
         error: {
           type: 'conflict',
           message:
-            'This role is mapped to an Ashby job. Remove the mapping in Ashby Mission Control first.',
+            'This agent is mapped to an Ashby job. Remove the mapping in Ashby Live Jobs first.',
         },
       });
     }

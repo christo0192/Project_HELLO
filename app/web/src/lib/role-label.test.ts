@@ -1,5 +1,12 @@
 import { describe, expect, it } from 'vitest';
-import { agentLabel, agentWithRoleLabel, roleAgentName, uniqueAgentLabels } from './role-label';
+import {
+  agentLabel,
+  agentWithRoleLabel,
+  roleAgentName,
+  roleWithAgentLabel,
+  uniqueAgentLabels,
+  uniqueRoleLabels,
+} from './role-label';
 
 const role = (id: string, title: string, agent_name?: string | null) => ({ id, title, agent_name });
 
@@ -94,6 +101,59 @@ describe('role labels', () => {
       expect(labels.get('r2')).toBe('Sales · 2');
       expect(labels.get('r3')).toBe('Sales · 3');
       expect(new Set(labels.values()).size).toBe(3);
+    });
+  });
+
+  it('renders "Title — Agent" only when there is an agent name', () => {
+    expect(roleWithAgentLabel(role('a', 'Sales Program Advisor', '  Gopu '))).toBe('Sales Program Advisor — Gopu');
+    expect(roleWithAgentLabel(role('b', 'Sales Program Advisor', '   '))).toBe('Sales Program Advisor');
+    expect(roleWithAgentLabel(role('c', 'Sales Program Advisor'))).toBe('Sales Program Advisor');
+  });
+
+  describe('uniqueRoleLabels', () => {
+    it('names every role by its TITLE, never its agent, when titles are unique', () => {
+      const labels = uniqueRoleLabels([
+        role('r1', 'Sales Program Advisor', 'Gopu'),
+        role('r2', 'Support', null),
+      ]);
+      expect(labels.get('r1')).toBe('Sales Program Advisor');
+      expect(labels.get('r2')).toBe('Support');
+    });
+
+    it('tells same-titled roles apart by agent, title first, after an em dash', () => {
+      const labels = uniqueRoleLabels([
+        role('r1', 'Sales Program Advisor', 'Gopu'),
+        role('r2', 'Sales Program Advisor', 'Meera'),
+        role('r3', 'Support', 'Nova'),
+      ]);
+      expect(labels.get('r1')).toBe('Sales Program Advisor — Gopu');
+      expect(labels.get('r2')).toBe('Sales Program Advisor — Meera');
+      // Only the CLASHING roles gain an agent name.
+      expect(labels.get('r3')).toBe('Support');
+    });
+
+    it('numbers what the agent cannot tell apart, in list order', () => {
+      const labels = uniqueRoleLabels([
+        role('r1', 'Sales', null),
+        role('r2', 'Sales', '   '),
+        role('r3', 'Sales', 'Gopu'),
+        role('r4', 'Sales', 'Gopu'),
+      ]);
+      expect(labels.get('r1')).toBe('Sales');
+      expect(labels.get('r2')).toBe('Sales · 2');
+      expect(labels.get('r3')).toBe('Sales — Gopu');
+      expect(labels.get('r4')).toBe('Sales — Gopu · 2');
+      expect(new Set(labels.values()).size).toBe(4);
+    });
+
+    it('never hands out a number another role already reads as', () => {
+      const labels = uniqueRoleLabels([
+        role('r1', 'Sales', null),
+        role('r2', 'Sales · 2', null),
+        role('r3', 'Sales', null),
+      ]);
+      expect(labels.get('r2')).toBe('Sales · 2');
+      expect(labels.get('r3')).toBe('Sales · 3');
     });
   });
 });
