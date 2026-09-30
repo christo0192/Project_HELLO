@@ -146,6 +146,21 @@ jobs:
           path: sbom-artifacts/*.cdx.json
           retention-days: 90
       - name: Compile LiveKit worker
-        run: python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/phone.py app/voice-livekit/phone_canary.py app/voice-livekit/persistence.py app/voice-livekit/prompting.py app/voice-livekit/observability.py app/voice-livekit/provenance.py app/voice-livekit/provider_resilience.py
+        run: python3 -m py_compile app/voice-livekit/agent.py app/voice-livekit/noise_suppression.py app/voice-livekit/phone.py app/voice-livekit/phone_canary.py app/voice-livekit/persistence.py app/voice-livekit/prompting.py app/voice-livekit/observability.py app/voice-livekit/provenance.py app/voice-livekit/provider_resilience.py
       - name: Test LiveKit worker
         run: cd app/voice-livekit && python3 -m unittest discover -s tests -p 'test_*.py' -v
+      # Phone RNNoise (noise_suppression.py): the bare-python step above SKIPS
+      # its DSP tests (no numpy/livekit/librnnoise), so the FIFO, frame-length
+      # and real-library equivalence tests would otherwise never run in CI. Run
+      # them against the production pins in an isolated venv — requirements.txt
+      # plus pyrnnoise --no-deps, exactly as the Dockerfile installs them — and
+      # fail if any of them skipped.
+      - name: Test phone noise suppression (real DSP)
+        run: |
+          python3 -m venv /tmp/ns-venv
+          /tmp/ns-venv/bin/pip install --no-cache-dir -q -r app/voice-livekit/requirements.txt
+          /tmp/ns-venv/bin/pip install --no-cache-dir -q --no-deps pyrnnoise==0.4.5
+          cd app/voice-livekit
+          /tmp/ns-venv/bin/python -m unittest tests.test_noise_suppression -v > /tmp/ns-test.log 2>&1 || { cat /tmp/ns-test.log; exit 1; }
+          cat /tmp/ns-test.log
+          if grep -q "skipped" /tmp/ns-test.log; then echo "::error::RNNoise DSP tests skipped"; exit 1; fi

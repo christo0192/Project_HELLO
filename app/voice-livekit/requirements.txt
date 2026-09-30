@@ -30,3 +30,15 @@ livekit-plugins-google==1.6.4
 python-dotenv==1.2.2
 supabase==2.31.0
 httpx==0.28.1
+# NOT LISTED HERE, ON PURPOSE: pyrnnoise==0.4.5 (Apache-2.0), the phone-path
+# RNNoise library used by noise_suppression.py. It is installed by the
+# Dockerfile builder stage as a SEPARATE step:
+#   pip install --no-cache-dir --no-deps pyrnnoise==0.4.5
+# A requirements line cannot carry --no-deps, and without it pip would pull
+# pyrnnoise's declared deps (audiolab, matplotlib, click, tqdm), which serve
+# only its CLI/wav helpers. The worker uses nothing but the librnnoise.so the
+# wheel bundles (bound via ctypes; `pyrnnoise` itself is never imported), and
+# the one runtime dependency that needs, numpy, already arrives unconditionally
+# with livekit-agents==1.6.4 (Requires-Dist: numpy>=1.26.0). A local venv that
+# skips that step simply runs with suppression fail-open OFF (logged
+# `phone_noise_suppression_unavailable reason=not_installed`).

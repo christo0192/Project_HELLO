@@ -11,7 +11,8 @@
 #    drain on SIGTERM) is owner-verified at runtime, not claimed here.
 #  - No custom VAD or local turn-detector model is bundled; turn handling uses
 #    LiveKit Agents defaults to stay within the low-memory worker budget.
-#  - Direct pins only (requirements.txt); this is not a full lock.
+#  - Direct pins only (requirements.txt, plus pyrnnoise==0.4.5 installed
+#    --no-deps in the builder stage below); this is not a full lock.
 
 # Stage 1: resolve and install pinned direct dependencies in an isolated venv.
 FROM python:3.12-slim AS builder
@@ -25,6 +26,18 @@ WORKDIR /build
 COPY requirements.txt ./
 RUN python -m venv /opt/venv \
     && /opt/venv/bin/pip install --no-cache-dir -r requirements.txt
+
+# Phone-path noise suppression (noise_suppression.py): pyrnnoise is installed
+# ONLY for the librnnoise.so it bundles (manylinux1_x86_64 wheel, no build
+# step), which noise_suppression.py binds via ctypes WITHOUT importing
+# pyrnnoise. --no-deps on purpose: its declared deps (audiolab, matplotlib,
+# click, tqdm) serve only its CLI/wav helpers, which the worker never imports,
+# and would add a plotting stack to a memory-bounded image. The one runtime
+# dependency the denoiser does need, numpy, is already an unconditional
+# requirement of livekit-agents==1.6.4 (Requires-Dist: numpy>=1.26.0).
+# Pinned exactly here rather than in requirements.txt, because a
+# requirements line cannot carry --no-deps (see the note there).
+RUN /opt/venv/bin/pip install --no-cache-dir --no-deps pyrnnoise==0.4.5
 
 # Stage 2: minimal runtime image with the venv and worker sources only.
 FROM python:3.12-slim AS runtime
@@ -76,13 +89,17 @@ COPY --from=builder /opt/venv /opt/venv
 # agent.py, for the PR B on-demand orchestration readiness ping) and MUST ship
 # for the same reason — a worker that cannot import it crash-loops at startup
 # even though the ping is gated OFF unless WORKER_ORCHESTRATION=worker.
+# noise_suppression.py was added the same way (`import noise_suppression` in
+# agent.py, for phone-path RNNoise) and MUST ship for the same reason — a worker
+# that cannot import it crash-loops at startup even though suppression is
+# switchable OFF with PHONE_NOISE_SUPPRESSION=off.
 # Deliberately excluded (not on the runtime import path): voice_quality_harness.py,
 # model_governance/, tests/ — see .dockerignore.
 # Limitation: the static closure resolves absolute, relative, and literal-string
 # dynamic imports (importlib.import_module("x")/__import__("x")); a first-party
 # module pulled in only via a computed/non-literal import name cannot be seen
 # statically and must be added here by hand.
-COPY agent.py closing.py observability.py persistence.py phone.py phone_canary.py prompting.py provenance.py provider_resilience.py recording.py recording_api.py worker_ready_api.py ./
+COPY agent.py closing.py noise_suppression.py observability.py persistence.py phone.py phone_canary.py prompting.py provenance.py provider_resilience.py recording.py recording_api.py worker_ready_api.py ./
 
 USER 1000:1000
 
