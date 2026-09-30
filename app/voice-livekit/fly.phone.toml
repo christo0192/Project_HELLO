@@ -141,6 +141,29 @@ primary_region = "sin"
   PHONE_SARVAM_NEGATIVE_SPEECH_THRESHOLD = "0.55"
   PHONE_SARVAM_NEGATIVE_FRAMES_COUNT = "22"
   PHONE_SARVAM_NEGATIVE_FRAMES_WINDOW = "28"
+  # ── CANDIDATE-SIDE NOISE SUPPRESSION: RNNoise (owner report, 2026-09-30) ──
+  # The candidate's background (traffic, TV, other voices) reached STT and VAD
+  # untouched: nothing on the PSTN leg suppresses it, and in livekit-agents
+  # 1.6.4 VAD does not gate STT. "rnnoise" runs RNNoise on the phone session's
+  # INBOUND audio only (noise_suppression.py, wired at the phone session.start
+  # in agent.py); the bot's own TTS and the browser worker are untouched.
+  #
+  # EVIDENCE — offline A/B on the owner-reported noisy call (2026-09-30), 244 s:
+  #   Silero VAD speech segments            53 -> 36
+  #   caller "speech" overlapping bot speech 27.0 s -> 12.9 s
+  #   Whisper words on the caller track     159 -> 162 (speech not eaten)
+  # WebRTC NS made the same call WORSE. Krisp NC is not used: free-plan
+  # constraint, and it also scored worse than RNNoise on this call.
+  #
+  # KILL SWITCH: "off" restores the exact pre-change session start (24 kHz
+  # input, no frame processor). ENV-REVERTIBLE without a code change. A Fly
+  # SECRET of the same name SHADOWS this line (same trap as the DEPLOY NOTE
+  # below), so the fastest live revert is
+  #   fly secrets set PHONE_NOISE_SUPPRESSION=off -a project-hello-phone-voice
+  # and it MUST be unset again afterwards or this line stays documentation.
+  # Fail-open either way: if the library cannot load, the call proceeds
+  # unfiltered (`phone_noise_suppression_unavailable reason=...`).
+  PHONE_NOISE_SUPPRESSION = "rnnoise"
   SARVAM_TTS_MODEL = "bulbul:v3"
   SARVAM_TTS_VOICE = "simran"
   # Call G RCA (2026-09-08) — REVERTED "stt" -> "local". The X8 stt experiment

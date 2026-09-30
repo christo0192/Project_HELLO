@@ -24,6 +24,7 @@ from livekit import api as livekit_api
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
 from livekit.plugins import openai, sarvam
 
+import noise_suppression
 import persistence
 import phone
 import phone_canary
@@ -8604,7 +8605,46 @@ async def _run_phone_session(
         if participant is None:
             return None
         participant_present_anchor[0] = int(round(time.time() * 1000))
-        await session.start(agent=agent, room=ctx.room, record=dict(_PHONE_NO_RECORDING))
+        # ── PHONE NOISE SUPPRESSION: RNNoise ON THE CANDIDATE'S INBOUND AUDIO ──
+        # Owner report 2026-09-30: the candidate's background (traffic, TV, other
+        # voices) reached STT and VAD untouched on PSTN, and in livekit-agents
+        # 1.6.4 VAD does NOT gate STT, so noise became phantom turns and garbage
+        # transcript. An offline A/B on the real call chose RNNoise (WebRTC NS
+        # made it worse; Krisp NC is not used). The options come from
+        # `noise_suppression.phone_room_options()`, computed HERE — per call, just
+        # before start, after the answer — and are passed ONLY when non-None:
+        # `None` (kill switch PHONE_NOISE_SUPPRESSION=off in fly.phone.toml, or
+        # the library failing to load) is EXACTLY the pre-change start call.
+        # Non-None differs from the SDK default RoomOptions in two fields only:
+        # the input sample rate (24 kHz -> 48 kHz, RNNoise's native rate) and
+        # `noise_cancellation` (a per-track RNNoise FrameProcessor selector).
+        # Every consumer of that input resamples on its own first frame (Sarvam
+        # STT -> 16 kHz, Silero VAD -> 16 kHz, RecorderIO -> 48 kHz), verified
+        # against the pinned 1.6.4 wheels. Fail-OPEN: the module never raises,
+        # and this guard makes sure a future regression in it cannot either —
+        # a call without a denoiser is degraded, a call that never starts is
+        # lost. PHONE ONLY: the browser `_run_session` start and the Canary-1
+        # start in phone_canary.py are deliberately untouched.
+        noise_room_options: Any = None
+        try:
+            noise_room_options = noise_suppression.phone_room_options()
+        except Exception:  # noqa: BLE001 — fail open: never cost the call a start
+            noise_room_options = None
+            _log.warn(
+                "unknown_event", error_type="phone_noise_suppression",
+                error_category="options_failed",
+            )
+        _log.info(
+            "unknown_event", error_type="phone_noise_suppression",
+            error_category="applied" if noise_room_options is not None else "not_applied",
+        )
+        if noise_room_options is None:
+            await session.start(agent=agent, room=ctx.room, record=dict(_PHONE_NO_RECORDING))
+        else:
+            await session.start(
+                agent=agent, room=ctx.room, record=dict(_PHONE_NO_RECORDING),
+                room_options=noise_room_options,
+            )
         # ── PR A SEAM 1: WIRE THE IN-WORKER RECORDER AFTER THE SESSION STARTS ──
         # RecorderIO's taps must wrap the LIVE room audio I/O, and RoomIO only
         # attaches that to `session.input.audio` / `session.output.audio` DURING
