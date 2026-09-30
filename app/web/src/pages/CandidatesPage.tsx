@@ -33,7 +33,6 @@ import { api, ApiError } from "../api";
 import {
   roleFilterOptions,
   shouldResetRoleFilter,
-  useMappedRoleIds,
 } from "../lib/mapped-roles";
 import type { Candidate, Role } from "../types";
 import type { CandidateFilters } from "../components/talent";
@@ -418,17 +417,15 @@ export function CandidatesPage() {
     [applyFilters],
   );
 
-  // The role filter lists only roles with an Ashby job mapping (live, paused
-  // or drift), by role title (owner decision, M008), or every role when the
-  // mappings cannot be read. A role in the URL that is not offered falls back
-  // to "All roles": REPLACING the history entry, so Back does not return to a
-  // filter the control cannot show.
-  const mappedRoles = useMappedRoleIds();
-  const roleOptions = useMemo(
-    () => roleFilterOptions(roles, mappedRoles, roleId),
-    [roles, mappedRoles, roleId],
-  );
-  const resetRole = shouldResetRoleFilter(roleId, mappedRoles, rolesLoaded, roleOptions);
+  // The role filter lists only the roles the server flags `has_ashby_mapping`
+  // (a live, paused or drift Ashby job mapping), by role title (owner
+  // decision, M008), or every role on an API older than the flag. A role in
+  // the URL that is not offered falls back to "All roles" once the roles have
+  // loaded: REPLACING the history entry, so Back does not return to a filter
+  // the control cannot show. No listed roles hides the control, as on the
+  // Dashboard.
+  const roleOptions = useMemo(() => roleFilterOptions(roles), [roles]);
+  const resetRole = shouldResetRoleFilter(roleId, rolesLoaded, roleOptions);
   useEffect(() => {
     if (!resetRole) return;
     setSearchParams(buildCandidateSearch({ ...filters, roleId: null }), { replace: true });
@@ -559,7 +556,7 @@ export function CandidatesPage() {
               </span>
             )}
           </h2>
-          {roles.length > 0 && (
+          {roleOptions.length > 0 && (
             <div className="w-full sm:w-56">
               <label htmlFor="role-filter" className="sr-only">
                 Filter by role

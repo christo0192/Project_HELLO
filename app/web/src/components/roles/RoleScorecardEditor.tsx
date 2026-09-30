@@ -432,7 +432,7 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
 
       {metrics.length === 0 ? (
         <p className="mt-4 text-sm text-ink-tertiary">
-          No metrics attached yet. This role uses the legacy scoring until a scorecard is saved.
+          No metrics attached yet. This agent uses the legacy scoring until a scorecard is saved.
         </p>
       ) : (
         <ul className="mt-4 space-y-3" data-scorecard-metrics>
@@ -474,9 +474,9 @@ export function RoleScorecardEditor({ roleId }: { roleId: string }) {
               </div>
 
               <Field
-                label="Instruction for this role"
+                label="Instruction for this agent"
                 id={`metric-${m.id}-instruction`}
-                hint="Overrides the library default for this role only."
+                hint="Overrides the library default for this agent only."
               >
                 {({ id, describedBy }) => (
                   <TextArea

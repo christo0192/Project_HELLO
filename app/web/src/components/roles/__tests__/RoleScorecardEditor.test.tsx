@@ -539,7 +539,7 @@ describe('RoleScorecardEditor', () => {
     api.getRoleScorecard.mockResolvedValue({ scorecard: null });
     render(<RoleScorecardEditor roleId="r1" />);
     expect(
-      await screen.findByText(/This role uses the legacy scoring until a scorecard is saved\./),
+      await screen.findByText(/This agent uses the legacy scoring until a scorecard is saved\./),
     ).toBeInTheDocument();
   });
 
@@ -549,7 +549,7 @@ describe('RoleScorecardEditor', () => {
     // alarm about nothing, and it would be the loudest thing on the panel.
     api.getRoleScorecard.mockResolvedValue({ scorecard: null });
     render(<RoleScorecardEditor roleId="r1" />);
-    await screen.findByText(/This role uses the legacy scoring/);
+    await screen.findByText(/This agent uses the legacy scoring/);
 
     expect(document.querySelector('[data-weight-total-bps]')).toBeNull();
     expect(document.querySelector('[data-weight-total-footer]')).toBeNull();

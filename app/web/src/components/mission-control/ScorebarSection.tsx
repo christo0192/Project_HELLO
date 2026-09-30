@@ -506,7 +506,7 @@ export function ScorebarSection() {
       {metrics.length === 0 ? (
         <EmptyPanel
           title="No scorecard metrics yet"
-          hint="Create the first metric to start the library roles score against."
+          hint="Create the first metric to start the library agents score against."
         />
       ) : (
         <div>

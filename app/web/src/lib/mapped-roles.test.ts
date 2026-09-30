@@ -1,83 +1,97 @@
 import { describe, expect, it } from 'vitest';
-import type { AshbyMcMapping } from '../types';
 import {
-  mappedRoleIds,
+  hasMappingFlag,
+  listedRoles,
   roleFilterOptions,
   shouldResetRoleFilter,
-  type MappedRoles,
+  type FilterableRole,
 } from './mapped-roles';
 
-function mapping(roleId: string | null | undefined, status: AshbyMcMapping['status']): AshbyMcMapping {
-  return {
-    id: `m-${String(roleId)}-${status}`, externalJobId: 'job', status, statusReason: null,
-    deliveryMode: 'email', hasAiStage: true, hasTaStage: true, label: null, roleId,
-    updatedAt: '2026-09-16T06:00:00Z',
-  };
-}
-
-const ready = (...ids: string[]): MappedRoles => ({ status: 'ready', roleIds: new Set(ids) });
-const loading: MappedRoles = { status: 'loading', roleIds: new Set() };
-const unavailable: MappedRoles = { status: 'unavailable', roleIds: new Set() };
-
-const ROLES = [
-  { id: 'r1', title: 'Sales Program Advisor', agent_name: 'Gopu' },
-  { id: 'r2', title: 'Customer Support' },
-  { id: 'r3', title: 'Backend Engineer' },
+// The server computes `has_ashby_mapping` from every non-archived mapping in
+// ANY status, so a live, a paused-only and a drift-only role all arrive as
+// `true`; a role with none (or only archived ones) arrives as `false`.
+const FLAGGED: FilterableRole[] = [
+  { id: 'r1', title: 'Sales Program Advisor', agent_name: 'Gopu', has_ashby_mapping: true }, // live
+  { id: 'r2', title: 'Customer Support', has_ashby_mapping: true }, // paused-only
+  { id: 'r3', title: 'Backend Engineer', has_ashby_mapping: true }, // drift
+  { id: 'r4', title: 'Unmapped Role', has_ashby_mapping: false },
 ];
 
-describe('mappedRoleIds', () => {
-  it('counts a mapping in ANY status — live, paused or drift — that names a role', () => {
-    const ids = mappedRoleIds([
-      mapping('r1', 'enabled'),
-      mapping('r2', 'paused'),
-      mapping('r3', 'drift'),
-      mapping(null, 'enabled'),
-      mapping(undefined, 'enabled'),
-      mapping('r4', 'enabled'),
-      mapping('r4', 'paused'),
-    ]);
-    expect([...ids].sort()).toEqual(['r1', 'r2', 'r3', 'r4']);
-  });
+/** The same roles from an API older than the flag. */
+const UNFLAGGED: FilterableRole[] = FLAGGED.map(({ has_ashby_mapping: _flag, ...role }) => role);
 
-  it('counts nothing when there are no mappings', () => {
-    expect(mappedRoleIds([]).size).toBe(0);
+describe('hasMappingFlag', () => {
+  it('is true only when every row carries a boolean flag', () => {
+    expect(hasMappingFlag(FLAGGED)).toBe(true);
+    expect(hasMappingFlag(UNFLAGGED)).toBe(false);
+    expect(hasMappingFlag([...UNFLAGGED.slice(0, 1), ...FLAGGED.slice(1)])).toBe(false);
+    expect(hasMappingFlag([{ id: 'x', title: 'X', has_ashby_mapping: null }])).toBe(false);
   });
 });
 
 describe('roleFilterOptions', () => {
-  it('lists only mapped roles when the read succeeded, sorted by title, values = ids', () => {
-    expect(roleFilterOptions(ROLES, ready('r1', 'r3', 'gone'), null)).toEqual([
+  it('lists only roles flagged true, sorted by title, values = ids', () => {
+    expect(roleFilterOptions(FLAGGED)).toEqual([
       { id: 'r3', label: 'Backend Engineer' },
+      { id: 'r2', label: 'Customer Support' },
       { id: 'r1', label: 'Sales Program Advisor' },
     ]);
   });
 
-  it('lists every role when the read failed', () => {
-    expect(roleFilterOptions(ROLES, unavailable, null).map((o) => o.id)).toEqual(['r3', 'r2', 'r1']);
+  it('hides a role flagged false', () => {
+    expect(roleFilterOptions(FLAGGED).map((o) => o.id)).not.toContain('r4');
   });
 
-  it('lists only the current selection while loading', () => {
-    expect(roleFilterOptions(ROLES, loading, null)).toEqual([]);
-    expect(roleFilterOptions(ROLES, loading, 'r2')).toEqual([{ id: 'r2', label: 'Customer Support' }]);
+  it('lists EVERY role when the flag is absent (an API older than the flag)', () => {
+    expect(roleFilterOptions(UNFLAGGED).map((o) => o.id)).toEqual(['r3', 'r2', 'r1', 'r4']);
+  });
+
+  it('lists nothing when no role is mapped, or there are no roles', () => {
+    expect(roleFilterOptions(FLAGGED.map((r) => ({ ...r, has_ashby_mapping: false })))).toEqual([]);
+    expect(roleFilterOptions([])).toEqual([]);
+  });
+
+  it('labels by role TITLE, disambiguating only among the listed roles', () => {
+    const roles: FilterableRole[] = [
+      { id: 'a', title: 'Sales', agent_name: 'Gopu', has_ashby_mapping: true },
+      { id: 'b', title: 'Sales', agent_name: 'Meera', has_ashby_mapping: true },
+      { id: 'c', title: 'Ops', agent_name: 'Nova', has_ashby_mapping: true },
+      { id: 'd', title: 'Ops', agent_name: 'Other', has_ashby_mapping: false },
+    ];
+    expect(roleFilterOptions(roles)).toEqual([
+      { id: 'c', label: 'Ops' },
+      { id: 'a', label: 'Sales — Gopu' },
+      { id: 'b', label: 'Sales — Meera' },
+    ]);
+  });
+});
+
+describe('listedRoles', () => {
+  it('keeps the role objects themselves', () => {
+    expect(listedRoles(FLAGGED)).toEqual(FLAGGED.slice(0, 3));
+    expect(listedRoles(UNFLAGGED)).toEqual(UNFLAGGED);
   });
 });
 
 describe('shouldResetRoleFilter', () => {
-  const options = roleFilterOptions(ROLES, ready('r1'), 'r2');
+  const options = roleFilterOptions(FLAGGED);
 
-  it('resets a selection the mapped set does not offer', () => {
-    expect(shouldResetRoleFilter('r2', ready('r1'), true, options)).toBe(true);
+  it('resets a selection the flagged roles do not offer', () => {
+    expect(shouldResetRoleFilter('r4', true, options)).toBe(true);
+    expect(shouldResetRoleFilter('gone', true, options)).toBe(true);
   });
 
-  it('keeps a mapped selection, and never resets with nothing selected', () => {
-    expect(shouldResetRoleFilter('r1', ready('r1'), true, options)).toBe(false);
-    expect(shouldResetRoleFilter(null, ready('r1'), true, options)).toBe(false);
-    expect(shouldResetRoleFilter('', ready('r1'), true, options)).toBe(false);
+  it('keeps an offered selection, and never resets with nothing selected', () => {
+    expect(shouldResetRoleFilter('r1', true, options)).toBe(false);
+    expect(shouldResetRoleFilter(null, true, options)).toBe(false);
+    expect(shouldResetRoleFilter('', true, options)).toBe(false);
   });
 
-  it('never resets while loading, after a failed read, or before roles load', () => {
-    expect(shouldResetRoleFilter('r2', loading, true, [])).toBe(false);
-    expect(shouldResetRoleFilter('r2', unavailable, true, [])).toBe(false);
-    expect(shouldResetRoleFilter('r2', ready('r1'), false, [])).toBe(false);
+  it('never resets before the roles load (or when their read failed)', () => {
+    expect(shouldResetRoleFilter('r4', false, [])).toBe(false);
+  });
+
+  it('keeps any real role on an older API, where every role is offered', () => {
+    expect(shouldResetRoleFilter('r4', true, roleFilterOptions(UNFLAGGED))).toBe(false);
   });
 });

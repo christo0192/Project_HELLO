@@ -128,7 +128,16 @@ const ROUTES: Array<[string, string, Handler]> = [
   ['GET', '/api/me', (_r, db) => ok(db.me)],
 
   // ── Roles + Ask Hello drafting ─────────────────────────────────────
-  ['GET', '/api/roles', (_r, db) => ok(db.roles)],
+  // Every row carries `has_ashby_mapping`, derived the way the API derives
+  // it (M008): true iff a live (non-archived) mapping names the role, in any
+  // status. Archive REMOVES a fixture mapping, so `db.ashby.mappings` is the
+  // non-archived set. The seed maps backend (enabled), data (paused) and
+  // frontend (drift); sre, support and qa have none, so the role filters
+  // must list three roles and hide three.
+  ['GET', '/api/roles', (_r, db) => {
+    const mapped = new Set(db.ashby.mappings.map((m) => m.roleId).filter(Boolean));
+    return ok(db.roles.map((role) => ({ ...role, has_ashby_mapping: mapped.has(role.id) })));
+  }],
   ['POST', '/api/roles', ({ body }, db) => {
     const role = { ...(body as unknown as Role), id: mintId(), is_active: true, created_at: nowIso() };
     db.roles.unshift(role);

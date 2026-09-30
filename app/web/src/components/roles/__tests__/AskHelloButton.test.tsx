@@ -136,7 +136,7 @@ describe('AskHelloButton', () => {
     await act(async () => askHello().click());
 
     const status = await screen.findByRole('status');
-    await waitFor(() => expect(status.textContent).toContain('Writing the role'));
+    await waitFor(() => expect(status.textContent).toContain('Writing the agent'));
     expect(status.textContent).toContain('1 of 3');
 
     mockApi.getRoleDraft.mockResolvedValue(

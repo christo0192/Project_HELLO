@@ -42,7 +42,7 @@ import type { MetricItem } from '../design/MetricStrip';
 import { LineChart } from '../charts';
 import { formatDayLabel, formatDayTime } from '../charts/dates';
 import { buildRateSeries, pct, pctLabel } from './rates';
-import { roleFilterOptions, shouldResetRoleFilter, useMappedRoleIds } from '../../lib/mapped-roles';
+import { roleFilterOptions, shouldResetRoleFilter } from '../../lib/mapped-roles';
 
 /** Selectable trailing windows. 30 is the default the endpoint already uses. */
 const RANGE_OPTIONS = [
@@ -79,18 +79,16 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
   const rolesLoaded = rolesProp !== undefined || rolesLoadedFromApi;
   const [roleId, setRoleId] = useState<string>('');
   // The filter is ROLE-wise (owner decision, M008): it lists only the roles
-  // with an Ashby job mapping (live, paused or drift), each named by its
-  // role title, with same-titled roles told apart (see `uniqueRoleLabels`).
-  // If the mappings cannot be read it lists every role instead. The option
-  // VALUE stays the role id, so the filter itself never changes.
-  const mappedRoles = useMappedRoleIds();
-  const roleOptions = useMemo(
-    () => roleFilterOptions(roles, mappedRoles, roleId),
-    [roles, mappedRoles, roleId],
-  );
+  // the server flags `has_ashby_mapping` (a live, paused or drift Ashby job
+  // mapping), each named by its role title, with same-titled roles told
+  // apart (see `uniqueRoleLabels`). An API older than the flag lists every
+  // role instead. The option VALUE stays the role id, so the filter itself
+  // never changes. No listed roles hides the control: a lone "All roles"
+  // select filters nothing.
+  const roleOptions = useMemo(() => roleFilterOptions(roles), [roles]);
   // A selection that is not (or no longer) offered falls back to "All roles"
   // rather than filtering on a role the control cannot show.
-  const resetRole = shouldResetRoleFilter(roleId, mappedRoles, rolesLoaded, roleOptions);
+  const resetRole = shouldResetRoleFilter(roleId, rolesLoaded, roleOptions);
   useEffect(() => {
     if (resetRole) setRoleId('');
   }, [resetRole]);
@@ -371,7 +369,7 @@ export function ScreeningKpis({ className, roles: rolesProp }: ScreeningKpisProp
           description="Who we reached, what screening concluded and what the team did next."
         />
         <div className="flex w-full flex-wrap items-center gap-2 sm:w-auto">
-          {roles.length > 0 && (
+          {roleOptions.length > 0 && (
             <label className="block w-full sm:w-56">
               <span className="sr-only">Filter by role</span>
               <select

@@ -62,7 +62,7 @@ const POLL_MS = 2_000;
 function phaseLabel(p: RoleDraftProgress | null): string {
   if (!p) return 'Starting…';
   const of = `${p.attempt} of ${p.maxAttempts}`;
-  if (p.phase === 'drafting') return `Writing the role… (${of})`;
+  if (p.phase === 'drafting') return `Writing the agent… (${of})`;
   if (p.phase === 'checking') return `Checking the questions are speakable… (${of})`;
   if (p.phase === 'rereading') return `Hello's answer was unreadable — asking again… (${of})`;
   return `Rephrasing ${p.rejected} question${p.rejected === 1 ? '' : 's'} the screener won't read aloud… (${of})`;
@@ -272,7 +272,7 @@ export function AskHelloButton({
         // is a silent lie.
         cbs.current.onDrafted(job.draft, job.repaired, job.job_role);
       } else if (job.status === 'failed') {
-        cbs.current.onError(job.error_message ?? 'Hello could not draft this role.');
+        cbs.current.onError(job.error_message ?? 'Hello could not draft this agent.');
       }
       // `cancelled` is the operator's own doing — nothing to report.
     };

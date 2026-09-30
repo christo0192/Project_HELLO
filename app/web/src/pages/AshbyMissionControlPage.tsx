@@ -188,8 +188,8 @@ const SCREENING_CANCELLED = 'Screening cancelled.';
 const NO_OPEN_JOBS = 'There are no open jobs in Ashby right now.';
 const CONFIDENTIAL_WITHHELD = "Confidential jobs aren't listed here.";
 const ROLES_ERROR = "Couldn't load roles.";
-const NO_ACTIVE_ROLES = 'There are no active roles yet.';
-const NO_ACTIVE_ROLES_HINT = 'Create one on the Roles page first.';
+const NO_ACTIVE_ROLES = 'There are no active agents yet.';
+const NO_ACTIVE_ROLES_HINT = 'Create one on the Agents page first.';
 /**
  * What Delete does, said before it is done. An archive, not a pause: it
  * cannot be undone, and adding the job again starts a NEW mapping.
@@ -412,7 +412,7 @@ export function AshbyMissionControlPage() {
       setWorkflows(w.workflows);
       setError(null);
     } catch (e) {
-      setError(e instanceof ApiError ? e.message : 'Failed to load Mission Control');
+      setError(e instanceof ApiError ? e.message : 'Failed to load Ashby Live Jobs');
     } finally {
       setLoaded(true);
     }
@@ -1679,7 +1679,7 @@ export function AshbyMissionControlPage() {
                     to="/roles"
                     className="rounded-sm font-medium text-ink underline underline-offset-2 hover:text-info focus:outline-none focus-visible:ring-2 focus-visible:ring-info"
                   >
-                    Roles page
+                    Agents page
                   </Link>{' '}
                   first.
                 </InlineNotice>

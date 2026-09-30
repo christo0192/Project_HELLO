@@ -77,13 +77,13 @@ paths:
       summary: List roles (viewer+; interviewer scoped to own records)
       responses:
         '200':
-          description: Array of role rows.
+          description: Array of role rows, each flagged with whether it has a non-archived Ashby job mapping.
           content:
             application/json:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/Role'
+                  $ref: '#/components/schemas/RoleListItem'
     post:
       tags: [roles]
       operationId: createRole
@@ -8268,6 +8268,17 @@ components:
           type: string
           format: date-time
       additionalProperties: true
+
+    RoleListItem:
+      description: A role row as the list returns it - the Role plus has_ashby_mapping. Only GET /api/roles computes the flag; the single-role reads and writes return a plain Role.
+      allOf:
+        - $ref: '#/components/schemas/Role'
+        - type: object
+          required: [has_ashby_mapping]
+          properties:
+            has_ashby_mapping:
+              type: boolean
+              description: True iff at least one ashby_job_mappings row with this role_id has archived_at null, in any status (enabled, paused or drift). Computed server-side in one read for the whole list, with no audit write. The Dashboard and Candidates role filters list only roles where this is true.
 
     CandidateListItem:
       type: object

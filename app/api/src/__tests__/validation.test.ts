@@ -121,6 +121,7 @@ function chainable(value: any): any {
   // Passthrough methods that routes call: .eq(), .order(), .limit(), .single(), .maybeSingle()
   fn.eq = () => chainable(value);
   fn.in = () => chainable(value);
+  fn.is = () => chainable(value);
   fn.order = () => chainable(value);
   fn.limit = () => chainable(value);
   fn.select = () => chainable(value);
