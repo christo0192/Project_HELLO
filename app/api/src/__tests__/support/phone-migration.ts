@@ -97,6 +97,15 @@ export const MIGRATION_0096_PATH = fileURLToPath(
 
 export const MIGRATION_0096 = readFileSync(MIGRATION_0096_PATH, 'utf8');
 
+// 0111 re-declares phone_ist_window_open IN FULL (0085's body plus the single
+// owner-test date 2026-09-30). It must outrank 0085, or functionBody() reads
+// the superseded predicate and the TS mirror drift test is blind to the date.
+export const MIGRATION_0111_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0111_phone_owner_test_night_2026_09_30.sql', import.meta.url),
+);
+
+export const MIGRATION_0111 = readFileSync(MIGRATION_0111_PATH, 'utf8');
+
 // 0110 re-declares set_phone_halt IN FULL (the reason in force escalates to the
 // most restrictive one requested and is never downgraded). It must outrank
 // 0042, or every extractor — the reason allowlist, the status vocabulary and
@@ -303,6 +312,9 @@ export const MIGRATION_0092 = readFileSync(MIGRATION_0092_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0111 — phone_ist_window_open IN FULL (one-night owner test date), so it
+    // must precede 0085.
+    { name: '0111', sql: MIGRATION_0111 },
     // 0110 — set_phone_halt IN FULL (halt reason precedence), so it must
     // precede 0042.
     { name: '0110', sql: MIGRATION_0110 },

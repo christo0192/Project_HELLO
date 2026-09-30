@@ -17,6 +17,7 @@ import {
   PHONE_IST_WINDOW,
   PHONE_IST_WINDOW_CLOSE_AT,
   PHONE_TEMPORARY_247_UNTIL_IST,
+  PHONE_OWNER_TEST_247_DATES_IST,
   PHONE_IST_WINDOW_OPEN_AT,
   PHONE_MAX_CONCURRENT,
   istDate,
@@ -30,7 +31,7 @@ import {
   nextIstWindowOpen,
   parseIstClockTime,
 } from '../lib/phone-screening/ist-window.js';
-import { helperLiteral, functionBody, MIGRATION_0042, MIGRATION_0064, MIGRATION_0085, MIGRATION_0092 } from './support/phone-migration.js';
+import { helperLiteral, functionBody, MIGRATION_0042, MIGRATION_0064, MIGRATION_0085, MIGRATION_0092, MIGRATION_0111 } from './support/phone-migration.js';
 
 const IST_SOURCE = readFileSync(
   fileURLToPath(new URL('../lib/phone-screening/ist-window.ts', import.meta.url)),
@@ -213,8 +214,10 @@ describe('the effective temporary window', () => {
   it('at or after close returns TOMORROW\'S open', () => {
     expect(nextIstWindowOpen(ist(2026, 9, 14, 21, 0, 0)).getTime())
       .toBe(ist(2026, 9, 15, 9, 0, 0).getTime());
-    expect(nextIstWindowOpen(ist(2026, 9, 30, 23, 30, 0)).getTime())
-      .toBe(ist(2026, 10, 1, 9, 0, 0).getTime());
+    // Month rollover. (Was 2026-09-30 → 10-01; 09-30 is now the 0111 owner
+    // test date, open all hours, so the rollover case moved to October.)
+    expect(nextIstWindowOpen(ist(2026, 10, 31, 23, 30, 0)).getTime())
+      .toBe(ist(2026, 11, 1, 9, 0, 0).getTime());
   });
 
   it('20:59 plus a 120-second reconnect backoff lands OUTSIDE the window', () => {
@@ -247,5 +250,37 @@ describe('the effective temporary window', () => {
     expect(() => istWallClockToInstant(2026, 8, 22, -1)).toThrow(/out_of_range/);
     expect(() => parseIstClockTime('9:00')).toThrow();
     expect(() => parseIstClockTime('25:00:00')).toThrow();
+  });
+});
+
+describe('0111: the one-night owner test allowance (2026-09-30 only)', () => {
+  it('SQL and the TS mirror name the same single date, and the SQL keeps the cutoff and normal bounds', () => {
+    const body = functionBody('phone_ist_window_open');
+    expect(PHONE_OWNER_TEST_247_DATES_IST).toEqual(['2026-09-30']);
+    expect(MIGRATION_0111).toContain("date '2026-09-30'");
+    expect(body).toContain("= date '2026-09-30'");
+    expect(body).toContain('<= screening_v2.phone_temporary_247_until()');
+    expect(body).toContain('>= screening_v2.phone_ist_window_open_at()');
+    expect(body).toContain('< screening_v2.phone_ist_window_close_at()');
+    // It is a DATE, not a cutoff: the cutoff helper is untouched.
+    expect(helperLiteral('phone_temporary_247_until')).toBe('2026-09-09');
+  });
+
+  it('opens all hours on 2026-09-30 IST and nowhere else', () => {
+    expect(istWindowForDate('2026-09-30')).toBe(PHONE_24X7_WINDOW);
+    expect(istWindowOpen(ist(2026, 9, 30, 22, 30))).toBe(true);        // tonight, 22:30 IST
+    expect(istWindowOpen(ist(2026, 9, 30, 23, 59, 59))).toBe(true);    // last allowed instant
+    expect(istWindowOpen(ist(2026, 10, 1, 0, 0, 0))).toBe(false);      // expires at 00:00 IST
+    expect(istWindowForDate('2026-10-01')).toBe(PHONE_IST_WINDOW);
+    expect(istWindowOpen(ist(2026, 9, 29, 22, 30))).toBe(false);       // the night before stays closed
+    expect(istWindowForDate('2026-09-29')).toBe(PHONE_IST_WINDOW);
+    expect(istWindowOpen(ist(2026, 10, 1, 9, 0))).toBe(true);          // normal window resumes
+  });
+
+  it('next legal instant: now during the allowance, 09:00 IST after it', () => {
+    const tonight = ist(2026, 9, 30, 22, 30);
+    expect(nextIstWindowOpen(tonight).getTime()).toBe(tonight.getTime());
+    expect(nextIstWindowOpen(ist(2026, 10, 1, 0, 0, 0)).getTime())
+      .toBe(ist(2026, 10, 1, 9, 0, 0).getTime());
   });
 });

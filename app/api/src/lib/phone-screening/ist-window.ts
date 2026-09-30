@@ -50,6 +50,19 @@ export const PHONE_IST_WINDOW_CLOSE_AT = '21:00:00';
  */
 export const PHONE_TEMPORARY_247_UNTIL_IST = '2026-09-09';
 
+/**
+ * Single IST dates that are open ALL HOURS, independent of the cutoff above.
+ *
+ * Mirror of the literal date in `screening_v2.phone_ist_window_open()` as
+ * declared by migration 0111: a one-night owner test allowance for
+ * 2026-09-30 (verifying the RNNoise release after 21:00 IST). A date, not a
+ * cutoff, so no other date's behaviour changes and it expires by itself at
+ * 00:00 IST 2026-10-01. Real candidates are not exposed: the owner test gate
+ * only arms under an `operator_pause` halt, which stops the ordinary due loop.
+ * Change this only together with a migration that changes the SQL predicate.
+ */
+export const PHONE_OWNER_TEST_247_DATES_IST: readonly string[] = Object.freeze(['2026-09-30']);
+
 /** The temporary window's full-day bounds. The normal bounds remain above. */
 export const PHONE_24X7_WINDOW: IstWindowBounds = Object.freeze({
   openSeconds: 0,
@@ -229,15 +242,13 @@ export function istWallClockToInstant(
  */
 function effectiveWindowForInstant(at: Date, bounds?: IstWindowBounds): IstWindowBounds {
   if (bounds !== undefined) return bounds;
-  return istDate(at) <= PHONE_TEMPORARY_247_UNTIL_IST
-    ? PHONE_24X7_WINDOW
-    : PHONE_IST_WINDOW;
+  return istWindowForDate(istDate(at));
 }
 
 /** The effective bounds for a validated IST calendar date. */
 export function istWindowForDate(date: string): IstWindowBounds {
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new Error('phone_ist_date_invalid');
-  return date <= PHONE_TEMPORARY_247_UNTIL_IST
+  return date <= PHONE_TEMPORARY_247_UNTIL_IST || PHONE_OWNER_TEST_247_DATES_IST.includes(date)
     ? PHONE_24X7_WINDOW
     : PHONE_IST_WINDOW;
 }
