@@ -45,6 +45,9 @@ const _contractVisibleEnvReads = [
   // is partial-finalized. Read functionally through the injectable `source`
   // below; this literal keeps it visible to `check-env-contract.mjs`.
   process.env.PHONE_PARTIAL_FINALIZE_GRACE_SEC,
+  // 0114 (C10d): how long a due-loop starvation episode lasts before the lane
+  // reports `phone_due_starved`.
+  process.env.PHONE_DUE_STARVATION_ALERT_SEC,
 ];
 void _contractVisibleEnvReads;
 
@@ -174,6 +177,29 @@ export function loadPhoneRuntimeConfig(
       source.PHONE_PARTIAL_FINALIZE_GRACE_SEC, b.partialFinalizeGraceSec!,
     ),
   });
+}
+
+/**
+ * 0114 (C10d). The due-loop starvation alert threshold, in SECONDS.
+ *
+ * Kept OUT of `PHONE_RUNTIME_BOUNDS` / `PhoneRuntimeConfig` on purpose: those
+ * are the loop cadences and batch sizes, published as `runtime.config`, and
+ * this is an alerting threshold, not a cadence. Default 30 minutes — long
+ * enough that a cold start, a provider blip or a deploy never pages; the
+ * floor of 5 minutes stays well above the 15 s due cadence, the ceiling of 6
+ * hours keeps a mis-set value from hiding a whole calling day.
+ */
+export const PHONE_DUE_STARVATION_ALERT_BOUNDS: PhoneRuntimeBound = Object.freeze({
+  def: 1800,
+  min: 300,
+  max: 21_600,
+});
+
+/** Parse and clamp `PHONE_DUE_STARVATION_ALERT_SEC`. Never throws. */
+export function loadPhoneDueStarvationAlertSec(
+  source: NodeJS.ProcessEnv = process.env,
+): number {
+  return boundedInt(source.PHONE_DUE_STARVATION_ALERT_SEC, PHONE_DUE_STARVATION_ALERT_BOUNDS);
 }
 
 /**

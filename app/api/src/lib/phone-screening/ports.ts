@@ -53,6 +53,7 @@ import type {
   PhoneEventSource,
   PhoneHaltReason,
   PhoneRecordingRole,
+  PhoneScoreSuppressReason,
   PhoneSuppressionReason,
   PhoneSuppressionSource,
 } from './vocabulary.js';
@@ -202,6 +203,18 @@ export interface SweepPhoneStrandedSessionsResult {
   readonly completed?: number;
   readonly failed?: number;
   readonly skipped?: number;
+  /**
+   * 0114 (C2-P5) — `failed/assessment_aborted` engagements this pass moved to
+   * `completed/late_score_after_stranded_abort` because a phone assessment
+   * landed after the sweep's own stranded abort. Absent from an older RPC.
+   */
+  readonly lateCompleted?: number;
+  /**
+   * 0114 (C2-P5) — late-scored engagements LEFT failed because a newer cycle
+   * exists on the same application link. Operator attention, not an error.
+   * Absent from an older RPC.
+   */
+  readonly lateSuperseded?: number;
 }
 
 /** 0071 / X5b — the crashed-session recording-finalization backstop sweep. */
@@ -262,6 +275,23 @@ export interface PhonePartialFinalizeSession {
    * older RPC keeps today's behaviour.
    */
   readonly callbackBooked: boolean;
+  /**
+   * 0114 (C2) — `phone_attempt_score_suppression(attempt)` is non-null for
+   * this session's attempt: a booked callback, an in-call callback deferral,
+   * or a worker-declared abort. The RPC still drove the session
+   * `in_progress -> completed` (so the MP3 finalizes) but the leg is NOT a
+   * screening, and the tick never enqueues scoring for it. Implies nothing
+   * about `callbackBooked`, which stays reported separately; either one skips
+   * the enqueue. Defaults false when absent, so an older RPC keeps today's
+   * behaviour.
+   */
+  readonly scoreSuppressed: boolean;
+  /**
+   * 0114 (C2) — the suppression's reason when `scoreSuppressed`, else null. A
+   * value outside `PHONE_SCORE_SUPPRESS_REASONS` is narrowed to null; the
+   * boolean above still governs the skip.
+   */
+  readonly suppressReason: PhoneScoreSuppressReason | null;
 }
 
 /** 0072 — the server-side partial-finalize sweep. */
@@ -374,6 +404,13 @@ export interface RequestPhoneRescreenResult {
   readonly cycleNumber?: number;
   readonly predecessorEngagementId?: string;
   readonly requestId?: string;
+  /**
+   * 0114 (C6): the status ensure_ashby_phone_engagement returned for the new
+   * (or self-healed) child, e.g. `eligible`, `scheduled_next_window` or a
+   * stable prerequisite refusal. `null` on a replay that evaluated nothing;
+   * `undefined` when the database predates 0114 and sent no key.
+   */
+  readonly prerequisiteStatus?: string | null;
 }
 
 export interface CancelPhoneAppointmentInput {
@@ -396,6 +433,17 @@ export interface ExpirePhoneAppointmentsResult {
   readonly expired?: number;
   readonly graceSeconds?: number;
   readonly limit?: number;
+  /**
+   * 0114 (C5): overdue live slots NOT expired this pass because the lane is
+   * halted (or was halted after the slot began) and 21:00 IST on the slot's
+   * day has not yet passed. Optional: absent from a pre-0114 database.
+   */
+  readonly held?: number;
+  /**
+   * 0114 (C5): wedged `scheduled` engagements with no live appointment that
+   * the sweep released to `eligible/appointment_lost`. Optional, as above.
+   */
+  readonly released?: number;
 }
 
 // ═══════════════════════════════════════════════════════════════════════

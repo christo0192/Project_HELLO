@@ -126,6 +126,7 @@ import {
   PHONE_RECORDING_ROLES,
   PHONE_SUPPRESSION_REASONS,
   PHONE_SUPPRESSION_SOURCES,
+  isPhoneScoreSuppressReason,
   type PhoneAttemptKind,
   type PhoneAttemptState,
   type PhoneEngagementState,
@@ -188,6 +189,23 @@ function boundedResumeFacts(row: Row): Readonly<Record<string, unknown>> {
     }
   }
   return out;
+}
+
+/**
+ * 0114 (C2) — the finalize RPC's `score_suppressed` / `suppress_reason` pair.
+ * The boolean governs; a reason outside the closed vocabulary (or one sent
+ * beside `score_suppressed:false`) is reported as null rather than invented.
+ */
+function scoreSuppression(row: Row): {
+  scoreSuppressed: boolean;
+  suppressReason: PhonePartialFinalizeSession['suppressReason'];
+} {
+  const scoreSuppressed = bool(row, 'score_suppressed') ?? false;
+  const reason = row?.suppress_reason;
+  return {
+    scoreSuppressed,
+    suppressReason: scoreSuppressed && isPhoneScoreSuppressReason(reason) ? reason : null,
+  };
 }
 
 /** `timestamptz` arrives as an ISO string; anything else is dropped. */
@@ -525,6 +543,10 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
         completed: num(row, 'completed'),
         failed: num(row, 'failed'),
         skipped: num(row, 'skipped'),
+        // 0114 (C2-P5). Absent from an older RPC -> undefined, never 0: the
+        // tick must not report a late completion nobody performed.
+        lateCompleted: num(row, 'late_completed'),
+        lateSuperseded: num(row, 'late_superseded'),
       };
     },
 
@@ -589,6 +611,12 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
                 // today's behaviour (score it). The handler's own
                 // confirmed_from_attempt_id guard is the belt behind this.
                 callbackBooked: bool(e, 'callback_booked') ?? false,
+                // 0114 (C2). Absent/malformed -> false: an older RPC keeps
+                // today's behaviour (score it). The handler's own
+                // phone_attempt_score_suppression check is the belt behind
+                // this. The reason is narrowed to the closed vocabulary and
+                // reported only when the leg is actually suppressed.
+                ...scoreSuppression(e),
               };
             })
             .filter((s): s is PhonePartialFinalizeSession => s !== null)
@@ -767,6 +795,14 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
         cycleNumber: num(row, 'cycle_number'),
         predecessorEngagementId: str(row, 'predecessor_engagement_id'),
         requestId: str(row, 'request_id'),
+        // 0114 (C6): ensure_ashby_phone_engagement's answer for the child.
+        // A present-but-null key is a same-intent replay that evaluated
+        // nothing (pure read); an ABSENT key is a pre-0114 database, kept
+        // distinguishable (undefined) rather than read as "evaluated, null".
+        prerequisiteStatus:
+          row && 'prerequisite_status' in row
+            ? (str(row, 'prerequisite_status') ?? null)
+            : undefined,
       };
     },
 
@@ -809,6 +845,9 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
         expired: num(row, 'expired'),
         graceSeconds: num(row, 'grace_seconds'),
         limit: num(row, 'limit'),
+        // 0114 (C5). Absent (undefined) on a pre-0114 database, never 0.
+        held: num(row, 'held'),
+        released: num(row, 'released'),
       };
     },
 

@@ -9,6 +9,7 @@ import {
   sessionStatusCounts,
   attemptOutcomeLabel,
   attemptRawStatus,
+  engagementReasonLabel,
   appealStatusLabel,
   appealCategoryLabel,
   isAppealPending,
@@ -137,6 +138,8 @@ describe('attemptOutcomeLabel', () => {
       'completed', 'disconnected', 'no_answer', 'busy', 'voicemail', 'declined',
       'wrong_number', 'opt_out', 'provider_error', 'window_closed', 'cancelled',
       'abandoned_pre_disclosure', 'consent_failed',
+      // 0114 (C2-P1).
+      'callback_deferred',
     ];
     for (const outcome of allowlist) {
       const label = attemptOutcomeLabel(outcome, 'ended');
@@ -171,6 +174,54 @@ describe('attemptOutcomeLabel', () => {
   it('keeps the raw pair for an operator tooltip', () => {
     expect(attemptRawStatus('no_answer', 'ended')).toBe('state: ended · outcome: no_answer');
     expect(attemptRawStatus(null, 'ringing')).toBe('state: ringing');
+  });
+});
+
+describe('callback_deferred (0114)', () => {
+  it('reads as a callback request, distinct from a drop, a cancel and a completion', () => {
+    const deferred = attemptOutcomeLabel('callback_deferred', 'ended');
+    expect(deferred).toBe('Asked to be called back later');
+    for (const other of ['disconnected', 'cancelled', 'completed', 'declined']) {
+      expect(attemptOutcomeLabel(other, 'ended')).not.toBe(deferred);
+    }
+  });
+});
+
+describe('engagementReasonLabel', () => {
+  it('names the three 0114 (C2) reasons in plain words', () => {
+    expect(engagementReasonLabel('callback_deferred_in_call'))
+      .toBe('Asked to be called back; redial next day');
+    expect(engagementReasonLabel('callback_deferral_limit'))
+      .toBe('Asked to be called back too many times');
+    expect(engagementReasonLabel('late_score_after_stranded_abort'))
+      .toBe('Completed (score arrived late)');
+  });
+
+  it('never renders a raw snake_case reason for the known vocabulary', () => {
+    for (const reason of [
+      'no_answer_budget_exhausted', 'reconnect_budget_exhausted', 'provider_budget_exhausted',
+      'window_closed', 'assessment_aborted', 'wrong_number', 'disclosure_refused',
+      'candidate_opt_out', 'hr_cancelled', 'emergency_stop', 'ashby_stage_left', 'prereq_lost',
+      'abandoned_pre_disclosure', 'consent_gate_failed', 'callback_deferred_in_call',
+      'callback_deferral_limit', 'late_score_after_stranded_abort',
+    ]) {
+      const label = engagementReasonLabel(reason);
+      expect(label, reason).not.toMatch(/_/);
+      expect(label.charAt(0), reason).toBe(label.charAt(0).toUpperCase());
+    }
+  });
+
+  it('keeps the late completion apart from the abort it replaced', () => {
+    expect(engagementReasonLabel('late_score_after_stranded_abort'))
+      .not.toBe(engagementReasonLabel('assessment_aborted'));
+  });
+
+  it('humanizes an unknown reason and renders nothing for an absent one', () => {
+    expect(engagementReasonLabel('some_new_reason')).toBe('Some new reason');
+    expect(engagementReasonLabel(null)).toBe('');
+    expect(engagementReasonLabel(undefined)).toBe('');
+    expect(engagementReasonLabel('   ')).toBe('');
+    expect(engagementReasonLabel({ v: 1 } as unknown as string)).toBe('');
   });
 });
 

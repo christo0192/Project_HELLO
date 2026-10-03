@@ -106,6 +106,15 @@ const ATTEMPT_COLUMNS =
  *  `phone_valid`, `parsed`, `skills` or `text_extracted`. */
 const CANDIDATE_COLUMNS = 'id,name,status,ats_external_id';
 
+/**
+ * 0114 (C8): the duplicate-hold count reads the engagement id and nothing
+ * else, and only to count it.
+ */
+const HOLD_ID_COLUMNS = 'id';
+
+/** 0114 (C8): the state reason `ensure_ashby_phone_engagement` writes on a hold. */
+const DUPLICATE_APPLICATION_REASON = 'duplicate_application';
+
 /** Hard ceiling every caller-supplied limit is clamped into. */
 export const PHONE_READ_MAX_ROWS = 500;
 
@@ -486,6 +495,28 @@ export function createPhoneReadStore(client: SupabaseClient): PhoneReadStore {
         engagementVersion: version,
         sessionId: str(engagementRow, 'session_id') ?? null,
       };
+    },
+
+    async countDuplicateApplicationHolds(): Promise<number> {
+      // 0114 (C8). Only the COUNT leaves this function: the rows carry the
+      // engagement id alone and are discarded here, so no identifier — let
+      // alone the other candidate row a hold points at — reaches the health
+      // surface. Bounded like every read in this file; a count at the bound
+      // is a lower bound.
+      //
+      // No `state` filter, deliberately: `ensure_ashby_phone_engagement` is the
+      // only writer of this reason and writes it only on a `pending_prereqs`
+      // row, and the only exits from that state (0042) are `eligible`, which
+      // clears the reason, and `cancelled`, which is terminal. So a
+      // non-terminal row carrying it IS a held pending row.
+      const { data, error } = await client
+        .from('phone_engagements')
+        .select(HOLD_ID_COLUMNS)
+        .eq('state_reason', DUPLICATE_APPLICATION_REASON)
+        .is('terminal_at', null)
+        .limit(PHONE_READ_MAX_ROWS);
+      if (error || !Array.isArray(data)) throw new Error('phone_engagement_read_error');
+      return data.length;
     },
   };
 }

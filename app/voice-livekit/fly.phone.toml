@@ -381,6 +381,23 @@ kill_timeout = 300
   # the failure first. Set it as a secret on one test call, listen, and only
   # then consider pinning it here.
   LIVEKIT_WORKER_DRAIN_SEC = "10"
+  # M009 C9-1: the LiveKit SDK drain bound for THIS (named phone) worker. NOT
+  # the same knob as LIVEKIT_WORKER_DRAIN_SEC above (that one bounds the
+  # per-item transcript-write drain in persistence.py).
+  # On a stop the SDK's drain() waits this long for a live job, and only THEN
+  # does aclose() send the job its ShutdownRequest. The SDK default is 1800 s,
+  # far past kill_timeout (300 s, top of file), so a live call at SIGINT was
+  # force-killed before its own teardown ran and its recording was lost
+  # (286d921a / ab83952e / dcde16d5).
+  # BUDGET (enforced by scripts/validate-voice-worker-apps.mjs):
+  #   PHONE_DRAIN_TIMEOUT_SEC + 2 x PHONE_SHUTDOWN_PROCESS_TIMEOUT + 30 <= kill_timeout
+  #   90                      + 2 x 90 (default, not set here)     + 30  = 300
+  # Worker clamp 30..120. POLICY: a call still live 90 s after SIGINT is ended
+  # with its evidence saved, so deploy outside the IST calling window.
+  # ROLLBACK: may be raised to 120 only together with a lower
+  # PHONE_SHUTDOWN_PROCESS_TIMEOUT (the validator refuses 120 + 2 x 90 + 30).
+  # To remove the bound, revert this line and the worker's drain_timeout.
+  PHONE_DRAIN_TIMEOUT_SEC = "90"
   CANDIDATE_SILENCE_PROMPT_SEC = "30"
   CANDIDATE_SILENCE_END_SEC = "20"
   PHONE_TERMINAL_REPLY_TIMEOUT_SEC = "10"

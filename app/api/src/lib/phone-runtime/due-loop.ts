@@ -43,6 +43,11 @@ import { istWindowOpen, PHONE_DEFERRAL_CODES } from '../phone-screening/index.js
 import { ADMIT_PHONE_ATTEMPT_STATUSES } from '../phone-screening/rpc-contract.js';
 import type { DuePhoneEngagement, PhoneRuntimeReader } from './read.js';
 import type { DialableNumber } from '../../integrations/livekit-phone-dial/dialable-number.js';
+// TYPE-ONLY (erased at runtime): the starvation classifier below is checked
+// for exhaustiveness against these closed vocabularies at COMPILE time.
+import type { PhoneDialRefusal } from '../../integrations/livekit-phone-dial/dial.js';
+import type { PhoneDeferralCode } from '../phone-screening/index.js';
+import type { AdmitPhoneAttemptStatus } from '../phone-screening/rpc-contract.js';
 
 /** Why a due row was not offered to admission. Stable, sanitized, countable. */
 export const PHONE_DUE_SKIPS = [
@@ -72,6 +77,12 @@ export const PHONE_DUE_SKIPS = [
   'not_yet_due',
   'outside_ist_window',
   'candidate_already_offered',
+  // 0114 (C8-F): a second engagement on a LINE already offered this pass.
+  // One person can sit on several candidate rows (the Ashby house rule
+  // creates one row per application), so `candidate_already_offered` alone
+  // let one phone ring twice from a single pass. Keyed on the number's
+  // digest; the number itself is never emitted.
+  'line_already_offered',
   'no_dialable_number',
   'no_session',
   'appointment_not_due',
@@ -553,9 +564,28 @@ export async function runPhoneDuePass(
     candidateIds: ready.map((r) => r.row.candidateId),
   });
 
+  // ── ONE OFFER PER LINE PER PASS (0114, C8-F) ────────────────────────
+  // The candidate Set above dedups ROWS, and one person can be several rows:
+  // two applications from one mobile produced two candidates, both offered in
+  // the same pass, and the phone rang twice (prod lines ffc393 / 3247c3). So
+  // the line is deduped too, keyed on the number's SHA-256 digest — the form
+  // `DialableNumber` already exposes — so the raw number is never read here,
+  // never stored in the Set beyond the pass, and never emitted.
+  //
+  // Like the candidate Set it bounds the hazard to a pass. Across passes and
+  // replicas `admit_phone_attempt`'s line-scoped Guards A/B (0114 §6) are the
+  // authority; this only stops the pass from spending a session and an
+  // admission round trip on a refusal it can predict.
+  //
+  // Checked BEFORE `ensureSession` (a write), claimed only once a session
+  // exists — the same "claim after every gate" rule as the candidate Set, so
+  // a row skipped `no_session` does not suppress a sibling on the same line.
+  const offeredLines = new Set<string>();
+
   for (const { row, kind } of ready) {
     const number = numbers.get(row.candidateId);
     if (number === undefined) { bump(skipped, 'no_dialable_number'); continue; }
+    if (offeredLines.has(number.digest)) { bump(skipped, 'line_already_offered'); continue; }
 
     const sessionId = await deps.sessions.ensureSession({
       engagementId: row.engagementId,
@@ -565,6 +595,7 @@ export async function runPhoneDuePass(
     });
     if (sessionId === null) { bump(skipped, 'no_session'); continue; }
 
+    offeredLines.add(number.digest);
     offered += 1;
     // FRESH, per dial. See `PhoneDueOptions.clock`: this instant becomes the
     // attempt's lease start, and the pass clock can be minutes old by now.
@@ -588,5 +619,230 @@ export async function runPhoneDuePass(
     dialing,
     skipped: Object.freeze(skipped),
     refusals: Object.freeze(refusals),
+  };
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// DUE-LOOP STARVATION (0114, C10d)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// THE DEFECT. From 2026-10-02 to 2026-10-03 09:08 IST the due pass answered
+// `ok` on every tick, examined rows, and dialled NOBODY — every row was
+// skipped `no_session` — and nothing alerted. A pass that runs and cannot
+// dial looks, to every existing signal, exactly like a pass with nothing to
+// do: the loop is ticking, no sweep is not-ok, nothing throws.
+//
+// THE RULE. Every count key a pass can produce is classified, once, here:
+//   * `benign`   — the lane works, and policy or the candidate's own state
+//                  says "not now": the IST window, not yet due, the per-pass
+//                  and per-day caps, budgets, consent, suppression, a
+//                  candidate's own unusable number, an operator-paused
+//                  mapping. Any amount of these is a healthy quiet lane.
+//   * `starving` — the MACHINERY cannot dial: no session could be
+//                  provisioned, an unreadable halt, an unconfigured
+//                  transport, an originate failure, a vocabulary the code
+//                  does not know. Persisting, these mean calls are owed and
+//                  none are being placed.
+// A pass is STARVING when it answered `ok`, examined at least one row,
+// dialled none, and saw at least one starving code. An episode is a run of
+// consecutive starving passes; once it has lasted
+// `PHONE_DUE_STARVATION_ALERT_SEC` the lane is `phone_due_starved`.
+//
+// The map is EXHAUSTIVE at compile time (`satisfies Record<PhoneDueCountKey,
+// ...>` over the closed vocabularies), so a new skip, refusal, admission
+// status or deferral code cannot be added without being classified here —
+// including `line_already_offered` (0114 C8, R10), which is benign.
+
+/** How a due-pass count key bears on starvation. */
+export type PhoneDueCodeClass = 'benign' | 'starving';
+
+type AdmissionRefusalDetail =
+  | Exclude<AdmitPhoneAttemptStatus, 'ok'>
+  | 'ok_without_attempt'
+  | 'test_gate_unavailable'
+  | 'test_gate_halt_not_permitted'
+  | 'candidate_mismatch'
+  | typeof PHONE_UNKNOWN_ADMISSION_DETAIL;
+
+type AdmissionDeferralDetail = PhoneDeferralCode | typeof PHONE_UNKNOWN_ADMISSION_DETAIL;
+
+/** Every key `runPhoneDuePass` can put in `skipped` or `refusals`. */
+export type PhoneDueCountKey =
+  | PhoneDueSkip
+  | Exclude<PhoneDialRefusal, typeof PHONE_ADMISSION_REFUSAL | typeof PHONE_ADMISSION_DEFERRAL>
+  | 'unknown'
+  | `${typeof PHONE_ADMISSION_REFUSAL}:${AdmissionRefusalDetail}`
+  | `${typeof PHONE_ADMISSION_DEFERRAL}:${AdmissionDeferralDetail}`;
+
+/** The classification. See the block comment above for the rule. */
+export const PHONE_DUE_CODE_CLASS = Object.freeze({
+  // ── skips ────────────────────────────────────────────────────────────
+  not_yet_due: 'benign',
+  outside_ist_window: 'benign',
+  candidate_already_offered: 'benign',
+  line_already_offered: 'benign',
+  // The candidate's own number is absent or unusable: their data, not ours.
+  no_dialable_number: 'benign',
+  // THE 10-02 INCIDENT: a session could not be provisioned for the row.
+  no_session: 'starving',
+  appointment_not_due: 'benign',
+  // A code defect by construction (see PHONE_DUE_SKIPS).
+  unknown_state: 'starving',
+  // ── dial-controller refusals (no detail) ─────────────────────────────
+  runtime_disabled: 'starving',
+  transport_not_configured: 'starving',
+  timeouts_misordered: 'starving',
+  lease_too_short_for_gate: 'starving',
+  room_unavailable: 'starving',
+  lease_too_short: 'starving',
+  worker_not_ready: 'starving',
+  originate_failed: 'starving',
+  // `result.refusal ?? 'unknown'`: a refusal that carried no code at all.
+  unknown: 'starving',
+  // ── admission refusals, by admission's own status ────────────────────
+  'admission_refused:application_not_found': 'starving',
+  'admission_refused:application_not_live': 'benign',
+  'admission_refused:application_terminal': 'benign',
+  'admission_refused:at_capacity': 'benign',
+  'admission_refused:attempt_in_flight': 'benign',
+  'admission_refused:consent_expired': 'benign',
+  'admission_refused:consent_missing': 'benign',
+  'admission_refused:consent_not_granted': 'benign',
+  'admission_refused:consent_subset_missing': 'benign',
+  'admission_refused:consent_template_inactive': 'starving',
+  'admission_refused:daily_attempt_exists': 'benign',
+  'admission_refused:engagement_terminal': 'benign',
+  'admission_refused:halt_unreadable': 'starving',
+  'admission_refused:halted': 'benign',
+  'admission_refused:ingestion_not_ready': 'starving',
+  'admission_refused:invalid_kind': 'starving',
+  'admission_refused:kind_not_admissible': 'starving',
+  'admission_refused:mapping_not_enabled': 'benign',
+  'admission_refused:no_answer_budget_exhausted': 'benign',
+  'admission_refused:not_found': 'starving',
+  'admission_refused:not_yet_eligible': 'benign',
+  'admission_refused:phone_invalid': 'benign',
+  'admission_refused:state_not_admissible': 'starving',
+  'admission_refused:suppressed': 'benign',
+  'admission_refused:window_closed': 'benign',
+  'admission_refused:candidate_call_in_flight': 'benign',
+  'admission_refused:candidate_daily_attempt_exists': 'benign',
+  'admission_refused:fleet_daily_cap_reached': 'benign',
+  'admission_refused:ok_without_attempt': 'starving',
+  'admission_refused:test_gate_unavailable': 'starving',
+  'admission_refused:test_gate_halt_not_permitted': 'benign',
+  'admission_refused:candidate_mismatch': 'starving',
+  'admission_refused:unknown': 'starving',
+  // ── local-preflight deferrals ────────────────────────────────────────
+  'admission_deferred:cold_start': 'benign',
+  'admission_deferred:screening_disabled': 'starving',
+  'admission_deferred:runtime_disabled': 'starving',
+  'admission_deferred:dial_mode_off': 'starving',
+  // Allowlist mode: a candidate off the allowlist is policy, not a fault.
+  'admission_deferred:dial_not_allowlisted': 'benign',
+  'admission_deferred:window_closed_defer': 'benign',
+  'admission_deferred:consent_preflight_refused': 'benign',
+  'admission_deferred:unknown': 'starving',
+} as const satisfies Record<PhoneDueCountKey, PhoneDueCodeClass>);
+
+/**
+ * The class of a count key AS EMITTED. A key outside the closed map — which
+ * the compile-time check says cannot be produced — reads as `starving`: an
+ * unrecognised code is a fault to look at, never a reason to stay quiet.
+ */
+export function phoneDueCodeClass(key: string): PhoneDueCodeClass {
+  return Object.prototype.hasOwnProperty.call(PHONE_DUE_CODE_CLASS, key)
+    ? PHONE_DUE_CODE_CLASS[key as PhoneDueCountKey]
+    : 'starving';
+}
+
+/** The starving codes of one pass, sorted. Empty for a non-starving pass. */
+export function phoneDueStarvingCodes(result: PhoneDueResult): string[] {
+  if (result.status !== 'ok' || result.examined <= 0 || result.dialing > 0) return [];
+  const codes = [...Object.keys(result.skipped), ...Object.keys(result.refusals)]
+    .filter((key) => phoneDueCodeClass(key) === 'starving');
+  return [...new Set(codes)].sort();
+}
+
+/** Seconds between `phone_due_starved` warn lines while an episode lasts. */
+export const PHONE_DUE_STARVATION_WARN_INTERVAL_SEC = 3600;
+
+/** The publishable state of the starvation tracker. Codes and instants only. */
+export interface PhoneDueStarvationState {
+  /** The last observed pass was starving. */
+  readonly starving: boolean;
+  /** When the current episode's first starving pass was observed, or null. */
+  readonly since: string | null;
+  /** The episode has lasted at least the alert threshold. */
+  readonly alarmed: boolean;
+  /** The starving codes of the last starving pass (closed vocabulary). */
+  readonly codes: readonly string[];
+}
+
+/** What one observation changed — the runtime turns these into log lines. */
+export interface PhoneDueStarvationTransition {
+  /** The episode crossed the threshold on THIS pass (audit once). */
+  readonly alarmRaised: boolean;
+  /** Emit the hourly `phone_due_starved` warn line now. */
+  readonly warn: boolean;
+  /** An alarmed episode ended on this pass (info line). */
+  readonly cleared: boolean;
+  /** Whole seconds the episode has lasted (0 when not starving). */
+  readonly episodeSec: number;
+}
+
+export interface PhoneDueStarvationTracker {
+  /** Feed one pass. Pure apart from its own state; the clock is a parameter. */
+  observe(result: PhoneDueResult, nowMs: number): PhoneDueStarvationTransition;
+  state(): PhoneDueStarvationState;
+}
+
+/**
+ * The starvation episode tracker. PROCESS-LOCAL by design: each replica
+ * answers for the passes it ran, like every other runtime count, and a
+ * restart starts a fresh episode (a stated risk). A `halted` or `disabled`
+ * pass ENDS an episode — the halt has its own reason, and "no
+ * phone_due_starved while halted" is an explicit post-deploy check.
+ */
+export function createPhoneDueStarvationTracker(alertSec: number): PhoneDueStarvationTracker {
+  const alertMs = Math.max(1, Math.trunc(alertSec)) * 1000;
+  const warnMs = PHONE_DUE_STARVATION_WARN_INTERVAL_SEC * 1000;
+  let sinceMs: number | null = null;
+  let alarmed = false;
+  let lastWarnMs: number | null = null;
+  let codes: readonly string[] = [];
+
+  return {
+    observe(result, nowMs) {
+      const starvingCodes = phoneDueStarvingCodes(result);
+      if (starvingCodes.length === 0) {
+        const cleared = alarmed;
+        sinceMs = null;
+        alarmed = false;
+        lastWarnMs = null;
+        codes = [];
+        return { alarmRaised: false, warn: false, cleared, episodeSec: 0 };
+      }
+      codes = Object.freeze(starvingCodes);
+      if (sinceMs === null) sinceMs = nowMs;
+      const elapsedMs = Math.max(0, nowMs - sinceMs);
+      const episodeSec = Math.floor(elapsedMs / 1000);
+      if (elapsedMs < alertMs) {
+        return { alarmRaised: false, warn: false, cleared: false, episodeSec };
+      }
+      const alarmRaised = !alarmed;
+      alarmed = true;
+      const warn = lastWarnMs === null || nowMs - lastWarnMs >= warnMs;
+      if (warn) lastWarnMs = nowMs;
+      return { alarmRaised, warn, cleared: false, episodeSec };
+    },
+    state() {
+      return {
+        starving: codes.length > 0,
+        since: sinceMs === null ? null : new Date(sinceMs).toISOString(),
+        alarmed,
+        codes,
+      };
+    },
   };
 }

@@ -131,6 +131,9 @@ vi.mock('../lib/supabase.js', () => {
     const chain = () => api;
     api.select = () => chain();
     api.eq = () => chain();
+    // C3 (0114): the candidate status rule filters with neq/in.
+    api.neq = () => chain();
+    api.in = () => chain();
     api.order = () => chain();
     api.limit = () => chain();
     api.maybeSingle = () => Promise.resolve(SUPABASE_STATE.tables[table] ?? { data: null, error: null });

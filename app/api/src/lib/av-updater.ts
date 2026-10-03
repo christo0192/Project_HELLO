@@ -40,6 +40,8 @@
  */
 
 import { execFile } from 'node:child_process';
+import { readFile, rename, unlink, writeFile } from 'node:fs/promises';
+import { isAbsolute } from 'node:path';
 
 import { createLogger } from './logger.js';
 
@@ -48,6 +50,9 @@ import { createLogger } from './logger.js';
 const _contractVisibleEnvReads = [
   process.env.AV_UPDATER_INTERVAL_MS,
   process.env.AV_UPDATER_TIMEOUT_MS,
+  // 0114 (C10c): where the supervisor publishes the updater's status for the
+  // API process (a separate process) to read on /health.
+  process.env.AV_UPDATER_STATUS_FILE,
 ];
 void _contractVisibleEnvReads;
 
@@ -141,6 +146,26 @@ export interface RunUpdateOptions {
    * takes an argv array and never involves a shell.
    */
   execFileImpl?: typeof execFile;
+  /**
+   * 0114 (C10c). Re-reads signature freshness to resolve freshclam's exit 1.
+   *
+   * freshclam exits 1 for "database is up to date" — a success that changed
+   * nothing — but an exit status alone is not evidence that the database on
+   * disk is usable. So exit 1 is decided by EVIDENCE: success iff the
+   * database is fresh right now. Absent, exit 1 stays a failure, which is the
+   * fail-closed reading and the pre-0114 behaviour.
+   */
+  isFresh?: () => boolean | Promise<boolean>;
+}
+
+/** freshclam's "database is up to date" exit status. */
+export const FRESHCLAM_EXIT_UP_TO_DATE = 1;
+
+/** One attempt's outcome plus the process exit status. */
+export interface AvUpdateAttempt {
+  outcome: AvUpdateOutcome;
+  /** The child's exit status; null for a spawn failure, a timeout or a signal. */
+  exitCode: number | null;
 }
 
 /**
@@ -152,14 +177,23 @@ export interface RunUpdateOptions {
  * non-zero exit is decided by the exit code alone rather than by scraping text.
  */
 export async function runAvUpdateOnce(opts: RunUpdateOptions = {}): Promise<AvUpdateOutcome> {
+  return (await runAvUpdateAttempt(opts)).outcome;
+}
+
+/**
+ * `runAvUpdateOnce`, KEEPING the exit status (0114, C10c). It used to be
+ * discarded at the callback, so "up to date", "the mirror refused us" and
+ * "the binary is missing" were one fact. It is an integer, never text.
+ */
+export async function runAvUpdateAttempt(opts: RunUpdateOptions = {}): Promise<AvUpdateAttempt> {
   const bin = opts.bin ?? FRESHCLAM_BIN;
   const configFile = opts.configFile ?? FRESHCLAM_CONFIG;
   const timeoutMs = opts.timeoutMs ?? AV_UPDATER_BOUNDS.timeoutMs.def;
   const execFileImpl = opts.execFileImpl ?? execFile;
 
-  return new Promise<AvUpdateOutcome>((resolve) => {
+  return new Promise<AvUpdateAttempt>((resolve) => {
     let settled = false;
-    const done = (outcome: AvUpdateOutcome): void => {
+    const done = (outcome: AvUpdateOutcome, exitCode: number | null): void => {
       if (settled) return;
       settled = true;
       if (!outcome.ok) {
@@ -168,7 +202,7 @@ export async function runAvUpdateOnce(opts: RunUpdateOptions = {}): Promise<AvUp
           error_type: outcome.reason,
         });
       }
-      resolve(outcome);
+      resolve({ outcome, exitCode });
     };
 
     try {
@@ -177,24 +211,217 @@ export async function runAvUpdateOnce(opts: RunUpdateOptions = {}): Promise<AvUp
         [`--config-file=${configFile}`, '--stdout'],
         { timeout: timeoutMs, maxBuffer: 256 * 1024, killSignal: 'SIGTERM' },
         (error) => {
-          if (!error) { done({ ok: true }); return; }
-          const err = error as NodeJS.ErrnoException & { killed?: boolean; signal?: string };
+          if (!error) { done({ ok: true }, 0); return; }
+          const err = error as NodeJS.ErrnoException & {
+            killed?: boolean;
+            signal?: string;
+            code?: unknown;
+          };
           if (err.killed || err.signal === 'SIGTERM' || err.code === 'ETIMEDOUT') {
-            done({ ok: false, reason: 'update_timeout' });
+            done({ ok: false, reason: 'update_timeout' }, null);
             return;
           }
           if (err.code === 'ENOENT' || err.code === 'EACCES') {
-            done({ ok: false, reason: 'updater_unavailable' });
+            done({ ok: false, reason: 'updater_unavailable' }, null);
             return;
           }
-          done({ ok: false, reason: 'update_failed' });
+          // A non-zero exit carries its status as a NUMBER on `code`.
+          const exitCode = typeof err.code === 'number' && Number.isSafeInteger(err.code)
+            ? err.code
+            : null;
+          const isFresh = opts.isFresh;
+          if (exitCode === FRESHCLAM_EXIT_UP_TO_DATE && isFresh) {
+            void (async () => {
+              let fresh = false;
+              try { fresh = (await isFresh()) === true; } catch { fresh = false; }
+              done(fresh ? { ok: true } : { ok: false, reason: 'update_failed' }, exitCode);
+            })();
+            return;
+          }
+          done({ ok: false, reason: 'update_failed' }, exitCode);
         },
       );
     } catch {
       // A synchronous spawn failure (bad path, EMFILE) is still just a failure.
-      done({ ok: false, reason: 'updater_unavailable' });
+      done({ ok: false, reason: 'updater_unavailable' }, null);
     }
   });
+}
+
+// ── Updater status (0114, C10c) ─────────────────────────────────────────────
+
+/** Default location of the supervisor-written status file. */
+export const AV_UPDATER_STATUS_FILE_DEFAULT = '/tmp/av-updater-status.json';
+
+/**
+ * Health thresholds. WARNING-ONLY: neither degrades the scanner, which stays
+ * fail-closed on its own 24 h freshness ceiling. They exist to give an
+ * operator hours of notice BEFORE that ceiling turns resume ingestion off.
+ */
+export const AV_UPDATER_HEALTH = {
+  /** `scanner_updater_failing` at this many consecutive failed attempts… */
+  failingConsecutive: 6,
+  /** …or when nothing has succeeded for this long (from start if never). */
+  failingNoSuccessSec: 6 * 3600,
+  /** `scanner_signatures_aging` once the daily database is this old. */
+  agingSignatureSec: 18 * 3600,
+  /** At most one `av_updater_failing` warn line per this interval. */
+  warnIntervalMs: 3_600_000,
+} as const;
+
+/**
+ * What the supervisor publishes. Integers, ISO instants and a closed reason
+ * code: no path, mirror, version or freshclam output.
+ */
+export interface AvUpdaterStatus {
+  version: 1;
+  started_at: string;
+  runs: number;
+  successes: number;
+  failures: number;
+  consecutive_failures: number;
+  last_attempt_at: string | null;
+  last_success_at: string | null;
+  last_exit_code: number | null;
+  last_reason: AvUpdateReason | null;
+}
+
+/**
+ * The status-file path. Only an absolute path with no `..` segment and at
+ * most 256 characters is honoured; anything else is the default, never fatal.
+ */
+export function resolveAvUpdaterStatusFile(source: NodeJS.ProcessEnv = process.env): string {
+  const raw = (source.AV_UPDATER_STATUS_FILE ?? '').trim();
+  if (
+    raw === ''
+    || raw.length > 256
+    || !isAbsolute(raw)
+    || raw.split(/[\\/]/).includes('..')
+  ) {
+    return AV_UPDATER_STATUS_FILE_DEFAULT;
+  }
+  return raw;
+}
+
+/** Filesystem seam for the status file (tests). */
+export interface AvStatusFs {
+  writeFile: (path: string, data: string) => Promise<void>;
+  rename: (from: string, to: string) => Promise<void>;
+  unlink: (path: string) => Promise<void>;
+  readFile: (path: string) => Promise<string>;
+}
+
+const realStatusFs: AvStatusFs = {
+  writeFile: (path, data) => writeFile(path, data, { encoding: 'utf8', mode: 0o644 }),
+  rename: (from, to) => rename(from, to),
+  unlink: (path) => unlink(path),
+  readFile: (path) => readFile(path, 'utf8'),
+};
+
+/**
+ * Write the status ATOMICALLY — a sibling temp file, then a rename over the
+ * target — so a reader never sees a half-written document. Never throws: a
+ * status file is observability, and failing to write one must never touch
+ * the updater or the container. Returns whether it landed.
+ */
+export async function writeAvUpdaterStatusFile(
+  path: string,
+  status: AvUpdaterStatus,
+  fs: AvStatusFs = realStatusFs,
+): Promise<boolean> {
+  const tmp = `${path}.${process.pid}.tmp`;
+  try {
+    await fs.writeFile(tmp, `${JSON.stringify(status)}\n`);
+    await fs.rename(tmp, path);
+    return true;
+  } catch {
+    try { await fs.unlink(tmp); } catch { /* nothing to clean up */ }
+    return false;
+  }
+}
+
+const STATUS_ISO_RE = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/;
+const STATUS_REASONS: ReadonlySet<string> = new Set([
+  'update_failed', 'update_timeout', 'updater_unavailable',
+]);
+
+function statusCount(v: unknown): number | null {
+  return typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 && v <= 1_000_000_000
+    ? v
+    : null;
+}
+
+function statusInstant(v: unknown): string | null {
+  return typeof v === 'string' && STATUS_ISO_RE.test(v) && Number.isFinite(Date.parse(v))
+    ? v
+    : null;
+}
+
+/**
+ * Parse a status document STRICTLY. The file sits on a shared /tmp, so every
+ * field is re-validated; a document that does not parse is null ("unknown"),
+ * never a guess. An exit status outside [-1, 255] is dropped to null.
+ */
+export function parseAvUpdaterStatus(text: string): AvUpdaterStatus | null {
+  let raw: unknown;
+  try { raw = JSON.parse(text); } catch { return null; }
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const o = raw as Record<string, unknown>;
+  if (o.version !== 1) return null;
+  const startedAt = statusInstant(o.started_at);
+  const runs = statusCount(o.runs);
+  const successes = statusCount(o.successes);
+  const failures = statusCount(o.failures);
+  const consecutive = statusCount(o.consecutive_failures);
+  if (
+    startedAt === null || runs === null || successes === null
+    || failures === null || consecutive === null
+  ) {
+    return null;
+  }
+  const exit = o.last_exit_code;
+  return {
+    version: 1,
+    started_at: startedAt,
+    runs,
+    successes,
+    failures,
+    consecutive_failures: consecutive,
+    last_attempt_at: statusInstant(o.last_attempt_at),
+    last_success_at: statusInstant(o.last_success_at),
+    last_exit_code: typeof exit === 'number' && Number.isSafeInteger(exit) && exit >= -1 && exit <= 255
+      ? exit
+      : null,
+    last_reason: typeof o.last_reason === 'string' && STATUS_REASONS.has(o.last_reason)
+      ? (o.last_reason as AvUpdateReason)
+      : null,
+  };
+}
+
+/** Read and parse the status file. Never throws; null when absent or invalid. */
+export async function readAvUpdaterStatusFile(
+  path: string,
+  fs: Pick<AvStatusFs, 'readFile'> = realStatusFs,
+): Promise<AvUpdaterStatus | null> {
+  try {
+    const text = await fs.readFile(path);
+    if (text.length > 4096) return null;
+    return parseAvUpdaterStatus(text);
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Whether the updater is FAILING (warning-only): `failingConsecutive` failed
+ * attempts in a row, or no success for `failingNoSuccessSec` — measured from
+ * the last success, or from the supervisor's start when there never was one.
+ */
+export function avUpdaterFailing(status: AvUpdaterStatus, nowMs: number): boolean {
+  if (status.consecutive_failures >= AV_UPDATER_HEALTH.failingConsecutive) return true;
+  const anchor = Date.parse(status.last_success_at ?? status.started_at);
+  if (!Number.isFinite(anchor)) return false;
+  return nowMs - anchor >= AV_UPDATER_HEALTH.failingNoSuccessSec * 1000;
 }
 
 export interface AvUpdaterHandle {
@@ -203,7 +430,22 @@ export interface AvUpdaterHandle {
   /** Stop the periodic timer. Idempotent. Does not abort an in-flight attempt. */
   stop(): void;
   /** Attempts started, successes, and the last stable failure reason. */
-  stats(): { runs: number; successes: number; failures: number; lastReason: AvUpdateReason | null };
+  stats(): {
+    runs: number;
+    successes: number;
+    failures: number;
+    lastReason: AvUpdateReason | null;
+    // 0114 (C10c). Optional in the TYPE only so hand-built handles (test
+    // doubles) stay valid; `startAvUpdater` always reports all three.
+    /** Failed attempts since the last success. */
+    consecutiveFailures?: number;
+    /** ISO instant of the last success, or null. */
+    lastSuccessAt?: string | null;
+    /** The last attempt's exit status, or null. */
+    lastExitCode?: number | null;
+  };
+  /** 0114 (C10c). The publishable status document (always present on a real handle). */
+  status?(): AvUpdaterStatus;
 }
 
 export interface StartUpdaterOptions extends RunUpdateOptions {
@@ -228,6 +470,13 @@ export interface StartUpdaterOptions extends RunUpdateOptions {
    * so the CADENCE can be tested without spawning freshclam.
    */
   runOnce?: () => Promise<AvUpdateOutcome>;
+  /** 0114 (C10c). Clock seam for the status instants and the warn rate limit. */
+  now?: () => Date;
+  /**
+   * 0114 (C10c). Called with the status after EVERY settled attempt (the
+   * supervisor writes the status file from it). Its errors are swallowed.
+   */
+  onStatus?: (status: AvUpdaterStatus) => void | Promise<void>;
 }
 
 /**
@@ -265,14 +514,75 @@ export function startAvUpdater(opts: StartUpdaterOptions): AvUpdaterHandle {
   let successes = 0;
   let failures = 0;
   let lastReason: AvUpdateReason | null = null;
+  // 0114 (C10c): the supervisor's view of the updater, published to /health.
+  const now = opts.now ?? ((): Date => new Date());
+  const startedAt = now().toISOString();
+  let consecutiveFailures = 0;
+  let lastSuccessAt: string | null = null;
+  let lastAttemptAt: string | null = null;
+  let lastExitCode: number | null = null;
+  let lastFailingWarnMs: number | null = null;
+
+  const status = (): AvUpdaterStatus => ({
+    version: 1,
+    started_at: startedAt,
+    runs,
+    successes,
+    failures,
+    consecutive_failures: consecutiveFailures,
+    last_attempt_at: lastAttemptAt,
+    last_success_at: lastSuccessAt,
+    last_exit_code: lastExitCode,
+    last_reason: lastReason,
+  });
+
+  /**
+   * `av_updater_failing`, RATE-LIMITED to one line per `warnIntervalMs`. The
+   * per-attempt `av_updater` warn already exists; this one says the failures
+   * have become a TREND (the health warning's own predicate), and says it
+   * once an hour rather than on every retry of the cold ladder.
+   */
+  const maybeWarnFailing = (): void => {
+    const nowMs = now().getTime();
+    if (!avUpdaterFailing(status(), nowMs)) return;
+    if (lastFailingWarnMs !== null && nowMs - lastFailingWarnMs < AV_UPDATER_HEALTH.warnIntervalMs) {
+      return;
+    }
+    lastFailingWarnMs = nowMs;
+    updaterLogger.warn('unknown_event', {
+      error_category: 'av_updater_failing',
+      error_type: lastReason ?? 'update_failed',
+      status: Math.min(consecutiveFailures, 1_000_000),
+    });
+  };
+
+  const attempt = async (): Promise<AvUpdateAttempt> => {
+    if (opts.runOnce) return { outcome: await opts.runOnce(), exitCode: null };
+    return runAvUpdateAttempt(opts);
+  };
 
   const runNow = async (): Promise<AvUpdateOutcome> => {
     if (inFlight) return inFlight;
     runs += 1;
-    inFlight = (opts.runOnce ? opts.runOnce() : runAvUpdateOnce(opts))
-      .then((outcome) => {
-        if (outcome.ok) { successes += 1; lastReason = null; }
-        else { failures += 1; lastReason = outcome.reason; }
+    inFlight = attempt()
+      .then(async ({ outcome, exitCode }) => {
+        lastAttemptAt = now().toISOString();
+        lastExitCode = exitCode;
+        if (outcome.ok) {
+          successes += 1;
+          lastReason = null;
+          consecutiveFailures = 0;
+          lastSuccessAt = lastAttemptAt;
+          lastFailingWarnMs = null;
+        } else {
+          failures += 1;
+          lastReason = outcome.reason;
+          consecutiveFailures += 1;
+          maybeWarnFailing();
+        }
+        if (opts.onStatus) {
+          try { await opts.onStatus(status()); } catch { /* observability only */ }
+        }
         return outcome;
       })
       .finally(() => { inFlight = null; });
@@ -331,6 +641,9 @@ export function startAvUpdater(opts: StartUpdaterOptions): AvUpdaterHandle {
       stopped = true;
       if (timer !== null) clearTimer(timer);
     },
-    stats: () => ({ runs, successes, failures, lastReason }),
+    stats: () => ({
+      runs, successes, failures, lastReason, consecutiveFailures, lastSuccessAt, lastExitCode,
+    }),
+    status,
   };
 }

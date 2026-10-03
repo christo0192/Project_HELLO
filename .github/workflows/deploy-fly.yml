@@ -206,6 +206,13 @@ jobs:
           set -euo pipefail
           test -n "$SUPABASE_DB_URL" || { echo "::error::SUPABASE_DB_URL is not configured"; exit 1; }
           npx --yes supabase@2.110.0 db push --db-url "$SUPABASE_DB_URL" --include-all
+      # 0114 C6: prove the body prod RUNS, not the repo text (PR #145 edited an
+      # applied migration and prod silently kept the old function). Read-only
+      # SELECTs; fails the job, and so every app deploy, on any drift.
+      - name: Verify production function bodies (read-only drift check)
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: bash scripts/verify-prod-function-drift.sh
 
   deploy-api:
     needs: [detect, migrate-production]

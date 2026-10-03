@@ -36,6 +36,7 @@ import { cx, StatusBadge } from './design';
 import type { StatusTone } from './design';
 import { RoleScorecardView } from './session/RoleScorecardView';
 import { ScoreVerdict } from './session/ScoreVerdict';
+import { EvidenceHoldNotice } from './talent/EvidenceHoldNotice';
 import { finiteNumber, isRecord } from './session/scorecard-read';
 import type { ScorecardLayout } from './session/scorecard-read';
 
@@ -407,6 +408,13 @@ export function Scorecard({ assessment, layout = 'stacked' }: ScorecardProps) {
   if (!isRecord(assessment)) {
     return <p className="text-sm text-ink-secondary">This scorecard could not be read.</p>;
   }
-  if (isAssessmentV2(assessment)) return <RoleScorecardView assessment={assessment} layout={layout} />;
-  return <LegacyScorecard assessment={assessment} layout={layout} />;
+  // C3: a scorecard held for thin interview evidence says so above the card.
+  return (
+    <>
+      <EvidenceHoldNotice assessment={assessment} />
+      {isAssessmentV2(assessment)
+        ? <RoleScorecardView assessment={assessment} layout={layout} />
+        : <LegacyScorecard assessment={assessment} layout={layout} />}
+    </>
+  );
 }

@@ -82,6 +82,15 @@ export const TARGETS = Object.freeze(['local', 'production']);
 /** Typed out in full, on purpose. A confirmation you can tab-complete is not one. */
 export const PRODUCTION_CONFIRMATION = 'STOP THE PHONE DIALER';
 
+/**
+ * The actor a LOCAL clear passes. Since 0114 a NULL-actor `clear_phone_halt`
+ * answers `actor_required` without touching the row. This is the drill
+ * sentinel (a fixed id, not a person); production clears go through
+ * `/halt/clear`, which passes the signed-in admin.
+ */
+export const DRILL_ACTOR_ID = '00000000-0000-4000-8000-0000000000d1';
+const DRILL_ACTOR = `'${DRILL_ACTOR_ID}'::uuid`;
+
 export class DrillRefusal extends Error {
   constructor(code, hint) {
     super(hint === undefined ? code : `${code}: ${hint}`);
@@ -411,7 +420,7 @@ async function runClear(args, token) {
 
     const auditBefore = auditCount(args.container, 'phone_admission_halt_cleared');
     const status = queryScalar(args.container,
-      'select screening_v2.clear_phone_halt(null, now())->>\'status\';');
+      `select screening_v2.clear_phone_halt(${DRILL_ACTOR}, now())->>'status';`);
     say('rpc_status', CODE.test(status) ? status : 'unprintable');
     const after = readControl(args.container);
     say('halted', after.halted);

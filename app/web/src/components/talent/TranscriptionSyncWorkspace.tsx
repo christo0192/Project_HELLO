@@ -42,6 +42,7 @@ import {
   CandidateScorecardRoleFit,
 } from './CandidateScorecard';
 import { CandidateScorecardV2 } from './CandidateScorecardV2';
+import { EvidenceHoldNotice } from './EvidenceHoldNotice';
 import { RecordingPlayer } from './RecordingPlayer';
 import type { RecordingPlayerHandle } from './RecordingPlayer';
 import { SeekableTranscript } from './SeekableTranscript';
@@ -467,6 +468,8 @@ function ScorecardBlock({
       >
         {heading ?? 'Scorecard'}
       </h2>
+      {/* C3: a scorecard held for thin interview evidence says so first. */}
+      {!blocked && <EvidenceHoldNotice assessment={assessment} />}
       {blocked ? (
         <p className="max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
           Scorecards are suppressed while an appeal is under review.

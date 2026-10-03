@@ -1892,6 +1892,118 @@ describe('the day-roll and stranded sweeps run, and the claim gates them', () =>
     // watching this number wants "how many stopped being stranded".
     expect(snap.lastStranded).toBe(4);
   });
+
+  it('0114 (C2-P5): late completions are counted as resolutions too', async () => {
+    const c = counters();
+    const runtime = buildRuntime({
+      stores: makeStores(c, {
+        sweepStrandedSessions: async () => ({
+          status: 'ok' as const, examined: 4, completed: 1, failed: 1, skipped: 0,
+          lateCompleted: 2, lateSuperseded: 0,
+        }),
+      }),
+      queue: makeEmptyQueue(c),
+      config: FAST,
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      runtime.scheduler.start();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(runtime.snapshot().lastStranded).toBe(4);
+      // Nothing superseded: no operator warning.
+      expect(warn.mock.calls.map((a) => String(a[0])).join('\n'))
+        .not.toContain('phone_late_score_superseded');
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('0114 (C2-P5): a superseded late score warns with a COUNT only, and is not a resolution', async () => {
+    const c = counters();
+    const runtime = buildRuntime({
+      stores: makeStores(c, {
+        sweepStrandedSessions: async () => ({
+          status: 'ok' as const, examined: 2, completed: 0, failed: 0, skipped: 0,
+          lateCompleted: 0, lateSuperseded: 3,
+        }),
+      }),
+      queue: makeEmptyQueue(c),
+      config: FAST,
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      runtime.scheduler.start();
+      await vi.advanceTimersByTimeAsync(5_000);
+      // Left failed for the operator: it did NOT stop being stranded.
+      expect(runtime.snapshot().lastStranded).toBe(0);
+      const lines = warn.mock.calls.map((a) => String(a[0]))
+        .filter((l) => l.includes('phone_late_score_superseded'));
+      expect(lines.length).toBeGreaterThan(0);
+      const line = lines[0];
+      expect(line).toContain('"error_category":"phone_stranded:late_superseded.3"');
+      // PII-free: no uuid of any kind rides on the line.
+      expect(line).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('0114 (C2-P5): the superseded warn fires once per change of count, not on every tick', async () => {
+    // The sweep recomputes late_superseded on every pass and the operator
+    // cannot clear it, so a per-tick warn would be ~720 lines/day of noise.
+    const counts = [3, 3, 3, 5, 5, 0, 5, 5];
+    let i = 0;
+    const c = counters();
+    const runtime = buildRuntime({
+      stores: makeStores(c, {
+        sweepStrandedSessions: async () => {
+          const n = counts[Math.min(i, counts.length - 1)];
+          i += 1;
+          return {
+            status: 'ok' as const, examined: n, completed: 0, failed: 0, skipped: 0,
+            lateCompleted: 0, lateSuperseded: n,
+          };
+        },
+      }),
+      queue: makeEmptyQueue(c),
+      config: FAST,
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      runtime.scheduler.start();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(i).toBeGreaterThanOrEqual(counts.length);
+      const lines = warn.mock.calls.map((a) => String(a[0]))
+        .filter((l) => l.includes('phone_late_score_superseded'));
+      // 3 (first), 5 (changed), then 0 re-arms and 5 warns again: exactly three.
+      expect(lines.map((l) => /late_superseded\.(\d+)/.exec(l)?.[1])).toEqual(['3', '5', '5']);
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('0114: an older RPC with no late_* keys keeps today\'s count and never warns', async () => {
+    const c = counters();
+    const runtime = buildRuntime({
+      stores: makeStores(c, {
+        sweepStrandedSessions: async () => ({
+          status: 'ok' as const, examined: 4, completed: 3, failed: 1, skipped: 0,
+        }),
+      }),
+      queue: makeEmptyQueue(c),
+      config: FAST,
+    });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => undefined);
+    try {
+      runtime.scheduler.start();
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(runtime.snapshot().lastStranded).toBe(4);
+      expect(warn.mock.calls.map((a) => String(a[0])).join('\n'))
+        .not.toContain('phone_late_score_superseded');
+    } finally {
+      warn.mockRestore();
+    }
+  });
 });
 
 describe('F. M-9 — a construction failure and a deliberate disable are different facts', () => {

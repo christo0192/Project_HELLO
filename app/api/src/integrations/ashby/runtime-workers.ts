@@ -1366,6 +1366,15 @@ export function buildAshbyHandlers(
         //                             dial.
         // Everything else is a prerequisite failure over a row that exists but
         // is not dialable.
+        //
+        // 0114 (C8) adds one more of those: `duplicate_application`. The
+        // engagement stays `pending_prereqs` because the same person already
+        // holds a live or completed screen for the SAME role on another
+        // candidate row (matched on phone, normalised email, or Ashby
+        // candidate id + job mapping). Nothing dials it until HR releases the
+        // hold (POST /candidates/:id/phone/release-duplicate-hold), so it is
+        // deliberately NOT a will-be-called status: generating questions for
+        // it would pay a provider call for a screen that may never happen.
         const willBeCalled = engagement?.status === 'eligible'
           || engagement?.status === 'scheduled_next_window'
           || engagement?.status === 'engagement_active';

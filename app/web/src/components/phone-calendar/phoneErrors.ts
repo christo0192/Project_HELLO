@@ -53,6 +53,13 @@ const CODE_MESSAGES: Record<string, string> = {
   slot_straddles_ist_midnight:
     'A call cannot cross midnight IST. Pick a slot inside one calendar day.',
   invalid_slot: 'That slot was refused as invalid.',
+  // 0114 (C5). Both refusals are decided BEFORE any supersede, so a refused
+  // reschedule leaves the existing slot exactly where it was — the copy says
+  // so, because an operator would otherwise assume the old slot was lost.
+  slot_not_yet_eligible:
+    'This candidate cannot be called that early — their next eligible time is later than the slot you picked. Pick a later slot. Any existing appointment is unchanged.',
+  daily_attempt_exists:
+    'This candidate has already had the maximum number of calls on that day (India time), so no call could be placed in that slot. Pick a slot on another day. Any existing appointment is unchanged.',
 
   // ── Engagement state ──
   engagement_terminal:
@@ -61,6 +68,36 @@ const CODE_MESSAGES: Record<string, string> = {
     'A call attempt is in progress for this engagement, so it cannot be changed right now.',
   invalid_reason: 'That cancellation reason was refused.',
   invalid_source: 'That booking source was refused.',
+
+  // ── Candidate-page booking: schedule_candidate_phone_appointment's own
+  // refusals (0058, redeclared in 0114 §6) plus the route's 503. These
+  // resolve the candidate's live application and current cycle before any
+  // slot rule runs, so each one means "no slot could be booked for this
+  // candidate", never "this slot is wrong". Owner request 2026-10-03: none of
+  // them may fall to the generic sentence, which told operators to refresh
+  // and retry a booking that can never succeed until something else changes.
+  rescreen_required:
+    "This candidate's call cycle has ended. Use Rescreen first, then book a slot.",
+  application_not_live:
+    "This candidate's application is no longer active (it has been completed or cancelled), so no call can be booked for it.",
+  application_not_found:
+    'This candidate has no active application that phone screening can use, so no call can be booked. Check the application in Ashby.',
+  candidate_not_found:
+    'This candidate could not be found, or is not visible to your account, so nothing was booked.',
+  prerequisites_unavailable:
+    "Phone screening could not be set up for this candidate's application, so no call can be booked. Check the candidate's phone screening status for what is missing (for example a valid phone number or a role that is enabled for phone screening).",
+  invalid_request:
+    'The booking request could not be attributed to your account, so nothing was booked. Sign in again and retry.',
+  // 0114 (C8). Same meaning as the request/release copy in lib/duplicate-hold.ts,
+  // phrased for a booking. The other candidate record is never named.
+  duplicate_application:
+    'Not booked: this person already has a phone screen for this role on another candidate record. Release the duplicate-application hold on the candidate page first if this application should be screened.',
+  phone_schedule_unavailable:
+    'The booking service could not be reached, so nothing was booked. Try again shortly.',
+  // The candidate-page reschedule and cancel routes answer this 404 when the
+  // appointment is gone or no longer belongs to this candidate's engagement.
+  appointment_not_found:
+    'This appointment no longer exists for this candidate, so nothing was changed. Refresh the page to see the current booking.',
 
   // ── Server-side failures ──
   phone_read_error:
@@ -94,6 +131,15 @@ const REFRESH_REQUIRED = new Set([
   // means the row on screen is stale.
   'attempt_in_flight',
   'engagement_terminal',
+  // The candidate's application or cycle changed underneath the loaded
+  // view (cycle ended, application closed or gone, hold placed), so the
+  // calendar's candidate rows are stale.
+  'rescreen_required',
+  'application_not_live',
+  'application_not_found',
+  'candidate_not_found',
+  'duplicate_application',
+  'appointment_not_found',
 ]);
 
 const GENERIC =

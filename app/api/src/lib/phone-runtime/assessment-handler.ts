@@ -102,6 +102,27 @@ export function createPhoneAssessmentHandler(
       return;
     }
 
+    // 0114 (C2) — SCORE-SUPPRESSION GUARD, after the E4 guard and before ANY
+    // score() call. `phone_attempt_score_suppression` answers non-null for a
+    // leg that ended WITHOUT a screening: a booked callback, an in-call
+    // callback deferral, or an applied worker-declared `assessment.aborted`
+    // carrying this attempt id. Scoring such a leg published a verdict on an
+    // interview that never finished (4352df89, ab6126e0). The stranded sweep's
+    // own abort carries NO attempt id, so a DLQ replay of a stranded session
+    // is not suppressed and still scores (PR-B E5).
+    //
+    // Fail closed, like the guard above: an RPC error THROWS (bounded queue
+    // retry) because a scorecard published to Ashby cannot be retracted. Any
+    // non-null answer returns without scoring and without posting; the reason
+    // is not logged here (this file renders nothing by package invariant).
+    const suppression = await options.client.rpc('phone_attempt_score_suppression', {
+      p_attempt_id: attemptId,
+    });
+    if (suppression.error) throw new Error('phone_assessment_suppression_check_failed');
+    if (suppression.data != null) {
+      return;
+    }
+
     // A scoring failure must fail the queue claim so the existing bounded retry
     // policy can retry it. No terminal event is posted until scoring succeeds.
     // The interlock is preserved: the assessment ROW is written HERE, before

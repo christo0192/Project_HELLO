@@ -54,8 +54,12 @@ primary_region = "sin"
 [[vm]]
   cpus = 1
 `;
+// C9-1 (M009 PR-C): the phone app now REQUIRES kill_timeout and
+// PHONE_DRAIN_TIMEOUT_SEC (the SDK drain budget), so the clean fixture carries
+// the shipped defaults. Kill-timeout fixtures below REPLACE this line.
 const GOOD_PHONE = `app = "project-hello-phone-voice"
 primary_region = "sin"
+kill_timeout = 300
 
 [build]
   dockerfile = "Dockerfile"
@@ -63,6 +67,7 @@ primary_region = "sin"
 [env]
   COMPANY_NAME = "Interview Kickstart"
   PHONE_AGENT_NAME = "phone-screener"
+  PHONE_DRAIN_TIMEOUT_SEC = "90"
 
 [[vm]]
   cpus = 1
@@ -135,11 +140,22 @@ const NEG = [
   ["phone PHONE_PER_MACHINE_AGENT_NAME is not exactly true (TRUE)", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  PHONE_PER_MACHINE_AGENT_NAME = "TRUE"\n')],
   ["phone PHONE_PER_MACHINE_AGENT_NAME is 1", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  PHONE_PER_MACHINE_AGENT_NAME = "1"\n')],
   ["phone PHONE_PER_MACHINE_AGENT_NAME is empty", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  PHONE_PER_MACHINE_AGENT_NAME = ""\n')],
-  ["phone kill_timeout below the 90 s drain floor", GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"\n', 'primary_region = "sin"\nkill_timeout = 5\n')],
-  ["phone kill_timeout above Fly's 300 s max", GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"\n', 'primary_region = "sin"\nkill_timeout = 301\n')],
-  ["phone kill_timeout quoted / not a bare integer", GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"\n', 'primary_region = "sin"\nkill_timeout = "300s"\n')],
-  ["phone kill_timeout declared twice", GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"\n', 'primary_region = "sin"\nkill_timeout = 300\nkill_timeout = 5\n')],
-  ["phone kill_timeout nested in a table", GOOD_BROWSER, GOOD_PHONE.replace("[[vm]]\n", "[[vm]]\n  kill_timeout = 300\n")],
+  ["phone kill_timeout below the 90 s drain floor", GOOD_BROWSER, GOOD_PHONE.replace('kill_timeout = 300\n', 'kill_timeout = 5\n')],
+  ["phone kill_timeout above Fly's 300 s max", GOOD_BROWSER, GOOD_PHONE.replace('kill_timeout = 300\n', 'kill_timeout = 301\n')],
+  ["phone kill_timeout quoted / not a bare integer", GOOD_BROWSER, GOOD_PHONE.replace('kill_timeout = 300\n', 'kill_timeout = "300s"\n')],
+  ["phone kill_timeout declared twice", GOOD_BROWSER, GOOD_PHONE.replace('kill_timeout = 300\n', 'kill_timeout = 300\nkill_timeout = 5\n')],
+  ["phone kill_timeout nested in a table", GOOD_BROWSER, GOOD_PHONE.replace('kill_timeout = 300\n', "").replace("[[vm]]\n", "[[vm]]\n  kill_timeout = 300\n")],
+  // ── C9-1 (M009 PR-C): the SDK drain budget ──────────────────────────────
+  //   PHONE_DRAIN_TIMEOUT_SEC + 2 x PHONE_SHUTDOWN_PROCESS_TIMEOUT + 30 <= kill_timeout
+  ["phone kill_timeout absent (the drain budget has nothing to fit in)", GOOD_BROWSER, GOOD_PHONE.replace('kill_timeout = 300\n', "")],
+  ["phone kill_timeout = 240 cannot hold 90 + 2 x 90 + 30 = 300", GOOD_BROWSER, GOOD_PHONE.replace('kill_timeout = 300\n', 'kill_timeout = 240\n')],
+  ["phone drain = 120 with kill_timeout 300 (120 + 180 + 30 = 330)", GOOD_BROWSER, GOOD_PHONE.replace('PHONE_DRAIN_TIMEOUT_SEC = "90"', 'PHONE_DRAIN_TIMEOUT_SEC = "120"')],
+  ["phone PHONE_DRAIN_TIMEOUT_SEC absent (SDK default 1800 s)", GOOD_BROWSER, GOOD_PHONE.replace('  PHONE_DRAIN_TIMEOUT_SEC = "90"\n', "")],
+  ["phone PHONE_DRAIN_TIMEOUT_SEC below the 30 s clamp", GOOD_BROWSER, GOOD_PHONE.replace('PHONE_DRAIN_TIMEOUT_SEC = "90"', 'PHONE_DRAIN_TIMEOUT_SEC = "20"')],
+  ["phone PHONE_DRAIN_TIMEOUT_SEC not a whole number", GOOD_BROWSER, GOOD_PHONE.replace('PHONE_DRAIN_TIMEOUT_SEC = "90"', 'PHONE_DRAIN_TIMEOUT_SEC = "90s"')],
+  ["phone PHONE_SHUTDOWN_PROCESS_TIMEOUT = 120 overflows the budget (90 + 240 + 30)", GOOD_BROWSER, GOOD_PHONE.replace('PHONE_DRAIN_TIMEOUT_SEC = "90"', 'PHONE_DRAIN_TIMEOUT_SEC = "90"\n  PHONE_SHUTDOWN_PROCESS_TIMEOUT = "120"')],
+  ["phone PHONE_SHUTDOWN_PROCESS_TIMEOUT outside the worker clamp", GOOD_BROWSER, GOOD_PHONE.replace('PHONE_DRAIN_TIMEOUT_SEC = "90"', 'PHONE_DRAIN_TIMEOUT_SEC = "90"\n  PHONE_SHUTDOWN_PROCESS_TIMEOUT = "5"')],
+  ["browser carries PHONE_DRAIN_TIMEOUT_SEC", GOOD_BROWSER.replace("[env]\n", '[env]\n  PHONE_DRAIN_TIMEOUT_SEC = "90"\n'), GOOD_PHONE],
 ];
 for (const [label, browser, phone] of NEG) {
   const dir = fixture(browser, phone);
@@ -154,9 +170,16 @@ for (const [label, browser, phone] of NEG) {
     ["phone PHONE_PER_MACHINE_AGENT_NAME = \"true\" (PR-B posture)",
       GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  PHONE_PER_MACHINE_AGENT_NAME = "true"\n'), /phone_per_machine_agent_name=on/],
     ["phone kill_timeout = 300 (PR-A posture)",
-      GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"\n', 'primary_region = "sin"\nkill_timeout = 300\n'), /phone_per_machine_agent_name=off/],
-    ["phone kill_timeout = 90 with a trailing comment",
-      GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"\n', 'primary_region = "sin"\nkill_timeout = 90 # drain\n'), null],
+      GOOD_BROWSER, GOOD_PHONE, /phone_per_machine_agent_name=off/],
+    ["phone kill_timeout = 300 with a trailing comment",
+      GOOD_BROWSER, GOOD_PHONE.replace('kill_timeout = 300\n', 'kill_timeout = 300 # drain\n'), null],
+    // C9-1 budget positives: exactly at the bound passes.
+    ["phone drain 90 + 2 x 90 + 30 = 300 at kill_timeout 300 (shipped defaults)",
+      GOOD_BROWSER, GOOD_PHONE, /phone_drain_timeout_sec=90/],
+    ["phone drain 30 + 2 x 90 + 30 = 240 at kill_timeout 240",
+      GOOD_BROWSER, GOOD_PHONE.replace('kill_timeout = 300\n', 'kill_timeout = 240\n').replace('PHONE_DRAIN_TIMEOUT_SEC = "90"', 'PHONE_DRAIN_TIMEOUT_SEC = "30"'), null],
+    ["phone drain 120 fits once the shutdown grace is lowered (120 + 2 x 60 + 30 = 270)",
+      GOOD_BROWSER, GOOD_PHONE.replace('PHONE_DRAIN_TIMEOUT_SEC = "90"', 'PHONE_DRAIN_TIMEOUT_SEC = "120"\n  PHONE_SHUTDOWN_PROCESS_TIMEOUT = "60"'), null],
     ["browser kill_timeout accepted",
       GOOD_BROWSER.replace('primary_region = "sin"\n', 'primary_region = "sin"\nkill_timeout = 30\n'), GOOD_PHONE, null],
   ];
@@ -180,6 +203,41 @@ for (const [label, browser, phone] of NEG) {
   const phoneText = readFileSync(path.join(here, "..", "app/voice-livekit/fly.phone.toml"), "utf8");
   ok(/^kill_timeout = 300\r?$/m.test(phoneText),
     "fly.phone.toml must set a top-level kill_timeout = 300 so a stop drains a live call");
+  // C9-1: the shipped drain bound, and the budget it must satisfy.
+  ok(/^  PHONE_DRAIN_TIMEOUT_SEC = "90"\r?$/m.test(phoneText),
+    "fly.phone.toml must set PHONE_DRAIN_TIMEOUT_SEC = \"90\" (C9-1 SDK drain bound)");
+  ok(/phone_drain_timeout_sec=90/.test(out), `the validator must surface the shipped drain bound, got:\n${out}`);
+  const browserText = readFileSync(path.join(here, "..", "app/voice-livekit/fly.toml"), "utf8");
+  ok(!/PHONE_DRAIN_TIMEOUT_SEC/.test(browserText),
+    "fly.toml (browser) must not carry PHONE_DRAIN_TIMEOUT_SEC (browser options stay byte-identical)");
+}
+
+// ── C9-1: the drain budget is EFFECTIVE, and its failure names the sum ────
+{
+  const mod = await import(pathToFileURL(validator).href);
+  const B = mod.checkPhoneDrainBudget;
+  ok(typeof B === "function", "validate-voice-worker-apps.mjs must export checkPhoneDrainBudget");
+  if (typeof B === "function") {
+    ok(B({ killTimeout: "300", drain: "90", shutdown: undefined }).length === 0,
+      "defaults (90 + 2 x 90 + 30 = 300 <= 300) must pass");
+    ok(B({ killTimeout: "240", drain: "90", shutdown: undefined }).some((p) => /= 300 > kill_timeout 240/.test(p)),
+      "kill_timeout 240 must fail and name the 300 s requirement");
+    ok(B({ killTimeout: "300", drain: "120", shutdown: undefined }).some((p) => /= 330 > kill_timeout 300/.test(p)),
+      "drain 120 with kill_timeout 300 must fail and name the 330 s requirement");
+    ok(B({ killTimeout: undefined, drain: "90", shutdown: undefined }).some((p) => /kill_timeout/.test(p)),
+      "an absent kill_timeout must fail");
+    ok(B({ killTimeout: "300", drain: undefined, shutdown: undefined }).some((p) => /1800/.test(p)),
+      "an absent drain must fail and name the SDK's 1800 s default");
+    ok(mod.PHONE_DRAIN_BUDGET_MARGIN_SEC === 30 && mod.PHONE_SHUTDOWN_PROCESS_TIMEOUT_DEFAULT_SEC === 90,
+      "the budget constants must match agent.py (margin 30, shutdown default 90)");
+  }
+  // Mutation isolation: the ONLY difference is the kill_timeout, and the
+  // failure is exactly one (the budget), so it cannot be attributed elsewhere.
+  const bad = fixture(GOOD_BROWSER, GOOD_PHONE.replace('kill_timeout = 300\n', 'kill_timeout = 240\n'));
+  const rb = run(bad);
+  ok(rb.code !== 0 && /voice worker app config contract FAILED \(1\)/.test(rb.out) && /drain budget exceeds kill_timeout/.test(rb.out),
+    `kill_timeout 240 must produce EXACTLY the drain-budget failure, got:\n${rb.out}`);
+  rmSync(bad, { recursive: true, force: true });
 }
 
 // ── PR104: the region guard must be EFFECTIVE, not merely present ───────

@@ -254,6 +254,13 @@ export const api = {
       `/api/candidates/${id}/phone-call`,
       { method: 'POST', body: JSON.stringify({ confirm: true }) },
     ),
+  // 0114 (C8): lift a same-role duplicate-application hold. The server
+  // resolves the held engagement from the candidate; nothing dials here.
+  releaseCandidatePhoneDuplicateHold: (id: string) =>
+    request<{ ok: true; status: 'released'; engagement_id: string; prerequisite_status: string | null }>(
+      `/api/candidates/${encodeURIComponent(id)}/phone/release-duplicate-hold`,
+      { method: 'POST', body: JSON.stringify({ confirm: true }) },
+    ),
   getCandidatePhoneScreenings: (id: string) =>
     request<PhoneScreeningsResponse>(`/api/candidates/${encodeURIComponent(id)}/phone-cycles`),
   scheduleCandidatePhoneAppointment: (id: string, body: PhoneCandidateAppointmentCreateInput) =>

@@ -54,6 +54,38 @@ permissions:
   contents: read
 
 jobs:
+  # 0114 C6: an APPLIED migration is immutable. PR #145 edited 0057 after prod
+  # had applied it; Supabase never re-runs an applied file, so prod kept the
+  # old request_phone_rescreen body while every local/CI database (which apply
+  # the edited text) looked right. A change to shipped SQL must be a NEW
+  # forward migration. PR-only: diff the PR head against its merge-base with
+  # the base branch (three-dot, so newer base migrations never read as
+  # deletions) and refuse any Modified, Deleted, Renamed or type-changed file
+  # under app/supabase/migrations/. Adding files is the only allowed change.
+  migrations-immutable:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Refuse edits to existing migration files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          test -n "$BASE_SHA" && test -n "$HEAD_SHA" || { echo '::error::missing pull_request base/head sha'; exit 1; }
+          changed=$(git diff --no-color --name-status -M --diff-filter=MDRT \
+            "$BASE_SHA...$HEAD_SHA" -- app/supabase/migrations/)
+          if [ -n "$changed" ]; then
+            echo '::error::existing migration files were modified, deleted or renamed. Applied migrations are immutable: ship the change as a NEW forward migration.'
+            printf '%s\n' "$changed"
+            exit 1
+          fi
+          echo "migrations-immutable: only additions under app/supabase/migrations/ ($BASE_SHA...$HEAD_SHA)"
+
   supabase-check:
     runs-on: ubuntu-latest
     timeout-minutes: 20

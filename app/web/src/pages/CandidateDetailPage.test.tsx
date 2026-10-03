@@ -49,6 +49,9 @@ const mockApi = {
   // pipeline card contributes nothing to the Overview.
   getCandidateAshbyWorkflow: vi.fn().mockResolvedValue({ ok: true, workflow: null }),
   requestCandidatePhoneCall: vi.fn().mockResolvedValue({ ok: true, status: 'requested' }),
+  releaseCandidatePhoneDuplicateHold: vi.fn().mockResolvedValue({
+    ok: true, status: 'released', engagement_id: 'engagement-1', prerequisite_status: 'eligible',
+  }),
 };
 
 vi.mock('../api', () => ({
@@ -74,6 +77,7 @@ vi.mock('../api', () => ({
     listCandidates: vi.fn().mockResolvedValue([]),
     getCandidateAshbyWorkflow: (...args: any[]) => mockApi.getCandidateAshbyWorkflow(...args),
     requestCandidatePhoneCall: (...args: any[]) => mockApi.requestCandidatePhoneCall(...args),
+    releaseCandidatePhoneDuplicateHold: (...args: any[]) => mockApi.releaseCandidatePhoneDuplicateHold(...args),
   },
   ApiError: class extends Error {
     status: number;
@@ -583,6 +587,101 @@ describe('CandidateDetailPage', () => {
       'candidate-1',
       expect.objectContaining({ request_id: expect.stringMatching(/^ui-/), reason: 'technical_issue' }),
     ));
+  });
+
+  it('C3: recommends a technical_issue re-screen when the newest scorecard is held for evidence', async () => {
+    const terminalCycle = {
+      cycle_number: 1, state: 'completed', state_reason: null, version: 2,
+      no_answer_attempts: 0, no_answer_limit: 3, reconnects_used: 0, provider_failures: 0,
+      next_eligible_at: null, last_attempt_at: null, terminal_at: '2026-08-27T10:00:00Z',
+      created_at: '2026-08-27T09:00:00Z', updated_at: '2026-08-27T10:00:00Z',
+      has_session: true, has_assessment: true, appointment: null,
+    };
+    mockApi.getCandidatePhoneScreenings.mockResolvedValue({
+      ok: true, enabled: true, current_cycle: 1, cycles: [terminalCycle],
+    });
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      assessments: [{
+        ...mockCandidateDetail.assessments[0],
+        evidence_grade: 'insufficient',
+        evidence_reason: 'infra_interrupted',
+        evidence_answered: 1,
+        evidence_planned: 5,
+      }],
+    });
+    renderDetailPage();
+    const button = await screen.findByRole('button', { name: 'Rescreen recommended' });
+    expect(screen.getByText(/cut off on our side/)).toBeInTheDocument();
+    // The ordinary governed form is still there.
+    expect(screen.getByRole('button', { name: 'Request re-screen' })).toBeInTheDocument();
+    await userEvent.click(button);
+    await waitFor(() => expect(mockApi.requestPhoneRescreen).toHaveBeenCalledWith(
+      'candidate-1',
+      expect.objectContaining({ request_id: expect.stringMatching(/^ui-/), reason: 'technical_issue' }),
+    ));
+  });
+
+  describe('C8: a same-role duplicate-application hold', () => {
+    const heldCycle = {
+      cycle_number: 1, state: 'pending_prereqs', state_reason: 'duplicate_application', version: 2,
+      no_answer_attempts: 0, no_answer_limit: 3, reconnects_used: 0, provider_failures: 0,
+      next_eligible_at: null, last_attempt_at: null, terminal_at: null,
+      created_at: '2026-10-03T09:00:00Z', updated_at: '2026-10-03T09:00:00Z',
+      has_session: false, has_assessment: false, appointment: null,
+    };
+
+    it('shows the hold without naming the other record, and Release calls the API', async () => {
+      mockApi.getCandidatePhoneScreenings.mockResolvedValue({
+        ok: true, enabled: true, current_cycle: 1, cycles: [heldCycle],
+      });
+      renderDetailPage();
+      expect(await screen.findByText('Held: duplicate application')).toBeInTheDocument();
+      expect(screen.getByText(/already has a phone screen for this role on another candidate record/)).toBeInTheDocument();
+      await userEvent.click(screen.getByRole('button', { name: 'Release hold' }));
+      await waitFor(() => expect(mockApi.releaseCandidatePhoneDuplicateHold).toHaveBeenCalledWith('candidate-1'));
+      expect(await screen.findByRole('status')).toHaveTextContent(/Hold released/);
+      // Re-read after the release.
+      await waitFor(() => expect(mockApi.getCandidatePhoneScreenings.mock.calls.length).toBeGreaterThanOrEqual(2));
+    });
+
+    it('no hold banner for an ordinary pending cycle', async () => {
+      mockApi.getCandidatePhoneScreenings.mockResolvedValue({
+        ok: true, enabled: true, current_cycle: 1,
+        cycles: [{ ...heldCycle, state_reason: 'consent_missing' }],
+      });
+      renderDetailPage();
+      await screen.findByRole('button', { name: 'Book a slot' });
+      expect(screen.queryByRole('button', { name: 'Release hold' })).toBeNull();
+    });
+
+    it('a request answered duplicate_application shows recruiter copy, not the raw code', async () => {
+      const { ApiError } = await import('../api');
+      mockApi.requestCandidatePhoneCall.mockRejectedValueOnce(new ApiError('duplicate_application', 409));
+      renderDetailPage();
+      await screen.findByText('Jane Doe');
+      await userEvent.click(await screen.findByRole('button', { name: 'Call candidate' }));
+      await userEvent.click(screen.getByRole('button', { name: 'Confirm call' }));
+      const status = await screen.findByRole('status');
+      expect(status).toHaveTextContent(/another candidate record/);
+      expect(status).not.toHaveTextContent('duplicate_application');
+    });
+  });
+
+  it('C3: no re-screen recommendation for a decision-graded (or ungraded) scorecard', async () => {
+    mockApi.getCandidatePhoneScreenings.mockResolvedValue({
+      ok: true, enabled: true, current_cycle: 1,
+      cycles: [{
+        cycle_number: 1, state: 'completed', state_reason: null, version: 2,
+        no_answer_attempts: 0, no_answer_limit: 3, reconnects_used: 0, provider_failures: 0,
+        next_eligible_at: null, last_attempt_at: null, terminal_at: '2026-08-27T10:00:00Z',
+        created_at: '2026-08-27T09:00:00Z', updated_at: '2026-08-27T10:00:00Z',
+        has_session: true, has_assessment: true, appointment: null,
+      }],
+    });
+    renderDetailPage();
+    await screen.findByRole('button', { name: 'Request re-screen' });
+    expect(screen.queryByRole('button', { name: 'Rescreen recommended' })).toBeNull();
   });
 
   it('renders the session summary in Overview', async () => {

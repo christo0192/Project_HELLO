@@ -23,6 +23,7 @@ import {
   decisionIsTerminal,
   resetsReconnectBudget,
   PHONE_OUTCOME_MIGRATION_REASONS,
+  PHONE_CALLBACK_DEFERRAL_LIMIT,
   type PhoneBudgetCounters,
   type PhoneOutcomeDecision,
 } from '../lib/phone-screening/budget.js';
@@ -32,7 +33,12 @@ import {
   PHONE_BUDGET_CEILINGS,
   type PhoneOutcomeClass,
 } from '../lib/phone-screening/vocabulary.js';
-import { MIGRATION_0042, PHONE_MIGRATIONS_TEXT, functionBody } from './support/phone-migration.js';
+import {
+  MIGRATION_0042,
+  MIGRATION_0114,
+  PHONE_MIGRATIONS_TEXT,
+  functionBody,
+} from './support/phone-migration.js';
 
 const SEED = 0x0b0dae7;
 const NUM_RUNS = 500;
@@ -344,5 +350,94 @@ describe('outcome map — reasons and the reconnect reset', () => {
     expect(functionBody('apply_phone_event')).toContain(
       "and coalesce(v_att.kind, 'initial') <> 'reconnect'",
     );
+  });
+});
+
+describe('outcome map — 0114 (C2-P1) the in-call callback deferral', () => {
+  it('a deferral is a free, non-terminal wait to the next IST day', () => {
+    const counters = at({ noAnswerAttempts: 2, reconnectsUsed: 2, providerFailures: 4 });
+    const d = decidePhoneOutcome('callback_deferred', { counters, windowOpen: true });
+    expect(d.charge).toBe('none');
+    expect(d.counters).toEqual(counters);
+    expect(d.engagementState).toBe('eligible');
+    expect(d.terminal).toBe(false);
+    expect(d.stateReason).toBe('callback_deferred_in_call');
+    expect(d.deferral).toBe('next_ist_day');
+    expect(d.writesSuppression).toBe(false);
+    expect(d.hasMigrationWriter).toBe(true);
+  });
+
+  it('the THIRD deferral (two already applied) fails the engagement, still uncharged', () => {
+    expect(PHONE_CALLBACK_DEFERRAL_LIMIT).toBe(2);
+    for (const prior of [0, 1]) {
+      const d = decidePhoneOutcome('callback_deferred', {
+        counters: zero, windowOpen: true, priorCallbackDeferrals: prior,
+      });
+      expect(d.engagementState, `prior=${prior}`).toBe('eligible');
+      expect(d.terminal).toBe(false);
+    }
+    for (const prior of [2, 3, 7]) {
+      const d = decidePhoneOutcome('callback_deferred', {
+        counters: zero, windowOpen: true, priorCallbackDeferrals: prior,
+      });
+      expect(d.engagementState, `prior=${prior}`).toBe('failed');
+      expect(d.terminal).toBe(true);
+      expect(d.stateReason).toBe('callback_deferral_limit');
+      expect(d.charge).toBe('none');
+      expect(d.counters).toEqual(zero);
+      expect(d.deferral).toBe('none');
+    }
+  });
+
+  it('the window does not matter: the deferral targets the next day either way', () => {
+    for (const windowOpen of [true, false]) {
+      const d = decidePhoneOutcome('callback_deferred', { counters: zero, windowOpen });
+      expect(d.engagementState).toBe('eligible');
+      expect(d.deferral).toBe('next_ist_day');
+    }
+  });
+
+  it('never charges any budget, at any counter triple or deferral count', () => {
+    fc.assert(
+      fc.property(
+        fc.integer({ min: 0, max: PHONE_BUDGET_CEILINGS.noAnswer }),
+        fc.integer({ min: 0, max: PHONE_BUDGET_CEILINGS.reconnect }),
+        fc.integer({ min: 0, max: PHONE_BUDGET_CEILINGS.providerFailure }),
+        fc.integer({ min: 0, max: 10 }),
+        fc.boolean(),
+        (na, rc, pf, prior, windowOpen) => {
+          const counters = at({ noAnswerAttempts: na, reconnectsUsed: rc, providerFailures: pf });
+          const d = decidePhoneOutcome('callback_deferred', {
+            counters, windowOpen, priorCallbackDeferrals: prior,
+          });
+          expect(d.charge).toBe('none');
+          expect(d.counters).toEqual(counters);
+          expect(d.terminal).toBe(decisionIsTerminal(d));
+          expect(d.terminal).toBe(prior >= PHONE_CALLBACK_DEFERRAL_LIMIT);
+        },
+      ),
+      { seed: SEED, numRuns: NUM_RUNS },
+    );
+  });
+
+  it('mirrors the callback.deferred_in_call branch of apply_phone_event (0114)', () => {
+    const body = functionBody('apply_phone_event');
+    // The NEWEST body is 0114's: the branch exists and is the writer.
+    expect(MIGRATION_0114).toContain("p_event_type = 'callback.deferred_in_call'");
+    expect(body).toContain("v_outcome := 'callback_deferred'");
+    // The ceiling literal this map mirrors as PHONE_CALLBACK_DEFERRAL_LIMIT.
+    const branch = body.slice(body.indexOf("p_event_type = 'callback.deferred_in_call'"));
+    expect(branch).toMatch(/and ev\.applied\) >= 2 then/);
+    expect(branch).toContain("v_new_state := 'failed'; v_reason := 'callback_deferral_limit'");
+    expect(branch).toContain("v_new_state := 'eligible'; v_reason := 'callback_deferred_in_call'");
+  });
+
+  it('both callback_deferred reasons are written by 0114 itself', () => {
+    expect(PHONE_OUTCOME_MIGRATION_REASONS.callback_deferred).toEqual([
+      'callback_deferred_in_call', 'callback_deferral_limit',
+    ]);
+    for (const reason of PHONE_OUTCOME_MIGRATION_REASONS.callback_deferred) {
+      expect(MIGRATION_0114, reason).toContain(`'${reason}'`);
+    }
   });
 });

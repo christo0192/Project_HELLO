@@ -140,6 +140,9 @@ describe('the adapters call the RPCs by name, with the declared keys', () => {
       neverStarted: true,
       // 0113 (E4): absent on this wire row, so it parses to the safe default.
       callbackBooked: false,
+      // 0114 (C2): absent too — score it, as today.
+      scoreSuppressed: false,
+      suppressReason: null,
     });
   });
 
@@ -183,7 +186,80 @@ describe('the adapters call the RPCs by name, with the declared keys', () => {
       recordingPresent: true,
       neverStarted: false,
       callbackBooked: true,
+      scoreSuppressed: false,
+      suppressReason: null,
     });
+  });
+
+  it.each(['callback_booked', 'callback_deferred', 'worker_aborted'] as const)(
+    'finalizePartialSessions maps 0114 score_suppressed:true + %s',
+    async (reason) => {
+      // 0114 (C2). The wire keys are snake_case; a mis-spelling would parse
+      // every suppressed leg as scoreable and the tick would go back to
+      // scoring deferrals and worker aborts.
+      const { client } = fakeClient({
+        status: 'ok',
+        sessions: [{
+          session_id: 's1', attempt_id: 'a1', callback_booked: reason === 'callback_booked',
+          score_suppressed: true, suppress_reason: reason,
+        }],
+      });
+      const result = await createPhoneStores(client).finalizePartialSessions!({
+        limit: 25, now: NOW,
+      });
+      expect(result.sessions[0].scoreSuppressed).toBe(true);
+      expect(result.sessions[0].suppressReason).toBe(reason);
+    },
+  );
+
+  it.each([
+    ['a string flag', 'true', 'worker_aborted', false, null],
+    ['a null flag', null, 'worker_aborted', false, null],
+    ['an unknown reason', true, 'because', true, null],
+    ['a reason beside false', false, 'worker_aborted', false, null],
+    ['a numeric reason', true, 7, true, null],
+  ] as const)(
+    'finalizePartialSessions narrows a MALFORMED suppression pair (%s)',
+    async (_label, flag, reason, suppressed, narrowed) => {
+      // The boolean governs. Anything but a JSON boolean is not evidence of a
+      // suppression (score it, as today), and a reason outside the closed
+      // vocabulary is reported as null rather than invented.
+      const { client } = fakeClient({
+        status: 'ok',
+        sessions: [{
+          session_id: 's1', attempt_id: 'a1', score_suppressed: flag, suppress_reason: reason,
+        }],
+      });
+      const result = await createPhoneStores(client).finalizePartialSessions!({
+        limit: 25, now: NOW,
+      });
+      expect(result.sessions[0].scoreSuppressed).toBe(suppressed);
+      expect(result.sessions[0].suppressReason).toBe(narrowed);
+    },
+  );
+
+  it('sweepStrandedSessions maps 0114 late_completed / late_superseded', async () => {
+    const { client, calls } = fakeClient({
+      status: 'ok', examined: 3, completed: 1, failed: 0, skipped: 0,
+      late_completed: 2, late_superseded: 1,
+    });
+    const result = await createPhoneStores(client).sweepStrandedSessions({ limit: 25, now: NOW });
+    expect(calls[0].name).toBe('sweep_phone_stranded_sessions');
+    // The contract stays [p_limit, p_now]: 0114 adds no parameter.
+    expect(Object.keys(calls[0].args).sort()).toEqual(['p_limit', 'p_now']);
+    expect(result).toEqual({
+      status: 'ok', examined: 3, completed: 1, failed: 0, skipped: 0,
+      lateCompleted: 2, lateSuperseded: 1,
+    });
+  });
+
+  it('sweepStrandedSessions leaves the 0114 counts UNDEFINED on an older RPC', async () => {
+    // Never 0: the tick must not report a late completion nobody performed,
+    // and "absent" is how an older RPC says it has no such pass.
+    const { client } = fakeClient({ status: 'ok', examined: 0, completed: 0, failed: 0, skipped: 0 });
+    const result = await createPhoneStores(client).sweepStrandedSessions({ now: NOW });
+    expect(result.lateCompleted).toBeUndefined();
+    expect(result.lateSuperseded).toBeUndefined();
   });
 
   it.each([
@@ -232,6 +308,9 @@ describe('the adapters call the RPCs by name, with the declared keys', () => {
     expect(result.sessions[0].engagementId).toBeNull();
     // 0113 (E4): an older RPC sends no callback_booked — score it, as today.
     expect(result.sessions[0].callbackBooked).toBe(false);
+    // 0114 (C2): nor score_suppressed / suppress_reason — score it, as today.
+    expect(result.sessions[0].scoreSuppressed).toBe(false);
+    expect(result.sessions[0].suppressReason).toBeNull();
   });
 
   it('a refusal carries only sanitized detail — codes, counts and instants', async () => {

@@ -12,10 +12,23 @@ import { scoreWithScorecard } from '../lib/scorecards/scorer.js';
 import { ScorecardValidationError } from '../lib/scorecards/domain.js';
 import { analyzeResumeIntegrity } from '../lib/scorecards/integrity.js';
 import {
+  ANSWERED_DISPOSITIONS,
+  EVIDENCE_COLUMN_NAMES,
+  canAutoReject,
+  evidenceColumns,
+  gradeEvidence,
+  isMissingColumnError,
+  parseEvidenceGrade,
+  parseEvidenceReason,
+  type EvidenceGrade,
+  type EvidenceMeasurement,
+} from '../lib/scorecards/evidence.js';
+import {
   createPhoneStores,
   createPhoneReadStore,
   PHONE_SYSTEM_ACTOR,
   PHONE_VOICE_CALLBACK_DURATION_SECONDS,
+  type SchedulePhoneAppointmentStatus,
 } from '../lib/phone-screening/index.js';
 import { createLogger } from '../lib/logger.js';
 
@@ -512,6 +525,36 @@ async function runAssessmentImpl(
     basePayload.raw = { ...(basePayload.raw as Record<string, unknown>), partial: partialMeta };
   }
 
+  // ── C3 (0114 §4): INTERVIEW-COVERAGE EVIDENCE GRADE ─────────────────
+  // How much of the planned screening actually happened — graded per revision
+  // and persisted for the PHONE path only (the browser insert payload stays
+  // byte-identical; a browser row reads as NULL = decision). It decides what
+  // the scorecard may be USED for (the candidate status below, the Ashby
+  // gate in the observer), never whether it is produced. A RESCORE copies the
+  // superseded revision's grade (it never upgrades an insufficient one) and
+  // recomputes only when that revision has none or its read had failed.
+  const candidateTurns = transcript.filter((turn) => turn.speaker !== 'bot').length;
+  const evidence: EvidenceGrade = !isPhone
+    ? gradeEvidence({
+        source: 'browser',
+        partial: false,
+        candidateTurns,
+        disconnectReason: null,
+        measurement: null,
+      })
+    : isRescore
+      ? await rescoreEvidence(sessionId, supersedesAssessmentId, candidateTurns)
+      : gradeEvidence({
+          source: 'phone',
+          partial: isPartial,
+          candidateTurns,
+          disconnectReason: isPartial ? (options?.disconnectReason ?? 'disconnected') : null,
+          measurement: await readEvidenceMeasurement(sessionId),
+        });
+  if (isPhone) {
+    Object.assign(basePayload, evidenceColumns(evidence));
+  }
+
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- the schema
   // client returns loosely-typed rows; `row.id` is read below exactly as the
   // pre-Phase-4 code did.
@@ -541,6 +584,10 @@ async function runAssessmentImpl(
         row = data;
         break;
       }
+      // C3: a stale schema (0114 §4 not applied, or a stale PostgREST cache)
+      // must not lose the rescore — drop the evidence columns and retry. The
+      // grade still drives the status rule below from memory.
+      if (stripEvidenceOnStaleSchema(basePayload, error)) continue;
       if (!isUniqueViolation(error)) throw new Error(error.message);
       const winner = await loadAssessmentByRescoreRequestId(rescoreRequestId!);
       if (winner) return winner; // idempotency race — another request won.
@@ -560,6 +607,18 @@ async function runAssessmentImpl(
       .insert(basePayload)
       .select()
       .single();
+
+    // C3 (0114 §4): if the evidence_* columns are not in the schema (cache)
+    // yet, retry WITHOUT them. The grade is recomputable and still drives the
+    // status rule and the Ashby gate from memory; the scorecard is never lost.
+    // `basePayload` itself is stripped so the fallbacks below cannot re-add it.
+    if (aErr && stripEvidenceOnStaleSchema(basePayload, aErr)) {
+      ({ data, error: aErr } = await supabase
+        .from('assessments')
+        .insert(basePayload)
+        .select()
+        .single());
+    }
 
     // If optional communication/motivation columns haven't been migrated yet,
     // retry with those columns only.  Provenance is *never* dropped — it must
@@ -637,15 +696,35 @@ async function runAssessmentImpl(
     candidateRow?.decision_use_blocked_at != null &&
     candidateRow.decision_use_blocked_at !== '';
   if (!decisionBlocked) {
-    // Auto-terminate to 'rejected' ONLY on a COMPLETE reject. A PROVISIONAL
-    // reject (incomplete_evidence — scored over a subset of metrics) must land
-    // 'screened' so a human confirms before the candidate is rejected on partial
-    // evidence; the provisional verdict is still shown on the scorecard.
-    const terminalReject = recommendationValue === 'reject' && !isProvisionalRecommendation;
-    await supabase
-      .from('candidates')
-      .update({ status: terminalReject ? 'rejected' : 'screened' })
-      .eq('id', session.candidate_id);
+    // C3: ONE status rule, keyed on INTERVIEW coverage, never overwriting a
+    // human `advanced`.
+    //   * insufficient evidence -> `screened`, and only from new/queued/
+    //     screening: a thin or infra-killed call never moves a candidate a
+    //     human (or an earlier full screening) already placed;
+    //   * decision -> `rejected` ONLY when canAutoReject holds (a COMPLETE
+    //     reject — a PROVISIONAL incomplete_evidence reject never qualifies —
+    //     and, on the phone, a MEASURED answered*2 >= planned); otherwise
+    //     `screened`, so a human confirms before the candidate is rejected.
+    if (evidence.grade === 'insufficient') {
+      await supabase
+        .from('candidates')
+        .update({ status: 'screened' })
+        .eq('id', session.candidate_id)
+        .in('status', ['new', 'queued', 'screening'])
+        .neq('status', 'advanced');
+    } else {
+      const terminalReject = canAutoReject({
+        source: isPhone ? 'phone' : 'browser',
+        recommendation: recommendationValue,
+        scoringStatus: isProvisionalRecommendation ? 'incomplete_evidence' : null,
+        evidence,
+      });
+      await supabase
+        .from('candidates')
+        .update({ status: terminalReject ? 'rejected' : 'screened' })
+        .eq('id', session.candidate_id)
+        .neq('status', 'advanced');
+    }
   }
 
   // VOI-08: best-effort non-concurrent repeat guard — transition the session's
@@ -673,10 +752,18 @@ async function runAssessmentImpl(
   //
   // Deliberately best-effort with respect to scoring: `observeAshbyCompletion`
   // never throws, so a bookkeeping failure cannot discard a scored assessment.
-  await observeAshbyCompletion(sessionId, {
-    lookup: createAshbyLinkLookup(supabase as never),
-    stores: createWorkflowStores(supabase as never),
-  });
+  //
+  // C3: an INSUFFICIENT-evidence row is held for human review instead — the
+  // observer parks it with `evidence_insufficient_review` and never enqueues
+  // the scorecard write.
+  await observeAshbyCompletion(
+    sessionId,
+    {
+      lookup: createAshbyLinkLookup(supabase as never),
+      stores: createWorkflowStores(supabase as never),
+    },
+    { evidenceGrade: evidence.grade },
+  );
 
   // ── POST-CALL CALLBACK BACKSTOP ─────────────────────────────────────
   // If the candidate asked for a callback and the in-call flow did NOT already
@@ -703,6 +790,19 @@ async function runAssessmentImpl(
 
   return { ...assessmentForReturn, id: row.id };
 }
+
+/**
+ * Backstop refusals that leave a `phone_callback_recovery_required` audit row,
+ * with the status itself as `metadata.reason`. `engagement_terminal` since the
+ * backstop shipped; `slot_not_yet_eligible` and `daily_attempt_exists` since
+ * 0114 (C5) — a callback the candidate asked for, at a time no dial can reach.
+ * Typed against the RPC's own vocabulary so a rename breaks the build.
+ */
+const CALLBACK_RECOVERY_REASONS: ReadonlySet<string> = new Set<SchedulePhoneAppointmentStatus>([
+  'engagement_terminal',
+  'slot_not_yet_eligible',
+  'daily_attempt_exists',
+]);
 
 /**
  * Book a system-deferral callback from the scorer's post-call extraction, if
@@ -775,10 +875,13 @@ async function bookPostCallCallbackBestEffort(
       assessmentLog.info('unknown_event', { error_category: `callback_backstop_${result.status}` });
     } else {
       assessmentLog.warn('unknown_event', { error_category: `callback_backstop_refused_${result.status}` });
-      if (result.status === 'engagement_terminal') {
+      if (CALLBACK_RECOVERY_REASONS.has(result.status)) {
         // Durable, PII-free operator visibility. The ordinary appointment RPC
-        // correctly refuses to resurrect a terminal engagement; losing the
-        // candidate's explicit request in a transient log would be worse.
+        // correctly refuses to resurrect a terminal engagement, and (0114, C5)
+        // refuses a slot no dial could honour — one before the engagement's
+        // own `next_eligible_at`, or on an IST day whose dials are spent.
+        // Losing the candidate's explicit request in a transient log would be
+        // worse, so each leaves a recovery record naming the refusal.
         await supabase.from('audit_events').insert({
           actor_id: PHONE_SYSTEM_ACTOR,
           actor_type: 'system',
@@ -786,7 +889,7 @@ async function bookPostCallCallbackBestEffort(
           target_type: 'call_session',
           target_id: sessionId,
           result: 'failure',
-          metadata: { reason: 'engagement_terminal', engagement_id: engagementId },
+          metadata: { reason: result.status, engagement_id: engagementId },
         });
       }
     }
@@ -818,6 +921,132 @@ function isPhoneSession(externalCallId: unknown): boolean {
  */
 function isUniqueViolation(error: { code?: string | null } | null | undefined): boolean {
   return error?.code === '23505';
+}
+
+/**
+ * C3: the stale-schema insert fallback. When the insert failed because an
+ * `evidence_*` column is unknown (PGRST204 / 42703, or any message naming
+ * one), strip the four evidence columns from the payload IN PLACE and report
+ * true so the caller retries. Returns false — and changes nothing — for any
+ * other error, or when the payload carries no evidence column (browser).
+ */
+function stripEvidenceOnStaleSchema(
+  payload: Record<string, unknown>,
+  error: { code?: string | null; message?: string | null } | null | undefined,
+): boolean {
+  if (!error) return false;
+  if (!EVIDENCE_COLUMN_NAMES.some((name) => name in payload)) return false;
+  const message = typeof error.message === 'string' ? error.message : '';
+  if (!/evidence_/i.test(message)) return false;
+  for (const name of EVIDENCE_COLUMN_NAMES) delete payload[name];
+  assessmentLog.warn('unknown_event', {
+    error_category: 'assessment_evidence_columns_missing',
+    error_type: isMissingColumnError(error) ? String(error.code) : 'message_match',
+  });
+  return true;
+}
+
+/**
+ * C3: the coverage read for one PHONE session — the plan's question count and
+ * the per-boundary dispositions (0086). Retried ONCE; a second failure
+ * resolves to `read_failed`, which grades a partial call
+ * `insufficient/evidence_read_failed` (fail closed: the card is withheld from
+ * Ashby and the candidate is not moved, rather than graded on a guess).
+ */
+async function readEvidenceMeasurement(
+  sessionId: string,
+): Promise<EvidenceMeasurement | 'read_failed'> {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const { data: plan, error: planError } = await supabase
+        .from('phone_session_plans')
+        .select('question_count')
+        .eq('session_id', sessionId)
+        .maybeSingle();
+      if (planError) continue;
+      const { data: rows, error: rowsError } = await supabase
+        .from('phone_session_progress')
+        .select('disposition')
+        .eq('session_id', sessionId);
+      if (rowsError) continue;
+      const list = Array.isArray(rows) ? (rows as Array<{ disposition?: unknown }>) : [];
+      const planned = (plan as { question_count?: unknown } | null)?.question_count;
+      return {
+        planned: typeof planned === 'number' ? planned : null,
+        progressRows: list.length,
+        answeredRows: list.filter(
+          (r) => typeof r.disposition === 'string' && ANSWERED_DISPOSITIONS.includes(r.disposition),
+        ).length,
+        nullDispositionRows: list.filter((r) => r.disposition == null).length,
+      };
+    } catch {
+      // retry once, then fail closed below
+    }
+  }
+  assessmentLog.warn('unknown_event', { error_category: 'assessment_evidence_read_failed' });
+  return 'read_failed';
+}
+
+/**
+ * C3: the evidence grade of a PHONE rescore. COPIED from the superseded latest
+ * revision — a rescore re-reads the same interview, so its coverage cannot
+ * change, and copying is what guarantees a rescore never upgrades an
+ * insufficient row. Recomputed ONLY when that revision carries no grade (a
+ * pre-0114 row, or the column is missing) or its read had failed, using the
+ * revision's STORED `partial` and `raw.partial.disconnect_reason` — never the
+ * rescore caller's options.
+ */
+async function rescoreEvidence(
+  sessionId: string,
+  supersedesAssessmentId: string | null,
+  candidateTurns: number,
+): Promise<EvidenceGrade> {
+  let prior: Record<string, unknown> | null = null;
+  if (supersedesAssessmentId) {
+    const withEvidence = await supabase
+      .from('assessments')
+      .select('evidence_grade,evidence_reason,evidence_answered,evidence_planned,partial,raw')
+      .eq('id', supersedesAssessmentId)
+      .maybeSingle();
+    if (!withEvidence.error) {
+      prior = (withEvidence.data as Record<string, unknown> | null) ?? null;
+    } else if (isMissingColumnError(withEvidence.error)) {
+      const legacy = await supabase
+        .from('assessments')
+        .select('partial,raw')
+        .eq('id', supersedesAssessmentId)
+        .maybeSingle();
+      if (legacy.error) {
+        return { grade: 'insufficient', reason: 'evidence_read_failed', answered: null, planned: null };
+      }
+      prior = (legacy.data as Record<string, unknown> | null) ?? null;
+    } else {
+      return { grade: 'insufficient', reason: 'evidence_read_failed', answered: null, planned: null };
+    }
+  }
+  const priorGrade = parseEvidenceGrade(prior?.evidence_grade);
+  const priorReason = parseEvidenceReason(prior?.evidence_reason);
+  if (priorGrade !== null && priorReason !== null && priorReason !== 'evidence_read_failed') {
+    const num = (v: unknown): number | null =>
+      typeof v === 'number' && Number.isFinite(v) ? v : null;
+    return {
+      grade: priorGrade,
+      reason: priorReason,
+      answered: num(prior?.evidence_answered),
+      planned: num(prior?.evidence_planned),
+    };
+  }
+  const partial = prior?.partial === true;
+  const rawPartial = (prior?.raw as { partial?: { disconnect_reason?: unknown } } | null | undefined)?.partial;
+  const disconnectReason =
+    typeof rawPartial?.disconnect_reason === 'string' ? rawPartial.disconnect_reason : null;
+  return gradeEvidence({
+    source: 'phone',
+    partial,
+    candidateTurns,
+    disconnectReason: partial ? (disconnectReason ?? 'disconnected') : null,
+    measurement: await readEvidenceMeasurement(sessionId),
+  });
 }
 
 /**

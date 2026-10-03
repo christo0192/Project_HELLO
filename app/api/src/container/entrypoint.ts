@@ -33,7 +33,15 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { join } from 'node:path';
 
-import { loadAvUpdaterConfig, startAvUpdater, type AvUpdaterHandle } from '../lib/av-updater.js';
+import {
+  loadAvUpdaterConfig,
+  resolveAvUpdaterStatusFile,
+  startAvUpdater,
+  writeAvUpdaterStatusFile,
+  type AvUpdaterHandle,
+  type AvUpdaterStatus,
+  type StartUpdaterOptions,
+} from '../lib/av-updater.js';
 import { readSignatureState } from '../lib/clamav-signatures.js';
 import { createLogger } from '../lib/logger.js';
 
@@ -70,6 +78,8 @@ export interface SupervisorOptions {
   startUpdater?: (cfg: ReturnType<typeof loadAvUpdaterConfig>) => AvUpdaterHandle | null;
   /** Signal registrar (tests). */
   onSignal?: (signal: NodeJS.Signals, handler: () => void) => void;
+  /** 0114 (C10c). Status-file writer seam (tests). Defaults to the atomic writer. */
+  writeStatus?: (path: string, status: AvUpdaterStatus) => Promise<boolean>;
 }
 
 export interface SupervisorHandle {
@@ -79,6 +89,45 @@ export interface SupervisorHandle {
   updater: AvUpdaterHandle | null;
   /** Deliver a termination signal (used by the registered handlers and tests). */
   terminate(signal: NodeJS.Signals): void;
+}
+
+/**
+ * The options the supervisor starts the real updater with. Exported so the
+ * wiring is testable without spawning freshclam.
+ *
+ * 0114 (C10c). The API is a SEPARATE process, so the updater's state reaches
+ * `/health` through a small status file this supervisor rewrites atomically
+ * after every attempt (`AV_UPDATER_STATUS_FILE`). Counts, instants, an exit
+ * status and a closed reason code only.
+ */
+export function supervisorUpdaterOptions(
+  cfg: ReturnType<typeof loadAvUpdaterConfig>,
+  source: NodeJS.ProcessEnv,
+  writeStatus: (path: string, status: AvUpdaterStatus) => Promise<boolean> = writeAvUpdaterStatusFile,
+): StartUpdaterOptions {
+  const statusFile = resolveAvUpdaterStatusFile(source);
+  return {
+    intervalMs: cfg.intervalMs,
+    timeoutMs: cfg.timeoutMs,
+    immediate: true,
+    // freshclam's exit 1 ("up to date") is a success only if the database on
+    // disk is fresh NOW: decided by evidence, not by the exit status.
+    isFresh: async (): Promise<boolean> => (await readSignatureState({ source })).fresh,
+    onStatus: async (status): Promise<void> => {
+      await writeStatus(statusFile, status);
+    },
+    // A machine with NO usable database cannot scan at all, and a lost
+    // cold-start download used to cost a full steady-state hour of that.
+    // `fresh` is false for a stale database too, but that machine CAN still be
+    // topped up politely — only a genuinely absent/unreadable/corrupt
+    // database takes the urgent ladder.
+    isCold: async (): Promise<boolean> => {
+      const state = await readSignatureState({ source });
+      return state.reason === 'signatures_missing'
+        || state.reason === 'signatures_unreadable'
+        || state.reason === 'signatures_corrupt';
+    },
+  };
 }
 
 /**
@@ -95,24 +144,7 @@ export function startSupervisor(opts: SupervisorOptions = {}): SupervisorHandle 
   const updaterConfig = loadAvUpdaterConfig(source);
   const startUpdater = opts.startUpdater
     ?? ((cfg): AvUpdaterHandle | null => (
-      cfg.enabled
-        ? startAvUpdater({
-            intervalMs: cfg.intervalMs,
-            timeoutMs: cfg.timeoutMs,
-            immediate: true,
-            // A machine with NO usable database cannot scan at all, and a lost
-            // cold-start download used to cost a full steady-state hour of
-            // that. `fresh` is false for a stale database too, but that
-            // machine CAN still be topped up politely — only a genuinely
-            // absent/unreadable/corrupt database takes the urgent ladder.
-            isCold: async (): Promise<boolean> => {
-              const state = await readSignatureState({ source });
-              return state.reason === 'signatures_missing'
-                || state.reason === 'signatures_unreadable'
-                || state.reason === 'signatures_corrupt';
-            },
-          })
-        : null
+      cfg.enabled ? startAvUpdater(supervisorUpdaterOptions(cfg, source, opts.writeStatus)) : null
     ));
   const updater = startUpdater(updaterConfig);
 

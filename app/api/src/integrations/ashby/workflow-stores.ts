@@ -25,6 +25,7 @@ import {
   scorecardSourceFromV2Assessment,
   type PersistedV2AssessmentRow,
 } from './scorecard-v2-adapter.js';
+import { parseEvidenceGrade, readAssessmentEvidenceGrade } from '../../lib/scorecards/evidence.js';
 
 /**
  * The assessment columns BOTH scorecard build sites read. One list, so the
@@ -123,7 +124,7 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
     async findLinkByApplicationId(externalApplicationId): Promise<ExistingLinkRow | null> {
       const { data, error } = await client
         .from('ashby_application_links')
-        .select('id, external_application_id, terminal_state, external_resume_file_handle')
+        .select('id, external_application_id, terminal_state, external_resume_file_handle, external_candidate_id')
         .eq('provider', 'ashby')
         .eq('external_application_id', externalApplicationId)
         .maybeSingle();
@@ -134,12 +135,14 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         external_application_id: string;
         terminal_state: string | null;
         external_resume_file_handle: string | null;
+        external_candidate_id?: string | null;
       };
       return {
         id: row.id,
         externalApplicationId: row.external_application_id,
         terminalState: (row.terminal_state as ExistingLinkRow['terminalState']) ?? null,
         externalResumeFileHandle: row.external_resume_file_handle ?? null,
+        externalCandidateId: row.external_candidate_id ?? null,
       };
     },
     /**
@@ -165,6 +168,21 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         .is('submitted_at', null);
       if (error) throw new Error('ashby_link_submission_backfill_error');
     },
+    /**
+     * 0114 (C8-F). Backfill-on-reuse of the opaque Ashby candidate id, guarded
+     * in SQL: the `is` filter is a compare-and-set, so a concurrent writer that
+     * already stored a value wins and this update matches no row. The value is
+     * never logged and never placed in an error message.
+     */
+    async bindLinkExternalCandidateId(applicationLinkId, externalCandidateId): Promise<void> {
+      const { error } = await client
+        .from('ashby_application_links')
+        .update({ external_candidate_id: externalCandidateId })
+        .eq('provider', 'ashby')
+        .eq('id', applicationLinkId)
+        .is('external_candidate_id', null);
+      if (error) throw new Error('ashby_link_candidate_id_backfill_error');
+    },
     async createLink(input): Promise<{ id: string }> {
       const { data, error } = await client
         .from('ashby_application_links')
@@ -176,6 +194,8 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
           job_mapping_id: input.jobMappingId,
           external_resume_file_handle: input.externalResumeFileHandle,
           submitted_at: input.submittedAt,
+          // 0114 (C8-F): opaque Ashby candidate id; null when absent.
+          external_candidate_id: input.externalCandidateId ?? null,
           lifecycle: 'imported',
         })
         .select('id')
@@ -339,11 +359,26 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         .limit(1)
         .maybeSingle();
       if (assessmentError || !assessment) return null;
-      return scorecardSourceFromAssessmentRow(
+      const source = scorecardSourceFromAssessmentRow(
         assessment as unknown as Record<string, unknown>,
         applicationLinkId,
         String(link.external_application_id),
       );
+      if (!source) return null;
+      // C3 (0114 §4): the gate rides on the source, read TOLERANTLY and
+      // separately (never via SCORECARD_ASSESSMENT_COLUMNS, so a stale schema
+      // cannot break execute and the marker inputs are unchanged). A real read
+      // failure returns null — the worker's retryable `assessment_missing`.
+      let evidenceGrade: 'decision' | 'insufficient' | null;
+      try {
+        evidenceGrade = await readAssessmentEvidenceGrade(
+          client,
+          String((assessment as unknown as { id: unknown }).id),
+        );
+      } catch {
+        return null;
+      }
+      return { ...source, evidenceGrade };
     },
     async readLink(applicationLinkId): Promise<WorkflowLinkRow | null> {
       const { data, error } = await client
@@ -495,6 +530,20 @@ export function createWorkflowStores(client: SupabaseClient, actorId: string = S
         .limit(1)
         .maybeSingle();
       if (assessmentError || !assessment) return { status: 'assessment_missing' };
+      // C3 (0114 §4): an INSUFFICIENT-evidence interview is held for a human,
+      // refused here BEFORE the enqueue RPC. Tolerant separate read: a missing
+      // column is null (= decision, the pre-0114 behaviour); any other read
+      // error fails closed like every other read in this seam.
+      let evidenceGrade: 'decision' | 'insufficient' | null;
+      try {
+        evidenceGrade = await readAssessmentEvidenceGrade(
+          client,
+          String((assessment as unknown as { id: unknown }).id),
+        );
+      } catch {
+        throw new Error('ashby_scorecard_enqueue_error');
+      }
+      if (evidenceGrade === 'insufficient') return { status: 'evidence_insufficient' };
       // The SAME builder the execute-time read uses, so the marker hashed here
       // is the marker the worker recomputes. A v2 row that is not fully
       // evidenced yields no source and is not enqueued (a human confirms it
@@ -619,6 +668,17 @@ export interface MissionControlWorkflow {
   sessionStatus: string | null;
   /** Opaque internal session id for authorized recruiter review navigation. */
   sessionId?: string | null;
+  /**
+   * C3 (0114 §4): true when this workflow is parked `writeback_pending`, has no
+   * scorecard write, and its NEWEST assessment (across the link's own session
+   * and its phone cycles' sessions) is graded `insufficient` — the interview
+   * is held for a human, and nothing will reach Ashby until someone acts
+   * (typically "Rescreen recommended"). Derived by a JOIN on the assessment's
+   * grade, never from the park's audit reason (which `already_pending` does
+   * not persist). `false` when not held; `null` when it could not be read —
+   * a diagnostic, never a reason to fail the list.
+   */
+  heldForEvidence?: boolean | null;
   updatedAt: string;
 }
 
@@ -763,6 +823,86 @@ export function readEmbeddedIngestionState(embed: unknown): string | null {
   return typeof state === 'string' && state.length > 0 ? state : null;
 }
 
+/**
+ * C3 (0114 §4): which listed workflows are HELD FOR EVIDENCE — a JOIN from the
+ * link to its sessions (its own `session_id` plus every phone cycle's) to the
+ * newest assessment's `evidence_grade`.
+ *
+ * Only links that could be held are examined: parked `writeback_pending`,
+ * non-terminal, and with no `scorecard_write` operation. Two bounded `in (...)`
+ * reads, strictly additive like the session-status read: a failed read (or a
+ * schema without the column) marks every candidate `null` and never takes the
+ * list down. Returns link id -> held, for the examined links only.
+ */
+async function readHeldForEvidence(
+  client: SupabaseClient,
+  rows: ReadonlyArray<Record<string, unknown>>,
+): Promise<Map<string, boolean | null>> {
+  const out = new Map<string, boolean | null>();
+  const candidates = rows.filter((r) => {
+    const ops = (r.ashby_operations as Array<{ operation_type?: unknown }> | null) ?? [];
+    return r.lifecycle === 'writeback_pending'
+      && r.terminal_state == null
+      && !ops.some((o) => o.operation_type === 'scorecard_write');
+  });
+  if (candidates.length === 0) return out;
+  const linkIds = candidates.map((r) => String(r.id));
+  try {
+    const sessionsByLink = new Map<string, Set<string>>();
+    for (const r of candidates) {
+      const set = new Set<string>();
+      if (typeof r.session_id === 'string' && r.session_id.length > 0) set.add(r.session_id);
+      sessionsByLink.set(String(r.id), set);
+    }
+    const { data: engagements, error: engagementError } = await client
+      .from('phone_engagements')
+      .select('application_link_id, session_id')
+      .in('application_link_id', linkIds);
+    if (engagementError) throw new Error('held_for_evidence_read_error');
+    for (const e of ((engagements ?? []) as Array<{ application_link_id?: unknown; session_id?: unknown }>)) {
+      if (typeof e.application_link_id !== 'string' || typeof e.session_id !== 'string') continue;
+      sessionsByLink.get(e.application_link_id)?.add(e.session_id);
+    }
+    const sessionIds = [...new Set([...sessionsByLink.values()].flatMap((s) => [...s]))];
+    if (sessionIds.length === 0) {
+      for (const id of linkIds) out.set(id, false);
+      return out;
+    }
+    const { data: assessments, error: assessmentError } = await client
+      .from('assessments')
+      .select('session_id, evidence_grade, created_at')
+      .in('session_id', sessionIds)
+      .order('created_at', { ascending: false });
+    if (assessmentError) throw new Error('held_for_evidence_read_error');
+    // Newest first, so the first row seen per session is that session's latest.
+    const latestBySession = new Map<string, { grade: string | null; createdAt: string }>();
+    for (const a of ((assessments ?? []) as Array<{ session_id?: unknown; evidence_grade?: unknown; created_at?: unknown }>)) {
+      if (typeof a.session_id !== 'string' || latestBySession.has(a.session_id)) continue;
+      latestBySession.set(a.session_id, {
+        grade: parseEvidenceGrade(a.evidence_grade),
+        createdAt: typeof a.created_at === 'string' ? a.created_at : '',
+      });
+    }
+    for (const [linkId, sessions] of sessionsByLink) {
+      let newest: { grade: string | null; createdAt: string } | null = null;
+      for (const s of sessions) {
+        const latest = latestBySession.get(s);
+        if (latest && (newest === null || latest.createdAt > newest.createdAt)) newest = latest;
+      }
+      out.set(linkId, newest?.grade === 'insufficient');
+    }
+  } catch {
+    for (const id of linkIds) out.set(id, null);
+  }
+  return out;
+}
+
+/** A link that was not examined is not held (`false`); an unreadable one is `null`. */
+function heldOf(map: Map<string, boolean | null>, linkId: string): boolean | null {
+  const held = map.get(linkId);
+  return held === undefined ? false : held;
+}
+
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /** SQLSTATE unique_violation, as PostgREST reports it on `error.code`. */
@@ -842,6 +982,8 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
         }
       }
 
+      const heldForEvidence = await readHeldForEvidence(client, rows);
+
       return rows.map((r) => {
         const ops = (r.ashby_operations as Array<{ id: string; operation_type: string; state: string; error_code: string | null }> | null) ?? [];
         return {
@@ -857,6 +999,8 @@ export function createMissionControlStore(client: SupabaseClient): MissionContro
           // returned only to the already-authenticated Mission Control surface
           // so an authorized reviewer can open the existing session view.
           sessionId: typeof r.session_id === 'string' ? r.session_id : null,
+          // `null` (unreadable) must survive — `??` would turn it into false.
+          heldForEvidence: heldOf(heldForEvidence, String(r.id)),
           updatedAt: String(r.updated_at),
         };
       });

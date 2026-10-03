@@ -22,7 +22,7 @@ import {
   PHONE_RESIDUAL_CODES,
   PHONE_SUBSTRATE_RESIDUALS,
 } from '../lib/phone-screening/index.js';
-import { MIGRATION_0042, functionBody } from './support/phone-migration.js';
+import { MIGRATION_0042, MIGRATION_0114, functionBody } from './support/phone-migration.js';
 
 /** 0042 with SQL line comments removed. Every prose mention of `confirmed`
  *  lives in a comment, so a check over raw text would be answered by the
@@ -169,6 +169,28 @@ describe('R-c: `missed` is written by the expiry sweep, and only there', () => {
     expect(entry).toBeDefined();
     expect(entry!.writer).toBe('expire_phone_appointments');
     expect(entry!.appointmentStatus).toBe('missed');
+  });
+});
+
+describe('0114 (C5): the residuals still hold against the 0114 bodies', () => {
+  // `functionBody` resolves newest-first, so after 0114 the writer bodies
+  // above are 0114's schedule_phone_appointment and expire_phone_appointments,
+  // not 0042's. Pin that, so a registry slip back to 0042 cannot make R-a/R-c
+  // pass on history.
+  it('schedule and expire resolve to their 0114 declarations', () => {
+    for (const name of ['schedule_phone_appointment', 'expire_phone_appointments']) {
+      expect(MIGRATION_0114, `${name} did not resolve to 0114`).toContain(functionBody(name));
+      expect(MIGRATION_0042).not.toContain(functionBody(name));
+    }
+  });
+
+  it('expiry still writes the literal missed status, now with a cause-based reason', () => {
+    const body = functionBody('expire_phone_appointments').replace(/--.*$/gm, '');
+    expect(body).toMatch(/status\s*=\s*'missed'/);
+    expect(body).toMatch(/cancel_reason\s*=\s*v_cause/);
+    for (const cause of ['engagement_cancelled', 'emergency_stop', 'system_deferral_expired']) {
+      expect(body).toContain(`'${cause}'`);
+    }
   });
 });
 

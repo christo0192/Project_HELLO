@@ -5,9 +5,9 @@
  * `apply_phone_event` decides three things together — which budget moves,
  * which engagement state results, and whether that state is terminal. Writing
  * them apart in TypeScript is how the two halves drift. `decidePhoneOutcome`
- * is exhaustive over the ELEVEN `outcome_class` members (`assertNever` at the
- * end of the switch), so ADDING a twelfth member to `PHONE_OUTCOME_CLASSES`
- * without also deciding its budget is a COMPILE ERROR, not a review comment.
+ * is exhaustive over EVERY `outcome_class` member (`assertNever` at the end of
+ * the switch), so ADDING a member to `PHONE_OUTCOME_CLASSES` without also
+ * deciding its budget is a COMPILE ERROR, not a review comment.
  *
  * ── THE THREE BUDGETS, AND THE ORDINAL THAT ENDS EACH ─────────────────
  * Read straight off `apply_phone_event`:
@@ -80,7 +80,24 @@ export interface PhoneOutcomeContext {
    */
   readonly windowOpen: boolean;
   readonly disconnectCause?: PhoneDisconnectCause;
+  /**
+   * 0114 (C2-P1). How many `callback.deferred_in_call` events were ALREADY
+   * applied for this engagement before the one being decided. Read only for
+   * `callback_deferred`; absent means none. `apply_phone_event` counts the
+   * applied ledger rows itself — this is the mirror of that count, not a
+   * counter the engagement carries.
+   */
+  readonly priorCallbackDeferrals?: number;
 }
+
+/**
+ * 0114 (C2-P1): the number of EARLIER applied in-call callback deferrals at
+ * which the next one stops deferring and fails the engagement
+ * (`failed/callback_deferral_limit`). Mirrors the literal in
+ * `apply_phone_event`'s `callback.deferred_in_call` branch
+ * (`... and ev.applied) >= 2 then`), so the THIRD deferral is terminal.
+ */
+export const PHONE_CALLBACK_DEFERRAL_LIMIT = 2;
 
 export interface PhoneOutcomeDecision {
   readonly outcome: PhoneOutcomeClass;
@@ -359,6 +376,42 @@ export function decidePhoneOutcome(
         stateReason: 'consent_gate_failed',
       };
 
+    // ── 0114 (C2-P1): the candidate asked in-call to be called back ─────
+    // No slot could be booked, so the worker ended the leg with
+    // `callback.deferred_in_call`. That is a WAIT, and a wait never charges a
+    // failure budget: the candidate answered and talked to us. The engagement
+    // returns to `eligible` at the next IST-day window (the same expression
+    // the pre-disclosure deferral uses), its session detached so the redial
+    // mints a fresh one behind a fresh consent gate.
+    //
+    // The ceiling is NOT a counter on the engagement: `apply_phone_event`
+    // counts the applied deferral events. With two already applied, the third
+    // is terminal and truthful (`failed/callback_deferral_limit`) rather than
+    // deferring for ever. Still uncharged — the budgets are untouched either
+    // way.
+    case 'callback_deferred': {
+      const prior = context.priorCallbackDeferrals ?? 0;
+      if (prior >= PHONE_CALLBACK_DEFERRAL_LIMIT) {
+        return {
+          ...base,
+          charge: 'none',
+          counters: noCharge(counters),
+          engagementState: 'failed',
+          terminal: true,
+          stateReason: 'callback_deferral_limit',
+        };
+      }
+      return {
+        ...base,
+        charge: 'none',
+        counters: noCharge(counters),
+        engagementState: 'eligible',
+        terminal: false,
+        stateReason: 'callback_deferred_in_call',
+        deferral: 'next_ist_day',
+      };
+    }
+
     // ── Declared in the CHECK, written by nothing in 0042 ───────────────
     // Neither has an edge in `apply_phone_event`. Returning an invented
     // transition here would be a decision no migration has made; a null state
@@ -409,7 +462,9 @@ export const PHONE_OUTCOME_MIGRATION_REASONS: Readonly<
   // Not folded into any existing reason: an operator filtering for calls we
   // broke cannot recover them once merged with a candidate's refusal.
   consent_failed: ['consent_gate_failed'],
-
+  // 0114 (C2-P1). Both written by the `callback.deferred_in_call` branch of
+  // `apply_phone_event`: the deferral itself, and the third one that fails.
+  callback_deferred: ['callback_deferred_in_call', 'callback_deferral_limit'],
 });
 
 /**

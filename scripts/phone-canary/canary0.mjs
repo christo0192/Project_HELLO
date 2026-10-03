@@ -56,6 +56,13 @@ const TEARDOWN = path.join(HERE, 'teardown.sql');
  */
 const RACE_LINE_SUFFIX = '99001';
 
+/**
+ * The actor every clear in this runner passes. Since 0114 a NULL-actor
+ * `clear_phone_halt` answers `actor_required` without touching the row, so a
+ * drill clear must be attributable. This is the drill sentinel, not a person.
+ */
+const DRILL_ACTOR = "'00000000-0000-4000-8000-0000000000d1'::uuid";
+
 // ── argv ──────────────────────────────────────────────────────────────
 
 function parseArgs(argv) {
@@ -125,7 +132,7 @@ async function runHaltRace(container) {
     const now = "'2026-10-19T06:00:00Z'::timestamptz";
 
     // Make sure nothing is halted going in, or the race proves nothing.
-    queryScalar(container, `select screening_v2.clear_phone_halt(null, ${now})->>'status';`);
+    queryScalar(container, `select screening_v2.clear_phone_halt(${DRILL_ACTOR}, ${now})->>'status';`);
 
     blocker.send('begin;');
     blocker.send("select pg_advisory_xact_lock(hashtext('phone_admission'));");
@@ -178,7 +185,7 @@ async function runHaltRace(container) {
     // `halt-drill.mjs` for why. Here it is an explicit teardown step on the
     // success path, and the check below proves the lane is running again.
     const cleared = queryScalar(container,
-      `select screening_v2.clear_phone_halt(null, ${now})->>'status';`);
+      `select screening_v2.clear_phone_halt(${DRILL_ACTOR}, ${now})->>'status';`);
     check('halt_cleared_deliberately', cleared === 'ok', cleared === 'ok' ? 'ok' : 'clear_refused');
     return { verdicts, counts };
   } finally {
@@ -278,7 +285,7 @@ async function main() {
     // than a `finally`, and it happens BEFORE the run rather than after it —
     // so it can never undo a stop the run itself just made.
     const precondition = queryScalar(args.container,
-      "select screening_v2.clear_phone_halt(null, now())->>'status';");
+      `select screening_v2.clear_phone_halt(${DRILL_ACTOR}, now())->>'status';`);
     if (precondition !== 'ok' && precondition !== 'halt_unreadable') {
       problems.push(`could not establish a cleared control row: ${precondition}`);
     }

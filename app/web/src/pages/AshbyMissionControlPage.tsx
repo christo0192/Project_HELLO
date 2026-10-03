@@ -1063,6 +1063,7 @@ export function AshbyMissionControlPage() {
     ? sentence([
         [workflows.filter((w) => w.operations.some((op) => op.state === 'failed')).length, 'with a failed operation'],
         [workflows.filter(notQueuedForWriteback).length, 'not queued for write-back'],
+        [workflows.filter((w) => w.heldForEvidence === true).length, 'held for interview evidence'],
         [workflows.filter((w) => w.ingestionState === 'failed_review').length, 'with a resume to review'],
       ])
     : null;
@@ -1142,6 +1143,17 @@ export function AshbyMissionControlPage() {
                   <StatusBadge tone="warning">
                     <span title="The screening finished, but the workflow never reached writeback_pending, so its scorecard will not be written to Ashby.">
                       Not queued for write-back
+                    </span>
+                  </StatusBadge>
+                )}
+                {/* C3: parked for a human because the newest scorecard's
+                    interview evidence was too thin to publish. Nothing
+                    reaches Ashby until someone acts — usually a re-screen
+                    from the candidate page. */}
+                {w.heldForEvidence === true && (
+                  <StatusBadge tone="warning">
+                    <span title="The newest scorecard was graded insufficient interview evidence, so it is held for review and will not be written to Ashby. A re-screen is recommended.">
+                      Held for evidence
                     </span>
                   </StatusBadge>
                 )}

@@ -200,6 +200,39 @@ describe('post-call callback backstop', () => {
     })).toBe(true);
   });
 
+  it.each(['engagement_terminal', 'slot_not_yet_eligible', 'daily_attempt_exists'])(
+    '0114 (C5): a %s refusal leaves a recovery record whose metadata.reason names it',
+    async (status) => {
+      mockRpc.mockResolvedValue({ data: { status }, error: null });
+      const result = await runAssessment(SESSION_ID, { source: 'phone' });
+      expect(result.id).toBeDefined();
+      const audits = callsFor('audit_events', 'insert')
+        .map((c) => c.args[0] as Record<string, unknown>)
+        .filter((row) => row.action === 'phone_callback_recovery_required');
+      expect(audits).toHaveLength(1);
+      expect(audits[0]).toMatchObject({
+        actor_type: 'system',
+        target_type: 'call_session',
+        target_id: SESSION_ID,
+        result: 'failure',
+        metadata: { reason: status, engagement_id: ENGAGEMENT_ID },
+      });
+      // PII-free: the metadata carries the refusal and the engagement id only.
+      expect(Object.keys(audits[0].metadata as object).sort()).toEqual(['engagement_id', 'reason']);
+    },
+  );
+
+  it.each(['window_closed', 'slot_in_past', 'version_conflict'])(
+    'an ordinary %s refusal is logged but writes no recovery record',
+    async (status) => {
+      mockRpc.mockResolvedValue({ data: { status }, error: null });
+      await runAssessment(SESSION_ID, { source: 'phone' });
+      expect(callsFor('audit_events', 'insert').some((c) =>
+        (c.args[0] as Record<string, unknown>).action === 'phone_callback_recovery_required',
+      )).toBe(false);
+    },
+  );
+
   it('a booking failure NEVER fails the assessment', async () => {
     mockRpc.mockRejectedValue(new Error('rpc exploded'));
     const result = await runAssessment(SESSION_ID, { source: 'phone' });

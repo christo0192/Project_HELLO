@@ -646,6 +646,8 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
         appointments: null,
         ingress: null,
         backlog_unavailable: false,
+        // 0114 (C8): not read while the lane is off.
+        identity_holds: null,
         residuals: residualBlock(),
         runtime: runtimeBlock,
       });
@@ -683,6 +685,8 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
         appointments: null,
         ingress: null,
         backlog_unavailable: true,
+        // 0114 (C8): null with every other count block — "could not read".
+        identity_holds: null,
         residuals: residualBlock(),
         runtime: runtimeBlock,
       });
@@ -714,6 +718,27 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
     // surface even when every backlog count is healthy, because a healthy
     // backlog with no worker turning is precisely the silent-stall case.
     reasons.push(...phoneRuntimeDegradeReasons(runtimeBlock));
+
+    // 0114 (C8). Engagements HELD as a same-role duplicate application, as a
+    // bare count. Not a degradation reason: a hold is the guard working, and
+    // only a human can decide to release one. Null — never 0 — when the read
+    // is unavailable, for the same reason every count block above is.
+    //
+    // Read through the INJECTED read store when there is one. A router built
+    // with injected write stores but no read store has not been given a
+    // durable read seam, and must not reach for the global client behind its
+    // caller's back (in a test that would be a live network call), so it
+    // reports null — "not read" — instead. Production injects neither and
+    // builds both lazily from the same client.
+    let identityHolds: number | null = null;
+    const readForHolds = deps.readStore ?? (deps.stores ? undefined : readStore());
+    if (readForHolds?.countDuplicateApplicationHolds) {
+      try {
+        identityHolds = await readForHolds.countDuplicateApplicationHolds();
+      } catch {
+        identityHolds = null;
+      }
+    }
 
     await recordAudit(req, 'resource.read', 200, {
       metadata: { resource: 'phone_health', reason_count: reasons.length },
@@ -758,6 +783,7 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
         unexpected_event_last_24h: backlog.events.unexpectedEventLast24h,
       },
       backlog_unavailable: false,
+      identity_holds: identityHolds,
       residuals: residualBlock(),
       runtime: runtimeBlock,
     });
@@ -1191,6 +1217,15 @@ export function createPhoneApiRouter(deps: PhoneApiDeps = {}): Router {
           // error — 0042 refuses to invent a cleared row and so does this.
           if (result.status === 'halt_unreadable') {
             res.status(503).json({ ok: false, error: 'halt_unreadable' });
+            return;
+          }
+          // 0114 (C10b). `clear_phone_halt` refuses a NULL actor before any
+          // write. This route is admin-only and always passes the admin's id,
+          // so reaching this is OUR defect (a lost auth context), never the
+          // client's: a 500, not the 409 every other refusal maps to. Nothing
+          // was cleared, so there is nothing to compensate.
+          if (result.status === 'actor_required') {
+            res.status(500).json({ ok: false, error: 'phone_halt_actor_required' });
             return;
           }
           sendRefusal(res, result.status);

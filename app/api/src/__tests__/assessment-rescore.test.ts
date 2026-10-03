@@ -262,6 +262,9 @@ describe('FIX 1 — a v1-origin phone rescore advances off the ALL-SCHEMA max', 
       ok(null), // idempotency-first: no row under this request id yet
       // latest revision ACROSS ALL SCHEMAS is the v1 phone first-score row.
       ok({ id: V1_PHONE_ID, revision: 1, created_at: '2026-09-01T06:05:00.000Z' }),
+      // C3 (0114): a PHONE rescore reads the superseded row's evidence grade
+      // (copy-or-recompute); a pre-0114 row has none.
+      ok({ evidence_grade: null, evidence_reason: null, partial: false, raw: {} }),
       ok({ id: NEW_ID }), // the insert succeeds first try — revision 2 does not collide
     );
 

@@ -117,9 +117,11 @@ export type PhoneAdmissiblePriorState = (typeof PHONE_ADMISSIBLE_PRIOR_STATES)[n
 // ═══════════════════════════════════════════════════════════════════════
 
 /**
- * `chk_phone_call_attempts_outcome` — EXACTLY eleven members.
+ * `chk_phone_call_attempts_outcome` — EXACTLY fourteen members (eleven from
+ * 0042, `abandoned_pre_disclosure` from 0043, `consent_failed` from 0095 and
+ * `callback_deferred` from 0114).
  *
- * A twelfth member in this union would produce a value the database rejects on
+ * A member the newest CHECK does not list in this union would produce a value the database rejects on
  * write. In particular COLD START IS NOT AN OUTCOME: a runtime that is not yet
  * ready has not made a call, so it is a PRE-CLAIM deferral or refusal
  * (`PhoneDeferralCode` in `admission.ts`), never an `outcome_class`.
@@ -157,15 +159,51 @@ export const PHONE_OUTCOME_CLASSES = [
    * redials someone who said no or abandons someone we failed.
    */
   'consent_failed',
+  /**
+   * 0114 (C2-P1): the candidate asked, MID-CALL, to be called later and no
+   * slot could be booked, so the worker ended the leg with
+   * `callback.deferred_in_call`.
+   *
+   * Deliberately NOT `cancelled` and NOT `disconnected`. Nothing dropped and
+   * nobody refused: the conversation is owed a redial at the next IST-day
+   * window, uncharged. It is also NOT a screening — a leg with this outcome is
+   * never scored (`phone_attempt_score_suppression` answers
+   * `callback_deferred`), so an operator filtering for scored legs must not
+   * find it under `completed`.
+   */
+  'callback_deferred',
 ] as const;
 
 export type PhoneOutcomeClass = (typeof PHONE_OUTCOME_CLASSES)[number];
 
 const OUTCOME_SET: ReadonlySet<string> = new Set(PHONE_OUTCOME_CLASSES);
 
-/** True iff the value is one of the twelve `outcome_class` members. */
+/** True iff the value is one of the fourteen `outcome_class` members. */
 export function isPhoneOutcomeClass(value: string): value is PhoneOutcomeClass {
   return OUTCOME_SET.has(value);
+}
+
+/**
+ * 0114 (C2) — the non-null answers of `phone_attempt_score_suppression`:
+ * why a leg is withheld from scoring. `callback_booked` is PR-B's E4 fact;
+ * `callback_deferred` is the in-call deferral outcome; `worker_aborted` is an
+ * applied INTERNAL `assessment.aborted` carrying this attempt id (the stranded
+ * sweep's abort carries none, so a DLQ replay of a stranded session still
+ * scores).
+ */
+export const PHONE_SCORE_SUPPRESS_REASONS = [
+  'callback_booked',
+  'callback_deferred',
+  'worker_aborted',
+] as const;
+
+export type PhoneScoreSuppressReason = (typeof PHONE_SCORE_SUPPRESS_REASONS)[number];
+
+const SCORE_SUPPRESS_SET: ReadonlySet<string> = new Set(PHONE_SCORE_SUPPRESS_REASONS);
+
+/** True iff the value is one of the three score-suppression reasons. */
+export function isPhoneScoreSuppressReason(value: unknown): value is PhoneScoreSuppressReason {
+  return typeof value === 'string' && SCORE_SUPPRESS_SET.has(value);
 }
 
 /**

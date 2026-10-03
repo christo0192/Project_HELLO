@@ -450,6 +450,20 @@ PHONE_OPT_OUT_TEXT = (
     "Understood. I'll pass that on so you're not contacted about this again. "
     "Thanks for your time, and goodbye."
 )
+# M009 PR-C (C7): the ONE confirmation asked after a mid-call decline ("I'm not
+# interested in this role"). Deliberately a two-option question, so a bare
+# "yes", "no" or "okay" cannot be read either way (it is ambiguous and gets the
+# single re-ask below). Fixed copy: it is gate copy, never a screening turn.
+PHONE_WITHDRAWAL_CONFIRM_TEXT = (
+    "I understand. Would you like me to stop the screening here, or would you "
+    "prefer to carry on with the questions?"
+)
+#: Asked at most once, when the reply to the confirmation is ambiguous. A
+#: second ambiguous reply ends the call as an opt-out (C7 policy).
+PHONE_WITHDRAWAL_CONFIRM_REASK_TEXT = (
+    "Sorry, just so I get this right: should I stop here, or carry on with "
+    "the questions?"
+)
 # Asked once when the first response cannot be read as any of the five outcomes.
 # Consent must be affirmative, so an unreadable answer is re-asked rather than
 # assumed either way.
@@ -822,6 +836,11 @@ def gate_copy_texts() -> frozenset[str]:
         PHONE_REASK_TEXT,
         PHONE_REFUSED_TEXT,
         PHONE_OPT_OUT_TEXT,
+        # M009 PR-C (C7): the mid-call withdrawal confirmation and its single
+        # re-ask. Without these the confirmation would be captured inside the
+        # open question's boundary as if it were a screening turn.
+        PHONE_WITHDRAWAL_CONFIRM_TEXT,
+        PHONE_WITHDRAWAL_CONFIRM_REASK_TEXT,
         PHONE_WRONG_NUMBER_TEXT,
         PHONE_ASSESSMENT_CLOSING_TEXT,
         PHONE_CANDIDATE_END_TEXT,
@@ -845,7 +864,11 @@ def is_gate_copy(text: Any) -> bool:
     clean = text.strip()
     return clean in gate_copy_texts() or (
         clean.startswith("I can call you back on ") and clean.endswith("?")
-    ) or clean.startswith(_PHONE_ROLE_OPENING_PREFIX)
+    ) or clean.startswith(_PHONE_ROLE_OPENING_PREFIX) or (
+        # M009 PR-C (C5): the booked line names its time, so it is composed at
+        # runtime and matched by its fixed prefix (`_callback_booked_text`).
+        clean.startswith(_CALLBACK_BOOKED_PREFIX)
+    )
 
 
 # ── Worker event API ──────────────────────────────────────────────────
@@ -935,6 +958,14 @@ PHONE_WORKER_EVENTS: frozenset[str] = frozenset([
     "call.no_answer",
     "call.busy",
     "call.failed",
+    # M009 C1 (0114): a reconnect/redial leg answered into a session whose
+    # consent is already durable. The ledger moves dialing -> in_call (epoch
+    # bump) only for a live, engagement-owned, planned session from `internal`.
+    # Not consent, not a recording trigger, not a purge trigger.
+    "consent.resumed",
+    # M009 C2 (0114): an in-call callback request that could not be booked.
+    # The ledger ends the attempt uncharged and redials at the next IST window.
+    "callback.deferred_in_call",
 ])
 
 _ERR_CONFIGURATION = "configuration"
@@ -1032,6 +1063,53 @@ def phone_event_timeout_sec() -> float:
     completion latency.
     """
     return _bounded_float(os.getenv("PHONE_EVENT_TIMEOUT_SEC"), 30.0, 1.0, 60.0)
+
+
+# ── M009 C1: a resumed leg is a CONTINUATION, and the ledger must hear it ──
+# A reconnect leg (or any redial into the engagement's live session) finds
+# durable consent and skips the gate. Until 0114 it posted nothing, so the
+# engagement stayed `dialing` for the whole resumed conversation: its
+# completion became `unexpected_event`, a drop was labelled
+# `abandoned_pre_disclosure`, and the leg only ended by reclaim (prod 83ce56fb,
+# e6bc7f18, fd9b54f0). 0114's R1 edge moves `dialing -> in_call` on this event
+# when the session is live, engagement-owned and planned.
+CONSENT_RESUMED_EVENT = "consent.resumed"
+#: At most this many `consent.resumed` posts, each bounded by
+#: `phone_consent_resume_try_timeout_sec`. A retry is spent ONLY when there was
+#: no verdict (timeout, transport, garbled body); the ledger dedups on the
+#: deterministic internal id, so a retry after a lost response reads back the
+#: first answer instead of writing a second row.
+CONSENT_RESUME_MAX_TRIES = 2
+#: The ledger verdicts that mean "this leg is NOT a continuation any more": the
+#: engagement went terminal (HR stop, cancel), another leg superseded this one,
+#: or the attempt is unknown. The leg ends with NO terminal post. Every other
+#: refusal (`unexpected_event`: no plan, a session that is not live, ...) fails
+#: OPEN to the pre-0114 behaviour.
+CONSENT_RESUME_REFUSALS: frozenset[str] = frozenset({
+    "terminal", "stale_epoch", "unknown_attempt",
+})
+#: `_resume_consented_leg` verdicts.
+CONSENT_RESUME_APPLIED = "applied"
+CONSENT_RESUME_REFUSED = "refused"
+CONSENT_RESUME_FAIL_OPEN = "fail_open"
+#: Log categories a fail-open may name (`consent_resume_<x>`); anything else
+#: is logged as `unconfirmed`.
+_CONSENT_RESUME_FAIL_OPEN_CATEGORIES: frozenset[str] = frozenset({
+    "unexpected_event", "ignored", "configuration", "transport",
+    "business_error", "event_not_allowed", "malformed_response",
+})
+
+
+def phone_consent_resume_try_timeout_sec() -> float:
+    """Bound (seconds) on ONE `consent.resumed` try, and on the `call.answered`
+    confirmation that precedes it. INDEPENDENT of `phone_event_timeout_sec`
+    (10-30 s, sized for scoring): this wait sits between a resumed candidate's
+    pickup and the first word, so two tries cost about 3 s at most. Default
+    1.5, clamped 0.2-5.0.
+    """
+    return _bounded_float(
+        os.getenv("PHONE_CONSENT_RESUME_TRY_TIMEOUT_SEC"), 1.5, 0.2, 5.0,
+    )
 
 
 def phone_participant_wait_sec() -> float:
@@ -3100,6 +3178,22 @@ PHONE_CALLBACK_DEFERRAL_TEXT = (
 #     candidate would be dialled back up to three times for having gone quiet,
 #     on a dialer whose per-day index exists to prevent exactly that. These end
 #     the call truthfully with `assessment.aborted`.
+#   * CALLBACK DEFERRED (M009 PR-C, C2): the candidate asked to be called back
+#     and the in-call flow could not book a time. That is neither the
+#     candidate ending the assessment nor an infrastructure failure, so it is
+#     its own reason: the leg posts `callback.deferred_in_call` (0114 moves the
+#     engagement to the next IST-day window, uncharged, session detached) and
+#     NEVER `assessment.aborted`, which used to fail the engagement and let a
+#     partial score publish a reject for a candidate who only asked for a
+#     later call (4352df89, ab6126e0). Not retryable: it posts exactly one
+#     event, and posts nothing more if that event is not applied.
+#   * CANDIDATE OPTED OUT (M009 PR-C, C7): the candidate withdrew mid-call
+#     (an opt-out, an explicit withdrawal, or a confirmed decline). The leg
+#     posts `candidate.opt_out` — line suppression, session cancelled, nothing
+#     scored — and falls back to `assessment.aborted` only when that post is
+#     not applied for a reason other than `terminal`. Not retryable.
+#
+# Only the explicit "end this call" request uses HALT_CANDIDATE_ENDED.
 HALT_PERSISTENCE = "persistence_failed"
 HALT_SCORING = "scoring_unreachable"
 HALT_MALFORMED_EXCHANGE = "malformed_exchange"
@@ -3133,6 +3227,21 @@ HALT_CALLBACK_RECOVERY = "callback_recovery_required"
 # future contact, so it must not write the digest suppression used by
 # `candidate.opt_out`; the assessment is aborted and the room is closed.
 HALT_CANDIDATE_ENDED = "candidate_ended_call"
+# M009 PR-C (C2): the in-call callback flow ended on its terminal deferral (no
+# bookable time). Posts `callback.deferred_in_call` only. Deliberately NOT in
+# RETRYABLE_HALTS: it does post, once, and the dispatcher owns that post.
+HALT_CALLBACK_DEFERRED = "callback_deferred_in_call"
+# M009 PR-C (C7): the candidate withdrew MID-CALL — a contact-level opt-out or
+# an explicit withdrawal heard during the screening, a decline they confirmed,
+# or a leg that ended while that confirmation was owed. Posts
+# `candidate.opt_out` (0114 moves the engagement to opted_out, writes the line
+# suppression and cancels the session so nothing is scored). Not retryable: it
+# posts exactly one event. If that event comes back `ignored` with reason
+# `terminal`, nothing more is posted; on a transport failure or any other
+# ignore the dispatcher falls back to `assessment.aborted`, which C2 keeps
+# unscored. Distinct from HALT_CANDIDATE_ENDED ("end this call"), which never
+# writes a suppression.
+HALT_CANDIDATE_OPTED_OUT = "candidate_opted_out"
 
 #: The halt reasons that must post NOTHING. Enumerated rather than inferred, so
 #: a new reason has to declare which kind it is instead of defaulting into the
@@ -3485,6 +3594,21 @@ PHONE_CALLBACK_POLICY_TEXT = (
     "- Ask one question at a time and wait for the answer. Never re-ask a "
     "question the candidate has already answered; briefly acknowledge and "
     "move on instead."
+)
+
+#: M009 PR-C (C7). PHONE-ONLY prompt addendum, appended after the callback
+#: policy by agent.py (never inside the sha-pinned `prompting.system_prompt`).
+#: The worker's deterministic classifier owns the decision; this only stops
+#: the model from arguing with, or re-pitching to, a candidate who is leaving.
+#: Omitted when `PHONE_MIDCALL_OPT_OUT=off`, so the kill switch restores the
+#: previous prompt as well as the previous routing.
+PHONE_WITHDRAWAL_POLICY_TEXT = (
+    "\n\nWithdrawal policy (mandatory):\n"
+    "- If the candidate says they are not interested, did not apply, want to "
+    "withdraw, or do not want to be contacted again, do NOT argue, persuade, "
+    "re-pitch the role, or offer a callback.\n"
+    "- Do not decide on your own that the call is over: you will be given the "
+    "exact words to say."
 )
 
 
@@ -4422,32 +4546,200 @@ _WEEKDAY_RE = re.compile(
 _EXPLICIT_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 
 
-def _resolve_ist_hour(hour: int, minute: int, ampm: str | None, part: str | None) -> tuple[int, int] | None:
-    """Turn a spoken clock into a 24h IST (hour, minute), or None if impossible."""
+#: M009 PR-C (C5). The bookable IST window, in minutes after midnight: a
+#: resolved start outside [09:00, 21:00) returns None (one clarification)
+#: instead of a proposal the server can only refuse.
+_CALLBACK_WINDOW_OPEN_MIN = 9 * 60
+_CALLBACK_WINDOW_CLOSE_MIN = 21 * 60
+
+_PM_DAYPARTS = frozenset(["afternoon", "evening", "night"])
+
+#: A daypart binds to the clock ONLY as a phrase (C5): "in the evening",
+#: "this morning", "tomorrow afternoon", "Monday evening", "at night",
+#: "tonight", or a daypart directly followed by the time ("evening 6",
+#: "evening at 6"). A stray daypart word — "good morning, call me at 3" — no
+#: longer turns 3 into 03:00.
+_DAYPART_PHRASE_RE = re.compile(
+    r"\b(?:(?:in\s+the|this|tomorrow|today|"
+    + "|".join(sorted(_WEEKDAYS, key=len, reverse=True))
+    + r")\s+(?P<p1>morning|afternoon|evening|night)"
+    r"|(?P<p2>morning|afternoon|evening|night)\s+(?:at\s+)?(?=\d)"
+    r"|at\s+(?P<p3>night)"
+    r"|(?P<p4>tonight))\b",
+    re.IGNORECASE,
+)
+
+#: A day reference this parser cannot resolve: an ordinal or calendar date
+#: ("on the 5th", "October 4", "on the fifth"), a week-level span, or a
+#: relative day count. Silently dropping it and booking today/tomorrow at the
+#: named clock was the C5 defect; such an utterance now returns None.
+#: "march"/"may" count only next to a number — both are ordinary English words.
+_ORDINAL_WORDS = (
+    "first|second|third|fourth|fifth|sixth|seventh|eighth|ninth|tenth|"
+    "eleventh|twelfth|thirteenth|fourteenth|fifteenth|sixteenth|seventeenth|"
+    "eighteenth|nineteenth|twentieth|thirtieth"
+)
+_UNRESOLVED_DAY_RE = re.compile(
+    r"\b(?:\d{1,2}(?:st|nd|rd|th)"
+    r"|on\s+the\s+(?:twenty[\s-]?|thirty[\s-]?)?(?:" + _ORDINAL_WORDS + r")"
+    r"|january|february|april|june|july|august|september|october|november|december"
+    r"|jan|feb|apr|jun|jul|aug|sept?|oct|nov|dec"
+    r"|(?:march|may)\s+\d{1,2}|\d{1,2}\s+(?:of\s+)?(?:march|may)"
+    r"|next\s+(?:week|month)|this\s+week|weekend|end\s+of\s+(?:the\s+)?week"
+    r"|(?:in|after)\s+(?:\d+|a|an|one|two|three|four|five|six|seven|a\s+couple\s+of|a\s+few)"
+    r"\s+(?:days?|weeks?))\b",
+    re.IGNORECASE,
+)
+
+#: "in 2 hours", "in half an hour", "after 30 minutes": a relative offset, not
+#: a clock time. Returns None rather than guessing an instant (C5).
+_RELATIVE_OFFSET_RE = re.compile(
+    r"\b(?:in|after|within)\s+(?:(?:about|around)\s+)?"
+    r"(?:\d+|an?|half\s+an?|one|two|three|four|five|six|a\s+couple\s+of|a\s+few|few)"
+    r"\s+(?:hours?|hrs?|minutes?|mins?)\b",
+    re.IGNORECASE,
+)
+
+#: "same time" / "this time": the CURRENT clock, honoured only with a resolved
+#: day and no explicit clock ("tomorrow same time"), rounded UP to 5 minutes.
+_SAME_TIME_RE = re.compile(r"\b(?:same|this)\s+time\b", re.IGNORECASE)
+
+_HOUR_WORDS = {
+    "one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6,
+    "seven": 7, "eight": 8, "nine": 9, "ten": 10, "eleven": 11, "twelve": 12,
+}
+_HOUR_TOKEN = r"(?P<h>1[0-2]|0?[1-9]|" + "|".join(_HOUR_WORDS) + r")"
+_MINUTE_WORDS = {"fifteen": 15, "thirty": 30, "forty five": 45, "forty-five": 45, "fortyfive": 45}
+
+_NOON_RE = re.compile(r"\b(?:(?:12|twelve)\s+)?(?:noon|midday|mid-day)\b", re.IGNORECASE)
+_HALF_QUARTER_PAST_RE = re.compile(
+    r"\b(?P<q>half|quarter)\s+past\s+" + _HOUR_TOKEN + r"\b", re.IGNORECASE,
+)
+_QUARTER_TO_RE = re.compile(r"\bquarter\s+to\s+" + _HOUR_TOKEN + r"\b", re.IGNORECASE)
+_HOUR_MINUTE_WORDS_RE = re.compile(
+    r"\b" + _HOUR_TOKEN + r"\s+(?P<m>fifteen|thirty|forty[\s-]?five)\b", re.IGNORECASE,
+)
+#: Number words become digits ONLY in clock context: followed by am/pm,
+#: o'clock or "in the <daypart>", or after "at" when the next token is an end,
+#: a punctuation mark or a day/daypart word ("at three tomorrow"). "one of
+#: them" or "at one point" stays text.
+_HOUR_WORD_CLOCK_RE = re.compile(
+    r"\b(?P<w>" + "|".join(_HOUR_WORDS) + r")\b"
+    r"(?=\s*(?:a\.?m\b|p\.?m\b|o'?clock|in\s+the\s+(?:morning|afternoon|evening|night)))",
+    re.IGNORECASE,
+)
+_AT_HOUR_WORD_RE = re.compile(
+    r"\bat\s+(?P<w>" + "|".join(_HOUR_WORDS) + r")\b"
+    r"(?=\s*(?:$|[,.?!;]|this\b|tomorrow\b|today\b|tonight\b|on\b|then\b|please\b"
+    r"|india\b|ist\b|in\s+the\b|"
+    + "|".join(sorted(_WEEKDAYS, key=len, reverse=True))
+    + r"))",
+    re.IGNORECASE,
+)
+
+
+def _hour_token_value(token: str) -> int:
+    low = token.lower()
+    return _HOUR_WORDS[low] if low in _HOUR_WORDS else int(low)
+
+
+def _normalize_clock_words(text: str) -> str:
+    """Rewrite spoken clock phrases into the digit forms `_TIME_RE` reads.
+
+    noon/midday -> 12:00 pm; "half past 3" -> 3:30; "quarter past 3" -> 3:15;
+    "quarter to 4" -> 3:45; "three thirty" -> 3:30; "three pm" -> 3 pm;
+    "at three" -> at 3. Every rewrite produces a minute or keeps the trailing
+    am/pm, so the result carries the same time evidence the words did.
+    """
+    out = _NOON_RE.sub(" 12:00 pm ", text)
+
+    def _past(m: re.Match[str]) -> str:
+        minute = 30 if m.group("q").lower() == "half" else 15
+        return f"{_hour_token_value(m.group('h'))}:{minute:02d}"
+
+    def _to(m: re.Match[str]) -> str:
+        hour = _hour_token_value(m.group("h")) - 1
+        return f"{hour if hour >= 1 else 12}:45"
+
+    def _hm(m: re.Match[str]) -> str:
+        key = " ".join(m.group("m").lower().replace("-", " ").split())
+        return f"{_hour_token_value(m.group('h'))}:{_MINUTE_WORDS[key]:02d}"
+
+    out = _HALF_QUARTER_PAST_RE.sub(_past, out)
+    out = _QUARTER_TO_RE.sub(_to, out)
+    out = _HOUR_MINUTE_WORDS_RE.sub(_hm, out)
+    out = _HOUR_WORD_CLOCK_RE.sub(lambda m: str(_HOUR_WORDS[m.group("w").lower()]), out)
+    out = _AT_HOUR_WORD_RE.sub(lambda m: f"at {_HOUR_WORDS[m.group('w').lower()]}", out)
+    return " ".join(out.split())
+
+
+def _utterance_daypart(low: str) -> str | None | bool:
+    """The daypart bound by a PHRASE anywhere in the utterance.
+
+    Returns the daypart word, None when there is none, or False when the
+    phrases disagree on am vs pm ("tomorrow morning … in the evening"), which
+    the caller treats as unresolvable.
+    """
+    parts: set[str] = set()
+    for m in _DAYPART_PHRASE_RE.finditer(low):
+        word = (m.group("p1") or m.group("p2") or m.group("p3") or m.group("p4") or "").lower()
+        parts.add("night" if word == "tonight" else word)
+    if not parts:
+        return None
+    if len({p in _PM_DAYPARTS for p in parts}) > 1:
+        return False
+    # Deterministic pick; every member agrees on am vs pm.
+    return sorted(parts)[0]
+
+
+def _resolve_ist_hour(
+    hour: int,
+    minute: int,
+    ampm: str | None,
+    part: str | None,
+    *,
+    zero_padded: bool = False,
+) -> tuple[int, int] | None:
+    """Turn a spoken clock into a 24h IST (hour, minute), or None if impossible.
+
+    M009 PR-C (C5) rules for a clock WITHOUT am/pm or a bound daypart:
+    * a bare 1-6 is read as PM — nobody books a 3 AM call, and "at 3" said in
+      a call is the afternoon;
+    * a bare 7 or 8 is genuinely ambiguous (07:00 is before the window,
+      19:00/20:00 are inside it), so it returns None and the caller asks ONE
+      clarification;
+    * a zero-padded or 0 hour ("07:30", "00:15") is a literal 24h reading
+      (and lands before 09:00, so the window check refuses it);
+    * 9..23 is read as 24h.
+    """
     if not 0 <= minute <= 59:
         return None
     ampm_norm = (ampm or "").replace(".", "").replace("'", "").lower()
     part_norm = (part or "").lower()
-    is_pm = ampm_norm == "pm" or part_norm in {"afternoon", "evening", "night"}
-    is_am = ampm_norm == "am" or part_norm == "morning"
-    if ampm_norm in {"", "oclock"} and not part_norm:
-        # 24h reading. Accept 0..23 as-is.
-        if 0 <= hour <= 23:
-            return hour, minute
+    if ampm_norm in {"am", "pm"}:
+        if not 1 <= hour <= 12:
+            # "13pm" is nonsense: reject rather than guess.
+            return None
+        is_pm = ampm_norm == "pm"
+        if part_norm and (part_norm in _PM_DAYPARTS) != is_pm:
+            # "3 pm in the morning": contradictory, so not a time.
+            return None
+        return hour % 12 + (12 if is_pm else 0), minute
+    if part_norm:
+        # 12h reading with a daypart phrase.
+        if not 1 <= hour <= 12:
+            # A 24h hour given with a daypart phrase: reject rather than guess.
+            return None
+        return hour % 12 + (12 if part_norm in _PM_DAYPARTS else 0), minute
+    if zero_padded or hour == 0:
+        return (hour, minute) if 0 <= hour <= 23 else None
+    if 1 <= hour <= 6:
+        return hour + 12, minute
+    if hour in (7, 8):
         return None
-    # 12h reading with an am/pm or a daypart word.
-    if not 1 <= hour <= 12:
-        # "13pm" is nonsense; if a 24h hour was given with a daypart word,
-        # reject rather than guess.
-        return None
-    h = hour % 12
-    if is_pm:
-        h += 12
-    elif is_am:
-        h = hour % 12
-    else:
-        return None
-    return h, minute
+    if 9 <= hour <= 23:
+        return hour, minute
+    return None
 
 
 def parse_callback_time_ist(text: Any, now: datetime) -> str | None:
@@ -4460,16 +4752,39 @@ def parse_callback_time_ist(text: Any, now: datetime) -> str | None:
     Handled: "tomorrow at 3pm", "today 5:30pm", "monday 10am", an explicit
     ``YYYY-MM-DD`` with a time, "3 in the afternoon tomorrow". Garbage, a
     day with no time, or a time with no resolvable day → None.
+
+    M009 PR-C (C5) additions — each one returns a value only when it is
+    unambiguous, and None (one clarification) otherwise:
+    * "tomorrow same time" / "this time Monday": the current IST clock rounded
+      UP to 5 minutes, only with a resolved day and no explicit clock;
+    * noon/midday, "half past 3", "quarter past/to 4", and the number words
+      one..twelve in clock context ("at three", "four thirty pm");
+    * a daypart binds only as a phrase (see `_DAYPART_PHRASE_RE`);
+    * a bare 1-6 reads as PM; a bare 7/8, or h:mm before 09:00 without
+      am/pm, is None;
+    * a date it cannot resolve ("on the 5th", "October 4", "next week"), or a
+      relative offset ("in 2 hours"), is None — never silently today/tomorrow;
+    * a resolved start outside 09:00-21:00 IST is None.
     """
     if not isinstance(text, str):
         return None
     clean = " ".join(text.strip().split())
     if not clean:
         return None
-    low = clean.lower()
     if now.tzinfo is None:
         now = now.replace(tzinfo=timezone.utc)
     now_ist = now.astimezone(_IST_ZONE)
+
+    # 0) Refuse what cannot be resolved honestly, before any guessing.
+    if _UNRESOLVED_DAY_RE.search(_EXPLICIT_DATE_RE.sub(" ", clean)):
+        return None
+    if _RELATIVE_OFFSET_RE.search(clean):
+        return None
+    clean = _normalize_clock_words(clean)
+    low = clean.lower()
+    day_part = _utterance_daypart(low)
+    if day_part is False:
+        return None
 
     # 1) Resolve the DAY (IST calendar date).
     target_date = None
@@ -4485,7 +4800,7 @@ def parse_callback_time_ist(text: Any, now: datetime) -> str | None:
         target_date = (now_ist + timedelta(days=2)).date()
     elif re.search(r"\btomorrow\b", low):
         target_date = (now_ist + timedelta(days=1)).date()
-    elif re.search(r"\btoday\b", low):
+    elif re.search(r"\b(?:today|tonight)\b", low):
         target_date = now_ist.date()
     else:
         m_wd = _WEEKDAY_RE.search(low)
@@ -4517,18 +4832,43 @@ def parse_callback_time_ist(text: Any, now: datetime) -> str | None:
             or m_time.group("part")
             or m_time.group("minute") is not None
             or m_time.group("at")
+            or day_part is not None
         )
         if not has_evidence:
             continue
-        hour = int(m_time.group("hour"))
+        hour_text = m_time.group("hour")
+        hour = int(hour_text)
         minute = int(m_time.group("minute") or 0)
         resolved_hm = _resolve_ist_hour(
-            hour, minute, m_time.group("ampm"), m_time.group("part"),
+            hour, minute, m_time.group("ampm"),
+            m_time.group("part") or day_part,
+            zero_padded=len(hour_text) == 2 and hour_text.startswith("0"),
         )
         if resolved_hm is not None:
             break
 
+    if (
+        resolved_hm is None
+        and target_date is not None
+        and _SAME_TIME_RE.search(low)
+    ):
+        # "tomorrow same time": the current IST clock, rounded UP to the next
+        # 5-minute mark (a partial minute counts as a minute). Only reached
+        # when no explicit clock resolved, and only with a resolved day.
+        base = now_ist.hour * 60 + now_ist.minute
+        if now_ist.second or now_ist.microsecond:
+            base += 1
+        rounded = -(-base // 5) * 5
+        if rounded < 24 * 60:
+            resolved_hm = divmod(rounded, 60)
+
     if resolved_hm is None:
+        return None
+    if not (
+        _CALLBACK_WINDOW_OPEN_MIN
+        <= resolved_hm[0] * 60 + resolved_hm[1]
+        < _CALLBACK_WINDOW_CLOSE_MIN
+    ):
         return None
 
     # 3) If no day was named but a time was, default to TODAY when that instant
@@ -4619,10 +4959,48 @@ _SCHEDULE_REFUSAL_FALLBACK = (
     "I wasn't able to set that up, so I don't want to promise it. The team will "
     "follow up with you to fix a time."
 )
+#: The time-less confirmation. Still registered as gate copy and still the
+#: fallback when the booked instant cannot be read back (see
+#: `_callback_booked_text`), so it stays a constant.
 _SCHEDULE_CONFIRMED_TEXT = (
     "Done, I've got that booked. Someone will call you back then. "
     "Thanks for your time, and goodbye."
 )
+#: M009 PR-C (C5): the booked line NAMES the time it booked, so a misheard
+#: "tomorrow same time" is audible on the call instead of discovered as a
+#: missed slot. Composed at runtime, so `is_gate_copy` matches it by this
+#: PREFIX (a change here must keep the prefix unique to the booked line).
+_CALLBACK_BOOKED_PREFIX = "Done, I've booked you for "
+_CALLBACK_BOOKED_TEMPLATE = (
+    _CALLBACK_BOOKED_PREFIX
+    + "{weekday} at {time} India time. Someone will call you back then. "
+    "Thanks for your time, and goodbye."
+)
+_WEEKDAY_NAMES = (
+    "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday",
+)
+
+
+def _callback_booked_text(starts_at: Any) -> str:
+    """The confirmation for a booked callback, naming its IST weekday and time.
+
+    ``starts_at`` is the absolute UTC instant that was booked. Anything that is
+    not one falls back to the time-less `_SCHEDULE_CONFIRMED_TEXT` — the
+    booking exists either way, and a wrong read-back is worse than none.
+    """
+    if not isinstance(starts_at, str) or not _ISO_UTC_RE.match(starts_at.strip()):
+        return _SCHEDULE_CONFIRMED_TEXT
+    try:
+        instant = datetime.fromisoformat(starts_at.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return _SCHEDULE_CONFIRMED_TEXT
+    ist = instant.astimezone(_IST_ZONE)
+    hour12 = ist.hour % 12 or 12
+    suffix = "am" if ist.hour < 12 else "pm"
+    return _CALLBACK_BOOKED_TEMPLATE.format(
+        weekday=_WEEKDAY_NAMES[ist.weekday()],
+        time=f"{hour12}:{ist.minute:02d} {suffix}",
+    )
 _CALLBACK_PROPOSAL_PROMPT = (
     "I can call you back on {weekday}, {date} at {time} India time for a "
     "ten-minute call. Is that correct?"
@@ -4791,7 +5169,7 @@ async def schedule_callback_turn(
 
     outcome = await client.book_appointment(attempt_id, starts_at.strip(), duration)
     if outcome.ok and outcome.status in BOOKED_STATUSES:
-        return ScheduleTurn(_SCHEDULE_CONFIRMED_TEXT, True, outcome.status)
+        return ScheduleTurn(_callback_booked_text(starts_at.strip()), True, outcome.status)
     # `ok` with an unrecognised status is NOT a booking. A future server status
     # must be added here deliberately, never confirmed by default.
     return ScheduleTurn(schedule_refusal_text(outcome.status), False, outcome.status)
@@ -4959,11 +5337,20 @@ class CallbackDecision:
 
     ``spoken`` is the line the bot must say. When ``terminal`` is True the call
     ends with ``terminal_reason`` (``HALT_CALLBACK_SCHEDULED`` on a booking,
-    ``HALT_CANDIDATE_ENDED`` on the deferral); when False the bot speaks
-    ``spoken`` and waits for the candidate's next turn (still inside the bound).
+    ``HALT_CALLBACK_DEFERRED`` on the deferral, ``HALT_CALLBACK_RECOVERY`` when
+    infrastructure could not prove a validated booking); when False the bot
+    speaks ``spoken`` and waits for the candidate's next turn (still inside the
+    bound).
+
+    ``sub_reason`` (M009 PR-C, C2) names WHICH deferral exit ended the flow.
+    It is a bounded code from ``CALLBACK_DEFERRAL_SUB_REASONS`` (or
+    ``propose_status_<code>``), never transcript text, and it is logged as
+    ``error_category``. Both prod deferrals (4352df89, ab6126e0) could only
+    have come from a failed /callbacks/propose; the logs had rotated and the
+    status was unrecoverable. This is the field that would have named it.
     """
 
-    __slots__ = ("spoken", "terminal", "terminal_reason", "booked")
+    __slots__ = ("spoken", "terminal", "terminal_reason", "booked", "sub_reason")
 
     def __init__(
         self,
@@ -4972,19 +5359,69 @@ class CallbackDecision:
         terminal: bool,
         terminal_reason: str | None = None,
         booked: bool = False,
+        sub_reason: str | None = None,
     ) -> None:
         self.spoken = spoken
         self.terminal = terminal
         self.terminal_reason = terminal_reason
         self.booked = booked
+        self.sub_reason = sub_reason
 
 
-def _deferral_decision() -> CallbackDecision:
-    """The bounded conversational fallback when no bookable time was resolved."""
+#: The fixed deferral sub-reasons (M009 PR-C, C2). A propose refusal the
+#: candidate could not act on is reported as ``propose_status_<code>`` with the
+#: code bounded by ``_bounded_deferral_sub_reason``.
+CALLBACK_DEFERRAL_SUB_REASONS: frozenset[str] = frozenset({
+    "proposer_missing",       # the client has no propose_callback
+    "proposer_transport",     # propose raised, or failed with no status
+    "unparseable",            # no time could be parsed after the clarification
+    "retime_spent",           # refused again (or unparseable) after the one re-ask
+    "confirm_refusal_spent",  # confirm refused a candidate-fixable status, re-ask spent
+    "alt_unpicked",           # no clear pick from the offered alternatives
+})
+_PROPOSE_STATUS_PREFIX = "propose_status_"
+_SUB_REASON_CODE_RE = re.compile(r"^[a-z0-9_]{1,40}$")
+
+
+def _bounded_deferral_sub_reason(raw: Any) -> str:
+    """Map a deferral sub-reason onto the bounded vocabulary. Never raises.
+
+    A fixed code passes through. ``propose_status_<code>`` passes through only
+    when ``<code>`` is a short ``[a-z0-9_]`` token (a server status), so a
+    malformed or hostile body can never put free text in a log line. Anything
+    else collapses to ``propose_status_unknown``.
+    """
+    if isinstance(raw, str):
+        value = raw.strip().lower()
+        if value in CALLBACK_DEFERRAL_SUB_REASONS:
+            return value
+        if value.startswith(_PROPOSE_STATUS_PREFIX):
+            code = value[len(_PROPOSE_STATUS_PREFIX):]
+            if _SUB_REASON_CODE_RE.match(code):
+                return value
+    return _PROPOSE_STATUS_PREFIX + "unknown"
+
+
+def _deferral_decision(
+    sub_reason: str, spoken: str = PHONE_CALLBACK_DEFERRAL_TEXT,
+) -> CallbackDecision:
+    """The bounded terminal deferral when no bookable time was resolved.
+
+    EVERY terminal-deferral exit of the flow comes through here (M009 PR-C,
+    C2), so all of them end ``HALT_CALLBACK_DEFERRED`` with a bounded
+    ``sub_reason``. ``spoken`` defaults to the plain deferral; the
+    explained-refusal exits pass ``schedule_terminal_deferral_text(status)``.
+    """
+    bounded = _bounded_deferral_sub_reason(sub_reason)
+    _log.info(
+        "unknown_event", error_type="phone_callback_deferred",
+        error_category=bounded,
+    )
     return CallbackDecision(
-        PHONE_CALLBACK_DEFERRAL_TEXT,
+        spoken,
         terminal=True,
-        terminal_reason=HALT_CANDIDATE_ENDED,
+        terminal_reason=HALT_CALLBACK_DEFERRED,
+        sub_reason=bounded,
     )
 
 
@@ -5019,7 +5456,7 @@ async def _propose_and_confirm(
             error_category="proposer_missing", schema="deferred",
         )
         flow.phase = CALLBACK_PHASE_DONE
-        return _deferral_decision()
+        return _deferral_decision("proposer_missing")
     try:
         outcome, _proposal = await proposer(attempt_id, starts_at)
     except Exception:  # noqa: BLE001
@@ -5030,7 +5467,7 @@ async def _propose_and_confirm(
             error_category=_ERR_TRANSPORT, schema="deferred",
         )
         flow.phase = CALLBACK_PHASE_DONE
-        return _deferral_decision()
+        return _deferral_decision("proposer_transport")
     if outcome.ok and outcome.status == "proposal_valid":
         # Phase is advanced BEFORE the await. `confirm_callback` is outside the
         # try above, and if it ever raised with the phase still at its entry
@@ -5056,7 +5493,7 @@ async def _propose_and_confirm(
             return _confirmation_failure_decision()
         if confirm.ok and confirm.status in {"ok", "already_confirmed"}:
             return CallbackDecision(
-                _SCHEDULE_CONFIRMED_TEXT,
+                _callback_booked_text(starts_at),
                 terminal=True,
                 terminal_reason=HALT_CALLBACK_SCHEDULED,
                 booked=True,
@@ -5094,10 +5531,9 @@ async def _propose_and_confirm(
                 "unknown_event", error_type="phone_callback_refused",
                 error_category=confirm_status, schema="confirm_deferred_explained",
             )
-            return CallbackDecision(
+            return _deferral_decision(
+                "confirm_refusal_spent",
                 schedule_terminal_deferral_text(confirm_status),
-                terminal=True,
-                terminal_reason=HALT_CANDIDATE_ENDED,
             )
 
         # Validated but could not be confirmed (a race, a transport failure):
@@ -5165,10 +5601,8 @@ async def _propose_and_confirm(
             error_category=status, schema="deferred_explained",
         )
         flow.phase = CALLBACK_PHASE_DONE
-        return CallbackDecision(
-            schedule_terminal_deferral_text(status),
-            terminal=True,
-            terminal_reason=HALT_CANDIDATE_ENDED,
+        return _deferral_decision(
+            "retime_spent", schedule_terminal_deferral_text(status),
         )
 
     # Not actionable by the candidate at all (a transport failure, an unknown
@@ -5181,7 +5615,11 @@ async def _propose_and_confirm(
         schema="deferred",
     )
     flow.phase = CALLBACK_PHASE_DONE
-    return _deferral_decision()
+    # A categorised transport failure carries no status; it is the same
+    # finding as a propose that raised.
+    return _deferral_decision(
+        _PROPOSE_STATUS_PREFIX + status if status else "proposer_transport",
+    )
 
 
 async def run_callback_turn(
@@ -5220,7 +5658,7 @@ async def run_callback_turn(
             return await _propose_and_confirm(client, attempt_id, starts_at, flow)
         # Still unparseable after the one clarification: terminal deferral.
         flow.phase = CALLBACK_PHASE_DONE
-        return _deferral_decision()
+        return _deferral_decision("unparseable")
 
     if phase == CALLBACK_PHASE_AWAITING_RETIME:
         # The candidate was told WHY their time was refused and asked for
@@ -5232,7 +5670,7 @@ async def run_callback_turn(
         if starts_at is not None:
             return await _propose_and_confirm(client, attempt_id, starts_at, flow)
         flow.phase = CALLBACK_PHASE_DONE
-        return _deferral_decision()
+        return _deferral_decision("retime_spent")
 
     if phase == CALLBACK_PHASE_AWAITING_ALT_PICK:
         picked = _match_alternative(candidate_text, flow.alternatives)
@@ -5240,12 +5678,14 @@ async def run_callback_turn(
             return await _propose_and_confirm(client, attempt_id, picked.starts_at, flow)
         # No clear pick from the offered slots: terminal deferral. ONE round only.
         flow.phase = CALLBACK_PHASE_DONE
-        return _deferral_decision()
+        return _deferral_decision("alt_unpicked")
 
     # CALLBACK_PHASE_DONE or any unexpected phase: the flow is over. Anything
-    # further is deferred rather than looped.
+    # further is deferred rather than looped. Not one of the seven exits: it
+    # is only reachable when a caller re-enters a finished flow, so it reports
+    # the bounded catch-all.
     flow.phase = CALLBACK_PHASE_DONE
-    return _deferral_decision()
+    return _deferral_decision(_PROPOSE_STATUS_PREFIX + "unknown")
 
 
 # ── LLM tool binding ──────────────────────────────────────────────────
@@ -6072,6 +6512,17 @@ async def run_phone_gate(
     loop still continues from exactly where it left off. When no durable
     consent exists — a fresh call, or a new-epoch reconnect that never
     consented — this is a no-op and every existing behaviour is unchanged.
+
+    M009 C1: a re-entry is no longer silent. Before returning it confirms
+    ``call.answered`` (re-posting it once if needed) and posts
+    ``consent.resumed`` with the session hint and no epoch, at most twice,
+    each try bounded by ``PHONE_CONSENT_RESUME_TRY_TIMEOUT_SEC`` — the ledger's
+    only ``dialing -> in_call`` edge for a continuation leg (0114 R1). Applied
+    ⇒ the phase ``consent_resumed``. A ``terminal`` / ``stale_epoch`` /
+    ``unknown_attempt`` refusal ⇒ ``assessment_allowed=False`` with nothing
+    further posted. An unconfirmed answer, a timeout, a transport failure, a
+    4xx or ``unexpected_event`` ⇒ fail open: the resumed screening proceeds
+    exactly as before 0114.
     """
     events: list[str] = []
     spoken: list[str] = []
@@ -6484,6 +6935,124 @@ async def run_phone_gate(
     # Fail OPEN toward gating: any fetch failure, a not-ok state, or absent
     # `gate_recorded` falls through to the normal gate, so a fresh call and a
     # new-epoch-no-consent reconnect both still run the full disclosure.
+    async def _resume_consented_leg() -> str:
+        """M009 C1: post `consent.resumed` for a re-entry. Never raises
+        (except the caller's own cancellation, which must propagate).
+
+        1. `call.answered` must be confirmed first: 0114's R1 edge only
+           accepts an ANSWERED attempt, and a `consent.resumed` refused as
+           `unexpected_event` would burn its deterministic id
+           (`internal:<att>:consent.resumed:-1`) for good. The backgrounded
+           post is awaited (bounded); if it is still unconfirmed it is
+           re-posted ONCE (the ledger dedups it). Bounce mode needs neither:
+           its wait already read the server-applied answer.
+        2. Still unconfirmed: skip `consent.resumed`, log
+           `consent_resume_unrecorded`, fail open.
+        3. Post it with the session hint and NO epoch (the ledger uses the
+           current one), at most `CONSENT_RESUME_MAX_TRIES` tries, each
+           bounded by `phone_consent_resume_try_timeout_sec`.
+        4. applied → `consent_resumed`; a `CONSENT_RESUME_REFUSALS` verdict →
+           `refused`; timeout / transport / 4xx / `unexpected_event` → fail
+           open to the pre-0114 behaviour.
+        """
+        try_timeout = phone_consent_resume_try_timeout_sec()
+
+        def _answered_confirmed() -> bool:
+            if bounce_mode or "call.answered" in events:
+                return True
+            task = answer_post.get(ANSWERED_POST_TASK_KEY)
+            if task is None or not task.done() or task.cancelled():
+                return False
+            try:
+                outcome = task.result()
+            except Exception:  # noqa: BLE001 — logged where the post completed
+                return False
+            return outcome is not None and (
+                event_applied(outcome) or outcome.duplicate
+            )
+
+        try:
+            await asyncio.wait_for(_await_answered_post(), timeout=try_timeout)
+        except asyncio.TimeoutError:
+            pass
+        if not _answered_confirmed():
+            try:
+                again: Optional[PhoneApiOutcome] = await asyncio.wait_for(
+                    client.post_event(
+                        attempt_id, "call.answered", epoch=epoch,
+                        session_id=session_id,
+                    ),
+                    timeout=try_timeout,
+                )
+            except asyncio.TimeoutError:
+                again = None
+            except Exception:  # noqa: BLE001 — fail open, logged below
+                again = None
+            if again is not None and (event_applied(again) or again.duplicate):
+                if "call.answered" not in events:
+                    events.append("call.answered")
+                _phase("answered")
+                _fire_begin_recording_at_answer()
+            else:
+                _log.warn(
+                    "unknown_event", error_type="phone_consent_resumed",
+                    error_category="consent_resume_unrecorded",
+                )
+                return CONSENT_RESUME_FAIL_OPEN
+
+        outcome: Optional[PhoneApiOutcome] = None
+        for _ in range(CONSENT_RESUME_MAX_TRIES):
+            try:
+                outcome = await asyncio.wait_for(
+                    client.post_event(
+                        attempt_id, CONSENT_RESUMED_EVENT, epoch=None,
+                        session_id=session_id,
+                    ),
+                    timeout=try_timeout,
+                )
+            except asyncio.TimeoutError:
+                outcome = None
+            except Exception:  # noqa: BLE001 — fail open, logged below
+                outcome = None
+            if outcome is not None and (
+                outcome.status is not None
+                or outcome.error_category not in (_ERR_TRANSPORT, _ERR_MALFORMED)
+            ):
+                break  # a verdict (or a deterministic 4xx): never re-post it
+        if outcome is not None and event_applied(outcome):
+            events.append(CONSENT_RESUMED_EVENT)
+            _phase("consent_resumed")
+            _log.info(
+                "unknown_event", error_type="phone_consent_resumed",
+                error_category="consent_resumed",
+            )
+            return CONSENT_RESUME_APPLIED
+        if (
+            outcome is not None
+            and outcome.ignored_reason in CONSENT_RESUME_REFUSALS
+        ):
+            _phase("consent_resume_refused")
+            _log.warn(
+                "unknown_event", error_type="phone_consent_resumed",
+                error_category=f"consent_resume_{outcome.ignored_reason}",
+            )
+            return CONSENT_RESUME_REFUSED
+        # Fixed vocabulary only: a server-supplied string never reaches a log
+        # category unbounded.
+        if outcome is None:
+            category = "timeout"
+        else:
+            category = next((
+                value for value in (
+                    outcome.ignored_reason, outcome.status, outcome.error_category,
+                ) if value in _CONSENT_RESUME_FAIL_OPEN_CATEGORIES
+            ), "unconfirmed")
+        _log.warn(
+            "unknown_event", error_type="phone_consent_resumed",
+            error_category=f"consent_resume_{category}",
+        )
+        return CONSENT_RESUME_FAIL_OPEN
+
     if fetch_durable_consent is not None:
         try:
             # M009 E6: on the answer-seam path the read was started during the
@@ -6516,6 +7085,17 @@ async def run_phone_gate(
                 "unknown_event", error_type="phone_gate_outcome",
                 schema="gate_resumed_consent",
             )
+            # M009 C1: tell the ledger this leg is a continuation. A refusal
+            # that says the leg is over (terminal / superseded / unknown)
+            # ends it here, posting NOTHING further: the teardown sees a
+            # non-assessment human result with no terminal requested and only
+            # closes the room. Every other outcome is today's path.
+            if await _resume_consented_leg() == CONSENT_RESUME_REFUSED:
+                return PhoneGateResult(
+                    CLASSIFY_HUMAN, assessment_allowed=False,
+                    recording_allowed=False, events=events, spoken=spoken,
+                    assessment_state=durable,
+                )
             return PhoneGateResult(
                 CLASSIFY_HUMAN, assessment_allowed=True, recording_allowed=True,
                 events=events, spoken=spoken, assessment_state=durable,
@@ -7084,6 +7664,282 @@ _END_CALL_RE = re.compile(
 def is_explicit_end_call_request(text: Any) -> bool:
     """Recognise an unambiguous request to end the current call only."""
     return isinstance(text, str) and _END_CALL_RE.search(text) is not None
+
+
+# ── M009 PR-C (C7): mid-call withdrawal ─────────────────────────────────
+#
+# RCA (e80c5fa3 / 4352df89): after consent, only the explicit end-call
+# request short-circuited. "Not interested" and "didn't apply" fell into the
+# callback route and the answer gate; the bot re-pitched, the leg aborted, and
+# the decliner was partial-scored as a reject with no suppression.
+#
+# Three classes, by cost of a false positive:
+#   * opt_out — a contact-level "don't call me again". Ends immediately.
+#   * withdraw_explicit — "I want to withdraw my application". Ends
+#     immediately.
+#   * decline — "I'm not interested in this role", "I didn't apply". Gets ONE
+#     confirmation (PHONE_WITHDRAWAL_CONFIRM_TEXT) before anything ends.
+#
+# Tuned for PRECISION, like the callback detector: the population is sales
+# candidates who quote objections ("when a customer says I'm not interested,
+# I ...") as their actual job. VETOES RUN FIRST: reported speech, a
+# hypothetical or conditional, a negated negation, and a now-scoped deferral
+# ("not right now", "busy today") all return None — a now-scoped deferral is
+# the callback flow's, never a decline. The gate's `_OPT_OUT_RE` (agent.py) is
+# deliberately NOT reused and stays byte-identical: it reads the FIRST answer
+# to a disclosure, where "take me off" can only mean one thing.
+
+MIDCALL_OPT_OUT = "opt_out"
+MIDCALL_WITHDRAW_EXPLICIT = "withdraw_explicit"
+MIDCALL_DECLINE = "decline"
+
+WITHDRAWAL_REPLY_CONTINUE = "continue"
+WITHDRAWAL_REPLY_STOP = "stop"
+WITHDRAWAL_REPLY_AMBIGUOUS = "ambiguous"
+
+
+def phone_midcall_opt_out_enabled() -> bool:
+    """Kill switch. Default ON; only the literal ``off`` restores the pre-C7
+    path (no classifier, no confirmation, no prompt addendum)."""
+    return (os.getenv("PHONE_MIDCALL_OPT_OUT") or "").strip().lower() != "off"
+
+
+#: What a decline has to be ABOUT. "I'm not interested in night shifts" is an
+#: answer, not a withdrawal, so a decline either names this role/process or
+#: ends its clause.
+_WD_ROLE_OBJECT = (
+    r"(?:this|the|your)\s+(?:role|job|position|opening|opportunity|offer|"
+    r"program|programme|profile|post|vacancy|interview|screening|process|"
+    r"application|call)"
+)
+#: The decline phrase has to END its clause: end of turn, punctuation, or a
+#: closing courtesy. Lookahead only, so nothing after it is consumed.
+_WD_CLAUSE_END = (
+    r"(?=\s*(?:$|[.!?,;:]|(?:and|thanks|thank\s+you|sorry|please|anymore|"
+    r"any\s+more|at\s+all|sir|ma'?am|madam)\b))"
+)
+#: TEMPORAL NEGATIVE LOOKAHEAD for opt-outs: "don't call me again TODAY" and
+#: "stop calling me at work" are scheduling, not a permanent opt-out.
+_WD_NOT_TEMPORAL = (
+    r"(?!\s*,?\s*(?:right\s+now|now|today|tonight|at\s+the\s+moment|this\s+\w+|"
+    r"before|after|until|till|during|while|at\s+\w+|in\s+the\s+\w+|on\s+\w+|"
+    r"for\s+(?:now|a\s+while|some\s+time|today)))"
+)
+
+_WD_OPT_OUT_RE = re.compile(
+    r"\bdo(?:n'?t|\s+not)\s+(?:ever\s+)?(?:call|contact|phone|ring)\s+"
+    r"(?:me|this\s+number|us)\s+(?:ever\s+)?(?:again|anymore|any\s+more|"
+    r"in\s+(?:the\s+)?future)\b" + _WD_NOT_TEMPORAL + r"|"
+    r"\bnever\s+(?:call|contact|phone|ring)\s+(?:me|this\s+number)\s+again\b"
+    + _WD_NOT_TEMPORAL + r"|"
+    r"\bstop\s+(?:calling|contacting|phoning|ringing)\s+(?:me|this\s+number)"
+    r"(?:\s+(?:again|anymore|any\s+more|please))?" + _WD_CLAUSE_END
+    + _WD_NOT_TEMPORAL + r"|"
+    r"\b(?:remove|delete)\s+(?:my|this)\s+(?:phone\s+number|number|contact"
+    r"(?:\s+details)?|details)\b(?:\s+from\s+(?:your|the)\s+\w+)?"
+    + _WD_CLAUSE_END + r"|"
+    r"\btake\s+(?:me|my\s+number|this\s+number)\s+off\s+(?:your|the)\s+"
+    r"(?:list|calling\s+list|database|records?|system)\b|"
+    r"\bi\s+(?:do(?:n'?t|\s+not)|never)\s+want\s+to\s+be\s+(?:called|contacted)"
+    r"\s+(?:again|anymore|any\s+more|in\s+(?:the\s+)?future)\b"
+    + _WD_NOT_TEMPORAL + r"|"
+    r"\bdo(?:n'?t|\s+not)\s+(?:bother\s+)?(?:calling|to\s+call)\s+me\s+"
+    r"(?:again|anymore|any\s+more|back)\b" + _WD_NOT_TEMPORAL,
+    re.IGNORECASE,
+)
+
+_WD_WITHDRAW_RE = re.compile(
+    r"\bi(?:\s+(?:want|would\s+like|wish|need|have\s+decided)|'d\s+like)\s+to\s+"
+    r"withdraw(?:\s+(?:my\s+(?:application|candidacy|candidature|profile|name)"
+    r"|from\s+" + _WD_ROLE_OBJECT + r"))?" + _WD_CLAUSE_END + r"|"
+    r"\b(?:i'?m|i\s+am)\s+withdrawing(?:\s+(?:my\s+(?:application|candidacy|"
+    r"candidature|profile|name)|from\s+" + _WD_ROLE_OBJECT + r"))?"
+    + _WD_CLAUSE_END + r"|"
+    r"\b(?:please\s+)?withdraw\s+my\s+(?:application|candidacy|candidature|"
+    r"profile|name)\b|"
+    r"\b(?:please\s+)?(?:cancel|close)\s+my\s+(?:application|candidacy|"
+    r"candidature)\b",
+    re.IGNORECASE,
+)
+
+_WD_DECLINE_RE = re.compile(
+    # "I'm not interested", "I am honestly not interested in this role".
+    r"\b(?:i'?m|i\s+am|we'?re|we\s+are)\s+(?:(?:really|just|actually|honestly|"
+    r"frankly|totally|simply|sorry)\s+)*not\s+(?:really\s+|at\s+all\s+)?"
+    r"interested(?:\s+in\s+(?:" + _WD_ROLE_OBJECT + r"|it|this|that|this\s+one))?"
+    + _WD_CLAUSE_END + r"|"
+    r"\b(?:i'?m|i\s+am)\s+no\s+longer\s+interested(?:\s+in\s+(?:"
+    + _WD_ROLE_OBJECT + r"|it|this|that))?" + _WD_CLAUSE_END + r"|"
+    # A clause-initial bare "not interested" ("No, not interested.").
+    r"(?:^|[.!?,;]\s*)(?:(?:no|nah|sorry|actually|honestly|frankly|well|but|"
+    r"sir|madam|ma'?am)[\s,]+){0,3}not\s+(?:really\s+)?interested(?:\s+in\s+(?:"
+    + _WD_ROLE_OBJECT + r"|it|this|that))?" + _WD_CLAUSE_END + r"|"
+    r"\bi\s+(?:do(?:n'?t|\s+not)|no\s+longer)\s+want\s+" + _WD_ROLE_OBJECT
+    + _WD_CLAUSE_END + r"|"
+    r"\bi\s+(?:do(?:n'?t|\s+not)|no\s+longer)\s+want\s+to\s+(?:continue|proceed|"
+    r"go\s+ahead|carry\s+on|do\s+(?:this|it))(?:\s+with\s+(?:" + _WD_ROLE_OBJECT
+    + r"|it|this))?" + _WD_CLAUSE_END + r"|"
+    r"\bi(?:\s+(?:want|would\s+like)|'d\s+like)\s+to\s+stop(?:\s+(?:here|this|"
+    r"the\s+(?:interview|screening)))?" + _WD_CLAUSE_END + r"|"
+    r"\bi\s+(?:didn'?t|did\s+not|never)\s+appl(?:y|ied)(?:\s+(?:for|to)\s+(?:"
+    + _WD_ROLE_OBJECT + r"|this|it|anything|any\s+job))?" + _WD_CLAUSE_END + r"|"
+    r"\bi(?:'ve|\s+have)\s+changed\s+my\s+mind(?:\s+about\s+(?:"
+    + _WD_ROLE_OBJECT + r"|it|this))?" + _WD_CLAUSE_END,
+    re.IGNORECASE,
+)
+
+#: VETO 1 — reported speech, objection-handling and hypotheticals, read in the
+#: clause BEFORE the hit. "When a customer says I'm not interested, I ..." is a
+#: screening answer from a sales candidate, and the commonest one there is.
+_WD_REPORTED_VETO_RE = re.compile(
+    r"\b(?:say|says|said|saying|tell|tells|told|telling|ask|asks|asked|reply|"
+    r"replies|replied|respond|responds|responded|objection|objections|pitch|"
+    r"pitching|handle|handling|convince|convincing|customer|customers|client|"
+    r"clients|prospect|prospects|lead|leads|parent|parents|student|students|"
+    r"caller|callers|buyer|buyers|people|someone|somebody|they|he|she|"
+    r"what\s+if|even\s+if|if|suppose|supposing|hypothetically|in\s+case|"
+    r"imagine|example|(?:be|was|were|are|is|they'?re|he'?s|she'?s)\s+like)\b",
+    re.IGNORECASE,
+)
+#: VETO 2 — a negated negation: "not that I'm not interested", "I never said
+#: I don't want this job".
+_WD_NEGATED_VETO_RE = re.compile(
+    r"\b(?:not\s+that|it'?s\s+not\s+like|never\s+said|didn'?t\s+say|"
+    r"did\s+not\s+say|not\s+saying|doesn'?t\s+mean|does\s+not\s+mean|"
+    r"don'?t\s+mean|wouldn'?t\s+say|it'?s\s+not\s+as\s+if)\b",
+    re.IGNORECASE,
+)
+#: VETO 3 — a NOW-scoped deferral in the same clause ("I'm not interested
+#: right now, call me later"): that is the callback flow's, never a decline.
+#: Applied to declines and withdrawals; opt-outs use the narrower lookahead.
+_WD_NOW_SCOPE_RE = re.compile(
+    r"\b(?:right\s+now|just\s+now|now|at\s+the\s+moment|at\s+this\s+moment|"
+    r"today|tonight|currently|at\s+present|for\s+now|later|another\s+time|"
+    r"some\s+other\s+time|tomorrow|busy|driving|in\s+a\s+meeting)\b",
+    re.IGNORECASE,
+)
+_WD_CLAUSE_SPLIT_RE = re.compile(r"[.!?;]")
+_WD_MAX_CHARS = 2000
+
+
+def _wd_normalise(text: Any) -> str:
+    if not isinstance(text, str):
+        return ""
+    value = text[:_WD_MAX_CHARS].replace("’", "'").replace("‘", "'")
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _wd_clause_bounds(value: str, start: int, end: int) -> tuple[int, int, bool]:
+    """The sentence holding ``[start, end)``: (begin, finish, is_question)."""
+    begin = 0
+    for match in _WD_CLAUSE_SPLIT_RE.finditer(value, 0, start):
+        begin = match.end()
+    finish_match = _WD_CLAUSE_SPLIT_RE.search(value, end)
+    finish = finish_match.start() if finish_match else len(value)
+    is_question = bool(finish_match) and finish_match.group(0) == "?"
+    return begin, finish, is_question
+
+
+def _wd_vetoed(value: str, match: "re.Match[str]", *, now_scope: bool) -> bool:
+    begin, finish, _ = _wd_clause_bounds(value, match.start(), match.end())
+    prefix = value[begin:match.start()]
+    if _WD_REPORTED_VETO_RE.search(prefix) or _WD_NEGATED_VETO_RE.search(prefix):
+        return True
+    if now_scope and _WD_NOW_SCOPE_RE.search(value[begin:finish]):
+        return True
+    return False
+
+
+def _wd_first_unvetoed(
+    pattern: "re.Pattern[str]", value: str, *, now_scope: bool,
+) -> "re.Match[str] | None":
+    for match in pattern.finditer(value):
+        if not _wd_vetoed(value, match, now_scope=now_scope):
+            return match
+    return None
+
+
+def classify_midcall_withdrawal(text: Any) -> str | None:
+    """Classify one (coalesced) candidate turn heard DURING the screening.
+
+    Returns ``opt_out``, ``withdraw_explicit``, ``decline`` or None. Pure and
+    bounded (input capped at 2000 characters, no nested quantifiers), so it is
+    safe on the event loop. Vetoes are checked per hit, before any class is
+    returned. A withdrawal phrased as a question ("can I withdraw?") is only a
+    decline (it gets the confirmation); a decline phrased as a question ("so
+    I'm not interested?") is nothing.
+    """
+    value = _wd_normalise(text)
+    if not value:
+        return None
+    if _wd_first_unvetoed(_WD_OPT_OUT_RE, value, now_scope=False) is not None:
+        return MIDCALL_OPT_OUT
+    withdraw = _wd_first_unvetoed(_WD_WITHDRAW_RE, value, now_scope=True)
+    if withdraw is not None:
+        _, _, is_question = _wd_clause_bounds(value, withdraw.start(), withdraw.end())
+        return MIDCALL_DECLINE if is_question else MIDCALL_WITHDRAW_EXPLICIT
+    for match in _WD_DECLINE_RE.finditer(value):
+        if _wd_vetoed(value, match, now_scope=True):
+            continue
+        _, _, is_question = _wd_clause_bounds(value, match.start(), match.end())
+        if is_question:
+            continue
+        return MIDCALL_DECLINE
+    return None
+
+
+#: "don't stop" / "no need to stop" are CONTINUE signals and are removed
+#: before the stop vocabulary runs, so "stop" inside them cannot be read.
+_WD_DONT_STOP_RE = re.compile(
+    r"\b(?:do(?:n'?t|\s+not)|not|no\s+need\s+to|never)\s+stop\b", re.IGNORECASE,
+)
+_WD_NEG_CONTINUE_RE = re.compile(
+    r"\b(?:do(?:n'?t|\s+not)|can'?t|cannot|won'?t|will\s+not|not)\s+"
+    r"(?:want\s+to\s+|wish\s+to\s+|like\s+to\s+)?(?:continue|carry\s+on|proceed|"
+    r"go\s+ahead|go\s+on)\b",
+    re.IGNORECASE,
+)
+_WD_CONTINUE_RE = re.compile(
+    r"\b(?:carry\s+on|continue|go\s+ahead|go\s+on|proceed|keep\s+going|"
+    r"let'?s\s+(?:go|do\s+(?:it|this)|continue|carry\s+on|proceed)|"
+    r"(?:i'?m|i\s+am)\s+(?:still\s+)?interested|"
+    r"(?:ask|next)\s+(?:me\s+)?(?:the\s+)?(?:next\s+)?question|"
+    r"i(?:\s+will|'ll)\s+(?:continue|answer)|misunderstood|"
+    r"didn'?t\s+mean\s+(?:that|it)|i\s+meant)\b",
+    re.IGNORECASE,
+)
+_WD_STOP_RE = re.compile(
+    r"\b(?:stop|end\s+(?:it|this|here|now|the\s+(?:call|interview|screening))|"
+    r"i'?m\s+done|that'?s\s+(?:it|all)|withdraw|no\s+thanks|no\s+thank\s+you|"
+    r"not\s+interested|leave\s+it|forget\s+it|bye|goodbye)\b",
+    re.IGNORECASE,
+)
+
+
+def classify_withdrawal_confirm_reply(text: Any) -> str:
+    """Classify the reply to PHONE_WITHDRAWAL_CONFIRM_TEXT (or its re-ask).
+
+    ``stop`` — any withdrawal class, or a stop signal alone.
+    ``continue`` — a continue signal alone.
+    ``ambiguous`` — both, neither, or a bare yes/no/okay: the confirmation is a
+    two-option question, so a bare yes or no answers neither option.
+    """
+    value = _wd_normalise(text)
+    if not value:
+        return WITHDRAWAL_REPLY_AMBIGUOUS
+    if classify_midcall_withdrawal(value) is not None:
+        return WITHDRAWAL_REPLY_STOP
+    stop = bool(_WD_NEG_CONTINUE_RE.search(value))
+    stripped = _WD_NEG_CONTINUE_RE.sub(" ", value)
+    go_on = bool(_WD_DONT_STOP_RE.search(stripped))
+    stripped = _WD_DONT_STOP_RE.sub(" ", stripped)
+    stop = stop or bool(_WD_STOP_RE.search(stripped))
+    go_on = go_on or bool(_WD_CONTINUE_RE.search(stripped))
+    if stop and not go_on:
+        return WITHDRAWAL_REPLY_STOP
+    if go_on and not stop:
+        return WITHDRAWAL_REPLY_CONTINUE
+    return WITHDRAWAL_REPLY_AMBIGUOUS
 
 
 # Post-plan candidate Q&A is deliberately bounded. Three real questions is
@@ -14048,7 +14904,9 @@ def phone_agent_class(agent_base: Any) -> Any:
                 return "There is no callback time waiting for confirmation."
             outcome = await self._client.confirm_callback(self._attempt_id, proposal.starts_at)
             if outcome.ok and outcome.status in {"ok", "already_confirmed"}:
-                turn = ScheduleTurn(_SCHEDULE_CONFIRMED_TEXT, True, outcome.status)
+                turn = ScheduleTurn(
+                    _callback_booked_text(proposal.starts_at), True, outcome.status,
+                )
                 self.bookings.append(turn)
                 self._callback_proposal = None
                 await self._say(turn.spoken)

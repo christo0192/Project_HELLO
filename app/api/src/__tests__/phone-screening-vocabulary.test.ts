@@ -31,11 +31,14 @@ import {
   isTerminalEngagementState,
   isLiveAttemptState,
   isPhoneOutcomeClass,
+  PHONE_SCORE_SUPPRESS_REASONS,
+  isPhoneScoreSuppressReason,
   CONSENT_RECORD_STATUSES,
   CONSENT_TYPES,
 } from '../lib/phone-screening/vocabulary.js';
 import {
   MIGRATION_0042,
+  MIGRATION_0114,
   checkMembers,
   consentStatusMembers,
   consentTypeEnumMembers,
@@ -101,15 +104,26 @@ describe('phone-screening vocabulary mirrors 0042 exactly', () => {
     );
   });
 
-  it('EXACTLY thirteen outcome classes, matching chk_phone_call_attempts_outcome', () => {
+  it('EXACTLY fourteen outcome classes, matching chk_phone_call_attempts_outcome', () => {
     // TWELVE since 0043 (`abandoned_pre_disclosure`), THIRTEEN since 0095,
-    // which re-declares this CHECK in full again to add `consent_failed`. `checkMembers` reads
+    // which re-declares this CHECK in full again to add `consent_failed`,
+    // FOURTEEN since 0114, which re-declares it once more to add
+    // `callback_deferred`. `checkMembers` reads
     // the NEWEST declaration, so this compares against what the database
     // actually enforces rather than against a superseded inline list.
     const members = checkMembers('chk_phone_call_attempts_outcome');
     expect(set(PHONE_OUTCOME_CLASSES)).toEqual(set(members));
-    expect(PHONE_OUTCOME_CLASSES).toHaveLength(13);
-    expect(members).toHaveLength(13);
+    expect(PHONE_OUTCOME_CLASSES).toHaveLength(14);
+    expect(members).toHaveLength(14);
+    // 0114 (C2-P1): the in-call callback deferral. Not `cancelled`, not
+    // `disconnected` — a wait owed a redial, and never scored.
+    expect(members).toContain('callback_deferred');
+    expect(isPhoneOutcomeClass('callback_deferred')).toBe(true);
+    // ...and it is the 0114 re-declaration that supplies it.
+    const anchor = MIGRATION_0114.indexOf('add constraint chk_phone_call_attempts_outcome');
+    expect(anchor).toBeGreaterThan(-1);
+    expect(MIGRATION_0114.slice(anchor, MIGRATION_0114.indexOf('not valid', anchor)))
+      .toContain("'callback_deferred'");
     // The added members BY VALUE, so a re-declaration that silently dropped
     // one fails on the value and not only on the count. Each of these CHECKs
     // has now been re-declared in full twice; a dropped member is the failure
@@ -120,6 +134,26 @@ describe('phone-screening vocabulary mirrors 0042 exactly', () => {
     // refusing — terminal, never dialled again. Losing that distinction
     // either redials someone who said no or abandons someone we failed.
     expect(members).toContain('declined');
+  });
+
+  it('score-suppression reasons are exactly what phone_attempt_score_suppression answers (0114)', () => {
+    // The TS narrowing drops an unknown reason to null, so a reason the SQL
+    // adds without this union being widened would vanish from the finalize
+    // result silently. Both directions, read from the newest body.
+    const body = functionBody('phone_attempt_score_suppression');
+    expect(body).toMatch(/returns text/);
+    for (const reason of PHONE_SCORE_SUPPRESS_REASONS) {
+      expect(body, reason).toContain(`'${reason}'`);
+    }
+    expect(set(PHONE_SCORE_SUPPRESS_REASONS)).toEqual(
+      set(['callback_booked', 'callback_deferred', 'worker_aborted']),
+    );
+    for (const reason of PHONE_SCORE_SUPPRESS_REASONS) {
+      expect(isPhoneScoreSuppressReason(reason)).toBe(true);
+    }
+    expect(isPhoneScoreSuppressReason('completed')).toBe(false);
+    expect(isPhoneScoreSuppressReason(null)).toBe(false);
+    expect(isPhoneScoreSuppressReason(7)).toBe(false);
   });
 
   it('cold start is NOT an outcome class', () => {

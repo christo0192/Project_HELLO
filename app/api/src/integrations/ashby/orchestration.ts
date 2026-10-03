@@ -64,6 +64,12 @@ export interface ExistingLinkRow {
    * backfilled — see the backfill in `runImport`.
    */
   externalResumeFileHandle?: string | null;
+  /**
+   * 0114 (C8-F): the link's stored opaque Ashby candidate id, if the store
+   * surfaces it. Decides whether a REUSED link still needs it backfilled. An
+   * opaque identifier; never logged.
+   */
+  externalCandidateId?: string | null;
 }
 
 export interface EnqueueResult {
@@ -101,6 +107,13 @@ export interface WorkflowStores {
     jobMappingId: string | null;
     externalResumeFileHandle: string | null;
     submittedAt: string | null;
+    /**
+     * 0114 (C8-F): the opaque Ashby candidate id from application.info, or
+     * null when the payload carries none. `ensure_ashby_phone_engagement`'s
+     * same-role duplicate hold matches on it (with the job mapping). Optional
+     * so an older injected store keeps compiling; never logged.
+     */
+    externalCandidateId?: string | null;
   }): Promise<{ id: string }>;
   /** Backfill source-authentic submission evidence on a reused link. */
   bindLinkSubmittedAt?(applicationLinkId: string, submittedAt: string): Promise<void>;
@@ -138,6 +151,13 @@ export interface WorkflowStores {
    * is simply skipped. Implementations must never overwrite a non-null handle.
    */
   bindLinkResumeHandle?(applicationLinkId: string, handle: string): Promise<void>;
+  /**
+   * 0114 (C8-F). Backfill the opaque Ashby candidate id onto an EXISTING link
+   * that has none — a compare-and-set on `external_candidate_id IS NULL`, so a
+   * stored value is never overwritten. Optional so every existing fake keeps
+   * compiling; when absent the backfill is skipped.
+   */
+  bindLinkExternalCandidateId?(applicationLinkId: string, externalCandidateId: string): Promise<void>;
   completeOperation(id: string, leaseToken: string, externalAnchor?: string | null, marker?: string | null): Promise<'ok' | 'not_owned'>;
   failOperation(id: string, leaseToken: string, errorCode: string, retryable: boolean): Promise<{ outcome: 'retry' | 'failed' } | 'not_owned'>;
 }
@@ -438,6 +458,14 @@ export async function runImport(externalApplicationId: string, deps: ImportDeps)
     if (view.submittedAt && deps.stores.bindLinkSubmittedAt) {
       await deps.stores.bindLinkSubmittedAt(linkId, view.submittedAt);
     }
+    // 0114 (C8-F): the same backfill-on-reuse for the opaque Ashby candidate
+    // id. Before 0114 nothing wrote `external_candidate_id`, so every link
+    // imported earlier has none and the duplicate hold's
+    // (external_candidate_id, job mapping) match could never fire for it. The
+    // store's CAS (`external_candidate_id IS NULL`) never overwrites a value.
+    if (view.candidateId && !existing.externalCandidateId && deps.stores.bindLinkExternalCandidateId) {
+      await deps.stores.bindLinkExternalCandidateId(linkId, view.candidateId);
+    }
   } else {
     const created = await deps.stores.createLink({
       externalApplicationId: appId,
@@ -446,6 +474,8 @@ export async function runImport(externalApplicationId: string, deps: ImportDeps)
       jobMappingId: mapping.id,
       externalResumeFileHandle: resumeHandle,
       submittedAt: view.submittedAt ?? null,
+      // 0114 (C8-F): opaque, bounded by the extractor's safeId; never logged.
+      externalCandidateId: view.candidateId ?? null,
     });
     linkId = created.id;
     reused = false;
@@ -608,6 +638,12 @@ export interface SagaDeps {
  */
 export async function enqueueScorecard(source: ScorecardSource, deps: SagaDeps): Promise<SagaResult> {
   if (!deps.gates.enabled) return { status: 'disabled' };
+  // C3 (0114 §4): an INSUFFICIENT-evidence interview is held for a human and
+  // never enqueued — the same gate `enqueueScorecardWrite` applies, checked
+  // before any store call.
+  if (source.evidenceGrade === 'insufficient') {
+    return { status: 'blocked_scorecard', reason: 'evidence_insufficient' };
+  }
   const built = buildScorecard(source, deps.scale);
   if (!built.ok) return { status: 'blocked_scorecard', reason: built.reason };
   // LINK-SCOPED admission, ahead of the enqueue and independent of any key or

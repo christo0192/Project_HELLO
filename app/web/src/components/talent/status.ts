@@ -84,7 +84,7 @@ export function sessionStatusLabel(status: string | null | undefined): string {
 /* ── Phone call attempts ─────────────────────────────────────────────
  *
  * The words a recruiter reads for one dial. The vocabularies are the closed
- * CHECK allowlists on `phone_call_attempts` (0042, extended by 0043 and 0095;
+ * CHECK allowlists on `phone_call_attempts` (0042, extended by 0043, 0095 and 0114;
  * mirrored in app/api/src/lib/phone-screening/vocabulary.ts). The OUTCOME is
  * what a recruiter acts on, so it is the word shown; the attempt STATE is
  * only shown while no outcome has been recorded yet (a dial in flight).
@@ -111,6 +111,9 @@ const ATTEMPT_OUTCOME_LABELS: Readonly<Record<string, string>> = {
   // 0095: OUR consent gate failed (malformed RPC, classifier error). Not the
   // candidate declining: they are owed the call and it is retried.
   consent_failed: 'Consent check failed on our side',
+  // 0114: the candidate asked mid-call to be called back and no slot could be
+  // booked. Not a screening and not a drop: they are redialled next day.
+  callback_deferred: 'Asked to be called back later',
   // Values the offline e2e fixtures use for the same situations. Harmless in
   // production (the allowlist never produces them) and they keep the fixture
   // screenshots in plain words. `dropped_at_gate` is a call that ended at the
@@ -147,6 +150,47 @@ export function attemptRawStatus(
   return [state ? `state: ${state}` : null, outcome ? `outcome: ${outcome}` : null]
     .filter(Boolean)
     .join(' · ');
+}
+
+/* ── Phone engagement state reasons ─────────────────────────────────
+ *
+ * `phone_engagements.state_reason`: WHY a screening cycle is in its state.
+ * Not a closed CHECK (the event-derived cancel reasons are written as the
+ * event type with its dot replaced), so unknown values fall through to
+ * `humanizeEnum`. The vocabulary mirrors PHONE_OUTCOME_MIGRATION_REASONS in
+ * app/api/src/lib/phone-screening/budget.ts plus 0114's late-score reason.
+ */
+
+const ENGAGEMENT_REASON_LABELS: Readonly<Record<string, string>> = {
+  no_answer_budget_exhausted: 'No answer after every attempt',
+  reconnect_budget_exhausted: 'Dropped too many times',
+  provider_budget_exhausted: 'Could not connect after every attempt',
+  window_closed: 'Waiting for the next calling window',
+  assessment_aborted: 'Interview ended before it finished',
+  wrong_number: 'Wrong number',
+  disclosure_refused: 'Declined the recording notice',
+  candidate_opt_out: 'Candidate opted out',
+  hr_cancelled: 'Cancelled by HR',
+  emergency_stop: 'Stopped by the emergency stop',
+  ashby_stage_left: 'Left the Ashby stage',
+  prereq_lost: 'Prerequisites no longer met',
+  abandoned_pre_disclosure: 'Hung up before the recording notice',
+  consent_gate_failed: 'Consent check failed on our side',
+  // 0114 (C2): the candidate asked mid-call to be called back and no slot
+  // could be booked. Redialled at the next day's window, budget untouched.
+  callback_deferred_in_call: 'Asked to be called back; redial next day',
+  // 0114 (C2): the third such request. The cycle stops rather than deferring
+  // for ever.
+  callback_deferral_limit: 'Asked to be called back too many times',
+  // 0114 (C2): the interview was marked aborted by the stranded sweep, then
+  // its score landed. Completed late, with the original end time kept.
+  late_score_after_stranded_abort: 'Completed (score arrived late)',
+};
+
+/** Why a screening cycle is in its state, in a recruiter's words. */
+export function engagementReasonLabel(reason: string | null | undefined): string {
+  if (typeof reason !== 'string' || reason.trim() === '') return '';
+  return humanizeEnum(reason, ENGAGEMENT_REASON_LABELS);
 }
 
 /* ── Appeals ─────────────────────────────────────────────────────────

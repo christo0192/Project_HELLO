@@ -178,6 +178,19 @@ export const WORKER_PHONE_EVENTS = [
   // terminal and must never be dialled again; this is a fault we own and the
   // candidate is owed the call they never got.
   'consent.failed',
+  // M009 C1 (0114): a RECONNECT/redial leg answered into a session whose
+  // consent is ALREADY durable (the plan exists, the session is in_progress).
+  // The worker short-circuits the gate and says so; the ledger moves the
+  // engagement dialing -> in_call and bumps the epoch only when that consent
+  // is live, engagement-owned and planned, and only from source `internal`.
+  // It is NOT consent: it starts no recording (the leg was already recording
+  // from `call.answered`) and it is not a purge trigger.
+  'consent.resumed',
+  // M009 C2 (0114): the candidate asked for a callback mid-interview and the
+  // booking could not be made. The ledger ends the attempt uncharged
+  // (`callback_deferred`) and makes the engagement eligible at the next IST
+  // window. It starts no recording and is not a purge trigger.
+  'callback.deferred_in_call',
   'sip.participant_left',
   'assessment.completed',
   'assessment.aborted',
@@ -2039,6 +2052,18 @@ export function createPhoneWorkerRouter(deps: PhoneWorkerRouterDeps = {}): Route
         // slot. Finalize their own object first; the old session finalizer is a
         // compatibility pass for consented calls only.
         status = await deps.finalizeAttemptRecording(parsed.data.attempt_id, parsed.data.session_id);
+        if (status !== 'ready') {
+          // M009 C9-2: the attempt-first miss behind 9f43090e/76b3793c is
+          // unproven. Record WHICH non-ready status it was (a bounded code, no
+          // ids). Nothing else changes here: the `recording.finalize` job
+          // (0038 trigger / sweeper) now links the attempt best-effort when it
+          // links the session, and the sweeper's attempt-link pass re-drives
+          // an attempt left behind an already-linked session.
+          phoneWorkerLog.warn('unknown_event', {
+            schema: 'recording_complete_attempt',
+            error_category: `attempt_finalize:${status}`,
+          });
+        }
         if (status === 'ready') {
           let sessionStatus: 'ready' | 'fallback_required' | 'pending' = 'fallback_required';
           try {

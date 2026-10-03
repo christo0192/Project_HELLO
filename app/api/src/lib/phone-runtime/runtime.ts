@@ -71,6 +71,7 @@ import {
   createPhoneStores,
   isPhoneRuntimeActive,
   loadPhoneScreeningConfig,
+  PHONE_SYSTEM_ACTOR,
   type PhoneScreeningConfig,
   type PhoneStores,
 } from '../phone-screening/index.js';
@@ -102,6 +103,7 @@ import {
   PHONE_ASSESSMENT_QUEUE,
   phoneAssessmentDedupKey,
   describePhoneRuntimeConfig,
+  loadPhoneDueStarvationAlertSec,
   loadPhoneRuntimeConfig,
   type PhoneRuntimeConfig,
 } from './config.js';
@@ -115,9 +117,11 @@ import {
 } from './read.js';
 import { createPhoneRoomClients } from './livekit-clients.js';
 import {
+  createPhoneDueStarvationTracker,
   phoneDueDiagSummary,
   runPhoneDuePass,
   type PhoneDueResult,
+  type PhoneDueStarvationState,
   type PhoneSessionPort,
 } from './due-loop.js';
 
@@ -131,6 +135,17 @@ export interface PhoneRuntimeOptions {
   readonly reader?: PhoneRuntimeReader;
   readonly stores?: PhoneStores;
   readonly scheduler?: { readonly random?: () => number };
+  /**
+   * 0114 (C10d). The starvation alert threshold in seconds. Defaults to
+   * `PHONE_DUE_STARVATION_ALERT_SEC` (1800, clamped 300..21600).
+   */
+  readonly starvationAlertSec?: number;
+  /**
+   * 0114 (C10d). The clock the starvation tracker measures episodes with, in
+   * epoch ms. Defaults to the host clock; injected so a test can drive an
+   * episode across its threshold without waiting half an hour.
+   */
+  readonly starvationClock?: () => number;
 }
 
 export interface PhoneRuntimeSnapshot {
@@ -185,6 +200,12 @@ export interface PhoneRuntimeSnapshot {
    * a healthy idle one.
    */
   readonly sweepNotOk: Readonly<Record<string, boolean>>;
+  /**
+   * 0114 (C10d). The due-loop starvation episode, as this process observed it.
+   * Optional so hand-built snapshots (test doubles) stay valid; the real
+   * runtime always carries it.
+   */
+  readonly dueStarvation?: PhoneDueStarvationState;
 }
 
 export interface PhoneRuntimeHandle {
@@ -256,6 +277,46 @@ export interface PhoneSessionUnavailable {
   readonly engagementId: string;
   /** A five-character SQLSTATE, only when the driver reported one. */
   readonly pgCode?: string;
+}
+
+/**
+ * 0114 — a coverage figure for the partial-finalize log tag: an integer in
+ * [-1, 999], with -1 meaning unknown. Bounded so the composite tag can never
+ * outgrow the logger's 64-character SAFE_IDENT cap (a value that overflows is
+ * dropped whole, taking every other signal in the tag with it).
+ */
+export function boundedCount(value: number | null): number {
+  if (value === null || !Number.isFinite(value) || value < 0) return -1;
+  return Math.min(Math.trunc(value), 999);
+}
+
+/**
+ * 0114 (C5) — the one `phone_expire_sweep` count line for an expiry pass, or
+ * `null` when there is nothing to say (a non-`ok` answer, or every count 0).
+ *
+ * Counts only: no engagement, appointment, candidate or session id, no phone,
+ * no name, no room. Each count is clamped by `boundedCount` to [-1, 999]
+ * (-1 = the key was absent, e.g. a pre-0114 database answering without
+ * `held`/`released`), so the worst case
+ * `phone_expire_sweep:x999:h999:r999` is 34 characters, well under the
+ * logger's 64-character SAFE_IDENT cap, and can never reach the logger's
+ * ten-consecutive-digit phone guard.
+ */
+export function phoneExpireSweepMeta(result: {
+  readonly status: string;
+  readonly expired?: number;
+  readonly held?: number;
+  readonly released?: number;
+}): { error_type: 'phone_expire_sweep'; error_category: string } | null {
+  if (result.status !== 'ok') return null;
+  const expired = boundedCount(result.expired ?? null);
+  const held = boundedCount(result.held ?? null);
+  const released = boundedCount(result.released ?? null);
+  if (expired <= 0 && held <= 0 && released <= 0) return null;
+  return {
+    error_type: 'phone_expire_sweep',
+    error_category: `phone_expire_sweep:x${expired}:h${held}:r${released}`,
+  };
 }
 
 const LOG_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -599,6 +660,11 @@ export function createPhoneRuntime(
 
   const dialJobOutcomes: Record<string, number> = {};
   let lastDue: PhoneDueResult | null = null;
+  // 0114 (C10d). A pass that answers `ok`, examines rows and can dial none
+  // for a machinery reason is STARVING; see `PHONE_DUE_CODE_CLASS`.
+  const starvationAlertSec = options.starvationAlertSec ?? loadPhoneDueStarvationAlertSec();
+  const starvation = createPhoneDueStarvationTracker(starvationAlertSec);
+  const starvationNow = options.starvationClock ?? ((): number => Date.now());
   let lastReclaimed: number | null = null;
   let lastExpired: number | null = null;
   let lastReconciled: number | null = null;
@@ -615,6 +681,10 @@ export function createPhoneRuntime(
   // that can finally be released.
   let lastOrphanExpired: number | null = null;
   let lastStranded: number | null = null;
+  // 0114 (C2-P5): the late_superseded count last WARNED. The sweep recomputes
+  // it on every pass and the operator cannot clear it (the row is terminal
+  // and a newer cycle exists), so the warn fires only when the count changes.
+  let lastLateSupersededWarned = 0;
   // 0071 / X5b: sessions driven terminal so a crashed call's recording could
   // finalize. Kept apart from `stranded` (0045), which resolves the opposite
   // shape — an engagement pointing at an already-terminal session.
@@ -873,6 +943,68 @@ export function createPhoneRuntime(
           { now, limit: runtimeConfig.dueLimit },
         );
         lastDue = result;
+        // ── 0114 (C10d): THE STARVATION ALARM ───────────────────────
+        // Observed on EVERY completed pass (a throw never reaches here and
+        // changes nothing). Lines carry codes from the closed vocabulary and
+        // integers only — never a row, an id or a number.
+        try {
+          const transition = starvation.observe(result, starvationNow());
+          const state = starvation.state();
+          if (transition.warn) {
+            logger.warn('unknown_event', {
+              error_type: 'phone_due_starved',
+              error_category: 'phone_due_starvation',
+              duration_sec: transition.episodeSec,
+            });
+            for (const code of state.codes) {
+              logger.warn('unknown_event', {
+                error_type: 'phone_due_starved_code',
+                error_category: code,
+              });
+            }
+          }
+          if (transition.cleared) {
+            logger.info('unknown_event', {
+              error_type: 'phone_due_starvation_cleared',
+              error_category: 'phone_due_starvation',
+            });
+          }
+          if (transition.alarmRaised) {
+            // ONE durable row per episode, FAIL-OPEN: an audit outage must
+            // never disturb the due pass. `phone_due_starved` is in 0114's
+            // chk_audit_action.
+            try {
+              const { error } = await client.from('audit_events').insert({
+                actor_id: PHONE_SYSTEM_ACTOR,
+                actor_type: 'system',
+                action: 'phone_due_starved',
+                target_type: 'phone_runtime',
+                target_id: 'phone-due',
+                result: 'failure',
+                metadata: {
+                  codes: [...state.codes],
+                  episode_sec: transition.episodeSec,
+                  alert_sec: starvationAlertSec,
+                  examined: result.examined,
+                  offered: result.offered,
+                },
+              });
+              if (error) {
+                logger.warn('unknown_event', {
+                  error_type: 'phone_due_starved_audit_failed',
+                  error_category: 'phone_due_starvation',
+                });
+              }
+            } catch {
+              logger.warn('unknown_event', {
+                error_type: 'phone_due_starved_audit_failed',
+                error_category: 'phone_due_starvation',
+              });
+            }
+          }
+        } catch {
+          // The alarm is observability; it must never affect the tick.
+        }
         // ── TEMP DIAG (revert after diagnosis) ──────────────────────
         // Bounded, PII-free dial-decision telemetry for the owner test
         // gate that is not being originated. Emits only on interesting
@@ -1024,7 +1156,14 @@ export function createPhoneRuntime(
         });
         sweepNotOk.expire = expired.status !== 'ok';
         lastExpired = expired.status === 'ok' ? (expired.expired ?? 0) : null;
-        return (lastExpired ?? 0) > 0;
+        // 0114 (C5): slots held across an operator halt and wedged engagements
+        // released are now decided by the same RPC. One bounded, count-only,
+        // PII-free line per pass that did anything.
+        const sweepMeta = phoneExpireSweepMeta(expired);
+        if (sweepMeta) logger.info('unknown_event', sweepMeta);
+        // A released engagement is work done, exactly as an expiry is.
+        return (lastExpired ?? 0) > 0
+          || (expired.status === 'ok' && (expired.released ?? 0) > 0);
       },
     },
     {
@@ -1167,9 +1306,30 @@ export function createPhoneRuntime(
           now: new Date(),
         });
         sweepNotOk.stranded = resolved.status !== 'ok';
+        // 0114 (C2-P5): a `failed/assessment_aborted` engagement whose score
+        // landed after the sweep's own abort is completed late by the same
+        // RPC. It is a stranded engagement resolved, so it is counted with
+        // the other two.
         lastStranded = resolved.status === 'ok'
-          ? (resolved.completed ?? 0) + (resolved.failed ?? 0)
+          ? (resolved.completed ?? 0) + (resolved.failed ?? 0) + (resolved.lateCompleted ?? 0)
           : null;
+        // A late score on an engagement a NEWER cycle superseded is left
+        // failed for the operator: completing the old cycle would contradict
+        // the new one. Count only — no engagement, session or candidate id.
+        // The count is a STANDING fact (recomputed every pass, never cleared
+        // by the sweep), so it warns once per change of value, not on every
+        // tick: a non-ok pass leaves the latch alone, and a return to 0
+        // re-arms it so a new superseded row warns again.
+        if (resolved.status === 'ok') {
+          const superseded = resolved.lateSuperseded ?? 0;
+          if (superseded > 0 && superseded !== lastLateSupersededWarned) {
+            logger.warn('unknown_event', {
+              error_type: 'phone_late_score_superseded',
+              error_category: `phone_stranded:late_superseded.${Math.min(superseded, 9999)}`,
+            });
+          }
+          lastLateSupersededWarned = superseded;
+        }
         return resolved.status === 'ok' ? HOLD_BASE_CADENCE : ALLOW_IDLE_BACKOFF;
       },
     },
@@ -1297,7 +1457,16 @@ export function createPhoneRuntime(
           // skip does NOT reintroduce the starvation described above. The
           // assessment handler re-checks the same predicate before score() as
           // a belt (it also covers jobs queued before this deploy).
-          if (!s.callbackBooked) {
+          //
+          // 0114 (C2) widens that exception to every leg
+          // `phone_attempt_score_suppression` withholds: a booked callback, an
+          // in-call callback deferral, or a worker-declared abort. Each is a
+          // leg that ended WITHOUT a screening, so scoring it would publish a
+          // verdict on an interview that never finished. The RPC completed the
+          // session anyway (the MP3 finalizes) and its expired arm no longer
+          // re-selects it, so the skip still cannot starve the window. The
+          // handler checks the same function before score().
+          if (!s.callbackBooked && !s.scoreSuppressed) {
             try {
               await queue.enqueue(
                 PHONE_ASSESSMENT_QUEUE,
@@ -1322,20 +1491,26 @@ export function createPhoneRuntime(
           // SAFE_IDENT-shaped composite category (max 64 chars, no PII): e.g.
           // `phone_partial_finalize:c3:t5:mp3.1:sc.0`. `error_type` carries the
           // disconnect reason. No transcript, no candidate data, no session id.
-          const cov = s.covered ?? -1;
-          const tot = s.total ?? -1;
+          const cov = boundedCount(s.covered);
+          const tot = boundedCount(s.total);
           logger.info('unknown_event', {
             // `ns.1` is 0095's addition and the one the owner asked to be able
             // to see: this call never reached a question, so it was NOT
             // scored and the engagement was released for a redial. Still
             // bounded and SAFE_IDENT-shaped, still no PII. `cb.1` (0113, E4)
             // marks a confirmed-callback leg: finalized, deliberately NOT
-            // queued for scoring. The worst realistic tag
-            // (`...:c-1:t-1:mp3.1:sc.1:ns.1:cb.1`) is 51 chars, under the 64 cap.
+            // queued for scoring. `ss.1` (0114, C2) marks any score-suppressed
+            // leg (callback booked, callback deferred, worker abort); the
+            // reason itself is not spliced in, so the tag stays bounded.
+            // Coverage is clamped to [-1, 999] so the tag cannot grow with
+            // the data: the worst case
+            // (`phone_partial_finalize:c999:t999:mp3.1:sc.1:ns.1:cb.1:ss.1`)
+            // is 59 chars, under the 64 cap.
             error_category:
               `phone_partial_finalize:c${cov}:t${tot}` +
               `:mp3.${s.recordingPresent ? 1 : 0}:sc.${s.assessmentPresent ? 1 : 0}` +
-              `:ns.${s.neverStarted ? 1 : 0}:cb.${s.callbackBooked ? 1 : 0}`,
+              `:ns.${s.neverStarted ? 1 : 0}:cb.${s.callbackBooked ? 1 : 0}` +
+              `:ss.${s.scoreSuppressed ? 1 : 0}`,
             error_type: s.disconnectReason,
           });
         }
@@ -1426,6 +1601,7 @@ export function createPhoneRuntime(
       lastRecStranded,
       lastPartialFinalized,
       sweepNotOk: { ...sweepNotOk },
+      dueStarvation: starvation.state(),
     }),
     async tickAll(): Promise<void> {
       await runner.tick();

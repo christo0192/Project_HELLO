@@ -425,18 +425,30 @@ export type ApplyPhoneEventStatus = (typeof APPLY_PHONE_EVENT_STATUSES)[number];
  * real and HR can see it, but the engagement's prerequisites are unmet so
  * nothing will dial it. Collapsing it into `ok` would let a caller believe a
  * call is going to happen at that time.
+ *
+ * 0114 (C5) adds two refusals, both evaluated under the engagement lock and
+ * BEFORE any supersede, so a refused reschedule leaves the old slot live:
+ *   * `slot_not_yet_eligible` — the slot starts before the engagement's own
+ *     `next_eligible_at` (admission's `not_yet_eligible`), so nothing could
+ *     ever dial it;
+ *   * `daily_attempt_exists` — the slot's IST date already holds admission's
+ *     per-day cap of counted dials.
+ * Neither is new to the union: `confirm_candidate_voice_callback` already
+ * answers both, so `PHONE_RPC_STATUS_COUNT` does not move.
  */
 export const SCHEDULE_PHONE_APPOINTMENT_STATUSES = [
   'ok',
   'ok_prereqs_pending',
   'appointment_exists',
   'attempt_in_flight',
+  'daily_attempt_exists',
   'engagement_terminal',
   'invalid_slot',
   'invalid_source',
   'not_found',
   'slot_duration_invalid',
   'slot_in_past',
+  'slot_not_yet_eligible',
   'slot_straddles_ist_midnight',
   'version_conflict',
   'window_closed',
@@ -475,8 +487,14 @@ export type SetPhoneHaltStatus = (typeof SET_PHONE_HALT_STATUSES)[number];
  * `clear_phone_halt` — a MISSING control singleton answers `halt_unreadable`
  * rather than inventing a cleared one, because inventing it would turn a
  * fail-closed stop into a go.
+ *
+ * 0114 (C10b) adds `actor_required`: a NULL actor is refused as the FIRST
+ * statement, before any read or write, because resuming calls to people must
+ * be attributable. Already a member of the union (request_phone_rescreen and
+ * arm_phone_test_gate answer it), so `PHONE_RPC_STATUS_COUNT` does not move.
+ * `/halt/clear` always passes the admin's id, so the route maps it to a 500.
  */
-export const CLEAR_PHONE_HALT_STATUSES = ['ok', 'halt_unreadable'] as const;
+export const CLEAR_PHONE_HALT_STATUSES = ['ok', 'actor_required', 'halt_unreadable'] as const;
 
 export type ClearPhoneHaltStatus = (typeof CLEAR_PHONE_HALT_STATUSES)[number];
 
@@ -939,6 +957,9 @@ export const PHONE_RPC_RESULT_KEYS: Readonly<Record<string, readonly string[]>> 
     'superseded_appointment_id',
   ],
   cancel_phone_appointment: ['appointment_id', 'version'],
+  // 0114 (C5). `held` and `released` are counts the runtime logs; pinned so a
+  // rename is caught here rather than read as "nothing held" for ever.
+  expire_phone_appointments: ['expired', 'held', 'released'],
   // 0110. `halt_reason` is the reason IN FORCE after the call — the most
   // restrictive one requested while halted, never the first one. It is
   // load-bearing in the fail-open direction: `/halt` reports it to the
@@ -988,7 +1009,17 @@ export const PHONE_RPC_RESULT_KEYS: Readonly<Record<string, readonly string[]>> 
     'plan_complete',
     'expected_key',
   ],
-  request_phone_rescreen: ['engagement_id', 'cycle_number', 'predecessor_engagement_id', 'request_id'],
+  // 0114 (C6). `prerequisite_status` is ensure_ashby_phone_engagement's answer
+  // for the child. The owner test gate refuses to arm on it (409
+  // phone_test_gate_prereqs_unmet), so a rename would read as "unknown" and
+  // silently skip that refusal.
+  request_phone_rescreen: [
+    'engagement_id',
+    'cycle_number',
+    'predecessor_engagement_id',
+    'request_id',
+    'prerequisite_status',
+  ],
   arm_phone_test_gate: ['gate_id', 'candidate_id', 'engagement_id', 'expires_at'],
 });
 
@@ -1016,3 +1047,131 @@ export function narrowPhoneRpcStatus<T extends string>(
     ? (raw as T)
     : PHONE_RPC_UNKNOWN_STATUS;
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// 0114 §3 (C2) — outcome-consistency RPCs OUTSIDE the store-layer contract
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Registered HERE (names, parameter names in order, answers) but deliberately
+// NOT in `PHONE_RPC_NAMES`: that list is in bijection with the
+// `phone-screening/stores.ts` adapters (`phone-screening-stores.test.ts` pins
+// `attempts.toHaveLength(PHONE_RPC_NAMES.length)`), and neither of these has a
+// store adapter.
+//   * `phone_attempt_score_suppression` is called directly by the assessment
+//     handler (`phone-runtime/assessment-handler.ts`) and from SQL by
+//     partial-finalize. It returns a bare `text` (a reason or NULL), not a
+//     status envelope, so it has no status vocabulary to narrow.
+//   * `complete_phone_engagement_after_late_score` is called only from SQL, by
+//     `sweep_phone_stranded_sessions`' late-completion loop.
+// `phone-0114-outcome.test.ts` asserts every entry below against the 0114
+// signatures and bodies, so a rename still cannot land unnoticed.
+
+/** 0114 §3 RPCs that have no store adapter, with their exact parameter names. */
+export const PHONE_OUTCOME_RPC_PARAMETERS = Object.freeze({
+  phone_attempt_score_suppression: ['p_attempt_id'],
+  complete_phone_engagement_after_late_score: ['p_engagement_id', 'p_now'],
+} as const satisfies Record<string, readonly string[]>);
+
+export type PhoneOutcomeRpcName = keyof typeof PHONE_OUTCOME_RPC_PARAMETERS;
+
+/**
+ * `phone_attempt_score_suppression` — every NON-NULL answer (NULL = score it).
+ * Mirrors `PHONE_SCORE_SUPPRESS_REASONS` in vocabulary.ts; the 0114 test pins
+ * both against the function body.
+ */
+export const PHONE_ATTEMPT_SCORE_SUPPRESSION_RESULTS = [
+  'callback_booked',
+  'callback_deferred',
+  'worker_aborted',
+] as const;
+
+/** `complete_phone_engagement_after_late_score` — relabelled, or refused. */
+export const COMPLETE_PHONE_ENGAGEMENT_AFTER_LATE_SCORE_STATUSES = [
+  'completed',
+  'not_eligible',
+] as const;
+export type CompletePhoneEngagementAfterLateScoreStatus =
+  (typeof COMPLETE_PHONE_ENGAGEMENT_AFTER_LATE_SCORE_STATUSES)[number];
+
+// ═══════════════════════════════════════════════════════════════════════
+// 0114 §6 (C8) — person-identity guards, OUTSIDE the store-layer contract
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Registered here for the same reason as the §3 block above: none of these
+// has a `phone-screening/stores.ts` adapter, so adding them to
+// `PHONE_RPC_NAMES` would break the store bijection.
+//   * `release_phone_identity_hold` is called directly by
+//     `POST /candidates/:id/phone/release-duplicate-hold`.
+//   * `schedule_candidate_phone_appointment` (0058, redeclared in 0114 §6) is
+//     called directly by `POST /candidates/:id/phone-appointments`; its full
+//     vocabulary is pinned here because 0114 gives it a new answer,
+//     `duplicate_application`.
+// `phone-0114-identity-api.test.ts` asserts every entry below against the 0114
+// signatures and bodies, so a rename or a new status cannot land unnoticed.
+
+/**
+ * The status `ensure_ashby_phone_engagement` (and, through it,
+ * `request_candidate_phone_call` and `schedule_candidate_phone_appointment`)
+ * answers when the engagement is HELD as a same-role duplicate application:
+ * still `pending_prereqs`, `state_reason = 'duplicate_application'`, and never
+ * dialled until an operator releases it. The other candidate row is never
+ * named — only this engagement's own id travels with the status.
+ */
+export const PHONE_DUPLICATE_APPLICATION_STATUS = 'duplicate_application' as const;
+
+/** 0114 §6 RPCs that have no store adapter, with their exact parameter names. */
+export const PHONE_IDENTITY_RPC_PARAMETERS = Object.freeze({
+  release_phone_identity_hold: ['p_engagement_id', 'p_actor_id', 'p_now'],
+  schedule_candidate_phone_appointment: [
+    'p_candidate_id', 'p_starts_at', 'p_ends_at', 'p_actor_id', 'p_now',
+  ],
+} as const satisfies Record<string, readonly string[]>);
+
+export type PhoneIdentityRpcName = keyof typeof PHONE_IDENTITY_RPC_PARAMETERS;
+
+/**
+ * `release_phone_identity_hold` (0114 §6). `ok` released the hold and re-ran
+ * the prerequisite evaluator (its answer is the `prerequisite_status` key);
+ * `not_held` means the engagement is not `pending_prereqs/duplicate_application`
+ * right now (already released, moved on, or never held) — a benign conflict,
+ * never a write.
+ */
+export const RELEASE_PHONE_IDENTITY_HOLD_STATUSES = [
+  'ok',
+  'actor_required',
+  'invalid_request',
+  'not_found',
+  'not_held',
+] as const;
+export type ReleasePhoneIdentityHoldStatus =
+  (typeof RELEASE_PHONE_IDENTITY_HOLD_STATUSES)[number];
+
+/** Result keys the release route reads. Pinned against the 0114 body. */
+export const RELEASE_PHONE_IDENTITY_HOLD_RESULT_KEYS = [
+  'engagement_id',
+  'prerequisite_status',
+  'state',
+] as const;
+
+/**
+ * `schedule_candidate_phone_appointment` — its own resolution refusals, plus
+ * `duplicate_application` (0114 §6), plus everything the delegated
+ * `schedule_phone_appointment` can answer (it returns that RPC's body
+ * verbatim, merged with `engagement_id`).
+ */
+export const SCHEDULE_CANDIDATE_PHONE_APPOINTMENT_OWN_STATUSES = [
+  'invalid_request',
+  'application_not_found',
+  'candidate_not_found',
+  PHONE_DUPLICATE_APPLICATION_STATUS,
+  'rescreen_required',
+  'application_not_live',
+  'prerequisites_unavailable',
+] as const;
+
+export const SCHEDULE_CANDIDATE_PHONE_APPOINTMENT_STATUSES: readonly string[] = Object.freeze(
+  Array.from(new Set<string>([
+    ...SCHEDULE_CANDIDATE_PHONE_APPOINTMENT_OWN_STATUSES,
+    ...SCHEDULE_PHONE_APPOINTMENT_STATUSES,
+  ])),
+);

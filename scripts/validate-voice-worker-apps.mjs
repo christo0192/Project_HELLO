@@ -59,6 +59,10 @@
 //      fly.toml (browser) must never carry it. A top-level kill_timeout is
 //      accepted (bare integer seconds, 1..300; >= 90 on the phone app so a
 //      stop drains a live call instead of Fly's 5 s default force-kill).
+//  11. SDK DRAIN BUDGET (C9-1, M009 PR-C). fly.phone.toml must declare
+//      kill_timeout AND PHONE_DRAIN_TIMEOUT_SEC (30..120), and
+//      drain + 2 x PHONE_SHUTDOWN_PROCESS_TIMEOUT (default 90) + 30 must be
+//      <= kill_timeout. fly.toml (browser) must never carry the drain key.
 
 import { readFileSync } from "node:fs";
 import { APPROVED_WORKER_REGIONS, assertPolicyConsistent, checkPrimaryRegion } from "./fly-region-policy.mjs";
@@ -219,6 +223,64 @@ export function checkOrchestrationPosture(label, text, orchestrationOn) {
   return problems;
 }
 
+// ── 5f. SDK drain budget (C9-1, M009 PR-C) ───────────────────────────────
+// The named phone worker sets the LiveKit SDK drain_timeout from
+// PHONE_DRAIN_TIMEOUT_SEC (agent.py `_phone_drain_timeout_sec`). On a stop the
+// SDK waits that long for a live job, THEN sends it a ShutdownRequest and
+// gives the process its shutdown grace. All of it must fit inside Fly's
+// kill_timeout, or the force-kill lands mid-upload and the recording is lost:
+//   drain + 2 x PHONE_SHUTDOWN_PROCESS_TIMEOUT + 30 <= kill_timeout
+// So on the phone app both kill_timeout and PHONE_DRAIN_TIMEOUT_SEC are
+// REQUIRED (absent drain = the SDK's 1800 s default, which no kill_timeout can
+// cover). The worker clamps drain to 30..120 and the shutdown grace to
+// 10..120; the validator demands values inside those clamps rather than
+// reasoning about a clamped value the file does not state. The browser app
+// must not carry PHONE_DRAIN_TIMEOUT_SEC: its options are byte-identical.
+export const PHONE_DRAIN_BUDGET_MARGIN_SEC = 30;
+export const PHONE_SHUTDOWN_PROCESS_TIMEOUT_DEFAULT_SEC = 90;
+const BARE_INT_STR = /^[0-9]+$/;
+/**
+ * Pure check of the phone drain budget, exported for the test. Inputs are the
+ * raw strings from the config (undefined = absent). Returns a list of problems.
+ */
+export function checkPhoneDrainBudget({ killTimeout, drain, shutdown }) {
+  const problems = [];
+  if (killTimeout === undefined) {
+    problems.push("fly.phone.toml must declare a top-level kill_timeout: the drain budget (PHONE_DRAIN_TIMEOUT_SEC + 2 x PHONE_SHUTDOWN_PROCESS_TIMEOUT + 30) has to fit inside it");
+  }
+  if (drain === undefined) {
+    problems.push("fly.phone.toml must set PHONE_DRAIN_TIMEOUT_SEC in [env]; absent, the SDK drains for its 1800 s default and Fly force-kills a live call before its teardown runs");
+  } else if (!BARE_INT_STR.test(drain)) {
+    problems.push(`fly.phone.toml PHONE_DRAIN_TIMEOUT_SEC must be a whole number of seconds (got ${JSON.stringify(drain)})`);
+  } else {
+    const d = Number.parseInt(drain, 10);
+    if (d < 30 || d > 120) {
+      problems.push(`fly.phone.toml PHONE_DRAIN_TIMEOUT_SEC must be within the worker clamp 30..120 (got ${drain})`);
+    }
+  }
+  let shutdownSecs = PHONE_SHUTDOWN_PROCESS_TIMEOUT_DEFAULT_SEC;
+  if (shutdown !== undefined) {
+    if (!BARE_INT_STR.test(shutdown)) {
+      problems.push(`fly.phone.toml PHONE_SHUTDOWN_PROCESS_TIMEOUT must be a whole number of seconds (got ${JSON.stringify(shutdown)})`);
+      shutdownSecs = Number.NaN;
+    } else {
+      shutdownSecs = Number.parseInt(shutdown, 10);
+      if (shutdownSecs < 10 || shutdownSecs > 120) {
+        problems.push(`fly.phone.toml PHONE_SHUTDOWN_PROCESS_TIMEOUT must be within the worker clamp 10..120 (got ${shutdown})`);
+      }
+    }
+  }
+  if (problems.length === 0) {
+    const kill = Number.parseInt(String(killTimeout), 10);
+    const d = Number.parseInt(drain, 10);
+    const need = d + 2 * shutdownSecs + PHONE_DRAIN_BUDGET_MARGIN_SEC;
+    if (!(Number.isFinite(kill) && need <= kill)) {
+      problems.push(`fly.phone.toml drain budget exceeds kill_timeout: PHONE_DRAIN_TIMEOUT_SEC ${d} + 2 x PHONE_SHUTDOWN_PROCESS_TIMEOUT ${shutdownSecs} + ${PHONE_DRAIN_BUDGET_MARGIN_SEC} = ${need} > kill_timeout ${killTimeout}; Fly would force-kill the job before its evidence upload finishes`);
+    }
+  }
+  return problems;
+}
+
 if (isMain) {
 const browser = read("fly.toml");
 const phoneCfg = read("fly.phone.toml");
@@ -321,6 +383,27 @@ for (const [label, text, isPhone] of [["fly.toml", browser, false], ["fly.phone.
   if (isPhone) {
     ok(secs >= 90, `fly.phone.toml kill_timeout must be >= 90 s so a stop drains the phone worker (PHONE_SHUTDOWN_PROCESS_TIMEOUT) instead of force-killing a live call (got ${raw})`);
   }
+}
+
+// ── 5f. SDK drain budget (C9-1); the check itself is checkPhoneDrainBudget above.
+{
+  ok(!hasEnvKey(browser, "PHONE_DRAIN_TIMEOUT_SEC"),
+    "fly.toml (browser) must NOT set PHONE_DRAIN_TIMEOUT_SEC — the SDK drain bound is a phone-worker-only option");
+  const killDeclared = topLevelRawAll(phoneCfg, "kill_timeout");
+  const killTimeout = killDeclared.length === 1 && /^[0-9]+$/.test(killDeclared[0])
+    ? killDeclared[0]
+    : (killDeclared.length === 0 ? undefined : "invalid");
+  // An invalid/duplicate kill_timeout is already reported by 5e; do not
+  // double-report it as "absent" here.
+  if (killTimeout !== "invalid") {
+    for (const problem of checkPhoneDrainBudget({
+      killTimeout,
+      drain: envValue(phoneCfg, "PHONE_DRAIN_TIMEOUT_SEC"),
+      shutdown: envValue(phoneCfg, "PHONE_SHUTDOWN_PROCESS_TIMEOUT"),
+    })) ok(false, problem);
+  }
+  const drainNote = envValue(phoneCfg, "PHONE_DRAIN_TIMEOUT_SEC");
+  notes.push(`phone_drain_timeout_sec=${drainNote === undefined ? "absent" : drainNote}`);
 }
 
 // ── 5c. Deployment region contract (PR104) ───────────────────────────────

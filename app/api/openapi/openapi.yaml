@@ -1249,13 +1249,98 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorBody'
         '409':
-          description: A phone prerequisite refused the request.
+          description: A phone prerequisite refused the request (error phone_request_refused, with the stable status). Since 0114 (C8) a same-role duplicate application answers error duplicate_application instead - the engagement is held in pending_prereqs because the same person already has a live or completed screen for this role on another candidate row, which is never named. POST /api/candidates/{id}/phone/release-duplicate-hold lifts it.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/SimpleError'
         '503':
           description: Phone screening is disabled or unavailable.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+
+  /api/candidates/{id}/phone/release-duplicate-hold:
+    parameters:
+      - name: id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+    post:
+      tags: [candidates, phone]
+      operationId: releaseCandidatePhoneDuplicateHold
+      summary: Release a same-role duplicate-application phone hold (interviewer+)
+      description: 0114 (C8). Same authorization as the manual phone request - interviewers only for candidates they own, admins for any. Requires explicit confirmation. The held engagement is resolved server-side from the candidate (state pending_prereqs, state_reason duplicate_application); the client never names one, and more than one held engagement is refused rather than guessed. The database re-checks the hold under lock, records the release so the engagement is never re-held, writes its own phone_identity_hold_release audit row, and re-runs the prerequisite evaluator. It never creates a call attempt or a queue job. The response carries no phone, email, name or the other candidate row.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [confirm]
+              properties:
+                confirm:
+                  type: boolean
+                  enum: [true]
+      responses:
+        '200':
+          description: The hold was released.
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [ok, status, engagement_id, prerequisite_status]
+                properties:
+                  ok:
+                    type: boolean
+                    enum: [true]
+                  status:
+                    type: string
+                    enum: [released]
+                  engagement_id:
+                    type: string
+                    format: uuid
+                  prerequisite_status:
+                    description: What the prerequisite evaluator answered once the hold was lifted (eligible, scheduled_next_window, or a stable reason the engagement is still pending). A stable code, never PII; null when absent.
+                    type: string
+                    nullable: true
+        '400':
+          description: Confirmation or identifier validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBody'
+        '403':
+          description: The caller has no attributable identity (actor_required).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '404':
+          description: Candidate not found or not visible to this recruiter.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '409':
+          description: Nothing to release (phone_hold_not_held - never held, already released, or moved on) or more than one held engagement (phone_hold_ambiguous).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '500':
+          description: The database answered outside the release vocabulary (phone_rpc_unknown_status).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SimpleError'
+        '503':
+          description: Phone screening is disabled or the release is unavailable.
           content:
             application/json:
               schema:
@@ -1355,7 +1440,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/SimpleError' }
         '409':
-          description: Current cycle or slot policy refused the booking.
+          description: Current cycle or slot policy refused the booking. The error is the RPC's own status, including slot_not_yet_eligible (0114 — the slot starts before the engagement's next_eligible_at) and daily_attempt_exists (0114 — the slot's IST day already holds the per-day dial cap). duplicate_application (0114 C8 - the same person already has a live or completed screen for this role on another candidate row, never named; nothing is booked until the hold is released through POST /api/candidates/{id}/phone/release-duplicate-hold).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/SimpleError' }
@@ -1408,7 +1493,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/SimpleError' }
         '409':
-          description: Version, slot, state, or appointment policy refused the mutation.
+          description: Version, slot, state, or appointment policy refused the mutation, including slot_not_yet_eligible and daily_attempt_exists (0114). Both are decided before any supersede, so a refused reschedule leaves the existing slot live.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/SimpleError' }
@@ -6603,7 +6688,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneApiError'
         '409':
-          description: A substrate refusal, carrying its own status as the error code — invalid_slot, slot_duration_invalid, slot_in_past, window_closed, slot_straddles_ist_midnight, invalid_source, appointment_exists, attempt_in_flight, engagement_terminal or version_conflict.
+          description: A substrate refusal, carrying its own status as the error code — invalid_slot, slot_duration_invalid, slot_in_past, window_closed, slot_straddles_ist_midnight, invalid_source, appointment_exists, attempt_in_flight, engagement_terminal, version_conflict, slot_not_yet_eligible (0114 — the slot starts before the engagement's own next_eligible_at, so admission could never dial it) or daily_attempt_exists (0114 — the slot's IST day already holds the per-day dial cap). The HR channel is refused these two exactly as every other source is.
           content:
             application/json:
               schema:
@@ -6680,7 +6765,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneApiError'
         '409':
-          description: not_live when the addressed appointment is cancelled, superseded, fulfilled or missed, or any schedule refusal including version_conflict. A version_conflict here may also mean the addressed row stopped being live between the pre-read and the RPC — schedule_phone_appointment compares the expected version ONLY when it finds a live appointment, so that race would otherwise turn a reschedule into a silent create. The route detects it (nothing was superseded), undoes the insert, audits the attempt, and reports appointment_rolled_back.
+          description: not_live when the addressed appointment is cancelled, superseded, fulfilled or missed, or any schedule refusal including version_conflict, slot_not_yet_eligible or daily_attempt_exists (0114; both refused before any supersede, so the existing slot stays live). A version_conflict here may also mean the addressed row stopped being live between the pre-read and the RPC — schedule_phone_appointment compares the expected version ONLY when it finds a live appointment, so that race would otherwise turn a reschedule into a silent create. The route detects it (nothing was superseded), undoes the insert, audits the attempt, and reports appointment_rolled_back.
           content:
             application/json:
               schema:
@@ -6888,7 +6973,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/PhoneApiError'
         '500':
-          description: phone_rpc_unknown_status, phone_action_error or phone_audit_write_failed with rolled_back.
+          description: phone_rpc_unknown_status, phone_action_error or phone_audit_write_failed with rolled_back. Also phone_halt_actor_required (0114) - clear_phone_halt refuses a NULL actor before any write, and this admin-only route always passes the caller's id, so reaching it means the server lost the auth context; nothing was cleared.
           content:
             application/json:
               schema:
@@ -7488,6 +7573,37 @@ components:
           description: Stable reason code when not ready (signature-state, capability-failure, scanner_busy, test_scanner, or scanner_not_configured); null when ready.
           type: string
           nullable: true
+        updater:
+          description: 0114 (C10c). The ClamAV signature updater's state as the container supervisor last published it (AV_UPDATER_STATUS_FILE, rewritten atomically after every attempt). PRESENT only when a valid status document was read - absent on a machine with no supervisor, or before the first attempt settles; never a fabricated zero. Counts, ISO instants, an exit status and a closed reason code only.
+          type: object
+          required: [consecutiveFailures, lastSuccessAt, lastAttemptAt, lastExitCode, lastReason]
+          properties:
+            consecutiveFailures:
+              description: Failed attempts since the last success.
+              type: integer
+            lastSuccessAt:
+              type: string
+              format: date-time
+              nullable: true
+            lastAttemptAt:
+              type: string
+              format: date-time
+              nullable: true
+            lastExitCode:
+              description: freshclam's exit status for the last attempt; null for a spawn failure, timeout or signal. Exit 1 ("up to date") counts as a success only when the database on disk was fresh at that moment.
+              type: integer
+              nullable: true
+            lastReason:
+              description: update_failed, update_timeout or updater_unavailable; null after a success.
+              type: string
+              nullable: true
+          additionalProperties: false
+        warnings:
+          description: 0114 (C10c). WARNING-ONLY codes that never change ready or the degradation verdict - scanner_updater_failing (6+ consecutive failed updates, or no success for 6 h) and scanner_signatures_aging (the daily database is 18 h old or more, i.e. hours before the 24 h fail-closed ceiling). Present only when non-empty.
+          type: array
+          items:
+            type: string
+            enum: [scanner_updater_failing, scanner_signatures_aging]
     AshbyRuntimeHealthResponse:
       type: object
       required: [ok, integration, runtime, scanner, provider]
@@ -9211,6 +9327,8 @@ components:
             - candidate.wrong_number
             - candidate.deferred_pre_disclosure
             - consent.failed
+            - consent.resumed
+            - callback.deferred_in_call
             - sip.participant_left
             - assessment.completed
             - assessment.aborted
@@ -12170,7 +12288,7 @@ components:
     PhoneHealthResponse:
       description: Always 200. Degradation is reported in the body. Every count block is NULL rather than zero when the backlog cannot be read, because we could not read it and there is none are different answers and only one of them means everything is fine.
       type: object
-      required: [ok, enabled, status, reasons, config, window, admission, concurrency, engagements_by_state, appointments, ingress, backlog_unavailable, residuals, runtime]
+      required: [ok, enabled, status, reasons, config, window, admission, concurrency, engagements_by_state, appointments, ingress, backlog_unavailable, identity_holds, residuals, runtime]
       properties:
         ok:
           type: boolean
@@ -12180,7 +12298,7 @@ components:
           type: string
           enum: [ok, degraded, disabled]
         reasons:
-          description: Stable codes only — phone_screening_disabled, backlog_unavailable, halt_unreadable, admission_halted, attempt_leases_expired, fleet_at_capacity, appointments_overdue, phone_runtime_stopped, phone_loop_stale, phone_loop_erroring, phone_due_halted, phone_sweep_not_ok, phone_runtime_start_failed.
+          description: Stable codes only — phone_screening_disabled, backlog_unavailable, halt_unreadable, admission_halted, attempt_leases_expired, fleet_at_capacity, appointments_overdue, phone_runtime_stopped, phone_loop_stale, phone_loop_erroring, phone_due_halted, phone_sweep_not_ok, phone_runtime_start_failed, phone_due_starved (0114 - an ok due pass that examined rows and dialled none, for a machinery reason such as no_session, for PHONE_DUE_STARVATION_ALERT_SEC; never while halted).
           type: array
           items:
             type: string
@@ -12211,6 +12329,10 @@ components:
             - $ref: '#/components/schemas/PhoneIngressCounts'
         backlog_unavailable:
           type: boolean
+        identity_holds:
+          description: 0114 (C8). How many non-terminal engagements are held as a same-role duplicate application (pending_prereqs with state_reason duplicate_application) and will not be dialled until a recruiter releases them. A bare count - never which engagement, candidate or line. Not a degradation reason, since a hold is the guard working. Null when phone screening is disabled, the backlog is unavailable, or the count could not be read.
+          type: integer
+          nullable: true
         residuals:
           type: array
           items:
@@ -12280,6 +12402,28 @@ components:
           type: array
           items:
             type: string
+        due_starvation:
+          description: 0114 (C10d). The due-loop starvation episode THIS process observed. A pass is starving when it answered ok, examined at least one row, dialled none, and saw at least one code classified starving (a machinery reason such as no_session, halt_unreadable or originate_failed - never the IST window, a cap, a budget, consent or suppression). An episode ends on any pass that dials, sees nothing starving, or is halted. Process-local and reset by a restart. Present whenever a registered runtime reports it; absent on the unregistered shape. Codes are from the closed due-pass vocabulary only - no row, id or number.
+          type: object
+          required: [starving, since, alarmed, codes]
+          properties:
+            starving:
+              description: The last completed pass was starving.
+              type: boolean
+            since:
+              description: When the current episode's first starving pass was observed; null when not starving.
+              type: string
+              format: date-time
+              nullable: true
+            alarmed:
+              description: The episode has lasted at least PHONE_DUE_STARVATION_ALERT_SEC. True contributes the phone_due_starved degradation reason; one audit row is written per episode.
+              type: boolean
+            codes:
+              description: The starving codes of the last starving pass, sorted.
+              type: array
+              items:
+                type: string
+          additionalProperties: false
         start_failed:
           description: Whether createPhoneRuntime THREW in this process. The ONE field that separates "this process was deliberately not armed" from "arming it FAILED" - the composition root catches the throw, logs phone_runtime_start_failed and leaves phoneRuntime null, so a broken replica and a deliberately-disabled one both report enabled false and the fault was invisible on the surface whose most important question is health truth. A BOOLEAN ONLY, deliberately: it carries nothing about WHY, because the reason stays in the sanitized startup log and a health surface is not where a configuration error gets rendered. True contributes the phone_runtime_start_failed degradation reason - the only reason a disabled process contributes at all, since enabled false is the shipped default and marking every healthy deployment degraded would make the surface useless. Always false when enabled is true, a registered runtime being proof that construction succeeded.
           type: boolean
