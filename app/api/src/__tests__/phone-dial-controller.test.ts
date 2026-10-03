@@ -649,7 +649,10 @@ describe('P5 dial — the lease must be PROVEN to outlive the originate', () => 
     expect(asked.leaseSeconds).toBeGreaterThanOrEqual(REQUIRED);
     expect(asked.attemptId).toBe(ATTEMPT);
     expect(asked.leaseToken).toBe('lease-token-1');
-    expect(asked.now).toBe(NOW);
+    // M009: measured at the CURRENT instant — `request.now` advanced by the
+    // time this dial has spent (wall clock here; milliseconds in a unit run).
+    expect(asked.now.getTime()).toBeGreaterThanOrEqual(NOW.getTime());
+    expect(asked.now.getTime() - NOW.getTime()).toBeLessThan(5_000);
     // The lease is sized to the WORK, not to the configured default.
     expect(asked.leaseSeconds).toBeGreaterThanOrEqual(h.deps.config.leaseSeconds);
 

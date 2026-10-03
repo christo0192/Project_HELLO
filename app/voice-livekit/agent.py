@@ -1565,6 +1565,90 @@ def _phone_worker_orchestrated() -> bool:
     return bool(_phone_agent_name()) and worker_ready_api.worker_orchestration_enabled()
 
 
+# ── E2 (M009): per-machine registration name ─────────────────────────
+# WHY: every phone pool machine used to register under the ONE shared name
+# ("phone-screener"), so LiveKit handed session S's job to ANY idle machine,
+# while every stop path (reaper, terminal-release, orphan sweep) judges a
+# machine by the session it was LEASED for. A machine leased to S but running
+# T's interview was stopped the moment S's room went away — a live call cut
+# off (2026-10-03). Registering as ``<base>-<FLY_MACHINE_ID>`` lets the API
+# dispatch S's job to exactly the machine it leased for S.
+#
+# The machine id shape is pinned against the API's PER_MACHINE_ID_RE
+# (app/api/src/integrations/livekit-phone-dial/agent-name.ts) and the 0112
+# lease-column CHECK by phone-agent-name-cross-language.test.ts, which reads
+# this literal — keep it a single-quoted raw string on one line.
+_PER_MACHINE_ID_RE = re.compile(r'^[0-9a-z]{8,32}$')
+# The COMPOSED name must also satisfy the API's AGENT_NAME_RE / the 0112
+# CHECK: a base the API would reject (too long, odd characters) would turn
+# every ready post into a 400 and every dial into a deferral, so such a base
+# falls back to the shared name instead. Same single-line literal rule.
+_PER_MACHINE_AGENT_NAME_RE = re.compile(r'^[A-Za-z0-9_-]{1,64}-[0-9a-z]{8,32}$')
+
+# Once per process: the fallback is a configuration fault, not a per-call
+# event, and both the parent (build_worker_options) and each prewarmed child
+# resolve the name — one line per process is enough to find it.
+_PHONE_AGENT_NAME_FALLBACK_LOGGED = False
+
+
+def _per_machine_agent_name_flag_on() -> bool:
+    """PHONE_PER_MACHINE_AGENT_NAME, stripped + lowercased, == "true". Read at
+    call time so the default (absent ⇒ off) is observable in a test."""
+    return (os.getenv("PHONE_PER_MACHINE_AGENT_NAME") or "").strip().lower() == "true"
+
+
+def phone_registered_agent_name() -> str:
+    """The name THIS phone worker registers with LiveKit under.
+
+    ``f"{_phone_agent_name()}-{FLY_MACHINE_ID}"`` ONLY when ALL hold:
+      * the orchestrated phone worker (``_phone_worker_orchestrated``) — the
+        API only targets a machine it LEASED, so naming without the lease gate
+        would register a name nothing ever dispatches to;
+      * PHONE_PER_MACHINE_AGENT_NAME == "true" (the worker-side rollout flag;
+        ABSENT in PR-A, flipped in PR-B only once the API stores names);
+      * FLY_MACHINE_ID is a well-formed machine id, and the composed name
+        satisfies the API's stored-name contract.
+    Otherwise the BASE name — byte-identical to the pre-E2 worker.
+
+    The flag-on/invalid-id case deliberately falls back to the base name AND
+    (because the prewarm only reports a name that DIFFERS from the base) posts
+    no ``agent_name``: the API then dispatches to the base name, which is what
+    this worker registered, so the two ends still agree. Failing to the
+    per-machine name instead would register something the API cannot verify.
+
+    ``fullmatch``, not ``match``: Python's ``$`` also matches before a trailing
+    newline, which JavaScript's does not — ``fullmatch`` keeps this helper and
+    the API's regex in exact agreement on every input.
+
+    Used ONLY for ``options["agent_name"]`` on the phone path and for the
+    prewarm ready post. ``_phone_agent_name()`` stays the BASE name for
+    phone-mode detection and room ownership, which must not depend on which
+    machine a worker runs on."""
+    global _PHONE_AGENT_NAME_FALLBACK_LOGGED
+    base = _phone_agent_name()
+    if not (_phone_worker_orchestrated() and _per_machine_agent_name_flag_on()):
+        return base
+    machine_id = os.getenv("FLY_MACHINE_ID") or ""
+    if not machine_id:
+        category = "machine_id_missing"
+    elif not _PER_MACHINE_ID_RE.fullmatch(machine_id):
+        category = "machine_id_invalid"
+    else:
+        registered = f"{base}-{machine_id}"
+        if _PER_MACHINE_AGENT_NAME_RE.fullmatch(registered):
+            return registered
+        category = "base_name_invalid"
+    if not _PHONE_AGENT_NAME_FALLBACK_LOGGED:
+        _PHONE_AGENT_NAME_FALLBACK_LOGGED = True
+        # Fixed category only — the raw env values are never logged.
+        _log.warn(
+            "unknown_event",
+            error_type="phone_agent_name_fallback",
+            error_category=category,
+        )
+    return base
+
+
 def _prewarm_post_machine_ready(_proc: Any) -> None:
     """WorkerOptions.prewarm_fnc for a NAMED worker under on-demand
     orchestration: post MACHINE-level readiness (design §2.3b B-i for browser,
@@ -1589,8 +1673,18 @@ def _prewarm_post_machine_ready(_proc: Any) -> None:
     raise out of process init (which would fail the warmup)."""
     if not (_browser_worker_named() or _phone_worker_orchestrated()):
         return
+    # E2: report the per-machine registration name ONLY when it differs from
+    # the base — flag off (PR-A as deployed), the browser worker, and the
+    # invalid-machine-id fallback all post exactly {app, machine_id}, so the
+    # body the pre-E2 strict /ready-machine schema accepts is unchanged. The
+    # API stores a reported name on the lease and dispatches to it.
+    ready_kwargs: dict[str, Any] = {}
+    if _phone_worker_orchestrated():
+        registered = phone_registered_agent_name()
+        if registered != _phone_agent_name():
+            ready_kwargs["agent_name"] = registered
     try:
-        asyncio.run(worker_ready_api.post_worker_ready_machine())
+        asyncio.run(worker_ready_api.post_worker_ready_machine(**ready_kwargs))
     except Exception:  # noqa: BLE001
         _log.info(
             "unknown_event",
@@ -1718,7 +1812,11 @@ def build_worker_options() -> WorkerOptions:
             if not judge_config.ok:
                 # Fixed exception: credentials and raw URLs are never included.
                 raise RuntimeError("phone_judge_runtime_config_invalid")
-        options["agent_name"] = agent_name
+        # E2: the REGISTERED name may be per-machine (`<base>-<machine id>`,
+        # behind PHONE_PER_MACHINE_AGENT_NAME under orchestration) so the API
+        # can bind each leased session to its machine. Everything else in this
+        # branch keys off the BASE `agent_name` above; flag off ⇒ the base.
+        options["agent_name"] = phone_registered_agent_name()
         # ── PHONE-PATH RETROFIT: machine-level ready-before-dispatch ─────
         # design §2.3, PR B RISK "dispatch ordering vs cold start". When
         # orchestration is on, the phone worker posts MACHINE-level readiness
@@ -1832,6 +1930,78 @@ async def _wait_for_sip_participant(ctx: JobContext, timeout_sec: float) -> Any:
         if _monotonic() >= deadline:
             return None
         await asyncio.sleep(_PARTICIPANT_POLL_SEC)
+
+
+# ── E3 (M009): A PRE-CONSENT SIP DEPARTURE ENDS THE GATE, TRUTHFULLY ──
+# RCA 2026-10-03. When a ring-out's SIP participant LEAVES, LiveKit RoomIO only
+# closes the AgentSession for CLIENT_INITIATED / ROOM_DELETED / USER_REJECTED
+# (livekit-agents 1.6.4 room_io/types.py). A callee who simply never answers
+# leaves with another reason, so the gate stayed wedged in a playout until the
+# SDK cancelled the entrypoint ~20 s later — and a bare cancel posts NO
+# terminal. The ledger was left holding only `call.answered`, the lease lapsed,
+# the reclaim restored the engagement with a stale `next_eligible_at`, and the
+# candidate was rung again within seconds (0112 adds the server-side hold).
+#
+# The phone entrypoint therefore listens for its OWN SIP participant leaving
+# while the gate is still running and consent is not durable, remembers the
+# reason, and — for the reasons below — schedules the existing GUARDED session
+# close, so the gate ends GATE_PARTICIPANT_LEFT through the path every other
+# SDK close already takes (evidence, then terminal, then room delete). The
+# terminal is then `sip.participant_left`, which the worker is already allowed
+# to post and which 0095 ends uncharged, held to the next IST-day window.
+#
+# NOT SIGNAL_CLOSE / MIGRATION: those are transport events on OUR side, not the
+# callee hanging up, and closing on them early is the egress race described at
+# the "Bounded room residency" note above (EGRESS_ABORTED). Their reason is
+# still RECORDED, so the gate's own exit still names the departure truthfully.
+_PHONE_SIP_LEFT_CLOSE_REASONS: frozenset[str] = frozenset({
+    "USER_UNAVAILABLE", "USER_REJECTED", "SIP_TRUNK_FAILURE",
+    "CLIENT_INITIATED", "UNKNOWN",
+})
+
+
+def _livekit_rtc() -> Any:
+    """The real ``livekit.rtc`` module, or None.
+
+    Imported lazily: CI runs this suite on a bare python image with only an SDK
+    stub, and a module-level import would make ``agent`` unimportable there.
+    A seam, so a test can supply the two enums this lane reads. None means the
+    listener stays INERT (records nothing, closes nothing) — today's behaviour.
+    """
+    try:
+        from livekit import rtc  # noqa: PLC0415 — deliberately lazy
+
+        return rtc
+    except Exception:  # noqa: BLE001 — absent SDK is a supported shape in tests
+        return None
+
+
+def _phone_participant_identity(attempt_id: str) -> str:
+    """This attempt's SIP participant identity.
+
+    Mirrors the API's ``phoneParticipantIdentity`` (livekit-phone-dial/sip.ts):
+    ``phone-<attemptId>``. Keyed by ATTEMPT, not session, so a reconnect leg's
+    worker never mistakes the previous attempt's departing leg for its own.
+    """
+    return f"phone-{attempt_id}"
+
+
+def _sip_disconnect_reason_name(rtc_mod: Any, participant: Any) -> str:
+    """A bounded enum NAME for why the SIP participant left; never raises.
+
+    ``RemoteParticipant.disconnect_reason`` returns None for UNKNOWN_REASON
+    (livekit rtc participant.py), and ``DisconnectReason.Name(None)`` raises —
+    so None is mapped to "UNKNOWN" without ever calling ``Name``. A value the
+    enum does not know becomes "UNMAPPED". Only these fixed names are logged.
+    """
+    try:
+        raw = getattr(participant, "disconnect_reason", None)
+        if raw is None:
+            return "UNKNOWN"
+        name = rtc_mod.DisconnectReason.Name(raw)
+        return str(name) if name else "UNMAPPED"
+    except Exception:  # noqa: BLE001 — a reason we cannot name is still a departure
+        return "UNMAPPED"
 
 
 # ── P4: the default answer classifier ─────────────────────────────────
@@ -9439,6 +9609,9 @@ async def _run_phone_session(
     gate_task_holder: list[asyncio.Task | None] = [None]
     gate_done = asyncio.Event()
     sdk_close_requested = False
+    # E3 (M009): the installed `_guarded_sdk_close`, or None when no guard
+    # could be installed (a test double without `_aclose_impl`).
+    guarded_close_holder: list[Any] = [None]
     room_closed = False
 
     async def _close_room_after_evidence() -> None:
@@ -9485,10 +9658,18 @@ async def _run_phone_session(
         elif gate_result.outcome in {
             phone.GATE_TIMED_OUT, phone.GATE_PARTICIPANT_LEFT,
         }:
-            event_type = (
-                "assessment.aborted" if gate_lifecycle.get("consent_durable")
-                else "candidate.deferred_pre_disclosure"
-            )
+            # E3 (M009): a pre-consent exit the SIP-departure listener OBSERVED
+            # is named for what it was — the leg left — rather than as a
+            # "call me later" deferral nobody asked for. Same 0095 branch (the
+            # attempt ends uncharged, next IST-day window), different truth in
+            # the ledger. Without an observed departure the label is unchanged,
+            # and a durable consent always keeps `assessment.aborted`.
+            if gate_lifecycle.get("consent_durable"):
+                event_type = "assessment.aborted"
+            elif gate_lifecycle.get("sip_left_reason"):
+                event_type = "sip.participant_left"
+            else:
+                event_type = "candidate.deferred_pre_disclosure"
         elif failure is not None:
             event_type = (
                 "assessment.aborted"
@@ -9685,6 +9866,9 @@ async def _run_phone_session(
             try:
                 setattr(session, "_aclose_impl", _guarded_sdk_close)
                 setattr(session, "_phone_teardown_guarded", True)
+                # E3: the SIP-departure listener may only ever close THROUGH
+                # this guard; it checks the seam still holds this function.
+                guarded_close_holder[0] = _guarded_sdk_close
             except Exception as exc:  # noqa: BLE001 — this bound is load-bearing
                 if _is_real_livekit:
                     raise RuntimeError(
@@ -9804,10 +9988,90 @@ async def _run_phone_session(
             gate_phase_out=gate_lifecycle,
         )
 
-    gate_lifecycle: dict[str, bool] = {}
+    # Boolean phase marks from the gate, plus E3's `sip_left_reason` (a fixed
+    # DisconnectReason NAME, never participant data).
+    gate_lifecycle: dict[str, Any] = {}
     gate_error: BaseException | None = None
     gate_cancelled = False
     result: phone.PhoneGateResult | None = None
+
+    # ── E3 (M009): OUR SIP leg leaving before consent ends the gate now ──
+    # See `_PHONE_SIP_LEFT_CLOSE_REASONS`. Registered here, immediately before
+    # the gate task exists, and removed in the gate's `finally` below — the one
+    # finally every later path (including the lease-halt raise, which skips the
+    # post-gate finally) runs through. Phone entrypoint ONLY: the browser
+    # handler in `entrypoint` and Canary-1 are untouched.
+    sip_left_room = getattr(ctx, "room", None)
+    sip_left_expected_identity = _phone_participant_identity(attempt_id)
+    sip_left_close_tasks: list["asyncio.Future[Any]"] = []
+
+    def _on_phone_participant_disconnected(participant: Any = None, *_: Any) -> None:
+        # Never raises into the room's event emitter.
+        try:
+            rtc_mod = _livekit_rtc()
+            if rtc_mod is None:
+                return
+            if getattr(participant, "identity", None) != sip_left_expected_identity:
+                return
+            sip_kind = getattr(
+                getattr(rtc_mod, "ParticipantKind", None),
+                "PARTICIPANT_KIND_SIP", None,
+            )
+            if sip_kind is None or getattr(participant, "kind", None) != sip_kind:
+                return
+            gate_task = gate_task_holder[0]
+            if gate_task is None or gate_task.done():
+                return
+            if "terminal_posted" in gate_lifecycle:
+                return
+            if gate_lifecycle.get("consent_durable"):
+                # Post-consent departures belong to the screening's own
+                # close path and its `assessment.aborted` / reconnect ledger.
+                return
+            if gate_lifecycle.get("sip_left_reason"):
+                return  # one departure, one decision
+            name = _sip_disconnect_reason_name(rtc_mod, participant)
+            gate_lifecycle["sip_left_reason"] = name
+            will_close = name in _PHONE_SIP_LEFT_CLOSE_REASONS
+            # Fixed category only: the reason is an enum name, the identity
+            # and every `sip.*` attribute stay out of the line.
+            _log.info(
+                "unknown_event", error_type="phone_sip_left_pre_consent",
+                error_category=name,
+                phase="close_scheduled" if will_close else "no_close",
+            )
+            if not will_close:
+                return
+            guarded = guarded_close_holder[0]
+            close = getattr(session, "aclose", None)
+            # ONLY through the installed guard: `aclose()` is the SDK's public
+            # close, which enters `_aclose_impl(reason=USER_INITIATED)` — the
+            # guarded seam that sets `sdk_close_requested` and settles evidence
+            # first. If the guard is not the live seam, close nothing.
+            if (
+                guarded is None or not callable(close)
+                or getattr(session, "_aclose_impl", None) is not guarded
+            ):
+                return
+            task = asyncio.ensure_future(close())
+            sip_left_close_tasks.append(task)
+            task.add_done_callback(_consume_detached_task)
+        except Exception:  # noqa: BLE001 — an observer must never break the call
+            _log.warn(
+                "unknown_event", error_type="phone_sip_left_pre_consent",
+                error_category="handler_failed",
+            )
+
+    sip_left_registered = False
+    _sip_left_room_on = getattr(sip_left_room, "on", None)
+    if callable(_sip_left_room_on):
+        try:
+            _sip_left_room_on(
+                "participant_disconnected", _on_phone_participant_disconnected,
+            )
+            sip_left_registered = True
+        except Exception:  # noqa: BLE001 — fail open: today's behaviour
+            sip_left_registered = False
 
     # ONE catch for every spoken line in the gate. `say` raises
     # `PhoneParticipantGone` when the AgentSession has already closed under it,
@@ -9892,6 +10156,18 @@ async def _run_phone_session(
         # `latest_assistant_anchor` machinery for that job.
         _clear_question_anchor()
         gate_done.set()
+        # E3: the gate is over, so the SIP-departure listener has nothing left
+        # to end. Deregister before any teardown await.
+        if sip_left_registered:
+            _sip_left_room_off = getattr(sip_left_room, "off", None)
+            if callable(_sip_left_room_off):
+                try:
+                    _sip_left_room_off(
+                        "participant_disconnected",
+                        _on_phone_participant_disconnected,
+                    )
+                except Exception:  # noqa: BLE001 — the gate-done check is the backstop
+                    pass
         if gate_cancelled:
             # This raise exits before the post-gate finally exists. Preserve
             # evidence here while leaving terminal ownership to lease/recovery.

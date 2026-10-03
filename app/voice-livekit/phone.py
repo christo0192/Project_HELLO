@@ -5997,8 +5997,13 @@ async def run_phone_gate(
 
     participant = await wait_for_participant()
     if participant is None:
-        # Nothing answered inside the bound. The attempt's outcome belongs to
-        # the dialer's no-answer accounting, not to a worker event.
+        # Nothing joined inside the bound, so the worker posts no event here.
+        # NOTE (M009 E3): outside bounce mode there is NO dialer no-answer
+        # accounting behind this — nothing charges or ends the attempt but the
+        # lease reclaim, which 0112 now holds off a same-minute redial. A leg
+        # that DID join and then left before consent is a different path: the
+        # phone entrypoint's SIP-departure listener ends the gate and posts
+        # `sip.participant_left` (agent.py, `_PHONE_SIP_LEFT_CLOSE_REASONS`).
         _log.info(
             "unknown_event", error_type="phone_gate_outcome",
             schema=GATE_NO_PARTICIPANT,

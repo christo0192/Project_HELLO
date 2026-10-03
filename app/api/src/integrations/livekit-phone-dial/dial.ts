@@ -54,10 +54,27 @@ import {
   type PhoneScreeningConfig,
   type PhoneStores,
 } from '../../lib/phone-screening/index.js';
+// The ONE delay primitive in this directory, and deliberately the PROMISE form:
+// it is awaited inside the agent-join barrier's bounded poll, so it can never
+// outlive the dial that awaits it. That is the property §5 of
+// phone-dial-structural.test.ts protects ("a timer would be a dial that
+// outlives the request"); a detached `setTimeout(` callback is still banned.
+import { setTimeout as delayMs } from 'node:timers/promises';
 import type { DialableNumber } from './dialable-number.js';
 import type { PhoneOriginateResult, PhoneSipClient } from './sip.js';
-import { provisionPhoneRoom, type ProvisionPhoneRoomDeps } from './phone-room.js';
-import { isPhoneTransportReady, type PhoneDialConfig } from './config.js';
+import {
+  phoneRoomName,
+  provisionPhoneRoom,
+  type PhoneRoomParticipantLike,
+  type PhoneRoomServiceClientLike,
+  type ProvisionPhoneRoomDeps,
+} from './phone-room.js';
+import {
+  effectivePhoneAgentJoinTimeoutSec,
+  isPhoneTransportReady,
+  type PhoneDialConfig,
+} from './config.js';
+import { isReportedAgentNameFor } from './agent-name.js';
 
 /**
  * Safety margin between the worst-case originate and the lease. Not a round
@@ -67,6 +84,74 @@ import { isPhoneTransportReady, type PhoneDialConfig } from './config.js';
  * act on it.
  */
 export const LEASE_MARGIN_SECONDS = 15;
+
+/**
+ * M009 E2: how often the agent-join barrier re-reads room membership. Half a
+ * second keeps a warm worker's join (typically 1-3 s after dispatch) from
+ * costing the candidate a noticeable extra pause before the ring, while
+ * bounding the barrier to ~2 LiveKit reads a second for at most the join
+ * timeout.
+ */
+export const PHONE_AGENT_JOIN_POLL_MS = 500;
+
+/**
+ * The longest the worker-ready gate's READY POLL can run: the orchestration
+ * service clamps every `readyTimeoutSec` to at most 120 s
+ * (`MAX_READY_TIMEOUT_MS` in worker-orchestration.ts). A copy, not an import —
+ * that module pulls env and Fly wiring into this one — kept equal to the
+ * source by worker-orchestration-default-lease-reader.test.ts.
+ */
+export const PHONE_WORKER_READY_CEILING_SEC = 120;
+
+/**
+ * The Fly start wait the gate spends BEFORE its ready poll even starts
+ * (`DEFAULT_START_WAIT_SEC` in worker-orchestration.ts, the value the
+ * production service uses). Same copy-plus-parity-test arrangement as above.
+ */
+export const PHONE_WORKER_START_WAIT_CEILING_SEC = 60;
+
+/**
+ * The worst case the whole worker gate can spend before the join barrier
+ * starts: the start wait, THEN the ready poll (the poll's deadline is taken
+ * only after `started`). The barrier sizes its own budget against this
+ * CEILING rather than against whatever the runtime happened to pass, because
+ * the controller cannot see those values and the ceiling is the worst case
+ * the admission lease has to survive. An earlier draft clamped against the
+ * ready ceiling alone and so under-counted a slow cold boot by a minute.
+ */
+export const PHONE_WORKER_GATE_CEILING_SEC =
+  PHONE_WORKER_START_WAIT_CEILING_SEC + PHONE_WORKER_READY_CEILING_SEC;
+
+/**
+ * How many CONSECUTIVE non-`not_found` LiveKit listing failures the join
+ * barrier (and its pre-dispatch snapshot) tolerates before it gives up as
+ * `'unreadable'`. One 429/5xx/transport blip during a dial burst must not cost
+ * a freshly booted machine and a 5-minute infra backoff; a LiveKit that keeps
+ * failing still defers well inside the join budget (3 reads, 500 ms apart).
+ */
+export const PHONE_AGENT_JOIN_MAX_CONSECUTIVE_ERRORS = 3;
+
+/**
+ * The participant attribute the LiveKit Agents SDK stamps on every agent it
+ * joins to a room, carrying the worker's REGISTERED agent name.
+ *
+ * NOTE THE DOT. livekit-agents 1.6.4 (the pinned worker SDK) defines
+ * `ATTRIBUTE_AGENT_NAME = "lk.agent.name"` in `livekit/agents/types.py` and
+ * sets it in `worker.py` on job accept (`participant_attributes[...] =
+ * self._agent_name`); its own `wait_for_agent` matches on the same key. The
+ * similar-looking `lk.agent_name` exists only as a TELEMETRY span attribute in
+ * that SDK and is never set on a participant — matching on it would make every
+ * targeted dial time out and defer. Re-verify this key whenever the worker's
+ * livekit-agents pin moves.
+ */
+export const PHONE_AGENT_NAME_ATTRIBUTE = 'lk.agent.name';
+
+/**
+ * `ParticipantInfo_Kind.AGENT` in @livekit/protocol. The SDK hands it back as
+ * the enum's number; the JSON spelling is accepted too so a client that
+ * serialises enums by name cannot silently turn every join into a timeout.
+ */
+const PARTICIPANT_KIND_AGENT = 4;
 
 export const PHONE_DIAL_REFUSALS = [
   'runtime_disabled',
@@ -157,7 +242,22 @@ export interface PhoneWorkerReadyGate {
      */
     readyTimeoutSec?: number;
   }): Promise<
-    | { status: 'ready'; machineId: string }
+    | {
+        status: 'ready';
+        machineId: string;
+        /**
+         * M009 E2: the LEASE epoch from the read that proved ready — the token
+         * `markBusy` must send on a targeted dispatch. Optional only for
+         * hand-built gates that predate it; a targeted dispatch without one
+         * must not guess.
+         */
+        epoch?: number;
+        /**
+         * M009 E2: the per-machine agent name the worker reported, or null /
+         * absent when it reported none (dispatch the shared name, as today).
+         */
+        agentName?: string | null;
+      }
     | { status: 'no_capacity' }
     | { status: 'timeout' }
     | { status: 'error'; code: string }
@@ -196,7 +296,30 @@ export interface PhoneDialDeps {
    * is on and the runtime wires it — see `runtime.ts`.
    */
   readonly workerGate?: PhoneWorkerReadyGate;
+  /**
+   * M009 E2: the clock the agent-join barrier polls on, and the clock the
+   * post-gate lease checks measure elapsed time on. Test seam only —
+   * production omits it and gets the wall clock plus an awaited delay. Only a
+   * targeted (per-machine) dispatch ever SLEEPS on it; every path reads
+   * `now()` to tell how long the dial has been running.
+   */
+  readonly agentJoinClock?: PhoneAgentJoinClock;
 }
+
+/** The wall-clock seam the agent-join barrier polls on. */
+export interface PhoneAgentJoinClock {
+  /** Milliseconds since the epoch. */
+  now(): number;
+  /** Resolve after `ms`. Awaited — never a detached timer. */
+  sleep(ms: number): Promise<void>;
+}
+
+const WALL_CLOCK: PhoneAgentJoinClock = {
+  now: () => Date.now(),
+  sleep: async (ms) => {
+    await delayMs(ms);
+  },
+};
 
 /**
  * Place one outbound dial, or refuse and touch nothing.
@@ -211,6 +334,28 @@ export async function dialPhoneAttempt(
   deps: PhoneDialDeps,
 ): Promise<PhoneDialResult> {
   const { config, dialConfig } = deps;
+
+  // ── WHAT TIME IT IS *NOW*, not when this dial started ───────────────
+  // `request.now` is taken fresh per dial (due-loop.ts), i.e. BEFORE
+  // admission — and the worker gate (Fly start wait + ready poll) plus the
+  // join barrier can then spend minutes before Gate 5. Measuring the lease
+  // against that instant over-reports what is left (a slow cold boot read
+  // ~240 s remaining with ~40 s actually left), so Gate 5 skipped the renewal
+  // and the reclaimer could take the attempt back mid-ring. Worse,
+  // `heartbeat_phone_attempt` uses `p_now` both for its "still live?" test and
+  // as the base of the new expiry, so a stale `p_now` would renew a lapsed
+  // lease AND renew it short.
+  //
+  // So every post-admission lease decision uses `request.now` ADVANCED by the
+  // time this dial has actually spent, measured on the clock seam (the wall
+  // clock in production). Staying in `request.now`'s frame — rather than
+  // reading the wall clock outright — keeps one time base for admission and
+  // everything after it, and keeps the controller deterministic under a
+  // caller-supplied `now`.
+  const clock = deps.agentJoinClock ?? WALL_CLOCK;
+  const dialStartedMs = clock.now();
+  const currentNow = (): Date =>
+    new Date(request.now.getTime() + Math.max(0, clock.now() - dialStartedMs));
 
   // ── Gate 1: the two flags ───────────────────────────────────────────
   if (!isPhoneRuntimeActive(config)) {
@@ -359,71 +504,33 @@ export async function dialPhoneAttempt(
   // service's own flag-off answer) is treated exactly like an absent gate:
   // proceed exactly as before.
   let gatedMachineId: string | undefined;
-  if (deps.workerGate !== undefined) {
-    const gate = await deps.workerGate.ensureReadyWorker({
-      app: deps.workerGate.app,
-      pipeline: 'phone',
-      sessionId: request.sessionId,
-      epoch,
-      // Gap 4: the runtime supplies env.phoneWorkerReadyTimeoutSec; the service
-      // clamps and defaults it. Undefined here (a hand-built gate) uses the
-      // service default.
-    });
-    if (gate.status === 'ready') {
-      gatedMachineId = gate.machineId;
-    } else if (gate.status !== 'disabled') {
-      // no_capacity | timeout | error — defer, and touch no carrier. No room
-      // was provisioned (we gate BEFORE the dispatch), so there is no room name
-      // to report and no dispatch to undo. The service released any machine it
-      // could PROVE it still held for this attempt, so we do not release here.
-      // (It stops nothing it cannot prove — a claim that moved on belongs to
-      // whoever holds it now, and the reaper is the backstop for the rest.)
-      //
-      // ── Gap 5: SAME-IST-DAY RETRYABILITY ────────────────────────────────
-      // Admission has ALREADY committed this attempt and charged the per-IST-day
-      // index (that happens inside `admit_phone_attempt`, before this gate). A
-      // pre-originate infra defer reached NO carrier, so leaving the attempt
-      // `admitted` would wedge the engagement at `daily_attempt_exists` until
-      // IST midnight for a hiccup the candidate never experienced. So we abandon
-      // it NOW (transition #30, charges nothing) and — via the 0083 narrowed
-      // index — free the same engagement to redial the same IST day. Best-effort
-      // and fail-open: if the abandon RPC is absent (legacy fake) or fails, the
-      // lease-reclaim sweep still recovers the attempt (same-day-retryable under
-      // the same narrowed index), just not as promptly.
-      if (deps.stores.abandonAttemptInfra) {
-        try {
-          // P3: pass the configured backoff so the restore also pushes
-          // next_eligible_at forward — a persistently-broken pool defers once
-          // per window, not once per due tick. The RPC clamps [60,3600] again.
-          await deps.stores.abandonAttemptInfra({
-            attemptId,
-            backoffSeconds: config.infraDeferBackoffSeconds,
-            now: request.now,
-          });
-        } catch {
-          /* fail-open: reclaim sweep backstops the abandonment */
-        }
-      }
-      return {
-        status: 'refused',
-        refusal: 'worker_not_ready',
-        detail: gate.status,
-        attemptId,
-        providerContacted: false,
-      };
-    }
-    // status === 'disabled' falls through: the service's flag is off, so the
-    // gate is inert and the dial proceeds exactly as it does with no gate.
-  }
 
-  // Best-effort release of the worker we gated onto, for the refusal paths
-  // BELOW this point (room-unavailable, lease-too-short, originate-failed). A
-  // claim we made and then declined to use must not sit `busy`/`ready`; the
-  // reaper would stop it within one grace window, but releasing promptly
-  // returns the pool slot now. Declared BEFORE the room provisioning because
-  // the gate now runs first, so a room failure is the earliest point that can
-  // strand a claim. Fail-open: a release failure never changes the refusal we
-  // return. A no-op when no machine was gated (gate off / `disabled`).
+  // ── M009 E2: WHICH AGENT THIS DIAL DISPATCHES TO ─────────────────────
+  // The shared name (`dialConfig.agentName`) unless the gated machine's worker
+  // REPORTED its own per-machine name for this claim, in which case the dial is
+  // bound to that one machine. Every phone worker used to register the shared
+  // name, so LiveKit handed a session's job to ANY idle worker — not the
+  // machine leased for it — and every stop path (reaper, terminal-release,
+  // cleanup), which judges a machine by the session on its lease, then stopped
+  // machines that were running somebody else's interview. A targeted dispatch
+  // makes the lease's session the session the machine actually runs.
+  //
+  // The API never INVENTS a per-machine name: a lease with no reported name
+  // dispatches the shared name, byte-identical to before (and that is every
+  // dial while the worker flag PHONE_PER_MACHINE_AGENT_NAME is off).
+  let targetAgent = dialConfig.agentName;
+  /** The LEASE epoch from the read that proved ready — markBusy's token when targeted. */
+  let leaseEpoch: number | undefined;
+
+  // Best-effort release of the worker we gated onto, for every refusal path
+  // after a `ready` verdict (agent-name mismatch, join barrier, room
+  // unavailable, lease too short, originate failed). A claim we made and then
+  // declined to use must not sit `busy`/`ready`; the reaper would stop it
+  // within one grace window, but releasing promptly returns the pool slot now.
+  // Declared BEFORE the gate's own refusal branches because the M009 name check
+  // can refuse a `ready` verdict. Fail-open: a release failure never changes
+  // the refusal we return. A no-op when no machine was gated (gate off /
+  // `disabled`).
   const releaseGatedWorker = async (): Promise<void> => {
     if (gatedMachineId === undefined || deps.workerGate === undefined) return;
     try {
@@ -437,6 +544,126 @@ export async function dialPhoneAttempt(
     }
   };
 
+  // The ONE infra deferral every pre-originate "no usable worker" path returns:
+  // the gate's own no_capacity/timeout/error AND the M009 targeted-dispatch
+  // refusals (name mismatch, agent never joined). Sharing it is the point —
+  // a targeted dispatch that fails must consume the per-IST-day attempt cap
+  // EXACTLY as a gate timeout always has (abandoned now, charged nothing,
+  // same-day redialable), so `reclaim_phone_attempt_leases` never sees it and
+  // the E3 reclaim redial hold never applies to it.
+  //
+  // ── Gap 5: SAME-IST-DAY RETRYABILITY ────────────────────────────────
+  // Admission has ALREADY committed this attempt and charged the per-IST-day
+  // index (that happens inside `admit_phone_attempt`, before this gate). A
+  // pre-originate infra defer reached NO carrier, so leaving the attempt
+  // `admitted` would wedge the engagement at `daily_attempt_exists` until
+  // IST midnight for a hiccup the candidate never experienced. So we abandon
+  // it NOW (transition #30, charges nothing) and — via the 0083 narrowed
+  // index — free the same engagement to redial the same IST day. Best-effort
+  // and fail-open: if the abandon RPC is absent (legacy fake) or fails, the
+  // lease-reclaim sweep still recovers the attempt (same-day-retryable under
+  // the same narrowed index), just not as promptly.
+  //
+  // `detail` is a closed, PII-free code: the gate's status, or one of the
+  // `agent_*` codes below. No room name is reported, as on the gate path —
+  // for the join-barrier refusals a room may exist, but it holds no SIP leg
+  // and drains on its own empty timeout.
+  const deferWorkerNotReady = async (detail: string): Promise<PhoneDialResult> => {
+    if (deps.stores.abandonAttemptInfra) {
+      try {
+        // P3: pass the configured backoff so the restore also pushes
+        // next_eligible_at forward — a persistently-broken pool defers once
+        // per window, not once per due tick. The RPC clamps [60,3600] again.
+        await deps.stores.abandonAttemptInfra({
+          attemptId,
+          backoffSeconds: config.infraDeferBackoffSeconds,
+          // The backoff runs from when the defer HAPPENED, not from when the
+          // pass began, possibly minutes earlier.
+          now: currentNow(),
+        });
+      } catch {
+        /* fail-open: reclaim sweep backstops the abandonment */
+      }
+    }
+    return {
+      status: 'refused',
+      refusal: 'worker_not_ready',
+      detail,
+      attemptId,
+      providerContacted: false,
+    };
+  };
+
+  if (deps.workerGate !== undefined) {
+    const gate = await deps.workerGate.ensureReadyWorker({
+      app: deps.workerGate.app,
+      pipeline: 'phone',
+      sessionId: request.sessionId,
+      epoch,
+      // Gap 4: the runtime supplies env.phoneWorkerReadyTimeoutSec; the service
+      // clamps and defaults it. Undefined here (a hand-built gate) uses the
+      // service default.
+    });
+    if (gate.status === 'ready') {
+      gatedMachineId = gate.machineId;
+      const reported = gate.agentName ?? null;
+      if (reported !== null) {
+        // A reported name is trusted ONLY if it is exactly `<shared>-<this
+        // lease's machine id>`. Anything else (a name for another machine, a
+        // different base, a malformed value) is NOT downgraded to the shared
+        // name: a worker that registered a per-machine name is not listening
+        // on the shared one, so dispatching the shared name would put the job
+        // on whichever OTHER worker LiveKit picks — the defect this exists to
+        // remove. Defer instead, before any room exists.
+        if (!isReportedAgentNameFor(dialConfig.agentName, gate.machineId, reported)) {
+          await releaseGatedWorker();
+          return deferWorkerNotReady('agent_name_mismatch');
+        }
+        targetAgent = reported;
+        leaseEpoch = gate.epoch;
+      }
+    } else if (gate.status !== 'disabled') {
+      // no_capacity | timeout | error — defer, and touch no carrier. No room
+      // was provisioned (we gate BEFORE the dispatch), so there is no room name
+      // to report and no dispatch to undo. The service released any machine it
+      // could PROVE it still held for this attempt, so we do not release here.
+      // (It stops nothing it cannot prove — a claim that moved on belongs to
+      // whoever holds it now, and the reaper is the backstop for the rest.)
+      return deferWorkerNotReady(gate.status);
+    }
+    // status === 'disabled' falls through: the service's flag is off, so the
+    // gate is inert and the dial proceeds exactly as it does with no gate.
+  }
+
+  // True only when a per-machine name was reported AND verified above. Every
+  // M009 behaviour below (snapshot, join barrier, lease-epoch markBusy) hangs
+  // off this one flag, so the untargeted path is the pre-M009 path verbatim.
+  const targeted = targetAgent !== dialConfig.agentName;
+
+  // ── M009 E2: snapshot the agents ALREADY in the room ────────────────
+  // Taken BEFORE the dispatch, so the join barrier below can tell the agent
+  // THIS dispatch produced from one that was already there. A reconnect adopts
+  // the session's existing room, and that room can still hold the previous
+  // attempt's agent — possibly from this very machine, under this very name.
+  // Counting it as "joined" would originate a SIP leg on the strength of an
+  // agent that is about to leave. A room that does not exist yet (the normal
+  // first dial) is an empty snapshot. Any other read failure means the join
+  // cannot be proven later either, so it defers now, before a room or dispatch
+  // is created.
+  let agentsBefore: ReadonlySet<string> = new Set<string>();
+  if (targeted) {
+    const snapshot = await readAgentIdentities(
+      deps.room.rooms,
+      phoneRoomName(request.sessionId),
+      clock,
+    );
+    if (snapshot === 'unreadable') {
+      await releaseGatedWorker();
+      return deferWorkerNotReady('agent_join_unverifiable');
+    }
+    agentsBefore = snapshot;
+  }
+
   // ── Gate 4: a room to originate into ────────────────────────────────
   // The room is created BEFORE the dial and starts NO egress. A reconnect
   // adopts the existing room, keeping one session and one transcript. Created
@@ -445,7 +672,7 @@ export async function dialPhoneAttempt(
   // is still cold. When the gate is absent (the default), this is exactly the
   // first thing that happens after admission, byte-identical to today.
   const room = await provisionPhoneRoom(
-    { sessionId: request.sessionId, attemptId, epoch, agentName: dialConfig.agentName },
+    { sessionId: request.sessionId, attemptId, epoch, agentName: targetAgent },
     deps.room,
   );
   if (room.status === 'not_configured' || room.status === 'provider_failed') {
@@ -462,10 +689,60 @@ export async function dialPhoneAttempt(
     };
   }
 
+  // ── Gate 4-ter (M009 E2): the TARGETED agent must be IN the room ─────
+  // Before a single ring. "Ready" is a MACHINE-level fact posted at prewarm,
+  // which can land before the worker finishes registering its name with
+  // LiveKit, and a same-session redial can land on a machine still at full
+  // load from the previous leg. A targeted dispatch has exactly ONE worker
+  // that can take it, so if that worker does not show up the room stays
+  // empty — and a candidate dialled into it hears dead air. So the barrier
+  // waits, bounded, for a NEW agent participant (identity not in the snapshot)
+  // carrying the targeted name, and on anything short of that it defers
+  // through the same infra deferral as a gate timeout, after the same cleanup
+  // as a room failure (release the claim; the room itself holds no SIP leg and
+  // drains on its empty timeout). It NEVER originates on this path.
+  //
+  // The untargeted (shared-name) path skips this entirely: no listing, no
+  // wait — byte-identical to before.
+  if (targeted) {
+    // A dispatch that never happened (failed, or no dispatch client) cannot
+    // produce an agent. Waiting out the join timeout for it would only burn
+    // lease; defer now. (The untargeted path keeps its historical behaviour
+    // for this case and is deliberately not changed here.)
+    if (!room.dispatched) {
+      await releaseGatedWorker();
+      return deferWorkerNotReady('agent_dispatch_failed');
+    }
+    const joinTimeoutSec = effectivePhoneAgentJoinTimeoutSec({
+      configuredSec: dialConfig.agentJoinTimeoutSec,
+      originateLeaseSec: config.leaseSeconds,
+      // Start wait + ready poll, not the ready poll alone (see the constant).
+      workerReadyTimeoutSec: PHONE_WORKER_GATE_CEILING_SEC,
+    }).seconds;
+    const joined = await awaitTargetedAgentJoin({
+      rooms: deps.room.rooms,
+      roomName: room.roomName,
+      targetAgent,
+      agentsBefore,
+      timeoutMs: joinTimeoutSec * 1000,
+      clock,
+    });
+    if (joined !== 'joined') {
+      await releaseGatedWorker();
+      return deferWorkerNotReady(
+        joined === 'timeout' ? 'agent_join_timeout' : 'agent_join_unverifiable',
+      );
+    }
+  }
+
   // ── Gate 5: the lease must outlive the originate ────────────────────
+  // Measured at the CURRENT instant (see `currentNow`): after a slow gate and
+  // join the lease may be far shorter than `request.now` suggests, and this is
+  // the last point at which it can be renewed — or found already lapsed
+  // (`lease_lost` ⇒ refuse) — before a carrier is reached.
   const required = dialConfig.originateTimeoutSeconds + LEASE_MARGIN_SECONDS;
   if (!(await leaseOutlivesOriginate(
-    { attemptId, leaseToken, leaseExpiresAt, required, now: request.now },
+    { attemptId, leaseToken, leaseExpiresAt, required, now: currentNow() },
     deps,
   ))) {
     await releaseGatedWorker();
@@ -528,13 +805,33 @@ export async function dialPhoneAttempt(
   // already `ready`, which the reaper spares while the LiveKit room is live. A
   // synthetic rehearsal still marks busy: the lease bookkeeping is about the
   // machine's claim, not about whether a real carrier was reached.
-  if (gatedMachineId !== undefined && deps.workerGate?.markBusy !== undefined) {
+  //
+  // ── M009 E2: WHICH EPOCH ─────────────────────────────────────────────
+  // `mark_voice_worker_busy` CASes on the LEASE epoch (prev+1 per claim,
+  // 0079). The ATTEMPT epoch sent below on the untargeted path can never equal
+  // it, so that call has always been a no-op and the lease has stayed `ready`.
+  //
+  // TARGETED: send the lease epoch, so the lease really reaches `busy`. Now
+  // that the job is bound to this machine, `busy` is TRUE.
+  //
+  // UNTARGETED: deliberately UNCHANGED (still the attempt epoch, still a
+  // no-op). On the shared-name fleet the job may be running on a DIFFERENT
+  // machine; a working `busy` would stop this lease's prewarm heartbeat
+  // refreshes and make the reaper act on it EARLIER — more wrongful stops, not
+  // fewer. A targeted dispatch that somehow lacks a lease epoch sends nothing
+  // rather than guessing a token.
+  const busyEpoch = targeted ? leaseEpoch : epoch;
+  if (
+    gatedMachineId !== undefined
+    && deps.workerGate?.markBusy !== undefined
+    && busyEpoch !== undefined
+  ) {
     try {
       await deps.workerGate.markBusy({
         app: deps.workerGate.app,
         machineId: gatedMachineId,
         sessionId: request.sessionId,
-        epoch,
+        epoch: busyEpoch,
       });
     } catch {
       /* best-effort: the lease is already ready, which the reaper spares */
@@ -600,6 +897,140 @@ async function leaseOutlivesOriginate(
   // claim as "we have enough".
   const renewed = remainingLeaseSeconds(heartbeat.leaseExpiresAt, input.now);
   return renewed !== undefined && renewed >= input.required;
+}
+
+/**
+ * True iff LiveKit's rejection says the ROOM does not exist. Mirrors the
+ * reaper's classifier in worker-orchestration.ts (not imported: that module
+ * pulls env and Fly wiring into this one). A Twirp `not_found`, an HTTP 404,
+ * or the server's literal "requested room does not exist".
+ */
+function isRoomNotFound(err: unknown): boolean {
+  if (err === null || typeof err !== 'object') return false;
+  const e = err as { code?: unknown; status?: unknown; statusCode?: unknown; message?: unknown };
+  if (typeof e.code === 'string' && e.code.toLowerCase() === 'not_found') return true;
+  if (e.status === 404 || e.statusCode === 404) return true;
+  return typeof e.message === 'string' && /requested room does not exist/i.test(e.message);
+}
+
+/** An AGENT-kind participant. A SIP or standard participant never matches. */
+function isAgentParticipant(p: PhoneRoomParticipantLike | null | undefined): boolean {
+  return p !== null
+    && typeof p === 'object'
+    && (p.kind === PARTICIPANT_KIND_AGENT || p.kind === 'AGENT');
+}
+
+/**
+ * List the room once. `not_found` is an EMPTY room (a room that does not exist
+ * holds nobody). A client with no `listParticipants` is `'unsupported'` — a
+ * STRUCTURAL inability no retry will cure. Every other failure, and a
+ * non-array answer, is `'failed'`: possibly transient, and never guessed into
+ * "empty".
+ */
+async function listRoomOnce(
+  rooms: PhoneRoomServiceClientLike,
+  roomName: string,
+): Promise<ReadonlyArray<PhoneRoomParticipantLike> | 'failed' | 'unsupported'> {
+  if (typeof rooms.listParticipants !== 'function') return 'unsupported';
+  try {
+    const listed = await rooms.listParticipants(roomName);
+    return Array.isArray(listed) ? listed : 'failed';
+  } catch (err) {
+    return isRoomNotFound(err) ? [] : 'failed';
+  }
+}
+
+/**
+ * The identities of the AGENT participants currently in `roomName` — the
+ * pre-dispatch snapshot of the join barrier. Only agent identities are kept;
+ * no attribute of any participant is read here.
+ *
+ * A failed listing is retried, one poll interval apart, up to
+ * `PHONE_AGENT_JOIN_MAX_CONSECUTIVE_ERRORS` reads in all: the machine is
+ * already booted and claimed by now, and one LiveKit blip should not throw it
+ * away. Only a client that cannot list at all, or a LiveKit that keeps
+ * failing, is `'unreadable'`.
+ */
+async function readAgentIdentities(
+  rooms: PhoneRoomServiceClientLike,
+  roomName: string,
+  clock: PhoneAgentJoinClock,
+): Promise<ReadonlySet<string> | 'unreadable'> {
+  let listed = await listRoomOnce(rooms, roomName);
+  for (
+    let tries = 1;
+    listed === 'failed' && tries < PHONE_AGENT_JOIN_MAX_CONSECUTIVE_ERRORS;
+    tries += 1
+  ) {
+    await clock.sleep(PHONE_AGENT_JOIN_POLL_MS);
+    listed = await listRoomOnce(rooms, roomName);
+  }
+  if (listed === 'failed' || listed === 'unsupported') return 'unreadable';
+  const out = new Set<string>();
+  for (const p of listed) {
+    if (isAgentParticipant(p) && typeof p.identity === 'string') out.add(p.identity);
+  }
+  return out;
+}
+
+/**
+ * Poll until an agent participant that was NOT in `agentsBefore` appears
+ * carrying `targetAgent` as its registered name, or the budget runs out.
+ *
+ * All three conditions are required, and each closes a distinct false
+ * positive: AGENT kind (the SIP leg or any other participant is not a worker),
+ * a NEW identity (a previous attempt's agent still in an adopted room), and
+ * the EXACT targeted name (an agent from another worker pool or another
+ * machine). The attribute is read only from agent-kind participants.
+ *
+ * `not_found` while polling is read as "not joined yet" (the room is being
+ * created / propagated), never as joined. Any other listing failure is ALSO
+ * "not seen yet" — never "joined" — and polling continues: one 429/5xx during
+ * a burst must not cost a booted machine and a 5-minute backoff. The wait
+ * gives up as `'unreadable'` only when failures become persistent
+ * (`PHONE_AGENT_JOIN_MAX_CONSECUTIVE_ERRORS` in a row), when the client cannot
+ * list at all, or when the budget ran out WITHOUT A SINGLE successful listing
+ * (a join that was never observable cannot be proven, and an unproven join
+ * must not be dialled into). A budget that ran out after at least one good
+ * listing is a plain `'timeout'`. Always performs at least one listing, and
+ * one final listing at the deadline, so a join that landed during the last
+ * sleep is not missed.
+ */
+async function awaitTargetedAgentJoin(input: {
+  rooms: PhoneRoomServiceClientLike;
+  roomName: string;
+  targetAgent: string;
+  agentsBefore: ReadonlySet<string>;
+  timeoutMs: number;
+  clock: PhoneAgentJoinClock;
+}): Promise<'joined' | 'timeout' | 'unreadable'> {
+  const deadline = input.clock.now() + input.timeoutMs;
+  let consecutiveFailures = 0;
+  let anyListingSucceeded = false;
+  for (;;) {
+    const listed = await listRoomOnce(input.rooms, input.roomName);
+    if (listed === 'unsupported') return 'unreadable';
+    if (listed === 'failed') {
+      consecutiveFailures += 1;
+      if (consecutiveFailures >= PHONE_AGENT_JOIN_MAX_CONSECUTIVE_ERRORS) return 'unreadable';
+    } else {
+      consecutiveFailures = 0;
+      anyListingSucceeded = true;
+    }
+    for (const p of listed === 'failed' ? [] : listed) {
+      if (
+        isAgentParticipant(p)
+        && typeof p.identity === 'string'
+        && !input.agentsBefore.has(p.identity)
+        && p.attributes?.[PHONE_AGENT_NAME_ATTRIBUTE] === input.targetAgent
+      ) {
+        return 'joined';
+      }
+    }
+    const remaining = deadline - input.clock.now();
+    if (!(remaining > 0)) return anyListingSucceeded ? 'timeout' : 'unreadable';
+    await input.clock.sleep(Math.min(PHONE_AGENT_JOIN_POLL_MS, remaining));
+  }
 }
 
 /** Seconds of lease left, or `undefined` when the value is unusable. */

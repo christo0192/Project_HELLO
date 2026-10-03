@@ -521,6 +521,44 @@ function analyzeMigrations(files) {
                 'i',
               ).exec(sql);
               return m !== null && dropIdxPos >= 0 && m.index > dropIdxPos;
+            })())
+          // 0112 (E1) narrows 0107's one-session-per-engagement UNIQUE to LIVE
+          // sessions (created/waiting/in_progress), re-created under the SAME
+          // name. Coverage only shrinks (terminal sessions leave the index), so
+          // it can never newly reject an insert the old index allowed; without
+          // it an orphan-swept session held its engagement's slot forever.
+          //
+          // Unlike the 0083/0088 branches, the predicate and the ordering are
+          // evaluated on COMMENT-STRIPPED SQL (`splitStatements` drops `--` and
+          // `/* */`). A sanction read off the raw text can be satisfied by a
+          // comment that quotes the intended CREATE while the real CREATE omits
+          // the status conjunct — the exact mutant the self-tests below build.
+          // The marker alone is read from the raw text, because it IS a
+          // comment. One `[^;]`-bounded regex, as in 0095, so every conjunct
+          // must hold inside the replacement index's own CREATE statement.
+          || (migration.startsWith('0112_') &&
+            idxUnqualified === 'uq_call_sessions_phone_engagement' &&
+            /INDEX-NARROW SANCTION \(E1\)/.test(sql) &&
+            (() => {
+              const code = splitStatements(sql).join(';\n');
+              const dropPos = code.indexOf(stmt);
+              const m = new RegExp(
+                'create\\s+unique\\s+index\\s+if\\s+not\\s+exists\\s+' +
+                // `\b`: a re-create under a LONGER name (`..._live`) is a
+                // different index, and the dropped one would be gone for good.
+                'uq_call_sessions_phone_engagement\\b' +
+                '[^;]*?on\\s+screening_v2\\.call_sessions\\s*\\(\\s*phone_engagement_id\\s*\\)' +
+                '[^;]*?phone_engagement_id\\s+is\\s+not\\s+null' +
+                "[^;]*?status\\s+in\\s*\\(\\s*'created'\\s*,\\s*'waiting'\\s*,\\s*'in_progress'\\s*\\)" +
+                // The live list must END the predicate: `... or status =
+                // 'completed'` after it would re-widen coverage to a terminal
+                // status and still satisfy everything above.
+                '\\s*(?:;|$)',
+                'i',
+              ).exec(code);
+              // Same ordering assertion as 0083/0095: a CREATE-then-DROP would
+              // leave the chain with NO index at all.
+              return m !== null && dropPos >= 0 && m.index > dropPos;
             })());
         if (sanctionedIndexNarrow) {
           ok(migration, stmt, "REPLACEABLE_DROP_INDEX", "0083 sanctioned index-narrow: drop + re-create same name (CREATE follows DROP, carries narrowed predicate; coverage only shrinks)");
@@ -814,6 +852,54 @@ function runSelfTests() {
       { name: "9009_negative_drop_view.sql", sql: "drop view screening_v2.v_funnel_intake;" },
     ]);
     check("N9 unguarded DROP VIEW → RED", reds.some((r) => r.rule === "DESTRUCTIVE_DROP_VIEW_UNGUARDED"), "expected DESTRUCTIVE_DROP_VIEW_UNGUARDED");
+  }
+
+  // ── 0112 (E1) index-narrow sanction: exact, comment-proof, ordered ──
+  // A base chain that creates the table-wide index the way 0107 did, so a
+  // DROP of it is DESTRUCTIVE_DROP_INDEX unless the 0112 branch sanctions it.
+  {
+    const base = [
+      { name: "0001_base.sql", sql: "create table screening_v2.call_sessions (id uuid primary key, status text not null, phone_engagement_id uuid);" },
+      { name: "0107_phone_attempt_evidence.sql", sql: "create unique index if not exists uq_call_sessions_phone_engagement\n  on screening_v2.call_sessions (phone_engagement_id)\n  where phone_engagement_id is not null; create unique index if not exists uq_call_sessions_other_claim\n  on screening_v2.call_sessions (phone_engagement_id)\n  where phone_engagement_id is not null;" },
+    ];
+    const MARKER = "-- INDEX-NARROW SANCTION (E1)\n-- prose only: the engagement claim index is narrowed to live sessions.\n";
+    const DROP = "drop index if exists screening_v2.uq_call_sessions_phone_engagement;\n";
+    const createWith = (predicate, name = "uq_call_sessions_phone_engagement") =>
+      `create unique index if not exists ${name}\n  on screening_v2.call_sessions (phone_engagement_id)\n  where ${predicate};\n`;
+    const LIVE = "phone_engagement_id is not null and status in ('created', 'waiting', 'in_progress')";
+    const PLAIN = "create index if not exists idx_call_sessions_phone_engagement\n  on screening_v2.call_sessions (phone_engagement_id)\n  where phone_engagement_id is not null;\n";
+    const scan = (name, sql) => runScannerOn([...base, { name, sql }]);
+    const dropIsRed = ({ reds }) => reds.some((r) => r.rule === "DESTRUCTIVE_DROP_INDEX");
+
+    {
+      const res = scan("0112_phone_dial_orchestration_hardening.sql", "set local lock_timeout = '10s';\n" + MARKER + DROP + createWith(LIVE) + PLAIN);
+      check("P8 0112 live-only re-create (marker + DROP then exact CREATE) → not RED", res.reds.length === 0, `unexpected reds: ${JSON.stringify(res.reds.map((r) => r.rule))}`);
+      check("P8 0112 drop tracked as sanctioned REPLACEABLE_DROP_INDEX", res.findings.some((f) => f.migration.startsWith("0112_") && f.rule === "REPLACEABLE_DROP_INDEX"), "expected REPLACEABLE_DROP_INDEX");
+      check("P8 0112 additive non-unique index classifies CREATE_INDEX", res.findings.some((f) => f.migration.startsWith("0112_") && f.rule === "CREATE_INDEX" && /idx_call_sessions_phone_engagement/.test(f.stmt)), "expected CREATE_INDEX for idx_call_sessions_phone_engagement");
+    }
+    const mutants = [
+      ["M1 no status conjunct", "0112_x.sql", MARKER + DROP + createWith("phone_engagement_id is not null")],
+      ["M2 live predicate only in a -- comment",
+        "0112_x.sql",
+        // AFTER the DROP, so only comment-stripping (not the ordering check)
+        // can reject it.
+        MARKER + DROP + "-- " + createWith(LIVE).replace(/\n/g, " ") + "\n" + createWith("phone_engagement_id is not null")],
+      ["M3 CREATE before DROP", "0112_x.sql", MARKER + createWith(LIVE) + DROP],
+      ["M4 predicate in a different statement",
+        "0112_x.sql",
+        MARKER + DROP + createWith("phone_engagement_id is not null") + "comment on index screening_v2.uq_call_sessions_phone_engagement is 'status in (''created'', ''waiting'', ''in_progress'')';\n"],
+      ["M5 status list widened to include 'completed'", "0112_x.sql", MARKER + DROP + createWith("phone_engagement_id is not null and status in ('created', 'waiting', 'in_progress', 'completed')")],
+      ["M6 different migration number (0113_)", "0113_x.sql", MARKER + DROP + createWith(LIVE)],
+      ["M7a different index name re-created", "0112_x.sql", MARKER + DROP + createWith(LIVE, "uq_call_sessions_phone_engagement_live")],
+      ["M7b a different (known) index dropped",
+        "0112_x.sql",
+        MARKER + "drop index if exists screening_v2.uq_call_sessions_other_claim;\n" + createWith(LIVE, "uq_call_sessions_other_claim")],
+      ["M8 no sanction marker", "0112_x.sql", DROP + createWith(LIVE)],
+      ["M9 live list re-widened by a trailing OR", "0112_x.sql", MARKER + DROP + createWith(LIVE + " or status = 'completed'")],
+    ];
+    for (const [label, name, sql] of mutants) {
+      check(`${label} → RED`, dropIsRed(scan(name, sql)), "expected DESTRUCTIVE_DROP_INDEX");
+    }
   }
 
   return results;

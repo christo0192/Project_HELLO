@@ -9002,6 +9002,10 @@ components:
         machine_id:
           type: string
           description: Fly machine id, the join key back to the lease and the Fly Machines API.
+        agent_name:
+          type: string
+          pattern: '^[A-Za-z0-9_-]{1,64}-[0-9a-z]{8,32}$'
+          description: "M009 E2, optional. The per-machine LiveKit agent name (<base>-<flyMachineId>) a phone worker registered under when per-machine naming is on. When present the API records it on the lease (set_voice_worker_agent_name) BEFORE marking the row ready, and dispatches that machine's session to exactly this name; if recording it fails or is stale the response is 500 and the row is NOT marked ready (the dial gate then times out and defers rather than dispatching to an unrecorded name). Absent (browser workers, phone workers with per-machine naming off) the behaviour is unchanged."
       additionalProperties: false
 
     VoiceWorkerReadyResponse:

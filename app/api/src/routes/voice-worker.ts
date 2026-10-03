@@ -35,6 +35,7 @@ import { z } from 'zod';
 import { createLogger } from '../lib/logger.js';
 import { env } from '../lib/env.js';
 import { supabase } from '../lib/supabase.js';
+import { AGENT_NAME_RE } from '../integrations/livekit-phone-dial/agent-name.js';
 
 const log = createLogger('voice-worker');
 
@@ -59,11 +60,22 @@ const readySchema = z
  * it knows only (app, machine_id), so it posts THIS shape and the API flips the
  * row it already claimed (which already carries session + epoch) to `ready`.
  * See migration 0080 for the epoch-safety argument.
+ *
+ * ── OPTIONAL `agent_name` (M009 E2) ───────────────────────────────────
+ * A phone worker that registered with LiveKit under its PER-MACHINE name
+ * (`<base>-<flyMachineId>`, behind the worker-side PHONE_PER_MACHINE_AGENT_NAME
+ * flag) reports that exact name here, so the API can dispatch the session's job
+ * to the machine leased for it instead of to whichever worker LiveKit picks.
+ * Absent (every browser worker, every flag-off phone worker) the body and the
+ * handling are byte-identical to before. The pattern is the 0112 CHECK
+ * constraint's, so a name this schema admits is a name the column accepts.
+ * Still `.strict()`: an unknown key is a 400, never silently dropped.
  */
 const readyMachineSchema = z
   .object({
     app: z.string().regex(FLY_ID_RE),
     machine_id: z.string().regex(FLY_ID_RE),
+    agent_name: z.string().regex(AGENT_NAME_RE).optional(),
   })
   .strict();
 
@@ -176,6 +188,51 @@ export function createVoiceWorkerRouter(deps: VoiceWorkerRouterDeps = {}): Route
       const parsed = readyMachineSchema.safeParse(req.body);
       if (!parsed.success) {
         return res.status(400).json({ ok: false, error: 'invalid_request' });
+      }
+      // ── M009 E2: record the reported per-machine name BEFORE marking ready.
+      // ORDER IS THE SAFETY PROPERTY. The dial gate dispatches the moment it
+      // reads `ready`; if `ready` landed first, a dial could read a ready lease
+      // whose name is still null and dispatch the SHARED name — which this
+      // worker no longer answers — dialling the candidate into a room with no
+      // agent. So the name is written first and `ready` only follows a
+      // confirmed `ok`.
+      //
+      // Any failure here (driver error, `invalid_request`, anything
+      // unrecognised) is a 500 and the row is NOT marked ready. That is
+      // deliberately fail-closed on the API side: the worker treats this ping
+      // as fail-open, the gate's ready budget then times out and DEFERS the
+      // dial (worker_not_ready), and nothing is ever dispatched to a name the
+      // lease does not carry. Logs carry the event kind only — never the name,
+      // the machine id or the driver message.
+      //
+      // `stale` is the ONE benign answer and is NOT a 500: the RPC only names
+      // a `starting`/`ready` lease, so a lease that is already `busy` (a
+      // targeted dial marked it, and the SDK's replacement idle process then
+      // re-posts this ping from its own prewarm) or `draining` answers
+      // `stale` on EVERY call. Turning that into a 500 would emit a 5xx and a
+      // "rejected" log line per successful call, drowning the real signal. It
+      // gets exactly the legacy path's answer for a non-ready claim — 200
+      // {ok:false, status:'stale'} — and STILL never calls mark_ready, so the
+      // ordering guarantee above is unchanged.
+      if (parsed.data.agent_name !== undefined) {
+        const named = await rpc('set_voice_worker_agent_name', {
+          p_app: parsed.data.app,
+          p_machine_id: parsed.data.machine_id,
+          p_agent_name: parsed.data.agent_name,
+          p_now: now().toISOString(),
+        });
+        const namedStatus = (!named.error && named.data && typeof named.data === 'object'
+          && !Array.isArray(named.data)
+          ? (named.data as Record<string, unknown>).status
+          : undefined);
+        if (namedStatus === 'stale') {
+          log.info('unknown_event', { error_category: 'voice_worker_ready_machine_stale' });
+          return res.json({ ok: false, status: 'stale' });
+        }
+        if (namedStatus !== 'ok') {
+          log.info('unknown_event', { error_category: 'voice_worker_agent_name_rejected' });
+          return res.status(500).json({ ok: false, error: 'voice_worker_ready_error' });
+        }
       }
       const { data, error } = await rpc('mark_voice_worker_ready_machine', {
         p_app: parsed.data.app,

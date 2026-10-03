@@ -129,12 +129,54 @@ const NEG = [
   ["phone worker declares primary_region twice (sin then bom)", GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"', 'primary_region = "sin"\nprimary_region = "bom"')],
   ["browser worker declares primary_region twice (sin then bom)", GOOD_BROWSER.replace('primary_region = "sin"', 'primary_region = "sin"\nprimary_region = "bom"'), GOOD_PHONE],
   ["phone worker declares the app key twice", GOOD_BROWSER, GOOD_PHONE.replace('app = "project-hello-phone-voice"', 'app = "project-hello-phone-voice"\napp = "project-hello-voice"')],
+  // ── E2 (M009): per-machine registration flag + kill_timeout ─────────────
+  ["browser carries PHONE_PER_MACHINE_AGENT_NAME", GOOD_BROWSER.replace("[env]\n", '[env]\n  PHONE_PER_MACHINE_AGENT_NAME = "true"\n'), GOOD_PHONE],
+  ["browser carries PHONE_PER_MACHINE_AGENT_NAME even as false", GOOD_BROWSER.replace("[env]\n", '[env]\n  PHONE_PER_MACHINE_AGENT_NAME = "false"\n'), GOOD_PHONE],
+  ["phone PHONE_PER_MACHINE_AGENT_NAME is not exactly true (TRUE)", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  PHONE_PER_MACHINE_AGENT_NAME = "TRUE"\n')],
+  ["phone PHONE_PER_MACHINE_AGENT_NAME is 1", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  PHONE_PER_MACHINE_AGENT_NAME = "1"\n')],
+  ["phone PHONE_PER_MACHINE_AGENT_NAME is empty", GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  PHONE_PER_MACHINE_AGENT_NAME = ""\n')],
+  ["phone kill_timeout below the 90 s drain floor", GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"\n', 'primary_region = "sin"\nkill_timeout = 5\n')],
+  ["phone kill_timeout above Fly's 300 s max", GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"\n', 'primary_region = "sin"\nkill_timeout = 301\n')],
+  ["phone kill_timeout quoted / not a bare integer", GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"\n', 'primary_region = "sin"\nkill_timeout = "300s"\n')],
+  ["phone kill_timeout declared twice", GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"\n', 'primary_region = "sin"\nkill_timeout = 300\nkill_timeout = 5\n')],
+  ["phone kill_timeout nested in a table", GOOD_BROWSER, GOOD_PHONE.replace("[[vm]]\n", "[[vm]]\n  kill_timeout = 300\n")],
 ];
 for (const [label, browser, phone] of NEG) {
   const dir = fixture(browser, phone);
   const r = run(dir);
   ok(r.code !== 0, `negative control should FAIL but passed: ${label}`);
   rmSync(dir, { recursive: true, force: true });
+}
+
+// ── E2 (M009) positive controls: the PR-B flag value and kill_timeout pass ──
+{
+  const POS = [
+    ["phone PHONE_PER_MACHINE_AGENT_NAME = \"true\" (PR-B posture)",
+      GOOD_BROWSER, GOOD_PHONE.replace("[env]\n", '[env]\n  PHONE_PER_MACHINE_AGENT_NAME = "true"\n'), /phone_per_machine_agent_name=on/],
+    ["phone kill_timeout = 300 (PR-A posture)",
+      GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"\n', 'primary_region = "sin"\nkill_timeout = 300\n'), /phone_per_machine_agent_name=off/],
+    ["phone kill_timeout = 90 with a trailing comment",
+      GOOD_BROWSER, GOOD_PHONE.replace('primary_region = "sin"\n', 'primary_region = "sin"\nkill_timeout = 90 # drain\n'), null],
+    ["browser kill_timeout accepted",
+      GOOD_BROWSER.replace('primary_region = "sin"\n', 'primary_region = "sin"\nkill_timeout = 30\n'), GOOD_PHONE, null],
+  ];
+  for (const [label, browser, phone, note] of POS) {
+    const dir = fixture(browser, phone);
+    const r = run(dir);
+    ok(r.code === 0, `E2 positive control should PASS: ${label}\n${r.out}`);
+    if (note) ok(note.test(r.out), `E2 positive control must surface ${note}: ${label}\n${r.out}`);
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+// The SHIPPED PR-A phone config: flag absent (off), kill_timeout set.
+{
+  const r = spawnSync(process.execPath, [validator], { encoding: "utf8" });
+  const out = (r.stdout || "") + (r.stderr || "");
+  ok(/phone_per_machine_agent_name=off/.test(out),
+    `PR-A ships PHONE_PER_MACHINE_AGENT_NAME absent (flipped only after the API stores names), got:\n${out}`);
+  const phoneText = readFileSync(path.join(here, "..", "app/voice-livekit/fly.phone.toml"), "utf8");
+  ok(/^kill_timeout = 300\r?$/m.test(phoneText),
+    "fly.phone.toml must set a top-level kill_timeout = 300 so a stop drains a live call");
 }
 
 // ── PR104: the region guard must be EFFECTIVE, not merely present ───────

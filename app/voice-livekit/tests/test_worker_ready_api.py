@@ -222,5 +222,78 @@ class TestPostWorkerReadyMachine(unittest.TestCase):
                 self.assertFalse(_run(api.post_worker_ready_machine(post=post)))
 
 
+class TestPostWorkerReadyMachineAgentName(unittest.TestCase):
+    """E2 (M009): the phone worker reports its per-machine registration name.
+
+    The API's /ready-machine schema is STRICT, so the key must be ABSENT (not
+    null, not empty) whenever the caller passes none — that is what keeps a
+    flag-off worker's body byte-identical to the pre-E2 one."""
+
+    _NAME = "phone-screener-d895472c499e38"
+
+    def test_body_is_exactly_app_and_machine_when_agent_name_is_none(self):
+        with _EnvGuard():
+            _arm()
+            for kwargs in ({}, {"agent_name": None}):
+                with self.subTest(kwargs=kwargs):
+                    cap = {}
+                    post = _poster({"ok": True}, captured=cap)
+                    self.assertTrue(_run(api.post_worker_ready_machine(post=post, **kwargs)))
+                    self.assertEqual(cap["body"], {
+                        "app": "project-hello-phone-voice", "machine_id": "d891ee23",
+                    })
+                    self.assertNotIn("agent_name", cap["body"])
+
+    def test_agent_name_is_carried_when_given(self):
+        with _EnvGuard():
+            _arm()
+            cap = {}
+            post = _poster({"ok": True, "status": "ready"}, captured=cap)
+            ok = _run(api.post_worker_ready_machine(agent_name=self._NAME, post=post))
+            self.assertTrue(ok)
+            self.assertTrue(cap["url"].endswith("/api/internal/voice-worker/ready-machine"))
+            self.assertEqual(cap["body"], {
+                "app": "project-hello-phone-voice",
+                "machine_id": "d891ee23",
+                "agent_name": self._NAME,
+            })
+
+    def test_fail_open_with_agent_name_on_api_and_transport_errors(self):
+        # A 400 (an older strict API rejecting the key) and a 500 (set-name
+        # failed) both surface from call_with_breaker as Provider/Business
+        # errors; a transport failure as anything else. None may raise.
+        with _EnvGuard():
+            _arm()
+            for exc in (ProviderError("400"), ProviderError("500"), BusinessError(),
+                        ConnectionError("down"), RuntimeError("z")):
+                with self.subTest(exc=type(exc).__name__):
+                    post = _poster(raise_exc=exc)
+                    self.assertFalse(_run(api.post_worker_ready_machine(
+                        agent_name=self._NAME, post=post)))
+
+    def test_not_ok_verdict_returns_false_with_agent_name(self):
+        with _EnvGuard():
+            _arm()
+            for payload in ({"ok": False, "status": "stale"}, {"error": "bad_request"}, None, []):
+                with self.subTest(payload=payload):
+                    post = _poster(payload)
+                    self.assertFalse(_run(api.post_worker_ready_machine(
+                        agent_name=self._NAME, post=post)))
+
+    def test_noop_when_flag_off_even_with_agent_name(self):
+        with _EnvGuard():
+            _arm()
+            os.environ["WORKER_ORCHESTRATION"] = "off"
+            called = {"n": 0}
+
+            async def post(*_a, **_k):
+                called["n"] += 1
+                return _Resp({"ok": True})
+
+            self.assertFalse(_run(api.post_worker_ready_machine(
+                agent_name=self._NAME, post=post)))
+            self.assertEqual(called["n"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

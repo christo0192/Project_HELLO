@@ -2,5 +2,15 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Dependency Audit Exceptions (app/web)",
   "description": "Web-app-scoped audit exceptions. Kept separate from the API's exceptions so an API-only exception (e.g. a transitive dep not present in the web tree) is not flagged stale when auditing app/web. Empty = no accepted web vulns.",
-  "exceptions": []
+  "exceptions": [
+    {
+      "id": "GHSA-vfj7-8cjw-p6xm",
+      "package": "braces",
+      "owner": "christo.b@interviewkickstart.com",
+      "rationale": "Advisory published 2026-09-18 (CVE-2026-93687, stack-exhaustion DoS via deeply nested brace patterns) affects braces through 3.0.3, the latest published version, so no patched release exists. In app/web braces is a dev-only transitive (package-lock dev:true, via micromatch/fast-glob in the build toolchain); it is never bundled into the shipped SPA and never receives untrusted input.",
+      "compensating_control": "braces only runs at build time on repository-controlled glob patterns inside CI/Vercel builds; no runtime or user-supplied pattern ever reaches it, so the DoS is not reachable in production.",
+      "expiry": "2026-10-17",
+      "review_trigger": "A braces release >3.0.3 fixing GHSA-vfj7-8cjw-p6xm is published; update the lockfile and remove this entry."
+    }
+  ]
 }

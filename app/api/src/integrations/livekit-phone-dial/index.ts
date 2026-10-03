@@ -22,8 +22,10 @@
 export {
   PHONE_DIAL_BOUNDS,
   describePhoneDialConfig,
+  effectivePhoneAgentJoinTimeoutSec,
   isPhoneTransportReady,
   loadPhoneDialConfig,
+  warnPhoneAgentJoinBudgetOnce,
   type PhoneDialConfig,
 } from './config.js';
 
@@ -55,6 +57,7 @@ export {
   phoneRoomName,
   provisionPhoneRoom,
   type PhoneAgentDispatchClientLike,
+  type PhoneRoomParticipantLike,
   type PhoneRoomResult,
   type PhoneRoomServiceClientLike,
   type PhoneRoomStatus,
@@ -65,6 +68,10 @@ export {
 export {
   LEASE_MARGIN_SECONDS,
   PHONE_DIAL_REFUSALS,
+  PHONE_WORKER_READY_CEILING_SEC,
+  PHONE_WORKER_START_WAIT_CEILING_SEC,
+  PHONE_WORKER_GATE_CEILING_SEC,
+  PHONE_AGENT_JOIN_MAX_CONSECUTIVE_ERRORS,
   dialPhoneAttempt,
   type PhoneDialDeps,
   type PhoneDialRefusal,

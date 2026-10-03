@@ -104,6 +104,7 @@ const LIVE_DECL = 'export function createLiveSipClient(';
 describe('1. the module exists and the extractor does not swallow code', () => {
   it('reads every dialer file', () => {
     expect(FILES.map((f) => f.name)).toEqual([
+      'agent-name.ts',
       'config.ts',
       'dial.ts',
       'dialable-number.ts',
@@ -121,6 +122,7 @@ describe('1. the module exists and the extractor does not swallow code', () => {
     // A `not.toContain` over an empty string passes for free. Two independent
     // witnesses: a size floor, and a marker that must SURVIVE the stripper.
     const markers: Record<string, string> = {
+      'agent-name.ts': 'export function isReportedAgentNameFor(',
       'config.ts': 'export function loadPhoneDialConfig(',
       'dial.ts': 'export async function dialPhoneAttempt(',
       'dialable-number.ts': 'export function wrapDialableNumber(',

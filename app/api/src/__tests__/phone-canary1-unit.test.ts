@@ -129,6 +129,66 @@ describe('1. the destination cannot arrive in argv', () => {
     }
   });
 
+  // ── M009 E2: `--machine <flyMachineId>` ───────────────────────────────
+  // With PHONE_PER_MACHINE_AGENT_NAME on, nothing registers the shared name,
+  // so the operator names the ONE started machine and the CLI resolves the
+  // dispatch name through the same helper the API uses. The id routinely
+  // carries a 7-digit run (`7812736` below), which is why its value — and ONLY
+  // its value — is exempt from the digit-run heuristic.
+  it('--machine resolves the per-machine agent name and is NOT refused for its digit run', () => {
+    expect(containsDigitRun('7812736a540d58')).toBe(true); // the premise
+    const ok = parseCanary1Argv(['--machine', '7812736a540d58']);
+    expect(ok.ok).toBe(true);
+    if (ok.ok) {
+      expect(ok.flags.agentName).toBe('phone-screener-7812736a540d58');
+      expect(ok.flags.machineId).toBe('7812736a540d58');
+    }
+    // Composes with the rest of the grammar, in either order.
+    const exec = parseCanary1Argv(['--execute', '--machine', 'd895472c499e38', '--confirm', CANARY1_CONFIRM_PHRASE]);
+    expect(exec).toMatchObject({ ok: true, flags: { execute: true, agentName: 'phone-screener-d895472c499e38' } });
+  });
+
+  it('a 7+-digit run in ANY other argument is still refused alongside a valid --machine', () => {
+    expect(parseCanary1Argv(['--machine', '7812736a540d58', '--agent-name', 'worker9812345670']))
+      .toMatchObject({ refusal: 'destination_in_argv' });
+    expect(parseCanary1Argv(['--machine', '7812736a540d58', '--confirm', FAKE_NUMBER]))
+      .toMatchObject({ refusal: 'destination_in_argv' });
+    expect(parseCanary1Argv(['--machine', '7812736a540d58', '--ring-seconds', '1234567']))
+      .toMatchObject({ refusal: 'destination_in_argv' });
+    expect(parseCanary1Argv(['--machine', '7812736a540d58', FAKE_NUMBER]))
+      .toMatchObject({ refusal: 'destination_in_argv' });
+  });
+
+  it('the --machine value itself is still scanned: a bare number is a destination, not an id', () => {
+    // An all-digit token satisfies PER_MACHINE_ID_RE's class, so the shape
+    // check alone would let a phone number into createDispatch's agent name.
+    for (const raw of [FAKE_NUMBER, '919812345670', '98123 45670', '--number']) {
+      expect(parseCanary1Argv(['--machine', raw]), raw).toMatchObject({ refusal: 'destination_in_argv' });
+    }
+  });
+
+  it('an invalid --machine is refused, never falling back to the shared name', () => {
+    for (const raw of ['', 'ABCDEF1234', 'abc', 'a'.repeat(33), 'a.b.c.d.e.f', 'd895472c-499e38', 'phone-screener']) {
+      expect(parseCanary1Argv(['--machine', raw]), JSON.stringify(raw))
+        .toMatchObject({ ok: false, refusal: 'machine_id_invalid' });
+    }
+    expect(parseCanary1Argv(['--machine'])).toMatchObject({ refusal: 'flag_value_missing' });
+  });
+
+  it('--machine conflicts with --agent-name and with a second --machine', () => {
+    expect(parseCanary1Argv(['--agent-name', 'phone-screener', '--machine', '7812736a540d58']))
+      .toMatchObject({ refusal: 'flag_conflict' });
+    expect(parseCanary1Argv(['--machine', '7812736a540d58', '--agent-name', 'phone-screener']))
+      .toMatchObject({ refusal: 'flag_conflict' });
+    expect(parseCanary1Argv(['--machine', '7812736a540d58', '--machine', 'd895472c499e38']))
+      .toMatchObject({ refusal: 'flag_conflict' });
+  });
+
+  it('the default path is unchanged: no --machine means no agent name and no machine id', () => {
+    const result = parseCanary1Argv([]);
+    expect(result).toMatchObject({ ok: true, flags: { agentName: undefined, machineId: undefined } });
+  });
+
   it('refuses an unknown flag rather than ignoring it', () => {
     const result = parseCanary1Argv(['--yolo']);
     expect(result.ok).toBe(false);

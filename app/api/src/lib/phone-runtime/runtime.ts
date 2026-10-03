@@ -75,10 +75,13 @@ import {
   type PhoneStores,
 } from '../phone-screening/index.js';
 import {
+  PHONE_WORKER_GATE_CEILING_SEC,
   dialPhoneAttempt,
+  effectivePhoneAgentJoinTimeoutSec,
   loadPhoneDialConfig,
   phoneRoomName,
   resolvePhoneSipClient,
+  warnPhoneAgentJoinBudgetOnce,
   type PhoneDialConfig,
   type PhoneWorkerReadyGate,
 } from '../../integrations/livekit-phone-dial/index.js';
@@ -226,10 +229,133 @@ export interface PhoneSessionWriter {
   transitionSession: typeof transitionSession;
 }
 
+/**
+ * Why `ensureSession` handed the due pass no session (M009 E1).
+ *
+ * The due loop counts every such engagement as `no_session` and that
+ * vocabulary is deliberately unchanged — but on its own it could not tell
+ * "the engagement's bound session is dead" (E3/E4 territory, by design) from
+ * "our insert hit the engagement-claim index" (E1, a bug), and the outage E1
+ * caused was reconstructed from timestamps because the 23505 was masked.
+ *   existing_terminal         the session named on the engagement is terminal
+ *                             or gone; never re-minted here, by design.
+ *   existing_room_unverified  it is live but does not carry its own room name.
+ *   insert_failed             `createSession` failed; `pgCode` when known.
+ *   provision_cas_failed      a `created -> waiting` CAS failed and the row
+ *                             is (or may be) still sitting in `created`.
+ */
+export type PhoneSessionUnavailableReason =
+  | 'existing_terminal'
+  | 'existing_room_unverified'
+  | 'insert_failed'
+  | 'provision_cas_failed';
+
+export interface PhoneSessionUnavailable {
+  readonly reason: PhoneSessionUnavailableReason;
+  /** The engagement id — a UUID, not PII. */
+  readonly engagementId: string;
+  /** A five-character SQLSTATE, only when the driver reported one. */
+  readonly pgCode?: string;
+}
+
+const LOG_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const LOG_SQLSTATE_RE = /^[0-9A-Z]{5}$/;
+
+/**
+ * The one log line for a `null` from `ensureSession`, shaped for the
+ * repository logger's allowlist.
+ *
+ * The logger accepts a closed key set and a closed event catalogue (with a
+ * Python twin that must stay in parity), so the reason, the engagement id
+ * and the SQLSTATE travel the way every other phone-runtime diagnostic does,
+ * in two SAFE_IDENT-shaped fields (each capped at 64 characters):
+ *   error_type      `phone_session_unavailable:<reason>` — at most 50;
+ *                   grep the prefix for every null, the suffix for one kind.
+ *   error_category  `e.<engagement uuid>[:pg.<sqlstate>]` — at most 47.
+ * Split this way so no combination can overflow the bound and be dropped
+ * whole. Both identifiers are re-validated here, so nothing but a UUID and a
+ * SQLSTATE can ever be spliced in; anything else is left out.
+ *
+ * One edge is handled on purpose: the logger drops any value containing ten
+ * consecutive digits (its phone-number guard), and a UUID's last group can
+ * be twelve. Such an id is left out rather than let it cost the SQLSTATE
+ * riding in the same field.
+ */
+export function phoneSessionUnavailableMeta(
+  event: PhoneSessionUnavailable,
+): { error_type: string; error_category?: string } {
+  const parts: string[] = [];
+  if (LOG_UUID_RE.test(event.engagementId) && !/\d{10,}/.test(event.engagementId)) {
+    parts.push(`e.${event.engagementId.toLowerCase()}`);
+  }
+  if (event.pgCode !== undefined && LOG_SQLSTATE_RE.test(event.pgCode)) {
+    parts.push(`pg.${event.pgCode}`);
+  }
+  const errorType = `phone_session_unavailable:${event.reason}`;
+  return parts.length === 0
+    ? { error_type: errorType }
+    : { error_type: errorType, error_category: parts.join(':') };
+}
+
+function defaultSessionUnavailableSink(): (event: PhoneSessionUnavailable) => void {
+  const logger = createLogger('phone-runtime');
+  return (event) => {
+    logger.info('unknown_event', phoneSessionUnavailableMeta(event));
+  };
+}
+
+/** The SQLSTATE riding on a `createSession` error, if any. */
+function insertPgCode(error: unknown): string | undefined {
+  const code = (error as { pgCode?: unknown } | null)?.pgCode;
+  return typeof code === 'string' && LOG_SQLSTATE_RE.test(code) ? code : undefined;
+}
+
 export function createPhoneSessionPort(
   reader: PhoneRuntimeReader,
   writer: PhoneSessionWriter = { createSession, transitionSession },
+  onUnavailable: (event: PhoneSessionUnavailable) => void = defaultSessionUnavailableSink(),
 ): PhoneSessionPort {
+  /**
+   * Every `return null` goes through here, so "exactly one reason line per
+   * null" is a property of the shape rather than of remembering. The sink is
+   * diagnostics only: a throwing one must not change what the pass decides.
+   */
+  function unavailable(
+    engagementId: string,
+    reason: PhoneSessionUnavailableReason,
+    pgCode?: string,
+  ): null {
+    try {
+      onUnavailable(pgCode === undefined
+        ? { reason, engagementId }
+        : { reason, engagementId, pgCode });
+    } catch {
+      // Diagnostics must never affect the tick.
+    }
+    return null;
+  }
+
+  /**
+   * Abandon a half-provisioned `created` row so it stops occupying the
+   * engagement's live slot in `uq_call_sessions_phone_engagement`.
+   *
+   * `created -> cancelled` is a legal edge (session-lifecycle) and a CAS, so
+   * it can only ever cancel a row that is STILL `created`: a row a concurrent
+   * pass has meanwhile moved to `waiting` — the only state this port ever
+   * returns — conflicts and is left alone. `duplicate_session` is the
+   * cancellation reason that says what happened: it is being superseded by
+   * a fresh session for the same engagement.
+   */
+  async function abandon(sessionId: string): Promise<boolean> {
+    const cancelled = await writer.transitionSession(
+      sessionId,
+      'created',
+      'cancelled',
+      'duplicate_session',
+    );
+    return cancelled.ok;
+  }
+
   return {
     async ensureSession(input): Promise<string | null> {
       // ── The session already named on the engagement ──────────────────
@@ -242,13 +368,25 @@ export function createPhoneSessionPort(
       // `start_phone_assessment` with `session_not_active`. A call that could
       // never have gone anywhere, charged against a reconnect budget that is
       // spent AT THE GRANT.
+      //
+      // UNCHANGED BY M009 E1, deliberately: a terminal (or missing) bound
+      // session still returns null and NEVER mints. That case is a scored or
+      // interrupted conversation, and redialling it into a fresh session is
+      // E3/E4's decision, not this port's. It is now merely LOGGED. A row that
+      // no longer exists is reported as `existing_terminal` too: operationally
+      // it is the same fact — the named session can never be resumed.
       if (input.existingSessionId !== null) {
         const existing = await reader.readSessionForReuse({
           sessionId: input.existingSessionId,
         });
-        if (existing === null || !existing.roomVerified) return null;
-        if (!(RESUMABLE_SESSION_STATUSES as readonly string[]).includes(existing.status)) {
-          return null;
+        if (
+          existing === null
+          || !(RESUMABLE_SESSION_STATUSES as readonly string[]).includes(existing.status)
+        ) {
+          return unavailable(input.engagementId, 'existing_terminal');
+        }
+        if (!existing.roomVerified) {
+          return unavailable(input.engagementId, 'existing_room_unverified');
         }
         return input.existingSessionId;
       }
@@ -276,20 +414,59 @@ export function createPhoneSessionPort(
       // engagement adopts nothing and mints its own session. An extra row is
       // the cheap direction; two SIP legs in one room is not.
       // THIS ENGAGEMENT'S OWN SESSION FIRST. Exact, so it is safe even with
-      // several live engagements — and required, because the 0107 unique
-      // index on `phone_engagement_id` makes a second `createSession` for the
-      // same engagement fail, which took the engagement out of the dial loop
+      // several live engagements — and required, because
+      // `uq_call_sessions_phone_engagement` allows at most ONE LIVE
+      // (`created`/`waiting`/`in_progress`) session per engagement: while
+      // this engagement has a live session, a second `createSession` for it
+      // fails 23505. Since 0112 the index is live-only, so a session that has
+      // gone TERMINAL (e.g. the 0096 orphan sweep expiring a 4 h-old
+      // `waiting` row, which keeps its claim as history) no longer blocks the
+      // mint below. Before 0112 it did, and that took every no-answer
+      // engagement whose retry came after the sweep out of the dial loop,
       // permanently and silently.
       const mine = await reader.findSessionForEngagement({
         engagementId: input.engagementId,
       });
       if (mine !== null) return mine;
 
+      // ── THIS ENGAGEMENT'S OWN HALF-PROVISIONED SESSION (M009 E1) ─────
+      // `findSessionForEngagement` rejects a `created` row with no room name,
+      // yet the live-only index still counts it, and no sweep reaps
+      // `created`. So a mint whose `created -> waiting` CAS once failed would
+      // wedge the engagement exactly as the old index did. Finish that
+      // provisioning — the same CAS the mint path runs, with the same
+      // deterministic room — or, if it cannot be finished, cancel the row so
+      // the slot frees and fall through to adoption/mint.
+      if (reader.findUnprovisionedSessionForEngagement !== undefined) {
+        const stale = await reader.findUnprovisionedSessionForEngagement({
+          engagementId: input.engagementId,
+        });
+        if (stale !== null) {
+          const finished = await writer.transitionSession(
+            stale,
+            'created',
+            'waiting',
+            undefined,
+            { external_call_id: phoneRoomName(stale) },
+          );
+          if (finished.ok) return stale;
+          // Could not cancel either: the row may still hold the live slot,
+          // so a mint would only 23505. Skip this pass; a concurrent pass
+          // that won the CAS leaves a `waiting` row the next pass reuses.
+          if (!(await abandon(stale))) {
+            return unavailable(input.engagementId, 'provision_cas_failed');
+          }
+        }
+      }
+
       const liveEngagements = await reader.countLiveEngagements({
         candidateId: input.candidateId,
       });
       if (liveEngagements <= 1) {
-        const adopted = await reader.findReusableSession({ candidateId: input.candidateId });
+        const adopted = await reader.findReusableSession({
+          candidateId: input.candidateId,
+          engagementId: input.engagementId,
+        });
         if (adopted !== null) {
           const owner = await reader.engagementOwningSession({ sessionId: adopted });
           if (owner === null || owner === input.engagementId) return adopted;
@@ -303,7 +480,16 @@ export function createPhoneSessionPort(
         provider: 'livekit',
         phone_engagement_id: input.engagementId,
       });
-      if (created.error !== null || created.data === null) return null;
+      if (created.error !== null || created.data === null) {
+        // A 23505 here is a concurrent pass that minted first (the next pass
+        // reuses its row) — or, if it repeats, an E1-class claim conflict.
+        // The SQLSTATE is what tells those apart from everything else.
+        return unavailable(
+          input.engagementId,
+          'insert_failed',
+          insertPgCode(created.error),
+        );
+      }
 
       const sessionId = created.data.id as string;
       // `created` -> `waiting` AND the room name in one CAS. A session without
@@ -316,7 +502,12 @@ export function createPhoneSessionPort(
         undefined,
         { external_call_id: phoneRoomName(sessionId) },
       );
-      return moved.ok ? sessionId : null;
+      if (moved.ok) return sessionId;
+      // Still null either way — this pass has no usable session — but try to
+      // cancel first so the row cannot wedge the engagement. If the cancel
+      // also fails, the recovery above finishes or cancels it next pass.
+      await abandon(sessionId);
+      return unavailable(input.engagementId, 'provision_cas_failed');
     },
   };
 }
@@ -376,6 +567,22 @@ export function createPhoneRuntime(
   const runtimeConfig = options.runtimeConfig ?? loadPhoneRuntimeConfig();
   const dialConfig = options.dialConfig ?? loadPhoneDialConfig();
   const logger = createLogger('phone-runtime');
+  // M009 E2. The targeted-dispatch join wait is CLAMPED so the worker-ready
+  // gate plus the join still fit inside the admission lease; when the lease is
+  // too short for even the floor, every targeted dial would spend lease the
+  // reclaimer is entitled to take back. Say so ONCE, at boot, as an event kind
+  // only (no values) — the same inputs `dial.ts` uses per dial, so the warning
+  // and the behaviour cannot disagree. The gate ceiling is the Fly start wait
+  // PLUS the ready poll (60 + 120), not the ready poll alone. Inert on the
+  // healthy defaults (240 - 180 - 5 = 55 >= 20).
+  warnPhoneAgentJoinBudgetOnce(
+    effectivePhoneAgentJoinTimeoutSec({
+      configuredSec: dialConfig.agentJoinTimeoutSec,
+      originateLeaseSec: config.leaseSeconds,
+      workerReadyTimeoutSec: PHONE_WORKER_GATE_CEILING_SEC,
+    }),
+    (kind) => logger.info('unknown_event', { error_type: kind }),
+  );
   const client = options.client ?? (supabase as unknown as SupabaseClient);
   const queue = options.queue ?? new Queue(new PgAdapter(client), { defaultMaxAttempts: 5 });
   // ── THE OWNER MUST BE UNIQUE PER PROCESS, NOT PER PID ──────────────
@@ -581,7 +788,15 @@ export function createPhoneRuntime(
     },
   });
 
-  const sessions = createPhoneSessionPort(reader);
+  // The runtime's own logger carries the port's `phone_session_unavailable`
+  // line, so it lands under the same component as `phone_due_skip`.
+  const sessions = createPhoneSessionPort(
+    reader,
+    { createSession, transitionSession },
+    (event) => {
+      logger.info('unknown_event', phoneSessionUnavailableMeta(event));
+    },
+  );
 
   /**
    * THE LOOP SET, in one array.
