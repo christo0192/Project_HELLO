@@ -19,6 +19,7 @@
 
 import type {
   PhoneAgentDispatchClientLike,
+  PhoneRoomParticipantLike,
   PhoneRoomServiceClientLike,
 } from '../../integrations/livekit-phone-dial/index.js';
 
@@ -57,11 +58,13 @@ export function createPhoneRoomClients(
   let roomService: {
     createRoom: (opts: unknown) => Promise<unknown>;
     updateRoomMetadata: (room: string, metadata: string) => Promise<unknown>;
+    listParticipants: (room: string) => Promise<ReadonlyArray<PhoneRoomParticipantLike>>;
   } | null = null;
 
   async function roomServiceClient(): Promise<{
     createRoom: (opts: unknown) => Promise<unknown>;
     updateRoomMetadata: (room: string, metadata: string) => Promise<unknown>;
+    listParticipants: (room: string) => Promise<ReadonlyArray<PhoneRoomParticipantLike>>;
   }> {
     if (roomService === null) {
       const { RoomServiceClient } = await import('livekit-server-sdk');
@@ -82,6 +85,18 @@ export function createPhoneRoomClients(
     async updateRoomMetadata(room, metadata) {
       const client = await roomServiceClient();
       await client.updateRoomMetadata(room, metadata);
+    },
+    // M009 E2. The targeted-dispatch join barrier in `dial.ts` lists the room
+    // to see the per-machine agent join BEFORE any SIP leg is originated. It
+    // is optional on the port and the dial fails CLOSED without it
+    // (`agent_join_unverifiable`), so a production client that lacked it would
+    // defer every targeted dial the moment PHONE_PER_MACHINE_AGENT_NAME is on.
+    // The SDK's error is returned untouched: `dial.ts` reads only its
+    // `not_found` code (an empty room) and discards everything else. Lazy like
+    // the two methods above — no SDK work until a dial actually needs it.
+    async listParticipants(room) {
+      const client = await roomServiceClient();
+      return client.listParticipants(room);
     },
   };
 

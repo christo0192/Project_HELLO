@@ -198,12 +198,43 @@ export type TransitionResult = TransitionResultOk | TransitionResultConflict | T
 // ── createSession ────────────────────────────────────────────────────
 
 /**
+ * The error `createSession` returns. Still `ERR_INSERT_FAILED` by message —
+ * that is the contract browser session creation matches on and it does not
+ * move — plus ONE additive, optional field: the SQLSTATE the insert failed
+ * with, when the driver reported one.
+ *
+ * WHY IT EXISTS (M009 E1). The phone session port used to see only
+ * `ERR_INSERT_FAILED`, so a 23505 from `uq_call_sessions_phone_engagement`
+ * (an engagement whose claiming session the orphan sweep had expired) was
+ * indistinguishable from any other insert failure, and the outage it caused
+ * was diagnosed from timestamps rather than from a log line. A SQLSTATE is a
+ * five-character class code — never a statement, a detail or a row value — so
+ * it is the one piece of the driver error that may travel.
+ */
+export interface SessionInsertError extends Error {
+  /** A five-character SQLSTATE (e.g. `23505`), or absent when unknown. */
+  readonly pgCode?: string;
+}
+
+/** SQLSTATE shape. Anything else (a PGRST code, a message) is not surfaced. */
+const SQLSTATE_PATTERN = /^[0-9A-Z]{5}$/;
+
+function insertError(driverError: unknown): SessionInsertError {
+  const err: SessionInsertError = new Error(ERR_INSERT_FAILED);
+  const code = (driverError as { code?: unknown } | null)?.code;
+  if (typeof code === 'string' && SQLSTATE_PATTERN.test(code)) {
+    Object.defineProperty(err, 'pgCode', { value: code, enumerable: true });
+  }
+  return err;
+}
+
+/**
  * Inserts a new session in the `created` state.  Constructs a closed
  * payload — never spreads caller fields directly into the insert.
  */
 export async function createSession(
   fields: SessionInsertFields,
-): Promise<{ data: SessionRow; error: null } | { data: null; error: Error }> {
+): Promise<{ data: SessionRow; error: null } | { data: null; error: SessionInsertError }> {
   // Construct closed insert payload.
   const payload: Record<string, unknown> = {
     candidate_id: fields.candidate_id,
@@ -227,7 +258,7 @@ export async function createSession(
     .select()
     .single();
 
-  if (error) return { data: null, error: new Error(ERR_INSERT_FAILED) };
+  if (error) return { data: null, error: insertError(error) };
   return { data: data as SessionRow, error: null };
 }
 

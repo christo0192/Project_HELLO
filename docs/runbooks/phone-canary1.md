@@ -169,9 +169,59 @@ chance to typo into a live carrier.
 **Flags.** `--dry-run` (default), `--execute`, `--confirm <phrase>`,
 `--questions 1..3`, `--max-call-seconds`, `--ring-seconds`,
 `--participant-wait-seconds`, `--join-wait-seconds`, `--wall-clock-seconds`,
-`--agent-name`. Everything else is refused. **There is no `--out`.**
+`--agent-name`, `--machine <flyMachineId>` (§4d). Everything else is refused.
+**There is no `--out`.**
 Three of those are **expectations rather than controls** — read §4c before
 touching any of them.
+
+## 4d. `--machine` — Canary-1 with per-machine agent names (M009 E2)
+
+**The problem:** with `PHONE_PER_MACHINE_AGENT_NAME="true"` on the phone
+worker, every phone machine registers as `phone-screener-<itsFlyMachineId>`,
+and **nothing registers the shared name `phone-screener`**. A Canary-1 run
+without `--machine` dispatches the shared name, no worker takes the job, and
+the run **fails safe**:
+
+- you see `worker_present_before_originate|FAIL|worker_never_joined`;
+- no SIP leg is originated, because the CLI never originates without an
+  observed agent join.
+
+That result is not a provider fault. It is what the flag does.
+
+**How to run a canary with the flag on:**
+
+```bash
+# 1. Pick ONE phone machine and START it (the canary does not start machines).
+fly machines list -a project-hello-phone-voice
+fly machine start <id> -a project-hello-phone-voice
+# 2. Dry run against exactly that machine (from app/api, as in §4).
+npm run canary:phone1 -- --dry-run --machine <id>
+```
+
+**What `--machine` does and refuses:**
+
+- **Name resolution.** It resolves the dispatch name through the same helper
+  the API uses (`phoneMachineAgentName('phone-screener', <id>)`), so the CLI
+  cannot spell the name differently from the worker.
+- **Invalid ids.** The id must match `^[0-9a-z]{8,32}$`. Anything else is
+  refused `machine_id_invalid`. There is **no fallback** to the shared name:
+  a run that asked for one machine must prove that machine or fail.
+- **Digit-run exemption.** A real machine id often contains seven digits in a
+  row (for example `7812736a540d58`). The digit-run rule is waived **for this
+  one value only**, and only because the shape check above admits nothing a
+  person types a phone number in.
+- **Bare numbers.** An all-digit value is still refused `destination_in_argv`.
+- **Other arguments.** Every other argument keeps the full destination scan.
+  A 7+-digit run in `--confirm`, `--agent-name` or a bound is refused exactly
+  as before.
+- **Conflicts.** `--machine` together with `--agent-name`, or a second
+  `--machine`, is refused `flag_conflict`.
+- **The default path is unchanged.** Without `--machine`, the run dispatches
+  `phone-screener` (or `--agent-name`) as before.
+
+**Residual (unchanged):** a machine the operator started for a canary holds no
+lease. The orphan sweep may stop it during a long run, which ends the run as
+`worker_never_joined`. Run the canary promptly after starting the machine.
 
 ## 4a. Credential acquisition — no `.env`, no argv, no history, no temp file
 

@@ -202,6 +202,14 @@ function renderings(value: unknown): string {
 const NOW_ISO = '2026-08-24T03:30:00.000Z';
 
 /**
+ * The engagement candidate adoption is scoped to (M009 E1). UUID-shaped
+ * because the reader refuses anything else before it builds the `or` filter.
+ * Synthetic — not a real row.
+ */
+const ADOPT_ENGAGEMENT = 'e1e1e1e1-0000-4000-8000-00000000b001';
+const SIBLING_ENGAGEMENT = 'e1e1e1e1-0000-4000-8000-00000000b002';
+
+/**
  * The reconnect backoff the pass runs with, in seconds.
  *
  * H-2 made this an INPUT to `listDueEngagements` rather than something the
@@ -1179,11 +1187,11 @@ describe('C. findReusableSession — adoption is verified, not assumed', () => {
     });
 
     await expect(
-      createPhoneRuntimeReader(fake.client).findReusableSession({ candidateId: 'c1' }),
+      createPhoneRuntimeReader(fake.client).findReusableSession({ candidateId: 'c1', engagementId: ADOPT_ENGAGEMENT }),
     ).resolves.toBe(sessionId);
 
     const q = fake.only('call_sessions');
-    expect(q.columns).toBe('id,status,external_call_id,started_at');
+    expect(q.columns).toBe('id,status,external_call_id,started_at,phone_engagement_id');
     expect(q.columns).not.toContain('*');
     expect(allArgsOf(q, 'eq')).toEqual([
       ['candidate_id', 'c1'],
@@ -1224,7 +1232,7 @@ describe('C. findReusableSession — adoption is verified, not assumed', () => {
     for (const { label, data } of cases) {
       const fake = fakeClient({ call_sessions: { data } });
       await expect(
-        createPhoneRuntimeReader(fake.client).findReusableSession({ candidateId: 'c1' }),
+        createPhoneRuntimeReader(fake.client).findReusableSession({ candidateId: 'c1', engagementId: ADOPT_ENGAGEMENT }),
         label,
       ).resolves.toBeNull();
     }
@@ -1237,7 +1245,7 @@ describe('C. findReusableSession — adoption is verified, not assumed', () => {
     // filtered out of a returned batch — feeding one through a fake that
     // ignores filters would test the fake, not the reader.
     const fake = fakeClient({ call_sessions: { data: [] } });
-    await createPhoneRuntimeReader(fake.client).findReusableSession({ candidateId: 'c1' });
+    await createPhoneRuntimeReader(fake.client).findReusableSession({ candidateId: 'c1', engagementId: ADOPT_ENGAGEMENT });
 
     const inArgs = argsOf(fake.only('call_sessions'), 'in');
     expect(inArgs?.[0]).toBe('status');
@@ -1263,10 +1271,140 @@ describe('C. findReusableSession — adoption is verified, not assumed', () => {
     // session is created anyway".
     const fake = fakeClient({ call_sessions: { error: pgError() } });
     const thrown = await createPhoneRuntimeReader(fake.client)
-      .findReusableSession({ candidateId: 'c1' })
+      .findReusableSession({ candidateId: 'c1', engagementId: ADOPT_ENGAGEMENT })
       .then((v) => ({ resolved: v }), (e: unknown) => e);
 
     expect(thrown, 'the read degraded to a value instead of throwing').toBeInstanceOf(Error);
+    expect((thrown as Error).message).toBe('phone_runtime_session_read_error');
+    const rendered = renderings(thrown);
+    for (const sentinel of PG_ERROR_SENTINELS) {
+      expect(rendered, `driver payload ${sentinel} escaped`).not.toContain(sentinel);
+    }
+  });
+
+  // ── M009 E1: never a sibling engagement's claimed session ───────────
+  it('C15: the query carries the phone_engagement_id null-or-self filter', async () => {
+    const fake = fakeClient({ call_sessions: { data: [] } });
+    await createPhoneRuntimeReader(fake.client)
+      .findReusableSession({ candidateId: 'c1', engagementId: ADOPT_ENGAGEMENT });
+
+    const q = fake.only('call_sessions');
+    expect(allArgsOf(q, 'or')).toEqual([
+      [`phone_engagement_id.is.null,phone_engagement_id.eq.${ADOPT_ENGAGEMENT}`],
+    ]);
+    // The existing scoping is unchanged alongside it.
+    expect(allArgsOf(q, 'eq')).toEqual([
+      ['candidate_id', 'c1'],
+      ['mode', PHONE_SESSION_MODE],
+    ]);
+    expect(argsOf(q, 'limit')).toEqual([1]);
+  });
+
+  it('C16: a session claimed by ANOTHER engagement is not adopted, even if the filter were ignored', async () => {
+    // This fake records `.or` but does not apply it, so the row below reaches
+    // the reader exactly as it would if the filter had been dropped. The
+    // reader's own re-check is what must refuse it.
+    const sessionId = 's-sibling-claimed';
+    const fake = fakeClient({
+      call_sessions: {
+        data: [{
+          id: sessionId,
+          status: 'waiting',
+          external_call_id: phoneRoomName(sessionId),
+          started_at: '2026-08-23T10:00:00.000Z',
+          phone_engagement_id: SIBLING_ENGAGEMENT,
+        }],
+      },
+    });
+
+    await expect(
+      createPhoneRuntimeReader(fake.client)
+        .findReusableSession({ candidateId: 'c1', engagementId: ADOPT_ENGAGEMENT }),
+    ).resolves.toBeNull();
+  });
+
+  it('C17: CONTROL — an unclaimed session and one claimed by THIS engagement are both adopted', async () => {
+    for (const claim of [null, ADOPT_ENGAGEMENT, ADOPT_ENGAGEMENT.toUpperCase()]) {
+      const sessionId = 's-adoptable-2';
+      const fake = fakeClient({
+        call_sessions: {
+          data: [{
+            id: sessionId,
+            status: 'waiting',
+            external_call_id: phoneRoomName(sessionId),
+            started_at: '2026-08-23T10:00:00.000Z',
+            phone_engagement_id: claim,
+          }],
+        },
+      });
+      await expect(
+        createPhoneRuntimeReader(fake.client)
+          .findReusableSession({ candidateId: 'c1', engagementId: ADOPT_ENGAGEMENT }),
+        String(claim),
+      ).resolves.toBe(sessionId);
+    }
+  });
+
+  it('C18: an invalid engagementId THROWS before any query is built', async () => {
+    for (const bad of [
+      '',
+      'not-a-uuid',
+      `${ADOPT_ENGAGEMENT},status.eq.completed`,
+      `${ADOPT_ENGAGEMENT})`,
+      undefined as unknown as string,
+    ]) {
+      const fake = fakeClient({ call_sessions: { data: [] } });
+      const thrown = await createPhoneRuntimeReader(fake.client)
+        .findReusableSession({ candidateId: 'c1', engagementId: bad })
+        .then((v) => ({ resolved: v }), (e: unknown) => e);
+      expect(thrown, String(bad)).toBeInstanceOf(Error);
+      expect((thrown as Error).message).toBe('phone_runtime_bad_engagement_id');
+      expect(fake.fromCalls(), 'a query was issued for an invalid id').toBe(0);
+    }
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  C'. findUnprovisionedSessionForEngagement (M009 E1)
+// ════════════════════════════════════════════════════════════════════
+
+describe("C'. findUnprovisionedSessionForEngagement — this engagement's half-provisioned row", () => {
+  it('C19: reads ONE `created` live session claimed by the engagement, newest first', async () => {
+    const fake = fakeClient({ call_sessions: { data: [{ id: 's-own-created' }] } });
+    const reader = createPhoneRuntimeReader(fake.client);
+    expect(reader.findUnprovisionedSessionForEngagement).toBeTypeOf('function');
+
+    await expect(
+      reader.findUnprovisionedSessionForEngagement!({ engagementId: ADOPT_ENGAGEMENT }),
+    ).resolves.toBe('s-own-created');
+
+    const q = fake.only('call_sessions');
+    expect(q.columns).toBe('id');
+    expect(allArgsOf(q, 'eq')).toEqual([
+      ['phone_engagement_id', ADOPT_ENGAGEMENT],
+      ['mode', PHONE_SESSION_MODE],
+      ['status', 'created'],
+    ]);
+    expect(argsOf(q, 'order')).toEqual(['started_at', { ascending: false }]);
+    expect(argsOf(q, 'limit')).toEqual([1]);
+  });
+
+  it('C20: no row, or a row without an id, is null', async () => {
+    for (const data of [[], null, [{}]]) {
+      const fake = fakeClient({ call_sessions: { data } });
+      await expect(
+        createPhoneRuntimeReader(fake.client)
+          .findUnprovisionedSessionForEngagement!({ engagementId: ADOPT_ENGAGEMENT }),
+      ).resolves.toBeNull();
+    }
+  });
+
+  it('C21: a read error throws the bare stable code, carrying nothing from the driver', async () => {
+    const fake = fakeClient({ call_sessions: { error: pgError() } });
+    const thrown = await createPhoneRuntimeReader(fake.client)
+      .findUnprovisionedSessionForEngagement!({ engagementId: ADOPT_ENGAGEMENT })
+      .then((v) => ({ resolved: v }), (e: unknown) => e);
+    expect(thrown).toBeInstanceOf(Error);
     expect((thrown as Error).message).toBe('phone_runtime_session_read_error');
     const rendered = renderings(thrown);
     for (const sentinel of PG_ERROR_SENTINELS) {

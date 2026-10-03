@@ -36,6 +36,24 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+// 0112 re-declares reclaim_phone_attempt_leases IN FULL (0096's body plus the
+// E3 redial hold: the RESTORE branch now also sets next_eligible_at and the
+// audit row carries `redial_not_before`). It must outrank 0096, or every
+// extractor — the clock check, the parameter order, the status vocabulary —
+// reads the superseded body that restored an engagement with no hold and let
+// it be redialled within seconds. It also narrows the engagement-claim unique
+// index to live sessions (E1) and adds the voice-worker agent-name RPC (E2);
+// the voice-worker RPCs are NOT phone-domain and are not in RPC_NAMES below,
+// for the same reason 0083's pair is not.
+export const MIGRATION_0112_PATH = fileURLToPath(
+  new URL(
+    '../../../../supabase/migrations/0112_phone_dial_orchestration_hardening.sql',
+    import.meta.url,
+  ),
+);
+
+export const MIGRATION_0112 = readFileSync(MIGRATION_0112_PATH, 'utf8');
+
 // 0105 re-declares commit_phone_item_turn IN FULL (0071's body plus
 // `p_is_gate`, and the 0071 signature dropped first). It must outrank 0071,
 // or the contract's parameter-order check reads the superseded six-argument
@@ -312,6 +330,9 @@ export const MIGRATION_0092 = readFileSync(MIGRATION_0092_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0112 — reclaim_phone_attempt_leases IN FULL (the E3 redial hold), so it
+    // must precede 0096, whose body it supersedes.
+    { name: '0112', sql: MIGRATION_0112 },
     // 0111 — phone_ist_window_open IN FULL (one-night owner test date), so it
     // must precede 0085.
     { name: '0111', sql: MIGRATION_0111 },

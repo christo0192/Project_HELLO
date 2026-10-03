@@ -31,8 +31,11 @@
 import { describe, expect, it } from 'vitest';
 import {
   createPhoneSessionPort,
+  phoneSessionUnavailableMeta,
+  type PhoneSessionUnavailable,
   type PhoneSessionWriter,
 } from '../lib/phone-runtime/runtime.js';
+import { createLogger } from '../lib/logger.js';
 import {
   PHONE_SESSION_MODE,
   RESUMABLE_SESSION_STATUSES,
@@ -46,8 +49,10 @@ import { TERMINAL_STATES, type SessionRow } from '../lib/session-lifecycle.js';
 // Fixtures
 // ═══════════════════════════════════════════════════════════════════════
 
-const ENGAGEMENT = 'engagement-asking-1';
-const OTHER_ENGAGEMENT = 'engagement-other-2';
+// UUID-shaped since M009 E1: the reason log line carries the engagement id,
+// and only a UUID is ever spliced into it. Synthetic, not a real row.
+const ENGAGEMENT = 'e1e1e1e1-0000-4000-8000-00000000a001';
+const OTHER_ENGAGEMENT = 'e1e1e1e1-0000-4000-8000-00000000a002';
 const CANDIDATE = 'candidate-1';
 const ROLE = 'role-1';
 
@@ -60,7 +65,10 @@ type SessionReuse = { status: string; roomVerified: boolean } | null;
 interface ReaderCalls {
   readSessionForReuse: string[];
   findReusableSession: string[];
+  /** The engagement each candidate-adoption read was scoped to (M009 E1). */
+  findReusableSessionEngagement: string[];
   findSessionForEngagement: string[];
+  findUnprovisionedSessionForEngagement: string[];
   engagementOwningSession: string[];
   countLiveEngagements: string[];
 }
@@ -84,11 +92,15 @@ function fakeReader(over: {
   liveEngagements?: number;
   /** The session THIS engagement already owns (0107 `phone_engagement_id`). */
   ownSession?: string | null;
+  /** THIS engagement's half-provisioned `created` session (M009 E1). */
+  unprovisioned?: string | null;
 } = {}): { reader: PhoneRuntimeReader; calls: ReaderCalls } {
   const calls: ReaderCalls = {
     readSessionForReuse: [],
     findReusableSession: [],
+    findReusableSessionEngagement: [],
     findSessionForEngagement: [],
+    findUnprovisionedSessionForEngagement: [],
     engagementOwningSession: [],
     countLiveEngagements: [],
   };
@@ -111,8 +123,13 @@ function fakeReader(over: {
       calls.findSessionForEngagement.push(input.engagementId);
       return over.ownSession ?? null;
     },
+    async findUnprovisionedSessionForEngagement(input) {
+      calls.findUnprovisionedSessionForEngagement.push(input.engagementId);
+      return over.unprovisioned ?? null;
+    },
     async findReusableSession(input) {
       calls.findReusableSession.push(input.candidateId);
+      calls.findReusableSessionEngagement.push(input.engagementId);
       return over.reusable ?? null;
     },
     async engagementOwningSession(input) {
@@ -165,6 +182,11 @@ function sessionRow(id: string, over: Partial<SessionRow> = {}): SessionRow {
 function fakeWriter(over: {
   created?: CreateResult;
   moved?: TransitionResult;
+  /**
+   * Per-call answers for `transitionSession`, in issue order (M009 E1: the
+   * port may now CAS, then cancel). Falls back to `moved`, then `ok`.
+   */
+  transitions?: readonly TransitionResult[];
 } = {}): { writer: PhoneSessionWriter; calls: WriterCalls } {
   const calls: WriterCalls = { createSession: [], transitionSession: [] };
   const writer: PhoneSessionWriter = {
@@ -173,12 +195,21 @@ function fakeWriter(over: {
       return over.created ?? { data: sessionRow(NEW_SESSION), error: null };
     },
     async transitionSession(...args: TransitionArgs) {
+      const at = calls.transitionSession.length;
       calls.transitionSession.push(args);
-      return over.moved ?? { ok: true };
+      return over.transitions?.[at] ?? over.moved ?? { ok: true };
     },
   };
   return { writer, calls };
 }
+
+/** Records every `phone_session_unavailable` event the port emits. */
+function fakeSink(): { sink: (e: PhoneSessionUnavailable) => void; events: PhoneSessionUnavailable[] } {
+  const events: PhoneSessionUnavailable[] = [];
+  return { sink: (e) => { events.push(e); }, events };
+}
+
+const CAS_CONFLICT = { ok: false, conflict: true } as TransitionResult;
 
 function ensureInput(over: Partial<Parameters<
   ReturnType<typeof createPhoneSessionPort>['ensureSession']
@@ -564,9 +595,13 @@ describe('phone session port: minting provisions the room in the same CAS', () =
       expect(got).toBeNull();
       expect(got).not.toBe(NEW_SESSION);
       // The attempt was genuinely made — this is a refusal AFTER the write,
-      // not a port that skipped provisioning altogether.
+      // not a port that skipped provisioning altogether. Since M009 E1 the
+      // port then tries to CANCEL the half-provisioned row (second call), so
+      // it cannot hold the engagement's live slot.
       expect(w.calls.createSession).toHaveLength(1);
-      expect(w.calls.transitionSession).toHaveLength(1);
+      expect(w.calls.transitionSession).toHaveLength(2);
+      expect(w.calls.transitionSession[1]!.slice(0, 4))
+        .toEqual([NEW_SESSION, 'created', 'cancelled', 'duplicate_session']);
     });
   }
 });
@@ -627,5 +662,285 @@ describe('a candidate with more than one live engagement adopts NOTHING', () => 
 
     expect(id).toBe('S-ORPHAN');
     expect(writes.createSession.length).toBe(0);
+  });
+});
+
+// ════════════════════════════════════════════════════════════════════
+//  M009 E1 — the live-only engagement index, and every null explained
+// ════════════════════════════════════════════════════════════════════
+
+describe('M009 E1: own session recovery, reason-coded nulls, no sibling adoption', () => {
+  // 0112 narrowed `uq_call_sessions_phone_engagement` to LIVE sessions. The
+  // port's half of the fix: a terminal own session no longer blocks a mint
+  // (the index is what stopped it, and the port must not stop it either), a
+  // half-provisioned own `created` row is finished or cancelled rather than
+  // left to wedge the engagement, and every `null` says why in one line.
+
+  it('own session terminal, two live engagements: exactly one create, claimed by THIS engagement', async () => {
+    // `findSessionForEngagement` answers null for a terminal own session (it
+    // filters `created`/`waiting`), and two live engagements skip candidate
+    // adoption — so the only road left is the mint, and it must be taken.
+    const { reader, calls } = fakeReader({
+      ownSession: null,
+      unprovisioned: null,
+      liveEngagements: 2,
+      reusable: 'session-must-not-be-adopted',
+    });
+    const w = fakeWriter();
+    const s = fakeSink();
+    const port = createPhoneSessionPort(reader, w.writer, s.sink);
+
+    const got = await port.ensureSession(ensureInput());
+
+    expect(got).toBe(NEW_SESSION);
+    expect(w.calls.createSession).toHaveLength(1);
+    expect(w.calls.createSession[0]!.phone_engagement_id).toBe(ENGAGEMENT);
+    expect(calls.findUnprovisionedSessionForEngagement).toEqual([ENGAGEMENT]);
+    expect(calls.findReusableSession).toHaveLength(0);
+    expect(s.events).toEqual([]);
+  });
+
+  it('own `created` session unprovisioned: CAS to `waiting` with its room, id returned, ZERO creates', async () => {
+    const STALE = 'session-own-created-4';
+    const { reader, calls } = fakeReader({ ownSession: null, unprovisioned: STALE });
+    const w = fakeWriter();
+    const s = fakeSink();
+    const port = createPhoneSessionPort(reader, w.writer, s.sink);
+
+    const got = await port.ensureSession(ensureInput());
+
+    expect(got).toBe(STALE);
+    expect(calls.findUnprovisionedSessionForEngagement).toEqual([ENGAGEMENT]);
+    expect(w.calls.createSession).toHaveLength(0);
+    expect(w.calls.transitionSession).toHaveLength(1);
+    const [id, from, to, reason, extra] = w.calls.transitionSession[0]!;
+    expect([id, from, to, reason]).toEqual([STALE, 'created', 'waiting', undefined]);
+    expect(extra).toEqual({ external_call_id: phoneRoomName(STALE) });
+    // Recovery short-circuits adoption entirely.
+    expect(calls.countLiveEngagements).toHaveLength(0);
+    expect(calls.findReusableSession).toHaveLength(0);
+    expect(s.events).toEqual([]);
+  });
+
+  it('own `created` CAS fails: the row is cancelled, then exactly one create runs', async () => {
+    const STALE = 'session-own-created-5';
+    const { reader } = fakeReader({ ownSession: null, unprovisioned: STALE, reusable: null });
+    const w = fakeWriter({ transitions: [CAS_CONFLICT, { ok: true }, { ok: true }] });
+    const s = fakeSink();
+    const port = createPhoneSessionPort(reader, w.writer, s.sink);
+
+    const got = await port.ensureSession(ensureInput());
+
+    expect(got).toBe(NEW_SESSION);
+    expect(w.calls.transitionSession.map((a) => a.slice(0, 4))).toEqual([
+      [STALE, 'created', 'waiting', undefined],
+      [STALE, 'created', 'cancelled', 'duplicate_session'],
+      [NEW_SESSION, 'created', 'waiting', undefined],
+    ]);
+    expect(w.calls.createSession).toHaveLength(1);
+    expect(w.calls.createSession[0]!.phone_engagement_id).toBe(ENGAGEMENT);
+    expect(s.events).toEqual([]);
+  });
+
+  it('own `created` CAS AND cancel both fail: null, no create, provision_cas_failed', async () => {
+    // The row may still hold the live slot, so a mint would only 23505.
+    const STALE = 'session-own-created-6';
+    const { reader } = fakeReader({ ownSession: null, unprovisioned: STALE });
+    const w = fakeWriter({ transitions: [CAS_CONFLICT, CAS_CONFLICT] });
+    const s = fakeSink();
+    const port = createPhoneSessionPort(reader, w.writer, s.sink);
+
+    const got = await port.ensureSession(ensureInput());
+
+    expect(got).toBeNull();
+    expect(w.calls.createSession).toHaveLength(0);
+    expect(w.calls.transitionSession).toHaveLength(2);
+    expect(s.events).toEqual([{ reason: 'provision_cas_failed', engagementId: ENGAGEMENT }]);
+  });
+
+  it('CAS after a FRESH create fails: cancel attempted, null, provision_cas_failed logged once', async () => {
+    const { reader } = fakeReader({ reusable: null });
+    const w = fakeWriter({ transitions: [CAS_CONFLICT, { ok: true }] });
+    const s = fakeSink();
+    const port = createPhoneSessionPort(reader, w.writer, s.sink);
+
+    const got = await port.ensureSession(ensureInput());
+
+    expect(got).toBeNull();
+    expect(w.calls.createSession).toHaveLength(1);
+    expect(w.calls.transitionSession.map((a) => a.slice(0, 4))).toEqual([
+      [NEW_SESSION, 'created', 'waiting', undefined],
+      [NEW_SESSION, 'created', 'cancelled', 'duplicate_session'],
+    ]);
+    expect(s.events).toEqual([{ reason: 'provision_cas_failed', engagementId: ENGAGEMENT }]);
+  });
+
+  it('createSession fails 23505: null, no transition, insert_failed carries the SQLSTATE', async () => {
+    const { reader } = fakeReader({ reusable: null });
+    const err = Object.assign(new Error('ERR_INSERT_FAILED'), { pgCode: '23505' });
+    const w = fakeWriter({ created: { data: null, error: err } });
+    const s = fakeSink();
+    const port = createPhoneSessionPort(reader, w.writer, s.sink);
+
+    const got = await port.ensureSession(ensureInput());
+
+    expect(got).toBeNull();
+    expect(w.calls.transitionSession).toHaveLength(0);
+    expect(s.events).toEqual([
+      { reason: 'insert_failed', engagementId: ENGAGEMENT, pgCode: '23505' },
+    ]);
+  });
+
+  it('createSession fails with no SQLSTATE: insert_failed with no pgCode at all', async () => {
+    const { reader } = fakeReader({ reusable: null });
+    const w = fakeWriter({ created: { data: null, error: new Error('ERR_INSERT_FAILED') } });
+    const s = fakeSink();
+    const port = createPhoneSessionPort(reader, w.writer, s.sink);
+
+    expect(await port.ensureSession(ensureInput())).toBeNull();
+    expect(s.events).toEqual([{ reason: 'insert_failed', engagementId: ENGAGEMENT }]);
+  });
+
+  it('an existing `in_progress` session is reused (reconnect, unchanged) and logs nothing', async () => {
+    const { reader, calls } = fakeReader({
+      session: { status: 'in_progress', roomVerified: true },
+    });
+    const w = fakeWriter();
+    const s = fakeSink();
+    const port = createPhoneSessionPort(reader, w.writer, s.sink);
+
+    const got = await port.ensureSession(ensureInput({ existingSessionId: EXISTING_SESSION }));
+
+    expect(got).toBe(EXISTING_SESSION);
+    expect(calls.findUnprovisionedSessionForEngagement).toHaveLength(0);
+    expectNoWrites(w.calls);
+    expect(s.events).toEqual([]);
+  });
+
+  for (const status of TERMINAL_STATES) {
+    it(`an existing \`${status}\` session: null, ZERO creates, existing_terminal logged`, async () => {
+      const { reader, calls } = fakeReader({ session: { status, roomVerified: true } });
+      const w = fakeWriter();
+      const s = fakeSink();
+      const port = createPhoneSessionPort(reader, w.writer, s.sink);
+
+      const got = await port.ensureSession(ensureInput({ existingSessionId: EXISTING_SESSION }));
+
+      expect(got).toBeNull();
+      expectNoWrites(w.calls);
+      // The recovery path is for PRE-consent engagements only; a bound dead
+      // session is E3/E4's to resolve, so it is never even consulted.
+      expect(calls.findUnprovisionedSessionForEngagement).toHaveLength(0);
+      expect(s.events).toEqual([{ reason: 'existing_terminal', engagementId: ENGAGEMENT }]);
+    });
+  }
+
+  it('an existing session that no longer exists also logs existing_terminal', async () => {
+    const { reader } = fakeReader({ session: null });
+    const w = fakeWriter();
+    const s = fakeSink();
+    const port = createPhoneSessionPort(reader, w.writer, s.sink);
+
+    expect(await port.ensureSession(ensureInput({ existingSessionId: EXISTING_SESSION })))
+      .toBeNull();
+    expectNoWrites(w.calls);
+    expect(s.events).toEqual([{ reason: 'existing_terminal', engagementId: ENGAGEMENT }]);
+  });
+
+  it('an existing live session with an unverified room logs existing_room_unverified', async () => {
+    const { reader } = fakeReader({ session: { status: 'waiting', roomVerified: false } });
+    const w = fakeWriter();
+    const s = fakeSink();
+    const port = createPhoneSessionPort(reader, w.writer, s.sink);
+
+    expect(await port.ensureSession(ensureInput({ existingSessionId: EXISTING_SESSION })))
+      .toBeNull();
+    expectNoWrites(w.calls);
+    expect(s.events).toEqual([{ reason: 'existing_room_unverified', engagementId: ENGAGEMENT }]);
+  });
+
+  it('candidate adoption is scoped to the asking engagement', async () => {
+    // The reader turns this into the `phone_engagement_id` null-or-self
+    // filter (see phone-runtime-read.test.ts); the port's job is to pass it.
+    const { reader, calls } = fakeReader({ reusable: ADOPTED_SESSION, owner: null });
+    const w = fakeWriter();
+    const port = createPhoneSessionPort(reader, w.writer, fakeSink().sink);
+
+    expect(await port.ensureSession(ensureInput())).toBe(ADOPTED_SESSION);
+    expect(calls.findReusableSessionEngagement).toEqual([ENGAGEMENT]);
+  });
+
+  it('a throwing sink cannot change the decision', async () => {
+    const { reader } = fakeReader({ session: { status: 'expired', roomVerified: true } });
+    const w = fakeWriter();
+    const port = createPhoneSessionPort(reader, w.writer, () => {
+      throw new Error('sink_down');
+    });
+
+    await expect(port.ensureSession(ensureInput({ existingSessionId: EXISTING_SESSION })))
+      .resolves.toBeNull();
+    expectNoWrites(w.calls);
+  });
+
+  it('a reader without the recovery method (a due-pass double) still mints as before', async () => {
+    const { reader } = fakeReader({ reusable: null });
+    const bare: typeof reader = { ...reader, findUnprovisionedSessionForEngagement: undefined };
+    const w = fakeWriter();
+    const port = createPhoneSessionPort(bare, w.writer, fakeSink().sink);
+
+    expect(await port.ensureSession(ensureInput())).toBe(NEW_SESSION);
+    expect(w.calls.createSession).toHaveLength(1);
+  });
+});
+
+describe('M009 E1: the phone_session_unavailable log line survives the logger allowlist', () => {
+  function emitted(event: PhoneSessionUnavailable): Record<string, unknown> {
+    const lines: string[] = [];
+    const logger = createLogger('phone-runtime', {
+      writer: (line) => { lines.push(line); },
+      clock: () => '2026-10-03T00:00:00.000Z',
+      correlationIdGetter: () => null,
+    });
+    logger.info('unknown_event', phoneSessionUnavailableMeta(event));
+    expect(lines).toHaveLength(1);
+    return JSON.parse(lines[0]!) as Record<string, unknown>;
+  }
+
+  it('reason, engagement uuid and SQLSTATE all reach the emitted line', () => {
+    const line = emitted({ reason: 'insert_failed', engagementId: ENGAGEMENT, pgCode: '23505' });
+    expect(line.error_type).toBe('phone_session_unavailable:insert_failed');
+    expect(line.error_category).toBe(`e.${ENGAGEMENT}:pg.23505`);
+  });
+
+  // Every reason with the LONGEST possible payload: a field over the logger's
+  // 64-character SAFE_IDENT bound is dropped whole, silently, so the bound is
+  // asserted through the real logger rather than by arithmetic in a comment.
+  for (const reason of [
+    'existing_terminal',
+    'existing_room_unverified',
+    'insert_failed',
+    'provision_cas_failed',
+  ] as const) {
+    it(`\`${reason}\` with an engagement id and a SQLSTATE survives the logger intact`, () => {
+      const line = emitted({ reason, engagementId: ENGAGEMENT, pgCode: '23505' });
+      expect(line.error_type).toBe(`phone_session_unavailable:${reason}`);
+      expect(line.error_category).toBe(`e.${ENGAGEMENT}:pg.23505`);
+    });
+  }
+
+  it('a non-UUID engagement id and a non-SQLSTATE code are left out, never spliced in', () => {
+    const meta = phoneSessionUnavailableMeta({
+      reason: 'insert_failed',
+      engagementId: 'not,a.uuid',
+      pgCode: 'PGRST116',
+    });
+    expect(meta).toEqual({ error_type: 'phone_session_unavailable:insert_failed' });
+  });
+
+  it('an id with a ten-digit run is dropped so the logger guard cannot eat the SQLSTATE', () => {
+    const digits = 'e1e1e1e1-0000-4000-8000-123456789012';
+    const line = emitted({ reason: 'insert_failed', engagementId: digits, pgCode: '23505' });
+    expect(line.error_type).toBe('phone_session_unavailable:insert_failed');
+    expect(line.error_category).toBe('pg.23505');
   });
 });

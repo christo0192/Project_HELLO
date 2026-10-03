@@ -313,3 +313,126 @@ lane-specific facts:
 (`flyctl machine start` the pool / the always-on machine), THEN revert the
 `fly.toml` flip and unset the API `BROWSER_AGENT_NAME`. Never flip the flag off
 while the app is at zero — that strands in-flight browser candidates.
+
+---
+
+## 9. Per-machine dispatch names, kill_timeout and the reaper (M009 E2, 2026-10-03)
+
+### Why it exists
+
+Before M009 every phone machine registered with LiveKit under the one shared
+name `phone-screener`. A dispatch for session S could be taken by **any** idle
+phone worker, not necessarily the machine the orchestrator leased for S. Every
+stop path (terminal-release, reaper, cleanup) judges a machine by the session
+on **its lease**, so a machine running somebody else's interview could be
+stopped mid-call. The per-machine name ties the dispatch back to the leased
+machine.
+
+### The naming contract
+
+- **Name shape:** `<PHONE_AGENT_NAME>-<FLY_MACHINE_ID>`, e.g.
+  `phone-screener-7812736a540d58`.
+  - The machine id must match `^[0-9a-z]{8,32}$`.
+  - The full name must match `^[A-Za-z0-9_-]{1,64}-[0-9a-z]{8,32}$`.
+  - The API (`livekit-phone-dial/agent-name.ts`), the 0112 CHECK constraint on
+    `voice_worker_leases.registered_agent_name`, the `/ready-machine` schema and
+    the worker (`agent.py`) all pin the same patterns. Cross-language tests
+    fail if they drift.
+- **Who decides the name:** the worker. With `PHONE_PER_MACHINE_AGENT_NAME="true"`
+  it registers that name and reports it as `agent_name` on its machine-level
+  ready post. The API stores it on the lease through
+  `set_voice_worker_agent_name`, which refuses a name whose suffix is not the
+  lease's own machine id.
+- **What the API does with it:** it **never invents** a per-machine name.
+  - The dial dispatches to the reported name only if it is exactly
+    `phone-screener-<the lease's machine id>`.
+  - It then waits a bounded time (`PHONE_AGENT_JOIN_TIMEOUT_SEC`, default 20,
+    clamped so the admission lease still covers it) for that agent to join
+    before originating any SIP leg.
+  - A mismatched name, or an agent that never joins, defers the dial as
+    `worker_not_ready` through the same infra deferral as a gate timeout. It
+    is uncharged and retried the same day.
+- **An unnamed lease** (the flag off, or an old worker) dispatches the shared
+  base name exactly as before. With the flag off nothing changes:
+  - the worker registers `phone-screener`;
+  - the ready body is `{app, machine_id}`;
+  - `markBusy` keeps the attempt epoch;
+  - there is no participant polling.
+- **Claim and reset** clear the stored name, so a stale name can never outlive
+  the boot that reported it.
+
+### Rollout order (do not reorder)
+
+1. **PR-A deploys** with the worker flag **absent**. It contains migration 0112,
+   the API that accepts and stores names, the targeted-dispatch code (inert
+   without names), the worker code, `kill_timeout = 300` and the per-app reaper.
+2. Confirm the **new API image is live**. Run
+   `fly logs -a project-hello-api --no-tail` and check that the release running
+   is the PR-A image (`fly releases -a project-hello-api`). Until then, an old
+   API's strict `/ready-machine` schema returns 400 to a body carrying
+   `agent_name`.
+3. **Pre-flip smoke test** (dial loop halted):
+   - Set the flag on **one** stopped phone machine only:
+     `fly machine update <id> -a project-hello-phone-voice --env PHONE_PER_MACHINE_AGENT_NAME=true`.
+   - Start it.
+   - Run Canary-1 as a dry run with `--machine <id>` (see
+     `phone-canary1.md` §4d) and confirm `worker_present_before_originate|PASS`.
+4. **PR-B flips** `PHONE_PER_MACHINE_AGENT_NAME = "true"` in `fly.phone.toml`
+   `[env]`. Before that PR merges, the production room client must expose
+   `listParticipants`, or every targeted dial defers as
+   `agent_join_unverifiable`.
+
+### Rollback
+
+**Remove `PHONE_PER_MACHINE_AGENT_NAME` from `fly.phone.toml` and redeploy
+phone-voice only. The API needs no change.**
+
+- Workers re-register `phone-screener` and stop reporting a name.
+- The next claim or reset nulls any stored name, so the API goes back to the
+  shared-name dispatch.
+- 0112 needs no down migration: the column and RPC are inert when unused.
+
+### Do NOT turn the API `WORKER_ORCHESTRATION` off while the worker flag is on
+
+With orchestration off there is no dial gate. The API then dispatches the
+**shared** name, and with the worker flag on no worker is registered under it,
+so no call is answered. This is **documented, not enforced** in code.
+
+If you need to roll orchestration back (§6), first remove the worker flag and
+redeploy phone-voice, and only then follow §6.
+
+### `kill_timeout = 300` (fly.phone.toml)
+
+- **The default was too short.** Fly's default stop grace is **5 s**. On
+  2026-10-03 a machine running a live interview logged `draining worker` and
+  was force-killed 5 s later, mid-call. 5 s defeats both the SDK drain and
+  `PHONE_SHUTDOWN_PROCESS_TIMEOUT`.
+- **300 s costs nothing when healthy.** 300 is Fly's documented maximum. An
+  idle worker has no job to drain and exits at once.
+- **What it protects:** a busy worker gets up to 300 s to finish the call and
+  the recording upload, on both a wrongful stop and a legitimate
+  terminal-release stop.
+- **Validation:** `scripts/validate-voice-worker-apps.mjs` requires a top-level
+  integer in 90..300 on the phone app.
+- **Side effect on deploys:** a deploy that has to drain a live call can take
+  up to 5 minutes longer. Merge outside the IST calling window.
+- **Verify after deploy:** run
+  `fly machine status <id> -a project-hello-phone-voice -d` and check that
+  `stop_config.timeout` is 300 s. If it is not populated, the orchestrator's
+  stop (POST /stop with no body) does not inherit it. In that case, pass
+  `{timeout:'300s'}` explicitly (PR-B follow-up).
+
+### Reaper and terminal-release are now per app
+
+**This changes browser behaviour.**
+
+- **Before:** the reaper and terminal-release loops used one phone-configured
+  service for both apps. So a browser lease's room was probed as
+  `phone-<browserSessionId>`, which never exists. The probe read "not found",
+  and a **live browser machine could be stopped**.
+- **Now:** each app uses its own service.
+  - Phone leases probe `phone-<id>`.
+  - Browser leases probe `screening-<id>`.
+  - A not-found room still counts as dead.
+- **What to watch** after deploy: browser reaper stops should drop to only
+  genuinely idle or orphaned machines.

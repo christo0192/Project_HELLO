@@ -132,6 +132,25 @@ export function buildPhoneDispatchMetadata(
   });
 }
 
+/**
+ * The participant fields the M009 E2 agent-join barrier (dial.ts) reads, and
+ * nothing more. Every field is optional and loosely typed because the value
+ * comes straight off the SDK's `ParticipantInfo` and is validated at the read.
+ *
+ * `attributes` is present ONLY so the barrier can read ONE key,
+ * `lk.agent_name`, and only on a participant already proven to be of AGENT
+ * kind. A SIP participant's attribute map carries the subscriber's number;
+ * the barrier never reads a SIP participant's attributes, never copies the
+ * map, and never returns or retains the listing — it reduces it to a boolean
+ * (or a set of agent identities) on the spot.
+ */
+export interface PhoneRoomParticipantLike {
+  readonly identity?: string;
+  /** `ParticipantInfo_Kind` — numeric from the SDK (AGENT = 4). */
+  readonly kind?: number | string;
+  readonly attributes?: Readonly<Record<string, string>>;
+}
+
 /** The narrow slice of `RoomServiceClient` this file uses. */
 export interface PhoneRoomServiceClientLike {
   createRoom(options: {
@@ -141,6 +160,17 @@ export interface PhoneRoomServiceClientLike {
     metadata: string;
   }): Promise<unknown>;
   updateRoomMetadata(room: string, metadata: string): Promise<unknown>;
+  /**
+   * M009 E2: room membership, read ONLY by the targeted (per-machine) dispatch's
+   * agent-join barrier in dial.ts. Must REJECT rather than invent on failure; a
+   * room that does not exist rejects with LiveKit's `not_found`.
+   *
+   * OPTIONAL so every existing implementation (Canary-1, the untargeted path,
+   * hand-built fakes) keeps compiling unchanged. A targeted dispatch whose
+   * client lacks it cannot prove the agent joined, so it DEFERS — it never
+   * originates on an unverifiable join.
+   */
+  listParticipants?(room: string): Promise<ReadonlyArray<PhoneRoomParticipantLike>>;
 }
 
 /** The named-agent dispatch seam. Absent when no phone worker is deployed. */

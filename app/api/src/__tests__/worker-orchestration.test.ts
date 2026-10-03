@@ -38,13 +38,18 @@ const MACHINE = 'd891234abcd567';
  */
 function lease(
   state: string | null,
-  over: { claimedSessionId?: string | null; epoch?: number | null } = {},
+  over: {
+    claimedSessionId?: string | null;
+    epoch?: number | null;
+    registeredAgentName?: string | null;
+  } = {},
 ) {
   return {
     state,
     claimedSessionId:
       'claimedSessionId' in over ? (over.claimedSessionId ?? null) : SESSION,
     epoch: over.epoch ?? null,
+    registeredAgentName: over.registeredAgentName ?? null,
   };
 }
 
@@ -169,7 +174,7 @@ describe('ensureReadyWorker', () => {
       },
     }));
     const r = await svc.ensureReadyWorker({ app: APP, pipeline: 'phone', sessionId: SESSION });
-    expect(r).toEqual({ status: 'ready', machineId: MACHINE });
+    expect(r).toEqual({ status: 'ready', machineId: MACHINE, epoch: 7, agentName: null });
     expect(fly.calls).toContain(`start:${APP}:${MACHINE}`);
     expect(fly.calls).toContain(`wait:${APP}:${MACHINE}:started`);
     // Never cleaned up on the happy path.
@@ -296,7 +301,7 @@ describe('ensureReadyWorker', () => {
     }));
 
     const r = await svc.ensureReadyWorker({ app: APP, pipeline: 'phone', sessionId: SESSION });
-    expect(r).toEqual({ status: 'ready', machineId: MACHINE });
+    expect(r).toEqual({ status: 'ready', machineId: MACHINE, epoch: 4, agentName: null });
   });
 
   it('a STOPPED lease (null claim) is "not yet", not "lost" — the budget is spent', async () => {
@@ -880,7 +885,7 @@ describe('FULL LIFECYCLE E2E (no PSTN): claim → ready → busy → terminal re
 
     // 1. claim → start → ready
     const ready = await svc.ensureReadyWorker({ app: APP, pipeline: 'phone', sessionId: SESSION });
-    expect(ready).toEqual({ status: 'ready', machineId: MACHINE });
+    expect(ready).toEqual({ status: 'ready', machineId: MACHINE, epoch: 1, agentName: null });
     expect(machineState).toBe('started');
     // The readiness poll observed 'ready' (mapped from 'starting' in the model).
 
@@ -897,7 +902,7 @@ describe('FULL LIFECYCLE E2E (no PSTN): claim → ready → busy → terminal re
     // 4. the pool row is REUSABLE — a new session can claim the same machine.
     const OTHER = '33333333-3333-4333-8333-333333333333';
     const reclaim = await svc.ensureReadyWorker({ app: APP, pipeline: 'phone', sessionId: OTHER });
-    expect(reclaim).toEqual({ status: 'ready', machineId: MACHINE });
+    expect(reclaim).toEqual({ status: 'ready', machineId: MACHINE, epoch: 2, agentName: null });
     expect(boundSession).toBe(OTHER);
   });
 
@@ -970,7 +975,7 @@ describe('FULL LIFECYCLE E2E (no PSTN): claim → ready → busy → terminal re
 
     // Claim + ready, then the call ends and the session goes terminal.
     const ready = await svc.ensureReadyWorker({ app: APP, pipeline: 'phone', sessionId: SESSION });
-    expect(ready).toEqual({ status: 'ready', machineId: MACHINE });
+    expect(ready).toEqual({ status: 'ready', machineId: MACHINE, epoch: 1, agentName: null });
     expect(machineState).toBe('started');
     sessionTerminal = true; // the bound session reached a terminal status
 
@@ -984,7 +989,7 @@ describe('FULL LIFECYCLE E2E (no PSTN): claim → ready → busy → terminal re
     // The lease is REUSABLE: a fresh session claims the same machine.
     const OTHER = '44444444-4444-4444-8444-444444444444';
     const reclaim = await svc.ensureReadyWorker({ app: APP, pipeline: 'phone', sessionId: OTHER });
-    expect(reclaim).toEqual({ status: 'ready', machineId: MACHINE });
+    expect(reclaim).toEqual({ status: 'ready', machineId: MACHINE, epoch: 2, agentName: null });
     expect(boundSession).toBe(OTHER);
   });
 });
@@ -1253,5 +1258,100 @@ describe('reaper runtime gate', () => {
     expect(runtime!.loopIntervalsMs).toHaveProperty('worker-orchestration-terminal-release');
     expect(runtime!.loopIntervalsMs).toHaveProperty('worker-orchestration-reap');
     await runtime!.stop();
+  });
+});
+
+// ── M009 E2: ensureReadyWorker surfaces the LEASE epoch + the reported name ──
+describe('ensureReadyWorker — lease epoch and registered agent name (M009 E2)', () => {
+  const ATTEMPT_EPOCH = 1;
+  const AGENT = 'phone-screener-d891234abcd567';
+
+  it('returns the LEASE epoch (7) from the ready read, not the attempt epoch passed in', async () => {
+    const { rpc, calls } = fakeRpc({
+      claim_voice_worker: [{ data: { status: 'claimed', machine_id: MACHINE, epoch: 7 } }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({
+      rpc,
+      readLeaseState: async () => lease('ready', { epoch: 7, registeredAgentName: AGENT }),
+    }));
+    const r = await svc.ensureReadyWorker({
+      app: APP, pipeline: 'phone', sessionId: SESSION, epoch: ATTEMPT_EPOCH,
+    });
+    expect(r).toEqual({ status: 'ready', machineId: MACHINE, epoch: 7, agentName: AGENT });
+    // The attempt epoch still reaches the claim RPC unchanged.
+    expect(calls.find((c) => c.name === 'claim_voice_worker')!.args.p_epoch).toBe(ATTEMPT_EPOCH);
+  });
+
+  it('a NULL registered_agent_name gives agentName null (shared-name dispatch)', async () => {
+    const { rpc } = fakeRpc({
+      claim_voice_worker: [{ data: { status: 'claimed', machine_id: MACHINE, epoch: 7 } }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({
+      rpc,
+      readLeaseState: async () => lease('ready', { epoch: 7, registeredAgentName: null }),
+    }));
+    const r = await svc.ensureReadyWorker({
+      app: APP, pipeline: 'phone', sessionId: SESSION, epoch: ATTEMPT_EPOCH,
+    });
+    expect(r).toEqual({ status: 'ready', machineId: MACHINE, epoch: 7, agentName: null });
+  });
+
+  it('a reader that omits the name field entirely reads as agentName null', async () => {
+    const { rpc } = fakeRpc({
+      claim_voice_worker: [{ data: { status: 'claimed', machine_id: MACHINE, epoch: 5 } }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({
+      rpc,
+      readLeaseState: async () => ({ state: 'busy', claimedSessionId: SESSION, epoch: 5 }),
+    }));
+    const r = await svc.ensureReadyWorker({ app: APP, pipeline: 'phone', sessionId: SESSION });
+    expect(r).toEqual({ status: 'ready', machineId: MACHINE, epoch: 5, agentName: null });
+  });
+
+  it('an unparsed read epoch falls back to the CLAIM epoch (still the lease epoch)', async () => {
+    const { rpc } = fakeRpc({
+      claim_voice_worker: [{ data: { status: 'claimed', machine_id: MACHINE, epoch: 12 } }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({
+      rpc,
+      readLeaseState: async () => lease('ready', { epoch: null, registeredAgentName: AGENT }),
+    }));
+    const r = await svc.ensureReadyWorker({
+      app: APP, pipeline: 'phone', sessionId: SESSION, epoch: ATTEMPT_EPOCH,
+    });
+    expect(r).toEqual({ status: 'ready', machineId: MACHINE, epoch: 12, agentName: AGENT });
+  });
+
+  it('the name comes from the read that PROVED ready, not from an earlier not-ready read', async () => {
+    // A `starting` read carrying a name (it cannot in production — the name
+    // and ready are written in that order by one request — but the service
+    // must not depend on that) is ignored; only the ready read's fields count.
+    const { rpc } = fakeRpc({
+      claim_voice_worker: [{ data: { status: 'claimed', machine_id: MACHINE, epoch: 3 } }],
+    });
+    let reads = 0;
+    const svc = createWorkerOrchestrationService(baseDeps({
+      rpc,
+      readLeaseState: async () => {
+        reads += 1;
+        return reads === 1
+          ? lease('starting', { epoch: 3, registeredAgentName: 'phone-screener-ffffffffffffff' })
+          : lease('ready', { epoch: 3, registeredAgentName: null });
+      },
+    }));
+    const r = await svc.ensureReadyWorker({ app: APP, pipeline: 'phone', sessionId: SESSION });
+    expect(r).toEqual({ status: 'ready', machineId: MACHINE, epoch: 3, agentName: null });
+  });
+
+  it('a claim lost to a higher epoch still never returns ready (no epoch/name leaked)', async () => {
+    const { rpc } = fakeRpc({
+      claim_voice_worker: [{ data: { status: 'claimed', machine_id: MACHINE, epoch: 3 } }],
+    });
+    const svc = createWorkerOrchestrationService(baseDeps({
+      rpc,
+      readLeaseState: async () => lease('ready', { epoch: 4, registeredAgentName: AGENT }),
+    }));
+    const r = await svc.ensureReadyWorker({ app: APP, pipeline: 'phone', sessionId: SESSION });
+    expect(r).toEqual({ status: 'timeout' });
   });
 });

@@ -54,6 +54,11 @@
 //      bad value would validate on the good one. Duplicate keys are invalid
 //      TOML and flyctl rejects the file, but a checker must not be the thing
 //      that says "fine" about a file the deploy will reject.
+//  10. PER-MACHINE REGISTRATION (E2, M009). PHONE_PER_MACHINE_AGENT_NAME is
+//      allowed only in fly.phone.toml, and only absent or exactly "true";
+//      fly.toml (browser) must never carry it. A top-level kill_timeout is
+//      accepted (bare integer seconds, 1..300; >= 90 on the phone app so a
+//      stop drains a live call instead of Fly's 5 s default force-kill).
 
 import { readFileSync } from "node:fs";
 import { APPROVED_WORKER_REGIONS, assertPolicyConsistent, checkPrimaryRegion } from "./fly-region-policy.mjs";
@@ -267,6 +272,55 @@ for (const [label, text] of [["fly.toml", browser], ["fly.phone.toml", phoneCfg]
 if (typeof phoneName === "string") {
   ok(!/[0-9]{7,}/.test(phoneName), "PHONE_AGENT_NAME must be a dispatch name, not a phone/trunk number");
   ok(/^[A-Za-z][A-Za-z0-9_-]*$/.test(phoneName.trim()), "PHONE_AGENT_NAME must be a simple identifier");
+}
+
+// ── 5d. Per-machine registration flag (E2, M009) ─────────────────────────
+// PHONE_PER_MACHINE_AGENT_NAME makes the PHONE worker register as
+// `<PHONE_AGENT_NAME>-<FLY_MACHINE_ID>` so the API can dispatch a leased
+// session to exactly its leased machine. Phone app: absent (PR-A, the shared
+// name) or exactly "true" — any other value is a typo the worker silently
+// reads as OFF, which would look like a rollout that never happened. Browser
+// app: never — the browser worker has no per-machine dispatch, and the key
+// there could only be a copy-paste from the phone config.
+ok(!hasEnvKey(browser, "PHONE_PER_MACHINE_AGENT_NAME"),
+  "fly.toml (browser) must NOT set PHONE_PER_MACHINE_AGENT_NAME — per-machine registration is a phone-worker-only rollout flag");
+{
+  const perMachine = envValue(phoneCfg, "PHONE_PER_MACHINE_AGENT_NAME");
+  ok(perMachine === undefined || perMachine === "true",
+    `fly.phone.toml PHONE_PER_MACHINE_AGENT_NAME must be absent or exactly "true" (got ${JSON.stringify(perMachine)})`);
+  notes.push(`phone_per_machine_agent_name=${perMachine === "true" ? "on" : "off"}`);
+}
+
+// ── 5e. kill_timeout (E2, M009) ──────────────────────────────────────────
+// Fly's default 5 s force-kill defeats the SDK drain, so the phone app sets a
+// top-level kill_timeout. Accepted on either config; when present it must be a
+// single top-level bare integer in seconds. On the PHONE app it must cover the
+// parent's PHONE_SHUTDOWN_PROCESS_TIMEOUT grace (90 s) and stay within Fly's
+// documented 300 s maximum — a value Fly refuses would fail the deploy late.
+function topLevelRawAll(text, key) {
+  const found = [];
+  for (const line of text.split("\n")) {
+    if (/^\s*\[/.test(line)) break;
+    const m = line.replace(/\r$/, "").match(new RegExp(`^${key}\\s*=\\s*([^#]*?)\\s*(#.*)?$`));
+    if (m) found.push(m[1]);
+  }
+  return found;
+}
+for (const [label, text, isPhone] of [["fly.toml", browser, false], ["fly.phone.toml", phoneCfg, true]]) {
+  const declared = topLevelRawAll(text, "kill_timeout");
+  // A kill_timeout nested under a table is not the app-level setting Fly reads.
+  const anywhere = anyValueAll(text, "kill_timeout").length;
+  ok(anywhere === declared.length,
+    `${label} declares kill_timeout inside a table; it must be a top-level key to apply to the app`);
+  ok(declared.length <= 1, `${label} declares kill_timeout ${declared.length} times — a duplicate key is invalid TOML`);
+  if (declared.length !== 1) continue;
+  const raw = declared[0];
+  ok(/^[0-9]+$/.test(raw), `${label} kill_timeout must be a bare integer number of seconds (got ${raw})`);
+  const secs = Number.parseInt(raw, 10);
+  ok(secs >= 1 && secs <= 300, `${label} kill_timeout must be within Fly's 1..300 s range (got ${raw})`);
+  if (isPhone) {
+    ok(secs >= 90, `fly.phone.toml kill_timeout must be >= 90 s so a stop drains the phone worker (PHONE_SHUTDOWN_PROCESS_TIMEOUT) instead of force-killing a live call (got ${raw})`);
+  }
 }
 
 // ── 5c. Deployment region contract (PR104) ───────────────────────────────

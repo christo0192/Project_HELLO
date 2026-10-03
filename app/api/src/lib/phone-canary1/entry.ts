@@ -53,6 +53,11 @@ import { wrapDialableNumber, type DialableNumber } from '../../integrations/live
 // originate seam into this module's graph in order to sanitise a string would
 // be the wrong shape whatever the structural suite made of it.
 import { loadPhoneDialConfig } from '../../integrations/livekit-phone-dial/config.js';
+// M009 E2. `agent-name.ts` has zero imports and performs no I/O, so this adds
+// one leaf to the closure and nothing behind it. Imported DIRECTLY, never via
+// the directory barrel, for the same reason as the two imports above.
+import { phoneMachineAgentName } from '../../integrations/livekit-phone-dial/agent-name.js';
+import { CANARY1_DEFAULT_AGENT_NAME } from './plan.js';
 import { containsDigitRun } from './metadata.js';
 
 /** Every stable refusal this module can produce. */
@@ -67,6 +72,8 @@ export const CANARY1_ENTRY_REFUSALS = [
   'phone_number_not_dialable',
   'flag_value_missing',
   'flag_value_not_an_integer',
+  'machine_id_invalid',
+  'flag_conflict',
 ] as const;
 
 export type Canary1EntryRefusal = (typeof CANARY1_ENTRY_REFUSALS)[number];
@@ -142,6 +149,13 @@ export interface Canary1Flags {
   readonly joinWaitSeconds: number | undefined;
   readonly wallClockSeconds: number | undefined;
   readonly agentName: string | undefined;
+  /**
+   * The Fly machine id `--machine` named, or undefined. When set, `agentName`
+   * is already the per-machine name resolved from it — the orchestrator needs
+   * nothing else, and the id is carried only so a caller can say which machine
+   * the run was bound to.
+   */
+  readonly machineId: string | undefined;
 }
 
 export type Canary1ParseResult =
@@ -181,6 +195,7 @@ export function parseCanary1Argv(argv: readonly string[]): Canary1ParseResult {
     joinWaitSeconds: undefined as number | undefined,
     wallClockSeconds: undefined as number | undefined,
     agentName: undefined as string | undefined,
+    machineId: undefined as string | undefined,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -192,6 +207,50 @@ export function parseCanary1Argv(argv: readonly string[]): Canary1ParseResult {
       return refuse('destination_in_argv');
     }
     if (looksLikeDestination(token)) return refuse('destination_in_argv');
+
+    // ── `--machine <flyMachineId>` (M009 E2) ─────────────────────────────
+    // With `PHONE_PER_MACHINE_AGENT_NAME` on, every phone worker registers as
+    // `phone-screener-<itsMachineId>` and NOTHING registers the shared name, so
+    // a canary dispatched to the default name is never picked up and fails
+    // safe as `worker_never_joined` (no SIP leg is originated without a join).
+    // `--machine` names the ONE started machine the operator wants exercised
+    // and resolves the dispatch name through the SAME helper the API uses, so
+    // the CLI cannot spell the name differently from the worker.
+    //
+    // WHY ITS VALUE IS EXEMPT FROM THE DIGIT-RUN RULE, AND ONLY FROM THAT ONE.
+    // A Fly machine id is 14 lowercase hex characters and routinely contains
+    // seven consecutive decimal digits (`7812736a540d58`), so the
+    // `containsDigitRun` rule `--agent-name` applies would refuse real ids.
+    // The exemption is earned by the shape check, not granted by the flag:
+    // the value must match `PER_MACHINE_ID_RE` (8-32 of [0-9a-z], no `+`, no
+    // separators), which no typed phone number satisfies — EXCEPT a bare digit
+    // string. So `looksLikeDestination` still runs FIRST: an all-digit value
+    // is refused `destination_in_argv` exactly like any other argument, and
+    // the only thing waived is the "digit run behind a letter" heuristic.
+    // Every OTHER argument keeps both rules; this case consumes only its own
+    // value token.
+    if (token === '--machine') {
+      const raw = argv[i + 1];
+      if (raw === undefined) return refuse('flag_value_missing');
+      if (CANARY1_FORBIDDEN_FLAGS.includes(raw as (typeof CANARY1_FORBIDDEN_FLAGS)[number])) {
+        return refuse('destination_in_argv');
+      }
+      if (looksLikeDestination(raw)) return refuse('destination_in_argv');
+      // One machine per run, and never alongside `--agent-name`: two sources
+      // for one dispatch name means one of them is silently ignored.
+      if (flags.machineId !== undefined || flags.agentName !== undefined) {
+        return refuse('flag_conflict');
+      }
+      const resolved = phoneMachineAgentName(CANARY1_DEFAULT_AGENT_NAME, raw);
+      // `null` is NOT "fall back to the shared name": a run that asked for one
+      // machine and silently dispatched to whichever worker LiveKit picks would
+      // prove nothing about the machine the operator named.
+      if (resolved === null) return refuse('machine_id_invalid');
+      flags.machineId = raw;
+      flags.agentName = resolved;
+      i += 1;
+      continue;
+    }
 
     const numeric = (assign: (n: number) => void): Canary1ParseResult | null => {
       const raw = argv[i + 1];
@@ -241,6 +300,8 @@ export function parseCanary1Argv(argv: readonly string[]): Canary1ParseResult {
           return refuse('destination_in_argv');
         }
         if (!/^[A-Za-z][A-Za-z0-9_-]{0,63}$/.test(raw)) return refuse('unknown_flag');
+        // See `--machine`: the two flags name the same dispatch field.
+        if (flags.agentName !== undefined) return refuse('flag_conflict');
         flags.agentName = raw;
         i += 1;
         break;

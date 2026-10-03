@@ -80,6 +80,24 @@ export const REUSABLE_SESSION_STATUSES = ['created', 'waiting'] as const;
 
 const REUSABLE_SESSION_COLUMNS = 'id,status,external_call_id,started_at';
 
+/**
+ * Candidate ADOPTION also reads the engagement claim, so the reader can
+ * re-check in process what the `.or(...)` filter already asked SQL for: a
+ * session another engagement has claimed is never handed back. Belt and
+ * braces on purpose — the filter is a string in a comma-delimited grammar,
+ * and the re-check is what a fake that ignores filters can still fail on.
+ */
+const ADOPTABLE_SESSION_COLUMNS = 'id,status,external_call_id,started_at,phone_engagement_id';
+
+/**
+ * M009 E1. The one column the half-provisioned recovery needs: WHICH row. The
+ * status is fixed by the filter and the room name is about to be written.
+ */
+const UNPROVISIONED_SESSION_COLUMNS = 'id';
+
+/** Canonical UUID shape — the only engagement id the adoption filter accepts. */
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /** One column, because the only question is WHICH engagement, if any. */
 const OWNING_ENGAGEMENT_COLUMNS = 'id';
 
@@ -190,8 +208,41 @@ export interface PhoneRuntimeReader {
    * So a non-terminal phone session for the same candidate is ADOPTED instead.
    * That is also the correct behaviour on its own terms: 0042 keys the room by
    * session precisely so every attempt of one conversation shares a transcript.
+   *
+   * ── NEVER A SIBLING ENGAGEMENT'S CLAIMED SESSION (M009 E1) ──────────
+   * Scoped by `engagementId` too: only a session whose `phone_engagement_id`
+   * is NULL or is the asking engagement is adoptable. Without it, a session
+   * minted (and claimed) by the candidate's OTHER engagement — which this read
+   * could see whenever that engagement had since gone terminal, so the live
+   * count said one — was adopted, dialled, and then refused at the evidence
+   * bind with `session_engagement_mismatch`. `engagementId` must be a UUID: it
+   * is the one value interpolated into a PostgREST `or` filter here, and an
+   * invalid one THROWS rather than widening or narrowing the query silently.
    */
-  findReusableSession(input: { candidateId: string }): Promise<string | null>;
+  findReusableSession(input: {
+    candidateId: string;
+    engagementId: string;
+  }): Promise<string | null>;
+
+  /**
+   * THIS engagement's newest half-provisioned session: `created`, never moved
+   * to `waiting`, so it carries no room name. Or null.
+   *
+   * M009 E1. The live-only `uq_call_sessions_phone_engagement` index counts a
+   * `created` row as live, `findSessionForEngagement` rejects it (its room is
+   * not verified), and no sweep ever reaps `created` — so one failed
+   * `created -> waiting` CAS after a successful insert would otherwise wedge
+   * the engagement out of the dial loop for good. The session port uses this
+   * to FINISH that provisioning, or cancel the row so a fresh one can be
+   * minted.
+   *
+   * Optional only so test doubles of the due pass, which never reach the
+   * session port, need not grow a method they cannot be asked for. The
+   * production reader always implements it.
+   */
+  findUnprovisionedSessionForEngagement?(input: {
+    engagementId: string;
+  }): Promise<string | null>;
   /**
    * The session THIS engagement already minted, if it is still usable.
    *
@@ -641,13 +692,36 @@ export function createPhoneRuntimeReader(client: SupabaseClient): PhoneRuntimeRe
       return str(row, 'external_call_id') === phoneRoomName(id) ? id : null;
     },
 
-    async findReusableSession(input): Promise<string | null> {
+    async findUnprovisionedSessionForEngagement(input): Promise<string | null> {
       const { data, error } = await client
         .from('call_sessions')
-        .select(REUSABLE_SESSION_COLUMNS)
+        .select(UNPROVISIONED_SESSION_COLUMNS)
+        .eq('phone_engagement_id', input.engagementId)
+        .eq('mode', PHONE_SESSION_MODE)
+        .eq('status', 'created')
+        .order('started_at', { ascending: false })
+        .limit(1);
+      if (error) throw new Error('phone_runtime_session_read_error');
+      const rows = Array.isArray(data) ? (data as Row[]) : [];
+      const row = rows[0];
+      return row === undefined ? null : (str(row, 'id') ?? null);
+    },
+
+    async findReusableSession(input): Promise<string | null> {
+      // Validated BEFORE the query is built: this value is spliced into the
+      // comma- and dot-delimited `or` grammar below, so an unvalidated string
+      // would decide how many filter terms the query has.
+      const engagementId = input.engagementId;
+      if (typeof engagementId !== 'string' || !UUID_RE.test(engagementId)) {
+        throw new Error('phone_runtime_bad_engagement_id');
+      }
+      const { data, error } = await client
+        .from('call_sessions')
+        .select(ADOPTABLE_SESSION_COLUMNS)
         .eq('candidate_id', input.candidateId)
         .eq('mode', PHONE_SESSION_MODE)
         .in('status', REUSABLE_SESSION_STATUSES as unknown as string[])
+        .or(`phone_engagement_id.is.null,phone_engagement_id.eq.${engagementId}`)
         .order('started_at', { ascending: false })
         .limit(1);
       if (error) throw new Error('phone_runtime_session_read_error');
@@ -657,6 +731,14 @@ export function createPhoneRuntimeReader(client: SupabaseClient): PhoneRuntimeRe
       if (row === undefined) return null;
       const id = str(row, 'id');
       if (id === undefined) return null;
+      // The in-process twin of the `or` filter. A row claimed by ANOTHER
+      // engagement is refused even if the filter was somehow not applied.
+      const claimedBy = str(row, 'phone_engagement_id');
+      // Case-folded because Postgres renders a uuid in lower case whatever
+      // case the filter value arrived in.
+      if (claimedBy !== undefined && claimedBy.toLowerCase() !== engagementId.toLowerCase()) {
+        return null;
+      }
       // The room name is derived from the session id, and
       // `start_phone_assessment` VERIFIES that derivation before it will bind
       // anything. A session that does not already carry it is not adoptable —

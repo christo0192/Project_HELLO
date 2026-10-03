@@ -360,6 +360,9 @@ describe('the env contract holds in BOTH directions', () => {
     'PHONE_AGENT_NAME',
     'PHONE_ORIGINATE_TIMEOUT_SECONDS',
     'PHONE_MAX_CALL_SECONDS',
+    // M009 E2: the per-machine agent-join wait before origination, a BOUND
+    // (default 20, clamped [5,60]), read in `livekit-phone-dial/config.ts`.
+    'PHONE_AGENT_JOIN_TIMEOUT_SEC',
     // Answer-first origination ("bounce") transport knobs. The first three are
     // read in `livekit-phone-dial/config.ts`; the caller id is read in
     // `plivo-phone/config.ts`. All four are OFF/empty by default (bounce is a

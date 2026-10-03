@@ -55,11 +55,23 @@ const log = createLogger('worker-orchestration');
 
 // ── Bounds ─────────────────────────────────────────────────────────────────
 
-/** Fly-side wait budget (seconds) for the machine to reach `started`. */
-const DEFAULT_START_WAIT_SEC = 60;
+/**
+ * Fly-side wait budget (seconds) for the machine to reach `started`.
+ *
+ * EXPORTED (M009) only so a test can pin it equal to the phone dial's
+ * `PHONE_WORKER_START_WAIT_CEILING_SEC`: the dial sizes its agent-join budget
+ * against start wait + ready ceiling, and dial.ts deliberately does not import
+ * this module (it pulls env and Fly wiring), so the two literals are kept equal
+ * by a test rather than by an import.
+ */
+export const DEFAULT_START_WAIT_SEC = 60;
 /** Default wall-clock budget (ms) to observe the lease reach `ready`. */
 const DEFAULT_READY_TIMEOUT_MS = 30_000;
-const MAX_READY_TIMEOUT_MS = 120_000;
+/**
+ * The ceiling every `readyTimeoutSec` is clamped to. EXPORTED for the same
+ * parity test as `DEFAULT_START_WAIT_SEC` (dial.ts `PHONE_WORKER_READY_CEILING_SEC`).
+ */
+export const MAX_READY_TIMEOUT_MS = 120_000;
 const MIN_READY_TIMEOUT_MS = 1_000;
 /** Cadence (ms) at which the readiness poll re-reads the lease state. */
 const DEFAULT_READY_POLL_MS = 750;
@@ -101,6 +113,16 @@ export interface LeaseStateSnapshot {
   readonly claimedSessionId: string | null;
   /** The fencing token of the CURRENT claim, not of ours. */
   readonly epoch: number | null;
+  /**
+   * M009 E2: the per-machine LiveKit agent name the machine's worker reported
+   * on its ready ping (0112 `registered_agent_name`), or null when it reported
+   * none. Nulled by every new claim and every reset, so a non-null value was
+   * reported by THIS claim's boot of this machine.
+   *
+   * Optional only so hand-built test readers that predate the column still
+   * type-check; absent reads exactly like null (dispatch the shared name).
+   */
+  readonly registeredAgentName?: string | null;
 }
 
 /**
@@ -177,7 +199,28 @@ export interface WorkerOrchestrationDeps {
 // ── Result types ────────────────────────────────────────────────────────────
 
 export type EnsureReadyResult =
-  | { status: 'ready'; machineId: string }
+  | {
+      status: 'ready';
+      machineId: string;
+      /**
+       * M009 E2: the LEASE epoch read alongside the ready/busy observation —
+       * the fencing token `mark_voice_worker_busy` compares for equality. NOT
+       * the attempt epoch the caller passed in: a lease epoch is `prev+1` per
+       * claim (0079), so sending the attempt epoch (0/1) can never match and
+       * the lease never reaches `busy`.
+       *
+       * Optional only so hand-built fakes that predate M009 still type-check;
+       * the real service always sets it on `ready`.
+       */
+      epoch?: number;
+      /**
+       * M009 E2: the per-machine agent name the worker reported for this
+       * claim, or null when it reported none (dispatch the shared name —
+       * today's behaviour). Never synthesised by the API. Optional for the
+       * same fake-compatibility reason; absent means null.
+       */
+      agentName?: string | null;
+    }
   | { status: 'no_capacity' }
   | { status: 'timeout' }
   | { status: 'error'; code: string }
@@ -455,6 +498,8 @@ export function createWorkerOrchestrationService(
     const deadline = now() + readyTimeoutMs;
     let observedReady = false;
     let claimLost = false;
+    /** The lease read that proved `ready` — the source of the epoch/name we return. */
+    let readySnap: LeaseStateSnapshot | null = null;
 
     /**
      * Believe a lease read only while the row is still OUR claim.
@@ -479,13 +524,16 @@ export function createWorkerOrchestrationService(
     // the worker was already ready — e.g. a warm-standby machine.)
     for (;;) {
       let seen: 'ready' | 'lost' | 'waiting' = 'waiting';
+      let snap: LeaseStateSnapshot | null = null;
       try {
-        seen = verdict(await deps.readLeaseState({ app, machineId }));
+        snap = await deps.readLeaseState({ app, machineId });
+        seen = verdict(snap);
       } catch {
         seen = 'waiting'; // transient; retry within budget
       }
       if (seen === 'ready') {
         observedReady = true;
+        readySnap = snap;
         break;
       }
       if (seen === 'lost') {
@@ -498,8 +546,12 @@ export function createWorkerOrchestrationService(
         // One last read after the final sleep, so a ready that landed during
         // the sleep is not missed.
         try {
-          const last = verdict(await deps.readLeaseState({ app, machineId }));
-          if (last === 'ready') observedReady = true;
+          const lastSnap = await deps.readLeaseState({ app, machineId });
+          const last = verdict(lastSnap);
+          if (last === 'ready') {
+            observedReady = true;
+            readySnap = lastSnap;
+          }
           if (last === 'lost') claimLost = true;
         } catch {
           /* keep observedReady false */
@@ -539,12 +591,22 @@ export function createWorkerOrchestrationService(
     }
 
     // Confirmed ready. This is the ONLY place 'ready' is returned, and only
-    // after a ready/busy lease read. `epoch` is intentionally not surfaced to
-    // the caller here — the caller re-reads it via the lease if it needs to
-    // mark_busy; the invariant is satisfied by the state observation.
-    void epoch;
+    // after a ready/busy lease read.
+    //
+    // M009 E2: the lease epoch and the reported agent name are surfaced from
+    // THAT SAME read. The epoch is the token `mark_voice_worker_busy` CASes on
+    // (the attempt epoch the caller holds never equals it), and the name is
+    // only meaningful from the read that proved the row is still ours — a
+    // name read from any other snapshot could belong to a claim that has
+    // since moved on. The read's epoch is preferred (it is what the row says
+    // now); the verdict has already refused any read whose epoch is HIGHER
+    // than our claim's, and an unparsed read epoch falls back to the claim's.
+    const leaseEpoch = typeof readySnap?.epoch === 'number' ? readySnap.epoch : epoch;
+    const agentName = typeof readySnap?.registeredAgentName === 'string'
+      ? readySnap.registeredAgentName
+      : null;
     event('ready', { app });
-    return { status: 'ready', machineId };
+    return { status: 'ready', machineId, epoch: leaseEpoch, agentName };
   }
 
   async function releaseWorker(input: {
@@ -944,7 +1006,7 @@ export function createDefaultWorkerOrchestrationService(
   const readLeaseState: LeaseStateReader = async ({ app, machineId }) => {
     const { data, error } = await client
       .from('voice_worker_leases')
-      .select('state, claimed_session_id, epoch')
+      .select('state, claimed_session_id, epoch, registered_agent_name')
       .eq('app', app)
       .eq('machine_id', machineId)
       .maybeSingle();
@@ -953,6 +1015,7 @@ export function createDefaultWorkerOrchestrationService(
       state?: unknown;
       claimed_session_id?: unknown;
       epoch?: unknown;
+      registered_agent_name?: unknown;
     } | null;
     return {
       state: typeof row?.state === 'string' ? row.state : null,
@@ -966,6 +1029,14 @@ export function createDefaultWorkerOrchestrationService(
         : typeof row?.epoch === 'string' && /^\d+$/.test(row.epoch)
           ? Number(row.epoch)
           : null,
+      // M009 E2 (0112). Anything but a string reads as "no name reported",
+      // which dispatches the shared name exactly as before. NOTE the select
+      // names the 0112 column, so this read REQUIRES 0112 to be applied:
+      // deploy-fly runs migrate-production before deploy-api, and a missing
+      // column fails the read (lease_read_error → not-ready → the dial
+      // defers), which is fail-closed, never a dispatch to a guessed name.
+      registeredAgentName:
+        typeof row?.registered_agent_name === 'string' ? row.registered_agent_name : null,
     };
   };
 

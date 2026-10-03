@@ -10227,6 +10227,10 @@ declare
   v_admitted integer := 0; v_bad text := '';
   v_backlog jsonb; v_state text; v_na integer; v_rc integer; v_pf integer;
   v_abandoned integer;
+  -- 0112 / E3: the reclaim below runs at T+10m, and the hold it writes is
+  -- measured from THAT instant, not from the admission.
+  v_reclaim_at timestamptz := '2026-09-01T06:10:00Z';
+  v_hold timestamptz; v_nea timestamptz; v_seq integer;
 begin
   for v_i in 1..11 loop
     v_eng := _policy_tests.phone_fixture('pol42-cap' || v_i);
@@ -10314,28 +10318,57 @@ begin
     '0042: reclaiming an expired lease genuinely frees its fleet slot',
     v_res->>'status' = 'ok', coalesce(v_res::text, '<null>'));
 
-  -- And a reclaimed engagement is admissible again. The per-day ladder
-  -- still holds and still fails closed on the uncertainty it was written
-  -- for: a reclaim-abandoned attempt (abandon_reason NULL) may well have
-  -- rung the phone before the worker died, so it CHARGES the day. 0095
-  -- changes only the ceiling — one such charged attempt now leaves one dial
-  -- left, so this is admitted as the day's SECOND rather than refused.
-  -- 0083's `infra_deferred` abandonments are the ones that charge nothing,
-  -- and `phone_daily_cap_infra_defer_assert.sql` is where that is proved.
+  -- 0112 / E3 REWRITE of this block's second half. Before 0112 the restore
+  -- wrote only the state, so the engagement was due again on the very next
+  -- pass and this block asserted a second dial two minutes after the
+  -- reclaim. Production showed exactly that, as a burst: the same candidate
+  -- re-rung 2-26 s after every reclaim. The restore now also HOLDS the next
+  -- dial: this was the day's FIRST dial (initial, ist_day_seq 1) and the
+  -- engagement returns to `eligible`, so the hold is the same spacing the
+  -- no-answer ladder already uses for the day's second dial.
+  v_hold := v_reclaim_at + screening_v2.phone_same_day_retry_delay();
+  select next_eligible_at into v_nea
+    from screening_v2.phone_engagements where id = v_engs[1];
+  perform _policy_tests.assert(
+    '0112: a reclaimed first dial of the IST day holds the engagement for the same-day retry delay',
+    v_nea = v_hold,
+    'expected next_eligible_at=' || v_hold || '; got ' || coalesce(v_nea::text, '<null>'));
+
+  -- Two minutes after the reclaim is INSIDE the hold. Refused in the open,
+  -- not by an index, and nothing is charged for asking.
   v_res := screening_v2.admit_phone_attempt(v_engs[1], 'initial', 'owner-1', 60,
                                             v_t + interval '12 minutes');
   perform _policy_tests.assert(
-    '0095: a reclaimed engagement gets the day''s SECOND dial, not a refusal',
-    v_res->>'status' = 'ok', coalesce(v_res::text, '<null>'));
+    '0112: a reclaimed engagement is NOT redialled inside its hold (not_yet_eligible at +12 min)',
+    v_res->>'status' = 'not_yet_eligible'
+      and (v_res->>'next_eligible_at')::timestamptz = v_hold,
+    'a redial seconds after a reclaim is the burst this fixes; got ' || coalesce(v_res::text, '<null>'));
+
+  -- And a reclaimed engagement is admissible again once the hold passes. The
+  -- per-day ladder still holds and still fails closed on the uncertainty it
+  -- was written for: a reclaim-abandoned attempt (abandon_reason NULL) may
+  -- well have rung the phone before the worker died, so it CHARGES the day.
+  -- 0095 changes only the ceiling — one such charged attempt now leaves one
+  -- dial left, so this is admitted as the day's SECOND rather than refused.
+  -- 0083's `infra_deferred` abandonments are the ones that charge nothing,
+  -- and `phone_daily_cap_infra_defer_assert.sql` is where that is proved.
+  v_res := screening_v2.admit_phone_attempt(v_engs[1], 'initial', 'owner-1', 60,
+                                            v_hold + interval '1 second');
+  select ist_day_seq into v_seq from screening_v2.phone_call_attempts
+   where id = (v_res->>'attempt_id')::uuid;
+  perform _policy_tests.assert(
+    '0095: a reclaimed engagement gets the day''s SECOND dial once its hold passes, not a refusal',
+    v_res->>'status' = 'ok' and v_seq = 2,
+    'ist_day_seq=' || coalesce(v_seq::text, '<null>') || ' ' || coalesce(v_res::text, '<null>'));
 
   -- The ceiling still bites on the third. End the live attempt first so the
   -- refusal is the DAILY one and not `attempt_in_flight`.
   update screening_v2.phone_call_attempts
-     set state = 'ended', ended_at = v_t + interval '13 minutes'
+     set state = 'ended', ended_at = v_hold + interval '2 minutes'
    where id = (v_res->>'attempt_id')::uuid;
   update screening_v2.phone_engagements set state = 'eligible' where id = v_engs[1];
   v_res := screening_v2.admit_phone_attempt(v_engs[1], 'initial', 'owner-1', 60,
-                                            v_t + interval '14 minutes');
+                                            v_hold + interval '3 minutes');
   perform _policy_tests.assert(
     '0095: a reclaimed engagement still cannot exceed TWO dials in an IST day',
     v_res->>'status' = 'daily_attempt_exists', coalesce(v_res::text, '<null>'));
@@ -14292,7 +14325,9 @@ select _policy_tests.assert(
                         'mark_voice_worker_ready_machine',
                         'mark_voice_worker_busy','heartbeat_voice_worker',
                         'release_voice_worker','reset_voice_worker',
-                        'list_reapable_voice_workers','register_voice_worker')),
+                        'list_reapable_voice_workers','register_voice_worker',
+                        -- 0112 / E2: the per-machine agent-name writer.
+                        'set_voice_worker_agent_name')),
   'every voice-worker RPC must be SECURITY DEFINER, pinned search_path, service-role-only');
 
 select _policy_tests.assert(
@@ -15445,6 +15480,913 @@ begin
   -- trail the same way.
   delete from screening_v2.ashby_resume_ingestions where application_link_id = v_link;
   delete from screening_v2.ashby_application_links where id = v_link;
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0112 — phone dial orchestration hardening (M009 / S01, PR-A)
+-- ═══════════════════════════════════════════════════════════════════════
+-- Real-Postgres proof for the three blocks of 0112, run on the full chain:
+--   E1  the engagement-claim UNIQUE index covers LIVE sessions only, so a
+--       session the orphan sweep expired no longer wedges its engagement;
+--   E2  the lease records the per-machine agent name its machine reported,
+--       and that name can never outlive the boot/claim that reported it;
+--   E3  a lease reclaim that restores an engagement also HOLDS its next dial.
+-- Every fixture is tagged `pol112-*`, torn down at the end of its block, and
+-- written with an injected clock. No assertion here reads the host clock.
+
+-- ── E1 helpers ──────────────────────────────────────────────────────────
+-- A phone session born `created` (0006 requires it), its room derived from
+-- its own id exactly as the dialer writes it, then walked along LEGAL edges
+-- to the requested status. `p_claim` is the engagement claim written at
+-- insert, the way createSession writes it; it may raise unique_violation,
+-- which is the point of several assertions below.
+create or replace function _policy_tests.p112_session(
+  p_cand    uuid,
+  p_role    uuid,
+  p_claim   uuid,
+  p_started timestamptz,
+  p_status  text default 'waiting'
+)
+returns uuid
+language plpgsql as $p112s$
+declare v_s uuid;
+begin
+  insert into screening_v2.call_sessions
+    (candidate_id, role_id, mode, provider, external_call_id, status, started_at,
+     phone_engagement_id)
+  values (p_cand, p_role, 'live', 'livekit', 'placeholder', 'created', p_started, p_claim)
+  returning id into v_s;
+  update screening_v2.call_sessions
+     set external_call_id = 'phone-' || v_s::text
+   where id = v_s;
+
+  if p_status = 'cancelled' then
+    update screening_v2.call_sessions
+       set status = 'cancelled', terminal_reason = 'duplicate_session'
+     where id = v_s;
+    return v_s;
+  end if;
+  if p_status in ('waiting', 'in_progress', 'completed', 'failed') then
+    update screening_v2.call_sessions
+       set status = 'waiting', waiting_at = p_started
+     where id = v_s;
+  end if;
+  if p_status in ('in_progress', 'completed', 'failed') then
+    update screening_v2.call_sessions set status = 'in_progress' where id = v_s;
+  end if;
+  if p_status = 'completed' then
+    update screening_v2.call_sessions
+       set status = 'completed', terminal_reason = 'conversation_complete'
+     where id = v_s;
+  elsif p_status = 'failed' then
+    update screening_v2.call_sessions
+       set status = 'failed', terminal_reason = 'worker_crash'
+     where id = v_s;
+  end if;
+  return v_s;
+end;
+$p112s$;
+
+-- The same, but a unique_violation is reported as NULL instead of raised,
+-- so a pre-0112 chain records a FAIL rather than aborting the suite.
+create or replace function _policy_tests.p112_try_session(
+  p_cand    uuid,
+  p_role    uuid,
+  p_claim   uuid,
+  p_started timestamptz,
+  p_status  text default 'waiting'
+)
+returns uuid
+language plpgsql as $p112t$
+begin
+  return _policy_tests.p112_session(p_cand, p_role, p_claim, p_started, p_status);
+exception when unique_violation then
+  return null;
+end;
+$p112t$;
+
+-- A PROBE: does claiming `p_eng` on an existing live session collide with
+-- the unique index? The claim is always rolled back (the sentinel raise
+-- unwinds the subtransaction when it did NOT collide), so probing never
+-- changes the fixture it probes.
+create or replace function _policy_tests.p112_claim_blocked(p_session uuid, p_eng uuid)
+returns boolean
+language plpgsql as $p112c$
+begin
+  begin
+    update screening_v2.call_sessions
+       set phone_engagement_id = p_eng
+     where id = p_session;
+    raise exception using errcode = 'P0001', message = 'pol112 probe: claim accepted';
+  exception
+    when unique_violation then
+      return true;
+    when sqlstate 'P0001' then
+      return false;
+  end;
+end;
+$p112c$;
+
+-- The reclaim's own audit row for one attempt (append-only, one per reclaim).
+create or replace function _policy_tests.p112_reclaim_audit(p_att uuid)
+returns jsonb
+language sql as $p112a$
+  select metadata
+    from screening_v2.audit_events
+   where action = 'phone_attempt_ended'
+     and target_id = p_att::text
+     and metadata->>'reason' = 'lease_reclaimed'
+   order by created_at desc
+   limit 1;
+$p112a$;
+
+-- ── E1 (a): the catalog shape ───────────────────────────────────────────
+select _policy_tests.assert(
+  '0112-E1: uq_call_sessions_phone_engagement is UNIQUE and partial over LIVE sessions only',
+  exists (
+    select 1
+      from pg_indexes x
+     where x.schemaname = 'screening_v2'
+       and x.tablename  = 'call_sessions'
+       and x.indexname  = 'uq_call_sessions_phone_engagement'
+       and x.indexdef ilike 'create unique index%'
+       and x.indexdef ilike '%(phone_engagement_id)%'
+       and x.indexdef ilike '%phone_engagement_id is not null%'
+       and x.indexdef ilike '%''created''%'
+       and x.indexdef ilike '%''waiting''%'
+       and x.indexdef ilike '%''in_progress''%'
+       -- No terminal status may be covered: a terminal claim is history.
+       and x.indexdef not ilike '%''completed''%'
+       and x.indexdef not ilike '%''failed''%'
+       and x.indexdef not ilike '%''cancelled''%'
+       and x.indexdef not ilike '%''expired''%'),
+  'the live set must equal bind_phone_attempt_recording_session''s live precondition; got '
+    || coalesce((select indexdef from pg_indexes
+                  where schemaname = 'screening_v2'
+                    and indexname = 'uq_call_sessions_phone_engagement'), '<missing>'));
+
+select _policy_tests.assert(
+  '0112-E1: idx_call_sessions_phone_engagement keeps every claimed session (live or terminal) indexed',
+  exists (
+    select 1
+      from pg_indexes x
+     where x.schemaname = 'screening_v2'
+       and x.tablename  = 'call_sessions'
+       and x.indexname  = 'idx_call_sessions_phone_engagement'
+       and x.indexdef ilike 'create index%'
+       and x.indexdef ilike '%(phone_engagement_id)%'
+       and x.indexdef ilike '%phone_engagement_id is not null%'
+       and x.indexdef not ilike '%status%'),
+  'the FK''s ON DELETE SET NULL scan and engagement lookups need an index over terminal claims too; got '
+    || coalesce((select indexdef from pg_indexes
+                  where schemaname = 'screening_v2'
+                    and indexname = 'idx_call_sessions_phone_engagement'), '<missing>'));
+
+-- ── E1 (b)-(e): the 2026-10-03 wedge, replayed ──────────────────────────
+-- Production: an engagement's claiming `waiting` session sat past the 4 h
+-- orphan grace (the same-day retry is 5 h), the 0096 sweep expired it with
+-- its claim kept, and every later createSession for that engagement hit
+-- 23505 on the table-wide 0107 index — the engagement silently left the
+-- dial loop. This replays that exact sequence and asserts the way out.
+do $$
+declare
+  v_e  uuid; v_e2 uuid; v_cand uuid; v_role uuid; v_cand2 uuid; v_role2 uuid;
+  v_a  uuid; v_x uuid; v_b uuid; v_d uuid; v_p uuid; v_q uuid; v_r uuid; v_y uuid;
+  -- A's age anchor is deliberately EARLIER than every other session in this
+  -- file: the orphan sweep is fleet-wide and oldest-first, so anchoring A
+  -- here keeps it inside the sweep's limit and keeps the sweep (run at
+  -- A + 5 h) from reaching any other block's rows.
+  v_t    constant timestamptz := '2026-01-05T04:30:00Z';
+  v_dial constant timestamptz := '2026-09-24T04:30:00Z';
+  v_blocked boolean; v_sw jsonb; v_status text; v_reason text; v_claim uuid;
+  v_res jsonb; v_att uuid; v_astate text; v_rec uuid;
+begin
+  v_e  := _policy_tests.phone_fixture('pol112-e1');
+  v_e2 := _policy_tests.phone_fixture('pol112-e1-other');
+  select candidate_id, role_id into v_cand, v_role
+    from screening_v2.phone_engagements where id = v_e;
+  select candidate_id, role_id into v_cand2, v_role2
+    from screening_v2.phone_engagements where id = v_e2;
+
+  -- (b) every LIVE status holds the slot.
+  -- A: E's claiming session, born `created` (the half-provisioned shape).
+  v_a := _policy_tests.p112_session(v_cand, v_role, v_e, v_t, 'created');
+  -- X: a live, UNCLAIMED session of the same candidate; claiming E on it is
+  -- the collision a second createSession / the bind's coalesce would make.
+  v_x := _policy_tests.p112_session(v_cand, v_role, null, '2026-09-24T04:00:00Z', 'waiting');
+
+  v_blocked := _policy_tests.p112_claim_blocked(v_x, v_e);
+  perform _policy_tests.assert(
+    '0112-E1: a CREATED session claiming an engagement blocks a second live claim (23505)',
+    v_blocked,
+    'a half-provisioned created session is live; two live sessions per engagement must stay impossible');
+
+  update screening_v2.call_sessions
+     set status = 'waiting', waiting_at = v_t
+   where id = v_a;
+  v_blocked := _policy_tests.p112_claim_blocked(v_x, v_e);
+  perform _policy_tests.assert(
+    '0112-E1: a second WAITING session for the same engagement raises unique_violation (23505)',
+    v_blocked,
+    'two waiting sessions claiming one engagement must be uninsertable');
+
+  v_p := _policy_tests.p112_session(v_cand2, v_role2, v_e2, v_dial, 'in_progress');
+  v_y := _policy_tests.p112_session(v_cand2, v_role2, null, v_dial, 'waiting');
+  v_blocked := _policy_tests.p112_claim_blocked(v_y, v_e2);
+  perform _policy_tests.assert(
+    '0112-E1: an IN_PROGRESS session claiming an engagement blocks a new waiting claim (23505)',
+    v_blocked,
+    'a live interview must keep its engagement slot');
+
+  -- (d) every TERMINAL status releases it, and keeps its claim as history.
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'conversation_complete'
+   where id = v_p;
+  v_q := _policy_tests.p112_try_session(v_cand2, v_role2, v_e2, v_dial, 'failed');
+  perform _policy_tests.assert(
+    '0112-E1: a COMPLETED session claiming the engagement does not block a new live session',
+    v_q is not null,
+    'a terminal claim is history; under the 0107 table-wide index this insert hit 23505');
+  v_r := _policy_tests.p112_try_session(v_cand2, v_role2, v_e2, v_dial, 'cancelled');
+  perform _policy_tests.assert(
+    '0112-E1: a FAILED session claiming the engagement does not block a new live session',
+    v_r is not null,
+    'a terminal claim is history; under the 0107 table-wide index this insert hit 23505');
+  -- D is live, claims E2, but belongs to E's CANDIDATE: (e)'s cross-engagement case.
+  v_d := _policy_tests.p112_try_session(v_cand, v_role, v_e2, v_dial, 'waiting');
+  perform _policy_tests.assert(
+    '0112-E1: a CANCELLED session claiming the engagement does not block a new live session',
+    v_d is not null,
+    'a terminal claim is history; under the 0107 table-wide index this insert hit 23505');
+  perform _policy_tests.assert(
+    '0112-E1: terminal sessions keep their engagement claim as history',
+    (select count(*) from screening_v2.call_sessions
+      where id in (v_p, v_q, v_r) and phone_engagement_id = v_e2) = 3,
+    'the narrowing must not be implemented by clearing claims');
+
+  -- (c) THE REPLAY. A sits `waiting` with its room set and no attempt; the
+  -- orphan sweep runs past its 4 h grace, exactly as the runtime tick does.
+  v_sw := screening_v2.sweep_phone_orphan_sessions(
+            p_limit => 200, p_now => v_t + interval '5 hours');
+  select status, terminal_reason, phone_engagement_id into v_status, v_reason, v_claim
+    from screening_v2.call_sessions where id = v_a;
+  perform _policy_tests.assert(
+    '0112-E1 replay: the orphan sweep expires the claiming session and KEEPS its claim',
+    v_status = 'expired' and v_reason = 'idle_timeout' and v_claim = v_e,
+    'the wedge needs exactly this shape to reproduce; got status=' || coalesce(v_status, '<null>')
+      || ' reason=' || coalesce(v_reason, '<null>') || ' claim_kept=' || coalesce((v_claim = v_e)::text, 'false')
+      || ' sweep=' || coalesce(v_sw::text, '<null>'));
+
+  v_b := _policy_tests.p112_try_session(v_cand, v_role, v_e, v_dial, 'waiting');
+  perform _policy_tests.assert(
+    '0112-E1 replay: a NEW live session for the engagement is insertable after its old one expired',
+    v_b is not null,
+    'this is the 2026-10-03 outage: ensureSession''s createSession hit 23505 on every pass and '
+      || 'the engagement silently left the dial loop');
+
+  -- (e) bind_phone_attempt_recording_session keeps every verdict it had.
+  v_res := screening_v2.admit_phone_attempt(v_e, 'initial', null, 60, v_dial);
+  v_att := (v_res->>'attempt_id')::uuid;
+  perform screening_v2.apply_phone_event('internal', 'call.answered',
+            v_att, null, null, null, null, v_dial + interval '20 seconds');
+  select state into v_astate from screening_v2.phone_call_attempts where id = v_att;
+
+  v_res := screening_v2.bind_phone_attempt_recording_session(
+             v_att, v_a, v_e, v_dial + interval '30 seconds');
+  perform _policy_tests.assert(
+    '0112-E1 bind: the EXPIRED old session is refused session_not_active',
+    v_res->>'status' = 'session_not_active',
+    'attempt=' || coalesce(v_astate, '<null>') || ' ' || coalesce(v_res::text, '<null>'));
+
+  v_res := screening_v2.bind_phone_attempt_recording_session(
+             v_att, v_d, v_e, v_dial + interval '30 seconds');
+  perform _policy_tests.assert(
+    '0112-E1 bind: a live session claiming ANOTHER engagement is refused session_engagement_mismatch',
+    v_res->>'status' = 'session_engagement_mismatch',
+    coalesce(v_res::text, '<null>'));
+
+  v_res := screening_v2.bind_phone_attempt_recording_session(
+             v_att, v_x, v_e, v_dial + interval '30 seconds');
+  select phone_engagement_id into v_claim from screening_v2.call_sessions where id = v_x;
+  perform _policy_tests.assert(
+    '0112-E1 bind: a coalesce claim colliding with the live session is session_engagement_race, rolled back',
+    v_res->>'status' = 'session_engagement_race' and v_claim is null,
+    'the race verdict depends on the index predicate equalling the RPC''s live set; got '
+      || coalesce(v_res::text, '<null>') || ' claim=' || coalesce(v_claim::text, '<null>'));
+
+  v_res := screening_v2.bind_phone_attempt_recording_session(
+             v_att, v_b, v_e, v_dial + interval '30 seconds');
+  select recording_session_id into v_rec from screening_v2.phone_call_attempts where id = v_att;
+  perform _policy_tests.assert(
+    '0112-E1 bind: the NEW live session binds ok',
+    v_res->>'status' = 'ok' and v_rec = v_b and v_b is not null,
+    coalesce(v_res::text, '<null>'));
+
+  perform _policy_tests.phone44_teardown('pol112-e1');
+  perform _policy_tests.phone44_teardown('pol112-e1-other');
+end;
+$$;
+
+-- ── E2: set_voice_worker_agent_name and the name's lifetime ─────────────
+select _policy_tests.assert(
+  '0112-E2: set_voice_worker_agent_name exists, is SECURITY DEFINER, pins search_path, service-role-only',
+  exists (
+    select 1
+      from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+     where n.nspname = 'screening_v2'
+       and p.proname = 'set_voice_worker_agent_name'
+       and p.prosecdef
+       and p.proconfig @> array['search_path=pg_catalog, screening_v2']
+       and has_function_privilege('service_role', p.oid, 'EXECUTE')
+       and not has_function_privilege('anon', p.oid, 'EXECUTE')
+       and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+       and not has_function_privilege('public', p.oid, 'EXECUTE')),
+  'a browser role that can write a lease''s dispatch name can steer an interview to any machine');
+
+select _policy_tests.assert(
+  '0112-E2: registered_agent_name carries a VALIDATED format CHECK',
+  exists (
+    select 1 from pg_constraint
+     where conname = 'voice_worker_leases_registered_agent_name_format'
+       and conrelid = to_regclass('screening_v2.voice_worker_leases')
+       and contype = 'c'
+       and convalidated),
+  'the column must be fail-closed on its own, not only through the RPC');
+
+do $$
+declare
+  v_app  constant text := 'pol112-app';
+  -- Fly machine ids: 8-32 lowercase alphanumerics (the API's PER_MACHINE_ID_RE).
+  v_m1   constant text := 'a112m0000001';
+  v_m2   constant text := 'a112m0000002';
+  v_mx   constant text := 'bbbbbbbb';
+  v_s1   constant uuid := '11200000-0000-4000-8000-000000000001';
+  v_s2   constant uuid := '11200000-0000-4000-8000-000000000002';
+  v_s3   constant uuid := '11200000-0000-4000-8000-000000000003';
+  v_now  constant timestamptz := '2026-09-24T04:30:00Z';
+  v_res  jsonb; v_name text; v_state text; v_ep bigint; v_m text; v_threw boolean;
+begin
+  if to_regprocedure('screening_v2.set_voice_worker_agent_name(text,text,text,timestamptz)') is null then
+    perform _policy_tests.assert(
+      '0112-E2: the agent-name RPC and column are present (behaviour block)', false,
+      'set_voice_worker_agent_name is missing; 0112 is not applied');
+    return;
+  end if;
+
+  delete from screening_v2.voice_worker_leases where app = v_app;
+  perform screening_v2.register_voice_worker(v_app, 'phone', v_m1, v_now);
+  perform screening_v2.register_voice_worker(v_app, 'phone', v_m2, v_now);
+  perform screening_v2.register_voice_worker(v_app, 'phone', v_mx, v_now);
+
+  -- A STARTING row records its own name.
+  v_res := screening_v2.claim_voice_worker(v_app, 'phone', v_s1, null, v_now);
+  v_m := v_res->>'machine_id';
+  v_ep := (v_res->>'epoch')::bigint;
+  v_res := screening_v2.set_voice_worker_agent_name(v_app, v_m1, 'phone-screener-' || v_m1, v_now);
+  select registered_agent_name, state into v_name, v_state
+    from screening_v2.voice_worker_leases where app = v_app and machine_id = v_m1;
+  perform _policy_tests.assert(
+    '0112-E2: a starting row records its own per-machine name (ok)',
+    v_m = v_m1 and v_state = 'starting' and v_res->>'status' = 'ok'
+      and (v_res->>'updated')::integer = 1 and v_name = 'phone-screener-' || v_m1,
+    'machine=' || coalesce(v_m, '<null>') || ' state=' || coalesce(v_state, '<null>')
+      || ' res=' || coalesce(v_res::text, '<null>') || ' name=' || coalesce(v_name, '<null>'));
+
+  -- A READY row too (the ready post may arrive after machine-level ready).
+  perform screening_v2.mark_voice_worker_ready_machine(v_app, v_m1, v_now);
+  v_res := screening_v2.set_voice_worker_agent_name(v_app, v_m1, 'phone-screener-' || v_m1, v_now);
+  select state into v_state from screening_v2.voice_worker_leases
+   where app = v_app and machine_id = v_m1;
+  perform _policy_tests.assert(
+    '0112-E2: a ready row records its own per-machine name (ok)',
+    v_state = 'ready' and v_res->>'status' = 'ok',
+    'state=' || coalesce(v_state, '<null>') || ' res=' || coalesce(v_res::text, '<null>'));
+
+  -- The idempotent re-claim for the SAME live session is the same boot: it
+  -- must keep the name, or a retried admit would dispatch to the base name.
+  v_res := screening_v2.claim_voice_worker(v_app, 'phone', v_s1, null, v_now + interval '1 minute');
+  select registered_agent_name into v_name from screening_v2.voice_worker_leases
+   where app = v_app and machine_id = v_m1;
+  perform _policy_tests.assert(
+    '0112-E2: the idempotent re-claim of the same live session keeps the name',
+    v_res->>'machine_id' = v_m1 and v_name = 'phone-screener-' || v_m1,
+    'res=' || coalesce(v_res::text, '<null>') || ' name=' || coalesce(v_name, '<null>'));
+
+  -- A name whose suffix is another machine is refused with NO write, so one
+  -- lease can never be pointed at a different machine's worker.
+  v_res := screening_v2.claim_voice_worker(v_app, 'phone', v_s2, null, v_now);  -- takes m2
+  update screening_v2.voice_worker_leases
+     set state = 'starting', claimed_session_id = v_s3, started_at = v_now
+   where app = v_app and machine_id = v_mx;
+  v_res := screening_v2.set_voice_worker_agent_name(v_app, v_mx, 'phone-screener-aaaaaaaa', v_now);
+  select registered_agent_name into v_name from screening_v2.voice_worker_leases
+   where app = v_app and machine_id = v_mx;
+  perform _policy_tests.assert(
+    '0112-E2: a name whose suffix is not -<machine_id> is invalid_request, with no write',
+    v_res->>'status' = 'invalid_request' and v_name is null,
+    'res=' || coalesce(v_res::text, '<null>') || ' name=' || coalesce(v_name, '<null>'));
+
+  v_res := screening_v2.set_voice_worker_agent_name(v_app, v_mx, 'phone screener!-' || v_mx, v_now);
+  perform _policy_tests.assert(
+    '0112-E2: a malformed name is invalid_request at the RPC',
+    v_res->>'status' = 'invalid_request',
+    coalesce(v_res::text, '<null>'));
+
+  -- ...and refused by the CHECK even when the RPC is bypassed.
+  begin
+    update screening_v2.voice_worker_leases
+       set registered_agent_name = 'not a valid name'
+     where app = v_app and machine_id = v_mx;
+    v_threw := false;
+  exception when check_violation then
+    v_threw := true;
+  end;
+  perform _policy_tests.assert(
+    '0112-E2: the CHECK rejects a malformed registered_agent_name',
+    v_threw,
+    'a direct write must not be able to store a name the API would dispatch to');
+
+  -- A BUSY row is past the boot that reports a name: stale, no write.
+  update screening_v2.voice_worker_leases set registered_agent_name = null
+   where app = v_app and machine_id = v_m1;
+  perform screening_v2.mark_voice_worker_busy(v_app, v_m1, v_s1, v_ep, v_now);
+  v_res := screening_v2.set_voice_worker_agent_name(v_app, v_m1, 'phone-screener-' || v_m1,
+                                                    v_now + interval '2 minutes');
+  select registered_agent_name, state into v_name, v_state
+    from screening_v2.voice_worker_leases where app = v_app and machine_id = v_m1;
+  perform _policy_tests.assert(
+    '0112-E2: a busy row is stale, with no write',
+    v_state = 'busy' and v_res->>'status' = 'stale' and v_name is null,
+    'state=' || coalesce(v_state, '<null>') || ' res=' || coalesce(v_res::text, '<null>')
+      || ' name=' || coalesce(v_name, '<null>'));
+
+  -- reset nulls the name (m2 carries one first).
+  perform screening_v2.set_voice_worker_agent_name(v_app, v_m2, 'phone-screener-' || v_m2, v_now);
+  v_res := screening_v2.reset_voice_worker(v_app, v_m2, v_now + interval '3 minutes');
+  select registered_agent_name, state into v_name, v_state
+    from screening_v2.voice_worker_leases where app = v_app and machine_id = v_m2;
+  perform _policy_tests.assert(
+    '0112-E2: reset_voice_worker nulls the name',
+    v_res->>'status' = 'stopped' and v_state = 'stopped' and v_name is null,
+    'res=' || coalesce(v_res::text, '<null>') || ' name=' || coalesce(v_name, '<null>'));
+
+  -- A STOPPED row is not booting for a claim: a late post is stale, no write.
+  v_res := screening_v2.set_voice_worker_agent_name(v_app, v_m2, 'phone-screener-' || v_m2,
+                                                    v_now + interval '4 minutes');
+  select registered_agent_name into v_name from screening_v2.voice_worker_leases
+   where app = v_app and machine_id = v_m2;
+  perform _policy_tests.assert(
+    '0112-E2: a stopped row is stale, with no write',
+    v_res->>'status' = 'stale' and v_name is null,
+    'res=' || coalesce(v_res::text, '<null>') || ' name=' || coalesce(v_name, '<null>'));
+
+  -- 0112: a claim picks the LEAST-RECENTLY-STOPPED machine, not the lowest
+  -- id — a machine reset a moment ago (its Fly stop may still be draining
+  -- under kill_timeout) is the last choice. Probe in a savepoint so the
+  -- surrounding sequence is untouched.
+  begin
+    update screening_v2.voice_worker_leases
+       set state = 'stopped', claimed_session_id = null, updated_at = v_now + interval '1 hour'
+     where app = v_app and machine_id = v_m1;
+    update screening_v2.voice_worker_leases
+       set state = 'stopped', claimed_session_id = null, updated_at = v_now
+     where app = v_app and machine_id = v_m2;
+    v_res := screening_v2.claim_voice_worker(v_app, 'phone',
+               '11200000-0000-4000-8000-0000000000aa'::uuid, null, v_now + interval '2 hours');
+    -- Undo the probe's writes; the plpgsql variable v_res survives.
+    raise exception using errcode = 'P0001', message = 'pol112_claim_order_rollback';
+  exception when sqlstate 'P0001' then
+    if sqlerrm <> 'pol112_claim_order_rollback' then raise; end if;
+  end;
+  perform _policy_tests.assert(
+    '0112: claim prefers the least-recently-stopped machine over a lower id stopped just now',
+    v_res->>'status' = 'claimed' and v_res->>'machine_id' = v_m2,
+    'expected ' || v_m2 || ' (stopped earlier) over ' || v_m1 || ' (stopped just now); res='
+      || coalesce(v_res::text, '<null>'));
+
+  -- A NEW claim never inherits a name: plant one on the stopped m2 (the
+  -- shape a pre-0112 reset or a manual edit could leave) and claim it for a
+  -- different session.
+  update screening_v2.voice_worker_leases
+     set registered_agent_name = 'phone-screener-' || v_m2
+   where app = v_app and machine_id = v_m2;
+  v_res := screening_v2.claim_voice_worker(v_app, 'phone',
+             '11200000-0000-4000-8000-000000000004'::uuid, null, v_now + interval '5 minutes');
+  select registered_agent_name into v_name from screening_v2.voice_worker_leases
+   where app = v_app and machine_id = v_m2;
+  perform _policy_tests.assert(
+    '0112-E2: a NEW claim (a different session) nulls a previously registered name',
+    v_res->>'status' = 'claimed' and v_res->>'machine_id' = v_m2 and v_name is null,
+    'a fresh claim dispatching to a previous boot''s name is the cross-dispatch this fixes; res='
+      || coalesce(v_res::text, '<null>') || ' name=' || coalesce(v_name, '<null>'));
+
+  delete from screening_v2.voice_worker_leases where app = v_app;
+end;
+$$;
+
+-- ── E3: a reclaimed engagement is HELD before its next dial ─────────────
+-- Production 10-01..10-03: all 26 lease_reclaimed restores were redialled
+-- 2-26 s later; only the two-per-IST-day cap stopped a third dial. Each
+-- block below drives the REAL admission and reclaim RPCs with an injected
+-- clock. Unanswered legs are used wherever the answered grace is not the
+-- point, so the reclaim instant is simply T + 10 min.
+
+-- dseq 1 -> same-day hold; dseq 2 -> next IST day's window; audit; budgets.
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_att1 uuid; v_att2 uuid;
+  v_t   constant timestamptz := '2026-09-24T04:30:00Z';      -- 10:00 IST
+  v_rc1 timestamptz; v_hold timestamptz; v_rc2 timestamptz; v_next_day timestamptz;
+  v_state text; v_reason text; v_nea timestamptz; v_na integer; v_rcu integer; v_pf integer;
+  v_astate text; v_abr text; v_meta jsonb; v_seq integer;
+begin
+  v_eng := _policy_tests.phone_fixture('pol112-e3-seq');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att1 := (v_res->>'attempt_id')::uuid;
+
+  v_rc1  := v_t + interval '10 minutes';
+  v_hold := v_rc1 + screening_v2.phone_same_day_retry_delay();
+  perform screening_v2.reclaim_phone_attempt_leases(500, v_rc1);
+
+  select e.state, e.state_reason, e.next_eligible_at,
+         e.no_answer_attempts, e.reconnects_used, e.provider_failures, a.state, a.abandon_reason
+    into v_state, v_reason, v_nea, v_na, v_rcu, v_pf, v_astate, v_abr
+    from screening_v2.phone_engagements e
+    join screening_v2.phone_call_attempts a on a.id = v_att1
+   where e.id = v_eng;
+  perform _policy_tests.assert(
+    '0112-E3: a reclaimed FIRST dial of the IST day restores eligible with a same-day-retry hold, uncharged',
+    v_astate = 'abandoned' and v_abr is null
+      and v_state = 'eligible' and v_reason = 'lease_reclaimed' and v_nea = v_hold
+      and v_na = 0 and v_rcu = 0 and v_pf = 0,
+    'attempt=' || coalesce(v_astate, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || '/' || coalesce(v_reason, '<null>') || ' next_eligible_at=' || coalesce(v_nea::text, '<null>')
+      || ' expected=' || v_hold || ' budgets=' || v_na || '/' || v_rcu || '/' || v_pf);
+
+  v_meta := _policy_tests.p112_reclaim_audit(v_att1);
+  perform _policy_tests.assert(
+    '0112-E3: the reclaim audit row carries redial_not_before = the hold it wrote',
+    v_meta ? 'redial_not_before'
+      and (v_meta->>'redial_not_before')::timestamptz = v_hold
+      and (v_meta->>'restored')::boolean and (v_meta->>'budget_charged')::boolean is false,
+    'an operator reading a reclaim must see when the candidate may next be rung; metadata='
+      || coalesce(v_meta::text, '<null>'));
+
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'no_answer_retry', null, 60,
+                                            v_rc1 + interval '30 seconds');
+  perform _policy_tests.assert(
+    '0112-E3: admission 30 s after the reclaim is not_yet_eligible',
+    v_res->>'status' = 'not_yet_eligible', coalesce(v_res::text, '<null>'));
+
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'no_answer_retry', null, 60,
+                                            v_hold + interval '1 second');
+  v_att2 := (v_res->>'attempt_id')::uuid;
+  select ist_day_seq into v_seq from screening_v2.phone_call_attempts where id = v_att2;
+  perform _policy_tests.assert(
+    '0112-E3: admission just after the hold is ok, as the day''s second dial',
+    v_res->>'status' = 'ok' and v_seq = 2,
+    'ist_day_seq=' || coalesce(v_seq::text, '<null>') || ' ' || coalesce(v_res::text, '<null>'));
+
+  -- The day's SECOND dial is reclaimed: there is no dial left today, so the
+  -- hold is the next IST day's window open — the expression 0095 uses for an
+  -- abandoned pre-disclosure leg — and the daily cap becomes unreachable.
+  v_rc2 := v_hold + interval '10 minutes';
+  v_next_day := screening_v2.phone_next_window_open(
+                  (screening_v2.phone_ist_date(v_rc2) + 1)::timestamp at time zone 'Asia/Kolkata');
+  perform screening_v2.reclaim_phone_attempt_leases(500, v_rc2);
+  select state, next_eligible_at into v_state, v_nea
+    from screening_v2.phone_engagements where id = v_eng;
+  v_meta := _policy_tests.p112_reclaim_audit(v_att2);
+  perform _policy_tests.assert(
+    '0112-E3: a reclaimed SECOND dial of the IST day is held to the next IST day''s window open',
+    v_state = 'eligible' and v_nea = v_next_day
+      and v_nea = '2026-09-25T03:30:00Z'::timestamptz
+      and (v_meta->>'redial_not_before')::timestamptz = v_next_day,
+    'next_eligible_at=' || coalesce(v_nea::text, '<null>') || ' expected=' || v_next_day
+      || ' metadata=' || coalesce(v_meta::text, '<null>'));
+
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'no_answer_retry', null, 60,
+                                            v_rc2 + interval '1 hour');
+  perform _policy_tests.assert(
+    '0112-E3: a same-day admission after the second reclaim is not_yet_eligible',
+    v_res->>'status' = 'not_yet_eligible', coalesce(v_res::text, '<null>'));
+
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'no_answer_retry', null, 60, v_next_day);
+  perform _policy_tests.assert(
+    '0112-E3: the engagement is admissible at the next IST day''s window open',
+    v_res->>'status' = 'ok', coalesce(v_res::text, '<null>'));
+
+  perform _policy_tests.phone44_teardown('pol112-e3-seq');
+end;
+$$;
+
+-- A prior `reconnecting` state is NOT held: the reconnect backoff lives in
+-- the TS clock, so the restore leaves next_eligible_at exactly as it was.
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_att uuid;
+  v_t   constant timestamptz := '2026-09-24T05:30:00Z';
+  v_before constant timestamptz := '2026-09-24T05:29:00Z';
+  v_state text; v_nea timestamptz; v_meta jsonb;
+begin
+  v_eng := _policy_tests.phone_fixture('pol112-e3-recon', 'reconnecting');
+  update screening_v2.phone_engagements set next_eligible_at = v_before where id = v_eng;
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'reconnect', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+
+  perform screening_v2.reclaim_phone_attempt_leases(500, v_t + interval '10 minutes');
+  select state, next_eligible_at into v_state, v_nea
+    from screening_v2.phone_engagements where id = v_eng;
+  v_meta := _policy_tests.p112_reclaim_audit(v_att);
+  perform _policy_tests.assert(
+    '0112-E3: a reclaim restoring RECONNECTING leaves next_eligible_at unchanged (no hold)',
+    v_res->>'status' = 'ok' and v_state = 'reconnecting' and v_nea = v_before
+      and (v_meta->>'restored')::boolean and v_meta ? 'redial_not_before'
+      and v_meta->>'redial_not_before' is null,
+    'admit=' || coalesce(v_res->>'status', '<null>') || ' state=' || coalesce(v_state, '<null>')
+      || ' next_eligible_at=' || coalesce(v_nea::text, '<null>')
+      || ' metadata=' || coalesce(v_meta::text, '<null>'));
+
+  perform _policy_tests.phone44_teardown('pol112-e3-recon');
+end;
+$$;
+
+-- A prior `scheduled` state gets a SHORT hold: the candidate asked for this
+-- slot, so it is 15 minutes (the stranded-session grace), not hours.
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_att uuid;
+  v_t   constant timestamptz := '2026-09-24T06:30:00Z';
+  v_rc  timestamptz; v_state text; v_reason text; v_nea timestamptz; v_meta jsonb;
+begin
+  v_eng := _policy_tests.phone_fixture('pol112-e3-sched', 'scheduled');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'scheduled', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+
+  v_rc := v_t + interval '10 minutes';
+  perform screening_v2.reclaim_phone_attempt_leases(500, v_rc);
+  select state, state_reason, next_eligible_at into v_state, v_reason, v_nea
+    from screening_v2.phone_engagements where id = v_eng;
+  v_meta := _policy_tests.p112_reclaim_audit(v_att);
+  perform _policy_tests.assert(
+    '0112-E3: a reclaim restoring SCHEDULED holds it for 15 minutes and keeps it scheduled',
+    v_res->>'status' = 'ok' and v_state = 'scheduled' and v_reason = 'lease_reclaimed'
+      and v_nea = v_rc + interval '15 minutes'
+      and (v_meta->>'redial_not_before')::timestamptz = v_rc + interval '15 minutes',
+    'admit=' || coalesce(v_res->>'status', '<null>') || ' state=' || coalesce(v_state, '<null>')
+      || ' next_eligible_at=' || coalesce(v_nea::text, '<null>')
+      || ' metadata=' || coalesce(v_meta::text, '<null>'));
+
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'scheduled', null, 60, v_rc + interval '5 minutes');
+  perform _policy_tests.assert(
+    '0112-E3: a scheduled engagement is not redialled inside its 15-minute hold',
+    v_res->>'status' = 'not_yet_eligible', coalesce(v_res::text, '<null>'));
+
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'scheduled', null, 60,
+                                            v_rc + interval '15 minutes 1 second');
+  perform _policy_tests.assert(
+    '0112-E3: a scheduled engagement is admissible once its 15-minute hold passes',
+    v_res->>'status' = 'ok', coalesce(v_res::text, '<null>'));
+
+  perform _policy_tests.phone44_teardown('pol112-e3-sched');
+end;
+$$;
+
+-- greatest(): a LATER hold already on the row is never pulled forward.
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_att uuid;
+  v_t     constant timestamptz := '2026-09-24T07:30:00Z';
+  v_later constant timestamptz := '2026-09-26T07:30:00Z';
+  v_rc  timestamptz; v_nea timestamptz; v_meta jsonb;
+begin
+  v_eng := _policy_tests.phone_fixture('pol112-e3-later');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+  -- Something else (an operator, a future edge) set a later hold mid-dial.
+  update screening_v2.phone_engagements set next_eligible_at = v_later where id = v_eng;
+
+  v_rc := v_t + interval '10 minutes';
+  perform screening_v2.reclaim_phone_attempt_leases(500, v_rc);
+  select next_eligible_at into v_nea from screening_v2.phone_engagements where id = v_eng;
+  v_meta := _policy_tests.p112_reclaim_audit(v_att);
+  perform _policy_tests.assert(
+    '0112-E3: a pre-existing LATER next_eligible_at is kept (greatest), never pulled forward',
+    v_res->>'status' = 'ok' and v_nea = v_later
+      and (v_meta->>'redial_not_before')::timestamptz
+            = v_rc + screening_v2.phone_same_day_retry_delay(),
+    'next_eligible_at=' || coalesce(v_nea::text, '<null>')
+      || ' metadata=' || coalesce(v_meta::text, '<null>'));
+
+  perform _policy_tests.phone44_teardown('pol112-e3-later');
+end;
+$$;
+
+-- The scored-session branch is NOT held: a conversation that completed and
+-- was scored is never restored to a dialable state, and 0112's hold must not
+-- leak into it (no next_eligible_at write, no redial_not_before).
+--
+-- KNOWN PRE-EXISTING DEFECT (0096, not introduced or fixed by 0112): this
+-- branch posts the engagement-level `assessment.completed` with
+-- p_attempt_id => null while the engagement is still `in_call`, and
+-- apply_phone_event refuses that shape with `attempt_required` (only the
+-- stranded states eligible/scheduled/reconnecting accept an attemptless
+-- post). So the engagement is NOT completed here: it is left `in_call` with
+-- its attempt abandoned, outside the stranded sweep's reach. This block
+-- asserts what 0112 owns — no restore, no hold — AND, separately, PINS the
+-- defect's exact current shape (engagement still `in_call`, no terminal_at).
+-- That pin is DELIBERATELY brittle: it goes RED the day the defect is fixed,
+-- and whoever fixes it must then replace it with the plan's original
+-- "completes the engagement" assertion. It exists so the weaker no-restore
+-- check above can never quietly become the permanent contract.
+-- Follow-up: PR-B / E4 (post with v_att.id, or route through the stranded
+-- edge).
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_att uuid; v_sess uuid; v_cand uuid; v_role uuid;
+  v_t constant timestamptz := '2026-09-24T08:30:00Z';
+  v_state text; v_term timestamptz; v_nea timestamptz; v_meta jsonb;
+  v_att_state text;
+begin
+  v_eng := _policy_tests.phone_fixture('pol112-e3-scored');
+  select candidate_id, role_id into v_cand, v_role
+    from screening_v2.phone_engagements where id = v_eng;
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+  perform screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_joined',
+            v_att, null, 'pol112-scored-join', null, null, v_t);
+  perform screening_v2.apply_phone_event('internal', 'classify.human',
+            v_att, null, null, null, null, v_t);
+  perform screening_v2.apply_phone_event('internal', 'disclosure.delivered',
+            v_att, null, null, null, null, v_t);
+
+  v_sess := _policy_tests.p112_session(v_cand, v_role, v_eng, v_t, 'completed');
+  update screening_v2.phone_engagements set session_id = v_sess where id = v_eng;
+  update screening_v2.phone_call_attempts set session_id = v_sess where id = v_att;
+  insert into screening_v2.assessments
+    (session_id, candidate_id, overall_score, recommendation, summary, raw, provenance, source)
+  values (v_sess, v_cand, 70, 'advance', 'pol112 synthetic', '{}'::jsonb,
+          '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet-4-20250514","workload":"scoring","prompt_template_version":"2026-07-28.1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb,
+          'phone');
+
+  perform screening_v2.reclaim_phone_attempt_leases(500, v_t + interval '10 minutes');
+  select state, terminal_at, next_eligible_at into v_state, v_term, v_nea
+    from screening_v2.phone_engagements where id = v_eng;
+  v_meta := _policy_tests.p112_reclaim_audit(v_att);
+  perform _policy_tests.assert(
+    '0112-E3: the scored-session reclaim branch is never restored to a dialable state and gets no hold',
+    v_state not in ('eligible', 'scheduled', 'reconnecting') and v_nea is null
+      and (v_meta->>'restored')::boolean is false
+      and v_meta ? 'redial_not_before' and v_meta->>'redial_not_before' is null,
+    'state=' || coalesce(v_state, '<null>') || ' next_eligible_at=' || coalesce(v_nea::text, '<null>')
+      || ' metadata=' || coalesce(v_meta::text, '<null>'));
+
+  select state into v_att_state from screening_v2.phone_call_attempts where id = v_att;
+  perform _policy_tests.assert(
+    '0112-E3 KNOWN-DEFECT PIN (0096): the scored-session reclaim currently leaves the engagement in_call '
+      || '(attemptless assessment.completed refused) — RED here means the defect was fixed: replace this '
+      || 'pin with the "completes the engagement" assertion',
+    v_state = 'in_call' and v_term is null
+      and v_att_state not in ('admitted', 'ringing', 'answered_unclassified', 'human', 'machine'),
+    'state=' || coalesce(v_state, '<null>') || ' terminal_at=' || coalesce(v_term::text, '<null>')
+      || ' attempt_state=' || coalesce(v_att_state, '<null>'));
+
+  perform _policy_tests.phone44_teardown('pol112-e3-scored');
+end;
+$$;
+
+-- PIN (existing 0095 behaviour, unchanged by 0112): the worker-allowlisted
+-- `sip.participant_left`, posted INTERNALLY from dialing + an answered-but-
+-- unclassified leg, ends the attempt abandoned_pre_disclosure, charges
+-- nothing and holds to the next IST day. The PR-A worker change (A7) posts
+-- exactly this for a pre-consent ring-out, so this edge must not drift.
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_att uuid; v_ev jsonb;
+  v_t constant timestamptz := '2026-09-24T09:30:00Z';
+  v_astate_before text; v_astate text; v_outcome text;
+  v_state text; v_nea timestamptz; v_na integer; v_rcu integer; v_pf integer;
+begin
+  v_eng := _policy_tests.phone_fixture('pol112-e3-left');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+  perform screening_v2.apply_phone_event('internal', 'call.answered',
+            v_att, null, null, null, null, v_t + interval '20 seconds');
+  select state into v_astate_before from screening_v2.phone_call_attempts where id = v_att;
+
+  v_ev := screening_v2.apply_phone_event('internal', 'sip.participant_left',
+            v_att, null, null, null, null, v_t + interval '1 minute');
+  select a.state, a.outcome_class, e.state, e.next_eligible_at,
+         e.no_answer_attempts, e.reconnects_used, e.provider_failures
+    into v_astate, v_outcome, v_state, v_nea, v_na, v_rcu, v_pf
+    from screening_v2.phone_call_attempts a
+    join screening_v2.phone_engagements e on e.id = a.engagement_id
+   where a.id = v_att;
+  perform _policy_tests.assert(
+    '0112-E3 pin: internal sip.participant_left from dialing + answered_unclassified ends the attempt '
+      || 'abandoned_pre_disclosure, uncharged, held to the next IST-day window',
+    v_astate_before = 'answered_unclassified'
+      and v_astate = 'ended' and v_outcome = 'abandoned_pre_disclosure'
+      and v_state = 'eligible' and v_na = 0 and v_rcu = 0 and v_pf = 0
+      and v_nea = screening_v2.phone_next_window_open(
+                    (screening_v2.phone_ist_date(v_t + interval '1 minute') + 1)::timestamp
+                      at time zone 'Asia/Kolkata')
+      and v_nea = '2026-09-25T03:30:00Z'::timestamptz,
+    'before=' || coalesce(v_astate_before, '<null>') || ' attempt=' || coalesce(v_astate, '<null>')
+      || '/' || coalesce(v_outcome, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || ' next_eligible_at=' || coalesce(v_nea::text, '<null>')
+      || ' budgets=' || v_na || '/' || v_rcu || '/' || v_pf || ' event=' || coalesce(v_ev::text, '<null>'));
+
+  perform _policy_tests.phone44_teardown('pol112-e3-left');
+end;
+$$;
+
+-- THE REDIAL-INTO-LIVE-INTERVIEW SHAPE (eng fd9b54f0, 2026-10-03): a live, consented interview
+-- whose attempt was reclaimed — the worker that carried it was lost — while
+-- its session was still in_progress. Before 0112 the engagement was redialled
+-- 12 s later into a still-running interview. Now it is held 5 h; the session
+-- then ends and is scored, and the engagement-level internal
+-- assessment.completed (the stranded edge the sweep drives) completes it
+-- INSIDE the hold, so the candidate is never dialled again.
+do $$
+declare
+  v_eng uuid; v_res jsonb; v_att uuid; v_sess uuid; v_cand uuid; v_role uuid;
+  v_t  constant timestamptz := '2026-09-24T10:30:00Z';
+  v_rc timestamptz; v_hold timestamptz;
+  v_state text; v_term timestamptz; v_nea timestamptz; v_astate text; v_sstate text;
+  v_ev jsonb;
+begin
+  v_eng := _policy_tests.phone_fixture('pol112-e3-liveredial');
+  select candidate_id, role_id into v_cand, v_role
+    from screening_v2.phone_engagements where id = v_eng;
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+  perform screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_joined',
+            v_att, null, 'pol112-liveredial-join', null, null, v_t);
+  perform screening_v2.apply_phone_event('internal', 'classify.human',
+            v_att, null, null, null, null, v_t);
+  perform screening_v2.apply_phone_event('internal', 'disclosure.delivered',
+            v_att, null, null, null, null, v_t);
+
+  -- The consented session, bound at both scopes as start_phone_assessment
+  -- leaves it, and still in_progress (no stuck egress, so 0071's terminalize
+  -- does not apply).
+  v_sess := _policy_tests.p112_session(v_cand, v_role, v_eng, v_t, 'in_progress');
+  update screening_v2.phone_engagements set session_id = v_sess where id = v_eng;
+  update screening_v2.phone_call_attempts set session_id = v_sess where id = v_att;
+  select state into v_state from screening_v2.phone_engagements where id = v_eng;
+
+  v_rc := v_t + interval '10 minutes';
+  v_hold := v_rc + screening_v2.phone_same_day_retry_delay();
+  perform screening_v2.reclaim_phone_attempt_leases(500, v_rc);
+  select e.state, e.next_eligible_at, a.state, s.status
+    into v_state, v_nea, v_astate, v_sstate
+    from screening_v2.phone_engagements e
+    join screening_v2.phone_call_attempts a on a.id = v_att
+    join screening_v2.call_sessions s on s.id = v_sess
+   where e.id = v_eng;
+  perform _policy_tests.assert(
+    '0112-E3 LIVE-REDIAL: an in_call attempt with an in_progress session is reclaimed and HELD 5 h',
+    v_astate = 'abandoned' and v_state = 'eligible' and v_nea = v_hold
+      and v_sstate = 'in_progress',
+    'attempt=' || coalesce(v_astate, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || ' next_eligible_at=' || coalesce(v_nea::text, '<null>') || ' expected=' || v_hold
+      || ' session=' || coalesce(v_sstate, '<null>'));
+
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'no_answer_retry', null, 60,
+                                            v_rc + interval '12 seconds');
+  perform _policy_tests.assert(
+    '0112-E3 LIVE-REDIAL: the engagement is NOT redialled into the live interview (12 s after reclaim)',
+    v_res->>'status' = 'not_yet_eligible', coalesce(v_res::text, '<null>'));
+
+  -- The interview ends and is scored inside the hold.
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'conversation_complete'
+   where id = v_sess;
+  insert into screening_v2.assessments
+    (session_id, candidate_id, overall_score, recommendation, summary, raw, provenance, source)
+  values (v_sess, v_cand, 70, 'advance', 'pol112 synthetic', '{}'::jsonb,
+          '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet-4-20250514","workload":"scoring","prompt_template_version":"2026-07-28.1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb,
+          'phone');
+  v_ev := screening_v2.apply_phone_event('internal', 'assessment.completed',
+            null, v_eng, 'stranded:' || v_sess::text || ':assessment.completed',
+            null, null, v_rc + interval '20 minutes');
+  select state, terminal_at into v_state, v_term
+    from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0112-E3 LIVE-REDIAL: the engagement-level assessment.completed (stranded edge) completes it inside the hold',
+    v_state = 'completed' and v_term is not null,
+    'a scored interview must reach its engagement whatever ended the worker; event='
+      || coalesce(v_ev::text, '<null>') || ' state=' || coalesce(v_state, '<null>'));
+
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'no_answer_retry', null, 60,
+                                            v_hold + interval '1 second');
+  perform _policy_tests.assert(
+    '0112-E3 LIVE-REDIAL: a completed engagement is never admitted again, even after the hold',
+    coalesce(v_res->>'status', '') <> 'ok', coalesce(v_res::text, '<null>'));
+
+  perform _policy_tests.phone44_teardown('pol112-e3-liveredial');
 end;
 $$;
 

@@ -44,6 +44,21 @@ app = "project-hello-phone-voice"
 # and fatal to the one deploy that has to create one. The allowlist in
 # scripts/fly-region-policy.mjs is enforced by scripts/validate-voice-worker-apps.mjs.
 primary_region = "sin"
+# E2 (M009, 2026-10-03): seconds Fly waits after the stop signal before it
+# force-kills the VM. Fly's DEFAULT is 5 s, which defeats the LiveKit SDK's
+# drain (drain_timeout 1800 s) and the parent's PHONE_SHUTDOWN_PROCESS_TIMEOUT
+# (90 s) grace: on 2026-10-03 a machine running a live interview logged
+# "draining worker" and was force-killed 5 s later, mid-call. 300 is Fly's
+# maximum. It costs nothing on the healthy path — an IDLE worker has no job to
+# drain and exits at once — and it also protects the recording upload during a
+# legitimate terminal-release stop. Checked by
+# scripts/validate-voice-worker-apps.mjs (integer, 90..300).
+#
+# NOT here in PR-A: PHONE_PER_MACHINE_AGENT_NAME (the per-machine registration
+# flag). It must only be set once the API that accepts and stores agent names
+# is live, or the worker's ready post carries a key the old strict schema
+# rejects. It lands in a follow-up PR under [env].
+kill_timeout = 300
 
 [build]
   dockerfile = "Dockerfile"

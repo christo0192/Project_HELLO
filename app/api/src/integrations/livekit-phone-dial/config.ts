@@ -40,6 +40,7 @@ const _contractVisibleEnvReads = [
   process.env.PHONE_BOUNCE_MODE,
   process.env.PHONE_BOUNCE_TRUNK_ID,
   process.env.PHONE_BOUNCE_SIP_USER,
+  process.env.PHONE_AGENT_JOIN_TIMEOUT_SEC,
 ];
 void _contractVisibleEnvReads;
 
@@ -79,6 +80,21 @@ export const PHONE_DIAL_BOUNDS = {
    * and a stuck leg would hold a fleet slot until something else noticed.
    */
   maxCallSeconds: { def: 900, min: 60, max: 3_600 },
+  /**
+   * M009 E2: how long a TARGETED (per-machine) dispatch waits, after the room
+   * is provisioned and BEFORE any SIP leg is originated, for the leased
+   * machine's agent to actually join the room. If it does not, the dial
+   * defers (worker_not_ready) and no candidate is ever dialled into a room
+   * with no agent.
+   *
+   * It spends the SAME admission lease the worker-ready gate spends, before
+   * the ring even starts, so its effective value is additionally clamped by
+   * `effectivePhoneAgentJoinTimeoutSec` against that lease — this bound only
+   * keeps a typo from becoming a minute-long stall or a sub-second give-up.
+   * The default (20 s) covers a warm worker's join with margin; the floor (5 s)
+   * is the least that is not a guaranteed defer.
+   */
+  agentJoinTimeoutSec: { def: 20, min: 5, max: 60 },
 } as const;
 
 export interface PhoneDialConfig {
@@ -102,6 +118,17 @@ export interface PhoneDialConfig {
   agentName: string;
   originateTimeoutSeconds: number;
   maxCallSeconds: number;
+  /**
+   * M009 E2: the CONFIGURED per-machine agent-join wait (seconds), already
+   * clamped into `PHONE_DIAL_BOUNDS.agentJoinTimeoutSec`. Read only on a
+   * targeted dispatch; the untargeted (shared-name) path never waits. Apply
+   * `effectivePhoneAgentJoinTimeoutSec` before using it as a budget.
+   *
+   * Optional ONLY so hand-assembled configs (Canary-1's pinned direct-dial
+   * config) keep compiling; `loadPhoneDialConfig` always sets it, and a
+   * reader that finds it absent must use `PHONE_DIAL_BOUNDS.agentJoinTimeoutSec.def`.
+   */
+  agentJoinTimeoutSec?: number;
   /**
    * ── ANSWER-FIRST ORIGINATION ("bounce mode"), default OFF ─────────────
    * When true, LiveKit no longer dials the candidate directly. It dials a
@@ -170,6 +197,10 @@ export function loadPhoneDialConfig(
       PHONE_DIAL_BOUNDS.originateTimeoutSeconds,
     ),
     maxCallSeconds: boundedInt(source.PHONE_MAX_CALL_SECONDS, PHONE_DIAL_BOUNDS.maxCallSeconds),
+    agentJoinTimeoutSec: boundedInt(
+      source.PHONE_AGENT_JOIN_TIMEOUT_SEC,
+      PHONE_DIAL_BOUNDS.agentJoinTimeoutSec,
+    ),
     // The SAME `=== 'true'` idiom the domain master switch uses: anything but
     // the exact string `true` is OFF, which is fail-closed for a flag that
     // reroutes every dial.
@@ -181,6 +212,101 @@ export function loadPhoneDialConfig(
     // dropped to empty (fail-closed) rather than sent.
     bounceSipUser: boundedOpaqueId(source.PHONE_BOUNCE_SIP_USER, 64),
   };
+}
+
+/**
+ * Headroom (seconds) the join wait leaves inside the admission lease after the
+ * worker-ready gate, so the lease does not lapse in the same second the join
+ * wait gives up.
+ */
+export const PHONE_AGENT_JOIN_LEASE_MARGIN_SEC = 5;
+
+export interface EffectivePhoneAgentJoinTimeout {
+  /** The join wait to actually use, in whole seconds. Never below the floor. */
+  readonly seconds: number;
+  /**
+   * True when the lease cannot fit even the floor after the worker-ready
+   * budget: `originateLeaseSec - workerReadyTimeoutSec - margin < floor`. The
+   * floor is still returned (a sub-floor wait is a guaranteed defer, which is
+   * no safer), but the deployment is misconfigured and should say so once.
+   */
+  readonly budgetShort: boolean;
+}
+
+/**
+ * The join wait a targeted dispatch may actually spend:
+ *
+ *   min(configured, originateLeaseSec − workerReadyTimeoutSec − 5), floor 5.
+ *
+ * ── WHY IT IS CLAMPED AGAINST THE LEASE ───────────────────────────────
+ * The admission lease (`PHONE_LEASE_SECONDS`) is the clock the reclaimer reads.
+ * The worker-ready gate (`PHONE_WORKER_READY_TIMEOUT_SEC`) and this join wait
+ * both run on it before a single ring. If the two together could outlast it,
+ * a slow-but-successful boot followed by a slow join would originate into a
+ * lease `reclaim_phone_attempt_leases` is already entitled to take back — the
+ * exact "dial still in flight while reclaimed" race the originate bound was
+ * sized to prevent. So the join wait yields to the other two rather than
+ * stretching the lease, which is a deployment decision (see
+ * `lease_too_short_for_gate`).
+ *
+ * Pure: no I/O, no ambient reads. Malformed inputs fall back to the bound's
+ * default / floor rather than producing NaN.
+ */
+export function effectivePhoneAgentJoinTimeoutSec(input: {
+  configuredSec: number | undefined;
+  originateLeaseSec: number;
+  /**
+   * The WHOLE worst-case worker gate before the join starts — the Fly start
+   * wait plus the ready poll (`PHONE_WORKER_GATE_CEILING_SEC` in dial.ts), not
+   * the ready poll alone, which under-counts a cold boot by the start wait.
+   */
+  workerReadyTimeoutSec: number;
+}): EffectivePhoneAgentJoinTimeout {
+  const bound = PHONE_DIAL_BOUNDS.agentJoinTimeoutSec;
+  const finite = (n: number | undefined, fallback: number): number =>
+    typeof n === 'number' && Number.isFinite(n) ? Math.floor(n) : fallback;
+  const configured = Math.min(
+    bound.max,
+    Math.max(bound.min, finite(input.configuredSec, bound.def)),
+  );
+  const remaining = finite(input.originateLeaseSec, 0)
+    - finite(input.workerReadyTimeoutSec, 0)
+    - PHONE_AGENT_JOIN_LEASE_MARGIN_SEC;
+  const budgetShort = remaining < bound.min;
+  return {
+    seconds: Math.max(bound.min, Math.min(configured, remaining)),
+    budgetShort,
+  };
+}
+
+let agentJoinBudgetWarned = false;
+
+/**
+ * Report a short join budget ONCE per process, through the caller's logger.
+ *
+ * Called at boot by whoever wires the dial path. Takes the sink rather than
+ * importing a logger so this module keeps its no-I/O-on-import property, and
+ * latches so a per-dial caller cannot turn one config mistake into a log line
+ * per dial. The sink receives an event KIND only — no values, no identifiers.
+ * Returns true iff it emitted.
+ */
+export function warnPhoneAgentJoinBudgetOnce(
+  effective: EffectivePhoneAgentJoinTimeout,
+  warn: (kind: string) => void,
+): boolean {
+  if (!effective.budgetShort || agentJoinBudgetWarned) return false;
+  agentJoinBudgetWarned = true;
+  try {
+    warn('phone_agent_join_budget_short');
+  } catch {
+    /* a throwing sink must never break boot */
+  }
+  return true;
+}
+
+/** Test seam: re-arm the once-per-process latch. */
+export function resetPhoneAgentJoinBudgetWarningForTests(): void {
+  agentJoinBudgetWarned = false;
 }
 
 /**

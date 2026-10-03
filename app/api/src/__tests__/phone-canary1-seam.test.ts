@@ -341,6 +341,26 @@ describe('3. one invocation, one room, at most one originate', () => {
     expect(h.dispatches[0]?.agent).toBe('phone-screener');
   });
 
+  it('M009 E2 — --machine dispatches the per-machine name; the default still dispatches the shared one', async () => {
+    const targeted = harness({ argv: ['--machine', '7812736a540d58'] });
+    const result = await runCanary1(targeted.deps);
+    expect(targeted.dispatches.map((d) => d.agent)).toEqual(['phone-screener-7812736a540d58']);
+    // The machine id is a dispatch name, never a metadata field.
+    expect(Object.keys(JSON.parse(targeted.dispatches[0]?.metadata as string) as object).sort())
+      .toEqual(['canary_id', 'channel', 'mode', 'session_id']);
+    expect(result.lines).toContain('CANARY|canary1|originate_skipped|PASS|dry_run');
+
+    const untargeted = harness({ argv: [] });
+    await runCanary1(untargeted.deps);
+    expect(untargeted.dispatches.map((d) => d.agent)).toEqual(['phone-screener']);
+
+    const invalid = harness({ argv: ['--machine', 'NOT-AN-ID'] });
+    const refused = await runCanary1(invalid.deps);
+    expect(invalid.calls).toEqual([]);
+    expect(refused.providerContacted).toBe(false);
+    expect(refused.exitCode).not.toBe(0);
+  });
+
   it('DISARMED — refuses before the prompt and before EVERY provider call', async () => {
     const h = harness({ armed: false });
     const result = await runCanary1(h.deps);
