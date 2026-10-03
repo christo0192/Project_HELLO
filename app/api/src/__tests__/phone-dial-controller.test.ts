@@ -260,8 +260,14 @@ function harness(opts: {
     return undefined;
   });
 
+  // Deterministic clock: the dial measures elapsed time on this seam (M009),
+  // so wall-clock jitter on a loaded CI runner must not move a lease boundary.
+  // Time advances only through sleep(), so any barrier loop still terminates.
+  let fakeMs = NOW.getTime();
+  const agentJoinClock = { now: () => fakeMs, sleep: async (ms: number) => { fakeMs += ms; } };
   const deps: PhoneDialDeps = {
     config: opts.config ?? screeningConfig(),
+    agentJoinClock,
     dialConfig: opts.dialConfig ?? DIAL_CONFIG,
     stores,
     admission: { consentReader },
