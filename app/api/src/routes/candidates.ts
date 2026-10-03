@@ -38,6 +38,34 @@ function rpcStatus(data: unknown): string {
     : 'unknown_status';
 }
 
+// 0114 (C6): request_phone_rescreen's `prerequisite_status` (the status
+// ensure_ashby_phone_engagement returned for the child). A stable code, never
+// PII. null when absent or not a string: a replay that evaluated nothing, or a
+// database that predates 0114.
+function prerequisiteStatus(data: unknown): string | null {
+  const v = data && typeof data === 'object'
+    ? (data as { prerequisite_status?: unknown }).prerequisite_status
+    : undefined;
+  return typeof v === 'string' ? v : null;
+}
+
+// The ensure statuses that leave a child gate-armable (0081 arms only
+// `eligible` or a due `scheduled` engagement).
+const TEST_GATE_ARMABLE_PREREQUISITES: ReadonlySet<string> = new Set([
+  'eligible',
+  'scheduled_next_window',
+]);
+
+// 0114 (C8). This route module deliberately does not import the phone screening
+// package (a structural boundary), so the two §6 vocabularies it acts on are
+// restated here and pinned to the domain rpc-contract module
+// (`PHONE_DUPLICATE_APPLICATION_STATUS`, `RELEASE_PHONE_IDENTITY_HOLD_STATUSES`)
+// and to the 0114 bodies by phone-0114-identity-api.test.ts.
+const PHONE_DUPLICATE_APPLICATION_STATUS = 'duplicate_application';
+const RELEASE_PHONE_IDENTITY_HOLD_STATUSES: readonly string[] = [
+  'ok', 'actor_required', 'invalid_request', 'not_found', 'not_held',
+];
+
 const PHONE_ATTEMPT_HISTORY_MAX = 50;
 
 type AttemptHistoryCursor = { admitted_at: string; id: string };
@@ -349,6 +377,14 @@ candidatesRouter.post(
       await recordAudit(req, 'resource.create', accepted ? 202 : 409, {
         metadata: { resource: 'phone_call_request', status },
       });
+      // 0114 (C8): the same person already has a live or completed screen for
+      // this role on another candidate row, so ensure HELD this engagement in
+      // pending_prereqs. A distinct error code (not phone_request_refused) so
+      // the client can offer the release action; the other row is never named.
+      if (status === PHONE_DUPLICATE_APPLICATION_STATUS) {
+        res.status(409).json({ ok: false, error: PHONE_DUPLICATE_APPLICATION_STATUS, status });
+        return;
+      }
       if (!accepted) {
         res.status(409).json({ ok: false, error: 'phone_request_refused', status });
         return;
@@ -607,9 +643,117 @@ candidatesRouter.post(
         });
         return;
       }
+      // 0114 (C8): schedule_candidate_phone_appointment books nothing for a
+      // same-role duplicate application held in pending_prereqs. Named
+      // explicitly (it would also fall through below) because the web client
+      // keys its release action on this exact code.
+      if (status === PHONE_DUPLICATE_APPLICATION_STATUS) {
+        res.status(409).json({ ok: false, error: PHONE_DUPLICATE_APPLICATION_STATUS });
+        return;
+      }
       res.status(409).json({ ok: false, error: status === 'unknown_status' ? 'phone_rpc_unknown_status' : status });
     } catch {
       res.status(503).json({ ok: false, error: 'phone_schedule_unavailable' });
+    }
+  },
+);
+
+// 0114 (C8-C). Release a same-role duplicate-application hold. The same authz
+// as the manual phone request (interviewer, owner-scoped; admin unrestricted),
+// because releasing the hold is what lets that request's engagement proceed.
+// The engagement is resolved SERVER-SIDE from the candidate: the browser never
+// names one. A candidate row is one application, so normally exactly one held
+// engagement exists; more than one is refused rather than guessed. The SQL
+// re-checks the hold under the link and engagement locks, records the
+// release, writes its own `phone_identity_hold_release` audit row, and re-runs
+// the prerequisite evaluator. It never creates an attempt or a queue job — the
+// due pass and admit_phone_attempt remain the only dial path.
+candidatesRouter.post(
+  '/:id/phone/release-duplicate-hold',
+  requireRole('interviewer'),
+  validateParams(candidateIdParamSchema),
+  validateBody(manualPhoneCallBodySchema),
+  async (req, res) => {
+    if (process.env.PHONE_SCREENING_ENABLED !== 'true') {
+      res.status(503).json({ ok: false, error: 'phone_screening_disabled' });
+      return;
+    }
+    const actorId = req.authUser?.id;
+    if (!actorId) {
+      res.status(403).json({ ok: false, error: 'actor_required' });
+      return;
+    }
+    if (!(await candidateVisibleToRecruiter(req.params.id, req.authUser))) {
+      res.status(404).json({ ok: false, error: 'candidate_not_found' });
+      return;
+    }
+    try {
+      const { data: rows, error: readError } = await supabase
+        .from('phone_engagements')
+        .select('id')
+        .eq('candidate_id', req.params.id)
+        .eq('state', 'pending_prereqs')
+        .eq('state_reason', PHONE_DUPLICATE_APPLICATION_STATUS)
+        .is('terminal_at', null)
+        .limit(2);
+      if (readError) {
+        res.status(503).json({ ok: false, error: 'phone_release_unavailable' });
+        return;
+      }
+      const held = (Array.isArray(rows) ? rows : [])
+        .map((row) => (row as { id?: unknown }).id)
+        .filter((id): id is string => typeof id === 'string');
+      if (held.length === 0) {
+        res.status(409).json({ ok: false, error: 'phone_hold_not_held' });
+        return;
+      }
+      if (held.length > 1) {
+        res.status(409).json({ ok: false, error: 'phone_hold_ambiguous' });
+        return;
+      }
+
+      const { data, error } = await supabase.rpc('release_phone_identity_hold', {
+        p_engagement_id: held[0],
+        p_actor_id: actorId,
+        p_now: new Date().toISOString(),
+      });
+      if (error) {
+        res.status(503).json({ ok: false, error: 'phone_release_unavailable' });
+        return;
+      }
+      const raw = rpcStatus(data);
+      const status = RELEASE_PHONE_IDENTITY_HOLD_STATUSES.includes(raw)
+        ? raw : 'unknown_status';
+      await recordAudit(req, 'resource.update', status === 'ok' ? 200 : 409, {
+        metadata: { resource: 'phone_identity_hold', outcome: status },
+      });
+      if (status === 'ok') {
+        res.json({
+          ok: true,
+          status: 'released',
+          engagement_id: held[0],
+          // What the prerequisite evaluator said once the hold was lifted
+          // (eligible, scheduled_next_window, or a stable pending reason).
+          prerequisite_status: prerequisiteStatus(data),
+        });
+        return;
+      }
+      if (status === 'not_held') {
+        // Lost a race: another operator released it, or it moved on.
+        res.status(409).json({ ok: false, error: 'phone_hold_not_held' });
+        return;
+      }
+      if (status === 'not_found') {
+        res.status(404).json({ ok: false, error: 'phone_hold_not_found' });
+        return;
+      }
+      if (status === 'actor_required') {
+        res.status(403).json({ ok: false, error: 'actor_required' });
+        return;
+      }
+      res.status(500).json({ ok: false, error: 'phone_rpc_unknown_status' });
+    } catch {
+      res.status(503).json({ ok: false, error: 'phone_release_unavailable' });
     }
   },
 );
@@ -945,6 +1089,10 @@ candidatesRouter.post(
           status,
           cycle_number: typeof (data as { cycle_number?: unknown })?.cycle_number === 'number'
             ? (data as { cycle_number: number }).cycle_number : null,
+          // 0114 (C6): what the prerequisite evaluator said about the new
+          // cycle (eligible, scheduled_next_window, or a stable reason it is
+          // still pending). null on a replay that evaluated nothing.
+          prerequisite_status: prerequisiteStatus(data),
         });
         return;
       }
@@ -1120,11 +1268,31 @@ candidatesRouter.post(
         res.status(503).json({ ok: false, error: 'phone_test_gate_unavailable' });
         return;
       }
-      await armGate(
-        engagementId,
-        rescreen && typeof rescreen === 'object' && 'cycle_number' in rescreen
-          ? (rescreen as { cycle_number?: unknown }).cycle_number : null,
-      );
+      const cycleNumber = rescreen && typeof rescreen === 'object' && 'cycle_number' in rescreen
+        ? (rescreen as { cycle_number?: unknown }).cycle_number : null;
+      // 0114 (C6): request_phone_rescreen now runs the prerequisite evaluator
+      // and reports its verdict. Only an `eligible` or `scheduled_next_window`
+      // child is an owner-test target; anything else (consent, mapping,
+      // ingestion, duplicate hold, ...) would only be refused by the arm as
+      // not armable, so answer with the real reason and do NOT arm.
+      // NOTE: the rescreen cycle is already COMMITTED at this point (the RPC
+      // is its own transaction). It consumes one of the 3 cycle slots and
+      // stays pending_prereqs; a retry with the same request_id replays it
+      // (and self-heals it once the prerequisite is met) instead of minting
+      // another. A null status (a replay that evaluated nothing, or a pre-0114
+      // database) falls through to the arm, which re-checks the state itself.
+      const prereq = prerequisiteStatus(rescreen);
+      if (prereq !== null && !TEST_GATE_ARMABLE_PREREQUISITES.has(prereq)) {
+        res.status(409).json({
+          ok: false,
+          error: 'phone_test_gate_prereqs_unmet',
+          status: prereq,
+          engagement_id: engagementId,
+          cycle_number: typeof cycleNumber === 'number' ? cycleNumber : null,
+        });
+        return;
+      }
+      await armGate(engagementId, cycleNumber);
     } catch {
       res.status(503).json({ ok: false, error: 'phone_test_gate_unavailable' });
     }

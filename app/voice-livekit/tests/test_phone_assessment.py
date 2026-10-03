@@ -208,9 +208,18 @@ class TestHaltTaxonomy(unittest.TestCase):
             # Explicitly ending this call is terminal but not a future-contact
             # opt-out, so it is classified outside the post-nothing family.
             phone.HALT_CANDIDATE_ENDED,
+            # M009 PR-C (C2): the in-call callback flow's terminal deferral.
+            # It posts `callback.deferred_in_call` exactly once, so it is
+            # neither retryable (post-nothing) nor a candidate abort.
+            phone.HALT_CALLBACK_DEFERRED,
+            # M009 PR-C (C7): a mid-call withdrawal. It posts
+            # `candidate.opt_out` exactly once, so it is not retryable.
+            phone.HALT_CANDIDATE_OPTED_OUT,
         }
-        self.assertEqual(len(declared), 9)
+        self.assertEqual(len(declared), 11)
         self.assertTrue(phone.RETRYABLE_HALTS.issubset(declared))
+        self.assertFalse(phone.halt_is_retryable(phone.HALT_CALLBACK_DEFERRED))
+        self.assertFalse(phone.halt_is_retryable(phone.HALT_CANDIDATE_OPTED_OUT))
         self.assertTrue(phone.halt_is_retryable(phone.HALT_LEASE_LOST))
         self.assertTrue(phone.halt_is_retryable(phone.HALT_LEASE_UNCONFIRMED))
         self.assertTrue(phone.halt_is_retryable(phone.HALT_CALLBACK_SCHEDULED))

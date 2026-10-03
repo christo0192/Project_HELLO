@@ -1137,7 +1137,11 @@ describe('OpenAPI document integrity', () => {
     // instruction and 1-4 rubric from its name and description and writes
     // nothing. Its bodies are documented inline, so the schema count below is
     // unchanged. 142 + 1 = 143.
-    expect(Object.keys(paths).length).toBe(143);
+    // 0114 (C8) adds ONE recruiter action — POST /api/candidates/{id}/phone/
+    // release-duplicate-hold, which lifts a same-role duplicate-application
+    // hold. Its bodies are documented inline, so the schema count below is
+    // unchanged. 143 + 1 = 144.
+    expect(Object.keys(paths).length).toBe(144);
     // 149 + RoomUnavailableError + MaintenanceBlockedBody (discriminated
     // 503 bodies on exchangeInvite) + RecordingFinalizeHealth (0038)
     // + the five read-only feedback-form discovery schemas

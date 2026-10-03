@@ -200,6 +200,20 @@ export interface PhoneRuntimeView {
    * and a health surface is not where a configuration error gets rendered.
    */
   start_failed: boolean;
+  /**
+   * 0114 (C10d). The due-loop starvation episode THIS process observed:
+   * whether the last pass was starving, since when, whether the episode has
+   * passed `PHONE_DUE_STARVATION_ALERT_SEC` (`alarmed`, which contributes the
+   * `phone_due_starved` reason), and the starving codes from the closed
+   * vocabulary. Present whenever a registered runtime reports it; absent on
+   * the unregistered shape, where no pass has run.
+   */
+  due_starvation?: {
+    starving: boolean;
+    since: string | null;
+    alarmed: boolean;
+    codes: string[];
+  };
 }
 
 function view(
@@ -291,6 +305,17 @@ export function phoneRuntimeView(now: Date = new Date()): PhoneRuntimeView {
       .sort(),
     // A registered runtime constructed successfully by definition.
     start_failed: false,
+    // 0114 (C10d). Additive: only when the runtime reports it.
+    ...(snapshot.dueStarvation === undefined
+      ? {}
+      : {
+        due_starvation: {
+          starving: snapshot.dueStarvation.starving,
+          since: snapshot.dueStarvation.since,
+          alarmed: snapshot.dueStarvation.alarmed,
+          codes: [...snapshot.dueStarvation.codes],
+        },
+      }),
   };
 }
 
@@ -321,5 +346,10 @@ export function phoneRuntimeDegradeReasons(view_: PhoneRuntimeView): string[] {
   // this the surface reported `status: ok` with `last_reclaimed: 0` while
   // expired attempt leases piled up holding fleet slots.
   if (view_.sweeps_not_ok.length > 0) reasons.push('phone_sweep_not_ok');
+  // 0114 (C10d). An `ok` lane that has examined rows and dialled nobody, for a
+  // machinery reason, for PHONE_DUE_STARVATION_ALERT_SEC. Ended by any pass
+  // that dials, finds nothing starving, or is halted — so a halted lane never
+  // carries it (`phone_due_halted` says that).
+  if (view_.due_starvation?.alarmed === true) reasons.push('phone_due_starved');
   return reasons;
 }

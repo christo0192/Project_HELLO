@@ -878,7 +878,17 @@ begin
                             _phone_canary.code(r->>'status'));
   if r->>'status' = 'halted' then refusals := refusals + 1; end if;
 
+  -- 0114: an UNATTRIBUTED clear is refused before any write, and the halt
+  -- stays exactly as it was. Resuming calls to people must name who did it.
   r := screening_v2.clear_phone_halt(null, t + interval '3 minutes');
+  perform _phone_canary.chk(s, 'unattributed_clear_refused',
+    r->>'status' = 'actor_required'
+      and (select halt_reason from screening_v2.phone_control where control_key = 'default')
+          = 'cost_control',
+    _phone_canary.code(r->>'status'));
+
+  r := screening_v2.clear_phone_halt('00000000-0000-4000-8000-0000000000d1',
+                                    t + interval '3 minutes');
   perform _phone_canary.chk(s, 'halt_cleared', r->>'status' = 'ok',
                             _phone_canary.code(r->>'status'));
   perform _phone_canary.chk(s, 'clear_reports_it_was_halted',
@@ -903,7 +913,8 @@ begin
   perform _phone_canary.chk(s, 'backlog_names_the_unreadable_switch',
                             bl->'admission'->>'halt_reason' = 'halt_unreadable',
                             _phone_canary.code(bl->'admission'->>'halt_reason'));
-  r := screening_v2.clear_phone_halt(null, t + interval '6 minutes');
+  r := screening_v2.clear_phone_halt('00000000-0000-4000-8000-0000000000d1',
+                                    t + interval '6 minutes');
   perform _phone_canary.chk(s, 'clear_refuses_to_invent_a_cleared_row',
                             r->>'status' = 'halt_unreadable',
                             _phone_canary.code(r->>'status'));

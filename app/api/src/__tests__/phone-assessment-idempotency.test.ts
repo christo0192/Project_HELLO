@@ -56,7 +56,7 @@ vi.mock('../integrations/ashby/completion-observer.js', () => ({ observeAshbyCom
 
 const CHAIN = [
   'select', 'insert', 'update', 'upsert', 'delete',
-  'eq', 'neq', 'order', 'limit', 'single', 'maybeSingle',
+  'eq', 'neq', 'in', 'order', 'limit', 'single', 'maybeSingle',
 ] as const;
 
 interface Call { table: string; method: string; args: unknown[] }

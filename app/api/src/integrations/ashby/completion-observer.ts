@@ -36,11 +36,22 @@
  */
 
 import { createLogger } from '../../lib/logger.js';
+import type { EvidenceGradeValue } from '../../lib/scorecards/evidence.js';
 
 const logger = createLogger('ashby-completion');
 
 /** The reason recorded on every park. Stable and greppable. */
 export const NO_RESULT_SINK_REASON = 'no_verified_result_sink';
+
+/**
+ * C3 (0114 §4): the park reason for an INSUFFICIENT-evidence screening. The
+ * link is parked `writeback_pending` for a human, and NO scorecard write is
+ * enqueued — a thin or infra-killed interview never reaches Ashby on its own.
+ * (`mark_ashby_writeback_pending` answers `already_pending` without persisting
+ * a new reason, so Mission Control derives "held for evidence" by a JOIN on
+ * the assessment's grade, never from this string.)
+ */
+export const EVIDENCE_INSUFFICIENT_REVIEW_REASON = 'evidence_insufficient_review';
 
 /** Narrow store seam — satisfied by `RuntimeWorkflowStores`. */
 export interface CompletionStore {
@@ -62,11 +73,21 @@ export interface CompletionObserverDeps {
   stores: CompletionStore;
 }
 
+/** Per-call facts about the assessment that just landed. */
+export interface CompletionObserverOptions {
+  /**
+   * The persisted (or, on a stale schema, in-memory) evidence grade of the
+   * revision. Absent or `decision` keeps the pre-0114 path unchanged.
+   */
+  evidenceGrade?: EvidenceGradeValue | null;
+}
+
 export type CompletionObserverOutcome =
   | { status: 'not_ashby' }
   | { status: 'blocked_terminal' }
   | { status: 'parked'; applicationLinkId: string }
   | { status: 'already_pending'; applicationLinkId: string }
+  | { status: 'held_insufficient_evidence'; applicationLinkId: string }
   | { status: 'error' };
 
 /**
@@ -78,6 +99,7 @@ export type CompletionObserverOutcome =
 export async function observeAshbyCompletion(
   sessionId: string,
   deps: CompletionObserverDeps,
+  options: CompletionObserverOptions = {},
 ): Promise<CompletionObserverOutcome> {
   try {
     const link = await deps.lookup.findLinkBySessionId(sessionId);
@@ -88,6 +110,17 @@ export async function observeAshbyCompletion(
     // would overwrite that terminal record with a "waiting to publish" state
     // that is not true, so we refuse — as does the RPC itself.
     if (link.terminalState) return { status: 'blocked_terminal' };
+
+    // C3: an insufficient-evidence row is HELD — parked for a human with its
+    // own reason, and the scorecard write is never enqueued from here.
+    if (options.evidenceGrade === 'insufficient') {
+      const held = await deps.stores.markWritebackPending(link.id, EVIDENCE_INSUFFICIENT_REVIEW_REASON);
+      if (held.status === 'ok' || held.status === 'already_pending') {
+        return { status: 'held_insufficient_evidence', applicationLinkId: link.id };
+      }
+      if (held.status === 'blocked_terminal') return { status: 'blocked_terminal' };
+      return { status: 'error' };
+    }
 
     const result = await deps.stores.markWritebackPending(link.id, 'scorecard_write_pending');
     if (result.status === 'ok' || result.status === 'already_pending') {

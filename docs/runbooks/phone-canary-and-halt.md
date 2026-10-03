@@ -106,7 +106,7 @@ node scripts/phone-canary/canary0.test.mjs
 | `disconnect_then_reconnect_same_session` | a mid-call drop grants exactly one reconnect; 120 s later the reconnect is admitted, lands back in `in_call`, resumes the **same session at the same cursor**, and `reconnects_used` is **not** refilled. |
 | `three_no_answer_ist_days_then_terminal` | three no-answers across three distinct IST days (rolled by the production sweep) exhaust the budget into `abandoned_no_answer`; a fourth admission is refused `engagement_terminal`; and a second cold call on one IST day is refused. |
 | `appointment_lifecycle` | book, supersede under `p_expected_version` (`version_conflict`), fulfil at the dial, expire into `missed` and back to `eligible`; plus the shape refusals. |
-| `halt_admission_fail_closed` | halt refuses admission; a second, **stronger** halt escalates the reason in force while keeping the **original** instant, and a weaker one changes nothing (§5, precedence); clearing restores service; and a **missing control singleton** reads as halted everywhere — admission, `phone_backlog`, and `clear_phone_halt`, which refuses to invent a cleared row. |
+| `halt_admission_fail_closed` | halt refuses admission; a second, **stronger** halt escalates the reason in force while keeping the **original** instant, and a weaker one changes nothing (§5, precedence); an **unattributed** clear is refused `actor_required` and leaves the halt in force (0114); an attributed clear restores service; and a **missing control singleton** reads as halted everywhere — admission, `phone_backlog`, and `clear_phone_halt`, which refuses to invent a cleared row. |
 | `attempt_lease_heartbeat_and_reclaim` | the heartbeat extends the lease **beyond** its original end; a stale dispatch epoch is still accepted (the `>=` fence) and a future one is not; an un-renewed lease is reclaimed to `abandoned` **charging no budget**; a post-reclaim heartbeat answers `lease_lost`. |
 | `cross_engagement_candidate_guard` | one candidate with two engagements: guard A refuses a second call while one is in flight, guard B refuses a second cold call the same IST day, and the next IST day is admitted — a pace, not a latch. |
 | `halt_race` (runner-driven) | a halt raised **while an admission is already blocked on the admission lock** still refuses that admission, and no attempt row is written. |
@@ -239,6 +239,61 @@ reason now replaces the pause on the row, a stop raised *after* the pause also
 refuses the gate — `arm_phone_test_gate` answers `test_gate_halt_not_permitted`
 and an already-armed gate cannot dial (`admit_phone_test_attempt` and the due
 pass read the same column).
+
+### Attribution and direct writes (0114)
+
+Since `0114` (C10b) every change to the kill switch is attributable:
+
+* **`clear_phone_halt` refuses an unattributed clear.** A `NULL` actor answers
+  `{status: 'actor_required'}` as the function's **first** statement: no read,
+  no write, no audit row, and the halt stays exactly as it was. Resuming calls
+  to people must name who did it. `/halt/clear` always passes the signed-in
+  admin; local tools (`halt-drill.mjs clear`, `canary0.mjs`, `canary0.sql`,
+  `phone_halt_precedence.sql`) pass the **drill sentinel**
+  `00000000-0000-4000-8000-0000000000d1`. Canary-0 asserts the refusal
+  (`halt_admission_fail_closed` / `unattributed_clear_refused`).
+* **An unattributed halt is still allowed** (a halt is never refused), but its
+  audit row now says `actor_type: system` and `attributed: false` instead of
+  posing as a recruiter. Both RPCs' audit metadata gain `attributed`,
+  `db_session_user` and a sanitised `application_name` (a bounded
+  `[A-Za-z0-9 _./:-]` prefix).
+* **Raw writes are audited.** An `AFTER INSERT OR UPDATE OR DELETE` trigger on
+  `phone_control` writes one `admin_session_override` row with
+  `metadata.override = 'phone_control_direct_write'` (system actor,
+  `attributed: false`, `operation`, `state_before` / `state_after` in
+  `absent|clear|halted`, `previous_reason`, `reason_after`, `caller`,
+  `db_session_user`, `application_name`) for any INSERT, DELETE, or UPDATE of
+  `halted_at` / `halt_reason` / `halt_actor_id` that was **not** issued by
+  `set_phone_halt`, `clear_phone_halt` or the owner-test gate
+  (`admit_phone_test_attempt`, whose pause lift/restore is expected). The
+  trigger reads the writer from the PL/pgSQL call stack; `caller` names the
+  calling PL/pgSQL function (`inline_code_block` for a `DO` block, `none` for a
+  plain client statement). An UPDATE of `updated_at` alone is not audited. A
+  raw write in the same transaction as an RPC is still audited.
+* **The audit never blocks the write.** If the audit insert fails, the trigger
+  logs a `WARNING` (SQLSTATE only) and the halt or lift stands.
+
+Find out-of-API changes:
+
+```sql
+select created_at, metadata->>'operation' as op, metadata->>'state_before' as before,
+       metadata->>'state_after' as after, metadata->>'reason_after' as reason,
+       metadata->>'caller' as caller, metadata->>'db_session_user' as db_user,
+       metadata->>'application_name' as app
+  from screening_v2.audit_events
+ where target_type = 'phone_control'
+   and metadata->>'override' = 'phone_control_direct_write'
+ order by created_at desc limit 20;
+```
+
+**Limits, stated.** This gives honest operators visibility. It is not a
+security boundary (only `service_role` and the owner can write the table): a
+`DO` block that embeds a fake call-stack line in its statement text, or a
+same-named function created by someone with DDL rights, is not audited.
+`TRUNCATE` is statement-level and is not covered. The design called for a
+function-level `SET screening_v2.phone_control_writer`; Postgres refuses that
+to a non-superuser and Supabase migrations run as `postgres`, so the call
+stack is used instead.
 
 ### Production mode
 
@@ -428,6 +483,9 @@ no gap list.
   compare-and-clear in SQL (a `clear_phone_halt` signature change). Probe after
   every clear.
 * **Production halt mode is untested against production**, by constraint.
+* **The direct-write audit is not tamper-proof.** Anyone who can already
+  write the table can disguise a write as an RPC frame, and `TRUNCATE` is not
+  covered. Historical (pre-0114) raw writes stay unaudited.
 * **No leader election.** `claim_phone_sweep` is a claim and can lapse while its
   holder works; every sweep behind it is idempotent, which is what makes that
   acceptable. `phone-reconcile` still multiplies provider traffic per replica.

@@ -82,6 +82,14 @@ export interface ScorecardSource {
    * {@link normalizeRedFlags} before they reach the provider.
    */
   redFlags?: readonly unknown[];
+  /**
+   * C3 (0114 §4): the assessment revision's interview-coverage grade, read
+   * tolerantly (a missing column is null = decision). A GATE, not content:
+   * it is never copied into the normalized scorecard, so it is excluded from
+   * the idempotency marker and from the provider form. An `insufficient`
+   * source is refused by the saga and failed non-retryably by the worker.
+   */
+  evidenceGrade?: 'decision' | 'insufficient' | null;
 }
 
 /** The configured target scale for the overall score on the Ashby scorecard. */

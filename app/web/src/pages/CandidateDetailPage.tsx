@@ -49,6 +49,12 @@ import {
   isAppealPending,
 } from "../components/talent/status";
 import { CandidateHeadlineFacts } from "../components/talent/CandidateHeadlineFacts";
+import { evidenceHoldReason, isEvidenceInsufficient } from "../lib/evidence-hold";
+import {
+  DUPLICATE_HOLD_NOTICE,
+  duplicateHoldErrorMessage,
+  isDuplicateApplicationHold,
+} from "../lib/duplicate-hold";
 import { formatDateTime } from "../lib/datetime";
 import {
   PhoneSlotDialog,
@@ -247,6 +253,11 @@ export function CandidateDetailPage() {
 
   const { candidate, sessions, assessments } = detail;
   const decisionBlocked = candidate.decision_use_blocked_at != null;
+  // C3: the NEWEST assessment (the API orders by created_at desc) was graded
+  // `insufficient` — held from Ashby and from the status, so the phone card
+  // recommends a re-screen. Never while an appeal blocks decision use.
+  const latestAssessment = assessments[0] ?? null;
+  const rescreenRecommended = !decisionBlocked && isEvidenceInsufficient(latestAssessment);
 
   /**
    * The LONGEST call that RECORDED A DURATION, not the latest — and not
@@ -371,6 +382,7 @@ export function CandidateDetailPage() {
                   callRequest={callRequest}
                   headerCallRef={headerCallRef}
                   onCallAvailableChange={setCallAvailable}
+                  rescreenRecommendation={rescreenRecommended ? evidenceHoldReason(latestAssessment!) : null}
                 />
               ),
             },
@@ -475,6 +487,7 @@ function OverviewTab({
   callRequest,
   headerCallRef,
   onCallAvailableChange,
+  rescreenRecommendation = null,
 }: {
   candidate: CandidateDetail["candidate"];
   sessions: CandidateDetail["sessions"];
@@ -484,6 +497,8 @@ function OverviewTab({
   callRequest: number;
   headerCallRef: RefObject<HTMLButtonElement | null>;
   onCallAvailableChange: (available: boolean) => void;
+  /** C3: why the latest scorecard is held for evidence, or null when it is not. */
+  rescreenRecommendation?: string | null;
 }) {
   const liveCallRelevant = useLiveCallRelevant(candidate.id, sessions);
   return (
@@ -543,6 +558,7 @@ function OverviewTab({
             callRequest={callRequest}
             headerCallRef={headerCallRef}
             onCallAvailableChange={onCallAvailableChange}
+            rescreenRecommendation={rescreenRecommendation}
           />
         )}
 
@@ -589,6 +605,7 @@ function PhoneCycleCard({
   callRequest = 0,
   headerCallRef,
   onCallAvailableChange,
+  rescreenRecommendation = null,
 }: {
   candidateId: string;
   admin: boolean;
@@ -603,6 +620,12 @@ function PhoneCycleCard({
   headerCallRef?: RefObject<HTMLButtonElement | null>;
   /** Whether a first call can be requested right now (enabled, no cycle). */
   onCallAvailableChange?: (available: boolean) => void;
+  /**
+   * C3: the latest scorecard is held for thin interview evidence; this is the
+   * plain-language reason. The card then recommends a re-screen with reason
+   * `technical_issue` through the existing HR request — never automatically.
+   */
+  rescreenRecommendation?: string | null;
 }) {
   const headingId = useId();
   const [data, setData] = useState<PhoneScreeningsResponse | null>(null);
@@ -653,6 +676,7 @@ function PhoneCycleCard({
   const slotTriggerRef = useRef<HTMLButtonElement | null>(null);
 
   const [savingAppointment, setSavingAppointment] = useState(false);
+  const [releasing, setReleasing] = useState(false);
   const [message, setMessage] = useState<string | null>(null);
 
   const load = useCallback(() => {
@@ -690,6 +714,9 @@ function PhoneCycleCard({
     && current.terminal_at != null
     && ["completed", "failed", "abandoned_no_answer", "cancelled", "wrong_number"].includes(current.state);
   const requiresVerification = current?.state === "wrong_number";
+  // C8 (0114): held as a same-role duplicate application; never dialled
+  // until a recruiter releases it.
+  const duplicateHold = isDuplicateApplicationHold(current);
 
   // A first call can be requested: the deployment is on and no cycle exists.
   const callAvailable = data !== null && data.enabled && data.cycles.length === 0;
@@ -726,18 +753,45 @@ function PhoneCycleCard({
         : "Phone screening requested. It will run only when all call gates permit it.");
       load();
     } catch (e) {
-      setMessage(e instanceof ApiError ? e.message : "The phone screening could not be requested.");
+      if (e instanceof ApiError && duplicateHoldErrorMessage(e.message)) {
+        // The request created (or adopted) the engagement and ensure HELD it,
+        // so close the confirmation and re-read: the card then shows the hold
+        // and its Release action.
+        setConfirming(false);
+        setMessage(duplicateHoldErrorMessage(e.message));
+        load();
+      } else {
+        setMessage(e instanceof ApiError ? e.message : "The phone screening could not be requested.");
+      }
     } finally {
       setRequesting(false);
     }
   }
 
-  async function requestRescreen() {
+  async function releaseDuplicateHold() {
+    setReleasing(true);
+    setMessage(null);
+    try {
+      const result = await api.releaseCandidatePhoneDuplicateHold(candidateId);
+      setMessage(result.prerequisite_status === "eligible" || result.prerequisite_status === "scheduled_next_window"
+        ? "Hold released. The screening will run only when all call gates permit it."
+        : "Hold released. The screening is still waiting on another prerequisite before it can be called.");
+      load();
+    } catch (e) {
+      setMessage(e instanceof ApiError
+        ? duplicateHoldErrorMessage(e.message) ?? e.message
+        : "The hold could not be released.");
+    } finally {
+      setReleasing(false);
+    }
+  }
+
+  async function requestRescreen(override?: PhoneRescreenReason) {
     setRequesting(true);
     setMessage(null);
     try {
       const requestId = `ui-${crypto.randomUUID()}`;
-      const result = await api.requestPhoneRescreen(candidateId, { request_id: requestId, reason });
+      const result = await api.requestPhoneRescreen(candidateId, { request_id: requestId, reason: override ?? reason });
       setMessage(result.status === "already_requested"
         ? "That re-screen request was already accepted."
         : `Re-screen cycle ${result.cycle_number ?? ""} requested. It will run only when all call gates permit it.`);
@@ -777,7 +831,9 @@ function PhoneCycleCard({
       setSlotDialogOpen(false);
       load();
     } catch (e) {
-      setMessage(e instanceof ApiError ? e.message : "The appointment could not be saved.");
+      setMessage(e instanceof ApiError
+        ? duplicateHoldErrorMessage(e.message) ?? e.message
+        : "The appointment could not be saved.");
     } finally {
       setSavingAppointment(false);
     }
@@ -922,6 +978,23 @@ function PhoneCycleCard({
             ))}
           </ul>
 
+          {duplicateHold && (
+            // C8 (0114): a same-role duplicate application. The other record
+            // is never named. Releasing is a deliberate, audited action.
+            <SurfaceCard level="sunken" className="mt-4 p-3">
+              <p className="text-label font-medium text-warning-text">Held: duplicate application</p>
+              <p className="mt-1 text-sm text-ink-secondary">{DUPLICATE_HOLD_NOTICE}</p>
+              <CandidateButton
+                variant="secondary"
+                className="mt-2.5"
+                onClick={() => void releaseDuplicateHold()}
+                loading={releasing}
+              >
+                Release hold
+              </CandidateButton>
+            </SurfaceCard>
+          )}
+
           {current?.state === "opted_out" ? (
             <p className="mt-3 text-sm text-warning-text">
               Re-screening is unavailable because the candidate opted out. Renewed consent requires separate governance.
@@ -951,6 +1024,26 @@ function PhoneCycleCard({
               </div>
             </SurfaceCard>
           ) : canRescreen ? (
+            <>
+            {rescreenRecommendation && (
+              // C3: the newest scorecard is held for thin interview evidence.
+              // One click asks for the existing HR re-screen with reason
+              // technical_issue; all call gates still decide when it runs.
+              <SurfaceCard level="sunken" className="mt-4 p-3">
+                <p className="text-label font-medium text-warning-text">Rescreen recommended</p>
+                <p className="mt-1 text-sm text-ink-secondary">
+                  {rescreenRecommendation} The scorecard is held: it was not sent to Ashby and did not change the candidate&apos;s status.
+                </p>
+                <CandidateButton
+                  variant="secondary"
+                  className="mt-2.5"
+                  onClick={() => void requestRescreen("technical_issue")}
+                  loading={requesting}
+                >
+                  Rescreen recommended
+                </CandidateButton>
+              </SurfaceCard>
+            )}
             <SurfaceCard level="sunken" className="mt-4 p-3">
               <div className="grid gap-x-3 gap-y-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-end">
                 <div className="min-w-0">
@@ -974,6 +1067,7 @@ function PhoneCycleCard({
                 </CandidateButton>
               </div>
             </SurfaceCard>
+            </>
           ) : current?.terminal_at ? (
             <p className="mt-3 text-sm text-ink-secondary">This cycle is terminal; no new cycle can be started from its current state.</p>
           ) : null}

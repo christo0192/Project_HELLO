@@ -206,6 +206,68 @@ export function stableMutationMessage(
   return fallback;
 }
 
+/* ── Phone lane health reasons (GET /api/phone/health) ───────────────── */
+
+/**
+ * Operator copy for every reason `GET /api/phone/health` can carry. The codes
+ * are the API's closed vocabulary (`openapi.yaml`, PhoneHealthResponse
+ * reasons); an unknown code is shown as itself rather than guessed at.
+ */
+const PHONE_HEALTH_REASON_LABELS: Record<string, string> = {
+  phone_screening_disabled: 'Phone screening is turned off.',
+  backlog_unavailable: 'The calling backlog could not be read.',
+  halt_unreadable: 'The calling switch could not be read, so calling is stopped.',
+  admission_halted: 'Calling is paused.',
+  attempt_leases_expired: 'Some calls lost contact with their worker and are being recovered.',
+  fleet_at_capacity: 'Every calling slot is in use.',
+  appointments_overdue: 'Some booked calls are past their time.',
+  phone_runtime_stopped: 'The calling loops on this server are stopped.',
+  phone_loop_stale: 'A calling loop on this server has stopped ticking.',
+  phone_loop_erroring: 'A calling loop on this server is failing.',
+  phone_due_halted: 'The dialler is holding because calling is paused or unreadable.',
+  phone_sweep_not_ok: 'A calling clean-up job is failing.',
+  phone_runtime_start_failed: 'The calling loops failed to start on this server.',
+  // 0114 (C10d).
+  phone_due_starved:
+    'Calls are due but none are being placed (for example, no call session could be prepared). Check the dialler.',
+};
+
+/** Label for a phone health reason; unknown codes fall back to the code. */
+export function phoneHealthReasonLabel(reason: string): string {
+  return Object.prototype.hasOwnProperty.call(PHONE_HEALTH_REASON_LABELS, reason)
+    ? PHONE_HEALTH_REASON_LABELS[reason]
+    : reason;
+}
+
+/** Tone for a phone health reason: starvation and start failures are errors. */
+export function phoneHealthReasonTone(reason: string): StatusTone {
+  if (
+    reason === 'phone_due_starved'
+    || reason === 'phone_runtime_start_failed'
+    || reason === 'halt_unreadable'
+  ) {
+    return 'danger';
+  }
+  if (reason === 'admission_halted' || reason === 'phone_due_halted') return 'info';
+  return 'warning';
+}
+
+/* ── Resume scanner warnings (Ashby health `scanner.warnings`) ───────── */
+
+const SCANNER_WARNING_LABELS: Record<string, string> = {
+  scanner_updater_failing:
+    'Virus-definition updates keep failing. Résumé scanning will stop if this continues.',
+  scanner_signatures_aging:
+    'Virus definitions are getting old. Résumé scanning stops when they reach 24 hours.',
+};
+
+/** Label for a WARNING-ONLY scanner code (0114, C10c); unknown → the code. */
+export function scannerWarningLabel(code: string): string {
+  return Object.prototype.hasOwnProperty.call(SCANNER_WARNING_LABELS, code)
+    ? SCANNER_WARNING_LABELS[code]
+    : code;
+}
+
 /* ── Small display helpers ───────────────────────────────────────────── */
 
 /** Localized date-time, with a truthful placeholder for missing data. */

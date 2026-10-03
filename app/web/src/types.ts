@@ -458,7 +458,33 @@ export interface Assessment {
   /** Rubric scale the row was scored on (4 since the four-level rubric; 5 before). Absent on older API payloads. */
   score_scale_max?: ScoreScaleMax | null;
   metric_results?: ScorecardMetricModelResult[];
+  /**
+   * C3 (0114): interview-coverage grade of this revision. `insufficient` means
+   * too little of the planned screening happened to decide on: the card is
+   * shown but held from Ashby and from the candidate status. Absent/null on
+   * browser rows and pre-0114 payloads (= decision).
+   */
+  evidence_grade?: AssessmentEvidenceGrade | null;
+  evidence_reason?: AssessmentEvidenceReason | (string & {}) | null;
+  /** Measured answered questions; null when unmeasured. */
+  evidence_answered?: number | null;
+  /** The plan's question count; null when there was no plan. */
+  evidence_planned?: number | null;
+  /** 0072: the phone call ended before the plan completed. */
+  partial?: boolean | null;
 }
+
+/** C3 (0114): mirrors app/api/src/lib/scorecards/evidence.ts EVIDENCE_GRADES. */
+export type AssessmentEvidenceGrade = 'decision' | 'insufficient';
+/** C3 (0114): mirrors app/api/src/lib/scorecards/evidence.ts EVIDENCE_REASONS. */
+export type AssessmentEvidenceReason =
+  | 'complete_call'
+  | 'partial_sufficient'
+  | 'no_candidate_speech'
+  | 'infra_interrupted'
+  | 'partial_thin'
+  | 'no_plan'
+  | 'evidence_read_failed';
 
 // ── Scorecards (Phase 3 web UI) ──────────────────────────────────────────
 //
@@ -1472,6 +1498,12 @@ export interface AshbyMcWorkflow {
    */
   sessionStatus: string | null;
   sessionId?: string | null;
+  /**
+   * C3 (0114): parked for a human because the newest assessment's interview
+   * evidence is insufficient — nothing reaches Ashby until someone acts.
+   * null when the server could not read it; absent on older APIs.
+   */
+  heldForEvidence?: boolean | null;
   updatedAt: string;
 }
 
@@ -2011,6 +2043,43 @@ export interface PhoneHealthResponse {
   status: 'ok' | 'degraded' | 'disabled';
   reasons: string[];
   admission: PhoneAdmissionState | null;
+  /**
+   * The PROCESS-LOCAL runtime block. Only the part this UI reads is typed;
+   * optional because older servers and a process with no runtime omit it.
+   */
+  runtime?: {
+    /** 0114 (C10d). Absent on a process that has run no due pass. */
+    due_starvation?: PhoneDueStarvation;
+  };
+}
+
+/**
+ * 0114 (C10d). A due-loop starvation episode: an `ok` pass that examined rows
+ * and dialled none for a machinery reason (e.g. `no_session`). `alarmed`
+ * means it has lasted `PHONE_DUE_STARVATION_ALERT_SEC` and the health reasons
+ * carry `phone_due_starved`. Codes are the closed due-pass vocabulary.
+ */
+export interface PhoneDueStarvation {
+  starving: boolean;
+  since: string | null;
+  alarmed: boolean;
+  codes: string[];
+}
+
+/**
+ * 0114 (C10c). The resume malware scanner's WARNING-ONLY codes. They never
+ * change `ready` or the degradation verdict; they warn hours before the 24 h
+ * signature ceiling turns resume ingestion off.
+ */
+export type ScannerWarningReason = 'scanner_updater_failing' | 'scanner_signatures_aging';
+
+/** 0114 (C10c). The signature updater block on the Ashby health `scanner`. */
+export interface ScannerUpdaterState {
+  consecutiveFailures: number;
+  lastSuccessAt: string | null;
+  lastAttemptAt: string | null;
+  lastExitCode: number | null;
+  lastReason: string | null;
 }
 
 /**

@@ -2025,3 +2025,58 @@ describe('while PHONE_SCREENING_ENABLED is off', () => {
     expect(audited).toEqual([]);
   });
 });
+
+// 0114 (C8): the duplicate-application hold count on the health surface.
+describe('the health surface: identity_holds (0114, C8)', () => {
+  it('reports the bare count from the read store and does not degrade on it', async () => {
+    const read = fakeReadStore({ countDuplicateApplicationHolds: async () => 2 });
+    const res = await request(appWith('interviewer', {
+      readStore: read.store, stores: fakeStores().store,
+    })).get('/api/phone/health');
+    expect(res.status).toBe(200);
+    expect(res.body.identity_holds).toBe(2);
+    // A hold is the guard working, not a fault.
+    expect(res.body.status).toBe('ok');
+    expect(res.body.reasons).toEqual([]);
+    // It is the ONLY read-store call the health handler makes.
+    expect(read.calls).toEqual(['countDuplicateApplicationHolds']);
+  });
+
+  it('null, never 0, when the count read fails', async () => {
+    const read = fakeReadStore({
+      countDuplicateApplicationHolds: async () => { throw new Error('phone_engagement_read_error'); },
+    });
+    const res = await request(appWith('interviewer', {
+      readStore: read.store, stores: fakeStores().store,
+    })).get('/api/phone/health');
+    expect(res.status).toBe(200);
+    expect(res.body.identity_holds).toBeNull();
+    expect(res.body.status).toBe('ok');
+  });
+
+  it('null when the read store has no count seam, or no read store was injected beside injected stores', async () => {
+    const withoutSeam = await request(appWith('interviewer', {
+      readStore: fakeReadStore().store, stores: fakeStores().store,
+    })).get('/api/phone/health');
+    expect(withoutSeam.body.identity_holds).toBeNull();
+
+    const storesOnly = await request(appWith('interviewer', { stores: fakeStores().store }))
+      .get('/api/phone/health');
+    expect(storesOnly.body.identity_holds).toBeNull();
+  });
+
+  it('null when the backlog is unavailable or screening is disabled, and the count is not read', async () => {
+    const read = fakeReadStore({ countDuplicateApplicationHolds: async () => 5 });
+    const unavailable = await request(appWith('interviewer', {
+      readStore: read.store,
+      stores: fakeStores({ backlog: async () => { throw new Error('phone_backlog_error'); } }).store,
+    })).get('/api/phone/health');
+    expect(unavailable.body.identity_holds).toBeNull();
+
+    const disabled = await request(appWith('interviewer', {
+      readStore: read.store, stores: fakeStores().store, configSource: DISABLED,
+    })).get('/api/phone/health');
+    expect(disabled.body.identity_holds).toBeNull();
+    expect(read.calls).toEqual([]);
+  });
+});

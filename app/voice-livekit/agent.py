@@ -224,6 +224,61 @@ PHONE_RECORDING_FINISH_SECONDS = _bounded_float_env(
 )
 
 
+def _phone_shutdown_process_timeout() -> float:
+    """The parent's grace for a phone job process after a shutdown request.
+
+    One reader for both consumers: the WorkerOptions key below and the
+    detached-finish wait cap (M009 C9-1), so the two can never disagree.
+    """
+    return _bounded_float_env("PHONE_SHUTDOWN_PROCESS_TIMEOUT", 90.0, 10.0, 120.0)
+
+
+def _phone_drain_timeout_sec() -> int:
+    """M009 C9-1: how long the SDK's ``drain()`` waits for a live phone job.
+
+    The SDK default is 1800 s, and only AFTER drain returns does ``aclose()``
+    send the job its ShutdownRequest. Fly force-kills at ``kill_timeout``
+    (300 s, PR-A), so with the default a live call at SIGINT never reached its
+    own teardown and the audio was lost (286d921a / ab83952e / dcde16d5).
+    Clamped to 30..120. The SDK field is an int.
+
+    BUDGET (checked by scripts/validate-voice-worker-apps.mjs):
+        drain + 2 x PHONE_SHUTDOWN_PROCESS_TIMEOUT + 30 <= kill_timeout
+        90    + 2 x 90                           + 30 =  300
+    """
+    return int(_bounded_float_env("PHONE_DRAIN_TIMEOUT_SEC", 90.0, 30.0, 120.0))
+
+
+# The two reserves inside the shutdown grace that the detached-finish wait must
+# leave untouched: the SDK's own job exit after the shutdown callback returns
+# (room disconnect, telemetry flush), and a margin for the watchdog arm and the
+# bounded session close that follow the wait.
+PHONE_DETACHED_FINISH_SDK_RESERVE_SECONDS = 15.0
+PHONE_DETACHED_FINISH_MARGIN_SECONDS = 10.0
+
+
+def _detached_finish_wait_cap(elapsed: float) -> float:
+    """M009 C9-1: how long shutdown may still wait for a detached upload.
+
+    ``min(PHONE_RECORDING_FINISH_SECONDS - elapsed,
+    PHONE_SHUTDOWN_PROCESS_TIMEOUT - 15 - PHONE_TEARDOWN_MAX_SECONDS - 10)``,
+    clamped at 0. The first term gives the upload no more than its own budget
+    in total, counted from when it started. The second keeps the wait inside the
+    parent's process grace, after the teardown that already ran and the
+    reserves above, so the watchdog still bounds a wedged job.
+    """
+    cap = min(
+        PHONE_RECORDING_FINISH_SECONDS - max(0.0, elapsed),
+        _phone_shutdown_process_timeout()
+        - PHONE_DETACHED_FINISH_SDK_RESERVE_SECONDS
+        - PHONE_TEARDOWN_MAX_SECONDS
+        - PHONE_DETACHED_FINISH_MARGIN_SECONDS,
+    )
+    if cap != cap:  # NaN
+        return 0.0
+    return max(0.0, cap)
+
+
 def _worker_options_accepts(field: str) -> bool:
     """Whether the pinned `WorkerOptions` really has this field.
 
@@ -1091,12 +1146,67 @@ async def _silence_termination_loop(
         return
 
 
+def _room_delete_disposition(exc: BaseException) -> str | None:
+    """M009 C9-3: classify a delete_room failure that is not a real failure.
+
+    ``room_already_closed``: LiveKit answered NOT_FOUND, i.e. the room is
+    already gone (the candidate hung up and the server closed it first), which
+    is the outcome the delete wanted. ``room_delete_disconnected``: the server
+    dropped the connection mid-request; the outcome is unknown, so it stays a
+    warning. Anything else returns None and is re-raised.
+
+    The SDK names are looked up with ``getattr`` so an SDK without them (or the
+    test stub) falls back to the error's own ``code`` attribute and class name.
+    """
+    twirp_error = getattr(livekit_api, "TwirpError", None)
+    codes = getattr(livekit_api, "TwirpErrorCode", None)
+    not_found = getattr(codes, "NOT_FOUND", "not_found")
+    twirp_known = isinstance(twirp_error, type)
+    if (not twirp_known) or isinstance(exc, twirp_error):
+        code = getattr(exc, "code", None)
+        if code is not None and (
+            code == not_found or str(code).strip().lower() == "not_found"
+        ):
+            return "room_already_closed"
+    if any(
+        cls.__name__ == "ServerDisconnectedError" for cls in type(exc).__mro__
+    ):
+        return "room_delete_disconnected"
+    return None
+
+
 async def _delete_livekit_room(room_name: str) -> None:
     """Delete the room so every participant receives a terminal disconnect."""
     client = livekit_api.LiveKitAPI()
+
+    async def _delete() -> None:
+        # The classification has to happen HERE, inside the coroutine handed
+        # to `_bounded_await`: that helper logs every exception it sees as
+        # `room_delete_failed`, which is how an already-closed room used to
+        # read as a teardown failure on every hung-up call.
+        try:
+            await client.room.delete_room(
+                livekit_api.DeleteRoomRequest(room=room_name),
+            )
+        except Exception as exc:  # noqa: BLE001 — classified, else re-raised
+            disposition = _room_delete_disposition(exc)
+            if disposition == "room_already_closed":
+                _log.info(
+                    "unknown_event", error_type="phone_teardown",
+                    error_category="room_already_closed",
+                )
+                return
+            if disposition == "room_delete_disconnected":
+                _log.warn(
+                    "unknown_event", error_type="phone_teardown",
+                    error_category="room_delete_disconnected",
+                )
+                return
+            raise
+
     try:
         await _bounded_await(
-            client.room.delete_room(livekit_api.DeleteRoomRequest(room=room_name)),
+            _delete(),
             PHONE_TEARDOWN_STEP_SECONDS,
             category="room_delete",
         )
@@ -1233,6 +1343,20 @@ async def _read_fresh_turn(
         return text
 
 
+def _is_sdk_session_stopped(exc: BaseException) -> bool:
+    """True when ``exc`` is the SDK's "session stopped" RuntimeError.
+
+    M009 C4. The ONE match on the vendor prose (`_SDK_SESSION_STOPPED_MARKERS`,
+    pinned to livekit-agents 1.6.4), shared by `_participant_gone_from` and the
+    run-level backstop in `_run_phone_session`, so the two can never disagree
+    about which RuntimeError means "the candidate's leg is gone".
+    """
+    if not isinstance(exc, RuntimeError):
+        return False
+    message = str(exc)
+    return any(marker in message for marker in _SDK_SESSION_STOPPED_MARKERS)
+
+
 def _participant_gone_from(exc: RuntimeError, *, category: str) -> Exception:
     """Translate an SDK "session stopped" RuntimeError, or re-raise it.
 
@@ -1246,8 +1370,7 @@ def _participant_gone_from(exc: RuntimeError, *, category: str) -> Exception:
     the call site); raises the original for anything that is not a stopped
     session.
     """
-    message = str(exc)
-    if not any(marker in message for marker in _SDK_SESSION_STOPPED_MARKERS):
+    if not _is_sdk_session_stopped(exc):
         raise exc
     _log.warn(
         "unknown_event", error_type="phone_say_after_close",
@@ -1349,6 +1472,11 @@ _ROOM_TEARDOWN_LABELS: dict[str | None, str] = {
     phone.HALT_MALFORMED_EXCHANGE: "malformed_exchange",
     phone.HALT_CALLBACK_SCHEDULED: "callback_scheduled",
     phone.HALT_CALLBACK_RECOVERY: "callback_recovery_required",
+    # M009 PR-C (C2): the callback flow deferred; the leg posted
+    # `callback.deferred_in_call`, never an abort.
+    phone.HALT_CALLBACK_DEFERRED: "callback_deferred",
+    # M009 PR-C (C7): a mid-call withdrawal; the leg posted `candidate.opt_out`.
+    phone.HALT_CANDIDATE_OPTED_OUT: "candidate_opted_out",
     phone.HALT_PERSISTENCE: "persistence_failed",
     phone.HALT_SCORING: "scoring_unreachable",
     phone.HALT_LEASE_LOST: "lease_lost",
@@ -1793,9 +1921,7 @@ def build_worker_options() -> WorkerOptions:
     # PHONE ONLY. `build_worker_options` promises the unnamed browser worker
     # byte-identical options, and this key is about the phone teardown budget.
     if _phone_agent_name() and _worker_options_accepts("shutdown_process_timeout"):
-        options["shutdown_process_timeout"] = _bounded_float_env(
-            "PHONE_SHUTDOWN_PROCESS_TIMEOUT", 90.0, 10.0, 120.0,
-        )
+        options["shutdown_process_timeout"] = _phone_shutdown_process_timeout()
     if browser_named:
         # The browser worker becomes NAMED + explicit-dispatch. Its prewarm
         # posts machine-level readiness (ready-before-dispatch). The API
@@ -1831,6 +1957,19 @@ def build_worker_options() -> WorkerOptions:
         # can bind each leased session to its machine. Everything else in this
         # branch keys off the BASE `agent_name` above; flag off ⇒ the base.
         options["agent_name"] = phone_registered_agent_name()
+        # ── M009 C9-1: bounded SDK drain (named PHONE worker only) ───────
+        # The SDK's drain() waits drain_timeout (default 1800 s) for live jobs
+        # BEFORE aclose() sends them a ShutdownRequest, and Fly force-kills at
+        # kill_timeout (300 s). So a live call at SIGINT never ran its own
+        # teardown and its audio was lost. 90 s lets a call that is nearly
+        # done finish naturally, then the job is told to shut down with
+        # enough of the budget left to upload its evidence:
+        #   drain 90 + 2 x shutdown_process_timeout 90 + 30 = 300 = kill_timeout
+        # Only set when the pinned SDK really has the field (an unknown kwarg
+        # raises at worker start). The browser and unnamed options never get
+        # it: they return above or never enter this branch.
+        if _worker_options_accepts("drain_timeout"):
+            options["drain_timeout"] = _phone_drain_timeout_sec()
         # ── PHONE-PATH RETROFIT: machine-level ready-before-dispatch ─────
         # design §2.3, PR B RISK "dispatch ordering vs cold start". When
         # orchestration is on, the phone worker posts MACHINE-level readiness
@@ -2890,6 +3029,13 @@ def _phone_instructions_text(state: "phone.PhoneAssessmentState") -> str:
     text = (
         text
         + phone.PHONE_CALLBACK_POLICY_TEXT
+        # M009 PR-C (C7): phone-only withdrawal addendum. Appended here, never
+        # inside the sha-pinned `system_prompt`, and omitted under the
+        # `PHONE_MIDCALL_OPT_OUT=off` kill switch.
+        + (
+            phone.PHONE_WITHDRAWAL_POLICY_TEXT
+            if phone.phone_midcall_opt_out_enabled() else ""
+        )
         + phone.PHONE_ROLE_GROUNDING_TEXT
         + phone.PHONE_TURN_DISCIPLINE_TEXT
         + phone.PHONE_EXPRESSIVENESS_TEXT
@@ -3581,6 +3727,17 @@ async def _run_native_phone_screening(
     # (see phone.run_callback_turn). While it is active and not DONE, the turn
     # hook routes every candidate turn to it instead of the ordinary flow.
     callback_flow: dict[str, Any] = {"state": None}
+    # M009 PR-C (C7): the mid-call withdrawal latch. `pending` is the CONFIRM
+    # LATCH: a decline was heard and PHONE_WITHDRAWAL_CONFIRM_TEXT is owed an
+    # answer. `last_text` is the classifier's view of the current LOGICAL turn
+    # (continuation fragments are joined onto it, so a decline split across
+    # two STT finals is still heard). `declines_dismissed` is set once the
+    # candidate chose to continue: later declines are then answers, not
+    # withdrawals (opt-outs and explicit withdrawals still end the call).
+    withdrawal: dict[str, Any] = {
+        "pending": False, "reasks": 0, "last_text": "", "last_verdict": None,
+        "declines_dismissed": False, "stage": None,
+    }
     # The coordinator owns pending evidence; durable effects happen only from
     # coordinator-bound tools after LiveKit authorizes the scheduled reply.
     reply_plan: list[str | None] = [None]
@@ -4604,7 +4761,9 @@ async def _run_native_phone_screening(
         instruction), and NO tool is added to the toolless turn. A terminal
         decision ends the call with its own reason (`HALT_CALLBACK_SCHEDULED` on
         a booking — retryable/post-nothing so the booking owns the redial —
-        or `HALT_CANDIDATE_ENDED` on the deferral).
+        `HALT_CALLBACK_DEFERRED` on the deferral, which posts
+        `callback.deferred_in_call` and never an abort, or
+        `HALT_CALLBACK_RECOVERY` when the booking could not be proven).
         """
         setattr(agent, "_turn_policy", "closing" if decision.terminal else "clarification")
         reply_plan[0] = decision.spoken
@@ -4616,6 +4775,184 @@ async def _run_native_phone_screening(
         )
         if decision.terminal:
             arm_terminal_reply(decision.terminal_reason)
+
+    # ── M009 PR-C (C7): mid-call withdrawal ───────────────────────────────
+    def _withdrawal_log(category: str) -> None:
+        # Fixed category literals only — never the candidate's words.
+        _log.info(
+            "unknown_event", error_type="phone_midcall_withdrawal",
+            error_category=category,
+        )
+
+    def _interrupt_stale_reply() -> None:
+        """Cancel the reply a PREVIOUS fragment of this logical turn started."""
+        interrupt = getattr(reply_handle[0], "interrupt", None)
+        if callable(interrupt):
+            interrupt(force=True)
+
+    def _speak_withdrawal_line(turn_ctx: Any, line: str, *, phase: str) -> None:
+        """Speak one fixed C7 line verbatim (the confirm or its re-ask)."""
+        setattr(agent, "_turn_policy", "clarification")
+        reply_plan[0] = line
+        set_reply_snapshot(line, phase=phase)
+        add_turn_instruction(
+            turn_ctx,
+            "Say this to the candidate, in these words, and nothing else. Do NOT "
+            "ask a screening question and do NOT add anything:\n" + line,
+        )
+
+    def _end_midcall_opted_out(turn_ctx: Any, category: str) -> None:
+        """Speak the opt-out closing and arm HALT_CANDIDATE_OPTED_OUT."""
+        withdrawal["pending"] = False
+        withdrawal["stage"] = None
+        # A decline beats a callback: the negotiation is abandoned.
+        callback_flow["state"] = None
+        setattr(agent, "_turn_policy", "closing")
+        reply_plan[0] = phone.PHONE_OPT_OUT_TEXT
+        set_reply_snapshot(phone.PHONE_OPT_OUT_TEXT, phase="candidate_opt_out")
+        add_turn_instruction(
+            turn_ctx,
+            "Say this to the candidate, in these words, and nothing else. Do NOT "
+            "ask a screening question and do NOT add anything:\n"
+            + phone.PHONE_OPT_OUT_TEXT,
+        )
+        arm_terminal_reply(phone.HALT_CANDIDATE_OPTED_OUT)
+        _withdrawal_log(category)
+
+    def _reask_owed_after_continue(turn_ctx: Any) -> None:
+        """The candidate chose to carry on: re-ask the SAME owed question."""
+        question = state.question_at(cursor)
+        setattr(agent, "_turn_policy", "clarification")
+        if question is None:
+            add_turn_instruction(
+                turn_ctx,
+                "The candidate chose to continue. Briefly thank them and carry "
+                "on where you left off. Do not say goodbye.",
+            )
+            return
+        set_question_reply_snapshot(question)
+        authorize_generated_reply(
+            question.spoken_text,
+            control_text=(
+                "The candidate chose to continue the screening. Briefly thank "
+                "them, then ask the SAME question again in your own natural "
+                "words and wait. Do not advance to a new topic."
+            ),
+        )
+        add_turn_instruction(
+            turn_ctx,
+            "The candidate chose to continue. Briefly thank them, then re-ask "
+            "the SAME topic in your own words and wait; do not move on: "
+            + question.spoken_text,
+        )
+
+    def _midcall_withdrawal_turn(
+        turn_ctx: Any, text: Any, *, continuation: bool, active: bool = True,
+    ) -> str | None:
+        """Route one candidate turn through the C7 classifier and latch.
+
+        Returns ``"reply"`` when the turn was consumed and a reply is owed
+        (the caller returns normally), ``"swallow"`` when the turn is a
+        continuation fragment of a turn already answered by the in-flight
+        confirmation (the caller raises StopResponse), or None to fall through
+        to the ordinary flow untouched.
+
+        FRAGMENT SAFETY: a continuation fragment is classified JOINED onto the
+        previous fragment of the same logical turn, both before the latch
+        ("I'm not" + "interested in this role") and after it ("I'm not
+        interested" + "in night shifts" un-latches and re-asks the question).
+        """
+        fragment = str(text or "").strip()
+        if continuation and withdrawal["last_text"]:
+            # STT closes every final with punctuation; a split clause is one
+            # clause, so the previous fragment's terminal mark is dropped.
+            joined = (
+                str(withdrawal["last_text"]).rstrip(" .!?,;:") + " " + fragment
+            ).strip()
+        else:
+            joined = fragment
+        joined = joined[-2000:]
+        withdrawal["last_text"] = joined
+        if not active:
+            # Kill switch off, or outside the screening phase: track the turn
+            # text only, so a later fragment never joins onto a stale turn.
+            return None
+
+        if withdrawal["pending"] and withdrawal.get("stage") == "latched" and continuation:
+            # A later fragment of the very turn that set the latch.
+            klass = phone.classify_midcall_withdrawal(joined)
+            if klass in {phone.MIDCALL_OPT_OUT, phone.MIDCALL_WITHDRAW_EXPLICIT}:
+                _interrupt_stale_reply()
+                _end_midcall_opted_out(turn_ctx, f"{klass}_fragment")
+                return "reply"
+            if klass == phone.MIDCALL_DECLINE:
+                return "swallow"  # the confirmation already in flight stands
+            withdrawal["pending"] = False
+            withdrawal["stage"] = None
+            _interrupt_stale_reply()
+            _reask_owed_after_continue(turn_ctx)
+            _withdrawal_log("latch_released_fragment")
+            return "reply"
+
+        if withdrawal["pending"]:
+            # The reply to the confirmation (or a fragment of it).
+            if not continuation:
+                withdrawal["stage"] = "replying"
+            elif withdrawal.get("last_verdict") == phone.WITHDRAWAL_REPLY_AMBIGUOUS:
+                # The previous fragment's ambiguous read spent the re-ask;
+                # the joined reply is re-decided, so give it back.
+                withdrawal["reasks"] = max(0, int(withdrawal["reasks"]) - 1)
+            if continuation:
+                _interrupt_stale_reply()
+            # A reply to the confirmation is not a silence-ladder answer.
+            silence_prompted["value"] = False
+            verdict = phone.classify_withdrawal_confirm_reply(joined)
+            withdrawal["last_verdict"] = verdict
+            if verdict == phone.WITHDRAWAL_REPLY_STOP:
+                _end_midcall_opted_out(turn_ctx, "confirmed_stop")
+                return "reply"
+            if verdict == phone.WITHDRAWAL_REPLY_CONTINUE:
+                withdrawal["pending"] = False
+                withdrawal["stage"] = None
+                withdrawal["declines_dismissed"] = True
+                _reask_owed_after_continue(turn_ctx)
+                _withdrawal_log("confirmed_continue")
+                return "reply"
+            if int(withdrawal["reasks"]) < 1:
+                withdrawal["reasks"] = int(withdrawal["reasks"]) + 1
+                _speak_withdrawal_line(
+                    turn_ctx, phone.PHONE_WITHDRAWAL_CONFIRM_REASK_TEXT,
+                    phase="withdrawal_confirm",
+                )
+                _withdrawal_log("confirm_reasked")
+                return "reply"
+            _end_midcall_opted_out(turn_ctx, "ambiguous_after_reask")
+            return "reply"
+
+        klass = phone.classify_midcall_withdrawal(joined)
+        if klass is None:
+            return None
+        if klass == phone.MIDCALL_DECLINE and withdrawal["declines_dismissed"]:
+            # The candidate already chose to continue once; a later decline-
+            # shaped turn is an answer, and asking again would loop.
+            _withdrawal_log("decline_ignored_after_continue")
+            return None
+        if continuation:
+            _interrupt_stale_reply()
+        if klass in {phone.MIDCALL_OPT_OUT, phone.MIDCALL_WITHDRAW_EXPLICIT}:
+            _end_midcall_opted_out(turn_ctx, klass)
+            return "reply"
+        # A decline beats a callback: abandon any negotiation in progress.
+        callback_flow["state"] = None
+        withdrawal["pending"] = True
+        withdrawal["stage"] = "latched"
+        withdrawal["reasks"] = 0
+        withdrawal["last_verdict"] = None
+        _speak_withdrawal_line(
+            turn_ctx, phone.PHONE_WITHDRAWAL_CONFIRM_TEXT, phase="withdrawal_confirm",
+        )
+        _withdrawal_log("decline_confirm_asked")
+        return "reply"
 
     async def on_native_turn(
         text: str, message: Any = None, turn_ctx: Any = None,
@@ -4760,6 +5097,48 @@ async def _run_native_phone_screening(
                     "sequence": None, "key": None, "mismatch": None,
                     "action_id": None,
                 })
+        # M009 PR-C (C7): MID-CALL WITHDRAWAL. Runs on the coalesced text (a
+        # continuation fragment — the same structural signal the coalescer
+        # keys on, or a final that predates the current question — is joined
+        # onto the previous fragment), and BEFORE the candidate-end request,
+        # the callback flow, the goodbye latch and the answer gate: a decline
+        # beats a callback, and an opt-out beats an end-call. Active only while
+        # a planned question is owed (or a confirmation is), never once a
+        # terminal reply is armed, and not at all under PHONE_MIDCALL_OPT_OUT=off.
+        active_flow_for_withdrawal = callback_flow["state"]
+        withdrawal_active = (
+            phone.phone_midcall_opt_out_enabled()
+            and not candidate_end_requested.is_set()
+            and pending_terminal_reason.get("value") is None
+            and not (
+                active_flow_for_withdrawal is not None
+                and active_flow_for_withdrawal.phase == phone.CALLBACK_PHASE_DONE
+            )
+            and (withdrawal["pending"] or state.question_at(cursor) is not None)
+        )
+        withdrawal_continuation = bool(
+            (
+                # The coalescer's own structural signal (~the split-final
+                # guard below), read from the same raw interrupt latches.
+                prior_reply_started
+                and not prior_speech_first_audio
+                and not prior_turn_interrupted["value"]
+                and not prior_handle_interrupted
+            )
+            or _native_turn_predates_question(message, latest_assistant_anchor[0])
+        )
+        withdrawal_route = _midcall_withdrawal_turn(
+            turn_ctx, text, continuation=withdrawal_continuation,
+            active=withdrawal_active,
+        )
+        if withdrawal_route is not None and withdrawal_continuation:
+            # A consumed continuation fragment is the same LOGICAL turn.
+            _uncount_continuation_fragment()
+        if withdrawal_route == "swallow":
+            from livekit.agents import StopResponse  # noqa: PLC0415
+            raise StopResponse()
+        if withdrawal_route == "reply":
+            return
         if candidate_end_requested.is_set() or phone.is_explicit_end_call_request(text):
             candidate_end_requested.set()
             reply_plan[0] = phone.PHONE_CANDIDATE_END_TEXT
@@ -6607,6 +6986,19 @@ async def _run_native_phone_screening(
                 )
             except asyncio.TimeoutError:
                 pass
+        # M009 PR-C (C7): a fragment whose continuation turned out to be a
+        # withdrawal ("I'm not" + "interested in this role") must not become a
+        # durable answer. While the confirmation is owed, or once the opt-out
+        # closing is armed, the boundary is skipped; on "carry on" the SAME
+        # owed question is re-asked, so nothing is lost.
+        if withdrawal["pending"] or phone.HALT_CANDIDATE_OPTED_OUT in {
+            pending_terminal_reason.get("value"), terminal_reason.get("reason"),
+        }:
+            _log.info(
+                "unknown_event", error_type="phone_toolless_commit",
+                error_category="withdrawal_commit_skipped",
+            )
+            return
         candidate_text = boundary.get("candidate")
         # F-Q3c: `ask_delivered` is now HONEST (derived from the coverage
         # signals), so it no longer doubles as the populated-boundary marker.
@@ -7558,6 +7950,38 @@ async def _run_native_phone_screening(
         raise RuntimeError("phone_consent_authorization_unavailable")
     authorize()
 
+    # ── M009 C4: the pre-loop lines are GUARDED ─────────────────────────────
+    # The role opening and Q1 are spoken before the try/finally below, which
+    # owns the silence task, the watchdog and the disconnect branch. A hangup
+    # on a resumed leg closed the AgentSession under the raw `say`, which then
+    # raised `RuntimeError("AgentSession isn't running")` past all of it: the
+    # job crashed, the silence task and watchdog were never cancelled and the
+    # non-terminal `disconnect` branch never ran (Fly d8d9564b50e908, room
+    # phone-e5f260c9, agent.py:7162). Now a line that cannot be heard ends the
+    # pre-loop as a DISCONNECT and falls through to that try/finally. A
+    # non-marker RuntimeError still propagates, unchanged.
+    async def _speak_preloop(text: str, category: str) -> bool:
+        """Speak one pre-loop line. True only if it played with the leg up."""
+        if close_event.is_set():
+            return False
+        try:
+            speech = session.say(text, allow_interruptions=True)
+            wait = getattr(speech, "wait_for_playout", None)
+            if callable(wait):
+                value = wait()
+                if inspect.isawaitable(value):
+                    await value
+        except RuntimeError as exc:
+            _participant_gone_from(exc, category=category)  # re-raises non-marker
+            return False
+        return not close_event.is_set()
+
+    def _preloop_disconnect() -> None:
+        # Never `completed`: a consented candidate who dropped is owed a
+        # reconnect, not a terminal (R3/R4, X2).
+        terminal_reason.setdefault("reason", "disconnect")
+        finished.set()
+
     # F1 (call 24): state the EXACT role deterministically at the top of the
     # screening. `state.role_title` is the server-verified title returned by the
     # atomic consent/start RPC, available here before the first question is
@@ -7566,19 +7990,24 @@ async def _run_native_phone_screening(
     # as a screening boundary. None when no role is known → byte-unchanged.
     # The gate now speaks the role-opening line itself (masking the commit +
     # egress start), so agent.py must NOT speak it again when it already did.
+    preloop_done = asyncio.Event()
+    setattr(agent, "_native_preloop_done", preloop_done)
+    preloop_heard = True
     role_opening = phone.phone_role_opening_text(state.role_title)
     if role_opening is not None and not getattr(result, "role_opening_spoken", False):
-        role_speech = session.say(role_opening, allow_interruptions=True)
-        role_wait = getattr(role_speech, "wait_for_playout", None)
-        if callable(role_wait):
-            role_value = role_wait()
-            if inspect.isawaitable(role_value):
-                await role_value
+        preloop_heard = await _speak_preloop(role_opening, "preloop_role_opening")
 
     question = state.question_at(cursor)
-    if question is None:
+    if not preloop_heard:
+        # The role opening was not heard: skip the whole question block (no
+        # `completed`, no rephrase, no Q1, no F0a).
+        _preloop_disconnect()
+    elif question is None:
         terminal_reason["reason"] = "completed"
         finished.set()
+    elif close_event.is_set():
+        # Gone before the rephrase: do not spend an LLM call on nobody.
+        _preloop_disconnect()
     else:
         # Q1 is spoken via `say`, NOT a live generation — the context here ends
         # with the model's role-opening turn, which the LLM rejects ("Requests
@@ -7591,12 +8020,11 @@ async def _run_native_phone_screening(
         # and the owed objective is unchanged: the candidate's first answer binds
         # to it regardless of the phrasing actually spoken.
         q1_text = await phone.phone_rephrase_first_question(question.spoken_text)
-        speech = session.say(q1_text, allow_interruptions=True)
-        wait = getattr(speech, "wait_for_playout", None)
-        if callable(wait):
-            value = wait()
-            if inspect.isawaitable(value):
-                await value
+        if not await _speak_preloop(q1_text, "preloop_q1"):
+            # Q1 was not heard: a disconnect, and F0a is skipped (there is no
+            # delivered ask to prime the turn tracking with).
+            _preloop_disconnect()
+            question = None
         # F0a — PRIME THE NATIVE TURN TRACKING AT THE GATE HANDOFF.
         # The first planned question is delivered HERE, at the consent→screening
         # handoff, through `generate_reply`/`say`. The native turn hook
@@ -7638,6 +8066,10 @@ async def _run_native_phone_screening(
             if not assistant_delivery_complete.is_set():
                 assistant_delivery_complete.set()
             await prime_preemptive_objective(state.question_at(cursor + 1))
+    # M009 C4 test seam: the pre-loop (role opening, Q1, F0a) is over, either
+    # way. Session harnesses that end a fake call by firing `close` wait for it,
+    # because a close that lands earlier is now (correctly) a disconnect.
+    preloop_done.set()
 
     try:
         # This bounds the whole leg, not one answer. Per-turn inactivity is
@@ -7670,6 +8102,28 @@ async def _run_native_phone_screening(
                     await asyncio.gather(*pending_commits, return_exceptions=True)
 
     reason = terminal_reason.get("reason")
+    # M009 PR-C (C7): a leg that ends while the withdrawal confirmation is
+    # still owed — the candidate declined, was asked "stop here or carry on?",
+    # and then hung up or went silent — ends as the opt-out it most likely is,
+    # never as a reconnect-granting drop or a scored abort. The same holds for
+    # an opt-out closing that was ARMED but had not finished playing.
+    opt_out_armed = (
+        pending_terminal_reason.get("value") == phone.HALT_CANDIDATE_OPTED_OUT
+    )
+    if (
+        (withdrawal["pending"] or opt_out_armed)
+        and reason in {"disconnect", phone.HALT_NO_ANSWER}
+    ):
+        _log.info(
+            "unknown_event", error_type="phone_midcall_withdrawal",
+            error_category=(
+                ("armed_" if opt_out_armed else "latched_")
+                + ("drop" if reason == "disconnect" else "silence")
+            ),
+        )
+        reason = phone.HALT_CANDIDATE_OPTED_OUT
+        terminal_reason["reason"] = reason
+        withdrawal["pending"] = False
     # F3 (call 24) + F8 (live 2026-09-03): the goodbye MUST be spoken, and only
     # PROOF counts. `goodbye_delivered` is set solely by `on_reply_delivered`
     # when the armed terminal reply played to completion uninterrupted — a
@@ -7923,13 +8377,71 @@ async def _run_native_phone_screening(
                 events, attempt_id, "assessment.completed",
             )
         elif done is not None and done.status is not None:
-            # A known non-score verdict is truthfully terminal. A transport
-            # failure has no status and remains non-terminal for recovery.
-            if before_terminal is not None:
-                await before_terminal()
-            await _post_phone_event_with_retry(
-                events, attempt_id, "assessment.aborted",
+            # M009 PR-C (C2-P2): a known non-score verdict (plan_incomplete,
+            # completion_failed, session_not_active, assessment_missing,
+            # scoring_failed) is an INFRASTRUCTURE fault on a conversation the
+            # candidate finished. It used to post `assessment.aborted`, which
+            # failed the engagement while the session was still scoreable.
+            # It now posts NOTHING, exactly like the retryable halts: reclaim,
+            # PR-A's E3 hold, partial-finalize and the stranded completion own
+            # the leg, and the candidate still gets a scorecard. The status is
+            # logged as a fixed `completion_verdict_<status>` code. A transport
+            # failure (no status) was already non-terminal and is unchanged.
+            verdict = str(done.status).strip().lower()
+            if not re.fullmatch(r"[a-z0-9_]{1,40}", verdict):
+                verdict = "unknown"
+            _log.warn(
+                "unknown_event", error_type="phone_session_terminal",
+                error_category=f"completion_verdict_{verdict}",
             )
+    elif reason == phone.HALT_CALLBACK_DEFERRED:
+        # M009 PR-C (C2-P1): the in-call callback flow could not book a time.
+        # Post `callback.deferred_in_call` ONCE (bounded idempotent retries);
+        # 0114 moves the engagement to the next IST-day window, uncharged, with
+        # its session detached. NEVER `assessment.aborted`: that failed the
+        # engagement and let a partial score publish a reject (4352df89). When
+        # the deferral is not applied (an old API, a terminal engagement, a
+        # stale epoch, a transport failure) post NOTHING more — reclaim and the
+        # partial path own the leg, as they did before this event existed.
+        if before_terminal is not None:
+            await before_terminal()
+        deferred = await _post_phone_event_with_retry(
+            events, attempt_id, "callback.deferred_in_call",
+        )
+        if deferred is None or not phone.event_applied(deferred):
+            _log.warn(
+                "unknown_event", error_type="phone_callback_deferred",
+                error_category="deferral_not_applied",
+            )
+    elif reason == phone.HALT_CANDIDATE_OPTED_OUT:
+        # M009 PR-C (C7): a mid-call withdrawal. Post `candidate.opt_out` ONCE
+        # (bounded idempotent retries): 0114 moves the engagement to
+        # opted_out, writes the line suppression and cancels the session, so
+        # nothing is scored. When it is not applied:
+        #   * ignored with reason `terminal` — the engagement is already over
+        #     (an HR stop, a drop that already terminalised it): post nothing.
+        #   * a transport failure or any other ignore — fall back to
+        #     `assessment.aborted`, which C2's worker_aborted suppression keeps
+        #     unscored. A decliner must never be left scoreable.
+        if before_terminal is not None:
+            await before_terminal()
+        opted = await _post_phone_event_with_retry(
+            events, attempt_id, "candidate.opt_out",
+        )
+        if opted is None or not phone.event_applied(opted):
+            terminal_ignored = (
+                opted is not None
+                and getattr(opted, "status", None) == "ignored"
+                and getattr(opted, "ignored_reason", None) == "terminal"
+            )
+            _log.warn(
+                "unknown_event", error_type="phone_opt_out_not_applied",
+                error_category=(
+                    "ignored_terminal" if terminal_ignored else "fallback_aborted"
+                ),
+            )
+            if not terminal_ignored:
+                await events.post_event(attempt_id, "assessment.aborted")
     elif reason in {
         phone.HALT_CANDIDATE_ENDED,
         phone.HALT_NO_ANSWER,
@@ -9766,6 +10278,14 @@ async def _run_phone_session(
     recording_finish_lock = asyncio.Lock()
     recording_finished = False
     teardown_deadline: float | None = None
+    # M009 C9-1: job-scoped list of detached `recorder.finish` uploads, each
+    # with the monotonic time it started. Shutdown awaits them (never cancels)
+    # up to `_detached_finish_wait_cap` BEFORE arming the exit watchdog, which
+    # would otherwise os._exit the process 16 s later with the PUT in flight.
+    detached_finish_tasks: list[tuple["asyncio.Task[Any]", float]] = []
+    # Single-flight: the first wait fixes one absolute deadline, so the three
+    # watchdog-arm sites can never stack their waits past the budget.
+    detached_finish_deadline: list[float | None] = [None]
 
     def _teardown_timeout(default: float) -> float:
         if teardown_deadline is None:
@@ -9848,6 +10368,7 @@ async def _run_phone_session(
                 return
             try:
                 sid = phone.session_id_from_room_name(room_name)
+                finish_started = time.monotonic()
                 finish_task = asyncio.ensure_future(recorder.finish(upload_url))
                 budget = _teardown_timeout(PHONE_RECORDING_FINISH_SECONDS)
                 finish_deadline = min(
@@ -9880,6 +10401,8 @@ async def _run_phone_session(
                             t, sid, getattr(recorder, "finish_failure", None),
                         )
                     )
+                    # C9-1: shutdown waits for it (bounded, never cancels).
+                    detached_finish_tasks.append((finish_task, finish_started))
                     _log.warn(
                         "unknown_event", error_type="phone_teardown",
                         error_category="recording_finish_detached",
@@ -9966,7 +10489,10 @@ async def _run_phone_session(
              admitted, and both are `unexpected_event` there after 0113.
           3. Answer observed, E3 saw the leg leave, consent not durable —
              `sip.participant_left` (below).
-          4. Otherwise the pre-E6 labels (deferred / aborted / consent.failed).
+          4. Otherwise the pre-E6 labels (deferred / consent.failed).
+          5. M009 PR-C (R4): once consent is DURABLE, a drop, timeout or
+             exception posts NOTHING (no `assessment.aborted`, no
+             `sip.participant_left`); the server-side paths own the leg.
         """
         if gate_result is None or "terminal_posted" in gate_lifecycle:
             return
@@ -10053,20 +10579,40 @@ async def _run_phone_session(
             # is named for what it was — the leg left — rather than as a
             # "call me later" deferral nobody asked for. Same 0095 branch (the
             # attempt ends uncharged, next IST-day window), different truth in
-            # the ledger. Without an observed departure the label is unchanged,
-            # and a durable consent always keeps `assessment.aborted`.
+            # the ledger. Without an observed departure the label is unchanged.
+            #
+            # M009 PR-C (R4): after DURABLE consent a gate drop or timeout
+            # posts NOTHING. It used to post `assessment.aborted`, failing an
+            # engagement whose conversation was interrupted, not ended; and a
+            # worker-posted `sip.participant_left` would be worse, because
+            # CloseReason.ERROR can fire while SIP is still alive and that
+            # event grants a reconnect redial onto a live line. The server
+            # ends the leg truthfully instead: the webhook/reconciliation
+            # drop, or reclaim + PR-A's E3 hold + partial-finalize + the
+            # stranded completion.
             if gate_lifecycle.get("consent_durable"):
-                event_type = "assessment.aborted"
-            elif gate_lifecycle.get("sip_left_reason"):
+                _log.info(
+                    "unknown_event", error_type="phone_gate_outcome",
+                    error_category="post_consent_failure_unposted",
+                    phase="drop_or_timeout",
+                )
+                return
+            if gate_lifecycle.get("sip_left_reason"):
                 event_type = "sip.participant_left"
             else:
                 event_type = "candidate.deferred_pre_disclosure"
         elif failure is not None:
-            event_type = (
-                "assessment.aborted"
-                if gate_lifecycle.get("consent_durable")
-                else "consent.failed"
-            )
+            if gate_lifecycle.get("consent_durable"):
+                # M009 PR-C (R4): a gate EXCEPTION after durable consent is
+                # an infrastructure fault, never the candidate's outcome.
+                # Post nothing (see the drop/timeout branch above).
+                _log.info(
+                    "unknown_event", error_type="phone_gate_outcome",
+                    error_category="post_consent_failure_unposted",
+                    phase="exception",
+                )
+                return
+            event_type = "consent.failed"
         if event_type is None:
             if gate_lifecycle.get("consent_failure"):
                 event_type = "consent.failed"
@@ -10297,6 +10843,49 @@ async def _run_phone_session(
     add_shutdown_callback = getattr(ctx, "add_shutdown_callback", None)
     shutdown_watchdog_armed = False
 
+    async def _await_detached_finishes() -> None:
+        """M009 C9-1: give a detached upload its remaining budget, bounded.
+
+        NEVER cancels: a cancelled `finish()` deletes the local OGG/MP3, so a
+        wait that cancels is data loss, not a bound. When the cap expires the
+        task is simply left running (the watchdog may still end the process),
+        exactly as before this wait existed.
+        """
+        pending = [(t, s) for t, s in detached_finish_tasks if not t.done()]
+        if not pending:
+            return
+        if detached_finish_deadline[0] is None:
+            now = time.monotonic()
+            cap = max(_detached_finish_wait_cap(now - s) for _t, s in pending)
+            detached_finish_deadline[0] = now + cap
+        deadline = detached_finish_deadline[0]
+        while True:
+            waiting = {t for t, _s in pending if not t.done()}
+            if not waiting:
+                break
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                await asyncio.wait(waiting, timeout=remaining)
+            except asyncio.CancelledError:
+                # Same posture as `_bounded_await`: stay for the evidence, do
+                # not extend the wall clock, keep the cancel counter balanced.
+                current = asyncio.current_task()
+                if current is not None and hasattr(current, "uncancel"):
+                    current.uncancel()
+                continue
+        if any(not t.done() for t, _s in pending):
+            _log.warn(
+                "unknown_event", error_type="phone_teardown",
+                error_category="recording_finish_wait_expired",
+            )
+        else:
+            _log.info(
+                "unknown_event", error_type="phone_teardown",
+                error_category="recording_finish_awaited",
+            )
+
     def _arm_phone_job_watchdog() -> None:
         nonlocal shutdown_watchdog_armed
         # Never hard-exit the long-lived worker or a console/browser process.
@@ -10322,6 +10911,8 @@ async def _run_phone_session(
     if callable(add_shutdown_callback):
         async def _phone_job_shutdown(_reason: str | None = None) -> None:
             await _run_teardown(result, gate_error)
+            # C9-1: the bounded detached-upload wait comes BEFORE the arm.
+            await _await_detached_finishes()
             _arm_phone_job_watchdog()
 
         add_shutdown_callback(_phone_job_shutdown)
@@ -10628,6 +11219,8 @@ async def _run_phone_session(
             # evidence here while leaving terminal ownership to lease/recovery.
             await _request_room_close()
             await _run_teardown(result, gate_error)
+            # C9-1: the bounded detached-upload wait comes BEFORE the arm.
+            await _await_detached_finishes()
             _arm_phone_job_watchdog()
 
 
@@ -10770,7 +11363,12 @@ async def _run_phone_session(
                     # which is what an adoption is — would make a recovered screening
                     # end worse than a failed one. The closing line is fixed copy and
                     # is not a transcript turn, so saying it records nothing.
-                    await say(phone.PHONE_ASSESSMENT_CLOSING_TEXT)
+                    # M009 C4: a courtesy line nobody can hear must not cost
+                    # the recording, the completion post or the room close.
+                    try:
+                        await say(phone.PHONE_ASSESSMENT_CLOSING_TEXT)
+                    except phone.PhoneParticipantGone:
+                        pass
                     await _finish_recording()
                     await events.post_event(attempt_id, "assessment.completed")
                     await _request_room_close()
@@ -10789,7 +11387,11 @@ async def _run_phone_session(
                             "unknown_event", error_type="phone_assessment_recovered",
                             error_category=recovered.status,
                         )
-                        await say(phone.PHONE_ASSESSMENT_CLOSING_TEXT)
+                        # M009 C4: same tolerance as the adoption path.
+                        try:
+                            await say(phone.PHONE_ASSESSMENT_CLOSING_TEXT)
+                        except phone.PhoneParticipantGone:
+                            pass
                         await _finish_recording()
                         await events.post_event(attempt_id, "assessment.completed")
                         await _request_room_close()
@@ -10858,6 +11460,18 @@ async def _run_phone_session(
                 close_room_after_evidence=_close_room_after_evidence,
                 before_terminal=_finish_recording,
             )
+
+        async def _post_consent_exception(exc: BaseException) -> None:
+            """The generic post-consent failure body, shared by the C4 backstop
+            (a non-marker RuntimeError) and the `except Exception` arm, so the
+            two can never drift. The caller re-raises."""
+            nonlocal gate_error
+            gate_error = exc
+            _log.warn(
+                "unknown_event", error_type="phone_assessment_failed",
+                error_category="post_consent_exception",
+            )
+            await _request_room_close()
 
         heartbeat_task = asyncio.create_task(
             phone.run_phone_heartbeat(
@@ -10971,13 +11585,27 @@ async def _run_phone_session(
                 )
                 await _request_room_close()
                 return result
-            except Exception as exc:  # noqa: BLE001 — finalizer owns truth
-                gate_error = exc
+            except (phone.PhoneParticipantGone, RuntimeError) as exc:
+                # M009 C4 RUN-LEVEL BACKSTOP. A raw `say` anywhere in the
+                # screening (the silence loop, a recovery line) can still meet
+                # a session the candidate's hangup already closed. That is a
+                # DROP, not a fault: post nothing (the webhook / reconciliation
+                # `sip.participant_left` owns a consented drop, X2), leave
+                # gate_error unset, request no room close (the leg is the
+                # reconnect path's), and return. Any OTHER RuntimeError takes
+                # the generic body below, byte-identically.
+                if not isinstance(exc, phone.PhoneParticipantGone) and (
+                    not _is_sdk_session_stopped(exc)
+                ):
+                    await _post_consent_exception(exc)
+                    raise
                 _log.warn(
-                    "unknown_event", error_type="phone_assessment_failed",
-                    error_category="post_consent_exception",
+                    "unknown_event", error_type="phone_assessment_halted_leg",
+                    error_category="participant_gone",
                 )
-                await _request_room_close()
+                return result
+            except Exception as exc:  # noqa: BLE001 — finalizer owns truth
+                await _post_consent_exception(exc)
                 raise
         finally:
             heartbeat_task.cancel()
@@ -11015,6 +11643,8 @@ async def _run_phone_session(
         # Arm after the phone body (including queued scoring) and evidence
         # settle, not only in the later SDK callback: SDK room/telemetry cleanup
         # runs before that callback and may itself hang.
+        # C9-1: a detached upload gets its bounded wait before the arm.
+        await _await_detached_finishes()
         _arm_phone_job_watchdog()
 
 

@@ -96,15 +96,19 @@ const HEALTHY_BACKLOG = {
 type BacklogResult = Awaited<ReturnType<PhoneStores['backlog']>>;
 
 /**
- * A read store that throws on every call.
+ * A read store that throws on every call but one.
  *
- * `GET /api/phone/health` reads only the WRITE store's `backlog`. A read store
- * that answered politely would hide a health handler that had quietly started
- * reading a projection, so this one fails loudly instead.
+ * `GET /api/phone/health` reads the WRITE store's `backlog` and, since 0114
+ * (C8), exactly ONE read-store method: the bare duplicate-hold COUNT, which
+ * returns a number and no row. A read store that answered politely would hide
+ * a health handler that had quietly started reading a projection, so every
+ * other member fails loudly instead.
  */
 function explodingReadStore(): PhoneReadStore {
   const explode = () => { throw new Error('health must not read a projection'); };
-  return new Proxy({} as PhoneReadStore, { get: () => explode });
+  return new Proxy({} as PhoneReadStore, {
+    get: (_target, prop) => (prop === 'countDuplicateApplicationHolds' ? async () => 0 : explode),
+  });
 }
 
 /** Only `backlog` is ever called; every other RPC throws if the surface reaches it. */

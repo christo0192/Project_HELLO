@@ -43,6 +43,13 @@ import {
   defaultScannerCapabilityReader,
   type ScannerCapabilityReader,
 } from '../../lib/malware-scanner.js';
+import {
+  AV_UPDATER_HEALTH,
+  avUpdaterFailing,
+  readAvUpdaterStatusFile,
+  resolveAvUpdaterStatusFile,
+  type AvUpdaterStatus,
+} from '../../lib/av-updater.js';
 
 /**
  * How many missed intervals before a loop is called `stale`. Three gives a
@@ -613,6 +620,64 @@ export interface ScannerHealthView {
   maxAgeSec: number | null;
   /** Stable reason code when not ready; null when ready. */
   reason: string | null;
+  /**
+   * 0114 (C10c). The signature updater's state, as the container supervisor
+   * last published it (`AV_UPDATER_STATUS_FILE`). PRESENT only when a status
+   * document was read and validated — absent on a machine with no supervisor
+   * (local dev) or before the first attempt settles, never a fabricated zero.
+   */
+  updater?: ScannerUpdaterView;
+  /**
+   * 0114 (C10c). WARNING-ONLY reason codes: `scanner_updater_failing` and
+   * `scanner_signatures_aging`. They never degrade the verdict (the scanner
+   * is already fail-closed on its own freshness ceiling); they exist to warn
+   * hours BEFORE that ceiling is reached. Present only when non-empty.
+   */
+  warnings?: string[];
+}
+
+/** The publishable part of the updater status. Counts, instants, an exit status. */
+export interface ScannerUpdaterView {
+  consecutiveFailures: number;
+  lastSuccessAt: string | null;
+  lastAttemptAt: string | null;
+  lastExitCode: number | null;
+  lastReason: string | null;
+}
+
+/** The warning-only scanner reasons (0114, C10c). */
+export const SCANNER_WARNING_REASONS = ['scanner_updater_failing', 'scanner_signatures_aging'] as const;
+export type ScannerWarningReason = (typeof SCANNER_WARNING_REASONS)[number];
+
+/** Reads the supervisor's updater status; null when there is none. */
+export type ScannerUpdaterStatusReader = () => Promise<AvUpdaterStatus | null>;
+
+/**
+ * Attach the updater block and the warning-only reasons to a ClamAV view.
+ * Pure: the clock is a parameter. Never removes or changes an existing field.
+ */
+export function withScannerUpdaterHealth(
+  view: ScannerHealthView,
+  status: AvUpdaterStatus | null,
+  nowMs: number,
+): ScannerHealthView {
+  const warnings: ScannerWarningReason[] = [];
+  if (status !== null && avUpdaterFailing(status, nowMs)) warnings.push('scanner_updater_failing');
+  if (view.signatureAgeSec !== null && view.signatureAgeSec >= AV_UPDATER_HEALTH.agingSignatureSec) {
+    warnings.push('scanner_signatures_aging');
+  }
+  const out: ScannerHealthView = { ...view };
+  if (status !== null) {
+    out.updater = {
+      consecutiveFailures: status.consecutive_failures,
+      lastSuccessAt: status.last_success_at,
+      lastAttemptAt: status.last_attempt_at,
+      lastExitCode: status.last_exit_code,
+      lastReason: status.last_reason,
+    };
+  }
+  if (warnings.length > 0) out.warnings = warnings;
+  return out;
 }
 
 /** Resolve the configured scanner mode without constructing a scanner. */
@@ -638,6 +703,24 @@ export async function readScannerHealth(
   source: NodeJS.ProcessEnv = process.env,
   freshness: SignatureFreshnessReader = defaultSignatureFreshnessReader(),
   capability: ScannerCapabilityReader = defaultScannerCapabilityReader,
+  updaterStatus: ScannerUpdaterStatusReader =
+    () => readAvUpdaterStatusFile(resolveAvUpdaterStatusFile(source)),
+  now: () => number = Date.now,
+): Promise<ScannerHealthView> {
+  const view = await readScannerReadiness(source, freshness, capability);
+  if (view.mode !== 'clamav') return view;
+  // 0114 (C10c). Never throws: an unreadable status file is "no updater
+  // block", and the readiness verdict above is untouched either way.
+  let status: AvUpdaterStatus | null = null;
+  try { status = await updaterStatus(); } catch { status = null; }
+  return withScannerUpdaterHealth(view, status, now());
+}
+
+/** The pre-0114 readiness read, unchanged. */
+async function readScannerReadiness(
+  source: NodeJS.ProcessEnv,
+  freshness: SignatureFreshnessReader,
+  capability: ScannerCapabilityReader,
 ): Promise<ScannerHealthView> {
   const mode = scannerMode(source);
   if (mode !== 'clamav') {

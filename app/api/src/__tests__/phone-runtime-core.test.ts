@@ -79,12 +79,26 @@ import type { QueueJob } from '../lib/queue/types.js';
  * omit because the due pass never reads them: it receives the opaque value
  * from the reader and hands it to the dial port unexamined, which is exactly
  * the path this stand-in exercises.
+ *
+ * 0114 (C8-F): one stand-in PER CANDIDATE, each with its own digest. The due
+ * pass now dedups offers by LINE (the number's digest), so a harness that
+ * handed every candidate one shared stand-in would read as "every candidate
+ * shares one phone" and skip all but the first `line_already_offered`. The
+ * shared-line behaviour itself is pinned in `phone-0114-due-line-dedup.test.ts`.
  */
-const NUMBER = Object.freeze({
-  digest: 'd'.repeat(64),
-  toString: () => '[redacted]',
-  toJSON: () => '[redacted]',
-}) as unknown as DialableNumber;
+const NUMBERS_BY_CANDIDATE = new Map<string, DialableNumber>();
+function numberFor(candidateId: string): DialableNumber {
+  let n = NUMBERS_BY_CANDIDATE.get(candidateId);
+  if (n === undefined) {
+    n = Object.freeze({
+      digest: `line:${candidateId}`,
+      toString: () => '[redacted]',
+      toJSON: () => '[redacted]',
+    }) as unknown as DialableNumber;
+    NUMBERS_BY_CANDIDATE.set(candidateId, n);
+  }
+  return n;
+}
 
 const NOW = new Date('2026-09-01T06:00:00.000Z');
 
@@ -536,7 +550,7 @@ function harness(options: {
       const allowed = options.dialableCandidates ?? input.candidateIds;
       const out = new Map<string, DialableNumber>();
       for (const id of input.candidateIds) {
-        if (allowed.includes(id)) out.set(id, NUMBER);
+        if (allowed.includes(id)) out.set(id, numberFor(id));
       }
       return out;
     },

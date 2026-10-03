@@ -211,18 +211,47 @@ describe('P3 reconciliation — what it concludes, and when it says nothing', ()
     // demonstrably picked up as `no_answer`, charge the anti-harassment
     // budget, and re-dial them the next IST day on the strength of it.
     for (const attemptState of ['answered_unclassified', 'human', 'machine']) {
-      expect(recoveredEventType('dialing', attemptState)).toBeNull();
+      expect(recoveredEventType('dialing', attemptState)).not.toBe('sip.originate_timeout');
     }
+    // A classified machine has no conversation to continue: still nothing.
+    expect(recoveredEventType('dialing', 'machine')).toBeNull();
   });
 
-  it('leaves an answered-then-dropped attempt to the reclaimer, posting nothing', async () => {
+  it('0114 (C1): an ANSWERED dialing leg that vanished is reported as a departure; the ledger decides', () => {
+    // The drop-race branch's production producer. 0114 applies it only to a
+    // consented-live continuation leg (charged reconnect) and records any
+    // other answered leg's `reconciliation` post as unexpected_event.
+    expect(recoveredEventType('dialing', 'answered_unclassified')).toBe('sip.participant_left');
+    expect(recoveredEventType('dialing', 'human')).toBe('sip.participant_left');
+  });
+
+  it('0114 (C1): posts sip.participant_left for an answered-then-dropped dialing attempt, epoch-fenced', async () => {
     const d = deps({
       due: [attempt({ engagementState: 'dialing', attemptState: 'human' })],
       participants: [],
     });
     const result = await runPhoneReconciliation(d.deps, { now: NOW });
+    expect(d.applyEvent).toHaveBeenCalledTimes(1);
+    const input = d.applyEvent.mock.calls[0][0] as Record<string, unknown>;
+    expect(input).toMatchObject({
+      source: 'reconciliation',
+      eventType: 'sip.participant_left',
+      attemptId: A1,
+      epoch: 5,
+      providerEventId: `recon:${A1}:sip.participant_left:5`,
+    });
+    expect(result.skipped).toEqual({});
+    expect(result.posted).toBe(1);
+  });
+
+  it('0114 (C1): says nothing while the answered dialing leg is still in the room', async () => {
+    const d = deps({
+      due: [attempt({ engagementState: 'dialing', attemptState: 'answered_unclassified' })],
+      participants: [{ identity: `phone-${A1}` }],
+    });
+    const result = await runPhoneReconciliation(d.deps, { now: NOW });
     expect(d.applyEvent).not.toHaveBeenCalled();
-    expect(result.skipped).toEqual({ state_not_recoverable: 1 });
+    expect(result.skipped).toEqual({ participant_present: 1 });
   });
 
   it('says nothing when our participant is STILL in the room', async () => {

@@ -140,8 +140,9 @@ describe('listWorkflows — ingestionState projection', () => {
   it('keeps every other field of the response shape unchanged', async () => {
     const { client } = fakeClient([linkRow()]);
     const [w] = await createMissionControlStore(client).listWorkflows(50);
+    // C3 (0114) adds exactly one key: `heldForEvidence` (false when not held).
     expect(Object.keys(w).sort()).toEqual([
-      'applicationLinkId', 'externalApplicationId', 'externalJobId', 'ingestionState',
+      'applicationLinkId', 'externalApplicationId', 'externalJobId', 'heldForEvidence', 'ingestionState',
       'lifecycle', 'operations', 'sessionId', 'sessionStatus', 'terminalState', 'updatedAt',
     ]);
     expect(w).toMatchObject({

@@ -392,6 +392,28 @@ describe('AshbyMissionControlPage — manual invite delivery (B1)', () => {
     expect(screen.getByText(/\b1 not queued for write-back\b/)).toBeInTheDocument();
   });
 
+  it('C3: flags a workflow held for interview evidence, and counts it', async () => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [{ ...WORKFLOWS.workflows[0], lifecycle: 'writeback_pending', sessionStatus: 'completed', heldForEvidence: true }],
+    });
+    renderPage();
+    expect(await screen.findByText('Held for evidence')).toBeInTheDocument();
+    expect(screen.getByText(/\b1 held for interview evidence\b/)).toBeInTheDocument();
+  });
+
+  it('C3: no evidence badge when not held, unreadable (null) or absent', async () => {
+    listAshbyWorkflows.mockResolvedValue({
+      ok: true,
+      workflows: [
+        { ...WORKFLOWS.workflows[0], lifecycle: 'writeback_pending', sessionStatus: 'completed', heldForEvidence: false },
+      ],
+    });
+    renderPage();
+    expect(await screen.findByText('app_1')).toBeInTheDocument();
+    expect(screen.queryByText('Held for evidence')).toBeNull();
+  });
+
   it('does not flag a screening that parked correctly', async () => {
     listAshbyWorkflows.mockResolvedValue({
       ok: true,

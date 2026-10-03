@@ -2416,3 +2416,122 @@ describe('M009 E6 — the pre-answer verdicts call.no_answer / call.busy / call.
     });
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// M009 C1 / C2 (0114) — `consent.resumed` and `callback.deferred_in_call`.
+//
+// Both are attempt-scoped worker verdicts forwarded to the ledger as source
+// `internal`; 0114's apply_phone_event owns every guard (live planned session,
+// answered attempt, epoch). The ROUTE's obligations are narrower and pinned
+// here: accept them, forward them attempt-scoped and `internal`, report
+// `ok` only when APPLIED, and never let either one start a recording or a
+// purge. The resumed leg was already recording from `call.answered`; a
+// deferral ends a leg whose audio is kept.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('M009 C1/C2 — consent.resumed and callback.deferred_in_call (0114)', () => {
+  const NEW_EVENTS = ['consent.resumed', 'callback.deferred_in_call'] as const;
+
+  it('both are in the closed allowlist and neither is a purge trigger', () => {
+    for (const event of NEW_EVENTS) {
+      expect(WORKER_PHONE_EVENTS).toContain(event);
+      expect(PURGE_BEFORE_EVENTS.has(event)).toBe(false);
+    }
+  });
+
+  for (const event of NEW_EVENTS) {
+    it(`${event}: accepted and forwarded as internal, attempt-scoped`, async () => {
+      const h = build();
+      const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: event });
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ ok: true, status: 'applied', ignored_reason: null, duplicate: false });
+      expect(h.applyEvent).toHaveBeenCalledTimes(1);
+      const input = h.applyEvent.mock.calls[0][0] as Record<string, unknown>;
+      expect(input).toMatchObject({ source: 'internal', eventType: event, attemptId: ATTEMPT, now: NOW });
+      // No explicit epoch: the worker posts NONE, so 0042 fences against the
+      // epoch stored on the attempt.
+      expect(input.epoch).toBeUndefined();
+    });
+
+    it(`${event}: an APPLIED post (with a session hint) starts NO recording and NO purge`, async () => {
+      const h = build({ withRecorder: true, withHintVerifier: true, withPurge: true });
+      const res = await post(h, '/events', {
+        attempt_id: ATTEMPT,
+        event_type: event,
+        session_id: SESSION,
+      });
+      expect(res.status).toBe(200);
+      expect(res.body.ok).toBe(true);
+      expect(h.startRecording).not.toHaveBeenCalled();
+      expect(h.purgeRecordings).not.toHaveBeenCalled();
+      expect(h.latchDiscardedRecording).not.toHaveBeenCalled();
+      expect(h.applyEvent).toHaveBeenCalledTimes(1);
+    });
+
+    it(`${event}: a duplicate re-post is still ok and still records nothing`, async () => {
+      const h = build({
+        withRecorder: true,
+        withPurge: true,
+        applyEvent: async () =>
+          ({ status: 'applied', applied: true, duplicate: true }) as ApplyPhoneEventResult,
+      });
+      const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: event });
+      expect(res.body).toEqual({ ok: true, status: 'applied', ignored_reason: null, duplicate: true });
+      expect(h.startRecording).not.toHaveBeenCalled();
+      expect(h.purgeRecordings).not.toHaveBeenCalled();
+    });
+
+    for (const reason of ['terminal', 'stale_epoch', 'unknown_attempt'] as const) {
+      it(`${event}: ignored (${reason}) is forwarded but NOT ok`, async () => {
+        // The C1 worker branches on this: terminal/stale_epoch/unknown_attempt
+        // end the leg with no terminal post. `ok` must therefore mean APPLIED.
+        const h = build({
+          withRecorder: true,
+          applyEvent: async () =>
+            ({ status: 'ignored', applied: false, ignoredReason: reason, duplicate: false }) as ApplyPhoneEventResult,
+        });
+        const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: event });
+        expect(res.status).toBe(200);
+        expect(res.body).toEqual({ ok: false, status: 'ignored', ignored_reason: reason, duplicate: false });
+        expect(h.startRecording).not.toHaveBeenCalled();
+      });
+    }
+
+    it(`${event}: unexpected_event is NOT ok (the worker fails open)`, async () => {
+      const h = build({
+        applyEvent: async () =>
+          ({ status: 'unexpected_event', applied: false, duplicate: false }) as unknown as ApplyPhoneEventResult,
+      });
+      const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: event });
+      expect(res.status).toBe(200);
+      expect(res.body.ok).toBe(false);
+      expect(res.body.status).toBe('unexpected_event');
+    });
+
+    it(`${event}: disabled deployment answers 503 with no database work`, async () => {
+      const h = build({ configSource: DISABLED });
+      const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: event });
+      expect(res.status).toBe(503);
+      expect(h.storeCalls()).toBe(0);
+    });
+  }
+
+  it('adding them did not open the provider verdicts: sip.originate_* still 400', async () => {
+    for (const eventType of ['sip.originate_timeout', 'sip.originate_rejected_busy', 'sip.originate_failed']) {
+      const h = build();
+      const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: eventType });
+      expect(res.status).toBe(400);
+      expect(h.storeCalls()).toBe(0);
+    }
+    expect(WORKER_PHONE_EVENTS.some((e) => e.startsWith('sip.originate'))).toBe(false);
+  });
+
+  it('near-miss spellings are refused before the database', async () => {
+    for (const eventType of ['consent.resume', 'consent_resumed', 'callback.deferred', 'callback.deferred_pre_disclosure']) {
+      const h = build();
+      const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: eventType });
+      expect(res.status).toBe(400);
+      expect(h.storeCalls()).toBe(0);
+    }
+  });
+});

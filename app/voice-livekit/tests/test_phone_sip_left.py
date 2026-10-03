@@ -335,11 +335,104 @@ class TestSipDepartureEndsTheGate(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(h.client.event_types, ["candidate.deferred_pre_disclosure"])
 
 
+def _consent_durable(kwargs):
+    kwargs["gate_phase_out"]["consent_durable"] = True
+
+
+class TestPostConsentGateFailurePostsNothing(unittest.IsolatedAsyncioTestCase):
+    """M009 PR-C (R4): after durable consent, a gate drop, timeout or
+    exception posts NO terminal at all. Not `assessment.aborted` (that failed
+    an interrupted engagement) and not `sip.participant_left` (CloseReason.ERROR
+    can fire with SIP still alive, and that event grants a reconnect redial
+    onto a live line). Evidence still settles before the room delete."""
+
+    def setUp(self):
+        _Session.wedge_say = True
+
+    def _unposted_phases(self, h):
+        return [
+            c.kwargs.get("phase") for c in h.log.info.call_args_list
+            if c.kwargs.get("error_category") == "post_consent_failure_unposted"
+        ]
+
+    def _assert_nothing_posted_and_evidence_first(self, h):
+        self.assertEqual(h.client.event_types, [])
+        self.assertFalse(
+            any(item.startswith("event:") for item in h.client.timeline),
+            h.client.timeline,
+        )
+        timeline = h.client.timeline
+        self.assertIn("recording.completed", timeline)
+        self.assertIn("room.delete", timeline)
+        self.assertLess(
+            timeline.index("recording.completed"), timeline.index("room.delete"),
+        )
+
+    async def test_post_consent_timeout_posts_nothing(self):
+        h = _Harness()
+        result = await h.run(
+            _wedged_gate(h, before_wedge=_consent_durable), wall_clock=0.2,
+        )
+        self.assertEqual(result.outcome, phone.GATE_TIMED_OUT)
+        self._assert_nothing_posted_and_evidence_first(h)
+        self.assertEqual(self._unposted_phases(h), ["drop_or_timeout"])
+
+    async def test_post_consent_drop_posts_nothing(self):
+        h = _Harness()
+        result = await h.run(
+            _wedged_gate(h, before_wedge=_consent_durable),
+            drive=h.disconnect, wall_clock=0.2,
+        )
+        self.assertIn(
+            result.outcome, {phone.GATE_TIMED_OUT, phone.GATE_PARTICIPANT_LEFT},
+        )
+        self.assertNotIn("sip.participant_left", h.client.event_types)
+        self._assert_nothing_posted_and_evidence_first(h)
+
+    async def test_post_consent_exception_posts_nothing(self):
+        h = _Harness()
+
+        async def gate(**kwargs):
+            await kwargs["wait_for_participant"]()
+            await kwargs["begin_recording_at_answer"]()
+            kwargs["gate_phase_out"]["consent_durable"] = True
+            h.gate_ready.set()
+            raise RuntimeError("gate provider failed")
+
+        await h.run(gate, expect=RuntimeError)
+        self._assert_nothing_posted_and_evidence_first(h)
+        self.assertEqual(self._unposted_phases(h), ["exception"])
+
+    async def test_pre_consent_exception_is_unchanged(self):
+        h = _Harness()
+
+        async def gate(**kwargs):
+            await kwargs["wait_for_participant"]()
+            await kwargs["begin_recording_at_answer"]()
+            h.gate_ready.set()
+            raise RuntimeError("gate provider failed")
+
+        await h.run(gate, expect=RuntimeError)
+        self.assertEqual(h.client.event_types, ["consent.failed"])
+        self.assertEqual(self._unposted_phases(h), [])
+
+    async def test_pre_consent_timeout_is_unchanged(self):
+        h = _Harness()
+        result = await h.run(_wedged_gate(h), wall_clock=0.2)
+        self.assertEqual(result.outcome, phone.GATE_TIMED_OUT)
+        self.assertEqual(h.client.event_types, ["candidate.deferred_pre_disclosure"])
+
 class TestSipDepartureLeavesOtherPathsAlone(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         _Session.wedge_say = True
 
-    async def test_after_consent_durable_no_sip_left_and_assessment_aborted(self):
+    async def test_after_consent_durable_nothing_is_posted(self):
+        """M009 PR-C (R4): after consent_durable a gate drop posts NOTHING.
+
+        It used to post `assessment.aborted`. Neither that nor a worker
+        `sip.participant_left` is truthful here: the server ends the leg via
+        the webhook/reconciliation drop or reclaim + E3 hold + partial-finalize.
+        """
         h = _Harness()
         departed = asyncio.Event()
 
@@ -360,7 +453,8 @@ class TestSipDepartureLeavesOtherPathsAlone(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(_Session.sdk_closes, [])
         self.assertEqual(h.sip_left_logs(), [])
         self.assertNotIn("sip.participant_left", h.client.event_types)
-        self.assertEqual(h.client.event_types.count("assessment.aborted"), 1)
+        self.assertNotIn("assessment.aborted", h.client.event_types)
+        self.assertEqual(h.client.event_types, [])
 
     async def test_lease_halt_cancellation_still_posts_nothing(self):
         h = _Harness()

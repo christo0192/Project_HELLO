@@ -280,14 +280,69 @@ function defaultAuditSink(entry: AuditEntry): void {
  */
 const SYSTEM_ACTOR_ID = '00000000-0000-4000-8000-000000000001';
 
-function auditTarget(entry: AuditEntry): { type: string; id: string } {
+/**
+ * A target_type is a short lower-case resource word: never an id, never free
+ * text. Anything that does not match this is not used as a type.
+ */
+const AUDIT_TARGET_TYPE_RE = /^[a-z][a-z0-9_-]{0,63}$/;
+
+/** Mount prefixes that name a lane, not a resource (`/api/internal/phone`). */
+const AUDIT_TARGET_SKIP_SEGMENTS: ReadonlySet<string> = new Set(['internal', 'integrations']);
+
+/**
+ * A path segment that is an IDENTIFIER rather than a resource word: a UUID, a
+ * bare number, or a long hex run. Where the resource word should be, an id
+ * means the path carries no usable type and the answer falls back to `api`.
+ */
+const AUDIT_TARGET_ID_SEGMENT_RE =
+  /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|\d+|[0-9a-f]{16,})$/i;
+
+/**
+ * The audit row's `target_type` (0114, C10a).
+ *
+ * THE DEFECT. This used to take the SECOND segment of `req.path`, and
+ * `req.path` is MOUNT-RELATIVE inside a router: `/api/phone/halt` arrives as
+ * `/halt`, so the type was `api` (no second segment), `clear` (from
+ * `/halt/clear`), `download`, or a bare UUID from `/:id/...`. Every phone
+ * halt in production was audited as target_type `api` or `clear`.
+ *
+ * Precedence, first match wins:
+ *   1. `metadata.resource` — what the handler SAYS it acted on
+ *      (`phone_control` for /halt). Every route that audits a mutation
+ *      already names it, so this is the common path.
+ *   2. the first path segment after `api`, skipping the lane prefixes
+ *      `internal` and `integrations`; an id in that position is rejected.
+ *   3. `api`.
+ *
+ * Historical rows are NOT backfilled: audit_events is append-only.
+ */
+export function auditTargetType(path: string, resource: unknown): string {
+  if (typeof resource === 'string') {
+    const named = resource.trim().toLowerCase();
+    if (AUDIT_TARGET_TYPE_RE.test(named) && !AUDIT_TARGET_ID_SEGMENT_RE.test(named)) return named;
+  }
+  const segments = path.split('?')[0]!.split('/').filter(Boolean);
+  const apiAt = segments.indexOf('api');
+  if (apiAt !== -1) {
+    for (const raw of segments.slice(apiAt + 1)) {
+      const segment = raw.toLowerCase();
+      if (AUDIT_TARGET_SKIP_SEGMENTS.has(segment)) continue;
+      if (AUDIT_TARGET_ID_SEGMENT_RE.test(segment)) break;
+      if (AUDIT_TARGET_TYPE_RE.test(segment)) return segment;
+      break;
+    }
+  }
+  return 'api';
+}
+
+/** The `{target_type, target_id}` pair an audit entry is written under. */
+export function auditTarget(entry: AuditEntry): { type: string; id: string } {
   const metadata = entry.metadata ?? {};
   const idEntry = Object.entries(metadata).find(
     ([key, value]) => key.endsWith('_id') && typeof value === 'string' && value.length <= 128,
   );
-  const segment = entry.path.split('/').filter(Boolean).at(1) ?? 'api';
   return {
-    type: segment.replace(/[^a-z0-9_-]/gi, '').slice(0, 64) || 'api',
+    type: auditTargetType(entry.path, metadata.resource),
     id: idEntry ? String(idEntry[1]) : entry.path.slice(0, 256),
   };
 }
@@ -364,7 +419,11 @@ export async function recordAudit(
     userId: req.authUser?.id ?? null,
     userRole: req.authUser?.appRole ?? null,
     method: req.method,
-    path: req.path,
+    // FULL path (0114, C10a). Inside a mounted router `req.path` is relative
+    // to the mount (`/halt` for `/api/phone/halt`), which is how target_type
+    // came to read `api` or `clear`. `baseUrl` restores the mount prefix; it
+    // is '' (or absent on a hand-built request) at the app level.
+    path: `${req.baseUrl ?? ''}${req.path ?? ''}`,
     statusCode,
     metadata,
     timestamp: new Date().toISOString(),

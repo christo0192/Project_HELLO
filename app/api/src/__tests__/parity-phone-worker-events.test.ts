@@ -95,6 +95,19 @@ describe('parity-phone-worker-events', () => {
     }
   });
 
+  it('the M009 C1/C2 events are postable on BOTH sides and never purge (0114)', () => {
+    // Named, like the E6 verdicts: a worker that refuses `consent.resumed`
+    // locally leaves every reconnect leg stuck in `dialing` (the 83ce56fb
+    // shape C1 fixes), and one that refuses `callback.deferred_in_call` falls
+    // back to `assessment.aborted`, scoring a call the candidate asked to
+    // continue later. Neither is a purge trigger: both legs keep their audio.
+    for (const event of ['consent.resumed', 'callback.deferred_in_call']) {
+      expect(py.has(event), `${event} missing from phone.py`).toBe(true);
+      expect(WORKER_PHONE_EVENTS, `${event} missing from the route`).toContain(event);
+      expect(PURGE_BEFORE_EVENTS.has(event), `${event} must not purge`).toBe(false);
+    }
+  });
+
   it('the worker still cannot post a PROVIDER verdict (sip.originate_*)', () => {
     for (const set of [[...py], [...WORKER_PHONE_EVENTS]]) {
       expect(set.some((e) => e.startsWith('sip.originate'))).toBe(false);

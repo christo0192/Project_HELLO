@@ -111,10 +111,24 @@ const PRE_ANSWER_ATTEMPT_STATES: ReadonlySet<string> = new Set(['admitted', 'rin
  * `answered_unclassified` or `human` would record a demonstrably ANSWERED call
  * as `no_answer` and charge the anti-harassment budget for it — the candidate
  * would then be re-dialled the next IST day on the strength of a call they had
- * actually picked up. 0042 has no "answered then dropped before disclosure"
- * edge from `dialing`, so the truthful answer is to post nothing and let the
- * reclaimer abandon the attempt when the lease lapses, charging nobody.
+ * actually picked up.
+ *
+ * An ANSWERED `dialing` attempt (`answered_unclassified` / `human`) whose
+ * participant is gone is reported as what it is — the participant left — and
+ * 0114 decides (M009 PR-C, C1). This sweep cannot see whether the leg was a
+ * CONTINUATION of a consented, live, planned session (a reconnect leg whose
+ * `consent.resumed` was not recorded); the ledger can. For such a leg 0114's
+ * drop-race branch charges the reconnect a consented candidate is owed (#19,
+ * #21 budget exhausted, #20 window closed). For any other answered leg 0114
+ * records this `reconciliation` post as `unexpected_event` and changes
+ * nothing, so a pre-consent drop keeps today's path (the worker's own
+ * departure post, else reclaim, charging nobody). Without this mapping the
+ * drop-race branch had no production producer: the webhook is not delivered in
+ * production, and the worker posts no drop after consent (R4). `machine` keeps
+ * null: a classified machine has no conversation to continue.
  */
+const ANSWERED_ATTEMPT_STATES: ReadonlySet<string> = new Set(['answered_unclassified', 'human']);
+
 export function recoveredEventType(
   engagementState: string,
   attemptState: string,
@@ -122,6 +136,9 @@ export function recoveredEventType(
   if (engagementState === 'in_call') return 'sip.participant_left';
   if (engagementState === 'dialing' && PRE_ANSWER_ATTEMPT_STATES.has(attemptState)) {
     return 'sip.originate_timeout';
+  }
+  if (engagementState === 'dialing' && ANSWERED_ATTEMPT_STATES.has(attemptState)) {
+    return 'sip.participant_left';
   }
   return null;
 }

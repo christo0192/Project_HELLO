@@ -385,6 +385,9 @@ describe('the env contract holds in BOTH directions', () => {
     // D1 partial-finalize grace (reconnect window before a disconnected
     // session is scored + finalized), read in `lib/phone-runtime/config.ts`.
     'PHONE_PARTIAL_FINALIZE_GRACE_SEC',
+    // 0114 (C10d) due-loop starvation alert threshold, read in
+    // `lib/phone-runtime/config.ts`. An alerting bound, not a switch.
+    'PHONE_DUE_STARVATION_ALERT_SEC',
   ];
 
   it('every variable is declared, exampled, and read', () => {

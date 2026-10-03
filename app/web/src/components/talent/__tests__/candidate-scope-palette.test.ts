@@ -44,6 +44,8 @@ const CANDIDATE_SCOPE_SOURCES = [
   'src/components/talent/CandidateHeadlineFacts.tsx',
   'src/components/talent/AshbyWorkflowCard.tsx',
   'src/components/talent/TranscriptionSyncWorkspace.tsx',
+  // C3 (0114): the evidence-hold banner renders inside the Review tab.
+  'src/components/talent/EvidenceHoldNotice.tsx',
   'src/components/talent/Tabs.tsx',
   'src/components/talent/RecordingPlayer.tsx',
   'src/components/talent/SeekableTranscript.tsx',

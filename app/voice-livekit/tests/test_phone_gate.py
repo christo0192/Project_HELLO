@@ -553,6 +553,32 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+async def _await_native_preloop(
+    session, task, bound_sec: float = 1.0, settle_sec: float = 0.05,
+) -> None:
+    """Let a harness call finish its pre-loop (role opening, Q1) before `close`.
+
+    M009 C4: the pre-loop now honours `close_event` — a close that lands before
+    the role opening or Q1 is a (non-terminal) disconnect, because on a real
+    AgentSession a closed session cannot speak. The session harnesses end a fake
+    call by firing `close` a few milliseconds in, which in practice landed
+    BEFORE the pre-loop (it was ignored there, and the scripted Q&A then beat
+    the silence loop's close check). So: wait for the coordinator's
+    `_native_preloop_done` seam, then give the scripted conversation a short
+    settle window to end on its own; the caller fires `close` only if it is
+    still running. Bounded throughout, and returns at once if the call ended
+    (or never reached screening) by itself.
+    """
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + bound_sec
+    while loop.time() < deadline and not task.done():
+        done = getattr(getattr(session, 'agent', None), '_native_preloop_done', None)
+        if done is not None and done.is_set():
+            await asyncio.wait({task}, timeout=settle_sec)
+            return
+        await asyncio.sleep(0.002)
+
+
 # ── Room classification ───────────────────────────────────────────────
 
 class TestRoomClassification(unittest.TestCase):
@@ -2283,6 +2309,368 @@ class TestPhoneParity2Gate(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.assessment_allowed)
         self.assertIn(phone.PHONE_DISCLOSURE_TEXT, recorder.spoken)
         self.assertTrue(classified["ran"])
+
+
+class _ResumeScriptClient(_AtomicEventClient):
+    """Per-event SEQUENCES of outcomes (the base client scripts one per type).
+
+    Each entry is a `PhoneApiOutcome`, an Exception to raise, or the string
+    "hang" (the post never returns inside any sane bound). An exhausted or
+    unscripted type answers `applied`, like the base client.
+    """
+
+    def __init__(self, script=None, **kwargs):
+        super().__init__(**kwargs)
+        self._script = {k: list(v) for k, v in (script or {}).items()}
+
+    async def post_event(self, attempt_id, event_type, *, epoch=None, session_id=None,
+                         recording_discarded=False):
+        self.discard_flags.append((event_type, bool(recording_discarded)))
+        self.timeline.append(f"event:{event_type}")
+        self.calls.append((attempt_id, event_type, {"epoch": epoch, "session_id": session_id}))
+        queue = self._script.get(event_type)
+        if queue:
+            item = queue.pop(0)
+            if item == "hang":
+                await asyncio.sleep(30)
+            elif isinstance(item, Exception):
+                raise item
+            else:
+                return item
+        return phone.PhoneApiOutcome(True, phone.EVENT_STATUS_APPLIED)
+
+
+def _ignored(reason, *, duplicate=False):
+    return phone.PhoneApiOutcome(
+        False, "ignored", ignored_reason=reason, duplicate=duplicate,
+    )
+
+
+def _failed(category):
+    return phone.PhoneApiOutcome(False, error_category=category)
+
+
+class TestConsentResumedContinuation(unittest.IsolatedAsyncioTestCase):
+    """M009 C1 (W1): a re-entry into a consented session posts `consent.resumed`.
+
+    Prod 83ce56fb / e6bc7f18 / fd9b54f0: every applied resumed leg stayed
+    `dialing` because the durable short-circuit posted nothing, so its
+    completion was `unexpected_event` and its drop `abandoned_pre_disclosure`.
+    0114's R1 edge needs this one worker post. The list mirrors RESEARCH C1
+    worker steps 1-4:
+
+      (1) call.answered confirmed -> consent.resumed posted ONCE, after it, with
+          the session hint and NO epoch; phase `consent_resumed`.
+      (2) call.answered unconfirmed -> re-posted ONCE; still unconfirmed ->
+          consent.resumed is NOT posted (its deterministic id must not be burned
+          as unexpected_event), `consent_resume_unrecorded`, fail open.
+      (3) terminal / stale_epoch / unknown_attempt -> assessment_allowed False,
+          nothing further posted.
+      (4) unexpected_event / 4xx -> fail open, never re-posted.
+      (5) transport / timeout -> at most 2 tries, then fail open; bounded.
+      (6) the non-durable gate never posts it, and the answer-seam path posts it
+          only after the backgrounded call.answered landed.
+    """
+
+    def setUp(self):
+        patcher = patch.dict(os.environ, {"PHONE_CONSENT_RESUME_TRY_TIMEOUT_SEC": "0.2"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _consented_state(self):
+        payload = _plan_payload(cursor=1, completed=["k1"])
+        payload["gate_recorded"] = True
+        return phone.PhoneAssessmentState.parse(payload)
+
+    async def _gate(self, client, *, durable=None, post_call_answered=True, **extra):
+        recorder = Recorder()
+        phases: dict = {}
+        durable = durable if durable is not None else self._consented_state()
+
+        async def wait_for_participant():
+            return _participant()
+
+        async def classify():
+            return phone.CLASSIFY_HUMAN
+
+        async def fetch_durable_consent():
+            return durable
+
+        result = await phone.run_phone_gate(
+            attempt_id=_ATTEMPT_ID,
+            client=client,
+            wait_for_participant=wait_for_participant,
+            classify=classify,
+            say=recorder.say,
+            start_recording=recorder.start_recording,
+            classify_timeout_sec=0.05,
+            session_id=_SESSION_ID,
+            epoch=_EPOCH,
+            post_call_answered=post_call_answered,
+            consent_reply_out=[],
+            fetch_durable_consent=fetch_durable_consent,
+            gate_phase_out=phases,
+            **extra,
+        )
+        return result, recorder, phases
+
+    @staticmethod
+    def _posts(client, event_type):
+        return [kw for _a, ev, kw in client.calls if ev == event_type]
+
+    # (1)
+    async def test_applied_continuation_posts_consent_resumed_once_after_the_answer(self):
+        client = _ResumeScriptClient()
+        result, recorder, phases = await self._gate(client)
+        self.assertTrue(result.assessment_allowed)
+        self.assertTrue(result.recording_allowed)
+        self.assertEqual(
+            client.event_types, ["call.answered", phone.CONSENT_RESUMED_EVENT],
+        )
+        resumed = self._posts(client, phone.CONSENT_RESUMED_EVENT)
+        self.assertEqual(len(resumed), 1)
+        # The session hint rides; the epoch does NOT (the ledger uses the
+        # current one, so a dispatch epoch can never make it stale).
+        self.assertIsNone(resumed[0]["epoch"])
+        self.assertEqual(resumed[0]["session_id"], _SESSION_ID)
+        self.assertIn(phone.CONSENT_RESUMED_EVENT, result.events)
+        self.assertTrue(phases.get("consent_resumed"))
+        self.assertTrue(phases.get("consent_durable"))
+        # Still a re-entry: nothing spoken, no consent RPC, no recording start.
+        self.assertEqual(recorder.spoken, [])
+        self.assertEqual(client.consent_calls, [])
+        self.assertEqual(recorder.recording_calls, 0)
+
+    async def test_a_duplicate_applied_verdict_is_a_continuation_too(self):
+        client = _ResumeScriptClient(script={
+            phone.CONSENT_RESUMED_EVENT: [
+                phone.PhoneApiOutcome(True, phone.EVENT_STATUS_APPLIED, duplicate=True),
+            ],
+        })
+        result, _, phases = await self._gate(client)
+        self.assertTrue(result.assessment_allowed)
+        self.assertTrue(phases.get("consent_resumed"))
+        self.assertEqual(len(self._posts(client, phone.CONSENT_RESUMED_EVENT)), 1)
+
+    # (2)
+    async def test_unconfirmed_answer_is_reposted_once_then_resume_is_skipped(self):
+        client = _ResumeScriptClient(script={
+            "call.answered": [_ignored("unexpected_event"), _ignored("unexpected_event")],
+        })
+        with patch.object(phone, "_log") as log:
+            result, _, phases = await self._gate(client)
+        # Fail OPEN: today's resumed screening.
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(len(self._posts(client, "call.answered")), 2)
+        self.assertEqual(self._posts(client, phone.CONSENT_RESUMED_EVENT), [])
+        self.assertNotIn("consent_resumed", phases)
+        categories = [c.kwargs.get("error_category") for c in log.warn.call_args_list]
+        self.assertIn("consent_resume_unrecorded", categories)
+
+    async def test_a_repost_that_confirms_the_answer_lets_the_resume_proceed(self):
+        client = _ResumeScriptClient(script={
+            "call.answered": [_failed("transport")],
+        })
+        result, _, phases = await self._gate(client)
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(
+            client.event_types,
+            ["call.answered", "call.answered", phone.CONSENT_RESUMED_EVENT],
+        )
+        self.assertTrue(phases.get("answered"))
+        self.assertTrue(phases.get("consent_resumed"))
+
+    async def test_a_legacy_caller_without_call_answered_confirms_it_first(self):
+        # post_call_answered=False never posts it in the gate; the attempt must
+        # still be answered before R1 can accept the resume.
+        client = _ResumeScriptClient()
+        result, _, _ = await self._gate(client, post_call_answered=False)
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(
+            client.event_types, ["call.answered", phone.CONSENT_RESUMED_EVENT],
+        )
+
+    # (3)
+    async def test_a_leg_the_ledger_says_is_over_ends_with_nothing_further(self):
+        for reason in ("terminal", "stale_epoch", "unknown_attempt"):
+            for duplicate in (False, True):
+                with self.subTest(reason=reason, duplicate=duplicate):
+                    client = _ResumeScriptClient(script={
+                        phone.CONSENT_RESUMED_EVENT: [_ignored(reason, duplicate=duplicate)],
+                    })
+                    result, recorder, phases = await self._gate(client)
+                    self.assertEqual(result.outcome, phone.CLASSIFY_HUMAN)
+                    self.assertFalse(result.assessment_allowed)
+                    self.assertFalse(result.recording_allowed)
+                    # Exactly one try: a verdict is never re-posted.
+                    self.assertEqual(
+                        client.event_types,
+                        ["call.answered", phone.CONSENT_RESUMED_EVENT],
+                    )
+                    self.assertNotIn(phone.CONSENT_RESUMED_EVENT, result.events)
+                    self.assertNotIn("consent_resumed", phases)
+                    self.assertTrue(phases.get("consent_resume_refused"))
+                    self.assertEqual(recorder.spoken, [])
+
+    # (4)
+    async def test_unexpected_event_and_4xx_fail_open_without_a_retry(self):
+        for outcome in (
+            _ignored("unexpected_event"),
+            _failed("business_error"),
+            _failed("event_not_allowed"),
+            _failed("configuration"),
+        ):
+            with self.subTest(outcome=repr(outcome)):
+                client = _ResumeScriptClient(script={
+                    phone.CONSENT_RESUMED_EVENT: [outcome],
+                })
+                result, _, phases = await self._gate(client)
+                self.assertTrue(result.assessment_allowed)
+                self.assertTrue(result.recording_allowed)
+                self.assertEqual(len(self._posts(client, phone.CONSENT_RESUMED_EVENT)), 1)
+                self.assertNotIn("consent_resumed", phases)
+
+    # (5)
+    async def test_transport_failures_get_exactly_two_tries_then_fail_open(self):
+        client = _ResumeScriptClient(script={
+            phone.CONSENT_RESUMED_EVENT: [
+                _failed("transport"), RuntimeError("boom"), _failed("transport"),
+            ],
+        })
+        result, _, phases = await self._gate(client)
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(len(self._posts(client, phone.CONSENT_RESUMED_EVENT)), 2)
+        self.assertNotIn("consent_resumed", phases)
+
+    async def test_a_transport_blip_then_applied_is_a_continuation(self):
+        client = _ResumeScriptClient(script={
+            phone.CONSENT_RESUMED_EVENT: [_failed("malformed_response")],
+        })
+        result, _, phases = await self._gate(client)
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(len(self._posts(client, phone.CONSENT_RESUMED_EVENT)), 2)
+        self.assertTrue(phases.get("consent_resumed"))
+
+    async def test_a_hanging_api_is_BOUNDED_on_the_wall_clock(self):
+        # The answer re-post and both resume tries hang. Each is bounded by the
+        # 0.2 s env, so the whole re-entry costs < 1 s here (production default
+        # 1.5 s/try) instead of the 10-30 s event timeout. (The gate's own
+        # inline call.answered is the pre-existing post, bounded by the client.)
+        import time as _time
+        client = _ResumeScriptClient(script={
+            "call.answered": [_ignored("unexpected_event"), "hang"],
+            phone.CONSENT_RESUMED_EVENT: ["hang", "hang"],
+        })
+        start = _time.monotonic()
+        result, _, _ = await self._gate(client)
+        elapsed = _time.monotonic() - start
+        self.assertTrue(result.assessment_allowed)
+        self.assertLess(elapsed, 1.5)
+        # The answer never confirmed, so the resume was never attempted.
+        self.assertEqual(self._posts(client, phone.CONSENT_RESUMED_EVENT), [])
+
+        client = _ResumeScriptClient(script={
+            phone.CONSENT_RESUMED_EVENT: ["hang", "hang"],
+        })
+        start = _time.monotonic()
+        result, _, phases = await self._gate(client)
+        elapsed = _time.monotonic() - start
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(len(self._posts(client, phone.CONSENT_RESUMED_EVENT)), 2)
+        self.assertNotIn("consent_resumed", phases)
+        self.assertLess(elapsed, 1.0)
+
+    # (6)
+    async def test_a_fresh_call_never_posts_consent_resumed(self):
+        client = _ResumeScriptClient()
+        result, _, _ = await self._gate(client, durable=_default_state())
+        self.assertTrue(result.assessment_allowed)
+        self.assertNotIn(phone.CONSENT_RESUMED_EVENT, client.event_types)
+        # The full gate ran: the atomic consent/start RPC recorded consent.
+        self.assertEqual(len(client.consent_calls), 1)
+
+    async def test_answer_seam_resume_waits_for_the_backgrounded_answer(self):
+        answered_gate = asyncio.Event()
+
+        class _SlowAnswer(_ResumeScriptClient):
+            async def post_event(self, attempt_id, event_type, **kw):
+                if event_type == "call.answered":
+                    await answered_gate.wait()
+                return await super().post_event(attempt_id, event_type, **kw)
+
+        client = _SlowAnswer()
+
+        async def wait_for_answer():
+            return phone.ANSWER_VERDICT_ANSWERED
+
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.05, answered_gate.set)
+        result, _, phases = await self._gate(client, wait_for_answer=wait_for_answer)
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(
+            client.event_types, ["call.answered", phone.CONSENT_RESUMED_EVENT],
+        )
+        self.assertTrue(phases.get("answer_observed"))
+        self.assertTrue(phases.get("consent_resumed"))
+
+    def test_the_try_timeout_is_bounded_and_independent(self):
+        cases = {None: 1.5, "": 1.5, "junk": 1.5, "0": 0.2, "0.05": 0.2,
+                 "2.5": 2.5, "60": 5.0, "nan": 1.5}
+        for raw, expected in cases.items():
+            env = {"PHONE_EVENT_TIMEOUT_SEC": "45"}
+            with self.subTest(raw=raw), patch.dict(os.environ, env):
+                if raw is None:
+                    os.environ.pop("PHONE_CONSENT_RESUME_TRY_TIMEOUT_SEC", None)
+                else:
+                    os.environ["PHONE_CONSENT_RESUME_TRY_TIMEOUT_SEC"] = raw
+                self.assertEqual(phone.phone_consent_resume_try_timeout_sec(), expected)
+
+    def test_consent_resumed_is_on_the_worker_allowlist(self):
+        self.assertIn(phone.CONSENT_RESUMED_EVENT, phone.PHONE_WORKER_EVENTS)
+
+    async def test_a_refused_resume_closes_the_room_and_posts_NO_terminal(self):
+        # End to end through `_run_phone_session`: the teardown must read the
+        # refusal as "nothing to post" (not consent.failed, not aborted).
+        consented = self._consented_state()
+
+        class _Reentry(_ResumeScriptClient):
+            async def fetch_assessment_state(self, session_id):
+                return consented
+
+        client = _Reentry(script={
+            phone.CONSENT_RESUMED_EVENT: [_ignored("terminal")],
+        })
+        ctx = FakeCtx(_PHONE_ROOM, participants=[_participant()])
+
+        async def recording_seam():
+            return None
+
+        async def classifier(turns, say):
+            return phone.CLASSIFY_HUMAN
+
+        _FakePhoneSession.instances = []
+        _FakePhoneSession.default_answers = []
+        with patch.object(agent_mod, "AgentSession", _FakePhoneSession), \
+             patch.object(agent_mod, "persistence", MagicMock()), \
+             patch.object(
+                 agent_mod, "_delete_livekit_room", new_callable=AsyncMock,
+             ) as delete, \
+             patch.object(
+                 agent_mod, "_phone_recording_permitted", new=recording_seam), \
+             patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC", _HARNESS_RESIDENCY_SEC):
+            result = await asyncio.wait_for(
+                agent_mod._run_phone_session(
+                    ctx, _PHONE_ROOM, _ATTEMPT_ID, _EPOCH,
+                    client=client, classifier=classifier,
+                ),
+                timeout=10,
+            )
+        self.assertFalse(result.assessment_allowed)
+        self.assertEqual(
+            client.event_types, ["call.answered", phone.CONSENT_RESUMED_EVENT],
+        )
+        self.assertEqual(client.assessment_calls, [])
+        delete.assert_awaited()
 
 
 class _noop_ctx:
@@ -4112,6 +4500,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
                     handler(types.SimpleNamespace(old_state="active", new_state="away"))
                     await asyncio.sleep(0.01)
             if close_after and session is not None and session.start_calls:
+                await _await_native_preloop(session, task)
                 session.emit_close()
             result = await asyncio.wait_for(task, timeout=5)
         return result, client, recording, delete, session, persistence_spy
@@ -4763,12 +5152,14 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(first[0]["text"].startswith(phone.INTERRUPTED_QUESTION_PREFIX))
         self.assertEqual(client.committed_keys.count("k1"), 1)
 
-    async def test_an_UNSCORED_completion_falls_back_to_the_truthful_aborted(self):
+    async def test_an_UNSCORED_completion_posts_nothing(self):
         """Scoring succeeding is not the same as an assessment existing.
 
-        When the completion endpoint refuses — for any reason — nothing may
-        claim a completed screening, and `assessment.aborted` is the truthful
-        terminal: the conversation happened and produced nothing scorable.
+        When the completion endpoint refuses, nothing may claim a completed
+        screening. M009 PR-C (C2-P2): it no longer posts `assessment.aborted`
+        either. A non-score verdict is an infrastructure fault on a finished
+        conversation; the abort failed the engagement while the session was
+        still scoreable. Reclaim + E3 hold + partial-finalize own the leg now.
         """
         client = FakeEventClient(
             complete=phone.PhoneApiOutcome(False, "scoring_failed"),
@@ -4776,14 +5167,40 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         _, client, _, _, session, _ = await self._run_session(
             answers=("Yes, that's fine.",), client=client
         )
-        self.assertIn("assessment.aborted", client.event_types)
+        self.assertNotIn("assessment.aborted", client.event_types)
         self.assertNotIn("assessment.completed", client.event_types)
+        self.assertNotIn("callback.deferred_in_call", client.event_types)
         # The boundaries still committed, so the transcript is durable and the
-        # session is scorable — but note what this does NOT claim: the
-        # engagement is now terminal `failed`, and re-scoring it later produces
-        # an assessment and a scorecard while leaving that terminal state
-        # where it is. There is no path back to `completed`. See the runbook.
+        # session stays scorable by the partial path.
         self.assertEqual(client.committed_keys, ["k1", "k2"])
+
+    async def test_every_non_score_verdict_posts_nothing_and_logs_its_code(self):
+        """M009 PR-C (C2-P2): the five non-score completion verdicts are
+        infrastructure faults on a finished conversation. Each posts NOTHING
+        (it used to post `assessment.aborted`) and logs a fixed
+        `completion_verdict_<status>` code."""
+        for status in (
+            "plan_incomplete", "completion_failed", "session_not_active",
+            "assessment_missing", "scoring_failed",
+        ):
+            with self.subTest(status=status):
+                spy = MagicMock(wraps=agent_mod._log)
+                with patch.object(agent_mod, "_log", spy):
+                    _, client, _, _, _, _ = await self._run_session(
+                        answers=("Yes, that's fine.",),
+                        client=FakeEventClient(
+                            complete=phone.PhoneApiOutcome(False, status),
+                        ),
+                    )
+                for event_type in (
+                    "assessment.aborted", "assessment.completed",
+                    "callback.deferred_in_call", "sip.participant_left",
+                ):
+                    self.assertNotIn(event_type, client.event_types)
+                categories = [
+                    c.kwargs.get("error_category") for c in spy.warn.call_args_list
+                ]
+                self.assertIn(f"completion_verdict_{status}", categories)
 
     async def test_the_exact_role_is_SPOKEN_at_the_top_of_the_screening(self):
         """F1 (call 24): the opening was generic and the model later hallucinated
@@ -7676,6 +8093,7 @@ class TestNumberNeverCarried(unittest.IsolatedAsyncioTestCase):
             )
             await asyncio.sleep(0.01)
             session = _FakePhoneSession.instances[-1]
+            await _await_native_preloop(session, task)
             session.emit_close()
             await asyncio.wait_for(task, timeout=5)
 
@@ -14302,6 +14720,7 @@ class TestSilentRoomKillGuard(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
             session = _FakePhoneSession.instances[-1] if _FakePhoneSession.instances else None
             if session is not None and session.start_calls:
+                await _await_native_preloop(session, task)
                 session.emit_close()
             await asyncio.wait_for(task, timeout=5)
         return client, delete, session, spy
@@ -14467,6 +14886,7 @@ class TestSilentRoomKillGuard(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
             session = _FakePhoneSession.instances[-1]
             # The leg drops: the close event fires while the loop is waiting.
+            await _await_native_preloop(session, task)
             session.emit_close()
             await asyncio.wait_for(task, timeout=5)
         # NON-TERMINAL: neither terminal event is posted for a disconnect.
@@ -14871,11 +15291,16 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
             datetime(2026, 9, 2, 6, 0, tzinfo=timezone.utc),
         ))
         self.assertTrue(decision.terminal)
+        # M009 PR-C (C2): the explained deferral ends HALT_CALLBACK_DEFERRED,
+        # which posts `callback.deferred_in_call` — still a POSTING terminal,
+        # never the post-nothing retryable family.
+        self.assertNotIn(phone.HALT_CALLBACK_DEFERRED, phone.RETRYABLE_HALTS)
         self.assertEqual(
-            decision.terminal_reason, phone.HALT_CANDIDATE_ENDED,
-            "an explained refusal must still post the candidate-ended "
-            "terminal; a retryable halt posts nothing at all",
+            decision.terminal_reason, phone.HALT_CALLBACK_DEFERRED,
+            "an explained refusal must still post the deferral terminal; a "
+            "retryable halt posts nothing at all",
         )
+        self.assertEqual(decision.sub_reason, "retime_spent")
 
     def test_the_refusal_vocabulary_has_a_line_for_every_retryable_status(self):
         """A retryable status with no written line would speak the generic
@@ -15051,8 +15476,106 @@ class TestToollessGovernedActions(unittest.IsolatedAsyncioTestCase):
         with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 0.05), \
              patch.object(agent_mod, "PHONE_FAREWELL_PLAYOUT_FLOOR_SEC", 0.05):
             await hooks["drive_terminal"]()
-        self.assertIn("assessment.aborted", client.event_types)
+        # M009 PR-C (C2): the deferral posts `callback.deferred_in_call`
+        # exactly once and NEVER `assessment.aborted`.
+        self.assertEqual(client.event_types.count("callback.deferred_in_call"), 1)
+        self.assertNotIn("assessment.aborted", client.event_types)
 
+
+class _AlwaysValidUnconfirmableClient(FakeEventClient):
+    """Every proposal is valid; every confirm fails with no status (a
+    transport failure) -> HALT_CALLBACK_RECOVERY."""
+
+    async def propose_callback(self, attempt_id, starts_at):
+        self.propose_calls.append((attempt_id, starts_at))
+        return phone.PhoneApiOutcome(True, "proposal_valid"), None
+
+    async def confirm_callback(self, attempt_id, starts_at):
+        self.confirm_calls.append((attempt_id, starts_at))
+        return phone.PhoneApiOutcome(False, None, error_category="transport_error")
+
+
+class TestCallbackDeferralDispatch(unittest.IsolatedAsyncioTestCase):
+    """M009 PR-C (C2-P1): the dispatcher's HALT_CALLBACK_DEFERRED branch."""
+
+    _NO_TIME = (
+        "Can you call me back later? Now is not a good time.",
+        "Uh, I'm not sure, whenever.",
+    )
+
+    async def _drive(self, client, texts):
+        agent, session, state, client, hooks = await _make_native_coordinator(
+            turn_mode="toolless", client=client,
+        )
+        on_turn = hooks["on_native_turn"]
+        for text in texts:
+            await on_turn(
+                text, types.SimpleNamespace(text_content=text),
+                types.SimpleNamespace(items=[]),
+            )
+        with patch.object(agent_mod, "PHONE_TERMINAL_REPLY_TIMEOUT_SEC", 0.05), \
+             patch.object(agent_mod, "PHONE_FAREWELL_PLAYOUT_FLOOR_SEC", 0.05):
+            await hooks["drive_terminal"]()
+        return client, hooks
+
+    @staticmethod
+    def _categories(spy, level, error_type):
+        return [
+            c.kwargs.get("error_category")
+            for c in getattr(spy, level).call_args_list
+            if c.kwargs.get("error_type") == error_type
+        ]
+
+    async def test_a_deferral_posts_callback_deferred_in_call_exactly_once(self):
+        client, hooks = await self._drive(FakeEventClient(), self._NO_TIME)
+        self.assertEqual(client.event_types.count("callback.deferred_in_call"), 1)
+        for event_type in (
+            "assessment.aborted", "assessment.completed", "sip.participant_left",
+        ):
+            self.assertNotIn(event_type, client.event_types)
+        self.assertIn(
+            "callback_deferred",
+            self._categories(hooks["log"], "info", "phone_room_teardown"),
+        )
+        self.assertEqual(
+            self._categories(hooks["log"], "warn", "phone_callback_deferred"), [],
+        )
+
+    async def test_a_deferral_that_is_not_applied_posts_nothing_more(self):
+        client = FakeEventClient(outcomes={
+            "callback.deferred_in_call": phone.PhoneApiOutcome(
+                False, "ignored", ignored_reason="terminal",
+            ),
+        })
+        client, hooks = await self._drive(client, self._NO_TIME)
+        self.assertEqual(client.event_types, ["callback.deferred_in_call"])
+        self.assertIn(
+            "deferral_not_applied",
+            self._categories(hooks["log"], "warn", "phone_callback_deferred"),
+        )
+
+    async def test_callback_recovery_still_posts_nothing(self):
+        text = "Can you call me back tomorrow at 4 pm?"
+        self.assertEqual(phone.candidate_turn_route(text), "callback_deferral")
+        client, hooks = await self._drive(_AlwaysValidUnconfirmableClient(), (text,))
+        self.assertEqual(len(client.confirm_calls), 1)
+        self.assertEqual(client.event_types, [])
+        self.assertIn(
+            "callback_recovery_required",
+            self._categories(hooks["log"], "info", "phone_room_teardown"),
+        )
+
+    async def test_an_explicit_end_call_still_posts_aborted(self):
+        client, _ = await self._drive(
+            FakeEventClient(), ("Please end the call now.",),
+        )
+        self.assertEqual(client.event_types.count("assessment.aborted"), 1)
+        self.assertNotIn("callback.deferred_in_call", client.event_types)
+
+    def test_the_teardown_label_is_bounded(self):
+        self.assertEqual(
+            agent_mod._teardown_label(phone.HALT_CALLBACK_DEFERRED), "callback_deferred",
+        )
 
 class TestTheFlowCANNOTLoop(unittest.IsolatedAsyncioTestCase):
     """The rank guards, tested by BEHAVIOUR instead of by their lookup table.
@@ -15225,9 +15748,10 @@ class TestTheFlowCANNOTLoop(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(decision.terminal)
         self.assertFalse(decision.booked, "a refusal must never look like a booking")
         self.assertEqual(
-            decision.terminal_reason, phone.HALT_CANDIDATE_ENDED,
+            decision.terminal_reason, phone.HALT_CALLBACK_DEFERRED,
             "a candidate-fixable refusal is not an infrastructure failure",
         )
+        self.assertEqual(decision.sub_reason, "confirm_refusal_spent")
         self.assertEqual(
             decision.spoken,
             phone.schedule_terminal_deferral_text("daily_attempt_exists"),

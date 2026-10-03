@@ -215,7 +215,9 @@ begin
   -- ── 8. The WHOLE order, every ordered pair ────────────────────────────
   for v_i in 1..5 loop
     for v_j in 1..5 loop
-      perform screening_v2.clear_phone_halt(null, t0 + interval '20 minutes');
+      -- 0114: a NULL-actor clear is refused actor_required; the drill sentinel
+      -- keeps every clear attributable.
+      perform screening_v2.clear_phone_halt('00000000-0000-4000-8000-0000000000d1', t0 + interval '20 minutes');
       perform screening_v2.set_phone_halt(v_order[v_i], v_ga, t0 + interval '21 minutes');
       v_res := screening_v2.set_phone_halt(v_order[v_j], v_gb, t0 + interval '22 minutes');
       v_want := v_order[greatest(v_i, v_j)];

@@ -266,13 +266,20 @@ class TestPhoneEvidenceTeardown(unittest.IsolatedAsyncioTestCase):
             client.timeline,
         )
 
-    async def test_post_consent_exception_posts_aborted_before_room_close(self):
+    async def test_post_consent_exception_posts_nothing_before_room_close(self):
+        """M009 PR-C (R4): a post-consent exception posts NO terminal.
+
+        It used to post `assessment.aborted`. The server ends the leg instead
+        (webhook/reconciliation drop, or reclaim + E3 hold + partial-finalize).
+        """
         client = fixtures.FakeEventClient(start=RuntimeError("screen failed"))
         with self.assertRaisesRegex(RuntimeError, "screen failed"):
             await self._run_session(
                 client=client, answers=("Yes, that's fine.",), close_after=False,
             )
-        self.assertIn("assessment.aborted", client.event_types)
+        self.assertNotIn("assessment.aborted", client.event_types)
+        self.assertNotIn("sip.participant_left", client.event_types)
+        self.assertNotIn("consent.failed", client.event_types)
         self.assertNotIn("assessment.completed", client.event_types)
 
     async def test_gate_wrong_number_latches_privacy_before_terminal_api_failure(self):

@@ -13884,13 +13884,21 @@ begin
   v_result := screening_v2.request_phone_rescreen(
     v_candidate, 'technical_issue', 'policy-rescreen-1', 'hr_manual', v_actor, v_t);
   v_second := (v_result->>'engagement_id')::uuid;
+  -- 0114 C6: tightened. `pending_prereqs` alone was vacuous: it also holds
+  -- when the evaluator never ran (the #145 prod drift). This fixture has no
+  -- job mapping, so a body that RAN ensure leaves exactly mapping_not_enabled
+  -- (and reports it as prerequisite_status); one that did not leaves
+  -- rescreen_requested.
   perform _policy_tests.assert(
-    '0057-G1: explicit request creates cycle 2 and no dial work',
+    '0057-G1: explicit request creates cycle 2, runs the evaluator, and no dial work',
     v_result->>'status' = 'ok'
       and (v_result->>'cycle_number')::integer = 2
+      and v_result->>'prerequisite_status' = 'mapping_not_enabled'
       and exists (select 1 from screening_v2.phone_engagements
                   where id = v_second and cycle_number = 2
-                    and state = 'pending_prereqs' and no_answer_limit = 1)
+                    and state = 'pending_prereqs'
+                    and state_reason = 'mapping_not_enabled'
+                    and no_answer_limit = 1)
       and not exists (select 1 from screening_v2.phone_call_attempts where engagement_id = v_second)
       and not exists (select 1 from screening_v2.job_queue
                       where payload->>'attemptId' in
@@ -17166,6 +17174,3884 @@ begin
   perform _policy_tests.p113_teardown('pol113-e4-rep-term');
 end;
 $$;
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0114 — phone outcome integrity (M009 / S03, PR-C)
+-- ═══════════════════════════════════════════════════════════════════════
+-- One block per 0114 section. Each block is filled ONLY by the task that
+-- owns that section, strictly between its BEGIN/END markers (S03-PLAN ground
+-- rule 2). Every block must leave no fixture behind and must leave the phone
+-- kill switch UNHALTED: the C0 assertion after §8 re-checks the 0042
+-- suite-end invariant once every 0114 block has run, so it stays the last
+-- phone assertion before the verdict.
+
+-- ==== 0114-§1 BEGIN ====
+-- §1 (C0): both CHECKs re-created by 0114, validated, additive.
+select _policy_tests.assert(
+  '0114-§1: chk_phone_call_attempts_outcome is VALIDATED and admits callback_deferred plus every 0095 member',
+  coalesce((
+    select c.convalidated
+       and pg_get_constraintdef(c.oid) like '%''callback_deferred''%'
+       and pg_get_constraintdef(c.oid) like '%''consent_failed''%'
+       and pg_get_constraintdef(c.oid) like '%''abandoned_pre_disclosure''%'
+       and pg_get_constraintdef(c.oid) like '%''declined''%'
+       and pg_get_constraintdef(c.oid) like '%''window_closed''%'
+      from pg_constraint c
+     where c.conrelid = 'screening_v2.phone_call_attempts'::regclass
+       and c.conname = 'chk_phone_call_attempts_outcome'), false),
+  'the outcome CHECK is missing, NOT VALID, or lost a member (0114 §1a)');
+
+select _policy_tests.assert(
+  '0114-§1: chk_audit_action is VALIDATED and keeps the 0102 tail',
+  coalesce((
+    select c.convalidated
+       and pg_get_constraintdef(c.oid) like '%''resource_generate''%'
+       and pg_get_constraintdef(c.oid) like '%''ashby_ingestion_midflight_resume''%'
+       and pg_get_constraintdef(c.oid) like '%''phone_suppression_released''%'
+       and pg_get_constraintdef(c.oid) like '%''phone_callback_recovery_required''%'
+       and pg_get_constraintdef(c.oid) like '%''invite_sent''%'
+      from pg_constraint c
+     where c.conrelid = 'screening_v2.audit_events'::regclass
+       and c.conname = 'chk_audit_action'), false),
+  'the audit CHECK is missing, NOT VALID, or lost a 0097/0102 member (0114 §1b)');
+
+-- Behaviour, with no residue: each probe inserts inside a subtransaction and
+-- then raises a sentinel, so the row is rolled back. Reaching the sentinel
+-- proves the CHECK admitted the action; a check_violation proves it refused.
+do $$
+declare
+  v_action text;
+  v_admitted text := '';
+  v_refused  text := '';
+  v_bogus_refused boolean := false;
+begin
+  foreach v_action in array array[
+    'phone_engagement_late_completed', 'phone_scheduled_engagement_released',
+    'phone_identity_hold_release', 'phone_due_starved'] loop
+    begin
+      insert into screening_v2.audit_events
+        (actor_id, actor_type, action, target_type, target_id, result, metadata)
+      values ('00000000-0000-0000-0000-000000000000'::uuid, 'system',
+              v_action, 'phone_engagement', 'pol114-s1-probe', 'success', '{}'::jsonb);
+      raise exception 'pol114_probe_rollback';
+    exception
+      when check_violation then v_refused := v_refused || v_action || ' ';
+      when others then
+        if sqlerrm = 'pol114_probe_rollback' then
+          v_admitted := v_admitted || v_action || ' ';
+        else
+          v_refused := v_refused || v_action || '(' || sqlstate || ') ';
+        end if;
+    end;
+  end loop;
+
+  begin
+    insert into screening_v2.audit_events
+      (actor_id, actor_type, action, target_type, target_id, result, metadata)
+    values ('00000000-0000-0000-0000-000000000000'::uuid, 'system',
+            'pol114_not_an_action', 'phone_engagement', 'pol114-s1-probe', 'success', '{}'::jsonb);
+    raise exception 'pol114_probe_rollback';
+  exception
+    when check_violation then v_bogus_refused := true;
+    when others then v_bogus_refused := false;
+  end;
+
+  perform _policy_tests.assert(
+    '0114-§1: chk_audit_action admits the four 0114 actions (C2, C5, C8, C10)',
+    v_refused = '' and v_admitted = 'phone_engagement_late_completed '
+      || 'phone_scheduled_engagement_released phone_identity_hold_release phone_due_starved ',
+    'admitted=[' || v_admitted || '] refused=[' || v_refused || ']');
+  perform _policy_tests.assert(
+    '0114-§1: chk_audit_action is still CLOSED (an unknown action is a check_violation)',
+    v_bogus_refused, 'an unlisted action was admitted');
+end;
+$$;
+
+select _policy_tests.assert(
+  '0114-§1: the probes left no audit row behind',
+  not exists (select 1 from screening_v2.audit_events where target_id = 'pol114-s1-probe'),
+  'a probe insert was not rolled back');
+-- ==== 0114-§1 END ====
+
+-- ==== 0114-§2 BEGIN ====
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0114 §2 / M009 S2 — the ledger: C1 consent.resumed continuation and drop
+-- race, C2 in-call callback deferral, C7 mid-call opt-out race and session
+-- cancel, and the transition trigger's late-score exception.
+--
+-- Anchor Tue 2026-10-06 11:30 IST (06:00Z), as the 0113 blocks; 21:30 IST
+-- (16:00Z) is outside the 09:00-21:00 window. Every fixture is tagged
+-- `pol114-s2-*` and torn down at the end of its block. Neutral labels only;
+-- no assertion reads the host clock. Cases marked RED fail on 0001..0113.
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- Runs one statement and reports its SQLSTATE, or 'accepted'. An accepted
+-- statement is rolled back by the sentinel, so probing never changes a row.
+create or replace function _policy_tests.p114_try(p_sql text)
+returns text
+language plpgsql as $p114try$
+begin
+  begin
+    execute p_sql;
+    raise exception using errcode = 'Z0114', message = 'pol114 probe: accepted';
+  exception
+    when sqlstate 'Z0114' then return 'accepted';
+    when others then return sqlstate;
+  end;
+end;
+$p114try$;
+
+-- A plan for a session, the way start_phone_assessment snapshots it.
+create or replace function _policy_tests.p114_plan(p_session uuid, p_engagement uuid)
+returns void
+language sql as $p114plan$
+  insert into screening_v2.phone_session_plans
+    (session_id, engagement_id, source, question_count, questions)
+  values (p_session, p_engagement, 'default', 1,
+          '[{"key":"k1","text":"Can you walk me through a recent project you worked on?","hint":null}]'::jsonb);
+$p114plan$;
+
+-- The 83ce56fb shape: a disclosed leg (engagement bound to an in_progress
+-- session that claims it, plus a plan when p_plan) drops by webhook, the
+-- reconnect is admitted and answered. The engagement is `dialing`, the
+-- reconnect attempt `answered_unclassified`, reconnects_used = 1.
+-- Returns [engagement, first attempt, session, candidate, role, reconnect attempt].
+create or replace function _policy_tests.p114_resumed(
+  p_tag  text,
+  p_t    timestamptz,
+  p_plan boolean default true
+)
+returns uuid[]
+language plpgsql as $p114r$
+declare
+  v_ids uuid[]; v_res jsonb; v_att2 uuid; v_ev jsonb;
+begin
+  v_ids := _policy_tests.p113_leg(p_tag, p_t);
+  if p_plan then
+    perform _policy_tests.p114_plan(v_ids[3], v_ids[1]);
+  end if;
+  v_ev := screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_left', v_ids[2], null,
+            p_tag || '-drop1', null, null, p_t + interval '3 minutes');
+  if v_ev->>'status' is distinct from 'applied' then
+    raise exception 'p114_resumed(%): first drop not applied: %', p_tag, v_ev;
+  end if;
+  v_res := screening_v2.admit_phone_attempt(v_ids[1], 'reconnect', null, 60, p_t + interval '4 minutes');
+  if v_res->>'status' is distinct from 'ok' then
+    raise exception 'p114_resumed(%): reconnect admission refused: %', p_tag, v_res;
+  end if;
+  v_att2 := (v_res->>'attempt_id')::uuid;
+  perform screening_v2.apply_phone_event('internal', 'call.answered', v_att2, null,
+            null, (v_res->>'epoch')::integer, null, p_t + interval '4 minutes 20 seconds');
+  return v_ids || v_att2;
+end;
+$p114r$;
+
+-- A phone assessment for a session (the 0113 synthetic shape).
+create or replace function _policy_tests.p114_assess(p_session uuid, p_cand uuid)
+returns void
+language sql as $p114a$
+  insert into screening_v2.assessments
+    (session_id, candidate_id, overall_score, recommendation, summary, raw, provenance, source)
+  values (p_session, p_cand, 61, 'advance', 'pol114 synthetic', '{}'::jsonb,
+          '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet-4-20250514","workload":"scoring","prompt_template_version":"2026-07-28.1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb,
+          'phone');
+$p114a$;
+
+-- ── C1: the 83ce56fb replay (RED), R0, fencing, terminal ───────────────
+do $$
+declare
+  v_t constant timestamptz := '2026-10-06T06:00:00Z';
+  v_ids uuid[]; v_eng uuid; v_att1 uuid; v_sess uuid; v_att2 uuid;
+  v_ev jsonb; v_ev2 jsonb; v_ev3 jsonb;
+  v_e0 integer; v_e1 integer; v_a1 integer; v_state text; v_astate text; v_asess uuid;
+  v_rcu integer; v_cls integer; v_term timestamptz; v_aout text;
+begin
+  v_ids := _policy_tests.p114_resumed('pol114-s2-c1', v_t);
+  v_eng := v_ids[1]; v_att1 := v_ids[2]; v_sess := v_ids[3]; v_att2 := v_ids[6];
+  select epoch into v_e0 from screening_v2.phone_engagements where id = v_eng;
+
+  v_ev := screening_v2.apply_phone_event('internal', 'consent.resumed', v_att2, null,
+            null, null, null, v_t + interval '4 minutes 30 seconds');
+  select state, epoch, reconnects_used into v_state, v_e1, v_rcu
+    from screening_v2.phone_engagements where id = v_eng;
+  select state, epoch, session_id into v_astate, v_a1, v_asess
+    from screening_v2.phone_call_attempts where id = v_att2;
+  select count(*) into v_cls from screening_v2.audit_events
+   where action = 'phone_attempt_classified' and target_id = v_att2::text;
+  perform _policy_tests.assert(
+    '0114-§2 C1 (RED): consent.resumed on a resumed leg -> in_call, epoch +1 on engagement and attempt, '
+      || 'attempt bound to the session, still answered_unclassified, budget kept, no classification',
+    v_ev->>'status' = 'applied' and v_state = 'in_call' and v_e1 = v_e0 + 1 and v_a1 = v_e0 + 1
+      and v_asess = v_sess and v_astate = 'answered_unclassified' and v_rcu = 1 and v_cls = 0,
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || ' epoch ' || v_e0 || '->' || coalesce(v_e1::text, '<null>') || ' attempt_epoch='
+      || coalesce(v_a1::text, '<null>') || ' attempt=' || coalesce(v_astate, '<null>')
+      || ' bound=' || coalesce((v_asess = v_sess)::text, 'false') || ' reconnects_used='
+      || coalesce(v_rcu::text, '<null>') || ' classified_audits=' || v_cls);
+
+  -- R0: a second, distinct consent.resumed on the live attempt is an applied
+  -- no-op; a re-post of the same event dedups.
+  v_ev2 := screening_v2.apply_phone_event('internal', 'consent.resumed', v_att2, null,
+             null, v_e0 + 1, null, v_t + interval '4 minutes 40 seconds');
+  v_ev3 := screening_v2.apply_phone_event('internal', 'consent.resumed', v_att2, null,
+             null, v_e0 + 1, null, v_t + interval '4 minutes 41 seconds');
+  select state, epoch into v_state, v_e1 from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0114-§2 C1 R0: consent.resumed from in_call is an applied no-op; a re-post is a duplicate',
+    v_ev2->>'status' = 'applied' and (v_ev2->>'duplicate')::boolean is false
+      and v_ev3->>'status' = 'applied' and (v_ev3->>'duplicate')::boolean is true
+      and v_state = 'in_call' and v_e1 = v_e0 + 1,
+    'r0=' || coalesce(v_ev2::text, '<null>') || ' repost=' || coalesce(v_ev3::text, '<null>')
+      || ' engagement=' || coalesce(v_state, '<null>') || ' epoch=' || coalesce(v_e1::text, '<null>'));
+
+  -- Fencing: the previous leg's completion and abort are now stale.
+  v_ev2 := screening_v2.apply_phone_event('internal', 'assessment.completed', v_att1, null,
+             null, null, null, v_t + interval '5 minutes');
+  v_ev3 := screening_v2.apply_phone_event('internal', 'assessment.aborted', v_att1, null,
+             null, null, null, v_t + interval '5 minutes');
+  select state into v_state from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0114-§2 C1 fencing: after R1 the previous attempt''s completion and abort are stale_epoch',
+    v_ev2->>'ignored_reason' = 'stale_epoch' and v_ev3->>'ignored_reason' = 'stale_epoch'
+      and v_state = 'in_call',
+    'completed=' || coalesce(v_ev2::text, '<null>') || ' aborted=' || coalesce(v_ev3::text, '<null>'));
+
+  -- The completion: refused (not recorded) without a score, applied with one.
+  v_ev2 := screening_v2.apply_phone_event('internal', 'assessment.completed', v_att2, null,
+             null, null, null, v_t + interval '20 minutes');
+  perform _policy_tests.p114_assess(v_sess, v_ids[4]);
+  v_ev3 := screening_v2.apply_phone_event('internal', 'assessment.completed', v_att2, null,
+             null, null, null, v_t + interval '21 minutes');
+  select state, terminal_at into v_state, v_term from screening_v2.phone_engagements where id = v_eng;
+  select state, outcome_class into v_astate, v_aout from screening_v2.phone_call_attempts where id = v_att2;
+  perform _policy_tests.assert(
+    '0114-§2 C1 (RED): the resumed leg''s assessment.completed is assessment_missing without a score '
+      || 'and completes the engagement with one',
+    v_ev2->>'status' = 'assessment_missing' and v_ev3->>'status' = 'applied'
+      and v_state = 'completed' and v_term is not null
+      and v_astate = 'ended' and v_aout = 'completed',
+    'unscored=' || coalesce(v_ev2::text, '<null>') || ' scored=' || coalesce(v_ev3::text, '<null>')
+      || ' engagement=' || coalesce(v_state, '<null>') || ' attempt=' || coalesce(v_astate, '<null>')
+      || '/' || coalesce(v_aout, '<null>'));
+
+  -- Terminal: a further (distinct) consent.resumed is ignored as terminal.
+  v_ev2 := screening_v2.apply_phone_event('internal', 'consent.resumed', v_att2, null,
+             null, 99, null, v_t + interval '22 minutes');
+  perform _policy_tests.assert(
+    '0114-§2 C1: consent.resumed on a terminal engagement is ignored as terminal',
+    v_ev2->>'ignored_reason' = 'terminal',
+    'event=' || coalesce(v_ev2::text, '<null>'));
+
+  perform _policy_tests.p113_teardown('pol114-s2-c1');
+end;
+$$;
+
+-- ── C1 superseded attempt: a consent.resumed for the previous leg ──────
+do $$
+declare
+  v_t constant timestamptz := '2026-10-06T06:00:00Z';
+  v_ids uuid[]; v_ev jsonb; v_state text;
+begin
+  v_ids := _policy_tests.p114_resumed('pol114-s2-c1st', v_t);
+  perform screening_v2.apply_phone_event('internal', 'consent.resumed', v_ids[6], null,
+            null, null, null, v_t + interval '4 minutes 30 seconds');
+  -- Re-answer the old attempt shape is impossible (it ended); post for it
+  -- with the pre-R1 epoch: stale.
+  v_ev := screening_v2.apply_phone_event('internal', 'consent.resumed', v_ids[2], null,
+            null, null, null, v_t + interval '4 minutes 40 seconds');
+  select state into v_state from screening_v2.phone_engagements where id = v_ids[1];
+  perform _policy_tests.assert(
+    '0114-§2 C1: consent.resumed for a superseded attempt is stale_epoch',
+    v_ev->>'ignored_reason' = 'stale_epoch' and v_state = 'in_call',
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-c1st');
+end;
+$$;
+
+-- ── C1 guard negatives: each is unexpected_event and leaves the engagement ─
+do $$
+declare
+  v_t constant timestamptz := '2026-10-06T06:00:00Z';
+  v_ids uuid[]; v_other uuid; v_ev jsonb; v_state text; v_bad text := ''; v_case text;
+  v_status text;
+begin
+  -- (a) no plan
+  v_ids := _policy_tests.p114_resumed('pol114-s2-g-noplan', v_t, false);
+  v_ev := screening_v2.apply_phone_event('internal', 'consent.resumed', v_ids[6], null,
+            null, null, null, v_t + interval '5 minutes');
+  select state into v_state from screening_v2.phone_engagements where id = v_ids[1];
+  if not (v_ev->>'ignored_reason' = 'unexpected_event' and v_state = 'dialing') then
+    v_bad := v_bad || ' no_plan:' || coalesce(v_ev::text, '<null>') || '/' || coalesce(v_state, '<null>');
+  end if;
+  perform _policy_tests.p113_teardown('pol114-s2-g-noplan');
+
+  -- (b) the session's plan belongs to another engagement; (c) the session
+  -- claims another engagement.
+  foreach v_case in array array['plan_other', 'claim_other'] loop
+    v_other := _policy_tests.phone_fixture('pol114-s2-g-other');
+    v_ids := _policy_tests.p114_resumed('pol114-s2-g-' || v_case, v_t,
+               v_case = 'claim_other');
+    if v_case = 'plan_other' then
+      perform _policy_tests.p114_plan(v_ids[3], v_other);
+    else
+      update screening_v2.call_sessions set phone_engagement_id = v_other where id = v_ids[3];
+    end if;
+    v_ev := screening_v2.apply_phone_event('internal', 'consent.resumed', v_ids[6], null,
+              null, null, null, v_t + interval '5 minutes');
+    select state into v_state from screening_v2.phone_engagements where id = v_ids[1];
+    if not (v_ev->>'ignored_reason' = 'unexpected_event' and v_state = 'dialing') then
+      v_bad := v_bad || ' ' || v_case || ':' || coalesce(v_ev::text, '<null>') || '/' || coalesce(v_state, '<null>');
+    end if;
+    perform _policy_tests.p113_teardown('pol114-s2-g-' || v_case);
+    perform _policy_tests.phone_teardown('pol114-s2-g-other');
+  end loop;
+
+  -- (d) the bound session is not live
+  foreach v_status in array array['failed', 'expired', 'cancelled', 'completed'] loop
+    v_ids := _policy_tests.p114_resumed('pol114-s2-g-' || v_status, v_t);
+    update screening_v2.call_sessions
+       set status = v_status,
+           terminal_reason = case v_status when 'failed' then 'worker_crash'
+                                           when 'expired' then 'grace_timeout'
+                                           when 'cancelled' then 'duplicate_session'
+                                           else 'conversation_complete' end
+     where id = v_ids[3];
+    v_ev := screening_v2.apply_phone_event('internal', 'consent.resumed', v_ids[6], null,
+              null, null, null, v_t + interval '5 minutes');
+    select state into v_state from screening_v2.phone_engagements where id = v_ids[1];
+    if not (v_ev->>'ignored_reason' = 'unexpected_event' and v_state = 'dialing') then
+      v_bad := v_bad || ' session_' || v_status || ':' || coalesce(v_ev::text, '<null>') || '/' || coalesce(v_state, '<null>');
+    end if;
+    perform _policy_tests.p113_teardown('pol114-s2-g-' || v_status);
+  end loop;
+
+  -- (e) the attempt is pre-answer (admitted / ringing)
+  foreach v_status in array array['admitted', 'ringing'] loop
+    v_ids := _policy_tests.p114_resumed('pol114-s2-g-' || v_status, v_t);
+    update screening_v2.phone_call_attempts set state = v_status, answered_at = null
+     where id = v_ids[6];
+    v_ev := screening_v2.apply_phone_event('internal', 'consent.resumed', v_ids[6], null,
+              null, null, null, v_t + interval '5 minutes');
+    select state into v_state from screening_v2.phone_engagements where id = v_ids[1];
+    if not (v_ev->>'ignored_reason' = 'unexpected_event' and v_state = 'dialing') then
+      v_bad := v_bad || ' attempt_' || v_status || ':' || coalesce(v_ev::text, '<null>') || '/' || coalesce(v_state, '<null>');
+    end if;
+    perform _policy_tests.p113_teardown('pol114-s2-g-' || v_status);
+  end loop;
+
+  -- (f) the engagement is eligible, or still reconnecting (before the admit)
+  v_ids := _policy_tests.p114_resumed('pol114-s2-g-elig', v_t);
+  update screening_v2.phone_engagements set state = 'eligible' where id = v_ids[1];
+  v_ev := screening_v2.apply_phone_event('internal', 'consent.resumed', v_ids[6], null,
+            null, null, null, v_t + interval '5 minutes');
+  select state into v_state from screening_v2.phone_engagements where id = v_ids[1];
+  if not (v_ev->>'ignored_reason' = 'unexpected_event' and v_state = 'eligible') then
+    v_bad := v_bad || ' eligible:' || coalesce(v_ev::text, '<null>') || '/' || coalesce(v_state, '<null>');
+  end if;
+  perform _policy_tests.p113_teardown('pol114-s2-g-elig');
+
+  v_ids := _policy_tests.p113_leg('pol114-s2-g-recon', v_t);
+  perform _policy_tests.p114_plan(v_ids[3], v_ids[1]);
+  perform screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_left', v_ids[2], null,
+            'pol114-s2-g-recon-drop', null, null, v_t + interval '3 minutes');
+  v_ev := screening_v2.apply_phone_event('internal', 'consent.resumed', v_ids[2], null,
+            null, null, null, v_t + interval '3 minutes 10 seconds');
+  select state into v_state from screening_v2.phone_engagements where id = v_ids[1];
+  if not (v_ev->>'ignored_reason' = 'unexpected_event' and v_state = 'reconnecting') then
+    v_bad := v_bad || ' reconnecting:' || coalesce(v_ev::text, '<null>') || '/' || coalesce(v_state, '<null>');
+  end if;
+  perform _policy_tests.p113_teardown('pol114-s2-g-recon');
+
+  -- (g) a non-internal source
+  v_ids := _policy_tests.p114_resumed('pol114-s2-g-src', v_t);
+  v_ev := screening_v2.apply_phone_event('livekit_webhook', 'consent.resumed', v_ids[6], null,
+            'pol114-s2-g-src-ev', null, null, v_t + interval '5 minutes');
+  select state into v_state from screening_v2.phone_engagements where id = v_ids[1];
+  if not (v_ev->>'ignored_reason' = 'unexpected_event' and v_state = 'dialing') then
+    v_bad := v_bad || ' webhook_source:' || coalesce(v_ev::text, '<null>') || '/' || coalesce(v_state, '<null>');
+  end if;
+  perform _policy_tests.p113_teardown('pol114-s2-g-src');
+
+  perform _policy_tests.assert(
+    '0114-§2 C1 guards: no plan, another engagement''s plan or claim, a non-live session, a pre-answer '
+      || 'attempt, an eligible/reconnecting engagement or a non-internal source never continue',
+    v_bad = '',
+    'continued where it must not:' || v_bad);
+end;
+$$;
+
+-- ── C1 drop race (webhook): charged reconnect, budget exhausted, window closed ─
+do $$
+declare
+  v_t constant timestamptz := '2026-10-06T06:00:00Z';
+  v_night constant timestamptz := '2026-10-06T16:00:00Z';   -- 21:30 IST
+  v_ids uuid[]; v_ev jsonb; v_state text; v_reason text; v_rcu integer; v_astate text; v_aout text;
+  v_term timestamptz; v_apt_src text; v_apt_status text; v_n integer;
+begin
+  -- In window: a charged reconnect (RED: abandoned_pre_disclosure, uncharged).
+  v_ids := _policy_tests.p114_resumed('pol114-s2-race', v_t);
+  v_ev := screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_left', v_ids[6], null,
+            'pol114-s2-race-drop2', null, null, v_t + interval '4 minutes 25 seconds');
+  select e.state, e.reconnects_used, a.state, a.outcome_class
+    into v_state, v_rcu, v_astate, v_aout
+    from screening_v2.phone_engagements e
+    join screening_v2.phone_call_attempts a on a.id = v_ids[6]
+   where e.id = v_ids[1];
+  perform _policy_tests.assert(
+    '0114-§2 C1 drop race (RED): a continuation leg dropping before consent.resumed is a charged reconnect',
+    v_ev->>'status' = 'applied' and v_state = 'reconnecting' and v_rcu = 2
+      and v_astate = 'ended' and v_aout = 'disconnected',
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || ' reconnects_used=' || coalesce(v_rcu::text, '<null>') || ' attempt=' || coalesce(v_astate, '<null>')
+      || '/' || coalesce(v_aout, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-race');
+
+  -- reconnects_used = 3: failed/reconnect_budget_exhausted.
+  v_ids := _policy_tests.p114_resumed('pol114-s2-race3', v_t);
+  update screening_v2.phone_engagements set reconnects_used = 3 where id = v_ids[1];
+  v_ev := screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_left', v_ids[6], null,
+            'pol114-s2-race3-drop2', null, null, v_t + interval '4 minutes 25 seconds');
+  select state, state_reason, terminal_at into v_state, v_reason, v_term
+    from screening_v2.phone_engagements where id = v_ids[1];
+  perform _policy_tests.assert(
+    '0114-§2 C1 drop race: with reconnects_used=3 the drop is failed/reconnect_budget_exhausted',
+    v_ev->>'status' = 'applied' and v_state = 'failed'
+      and v_reason = 'reconnect_budget_exhausted' and v_term is not null,
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || '/' || coalesce(v_reason, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-race3');
+
+  -- Window closed: scheduled/window_closed on a system_deferral slot, uncharged.
+  v_ids := _policy_tests.p114_resumed('pol114-s2-racew', v_t);
+  v_ev := screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_left', v_ids[6], null,
+            'pol114-s2-racew-drop2', null, null, v_night);
+  select state, state_reason, reconnects_used into v_state, v_reason, v_rcu
+    from screening_v2.phone_engagements where id = v_ids[1];
+  select count(*), max(source), max(status) into v_n, v_apt_src, v_apt_status
+    from screening_v2.phone_appointments where engagement_id = v_ids[1];
+  perform _policy_tests.assert(
+    '0114-§2 C1 drop race: outside the window it is scheduled/window_closed on a system_deferral slot, uncharged',
+    v_ev->>'status' = 'applied' and v_state = 'scheduled' and v_reason = 'window_closed'
+      and v_rcu = 1 and v_n = 1 and v_apt_src = 'system_deferral' and v_apt_status = 'scheduled',
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || '/' || coalesce(v_reason, '<null>') || ' reconnects_used=' || coalesce(v_rcu::text, '<null>')
+      || ' appointments=' || v_n || ' ' || coalesce(v_apt_src, '<null>') || '/' || coalesce(v_apt_status, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-racew');
+
+  -- PR-A A2 pin, resumed shape with NO plan: unchanged pre-disclosure path.
+  v_ids := _policy_tests.p114_resumed('pol114-s2-raceA2', v_t, false);
+  v_ev := screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_left', v_ids[6], null,
+            'pol114-s2-raceA2-drop2', null, null, v_t + interval '4 minutes 25 seconds');
+  select e.state, e.state_reason, e.reconnects_used, a.outcome_class
+    into v_state, v_reason, v_rcu, v_aout
+    from screening_v2.phone_engagements e
+    join screening_v2.phone_call_attempts a on a.id = v_ids[6]
+   where e.id = v_ids[1];
+  perform _policy_tests.assert(
+    '0114-§2 C1 A2 pin: with no plan the dialing drop stays abandoned_pre_disclosure, uncharged, next IST day',
+    v_ev->>'status' = 'applied' and v_state = 'eligible' and v_reason = 'abandoned_pre_disclosure'
+      and v_rcu = 1 and v_aout = 'abandoned_pre_disclosure'
+      and (select next_eligible_at from screening_v2.phone_engagements where id = v_ids[1])
+          = '2026-10-07T03:30:00Z'::timestamptz,
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || '/' || coalesce(v_reason, '<null>') || ' reconnects_used=' || coalesce(v_rcu::text, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-raceA2');
+end;
+$$;
+
+-- ── C1: completion/abort from dialing on a completed planned session ───
+do $$
+declare
+  v_t constant timestamptz := '2026-10-06T06:00:00Z';
+  v_ids uuid[]; v_ev jsonb; v_ev2 jsonb; v_state text;
+begin
+  v_ids := _policy_tests.p114_resumed('pol114-s2-c1done', v_t);
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'conversation_complete'
+   where id = v_ids[3];
+  perform _policy_tests.p114_assess(v_ids[3], v_ids[4]);
+  v_ev := screening_v2.apply_phone_event('internal', 'assessment.completed', v_ids[6], null,
+            null, null, null, v_t + interval '6 minutes');
+  v_ev2 := screening_v2.apply_phone_event('internal', 'assessment.aborted', v_ids[6], null,
+             null, null, null, v_t + interval '6 minutes');
+  select state into v_state from screening_v2.phone_engagements where id = v_ids[1];
+  perform _policy_tests.assert(
+    '0114-§2 C1: assessment.completed/aborted from dialing on a completed planned session stay unexpected_event',
+    v_ev->>'ignored_reason' = 'unexpected_event' and v_ev2->>'ignored_reason' = 'unexpected_event'
+      and v_state = 'dialing',
+    'completed=' || coalesce(v_ev::text, '<null>') || ' aborted=' || coalesce(v_ev2::text, '<null>')
+      || ' engagement=' || coalesce(v_state, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-c1done');
+end;
+$$;
+
+-- ── C1 reset rule and the initial-redial-into-live-session case into a live session ─
+do $$
+declare
+  v_t constant timestamptz := '2026-10-06T06:00:00Z';
+  v_eng uuid; v_res jsonb; v_att uuid; v_ev jsonb; v_ev2 jsonb; v_rcu integer; v_state text;
+  v_cand uuid; v_role uuid; v_sess uuid; v_epoch integer;
+begin
+  -- disclosure.delivered on an initial attempt still zeroes the budget.
+  v_eng := _policy_tests.phone_fixture('pol114-s2-reset');
+  update screening_v2.phone_engagements set reconnects_used = 2 where id = v_eng;
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid; v_epoch := (v_res->>'epoch')::integer;
+  perform screening_v2.apply_phone_event('internal', 'call.answered', v_att, null, null, v_epoch, null, v_t + interval '20 seconds');
+  perform screening_v2.apply_phone_event('internal', 'classify.human', v_att, null, null, v_epoch, null, v_t + interval '22 seconds');
+  v_ev := screening_v2.apply_phone_event('internal', 'disclosure.delivered', v_att, null, null, v_epoch, null, v_t + interval '40 seconds');
+  select reconnects_used, state into v_rcu, v_state from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0114-§2 C1 reset rule: disclosure.delivered on an initial attempt still zeroes reconnects_used',
+    v_ev->>'status' = 'applied' and v_state = 'in_call' and v_rcu = 0,
+    'event=' || coalesce(v_ev::text, '<null>') || ' reconnects_used=' || coalesce(v_rcu::text, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-reset');
+
+  -- LIVE-REDIAL: an INITIAL redial adopts the engagement's live planned session.
+  v_eng := _policy_tests.phone_fixture('pol114-s2-liveredial');
+  select candidate_id, role_id into v_cand, v_role from screening_v2.phone_engagements where id = v_eng;
+  v_sess := _policy_tests.p112_session(v_cand, v_role, v_eng, '2025-03-01T04:30:00Z'::timestamptz, 'in_progress');
+  update screening_v2.phone_engagements set session_id = v_sess, reconnects_used = 2 where id = v_eng;
+  perform _policy_tests.p114_plan(v_sess, v_eng);
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid; v_epoch := (v_res->>'epoch')::integer;
+  perform screening_v2.apply_phone_event('internal', 'call.answered', v_att, null, null, v_epoch, null, v_t + interval '20 seconds');
+  v_ev := screening_v2.apply_phone_event('internal', 'consent.resumed', v_att, null, null, null, null, v_t + interval '25 seconds');
+  select reconnects_used, state into v_rcu, v_state from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0114-§2 C1 (RED): an initial redial into a live planned session continues to in_call; consent.resumed '
+      || 'on an initial attempt does NOT reset reconnects_used',
+    v_res->>'status' = 'ok' and v_ev->>'status' = 'applied' and v_state = 'in_call' and v_rcu = 2,
+    'admit=' || coalesce(v_res->>'status', '<null>') || ' event=' || coalesce(v_ev::text, '<null>')
+      || ' engagement=' || coalesce(v_state, '<null>') || ' reconnects_used=' || coalesce(v_rcu::text, '<null>'));
+  perform _policy_tests.p114_assess(v_sess, v_cand);
+  v_ev2 := screening_v2.apply_phone_event('internal', 'assessment.completed', v_att, null, null, null, null, v_t + interval '15 minutes');
+  select state into v_state from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0114-§2 C1: the continued initial leg''s completion applies',
+    v_ev2->>'status' = 'applied' and v_state = 'completed',
+    'event=' || coalesce(v_ev2::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-liveredial');
+end;
+$$;
+
+-- ── Trigger pin: dialing -> completed is still illegal ─────────────────
+do $$
+declare
+  v_t constant timestamptz := '2026-10-06T06:00:00Z';
+  v_eng uuid; v_try text;
+begin
+  v_eng := _policy_tests.phone_fixture('pol114-s2-pin');
+  perform screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_try := _policy_tests.p114_try(format(
+    'update screening_v2.phone_engagements set state = %L, terminal_at = %L where id = %L',
+    'completed', v_t, v_eng));
+  perform _policy_tests.assert(
+    '0114-§2 trigger pin: a direct dialing -> completed UPDATE still raises',
+    v_try = 'P0001',
+    'result=' || coalesce(v_try, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-pin');
+end;
+$$;
+
+-- ── C2: the in-call callback deferral ─────────────────────────────────
+do $$
+declare
+  v_t constant timestamptz := '2026-10-06T06:00:00Z';
+  v_ids uuid[]; v_eng uuid; v_att uuid; v_sess uuid; v_new uuid;
+  v_ev jsonb; v_dup jsonb; v_stale jsonb;
+  v_state text; v_reason text; v_nea timestamptz; v_bound uuid; v_claim uuid;
+  v_na integer; v_rcu integer; v_pf integer; v_term timestamptz; v_astate text; v_aout text;
+  v_ep integer;
+begin
+  v_ids := _policy_tests.p113_leg('pol114-s2-c2', v_t);
+  v_eng := v_ids[1]; v_att := v_ids[2]; v_sess := v_ids[3];
+  select epoch into v_ep from screening_v2.phone_engagements where id = v_eng;
+
+  v_ev := screening_v2.apply_phone_event('internal', 'callback.deferred_in_call', v_att, null,
+            null, null, null, v_t + interval '3 minutes');
+  select state, state_reason, next_eligible_at, session_id, no_answer_attempts, reconnects_used,
+         provider_failures, terminal_at
+    into v_state, v_reason, v_nea, v_bound, v_na, v_rcu, v_pf, v_term
+    from screening_v2.phone_engagements where id = v_eng;
+  select state, outcome_class into v_astate, v_aout from screening_v2.phone_call_attempts where id = v_att;
+  select phone_engagement_id into v_claim from screening_v2.call_sessions where id = v_sess;
+  perform _policy_tests.assert(
+    '0114-§2 C2: callback.deferred_in_call ends the attempt callback_deferred and makes the engagement '
+      || 'eligible/callback_deferred_in_call at the next IST-day window, uncharged, detached, claim released',
+    v_ev->>'status' = 'applied' and v_astate = 'ended' and v_aout = 'callback_deferred'
+      and v_state = 'eligible' and v_reason = 'callback_deferred_in_call'
+      and v_nea = '2026-10-07T03:30:00Z'::timestamptz and v_term is null
+      and v_na = 0 and v_rcu = 0 and v_pf = 0 and v_bound is null and v_claim is null,
+    'event=' || coalesce(v_ev::text, '<null>') || ' attempt=' || coalesce(v_astate, '<null>') || '/'
+      || coalesce(v_aout, '<null>') || ' engagement=' || coalesce(v_state, '<null>') || '/'
+      || coalesce(v_reason, '<null>') || ' next=' || coalesce(v_nea::text, '<null>')
+      || ' budgets=' || v_na || '/' || v_rcu || '/' || v_pf
+      || ' bound=' || (v_bound is not null)::text || ' claim=' || (v_claim is not null)::text);
+
+  v_new := _policy_tests.p112_try_session(v_ids[4], v_ids[5], v_eng, v_t + interval '4 minutes', 'waiting');
+  perform _policy_tests.assert(
+    '0114-§2 C2: after the deferral a fresh session can claim the engagement under the live-only index',
+    v_new is not null,
+    'the deferred leg''s live claim still blocks the next dial''s createSession');
+
+  v_dup := screening_v2.apply_phone_event('internal', 'callback.deferred_in_call', v_att, null,
+             null, null, null, v_t + interval '3 minutes 5 seconds');
+  v_stale := screening_v2.apply_phone_event('internal', 'callback.deferred_in_call', v_att, null,
+               null, v_ep - 1, null, v_t + interval '3 minutes 6 seconds');
+  perform _policy_tests.assert(
+    '0114-§2 C2: a redelivery dedups to the original verdict and a stale epoch is refused',
+    v_dup->>'status' = 'applied' and (v_dup->>'duplicate')::boolean is true
+      and v_stale->>'ignored_reason' = 'stale_epoch',
+    'dup=' || coalesce(v_dup::text, '<null>') || ' stale=' || coalesce(v_stale::text, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-c2');
+end;
+$$;
+
+-- C2: the third deferral fails the engagement; other states are no-ops.
+do $$
+declare
+  v_t constant timestamptz := '2026-10-06T06:00:00Z';
+  v_eng uuid; v_res jsonb; v_att uuid; v_ep integer; v_ev jsonb; v_d integer;
+  v_state text; v_reason text; v_term timestamptz; v_bad text := '';
+begin
+  v_eng := _policy_tests.phone_fixture('pol114-s2-c2lim');
+  for v_d in 0..2 loop
+    v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t + make_interval(days => v_d));
+    if v_res->>'status' is distinct from 'ok' then
+      v_bad := v_bad || ' admit' || v_d || '=' || v_res::text;
+      exit;
+    end if;
+    v_att := (v_res->>'attempt_id')::uuid; v_ep := (v_res->>'epoch')::integer;
+    perform screening_v2.apply_phone_event('internal', 'call.answered', v_att, null, null, v_ep, null,
+              v_t + make_interval(days => v_d, secs => 20));
+    perform screening_v2.apply_phone_event('internal', 'classify.human', v_att, null, null, v_ep, null,
+              v_t + make_interval(days => v_d, secs => 22));
+    perform screening_v2.apply_phone_event('internal', 'disclosure.delivered', v_att, null, null, v_ep, null,
+              v_t + make_interval(days => v_d, secs => 40));
+    v_ev := screening_v2.apply_phone_event('internal', 'callback.deferred_in_call', v_att, null, null, null, null,
+              v_t + make_interval(days => v_d, mins => 3));
+    if v_ev->>'status' is distinct from 'applied' then
+      v_bad := v_bad || ' defer' || v_d || '=' || v_ev::text;
+    end if;
+  end loop;
+  select state, state_reason, terminal_at into v_state, v_reason, v_term
+    from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0114-§2 C2: the third in-call deferral is failed/callback_deferral_limit (terminal)',
+    v_bad = '' and v_state = 'failed' and v_reason = 'callback_deferral_limit' and v_term is not null,
+    coalesce(v_bad, '') || ' engagement=' || coalesce(v_state, '<null>') || '/' || coalesce(v_reason, '<null>'));
+
+  -- Terminal: ignored as terminal.
+  v_ev := screening_v2.apply_phone_event('internal', 'callback.deferred_in_call', v_att, null, null, 77, null,
+            v_t + interval '3 days');
+  perform _policy_tests.assert(
+    '0114-§2 C2: callback.deferred_in_call on a terminal engagement is ignored as terminal',
+    v_ev->>'ignored_reason' = 'terminal',
+    'event=' || coalesce(v_ev::text, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-c2lim');
+
+  -- dialing (answered, not disclosed) and scheduled: unexpected_event.
+  v_eng := _policy_tests.phone_fixture('pol114-s2-c2dial');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid; v_ep := (v_res->>'epoch')::integer;
+  perform screening_v2.apply_phone_event('internal', 'call.answered', v_att, null, null, v_ep, null, v_t + interval '20 seconds');
+  perform screening_v2.apply_phone_event('internal', 'classify.human', v_att, null, null, v_ep, null, v_t + interval '22 seconds');
+  v_ev := screening_v2.apply_phone_event('internal', 'callback.deferred_in_call', v_att, null, null, null, null, v_t + interval '1 minute');
+  select state into v_state from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0114-§2 C2: from dialing callback.deferred_in_call is unexpected_event and changes nothing',
+    v_ev->>'ignored_reason' = 'unexpected_event' and v_state = 'dialing'
+      and (select state from screening_v2.phone_call_attempts where id = v_att) = 'human',
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-c2dial');
+
+  v_eng := _policy_tests.phone_fixture('pol114-s2-c2sched', 'scheduled');
+  v_ev := screening_v2.apply_phone_event('internal', 'callback.deferred_in_call', null, v_eng, null, null, null, v_t);
+  select state into v_state from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0114-§2 C2: from scheduled callback.deferred_in_call is unexpected_event',
+    v_ev->>'ignored_reason' = 'unexpected_event' and v_state = 'scheduled',
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-c2sched');
+end;
+$$;
+
+-- ── C7: opt-out from in_call cancels the bound session (RED) ──────────
+do $$
+declare
+  v_t constant timestamptz := '2026-10-06T06:00:00Z';
+  v_ids uuid[]; v_ev jsonb; v_state text; v_sstatus text; v_sreason text; v_sup integer;
+begin
+  v_ids := _policy_tests.p113_leg('pol114-s2-c7a', v_t);
+  v_ev := screening_v2.apply_phone_event('internal', 'candidate.opt_out', v_ids[2], null,
+            null, null, null, v_t + interval '3 minutes');
+  select state into v_state from screening_v2.phone_engagements where id = v_ids[1];
+  select status, terminal_reason into v_sstatus, v_sreason from screening_v2.call_sessions where id = v_ids[3];
+  select count(*) into v_sup from screening_v2.phone_suppressions where candidate_id = v_ids[4];
+  perform _policy_tests.assert(
+    '0114-§2 C7 (RED): in_call candidate.opt_out -> opted_out, line suppressed, bound session cancelled/candidate_opt_out',
+    v_ev->>'status' = 'applied' and v_state = 'opted_out' and v_sup = 1
+      and v_sstatus = 'cancelled' and v_sreason = 'candidate_opt_out',
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || ' suppressions=' || v_sup || ' session=' || coalesce(v_sstatus, '<null>') || '/' || coalesce(v_sreason, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-c7a');
+
+  -- wrong_number cancels with its own reason.
+  v_ids := _policy_tests.p113_leg('pol114-s2-c7wn', v_t);
+  v_ev := screening_v2.apply_phone_event('internal', 'candidate.wrong_number', v_ids[2], null,
+            null, null, null, v_t + interval '3 minutes');
+  select state into v_state from screening_v2.phone_engagements where id = v_ids[1];
+  select status, terminal_reason into v_sstatus, v_sreason from screening_v2.call_sessions where id = v_ids[3];
+  perform _policy_tests.assert(
+    '0114-§2 C7: in_call candidate.wrong_number cancels the bound session as wrong_number',
+    v_ev->>'status' = 'applied' and v_state = 'wrong_number'
+      and v_sstatus = 'cancelled' and v_sreason = 'wrong_number',
+    'event=' || coalesce(v_ev::text, '<null>') || ' session=' || coalesce(v_sstatus, '<null>') || '/' || coalesce(v_sreason, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-c7wn');
+end;
+$$;
+
+-- A dialing refusal with no bound session is unchanged by the session cancel.
+do $$
+declare
+  v_t constant timestamptz := '2026-10-06T06:00:00Z';
+  v_eng uuid; v_res jsonb; v_att uuid; v_ep integer; v_ev jsonb; v_state text;
+begin
+  v_eng := _policy_tests.phone_fixture('pol114-s2-c7dial');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid; v_ep := (v_res->>'epoch')::integer;
+  perform screening_v2.apply_phone_event('internal', 'call.answered', v_att, null, null, v_ep, null, v_t + interval '20 seconds');
+  v_ev := screening_v2.apply_phone_event('internal', 'disclosure.refused', v_att, null, null, v_ep, null, v_t + interval '30 seconds');
+  select state into v_state from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0114-§2 C7: a dialing opt-out with no bound session is unchanged (opted_out, no error)',
+    v_ev->>'status' = 'applied' and v_state = 'opted_out',
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-c7dial');
+end;
+$$;
+
+-- ── C7 race: the webhook drop lands first, then the worker opt-out ─────
+do $$
+declare
+  v_t constant timestamptz := '2026-10-06T06:00:00Z';
+  v_ids uuid[]; v_drop jsonb; v_ev jsonb; v_adm jsonb; v_ep integer;
+  v_state text; v_reason text; v_rcu integer; v_sstatus text; v_sup integer;
+begin
+  v_ids := _policy_tests.p113_leg('pol114-s2-c7race', v_t);
+  v_drop := screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_left', v_ids[2], null,
+              'pol114-s2-c7race-drop', null, null, v_t + interval '3 minutes');
+  select epoch into v_ep from screening_v2.phone_engagements where id = v_ids[1];
+  v_ev := screening_v2.apply_phone_event('internal', 'candidate.opt_out', v_ids[2], null,
+            null, v_ep, null, v_t + interval '3 minutes 2 seconds');
+  select state, state_reason, reconnects_used into v_state, v_reason, v_rcu
+    from screening_v2.phone_engagements where id = v_ids[1];
+  select status into v_sstatus from screening_v2.call_sessions where id = v_ids[3];
+  select count(*) into v_sup from screening_v2.phone_suppressions where candidate_id = v_ids[4];
+  v_adm := screening_v2.admit_phone_attempt(v_ids[1], 'reconnect', null, 60, v_t + interval '4 minutes');
+  perform _policy_tests.assert(
+    '0114-§2 C7 race (RED): drop to reconnecting, then the worker opt-out -> opted_out, suppression, '
+      || 'session cancelled, no further charge, and the reconnect admission is refused',
+    v_drop->>'status' = 'applied' and v_ev->>'status' = 'applied'
+      and v_state = 'opted_out' and v_reason = 'candidate_opt_out' and v_rcu = 1
+      and v_sup = 1 and v_sstatus = 'cancelled' and v_adm->>'status' is distinct from 'ok'
+      and not exists (select 1 from screening_v2.phone_call_attempts
+                       where engagement_id = v_ids[1] and kind = 'reconnect'),
+    'drop=' || coalesce(v_drop::text, '<null>') || ' optout=' || coalesce(v_ev::text, '<null>')
+      || ' engagement=' || coalesce(v_state, '<null>') || '/' || coalesce(v_reason, '<null>')
+      || ' reconnects_used=' || coalesce(v_rcu::text, '<null>') || ' suppressions=' || v_sup
+      || ' session=' || coalesce(v_sstatus, '<null>') || ' admit=' || coalesce(v_adm::text, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-c7race');
+end;
+$$;
+
+-- ── C7 window: the drop is outside the window (scheduled/window_closed) ─
+do $$
+declare
+  v_t constant timestamptz := '2026-10-06T06:00:00Z';
+  v_night constant timestamptz := '2026-10-06T16:00:00Z';   -- 21:30 IST
+  v_ids uuid[]; v_ev jsonb; v_state text; v_apt uuid; v_apt_status text; v_apt_reason text;
+  v_sup integer; v_sstatus text;
+begin
+  v_ids := _policy_tests.p113_leg('pol114-s2-c7win', v_t);
+  perform screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_left', v_ids[2], null,
+            'pol114-s2-c7win-drop', null, null, v_night);
+  select id into v_apt from screening_v2.phone_appointments
+   where engagement_id = v_ids[1] and source = 'system_deferral' and status = 'scheduled';
+  v_ev := screening_v2.apply_phone_event('internal', 'candidate.opt_out', v_ids[2], null,
+            null, null, null, v_night + interval '5 seconds');
+  select state into v_state from screening_v2.phone_engagements where id = v_ids[1];
+  select status, cancel_reason into v_apt_status, v_apt_reason from screening_v2.phone_appointments where id = v_apt;
+  select count(*) into v_sup from screening_v2.phone_suppressions where candidate_id = v_ids[4];
+  select status into v_sstatus from screening_v2.call_sessions where id = v_ids[3];
+  perform _policy_tests.assert(
+    '0114-§2 C7 window: after a window-closed drop the opt-out -> opted_out, suppression, the '
+      || 'system_deferral slot cancelled/engagement_cancelled, session cancelled',
+    v_apt is not null and v_ev->>'status' = 'applied' and v_state = 'opted_out' and v_sup = 1
+      and v_apt_status = 'cancelled' and v_apt_reason = 'engagement_cancelled' and v_sstatus = 'cancelled',
+    'slot=' || coalesce(v_apt::text, '<none>') || ' event=' || coalesce(v_ev::text, '<null>')
+      || ' engagement=' || coalesce(v_state, '<null>') || ' slot=' || coalesce(v_apt_status, '<null>')
+      || '/' || coalesce(v_apt_reason, '<null>') || ' suppressions=' || v_sup
+      || ' session=' || coalesce(v_sstatus, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-c7win');
+
+  -- An HR-booked live slot means a human booked a call: not applied.
+  v_ids := _policy_tests.p113_leg('pol114-s2-c7hr', v_t);
+  perform screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_left', v_ids[2], null,
+            'pol114-s2-c7hr-drop', null, null, v_night);
+  update screening_v2.phone_appointments
+     set status = 'superseded', cancel_reason = 'superseded', version = version + 1
+   where engagement_id = v_ids[1] and status = 'scheduled';
+  insert into screening_v2.phone_appointments
+    (engagement_id, starts_at, ends_at, ist_date, status, source, created_by, created_at, updated_at)
+  values (v_ids[1], '2026-10-07T05:30:00Z', '2026-10-07T06:00:00Z', '2026-10-07', 'scheduled',
+          'hr_manual', '00000000-0000-4000-8000-0000000000ad', v_night, v_night);
+  v_ev := screening_v2.apply_phone_event('internal', 'candidate.opt_out', v_ids[2], null,
+            null, null, null, v_night + interval '5 seconds');
+  select state into v_state from screening_v2.phone_engagements where id = v_ids[1];
+  select count(*) into v_sup from screening_v2.phone_suppressions where candidate_id = v_ids[4];
+  perform _policy_tests.assert(
+    '0114-§2 C7 window: with an hr_manual live slot the opt-out is not applied',
+    v_ev->>'ignored_reason' = 'unexpected_event' and v_state = 'scheduled' and v_sup = 0
+      and exists (select 1 from screening_v2.phone_appointments
+                   where engagement_id = v_ids[1] and source = 'hr_manual' and status = 'scheduled'),
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || ' suppressions=' || v_sup);
+  perform _policy_tests.p113_teardown('pol114-s2-c7hr');
+
+  -- scheduled with a reason other than window_closed: not applied.
+  v_ids := _policy_tests.p113_leg('pol114-s2-c7why', v_t);
+  perform screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_left', v_ids[2], null,
+            'pol114-s2-c7why-drop', null, null, v_night);
+  update screening_v2.phone_engagements set state_reason = 'candidate_callback_confirmed' where id = v_ids[1];
+  v_ev := screening_v2.apply_phone_event('internal', 'candidate.opt_out', v_ids[2], null,
+            null, null, null, v_night + interval '5 seconds');
+  select state into v_state from screening_v2.phone_engagements where id = v_ids[1];
+  perform _policy_tests.assert(
+    '0114-§2 C7 fence: scheduled with a reason other than window_closed is not applied',
+    v_ev->>'ignored_reason' = 'unexpected_event' and v_state = 'scheduled',
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-c7why');
+end;
+$$;
+
+-- ── C7 fence on the race shape: none of these moves the engagement ─────
+do $$
+declare
+  v_t constant timestamptz := '2026-10-06T06:00:00Z';
+  v_ids uuid[]; v_ep integer; v_ev jsonb; v_bad text := ''; v_state text; v_sup integer; v_sstatus text;
+begin
+  v_ids := _policy_tests.p113_leg('pol114-s2-c7fence', v_t);
+  perform screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_left', v_ids[2], null,
+            'pol114-s2-c7fence-drop', null, null, v_t + interval '3 minutes');
+  select epoch into v_ep from screening_v2.phone_engagements where id = v_ids[1];
+
+  v_ev := screening_v2.apply_phone_event('internal', 'candidate.opt_out', v_ids[2], null,
+            null, v_ep - 1, null, v_t + interval '3 minutes 1 second');
+  if v_ev->>'ignored_reason' is distinct from 'stale_epoch' then v_bad := v_bad || ' lower_epoch=' || v_ev::text; end if;
+  v_ev := screening_v2.apply_phone_event('internal', 'candidate.opt_out', v_ids[2], null,
+            null, v_ep + 1, null, v_t + interval '3 minutes 2 seconds');
+  if v_ev->>'ignored_reason' is distinct from 'unexpected_event' then v_bad := v_bad || ' higher_epoch=' || v_ev::text; end if;
+  v_ev := screening_v2.apply_phone_event('internal', 'candidate.opt_out', null, v_ids[1],
+            null, null, null, v_t + interval '3 minutes 3 seconds');
+  if v_ev->>'ignored_reason' is distinct from 'unexpected_event' then v_bad := v_bad || ' no_attempt=' || v_ev::text; end if;
+  v_ev := screening_v2.apply_phone_event('livekit_webhook', 'candidate.opt_out', v_ids[2], null,
+            'pol114-s2-c7fence-prov', null, null, v_t + interval '3 minutes 4 seconds');
+  if v_ev->>'ignored_reason' is distinct from 'unexpected_event' then v_bad := v_bad || ' provider=' || v_ev::text; end if;
+
+  -- A later attempt exists: the posted one is no longer the latest.
+  insert into screening_v2.phone_call_attempts
+    (engagement_id, attempt_seq, epoch, kind, state, outcome_class, ist_date,
+     prior_engagement_state, admitted_at, ended_at)
+  values (v_ids[1], 2, v_ep, 'reconnect', 'ended', 'no_answer',
+          screening_v2.phone_ist_date(v_t + interval '4 minutes'), 'reconnecting',
+          v_t + interval '4 minutes', v_t + interval '5 minutes');
+  v_ev := screening_v2.apply_phone_event('internal', 'candidate.opt_out', v_ids[2], null,
+            null, null, null, v_t + interval '5 minutes 1 second');
+  if v_ev->>'ignored_reason' is distinct from 'unexpected_event' then v_bad := v_bad || ' not_latest=' || v_ev::text; end if;
+
+  select state into v_state from screening_v2.phone_engagements where id = v_ids[1];
+  select count(*) into v_sup from screening_v2.phone_suppressions where candidate_id = v_ids[4];
+  select status into v_sstatus from screening_v2.call_sessions where id = v_ids[3];
+  perform _policy_tests.assert(
+    '0114-§2 C7 fence: a wrong epoch, a null attempt, a provider source or a non-latest attempt is '
+      || 'recorded but moves nothing',
+    v_bad = '' and v_state = 'reconnecting' and v_sup = 0 and v_sstatus = 'in_progress',
+    coalesce(v_bad, '') || ' engagement=' || coalesce(v_state, '<null>') || ' suppressions=' || v_sup
+      || ' session=' || coalesce(v_sstatus, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-c7fence');
+end;
+$$;
+
+-- ── Trigger (ii): the late-score exception, and what it never allows ───
+do $$
+declare
+  v_t constant timestamptz := '2026-10-06T06:00:00Z';
+  v_ids uuid[]; v_eng uuid; v_sess uuid; v_ev jsonb; v_state text; v_reason text;
+  v_term0 timestamptz; v_term1 timestamptz; v_bad text := ''; v_try text; v_upd text;
+begin
+  -- The sweep's shape: reconnecting, bound session terminal, stranded abort.
+  v_ids := _policy_tests.p113_leg('pol114-s2-late', v_t);
+  v_eng := v_ids[1]; v_sess := v_ids[3];
+  perform screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_left', v_ids[2], null,
+            'pol114-s2-late-drop', null, null, v_t + interval '3 minutes');
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'conversation_complete'
+   where id = v_sess;
+  v_ev := screening_v2.apply_phone_event('internal', 'assessment.aborted', null, v_eng,
+            'stranded:' || v_sess::text || ':assessment.aborted', null, null, v_t + interval '30 minutes');
+  select state, state_reason, terminal_at into v_state, v_reason, v_term0
+    from screening_v2.phone_engagements where id = v_eng;
+  if not (v_ev->>'status' = 'applied' and v_state = 'failed' and v_reason = 'assessment_aborted') then
+    v_bad := v_bad || ' setup=' || coalesce(v_ev::text, '<null>') || '/' || coalesce(v_state, '<null>');
+  end if;
+
+  v_upd := 'update screening_v2.phone_engagements set state = ''completed'', '
+        || 'state_reason = ''late_score_after_stranded_abort'', version = version + 1, '
+        || 'updated_at = ' || quote_literal(v_t + interval '2 hours') || '::timestamptz';
+  -- No assessment yet.
+  v_try := _policy_tests.p114_try(v_upd || format(' where id = %L', v_eng));
+  if v_try <> 'P0001' then v_bad := v_bad || ' no_assessment=' || v_try; end if;
+
+  perform _policy_tests.p114_assess(v_sess, v_ids[4]);
+  -- terminal_at changed; another column changed; a different target reason.
+  v_try := _policy_tests.p114_try(v_upd || ', terminal_at = terminal_at + interval ''1 second'''
+                                  || format(' where id = %L', v_eng));
+  if v_try <> 'P0001' then v_bad := v_bad || ' terminal_at=' || v_try; end if;
+  v_try := _policy_tests.p114_try(v_upd || ', no_answer_attempts = no_answer_attempts + 1'
+                                  || format(' where id = %L', v_eng));
+  if v_try <> 'P0001' then v_bad := v_bad || ' other_column=' || v_try; end if;
+  v_try := _policy_tests.p114_try(format(
+             'update screening_v2.phone_engagements set state = %L, state_reason = %L where id = %L',
+             'completed', 'assessment_done', v_eng));
+  if v_try <> 'P0001' then v_bad := v_bad || ' other_target_reason=' || v_try; end if;
+
+  -- The valid shape applies, and only the four columns move. Caught, so a
+  -- chain without the exception records a FAIL instead of aborting the suite.
+  begin
+    execute v_upd || format(' where id = %L', v_eng);
+  exception when others then
+    v_bad := v_bad || ' valid_shape=' || sqlstate;
+  end;
+  select state, state_reason, terminal_at into v_state, v_reason, v_term1
+    from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0114-§2 trigger (ii): failed/assessment_aborted -> completed/late_score_after_stranded_abort applies '
+      || 'only with a phone assessment, the stranded row and no other column change',
+    v_bad = '' and v_state = 'completed' and v_reason = 'late_score_after_stranded_abort'
+      and v_term1 = v_term0,
+    coalesce(v_bad, '') || ' engagement=' || coalesce(v_state, '<null>') || '/' || coalesce(v_reason, '<null>')
+      || ' terminal_at ' || coalesce(v_term0::text, '<null>') || ' -> ' || coalesce(v_term1::text, '<null>'));
+
+  -- Terminal -> anything still raises (now completed).
+  v_try := _policy_tests.p114_try(format(
+             'update screening_v2.phone_engagements set state = %L where id = %L', 'failed', v_eng));
+  perform _policy_tests.assert(
+    '0114-§2 trigger: a terminal engagement still admits no further change',
+    v_try = 'P0001', 'result=' || coalesce(v_try, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-late');
+end;
+$$;
+
+do $$
+declare
+  v_t constant timestamptz := '2026-10-06T06:00:00Z';
+  v_ids uuid[]; v_ev jsonb; v_bad text := ''; v_try text; v_state text; v_reason text;
+begin
+  -- A WORKER-declared abort (attempt-scoped, no stranded row) is never relabelled.
+  v_ids := _policy_tests.p113_leg('pol114-s2-late-w', v_t);
+  v_ev := screening_v2.apply_phone_event('internal', 'assessment.aborted', v_ids[2], null,
+            null, null, null, v_t + interval '3 minutes');
+  select state, state_reason into v_state, v_reason from screening_v2.phone_engagements where id = v_ids[1];
+  perform _policy_tests.p114_assess(v_ids[3], v_ids[4]);
+  v_try := _policy_tests.p114_try(format(
+             'update screening_v2.phone_engagements set state = %L, state_reason = %L, version = version + 1 where id = %L',
+             'completed', 'late_score_after_stranded_abort', v_ids[1]));
+  if not (v_state = 'failed' and v_reason = 'assessment_aborted' and v_try = 'P0001') then
+    v_bad := v_bad || ' worker_abort=' || coalesce(v_state, '<null>') || '/' || coalesce(v_reason, '<null>') || '/' || v_try;
+  end if;
+  perform _policy_tests.p113_teardown('pol114-s2-late-w');
+
+  -- A different prior reason, even with an assessment and a stranded-id row.
+  v_ids := _policy_tests.p113_leg('pol114-s2-late-r', v_t);
+  update screening_v2.phone_engagements set reconnects_used = 3 where id = v_ids[1];
+  perform screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_left', v_ids[2], null,
+            'pol114-s2-late-r-drop', null, null, v_t + interval '3 minutes');
+  select state, state_reason into v_state, v_reason from screening_v2.phone_engagements where id = v_ids[1];
+  perform _policy_tests.p114_assess(v_ids[3], v_ids[4]);
+  insert into screening_v2.phone_call_events
+    (source, provider_event_id, engagement_id, attempt_id, epoch, event_type,
+     received_at, applied, ignored_reason, metadata, created_at)
+  values ('internal', 'stranded:' || v_ids[3]::text || ':assessment.aborted', v_ids[1], null, null,
+          'assessment.aborted', v_t + interval '4 minutes', true, null, null, v_t + interval '4 minutes');
+  v_try := _policy_tests.p114_try(format(
+             'update screening_v2.phone_engagements set state = %L, state_reason = %L, version = version + 1 where id = %L',
+             'completed', 'late_score_after_stranded_abort', v_ids[1]));
+  if not (v_state = 'failed' and v_reason = 'reconnect_budget_exhausted' and v_try = 'P0001') then
+    v_bad := v_bad || ' other_reason=' || coalesce(v_state, '<null>') || '/' || coalesce(v_reason, '<null>') || '/' || v_try;
+  end if;
+  perform _policy_tests.p113_teardown('pol114-s2-late-r');
+
+  -- reconnecting -> in_call is still illegal.
+  v_ids := _policy_tests.p113_leg('pol114-s2-late-rc', v_t);
+  perform screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_left', v_ids[2], null,
+            'pol114-s2-late-rc-drop', null, null, v_t + interval '3 minutes');
+  v_try := _policy_tests.p114_try(format(
+             'update screening_v2.phone_engagements set state = %L where id = %L', 'in_call', v_ids[1]));
+  if v_try <> 'P0001' then v_bad := v_bad || ' reconnecting_in_call=' || v_try; end if;
+  -- ...while reconnecting -> opted_out (C7 (i)) is legal at the trigger.
+  v_try := _policy_tests.p114_try(format(
+             'update screening_v2.phone_engagements set state = %L, terminal_at = %L where id = %L',
+             'opted_out', v_t + interval '4 minutes', v_ids[1]));
+  if v_try <> 'accepted' then v_bad := v_bad || ' reconnecting_opted_out=' || v_try; end if;
+  perform _policy_tests.p113_teardown('pol114-s2-late-rc');
+
+  perform _policy_tests.assert(
+    '0114-§2 trigger (ii) negatives: a worker abort, another prior reason and reconnecting -> in_call '
+      || 'still raise; reconnecting -> opted_out is now legal',
+    v_bad = '',
+    v_bad);
+end;
+$$;
+
+-- ── C1-e / C1-d: a continuation leg whose consent.resumed was NOT recorded ─
+-- The worker fails open (R1 never applied): the engagement stays `dialing`
+-- and, before this fix, the reconnect leg was never bound to the session, so
+-- its opt-out / deferral was ignored and finalize scored the session on the
+-- PREVIOUS leg's attempt. Cases marked RED fail on the pre-fix 0114.
+do $$
+declare
+  v_t constant timestamptz := '2026-10-06T06:00:00Z';
+  v_ids uuid[]; v_ev jsonb; v_fin jsonb; v_row jsonb;
+  v_state text; v_reason text; v_astate text; v_aout text; v_asess uuid; v_bound uuid;
+  v_sstatus text; v_sreason text; v_sup integer; v_claim uuid; v_rcu integer; v_found boolean;
+begin
+  -- Opt-out on the fail-open continuation leg (RED: unexpected_event, dialing).
+  v_ids := _policy_tests.p114_resumed('pol114-s2-c1e-opt', v_t);
+  v_ev := screening_v2.apply_phone_event('internal', 'candidate.opt_out', v_ids[6], null,
+            null, null, null, v_t + interval '6 minutes');
+  select state, state_reason into v_state, v_reason from screening_v2.phone_engagements where id = v_ids[1];
+  select state, outcome_class, session_id into v_astate, v_aout, v_asess
+    from screening_v2.phone_call_attempts where id = v_ids[6];
+  select status, terminal_reason into v_sstatus, v_sreason from screening_v2.call_sessions where id = v_ids[3];
+  select count(*) into v_sup from screening_v2.phone_suppressions where candidate_id = v_ids[4];
+  v_fin := screening_v2.finalize_phone_partial_sessions(200, 180, v_t + interval '40 minutes');
+  select exists (select 1 from jsonb_array_elements(v_fin->'sessions') s
+                  where s->>'session_id' = v_ids[3]::text) into v_found;
+  perform _policy_tests.assert(
+    '0114-§2 C1-e (RED): candidate.opt_out on a continuation leg without consent.resumed -> opted_out, '
+      || 'leg ended/opt_out and bound to the session, line suppressed, session cancelled, never finalized',
+    v_ev->>'status' = 'applied' and v_state = 'opted_out' and v_reason = 'candidate_opt_out'
+      and v_astate = 'ended' and v_aout = 'opt_out' and v_asess = v_ids[3] and v_sup = 1
+      and v_sstatus = 'cancelled' and v_sreason = 'candidate_opt_out' and not v_found,
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || '/' || coalesce(v_reason, '<null>') || ' attempt=' || coalesce(v_astate, '<null>') || '/'
+      || coalesce(v_aout, '<null>') || ' bound=' || coalesce((v_asess = v_ids[3])::text, 'false')
+      || ' suppressions=' || v_sup || ' session=' || coalesce(v_sstatus, '<null>') || '/'
+      || coalesce(v_sreason, '<null>') || ' finalized=' || v_found);
+  perform _policy_tests.p113_teardown('pol114-s2-c1e-opt');
+
+  -- Deferral on the fail-open continuation leg (RED: unexpected_event, and the
+  -- session was later scored on the previous leg's attempt).
+  v_ids := _policy_tests.p114_resumed('pol114-s2-c1e-def', v_t);
+  v_ev := screening_v2.apply_phone_event('internal', 'callback.deferred_in_call', v_ids[6], null,
+            null, null, null, v_t + interval '6 minutes');
+  select state, state_reason, session_id into v_state, v_reason, v_bound
+    from screening_v2.phone_engagements where id = v_ids[1];
+  select state, outcome_class, session_id into v_astate, v_aout, v_asess
+    from screening_v2.phone_call_attempts where id = v_ids[6];
+  select phone_engagement_id into v_claim from screening_v2.call_sessions where id = v_ids[3];
+  v_fin := screening_v2.finalize_phone_partial_sessions(200, 180, v_t + interval '40 minutes');
+  select s into v_row from jsonb_array_elements(v_fin->'sessions') s
+   where s->>'session_id' = v_ids[3]::text;
+  perform _policy_tests.assert(
+    '0114-§2 C1-e (RED): callback.deferred_in_call on a continuation leg without consent.resumed -> '
+      || 'eligible/callback_deferred_in_call, session detached, leg bound; finalize reads THIS leg and '
+      || 'suppresses scoring (callback_deferred)',
+    v_ev->>'status' = 'applied' and v_state = 'eligible' and v_reason = 'callback_deferred_in_call'
+      and v_bound is null and v_claim is null
+      and v_astate = 'ended' and v_aout = 'callback_deferred' and v_asess = v_ids[3]
+      and v_row->>'attempt_id' = v_ids[6]::text
+      and (v_row->>'score_suppressed')::boolean is true
+      and v_row->>'suppress_reason' = 'callback_deferred'
+      and screening_v2.phone_attempt_score_suppression(v_ids[6]) = 'callback_deferred',
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || '/' || coalesce(v_reason, '<null>') || ' attempt=' || coalesce(v_astate, '<null>') || '/'
+      || coalesce(v_aout, '<null>') || ' bound=' || coalesce((v_asess = v_ids[3])::text, 'false')
+      || ' finalize_row=' || coalesce(v_row::text, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-c1e-def');
+
+  -- Not consented-live (no plan): the dialing opt-out stays unexpected_event.
+  v_ids := _policy_tests.p114_resumed('pol114-s2-c1e-noplan', v_t, false);
+  v_ev := screening_v2.apply_phone_event('internal', 'candidate.opt_out', v_ids[6], null,
+            null, null, null, v_t + interval '6 minutes');
+  select state into v_state from screening_v2.phone_engagements where id = v_ids[1];
+  select session_id into v_asess from screening_v2.phone_call_attempts where id = v_ids[6];
+  perform _policy_tests.assert(
+    '0114-§2 C1-e: with no plan a dialing candidate.opt_out is unexpected_event and binds nothing',
+    v_ev->>'ignored_reason' = 'unexpected_event' and v_state = 'dialing' and v_asess is null,
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-c1e-noplan');
+
+  -- The drop race (any source) binds the continuation leg to the session.
+  v_ids := _policy_tests.p114_resumed('pol114-s2-c1d-race', v_t);
+  v_ev := screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_left', v_ids[6], null,
+            'pol114-s2-c1d-race-drop2', null, null, v_t + interval '4 minutes 25 seconds');
+  select session_id into v_asess from screening_v2.phone_call_attempts where id = v_ids[6];
+  perform _policy_tests.assert(
+    '0114-§2 C1-d: the drop race binds the continuation leg to its session',
+    v_ev->>'status' = 'applied' and v_asess = v_ids[3],
+    'event=' || coalesce(v_ev::text, '<null>') || ' bound=' || coalesce((v_asess = v_ids[3])::text, 'false'));
+  perform _policy_tests.p113_teardown('pol114-s2-c1d-race');
+
+  -- The reconciler is the drop race's production producer: consented-live ->
+  -- charged reconnect (RED: the reconciler posted nothing for dialing+answered).
+  v_ids := _policy_tests.p114_resumed('pol114-s2-c1e-recon', v_t);
+  v_ev := screening_v2.apply_phone_event('reconciliation', 'sip.participant_left', v_ids[6], null,
+            null, null, null, v_t + interval '8 minutes');
+  select state, reconnects_used into v_state, v_rcu from screening_v2.phone_engagements where id = v_ids[1];
+  select state, outcome_class, session_id into v_astate, v_aout, v_asess
+    from screening_v2.phone_call_attempts where id = v_ids[6];
+  perform _policy_tests.assert(
+    '0114-§2 C1-e: a reconciliation drop of a consented-live continuation leg is a charged reconnect',
+    v_ev->>'status' = 'applied' and v_state = 'reconnecting' and v_rcu = 2
+      and v_astate = 'ended' and v_aout = 'disconnected' and v_asess = v_ids[3],
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || ' reconnects_used=' || coalesce(v_rcu::text, '<null>') || ' attempt=' || coalesce(v_astate, '<null>')
+      || '/' || coalesce(v_aout, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-c1e-recon');
+
+  -- ...and outside a continuation it is recorded, not applied; the webhook
+  -- still takes the 0043 pre-disclosure branch (PR-A A2 unchanged).
+  v_ids := _policy_tests.p114_resumed('pol114-s2-c1e-recon0', v_t, false);
+  v_ev := screening_v2.apply_phone_event('reconciliation', 'sip.participant_left', v_ids[6], null,
+            null, null, null, v_t + interval '8 minutes');
+  select state into v_state from screening_v2.phone_engagements where id = v_ids[1];
+  select state into v_astate from screening_v2.phone_call_attempts where id = v_ids[6];
+  perform _policy_tests.assert(
+    '0114-§2 C1-e: a reconciliation drop of a pre-consent answered dialing leg is unexpected_event, nothing moves',
+    v_ev->>'ignored_reason' = 'unexpected_event' and v_state = 'dialing' and v_astate = 'answered_unclassified',
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || ' attempt=' || coalesce(v_astate, '<null>'));
+  v_ev := screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_left', v_ids[6], null,
+            'pol114-s2-c1e-recon0-drop2', null, null, v_t + interval '8 minutes 10 seconds');
+  select state, state_reason into v_state, v_reason from screening_v2.phone_engagements where id = v_ids[1];
+  perform _policy_tests.assert(
+    '0114-§2 C1-e: after it, the webhook drop is still abandoned_pre_disclosure (A2 pin)',
+    v_ev->>'status' = 'applied' and v_state = 'eligible' and v_reason = 'abandoned_pre_disclosure',
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || '/' || coalesce(v_reason, '<null>'));
+  perform _policy_tests.p113_teardown('pol114-s2-c1e-recon0');
+end;
+$$;
+-- ==== 0114-§2 END ====
+
+-- ==== 0114-§3 BEGIN ====
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0114 §3 / M009 S3 — outcome consistency: score suppression, partial
+-- finalize (C2 suppression + C7 withdrawn), the stranded sweep's live-job
+-- guard (C2-P4) and the late completion (C2-P5).
+--
+-- Same Tue 2026-10-06 11:30 IST (06:00Z) anchor as the 0113/0114-§2 blocks.
+-- Every fixture is tagged `pol114-s3-*` and torn down at the end of its
+-- block; job_queue / job_dlq rows a block writes are deleted by key. Neutral
+-- labels only; no assertion reads the host clock. Cases marked RED fail on
+-- 0001..0113 by assertion (they call only functions 0113 already has).
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- The stranded sweep's input shape: a disclosed leg dropped by webhook
+-- (reconnecting, charged), its bound session completed and unscored.
+-- Returns p113_leg's [engagement, attempt, session, candidate, role].
+create or replace function _policy_tests.p114s3_stranded(p_tag text, p_t timestamptz)
+returns uuid[]
+language plpgsql as $p114s3s$
+declare
+  v_ids uuid[]; v_ev jsonb;
+begin
+  v_ids := _policy_tests.p113_leg(p_tag, p_t);
+  v_ev := screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_left', v_ids[2], null,
+            p_tag || '-drop', null, null, p_t + interval '3 minutes');
+  if v_ev->>'status' is distinct from 'applied' then
+    raise exception 'p114s3_stranded(%): drop not applied: %', p_tag, v_ev;
+  end if;
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'conversation_complete',
+         ended_at = p_t + interval '5 minutes'
+   where id = v_ids[3];
+  return v_ids;
+end;
+$p114s3s$;
+
+-- ── C2 (RED): the 4352df89 regression — a worker abort, finalize suppresses
+do $$
+declare
+  v_t   constant timestamptz := '2026-10-06T06:00:00Z';
+  v_now constant timestamptz := '2026-10-06T07:00:00Z';   -- far past the 180 s grace
+  v_w uuid[]; v_ev jsonb; v_fin jsonb; v_e jsonb; v_a jsonb;
+  v_state text; v_reason text; v_status text; v_jobs integer;
+begin
+  v_w := _policy_tests.p113_leg('pol114-s3-w', v_t);
+  update screening_v2.call_sessions set recording_egress_id = 'EG_pol114s3w' where id = v_w[3];
+  -- The worker declares the interview over (the HALT_CANDIDATE_ENDED path):
+  -- engagement failed/assessment_aborted, the session left in_progress.
+  v_ev := screening_v2.apply_phone_event('internal', 'assessment.aborted', v_w[2], null,
+            null, null, null, v_t + interval '3 minutes');
+  select state, state_reason into v_state, v_reason from screening_v2.phone_engagements where id = v_w[1];
+  if not (v_ev->>'status' = 'applied' and v_state = 'failed' and v_reason = 'assessment_aborted') then
+    raise exception '0114-§3 worker-abort fixture: %/%/%', v_ev, v_state, v_reason;
+  end if;
+
+  v_fin := screening_v2.finalize_phone_partial_sessions(200, 180, v_now);
+  for v_e in select * from jsonb_array_elements(coalesce(v_fin->'sessions', '[]'::jsonb)) loop
+    if v_e->>'session_id' = v_w[3]::text then v_a := v_e; end if;
+  end loop;
+  select status into v_status from screening_v2.call_sessions where id = v_w[3];
+  select count(*) into v_jobs from screening_v2.job_queue
+   where name = 'recording.finalize' and dedup_key = 'recording.finalize:' || v_w[3]::text;
+  perform _policy_tests.assert(
+    '0114-§3 C2 (RED): a worker-aborted leg is finalized (session completed, MP3 trigger fired) '
+      || 'and reported score_suppressed/worker_aborted, so it is never scored',
+    v_a is not null and (v_a->>'score_suppressed')::boolean is true
+      and v_a->>'suppress_reason' = 'worker_aborted'
+      and (v_a->>'callback_booked')::boolean is false
+      and (v_a->>'transitioned')::boolean is true
+      and v_status = 'completed' and v_jobs = 1
+      and (v_fin->>'withdrawn_skipped')::int is not null,
+    'entry=' || coalesce(v_a::text, '<absent>') || ' session=' || coalesce(v_status, '<null>')
+      || ' finalize_jobs=' || v_jobs || ' withdrawn_skipped=' || coalesce(v_fin->>'withdrawn_skipped', '<absent>'));
+
+  delete from screening_v2.job_queue where dedup_key = 'recording.finalize:' || v_w[3]::text;
+  perform _policy_tests.p113_teardown('pol114-s3-w');
+end;
+$$;
+
+-- ── C2: phone_attempt_score_suppression, shape by shape ─────────────────
+do $$
+declare
+  v_t constant timestamptz := '2026-10-06T06:00:00Z';
+  v_w uuid[]; v_cb uuid[]; v_df uuid[]; v_st uuid[]; v_ig uuid[]; v_pl uuid[];
+  v_res jsonb; v_ev jsonb; v_bad text := ''; v_got text;
+begin
+  -- worker_aborted: an applied internal assessment.aborted on THIS attempt.
+  v_w := _policy_tests.p113_leg('pol114-s3-sw', v_t);
+  perform screening_v2.apply_phone_event('internal', 'assessment.aborted', v_w[2], null,
+            null, null, null, v_t + interval '3 minutes');
+  v_got := screening_v2.phone_attempt_score_suppression(v_w[2]);
+  if v_got is distinct from 'worker_aborted' then v_bad := v_bad || ' worker=' || coalesce(v_got, '<null>'); end if;
+
+  -- callback_booked: PR-B's confirmed in-call callback.
+  v_cb := _policy_tests.p113_leg('pol114-s3-scb', v_t);
+  v_res := screening_v2.confirm_candidate_voice_callback(v_cb[2], '2026-10-07T06:00:00Z',
+             v_t + interval '3 minutes');
+  if v_res->>'status' is distinct from 'ok' then raise exception 'scb fixture: %', v_res; end if;
+  v_got := screening_v2.phone_attempt_score_suppression(v_cb[2]);
+  if v_got is distinct from 'callback_booked' then v_bad := v_bad || ' booked=' || coalesce(v_got, '<null>'); end if;
+
+  -- callback_deferred: the §2 in-call deferral ended the attempt.
+  v_df := _policy_tests.p113_leg('pol114-s3-sdf', v_t);
+  v_ev := screening_v2.apply_phone_event('internal', 'callback.deferred_in_call', v_df[2], null,
+            null, null, null, v_t + interval '3 minutes');
+  if v_ev->>'status' is distinct from 'applied' then raise exception 'sdf fixture: %', v_ev; end if;
+  v_got := screening_v2.phone_attempt_score_suppression(v_df[2]);
+  if v_got is distinct from 'callback_deferred' then v_bad := v_bad || ' deferred=' || coalesce(v_got, '<null>'); end if;
+
+  -- The stranded sweep's abort carries attempt_id NULL: NOT suppressed (a DLQ
+  -- replay of a stranded session still scores, PR-B E5).
+  v_st := _policy_tests.p114s3_stranded('pol114-s3-sst', v_t);
+  v_ev := screening_v2.apply_phone_event('internal', 'assessment.aborted', null, v_st[1],
+            'stranded:' || v_st[3]::text || ':assessment.aborted', null, null, v_t + interval '30 minutes');
+  if v_ev->>'status' is distinct from 'applied' then raise exception 'sst fixture: %', v_ev; end if;
+  v_got := screening_v2.phone_attempt_score_suppression(v_st[2]);
+  if v_got is not null then v_bad := v_bad || ' stranded=' || v_got; end if;
+
+  -- A worker abort that was NOT applied (stale epoch) is not a reason.
+  v_ig := _policy_tests.p113_leg('pol114-s3-sig', v_t);
+  v_ev := screening_v2.apply_phone_event('internal', 'assessment.aborted', v_ig[2], null,
+            null, 0, null, v_t + interval '3 minutes');
+  if v_ev->>'ignored_reason' is distinct from 'stale_epoch' then raise exception 'sig fixture: %', v_ev; end if;
+  v_got := screening_v2.phone_attempt_score_suppression(v_ig[2]);
+  if v_got is not null then v_bad := v_bad || ' unapplied=' || v_got; end if;
+
+  -- An ordinary hang-up partial, and a NULL attempt.
+  v_pl := _policy_tests.p113_leg('pol114-s3-spl', v_t, 'disconnected');
+  v_got := screening_v2.phone_attempt_score_suppression(v_pl[2]);
+  if v_got is not null then v_bad := v_bad || ' plain=' || v_got; end if;
+  v_got := screening_v2.phone_attempt_score_suppression(null);
+  if v_got is not null then v_bad := v_bad || ' null_attempt=' || v_got; end if;
+
+  perform _policy_tests.assert(
+    '0114-§3 C2: suppression answers worker_aborted / callback_booked / callback_deferred for those legs '
+      || 'and null for a stranded abort, an unapplied worker abort, a plain partial and a null attempt',
+    v_bad = '', v_bad);
+
+  perform _policy_tests.p113_teardown('pol114-s3-sw');
+  perform _policy_tests.p113_teardown('pol114-s3-scb');
+  perform _policy_tests.p113_teardown('pol114-s3-sdf');
+  perform _policy_tests.p113_teardown('pol114-s3-sst');
+  perform _policy_tests.p113_teardown('pol114-s3-sig');
+  perform _policy_tests.p113_teardown('pol114-s3-spl');
+end;
+$$;
+
+-- ── C2: suppressed legs on the expired arm are not selected; posture ────
+do $$
+declare
+  v_t   constant timestamptz := '2026-10-06T06:00:00Z';
+  v_now constant timestamptz := '2026-10-06T07:00:00Z';
+  v_df uuid[]; v_wx uuid[]; v_fin jsonb; v_e jsonb; v_hit text := '';
+begin
+  -- A deferred leg and a worker-aborted leg, both already crash-terminalized
+  -- to expired/grace_timeout: neither is ever scored, so the expired arm
+  -- (which only an assessment row drains) must not select them.
+  v_df := _policy_tests.p113_leg('pol114-s3-xdf', v_t);
+  perform screening_v2.apply_phone_event('internal', 'callback.deferred_in_call', v_df[2], null,
+            null, null, null, v_t + interval '3 minutes');
+  update screening_v2.call_sessions
+     set status = 'expired', terminal_reason = 'grace_timeout', ended_at = v_t + interval '4 minutes'
+   where id = v_df[3];
+  v_wx := _policy_tests.p113_leg('pol114-s3-xw', v_t);
+  perform screening_v2.apply_phone_event('internal', 'assessment.aborted', v_wx[2], null,
+            null, null, null, v_t + interval '3 minutes');
+  update screening_v2.call_sessions
+     set status = 'expired', terminal_reason = 'grace_timeout', ended_at = v_t + interval '4 minutes'
+   where id = v_wx[3];
+
+  v_fin := screening_v2.finalize_phone_partial_sessions(200, 180, v_now);
+  for v_e in select * from jsonb_array_elements(coalesce(v_fin->'sessions', '[]'::jsonb)) loop
+    if v_e->>'session_id' in (v_df[3]::text, v_wx[3]::text) then v_hit := v_hit || ' ' || v_e::text; end if;
+  end loop;
+  perform _policy_tests.assert(
+    '0114-§3 C2: expired/grace_timeout deferred and worker-aborted legs are not selected (no starvation)',
+    v_hit = '', 'selected:' || v_hit);
+
+  perform _policy_tests.assert(
+    '0114-§3 posture: the four §3 functions are SECURITY DEFINER, search_path pinned, service_role-only',
+    (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'screening_v2'
+        and p.proname in ('phone_attempt_score_suppression', 'finalize_phone_partial_sessions',
+                          'complete_phone_engagement_after_late_score', 'sweep_phone_stranded_sessions')
+        and p.prosecdef
+        and p.proconfig @> array['search_path=pg_catalog, screening_v2']
+        and has_function_privilege('service_role', p.oid, 'execute')
+        and not has_function_privilege('anon', p.oid, 'execute')
+        and not has_function_privilege('authenticated', p.oid, 'execute')) = 4,
+    'a §3 function lost its definer, search_path or service_role-only grant');
+
+  perform _policy_tests.p113_teardown('pol114-s3-xdf');
+  perform _policy_tests.p113_teardown('pol114-s3-xw');
+end;
+$$;
+
+-- ── C2-P4: a live phone.assessment job means "not stranded" ─────────────
+do $$
+declare
+  v_t   constant timestamptz := '2026-10-06T06:00:00Z';
+  v_now constant timestamptz := '2026-10-06T08:00:00Z';   -- far past the 900 s grace
+  v_p uuid[]; v_a uuid[]; v_d uuid[]; v_sw jsonb; v_sw2 jsonb;
+  v_ps text; v_as text; v_ds text; v_job_a uuid;
+begin
+  -- Resolve whatever an earlier block left stranded (the sweep is fleet-wide).
+  perform screening_v2.sweep_phone_stranded_sessions(200, v_now);
+
+  v_p := _policy_tests.p114s3_stranded('pol114-s3-jp', v_t);
+  v_a := _policy_tests.p114s3_stranded('pol114-s3-ja', v_t);
+  v_d := _policy_tests.p114s3_stranded('pol114-s3-jd', v_t);
+  insert into screening_v2.job_queue (name, payload, status, dedup_key, scheduled_at, created_at)
+  values ('phone.assessment', jsonb_build_object('session_id', v_p[3]), 'pending',
+          'phone.assessment:' || v_p[3]::text, v_t, v_t),
+         ('phone.assessment', jsonb_build_object('session_id', v_a[3]), 'active',
+          'phone.assessment:' || v_a[3]::text, v_t, v_t),
+         ('phone.assessment', jsonb_build_object('session_id', v_d[3]), 'delayed',
+          'phone.assessment:' || v_d[3]::text, v_t, v_t);
+
+  v_sw := screening_v2.sweep_phone_stranded_sessions(200, v_now);
+  select state into v_ps from screening_v2.phone_engagements where id = v_p[1];
+  select state into v_as from screening_v2.phone_engagements where id = v_a[1];
+  select state into v_ds from screening_v2.phone_engagements where id = v_d[1];
+  perform _policy_tests.assert(
+    '0114-§3 C2-P4: with a pending, active or delayed phone.assessment job the sweep examines 0',
+    (v_sw->>'examined')::int = 0 and v_ps = 'reconnecting' and v_as = 'reconnecting' and v_ds = 'reconnecting',
+    'sweep=' || coalesce(v_sw::text, '<null>') || ' states=' || coalesce(v_ps, '<null>') || '/'
+      || coalesce(v_as, '<null>') || '/' || coalesce(v_ds, '<null>'));
+
+  -- The job completes for one, is moved to the DLQ for another: both resolve
+  -- exactly as before (unscored -> failed). The delayed one stays protected.
+  update screening_v2.job_queue set status = 'completed', completed_at = v_now
+   where dedup_key = 'phone.assessment:' || v_p[3]::text;
+  select id into v_job_a from screening_v2.job_queue where dedup_key = 'phone.assessment:' || v_a[3]::text;
+  insert into screening_v2.job_dlq (id, name, payload, dedup_key, attempts, max_attempts, error_message, failed_at, moved_at)
+  select id, name, payload, dedup_key, 5, 5, 'pol114 synthetic', v_now, v_now
+    from screening_v2.job_queue where id = v_job_a;
+  delete from screening_v2.job_queue where id = v_job_a;
+
+  v_sw2 := screening_v2.sweep_phone_stranded_sessions(200, v_now + interval '1 minute');
+  select state into v_ps from screening_v2.phone_engagements where id = v_p[1];
+  select state into v_as from screening_v2.phone_engagements where id = v_a[1];
+  select state into v_ds from screening_v2.phone_engagements where id = v_d[1];
+  perform _policy_tests.assert(
+    '0114-§3 C2-P4: once the job completed or went to the DLQ the sweep aborts as before; delayed stays',
+    (v_sw2->>'examined')::int = 2 and (v_sw2->>'failed')::int = 2
+      and v_ps = 'failed' and v_as = 'failed' and v_ds = 'reconnecting',
+    'sweep=' || coalesce(v_sw2::text, '<null>') || ' states=' || coalesce(v_ps, '<null>') || '/'
+      || coalesce(v_as, '<null>') || '/' || coalesce(v_ds, '<null>'));
+
+  delete from screening_v2.job_queue
+   where dedup_key in ('phone.assessment:' || v_p[3]::text, 'phone.assessment:' || v_a[3]::text,
+                       'phone.assessment:' || v_d[3]::text);
+  delete from screening_v2.job_dlq where id = v_job_a;
+  perform _policy_tests.p113_teardown('pol114-s3-jp');
+  perform _policy_tests.p113_teardown('pol114-s3-ja');
+  perform _policy_tests.p113_teardown('pol114-s3-jd');
+end;
+$$;
+
+-- ── C2-P5 (RED): the e6bc7f18 shape — sweep abort, then the score lands ──
+do $$
+declare
+  v_t   constant timestamptz := '2026-10-06T06:00:00Z';
+  v_now constant timestamptz := '2026-10-06T08:00:00Z';
+  v_ids uuid[]; v_eng uuid; v_sess uuid;
+  v_sw jsonb; v_sw2 jsonb; v_sw3 jsonb; v_res jsonb;
+  v_state text; v_reason text; v_term0 timestamptz; v_term1 timestamptz;
+  v_ver1 integer; v_ver2 integer; v_upd1 timestamptz;
+  v_ledger integer; v_audit integer; v_meta jsonb;
+begin
+  perform screening_v2.sweep_phone_stranded_sessions(200, v_now);
+
+  v_ids := _policy_tests.p114s3_stranded('pol114-s3-late', v_t);
+  v_eng := v_ids[1]; v_sess := v_ids[3];
+  v_sw := screening_v2.sweep_phone_stranded_sessions(200, v_now);
+  select state, state_reason, terminal_at into v_state, v_reason, v_term0
+    from screening_v2.phone_engagements where id = v_eng;
+  if not (v_state = 'failed' and v_reason = 'assessment_aborted' and (v_sw->>'failed')::int = 1) then
+    raise exception '0114-§3 late fixture: sweep=% engagement=%/%', v_sw, v_state, v_reason;
+  end if;
+
+  -- The score lands after the abort (a DLQ replay / slow job).
+  perform _policy_tests.p114_assess(v_sess, v_ids[4]);
+  v_sw2 := screening_v2.sweep_phone_stranded_sessions(200, v_now + interval '10 minutes');
+  select state, state_reason, terminal_at, version, updated_at
+    into v_state, v_reason, v_term1, v_ver1, v_upd1
+    from screening_v2.phone_engagements where id = v_eng;
+  select count(*) into v_ledger from screening_v2.phone_call_events
+   where source = 'internal' and engagement_id = v_eng and applied
+     and event_type = 'assessment.completed'
+     and provider_event_id = 'late:' || v_sess::text || ':assessment.completed';
+  select count(*), max(metadata::text)::jsonb into v_audit, v_meta from screening_v2.audit_events
+   where action = 'phone_engagement_late_completed' and target_type = 'phone_engagement'
+     and target_id = v_eng::text and actor_type = 'system';
+  perform _policy_tests.assert(
+    '0114-§3 C2-P5 (RED): a sweep-aborted engagement whose score landed later becomes '
+      || 'completed/late_score_after_stranded_abort, terminal_at unchanged, ledger and audit written',
+    coalesce((v_sw2->>'late_completed')::int, 0) = 1
+      and v_state = 'completed' and v_reason = 'late_score_after_stranded_abort'
+      and v_term1 = v_term0 and v_upd1 = v_now + interval '10 minutes'
+      and v_ledger = 1 and v_audit = 1
+      and v_meta->>'session_id' = v_sess::text and v_meta->>'prior_reason' = 'assessment_aborted'
+      and not (v_meta ?| array['phone_e164', 'email', 'name', 'room_name']),
+    'sweep=' || coalesce(v_sw2::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>') || '/'
+      || coalesce(v_reason, '<null>') || ' terminal_at ' || coalesce(v_term0::text, '<null>') || ' -> '
+      || coalesce(v_term1::text, '<null>') || ' ledger=' || v_ledger || ' audit=' || v_audit
+      || ' meta=' || coalesce(v_meta::text, '<null>'));
+
+  -- A rerun is a no-op; a direct call is not_eligible.
+  v_sw3 := screening_v2.sweep_phone_stranded_sessions(200, v_now + interval '20 minutes');
+  v_res := screening_v2.complete_phone_engagement_after_late_score(v_eng, v_now + interval '21 minutes');
+  select version into v_ver2 from screening_v2.phone_engagements where id = v_eng;
+  select count(*) into v_audit from screening_v2.audit_events
+   where action = 'phone_engagement_late_completed' and target_id = v_eng::text;
+  perform _policy_tests.assert(
+    '0114-§3 C2-P5: a rerun completes nothing more and a direct call is not_eligible',
+    coalesce((v_sw3->>'late_completed')::int, -1) = 0 and v_res->>'status' = 'not_eligible'
+      and v_ver2 = v_ver1 and v_audit = 1,
+    'rerun=' || coalesce(v_sw3::text, '<null>') || ' direct=' || coalesce(v_res::text, '<null>')
+      || ' version ' || coalesce(v_ver1::text, '<null>') || ' -> ' || coalesce(v_ver2::text, '<null>'));
+
+  perform _policy_tests.assert(
+    '0114-§3 C2-P5: complete_phone_engagement_after_late_score(null) is not_eligible',
+    screening_v2.complete_phone_engagement_after_late_score(null, v_now)->>'status' = 'not_eligible',
+    'null engagement');
+
+  perform _policy_tests.p113_teardown('pol114-s3-late');
+end;
+$$;
+
+-- ── C2-P5: a newer cycle supersedes; a worker abort is never relabelled ──
+do $$
+declare
+  v_t   constant timestamptz := '2026-10-06T06:00:00Z';
+  v_now constant timestamptz := '2026-10-06T08:00:00Z';
+  v_ids uuid[]; v_eng uuid; v_sess uuid; v_new uuid; v_w uuid[];
+  v_sw jsonb; v_sw2 jsonb; v_res jsonb; v_res2 jsonb;
+  v_state text; v_reason text; v_wstate text; v_wreason text;
+begin
+  perform screening_v2.sweep_phone_stranded_sessions(200, v_now);
+
+  v_ids := _policy_tests.p114s3_stranded('pol114-s3-sup', v_t);
+  v_eng := v_ids[1]; v_sess := v_ids[3];
+  v_sw := screening_v2.sweep_phone_stranded_sessions(200, v_now);
+  perform _policy_tests.p114_assess(v_sess, v_ids[4]);
+  -- A newer cycle on the same application (cycle 2, not yet started).
+  v_new := gen_random_uuid();
+  insert into screening_v2.phone_engagements
+  select (jsonb_populate_record(null::screening_v2.phone_engagements,
+            to_jsonb(e) || jsonb_build_object(
+              'id', v_new, 'cycle_number', 2, 'state', 'pending_prereqs', 'state_reason', null,
+              'terminal_at', null, 'session_id', null, 'version', 1, 'epoch', 0,
+              'reconnects_used', 0, 'no_answer_attempts', 0, 'provider_failures', 0))).*
+    from screening_v2.phone_engagements e where e.id = v_eng;
+
+  v_res := screening_v2.complete_phone_engagement_after_late_score(v_eng, v_now + interval '5 minutes');
+  v_sw2 := screening_v2.sweep_phone_stranded_sessions(200, v_now + interval '10 minutes');
+  select state, state_reason into v_state, v_reason from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0114-§3 C2-P5: with a newer cycle the late completion is not_eligible and counted late_superseded=1',
+    v_res->>'status' = 'not_eligible' and coalesce((v_sw2->>'late_completed')::int, -1) = 0
+      and coalesce((v_sw2->>'late_superseded')::int, -1) = 1
+      and v_state = 'failed' and v_reason = 'assessment_aborted',
+    'direct=' || coalesce(v_res::text, '<null>') || ' sweep=' || coalesce(v_sw2::text, '<null>')
+      || ' engagement=' || coalesce(v_state, '<null>') || '/' || coalesce(v_reason, '<null>'));
+
+  -- A WORKER-declared abort with a score is unchanged (C2-P3: HR admin-scores).
+  v_w := _policy_tests.p113_leg('pol114-s3-wl', v_t);
+  perform screening_v2.apply_phone_event('internal', 'assessment.aborted', v_w[2], null,
+            null, null, null, v_t + interval '3 minutes');
+  perform _policy_tests.p114_assess(v_w[3], v_w[4]);
+  v_res2 := screening_v2.complete_phone_engagement_after_late_score(v_w[1], v_now + interval '15 minutes');
+  perform screening_v2.sweep_phone_stranded_sessions(200, v_now + interval '16 minutes');
+  select state, state_reason into v_wstate, v_wreason from screening_v2.phone_engagements where id = v_w[1];
+  perform _policy_tests.assert(
+    '0114-§3 C2-P5: a worker-aborted engagement with an assessment stays failed/assessment_aborted',
+    v_res2->>'status' = 'not_eligible' and v_wstate = 'failed' and v_wreason = 'assessment_aborted',
+    'direct=' || coalesce(v_res2::text, '<null>') || ' engagement=' || coalesce(v_wstate, '<null>')
+      || '/' || coalesce(v_wreason, '<null>'));
+
+  perform _policy_tests.p113_teardown('pol114-s3-sup');
+  perform _policy_tests.p113_teardown('pol114-s3-wl');
+end;
+$$;
+
+-- ── C7: finalize never completes or returns a withdrawn leg ─────────────
+do $$
+declare
+  v_t   constant timestamptz := '2026-10-06T06:00:00Z';
+  v_now constant timestamptz := '2026-10-06T07:00:00Z';
+  v_o uuid[]; v_wn uuid[]; v_ox uuid[]; v_b uuid[];
+  v_ev jsonb; v_fin jsonb; v_e jsonb; v_hit text := '';
+  v_os text; v_otr text; v_ws text; v_wtr text; v_xs text; v_bs text; v_btr text;
+  v_breason text;
+begin
+  -- (o) an opted_out engagement whose leg session is still in_progress.
+  v_o := _policy_tests.p113_leg('pol114-s3-fo', v_t, 'disconnected');
+  update screening_v2.phone_engagements
+     set state = 'opted_out', state_reason = 'candidate_opt_out', terminal_at = v_t + interval '3 minutes'
+   where id = v_o[1];
+  -- (wn) a wrong_number engagement, same shape.
+  v_wn := _policy_tests.p113_leg('pol114-s3-fwn', v_t, 'disconnected');
+  update screening_v2.phone_engagements
+     set state = 'wrong_number', state_reason = 'wrong_number', terminal_at = v_t + interval '3 minutes'
+   where id = v_wn[1];
+  -- (ox) an opted_out engagement whose session is crash residue (expired arm).
+  v_ox := _policy_tests.p113_leg('pol114-s3-fox', v_t, 'disconnected');
+  update screening_v2.phone_engagements
+     set state = 'opted_out', state_reason = 'candidate_opt_out', terminal_at = v_t + interval '3 minutes'
+   where id = v_ox[1];
+  update screening_v2.call_sessions
+     set status = 'expired', terminal_reason = 'grace_timeout', ended_at = v_t + interval '4 minutes'
+   where id = v_ox[3];
+  -- (b) failed/reconnect_budget_exhausted, then the candidate's opt-out lost
+  -- the race and was IGNORED (terminal) on the leg's attempt.
+  v_b := _policy_tests.p113_leg('pol114-s3-fb', v_t);
+  update screening_v2.phone_engagements set reconnects_used = 3 where id = v_b[1];
+  perform screening_v2.apply_phone_event('livekit_webhook', 'sip.participant_left', v_b[2], null,
+            'pol114-s3-fb-drop', null, null, v_t + interval '3 minutes');
+  select state_reason into v_breason from screening_v2.phone_engagements where id = v_b[1];
+  v_ev := screening_v2.apply_phone_event('internal', 'candidate.opt_out', v_b[2], null,
+            null, null, null, v_t + interval '3 minutes 5 seconds');
+  if not (v_breason = 'reconnect_budget_exhausted' and v_ev->>'ignored_reason' = 'terminal') then
+    raise exception '0114-§3 C7 fixture (b): reason=% opt_out=%', v_breason, v_ev;
+  end if;
+
+  v_fin := screening_v2.finalize_phone_partial_sessions(200, 180, v_now);
+  for v_e in select * from jsonb_array_elements(coalesce(v_fin->'sessions', '[]'::jsonb)) loop
+    if v_e->>'session_id' in (v_o[3]::text, v_wn[3]::text, v_ox[3]::text, v_b[3]::text) then
+      v_hit := v_hit || ' ' || v_e::text;
+    end if;
+  end loop;
+  select status, terminal_reason into v_os, v_otr from screening_v2.call_sessions where id = v_o[3];
+  select status, terminal_reason into v_ws, v_wtr from screening_v2.call_sessions where id = v_wn[3];
+  select status into v_xs from screening_v2.call_sessions where id = v_ox[3];
+  select status, terminal_reason into v_bs, v_btr from screening_v2.call_sessions where id = v_b[3];
+
+  perform _policy_tests.assert(
+    '0114-§3 C7: a withdrawn leg is never returned for scoring (opted_out, wrong_number, expired residue, '
+      || 'ignored opt-out)',
+    v_hit = '', 'returned:' || v_hit);
+  perform _policy_tests.assert(
+    '0114-§3 C7: withdrawn in_progress sessions are CANCELLED with the truthful reason, never completed; '
+      || 'the expired residue is left as it is; withdrawn_skipped counts them',
+    v_os = 'cancelled' and v_otr = 'candidate_opt_out'
+      and v_ws = 'cancelled' and v_wtr = 'wrong_number'
+      and v_xs = 'expired'
+      and v_bs = 'cancelled' and v_btr = 'candidate_opt_out'
+      and (v_fin->>'withdrawn_skipped')::int >= 3,
+    'opted_out=' || coalesce(v_os, '<null>') || '/' || coalesce(v_otr, '<null>')
+      || ' wrong_number=' || coalesce(v_ws, '<null>') || '/' || coalesce(v_wtr, '<null>')
+      || ' expired=' || coalesce(v_xs, '<null>')
+      || ' budget_exhausted=' || coalesce(v_bs, '<null>') || '/' || coalesce(v_btr, '<null>')
+      || ' withdrawn_skipped=' || coalesce(v_fin->>'withdrawn_skipped', '<absent>'));
+
+  perform _policy_tests.p113_teardown('pol114-s3-fo');
+  perform _policy_tests.p113_teardown('pol114-s3-fwn');
+  perform _policy_tests.p113_teardown('pol114-s3-fox');
+  perform _policy_tests.p113_teardown('pol114-s3-fb');
+end;
+$$;
+-- ==== 0114-§3 END ====
+
+-- ==== 0114-§4 BEGIN ====
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0114 §4 / M009 S4 — the assessment evidence gate (C3): the evidence_*
+-- CHECKs, the gradeEvidence backfill over seeded production shapes, and the
+-- candidate-status repair with its blocked / human-audit / latest-assessment
+-- guards. Every fixture is tagged `pol114-s4-*` and torn down at the end of
+-- its block (audit_events is append-only; its rows are filtered by target).
+-- Fixed timestamps only; no assertion reads the host clock. The repair is
+-- always SCOPED to this block's candidates, so no other suite row moves.
+-- Shapes are the 2026-10-03 prod dry-run's (neutral labels; the short ids
+-- name the production assessment each one mirrors).
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- One scored session on the tag's candidate (phone_fixture), returning the
+-- assessment id. p_turns non-gate candidate turns (plus as many bot turns,
+-- plus ONE gate candidate turn that must never count); a plan of p_planned
+-- questions (NULL: no plan); one progress row per p_dispositions element
+-- (NULL elements are pre-0086 rows). The assessment is a v1 row, which
+-- satisfies the NOT VALID chk_assessments_v2_shape for either scoring_status.
+create or replace function _policy_tests.p114s4_shape(
+  p_tag          text,
+  p_partial      boolean,
+  p_disconnect   text,
+  p_turns        integer,
+  p_planned      integer,
+  p_dispositions text[],
+  p_reco         text,
+  p_scoring      text,
+  p_at           timestamptz,
+  p_source       text default 'phone'
+)
+returns uuid
+language plpgsql as $p114s4$
+declare
+  v_eng uuid; v_cand uuid; v_role uuid; v_sess uuid; v_aid uuid; i integer;
+begin
+  select e.id, e.candidate_id, e.role_id into v_eng, v_cand, v_role
+    from screening_v2.phone_engagements e
+    join screening_v2.ashby_application_links l on l.id = e.application_link_id
+   where l.external_application_id = p_tag || '-app';
+  if v_eng is null then
+    raise exception 'p114s4_shape(%): no phone_fixture for the tag', p_tag;
+  end if;
+
+  v_sess := _policy_tests.p112_session(v_cand, v_role, null, p_at, 'completed');
+
+  if p_planned is not null then
+    insert into screening_v2.phone_session_plans
+      (session_id, engagement_id, role_id, source, questions, question_count)
+    values (v_sess, v_eng, v_role, 'default',
+            (select jsonb_agg(jsonb_build_object('key', 'q' || g, 'text', 'What did you do in step ' || g || '?'))
+               from generate_series(1, p_planned) g),
+            p_planned);
+  end if;
+
+  for i in 1 .. coalesce(array_length(p_dispositions, 1), 0) loop
+    insert into screening_v2.phone_session_progress
+      (session_id, question_key, question_index, source_event_id,
+       first_turn_index, last_turn_index, turn_count, disposition)
+    values (v_sess, 'q' || i, i - 1, 'ev-' || i, 2 * i, 2 * i + 1, 2, p_dispositions[i]);
+  end loop;
+
+  insert into screening_v2.transcript_turns (session_id, turn_index, speaker, text, is_gate)
+  values (v_sess, 0, 'bot', 'synthetic gate prompt', true),
+         (v_sess, 1, 'candidate', 'synthetic gate reply', true);
+  for i in 1 .. p_turns loop
+    insert into screening_v2.transcript_turns (session_id, turn_index, speaker, text, is_gate)
+    values (v_sess, 2 * i, 'bot', 'synthetic question', false),
+           (v_sess, 2 * i + 1, 'candidate', 'synthetic answer', false);
+  end loop;
+
+  insert into screening_v2.assessments
+    (session_id, candidate_id, overall_score, recommendation, summary, raw, provenance,
+     source, partial, scoring_status, created_at)
+  values (v_sess, v_cand, 30, p_reco, 'pol114-s4 synthetic',
+          case when p_partial then
+            jsonb_build_object('partial', jsonb_strip_nulls(jsonb_build_object(
+              'partial', true, 'disconnect_reason', p_disconnect)))
+          else '{}'::jsonb end,
+          '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet-4-20250514","workload":"scoring","prompt_template_version":"2026-07-28.1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb,
+          p_source, p_partial, p_scoring, p_at)
+  returning id into v_aid;
+  return v_aid;
+end;
+$p114s4$;
+
+-- ── §4b: the CHECKs refuse an unknown grade or reason, and incoherence ───
+do $$
+declare
+  v_at  constant timestamptz := '2026-10-02T05:00:00Z';
+  v_aid uuid; v_bad text := ''; v_ok boolean := false;
+  v_probe record;
+begin
+  perform _policy_tests.phone_fixture('pol114-s4-chk');
+  v_aid := _policy_tests.p114s4_shape('pol114-s4-chk', false, null, 4, 4,
+             array['asked_answered','asked_answered','asked_answered','asked_answered'],
+             'advance', 'complete', v_at);
+
+  for v_probe in
+    select * from (values
+      ('unknown grade',            'maybe',        'complete_call',     4, 4),
+      ('unknown reason',           'insufficient', 'vibes',             0, 4),
+      ('decision + thin reason',   'decision',     'partial_thin',      1, 4),
+      ('insufficient + complete',  'insufficient', 'complete_call',     4, 4),
+      ('reason without a grade',   null,           'no_plan',           null, null),
+      ('grade without a reason',   'insufficient', null,                null, null),
+      ('counts without a grade',   null,           null,                1, 4),
+      ('negative answered',        'decision',     'complete_call',     -1, 4),
+      ('planned 0',                'decision',     'complete_call',     0, 0),
+      ('planned above 100',        'decision',     'complete_call',     1, 101)
+    ) as t(label, grade, reason, answered, planned)
+  loop
+    begin
+      update screening_v2.assessments
+         set evidence_grade = v_probe.grade, evidence_reason = v_probe.reason,
+             evidence_answered = v_probe.answered, evidence_planned = v_probe.planned
+       where id = v_aid;
+      v_bad := v_bad || ' accepted:' || v_probe.label;
+    exception when check_violation then null;
+    end;
+  end loop;
+
+  begin
+    update screening_v2.assessments
+       set evidence_grade = 'insufficient', evidence_reason = 'evidence_read_failed',
+           evidence_answered = null, evidence_planned = null
+     where id = v_aid;
+    update screening_v2.assessments
+       set evidence_grade = 'decision', evidence_reason = 'partial_sufficient',
+           evidence_answered = 3, evidence_planned = 4
+     where id = v_aid;
+    v_ok := true;
+  exception when check_violation then v_ok := false;
+  end;
+
+  perform _policy_tests.assert(
+    '0114-§4 CHECKs: an unknown grade or reason, a reason outside its grade, a reason without a '
+      || 'grade and out-of-range counts are refused; coherent rows are accepted',
+    v_bad = '' and v_ok,
+    'violations accepted:' || coalesce(nullif(v_bad, ''), ' none') || ' coherent_ok=' || v_ok::text);
+
+  perform _policy_tests.assert(
+    '0114-§4 CHECKs are VALIDATED and the insufficient index is partial',
+    (select count(*) from pg_constraint
+      where conrelid = 'screening_v2.assessments'::regclass and convalidated
+        and conname in ('chk_assessments_evidence_grade','chk_assessments_evidence_reason',
+                        'chk_assessments_evidence_shape','chk_assessments_evidence_counts')) = 4
+      and exists (select 1 from pg_indexes
+                   where schemaname = 'screening_v2' and indexname = 'idx_assessments_evidence_insufficient'
+                     and indexdef ilike '%where%evidence_grade%insufficient%'),
+    'constraints/index missing or not validated');
+
+  perform _policy_tests.assert(
+    '0114-§4 posture: backfill and repair are service_role-only, search_path pinned',
+    (select bool_and(not has_function_privilege('anon', p.oid, 'EXECUTE')
+                     and not has_function_privilege('authenticated', p.oid, 'EXECUTE')
+                     and has_function_privilege('service_role', p.oid, 'EXECUTE')
+                     and p.proconfig @> array['search_path=pg_catalog, screening_v2'])
+       from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+      where n.nspname = 'screening_v2'
+        and p.proname in ('backfill_assessment_evidence_grades',
+                          'repair_evidence_gated_candidate_status'))
+      and (select count(*) from pg_proc p join pg_namespace n on n.oid = p.pronamespace
+            where n.nspname = 'screening_v2'
+              and p.proname in ('backfill_assessment_evidence_grades',
+                                'repair_evidence_gated_candidate_status')) = 2,
+    'grant or search_path posture wrong');
+
+  perform _policy_tests.phone44_teardown('pol114-s4-chk');
+end;
+$$;
+
+-- ── §4d: the backfill grades the production shapes like gradeEvidence ───
+do $$
+declare
+  v_at   constant timestamptz := '2026-10-02T05:00:00Z';
+  v_tag  constant text := 'pol114-s4-bf';
+  v_ids  uuid[] := '{}';
+  v_exp  text[] := '{}';
+  v_got  text; v_bad text := ''; v_n integer; v_n2 integer; i integer;
+  v_pre  uuid; v_browser uuid;
+begin
+  perform _policy_tests.phone_fixture(v_tag);
+
+  -- a744741c: partial hangup, 8 turns, 0 of 4 answered (2 boundaries reached).
+  v_ids := v_ids || _policy_tests.p114s4_shape(v_tag, true, 'candidate_hangup', 8, 4,
+             array['asked_declined','asked_unanswered'], 'reject', 'complete', v_at);
+  v_exp := v_exp || 'insufficient/partial_thin/0/4'::text;
+  -- 5cf5809c: partial hangup, 2 turns, no boundary of 5.
+  v_ids := v_ids || _policy_tests.p114s4_shape(v_tag, true, 'candidate_hangup', 2, 5,
+             '{}'::text[], 'reject', 'incomplete_evidence', v_at + interval '1 minute');
+  v_exp := v_exp || 'insufficient/partial_thin/0/5'::text;
+  -- 494a13d5: killed by our side before the candidate spoke.
+  v_ids := v_ids || _policy_tests.p114s4_shape(v_tag, true, 'worker_crash', 0, 5,
+             '{}'::text[], null, 'incomplete_evidence', v_at + interval '2 minutes');
+  v_exp := v_exp || 'insufficient/infra_interrupted/0/5'::text;
+  -- clean: a complete call.
+  v_ids := v_ids || _policy_tests.p114s4_shape(v_tag, false, null, 10, 4,
+             array['asked_answered','asked_answered','asked_answered','asked_answered'],
+             'advance', 'complete', v_at + interval '3 minutes');
+  v_exp := v_exp || 'decision/complete_call/4/4'::text;
+  -- 3/4 partial: exactly PARTIAL_DECISION.
+  v_ids := v_ids || _policy_tests.p114s4_shape(v_tag, true, 'disconnected', 6, 4,
+             array['asked_answered','volunteered_with_evidence','asked_answered'],
+             'hold', 'complete', v_at + interval '4 minutes');
+  v_exp := v_exp || 'decision/partial_sufficient/3/4'::text;
+  -- 2/4 partial: just under PARTIAL_DECISION (a hangup, so partial_thin).
+  v_ids := v_ids || _policy_tests.p114s4_shape(v_tag, true, 'candidate_hangup', 6, 4,
+             array['asked_answered','asked_answered','asked_declined'],
+             'hold', 'complete', v_at + interval '5 minutes');
+  v_exp := v_exp || 'insufficient/partial_thin/2/4'::text;
+  -- partial with no plan.
+  v_ids := v_ids || _policy_tests.p114s4_shape(v_tag, true, 'disconnected', 3, null,
+             '{}'::text[], 'hold', 'complete', v_at + interval '6 minutes');
+  v_exp := v_exp || 'insufficient/no_plan/-/-'::text;
+  -- pre-0086 NULL dispositions: graded on the row count, persisted unmeasured.
+  v_ids := v_ids || _policy_tests.p114s4_shape(v_tag, true, 'disconnected', 5, 4,
+             array[null, null, null]::text[], 'hold', 'complete', v_at + interval '7 minutes');
+  v_exp := v_exp || 'decision/partial_sufficient/-/4'::text;
+  -- infra-killed after some speech: 1 of 4.
+  v_ids := v_ids || _policy_tests.p114s4_shape(v_tag, true, 'worker_crash', 4, 4,
+             array['asked_answered'], 'reject', 'complete', v_at + interval '8 minutes');
+  v_exp := v_exp || 'insufficient/infra_interrupted/1/4'::text;
+  -- only GATE speech: the gate turn never counts.
+  v_ids := v_ids || _policy_tests.p114s4_shape(v_tag, true, 'candidate_hangup', 0, 4,
+             '{}'::text[], 'reject', 'complete', v_at + interval '9 minutes');
+  v_exp := v_exp || 'insufficient/no_candidate_speech/0/4'::text;
+  -- partial with a missing disconnect_reason reads 'disconnected' (not infra).
+  v_ids := v_ids || _policy_tests.p114s4_shape(v_tag, true, null, 2, 4,
+             array['asked_answered'], 'reject', 'complete', v_at + interval '10 minutes');
+  v_exp := v_exp || 'insufficient/partial_thin/1/4'::text;
+
+  -- A browser row stays ungraded; an already-graded phone row is not rewritten.
+  v_browser := _policy_tests.p114s4_shape(v_tag, false, null, 3, null, '{}'::text[],
+                 'hold', 'complete', v_at + interval '11 minutes', 'browser');
+  v_pre := _policy_tests.p114s4_shape(v_tag, true, 'candidate_hangup', 1, 4, '{}'::text[],
+             'reject', 'complete', v_at + interval '12 minutes');
+  update screening_v2.assessments
+     set evidence_grade = 'insufficient', evidence_reason = 'evidence_read_failed'
+   where id = v_pre;
+
+  v_n  := screening_v2.backfill_assessment_evidence_grades();
+  v_n2 := screening_v2.backfill_assessment_evidence_grades();
+
+  for i in 1 .. array_length(v_ids, 1) loop
+    select coalesce(evidence_grade, '-') || '/' || coalesce(evidence_reason, '-') || '/'
+             || coalesce(evidence_answered::text, '-') || '/' || coalesce(evidence_planned::text, '-')
+      into v_got from screening_v2.assessments where id = v_ids[i];
+    if v_got is distinct from v_exp[i] then
+      v_bad := v_bad || ' #' || i || ' want ' || v_exp[i] || ' got ' || coalesce(v_got, '<null>');
+    end if;
+  end loop;
+
+  perform _policy_tests.assert(
+    '0114-§4 backfill (RED pre-0114: no columns): the a744741c, 5cf5809c, 494a13d5, clean, 3/4 '
+      || 'partial and edge shapes grade exactly as evidence.ts gradeEvidence',
+    v_bad = '' and v_n >= array_length(v_ids, 1),
+    'mismatches:' || coalesce(nullif(v_bad, ''), ' none') || ' graded=' || v_n);
+
+  perform _policy_tests.assert(
+    '0114-§4 backfill: browser rows stay NULL, a graded row is never rewritten, a rerun grades 0',
+    v_n2 = 0
+      and (select evidence_grade is null and evidence_reason is null
+             from screening_v2.assessments where id = v_browser)
+      and (select evidence_reason = 'evidence_read_failed'
+             from screening_v2.assessments where id = v_pre),
+    'rerun=' || v_n2 || ' browser='
+      || coalesce((select coalesce(evidence_grade, 'NULL') from screening_v2.assessments where id = v_browser), '<gone>')
+      || ' pre=' || coalesce((select evidence_reason from screening_v2.assessments where id = v_pre), '<null>'));
+
+  perform _policy_tests.phone44_teardown(v_tag);
+end;
+$$;
+
+-- ── §4e: the candidate repair and its guards ────────────────────────────
+do $$
+declare
+  v_at   constant timestamptz := '2026-10-02T05:00:00Z';
+  v_now  constant timestamptz := '2026-10-03T10:00:00Z';
+  v_tags constant text[] := array['pol114-s4-ra','pol114-s4-rb','pol114-s4-rc','pol114-s4-rd',
+    'pol114-s4-re','pol114-s4-rf','pol114-s4-rg','pol114-s4-rh','pol114-s4-ri','pol114-s4-rj',
+    'pol114-s4-rk','pol114-s4-rl'];
+  -- want the candidate reverted to screened?
+  v_want constant boolean[] := array[true, true, false, false,
+    false, true, false, true, false, false,
+    false, true];
+  v_cands uuid[] := '{}';
+  v_c uuid; v_r1 jsonb; v_r2 jsonb; i integer; v_bad text := ''; v_status text;
+  v_audits integer; v_meta jsonb; v_actor text; v_actor_id uuid; v_audit_at timestamptz;
+  v_total_before integer; v_total_after integer;
+  v_thin text[] := array['asked_declined','asked_unanswered'];
+  v_two  text[] := array['asked_answered','asked_answered','asked_declined','asked_unanswered'];
+  v_one  text[] := array['asked_answered','asked_declined','asked_declined','asked_unanswered'];
+begin
+  for i in 1 .. array_length(v_tags, 1) loop
+    perform _policy_tests.phone_fixture(v_tags[i]);
+    select e.candidate_id into v_c from screening_v2.phone_engagements e
+      join screening_v2.ashby_application_links l on l.id = e.application_link_id
+     where l.external_application_id = v_tags[i] || '-app';
+    v_cands := v_cands || v_c;
+  end loop;
+
+  -- ra: a744741c — partial 0/4 reject, rejected -> REVERT.
+  perform _policy_tests.p114s4_shape(v_tags[1], true, 'candidate_hangup', 8, 4, v_thin, 'reject', 'complete', v_at);
+  -- rb: 7f6bb294 — complete call, 1 of 4 answered, reject -> REVERT (fails AUTO_REJECT_MIN).
+  perform _policy_tests.p114s4_shape(v_tags[2], false, null, 10, 4, v_one, 'reject', 'complete', v_at);
+  -- rc: e3a187ed — complete call, 2 of 4 answered, reject -> stays rejected.
+  perform _policy_tests.p114s4_shape(v_tags[3], false, null, 11, 4, v_two, 'reject', 'complete', v_at);
+  -- rd: the a744741c shape on a decision-BLOCKED candidate -> stays.
+  perform _policy_tests.p114s4_shape(v_tags[4], true, 'candidate_hangup', 8, 4, v_thin, 'reject', 'complete', v_at);
+  update screening_v2.candidates set decision_use_blocked_at = v_at where id = v_cands[4];
+  -- re: a744741c shape, but a RECRUITER changed the status after the assessment -> stays.
+  perform _policy_tests.p114s4_shape(v_tags[5], true, 'candidate_hangup', 8, 4, v_thin, 'reject', 'complete', v_at);
+  insert into screening_v2.audit_events
+    (actor_id, actor_type, action, target_type, target_id, result, metadata, created_at)
+  values ('00000000-0000-4000-8000-0000000000ad', 'recruiter', 'candidate_status_changed',
+          'candidate', v_cands[5]::text, 'success',
+          '{"from_status":"screened","to_status":"rejected"}'::jsonb, v_at + interval '1 hour');
+  -- rf: same, but the recruiter's change PREDATES the assessment -> REVERT.
+  perform _policy_tests.p114s4_shape(v_tags[6], true, 'candidate_hangup', 8, 4, v_thin, 'reject', 'complete', v_at);
+  insert into screening_v2.audit_events
+    (actor_id, actor_type, action, target_type, target_id, result, metadata, created_at)
+  values ('00000000-0000-4000-8000-0000000000ad', 'recruiter', 'candidate_status_changed',
+          'candidate', v_cands[6]::text, 'success',
+          '{"from_status":"new","to_status":"screening"}'::jsonb, v_at - interval '1 day');
+  -- rg: an OLDER failing row, but the LATEST passes (e3a187ed) -> stays.
+  perform _policy_tests.p114s4_shape(v_tags[7], true, 'candidate_hangup', 8, 4, v_thin, 'reject', 'complete', v_at - interval '1 day');
+  perform _policy_tests.p114s4_shape(v_tags[7], false, null, 11, 4, v_two, 'reject', 'complete', v_at);
+  -- rh: an OLDER passing row, the LATEST fails -> REVERT.
+  perform _policy_tests.p114s4_shape(v_tags[8], false, null, 11, 4, v_two, 'reject', 'complete', v_at - interval '1 day');
+  perform _policy_tests.p114s4_shape(v_tags[8], true, 'candidate_hangup', 8, 4, v_thin, 'reject', 'complete', v_at);
+  -- ri: an older failing PHONE row, the LATEST is a browser reject -> stays.
+  perform _policy_tests.p114s4_shape(v_tags[9], true, 'candidate_hangup', 8, 4, v_thin, 'reject', 'complete', v_at - interval '1 day');
+  perform _policy_tests.p114s4_shape(v_tags[9], false, null, 6, null, '{}'::text[], 'reject', 'complete', v_at, 'browser');
+  -- rj: a failing row on a candidate who is NOT rejected -> untouched, no audit.
+  perform _policy_tests.p114s4_shape(v_tags[10], true, 'candidate_hangup', 8, 4, v_thin, 'reject', 'complete', v_at);
+  -- rk: a PROVISIONAL reject (incomplete_evidence) — the old rule never
+  -- auto-rejected it, so the rejection is someone else's -> stays.
+  perform _policy_tests.p114s4_shape(v_tags[11], true, 'candidate_hangup', 8, 4, v_thin, 'reject', 'incomplete_evidence', v_at);
+  -- rl: complete call, pre-0086 NULL dispositions -> answered UNMEASURED -> REVERT.
+  perform _policy_tests.p114s4_shape(v_tags[12], false, null, 10, 4, array[null, null, null, null]::text[],
+            'reject', 'complete', v_at);
+
+  update screening_v2.candidates set status = 'rejected'
+   where id = any (v_cands) and id <> v_cands[10];
+  update screening_v2.candidates set status = 'screened' where id = v_cands[10];
+
+  perform screening_v2.backfill_assessment_evidence_grades();
+  select count(*) into v_total_before from screening_v2.audit_events
+   where action = 'candidate_status_changed' and target_id = any (select unnest(v_cands)::text);
+  v_r1 := screening_v2.repair_evidence_gated_candidate_status(v_cands, v_now);
+  v_r2 := screening_v2.repair_evidence_gated_candidate_status(v_cands, v_now + interval '1 hour');
+  select count(*) into v_total_after from screening_v2.audit_events
+   where action = 'candidate_status_changed' and target_id = any (select unnest(v_cands)::text);
+
+  for i in 1 .. array_length(v_tags, 1) loop
+    select status into v_status from screening_v2.candidates where id = v_cands[i];
+    select count(*), min(metadata::text)::jsonb, min(actor_type), min(actor_id::text)::uuid, min(created_at)
+      into v_audits, v_meta, v_actor, v_actor_id, v_audit_at
+      from screening_v2.audit_events
+     where action = 'candidate_status_changed' and target_type = 'candidate'
+       and target_id = v_cands[i]::text and actor_type = 'system';
+    if v_want[i] then
+      if not (v_status = 'screened' and v_audits = 1
+              and v_meta = '{"from":"rejected","to":"screened","reason":"evidence_gate","migration":"0114"}'::jsonb
+              and v_actor = 'system' and v_actor_id = '00000000-0000-0000-0000-000000000000'
+              and v_audit_at = v_now) then
+        v_bad := v_bad || ' ' || v_tags[i] || ':status=' || coalesce(v_status, '<null>')
+                 || ',audits=' || v_audits || ',meta=' || coalesce(v_meta::text, '<null>');
+      end if;
+    else
+      if not (v_status = case when i = 10 then 'screened' else 'rejected' end and v_audits = 0) then
+        v_bad := v_bad || ' ' || v_tags[i] || ':status=' || coalesce(v_status, '<null>')
+                 || ',audits=' || v_audits;
+      end if;
+    end if;
+  end loop;
+
+  perform _policy_tests.assert(
+    '0114-§4 repair (RED pre-0114): only latest canAutoReject-failing auto-rejected candidates '
+      || 'revert to screened, each with ONE system candidate_status_changed audit; blocked, '
+      || 'human-decided, latest-passing (e3a187ed), browser-latest, provisional and non-rejected '
+      || 'candidates are untouched',
+    v_bad = '' and (v_r1->>'reverted')::int = 5 and v_r1->>'status' = 'ok',
+    'first=' || coalesce(v_r1::text, '<null>') || ' bad:' || coalesce(nullif(v_bad, ''), ' none'));
+
+  perform _policy_tests.assert(
+    '0114-§4 repair is idempotent: a second run reverts 0 and writes no audit row',
+    (v_r2->>'reverted')::int = 0 and v_total_after - v_total_before = 5,
+    'second=' || coalesce(v_r2::text, '<null>') || ' audits_written=' || (v_total_after - v_total_before));
+
+  for i in 1 .. array_length(v_tags, 1) loop
+    perform _policy_tests.phone44_teardown(v_tags[i]);
+  end loop;
+end;
+$$;
+-- ==== 0114-§4 END ====
+
+-- ==== 0114-§5 BEGIN ====
+-- §5 (S5, C5): appointment truthfulness. expire_phone_appointments holds a
+-- slot across an operator halt (and one grace after a lift) until 21:00 IST
+-- on the slot's own day, records the cause, and releases a wedged
+-- `scheduled` engagement; schedule_phone_appointment refuses a slot that
+-- admission could never dial. The sweep is FLEET-WIDE, so every assertion
+-- is scoped to this block's own rows (counts are asserted as "at least").
+-- Every block that touches phone_control restores the saved row before it
+-- ends, so the suite-end "not halted" assertion stays green.
+
+-- ── §5 A: halted hold, then expiry at 21:00 IST as emergency_stop ─────
+do $$
+declare
+  v_saved  screening_v2.phone_control%rowtype;
+  v_t0     constant timestamptz := '2026-11-20T04:00:00Z';   -- 09:30 IST
+  v_slot   constant timestamptz := '2026-11-20T06:30:00Z';   -- 12:00 IST
+  v_close  constant timestamptz := '2026-11-20T15:30:00Z';   -- 21:00 IST, slot's own day
+  v_eng uuid; v_apt uuid; v_res jsonb; v_res2 jsonb;
+  v_status text; v_reason text; v_state text; v_sreason text; v_next timestamptz;
+  v_na integer; v_audits integer; v_meta jsonb;
+begin
+  select * into v_saved from screening_v2.phone_control where control_key = 'default';
+  perform _policy_tests.assert(
+    '0114-§5 fixture sanity: the lane is unhalted on entry',
+    v_saved.control_key = 'default' and v_saved.halted_at is null,
+    'halted_at=' || coalesce(v_saved.halted_at::text, '<null>'));
+
+  v_eng := _policy_tests.phone_fixture('pol114s5-halt');
+  v_res := screening_v2.schedule_phone_appointment(
+             v_eng, v_slot, v_slot + interval '30 minutes', 'hr_manual', null, null, v_t0);
+  v_apt := (v_res->>'appointment_id')::uuid;
+
+  -- The operator pauses the lane BEFORE the slot.
+  update screening_v2.phone_control
+     set halted_at = v_t0, halt_reason = 'operator_pause',
+         halt_actor_id = '00000000-0000-4000-8000-0000000000ad', updated_at = v_t0
+   where control_key = 'default';
+
+  v_res := screening_v2.expire_phone_appointments(900, 500, v_slot + interval '2 hours');
+  v_res2 := screening_v2.expire_phone_appointments(900, 500, v_close - interval '1 second');
+  select status into v_status from screening_v2.phone_appointments where id = v_apt;
+  select state into v_state from screening_v2.phone_engagements where id = v_eng;
+  select count(*) into v_audits from screening_v2.audit_events
+   where action = 'phone_appointment_missed' and target_id = v_apt::text;
+  perform _policy_tests.assert(
+    '0114-§5 C5 halted hold: a slot that passed while the lane is halted stays live (held) until 21:00 IST',
+    v_status = 'scheduled' and v_state = 'scheduled' and v_audits = 0
+      and (v_res->>'held')::int >= 1 and (v_res2->>'held')::int >= 1
+      and v_res->>'status' = 'ok' and v_res ? 'released',
+    'res=' || v_res::text || ' res2=' || v_res2::text || ' status=' || coalesce(v_status, '<null>')
+      || ' state=' || coalesce(v_state, '<null>') || ' audits=' || v_audits);
+
+  -- At 21:00 IST on the slot's own day the day is over whatever the lane did.
+  v_res := screening_v2.expire_phone_appointments(900, 500, v_close);
+  select status, cancel_reason into v_status, v_reason
+    from screening_v2.phone_appointments where id = v_apt;
+  select state, state_reason, next_eligible_at, no_answer_attempts
+    into v_state, v_sreason, v_next, v_na
+    from screening_v2.phone_engagements where id = v_eng;
+  select metadata into v_meta from screening_v2.audit_events
+   where action = 'phone_appointment_missed' and target_id = v_apt::text;
+  perform _policy_tests.assert(
+    '0114-§5 C5 halted past 21:00 IST: missed/emergency_stop, engagement eligible now, uncharged, cause audited',
+    v_status = 'missed' and v_reason = 'emergency_stop'
+      and v_state = 'eligible' and v_sreason = 'appointment_missed' and v_next = v_close
+      and v_na = 0
+      and v_meta->>'cause' = 'emergency_stop' and (v_meta->>'lane_halted')::boolean
+      and (v_meta->>'control_updated_at')::timestamptz = v_t0
+      and (v_meta->>'budget_charged')::boolean = false,
+    'status=' || coalesce(v_status, '<null>') || ' reason=' || coalesce(v_reason, '<null>')
+      || ' state=' || coalesce(v_state, '<null>') || '/' || coalesce(v_sreason, '<null>')
+      || ' next=' || coalesce(v_next::text, '<null>') || ' meta=' || coalesce(v_meta::text, '<null>'));
+
+  update screening_v2.phone_control
+     set halted_at = v_saved.halted_at, halt_reason = v_saved.halt_reason,
+         halt_actor_id = v_saved.halt_actor_id, updated_at = v_saved.updated_at
+   where control_key = 'default';
+end;
+$$;
+
+-- ── §5 B: the lift race ───────────────────────────────────────────────
+-- Halted through the slot, lifted two hours later: the slot stays live for
+-- one grace after the lift so the due loop can still admit it as kind
+-- 'scheduled'; untaken, it is missed with cause emergency_stop.
+do $$
+declare
+  v_saved  screening_v2.phone_control%rowtype;
+  v_t0     constant timestamptz := '2026-11-20T04:00:00Z';
+  v_slot   constant timestamptz := '2026-11-20T07:30:00Z';   -- 13:00 IST
+  v_lift   constant timestamptz := '2026-11-20T09:30:00Z';   -- 15:00 IST
+  v_take uuid; v_miss uuid; v_apt_take uuid; v_apt_miss uuid; v_res jsonb; v_adm jsonb;
+  v_s1 text; v_s2 text; v_r2 text; v_state text;
+begin
+  select * into v_saved from screening_v2.phone_control where control_key = 'default';
+  v_take := _policy_tests.phone_fixture('pol114s5-lift-take');
+  v_miss := _policy_tests.phone_fixture('pol114s5-lift-miss');
+  v_apt_take := (screening_v2.schedule_phone_appointment(
+                   v_take, v_slot, v_slot + interval '30 minutes', 'hr_manual', null, null, v_t0)
+                 ->>'appointment_id')::uuid;
+  v_apt_miss := (screening_v2.schedule_phone_appointment(
+                   v_miss, v_slot, v_slot + interval '30 minutes', 'hr_manual', null, null, v_t0)
+                 ->>'appointment_id')::uuid;
+
+  update screening_v2.phone_control
+     set halted_at = v_t0, halt_reason = 'operator_pause',
+         halt_actor_id = '00000000-0000-4000-8000-0000000000ad', updated_at = v_t0
+   where control_key = 'default';
+  -- The lift (clear_phone_halt stamps updated_at with its p_now).
+  update screening_v2.phone_control
+     set halted_at = null, halt_reason = null, halt_actor_id = null, updated_at = v_lift
+   where control_key = 'default';
+
+  -- Inside the post-lift grace: both slots still live.
+  v_res := screening_v2.expire_phone_appointments(900, 500, v_lift + interval '10 minutes');
+  select status into v_s1 from screening_v2.phone_appointments where id = v_apt_take;
+  select status into v_s2 from screening_v2.phone_appointments where id = v_apt_miss;
+  perform _policy_tests.assert(
+    '0114-§5 C5 lift race: inside one grace after the lift, a slot that passed during the halt is still live',
+    v_s1 = 'scheduled' and v_s2 = 'scheduled' and (v_res->>'held')::int >= 2,
+    'res=' || v_res::text || ' take=' || coalesce(v_s1, '<null>') || ' miss=' || coalesce(v_s2, '<null>'));
+
+  -- The due loop admits it as kind 'scheduled' inside the grace: fulfilled.
+  v_adm := screening_v2.admit_phone_attempt(v_take, 'scheduled', null, 60,
+                                            v_lift + interval '10 minutes');
+  select status into v_s1 from screening_v2.phone_appointments where id = v_apt_take;
+  perform _policy_tests.assert(
+    '0114-§5 C5 lift race: a held slot is admitted as kind scheduled inside the grace and fulfilled',
+    v_adm->>'status' = 'ok' and v_s1 = 'fulfilled',
+    'admit=' || coalesce(v_adm::text, '<null>') || ' apt=' || coalesce(v_s1, '<null>'));
+
+  -- After the grace, the untaken one is missed, and the cause is the halt.
+  v_res := screening_v2.expire_phone_appointments(900, 500, v_lift + interval '15 minutes 1 second');
+  select status, cancel_reason into v_s2, v_r2 from screening_v2.phone_appointments where id = v_apt_miss;
+  select state into v_state from screening_v2.phone_engagements where id = v_miss;
+  select status into v_s1 from screening_v2.phone_appointments where id = v_apt_take;
+  perform _policy_tests.assert(
+    '0114-§5 C5 lift race: after the post-lift grace the untaken slot is missed/emergency_stop; the fulfilled one is untouched',
+    v_s2 = 'missed' and v_r2 = 'emergency_stop' and v_state = 'eligible' and v_s1 = 'fulfilled',
+    'res=' || v_res::text || ' miss=' || coalesce(v_s2, '<null>') || '/' || coalesce(v_r2, '<null>')
+      || ' state=' || coalesce(v_state, '<null>') || ' take=' || coalesce(v_s1, '<null>'));
+
+  update screening_v2.phone_control
+     set halted_at = v_saved.halted_at, halt_reason = v_saved.halt_reason,
+         halt_actor_id = v_saved.halt_actor_id, updated_at = v_saved.updated_at
+   where control_key = 'default';
+end;
+$$;
+
+-- ── §5 C: a missing singleton is a halt (fail closed) ─────────────────
+do $$
+declare
+  v_saved screening_v2.phone_control%rowtype;
+  v_slot  constant timestamptz := '2026-11-21T06:30:00Z';   -- 12:00 IST
+  v_close constant timestamptz := '2026-11-21T15:30:00Z';   -- 21:00 IST
+  v_eng uuid; v_apt uuid; v_res jsonb; v_s text; v_r text; v_meta jsonb;
+begin
+  select * into v_saved from screening_v2.phone_control where control_key = 'default';
+  v_eng := _policy_tests.phone_fixture('pol114s5-nosingleton');
+  v_apt := (screening_v2.schedule_phone_appointment(
+              v_eng, v_slot, v_slot + interval '30 minutes', 'hr_manual', null, null,
+              '2026-11-21T04:00:00Z')->>'appointment_id')::uuid;
+
+  delete from screening_v2.phone_control where control_key = 'default';
+  v_res := screening_v2.expire_phone_appointments(900, 500, v_slot + interval '2 hours');
+  select status into v_s from screening_v2.phone_appointments where id = v_apt;
+  perform _policy_tests.assert(
+    '0114-§5 C5 missing singleton: an unreadable kill switch holds the slot (fail closed)',
+    v_s = 'scheduled' and v_res->>'status' = 'ok',
+    'res=' || v_res::text || ' status=' || coalesce(v_s, '<null>'));
+
+  v_res := screening_v2.expire_phone_appointments(900, 500, v_close);
+  select status, cancel_reason into v_s, v_r from screening_v2.phone_appointments where id = v_apt;
+  select metadata into v_meta from screening_v2.audit_events
+   where action = 'phone_appointment_missed' and target_id = v_apt::text;
+  perform _policy_tests.assert(
+    '0114-§5 C5 missing singleton: at 21:00 IST the slot is missed/emergency_stop with lane_halted true',
+    v_s = 'missed' and v_r = 'emergency_stop' and (v_meta->>'lane_halted')::boolean
+      and v_meta ? 'control_updated_at' and v_meta->>'control_updated_at' is null,
+    'status=' || coalesce(v_s, '<null>') || '/' || coalesce(v_r, '<null>') || ' meta=' || coalesce(v_meta::text, '<null>'));
+
+  insert into screening_v2.phone_control (control_key, halted_at, halt_reason, halt_actor_id, updated_at)
+  values ('default', v_saved.halted_at, v_saved.halt_reason, v_saved.halt_actor_id, v_saved.updated_at)
+  on conflict (control_key) do nothing;
+end;
+$$;
+
+-- ── §5 D: unhalted path unchanged; a terminal engagement's slot ───────
+do $$
+declare
+  v_saved screening_v2.phone_control%rowtype;
+  v_slot  constant timestamptz := '2026-11-21T08:30:00Z';   -- 14:00 IST
+  v_e1 uuid; v_e2 uuid; v_e3 uuid; v_a1 uuid; v_a2 uuid; v_a3 uuid; v_res jsonb;
+  v_s1 text; v_s2 text; v_r1 text; v_r2 text; v_st1 text; v_st2 text; v_n1 timestamptz;
+  v_s3 text; v_r3 text; v_st3 text; v_v3a integer; v_v3b integer; v_meta jsonb;
+begin
+  select * into v_saved from screening_v2.phone_control where control_key = 'default';
+  v_e1 := _policy_tests.phone_fixture('pol114s5-plain');
+  v_e2 := _policy_tests.phone_fixture('pol114s5-futurestamp');
+  v_e3 := _policy_tests.phone_fixture('pol114s5-terminal');
+  v_a1 := (screening_v2.schedule_phone_appointment(v_e1, v_slot, v_slot + interval '30 minutes',
+             'hr_manual', null, null, '2026-11-21T04:00:00Z')->>'appointment_id')::uuid;
+
+  -- Unhalted, last lane change long before the slot: exactly the 0042 rule.
+  update screening_v2.phone_control
+     set halted_at = null, halt_reason = null, halt_actor_id = null,
+         updated_at = '2026-11-01T00:00:00Z'
+   where control_key = 'default';
+
+  v_res := screening_v2.expire_phone_appointments(900, 500, v_slot + interval '44 minutes');
+  select status into v_s1 from screening_v2.phone_appointments where id = v_a1;
+  perform _policy_tests.assert(
+    '0114-§5 C5 unhalted path unchanged: inside ends_at+grace the slot is still live',
+    v_s1 = 'scheduled', 'status=' || coalesce(v_s1, '<null>'));
+
+  v_res := screening_v2.expire_phone_appointments(900, 500, v_slot + interval '45 minutes');
+  select status, cancel_reason into v_s1, v_r1 from screening_v2.phone_appointments where id = v_a1;
+  select state, next_eligible_at into v_st1, v_n1 from screening_v2.phone_engagements where id = v_e1;
+  select metadata into v_meta from screening_v2.audit_events
+   where action = 'phone_appointment_missed' and target_id = v_a1::text;
+  perform _policy_tests.assert(
+    '0114-§5 C5 unhalted path unchanged: at ends_at+grace it is missed/system_deferral_expired, eligible at p_now',
+    v_s1 = 'missed' and v_r1 = 'system_deferral_expired' and v_st1 = 'eligible'
+      and v_n1 = v_slot + interval '45 minutes'
+      and v_meta->>'cause' = 'system_deferral_expired'
+      and (v_meta->>'lane_halted')::boolean = false,
+    'status=' || coalesce(v_s1, '<null>') || '/' || coalesce(v_r1, '<null>') || ' state='
+      || coalesce(v_st1, '<null>') || ' meta=' || coalesce(v_meta::text, '<null>'));
+
+  -- A control stamp LATER than p_now (a logical-clock replay) is ignored,
+  -- not clamped: the slot is not held for an extra grace.
+  v_a2 := (screening_v2.schedule_phone_appointment(v_e2, v_slot, v_slot + interval '30 minutes',
+             'hr_manual', null, null, '2026-11-21T04:00:00Z')->>'appointment_id')::uuid;
+  update screening_v2.phone_control set updated_at = '2026-12-31T00:00:00Z'
+   where control_key = 'default';
+  v_res := screening_v2.expire_phone_appointments(900, 500, v_slot + interval '45 minutes');
+  select status, cancel_reason into v_s2, v_r2 from screening_v2.phone_appointments where id = v_a2;
+  select state into v_st2 from screening_v2.phone_engagements where id = v_e2;
+  perform _policy_tests.assert(
+    '0114-§5 C5 a control stamp later than p_now is ignored: the 0042 timing and reason hold',
+    v_s2 = 'missed' and v_r2 = 'system_deferral_expired' and v_st2 = 'eligible',
+    'status=' || coalesce(v_s2, '<null>') || '/' || coalesce(v_r2, '<null>') || ' state=' || coalesce(v_st2, '<null>'));
+
+  -- Terminal engagement, lane HALTED: the slot is not held (nothing would
+  -- ever dial it) and is closed as engagement_cancelled; the terminal
+  -- engagement row is not touched.
+  v_a3 := (screening_v2.schedule_phone_appointment(v_e3, v_slot, v_slot + interval '30 minutes',
+             'hr_manual', null, null, '2026-11-21T04:00:00Z')->>'appointment_id')::uuid;
+  update screening_v2.phone_engagements
+     set state = 'cancelled', state_reason = 'operator_cancelled',
+         terminal_at = '2026-11-21T05:00:00Z', version = version + 1
+   where id = v_e3;
+  select version into v_v3a from screening_v2.phone_engagements where id = v_e3;
+  update screening_v2.phone_control
+     set halted_at = '2026-11-21T05:00:00Z', halt_reason = 'operator_pause',
+         halt_actor_id = '00000000-0000-4000-8000-0000000000ad', updated_at = '2026-11-21T05:00:00Z'
+   where control_key = 'default';
+  v_res := screening_v2.expire_phone_appointments(900, 500, v_slot + interval '2 hours');
+  select status, cancel_reason into v_s3, v_r3 from screening_v2.phone_appointments where id = v_a3;
+  select state, version into v_st3, v_v3b from screening_v2.phone_engagements where id = v_e3;
+  perform _policy_tests.assert(
+    '0114-§5 C5 terminal engagement: its slot is missed/engagement_cancelled even while halted; the engagement is untouched',
+    v_s3 = 'missed' and v_r3 = 'engagement_cancelled' and v_st3 = 'cancelled' and v_v3b = v_v3a,
+    'status=' || coalesce(v_s3, '<null>') || '/' || coalesce(v_r3, '<null>') || ' state='
+      || coalesce(v_st3, '<null>') || ' version ' || v_v3a || '->' || coalesce(v_v3b, -1));
+
+  update screening_v2.phone_control
+     set halted_at = v_saved.halted_at, halt_reason = v_saved.halt_reason,
+         halt_actor_id = v_saved.halt_actor_id, updated_at = v_saved.updated_at
+   where control_key = 'default';
+end;
+$$;
+
+-- ── §5 E: wedge release ───────────────────────────────────────────────
+do $$
+declare
+  v_w    constant timestamptz := '2026-11-22T05:00:00Z';     -- 10:30 IST
+  v_open constant timestamptz := '2026-11-23T03:30:00Z';     -- 09:00 IST next day
+  v_wedge uuid; v_live uuid; v_hold uuid; v_recent uuid; v_res jsonb; v_res2 jsonb;
+  v_state text; v_reason text; v_next timestamptz; v_ver0 integer; v_ver1 integer; v_ver2 integer;
+  v_audits integer; v_meta jsonb; v_other text := '';
+begin
+  v_wedge  := _policy_tests.phone_fixture('pol114s5-wedge', 'scheduled');
+  v_live   := _policy_tests.phone_fixture('pol114s5-wedge-live', 'scheduled');
+  v_hold   := _policy_tests.phone_fixture('pol114s5-wedge-hold', 'scheduled');
+  v_recent := _policy_tests.phone_fixture('pol114s5-wedge-recent', 'scheduled');
+
+  -- A live future slot keeps an engagement out of the release entirely.
+  perform screening_v2.schedule_phone_appointment(
+            v_live, '2026-11-23T06:30:00Z', '2026-11-23T07:00:00Z', 'hr_manual', null, null,
+            v_w - interval '2 hours');
+
+  update screening_v2.phone_engagements set updated_at = v_w - interval '1 hour'
+   where id in (v_wedge, v_live, v_hold);
+  -- PR-A's reclaim hold (next_eligible_at in the future) is respected.
+  update screening_v2.phone_engagements set next_eligible_at = v_w + interval '10 minutes'
+   where id = v_hold;
+  -- Rested less than a grace: not yet.
+  update screening_v2.phone_engagements set updated_at = v_w - interval '5 minutes'
+   where id = v_recent;
+  select version into v_ver0 from screening_v2.phone_engagements where id = v_wedge;
+
+  v_res := screening_v2.expire_phone_appointments(900, 500, v_w);
+  select state, state_reason, next_eligible_at, version into v_state, v_reason, v_next, v_ver1
+    from screening_v2.phone_engagements where id = v_wedge;
+  select count(*), max(metadata::text)::jsonb into v_audits, v_meta from screening_v2.audit_events
+   where action = 'phone_scheduled_engagement_released' and target_id = v_wedge::text;
+  perform _policy_tests.assert(
+    '0114-§5 C5 wedge release: a scheduled engagement with no live slot goes eligible/appointment_lost at the next IST-day open',
+    v_state = 'eligible' and v_reason = 'appointment_lost' and v_next = v_open
+      and v_ver1 = v_ver0 + 1 and v_audits = 1 and (v_res->>'released')::int >= 1
+      and (v_meta->>'budget_charged')::boolean = false,
+    'res=' || v_res::text || ' state=' || coalesce(v_state, '<null>') || '/' || coalesce(v_reason, '<null>')
+      || ' next=' || coalesce(v_next::text, '<null>') || ' version ' || v_ver0 || '->'
+      || coalesce(v_ver1, -1) || ' audits=' || v_audits);
+
+  select string_agg(e.id::text || '=' || e.state, ' ') into v_other
+    from screening_v2.phone_engagements e
+   where e.id in (v_live, v_hold, v_recent) and e.state <> 'scheduled';
+  perform _policy_tests.assert(
+    '0114-§5 C5 wedge release leaves a live-slot engagement, a future hold and a recently-updated row alone',
+    v_other is null, 'released: ' || coalesce(v_other, ''));
+
+  v_res2 := screening_v2.expire_phone_appointments(900, 500, v_w);
+  select version into v_ver2 from screening_v2.phone_engagements where id = v_wedge;
+  perform _policy_tests.assert(
+    '0114-§5 C5 wedge release is idempotent: a rerun releases 0',
+    (v_res2->>'released')::int = 0 and v_ver2 = v_ver1,
+    'rerun=' || v_res2::text || ' version=' || coalesce(v_ver2, -1));
+end;
+$$;
+
+-- ── §5 F: booking refusals (daily_attempt_exists, slot_not_yet_eligible) ─
+do $$
+declare
+  v_day   constant date := date '2026-11-24';
+  v_book  constant timestamptz := '2026-11-24T04:00:00Z';   -- 09:30 IST
+  v_slot  constant timestamptz := '2026-11-24T09:30:00Z';   -- 15:00 IST
+  v_two uuid; v_infra uuid; v_reclaim uuid; v_recon uuid; v_res jsonb; v_bad text := '';
+  v_n integer;
+begin
+  v_two     := _policy_tests.phone_fixture('pol114s5-day-two');
+  v_infra   := _policy_tests.phone_fixture('pol114s5-day-infra');
+  v_reclaim := _policy_tests.phone_fixture('pol114s5-day-reclaim');
+  v_recon   := _policy_tests.phone_fixture('pol114s5-day-recon');
+
+  -- Two counted dials on the slot's IST date.
+  insert into screening_v2.phone_call_attempts
+    (engagement_id, attempt_seq, epoch, kind, state, outcome_class, ist_date, ist_day_seq,
+     prior_engagement_state, admitted_at, ended_at)
+  values
+    (v_two, 1, 0, 'initial', 'ended', 'no_answer', v_day, 1, 'eligible',
+     '2026-11-24T03:40:00Z', '2026-11-24T03:41:00Z'),
+    (v_two, 2, 0, 'no_answer_retry', 'ended', 'no_answer', v_day, 2, 'eligible',
+     '2026-11-24T03:50:00Z', '2026-11-24T03:51:00Z');
+  -- The second row is an infra_deferred abandonment: exempt, as at admission.
+  insert into screening_v2.phone_call_attempts
+    (engagement_id, attempt_seq, epoch, kind, state, outcome_class, ist_date, ist_day_seq,
+     prior_engagement_state, admitted_at, ended_at, abandon_reason)
+  values
+    (v_infra, 1, 0, 'initial', 'ended', 'no_answer', v_day, 1, 'eligible',
+     '2026-11-24T03:40:00Z', '2026-11-24T03:41:00Z', null),
+    (v_infra, 2, 0, 'initial', 'abandoned', null, v_day, 2, 'eligible',
+     '2026-11-24T03:50:00Z', '2026-11-24T03:51:00Z', 'infra_deferred');
+  -- A lease-RECLAIMED abandonment (abandon_reason NULL) still charges the day.
+  insert into screening_v2.phone_call_attempts
+    (engagement_id, attempt_seq, epoch, kind, state, outcome_class, ist_date, ist_day_seq,
+     prior_engagement_state, admitted_at, ended_at, abandon_reason)
+  values
+    (v_reclaim, 1, 0, 'initial', 'ended', 'no_answer', v_day, 1, 'eligible',
+     '2026-11-24T03:40:00Z', '2026-11-24T03:41:00Z', null),
+    (v_reclaim, 2, 0, 'no_answer_retry', 'abandoned', null, v_day, 2, 'eligible',
+     '2026-11-24T03:50:00Z', '2026-11-24T03:51:00Z', null);
+  -- A reconnect is neither counted nor refused.
+  insert into screening_v2.phone_call_attempts
+    (engagement_id, attempt_seq, epoch, kind, state, outcome_class, ist_date, ist_day_seq,
+     prior_engagement_state, admitted_at, ended_at)
+  values
+    (v_recon, 1, 0, 'initial', 'ended', 'disconnected', v_day, 1, 'eligible',
+     '2026-11-24T03:40:00Z', '2026-11-24T03:41:00Z'),
+    (v_recon, 2, 0, 'reconnect', 'ended', 'disconnected', v_day, 1, 'reconnecting',
+     '2026-11-24T03:50:00Z', '2026-11-24T03:51:00Z');
+
+  v_res := screening_v2.schedule_phone_appointment(
+             v_two, v_slot, v_slot + interval '30 minutes', 'hr_manual', null, null, v_book);
+  select count(*) into v_n from screening_v2.phone_appointments where engagement_id = v_two;
+  if v_res->>'status' is distinct from 'daily_attempt_exists'
+     or (v_res->>'dials_today')::int <> 2 or (v_res->>'max_per_day')::int <> 2
+     or (v_res->>'ist_date')::date <> v_day or v_n <> 0 then
+    v_bad := v_bad || ' two=' || v_res::text || '/rows=' || v_n;
+  end if;
+  -- The NEXT IST day is bookable.
+  v_res := screening_v2.schedule_phone_appointment(
+             v_two, v_slot + interval '1 day', v_slot + interval '1 day 30 minutes',
+             'hr_manual', null, null, v_book);
+  if v_res->>'status' is distinct from 'ok' then v_bad := v_bad || ' two_next_day=' || v_res::text; end if;
+
+  v_res := screening_v2.schedule_phone_appointment(
+             v_infra, v_slot, v_slot + interval '30 minutes', 'hr_manual', null, null, v_book);
+  if v_res->>'status' is distinct from 'ok' then v_bad := v_bad || ' infra=' || v_res::text; end if;
+
+  v_res := screening_v2.schedule_phone_appointment(
+             v_reclaim, v_slot, v_slot + interval '30 minutes', 'hr_manual', null, null, v_book);
+  if v_res->>'status' is distinct from 'daily_attempt_exists' then
+    v_bad := v_bad || ' reclaim_null_reason=' || v_res::text;
+  end if;
+
+  v_res := screening_v2.schedule_phone_appointment(
+             v_recon, v_slot, v_slot + interval '30 minutes', 'hr_manual', null, null, v_book);
+  if v_res->>'status' is distinct from 'ok' then v_bad := v_bad || ' reconnect=' || v_res::text; end if;
+
+  perform _policy_tests.assert(
+    '0114-§5 C5 daily_attempt_exists: two counted dials on the slot''s IST day refuse it (infra_deferred exempt, NULL reason counted, reconnect not counted)',
+    v_bad = '', v_bad);
+end;
+$$;
+
+do $$
+declare
+  v_book constant timestamptz := '2026-11-24T04:00:00Z';    -- 09:30 IST
+  v_gate constant timestamptz := '2026-11-24T08:30:00Z';    -- 14:00 IST
+  v_eng uuid; v_cand_eng uuid; v_cand uuid; v_res jsonb; v_n integer; v_bad text := '';
+begin
+  v_eng := _policy_tests.phone_fixture('pol114s5-notyet');
+  update screening_v2.phone_engagements set next_eligible_at = v_gate where id = v_eng;
+
+  v_res := screening_v2.schedule_phone_appointment(
+             v_eng, v_gate - interval '30 minutes', v_gate, 'candidate_voice', null, null, v_book);
+  select count(*) into v_n from screening_v2.phone_appointments where engagement_id = v_eng;
+  if v_res->>'status' is distinct from 'slot_not_yet_eligible'
+     or (v_res->>'next_eligible_at')::timestamptz <> v_gate or v_n <> 0 then
+    v_bad := v_bad || ' before=' || v_res::text || '/rows=' || v_n;
+  end if;
+  -- Exactly at next_eligible_at is admissible, so it books.
+  v_res := screening_v2.schedule_phone_appointment(
+             v_eng, v_gate, v_gate + interval '30 minutes', 'candidate_voice', null, null, v_book);
+  if v_res->>'status' is distinct from 'ok' then v_bad := v_bad || ' at_gate=' || v_res::text; end if;
+
+  -- Through the candidate-scoped HR wrapper (0058), which delegates. The
+  -- paused mapping makes ensure return early WITH the engagement id, so the
+  -- wrapper reaches schedule_phone_appointment without re-deriving
+  -- next_eligible_at.
+  v_cand_eng := _policy_tests.phone_fixture('pol114s5-notyet-hr', 'eligible', 'ready', 'paused');
+  update screening_v2.phone_engagements set next_eligible_at = v_gate where id = v_cand_eng;
+  select candidate_id into v_cand from screening_v2.phone_engagements where id = v_cand_eng;
+  v_res := screening_v2.schedule_candidate_phone_appointment(
+             v_cand, v_gate - interval '1 hour', v_gate - interval '30 minutes',
+             '00000000-0000-4000-8000-0000000000ad', v_book);
+  select count(*) into v_n from screening_v2.phone_appointments where engagement_id = v_cand_eng;
+  if v_res->>'status' is distinct from 'slot_not_yet_eligible'
+     or (v_res->>'engagement_id')::uuid is distinct from v_cand_eng or v_n <> 0 then
+    v_bad := v_bad || ' hr_wrapper=' || v_res::text || '/rows=' || v_n;
+  end if;
+
+  perform _policy_tests.assert(
+    '0114-§5 C5 slot_not_yet_eligible: a slot before next_eligible_at is refused (direct and through schedule_candidate_phone_appointment)',
+    v_bad = '', v_bad);
+end;
+$$;
+
+do $$
+declare
+  v_book constant timestamptz := '2026-11-25T04:00:00Z';    -- 09:30 IST
+  v_a    constant timestamptz := '2026-11-26T06:30:00Z';    -- 12:00 IST
+  v_eng uuid; v_res jsonb; v_apt uuid; v_ver integer; v_s text; v_v integer; v_n integer;
+  v_bad text := '';
+begin
+  v_eng := _policy_tests.phone_fixture('pol114s5-resched');
+  v_res := screening_v2.schedule_phone_appointment(
+             v_eng, v_a, v_a + interval '30 minutes', 'hr_manual',
+             '00000000-0000-4000-8000-0000000000ad', null, v_book);
+  v_apt := (v_res->>'appointment_id')::uuid;
+  v_ver := (v_res->>'version')::int;
+
+  -- (1) Reschedule onto a day already holding two counted dials.
+  insert into screening_v2.phone_call_attempts
+    (engagement_id, attempt_seq, epoch, kind, state, outcome_class, ist_date, ist_day_seq,
+     prior_engagement_state, admitted_at, ended_at)
+  values
+    (v_eng, 1, 0, 'initial', 'ended', 'no_answer', date '2026-11-27', 1, 'eligible',
+     '2026-11-27T03:40:00Z', '2026-11-27T03:41:00Z'),
+    (v_eng, 2, 0, 'no_answer_retry', 'ended', 'no_answer', date '2026-11-27', 2, 'eligible',
+     '2026-11-27T03:50:00Z', '2026-11-27T03:51:00Z');
+  v_res := screening_v2.schedule_phone_appointment(
+             v_eng, '2026-11-27T09:30:00Z', '2026-11-27T10:00:00Z', 'hr_manual',
+             '00000000-0000-4000-8000-0000000000ad', v_ver, v_book);
+  if v_res->>'status' is distinct from 'daily_attempt_exists' then
+    v_bad := v_bad || ' daily=' || v_res::text;
+  end if;
+
+  -- (2) Reschedule before the engagement's time gate.
+  update screening_v2.phone_engagements set next_eligible_at = '2026-11-26T10:00:00Z'
+   where id = v_eng;
+  v_res := screening_v2.schedule_phone_appointment(
+             v_eng, '2026-11-26T08:30:00Z', '2026-11-26T09:00:00Z', 'hr_manual',
+             '00000000-0000-4000-8000-0000000000ad', v_ver, v_book);
+  if v_res->>'status' is distinct from 'slot_not_yet_eligible' then
+    v_bad := v_bad || ' notyet=' || v_res::text;
+  end if;
+
+  select status, version into v_s, v_v from screening_v2.phone_appointments where id = v_apt;
+  select count(*) into v_n from screening_v2.phone_appointments where engagement_id = v_eng;
+  if v_s <> 'scheduled' or v_v <> v_ver or v_n <> 1 then
+    v_bad := v_bad || ' old_slot=' || coalesce(v_s, '<null>') || '/v' || coalesce(v_v, -1)
+             || '/rows=' || v_n;
+  end if;
+
+  perform _policy_tests.assert(
+    '0114-§5 C5 a refused HR reschedule leaves the old slot live and unversioned (no supersede)',
+    v_bad = '', v_bad);
+end;
+$$;
+
+-- ── §5 teardown: every fixture above, so no row outlives the block (the
+-- GOV-06 synthetic_seed_tests manifest count runs on this same database).
+do $$
+declare v_tag text;
+begin
+  foreach v_tag in array array[
+    'pol114s5-halt', 'pol114s5-lift-take', 'pol114s5-lift-miss', 'pol114s5-nosingleton',
+    'pol114s5-plain', 'pol114s5-futurestamp', 'pol114s5-terminal',
+    'pol114s5-wedge', 'pol114s5-wedge-live', 'pol114s5-wedge-hold', 'pol114s5-wedge-recent',
+    'pol114s5-day-two', 'pol114s5-day-infra', 'pol114s5-day-reclaim', 'pol114s5-day-recon',
+    'pol114s5-notyet', 'pol114s5-notyet-hr', 'pol114s5-resched'] loop
+    perform _policy_tests.p113_teardown(v_tag);
+  end loop;
+  perform _policy_tests.assert(
+    '0114-§5 teardown: no pol114s5-* candidate outlives the block',
+    not exists (select 1 from screening_v2.candidates where email like 'pol114s5-%@example.test'),
+    'leaked=' || (select count(*) from screening_v2.candidates
+                   where email like 'pol114s5-%@example.test')::text);
+end;
+$$;
+-- ==== 0114-§5 END ====
+
+-- ==== 0114-§6 BEGIN ====
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0114 §6 (S6) — C8 person identity guards. One person on several
+-- candidate rows: line-scoped admission guards, the same-role duplicate
+-- hold in ensure, the booking early return, and the operator release.
+-- Every fixture is torn down inside its own block; no contact datum is
+-- asserted into any result row (the detail strings carry statuses only).
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- Pending first-cycle engagement whose link carries an application time, so
+-- ensure can evaluate it end to end. Returns the engagement id.
+create or replace function _policy_tests.c8_pending(
+  p_tag text, p_phone text, p_consent text default 'full', p_state text default 'pending_prereqs'
+)
+returns uuid language plpgsql as $c8p$
+declare v_eng uuid;
+begin
+  v_eng := _policy_tests.phone_fixture(p_tag, p_state, 'ready', 'enabled', p_consent, p_phone);
+  update screening_v2.ashby_application_links
+     set submitted_at = '2026-09-14T05:00:00Z'
+   where id = (select application_link_id from screening_v2.phone_engagements where id = v_eng);
+  return v_eng;
+end;
+$c8p$;
+
+create or replace function _policy_tests.c8_ensure(p_eng uuid, p_now timestamptz)
+returns jsonb language sql as $c8e$
+  select screening_v2.ensure_ashby_phone_engagement(
+           (select application_link_id from screening_v2.phone_engagements where id = p_eng),
+           p_now);
+$c8e$;
+
+-- ── 0114-1: posture. admit's first statement is the phone_admission lock and
+--    no exception handler precedes the halt read; all four functions are
+--    SECURITY DEFINER with the pinned search_path and service_role-only; the
+--    release table has RLS on and no browser grant; the email index exists ─
+do $$
+declare
+  v_src text; v_body text; v_first text; v_bad text := '';
+  v_fn regprocedure;
+  v_halt integer; v_exc integer;
+begin
+  select prosrc into v_src from pg_proc
+   where oid = 'screening_v2.admit_phone_attempt(uuid,text,text,integer,timestamptz)'::regprocedure;
+  v_body := regexp_replace(v_src, '--[^\n]*', '', 'g');
+  v_body := substr(v_body, strpos(v_body, E'\nbegin') + 6);
+  v_first := btrim(regexp_replace(split_part(v_body, ';', 1), '\s+', ' ', 'g'));
+  if v_first <> 'perform pg_advisory_xact_lock(hashtext(''phone_admission''))' then
+    v_bad := v_bad || ' first_statement=' || left(v_first, 80);
+  end if;
+  v_halt := strpos(v_body, 'from screening_v2.phone_control');
+  v_exc  := coalesce((select min(m.p) from (
+              select strpos(v_body, 'exception') as p) m where m.p > 0), 0);
+  if v_halt = 0 or (v_exc > 0 and v_exc < v_halt) then
+    v_bad := v_bad || ' exception_before_halt_read(' || v_exc || '<' || v_halt || ')';
+  end if;
+
+  foreach v_fn in array array[
+    'screening_v2.admit_phone_attempt(uuid,text,text,integer,timestamptz)'::regprocedure,
+    'screening_v2.ensure_ashby_phone_engagement(uuid,timestamptz)'::regprocedure,
+    'screening_v2.schedule_candidate_phone_appointment(uuid,timestamptz,timestamptz,uuid,timestamptz)'::regprocedure,
+    'screening_v2.release_phone_identity_hold(uuid,uuid,timestamptz)'::regprocedure]
+  loop
+    if not (select prosecdef from pg_proc where oid = v_fn) then
+      v_bad := v_bad || ' not_definer:' || v_fn::text; end if;
+    if not coalesce((select 'search_path=pg_catalog, screening_v2' = any (proconfig)
+                       from pg_proc where oid = v_fn), false) then
+      v_bad := v_bad || ' search_path:' || v_fn::text; end if;
+    if has_function_privilege('anon', v_fn, 'execute')
+       or has_function_privilege('authenticated', v_fn, 'execute')
+       or not has_function_privilege('service_role', v_fn, 'execute') then
+      v_bad := v_bad || ' acl:' || v_fn::text; end if;
+    if exists (select 1 from pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
+                where p.oid = v_fn and a.grantee = 0 and a.privilege_type = 'EXECUTE') then
+      v_bad := v_bad || ' public_execute:' || v_fn::text; end if;
+  end loop;
+
+  if not (select relrowsecurity from pg_class
+           where oid = 'screening_v2.phone_identity_hold_releases'::regclass) then
+    v_bad := v_bad || ' release_table_rls_off'; end if;
+  if has_table_privilege('anon', 'screening_v2.phone_identity_hold_releases', 'select,insert,update,delete')
+     or has_table_privilege('authenticated', 'screening_v2.phone_identity_hold_releases', 'select,insert,update,delete')
+     or not has_table_privilege('service_role', 'screening_v2.phone_identity_hold_releases', 'select,insert') then
+    v_bad := v_bad || ' release_table_acl'; end if;
+  if not exists (select 1 from pg_indexes
+                  where schemaname = 'screening_v2' and indexname = 'idx_v2_candidates_email_norm') then
+    v_bad := v_bad || ' email_index_missing'; end if;
+
+  perform _policy_tests.assert(
+    '0114-1 C8 posture: admit lock-first, no handler before the halt read; 4 functions definer + pinned search_path + service_role only; release table RLS, no browser grant; email index',
+    v_bad = '', v_bad);
+end;
+$$;
+
+-- ── 0114-2 / 0114-3: admission guards key on the LINE. A sibling row on the
+--    same number is refused candidate_call_in_flight (scope line) while the
+--    first row's call is live, and candidate_daily_attempt_exists (scope line)
+--    once it has been dialled today; the 0045 same-person meaning keeps scope
+--    candidate; a scheduled dial and a different number are unaffected ──────
+do $$
+declare
+  v_t   timestamptz := '2026-09-14T06:00:00Z';   -- Monday 11:30 IST
+  v_a uuid; v_b uuid; v_d uuid; v_a2 uuid;
+  v_link_a uuid; v_map_a uuid; v_link_a2 uuid; v_cand_a uuid;
+  v_res jsonb; v_att_a uuid;
+  v_s text;
+  v_bad2 text := ''; v_bad3 text := '';
+begin
+  v_a := _policy_tests.c8_pending('pol114c8-ga', '+919811400001', 'full', 'eligible');
+  v_b := _policy_tests.c8_pending('pol114c8-gb', '+919811400001', 'full', 'eligible');
+  v_d := _policy_tests.c8_pending('pol114c8-gd', '+919811400009', 'full', 'eligible');
+
+  -- A second application of A's OWN candidate row (the 0045 shape).
+  select application_link_id, candidate_id into v_link_a, v_cand_a
+    from screening_v2.phone_engagements where id = v_a;
+  select job_mapping_id into v_map_a from screening_v2.ashby_application_links where id = v_link_a;
+  insert into screening_v2.ashby_application_links
+    (external_application_id, external_job_id, job_mapping_id,
+     external_resume_file_handle, candidate_id)
+  values ('pol114c8-ga2-app', 'pol114c8-ga-job', v_map_a, repeat('h', 64), v_cand_a)
+  returning id into v_link_a2;
+  foreach v_s in array array['queued','fetching','scanning','extracting','structuring','ready'] loop
+    perform screening_v2.advance_ashby_ingestion(v_link_a2, v_s, null, null, null, null);
+  end loop;
+  insert into screening_v2.phone_engagements (application_link_id, candidate_id, role_id, state)
+  select v_link_a2, v_cand_a, role_id, 'eligible' from screening_v2.phone_engagements where id = v_a
+  returning id into v_a2;
+
+  v_res := screening_v2.admit_phone_attempt(v_a, 'initial', null, 60, v_t);
+  v_att_a := (v_res->>'attempt_id')::uuid;
+  if v_res->>'status' <> 'ok' then v_bad2 := v_bad2 || ' a=' || (v_res->>'status'); end if;
+
+  v_res := screening_v2.admit_phone_attempt(v_b, 'initial', null, 60, v_t + interval '10 seconds');
+  if v_res->>'status' <> 'candidate_call_in_flight' or v_res->>'scope' is distinct from 'line'
+     or v_res::text like '%' || v_cand_a::text || '%' or v_res::text like '%' || v_a::text || '%' then
+    v_bad2 := v_bad2 || ' sibling=' || coalesce(v_res::text, '<null>'); end if;
+
+  v_res := screening_v2.admit_phone_attempt(v_a2, 'initial', null, 60, v_t + interval '10 seconds');
+  if v_res->>'status' <> 'candidate_call_in_flight' or v_res->>'scope' is distinct from 'candidate' then
+    v_bad2 := v_bad2 || ' same_person=' || coalesce(v_res::text, '<null>'); end if;
+
+  v_res := screening_v2.admit_phone_attempt(v_d, 'initial', null, 60, v_t + interval '10 seconds');
+  if v_res->>'status' <> 'ok' then v_bad2 := v_bad2 || ' other_number=' || (v_res->>'status'); end if;
+
+  perform _policy_tests.assert(
+    '0114-2 C8 Guard A keys on the line: sibling row refused candidate_call_in_flight scope=line (no other id leaked); same person scope=candidate; another number admitted',
+    v_bad2 = '', v_bad2);
+
+  -- A's call is over (lease lapsed), but it still charged the line's day.
+  update screening_v2.phone_call_attempts
+     set lease_expires_at = v_t + interval '1 second'
+   where id = v_att_a;
+
+  v_res := screening_v2.admit_phone_attempt(v_b, 'initial', null, 60, v_t + interval '20 minutes');
+  if v_res->>'status' <> 'candidate_daily_attempt_exists' or v_res->>'scope' is distinct from 'line'
+     or v_res->>'ist_date' is distinct from '2026-09-14' then
+    v_bad3 := v_bad3 || ' sibling=' || coalesce(v_res::text, '<null>'); end if;
+
+  v_res := screening_v2.admit_phone_attempt(v_a2, 'no_answer_retry', null, 60, v_t + interval '20 minutes');
+  if v_res->>'status' <> 'candidate_daily_attempt_exists' or v_res->>'scope' is distinct from 'candidate' then
+    v_bad3 := v_bad3 || ' same_person=' || coalesce(v_res::text, '<null>'); end if;
+
+  -- The scheduled exemption is byte-identical: a booked slot on the sibling
+  -- row is not a cold call and is admitted.
+  update screening_v2.phone_engagements set state = 'scheduled' where id = v_b;
+  v_res := screening_v2.admit_phone_attempt(v_b, 'scheduled', null, 60, v_t + interval '20 minutes');
+  if v_res->>'status' <> 'ok' then
+    v_bad3 := v_bad3 || ' scheduled=' || coalesce(v_res::text, '<null>'); end if;
+
+  perform _policy_tests.assert(
+    '0114-3 C8 Guard B keys on the line: dialled-today sibling refused candidate_daily_attempt_exists scope=line; same person scope=candidate; scheduled exemption unchanged',
+    v_bad3 = '', v_bad3);
+
+  perform _policy_tests.phone_teardown_links(array['pol114c8-ga2-app'], 'nobody@example.test');
+  perform _policy_tests.phone_teardown('pol114c8-ga');
+  perform _policy_tests.phone_teardown('pol114c8-gb');
+  perform _policy_tests.phone_teardown('pol114c8-gd');
+end;
+$$;
+
+-- ── 0114-4 … 0114-6: the same-role duplicate hold, by phone, by normalised
+--    email, and by (external_candidate_id, job mapping). The held row stays
+--    pending_prereqs/duplicate_application, gets NO consent record, and the
+--    result names only its own engagement ────────────────────────────────
+do $$
+declare
+  v_t timestamptz := '2026-09-14T06:00:00Z';
+  v_a uuid; v_b uuid; v_res jsonb; v_res2 jsonb;
+  v_cand_a uuid; v_cand_b uuid; v_state text; v_reason text;
+  v_bad text := '';
+begin
+  -- 0114-4: phone line.
+  v_a := _policy_tests.c8_pending('pol114c8-ha', '+919811400011', 'full', 'eligible');
+  v_b := _policy_tests.c8_pending('pol114c8-hb', '+919811400011', 'none');
+  select candidate_id into v_cand_a from screening_v2.phone_engagements where id = v_a;
+  select candidate_id into v_cand_b from screening_v2.phone_engagements where id = v_b;
+
+  v_res := _policy_tests.c8_ensure(v_b, v_t);
+  v_res2 := _policy_tests.c8_ensure(v_b, v_t + interval '1 minute');
+  select state, state_reason into v_state, v_reason from screening_v2.phone_engagements where id = v_b;
+  if v_res->>'status' <> 'duplicate_application'
+     or (v_res->>'engagement_id')::uuid <> v_b
+     or (select array_agg(k order by k) from jsonb_object_keys(v_res) k) <> array['engagement_id','status']
+     or v_res2->>'status' <> 'duplicate_application'
+     or v_state <> 'pending_prereqs' or v_reason <> 'duplicate_application'
+     or exists (select 1 from screening_v2.consent_records where candidate_id = v_cand_b)
+     or (select consent_at from screening_v2.candidates where id = v_cand_b) is not null then
+    v_bad := ' ' || coalesce(v_res::text, '<null>') || ' state=' || coalesce(v_state, '<null>')
+             || '/' || coalesce(v_reason, '<null>');
+  end if;
+  perform _policy_tests.assert(
+    '0114-4 C8 a same-role row on the same line is held pending_prereqs/duplicate_application, no consent minted, result names only itself',
+    v_bad = '', v_bad);
+  perform _policy_tests.phone_teardown('pol114c8-hb');
+  perform _policy_tests.phone_teardown('pol114c8-ha');
+
+  -- 0114-5: normalised email (different number; case and whitespace differ).
+  v_bad := '';
+  v_a := _policy_tests.c8_pending('pol114c8-ea', '+919811400021', 'full', 'eligible');
+  v_b := _policy_tests.c8_pending('pol114c8-eb', '+919811400022');
+  select candidate_id into v_cand_b from screening_v2.phone_engagements where id = v_b;
+  update screening_v2.candidates set email = '  POL114C8-EA@Example.TEST ' where id = v_cand_b;
+  v_res := _policy_tests.c8_ensure(v_b, v_t);
+  if v_res->>'status' <> 'duplicate_application' then v_bad := ' ' || v_res::text; end if;
+  update screening_v2.candidates set email = 'pol114c8-eb@example.test' where id = v_cand_b;
+  perform _policy_tests.assert(
+    '0114-5 C8 a same-role row matching on normalised email (case/whitespace) is held',
+    v_bad = '', v_bad);
+  perform _policy_tests.phone_teardown('pol114c8-eb');
+  perform _policy_tests.phone_teardown('pol114c8-ea');
+
+  -- 0114-6: external_candidate_id + job mapping. Same external id under a
+  -- DIFFERENT mapping is not a match; under the same mapping it is.
+  v_bad := '';
+  v_a := _policy_tests.c8_pending('pol114c8-xa', '+919811400031', 'full', 'eligible');
+  v_b := _policy_tests.c8_pending('pol114c8-xb', '+919811400032');
+  update screening_v2.ashby_application_links set external_candidate_id = 'ext-pol114c8'
+   where id in (select application_link_id from screening_v2.phone_engagements where id in (v_a, v_b));
+  v_res := _policy_tests.c8_ensure(v_b, v_t);
+  if v_res->>'status' not in ('eligible', 'scheduled_next_window') then
+    v_bad := v_bad || ' other_mapping=' || v_res::text; end if;
+  -- Back to pending (the trigger allows no eligible -> pending edge, so a
+  -- fresh fixture), now sharing A's mapping.
+  perform _policy_tests.phone_teardown('pol114c8-xb');
+  v_b := _policy_tests.c8_pending('pol114c8-xb', '+919811400032');
+  update screening_v2.ashby_application_links
+     set external_candidate_id = 'ext-pol114c8',
+         job_mapping_id = (select l.job_mapping_id
+                             from screening_v2.ashby_application_links l
+                             join screening_v2.phone_engagements e on e.application_link_id = l.id
+                            where e.id = v_a)
+   where id = (select application_link_id from screening_v2.phone_engagements where id = v_b);
+  v_res := _policy_tests.c8_ensure(v_b, v_t);
+  if v_res->>'status' <> 'duplicate_application' then
+    v_bad := v_bad || ' same_mapping=' || v_res::text; end if;
+  perform _policy_tests.assert(
+    '0114-6 C8 external_candidate_id matches only under the same job mapping, and then holds',
+    v_bad = '', v_bad);
+  perform _policy_tests.phone_teardown('pol114c8-xb');
+  perform _policy_tests.phone_teardown('pol114c8-xa');
+end;
+$$;
+
+-- ── 0114-7: an ELIGIBLE row is never relabelled, even with a live sibling ──
+do $$
+declare
+  v_t timestamptz := '2026-09-14T06:00:00Z';
+  v_a uuid; v_b uuid; v_res jsonb; v_state text; v_reason text;
+begin
+  v_a := _policy_tests.c8_pending('pol114c8-la', '+919811400041', 'full', 'eligible');
+  v_b := _policy_tests.c8_pending('pol114c8-lb', '+919811400041', 'full', 'eligible');
+  v_res := _policy_tests.c8_ensure(v_b, v_t);
+  select state, state_reason into v_state, v_reason from screening_v2.phone_engagements where id = v_b;
+  perform _policy_tests.assert(
+    '0114-7 C8 an eligible row is never relabelled duplicate_application',
+    v_res->>'status' in ('eligible', 'scheduled_next_window')
+      and v_state = 'eligible' and v_reason is null,
+    coalesce(v_res::text, '<null>') || ' state=' || coalesce(v_state, '<null>') || '/' || coalesce(v_reason, '<null>'));
+  perform _policy_tests.phone_teardown('pol114c8-lb');
+  perform _policy_tests.phone_teardown('pol114c8-la');
+end;
+$$;
+
+-- ── 0114-8: an HR rescreen child is never held (the #145 regression).
+--    request_phone_rescreen is redeclared in §7 (C6), which runs ensure for
+--    the child; S7 enabled this case when §7 landed. ─────────────────────────
+do $$
+declare
+  v_enabled boolean := true;    -- S7: enabled with §7 (C6).
+  v_t timestamptz := '2026-09-14T06:00:00Z';
+  v_a uuid; v_b uuid; v_res jsonb; v_child uuid; v_state text; v_reason text; v_cand_b uuid;
+begin
+  if not v_enabled then
+    raise notice '0114-8 C8 rescreen-child case PENDING S7 (enabled by §7)';
+    return;
+  end if;
+  v_a := _policy_tests.c8_pending('pol114c8-ra', '+919811400051', 'full', 'eligible');
+  v_b := _policy_tests.c8_pending('pol114c8-rb', '+919811400051', 'full', 'completed');
+  select candidate_id into v_cand_b from screening_v2.phone_engagements where id = v_b;
+  v_res := screening_v2.request_phone_rescreen(
+    v_cand_b, 'technical_issue', 'pol114c8-rescreen', 'hr_manual',
+    '00000000-0000-4000-8000-0000000000ad', v_t);
+  v_child := (v_res->>'engagement_id')::uuid;
+  select state, state_reason into v_state, v_reason from screening_v2.phone_engagements where id = v_child;
+  perform _policy_tests.assert(
+    '0114-8 C8 an HR rescreen child (cycle 2) is never held, even with a live same-line sibling',
+    v_res->>'status' = 'ok' and v_state = 'eligible'
+      and v_reason is distinct from 'duplicate_application',
+    coalesce(v_res::text, '<null>') || ' child=' || coalesce(v_state, '<null>') || '/' || coalesce(v_reason, '<null>'));
+  delete from screening_v2.phone_rescreen_requests where candidate_id = v_cand_b;
+  perform _policy_tests.phone_teardown('pol114c8-rb');
+  perform _policy_tests.phone_teardown('pol114c8-ra');
+end;
+$$;
+
+-- ── 0114-9: no cross-role hold ────────────────────────────────────────────
+do $$
+declare
+  v_t timestamptz := '2026-09-14T06:00:00Z';
+  v_a uuid; v_b uuid; v_res jsonb; v_role2 uuid; v_cand_b uuid; v_reason text;
+begin
+  v_a := _policy_tests.c8_pending('pol114c8-ca', '+919811400061', 'full', 'eligible');
+  v_b := _policy_tests.c8_pending('pol114c8-cb', '+919811400061');
+  insert into screening_v2.roles (title) values ('pol114c8 other role') returning id into v_role2;
+  select candidate_id into v_cand_b from screening_v2.phone_engagements where id = v_b;
+  update screening_v2.candidates set role_id = v_role2 where id = v_cand_b;
+  update screening_v2.phone_engagements set role_id = v_role2 where id = v_b;
+  update screening_v2.ashby_job_mappings set role_id = v_role2 where external_job_id = 'pol114c8-cb-job';
+  v_res := _policy_tests.c8_ensure(v_b, v_t);
+  select state_reason into v_reason from screening_v2.phone_engagements where id = v_b;
+  perform _policy_tests.assert(
+    '0114-9 C8 the same line under a DIFFERENT role is never held',
+    v_res->>'status' in ('eligible', 'scheduled_next_window') and v_reason is null,
+    coalesce(v_res::text, '<null>'));
+  perform _policy_tests.phone_teardown('pol114c8-cb');
+  perform _policy_tests.phone_teardown('pol114c8-ca');
+  delete from screening_v2.roles where id = v_role2;
+end;
+$$;
+
+-- ── 0114-10: only a sibling past prerequisites or COMPLETED blocks. A
+--    withdrawn/failed/unreached/cancelled/opted-out screen, or a sibling that
+--    is itself pending (held or not), never holds a re-application ─────────
+do $$
+declare
+  v_t timestamptz := '2026-09-14T06:00:00Z';
+  v_a uuid; v_b uuid; v_res jsonb;
+  v_s text; v_bad text := '';
+begin
+  foreach v_s in array array['failed','cancelled','abandoned_no_answer','opted_out',
+                             'pending_prereqs','completed','scheduled'] loop
+    v_a := _policy_tests.c8_pending('pol114c8-sa', '+919811400071', 'full', v_s);
+    v_b := _policy_tests.c8_pending('pol114c8-sb', '+919811400071');
+    v_res := _policy_tests.c8_ensure(v_b, v_t);
+    if (v_s in ('completed','scheduled')) <> (v_res->>'status' = 'duplicate_application') then
+      v_bad := v_bad || ' ' || v_s || '=' || (v_res->>'status');
+    end if;
+    perform _policy_tests.phone_teardown('pol114c8-sb');
+    perform _policy_tests.phone_teardown('pol114c8-sa');
+  end loop;
+  perform _policy_tests.assert(
+    '0114-10 C8 a terminal-unsuccessful or pending sibling never holds; completed or live-past-prereqs does',
+    v_bad = '', v_bad);
+end;
+$$;
+
+-- ── 0114-11 / 0114-12: release_phone_identity_hold. actor_required first;
+--    not_held unless held; the release records, audits (no PII), re-runs
+--    ensure (consent minted only now), and is never re-held ───────────────
+do $$
+declare
+  v_t timestamptz := '2026-09-14T06:00:00Z';
+  v_actor uuid := '00000000-0000-4000-8000-0000000000ad';
+  v_a uuid; v_b uuid; v_cand_b uuid; v_res jsonb; v_meta jsonb;
+  v_state text; v_reason text;
+  v_bad11 text := ''; v_bad12 text := '';
+begin
+  v_a := _policy_tests.c8_pending('pol114c8-pa', '+919811400081', 'full', 'eligible');
+  v_b := _policy_tests.c8_pending('pol114c8-pb', '+919811400081', 'none');
+  select candidate_id into v_cand_b from screening_v2.phone_engagements where id = v_b;
+  v_res := _policy_tests.c8_ensure(v_b, v_t);
+  if v_res->>'status' <> 'duplicate_application' then v_bad11 := ' setup=' || v_res::text; end if;
+
+  v_res := screening_v2.release_phone_identity_hold(v_b, null, v_t);
+  if v_res->>'status' <> 'actor_required' then v_bad11 := v_bad11 || ' null_actor=' || v_res::text; end if;
+  v_res := screening_v2.release_phone_identity_hold(v_a, v_actor, v_t);
+  if v_res->>'status' <> 'not_held' then v_bad11 := v_bad11 || ' unheld=' || v_res::text; end if;
+  v_res := screening_v2.release_phone_identity_hold(gen_random_uuid(), v_actor, v_t);
+  if v_res->>'status' <> 'not_found' then v_bad11 := v_bad11 || ' missing=' || v_res::text; end if;
+  if exists (select 1 from screening_v2.phone_identity_hold_releases where engagement_id in (v_a, v_b))
+     or exists (select 1 from screening_v2.audit_events
+                 where action = 'phone_identity_hold_release' and target_id in (v_a::text, v_b::text)) then
+    v_bad11 := v_bad11 || ' refusal_wrote_rows';
+  end if;
+  perform _policy_tests.assert(
+    '0114-11 C8 release refuses actor_required (null actor), not_held (unheld row), not_found, and writes nothing',
+    v_bad11 = '', v_bad11);
+
+  v_res := screening_v2.release_phone_identity_hold(v_b, v_actor, v_t + interval '1 minute');
+  select state, state_reason into v_state, v_reason from screening_v2.phone_engagements where id = v_b;
+  select metadata into v_meta from screening_v2.audit_events
+   where action = 'phone_identity_hold_release' and target_id = v_b::text;
+  if v_res->>'status' <> 'ok' or (v_res->>'engagement_id')::uuid <> v_b
+     or v_res->>'prerequisite_status' not in ('eligible', 'scheduled_next_window')
+     or v_state <> 'eligible' or v_reason is not null
+     or (select count(*) from screening_v2.phone_identity_hold_releases
+          where engagement_id = v_b and actor_id = v_actor) <> 1
+     or (select count(*) from screening_v2.audit_events
+          where action = 'phone_identity_hold_release' and target_id = v_b::text
+            and actor_id = v_actor and actor_type = 'recruiter'
+            and target_type = 'phone_engagement' and result = 'success') <> 1
+     or (select array_agg(k order by k) from jsonb_object_keys(v_meta) k)
+          <> array['application_link_id','cycle_number','prior_reason']
+     or not exists (select 1 from screening_v2.consent_records where candidate_id = v_cand_b) then
+    v_bad12 := ' release=' || coalesce(v_res::text, '<null>') || ' state=' || coalesce(v_state, '<null>')
+               || '/' || coalesce(v_reason, '<null>');
+  end if;
+  -- Never re-held: ensure again is a plain re-evaluation; a second release is not_held.
+  v_res := _policy_tests.c8_ensure(v_b, v_t + interval '2 minutes');
+  if v_res->>'status' not in ('eligible', 'scheduled_next_window') then
+    v_bad12 := v_bad12 || ' rerun=' || v_res::text; end if;
+  v_res := screening_v2.release_phone_identity_hold(v_b, v_actor, v_t + interval '3 minutes');
+  if v_res->>'status' <> 'not_held'
+     or (select count(*) from screening_v2.phone_identity_hold_releases where engagement_id = v_b) <> 1 then
+    v_bad12 := v_bad12 || ' second=' || v_res::text; end if;
+  perform _policy_tests.assert(
+    '0114-12 C8 release records once, audits phone_identity_hold_release (opaque metadata only), mints consent only now, promotes, never re-held',
+    v_bad12 = '', v_bad12);
+
+  perform _policy_tests.phone_teardown('pol114c8-pb');
+  perform _policy_tests.phone_teardown('pol114c8-pa');
+end;
+$$;
+
+-- ── 0114-13: schedule_candidate_phone_appointment books nothing for a held
+--    duplicate application ─────────────────────────────────────────────────
+do $$
+declare
+  v_t timestamptz := '2026-09-14T06:00:00Z';
+  v_a uuid; v_b uuid; v_cand_b uuid; v_res jsonb; v_reason text;
+begin
+  v_a := _policy_tests.c8_pending('pol114c8-ka', '+919811400091', 'full', 'eligible');
+  v_b := _policy_tests.c8_pending('pol114c8-kb', '+919811400091');
+  select candidate_id into v_cand_b from screening_v2.phone_engagements where id = v_b;
+  v_res := screening_v2.schedule_candidate_phone_appointment(
+    v_cand_b, '2026-09-15T06:00:00Z', '2026-09-15T06:30:00Z',
+    '00000000-0000-4000-8000-0000000000ad', v_t);
+  select state_reason into v_reason from screening_v2.phone_engagements where id = v_b;
+  perform _policy_tests.assert(
+    '0114-13 C8 booking a held duplicate application returns duplicate_application and writes no appointment',
+    v_res->>'status' = 'duplicate_application'
+      and (v_res->>'engagement_id')::uuid = v_b
+      and v_reason = 'duplicate_application'
+      and not exists (select 1 from screening_v2.phone_appointments where engagement_id = v_b),
+    coalesce(v_res::text, '<null>'));
+  perform _policy_tests.phone_teardown('pol114c8-kb');
+  perform _policy_tests.phone_teardown('pol114c8-ka');
+end;
+$$;
+
+select _policy_tests.assert(
+  '0114-§6 C8 fixtures leave nothing behind',
+  not exists (select 1 from screening_v2.candidates where email like 'pol114c8-%')
+  and not exists (select 1 from screening_v2.ashby_application_links where external_application_id like 'pol114c8-%')
+  and not exists (select 1 from screening_v2.phone_identity_hold_releases),
+  'a 0114-§6 fixture leaked');
+
+drop function _policy_tests.c8_ensure(uuid, timestamptz);
+drop function _policy_tests.c8_pending(text, text, text, text);
+-- ==== 0114-§6 END ====
+
+-- ==== 0114-§7 BEGIN ====
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0114 §7 (S7) — C6 request_phone_rescreen drift. PR #145 edited 0057 after
+-- prod applied it, so prod's body never ran ensure and every rescreen child
+-- stayed pending_prereqs. §7 redeclares the function: canonical lock order,
+-- ensure after the inserts, prerequisite_status, and a strictly predicated
+-- self-heal on a same-intent replay. Every fixture is torn down in its block.
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- A terminal first cycle on a fully-prerequisite'd application (mapping
+-- enabled, ingestion ready, valid line, consent, application time), so a
+-- rescreen child can be evaluated end to end. Returns the engagement id.
+create or replace function _policy_tests.c6_terminal(
+  p_tag text, p_state text default 'completed', p_consent text default 'full'
+)
+returns uuid language plpgsql as $c6t$
+declare v_eng uuid;
+begin
+  v_eng := _policy_tests.phone_fixture(p_tag, p_state, 'ready', 'enabled', p_consent, null);
+  update screening_v2.ashby_application_links
+     set submitted_at = '2026-09-14T05:00:00Z'
+   where id = (select application_link_id from screening_v2.phone_engagements where id = v_eng);
+  return v_eng;
+end;
+$c6t$;
+
+create or replace function _policy_tests.c6_teardown(p_tag text)
+returns void language plpgsql as $c6d$
+begin
+  delete from screening_v2.phone_rescreen_requests
+   where candidate_id in (select id from screening_v2.candidates where email = p_tag || '@example.test');
+  perform _policy_tests.phone_teardown(p_tag);
+end;
+$c6d$;
+
+-- ── C6a: all prerequisites met. The rescreen child is evaluated in the SAME
+--    call: eligible (or scheduled_next_window outside the IST window), with
+--    the status echoed as prerequisite_status, and still no attempt and no
+--    phone.dial job (admission stays the only billable door). ────────────────
+do $$
+declare
+  v_t timestamptz := '2026-09-14T06:00:00Z';   -- Monday 11:30 IST, window open
+  v_prev uuid; v_cand uuid; v_res jsonb; v_child uuid;
+  v_state text; v_reason text; v_dial_before bigint;
+begin
+  v_prev := _policy_tests.c6_terminal('pol114c6-a');
+  select candidate_id into v_cand from screening_v2.phone_engagements where id = v_prev;
+  select count(*) into v_dial_before from screening_v2.job_queue where name = 'phone.dial';
+
+  v_res := screening_v2.request_phone_rescreen(
+    v_cand, 'technical_issue', 'pol114c6-a-req', 'hr_manual',
+    '00000000-0000-4000-8000-0000000000ad', v_t);
+  v_child := (v_res->>'engagement_id')::uuid;
+  select state, state_reason into v_state, v_reason
+    from screening_v2.phone_engagements where id = v_child;
+
+  perform _policy_tests.assert(
+    '0114-C6a a rescreen with every prerequisite met is evaluated in the same call (eligible, prerequisite_status echoed)',
+    v_res->>'status' = 'ok'
+      and (v_res->>'cycle_number')::integer = 2
+      and (v_res->>'predecessor_engagement_id')::uuid = v_prev
+      and v_res->>'prerequisite_status' = 'eligible'
+      and v_state = 'eligible' and v_reason is null,
+    coalesce(v_res::text, '<null>') || ' child=' || coalesce(v_state, '<null>') || '/' || coalesce(v_reason, '<null>'));
+  perform _policy_tests.assert(
+    '0114-C6a the evaluated rescreen creates 0 attempts and 0 phone.dial jobs',
+    not exists (select 1 from screening_v2.phone_call_attempts where engagement_id = v_child)
+      and (select count(*) from screening_v2.job_queue where name = 'phone.dial') = v_dial_before
+      and exists (select 1 from screening_v2.audit_events
+                   where action = 'phone_rescreen_requested' and target_id = v_child::text),
+    'a rescreen intent must never dial; admission is the only billable door');
+
+  -- Outside the IST window the same evaluation answers scheduled_next_window.
+  perform _policy_tests.c6_teardown('pol114c6-a');
+  v_prev := _policy_tests.c6_terminal('pol114c6-a');
+  select candidate_id into v_cand from screening_v2.phone_engagements where id = v_prev;
+  v_res := screening_v2.request_phone_rescreen(
+    v_cand, 'technical_issue', 'pol114c6-a-req2', 'hr_manual',
+    '00000000-0000-4000-8000-0000000000ad', '2026-09-14T17:00:00Z');   -- 22:30 IST
+  select state into v_state from screening_v2.phone_engagements
+   where id = (v_res->>'engagement_id')::uuid;
+  perform _policy_tests.assert(
+    '0114-C6a outside the IST window the child is eligible for the next window (scheduled_next_window)',
+    v_res->>'status' = 'ok'
+      and v_res->>'prerequisite_status' = 'scheduled_next_window'
+      and v_state = 'eligible',
+    coalesce(v_res::text, '<null>') || ' child=' || coalesce(v_state, '<null>'));
+  perform _policy_tests.c6_teardown('pol114c6-a');
+end;
+$$;
+
+-- ── C6b / C6b2 / C6b3: the self-heal on a same-intent replay is strictly
+--    predicated. C6b reproduces the prod shape the #145 drift left (a child
+--    stuck pending_prereqs/rescreen_requested with its request row): the
+--    replay promotes it, with ONE request row. C6b2: replaying an eligible
+--    child is a pure read. C6b3: a pending child that a newer cycle has
+--    superseded is never evaluated. ─────────────────────────────────────────
+do $$
+declare
+  v_t timestamptz := '2026-09-14T06:00:00Z';
+  v_actor uuid := '00000000-0000-4000-8000-0000000000ad';
+  v_prev uuid; v_cand uuid; v_link uuid; v_role uuid; v_consent uuid; v_child uuid;
+  v_res jsonb; v_state text; v_reason text;
+  v_upd timestamptz; v_ver bigint; v_upd2 timestamptz; v_ver2 bigint;
+begin
+  v_prev := _policy_tests.c6_terminal('pol114c6-b');
+  select candidate_id, application_link_id, role_id into v_cand, v_link, v_role
+    from screening_v2.phone_engagements where id = v_prev;
+  select id into v_consent from screening_v2.consent_records
+   where candidate_id = v_cand order by created_at desc, id desc limit 1;
+  -- Exactly what prod's #144 body wrote: child + request row, no evaluation.
+  insert into screening_v2.phone_engagements
+    (application_link_id, candidate_id, role_id, cycle_number, no_answer_limit,
+     state, state_reason, consent_record_id, created_at, updated_at)
+  values (v_link, v_cand, v_role, 2, 1, 'pending_prereqs', 'rescreen_requested',
+          v_consent, v_t, v_t)
+  returning id into v_child;
+  insert into screening_v2.phone_rescreen_requests
+    (application_link_id, candidate_id, predecessor_engagement_id, new_engagement_id,
+     source, reason, request_id, actor_id, created_at)
+  values (v_link, v_cand, v_prev, v_child, 'hr_manual', 'technical_issue',
+          'pol114c6-b-req', v_actor, v_t);
+
+  v_res := screening_v2.request_phone_rescreen(
+    v_cand, 'technical_issue', 'pol114c6-b-req', 'hr_manual', v_actor,
+    v_t + interval '1 minute');
+  select state, state_reason into v_state, v_reason
+    from screening_v2.phone_engagements where id = v_child;
+  perform _policy_tests.assert(
+    '0114-C6b a same-intent replay on a stuck child returns already_requested and PROMOTES it, with one request row',
+    v_res->>'status' = 'already_requested'
+      and (v_res->>'engagement_id')::uuid = v_child
+      and (v_res->>'cycle_number')::integer = 2
+      and v_res->>'request_id' = 'pol114c6-b-req'
+      and v_res->>'prerequisite_status' = 'eligible'
+      and v_state = 'eligible' and v_reason is null
+      and (select count(*) from screening_v2.phone_rescreen_requests where candidate_id = v_cand) = 1
+      and (select count(*) from screening_v2.phone_engagements where application_link_id = v_link) = 2
+      and not exists (select 1 from screening_v2.phone_call_attempts where engagement_id = v_child),
+    coalesce(v_res::text, '<null>') || ' child=' || coalesce(v_state, '<null>') || '/' || coalesce(v_reason, '<null>'));
+
+  select updated_at, version into v_upd, v_ver from screening_v2.phone_engagements where id = v_child;
+  v_res := screening_v2.request_phone_rescreen(
+    v_cand, 'technical_issue', 'pol114c6-b-req', 'hr_manual', v_actor,
+    v_t + interval '2 minutes');
+  select updated_at, version into v_upd2, v_ver2 from screening_v2.phone_engagements where id = v_child;
+  perform _policy_tests.assert(
+    '0114-C6b2 a replay on an ELIGIBLE child is a pure read: prerequisite_status null, updated_at and version unchanged',
+    v_res->>'status' = 'already_requested'
+      and (v_res->>'engagement_id')::uuid = v_child
+      and v_res ? 'prerequisite_status'
+      and v_res->'prerequisite_status' = 'null'::jsonb
+      and v_upd2 = v_upd and v_ver2 = v_ver,
+    coalesce(v_res::text, '<null>') || ' updated_at ' || v_upd || '->' || v_upd2);
+  perform _policy_tests.c6_teardown('pol114c6-b');
+
+  -- C6b3: the same stuck child, but a (terminal) newer cycle exists on the
+  -- link. The child is no longer the newest cycle, so the replay must not
+  -- evaluate it (ensure works on the NEWEST cycle only).
+  v_prev := _policy_tests.c6_terminal('pol114c6-b');
+  select candidate_id, application_link_id, role_id into v_cand, v_link, v_role
+    from screening_v2.phone_engagements where id = v_prev;
+  select id into v_consent from screening_v2.consent_records
+   where candidate_id = v_cand order by created_at desc, id desc limit 1;
+  insert into screening_v2.phone_engagements
+    (application_link_id, candidate_id, role_id, cycle_number, no_answer_limit,
+     state, state_reason, consent_record_id, created_at, updated_at)
+  values (v_link, v_cand, v_role, 2, 1, 'pending_prereqs', 'rescreen_requested',
+          v_consent, v_t, v_t)
+  returning id into v_child;
+  insert into screening_v2.phone_rescreen_requests
+    (application_link_id, candidate_id, predecessor_engagement_id, new_engagement_id,
+     source, reason, request_id, actor_id, created_at)
+  values (v_link, v_cand, v_prev, v_child, 'hr_manual', 'technical_issue',
+          'pol114c6-b3-req', v_actor, v_t);
+  insert into screening_v2.phone_engagements
+    (application_link_id, candidate_id, role_id, cycle_number, no_answer_limit,
+     state, state_reason, terminal_at, created_at, updated_at)
+  values (v_link, v_cand, v_role, 3, 1, 'cancelled', 'application_terminal',
+          v_t, v_t, v_t);
+  select updated_at, version into v_upd, v_ver from screening_v2.phone_engagements where id = v_child;
+  v_res := screening_v2.request_phone_rescreen(
+    v_cand, 'technical_issue', 'pol114c6-b3-req', 'hr_manual', v_actor,
+    v_t + interval '1 minute');
+  select state, state_reason, updated_at, version into v_state, v_reason, v_upd2, v_ver2
+    from screening_v2.phone_engagements where id = v_child;
+  perform _policy_tests.assert(
+    '0114-C6b3 a replay on a pending child that a newer cycle superseded is a pure read (never evaluated)',
+    v_res->>'status' = 'already_requested'
+      and v_res->'prerequisite_status' = 'null'::jsonb
+      and v_state = 'pending_prereqs' and v_reason = 'rescreen_requested'
+      and v_upd2 = v_upd and v_ver2 = v_ver,
+    coalesce(v_res::text, '<null>') || ' child=' || coalesce(v_state, '<null>') || '/' || coalesce(v_reason, '<null>'));
+  perform _policy_tests.c6_teardown('pol114c6-b');
+end;
+$$;
+
+-- ── C6c (LOCAL-ONLY): the LOCAL function definition calls ensure. This proves
+--    the repo/0114 text only; it cannot see prod, which is exactly how the
+--    #145 drift hid. Prod is checked by scripts/verify-prod-function-drift.sh
+--    after every production migration run (deploy-fly.yml). ──────────────────
+select _policy_tests.assert(
+  '0114-C6c (local-only) the local request_phone_rescreen definition calls ensure_ashby_phone_engagement',
+  position('ensure_ashby_phone_engagement' in pg_get_functiondef(
+    'screening_v2.request_phone_rescreen(uuid,text,text,text,uuid,timestamptz)'::regprocedure)) > 0,
+  'the local body does not call the evaluator; prod drift would be invisible here anyway');
+
+-- ── C6c posture: SECURITY DEFINER, pinned search_path, service_role-only ──
+select _policy_tests.assert(
+  '0114-C6c request_phone_rescreen stays SECURITY DEFINER, search_path-pinned and service_role-only',
+  (select p.prosecdef
+          and p.proconfig @> array['search_path=pg_catalog, screening_v2']
+     from pg_proc p
+    where p.oid = 'screening_v2.request_phone_rescreen(uuid,text,text,text,uuid,timestamptz)'::regprocedure)
+  and has_function_privilege('service_role',
+        'screening_v2.request_phone_rescreen(uuid,text,text,text,uuid,timestamptz)', 'execute')
+  and not has_function_privilege('anon',
+        'screening_v2.request_phone_rescreen(uuid,text,text,text,uuid,timestamptz)', 'execute')
+  and not has_function_privilege('authenticated',
+        'screening_v2.request_phone_rescreen(uuid,text,text,text,uuid,timestamptz)', 'execute'),
+  'the rescreen door changed posture');
+
+-- ── C6d: every refusal is unchanged by the redeclaration, and none of them
+--    writes a child, a request row or runs the evaluator. (0057-G2..G6 above
+--    cover already_requested, active_cycle, the frozen predecessor, cycle 3
+--    and cycle_limit_reached against this same 0114 body.) ─────────────────
+do $$
+declare
+  v_t timestamptz := '2026-09-14T06:00:00Z';
+  v_actor uuid := '00000000-0000-4000-8000-0000000000ad';
+  v_eng uuid; v_cand uuid; v_link uuid; v_other uuid; v_res jsonb;
+  v_bad text := '';
+  v_case record;
+begin
+  -- Argument refusals on an otherwise rescreen-able candidate.
+  v_eng := _policy_tests.c6_terminal('pol114c6-d');
+  select candidate_id, application_link_id into v_cand, v_link
+    from screening_v2.phone_engagements where id = v_eng;
+  for v_case in
+    select * from (values
+      ('invalid_source',     'technical_issue', 'pol114c6-d-r1', 'browser',   v_actor),
+      ('invalid_reason',     'because',         'pol114c6-d-r2', 'hr_manual', v_actor),
+      ('invalid_request_id', 'technical_issue', 'bad id!',       'hr_manual', v_actor),
+      ('actor_required',     'technical_issue', 'pol114c6-d-r4', 'hr_manual', null::uuid)
+    ) as t(expected, reason, request_id, source, actor)
+  loop
+    v_res := screening_v2.request_phone_rescreen(
+      v_cand, v_case.reason, v_case.request_id, v_case.source, v_case.actor, v_t);
+    if v_res->>'status' is distinct from v_case.expected then
+      v_bad := v_bad || ' ' || v_case.expected || '=>' || coalesce(v_res->>'status', '<null>');
+    end if;
+  end loop;
+  v_res := screening_v2.request_phone_rescreen(
+    '00000000-0000-4000-8000-00000000c6ff', 'technical_issue', 'pol114c6-d-r5', 'hr_manual', v_actor, v_t);
+  if v_res->>'status' is distinct from 'candidate_not_found' then
+    v_bad := v_bad || ' candidate_not_found=>' || coalesce(v_res->>'status', '<null>');
+  end if;
+
+  -- idempotency_conflict: a request id already owned by ANOTHER candidate.
+  v_other := _policy_tests.c6_terminal('pol114c6-d2');
+  v_res := screening_v2.request_phone_rescreen(
+    (select candidate_id from screening_v2.phone_engagements where id = v_other),
+    'technical_issue', 'pol114c6-d-owned', 'hr_manual', v_actor, v_t);
+  if v_res->>'status' is distinct from 'ok' then
+    v_bad := v_bad || ' setup_owned=>' || coalesce(v_res->>'status', '<null>');
+  end if;
+  v_res := screening_v2.request_phone_rescreen(
+    v_cand, 'technical_issue', 'pol114c6-d-owned', 'hr_manual', v_actor, v_t);
+  if v_res->>'status' is distinct from 'idempotency_conflict' then
+    v_bad := v_bad || ' idempotency_conflict=>' || coalesce(v_res->>'status', '<null>');
+  end if;
+
+  -- application_not_live: the newest application is cancelled.
+  update screening_v2.ashby_application_links set lifecycle = 'cancelled' where id = v_link;
+  v_res := screening_v2.request_phone_rescreen(
+    v_cand, 'technical_issue', 'pol114c6-d-r6', 'hr_manual', v_actor, v_t);
+  if v_res->>'status' is distinct from 'application_not_live' then
+    v_bad := v_bad || ' application_not_live=>' || coalesce(v_res->>'status', '<null>');
+  end if;
+  update screening_v2.ashby_application_links set lifecycle = 'ready' where id = v_link;
+
+  -- engagement_not_found: a live application with no cycle at all.
+  delete from screening_v2.phone_engagements where id = v_eng;
+  v_res := screening_v2.request_phone_rescreen(
+    v_cand, 'technical_issue', 'pol114c6-d-r7', 'hr_manual', v_actor, v_t);
+  if v_res->>'status' is distinct from 'engagement_not_found' then
+    v_bad := v_bad || ' engagement_not_found=>' || coalesce(v_res->>'status', '<null>');
+  end if;
+
+  perform _policy_tests.assert(
+    '0114-C6d argument, identity, idempotency, application and engagement refusals are unchanged and write nothing',
+    v_bad = ''
+      and not exists (select 1 from screening_v2.phone_engagements where application_link_id = v_link)
+      and not exists (select 1 from screening_v2.phone_rescreen_requests where candidate_id = v_cand),
+    'refusal drift:' || v_bad);
+  perform _policy_tests.c6_teardown('pol114c6-d2');
+  perform _policy_tests.c6_teardown('pol114c6-d');
+
+  -- State and consent refusals, each on its own predecessor.
+  v_bad := '';
+  for v_case in
+    select * from (values
+      ('pol114c6-e1', 'opted_out',    'full',     'opted_out'),
+      ('pol114c6-e2', 'wrong_number', 'full',     'wrong_number_unverified'),
+      ('pol114c6-e3', 'completed',    'declined', 'consent_not_granted'),
+      ('pol114c6-e4', 'completed',    'expired',  'consent_expired'),
+      ('pol114c6-e5', 'eligible',     'full',     'active_cycle')
+    ) as t(tag, state, consent, expected)
+  loop
+    v_eng := _policy_tests.c6_terminal(v_case.tag, v_case.state, v_case.consent);
+    select candidate_id, application_link_id into v_cand, v_link
+      from screening_v2.phone_engagements where id = v_eng;
+    v_res := screening_v2.request_phone_rescreen(
+      v_cand, 'technical_issue', v_case.tag || '-req', 'hr_manual', v_actor, v_t);
+    if v_res->>'status' is distinct from v_case.expected
+       or (select count(*) from screening_v2.phone_engagements where application_link_id = v_link) <> 1
+       or exists (select 1 from screening_v2.phone_rescreen_requests where candidate_id = v_cand) then
+      v_bad := v_bad || ' ' || v_case.expected || '=>' || coalesce(v_res::text, '<null>');
+    end if;
+    perform _policy_tests.c6_teardown(v_case.tag);
+  end loop;
+  perform _policy_tests.assert(
+    '0114-C6d opted_out, wrong_number_unverified, consent_not_granted, consent_expired and active_cycle are unchanged and write nothing',
+    v_bad = '',
+    'refusal drift:' || v_bad);
+end;
+$$;
+
+select _policy_tests.assert(
+  '0114-§7 C6 fixtures leave nothing behind',
+  not exists (select 1 from screening_v2.candidates where email like 'pol114c6-%')
+  and not exists (select 1 from screening_v2.ashby_application_links where external_application_id like 'pol114c6-%')
+  and not exists (select 1 from screening_v2.phone_rescreen_requests where request_id like 'pol114c6-%'),
+  'a 0114-§7 fixture leaked');
+
+drop function _policy_tests.c6_teardown(text);
+drop function _policy_tests.c6_terminal(text, text, text);
+-- ==== 0114-§7 END ====
+
+-- ==== 0114-§8 BEGIN ====
+-- §8 (S8, C10b): halt provenance and the phone_control direct-write audit.
+-- Every case starts and ends UNHALTED with the singleton present. New audit
+-- rows are found by difference against a snapshot of the phone_control
+-- audit ids (audit_events is append-only, and earlier blocks write rows of
+-- the same shapes). No contact datum appears in any detail string.
+
+-- Snapshot of every phone_control audit id, for "rows this step wrote".
+create or replace function _policy_tests.s8_mark()
+returns uuid[] language sql as $s8m$
+  select coalesce(array_agg(id), '{}') from screening_v2.audit_events
+   where target_type = 'phone_control';
+$s8m$;
+
+-- The phone_control audit rows written since p_mark, as `override:actor_type`
+-- tokens in a stable order (for compact assertions and failure details).
+create or replace function _policy_tests.s8_new(p_mark uuid[])
+returns text language sql as $s8n$
+  select coalesce(string_agg(coalesce(metadata->>'override', '?') || ':' || actor_type, ','
+                             order by metadata->>'override', actor_type), '')
+    from screening_v2.audit_events
+   where target_type = 'phone_control' and not (id = any (p_mark));
+$s8n$;
+
+-- ── 0114-§8 posture: set/clear and the test gate keep exactly the pinned
+--    search_path (the writer is read from the call stack, not a parameter);
+--    the test gate's body is untouched; the trigger function is definer,
+--    pinned and not browser-callable; the trigger is AFTER INSERT OR UPDATE
+--    OR DELETE, FOR EACH ROW, enabled ───────────────────────────────────────
+do $$
+declare
+  v_bad text := '';
+  v_fn  regprocedure;
+  v_cfg text[];
+begin
+  foreach v_fn in array array[
+    'screening_v2.set_phone_halt(text,uuid,timestamptz)'::regprocedure,
+    'screening_v2.clear_phone_halt(uuid,timestamptz)'::regprocedure,
+    'screening_v2.admit_phone_test_attempt(uuid,uuid,text,text,integer,timestamptz)'::regprocedure]
+  loop
+    select proconfig into v_cfg from pg_proc where oid = v_fn;
+    if v_cfg is distinct from array['search_path=pg_catalog, screening_v2'] then
+      v_bad := v_bad || ' proconfig:' || v_fn::text || '=' || coalesce(v_cfg::text, 'null'); end if;
+    if not (select prosecdef from pg_proc where oid = v_fn) then
+      v_bad := v_bad || ' not_definer:' || v_fn::text; end if;
+    if has_function_privilege('anon', v_fn, 'execute')
+       or has_function_privilege('authenticated', v_fn, 'execute')
+       or not has_function_privilege('service_role', v_fn, 'execute') then
+      v_bad := v_bad || ' acl:' || v_fn::text; end if;
+  end loop;
+
+  -- The test gate is not redeclared: its body still restores the control row
+  -- inside the exception handler exactly as 0063 wrote it.
+  if (select prosrc from pg_proc
+       where oid = 'screening_v2.admit_phone_test_attempt(uuid,uuid,text,text,integer,timestamptz)'::regprocedure)
+     not like '%exception when others then%update screening_v2.phone_control%raise;%' then
+    v_bad := v_bad || ' test_gate_body_changed'; end if;
+
+  v_fn := 'screening_v2.audit_phone_control_direct_write()'::regprocedure;
+  if not (select prosecdef from pg_proc where oid = v_fn) then
+    v_bad := v_bad || ' trigger_fn_not_definer'; end if;
+  if not coalesce((select 'search_path=pg_catalog, screening_v2' = any (proconfig)
+                     from pg_proc where oid = v_fn), false) then
+    v_bad := v_bad || ' trigger_fn_search_path'; end if;
+  if has_function_privilege('anon', v_fn, 'execute')
+     or has_function_privilege('authenticated', v_fn, 'execute')
+     or exists (select 1 from pg_proc p, aclexplode(coalesce(p.proacl, acldefault('f', p.proowner))) a
+                 where p.oid = v_fn and a.grantee = 0 and a.privilege_type = 'EXECUTE') then
+    v_bad := v_bad || ' trigger_fn_executable'; end if;
+  -- tgtype bits: ROW 1, BEFORE 2, INSERT 4, DELETE 8, UPDATE 16 -> 29 is
+  -- AFTER (no BEFORE bit) INSERT OR UPDATE OR DELETE FOR EACH ROW.
+  if not exists (select 1 from pg_trigger
+                  where tgrelid = 'screening_v2.phone_control'::regclass
+                    and tgname = 'trg_phone_control_direct_write_audit'
+                    and tgfoid = v_fn and tgtype = 29 and tgenabled = 'O'
+                    and not tgisinternal) then
+    v_bad := v_bad || ' trigger_missing_or_wrong_shape'; end if;
+
+  perform _policy_tests.assert(
+    '0114-§8 posture: set/clear and the test gate keep exactly the pinned search_path, definer, '
+    || 'service_role only; the audit trigger is definer, pinned, not executable, AFTER I/U/D ROW',
+    v_bad = '', v_bad);
+end;
+$$;
+
+-- ── 0114-§8 provenance: a NULL-actor halt is allowed and audited as SYSTEM,
+--    unattributed; an attributed halt is a recruiter's; a NULL-actor clear is
+--    refused actor_required with no write and no audit; an attributed clear
+--    lifts the halt; RPC writes leave no direct-write row ───────────────────
+do $$
+declare
+  t    constant timestamptz := '2026-10-06T06:00:00Z';
+  v_sys constant uuid := '00000000-0000-4000-8000-000000000001';
+  v_a   constant uuid := '00000000-0000-4000-8000-00000114c8a1';
+  v_mark uuid[];
+  v_res jsonb;
+  v_md  jsonb;
+  v_row record;
+  v_bad_set text := ''; v_bad_attr text := ''; v_bad_clear text := ''; v_bad_ok text := '';
+begin
+  -- 1. Anonymous halt: allowed, system actor, attributed=false.
+  v_mark := _policy_tests.s8_mark();
+  v_res := screening_v2.set_phone_halt('operator_pause', null, t);
+  if v_res->>'status' <> 'ok' then v_bad_set := v_bad_set || ' status=' || (v_res->>'status'); end if;
+  if _policy_tests.s8_new(v_mark) <> 'phone_admission_halt_set:system' then
+    v_bad_set := v_bad_set || ' rows=[' || _policy_tests.s8_new(v_mark) || ']'; end if;
+  select actor_id, metadata into v_row from screening_v2.audit_events
+   where target_type = 'phone_control' and not (id = any (v_mark));
+  v_md := v_row.metadata;
+  if v_row.actor_id <> v_sys or (v_md->>'attributed')::boolean is not false
+     or coalesce(v_md->>'db_session_user', '') = '' or not (v_md ? 'application_name')
+     or v_md->>'reason' <> 'operator_pause' or v_md->>'reason_in_force' <> 'operator_pause' then
+    v_bad_set := v_bad_set || ' md=' || coalesce(v_md::text, '<null>'); end if;
+  if (select halt_actor_id from screening_v2.phone_control where control_key = 'default') <> v_sys then
+    v_bad_set := v_bad_set || ' halt_actor_not_system'; end if;
+  perform _policy_tests.assert(
+    '0114-§8 C10b: a NULL-actor halt is still allowed and is audited actor_type system, attributed=false, '
+    || 'with db_session_user and application_name; no direct-write row',
+    v_bad_set = '', v_bad_set);
+
+  -- 2. Attributed escalation: a recruiter's, attributed=true.
+  v_mark := _policy_tests.s8_mark();
+  v_res := screening_v2.set_phone_halt('legal_hold', v_a, t + interval '1 minute');
+  if v_res->>'halt_reason' is distinct from 'legal_hold' then
+    v_bad_attr := v_bad_attr || ' res=' || v_res::text; end if;
+  if _policy_tests.s8_new(v_mark) <> 'phone_admission_halt_set:recruiter' then
+    v_bad_attr := v_bad_attr || ' rows=[' || _policy_tests.s8_new(v_mark) || ']'; end if;
+  select metadata into v_md from screening_v2.audit_events
+   where target_type = 'phone_control' and not (id = any (v_mark)) and actor_id = v_a;
+  if (v_md->>'attributed')::boolean is not true then
+    v_bad_attr := v_bad_attr || ' md=' || coalesce(v_md::text, '<null>'); end if;
+  perform _policy_tests.assert(
+    '0114-§8 C10b: an attributed halt is audited actor_type recruiter, attributed=true (0110 precedence intact)',
+    v_bad_attr = '', v_bad_attr);
+
+  -- 3. Anonymous clear: refused FIRST, nothing written, still halted.
+  v_mark := _policy_tests.s8_mark();
+  v_res := screening_v2.clear_phone_halt(null, t + interval '2 minutes');
+  select halted_at, halt_reason, halt_actor_id, updated_at into v_row
+    from screening_v2.phone_control where control_key = 'default';
+  if v_res is distinct from '{"status": "actor_required"}'::jsonb then
+    v_bad_clear := v_bad_clear || ' res=' || coalesce(v_res::text, '<null>'); end if;
+  if v_row.halted_at is distinct from t or v_row.halt_reason is distinct from 'legal_hold'
+     or v_row.halt_actor_id is distinct from v_a
+     or v_row.updated_at is distinct from t + interval '1 minute' then
+    v_bad_clear := v_bad_clear || ' row_changed'; end if;
+  if _policy_tests.s8_new(v_mark) <> '' then
+    v_bad_clear := v_bad_clear || ' rows=[' || _policy_tests.s8_new(v_mark) || ']'; end if;
+  perform _policy_tests.assert(
+    '0114-§8 C10b (RED pre-0114): a NULL-actor clear answers actor_required, the halt stays in force '
+    || 'untouched, and no audit row is written',
+    v_bad_clear = '', v_bad_clear);
+
+  -- 4. Attributed clear: ok, recruiter, attributed; RPC writes never trip
+  --    the direct-write audit (the whole case wrote none).
+  v_mark := _policy_tests.s8_mark();
+  v_res := screening_v2.clear_phone_halt(v_a, t + interval '3 minutes');
+  if v_res->>'status' <> 'ok' or (v_res->>'was_halted')::boolean is not true then
+    v_bad_ok := v_bad_ok || ' res=' || v_res::text; end if;
+  if _policy_tests.s8_new(v_mark) <> 'phone_admission_halt_cleared:recruiter' then
+    v_bad_ok := v_bad_ok || ' rows=[' || _policy_tests.s8_new(v_mark) || ']'; end if;
+  select metadata into v_md from screening_v2.audit_events
+   where target_type = 'phone_control' and not (id = any (v_mark));
+  if (v_md->>'attributed')::boolean is not true or v_md->>'previous_reason' <> 'legal_hold'
+     or coalesce(v_md->>'db_session_user', '') = '' then
+    v_bad_ok := v_bad_ok || ' md=' || coalesce(v_md::text, '<null>'); end if;
+  if (select halted_at from screening_v2.phone_control where control_key = 'default') is not null then
+    v_bad_ok := v_bad_ok || ' still_halted'; end if;
+  perform _policy_tests.assert(
+    '0114-§8 C10b: an attributed clear lifts the halt as a recruiter (attributed=true); '
+    || 'set/clear wrote no direct-write row',
+    v_bad_ok = '', v_bad_ok);
+end;
+$$;
+
+-- ── 0114-§8 direct writes: a raw halt, a raw lift, a DELETE and an INSERT of
+--    the singleton are each audited ONCE under the system actor; an UPDATE of
+--    updated_at alone is not; a NULL-actor clear on a MISSING singleton is
+--    actor_required (the actor check is the first statement) ───────────────
+do $$
+declare
+  t    constant timestamptz := '2026-10-06T06:10:00Z';
+  v_sys constant uuid := '00000000-0000-4000-8000-000000000001';
+  v_a   constant uuid := '00000000-0000-4000-8000-00000114c8a1';
+  v_mark uuid[];
+  v_md  jsonb;
+  v_row record;
+  v_saved screening_v2.phone_control%rowtype;
+  v_res jsonb; v_res2 jsonb;
+  v_bad text := ''; v_bad_missing text := '';
+begin
+  -- Raw halt.
+  v_mark := _policy_tests.s8_mark();
+  update screening_v2.phone_control
+     set halted_at = t, halt_reason = 'emergency_stop', halt_actor_id = v_sys, updated_at = t
+   where control_key = 'default';
+  if _policy_tests.s8_new(v_mark) <> 'phone_control_direct_write:system' then
+    v_bad := v_bad || ' halt_rows=[' || _policy_tests.s8_new(v_mark) || ']'; end if;
+  select actor_id, target_id, metadata into v_row from screening_v2.audit_events
+   where target_type = 'phone_control' and not (id = any (v_mark));
+  v_md := v_row.metadata;
+  if v_row.actor_id <> v_sys or v_row.target_id <> 'default'
+     or v_md->>'operation' <> 'update' or v_md->>'state_before' <> 'clear'
+     or v_md->>'state_after' <> 'halted' or v_md->>'previous_reason' <> 'none'
+     or v_md->>'reason_after' <> 'emergency_stop' or v_md->>'caller' <> 'inline_code_block'
+     or (v_md->>'attributed')::boolean is not false or (v_md->>'actor_changed')::boolean is not true
+     or coalesce(v_md->>'db_session_user', '') = '' then
+    v_bad := v_bad || ' halt_md=' || coalesce(v_md::text, '<null>'); end if;
+
+  -- updated_at only: not a halt change.
+  v_mark := _policy_tests.s8_mark();
+  update screening_v2.phone_control set updated_at = t + interval '1 minute'
+   where control_key = 'default';
+  if _policy_tests.s8_new(v_mark) <> '' then
+    v_bad := v_bad || ' stamp_rows=[' || _policy_tests.s8_new(v_mark) || ']'; end if;
+
+  -- Raw lift.
+  v_mark := _policy_tests.s8_mark();
+  update screening_v2.phone_control
+     set halted_at = null, halt_reason = null, halt_actor_id = null, updated_at = t + interval '2 minutes'
+   where control_key = 'default';
+  select metadata into v_md from screening_v2.audit_events
+   where target_type = 'phone_control' and not (id = any (v_mark));
+  if _policy_tests.s8_new(v_mark) <> 'phone_control_direct_write:system'
+     or v_md->>'state_before' <> 'halted' or v_md->>'state_after' <> 'clear'
+     or v_md->>'previous_reason' <> 'emergency_stop' or v_md->>'reason_after' <> 'none' then
+    v_bad := v_bad || ' lift=[' || _policy_tests.s8_new(v_mark) || '] ' || coalesce(v_md::text, '<null>'); end if;
+
+  -- DELETE, then the missing-singleton clears, then INSERT.
+  select * into v_saved from screening_v2.phone_control where control_key = 'default';
+  v_mark := _policy_tests.s8_mark();
+  delete from screening_v2.phone_control where control_key = 'default';
+  select metadata into v_md from screening_v2.audit_events
+   where target_type = 'phone_control' and not (id = any (v_mark));
+  if _policy_tests.s8_new(v_mark) <> 'phone_control_direct_write:system'
+     or v_md->>'operation' <> 'delete' or v_md->>'state_after' <> 'absent'
+     or v_md->>'state_before' <> 'clear' then
+    v_bad := v_bad || ' delete=[' || _policy_tests.s8_new(v_mark) || '] ' || coalesce(v_md::text, '<null>'); end if;
+
+  v_res  := screening_v2.clear_phone_halt(null, t + interval '3 minutes');
+  v_res2 := screening_v2.clear_phone_halt(v_a, t + interval '3 minutes');
+  if v_res->>'status' is distinct from 'actor_required' then
+    v_bad_missing := v_bad_missing || ' anon=' || coalesce(v_res::text, '<null>'); end if;
+  if v_res2->>'status' is distinct from 'halt_unreadable' then
+    v_bad_missing := v_bad_missing || ' attributed=' || coalesce(v_res2::text, '<null>'); end if;
+  if exists (select 1 from screening_v2.phone_control) then
+    v_bad_missing := v_bad_missing || ' singleton_invented'; end if;
+
+  v_mark := _policy_tests.s8_mark();
+  insert into screening_v2.phone_control
+    (control_key, halted_at, halt_reason, halt_actor_id, updated_at)
+  values (v_saved.control_key, v_saved.halted_at, v_saved.halt_reason,
+          v_saved.halt_actor_id, v_saved.updated_at);
+  select metadata into v_md from screening_v2.audit_events
+   where target_type = 'phone_control' and not (id = any (v_mark));
+  if _policy_tests.s8_new(v_mark) <> 'phone_control_direct_write:system'
+     or v_md->>'operation' <> 'insert' or v_md->>'state_before' <> 'absent'
+     or v_md->>'state_after' <> 'clear' then
+    v_bad := v_bad || ' insert=[' || _policy_tests.s8_new(v_mark) || '] ' || coalesce(v_md::text, '<null>'); end if;
+
+  perform _policy_tests.assert(
+    '0114-§8 C10b (RED pre-0114): raw halt, raw lift, DELETE and INSERT of phone_control are each audited '
+    || 'once as phone_control_direct_write (system actor, unattributed, states and reasons); updated_at alone is not',
+    v_bad = '', v_bad);
+  perform _policy_tests.assert(
+    '0114-§8 C10b: with the singleton missing, a NULL-actor clear is actor_required (first statement) and an '
+    || 'attributed clear is still halt_unreadable; no row is invented',
+    v_bad_missing = '', v_bad_missing);
+end;
+$$;
+
+-- ── 0114-§8 the exemption is by exact name in screening_v2: a same-named
+--    function in ANOTHER schema that writes the row is audited, and named ──
+create or replace function _policy_tests.set_phone_halt(p_at timestamptz)
+returns void language plpgsql as $s8f$
+begin
+  update screening_v2.phone_control
+     set halted_at = p_at, halt_reason = 'operator_pause',
+         halt_actor_id = '00000000-0000-4000-8000-000000000001', updated_at = p_at
+   where control_key = 'default';
+end;
+$s8f$;
+
+do $$
+declare
+  t    constant timestamptz := '2026-10-06T06:15:00Z';
+  v_a  constant uuid := '00000000-0000-4000-8000-00000114c8a1';
+  v_mark uuid[];
+  v_md jsonb;
+begin
+  v_mark := _policy_tests.s8_mark();
+  perform _policy_tests.set_phone_halt(t);
+  select metadata into v_md from screening_v2.audit_events
+   where target_type = 'phone_control' and not (id = any (v_mark));
+  perform _policy_tests.assert(
+    '0114-§8 C10b: a same-named set_phone_halt in another schema is NOT exempt; its raw write is audited '
+    || 'with that caller',
+    _policy_tests.s8_new(v_mark) = 'phone_control_direct_write:system'
+      and v_md->>'caller' = '_policy_tests.set_phone_halt' and v_md->>'state_after' = 'halted',
+    'rows=[' || _policy_tests.s8_new(v_mark) || '] ' || coalesce(v_md::text, '<null>'));
+  perform screening_v2.clear_phone_halt(v_a, t + interval '1 minute');
+end;
+$$;
+drop function _policy_tests.set_phone_halt(timestamptz);
+
+-- ── 0114-§8 same-transaction leak: an RPC and a raw write in ONE transaction.
+--    The writer is read per statement from the call stack, so nothing the RPC
+--    did can exempt the raw write after it; the RPC itself is not audited ──
+do $$
+declare
+  t    constant timestamptz := '2026-10-06T06:20:00Z';
+  v_a  constant uuid := '00000000-0000-4000-8000-00000114c8a1';
+  v_mark uuid[];
+  v_md jsonb;
+  v_bad text := '';
+begin
+  v_mark := _policy_tests.s8_mark();
+  perform screening_v2.set_phone_halt('operator_pause', v_a, t);
+  update screening_v2.phone_control set halt_reason = 'legal_hold'
+   where control_key = 'default';
+  if _policy_tests.s8_new(v_mark)
+       <> 'phone_admission_halt_set:recruiter,phone_control_direct_write:system' then
+    v_bad := v_bad || ' rows=[' || _policy_tests.s8_new(v_mark) || ']'; end if;
+  select metadata into v_md from screening_v2.audit_events
+   where target_type = 'phone_control' and not (id = any (v_mark))
+     and metadata->>'override' = 'phone_control_direct_write';
+  if v_md->>'previous_reason' <> 'operator_pause' or v_md->>'reason_after' <> 'legal_hold'
+     or v_md->>'state_before' <> 'halted' or v_md->>'state_after' <> 'halted' then
+    v_bad := v_bad || ' md=' || coalesce(v_md::text, '<null>'); end if;
+
+  v_mark := _policy_tests.s8_mark();
+  perform screening_v2.clear_phone_halt(v_a, t + interval '1 minute');
+  if _policy_tests.s8_new(v_mark) <> 'phone_admission_halt_cleared:recruiter' then
+    v_bad := v_bad || ' clear_rows=[' || _policy_tests.s8_new(v_mark) || ']'; end if;
+
+  perform _policy_tests.assert(
+    '0114-§8 C10b: in one transaction, set_phone_halt is not double-audited and a raw write right after it '
+    || 'is still audited (operator_pause -> legal_hold)',
+    v_bad = '', v_bad);
+end;
+$$;
+
+-- ── 0114-§8 a forced audit failure never blocks or reverts the write ───────
+create or replace function _policy_tests.s8_refuse_direct_write_audit()
+returns trigger language plpgsql as $s8r$
+begin
+  if new.metadata->>'override' = 'phone_control_direct_write' then
+    raise exception 'pol114s8_forced_audit_failure';
+  end if;
+  return new;
+end;
+$s8r$;
+
+do $$
+declare
+  t    constant timestamptz := '2026-10-06T06:30:00Z';
+  v_sys constant uuid := '00000000-0000-4000-8000-000000000001';
+  v_a   constant uuid := '00000000-0000-4000-8000-00000114c8a1';
+  v_mark uuid[];
+  v_ok boolean := true;
+  v_err text := '';
+  v_row record;
+begin
+  create trigger pol114s8_refuse_audit before insert on screening_v2.audit_events
+    for each row execute function _policy_tests.s8_refuse_direct_write_audit();
+  v_mark := _policy_tests.s8_mark();
+  begin
+    update screening_v2.phone_control
+       set halted_at = t, halt_reason = 'emergency_stop', halt_actor_id = v_sys, updated_at = t
+     where control_key = 'default';
+  exception when others then
+    v_ok := false; v_err := sqlstate;
+  end;
+  drop trigger pol114s8_refuse_audit on screening_v2.audit_events;
+
+  select halted_at, halt_reason into v_row
+    from screening_v2.phone_control where control_key = 'default';
+  perform _policy_tests.assert(
+    '0114-§8 C10b: a forced audit failure does not block the raw halt (WARNING only, no audit row, row halted)',
+    v_ok and v_row.halted_at = t and v_row.halt_reason = 'emergency_stop'
+      and _policy_tests.s8_new(v_mark) = '',
+    'ok=' || v_ok || ' err=' || v_err || ' halted=' || coalesce(v_row.halted_at::text, 'null')
+      || ' rows=[' || _policy_tests.s8_new(v_mark) || ']');
+
+  perform screening_v2.clear_phone_halt(v_a, t + interval '1 minute');
+end;
+$$;
+drop function _policy_tests.s8_refuse_direct_write_audit();
+
+-- ── 0114-§8 the owner-test gate: its lift/restore of phone_control writes
+--    ZERO direct-write rows, on success and when the inner admit raises; the
+--    operator_pause it bypassed is back exactly as it was ────────────────────
+create or replace function _policy_tests.s8_refuse_attempt()
+returns trigger language plpgsql as $s8a$
+begin
+  if new.engagement_id = (select e.id from screening_v2.phone_engagements e
+                            join screening_v2.ashby_application_links l on l.id = e.application_link_id
+                           where l.external_application_id = 'pol114s8-gate2-app') then
+    raise exception 'pol114s8_forced_admit_failure';
+  end if;
+  return new;
+end;
+$s8a$;
+
+do $$
+declare
+  t    constant timestamptz := '2026-09-14T06:00:00Z';   -- Monday 11:30 IST
+  v_a  constant uuid := '00000000-0000-4000-8000-00000114c8a1';
+  v_eng uuid; v_eng2 uuid; v_cand uuid; v_cand2 uuid;
+  v_gate jsonb; v_gate2 jsonb; v_res jsonb;
+  v_mark uuid[];
+  v_raised text := '';
+  v_row record;
+  v_bad text := ''; v_bad2 text := '';
+begin
+  v_eng  := _policy_tests.phone_fixture('pol114s8-gate', 'eligible');
+  v_eng2 := _policy_tests.phone_fixture('pol114s8-gate2', 'eligible');
+  select candidate_id into v_cand  from screening_v2.phone_engagements where id = v_eng;
+  select candidate_id into v_cand2 from screening_v2.phone_engagements where id = v_eng2;
+
+  perform screening_v2.set_phone_halt('operator_pause', v_a, t);
+
+  -- Success path.
+  v_gate := screening_v2.arm_phone_test_gate(v_cand, v_eng, v_a, 'pol114s8-gate-1',
+                                             t + interval '10 minutes', t);
+  v_mark := _policy_tests.s8_mark();
+  v_res := screening_v2.admit_phone_test_attempt((v_gate->>'gate_id')::uuid, v_eng, 'initial',
+                                                 'pol114s8', 60, t + interval '1 second');
+  select halted_at, halt_reason, halt_actor_id, updated_at into v_row
+    from screening_v2.phone_control where control_key = 'default';
+  if v_gate->>'status' <> 'ok' then v_bad := v_bad || ' arm=' || (v_gate->>'status'); end if;
+  if v_res->>'status' <> 'ok' then v_bad := v_bad || ' admit=' || coalesce(v_res->>'status', '<null>')
+                                     || '/' || coalesce(v_res->>'constraint', ''); end if;
+  if _policy_tests.s8_new(v_mark) <> '' then
+    v_bad := v_bad || ' rows=[' || _policy_tests.s8_new(v_mark) || ']'; end if;
+  if v_row.halted_at is distinct from t or v_row.halt_reason is distinct from 'operator_pause'
+     or v_row.halt_actor_id is distinct from v_a or v_row.updated_at is distinct from t then
+    v_bad := v_bad || ' control_not_restored'; end if;
+  perform _policy_tests.assert(
+    '0114-§8 C10b: an admitted owner-test dial (lift + restore of the pause) writes zero direct-write rows '
+    || 'and restores the pause exactly',
+    v_bad = '', v_bad);
+
+  -- Raise path: the inner admission throws after the lift.
+  create trigger pol114s8_refuse_attempt before insert on screening_v2.phone_call_attempts
+    for each row execute function _policy_tests.s8_refuse_attempt();
+  v_gate2 := screening_v2.arm_phone_test_gate(v_cand2, v_eng2, v_a, 'pol114s8-gate-2',
+                                              t + interval '10 minutes', t + interval '2 seconds');
+  v_mark := _policy_tests.s8_mark();
+  begin
+    v_res := screening_v2.admit_phone_test_attempt((v_gate2->>'gate_id')::uuid, v_eng2, 'initial',
+                                                   'pol114s8', 60, t + interval '3 seconds');
+    v_raised := 'no_raise:' || coalesce(v_res->>'status', '<null>');
+  exception when others then
+    v_raised := sqlerrm;
+  end;
+  drop trigger pol114s8_refuse_attempt on screening_v2.phone_call_attempts;
+  select halted_at, halt_reason, halt_actor_id, updated_at into v_row
+    from screening_v2.phone_control where control_key = 'default';
+  if v_gate2->>'status' <> 'ok' then v_bad2 := v_bad2 || ' arm=' || (v_gate2->>'status'); end if;
+  if v_raised <> 'pol114s8_forced_admit_failure' then v_bad2 := v_bad2 || ' raised=' || v_raised; end if;
+  if _policy_tests.s8_new(v_mark) <> '' then
+    v_bad2 := v_bad2 || ' rows=[' || _policy_tests.s8_new(v_mark) || ']'; end if;
+  if v_row.halted_at is distinct from t or v_row.halt_reason is distinct from 'operator_pause'
+     or v_row.halt_actor_id is distinct from v_a or v_row.updated_at is distinct from t then
+    v_bad2 := v_bad2 || ' control_not_restored'; end if;
+  perform _policy_tests.assert(
+    '0114-§8 C10b: when the inner admission raises, the test gate still writes zero direct-write rows and the '
+    || 'pause stands',
+    v_bad2 = '', v_bad2);
+
+  -- Teardown: gates first (they reference the engagements), then fixtures.
+  delete from screening_v2.phone_test_gates where engagement_id in (v_eng, v_eng2);
+  perform _policy_tests.phone_teardown('pol114s8-gate');
+  perform _policy_tests.phone_teardown('pol114s8-gate2');
+  perform screening_v2.clear_phone_halt(v_a, t + interval '1 minute');
+end;
+$$;
+drop function _policy_tests.s8_refuse_attempt();
+
+select _policy_tests.assert(
+  '0114-§8 fixtures leave nothing behind and the kill switch is unhalted',
+  not exists (select 1 from screening_v2.ashby_application_links where external_application_id like 'pol114s8-%')
+  and not exists (select 1 from screening_v2.phone_test_gates where request_id like 'pol114s8-%')
+  and not exists (select 1 from pg_trigger where tgname like 'pol114s8_%')
+  and (select halted_at is null from screening_v2.phone_control where control_key = 'default'),
+  'a 0114-§8 fixture leaked');
+
+drop function _policy_tests.s8_new(uuid[]);
+drop function _policy_tests.s8_mark();
+-- ==== 0114-§8 END ====
+
+-- C0, suite end for the phone lane: the 0042 invariant re-asserted AFTER every
+-- 0114 block (§8 exercises set_phone_halt / clear_phone_halt), so it stays
+-- the last phone assertion before the verdict.
+select _policy_tests.assert(
+  '0114: the phone control singleton is present and NOT halted after every 0114 block',
+  (select count(*) from screening_v2.phone_control where control_key = 'default') = 1
+  and (select halted_at is null from screening_v2.phone_control where control_key = 'default'),
+  'a 0114 block left the kill switch engaged');
 
 -- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)

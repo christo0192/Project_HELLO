@@ -209,6 +209,15 @@ export interface PhoneReadStore {
    * unknown attempt is a normal answer on a surface a retrying worker calls.
    */
   getAttemptContext(input: { attemptId: string }): Promise<PhoneAttemptContext | null>;
+
+  /**
+   * 0114 (C8). How many non-terminal engagements are HELD as a same-role
+   * duplicate application (`pending_prereqs` / `duplicate_application`), for
+   * the health surface. A count only — never which engagement, candidate or
+   * line. Optional so existing fakes keep compiling; the health route reports
+   * `null` when it is absent or the read fails.
+   */
+  countDuplicateApplicationHolds?(): Promise<number>;
 }
 
 /** The bridge from a SIP participant identity to something writable. */

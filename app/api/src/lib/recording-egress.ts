@@ -9,6 +9,7 @@ import {
 } from 'livekit-server-sdk';
 import { env } from './env.js';
 import { supabase } from './supabase.js';
+import { createLogger } from './logger.js';
 import { phoneAttemptRecordingObjectKey } from './phone-screening/index.js';
 
 export type RecordingFinalizeStatus = 'ready' | 'fallback_required' | 'pending';
@@ -731,6 +732,77 @@ export async function finalizeWorkerInbandAttemptRecording(
   return 'fallback_required';
 }
 
+const recordingEgressLog = createLogger('recording-egress');
+
+/**
+ * M009 C9-2 (PR-C) — link the session's WORKER-INBAND attempt row to the same
+ * verified bytes, best-effort.
+ *
+ * WHY (prod 9f43090e / 76b3793c, 2026-09-30): `/recording/complete` runs the
+ * attempt-scoped finalizer first and falls back to the session finalizer. When
+ * the attempt pass did not converge, the session pass linked `call_sessions`
+ * only, and every later finalize hit the already-linked early return — so the
+ * attempt sat at `recording_ready=false` forever although the session, the
+ * object and the manifest were all complete. This runs the attempt finalizer
+ * (which re-reads the bytes and enforces every attempt evidence guard: bound
+ * `recording_session_id`, own attempt-scoped key, verified audio container,
+ * parent lifecycle, quarantine/deletion CAS) after the session-link CAS
+ * (winner OR loser) and on the already-linked early return.
+ *
+ * NEVER changes the session result and never throws: the session finalizer's
+ * return value, its deferral accounting and its latches are exactly as before.
+ * A failure is logged (sanitised, no ids) and left to the next finalize — the
+ * recording sweeper's attempt-link pass re-drives such rows.
+ *
+ * Guards: only a worker-inband egress id; only an attempt bound to THIS
+ * session that owns THIS egress id and already carries an object key; an
+ * attempt already `recording_ready` is not touched (no second download).
+ */
+async function linkWorkerAttemptBestEffort(
+  sessionId: string,
+  egressId: string,
+  deps: RecordingEgressDeps,
+  knownAttemptId?: string,
+): Promise<void> {
+  const db = deps.db ?? supabase;
+  try {
+    if (!isWorkerInbandEgressId(egressId)) return;
+    let attemptId = knownAttemptId;
+    if (attemptId === undefined) {
+      const { data, error } = await db
+        .from('phone_call_attempts')
+        .select('id,recording_ready')
+        .or(`session_id.eq.${sessionId},recording_session_id.eq.${sessionId}`)
+        .eq('egress_id', egressId)
+        .not('recording_object_key', 'is', null)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle();
+      if (error) {
+        recordingEgressLog.warn('unknown_event', {
+          error_category: 'worker_attempt_link_failed',
+          error_type: 'attempt_read_error',
+        });
+        return;
+      }
+      if (!data || typeof data.id !== 'string') return;
+      if (data.recording_ready === true) return;
+      attemptId = data.id;
+    }
+    const status = await finalizeWorkerInbandAttemptRecording(attemptId, deps, sessionId);
+    if (status !== 'ready') {
+      recordingEgressLog.info('unknown_event', {
+        error_category: `worker_attempt_link:${status}`,
+      });
+    }
+  } catch {
+    recordingEgressLog.warn('unknown_event', {
+      error_category: 'worker_attempt_link_failed',
+      error_type: 'attempt_finalize_error',
+    });
+  }
+}
+
 /**
  * PR A — finalize a WORKER-INBAND recording.
  *
@@ -785,7 +857,14 @@ export async function finalizeWorkerInbandRecording(
   if (session.recording_revoked_at || session.recording_deleted_at || session.recording_quarantined === true) {
     return 'fallback_required';
   }
-  if (session.recording_object_key) return 'ready';
+  if (session.recording_object_key) {
+    // M009 C9-2: an already-linked session must still converge its attempt
+    // row. Best-effort; the session result is unchanged.
+    if (typeof session.recording_egress_id === 'string') {
+      await linkWorkerAttemptBestEffort(sessionId, session.recording_egress_id, deps);
+    }
+    return 'ready';
+  }
   if (!session.recording_egress_id) return 'fallback_required';
   // Latched failed — the worker reported the upload permanently lost (or the
   // deferrals exhausted). There is nothing to download; do not spend another
@@ -885,6 +964,11 @@ export async function finalizeWorkerInbandRecording(
   // `linked` is referenced so the CAS result is not silently discarded — a
   // future reader can distinguish the winner from the loser here if needed.
   void linked;
+  // M009 C9-2: winner OR loser, link the attempt that owns these bytes.
+  // Best-effort; it never changes this session result or its latches.
+  if (typeof attempt.id === 'string') {
+    await linkWorkerAttemptBestEffort(sessionId, egressId, deps, attempt.id);
+  }
   return 'ready';
 }
 
@@ -1030,7 +1114,12 @@ export async function finalizeAuthoritativeRecording(
     typeof session.recording_egress_id === 'string'
     && isWorkerInbandEgressId(session.recording_egress_id)
   ) {
-    if (session.recording_object_key) return 'ready';
+    if (session.recording_object_key) {
+      // M009 C9-2: the job/play/complete re-finalize of an already-linked
+      // worker session is where an unlinked attempt row converges. Best-effort.
+      await linkWorkerAttemptBestEffort(sessionId, session.recording_egress_id, deps);
+      return 'ready';
+    }
     return finalizeWorkerInbandRecording(sessionId, deps);
   }
   // I‑1: a linked key is only authoritative when it came from the egress.

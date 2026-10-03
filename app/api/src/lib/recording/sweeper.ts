@@ -24,6 +24,15 @@
  *   3. the halt flag      — freezes the sweep with no deploy, and freezes
  *                           claiming at the other end too.
  * A truncated pass is LOGGED. A silent cap reads as "covered everything".
+ *
+ * M009 C9-2 (PR-C) adds a SECOND, enqueue-only pass for the worker provider:
+ * a worker-inband session that is already linked while its owning attempt row
+ * is still `recording_ready=false` (prod 9f43090e / 76b3793c). It enqueues the
+ * SAME `recording.finalize` job for the session (same dedup key, so it can
+ * never double a live job); the finalizer's already-linked early return then
+ * links the attempt best-effort. Bounded by `ATTEMPT_LINK_PASS_LIMIT`, the same
+ * halt flag, `maxAgeSec`/`graceSec`, and logged when truncated. It never
+ * changes the first pass's result fields and never throws.
  */
 
 import type { SupabaseClient } from '@supabase/supabase-js';
@@ -51,6 +60,29 @@ export interface SweeperOptions {
   now?: () => number;
 }
 
+/** Hard cap on attempt rows read per tick by the attempt-link pass (M009 C9-2). */
+export const ATTEMPT_LINK_PASS_LIMIT = 10;
+
+/**
+ * The in-worker recorder's synthetic egress id for an attempt. Mirrors
+ * `WORKER_INBAND_EGRESS_ID_PREFIX` in `lib/recording-egress.ts` (not imported:
+ * this module stays free of the provider SDK). Requiring the attempt's OWN id
+ * is stricter than the prefix: only the attempt that minted the recording.
+ */
+function workerInbandEgressIdFor(attemptId: string): string {
+  return `EG_worker_${attemptId}`;
+}
+
+export interface AttemptLinkPassResult {
+  /** Attempt rows read (before the egress/session cross-check). */
+  scanned: number;
+  /** Sessions for which a finalize job was enqueued (or already existed). */
+  enqueued: number;
+  /** True when the read filled `ATTEMPT_LINK_PASS_LIMIT`. */
+  truncated: boolean;
+  stop: 'ok' | 'skipped' | 'read_error' | 'enqueue_error';
+}
+
 export interface SweepResult {
   /** Eligible rows read this pass. */
   scanned: number;
@@ -60,6 +92,8 @@ export interface SweepResult {
   truncated: boolean;
   /** Why the pass did no work, when it did none. */
   stop: 'ok' | 'halted' | 'read_error' | 'enqueue_error';
+  /** M009 C9-2 second pass. Absent when the first pass returned early. */
+  attemptLink?: AttemptLinkPassResult;
 }
 
 /**
@@ -165,5 +199,115 @@ export async function runRecordingSweep(options: SweeperOptions): Promise<SweepR
     });
   }
 
-  return { scanned: rows.length, enqueued, truncated, stop };
+  // The queue just failed for the first pass; do not hammer it again.
+  const attemptLink: AttemptLinkPassResult = stop === 'ok'
+    ? await runAttemptLinkPass(options, logger, notBefore, notAfter)
+    : { scanned: 0, enqueued: 0, truncated: false, stop: 'skipped' };
+
+  return { scanned: rows.length, enqueued, truncated, stop, attemptLink };
+}
+
+type AttemptLinkRow = { id: string; egress_id: string | null; recording_session_id: string | null };
+
+/**
+ * M009 C9-2 — the enqueue-only attempt-link pass. See the module header.
+ *
+ * Selection (worker provider only): an attempt that ENDED inside the same
+ * grace/max-age window, whose egress id is its own worker-inband id, with an
+ * object key and a bound `recording_session_id`, still `recording_ready=false`,
+ * not quarantined, not deleted, not latched `failed` — AND whose session is
+ * already linked (`worker_inband` provenance, an object key, the SAME egress
+ * id, no lifecycle block). An unlinked session is the first pass's job.
+ */
+async function runAttemptLinkPass(
+  options: SweeperOptions,
+  logger: ReturnType<typeof createLogger>,
+  notBefore: string,
+  notAfter: string,
+): Promise<AttemptLinkPassResult> {
+  let rawCount = 0;
+  const targets = new Set<string>();
+  try {
+    const { data, error } = await options.client
+      .from('phone_call_attempts')
+      .select('id,egress_id,recording_session_id')
+      .eq('recording_ready', false)
+      .eq('recording_quarantined', false)
+      .is('recording_deleted_at', null)
+      .not('recording_object_key', 'is', null)
+      .not('recording_session_id', 'is', null)
+      .like('egress_id', 'EG_worker_%')
+      .or('egress_status.is.null,egress_status.neq.failed')
+      .gt('ended_at', notBefore)
+      .lt('ended_at', notAfter)
+      .order('ended_at', { ascending: true })
+      .limit(ATTEMPT_LINK_PASS_LIMIT);
+    if (error) throw new Error('recording_attempt_link_read_error');
+    const raw = (data ?? []) as AttemptLinkRow[];
+    rawCount = raw.length;
+    const attempts = raw.filter((a) =>
+      typeof a.id === 'string'
+      && typeof a.recording_session_id === 'string'
+      && a.egress_id === workerInbandEgressIdFor(a.id));
+    const sessionIds = [...new Set(attempts.map((a) => a.recording_session_id as string))];
+    if (sessionIds.length > 0) {
+      const { data: linked, error: sessionError } = await options.client
+        .from('call_sessions')
+        .select('id,recording_egress_id')
+        .in('id', sessionIds)
+        .not('recording_object_key', 'is', null)
+        .eq('recording_provenance', 'worker_inband')
+        .is('recording_deleted_at', null)
+        .is('recording_revoked_at', null)
+        .eq('recording_quarantined', false);
+      if (sessionError) throw new Error('recording_attempt_link_read_error');
+      // The session's stamped egress must be THIS attempt's: the finalizer
+      // links the attempt that owns the session's egress id, so any other
+      // pairing would enqueue a job that can never converge it.
+      const egressBySession = new Map(
+        ((linked ?? []) as Array<{ id: string; recording_egress_id: string | null }>)
+          .map((row) => [row.id, row.recording_egress_id]),
+      );
+      for (const a of attempts) {
+        const sessionId = a.recording_session_id as string;
+        if (egressBySession.get(sessionId) === a.egress_id) targets.add(sessionId);
+      }
+    }
+  } catch {
+    logger.error('unknown_event', {
+      error_category: 'recording_attempt_link_read_error',
+      error_type: 'db_unavailable',
+    });
+    return { scanned: 0, enqueued: 0, truncated: false, stop: 'read_error' };
+  }
+
+  const truncated = rawCount >= ATTEMPT_LINK_PASS_LIMIT;
+  if (truncated) {
+    logger.warn('unknown_event', {
+      error_category: 'recording_attempt_link_truncated',
+      error_type: 'admission_budget',
+    });
+  }
+
+  let enqueued = 0;
+  for (const sessionId of targets) {
+    try {
+      await options.queue.enqueue(
+        RECORDING_FINALIZE_QUEUE,
+        { session_id: sessionId },
+        {
+          dedupKey: recordingFinalizeDedupKey(sessionId),
+          maxAttempts: options.maxAttempts,
+        },
+      );
+      enqueued += 1;
+    } catch {
+      logger.error('unknown_event', {
+        error_category: 'recording_attempt_link_enqueue_error',
+        error_type: 'queue_unavailable',
+      });
+      return { scanned: rawCount, enqueued, truncated, stop: 'enqueue_error' };
+    }
+  }
+  return { scanned: rawCount, enqueued, truncated, stop: 'ok' };
 }

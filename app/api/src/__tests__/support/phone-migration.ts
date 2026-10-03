@@ -36,6 +36,24 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+// 0114 (PR-C, one migration in numbered sections) re-declares IN FULL, each
+// exactly once: apply_phone_event, finalize_phone_partial_sessions and
+// sweep_phone_stranded_sessions (from 0113), enforce_phone_engagement_transition
+// (0045), admit_phone_attempt (0095), ensure_ashby_phone_engagement and
+// request_phone_rescreen (0057), schedule_candidate_phone_appointment (0058),
+// schedule_phone_appointment, expire_phone_appointments and clear_phone_halt
+// (0042), set_phone_halt (0110), and re-creates chk_phone_call_attempts_outcome
+// (0095) and chk_audit_action (0102). It must outrank 0113 and 0112, or every
+// extractor reads a superseded body or CHECK list.
+export const MIGRATION_0114_PATH = fileURLToPath(
+  new URL(
+    '../../../../supabase/migrations/0114_phone_outcome_integrity.sql',
+    import.meta.url,
+  ),
+);
+
+export const MIGRATION_0114 = readFileSync(MIGRATION_0114_PATH, 'utf8');
+
 // 0113 re-declares apply_phone_event and finalize_phone_partial_sessions (both
 // from 0095), confirm_candidate_voice_callback (from 0073) and
 // sweep_phone_stranded_sessions (from 0045) IN FULL: the E6 pre-answer ledger
@@ -355,6 +373,12 @@ export const MIGRATION_0092 = readFileSync(MIGRATION_0092_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0114 — PR-C. Redeclares the functions in S03-RESEARCH table 1a
+    // (apply_phone_event, finalize, sweep from 0113; the 0045 transition
+    // trigger; admit 0095; ensure/request_phone_rescreen 0057;
+    // schedule_candidate 0058; schedule/expire/clear_phone_halt 0042;
+    // set_phone_halt 0110) and both §1 CHECKs, so it precedes 0113 and 0112.
+    { name: '0114', sql: MIGRATION_0114 },
     // 0113 — apply_phone_event, finalize_phone_partial_sessions,
     // confirm_candidate_voice_callback and sweep_phone_stranded_sessions IN
     // FULL (E6 + E4), so it must precede 0095, 0073 and 0045.

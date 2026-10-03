@@ -239,6 +239,13 @@ export async function runClaimedAshbyOperation(
         const r = await deps.stores.failOperation(claim.id, claim.leaseToken, 'assessment_missing', true);
         return { claimed: true, operationType: claim.operationType, committed: false, staleLease: r === 'not_owned', code: 'assessment_missing' };
       }
+      // C3 (0114 §4): an operation enqueued before its source was graded (or
+      // whose source was regraded) must never write an INSUFFICIENT-evidence
+      // interview to Ashby. Non-retryable: retrying cannot add evidence.
+      if (source.evidenceGrade === 'insufficient') {
+        const r = await deps.stores.failOperation(claim.id, claim.leaseToken, 'evidence_insufficient', false);
+        return { claimed: true, operationType: claim.operationType, committed: false, staleLease: r === 'not_owned', code: 'evidence_insufficient' };
+      }
       const built = buildScorecard(source, { min: 1, max: 4 });
       if (!built.ok) {
         const r = await deps.stores.failOperation(claim.id, claim.leaseToken, `scorecard_${built.reason}`, false);
