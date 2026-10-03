@@ -252,6 +252,16 @@ export interface PhonePartialFinalizeSession {
   readonly assessmentPresent: boolean;
   /** Whether the session already carries a finalized recording object key. */
   readonly recordingPresent: boolean;
+  /**
+   * 0113 (E4) — the session's latest attempt is exactly the
+   * `phone_appointments.confirmed_from_attempt_id` of a booked callback, i.e.
+   * the leg ended because the candidate CONFIRMED a callback. That leg is a
+   * deferral, not a screening: the tick finalizes it (the RPC already did) but
+   * never enqueues scoring for it, so it cannot consume the one-per-link Ashby
+   * scorecard or terminate the engagement. Defaults false when absent, so an
+   * older RPC keeps today's behaviour.
+   */
+  readonly callbackBooked: boolean;
 }
 
 /** 0072 — the server-side partial-finalize sweep. */

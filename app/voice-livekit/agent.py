@@ -395,6 +395,17 @@ def _phone_gate_wall_clock_seconds() -> float:
     does not weaken the wedge detection this bound exists for — it only stops
     the bound firing on a call that simply rang for a while.
     """
+    # M009 E6: the REAL-answer wait shares the participant budget — it is
+    # measured from the START of `wait_for_participant`, not added to it — so
+    # this sum is unchanged by the answer gate.
+    #
+    # LEASE BUDGET (asserted in tests/test_phone_answer.py): the API's
+    # admission lease (240 s) must cover everything before the answer-time
+    # re-base: machine boot (<= 32 s cold) + PR-A's per-machine agent-join
+    # wait before originate (<= 20 s default) + the ring
+    # (PHONE_PARTICIPANT_WAIT_SEC, 60 s in fly.phone.toml) = 112 s, leaving
+    # > 2x margin. An unanswered leg is ended by the worker inside the ring
+    # budget, so it never needs the re-base at all.
     pre_answer = phone.phone_participant_wait_sec()
     if phone.phone_bounce_mode():
         pre_answer += phone.phone_answer_timeout_sec()
@@ -1342,6 +1353,9 @@ _ROOM_TEARDOWN_LABELS: dict[str | None, str] = {
     phone.HALT_SCORING: "scoring_unreachable",
     phone.HALT_LEASE_LOST: "lease_lost",
     phone.HALT_LEASE_UNCONFIRMED: "lease_unconfirmed",
+    # M009 E6: the callee never really answered. The room delete CANCELs the
+    # still-ringing INVITE; nothing was spoken or recorded.
+    phone.GATE_NOT_ANSWERED: "not_answered",
 }
 
 
@@ -2002,6 +2016,254 @@ def _sip_disconnect_reason_name(rtc_mod: Any, participant: Any) -> str:
         return str(name) if name else "UNMAPPED"
     except Exception:  # noqa: BLE001 — a reason we cannot name is still a departure
         return "UNMAPPED"
+
+
+# ── M009 E6: WAIT FOR THE REAL ANSWER ──────────────────────────────────
+# `_wait_for_sip_participant` (shared with Canary-1, deliberately untouched)
+# returns at PRESENCE, which LiveKit reaches when it starts DIALING. This is the
+# second half: from presence to a real pickup. Answered = `sip.callStatus`
+# becomes 'active' OR the agent's audio track is subscribed by the SIP peer
+# (RoomIO `subscribed_fut`, which only resolves after the 200 OK), whichever is
+# first. Both are kept on purpose: a false "answered" (subscription during
+# early media) only falls back to the pre-E6 behaviour, while a false "not
+# answered" (a status stuck at ringing) would hang up on a live human and
+# charge them a no-answer.
+#: After `sip.callStatus` says 'hangup' before any answer, how long to wait for
+#: the departure (which carries the reason) before calling it a no-answer.
+_SIP_ANSWER_HANGUP_GRACE_SEC = 2.0
+#: Bound on the relative-timing lines one answer wait may emit.
+_SIP_ANSWER_MAX_TIMINGS = 8
+
+
+def _phone_sip_kind(rtc_mod: Any) -> Any:
+    """The rtc SIP participant-kind value, or None when it cannot be read."""
+    return getattr(
+        getattr(rtc_mod, "ParticipantKind", None), "PARTICIPANT_KIND_SIP", None,
+    ) if rtc_mod is not None else None
+
+
+def _disconnect_reason_value_name(rtc_mod: Any, raw: Any) -> str:
+    """Bounded NAME of a RAW disconnect-reason value; never calls Name(None)."""
+    if raw is None:
+        return "UNKNOWN"
+    try:
+        name = rtc_mod.DisconnectReason.Name(raw)
+        return str(name) if name else "UNMAPPED"
+    except Exception:  # noqa: BLE001
+        return "UNMAPPED"
+
+
+def _participant_still_present(ctx: Any, identity: Any) -> bool:
+    """False only when the room PROVABLY no longer holds this identity."""
+    try:
+        participants = getattr(getattr(ctx, "room", None), "remote_participants", None)
+        if participants is None or identity is None:
+            return True
+        return identity in participants
+    except Exception:  # noqa: BLE001 — unknown is "still present"
+        return True
+
+
+async def _wait_for_sip_answer(
+    ctx: Any,
+    participant: Any,
+    deadline_monotonic: float,
+    subscribed_fut: Any,
+    reason_holder: dict[str, Any],
+    timings: list[tuple[str, int]],
+) -> str:
+    """Wait, bounded, for the SIP callee to REALLY answer. Returns a verdict.
+
+    One of ``phone.ANSWER_VERDICT_*``: ``answered``, or ``no_answer`` /
+    ``busy`` / ``provider_error`` / ``aborted`` mapped by
+    ``phone.unanswered_verdict`` from the raw disconnect reason.
+
+    * Not a SIP participant (the e2e harness, test fakes) or the rtc module is
+      unavailable → ``answered`` at once: the pre-E6 behaviour.
+    * Already 'active' at entry (a re-dispatch into a live call) → ``answered``.
+    * Otherwise listen on the room: an attribute change to 'active' answers; a
+      departure of THIS identity writes ``reason_holder['reason']`` (the raw
+      int, or None) SYNCHRONOUSLY in the handler — the teardown may read it the
+      instant the gate is cancelled — and resolves to the mapped verdict;
+      'hangup' with no departure inside 2 s is a no-answer; the deadline is a
+      no-answer. ``subscribed_fut`` resolving is an equal answer signal; when it
+      wins while the status still says dialing/ringing, a WARN
+      ``answer_signal_disagree`` records it so live calls prove the semantics.
+
+    The verdict future is single-assignment (late duplicate events are no-ops)
+    and every listener is removed in ``finally``. PRIVACY: the participant's
+    attributes are read by ONE key (``phone.sip_call_status``); only the
+    bounded verdict, the reason enum NAME and relative timings are logged.
+    """
+    rtc_mod = _livekit_rtc()
+    sip_kind = _phone_sip_kind(rtc_mod)
+    if sip_kind is None or getattr(participant, "kind", None) != sip_kind:
+        return phone.ANSWER_VERDICT_ANSWERED
+    if phone.sip_call_status(participant) == phone.SIP_CALL_STATUS_ACTIVE:
+        return phone.ANSWER_VERDICT_ANSWERED
+
+    loop = asyncio.get_running_loop()
+    started = _monotonic()
+    identity = getattr(participant, "identity", None)
+    room = getattr(ctx, "room", None)
+    verdict_fut: "asyncio.Future[str]" = loop.create_future()
+    hangup_timer: list[Any] = [None]
+    seen: set[str] = set()
+
+    def _rel_ms() -> int:
+        return max(0, int(round((_monotonic() - started) * 1000)))
+
+    def _mark(label: str) -> None:
+        if label in seen or len(timings) >= _SIP_ANSWER_MAX_TIMINGS:
+            return
+        seen.add(label)
+        timings.append((label, _rel_ms()))
+
+    def _resolve(verdict: str) -> None:
+        if not verdict_fut.done():
+            if verdict != phone.ANSWER_VERDICT_ANSWERED:
+                # Evidence for the teardown terminal: a NON-answer was really
+                # observed (departure, hangup grace, ring deadline). Written
+                # synchronously, so a gate cancelled the same tick still has
+                # it. Absent ⇒ nothing proved the callee did not pick up.
+                reason_holder["verdict"] = verdict
+            verdict_fut.set_result(verdict)
+
+    def _depart(departed: Any) -> None:
+        reason = getattr(departed, "disconnect_reason", None)
+        reason_holder["reason"] = reason
+        _mark("departed")
+        _resolve(phone.unanswered_verdict(reason))
+
+    def _on_attributes_changed(*args: Any) -> None:
+        try:
+            # rtc emits (changed_attributes, participant).
+            changed = args[-1] if args else None
+            if getattr(changed, "identity", None) != identity:
+                return
+            status = phone.sip_call_status(changed)
+            if status is None:
+                return
+            _mark(f"status_{status}")
+            if status == phone.SIP_CALL_STATUS_ACTIVE:
+                _resolve(phone.ANSWER_VERDICT_ANSWERED)
+            elif (
+                status == phone.SIP_CALL_STATUS_HANGUP
+                and hangup_timer[0] is None and not verdict_fut.done()
+            ):
+                hangup_timer[0] = loop.call_later(
+                    _SIP_ANSWER_HANGUP_GRACE_SEC, _resolve,
+                    phone.ANSWER_VERDICT_NO_ANSWER,
+                )
+        except Exception:  # noqa: BLE001 — an observer must never break the call
+            pass
+
+    def _on_disconnected(departed: Any = None, *_: Any) -> None:
+        try:
+            if getattr(departed, "identity", None) != identity:
+                return
+            _depart(departed)
+        except Exception:  # noqa: BLE001
+            _resolve(phone.ANSWER_VERDICT_NO_ANSWER)
+
+    def _on_track_published(*args: Any) -> None:
+        try:
+            owner = args[-1] if args else None
+            if getattr(owner, "identity", None) == identity:
+                _mark("remote_track_published")
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _on_subscribed(fut: Any) -> None:
+        try:
+            if fut.cancelled() or fut.exception() is not None:
+                return
+        except Exception:  # noqa: BLE001
+            return
+        _mark("agent_track_subscribed")
+        if verdict_fut.done():
+            return
+        status = phone.sip_call_status(participant)
+        if status in phone.SIP_CALL_STATUSES_PRE_ANSWER:
+            _log.warn(
+                "unknown_event", error_type="phone_answer_signal",
+                error_category="answer_signal_disagree",
+                phase=f"status_{status}",
+                duration_sec=_rel_ms() / 1000.0,
+            )
+        _resolve(phone.ANSWER_VERDICT_ANSWERED)
+
+    registered: list[tuple[str, Any]] = []
+    room_on = getattr(room, "on", None)
+    if callable(room_on):
+        for event, handler in (
+            ("participant_attributes_changed", _on_attributes_changed),
+            ("participant_disconnected", _on_disconnected),
+            ("track_published", _on_track_published),
+        ):
+            try:
+                room_on(event, handler)
+                registered.append((event, handler))
+            except Exception:  # noqa: BLE001 — fewer signals, still bounded
+                pass
+    sub_registered = False
+    add_cb = getattr(subscribed_fut, "add_done_callback", None)
+    if callable(add_cb):
+        try:
+            add_cb(_on_subscribed)
+            sub_registered = True
+        except Exception:  # noqa: BLE001
+            sub_registered = False
+
+    try:
+        # The leg may have left between presence and these listeners.
+        if not _participant_still_present(ctx, identity):
+            _depart(participant)
+        remaining = deadline_monotonic - _monotonic()
+        if not verdict_fut.done() and remaining <= 0:
+            _resolve(phone.unanswered_verdict(phone.ANSWER_DEADLINE))
+        if not verdict_fut.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(verdict_fut), timeout=remaining)
+            except asyncio.TimeoutError:
+                _mark("deadline")
+                _resolve(phone.unanswered_verdict(phone.ANSWER_DEADLINE))
+        verdict = verdict_fut.result()
+    finally:
+        if hangup_timer[0] is not None:
+            hangup_timer[0].cancel()
+        room_off = getattr(room, "off", None)
+        for event, handler in registered:
+            try:
+                if callable(room_off):
+                    room_off(event, handler)
+            except Exception:  # noqa: BLE001
+                pass
+        if sub_registered:
+            try:
+                subscribed_fut.remove_done_callback(_on_subscribed)
+            except Exception:  # noqa: BLE001
+                pass
+        # Cancelled: settle the future WITHOUT `_resolve`, so no verdict is
+        # recorded — our own cancellation is not an observed non-answer.
+        if not verdict_fut.done():
+            verdict_fut.set_result(phone.ANSWER_VERDICT_ABORTED)
+
+    _log.info(
+        "unknown_event", error_type="phone_answer_wait",
+        error_category=verdict,
+        schema=(
+            _disconnect_reason_value_name(rtc_mod, reason_holder.get("reason"))
+            if "reason" in reason_holder else "none"
+        ),
+        duration_sec=_rel_ms() / 1000.0,
+    )
+    for label, ms in timings:
+        _log.info(
+            "unknown_event", error_type="phone_answer_timing",
+            phase=label, duration_sec=ms / 1000.0,
+        )
+    return verdict
 
 
 # ── P4: the default answer classifier ─────────────────────────────────
@@ -7859,6 +8121,29 @@ async def _run_phone_session(
     latest_candidate_anchor: list[int | None] = [None]
     latest_candidate_stopped_anchor: list[int | None] = [None]
     participant_present_anchor: list[int | None] = [None]
+    # ── M009 E6: the REAL answer ──────────────────────────────────────────
+    # `answered_anchor` is the wall-clock ms of the real pickup (the recorder's
+    # start offset and the answer→first-audio metric are measured from it). In
+    # presence mode it IS the presence anchor. `answer_reason_holder` is written
+    # synchronously by `_wait_for_sip_answer`'s departure handler and read by
+    # the teardown terminal; `answer_post_holder` carries the gate's
+    # backgrounded `call.answered` so a teardown terminal never overtakes it.
+    answered_anchor: list[int | None] = [None]
+    answer_first_audio_emitted: list[bool] = [False]
+    answer_reason_holder: dict[str, Any] = {}
+    answer_timings: list[tuple[str, int]] = []
+    answer_post_holder: dict[str, Any] = {}
+    participant_wait_started: list[float | None] = [None]
+    phone_participant_holder: list[Any] = [None]
+    # The seam is wired unless bounce mode owns the answer, the kill switch
+    # (`PHONE_ANSWER_SIGNAL=presence`) is on, or the rtc module — the only way
+    # to read a participant's kind — is unavailable (then presence is all the
+    # worker can know, which is exactly the pre-E6 behaviour).
+    answer_seam_wired = (
+        not phone.phone_bounce_mode()
+        and phone.phone_answer_signal() != "presence"
+        and _livekit_rtc() is not None
+    )
 
     # ── PR A: IN-WORKER RECORDER HOLDER ────────────────────────────────────
     # A single enclosing-scope holder threaded through the three recording
@@ -8604,6 +8889,22 @@ async def _run_phone_session(
     except Exception:  # noqa: BLE001
         pass
 
+    def _note_first_gate_audio(started_ms: int) -> None:
+        """M009 E6: answer → first spoken gate line, once per call.
+
+        Anchored on the REAL answer, so it measures what the candidate hears
+        after picking up (acceptance: p50 <= 1.5 s, p95 <= 2.5 s), not the ring.
+        """
+        if answer_first_audio_emitted[0] or answered_anchor[0] is None:
+            return
+        answer_first_audio_emitted[0] = True
+        delta_ms = started_ms - answered_anchor[0]
+        if delta_ms >= 0:
+            _safe_emit(
+                histogram_metric, "voice_phone_answer_to_first_audio_sec",
+                delta_ms / 1000.0, {"channel": "phone"},
+            )
+
     async def say(text: str) -> None:
         started_ms = int(round(time.time() * 1000))
         try:
@@ -8631,6 +8932,7 @@ async def _run_phone_session(
         # Both disclosure variants, or the metric silently loses every sample
         # the moment the conversational flow is enabled (that flow speaks
         # `PHONE_DISCLOSURE_CONTINUATION_TEXT` and never the other one).
+        _note_first_gate_audio(started_ms)
         if text in (
             phone.PHONE_DISCLOSURE_TEXT, phone.PHONE_DISCLOSURE_CONTINUATION_TEXT,
         ) and participant_present_anchor[0] is not None:
@@ -8769,12 +9071,28 @@ async def _run_phone_session(
         there is no code path on which the agent can speak, run a turn, or start
         a silence timer before something has actually answered the call.
         """
+        # E6: the answer wait shares this budget, measured from HERE.
+        participant_wait_started[0] = _monotonic()
         participant = await _wait_for_sip_participant(
             ctx, phone.phone_participant_wait_sec()
         )
         if participant is None:
             return None
         participant_present_anchor[0] = int(round(time.time() * 1000))
+        phone_participant_holder[0] = participant
+        if not answer_seam_wired:
+            # Presence mode: presence IS the answer (pre-E6, byte-identical).
+            answered_anchor[0] = participant_present_anchor[0]
+        elif (
+            getattr(participant, "kind", None) == _phone_sip_kind(_livekit_rtc())
+            and phone.sip_call_status(participant) not in (
+                None, phone.SIP_CALL_STATUS_ACTIVE,
+            )
+        ):
+            # A SIP leg that is still dialing/ringing at presence: the answer
+            # seam owns this call from THIS instant, so E3's departure listener
+            # stands down during session.start, before the wait itself begins.
+            gate_lifecycle["answer_seam"] = True
         # ── PHONE NOISE SUPPRESSION: RNNoise ON THE CANDIDATE'S INBOUND AUDIO ──
         # Owner report 2026-09-30: the candidate's background (traffic, TV, other
         # voices) reached STT and VAD untouched on PSTN, and in livekit-agents
@@ -8948,6 +9266,7 @@ async def _run_phone_session(
         if callable(setter):
             setter(True)
         latest_assistant[0] = None
+        _note_first_gate_audio(int(round(time.time() * 1000)))
         try:
             await _await_output_subscription()
             try:
@@ -9253,9 +9572,14 @@ async def _run_phone_session(
             # FIX 4: the participant-arrival anchor is the closest wall-clock the
             # worker holds for "answered"; passing it lets begin() log the
             # recording START offset from answer (the observed ~28s head-gap).
+            # E6: anchored on the REAL answer (presence only in presence mode,
+            # or when the seam failed open), so the logged head-gap is true.
             if await recorder.begin(
                 prepared["object_key"],
-                answered_epoch_ms=participant_present_anchor[0],
+                answered_epoch_ms=(
+                    answered_anchor[0] if answered_anchor[0] is not None
+                    else participant_present_anchor[0]
+                ),
             ):
                 recorder_holder[1] = prepared["upload_url"]
                 # FIX 4: capture is live — start the audio-path health heartbeat.
@@ -9630,12 +9954,79 @@ async def _run_phone_session(
         failure: BaseException | None,
         deadline: float | None = None,
     ) -> None:
-        """Choose a truthful pre/post-consent gate terminal exactly once."""
+        """Choose a truthful pre/post-consent gate terminal exactly once.
+
+        M009 E6 precedence, in this order:
+          1. GATE_NOT_ANSWERED — the gate already posted its one pre-answer
+             event (or deliberately nothing); post nothing more.
+          2. The answer seam was active and no answer was observed — post the
+             mapped pre-answer event (call.busy / call.no_answer / call.failed;
+             `aborted` posts nothing). NEVER `sip.participant_left` or
+             `candidate.deferred_pre_disclosure` here: the attempt is still
+             admitted, and both are `unexpected_event` there after 0113.
+          3. Answer observed, E3 saw the leg leave, consent not durable —
+             `sip.participant_left` (below).
+          4. Otherwise the pre-E6 labels (deferred / aborted / consent.failed).
+        """
         if gate_result is None or "terminal_posted" in gate_lifecycle:
             return
         if isinstance(failure, asyncio.CancelledError):
             # Cancellation is the reconnect/lease owner’s signal, not a
             # completed interview and not a consent failure.
+            return
+        if gate_result.outcome == phone.GATE_NOT_ANSWERED:
+            return
+        if (
+            gate_lifecycle.get("answer_seam")
+            and not gate_lifecycle.get("answer_observed")
+        ):
+            # Typically the RoomIO close race: USER_REJECTED/CLIENT_INITIATED
+            # close the AgentSession before `_wait_for_sip_answer` returns, so
+            # the gate ends GATE_PARTICIPANT_LEFT. The departure handler wrote
+            # the raw reason synchronously, so it is already here.
+            if "reason" in answer_reason_holder:
+                verdict = phone.unanswered_verdict(answer_reason_holder["reason"])
+            elif "verdict" in answer_reason_holder:
+                # Hangup grace / ring deadline resolved before the gate could
+                # post it itself: still an observed non-answer.
+                verdict = answer_reason_holder["verdict"]
+            else:
+                # NO departure and no resolved verdict: a worker exception, OUR
+                # SDK/job shutdown mid-ring (deploy, machine stop — the close
+                # cancels the gate with failure=None), or the wall clock. None
+                # of that proves the callee did not answer, and charging
+                # call.no_answer would spend their anti-harassment budget on a
+                # call we aborted. Post nothing; the admitted attempt is left
+                # to reconciliation, which posts sip.originate_timeout only once
+                # the leg is provably gone.
+                _log.warn(
+                    "unknown_event", error_type="phone_gate_outcome",
+                    schema=phone.GATE_NOT_ANSWERED,
+                    error_category="pre_answer_failure_uncharged",
+                    phase="exception" if failure is not None else "no_departure",
+                )
+                return
+            pre_answer_event = phone.unanswered_event(verdict)
+            _log.info(
+                "unknown_event", error_type="phone_gate_outcome",
+                schema=phone.GATE_NOT_ANSWERED,
+                error_category=verdict, phase="teardown",
+            )
+            if pre_answer_event is None:
+                return
+            for _ in range(2):
+                outcome = await _bounded_await(
+                    events.post_event(attempt_id, pre_answer_event, epoch=epoch),
+                    _teardown_timeout(PHONE_TEARDOWN_STEP_SECONDS),
+                    category="gate_terminal_post", deadline=deadline,
+                )
+                if outcome is not None and phone.event_applied(outcome):
+                    gate_lifecycle["terminal_posted"] = True
+                    return
+            _log.warn(
+                "unknown_event", error_type="phone_gate_outcome",
+                error_category="terminal_not_applied",
+            )
             return
         events_seen = set(getattr(gate_result, "events", []) or [])
         if events_seen & {
@@ -9689,6 +10080,14 @@ async def _run_phone_session(
         # discard only on the flag. A terminal that applies without it leaves
         # the attempt pointing at audio the worker has already destroyed.
         discarded = bool(gate_lifecycle.get("not_the_candidate"))
+        # E6: `call.answered` may still be in flight (the gate backgrounds it).
+        # Every branch above it ends an ANSWERED attempt, which the ledger only
+        # accepts once `call.answered` has landed — so let it land first.
+        await _bounded_await(
+            phone.await_answered_post(answer_post_holder),
+            _teardown_timeout(PHONE_TEARDOWN_STEP_SECONDS),
+            category="call_answered_settle", deadline=deadline,
+        )
         for _ in range(2):
             outcome = await _bounded_await(
                 events.post_event(
@@ -9769,6 +10168,19 @@ async def _run_phone_session(
                 "unknown_event", error_type="phone_recording_finish",
                 error_category="discarded_not_the_candidate",
             )
+        elif gate_result is not None and (
+            gate_result.outcome == phone.GATE_NOT_ANSWERED
+            or (
+                gate_lifecycle.get("answer_seam")
+                and not gate_lifecycle.get("answer_observed")
+            )
+        ):
+            # M009 E6: nobody answered. The recorder never began (there is no
+            # upload and no fail_recording to report), and anything STT heard
+            # was ringback, a caller tune or carrier early media — not gate turns
+            # anybody consented to. Drop the buffer unsent.
+            await _finish_recording(evidence_deadline)
+            _drop_gate_transcript("not_answered")
         else:
             # Recording upload/API completion is first. Transcript settlement
             # follows it and is still bounded by the same absolute deadline.
@@ -9805,6 +10217,13 @@ async def _run_phone_session(
             (gate_result is not None and not gate_result.assessment_allowed)
             or room_close_requested
         ) and not room_closed:
+            if gate_result is not None and gate_result.outcome == phone.GATE_NOT_ANSWERED:
+                # F0c: no room is deleted without a log naming why. Deleting
+                # it CANCELs the still-ringing INVITE.
+                _log.info(
+                    "unknown_event", error_type="phone_room_teardown",
+                    error_category=_teardown_label(phone.GATE_NOT_ANSWERED),
+                )
             await _bounded_await(
                 _close_phone_room(room_name), _teardown_timeout(PHONE_TEARDOWN_STEP_SECONDS),
                 category="room_teardown", deadline=deadline,
@@ -9907,6 +10326,26 @@ async def _run_phone_session(
 
         add_shutdown_callback(_phone_job_shutdown)
 
+    async def _wait_for_answer() -> str:
+        """M009 E6: the gate's real-answer seam. Wired only when
+        `answer_seam_wired`; returns a `phone.ANSWER_VERDICT_*` string."""
+        # Latched before the wait: from here on a pre-answer departure belongs
+        # to `_wait_for_sip_answer`, never to E3's listener.
+        gate_lifecycle["answer_seam"] = True
+        started = participant_wait_started[0]
+        if started is None:
+            started = _monotonic()
+        room_io = getattr(session, "_room_io", None)
+        verdict = await _wait_for_sip_answer(
+            ctx, phone_participant_holder[0],
+            started + phone.phone_participant_wait_sec(),
+            getattr(room_io, "subscribed_fut", None),
+            answer_reason_holder, answer_timings,
+        )
+        if verdict == phone.ANSWER_VERDICT_ANSWERED:
+            answered_anchor[0] = int(round(time.time() * 1000))
+        return verdict
+
     async def _run_gate() -> "phone.PhoneGateResult":
         return await phone.run_phone_gate(
             attempt_id=attempt_id,
@@ -9986,6 +10425,11 @@ async def _run_phone_session(
             mark_question_asked=_mark_question_asked,
             candidate_name=getattr(instruction_state, "candidate_name", None),
             gate_phase_out=gate_lifecycle,
+            # M009 E6: wait for the REAL answer before posting, recording or
+            # speaking. None (bounce mode, `PHONE_ANSWER_SIGNAL=presence`, no
+            # rtc) ⇒ presence is the answer, the pre-E6 path.
+            wait_for_answer=_wait_for_answer if answer_seam_wired else None,
+            answer_post_out=answer_post_holder,
         )
 
     # Boolean phase marks from the gate, plus E3's `sip_left_reason` (a fixed
@@ -10030,6 +10474,17 @@ async def _run_phone_session(
                 return
             if gate_lifecycle.get("sip_left_reason"):
                 return  # one departure, one decision
+            if (
+                gate_lifecycle.get("answer_seam")
+                and not gate_lifecycle.get("answer_observed")
+            ):
+                # M009 E6: a PRE-ANSWER departure belongs to
+                # `_wait_for_sip_answer`, which maps it to call.busy /
+                # call.no_answer / call.failed. Acting here would race the
+                # GATE_NOT_ANSWERED path with a guarded close, and
+                # `sip.participant_left` from an admitted attempt is an
+                # `unexpected_event` at the ledger. No record, no close.
+                return
             name = _sip_disconnect_reason_name(rtc_mod, participant)
             gate_lifecycle["sip_left_reason"] = name
             will_close = name in _PHONE_SIP_LEFT_CLOSE_REASONS

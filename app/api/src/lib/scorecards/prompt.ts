@@ -97,8 +97,8 @@ OUTPUT CONTRACT — return STRICT JSON ONLY. No markdown, no commentary, no keys
       "configMetricId": "<one of the exact ids listed below>",
       "score": <integer 1..4, or null>,
       "evidenceStatus": "scored" | "insufficient_evidence",
-      "rationale": "<verbose, natural-language explanation of WHY this score was given, grounded in specific things the candidate said; at most 1000 characters>",
-      "evidenceRefs": ["<short quotes or references to the transcript turns that justify the score>"]
+      "rationale": "<verbose, natural-language explanation of WHY this score was given, grounded in specific things the candidate said; at most 900 characters (hard limit 1000)>",
+      "evidenceRefs": ["<up to 5 short verbatim excerpts of the CANDIDATE's own words, each at most 80 characters — excerpt the key phrase, never paste a whole answer>"]
     }
   ]
 }
@@ -110,6 +110,10 @@ RULES:
 - If a metric CANNOT be judged from the transcript, set "evidenceStatus": "insufficient_evidence" and "score": null. NEVER invent or guess a score to fill a gap — an honest gap is required, not a fabricated number.
 - "rationale" must cite specifics from the transcript (what the candidate actually said), not generic praise. For an insufficient_evidence metric, explain what evidence was missing. Never copy personal identifiers into "rationale" — no phone numbers, email addresses, postal addresses, ID numbers, or names of third parties; describe the evidence instead.
 - Keep "evidenceRefs" short and grounded in the transcript; use an empty array [] if you have no direct quote.
+- Each "evidenceRefs" entry MUST be at most 80 characters (hard limit 100) and quote only the Candidate; use at most 5 entries per metric.
+- "score" must be a JSON integer, not a string.
+- For an insufficient_evidence metric "score" MUST be JSON null — never 0, never a number, never omitted.
+- "rationale" MUST be at most 900 characters (hard limit 1000).
 
 ${TRANSCRIPT_BEGIN}
 ${transcriptStr}

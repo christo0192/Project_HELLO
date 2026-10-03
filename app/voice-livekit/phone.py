@@ -924,6 +924,17 @@ PHONE_WORKER_EVENTS: frozenset[str] = frozenset([
     # double has no allowlist. `test_phone_gate.py` now pins the two
     # allowlists against each other.
     "consent.failed",
+    # M009 E6 (0113): the worker's PRE-ANSWER verdicts. Until now nothing could
+    # record a truthful ring-out or reject: presence was treated as the answer,
+    # so every unanswered leg was already `answered_unclassified`. The gate now
+    # waits for a REAL answer (`sip.callStatus == 'active'` or the agent track
+    # being subscribed) and, when it never comes, posts exactly one of these.
+    # The ledger refuses them unless the attempt is still admitted/ringing with
+    # `answered_at` null, and the epoch fences a stale leg, so an answered call
+    # can never be charged a no-answer. `sip.originate_*` stay provider-only.
+    "call.no_answer",
+    "call.busy",
+    "call.failed",
 ])
 
 _ERR_CONFIGURATION = "configuration"
@@ -1026,6 +1037,193 @@ def phone_event_timeout_sec() -> float:
 def phone_participant_wait_sec() -> float:
     """Bounded wall clock for 'has anything answered yet'."""
     return _bounded_float(os.getenv("PHONE_PARTICIPANT_WAIT_SEC"), 45.0, 1.0, 180.0)
+
+
+# ── M009 E6: the REAL answer, not participant presence ─────────────────────
+# RCA 2026-10-03. The API originates with `waitUntilAnswered: false`, and
+# LiveKit adds the SIP participant to the room when it STARTS DIALING — so
+# "a participant is present" is true ~1-2 s into the ring, not at pickup. The
+# gate treated it as the answer: it posted `call.answered`, began recording
+# 16-51 s of ringback and re-based the lease, and no path could ever record a
+# truthful no-answer or busy (0 such outcomes all-time in production).
+#
+# The pinned SDK's own AMD (livekit-agents 1.6.4 amd/detector.py) waits for
+# `sip.callStatus == 'active'` before it treats a SIP call as answered, for the
+# same reason: ringback and carrier early media reach the room before pickup.
+SIP_CALL_STATUS_ATTRIBUTE = "sip.callStatus"
+SIP_CALL_STATUS_ACTIVE = "active"
+SIP_CALL_STATUS_HANGUP = "hangup"
+#: The statuses LiveKit SIP documents for an outbound leg. Anything else is
+#: treated as absent rather than trusted, so an unexpected value can never be
+#: read as an answer.
+_SIP_CALL_STATUSES: frozenset[str] = frozenset({
+    "dialing", "ringing", "automation", SIP_CALL_STATUS_ACTIVE,
+    SIP_CALL_STATUS_HANGUP,
+})
+#: Pre-answer statuses: a subscription that wins while the leg still reports
+#: one of these is the "signals disagree" case worth a WARN.
+SIP_CALL_STATUSES_PRE_ANSWER: frozenset[str] = frozenset({"dialing", "ringing"})
+
+
+def sip_call_status(participant: Any) -> Optional[str]:
+    """The participant's ``sip.callStatus``, or None. Never raises.
+
+    PRIVACY: reads exactly ONE key by name. The attribute map of a SIP
+    participant also carries ``sip.phoneNumber``; this function never iterates,
+    copies, logs or returns the map, so the candidate's number cannot reach a
+    log line or an exception message through it.
+    """
+    try:
+        attributes = getattr(participant, "attributes", None)
+        getter = getattr(attributes, "get", None)
+        if not callable(getter):
+            return None
+        value = getter(SIP_CALL_STATUS_ATTRIBUTE)
+    except Exception:  # noqa: BLE001 — an unreadable map is an absent status
+        return None
+    if not isinstance(value, str):
+        return None
+    status = value.strip().lower()
+    return status if status in _SIP_CALL_STATUSES else None
+
+
+#: The verdicts of the pre-answer wait. `answered` proceeds to speak; the
+#: next three each map to exactly ONE worker event; `aborted` posts nothing.
+ANSWER_VERDICT_ANSWERED = "answered"
+ANSWER_VERDICT_NO_ANSWER = "no_answer"
+ANSWER_VERDICT_BUSY = "busy"
+ANSWER_VERDICT_PROVIDER_ERROR = "provider_error"
+ANSWER_VERDICT_ABORTED = "aborted"
+#: Sentinel the answer wait passes when its budget expires with no answer.
+ANSWER_DEADLINE = "deadline"
+
+_UNANSWERED_EVENT: dict[str, str] = {
+    ANSWER_VERDICT_NO_ANSWER: "call.no_answer",
+    ANSWER_VERDICT_BUSY: "call.busy",
+    ANSWER_VERDICT_PROVIDER_ERROR: "call.failed",
+}
+
+# livekit rtc `DisconnectReason` RAW enum ints (pinned rtc 1.1.12 under
+# livekit-agents 1.6.4). Ints, not names: `RemoteParticipant.disconnect_reason`
+# returns None for UNKNOWN_REASON and `DisconnectReason.Name(None)` raises, so
+# this table is keyed on the raw value and nothing here ever calls `Name`.
+_DR_UNKNOWN_REASON = 0
+_DR_CLIENT_INITIATED = 1
+_DR_USER_UNAVAILABLE = 11
+_DR_USER_REJECTED = 12
+_DR_SIP_TRUNK_FAILURE = 13
+
+
+def unanswered_verdict(reason_value: Any) -> str:
+    """Map why an UNANSWERED leg ended to a bounded verdict. Pure; never raises.
+
+    * USER_REJECTED → ``busy`` (the callee declined).
+    * USER_UNAVAILABLE, CLIENT_INITIATED, None / UNKNOWN_REASON, or the
+      ``deadline`` sentinel → ``no_answer`` (rang out, or nobody picked up
+      inside our budget).
+    * SIP_TRUNK_FAILURE → ``provider_error``. It charges the PROVIDER budget
+      (paced one per IST day, terminal at 5), which is more lenient than the
+      no-answer budget for a carrier "unreachable" response.
+    * Everything else — CONNECTION_TIMEOUT, JOIN_FAILURE, SIGNAL_CLOSE,
+      ROOM_DELETED, ROOM_CLOSED, PARTICIPANT_REMOVED, SERVER_SHUTDOWN,
+      DUPLICATE_IDENTITY, MIGRATION, MEDIA_FAILURE, AGENT_ERROR,
+      STATE_MISMATCH and any value this table does not know → ``aborted``,
+      which posts NOTHING. Those are our/LiveKit's transport faults, not the
+      callee's answer; reconciliation, the lease and E3 own them.
+    """
+    if reason_value is None or reason_value == ANSWER_DEADLINE:
+        return ANSWER_VERDICT_NO_ANSWER
+    if isinstance(reason_value, bool) or not isinstance(reason_value, int):
+        return ANSWER_VERDICT_ABORTED
+    if reason_value == _DR_USER_REJECTED:
+        return ANSWER_VERDICT_BUSY
+    if reason_value in (_DR_USER_UNAVAILABLE, _DR_CLIENT_INITIATED, _DR_UNKNOWN_REASON):
+        return ANSWER_VERDICT_NO_ANSWER
+    if reason_value == _DR_SIP_TRUNK_FAILURE:
+        return ANSWER_VERDICT_PROVIDER_ERROR
+    return ANSWER_VERDICT_ABORTED
+
+
+def _consume_task_result(task: "asyncio.Future[Any]") -> None:
+    """Retrieve a detached task's outcome so asyncio never logs it as unseen."""
+    try:
+        if not task.cancelled():
+            task.exception()
+    except Exception:  # noqa: BLE001 — observing a result must never raise
+        pass
+
+
+def unanswered_event(verdict: str) -> Optional[str]:
+    """The ONE worker event for an unanswered verdict, or None (post nothing)."""
+    return _UNANSWERED_EVENT.get(verdict)
+
+
+def phone_answer_signal() -> str:
+    """Which signal means "answered". ``sip_status`` (default) or ``presence``.
+
+    ``sip_status`` waits for ``sip.callStatus == 'active'`` OR the agent track
+    being subscribed, whichever comes first (M009 E6). ``presence`` is the
+    KILL SWITCH: participant presence is the answer again, byte-identical to
+    the pre-E6 gate — ``fly secrets set PHONE_ANSWER_SIGNAL=presence``, no
+    deploy. Unknown values fail to the default. Read at the call site with the
+    literal name so the env-contract scanner sees it.
+    """
+    raw = (os.getenv("PHONE_ANSWER_SIGNAL") or "").strip().lower()
+    return "presence" if raw == "presence" else "sip_status"
+
+
+#: Key under which the gate parks its backgrounded `call.answered` post in the
+#: caller's `answer_post_out` holder, so the worker's teardown terminal can
+#: await it too (a terminal that overtakes `call.answered` is refused by the
+#: ledger, which only ends answered attempts through those branches).
+ANSWERED_POST_TASK_KEY = "call_answered_task"
+
+
+def _answered_post_wait_sec() -> float:
+    """Bound on how long a ledger post waits for the backgrounded
+    `call.answered`. The post is itself bounded by `phone_event_timeout_sec`,
+    so waiting longer than that would buy nothing."""
+    return phone_event_timeout_sec()
+
+
+async def await_answered_post(holder: Optional[dict[str, Any]]) -> None:
+    """Let the backgrounded `call.answered` post land first. Never raises
+    (except cancellation of the CALLER, which must propagate).
+
+    Server ordering is the contract: `classify.human`, `disclosure.delivered`,
+    `consent.failed` and every gate terminal are only accepted once the attempt
+    is `answered_unclassified`, which `call.answered` sets. The post runs off
+    the answer→first-word path (it was a whole Fly round trip of silence), so
+    each LATER post awaits it here instead — bounded, shielded so a timeout
+    here never cancels the post itself, and silent on failure because the
+    failure was already logged where the post completed. With no task parked
+    (the presence path, or a gate that never saw an answer) this returns
+    without suspending, so the legacy path's scheduling is unchanged.
+    """
+    if not holder:
+        return
+    task = holder.get(ANSWERED_POST_TASK_KEY)
+    if task is None or task.done():
+        return
+    try:
+        await asyncio.wait_for(
+            asyncio.shield(task), timeout=_answered_post_wait_sec(),
+        )
+    except asyncio.CancelledError:
+        # A cancelled POST surfaces here as CancelledError too; only the
+        # caller's own cancellation may propagate.
+        current = asyncio.current_task()
+        cancelling = getattr(current, "cancelling", None)
+        if task.cancelled() and callable(cancelling) and not cancelling():
+            return
+        raise
+    except asyncio.TimeoutError:
+        _log.warn(
+            "unknown_event", error_type="phone_call_answered_not_applied",
+            error_category="call_answered_wait_timeout",
+        )
+    except Exception:  # noqa: BLE001 — already logged at the post's completion
+        pass
 
 
 def phone_output_subscribe_timeout_sec() -> float:
@@ -5150,6 +5348,12 @@ GATE_FAILED = "gate_failed"
 #: is now a REPORTED fault rather than an indefinite wait, which is the whole
 #: difference between a diagnosable incident and dead air.
 GATE_TIMED_OUT = "gate_timed_out"
+#: M009 E6: the leg ended (or the ring budget ran out) before a REAL answer.
+#: Nothing was spoken, nothing was recorded, and the gate itself has already
+#: posted the one mapped pre-answer event (or, for a transport abort, nothing).
+#: `assessment_allowed` is False, so the caller closes the room; it must post
+#: NOTHING further for this outcome.
+GATE_NOT_ANSWERED = "not_answered"
 
 
 class PhoneParticipantGone(Exception):
@@ -5807,6 +6011,19 @@ async def run_phone_gate(
     # Content-free lifecycle facts used by the worker when an exception lands
     # before PhoneGateResult can be returned.
     gate_phase_out: Optional[dict[str, bool]] = None,
+    # ── M009 E6: the REAL-answer seam (non-bounce only) ───────────────────
+    # Awaited right after participant presence; returns one of the
+    # `ANSWER_VERDICT_*` strings. `answered` proceeds with `call.answered`
+    # BACKGROUNDED (see `await_answered_post`); any other verdict posts the one
+    # mapped pre-answer event and returns GATE_NOT_ANSWERED having spoken,
+    # recorded and re-based nothing. Absent (None) ⇒ presence is the answer,
+    # the pre-E6 path, byte-identical — and ignored entirely in bounce mode,
+    # whose server-verified wait already owns the answer.
+    wait_for_answer: Optional[Callable[[], Awaitable[str]]] = None,
+    # Where the backgrounded `call.answered` task is parked
+    # (`ANSWERED_POST_TASK_KEY`), so the worker's own teardown terminal can
+    # await it before posting. Absent ⇒ a private holder.
+    answer_post_out: Optional[dict[str, Any]] = None,
 ) -> PhoneGateResult:
     """Run the phone screening's opening, in the ONLY order that is safe.
 
@@ -5820,6 +6037,11 @@ async def run_phone_gate(
        terminal attempt or a spent budget closes the leg exactly like the
        no-participant path, having spoken nothing. Off by default — every other
        caller's ordering is byte-identical.
+    1b. (M009 E6, ``wait_for_answer`` wired, not bounce) Wait for the REAL
+       answer. Not answered ⇒ post the one mapped pre-answer event and return
+       ``GATE_NOT_ANSWERED`` having spoken, recorded and re-based nothing.
+       Answered ⇒ ``answer_observed`` is latched, ``call.answered`` is posted
+       in the BACKGROUND and every later ledger post awaits it first.
     2. Post ``call.answered`` (BEST EFFORT) so the server can begin recording
        from the answer. This is behind ``post_call_answered`` so legacy callers
        and their tests keep their exact event ordering.
@@ -5868,6 +6090,16 @@ async def run_phone_gate(
         if gate_phase_out is not None:
             gate_phase_out[name] = True
 
+    # M009 E6: the backgrounded `call.answered` lives here. Empty on every path
+    # that awaits it inline (presence, bounce), so `_await_answered_post` is a
+    # no-suspension no-op there.
+    answer_post: dict[str, Any] = (
+        answer_post_out if answer_post_out is not None else {}
+    )
+
+    async def _await_answered_post() -> None:
+        await await_answered_post(answer_post)
+
     async def _say(text: str) -> None:
         spoken.append(text)
         await say(text)
@@ -5902,6 +6134,7 @@ async def run_phone_gate(
             # `candidate.deferred_pre_disclosure`, which an ordinary deferral
             # — whose audio is KEPT — also posts. Without it the attempt sat
             # at "processing" forever for a call whose audio we destroyed.
+            await _await_answered_post()
             outcome = await client.post_event(
                 attempt_id, event_type, epoch=epoch,
                 recording_discarded=discarded,
@@ -6046,53 +6279,164 @@ async def run_phone_gate(
             )
             return PhoneGateResult(GATE_NO_PARTICIPANT, events=events, spoken=spoken)
 
+    # ── M009 E6: WAIT FOR THE REAL ANSWER (non-bounce, seam wired) ─────────
+    # Presence is NOT the answer: LiveKit adds the SIP participant when it
+    # starts dialing. So before anything is posted, recorded, re-based or
+    # spoken, the gate waits for the seam's verdict. The durable-consent read
+    # is STARTED now, so its round trip overlaps the ring instead of sitting
+    # on the answer→first-word path, and is awaited at its old site below.
+    answer_seam = wait_for_answer is not None and not bounce_mode
+    durable_task: "Optional[asyncio.Future[Any]]" = None
+    if answer_seam:
+        if fetch_durable_consent is not None:
+            durable_task = asyncio.ensure_future(fetch_durable_consent())
+        try:
+            verdict = await wait_for_answer()  # type: ignore[misc]
+        except asyncio.CancelledError:
+            if durable_task is not None:
+                durable_task.cancel()
+            raise
+        except Exception:  # noqa: BLE001
+            # FAIL OPEN to today's behaviour. A broken wait must never hang
+            # up on a live human and charge them a no-answer; the opposite
+            # error (treating a ring as the answer) is the pre-E6 status quo.
+            _log.warn(
+                "unknown_event", error_type="phone_answer_wait",
+                error_category="answer_wait_failed",
+            )
+            verdict = ANSWER_VERDICT_ANSWERED
+        if verdict != ANSWER_VERDICT_ANSWERED:
+            if durable_task is not None:
+                durable_task.cancel()
+                durable_task.add_done_callback(_consume_task_result)
+            _phase("not_answered")
+            event_type = unanswered_event(verdict)
+            if event_type is not None:
+                try:
+                    outcome: Optional[PhoneApiOutcome] = await client.post_event(
+                        attempt_id, event_type, epoch=epoch, session_id=session_id,
+                    )
+                except Exception:  # noqa: BLE001 — never crash the teardown
+                    outcome = None
+                if outcome is not None and (
+                    event_applied(outcome) or outcome.duplicate
+                ):
+                    events.append(event_type)
+                    _phase("terminal_posted")
+                else:
+                    # The ledger refused it (stale epoch, already answered,
+                    # terminal) or the API was unreachable. NOT retried as
+                    # anything else: reconciliation still owns an admitted
+                    # attempt whose participant is gone.
+                    _log.warn(
+                        "unknown_event", error_type="phone_gate_outcome",
+                        schema=GATE_NOT_ANSWERED,
+                        error_category="unanswered_not_applied",
+                    )
+            _log.info(
+                "unknown_event", error_type="phone_gate_outcome",
+                schema=GATE_NOT_ANSWERED,
+                error_category=verdict if verdict in (
+                    ANSWER_VERDICT_NO_ANSWER, ANSWER_VERDICT_BUSY,
+                    ANSWER_VERDICT_PROVIDER_ERROR,
+                ) else ANSWER_VERDICT_ABORTED,
+            )
+            return PhoneGateResult(GATE_NOT_ANSWERED, events=events, spoken=spoken)
+        # Synchronously, before ANY network call: the worker's teardown reads
+        # this to decide whether a later exit is pre- or post-answer, and a
+        # post-answer exit must never be charged as a no-answer.
+        _phase("answer_observed")
+
+    def _fire_begin_recording_at_answer() -> None:
+        """0105: RECORD FROM THE ANSWER, fired and not awaited.
+
+        Only once the server has the attempt in `answered_unclassified`
+        (that is what `call.answered` sets, and what
+        `attach_phone_attempt_recording` admits), and BEFORE a word is
+        spoken. Best effort, every failure swallowed: a missed begin here
+        degrades to the consent-time `start_recording`, i.e. to exactly
+        the coverage every call had before this seam existed.
+
+        FIRED, NOT AWAITED — like the lease re-base below, for the same
+        reason: nothing on the answer→first-word path may wait on a network
+        hop (#279/#289/#290). Prepare is one HTTP call over several Supabase
+        round trips; awaiting it here was up to ~25s of silence before the
+        disclosure — the shape the 2026-09-25 candidates hung up on.
+        `begin()` is idempotent and the consent-time `start_recording` is the
+        fallback if this task loses. Review finding, PR #310.
+        """
+        if begin_recording_at_answer is None:
+            return
+        _begin_task = asyncio.ensure_future(begin_recording_at_answer())
+
+        def _begin_done(task: "asyncio.Future[Any]") -> None:
+            try:
+                task.result()
+            except Exception:  # noqa: BLE001 — recording is strictly secondary
+                _log.warn(
+                    "unknown_event", error_type="phone_recording_begin",
+                    error_category="begin_at_answer_failed",
+                )
+
+        _begin_task.add_done_callback(_begin_done)
+
     # ── call.answered: recording-from-answer, BEST EFFORT ─────────────────
     # Posted the instant a participant is present and the session is started,
     # BEFORE any disclosure is spoken, so the server can begin the recording
     # egress from the top of the call. `applied`/`duplicate` proceed; anything
     # else (`ignored`, transport failure) logs loudly with FIXED strings and the
     # call continues — a best-effort recording start must never kill a call.
-    if post_call_answered:
+    if post_call_answered and answer_seam:
+        # M009 E6: BACKGROUNDED. A real answer means a human is on the line
+        # now, and a Fly round trip here is silence they hear. The NEXT ledger
+        # post (classify.human, disclosure.*, consent, any terminal) awaits
+        # this task first via `_await_answered_post`, so server ordering is
+        # unchanged. Recording still begins only once the post is applied (or
+        # a duplicate): `attach_phone_attempt_recording` admits nothing else.
+        async def _post_call_answered() -> PhoneApiOutcome:
+            return await client.post_event(
+                attempt_id, "call.answered", epoch=epoch, session_id=session_id,
+            )
+
+        answered_task = asyncio.ensure_future(_post_call_answered())
+        answer_post[ANSWERED_POST_TASK_KEY] = answered_task
+
+        def _answered_done(task: "asyncio.Future[Any]") -> None:
+            answered_outcome: Optional[PhoneApiOutcome] = None
+            try:
+                if not task.cancelled():
+                    answered_outcome = task.result()
+            except Exception:  # noqa: BLE001 — logged as unconfirmed below
+                answered_outcome = None
+            if answered_outcome is not None and (
+                event_applied(answered_outcome) or answered_outcome.duplicate
+            ):
+                events.append("call.answered")
+                _phase("answered")
+                _fire_begin_recording_at_answer()
+            else:
+                _log.warn(
+                    "unknown_event", error_type="phone_call_answered_not_applied",
+                    error_category="call_answered_unconfirmed",
+                )
+
+        answered_task.add_done_callback(_answered_done)
+    elif post_call_answered:
         answered = await client.post_event(
             attempt_id, "call.answered", epoch=epoch, session_id=session_id,
         )
         if event_applied(answered) or answered.duplicate:
             events.append("call.answered")
             _phase("answered")
-            # ── 0105: RECORD FROM THE ANSWER ────────────────────────────
-            # Only once the server has the attempt in `answered_unclassified`
-            # (that is what `call.answered` sets, and what
-            # `attach_phone_attempt_recording` admits), and BEFORE a word is
-            # spoken. Best effort, every failure swallowed: a missed begin here
-            # degrades to the consent-time `start_recording`, i.e. to exactly
-            # the coverage every call had before this seam existed.
-            if begin_recording_at_answer is not None:
-                # FIRED, NOT AWAITED — like the lease re-base below, for the
-                # same reason: nothing on the answer→first-word path may wait
-                # on a network hop (#279/#289/#290). Prepare is one HTTP call
-                # over several Supabase round trips; awaiting it here was up to
-                # ~25s of silence before the disclosure — the shape the
-                # 2026-09-25 candidates hung up on. `begin()` is idempotent and
-                # the consent-time `start_recording` is the fallback if this
-                # task loses. Review finding, PR #310.
-                _begin_task = asyncio.ensure_future(begin_recording_at_answer())
-
-                def _begin_done(task: "asyncio.Future[Any]") -> None:
-                    try:
-                        task.result()
-                    except Exception:  # noqa: BLE001 — recording is strictly secondary
-                        _log.warn(
-                            "unknown_event", error_type="phone_recording_begin",
-                            error_category="begin_at_answer_failed",
-                        )
-
-                _begin_task.add_done_callback(_begin_done)
+            # ── 0105: RECORD FROM THE ANSWER ── see the helper above.
+            _fire_begin_recording_at_answer()
         else:
             _log.warn(
                 "unknown_event", error_type="phone_call_answered_not_applied",
                 error_category="call_answered_unconfirmed",
             )
 
+    if post_call_answered:
         # RE-BASE THE LEASE ON THE ANSWER. The clock has been running since
         # ADMISSION — through the dial, the ring, and any machine cold boot —
         # so without this the conversation inherits whatever is left rather
@@ -6142,7 +6486,28 @@ async def run_phone_gate(
     # new-epoch-no-consent reconnect both still run the full disclosure.
     if fetch_durable_consent is not None:
         try:
-            durable = await fetch_durable_consent()
+            # M009 E6: on the answer-seam path the read was started during the
+            # ring (`durable_task`); awaiting it here keeps its old position in
+            # the order while its round trip has already overlapped the ring.
+            durable = await (
+                durable_task if durable_task is not None
+                else fetch_durable_consent()
+            )
+        except asyncio.CancelledError:
+            # Awaiting a Task forwards OUR cancellation into it, so
+            # `durable_task.cancelled()` alone cannot tell "the read was
+            # cancelled" from "the gate is being cancelled" (SDK close on
+            # hangup, the wall clock). Swallowing the latter would leave a
+            # zombie gate speaking past teardown. Only a read cancelled while
+            # this task is NOT itself being cancelled fails open to gating.
+            current = asyncio.current_task()
+            cancelling = getattr(current, "cancelling", None)
+            if (
+                durable_task is None or not durable_task.cancelled()
+                or not callable(cancelling) or cancelling()
+            ):
+                raise
+            durable = None
         except Exception:  # noqa: BLE001
             durable = None
         if durable is not None and durable.ok and durable.gate_recorded:
@@ -6564,6 +6929,7 @@ async def run_phone_gate(
             error_category=category,
         )
         try:
+            await _await_answered_post()
             outcome = await client.post_event(
                 attempt_id, "consent.failed", epoch=epoch,
             )
@@ -6588,6 +6954,7 @@ async def run_phone_gate(
     if callable(consent_start) and session_id is not None and epoch is not None:
         # The atomic consent/start RPC is fast; await it FIRST so the verbatim
         # server role_title is in hand before we speak.
+        await _await_answered_post()
         combined = await consent_start(attempt_id, session_id, epoch)
         if not combined.ok:
             await _report_consent_failed("consent_start_failed")
@@ -6667,6 +7034,7 @@ async def run_phone_gate(
                                assessment_state=combined,
                                role_opening_spoken=role_spoken)
 
+    await _await_answered_post()
     human = await client.post_event(attempt_id, "classify.human", epoch=epoch)
     if not event_applied(human):
         # `ok` is not consent. An `ignored` verdict — terminal, stale_epoch,

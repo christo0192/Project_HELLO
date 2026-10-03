@@ -9,6 +9,7 @@ import type { Assessment, TranscriptTurn } from '../lib/types.js';
 import { scoringProvenance } from '../lib/model-provenance.js';
 import { loadActiveRoleScorecard } from '../lib/scorecards/store.js';
 import { scoreWithScorecard } from '../lib/scorecards/scorer.js';
+import { ScorecardValidationError } from '../lib/scorecards/domain.js';
 import { analyzeResumeIntegrity } from '../lib/scorecards/integrity.js';
 import {
   createPhoneStores,
@@ -353,11 +354,21 @@ async function runAssessmentImpl(
       // DLQs it — where v_funnel_failures now surfaces it (0091). Sanitized: the
       // error message (which can carry provider text) is never logged, only its
       // class.
+      //
+      // A validation failure carries a stable PII-free code naming the rule the
+      // model output broke. It is logged as rejection_reason and becomes the
+      // rethrown message, because the queue stores ONLY a code-shaped message
+      // (runner.ts sanitizeErrorCode) — the sentence message used to collapse
+      // to 'unknown_error' in job_queue/job_dlq/v_funnel_failures. The original
+      // error stays reachable as `cause`. Provider errors (DeepseekError /
+      // BusinessError) are rethrown unchanged so their own codes still apply.
+      const validationCode = err instanceof ScorecardValidationError ? err.code : undefined;
       assessmentLog.warn('unknown_event', {
         error_category: 'scorecard_scoring_failed',
         error_type: err instanceof Error ? err.name : 'unknown',
+        rejection_reason: validationCode,
       });
-      throw err;
+      throw validationCode !== undefined ? new Error(validationCode, { cause: err }) : err;
     }
     // Provenance is the configured scoring model (the v2 scorer's default infer
     // uses exactly this model); required and fail-closed if missing.

@@ -138,7 +138,69 @@ describe('the adapters call the RPCs by name, with the declared keys', () => {
       assessmentPresent: false,
       recordingPresent: true,
       neverStarted: true,
+      // 0113 (E4): absent on this wire row, so it parses to the safe default.
+      callbackBooked: false,
     });
+  });
+
+  it('finalizePartialSessions maps 0113 callback_booked:true to callbackBooked', async () => {
+    // 0113 (E4). The wire key is snake_case; a mis-spelling here would parse
+    // every confirmed-callback leg as `callbackBooked:false` and the tick would
+    // go back to scoring callback legs — the exact bug E4 fixes.
+    const { client } = fakeClient({
+      status: 'ok',
+      examined: 1,
+      finalized: 1,
+      skipped: 0,
+      sessions: [
+        {
+          session_id: 's1',
+          attempt_id: 'a1',
+          engagement_id: 'e1',
+          covered: 2,
+          total: 5,
+          disconnect_reason: 'candidate_hangup',
+          transitioned: true,
+          assessment_present: false,
+          recording_present: true,
+          never_started: false,
+          callback_booked: true,
+        },
+      ],
+    });
+    const result = await createPhoneStores(client).finalizePartialSessions!({
+      limit: 25, graceSeconds: 180, now: NOW,
+    });
+    expect(result.sessions[0]).toEqual({
+      sessionId: 's1',
+      attemptId: 'a1',
+      engagementId: 'e1',
+      covered: 2,
+      total: 5,
+      disconnectReason: 'candidate_hangup',
+      transitioned: true,
+      assessmentPresent: false,
+      recordingPresent: true,
+      neverStarted: false,
+      callbackBooked: true,
+    });
+  });
+
+  it.each([
+    ['a string', 'true'],
+    ['a number', 1],
+    ['null', null],
+  ])('finalizePartialSessions defaults a MALFORMED callback_booked (%s) to false', async (_label, value) => {
+    // Anything but a JSON boolean is not evidence of a booked callback, so it
+    // must keep today's behaviour (score it) rather than withhold a scorecard.
+    const { client } = fakeClient({
+      status: 'ok',
+      sessions: [{ session_id: 's1', attempt_id: 'a1', callback_booked: value }],
+    });
+    const result = await createPhoneStores(client).finalizePartialSessions!({
+      limit: 25, now: NOW,
+    });
+    expect(result.sessions[0].callbackBooked).toBe(false);
   });
 
   it('finalizePartialSessions defaults the 0095 fields SAFELY on an older RPC', async () => {
@@ -168,6 +230,8 @@ describe('the adapters call the RPCs by name, with the declared keys', () => {
     });
     expect(result.sessions[0].neverStarted).toBe(false);
     expect(result.sessions[0].engagementId).toBeNull();
+    // 0113 (E4): an older RPC sends no callback_booked — score it, as today.
+    expect(result.sessions[0].callbackBooked).toBe(false);
   });
 
   it('a refusal carries only sanitized detail — codes, counts and instants', async () => {

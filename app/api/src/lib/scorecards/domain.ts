@@ -1,5 +1,6 @@
 import { createHash } from 'node:crypto';
 import {
+  SCORECARD_MAX_EVIDENCE_REF_LENGTH,
   SCORECARD_MAX_EVIDENCE_REFS,
   SCORECARD_MAX_INSTRUCTION_LENGTH,
   SCORECARD_MAX_METRICS,
@@ -15,21 +16,42 @@ import {
   type RoleScorecardMetric,
   type ScoreValue,
   type ScorecardMetricModelResult,
+  type ScorecardNormalizationRule,
   type ScorecardRubric,
+  type ScorecardValidationCode,
 } from './contracts.js';
 
+/**
+ * `message` is a human sentence the admin routes return verbatim (400 bodies),
+ * so every existing message is byte-identical. `code` is the stable, PII-free
+ * identifier the queue and the logs can actually store (see contracts.ts
+ * SCORECARD_VALIDATION_CODES); it defaults to the configuration code so every
+ * config/rubric/metric validator keeps its meaning without naming one.
+ */
 export class ScorecardValidationError extends Error {
-  constructor(message: string) {
+  readonly code: ScorecardValidationCode;
+
+  constructor(message: string, code: ScorecardValidationCode = 'scorecard_invalid:config') {
     super(message);
     this.name = 'ScorecardValidationError';
+    this.code = code;
   }
 }
 
-function boundedText(value: unknown, field: string, max: number): string {
-  if (typeof value !== 'string') throw new ScorecardValidationError(`${field} must be text`);
+interface BoundedTextCodes {
+  /** Non-text, or empty after whitespace collapse. */
+  readonly empty: ScorecardValidationCode;
+  readonly tooLong: ScorecardValidationCode;
+}
+
+function boundedText(value: unknown, field: string, max: number, codes?: BoundedTextCodes): string {
+  if (typeof value !== 'string') throw new ScorecardValidationError(`${field} must be text`, codes?.empty);
   const normalized = value.trim().replace(/\s+/g, ' ');
-  if (!normalized || normalized.length > max) {
-    throw new ScorecardValidationError(`${field} must contain 1..${max} characters`);
+  if (!normalized) {
+    throw new ScorecardValidationError(`${field} must contain 1..${max} characters`, codes?.empty);
+  }
+  if (normalized.length > max) {
+    throw new ScorecardValidationError(`${field} must contain 1..${max} characters`, codes?.tooLong);
   }
   return normalized;
 }
@@ -158,30 +180,203 @@ export function validateMetricResults(
   configuredMetrics: readonly RoleScorecardMetric[],
   results: readonly ScorecardMetricModelResult[],
 ): readonly ValidatedMetricResult[] {
+  // A corrupt CONFIGURATION throws here with the default config code — the one
+  // code the scorer never "repairs" by re-asking the model.
   const configured = validateRoleMetrics(configuredMetrics);
-  if (results.length !== configured.length) throw new ScorecardValidationError('model output must contain exactly one result per metric');
+  // Every throw below keeps its historical message byte-for-byte and adds the
+  // code naming the exact rule, so a DLQ row says which one fired.
+  if (results.length !== configured.length) {
+    throw new ScorecardValidationError('model output must contain exactly one result per metric', 'scorecard_invalid:result_count');
+  }
   const expected = new Set(configured.map((metric) => metric.id));
   const seen = new Set<string>();
   for (const result of results) {
-    if (!expected.has(result.configMetricId) || seen.has(result.configMetricId)) {
-      throw new ScorecardValidationError('model output contains an unknown or duplicate metric ID');
+    if (!expected.has(result.configMetricId)) {
+      throw new ScorecardValidationError('model output contains an unknown or duplicate metric ID', 'scorecard_invalid:unknown_metric_id');
+    }
+    if (seen.has(result.configMetricId)) {
+      throw new ScorecardValidationError('model output contains an unknown or duplicate metric ID', 'scorecard_invalid:duplicate_metric_id');
     }
     seen.add(result.configMetricId);
     if (result.evidenceStatus !== 'scored' && result.evidenceStatus !== 'insufficient_evidence') {
-      throw new ScorecardValidationError('metric evidence status is invalid');
+      throw new ScorecardValidationError('metric evidence status is invalid', 'scorecard_invalid:evidence_status');
     }
     if (result.evidenceStatus === 'scored' && !isScoreValue(result.score)) {
-      throw new ScorecardValidationError(`scored metric must have an integer score from ${SCORE_MIN} to ${SCORE_MAX}`);
+      throw new ScorecardValidationError(
+        `scored metric must have an integer score from ${SCORE_MIN} to ${SCORE_MAX}`,
+        'scorecard_invalid:score_not_integer_1_4',
+      );
     }
     if (result.evidenceStatus === 'insufficient_evidence' && result.score !== null) {
-      throw new ScorecardValidationError('insufficient-evidence metric must not receive an invented score');
+      throw new ScorecardValidationError('insufficient-evidence metric must not receive an invented score', 'scorecard_invalid:insufficient_with_score');
     }
-    boundedText(result.rationale, 'metric rationale', SCORECARD_MAX_RATIONALE_LENGTH);
-    if (!Array.isArray(result.evidenceRefs) || result.evidenceRefs.length > SCORECARD_MAX_EVIDENCE_REFS || result.evidenceRefs.some((ref) => typeof ref !== 'string' || ref.length > 100)) {
-      throw new ScorecardValidationError('metric evidence references are invalid');
+    boundedText(result.rationale, 'metric rationale', SCORECARD_MAX_RATIONALE_LENGTH, {
+      empty: 'scorecard_invalid:rationale_empty',
+      tooLong: 'scorecard_invalid:rationale_too_long',
+    });
+    // The former single combined refs check, split so each failure names its
+    // rule. Each is exactly as strict as before (raw length, no trimming).
+    const refsMessage = 'metric evidence references are invalid';
+    if (!Array.isArray(result.evidenceRefs)) {
+      throw new ScorecardValidationError(refsMessage, 'scorecard_invalid:evidence_refs_not_array');
+    }
+    if (result.evidenceRefs.length > SCORECARD_MAX_EVIDENCE_REFS) {
+      throw new ScorecardValidationError(refsMessage, 'scorecard_invalid:evidence_refs_too_many');
+    }
+    if (result.evidenceRefs.some((ref) => typeof ref !== 'string')) {
+      throw new ScorecardValidationError(refsMessage, 'scorecard_invalid:evidence_ref_not_string');
+    }
+    if (result.evidenceRefs.some((ref) => ref.length > SCORECARD_MAX_EVIDENCE_REF_LENGTH)) {
+      throw new ScorecardValidationError(refsMessage, 'scorecard_invalid:evidence_ref_too_long');
     }
   }
   return configured.map((metric) => results.find((result) => result.configMetricId === metric.id)!);
+}
+
+// ── Model-output normalizer (presentation-only) ─────────────────────────────
+
+const MODEL_RESULT_KEYS = new Set(['configMetricId', 'score', 'evidenceStatus', 'rationale', 'evidenceRefs']);
+const ELLIPSIS = '…';
+/** A truncated rationale is never cut shorter than this many characters. */
+const RATIONALE_MIN_CUT = 500;
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff;
+}
+
+/** First `units` UTF-16 units, backing off one so a surrogate pair is never split. */
+function headUtf16(value: string, units: number): string {
+  let end = Math.min(units, value.length);
+  if (end > 0 && end < value.length && isHighSurrogate(value.charCodeAt(end - 1))) end -= 1;
+  return value.slice(0, end);
+}
+
+function collapse(value: string): string {
+  return value.trim().replace(/\s+/g, ' ');
+}
+
+/**
+ * Cut an over-long rationale to at most SCORECARD_MAX_RATIONALE_LENGTH including
+ * the ellipsis: at the last sentence end, else the last space, at or after
+ * RATIONALE_MIN_CUT within the first max-1 units; else a hard cut. The floor
+ * keeps a rationale whose only full stop is early from collapsing to a stub.
+ */
+function truncateRationale(value: string): string {
+  const limit = SCORECARD_MAX_RATIONALE_LENGTH - 1;
+  const head = value.slice(0, limit);
+  for (let i = head.length - 1; i >= RATIONALE_MIN_CUT; i -= 1) {
+    const ch = head[i];
+    if (ch === '.' || ch === '!' || ch === '?') return head.slice(0, i + 1) + ELLIPSIS;
+  }
+  const space = head.lastIndexOf(' ');
+  if (space >= RATIONALE_MIN_CUT) return head.slice(0, space) + ELLIPSIS;
+  return headUtf16(value, limit) + ELLIPSIS;
+}
+
+const STATUS_SCORED: MetricEvidenceStatus = 'scored';
+const STATUS_INSUFFICIENT: MetricEvidenceStatus = 'insufficient_evidence';
+
+/**
+ * Fix ONLY presentation and type noise in raw model result entries, before the
+ * UNCHANGED strict validator sees them.
+ *
+ * Pure: returns NEW objects carrying exactly the five contract keys (so extra
+ * model keys are never persisted) plus the de-duplicated list of rules applied.
+ * It never clamps or rounds a score, never nulls a numeric score, never remaps
+ * an id, and leaves anything it cannot canonicalize RAW so validateMetricResults
+ * still rejects it. It is deliberately NOT called from validateMetricResults or
+ * calculateWeightedScore: the validator stays the single strict gate.
+ */
+export function normalizeModelResults(entries: readonly Record<string, unknown>[]): {
+  results: ScorecardMetricModelResult[];
+  applied: ScorecardNormalizationRule[];
+} {
+  const applied = new Set<ScorecardNormalizationRule>();
+  const results = entries.map((entry): ScorecardMetricModelResult => {
+    if (Object.keys(entry).some((key) => !MODEL_RESULT_KEYS.has(key))) applied.add('extra_keys_stripped');
+
+    let configMetricId: unknown = entry.configMetricId;
+    if (typeof configMetricId === 'string' && configMetricId.trim() !== configMetricId) {
+      configMetricId = configMetricId.trim();
+      applied.add('metric_id_trimmed');
+    }
+
+    let evidenceStatus: unknown = entry.evidenceStatus;
+    if (typeof evidenceStatus === 'string') {
+      const canonical = evidenceStatus.trim().toLowerCase().replace(/[\s-]+/g, '_');
+      if ((canonical === STATUS_SCORED || canonical === STATUS_INSUFFICIENT) && canonical !== evidenceStatus) {
+        evidenceStatus = canonical;
+        applied.add('evidence_status_canonicalized');
+      }
+    }
+
+    let score: unknown = entry.score;
+    if (typeof score === 'string' && /^\s*[1-4]\s*$/.test(score)) {
+      score = Number(score);
+      applied.add('score_string_coerced');
+    } else if (
+      evidenceStatus === STATUS_INSUFFICIENT &&
+      (score === undefined || (typeof score === 'string' && (score.trim() === '' || score.trim().toLowerCase() === 'null')))
+    ) {
+      // Only an ABSENT score becomes null. A numeric score on an
+      // insufficient_evidence metric is left as-is and still fails closed.
+      score = null;
+      applied.add('insufficient_score_nullified');
+    }
+
+    let rationale: unknown = entry.rationale;
+    if (typeof rationale === 'string') {
+      const collapsed = collapse(rationale);
+      // An empty rationale is left raw so it still fails rationale_empty.
+      if (collapsed) {
+        rationale = collapsed.length > SCORECARD_MAX_RATIONALE_LENGTH ? truncateRationale(collapsed) : collapsed;
+        if (collapsed.length > SCORECARD_MAX_RATIONALE_LENGTH) applied.add('rationale_truncated');
+      }
+    }
+
+    const rawRefs = entry.evidenceRefs;
+    let refList: readonly unknown[];
+    if (rawRefs === undefined || rawRefs === null) {
+      refList = [];
+    } else if (typeof rawRefs === 'string') {
+      refList = [rawRefs];
+      applied.add('evidence_refs_coerced_array');
+    } else if (!Array.isArray(rawRefs)) {
+      refList = [];
+      applied.add('evidence_refs_coerced_array');
+    } else {
+      refList = rawRefs;
+    }
+    const refs: string[] = [];
+    for (const ref of refList) {
+      // Non-strings (numbers included) are DROPPED, never stringified: a bare
+      // number is not a quote of anything the candidate said.
+      const text = typeof ref === 'string' ? collapse(ref) : '';
+      if (!text) {
+        applied.add('evidence_ref_dropped');
+        continue;
+      }
+      if (text.length > SCORECARD_MAX_EVIDENCE_REF_LENGTH) {
+        refs.push(headUtf16(text, SCORECARD_MAX_EVIDENCE_REF_LENGTH - 1) + ELLIPSIS);
+        applied.add('evidence_ref_truncated');
+      } else {
+        refs.push(text);
+      }
+    }
+    if (refs.length > SCORECARD_MAX_EVIDENCE_REFS) applied.add('evidence_refs_capped');
+    const evidenceRefs = refs.slice(0, SCORECARD_MAX_EVIDENCE_REFS);
+
+    // Values the normalizer could not canonicalize are carried RAW (hence the
+    // cast): the validator, not this function, decides whether they pass.
+    return {
+      configMetricId,
+      score,
+      evidenceStatus,
+      rationale,
+      evidenceRefs,
+    } as unknown as ScorecardMetricModelResult;
+  });
+  return { results, applied: [...applied] };
 }
 
 export function calculateWeightedScore(

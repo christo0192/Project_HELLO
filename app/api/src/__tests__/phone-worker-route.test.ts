@@ -2336,3 +2336,83 @@ describe('P-answer GET /attempt/:id/answered', () => {
     expect(res.status).toBe(503);
   });
 });
+
+// ═══════════════════════════════════════════════════════════════════════
+// M009 E6 (0113): the worker's PRE-ANSWER verdicts
+//
+// `call.no_answer` / `call.busy` / `call.failed` are the worker's own verdict
+// on a leg nobody answered. They charge a candidate's budget, so the ledger
+// fences them to an unanswered attempt — but at the ROUTE they must also be
+// inert for everything the route does on its own after apply: an unanswered
+// leg has no audio to record and nothing to purge.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('M009 E6 — the pre-answer verdicts call.no_answer / call.busy / call.failed', () => {
+  const PRE_ANSWER = ['call.no_answer', 'call.busy', 'call.failed'] as const;
+
+  it('are in the closed worker vocabulary, while sip.originate_* stay provider-only', () => {
+    for (const event of PRE_ANSWER) expect(WORKER_PHONE_EVENTS).toContain(event);
+    expect(WORKER_PHONE_EVENTS.some((e) => e.startsWith('sip.originate'))).toBe(false);
+  });
+
+  for (const event of PRE_ANSWER) {
+    it(`${event}: forwarded as \`internal\` with its epoch, and never starts a recording`, async () => {
+      const h = build({ withRecorder: true, withHintVerifier: true });
+      const res = await post(h, '/events', {
+        attempt_id: ATTEMPT,
+        event_type: event,
+        epoch: 3,
+        session_id: SESSION,
+      });
+
+      expect(res.status).toBe(200);
+      expect(res.body.ok).toBe(true);
+      expect(h.applyEvent).toHaveBeenCalledTimes(1);
+      expect(h.applyEvent.mock.calls[0][0]).toMatchObject({
+        source: 'internal',
+        eventType: event,
+        attemptId: ATTEMPT,
+        epoch: 3,
+      });
+      // The post-apply recording hook is call.answered / disclosure.delivered
+      // ONLY. An unanswered leg must never reach the egress.
+      expect(h.startRecording).not.toHaveBeenCalled();
+      expect(h.verifySessionHint).not.toHaveBeenCalled();
+      expect(h.latchDiscardedRecording).not.toHaveBeenCalled();
+    });
+
+    it(`${event}: is not a purge trigger, and a broken purge seam cannot hold it hostage`, async () => {
+      expect(PURGE_BEFORE_EVENTS.has(event)).toBe(false);
+      const h = build({ withPurge: true, purgeStatus: 'still_present', purgeSafe: false });
+      const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: event });
+
+      expect(res.status).toBe(200);
+      expect(h.purgeRecordings).not.toHaveBeenCalled();
+      expect(h.applyEvent).toHaveBeenCalledTimes(1);
+    });
+
+    it(`${event}: a ledger refusal (answered attempt) is reported as not ok`, async () => {
+      // 0113 applies these only to an admitted/ringing attempt with
+      // answered_at null; anything else is `unexpected_event`. The worker
+      // branches on `ok`, so an ignored verdict must not read as applied.
+      const h = build({
+        applyEvent: async () =>
+          ({
+            status: 'ignored',
+            applied: false,
+            ignoredReason: 'unexpected_event',
+            duplicate: false,
+          }) as ApplyPhoneEventResult,
+      });
+      const res = await post(h, '/events', { attempt_id: ATTEMPT, event_type: event });
+
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({
+        ok: false,
+        status: 'ignored',
+        ignored_reason: 'unexpected_event',
+        duplicate: false,
+      });
+    });
+  }
+});

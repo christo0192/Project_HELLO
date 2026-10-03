@@ -168,12 +168,15 @@ for (const [label, browser, phone] of NEG) {
     rmSync(dir, { recursive: true, force: true });
   }
 }
-// The SHIPPED PR-A phone config: flag absent (off), kill_timeout set.
+// The SHIPPED phone config: PR-B (M009 B6) flips the per-machine flag ON —
+// only after PR-A's API that accepts and stores names is live — and PR-A's
+// kill_timeout stays set. The shipped manifest must also pass the validator.
 {
   const r = spawnSync(process.execPath, [validator], { encoding: "utf8" });
   const out = (r.stdout || "") + (r.stderr || "");
-  ok(/phone_per_machine_agent_name=off/.test(out),
-    `PR-A ships PHONE_PER_MACHINE_AGENT_NAME absent (flipped only after the API stores names), got:\n${out}`);
+  ok(r.status === 0, `the shipped voice-worker configs must validate, got:\n${out}`);
+  ok(/phone_per_machine_agent_name=on/.test(out),
+    `PR-B ships PHONE_PER_MACHINE_AGENT_NAME = "true" (flipped once the API stores names), got:\n${out}`);
   const phoneText = readFileSync(path.join(here, "..", "app/voice-livekit/fly.phone.toml"), "utf8");
   ok(/^kill_timeout = 300\r?$/m.test(phoneText),
     "fly.phone.toml must set a top-level kill_timeout = 300 so a stop drains a live call");

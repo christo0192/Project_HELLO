@@ -84,6 +84,53 @@ describe('parity-phone-worker-events', () => {
     }
   });
 
+  it('the M009 E6 pre-answer verdicts are postable on BOTH sides (0113)', () => {
+    // Named, like consent.failed above: a worker that refuses its own
+    // ring-out verdict locally would leave every unanswered leg to the lease
+    // reclaimer — the redial loop E6 exists to end — while the set diff alone
+    // would only say "sets differ".
+    for (const event of ['call.no_answer', 'call.busy', 'call.failed']) {
+      expect(py.has(event), `${event} missing from phone.py`).toBe(true);
+      expect(WORKER_PHONE_EVENTS, `${event} missing from the route`).toContain(event);
+    }
+  });
+
+  it('the worker still cannot post a PROVIDER verdict (sip.originate_*)', () => {
+    for (const set of [[...py], [...WORKER_PHONE_EVENTS]]) {
+      expect(set.some((e) => e.startsWith('sip.originate'))).toBe(false);
+    }
+  });
+
+  it('no pre-answer verdict triggers a recording purge', () => {
+    // An unanswered leg has no audio; a purge trigger here would make a
+    // broken purge seam 503 the verdict that ends the attempt.
+    for (const event of ['call.no_answer', 'call.busy', 'call.failed']) {
+      expect(PURGE_BEFORE_EVENTS.has(event)).toBe(false);
+    }
+  });
+
+  it('the documented OpenAPI enum is the SAME set as the route allowlist', () => {
+    // The third copy of the vocabulary. It had already drifted (call.answered
+    // and consent.failed were never documented); pinned so it cannot again.
+    const yaml = fs
+      .readFileSync(path.join(__dirname, '../../openapi/openapi.yaml'), 'utf-8')
+      .replace(/\r\n/g, '\n');
+    const start = yaml.indexOf('\n    PhoneWorkerEventRequest:\n');
+    expect(start, 'PhoneWorkerEventRequest schema missing').toBeGreaterThan(-1);
+    const eventType = yaml.indexOf('\n        event_type:\n', start);
+    const enumAt = yaml.indexOf('\n          enum:\n', eventType);
+    expect(eventType).toBeGreaterThan(start);
+    expect(enumAt).toBeGreaterThan(eventType);
+    const documented: string[] = [];
+    for (const line of yaml.slice(enumAt + '\n          enum:\n'.length).split('\n')) {
+      const m = /^ {12}- ([a-z][a-z0-9_.]*)$/.exec(line);
+      if (!m) break;
+      documented.push(m[1]);
+    }
+    expect(documented.length).toBeGreaterThan(5);
+    expect([...documented].sort()).toEqual([...WORKER_PHONE_EVENTS].sort());
+  });
+
   it('screening.not_started is NOT worker-postable', () => {
     // It is posted by the API runtime from the partial-finalize sweep, which
     // has PROVEN there is no candidate turn. A worker able to post it could

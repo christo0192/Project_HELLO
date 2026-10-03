@@ -67,7 +67,16 @@ export function isLiveKitWebhookEvent(name: unknown): name is LiveKitWebhookEven
  *
  * `participant_joined -> sip.participant_joined` is the one 0042 documents as
  * "#14 JOIN IS NOT ANSWER": it moves the ATTEMPT to `answered_unclassified`
- * and moves the engagement nowhere. Classification (`classify.human` /
+ * and moves the engagement nowhere.
+ *
+ * RE-GATE BEFORE ENABLING THE WEBHOOK (M009 E6 / 0113). The SIP participant
+ * joins when LiveKit starts DIALING, not at the answer, so this mapping would
+ * move every attempt to `answered_unclassified` at ring start — which disarms
+ * 0113's pre-answer branch (`call.no_answer` / `call.busy` / `call.failed`
+ * apply only to an admitted/ringing attempt) and would make a ring-out
+ * uncountable again. The webhook is not delivered in production today, so this
+ * is inert; it must be unmapped or gated on `sip.callStatus` 'active' before
+ * any webhook enablement. Classification (`classify.human` /
  * `classify.machine`), disclosure and assessment events are produced by the
  * in-room agent, not by a webhook, so they are deliberately absent here.
  */
