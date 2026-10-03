@@ -39,11 +39,14 @@ import type { PhoneRuntimeConfig } from '../lib/phone-runtime/config.js';
 import { phoneAssessmentDedupKey } from '../lib/phone-runtime/config.js';
 import { createPhoneAssessmentHandler } from '../lib/phone-runtime/assessment-handler.js';
 import type { Queue } from '../lib/queue/index.js';
+import { sanitizeErrorCode } from '../lib/queue/runner.js';
 
 const SESSION_A = '11111111-1111-4111-a111-111111111111';
 const SESSION_B = '22222222-2222-4222-a222-222222222222';
 const ATTEMPT_A = 'aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa';
 const ATTEMPT_B = 'bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb';
+const SESSION_C = '33333333-3333-4333-a333-333333333333';
+const ATTEMPT_C = 'cccccccc-cccc-4ccc-accc-cccccccccccc';
 const ENGAGEMENT_A = 'eeeeeeee-eeee-4eee-aeee-eeeeeeeeeeee';
 
 interface EnqueueCall {
@@ -231,8 +234,21 @@ function partialSession(over: Partial<PhonePartialFinalizeSession> = {}): PhoneP
     transitioned: true,
     assessmentPresent: false,
     recordingPresent: false,
+    // 0113 (E4): the default is an ordinary partial, not a callback leg.
+    callbackBooked: false,
     ...over,
   };
+}
+
+/** Every `phone_partial_finalize:*` category the runtime logged to stdout. */
+function partialFinalizeCategories(spy: { mock: { calls: unknown[][] } }): string[] {
+  const out: string[] = [];
+  for (const [chunk] of spy.mock.calls) {
+    const line = String(chunk);
+    const m = /"error_category":"(phone_partial_finalize:[^"]*)"/.exec(line);
+    if (m) out.push(m[1]);
+  }
+  return out;
 }
 
 describe('the partial-finalize tick delivers the scorecard on a disconnect', () => {
@@ -530,6 +546,131 @@ describe('the partial-finalize tick delivers the scorecard on a disconnect', () 
       expect(call.options?.dedupKey).toBe(phoneAssessmentDedupKey(SESSION_A));
     }
   });
+
+  // ─────────────────────────────────────────────────────────────────────
+  // 0113 (E4) — a leg that ended in a CONFIRMED callback is not a screening
+  // ─────────────────────────────────────────────────────────────────────
+  //
+  // The RPC reports `callback_booked` by an exact
+  // `phone_appointments.confirmed_from_attempt_id` match. Such a leg is still
+  // finalized (MP3 kept) but must never be queued for scoring: scoring it
+  // published a provisional reject to Ashby and terminated an engagement that
+  // had to stay `scheduled` for the callback slot.
+
+  it('E4: a callbackBooked session is NOT enqueued and is logged with cb.1', async () => {
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    try {
+      const enqueues: EnqueueCall[] = [];
+      let passes = 0;
+      const stores = makeStores({
+        onFinalize: () => {
+          passes += 1;
+          return {
+            status: 'ok',
+            finalized: 1,
+            sessions: [partialSession({ callbackBooked: true, covered: 2 })],
+          };
+        },
+      });
+      const runtime = buildRuntime({ stores, queue: makeQueue(enqueues) });
+      runtime.scheduler.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await drainMicrotasks(() => partialFinalizeCategories(write).length > 0);
+
+      expect(passes).toBeGreaterThan(0);
+      expect(enqueues).toHaveLength(0);
+      const cats = partialFinalizeCategories(write);
+      expect(cats.length).toBeGreaterThan(0);
+      expect(cats[0]).toBe('phone_partial_finalize:c2:t5:mp3.0:sc.0:ns.0:cb.1');
+      // The finalize count is still reported: the RPC DID finalize the leg.
+      expect(runtime.snapshot().lastPartialFinalized).toBe(1);
+    } finally {
+      write.mockRestore();
+    }
+  });
+
+  it('E4: callbackBooked=false and neverStarted=true are still enqueued (cb.0)', async () => {
+    const write = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    try {
+      const enqueues: EnqueueCall[] = [];
+      const stores = makeStores({
+        onFinalize: () => ({
+          status: 'ok',
+          finalized: 3,
+          sessions: [
+            partialSession({ sessionId: SESSION_A, attemptId: ATTEMPT_A, callbackBooked: false }),
+            partialSession({
+              sessionId: SESSION_B, attemptId: ATTEMPT_B, neverStarted: true, covered: 0,
+            }),
+            partialSession({
+              sessionId: SESSION_C, attemptId: ATTEMPT_C, callbackBooked: true,
+            }),
+          ],
+        }),
+      });
+      const runtime = buildRuntime({ stores, queue: makeQueue(enqueues) });
+      runtime.scheduler.start();
+      await vi.advanceTimersByTimeAsync(1_000);
+      await drainMicrotasks(
+        () => enqueues.length >= 2 && partialFinalizeCategories(write).length >= 3,
+      );
+
+      const firstPass = enqueues.slice(0, 2)
+        .map((e) => (e.payload as { session_id: string }).session_id);
+      expect(firstPass).toEqual([SESSION_A, SESSION_B]);
+      // The callback leg never reaches the queue, on any pass.
+      expect(enqueues.some((e) => (e.payload as { session_id: string }).session_id === SESSION_C))
+        .toBe(false);
+      const cats = partialFinalizeCategories(write).slice(0, 3);
+      expect(cats[0].endsWith(':ns.0:cb.0')).toBe(true);
+      expect(cats[1].endsWith(':ns.1:cb.0')).toBe(true);
+      expect(cats[2].endsWith(':ns.0:cb.1')).toBe(true);
+    } finally {
+      write.mockRestore();
+    }
+  });
+
+  it('E4: one enqueue failure does not abort the loop, with a callback leg in the batch', async () => {
+    const seen: string[] = [];
+    let first = true;
+    const queue = {
+      async enqueue(name: string, payload: unknown) {
+        if (first) { first = false; throw new Error('enqueue_boom'); }
+        seen.push((payload as { session_id: string }).session_id);
+        return { id: 'job', name, payload } as never;
+      },
+      async claim() { return null; },
+      async completeClaim() { return true; },
+      async failClaim() { return 'failed'; },
+      async heartbeat() { return true; },
+      async deferClaim() { return 'deferred'; },
+    } as unknown as Queue;
+    const stores = makeStores({
+      onFinalize: () => ({
+        status: 'ok',
+        finalized: 3,
+        sessions: [
+          partialSession({ sessionId: SESSION_A, attemptId: ATTEMPT_A }),
+          partialSession({ sessionId: SESSION_C, attemptId: ATTEMPT_C, callbackBooked: true }),
+          partialSession({ sessionId: SESSION_B, attemptId: ATTEMPT_B }),
+        ],
+      }),
+    });
+    const runtime = buildRuntime({ stores, queue });
+    runtime.scheduler.start();
+    await vi.advanceTimersByTimeAsync(1_000);
+    await drainMicrotasks(() => seen.length > 0);
+
+    expect(seen).toContain(SESSION_B);
+    expect(seen).not.toContain(SESSION_C);
+  });
+
+  it('E4: the worst-case composite tag stays a valid SAFE_IDENT (<= 64 chars)', () => {
+    // Mirrors the runtime's template; pins the bound the cb suffix must keep.
+    const worst = 'phone_partial_finalize:c-1:t-1:mp3.1:sc.1:ns.1:cb.1';
+    expect(worst.length).toBeLessThanOrEqual(64);
+    expect(/^[a-zA-Z0-9_:.-]{1,64}$/.test(worst)).toBe(true);
+  });
 });
 
 /**
@@ -543,8 +684,20 @@ function makeAssessmentClient(opts: {
   engagementId?: string | null;
   assessmentExists?: boolean;
   rpcResult?: { data: unknown; error: unknown };
-}): { client: unknown; rpcCalls: Array<Record<string, unknown>> } {
+  /**
+   * 0113 (E4) — the callback-leg guard's `phone_appointments` read. `row`
+   * answers a matching confirmed_from_attempt_id; `error` fails the read.
+   * Absent: no appointment (an ordinary job).
+   */
+  callbackAppointment?: 'row' | 'error';
+}): {
+  client: unknown;
+  rpcCalls: Array<Record<string, unknown>>;
+  /** Every `phone_appointments` filter the guard applied, as [column, value]. */
+  appointmentFilters: Array<[string, unknown]>;
+} {
   const rpcCalls: Array<Record<string, unknown>> = [];
+  const appointmentFilters: Array<[string, unknown]> = [];
   const client = {
     async rpc(_name: string, args: Record<string, unknown>) {
       rpcCalls.push(args);
@@ -553,8 +706,19 @@ function makeAssessmentClient(opts: {
     from(table: string) {
       const builder = {
         select() { return builder; },
-        eq() { return builder; },
+        eq(column: string, value: unknown) {
+          if (table === 'phone_appointments') appointmentFilters.push([column, value]);
+          return builder;
+        },
         async maybeSingle() {
+          if (table === 'phone_appointments') {
+            if (opts.callbackAppointment === 'error') {
+              return { data: null, error: { message: 'boom' } };
+            }
+            return opts.callbackAppointment === 'row'
+              ? { data: { id: 'appt-1' }, error: null }
+              : { data: null, error: null };
+          }
           if (table === 'phone_call_attempts') {
             return opts.engagementId === undefined
               ? { data: null, error: null }
@@ -569,7 +733,7 @@ function makeAssessmentClient(opts: {
       return builder;
     },
   };
-  return { client, rpcCalls };
+  return { client, rpcCalls, appointmentFilters };
 }
 
 describe('the scorer plumbing forwards the partial fields', () => {
@@ -740,5 +904,110 @@ describe('the scorer plumbing forwards the partial fields', () => {
         },
       } as never),
     ).rejects.toThrow('phone_assessment_completion_not_applied');
+  });
+});
+
+describe('0113 (E4) — the handler never scores a confirmed-callback leg', () => {
+  const partialPayload = {
+    session_id: SESSION_A,
+    attempt_id: ATTEMPT_A,
+    partial: true,
+    covered: 2,
+    total: 5,
+    disconnect_reason: 'candidate_hangup',
+  };
+
+  it('(a) a callback attempt: no score(), no apply_phone_event, and the job resolves', async () => {
+    const scored: string[] = [];
+    const { client, rpcCalls, appointmentFilters } = makeAssessmentClient({
+      engagementId: ENGAGEMENT_A,
+      callbackAppointment: 'row',
+    });
+    const handler = createPhoneAssessmentHandler({
+      client: client as never,
+      score: async (sessionId) => { scored.push(sessionId); },
+    });
+    await expect(handler({ payload: partialPayload } as never)).resolves.toBeUndefined();
+    expect(scored).toHaveLength(0);
+    expect(rpcCalls).toHaveLength(0);
+    // EXACT attempt match — no engagement-level fallback, no status filter.
+    expect(appointmentFilters).toEqual([['confirmed_from_attempt_id', ATTEMPT_A]]);
+  });
+
+  it('(b) an appointment read error throws phone_assessment_callback_check_failed, before scoring', async () => {
+    const scored: string[] = [];
+    const { client, rpcCalls } = makeAssessmentClient({
+      engagementId: ENGAGEMENT_A,
+      callbackAppointment: 'error',
+    });
+    const handler = createPhoneAssessmentHandler({
+      client: client as never,
+      score: async (sessionId) => { scored.push(sessionId); },
+    });
+    await expect(handler({ payload: partialPayload } as never))
+      .rejects.toThrow('phone_assessment_callback_check_failed');
+    expect(scored).toHaveLength(0);
+    expect(rpcCalls).toHaveLength(0);
+    // The code must survive the queue runner's sanitizer verbatim, or the
+    // retry/DLQ row would read `unknown_error`.
+    expect(sanitizeErrorCode(new Error('phone_assessment_callback_check_failed')))
+      .toBe('phone_assessment_callback_check_failed');
+  });
+
+  it('(c) a non-callback partial still scores and posts the STRANDED shape', async () => {
+    const scored: string[] = [];
+    const { client, rpcCalls } = makeAssessmentClient({ engagementId: ENGAGEMENT_A });
+    const handler = createPhoneAssessmentHandler({
+      client: client as never,
+      score: async (sessionId) => { scored.push(sessionId); },
+    });
+    await handler({ payload: partialPayload } as never);
+    expect(scored).toEqual([SESSION_A]);
+    expect(rpcCalls).toHaveLength(1);
+    expect(rpcCalls[0].p_attempt_id).toBeNull();
+    expect(rpcCalls[0].p_engagement_id).toBe(ENGAGEMENT_A);
+  });
+
+  it('(d) a clean job still scores and posts ATTEMPT-scoped', async () => {
+    const scored: string[] = [];
+    const { client, rpcCalls, appointmentFilters } = makeAssessmentClient({});
+    const handler = createPhoneAssessmentHandler({
+      client: client as never,
+      score: async (sessionId) => { scored.push(sessionId); },
+    });
+    await handler({ payload: { session_id: SESSION_A, attempt_id: ATTEMPT_A } } as never);
+    expect(scored).toEqual([SESSION_A]);
+    expect(rpcCalls).toHaveLength(1);
+    expect(rpcCalls[0].p_attempt_id).toBe(ATTEMPT_A);
+    expect(rpcCalls[0].p_engagement_id).toBeNull();
+    // The guard ran for the CLEAN job too — it keys on every job.
+    expect(appointmentFilters).toEqual([['confirmed_from_attempt_id', ATTEMPT_A]]);
+  });
+
+  it('(e) a FULLY covered (partial=false) callback attempt is also skipped', async () => {
+    // payloadPartial reports 5/5 coverage as partial=false, so a guard keyed on
+    // `partial` would miss this leg. It keys on the attempt instead.
+    const scored: string[] = [];
+    const { client, rpcCalls } = makeAssessmentClient({
+      engagementId: ENGAGEMENT_A,
+      callbackAppointment: 'row',
+    });
+    const handler = createPhoneAssessmentHandler({
+      client: client as never,
+      score: async (sessionId) => { scored.push(sessionId); },
+    });
+    await handler({
+      payload: { ...partialPayload, covered: 5, total: 5 },
+    } as never);
+    expect(scored).toHaveLength(0);
+    expect(rpcCalls).toHaveLength(0);
+  });
+
+  it('a malformed payload still throws malformed BEFORE the guard reads anything', async () => {
+    const { client, appointmentFilters } = makeAssessmentClient({ callbackAppointment: 'row' });
+    const handler = createPhoneAssessmentHandler({ client: client as never, score: async () => {} });
+    await expect(handler({ payload: { session_id: SESSION_A } } as never))
+      .rejects.toThrow('malformed_phone_assessment_payload');
+    expect(appointmentFilters).toHaveLength(0);
   });
 });

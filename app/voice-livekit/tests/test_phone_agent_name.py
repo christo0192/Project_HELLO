@@ -17,8 +17,10 @@ What this file pins (runs on bare python3, SDK stubbed via the shared
   * ``_phone_agent_name()`` stays the base — phone-mode detection and room
     ownership must not depend on which machine a worker runs on;
   * the browser worker's options and ready post are untouched;
-  * PR-A ships the flag ABSENT from fly.phone.toml (flipped in PR-B only once
-    the API stores names) and sets kill_timeout so a stop drains.
+  * PR-A shipped the flag ABSENT from fly.phone.toml; PR-B (M009 B6) flips it
+    to exactly "true" now that the API stores names, and the SHIPPED [env]
+    resolves to the per-machine name on a well-formed machine id. kill_timeout
+    is set so a stop drains.
 """
 
 from __future__ import annotations
@@ -340,16 +342,53 @@ class TestPrewarmReadyPostAgentName(unittest.TestCase):
 
 
 class TestPhoneFlyConfig(unittest.TestCase):
-    """PR-A deploy posture for the phone app (fly.phone.toml)."""
+    """Deploy posture for the phone app (fly.phone.toml): PR-A's kill_timeout
+    plus PR-B's (M009 B6) per-machine registration flip."""
 
     def setUp(self):
         self.text = (_CTX / "fly.phone.toml").read_text(encoding="utf-8")
         self.cfg = tomllib.loads(self.text)
 
-    def test_per_machine_flag_is_absent_in_pr_a(self):
-        # Flipped in PR-B, only once the API that accepts and stores names is
-        # live — the old strict /ready-machine schema would 400 the new key.
-        self.assertNotIn("PHONE_PER_MACHINE_AGENT_NAME", self.cfg.get("env", {}))
+    def test_per_machine_flag_is_exactly_true_in_pr_b(self):
+        # Flipped in PR-B, only once PR-A's API that accepts and stores names
+        # is live — the old strict /ready-machine schema would 400 the new key.
+        # Exactly "true": the reader also accepts " TRUE " etc., but the deploy
+        # validator pins the literal so the manifest says what it means.
+        self.assertEqual(self.cfg.get("env", {}).get("PHONE_PER_MACHINE_AGENT_NAME"), "true")
+
+    def test_shipped_env_registers_per_machine_name(self):
+        # The SHIPPED [env] (orchestration posture, base name and flag exactly
+        # as deployed) plus a well-formed Fly machine id resolves to
+        # `<base>-<id>`, and the prewarm ready post reports that name — the two
+        # ends the API pairs to dispatch a leased session to its own machine.
+        env = self.cfg.get("env", {})
+        shipped = {
+            k: env[k]
+            for k in ("WORKER_ORCHESTRATION", "PHONE_AGENT_NAME", "PHONE_PER_MACHINE_AGENT_NAME")
+        }
+        base = shipped["PHONE_AGENT_NAME"]
+        with _Env({**shipped, "FLY_MACHINE_ID": _MACHINE}):
+            self.assertEqual(agent.phone_registered_agent_name(), f"{base}-{_MACHINE}")
+            # Phone-mode detection and room ownership still key off the base.
+            self.assertEqual(agent._phone_agent_name(), base)
+        kwargs = _prewarm_post_kwargs({**shipped, "FLY_MACHINE_ID": _MACHINE})
+        self.assertIsNotNone(kwargs)
+        self.assertEqual(kwargs.get("agent_name"), f"{base}-{_MACHINE}")
+
+    def test_shipped_env_falls_back_to_base_without_a_machine_id(self):
+        # Rollback-safe floor: with the flag on but no usable machine id the
+        # worker registers the BASE name and posts no agent_name, so it and the
+        # API still agree on the shared name.
+        env = self.cfg.get("env", {})
+        shipped = {
+            k: env[k]
+            for k in ("WORKER_ORCHESTRATION", "PHONE_AGENT_NAME", "PHONE_PER_MACHINE_AGENT_NAME")
+        }
+        with _Env(shipped):
+            self.assertEqual(agent.phone_registered_agent_name(), shipped["PHONE_AGENT_NAME"])
+        kwargs = _prewarm_post_kwargs(shipped)
+        self.assertIsNotNone(kwargs)
+        self.assertNotIn("agent_name", kwargs)
 
     def test_kill_timeout_lets_a_stop_drain(self):
         # Fly's default 5 s force-kill defeats the SDK drain; the configured

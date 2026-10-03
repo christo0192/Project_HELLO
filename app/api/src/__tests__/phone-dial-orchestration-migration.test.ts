@@ -86,8 +86,10 @@ const code = (lines: string[]): string[] =>
 const stripComments = (sql: string): string => sql.replace(/--[^\n]*/g, '');
 
 describe('0112 — harness registration', () => {
-  it('is the NEWEST entry, so the extractors read its reclaim body', () => {
-    expect(PHONE_MIGRATIONS[0].name).toBe('0112');
+  it('is registered ahead of 0096, so the extractors read its reclaim body', () => {
+    // ORDER, NOT POSITION: 0113 (PR-B) now leads. What the extractors depend
+    // on is that 0112 is present and outranks the body it supersedes.
+    expect(PHONE_MIGRATIONS.findIndex((m) => m.name === '0112')).toBeGreaterThan(-1);
     expect(PHONE_MIGRATIONS.findIndex((m) => m.name === '0112')).toBeLessThan(
       PHONE_MIGRATIONS.findIndex((m) => m.name === '0096'),
     );

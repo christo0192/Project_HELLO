@@ -1284,22 +1284,37 @@ export function createPhoneRuntime(
           // nowhere, which is all its evidence can support: the per-item
           // transcript writer is fire-and-forget, so a real screening can
           // read as never-started.
-          try {
-            await queue.enqueue(
-              PHONE_ASSESSMENT_QUEUE,
-              {
-                session_id: s.sessionId,
-                attempt_id: s.attemptId,
-                partial: true,
-                covered: s.covered,
-                total: s.total,
-                disconnect_reason: s.disconnectReason,
-              },
-              { dedupKey: phoneAssessmentDedupKey(s.sessionId), maxAttempts: 5 },
-            );
-          } catch {
-            // Best-effort: the next pass re-selects and re-enqueues. Do not
-            // let one session's enqueue failure abort the loop for the others.
+          //
+          // 0113 (E4) — the ONE exception: a leg whose latest attempt is the
+          // exact `confirmed_from_attempt_id` of a booked callback. That leg
+          // ended because the candidate confirmed a callback; it is a deferral,
+          // not a screening. Scoring it would publish a provisional reject to
+          // Ashby (consuming the one-per-link scorecard) and post a stranded
+          // completion that terminates an engagement that must stay
+          // `scheduled`. The RPC has already finalized it (MP3 kept) and does
+          // not re-select it — the in_progress arm now finds it `completed`,
+          // and the expired/grace_timeout arm excludes callback legs — so this
+          // skip does NOT reintroduce the starvation described above. The
+          // assessment handler re-checks the same predicate before score() as
+          // a belt (it also covers jobs queued before this deploy).
+          if (!s.callbackBooked) {
+            try {
+              await queue.enqueue(
+                PHONE_ASSESSMENT_QUEUE,
+                {
+                  session_id: s.sessionId,
+                  attempt_id: s.attemptId,
+                  partial: true,
+                  covered: s.covered,
+                  total: s.total,
+                  disconnect_reason: s.disconnectReason,
+                },
+                { dedupKey: phoneAssessmentDedupKey(s.sessionId), maxAttempts: 5 },
+              );
+            } catch {
+              // Best-effort: the next pass re-selects and re-enqueues. Do not
+              // let one session's enqueue failure abort the loop for the others.
+            }
           }
           // Bounded, PII-free structured line. The logger allowlist carries
           // only `error_category`/`error_type` for this event, so coverage and
@@ -1313,11 +1328,14 @@ export function createPhoneRuntime(
             // `ns.1` is 0095's addition and the one the owner asked to be able
             // to see: this call never reached a question, so it was NOT
             // scored and the engagement was released for a redial. Still
-            // bounded and SAFE_IDENT-shaped, still no PII.
+            // bounded and SAFE_IDENT-shaped, still no PII. `cb.1` (0113, E4)
+            // marks a confirmed-callback leg: finalized, deliberately NOT
+            // queued for scoring. The worst realistic tag
+            // (`...:c-1:t-1:mp3.1:sc.1:ns.1:cb.1`) is 51 chars, under the 64 cap.
             error_category:
               `phone_partial_finalize:c${cov}:t${tot}` +
               `:mp3.${s.recordingPresent ? 1 : 0}:sc.${s.assessmentPresent ? 1 : 0}` +
-              `:ns.${s.neverStarted ? 1 : 0}`,
+              `:ns.${s.neverStarted ? 1 : 0}:cb.${s.callbackBooked ? 1 : 0}`,
             error_type: s.disconnectReason,
           });
         }

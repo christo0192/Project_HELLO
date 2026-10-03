@@ -77,6 +77,31 @@ export function createPhoneAssessmentHandler(
     // captured before the disconnect and never depends on the recording.
     const partial = payloadPartial(job.payload);
 
+    // 0113 (E4) — CALLBACK-LEG GUARD, before ANY score() call, for EVERY job.
+    // A leg whose attempt is the exact `confirmed_from_attempt_id` of a booked
+    // callback ended because the candidate CONFIRMED a callback: it is a
+    // deferral, not a screening. Scoring it published a provisional reject to
+    // Ashby (consuming the one-per-link scorecard) and the stranded completion
+    // below then terminated an engagement that had to stay `scheduled` for the
+    // slot. The partial-finalize tick already skips these; this is the belt —
+    // it also covers jobs queued before the deploy. It keys on attemptId for
+    // every job, not only `partial`, because payloadPartial reports a fully
+    // covered callback leg as partial=false.
+    //
+    // A read error THROWS (bounded queue retry) rather than scoring on: a
+    // scorecard published to Ashby cannot be retracted, so fail closed.
+    const callbackLeg = await options.client
+      .from('phone_appointments')
+      .select('id')
+      .eq('confirmed_from_attempt_id', attemptId)
+      .maybeSingle();
+    if (callbackLeg.error) throw new Error('phone_assessment_callback_check_failed');
+    if (callbackLeg.data != null) {
+      // Not scored, nothing posted. The session is already finalized (MP3 and
+      // transcript kept); the engagement stays with its callback.
+      return;
+    }
+
     // A scoring failure must fail the queue claim so the existing bounded retry
     // policy can retry it. No terminal event is posted until scoring succeeds.
     // The interlock is preserved: the assessment ROW is written HERE, before

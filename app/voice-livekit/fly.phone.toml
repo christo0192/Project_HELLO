@@ -73,7 +73,13 @@ kill_timeout = 300
   # cold-boot drill measured 29s/29s boot-to-registered vs the 75s ready
   # budget. Pairs with WORKER_ORCHESTRATION=true on the API app (set at
   # activation, per docs/runbooks/phone-worker-orchestration-activation.md).
-  # ROLLBACK: scale the worker back up FIRST, then flip the API flag off.
+  # ROLLBACK, in this order: (1) remove PHONE_PER_MACHINE_AGENT_NAME below
+  # and redeploy phone-voice, so every worker registers the shared
+  # `phone-screener` name again; (2) scale the worker back up; (3) only then
+  # flip the API flag off. With the API flag off there is no dial gate, so
+  # the API dispatches to the shared name with no join barrier: a worker
+  # still registered per-machine never takes the job and the candidate
+  # picks up to silence.
   WORKER_ORCHESTRATION = "worker"
   COMPANY_NAME = "Interview Kickstart"
   SUPABASE_SCHEMA = "screening_v2"
@@ -393,8 +399,36 @@ kill_timeout = 300
   # deploy validator rejects an empty/absent PHONE_AGENT_NAME in this config.
   # This is a dispatch name, not a secret and not the SIP trunk value.
   PHONE_AGENT_NAME = "phone-screener"
+  # M009 E2 flip (PR-B): register as `phone-screener-<FLY_MACHINE_ID>` so the
+  # API dispatches a leased session to exactly its leased machine, not to
+  # whichever pool machine is idle (a live call on the "wrong" machine was
+  # stopped mid-interview by the reaper / terminal release, which stop the
+  # machine by its LEASE). The ready post then carries agent_name, which only
+  # PR-A's /ready-machine accepts — flipped here, not in PR-A, once PR-A's API
+  # is live. Exactly "true" (validate-voice-worker-apps.mjs rejects any other
+  # value; the worker would read it as OFF). PHONE_AGENT_NAME above stays the
+  # base: phone-mode detection and room ownership never use the per-machine
+  # name.
+  # ROLLBACK: remove to return to the shared phone-screener name; the API needs
+  # no change. This removal MUST precede any API WORKER_ORCHESTRATION off-flip
+  # (see the PLAN B ROLLBACK order above).
+  PHONE_PER_MACHINE_AGENT_NAME = "true"
   PHONE_EVENT_TIMEOUT_SEC = "10"
-  PHONE_PARTICIPANT_WAIT_SEC = "45"
+  # M009 E6: the ring is now measured to the REAL answer (sip.callStatus
+  # 'active' or the agent track subscribed), not to SIP-participant presence,
+  # which LiveKit reaches when it starts dialing. 45 -> 60 so a late pickup at
+  # 46-51 s (seen in production) is not cut off. The answer wait shares this
+  # budget from the start of the participant wait. Lease check: the API's 240 s
+  # admission lease covers boot (<= 32 s) + PR-A's agent-join wait (<= 20 s)
+  # + this 60 s ring with > 2x margin (asserted in tests/test_phone_answer.py).
+  PHONE_PARTICIPANT_WAIT_SEC = "60"
+  # M009 E6 answer signal. "sip_status" waits for a real pickup before posting
+  # call.answered, recording or speaking, and posts call.no_answer / call.busy /
+  # call.failed for a leg nobody answered. KILL SWITCH, no deploy needed:
+  #   fly secrets set PHONE_ANSWER_SIGNAL=presence -a project-hello-phone-voice
+  # restores presence-as-answer (the pre-E6 gate). A Fly SECRET of the same
+  # name shadows this line, so unset it again after the incident.
+  PHONE_ANSWER_SIGNAL = "sip_status"
   # RCA 2026-09-09: this is now the BACKSTOP wall clock for the WHOLE consent
   # classification (raised 20->40). Each individual answer — the first, and the
   # answer after the single re-ask — is bounded by PHONE_CLASSIFY_ANSWER_TIMEOUT_SEC

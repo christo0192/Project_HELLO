@@ -101,10 +101,18 @@ const phoneWorkerLog = createLogger('phone-worker');
 /**
  * The CLOSED set of events the worker may post.
  *
- * `sip.originate_*` are absent on purpose: those are the PROVIDER's verdicts
- * and arrive through the signed webhook, which is a different trust boundary.
- * A worker that could post them could manufacture a no-answer for a call that
- * was answered — and that charges a real candidate's anti-harassment budget.
+ * `sip.originate_*` STAY PROVIDER-ONLY: those are the provider's verdicts and
+ * arrive through the signed webhook (or the reconciler), a different trust
+ * boundary, and their ledger edges carry no attempt-state guard.
+ *
+ * The worker's OWN pre-answer verdicts (0113 / E6) are `call.no_answer`,
+ * `call.busy` and `call.failed`. They charge the same budgets, so the fence is
+ * not this list but the LEDGER: 0113's apply_phone_event applies them only
+ * while the engagement is `dialing` and the attempt is still `admitted`/
+ * `ringing` with `answered_at` null — anything else is `unexpected_event` and
+ * charges nothing — plus the epoch fence against a superseded leg. So a buggy
+ * or replayed worker cannot turn an ANSWERED call into a no-answer, which is
+ * the harm the provider-only rule exists to prevent.
  */
 /**
  * The events after which the engagement's recordings are destroyed before the
@@ -143,6 +151,14 @@ export const WORKER_PHONE_EVENTS = [
   // moves the engagement nowhere — it is not consent. Added to the closed
   // vocabulary so the new first-class event can reach apply_phone_event.
   'call.answered',
+  // M009 E6 (0113): the leg was NEVER answered — a ring-out, a reject, or a
+  // SIP trunk failure, decided by the worker's real-answer wait. The ledger
+  // refuses them unless the attempt is still pre-answer (see above). Neither
+  // the post-apply recording hook (call.answered / disclosure.delivered only)
+  // nor PURGE_BEFORE_EVENTS matches them: an unanswered leg has no audio.
+  'call.no_answer',
+  'call.busy',
+  'call.failed',
   'classify.human',
   'classify.machine',
   'disclosure.delivered',

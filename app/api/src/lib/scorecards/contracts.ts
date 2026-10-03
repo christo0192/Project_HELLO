@@ -8,6 +8,71 @@ export const SCORECARD_MAX_INSTRUCTION_LENGTH = 1_000 as const;
 export const SCORECARD_MAX_RUBRIC_DESCRIPTION_LENGTH = 500 as const;
 export const SCORECARD_MAX_RATIONALE_LENGTH = 1_000 as const;
 export const SCORECARD_MAX_EVIDENCE_REFS = 10 as const;
+/**
+ * Per-entry evidenceRefs limit (UTF-16 units). Same value the validator always
+ * enforced as a bare literal; named so the prompt, the normalizer and the
+ * validator can never drift apart. The prompt asks for 80 to leave headroom.
+ */
+export const SCORECARD_MAX_EVIDENCE_REF_LENGTH = 100 as const;
+
+/**
+ * Stable, PII-free codes for every ScorecardValidationError throw site.
+ *
+ * WHY: the queue stores only an error message that matches
+ * `^[a-z][a-z0-9_.:-]{2,63}$` (runner.ts sanitizeErrorCode); every sentence-style
+ * validation message collapsed to 'unknown_error', so a DLQ'd scorecard never
+ * said WHICH rule rejected the model output. Each code also passes the logger's
+ * SAFE_IDENT_RE and the v_funnel_failures regex, so it can be logged as
+ * `rejection_reason` and stored in job_queue/job_dlq verbatim.
+ *
+ * 'scorecard_invalid:config' is the default and covers every failure of the
+ * recruiter-authored configuration (metrics, rubric, weights, scale): those are
+ * never repaired by re-asking the model.
+ */
+export const SCORECARD_VALIDATION_CODES = [
+  'scorecard_invalid:config',
+  // parseResults (scorer.ts): the top-level output shape
+  'scorecard_invalid:output_not_object',
+  'scorecard_invalid:results_missing',
+  'scorecard_invalid:result_not_object',
+  // validateMetricResults (domain.ts): count and ids
+  'scorecard_invalid:result_count',
+  'scorecard_invalid:unknown_metric_id',
+  'scorecard_invalid:duplicate_metric_id',
+  // status and score pairing
+  'scorecard_invalid:evidence_status',
+  'scorecard_invalid:score_not_integer_1_4',
+  'scorecard_invalid:insufficient_with_score',
+  // rationale (a non-text rationale reports rationale_empty)
+  'scorecard_invalid:rationale_empty',
+  'scorecard_invalid:rationale_too_long',
+  // evidence refs
+  'scorecard_invalid:evidence_refs_not_array',
+  'scorecard_invalid:evidence_refs_too_many',
+  'scorecard_invalid:evidence_ref_not_string',
+  'scorecard_invalid:evidence_ref_too_long',
+] as const;
+export type ScorecardValidationCode = (typeof SCORECARD_VALIDATION_CODES)[number];
+
+/**
+ * One label per presentation-only fix normalizeModelResults may apply. Each
+ * applied rule is logged as its own event (never joined), so after deploy the
+ * logs show which benign output classes actually occur — truncation makes
+ * evidence_ref_too_long unreachable, so the rule log is the only witness left.
+ */
+export const SCORECARD_NORMALIZATION_RULES = [
+  'evidence_ref_truncated',
+  'evidence_refs_capped',
+  'evidence_refs_coerced_array',
+  'evidence_ref_dropped',
+  'rationale_truncated',
+  'score_string_coerced',
+  'insufficient_score_nullified',
+  'evidence_status_canonicalized',
+  'metric_id_trimmed',
+  'extra_keys_stripped',
+] as const;
+export type ScorecardNormalizationRule = (typeof SCORECARD_NORMALIZATION_RULES)[number];
 
 /**
  * Rubric scale — FOUR levels since 2026-09-10 (owner decision, #275/#284):

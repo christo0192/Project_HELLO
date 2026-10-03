@@ -2058,7 +2058,7 @@ paths:
       tags: [phone]
       operationId: postPhoneWorkerEvent
       summary: Post one phone screening event from the named phone voice worker
-      description: Internal, service-authenticated surface for the named phone voice worker. Uses the SAME constant-time WORKER_CONTEXT_SECRET boundary as the scoring callback, not a recruiter session, and is mounted before recruiter auth. The event vocabulary is a CLOSED allowlist, deliberately narrower than apply_phone_event's open event-type FORMAT: the open format exists so an unrecognised PROVIDER event stays recordable, but the worker is our own code with exactly one legitimate vocabulary, and an event outside it is refused before any database work. The sip.originate_* verdicts are absent on purpose — those are the provider's, arrive through the signed webhook, and a worker able to post them could manufacture a no-answer for a call that was answered, charging a real candidate's anti-harassment budget. Disabled by default: answers 503 while PHONE_SCREENING_ENABLED is off, having performed no database work. Duplicate posts converge on the original verdict via the deterministic synthetic provider id 0042 mints for internal events.
+      description: Internal, service-authenticated surface for the named phone voice worker. Uses the SAME constant-time WORKER_CONTEXT_SECRET boundary as the scoring callback, not a recruiter session, and is mounted before recruiter auth. The event vocabulary is a CLOSED allowlist, deliberately narrower than apply_phone_event's open event-type FORMAT: the open format exists so an unrecognised PROVIDER event stays recordable, but the worker is our own code with exactly one legitimate vocabulary, and an event outside it is refused before any database work. The sip.originate_* verdicts are absent on purpose — those are the provider's, arrive through the signed webhook, and their ledger edges carry no attempt-state guard. The worker's own pre-answer verdicts (0113) — call.no_answer, call.busy, call.failed — are fenced at the ledger instead: apply_phone_event applies them only while the engagement is dialing and the attempt is still admitted/ringing with answered_at null (anything else is unexpected_event and charges nothing), plus the epoch fence, so no worker post can turn an answered call into a no-answer charged against a real candidate's anti-harassment budget. Disabled by default: answers 503 while PHONE_SCREENING_ENABLED is off, having performed no database work. Duplicate posts converge on the original verdict via the deterministic synthetic provider id 0042 mints for internal events.
       security:
         - workerBearer: []
       requestBody:
@@ -9197,8 +9197,12 @@ components:
           description: The live attempt. Required for EVERY event: an engagement-scoped post cannot drive an attempt-scoped edge, and 0042 refuses one with attempt_required rather than applying half a transition.
         event_type:
           type: string
-          description: CLOSED worker vocabulary. Narrower than apply_phone_event's open format on purpose — the provider's sip.originate_* verdicts are excluded because they charge a candidate's anti-harassment budget.
+          description: CLOSED worker vocabulary, identical to WORKER_PHONE_EVENTS in routes/phone-worker.ts (pinned by parity-phone-worker-events.test.ts). Narrower than apply_phone_event's open format on purpose — the provider's sip.originate_* verdicts are excluded because their ledger edges are unguarded; the worker's pre-answer call.no_answer / call.busy / call.failed are ledger-fenced to an unanswered attempt.
           enum:
+            - call.answered
+            - call.no_answer
+            - call.busy
+            - call.failed
             - classify.human
             - classify.machine
             - disclosure.delivered
@@ -9206,6 +9210,7 @@ components:
             - candidate.opt_out
             - candidate.wrong_number
             - candidate.deferred_pre_disclosure
+            - consent.failed
             - sip.participant_left
             - assessment.completed
             - assessment.aborted

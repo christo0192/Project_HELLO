@@ -15,6 +15,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { runAssessment, injectAssessmentRunner } from '../services/assessment.js';
 import type { Assessment } from '../lib/types.js';
+import { ScorecardValidationError } from '../lib/scorecards/domain.js';
+import { DeepseekError } from '../lib/deepseek.js';
 import type {
   RoleScorecardVersion,
   ScorecardMetricModelResult,
@@ -303,6 +305,44 @@ describe('v2 branch — a role with an active scorecard', () => {
       'unknown_event',
       expect.objectContaining({ error_category: 'scorecard_scoring_failed' }),
     );
+  });
+
+  it('E5: a validation failure rethrows Error(<code>) with the cause, and logs rejection_reason', async () => {
+    // Both the first answer and the one repair resample break the same rule.
+    const bad = modelResults([4, 3, 1]);
+    (bad[0] as { score: number }).score = 5;
+    runClaudeJSONWithProvenance.mockResolvedValue({ data: { results: bad }, requestedModel: 'deepseek-v4-pro' });
+
+    const err = await runAssessment(SESSION_ID).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(Error);
+    expect(err).not.toBeInstanceOf(ScorecardValidationError);
+    expect((err as Error).message).toBe('scorecard_invalid:score_not_integer_1_4');
+    const cause = (err as Error & { cause?: unknown }).cause;
+    expect(cause).toBeInstanceOf(ScorecardValidationError);
+    expect((cause as ScorecardValidationError).code).toBe('scorecard_invalid:score_not_integer_1_4');
+    // Exactly one repair inference, then fail closed.
+    expect(runClaudeJSONWithProvenance).toHaveBeenCalledTimes(2);
+    expect(callsFor('assessments', 'insert')).toHaveLength(0);
+    expect(callsFor('candidates', 'update')).toHaveLength(0);
+    expect(loggerWarn).toHaveBeenCalledWith(
+      'unknown_event',
+      expect.objectContaining({
+        error_category: 'scorecard_scoring_failed',
+        error_type: 'ScorecardValidationError',
+        rejection_reason: 'scorecard_invalid:score_not_integer_1_4',
+      }),
+    );
+  });
+
+  it('E5: a provider error is rethrown unchanged (no code wrapping, no repair)', async () => {
+    const providerError = new DeepseekError('timeout');
+    runClaudeJSONWithProvenance.mockRejectedValue(providerError);
+    await expect(runAssessment(SESSION_ID)).rejects.toBe(providerError);
+    expect(runClaudeJSONWithProvenance).toHaveBeenCalledTimes(1);
+    expect(callsFor('assessments', 'insert')).toHaveLength(0);
+    const warnMeta = loggerWarn.mock.calls.find(([, meta]) =>
+      (meta as { error_category?: string }).error_category === 'scorecard_scoring_failed')?.[1] as Record<string, unknown>;
+    expect(warnMeta.rejection_reason).toBeUndefined();
   });
 
   it('a phone v2 assessment carries source=phone and revision=1 (index coverage)', async () => {

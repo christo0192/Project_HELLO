@@ -90,6 +90,21 @@ describe('buildScorecardPrompt', () => {
     expect(prompt).toContain('"score" to the integer 1..4');
   });
 
+  it('E5: states the real evidence, score and rationale limits the validator enforces', () => {
+    // Without a number the model pasted whole candidate answers as refs, and
+    // one >100-character ref failed the entire scorecard.
+    expect(prompt).toContain('80 characters');
+    expect(prompt).toContain('hard limit 100');
+    expect(prompt).toContain('at most 5 entries');
+    expect(prompt).toContain('quote only the Candidate');
+    expect(prompt).toContain('JSON integer');
+    expect(prompt).toContain('JSON null');
+    expect(prompt).toContain('never omitted');
+    expect(prompt).toContain('at most 900 characters (hard limit 1000)');
+    // Owner style choice: the rationale is still asked to be verbose.
+    expect(prompt).toContain('verbose');
+  });
+
   it('forbids copying personal identifiers into the rationale', () => {
     // The rationale is written verbatim onto the Ashby summary, so the prompt
     // must bar phone numbers / emails / addresses / third-party names from it.

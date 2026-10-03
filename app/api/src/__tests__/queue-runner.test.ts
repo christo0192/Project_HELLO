@@ -11,6 +11,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { Queue } from '../lib/queue/index.js';
 import { MemoryAdapter } from '../lib/queue/memory-adapter.js';
 import { createQueueRunner, nextPollDelayMs, sanitizeErrorCode, UNKNOWN_ERROR_CODE } from '../lib/queue/runner.js';
+import { ScorecardValidationError } from '../lib/scorecards/domain.js';
 
 
 /**
@@ -376,5 +377,36 @@ describe('sanitizeErrorCode — nothing raw reaches the queue error column or th
     expect(failed).toEqual([UNKNOWN_ERROR_CODE]);
     expect(failed.join()).not.toContain('a@b.example');
     expect(failed.join()).not.toContain('15551234567');
+  });
+
+  it('E5: stores a scorecard validation code verbatim instead of unknown_error', async () => {
+    // services/assessment.ts rethrows a ScorecardValidationError as
+    // Error(<code>, { cause }). The code is what job_queue/job_dlq must store;
+    // the sentence message on the cause would collapse to unknown_error.
+    const cause = new ScorecardValidationError('metric evidence references are invalid', 'scorecard_invalid:evidence_ref_too_long');
+    expect(sanitizeErrorCode(cause)).toBe(UNKNOWN_ERROR_CODE); // the pre-E5 symptom
+    const { queue } = makeQueue();
+    await queue.enqueue('q.a', {}, { maxAttempts: 1 });
+    const failed: string[] = [];
+    const facade = {
+      claim: queue.claim.bind(queue),
+      heartbeat: queue.heartbeat.bind(queue),
+      completeClaim: queue.completeClaim.bind(queue),
+      failClaim: async (_id: string, _t: string, message: string) => {
+        failed.push(message);
+        return 'dead_lettered' as const;
+      },
+    };
+    const runner = createQueueRunner({
+      queue: facade as never,
+      handlers: {
+        'q.a': async () => { throw new Error(cause.code, { cause }); },
+      },
+      owner: 'w1', leaseSeconds: 30, pollMs: 1000,
+    });
+    await runner.tick();
+    await runner.stop();
+
+    expect(failed).toEqual(['scorecard_invalid:evidence_ref_too_long']);
   });
 });

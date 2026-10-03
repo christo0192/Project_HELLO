@@ -16391,6 +16391,783 @@ end;
 $$;
 
 -- ═══════════════════════════════════════════════════════════════════════
+-- 0113 / M009 E6 — the worker's PRE-ANSWER verdicts
+--
+-- `call.no_answer` / `call.busy` / `call.failed` are posted by the worker when
+-- its real-answer wait ends without an answer. The ledger applies them ONLY
+-- from `dialing` with the attempt still `admitted`/`ringing` and `answered_at`
+-- null, through the existing charge ladder; every other shape is
+-- `unexpected_event` and charges nothing. Dates are after the 0085 24/7
+-- override and away from 0111's owner test night, so the normal IST window
+-- (09:00 open) is in force. Neutral fixture labels only.
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- (a) the three verdicts from dialing + admitted/ringing
+do $$
+declare
+  v_t   timestamptz := '2026-10-06T06:00:00Z';   -- Tue 11:30 IST
+  v_eng uuid; v_att uuid; v_res jsonb; v_ev jsonb;
+  v_astate text; v_out text; v_tok text; v_ans timestamptz;
+  v_state text; v_na integer; v_pf integer; v_nea timestamptz; v_term timestamptz;
+begin
+  -- call.no_answer from admitted.
+  v_eng := _policy_tests.phone_fixture('pol113-e6-na');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+  v_ev  := screening_v2.apply_phone_event('internal', 'call.no_answer', v_att, null,
+             null, (v_res->>'epoch')::integer, null, v_t + interval '61 seconds');
+  select state, outcome_class, lease_token::text, answered_at
+    into v_astate, v_out, v_tok, v_ans
+    from screening_v2.phone_call_attempts where id = v_att;
+  select state, no_answer_attempts, provider_failures, terminal_at
+    into v_state, v_na, v_pf, v_term
+    from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0113-E6-a: call.no_answer from dialing+admitted ends the attempt as no_answer and charges one no-answer',
+    v_res->>'status' = 'ok' and v_ev->>'status' = 'applied'
+      and v_astate = 'ended' and v_out = 'no_answer' and v_tok is null and v_ans is null
+      and v_state = 'awaiting_retry' and v_na = 1 and v_pf = 0 and v_term is null,
+    'admit=' || coalesce(v_res->>'status', '<null>') || ' event=' || coalesce(v_ev::text, '<null>')
+      || ' attempt=' || coalesce(v_astate, '<null>') || '/' || coalesce(v_out, '<null>')
+      || ' lease_cleared=' || (v_tok is null)::text
+      || ' engagement=' || coalesce(v_state, '<null>') || ' na=' || coalesce(v_na::text, '<null>')
+      || ' pf=' || coalesce(v_pf::text, '<null>'));
+  perform _policy_tests.phone_teardown('pol113-e6-na');
+
+  -- call.busy from RINGING: same no-answer charge, outcome busy.
+  v_eng := _policy_tests.phone_fixture('pol113-e6-busy');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+  update screening_v2.phone_call_attempts set state = 'ringing' where id = v_att;
+  v_ev  := screening_v2.apply_phone_event('internal', 'call.busy', v_att, null,
+             null, (v_res->>'epoch')::integer, null, v_t + interval '8 seconds');
+  select state, outcome_class, lease_token::text into v_astate, v_out, v_tok
+    from screening_v2.phone_call_attempts where id = v_att;
+  select state, no_answer_attempts, provider_failures into v_state, v_na, v_pf
+    from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0113-E6-a: call.busy from dialing+ringing ends the attempt as busy with the same no-answer charge',
+    v_ev->>'status' = 'applied' and v_astate = 'ended' and v_out = 'busy' and v_tok is null
+      and v_state = 'awaiting_retry' and v_na = 1 and v_pf = 0,
+    'event=' || coalesce(v_ev::text, '<null>') || ' attempt=' || coalesce(v_astate, '<null>')
+      || '/' || coalesce(v_out, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || ' na=' || coalesce(v_na::text, '<null>') || ' pf=' || coalesce(v_pf::text, '<null>'));
+  perform _policy_tests.phone_teardown('pol113-e6-busy');
+
+  -- call.failed: provider_error on the IST-day-paced provider budget.
+  v_eng := _policy_tests.phone_fixture('pol113-e6-failed');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+  v_ev  := screening_v2.apply_phone_event('internal', 'call.failed', v_att, null,
+             null, (v_res->>'epoch')::integer, null, v_t + interval '3 seconds');
+  select state, outcome_class, lease_token::text into v_astate, v_out, v_tok
+    from screening_v2.phone_call_attempts where id = v_att;
+  select state, no_answer_attempts, provider_failures, next_eligible_at
+    into v_state, v_na, v_pf, v_nea
+    from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0113-E6-a: call.failed ends the attempt as provider_error, charges the provider budget, defers to the next IST-day window',
+    v_ev->>'status' = 'applied' and v_astate = 'ended' and v_out = 'provider_error'
+      and v_tok is null and v_state = 'eligible' and v_na = 0 and v_pf = 1
+      -- Wed 2026-10-07 09:00 IST, the first legal instant of the next IST day.
+      and v_nea = '2026-10-07T03:30:00Z'::timestamptz,
+    'event=' || coalesce(v_ev::text, '<null>') || ' attempt=' || coalesce(v_astate, '<null>')
+      || '/' || coalesce(v_out, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || ' na=' || coalesce(v_na::text, '<null>') || ' pf=' || coalesce(v_pf::text, '<null>')
+      || ' next_eligible_at=' || coalesce(v_nea::text, '<null>'));
+  perform _policy_tests.phone_teardown('pol113-e6-failed');
+end;
+$$;
+
+-- (b) an ANSWERED attempt can never be charged as unanswered
+do $$
+declare
+  v_t   timestamptz := '2026-10-06T06:00:00Z';
+  v_eng uuid; v_att uuid; v_res jsonb; v_ev jsonb; v_bad text := '';
+  v_case text; v_type text; v_astate text; v_before text;
+  v_state text; v_na integer; v_pf integer;
+begin
+  foreach v_case in array array['answered_unclassified','human','admitted_answered_at'] loop
+    foreach v_type in array array['call.no_answer','call.busy','call.failed'] loop
+      v_eng := _policy_tests.phone_fixture('pol113-e6-ans');
+      v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+      v_att := (v_res->>'attempt_id')::uuid;
+      if v_case in ('answered_unclassified','human') then
+        perform screening_v2.apply_phone_event('internal', 'call.answered', v_att, null,
+                  null, (v_res->>'epoch')::integer, null, v_t + interval '20 seconds');
+      end if;
+      if v_case = 'human' then
+        perform screening_v2.apply_phone_event('internal', 'classify.human', v_att, null,
+                  null, (v_res->>'epoch')::integer, null, v_t + interval '22 seconds');
+      end if;
+      if v_case = 'admitted_answered_at' then
+        -- A pre-classification attempt whose answer was already stamped.
+        update screening_v2.phone_call_attempts
+           set answered_at = v_t + interval '20 seconds' where id = v_att;
+      end if;
+      select state into v_before from screening_v2.phone_call_attempts where id = v_att;
+
+      v_ev := screening_v2.apply_phone_event('internal', v_type, v_att, null,
+                null, (v_res->>'epoch')::integer, null, v_t + interval '40 seconds');
+      select state into v_astate from screening_v2.phone_call_attempts where id = v_att;
+      select state, no_answer_attempts, provider_failures into v_state, v_na, v_pf
+        from screening_v2.phone_engagements where id = v_eng;
+      if not (v_ev->>'status' = 'ignored' and v_ev->>'ignored_reason' = 'unexpected_event'
+              and v_astate = v_before and v_state = 'dialing' and v_na = 0 and v_pf = 0) then
+        v_bad := v_bad || v_case || '+' || v_type || ': event=' || coalesce(v_ev::text, '<null>')
+                 || ' attempt=' || coalesce(v_before, '<null>') || '->' || coalesce(v_astate, '<null>')
+                 || ' engagement=' || coalesce(v_state, '<null>')
+                 || ' na=' || coalesce(v_na::text, '<null>') || ' pf=' || coalesce(v_pf::text, '<null>')
+                 || '; ';
+      end if;
+      perform _policy_tests.phone_teardown('pol113-e6-ans');
+    end loop;
+  end loop;
+  perform _policy_tests.assert(
+    '0113-E6-b: against answered_unclassified, human, or admitted-with-answered_at the three verdicts are unexpected_event and charge nothing',
+    v_bad = '', v_bad);
+end;
+$$;
+
+-- (c) redelivery dedups; (d) no_answer_limit=1 goes terminal
+do $$
+declare
+  v_t   timestamptz := '2026-10-06T06:00:00Z';
+  v_eng uuid; v_att uuid; v_res jsonb; v_ev1 jsonb; v_ev2 jsonb;
+  v_state text; v_na integer; v_rows integer; v_term timestamptz; v_out text;
+begin
+  v_eng := _policy_tests.phone_fixture('pol113-e6-dup');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+  -- The worker route posts `internal` with no provider id, so 0042 mints the
+  -- SAME deterministic id for a retry of the same verdict on the same epoch.
+  v_ev1 := screening_v2.apply_phone_event('internal', 'call.no_answer', v_att, null,
+             null, (v_res->>'epoch')::integer, null, v_t + interval '61 seconds');
+  v_ev2 := screening_v2.apply_phone_event('internal', 'call.no_answer', v_att, null,
+             null, (v_res->>'epoch')::integer, null, v_t + interval '75 seconds');
+  select state, no_answer_attempts into v_state, v_na
+    from screening_v2.phone_engagements where id = v_eng;
+  select count(*) into v_rows from screening_v2.phone_call_events
+   where attempt_id = v_att and event_type = 'call.no_answer';
+  perform _policy_tests.assert(
+    '0113-E6-c: a redelivered call.no_answer dedups to the original verdict and charges once',
+    v_ev1->>'status' = 'applied' and v_ev2->>'status' = 'applied'
+      and (v_ev2->>'duplicate')::boolean and v_ev2->>'event_id' = v_ev1->>'event_id'
+      and v_rows = 1 and v_na = 1 and v_state = 'awaiting_retry',
+    'first=' || coalesce(v_ev1::text, '<null>') || ' second=' || coalesce(v_ev2::text, '<null>')
+      || ' rows=' || v_rows || ' na=' || coalesce(v_na::text, '<null>'));
+  perform _policy_tests.phone_teardown('pol113-e6-dup');
+
+  -- A rescreen cycle's budget is ONE: a single ring-out is terminal.
+  v_eng := _policy_tests.phone_fixture('pol113-e6-limit');
+  update screening_v2.phone_engagements set no_answer_limit = 1 where id = v_eng;
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+  v_ev1 := screening_v2.apply_phone_event('internal', 'call.busy', v_att, null,
+             null, (v_res->>'epoch')::integer, null, v_t + interval '10 seconds');
+  select state, no_answer_attempts, terminal_at into v_state, v_na, v_term
+    from screening_v2.phone_engagements where id = v_eng;
+  select outcome_class into v_out from screening_v2.phone_call_attempts where id = v_att;
+  perform _policy_tests.assert(
+    '0113-E6-d: with no_answer_limit=1 one pre-answer verdict spends the budget: abandoned_no_answer, terminal_at set',
+    v_res->>'status' = 'ok' and v_ev1->>'status' = 'applied'
+      and v_state = 'abandoned_no_answer' and v_term is not null and v_na = 1 and v_out = 'busy',
+    'admit=' || coalesce(v_res::text, '<null>') || ' event=' || coalesce(v_ev1::text, '<null>')
+      || ' engagement=' || coalesce(v_state, '<null>') || ' na=' || coalesce(v_na::text, '<null>')
+      || ' terminal_at=' || coalesce(v_term::text, '<null>'));
+  perform _policy_tests.phone_teardown('pol113-e6-limit');
+end;
+$$;
+
+-- (e) terminal engagement; (f) stale epoch
+do $$
+declare
+  v_t   timestamptz := '2026-10-06T06:00:00Z';
+  v_eng uuid; v_att uuid; v_res jsonb; v_ev jsonb; v_epoch integer;
+  v_state text; v_na integer; v_astate text;
+begin
+  v_eng := _policy_tests.phone_fixture('pol113-e6-term');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+  perform screening_v2.apply_phone_event('internal', 'hr.cancelled', v_att, null,
+            null, (v_res->>'epoch')::integer, null, v_t + interval '5 seconds');
+  v_ev := screening_v2.apply_phone_event('internal', 'call.no_answer', v_att, null,
+            null, (v_res->>'epoch')::integer, null, v_t + interval '61 seconds');
+  select state, no_answer_attempts into v_state, v_na
+    from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0113-E6-e: a pre-answer verdict on a terminal engagement is ignored as terminal',
+    v_ev->>'status' = 'ignored' and v_ev->>'ignored_reason' = 'terminal'
+      and v_state = 'cancelled' and v_na = 0,
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || ' na=' || coalesce(v_na::text, '<null>'));
+  perform _policy_tests.phone_teardown('pol113-e6-term');
+
+  v_eng := _policy_tests.phone_fixture('pol113-e6-stale');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+  select epoch into v_epoch from screening_v2.phone_engagements where id = v_eng;
+  -- A newer conversation owns the engagement: the leg posting is superseded.
+  update screening_v2.phone_engagements set epoch = v_epoch + 1 where id = v_eng;
+  v_ev := screening_v2.apply_phone_event('internal', 'call.no_answer', v_att, null,
+            null, v_epoch, null, v_t + interval '61 seconds');
+  select state, no_answer_attempts into v_state, v_na
+    from screening_v2.phone_engagements where id = v_eng;
+  select state into v_astate from screening_v2.phone_call_attempts where id = v_att;
+  perform _policy_tests.assert(
+    '0113-E6-f: a pre-answer verdict carrying a stale epoch is refused and charges nothing',
+    v_ev->>'status' = 'ignored' and v_ev->>'ignored_reason' = 'stale_epoch'
+      and v_state = 'dialing' and v_na = 0 and v_astate = 'admitted',
+    'event=' || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || ' attempt=' || coalesce(v_astate, '<null>') || ' na=' || coalesce(v_na::text, '<null>'));
+  perform _policy_tests.phone_teardown('pol113-e6-stale');
+end;
+$$;
+
+-- (g) the reconciler and the worker racing on one ring-out: first wins, once
+do $$
+declare
+  v_t   timestamptz := '2026-10-06T06:00:00Z';
+  v_eng uuid; v_att uuid; v_res jsonb; v_first jsonb; v_second jsonb;
+  v_state text; v_na integer; v_out text;
+begin
+  -- Reconciler first (attempt admitted, participant gone), worker second.
+  v_eng := _policy_tests.phone_fixture('pol113-e6-race');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+  v_first  := screening_v2.apply_phone_event('reconciliation', 'sip.originate_timeout', v_att, null,
+                null, null, null, v_t + interval '60 seconds');
+  v_second := screening_v2.apply_phone_event('internal', 'call.no_answer', v_att, null,
+                null, (v_res->>'epoch')::integer, null, v_t + interval '61 seconds');
+  select state, no_answer_attempts into v_state, v_na
+    from screening_v2.phone_engagements where id = v_eng;
+  select outcome_class into v_out from screening_v2.phone_call_attempts where id = v_att;
+  perform _policy_tests.assert(
+    '0113-E6-g: after the reconciler''s sip.originate_timeout, call.no_answer is ignored with no second charge',
+    v_first->>'status' = 'applied' and v_second->>'status' = 'ignored'
+      and v_second->>'ignored_reason' = 'unexpected_event'
+      and v_na = 1 and v_state = 'awaiting_retry' and v_out = 'no_answer',
+    'first=' || coalesce(v_first::text, '<null>') || ' second=' || coalesce(v_second::text, '<null>')
+      || ' engagement=' || coalesce(v_state, '<null>') || ' na=' || coalesce(v_na::text, '<null>'));
+  perform _policy_tests.phone_teardown('pol113-e6-race');
+
+  -- The mirror: worker first, reconciler second.
+  v_eng := _policy_tests.phone_fixture('pol113-e6-race2');
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, v_t);
+  v_att := (v_res->>'attempt_id')::uuid;
+  v_first  := screening_v2.apply_phone_event('internal', 'call.busy', v_att, null,
+                null, (v_res->>'epoch')::integer, null, v_t + interval '9 seconds');
+  v_second := screening_v2.apply_phone_event('reconciliation', 'sip.originate_timeout', v_att, null,
+                null, null, null, v_t + interval '60 seconds');
+  select state, no_answer_attempts into v_state, v_na
+    from screening_v2.phone_engagements where id = v_eng;
+  select outcome_class into v_out from screening_v2.phone_call_attempts where id = v_att;
+  perform _policy_tests.assert(
+    '0113-E6-g: after the worker''s call.busy, a late reconciler sip.originate_timeout is ignored with no second charge',
+    v_first->>'status' = 'applied' and v_second->>'status' = 'ignored'
+      and v_na = 1 and v_state = 'awaiting_retry' and v_out = 'busy',
+    'first=' || coalesce(v_first::text, '<null>') || ' second=' || coalesce(v_second::text, '<null>')
+      || ' engagement=' || coalesce(v_state, '<null>') || ' na=' || coalesce(v_na::text, '<null>')
+      || ' outcome=' || coalesce(v_out, '<null>'));
+  perform _policy_tests.phone_teardown('pol113-e6-race2');
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
+-- 0113 / M009 E4 — a booked voice callback is a DEFERRAL, not a screening
+--
+-- The production chain (neutral labels): the candidate confirmed a callback
+-- mid-call; confirm_candidate_voice_callback ended the attempt and moved the
+-- engagement to `scheduled` but left it BOUND to the leg's still-in_progress
+-- session, and left the leg's engagement claim in place. Partial-finalize
+-- then completed the leg, it was scored as a 0-coverage reject, and the
+-- handler's stranded-shape `assessment.completed` drove the engagement
+-- terminal before the slot. These cases replay that sequence (red before
+-- 0113) and pin every arm of the fix: the detach + claim release, the
+-- finalize `callback_booked` flag and expired-arm skip, the stranded-sweep
+-- guard, and the one-time data repair. Same Tue 2026-10-06 11:30 IST anchor
+-- as the E6 block; every callback slot is on Wed 2026-10-07 inside the
+-- window. Neutral fixture labels only.
+-- ═══════════════════════════════════════════════════════════════════════
+
+-- A live, answered, CLASSIFIED and DISCLOSED leg — the shape a candidate is in
+-- when they confirm a callback: engagement `in_call`, attempt `human`, and an
+-- `in_progress` session that the engagement is bound to AND that claims the
+-- engagement (0107 phone_engagement_id), exactly as the dialer leaves it.
+-- The session's start is anchored early so partial-finalize's fleet-wide
+-- `order by started_at limit` always reaches it. p_end = 'disconnected' ends
+-- the attempt as an ordinary hangup (a non-callback partial).
+-- Returns [engagement, attempt, session, candidate, role].
+create or replace function _policy_tests.p113_leg(
+  p_tag text,
+  p_t   timestamptz,
+  p_end text default null
+)
+returns uuid[]
+language plpgsql as $p113l$
+declare
+  v_eng uuid; v_att uuid; v_sess uuid; v_cand uuid; v_role uuid;
+  v_res jsonb; v_epoch integer;
+begin
+  v_eng := _policy_tests.phone_fixture(p_tag);
+  select candidate_id, role_id into v_cand, v_role
+    from screening_v2.phone_engagements where id = v_eng;
+
+  v_res := screening_v2.admit_phone_attempt(v_eng, 'initial', null, 60, p_t);
+  if v_res->>'status' is distinct from 'ok' then
+    raise exception 'p113_leg(%): admission refused: %', p_tag, v_res;
+  end if;
+  v_att   := (v_res->>'attempt_id')::uuid;
+  v_epoch := (v_res->>'epoch')::integer;
+  perform screening_v2.apply_phone_event('internal', 'call.answered', v_att, null,
+            null, v_epoch, null, p_t + interval '20 seconds');
+  perform screening_v2.apply_phone_event('internal', 'classify.human', v_att, null,
+            null, v_epoch, null, p_t + interval '22 seconds');
+  perform screening_v2.apply_phone_event('internal', 'disclosure.delivered', v_att, null,
+            null, v_epoch, null, p_t + interval '40 seconds');
+
+  v_sess := _policy_tests.p112_session(v_cand, v_role, v_eng,
+              '2025-03-01T04:30:00Z'::timestamptz, 'in_progress');
+  update screening_v2.phone_call_attempts set session_id = v_sess where id = v_att;
+  update screening_v2.phone_engagements
+     set session_id = v_sess, updated_at = p_t + interval '40 seconds'
+   where id = v_eng;
+
+  if p_end = 'disconnected' then
+    update screening_v2.phone_call_attempts
+       set state = 'ended', outcome_class = 'disconnected',
+           ended_at = p_t + interval '3 minutes'
+     where id = v_att;
+  end if;
+
+  return array[v_eng, v_att, v_sess, v_cand, v_role];
+end;
+$p113l$;
+
+-- Appointments must go before the tag teardown: phone_teardown deletes
+-- attempts first, and confirmed_from_attempt_id is ON DELETE RESTRICT.
+create or replace function _policy_tests.p113_teardown(p_tag text)
+returns void language plpgsql as $p113t$
+begin
+  delete from screening_v2.phone_appointments
+   where engagement_id in (
+     select e.id from screening_v2.phone_engagements e
+       join screening_v2.ashby_application_links l on l.id = e.application_link_id
+      where l.external_application_id = p_tag || '-app');
+  perform _policy_tests.phone44_teardown(p_tag);
+end;
+$p113t$;
+
+-- The exact production sequence: confirm, then the leg is finalized and
+-- scored and the handler posts the stranded-shape completion.
+do $$
+declare
+  v_t    timestamptz := '2026-10-06T06:00:00Z';   -- Tue 11:30 IST
+  v_slot timestamptz := '2026-10-07T05:30:00Z';   -- Wed 11:00 IST
+  v_ids uuid[]; v_eng uuid; v_att uuid; v_sess uuid; v_new uuid;
+  v_res jsonb; v_res2 jsonb; v_ev jsonb; v_ev2 jsonb; v_meta jsonb;
+  v_state text; v_reason text; v_bound uuid; v_ver integer; v_ver2 integer;
+  v_term timestamptz; v_claim uuid; v_ap_status text; v_ap_from uuid; v_ap_src text;
+begin
+  v_ids := _policy_tests.p113_leg('pol113-e4-reg', v_t);
+  v_eng := v_ids[1]; v_att := v_ids[2]; v_sess := v_ids[3];
+
+  v_res := screening_v2.confirm_candidate_voice_callback(v_att, v_slot, v_t + interval '3 minutes');
+  select state, state_reason, session_id, version into v_state, v_reason, v_bound, v_ver
+    from screening_v2.phone_engagements where id = v_eng;
+  select phone_engagement_id into v_claim from screening_v2.call_sessions where id = v_sess;
+  select status, confirmed_from_attempt_id, source into v_ap_status, v_ap_from, v_ap_src
+    from screening_v2.phone_appointments where id = (v_res->>'appointment_id')::uuid;
+  select metadata into v_meta from screening_v2.audit_events
+   where action = 'phone_callback_confirmed' and target_id = v_res->>'appointment_id'
+   order by created_at desc limit 1;
+  perform _policy_tests.assert(
+    '0113-E4-regression: confirm detaches the engagement from the callback leg and releases the leg''s claim',
+    v_res->>'status' = 'ok'
+      and v_state = 'scheduled' and v_reason = 'candidate_callback_confirmed'
+      and v_bound is null and v_claim is null
+      and v_ap_status = 'confirmed' and v_ap_from = v_att and v_ap_src = 'candidate_voice'
+      and (v_meta->>'session_detached')::boolean is true
+      and (v_meta->>'claim_released')::boolean is true,
+    'a bound callback leg is scored as the screening and ends the engagement before the slot; '
+      || 'confirm=' || coalesce(v_res::text, '<null>')
+      || ' engagement=' || coalesce(v_state, '<null>') || '/' || coalesce(v_reason, '<null>')
+      || ' still_bound=' || (v_bound is not null)::text
+      || ' claim_kept=' || (v_claim is not null)::text
+      || ' appointment=' || coalesce(v_ap_status, '<null>')
+      || ' from_attempt=' || coalesce((v_ap_from = v_att)::text, 'false')
+      || ' audit=' || coalesce(v_meta::text, '<null>'));
+
+  -- The slot dial's createSession: a NEW live session claiming the engagement.
+  -- The leg is still in_progress (live under 0112's index) until finalize.
+  v_new := _policy_tests.p112_try_session(v_ids[4], v_ids[5], v_eng,
+             v_t + interval '4 minutes', 'waiting');
+  perform _policy_tests.assert(
+    '0113-E4-regression: after confirm a fresh session can claim the engagement (no 23505 at the slot)',
+    v_new is not null,
+    'the leg''s live claim makes the slot''s createSession hit uq_call_sessions_phone_engagement, '
+      || 'so the callback is skipped no_session');
+
+  -- Replay: the same attempt returns the same booking and bumps nothing.
+  v_res2 := screening_v2.confirm_candidate_voice_callback(v_att, v_slot, v_t + interval '5 minutes');
+  select version, session_id into v_ver2, v_bound
+    from screening_v2.phone_engagements where id = v_eng;
+  perform _policy_tests.assert(
+    '0113-E4-regression: a confirm replay is idempotent (same appointment, no second version bump)',
+    v_res2->>'status' = 'already_confirmed'
+      and v_res2->>'appointment_id' = v_res->>'appointment_id'
+      and v_ver2 = v_ver and v_bound is null,
+    'first=' || coalesce(v_res::text, '<null>') || ' replay=' || coalesce(v_res2::text, '<null>')
+      || ' version ' || coalesce(v_ver::text, '<null>') || ' -> ' || coalesce(v_ver2::text, '<null>'));
+
+  -- The leg is finalized and scored, then the handler's stranded-shape post.
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'conversation_complete',
+         ended_at = v_t + interval '6 minutes'
+   where id = v_sess;
+  insert into screening_v2.assessments
+    (session_id, candidate_id, overall_score, recommendation, summary, raw, provenance, source)
+  values (v_sess, v_ids[4], 33, 'reject', 'pol113 synthetic', '{}'::jsonb,
+          '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet-4-20250514","workload":"scoring","prompt_template_version":"2026-07-28.1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb,
+          'phone');
+  v_ev := screening_v2.apply_phone_event('internal', 'assessment.completed', null, v_eng,
+            'assessment:' || v_sess::text, null, null, v_t + interval '7 minutes');
+  select state, terminal_at into v_state, v_term
+    from screening_v2.phone_engagements where id = v_eng;
+  select status into v_ap_status from screening_v2.phone_appointments
+   where id = (v_res->>'appointment_id')::uuid;
+  perform _policy_tests.assert(
+    '0113-E4-regression: the scored callback leg''s assessment.completed is NOT applied; the callback stays booked',
+    v_ev->>'status' = 'ignored' and v_state = 'scheduled' and v_term is null
+      and v_ap_status = 'confirmed',
+    'this is the production defect: a 0-coverage callback leg completed the engagement; event='
+      || coalesce(v_ev::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || ' terminal_at=' || coalesce(v_term::text, '<null>')
+      || ' appointment=' || coalesce(v_ap_status, '<null>'));
+
+  v_ev2 := screening_v2.apply_phone_event('internal', 'assessment.aborted', null, v_eng,
+             'stranded:' || v_sess::text || ':assessment.aborted', null, null,
+             v_t + interval '8 minutes');
+  select state, terminal_at into v_state, v_term
+    from screening_v2.phone_engagements where id = v_eng;
+  select status into v_ap_status from screening_v2.phone_appointments
+   where id = (v_res->>'appointment_id')::uuid;
+  perform _policy_tests.assert(
+    '0113-E4-regression: an assessment.aborted for the callback leg is NOT applied either (never failed)',
+    v_ev2->>'status' = 'ignored' and v_state = 'scheduled' and v_term is null
+      and v_ap_status = 'confirmed',
+    'event=' || coalesce(v_ev2::text, '<null>') || ' engagement=' || coalesce(v_state, '<null>')
+      || ' terminal_at=' || coalesce(v_term::text, '<null>'));
+
+  perform _policy_tests.p113_teardown('pol113-e4-reg');
+end;
+$$;
+
+-- finalize_phone_partial_sessions: callback_booked, and the expired-arm skip
+do $$
+declare
+  v_t   timestamptz := '2026-10-06T06:00:00Z';
+  v_now timestamptz := '2026-10-06T07:00:00Z';   -- an hour on, far past the 180 s grace
+  v_cb uuid[]; v_ord uuid[]; v_cbx uuid[]; v_ordx uuid[]; v_ns uuid[];
+  v_res jsonb; v_fin jsonb; v_e jsonb; v_status text;
+  v_a jsonb; v_b jsonb; v_c jsonb; v_d jsonb; v_n jsonb;
+begin
+  -- (a) a callback leg, still in_progress.
+  v_cb := _policy_tests.p113_leg('pol113-e4-fin-cb', v_t);
+  v_res := screening_v2.confirm_candidate_voice_callback(v_cb[2], '2026-10-07T06:00:00Z',
+             v_t + interval '3 minutes');
+  if v_res->>'status' is distinct from 'ok' then
+    raise exception 'finalize fixture (a): confirm refused: %', v_res;
+  end if;
+  -- (b) an ordinary partial; the candidate answered something.
+  v_ord := _policy_tests.p113_leg('pol113-e4-fin-ord', v_t, 'disconnected');
+  insert into screening_v2.transcript_turns (session_id, turn_index, speaker, text, is_gate)
+  values (v_ord[3], 1, 'candidate', 'synthetic answer', false);
+  -- (c) a callback leg already crash-terminalized to expired/grace_timeout.
+  v_cbx := _policy_tests.p113_leg('pol113-e4-fin-cbx', v_t);
+  v_res := screening_v2.confirm_candidate_voice_callback(v_cbx[2], '2026-10-07T06:30:00Z',
+             v_t + interval '3 minutes');
+  if v_res->>'status' is distinct from 'ok' then
+    raise exception 'finalize fixture (c): confirm refused: %', v_res;
+  end if;
+  update screening_v2.call_sessions
+     set status = 'expired', terminal_reason = 'grace_timeout',
+         ended_at = v_t + interval '4 minutes'
+   where id = v_cbx[3];
+  -- (d) a NON-callback leg in the same crash residue.
+  v_ordx := _policy_tests.p113_leg('pol113-e4-fin-ordx', v_t, 'disconnected');
+  update screening_v2.call_sessions
+     set status = 'expired', terminal_reason = 'grace_timeout',
+         ended_at = v_t + interval '4 minutes'
+   where id = v_ordx[3];
+  -- (e) an ordinary partial where the candidate never said anything.
+  v_ns := _policy_tests.p113_leg('pol113-e4-fin-ns', v_t, 'disconnected');
+
+  v_fin := screening_v2.finalize_phone_partial_sessions(200, 180, v_now);
+  for v_e in select * from jsonb_array_elements(coalesce(v_fin->'sessions', '[]'::jsonb)) loop
+    if v_e->>'session_id' = v_cb[3]::text then v_a := v_e; end if;
+    if v_e->>'session_id' = v_ord[3]::text then v_b := v_e; end if;
+    if v_e->>'session_id' = v_cbx[3]::text then v_c := v_e; end if;
+    if v_e->>'session_id' = v_ordx[3]::text then v_d := v_e; end if;
+    if v_e->>'session_id' = v_ns[3]::text then v_n := v_e; end if;
+  end loop;
+  select status into v_status from screening_v2.call_sessions where id = v_cb[3];
+
+  perform _policy_tests.assert(
+    '0113-E4-fin-a: a callback leg is finalized to completed (MP3 path kept) and reports callback_booked=true',
+    v_a is not null and (v_a->>'transitioned')::boolean is true
+      and (v_a->>'callback_booked')::boolean is true and v_status = 'completed',
+    'the caller can only skip scoring a leg it can recognise; entry=' || coalesce(v_a::text, '<absent>')
+      || ' session=' || coalesce(v_status, '<null>'));
+  perform _policy_tests.assert(
+    '0113-E4-fin-b: an ordinary partial is still selected and reports callback_booked=false',
+    v_b is not null and (v_b->>'callback_booked')::boolean is false
+      and (v_b->>'never_started')::boolean is false and (v_b->>'transitioned')::boolean is true,
+    'entry=' || coalesce(v_b::text, '<absent>'));
+  perform _policy_tests.assert(
+    '0113-E4-fin-c: an expired/grace_timeout CALLBACK leg is not selected (it would starve the window)',
+    v_c is null,
+    'a callback leg is never scored, so only an assessment row could drain it from this arm; entry='
+      || coalesce(v_c::text, '<absent>'));
+  perform _policy_tests.assert(
+    '0113-E4-fin-d: an expired/grace_timeout NON-callback leg is still selected for scoring',
+    v_d is not null and (v_d->>'callback_booked')::boolean is false
+      and (v_d->>'transitioned')::boolean is false,
+    'entry=' || coalesce(v_d::text, '<absent>'));
+  perform _policy_tests.assert(
+    '0113-E4-fin-e: a never-started non-callback partial is still returned',
+    v_n is not null and (v_n->>'never_started')::boolean is true
+      and (v_n->>'callback_booked')::boolean is false,
+    'entry=' || coalesce(v_n::text, '<absent>'));
+
+  perform _policy_tests.p113_teardown('pol113-e4-fin-cb');
+  perform _policy_tests.p113_teardown('pol113-e4-fin-ord');
+  perform _policy_tests.p113_teardown('pol113-e4-fin-cbx');
+  perform _policy_tests.p113_teardown('pol113-e4-fin-ordx');
+  perform _policy_tests.p113_teardown('pol113-e4-fin-ns');
+end;
+$$;
+
+-- sweep_phone_stranded_sessions: a booked callback is not stranded
+do $$
+declare
+  v_t   timestamptz := '2026-10-06T06:00:00Z';
+  v_now timestamptz := '2026-10-07T03:00:00Z';   -- far past the 900 s grace
+  v_s uuid[]; v_u uuid[]; v_sd uuid[];
+  v_res jsonb; v_sw jsonb; v_sw2 jsonb; v_rows integer;
+  v_s_state text; v_u_state text; v_sd_state text;
+  v_s_term timestamptz; v_u_term timestamptz;
+begin
+  -- Resolve whatever an earlier block left stranded, so `examined` below
+  -- counts only this block's rows (the sweep is fleet-wide).
+  perform screening_v2.sweep_phone_stranded_sessions(200, v_now);
+
+  -- The LEGACY shape: confirmed before 0113, so still bound to the ended leg;
+  -- scored and unscored variants.
+  v_s := _policy_tests.p113_leg('pol113-e4-sw-s', v_t);
+  v_res := screening_v2.confirm_candidate_voice_callback(v_s[2], '2026-10-07T07:00:00Z',
+             v_t + interval '3 minutes');
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'conversation_complete',
+         ended_at = v_t + interval '5 minutes'
+   where id = v_s[3];
+  update screening_v2.phone_engagements
+     set session_id = v_s[3], updated_at = v_t + interval '5 minutes'
+   where id = v_s[1];
+  insert into screening_v2.assessments
+    (session_id, candidate_id, overall_score, recommendation, summary, raw, provenance, source)
+  values (v_s[3], v_s[4], 33, 'reject', 'pol113 synthetic', '{}'::jsonb,
+          '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet-4-20250514","workload":"scoring","prompt_template_version":"2026-07-28.1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb,
+          'phone');
+
+  v_u := _policy_tests.p113_leg('pol113-e4-sw-u', v_t);
+  v_res := screening_v2.confirm_candidate_voice_callback(v_u[2], '2026-10-07T07:30:00Z',
+             v_t + interval '3 minutes');
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'conversation_complete',
+         ended_at = v_t + interval '5 minutes'
+   where id = v_u[3];
+  update screening_v2.phone_engagements
+     set session_id = v_u[3], updated_at = v_t + interval '5 minutes'
+   where id = v_u[1];
+
+  v_sw := screening_v2.sweep_phone_stranded_sessions(200, v_now);
+  select state, terminal_at into v_s_state, v_s_term
+    from screening_v2.phone_engagements where id = v_s[1];
+  select state, terminal_at into v_u_state, v_u_term
+    from screening_v2.phone_engagements where id = v_u[1];
+  select count(*) into v_rows from screening_v2.phone_call_events
+   where source = 'internal'
+     and (provider_event_id like 'stranded:' || v_s[3]::text || ':%'
+          or provider_event_id like 'stranded:' || v_u[3]::text || ':%');
+  perform _policy_tests.assert(
+    '0113-E4-sweep: a bound engagement waiting on a live candidate_voice callback is not swept (scored or not)',
+    (v_sw->>'examined')::int = 0 and v_rows = 0
+      and v_s_state = 'scheduled' and v_s_term is null
+      and v_u_state = 'scheduled' and v_u_term is null,
+    'the stranded sweep would complete (scored) or fail (unscored) a candidate who is waiting for '
+      || 'their callback; sweep=' || coalesce(v_sw::text, '<null>') || ' ledger_rows=' || v_rows
+      || ' scored=' || coalesce(v_s_state, '<null>') || ' unscored=' || coalesce(v_u_state, '<null>'));
+
+  -- CONTROL: a system_deferral appointment keeps the #20 behaviour — the
+  -- scored bound session still completes the engagement.
+  v_sd := _policy_tests.p113_leg('pol113-e4-sw-sd', v_t);
+  v_res := screening_v2.confirm_candidate_voice_callback(v_sd[2], '2026-10-07T08:00:00Z',
+             v_t + interval '3 minutes');
+  update screening_v2.phone_appointments
+     set source = 'system_deferral', confirmed_from_attempt_id = null
+   where id = (v_res->>'appointment_id')::uuid;
+  update screening_v2.call_sessions
+     set status = 'completed', terminal_reason = 'conversation_complete',
+         ended_at = v_t + interval '5 minutes'
+   where id = v_sd[3];
+  update screening_v2.phone_engagements
+     set session_id = v_sd[3], updated_at = v_t + interval '5 minutes'
+   where id = v_sd[1];
+  insert into screening_v2.assessments
+    (session_id, candidate_id, overall_score, recommendation, summary, raw, provenance, source)
+  values (v_sd[3], v_sd[4], 70, 'advance', 'pol113 synthetic', '{}'::jsonb,
+          '{"schema_version":1,"provider":"anthropic","requestedModel":"claude-sonnet-4-20250514","workload":"scoring","prompt_template_version":"2026-07-28.1","timestamp":"2026-07-28T12:00:00Z"}'::jsonb,
+          'phone');
+
+  v_sw2 := screening_v2.sweep_phone_stranded_sessions(200, v_now);
+  select state into v_sd_state from screening_v2.phone_engagements where id = v_sd[1];
+  select state into v_s_state from screening_v2.phone_engagements where id = v_s[1];
+  perform _policy_tests.assert(
+    '0113-E4-sweep: CONTROL — a scheduled system_deferral engagement with a scored bound session still completes',
+    (v_sw2->>'examined')::int = 1 and (v_sw2->>'completed')::int = 1
+      and v_sd_state = 'completed' and v_s_state = 'scheduled',
+    'the guard is candidate_voice-only; sweep=' || coalesce(v_sw2::text, '<null>')
+      || ' control=' || coalesce(v_sd_state, '<null>') || ' callback=' || coalesce(v_s_state, '<null>'));
+
+  perform _policy_tests.p113_teardown('pol113-e4-sw-s');
+  perform _policy_tests.p113_teardown('pol113-e4-sw-u');
+  perform _policy_tests.p113_teardown('pol113-e4-sw-sd');
+end;
+$$;
+
+-- The one-time data repair, replayed. Each UPDATE below is one of the 0113
+-- statements between its `0113-E4-REPAIR` markers, VERBATIM (a vitest pins
+-- that), so this proves the migration's own text, not a paraphrase of it.
+do $$
+declare
+  v_t   timestamptz := '2026-10-06T06:00:00Z';
+  v_b uuid[]; v_x uuid[];
+  v_res jsonb; v_n1 integer; v_n2 integer; v_n3 integer; v_n4 integer;
+  v_bound uuid; v_claim uuid; v_ver integer; v_ver_before integer;
+  v_x_bound uuid; v_x_claim uuid; v_x_state text;
+begin
+  -- Still bound: the pre-0113 confirm shape (scheduled, live candidate_voice
+  -- appointment, engagement bound to the leg, the leg still claiming it).
+  v_b := _policy_tests.p113_leg('pol113-e4-rep', v_t);
+  v_res := screening_v2.confirm_candidate_voice_callback(v_b[2], '2026-10-07T08:30:00Z',
+             v_t + interval '3 minutes');
+  update screening_v2.phone_engagements set session_id = v_b[3] where id = v_b[1];
+  update screening_v2.call_sessions set phone_engagement_id = v_b[1] where id = v_b[3];
+  select version into v_ver_before from screening_v2.phone_engagements where id = v_b[1];
+
+  -- The same shape, but TERMINAL (cancelled after the booking).
+  v_x := _policy_tests.p113_leg('pol113-e4-rep-term', v_t);
+  v_res := screening_v2.confirm_candidate_voice_callback(v_x[2], '2026-10-07T09:00:00Z',
+             v_t + interval '3 minutes');
+  update screening_v2.phone_engagements set session_id = v_x[3] where id = v_x[1];
+  update screening_v2.call_sessions set phone_engagement_id = v_x[1] where id = v_x[3];
+  update screening_v2.phone_engagements
+     set state = 'cancelled', state_reason = 'hr_cancelled',
+         terminal_at = v_t + interval '4 minutes'
+   where id = v_x[1];
+
+  -- First run.
+  update screening_v2.call_sessions s
+     set phone_engagement_id = null
+    from screening_v2.phone_engagements e
+   where s.phone_engagement_id = e.id
+     and s.id = e.session_id
+     and e.terminal_at is null
+     and e.state = 'scheduled'
+     and exists (
+       select 1 from screening_v2.phone_appointments ap
+        where ap.engagement_id = e.id
+          and ap.source = 'candidate_voice'
+          and ap.status in ('scheduled','confirmed')
+     );
+  get diagnostics v_n1 = row_count;
+
+  update screening_v2.phone_engagements e
+     set session_id = null, version = e.version + 1, updated_at = now()
+   where e.terminal_at is null
+     and e.state = 'scheduled'
+     and e.session_id is not null
+     and exists (
+       select 1 from screening_v2.phone_appointments ap
+        where ap.engagement_id = e.id
+          and ap.source = 'candidate_voice'
+          and ap.status in ('scheduled','confirmed')
+     );
+  get diagnostics v_n2 = row_count;
+
+  select session_id, version into v_bound, v_ver
+    from screening_v2.phone_engagements where id = v_b[1];
+  select phone_engagement_id into v_claim from screening_v2.call_sessions where id = v_b[3];
+  perform _policy_tests.assert(
+    '0113-E4-repair: a still-bound callback engagement is detached and its leg''s claim released',
+    v_n1 >= 1 and v_n2 >= 1 and v_bound is null and v_claim is null
+      and v_ver = v_ver_before + 1,
+    'released=' || v_n1 || ' detached=' || v_n2 || ' still_bound=' || (v_bound is not null)::text
+      || ' claim_kept=' || (v_claim is not null)::text
+      || ' version ' || coalesce(v_ver_before::text, '<null>') || ' -> ' || coalesce(v_ver::text, '<null>'));
+
+  -- Second run: must be a no-op.
+  update screening_v2.call_sessions s
+     set phone_engagement_id = null
+    from screening_v2.phone_engagements e
+   where s.phone_engagement_id = e.id
+     and s.id = e.session_id
+     and e.terminal_at is null
+     and e.state = 'scheduled'
+     and exists (
+       select 1 from screening_v2.phone_appointments ap
+        where ap.engagement_id = e.id
+          and ap.source = 'candidate_voice'
+          and ap.status in ('scheduled','confirmed')
+     );
+  get diagnostics v_n3 = row_count;
+
+  update screening_v2.phone_engagements e
+     set session_id = null, version = e.version + 1, updated_at = now()
+   where e.terminal_at is null
+     and e.state = 'scheduled'
+     and e.session_id is not null
+     and exists (
+       select 1 from screening_v2.phone_appointments ap
+        where ap.engagement_id = e.id
+          and ap.source = 'candidate_voice'
+          and ap.status in ('scheduled','confirmed')
+     );
+  get diagnostics v_n4 = row_count;
+
+  select session_id into v_bound from screening_v2.phone_engagements where id = v_b[1];
+  perform _policy_tests.assert(
+    '0113-E4-repair: a second run changes 0 rows (idempotent)',
+    v_n3 = 0 and v_n4 = 0 and v_bound is null,
+    'released=' || v_n3 || ' detached=' || v_n4);
+
+  select session_id, state into v_x_bound, v_x_state
+    from screening_v2.phone_engagements where id = v_x[1];
+  select phone_engagement_id into v_x_claim from screening_v2.call_sessions where id = v_x[3];
+  perform _policy_tests.assert(
+    '0113-E4-repair: a TERMINAL engagement is untouched (binding and claim kept)',
+    v_x_state = 'cancelled' and v_x_bound = v_x[3] and v_x_claim = v_x[1],
+    'state=' || coalesce(v_x_state, '<null>')
+      || ' bound_kept=' || coalesce((v_x_bound = v_x[3])::text, 'false')
+      || ' claim_kept=' || coalesce((v_x_claim = v_x[1])::text, 'false'));
+
+  perform _policy_tests.p113_teardown('pol113-e4-rep');
+  perform _policy_tests.p113_teardown('pol113-e4-rep-term');
+end;
+$$;
+
+-- ═══════════════════════════════════════════════════════════════════════
 -- Verdict (includes all Phase 1 and Phase 2 WS-A tests above)
 -- ═══════════════════════════════════════════════════════════════════════
 

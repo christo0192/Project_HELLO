@@ -585,6 +585,10 @@ export function createPhoneStores(client: SupabaseClient): PhoneStores {
                 transitioned: bool(e, 'transitioned') ?? false,
                 assessmentPresent: bool(e, 'assessment_present') ?? false,
                 recordingPresent: bool(e, 'recording_present') ?? false,
+                // 0113 (E4). Absent/malformed -> false: an older RPC keeps
+                // today's behaviour (score it). The handler's own
+                // confirmed_from_attempt_id guard is the belt behind this.
+                callbackBooked: bool(e, 'callback_booked') ?? false,
               };
             })
             .filter((s): s is PhonePartialFinalizeSession => s !== null)

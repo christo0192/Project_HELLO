@@ -36,6 +36,20 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
+// 0113 re-declares apply_phone_event and finalize_phone_partial_sessions (both
+// from 0095), confirm_candidate_voice_callback (from 0073) and
+// sweep_phone_stranded_sessions (from 0045) IN FULL: the E6 pre-answer ledger
+// branch and the E4 callback-leg detach. It must outrank all of those, or every
+// extractor reads a superseded body and the drift tests go blind to the change.
+export const MIGRATION_0113_PATH = fileURLToPath(
+  new URL(
+    '../../../../supabase/migrations/0113_phone_answer_and_callback_leg.sql',
+    import.meta.url,
+  ),
+);
+
+export const MIGRATION_0113 = readFileSync(MIGRATION_0113_PATH, 'utf8');
+
 // 0112 re-declares reclaim_phone_attempt_leases IN FULL (0096's body plus the
 // E3 redial hold: the RESTORE branch now also sets next_eligible_at and the
 // audit row carries `redial_not_before`). It must outrank 0096, or every
@@ -275,6 +289,17 @@ export const MIGRATION_0072_PATH = fileURLToPath(
 
 export const MIGRATION_0072 = readFileSync(MIGRATION_0072_PATH, 'utf8');
 
+// 0073 re-declares confirm_candidate_voice_callback IN FULL (0068's body plus
+// the owner-callback Ashby hand-off) and declares enqueue_ashby_cycle_scorecard.
+// It was never registered, so until 0113 the extractors resolved confirm to
+// 0068's SUPERSEDED body — the 0103 lesson again. Registered so the list is
+// complete for the function 0113 lifts from it.
+export const MIGRATION_0073_PATH = fileURLToPath(
+  new URL('../../../../supabase/migrations/0073_phone_owner_callback_ashby.sql', import.meta.url),
+);
+
+export const MIGRATION_0073 = readFileSync(MIGRATION_0073_PATH, 'utf8');
+
 export const MIGRATION_0075_PATH = fileURLToPath(
   new URL('../../../../supabase/migrations/0075_phone_objective_coverage.sql', import.meta.url),
 );
@@ -330,6 +355,10 @@ export const MIGRATION_0092 = readFileSync(MIGRATION_0092_PATH, 'utf8');
  */
 export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: string }[] =
   Object.freeze([
+    // 0113 — apply_phone_event, finalize_phone_partial_sessions,
+    // confirm_candidate_voice_callback and sweep_phone_stranded_sessions IN
+    // FULL (E6 + E4), so it must precede 0095, 0073 and 0045.
+    { name: '0113', sql: MIGRATION_0113 },
     // 0112 — reclaim_phone_attempt_leases IN FULL (the E3 redial hold), so it
     // must precede 0096, whose body it supersedes.
     { name: '0112', sql: MIGRATION_0112 },
@@ -405,6 +434,8 @@ export const PHONE_MIGRATIONS: readonly { readonly name: string; readonly sql: s
     { name: '0081', sql: MIGRATION_0081 },
     { name: '0077', sql: MIGRATION_0077 },
     { name: '0075', sql: MIGRATION_0075 },
+    // 0073 — confirm_candidate_voice_callback IN FULL, so it must precede 0068.
+    { name: '0073', sql: MIGRATION_0073 },
     // 0072 adds finalize_phone_partial_sessions (server-side partial-finalize)
     // and the assessments.partial column. Newest-first so its declaration wins.
     { name: '0072', sql: MIGRATION_0072 },

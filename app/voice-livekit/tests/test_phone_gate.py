@@ -3282,6 +3282,39 @@ class TestPhoneEventClient(unittest.IsolatedAsyncioTestCase):
         """L-4: the deferral event exists on both halves."""
         self.assertIn("candidate.deferred_pre_disclosure", phone.PHONE_WORKER_EVENTS)
 
+    async def test_worker_allowlist_is_the_api_route_set(self):
+        """M009 E6: the PYTHON half of the cross-language parity pin.
+
+        `parity-phone-worker-events.test.ts` reads this module from the API
+        side; this reads the route from the worker side, so a one-sided edit
+        fails in whichever suite runs. The three pre-answer verdicts are named
+        explicitly: a worker that refuses to post them locally silently
+        restores the "no truthful ring-out" defect E6 exists to fix.
+        """
+        for event_type in ("call.no_answer", "call.busy", "call.failed"):
+            self.assertIn(event_type, phone.PHONE_WORKER_EVENTS)
+        # The provider-only originate edges stay provider-only.
+        self.assertFalse(
+            any(e.startswith("sip.originate") for e in phone.PHONE_WORKER_EVENTS))
+        route = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "api" / "src" / "routes" / "phone-worker.ts"
+        )
+        if not route.exists():
+            self.skipTest("API route not present in this checkout")
+        text = route.read_text(encoding="utf-8")
+        match = re.search(
+            r"export const WORKER_PHONE_EVENTS = \[(.*?)\]", text, re.DOTALL,
+        )
+        self.assertIsNotNone(match, "WORKER_PHONE_EVENTS anchor missing")
+        server: set[str] = set()
+        for line in match.group(1).splitlines():
+            if line.strip().startswith("//"):
+                continue
+            server.update(re.findall(r"'([^']+)'", line))
+        self.assertGreater(len(server), 5)
+        self.assertEqual(set(phone.PHONE_WORKER_EVENTS), server)
+
     async def test_non_2xx_and_malformed_bodies_fail_closed(self):
         cases = [
             (500, {"ok": True}),
