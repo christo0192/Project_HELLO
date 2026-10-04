@@ -25,7 +25,7 @@
  * Fixture machine ids are synthetic Fly-shaped ids; no candidate data appears.
  */
 
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeAll, beforeEach } from 'vitest';
 
 const livekit = vi.hoisted(() => ({ configured: true }));
 vi.mock('../lib/room-provisioning.js', () => ({
@@ -1024,7 +1024,13 @@ describe('M010 — the targeted path reports what the join barrier saw', () => {
 // which is the path that failed in production on 2026-10-04.
 // ═══════════════════════════════════════════════════════════════════════
 
-describe('M010 — the agent name survives the REAL livekit-server-sdk parse', () => {
+describe('M010 — the agent name survives the REAL livekit-server-sdk parse', { timeout: 30_000 }, () => {
+  // The first real call pays the SDK's one-time lazy imports (JWT signing,
+  // camelcase-keys): seconds on a cold CI container. Paid once, here.
+  beforeAll(async () => {
+    await listViaRealSdk({ 'lk.agent.name': PER_MACHINE });
+  }, 60_000);
+
   /** A raw ListParticipants body exactly as LiveKit sends it (dotted keys). */
   function rawListing(attributes: Record<string, string>) {
     return {
