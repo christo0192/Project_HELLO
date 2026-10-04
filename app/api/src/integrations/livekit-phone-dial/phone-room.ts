@@ -137,12 +137,15 @@ export function buildPhoneDispatchMetadata(
  * nothing more. Every field is optional and loosely typed because the value
  * comes straight off the SDK's `ParticipantInfo` and is validated at the read.
  *
- * `attributes` is present ONLY so the barrier can read ONE key,
- * `lk.agent_name`, and only on a participant already proven to be of AGENT
- * kind. A SIP participant's attribute map carries the subscriber's number;
- * the barrier never reads a SIP participant's attributes, never copies the
- * map, and never returns or retains the listing — it reduces it to a boolean
- * (or a set of agent identities) on the spot.
+ * `attributes` is present ONLY so the barrier can read the agent-name keys
+ * through `readAgentNameAttribute` (dial.ts: `lk.agent.name`, `lk.agent_name`,
+ * or the 2.16 SDK's camel-cased `lkAgentName`), and the JOIN decision reads
+ * them only on a participant already proven to be of AGENT kind. A SIP
+ * participant's attribute map carries the subscriber's number; nothing here
+ * reads any other key of it — the M010 diagnostics classify only the
+ * agent-name keys, as a one-letter status — and nothing copies the map or
+ * returns or retains the listing: it is reduced on the spot to a boolean, a
+ * set of agent identities, or closed-vocabulary counters.
  */
 export interface PhoneRoomParticipantLike {
   readonly identity?: string;
