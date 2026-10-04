@@ -925,6 +925,16 @@ export function createPhoneRuntime(
                   // Undefined unless `env.workerOrchestration` is on ⇒ the dial
                   // path is byte-identical to today by default.
                   workerGate,
+                  // M010: one closed-vocabulary line per targeted join
+                  // barrier, so a deferred dial says WHY the agent was not
+                  // counted. Codes and seconds only — never a room or a name.
+                  onAgentJoinObservation: (code, elapsedSec) => {
+                    logger.info('unknown_event', {
+                      error_type: 'phone_agent_join_observed',
+                      error_category: code,
+                      duration_sec: elapsedSec,
+                    });
+                  },
                 });
                 // `detail` is carried, not dropped. It is admission's
                 // stable sub-code, and dropping it here is precisely how

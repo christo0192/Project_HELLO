@@ -304,6 +304,14 @@ export interface PhoneDialDeps {
    * `now()` to tell how long the dial has been running.
    */
   readonly agentJoinClock?: PhoneAgentJoinClock;
+  /**
+   * Diagnostic sink for the targeted-dispatch join barrier (M010). Receives
+   * ONE closed-vocabulary code per barrier run (see
+   * `phoneAgentJoinObservationCode`) and the seconds the wait took. Carries no
+   * room name, identity, number or attribute value. Optional and fail-open:
+   * a throwing sink never changes the dial.
+   */
+  readonly onAgentJoinObservation?: (code: string, elapsedSec: number) => void;
 }
 
 /** The wall-clock seam the agent-join barrier polls on. */
@@ -719,14 +727,28 @@ export async function dialPhoneAttempt(
       // Start wait + ready poll, not the ready poll alone (see the constant).
       workerReadyTimeoutSec: PHONE_WORKER_GATE_CEILING_SEC,
     }).seconds;
+    const observation = newAgentJoinObservation();
+    const joinStartedMs = clock.now();
     const joined = await awaitTargetedAgentJoin({
       rooms: deps.room.rooms,
       roomName: room.roomName,
       targetAgent,
+      sharedAgentName: dialConfig.agentName,
       agentsBefore,
       timeoutMs: joinTimeoutSec * 1000,
       clock,
+      observation,
     });
+    if (deps.onAgentJoinObservation) {
+      try {
+        deps.onAgentJoinObservation(
+          phoneAgentJoinObservationCode(joined, observation),
+          Math.max(0, (clock.now() - joinStartedMs) / 1000),
+        );
+      } catch {
+        /* diagnostics must never change the dial */
+      }
+    }
     if (joined !== 'joined') {
       await releaseGatedWorker();
       return deferWorkerNotReady(
@@ -1000,15 +1022,19 @@ async function awaitTargetedAgentJoin(input: {
   rooms: PhoneRoomServiceClientLike;
   roomName: string;
   targetAgent: string;
+  /** The shared base name, used only to classify a mismatch for diagnostics. */
+  sharedAgentName: string;
   agentsBefore: ReadonlySet<string>;
   timeoutMs: number;
   clock: PhoneAgentJoinClock;
+  observation: PhoneAgentJoinObservation;
 }): Promise<'joined' | 'timeout' | 'unreadable'> {
   const deadline = input.clock.now() + input.timeoutMs;
+  const obs = input.observation;
   let consecutiveFailures = 0;
   let anyListingSucceeded = false;
   for (;;) {
-    const listed = await listRoomOnce(input.rooms, input.roomName);
+    const listed = await listRoomOnceObserved(input.rooms, input.roomName, obs);
     if (listed === 'unsupported') return 'unreadable';
     if (listed === 'failed') {
       consecutiveFailures += 1;
@@ -1017,7 +1043,9 @@ async function awaitTargetedAgentJoin(input: {
       consecutiveFailures = 0;
       anyListingSucceeded = true;
     }
-    for (const p of listed === 'failed' ? [] : listed) {
+    const participants = listed === 'failed' ? [] : listed;
+    observeParticipants(obs, participants, input);
+    for (const p of participants) {
       if (
         isAgentParticipant(p)
         && typeof p.identity === 'string'
@@ -1031,6 +1059,139 @@ async function awaitTargetedAgentJoin(input: {
     if (!(remaining > 0)) return anyListingSucceeded ? 'timeout' : 'unreadable';
     await input.clock.sleep(Math.min(PHONE_AGENT_JOIN_POLL_MS, remaining));
   }
+}
+
+// ── M010: WHAT THE JOIN BARRIER SAW ──────────────────────────────────
+// Production deferred every targeted dial while the worker was visibly
+// connected to the room, and nothing recorded WHY the barrier did not count
+// it. These counters fold into one closed-vocabulary code: no room name, no
+// identity, no attribute value and no number ever leaves this module.
+
+/** How a NEW agent participant's `lk.agent.name` compared with the target. */
+export type PhoneAgentNameAttrStatus =
+  | 'none' | 'absent' | 'other' | 'shared' | 'machine' | 'match';
+
+/** Ranked so the most informative status seen during the wait is kept. */
+const NAME_ATTR_RANK: Record<PhoneAgentNameAttrStatus, number> = {
+  none: 0, absent: 1, other: 2, shared: 3, machine: 4, match: 5,
+};
+
+export interface PhoneAgentJoinObservation {
+  listingsOk: number;
+  listingsNotFound: number;
+  listingsFailed: number;
+  maxParticipants: number;
+  maxNewAgents: number;
+  /** Distinct participant kinds seen, as single safe tokens (at most 4). */
+  kinds: Set<string>;
+  nameAttr: PhoneAgentNameAttrStatus;
+}
+
+export function newAgentJoinObservation(): PhoneAgentJoinObservation {
+  return {
+    listingsOk: 0,
+    listingsNotFound: 0,
+    listingsFailed: 0,
+    maxParticipants: 0,
+    maxNewAgents: 0,
+    kinds: new Set<string>(),
+    nameAttr: 'none',
+  };
+}
+
+/** A participant kind as one safe token: a small enum number, or a letter. */
+function kindToken(kind: unknown): string {
+  if (typeof kind === 'number' && Number.isInteger(kind) && kind >= 0 && kind <= 15) {
+    return String(kind);
+  }
+  if (typeof kind === 'string' && /^[A-Za-z]/.test(kind)) return kind.charAt(0).toUpperCase();
+  return kind === undefined ? 'u' : 'x';
+}
+
+/** Classify a NEW agent's name attribute against the target. Never returns the value. */
+export function classifyAgentNameAttr(
+  value: unknown,
+  targetAgent: string,
+  sharedAgentName: string,
+): PhoneAgentNameAttrStatus {
+  if (typeof value !== 'string' || value === '') return 'absent';
+  if (value === targetAgent) return 'match';
+  if (value === sharedAgentName) return 'shared';
+  if (sharedAgentName !== '' && value.startsWith(`${sharedAgentName}-`)) return 'machine';
+  return 'other';
+}
+
+/** `listRoomOnce`, counting each outcome. Same answers, same classification. */
+async function listRoomOnceObserved(
+  rooms: PhoneRoomServiceClientLike,
+  roomName: string,
+  obs: PhoneAgentJoinObservation,
+): Promise<ReadonlyArray<PhoneRoomParticipantLike> | 'failed' | 'unsupported'> {
+  if (typeof rooms.listParticipants !== 'function') return 'unsupported';
+  try {
+    const listed = await rooms.listParticipants(roomName);
+    if (!Array.isArray(listed)) {
+      obs.listingsFailed += 1;
+      return 'failed';
+    }
+    obs.listingsOk += 1;
+    return listed;
+  } catch (err) {
+    if (isRoomNotFound(err)) {
+      obs.listingsNotFound += 1;
+      return [];
+    }
+    obs.listingsFailed += 1;
+    return 'failed';
+  }
+}
+
+function observeParticipants(
+  obs: PhoneAgentJoinObservation,
+  participants: ReadonlyArray<PhoneRoomParticipantLike>,
+  input: { targetAgent: string; sharedAgentName: string; agentsBefore: ReadonlySet<string> },
+): void {
+  obs.maxParticipants = Math.max(obs.maxParticipants, participants.length);
+  let newAgents = 0;
+  for (const p of participants) {
+    if (p === null || typeof p !== 'object') continue;
+    if (obs.kinds.size < 4) obs.kinds.add(kindToken(p.kind));
+    const isNew = typeof p.identity === 'string' && !input.agentsBefore.has(p.identity);
+    if (!isAgentParticipant(p) || !isNew) continue;
+    newAgents += 1;
+    const status = classifyAgentNameAttr(
+      p.attributes?.[PHONE_AGENT_NAME_ATTRIBUTE],
+      input.targetAgent,
+      input.sharedAgentName,
+    );
+    if (NAME_ATTR_RANK[status] > NAME_ATTR_RANK[obs.nameAttr]) obs.nameAttr = status;
+  }
+  obs.maxNewAgents = Math.max(obs.maxNewAgents, newAgents);
+}
+
+/**
+ * One code per barrier run, at most 64 characters (the logger's identifier
+ * cap), e.g. `o.timeout:l.20.0.0:p.1:a.1:k.4:n.absent`:
+ * `o` outcome; `l` listings ok.not_found.failed (each clamped to 99); `p` most
+ * participants seen in one listing (clamped to 9); `a` most NEW agent-kind
+ * participants (clamped to 9); `k` distinct kinds (enum numbers, or a letter
+ * for a string kind); `n` the best name-attribute status of a new agent.
+ */
+export function phoneAgentJoinObservationCode(
+  outcome: 'joined' | 'timeout' | 'unreadable',
+  obs: PhoneAgentJoinObservation,
+): string {
+  const clamp = (n: number, max: number): string =>
+    String(Math.min(max, Math.max(0, Math.floor(n))));
+  const kinds = [...obs.kinds].sort().join('.') || 'none';
+  return [
+    `o.${outcome}`,
+    `l.${clamp(obs.listingsOk, 99)}.${clamp(obs.listingsNotFound, 99)}.${clamp(obs.listingsFailed, 99)}`,
+    `p.${clamp(obs.maxParticipants, 9)}`,
+    `a.${clamp(obs.maxNewAgents, 9)}`,
+    `k.${kinds}`,
+    `n.${obs.nameAttr}`,
+  ].join(':');
 }
 
 /** Seconds of lease left, or `undefined` when the value is unusable. */

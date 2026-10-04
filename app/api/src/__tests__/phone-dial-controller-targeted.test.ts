@@ -42,7 +42,10 @@ import {
   PHONE_WORKER_GATE_CEILING_SEC,
   PHONE_WORKER_READY_CEILING_SEC,
   PHONE_WORKER_START_WAIT_CEILING_SEC,
+  classifyAgentNameAttr,
   dialPhoneAttempt,
+  newAgentJoinObservation,
+  phoneAgentJoinObservationCode,
   type PhoneAgentJoinClock,
   type PhoneDialDeps,
 } from '../integrations/livekit-phone-dial/dial.js';
@@ -758,5 +761,139 @@ describe('M009 — Gate 5 measures the lease at the current instant, not the sta
     expectInfraDeferral(res, h, 'agent_join_timeout');
     const abandon = h.abandonAttemptInfra.mock.calls[0]?.[0] as unknown as { now: Date };
     expect(abandon.now.getTime()).toBe(NOW.getTime() + SLOW_GATE_MS + 20_000);
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// M010 — the join barrier says WHAT it saw, in a closed vocabulary.
+// Production deferred every targeted dial while the worker was connected to
+// the room, and no line recorded why. One code per barrier run, no values.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('M010 — the agent-join barrier reports what it saw', () => {
+  /** The logger's identifier rule (lib/logger.ts SAFE_IDENT_RE), copied. */
+  const SAFE_IDENT = /^[a-zA-Z0-9_:.-]{1,64}$/;
+
+  function observed(opts: Parameters<typeof harness>[0], throwing = false) {
+    const h = harness(opts);
+    const sink = vi.fn((code: string, elapsedSec: number) => {
+      void code; void elapsedSec;
+      if (throwing) throw new Error('sink broke');
+    });
+    const deps = { ...h.deps, onAgentJoinObservation: sink };
+    return { h: { ...h, deps }, sink };
+  }
+
+  it('a join reports o.joined with the per-machine name matched', async () => {
+    const { h, sink } = observed({
+      worker: TARGETED_READY,
+      listings: [notFound(), [], [agent('AJ_new', PER_MACHINE)]],
+    });
+    const res = await run(h);
+    expect(res.status).toBe('dialing');
+    expect(sink).toHaveBeenCalledTimes(1);
+    expect(sink.mock.calls[0]?.[0]).toBe('o.joined:l.2.0.0:p.1:a.1:k.4:n.match');
+    expect(sink.mock.calls[0]?.[1]).toBe(PHONE_AGENT_JOIN_POLL_MS / 1000);
+  });
+
+  for (const [label, participant, n] of [
+    ['an agent with NO name attribute', { identity: 'AJ_new', kind: 4, attributes: {} }, 'absent'],
+    ['an agent with no attributes at all', { identity: 'AJ_new', kind: 4 }, 'absent'],
+    ['an agent of ANOTHER machine', agent('AJ_other', `${BASE}-${OTHER_MACHINE}`), 'machine'],
+    ['an agent under the SHARED name', agent('AJ_shared', BASE), 'shared'],
+    ['an agent under an unrelated name', agent('AJ_x', 'browser-screener'), 'other'],
+  ] as const) {
+    it(`a timeout with ${label} reports n.${n} — and still defers exactly as before`, async () => {
+      const { h, sink } = observed({ worker: TARGETED_READY, listings: [[], [participant]] });
+      const res = await run(h);
+      expectInfraDeferral(res, h, 'agent_join_timeout');
+      const code = sink.mock.calls[0]?.[0] ?? '';
+      expect(code).toMatch(new RegExp(`^o\.timeout:l\.\d+\.0\.0:p\.1:a\.1:k\.4:n\.${n}$`));
+      expect(sink.mock.calls[0]?.[1]).toBe(20);
+    });
+  }
+
+  it('a SIP-only room reports kind 3, no new agent and n.none', async () => {
+    const { h, sink } = observed({
+      worker: TARGETED_READY,
+      listings: [[], [{ identity: 'SIP_x', kind: 3, attributes: {} }]],
+    });
+    expectInfraDeferral(await run(h), h, 'agent_join_timeout');
+    expect(sink.mock.calls[0]?.[0]).toMatch(/^o\.timeout:l\.\d+\.0\.0:p\.1:a\.0:k\.3:n\.none$/);
+  });
+
+  it('a string kind is reported as its initial letter', async () => {
+    const { h, sink } = observed({
+      worker: TARGETED_READY,
+      listings: [[], [{ identity: 'AJ_new', kind: 'STANDARD', attributes: {} }]],
+    });
+    expectInfraDeferral(await run(h), h, 'agent_join_timeout');
+    expect(sink.mock.calls[0]?.[0]).toMatch(/:a\.0:k\.S:n\.none$/);
+  });
+
+  it('a room that never appears counts not_found listings separately', async () => {
+    const { h, sink } = observed({ worker: TARGETED_READY, listings: [notFound()] });
+    expectInfraDeferral(await run(h), h, 'agent_join_timeout');
+    expect(sink.mock.calls[0]?.[0]).toMatch(/^o\.timeout:l\.0\.\d+\.0:p\.0:a\.0:k\.none:n\.none$/);
+  });
+
+  it('persistent listing errors report o.unreadable with the failures counted', async () => {
+    const { h, sink } = observed({
+      worker: TARGETED_READY,
+      listings: [notFound(), [], new Error('livekit 503')],
+    });
+    expectInfraDeferral(await run(h), h, 'agent_join_unverifiable');
+    expect(sink.mock.calls[0]?.[0]).toBe(
+      `o.unreadable:l.1.0.${PHONE_AGENT_JOIN_MAX_CONSECUTIVE_ERRORS}:p.0:a.0:k.none:n.none`,
+    );
+  });
+
+  it('a pre-existing agent (adopted room) is not counted as new', async () => {
+    const old = agent('AJ_old', PER_MACHINE);
+    const { h, sink } = observed({ worker: TARGETED_READY, listings: [[old], [old]] });
+    expectInfraDeferral(await run(h), h, 'agent_join_timeout');
+    expect(sink.mock.calls[0]?.[0]).toMatch(/:p\.1:a\.0:k\.4:n\.none$/);
+  });
+
+  it('a THROWING sink never changes the dial', async () => {
+    const { h, sink } = observed({
+      worker: TARGETED_READY,
+      listings: [notFound(), [agent('AJ_new', PER_MACHINE)]],
+    }, true);
+    const res = await run(h);
+    expect(sink).toHaveBeenCalledTimes(1);
+    expect(res.status).toBe('dialing');
+    expect(h.originate).toHaveBeenCalledTimes(1);
+  });
+
+  it('the untargeted path never reports (no barrier ran)', async () => {
+    const { h, sink } = observed({});
+    expect((await run(h)).status).toBe('dialing');
+    expect(sink).not.toHaveBeenCalled();
+  });
+
+  it('the WORST-CASE code still fits the logger identifier rule', () => {
+    const obs = newAgentJoinObservation();
+    obs.listingsOk = 1000;
+    obs.listingsNotFound = 1000;
+    obs.listingsFailed = 1000;
+    obs.maxParticipants = 50;
+    obs.maxNewAgents = 50;
+    for (const k of ['0', '1', '2', '3']) obs.kinds.add(k);
+    obs.nameAttr = 'machine';
+    const code = phoneAgentJoinObservationCode('unreadable', obs);
+    expect(code).toBe('o.unreadable:l.99.99.99:p.9:a.9:k.0.1.2.3:n.machine');
+    expect(code).toMatch(SAFE_IDENT);
+  });
+
+  it('classifies name attributes without ever returning the value', () => {
+    expect(classifyAgentNameAttr(undefined, PER_MACHINE, BASE)).toBe('absent');
+    expect(classifyAgentNameAttr('', PER_MACHINE, BASE)).toBe('absent');
+    expect(classifyAgentNameAttr(42, PER_MACHINE, BASE)).toBe('absent');
+    expect(classifyAgentNameAttr(PER_MACHINE, PER_MACHINE, BASE)).toBe('match');
+    expect(classifyAgentNameAttr(BASE, PER_MACHINE, BASE)).toBe('shared');
+    expect(classifyAgentNameAttr(`${BASE}-${OTHER_MACHINE}`, PER_MACHINE, BASE)).toBe('machine');
+    expect(classifyAgentNameAttr('something-else', PER_MACHINE, BASE)).toBe('other');
+    expect(classifyAgentNameAttr(`${BASE}-x`, PER_MACHINE, '')).toBe('other');
   });
 });
