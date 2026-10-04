@@ -52,7 +52,7 @@ import {
 } from '../integrations/livekit-phone-dial/dial.js';
 import { loadPhoneDialConfig } from '../integrations/livekit-phone-dial/config.js';
 import { createLogger } from '../lib/logger.js';
-import { createAgentJoinObservationSink } from '../lib/phone-runtime/join-observation-log.js';
+import { createAgentJoinObservationSink } from '../lib/phone-join-observation-log.js';
 import { wrapDialableNumber } from '../integrations/livekit-phone-dial/dialable-number.js';
 import {
   createSyntheticSipClient,

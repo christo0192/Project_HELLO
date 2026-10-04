@@ -64,7 +64,7 @@ import {
   type SchedulerLoopConfig,
 } from '../scheduler.js';
 import { createLogger } from '../logger.js';
-import { createAgentJoinObservationSink } from './join-observation-log.js';
+import { createAgentJoinObservationSink } from '../phone-join-observation-log.js';
 import { supabase } from '../supabase.js';
 import { createSession, transitionSession } from '../session-lifecycle.js';
 import {
@@ -930,7 +930,7 @@ export function createPhoneRuntime(
                   // M010: one closed-vocabulary line per targeted dial, so a
                   // deferred dial says WHY the agent was not counted. A code,
                   // seconds, and the leased Fly machine id as a correlator to
-                  // the worker's own lines (see join-observation-log.ts).
+                  // the worker's own lines (see lib/phone-join-observation-log.ts).
                   onAgentJoinObservation: agentJoinObservationSink,
                 });
                 // `detail` is carried, not dropped. It is admission's
