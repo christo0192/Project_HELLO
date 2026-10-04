@@ -662,7 +662,7 @@ export async function dialPhoneAttempt(
   // is created.
   // M010: one diagnostic line per targeted dial, reported fail-open. The
   // sink is optional; nothing here can change what the dial does.
-  const targetedStartedMs = clock.now();
+  const targetedStartedMs = targeted ? clock.now() : 0;
   const reportTargeted = (stage: PhoneAgentJoinStage, obs: PhoneAgentJoinObservation): void => {
     if (!deps.onAgentJoinObservation) return;
     try {
@@ -985,9 +985,14 @@ async function listRoomTagged(
       ? { kind: 'ok', participants: listed }
       : { kind: 'failed', errorClass: 'na' };
   } catch (err) {
-    return isRoomNotFound(err)
-      ? { kind: 'not_found' }
-      : { kind: 'failed', errorClass: classifyListingError(err) };
+    if (isRoomNotFound(err)) return { kind: 'not_found' };
+    let errorClass: PhoneListingErrorClass = 'ot';
+    try {
+      errorClass = classifyListingError(err);
+    } catch {
+      /* diagnostics only: an unreadable error is still just 'failed' */
+    }
+    return { kind: 'failed', errorClass };
   }
 }
 
@@ -1062,7 +1067,8 @@ async function readAgentIdentities(
  * positive: AGENT kind (the SIP leg or any other participant is not a worker),
  * a NEW identity (a previous attempt's agent still in an adopted room), and
  * the EXACT targeted name (an agent from another worker pool or another
- * machine). The attribute is read only from agent-kind participants.
+ * machine). The join decision reads the attribute only from agent-kind
+ * participants; M010's diagnostics also classify (never log) it for others.
  *
  * `not_found` while polling is read as "not joined yet" (the room is being
  * created / propagated), never as joined. Any other listing failure is ALSO
@@ -1167,8 +1173,10 @@ export function classifyListingError(err: unknown): PhoneListingErrorClass {
   if (err === null || typeof err !== 'object') return 'ot';
   const e = err as { code?: unknown; status?: unknown; statusCode?: unknown };
   if (typeof e.code === 'string') {
-    const known = TWIRP_ERROR_CLASSES[e.code.toLowerCase()];
-    if (known !== undefined) return known;
+    const key = e.code.toLowerCase();
+    // Own keys only: a code such as `constructor` must not resolve to an
+    // inherited member and smuggle a non-vocabulary string into the line.
+    if (Object.hasOwn(TWIRP_ERROR_CLASSES, key)) return TWIRP_ERROR_CLASSES[key]!;
   }
   const status = typeof e.status === 'number' ? e.status : e.statusCode;
   if (typeof status === 'number') {
@@ -1194,12 +1202,16 @@ export interface PhoneAgentJoinObservation {
   snapshotAgents: number;
   maxParticipants: number;
   maxNewAgents: number;
-  /** Distinct participant kinds seen, as safe tokens (at most 4 kept). */
+  /** Distinct participant kinds seen, as safe tokens (at most 3 kept). */
   kinds: Set<string>;
   /** Best name status among NEW agent-kind participants. */
   agentName: PhoneAgentNameAttrStatus;
   /** Best name status among NEW non-agent participants (a worker of the wrong kind?). */
   otherName: PhoneAgentNameAttrStatus;
+  /** Best name status among agents ALREADY present before the dispatch. */
+  priorName: PhoneAgentNameAttrStatus;
+  /** NEW agent-kind participants in the most recent good listing (joined then left?). */
+  lastNewAgents: number;
 }
 
 export function newAgentJoinObservation(): PhoneAgentJoinObservation {
@@ -1215,6 +1227,8 @@ export function newAgentJoinObservation(): PhoneAgentJoinObservation {
     kinds: new Set<string>(),
     agentName: 'n',
     otherName: 'n',
+    priorName: 'n',
+    lastNewAgents: 0,
   };
 }
 
@@ -1246,7 +1260,11 @@ function kindToken(kind: unknown): string {
   if (typeof kind === 'number' && Number.isInteger(kind) && kind >= 0 && kind <= 15) {
     return String(kind);
   }
-  if (typeof kind === 'string') return KIND_NAME_TOKENS[kind.toUpperCase()] ?? 'x';
+  // Exact spelling only, as `isAgentParticipant` accepts only exact 'AGENT':
+  // a `k.4` must mean the barrier would have accepted the kind.
+  if (typeof kind === 'string') {
+    return Object.hasOwn(KIND_NAME_TOKENS, kind) ? KIND_NAME_TOKENS[kind]! : 'x';
+  }
   return kind === undefined ? 'u' : 'x';
 }
 
@@ -1285,9 +1303,12 @@ function observeParticipants(
   let newAgents = 0;
   for (const p of participants) {
     if (p === null || typeof p !== 'object') continue;
-    if (obs.kinds.size < 4) obs.kinds.add(kindToken(p.kind));
-    if (typeof p.identity === 'string' && input.agentsBefore.has(p.identity)) continue;
+    if (obs.kinds.size < 3) obs.kinds.add(kindToken(p.kind));
     const status = classifyAgentNameAttr(p.attributes, input.targetAgent, input.sharedAgentName);
+    if (typeof p.identity === 'string' && input.agentsBefore.has(p.identity)) {
+      obs.priorName = better(obs.priorName, status);
+      continue;
+    }
     if (isAgentParticipant(p)) {
       newAgents += 1;
       obs.agentName = better(obs.agentName, status);
@@ -1296,6 +1317,7 @@ function observeParticipants(
     }
   }
   obs.maxNewAgents = Math.max(obs.maxNewAgents, newAgents);
+  obs.lastNewAgents = newAgents;
 }
 
 /**
@@ -1307,13 +1329,17 @@ export type PhoneAgentJoinStage = 'j' | 't' | 'u' | 'su' | 'nd';
 
 /**
  * One code per targeted dial that reaches the snapshot, at most 64 characters
- * (the logger's identifier cap), e.g. `o.t:l.40.0.0:e.0:f.0:s.0:p.1:a.1:k.4:n.a:x.n`:
+ * (the logger's identifier cap), e.g.
+ * `o.t:l.40.0.0:e.0:f.0:s.0:p.1:a.1:z.1:k.4:n.a:x.n:b.n`:
  * `o` stage; `l` listings ok.not_found.failed (each clamped to 99); `e` the
  * first failure's class (`0` none); `f` 1 if the room vanished after a good
  * listing; `s` agents already present before the dispatch; `p` most
- * participants in one listing; `a` most NEW agent-kind participants (these
- * three clamped to 9); `k` distinct kinds; `n` best name status of a new agent;
- * `x` best name status of a new NON-agent participant.
+ * participants in one listing; `a` most NEW agent-kind participants; `z` new
+ * agent-kind participants in the LAST good listing (`a.1:z.0` = joined, then
+ * left); these four clamped to 9; `k` up to three distinct kinds; `n` best name
+ * status of a new agent (`o.t` with `n.y` means the matching agent had no
+ * string identity); `x` best name status of a new NON-agent participant; `b`
+ * best name status of an agent already present before the dispatch.
  */
 export function phoneAgentJoinObservationCode(
   stage: PhoneAgentJoinStage,
@@ -1330,9 +1356,11 @@ export function phoneAgentJoinObservationCode(
     `s.${clamp(obs.snapshotAgents, 9)}`,
     `p.${clamp(obs.maxParticipants, 9)}`,
     `a.${clamp(obs.maxNewAgents, 9)}`,
+    `z.${clamp(obs.lastNewAgents, 9)}`,
     `k.${kinds}`,
     `n.${obs.agentName}`,
     `x.${obs.otherName}`,
+    `b.${obs.priorName}`,
   ].join(':');
 }
 

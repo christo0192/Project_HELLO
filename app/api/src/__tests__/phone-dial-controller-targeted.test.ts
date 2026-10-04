@@ -52,6 +52,7 @@ import {
 } from '../integrations/livekit-phone-dial/dial.js';
 import { loadPhoneDialConfig } from '../integrations/livekit-phone-dial/config.js';
 import { createLogger } from '../lib/logger.js';
+import { createAgentJoinObservationSink } from '../lib/phone-runtime/join-observation-log.js';
 import { wrapDialableNumber } from '../integrations/livekit-phone-dial/dialable-number.js';
 import {
   createSyntheticSipClient,
@@ -783,6 +784,7 @@ describe('M010 — the targeted path reports what the join barrier saw', () => {
     return { h: { ...h, deps }, sink };
   }
   const codeOf = (sink: ReturnType<typeof vi.fn>): string => String(sink.mock.calls[0]?.[0] ?? '');
+  const TAIL_NONE = 'a.0:z.0:k.none:n.n:x.n:b.n';
 
   it('a join reports o.j with the per-machine name matched and the leased machine id', async () => {
     const { h, sink } = observed({
@@ -792,7 +794,7 @@ describe('M010 — the targeted path reports what the join barrier saw', () => {
     const res = await run(h);
     expect(res.status).toBe('dialing');
     expect(sink).toHaveBeenCalledTimes(1);
-    expect(codeOf(sink)).toBe('o.j:l.2.0.0:e.0:f.0:s.0:p.1:a.1:k.4:n.y:x.n');
+    expect(codeOf(sink)).toBe('o.j:l.2.0.0:e.0:f.0:s.0:p.1:a.1:z.1:k.4:n.y:x.n:b.n');
     expect(sink.mock.calls[0]?.[1]).toBe(PHONE_AGENT_JOIN_POLL_MS / 1000);
     expect(sink.mock.calls[0]?.[2]).toBe(MACHINE);
   });
@@ -804,16 +806,26 @@ describe('M010 — the targeted path reports what the join barrier saw', () => {
     ['an agent of ANOTHER machine', agent('AJ_other', `${BASE}-${OTHER_MACHINE}`), 'm'],
     ['an agent under the SHARED name', agent('AJ_shared', BASE), 's'],
     ['an agent under an unrelated name', agent('AJ_x', 'browser-screener'), 'o'],
+    ['the matching agent with NO identity', { kind: 4, attributes: { [PHONE_AGENT_NAME_ATTRIBUTE]: PER_MACHINE } }, 'y'],
   ] as const) {
     it(`a timeout with ${label} reports n.${n} and still defers exactly as before`, async () => {
       const { h, sink } = observed({ worker: TARGETED_READY, listings: [[], [participant]] });
       expectInfraDeferral(await run(h), h, 'agent_join_timeout');
       expect(codeOf(sink)).toMatch(
-        new RegExp(String.raw`^o\.t:l\.\d+\.0\.0:e\.0:f\.0:s\.0:p\.1:a\.1:k\.4:n\.` + n + String.raw`:x\.n$`),
+        new RegExp(String.raw`^o\.t:l\.\d+\.0\.0:e\.0:f\.0:s\.0:p\.1:a\.1:z\.1:k\.4:n\.` + n + String.raw`:x\.n:b\.n$`),
       );
       expect(sink.mock.calls[0]?.[1]).toBe(20);
     });
   }
+
+  it('an agent that joined and then LEFT shows a.1 with z.0', async () => {
+    const { h, sink } = observed({
+      worker: TARGETED_READY,
+      listings: [[], [{ identity: 'AJ_new', kind: 4, attributes: {} }], []],
+    });
+    expectInfraDeferral(await run(h), h, 'agent_join_timeout');
+    expect(codeOf(sink)).toMatch(/:a\.1:z\.0:k\.4:n\.e:x\.n:b\.n$/);
+  });
 
   it('our worker joining as a STANDARD participant shows up in x, not n', async () => {
     const { h, sink } = observed({
@@ -821,7 +833,7 @@ describe('M010 — the targeted path reports what the join barrier saw', () => {
       listings: [[], [{ identity: 'AJ_new', kind: 0, attributes: { [PHONE_AGENT_NAME_ATTRIBUTE]: PER_MACHINE } }]],
     });
     expectInfraDeferral(await run(h), h, 'agent_join_timeout');
-    expect(codeOf(sink)).toMatch(/:a\.0:k\.0:n\.n:x\.y$/);
+    expect(codeOf(sink)).toMatch(/:a\.0:z\.0:k\.0:n\.n:x\.y:b\.n$/);
   });
 
   it('a SIP-only room reports kind 3 with no new agent', async () => {
@@ -830,26 +842,26 @@ describe('M010 — the targeted path reports what the join barrier saw', () => {
       listings: [[], [{ identity: 'SIP_x', kind: 3, attributes: {} }]],
     });
     expectInfraDeferral(await run(h), h, 'agent_join_timeout');
-    expect(codeOf(sink)).toMatch(/:p\.1:a\.0:k\.3:n\.n:x\.e$/);
+    expect(codeOf(sink)).toMatch(/:p\.1:a\.0:z\.0:k\.3:n\.n:x\.e:b\.n$/);
   });
 
-  it('string kinds map to their enum numbers; anything else is x', async () => {
+  it('only EXACT string kind names map to enum numbers; any other spelling is x', async () => {
     const { h, sink } = observed({
       worker: TARGETED_READY,
       listings: [[], [
         { identity: 'P1', kind: 'STANDARD', attributes: {} },
-        { identity: 'P2', kind: 'sip', attributes: {} },
+        { identity: 'P2', kind: 'agent', attributes: {} },
         { identity: 'P3', kind: 'WEIRD', attributes: {} },
       ]],
     });
     expectInfraDeferral(await run(h), h, 'agent_join_timeout');
-    expect(codeOf(sink)).toMatch(/:k\.0\.3\.x:/);
+    expect(codeOf(sink)).toMatch(/:k\.0\.x:/);
   });
 
   it('a room that never appears counts not_found listings separately', async () => {
     const { h, sink } = observed({ worker: TARGETED_READY, listings: [notFound()] });
     expectInfraDeferral(await run(h), h, 'agent_join_timeout');
-    expect(codeOf(sink)).toMatch(/^o\.t:l\.0\.\d+\.0:e\.0:f\.0:s\.0:p\.0:a\.0:k\.none:n\.n:x\.n$/);
+    expect(codeOf(sink)).toMatch(new RegExp(String.raw`^o\.t:l\.0\.\d+\.0:e\.0:f\.0:s\.0:p\.0:` + TAIL_NONE + '$'));
   });
 
   it('a room that VANISHES after a good listing sets f.1', async () => {
@@ -864,12 +876,13 @@ describe('M010 — the targeted path reports what the join barrier saw', () => {
     ['a Twirp unavailable', Object.assign(new Error('no'), { code: 'unavailable' }), 'un'],
     ['an HTTP 500', Object.assign(new Error('no'), { status: 500 }), 'in'],
     ['a plain error', new Error('livekit 503'), 'ot'],
+    ['a code named constructor', Object.assign(new Error('no'), { code: 'constructor' }), 'ot'],
   ] as const) {
     it(`persistent listing errors (${label}) report o.u with class ${cls}`, async () => {
       const { h, sink } = observed({ worker: TARGETED_READY, listings: [notFound(), [], err] });
       expectInfraDeferral(await run(h), h, 'agent_join_unverifiable');
       expect(codeOf(sink)).toBe(
-        `o.u:l.1.0.${PHONE_AGENT_JOIN_MAX_CONSECUTIVE_ERRORS}:e.${cls}:f.0:s.0:p.0:a.0:k.none:n.n:x.n`,
+        `o.u:l.1.0.${PHONE_AGENT_JOIN_MAX_CONSECUTIVE_ERRORS}:e.${cls}:f.0:s.0:p.0:${TAIL_NONE}`,
       );
     });
   }
@@ -881,20 +894,22 @@ describe('M010 — the targeted path reports what the join barrier saw', () => {
     });
     expectInfraDeferral(await run(h), h, 'agent_join_unverifiable');
     expect(h.createRoom).not.toHaveBeenCalled();
-    expect(codeOf(sink)).toBe(`o.su:l.0.0.${PHONE_AGENT_JOIN_MAX_CONSECUTIVE_ERRORS}:e.ua:f.0:s.0:p.0:a.0:k.none:n.n:x.n`);
+    expect(codeOf(sink)).toBe(
+      `o.su:l.0.0.${PHONE_AGENT_JOIN_MAX_CONSECUTIVE_ERRORS}:e.ua:f.0:s.0:p.0:${TAIL_NONE}`,
+    );
   });
 
   it('a FAILED dispatch reports o.nd', async () => {
     const { h, sink } = observed({ worker: TARGETED_READY, listings: [notFound()], dispatchFails: true });
     expectInfraDeferral(await run(h), h, 'agent_dispatch_failed');
-    expect(codeOf(sink)).toBe('o.nd:l.0.1.0:e.0:f.0:s.0:p.0:a.0:k.none:n.n:x.n');
+    expect(codeOf(sink)).toBe(`o.nd:l.0.1.0:e.0:f.0:s.0:p.0:${TAIL_NONE}`);
   });
 
-  it('agents already in an adopted room are counted in s and not as new', async () => {
+  it('agents already in an adopted room are counted in s, classified in b, and never as new', async () => {
     const old = agent('AJ_old', PER_MACHINE);
     const { h, sink } = observed({ worker: TARGETED_READY, listings: [[old], [old]] });
     expectInfraDeferral(await run(h), h, 'agent_join_timeout');
-    expect(codeOf(sink)).toMatch(/:s\.1:p\.1:a\.0:k\.4:n\.n:x\.n$/);
+    expect(codeOf(sink)).toMatch(/:s\.1:p\.1:a\.0:z\.0:k\.4:n\.n:x\.n:b\.y$/);
   });
 
   it('a THROWING sink never changes the dial', async () => {
@@ -912,11 +927,12 @@ describe('M010 — the targeted path reports what the join barrier saw', () => {
     const unhandled = vi.fn();
     process.on('unhandledRejection', unhandled);
     try {
-      const { h } = observed(
+      const { h, sink } = observed(
         { worker: TARGETED_READY, listings: [notFound(), [agent('AJ_new', PER_MACHINE)]] },
         () => Promise.reject(new Error('async sink broke')),
       );
       expect((await run(h)).status).toBe('dialing');
+      expect(sink).toHaveBeenCalledTimes(1);
       await new Promise((r) => setTimeout(r, 0));
       expect(unhandled).not.toHaveBeenCalled();
     } finally {
@@ -930,9 +946,11 @@ describe('M010 — the targeted path reports what the join barrier saw', () => {
     expect(sink).not.toHaveBeenCalled();
   });
 
-  it('EVERY code survives the REAL logger unchanged, including the worst case', () => {
+  it('the runtime sink emits EVERY code through the REAL logger unchanged, worst case included', () => {
     const lines: string[] = [];
-    const logger = createLogger('phone-runtime', { writer: (l) => lines.push(l) });
+    const sink = createAgentJoinObservationSink(
+      createLogger('phone-runtime', { writer: (l) => lines.push(l) }),
+    );
     const stages = ['j', 't', 'u', 'su', 'nd'] as const;
     const statuses = ['n', 'e', 'a', 'o', 's', 'm', 'y'] as const;
     const classes = [undefined, 'pd', 'ua', 'un', 'de', 'in', 'rl', 'na', 'ot'] as const;
@@ -943,27 +961,28 @@ describe('M010 — the targeted path reports what the join barrier saw', () => {
           const obs = newAgentJoinObservation();
           obs.listingsOk = 1000; obs.listingsNotFound = 1000; obs.listingsFailed = 1000;
           obs.firstErrorClass = cls; obs.notFoundAfterOk = true;
-          obs.snapshotAgents = 50; obs.maxParticipants = 50; obs.maxNewAgents = 50;
-          for (const k of ['12', '13', '14', '15']) obs.kinds.add(k);
-          obs.agentName = n; obs.otherName = n;
+          obs.snapshotAgents = 50; obs.maxParticipants = 50; obs.maxNewAgents = 50; obs.lastNewAgents = 50;
+          for (const k of ['13', '14', '15']) obs.kinds.add(k);
+          obs.agentName = n; obs.otherName = n; obs.priorName = n;
           codes.push(phoneAgentJoinObservationCode(stage, obs));
         }
       }
     }
-    expect(Math.max(...codes.map((c) => c.length))).toBeLessThanOrEqual(64);
+    expect(Math.max(...codes.map((c) => c.length))).toBe(64);
     for (const code of codes) {
-      lines.length = 0;
-      logger.info('unknown_event', {
-        error_type: 'phone_agent_join_observed',
-        error_category: code,
-        duration_sec: 19.5,
-        phase: MACHINE,
-      });
-      const parsed = JSON.parse(lines[0] ?? '{}') as Record<string, unknown>;
-      expect(parsed.error_type).toBe('phone_agent_join_observed');
-      expect(parsed.error_category).toBe(code);
-      expect(parsed.duration_sec).toBe(19.5);
-      expect(parsed.phase).toBe(MACHINE);
+      for (const [machineId, phase] of [
+        [MACHINE, `m.${MACHINE.slice(0, 7)}.${MACHINE.slice(7)}`],
+        ['12345678901234', 'm.1234567.8901234'],
+        ['', 'none'],
+      ] as const) {
+        lines.length = 0;
+        sink(code, 19.5, machineId);
+        const parsed = JSON.parse(lines[0] ?? '{}') as Record<string, unknown>;
+        expect(parsed.error_type).toBe('phone_agent_join_observed');
+        expect(parsed.error_category).toBe(code);
+        expect(parsed.duration_sec).toBe(19.5);
+        expect(parsed.phase).toBe(phase);
+      }
     }
   });
 
@@ -979,11 +998,13 @@ describe('M010 — the targeted path reports what the join barrier saw', () => {
     expect(classifyAgentNameAttr({ [PHONE_AGENT_NAME_ATTRIBUTE]: `${BASE}-x` }, PER_MACHINE, '')).toBe('o');
   });
 
-  it('classifies listing errors from code or status only', () => {
+  it('classifies listing errors from code or status only, own keys only', () => {
     expect(classifyListingError(Object.assign(new Error('x'), { code: 'DEADLINE_EXCEEDED' }))).toBe('de');
     expect(classifyListingError(Object.assign(new Error('x'), { statusCode: 429 }))).toBe('rl');
     expect(classifyListingError(Object.assign(new Error('x'), { status: 403 }))).toBe('pd');
     expect(classifyListingError(Object.assign(new Error('x'), { status: 504 }))).toBe('de');
+    expect(classifyListingError({ code: '__proto__' })).toBe('ot');
+    expect(classifyListingError({ code: 'constructor' })).toBe('ot');
     expect(classifyListingError('nope')).toBe('ot');
     expect(classifyListingError(null)).toBe('ot');
   });

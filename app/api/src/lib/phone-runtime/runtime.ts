@@ -64,6 +64,7 @@ import {
   type SchedulerLoopConfig,
 } from '../scheduler.js';
 import { createLogger } from '../logger.js';
+import { createAgentJoinObservationSink } from './join-observation-log.js';
 import { supabase } from '../supabase.js';
 import { createSession, transitionSession } from '../session-lifecycle.js';
 import {
@@ -628,6 +629,7 @@ export function createPhoneRuntime(
   const runtimeConfig = options.runtimeConfig ?? loadPhoneRuntimeConfig();
   const dialConfig = options.dialConfig ?? loadPhoneDialConfig();
   const logger = createLogger('phone-runtime');
+  const agentJoinObservationSink = createAgentJoinObservationSink(logger);
   // M009 E2. The targeted-dispatch join wait is CLAMPED so the worker-ready
   // gate plus the join still fit inside the admission lease; when the lease is
   // too short for even the floor, every targeted dial would spend lease the
@@ -927,16 +929,9 @@ export function createPhoneRuntime(
                   workerGate,
                   // M010: one closed-vocabulary line per targeted dial, so a
                   // deferred dial says WHY the agent was not counted. A code,
-                  // seconds, and the leased Fly machine id (not personal data;
-                  // the worker logs it too) to match the worker's own lines.
-                  onAgentJoinObservation: (code, elapsedSec, machineId) => {
-                    logger.info('unknown_event', {
-                      error_type: 'phone_agent_join_observed',
-                      error_category: code,
-                      duration_sec: elapsedSec,
-                      phase: machineId === '' ? 'none' : machineId,
-                    });
-                  },
+                  // seconds, and the leased Fly machine id as a correlator to
+                  // the worker's own lines (see join-observation-log.ts).
+                  onAgentJoinObservation: agentJoinObservationSink,
                 });
                 // `detail` is carried, not dropped. It is admission's
                 // stable sub-code, and dropping it here is precisely how
