@@ -925,14 +925,16 @@ export function createPhoneRuntime(
                   // Undefined unless `env.workerOrchestration` is on ⇒ the dial
                   // path is byte-identical to today by default.
                   workerGate,
-                  // M010: one closed-vocabulary line per targeted join
-                  // barrier, so a deferred dial says WHY the agent was not
-                  // counted. Codes and seconds only — never a room or a name.
-                  onAgentJoinObservation: (code, elapsedSec) => {
+                  // M010: one closed-vocabulary line per targeted dial, so a
+                  // deferred dial says WHY the agent was not counted. A code,
+                  // seconds, and the leased Fly machine id (not personal data;
+                  // the worker logs it too) to match the worker's own lines.
+                  onAgentJoinObservation: (code, elapsedSec, machineId) => {
                     logger.info('unknown_event', {
                       error_type: 'phone_agent_join_observed',
                       error_category: code,
                       duration_sec: elapsedSec,
+                      phase: machineId === '' ? 'none' : machineId,
                     });
                   },
                 });
