@@ -808,7 +808,7 @@ describe('M010 — the agent-join barrier reports what it saw', () => {
       const res = await run(h);
       expectInfraDeferral(res, h, 'agent_join_timeout');
       const code = sink.mock.calls[0]?.[0] ?? '';
-      expect(code).toMatch(new RegExp(`^o\.timeout:l\.\d+\.0\.0:p\.1:a\.1:k\.4:n\.${n}$`));
+      expect(code).toMatch(new RegExp(String.raw`^o\.timeout:l\.\d+\.0\.0:p\.1:a\.1:k\.4:n\.` + `${n}$`));
       expect(sink.mock.calls[0]?.[1]).toBe(20);
     });
   }
