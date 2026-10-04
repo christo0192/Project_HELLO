@@ -64,6 +64,7 @@ import {
   type SchedulerLoopConfig,
 } from '../scheduler.js';
 import { createLogger } from '../logger.js';
+import { createAgentJoinObservationSink } from '../phone-join-observation-log.js';
 import { supabase } from '../supabase.js';
 import { createSession, transitionSession } from '../session-lifecycle.js';
 import {
@@ -628,6 +629,7 @@ export function createPhoneRuntime(
   const runtimeConfig = options.runtimeConfig ?? loadPhoneRuntimeConfig();
   const dialConfig = options.dialConfig ?? loadPhoneDialConfig();
   const logger = createLogger('phone-runtime');
+  const agentJoinObservationSink = createAgentJoinObservationSink(logger);
   // M009 E2. The targeted-dispatch join wait is CLAMPED so the worker-ready
   // gate plus the join still fit inside the admission lease; when the lease is
   // too short for even the floor, every targeted dial would spend lease the
@@ -925,6 +927,11 @@ export function createPhoneRuntime(
                   // Undefined unless `env.workerOrchestration` is on ⇒ the dial
                   // path is byte-identical to today by default.
                   workerGate,
+                  // M010: one closed-vocabulary line per targeted dial, so a
+                  // deferred dial says WHY the agent was not counted. A code,
+                  // seconds, and the leased Fly machine id as a correlator to
+                  // the worker's own lines (see lib/phone-join-observation-log.ts).
+                  onAgentJoinObservation: agentJoinObservationSink,
                 });
                 // `detail` is carried, not dropped. It is admission's
                 // stable sub-code, and dropping it here is precisely how
