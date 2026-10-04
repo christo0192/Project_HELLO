@@ -612,7 +612,7 @@ describe('M009 E2 — the agent-join barrier never dials into a room without the
     ['a new agent of ANOTHER machine', agent('AJ_other', `${BASE}-${OTHER_MACHINE}`)],
     ['a new agent under the SHARED name', agent('AJ_shared', BASE)],
     ['a SIP participant carrying the targeted name', { identity: 'SIP_x', kind: 3, attributes: { [PHONE_AGENT_NAME_ATTRIBUTE]: PER_MACHINE } }],
-    ['an agent with the name under the WRONG attribute key', { identity: 'AJ_key', kind: 4, attributes: { 'lk.agent_name': PER_MACHINE } }],
+    ['an agent with the name under the WRONG attribute key', { identity: 'AJ_key', kind: 4, attributes: { agent_name: PER_MACHINE } }],
     ['an agent with no identity', { kind: 4, attributes: { [PHONE_AGENT_NAME_ATTRIBUTE]: PER_MACHINE } }],
   ] as const) {
     it(`(e) ${label} does not satisfy the barrier`, async () => {
@@ -805,7 +805,7 @@ describe('M010 — the targeted path reports what the join barrier saw', () => {
   for (const [label, participant, n] of [
     ['an agent with NO attributes at all', { identity: 'AJ_new', kind: 4 }, 'e'],
     ['an agent with an EMPTY attribute map', { identity: 'AJ_new', kind: 4, attributes: {} }, 'e'],
-    ['an agent whose name sits under another key', { identity: 'AJ_new', kind: 4, attributes: { 'lk.agent_name': PER_MACHINE } }, 'a'],
+    ['an agent whose name sits under another key', { identity: 'AJ_new', kind: 4, attributes: { agent_name: PER_MACHINE } }, 'a'],
     ['an agent of ANOTHER machine', agent('AJ_other', `${BASE}-${OTHER_MACHINE}`), 'm'],
     ['an agent under the SHARED name', agent('AJ_shared', BASE), 's'],
     ['an agent under an unrelated name', agent('AJ_x', 'browser-screener'), 'o'],
@@ -1092,6 +1092,44 @@ describe('M010 — the agent name survives the REAL livekit-server-sdk parse', (
     expect(String(sink.mock.calls[0]?.[0])).toMatch(/^o\.j:.*:n\.y:/);
   });
 
+  it('the SERVER stamp alone (lk.agent_name) is found after the real parse', async () => {
+    const listed = await listViaRealSdk({ 'lk.agent_name': PER_MACHINE });
+    expect(readAgentNameAttribute(listed[0]?.attributes)).toBe(PER_MACHINE);
+  });
+
+  it('pins the 2.16 collision: with differing values the LAST key in the body wins', async () => {
+    // JSON preserves insertion order; LiveKit writes map keys sorted, so the
+    // server's lk.agent_name ('_' > '.') is the one a 2.16 SDK delivers.
+    const listed = await listViaRealSdk({ 'lk.agent.name': 'phone-screener-other', 'lk.agent_name': PER_MACHINE });
+    const name = readAgentNameAttribute(listed[0]?.attributes);
+    const attrs = (listed[0]?.attributes ?? {}) as Record<string, string>;
+    if (PHONE_AGENT_NAME_ATTRIBUTE in attrs) {
+      expect(name).toBe('phone-screener-other'); // an SDK without the rewrite keeps both keys
+    } else {
+      expect(name).toBe(PER_MACHINE);
+    }
+  });
+
+  it('END TO END: a SIP participant carrying the name through the real parse never satisfies the barrier', async () => {
+    const fetchSpy = vi.fn(async () => new Response(JSON.stringify({
+      participants: [{ sid: 'PA_sip', identity: 'sip-x', state: 'ACTIVE', kind: 'SIP', attributes: { lk_agent_name: PER_MACHINE, 'lk.agent.name': PER_MACHINE } }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } }));
+    vi.stubGlobal('fetch', fetchSpy);
+    let realParsed: Awaited<ReturnType<typeof listViaRealSdk>>;
+    try {
+      const clients = createPhoneRoomClients(
+        { url: 'https://livekit.test', apiKey: 'APItest', apiSecret: 'secret-for-tests-only-0123456789' },
+        BASE,
+      );
+      realParsed = await clients!.rooms.listParticipants!(ROOM);
+    } finally {
+      vi.unstubAllGlobals();
+    }
+    expect(realParsed[0]?.kind).toBe(3);
+    const h = harness({ worker: TARGETED_READY, listings: [[], realParsed] });
+    expectInfraDeferral(await run(h), h, 'agent_join_timeout');
+  });
+
   it('END TO END: another machine\'s name through the real parse still never satisfies the barrier', async () => {
     const realParsed = await listViaRealSdk({ 'lk.agent.name': `${BASE}-${OTHER_MACHINE}` });
     const h = harness({ worker: TARGETED_READY, listings: [[], realParsed] });
@@ -1104,7 +1142,9 @@ describe('M010 — the agent name survives the REAL livekit-server-sdk parse', (
     expect(readAgentNameAttribute({ 'lk.agent.name': 'a', lkAgentName: 'b' })).toBe('a');
     expect(readAgentNameAttribute({ 'lk.agent.name': '', lkAgentName: 'b' })).toBe('b');
     expect(readAgentNameAttribute({ 'lk.agent.name': 7 })).toBeUndefined();
-    expect(readAgentNameAttribute({ 'lk.agent_name': 'c' })).toBeUndefined();
+    expect(readAgentNameAttribute({ 'lk.agent_name': 'c' })).toBe('c');
+    expect(readAgentNameAttribute({ 'lk.agent_name': 'c', lkAgentName: 'b' })).toBe('c');
+    expect(readAgentNameAttribute({ agent_name: 'x', lk_agent: 'y' })).toBeUndefined();
     expect(readAgentNameAttribute({})).toBeUndefined();
     expect(readAgentNameAttribute(undefined)).toBeUndefined();
     expect(readAgentNameAttribute(Object.create({ lkAgentName: 'inherited' }))).toBeUndefined();
