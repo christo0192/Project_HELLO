@@ -968,7 +968,8 @@ describe('M010 — the targeted path reports what the join barrier saw', () => {
         }
       }
     }
-    expect(Math.max(...codes.map((c) => c.length))).toBe(64);
+    // The worst case (every field at its widest) is 63 characters: inside 64.
+    expect(Math.max(...codes.map((c) => c.length))).toBe(63);
     for (const code of codes) {
       for (const [machineId, phase] of [
         [MACHINE, `m.${MACHINE.slice(0, 7)}.${MACHINE.slice(7)}`],
