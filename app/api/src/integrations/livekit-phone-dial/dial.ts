@@ -139,12 +139,48 @@ export const PHONE_AGENT_JOIN_MAX_CONSECUTIVE_ERRORS = 3;
  * `ATTRIBUTE_AGENT_NAME = "lk.agent.name"` in `livekit/agents/types.py` and
  * sets it in `worker.py` on job accept (`participant_attributes[...] =
  * self._agent_name`); its own `wait_for_agent` matches on the same key. The
- * similar-looking `lk.agent_name` exists only as a TELEMETRY span attribute in
- * that SDK and is never set on a participant — matching on it would make every
- * targeted dial time out and defer. Re-verify this key whenever the worker's
- * livekit-agents pin moves.
+ * LiveKit server additionally stamps `lk.agent_name` (underscore) with the same
+ * registered name on recent versions; this module does not rely on it.
+ * Re-verify this key whenever the worker's livekit-agents pin moves.
+ *
+ * NEVER read this key directly — use `readAgentNameAttribute` (see below).
  */
 export const PHONE_AGENT_NAME_ATTRIBUTE = 'lk.agent.name';
+
+/**
+ * The SAME attribute as it actually arrives through livekit-server-sdk 2.16.x.
+ *
+ * ── M010 ROOT CAUSE (production 2026-10-04) ────────────────────────────
+ * livekit-server-sdk 2.16.0's `TwirpRpc.request` runs
+ * `camelcaseKeys(parsedResp, { deep: true })` over EVERY Twirp response
+ * (dist/TwirpRPC.js). "Deep" includes the user-data keys of
+ * `ParticipantInfo.attributes`, a map<string,string>, so `lk.agent.name`
+ * reaches us as `lkAgentName` (and `lk.agent_name` collapses onto the same
+ * key). The barrier looked up the dotted key, found nothing on every agent,
+ * and deferred every targeted dial: nobody was called. The unit tests never
+ * saw it because they mocked `listParticipants` above the SDK. Upstream
+ * dropped the conversion in 2.17.0, so the dotted key is read FIRST and this
+ * spelling is the fallback — correct on either SDK version.
+ */
+export const PHONE_AGENT_NAME_ATTRIBUTE_SDK_CAMEL = 'lkAgentName';
+
+/**
+ * The registered agent name a participant's attribute map carries, under
+ * either spelling (dotted, or the SDK's camel-cased rewrite), or `undefined`.
+ * Only a non-empty string counts. Both spellings carry the SAME registered
+ * name when both are present (the agents SDK's and the server's stamps), so
+ * the order only matters for an SDK that keeps the dotted key.
+ */
+export function readAgentNameAttribute(attributes: unknown): string | undefined {
+  if (attributes === null || typeof attributes !== 'object') return undefined;
+  const map = attributes as Record<string, unknown>;
+  for (const key of [PHONE_AGENT_NAME_ATTRIBUTE, PHONE_AGENT_NAME_ATTRIBUTE_SDK_CAMEL]) {
+    if (!Object.hasOwn(map, key)) continue;
+    const value = map[key];
+    if (typeof value === 'string' && value !== '') return value;
+  }
+  return undefined;
+}
 
 /**
  * `ParticipantInfo_Kind.AGENT` in @livekit/protocol. The SDK hands it back as
@@ -1119,7 +1155,7 @@ async function awaitTargetedAgentJoin(input: {
         isAgentParticipant(p)
         && typeof p.identity === 'string'
         && !input.agentsBefore.has(p.identity)
-        && p.attributes?.[PHONE_AGENT_NAME_ATTRIBUTE] === input.targetAgent
+        && readAgentNameAttribute(p.attributes) === input.targetAgent
       ) {
         return 'joined';
       }
@@ -1279,8 +1315,8 @@ export function classifyAgentNameAttr(
 ): PhoneAgentNameAttrStatus {
   if (attributes === null || typeof attributes !== 'object') return 'e';
   if (Object.keys(attributes).length === 0) return 'e';
-  const value = (attributes as Record<string, unknown>)[PHONE_AGENT_NAME_ATTRIBUTE];
-  if (typeof value !== 'string' || value === '') return 'a';
+  const value = readAgentNameAttribute(attributes);
+  if (value === undefined) return 'a';
   if (value === targetAgent) return 'y';
   if (value === sharedAgentName) return 's';
   if (sharedAgentName !== '' && value.startsWith(`${sharedAgentName}-`)) return 'm';

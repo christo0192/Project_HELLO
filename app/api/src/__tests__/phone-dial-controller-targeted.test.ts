@@ -39,6 +39,7 @@ import {
   PHONE_AGENT_JOIN_MAX_CONSECUTIVE_ERRORS,
   PHONE_AGENT_JOIN_POLL_MS,
   PHONE_AGENT_NAME_ATTRIBUTE,
+  PHONE_AGENT_NAME_ATTRIBUTE_SDK_CAMEL,
   PHONE_WORKER_GATE_CEILING_SEC,
   PHONE_WORKER_READY_CEILING_SEC,
   PHONE_WORKER_START_WAIT_CEILING_SEC,
@@ -47,11 +48,13 @@ import {
   dialPhoneAttempt,
   newAgentJoinObservation,
   phoneAgentJoinObservationCode,
+  readAgentNameAttribute,
   type PhoneAgentJoinClock,
   type PhoneDialDeps,
 } from '../integrations/livekit-phone-dial/dial.js';
 import { loadPhoneDialConfig } from '../integrations/livekit-phone-dial/config.js';
 import { createLogger } from '../lib/logger.js';
+import { createPhoneRoomClients } from '../lib/phone-runtime/livekit-clients.js';
 import { createAgentJoinObservationSink } from '../lib/phone-join-observation-log.js';
 import { wrapDialableNumber } from '../integrations/livekit-phone-dial/dialable-number.js';
 import {
@@ -1008,5 +1011,102 @@ describe('M010 — the targeted path reports what the join barrier saw', () => {
     expect(classifyListingError({ code: 'constructor' })).toBe('ot');
     expect(classifyListingError('nope')).toBe('ot');
     expect(classifyListingError(null)).toBe('ot');
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// M010 ROOT CAUSE — the attribute key as the REAL SDK delivers it.
+// livekit-server-sdk 2.16.x deep-camel-cases every Twirp response, so the
+// agents SDK's `lk.agent.name` reaches us as `lkAgentName`. Every test above
+// hands the barrier hand-built participants with the dotted key; these run
+// the REAL client (createPhoneRoomClients → RoomServiceClient →
+// TwirpRpc → ListParticipantsResponse.fromJson) over a raw LiveKit JSON body,
+// which is the path that failed in production on 2026-10-04.
+// ═══════════════════════════════════════════════════════════════════════
+
+describe('M010 — the agent name survives the REAL livekit-server-sdk parse', () => {
+  /** A raw ListParticipants body exactly as LiveKit sends it (dotted keys). */
+  function rawListing(attributes: Record<string, string>) {
+    return {
+      participants: [{
+        sid: 'PA_test', identity: 'agent-AJ_test', state: 'ACTIVE', kind: 'AGENT',
+        attributes,
+      }],
+    };
+  }
+
+  async function listViaRealSdk(attributes: Record<string, string>) {
+    const fetchSpy = vi.fn(async (input: unknown) => {
+      expect(String(input)).toContain('/twirp/livekit.RoomService/ListParticipants');
+      return new Response(JSON.stringify(rawListing(attributes)), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    });
+    vi.stubGlobal('fetch', fetchSpy);
+    try {
+      const clients = createPhoneRoomClients(
+        { url: 'https://livekit.test', apiKey: 'APItest', apiSecret: 'secret-for-tests-only-0123456789' },
+        BASE,
+      );
+      expect(clients).not.toBeNull();
+      const listed = await clients!.rooms.listParticipants!(ROOM);
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      return listed;
+    } finally {
+      vi.unstubAllGlobals();
+    }
+  }
+
+  it('the agents-SDK stamp (lk.agent.name) is found after the real parse, whatever key spelling the SDK delivers', async () => {
+    const listed = await listViaRealSdk({ 'lk.agent.name': PER_MACHINE, 'lk.agent.state': 'listening' });
+    expect(listed).toHaveLength(1);
+    expect(listed[0]?.kind).toBe(4);
+    expect(readAgentNameAttribute(listed[0]?.attributes)).toBe(PER_MACHINE);
+  });
+
+  it('documents the 2.16 rewrite this fix exists for (dotted key gone, camel key present)', async () => {
+    const listed = await listViaRealSdk({ 'lk.agent.name': PER_MACHINE });
+    const attrs = (listed[0]?.attributes ?? {}) as Record<string, string>;
+    // If the SDK is upgraded past the rewrite this flips to the dotted key, and
+    // readAgentNameAttribute (asserted above) keeps working either way.
+    expect(attrs[PHONE_AGENT_NAME_ATTRIBUTE] ?? attrs[PHONE_AGENT_NAME_ATTRIBUTE_SDK_CAMEL]).toBe(PER_MACHINE);
+  });
+
+  it('the server stamp (lk.agent_name) alongside it still resolves to the registered name', async () => {
+    const listed = await listViaRealSdk({ 'lk.agent.name': PER_MACHINE, 'lk.agent_name': PER_MACHINE });
+    expect(readAgentNameAttribute(listed[0]?.attributes)).toBe(PER_MACHINE);
+  });
+
+  it('END TO END: the barrier joins on a participant produced by the real SDK parse, then rings', async () => {
+    const realParsed = await listViaRealSdk({ 'lk.agent.name': PER_MACHINE, 'lk.agent.state': 'initializing' });
+    const { h, sink } = (() => {
+      const hh = harness({ worker: TARGETED_READY, listings: [notFound(), [], realParsed] });
+      const s = vi.fn();
+      return { h: { ...hh, deps: { ...hh.deps, onAgentJoinObservation: s } }, sink: s };
+    })();
+    const res = await run(h);
+    expect(res.status).toBe('dialing');
+    expect(res.providerContacted).toBe(true);
+    expect(h.originate).toHaveBeenCalledTimes(1);
+    expect(String(sink.mock.calls[0]?.[0])).toMatch(/^o\.j:.*:n\.y:/);
+  });
+
+  it('END TO END: another machine\'s name through the real parse still never satisfies the barrier', async () => {
+    const realParsed = await listViaRealSdk({ 'lk.agent.name': `${BASE}-${OTHER_MACHINE}` });
+    const h = harness({ worker: TARGETED_READY, listings: [[], realParsed] });
+    expectInfraDeferral(await run(h), h, 'agent_join_timeout');
+  });
+
+  it('readAgentNameAttribute: dotted first, camel fallback, non-empty strings only, own keys only', () => {
+    expect(readAgentNameAttribute({ 'lk.agent.name': 'a' })).toBe('a');
+    expect(readAgentNameAttribute({ lkAgentName: 'b' })).toBe('b');
+    expect(readAgentNameAttribute({ 'lk.agent.name': 'a', lkAgentName: 'b' })).toBe('a');
+    expect(readAgentNameAttribute({ 'lk.agent.name': '', lkAgentName: 'b' })).toBe('b');
+    expect(readAgentNameAttribute({ 'lk.agent.name': 7 })).toBeUndefined();
+    expect(readAgentNameAttribute({ 'lk.agent_name': 'c' })).toBeUndefined();
+    expect(readAgentNameAttribute({})).toBeUndefined();
+    expect(readAgentNameAttribute(undefined)).toBeUndefined();
+    expect(readAgentNameAttribute(Object.create({ lkAgentName: 'inherited' }))).toBeUndefined();
   });
 });
