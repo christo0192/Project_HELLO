@@ -1791,6 +1791,61 @@ def phone_registered_agent_name() -> str:
     return base
 
 
+
+# ── M010: PUBLISH OUR OWN AGENT NAME AFTER CONNECT ─────────────────────
+# The API's agent-join barrier (livekit-phone-dial/dial.ts) rings a candidate
+# only once a NEW agent participant carrying `lk.agent.name` == the targeted
+# per-machine name is in the room. livekit-agents sends that attribute in its
+# job-accept availability response, but on our LiveKit Cloud project it never
+# reaches the participant (production 2026-10-04: the agent joined within ~3 s
+# and carried attributes, but not `lk.agent.name` — `n.a` on every targeted
+# dial), so every targeted dial deferred and nobody was called. The worker can
+# set its OWN participant attributes after connect — livekit-agents itself
+# sets `lk.agent.state` exactly this way — so it publishes the name here.
+#
+# Only the worker that actually received THIS job can publish it, and LiveKit
+# only routes a per-machine dispatch to the one machine registered under that
+# name, so the barrier's guarantee ("the leased machine's agent is in the
+# room") is unchanged. The key must equal the API's PHONE_AGENT_NAME_ATTRIBUTE
+# (pinned by test_phone_publish_agent_name.py).
+_PHONE_AGENT_NAME_ATTRIBUTE = "lk.agent.name"
+_PHONE_AGENT_NAME_PUBLISH_TIMEOUT_SEC = 5.0
+
+
+async def _publish_phone_agent_name(room: Any) -> str:
+    """Set ``lk.agent.name`` on this worker's own participant, once, after
+    ``ctx.connect``. Returns a fixed outcome label (also logged):
+
+      * ``skipped``  — the worker registered the BASE name, so the API never
+        targets it and runs no join barrier: nothing to publish (byte-identical
+        to the pre-M010 worker);
+      * ``ok``       — published;
+      * ``failed`` / ``timeout`` — could not publish. Fail-open: the session
+        proceeds; the API's barrier then defers the dial (no ring), exactly as
+        before this fix, so a failure here can never ring a candidate.
+
+    Never logs the name or any value — fixed categories only.
+    """
+    name = phone_registered_agent_name()
+    if name == "" or name == _phone_agent_name():
+        return "skipped"
+    try:
+        await asyncio.wait_for(
+            room.local_participant.set_attributes({_PHONE_AGENT_NAME_ATTRIBUTE: name}),
+            timeout=_PHONE_AGENT_NAME_PUBLISH_TIMEOUT_SEC,
+        )
+        outcome = "ok"
+    except asyncio.TimeoutError:
+        outcome = "timeout"
+    except Exception:  # noqa: BLE001 — fail-open; the API barrier stays closed
+        outcome = "failed"
+    if outcome == "ok":
+        _log.info("unknown_event", error_type="phone_agent_name_published", error_category=outcome)
+    else:
+        _log.warn("unknown_event", error_type="phone_agent_name_published", error_category=outcome)
+    return outcome
+
+
 def _prewarm_post_machine_ready(_proc: Any) -> None:
     """WorkerOptions.prewarm_fnc for a NAMED worker under on-demand
     orchestration: post MACHINE-level readiness (design §2.3b B-i for browser,
@@ -8544,6 +8599,9 @@ async def _run_phone_session(
 ) -> phone.PhoneGateResult:
     """Connect, wait, disclose, classify — then, and only then, screen."""
     await ctx.connect()
+    # M010: before anything else, so the API's join barrier sees this agent
+    # well inside its wait (see `_publish_phone_agent_name`).
+    await _publish_phone_agent_name(ctx.room)
 
     # ── ON-DEMAND ORCHESTRATION: READINESS IS NOW MACHINE-LEVEL AT PREWARM ─
     # design §2.3, PR B RISK "dispatch ordering vs cold start". The phone worker
