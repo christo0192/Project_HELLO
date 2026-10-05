@@ -17,6 +17,7 @@ import { idParamSchema, uuidSchema } from '../schemas/common.js';
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
 import { redactCandidatePhone } from '../lib/candidate-phone.js';
+import { loadPhoneProgress, phoneProgressFields } from '../lib/candidate-phone-progress.js';
 import { createLogger } from '../lib/logger.js';
 
 const candidateLogger = createLogger('candidates');
@@ -243,7 +244,8 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
   // candidate list must not stop working because the Ashby tables are
   // unavailable.
   let resumeReview = new Map<string, ResumeReview | null>();
-  if (ids.length > 0) {
+  const loadResumeReview = async (): Promise<void> => {
+    if (ids.length === 0) return;
     try {
       const { data: links, error: linkErr } = await supabase
         .from('ashby_application_links')
@@ -254,7 +256,14 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
         .limit(1, { foreignTable: 'ashby_resume_ingestions' });
       if (!linkErr) resumeReview = resumeReviewByCandidate(links as RawLinkRow[] | null);
     } catch { /* additive only — never fails the list */ }
-  }
+  };
+
+  // Phone progress (dial count, latest engagement state, allowlisted reason,
+  // last dial), alongside the links read. One query per 100 ids, over the
+  // SAME authorized candidate set, so interviewer owner-scoping is inherited.
+  // It never rejects: a failed or possibly-truncated read reports
+  // `dial_count: null` (unknown), never a confident 0.
+  const [, phoneProgress] = await Promise.all([loadResumeReview(), loadPhoneProgress(ids)]);
 
   // The role this list is being rendered for. `phone_e164` is admin-only —
   // see `redactCandidatePhone`. This endpoint has always SELECTED the column;
@@ -276,6 +285,9 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
       // import has null `name`/`email` and this is the only field that says
       // anything about it at all.
       resume_review: resumeReview.get(row.id) ?? null,
+      // dial_count / phone_state / phone_state_reason / last_dialed_at.
+      // null dial_count = unknown; 0 = never dialled.
+      ...phoneProgressFields(phoneProgress, row.id),
     };
   });
 
@@ -1357,6 +1369,13 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
   const { data: candidate, error } = await q.single();
   if (error) return res.status(404).json({ error: 'Candidate not found' });
 
+  // The same four phone-progress fields the list carries, from the same
+  // helper, read only for the candidate just authorized above. Started now and
+  // awaited at the end; it never rejects and degrades to unknown (all null).
+  const candidateId = (candidate as { id?: unknown } | null)?.id;
+  const authorizedId = typeof candidateId === 'string' ? candidateId : req.params.id;
+  const phoneProgressPromise = loadPhoneProgress([authorizedId]);
+
   const { data: sessions } = await supabase
     .from('call_sessions')
     .select('*')
@@ -1480,8 +1499,12 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
   // `select('*')` returns `phone_raw`, `phone_e164` AND the `parsed` blob, all
   // three of which carry the same number. One helper covers all three so a
   // future column cannot be redacted in one route and forgotten in another.
+  const phoneProgress = await phoneProgressPromise;
   res.json({
-    candidate: redactCandidatePhone(candidate as Record<string, unknown>, req.authUser?.appRole),
+    candidate: {
+      ...redactCandidatePhone(candidate as Record<string, unknown>, req.authUser?.appRole),
+      ...phoneProgressFields(phoneProgress, authorizedId),
+    },
     sessions: (sessions ?? []).map((session) => {
       const row = session as Record<string, unknown>;
       const id = row.id as string;

@@ -8398,7 +8398,7 @@ components:
 
     CandidateListItem:
       type: object
-      required: [id, name, email, phone_e164, phone_valid, skills, experience_years, status, role_id, created_at, resume_review]
+      required: [id, name, email, phone_e164, phone_valid, skills, experience_years, status, role_id, created_at, resume_review, dial_count, phone_state, phone_state_reason, last_dialed_at]
       properties:
         id:
           type: string
@@ -8443,7 +8443,39 @@ components:
           description: Sanitized resume-ingestion status for an Ashby-sourced candidate; null for every non-Ashby candidate and whenever the ingestion state cannot be read. needs_review deliberately says only that a human must look - never why, since the underlying scan/guard/parse codes are operator information behind the admin-gated Mission Control. An Ashby candidate whose resume has not been parsed yet is a PII-minimal shell, so name and email are legitimately null alongside a non-null value here.
           enum: [ready, processing, needs_review, cancelled]
           nullable: true
+        dial_count:
+          $ref: '#/components/schemas/CandidateDialCount'
+        phone_state:
+          $ref: '#/components/schemas/CandidatePhoneState'
+        phone_state_reason:
+          $ref: '#/components/schemas/CandidatePhoneStateReason'
+        last_dialed_at:
+          $ref: '#/components/schemas/CandidateLastDialedAt'
       additionalProperties: true
+
+    CandidateDialCount:
+      type: integer
+      minimum: 0
+      nullable: true
+      description: Phone dials that actually reached the candidate's phone, across every screening cycle. Counts every attempt kind, including lease-reclaimed attempts (state abandoned with a null abandon_reason), which rang before the worker died; excludes attempts abandoned with abandon_reason infra_deferred (given up before any carrier contact) and attempts whose outcome_class is provider_error (refused by the carrier before ringing). 0 means never dialled. null means UNKNOWN - the phone read failed or may have been truncated at the row cap - and is never a claim of zero.
+
+    CandidatePhoneState:
+      type: string
+      enum: [pending_prereqs, eligible, scheduled, dialing, in_call, reconnecting, awaiting_retry, completed, abandoned_no_answer, opted_out, wrong_number, failed, cancelled]
+      nullable: true
+      description: The latest phone screening cycle's engagement state (highest cycle_number, then newest). null when the candidate was never engaged or when the phone read failed (see dial_count). Does not replace status - a decided status (screened, advanced, rejected, consent_declined) is never overridden by it.
+
+    CandidatePhoneStateReason:
+      type: string
+      enum: [no_answer_budget_exhausted, reconnect_budget_exhausted, provider_budget_exhausted, window_closed, assessment_aborted, wrong_number, disclosure_refused, candidate_opt_out, hr_cancelled, emergency_stop, ashby_stage_left, prereq_lost, abandoned_pre_disclosure, consent_gate_failed, callback_deferred_in_call, callback_deferral_limit, late_score_after_stranded_abort]
+      nullable: true
+      description: Why the latest cycle is in its state, projected server-side through a closed allowlist. The underlying column is not constrained, so any value outside this list - including any free text - is reported as null rather than echoed.
+
+    CandidateLastDialedAt:
+      type: string
+      format: date-time
+      nullable: true
+      description: The admitted_at of the most recent dial counted in dial_count. null when there is none or when the phone read failed.
 
     CandidatesSummary:
       type: object
@@ -8531,6 +8563,14 @@ components:
         updated_at:
           type: string
           format: date-time
+        dial_count:
+          $ref: '#/components/schemas/CandidateDialCount'
+        phone_state:
+          $ref: '#/components/schemas/CandidatePhoneState'
+        phone_state_reason:
+          $ref: '#/components/schemas/CandidatePhoneStateReason'
+        last_dialed_at:
+          $ref: '#/components/schemas/CandidateLastDialedAt'
       additionalProperties: true
 
     CallSession:
