@@ -373,16 +373,26 @@ interface CandidateSeed {
   review: Candidate['resume_review'];
   daysAgo: number;
   skills: string[];
+  /** Phone-screen progress, when the default for the status is not the story. */
+  phone?: PhoneProgress;
 }
+
+/** The four phone-progress fields `GET /api/candidates` (and detail) carry. */
+type PhoneProgress = Required<Pick<Candidate, 'dial_count' | 'phone_state' | 'phone_state_reason' | 'last_dialed_at'>>;
 
 /** Newest first, which is the order `GET /api/candidates` returns. */
 const CANDIDATE_SEEDS: CandidateSeed[] = [
-  { name: 'Meera Iyer', status: 'screened', role: 'backend', exp: 7, rec: 'advance', score: 86, review: 'ready', daysAgo: 0.2, skills: ['Go', 'PostgreSQL', 'Kafka', 'Kubernetes'] },
+  // Three reached dials (no answer, dropped at the consent check, the full
+  // screen): see phoneAttempts. A settled status, so no "(dialed N)" suffix.
+  { name: 'Meera Iyer', status: 'screened', role: 'backend', exp: 7, rec: 'advance', score: 86, review: 'ready', daysAgo: 0.2, skills: ['Go', 'PostgreSQL', 'Kafka', 'Kubernetes'], phone: { dial_count: 3, phone_state: 'completed', phone_state_reason: null, last_dialed_at: ago(4 * HOUR) } },
   { name: 'Rohan Deshpande', status: 'advanced', role: 'backend', exp: 9, rec: 'advance', score: 91, review: 'ready', daysAgo: 1, skills: ['Java', 'PostgreSQL', 'gRPC', 'AWS'] },
   // A PII-minimal Ashby import shell: no name until the resume parses.
   { name: null, status: 'new', role: 'frontend', exp: null, rec: null, score: null, review: 'processing', daysAgo: 0.1, skills: [] },
   { name: 'Ananya Chaudhary', status: 'screening', role: 'data', exp: 3, rec: null, score: null, review: 'ready', daysAgo: 0.5, skills: ['SQL', 'Python', 'Tableau'] },
-  { name: 'Vikram Pillai', status: 'queued', role: 'sre', exp: 6, rec: null, score: null, review: 'ready', daysAgo: 1.2, skills: ['Terraform', 'AWS', 'Grafana'] },
+  // Mid-cycle: "Queued (dialed 2)". Two dials reached the phone (a no answer
+  // and a lease-reclaimed "Call interrupted"); a third was deferred by our
+  // infrastructure before ringing and does not count. See phoneAttempts.
+  { name: 'Vikram Pillai', status: 'queued', role: 'sre', exp: 6, rec: null, score: null, review: 'ready', daysAgo: 1.2, skills: ['Terraform', 'AWS', 'Grafana'], phone: { dial_count: 2, phone_state: 'awaiting_retry', phone_state_reason: null, last_dialed_at: ago(3 * HOUR) } },
   { name: 'Sara Lindqvist', status: 'rejected', role: 'frontend', exp: 2, rec: 'reject', score: 38, review: 'ready', daysAgo: 2, skills: ['Vue', 'CSS'] },
   { name: 'Diego Ferreira', status: 'screened', role: 'sre', exp: 8, rec: 'hold', score: 64, review: 'ready', daysAgo: 2.5, skills: ['Kubernetes', 'GCP', 'Prometheus'] },
   { name: 'Wei Zhang', status: 'new', role: 'backend', exp: 5, rec: null, score: null, review: 'needs_review', daysAgo: 3, skills: ['Rust', 'PostgreSQL'] },
@@ -402,17 +412,43 @@ const CANDIDATE_SEEDS: CandidateSeed[] = [
   { name: 'Samuel Okafor', status: 'screened', role: 'backend', exp: 7, rec: 'hold', score: 67, review: 'ready', daysAgo: 12.5, skills: ['C#', '.NET', 'SQL Server'] },
   { name: 'Priya Natarajan', status: 'rejected', role: 'frontend', exp: 5, rec: 'reject', score: 49, review: 'ready', daysAgo: 13, skills: ['Angular', 'RxJS'] },
   { name: 'Harsh Vora', status: 'new', role: 'qa', exp: 3, rec: null, score: null, review: null, daysAgo: 13.5, skills: ['Selenium', 'Java'] },
+  // Appended (oldest) so every index above keeps its id, phone and sessions.
+  // The stored status stays "queued" for the whole cycle; the ended cycle
+  // makes it "Abandoned: no answer". The accented name exercises the
+  // diacritic-insensitive search (`?q=lucia`).
+  { name: 'Lucía Fernández', status: 'queued', role: 'backend', exp: 4, rec: null, score: null, review: 'ready', daysAgo: 14, skills: ['Python', 'Django', 'PostgreSQL'], phone: { dial_count: 3, phone_state: 'abandoned_no_answer', phone_state_reason: 'no_answer_budget_exhausted', last_dialed_at: ago(2 * DAY) } },
 ];
 
 function emailFor(name: string | null): string | null {
   if (!name) return null;
-  return `${name.toLowerCase().replace(/[^a-z ]/g, '').trim().replace(/\s+/g, '.')}@example.com`;
+  const ascii = name.normalize('NFD').replace(/[̀-ͯ]/g, '');
+  return `${ascii.toLowerCase().replace(/[^a-z ]/g, '').trim().replace(/\s+/g, '.')}@example.com`;
+}
+
+/**
+ * The default phone progress for a seed's status. No usable phone → never
+ * dialled. A decided or in-flight screen was reached on one dial, at the
+ * moment its session started (see addSession). Everyone else is undialled.
+ */
+function defaultPhoneProgress(s: CandidateSeed, hasPhone: boolean, createdMs: number): PhoneProgress {
+  const none: PhoneProgress = { dial_count: 0, phone_state: null, phone_state_reason: null, last_dialed_at: null };
+  if (!hasPhone) return none;
+  const dialedAt = iso(createdMs + 3 * HOUR);
+  if (['screened', 'advanced', 'rejected'].includes(s.status)) {
+    return { dial_count: 1, phone_state: 'completed', phone_state_reason: null, last_dialed_at: dialedAt };
+  }
+  if (s.status === 'consent_declined') {
+    return { dial_count: 1, phone_state: 'opted_out', phone_state_reason: 'disclosure_refused', last_dialed_at: dialedAt };
+  }
+  if (s.status === 'screening') return { dial_count: 1, phone_state: 'in_call', phone_state_reason: null, last_dialed_at: dialedAt };
+  return none;
 }
 
 const CANDIDATES: Candidate[] = CANDIDATE_SEEDS.map((s, i) => {
   // Every third candidate has no usable phone: a real, common state that the
   // phone surfaces must render truthfully.
   const hasPhone = s.name !== null && i % 3 !== 2;
+  const createdMs = FROZEN_NOW_MS - s.daysAgo * DAY;
   return {
     id: uid('2', i + 1),
     name: s.name,
@@ -427,6 +463,7 @@ const CANDIDATES: Candidate[] = CANDIDATE_SEEDS.map((s, i) => {
     latest_recommendation: s.rec,
     latest_score: s.score,
     resume_review: s.review,
+    ...(s.phone ?? defaultPhoneProgress(s, hasPhone, createdMs)),
   };
 });
 
@@ -434,6 +471,10 @@ const CANDIDATES: Candidate[] = CANDIDATE_SEEDS.map((s, i) => {
 export const STAR_CANDIDATE_ID = CANDIDATES[0].id;
 /** An advanced candidate whose only assessment is a legacy (v1) scorecard. */
 export const LEGACY_CANDIDATE_ID = CANDIDATES[1].id;
+/** Stored "queued", mid-cycle after two reached dials: "Queued (dialed 2)". */
+export const DIALED_CANDIDATE_ID = CANDIDATES.find((c) => c.name === 'Vikram Pillai')!.id;
+/** Stored "queued", cycle ended on the no-answer budget: "Abandoned: no answer". */
+export const ABANDONED_CANDIDATE_ID = CANDIDATES.find((c) => c.name === 'Lucía Fernández')!.id;
 
 /* ── Sessions, transcripts and assessments ───────────────────────────── */
 
@@ -688,6 +729,50 @@ const APPEALS: AppealRow[] = [
 ];
 
 function phoneCycles(c: Candidate): PhoneScreeningCycle[] {
+  if (c.id === DIALED_CANDIDATE_ID) {
+    return [
+      {
+        cycle_number: 1,
+        state: 'awaiting_retry',
+        state_reason: null,
+        version: 5,
+        no_answer_attempts: 1,
+        no_answer_limit: 3,
+        reconnects_used: 1,
+        provider_failures: 0,
+        next_eligible_at: iso(FROZEN_NOW_MS + 2 * HOUR),
+        last_attempt_at: ago(1 * HOUR),
+        terminal_at: null,
+        created_at: ago(22 * HOUR),
+        updated_at: ago(1 * HOUR),
+        has_session: false,
+        has_assessment: false,
+        appointment: null,
+      },
+    ];
+  }
+  if (c.id === ABANDONED_CANDIDATE_ID) {
+    return [
+      {
+        cycle_number: 1,
+        state: 'abandoned_no_answer',
+        state_reason: 'no_answer_budget_exhausted',
+        version: 7,
+        no_answer_attempts: 3,
+        no_answer_limit: 3,
+        reconnects_used: 0,
+        provider_failures: 0,
+        next_eligible_at: null,
+        last_attempt_at: ago(2 * DAY),
+        terminal_at: ago(2 * DAY - 45_000),
+        created_at: ago(4 * DAY),
+        updated_at: ago(2 * DAY - 45_000),
+        has_session: false,
+        has_assessment: false,
+        appointment: null,
+      },
+    ];
+  }
   if (c.id !== STAR_CANDIDATE_ID) return [];
   return [
     {
@@ -712,6 +797,25 @@ function phoneCycles(c: Candidate): PhoneScreeningCycle[] {
 }
 
 function phoneAttempts(c: Candidate): CandidatePhoneAttempt[] {
+  if (c.id === DIALED_CANDIDATE_ID) {
+    // Newest first. Attempt 3 was deferred by our infrastructure before any
+    // carrier was contacted ("Not placed", not a reached dial). Attempt 2 was
+    // answered, then its worker lease was reclaimed mid-call: abandoned with
+    // a NULL reason reads "Call interrupted" and DOES count, as does the
+    // no answer. So dial_count is 2.
+    return [
+      { id: uid('7', 13), attempt_seq: 3, admitted_at: ago(1 * HOUR), answered_at: null, ended_at: ago(1 * HOUR - 2_000), state: 'abandoned', abandon_reason: 'infra_deferred', outcome_class: null, duration_sec: null, recording: { state: 'unavailable', reason: 'no_recording' }, consent_stage: null, transcript: null },
+      { id: uid('7', 12), attempt_seq: 2, admitted_at: ago(3 * HOUR), answered_at: ago(3 * HOUR - 11_000), ended_at: ago(3 * HOUR - 95_000), state: 'abandoned', abandon_reason: null, outcome_class: null, duration_sec: 84, recording: { state: 'ready' }, consent_stage: 'before_consent', transcript: null },
+      { id: uid('7', 11), attempt_seq: 1, admitted_at: ago(20 * HOUR), answered_at: null, ended_at: ago(20 * HOUR - 38_000), state: 'completed', abandon_reason: null, outcome_class: 'no_answer', duration_sec: null, recording: { state: 'unavailable', reason: 'no_recording' }, consent_stage: null, transcript: null },
+    ];
+  }
+  if (c.id === ABANDONED_CANDIDATE_ID) {
+    // The whole no-answer budget: three rings, nobody picked up.
+    return [3, 2, 1].map((seq) => {
+      const at = (2 + (3 - seq)) * DAY;
+      return { id: uid('7', 20 + seq), attempt_seq: seq, admitted_at: ago(at), answered_at: null, ended_at: ago(at - 40_000), state: 'completed', abandon_reason: null, outcome_class: 'no_answer', duration_sec: null, recording: { state: 'unavailable', reason: 'no_recording' }, consent_stage: null, transcript: null };
+    });
+  }
   const own = sessions.filter((s) => s.candidate_id === c.id);
   if (c.id !== STAR_CANDIDATE_ID || own.length < 2) return [];
   return [
