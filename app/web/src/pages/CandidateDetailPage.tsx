@@ -39,8 +39,7 @@ import {
   candidateDisplayName,
 } from "../components/talent";
 import {
-  candidateStatusLabel,
-  candidateStatusTone,
+  candidateDisplayStatus,
   sessionStatusLabel,
 } from "../components/talent";
 import {
@@ -253,6 +252,9 @@ export function CandidateDetailPage() {
 
   const { candidate, sessions, assessments } = detail;
   const decisionBlocked = candidate.decision_use_blocked_at != null;
+  // The list's derivation (stored status + phone progress from GET /:id), so
+  // the header, the Overview field and the list row say the same words.
+  const displayStatus = candidateDisplayStatus(candidate);
   // C3: the NEWEST assessment (the API orders by created_at desc) was graded
   // `insufficient` — held from Ashby and from the status, so the phone card
   // recommends a re-screen. Never while an appeal blocks decision use.
@@ -339,10 +341,8 @@ export function CandidateDetailPage() {
         // row beside the buttons, where it read as one more control.
         meta={
           <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-            <StatusBadge tone={candidateStatusTone(candidate.status)}>
-              <span title={`Status: ${candidate.status}`}>
-                {candidateStatusLabel(candidate.status)}
-              </span>
+            <StatusBadge tone={displayStatus.tone}>
+              <span title={displayStatus.title}>{displayStatus.label}</span>
             </StatusBadge>
             <CandidateHeadlineFacts
               roleTitle={roleTitle}

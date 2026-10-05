@@ -283,6 +283,21 @@ export interface Candidate {
    * that predate the field; null when the candidate has no Ashby ingestion.
    */
   resume_review?: ResumeReview | null;
+  /**
+   * Phone-screen progress (list and detail endpoints). Optional: payloads
+   * that predate the fields, and the Ashby scoped review, omit them.
+   *
+   * `dial_count`: dials that reached the phone, across every cycle. `null`
+   * (or absent) means UNKNOWN — the read failed or was capped — and `0`
+   * means never dialled. Render through `candidateDisplayStatus`.
+   */
+  dial_count?: number | null;
+  /** The latest cycle's engagement state; null = never engaged or unknown. */
+  phone_state?: PhoneEngagementState | null;
+  /** Allowlisted reason code (ENGAGEMENT_REASON_LABELS keys) or null. */
+  phone_state_reason?: string | null;
+  /** When the most recent counted dial was admitted. */
+  last_dialed_at?: string | null;
   /** Bounded parsed resume evidence returned on candidate detail. */
   parsed?: CandidateResumeFacts | null;
 }

@@ -340,3 +340,65 @@ describe('resume-review facet', () => {
     });
   });
 });
+
+/**
+ * Feature: dial status. The status dimension is keyed by the DISPLAY status
+ * (`candidateStatusKey`), so a phone cycle's terminal outcome is its own
+ * filterable, countable bucket and stops hiding inside "Queued".
+ */
+describe('phone-outcome display keys', () => {
+  it('parses and round-trips the new keys in canonical order', () => {
+    const parsed = parseCandidateFilters(
+      new URLSearchParams('status=wrong_number,abandoned_no_answer,queued,bogus'),
+    );
+    expect(parsed.statuses).toEqual(['queued', 'abandoned_no_answer', 'wrong_number']);
+    expect(candidatesHref({ statuses: ['abandoned_no_answer'] })).toBe(
+      '/candidates?status=abandoned_no_answer',
+    );
+    const back = parseCandidateFilters(new URLSearchParams('status=abandoned_no_answer'));
+    expect(back.statuses).toEqual(['abandoned_no_answer']);
+  });
+
+  it('queued excludes an abandoned row and abandoned_no_answer matches it', () => {
+    const abandoned = cand({ status: 'queued', dial_count: 5, phone_state: 'abandoned_no_answer' });
+    const dialled = cand({ status: 'queued', dial_count: 3, phone_state: 'awaiting_retry' });
+    expect(matchesCandidateStatus(abandoned, f({ statuses: ['queued'] }))).toBe(false);
+    expect(matchesCandidateStatus(abandoned, f({ statuses: ['abandoned_no_answer'] }))).toBe(true);
+    expect(matchesCandidateStatus(dialled, f({ statuses: ['queued'] }))).toBe(true);
+    expect(matchesCandidateStatus(dialled, f({ statuses: ['abandoned_no_answer'] }))).toBe(false);
+  });
+
+  it('a decided status is never re-bucketed by a later phone cycle', () => {
+    const screened = cand({ status: 'screened', phone_state: 'failed', dial_count: 2 });
+    expect(matchesCandidateStatus(screened, f({ statuses: ['screened'] }))).toBe(true);
+    expect(matchesCandidateStatus(screened, f({ statuses: ['phone_failed'] }))).toBe(false);
+  });
+
+  it('the funnel counts by display key, phone outcomes after the stored statuses', () => {
+    expect(
+      candidateFunnel([
+        cand({ status: 'queued', phone_state: 'abandoned_no_answer', dial_count: 5 }),
+        cand({ status: 'queued', dial_count: 3 }),
+        cand({ status: 'queued', phone_state: 'failed' }),
+        cand({ status: 'screened', phone_state: 'failed' }),
+      ]),
+    ).toEqual([
+      { status: 'queued', label: 'Queued', value: 1 },
+      { status: 'screened', label: 'Screened', value: 1 },
+      { status: 'abandoned_no_answer', label: 'Abandoned: no answer', value: 1 },
+      { status: 'phone_failed', label: 'Phone screen failed', value: 1 },
+    ]);
+  });
+
+  it('gives each phone outcome a plain, un-emphasised next action', () => {
+    expect(candidateNextAction('abandoned_no_answer')).toEqual({
+      label: 'No answer after every attempt',
+      emphasis: false,
+    });
+    for (const key of ['phone_failed', 'wrong_number', 'opted_out', 'phone_cancelled']) {
+      const next = candidateNextAction(key);
+      expect(next.emphasis, key).toBe(false);
+      expect(next.label, key).not.toBe('Open profile');
+    }
+  });
+});

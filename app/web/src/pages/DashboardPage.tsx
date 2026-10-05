@@ -7,9 +7,11 @@
  * visibly-represented filter on the Candidates page. Deep links and browser
  * back/forward therefore work end-to-end.
  *
- *   - Pipeline figures + stages ← GET /api/candidates (viewer+), by status.
- *       Each → /candidates?status=… (drill-down).
- *   - Completion                ← decided ÷ considered, from the same statuses.
+ *   - Pipeline figures + stages ← GET /api/candidates (viewer+), by DISPLAY
+ *       status (`candidateStatusKey`: the stored status, or the phone
+ *       cycle's terminal outcome). Each → /candidates?status=… (drill-down).
+ *   - Completion                ← decided ÷ considered, from the same keys
+ *       (see COMPLETION_EXCLUDED for who leaves the denominator).
  *   - Candidates added          ← candidates.created_at per day (all roles).
  *   - Assessments               ← GET /api/candidates/summary (server aggregate).
  *   - Prioritized work          ← GET /api/notifications (interviewer+), joined
@@ -55,11 +57,10 @@ import type { BarListDatum, BarTone } from '../components/charts';
 import { countPerDay, formatDay, formatDayTime } from '../components/charts/dates';
 import { ScreeningKpis } from '../components/dashboard/ScreeningKpis';
 import {
-  candidateStatusLabel,
-  candidateStatusTone,
+  candidateDisplayStatus,
   candidateFunnel,
   candidatesHref,
-  normalizeStatus,
+  candidateStatusKey,
   recommendationLabel,
   RECOMMENDATION_ORDER,
 } from '../components/talent';
@@ -72,6 +73,25 @@ import {
 import { humanizeEnum } from '../lib/humanize';
 import { addIstDays, IST_TIME_ZONE, istDayStartUtcIso, istToday } from '../lib/ist-datetime';
 import type { PhoneCalendarResponse } from '../types';
+
+/**
+ * Display statuses that leave the completion denominator, beside
+ * `consent_declined`. Each is a phone cycle that ENDED without a screening the
+ * recruiter can decide on: nobody answered every attempt, the number is wrong,
+ * or the candidate opted out. Counting them as "not yet decided" would hold
+ * the completion figure down for people no recruiter can act on, exactly the
+ * reason consent refusals were already excluded.
+ *
+ * `phone_failed` and `phone_cancelled` STAY in the denominator on purpose: a
+ * failed cycle (e.g. the interview ended early) or one cancelled by HR is
+ * recoverable with a rescreen, so that candidate is still in consideration.
+ */
+const COMPLETION_EXCLUDED: ReadonlySet<string> = new Set([
+  'consent_declined',
+  'abandoned_no_answer',
+  'opted_out',
+  'wrong_number',
+]);
 
 const INTENT_KIND_META: Record<string, { title: string; tone: StatusTone }> = {
   assessment_ready: { title: 'Screening ready for review', tone: 'info' },
@@ -171,8 +191,10 @@ export function DashboardPage() {
     return <LoadingPanel label="Loading dashboard…" />;
   }
 
+  // Display keys, so "In screening" (queued + screening) stops counting a
+  // candidate whose phone cycle already ended with no answer or failed.
   const byStatus = (statuses: string[]) =>
-    candidates.filter((c) => statuses.includes(normalizeStatus(c.status))).length;
+    candidates.filter((c) => statuses.includes(candidateStatusKey(c))).length;
 
   const total = candidates.length;
   const awaiting = byStatus(['new']);
@@ -180,7 +202,7 @@ export function DashboardPage() {
   const awaitingDecision = byStatus(['screened']);
   const decided = byStatus(['advanced', 'rejected']);
   const considered = candidates.filter(
-    (c) => normalizeStatus(c.status) !== 'consent_declined',
+    (c) => !COMPLETION_EXCLUDED.has(candidateStatusKey(c)),
   ).length;
   const completionPct = considered > 0 ? Math.round((decided / considered) * 100) : 0;
 
@@ -490,6 +512,7 @@ function RecentCandidates({ candidates }: { candidates: Candidate[] }) {
       ) : (
         <ul role="list" aria-label="Recent candidates, newest first" className="divide-y divide-glass-ring">
           {recent.map((candidate) => {
+            const status = candidateDisplayStatus(candidate);
             const added = formatDay(candidate.created_at);
             const meta = [
               candidate.experience_years != null ? `${candidate.experience_years} yr experience` : null,
@@ -505,8 +528,8 @@ function RecentCandidates({ candidates }: { candidates: Candidate[] }) {
                     <p className="truncate text-label tabular-nums text-ink-tertiary">{meta.join(' · ')}</p>
                   )}
                 </div>
-                <StatusBadge tone={candidateStatusTone(candidate.status)} className="shrink-0">
-                  {candidateStatusLabel(candidate.status)}
+                <StatusBadge tone={status.tone} className="shrink-0">
+                  <span title={status.title}>{status.label}</span>
                 </StatusBadge>
               </li>
             );

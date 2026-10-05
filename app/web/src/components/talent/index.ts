@@ -50,14 +50,18 @@ export type { TranscriptionSyncWorkspaceProps } from './TranscriptionSyncWorkspa
 export {
   candidateStatusLabel,
   candidateStatusTone,
+  candidateDisplayStatus,
+  candidateStatusKey,
   sessionStatusLabel,
   sessionStatusTone,
   formatDurationSec,
   candidateStatusCounts,
   sessionStatusCounts,
 } from './status';
+export type { CandidateDisplayInput, CandidateDisplayStatus } from './status';
 export {
   CANDIDATE_STATUS_ORDER,
+  PHONE_OUTCOME_STATUS_KEYS,
   RECOMMENDATION_ORDER,
   EMPTY_CANDIDATE_FILTERS,
   normalizeStatus,

@@ -73,10 +73,12 @@ import {
 } from "../components/talent";
 import {
   buildCandidateSearch,
+  candidateDisplayStatus,
   candidateNextAction,
+  candidateStatusKey,
   candidateStatusLabel,
-  candidateStatusTone,
   CANDIDATE_STATUS_ORDER,
+  PHONE_OUTCOME_STATUS_KEYS,
   hasActiveFilters,
   matchesCandidateFilters,
   matchesCandidateSearch,
@@ -140,6 +142,14 @@ const STATUS_BAR_TONE: Record<string, PipelineTone> = {
   advanced: "positive",
   rejected: "negative",
   consent_declined: "negative",
+  // The phone-cycle outcomes, in CANDIDATE_STATUS_ORDER order. Five tones
+  // cannot be injective over twelve keys, so the most this can promise is
+  // that neighbours in that order differ; the legend text names each one.
+  abandoned_no_answer: "caution",
+  phone_failed: "negative",
+  wrong_number: "neutral",
+  opted_out: "accent",
+  phone_cancelled: "neutral",
 };
 
 const RECOMMENDATION_BAR_TONE: Record<string, PipelineTone> = {
@@ -272,6 +282,8 @@ function NextActionCell({
   next: { label: string; emphasis: boolean };
 }) {
   if (next.emphasis) {
+    // `status` is the DISPLAY key (candidateStatusKey), the same one the
+    // badge and `next` were derived from.
     const isReview = normalizeStatus(status) === "screened";
     return (
       <Link
@@ -532,11 +544,12 @@ export function CandidatesPage() {
   const active = hasActiveFilters(filters);
   const roleTitle = roles.find((r) => r.id === roleId)?.title;
 
-  // Live count per status from the currently loaded (role-scoped) set.
+  // Live count per DISPLAY status from the currently loaded (role-scoped)
+  // set: the same key the row badge and the status filter use.
   const statusCounts = useMemo(() => {
     const counts = new Map<string, number>();
     for (const c of candidates ?? []) {
-      const key = normalizeStatus(c.status);
+      const key = candidateStatusKey(c);
       counts.set(key, (counts.get(key) ?? 0) + 1);
     }
     return counts;
@@ -748,7 +761,19 @@ export function CandidatesPage() {
             total={candidates.length}
             onToggle={toggleStatus}
             selectedKeys={filters.statuses}
-            segments={CANDIDATE_STATUS_ORDER.map((status) => ({
+            // "Abandoned: no answer" is always offered: it is the phone
+            // outcome recruiters asked to find. The other four phone outcomes
+            // appear only when some loaded candidate has one (or a deep link
+            // selected it) — four permanently-zero toggles would be noise.
+            // A hidden key has a zero count, so the bar still partitions the
+            // whole loaded set.
+            segments={CANDIDATE_STATUS_ORDER.filter(
+              (status) =>
+                status === "abandoned_no_answer" ||
+                !PHONE_OUTCOME_STATUS_KEYS.has(status) ||
+                (statusCounts.get(status) ?? 0) > 0 ||
+                filters.statuses.includes(status),
+            ).map((status) => ({
               key: status,
               label: candidateStatusLabel(status),
               value: statusCounts.get(status) ?? 0,
@@ -990,7 +1015,10 @@ export function CandidatesPage() {
                   prefers-reduced-motion with the rest of the shell. */}
               <TBody className="fade-up-stagger">
                 {page.items.map((c) => {
-                  const next = candidateNextAction(c.status);
+                  // ONE derivation per row: badge, tooltip, next action and
+                  // the review link all read the same display status.
+                  const ds = candidateDisplayStatus(c);
+                  const next = candidateNextAction(ds.key);
                   const role = c.role_id ? roleById.get(c.role_id) : undefined;
                   const displayName = candidateDisplayName(c.name);
                   return (
@@ -1050,10 +1078,8 @@ export function CandidatesPage() {
                             side by side would force the column wide, and a
                             flex-wrap broke them at arbitrary points. */}
                         <div className="flex flex-col items-start gap-1">
-                          <StatusBadge tone={candidateStatusTone(c.status)}>
-                            <span title={`Status: ${c.status}`}>
-                              {candidateStatusLabel(c.status)}
-                            </span>
+                          <StatusBadge tone={ds.tone}>
+                            <span title={ds.title}>{ds.label}</span>
                           </StatusBadge>
                           {/* Additive only: the candidate's own status is
                               unchanged and still first. */}
@@ -1082,7 +1108,7 @@ export function CandidatesPage() {
                         <NextActionCell
                           candidateId={c.id}
                           candidateName={displayName}
-                          status={c.status}
+                          status={ds.key}
                           next={next}
                         />
                       </Td>

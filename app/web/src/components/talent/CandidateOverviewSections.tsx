@@ -25,8 +25,7 @@ import { SurfaceCard, Tag } from '../design/candidate';
 import {
   attemptOutcomeLabel,
   attemptRawStatus,
-  candidateStatusLabel,
-  candidateStatusTone,
+  candidateDisplayStatus,
   formatDurationSec,
   sessionStatusLabel,
   sessionStatusTone,
@@ -246,6 +245,7 @@ export function CandidateProfileCard({
   className = 'p-4 sm:p-5 lg:col-span-1',
 }: CandidateProfileCardProps) {
   const headingId = useId();
+  const displayStatus = candidateDisplayStatus(candidate);
   return (
     <SurfaceCard as="section" labelledBy={headingId} className={className}>
       <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
@@ -293,8 +293,9 @@ export function CandidateProfileCard({
             : "—"}
         </Field>
         <Field label="Status">
-          <StatusBadge tone={candidateStatusTone(candidate.status)}>
-            {candidateStatusLabel(candidate.status)}
+          {/* The same derivation as the header and the list row. */}
+          <StatusBadge tone={displayStatus.tone}>
+            <span title={displayStatus.title}>{displayStatus.label}</span>
           </StatusBadge>
         </Field>
         <div>

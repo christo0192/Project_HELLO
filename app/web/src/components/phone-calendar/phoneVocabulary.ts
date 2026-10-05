@@ -55,7 +55,7 @@ const ENGAGEMENT_STATE_TERMS: Record<PhoneEngagementState, Term> = {
   reconnecting: { label: 'Reconnecting', tone: 'warning' },
   awaiting_retry: { label: 'Awaiting retry', tone: 'warning' },
   completed: { label: 'Completed', tone: 'success' },
-  abandoned_no_answer: { label: 'Abandoned — no answer', tone: 'danger' },
+  abandoned_no_answer: { label: 'Abandoned: no answer', tone: 'danger' },
   opted_out: { label: 'Opted out', tone: 'neutral' },
   wrong_number: { label: 'Wrong number', tone: 'danger' },
   failed: { label: 'Failed', tone: 'danger' },

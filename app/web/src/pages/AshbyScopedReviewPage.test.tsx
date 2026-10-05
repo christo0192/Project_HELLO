@@ -102,6 +102,34 @@ describe('scoped review shell', () => {
     expect(screen.queryByRole('button', { name: /retry|reprocess|re-?parse|start|export|note|appeal/i })).toBeNull();
   });
 
+  it('shows the stored status through the shared display helper (no phone fields here)', async () => {
+    // The scoped payload never carries dial_count / phone_state, so the badge
+    // degrades to the plain stored status — never "(dialed …)".
+    mockApi.getAshbyScopedReview.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: { ...mockCandidateDetail.candidate, status: 'queued' },
+    });
+    renderPage();
+    await screen.findByText('Jane Doe');
+    expect(screen.getAllByText('Queued').length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByText(/dialed/)).toBeNull();
+  });
+
+  it('still names a phone outcome if a future payload carries one', async () => {
+    mockApi.getAshbyScopedReview.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: {
+        ...mockCandidateDetail.candidate,
+        status: 'queued',
+        dial_count: 5,
+        phone_state: 'abandoned_no_answer',
+      },
+    });
+    renderPage();
+    await screen.findByText('Jane Doe');
+    expect(screen.getAllByText('Abandoned: no answer (dialed 5)').length).toBeGreaterThanOrEqual(1);
+  });
+
   it('renders no global navigation, no backlinks and no cross-candidate links', async () => {
     const { container } = renderPage();
     await screen.findByText('Jane Doe');

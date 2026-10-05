@@ -12,9 +12,20 @@
  */
 
 import type { StatusTone } from '../design/StatusBadge';
+import type { Candidate } from '../../types';
 import { humanizeEnum } from '../../lib/humanize';
+import { formatDateTime } from '../../lib/datetime';
+import { engagementStateTerm } from '../phone-calendar/phoneVocabulary';
 
-/** Human label for a candidate status (fallback: the raw value). */
+/**
+ * Human label for a candidate status KEY (fallback: the raw value).
+ *
+ * Besides the stored `candidates.status` vocabulary this names the five
+ * DISPLAY keys `candidateDisplayStatus` derives from a finished phone cycle
+ * (`abandoned_no_answer`, `phone_failed`, `wrong_number`, `opted_out`,
+ * `phone_cancelled`). Those are never stored on the candidate; they exist so
+ * the list, its filters and its counts can name what actually happened.
+ */
 export function candidateStatusLabel(status: string | null | undefined): string {
   if (typeof status !== 'string' && status != null) return 'New';
   switch (status ?? 'new') {
@@ -32,6 +43,16 @@ export function candidateStatusLabel(status: string | null | undefined): string 
       return 'Rejected';
     case 'consent_declined':
       return 'Consent declined';
+    case 'abandoned_no_answer':
+      return 'Abandoned: no answer';
+    case 'phone_failed':
+      return 'Phone screen failed';
+    case 'wrong_number':
+      return 'Wrong number';
+    case 'opted_out':
+      return 'Opted out';
+    case 'phone_cancelled':
+      return 'Phone screen cancelled';
     default:
       return humanizeEnum((status ?? 'new').trim()) || 'New';
   }
@@ -46,12 +67,122 @@ export function candidateStatusTone(status: string | null | undefined): StatusTo
     case 'queued':
       return 'warning';
     case 'rejected':
+    case 'abandoned_no_answer':
+    case 'phone_failed':
+    case 'wrong_number':
       return 'danger';
     case 'new':
       return 'info';
     default:
+      // consent_declined, opted_out, phone_cancelled and anything unknown.
       return 'neutral';
   }
+}
+
+/* ── Display status: the stored status plus what the phone screen did ──
+ *
+ * `candidates.status` stays `queued` for the whole of a phone cycle: no phone
+ * transition writes it except completion (`screened`) and the consent route
+ * (`consent_declined`). So a candidate dialled five times, or one whose cycle
+ * ended with no answer, read exactly like one never dialled. The list and
+ * detail endpoints now carry `dial_count` and the latest cycle's
+ * `phone_state`; this is the ONE place they are turned into a status, used by
+ * every surface that shows or counts one (list badge, filters, counts, bar,
+ * next action, dashboard funnel and figures, detail header and overview).
+ */
+
+/**
+ * Statuses a person or a score has decided. Phone data never overrides
+ * these: a screened candidate whose later re-screen cycle failed is still
+ * "Screened".
+ */
+const SETTLED_CANDIDATE_STATUSES: ReadonlySet<string> = new Set([
+  'screened',
+  'advanced',
+  'rejected',
+  'consent_declined',
+]);
+
+/**
+ * Terminal engagement states that become their own display key. `completed`
+ * is absent on purpose: a completed cycle whose score has not landed keeps
+ * the stored status, and the scorer moves it to `screened`.
+ */
+const PHONE_TERMINAL_DISPLAY_KEY: Readonly<Record<string, string>> = {
+  abandoned_no_answer: 'abandoned_no_answer',
+  failed: 'phone_failed',
+  wrong_number: 'wrong_number',
+  opted_out: 'opted_out',
+  cancelled: 'phone_cancelled',
+};
+
+export type CandidateDisplayInput = { status: string | null | undefined } & Partial<
+  Pick<Candidate, 'dial_count' | 'phone_state' | 'phone_state_reason' | 'last_dialed_at'>
+>;
+
+export interface CandidateDisplayStatus {
+  /** Filter / count / next-action key (a stored status or a display key). */
+  key: string;
+  /** Badge text, e.g. "Queued (dialed 3)". */
+  label: string;
+  tone: StatusTone;
+  /** Operator tooltip: the raw status, phone state, reason and last dial. */
+  title: string;
+}
+
+function rawStatusKey(status: unknown): string {
+  if (typeof status !== 'string') return 'new';
+  return status.trim() || 'new';
+}
+
+/** Reached dials, or null when unknown (absent, null or malformed). */
+function knownDialCount(value: unknown): number | null {
+  return typeof value === 'number' && Number.isInteger(value) && value >= 0 ? value : null;
+}
+
+/**
+ * The status a recruiter sees for a candidate.
+ *
+ * 1. A settled stored status (screened / advanced / rejected /
+ *    consent_declined) wins unchanged.
+ * 2. Otherwise a terminal phone state other than `completed` becomes its own
+ *    key ("Abandoned: no answer", "Phone screen failed", "Wrong number",
+ *    "Opted out", "Phone screen cancelled").
+ * 3. Otherwise the stored status.
+ * 4. An unsettled key gains "(dialed N)" when N > 0 dials reached the phone.
+ *    `dial_count` null / absent means UNKNOWN (the read failed, or an older
+ *    payload), and 0 means never dialled: both show the plain label, so an
+ *    unknown count never reads as a confident "Queued (dialed 0)".
+ */
+export function candidateDisplayStatus(c: CandidateDisplayInput): CandidateDisplayStatus {
+  const raw = rawStatusKey(c.status);
+  const phoneState = typeof c.phone_state === 'string' ? c.phone_state : null;
+  const settled = SETTLED_CANDIDATE_STATUSES.has(raw);
+  const key = !settled && phoneState && PHONE_TERMINAL_DISPLAY_KEY[phoneState]
+    ? PHONE_TERMINAL_DISPLAY_KEY[phoneState]
+    : raw;
+
+  const dials = knownDialCount(c.dial_count);
+  const base = candidateStatusLabel(key);
+  const label = !settled && dials !== null && dials > 0 ? `${base} (dialed ${dials})` : base;
+
+  const reason = engagementReasonLabel(c.phone_state_reason);
+  const title = [
+    `Status: ${typeof c.status === 'string' && c.status.trim() ? c.status : raw}`,
+    phoneState ? `Phone: ${engagementStateTerm(phoneState).label}` : null,
+    reason || null,
+    dials !== null && dials > 0 ? `Dialed ${dials} ${dials === 1 ? 'time' : 'times'}` : null,
+    c.last_dialed_at ? `Last dialed ${formatDateTime(c.last_dialed_at)}` : null,
+  ]
+    .filter(Boolean)
+    .join(' · ');
+
+  return { key, label, tone: candidateStatusTone(key), title };
+}
+
+/** The filter / count key of `candidateDisplayStatus`, on its own. */
+export function candidateStatusKey(c: CandidateDisplayInput): string {
+  return candidateDisplayStatus(c).key;
 }
 
 /** Human label for a session status (fallback: the raw value). */
@@ -272,13 +403,17 @@ export function formatDurationSec(seconds: number | null | undefined): string {
   return `${minutes}m ${remaining}s`;
 }
 
-/** Count candidates by status — only statuses actually present are emitted. */
+/**
+ * Count candidates by DISPLAY status (`candidateDisplayStatus`), so these
+ * counts agree with the list's badges and filters — only statuses actually
+ * present are emitted.
+ */
 export function candidateStatusCounts(
-  candidates: ReadonlyArray<{ status: string | null | undefined }>,
+  candidates: ReadonlyArray<CandidateDisplayInput>,
 ): Array<{ label: string; value: number }> {
   const counts = new Map<string, number>();
   for (const candidate of candidates) {
-    const status = candidate.status ?? 'new';
+    const status = candidateStatusKey(candidate);
     counts.set(status, (counts.get(status) ?? 0) + 1);
   }
   return [...counts.entries()]

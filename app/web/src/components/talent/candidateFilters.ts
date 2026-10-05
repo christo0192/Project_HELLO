@@ -6,10 +6,14 @@
  * for parsing and building those params so the dashboard and the Candidates
  * page always agree, and so deep links / browser back-forward behave.
  *
- * - `status` is a comma-separated subset of the candidate status vocabulary
- *   (DB CHECK 0001/0006/notes): new | queued | screening | screened |
- *   advanced | rejected | consent_declined. Applied client-side (the list
- *   API only filters by role).
+ * - `status` is a comma-separated subset of the candidate DISPLAY status
+ *   vocabulary: the stored statuses (DB CHECK 0001/0006/notes) new | queued |
+ *   screening | screened | advanced | rejected | consent_declined, then the
+ *   five keys `candidateDisplayStatus` derives from a finished phone cycle:
+ *   abandoned_no_answer | phone_failed | wrong_number | opted_out |
+ *   phone_cancelled. Applied client-side (the list API only filters by role)
+ *   against `candidateStatusKey`, so a filter, its count and the row badge
+ *   always agree.
  * - `resume` is a comma-separated subset of the sanitized resume-review enum
  *   the list API returns (processing | needs_review | cancelled). Applied
  *   client-side over the already-loaded page: additive, adds no request, and
@@ -26,10 +30,14 @@
  */
 
 import type { Candidate } from '../../types';
-import { candidateStatusLabel } from './status';
+import { candidateStatusKey, candidateStatusLabel } from './status';
 import { RESUME_REVIEW_ORDER } from './ResumeReviewBadge';
 
-/** Canonical funnel order for the candidate status vocabulary. */
+/**
+ * Canonical funnel order for the candidate display-status vocabulary. The
+ * phone-cycle keys come last: they are terminal outcomes of `queued`, never
+ * stored on the candidate (see `candidateDisplayStatus`).
+ */
 export const CANDIDATE_STATUS_ORDER = [
   'new',
   'queued',
@@ -38,7 +46,24 @@ export const CANDIDATE_STATUS_ORDER = [
   'advanced',
   'rejected',
   'consent_declined',
+  'abandoned_no_answer',
+  'phone_failed',
+  'wrong_number',
+  'opted_out',
+  'phone_cancelled',
 ] as const;
+
+/**
+ * The phone-cycle display keys. The status bar always shows
+ * `abandoned_no_answer` and shows the rest only when present or selected.
+ */
+export const PHONE_OUTCOME_STATUS_KEYS: ReadonlySet<string> = new Set([
+  'abandoned_no_answer',
+  'phone_failed',
+  'wrong_number',
+  'opted_out',
+  'phone_cancelled',
+]);
 
 export type CandidateStatusKey = (typeof CANDIDATE_STATUS_ORDER)[number];
 
@@ -182,10 +207,14 @@ export function candidatesHref(filters: Partial<CandidateFilters> = {}): string 
   return qs ? `/candidates?${qs}` : '/candidates';
 }
 
-/** Client-side status predicate (role is filtered server-side). */
+/**
+ * Client-side status predicate (role is filtered server-side). Keyed by the
+ * DISPLAY status, so `queued` no longer includes a candidate whose phone
+ * cycle ended with no answer, and `abandoned_no_answer` selects exactly them.
+ */
 export function matchesCandidateStatus(candidate: Candidate, filters: CandidateFilters): boolean {
   if (filters.statuses.length === 0) return true;
-  return filters.statuses.includes(normalizeStatus(candidate.status));
+  return filters.statuses.includes(candidateStatusKey(candidate));
 }
 
 /**
@@ -225,8 +254,11 @@ export function hasActiveFilters(filters: CandidateFilters): boolean {
 }
 
 /**
- * The obvious next recruiter action for a candidate, by status. Keeps the
- * list actionable without inventing data — purely a restatement of status.
+ * The obvious next recruiter action for a candidate, by status (pass the
+ * DISPLAY key, `candidateStatusKey`). Keeps the list actionable without
+ * inventing data — purely a restatement of status. The phone-outcome keys are
+ * never emphasised: a rescreen is an interviewer action on the profile, not a
+ * list button.
  */
 export function candidateNextAction(status: string | null | undefined): {
   label: string;
@@ -247,13 +279,23 @@ export function candidateNextAction(status: string | null | undefined): {
       return { label: 'Rejected', emphasis: false };
     case 'consent_declined':
       return { label: 'Consent declined', emphasis: false };
+    case 'abandoned_no_answer':
+      return { label: 'No answer after every attempt', emphasis: false };
+    case 'phone_failed':
+      return { label: 'Phone screen failed', emphasis: false };
+    case 'wrong_number':
+      return { label: 'Wrong number', emphasis: false };
+    case 'opted_out':
+      return { label: 'Opted out', emphasis: false };
+    case 'phone_cancelled':
+      return { label: 'Phone screen cancelled', emphasis: false };
     default:
       return { label: 'Open profile', emphasis: false };
   }
 }
 
 /**
- * Count candidates per status, in canonical funnel order, keeping only
+ * Count candidates per DISPLAY status, in canonical funnel order, keeping only
  * statuses actually present. Each entry carries its status key so callers can
  * build drill-down links. Derived purely from the list — never fabricated.
  */
@@ -262,7 +304,7 @@ export function candidateFunnel(
 ): Array<{ status: string; label: string; value: number }> {
   const counts = new Map<string, number>();
   for (const c of candidates) {
-    const key = normalizeStatus(c.status);
+    const key = candidateStatusKey(c);
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
   const ordered = [

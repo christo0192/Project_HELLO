@@ -46,8 +46,7 @@ import {
   SessionsSummary,
   Tabs,
   TranscriptionSyncWorkspace,
-  candidateStatusLabel,
-  candidateStatusTone,
+  candidateDisplayStatus,
   candidateDisplayName,
 } from '../components/talent';
 
@@ -103,6 +102,7 @@ export function AshbyScopedReviewPage() {
 
   const { candidate, sessions, assessments } = detail;
   const decisionBlocked = candidate.decision_use_blocked_at != null;
+  const displayStatus = candidateDisplayStatus(candidate);
 
   return (
     // No <Layout>: this shell intentionally has no global navigation. The
@@ -116,8 +116,11 @@ export function AshbyScopedReviewPage() {
         title={candidateDisplayName(candidate.name)}
         description={candidate.email ?? undefined}
         actions={
-          <StatusBadge tone={candidateStatusTone(candidate.status)}>
-            {candidateStatusLabel(candidate.status)}
+          // The scoped payload carries no phone-progress fields, so this
+          // degrades to the stored status — through the same helper, so the
+          // words match the main candidate pages.
+          <StatusBadge tone={displayStatus.tone}>
+            <span title={displayStatus.title}>{displayStatus.label}</span>
           </StatusBadge>
         }
       />
