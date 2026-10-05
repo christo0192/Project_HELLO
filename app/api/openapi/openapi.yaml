@@ -10119,6 +10119,11 @@ components:
           nullable: true
         recording:
           $ref: '#/components/schemas/CandidatePhoneAttemptRecording'
+        consent_stage:
+          type: string
+          enum: [before_consent, after_consent]
+          nullable: true
+          description: Whether this leg's audio was captured before the candidate consented. after_consent when the leg is consent-bound (0107 session_id set). before_consent when it is unbound and either its outcome ends at or before the consent step or its parent session never completed (worker clips kept under the 2026-09-26 retention decision recorded in 0105). null when that cannot be told apart, e.g. a pre-0107 unbound leg under a completed parent. Derived from data already loaded; no transcript is read.
         transcript:
           allOf:
             - $ref: '#/components/schemas/CandidatePhoneAttemptTranscript'
@@ -10134,7 +10139,8 @@ components:
           enum: [ready, processing, unavailable]
         reason:
           type: string
-          enum: [access_unavailable, no_recording, recording_failed]
+          enum: [access_unavailable, no_recording, recording_failed, quarantined, deleted]
+          description: Why an unavailable recording cannot be played. access_unavailable (the caller may not read the parent session) takes precedence and reveals nothing about the recording's lifecycle. deleted means the attempt or parent recording was purged; quarantined means it failed an integrity check (attempt or parent).
       additionalProperties: false
 
     CandidatePhoneAttemptTranscript:

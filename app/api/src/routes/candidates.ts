@@ -98,6 +98,41 @@ function attemptDurationSeconds(answeredAt: string | null, endedAt: string | nul
   return Number.isFinite(duration) && duration >= 0 ? duration : null;
 }
 
+/**
+ * Attempt outcomes that by definition end before (or at) the recording
+ * consent step. Used only to classify a leg whose parent session was later
+ * completed by ANOTHER leg (0107 binds `session_id` at consent, so a completed
+ * parent alone does not say whether this leg consented).
+ */
+const PRE_CONSENT_ATTEMPT_OUTCOMES: ReadonlySet<string> = new Set([
+  'abandoned_pre_disclosure',
+  'consent_failed',
+  'declined',
+  'voicemail',
+]);
+
+/**
+ * Whether a leg's audio was captured before the candidate consented.
+ *
+ * - `session_id` set: 0107 binds it at consent, so the leg consented.
+ * - `session_id` NULL with a `recording_session_id`: the worker recorded the
+ *   leg from the start (0105 policy) and consent was never bound to it. That
+ *   is "before consent" when the outcome is a pre-consent one, or when the
+ *   parent session never completed. A NULL-bound leg under a COMPLETED parent
+ *   with any other outcome may be a pre-0107 leg that did consent, so it is
+ *   reported as unknown (null) rather than mislabelled. No transcript probe:
+ *   the parent status is already loaded with the lifecycle row.
+ */
+function attemptConsentStage(
+  row: { session_id: string | null; recording_session_id: string | null; outcome_class: string | null },
+  parentStatus: string | null | undefined,
+): 'before_consent' | 'after_consent' | null {
+  if (row.session_id) return 'after_consent';
+  if (!row.recording_session_id || parentStatus === undefined) return null;
+  if (row.outcome_class && PRE_CONSENT_ATTEMPT_OUTCOMES.has(row.outcome_class)) return 'before_consent';
+  return parentStatus !== null && parentStatus !== 'completed' ? 'before_consent' : null;
+}
+
 export const candidatesRouter = Router();
 
 type Recommendation = 'advance' | 'hold' | 'reject';
@@ -491,6 +526,7 @@ candidatesRouter.get(
       const sessionIds = [...new Set(shown.map((row) => row.session_id ?? row.recording_session_id).filter((id): id is string => !!id))];
       const sessionLifecycle = new Map<string, {
         ownerId: string | null;
+        status: string | null;
         revokedAt: string | null;
         quarantined: boolean;
         deletedAt: string | null;
@@ -498,7 +534,7 @@ candidatesRouter.get(
       if (sessionIds.length > 0) {
         const { data: sessionRows, error: sessionError } = await supabase
           .from('call_sessions')
-          .select('id,owner_id,recording_revoked_at,recording_quarantined,recording_deleted_at')
+          .select('id,owner_id,status,recording_revoked_at,recording_quarantined,recording_deleted_at')
           .in('id', sessionIds)
           .limit(sessionIds.length);
         if (sessionError) return res.status(503).json({ error: 'Phone attempt history unavailable' });
@@ -506,6 +542,7 @@ candidatesRouter.get(
           const row = session as {
             id?: unknown;
             owner_id?: unknown;
+            status?: unknown;
             recording_revoked_at?: unknown;
             recording_quarantined?: unknown;
             recording_deleted_at?: unknown;
@@ -513,6 +550,7 @@ candidatesRouter.get(
           if (typeof row.id === 'string') {
             sessionLifecycle.set(row.id, {
               ownerId: typeof row.owner_id === 'string' ? row.owner_id : null,
+              status: typeof row.status === 'string' ? row.status : null,
               revokedAt: typeof row.recording_revoked_at === 'string' ? row.recording_revoked_at : null,
               quarantined: row.recording_quarantined === true,
               deletedAt: typeof row.recording_deleted_at === 'string' ? row.recording_deleted_at : null,
@@ -587,12 +625,22 @@ candidatesRouter.get(
             duration_sec: attemptDurationSeconds(row.answered_at, row.ended_at),
             recording: {
               state: recordingState,
+              // access_unavailable first: a caller who may not read the
+              // session learns nothing about its recording's lifecycle.
               reason: !interviewerCanReadSession
                 ? 'access_unavailable'
-                : row.egress_status === 'failed'
-                  ? 'recording_failed'
-                  : recordingState === 'unavailable' ? 'no_recording' : undefined,
+                : row.recording_deleted_at || parent?.deletedAt
+                  ? 'deleted'
+                  : row.recording_quarantined || parent?.quarantined
+                    ? 'quarantined'
+                    : row.egress_status === 'failed'
+                      ? 'recording_failed'
+                      : recordingState === 'unavailable' ? 'no_recording' : undefined,
             },
+            consent_stage: attemptConsentStage(
+              row,
+              evidenceSessionId ? (parent ? parent.status : undefined) : undefined,
+            ),
             transcript: user.appRole === 'admin' && evidenceSessionId && kind !== 'none'
               ? {
                   href: `/sessions/${evidenceSessionId}`,

@@ -4,7 +4,7 @@
  * workspace transcript load (empty/error), on-demand recording gating, and
  * axe with hidden panels.
  */
-import { render, screen, fireEvent, waitFor } from '@testing-library/react';
+import { render, screen, fireEvent, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -23,6 +23,8 @@ const mockApi = {
   issueLiveKitInvite: vi.fn(),
   getSession: vi.fn(),
   getCandidateAshbyWorkflow: vi.fn().mockResolvedValue({ ok: true, workflow: null }),
+  getCandidatePhoneAttempts: vi.fn(),
+  getAttemptRecordingDownloadUrl: vi.fn(),
 };
 
 vi.mock('../api', () => ({
@@ -38,6 +40,8 @@ vi.mock('../api', () => ({
     issueLiveKitInvite: (...args: any[]) => mockApi.issueLiveKitInvite(...args),
     getSession: (...args: any[]) => mockApi.getSession(...args),
     getCandidateAshbyWorkflow: (...args: any[]) => mockApi.getCandidateAshbyWorkflow(...args),
+    getCandidatePhoneAttempts: (...args: any[]) => mockApi.getCandidatePhoneAttempts(...args),
+    getAttemptRecordingDownloadUrl: (...args: any[]) => mockApi.getAttemptRecordingDownloadUrl(...args),
   },
   ApiError: class extends Error {
     status: number;
@@ -87,6 +91,7 @@ describe('CandidateDetailPage tabs', () => {
     vi.clearAllMocks();
     mockApi.getCandidate.mockResolvedValue(mockCandidateDetail);
     mockApi.getSession.mockResolvedValue(mockSessionDetail);
+    mockApi.getCandidatePhoneAttempts.mockResolvedValue({ attempts: [], next_cursor: null });
   });
 
   it('renders a keyboard tablist with Overview + Review', async () => {
@@ -174,5 +179,58 @@ describe('CandidateDetailPage tabs', () => {
     const { container } = renderDetailPage();
     await screen.findByText('Jane Doe');
     await expect(container).toHaveNoViolations();
+  });
+
+  describe('call recordings before a completed screening (M011 F2)', () => {
+    const PRE_CONSENT_ATTEMPT = {
+      id: '00000000-0000-4000-8000-0000000000a1',
+      attempt_seq: 1,
+      admitted_at: '2026-09-25T13:00:00.000Z',
+      answered_at: '2026-09-25T13:00:01.000Z',
+      ended_at: '2026-09-25T13:00:09.000Z',
+      state: 'ended',
+      abandon_reason: null,
+      outcome_class: 'abandoned_pre_disclosure',
+      duration_sec: 8,
+      recording: { state: 'ready' },
+      consent_stage: 'before_consent',
+      transcript: null,
+    };
+
+    beforeEach(() => {
+      mockApi.getCandidate.mockResolvedValue({
+        ...mockCandidateDetail,
+        sessions: mockCandidateDetail.sessions.map((s) => ({ ...s, status: 'expired' })),
+        assessments: [],
+      });
+      mockApi.getCandidatePhoneAttempts.mockResolvedValue({ attempts: [PRE_CONSENT_ATTEMPT], next_cursor: null });
+    });
+
+    it('lists the recordings in the Review tab from ONE shared attempt fetch', async () => {
+      renderDetailPage();
+      await screen.findByText('Jane Doe');
+      await waitFor(() => expect(mockApi.getCandidatePhoneAttempts).toHaveBeenCalled());
+      fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
+      const review = screen.getByRole('tabpanel', { name: 'Review' });
+      expect(await within(review).findByRole('heading', { name: 'Call recordings' })).toBeInTheDocument();
+      expect(within(review).getByText('Recorded before consent')).toBeInTheDocument();
+      expect(within(review).getByText(/No completed screening yet/i)).toBeInTheDocument();
+      // Both panels stay mounted (Tabs), yet the list was fetched once.
+      expect(mockApi.getCandidatePhoneAttempts).toHaveBeenCalledTimes(1);
+      expect(mockApi.getAttemptRecordingDownloadUrl).not.toHaveBeenCalled();
+    });
+
+    it('plays a pre-consent recording inline from the Review tab only on click', async () => {
+      mockApi.getAttemptRecordingDownloadUrl.mockResolvedValue({ url: 'https://storage.invalid/a1', content_type: 'audio/mpeg' });
+      renderDetailPage();
+      await screen.findByText('Jane Doe');
+      fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
+      const review = screen.getByRole('tabpanel', { name: 'Review' });
+      fireEvent.click(await within(review).findByRole('button', { name: 'Play recording' }));
+      const player = await within(review).findByLabelText('Attempt 1 recording', { selector: 'audio' });
+      expect(player).toHaveAttribute('src', 'https://storage.invalid/a1');
+      expect(mockApi.getAttemptRecordingDownloadUrl).toHaveBeenCalledTimes(1);
+      expect(mockApi.getAttemptRecordingDownloadUrl).toHaveBeenCalledWith(PRE_CONSENT_ATTEMPT.id);
+    });
   });
 });

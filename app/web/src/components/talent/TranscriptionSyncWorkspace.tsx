@@ -58,6 +58,15 @@ export interface TranscriptionSyncWorkspaceProps {
   sessions: Session[];
   assessments: Assessment[];
   blocked: boolean;
+  /**
+   * Shown under the empty state when no session has completed: the
+   * candidate's per-call recordings (calls that ended early, including at the
+   * consent step). A slot rather than a candidate id so this component stays
+   * free of a second data path; the Ashby scoped page passes nothing and is
+   * unchanged. The host shares one attempt list between this copy and the
+   * Overview's, so the Review tab never fetches it a second time.
+   */
+  callRecordings?: React.ReactNode;
 }
 
 /** Résumé conflicts, whether they arrive on the column or (rarely) inside raw. */
@@ -98,6 +107,7 @@ export function TranscriptionSyncWorkspace({
   sessions,
   assessments,
   blocked,
+  callRecordings,
 }: TranscriptionSyncWorkspaceProps) {
   const selectableSessions = useMemo(
     () => sessions.filter((s) => s.status === 'completed'),
@@ -273,16 +283,29 @@ export function TranscriptionSyncWorkspace({
     return (
       <div className="space-y-4 sm:space-y-6">
         {frame(
-          <SurfaceCard className="p-4 sm:p-5">
-            <h2 className="mb-1 text-[15px] font-semibold tracking-tight text-[var(--c-ink)]">
-              Review workspace
-            </h2>
-            <p className="max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
-              No completed sessions with recordings yet. Complete a live voice
-              screening to review the transcript with synchronized playback and
-              the session scorecard here.
-            </p>
-          </SurfaceCard>,
+          <>
+            <SurfaceCard className="p-4 sm:p-5">
+              <h2 className="mb-1 text-[15px] font-semibold tracking-tight text-[var(--c-ink)]">
+                Review workspace
+              </h2>
+              <p className="max-w-prose text-sm leading-relaxed text-[var(--c-ink-secondary)]">
+                {callRecordings ? (
+                  <>
+                    No completed screening yet. Recordings of calls that ended
+                    early are listed below; a completed screening shows its
+                    transcript with synchronized playback and its scorecard here.
+                  </>
+                ) : (
+                  <>
+                    No completed sessions with recordings yet. Complete a live voice
+                    screening to review the transcript with synchronized playback and
+                    the session scorecard here.
+                  </>
+                )}
+              </p>
+            </SurfaceCard>
+            {callRecordings}
+          </>,
           <ScorecardBlock
             blocked={blocked}
             assessment={assessments[0] ?? null}

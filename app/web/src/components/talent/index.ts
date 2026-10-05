@@ -26,6 +26,8 @@ export type {
   SessionsSummaryProps,
   NotesListProps,
 } from './CandidateOverviewSections';
+export { usePhoneAttemptHistory } from './usePhoneAttemptHistory';
+export type { PhoneAttemptHistorySource } from './usePhoneAttemptHistory';
 export { AshbyWorkflowCard, AshbyWorkflowCardView } from './AshbyWorkflowCard';
 export type {
   AshbyWorkflowCardProps,

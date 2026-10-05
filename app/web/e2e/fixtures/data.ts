@@ -715,8 +715,8 @@ function phoneAttempts(c: Candidate): CandidatePhoneAttempt[] {
   const own = sessions.filter((s) => s.candidate_id === c.id);
   if (c.id !== STAR_CANDIDATE_ID || own.length < 2) return [];
   return [
-    { id: uid('7', 3), attempt_seq: 3, admitted_at: ago(4 * HOUR), answered_at: ago(4 * HOUR - 12_000), ended_at: ago(3.8 * HOUR), state: 'completed', abandon_reason: null, outcome_class: 'answered', duration_sec: own[1].duration_sec ?? null, recording: { state: 'ready' }, transcript: { href: `/sessions/${own[1].id}`, scope: 'session', kind: 'session', shared_session: false } },
-    { id: uid('7', 2), attempt_seq: 2, admitted_at: ago(5 * HOUR), answered_at: ago(5 * HOUR - 9_000), ended_at: ago(5 * HOUR - 18_000), state: 'completed', abandon_reason: null, outcome_class: 'dropped_at_gate', duration_sec: 9, recording: { state: 'unavailable', reason: 'no_recording' }, transcript: { href: `/sessions/${own[0].id}`, scope: 'session', kind: 'gate_only', shared_session: false } },
+    { id: uid('7', 3), attempt_seq: 3, admitted_at: ago(4 * HOUR), answered_at: ago(4 * HOUR - 12_000), ended_at: ago(3.8 * HOUR), state: 'completed', abandon_reason: null, outcome_class: 'answered', duration_sec: own[1].duration_sec ?? null, recording: { state: 'ready' }, consent_stage: 'after_consent', transcript: { href: `/sessions/${own[1].id}`, scope: 'session', kind: 'session', shared_session: false } },
+    { id: uid('7', 2), attempt_seq: 2, admitted_at: ago(5 * HOUR), answered_at: ago(5 * HOUR - 9_000), ended_at: ago(5 * HOUR - 18_000), state: 'completed', abandon_reason: null, outcome_class: 'dropped_at_gate', duration_sec: 9, recording: { state: 'ready' }, consent_stage: 'before_consent', transcript: { href: `/sessions/${own[0].id}`, scope: 'session', kind: 'gate_only', shared_session: false } },
     { id: uid('7', 1), attempt_seq: 1, admitted_at: ago(26 * HOUR), answered_at: null, ended_at: ago(26 * HOUR - 40_000), state: 'completed', abandon_reason: null, outcome_class: 'no_answer', duration_sec: null, recording: { state: 'unavailable', reason: 'no_recording' }, transcript: null },
   ];
 }

@@ -15,13 +15,15 @@
  * unscoped app, which the scoped route must not offer.
  */
 
-import { useCallback, useEffect, useId, useState } from 'react';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import { Link } from 'react-router-dom';
 import type { CandidateDetail, CandidatePhoneAttempt, CandidateResumeFacts, MembershipRole, Note, Session } from '../../types';
 import { api } from '../../api';
 import { ScrollArea, StatusBadge } from '../design';
 import { SurfaceCard, Tag } from '../design/candidate';
+import { usePhoneAttemptHistory } from './usePhoneAttemptHistory';
+import type { PhoneAttemptHistorySource } from './usePhoneAttemptHistory';
 import {
   attemptOutcomeLabel,
   attemptRawStatus,
@@ -60,73 +62,188 @@ export function Field({ label, children }: { label: string; children: ReactNode 
 const SESSION_ROWS_BEFORE_SCROLL = 5;
 const NOTE_ROWS_BEFORE_SCROLL = 4;
 
+/** One attempt's inline audio: what the open row is showing. */
+type AttemptAudio =
+  | { attemptId: string; status: 'loading' }
+  | { attemptId: string; status: 'ready'; url: string }
+  | { attemptId: string; status: 'error'; message: string; retryable: boolean };
+
 /**
- * Per-dial evidence. The audio action deliberately mints a URL only from an
- * explicit click; the history response contains state, never a signed URL.
+ * A refused mint, in a recruiter's words. The download route answers 409 for
+ * a recording still processing or quarantined, 403 for a deleted attempt or a
+ * revoked parent, 404 for a missing or purged one, and 429 past the strict
+ * per-user recordings bucket.
+ */
+function attemptAudioError(cause: unknown): { message: string; retryable: boolean } {
+  const status = typeof (cause as { status?: unknown } | null)?.status === 'number'
+    ? (cause as { status: number }).status
+    : 0;
+  const text = cause instanceof Error ? cause.message : '';
+  if (status === 409) {
+    return /process/i.test(text)
+      ? { message: 'Recording is still processing. Try again shortly.', retryable: true }
+      : { message: 'Recording withheld: it failed an integrity check.', retryable: false };
+  }
+  if (status === 403) {
+    return { message: 'Recording unavailable: it was deleted or access was withdrawn.', retryable: false };
+  }
+  if (status === 404) return { message: 'Recording no longer available.', retryable: false };
+  if (status === 429) {
+    return { message: 'Too many recording requests. Wait a moment, then try again.', retryable: true };
+  }
+  return { message: "Couldn't load the recording.", retryable: true };
+}
+
+/** Why a listed recording cannot be played. */
+function unavailableRecordingLabel(reason: CandidatePhoneAttempt['recording']['reason']): string {
+  switch (reason) {
+    case 'access_unavailable':
+      return 'Recording access unavailable';
+    case 'recording_failed':
+      return 'Recording unavailable (capture failed)';
+    case 'quarantined':
+      return 'Recording withheld (failed integrity check)';
+    case 'deleted':
+      return 'Recording deleted';
+    default:
+      return 'No recording available';
+  }
+}
+
+/**
+ * Per-dial evidence, with an inline player for every recorded leg —
+ * including calls that ended at or before the consent step, whose audio the
+ * worker keeps from the start of the call (0105, 2026-09-26 decision).
+ *
+ * The signed URL is minted ONLY from an explicit "Play recording" click,
+ * through the existing attempt download route (role/ownership, lifecycle,
+ * integrity re-verification and a `recording.download` audit with
+ * `pre_consent`). It lives only in this component's state for the open row:
+ * the history payload never carries one, nothing logs or stores it, and
+ * closing the row (or opening another) discards it. `preload="none"`.
  */
 export function PhoneAttemptHistory({
   candidateId,
   role,
+  source,
+  title = 'Call attempts',
+  description = 'Every phone leg and its recording, including calls that ended at the consent step.',
 }: {
   candidateId: string;
   role: MembershipRole;
+  /** A shared list from `usePhoneAttemptHistory`; omit to load one here. */
+  source?: PhoneAttemptHistorySource;
+  title?: string;
+  description?: string;
 }) {
   const headingId = useId();
-  const [attempts, setAttempts] = useState<CandidatePhoneAttempt[] | null>(null);
-  const [nextCursor, setNextCursor] = useState<string | null>(null);
-  const [error, setError] = useState(false);
-  const [loadingAudio, setLoadingAudio] = useState<string | null>(null);
+  const playerBaseId = useId();
+  const own = usePhoneAttemptHistory(candidateId, !source);
+  const { attempts, nextCursor, error, reload, loadOlder } = source ?? own;
 
-  const load = useCallback((before?: string, append = false) => {
-    setError(false);
-    // Candidate-scoped embedded hosts can provide a reduced API adapter. The
-    // production adapter always has this method; absence is a truthful empty
-    // state for those legacy hosts rather than a render failure.
-    if (typeof api.getCandidatePhoneAttempts !== 'function') {
-      setAttempts([]);
-      setNextCursor(null);
-      return;
-    }
-    api.getCandidatePhoneAttempts(candidateId, before)
-      .then((result) => {
-        setAttempts((current) => append && current ? [...current, ...result.attempts] : result.attempts);
-        setNextCursor(result.next_cursor);
-      })
-      .catch(() => {
-        setAttempts(null);
-        setError(true);
-      });
+  const [audio, setAudio] = useState<AttemptAudio | null>(null);
+  const audioGeneration = useRef(0);
+  const mountedRef = useRef(true);
+  const audioRef = useRef<HTMLAudioElement>(null);
+  // Position and play state carried across a "Refresh link" re-mint.
+  const resumeRef = useRef<{ time: number; playing: boolean } | null>(null);
+  const focusOnReadyRef = useRef(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  // A different candidate never inherits an open player or a late response.
+  useEffect(() => {
+    audioGeneration.current += 1;
+    resumeRef.current = null;
+    setAudio(null);
   }, [candidateId]);
 
-  useEffect(load, [load]);
+  const canPlay = typeof api.getAttemptRecordingDownloadUrl === 'function';
 
-  async function download(attemptId: string) {
-    if (typeof api.getAttemptRecordingDownloadUrl !== 'function') return;
-    setLoadingAudio(attemptId);
-    try {
-      const result = await api.getAttemptRecordingDownloadUrl(attemptId);
-      // The signed URL lives only for this user gesture. It is never placed in
-      // the history payload, application state, or a durable link.
-      window.open(result.url, '_blank', 'noopener,noreferrer');
-    } catch {
-      setError(true);
-    } finally {
-      setLoadingAudio(null);
+  const mint = useCallback((attemptId: string) => {
+    const gen = ++audioGeneration.current;
+    setAudio({ attemptId, status: 'loading' });
+    Promise.resolve()
+      .then(() => api.getAttemptRecordingDownloadUrl(attemptId))
+      .then((result) => {
+        if (!mountedRef.current || gen !== audioGeneration.current) return;
+        setAudio({ attemptId, status: 'ready', url: result.url });
+      })
+      .catch((cause: unknown) => {
+        if (!mountedRef.current || gen !== audioGeneration.current) return;
+        resumeRef.current = null;
+        setAudio({ attemptId, status: 'error', ...attemptAudioError(cause) });
+      });
+  }, []);
+
+  function toggle(attemptId: string) {
+    if (audio?.attemptId === attemptId) {
+      // Closing discards the URL and ignores any mint still in flight.
+      audioGeneration.current += 1;
+      resumeRef.current = null;
+      setAudio(null);
+      return;
     }
+    resumeRef.current = null;
+    focusOnReadyRef.current = true;
+    mint(attemptId);
   }
+
+  function refresh(attemptId: string) {
+    const el = audioRef.current;
+    resumeRef.current = el ? { time: el.currentTime, playing: !el.paused } : null;
+    focusOnReadyRef.current = false;
+    mint(attemptId);
+  }
+
+  const readyUrl = audio?.status === 'ready' ? audio.url : null;
+  // Once a freshly minted URL is on the <audio>: put keyboard focus on the
+  // controls after an open, or restore position after a refresh. Never
+  // autoplays on open: the gesture is gone after the async mint.
+  useEffect(() => {
+    const el = audioRef.current;
+    if (!readyUrl || !el) return;
+    if (focusOnReadyRef.current) {
+      focusOnReadyRef.current = false;
+      el.focus();
+    }
+    const resume = resumeRef.current;
+    if (!resume) return;
+    resumeRef.current = null;
+    const restore = () => {
+      try {
+        if (resume.time > 0.1) el.currentTime = resume.time;
+      } catch {
+        /* not seekable yet */
+      }
+      if (resume.playing) el.play().catch(() => {});
+    };
+    if (el.readyState >= 1) restore();
+    else {
+      el.addEventListener('loadedmetadata', restore, { once: true });
+      try {
+        el.load();
+      } catch {
+        /* preload="none" kick; ignore where unsupported */
+      }
+    }
+  }, [readyUrl]);
 
   return (
     <SurfaceCard as="section" labelledBy={headingId} className="p-4 sm:p-5">
       <h2 id={headingId} className="text-[15px] font-semibold tracking-tight text-ink">
-        Call attempts
+        {title}
       </h2>
-      <p className="mb-3 mt-0.5 text-label text-ink-tertiary">
-        Every phone leg, including calls that ended before screening began.
-      </p>
+      <p className="mb-3 mt-0.5 text-label text-ink-tertiary">{description}</p>
       {error ? (
         <div className="flex flex-wrap items-center gap-2">
           <p role="alert" className="text-sm text-ink-secondary">Attempt history unavailable.</p>
-          <button type="button" className={ROW_ACTION} onClick={() => load()}>Retry</button>
+          <button type="button" className={ROW_ACTION} onClick={reload}>Retry</button>
         </div>
       ) : attempts === null ? (
         <p className="text-sm text-ink-tertiary">Loading attempt history…</p>
@@ -134,86 +251,141 @@ export function PhoneAttemptHistory({
         <p className="text-sm text-ink-secondary">No phone call attempts yet.</p>
       ) : (
         <ul className="divide-y divide-line">
-          {attempts.map((attempt) => (
-            <li key={attempt.id} className="py-3 text-sm">
-              <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-1">
-                <div className="min-w-0">
-                  {/* The OUTCOME in a recruiter's words, beside the attempt
-                      number, because it is what they act on ("No answer",
-                      "Hung up before the recording notice"). The machine
-                      pair stays one hover away for an operator to quote. */}
-                  <p className="text-ink">
-                    <span className="font-medium">Attempt {attempt.attempt_seq}</span>
-                    <span aria-hidden="true" className="text-ink-tertiary"> · </span>
-                    <span
-                      className="text-ink-secondary"
-                      title={attemptRawStatus(attempt.outcome_class, attempt.state, attempt.abandon_reason)}
-                    >
-                      {attemptOutcomeLabel(attempt.outcome_class, attempt.state, attempt.abandon_reason)}
-                    </span>
-                  </p>
-                  <p className="text-meta tabular-nums text-ink-tertiary">
-                    {formatDateTime(attempt.admitted_at)}
-                    {attempt.duration_sec != null && attempt.duration_sec > 0
-                      ? ` · ${formatDurationSec(attempt.duration_sec)}`
-                      : ''}
-                  </p>
+          {attempts.map((attempt) => {
+            const open = audio?.attemptId === attempt.id ? audio : null;
+            const playerId = `${playerBaseId}-player-${attempt.id}`;
+            const recorded = attempt.recording.state !== 'unavailable';
+            const preConsent = recorded && attempt.consent_stage === 'before_consent';
+            const recordingName = `Attempt ${attempt.attempt_seq} recording`;
+            return (
+              <li key={attempt.id} className="py-3 text-sm">
+                <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-1">
+                  <div className="min-w-0">
+                    {/* The OUTCOME in a recruiter's words, beside the attempt
+                        number, because it is what they act on ("No answer",
+                        "Hung up before the recording notice"). The machine
+                        pair stays one hover away for an operator to quote. */}
+                    <p className="text-ink">
+                      <span className="font-medium">Attempt {attempt.attempt_seq}</span>
+                      <span aria-hidden="true" className="text-ink-tertiary"> · </span>
+                      <span
+                        className="text-ink-secondary"
+                        title={attemptRawStatus(attempt.outcome_class, attempt.state, attempt.abandon_reason)}
+                      >
+                        {attemptOutcomeLabel(attempt.outcome_class, attempt.state, attempt.abandon_reason)}
+                      </span>
+                    </p>
+                    <p className="text-meta tabular-nums text-ink-tertiary">
+                      {formatDateTime(attempt.admitted_at)}
+                      {attempt.duration_sec != null && attempt.duration_sec > 0
+                        ? ` · ${formatDurationSec(attempt.duration_sec)}`
+                        : ''}
+                    </p>
+                    {preConsent && (
+                      <p className="mt-1">
+                        <Tag tone="caution">Recorded before consent</Tag>
+                      </p>
+                    )}
+                  </div>
+                  <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1">
+                    {attempt.recording.state === 'ready' && canPlay ? (
+                      <button
+                        type="button"
+                        className={ROW_ACTION}
+                        aria-expanded={open !== null}
+                        aria-controls={open ? playerId : undefined}
+                        onClick={() => toggle(attempt.id)}
+                      >
+                        {open ? 'Hide player' : 'Play recording'}
+                      </button>
+                    ) : attempt.recording.state === 'processing' ? (
+                      <span className="text-xs text-ink-tertiary">Recording processing</span>
+                    ) : attempt.recording.state === 'ready' ? null : (
+                      <span className="text-xs text-ink-tertiary">
+                        {unavailableRecordingLabel(attempt.recording.reason)}
+                      </span>
+                    )}
+                    {attempt.transcript && (
+                      <Link
+                        to={attempt.transcript.href}
+                        className={ROW_ACTION}
+                      >
+                        {attempt.transcript.kind === 'gate_only' ? 'Pre-interview gate transcript' : 'Session transcript'}
+                      </Link>
+                    )}
+                  </div>
                 </div>
-                <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1">
-                  {attempt.recording.state === 'ready' ? (
-                    <button
-                      type="button"
-                      className={ROW_ACTION}
-                      onClick={() => download(attempt.id)}
-                      disabled={loadingAudio === attempt.id}
-                    >
-                      {loadingAudio === attempt.id ? 'Preparing audio…' : 'Download audio'}
-                    </button>
-                  ) : attempt.recording.state === 'processing' ? (
-                    <span className="text-xs text-ink-tertiary">Recording processing</span>
-                  ) : (
-                    <span className="text-xs text-ink-tertiary">
-                      {attempt.recording.reason === 'access_unavailable'
-                        ? 'Recording access unavailable'
-                        : attempt.recording.reason === 'recording_failed'
-                          ? 'Recording unavailable (capture failed)'
-                          : 'No recording available'}
-                    </span>
-                  )}
-                  {attempt.transcript && (
-                    <Link
-                      to={attempt.transcript.href}
-                      className={ROW_ACTION}
-                    >
-                      {attempt.transcript.kind === 'gate_only' ? 'Pre-interview gate transcript' : 'Session transcript'}
-                    </Link>
-                  )}
-                </div>
-              </div>
-              {attempt.transcript?.kind === 'gate_only' && (
-                <p className="mt-1 text-meta text-ink-secondary">
-                  Gate-only evidence: identity and recording-consent exchange before the interview.
-                </p>
-              )}
-              {attempt.transcript?.shared_session && (
-                <p className="mt-1 text-meta text-ink-tertiary">
-                  This session transcript may include multiple call legs; it is not an attempt-only transcript.
-                </p>
-              )}
-              {role === 'interviewer' && attempt.recording.reason === 'access_unavailable' && (
-                <p className="mt-1 text-meta text-ink-tertiary">
-                  Audio access is available only when the associated session has an owner you own.
-                </p>
-              )}
-            </li>
-          ))}
+                {open && (
+                  <div
+                    id={playerId}
+                    role="group"
+                    aria-label={recordingName}
+                    className="mt-2 space-y-1.5"
+                  >
+                    {open.status === 'loading' ? (
+                      <p role="status" className="text-meta text-ink-tertiary">Loading recording…</p>
+                    ) : open.status === 'error' ? (
+                      <div role="alert" className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                        <p className="text-meta text-ink-secondary">{open.message}</p>
+                        {open.retryable && (
+                          <button type="button" className={ROW_ACTION} onClick={() => mint(attempt.id)}>
+                            Try again
+                          </button>
+                        )}
+                      </div>
+                    ) : (
+                      <>
+                        <audio
+                          ref={audioRef}
+                          controls
+                          preload="none"
+                          src={open.url}
+                          className="h-9 w-full"
+                          aria-label={recordingName}
+                        />
+                        <div className="flex flex-wrap items-center gap-x-4 gap-y-1">
+                          <a href={open.url} download className={ROW_ACTION}>
+                            Download file
+                          </a>
+                          <button type="button" className={ROW_ACTION} onClick={() => refresh(attempt.id)}>
+                            Refresh link
+                          </button>
+                        </div>
+                      </>
+                    )}
+                    {preConsent && (
+                      <p className="text-meta text-ink-tertiary">
+                        Recorded before the candidate consented and kept under the
+                        2026-09-26 retention decision. Every playback is logged.
+                      </p>
+                    )}
+                  </div>
+                )}
+                {attempt.transcript?.kind === 'gate_only' && (
+                  <p className="mt-1 text-meta text-ink-secondary">
+                    Gate-only evidence: identity and recording-consent exchange before the interview.
+                  </p>
+                )}
+                {attempt.transcript?.shared_session && (
+                  <p className="mt-1 text-meta text-ink-tertiary">
+                    This session transcript may include multiple call legs; it is not an attempt-only transcript.
+                  </p>
+                )}
+                {role === 'interviewer' && attempt.recording.reason === 'access_unavailable' && (
+                  <p className="mt-1 text-meta text-ink-tertiary">
+                    Audio access is available only when the associated session has an owner you own.
+                  </p>
+                )}
+              </li>
+            );
+          })}
         </ul>
       )}
       {attempts && nextCursor && !error && (
         <button
           type="button"
           className={`mt-3 ${ROW_ACTION}`}
-          onClick={() => load(nextCursor, true)}
+          onClick={loadOlder}
         >
           Load older attempts
         </button>

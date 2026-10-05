@@ -802,6 +802,12 @@ export interface CandidateDetail {
 }
 
 export type PhoneAttemptRecordingState = 'ready' | 'processing' | 'unavailable';
+export type PhoneAttemptRecordingReason =
+  | 'access_unavailable'
+  | 'no_recording'
+  | 'recording_failed'
+  | 'quarantined'
+  | 'deleted';
 export type PhoneAttemptTranscriptKind = 'gate_only' | 'session';
 
 export interface CandidatePhoneAttempt {
@@ -819,7 +825,13 @@ export interface CandidatePhoneAttempt {
   abandon_reason: 'infra_deferred' | null;
   outcome_class: string | null;
   duration_sec: number | null;
-  recording: { state: PhoneAttemptRecordingState; reason?: 'access_unavailable' | 'no_recording' | 'recording_failed' };
+  recording: { state: PhoneAttemptRecordingState; reason?: PhoneAttemptRecordingReason };
+  /**
+   * Whether this leg's audio was captured before the candidate consented
+   * (kept under the 2026-09-26 retention decision, 0105). null = cannot be
+   * told; absent on older payloads.
+   */
+  consent_stage?: 'before_consent' | 'after_consent' | null;
   transcript: {
     href: string;
     scope: 'session';

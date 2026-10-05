@@ -374,8 +374,21 @@ recordingsRouter.get(
       if (signError || !signedData?.signedUrl) {
         return res.status(500).json({ error: { type: 'internal_error', message: 'Failed to generate download URL' } });
       }
+      // `scope` tells an attempt mint apart from a session mint in the audit
+      // trail. `pre_consent`: 0107 binds `session_id` only at consent, so an
+      // attempt still unbound was recorded before the candidate consented
+      // (kept under the 2026-09-26 retention decision recorded in 0105). Every
+      // such access is therefore visible as a pre-consent access. The URL
+      // itself is never part of the audit row.
       await recordAudit(req, 'recording.download', 200, {
-        metadata: { attempt_id: attemptId, requested_by: user.id, role: user.appRole, ttl_sec: ttlSec },
+        metadata: {
+          attempt_id: attemptId,
+          scope: 'attempt',
+          pre_consent: attempt.session_id == null,
+          requested_by: user.id,
+          role: user.appRole,
+          ttl_sec: ttlSec,
+        },
       }).catch(() => {});
       return res.json({ url: signedData.signedUrl, content_type: attempt.recording_content_type });
     } catch (error) {

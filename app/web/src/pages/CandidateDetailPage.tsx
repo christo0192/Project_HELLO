@@ -37,7 +37,9 @@ import {
   Tabs,
   TranscriptionSyncWorkspace,
   candidateDisplayName,
+  usePhoneAttemptHistory,
 } from "../components/talent";
+import type { PhoneAttemptHistorySource } from "../components/talent";
 import {
   candidateDisplayStatus,
   sessionStatusLabel,
@@ -225,6 +227,12 @@ export function CandidateDetailPage() {
     };
   }, [roleId]);
 
+  // ONE attempt list for the page, shared by the Overview rail and the Review
+  // tab's call recordings. `Tabs` keeps both panels mounted, so two
+  // self-loading copies would fetch it twice on every load. Loaded once the
+  // page itself has loaded, as the Overview copy always was.
+  const phoneAttempts = usePhoneAttemptHistory(id ?? "", Boolean(id && detail && me));
+
   // Silent refresh: re-read the candidate (its session list feeds the Review
   // tab) without unmounting the page. Used when a live call completes.
   const refresh = useCallback(() => {
@@ -377,6 +385,7 @@ export function CandidateDetailPage() {
                   candidate={candidate}
                   sessions={sessions}
                   phoneRole={me.role}
+                  phoneAttempts={phoneAttempts}
                   onSessionCompleted={refresh}
                   callInHeader={!reviewable}
                   callRequest={callRequest}
@@ -394,6 +403,15 @@ export function CandidateDetailPage() {
                   sessions={sessions}
                   assessments={assessments}
                   blocked={decisionBlocked}
+                  callRecordings={
+                    <PhoneAttemptHistory
+                      candidateId={candidate.id}
+                      role={me.role}
+                      source={phoneAttempts}
+                      title="Call recordings"
+                      description="Calls that ended before a screening completed, including at the consent step. Recordings play here on request."
+                    />
+                  }
                 />
               ),
             },
@@ -482,6 +500,7 @@ function OverviewTab({
   candidate,
   sessions,
   phoneRole,
+  phoneAttempts,
   onSessionCompleted,
   callInHeader,
   callRequest,
@@ -492,6 +511,8 @@ function OverviewTab({
   candidate: CandidateDetail["candidate"];
   sessions: CandidateDetail["sessions"];
   phoneRole: MeResponse["role"];
+  /** The page's shared attempt list (see `usePhoneAttemptHistory`). */
+  phoneAttempts: PhoneAttemptHistorySource;
   onSessionCompleted?: () => void;
   callInHeader: boolean;
   callRequest: number;
@@ -517,7 +538,7 @@ function OverviewTab({
 
         <SessionsSummary sessions={sessions} />
 
-        <PhoneAttemptHistory candidateId={candidate.id} role={phoneRole} />
+        <PhoneAttemptHistory candidateId={candidate.id} role={phoneRole} source={phoneAttempts} />
 
         <NotesSection candidateId={candidate.id} />
       </div>

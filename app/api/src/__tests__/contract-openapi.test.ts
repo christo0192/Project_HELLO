@@ -1440,6 +1440,35 @@ describe('OpenAPI document integrity', () => {
     expect(validateNamed(missing, 'CandidatePhoneAttempt', spec).length).toBeGreaterThan(0);
   });
 
+  it('CandidatePhoneAttempt documents consent_stage and the deleted/quarantined recording reasons', () => {
+    const base = {
+      id: '00000000-0000-4000-8000-000000000111',
+      attempt_seq: 1,
+      admitted_at: '2026-09-25T13:00:00.000Z',
+      answered_at: '2026-09-25T13:00:01.000Z',
+      ended_at: '2026-09-25T13:00:09.000Z',
+      state: 'ended',
+      abandon_reason: null,
+      outcome_class: 'abandoned_pre_disclosure',
+      duration_sec: 8,
+      recording: { state: 'ready' },
+      transcript: null,
+    };
+    for (const stage of ['before_consent', 'after_consent', null]) {
+      expect(validateNamed({ ...base, consent_stage: stage }, 'CandidatePhoneAttempt', spec)).toEqual([]);
+    }
+    expect(validateNamed({ ...base, consent_stage: 'maybe' }, 'CandidatePhoneAttempt', spec).length)
+      .toBeGreaterThan(0);
+    for (const reason of ['access_unavailable', 'no_recording', 'recording_failed', 'quarantined', 'deleted']) {
+      expect(validateNamed({ state: 'unavailable', reason }, 'CandidatePhoneAttemptRecording', spec)).toEqual([]);
+    }
+    expect(validateNamed({ state: 'unavailable', reason: 'purged' }, 'CandidatePhoneAttemptRecording', spec).length)
+      .toBeGreaterThan(0);
+    // The list never carries a signed URL or a storage key.
+    expect(validateNamed({ state: 'ready', url: 'https://x.invalid/a' }, 'CandidatePhoneAttemptRecording', spec).length)
+      .toBeGreaterThan(0);
+  });
+
   it('documents every route the app registers and nothing else', () => {
     const app = createContractApp();
     const documented = [...documentedOperations().keys()];

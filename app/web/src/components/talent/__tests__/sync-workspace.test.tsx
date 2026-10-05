@@ -158,6 +158,33 @@ describe('TranscriptionSyncWorkspace', () => {
     expect(screen.getByText(/No completed sessions with recordings yet/i)).toBeInTheDocument();
   });
 
+  it('lists the call recordings under the empty state when the host provides them', () => {
+    render(
+      <TranscriptionSyncWorkspace
+        sessions={[{ ...SESSION_COMPLETED_LIVE, status: 'expired' }]}
+        assessments={NO_ASSESSMENTS}
+        blocked={false}
+        callRecordings={<section aria-label="Call recordings">attempt list</section>}
+      />,
+    );
+    expect(screen.getByText(/No completed screening yet/i)).toBeInTheDocument();
+    expect(screen.getByRole('region', { name: 'Call recordings' })).toHaveTextContent('attempt list');
+    expect(screen.queryByText(/No completed sessions with recordings yet/i)).toBeNull();
+  });
+
+  it('does not render the call recordings once a session has completed', () => {
+    mockApi.getSession.mockReturnValue(new Promise(() => {}));
+    render(
+      <TranscriptionSyncWorkspace
+        sessions={[SESSION_COMPLETED_LIVE]}
+        assessments={NO_ASSESSMENTS}
+        blocked={false}
+        callRecordings={<section aria-label="Call recordings">attempt list</section>}
+      />,
+    );
+    expect(screen.queryByRole('region', { name: 'Call recordings' })).toBeNull();
+  });
+
   it('suppresses the scorecard when appeal-blocked', () => {
     render(
       <TranscriptionSyncWorkspace sessions={[SESSION_COMPLETED_LIVE]} assessments={NO_ASSESSMENTS} blocked={true} />,
