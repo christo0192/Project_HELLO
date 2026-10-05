@@ -218,17 +218,19 @@ describe('GET /api/candidates — resume_review', () => {
     expect(eqCalls).toContainEqual({ table: 'candidates', column: 'owner_id', value: interviewer.id });
   });
 
-  it('the row shape is otherwise byte-identical — exactly one field is added', async () => {
+  it('the row shape is otherwise byte-identical — only resume_review and the four phone-progress fields are added', async () => {
     configure({
       candidates: ok([PARSED_CANDIDATE]),
       assessments: ok([]),
       ashby_application_links: ok([]),
     });
     const res = await request(appFor(admin)).get('/api/candidates').set('Authorization', AUTH);
+    // dial_count / last_dialed_at / phone_state / phone_state_reason come from
+    // lib/candidate-phone-progress.ts (candidates-phone-progress.test.ts).
     expect(Object.keys(res.body[0]).sort()).toEqual([
-      'created_at', 'email', 'experience_years', 'id', 'latest_recommendation',
-      'latest_score', 'name', 'phone_e164', 'phone_valid', 'resume_review',
-      'role_id', 'skills', 'status',
+      'created_at', 'dial_count', 'email', 'experience_years', 'id', 'last_dialed_at',
+      'latest_recommendation', 'latest_score', 'name', 'phone_e164', 'phone_state',
+      'phone_state_reason', 'phone_valid', 'resume_review', 'role_id', 'skills', 'status',
     ]);
     // The internal suppression field never leaks, as before.
     expect(res.body[0]).not.toHaveProperty('decision_use_blocked_at');

@@ -1983,6 +1983,117 @@ describe('GET /api/recordings/attempts/:attemptId/download (0107)', () => {
     expect(res.body.url).toBe(SIGNED_URL);
   });
 
+  describe('audit metadata (M011 inline attempt player)', () => {
+    function appCapturingAudit(role: 'admin' | 'interviewer' | 'viewer', userId: string, entries: Array<Record<string, any>>) {
+      return createApp({
+        nodeEnv: 'test',
+        webOrigin: 'http://localhost:5173',
+        authDeps: authAs(role, userId),
+        auditSinkOverride: async (entry: Record<string, any>) => { entries.push(entry); },
+      });
+    }
+
+    it('audits a pre-consent mint as scope=attempt, pre_consent=true, and never records the URL', async () => {
+      // A worker clip of a leg that never reached consent: session_id is
+      // bound only at consent (0107), the parent never completed and has no
+      // session-level recording.
+      configureAttempt({ session_id: null, recording_session_id: SESSION }, { recording_object_key: null, status: 'failed' });
+      const entries: Array<Record<string, any>> = [];
+      const res = await request(appCapturingAudit('admin', 'admin-1', entries))
+        .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+        .set('Authorization', AUTH_HEADER);
+      expect(res.status).toBe(200);
+      expect(res.body).toEqual({ url: SIGNED_URL, content_type: 'audio/mpeg' });
+      const downloads = entries.filter((e) => e.event === 'recording.download');
+      expect(downloads).toHaveLength(1);
+      expect(downloads[0].statusCode).toBe(200);
+      // The synthetic id's all-digit last group trips redactForAudit's
+      // phone-number pattern (10+ digits); a real v4 uuid is hex. Only the
+      // id's presence is asserted here.
+      expect(downloads[0].metadata).toEqual({
+        attempt_id: expect.stringMatching(/^00000000-0000-4000-8000-/),
+        scope: 'attempt',
+        pre_consent: true,
+        requested_by: 'admin-1',
+        role: 'admin',
+        ttl_sec: expect.any(Number),
+      });
+      // Neither the signed URL nor the storage key ever reaches the audit trail.
+      for (const entry of entries) {
+        expect(JSON.stringify(entry)).not.toContain(SIGNED_URL);
+        expect(JSON.stringify(entry)).not.toContain(`phone-${ATTEMPT}-egress.mp3`);
+      }
+    });
+
+    it('audits a consented attempt as pre_consent=false', async () => {
+      configureAttempt();
+      const entries: Array<Record<string, any>> = [];
+      const res = await request(appCapturingAudit('admin', 'admin-1', entries))
+        .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+        .set('Authorization', AUTH_HEADER);
+      expect(res.status).toBe(200);
+      const download = entries.find((e) => e.event === 'recording.download');
+      expect(download?.metadata).toMatchObject({ scope: 'attempt', pre_consent: false });
+    });
+
+    it('uses the SAME classification as the attempt history: unbound leg under a completed parent', async () => {
+      // A pre-0107 leg may have consented: the history reports consent_stage
+      // null for it, so the audit must not claim a pre-consent access either.
+      configureAttempt(
+        { session_id: null, recording_session_id: SESSION, outcome_class: 'completed' },
+        { status: 'completed' },
+      );
+      const unknown: Array<Record<string, any>> = [];
+      const res = await request(appCapturingAudit('admin', 'admin-1', unknown))
+        .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+        .set('Authorization', AUTH_HEADER);
+      expect(res.status).toBe(200);
+      expect(unknown.find((e) => e.event === 'recording.download')?.metadata)
+        .toMatchObject({ scope: 'attempt', pre_consent: null });
+
+      // ...but a pre-consent OUTCOME under that completed parent is still
+      // before consent, exactly as the history tags it.
+      configureAttempt(
+        { session_id: null, recording_session_id: SESSION, outcome_class: 'abandoned_pre_disclosure' },
+        { status: 'completed' },
+      );
+      const pre: Array<Record<string, any>> = [];
+      await request(appCapturingAudit('admin', 'admin-1', pre))
+        .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+        .set('Authorization', AUTH_HEADER);
+      expect(pre.find((e) => e.event === 'recording.download')?.metadata)
+        .toMatchObject({ scope: 'attempt', pre_consent: true });
+    });
+
+    it('lets a viewer play pre-consent audio and audits it with the viewer role', async () => {
+      configureAttempt({ session_id: null, recording_session_id: SESSION }, { owner_id: null, status: 'expired' });
+      const entries: Array<Record<string, any>> = [];
+      const res = await request(appCapturingAudit('viewer', 'viewer-1', entries))
+        .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+        .set('Authorization', AUTH_HEADER);
+      expect(res.status).toBe(200);
+      const download = entries.find((e) => e.event === 'recording.download');
+      expect(download?.metadata).toMatchObject({ scope: 'attempt', pre_consent: true, role: 'viewer' });
+    });
+
+    it('mints and audits nothing for a deleted or quarantined attempt', async () => {
+      const entries: Array<Record<string, any>> = [];
+      configureAttempt({ session_id: null, recording_session_id: SESSION, recording_deleted_at: '2026-09-27T00:00:00.000Z' });
+      const deleted = await request(appCapturingAudit('admin', 'admin-1', entries))
+        .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+        .set('Authorization', AUTH_HEADER);
+      expect(deleted.status).toBe(403);
+
+      configureAttempt({ session_id: null, recording_session_id: SESSION, recording_ready: false, recording_quarantined: true });
+      const quarantined = await request(appCapturingAudit('admin', 'admin-1', entries))
+        .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+        .set('Authorization', AUTH_HEADER);
+      expect(quarantined.status).toBe(409);
+      expect(mockCreateSignedUrl).not.toHaveBeenCalled();
+      expect(entries.filter((e) => e.event === 'recording.download')).toHaveLength(0);
+    });
+  });
+
   it('keeps an old null-bound attempt unavailable rather than guessing a parent', async () => {
     configureAttempt({ session_id: null, recording_session_id: null });
     const app = createTestApp(authAs('admin', 'admin-1'));

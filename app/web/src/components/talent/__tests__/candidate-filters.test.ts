@@ -11,6 +11,8 @@ import {
   candidateNextAction,
   recommendationLabel,
   normalizeStatus,
+  normalizeCandidateQuery,
+  CANDIDATE_QUERY_MAX,
   EMPTY_CANDIDATE_FILTERS,
 } from '../candidateFilters';
 
@@ -46,6 +48,7 @@ describe('parseCandidateFilters', () => {
       resumeReview: [],
       assessed: true,
       roleId: 'r1',
+      query: '',
     });
   });
 
@@ -69,6 +72,7 @@ describe('buildCandidateSearch / candidatesHref', () => {
       recommendations: ['reject', 'advance'],
       assessed: true,
       roleId: 'r9',
+      query: '',
     });
     const back = parseCandidateFilters(new URLSearchParams(href.split('?')[1]));
     expect(back).toEqual({
@@ -77,6 +81,7 @@ describe('buildCandidateSearch / candidatesHref', () => {
       resumeReview: [],
       assessed: true,
       roleId: 'r9',
+      query: '',
     });
   });
 
@@ -90,6 +95,73 @@ describe('buildCandidateSearch / candidatesHref', () => {
       '/candidates?recommendation=advance',
     );
     expect(candidatesHref({ assessed: true })).toBe('/candidates?assessed=1');
+  });
+});
+
+/**
+ * The `q` (free-text search) dimension. Normalized on the way in AND on the
+ * way out, emitted last so every pre-existing href is byte-identical, and
+ * never consulted by `matchesCandidateFilters` (search is its own predicate).
+ */
+describe('search query dimension (q)', () => {
+  it('parses q trimmed with inner whitespace collapsed', () => {
+    expect(parseCandidateFilters(new URLSearchParams('q=%20%20jane%20%20%20doe%20')).query).toBe(
+      'jane doe',
+    );
+  });
+
+  it('treats a missing or whitespace-only q as no search', () => {
+    expect(parseCandidateFilters(new URLSearchParams('')).query).toBe('');
+    expect(parseCandidateFilters(new URLSearchParams('q=%20%20%20')).query).toBe('');
+    expect(normalizeCandidateQuery(null)).toBe('');
+    expect(normalizeCandidateQuery(undefined)).toBe('');
+  });
+
+  it(`caps q at ${CANDIDATE_QUERY_MAX} code points without splitting a surrogate pair`, () => {
+    const long = 'a'.repeat(250);
+    expect(parseCandidateFilters(new URLSearchParams({ q: long })).query).toHaveLength(
+      CANDIDATE_QUERY_MAX,
+    );
+    // 99 ASCII + an astral emoji (2 UTF-16 units) + more: the emoji is the
+    // 100th code point and must survive whole.
+    const astral = `${'b'.repeat(99)}😀zzz`;
+    const capped = normalizeCandidateQuery(astral);
+    expect(Array.from(capped)).toHaveLength(CANDIDATE_QUERY_MAX);
+    expect(capped.endsWith('😀')).toBe(true);
+  });
+
+  it('emits q only when non-empty, and LAST', () => {
+    expect(buildCandidateSearch(f({ query: '' })).has('q')).toBe(false);
+    expect(buildCandidateSearch(f({ query: '   ' })).has('q')).toBe(false);
+    const params = buildCandidateSearch(
+      f({ statuses: ['screened'], roleId: 'r1', assessed: true, query: 'sam' }),
+    );
+    expect([...params.keys()]).toEqual(['status', 'assessed', 'role', 'q']);
+    expect(params.toString()).toBe('status=screened&assessed=1&role=r1&q=sam');
+  });
+
+  it('normalizes q on the way OUT as well (no stray whitespace in the URL)', () => {
+    expect(candidatesHref({ query: '  jane   doe ' })).toBe('/candidates?q=jane+doe');
+  });
+
+  it('round-trips characters that are meaningful in a URL or an address', () => {
+    for (const query of ['jane+doe@example.com', 'a&b', '#1 pick', 'José Ñúñez', '100%']) {
+      const href = candidatesHref({ statuses: ['new'], query });
+      const back = parseCandidateFilters(new URLSearchParams(href.split('?')[1]));
+      expect(back.query).toBe(query);
+      expect(back.statuses).toEqual(['new']);
+    }
+  });
+
+  it('leaves every pre-existing href byte-identical when there is no search', () => {
+    expect(candidatesHref({ statuses: ['screened'] })).toBe('/candidates?status=screened');
+    expect(candidatesHref({ recommendations: ['advance'], roleId: 'r1' })).toBe(
+      '/candidates?recommendation=advance&role=r1',
+    );
+  });
+
+  it('is ignored by matchesCandidateFilters (search is its own predicate)', () => {
+    expect(matchesCandidateFilters(cand({ name: 'Jane' }), f({ query: 'nobody' }))).toBe(true);
   });
 });
 
@@ -127,6 +199,7 @@ describe('hasActiveFilters / normalizeStatus / recommendationLabel', () => {
     expect(hasActiveFilters(f({ recommendations: ['hold'] }))).toBe(true);
     expect(hasActiveFilters(f({ assessed: true }))).toBe(true);
     expect(hasActiveFilters(f({ roleId: 'r' }))).toBe(true);
+    expect(hasActiveFilters(f({ query: 'x' }))).toBe(true);
   });
 
   it('normalizes blank status to new and labels recommendations', () => {
@@ -180,6 +253,7 @@ describe('resume-review facet', () => {
       resumeReview: ['cancelled', 'processing'],
       assessed: true,
       roleId: 'r9',
+      query: '',
     });
     expect(href).toContain('resume=processing%2Ccancelled');
     const back = parseCandidateFilters(new URLSearchParams(href.split('?')[1]));
@@ -189,6 +263,7 @@ describe('resume-review facet', () => {
       resumeReview: ['processing', 'cancelled'],
       assessed: true,
       roleId: 'r9',
+      query: '',
     });
   });
 
@@ -263,5 +338,67 @@ describe('resume-review facet', () => {
       label: 'Queued for screening',
       emphasis: false,
     });
+  });
+});
+
+/**
+ * Feature: dial status. The status dimension is keyed by the DISPLAY status
+ * (`candidateStatusKey`), so a phone cycle's terminal outcome is its own
+ * filterable, countable bucket and stops hiding inside "Queued".
+ */
+describe('phone-outcome display keys', () => {
+  it('parses and round-trips the new keys in canonical order', () => {
+    const parsed = parseCandidateFilters(
+      new URLSearchParams('status=wrong_number,abandoned_no_answer,queued,bogus'),
+    );
+    expect(parsed.statuses).toEqual(['queued', 'abandoned_no_answer', 'wrong_number']);
+    expect(candidatesHref({ statuses: ['abandoned_no_answer'] })).toBe(
+      '/candidates?status=abandoned_no_answer',
+    );
+    const back = parseCandidateFilters(new URLSearchParams('status=abandoned_no_answer'));
+    expect(back.statuses).toEqual(['abandoned_no_answer']);
+  });
+
+  it('queued excludes an abandoned row and abandoned_no_answer matches it', () => {
+    const abandoned = cand({ status: 'queued', dial_count: 5, phone_state: 'abandoned_no_answer' });
+    const dialled = cand({ status: 'queued', dial_count: 3, phone_state: 'awaiting_retry' });
+    expect(matchesCandidateStatus(abandoned, f({ statuses: ['queued'] }))).toBe(false);
+    expect(matchesCandidateStatus(abandoned, f({ statuses: ['abandoned_no_answer'] }))).toBe(true);
+    expect(matchesCandidateStatus(dialled, f({ statuses: ['queued'] }))).toBe(true);
+    expect(matchesCandidateStatus(dialled, f({ statuses: ['abandoned_no_answer'] }))).toBe(false);
+  });
+
+  it('a decided status is never re-bucketed by a later phone cycle', () => {
+    const screened = cand({ status: 'screened', phone_state: 'failed', dial_count: 2 });
+    expect(matchesCandidateStatus(screened, f({ statuses: ['screened'] }))).toBe(true);
+    expect(matchesCandidateStatus(screened, f({ statuses: ['phone_failed'] }))).toBe(false);
+  });
+
+  it('the funnel counts by display key, phone outcomes after the stored statuses', () => {
+    expect(
+      candidateFunnel([
+        cand({ status: 'queued', phone_state: 'abandoned_no_answer', dial_count: 5 }),
+        cand({ status: 'queued', dial_count: 3 }),
+        cand({ status: 'queued', phone_state: 'failed' }),
+        cand({ status: 'screened', phone_state: 'failed' }),
+      ]),
+    ).toEqual([
+      { status: 'queued', label: 'Queued', value: 1 },
+      { status: 'screened', label: 'Screened', value: 1 },
+      { status: 'abandoned_no_answer', label: 'Abandoned: no answer', value: 1 },
+      { status: 'phone_failed', label: 'Phone screen failed', value: 1 },
+    ]);
+  });
+
+  it('gives each phone outcome a plain, un-emphasised next action', () => {
+    expect(candidateNextAction('abandoned_no_answer')).toEqual({
+      label: 'No answer after every attempt',
+      emphasis: false,
+    });
+    for (const key of ['phone_failed', 'wrong_number', 'opted_out', 'phone_cancelled']) {
+      const next = candidateNextAction(key);
+      expect(next.emphasis, key).toBe(false);
+      expect(next.label, key).not.toBe('Open profile');
+    }
   });
 });

@@ -26,6 +26,8 @@ export type {
   SessionsSummaryProps,
   NotesListProps,
 } from './CandidateOverviewSections';
+export { usePhoneAttemptHistory } from './usePhoneAttemptHistory';
+export type { PhoneAttemptHistorySource } from './usePhoneAttemptHistory';
 export { AshbyWorkflowCard, AshbyWorkflowCardView } from './AshbyWorkflowCard';
 export type {
   AshbyWorkflowCardProps,
@@ -50,14 +52,19 @@ export type { TranscriptionSyncWorkspaceProps } from './TranscriptionSyncWorkspa
 export {
   candidateStatusLabel,
   candidateStatusTone,
+  candidateDisplayStatus,
+  candidateStatusKey,
+  anyPhoneProgressUnknown,
   sessionStatusLabel,
   sessionStatusTone,
   formatDurationSec,
   candidateStatusCounts,
   sessionStatusCounts,
 } from './status';
+export type { CandidateDisplayInput, CandidateDisplayStatus } from './status';
 export {
   CANDIDATE_STATUS_ORDER,
+  PHONE_OUTCOME_STATUS_KEYS,
   RECOMMENDATION_ORDER,
   EMPTY_CANDIDATE_FILTERS,
   normalizeStatus,
@@ -70,7 +77,15 @@ export {
   hasActiveFilters,
   candidateFunnel,
   candidateNextAction,
+  CANDIDATE_QUERY_MAX,
+  normalizeCandidateQuery,
 } from './candidateFilters';
+export {
+  foldSearchText,
+  candidateSearchTokens,
+  matchesCandidateSearch,
+  PHONE_MIN_DIGITS,
+} from './candidateSearch';
 export type {
   CandidateFilters,
   CandidateStatusKey,

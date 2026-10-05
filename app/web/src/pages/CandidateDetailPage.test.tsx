@@ -476,6 +476,60 @@ describe('CandidateDetailPage', () => {
     expect(screen.queryByRole('button', { name: /retry|reprocess|re-?parse/i })).toBeNull();
   });
 
+  it('shows the dial count in the header and the Overview, like the list row', async () => {
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: {
+        ...mockCandidateDetail.candidate,
+        status: 'queued',
+        dial_count: 3,
+        phone_state: 'awaiting_retry',
+        last_dialed_at: '2026-10-01T09:30:00Z',
+      },
+    });
+    renderDetailPage();
+    await screen.findByText('Jane Doe');
+    // Header badge + Overview "Status" field: one derivation, same words.
+    const badges = screen.getAllByText('Queued (dialed 3)');
+    expect(badges.length).toBe(2);
+    expect(badges[0]).toHaveAttribute('title', expect.stringContaining('Phone cycle – Awaiting retry'));
+    // The same facts are VISIBLE under the header badge, not hover-only.
+    const detail = document.querySelector('[data-phone-status-detail]');
+    expect(detail?.textContent).toMatch(/Phone reached 3 times .* · Last dialed/);
+  });
+
+  it('names an abandoned_no_answer cycle in the header, never "Queued"', async () => {
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: {
+        ...mockCandidateDetail.candidate,
+        status: 'queued',
+        dial_count: 5,
+        phone_state: 'abandoned_no_answer',
+      },
+    });
+    renderDetailPage();
+    await screen.findByText('Jane Doe');
+    expect(screen.getAllByText('Abandoned: no answer').length).toBe(2);
+    expect(screen.queryByText('Queued')).toBeNull();
+  });
+
+  it('keeps a decided status even when a later cycle failed', async () => {
+    mockApi.getCandidate.mockResolvedValue({
+      ...mockCandidateDetail,
+      candidate: {
+        ...mockCandidateDetail.candidate,
+        status: 'screened',
+        dial_count: 2,
+        phone_state: 'failed',
+      },
+    });
+    renderDetailPage();
+    await screen.findByText('Jane Doe');
+    expect(screen.queryByText(/Phone screen failed/)).toBeNull();
+    expect(screen.queryByText(/dialed/)).toBeNull();
+  });
+
   it('renders Back to candidates link', async () => {
     renderDetailPage();
     expect(await screen.findByText('← Back to candidates')).toBeInTheDocument();

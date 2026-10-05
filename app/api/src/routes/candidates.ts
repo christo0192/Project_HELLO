@@ -17,6 +17,8 @@ import { idParamSchema, uuidSchema } from '../schemas/common.js';
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
 import { redactCandidatePhone } from '../lib/candidate-phone.js';
+import { loadCandidatePhoneProgress, phoneProgressFields } from '../lib/candidate-phone-progress.js';
+import { attemptConsentStage } from '../lib/attempt-consent-stage.js';
 import { createLogger } from '../lib/logger.js';
 
 const candidateLogger = createLogger('candidates');
@@ -243,7 +245,8 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
   // candidate list must not stop working because the Ashby tables are
   // unavailable.
   let resumeReview = new Map<string, ResumeReview | null>();
-  if (ids.length > 0) {
+  const loadResumeReview = async (): Promise<void> => {
+    if (ids.length === 0) return;
     try {
       const { data: links, error: linkErr } = await supabase
         .from('ashby_application_links')
@@ -254,7 +257,15 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
         .limit(1, { foreignTable: 'ashby_resume_ingestions' });
       if (!linkErr) resumeReview = resumeReviewByCandidate(links as RawLinkRow[] | null);
     } catch { /* additive only — never fails the list */ }
-  }
+  };
+
+  // Phone progress (dial count, latest engagement state, allowlisted reason,
+  // last dial), alongside the links read. One query per 100 ids, over the
+  // SAME authorized candidate set, so interviewer owner-scoping is inherited.
+  // It never rejects: a failed or possibly-truncated read reports
+  // `dial_count: null` (unknown), never a confident 0. Not read at all while
+  // PHONE_SCREENING_ENABLED is off, like every other phone route.
+  const [, phoneProgress] = await Promise.all([loadResumeReview(), loadCandidatePhoneProgress(ids)]);
 
   // The role this list is being rendered for. `phone_e164` is admin-only —
   // see `redactCandidatePhone`. This endpoint has always SELECTED the column;
@@ -276,6 +287,10 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
       // import has null `name`/`email` and this is the only field that says
       // anything about it at all.
       resume_review: resumeReview.get(row.id) ?? null,
+      // dial_count / phone_state / phone_state_reason / last_dialed_at.
+      // null dial_count = unknown; 0 = never dialled. The reason is
+      // interviewer+ only (same floor as /:id/phone-cycles).
+      ...phoneProgressFields(phoneProgress, row.id, role),
     };
   });
 
@@ -442,7 +457,7 @@ candidatesRouter.get(
 
       let attemptQuery = supabase
         .from('phone_call_attempts')
-        .select('id,attempt_seq,admitted_at,answered_at,ended_at,state,outcome_class,session_id,recording_session_id,recording_object_key,recording_sha256,recording_size_bytes,recording_content_type,recording_ready,recording_quarantined,recording_deleted_at,egress_status')
+        .select('id,attempt_seq,admitted_at,answered_at,ended_at,state,abandon_reason,outcome_class,session_id,recording_session_id,recording_object_key,recording_sha256,recording_size_bytes,recording_content_type,recording_ready,recording_quarantined,recording_deleted_at,egress_status')
         .in('engagement_id', engagementIds)
         .order('admitted_at', { ascending: false })
         .order('id', { ascending: false })
@@ -461,6 +476,7 @@ candidatesRouter.get(
         answered_at: string | null;
         ended_at: string | null;
         state: string;
+        abandon_reason?: string | null;
         outcome_class: string | null;
         session_id: string | null;
         recording_session_id: string | null;
@@ -478,6 +494,7 @@ candidatesRouter.get(
       const sessionIds = [...new Set(shown.map((row) => row.session_id ?? row.recording_session_id).filter((id): id is string => !!id))];
       const sessionLifecycle = new Map<string, {
         ownerId: string | null;
+        status: string | null;
         revokedAt: string | null;
         quarantined: boolean;
         deletedAt: string | null;
@@ -485,7 +502,7 @@ candidatesRouter.get(
       if (sessionIds.length > 0) {
         const { data: sessionRows, error: sessionError } = await supabase
           .from('call_sessions')
-          .select('id,owner_id,recording_revoked_at,recording_quarantined,recording_deleted_at')
+          .select('id,owner_id,status,recording_revoked_at,recording_quarantined,recording_deleted_at')
           .in('id', sessionIds)
           .limit(sessionIds.length);
         if (sessionError) return res.status(503).json({ error: 'Phone attempt history unavailable' });
@@ -493,6 +510,7 @@ candidatesRouter.get(
           const row = session as {
             id?: unknown;
             owner_id?: unknown;
+            status?: unknown;
             recording_revoked_at?: unknown;
             recording_quarantined?: unknown;
             recording_deleted_at?: unknown;
@@ -500,6 +518,7 @@ candidatesRouter.get(
           if (typeof row.id === 'string') {
             sessionLifecycle.set(row.id, {
               ownerId: typeof row.owner_id === 'string' ? row.owner_id : null,
+              status: typeof row.status === 'string' ? row.status : null,
               revokedAt: typeof row.recording_revoked_at === 'string' ? row.recording_revoked_at : null,
               quarantined: row.recording_quarantined === true,
               deletedAt: typeof row.recording_deleted_at === 'string' ? row.recording_deleted_at : null,
@@ -564,16 +583,40 @@ candidatesRouter.get(
             answered_at: row.answered_at,
             ended_at: row.ended_at,
             state: row.state,
+            // Why an `abandoned` attempt was abandoned (0083). Only
+            // 'infra_deferred' (never placed: no carrier contacted) is a
+            // member of the CHECK; NULL on an abandoned row means the lease
+            // was reclaimed mid-call. Projected through that one-value
+            // allowlist so nothing else can ever be echoed.
+            abandon_reason: row.abandon_reason === 'infra_deferred' ? 'infra_deferred' : null,
             outcome_class: row.outcome_class,
             duration_sec: attemptDurationSeconds(row.answered_at, row.ended_at),
             recording: {
               state: recordingState,
+              // access_unavailable first: a caller who may not read the
+              // session learns nothing about its recording's lifecycle.
               reason: !interviewerCanReadSession
                 ? 'access_unavailable'
-                : row.egress_status === 'failed'
-                  ? 'recording_failed'
-                  : recordingState === 'unavailable' ? 'no_recording' : undefined,
+                : row.recording_deleted_at || parent?.deletedAt
+                  ? 'deleted'
+                  // Consent to the recording was withdrawn on the parent: the
+                  // audio may still exist, but it is not "no recording".
+                  : parent?.revokedAt
+                    ? 'revoked'
+                  : row.recording_quarantined || parent?.quarantined
+                    ? 'quarantined'
+                    : row.egress_status === 'failed'
+                      ? 'recording_failed'
+                      : recordingState === 'unavailable' ? 'no_recording' : undefined,
             },
+            // Same rule as `recording.reason`: a caller who may not read the
+            // session learns nothing about how its audio was captured.
+            consent_stage: interviewerCanReadSession
+              ? attemptConsentStage(
+                  row,
+                  evidenceSessionId ? (parent ? parent.status : undefined) : undefined,
+                )
+              : null,
             transcript: user.appRole === 'admin' && evidenceSessionId && kind !== 'none'
               ? {
                   href: `/sessions/${evidenceSessionId}`,
@@ -1357,6 +1400,13 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
   const { data: candidate, error } = await q.single();
   if (error) return res.status(404).json({ error: 'Candidate not found' });
 
+  // The same four phone-progress fields the list carries, from the same
+  // helper, read only for the candidate just authorized above. Started now and
+  // awaited at the end; it never rejects and degrades to unknown (all null).
+  const candidateId = (candidate as { id?: unknown } | null)?.id;
+  const authorizedId = typeof candidateId === 'string' ? candidateId : req.params.id;
+  const phoneProgressPromise = loadCandidatePhoneProgress([authorizedId]);
+
   const { data: sessions } = await supabase
     .from('call_sessions')
     .select('*')
@@ -1480,8 +1530,12 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
   // `select('*')` returns `phone_raw`, `phone_e164` AND the `parsed` blob, all
   // three of which carry the same number. One helper covers all three so a
   // future column cannot be redacted in one route and forgotten in another.
+  const phoneProgress = await phoneProgressPromise;
   res.json({
-    candidate: redactCandidatePhone(candidate as Record<string, unknown>, req.authUser?.appRole),
+    candidate: {
+      ...redactCandidatePhone(candidate as Record<string, unknown>, req.authUser?.appRole),
+      ...phoneProgressFields(phoneProgress, authorizedId, req.authUser?.appRole),
+    },
     sessions: (sessions ?? []).map((session) => {
       const row = session as Record<string, unknown>;
       const id = row.id as string;

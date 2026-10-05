@@ -24,6 +24,14 @@
  * rows so it never runs off the page, and the filter contract
  * (`parseCandidateFilters` / `buildCandidateSearch` / `matchesCandidateFilters`)
  * is untouched: the chips, the counts and "Clear all" drive the same URL.
+ *
+ * SEARCH (`?q=`) is the fifth URL dimension. It matches name, email and —
+ * only when the row carries one, i.e. only for a role the API lets see it —
+ * phone digits (`matchesCandidateSearch`). It runs client-side over the rows
+ * already loaded, so it can never widen what the server returned, and the
+ * query is never sent to the API or logged. The input writes the URL after a
+ * short debounce with REPLACE (one history entry per search, not one per
+ * keystroke), so Back from a candidate returns to the searched list.
  */
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
@@ -36,7 +44,7 @@ import {
 } from "../lib/mapped-roles";
 import type { Candidate, Role } from "../types";
 import type { CandidateFilters } from "../components/talent";
-import { CandidateButton } from "../components/design/candidate";
+import { CandidateButton, CandidateInput } from "../components/design/candidate";
 import {
   Button,
   buttonClass,
@@ -64,13 +72,19 @@ import {
   RolePipelinePanel,
 } from "../components/talent";
 import {
+  anyPhoneProgressUnknown,
   buildCandidateSearch,
+  candidateDisplayStatus,
   candidateNextAction,
+  candidateStatusKey,
   candidateStatusLabel,
-  candidateStatusTone,
   CANDIDATE_STATUS_ORDER,
+  PHONE_OUTCOME_STATUS_KEYS,
   hasActiveFilters,
   matchesCandidateFilters,
+  matchesCandidateSearch,
+  normalizeCandidateQuery,
+  CANDIDATE_QUERY_MAX,
   normalizeStatus,
   parseCandidateFilters,
   recommendationLabel,
@@ -129,6 +143,14 @@ const STATUS_BAR_TONE: Record<string, PipelineTone> = {
   advanced: "positive",
   rejected: "negative",
   consent_declined: "negative",
+  // The phone-cycle outcomes, in CANDIDATE_STATUS_ORDER order. Five tones
+  // cannot be injective over twelve keys, so the most this can promise is
+  // that neighbours in that order differ; the legend text names each one.
+  abandoned_no_answer: "caution",
+  phone_failed: "negative",
+  wrong_number: "neutral",
+  opted_out: "accent",
+  phone_cancelled: "neutral",
 };
 
 const RECOMMENDATION_BAR_TONE: Record<string, PipelineTone> = {
@@ -261,6 +283,8 @@ function NextActionCell({
   next: { label: string; emphasis: boolean };
 }) {
   if (next.emphasis) {
+    // `status` is the DISPLAY key (candidateStatusKey), the same one the
+    // badge and `next` were derived from.
     const isReview = normalizeStatus(status) === "screened";
     return (
       <Link
@@ -288,6 +312,35 @@ export function CandidatesPage() {
   const filters = parseCandidateFilters(searchParams);
   const filterKey = buildCandidateSearch(filters).toString();
   const { roleId } = filters;
+
+  /**
+   * The search box. `draft` is what is typed; the URL (`filters.query`) is
+   * what filters the list. `committed` remembers the last value THIS input
+   * wrote, so the URL→input sync below only fires for changes from outside
+   * (Back/Forward, the chip's ×, "Clear all") — otherwise committing
+   * "jane " (normalized to "jane") would eat the trailing space being typed.
+   */
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const [draft, setDraft] = useState(filters.query);
+  const committed = useRef(filters.query);
+  useEffect(() => {
+    if (filters.query !== committed.current) {
+      committed.current = filters.query;
+      setDraft(filters.query);
+    }
+  }, [filters.query]);
+  // input → URL, debounced, REPLACING the entry: one history entry per
+  // search rather than one per keystroke.
+  useEffect(() => {
+    const next = normalizeCandidateQuery(draft);
+    if (next === filters.query) return;
+    const t = window.setTimeout(() => {
+      committed.current = next;
+      setSearchParams(buildCandidateSearch({ ...filters, query: next }), { replace: true });
+    }, SEARCH_COMMIT_MS);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft, filterKey, setSearchParams]);
 
   const [roles, setRoles] = useState<Role[]>([]);
   const [candidates, setCandidates] = useState<Candidate[] | null>(null);
@@ -436,22 +489,73 @@ export function CandidatesPage() {
     setSearchParams(new URLSearchParams());
   }, [setSearchParams]);
 
+  /** Clear the search now (no debounce) and keep the cursor in the box. */
+  const clearSearch = useCallback(() => {
+    setDraft("");
+    committed.current = "";
+    if (filters.query) {
+      setSearchParams(buildCandidateSearch({ ...filters, query: "" }), { replace: true });
+    }
+    searchInputRef.current?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filterKey, setSearchParams]);
+
   const visible = useMemo(
-    () => (candidates ?? []).filter((c) => matchesCandidateFilters(c, filters)),
+    () =>
+      (candidates ?? []).filter(
+        (c) => matchesCandidateFilters(c, filters) && matchesCandidateSearch(c, filters.query),
+      ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [candidates, filterKey],
   );
+
+  /**
+   * Phone is searchable only where the payload carries it: the list API nulls
+   * `phone_e164` for every role that may not see it, so the placeholder never
+   * advertises a search this viewer cannot run.
+   */
+  const phoneSearchable = useMemo(
+    () => (candidates ?? []).some((c) => Boolean(c.phone_e164)),
+    [candidates],
+  );
+
+  /**
+   * The result count for a screen reader: ALWAYS mounted (a live region
+   * announces reliably only if it exists before its text changes) and
+   * DEBOUNCED, so typing "sarah" is one announcement, not five. It says the
+   * count only and never echoes the query.
+   */
+  const [searchAnnouncement, setSearchAnnouncement] = useState("");
+  const searchResultCount = candidates && filters.query ? visible.length : null;
+  useEffect(() => {
+    if (searchResultCount === null) {
+      setSearchAnnouncement("");
+      return;
+    }
+    const next =
+      searchResultCount === 0
+        ? "No candidates match"
+        : `${searchResultCount} ${searchResultCount === 1 ? "candidate matches" : "candidates match"}`;
+    const t = window.setTimeout(() => setSearchAnnouncement(next), 400);
+    return () => window.clearTimeout(t);
+  }, [searchResultCount]);
 
   const page = usePagination(visible, 10, filterKey);
 
   const active = hasActiveFilters(filters);
   const roleTitle = roles.find((r) => r.id === roleId)?.title;
 
-  // Live count per status from the currently loaded (role-scoped) set.
+  const phoneProgressUnknown = useMemo(
+    () => anyPhoneProgressUnknown(candidates ?? []),
+    [candidates],
+  );
+
+  // Live count per DISPLAY status from the currently loaded (role-scoped)
+  // set: the same key the row badge and the status filter use.
   const statusCounts = useMemo(() => {
     const counts = new Map<string, number>();
     for (const c of candidates ?? []) {
-      const key = normalizeStatus(c.status);
+      const key = candidateStatusKey(c);
       counts.set(key, (counts.get(key) ?? 0) + 1);
     }
     return counts;
@@ -556,28 +660,98 @@ export function CandidatesPage() {
               </span>
             )}
           </h2>
-          {roleOptions.length > 0 && (
-            <div className="w-full sm:w-56">
-              <label htmlFor="role-filter" className="sr-only">
-                Filter by role
+          <div className="flex w-full flex-wrap items-center gap-3 sm:w-auto">
+            {/* SEARCH. Not a <form>: Enter submits nothing, the list follows the
+                typing. `type="search"` gives the searchbox role; the browser's
+                own cancel glyph is hidden in favour of one real, labelled
+                button that every engine shows. */}
+            <div role="search" aria-label="Candidates" className="relative w-full sm:w-72">
+              <label htmlFor="candidate-search" className="sr-only">
+                Search candidates
               </label>
-              <SelectField
-                id="role-filter"
-                value={roleId ?? ""}
-                onChange={(e) => setRole(e.target.value)}
-                aria-label="Filter by role"
-                className="w-full"
-              >
-                <option value="">All roles</option>
-                {roleOptions.map((option) => (
-                  <option key={option.id} value={option.id}>
-                    {option.label}
-                  </option>
-                ))}
-              </SelectField>
+              <CandidateInput
+                id="candidate-search"
+                ref={searchInputRef}
+                type="search"
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape" && draft) {
+                    e.preventDefault();
+                    clearSearch();
+                  }
+                }}
+                placeholder={phoneSearchable ? "Name, email or phone" : "Name or email"}
+                aria-describedby="candidate-search-hint"
+                maxLength={CANDIDATE_QUERY_MAX}
+                autoComplete="off"
+                spellCheck={false}
+                enterKeyHint="search"
+                className="w-full pr-11 [&::-webkit-search-cancel-button]:appearance-none"
+              />
+              <span id="candidate-search-hint" className="sr-only">
+                {phoneSearchable
+                  ? "Matches name, email or phone. Results update as you type."
+                  : "Matches name or email. Results update as you type."}
+              </span>
+              {draft && (
+                <button
+                  type="button"
+                  onClick={clearSearch}
+                  aria-label="Clear search"
+                  className="absolute inset-y-0 right-0 inline-flex min-w-11 items-center justify-center rounded-control text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+                >
+                  <span aria-hidden="true">×</span>
+                </button>
+              )}
             </div>
-          )}
+            {roleOptions.length > 0 && (
+              <div className="w-full sm:w-56">
+                <label htmlFor="role-filter" className="sr-only">
+                  Filter by role
+                </label>
+                <SelectField
+                  id="role-filter"
+                  value={roleId ?? ""}
+                  onChange={(e) => setRole(e.target.value)}
+                  aria-label="Filter by role"
+                  className="w-full"
+                >
+                  <option value="">All roles</option>
+                  {roleOptions.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.label}
+                    </option>
+                  ))}
+                </SelectField>
+              </div>
+            )}
+          </div>
         </div>
+
+        <p role="status" className="sr-only">
+          {searchAnnouncement}
+        </p>
+
+        {/* A failed phone read reports dial_count null, and the status then
+            falls back to the stored value: an abandoned candidate reads
+            "Queued". Said once, so that is never silent. */}
+        {phoneProgressUnknown && (
+          <InlineNotice tone="warning" role="none" className="mt-3">
+            Phone progress could not be loaded for some candidates. Their status shows the stored
+            value, so a finished phone outcome (such as “Abandoned: no answer”) may read as
+            “Queued”. Reload the page to try again.
+          </InlineNotice>
+        )}
+
+        {/* The list API stops at PostgREST's 1,000-row cap; a search over a
+            capped list would silently miss the older rows. */}
+        {filters.query && candidates && candidates.length >= 1000 && (
+          <InlineNotice tone="warning" className="mt-3">
+            Showing the newest {candidates.length.toLocaleString()} candidates; search covers only
+            these.
+          </InlineNotice>
+        )}
 
         {/* THE BAR IS THE FILTER. It was briefly a chart ABOVE the chips,
             which meant four rows of label+number where there had been two —
@@ -604,7 +778,19 @@ export function CandidatesPage() {
             total={candidates.length}
             onToggle={toggleStatus}
             selectedKeys={filters.statuses}
-            segments={CANDIDATE_STATUS_ORDER.map((status) => ({
+            // "Abandoned: no answer" is always offered: it is the phone
+            // outcome recruiters asked to find. The other four phone outcomes
+            // appear only when some loaded candidate has one (or a deep link
+            // selected it) — four permanently-zero toggles would be noise.
+            // A hidden key has a zero count, so the bar still partitions the
+            // whole loaded set.
+            segments={CANDIDATE_STATUS_ORDER.filter(
+              (status) =>
+                status === "abandoned_no_answer" ||
+                !PHONE_OUTCOME_STATUS_KEYS.has(status) ||
+                (statusCounts.get(status) ?? 0) > 0 ||
+                filters.statuses.includes(status),
+            ).map((status) => ({
               key: status,
               label: candidateStatusLabel(status),
               value: statusCounts.get(status) ?? 0,
@@ -698,6 +884,12 @@ export function CandidatesPage() {
         {active && (
           <div className="mt-3 flex flex-wrap items-center gap-2 text-label text-[var(--c-ink-secondary)]">
             <span className="font-medium">Active filters:</span>
+            {filters.query && (
+              <FilterChip
+                label={`Search: “${filters.query}”`}
+                onRemove={() => applyFilters({ query: "" })}
+              />
+            )}
             {roleTitle && (
               <FilterChip
                 label={`Role: ${roleTitle}`}
@@ -781,7 +973,22 @@ export function CandidatesPage() {
         {!error &&
           candidates !== null &&
           candidates.length > 0 &&
-          visible.length === 0 && (
+          visible.length === 0 &&
+          (filters.query && !hasActiveFilters({ ...filters, query: "" }) ? (
+            <EmptyPanel
+              title={`No candidates match “${filters.query}”`}
+              hint={
+                phoneSearchable
+                  ? "Search covers name, email and phone."
+                  : "Search covers name and email."
+              }
+              action={
+                <Button variant="secondary" size="sm" onClick={clearSearch}>
+                  Clear search
+                </Button>
+              }
+            />
+          ) : (
             <EmptyPanel
               title="No candidates match these filters"
               action={
@@ -790,7 +997,7 @@ export function CandidatesPage() {
                 </Button>
               }
             />
-          )}
+          ))}
 
         {!error && visible.length > 0 && (
           <>
@@ -825,7 +1032,10 @@ export function CandidatesPage() {
                   prefers-reduced-motion with the rest of the shell. */}
               <TBody className="fade-up-stagger">
                 {page.items.map((c) => {
-                  const next = candidateNextAction(c.status);
+                  // ONE derivation per row: badge, tooltip, next action and
+                  // the review link all read the same display status.
+                  const ds = candidateDisplayStatus(c);
+                  const next = candidateNextAction(ds.key);
                   const role = c.role_id ? roleById.get(c.role_id) : undefined;
                   const displayName = candidateDisplayName(c.name);
                   return (
@@ -885,10 +1095,12 @@ export function CandidatesPage() {
                             side by side would force the column wide, and a
                             flex-wrap broke them at arbitrary points. */}
                         <div className="flex flex-col items-start gap-1">
-                          <StatusBadge tone={candidateStatusTone(c.status)}>
-                            <span title={`Status: ${c.status}`}>
-                              {candidateStatusLabel(c.status)}
-                            </span>
+                          <StatusBadge tone={ds.tone}>
+                            <span title={ds.title}>{ds.label}</span>
+                            {/* The tooltip's phone facts (reason, count,
+                                last dial) for screen-reader users, who never
+                                get a hover. */}
+                            {ds.detail && <span className="sr-only">{`, ${ds.detail}`}</span>}
                           </StatusBadge>
                           {/* Additive only: the candidate's own status is
                               unchanged and still first. */}
@@ -917,7 +1129,7 @@ export function CandidatesPage() {
                         <NextActionCell
                           candidateId={c.id}
                           candidateName={displayName}
-                          status={c.status}
+                          status={ds.key}
                           next={next}
                         />
                       </Td>
@@ -933,6 +1145,9 @@ export function CandidatesPage() {
     </CandidateShell>
   );
 }
+
+/** How long typing settles before the search is written to the URL. */
+const SEARCH_COMMIT_MS = 200;
 
 function FilterChip({
   label,

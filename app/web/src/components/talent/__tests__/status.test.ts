@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  anyPhoneProgressUnknown,
   candidateStatusLabel,
   candidateStatusTone,
   sessionStatusLabel,
@@ -13,6 +14,8 @@ import {
   appealStatusLabel,
   appealCategoryLabel,
   isAppealPending,
+  candidateDisplayStatus,
+  candidateStatusKey,
 } from '../status';
 
 describe('candidateStatusLabel', () => {
@@ -174,6 +177,32 @@ describe('attemptOutcomeLabel', () => {
   it('keeps the raw pair for an operator tooltip', () => {
     expect(attemptRawStatus('no_answer', 'ended')).toBe('state: ended · outcome: no_answer');
     expect(attemptRawStatus(null, 'ringing')).toBe('state: ringing');
+    expect(attemptRawStatus(null, 'abandoned', 'infra_deferred'))
+      .toBe('state: abandoned · abandon_reason: infra_deferred');
+    expect(attemptRawStatus(null, 'abandoned', null)).toBe('state: abandoned');
+  });
+});
+
+describe('abandoned attempts (0083 abandon_reason)', () => {
+  it('says "Not placed" only for an infra defer, where no carrier was contacted', () => {
+    expect(attemptOutcomeLabel(null, 'abandoned', 'infra_deferred')).toBe('Not placed');
+  });
+
+  it('says "Call interrupted" for a lease-reclaimed attempt (reason null), never "Not placed"', () => {
+    expect(attemptOutcomeLabel(null, 'abandoned', null)).toBe('Call interrupted');
+    // A caller or payload without the field is not evidence of an infra
+    // defer either: these calls were placed, often answered and recorded.
+    expect(attemptOutcomeLabel(null, 'abandoned')).toBe('Call interrupted');
+    expect(attemptOutcomeLabel(null, 'abandoned', undefined)).toBe('Call interrupted');
+  });
+
+  it('lets a recorded outcome win over the abandon reason', () => {
+    expect(attemptOutcomeLabel('no_answer', 'abandoned', null)).toBe('No answer');
+    expect(attemptOutcomeLabel('provider_error', 'abandoned', 'infra_deferred')).toBe("Couldn't connect");
+  });
+
+  it('ignores abandon_reason on non-abandoned states', () => {
+    expect(attemptOutcomeLabel(null, 'ringing', 'infra_deferred')).toBe('Ringing');
   });
 });
 
@@ -242,5 +271,182 @@ describe('appeal vocabulary', () => {
     expect(appealCategoryLabel('other')).toBe('Appeal');
     expect(appealCategoryLabel('data_access')).toBe('Data access appeal');
     expect(appealCategoryLabel(null)).toBe('Appeal');
+  });
+});
+
+describe('candidateDisplayStatus (stored status + phone progress)', () => {
+  it('appends the reached-dial count to Queued', () => {
+    expect(candidateDisplayStatus({ status: 'queued', dial_count: 3 }).label).toBe('Queued (dialed 3)');
+    expect(candidateDisplayStatus({ status: 'queued', dial_count: 1 }).label).toBe('Queued (dialed 1)');
+    const ds = candidateDisplayStatus({ status: 'queued', dial_count: 3, phone_state: 'awaiting_retry' });
+    expect(ds).toMatchObject({ key: 'queued', label: 'Queued (dialed 3)', tone: 'warning' });
+  });
+
+  it('shows plain Queued when the count is 0 (never dialled) or unknown', () => {
+    expect(candidateDisplayStatus({ status: 'queued', dial_count: 0 }).label).toBe('Queued');
+    // null = the server could not stand behind a count; absent = an older payload.
+    expect(candidateDisplayStatus({ status: 'queued', dial_count: null }).label).toBe('Queued');
+    expect(candidateDisplayStatus({ status: 'queued' }).label).toBe('Queued');
+    // Malformed runtime values are unknown too, never rendered.
+    expect(
+      candidateDisplayStatus({ status: 'queued', dial_count: '4' as unknown as number }).label,
+    ).toBe('Queued');
+    expect(candidateDisplayStatus({ status: 'queued', dial_count: -1 }).label).toBe('Queued');
+    expect(candidateDisplayStatus({ status: 'queued', dial_count: 2.5 }).label).toBe('Queued');
+  });
+
+  it('turns an abandoned_no_answer cycle into its own filterable key, in exactly the owner wording', () => {
+    const ds = candidateDisplayStatus({ status: 'queued', dial_count: 5, phone_state: 'abandoned_no_answer' });
+    expect(ds.key).toBe('abandoned_no_answer');
+    // No "(dialed N)" on a terminal phone key: the count is in detail/title.
+    expect(ds.label).toBe('Abandoned: no answer');
+    expect(ds.detail).toContain('Phone reached 5 times');
+    expect(ds.tone).toBe('danger');
+    expect(candidateStatusKey({ status: 'queued', phone_state: 'abandoned_no_answer' })).toBe(
+      'abandoned_no_answer',
+    );
+    // Unknown count: the outcome still shows, without a number.
+    expect(
+      candidateDisplayStatus({ status: 'queued', dial_count: null, phone_state: 'abandoned_no_answer' }).label,
+    ).toBe('Abandoned: no answer');
+  });
+
+  it('maps the other terminal phone states', () => {
+    const cases: Array<[string, string, string, string]> = [
+      ['failed', 'phone_failed', 'Phone screen failed', 'danger'],
+      ['wrong_number', 'wrong_number', 'Wrong number', 'danger'],
+      ['opted_out', 'opted_out', 'Opted out', 'neutral'],
+      ['cancelled', 'phone_cancelled', 'Phone screen cancelled', 'neutral'],
+    ];
+    for (const [state, key, label, tone] of cases) {
+      const ds = candidateDisplayStatus({
+        status: 'queued',
+        dial_count: 1,
+        phone_state: state as 'failed',
+      });
+      expect(ds, state).toMatchObject({ key, label, tone });
+    }
+  });
+
+  it('never overrides a decided stored status', () => {
+    for (const status of ['screened', 'advanced', 'rejected', 'consent_declined']) {
+      const ds = candidateDisplayStatus({ status, dial_count: 4, phone_state: 'failed' });
+      expect(ds.key, status).toBe(status);
+      // No dial suffix on a decided status either.
+      expect(ds.label, status).not.toMatch(/dialed/);
+    }
+    expect(candidateDisplayStatus({ status: 'screened', phone_state: 'failed' }).label).toBe('Screened');
+  });
+
+  it('keeps the stored status for a completed cycle and for every non-terminal state', () => {
+    expect(candidateDisplayStatus({ status: 'queued', phone_state: 'completed', dial_count: 2 }).key).toBe(
+      'queued',
+    );
+    for (const state of [
+      'pending_prereqs',
+      'eligible',
+      'scheduled',
+      'dialing',
+      'in_call',
+      'reconnecting',
+      'awaiting_retry',
+    ] as const) {
+      expect(candidateDisplayStatus({ status: 'queued', phone_state: state }).key, state).toBe('queued');
+    }
+    // An unrecognised state is not invented into a key.
+    expect(
+      candidateDisplayStatus({ status: 'queued', phone_state: 'bogus' as unknown as 'failed' }).key,
+    ).toBe('queued');
+  });
+
+  it('normalizes a missing / blank stored status to new', () => {
+    expect(candidateDisplayStatus({ status: null }).key).toBe('new');
+    expect(candidateDisplayStatus({ status: '  ' }).key).toBe('new');
+    expect(candidateDisplayStatus({ status: undefined }).label).toBe('New');
+  });
+
+  it('puts the raw status, phone state, reason and last dial in the tooltip', () => {
+    const ds = candidateDisplayStatus({
+      status: 'queued',
+      dial_count: 5,
+      phone_state: 'abandoned_no_answer',
+      phone_state_reason: 'no_answer_budget_exhausted',
+      last_dialed_at: '2026-10-01T09:30:00Z',
+    });
+    expect(ds.title).toContain('Status: queued');
+    // The badge already says the phone outcome: no "Phone: Abandoned: no
+    // answer" double colon in the tooltip.
+    expect(ds.title).not.toContain('Phone:');
+    expect(ds.title).not.toContain('Phone cycle');
+    expect(ds.title).toContain('No answer after every attempt');
+    expect(ds.title).toContain('Phone reached 5 times (all cycles, incl. reconnects)');
+    expect(ds.title).toMatch(/Last dialed .*2026/);
+    expect(candidateDisplayStatus({ status: 'new' }).title).toBe('Status: new');
+  });
+
+  it('puts the same phone facts in VISIBLE detail text (not hover-only), and none on a decided status', () => {
+    const ds = candidateDisplayStatus({
+      status: 'queued',
+      dial_count: 5,
+      phone_state: 'abandoned_no_answer',
+      phone_state_reason: 'no_answer_budget_exhausted',
+      last_dialed_at: '2026-10-01T09:30:00Z',
+    });
+    expect(ds.detail).toMatch(/^No answer after every attempt · Phone reached 5 times .* · Last dialed .*2026/);
+    expect(ds.detail).not.toContain('Status:');
+    expect(candidateDisplayStatus({ status: 'new' }).detail).toBe('');
+    expect(
+      candidateDisplayStatus({ status: 'screened', dial_count: 2, phone_state: 'completed' }).detail,
+    ).toBe('');
+  });
+
+  it('says what the phone is doing while a queued candidate is on, or just off, a call', () => {
+    const cases: Array<[string, string]> = [
+      ['dialing', 'Calling now'],
+      ['in_call', 'On a call now'],
+      ['reconnecting', 'Reconnecting a dropped call'],
+      ['completed', 'Call completed, awaiting score'],
+    ];
+    for (const [state, words] of cases) {
+      const ds = candidateDisplayStatus({ status: 'queued', dial_count: 1, phone_state: state as 'in_call' });
+      // The badge keeps the decided wording...
+      expect(ds.label, state).toBe('Queued (dialed 1)');
+      // ...and the visible detail and tooltip say what is actually happening.
+      expect(ds.detail, state).toContain(words);
+      expect(ds.title, state).toContain(words);
+    }
+    expect(
+      candidateDisplayStatus({ status: 'queued', dial_count: 2, phone_state: 'awaiting_retry' }).detail,
+    ).toContain('Phone cycle – Awaiting retry');
+  });
+
+  it('flags an UNKNOWN phone read (explicit null) on an unsettled status, and only there', () => {
+    const unknown = candidateDisplayStatus({ status: 'queued', dial_count: null, phone_state: null });
+    expect(unknown.phoneUnknown).toBe(true);
+    expect(unknown.label).toBe('Queued');
+    expect(unknown.title).toContain('Phone progress unavailable');
+    // Never dialled (0) and an older payload (absent) are not "unknown".
+    expect(candidateDisplayStatus({ status: 'queued', dial_count: 0 }).phoneUnknown).toBe(false);
+    expect(candidateDisplayStatus({ status: 'queued' }).phoneUnknown).toBe(false);
+    // A decided status cannot be changed by phone data, so nothing is hidden.
+    expect(candidateDisplayStatus({ status: 'screened', dial_count: null }).phoneUnknown).toBe(false);
+    expect(anyPhoneProgressUnknown([{ status: 'queued', dial_count: 1 }, { status: 'new', dial_count: null }])).toBe(true);
+    expect(anyPhoneProgressUnknown([{ status: 'queued', dial_count: 1 }, { status: 'advanced', dial_count: null }])).toBe(false);
+  });
+
+  it('labels every new key in plain words (no underscores) and counts by display key', () => {
+    for (const key of ['abandoned_no_answer', 'phone_failed', 'wrong_number', 'opted_out', 'phone_cancelled']) {
+      expect(candidateStatusLabel(key)).not.toMatch(/_/);
+    }
+    expect(
+      candidateStatusCounts([
+        { status: 'queued', phone_state: 'abandoned_no_answer' },
+        { status: 'queued', dial_count: 2 },
+        { status: 'queued' },
+      ]),
+    ).toEqual([
+      { label: 'Queued', value: 2 },
+      { label: 'Abandoned: no answer', value: 1 },
+    ]);
   });
 });

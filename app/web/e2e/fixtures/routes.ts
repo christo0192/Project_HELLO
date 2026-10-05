@@ -9,6 +9,8 @@
  */
 
 import {
+  ABANDONED_CANDIDATE_ID,
+  DIALED_CANDIDATE_ID,
   LEGACY_CANDIDATE_ID,
   LEGACY_SESSION_ID,
   SCOPED_REVIEW_LINK_ID,
@@ -60,7 +62,20 @@ export const ROUTES: RouteCase[] = [
   { name: 'dashboard', path: '/dashboard', heading: 'Dashboard', landmark: 'Recent candidates' },
   { name: 'candidates', path: '/candidates', heading: 'Candidates', landmark: 'Meera Iyer' },
   { name: 'candidates-filtered', path: '/candidates?status=screened', heading: 'Candidates', landmark: 'Diego Ferreira' },
+  // Free-text search (`?q=`), client-side over the loaded list.
+  { name: 'candidates-search', path: '/candidates?q=diego', heading: 'Candidates', landmark: 'Diego Ferreira' },
+  // Case- and accent-insensitive: "lucia" finds "Lucía Fernández".
+  { name: 'candidates-search-diacritic', path: '/candidates?q=lucia', heading: 'Candidates', landmark: 'Lucía Fernández' },
+  // Search composes with the status filter; the badge carries the dial count
+  // (stored status "queued", two dials reached the phone).
+  { name: 'candidates-search-queued', path: '/candidates?status=queued&q=vikram', heading: 'Candidates', landmark: 'Queued (dialed 2)' },
+  // A phone outcome is its own, filterable status key.
+  { name: 'candidates-abandoned', path: '/candidates?status=abandoned_no_answer', heading: 'Candidates', landmark: 'Lucía Fernández' },
   { name: 'candidate-detail', path: `/candidates/${STAR_CANDIDATE_ID}`, heading: 'Meera Iyer', landmark: 'Screening cycle 1' },
+  // Mid-cycle: the attempt history shows a lease-reclaimed "Call interrupted"
+  // leg with a pre-consent recording, and an infra-deferred "Not placed" one.
+  { name: 'candidate-detail-dialed', path: `/candidates/${DIALED_CANDIDATE_ID}`, heading: 'Vikram Pillai', landmark: 'Call interrupted' },
+  { name: 'candidate-detail-abandoned', path: `/candidates/${ABANDONED_CANDIDATE_ID}`, heading: 'Lucía Fernández', landmark: 'Abandoned: no answer' },
   { name: 'candidate-detail-legacy', path: `/candidates/${LEGACY_CANDIDATE_ID}`, heading: 'Rohan Deshpande', landmark: 'Moved to technical round.' },
   // Named by whose screening it is (the candidate's name), never by the
   // session id. Legacy (v1) and role-scorecard (v2) assessments both render:

@@ -25,6 +25,7 @@ let attempts: Array<Record<string, unknown>>;
 let cursorFilters: string[];
 let turns: Array<Record<string, unknown>>;
 let candidateVisible = true;
+let sessionRows: Array<Record<string, unknown>>;
 
 function chain(table: string, result: unknown): any {
   let output = result;
@@ -59,7 +60,9 @@ function chain(table: string, result: unknown): any {
           ? { data: output, error: null }
           : table === 'transcript_turns'
             ? { data: transcriptInterviewOnly ? [] : turns, error: null }
-            : { data: [], error: null },
+            : table === 'call_sessions'
+              ? { data: sessionRows, error: null }
+              : { data: [], error: null },
     ).then(resolve),
   };
   return self;
@@ -101,6 +104,7 @@ beforeEach(() => {
   turns = [{ session_id: SESSION, is_gate: true }];
   cursorFilters = [];
   candidateVisible = true;
+  sessionRows = [];
   vi.mocked(supabase.from).mockImplementation((table: string) => {
     const result = table === 'phone_call_attempts' ? attempts : [];
     return chain(table, result) as never;
@@ -152,5 +156,160 @@ describe('candidate phone-attempt history', () => {
     const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
     expect(res.status).toBe(200);
     expect(res.body.attempts[0].recording).toEqual({ state: 'unavailable', reason: 'recording_failed' });
+  });
+
+  it('selects abandon_reason and returns it so an infra defer and a lease reclaim can be told apart', async () => {
+    const selects: string[] = [];
+    vi.mocked(supabase.from).mockImplementation((table: string) => {
+      const c = chain(table, table === 'phone_call_attempts' ? attempts : []);
+      const select = c.select;
+      c.select = (columns: string) => {
+        if (table === 'phone_call_attempts') selects.push(columns);
+        return select(columns);
+      };
+      return c as never;
+    });
+    attempts = [
+      { ...row(IDS[0], TIED), state: 'abandoned', outcome_class: null, abandon_reason: 'infra_deferred' },
+      { ...row(IDS[1], TIED), state: 'abandoned', outcome_class: null, abandon_reason: null },
+      row(IDS[2], '2026-09-24T13:00:00.000Z'),
+    ];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.status).toBe(200);
+    expect(selects.some((columns) => columns.split(',').includes('abandon_reason'))).toBe(true);
+    expect(res.body.attempts.map((a: { abandon_reason: unknown }) => a.abandon_reason))
+      .toEqual(['infra_deferred', null, null]);
+  });
+
+  it('never echoes an abandon_reason outside the 0083 CHECK allowlist', async () => {
+    attempts = [
+      { ...row(IDS[0], TIED), state: 'abandoned', outcome_class: null, abandon_reason: 'free text from somewhere' },
+      { ...row(IDS[1], TIED), state: 'abandoned', outcome_class: null },
+    ];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.status).toBe(200);
+    expect(res.body.attempts[0].abandon_reason).toBeNull();
+    // A row from a select that somehow lacks the column still serializes the
+    // key (null), so the required openapi property is always present.
+    expect(res.body.attempts[1]).toHaveProperty('abandon_reason', null);
+  });
+});
+
+describe('candidate phone-attempt history: recordings made before consent (M011 F2)', () => {
+  function parent(overrides: Record<string, unknown> = {}) {
+    return {
+      id: SESSION,
+      owner_id: null,
+      status: 'expired',
+      recording_revoked_at: null,
+      recording_quarantined: false,
+      recording_deleted_at: null,
+      ...overrides,
+    };
+  }
+
+  it('reports a ready pre-consent worker clip as playable and before_consent, with no key or URL', async () => {
+    sessionRows = [parent()];
+    attempts = [{
+      ...row(IDS[0], TIED, true),
+      session_id: null,
+      recording_session_id: SESSION,
+      egress_status: 'complete',
+    }];
+    for (const role of ['admin', 'viewer'] as const) {
+      const res = await request(app(role)).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+      expect(res.status).toBe(200);
+      const attempt = res.body.attempts[0];
+      expect(attempt.recording).toEqual({ state: 'ready' });
+      expect(attempt.consent_stage).toBe('before_consent');
+      const body = JSON.stringify(res.body);
+      expect(body).not.toContain('egress.mp3');
+      expect(body).not.toMatch(/https?:\/\//);
+      expect(body).not.toContain('a'.repeat(64));
+    }
+  });
+
+  it('marks a consent-bound leg after_consent', async () => {
+    sessionRows = [parent({ status: 'completed' })];
+    attempts = [{ ...row(IDS[0], TIED, true), outcome_class: 'completed' }];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.body.attempts[0].consent_stage).toBe('after_consent');
+  });
+
+  it('keeps a pre-consent outcome before_consent even when a later leg completed the parent', async () => {
+    sessionRows = [parent({ status: 'completed' })];
+    attempts = [{ ...row(IDS[0], TIED, true), session_id: null, recording_session_id: SESSION }];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.body.attempts[0].consent_stage).toBe('before_consent');
+  });
+
+  it('does not guess for a NULL-bound leg with a non-pre-consent outcome under a completed parent', async () => {
+    // Pre-0107 legs could consent without binding session_id; their parent
+    // completed. Reported as unknown rather than "before consent".
+    sessionRows = [parent({ status: 'completed' })];
+    attempts = [{
+      ...row(IDS[0], TIED, true),
+      session_id: null,
+      recording_session_id: SESSION,
+      outcome_class: 'completed',
+    }];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.body.attempts[0].consent_stage).toBeNull();
+  });
+
+  it('runs no transcript probe for a viewer to classify consent', async () => {
+    const tables: string[] = [];
+    vi.mocked(supabase.from).mockImplementation((table: string) => {
+      tables.push(table);
+      return chain(table, table === 'phone_call_attempts' ? attempts : []) as never;
+    });
+    sessionRows = [parent()];
+    attempts = [{ ...row(IDS[0], TIED, true), session_id: null, recording_session_id: SESSION }];
+    const res = await request(app('viewer')).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.status).toBe(200);
+    expect(res.body.attempts[0].consent_stage).toBe('before_consent');
+    expect(res.body.attempts[0].transcript).toBeNull();
+    expect(tables).not.toContain('transcript_turns');
+  });
+
+  it('reports a deleted recording as deleted and a quarantined one as quarantined, never ready', async () => {
+    sessionRows = [parent()];
+    attempts = [
+      { ...row(IDS[0], TIED, true), session_id: null, recording_session_id: SESSION, recording_deleted_at: '2026-09-27T00:00:00.000Z' },
+      { ...row(IDS[1], TIED, true), session_id: null, recording_session_id: SESSION, recording_ready: false, recording_quarantined: true },
+    ];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.status).toBe(200);
+    expect(res.body.attempts[0].recording).toEqual({ state: 'unavailable', reason: 'deleted' });
+    expect(res.body.attempts[1].recording).toEqual({ state: 'unavailable', reason: 'quarantined' });
+  });
+
+  it('inherits a deleted or quarantined parent session', async () => {
+    sessionRows = [parent({ recording_quarantined: true })];
+    attempts = [{ ...row(IDS[0], TIED, true), session_id: null, recording_session_id: SESSION }];
+    let res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.body.attempts[0].recording).toEqual({ state: 'unavailable', reason: 'quarantined' });
+
+    sessionRows = [parent({ recording_deleted_at: '2026-09-27T00:00:00.000Z' })];
+    res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.body.attempts[0].recording).toEqual({ state: 'unavailable', reason: 'deleted' });
+  });
+
+  it('tells a non-owning interviewer only that access is unavailable, never the lifecycle', async () => {
+    sessionRows = [parent({ owner_id: 'someone-else', recording_quarantined: true })];
+    attempts = [{ ...row(IDS[0], TIED, true), session_id: null, recording_session_id: SESSION }];
+    const res = await request(app('interviewer', 'owner-1')).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.status).toBe(200);
+    expect(res.body.attempts[0].recording).toEqual({ state: 'unavailable', reason: 'access_unavailable' });
+    // ...nor how its audio was captured.
+    expect(res.body.attempts[0].consent_stage).toBeNull();
+  });
+
+  it('names a recording on a consent-revoked parent "revoked", not "no recording"', async () => {
+    sessionRows = [parent({ recording_revoked_at: '2026-09-28T00:00:00.000Z' })];
+    attempts = [{ ...row(IDS[0], TIED, true), session_id: null, recording_session_id: SESSION }];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.status).toBe(200);
+    expect(res.body.attempts[0].recording).toEqual({ state: 'unavailable', reason: 'revoked' });
   });
 });

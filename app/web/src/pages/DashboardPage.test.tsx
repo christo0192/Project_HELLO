@@ -262,6 +262,67 @@ describe('DashboardPage', () => {
     expect(screen.queryByRole('link', { name: /^Rejected:/ })).not.toBeInTheDocument();
   });
 
+  describe('phone outcomes (display status)', () => {
+    // Dialled candidates stay `queued` in the database; the list endpoint adds
+    // dial_count + the latest cycle's phone_state.
+    const PHONE_CANDIDATES = [
+      { ...CANDIDATES[0], id: 'p1', name: 'Dialled Dee', status: 'queued', dial_count: 3, phone_state: 'awaiting_retry' },
+      { ...CANDIDATES[0], id: 'p2', name: 'Abandoned Abe', status: 'queued', dial_count: 5, phone_state: 'abandoned_no_answer', phone_state_reason: 'no_answer_budget_exhausted' },
+      { ...CANDIDATES[0], id: 'p3', name: 'Failed Fay', status: 'queued', dial_count: 2, phone_state: 'failed' },
+      { ...CANDIDATES[0], id: 'p4', name: 'Opted Otto', status: 'queued', dial_count: 1, phone_state: 'opted_out' },
+      ...CANDIDATES,
+    ];
+
+    it('counts only live screening as "In screening" and badges the recent list', async () => {
+      getMe.mockResolvedValue(VIEWER_ME);
+      listCandidates.mockResolvedValue(PHONE_CANDIDATES);
+      renderDashboard();
+      const hero = await screen.findByRole('group', { name: 'Pipeline' });
+      // screening (Alice) + queued-and-still-dialling (Dee). Not Abe, Fay, Otto.
+      expect(within(hero).getByRole('link', { name: 'In screening: 2' })).toBeInTheDocument();
+      const recent = screen.getByRole('list', { name: 'Recent candidates, newest first' });
+      expect(within(recent).getByText('Queued (dialed 3)')).toBeInTheDocument();
+      expect(within(recent).getByText('Abandoned: no answer')).toBeInTheDocument();
+      expect(within(recent).getByText('Phone screen failed')).toBeInTheDocument();
+    });
+
+    it('says so when phone progress is unknown for some candidates, and not otherwise', async () => {
+      getMe.mockResolvedValue(VIEWER_ME);
+      listCandidates.mockResolvedValue([
+        ...PHONE_CANDIDATES,
+        { ...CANDIDATES[0], id: 'p9', name: 'Unknown Uma', status: 'queued', dial_count: null, phone_state: null },
+      ]);
+      const { unmount } = renderDashboard();
+      expect(await screen.findByText(/Phone progress could not be loaded for some candidates/)).toBeInTheDocument();
+      unmount();
+
+      listCandidates.mockResolvedValue(PHONE_CANDIDATES);
+      renderDashboard();
+      await screen.findByRole('group', { name: 'Pipeline' });
+      expect(screen.queryByText(/Phone progress could not be loaded/)).toBeNull();
+    });
+
+    it('draws "Abandoned: no answer" as its own drill-down stage', async () => {
+      getMe.mockResolvedValue(VIEWER_ME);
+      listCandidates.mockResolvedValue(PHONE_CANDIDATES);
+      renderDashboard();
+      const link = await screen.findByRole('link', {
+        name: /^Abandoned: no answer: 1 .*View these candidates/,
+      });
+      expect(link).toHaveAttribute('href', candidatesHref({ statuses: ['abandoned_no_answer'] }));
+    });
+
+    it('drops ended-unreachable cycles from the completion denominator, keeps failed', async () => {
+      getMe.mockResolvedValue(VIEWER_ME);
+      listCandidates.mockResolvedValue(PHONE_CANDIDATES);
+      renderDashboard();
+      // 8 loaded − Abe (no answer) − Otto (opted out) = 6; Fay (failed) stays
+      // in consideration because a failed cycle can be rescreened.
+      expect(await screen.findByText(/1 of 6 decided/i)).toBeInTheDocument();
+      expect(screen.getByText('17% complete')).toBeInTheDocument();
+    });
+  });
+
   it('renders the average score linking to the assessed cohort', async () => {
     getMe.mockResolvedValue(VIEWER_ME);
     renderDashboard();

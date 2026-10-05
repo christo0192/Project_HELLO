@@ -101,6 +101,19 @@ function wireSupabase(opts: {
       return chainable({ data: [{ id: 'a1', candidate_id: CANDIDATE_ID, overall_score: 80 }], error: null });
     }
     if (table === 'recruiter_notes') return chainable({ data: notes, error: null });
+    if (table === 'phone_engagements') {
+      return chainable({
+        data: [{
+          candidate_id: CANDIDATE_ID, cycle_number: 1, created_at: '2026-10-01T00:00:00Z',
+          state: 'abandoned_no_answer', state_reason: 'no_answer_budget_exhausted',
+          phone_call_attempts: [
+            { state: 'ended', abandon_reason: null, outcome_class: 'no_answer', admitted_at: '2026-10-01T09:00:00Z', answered_at: null },
+            { state: 'ended', abandon_reason: null, outcome_class: 'no_answer', admitted_at: '2026-10-02T09:00:00Z', answered_at: null },
+          ],
+        }],
+        error: null,
+      });
+    }
     throw new Error(`unexpected table ${table}`);
   });
 }
@@ -128,6 +141,22 @@ beforeEach(async () => {
 afterEach(() => vi.restoreAllMocks());
 
 describe('GET /api/integrations/ashby/review/:applicationLinkId', () => {
+  it('carries the same phone-progress fields as GET /api/candidates/:id (reason interviewer+ only)', async () => {
+    vi.stubEnv('PHONE_SCREENING_ENABLED', 'true');
+    try {
+      const res = await request(makeApp(makeUser('interviewer'))).get(`/api/integrations/ashby/review/${LINK_ID}`).set(AUTH);
+      expect(res.status).toBe(200);
+      expect(res.body.candidate).toMatchObject({
+        dial_count: 2, phone_state: 'abandoned_no_answer',
+        phone_state_reason: 'no_answer_budget_exhausted', last_dialed_at: '2026-10-02T09:00:00.000Z',
+      });
+      const viewer = await request(makeApp(makeUser('viewer'))).get(`/api/integrations/ashby/review/${LINK_ID}`).set(AUTH);
+      expect(viewer.body.candidate).toMatchObject({ phone_state: 'abandoned_no_answer', phone_state_reason: null });
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
+
   it('returns the linked candidate Overview + Review payload for the owner', async () => {
     const res = await request(makeApp(makeUser('interviewer'))).get(`/api/integrations/ashby/review/${LINK_ID}`).set(AUTH);
     expect(res.status).toBe(200);

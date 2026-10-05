@@ -8398,7 +8398,7 @@ components:
 
     CandidateListItem:
       type: object
-      required: [id, name, email, phone_e164, phone_valid, skills, experience_years, status, role_id, created_at, resume_review]
+      required: [id, name, email, phone_e164, phone_valid, skills, experience_years, status, role_id, created_at, resume_review, dial_count, phone_state, phone_state_reason, last_dialed_at]
       properties:
         id:
           type: string
@@ -8443,7 +8443,39 @@ components:
           description: Sanitized resume-ingestion status for an Ashby-sourced candidate; null for every non-Ashby candidate and whenever the ingestion state cannot be read. needs_review deliberately says only that a human must look - never why, since the underlying scan/guard/parse codes are operator information behind the admin-gated Mission Control. An Ashby candidate whose resume has not been parsed yet is a PII-minimal shell, so name and email are legitimately null alongside a non-null value here.
           enum: [ready, processing, needs_review, cancelled]
           nullable: true
+        dial_count:
+          $ref: '#/components/schemas/CandidateDialCount'
+        phone_state:
+          $ref: '#/components/schemas/CandidatePhoneState'
+        phone_state_reason:
+          $ref: '#/components/schemas/CandidatePhoneStateReason'
+        last_dialed_at:
+          $ref: '#/components/schemas/CandidateLastDialedAt'
       additionalProperties: true
+
+    CandidateDialCount:
+      type: integer
+      minimum: 0
+      nullable: true
+      description: Phone calls that reached the candidate's phone, summed across EVERY screening cycle (a rescreen does not reset it) and every attempt kind - so a reconnect after a dropped call is its own count, and lease-reclaimed attempts (state abandoned with a null abandon_reason), which rang before the worker died, are counted. Excludes attempts abandoned with abandon_reason infra_deferred (given up before any carrier contact), attempts whose outcome_class is provider_error (refused by the carrier before ringing), and attempts with outcome_class cancelled or window_closed and no answered_at (ended before any evidence the phone rang). It is therefore not the per-cycle no-answer budget counter. 0 means never dialled (also reported for every candidate while PHONE_SCREENING_ENABLED is off, when the phone tables are not read). null means UNKNOWN - the phone read failed or may have been truncated at the row cap - and is never a claim of zero.
+
+    CandidatePhoneState:
+      type: string
+      enum: [pending_prereqs, eligible, scheduled, dialing, in_call, reconnecting, awaiting_retry, completed, abandoned_no_answer, opted_out, wrong_number, failed, cancelled]
+      nullable: true
+      description: The latest phone screening cycle's engagement state. Link-aware, because cycle_number is scoped per Ashby application link - any live (non-terminal) cycle wins over a terminal one, then the newest created_at, then the higher cycle_number. null when the candidate was never engaged, when phone screening is disabled, or when the phone read failed (see dial_count). Does not replace status - a decided status (screened, advanced, rejected, consent_declined) is never overridden by it.
+
+    CandidatePhoneStateReason:
+      type: string
+      enum: [no_answer_budget_exhausted, reconnect_budget_exhausted, provider_budget_exhausted, window_closed, assessment_aborted, wrong_number, disclosure_refused, candidate_opt_out, hr_cancelled, emergency_stop, ashby_stage_left, prereq_lost, abandoned_pre_disclosure, consent_gate_failed, callback_deferred_in_call, callback_deferral_limit, late_score_after_stranded_abort]
+      nullable: true
+      description: Why the latest cycle is in its state, projected server-side through a closed allowlist. The underlying column is not constrained, so any value outside this list - including any free text - is reported as null rather than echoed. Always null for the viewer role (the per-cycle view, /api/candidates/{id}/phone-cycles, is interviewer+).
+
+    CandidateLastDialedAt:
+      type: string
+      format: date-time
+      nullable: true
+      description: The admitted_at of the most recent dial counted in dial_count. null when there is none or when the phone read failed.
 
     CandidatesSummary:
       type: object
@@ -8531,6 +8563,14 @@ components:
         updated_at:
           type: string
           format: date-time
+        dial_count:
+          $ref: '#/components/schemas/CandidateDialCount'
+        phone_state:
+          $ref: '#/components/schemas/CandidatePhoneState'
+        phone_state_reason:
+          $ref: '#/components/schemas/CandidatePhoneStateReason'
+        last_dialed_at:
+          $ref: '#/components/schemas/CandidateLastDialedAt'
       additionalProperties: true
 
     CallSession:
@@ -10045,7 +10085,7 @@ components:
 
     CandidatePhoneAttempt:
       type: object
-      required: [id, attempt_seq, admitted_at, answered_at, ended_at, state, outcome_class, duration_sec, recording, transcript]
+      required: [id, attempt_seq, admitted_at, answered_at, ended_at, state, abandon_reason, outcome_class, duration_sec, recording, transcript]
       properties:
         id:
           type: string
@@ -10066,6 +10106,11 @@ components:
           nullable: true
         state:
           type: string
+        abandon_reason:
+          type: string
+          enum: [infra_deferred]
+          nullable: true
+          description: Why an abandoned attempt was abandoned (0083). infra_deferred means the call was never placed (no carrier contacted). null on an abandoned attempt means its lease was reclaimed mid-call (the call was placed and then interrupted); null on any other state carries no meaning. Any other stored value is reported as null.
         outcome_class:
           type: string
           nullable: true
@@ -10074,6 +10119,11 @@ components:
           nullable: true
         recording:
           $ref: '#/components/schemas/CandidatePhoneAttemptRecording'
+        consent_stage:
+          type: string
+          enum: [before_consent, after_consent]
+          nullable: true
+          description: Whether this leg's audio was captured before the candidate consented. after_consent when the leg is consent-bound (0107 session_id set). before_consent when it is unbound and either its outcome ends at or before the consent step or its parent session never completed (worker clips kept under the 2026-09-26 retention decision recorded in 0105). null when that cannot be told apart, e.g. a pre-0107 unbound leg under a completed parent. Derived from data already loaded; no transcript is read.
         transcript:
           allOf:
             - $ref: '#/components/schemas/CandidatePhoneAttemptTranscript'
@@ -10089,7 +10139,8 @@ components:
           enum: [ready, processing, unavailable]
         reason:
           type: string
-          enum: [access_unavailable, no_recording, recording_failed]
+          enum: [access_unavailable, no_recording, recording_failed, quarantined, deleted, revoked]
+          description: Why an unavailable recording cannot be played. access_unavailable (the caller may not read the parent session) takes precedence and reveals nothing about the recording's lifecycle. deleted means the attempt or parent recording was purged; revoked means recording consent was withdrawn on the parent session; quarantined means it failed an integrity check (attempt or parent).
       additionalProperties: false
 
     CandidatePhoneAttemptTranscript:

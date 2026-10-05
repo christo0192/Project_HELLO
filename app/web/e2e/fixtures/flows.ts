@@ -227,6 +227,31 @@ export const KEY_STATES: KeyState[] = [
     },
   },
   {
+    // The pre-consent leg's inline player, OPEN. The signed URL is minted
+    // only by the click (through the existing attempt download route), so
+    // the page must not have asked for it before.
+    name: 'candidate-attempt-recording-player',
+    fullPage: false,
+    async run(app) {
+      await app.goto(`/candidates/${STAR_CANDIDATE_ID}`);
+      const history = app.page.getByRole('region', { name: 'Call attempts' });
+      const row = history.getByRole('listitem').filter({ hasText: 'Attempt 2' });
+      await expect(row.getByText('Recorded before consent')).toBeVisible();
+      const mints = () =>
+        app.calls.filter((c) => c.method === 'GET' && /^\/api\/recordings\/attempts\/[^/]+\/download$/.test(new URL(c.url).pathname));
+      expect(mints(), 'no recording URL may be minted before Play is pressed').toEqual([]);
+
+      const play = row.getByRole('button', { name: 'Play recording' });
+      await play.click();
+      await expect(row.getByRole('button', { name: 'Hide player' })).toHaveAttribute('aria-expanded', 'true');
+      const player = row.getByRole('group', { name: 'Attempt 2 recording' });
+      await expect(player.locator('audio')).toHaveAttribute('preload', 'none');
+      await expect.poll(() => mints().length, { message: 'exactly one mint, on the click' }).toBe(1);
+      await app.settle();
+      return row;
+    },
+  },
+  {
     name: 'mission-control-tab-switch',
     fullPage: true,
     async run(app) {

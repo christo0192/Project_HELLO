@@ -1,7 +1,8 @@
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { fireEvent, render, renderHook, screen, waitFor } from '@testing-library/react';
 import { MemoryRouter } from 'react-router-dom';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { PhoneAttemptHistory } from '../CandidateOverviewSections';
+import { usePhoneAttemptHistory } from '../usePhoneAttemptHistory';
 
 const getCandidatePhoneAttempts = vi.fn();
 const getAttemptRecordingDownloadUrl = vi.fn();
@@ -53,19 +54,321 @@ describe('PhoneAttemptHistory', () => {
     expect(getAttemptRecordingDownloadUrl).not.toHaveBeenCalled();
   });
 
-  it('fetches audio only after an explicit click', async () => {
+  it('mints audio only after an explicit click and plays it inline', async () => {
     getCandidatePhoneAttempts.mockResolvedValue({
       attempts: [{ ...ATTEMPT, recording: { state: 'ready' }, transcript: null }],
       next_cursor: null,
     });
-    getAttemptRecordingDownloadUrl.mockResolvedValue({ url: 'https://storage.invalid/signed' });
+    getAttemptRecordingDownloadUrl.mockResolvedValue({ url: 'https://storage.invalid/signed', content_type: 'audio/mpeg' });
     const opened = vi.spyOn(window, 'open').mockImplementation(() => null);
-    renderHistory();
-    const button = await screen.findByRole('button', { name: /download audio/i });
+    const { container } = renderHistory();
+    const button = await screen.findByRole('button', { name: 'Play recording' });
+    // Nothing is minted on mount or on list load, and no <audio> exists yet.
     expect(getAttemptRecordingDownloadUrl).not.toHaveBeenCalled();
+    expect(container.querySelector('audio')).toBeNull();
+    expect(button).toHaveAttribute('aria-expanded', 'false');
+
     fireEvent.click(button);
-    await waitFor(() => expect(getAttemptRecordingDownloadUrl).toHaveBeenCalledWith(ATTEMPT.id));
-    await waitFor(() => expect(opened).toHaveBeenCalledWith('https://storage.invalid/signed', '_blank', 'noopener,noreferrer'));
+    await waitFor(() => expect(getAttemptRecordingDownloadUrl).toHaveBeenCalledTimes(1));
+    expect(getAttemptRecordingDownloadUrl).toHaveBeenCalledWith(ATTEMPT.id);
+    const player = await screen.findByLabelText('Attempt 1 recording', { selector: 'audio' });
+    expect(player).toHaveAttribute('src', 'https://storage.invalid/signed');
+    expect(player).toHaveAttribute('preload', 'none');
+    expect(player).toHaveAttribute('controls');
+    expect(screen.getByRole('link', { name: 'Download file' })).toHaveAttribute('href', 'https://storage.invalid/signed');
+    expect(screen.getByRole('button', { name: 'Hide player' })).toHaveAttribute('aria-expanded', 'true');
+    // Inline, not a popup that a blocker can stop.
+    expect(opened).not.toHaveBeenCalled();
     opened.mockRestore();
+  });
+
+  it('closing the player discards the URL; reopening mints a fresh one', async () => {
+    getCandidatePhoneAttempts.mockResolvedValue({
+      attempts: [{ ...ATTEMPT, recording: { state: 'ready' }, transcript: null }],
+      next_cursor: null,
+    });
+    getAttemptRecordingDownloadUrl
+      .mockResolvedValueOnce({ url: 'https://storage.invalid/first' })
+      .mockResolvedValueOnce({ url: 'https://storage.invalid/second' });
+    const { container } = renderHistory();
+    fireEvent.click(await screen.findByRole('button', { name: 'Play recording' }));
+    await screen.findByLabelText('Attempt 1 recording', { selector: 'audio' });
+    fireEvent.click(screen.getByRole('button', { name: 'Hide player' }));
+    expect(container.querySelector('audio')).toBeNull();
+    expect(container.innerHTML).not.toContain('storage.invalid/first');
+    fireEvent.click(screen.getByRole('button', { name: 'Play recording' }));
+    const player = await screen.findByLabelText('Attempt 1 recording', { selector: 'audio' });
+    expect(player).toHaveAttribute('src', 'https://storage.invalid/second');
+    expect(getAttemptRecordingDownloadUrl).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps one player open at a time', async () => {
+    const second = { ...ATTEMPT, id: '00000000-0000-4000-8000-000000000021', attempt_seq: 2, recording: { state: 'ready' }, transcript: null };
+    getCandidatePhoneAttempts.mockResolvedValue({
+      attempts: [second, { ...ATTEMPT, recording: { state: 'ready' }, transcript: null }],
+      next_cursor: null,
+    });
+    getAttemptRecordingDownloadUrl.mockImplementation(async (id: string) => ({ url: `https://storage.invalid/${id}` }));
+    const { container } = renderHistory();
+    const buttons = await screen.findAllByRole('button', { name: 'Play recording' });
+    fireEvent.click(buttons[0]);
+    await screen.findByLabelText('Attempt 2 recording', { selector: 'audio' });
+    fireEvent.click(screen.getByRole('button', { name: 'Play recording' }));
+    await screen.findByLabelText('Attempt 1 recording', { selector: 'audio' });
+    expect(container.querySelectorAll('audio')).toHaveLength(1);
+    expect(screen.queryByLabelText('Attempt 2 recording', { selector: 'audio' })).toBeNull();
+  });
+
+  it('tags a recording made before consent and explains that playback is logged', async () => {
+    getCandidatePhoneAttempts.mockResolvedValue({
+      attempts: [
+        { ...ATTEMPT, recording: { state: 'ready' }, consent_stage: 'before_consent', transcript: null },
+        { ...ATTEMPT, id: '00000000-0000-4000-8000-000000000022', attempt_seq: 2, recording: { state: 'ready' }, consent_stage: 'after_consent', transcript: null },
+        // No audio: no tag even when the leg never consented.
+        { ...ATTEMPT, id: '00000000-0000-4000-8000-000000000023', attempt_seq: 3, consent_stage: 'before_consent', transcript: null },
+      ],
+      next_cursor: null,
+    });
+    getAttemptRecordingDownloadUrl.mockResolvedValue({ url: 'https://storage.invalid/signed' });
+    renderHistory();
+    const tags = await screen.findAllByText('Recorded before consent');
+    expect(tags).toHaveLength(1);
+    fireEvent.click(screen.getAllByRole('button', { name: 'Play recording' })[0]);
+    expect(await screen.findByText(/Every playback is logged/)).toBeInTheDocument();
+  });
+
+  it('offers an explicit load for a processing recording (the route recovery path), minting only on click', async () => {
+    getCandidatePhoneAttempts.mockResolvedValue({
+      attempts: [{ ...ATTEMPT, recording: { state: 'processing' }, transcript: null }],
+      next_cursor: null,
+    });
+    getAttemptRecordingDownloadUrl
+      .mockRejectedValueOnce(Object.assign(new Error('Recording is still processing. Try again shortly.'), { status: 409 }))
+      .mockResolvedValueOnce({ url: 'https://storage.invalid/recovered' });
+    renderHistory();
+    expect(await screen.findByText('Recording processing')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Play recording' })).toBeNull();
+    expect(getAttemptRecordingDownloadUrl).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole('button', { name: 'Try to load recording' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('still processing');
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    const player = await screen.findByLabelText('Attempt 1 recording', { selector: 'audio' });
+    expect(player).toHaveAttribute('src', 'https://storage.invalid/recovered');
+  });
+
+  it('names a recording whose consent was withdrawn, and offers no player', async () => {
+    getCandidatePhoneAttempts.mockResolvedValue({
+      attempts: [{ ...ATTEMPT, recording: { state: 'unavailable', reason: 'revoked' }, transcript: null }],
+      next_cursor: null,
+    });
+    renderHistory();
+    expect(await screen.findByText('Recording withdrawn')).toBeInTheDocument();
+    expect(screen.queryByText('No recording available')).toBeNull();
+    expect(screen.queryByRole('button', { name: /recording/i })).toBeNull();
+  });
+
+  it('announces loading and ready through a persistent live region, and leaves focus on the toggle', async () => {
+    getCandidatePhoneAttempts.mockResolvedValue({
+      attempts: [{ ...ATTEMPT, recording: { state: 'ready' }, transcript: null }],
+      next_cursor: null,
+    });
+    let resolveMint: (v: { url: string }) => void = () => {};
+    getAttemptRecordingDownloadUrl.mockImplementation(() => new Promise((r) => { resolveMint = r; }));
+    renderHistory();
+    const button = await screen.findByRole('button', { name: 'Play recording' });
+    // Mounted before anything happens, so its later text is announced.
+    const live = document.querySelector('[data-player-announcer]') as HTMLElement;
+    expect(live).toHaveAttribute('aria-live', 'polite');
+    expect(live).toHaveTextContent('');
+    button.focus();
+    fireEvent.click(button);
+    await waitFor(() => expect(live).toHaveTextContent('Loading recording'));
+    resolveMint({ url: 'https://storage.invalid/signed' });
+    await screen.findByLabelText('Attempt 1 recording', { selector: 'audio' });
+    expect(live).toHaveTextContent('Recording ready');
+    expect(screen.getByRole('button', { name: 'Hide player' })).toHaveFocus();
+    fireEvent.click(screen.getByRole('button', { name: 'Hide player' }));
+    expect(live).toHaveTextContent('');
+  });
+
+  it('names a quarantined and a deleted recording and offers no player for either', async () => {
+    getCandidatePhoneAttempts.mockResolvedValue({
+      attempts: [
+        { ...ATTEMPT, recording: { state: 'unavailable', reason: 'quarantined' }, consent_stage: 'before_consent', transcript: null },
+        { ...ATTEMPT, id: '00000000-0000-4000-8000-000000000024', attempt_seq: 2, recording: { state: 'unavailable', reason: 'deleted' }, consent_stage: 'before_consent', transcript: null },
+      ],
+      next_cursor: null,
+    });
+    renderHistory();
+    expect(await screen.findByText('Recording withheld (failed integrity check)')).toBeInTheDocument();
+    expect(screen.getByText('Recording deleted')).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Play recording' })).toBeNull();
+    expect(screen.queryByText('Recorded before consent')).toBeNull();
+    expect(getAttemptRecordingDownloadUrl).not.toHaveBeenCalled();
+  });
+
+  it('reports a failed mint as an alert and retries on request', async () => {
+    getCandidatePhoneAttempts.mockResolvedValue({
+      attempts: [{ ...ATTEMPT, recording: { state: 'ready' }, transcript: null }],
+      next_cursor: null,
+    });
+    getAttemptRecordingDownloadUrl
+      .mockRejectedValueOnce(Object.assign(new Error('Internal error'), { status: 500 }))
+      .mockResolvedValueOnce({ url: 'https://storage.invalid/retried' });
+    renderHistory();
+    fireEvent.click(await screen.findByRole('button', { name: 'Play recording' }));
+    const alert = await screen.findByRole('alert');
+    expect(alert).toHaveTextContent("Couldn't load the recording.");
+    // A failed mint is not a failed history: the list stays.
+    expect(screen.queryByText('Attempt history unavailable.')).toBeNull();
+    fireEvent.click(screen.getByRole('button', { name: 'Try again' }));
+    const player = await screen.findByLabelText('Attempt 1 recording', { selector: 'audio' });
+    expect(player).toHaveAttribute('src', 'https://storage.invalid/retried');
+  });
+
+  it('explains a quarantine or deletion discovered at click time, without a retry', async () => {
+    getCandidatePhoneAttempts.mockResolvedValue({
+      attempts: [
+        { ...ATTEMPT, recording: { state: 'ready' }, transcript: null },
+        { ...ATTEMPT, id: '00000000-0000-4000-8000-000000000025', attempt_seq: 2, recording: { state: 'ready' }, transcript: null },
+      ],
+      next_cursor: null,
+    });
+    getAttemptRecordingDownloadUrl.mockImplementation(async (id: string) => {
+      throw id === ATTEMPT.id
+        ? Object.assign(new Error('Recording is quarantined'), { status: 409 })
+        : Object.assign(new Error('Forbidden'), { status: 403 });
+    });
+    renderHistory();
+    const [first, second] = await screen.findAllByRole('button', { name: 'Play recording' });
+    fireEvent.click(first);
+    expect(await screen.findByRole('alert')).toHaveTextContent('Recording withheld: it failed an integrity check.');
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull();
+    fireEvent.click(second);
+    expect(await screen.findByRole('alert')).toHaveTextContent('it was deleted or access was withdrawn');
+    expect(screen.queryByRole('button', { name: 'Try again' })).toBeNull();
+  });
+
+  it('offers a retry while a recording is still processing at click time', async () => {
+    getCandidatePhoneAttempts.mockResolvedValue({
+      attempts: [{ ...ATTEMPT, recording: { state: 'ready' }, transcript: null }],
+      next_cursor: null,
+    });
+    getAttemptRecordingDownloadUrl.mockRejectedValueOnce(
+      Object.assign(new Error('Recording is still processing. Try again shortly.'), { status: 409 }),
+    );
+    renderHistory();
+    fireEvent.click(await screen.findByRole('button', { name: 'Play recording' }));
+    expect(await screen.findByRole('alert')).toHaveTextContent('still processing');
+    expect(screen.getByRole('button', { name: 'Try again' })).toBeInTheDocument();
+  });
+
+  it('ignores a late mint after the player was closed', async () => {
+    getCandidatePhoneAttempts.mockResolvedValue({
+      attempts: [{ ...ATTEMPT, recording: { state: 'ready' }, transcript: null }],
+      next_cursor: null,
+    });
+    let resolveMint: (value: { url: string }) => void = () => {};
+    getAttemptRecordingDownloadUrl.mockImplementation(() => new Promise((resolve) => { resolveMint = resolve; }));
+    const { container } = renderHistory();
+    fireEvent.click(await screen.findByRole('button', { name: 'Play recording' }));
+    await waitFor(() => expect(getAttemptRecordingDownloadUrl).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getByRole('button', { name: 'Hide player' }));
+    resolveMint({ url: 'https://storage.invalid/late' });
+    await new Promise((r) => setTimeout(r, 0));
+    expect(container.querySelector('audio')).toBeNull();
+    expect(container.innerHTML).not.toContain('storage.invalid/late');
+  });
+
+  it('renders a shared list without fetching it again', async () => {
+    render(
+      <MemoryRouter>
+        <PhoneAttemptHistory
+          candidateId="candidate-1"
+          role="viewer"
+          title="Call recordings"
+          source={{
+            attempts: [{ ...ATTEMPT, recording: { state: 'ready' }, transcript: null }] as never,
+            nextCursor: null,
+            error: false,
+            reload: vi.fn(),
+            loadOlder: vi.fn(),
+          }}
+        />
+      </MemoryRouter>,
+    );
+    expect(screen.getByRole('heading', { name: 'Call recordings' })).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Play recording' })).toBeInTheDocument();
+    await new Promise((r) => setTimeout(r, 0));
+    expect(getCandidatePhoneAttempts).not.toHaveBeenCalled();
+  });
+
+  it('labels a lease-reclaimed attempt "Call interrupted" and only an infra defer "Not placed"', async () => {
+    getCandidatePhoneAttempts.mockResolvedValue({
+      attempts: [
+        {
+          ...ATTEMPT,
+          id: '00000000-0000-4000-8000-000000000011',
+          attempt_seq: 2,
+          state: 'abandoned',
+          abandon_reason: null,
+          outcome_class: null,
+          recording: { state: 'ready' },
+          transcript: null,
+        },
+        {
+          ...ATTEMPT,
+          id: '00000000-0000-4000-8000-000000000012',
+          attempt_seq: 1,
+          state: 'abandoned',
+          abandon_reason: 'infra_deferred',
+          outcome_class: null,
+          answered_at: null,
+          duration_sec: null,
+          transcript: null,
+        },
+      ],
+      next_cursor: null,
+    });
+    renderHistory();
+    const interrupted = await screen.findByText('Call interrupted');
+    expect(interrupted).toHaveAttribute('title', 'state: abandoned');
+    const notPlaced = screen.getByText('Not placed');
+    expect(notPlaced).toHaveAttribute('title', 'state: abandoned · abandon_reason: infra_deferred');
+    expect(screen.getAllByText('Not placed')).toHaveLength(1);
+  });
+});
+
+describe('usePhoneAttemptHistory', () => {
+  it("drops the previous candidate's attempts as soon as the candidate changes", async () => {
+    const forA = { attempts: [{ ...ATTEMPT, id: 'a-1' }], next_cursor: 'cursor-a' };
+    let resolveB: (v: unknown) => void = () => {};
+    getCandidatePhoneAttempts.mockImplementation((id: string) =>
+      id === 'cand-a' ? Promise.resolve(forA) : new Promise((r) => { resolveB = r; }));
+    const { result, rerender } = renderHook(({ id }) => usePhoneAttemptHistory(id), {
+      initialProps: { id: 'cand-a' },
+    });
+    await waitFor(() => expect(result.current.attempts?.[0]?.id).toBe('a-1'));
+    expect(result.current.nextCursor).toBe('cursor-a');
+
+    rerender({ id: 'cand-b' });
+    // B is still loading: nothing of A's (no rows, no cursor, no play buttons).
+    expect(result.current.attempts).toBeNull();
+    expect(result.current.nextCursor).toBeNull();
+
+    // The request is issued from a microtask; resolve it once it exists.
+    await waitFor(() => expect(getCandidatePhoneAttempts).toHaveBeenCalledWith('cand-b', undefined));
+    expect(result.current.attempts).toBeNull();
+    resolveB({ attempts: [{ ...ATTEMPT, id: 'b-1' }], next_cursor: null });
+    await waitFor(() => expect(result.current.attempts?.[0]?.id).toBe('b-1'));
+  });
+
+  it('clears the list when switched off', async () => {
+    const { result, rerender } = renderHook(({ on }) => usePhoneAttemptHistory('cand-a', on), {
+      initialProps: { on: true },
+    });
+    await waitFor(() => expect(result.current.attempts).not.toBeNull());
+    rerender({ on: false });
+    expect(result.current.attempts).toBeNull();
   });
 });

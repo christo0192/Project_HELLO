@@ -40,6 +40,7 @@ import {
   RECORDING_INTEGRITY_SHA256_HEX_LENGTH,
 } from '../lib/recording-integrity.js';
 import { getCorrelationId } from '../lib/correlation.js';
+import { attemptConsentStage, preConsentFlag } from '../lib/attempt-consent-stage.js';
 import {
   finalizeAuthoritativeRecording,
   finalizeWorkerInbandAttemptRecording,
@@ -227,7 +228,7 @@ recordingsRouter.get(
 
       const attemptResult = await supabase
         .from('phone_call_attempts')
-        .select('id,session_id,recording_session_id,recording_object_key,recording_manifest_key,recording_sha256,recording_size_bytes,recording_content_type,recording_ready,recording_quarantined,recording_deleted_at,egress_id,egress_status')
+        .select('id,session_id,recording_session_id,outcome_class,recording_object_key,recording_manifest_key,recording_sha256,recording_size_bytes,recording_content_type,recording_ready,recording_quarantined,recording_deleted_at,egress_id,egress_status')
         .eq('id', attemptId)
         .maybeSingle();
       let attempt = attemptResult.data;
@@ -254,7 +255,7 @@ recordingsRouter.get(
 
       const { data: session, error: sessionError } = await supabase
         .from('call_sessions')
-        .select('owner_id,recording_quarantined,recording_revoked_at,recording_deleted_at')
+        .select('owner_id,status,recording_quarantined,recording_revoked_at,recording_deleted_at')
         .eq('id', parentSessionId)
         .maybeSingle();
       const ownsSession = user.appRole === 'interviewer'
@@ -297,7 +298,7 @@ recordingsRouter.get(
           if (recovery === 'ready') {
             const reread = await supabase
               .from('phone_call_attempts')
-              .select('id,session_id,recording_session_id,recording_object_key,recording_manifest_key,recording_sha256,recording_size_bytes,recording_content_type,recording_ready,recording_quarantined,recording_deleted_at,egress_id,egress_status')
+              .select('id,session_id,recording_session_id,outcome_class,recording_object_key,recording_manifest_key,recording_sha256,recording_size_bytes,recording_content_type,recording_ready,recording_quarantined,recording_deleted_at,egress_id,egress_status')
               .eq('id', attemptId)
               .maybeSingle();
             if (reread.error || !reread.data) {
@@ -374,8 +375,31 @@ recordingsRouter.get(
       if (signError || !signedData?.signedUrl) {
         return res.status(500).json({ error: { type: 'internal_error', message: 'Failed to generate download URL' } });
       }
+      // `scope` tells an attempt mint apart from a session mint in the audit
+      // trail. `pre_consent` is the SAME classification the attempt history
+      // shows as "Recorded before consent" (attempt-consent-stage.ts): true
+      // for audio captured before consent (kept under the 2026-09-26
+      // retention decision recorded in 0105), false for a consent-bound leg,
+      // null when it cannot be told (an unbound pre-0107 leg under a
+      // completed parent). The URL itself is never part of the audit row.
       await recordAudit(req, 'recording.download', 200, {
-        metadata: { attempt_id: attemptId, requested_by: user.id, role: user.appRole, ttl_sec: ttlSec },
+        metadata: {
+          attempt_id: attemptId,
+          scope: 'attempt',
+          pre_consent: preConsentFlag(attemptConsentStage(
+            {
+              session_id: attempt.session_id,
+              recording_session_id: attempt.recording_session_id,
+              outcome_class: (attempt as { outcome_class?: string | null }).outcome_class ?? null,
+            },
+            typeof (session as { status?: unknown }).status === 'string'
+              ? (session as { status: string }).status
+              : null,
+          )),
+          requested_by: user.id,
+          role: user.appRole,
+          ttl_sec: ttlSec,
+        },
       }).catch(() => {});
       return res.json({ url: signedData.signedUrl, content_type: attempt.recording_content_type });
     } catch (error) {

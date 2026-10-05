@@ -973,6 +973,7 @@ beforeEach(() => {
 
 afterEach(() => {
   injectAssessmentRunner(null);
+  vi.unstubAllEnvs();
 });
 
 // ════════════════════════════════════════════════════════════════════
@@ -1252,7 +1253,11 @@ describe('OpenAPI document integrity', () => {
     // has no honest value for. 257 + 1 = 258.
     // M008 adds ONE: RoleListItem, the Role plus the list-only
     // has_ashby_mapping flag the role filters read. 258 + 1 = 259.
-    expect(Object.keys(schemas).length).toBe(259);
+    // M011 adds FOUR: the phone-progress fields shared by CandidateListItem
+    // and Candidate (CandidateDialCount, CandidatePhoneState,
+    // CandidatePhoneStateReason, CandidateLastDialedAt), defined once so the
+    // list and the detail cannot drift. 259 + 4 = 263.
+    expect(Object.keys(schemas).length).toBe(263);
     expect(Object.keys(securitySchemes).length).toBe(3);
     // At least 70 of the schemas must carry additionalProperties:false —
     // the few with true are intentionally extensible envelope/record types.
@@ -1409,6 +1414,60 @@ describe('OpenAPI document integrity', () => {
       validateNamed({ ...base, last_due: { not_a_documented_key: 1 } }, 'PhoneRuntimeState', spec).length,
       'allOf must not weaken validation of a non-null last_due',
     ).toBeGreaterThan(0);
+  });
+
+  it('CandidatePhoneAttempt requires abandon_reason and allows only infra_deferred or null', () => {
+    const base = {
+      id: '00000000-0000-4000-8000-000000000111',
+      attempt_seq: 1,
+      admitted_at: '2026-09-25T13:00:00.000Z',
+      answered_at: '2026-09-25T13:00:01.000Z',
+      ended_at: '2026-09-25T13:00:09.000Z',
+      state: 'abandoned',
+      abandon_reason: null as unknown,
+      outcome_class: null,
+      duration_sec: 8,
+      recording: { state: 'unavailable', reason: 'no_recording' },
+      transcript: null,
+    };
+    // Lease reclaim (null) and infra defer are both documented shapes.
+    expect(validateNamed(base, 'CandidatePhoneAttempt', spec)).toEqual([]);
+    expect(validateNamed({ ...base, abandon_reason: 'infra_deferred' }, 'CandidatePhoneAttempt', spec)).toEqual([]);
+    // Nothing outside the 0083 CHECK may be documented as a valid value.
+    expect(validateNamed({ ...base, abandon_reason: 'lease_reclaimed' }, 'CandidatePhoneAttempt', spec).length)
+      .toBeGreaterThan(0);
+    // Required, not merely documented: the label split depends on it.
+    const { abandon_reason: _omitted, ...missing } = base;
+    expect(validateNamed(missing, 'CandidatePhoneAttempt', spec).length).toBeGreaterThan(0);
+  });
+
+  it('CandidatePhoneAttempt documents consent_stage and the deleted/quarantined recording reasons', () => {
+    const base = {
+      id: '00000000-0000-4000-8000-000000000111',
+      attempt_seq: 1,
+      admitted_at: '2026-09-25T13:00:00.000Z',
+      answered_at: '2026-09-25T13:00:01.000Z',
+      ended_at: '2026-09-25T13:00:09.000Z',
+      state: 'ended',
+      abandon_reason: null,
+      outcome_class: 'abandoned_pre_disclosure',
+      duration_sec: 8,
+      recording: { state: 'ready' },
+      transcript: null,
+    };
+    for (const stage of ['before_consent', 'after_consent', null]) {
+      expect(validateNamed({ ...base, consent_stage: stage }, 'CandidatePhoneAttempt', spec)).toEqual([]);
+    }
+    expect(validateNamed({ ...base, consent_stage: 'maybe' }, 'CandidatePhoneAttempt', spec).length)
+      .toBeGreaterThan(0);
+    for (const reason of ['access_unavailable', 'no_recording', 'recording_failed', 'quarantined', 'deleted']) {
+      expect(validateNamed({ state: 'unavailable', reason }, 'CandidatePhoneAttemptRecording', spec)).toEqual([]);
+    }
+    expect(validateNamed({ state: 'unavailable', reason: 'purged' }, 'CandidatePhoneAttemptRecording', spec).length)
+      .toBeGreaterThan(0);
+    // The list never carries a signed URL or a storage key.
+    expect(validateNamed({ state: 'ready', url: 'https://x.invalid/a' }, 'CandidatePhoneAttemptRecording', spec).length)
+      .toBeGreaterThan(0);
   });
 
   it('documents every route the app registers and nothing else', () => {
@@ -1700,6 +1759,73 @@ describe('live handler shapes match documented schemas', () => {
     expect(res.status).toBe(200);
     expect(res.body).toHaveLength(1);
     expect(validateNamed(res.body[0], 'CandidateListItem', spec)).toEqual([]);
+  });
+
+  it('GET /api/candidates → CandidateListItem[] with phone progress (dialled, never engaged, unknown)', async () => {
+    // Phone progress is read only while phone screening is on.
+    vi.stubEnv('PHONE_SCREENING_ENABLED', 'true');
+    configureTables({
+      candidates: ok([
+        mockCandidateListItem,
+        { ...mockCandidateListItem, id: UUID_1, status: 'queued' },
+      ]),
+      phone_engagements: ok([
+        {
+          candidate_id: UUID_2, cycle_number: 1, created_at: T_2026,
+          state: 'abandoned_no_answer', state_reason: 'no_answer_budget_exhausted',
+          phone_call_attempts: [
+            { state: 'ended', abandon_reason: null, outcome_class: 'no_answer', admitted_at: T_2026 },
+            { state: 'abandoned', abandon_reason: 'infra_deferred', outcome_class: null, admitted_at: T_2026 },
+          ],
+        },
+      ]),
+    });
+    const app = createContractApp();
+    const res = await request(app).get('/api/candidates').set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(res.body[0]).toMatchObject({ dial_count: 1, phone_state: 'abandoned_no_answer', phone_state_reason: 'no_answer_budget_exhausted' });
+    expect(res.body[1]).toMatchObject({ dial_count: 0, phone_state: null, phone_state_reason: null, last_dialed_at: null });
+    for (const row of res.body) expect(validateNamed(row, 'CandidateListItem', spec)).toEqual([]);
+
+    // Unknown (read failed): every phone field null, still valid.
+    configureTables({
+      candidates: ok([{ ...mockCandidateListItem, id: UUID_3 }]),
+      phone_engagements: { data: null, error: { message: 'boom' } },
+    });
+    const failed = await request(app).get('/api/candidates').set('Authorization', AUTH_HEADER);
+    expect(failed.status).toBe(200);
+    expect(failed.body[0].dial_count).toBeNull();
+    expect(validateNamed(failed.body[0], 'CandidateListItem', spec)).toEqual([]);
+
+    // A value outside the documented enums would fail the contract — the
+    // route projects state and reason so this can never be emitted.
+    expect(validateNamed({ ...res.body[0], phone_state_reason: 'free text' }, 'CandidateListItem', spec)).not.toEqual([]);
+    expect(validateNamed({ ...res.body[0], phone_state: 'on_hold' }, 'CandidateListItem', spec)).not.toEqual([]);
+    const { dial_count: _omitted, ...withoutDialCount } = res.body[0];
+    expect(validateNamed(withoutDialCount, 'CandidateListItem', spec)).not.toEqual([]);
+  });
+
+  it('GET /api/candidates/{id} → CandidateDetail with phone progress on the candidate', async () => {
+    vi.stubEnv('PHONE_SCREENING_ENABLED', 'true');
+    configureTables({
+      candidates: ok(mockCandidateRow),
+      call_sessions: ok([mockSessionRow]),
+      assessments: ok([mockAssessmentRecord]),
+      phone_engagements: ok([
+        {
+          candidate_id: mockCandidateRow.id, cycle_number: 2, created_at: T_2026,
+          state: 'awaiting_retry', state_reason: 'window_closed',
+          phone_call_attempts: [
+            { state: 'abandoned', abandon_reason: null, outcome_class: null, admitted_at: T_2026 },
+          ],
+        },
+      ]),
+    });
+    const app = createContractApp();
+    const res = await request(app).get(`/api/candidates/${UUID_2}`).set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(res.body.candidate).toMatchObject({ dial_count: 1, phone_state: 'awaiting_retry', phone_state_reason: 'window_closed' });
+    expect(validateResponseBody(res.body, 'CandidateDetail', spec)).toEqual([]);
   });
 
   it('GET /api/candidates/{id} → CandidateDetail', async () => {

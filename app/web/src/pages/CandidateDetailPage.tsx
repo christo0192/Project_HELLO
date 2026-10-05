@@ -37,10 +37,11 @@ import {
   Tabs,
   TranscriptionSyncWorkspace,
   candidateDisplayName,
+  usePhoneAttemptHistory,
 } from "../components/talent";
+import type { PhoneAttemptHistorySource } from "../components/talent";
 import {
-  candidateStatusLabel,
-  candidateStatusTone,
+  candidateDisplayStatus,
   sessionStatusLabel,
 } from "../components/talent";
 import {
@@ -226,6 +227,13 @@ export function CandidateDetailPage() {
     };
   }, [roleId]);
 
+  // ONE attempt list for the page, shared by the Overview rail and the Review
+  // tab's call recordings. Each copy is mounted only while its tab is open
+  // (one player at a time), so self-loading copies would refetch on every tab
+  // switch. Loaded once the page itself has loaded, as the Overview copy
+  // always was; reset whenever the candidate changes.
+  const phoneAttempts = usePhoneAttemptHistory(id ?? "", Boolean(id && detail && me));
+
   // Silent refresh: re-read the candidate (its session list feeds the Review
   // tab) without unmounting the page. Used when a live call completes.
   const refresh = useCallback(() => {
@@ -253,6 +261,9 @@ export function CandidateDetailPage() {
 
   const { candidate, sessions, assessments } = detail;
   const decisionBlocked = candidate.decision_use_blocked_at != null;
+  // The list's derivation (stored status + phone progress from GET /:id), so
+  // the header, the Overview field and the list row say the same words.
+  const displayStatus = candidateDisplayStatus(candidate);
   // C3: the NEWEST assessment (the API orders by created_at desc) was graded
   // `insufficient` — held from Ashby and from the status, so the phone card
   // recommends a re-screen. Never while an appeal blocks decision use.
@@ -339,11 +350,17 @@ export function CandidateDetailPage() {
         // row beside the buttons, where it read as one more control.
         meta={
           <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-            <StatusBadge tone={candidateStatusTone(candidate.status)}>
-              <span title={`Status: ${candidate.status}`}>
-                {candidateStatusLabel(candidate.status)}
-              </span>
+            <StatusBadge tone={displayStatus.tone}>
+              <span title={displayStatus.title}>{displayStatus.label}</span>
             </StatusBadge>
+            {/* The tooltip's phone facts as visible text: why the cycle ended,
+                how often the phone was reached and when, for keyboard, touch
+                and screen-reader users too. */}
+            {displayStatus.detail && (
+              <span data-phone-status-detail="" className="text-meta text-[var(--c-ink-secondary)]">
+                {displayStatus.detail}
+              </span>
+            )}
             <CandidateHeadlineFacts
               roleTitle={roleTitle}
               callSeconds={longestSession?.duration_sec ?? null}
@@ -377,6 +394,8 @@ export function CandidateDetailPage() {
                   candidate={candidate}
                   sessions={sessions}
                   phoneRole={me.role}
+                  phoneAttempts={phoneAttempts}
+                  showPhoneAttempts={tab === "overview"}
                   onSessionCompleted={refresh}
                   callInHeader={!reviewable}
                   callRequest={callRequest}
@@ -394,6 +413,22 @@ export function CandidateDetailPage() {
                   sessions={sessions}
                   assessments={assessments}
                   blocked={decisionBlocked}
+                  // Mounted only while Review is the open tab (and the Overview
+                  // copy only while Overview is): one player on the page at a
+                  // time, and switching tabs unmounts the <audio>, so nothing
+                  // keeps playing in a hidden panel. The list itself is the
+                  // shared `phoneAttempts`, so remounting never refetches.
+                  callRecordings={
+                    tab === "review" ? (
+                      <PhoneAttemptHistory
+                        candidateId={candidate.id}
+                        role={me.role}
+                        source={phoneAttempts}
+                        title="Call recordings"
+                        description="Calls that ended before a screening completed, including at the consent step. Recordings play here on request."
+                      />
+                    ) : null
+                  }
                 />
               ),
             },
@@ -482,6 +517,8 @@ function OverviewTab({
   candidate,
   sessions,
   phoneRole,
+  phoneAttempts,
+  showPhoneAttempts,
   onSessionCompleted,
   callInHeader,
   callRequest,
@@ -492,6 +529,10 @@ function OverviewTab({
   candidate: CandidateDetail["candidate"];
   sessions: CandidateDetail["sessions"];
   phoneRole: MeResponse["role"];
+  /** The page's shared attempt list (see `usePhoneAttemptHistory`). */
+  phoneAttempts: PhoneAttemptHistorySource;
+  /** False while another tab is open: unmounts the player (see the page). */
+  showPhoneAttempts: boolean;
   onSessionCompleted?: () => void;
   callInHeader: boolean;
   callRequest: number;
@@ -517,7 +558,9 @@ function OverviewTab({
 
         <SessionsSummary sessions={sessions} />
 
-        <PhoneAttemptHistory candidateId={candidate.id} role={phoneRole} />
+        {showPhoneAttempts && (
+          <PhoneAttemptHistory candidateId={candidate.id} role={phoneRole} source={phoneAttempts} />
+        )}
 
         <NotesSection candidateId={candidate.id} />
       </div>

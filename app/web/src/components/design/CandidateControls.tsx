@@ -147,9 +147,13 @@ export function CandidateLabel({
 
 export function CandidateInput({
   className,
+  ref,
   ...rest
-}: InputHTMLAttributes<HTMLInputElement>) {
-  return <input className={cx(fieldBase, className)} {...rest} />;
+}: InputHTMLAttributes<HTMLInputElement> & {
+  /** React 19 ref-as-prop, so hosts can return focus to the field. */
+  ref?: Ref<HTMLInputElement>;
+}) {
+  return <input ref={ref} className={cx(fieldBase, className)} {...rest} />;
 }
 
 export function CandidateSelect({

@@ -6,25 +6,38 @@
  * for parsing and building those params so the dashboard and the Candidates
  * page always agree, and so deep links / browser back-forward behave.
  *
- * - `status` is a comma-separated subset of the candidate status vocabulary
- *   (DB CHECK 0001/0006/notes): new | queued | screening | screened |
- *   advanced | rejected | consent_declined. Applied client-side (the list
- *   API only filters by role).
+ * - `status` is a comma-separated subset of the candidate DISPLAY status
+ *   vocabulary: the stored statuses (DB CHECK 0001/0006/notes) new | queued |
+ *   screening | screened | advanced | rejected | consent_declined, then the
+ *   five keys `candidateDisplayStatus` derives from a finished phone cycle:
+ *   abandoned_no_answer | phone_failed | wrong_number | opted_out |
+ *   phone_cancelled. Applied client-side (the list API only filters by role)
+ *   against `candidateStatusKey`, so a filter, its count and the row badge
+ *   always agree.
  * - `resume` is a comma-separated subset of the sanitized resume-review enum
  *   the list API returns (processing | needs_review | cancelled). Applied
  *   client-side over the already-loaded page: additive, adds no request, and
  *   changes nothing about the status vocabulary.
  * - `role` is a role id, applied server-side via `listCandidates(roleId)`.
+ * - `q` is a free-text search (name / email / phone digits). Applied
+ *   client-side over the already-loaded rows by `matchesCandidateSearch`
+ *   (candidateSearch.ts) and NEVER sent to the API, so it can only narrow
+ *   what the server already chose to return (owner scoping, phone
+ *   redaction). Normalized by `normalizeCandidateQuery`.
  *
  * Everything here is derived from data the candidate list already returns —
  * no fabricated metrics.
  */
 
 import type { Candidate } from '../../types';
-import { candidateStatusLabel } from './status';
+import { candidateStatusKey, candidateStatusLabel } from './status';
 import { RESUME_REVIEW_ORDER } from './ResumeReviewBadge';
 
-/** Canonical funnel order for the candidate status vocabulary. */
+/**
+ * Canonical funnel order for the candidate display-status vocabulary. The
+ * phone-cycle keys come last: they are terminal outcomes of `queued`, never
+ * stored on the candidate (see `candidateDisplayStatus`).
+ */
 export const CANDIDATE_STATUS_ORDER = [
   'new',
   'queued',
@@ -33,7 +46,24 @@ export const CANDIDATE_STATUS_ORDER = [
   'advanced',
   'rejected',
   'consent_declined',
+  'abandoned_no_answer',
+  'phone_failed',
+  'wrong_number',
+  'opted_out',
+  'phone_cancelled',
 ] as const;
+
+/**
+ * The phone-cycle display keys. The status bar always shows
+ * `abandoned_no_answer` and shows the rest only when present or selected.
+ */
+export const PHONE_OUTCOME_STATUS_KEYS: ReadonlySet<string> = new Set([
+  'abandoned_no_answer',
+  'phone_failed',
+  'wrong_number',
+  'opted_out',
+  'phone_cancelled',
+]);
 
 export type CandidateStatusKey = (typeof CANDIDATE_STATUS_ORDER)[number];
 
@@ -73,6 +103,26 @@ export interface CandidateFilters {
   assessed: boolean;
   /** Selected role id, or null for all roles. */
   roleId: string | null;
+  /**
+   * Normalized free-text search (`''` = none). Client-side only; see
+   * `matchesCandidateSearch`. `matchesCandidateFilters` deliberately ignores
+   * it so the two predicates stay independently testable.
+   */
+  query: string;
+}
+
+/** Longest search the URL contract keeps, in code points. */
+export const CANDIDATE_QUERY_MAX = 100;
+
+/**
+ * Canonical form of a search query: trimmed, inner whitespace runs collapsed
+ * to one space, capped at `CANDIDATE_QUERY_MAX` code points (never splitting
+ * a surrogate pair). `null` / whitespace-only is `''`.
+ */
+export function normalizeCandidateQuery(raw: string | null | undefined): string {
+  if (!raw) return '';
+  const collapsed = raw.replace(/\s+/g, ' ').trim();
+  return Array.from(collapsed).slice(0, CANDIDATE_QUERY_MAX).join('').trim();
 }
 
 export const EMPTY_CANDIDATE_FILTERS: CandidateFilters = {
@@ -81,6 +131,7 @@ export const EMPTY_CANDIDATE_FILTERS: CandidateFilters = {
   resumeReview: [],
   assessed: false,
   roleId: null,
+  query: '',
 };
 
 /** Normalize a candidate's status to a known key ('new' when missing). */
@@ -116,6 +167,7 @@ export function parseCandidateFilters(params: URLSearchParams): CandidateFilters
     resumeReview: [...resumeReview],
     assessed: params.get('assessed') === '1',
     roleId: roleId && roleId.trim() ? roleId.trim() : null,
+    query: normalizeCandidateQuery(params.get('q')),
   };
 }
 
@@ -139,6 +191,9 @@ export function buildCandidateSearch(filters: CandidateFilters): URLSearchParams
   }
   if (filters.assessed) params.set('assessed', '1');
   if (filters.roleId) params.set('role', filters.roleId);
+  // LAST, so every pre-existing canonical href is byte-identical.
+  const query = normalizeCandidateQuery(filters.query);
+  if (query) params.set('q', query);
   return params;
 }
 
@@ -152,16 +207,21 @@ export function candidatesHref(filters: Partial<CandidateFilters> = {}): string 
   return qs ? `/candidates?${qs}` : '/candidates';
 }
 
-/** Client-side status predicate (role is filtered server-side). */
+/**
+ * Client-side status predicate (role is filtered server-side). Keyed by the
+ * DISPLAY status, so `queued` no longer includes a candidate whose phone
+ * cycle ended with no answer, and `abandoned_no_answer` selects exactly them.
+ */
 export function matchesCandidateStatus(candidate: Candidate, filters: CandidateFilters): boolean {
   if (filters.statuses.length === 0) return true;
-  return filters.statuses.includes(normalizeStatus(candidate.status));
+  return filters.statuses.includes(candidateStatusKey(candidate));
 }
 
 /**
  * Full client-side predicate: status + recommendation + assessed. Role is
- * filtered server-side. Recommendation/assessed use the list-enriched
- * latest_recommendation / latest_score fields.
+ * filtered server-side; the free-text `query` is applied separately by
+ * `matchesCandidateSearch` and ignored here. Recommendation/assessed use the
+ * list-enriched latest_recommendation / latest_score fields.
  */
 export function matchesCandidateFilters(candidate: Candidate, filters: CandidateFilters): boolean {
   if (!matchesCandidateStatus(candidate, filters)) return false;
@@ -188,13 +248,17 @@ export function hasActiveFilters(filters: CandidateFilters): boolean {
     filters.recommendations.length > 0 ||
     filters.resumeReview.length > 0 ||
     filters.assessed ||
-    filters.roleId !== null
+    filters.roleId !== null ||
+    filters.query !== ''
   );
 }
 
 /**
- * The obvious next recruiter action for a candidate, by status. Keeps the
- * list actionable without inventing data — purely a restatement of status.
+ * The obvious next recruiter action for a candidate, by status (pass the
+ * DISPLAY key, `candidateStatusKey`). Keeps the list actionable without
+ * inventing data — purely a restatement of status. The phone-outcome keys are
+ * never emphasised: a rescreen is an interviewer action on the profile, not a
+ * list button.
  */
 export function candidateNextAction(status: string | null | undefined): {
   label: string;
@@ -215,13 +279,23 @@ export function candidateNextAction(status: string | null | undefined): {
       return { label: 'Rejected', emphasis: false };
     case 'consent_declined':
       return { label: 'Consent declined', emphasis: false };
+    case 'abandoned_no_answer':
+      return { label: 'No answer after every attempt', emphasis: false };
+    case 'phone_failed':
+      return { label: 'Phone screen failed', emphasis: false };
+    case 'wrong_number':
+      return { label: 'Wrong number', emphasis: false };
+    case 'opted_out':
+      return { label: 'Opted out', emphasis: false };
+    case 'phone_cancelled':
+      return { label: 'Phone screen cancelled', emphasis: false };
     default:
       return { label: 'Open profile', emphasis: false };
   }
 }
 
 /**
- * Count candidates per status, in canonical funnel order, keeping only
+ * Count candidates per DISPLAY status, in canonical funnel order, keeping only
  * statuses actually present. Each entry carries its status key so callers can
  * build drill-down links. Derived purely from the list — never fabricated.
  */
@@ -230,7 +304,7 @@ export function candidateFunnel(
 ): Array<{ status: string; label: string; value: number }> {
   const counts = new Map<string, number>();
   for (const c of candidates) {
-    const key = normalizeStatus(c.status);
+    const key = candidateStatusKey(c);
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
   const ordered = [
