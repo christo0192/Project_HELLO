@@ -34,7 +34,7 @@
 **Counted as a miss** (`no_answer_attempts + 1`): **no answer, busy, voicemail**.
 
 **When the count reaches the limit (default 3)** the engagement becomes terminal
-**`abandoned_no_answer`** ("Abandoned — no answer") and dialing stops.
+**`abandoned_no_answer`** (shown on the dashboard as "Abandoned: no answer") and dialing stops.
 Source: `apply_phone_event` (0114), `phone_engagements.no_answer_limit` default 3 (0057).
 
 Typical timeline, first dial at 10:00:
@@ -112,3 +112,16 @@ Typical timeline, first dial at 10:00:
 - "Answered" counts before 2026-10-04 are inflated (ringing was recorded as answered, fixed in #328).
 - 2026-10-02 had zero dials (no_session bug, fixed in #326). 2026-10-04 had zero real dials (agent-join barrier outage, fixed in #332).
 - Use **consent given** as the true pickup measure for 2026-10-01 to 2026-10-03.
+
+## 7. Dashboard (from PR "dashboard dial status, call recordings, candidate search")
+
+- **Status column:** a queued candidate who has been dialed reads **"Queued (dialed N)"**, where N counts
+  every call that reached the phone across all cycles (lease-reclaimed legs and reconnects included;
+  infra deferrals, provider errors and calls cancelled before ringing excluded). This is NOT the
+  per-cycle no-answer counter in section 3. Finished phone outcomes show their own label instead,
+  e.g. **"Abandoned: no answer"**, "Opted out", "Wrong number".
+- **Call recordings:** every answered call with a ready recording can be played on the candidate page,
+  including calls that ended before consent (tagged "Recorded before consent"). Each playback mints a
+  short-lived link and is audited; quarantined or deleted recordings are never playable.
+- **Search:** the Candidates page search matches name and email (and phone digits for users allowed
+  to see phone numbers), and is kept in the URL as `?q=`.
