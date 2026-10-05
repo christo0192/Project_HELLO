@@ -796,6 +796,12 @@ export interface CandidatePhoneAttempt {
   answered_at: string | null;
   ended_at: string | null;
   state: string;
+  /**
+   * Why an `abandoned` attempt was abandoned (0083). 'infra_deferred' = never
+   * placed (no carrier contacted); null on an abandoned attempt = its lease
+   * was reclaimed mid-call, i.e. the call was placed and then interrupted.
+   */
+  abandon_reason: 'infra_deferred' | null;
   outcome_class: string | null;
   duration_sec: number | null;
   recording: { state: PhoneAttemptRecordingState; reason?: 'access_unavailable' | 'no_recording' | 'recording_failed' };

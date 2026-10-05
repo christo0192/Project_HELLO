@@ -148,9 +148,9 @@ export function PhoneAttemptHistory({
                     <span aria-hidden="true" className="text-ink-tertiary"> · </span>
                     <span
                       className="text-ink-secondary"
-                      title={attemptRawStatus(attempt.outcome_class, attempt.state)}
+                      title={attemptRawStatus(attempt.outcome_class, attempt.state, attempt.abandon_reason)}
                     >
-                      {attemptOutcomeLabel(attempt.outcome_class, attempt.state)}
+                      {attemptOutcomeLabel(attempt.outcome_class, attempt.state, attempt.abandon_reason)}
                     </span>
                   </p>
                   <p className="text-meta tabular-nums text-ink-tertiary">

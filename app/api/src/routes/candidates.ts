@@ -454,7 +454,7 @@ candidatesRouter.get(
 
       let attemptQuery = supabase
         .from('phone_call_attempts')
-        .select('id,attempt_seq,admitted_at,answered_at,ended_at,state,outcome_class,session_id,recording_session_id,recording_object_key,recording_sha256,recording_size_bytes,recording_content_type,recording_ready,recording_quarantined,recording_deleted_at,egress_status')
+        .select('id,attempt_seq,admitted_at,answered_at,ended_at,state,abandon_reason,outcome_class,session_id,recording_session_id,recording_object_key,recording_sha256,recording_size_bytes,recording_content_type,recording_ready,recording_quarantined,recording_deleted_at,egress_status')
         .in('engagement_id', engagementIds)
         .order('admitted_at', { ascending: false })
         .order('id', { ascending: false })
@@ -473,6 +473,7 @@ candidatesRouter.get(
         answered_at: string | null;
         ended_at: string | null;
         state: string;
+        abandon_reason?: string | null;
         outcome_class: string | null;
         session_id: string | null;
         recording_session_id: string | null;
@@ -576,6 +577,12 @@ candidatesRouter.get(
             answered_at: row.answered_at,
             ended_at: row.ended_at,
             state: row.state,
+            // Why an `abandoned` attempt was abandoned (0083). Only
+            // 'infra_deferred' (never placed: no carrier contacted) is a
+            // member of the CHECK; NULL on an abandoned row means the lease
+            // was reclaimed mid-call. Projected through that one-value
+            // allowlist so nothing else can ever be echoed.
+            abandon_reason: row.abandon_reason === 'infra_deferred' ? 'infra_deferred' : null,
             outcome_class: row.outcome_class,
             duration_sec: attemptDurationSeconds(row.answered_at, row.ended_at),
             recording: {

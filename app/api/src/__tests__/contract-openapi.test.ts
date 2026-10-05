@@ -1415,6 +1415,31 @@ describe('OpenAPI document integrity', () => {
     ).toBeGreaterThan(0);
   });
 
+  it('CandidatePhoneAttempt requires abandon_reason and allows only infra_deferred or null', () => {
+    const base = {
+      id: '00000000-0000-4000-8000-000000000111',
+      attempt_seq: 1,
+      admitted_at: '2026-09-25T13:00:00.000Z',
+      answered_at: '2026-09-25T13:00:01.000Z',
+      ended_at: '2026-09-25T13:00:09.000Z',
+      state: 'abandoned',
+      abandon_reason: null as unknown,
+      outcome_class: null,
+      duration_sec: 8,
+      recording: { state: 'unavailable', reason: 'no_recording' },
+      transcript: null,
+    };
+    // Lease reclaim (null) and infra defer are both documented shapes.
+    expect(validateNamed(base, 'CandidatePhoneAttempt', spec)).toEqual([]);
+    expect(validateNamed({ ...base, abandon_reason: 'infra_deferred' }, 'CandidatePhoneAttempt', spec)).toEqual([]);
+    // Nothing outside the 0083 CHECK may be documented as a valid value.
+    expect(validateNamed({ ...base, abandon_reason: 'lease_reclaimed' }, 'CandidatePhoneAttempt', spec).length)
+      .toBeGreaterThan(0);
+    // Required, not merely documented: the label split depends on it.
+    const { abandon_reason: _omitted, ...missing } = base;
+    expect(validateNamed(missing, 'CandidatePhoneAttempt', spec).length).toBeGreaterThan(0);
+  });
+
   it('documents every route the app registers and nothing else', () => {
     const app = createContractApp();
     const documented = [...documentedOperations().keys()];

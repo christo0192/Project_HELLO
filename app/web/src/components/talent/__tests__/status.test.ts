@@ -174,6 +174,32 @@ describe('attemptOutcomeLabel', () => {
   it('keeps the raw pair for an operator tooltip', () => {
     expect(attemptRawStatus('no_answer', 'ended')).toBe('state: ended · outcome: no_answer');
     expect(attemptRawStatus(null, 'ringing')).toBe('state: ringing');
+    expect(attemptRawStatus(null, 'abandoned', 'infra_deferred'))
+      .toBe('state: abandoned · abandon_reason: infra_deferred');
+    expect(attemptRawStatus(null, 'abandoned', null)).toBe('state: abandoned');
+  });
+});
+
+describe('abandoned attempts (0083 abandon_reason)', () => {
+  it('says "Not placed" only for an infra defer, where no carrier was contacted', () => {
+    expect(attemptOutcomeLabel(null, 'abandoned', 'infra_deferred')).toBe('Not placed');
+  });
+
+  it('says "Call interrupted" for a lease-reclaimed attempt (reason null), never "Not placed"', () => {
+    expect(attemptOutcomeLabel(null, 'abandoned', null)).toBe('Call interrupted');
+    // A caller or payload without the field is not evidence of an infra
+    // defer either: these calls were placed, often answered and recorded.
+    expect(attemptOutcomeLabel(null, 'abandoned')).toBe('Call interrupted');
+    expect(attemptOutcomeLabel(null, 'abandoned', undefined)).toBe('Call interrupted');
+  });
+
+  it('lets a recorded outcome win over the abandon reason', () => {
+    expect(attemptOutcomeLabel('no_answer', 'abandoned', null)).toBe('No answer');
+    expect(attemptOutcomeLabel('provider_error', 'abandoned', 'infra_deferred')).toBe("Couldn't connect");
+  });
+
+  it('ignores abandon_reason on non-abandoned states', () => {
+    expect(attemptOutcomeLabel(null, 'ringing', 'infra_deferred')).toBe('Ringing');
   });
 });
 

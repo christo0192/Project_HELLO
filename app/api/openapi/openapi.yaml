@@ -10085,7 +10085,7 @@ components:
 
     CandidatePhoneAttempt:
       type: object
-      required: [id, attempt_seq, admitted_at, answered_at, ended_at, state, outcome_class, duration_sec, recording, transcript]
+      required: [id, attempt_seq, admitted_at, answered_at, ended_at, state, abandon_reason, outcome_class, duration_sec, recording, transcript]
       properties:
         id:
           type: string
@@ -10106,6 +10106,11 @@ components:
           nullable: true
         state:
           type: string
+        abandon_reason:
+          type: string
+          enum: [infra_deferred]
+          nullable: true
+          description: Why an abandoned attempt was abandoned (0083). infra_deferred means the call was never placed (no carrier contacted). null on an abandoned attempt means its lease was reclaimed mid-call (the call was placed and then interrupted); null on any other state carries no meaning. Any other stored value is reported as null.
         outcome_class:
           type: string
           nullable: true

@@ -68,4 +68,39 @@ describe('PhoneAttemptHistory', () => {
     await waitFor(() => expect(opened).toHaveBeenCalledWith('https://storage.invalid/signed', '_blank', 'noopener,noreferrer'));
     opened.mockRestore();
   });
+
+  it('labels a lease-reclaimed attempt "Call interrupted" and only an infra defer "Not placed"', async () => {
+    getCandidatePhoneAttempts.mockResolvedValue({
+      attempts: [
+        {
+          ...ATTEMPT,
+          id: '00000000-0000-4000-8000-000000000011',
+          attempt_seq: 2,
+          state: 'abandoned',
+          abandon_reason: null,
+          outcome_class: null,
+          recording: { state: 'ready' },
+          transcript: null,
+        },
+        {
+          ...ATTEMPT,
+          id: '00000000-0000-4000-8000-000000000012',
+          attempt_seq: 1,
+          state: 'abandoned',
+          abandon_reason: 'infra_deferred',
+          outcome_class: null,
+          answered_at: null,
+          duration_sec: null,
+          transcript: null,
+        },
+      ],
+      next_cursor: null,
+    });
+    renderHistory();
+    const interrupted = await screen.findByText('Call interrupted');
+    expect(interrupted).toHaveAttribute('title', 'state: abandoned');
+    const notPlaced = screen.getByText('Not placed');
+    expect(notPlaced).toHaveAttribute('title', 'state: abandoned · abandon_reason: infra_deferred');
+    expect(screen.getAllByText('Not placed')).toHaveLength(1);
+  });
 });

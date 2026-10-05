@@ -153,4 +153,40 @@ describe('candidate phone-attempt history', () => {
     expect(res.status).toBe(200);
     expect(res.body.attempts[0].recording).toEqual({ state: 'unavailable', reason: 'recording_failed' });
   });
+
+  it('selects abandon_reason and returns it so an infra defer and a lease reclaim can be told apart', async () => {
+    const selects: string[] = [];
+    vi.mocked(supabase.from).mockImplementation((table: string) => {
+      const c = chain(table, table === 'phone_call_attempts' ? attempts : []);
+      const select = c.select;
+      c.select = (columns: string) => {
+        if (table === 'phone_call_attempts') selects.push(columns);
+        return select(columns);
+      };
+      return c as never;
+    });
+    attempts = [
+      { ...row(IDS[0], TIED), state: 'abandoned', outcome_class: null, abandon_reason: 'infra_deferred' },
+      { ...row(IDS[1], TIED), state: 'abandoned', outcome_class: null, abandon_reason: null },
+      row(IDS[2], '2026-09-24T13:00:00.000Z'),
+    ];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.status).toBe(200);
+    expect(selects.some((columns) => columns.split(',').includes('abandon_reason'))).toBe(true);
+    expect(res.body.attempts.map((a: { abandon_reason: unknown }) => a.abandon_reason))
+      .toEqual(['infra_deferred', null, null]);
+  });
+
+  it('never echoes an abandon_reason outside the 0083 CHECK allowlist', async () => {
+    attempts = [
+      { ...row(IDS[0], TIED), state: 'abandoned', outcome_class: null, abandon_reason: 'free text from somewhere' },
+      { ...row(IDS[1], TIED), state: 'abandoned', outcome_class: null },
+    ];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.status).toBe(200);
+    expect(res.body.attempts[0].abandon_reason).toBeNull();
+    // A row from a select that somehow lacks the column still serializes the
+    // key (null), so the required openapi property is always present.
+    expect(res.body.attempts[1]).toHaveProperty('abandon_reason', null);
+  });
 });

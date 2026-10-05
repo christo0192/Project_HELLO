@@ -129,16 +129,29 @@ const ATTEMPT_STATE_LABELS: Readonly<Record<string, string>> = {
   human: 'Answered',
   machine: 'Answering machine',
   ended: 'Ended',
-  abandoned: 'Not placed',
+  // `abandoned` is split by `abandon_reason` (0083) in attemptOutcomeLabel:
+  // only an infra defer was never placed; a lease reclaim (reason NULL) was a
+  // real call, usually answered, that our side lost mid-call.
+  abandoned: 'Call interrupted',
   completed: 'Completed',
 };
 
-/** What happened on one dial, in a recruiter's words (humanized floor). */
+/**
+ * What happened on one dial, in a recruiter's words (humanized floor).
+ *
+ * An `abandoned` attempt with no outcome reads "Not placed" ONLY when its
+ * `abandon_reason` is 'infra_deferred' (no carrier was contacted). Every
+ * other abandoned attempt, including a missing reason, is a lease reclaim:
+ * the call was placed and then interrupted, so it never claims "Not placed"
+ * beside a call that may have a recording.
+ */
 export function attemptOutcomeLabel(
   outcome: string | null | undefined,
   state: string | null | undefined,
+  abandonReason?: string | null,
 ): string {
   if (outcome) return humanizeEnum(outcome, ATTEMPT_OUTCOME_LABELS);
+  if (state === 'abandoned' && abandonReason === 'infra_deferred') return 'Not placed';
   return humanizeEnum(state, ATTEMPT_STATE_LABELS) || 'Unknown';
 }
 
@@ -146,8 +159,13 @@ export function attemptOutcomeLabel(
 export function attemptRawStatus(
   outcome: string | null | undefined,
   state: string | null | undefined,
+  abandonReason?: string | null,
 ): string {
-  return [state ? `state: ${state}` : null, outcome ? `outcome: ${outcome}` : null]
+  return [
+    state ? `state: ${state}` : null,
+    abandonReason ? `abandon_reason: ${abandonReason}` : null,
+    outcome ? `outcome: ${outcome}` : null,
+  ]
     .filter(Boolean)
     .join(' · ');
 }
