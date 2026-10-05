@@ -116,12 +116,18 @@ export function AshbyScopedReviewPage() {
         title={candidateDisplayName(candidate.name)}
         description={candidate.email ?? undefined}
         actions={
-          // The scoped payload carries no phone-progress fields, so this
-          // degrades to the stored status — through the same helper, so the
-          // words match the main candidate pages.
-          <StatusBadge tone={displayStatus.tone}>
-            <span title={displayStatus.title}>{displayStatus.label}</span>
-          </StatusBadge>
+          // The scoped payload carries the same phone-progress fields as
+          // GET /api/candidates/:id, through the same helper, so the words
+          // match the main candidate pages ("Abandoned: no answer", not a
+          // stale "Queued").
+          <span className="flex flex-col items-end gap-0.5 text-right">
+            <StatusBadge tone={displayStatus.tone}>
+              <span title={displayStatus.title}>{displayStatus.label}</span>
+            </StatusBadge>
+            {displayStatus.detail && (
+              <span className="text-meta text-[var(--c-ink-secondary)]">{displayStatus.detail}</span>
+            )}
+          </span>
         }
       />
 

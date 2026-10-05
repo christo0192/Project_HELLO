@@ -807,7 +807,8 @@ export type PhoneAttemptRecordingReason =
   | 'no_recording'
   | 'recording_failed'
   | 'quarantined'
-  | 'deleted';
+  | 'deleted'
+  | 'revoked';
 export type PhoneAttemptTranscriptKind = 'gate_only' | 'session';
 
 export interface CandidatePhoneAttempt {

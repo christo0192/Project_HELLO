@@ -492,7 +492,10 @@ describe('CandidateDetailPage', () => {
     // Header badge + Overview "Status" field: one derivation, same words.
     const badges = screen.getAllByText('Queued (dialed 3)');
     expect(badges.length).toBe(2);
-    expect(badges[0]).toHaveAttribute('title', expect.stringContaining('Phone: Awaiting retry'));
+    expect(badges[0]).toHaveAttribute('title', expect.stringContaining('Phone cycle – Awaiting retry'));
+    // The same facts are VISIBLE under the header badge, not hover-only.
+    const detail = document.querySelector('[data-phone-status-detail]');
+    expect(detail?.textContent).toMatch(/Phone reached 3 times .* · Last dialed/);
   });
 
   it('names an abandoned_no_answer cycle in the header, never "Queued"', async () => {
@@ -507,7 +510,7 @@ describe('CandidateDetailPage', () => {
     });
     renderDetailPage();
     await screen.findByText('Jane Doe');
-    expect(screen.getAllByText('Abandoned: no answer (dialed 5)').length).toBe(2);
+    expect(screen.getAllByText('Abandoned: no answer').length).toBe(2);
     expect(screen.queryByText('Queued')).toBeNull();
   });
 

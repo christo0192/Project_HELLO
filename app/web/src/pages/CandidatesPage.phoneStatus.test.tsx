@@ -120,7 +120,7 @@ describe('CandidatesPage phone status', () => {
     await screen.findByText('Dialled Dee');
     const badge = within(rowFor('Dialled Dee')).getByText('Queued (dialed 3)');
     expect(badge).toHaveAttribute('title', expect.stringContaining('Status: queued'));
-    expect(badge).toHaveAttribute('title', expect.stringContaining('Phone: Awaiting retry'));
+    expect(badge).toHaveAttribute('title', expect.stringContaining('Phone cycle – Awaiting retry'));
     expect(badge).toHaveAttribute('title', expect.stringContaining('Last dialed'));
   });
 
@@ -130,14 +130,32 @@ describe('CandidatesPage phone status', () => {
     const row = rowFor('Unknown Uma');
     expect(within(row).getByText('Queued')).toBeInTheDocument();
     expect(within(row).queryByText(/dialed/)).toBeNull();
+    // ...and the page says once that some statuses may be the stored value,
+    // so a failed phone read never silently turns "Abandoned" into "Queued".
+    expect(screen.getByText(/Phone progress could not be loaded for some candidates/)).toBeInTheDocument();
+    expect(within(row).getByText('Queued')).toHaveAttribute(
+      'title',
+      expect.stringContaining('Phone progress unavailable'),
+    );
+  });
+
+  it('shows no phone-progress notice when every count is known', async () => {
+    mockApi.listCandidates.mockResolvedValue(CANDIDATES.filter((c) => c.dial_count !== null));
+    renderPage();
+    await screen.findByText('Dialled Dee');
+    expect(screen.queryByText(/Phone progress could not be loaded/)).toBeNull();
   });
 
   it('names an abandoned cycle, with the reason in the tooltip', async () => {
     renderPage();
     await screen.findByText('Abandoned Abe');
     const row = rowFor('Abandoned Abe');
-    const badge = within(row).getByText('Abandoned: no answer (dialed 5)');
+    const badge = within(row).getByText('Abandoned: no answer');
     expect(badge).toHaveAttribute('title', expect.stringContaining('No answer after every attempt'));
+    // The tooltip's facts reach a screen reader too (sr-only, beside the badge).
+    expect(
+      within(row).getByText(/^, No answer after every attempt · Phone reached 5 times/, { selector: '.sr-only' }),
+    ).toBeInTheDocument();
     // Its next action restates the outcome; it is not a "Queued" row.
     expect(within(row).getByText('No answer after every attempt', { selector: '.sr-only' })).toBeInTheDocument();
     expect(within(row).queryByText('Queued for screening')).toBeNull();
@@ -216,7 +234,10 @@ describe('CandidatesPage phone status', () => {
     const { unmount } = renderPage();
     await screen.findByText('Wrong Wes');
     expect(within(statusGroup()).getByRole('button', { name: /^Wrong number/ })).toBeInTheDocument();
-    expect(within(rowFor('Wrong Wes')).getByText('Wrong number (dialed 1)')).toBeInTheDocument();
+    // The badge (its title starts with the raw status), not the next-action cell.
+    expect(
+      within(rowFor('Wrong Wes')).getByText('Wrong number', { selector: 'span[title^="Status:"]' }),
+    ).toBeInTheDocument();
     unmount();
 
     mockApi.listCandidates.mockResolvedValue(CANDIDATES);

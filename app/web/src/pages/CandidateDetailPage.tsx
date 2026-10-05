@@ -228,9 +228,10 @@ export function CandidateDetailPage() {
   }, [roleId]);
 
   // ONE attempt list for the page, shared by the Overview rail and the Review
-  // tab's call recordings. `Tabs` keeps both panels mounted, so two
-  // self-loading copies would fetch it twice on every load. Loaded once the
-  // page itself has loaded, as the Overview copy always was.
+  // tab's call recordings. Each copy is mounted only while its tab is open
+  // (one player at a time), so self-loading copies would refetch on every tab
+  // switch. Loaded once the page itself has loaded, as the Overview copy
+  // always was; reset whenever the candidate changes.
   const phoneAttempts = usePhoneAttemptHistory(id ?? "", Boolean(id && detail && me));
 
   // Silent refresh: re-read the candidate (its session list feeds the Review
@@ -352,6 +353,14 @@ export function CandidateDetailPage() {
             <StatusBadge tone={displayStatus.tone}>
               <span title={displayStatus.title}>{displayStatus.label}</span>
             </StatusBadge>
+            {/* The tooltip's phone facts as visible text: why the cycle ended,
+                how often the phone was reached and when, for keyboard, touch
+                and screen-reader users too. */}
+            {displayStatus.detail && (
+              <span data-phone-status-detail="" className="text-meta text-[var(--c-ink-secondary)]">
+                {displayStatus.detail}
+              </span>
+            )}
             <CandidateHeadlineFacts
               roleTitle={roleTitle}
               callSeconds={longestSession?.duration_sec ?? null}
@@ -386,6 +395,7 @@ export function CandidateDetailPage() {
                   sessions={sessions}
                   phoneRole={me.role}
                   phoneAttempts={phoneAttempts}
+                  showPhoneAttempts={tab === "overview"}
                   onSessionCompleted={refresh}
                   callInHeader={!reviewable}
                   callRequest={callRequest}
@@ -403,14 +413,21 @@ export function CandidateDetailPage() {
                   sessions={sessions}
                   assessments={assessments}
                   blocked={decisionBlocked}
+                  // Mounted only while Review is the open tab (and the Overview
+                  // copy only while Overview is): one player on the page at a
+                  // time, and switching tabs unmounts the <audio>, so nothing
+                  // keeps playing in a hidden panel. The list itself is the
+                  // shared `phoneAttempts`, so remounting never refetches.
                   callRecordings={
-                    <PhoneAttemptHistory
-                      candidateId={candidate.id}
-                      role={me.role}
-                      source={phoneAttempts}
-                      title="Call recordings"
-                      description="Calls that ended before a screening completed, including at the consent step. Recordings play here on request."
-                    />
+                    tab === "review" ? (
+                      <PhoneAttemptHistory
+                        candidateId={candidate.id}
+                        role={me.role}
+                        source={phoneAttempts}
+                        title="Call recordings"
+                        description="Calls that ended before a screening completed, including at the consent step. Recordings play here on request."
+                      />
+                    ) : null
                   }
                 />
               ),
@@ -501,6 +518,7 @@ function OverviewTab({
   sessions,
   phoneRole,
   phoneAttempts,
+  showPhoneAttempts,
   onSessionCompleted,
   callInHeader,
   callRequest,
@@ -513,6 +531,8 @@ function OverviewTab({
   phoneRole: MeResponse["role"];
   /** The page's shared attempt list (see `usePhoneAttemptHistory`). */
   phoneAttempts: PhoneAttemptHistorySource;
+  /** False while another tab is open: unmounts the player (see the page). */
+  showPhoneAttempts: boolean;
   onSessionCompleted?: () => void;
   callInHeader: boolean;
   callRequest: number;
@@ -538,7 +558,9 @@ function OverviewTab({
 
         <SessionsSummary sessions={sessions} />
 
-        <PhoneAttemptHistory candidateId={candidate.id} role={phoneRole} source={phoneAttempts} />
+        {showPhoneAttempts && (
+          <PhoneAttemptHistory candidateId={candidate.id} role={phoneRole} source={phoneAttempts} />
+        )}
 
         <NotesSection candidateId={candidate.id} />
       </div>

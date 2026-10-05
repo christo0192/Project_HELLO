@@ -1997,7 +1997,7 @@ describe('GET /api/recordings/attempts/:attemptId/download (0107)', () => {
       // A worker clip of a leg that never reached consent: session_id is
       // bound only at consent (0107), the parent never completed and has no
       // session-level recording.
-      configureAttempt({ session_id: null, recording_session_id: SESSION }, { recording_object_key: null });
+      configureAttempt({ session_id: null, recording_session_id: SESSION }, { recording_object_key: null, status: 'failed' });
       const entries: Array<Record<string, any>> = [];
       const res = await request(appCapturingAudit('admin', 'admin-1', entries))
         .get(`/api/recordings/attempts/${ATTEMPT}/download`)
@@ -2036,8 +2036,37 @@ describe('GET /api/recordings/attempts/:attemptId/download (0107)', () => {
       expect(download?.metadata).toMatchObject({ scope: 'attempt', pre_consent: false });
     });
 
+    it('uses the SAME classification as the attempt history: unbound leg under a completed parent', async () => {
+      // A pre-0107 leg may have consented: the history reports consent_stage
+      // null for it, so the audit must not claim a pre-consent access either.
+      configureAttempt(
+        { session_id: null, recording_session_id: SESSION, outcome_class: 'completed' },
+        { status: 'completed' },
+      );
+      const unknown: Array<Record<string, any>> = [];
+      const res = await request(appCapturingAudit('admin', 'admin-1', unknown))
+        .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+        .set('Authorization', AUTH_HEADER);
+      expect(res.status).toBe(200);
+      expect(unknown.find((e) => e.event === 'recording.download')?.metadata)
+        .toMatchObject({ scope: 'attempt', pre_consent: null });
+
+      // ...but a pre-consent OUTCOME under that completed parent is still
+      // before consent, exactly as the history tags it.
+      configureAttempt(
+        { session_id: null, recording_session_id: SESSION, outcome_class: 'abandoned_pre_disclosure' },
+        { status: 'completed' },
+      );
+      const pre: Array<Record<string, any>> = [];
+      await request(appCapturingAudit('admin', 'admin-1', pre))
+        .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+        .set('Authorization', AUTH_HEADER);
+      expect(pre.find((e) => e.event === 'recording.download')?.metadata)
+        .toMatchObject({ scope: 'attempt', pre_consent: true });
+    });
+
     it('lets a viewer play pre-consent audio and audits it with the viewer role', async () => {
-      configureAttempt({ session_id: null, recording_session_id: SESSION }, { owner_id: null });
+      configureAttempt({ session_id: null, recording_session_id: SESSION }, { owner_id: null, status: 'expired' });
       const entries: Array<Record<string, any>> = [];
       const res = await request(appCapturingAudit('viewer', 'viewer-1', entries))
         .get(`/api/recordings/attempts/${ATTEMPT}/download`)

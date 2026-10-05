@@ -22,8 +22,8 @@ import { api, ApiError } from '../../api';
 import type { Candidate, PhoneCandidateAppointmentCreateInput, PhoneSlot } from '../../types';
 import { GlassPanel, SectionHeader, SelectField } from '../design';
 import { ConfirmButton } from '../mission-control/ConfirmButton';
-import { humanizeEnum } from '../../lib/humanize';
 import { formatIstLongDayLabel, formatIstTimeRange, type IstDate } from '../../lib/ist-datetime';
+import { candidateDisplayStatus } from '../talent/status';
 import { PhoneCloseButton } from './PhoneCloseButton';
 import { PhoneSlotPicker } from './PhoneSlotPicker';
 
@@ -109,7 +109,7 @@ export function PhoneBookingPanel({ onCreate, today, id, onClose }: PhoneBooking
               <option value="">Select a candidate</option>
               {candidates.map((candidate) => (
                 <option key={candidate.id} value={candidate.id}>
-                  {candidate.name ?? 'Candidate'} · {humanizeEnum(candidate.status)}
+                  {candidate.name ?? 'Candidate'} · {candidateDisplayStatus(candidate).label}
                 </option>
               ))}
             </SelectField>

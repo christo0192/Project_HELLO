@@ -16,7 +16,7 @@
  *      viewer-level, so the reason crosses only through a closed allowlist.
  */
 
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import request from 'supertest';
@@ -137,6 +137,18 @@ describe('isReachedDial', () => {
     expect(isReachedDial({ state: 'ringing', abandon_reason: null, outcome_class: null })).toBe(true);
   });
 
+  it('EXCLUDES a cancelled / window_closed attempt with no answer: ended before any evidence it rang', () => {
+    // apply_phone_event (0095, 0113) ends an attempt still in `admitted` with
+    // outcome 'cancelled' on hr.cancelled / emergency.stop / stage_left /
+    // prereq.lost, before any originate.
+    for (const outcome of ['cancelled', 'window_closed']) {
+      expect(isReachedDial({ state: 'ended', abandon_reason: null, outcome_class: outcome, answered_at: null })).toBe(false);
+      expect(isReachedDial({ state: 'ended', abandon_reason: null, outcome_class: outcome })).toBe(false);
+      // Answered, then cancelled mid-call: it reached the phone.
+      expect(isReachedDial({ state: 'ended', abandon_reason: null, outcome_class: outcome, answered_at: T(1) })).toBe(true);
+    }
+  });
+
   it('infra_deferred only excludes when the attempt is actually abandoned', () => {
     // 0083 stamps the reason only on abandoned rows; the SQL form is
     // `state <> 'abandoned' OR abandon_reason IS DISTINCT FROM 'infra_deferred'`.
@@ -163,17 +175,52 @@ describe('reducePhoneProgress', () => {
     expect(m.get('c1')?.dial_count).toBe(2);
   });
 
-  it('sums dials across every cycle, and takes the state from the HIGHEST cycle', () => {
+  it('sums dials across every cycle; with every cycle terminal, the NEWEST engagement gives the state', () => {
     const m = reducePhoneProgress([
-      engagement('c1', { cycle_number: 3, created_at: T(1), state: 'abandoned_no_answer', state_reason: 'no_answer_budget_exhausted', phone_call_attempts: [attempt(), attempt()] }),
-      engagement('c1', { cycle_number: 1, created_at: T(5), state: 'failed', state_reason: 'assessment_aborted', phone_call_attempts: [attempt()] }),
+      engagement('c1', { cycle_number: 1, created_at: T(1), state: 'failed', state_reason: 'assessment_aborted', phone_call_attempts: [attempt(), attempt()] }),
+      engagement('c1', { cycle_number: 3, created_at: T(5), state: 'abandoned_no_answer', state_reason: 'no_answer_budget_exhausted', phone_call_attempts: [attempt()] }),
       engagement('c1', { cycle_number: 2, created_at: T(3), state: 'cancelled', phone_call_attempts: [attempt(), attempt()] }),
     ]);
     const p = m.get('c1')!;
     expect(p.dial_count).toBe(5);
-    // Cycle 3 wins even though cycle 1 was created later.
     expect(p.phone_state).toBe('abandoned_no_answer');
     expect(p.phone_state_reason).toBe('no_answer_budget_exhausted');
+  });
+
+  // cycle_number is scoped PER APPLICATION LINK (0057), and a candidate may
+  // have several links, so it cannot order engagements across links.
+  it('two links: a LIVE cycle on link B beats a terminal, higher-numbered cycle on link A', () => {
+    const m = reducePhoneProgress([
+      // Link A, cycle 2, terminal.
+      engagement('c1', { cycle_number: 2, created_at: T(2), state: 'abandoned_no_answer', state_reason: 'no_answer_budget_exhausted', phone_call_attempts: [attempt(), attempt()] }),
+      // Link B, cycle 1, still dialling.
+      engagement('c1', { cycle_number: 1, created_at: T(4), state: 'dialing', phone_call_attempts: [attempt({ state: 'admitted', outcome_class: null })] }),
+    ]);
+    expect(m.get('c1')).toMatchObject({ dial_count: 3, phone_state: 'dialing', phone_state_reason: null });
+  });
+
+  it('two links: an OLDER live cycle still beats a newer terminal one', () => {
+    const m = reducePhoneProgress([
+      engagement('c1', { cycle_number: 1, created_at: T(1), state: 'awaiting_retry' }),
+      engagement('c1', { cycle_number: 1, created_at: T(6), state: 'wrong_number', state_reason: 'wrong_number' }),
+    ]);
+    expect(m.get('c1')?.phone_state).toBe('awaiting_retry');
+  });
+
+  it('two links, both terminal: the newer engagement wins whatever its cycle_number', () => {
+    const m = reducePhoneProgress([
+      engagement('c1', { cycle_number: 3, created_at: T(1), state: 'abandoned_no_answer' }),
+      engagement('c1', { cycle_number: 1, created_at: T(5), state: 'completed' }),
+    ]);
+    expect(m.get('c1')?.phone_state).toBe('completed');
+  });
+
+  it('two live cycles: the newer one wins', () => {
+    const m = reducePhoneProgress([
+      engagement('c1', { cycle_number: 2, created_at: T(1), state: 'eligible' }),
+      engagement('c1', { cycle_number: 1, created_at: T(3), state: 'in_call' }),
+    ]);
+    expect(m.get('c1')?.phone_state).toBe('in_call');
   });
 
   it('breaks a cycle_number tie by newest created_at', () => {
@@ -445,6 +492,32 @@ const DIALLED = [
 ];
 
 describe('GET /api/candidates — phone progress fields', () => {
+  beforeEach(() => { vi.stubEnv('PHONE_SCREENING_ENABLED', 'true'); });
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  it('reads NO phone table while PHONE_SCREENING_ENABLED is off (like /:id/phone-cycles): no phone facts', async () => {
+    vi.stubEnv('PHONE_SCREENING_ENABLED', 'false');
+    configure({ candidates: ok([candidateRow('cand_a')]), assessments: ok([]), phone_engagements: ok(DIALLED) });
+    const res = await request(appFor(admin)).get('/api/candidates').set('Authorization', AUTH);
+    expect(res.status).toBe(200);
+    expect(fromCalls).not.toContain('phone_engagements');
+    expect(res.body[0]).toMatchObject({ dial_count: 0, phone_state: null, phone_state_reason: null, last_dialed_at: null });
+  });
+
+  it('phone_state_reason is interviewer+ only; a viewer keeps the state but never the reason', async () => {
+    const cases: Array<[AuthUser, string | null]> = [
+      [viewer, null],
+      [interviewer, 'no_answer_budget_exhausted'],
+      [admin, 'no_answer_budget_exhausted'],
+    ];
+    for (const [user, reason] of cases) {
+      configure({ candidates: ok([candidateRow('cand_a')]), assessments: ok([]), phone_engagements: ok(DIALLED) });
+      const res = await request(appFor(user)).get('/api/candidates').set('Authorization', AUTH);
+      expect(res.body[0].phone_state).toBe('abandoned_no_answer');
+      expect(res.body[0].phone_state_reason).toBe(reason);
+    }
+  });
+
   it('adds dial_count, phone_state, phone_state_reason and last_dialed_at to every row', async () => {
     configure({
       candidates: ok([candidateRow('cand_a'), candidateRow('cand_b', { status: 'new' })]),
@@ -558,6 +631,18 @@ describe('GET /api/candidates — phone progress fields', () => {
 });
 
 describe('GET /api/candidates/:id — phone progress fields', () => {
+  beforeEach(() => { vi.stubEnv('PHONE_SCREENING_ENABLED', 'true'); });
+  afterEach(() => { vi.unstubAllEnvs(); });
+
+  it('a viewer gets no phone_state_reason on the detail either', async () => {
+    configure({
+      candidates: ok(candidateRow(CAND_ID)), call_sessions: ok([]), assessments: ok([]),
+      phone_engagements: ok([engagement(CAND_ID, { state: 'opted_out', state_reason: 'candidate_opt_out' })]),
+    });
+    const res = await request(appFor(viewer)).get(`/api/candidates/${CAND_ID}`).set('Authorization', AUTH);
+    expect(res.body.candidate).toMatchObject({ phone_state: 'opted_out', phone_state_reason: null });
+  });
+
   it('candidate carries the same four fields, read for the authorized id only', async () => {
     configure({
       candidates: ok(candidateRow(CAND_ID)),

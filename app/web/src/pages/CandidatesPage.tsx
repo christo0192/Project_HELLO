@@ -72,6 +72,7 @@ import {
   RolePipelinePanel,
 } from "../components/talent";
 import {
+  anyPhoneProgressUnknown,
   buildCandidateSearch,
   candidateDisplayStatus,
   candidateNextAction,
@@ -544,6 +545,11 @@ export function CandidatesPage() {
   const active = hasActiveFilters(filters);
   const roleTitle = roles.find((r) => r.id === roleId)?.title;
 
+  const phoneProgressUnknown = useMemo(
+    () => anyPhoneProgressUnknown(candidates ?? []),
+    [candidates],
+  );
+
   // Live count per DISPLAY status from the currently loaded (role-scoped)
   // set: the same key the row badge and the status filter use.
   const statusCounts = useMemo(() => {
@@ -726,6 +732,17 @@ export function CandidatesPage() {
         <p role="status" className="sr-only">
           {searchAnnouncement}
         </p>
+
+        {/* A failed phone read reports dial_count null, and the status then
+            falls back to the stored value: an abandoned candidate reads
+            "Queued". Said once, so that is never silent. */}
+        {phoneProgressUnknown && (
+          <InlineNotice tone="warning" role="none" className="mt-3">
+            Phone progress could not be loaded for some candidates. Their status shows the stored
+            value, so a finished phone outcome (such as “Abandoned: no answer”) may read as
+            “Queued”. Reload the page to try again.
+          </InlineNotice>
+        )}
 
         {/* The list API stops at PostgREST's 1,000-row cap; a search over a
             capped list would silently miss the older rows. */}
@@ -1080,6 +1097,10 @@ export function CandidatesPage() {
                         <div className="flex flex-col items-start gap-1">
                           <StatusBadge tone={ds.tone}>
                             <span title={ds.title}>{ds.label}</span>
+                            {/* The tooltip's phone facts (reason, count,
+                                last dial) for screen-reader users, who never
+                                get a hover. */}
+                            {ds.detail && <span className="sr-only">{`, ${ds.detail}`}</span>}
                           </StatusBadge>
                           {/* Additive only: the candidate's own status is
                               unchanged and still first. */}

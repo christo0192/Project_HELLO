@@ -105,6 +105,8 @@ function unavailableRecordingLabel(reason: CandidatePhoneAttempt['recording']['r
       return 'Recording withheld (failed integrity check)';
     case 'deleted':
       return 'Recording deleted';
+    case 'revoked':
+      return 'Recording withdrawn';
     default:
       return 'No recording available';
   }
@@ -147,7 +149,12 @@ export function PhoneAttemptHistory({
   const audioRef = useRef<HTMLAudioElement>(null);
   // Position and play state carried across a "Refresh link" re-mint.
   const resumeRef = useRef<{ time: number; playing: boolean } | null>(null);
-  const focusOnReadyRef = useRef(false);
+  // The player's progress for a screen reader. ALWAYS mounted (a live region
+  // inserted together with its text is often not announced) and written on
+  // each step. Focus stays on the toggle, which controls the player: moving
+  // it to the <audio> once the asynchronous mint lands would pull it away
+  // from wherever the user had gone meanwhile. Errors use the row's alert.
+  const [announcement, setAnnouncement] = useState('');
 
   useEffect(() => {
     mountedRef.current = true;
@@ -161,6 +168,7 @@ export function PhoneAttemptHistory({
     audioGeneration.current += 1;
     resumeRef.current = null;
     setAudio(null);
+    setAnnouncement('');
   }, [candidateId]);
 
   const canPlay = typeof api.getAttemptRecordingDownloadUrl === 'function';
@@ -168,16 +176,19 @@ export function PhoneAttemptHistory({
   const mint = useCallback((attemptId: string) => {
     const gen = ++audioGeneration.current;
     setAudio({ attemptId, status: 'loading' });
+    setAnnouncement('Loading recording');
     Promise.resolve()
       .then(() => api.getAttemptRecordingDownloadUrl(attemptId))
       .then((result) => {
         if (!mountedRef.current || gen !== audioGeneration.current) return;
         setAudio({ attemptId, status: 'ready', url: result.url });
+        setAnnouncement('Recording ready. The player follows this button.');
       })
       .catch((cause: unknown) => {
         if (!mountedRef.current || gen !== audioGeneration.current) return;
         resumeRef.current = null;
         setAudio({ attemptId, status: 'error', ...attemptAudioError(cause) });
+        setAnnouncement('');
       });
   }, []);
 
@@ -187,31 +198,26 @@ export function PhoneAttemptHistory({
       audioGeneration.current += 1;
       resumeRef.current = null;
       setAudio(null);
+      setAnnouncement('');
       return;
     }
     resumeRef.current = null;
-    focusOnReadyRef.current = true;
     mint(attemptId);
   }
 
   function refresh(attemptId: string) {
     const el = audioRef.current;
     resumeRef.current = el ? { time: el.currentTime, playing: !el.paused } : null;
-    focusOnReadyRef.current = false;
     mint(attemptId);
   }
 
   const readyUrl = audio?.status === 'ready' ? audio.url : null;
-  // Once a freshly minted URL is on the <audio>: put keyboard focus on the
-  // controls after an open, or restore position after a refresh. Never
-  // autoplays on open: the gesture is gone after the async mint.
+  // Once a freshly minted URL is on the <audio> after a refresh, restore its
+  // position and play state. Never autoplays on open: the gesture is gone
+  // after the async mint.
   useEffect(() => {
     const el = audioRef.current;
     if (!readyUrl || !el) return;
-    if (focusOnReadyRef.current) {
-      focusOnReadyRef.current = false;
-      el.focus();
-    }
     const resume = resumeRef.current;
     if (!resume) return;
     resumeRef.current = null;
@@ -240,6 +246,11 @@ export function PhoneAttemptHistory({
         {title}
       </h2>
       <p className="mb-3 mt-0.5 text-label text-ink-tertiary">{description}</p>
+      {/* aria-live rather than role="status": the page already has status
+          regions of its own, and this one only narrates the player. */}
+      <p aria-live="polite" aria-atomic="true" data-player-announcer="" className="sr-only">
+        {announcement}
+      </p>
       {error ? (
         <div className="flex flex-wrap items-center gap-2">
           <p role="alert" className="text-sm text-ink-secondary">Attempt history unavailable.</p>
@@ -288,7 +299,15 @@ export function PhoneAttemptHistory({
                     )}
                   </div>
                   <div className="flex flex-wrap items-center justify-end gap-x-3 gap-y-1">
-                    {attempt.recording.state === 'ready' && canPlay ? (
+                    {attempt.recording.state === 'processing' && (
+                      <span className="text-xs text-ink-tertiary">Recording processing</span>
+                    )}
+                    {/* A processing clip gets the click too: for a worker gate
+                        clip whose finalize never completed, an explicit mint
+                        is the route's bounded recovery path (it re-runs the
+                        verifier and answers a retryable 409 while still not
+                        ready). */}
+                    {(attempt.recording.state === 'ready' || attempt.recording.state === 'processing') && canPlay ? (
                       <button
                         type="button"
                         className={ROW_ACTION}
@@ -296,11 +315,11 @@ export function PhoneAttemptHistory({
                         aria-controls={open ? playerId : undefined}
                         onClick={() => toggle(attempt.id)}
                       >
-                        {open ? 'Hide player' : 'Play recording'}
+                        {open
+                          ? 'Hide player'
+                          : attempt.recording.state === 'processing' ? 'Try to load recording' : 'Play recording'}
                       </button>
-                    ) : attempt.recording.state === 'processing' ? (
-                      <span className="text-xs text-ink-tertiary">Recording processing</span>
-                    ) : attempt.recording.state === 'ready' ? null : (
+                    ) : attempt.recording.state !== 'unavailable' ? null : (
                       <span className="text-xs text-ink-tertiary">
                         {unavailableRecordingLabel(attempt.recording.reason)}
                       </span>
@@ -323,7 +342,7 @@ export function PhoneAttemptHistory({
                     className="mt-2 space-y-1.5"
                   >
                     {open.status === 'loading' ? (
-                      <p role="status" className="text-meta text-ink-tertiary">Loading recording…</p>
+                      <p className="text-meta text-ink-tertiary">Loading recording…</p>
                     ) : open.status === 'error' ? (
                       <div role="alert" className="flex flex-wrap items-center gap-x-3 gap-y-1">
                         <p className="text-meta text-ink-secondary">{open.message}</p>
@@ -466,9 +485,15 @@ export function CandidateProfileCard({
         </Field>
         <Field label="Status">
           {/* The same derivation as the header and the list row. */}
-          <StatusBadge tone={displayStatus.tone}>
-            <span title={displayStatus.title}>{displayStatus.label}</span>
-          </StatusBadge>
+          <span className="flex flex-col items-end gap-0.5 text-right">
+            <StatusBadge tone={displayStatus.tone}>
+              <span title={displayStatus.title}>{displayStatus.label}</span>
+            </StatusBadge>
+            {/* Visible, not hover-only: the reason, count and last dial. */}
+            {displayStatus.detail && (
+              <span className="text-meta text-ink-tertiary">{displayStatus.detail}</span>
+            )}
+          </span>
         </Field>
         <div>
           <dt className="mb-1.5 text-xs font-medium text-ink-secondary">Skills</dt>

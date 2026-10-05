@@ -98,7 +98,7 @@ const REASON_SET: ReadonlySet<string> = new Set(PHONE_PROGRESS_REASON_ALLOWLIST)
 
 /** The exact embed this module reads. Named columns only. */
 export const PHONE_PROGRESS_SELECT =
-  'candidate_id, cycle_number, created_at, state, state_reason, phone_call_attempts ( state, abandon_reason, outcome_class, admitted_at )';
+  'candidate_id, cycle_number, created_at, state, state_reason, phone_call_attempts ( state, abandon_reason, outcome_class, admitted_at, answered_at )';
 
 export interface PhoneProgress {
   /** Dials that reached the phone, across every cycle. null = unknown. */
@@ -132,6 +132,7 @@ export interface RawAttemptRow {
   abandon_reason?: unknown;
   outcome_class?: unknown;
   admitted_at?: unknown;
+  answered_at?: unknown;
 }
 
 export interface RawEngagementRow {
@@ -153,15 +154,32 @@ export interface RawEngagementRow {
  *   one-per-IST-day index treats them as charged dials. COUNTED.
  * - `outcome_class = 'provider_error'`: the carrier refused the originate
  *   before ringing. NOT counted.
- * - Everything else, every attempt kind, including an in-flight `admitted`
+ * - `outcome_class` 'cancelled' or 'window_closed' with no `answered_at`:
+ *   apply_phone_event (0095, 0113) also ends an attempt still sitting in
+ *   `admitted` this way on hr.cancelled / emergency.stop / ashby.stage_left /
+ *   prereq.lost, before any originate. There is no evidence such an attempt
+ *   rang, so it is NOT counted. (A rare cancel that landed while an
+ *   unanswered call was ringing is undercounted by one: the label claims
+ *   "reached the phone", so it errs towards not claiming a ring.)
+ * - Everything else, every attempt kind (reconnect legs included: each is a
+ *   separate call that rang the candidate), including an in-flight `admitted`
  *   attempt. COUNTED.
  *
  * SQL equivalent: `(state <> 'abandoned' OR abandon_reason IS DISTINCT FROM
- * 'infra_deferred') AND outcome_class IS DISTINCT FROM 'provider_error'`.
+ * 'infra_deferred') AND outcome_class IS DISTINCT FROM 'provider_error' AND
+ * NOT (outcome_class IN ('cancelled','window_closed') AND answered_at IS NULL)`.
  */
-export function isReachedDial(a: { state?: unknown; abandon_reason?: unknown; outcome_class?: unknown }): boolean {
+export function isReachedDial(a: {
+  state?: unknown;
+  abandon_reason?: unknown;
+  outcome_class?: unknown;
+  answered_at?: unknown;
+}): boolean {
   if (a.state === 'abandoned' && a.abandon_reason === 'infra_deferred') return false;
-  return a.outcome_class !== 'provider_error';
+  if (a.outcome_class === 'provider_error') return false;
+  if ((a.outcome_class === 'cancelled' || a.outcome_class === 'window_closed')
+      && (a.answered_at === null || a.answered_at === undefined)) return false;
+  return true;
 }
 
 /** The allowlisted reason, or null. */
@@ -186,12 +204,46 @@ function timeOf(value: unknown): number {
   return Number.isFinite(t) ? t : -Infinity;
 }
 
-/** Same order as `/:id/phone-cycles`: cycle_number desc, then created_at desc. */
+/**
+ * Engagement states that end a cycle (`terminal_at` set, 0042). Every other
+ * known state is a live cycle.
+ */
+const TERMINAL_ENGAGEMENT_STATES: ReadonlySet<string> = new Set([
+  'completed',
+  'abandoned_no_answer',
+  'opted_out',
+  'wrong_number',
+  'failed',
+  'cancelled',
+]);
+
+function isLiveCycle(row: RawEngagementRow): boolean {
+  return typeof row.state === 'string'
+    && ENGAGEMENT_STATE_SET.has(row.state)
+    && !TERMINAL_ENGAGEMENT_STATES.has(row.state);
+}
+
+/**
+ * Is `a` the better "latest cycle" than `b`? LINK-AWARE.
+ *
+ * `cycle_number` is scoped per application link (0057: unique
+ * (application_link_id, cycle_number)) and one candidate may have several
+ * links, so comparing cycle numbers across engagements is meaningless: link
+ * A's terminal cycle 2 would outrank link B's live cycle 1. Instead:
+ *
+ * 1. A live (non-terminal) cycle beats any terminal one: while any link is
+ *    still dialling the candidate, that is what the status must say.
+ * 2. Then the newer `created_at` wins.
+ * 3. Then, only as a tie-break, the higher `cycle_number`.
+ */
 function isLater(a: RawEngagementRow, b: RawEngagementRow): boolean {
-  const ca = cycleOf(a);
-  const cb = cycleOf(b);
-  if (ca !== cb) return ca > cb;
-  return timeOf(a.created_at) > timeOf(b.created_at);
+  const la = isLiveCycle(a);
+  const lb = isLiveCycle(b);
+  if (la !== lb) return la;
+  const ta = timeOf(a.created_at);
+  const tb = timeOf(b.created_at);
+  if (ta !== tb) return ta > tb;
+  return cycleOf(a) > cycleOf(b);
 }
 
 interface Accumulator {
@@ -306,7 +358,40 @@ export async function loadPhoneProgress(candidateIds: readonly string[]): Promis
   return out;
 }
 
-/** The four public fields for one candidate, defaulting to unknown. */
-export function phoneProgressFields(progress: Map<string, PhoneProgress>, candidateId: string): PhoneProgress {
-  return { ...(progress.get(candidateId) ?? PHONE_PROGRESS_UNKNOWN) };
+/**
+ * The route entry point: `loadPhoneProgress` behind the phone feature flag.
+ *
+ * With `PHONE_SCREENING_ENABLED !== 'true'` the phone tables are not read at
+ * all, matching `/:id/phone-cycles` and every other phone route: each id is
+ * reported with no phone facts (dial_count 0, every other field null), which
+ * the UI renders as the plain stored status with no "unavailable" notice.
+ * The caller's authorization contract is the same as `loadPhoneProgress`.
+ */
+export async function loadCandidatePhoneProgress(candidateIds: readonly string[]): Promise<Map<string, PhoneProgress>> {
+  if (process.env.PHONE_SCREENING_ENABLED !== 'true') {
+    return new Map(
+      candidateIds
+        .filter((id) => typeof id === 'string' && id !== '')
+        .map((id) => [id, { ...NEVER_ENGAGED }]),
+    );
+  }
+  return loadPhoneProgress(candidateIds);
+}
+
+/**
+ * The four public fields for one candidate, defaulting to unknown.
+ *
+ * `phone_state_reason` goes only to roles that may already read the per-cycle
+ * view (`/:id/phone-cycles` is interviewer+). A viewer keeps `phone_state`,
+ * which is what the display status is derived from, but never learns WHY a
+ * cycle ended (opt-out, refused the recording notice, emergency stop...).
+ */
+export function phoneProgressFields(
+  progress: Map<string, PhoneProgress>,
+  candidateId: string,
+  appRole?: string | null,
+): PhoneProgress {
+  const p = { ...(progress.get(candidateId) ?? PHONE_PROGRESS_UNKNOWN) };
+  if (appRole !== 'admin' && appRole !== 'interviewer') p.phone_state_reason = null;
+  return p;
 }

@@ -8457,19 +8457,19 @@ components:
       type: integer
       minimum: 0
       nullable: true
-      description: Phone dials that actually reached the candidate's phone, across every screening cycle. Counts every attempt kind, including lease-reclaimed attempts (state abandoned with a null abandon_reason), which rang before the worker died; excludes attempts abandoned with abandon_reason infra_deferred (given up before any carrier contact) and attempts whose outcome_class is provider_error (refused by the carrier before ringing). 0 means never dialled. null means UNKNOWN - the phone read failed or may have been truncated at the row cap - and is never a claim of zero.
+      description: Phone calls that reached the candidate's phone, summed across EVERY screening cycle (a rescreen does not reset it) and every attempt kind - so a reconnect after a dropped call is its own count, and lease-reclaimed attempts (state abandoned with a null abandon_reason), which rang before the worker died, are counted. Excludes attempts abandoned with abandon_reason infra_deferred (given up before any carrier contact), attempts whose outcome_class is provider_error (refused by the carrier before ringing), and attempts with outcome_class cancelled or window_closed and no answered_at (ended before any evidence the phone rang). It is therefore not the per-cycle no-answer budget counter. 0 means never dialled (also reported for every candidate while PHONE_SCREENING_ENABLED is off, when the phone tables are not read). null means UNKNOWN - the phone read failed or may have been truncated at the row cap - and is never a claim of zero.
 
     CandidatePhoneState:
       type: string
       enum: [pending_prereqs, eligible, scheduled, dialing, in_call, reconnecting, awaiting_retry, completed, abandoned_no_answer, opted_out, wrong_number, failed, cancelled]
       nullable: true
-      description: The latest phone screening cycle's engagement state (highest cycle_number, then newest). null when the candidate was never engaged or when the phone read failed (see dial_count). Does not replace status - a decided status (screened, advanced, rejected, consent_declined) is never overridden by it.
+      description: The latest phone screening cycle's engagement state. Link-aware, because cycle_number is scoped per Ashby application link - any live (non-terminal) cycle wins over a terminal one, then the newest created_at, then the higher cycle_number. null when the candidate was never engaged, when phone screening is disabled, or when the phone read failed (see dial_count). Does not replace status - a decided status (screened, advanced, rejected, consent_declined) is never overridden by it.
 
     CandidatePhoneStateReason:
       type: string
       enum: [no_answer_budget_exhausted, reconnect_budget_exhausted, provider_budget_exhausted, window_closed, assessment_aborted, wrong_number, disclosure_refused, candidate_opt_out, hr_cancelled, emergency_stop, ashby_stage_left, prereq_lost, abandoned_pre_disclosure, consent_gate_failed, callback_deferred_in_call, callback_deferral_limit, late_score_after_stranded_abort]
       nullable: true
-      description: Why the latest cycle is in its state, projected server-side through a closed allowlist. The underlying column is not constrained, so any value outside this list - including any free text - is reported as null rather than echoed.
+      description: Why the latest cycle is in its state, projected server-side through a closed allowlist. The underlying column is not constrained, so any value outside this list - including any free text - is reported as null rather than echoed. Always null for the viewer role (the per-cycle view, /api/candidates/{id}/phone-cycles, is interviewer+).
 
     CandidateLastDialedAt:
       type: string
@@ -10139,8 +10139,8 @@ components:
           enum: [ready, processing, unavailable]
         reason:
           type: string
-          enum: [access_unavailable, no_recording, recording_failed, quarantined, deleted]
-          description: Why an unavailable recording cannot be played. access_unavailable (the caller may not read the parent session) takes precedence and reveals nothing about the recording's lifecycle. deleted means the attempt or parent recording was purged; quarantined means it failed an integrity check (attempt or parent).
+          enum: [access_unavailable, no_recording, recording_failed, quarantined, deleted, revoked]
+          description: Why an unavailable recording cannot be played. access_unavailable (the caller may not read the parent session) takes precedence and reveals nothing about the recording's lifecycle. deleted means the attempt or parent recording was purged; revoked means recording consent was withdrawn on the parent session; quarantined means it failed an integrity check (attempt or parent).
       additionalProperties: false
 
     CandidatePhoneAttemptTranscript:

@@ -128,7 +128,42 @@ export interface CandidateDisplayStatus {
   tone: StatusTone;
   /** Operator tooltip: the raw status, phone state, reason and last dial. */
   title: string;
+  /**
+   * The same phone facts as `title`, minus the raw status, as plain words
+   * for VISIBLE secondary text (a meta line, or sr-only text in a table row),
+   * so keyboard, touch and screen-reader users are not limited to a hover
+   * tooltip. Empty when there is nothing to add to the badge.
+   */
+  detail: string;
+  /**
+   * The phone progress was reported UNKNOWN (`dial_count: null`) on a status
+   * phone data could have changed, so the badge may be showing the stored
+   * status where the phone cycle says otherwise. Pages surface this once.
+   */
+  phoneUnknown: boolean;
 }
+
+/**
+ * What the dial count means, in words. It sums every cycle (a rescreen does
+ * not reset it) and every call that rang, a reconnect after a drop included,
+ * so it is NOT the per-cycle no-answer counter of the dialing SOP.
+ */
+function dialCountPhrase(dials: number): string {
+  return `Phone reached ${dials} ${dials === 1 ? 'time' : 'times'} (all cycles, incl. reconnects)`;
+}
+
+/**
+ * A live or just-finished cycle on a candidate still shown as queued: the
+ * badge keeps the stored words (the owner's decision), and this says what the
+ * phone is doing right now, so "Queued (dialed 1)" is never read as "still
+ * waiting to be called" while the call is happening or awaiting its score.
+ */
+const PHONE_IN_PROGRESS_DETAIL: Readonly<Record<string, string>> = {
+  dialing: 'Calling now',
+  in_call: 'On a call now',
+  reconnecting: 'Reconnecting a dropped call',
+  completed: 'Call completed, awaiting score',
+};
 
 function rawStatusKey(status: unknown): string {
   if (typeof status !== 'string') return 'new';
@@ -149,35 +184,64 @@ function knownDialCount(value: unknown): number | null {
  *    key ("Abandoned: no answer", "Phone screen failed", "Wrong number",
  *    "Opted out", "Phone screen cancelled").
  * 3. Otherwise the stored status.
- * 4. An unsettled key gains "(dialed N)" when N > 0 dials reached the phone.
+ * 4. A stored, unsettled key ("Queued", "Screening", ...) gains "(dialed N)"
+ *    when N > 0 calls reached the phone. A terminal phone key keeps its own
+ *    words ("Abandoned: no answer"); its count is in `detail` / `title`.
  *    `dial_count` null / absent means UNKNOWN (the read failed, or an older
  *    payload), and 0 means never dialled: both show the plain label, so an
- *    unknown count never reads as a confident "Queued (dialed 0)".
+ *    unknown count never reads as a confident "Queued (dialed 0)". An
+ *    explicit null additionally sets `phoneUnknown` and says so in `title`.
  */
 export function candidateDisplayStatus(c: CandidateDisplayInput): CandidateDisplayStatus {
   const raw = rawStatusKey(c.status);
   const phoneState = typeof c.phone_state === 'string' ? c.phone_state : null;
   const settled = SETTLED_CANDIDATE_STATUSES.has(raw);
-  const key = !settled && phoneState && PHONE_TERMINAL_DISPLAY_KEY[phoneState]
-    ? PHONE_TERMINAL_DISPLAY_KEY[phoneState]
-    : raw;
+  const phoneKey = !settled && phoneState ? PHONE_TERMINAL_DISPLAY_KEY[phoneState] : undefined;
+  const key = phoneKey ?? raw;
 
   const dials = knownDialCount(c.dial_count);
   const base = candidateStatusLabel(key);
-  const label = !settled && dials !== null && dials > 0 ? `${base} (dialed ${dials})` : base;
+  const label = !settled && !phoneKey && dials !== null && dials > 0 ? `${base} (dialed ${dials})` : base;
+  const phoneUnknown = !settled && c.dial_count === null;
 
   const reason = engagementReasonLabel(c.phone_state_reason);
+  // The phone cycle's own words, unless the badge already says them.
+  const phoneStateWords = phoneState && !phoneKey
+    ? PHONE_IN_PROGRESS_DETAIL[phoneState] ?? `Phone cycle – ${engagementStateTerm(phoneState).label}`
+    : null;
+  const phoneFacts = [
+    phoneStateWords,
+    reason || null,
+    dials !== null && dials > 0 ? dialCountPhrase(dials) : null,
+    c.last_dialed_at ? `Last dialed ${formatDateTime(c.last_dialed_at)}` : null,
+  ].filter((part): part is string => Boolean(part));
+
   const title = [
     `Status: ${typeof c.status === 'string' && c.status.trim() ? c.status : raw}`,
-    phoneState ? `Phone: ${engagementStateTerm(phoneState).label}` : null,
-    reason || null,
-    dials !== null && dials > 0 ? `Dialed ${dials} ${dials === 1 ? 'time' : 'times'}` : null,
-    c.last_dialed_at ? `Last dialed ${formatDateTime(c.last_dialed_at)}` : null,
+    ...phoneFacts,
+    phoneUnknown ? 'Phone progress unavailable: showing the stored status' : null,
   ]
     .filter(Boolean)
     .join(' · ');
 
-  return { key, label, tone: candidateStatusTone(key), title };
+  return {
+    key,
+    label,
+    tone: candidateStatusTone(key),
+    title,
+    detail: settled ? '' : phoneFacts.join(' · '),
+    phoneUnknown,
+  };
+}
+
+/**
+ * True when any of these candidates' phone progress came back unknown on a
+ * status it could have changed: the page then says, once, that some statuses
+ * may be the stored value rather than the phone outcome (a failed phone read
+ * must not silently reclassify "Abandoned: no answer" as "Queued").
+ */
+export function anyPhoneProgressUnknown(candidates: ReadonlyArray<CandidateDisplayInput>): boolean {
+  return candidates.some((c) => candidateDisplayStatus(c).phoneUnknown);
 }
 
 /** The filter / count key of `candidateDisplayStatus`, on its own. */

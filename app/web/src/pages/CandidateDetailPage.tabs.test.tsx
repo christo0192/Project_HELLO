@@ -215,9 +215,33 @@ describe('CandidateDetailPage tabs', () => {
       expect(await within(review).findByRole('heading', { name: 'Call recordings' })).toBeInTheDocument();
       expect(within(review).getByText('Recorded before consent')).toBeInTheDocument();
       expect(within(review).getByText(/No completed screening yet/i)).toBeInTheDocument();
-      // Both panels stay mounted (Tabs), yet the list was fetched once.
+      // The copies remount per tab, yet the list was fetched once.
       expect(mockApi.getCandidatePhoneAttempts).toHaveBeenCalledTimes(1);
       expect(mockApi.getAttemptRecordingDownloadUrl).not.toHaveBeenCalled();
+      // Switching back and forth never refetches either.
+      fireEvent.click(screen.getByRole('tab', { name: 'Overview' }));
+      fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
+      await within(screen.getByRole('tabpanel', { name: 'Review' })).findByRole('heading', { name: 'Call recordings' });
+      expect(mockApi.getCandidatePhoneAttempts).toHaveBeenCalledTimes(1);
+    });
+
+    it('has ONE attempt list (one player) on the page, and switching tabs stops the audio', async () => {
+      mockApi.getAttemptRecordingDownloadUrl.mockResolvedValue({ url: 'https://storage.invalid/a1', content_type: 'audio/mpeg' });
+      const { container } = renderDetailPage();
+      await screen.findByText('Jane Doe');
+      // Overview open: its copy only; the hidden Review panel has none.
+      const overviewPlay = await screen.findAllByRole('button', { name: 'Play recording' });
+      expect(overviewPlay).toHaveLength(1);
+      fireEvent.click(overviewPlay[0]);
+      await screen.findByLabelText('Attempt 1 recording', { selector: 'audio' });
+      expect(container.querySelectorAll('audio')).toHaveLength(1);
+      // Switching to Review unmounts the Overview player: no audio keeps
+      // playing in a hidden panel, and Review starts with its player closed.
+      fireEvent.click(screen.getByRole('tab', { name: 'Review' }));
+      const review = screen.getByRole('tabpanel', { name: 'Review' });
+      await within(review).findByRole('button', { name: 'Play recording' });
+      expect(container.querySelectorAll('audio')).toHaveLength(0);
+      expect(screen.getAllByRole('button', { name: 'Play recording' })).toHaveLength(1);
     });
 
     it('plays a pre-consent recording inline from the Review tab only on click', async () => {

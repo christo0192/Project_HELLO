@@ -25,6 +25,7 @@ import { Router, type Request } from 'express';
 import { supabase } from '../lib/supabase.js';
 import { requireRole } from '../lib/rbac.js';
 import { redactCandidatePhone } from '../lib/candidate-phone.js';
+import { loadCandidatePhoneProgress, phoneProgressFields } from '../lib/candidate-phone-progress.js';
 import { uuidSchema } from '../schemas/common.js';
 import {
   createCandidateWorkflowStore,
@@ -116,12 +117,21 @@ ashbyReviewRouter.get('/:applicationLinkId', requireRole('viewer'), async (req, 
       .eq('candidate_id', candidateId)
       .order('created_at', { ascending: false });
 
+    // The same four phone-progress fields as GET /api/candidates/:id, from the
+    // same helper, for the candidate this link already resolved to (so the
+    // scoped page says "Abandoned: no answer" where the main pages do, not a
+    // stale "Queued"). It never rejects and degrades to unknown.
+    const phoneProgress = await loadCandidatePhoneProgress([candidateId]);
+
     // Same envelope as GET /api/candidates/:id, so the SAME redaction. This is
     // a separate code path reading the same `select('*')`: redacting one route
     // and not the other would leave the number readable through the Ashby
     // review pane by every viewer.
     res.json({
-      candidate: redactCandidatePhone(candidate as Record<string, unknown>, req.authUser?.appRole),
+      candidate: {
+        ...redactCandidatePhone(candidate as Record<string, unknown>, req.authUser?.appRole),
+        ...phoneProgressFields(phoneProgress, candidateId, req.authUser?.appRole),
+      },
       sessions: sessions ?? [],
       assessments: assessments ?? [],
     });

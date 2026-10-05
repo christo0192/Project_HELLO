@@ -301,5 +301,15 @@ describe('candidate phone-attempt history: recordings made before consent (M011 
     const res = await request(app('interviewer', 'owner-1')).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
     expect(res.status).toBe(200);
     expect(res.body.attempts[0].recording).toEqual({ state: 'unavailable', reason: 'access_unavailable' });
+    // ...nor how its audio was captured.
+    expect(res.body.attempts[0].consent_stage).toBeNull();
+  });
+
+  it('names a recording on a consent-revoked parent "revoked", not "no recording"', async () => {
+    sessionRows = [parent({ recording_revoked_at: '2026-09-28T00:00:00.000Z' })];
+    attempts = [{ ...row(IDS[0], TIED, true), session_id: null, recording_session_id: SESSION }];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.status).toBe(200);
+    expect(res.body.attempts[0].recording).toEqual({ state: 'unavailable', reason: 'revoked' });
   });
 });

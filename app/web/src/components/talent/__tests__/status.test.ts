@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import {
+  anyPhoneProgressUnknown,
   candidateStatusLabel,
   candidateStatusTone,
   sessionStatusLabel,
@@ -294,10 +295,12 @@ describe('candidateDisplayStatus (stored status + phone progress)', () => {
     expect(candidateDisplayStatus({ status: 'queued', dial_count: 2.5 }).label).toBe('Queued');
   });
 
-  it('turns an abandoned_no_answer cycle into its own filterable key', () => {
+  it('turns an abandoned_no_answer cycle into its own filterable key, in exactly the owner wording', () => {
     const ds = candidateDisplayStatus({ status: 'queued', dial_count: 5, phone_state: 'abandoned_no_answer' });
     expect(ds.key).toBe('abandoned_no_answer');
-    expect(ds.label).toBe('Abandoned: no answer (dialed 5)');
+    // No "(dialed N)" on a terminal phone key: the count is in detail/title.
+    expect(ds.label).toBe('Abandoned: no answer');
+    expect(ds.detail).toContain('Phone reached 5 times');
     expect(ds.tone).toBe('danger');
     expect(candidateStatusKey({ status: 'queued', phone_state: 'abandoned_no_answer' })).toBe(
       'abandoned_no_answer',
@@ -318,6 +321,7 @@ describe('candidateDisplayStatus (stored status + phone progress)', () => {
     for (const [state, key, label, tone] of cases) {
       const ds = candidateDisplayStatus({
         status: 'queued',
+        dial_count: 1,
         phone_state: state as 'failed',
       });
       expect(ds, state).toMatchObject({ key, label, tone });
@@ -370,11 +374,64 @@ describe('candidateDisplayStatus (stored status + phone progress)', () => {
       last_dialed_at: '2026-10-01T09:30:00Z',
     });
     expect(ds.title).toContain('Status: queued');
-    expect(ds.title).toContain('Phone: Abandoned: no answer');
+    // The badge already says the phone outcome: no "Phone: Abandoned: no
+    // answer" double colon in the tooltip.
+    expect(ds.title).not.toContain('Phone:');
+    expect(ds.title).not.toContain('Phone cycle');
     expect(ds.title).toContain('No answer after every attempt');
-    expect(ds.title).toContain('Dialed 5 times');
+    expect(ds.title).toContain('Phone reached 5 times (all cycles, incl. reconnects)');
     expect(ds.title).toMatch(/Last dialed .*2026/);
     expect(candidateDisplayStatus({ status: 'new' }).title).toBe('Status: new');
+  });
+
+  it('puts the same phone facts in VISIBLE detail text (not hover-only), and none on a decided status', () => {
+    const ds = candidateDisplayStatus({
+      status: 'queued',
+      dial_count: 5,
+      phone_state: 'abandoned_no_answer',
+      phone_state_reason: 'no_answer_budget_exhausted',
+      last_dialed_at: '2026-10-01T09:30:00Z',
+    });
+    expect(ds.detail).toMatch(/^No answer after every attempt · Phone reached 5 times .* · Last dialed .*2026/);
+    expect(ds.detail).not.toContain('Status:');
+    expect(candidateDisplayStatus({ status: 'new' }).detail).toBe('');
+    expect(
+      candidateDisplayStatus({ status: 'screened', dial_count: 2, phone_state: 'completed' }).detail,
+    ).toBe('');
+  });
+
+  it('says what the phone is doing while a queued candidate is on, or just off, a call', () => {
+    const cases: Array<[string, string]> = [
+      ['dialing', 'Calling now'],
+      ['in_call', 'On a call now'],
+      ['reconnecting', 'Reconnecting a dropped call'],
+      ['completed', 'Call completed, awaiting score'],
+    ];
+    for (const [state, words] of cases) {
+      const ds = candidateDisplayStatus({ status: 'queued', dial_count: 1, phone_state: state as 'in_call' });
+      // The badge keeps the decided wording...
+      expect(ds.label, state).toBe('Queued (dialed 1)');
+      // ...and the visible detail and tooltip say what is actually happening.
+      expect(ds.detail, state).toContain(words);
+      expect(ds.title, state).toContain(words);
+    }
+    expect(
+      candidateDisplayStatus({ status: 'queued', dial_count: 2, phone_state: 'awaiting_retry' }).detail,
+    ).toContain('Phone cycle – Awaiting retry');
+  });
+
+  it('flags an UNKNOWN phone read (explicit null) on an unsettled status, and only there', () => {
+    const unknown = candidateDisplayStatus({ status: 'queued', dial_count: null, phone_state: null });
+    expect(unknown.phoneUnknown).toBe(true);
+    expect(unknown.label).toBe('Queued');
+    expect(unknown.title).toContain('Phone progress unavailable');
+    // Never dialled (0) and an older payload (absent) are not "unknown".
+    expect(candidateDisplayStatus({ status: 'queued', dial_count: 0 }).phoneUnknown).toBe(false);
+    expect(candidateDisplayStatus({ status: 'queued' }).phoneUnknown).toBe(false);
+    // A decided status cannot be changed by phone data, so nothing is hidden.
+    expect(candidateDisplayStatus({ status: 'screened', dial_count: null }).phoneUnknown).toBe(false);
+    expect(anyPhoneProgressUnknown([{ status: 'queued', dial_count: 1 }, { status: 'new', dial_count: null }])).toBe(true);
+    expect(anyPhoneProgressUnknown([{ status: 'queued', dial_count: 1 }, { status: 'advanced', dial_count: null }])).toBe(false);
   });
 
   it('labels every new key in plain words (no underscores) and counts by display key', () => {

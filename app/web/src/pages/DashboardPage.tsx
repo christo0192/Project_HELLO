@@ -57,6 +57,7 @@ import type { BarListDatum, BarTone } from '../components/charts';
 import { countPerDay, formatDay, formatDayTime } from '../components/charts/dates';
 import { ScreeningKpis } from '../components/dashboard/ScreeningKpis';
 import {
+  anyPhoneProgressUnknown,
   candidateDisplayStatus,
   candidateFunnel,
   candidatesHref,
@@ -207,6 +208,10 @@ export function DashboardPage() {
   const completionPct = considered > 0 ? Math.round((decided / considered) * 100) : 0;
 
   const intakeTrend = countPerDay(candidates);
+  // A failed phone read leaves those candidates on their stored status, which
+  // moves them between the figures below ("In screening" grows, completion's
+  // denominator shifts). Said once, never silently.
+  const phoneProgressUnknown = anyPhoneProgressUnknown(candidates);
 
   return (
     <div className="pb-4">
@@ -237,6 +242,14 @@ export function DashboardPage() {
           </>
         }
       />
+
+      {phoneProgressUnknown && (
+        <InlineNotice tone="warning" role="none" className="mt-6">
+          Phone progress could not be loaded for some candidates, so they are counted by their
+          stored status: a finished phone outcome (such as “Abandoned: no answer”) may be
+          counted as “In screening”. Refresh to try again.
+        </InlineNotice>
+      )}
 
       {/* The hero: the four figures a recruiter opens the page for, largest,
           on one surface. Each is a drill-down link to exactly those people. */}

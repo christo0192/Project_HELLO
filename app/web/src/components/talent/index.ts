@@ -54,6 +54,7 @@ export {
   candidateStatusTone,
   candidateDisplayStatus,
   candidateStatusKey,
+  anyPhoneProgressUnknown,
   sessionStatusLabel,
   sessionStatusTone,
   formatDurationSec,

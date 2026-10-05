@@ -115,7 +115,7 @@ describe('scoped review shell', () => {
     expect(screen.queryByText(/dialed/)).toBeNull();
   });
 
-  it('still names a phone outcome if a future payload carries one', async () => {
+  it('names the phone outcome the scoped payload now carries, like the main pages', async () => {
     mockApi.getAshbyScopedReview.mockResolvedValue({
       ...mockCandidateDetail,
       candidate: {
@@ -127,7 +127,8 @@ describe('scoped review shell', () => {
     });
     renderPage();
     await screen.findByText('Jane Doe');
-    expect(screen.getAllByText('Abandoned: no answer (dialed 5)').length).toBeGreaterThanOrEqual(1);
+    expect(screen.getAllByText('Abandoned: no answer').length).toBeGreaterThanOrEqual(1);
+    expect(screen.queryByText('Queued')).toBeNull();
   });
 
   it('renders no global navigation, no backlinks and no cross-candidate links', async () => {

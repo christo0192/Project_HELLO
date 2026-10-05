@@ -973,6 +973,7 @@ beforeEach(() => {
 
 afterEach(() => {
   injectAssessmentRunner(null);
+  vi.unstubAllEnvs();
 });
 
 // ════════════════════════════════════════════════════════════════════
@@ -1761,6 +1762,8 @@ describe('live handler shapes match documented schemas', () => {
   });
 
   it('GET /api/candidates → CandidateListItem[] with phone progress (dialled, never engaged, unknown)', async () => {
+    // Phone progress is read only while phone screening is on.
+    vi.stubEnv('PHONE_SCREENING_ENABLED', 'true');
     configureTables({
       candidates: ok([
         mockCandidateListItem,
@@ -1803,6 +1806,7 @@ describe('live handler shapes match documented schemas', () => {
   });
 
   it('GET /api/candidates/{id} → CandidateDetail with phone progress on the candidate', async () => {
+    vi.stubEnv('PHONE_SCREENING_ENABLED', 'true');
     configureTables({
       candidates: ok(mockCandidateRow),
       call_sessions: ok([mockSessionRow]),

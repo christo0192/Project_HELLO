@@ -17,7 +17,8 @@ import { idParamSchema, uuidSchema } from '../schemas/common.js';
 import { requireRole } from '../lib/rbac.js';
 import { recordAudit } from '../lib/audit.js';
 import { redactCandidatePhone } from '../lib/candidate-phone.js';
-import { loadPhoneProgress, phoneProgressFields } from '../lib/candidate-phone-progress.js';
+import { loadCandidatePhoneProgress, phoneProgressFields } from '../lib/candidate-phone-progress.js';
+import { attemptConsentStage } from '../lib/attempt-consent-stage.js';
 import { createLogger } from '../lib/logger.js';
 
 const candidateLogger = createLogger('candidates');
@@ -96,41 +97,6 @@ function attemptDurationSeconds(answeredAt: string | null, endedAt: string | nul
   if (!answeredAt || !endedAt) return null;
   const duration = (Date.parse(endedAt) - Date.parse(answeredAt)) / 1000;
   return Number.isFinite(duration) && duration >= 0 ? duration : null;
-}
-
-/**
- * Attempt outcomes that by definition end before (or at) the recording
- * consent step. Used only to classify a leg whose parent session was later
- * completed by ANOTHER leg (0107 binds `session_id` at consent, so a completed
- * parent alone does not say whether this leg consented).
- */
-const PRE_CONSENT_ATTEMPT_OUTCOMES: ReadonlySet<string> = new Set([
-  'abandoned_pre_disclosure',
-  'consent_failed',
-  'declined',
-  'voicemail',
-]);
-
-/**
- * Whether a leg's audio was captured before the candidate consented.
- *
- * - `session_id` set: 0107 binds it at consent, so the leg consented.
- * - `session_id` NULL with a `recording_session_id`: the worker recorded the
- *   leg from the start (0105 policy) and consent was never bound to it. That
- *   is "before consent" when the outcome is a pre-consent one, or when the
- *   parent session never completed. A NULL-bound leg under a COMPLETED parent
- *   with any other outcome may be a pre-0107 leg that did consent, so it is
- *   reported as unknown (null) rather than mislabelled. No transcript probe:
- *   the parent status is already loaded with the lifecycle row.
- */
-function attemptConsentStage(
-  row: { session_id: string | null; recording_session_id: string | null; outcome_class: string | null },
-  parentStatus: string | null | undefined,
-): 'before_consent' | 'after_consent' | null {
-  if (row.session_id) return 'after_consent';
-  if (!row.recording_session_id || parentStatus === undefined) return null;
-  if (row.outcome_class && PRE_CONSENT_ATTEMPT_OUTCOMES.has(row.outcome_class)) return 'before_consent';
-  return parentStatus !== null && parentStatus !== 'completed' ? 'before_consent' : null;
 }
 
 export const candidatesRouter = Router();
@@ -297,8 +263,9 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
   // last dial), alongside the links read. One query per 100 ids, over the
   // SAME authorized candidate set, so interviewer owner-scoping is inherited.
   // It never rejects: a failed or possibly-truncated read reports
-  // `dial_count: null` (unknown), never a confident 0.
-  const [, phoneProgress] = await Promise.all([loadResumeReview(), loadPhoneProgress(ids)]);
+  // `dial_count: null` (unknown), never a confident 0. Not read at all while
+  // PHONE_SCREENING_ENABLED is off, like every other phone route.
+  const [, phoneProgress] = await Promise.all([loadResumeReview(), loadCandidatePhoneProgress(ids)]);
 
   // The role this list is being rendered for. `phone_e164` is admin-only —
   // see `redactCandidatePhone`. This endpoint has always SELECTED the column;
@@ -321,8 +288,9 @@ candidatesRouter.get('/', requireRole('viewer'), validateQuery(listCandidatesQue
       // anything about it at all.
       resume_review: resumeReview.get(row.id) ?? null,
       // dial_count / phone_state / phone_state_reason / last_dialed_at.
-      // null dial_count = unknown; 0 = never dialled.
-      ...phoneProgressFields(phoneProgress, row.id),
+      // null dial_count = unknown; 0 = never dialled. The reason is
+      // interviewer+ only (same floor as /:id/phone-cycles).
+      ...phoneProgressFields(phoneProgress, row.id, role),
     };
   });
 
@@ -631,16 +599,24 @@ candidatesRouter.get(
                 ? 'access_unavailable'
                 : row.recording_deleted_at || parent?.deletedAt
                   ? 'deleted'
+                  // Consent to the recording was withdrawn on the parent: the
+                  // audio may still exist, but it is not "no recording".
+                  : parent?.revokedAt
+                    ? 'revoked'
                   : row.recording_quarantined || parent?.quarantined
                     ? 'quarantined'
                     : row.egress_status === 'failed'
                       ? 'recording_failed'
                       : recordingState === 'unavailable' ? 'no_recording' : undefined,
             },
-            consent_stage: attemptConsentStage(
-              row,
-              evidenceSessionId ? (parent ? parent.status : undefined) : undefined,
-            ),
+            // Same rule as `recording.reason`: a caller who may not read the
+            // session learns nothing about how its audio was captured.
+            consent_stage: interviewerCanReadSession
+              ? attemptConsentStage(
+                  row,
+                  evidenceSessionId ? (parent ? parent.status : undefined) : undefined,
+                )
+              : null,
             transcript: user.appRole === 'admin' && evidenceSessionId && kind !== 'none'
               ? {
                   href: `/sessions/${evidenceSessionId}`,
@@ -1429,7 +1405,7 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
   // awaited at the end; it never rejects and degrades to unknown (all null).
   const candidateId = (candidate as { id?: unknown } | null)?.id;
   const authorizedId = typeof candidateId === 'string' ? candidateId : req.params.id;
-  const phoneProgressPromise = loadPhoneProgress([authorizedId]);
+  const phoneProgressPromise = loadCandidatePhoneProgress([authorizedId]);
 
   const { data: sessions } = await supabase
     .from('call_sessions')
@@ -1558,7 +1534,7 @@ candidatesRouter.get('/:id', requireRole('viewer'), validateParams(candidateIdPa
   res.json({
     candidate: {
       ...redactCandidatePhone(candidate as Record<string, unknown>, req.authUser?.appRole),
-      ...phoneProgressFields(phoneProgress, authorizedId),
+      ...phoneProgressFields(phoneProgress, authorizedId, req.authUser?.appRole),
     },
     sessions: (sessions ?? []).map((session) => {
       const row = session as Record<string, unknown>;

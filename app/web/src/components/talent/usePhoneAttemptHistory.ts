@@ -12,11 +12,12 @@ import type { CandidatePhoneAttempt } from '../../types';
 /**
  * The attempt list for one candidate, loaded once and shareable.
  *
- * `CandidateDetailPage` renders the list twice (the Overview rail, and the
- * Review tab's empty state). `Tabs` keeps inactive panels mounted, so two
- * self-loading copies would fetch `/phone-attempts` twice on every page load.
- * The page calls this hook ONCE and hands the result to both copies; a copy
- * given no `source` loads its own (`enabled` stays true).
+ * `CandidateDetailPage` renders the list in two places (the Overview rail,
+ * and the Review tab's empty state), each mounted only while its tab is open
+ * so there is one player on the page. Self-loading copies would refetch
+ * `/phone-attempts` on every tab switch; the page calls this hook ONCE and
+ * hands the result to both copies. A copy given no `source` loads its own
+ * (`enabled` stays true).
  */
 export interface PhoneAttemptHistorySource {
   attempts: CandidatePhoneAttempt[] | null;
@@ -59,7 +60,13 @@ export function usePhoneAttemptHistory(candidateId: string, enabled = true): Pho
       });
   }, [candidateId, enabled]);
 
+  // A different candidate (or the list being switched off) starts from
+  // nothing: never render, or offer to play, the previous candidate's
+  // attempts while the next one's fetch is in flight.
   useEffect(() => {
+    setAttempts(null);
+    setNextCursor(null);
+    setError(false);
     load();
     return () => { generation.current += 1; };
   }, [load]);

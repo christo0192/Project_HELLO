@@ -282,8 +282,24 @@ describe('DashboardPage', () => {
       expect(within(hero).getByRole('link', { name: 'In screening: 2' })).toBeInTheDocument();
       const recent = screen.getByRole('list', { name: 'Recent candidates, newest first' });
       expect(within(recent).getByText('Queued (dialed 3)')).toBeInTheDocument();
-      expect(within(recent).getByText('Abandoned: no answer (dialed 5)')).toBeInTheDocument();
-      expect(within(recent).getByText('Phone screen failed (dialed 2)')).toBeInTheDocument();
+      expect(within(recent).getByText('Abandoned: no answer')).toBeInTheDocument();
+      expect(within(recent).getByText('Phone screen failed')).toBeInTheDocument();
+    });
+
+    it('says so when phone progress is unknown for some candidates, and not otherwise', async () => {
+      getMe.mockResolvedValue(VIEWER_ME);
+      listCandidates.mockResolvedValue([
+        ...PHONE_CANDIDATES,
+        { ...CANDIDATES[0], id: 'p9', name: 'Unknown Uma', status: 'queued', dial_count: null, phone_state: null },
+      ]);
+      const { unmount } = renderDashboard();
+      expect(await screen.findByText(/Phone progress could not be loaded for some candidates/)).toBeInTheDocument();
+      unmount();
+
+      listCandidates.mockResolvedValue(PHONE_CANDIDATES);
+      renderDashboard();
+      await screen.findByRole('group', { name: 'Pipeline' });
+      expect(screen.queryByText(/Phone progress could not be loaded/)).toBeNull();
     });
 
     it('draws "Abandoned: no answer" as its own drill-down stage', async () => {
