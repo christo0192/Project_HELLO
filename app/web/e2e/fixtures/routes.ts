@@ -60,6 +60,8 @@ export const ROUTES: RouteCase[] = [
   { name: 'dashboard', path: '/dashboard', heading: 'Dashboard', landmark: 'Recent candidates' },
   { name: 'candidates', path: '/candidates', heading: 'Candidates', landmark: 'Meera Iyer' },
   { name: 'candidates-filtered', path: '/candidates?status=screened', heading: 'Candidates', landmark: 'Diego Ferreira' },
+  // Free-text search (`?q=`), client-side over the loaded list.
+  { name: 'candidates-search', path: '/candidates?q=diego', heading: 'Candidates', landmark: 'Diego Ferreira' },
   { name: 'candidate-detail', path: `/candidates/${STAR_CANDIDATE_ID}`, heading: 'Meera Iyer', landmark: 'Screening cycle 1' },
   { name: 'candidate-detail-legacy', path: `/candidates/${LEGACY_CANDIDATE_ID}`, heading: 'Rohan Deshpande', landmark: 'Moved to technical round.' },
   // Named by whose screening it is (the candidate's name), never by the

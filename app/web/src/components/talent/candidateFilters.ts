@@ -15,6 +15,11 @@
  *   client-side over the already-loaded page: additive, adds no request, and
  *   changes nothing about the status vocabulary.
  * - `role` is a role id, applied server-side via `listCandidates(roleId)`.
+ * - `q` is a free-text search (name / email / phone digits). Applied
+ *   client-side over the already-loaded rows by `matchesCandidateSearch`
+ *   (candidateSearch.ts) and NEVER sent to the API, so it can only narrow
+ *   what the server already chose to return (owner scoping, phone
+ *   redaction). Normalized by `normalizeCandidateQuery`.
  *
  * Everything here is derived from data the candidate list already returns —
  * no fabricated metrics.
@@ -73,6 +78,26 @@ export interface CandidateFilters {
   assessed: boolean;
   /** Selected role id, or null for all roles. */
   roleId: string | null;
+  /**
+   * Normalized free-text search (`''` = none). Client-side only; see
+   * `matchesCandidateSearch`. `matchesCandidateFilters` deliberately ignores
+   * it so the two predicates stay independently testable.
+   */
+  query: string;
+}
+
+/** Longest search the URL contract keeps, in code points. */
+export const CANDIDATE_QUERY_MAX = 100;
+
+/**
+ * Canonical form of a search query: trimmed, inner whitespace runs collapsed
+ * to one space, capped at `CANDIDATE_QUERY_MAX` code points (never splitting
+ * a surrogate pair). `null` / whitespace-only is `''`.
+ */
+export function normalizeCandidateQuery(raw: string | null | undefined): string {
+  if (!raw) return '';
+  const collapsed = raw.replace(/\s+/g, ' ').trim();
+  return Array.from(collapsed).slice(0, CANDIDATE_QUERY_MAX).join('').trim();
 }
 
 export const EMPTY_CANDIDATE_FILTERS: CandidateFilters = {
@@ -81,6 +106,7 @@ export const EMPTY_CANDIDATE_FILTERS: CandidateFilters = {
   resumeReview: [],
   assessed: false,
   roleId: null,
+  query: '',
 };
 
 /** Normalize a candidate's status to a known key ('new' when missing). */
@@ -116,6 +142,7 @@ export function parseCandidateFilters(params: URLSearchParams): CandidateFilters
     resumeReview: [...resumeReview],
     assessed: params.get('assessed') === '1',
     roleId: roleId && roleId.trim() ? roleId.trim() : null,
+    query: normalizeCandidateQuery(params.get('q')),
   };
 }
 
@@ -139,6 +166,9 @@ export function buildCandidateSearch(filters: CandidateFilters): URLSearchParams
   }
   if (filters.assessed) params.set('assessed', '1');
   if (filters.roleId) params.set('role', filters.roleId);
+  // LAST, so every pre-existing canonical href is byte-identical.
+  const query = normalizeCandidateQuery(filters.query);
+  if (query) params.set('q', query);
   return params;
 }
 
@@ -160,8 +190,9 @@ export function matchesCandidateStatus(candidate: Candidate, filters: CandidateF
 
 /**
  * Full client-side predicate: status + recommendation + assessed. Role is
- * filtered server-side. Recommendation/assessed use the list-enriched
- * latest_recommendation / latest_score fields.
+ * filtered server-side; the free-text `query` is applied separately by
+ * `matchesCandidateSearch` and ignored here. Recommendation/assessed use the
+ * list-enriched latest_recommendation / latest_score fields.
  */
 export function matchesCandidateFilters(candidate: Candidate, filters: CandidateFilters): boolean {
   if (!matchesCandidateStatus(candidate, filters)) return false;
@@ -188,7 +219,8 @@ export function hasActiveFilters(filters: CandidateFilters): boolean {
     filters.recommendations.length > 0 ||
     filters.resumeReview.length > 0 ||
     filters.assessed ||
-    filters.roleId !== null
+    filters.roleId !== null ||
+    filters.query !== ''
   );
 }
 

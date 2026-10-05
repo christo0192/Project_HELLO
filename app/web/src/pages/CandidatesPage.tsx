@@ -24,6 +24,14 @@
  * rows so it never runs off the page, and the filter contract
  * (`parseCandidateFilters` / `buildCandidateSearch` / `matchesCandidateFilters`)
  * is untouched: the chips, the counts and "Clear all" drive the same URL.
+ *
+ * SEARCH (`?q=`) is the fifth URL dimension. It matches name, email and —
+ * only when the row carries one, i.e. only for a role the API lets see it —
+ * phone digits (`matchesCandidateSearch`). It runs client-side over the rows
+ * already loaded, so it can never widen what the server returned, and the
+ * query is never sent to the API or logged. The input writes the URL after a
+ * short debounce with REPLACE (one history entry per search, not one per
+ * keystroke), so Back from a candidate returns to the searched list.
  */
 
 import { useCallback, useEffect, useId, useMemo, useRef, useState } from "react";
@@ -36,7 +44,7 @@ import {
 } from "../lib/mapped-roles";
 import type { Candidate, Role } from "../types";
 import type { CandidateFilters } from "../components/talent";
-import { CandidateButton } from "../components/design/candidate";
+import { CandidateButton, CandidateInput } from "../components/design/candidate";
 import {
   Button,
   buttonClass,
@@ -71,6 +79,9 @@ import {
   CANDIDATE_STATUS_ORDER,
   hasActiveFilters,
   matchesCandidateFilters,
+  matchesCandidateSearch,
+  normalizeCandidateQuery,
+  CANDIDATE_QUERY_MAX,
   normalizeStatus,
   parseCandidateFilters,
   recommendationLabel,
@@ -289,6 +300,35 @@ export function CandidatesPage() {
   const filterKey = buildCandidateSearch(filters).toString();
   const { roleId } = filters;
 
+  /**
+   * The search box. `draft` is what is typed; the URL (`filters.query`) is
+   * what filters the list. `committed` remembers the last value THIS input
+   * wrote, so the URL→input sync below only fires for changes from outside
+   * (Back/Forward, the chip's ×, "Clear all") — otherwise committing
+   * "jane " (normalized to "jane") would eat the trailing space being typed.
+   */
+  const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const [draft, setDraft] = useState(filters.query);
+  const committed = useRef(filters.query);
+  useEffect(() => {
+    if (filters.query !== committed.current) {
+      committed.current = filters.query;
+      setDraft(filters.query);
+    }
+  }, [filters.query]);
+  // input → URL, debounced, REPLACING the entry: one history entry per
+  // search rather than one per keystroke.
+  useEffect(() => {
+    const next = normalizeCandidateQuery(draft);
+    if (next === filters.query) return;
+    const t = window.setTimeout(() => {
+      committed.current = next;
+      setSearchParams(buildCandidateSearch({ ...filters, query: next }), { replace: true });
+    }, SEARCH_COMMIT_MS);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draft, filterKey, setSearchParams]);
+
   const [roles, setRoles] = useState<Role[]>([]);
   const [candidates, setCandidates] = useState<Candidate[] | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -436,11 +476,56 @@ export function CandidatesPage() {
     setSearchParams(new URLSearchParams());
   }, [setSearchParams]);
 
+  /** Clear the search now (no debounce) and keep the cursor in the box. */
+  const clearSearch = useCallback(() => {
+    setDraft("");
+    committed.current = "";
+    if (filters.query) {
+      setSearchParams(buildCandidateSearch({ ...filters, query: "" }), { replace: true });
+    }
+    searchInputRef.current?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filterKey, setSearchParams]);
+
   const visible = useMemo(
-    () => (candidates ?? []).filter((c) => matchesCandidateFilters(c, filters)),
+    () =>
+      (candidates ?? []).filter(
+        (c) => matchesCandidateFilters(c, filters) && matchesCandidateSearch(c, filters.query),
+      ),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [candidates, filterKey],
   );
+
+  /**
+   * Phone is searchable only where the payload carries it: the list API nulls
+   * `phone_e164` for every role that may not see it, so the placeholder never
+   * advertises a search this viewer cannot run.
+   */
+  const phoneSearchable = useMemo(
+    () => (candidates ?? []).some((c) => Boolean(c.phone_e164)),
+    [candidates],
+  );
+
+  /**
+   * The result count for a screen reader: ALWAYS mounted (a live region
+   * announces reliably only if it exists before its text changes) and
+   * DEBOUNCED, so typing "sarah" is one announcement, not five. It says the
+   * count only and never echoes the query.
+   */
+  const [searchAnnouncement, setSearchAnnouncement] = useState("");
+  const searchResultCount = candidates && filters.query ? visible.length : null;
+  useEffect(() => {
+    if (searchResultCount === null) {
+      setSearchAnnouncement("");
+      return;
+    }
+    const next =
+      searchResultCount === 0
+        ? "No candidates match"
+        : `${searchResultCount} ${searchResultCount === 1 ? "candidate matches" : "candidates match"}`;
+    const t = window.setTimeout(() => setSearchAnnouncement(next), 400);
+    return () => window.clearTimeout(t);
+  }, [searchResultCount]);
 
   const page = usePagination(visible, 10, filterKey);
 
@@ -556,28 +641,87 @@ export function CandidatesPage() {
               </span>
             )}
           </h2>
-          {roleOptions.length > 0 && (
-            <div className="w-full sm:w-56">
-              <label htmlFor="role-filter" className="sr-only">
-                Filter by role
+          <div className="flex w-full flex-wrap items-center gap-3 sm:w-auto">
+            {/* SEARCH. Not a <form>: Enter submits nothing, the list follows the
+                typing. `type="search"` gives the searchbox role; the browser's
+                own cancel glyph is hidden in favour of one real, labelled
+                button that every engine shows. */}
+            <div role="search" aria-label="Candidates" className="relative w-full sm:w-72">
+              <label htmlFor="candidate-search" className="sr-only">
+                Search candidates
               </label>
-              <SelectField
-                id="role-filter"
-                value={roleId ?? ""}
-                onChange={(e) => setRole(e.target.value)}
-                aria-label="Filter by role"
-                className="w-full"
-              >
-                <option value="">All roles</option>
-                {roleOptions.map((option) => (
-                  <option key={option.id} value={option.id}>
-                    {option.label}
-                  </option>
-                ))}
-              </SelectField>
+              <CandidateInput
+                id="candidate-search"
+                ref={searchInputRef}
+                type="search"
+                value={draft}
+                onChange={(e) => setDraft(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Escape" && draft) {
+                    e.preventDefault();
+                    clearSearch();
+                  }
+                }}
+                placeholder={phoneSearchable ? "Name, email or phone" : "Name or email"}
+                aria-describedby="candidate-search-hint"
+                maxLength={CANDIDATE_QUERY_MAX}
+                autoComplete="off"
+                spellCheck={false}
+                enterKeyHint="search"
+                className="w-full pr-11 [&::-webkit-search-cancel-button]:appearance-none"
+              />
+              <span id="candidate-search-hint" className="sr-only">
+                {phoneSearchable
+                  ? "Matches name, email or phone. Results update as you type."
+                  : "Matches name or email. Results update as you type."}
+              </span>
+              {draft && (
+                <button
+                  type="button"
+                  onClick={clearSearch}
+                  aria-label="Clear search"
+                  className="absolute inset-y-0 right-0 inline-flex min-w-11 items-center justify-center rounded-control text-[var(--c-ink-secondary)] hover:text-[var(--c-ink)] focus:outline-none focus-visible:ring-2 focus-visible:ring-[var(--c-accent)]"
+                >
+                  <span aria-hidden="true">×</span>
+                </button>
+              )}
             </div>
-          )}
+            {roleOptions.length > 0 && (
+              <div className="w-full sm:w-56">
+                <label htmlFor="role-filter" className="sr-only">
+                  Filter by role
+                </label>
+                <SelectField
+                  id="role-filter"
+                  value={roleId ?? ""}
+                  onChange={(e) => setRole(e.target.value)}
+                  aria-label="Filter by role"
+                  className="w-full"
+                >
+                  <option value="">All roles</option>
+                  {roleOptions.map((option) => (
+                    <option key={option.id} value={option.id}>
+                      {option.label}
+                    </option>
+                  ))}
+                </SelectField>
+              </div>
+            )}
+          </div>
         </div>
+
+        <p role="status" className="sr-only">
+          {searchAnnouncement}
+        </p>
+
+        {/* The list API stops at PostgREST's 1,000-row cap; a search over a
+            capped list would silently miss the older rows. */}
+        {filters.query && candidates && candidates.length >= 1000 && (
+          <InlineNotice tone="warning" className="mt-3">
+            Showing the newest {candidates.length.toLocaleString()} candidates; search covers only
+            these.
+          </InlineNotice>
+        )}
 
         {/* THE BAR IS THE FILTER. It was briefly a chart ABOVE the chips,
             which meant four rows of label+number where there had been two —
@@ -698,6 +842,12 @@ export function CandidatesPage() {
         {active && (
           <div className="mt-3 flex flex-wrap items-center gap-2 text-label text-[var(--c-ink-secondary)]">
             <span className="font-medium">Active filters:</span>
+            {filters.query && (
+              <FilterChip
+                label={`Search: “${filters.query}”`}
+                onRemove={() => applyFilters({ query: "" })}
+              />
+            )}
             {roleTitle && (
               <FilterChip
                 label={`Role: ${roleTitle}`}
@@ -781,7 +931,22 @@ export function CandidatesPage() {
         {!error &&
           candidates !== null &&
           candidates.length > 0 &&
-          visible.length === 0 && (
+          visible.length === 0 &&
+          (filters.query && !hasActiveFilters({ ...filters, query: "" }) ? (
+            <EmptyPanel
+              title={`No candidates match “${filters.query}”`}
+              hint={
+                phoneSearchable
+                  ? "Search covers name, email and phone."
+                  : "Search covers name and email."
+              }
+              action={
+                <Button variant="secondary" size="sm" onClick={clearSearch}>
+                  Clear search
+                </Button>
+              }
+            />
+          ) : (
             <EmptyPanel
               title="No candidates match these filters"
               action={
@@ -790,7 +955,7 @@ export function CandidatesPage() {
                 </Button>
               }
             />
-          )}
+          ))}
 
         {!error && visible.length > 0 && (
           <>
@@ -933,6 +1098,9 @@ export function CandidatesPage() {
     </CandidateShell>
   );
 }
+
+/** How long typing settles before the search is written to the URL. */
+const SEARCH_COMMIT_MS = 200;
 
 function FilterChip({
   label,

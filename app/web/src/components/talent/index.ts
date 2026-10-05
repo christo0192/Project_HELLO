@@ -70,7 +70,15 @@ export {
   hasActiveFilters,
   candidateFunnel,
   candidateNextAction,
+  CANDIDATE_QUERY_MAX,
+  normalizeCandidateQuery,
 } from './candidateFilters';
+export {
+  foldSearchText,
+  candidateSearchTokens,
+  matchesCandidateSearch,
+  PHONE_MIN_DIGITS,
+} from './candidateSearch';
 export type {
   CandidateFilters,
   CandidateStatusKey,
