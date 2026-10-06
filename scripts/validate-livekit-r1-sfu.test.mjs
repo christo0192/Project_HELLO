@@ -34,6 +34,7 @@ const goodDockerfile = readFileSync(path.join(source, "Dockerfile"), "utf8");
 const goodTemplate = readFileSync(path.join(source, "livekit.yaml.tmpl"), "utf8");
 const readme = readFileSync(path.join(source, "README.md"), "utf8");
 const page = readFileSync(path.join(source, "spike/index.html"), "utf8");
+const s0eProbe = readFileSync(path.join(source, "spike/s0e-probe.html"), "utf8");
 const mint = readFileSync(path.join(source, "spike/mint-token.mjs"), "utf8");
 const coldDispatch = readFileSync(path.join(source, "spike/cold-dispatch-diagnosis.mjs"), "utf8");
 const dispatchDiagnosis = readFileSync(path.join(source, "spike/dispatch-diagnosis.spec.mjs"), "utf8");
@@ -53,12 +54,18 @@ ok(/Local Docker smoke test/.test(readme) && /LIVEKIT_R1_FGS_IP_OVERRIDE=127\.0\
 ok(/Config A first/.test(readme) && /Config B only if Config A fails/.test(readme) && /forced-TCP/.test(readme), "runbook must require Config A before opt-in Config B, including forced TCP");
 ok(/CRLF/.test(readme) && /LIVEKIT_KEYS/.test(readme) && /collide/.test(readme), "runbook must document the CRLF and LIVEKIT_KEYS parser-collision fixes");
 ok(/cdn\.jsdelivr\.net\/npm\/livekit-client/.test(page) && /URLSearchParams/.test(page) && /createLocalAudioTrack/.test(page) && /createLocalVideoTrack/.test(page), "spike page must use CDN LiveKit client, query/form inputs, microphone, and camera");
+for (const [label, html] of [["spike page", page], ["S0-E probe", s0eProbe]]) {
+  ok(/import\s*\{\s*assertSpikeUrl\s*\}\s*from\s*["']\.\/spike-host\.mjs["']/.test(html), `${label} must import the shared host fence`);
+  ok(!/(?:function\s+assertSpikeUrl\b|const\s+assertSpikeUrl\s*=)/.test(html), `${label} must not duplicate the host fence`);
+  ok(html.indexOf("assertSpikeUrl(") < html.indexOf("room.connect("), `${label} must validate the URL before room.connect`);
+}
 ok(/width: 640, height: 360, frameRate: 15/.test(page) && /simulcast: false/.test(page) && /maxBitrate: 500_000/.test(page), "spike page must publish the prescribed 640x360/15fps, no-simulcast, 500k video");
 ok(/manager\?\.publisher/.test(page) && /manager\?\.subscriber/.test(page) && /getStats\(\)/.test(page) && /NO-GO: no selected UDP/.test(page) && /setInterval\(.*5_000/.test(page) && /currentRoundTripTime/.test(page) && /jitter/.test(page) && /packetsLost/.test(page) && /framesPerSecond/.test(page) && /qualityLimitation/.test(page), "spike page must sample public PCTransport stats and mark a missing selected UDP pair NO-GO");
 ok(/RoomServiceClient/.test(mint) && /AgentDispatchClient/.test(mint) && /createRoom/.test(mint) && /createDispatch/.test(mint) && /canPublishSources/.test(mint) && /canPublishData: false/.test(mint) && !/r1-spike-agent/.test(mint), "mint helper must create a room, dispatch r1-spike, and mint only a least-privilege candidate token");
 ok(/agent_name(?:=|"\s*:\s*)"r1-spike"/.test(echo) && /AudioStream/.test(echo) && /capture_frame/.test(echo) && /participant_disconnected/.test(echo) && /await candidate_left/.test(echo) && /await source\.aclose\(\)/.test(echo), "echo worker must return subscribed audio until the candidate disconnects, then close its source");
 const spikeTools = [mint, coldDispatch, dispatchDiagnosis, laptopCheck, echo, s0eAgent];
 ok(spikeTools.every((tool) => /assertSpikeUrl|assert_spike_url/.test(tool)) && /SPIKE_HOST/.test(spikeHost) && /project-hello-r1-rtc-spike\.fly\.dev/.test(spikeHost), "all spike tools must use the shared exact-host fence without an environment override");
+ok(spikeTools.every((tool) => !/\b(?:R1_)?SPIKE_HOST\b|\bLIVEKIT_HOST\b/.test(tool)), "no spike tool may reference an environment override for the host");
 ok(!/(?:browser-screener|phone-screener)/.test(echo), "echo worker must never use a production agent name");
 ok(/≥98%/.test(results) && /≥90%/.test(results) && /≤200ms/.test(results) && /≥12fps/.test(results) && /NO-GO/.test(results), "results template must preserve v2 S0-F pass thresholds and kill switch");
 const cases = [

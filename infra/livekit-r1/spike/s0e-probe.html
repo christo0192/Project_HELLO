@@ -4,24 +4,11 @@
 <pre id="state">{"status":"booting"}</pre>
 <script type="module">
   import { Room, RoomEvent, createLocalAudioTrack, createLocalVideoTrack } from "https://cdn.jsdelivr.net/npm/livekit-client@2.21.0/+esm";
+  import { assertSpikeUrl } from "./spike-host.mjs";
 
   const state = { status: "booting", attributes: [], dataAttempt: null, outboundVideo: [], errors: [] };
   const write = () => document.querySelector('#state').textContent = JSON.stringify(state);
   let room, mic, camera;
-
-  const assertSpikeUrl = (value) => {
-    let parsed;
-    try { parsed = new URL(value); }
-    catch { throw new Error('LiveKit URL must be an absolute wss:// or https:// URL.'); }
-    const authority = value.match(/^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i)?.[1] || '';
-    const authorityHost = authority.slice(authority.lastIndexOf('@') + 1);
-    if (!['wss:', 'https:'].includes(parsed.protocol)
-      || parsed.hostname.toLowerCase() !== 'project-hello-r1-rtc-spike.fly.dev'
-      || parsed.username || parsed.password || parsed.port || authorityHost.includes(':')) {
-      throw new Error('LiveKit URL must use the approved disposable spike host without credentials or a port.');
-    }
-    return parsed.href;
-  };
 
   const videoStats = async () => {
     const report = await room?.engine?.pcManager?.publisher?.getStats?.();
@@ -34,7 +21,7 @@
 
   window.s0e = {
     async connect(url, token) {
-      try { url = assertSpikeUrl(url); }
+      try { url = assertSpikeUrl(url, 'LiveKit URL').href; }
       catch (error) { state.status = 'error'; state.errors.push(String(error)); write(); throw error; }
       room = new Room({ adaptiveStream: false, dynacast: false });
       room.on(RoomEvent.ParticipantAttributesChanged, (changed, participant) => {
