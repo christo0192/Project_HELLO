@@ -30,6 +30,7 @@ import { plivoWebhookRouter } from './routes/plivo-webhook.js';
 import { ashbyMissionControlRouter } from './routes/ashby-mission-control.js';
 import { ashbyReviewRouter } from './routes/ashby-review.js';
 import { phoneApiRouter } from './routes/phone.js';
+import { r1Router, r1InternalRouter } from './routes/r1.js';
 import { ashbyCandidateWorkflowRouter } from './routes/ashby-candidate-workflow.js';
 import { scorecardsRouter } from './routes/scorecards.js';
 import {
@@ -219,6 +220,9 @@ export function createApp(opts: CreateAppOptions = {}) {
   // recruiter auth because it uses a separate constant-time shared-secret
   // boundary and is still covered by the global per-IP limiter.
   app.use('/api/internal/assess', workerAssessRouter);
+  // Separate worker-only R1 boundary. Its configuration is lazy/never-throwing
+  // and it does not share the phone worker-context contract.
+  app.use('/api/internal/r1', express.json({ limit: '64kb' }), r1InternalRouter);
 
   // Internal phone-worker surface for the named phone voice worker. Mounted
   // beside the scoring callback and for the same reason: it uses the SAME
@@ -366,6 +370,7 @@ export function createApp(opts: CreateAppOptions = {}) {
     config: strictRateLimit, prefix: 'role-rephrase:', useUserKey: true,
   }));
   app.use('/api/candidates', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'candidates:', useUserKey: true }));
+  app.use('/api/interview-rounds', createRateLimitMiddleware({ config: defaultRateLimit, prefix: 'r1-rounds:', useUserKey: true }));
   app.use('/api/screening', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'screening:', useUserKey: true }));
   app.use('/api/assess', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'assess:', useUserKey: true }));
   app.use('/api/resumes', createRateLimitMiddleware({ config: strictRateLimit, prefix: 'resumes:', useUserKey: true }));
@@ -451,6 +456,7 @@ export function createApp(opts: CreateAppOptions = {}) {
   app.use('/api/roles', rolesRouter);
   app.use('/api/resumes', resumesRouter);
   app.use('/api/candidates', candidatesRouter);
+  app.use('/api', r1Router);
   // Read-only Ashby workflow card for a candidate. A separate router so the
   // Ashby integration stays out of the core candidates route; `/:id` above
   // never matches `/:id/ashby-workflow`, so ordering is not load-bearing.

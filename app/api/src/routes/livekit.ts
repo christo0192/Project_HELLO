@@ -54,6 +54,14 @@ const recordingLogger = createLogger('recording-finalize');
 
 export const livekitRouter = Router();
 
+/** Additive R1 fence: legacy browser recording/completion paths must never
+ * operate on an R1-bound session. Phone rows have NULL interview_round_id. */
+async function rejectR1Session(sessionId: string, res: import('express').Response): Promise<boolean> {
+  const { data } = await supabase.from('call_sessions').select('interview_round_id').eq('id', sessionId).maybeSingle();
+  if (data?.interview_round_id) { res.status(409).json({ error: 'r1_session' }); return true; }
+  return false;
+}
+
 /**
  * REC-03 (C-3, PROPOSED): reduced bounded browser audio-upload cap.
  * env.recordingMaxBytes = RECORDING_MAX_BYTES (default 25 MiB, hard max 50 MiB)
@@ -351,6 +359,7 @@ livekitRouter.post(
   async (req, res, next) => {
     try {
       const { grant_token, session_id } = req.body as { grant_token: string; session_id: string };
+      if (await rejectR1Session(session_id, res)) return;
 
       // ── Revocation/quarantine/deleted gate (REC-05, invariant 7) ──
       // Denies NEW mints within the (short) TTL; existing URLs expire
@@ -425,6 +434,7 @@ livekitRouter.post(
   async (req, res, next) => {
     try {
       const sessionId = req.params.sessionId;
+      if (await rejectR1Session(sessionId, res)) return;
       const grantHeader = req.headers['x-grant-token'];
       const grantToken = typeof grantHeader === 'string' && /^[a-f0-9]{64}$/.test(grantHeader)
         ? grantHeader
@@ -528,6 +538,7 @@ livekitRouter.post(
   async (req, res, next) => {
     try {
       const sessionId = req.params.sessionId;
+      if (await rejectR1Session(sessionId, res)) return;
       const file = req.file!;
       let user = req.authUser;
 

@@ -214,6 +214,18 @@ describe('VOI-08 assessment eligibility preflight', () => {
     }
   });
 
+  it('fences an R1-bound session before the legacy scorer reads transcript or provider state', async () => {
+    configureTable('call_sessions', ok({
+      ...sessionRow('completed', 'conversation_complete'),
+      interview_round_id: '10000000-0000-4000-8000-000000000099',
+    }));
+
+    await expect(runAssessment(SESSION_ID)).rejects.toThrow('r1_session');
+    expect(runClaudeJSONWithProvenance).not.toHaveBeenCalled();
+    expect(fromCalls('transcript_turns')).toBe(0);
+    expect(fromCalls('assessments')).toBe(0);
+  });
+
   // ══════════════════════════════════════════════════════════════════
   //  2. ELIGIBLE path — completed + conversation_complete reaches scoring
   // ══════════════════════════════════════════════════════════════════

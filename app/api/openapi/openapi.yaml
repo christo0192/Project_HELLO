@@ -41,8 +41,62 @@ tags:
   - name: dsar
   - name: consent
   - name: csp
+  - name: r1
 
 paths:
+  /api/candidates/{id}/interview-rounds:
+    get:
+      tags: [r1]
+      operationId: listR1InterviewRounds
+      summary: List R1 rounds for a candidate (viewer+; no video URLs)
+      responses:
+        '200': { description: R1 round cards }
+    post:
+      tags: [r1]
+      operationId: sendR1InterviewRound
+      summary: Create an R1 round and return its one-time join URL
+      responses:
+        '201': { description: Created; Cache-Control is no-store }
+        '409': { description: R1 disabled, paused, ineligible, or at capacity }
+  /api/interview-rounds/{id}/cancel:
+    post:
+      tags: [r1]
+      operationId: cancelR1InterviewRound
+      responses: { '200': { description: Cancelled } }
+  /api/interview-rounds/{id}/reissue:
+    post:
+      tags: [r1]
+      operationId: reissueR1InterviewRound
+      responses: { '200': { description: New one-time join URL; old digest invalidated } }
+  /api/interview-rounds/{id}/grant-retake:
+    post:
+      tags: [r1]
+      operationId: grantR1Retake
+      responses: { '200': { description: Retake granted when remaining count permits } }
+  /api/admin/r1/settings:
+    get:
+      tags: [r1]
+      operationId: getR1Settings
+      responses: { '200': { description: R1 settings and lazy runtime status } }
+    put:
+      tags: [r1]
+      operationId: updateR1Settings
+      responses: { '200': { description: Updated, audited R1 settings } }
+  /api/internal/r1/context:
+    post:
+      tags: [r1]
+      operationId: getR1WorkerContext
+      responses: { '200': { description: Sanitized R1 worker context } }
+  /api/internal/r1/usage:
+    post:
+      tags: [r1]
+      operationId: writeR1Usage
+      responses: { '201': { description: Append-only R1 usage entry } }
+  /api/internal/r1/admin-log:
+    post:
+      tags: [r1]
+      operationId: writeR1AdministrationLog
+      responses: { '201': { description: Trusted, bounded R1 administration event } }
   # ── Health ──────────────────────────────────────────────────────────
   /api/health:
     get:

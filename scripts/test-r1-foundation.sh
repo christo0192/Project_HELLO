@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # R1 assertions run inside scripts/supabase-test.sh's already-started local
-# Supabase stack. It has applied the complete 0001..0116 chain: never use stubs.
+# Supabase stack. It has applied the complete 0001..0117 chain: never use stubs.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -13,7 +13,7 @@ trap cleanup EXIT INT TERM
 docker inspect "$SUPABASE_DB_CONTAINER" >/dev/null \
   || { log "ERROR: expected Supabase database container $SUPABASE_DB_CONTAINER"; exit 1; }
 
-log 'Running R1 assertions against the complete 0001..0116 schema...'
+log 'Running R1 assertions against the complete 0001..0117 schema...'
 docker exec -i "$SUPABASE_DB_CONTAINER" \
   psql -U postgres -d postgres -q -v ON_ERROR_STOP=1 \
   < "$TESTS/r1_foundation_assert.sql"

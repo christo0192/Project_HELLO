@@ -310,4 +310,29 @@ begin
 end;
 $$;
 
+-- M2: worker-only append tables remain RLS-protected, while capacity views
+-- execute as the caller and cannot be used as a write path into phone/legacy
+-- sources. These are catalog assertions against the applied full chain, not
+-- regex checks of the migration text.
+do $$
+begin
+  perform _r1_tests.assert('M2 ledger and administration log have RLS with no caller grants',
+    (select relrowsecurity from pg_class where oid = 'screening_v2.r1_usage_ledger'::regclass)
+    and (select relrowsecurity from pg_class where oid = 'screening_v2.r1_admin_log'::regclass)
+    and not has_table_privilege('anon', 'screening_v2.r1_usage_ledger', 'select')
+    and not has_table_privilege('authenticated', 'screening_v2.r1_usage_ledger', 'insert')
+    and not has_table_privilege('anon', 'screening_v2.r1_admin_log', 'select')
+    and not has_table_privilege('authenticated', 'screening_v2.r1_admin_log', 'insert')
+    and has_table_privilege('service_role', 'screening_v2.r1_usage_ledger', 'insert')
+    and has_table_privilege('service_role', 'screening_v2.r1_admin_log', 'insert'));
+  perform _r1_tests.assert('M2 estimate views use security_invoker and are read-only',
+    (select reloptions @> array['security_invoker=true'] from pg_class where oid = 'screening_v2.v_webrtc_minutes_estimate'::regclass)
+    and (select reloptions @> array['security_invoker=true'] from pg_class where oid = 'screening_v2.v_r1_budget_month'::regclass)
+    and not has_table_privilege('service_role', 'screening_v2.v_webrtc_minutes_estimate', 'insert')
+    and not has_table_privilege('service_role', 'screening_v2.v_r1_budget_month', 'update')
+    and pg_relation_is_updatable('screening_v2.v_webrtc_minutes_estimate'::regclass, true) = 0
+    and pg_relation_is_updatable('screening_v2.v_r1_budget_month'::regclass, true) = 0);
+end;
+$$;
+
 drop schema _r1_tests cascade;

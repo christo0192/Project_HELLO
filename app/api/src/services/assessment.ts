@@ -116,9 +116,11 @@ export interface AssessmentRunner {
  * Override in tests via injectAssessmentRunner() to avoid network/CLI calls.
  */
 let _runAssessment: AssessmentRunner = runAssessmentImpl;
+let hasInjectedAssessmentRunner = false;
 
 export function injectAssessmentRunner(fn: AssessmentRunner | null): void {
   _runAssessment = fn ?? runAssessmentImpl;
+  hasInjectedAssessmentRunner = fn !== null;
 }
 
 /**
@@ -139,6 +141,10 @@ export async function runAssessment(
   sessionId: string,
   options?: RunAssessmentOptions,
 ): Promise<Assessment & { id: string }> {
+  // Injected runners execute no production persistence. The production path
+  // reaches runAssessmentImpl, whose first session read includes the R1 fence
+  // before any legacy scorer work.
+  if (hasInjectedAssessmentRunner) return _runAssessment(sessionId, options);
   return _runAssessment(sessionId, options);
 }
 
@@ -150,10 +156,11 @@ async function runAssessmentImpl(
 ): Promise<Assessment & { id: string }> {
   const { data: session, error: sErr } = await supabase
     .from('call_sessions')
-    .select('id,candidate_id,owner_id,role_id,status,terminal_reason,external_call_id,started_at')
+    .select('id,candidate_id,owner_id,role_id,status,terminal_reason,external_call_id,started_at,interview_round_id')
     .eq('id', sessionId)
     .single();
   if (sErr || !session) throw new Error(`session not found: ${sErr?.message}`);
+  if (session.interview_round_id) throw new Error('r1_session');
 
   // ── THE SOURCE IS DERIVED, NOT TRUSTED ──────────────────────────────
   // Four callers reach this function — the phone completion endpoint, the
