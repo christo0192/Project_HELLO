@@ -290,7 +290,7 @@ class TestGateFlowFlag(unittest.TestCase):
         # make `determinstic` — a plausible typo — select model-authored
         # pre-consent speech. Here every unrecognised token falls back.
         self.assertEqual(phone.phone_gate_flow(), "deterministic")
-        self.assertTrue(phone.phone_deterministic_opener())
+        self.assertFalse(phone.phone_deterministic_opener())
         for typo in ("determinstic", "deterministc", "scripted", "off", "0", ""):
             os.environ["PHONE_GATE_FLOW"] = typo
             self.assertEqual(phone.phone_gate_flow(), "deterministic", typo)

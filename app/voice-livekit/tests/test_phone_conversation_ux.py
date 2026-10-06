@@ -2,10 +2,12 @@
 import asyncio
 import types
 import unittest
+import sys
 from unittest.mock import AsyncMock, patch
 
 import phone
 from test_phone_gate import agent_mod
+import test_phone_gate as harness
 
 
 class ConversationGateTests(unittest.IsolatedAsyncioTestCase):
@@ -95,6 +97,23 @@ class ConversationGateTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("consent.failed", events)
         self.assertFalse(any("booked" in s.lower() for s in spoken))
 
+    async def test_end_request_wins_over_a_callback_time_at_each_gate_stage(self):
+        for identity, replies in (
+            (True, ["Hang up, call me tomorrow at 3 pm"]),
+            (False, ["Hang up, call me tomorrow at 3 pm"]),
+            (False, ["I'm busy", "Hang up, call me tomorrow at 3 pm"]),
+        ):
+            _, client, spoken, events, _ = await self.gate(replies, identity=identity)
+            client.propose_callback.assert_not_awaited()
+            self.assertEqual(events[-1], "candidate.deferred_pre_disclosure")
+            self.assertEqual(spoken[-1], phone.PHONE_CANDIDATE_END_TEXT)
+
+    async def test_time_correction_is_not_recording_refusal(self):
+        result, client, _, events, _ = await self.gate(["I'm busy", "No, tomorrow at 3 pm"])
+        self.assertEqual(result.outcome, phone.HALT_CALLBACK_SCHEDULED)
+        client.confirm_callback.assert_awaited_once()
+        self.assertNotIn("disclosure.refused", events)
+
     async def test_invalid_draft_is_never_spoken(self):
         draft = "Hi, is this Taylor? This call is recorded. Okay to continue?"
         _, _, spoken, _, _ = await self.gate(["No thanks"], draft=draft)
@@ -128,3 +147,69 @@ class IntentTests(unittest.TestCase):
             self.assertTrue(phone.phone_qna_acknowledgement(text))
         for text in ("Okay, but what is the salary?", "Thanks, and how about shifts", "Yeah, so", "Okay?"):
             self.assertFalse(phone.phone_qna_acknowledgement(text))
+
+
+class CandidateQnaTests(unittest.IsolatedAsyncioTestCase):
+    async def enter(self):
+        values = await harness.TestBoundedCandidateQna()._enter_qna()
+        hooks = values[-1]
+
+        async def cleanup():
+            hooks["task"].cancel()
+            await asyncio.gather(hooks["task"], return_exceptions=True)
+            hooks["log_patch"].stop()
+
+        self.addAsyncCleanup(cleanup)
+        return values
+
+    async def turn(self, hooks, text):
+        ctx = types.SimpleNamespace(items=[])
+        await hooks["on_native_turn"](text, types.SimpleNamespace(text_content=text), ctx)
+        return str(ctx.items).lower()
+
+    async def test_four_questions_are_answered_without_four_invitations(self):
+        agent, _, _, client, hooks = await self.enter()
+        for text in ("How large is the team?", "What are the work hours?",
+                     "Who would I report to?", "When is the next round?"):
+            instruction = await self.turn(hooks, text)
+            self.assertIn("answer", instruction)
+            self.assertIn("do not ask a question or invite more questions", instruction)
+            self.assertNotIn("anything else", instruction)
+            self.assertEqual(agent._closing_state_machine.state.value, "candidate_qna")
+        self.assertNotIn("assessment.completed", client.event_types)
+
+    async def test_ack_after_delivered_answer_closes_once(self):
+        for ack in ("Okay", "Thanks", "Got it"):
+            agent, _, _, client, hooks = await self.enter()
+            await self.turn(hooks, "How large is the team?")
+            await agent._on_reply_delivered(False, hooks["speech_sequence"][0] + 1)
+            instruction = await self.turn(hooks, ack)
+            self.assertIn("say goodbye", instruction)
+            self.assertNotIn("anything else", instruction)
+            self.assertEqual(agent._closing_state_machine.state.value, "closing_pending")
+            # Completion must wait for the farewell delivery path.
+            self.assertNotIn("assessment.completed", client.event_types)
+
+    async def test_ack_before_answer_is_delivered_does_not_close(self):
+        agent, _, _, _, hooks = await self.enter()
+        await self.turn(hooks, "How large is the team?")
+        with self.assertRaises(sys.modules["livekit.agents"].StopResponse):
+            await self.turn(hooks, "Okay")
+        self.assertEqual(agent._closing_state_machine.state.value, "candidate_qna")
+
+    async def test_ack_with_question_is_answered_even_after_delivery(self):
+        agent, _, _, _, hooks = await self.enter()
+        await self.turn(hooks, "How large is the team?")
+        await agent._on_reply_delivered(False, hooks["speech_sequence"][0] + 1)
+        instruction = await self.turn(hooks, "Thanks, but what are the work hours?")
+        self.assertIn("do not say goodbye yet", instruction)
+        self.assertEqual(agent._closing_state_machine.state.value, "candidate_qna")
+
+    async def test_incomplete_interruption_gets_space_without_reinvitation(self):
+        agent, _, _, _, hooks = await self.enter()
+        await self.turn(hooks, "How large is the team?")
+        hooks["reply_handle"][0] = harness._FakeSpeech(interrupted=True)
+        instruction = await self.turn(hooks, "Uh, yeah, so")
+        self.assertIn("take your time", instruction)
+        self.assertNotIn("anything else", instruction)
+        self.assertEqual(agent._closing_state_machine.state.value, "candidate_qna")

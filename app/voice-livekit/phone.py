@@ -1525,32 +1525,11 @@ def phone_bounce_mode() -> bool:
 
 
 def phone_deterministic_opener() -> bool:
-    """Fixed, scripted consent + role openings instead of LLM-authored ones.
-    DEFAULT ON — an explicit off token (``false``/``0``/``no``/``off``, case-
-    insensitive) disables it; anything else (incl. unset) leaves it ON.
+    """Natural validated drafts by default; explicit true is scripted rollback.
 
-    RCA (session 4355b045 retest, 2026-09-09): the openings were LLM-authored
-    and SPOKEN BEFORE they were verified. ``speak_opening`` streams the model's
-    greeting to TTS and waits for playout, THEN ``run_phone_gate`` verifies it;
-    a model that disobeyed its instruction and appended an identity question
-    ("am I speaking to Christo?") was HEARD, and the fixed ``PHONE_DISCLOSURE_TEXT``
-    was then spoken ON TOP — a double opener with no gap. The role opener
-    (``speak_role_opening`` -> ``_deliver_role_opening`` fixed fallback) has the
-    identical speak-then-verify shape.
-
-    When this is ON, the consent opening is the fixed ``PHONE_DISCLOSURE_TEXT``
-    and the role opening is the fixed ``phone_role_opening_text`` — never
-    LLM-authored — so nothing can be spoken-then-contradicted, and two
-    opening-time model generations are removed (a small latency win). The
-    bounded SIP-output-subscription warm-up (baseline fix 4a) is preserved on
-    the deterministic path. Set ``PHONE_DETERMINISTIC_OPENER=false`` to restore
-    the LLM-authored openers. Read at the call site with the literal name so the
-    env-contract scanner sees it.
+    Unrecognized nonempty values retain the conservative scripted behavior.
+    Unlike the retired streaming opener, a rejected draft is never audible.
     """
-    # Default stays ON (scripted). See `phone_gate_flow` for why the 2026-09-11
-    # flip was dropped: production selects the authored openers by SECRET, so an
-    # unconfigured deployment keeps the verified-by-construction copy and a
-    # mistyped rollback token still fails safe.
     return (os.getenv("PHONE_DETERMINISTIC_OPENER") or "false").strip().lower() not in (
         "false", "0", "no", "off",
     )
@@ -3667,7 +3646,8 @@ PHONE_PATIENCE_ENCOURAGEMENT_TEXT = (
 #: correct-false-claims, vary-openings) stay here in the cached prefix.
 PHONE_TURN_DISCIPLINE_TEXT = (
     "\n\nConversation discipline (mandatory):\n"
-    "- Ask exactly ONE question per turn — never two. Do not stack a second "
+    "- Ask at most ONE question per turn — never two. During candidate Q&A, "
+    "answer without appending another invitation for questions. Do not stack a second "
     "question while the candidate is still forming their answer.\n"
     "- If the candidate has not yet substantively answered the current "
     "question — a filler, a hesitation, or a half-formed thought is not an "
@@ -4028,7 +4008,7 @@ async def _tts_early_flush_segments(text: Any, min_chars: int) -> Any:
 #: ~2 KB long-form payload every turn.
 PHONE_PER_TURN_STYLE_TEXT = (
     "Style (phone line): plain spoken text only — never markdown, asterisks, "
-    "underscores or backticks. Ask exactly ONE question this turn, never two. "
+    "underscores or backticks. Ask at most ONE question this turn, never two. "
     "React with genuine warmth and light professional humour (the line is "
     "narrow, so carry the energy in your words), but never joke about the "
     "candidate or their answers, and never during consent, recording "
@@ -5743,6 +5723,7 @@ CLASSIFY_WRONG_NUMBER = "wrong_number"
 #: next IST day.
 CLASSIFY_DEFERRED_PRE_DISCLOSURE = "deferred_pre_disclosure"
 CLASSIFY_CALLBACK_REQUESTED = "callback_requested"
+CLASSIFY_END_REQUESTED = "end_requested"
 
 
 def phone_preconsent_callback_requested(text: Any) -> bool:
@@ -7232,6 +7213,11 @@ async def run_phone_gate(
                 isinstance(draft, str) and len(draft) <= 650
                 and draft.count("?") == 1
                 and _identity_line_asks_identity(draft)
+                and (gate_turns or (
+                    "christy" in draft.lower()
+                    and re.search(r"\bAI\b", draft, re.IGNORECASE)
+                    and _COMPANY.lower() in draft.lower()
+                ))
             )
             line = draft.strip() if valid else fixed_line
             await _say(line)
@@ -7294,6 +7280,11 @@ async def run_phone_gate(
             gate_turns.append({"speaker": "candidate", "text": reply})
         return reply
 
+    async def _end_before_consent() -> PhoneGateResult:
+        result = await _terminal_outcome(CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        await _say(PHONE_CANDIDATE_END_TEXT)
+        return result
+
     async def _schedule_before_consent(first_reply: str) -> PhoneGateResult:
         """Use the existing calendar pipeline without authorizing screening."""
         await _await_answered_post()
@@ -7301,7 +7292,16 @@ async def run_phone_gate(
         reply = first_reply
         for _ in range(5):
             verdict = classify_gate_reply(reply) if classify_gate_reply else None
-            if verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER, CLASSIFY_REFUSED}:
+            if verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER}:
+                return await _terminal_outcome(verdict)
+            if is_explicit_end_call_request(reply):
+                return await _end_before_consent()
+            # 'No, tomorrow at three' corrects the proposed TIME; it is not a
+            # recording refusal. Strong recording/participation refusals remain
+            # terminal even when they also mention a time.
+            if verdict == CLASSIFY_REFUSED and re.search(
+                r"\brecord\w*\b|\bnot interested\b", reply, re.IGNORECASE,
+            ):
                 return await _terminal_outcome(verdict)
             decision = await run_callback_turn(
                 flow, client, attempt_id, reply, datetime.now(timezone.utc),
@@ -7337,6 +7337,8 @@ async def run_phone_gate(
         )
         identity_reply = first_reply
         gate_verdict = classify_gate_reply(first_reply) if classify_gate_reply else None
+        if is_explicit_end_call_request(first_reply):
+            return await _end_before_consent()
         if gate_verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER}:
             return await _terminal_outcome(gate_verdict)
         if gate_verdict == CLASSIFY_CALLBACK_REQUESTED:
@@ -7356,6 +7358,8 @@ async def run_phone_gate(
             )
             identity_reply = second_reply
             gate_verdict = classify_gate_reply(second_reply) if classify_gate_reply else None
+            if is_explicit_end_call_request(second_reply):
+                return await _end_before_consent()
             if gate_verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER}:
                 return await _terminal_outcome(gate_verdict)
             if gate_verdict == CLASSIFY_CALLBACK_REQUESTED:
@@ -7574,6 +7578,8 @@ async def run_phone_gate(
                     "unknown_event", error_type="phone_consent_endpointing",
                     schema="restore_failed", duration_sec=normal_max,
                 )
+    if decision == CLASSIFY_END_REQUESTED:
+        return await _end_before_consent()
     if decision == CLASSIFY_CALLBACK_REQUESTED and consent_reply_out:
         return await _schedule_before_consent(consent_reply_out[-1])
     if decision not in PHONE_CLASSIFICATIONS:

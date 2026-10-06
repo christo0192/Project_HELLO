@@ -2845,6 +2845,8 @@ def classify_answer_text(text: str) -> str | None:
         return phone.CLASSIFY_WRONG_NUMBER
     if _OPT_OUT_RE.search(value):
         return phone.CLASSIFY_OPT_OUT
+    if phone.is_explicit_end_call_request(value):
+        return phone.CLASSIFY_END_REQUESTED
     if (phone.phone_preconsent_callback_requested(value)
             and not _RECORDING_CONFLICT_RE.search(value)
             and not re.search(r"\bnot interested\b", value, re.IGNORECASE)):
@@ -3808,6 +3810,7 @@ async def _run_native_phone_screening(
     generation_empty_reason: list[str | None] = [None]
     closing = ClosingStateMachine()
     qna_rounds = {"value": 0}
+    qna_answer_delivery = {"sequence": None, "delivered": False}
     silence_prompted = {"value": False}
     # The bounded in-call callback negotiation. `None` until the candidate first
     # asks for a callback; then a forward-only state machine that CANNOT loop
@@ -5301,6 +5304,11 @@ async def _run_native_phone_screening(
         patience_on = phone.phone_patience_gate_enabled()
         route = phone.candidate_turn_route(text)
         substance = phone.phone_turn_substance(text) if patience_on else None
+        qna_ack = (
+            closing.state is ClosingState.CANDIDATE_QNA
+            and qna_answer_delivery["delivered"] and not prior_interrupted
+            and phone.phone_qna_acknowledgement(text)
+        )
         # Callback intent outranks Q&A and authored closing. Until the goodbye
         # has cleanly played, teardown is cancellable and the bounded callback
         # flow owns subsequent candidate turns.
@@ -5343,6 +5351,7 @@ async def _run_native_phone_screening(
         # reason — its comment names the doom-loop session it was written for.
         if (
             patience_on
+            and not qna_ack
             and not prior_interrupted
             and (route == "hesitation" or substance == phone.PHONE_SUBSTANCE_HESITATION)
         ):
@@ -5406,8 +5415,14 @@ async def _run_native_phone_screening(
 
             # Invite once on entry. Acknowledgement after an answer closes;
             # unfinished thoughts get space, never another invitation.
-            qna_ack = qna_rounds["value"] > 0 and phone.phone_qna_acknowledgement(text)
             if phone.phone_qna_incomplete(text) and not qna_ack:
+                if prior_interrupted:
+                    set_reply_snapshot("Take your time.", phase="candidate_qna")
+                    setattr(agent, "_turn_policy", "clarification")
+                    add_turn_instruction(turn_ctx, "The candidate is forming a thought after "
+                                         "interrupting you. Say only 'Take your time.' "
+                                         "Do not invite more questions or say goodbye.")
+                    return
                 from livekit.agents import StopResponse
                 raise StopResponse()
             # FIX D (2026-09-06): an EXPLICIT dismissal ("no follow up from me,
@@ -5480,6 +5495,7 @@ async def _run_native_phone_screening(
                 # `phone_qna_done` failed to catch) gets a neutral ack instead.
                 turn_is_question = route == "candidate_question"
                 if qna_rounds["value"] < phone.PHONE_QNA_MAX_ROUNDS:
+                    qna_answer_delivery.update(sequence=speech_sequence[0] + 1, delivered=False)
                     set_reply_snapshot(
                         "The hiring team can help with that detail."
                         if turn_is_question else
@@ -7571,6 +7587,8 @@ async def _run_native_phone_screening(
                 # Candidate speech must always be able to barge into recovery.
                 # Disabling interruptions caused LiveKit to discard the owner's
                 # next utterance in the production failure.
+                if snapshot.get("phase") == "candidate_qna":
+                    qna_answer_delivery.update(sequence=speech_sequence[0] + 1, delivered=False)
                 speech = session.say(fallback, allow_interruptions=True)
                 wait = getattr(speech, "wait_for_playout", None)
                 if callable(wait):
@@ -7615,6 +7633,9 @@ async def _run_native_phone_screening(
         interrupted: bool = False, delivered_seq: int | None = None,
     ) -> None:
         """Commit terminal intent only for its correlated speech handle."""
+        if (delivered_seq is not None
+                and delivered_seq == qna_answer_delivery["sequence"]):
+            qna_answer_delivery["delivered"] = not interrupted
         reason = pending_terminal_reason.get("value")
         expected_seq = pending_terminal_speech_seq.get("value")
         conflict_seq = conflict_delivery.get("sequence")
@@ -9799,112 +9820,6 @@ async def _run_phone_session(
             # (the first frame's own await backstops it). CancelledError is
             # BaseException (not Exception) so task cancellation still propagates.
             pass
-
-    async def _speak_gate_generation(instructions: str) -> str | None:
-        """THE gate-window generation. Every spoken gate line goes through here.
-
-        This is the NORMAL TURN PATH and that is the entire point (owner
-        directive, 2026-09-10: "i want the normal-turn streaming with turn ctx
-        and exactly like all the logics and llm, ttft, stt settings the other
-        normal turns has"). Setting `_gate_opening` makes `llm_node` stream the
-        generation token-by-token through `tts_node` even though screening is not
-        yet authorized, so the line carries the same `turn_ctx`, the same LLM,
-        the same TTFT first-fragment behaviour, the same voice and the same
-        STT/endpointing settings as every screening turn.
-
-        ONE implementation, three callers (identity, consent opening, role
-        opening). There were previously two hand-copies of this body and a third
-        out-of-band composer on a different endpoint; the copies are how a
-        `NameError` reached the only new terminal path in this branch's first
-        draft. Returns the text that was actually SPOKEN, or None if nothing was.
-
-        The FIRST generation of a call runs against an EMPTY chat context, and
-        Gemini refuses a request with no contents (400 INVALID_ARGUMENT, observed
-        live 2026-08-29 — the opening fell back to fixed copy on every call).
-        `user_input` seeds one user turn ("Hello?", which is what answering a
-        phone sounds like) so the request always carries contents. It is model
-        context only: it is not an STT turn, fires no turn hooks, and the gate
-        transcript takes the candidate's replies from the classifier path.
-        """
-        generate = getattr(session, "generate_reply", None)
-        if not callable(generate):
-            return None
-        setter = getattr(agent, "set_gate_opening", None)
-        if callable(setter):
-            setter(True)
-        latest_assistant[0] = None
-        _note_first_gate_audio(int(round(time.time() * 1000)))
-        try:
-            await _await_output_subscription()
-            try:
-                handle = generate(user_input="Hello?", instructions=instructions)
-            except TypeError:
-                # An older/stubbed session without the `user_input` seam.
-                handle = generate(instructions=instructions)
-            if inspect.isawaitable(handle):
-                handle = await handle
-            wait = getattr(handle, "wait_for_playout", None)
-            if callable(wait):
-                value = wait()
-                if inspect.isawaitable(value):
-                    await value
-        except Exception:  # noqa: BLE001
-            # NOT an unconditional None. `wait_for_playout()` can raise AFTER
-            # the frames have already gone out, and telling the gate "nothing
-            # was spoken" then makes it speak the full fixed opener over live
-            # audio. Fall through to the emitted latch, which knows.
-            failed = True
-        else:
-            failed = False
-        finally:
-            if callable(setter):
-                setter(False)
-        spoken_text = None if failed else latest_assistant[0]
-        if isinstance(spoken_text, str) and spoken_text.strip():
-            return spoken_text
-        # SPOKEN, BUT NOT READ BACK. `latest_assistant[0]` comes from the SDK's
-        # `conversation_item_added`, which can lag the audio, arrive empty, or
-        # not arrive at all — and `wait_for_playout` can raise after the frames
-        # have already left. Returning None in those cases would tell the gate
-        # "nothing was spoken", and the gate would then speak its full fixed
-        # opener ON TOP of a line the candidate already heard: the 2026-09-09
-        # double-opener, reproduced by the helper written to prevent it.
-        #
-        # So the agent reports what it actually knows — whether the gate window
-        # released audio — and an empty string means "spoken, text unknown".
-        # The gate repairs that case instead of restarting.
-        emitted = getattr(agent, "gate_stream_emitted", None)
-        if callable(emitted) and emitted():
-            return ""
-        return None
-
-    async def _speak_gate_line(instructions: str) -> str | None:
-        """Speak ONE model-authored gate line (the identity turn and its re-ask).
-
-        Returns None under `PHONE_DETERMINISTIC_OPENER` (the default), which is
-        what gives this change a THREE-stage rollout rather than one flip:
-
-          1. `PHONE_GATE_FLOW=deterministic`                → today, unchanged.
-          2. `conversational`, opener still deterministic   → the identity turn
-             runs with the FIXED copy: the new flow, no new generation.
-          3. `conversational` + `PHONE_DETERMINISTIC_OPENER=false` → the identity
-             line, the consent opening and the role line are all model-authored.
-
-        Stage 2 exists so the turn ORDER and the classifier can be proven on a
-        live call before model-authored pre-consent speech is switched on.
-        """
-        if phone.phone_deterministic_opener():
-            # Stage 1 (conversational flow, fixed copy): this returns None and
-            # the GATE speaks the fixed identity line — which means the first
-            # audio of the call is that `session.say`, not a generation. The
-            # subscription warm-up lives inside `_speak_gate_generation`, so
-            # without this the first frame pays the whole untimed
-            # `wait_for_subscription` stall that baseline-fix 4a exists to bound
-            # (~17-20 s, and it would eat the identity answer window and the
-            # lease with it).
-            await _await_output_subscription()
-            return None
-        return await _speak_gate_generation(instructions)
 
     def _mark_question_asked() -> None:
         """Anchor the gate's current question at NOW (ms).
