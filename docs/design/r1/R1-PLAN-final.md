@@ -1438,6 +1438,6 @@ Codes: PI = phone isolation, CA = conversation/assessment, FC = free-plan capaci
 | DT-15 | Concurrency 2 versus pool 1 | Fixed | Concurrency 1; owner pool step |
 | DT-16 | Video on by default at the PR-9 merge | Fixed | PR-9a ships off; PR-V flips |
 | DT-17 | "Merged" versus "deployed" dependencies; HR card disabled state | Fixed | §10 dependency definition; PR-7 disabled state |
-| DT-18 | D-004 check and ADR evidence timing | Fixed | ADRs Proposed in PR-0; evidence after S0; D-004 change only with an owner decision in the same PR |
+| DT-18 | D-004 check and ADR evidence timing | Fixed | ADR-0015/0016/0017 were accepted by the owner on 2026-10-06 (PR-0). S0 evidence is appended as it lands, and the S0, Legal and calibration gates still bind implementation steps. The D-004 wording changes only with an owner decision, in the same PR. |
 | DT-19 | "No existing test modified" inaccurate; fence keying | Fixed | §9 additive test edits listed; fence keyed on the `r1/` prefix or label |
 | DT-20 | S0-D needs R2 early | Fixed | §12 item 7 moved to this week |
