@@ -232,12 +232,18 @@ describe('engagementReasonLabel', () => {
       'window_closed', 'assessment_aborted', 'wrong_number', 'disclosure_refused',
       'candidate_opt_out', 'hr_cancelled', 'emergency_stop', 'ashby_stage_left', 'prereq_lost',
       'abandoned_pre_disclosure', 'consent_gate_failed', 'callback_deferred_in_call',
-      'callback_deferral_limit', 'late_score_after_stranded_abort',
+      'callback_deferral_limit', 'late_score_after_stranded_abort', 'screening_abandoned',
     ]) {
       const label = engagementReasonLabel(reason);
       expect(label, reason).not.toMatch(/_/);
       expect(label.charAt(0), reason).toBe(label.charAt(0).toUpperCase());
     }
+  });
+
+  it('names the 0115 zero-answer relabel neutrally (never Queued, never Screened)', () => {
+    const label = engagementReasonLabel('screening_abandoned');
+    expect(label).toBe('Abandoned: dropped before screening');
+    expect(label).not.toMatch(/queued|screened/i);
   });
 
   it('keeps the late completion apart from the abort it replaced', () => {

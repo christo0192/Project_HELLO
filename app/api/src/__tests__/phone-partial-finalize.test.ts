@@ -905,6 +905,9 @@ function makeAssessmentClient(opts: {
     from(table: string) {
       const builder = {
         select() { return builder; },
+        // 0115 (T06): the latest-phone-evidence read orders and limits.
+        order() { return builder; },
+        limit() { return builder; },
         eq(column: string, value: unknown) {
           if (table === 'phone_appointments') appointmentFilters.push([column, value]);
           return builder;
@@ -1361,8 +1364,12 @@ describe('0114 (C2) — the handler never scores a score-suppressed leg', () => 
     expect(order).toEqual([
       'from:phone_appointments',
       'rpc:phone_attempt_score_suppression',
+      // 0115 (T06): the zero-answer retry check, then (after the post) the
+      // relabel check. Not a 0-answer row here, so no relabel call.
+      'from:assessments',
       'score',
       'rpc:apply_phone_event',
+      'from:assessments',
     ]);
   });
 

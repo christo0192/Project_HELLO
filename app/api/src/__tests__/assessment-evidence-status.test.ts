@@ -163,7 +163,10 @@ beforeEach(() => {
 afterEach(() => injectAssessmentRunner(null));
 
 describe('phone first score — grade persisted, one status rule', () => {
-  it('a744741c shape (partial, 0/4 answered): insufficient, screened only from new/queued/screening, held at Ashby', async () => {
+  it('a744741c shape (partial, 0/4 answered, MEASURED): insufficient, held at Ashby, status NOT written (0115)', async () => {
+    // 0115 (M013 D1/D3): a measured 0-answer phone row was not a screening.
+    // The candidate stays at its pre-assessment status (`screening`); the
+    // handler relabels the engagement failed/screening_abandoned.
     setDefault('phone_session_progress', progress('asked_declined', 'asked_declined'));
     await runAssessment(SESSION_ID, { source: 'phone', partial: true, covered: 2, total: 4, disconnectReason: 'candidate_hangup' });
 
@@ -171,6 +174,31 @@ describe('phone first score — grade persisted, one status rule', () => {
     expect(payload).toMatchObject({
       evidence_grade: 'insufficient', evidence_reason: 'partial_thin', evidence_answered: 0, evidence_planned: 4,
       partial: true, source: 'phone',
+    });
+    expect(candidateUpdate()).toBeNull();
+    expect(callsFor('candidates', 'update')).toHaveLength(0);
+    // The scorecard and the Ashby hold are unchanged.
+    expect(observeAshbyCompletion).toHaveBeenCalledWith(SESSION_ID, expect.anything(), { evidenceGrade: 'insufficient' });
+  });
+
+  it('9f60523d shape (0 candidate turns, 0/5 MEASURED): no_candidate_speech, status NOT written (0115)', async () => {
+    setDefault('transcript_turns', ok([{ speaker: 'bot', text: 'Tell me about your last role.' }]));
+    setDefault('phone_session_plans', ok({ question_count: 5 }));
+    setDefault('phone_session_progress', progress());
+    await runAssessment(SESSION_ID, {
+      source: 'phone', partial: true, covered: 0, total: 5, disconnectReason: 'unobserved_disconnect',
+    });
+    expect(insertPayloads()[0]).toMatchObject({
+      evidence_grade: 'insufficient', evidence_reason: 'no_candidate_speech', evidence_answered: 0, evidence_planned: 5,
+    });
+    expect(candidateUpdate()).toBeNull();
+  });
+
+  it('partial, 1/4 answered: insufficient, screened only from new/queued/screening (rule unchanged)', async () => {
+    setDefault('phone_session_progress', progress('asked_answered', 'asked_declined'));
+    await runAssessment(SESSION_ID, { source: 'phone', partial: true, covered: 2, total: 4, disconnectReason: 'candidate_hangup' });
+    expect(insertPayloads()[0]).toMatchObject({
+      evidence_grade: 'insufficient', evidence_reason: 'partial_thin', evidence_answered: 1, evidence_planned: 4,
     });
     expect(candidateUpdate()).toEqual({
       status: 'screened',
@@ -180,7 +208,20 @@ describe('phone first score — grade persisted, one status rule', () => {
         ['neq', ['status', 'advanced']],
       ],
     });
-    expect(observeAshbyCompletion).toHaveBeenCalledWith(SESSION_ID, expect.anything(), { evidenceGrade: 'insufficient' });
+  });
+
+  it('UNMEASURED answered (a pre-0086 NULL disposition): insufficient, still screened (0115 keys on a measured 0 only)', async () => {
+    setDefault('phone_session_progress', progress(null, 'asked_declined'));
+    await runAssessment(SESSION_ID, { source: 'phone', partial: true, covered: 2, total: 4, disconnectReason: 'candidate_hangup' });
+    expect(insertPayloads()[0]).toMatchObject({ evidence_grade: 'insufficient', evidence_answered: null });
+    expect(candidateUpdate()?.status).toBe('screened');
+  });
+
+  it('no plan (answered NULL): insufficient/no_plan, still screened', async () => {
+    setDefault('phone_session_plans', ok(null));
+    await runAssessment(SESSION_ID, { source: 'phone', partial: true, covered: 1, total: 4, disconnectReason: 'candidate_hangup' });
+    expect(insertPayloads()[0]).toMatchObject({ evidence_grade: 'insufficient', evidence_reason: 'no_plan', evidence_answered: null });
+    expect(candidateUpdate()?.status).toBe('screened');
   });
 
   it('e3a187ed shape (complete reject, 2/4 answered): decision, rejected, never over advanced', async () => {
@@ -247,7 +288,8 @@ describe('browser — payload byte-identical, no coverage reads', () => {
 
 describe('stale schema — the evidence columns are not there yet', () => {
   it('retries the insert WITHOUT the evidence keys and still applies the grade from memory', async () => {
-    setDefault('phone_session_progress', progress('asked_declined'));
+    // 1 of 4 answered: insufficient, and (not being a measured 0) screened.
+    setDefault('phone_session_progress', progress('asked_answered'));
     queue('assessments',
       { data: null, error: { code: 'PGRST204', message: "Could not find the 'evidence_answered' column of 'assessments' in the schema cache" } },
       ok({ id: 'fresh-row' }));
@@ -279,16 +321,27 @@ describe('rescore — copies the superseded revision, recomputes only when it ha
     queue('assessments',
       ok(null), // idempotency read: unused request id
       ok({ id: 'prior', revision: 1, created_at: '2026-10-01T00:00:00Z' }), // latest revision
-      ok({ evidence_grade: 'insufficient', evidence_reason: 'partial_thin', evidence_answered: 0, evidence_planned: 4, partial: true, raw: {} }),
+      ok({ evidence_grade: 'insufficient', evidence_reason: 'partial_thin', evidence_answered: 1, evidence_planned: 4, partial: true, raw: {} }),
       ok({ id: 'rev-2' }));
     await runAssessment(SESSION_ID, { rescore: { requestId: REQUEST } });
     const [payload] = insertPayloads();
     expect(payload).toMatchObject({
       revision: 2, supersedes_assessment_id: 'prior',
-      evidence_grade: 'insufficient', evidence_reason: 'partial_thin', evidence_answered: 0, evidence_planned: 4,
+      evidence_grade: 'insufficient', evidence_reason: 'partial_thin', evidence_answered: 1, evidence_planned: 4,
     });
     expect(callsFor('phone_session_plans')).toHaveLength(0);
     expect(candidateUpdate()?.filters).toContainEqual(['in', ['status', ['new', 'queued', 'screening']]]);
+  });
+
+  it('a copied MEASURED 0-answer grade leaves the candidate status alone (0115)', async () => {
+    queue('assessments',
+      ok(null),
+      ok({ id: 'prior', revision: 1, created_at: '2026-10-01T00:00:00Z' }),
+      ok({ evidence_grade: 'insufficient', evidence_reason: 'partial_thin', evidence_answered: 0, evidence_planned: 4, partial: true, raw: {} }),
+      ok({ id: 'rev-2' }));
+    await runAssessment(SESSION_ID, { rescore: { requestId: REQUEST } });
+    expect(insertPayloads()[0]).toMatchObject({ evidence_grade: 'insufficient', evidence_answered: 0 });
+    expect(candidateUpdate()).toBeNull();
   });
 
   it('recomputes from the STORED partial/disconnect when the prior revision has no grade', async () => {

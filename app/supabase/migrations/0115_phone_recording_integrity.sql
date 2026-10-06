@@ -30,16 +30,23 @@
 --       30 minutes after the latest bound leg ended; and a reclaimed leg that
 --       shows teardown evidence is labelled `unobserved_disconnect`, not
 --       `worker_crash`.
+--   §5  Zero-answer relabel (T06). enforce_phone_engagement_transition
+--       (0114) is lifted in full with ONE more terminal relabel exception,
+--       completed -> failed/screening_abandoned, interlocked on a measured
+--       evidence_answered = 0; relabel_zero_answer_phone_engagement is its
+--       one writer (engagement relabel, candidate screened -> screening,
+--       audits; never requeues or redials).
 --
--- Later S02 tasks APPEND their own sections after §4 (T06: the zero-answer
--- relabel). S01, if it needs a migration, takes 0116 and must not re-declare
--- the functions this file owns.
+-- S01, if it needs a migration, takes 0116 and must not re-declare the
+-- functions this file owns.
 --
 -- Function ownership (checked on origin/main 6fec38a with
 -- `grep -lE "function screening_v2\.<fn>\b" migrations/*.sql | tail -1`):
 --   set_phone_session_duration ...................... 0076 (lifted here, §3)
 --   finalize_phone_partial_sessions ................. 0114 (lifted here, §4)
+--   enforce_phone_engagement_transition ............. 0114 (lifted here, §5)
 --   stamp_phone_attempt_room_name, phone_session_leg_duration ... new (§2/§3)
+--   relabel_zero_answer_phone_engagement ............ new (§5)
 --
 -- Conventions: `$$` bodies; no machine-clock reads in any function body;
 -- `set search_path = pg_catalog, screening_v2`; execute revoked from the
@@ -887,6 +894,414 @@ comment on function screening_v2.finalize_phone_partial_sessions is
   'disconnect_reason is unobserved_disconnect (not worker_crash) when a '
   'reclaimed or lease-lapsed leg shows teardown evidence. Service-role-only.';
 -- ==== 0115 §4 END ====
+
+
+-- ==== 0115 §5 BEGIN ====
+-- ─────────────────────────────────────────────────────────────────────
+-- §5 — The zero-answer relabel (T06, S02-4 / S02-6 mechanism).
+--
+-- WHAT IT FIXES. A phone session in which the candidate answered NONE of
+-- the planned questions (a MEASURED evidence_answered = 0 on an
+-- `insufficient` phone assessment) was completed and scored like any other:
+-- the engagement ended `completed` and the C3 rule moved the candidate to
+-- `screened`. 9f60523d read "Screened" on 0 of 5 answers. The truthful label
+-- (M013 D1) is engagement failed / state_reason 'screening_abandoned'
+-- ("Abandoned: dropped before screening"; neutral on who dropped), with the
+-- candidate at `screening`: the status markPhoneCandidateScreening set when
+-- the call started, and the one the failed/assessment_aborted path already
+-- leaves. NEVER `queued` (it reads as the requeue the owner refused), and
+-- nothing redials: ensure_ashby_phone_engagement answers engagement_terminal
+-- for a terminal cycle, so the Ashby link stays parked.
+--
+--   §5a enforce_phone_engagement_transition — LIFTED IN FULL from 0114 §2
+--       (the newest declaration: 0045 plus the 0114 C2 late-score hunk).
+--       BYTE-IDENTICAL to 0114 apart from ONE marked hunk (`▼ 0115`), placed
+--       after the C2 exception and before the terminal-immutability raise:
+--       completed -> failed/screening_abandoned. The phone-0114-* tests read
+--       the NEWEST declaration, so the C2 hunk and the transition table must
+--       stay exactly as 0114 wrote them.
+--   §5b relabel_zero_answer_phone_engagement(p_engagement_id, p_actor_id,
+--       p_now) — the ONE writer of that relabel. SECURITY DEFINER,
+--       service_role only, idempotent; answers applied | already |
+--       not_eligible.
+--
+-- The state_reason CHECK is a regex (0042, ^[a-z0-9_.:-]{1,64}$), so
+-- `screening_abandoned` needs no constraint change. No new audit action
+-- (re-creating chk_audit_action would break the "0114 is the LAST
+-- re-creation" pins): the RPC writes two EXISTING actions, see §5b.
+--
+-- Callers: the phone assessment handler, after the completion post
+-- (app/api/src/lib/phone-runtime/assessment-handler.ts, system actor), and
+-- an operator once for the historical 9f60523d correction.
+-- ─────────────────────────────────────────────────────────────────────
+
+-- §5a ── the transition trigger ────────────────────────────────────────
+-- The trigger binding (0042 trg_phone_engagement_transition, BEFORE UPDATE)
+-- is not re-created: only the function body changes.
+create or replace function screening_v2.enforce_phone_engagement_transition()
+returns trigger
+language plpgsql
+security invoker
+set search_path = pg_catalog
+as $$
+declare
+  allowed text[];
+begin
+  -- TERMINAL MEANS TERMINAL, and it is checked before the same-state
+  -- shortcut below. Guarding only `state` would leave a finished
+  -- engagement's budgets, next_eligible_at and consent_record_id
+  -- writable — a narrower guarantee than the word "immutable", and one
+  -- a reader would not expect to have to check. No RPC in this file
+  -- updates a terminal row; this makes that a property of the schema
+  -- rather than a property of the current callers.
+  --
+  -- KNOWN CONSEQUENCE, stated where it bites: a referential SET NULL is
+  -- an UPDATE, so this refusal also blocks deleting the `roles` or
+  -- `call_sessions` row a TERMINAL engagement points at — its two
+  -- `on delete set null` FKs behave as `restrict` once it is terminal,
+  -- and the error names the engagement rather than the row being
+  -- deleted. See the file header for the erasure order that satisfies
+  -- this and the ledger's insert-once guard together.
+  -- ▼ 0114 C2 late-score exception
+  -- THE ONE EXCEPTION to terminal immutability (C2-P5). The stranded sweep
+  -- aborted an engagement whose phone score landed later (a DLQ replay or a
+  -- slow job): the screening WAS conducted and scored, and `failed` is
+  -- false. Allowed only for exactly that shape, and only as a relabel:
+  --   * failed/assessment_aborted -> completed/late_score_after_stranded_abort;
+  --   * NO other column changes (terminal_at, session_id, budgets ...),
+  --     only state, state_reason, version and updated_at;
+  --   * a source='phone' assessment exists for the bound session;
+  --   * the abort was the SWEEP's own (the applied internal
+  --     `stranded:<session>:assessment.aborted` ledger row), never a
+  --     worker-declared abort.
+  -- SECURITY INVOKER with search_path=pg_catalog, so every name is
+  -- schema-qualified.
+  if old.terminal_at is not null
+     and old.state = 'failed'
+     and old.state_reason = 'assessment_aborted'
+     and new.state = 'completed'
+     and new.state_reason = 'late_score_after_stranded_abort'
+     and (to_jsonb(new) - '{state,state_reason,version,updated_at}'::text[])
+         = (to_jsonb(old) - '{state,state_reason,version,updated_at}'::text[])
+     and old.session_id is not null
+     and exists (select 1 from screening_v2.assessments a
+                  where a.session_id = old.session_id
+                    and a.source = 'phone')
+     and exists (select 1 from screening_v2.phone_call_events ev
+                  where ev.source = 'internal'
+                    and ev.provider_event_id
+                        = 'stranded:' || old.session_id::text || ':assessment.aborted'
+                    and ev.engagement_id = old.id
+                    and ev.applied) then
+    return new;
+  end if;
+  -- ▲ 0114 C2 late-score exception
+  -- ▼ 0115 S02-4 zero-answer relabel
+  -- THE SECOND EXCEPTION to terminal immutability (0115 §5). A phone
+  -- screening in which the candidate answered NONE of the planned questions
+  -- was completed and read "Screened" (9f60523d: 0 of 5). The truth is that
+  -- it was abandoned before screening (M013 D1). Allowed only as a relabel,
+  -- in exactly this shape:
+  --   * completed -> failed/screening_abandoned;
+  --   * NO other column changes (terminal_at, session_id, next_eligible_at,
+  --     budgets ...), only state, state_reason, version and updated_at;
+  --   * THE INTERLOCK, and the only thing to judge this exception on: the
+  --     bound session's LATEST assessment (created_at, then revision, then
+  --     id) is a source='phone' row graded `insufficient` with a MEASURED
+  --     evidence_answered = 0. NULL (unmeasured) never qualifies, nor does a
+  --     browser row, a `decision` grade or one answered question;
+  --   * the transaction-local GUC screening_v2.zero_answer_relabel names this
+  --     engagement. Only relabel_zero_answer_phone_engagement (0115 §5b) sets
+  --     it, but ANY writer can call set_config: it is defence in depth that
+  --     keeps an accidental UPDATE out, NOT a security boundary.
+  -- It can never be flipped back: the C2 exception above matches only
+  -- failed/assessment_aborted, so a later stranded or late completion of a
+  -- failed/screening_abandoned row falls through to the raise below.
+  -- SECURITY INVOKER with search_path=pg_catalog, so every name is
+  -- schema-qualified.
+  if old.terminal_at is not null
+     and old.state = 'completed'
+     and new.state = 'failed'
+     and new.state_reason = 'screening_abandoned'
+     and (to_jsonb(new) - '{state,state_reason,version,updated_at}'::text[])
+         = (to_jsonb(old) - '{state,state_reason,version,updated_at}'::text[])
+     and old.session_id is not null
+     and pg_catalog.current_setting('screening_v2.zero_answer_relabel', true) = old.id::text
+     and exists (select 1
+                   from (select a.source, a.evidence_grade, a.evidence_answered
+                           from screening_v2.assessments a
+                          where a.session_id = old.session_id
+                          order by a.created_at desc, a.revision desc, a.id desc
+                          limit 1) l
+                  where l.source = 'phone'
+                    and l.evidence_grade = 'insufficient'
+                    and l.evidence_answered = 0) then
+    return new;
+  end if;
+  -- ▲ 0115 S02-4 zero-answer relabel
+  if old.terminal_at is not null and new is distinct from old then
+    raise exception 'phone engagement % is terminal (%) and immutable', old.id, old.state
+      using errcode = 'P0001';
+  end if;
+
+  if old.state = new.state then
+    return new;   -- idempotent no-op (#14/#16 and every retry)
+  end if;
+  case old.state
+    when 'pending_prereqs' then allowed := array['eligible','cancelled'];
+    -- 0045 added `completed` and `failed` to these three. They are
+    -- reachable ONLY through the stranded-session resolution in
+    -- `apply_phone_event`, which requires the engagement to hold a bound
+    -- session that is ALREADY TERMINAL, and — for `completed` — requires a
+    -- real `source='phone'` assessment row to exist. Widening the
+    -- allowlist without those interlocks would let any writer terminate an
+    -- engagement that is merely waiting its turn; with them, the only
+    -- thing these edges can do is tell an engagement the truth about a
+    -- conversation that already happened.
+    when 'eligible'        then allowed := array['dialing','scheduled','cancelled',
+                                                 'completed','failed'];
+    when 'scheduled'       then allowed := array['dialing','eligible','cancelled',
+                                                 'completed','failed','opted_out'];
+    when 'dialing'         then allowed := array[
+      'in_call','awaiting_retry','eligible','scheduled','reconnecting',
+      -- The no-answer charge that lands on 3 goes straight to the
+      -- terminal state; there is no honest `awaiting_retry` for an
+      -- engagement with nothing left to retry.
+      'abandoned_no_answer',
+      'opted_out','wrong_number','failed','cancelled'];
+    when 'in_call'         then allowed := array[
+      'reconnecting','scheduled','completed','failed','opted_out','wrong_number','cancelled',
+      -- A conversation whose worker died mid-call: the sweeper abandons
+      -- the attempt and restores the state the attempt was admitted
+      -- from. Without this edge the engagement is stranded `in_call`
+      -- with no live attempt and no event that can ever move it — the
+      -- PR #70 wedge wearing a different name.
+      'eligible'];
+    when 'reconnecting'    then allowed := array['dialing','scheduled','eligible','failed',
+                                                 'cancelled','completed','opted_out'];
+    when 'awaiting_retry'  then allowed := array[
+      'eligible','abandoned_no_answer','cancelled',
+      -- Booking a callback after a missed call is the single most
+      -- ordinary use of the internal calendar. Without this edge
+      -- schedule_phone_appointment raised P0001 on it.
+      'scheduled'];
+    -- Every terminal state: no outgoing edge at all.
+    else allowed := '{}'::text[];
+  end case;
+  if not (new.state = any(allowed)) then
+    raise exception 'invalid phone engagement transition % -> %', old.state, new.state
+      using errcode = 'P0001';
+  end if;
+  return new;
+end;
+$$;
+
+comment on function screening_v2.enforce_phone_engagement_transition is
+  'Enforces the legal phone_engagements state machine on UPDATE; same-state is '
+  'a no-op and a terminal row admits no change at all, with TWO exceptions, '
+  'each a relabel in which only state, state_reason, version and updated_at '
+  'change: (0114) failed/assessment_aborted -> '
+  'completed/late_score_after_stranded_abort when a phone assessment exists '
+  'for the bound session and the abort was the stranded sweep''s own ledger '
+  'row; (0115) completed -> failed/screening_abandoned when the bound '
+  'session''s latest assessment is a phone row graded insufficient with a '
+  'measured evidence_answered = 0 and the transaction-local GUC '
+  'screening_v2.zero_answer_relabel names the engagement (set only by '
+  'relabel_zero_answer_phone_engagement). Widened by 0045 so '
+  'eligible/scheduled/reconnecting may reach completed or failed '
+  '(stranded-session resolution only), and by 0114 so scheduled/reconnecting '
+  'may reach opted_out (a mid-call withdrawal that lost the race to the drop).';
+
+-- §5b ── relabel_zero_answer_phone_engagement ─────────────────────────
+-- The ONE writer of the §5a relabel. Under the engagement row lock it
+-- re-checks the full predicate (the caller's view is a hint, never the
+-- decision), then:
+--   1. relabels the engagement completed -> failed/screening_abandoned
+--      (state, state_reason, version + 1, updated_at = p_now; terminal_at,
+--      next_eligible_at, session_id and every budget untouched — the §5a
+--      exception refuses anything else);
+--   2. moves the candidate screened -> screening, only under the 0114 §4e
+--      repair guards: the candidate's LATEST assessment (any session;
+--      created_at, then revision, then id) is this row, the candidate is
+--      not decision-blocked, and no NON-system candidate_status_changed
+--      audit exists at or after this assessment (a human decided since;
+--      theirs stands). A candidate already at `screening` (every future case,
+--      because the API's C3 rule no longer sets `screened` for a measured
+--      0-answer phone row) is left as is and not audited. Never `queued`;
+--   3. audits each change with an EXISTING action (D7):
+--      `screening_failed` on the phone_engagement (no phone_* action names
+--      this truthfully: phone_engagement_late_completed would read
+--      "completed") and `candidate_status_changed` on the candidate, both
+--      with metadata {from, to, reason: 'screening_abandoned',
+--      migration: '0115'}. Opaque ids and stable codes only, no PII.
+-- It NEVER requeues, rescreens, creates an attempt, a ledger row or a queue
+-- job, and never touches the Ashby link.
+--
+-- Actor: p_actor_id is required (an action is attributable or it does not
+-- happen). The system sentinel (all zeros) audits as actor_type `system`,
+-- any other id as `recruiter` (the operator correction).
+--
+-- Answers:
+--   applied       the relabel happened (candidate_moved says whether the
+--                 candidate status moved too);
+--   already       the engagement is failed/screening_abandoned (idempotent:
+--                 nothing is written);
+--   not_eligible  anything else; `reason` is a stable code
+--                 (invalid_request | not_found | not_completed |
+--                 not_zero_answer).
+--
+-- Lock order: the engagement row (FOR UPDATE), then the candidate row (the
+-- UPDATE). No other writer in this schema locks a candidate row and then
+-- the engagement of the same cycle.
+create or replace function screening_v2.relabel_zero_answer_phone_engagement(
+  p_engagement_id uuid,
+  p_actor_id      uuid,
+  p_now           timestamptz default now()
+)
+returns jsonb
+language plpgsql
+security definer
+set search_path = pg_catalog, screening_v2
+as $$
+declare
+  c_system constant uuid := '00000000-0000-0000-0000-000000000000';
+  v_eng        screening_v2.phone_engagements%rowtype;
+  v_asm_id     uuid;
+  v_asm_cand   uuid;
+  v_asm_at     timestamptz;
+  v_asm_source text;
+  v_asm_grade  text;
+  v_asm_answered integer;
+  v_actor_type text;
+  v_moved      integer;
+begin
+  if p_engagement_id is null or p_actor_id is null or p_now is null then
+    return jsonb_build_object('status', 'not_eligible', 'reason', 'invalid_request');
+  end if;
+
+  select * into v_eng
+    from screening_v2.phone_engagements
+   where id = p_engagement_id
+   for update;
+  if not found then
+    return jsonb_build_object('status', 'not_eligible', 'reason', 'not_found');
+  end if;
+
+  -- Idempotent: a second call (a queue retry, an operator re-run) writes
+  -- nothing.
+  if v_eng.state = 'failed' and v_eng.state_reason = 'screening_abandoned' then
+    return jsonb_build_object('status', 'already',
+                              'engagement_id', v_eng.id,
+                              'session_id', v_eng.session_id);
+  end if;
+
+  if v_eng.state is distinct from 'completed'
+     or v_eng.terminal_at is null
+     or v_eng.session_id is null then
+    return jsonb_build_object('status', 'not_eligible', 'reason', 'not_completed',
+                              'engagement_id', v_eng.id);
+  end if;
+
+  -- The bound session's LATEST assessment, exactly as the §5a interlock
+  -- reads it.
+  select a.id, a.candidate_id, a.created_at, a.source, a.evidence_grade,
+         a.evidence_answered
+    into v_asm_id, v_asm_cand, v_asm_at, v_asm_source, v_asm_grade,
+         v_asm_answered
+    from screening_v2.assessments a
+   where a.session_id = v_eng.session_id
+   order by a.created_at desc, a.revision desc, a.id desc
+   limit 1;
+  if v_asm_id is null
+     or v_asm_source is distinct from 'phone'
+     or v_asm_grade is distinct from 'insufficient'
+     or v_asm_answered is distinct from 0 then
+    return jsonb_build_object('status', 'not_eligible', 'reason', 'not_zero_answer',
+                              'engagement_id', v_eng.id);
+  end if;
+
+  v_actor_type := case when p_actor_id = c_system then 'system' else 'recruiter' end;
+
+  -- 1. The relabel. The GUC is transaction-local, names THIS engagement and
+  --    is cleared straight after, so no later statement in the transaction
+  --    can ride it.
+  perform pg_catalog.set_config('screening_v2.zero_answer_relabel', v_eng.id::text, true);
+  update screening_v2.phone_engagements
+     set state        = 'failed',
+         state_reason = 'screening_abandoned',
+         version      = version + 1,
+         updated_at   = p_now
+   where id = v_eng.id;
+  perform pg_catalog.set_config('screening_v2.zero_answer_relabel', '', true);
+
+  insert into screening_v2.audit_events
+    (actor_id, actor_type, action, target_type, target_id, result, metadata,
+     created_at)
+  values
+    (p_actor_id, v_actor_type, 'screening_failed', 'phone_engagement',
+     v_eng.id::text, 'success',
+     jsonb_build_object('from', 'completed', 'to', 'failed',
+                        'reason', 'screening_abandoned', 'migration', '0115',
+                        'session_id', v_eng.session_id),
+     p_now);
+
+  -- 2. The candidate, under the 0114 §4e guards. Never `queued`.
+  update screening_v2.candidates c
+     set status = 'screening'
+   where c.id = v_asm_cand
+     and c.status = 'screened'
+     and c.decision_use_blocked_at is null
+     and (select l.id
+            from screening_v2.assessments l
+           where l.candidate_id = c.id
+           order by l.created_at desc, l.revision desc, l.id desc
+           limit 1) = v_asm_id
+     and not exists (
+       select 1
+         from screening_v2.audit_events ae
+        where ae.action = 'candidate_status_changed'
+          and ae.target_type = 'candidate'
+          and ae.target_id = c.id::text
+          and ae.actor_type <> 'system'
+          and ae.created_at >= v_asm_at);
+  get diagnostics v_moved = row_count;
+
+  if v_moved > 0 then
+    insert into screening_v2.audit_events
+      (actor_id, actor_type, action, target_type, target_id, result, metadata,
+       created_at)
+    values
+      (p_actor_id, v_actor_type, 'candidate_status_changed', 'candidate',
+       v_asm_cand::text, 'success',
+       jsonb_build_object('from', 'screened', 'to', 'screening',
+                          'reason', 'screening_abandoned', 'migration', '0115'),
+       p_now);
+  end if;
+
+  return jsonb_build_object('status', 'applied',
+                            'engagement_id', v_eng.id,
+                            'session_id', v_eng.session_id,
+                            'candidate_moved', v_moved > 0);
+end;
+$$;
+
+revoke all on function screening_v2.relabel_zero_answer_phone_engagement(uuid, uuid, timestamptz)
+  from public, anon, authenticated;
+grant execute on function screening_v2.relabel_zero_answer_phone_engagement(uuid, uuid, timestamptz)
+  to service_role;
+
+comment on function screening_v2.relabel_zero_answer_phone_engagement is
+  '0115 (M013 S02, D1): relabels a completed phone engagement whose bound '
+  'session''s latest assessment is a phone row graded insufficient with a '
+  'measured evidence_answered = 0 -> failed/screening_abandoned (terminal_at '
+  'and every other column unchanged), and moves the candidate screened -> '
+  'screening (never queued) under the 0114 §4e guards (latest assessment, not '
+  'decision-blocked, no human status change since). Audits screening_failed '
+  '(phone_engagement) and candidate_status_changed with metadata {from, to, '
+  'reason: screening_abandoned, migration: 0115}. Never requeues, rescreens, '
+  'creates an attempt, ledger row or job, or touches the Ashby link. '
+  'Idempotent: applied | already | not_eligible (reason). Service-role-only.';
+-- ==== 0115 §5 END ====
 
 
 notify pgrst, 'reload schema';

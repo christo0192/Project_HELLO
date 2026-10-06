@@ -8598,7 +8598,7 @@ components:
 
     CandidatePhoneStateReason:
       type: string
-      enum: [no_answer_budget_exhausted, reconnect_budget_exhausted, provider_budget_exhausted, window_closed, assessment_aborted, wrong_number, disclosure_refused, candidate_opt_out, hr_cancelled, emergency_stop, ashby_stage_left, prereq_lost, abandoned_pre_disclosure, consent_gate_failed, callback_deferred_in_call, callback_deferral_limit, late_score_after_stranded_abort]
+      enum: [no_answer_budget_exhausted, reconnect_budget_exhausted, provider_budget_exhausted, window_closed, assessment_aborted, wrong_number, disclosure_refused, candidate_opt_out, hr_cancelled, emergency_stop, ashby_stage_left, prereq_lost, abandoned_pre_disclosure, consent_gate_failed, callback_deferred_in_call, callback_deferral_limit, late_score_after_stranded_abort, screening_abandoned]
       nullable: true
       description: Why the latest cycle is in its state, projected server-side through a closed allowlist. The underlying column is not constrained, so any value outside this list - including any free text - is reported as null rather than echoed. Always null for the viewer role (the per-cycle view, /api/candidates/{id}/phone-cycles, is interviewer+).
 

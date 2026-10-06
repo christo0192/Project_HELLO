@@ -398,6 +398,9 @@ const ENGAGEMENT_REASON_LABELS: Readonly<Record<string, string>> = {
   // 0114 (C2): the interview was marked aborted by the stranded sweep, then
   // its score landed. Completed late, with the original end time kept.
   late_score_after_stranded_abort: 'Completed (score arrived late)',
+  // 0115 (M013 D1): the call ended before the candidate answered any planned
+  // question. Neutral on who dropped; the evidence reason is the detail line.
+  screening_abandoned: 'Abandoned: dropped before screening',
 };
 
 /** Why a screening cycle is in its state, in a recruiter's words. */

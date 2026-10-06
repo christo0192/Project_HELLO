@@ -92,6 +92,9 @@ export const PHONE_PROGRESS_REASON_ALLOWLIST = [
   'callback_deferred_in_call',
   'callback_deferral_limit',
   'late_score_after_stranded_abort',
+  // 0115 (M013 D1): failed — the candidate answered none of the planned
+  // questions (relabel_zero_answer_phone_engagement).
+  'screening_abandoned',
 ] as const;
 
 const REASON_SET: ReadonlySet<string> = new Set(PHONE_PROGRESS_REASON_ALLOWLIST);

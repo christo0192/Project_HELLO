@@ -20,7 +20,9 @@
 #      exact attempt-trigger set, the room_name stamp and the new duration
 #      rule on first completion (phone_0115_assert.sql);
 #   6. replay the 9f60523d sequence against §4's partial-finalize reconnect
-#      guard and the unobserved_disconnect label (phone_0115_finalize.sql).
+#      guard and the unobserved_disconnect label (phone_0115_finalize.sql);
+#   7. continue that replay into §5's zero-answer relabel, and try every
+#      shape the relabel exception must refuse (phone_0115_relabel.sql).
 #
 # If S01 (or anything else) merges a migration numbered 0115 first, this
 # migration is renumbered; MIGRATION below is the one place to change.
@@ -155,5 +157,8 @@ run_sql phone_0115_assert.sql
 
 log 'replaying the partial-finalize reconnect guard and the disconnect label (§4)...'
 run_sql phone_0115_finalize.sql
+
+log 'continuing the replay into the zero-answer relabel and its refusals (§5)...'
+run_sql phone_0115_relabel.sql
 
 log 'PASS'

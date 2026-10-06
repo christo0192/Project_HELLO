@@ -715,13 +715,24 @@ async function runAssessmentImpl(
     //     reject — a PROVISIONAL incomplete_evidence reject never qualifies —
     //     and, on the phone, a MEASURED answered*2 >= planned); otherwise
     //     `screened`, so a human confirms before the candidate is rejected.
+    //   * 0115 (M013 D1/D3): a PHONE row whose candidate answered NONE of
+    //     the planned questions — a MEASURED `evidence.answered === 0`, never
+    //     an unmeasured null — was not screened at all. The status is left
+    //     where it is (`screening`, set when the call started), and the
+    //     phone assessment handler relabels the engagement
+    //     failed/screening_abandoned through
+    //     `relabel_zero_answer_phone_engagement`. Browser rows (answered is
+    //     always null) and unmeasured phone rows keep the rule above
+    //     unchanged.
     if (evidence.grade === 'insufficient') {
-      await supabase
-        .from('candidates')
-        .update({ status: 'screened' })
-        .eq('id', session.candidate_id)
-        .in('status', ['new', 'queued', 'screening'])
-        .neq('status', 'advanced');
+      if (!(isPhone && evidence.answered === 0)) {
+        await supabase
+          .from('candidates')
+          .update({ status: 'screened' })
+          .eq('id', session.candidate_id)
+          .in('status', ['new', 'queued', 'screening'])
+          .neq('status', 'advanced');
+      }
     } else {
       const terminalReject = canAutoReject({
         source: isPhone ? 'phone' : 'browser',
