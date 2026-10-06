@@ -4587,6 +4587,101 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertEqual(cancels, ["cancelled"])
 
+    async def test_ONE_heartbeat_runs_from_the_ANSWER_through_the_screening(self):
+        """M013 S01 T03. The heartbeat starts at the answer (before any
+        consent post), replaces the one-shot re-base, and the screening reuses
+        it: one task for the whole call, cancelled once at the end."""
+        instances: list[dict] = []
+        cancels: list[str] = []
+        rebases: list[tuple] = []
+
+        async def beat():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancels.append("cancelled")
+                raise
+
+        def fake_heartbeat(*, attempt_id, session_id, epoch, client, halt):
+            # Plain `def`: this body runs when the task is CREATED, which is
+            # the moment that matters (the beat itself runs at the next yield).
+            instances.append({
+                "consent_posted": "classify.human" in client.event_types,
+                "triple": (attempt_id, session_id, epoch),
+            })
+            return beat()
+
+        async def fake_rebase(*args, **_kwargs):
+            rebases.append(args)
+            return True
+
+        with patch.object(phone, "run_phone_heartbeat", fake_heartbeat), \
+                patch.object(phone, "rebase_lease_on_answer", fake_rebase):
+            result, client, *_ = await self._run_session(
+                answers=("Yes, that's fine.",))
+        self.assertTrue(result.assessment_allowed)
+        self.assertIn("assessment.completed", client.event_types)
+        self.assertEqual(len(instances), 1, "a second heartbeat was started")
+        self.assertFalse(instances[0]["consent_posted"])
+        self.assertEqual(instances[0]["triple"], (_ATTEMPT_ID, _SESSION_ID, _EPOCH))
+        self.assertEqual(rebases, [])
+        self.assertEqual(cancels, ["cancelled"])
+
+    async def test_a_lease_lost_AFTER_consent_halts_the_screening_not_the_gate(self):
+        """The same heartbeat, after consent: its halt has been re-pointed at
+        the screening (`halt_for_lease`). The screening stops, nothing is
+        posted, nothing more is spoken, and the room is closed."""
+        instances: list = []
+
+        class _Client(FakeEventClient):
+            def __init__(self):
+                super().__init__()
+                self.screening_started = asyncio.Event()
+
+            async def start_assessment(self, attempt_id, session_id):
+                self.screening_started.set()
+                return await super().start_assessment(attempt_id, session_id)
+
+        async def fake_heartbeat(*, attempt_id, session_id, epoch, client, halt):
+            instances.append(halt)
+            await client.screening_started.wait()
+            await halt(phone.HALT_LEASE_LOST)
+            return phone.HALT_LEASE_LOST
+
+        with patch.object(phone, "run_phone_heartbeat", fake_heartbeat):
+            result, client, _rec, delete, session, _spy = await self._run_session(
+                answers=("Yes, that's fine.",), client=_Client(), close_after=False)
+        self.assertEqual(len(instances), 1)
+        self.assertTrue(result.assessment_allowed)
+        self.assertIn("classify.human", client.event_types)
+        self.assertIn("disclosure.delivered", client.event_types)
+        for event in ("assessment.completed", "assessment.aborted",
+                      "candidate.deferred_pre_disclosure", "consent.failed"):
+            self.assertNotIn(event, client.event_types)
+        self.assertNotIn(phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT, session.spoken)
+        delete.assert_awaited()
+
+    async def test_no_session_id_means_no_gate_heartbeat_and_the_rebase_is_kept(self):
+        """The heartbeat route fences on a UUID session and the epoch; with no
+        session id nothing can beat, so none is started and the gate keeps
+        the one-shot re-base (with a budget capped to the lease left)."""
+        instances: list = []
+        rebases: list[tuple] = []
+
+        async def fake_heartbeat(**kwargs):
+            instances.append(kwargs)
+
+        async def fake_rebase(_client, attempt_id, session_id, epoch):
+            rebases.append((attempt_id, session_id, epoch))
+            return False
+
+        with patch.object(phone, "run_phone_heartbeat", fake_heartbeat), \
+                patch.object(phone, "rebase_lease_on_answer", fake_rebase), \
+                patch.object(phone, "session_id_from_room_name", lambda _room: None):
+            await self._run_session(answers=("Yes, that's fine.",), close_after=False)
+        self.assertEqual(instances, [])
+        self.assertEqual(rebases, [(_ATTEMPT_ID, None, _EPOCH)])
+
     async def test_a_LOST_lease_STOPS_the_conversation_and_claims_nothing(self):
         """End to end, through the real loop: the slot is gone, so the
         conversation stops.
@@ -4596,31 +4691,39 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         NOTHING is posted: the reclaim sweep has already restored the
         engagement's previous state, so `assessment.aborted` would be untrue
         and ignored, and `assessment.completed` would be a lie.
+
+        M013 S01 T03: the heartbeat now starts at the ANSWER (its first beat
+        replaces the one-shot re-base), so a lease lost before consent stops
+        the GATE: the person hears the deferral goodbye, no consent event is
+        posted, nothing else is posted, and the room is closed. The consent
+        post is held open here so the loss deterministically lands before it.
         """
-        # TWO scripted refusals, not one. The lease is now re-based on the
-        # ANSWER (`rebase_lease_on_answer`), so the first scripted outcome is
-        # consumed by that renewal inside the gate; the periodic heartbeat's
-        # first beat takes the second. Scripting only one would have let the
-        # loop see the default `ok` and the conversation would carry on — the
-        # test would still pass its later assertions while no longer exercising
-        # a lost lease at all.
-        client = FakeEventClient(heartbeats=[
-            phone.PhoneApiOutcome(False, phone.HEARTBEAT_LEASE_LOST_STATUS),
+        class _ConsentHeldOpen(FakeEventClient):
+            async def post_event(self, attempt_id, event_type, **kwargs):
+                if event_type == "classify.human":
+                    await asyncio.Event().wait()  # the halt cancels the gate here
+                return await super().post_event(attempt_id, event_type, **kwargs)
+
+        client = _ConsentHeldOpen(heartbeats=[
             phone.PhoneApiOutcome(False, phone.HEARTBEAT_LEASE_LOST_STATUS),
         ])
         result, client, recording, delete, session, persistence_spy = (
             await self._run_session(answers=("Yes, that's fine.",), client=client)
         )
-        self.assertTrue(result.assessment_allowed)
-        self.assertEqual(
-            client.heartbeats,
-            [(_ATTEMPT_ID, _SESSION_ID, _EPOCH), (_ATTEMPT_ID, _SESSION_ID, _EPOCH)],
-        )
-        self.assertNotIn("assessment.completed", client.event_types)
-        self.assertNotIn("assessment.aborted", client.event_types)
-        # The screening never even began, because the slot was already gone.
+        self.assertEqual(result.outcome, phone.GATE_LEASE_HALTED)
+        self.assertFalse(result.assessment_allowed)
+        # ONE beat: the heartbeat's immediate first beat, and no separate
+        # re-base round trip next to it.
+        self.assertEqual(client.heartbeats, [(_ATTEMPT_ID, _SESSION_ID, _EPOCH)])
+        for event in ("classify.human", "disclosure.delivered", "consent.failed",
+                      "candidate.deferred_pre_disclosure", "assessment.completed",
+                      "assessment.aborted", "classify.machine"):
+            self.assertNotIn(event, client.event_types)
+        # The screening never began, because the slot was already gone.
         self.assertEqual(client.assessment_calls, [])
-        self.assertEqual(persistence_spy.mock_calls, [])
+        self.assertEqual(recording, [])
+        # The person on the line heard a goodbye, not dead air.
+        self.assertIn(phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT, session.spoken)
         # The leg is torn down rather than left on a slot it does not hold.
         delete.assert_awaited()
 
@@ -4671,13 +4774,20 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         self.assertIn("candidate.deferred_pre_disclosure", client.event_types)
 
     async def test_the_gate_bound_matches_the_API_lease_allowance(self):
-        """The worker's gate budget and the API's lease allowance describe the
-        same stretch of a call, so they must not drift apart.
+        """The worker's gate bound against the API's lease sizing.
 
         `PHONE_OPENING_GATE_SECONDS = 60 + PHONE_IDENTITY_TURN_SECONDS (46)` in
-        `app/api/src/lib/phone-screening/config.ts`. The worker's bound is that
-        number plus a small margin, so the WORKER times out first and produces a
-        diagnosable `gate_timed_out` instead of a silent server-side reap.
+        `app/api/src/lib/phone-screening/config.ts`. The bound used to be that
+        number plus a small margin, because nothing renewed the lease during
+        the gate and a longer gate was reaped silently by the server.
+
+        M013 S01 T03: the lease is HEARTBEATEN from the answer, so the bound
+        may exceed the allowance (it now holds #334's callback conversation).
+        What must hold instead: the worker still outlasts the allowance, the
+        bound stays under the 200 s owner-escalation ceiling, the session
+        actually wires the gate heartbeat (without it the 106 s allowance is
+        binding again), and with NO heartbeat the gate budget is capped below
+        what is known to remain of the admission lease.
         """
         cfg = (
             pathlib.Path(__file__).resolve().parents[2]
@@ -4696,9 +4806,21 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             "the worker must outlast the API's allowance so IT reports the fault",
         )
         self.assertLessEqual(
-            agent_mod.PHONE_GATE_MAX_SECONDS, api_allowance + 30,
-            "a bound far above the allowance lets the server reap first, which is"
-            " the silent failure this bound exists to replace",
+            agent_mod.PHONE_GATE_MAX_SECONDS, 200.0,
+            "past 200 s is an owner decision (M013 roadmap 5), not a quiet bump",
+        )
+        src = inspect.getsource(agent_mod._run_phone_session)
+        self.assertIn("start_lease_heartbeat=_start_gate_heartbeat,", src)
+        self.assertIn("gate_budget=gate_budget,", src)
+        # No heartbeat: the budget may not outlive the admission lease.
+        ring = 60.0
+        budget = phone.GateBudget(agent_mod.PHONE_GATE_MAX_SECONDS, clock=lambda: 0.0)
+        budget.start()
+        budget.cap_total(
+            phone.phone_unrenewed_lease_after_answer_sec(ring), reason="unrenewed_lease")
+        self.assertLess(
+            budget.remaining(),
+            phone.PHONE_ADMISSION_LEASE_SEC - phone.PHONE_PRE_RING_LEASE_SPEND_SEC - ring,
         )
 
     def test_the_wall_clock_also_covers_the_RING(self):
@@ -4744,9 +4866,13 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
 
         So exactly ONE renewal now happens, at `call.answered`, re-basing the
         clock on the moment a human picked up. The slot argument still holds:
-        this is one renewal, not a loop — a machine pickup holds the slot for
-        the length of the gate and not a beat longer, and the periodic heartbeat
-        still starts only once the call is a consented conversation.
+        a machine pickup holds the slot for the length of the gate and not a
+        beat longer.
+
+        M013 S01 T03: that renewal is now the FIRST BEAT of the call's one
+        heartbeat, started at the answer (no separate re-base next to it). A
+        short machine gate ends long before the next beat is due, and the
+        heartbeat is stopped with the gate, so this is still exactly one.
         """
         result, client, *_ = await self._run_session(
             answers=("Please leave a message after the tone.",)

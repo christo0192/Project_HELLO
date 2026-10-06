@@ -257,6 +257,29 @@ class TestLeaseBudget(unittest.TestCase):
                     ring + agent.PHONE_GATE_MAX_SECONDS,
                 )
 
+    def test_an_unrenewed_gate_budget_stays_inside_the_admission_lease(self):
+        """M013 S01 T03. With no gate heartbeat (no session id / epoch), the
+        gate budget is capped to what this arithmetic says is left of the
+        admission lease, for the worst-case ring, so the gate ends itself
+        before the server could reap it."""
+        self.assertEqual(phone.PHONE_ADMISSION_LEASE_SEC, self.ADMISSION_LEASE_SEC)
+        self.assertEqual(phone.PHONE_PRE_RING_LEASE_SPEND_SEC,
+                         self.BOOT_SEC + self.AGENT_JOIN_SEC)
+        with patch.dict(os.environ, {"PHONE_PARTICIPANT_WAIT_SEC": "60"}):
+            ring = phone.phone_participant_wait_sec()
+        left = self.ADMISSION_LEASE_SEC - self.BOOT_SEC - self.AGENT_JOIN_SEC - ring
+        self.assertEqual(phone.phone_unrenewed_lease_after_answer_sec(ring), left)
+        budget = phone.GateBudget(agent.PHONE_GATE_MAX_SECONDS, clock=lambda: 0.0)
+        budget.start()
+        budget.cap_total(phone.phone_unrenewed_lease_after_answer_sec(ring),
+                         reason="unrenewed_lease")
+        self.assertLessEqual(budget.remaining() + phone.GATE_BUDGET_MARGIN_SEC, left)
+        # And it still leaves room for the identity turn plus a consent round.
+        self.assertGreater(
+            budget.remaining(),
+            budget.round_cost_sec() + budget.round_cost_sec(
+                phone.GATE_DISCLOSURE_LINE_ESTIMATE_SEC))
+
 
 # ── _wait_for_sip_answer ────────────────────────────────────────────────
 

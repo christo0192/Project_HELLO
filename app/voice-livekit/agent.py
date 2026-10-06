@@ -405,10 +405,11 @@ SESSION_MAX_RESIDENCY_SEC = _bounded_float_env(
 # reported rather than a wait to be extended. The API sizes the concurrency
 # lease on exactly this number — `PHONE_OPENING_GATE_SECONDS = 60 +
 # PHONE_IDENTITY_TURN_SECONDS (46) = 106` in
-# `app/api/src/lib/phone-screening/config.ts:146` — so the two are deliberately
-# the same 106s, plus a small margin so the worker's own timeout fires FIRST
-# and produces a diagnosable `gate_timed_out` instead of a silent server-side
-# reap.
+# `app/api/src/lib/phone-screening/config.ts:146` — so the two were
+# deliberately the same 106s, plus a small margin so the worker's own timeout
+# fires FIRST and produces a diagnosable `gate_timed_out` instead of a silent
+# server-side reap. (Until M013 S01 T03: the lease is now heartbeaten from the
+# answer, see below.)
 #
 # ── IT MEASURES THE POST-ANSWER STRETCH, AND ONLY THAT ────────────────────
 # `PHONE_OPENING_GATE_SECONDS` is defined as the spend "from the moment
@@ -427,11 +428,32 @@ SESSION_MAX_RESIDENCY_SEC = _bounded_float_env(
 # conversation half of the gate may take) and the wrapper covers what it
 # actually wraps.
 #
-# Floor of 30s: below the classify wait (40s) the bound would cut off healthy
-# calls. Ceiling of 600s: a gate that has run ten minutes is wedged by
-# definition.
+# ── M013 S01 T03: 116 → 180 s, a BUDGET in front of the wall clock, and the
+# lease heartbeat from the answer ─────────────────────────────────────────
+# #334 put a whole callback conversation (and, with M013, consent re-asks
+# worded by reason) inside this stretch: identity, a busy reply, "what time
+# works?", a clarification, propose/confirm and the read-back do not fit in
+# 116 s once a re-ask is involved, and the wall clock then cut the call off
+# mid-booking. Two changes make a larger number safe:
+#   * the call's lease heartbeat now starts at the ANSWER, not at consent
+#     (`phone.run_phone_heartbeat`, one task per call), so the lease is
+#     renewed for as long as the gate runs and the API's 106 s sizing
+#     allowance (`PHONE_OPENING_GATE_SECONDS`) is no longer what reaps a long
+#     gate — no API change. Without a session id/epoch to fence with, the
+#     heartbeat cannot run and the budget is capped to the admission lease
+#     known to remain (`phone.phone_unrenewed_lease_after_answer_sec`);
+#   * `phone.GateBudget` (deadline = answer + this − 10 s) is checked before
+#     every new ask, so a healthy gate ends with a spoken deferral on its own
+#     terms and this wall clock is left as the wedge backstop it was built as.
+# 180 s is the M013 target ceiling; going past 200 s needs an owner decision
+# (and the API's lease sizing re-checked), not a quiet bump.
+#
+# Floor of 30s: below the consent backstop (`phone.phone_classify_timeout_sec`,
+# >= 52 s by default) a healthy consent read would be cut off — the floor is a
+# config guard, not a recommendation. Ceiling of 600s: a gate that has run ten
+# minutes is wedged by definition.
 PHONE_GATE_MAX_SECONDS = _bounded_float_env(
-    "PHONE_GATE_MAX_SECONDS", 116.0, 30.0, 600.0
+    "PHONE_GATE_MAX_SECONDS", 180.0, 30.0, 600.0
 )
 
 
@@ -1726,6 +1748,8 @@ _ROOM_TEARDOWN_LABELS: dict[str | None, str] = {
     # M009 E6: the callee never really answered. The room delete CANCELs the
     # still-ringing INVITE; nothing was spoken or recorded.
     phone.GATE_NOT_ANSWERED: "not_answered",
+    # M013 S01 T03: the gate's lease heartbeat lost the slot mid-gate.
+    phone.GATE_LEASE_HALTED: "gate_lease_halted",
 }
 
 
@@ -3478,6 +3502,7 @@ async def _classify_phone_answer(
     question_anchor: "Callable[[], int | None] | None" = None,
     on_grant_evidence: "Callable[[Any], Any] | None" = None,
     spoke: "gate_judge.HumanSpeechLatch | None" = None,
+    budget: "phone.GateBudget | None" = None,
 ) -> str:
     """Read the response to the disclosure, re-asking at most once.
 
@@ -3512,6 +3537,12 @@ async def _classify_phone_answer(
     attempt is deferred, uncharged. "Machine" remains only for a line on which
     nobody was heard at all, or whose first words were machine wording. The
     re-ask is worded by its reason (`phone.phone_consent_reask_text`).
+
+    M013 S01 T03: with a ``budget`` (`phone.GateBudget`), the re-ask is
+    spoken only if its answer still fits before the gate's deadline;
+    otherwise this returns ``CLASSIFY_DEFERRED_PRE_DISCLOSURE`` (the gate
+    then speaks the deferral goodbye) rather than starting a round the wall
+    clock would cut off.
     """
     if answer_timeout_sec is None:
         answer_timeout_sec = phone.phone_classify_answer_timeout_sec()
@@ -3600,6 +3631,10 @@ async def _classify_phone_answer(
             # appear nowhere. Without this line there is no way to measure how
             # often a consenting candidate is asked twice. Counts and a fixed
             # category only, never the utterance (PII).
+            if budget is not None and not budget.can_ask("consent_reask"):
+                # T03: no time for another round. A deferral, never "machine":
+                # the budget ran out, which says nothing about who answered.
+                return phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE
             reason = _consent_reask_reason(text, heard=bool(responsive))
             _log.info(
                 "unknown_event", error_type="phone_consent_reask",
@@ -10463,6 +10498,9 @@ async def _run_phone_session(
     # callback and consent readers. Once set, the gate can no longer end as
     # "machine" (see `_classify_phone_answer`).
     gate_spoke = gate_judge.HumanSpeechLatch()
+    # M013 S01 T03: the gate's post-answer time budget, started by the gate at
+    # the answer and checked before every new ask (here: the consent re-ask).
+    gate_budget = phone.GateBudget(PHONE_GATE_MAX_SECONDS)
 
     async def classify() -> str:
         if classifier is not None:
@@ -10472,6 +10510,7 @@ async def _run_phone_session(
             question_anchor=lambda: gate_question_anchor[0],
             on_grant_evidence=_record_gate_grant_evidence,
             spoke=gate_spoke,
+            budget=gate_budget,
         )
 
     # Arm the gate-window leak veto with the RÉSUMÉ FACTS — the text that must
@@ -11672,6 +11711,75 @@ async def _run_phone_session(
             answered_anchor[0] = int(round(time.time() * 1000))
         return verdict
 
+    # ── M013 S01 T03: ONE lease heartbeat per call, from the answer ──────────
+    # The gate starts it at the answer (`start_lease_heartbeat`), its first
+    # immediate beat replacing the one-shot re-base, and the post-consent code
+    # REUSES it rather than starting a second one. What a lost lease does
+    # depends on where the call is, so `halt` is a dispatcher: before the
+    # screening starts it cancels the gate (`_halt_gate_for_lease`), and once
+    # the screening is running it is re-pointed to `halt_for_lease`.
+    gate_heartbeat: list["asyncio.Task[Any] | None"] = [None]
+    gate_lease_halt: dict[str, str] = {}
+    lease_halt_target: list[Any] = [None]
+
+    async def _halt_gate_for_lease(reason: str) -> None:
+        # The reason is recorded FIRST, so the gate's cancellation can be told
+        # apart from an SDK close or a caller's cancellation at the await.
+        gate_lease_halt["reason"] = reason
+        task = gate_task_holder[0]
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _dispatch_lease_halt(reason: str) -> None:
+        target = lease_halt_target[0] or _halt_gate_for_lease
+        try:
+            await target(reason)
+        except Exception:  # noqa: BLE001 — a halt must never kill the beat task
+            _log.warn(
+                "unknown_event", error_type="phone_gate_heartbeat",
+                error_category="halt_dispatch_failed",
+            )
+
+    def _start_gate_heartbeat() -> bool:
+        """Start the call's lease heartbeat. True when it is running.
+
+        The heartbeat route fences on a UUID session id and the dispatch epoch
+        (`heartbeat_phone_attempt_by_epoch`); without both, a beat is a
+        guaranteed `lease_lost`, so none is started and the gate keeps the
+        one-shot re-base with a budget capped to the lease known to remain.
+        The DB fence accepts pre-consent beats (null attempt session,
+        `answered_unclassified`), so beating during the gate is valid.
+        """
+        if gate_heartbeat[0] is not None:
+            return not gate_heartbeat[0].done()
+        hb_session_id = phone.session_id_from_room_name(room_name)
+        if hb_session_id is None or epoch is None:
+            _log.info(
+                "unknown_event", error_type="phone_gate_heartbeat",
+                error_category="gate_heartbeat_unavailable",
+            )
+            return False
+        gate_heartbeat[0] = asyncio.ensure_future(
+            phone.run_phone_heartbeat(
+                attempt_id=attempt_id,
+                session_id=hb_session_id,
+                epoch=epoch,
+                client=events,
+                halt=_dispatch_lease_halt,
+            )
+        )
+        _log.info(
+            "unknown_event", error_type="phone_gate_heartbeat",
+            error_category="gate_heartbeat_started",
+        )
+        return True
+
+    def _stop_gate_heartbeat() -> None:
+        task = gate_heartbeat[0]
+        if task is not None and not task.done():
+            task.cancel()
+            task.add_done_callback(_consume_detached_task)
+
     async def _run_gate() -> "phone.PhoneGateResult":
         return await phone.run_phone_gate(
             attempt_id=attempt_id,
@@ -11758,6 +11866,10 @@ async def _run_phone_session(
             # rtc) ⇒ presence is the answer, the pre-E6 path.
             wait_for_answer=_wait_for_answer if answer_seam_wired else None,
             answer_post_out=answer_post_holder,
+            # M013 S01 T03: the post-answer budget, and the call's one lease
+            # heartbeat started at the answer.
+            gate_budget=gate_budget,
+            start_lease_heartbeat=_start_gate_heartbeat,
         )
 
     # Boolean phase marks from the gate, plus E3's `sip_left_reason` (a fixed
@@ -11765,6 +11877,8 @@ async def _run_phone_session(
     gate_lifecycle: dict[str, Any] = {}
     gate_error: BaseException | None = None
     gate_cancelled = False
+    # M013 S01 T03: the gate was cancelled by its lease heartbeat.
+    gate_lease_halted = False
     result: phone.PhoneGateResult | None = None
 
     # ── E3 (M009): OUR SIP leg leaving before consent ends the gate now ──
@@ -11896,7 +12010,34 @@ async def _run_phone_session(
             gate_task.cancel()
             gate_task.add_done_callback(_consume_detached_task)
             raise asyncio.TimeoutError
-        result = gate_task.result()
+        if gate_lease_halt.get("reason") and gate_task.cancelled():
+            # M013 S01 T03: the lease heartbeat lost the slot during the gate
+            # and cancelled it. A goodbye before durable consent (never after
+            # it: R4, nothing is spoken post-consent here), then teardown in
+            # the `finally` below, posting nothing new.
+            gate_lease_halted = True
+            _log.warn(
+                "unknown_event", error_type="phone_gate_outcome",
+                schema=phone.GATE_LEASE_HALTED,
+                error_category=gate_lease_halt["reason"],
+            )
+            if (
+                not gate_lifecycle.get("consent_durable")
+                and "terminal_posted" not in gate_lifecycle
+                and not (
+                    gate_lifecycle.get("answer_seam")
+                    and not gate_lifecycle.get("answer_observed")
+                )
+            ):
+                await _speak_gate_goodbye_bounded(
+                    session, say, phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT,
+                    pending_speech=gate_speech_holder[0],
+                )
+            result = phone.PhoneGateResult(
+                phone.GATE_LEASE_HALTED, events=[], spoken=[],
+            )
+        else:
+            result = gate_task.result()
     except asyncio.TimeoutError:
         _log.warn(
             "unknown_event", error_type="phone_gate_outcome",
@@ -11969,6 +12110,18 @@ async def _run_phone_session(
                     )
                 except Exception:  # noqa: BLE001 — the gate-done check is the backstop
                     pass
+        # M013 S01 T03: the gate's lease heartbeat outlives the gate only into
+        # a screening, which reuses it. Every other exit stops it here.
+        if result is None or not result.assessment_allowed:
+            _stop_gate_heartbeat()
+        if gate_lease_halted:
+            # The slot is lost: settle the evidence (the recording is KEPT)
+            # and close the room, but post NOTHING new. Teardown is handed the
+            # cancellation that ended the gate, which is exactly the
+            # "reconnect/lease owner's signal" it already posts nothing for.
+            # Single-flight, so the post-gate teardown call below is a no-op.
+            await _request_room_close()
+            await _run_teardown(result, asyncio.CancelledError())
         if gate_cancelled:
             # This raise exits before the post-gate finally exists. Preserve
             # evidence here while leaving terminal ownership to lease/recovery.
@@ -12228,18 +12381,32 @@ async def _run_phone_session(
             )
             await _request_room_close()
 
-        heartbeat_task = asyncio.create_task(
-            phone.run_phone_heartbeat(
-                attempt_id=attempt_id,
-                session_id=session_id,
-                epoch=epoch,
-                client=events,
-                halt=halt_for_lease,
+        # M013 S01 T03: REUSE the heartbeat the gate started at the answer
+        # (never a second one), re-pointing its halt at the screening. A lease
+        # lost between the gate's return and this line was recorded by the gate
+        # halt and is acted on as soon as the screening task exists. Only when
+        # the gate could not start one is a heartbeat started here, as before.
+        lease_halt_target[0] = halt_for_lease
+        lost_before_screening = gate_lease_halt.get("reason")
+        heartbeat_task = gate_heartbeat[0]
+        if heartbeat_task is None or (
+            heartbeat_task.done() and lost_before_screening is None
+        ):
+            heartbeat_task = asyncio.create_task(
+                phone.run_phone_heartbeat(
+                    attempt_id=attempt_id,
+                    session_id=session_id,
+                    epoch=epoch,
+                    client=events,
+                    halt=halt_for_lease,
+                )
             )
-        )
+            gate_heartbeat[0] = heartbeat_task
         try:
             screening = asyncio.ensure_future(_screen())
             running["screening"] = screening
+            if lost_before_screening is not None:
+                await halt_for_lease(lost_before_screening)
             try:
                 screened = await screening
                 if getattr(screened, "scoring_queue_owned", False):
@@ -12392,6 +12559,8 @@ async def _run_phone_session(
                     # every child) when the bound expires; nothing further is
                     # needed here.
     finally:
+        # T03 backstop: no exit may leave the call's lease heartbeat beating.
+        _stop_gate_heartbeat()
         # One owner settles gate/post-gate evidence, then performs any requested
         # room delete. It also runs when the caller cancels this task.
         await _run_teardown(result, gate_error)

@@ -1454,6 +1454,150 @@ def phone_identity_answer_timeout_sec() -> float:
         os.getenv("PHONE_IDENTITY_ANSWER_TIMEOUT_SEC"), 4.0, 2.0, 30.0)
 
 
+# ── M013 S01 T03: the gate's time budget ──────────────────────────────
+#
+# The worker's wall clock (`agent.PHONE_GATE_MAX_SECONDS`, wrapped around the
+# whole gate) is a WEDGE backstop: when it fires the gate task is cancelled
+# wherever it happens to be, mid-line or mid-booking. A healthy gate must
+# never reach it. So every new ask (identity re-ask, consent line, consent
+# re-ask, callback turn) first checks that one more round still fits before
+# the deadline; if it does not, the gate says the deferral goodbye and posts
+# `candidate.deferred_pre_disclosure` (uncharged, next IST-day window) on its
+# own terms, with time left to do both.
+
+#: Kept back at the end of the gate budget for the deferral goodbye (about 4 s
+#: of audio) and its terminal post, so a budget exit always finishes before
+#: the wall clock would cancel it.
+GATE_BUDGET_MARGIN_SEC = 10.0
+#: A conservative playout estimate for one short fixed gate line: a re-ask, a
+#: callback question or a read-back.
+GATE_LINE_ESTIMATE_SEC = 6.0
+#: The same for the consent line (the recording disclosure plus its question).
+GATE_DISCLOSURE_LINE_ESTIMATE_SEC = 12.0
+#: The admission lease the API mints at admission (`PHONE_LEASE_SECONDS`,
+#: 240 s, app/api/src/lib/phone-screening/config.ts). Only used when the gate
+#: heartbeat cannot run: then nothing renews the lease during the gate.
+PHONE_ADMISSION_LEASE_SEC = 240.0
+#: The worst case spent of that lease before the ring even starts: a cold
+#: machine boot (<= 32 s) plus the agent-join wait before originate (<= 20 s).
+#: Mirrors tests/test_phone_answer.py `TestLeaseBudget`.
+PHONE_PRE_RING_LEASE_SPEND_SEC = 52.0
+#: The fixed outcome schema of a gate that ran out of budget.
+GATE_BUDGET_EXHAUSTED_SCHEMA = "gate_budget_exhausted"
+
+
+class GateBudget:
+    """The post-answer time budget of one call's opening gate.
+
+    ``deadline = answer + max_seconds - margin``. Created unstarted by the
+    session and started by `run_phone_gate` at the answer; an unstarted
+    budget reports the whole of it as remaining. The clock is injectable so a
+    test can run a long gate on a fake clock. Never raises.
+    """
+
+    def __init__(
+        self,
+        max_seconds: float,
+        *,
+        margin_sec: float = GATE_BUDGET_MARGIN_SEC,
+        clock: Callable[[], float] = time_module.monotonic,
+    ) -> None:
+        self.max_seconds = max(0.0, float(max_seconds))
+        self.margin_sec = max(0.0, float(margin_sec))
+        self._clock = clock
+        self._started_at: float | None = None
+        self._deadline: float | None = None
+        #: Why the deadline was lowered below `max_seconds`, if it was.
+        self.capped_by: str | None = None
+
+    def now(self) -> float:
+        return float(self._clock())
+
+    @property
+    def started(self) -> bool:
+        return self._started_at is not None
+
+    def start(self) -> None:
+        """Start the budget at the answer. Idempotent: the first call wins."""
+        if self._started_at is not None:
+            return
+        self._started_at = self.now()
+        self._deadline = self._started_at + self.max_seconds - self.margin_sec
+
+    def cap_total(self, seconds: float, *, reason: str) -> None:
+        """Lower the deadline to ``answer + seconds - margin``; never raises it.
+
+        Used when the lease cannot be renewed during the gate: the gate may
+        then not outlive what is known to remain of the admission lease.
+        """
+        if self._started_at is None:
+            self.start()
+        capped = self._started_at + max(0.0, float(seconds)) - self.margin_sec  # type: ignore[operator]
+        if self._deadline is None or capped < self._deadline:
+            self._deadline = capped
+            self.capped_by = reason
+            _log.info(
+                "unknown_event", error_type="phone_gate_budget",
+                error_category="capped", phase=reason,
+                duration_sec=round(max(0.0, capped - self._started_at), 1),  # type: ignore[operator]
+            )
+
+    def remaining(self) -> float:
+        """Seconds left before the deadline (already net of the margin)."""
+        if self._deadline is None:
+            return max(0.0, self.max_seconds - self.margin_sec)
+        return self._deadline - self.now()
+
+    def bound(self, seconds: float) -> float:
+        """``seconds`` capped at what remains, never below zero."""
+        return max(0.0, min(float(seconds), self.remaining()))
+
+    def judge_timeout_sec(self) -> float:
+        """The gate judge's timeout for the next call: ``min(configured,
+        remaining)``. ``remaining`` is already net of the margin, so a judge
+        call can never eat the time reserved for the goodbye."""
+        return self.bound(gate_judge.judge_timeout_sec())
+
+    def round_cost_sec(self, line_sec: float | None = None) -> float:
+        """One more ask: the line, a full answer window and one judge call.
+
+        The CONFIGURED judge timeout, not the capped one: the question is
+        whether a whole round fits, so it is counted at full size even in
+        legacy mode (a few generous seconds cost nothing; a short budget
+        cuts off a person who is answering)."""
+        line = GATE_LINE_ESTIMATE_SEC if line_sec is None else float(line_sec)
+        return (
+            line + phone_classify_answer_timeout_sec()
+            + gate_judge.judge_timeout_sec()
+        )
+
+    def can_ask(self, phase: str, *, line_sec: float | None = None) -> bool:
+        """True when one more round of ``phase`` fits before the deadline.
+
+        False is logged once per refusal (`phone_gate_budget/exhausted`, with
+        the phase and the seconds left; never text).
+        """
+        remaining = self.remaining()
+        if remaining >= self.round_cost_sec(line_sec):
+            return True
+        _log.warn(
+            "unknown_event", error_type="phone_gate_budget",
+            error_category="exhausted", phase=phase,
+            duration_sec=round(max(0.0, remaining), 1),
+        )
+        return False
+
+
+def phone_unrenewed_lease_after_answer_sec(pre_answer_elapsed_sec: float) -> float:
+    """What is known to remain of the admission lease at the answer when
+    nothing renews it: lease - (boot + agent join) - the measured ring."""
+    return max(
+        0.0,
+        PHONE_ADMISSION_LEASE_SEC - PHONE_PRE_RING_LEASE_SPEND_SEC
+        - max(0.0, float(pre_answer_elapsed_sec)),
+    )
+
+
 def phone_answer_timeout_sec() -> float:
     """Bounded wall clock for ONE question's exchange.
 
@@ -5896,6 +6040,12 @@ GATE_TIMED_OUT = "gate_timed_out"
 #: `assessment_allowed` is False, so the caller closes the room; it must post
 #: NOTHING further for this outcome.
 GATE_NOT_ANSWERED = "not_answered"
+#: M013 S01 T03: the lease heartbeat that runs during the gate could no longer
+#: prove the slot (`lease_lost` / `lease_unconfirmed`), so the gate was
+#: cancelled. Before durable consent the person heard the deferral goodbye;
+#: nothing new is posted (the epoch fence would refuse it, and the slot may
+#: already be someone else's), and the room is closed.
+GATE_LEASE_HALTED = "gate_lease_halted"
 
 
 class PhoneParticipantGone(Exception):
@@ -6593,6 +6743,18 @@ async def run_phone_gate(
     # (`ANSWERED_POST_TASK_KEY`), so the worker's own teardown terminal can
     # await it before posting. Absent ⇒ a private holder.
     answer_post_out: Optional[dict[str, Any]] = None,
+    # ── M013 S01 T03 (both optional; absent ⇒ today's behaviour) ──────────
+    # The post-answer time budget (`GateBudget`), started here at the answer
+    # and checked before every new ask. When one more round no longer fits,
+    # the gate says the deferral goodbye and posts
+    # `candidate.deferred_pre_disclosure` instead of running into the wall
+    # clock.
+    gate_budget: Optional[GateBudget] = None,
+    # Start the call's ONE lease heartbeat at the answer. Returns True when it
+    # is running: its first, immediate beat then replaces the one-shot
+    # `rebase_lease_on_answer`. False (no session id or epoch to fence with)
+    # keeps the re-base and caps the budget to the lease known to remain.
+    start_lease_heartbeat: Optional[Callable[[], bool]] = None,
 ) -> PhoneGateResult:
     """Run the phone screening's opening, in the ONLY order that is safe.
 
@@ -6655,6 +6817,9 @@ async def run_phone_gate(
     """
     events: list[str] = []
     spoken: list[str] = []
+    # T03: when the gate (and with it the ring) began, on the budget's clock,
+    # so an unrenewed lease can be charged the ring it actually spent.
+    gate_entered_at = gate_budget.now() if gate_budget is not None else None
     #: The exact opening the bot spoke — from whichever path — so the gate
     #: transcript commit records what the candidate actually heard.
     opening_spoken: list[str] = []
@@ -6927,6 +7092,20 @@ async def run_phone_gate(
         # post-answer exit must never be charged as a no-answer.
         _phase("answer_observed")
 
+    # T03: the conversation's budget is measured from the answer, on every
+    # path that reaches one (seam, bounce, presence).
+    if gate_budget is not None:
+        gate_budget.start()
+
+    def _budget_allows(phase: str, *, line_sec: float | None = None) -> bool:
+        """T03: may the gate start one more ask? Always True with no budget."""
+        if gate_budget is None:
+            return True
+        try:
+            return gate_budget.can_ask(phase, line_sec=line_sec)
+        except Exception:  # noqa: BLE001 — a broken budget never ends a call
+            return True
+
     def _fire_begin_recording_at_answer() -> None:
         """0105: RECORD FROM THE ANSWER, fired and not awaited.
 
@@ -7043,11 +7222,42 @@ async def run_phone_gate(
         # The reference is held so the task cannot be garbage-collected
         # mid-flight, and the gate's own teardown outlives it: the renewal is a
         # single bounded HTTP round trip.
-        _rebase = asyncio.ensure_future(
-            rebase_lease_on_answer(client, attempt_id, session_id, epoch)
-        )
-        _lease_rebase_tasks.add(_rebase)
-        _rebase.add_done_callback(_lease_rebase_tasks.discard)
+        #
+        # M013 S01 T03: when the call's lease HEARTBEAT can start here, it
+        # replaces this one-shot re-base. Its first beat is immediate (the
+        # same renewal, from the same instant) and it keeps beating through
+        # the gate, so a long callback conversation can no longer outlive the
+        # lease. It is the ONE heartbeat of the call: the post-consent code
+        # reuses it. Starting it never awaits (no dead air after the answer).
+        heartbeat_running = False
+        if start_lease_heartbeat is not None:
+            try:
+                heartbeat_running = bool(start_lease_heartbeat())
+            except Exception:  # noqa: BLE001 — fall back to the re-base
+                heartbeat_running = False
+                _log.warn(
+                    "unknown_event", error_type="phone_gate_heartbeat",
+                    error_category="gate_heartbeat_start_failed",
+                )
+        if not heartbeat_running:
+            _rebase = asyncio.ensure_future(
+                rebase_lease_on_answer(client, attempt_id, session_id, epoch)
+            )
+            _lease_rebase_tasks.add(_rebase)
+            _rebase.add_done_callback(_lease_rebase_tasks.discard)
+            if gate_budget is not None:
+                # Nothing renews the lease during this gate (the re-base may
+                # not land either), so it may not outlive what is KNOWN to
+                # remain of the admission lease: lease - (boot + join) - the
+                # ring this gate measured.
+                pre_answer = (
+                    gate_budget.now() - gate_entered_at
+                    if gate_entered_at is not None else 0.0
+                )
+                gate_budget.cap_total(
+                    phone_unrenewed_lease_after_answer_sec(pre_answer),
+                    reason="unrenewed_lease",
+                )
 
     # ── Durable consent short-circuit: a re-entry never re-asks ────────────
     # A worker deploy/crash mid-call re-dispatches this leg into a conversation
@@ -7430,9 +7640,25 @@ async def run_phone_gate(
                 r"\brecord\w*\b|\bnot interested\b", reply, re.IGNORECASE,
             ):
                 return await _terminal_outcome(verdict)
-            decision = await run_callback_turn(
+            turn = run_callback_turn(
                 flow, client, attempt_id, reply, datetime.now(timezone.utc),
             )
+            if gate_budget is None:
+                decision = await turn
+            else:
+                # T03: a slow propose/confirm round trip is bounded by what
+                # is left of the budget, so it ends in a spoken deferral and
+                # not in the wall clock cancelling the gate mid-sentence.
+                try:
+                    decision = await asyncio.wait_for(
+                        turn, timeout=gate_budget.bound(gate_budget.remaining()),
+                    )
+                except asyncio.TimeoutError:
+                    _log.warn(
+                        "unknown_event", error_type="phone_gate_budget",
+                        error_category="exhausted", phase="callback_booking",
+                    )
+                    return await _defer_with_goodbye(GATE_BUDGET_EXHAUSTED_SCHEMA)
             if decision.terminal:
                 if decision.booked:
                     # Confirmation has durably ended the attempt. Latch before
@@ -7451,6 +7677,9 @@ async def run_phone_gate(
                 result = await _terminal_outcome(CLASSIFY_DEFERRED_PRE_DISCLOSURE)
                 await _say(decision.spoken)
                 return result
+            # T03: one more callback question only if its answer still fits.
+            if not _budget_allows("callback_turn"):
+                return await _defer_with_goodbye(GATE_BUDGET_EXHAUSTED_SCHEMA)
             _ask_barrier()
             await _say(decision.spoken)
             reader = next_callback_turn or next_candidate_turn
@@ -7481,6 +7710,10 @@ async def run_phone_gate(
             # ONE confirming re-ask, never more. The person who says "no, this
             # is her father" may equally be the candidate correcting a mangled
             # name, so the first verdict alone may not end a call.
+            # T03: only if its answer still fits the budget. A deferral is
+            # not a wrong-number verdict: nothing is suppressed or discarded.
+            if not _budget_allows("identity_reask"):
+                return await _defer_with_goodbye(GATE_BUDGET_EXHAUSTED_SCHEMA)
             second_reply = await _ask_identity(
                 phone_identity_reask_instruction(candidate_name),
                 phone_identity_reask_text(candidate_name),
@@ -7581,6 +7814,10 @@ async def run_phone_gate(
     # Scoped to the conversational flow so the deterministic rollback stays
     # byte-identical. There is no identity turn there, so nothing can have been
     # left in the queue by one.
+    # T03: the consent question is asked only if its answer still fits; a
+    # consent read the wall clock would cut short helps nobody.
+    if not _budget_allows("consent", line_sec=GATE_DISCLOSURE_LINE_ESTIMATE_SEC):
+        return await _defer_with_goodbye(GATE_BUDGET_EXHAUSTED_SCHEMA)
     if identity_ran:
         _ask_barrier()
 
@@ -7650,6 +7887,11 @@ async def run_phone_gate(
         classify_timeout_sec if classify_timeout_sec is not None
         else phone_classify_timeout_sec()
     )
+    if gate_budget is not None:
+        # T03: the backstop never runs past the budget. The reader's own
+        # re-ask check normally defers first; this is the net under it, and
+        # its expiry is the same spoken deferral (never "machine").
+        timeout = max(1.0, min(timeout, gate_budget.remaining()))
     # ── Consent-turn short max-endpointing (2026-09-09 latency RCA) ────────────
     # The consent reply is a bare affirmation ("yes"), which the local v1-mini
     # EOU scores INCOMPLETE — so it waits out the full mid-answer max tail (2.5s)

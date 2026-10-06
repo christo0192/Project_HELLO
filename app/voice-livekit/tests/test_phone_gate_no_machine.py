@@ -406,9 +406,10 @@ class _Gate:
             self.queue, self.say, consumed=self.consumed, answer_timeout_sec=0.02,
             spoke=self.latch)
 
-    async def run(self, *, flow="conversational", classify=None):
+    async def run(self, *, flow="conversational", classify=None, identity="unclear",
+                  **extra):
         async def infer(_prompt):
-            return "unclear"
+            return identity
 
         with patch.dict(os.environ, {"PHONE_GATE_FLOW": flow}), \
                 patch.object(phone, "_default_phone_identity_inference", infer):
@@ -422,7 +423,7 @@ class _Gate:
                 consent_reply_out=self.consumed,
                 classify_gate_reply=agent_mod.classify_answer_text,
                 gate_phase_out=self.phases, candidate_name="Kiran Example",
-                session_id="synthetic-session", epoch=1,
+                session_id="synthetic-session", epoch=1, **extra,
             )
 
 
@@ -770,6 +771,314 @@ class TestOverrunGoodbyeInTheSession(unittest.IsolatedAsyncioTestCase):
     async def test_nothing_is_spoken_after_a_terminal_already_posted(self):
         _result, _client, session = await self._wedged({"terminal_posted": True})
         self.assertNotIn(phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT, session.spoken)
+
+
+# ── T03: the gate's time budget ────────────────────────────────────────────
+
+
+class _Clock:
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+class TestGateBudgetUnit(unittest.TestCase):
+    """`phone.GateBudget`: deadline = answer + max - margin."""
+
+    def test_the_deadline_is_answer_plus_max_minus_margin(self):
+        clock = _Clock(5.0)
+        budget = phone.GateBudget(180.0, clock=clock)
+        # Unstarted: the whole budget is still ahead.
+        self.assertEqual(budget.remaining(), 180.0 - phone.GATE_BUDGET_MARGIN_SEC)
+        self.assertFalse(budget.started)
+        budget.start()
+        clock.t = 25.0
+        self.assertAlmostEqual(budget.remaining(), 180.0 - 10.0 - 20.0)
+        # The first start wins: a second call cannot move the deadline.
+        budget.start()
+        self.assertAlmostEqual(budget.remaining(), 150.0)
+
+    def test_a_cap_only_ever_LOWERS_the_deadline(self):
+        clock = _Clock()
+        budget = phone.GateBudget(180.0, clock=clock)
+        budget.start()
+        budget.cap_total(500.0, reason="ignored")
+        self.assertIsNone(budget.capped_by)
+        self.assertAlmostEqual(budget.remaining(), 170.0)
+        budget.cap_total(128.0, reason="unrenewed_lease")
+        self.assertEqual(budget.capped_by, "unrenewed_lease")
+        self.assertAlmostEqual(budget.remaining(), 118.0)
+
+    def test_judge_and_bounded_waits_never_eat_the_margin(self):
+        clock = _Clock()
+        budget = phone.GateBudget(30.0, clock=clock)
+        budget.start()
+        clock.t = 18.5  # 1.5 s left before the deadline (margin excluded)
+        self.assertAlmostEqual(budget.judge_timeout_sec(), 1.5)
+        self.assertAlmostEqual(budget.bound(40.0), 1.5)
+        clock.t = 40.0
+        self.assertEqual(budget.judge_timeout_sec(), 0.0)
+        self.assertEqual(budget.bound(5.0), 0.0)
+        # With room to spare the configured judge timeout stands.
+        roomy = phone.GateBudget(180.0, clock=_Clock())
+        roomy.start()
+        self.assertEqual(roomy.judge_timeout_sec(), gate_judge.judge_timeout_sec())
+
+    def test_one_round_is_line_plus_answer_window_plus_judge(self):
+        budget = phone.GateBudget(180.0, clock=_Clock())
+        self.assertAlmostEqual(
+            budget.round_cost_sec(),
+            phone.GATE_LINE_ESTIMATE_SEC + phone.phone_classify_answer_timeout_sec()
+            + gate_judge.judge_timeout_sec())
+        self.assertAlmostEqual(
+            budget.round_cost_sec(phone.GATE_DISCLOSURE_LINE_ESTIMATE_SEC)
+            - budget.round_cost_sec(),
+            phone.GATE_DISCLOSURE_LINE_ESTIMATE_SEC - phone.GATE_LINE_ESTIMATE_SEC)
+
+    def test_an_exhausted_budget_refuses_and_logs_once_without_text(self):
+        clock = _Clock()
+        budget = phone.GateBudget(30.0, clock=clock)
+        budget.start()
+        sink = _LogSink()
+        with patch.object(phone, "_log", sink):
+            self.assertFalse(budget.can_ask("consent_reask"))
+        records = sink.of("phone_gate_budget", "exhausted")
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["phase"], "consent_reask")
+        self.assertEqual(set(records[0]), {"error_type", "error_category", "phase",
+                                           "duration_sec"})
+        roomy = phone.GateBudget(180.0, clock=_Clock())
+        roomy.start()
+        self.assertTrue(roomy.can_ask("consent_reask"))
+
+    def test_the_unrenewed_lease_matches_the_api_lease_arithmetic(self):
+        self.assertEqual(phone.PHONE_ADMISSION_LEASE_SEC, 240.0)
+        self.assertEqual(phone.phone_unrenewed_lease_after_answer_sec(60.0), 128.0)
+        self.assertEqual(phone.phone_unrenewed_lease_after_answer_sec(500.0), 0.0)
+        self.assertEqual(phone.phone_unrenewed_lease_after_answer_sec(-3.0), 188.0)
+
+    def test_the_session_wires_the_budget_into_the_gate_and_the_consent_reader(self):
+        import inspect
+        src = inspect.getsource(agent_mod._run_phone_session)
+        self.assertIn("gate_budget = phone.GateBudget(PHONE_GATE_MAX_SECONDS)", src)
+        classify = src[src.index("async def classify() -> str:"):]
+        self.assertIn("budget=gate_budget,", classify[:800])
+        self.assertIn("gate_budget=gate_budget,", src)
+
+
+class _TimedGate(_Gate):
+    """`_Gate` on a fake clock: every line, reply and booking round trip
+    costs fake seconds, so a long gate runs in milliseconds."""
+
+    LINE = 6.0
+    REPLY = 10.0
+    SILENCE = 15.0
+    PROPOSE = 20.0
+
+    def __init__(self, replies, *, max_seconds, proposals=(), budget=True, **kw):
+        super().__init__(replies, **kw)
+        self.clock = _Clock()
+        self.budget = phone.GateBudget(max_seconds, clock=self.clock) if budget else None
+        self.said_at: list[tuple[float, str]] = []
+        self._proposals = list(proposals)
+
+        async def propose(_attempt, starts_at):
+            self.clock.t += self.PROPOSE
+            if self._proposals:
+                return self._proposals.pop(0), None
+            return phone.PhoneApiOutcome(False, "window_closed"), None
+
+        self.client.propose_callback = AsyncMock(side_effect=propose)
+
+    async def say(self, text):
+        self.said_at.append((self.clock.t, text))
+        await super().say(text)
+        self.clock.t += self.LINE
+
+    def _tick(self, reply):
+        self.clock.t += self.REPLY if reply else self.SILENCE
+        return reply
+
+    async def next_turn(self):
+        return self._tick(await super().next_turn())
+
+    async def next_callback_turn(self):
+        return self._tick(await super().next_callback_turn())
+
+    async def classify(self):
+        self.clock.t += self.REPLY
+        return await agent_mod._classify_phone_answer(
+            self.queue, self.say, consumed=self.consumed, answer_timeout_sec=0.02,
+            spoke=self.latch, budget=self.budget)
+
+    async def run(self, **kwargs):
+        return await super().run(gate_budget=self.budget, **kwargs)
+
+
+def _refusal(status, alternatives=()):
+    outcome = phone.PhoneApiOutcome(False, status)
+    outcome.alternatives = [phone.CallbackAlternative(a) for a in alternatives]
+    return outcome
+
+
+_ALTERNATIVE = {
+    "starts_at": "2026-10-08T08:30:00Z", "ends_at": "2026-10-08T08:45:00Z",
+    "ist_time": "14:00", "weekday": "Thursday",
+}
+
+
+class TestGateBudget(unittest.IsolatedAsyncioTestCase):
+    """Before every new ask the gate checks that one more round still fits."""
+
+    #: The pre-T03 bound, so the control run below shows the wall clock that
+    #: a budget-less gate would have run into.
+    MAX = 116.0
+
+    def _slow_booking(self, *, budget=True):
+        # busy -> "what time?" -> a time (slow propose, refused) -> another
+        # time (slow propose, slot full, alternatives offered) -> a pick.
+        return _TimedGate(
+            ["Hello", "I am busy right now", "tomorrow at 11 am",
+             "tomorrow at 2 pm", "the first one"],
+            max_seconds=self.MAX, budget=budget,
+            proposals=[_refusal("slot_not_yet_eligible"),
+                       _refusal("slot_full", [_ALTERNATIVE])],
+        )
+
+    async def test_a_SLOW_callback_booking_ends_in_a_spoken_deferral_in_time(self):
+        """A 20 s propose round trip, four callback turns: the gate defers
+        with a goodbye BEFORE the wall clock would have cut it off."""
+        g = self._slow_booking()
+        sink = _LogSink()
+        with patch.object(phone, "_log", sink):
+            result = await g.run()
+        self.assertEqual(result.outcome, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        self.assertEqual(g.events.count("candidate.deferred_pre_disclosure"), 1)
+        self.assertNotIn("classify.machine", g.events)
+        goodbye_at, last = g.said_at[-1]
+        self.assertEqual(last, phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT)
+        # The goodbye finishes before the old wall clock would have fired.
+        self.assertLessEqual(goodbye_at + _TimedGate.LINE, self.MAX)
+        # Both slow proposals ran; the alternatives question was never asked.
+        self.assertEqual(g.client.propose_callback.await_count, 2)
+        g.client.confirm_callback.assert_not_awaited()
+        self.assertFalse(any("Thursday" in text for _t, text in g.said_at))
+        self.assertEqual(
+            [f["phase"] for f in sink.of("phone_gate_budget", "exhausted")],
+            ["callback_turn"])
+        self.assertIn(phone.GATE_BUDGET_EXHAUSTED_SCHEMA,
+                      [f.get("schema") for f in sink.of("phone_gate_outcome")])
+
+    async def test_CONTROL_without_a_budget_the_same_call_runs_past_the_bound(self):
+        g = self._slow_booking(budget=False)
+        await g.run()
+        # The alternatives offer is started anyway, and the call is still
+        # talking after the old wall clock — the cut-off T03 prevents.
+        self.assertTrue(any("Thursday" in text for _t, text in g.said_at))
+        self.assertGreater(g.clock.t, self.MAX)
+
+    async def test_the_consent_question_is_not_started_without_time_for_its_answer(self):
+        g = _TimedGate(["Hello"], max_seconds=40.0)  # 16 s in, 14 s left
+        result = await g.run()
+        self.assertEqual(result.outcome, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        self.assertNotIn(phone.PHONE_DISCLOSURE_CONTINUATION_TEXT, g.spoken)
+        self.assertEqual(g.spoken[-1], phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT)
+        self.assertEqual(g.events, ["call.answered", "candidate.deferred_pre_disclosure"])
+        g.client.consent_and_start_assessment.assert_not_awaited()
+
+    async def test_the_identity_reask_is_not_started_without_time_for_its_answer(self):
+        g = _TimedGate(["No, I am her father"], max_seconds=40.0)
+        result = await g.run(identity=phone.PHONE_IDENTITY_OTHER)
+        self.assertEqual(result.outcome, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        # One identity line, then the goodbye: no re-ask, no wrong-number
+        # verdict, nothing suppressed or discarded.
+        self.assertEqual(len(g.spoken), 2)
+        self.assertEqual(g.spoken[-1], phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT)
+        self.assertNotIn("candidate.wrong_number", g.events)
+        self.assertFalse(g.phases.get("not_the_candidate"))
+        self.assertFalse(result.not_the_candidate)
+
+    async def test_with_time_to_spare_nothing_changes(self):
+        """The 32757295 busy -> time -> booked path, inside a 180 s budget."""
+        g = _TimedGate(["Hello", "I am busy right now", "tomorrow at 11 am"],
+                       max_seconds=180.0,
+                       proposals=[phone.PhoneApiOutcome(True, "proposal_valid")])
+        result = await g.run()
+        self.assertEqual(result.outcome, phone.HALT_CALLBACK_SCHEDULED)
+        g.client.confirm_callback.assert_awaited_once()
+
+    async def test_a_booking_round_trip_is_BOUNDED_by_what_is_left(self):
+        """Real clock, tiny numbers: a propose that hangs is cut at the
+        budget, and the person hears the goodbye."""
+        loop = asyncio.get_running_loop()
+        g = _Gate(["I'm busy, call me tomorrow at 11 am"])
+
+        async def hang(*_a, **_k):
+            await asyncio.sleep(30)
+
+        g.client.propose_callback = AsyncMock(side_effect=hang)
+        budget = phone.GateBudget(1.0, margin_sec=0.1, clock=loop.time)
+        started = loop.time()
+        result = await g.run(gate_budget=budget)
+        self.assertLess(loop.time() - started, 5.0)
+        self.assertEqual(result.outcome, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        self.assertEqual(g.spoken[-1], phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT)
+        self.assertEqual(g.events.count("candidate.deferred_pre_disclosure"), 1)
+        g.client.confirm_callback.assert_not_awaited()
+
+    async def test_the_consent_backstop_never_runs_past_the_budget(self):
+        loop = asyncio.get_running_loop()
+        g = _Gate(["Hello"])
+
+        async def hang():
+            await asyncio.sleep(60)
+
+        budget = phone.GateBudget(0.6, margin_sec=0.1, clock=loop.time)
+        started = loop.time()
+        with patch.object(phone, "phone_classify_answer_timeout_sec", lambda: 0.01), \
+                patch.object(gate_judge, "judge_timeout_sec", lambda: 0.01), \
+                patch.object(phone, "GATE_DISCLOSURE_LINE_ESTIMATE_SEC", 0.0):
+            result = await g.run(classify=hang, gate_budget=budget)
+        # Not the 52 s backstop: the budget's floor of one second.
+        self.assertLess(loop.time() - started, 5.0)
+        self.assertEqual(result.outcome, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        self.assertEqual(g.spoken[-1], phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT)
+
+
+class TestConsentReaskBudget(unittest.IsolatedAsyncioTestCase):
+    async def _read(self, budget):
+        queue: asyncio.Queue = asyncio.Queue()
+        queue.put_nowait("Hmm.")
+        spoken: list[str] = []
+
+        async def say(text):
+            spoken.append(text)
+
+        verdict = await agent_mod._classify_phone_answer(
+            queue, say, answer_timeout_sec=0.02, budget=budget)
+        return verdict, spoken
+
+    async def test_no_reask_without_time_for_its_answer(self):
+        budget = phone.GateBudget(30.0, clock=_Clock())
+        budget.start()  # 20 s left: less than one round
+        verdict, spoken = await self._read(budget)
+        self.assertEqual(verdict, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        self.assertEqual(spoken, [])
+
+    async def test_the_reask_is_spoken_when_it_fits(self):
+        budget = phone.GateBudget(180.0, clock=_Clock())
+        budget.start()
+        verdict, spoken = await self._read(budget)
+        self.assertEqual(spoken, [phone.PHONE_CONSENT_REASK_UNCLEAR_TEXT])
+        # After the re-ask, silence: a person spoke, so a deferral.
+        self.assertEqual(verdict, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+
+    async def test_without_a_budget_the_reader_is_unchanged(self):
+        verdict, spoken = await self._read(None)
+        self.assertEqual(spoken, [phone.PHONE_CONSENT_REASK_UNCLEAR_TEXT])
+        self.assertEqual(verdict, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
 
 
 # ── the replay ─────────────────────────────────────────────────────────────
