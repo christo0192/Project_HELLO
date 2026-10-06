@@ -5726,6 +5726,22 @@ CLASSIFY_CALLBACK_REQUESTED = "callback_requested"
 CLASSIFY_END_REQUESTED = "end_requested"
 
 
+def phone_preconsent_end_requested(text: Any) -> bool:
+    """A requested end, excluding 'please don't hang up' in gate replies."""
+    if not isinstance(text, str):
+        return False
+    clean = text.replace("’", "'")
+    # Remove negated end phrases before using the existing request detector.
+    # Another unnegated request elsewhere in the turn can still win.
+    clean = re.sub(
+        r"\b(?:don't|do not|never|no need to)\s+(?:(?:please|just)\s+)*"
+        r"(?:hang\s*up|disconnect|end|stop|cut|close|terminate)"
+        r"(?:\s+(?:the|this|our))?(?:\s+call)?", "", clean,
+        flags=re.IGNORECASE,
+    )
+    return is_explicit_end_call_request(clean)
+
+
 def phone_preconsent_callback_requested(text: Any) -> bool:
     """Gate-only availability: a bare 'I'm busy' also requests a callback."""
     if not isinstance(text, str):
@@ -6398,6 +6414,7 @@ async def run_phone_gate(
     compose_opening: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
     compose_gate_line: Optional[Callable[[str], Awaitable[Optional[str]]]] = None,
     classify_gate_reply: Optional[Callable[[str], Optional[str]]] = None,
+    next_callback_turn: Optional[Callable[[], Awaitable[str]]] = None,
     # Call G: authors the role-opening from the model (verbatim role, verified).
     # Given the server role title, returns the SPOKEN line, or None if generation
     # failed / did not name the role — in which case the gate speaks the fixed
@@ -7294,7 +7311,7 @@ async def run_phone_gate(
             verdict = classify_gate_reply(reply) if classify_gate_reply else None
             if verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER}:
                 return await _terminal_outcome(verdict)
-            if is_explicit_end_call_request(reply):
+            if phone_preconsent_end_requested(reply):
                 return await _end_before_consent()
             # 'No, tomorrow at three' corrects the proposed TIME; it is not a
             # recording refusal. Strong recording/participation refusals remain
@@ -7326,7 +7343,8 @@ async def run_phone_gate(
                 return result
             _ask_barrier()
             await _say(decision.spoken)
-            reply = await next_candidate_turn() if next_candidate_turn else ""
+            reader = next_callback_turn or next_candidate_turn
+            reply = await reader() if reader else ""
         return await _terminal_outcome(CLASSIFY_DEFERRED_PRE_DISCLOSURE)
 
     identity_reply = ""
@@ -7337,10 +7355,10 @@ async def run_phone_gate(
         )
         identity_reply = first_reply
         gate_verdict = classify_gate_reply(first_reply) if classify_gate_reply else None
-        if is_explicit_end_call_request(first_reply):
-            return await _end_before_consent()
         if gate_verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER}:
             return await _terminal_outcome(gate_verdict)
+        if phone_preconsent_end_requested(first_reply):
+            return await _end_before_consent()
         if gate_verdict == CLASSIFY_CALLBACK_REQUESTED:
             return await _schedule_before_consent(first_reply)
         identity_verdict = await phone_classify_identity(first_reply, candidate_name)
@@ -7358,10 +7376,10 @@ async def run_phone_gate(
             )
             identity_reply = second_reply
             gate_verdict = classify_gate_reply(second_reply) if classify_gate_reply else None
-            if is_explicit_end_call_request(second_reply):
-                return await _end_before_consent()
             if gate_verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER}:
                 return await _terminal_outcome(gate_verdict)
+            if phone_preconsent_end_requested(second_reply):
+                return await _end_before_consent()
             if gate_verdict == CLASSIFY_CALLBACK_REQUESTED:
                 return await _schedule_before_consent(second_reply)
             identity_verdict = await phone_classify_identity(

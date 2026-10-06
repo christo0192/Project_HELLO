@@ -114,6 +114,22 @@ class ConversationGateTests(unittest.IsolatedAsyncioTestCase):
         client.confirm_callback.assert_awaited_once()
         self.assertNotIn("disclosure.refused", events)
 
+    async def test_negated_end_request_keeps_calendar_selection_alive(self):
+        result, client, _, _, _ = await self.gate(
+            ["I'm busy", "Please do not hang up, tomorrow at 3 pm"],
+        )
+        self.assertEqual(result.outcome, phone.HALT_CALLBACK_SCHEDULED)
+        client.confirm_callback.assert_awaited_once()
+
+    async def test_opt_out_plus_end_remains_opt_out_at_every_stage(self):
+        stop = "Don't call me again, hang up the call"
+        for identity, replies in ((True, [stop]), (False, [stop]),
+                                  (False, ["I'm busy", stop])):
+            result, client, _, events, _ = await self.gate(replies, identity=identity)
+            self.assertEqual(result.outcome, phone.CLASSIFY_OPT_OUT)
+            self.assertEqual(events[-1], "candidate.opt_out")
+            client.propose_callback.assert_not_awaited()
+
     async def test_invalid_draft_is_never_spoken(self):
         draft = "Hi, is this Taylor? This call is recorded. Okay to continue?"
         _, _, spoken, _, _ = await self.gate(["No thanks"], draft=draft)
@@ -196,6 +212,22 @@ class CandidateQnaTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(sys.modules["livekit.agents"].StopResponse):
             await self.turn(hooks, "Okay")
         self.assertEqual(agent._closing_state_machine.state.value, "candidate_qna")
+
+    async def test_ack_after_watchdog_recovery_uses_replacement_delivery(self):
+        agent, session, _, _, hooks = await self.enter()
+        await self.turn(hooks, "How large is the team?")
+        # An intervening handle changes the actual fallback's sequence.
+        hooks["speech_sequence"][0] = 7
+        with patch.object(agent_mod, "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", .05):
+            await agent._on_reply_expected()
+            for _ in range(100):
+                if "The hiring team can help with that detail." in session.spoken:
+                    break
+                await asyncio.sleep(.01)
+        self.assertIn("The hiring team can help with that detail.", session.spoken)
+        await agent._on_reply_delivered(False, 8)
+        instruction = await self.turn(hooks, "Okay")
+        self.assertIn("say goodbye", instruction)
 
     async def test_ack_with_question_is_answered_even_after_delivery(self):
         agent, _, _, _, hooks = await self.enter()

@@ -4840,12 +4840,12 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             [c[0] for c in client.assessment_calls],
             ["start", "turn", "turn", "complete"],
         )
-        # The opening is the verified model greeting (through generate_reply),
-        # carrying the recording sentence — never spoken as the fixed disclosure.
+        # The SDK-free fixture has no model stream: it uses the validated
+        # fallback via say, outside the screening generation instructions.
         self.assertIn(
-            phone.PHONE_DISCLOSURE_RECORDING_SENTENCE, session.instructions[0]
+            phone.PHONE_DISCLOSURE_RECORDING_SENTENCE, session.spoken[0]
         )
-        self.assertNotIn(phone.PHONE_DISCLOSURE_TEXT, session.spoken)
+        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, session.spoken)
         terminal_context = str(session.turn_contexts[-1]).lower()
         self.assertIn("goodbye", terminal_context)
         self.assertIn("do not ask another question", terminal_context)
@@ -5078,11 +5078,11 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             answers=("Yes, that's fine.",),
             replies=["First answer.", "Second answer."],
         )
-        self.assertIn("okay to continue", session.instructions[0].lower())
+        self.assertIn("okay to continue", session.spoken[0].lower())
         self.assertIn("First question?", session.spoken)
         self.assertEqual(client.committed_keys, ["k1", "k2"])
-        # Gate opening plus the two answer-mediated Gemini replies.
-        self.assertEqual(len(session.instructions), 3)
+        # The opening is privately composed; only screening replies generate.
+        self.assertEqual(len(session.instructions), 2)
 
     async def test_first_question_falls_back_to_fixed_playout_without_generate_reply(self):
         """A session without `generate_reply` still asks the exact planned text."""
@@ -5457,9 +5457,9 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         # the recording sentence). It is deliberately NOT a transcript turn: the
         # gate opening is gate copy, and no boundary carries it.
         self.assertIn(
-            phone.PHONE_DISCLOSURE_RECORDING_SENTENCE, session.instructions[0]
+            phone.PHONE_DISCLOSURE_RECORDING_SENTENCE, session.spoken[0]
         )
-        self.assertNotIn(phone.PHONE_DISCLOSURE_TEXT, session.spoken)
+        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, session.spoken)
         for boundary in client.boundaries:
             for turn in boundary["turns"]:
                 self.assertNotIn("recorded so the hiring team", turn["text"])
@@ -5471,8 +5471,8 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
             close_after=False,
         )
 
-        # The gate opening plus one LiveKit-native terminal response.
-        self.assertEqual(len(session.instructions), 2)
+        # One LiveKit-native terminal response; the gate uses separate drafting.
+        self.assertEqual(len(session.instructions), 1)
         self.assertEqual(client.committed_keys, [])
         self.assertIn("assessment.aborted", client.event_types)
         terminal_context = str(session.turn_contexts[-1]).lower()
@@ -5553,7 +5553,7 @@ class TestPhoneSessionFlow(unittest.IsolatedAsyncioTestCase):
         # confirmations go through `say`; the gate opening is a generated
         # conversation item (verified, so never the fixed disclosure via say).
         self.assertIn(phone._SCHEDULE_CONFIRMED_TEXT, session.spoken)
-        self.assertIn(_FakePhoneSession.gate_opening_text, session.emitted_bot_turns)
+        self.assertIn(phone.PHONE_DISCLOSURE_TEXT, session.emitted_bot_turns)
         # …and a real generated turn DID survive, so the filter is not simply
         # dropping everything the bot says.
         self.assertTrue(any(t.startswith("asked-") for t in committed))
@@ -13027,7 +13027,7 @@ class TestOpeningSubscribeReadiness(unittest.IsolatedAsyncioTestCase):
         # work rather than being paid on the first spoken frame.
         self.assertLess(
             src.index("subscribed_fut"),
-            src.index("generate("),
+            src.index("session.llm.chat("),
             "the subscription wait must precede the generate() call",
         )
 
@@ -17578,7 +17578,7 @@ class TestPhoneInstructionAssembly(unittest.TestCase):
     def test_single_question_and_expressiveness_blocks_are_always_present(self):
         text = agent_mod._phone_instructions_text(self._state())
         low = text.lower()
-        self.assertIn("ask exactly one question per turn", low)
+        self.assertIn("ask at most one question per turn", low)
         self.assertIn("do not move to the next topic", low)
         self.assertIn("restate the current question only", low)
         # Natural delivery is specific, one-thought, and never speaks stage directions.

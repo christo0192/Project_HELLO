@@ -2845,7 +2845,7 @@ def classify_answer_text(text: str) -> str | None:
         return phone.CLASSIFY_WRONG_NUMBER
     if _OPT_OUT_RE.search(value):
         return phone.CLASSIFY_OPT_OUT
-    if phone.is_explicit_end_call_request(value):
+    if phone.phone_preconsent_end_requested(value):
         return phone.CLASSIFY_END_REQUESTED
     if (phone.phone_preconsent_callback_requested(value)
             and not _RECORDING_CONFLICT_RE.search(value)
@@ -9879,11 +9879,11 @@ async def _run_phone_session(
             return None
 
     async def speak_opening() -> str | None:
-        """Generate a warm, verified opening through the tool-less gate window.
+        """Compose a private opening draft; the gate validates and speaks it.
 
         Asks the model to greet as Christy, disclose recording (including the
         fixed recording-disclosure sentence verbatim), and ask consent, then
-        returns the exact spoken text. Returns None on any failure so the gate
+        returns the draft text. Returns None on any failure so the gate
         falls back to the fixed disclosure.
         """
         # Under the conversational flow the identity turn has ALREADY greeted
@@ -9914,29 +9914,9 @@ async def _run_phone_session(
             "MUST END with the consent question (for example, \"Is it okay to "
             "continue?\") so a simple yes or no answers it."
         )
-        # The SIP output-subscription warm-up (baseline-fix 4a) now lives in
-        # `_await_output_subscription`, which `_speak_gate_generation` runs
-        # before every gate generation. It must still run in DETERMINISTIC mode,
-        # where no opening is generated at all — otherwise the fixed disclosure
-        # pays the whole untimed subscription stall on its first frame.
+        # Warm the output track for both model-composed and rollback openings.
+        # The gate validates the private draft before any audio is emitted.
         await _await_output_subscription()
-        # ── Deterministic opener (default; PHONE_DETERMINISTIC_OPENER) ─────
-        # Author NO model opening: return None so `run_phone_gate` speaks the
-        # FIXED `PHONE_DISCLOSURE_TEXT` (the exact scripted consent line) with
-        # NOTHING spoken before it. This removes the speak-then-verify double
-        # opener RCA'd on session 4355b045 (the model appended "am I speaking to
-        # Christo?" — heard — and the fixed disclosure was then spoken on top)
-        # and drops one opening-time generation. The LLM path runs only when
-        # PHONE_DETERMINISTIC_OPENER=false.
-        #
-        # NOTE (baseline-fix repair, 2026-09-09): a defense-in-depth first-audio
-        # watchdog arm for the opening was REMOVED here as dead code —
-        # `_on_reply_expected` is wired only by the native screening loop, which
-        # runs AFTER this consent-gate opening, so at gate time it is always
-        # `None` and the arm could never fire (a guard that cannot fire). A
-        # stalled or verification-failed opening is already observable and
-        # recovered without it: `run_phone_gate` logs `opening_unverified` and
-        # speaks the fixed fallback when this returns None.
         if phone.phone_deterministic_opener():
             return None
         return await _compose_gate_line(opening_instructions)
@@ -10277,6 +10257,13 @@ async def _run_phone_session(
             phone.phone_identity_answer_timeout_sec(),
             speaking=lambda: bool(candidate_speaking.get("value")),
             hard_timeout_sec=phone.phone_classify_answer_timeout_sec(),
+        )
+
+    async def _next_callback_turn() -> str:
+        """Give calendar selection a full answer window, not identity's 4s."""
+        return await _read_fresh_turn(
+            user_turns, lambda: gate_question_anchor[0],
+            phone.phone_classify_answer_timeout_sec(),
         )
 
     recording_finish_lock = asyncio.Lock()
@@ -10985,6 +10972,7 @@ async def _run_phone_session(
             post_call_answered=True,
             compose_opening=speak_opening,
             classify_gate_reply=classify_answer_text,
+            next_callback_turn=_next_callback_turn,
             # Deterministic opener (default): withhold the LLM role opener so
             # `_deliver_role_opening` speaks the FIXED `phone_role_opening_text`
             # ("Before we dive in, just to confirm — this is about the {role} role at
