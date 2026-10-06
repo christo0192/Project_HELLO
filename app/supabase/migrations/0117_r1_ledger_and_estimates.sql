@@ -66,6 +66,10 @@ alter table screening_v2.r1_admin_log enable row level security;
 revoke all on screening_v2.r1_usage_ledger, screening_v2.r1_admin_log,
   screening_v2.v_webrtc_minutes_estimate, screening_v2.v_r1_budget_month from public, anon, authenticated;
 grant all privileges on screening_v2.r1_usage_ledger, screening_v2.r1_admin_log to service_role;
+-- 0001 sets `alter default privileges ... grant all on tables to service_role`, and a
+-- view is a table here, so service_role would otherwise keep INSERT/UPDATE/DELETE.
+-- The estimate views are read-only by contract: revoke everything, then grant SELECT.
+revoke all on screening_v2.v_webrtc_minutes_estimate, screening_v2.v_r1_budget_month from service_role;
 grant select on screening_v2.v_webrtc_minutes_estimate, screening_v2.v_r1_budget_month to service_role;
 
 -- 0117 is unreleased.  A hold belongs to the round that caused it, which makes
