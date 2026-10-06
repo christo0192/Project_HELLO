@@ -26,7 +26,8 @@ integrity checks, MP4 validation, crash recovery, and audio-only degradation.
 No LiveKit Egress is used or allowed for R1 in either the self-hosted or Cloud
 fallback mode. R1 recording objects have a 90-day deletion target with a
 97-day lifecycle backstop, subject to Legal approval. Video is HR-review-only;
-it is not used for bot vision or avatar behavior.
+it is not used for bot vision or avatar behavior. Recording remains off until
+both S0-C (A/V CPU) and S0-D (R2 recording) pass.
 
 ## Consequences
 
@@ -36,6 +37,13 @@ it is not used for bot vision or avatar behavior.
   encoder, performance, and crash-recovery work before video can be enabled.
 - R1 must degrade safely to audio-only when the recorder threatens interview
   quality; Legal and operational controls gate use of candidate video.
+
+## Approval and evidence
+
+The owner accepted this architecture decision on 2026-10-06. Acceptance does
+not authorize recording before evidence: S0-C and S0-D must both pass, and the
+applicable Legal gates remain in force. S0 evidence is appended here as it
+lands.
 
 ## Evidence
 

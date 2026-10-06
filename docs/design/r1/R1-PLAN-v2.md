@@ -6,7 +6,7 @@
 |---|---|
 | Date | 2026-10-06 |
 | Base | `origin/main` @ `eec54af` (#332); do not use the parent checkout, which is about 50 commits behind. |
-| Status | Plan only; implementation awaits the gates and owner actions below. |
+| Status | APPROVED by owner 2026-10-06 (all decisions D1-D18 at recommended defaults); implementation in progress |
 | Scope | Sales Program Advisor R1 only. Phone remains on LiveKit Cloud. |
 | Evidence | `R1-PLAN-final.md`, `R1-SELFHOST-LIVEKIT-FLY.md`, corrected `research/selfhost-verdicts.json`, and `R1-SCOUT-isolation-map.md`. Paths and line references are relative to `eec54af`. |
 

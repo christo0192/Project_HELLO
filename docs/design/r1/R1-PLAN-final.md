@@ -7,7 +7,7 @@
 | Title | R1 WebRTC interview bot: Sales Program Advisor role-play (Interview Kickstart) |
 | Date | 2026-10-05 |
 | Base commit | `origin/main` @ `eec54af` (#332). Do not base work on the parent checkout `fix/phone-consent-latency-opener`; it is about 50 commits behind. |
-| Status | **PLAN — awaiting owner approval; no implementation** |
+| Status | APPROVED by owner 2026-10-06 (all decisions D1-D18 at recommended defaults); implementation in progress |
 | Inputs | <ul><li>Scout isolation report, including its §13 corrections.</li><li>Research on four topics: the LiveKit free plan, storage pricing, in-worker A/V recording, and DeepSeek.</li><li>Fact-check dated 2026-10-05. Where it differs from the research, its corrected values are used.</li><li>The draft plan.</li><li>Five adversarial critiques: phone isolation, conversation/assessment, free-plan capacity, security/privacy, and delivery/testability. Every finding is dispositioned in Appendix A.</li></ul> |
 | Conventions | <ul><li>Paths are relative to the repo root at `eec54af`.</li><li>"est." means an estimate, not a measurement.</li><li>"Deploys" values come from the path rules in `deploy-fly.yml:156-174`.</li><li>"IST window" means 09:00-21:00 IST.</li></ul> |
 
@@ -1190,7 +1190,7 @@ The S0-E webhook question is already answered (phone uses webhooks) and needs no
 |---|---|---|---|---|---|
 | **PR-pre** (owner-approved) | <ul><li>Renew or resolve the API audit exceptions **before 2026-10-08** and the web exceptions before 2026-10-17.</li><li>Refresh `current-state.json` `evidenceDate` and update the `hosting-validate` baseline SHA before 2026-10-28.</li><li>Add a "CI expiry calendar" to the runbook.</li></ul> | Quality and hosting-validate green | S | Owner approval | Per path rules (verify; expected none) |
 | **PR-dep** | `constraints.txt` from the running phone image's `pip freeze`; `pip install -r requirements.txt -c constraints.txt`; CI step diffing the built `pip freeze` (explicit phone sign-off for any difference) | Built freeze equals the running image | S | S0-A | both workers + db |
-| **PR-0** | Docs only: ADR-0015 (R1 lane; DeepSeek; D-004 drift; supersedes AI-GATE for R1, **Proposed**), ADR-0016 (R1 camera video; R2; Proposed); deploy, budget and R1 incident runbooks; credential inventory and rotation entries; data classification | `check-adrs.mjs` passes. The D-004 wording check (`check-phase0-2-build-status.mjs:210-221`) changes only with an owner decision, in the same PR. Evidence sections are updated after S0. | S | S0-A | none |
+| **PR-0** | Docs only: ADR-0015 (R1 lane; DeepSeek; D-004 drift; supersedes AI-GATE for R1), ADR-0016 (R1 camera video; R2); deploy, budget and R1 incident runbooks; credential inventory and rotation entries; data classification. *Owner accepted ADR-0015/0016/0017 on 2026-10-06; S0 evidence is appended to the ADRs as it lands, and implementation steps remain gated on S0 results.* | `check-adrs.mjs` passes. The D-004 wording check (`check-phase0-2-build-status.mjs:210-221`) changes only with an owner decision, in the same PR. Evidence sections are updated after S0. | S | S0-A | none |
 | **PR-1** | M1 + M1b; SQL tests plus supabase-ci wiring; phone `worker-context` fence | Migrations apply and rollback verifies; WHEN-trigger tests (a phone update creates no job); admission RPC concurrency test; Ashby guard trigger test; RLS and grants | M | PR-0 | **database + api** (the fence is an API test) |
 | **PR-2** | <ul><li>`lib/r1/config.ts` (lazy, never throws).</li><li>Send R1, list, cancel, reissue and grant-retake; admin settings.</li><li>M2 ledger and estimate views; the usage and context internal routes.</li><li>Legacy endpoint and scorer guards (§8.6); Ashby mapping server 400.</li><li>`seed-r1-role.ts` (run by the owner after deploy).</li></ul> | Hold and release; cap and pause; link shown once; eligibility (phone engagement, jurisdiction); RBAC and IDOR; boot with malformed `R1_*`; 409 guards; contract tests | L | PR-1 | api + db |
 | **PR-L** | Legacy retirement (§8.5 steps 2-3); web hides the card | 410 paths tested; drain runbook executed | M | PR-2; D12 | api + db + Vercel |
@@ -1322,7 +1322,7 @@ The S0-E webhook question is already answered (phone uses webhooks) and needs no
 
 9. Stage `DEEPSEEK_API_KEY` on `project-hello-voice` only (`fly secrets set --stage`), outside the IST window. Optionally use a dedicated R1 key.
 10. Stage the `R1_RECORDING_S3_*` secrets on `project-hello-api` **only**, outside the IST window. Setting a secret restarts the API, so apply the §9 gate.
-11. Approve ADR-0015 and ADR-0016 (Proposed → Accepted after S0 evidence) and the D-004 wording change.
+11. ADR-0015, ADR-0016, and ADR-0017 were accepted by the owner on 2026-10-06. *Owner accepted ADR-0015/0016/0017 on 2026-10-06; S0 evidence is appended to the ADRs as it lands, and implementation steps remain gated on S0 results.* The D-004 wording change remains separately owner-controlled.
 
 **HR and the sales lead**
 

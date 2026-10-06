@@ -27,9 +27,10 @@ This decision is gated by the S0-F spike: no production self-hosted switch is
 permitted until its platform, lifecycle, agent, field-matrix, and soak/drill
 criteria pass. The endpoint seam is retained regardless of the outcome.
 
-If S0-F fails, or an always-on performance-1x posture makes the economics
-unsuitable, R1 uses the LiveKit Cloud Build fallback with the v2 §3.3 measured
-cap and pause controls. No LiveKit upgrade is authorized by this ADR.
+If S0-F fails, R1 uses the LiveKit Cloud Build fallback with the v2 §3.3
+measured cap and pause controls. If only an always-on performance-1x SFU
+passes, the owner chooses Cloud Ship or capped Build, as specified by plan v2
+D16 and section 3.2. No LiveKit upgrade is authorized by this ADR.
 
 ## Consequences
 
@@ -40,6 +41,13 @@ cap and pause controls. No LiveKit upgrade is authorized by this ADR.
   host-bound worker readiness, and a coordinated drained switch.
 - SFU deploys, upgrades, key rotations, and secret changes are manual and
   require zero live R1 rooms.
+
+## Approval and evidence
+
+The owner accepted this architecture decision on 2026-10-06. The switch to the
+self-hosted SFU happens only after S0-F passes; otherwise R1 uses capped Build.
+Where only always-on performance-1x passes, the owner chooses Cloud Ship or
+capped Build. S0-F evidence is appended here as it lands.
 
 ## Evidence
 

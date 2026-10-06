@@ -39,7 +39,8 @@ rotation procedure are tracked in the R1 design/runbook.
 | System | Planned secret names / scope | Required action | Rotation status |
 |--------|------------------------------|-----------------|-----------------|
 | Cloudflare R2 R1 recording | `R1_RECORDING_S3_*` on `project-hello-api` only | Use bucket-scoped credentials for the private R1 recording bucket; rotate with zero live R1 rooms | Planned |
-| R1 LiveKit API | `R1_LIVEKIT_*` on the API and selected R1 worker scope | Keep distinct from the LiveKit Cloud/phone key; rotate through the R1 drained switch procedure | Planned |
+| R1 LiveKit API | `R1_LIVEKIT_*` on `project-hello-api` only | Keep distinct from the LiveKit Cloud/phone key; rotate through the R1 drained switch procedure | Planned |
+| R1 browser worker endpoint | Normal `LIVEKIT_URL` / `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` on `project-hello-voice` | At self-host cutover, point this normal worker triple at the selected R1 SFU; it is separate from API-only `R1_LIVEKIT_*` | Planned |
 | R1 self-hosted LiveKit SFU | `LIVEKIT_KEYS` on `project-hello-r1-rtc` only | Maintain two active keys during rotation; remove the old key only after verification | Planned |
 | DeepSeek R1 conversation | `DEEPSEEK_API_KEY` on `project-hello-voice` | Stage before the R1 worker work; rotate through the provider and record non-secret evidence | Planned |
 

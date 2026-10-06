@@ -36,7 +36,8 @@ including coding rounds. R1-only records, routes, queues, scoring, and consent
 are additive and must not alter phone paths.
 
 For R1 only, this ADR explicitly supersedes the PLAN.md AI-GATE prohibition on
-automatic rejection. Auto-status remains disabled through shadow calibration.
+automatic rejection. Auto-status remains off until the calibration required by
+R1 plan final section 6.6 passes. Legal gates both Stage A and Stage B.
 It can be enabled only after the calibration criteria in R1 plan final §6.6
 are met, the owner makes the audited setting change, and Legal has approved
 the Stage B candidate use. A qualifying reject first becomes a cancellable
@@ -53,6 +54,13 @@ the Stage B candidate use. A qualifying reject first becomes a cancellable
   resolution.
 - R1 automatic status is fail-closed: no calibration, Legal approval, or owner
   enablement means no automatic status change.
+
+## Approval and evidence
+
+The owner accepted this architecture decision on 2026-10-06. Acceptance does
+not authorize implementation or operation ahead of its gates: S0 evidence is
+appended here as it lands, Legal gates Stage A and Stage B, and auto-status
+remains off until the R1 plan final section 6.6 calibration passes.
 
 ## Evidence
 

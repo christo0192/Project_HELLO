@@ -16,28 +16,40 @@ migrations. (implemented in PR-1 and deploy-guard follow-up)
    blocks new R1 attempts but lets live R1 sessions finish. (implemented in PR-2)
 3. Run read-only SQL and abort unless every result is zero:
 
+   The live-R1-session check is available after PR-1 (implemented in PR-1:
+   `interview_round_attempts` / `call_sessions.interview_round_id`).
+
    ```sql
+   -- Available after PR-1: live R1 sessions.
    select id from screening_v2.call_sessions
    where interview_round_id is not null
-     and status in ('created', 'waiting', 'in_progress');
+     and status in ('waiting', 'in_progress');
 
+   -- Live phone attempts.
    select id from screening_v2.phone_call_attempts
-   where status in ('admitted', 'ringing', 'answered_unclassified', 'human', 'machine')
-     and lease_expires_at > now();
+   where lease_expires_at > now();
 
+   -- Active phone dials, or dial work scheduled in the next 30 minutes.
    select id from screening_v2.job_queue
-   where kind = 'phone.dial' and status in ('ready', 'leased', 'running');
+   where name = 'phone.dial'
+     and (
+       status = 'active'
+       or (status in ('pending', 'delayed')
+           and scheduled_at <= now() + interval '30 minutes')
+     );
 
-   select id from screening_v2.phone_booked_callbacks
-   where scheduled_for < now() + interval '30 minutes'
-     and status in ('scheduled', 'pending');
+   -- Phone appointments due in the next 30 minutes.
+   select id from screening_v2.phone_appointments
+   where starts_at <= now() + interval '30 minutes'
+     and status in ('scheduled', 'confirmed');
 
+   -- Active phone assessments.
    select id from screening_v2.job_queue
-   where kind = 'phone.assessment' and status in ('leased', 'running');
+   where name = 'phone.assessment' and status = 'active';
    ```
 
-   Adapt table/status names to the deployed schema before automation; the
-   deploy guard must fail closed. (implemented in PR-1)
+   These queries use the `job_queue` and `phone_appointments` schema in the
+   migrations; the deploy guard must fail closed. (implemented in PR-1)
 4. Squash-merge only after applicable Quality, hosting, Supabase, secret-scan,
    and model-governance checks are green. (implemented in PR-x)
 5. Verify after deployment: watermarked worker registration, unchanged phone

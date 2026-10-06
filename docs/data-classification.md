@@ -315,10 +315,14 @@ to describe implemented schema only.
 
 | Column | Classification | Notes |
 |--------|---------------|-------|
-| `id`, round/attempt/session references, state, object key, bytes, duration, timestamps, retention/deletion markers | Internal | Recording lifecycle and storage metadata |
-| SHA-256 integrity value / upload identifiers | Internal | Integrity and multipart state; never treat as an access credential |
-| Presigned review/download URL | **Secret** | Bearer access to candidate video; generate on demand and never persist/log the URL |
+| `session_id` (PK), `bucket`, `object_key`, `partial_keys`, `upload_id`, `status` | Internal | Planned recording identity, object-location, multipart, and lifecycle state; no access credential is stored |
+| `sha256`, `bytes`, `duration_ms`, `content_type` | Internal | Planned integrity and media-description metadata |
+| `width`, `height`, `fps`, `frames_encoded`, `frames_dropped`, `camera_off_ms` | Internal | Planned video dimensions, encoder, and camera-availability metadata |
+| `started_at_ms`, `finalized_at`, `revoked_at`, `deleted_at`, `legal_hold` | Internal | Planned playback-anchor, finalization, revocation, deletion, and retention-hold metadata |
 | Recording object content (candidate camera, audio, transcript-linked playback) | **Confidential PII** | HR-review-only R1 A/V; 90-day target retention remains subject to Legal approval |
+
+Presigned review/download URLs are transient, **Secret**-class bearer URLs. They
+are generated on demand and are never persisted or logged.
 
 ## Classification summary
 
