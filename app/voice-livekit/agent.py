@@ -24,6 +24,7 @@ from livekit import api as livekit_api
 from livekit.agents import Agent, AgentSession, JobContext, WorkerOptions, cli
 from livekit.plugins import openai, sarvam
 
+import gate_judge
 import noise_suppression
 import persistence
 import phone
@@ -1334,11 +1335,10 @@ async def _read_fresh_turn(
         except Exception:  # noqa: BLE001
             return ""
         text, anchor_ms = _queued_turn(item)
-        if _queued_turn_is_stale(anchor_ms, question_anchor()):
-            _log.info(
-                "unknown_event", error_type="phone_gate_turn_barrier",
-                error_category="pre_question_turn_skipped",
-            )
+        question_ms = question_anchor()
+        if _queued_turn_is_stale(anchor_ms, question_ms):
+            _log_gate_turn_skip(
+                "pre_question_turn_skipped", item, anchor_ms, question_ms)
             continue
         return text
 
@@ -1387,7 +1387,16 @@ def _queued_turn(item: Any) -> tuple[str, int | None]:
     module-level function with its own direct tests that hand it a plain
     `Queue[str]`, and widening the queue should not force every one of those to
     learn a shape they do not care about.
+
+    M013 S01: the live producer now enqueues a `gate_judge.GateTurn`, whose
+    anchor is the start of the VAD speech its STT finals were paired with
+    (see `gate_judge`), not the SDK's carried-over `started_speaking_at`.
     """
+    if isinstance(item, gate_judge.GateTurn):
+        anchor = item.anchor_ms
+        return item.text, (
+            anchor if isinstance(anchor, int) and not isinstance(anchor, bool) else None
+        )
     if isinstance(item, tuple) and len(item) == 2:
         text, anchor = item
         return (text if isinstance(text, str) else ""), (
@@ -1417,6 +1426,150 @@ def _queued_turn_is_stale(anchor_ms: int | None, question_anchor_ms: int | None)
     if question_anchor_ms - anchor_ms > _TURN_ANCHOR_SANE_LOOKBACK_MS:
         return False
     return anchor_ms < question_anchor_ms
+
+
+def _log_gate_turn_skip(
+    category: str, item: Any, anchor_ms: int | None, question_anchor_ms: int | None,
+) -> None:
+    """Log one gate reader skip: the reason, the tag and signed deltas, NO text.
+
+    M013 S01: the consent reader used to skip a stale turn with a bare
+    `continue` (the 9f60523d drop left no trace at all). Every skip now says
+    where the utterance sat relative to the question (`phase` = pre_question /
+    during_question / post_question / no_segment) and by how much
+    (`schema` = anchor / final-arrival / segment-start deltas in ms against
+    the question anchor), so a dropped answer can be told from a correct skip.
+    """
+    def _delta(value: int | None) -> int | None:
+        if value is None or question_anchor_ms is None:
+            return None
+        return value - question_anchor_ms
+
+    if isinstance(item, gate_judge.GateTurn):
+        tag = item.tag_for(question_anchor_ms)
+        final_ms = item.final_arrival_ms
+        segment_ms = item.segment_start_ms
+    else:
+        # An older producer's (text, anchor) pair: judged by its start alone.
+        tag = gate_judge.question_tag(anchor_ms, anchor_ms, question_anchor_ms) or (
+            gate_judge.TAG_NO_SEGMENT)
+        final_ms = None
+        segment_ms = None
+    _log.info(
+        "unknown_event", error_type="phone_gate_turn_barrier",
+        error_category=category, phase=tag,
+        schema=gate_judge.delta_schema(
+            anchor_ms=_delta(anchor_ms), final_ms=_delta(final_ms),
+            segment_ms=_delta(segment_ms),
+        ),
+    )
+
+
+def _gate_turn_settle_ms() -> int:
+    """How long a group of finals the SDK never committed waits before closing.
+
+    The endpointing ceiling (the longest the SDK itself waits to commit a turn
+    on this lane) plus a margin, so a turn the SDK does commit is always
+    closed by that commit first. The consent turn tightens the SDK's ceiling
+    below this, which only widens the margin.
+    """
+    return (
+        int(round(phone.phone_static_endpointing_max_delay() * 1000))
+        + gate_judge.GATE_SETTLE_MARGIN_MS
+    )
+
+
+def _gate_capture_log(**fields: Any) -> None:
+    """The capture's log sink: categories, counts and durations only."""
+    _log.info("unknown_event", **fields)
+
+
+def _new_gate_turn_capture(
+    emit: Callable[["gate_judge.GateTurn"], None],
+) -> "gate_judge.GateTurnCapture":
+    """The per-call gate capture `_run_phone_session` feeds (and the replay does).
+
+    Module level so the replay harness drives the SAME construction the
+    session does, not a copy of it.
+    """
+    return gate_judge.GateTurnCapture(
+        emit=emit,
+        now_ms=lambda: int(round(time.time() * 1000)),
+        settle_ms=_gate_turn_settle_ms,
+        log=_gate_capture_log,
+    )
+
+
+def _user_state_anchor_ms(event: Any, now_s: float) -> int:
+    """The speech start a `user_state_changed` -> speaking event reports, in ms.
+
+    The SDK stamps the event's `created_at` with THIS segment's start
+    (`on_start_of_speech(speech_start_time=...)`), which is the real start of
+    what the candidate is saying. `time.time()` at the handler is later by the
+    VAD's detection delay. Anything implausible (a Mock, a wrong clock, more
+    than an hour away from now) falls back to `now_s`.
+    """
+    created_at = getattr(event, "created_at", None)
+    if (
+        isinstance(created_at, (int, float))
+        and not isinstance(created_at, bool)
+        and math.isfinite(float(created_at))
+        and abs(float(created_at) - float(now_s)) <= _TURN_ANCHOR_SANE_LOOKBACK_MS / 1000.0
+    ):
+        return int(round(float(created_at) * 1000))
+    return int(round(float(now_s) * 1000))
+
+
+def _gate_source_item_id(seq: Any) -> str:
+    """The per-item idempotency key of one buffered gate row.
+
+    An int is a conversation item (`phone-gate-item-<seq>`); a string is a
+    consent-grant utterance the SDK never committed (`phone-gate-final-<idx>`).
+    """
+    if isinstance(seq, str):
+        return f"phone-gate-{seq}"
+    return f"phone-gate-item-{seq}"
+
+
+def _gate_evidence_row(
+    item: Any, evidence_keys: "set[str]",
+    capture: "gate_judge.GateTurnCapture | None" = None,
+) -> "tuple[str, str, int | None, str] | None":
+    """The `gate_pending` row for a consent grant the SDK never committed.
+
+    A turn the SDK committed already reached the transcript through
+    `conversation_item_added`; one it dropped (committed while a gate line was
+    playing) never did, and the grant would rest on words with no row. Such a
+    turn gets exactly one candidate row, keyed `final-<first utterance idx>`.
+    A turn the SDK committed late (after the gate closed it by silence, before
+    the grant was read) already has its conversation row, so gets none.
+    """
+    if not isinstance(item, gate_judge.GateTurn) or item.committed:
+        return None
+    text = item.text.strip()
+    if not text or not item.utterance_idxs:
+        return None
+    if capture is not None and capture.is_committed(item.utterance_idxs):
+        return None
+    key = f"final-{item.utterance_idxs[0]}"
+    if key in evidence_keys:
+        return None
+    evidence_keys.add(key)
+    return ("candidate", text, item.anchor_ms, key)
+
+
+def _gate_user_row_is_evidence_echo(
+    text: str, capture: "gate_judge.GateTurnCapture", evidence_keys: "set[str]",
+) -> bool:
+    """True when a kept user item is the late commit of a grant already buffered.
+
+    The SDK can commit a turn after the gate closed it by silence and granted
+    on it; that commit must not write the same words a second time. Decided
+    by the capture, which saw the commit duplicate a closed turn, so a later
+    utterance that merely repeats the same words is still written.
+    """
+    idxs = capture.take_duplicate_commit(text)
+    return bool(idxs) and f"final-{idxs[0]}" in evidence_keys
 
 
 def _native_turn_predates_question(message: Any, question_anchor_ms: int | None) -> bool:
@@ -3108,6 +3261,7 @@ async def _classify_phone_answer(
     consumed: "list[str] | None" = None,
     answer_timeout_sec: float | None = None,
     question_anchor: "Callable[[], int | None] | None" = None,
+    on_grant_evidence: "Callable[[Any], Any] | None" = None,
 ) -> str:
     """Read the response to the disclosure, re-asking at most once.
 
@@ -3124,6 +3278,14 @@ async def _classify_phone_answer(
     the gate can read the RAW consent reply (the last consumed text) it decided
     HUMAN on and commit it as the candidate half of the gate transcript. The
     classifier reads it; the gate records it — no text is inferred after.
+
+    M013 S01: a skipped utterance is LOGGED (`consent_turn_skipped`, with its
+    tag and deltas, no text), never dropped silently. A turn that may not
+    ground a grant (`gate_judge.turn_is_grant_evidence` — a reply the SDK
+    dropped with no VAD timing) can still refuse, defer or end the call, but
+    it never grants: a would-be grant on it is logged and the reader keeps
+    waiting in the same window. ``on_grant_evidence`` receives the queued
+    item a HUMAN decision rests on, so the session can persist it once.
     """
     if answer_timeout_sec is None:
         answer_timeout_sec = phone.phone_classify_answer_timeout_sec()
@@ -3136,6 +3298,8 @@ async def _classify_phone_answer(
         # would be consent. That is the shared-FIFO defect, and it is why the
         # staleness test lives at the READER: only the reader knows its question.
         text = ""
+        chosen: Any = None
+        heard_ineligible = False
         deadline = time.monotonic() + answer_timeout_sec
         while True:
             remaining = deadline - time.monotonic()
@@ -3150,17 +3314,42 @@ async def _classify_phone_answer(
                 text = ""
                 break
             candidate_text, anchor_ms = _queued_turn(item)
+            question_ms = question_anchor() if question_anchor is not None else None
             if question_anchor is not None and _queued_turn_is_stale(
-                anchor_ms, question_anchor()
+                anchor_ms, question_ms
             ):
+                _log_gate_turn_skip(
+                    "consent_turn_skipped", item, anchor_ms, question_ms)
+                continue
+            if (
+                not gate_judge.turn_is_grant_evidence(item)
+                and classify_answer_text(candidate_text) == phone.CLASSIFY_HUMAN
+            ):
+                # Words with no speech timing cannot be shown to answer THIS
+                # question, so they never become consent. Kept waiting in the
+                # same window, exactly like a stale skip.
+                heard_ineligible = True
+                _log_gate_turn_skip(
+                    "consent_turn_not_grant_evidence", item, anchor_ms, question_ms)
                 continue
             text = candidate_text
+            chosen = item
             break
         if isinstance(text, str) and text.strip():
             responsive += 1
             if consumed is not None:
                 consumed.append(text)
+        elif heard_ineligible:
+            responsive += 1
         decision = classify_answer_text(text)
+        if decision == phone.CLASSIFY_HUMAN and on_grant_evidence is not None:
+            try:
+                on_grant_evidence(chosen)
+            except Exception:  # noqa: BLE001 — persistence never blocks consent
+                _log.warn(
+                    "unknown_event", error_type="phone_gate_turn_barrier",
+                    error_category="grant_evidence_record_failed",
+                )
         if decision is not None:
             return decision
         if attempt + 1 < attempts:
@@ -8877,7 +9066,8 @@ async def _run_phone_session(
     # and then popped by the CONSENT classifier, which is the shared-FIFO defect
     # this whole mechanism exists to close. Filtering at the producer cannot see
     # that; filtering at the reader can.
-    user_turns: "asyncio.Queue[tuple[str, int | None]]" = asyncio.Queue()
+    # M013 S01: entries are `gate_judge.GateTurn`s (closed by `gate_capture`).
+    user_turns: "asyncio.Queue[gate_judge.GateTurn]" = asyncio.Queue()
     # The gate's CURRENT question, as a speech-start anchor in ms. Set when the
     # gate begins asking, cleared when the gate returns. While set, a candidate
     # final whose SPEECH STARTED before it is never enqueued -- see
@@ -8972,7 +9162,11 @@ async def _run_phone_session(
     # bystander's words filed as `candidate` under the candidate's session
     # would have no erasure route (`transcript_turns` carries no candidate id,
     # so the DSAR erase matches nothing). See `_flush_gate_transcript`.
-    gate_pending: list[tuple[str, str, int | None, int]] = []
+    # The 4th element is the item seq (`phone-gate-item-<seq>`), or the string
+    # `final-<idx>` for a consent-grant utterance the SDK never committed
+    # (`phone-gate-final-<idx>`, see `_gate_evidence_row`).
+    gate_pending: list[tuple[str, str, int | None, int | str]] = []
+    gate_evidence_keys: set[str] = set()
     item_seq: list[int] = [0]
     persist_session_id = phone.session_id_from_room_name(room_name)
     persist_tasks: set[asyncio.Task] = set()
@@ -9105,7 +9299,7 @@ async def _run_phone_session(
                 return
             try:
                 task = asyncio.create_task(_persist_phone_item(
-                    speaker, text, anchor_ms, f"phone-gate-item-{seq}", True))
+                    speaker, text, anchor_ms, _gate_source_item_id(seq), True))
             except RuntimeError:
                 _leave_rest("gate_flush_loop_closing")
                 return
@@ -9200,10 +9394,36 @@ async def _run_phone_session(
     candidate_speaking: dict[str, bool] = {"value": False}
     candidate_speech_ended = asyncio.Event()
 
+    # ── M013 S01: THE GATE'S OWN RECORD OF WHAT THE CANDIDATE SAID ─────────
+    # Every VAD segment and every STT final, paired FIFO, closed into turns
+    # (on commit, or by silence for a turn the SDK dropped while a gate line
+    # played) and handed to the gate readers through `user_turns`. Why the
+    # SDK's committed turns alone were not enough is in `gate_judge`.
+    def _emit_gate_turn(turn: "gate_judge.GateTurn") -> None:
+        # A turn the SDK never committed skipped `on_candidate_turn`, so its
+        # explicit hang-up request is honoured here instead.
+        if turn.closed_by == "settle" and phone.is_explicit_end_call_request(turn.text):
+            candidate_end_requested.set()
+        user_turns.put_nowait(turn)
+
+    gate_capture = _new_gate_turn_capture(_emit_gate_turn)
+
+    def _record_gate_grant_evidence(item: Any) -> None:
+        """Buffer one candidate row for a grant whose words never committed."""
+        if not gate_persist_active[0] or assessment_persist_active[0]:
+            return
+        row = _gate_evidence_row(item, gate_evidence_keys, gate_capture)
+        if row is not None:
+            gate_pending.append(row)
+
     def _on_phone_vad_event(event: Any) -> None:
         """Record the actual local VAD boundary and bounded event fields."""
         raw_type = getattr(event, "type", None)
         event_type = getattr(raw_type, "value", raw_type)
+        try:
+            gate_capture.on_vad_event(event, time.time())
+        except Exception:  # noqa: BLE001 — the gate record never breaks the VAD hook
+            pass
         if event_type == "start_of_speech":
             candidate_speaking["value"] = True
             return
@@ -9399,8 +9619,10 @@ async def _run_phone_session(
             candidate_activity.set()
             # LiveKit 1.6.4 does not guarantee speech-start metrics on every
             # finalized ChatMessage. This event is the real local VAD anchor,
-            # used only when the message has no provider timestamp.
-            latest_candidate_anchor[0] = int(round(time.time() * 1000))
+            # used only when the message has no provider timestamp. M013 S01:
+            # the event's own `created_at` IS this segment's start; the
+            # handler's clock is later by the VAD's detection delay.
+            latest_candidate_anchor[0] = _user_state_anchor_ms(event, time.time())
         # DISCONNECT DIAGNOSTICS. A candidate going 'away' (LiveKit's own
         # inactivity state) and coming back is exactly the shape a dropped or
         # muted leg leaves behind, and the live call had no record of it. Log
@@ -9442,6 +9664,12 @@ async def _run_phone_session(
                     "unknown_event", error_type="voice_phone_boundary",
                     error_category="stt_final_arrived",
                 )
+                # M013 S01: every final reaches the gate, including one whose
+                # turn the SDK will drop for committing during a gate line.
+                try:
+                    gate_capture.on_final(str(getattr(event, "transcript", "") or ""))
+                except Exception:  # noqa: BLE001 — never breaks the transcript hook
+                    pass
 
     @session.on("agent_state_changed")
     def _on_phone_agent_state_changed(event):  # noqa: ANN001
@@ -9551,9 +9779,13 @@ async def _run_phone_session(
                 # 0105: the speaker's words in the gate — the consent reply, an
                 # identity answer, a "call me later" — buffered, flagged as the
                 # gate, and persisted once the gate says whose they are.
-                item_seq[0] += 1
-                gate_pending.append(
-                    ("candidate", text, _turn_anchor_ms(item), item_seq[0]))
+                # M013 S01: unless the gate already buffered these words as the
+                # evidence of a grant it read before the SDK committed them.
+                if not _gate_user_row_is_evidence_echo(
+                        text, gate_capture, gate_evidence_keys):
+                    item_seq[0] += 1
+                    gate_pending.append(
+                        ("candidate", text, _turn_anchor_ms(item), item_seq[0]))
             return
         # 0105: a bot item in the GATE phase — the disclosure, the identity
         # ask, the role line, a refusal closing — is persisted before the
@@ -9747,7 +9979,14 @@ async def _run_phone_session(
         # after the anchor and be kept. Fail-open either way, which is the
         # chosen direction. Only a message with neither is `None`, which the
         # readers also treat as KEEP.
-        user_turns.put_nowait((text, _turn_anchor_ms(message)))
+        #
+        # M013 S01: the commit now goes through the gate capture, which closes
+        # the STT finals it reconciles with and times them by their own VAD
+        # speech (FIFO-paired), not by the SDK's carried-over speech start —
+        # the 9f60523d drop. The SDK anchor is only the fallback for a call
+        # that delivered no VAD event at all. A commit that repeats a turn the
+        # capture already closed is not enqueued twice.
+        gate_capture.on_commit(text, _turn_anchor_ms(message))
 
     # Complete and immutable from construction. The exact owed question is
     # still supplied only per turn; this prompt carries role, resume,
@@ -9965,6 +10204,7 @@ async def _run_phone_session(
         return await _classify_phone_answer(
             user_turns, say, consumed=consent_reply_out,
             question_anchor=lambda: gate_question_anchor[0],
+            on_grant_evidence=_record_gate_grant_evidence,
         )
 
     # Arm the gate-window leak veto with the RÉSUMÉ FACTS — the text that must
@@ -10038,12 +10278,44 @@ async def _run_phone_session(
 
         Stamping here as well keeps the barrier armed for the window BEFORE
         first audio, which is what rejects the pickup "Hello?".
+
+        M013 S01: also clears the SDK's pending user turn, so speech from
+        before this question (a blip, an identity reply STT never finalised)
+        can no longer lend its start to the next committed turn. The gate's
+        own capture still holds every final, so nothing heard is lost.
         """
         gate_question_anchor[0] = int(round(time.time() * 1000))
+        _clear_sdk_user_turn()
+
+    clear_user_turn_unavailable_logged: list[bool] = [False]
+
+    def _clear_sdk_user_turn() -> None:
+        """`AgentSession.clear_user_turn()` (1.6.4), guarded. Never fails the gate."""
+        clear = getattr(session, "clear_user_turn", None)
+        if not callable(clear):
+            if not clear_user_turn_unavailable_logged[0]:
+                clear_user_turn_unavailable_logged[0] = True
+                _log.warn(
+                    "unknown_event", error_type="phone_gate_turn_barrier",
+                    error_category="clear_user_turn_unavailable",
+                )
+            return
+        try:
+            clear()
+        except Exception:  # noqa: BLE001 — a failed clear costs a stale start, not the call
+            _log.warn(
+                "unknown_event", error_type="phone_gate_turn_barrier",
+                error_category="clear_user_turn_failed",
+            )
 
     def _clear_question_anchor() -> None:
-        """Drop the barrier when the gate is done, so screening turns flow."""
+        """Drop the barrier when the gate is done, so screening turns flow.
+
+        M013 S01: the gate capture stops with it; screening turns are the
+        SDK's again.
+        """
         gate_question_anchor[0] = None
+        gate_capture.stop()
 
     async def _compose_gate_line(instructions: str) -> str | None:
         """Buffer the session's own model, with no tools or candidate records.

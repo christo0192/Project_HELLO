@@ -22,11 +22,11 @@ proves it by mutation).
 WHAT IT MIRRORS, AND WHY. The producers that feed those readers live in
 closures inside ``agent._run_phone_session`` and no test can reach them (the
 session harness patches ``persistence`` with a MagicMock, which blinds the
-barrier; see the ``_read_fresh_turn`` docstring). So the session GLUE is
-mirrored in ``OriginMainGlue``, line for line, and pinned by the source guard
-``TestReplayGlueMatchesOriginMain``: if ``agent.py`` changes the glue, that
-guard fails and the change must be carried here (or, better, moved to a
-module-level seam the glue class can call). The SDK behaviour the gate relies on
+barrier; see the ``_read_fresh_turn`` docstring). Since T01b the producer LOGIC
+is module level (``agent._new_gate_turn_capture`` -> ``gate_judge``), and only
+the forwarding glue is mirrored, in ``SessionGlue``, pinned by the source guard
+``TestReplayGlueMatchesAgent``: if ``agent.py`` changes the glue, that guard
+fails and the change must be carried here. The SDK behaviour the gate relies on
 is modelled in ``GateReplay`` itself:
 
 * a VAD segment starts at ``t - speech_duration - inference_duration`` (the
@@ -38,9 +38,10 @@ is modelled in ``GateReplay`` itself:
 * ``say`` raises the question anchor to its first audio (the
   ``agent_state_changed`` -> ``speaking`` handler) and returns at playout end.
 
-T01b replaces the producer half of ``OriginMainGlue`` with the per-final
-capture; T04/T05 add judge phases to ``judge_responses`` and a driver for the
-real ``run_phone_gate``. Extend this module; do not fork it.
+T01b replaced the origin/main producer (committed turns stamped with the
+SDK's speech start) with the per-final capture; T04/T05 add judge phases to
+``judge_responses`` and a driver for the real ``run_phone_gate``. Extend this
+module; do not fork it.
 
 PRIVACY. Fixture files are named by session prefix only, hold a synthetic first
 name, relative times and short non-identifying utterances. ``load_fixture``
@@ -494,23 +495,31 @@ class _LogRecorder:
         self._record("metric", name, value=value)
 
 
-# ── the session glue origin/main runs ────────────────────────────────────
+# ── the session glue agent.py runs ───────────────────────────────────────
 
 
-class OriginMainGlue:
-    """The `_run_phone_session` closure glue as origin/main has it (agent.py).
+class SessionGlue:
+    """The `_run_phone_session` closure glue (agent.py), M013 S01 T01b.
 
-    Mirrors, and ``TestReplayGlueMatchesOriginMain`` pins:
+    The logic lives in module-level seams the glue calls, so the replay runs
+    the SAME code: ``agent._new_gate_turn_capture`` (the per-final capture and
+    FIFO pairing in ``gate_judge``), ``agent._user_state_anchor_ms``,
+    ``agent._gate_evidence_row`` and ``agent._gate_user_row_is_evidence_echo``.
+    What remains here is the forwarding, pinned line by line by
+    ``TestReplayGlueMatchesAgent``:
 
-    * ``on_candidate_turn``: ``user_turns.put_nowait((text, _turn_anchor_ms(message)))``;
-    * ``_mark_question_asked``: anchor = ``int(round(time.time() * 1000))``;
+    * ``_emit_gate_turn``: ``user_turns.put_nowait(turn)``;
+    * ``_on_phone_vad_event``: ``gate_capture.on_vad_event(event, time.time())``
+      plus the ``candidate_speaking`` latch;
+    * ``_on_phone_transcript_activity``: ``gate_capture.on_final(...)``;
+    * ``on_candidate_turn``: ``gate_capture.on_commit(text, _turn_anchor_ms(message))``;
+    * ``_mark_question_asked``: anchor = ``int(round(time.time() * 1000))``,
+      then ``_clear_sdk_user_turn()`` (counted here; the SDK side is not
+      modelled, see ``clear_user_turn_calls``);
     * ``_on_phone_agent_state_changed`` -> speaking: raise the anchor to first
       audio, one way only;
-    * ``_on_phone_vad_event`` / ``_on_phone_user_state_changed``: the
-      ``candidate_speaking`` latch the identity reader's grace consults.
-
-    T01b changes the producer (per-final capture, segment pairing); it updates
-    or replaces this class in the same commit.
+    * ``_on_phone_item`` (user, gate phase): a candidate row unless it repeats
+      a grant-evidence row; ``_record_gate_grant_evidence`` for the grant.
     """
 
     def __init__(self, replay: "GateReplay") -> None:
@@ -519,6 +528,24 @@ class OriginMainGlue:
         self.gate_question_anchor: list[int | None] = [None]
         self.candidate_speaking: dict[str, Any] = {"value": False}
         self.latest_candidate_anchor: list[int | None] = [None]
+        self.gate_pending: list[tuple] = []
+        self.gate_evidence_keys: set[str] = set()
+        self.item_seq = 0
+        # The SDK's clear is NOT modelled: the fixtures' committed turns are
+        # the ones production recorded (no clear existed), and the gate no
+        # longer reads the SDK's speech start when VAD timing exists.
+        self.clear_user_turn_calls = 0
+        self.capture = agent_mod._new_gate_turn_capture(self._emit_gate_turn)
+
+    # agent.py `_emit_gate_turn`
+    def _emit_gate_turn(self, turn: Any) -> None:
+        if turn.closed_by == "settle" and phone.is_explicit_end_call_request(turn.text):
+            self.replay.result.end_call_requested = True
+        anchor = turn.anchor_ms
+        self.replay.enqueued.append(
+            (turn.text, None if anchor is None else anchor - self.replay.epoch_ms))
+        self.replay.result.gate_turns.append(turn)
+        self.user_turns.put_nowait(turn)
 
     # readers' view
     def question_anchor(self) -> int | None:
@@ -530,9 +557,12 @@ class OriginMainGlue:
     # agent.py `_mark_question_asked`
     def mark_question_asked(self) -> None:
         self.gate_question_anchor[0] = int(round(agent_mod.time.time() * 1000))
+        self.clear_user_turn_calls += 1
 
+    # agent.py `_clear_question_anchor`
     def clear_question_anchor(self) -> None:
         self.gate_question_anchor[0] = None
+        self.capture.stop()
 
     # agent.py `_on_phone_agent_state_changed`, new_state == "speaking"
     def on_agent_speaking(self) -> None:
@@ -543,6 +573,7 @@ class OriginMainGlue:
 
     # agent.py `_on_phone_vad_event`
     def on_vad_event(self, event: Any) -> None:
+        self.capture.on_vad_event(event, agent_mod.time.time())
         if event.type == "start_of_speech":
             self.candidate_speaking["value"] = True
         elif event.type == "end_of_speech":
@@ -552,19 +583,37 @@ class OriginMainGlue:
     def on_user_state_changed(self, event: Any) -> None:
         if event.new_state == "speaking":
             self.candidate_speaking["value"] = True
-            self.latest_candidate_anchor[0] = int(round(agent_mod.time.time() * 1000))
+            self.latest_candidate_anchor[0] = agent_mod._user_state_anchor_ms(
+                event, agent_mod.time.time())
         elif event.old_state == "speaking" and event.new_state in {"listening", "idle"}:
             self.candidate_speaking["value"] = False
 
-    # agent.py `_on_phone_transcript_activity` (finals are only logged there)
+    # agent.py `_on_phone_transcript_activity`
     def on_stt_final(self, event: Any) -> None:
-        return None
+        if str(getattr(event, "transcript", "") or "").strip() and bool(
+                getattr(event, "is_final", False)):
+            self.capture.on_final(str(event.transcript))
 
     # agent.py `on_candidate_turn` (reached only for turns the SDK did not drop)
     def on_candidate_turn(self, text: str, message: Any) -> None:
-        anchor = agent_mod._turn_anchor_ms(message)
-        self.replay.enqueued.append((text, None if anchor is None else anchor - self.replay.epoch_ms))
-        self.user_turns.put_nowait((text, anchor))
+        self.capture.on_commit(text, agent_mod._turn_anchor_ms(message))
+
+    # agent.py `_on_phone_item`, role user, gate phase (a commit the SDK kept)
+    def on_user_item(self, text: str, message: Any) -> None:
+        if not agent_mod._gate_user_row_is_evidence_echo(
+                text, self.capture, self.gate_evidence_keys):
+            self.item_seq += 1
+            self.gate_pending.append(
+                ("candidate", text, agent_mod._turn_anchor_ms(message), self.item_seq))
+
+    # agent.py `_record_gate_grant_evidence`
+    def on_grant_evidence(self, item: Any) -> None:
+        row = agent_mod._gate_evidence_row(item, self.gate_evidence_keys, self.capture)
+        if row is not None:
+            self.gate_pending.append(row)
+
+    def candidate_rows(self) -> list[tuple]:
+        return [row for row in self.gate_pending if row[0] == "candidate"]
 
 
 # ── result ───────────────────────────────────────────────────────────────
@@ -593,6 +642,13 @@ class GateReplayResult:
     logs: list[LogRecord] = field(default_factory=list)
     enqueued: list[tuple[str, int | None]] = field(default_factory=list)
     dropped_commits: list[str] = field(default_factory=list)
+    gate_turns: list[Any] = field(default_factory=list)
+    end_call_requested: bool = False
+    glue: Any = None
+
+    def candidate_rows(self) -> list[tuple]:
+        """The candidate `gate_pending` rows the session would have buffered."""
+        return [] if self.glue is None else self.glue.candidate_rows()
 
     def spoken_kinds(self) -> list[str]:
         return [line.kind for line in self.spoken]
@@ -629,7 +685,7 @@ class GateReplay:
         self,
         fixture: GateReplayFixture,
         *,
-        glue_factory: Callable[["GateReplay"], Any] = OriginMainGlue,
+        glue_factory: Callable[["GateReplay"], Any] = SessionGlue,
     ) -> None:
         self.fixture = fixture
         self.clock = VirtualClock()
@@ -770,6 +826,11 @@ class GateReplay:
         message = types.SimpleNamespace(
             metrics=metrics, created_at=self.wall_s(turn.created_at_ms))
         self.glue.on_candidate_turn(turn.text, message)
+        # A kept commit is then added to the chat context, which fires
+        # `conversation_item_added` (the gate transcript row).
+        on_user_item = getattr(self.glue, "on_user_item", None)
+        if callable(on_user_item):
+            on_user_item(turn.text, message)
 
     # running ------------------------------------------------------------------
 
@@ -779,6 +840,8 @@ class GateReplay:
             # Production defaults, whatever the developer's shell exports.
             "PHONE_CLASSIFY_ANSWER_TIMEOUT_SEC": None,
             "PHONE_IDENTITY_ANSWER_TIMEOUT_SEC": None,
+            # The silence close of a dropped turn waits on this ceiling.
+            "PHONE_STATIC_ENDPOINTING_MAX_DELAY_SEC": None,
         }
         saved_env = {k: os.environ.get(k) for k in env_overrides}
         handles: list[asyncio.TimerHandle] = []
@@ -792,6 +855,7 @@ class GateReplay:
                     patch.object(phone, "_log", _LogRecorder("phone", self.result.logs, self.clock)):
                 async def _main() -> Any:
                     self.glue = self._glue_factory(self)
+                    self.result.glue = self.glue
                     handles.extend(self._schedule_candidate_events(asyncio.get_running_loop()))
                     return await driver(self)
 
@@ -859,6 +923,7 @@ async def drive_identity_then_consent(rt: GateReplay) -> GateReplayResult:
         glue.user_turns, _reader_say,
         consumed=result.consumed,
         question_anchor=glue.question_anchor,
+        on_grant_evidence=getattr(glue, "on_grant_evidence", None),
     )
     result.decision_at_ms = rt.now_ms
     return result
@@ -868,7 +933,7 @@ def replay(
     fixture: GateReplayFixture | str,
     *,
     driver: Callable[[GateReplay], Awaitable[Any]] = drive_identity_then_consent,
-    glue_factory: Callable[[GateReplay], Any] = OriginMainGlue,
+    glue_factory: Callable[[GateReplay], Any] = SessionGlue,
 ) -> GateReplayResult:
     """Load (if needed) and replay one fixture; returns the result."""
     if isinstance(fixture, str):

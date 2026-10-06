@@ -29,7 +29,10 @@ import unittest
 from tests.test_phone_gate import FakeEventClient  # noqa: F401,E402
 
 import agent as agent_mod  # noqa: E402
+import gate_judge  # noqa: E402
 import phone  # noqa: E402
+
+from unittest.mock import MagicMock, patch  # noqa: E402
 
 
 def _msg(started_speaking_at: float | None = None, created_at: float | None = None):
@@ -40,11 +43,131 @@ def _msg(started_speaking_at: float | None = None, created_at: float | None = No
     return types.SimpleNamespace(metrics=metrics, created_at=created_at)
 
 
+# ── a hand-driven gate capture (M013 S01 T01b) ────────────────────────────
+
+_T0 = 1_800_000_000_000  # an arbitrary wall-clock origin, in ms
+
+
+class _Clock:
+    def __init__(self) -> None:
+        self.ms = _T0
+
+    def at(self, rel_ms: int) -> "_Clock":
+        if _T0 + rel_ms < self.ms:
+            raise AssertionError("the test clock only moves forward")
+        self.ms = _T0 + rel_ms
+        return self
+
+
+class _Timers:
+    """`call_later` on the test clock; `advance` fires what falls due."""
+
+    def __init__(self, clock: _Clock) -> None:
+        self.clock = clock
+        self.pending: list[list] = []
+
+    def call_later(self, delay_s, fn):
+        entry = [self.clock.ms + int(round(delay_s * 1000)), fn, False]
+        self.pending.append(entry)
+        return types.SimpleNamespace(cancel=lambda: entry.__setitem__(2, True))
+
+    def advance(self, rel_ms: int) -> None:
+        target = _T0 + rel_ms
+        while True:
+            due = sorted((e for e in self.pending if not e[2] and e[0] <= target),
+                         key=lambda e: e[0])
+            if not due:
+                break
+            entry = due[0]
+            entry[2] = True
+            self.clock.ms = max(self.clock.ms, entry[0])
+            entry[1]()
+        self.clock.ms = max(self.clock.ms, target)
+
+
+class _Rig:
+    """One capture on a manual clock, recording what it emits and logs."""
+
+    SETTLE_MS = 1050
+
+    def __init__(self) -> None:
+        self.clock = _Clock()
+        self.timers = _Timers(self.clock)
+        self.emitted: list = []
+        self.logs: list[dict] = []
+        self.capture = gate_judge.GateTurnCapture(
+            emit=self.emitted.append,
+            now_ms=lambda: self.clock.ms,
+            settle_ms=lambda: self.SETTLE_MS,
+            call_later=self.timers.call_later,
+            log=lambda **fields: self.logs.append(fields),
+        )
+
+    def vad(self, rel_ms: int, kind: str, *, speech_ms: int = 0, silence_ms: int = 0,
+            inference_ms: int = 0) -> None:
+        self.timers.advance(rel_ms)
+        self.capture.on_vad_event(types.SimpleNamespace(
+            type=kind, speech_duration=speech_ms / 1000.0,
+            silence_duration=silence_ms / 1000.0,
+            inference_duration=inference_ms / 1000.0,
+        ), self.clock.ms / 1000.0)
+
+    def segment(self, start_rel: int, end_rel: int) -> None:
+        """SDK-shaped start (detected 60 ms in) and end (256 ms of silence)."""
+        self.vad(start_rel + 60, "start_of_speech", speech_ms=50, inference_ms=10)
+        self.vad(end_rel + 256, "end_of_speech", speech_ms=end_rel - start_rel,
+                 silence_ms=256)
+
+    def final(self, rel_ms: int, text: str):
+        self.timers.advance(rel_ms)
+        return self.capture.on_final(text)
+
+    def commit(self, rel_ms: int, text: str, sdk_anchor_rel: int | None = None):
+        self.timers.advance(rel_ms)
+        return self.capture.on_commit(
+            text, None if sdk_anchor_rel is None else _T0 + sdk_anchor_rel)
+
+    def rel(self, abs_ms: int | None) -> int | None:
+        return None if abs_ms is None else abs_ms - _T0
+
+
+class _LogSink:
+    def __init__(self) -> None:
+        self.records: list[tuple[str, dict]] = []
+
+    def info(self, event, **fields):
+        self.records.append(("info", fields))
+
+    def warn(self, event, **fields):
+        self.records.append(("warn", fields))
+
+    error = debug = warn
+
+    def of(self, error_type: str, category: str | None = None) -> list[dict]:
+        return [f for _, f in self.records
+                if f.get("error_type") == error_type
+                and (category is None or f.get("error_category") == category)]
+
+
 class TestQueuedTurnUnpacking(unittest.TestCase):
     """`_queued_turn` — the tolerance that keeps the older seam working."""
 
     def test_it_unpacks_the_pair_the_live_producer_enqueues(self):
         self.assertEqual(agent_mod._queued_turn(("hello", 1234)), ("hello", 1234))
+
+    def test_it_unpacks_a_GATE_TURN_by_its_own_speech_start(self):
+        # M013 S01: the live producer now enqueues a GateTurn; the anchor is
+        # the paired VAD speech start, never the SDK's carried-over stamp.
+        turn = gate_judge.GateTurn(
+            text="Yes", utterance_idxs=(0,), segment_start_ms=5_000,
+            segment_end_ms=5_500, segment_speech_ms=500, final_arrival_ms=6_000,
+            committed=True, closed_by="commit", sdk_anchor_ms=1_000)
+        self.assertEqual(agent_mod._queued_turn(turn), ("Yes", 5_000))
+        untimed = gate_judge.GateTurn(
+            text="Yes", utterance_idxs=(0,), segment_start_ms=None,
+            segment_end_ms=None, segment_speech_ms=None, final_arrival_ms=6_000,
+            committed=False, closed_by="settle")
+        self.assertEqual(agent_mod._queued_turn(untimed), ("Yes", None))
 
     def test_a_BARE_STRING_still_works(self):
         # `_classify_phone_answer` has direct tests that hand it a plain
@@ -134,6 +257,22 @@ class TestTurnAnchorSource(unittest.TestCase):
             1_723_000_000_000,
         )
 
+    def test_the_user_state_anchor_is_the_events_created_at(self):
+        # M013 S01: `user_state_changed` -> speaking carries THIS segment's
+        # start in `created_at`; the handler's own clock is later by the VAD
+        # detection delay.
+        now_s = 1_800_000_010.0
+        event = types.SimpleNamespace(created_at=1_800_000_009.25)
+        self.assertEqual(agent_mod._user_state_anchor_ms(event, now_s), 1_800_000_009_250)
+
+    def test_an_implausible_created_at_falls_back_to_now(self):
+        now_s = 1_800_000_010.0
+        for junk in (None, True, "x", float("nan"), MagicMock(), now_s - 7_200.0, 12.5):
+            with self.subTest(junk=repr(junk)):
+                event = types.SimpleNamespace(created_at=junk)
+                self.assertEqual(
+                    agent_mod._user_state_anchor_ms(event, now_s), 1_800_000_010_000)
+
 
 class TestClassifyPhoneAnswerSkipsStaleTurns(unittest.IsolatedAsyncioTestCase):
     """The CONSENT reader, driven directly.
@@ -194,6 +333,78 @@ class TestClassifyPhoneAnswerSkipsStaleTurns(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(decision, phone.CLASSIFY_MACHINE)
         self.assertEqual(consumed, [], "a stale turn was consumed as consent")
+
+    @staticmethod
+    def _turn(text, *, start, end=None, committed=True, closed_by="commit",
+              vad_observed=True):
+        return gate_judge.GateTurn(
+            text=text, utterance_idxs=(3,), segment_start_ms=start,
+            segment_end_ms=end, segment_speech_ms=None if start is None else 400,
+            final_arrival_ms=9_000, committed=committed, closed_by=closed_by,
+            vad_observed=vad_observed, segment_first_end_ms=end)
+
+    async def test_a_turn_with_NO_SPEECH_TIMING_never_grants(self):
+        # A reply the SDK dropped and the VAD never timed cannot be shown to
+        # answer THIS question: it never becomes consent, and the skip is logged.
+        sink = _LogSink()
+        with patch.object(agent_mod, "_log", sink):
+            decision, said, consumed = await self._classify(
+                [self._turn("Yes", start=None, committed=False, closed_by="settle")],
+                anchor=2_000)
+        self.assertNotEqual(decision, phone.CLASSIFY_HUMAN)
+        self.assertEqual(consumed, [])
+        skips = sink.of("phone_gate_turn_barrier", "consent_turn_not_grant_evidence")
+        self.assertEqual(len(skips), 1)
+        self.assertEqual(skips[0]["phase"], gate_judge.TAG_NO_SEGMENT)
+        # It was heard, so the re-ask says "unmatched", not "no_speech".
+        self.assertIn(phone.PHONE_REASK_TEXT, said)
+        self.assertEqual(
+            [f["error_category"] for f in sink.of("phone_consent_reask")], ["unmatched"])
+
+    async def test_an_untimed_turn_can_still_REFUSE(self):
+        # Only a grant needs evidence; a refusal never needs to be proven.
+        decision, _, consumed = await self._classify(
+            [self._turn("No, not interested.", start=None, committed=False,
+                        closed_by="settle")],
+            anchor=2_000)
+        self.assertEqual(decision, phone.CLASSIFY_REFUSED)
+        self.assertEqual(consumed, ["No, not interested."])
+
+    async def test_the_grant_evidence_hook_receives_the_granting_turn(self):
+        turns: asyncio.Queue = asyncio.Queue()
+        granting = self._turn("Yes, go ahead.", start=3_000, end=3_500,
+                              committed=False, closed_by="settle")
+        turns.put_nowait(self._turn("Hello?", start=1_000, end=1_400))
+        turns.put_nowait(granting)
+        seen: list = []
+
+        async def _say(_text):
+            return None
+
+        decision = await agent_mod._classify_phone_answer(
+            turns, _say, answer_timeout_sec=0.05, question_anchor=(lambda: 2_000),
+            on_grant_evidence=seen.append)
+        self.assertEqual(decision, phone.CLASSIFY_HUMAN)
+        self.assertEqual(seen, [granting])
+
+    async def test_a_broken_evidence_hook_never_blocks_consent(self):
+        turns: asyncio.Queue = asyncio.Queue()
+        turns.put_nowait(self._turn("Yes", start=3_000, end=3_400))
+
+        async def _say(_text):
+            return None
+
+        def _boom(_item):
+            raise RuntimeError("persist exploded")
+
+        sink = _LogSink()
+        with patch.object(agent_mod, "_log", sink):
+            decision = await agent_mod._classify_phone_answer(
+                turns, _say, answer_timeout_sec=0.05, question_anchor=(lambda: 2_000),
+                on_grant_evidence=_boom)
+        self.assertEqual(decision, phone.CLASSIFY_HUMAN)
+        self.assertEqual(
+            len(sink.of("phone_gate_turn_barrier", "grant_evidence_record_failed")), 1)
 
 
 class TestIdentityReaderSkipsStaleTurns(unittest.IsolatedAsyncioTestCase):
@@ -274,6 +485,19 @@ class TestIdentityReaderSkipsStaleTurns(unittest.IsolatedAsyncioTestCase):
             await self._read([("Yes, speaking.", 12_345_678)], anchor=now_ms),
             "Yes, speaking.",
         )
+
+    async def test_a_skip_is_LOGGED_with_its_tag_and_deltas_and_no_text(self):
+        sink = _LogSink()
+        with patch.object(agent_mod, "_log", sink):
+            got = await self._read(
+                [("Hello there, who is this?", 1_000), ("Yes, speaking.", 5_000)],
+                anchor=4_000)
+        self.assertEqual(got, "Yes, speaking.")
+        skips = sink.of("phone_gate_turn_barrier", "pre_question_turn_skipped")
+        self.assertEqual(len(skips), 1)
+        self.assertEqual(skips[0]["phase"], gate_judge.TAG_PRE_QUESTION)
+        self.assertEqual(skips[0]["schema"], "anchor_ms:-3000_final_ms:na_segment_ms:na")
+        self.assertNotIn("Hello", str(skips[0]))
 
     async def test_an_EMPTY_queue_returns_nothing_rather_than_hanging(self):
         started = time.monotonic()
@@ -388,6 +612,22 @@ class TestTheGateAnchorRisesToFirstAudio(unittest.TestCase):
         body = doc[doc.index(marker):doc.index(marker) + 1200]
         self.assertIn("FLOOR", body)
         self.assertNotIn("deliberate and sufficient", body)
+
+    def test_each_question_CLEARS_the_sdk_user_turn_guarded(self):
+        # M013 S01 change 6. Clearing the SDK's pending turn at each question
+        # stops a pre-question blip lending its start to the next commit. The
+        # gate capture still holds every final, so nothing heard is lost.
+        import inspect
+        src = inspect.getsource(agent_mod._run_phone_session)
+        mark = src[src.index("def _mark_question_asked()"):]
+        mark = mark[:mark.index("def _clear_sdk_user_turn()")]
+        self.assertIn("_clear_sdk_user_turn()", mark)
+        clear = src[src.index("def _clear_sdk_user_turn()"):]
+        clear = clear[:clear.index("def _clear_question_anchor()")]
+        self.assertIn('getattr(session, "clear_user_turn", None)', clear)
+        self.assertIn("clear_user_turn_unavailable", clear)
+        self.assertIn("clear_user_turn_unavailable_logged[0] = True", clear)
+        self.assertIn("except Exception", clear)
 
 
 class TestRoleOpeningSayFailureIsAmbiguous(unittest.TestCase):
@@ -725,6 +965,440 @@ class TestTerminalClosingSurvivesAHangUp(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn("disclosure.refused", posted)
         self.assertIn(phone.PHONE_REFUSED_TEXT, spoken)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  M013 S01 T01b — the gate's own capture: per-segment anchors, FIFO pairing,
+#  closed turns, consume-once. Driven on `gate_judge.GateTurnCapture` with a
+#  manual clock; the replays in test_phone_gate_replay.py drive the same code
+#  through the real readers.
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestPerSegmentAnchors(unittest.TestCase):
+    """Each reply is timed by the VAD speech that produced it."""
+
+    def test_a_segment_starts_where_the_SDK_formula_says(self):
+        # start = now - speech_duration - inference_duration (audio_recognition.py)
+        rig = _Rig()
+        rig.vad(5_060, "start_of_speech", speech_ms=50, inference_ms=10)
+        rig.vad(5_756, "end_of_speech", speech_ms=500, silence_ms=256)
+        utterance = rig.final(6_000, "Yes")
+        self.assertEqual(rig.rel(utterance.segment_start_ms), 5_000)
+        self.assertEqual(rig.rel(utterance.segment_end_ms), 5_500)
+        self.assertEqual(utterance.segment_speech_ms, 500)
+
+    def test_the_commit_is_timed_by_its_segment_NOT_the_sdk_carried_start(self):
+        # 9f60523d in miniature: a blip at 1000 never produced a final, so the
+        # SDK still reports it as the reply's speech start.
+        rig = _Rig()
+        rig.segment(1_000, 1_200)
+        rig.segment(9_000, 9_800)
+        rig.final(10_300, "Yes, we can continue.")
+        turn = rig.commit(10_310, "Yes, we can continue.", sdk_anchor_rel=1_000)
+        self.assertEqual(rig.rel(turn.anchor_ms), 9_000)
+        self.assertTrue(turn.grant_eligible)
+        self.assertFalse(agent_mod._queued_turn_is_stale(turn.anchor_ms, _T0 + 5_000))
+
+    def test_with_no_vad_on_the_call_the_sdk_start_is_the_fallback(self):
+        # A test double or an SDK without the observed VAD stream: today's
+        # behaviour, unchanged.
+        rig = _Rig()
+        turn = rig.commit(10_310, "Yes", sdk_anchor_rel=9_000)
+        self.assertEqual(turn.closed_by, "commit_only")
+        self.assertEqual(rig.rel(turn.anchor_ms), 9_000)
+        self.assertTrue(turn.grant_eligible)
+
+    def test_a_mock_sdk_anchor_is_ignored_not_trusted(self):
+        rig = _Rig()
+        turn = rig.capture.on_commit("Yes", MagicMock())
+        self.assertIsNone(turn.anchor_ms)
+
+    def test_every_final_logs_its_speech_duration_and_no_text(self):
+        rig = _Rig()
+        rig.segment(5_000, 5_500)
+        rig.final(6_000, "Yes, go ahead.")
+        finals = [f for f in rig.logs if f["error_type"] == "phone_gate_final"]
+        self.assertEqual(len(finals), 1)
+        self.assertEqual(finals[0]["error_category"], "paired")
+        self.assertEqual(finals[0]["duration_sec"], 0.5)
+        self.assertEqual(finals[0]["option_count"], 1)
+        self.assertNotIn("go ahead", str(rig.logs))
+
+
+class TestFifoPairing(unittest.TestCase):
+    """A final takes the OLDEST unpaired closed segments that ended before it."""
+
+    def test_one_final_covers_several_segments(self):
+        rig = _Rig()
+        rig.segment(22_378, 23_333)
+        rig.segment(23_700, 24_732)
+        utterance = rig.final(25_618, "Yes, we can continue.")
+        self.assertEqual(rig.rel(utterance.segment_start_ms), 22_378)
+        self.assertEqual(rig.rel(utterance.segment_end_ms), 24_732)
+        self.assertEqual(rig.rel(utterance.segment_first_end_ms), 23_333)
+        self.assertEqual(utterance.segment_speech_ms, 955 + 1_032)
+
+    def test_ATTACK_a_noise_segment_after_the_question_cannot_lend_its_start(self):
+        # Identity "Yes" 2000-2600; consent question heard at 4000; noise
+        # 4200-4400 with no final; the identity final lands at 4700. Pairing
+        # with "the latest segment started before the final" would stamp it
+        # 4200 and make it consent.
+        rig = _Rig()
+        rig.segment(2_000, 2_600)
+        rig.segment(4_200, 4_400)
+        utterance = rig.final(4_700, "Yes")
+        self.assertEqual(rig.rel(utterance.segment_start_ms), 2_000)
+        tags = rig.capture.utterances.tagged(_T0 + 4_000)
+        self.assertEqual(tags[0].tag, gate_judge.TAG_PRE_QUESTION)
+
+    def test_a_blip_with_no_final_EXPIRES_and_never_shifts_a_later_pairing(self):
+        rig = _Rig()
+        rig.segment(1_974, 2_174)        # blip, no final
+        rig.segment(8_150, 9_532)        # a reply STT never finalised
+        rig.segment(22_378, 23_333)
+        utterance = rig.final(23_900, "Yes")
+        self.assertEqual(rig.rel(utterance.segment_start_ms), 22_378)
+        # ...and the expired ones are gone for good, not paired with the next.
+        rig.segment(30_000, 30_400)
+        second = rig.final(30_900, "Okay")
+        self.assertEqual(rig.rel(second.segment_start_ms), 30_000)
+
+    def test_two_finals_for_two_segments_pair_separately(self):
+        rig = _Rig()
+        rig.segment(5_000, 5_400)
+        first = rig.final(5_800, "Yes")
+        rig.segment(6_100, 7_600)
+        second = rig.final(8_000, "but I'm busy right now")
+        self.assertEqual(rig.rel(first.segment_start_ms), 5_000)
+        self.assertEqual(rig.rel(second.segment_start_ms), 6_100)
+
+    def test_a_final_mid_segment_shares_the_OPEN_segments_start(self):
+        rig = _Rig()
+        rig.vad(5_060, "start_of_speech", speech_ms=50, inference_ms=10)
+        utterance = rig.final(7_000, "So the thing is")
+        self.assertEqual(rig.rel(utterance.segment_start_ms), 5_000)
+        self.assertIsNone(utterance.segment_end_ms)
+        self.assertEqual(rig.capture.utterances.tagged(_T0 + 6_000)[0].tag,
+                         gate_judge.TAG_DURING_QUESTION)
+
+    def test_a_second_final_of_consumed_speech_shares_its_segment(self):
+        rig = _Rig()
+        rig.segment(5_000, 6_000)
+        rig.final(6_500, "Yes")
+        again = rig.final(6_900, "that is fine")
+        self.assertEqual(rig.rel(again.segment_start_ms), 5_000)
+
+    def test_a_final_with_NO_pairable_segment_is_never_grant_evidence(self):
+        rig = _Rig()
+        rig.segment(1_000, 1_200)
+        utterance = rig.final(9_000, "Yes")          # 7.8 s later: expired
+        self.assertIsNone(utterance.segment_start_ms)
+        self.assertEqual(
+            [f["error_category"] for f in rig.logs if f["error_type"] == "phone_gate_final"],
+            [gate_judge.TAG_NO_SEGMENT])
+        rig.timers.advance(20_000)                   # closed by silence
+        turn = rig.emitted[0]
+        self.assertEqual(turn.closed_by, "settle")
+        self.assertIsNone(turn.anchor_ms)
+        self.assertFalse(turn.grant_eligible)
+        self.assertFalse(gate_judge.turn_is_grant_evidence(turn))
+        self.assertTrue(gate_judge.turn_is_grant_evidence(("Yes", 1)))
+
+
+class TestFinalCapturedWhenCommitDropped(unittest.TestCase):
+    """A turn the SDK drops (committed during a gate line) is not lost."""
+
+    def test_a_final_with_no_commit_is_CLOSED_by_silence(self):
+        rig = _Rig()
+        rig.segment(5_000, 5_500)
+        rig.final(6_000, "Yes, go ahead.")
+        rig.timers.advance(6_000 + rig.SETTLE_MS - 1)
+        self.assertEqual(rig.emitted, [], "closed before the endpointing ceiling")
+        rig.timers.advance(6_000 + rig.SETTLE_MS)
+        self.assertEqual(len(rig.emitted), 1)
+        turn = rig.emitted[0]
+        self.assertEqual((turn.text, turn.closed_by, turn.committed),
+                         ("Yes, go ahead.", "settle", False))
+        self.assertEqual(rig.rel(turn.anchor_ms), 5_000)
+
+    def test_the_silence_close_waits_while_the_candidate_is_still_speaking(self):
+        rig = _Rig()
+        rig.segment(5_000, 5_400)
+        rig.final(5_800, "Yes")
+        rig.vad(6_160, "start_of_speech", speech_ms=50, inference_ms=10)
+        rig.timers.advance(9_000)
+        self.assertEqual(rig.emitted, [], "closed while a segment was open")
+        rig.vad(9_256, "end_of_speech", speech_ms=2_900, silence_ms=256)
+        rig.final(9_500, "but I'm busy right now")
+        rig.timers.advance(9_500 + rig.SETTLE_MS)
+        self.assertEqual([t.text for t in rig.emitted], ["Yes but I'm busy right now"])
+
+    def test_the_grant_evidence_row_is_written_ONCE_and_only_for_an_uncommitted_turn(self):
+        rig = _Rig()
+        rig.segment(5_000, 5_500)
+        rig.final(6_000, "Yes, go ahead.")
+        rig.timers.advance(8_000)
+        dropped = rig.emitted[0]
+        keys: set[str] = set()
+        row = agent_mod._gate_evidence_row(dropped, keys, rig.capture)
+        self.assertEqual(row, ("candidate", "Yes, go ahead.", dropped.anchor_ms, "final-0"))
+        self.assertIsNone(agent_mod._gate_evidence_row(dropped, keys), "written twice")
+        self.assertEqual(agent_mod._gate_source_item_id("final-0"), "phone-gate-final-0")
+        self.assertEqual(agent_mod._gate_source_item_id(7), "phone-gate-item-7")
+        committed = dataclasses_replace(dropped, committed=True)
+        self.assertIsNone(agent_mod._gate_evidence_row(committed, set()),
+                          "a committed turn already has its conversation row")
+        self.assertIsNone(agent_mod._gate_evidence_row(("Yes", 1), set()))
+
+    def _granted_on_a_dropped_turn(self):
+        rig = _Rig()
+        rig.segment(5_000, 5_500)
+        rig.final(6_000, "Yes, go ahead.")
+        rig.timers.advance(8_000)
+        keys: set[str] = set()
+        row = agent_mod._gate_evidence_row(rig.emitted[0], keys, rig.capture)
+        self.assertIsNotNone(row)
+        return rig, keys
+
+    def test_a_late_commit_AFTER_the_evidence_row_writes_no_second_row(self):
+        rig, keys = self._granted_on_a_dropped_turn()
+        self.assertIsNone(rig.commit(8_200, "Yes, go ahead.", sdk_anchor_rel=5_000))
+        # The SDK then adds the kept commit to the chat context.
+        self.assertTrue(agent_mod._gate_user_row_is_evidence_echo(
+            "Yes, go ahead.", rig.capture, keys))
+        # Consumed once: the same words said AGAIN later are written.
+        rig.segment(12_000, 12_500)
+        rig.final(13_000, "Yes, go ahead.")
+        rig.commit(13_100, "Yes, go ahead.")
+        self.assertFalse(agent_mod._gate_user_row_is_evidence_echo(
+            "Yes, go ahead.", rig.capture, keys))
+
+    def test_a_late_commit_BEFORE_the_grant_is_read_means_no_evidence_row(self):
+        rig = _Rig()
+        rig.segment(5_000, 5_500)
+        rig.final(6_000, "Yes, go ahead.")
+        rig.timers.advance(8_000)
+        settled = rig.emitted[0]
+        rig.commit(8_200, "Yes, go ahead.", sdk_anchor_rel=5_000)   # row written by SDK item
+        keys: set[str] = set()
+        self.assertFalse(agent_mod._gate_user_row_is_evidence_echo(
+            "Yes, go ahead.", rig.capture, keys), "the only row was suppressed")
+        self.assertIsNone(agent_mod._gate_evidence_row(settled, keys, rig.capture),
+                          "the grant wrote a second row for words already written")
+
+    def test_a_dropped_turn_never_committed_keeps_its_evidence_row(self):
+        rig, keys = self._granted_on_a_dropped_turn()
+        # A later, different utterance is written normally.
+        rig.segment(12_000, 12_500)
+        rig.final(13_000, "Okay")
+        rig.commit(13_100, "Okay")
+        self.assertFalse(agent_mod._gate_user_row_is_evidence_echo("Okay", rig.capture, keys))
+
+    def test_a_dropped_hang_up_request_is_still_honoured(self):
+        # `on_candidate_turn` honours an explicit end-call request; a dropped
+        # turn never reaches it, so the session's emit does (source pin).
+        import inspect
+        src = inspect.getsource(agent_mod._run_phone_session)
+        emit = src[src.index("def _emit_gate_turn("):]
+        emit = emit[:emit.index("gate_capture = _new_gate_turn_capture")]
+        self.assertIn('turn.closed_by == "settle"', emit)
+        self.assertIn("phone.is_explicit_end_call_request(turn.text)", emit)
+        self.assertIn("candidate_end_requested.set()", emit)
+
+
+def dataclasses_replace(obj, **changes):
+    import dataclasses
+    return dataclasses.replace(obj, **changes)
+
+
+class TestClosedTurnNotFragment(unittest.TestCase):
+    """Readers classify CLOSED turns: "Yes" + "but I'm busy" is one reply."""
+
+    def _two_finals(self) -> _Rig:
+        rig = _Rig()
+        rig.segment(5_000, 5_400)
+        rig.final(5_800, "Yes")
+        rig.segment(6_100, 7_600)
+        rig.final(8_000, "but I'm busy right now")
+        return rig
+
+    def test_one_commit_of_two_finals_is_ONE_turn_and_routes_to_callback(self):
+        rig = self._two_finals()
+        turn = rig.commit(8_500, "Yes but I'm busy right now", sdk_anchor_rel=5_000)
+        self.assertEqual(rig.emitted, [turn])
+        self.assertEqual(turn.utterance_idxs, (0, 1))
+        self.assertEqual(turn.text, "Yes but I'm busy right now")
+        self.assertEqual(agent_mod.classify_answer_text(turn.text),
+                         phone.CLASSIFY_CALLBACK_REQUESTED)
+
+    def test_a_dropped_two_final_turn_also_closes_as_one(self):
+        rig = self._two_finals()
+        rig.timers.advance(20_000)
+        self.assertEqual([t.text for t in rig.emitted], ["Yes but I'm busy right now"])
+        self.assertNotEqual(agent_mod.classify_answer_text(rig.emitted[0].text),
+                            phone.CLASSIFY_HUMAN)
+
+    def test_a_commit_of_the_FIRST_final_only_leaves_the_second_open(self):
+        # The SDK committed "Yes" on its own (its decision, today's behaviour);
+        # the second final becomes its own turn, never merged into the first.
+        rig = _Rig()
+        rig.segment(5_000, 5_400)
+        rig.final(5_800, "Yes")
+        first = rig.commit(5_900, "Yes", sdk_anchor_rel=5_000)
+        rig.segment(6_100, 7_600)
+        rig.final(8_000, "but I'm busy right now")
+        second = rig.commit(8_400, "but I'm busy right now", sdk_anchor_rel=6_100)
+        self.assertEqual([t.text for t in rig.emitted], ["Yes", "but I'm busy right now"])
+        self.assertEqual((first.utterance_idxs, second.utterance_idxs), ((0,), (1,)))
+
+
+class TestConsumedOnce(unittest.IsolatedAsyncioTestCase):
+    """Each final reaches a reader once; a late commit is never re-read."""
+
+    def test_a_commit_after_the_silence_close_is_NOT_emitted_again(self):
+        rig = _Rig()
+        rig.segment(5_000, 5_500)
+        rig.final(6_000, "Hmm")
+        rig.timers.advance(8_000)
+        self.assertEqual(len(rig.emitted), 1)
+        self.assertIsNone(rig.commit(8_200, "Hmm", sdk_anchor_rel=5_000))
+        self.assertEqual(len(rig.emitted), 1)
+        self.assertEqual(
+            [f["error_category"] for f in rig.logs
+             if f["error_type"] == "phone_gate_turn_barrier"],
+            ["commit_duplicate"])
+        self.assertTrue(rig.capture.utterances.get(0).committed)
+
+    def test_the_same_words_said_AGAIN_are_a_new_turn(self):
+        rig = _Rig()
+        rig.segment(5_000, 5_500)
+        rig.final(6_000, "Yes")
+        rig.commit(6_100, "Yes")
+        rig.segment(9_000, 9_400)
+        rig.final(9_800, "Yes")
+        rig.commit(9_900, "Yes")
+        self.assertEqual([t.utterance_idxs for t in rig.emitted], [(0,), (1,)])
+
+    async def test_a_re_ask_is_never_answered_by_the_ECHO_of_the_reply_that_caused_it(self):
+        rig = _Rig()
+        turns: asyncio.Queue = asyncio.Queue()
+        rig.capture._emit = turns.put_nowait
+        # "Hmm" over the consent line: dropped by the SDK, closed by silence.
+        rig.segment(5_000, 5_500)
+        rig.final(6_000, "Hmm")
+        rig.timers.advance(8_000)
+        said: list[str] = []
+
+        async def _say(text):
+            said.append(text)
+            # While the re-ask plays the SDK's late commit of "Hmm" lands; then
+            # the candidate really answers.
+            rig.commit(12_000, "Hmm", sdk_anchor_rel=5_000)
+            rig.segment(14_000, 14_500)
+            rig.final(15_000, "Yes, go ahead.")
+            rig.commit(15_100, "Yes, go ahead.")
+
+        consumed: list[str] = []
+        decision = await agent_mod._classify_phone_answer(
+            turns, _say, answer_timeout_sec=0.2, consumed=consumed,
+            question_anchor=(lambda: _T0 + 4_000))
+        self.assertEqual(said, [phone.PHONE_REASK_TEXT])
+        self.assertEqual(consumed, ["Hmm", "Yes, go ahead."])
+        self.assertEqual(decision, phone.CLASSIFY_HUMAN)
+
+    def test_the_capture_stops_with_the_gate(self):
+        rig = _Rig()
+        rig.capture.stop()
+        rig.segment(5_000, 5_500)
+        self.assertIsNone(rig.final(6_000, "Yes"))
+        rig.timers.advance(10_000)
+        self.assertEqual(rig.emitted, [])
+        # A commit after the gate passes straight through, as before.
+        turn = rig.commit(10_100, "Yes", sdk_anchor_rel=5_000)
+        self.assertEqual((turn.closed_by, rig.rel(turn.anchor_ms)), ("commit_only", 5_000))
+
+
+class TestSkipIsLogged(unittest.IsolatedAsyncioTestCase):
+    """No skip is silent: the consent reader's skip at 2959-2963 is now logged."""
+
+    async def test_the_consent_reader_logs_every_skip_with_tag_and_deltas(self):
+        rig = _Rig()
+        turns: asyncio.Queue = asyncio.Queue()
+        rig.capture._emit = turns.put_nowait
+        rig.segment(2_000, 2_600)          # identity reply, before the question
+        rig.final(3_000, "Yes, that's me.")
+        rig.commit(3_100, "Yes, that's me.")
+        rig.segment(5_000, 5_500)
+        rig.final(6_000, "Sure, go ahead.")
+        rig.commit(6_100, "Sure, go ahead.")
+        sink = _LogSink()
+
+        async def _say(_text):
+            return None
+
+        with patch.object(agent_mod, "_log", sink):
+            decision = await agent_mod._classify_phone_answer(
+                turns, _say, answer_timeout_sec=0.05,
+                question_anchor=(lambda: _T0 + 4_000))
+        self.assertEqual(decision, phone.CLASSIFY_HUMAN)
+        skips = sink.of("phone_gate_turn_barrier", "consent_turn_skipped")
+        self.assertEqual(len(skips), 1)
+        self.assertEqual(skips[0]["phase"], gate_judge.TAG_PRE_QUESTION)
+        self.assertEqual(skips[0]["schema"],
+                         "anchor_ms:-2000_final_ms:-1000_segment_ms:-2000")
+        self.assertNotIn("that's me", str(sink.records))
+
+    def test_the_delta_schema_survives_the_structured_logger(self):
+        # The logger allowlists its keys and drops non-identifier strings; the
+        # skip's deltas must come through the REAL logger intact.
+        import json
+        import observability
+        lines: list[str] = []
+        logger = observability.StructuredLogger("voice-test", writer=lines.append)
+        schema = gate_judge.delta_schema(anchor_ms=-3_600_000, final_ms=None, segment_ms=12)
+        logger.info("unknown_event", error_type="phone_gate_turn_barrier",
+                    error_category="consent_turn_skipped",
+                    phase=gate_judge.TAG_DURING_QUESTION, schema=schema)
+        entry = json.loads(lines[0])
+        self.assertEqual(entry["schema"], schema)
+        self.assertEqual(entry["phase"], "during_question")
+        self.assertLessEqual(len(gate_judge.delta_schema(
+            anchor_ms=-99_999_999, final_ms=-99_999_999, segment_ms=-99_999_999)), 64)
+
+    def test_the_consent_skip_site_is_no_longer_a_bare_continue(self):
+        import inspect
+        src = inspect.getsource(agent_mod._classify_phone_answer)
+        stale = src[src.index("_queued_turn_is_stale("):]
+        self.assertIn('"consent_turn_skipped"', stale[:400])
+
+
+class TestGateJudgeModuleIsStandalone(unittest.TestCase):
+    """`gate_judge` imports without livekit and without phone/agent."""
+
+    def test_it_imports_with_livekit_BLOCKED_and_pulls_in_no_worker_module(self):
+        import os
+        import subprocess
+        import sys
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        code = (
+            "import sys\n"
+            "for name in ('livekit', 'livekit.agents', 'livekit.rtc'):\n"
+            "    sys.modules[name] = None\n"
+            "import gate_judge\n"
+            "assert 'phone' not in sys.modules, 'gate_judge imported phone'\n"
+            "assert 'agent' not in sys.modules, 'gate_judge imported agent'\n"
+            "print('ok')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", code], cwd=here, capture_output=True, text=True,
+            timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("ok", result.stdout)
+
+    def test_normalisation_keeps_devanagari_matras(self):
+        self.assertEqual(gate_judge.normalize_gate_text("  Yes,   GO ahead! "), "yes go ahead")
+        self.assertEqual(gate_judge.normalize_gate_text("हाँ, ठीक है।"), "हाँ ठीक है")
 
 
 if __name__ == "__main__":
