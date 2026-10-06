@@ -98,6 +98,7 @@
 | `owner_id` | Public | UUID auth.users reference |
 | `updated_at` | Public | Timestamp |
 | `provenance` | Internal | Model provenance JSON (LLM-06) |
+| `interview_round_id` | Internal | Opaque R1 interview-round reference; only populated for R1 browser sessions |
 
 ### `screening_v2.transcript_turns`
 
@@ -109,6 +110,23 @@
 | `speaker` | Public | "bot" or "candidate" |
 | `text` | **Confidential PII** | Turn text — candidate speech may contain PII |
 | `created_at` | Public | Timestamp |
+| `phase` | Internal | R1 conversation phase label |
+| `interrupted` | Internal | Whether the turn was interrupted |
+
+### R1 interview-round tables
+
+| Column(s) | Classification | Notes |
+|--------|---------------|-------|
+| `interview_rounds.id`, `candidate_id`, `role_id`, `kind`, `status`, attempt counters, timestamps, `created_by`, `version` | Internal | R1 lifecycle and opaque references |
+| `interview_rounds.link_token_digest` | **Secret** | One-time-link digest; never returned to browser roles or logs |
+| `interview_rounds.candidate_status_at_send`, `recommendation`, `overall`, `assessment_id`, status-effect timestamps | Internal | Hiring workflow and scoring metadata |
+| `interview_round_attempts.session_id`, `round_id`, attempt/persona/version/variant, `counted`, `outcome`, timestamps | Internal | R1 attempt administration metadata |
+| `interview_round_attempts.content_sha` | Internal | Versioned R1 content-integrity digest |
+| `interview_round_attempts.nonce_digest` | **Secret** | Reconnect nonce digest; never browser-readable |
+| `interview_round_consent_templates` fields | Internal | Legal consent-copy versioning; immutable R1-only templates |
+| `interview_round_consents.round_id`, `template_id`, consent timestamps | Internal | Consent lifecycle metadata |
+| `interview_round_consents.consents`, `proof` | **Confidential PII** | Candidate consent declaration and proof may identify the candidate/device |
+| `r1_settings` and `r1_budget_month` fields | Internal | R1 operating capacity, scoring thresholds and aggregate cost controls |
 
 **Retention decision:** PENDING — legal review required. Transcript data may be subject to different retention periods than candidate profile data.
 
