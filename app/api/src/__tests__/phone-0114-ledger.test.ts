@@ -73,8 +73,12 @@ const APE = stripHunks(APE_0114);
 const TRG = stripHunks(TRG_0114);
 
 describe('0114 §2 — ownership and placement', () => {
-  it('is the newest registered migration, so the extractors read 0114 bodies', () => {
-    expect(PHONE_MIGRATIONS[0].name).toBe('0114');
+  it('is the newest registered migration after 0115, so the extractors read 0114 (or 0115-lifted) bodies', () => {
+    // 0115 (M013 S02) is newest; its later sections re-lift
+    // enforce_phone_engagement_transition with the C2 hunk byte-identical,
+    // so the C2 marker must still be in whatever body the extractor reads.
+    expect(PHONE_MIGRATIONS[0].name).toBe('0115');
+    expect(PHONE_MIGRATIONS[1].name).toBe('0114');
     expect(functionBody('apply_phone_event')).toContain('-- ▼ 0114 C1-b');
     expect(functionBody('enforce_phone_engagement_transition')).toContain(
       '-- ▼ 0114 C2 late-score exception',
