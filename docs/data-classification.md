@@ -256,6 +256,70 @@
 | `metadata` | Internal | Bounded JSONB; by policy contains no PII |
 | `created_at` | Public | Timestamp |
 
+## Planned R1 schema classification
+
+The following is the approved R1 design classification, not a claim that these
+migrations exist. It is to be implemented by the R1 migration PRs described in
+`docs/design/r1/R1-PLAN-final.md` §8.1. The existing summary below continues
+to describe implemented schema only.
+
+### `screening_v2.interview_rounds` (planned)
+
+| Column | Classification | Notes |
+|--------|---------------|-------|
+| `id`, `candidate_id`, `role_id`, `assessment_id`, `created_by` | Public | Opaque UUID identifiers and FK references |
+| `kind`, `status`, `attempts_allowed`, `attempts_counted`, `starts_used`, `candidate_status_at_send`, `recommendation`, `overall`, `version` | Internal | R1 lifecycle, scoring, and configuration state |
+| `link_token_digest` | **Secret** | One-time link-token digest; never return or log it |
+| `expires_at`, `status_written_at`, `pending_reject_until`, `created_at`, `updated_at` | Public | Lifecycle timestamps |
+
+### `screening_v2.interview_round_attempts` (planned)
+
+| Column | Classification | Notes |
+|--------|---------------|-------|
+| `session_id`, `round_id`, `attempt_number`, `counted`, `created_at`, `updated_at` | Public | Opaque references, attempt sequence, and timestamps |
+| `persona_id`, `persona_version`, `persona_variant`, `content_sha`, `outcome` | Internal | Controlled role-play content and result metadata |
+| `nonce_digest` | **Secret** | Rejoin nonce digest; token-equivalent and never returned or logged |
+
+### `screening_v2.interview_round_consent_templates` and `screening_v2.interview_round_consents` (planned)
+
+| Column | Classification | Notes |
+|--------|---------------|-------|
+| Template identifiers, `version`, `locale`, `created_at`, `updated_at` | Public | Template identity and timestamps |
+| Template body, required purposes, consent status, `withdrawn_at` | Internal | Consent policy and lifecycle data |
+| Round/candidate/attempt references, consent proof, IP address, user agent | **Confidential PII** | Candidate-linked consent evidence and technical identifiers |
+
+### `screening_v2.r1_settings` and `screening_v2.r1_budget_month` (planned)
+
+| Column | Classification | Notes |
+|--------|---------------|-------|
+| `id`, `enabled`, `paused`, `auto_status_enabled`, caps, pause line, thresholds, dashboard reading, month, timestamps | Internal | Operational and decision-policy settings; audit all changes |
+| Budget holds, reserved/actual minutes, provider and reconciliation measurements | Internal | R1 capacity and cost controls; no credential values |
+
+### Additions to existing tables (planned)
+
+| Table / columns | Classification | Notes |
+|-----------------|---------------|-------|
+| `roles.interview_kind` | Internal | Selects an interview type such as `sales_r1` |
+| `call_sessions.interview_round_id` | Public | Opaque R1 round FK |
+| `transcript_turns.phase`, `transcript_turns.interrupted` | Internal | R1 phase/evidence administration metadata |
+
+### `screening_v2.r1_usage_ledger` and `screening_v2.r1_admin_log` (planned)
+
+| Column group | Classification | Notes |
+|--------------|---------------|-------|
+| IDs, round/attempt/session references, timestamps, minute and cost measurements | Internal | R1 operational accounting and administration metadata |
+| Phase, scheduled move, delivery/slip, reveal and close-control data | Internal | Deterministic role-play audit data; not scoring text |
+| Candidate-linked administration evidence or free-text exception detail | **Confidential PII** | Restrict to R1 HR/operations access and minimize content |
+
+### `screening_v2.interview_round_recordings` (planned)
+
+| Column | Classification | Notes |
+|--------|---------------|-------|
+| `id`, round/attempt/session references, state, object key, bytes, duration, timestamps, retention/deletion markers | Internal | Recording lifecycle and storage metadata |
+| SHA-256 integrity value / upload identifiers | Internal | Integrity and multipart state; never treat as an access credential |
+| Presigned review/download URL | **Secret** | Bearer access to candidate video; generate on demand and never persist/log the URL |
+| Recording object content (candidate camera, audio, transcript-linked playback) | **Confidential PII** | HR-review-only R1 A/V; 90-day target retention remains subject to Legal approval |
+
 ## Classification summary
 
 | Level | Count | Examples |

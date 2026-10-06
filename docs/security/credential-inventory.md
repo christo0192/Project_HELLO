@@ -30,6 +30,19 @@ account and credential lifecycle; the schema treats each as a separate
 | ElevenLabs | Archived env files | Revoke or rotate; delete unused resources where approved | Owner verification pending |
 | Cartesia | Archived env files | Revoke or rotate; delete unused resources where approved | Owner verification pending |
 
+## Planned R1 credentials
+
+These are planned R1-only secrets, not provisioned credentials and not evidence
+of rotation. Values must never be recorded here. Their implementation and
+rotation procedure are tracked in the R1 design/runbook.
+
+| System | Planned secret names / scope | Required action | Rotation status |
+|--------|------------------------------|-----------------|-----------------|
+| Cloudflare R2 R1 recording | `R1_RECORDING_S3_*` on `project-hello-api` only | Use bucket-scoped credentials for the private R1 recording bucket; rotate with zero live R1 rooms | Planned |
+| R1 LiveKit API | `R1_LIVEKIT_*` on the API and selected R1 worker scope | Keep distinct from the LiveKit Cloud/phone key; rotate through the R1 drained switch procedure | Planned |
+| R1 self-hosted LiveKit SFU | `LIVEKIT_KEYS` on `project-hello-r1-rtc` only | Maintain two active keys during rotation; remove the old key only after verification | Planned |
+| DeepSeek R1 conversation | `DEEPSEEK_API_KEY` on `project-hello-voice` | Stage before the R1 worker work; rotate through the provider and record non-secret evidence | Planned |
+
 Rotation must be performed in each provider account by an authorized owner.
 Acceptable non-secret evidence includes a provider audit-log screenshot, a
 confirmed "last rotated" timestamp from the provider console, or a test proving
