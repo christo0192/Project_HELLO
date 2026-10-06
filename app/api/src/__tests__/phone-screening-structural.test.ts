@@ -383,6 +383,12 @@ describe('2. no provider, no dialing, no network, no Ashby mutation', () => {
       'lib/phone-runtime/due-loop.ts',
       'lib/phone-runtime/read.ts',
       'lib/phone-runtime/runtime.ts',
+      // M013 S02 (T06) — the phone assessment handler calls the 0115
+      // `relabel_zero_answer_phone_engagement` RPC. It imports the domain
+      // core only for that RPC's pinned constants (`SCREENING_ABANDONED_REASON`
+      // in rpc-contract) and the system actor sentinel (`PHONE_SYSTEM_ACTOR`):
+      // no transition is re-implemented, nothing dials and nothing loops.
+      'lib/phone-runtime/assessment-handler.ts',
       // 0107 derives the attempt object key from the same pure domain helper.
       'lib/recording-egress.ts',
       // PR105 — Canary-1's operator CLI. It imports the domain core for ONE

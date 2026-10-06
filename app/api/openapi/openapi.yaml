@@ -1500,6 +1500,13 @@ paths:
         schema:
           type: string
           maxLength: 256
+      - name: session_id
+        in: query
+        required: false
+        description: M013 S02. Only the legs of this session (session_id or recording_session_id equals it), ordered OLDEST first by admitted_at (the default listing is newest first). Still scoped to the candidate; another candidate's session lists nothing.
+        schema:
+          type: string
+          format: uuid
     get:
       tags: [candidates, phone]
       operationId: listCandidatePhoneAttempts
@@ -8766,6 +8773,29 @@ components:
         duration_sec:
           type: integer
           nullable: true
+          description: Phone sessions (0115) - connected seconds summed over the answered legs whose end was observed or ledger-recorded; legs ended only by the lease reclaim are excluded and counted in duration_unobserved_legs (null when no leg end was observed). Not talk time, and not shown as call length for phone sessions - use recorded_total_sec / connected_total_sec.
+        duration_unobserved_legs:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: M013 S02 (0115). Answered phone legs excluded from duration_sec because their end was never observed. null when not computed by the 0115 rule.
+        recorded_total_sec:
+          type: number
+          nullable: true
+          description: M013 S02. GET /api/candidates/{id} only. Sum of this session's legs' known recording lengths (see CandidatePhoneAttempt.recorded_sec). null when none is known, for a session with no phone legs, when the legs could not be read, or for an interviewer who does not own the session.
+        recorded_legs:
+          type: integer
+          minimum: 0
+          nullable: true
+          description: M013 S02. GET /api/candidates/{id} only. How many of this session's legs have a known recording length. null as for recorded_total_sec.
+        connected_complete:
+          type: boolean
+          nullable: true
+          description: M013 S02. GET /api/candidates/{id} only. true when every answered leg's end was observed or ledger-recorded; false when any answered leg's end was not observed (lease reclaim) or it has not ended. null when no leg was answered or the legs could not be read.
+        connected_total_sec:
+          type: number
+          nullable: true
+          description: M013 S02. GET /api/candidates/{id} only. Sum of the answered legs' connected_sec, only when connected_complete is true; otherwise null.
         created_at:
           type: string
           format: date-time
@@ -10260,13 +10290,52 @@ components:
         duration_sec:
           type: number
           nullable: true
+          description: Same value as connected_sec (kept for existing clients). null for a leg whose end was never observed (lease reclaim), never the span up to the reclaim.
+        connected_from:
+          type: string
+          format: date-time
+          nullable: true
+          description: M013 S02. When the leg was answered (answered_at); null for a leg that was never answered.
+        connected_to:
+          type: string
+          format: date-time
+          nullable: true
+          description: M013 S02. The leg end per connected_to_source. For unobserved it is the time the lease timeout DETECTED the dropped leg, not when the call ended. null while live or never answered.
+        connected_to_source:
+          type: string
+          enum: [observed, ledger, unobserved]
+          nullable: true
+          description: M013 S02. observed = the SIP leave the worker observed (0115 observed_ended_at); ledger = the ledger end (provider, reconciler or worker event); unobserved = ended only by the lease reclaim with no observed end, so the call's real end is unknown.
+        connected_sec:
+          type: number
+          nullable: true
+          description: M013 S02. Seconds from connected_from to connected_to. null when unobserved, live or never answered.
+        recorded_sec:
+          type: number
+          nullable: true
+          description: M013 S02. Length of this leg's recording in seconds - the worker's true audio length (0115 recording_duration_ms), or for a legacy worker MP3 an estimate from its size at 64 kbps (recorded_sec_estimated). null when unknown, when the capture failed, or when the caller may not read the session.
+        recorded_sec_estimated:
+          type: boolean
+          description: M013 S02. recorded_sec is a size-based estimate (show it as approximate).
+        recording_started_at_ms:
+          type: integer
+          nullable: true
+          description: M013 S02. Epoch ms of t = 0 in this leg's recording file (worker clock), to place transcript turns on the leg's audio. null for legacy legs (fall back to answered_at + about 1 s) and when the caller may not read the session.
+        tail_may_be_missing:
+          type: boolean
+          description: M013 S02. A worker recording whose tail flush is not known to have run (legacy rows and fail-open skips) and whose length does not already cover the connected span within 3 s - it may end a few seconds before the call did.
+        session_ref:
+          type: string
+          format: uuid
+          nullable: true
+          description: M013 S02. The session this leg belongs to - session_id (consent binding) else recording_session_id (0107 evidence binding). Reconnect legs share their session.
         recording:
           $ref: '#/components/schemas/CandidatePhoneAttemptRecording'
         consent_stage:
           type: string
-          enum: [before_consent, after_consent]
+          enum: [before_consent, after_consent, consent_withdrawn, deferred_after_consent]
           nullable: true
-          description: Whether this leg's audio was captured before the candidate consented. after_consent when the leg is consent-bound (0107 session_id set). before_consent when it is unbound and either its outcome ends at or before the consent step or its parent session never completed (worker clips kept under the 2026-09-26 retention decision recorded in 0105). null when that cannot be told apart, e.g. a pre-0107 unbound leg under a completed parent. Derived from data already loaded; no transcript is read.
+          description: Whether this leg's audio was captured before the candidate consented, and what the candidate did about consent on it. before_consent when the leg is unbound and either its outcome ends at or before the consent step (including opt_out, a refused disclosure) or its parent session never completed (worker clips kept under the 2026-09-26 retention decision recorded in 0105). On a consent-bound leg (0107 session_id set) - consent_withdrawn when the leg ended opt_out or a candidate.opt_out event names this attempt; deferred_after_consent when it ended callback_deferred or a callback.deferred_in_call event names it (a "call me later", not a withdrawal); otherwise after_consent. Keyed only on this leg's own facts, never the engagement's state. Every recording is kept; the stage only labels it. null when that cannot be told apart, e.g. a pre-0107 unbound leg under a completed parent. No transcript is read.
         transcript:
           allOf:
             - $ref: '#/components/schemas/CandidatePhoneAttemptTranscript'

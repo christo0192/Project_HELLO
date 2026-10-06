@@ -26,6 +26,12 @@ let cursorFilters: string[];
 let turns: Array<Record<string, unknown>>;
 let candidateVisible = true;
 let sessionRows: Array<Record<string, unknown>>;
+/** phone_call_events rows (M013 S02 D8 per-leg facts). */
+let events: Array<Record<string, unknown>>;
+let eventsError: unknown;
+/** Every `.in(column, values)` on phone_call_events, and every order on attempts. */
+let eventIns: Array<[string, unknown[]]>;
+let attemptOrders: Array<[string, unknown]>;
 
 function chain(table: string, result: unknown): any {
   let output = result;
@@ -36,8 +42,14 @@ function chain(table: string, result: unknown): any {
       if (table === 'transcript_turns' && column === 'is_gate' && value === false) transcriptInterviewOnly = true;
       return self;
     },
-    in: () => self,
-    order: () => self,
+    in: (column: string, values: unknown[]) => {
+      if (table === 'phone_call_events') eventIns.push([column, values]);
+      return self;
+    },
+    order: (column: string, options?: { ascending?: boolean }) => {
+      if (table === 'phone_call_attempts') attemptOrders.push([column, options?.ascending]);
+      return self;
+    },
     limit: () => self,
     range: () => self,
     or: (filter: string) => {
@@ -62,7 +74,9 @@ function chain(table: string, result: unknown): any {
             ? { data: transcriptInterviewOnly ? [] : turns, error: null }
             : table === 'call_sessions'
               ? { data: sessionRows, error: null }
-              : { data: [], error: null },
+              : table === 'phone_call_events'
+                ? (eventsError ? { data: null, error: eventsError } : { data: events, error: null })
+                : { data: [], error: null },
     ).then(resolve),
   };
   return self;
@@ -105,6 +119,10 @@ beforeEach(() => {
   cursorFilters = [];
   candidateVisible = true;
   sessionRows = [];
+  events = [];
+  eventsError = null;
+  eventIns = [];
+  attemptOrders = [];
   vi.mocked(supabase.from).mockImplementation((table: string) => {
     const result = table === 'phone_call_attempts' ? attempts : [];
     return chain(table, result) as never;
@@ -311,5 +329,376 @@ describe('candidate phone-attempt history: recordings made before consent (M011 
     const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
     expect(res.status).toBe(200);
     expect(res.body.attempts[0].recording).toEqual({ state: 'unavailable', reason: 'revoked' });
+  });
+});
+
+// ── M013 S02 T07: per-leg truth, multi-leg listing, consent flags ─────────
+// Every fixture is synthetic: placeholder ids, real TIMINGS only (the
+// 9f60523d and 32757295 shapes from the S02 research), no names or numbers.
+describe('candidate phone-attempt history: per-leg truth (M013 S02 T07)', () => {
+  const LEG_A = '00000000-0000-4000-8000-0000000000a1';
+  const LEG_B = '00000000-0000-4000-8000-0000000000b2';
+  const LEG_C = '00000000-0000-4000-8000-0000000000c3';
+  const OTHER_SESSION = '00000000-0000-4000-8000-000000000203';
+
+  function parentSession(overrides: Record<string, unknown> = {}) {
+    return {
+      id: SESSION,
+      owner_id: null,
+      status: 'completed',
+      recording_revoked_at: null,
+      recording_quarantined: false,
+      recording_deleted_at: null,
+      ...overrides,
+    };
+  }
+
+  /** A legacy (pre-T01/T02) worker MP3 leg: size only, no 0115 facts. */
+  function workerLeg(id: string, fields: Record<string, unknown>) {
+    return {
+      id,
+      attempt_seq: 1,
+      abandon_reason: null,
+      session_id: SESSION,
+      recording_session_id: SESSION,
+      recording_object_key: `phone-${id}-worker.mp3`,
+      recording_sha256: 'b'.repeat(64),
+      recording_content_type: 'audio/mpeg',
+      recording_ready: true,
+      recording_quarantined: false,
+      recording_deleted_at: null,
+      egress_id: `EG_worker_${id}`,
+      egress_status: 'complete',
+      observed_ended_at: null,
+      recording_started_at_ms: null,
+      recording_duration_ms: null,
+      recording_tail_flushed: null,
+      ...fields,
+    };
+  }
+
+  /**
+   * The 9f60523d shape (newest first, as the default listing orders):
+   * leg C a reconnect dial that never answered; leg B the reconnect leg ended
+   * only by the lease reclaim; leg A the first leg, ended by the reconciler.
+   */
+  function zeroAnswerShape() {
+    return [
+      {
+        ...workerLeg(LEG_C, {}),
+        attempt_seq: 10,
+        admitted_at: '2026-10-06T03:43:09.900Z',
+        answered_at: null,
+        ended_at: '2026-10-06T03:44:03.349Z',
+        state: 'ended',
+        outcome_class: 'provider_error',
+        session_id: null,
+        recording_session_id: null,
+        recording_object_key: null,
+        recording_sha256: null,
+        recording_size_bytes: null,
+        recording_content_type: null,
+        recording_ready: false,
+        egress_id: null,
+        egress_status: null,
+      },
+      workerLeg(LEG_B, {
+        attempt_seq: 9,
+        admitted_at: '2026-10-06T03:34:30.000Z',
+        answered_at: '2026-10-06T03:34:49.612Z',
+        ended_at: '2026-10-06T03:40:57.456Z',
+        state: 'abandoned',
+        outcome_class: null,
+        recording_size_bytes: 140_972,
+      }),
+      workerLeg(LEG_A, {
+        attempt_seq: 8,
+        admitted_at: '2026-10-06T03:30:30.000Z',
+        answered_at: '2026-10-06T03:30:46.822Z',
+        ended_at: '2026-10-06T03:32:02.356Z',
+        state: 'ended',
+        outcome_class: 'disconnected',
+        recording_size_bytes: 425_708,
+      }),
+    ];
+  }
+
+  it('9f60523d shape: ledger end + estimated length on leg A, unobserved leg B, no reclaim span as a length', async () => {
+    sessionRows = [parentSession()];
+    attempts = zeroAnswerShape();
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.status).toBe(200);
+    const [c, b, a] = res.body.attempts;
+
+    expect(a).toMatchObject({
+      connected_from: '2026-10-06T03:30:46.822Z',
+      connected_to: '2026-10-06T03:32:02.356Z',
+      connected_to_source: 'ledger',
+      connected_sec: 75.534,
+      duration_sec: 75.534,
+      recorded_sec: 53.2,
+      recorded_sec_estimated: true,
+      recording_started_at_ms: null,
+      tail_may_be_missing: true,
+      session_ref: SESSION,
+    });
+
+    // The reclaim-ended leg: its end is the DETECTION time and it has no
+    // length — not the 6 min between the hang-up and the sweep.
+    expect(b).toMatchObject({
+      connected_from: '2026-10-06T03:34:49.612Z',
+      connected_to: '2026-10-06T03:40:57.456Z',
+      connected_to_source: 'unobserved',
+      connected_sec: null,
+      duration_sec: null,
+      recorded_sec: 17.6,
+      recorded_sec_estimated: true,
+      session_ref: SESSION,
+    });
+
+    expect(c).toMatchObject({
+      connected_from: null,
+      connected_to: null,
+      connected_to_source: null,
+      connected_sec: null,
+      recorded_sec: null,
+      recorded_sec_estimated: false,
+      tail_may_be_missing: false,
+      session_ref: null,
+    });
+
+    // No field of any leg carries a reclaim-based length (367.8 s / 443 s).
+    for (const attempt of res.body.attempts) {
+      for (const key of ['duration_sec', 'connected_sec', 'recorded_sec']) {
+        expect([null, 75.534, 53.2, 17.6]).toContain(attempt[key]);
+      }
+    }
+    // Neither provider ids nor storage keys cross the boundary.
+    const body = JSON.stringify(res.body);
+    expect(body).not.toContain('EG_worker_');
+    expect(body).not.toContain('worker.mp3');
+  });
+
+  it('a 0115 leg: observed end, true audio length, anchor and a flushed tail', async () => {
+    sessionRows = [parentSession()];
+    attempts = [workerLeg(LEG_A, {
+      admitted_at: '2026-10-07T04:00:00.000Z',
+      answered_at: '2026-10-07T04:00:10.000Z',
+      // The reconciler saw it ~14 s later; the observed leave wins.
+      ended_at: '2026-10-07T04:01:24.000Z',
+      observed_ended_at: '2026-10-07T04:01:10.500Z',
+      state: 'ended',
+      outcome_class: 'disconnected',
+      recording_size_bytes: 480_000,
+      recording_duration_ms: 59_450,
+      recording_started_at_ms: 1_791_345_611_050,
+      recording_tail_flushed: true,
+    })];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.body.attempts[0]).toMatchObject({
+      connected_to: '2026-10-07T04:01:10.500Z',
+      connected_to_source: 'observed',
+      connected_sec: 60.5,
+      recorded_sec: 59.45,
+      recorded_sec_estimated: false,
+      recording_started_at_ms: 1_791_345_611_050,
+      tail_may_be_missing: false,
+    });
+  });
+
+  it('a 0115 leg whose fail-open flush was skipped still says the tail may be missing', async () => {
+    sessionRows = [parentSession()];
+    attempts = [workerLeg(LEG_A, {
+      admitted_at: '2026-10-07T04:00:00.000Z',
+      answered_at: '2026-10-07T04:00:10.000Z',
+      ended_at: '2026-10-07T04:01:24.000Z',
+      observed_ended_at: '2026-10-07T04:01:10.500Z',
+      state: 'ended',
+      outcome_class: 'disconnected',
+      recording_size_bytes: 400_000,
+      // The duration is known; the flush is independent of it.
+      recording_duration_ms: 50_000,
+      recording_tail_flushed: false,
+    })];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.body.attempts[0]).toMatchObject({ recorded_sec: 50, tail_may_be_missing: true });
+  });
+
+  it('32757295 shape: listed via recording_session_id, before consent, outcome as recorded, no truncation note', async () => {
+    sessionRows = [parentSession({ id: OTHER_SESSION, status: 'waiting' })];
+    attempts = [workerLeg(LEG_A, {
+      admitted_at: '2026-10-05T05:00:00.000Z',
+      answered_at: '2026-10-05T05:00:20.000Z',
+      ended_at: '2026-10-05T05:00:54.600Z',
+      state: 'ended',
+      outcome_class: 'voicemail',
+      session_id: null,
+      recording_session_id: OTHER_SESSION,
+      recording_size_bytes: 261_600,
+    })];
+    const res = await request(app())
+      .get(`/api/candidates/${CANDIDATE}/phone-attempts?session_id=${OTHER_SESSION}`);
+    expect(res.status).toBe(200);
+    expect(res.body.attempts).toHaveLength(1);
+    expect(res.body.attempts[0]).toMatchObject({
+      outcome_class: 'voicemail',
+      consent_stage: 'before_consent',
+      session_ref: OTHER_SESSION,
+      connected_to_source: 'ledger',
+      connected_sec: 34.6,
+      recorded_sec: 32.7,
+      recorded_sec_estimated: true,
+      // 34.6 - 32.7 < 3 s: the recording covers the call.
+      tail_may_be_missing: false,
+    });
+    // The session filter is applied, oldest first.
+    expect(cursorFilters).toContain(`session_id.eq.${OTHER_SESSION},recording_session_id.eq.${OTHER_SESSION}`);
+    expect(attemptOrders).toEqual([['admitted_at', true], ['id', true]]);
+  });
+
+  it('keeps the default listing newest first and combines a session filter with the cursor in ONE tree', async () => {
+    attempts = zeroAnswerShape();
+    await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(attemptOrders).toEqual([['admitted_at', false], ['id', false]]);
+    expect(cursorFilters).toEqual([]);
+
+    attemptOrders = [];
+    const cursor = Buffer.from(JSON.stringify({ admitted_at: '2026-10-06T03:30:30.000Z', id: LEG_A }), 'utf8')
+      .toString('base64url');
+    const res = await request(app())
+      .get(`/api/candidates/${CANDIDATE}/phone-attempts?session_id=${SESSION}&before=${cursor}`);
+    expect(res.status).toBe(200);
+    expect(cursorFilters).toEqual([
+      `and(or(session_id.eq.${SESSION},recording_session_id.eq.${SESSION}),`
+        + `or(admitted_at.gt.2026-10-06T03:30:30.000Z,and(admitted_at.eq.2026-10-06T03:30:30.000Z,id.gt.${LEG_A})))`,
+    ]);
+  });
+
+  it('rejects a session filter that is not a uuid before any read', async () => {
+    const tables: string[] = [];
+    vi.mocked(supabase.from).mockImplementation((table: string) => {
+      tables.push(table);
+      return chain(table, []) as never;
+    });
+    const res = await request(app())
+      .get(`/api/candidates/${CANDIDATE}/phone-attempts?session_id=${encodeURIComponent('x),id.not.is.null')}`);
+    expect(res.status).toBe(400);
+    expect(tables).not.toContain('phone_call_attempts');
+  });
+
+  it('withdrawn: a consented leg with its OWN candidate.opt_out event (C7-a lost race keeps it disconnected)', async () => {
+    sessionRows = [parentSession({ status: 'cancelled' })];
+    attempts = [{ ...row(IDS[0], TIED, true), outcome_class: 'disconnected' }];
+    events = [{ attempt_id: IDS[0], event_type: 'candidate.opt_out' }];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.body.attempts[0].consent_stage).toBe('consent_withdrawn');
+    // Recording kept and playable: the stage only labels it.
+    expect(res.body.attempts[0].recording).toEqual({ state: 'ready' });
+  });
+
+  it('withdrawn: a consented leg that ended opt_out', async () => {
+    sessionRows = [parentSession({ status: 'cancelled' })];
+    attempts = [{ ...row(IDS[0], TIED, true), outcome_class: 'opt_out' }];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.body.attempts[0].consent_stage).toBe('consent_withdrawn');
+  });
+
+  it('deferred: a consented leg ending callback_deferred, or named by callback.deferred_in_call, is not "withdrawn"', async () => {
+    sessionRows = [parentSession({ status: 'in_progress' })];
+    attempts = [
+      { ...row(IDS[0], TIED, true), outcome_class: 'callback_deferred' },
+      { ...row(IDS[1], TIED, true), outcome_class: 'disconnected' },
+    ];
+    events = [{ attempt_id: IDS[1], event_type: 'callback.deferred_in_call' }];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.body.attempts.map((a: { consent_stage: unknown }) => a.consent_stage))
+      .toEqual(['deferred_after_consent', 'deferred_after_consent']);
+  });
+
+  it('an EARLIER consented leg of an engagement that later opted out on another leg stays after_consent', async () => {
+    sessionRows = [parentSession({ status: 'cancelled' })];
+    attempts = [
+      { ...row(IDS[0], TIED, true), outcome_class: 'opt_out' },
+      { ...row(IDS[2], '2026-09-24T13:00:00.000Z', true), outcome_class: 'disconnected' },
+    ];
+    events = [{ attempt_id: IDS[0], event_type: 'candidate.opt_out' }];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.body.attempts.map((a: { consent_stage: unknown }) => a.consent_stage))
+      .toEqual(['consent_withdrawn', 'after_consent']);
+  });
+
+  it('a refused disclosure (opt_out) on an unbound leg is before consent, even under a completed parent', async () => {
+    sessionRows = [parentSession({ status: 'completed' })];
+    attempts = [{ ...row(IDS[0], TIED, true), session_id: null, recording_session_id: SESSION, outcome_class: 'opt_out' }];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.body.attempts[0].consent_stage).toBe('before_consent');
+  });
+
+  it('loads the leg facts in ONE batched query over the consent-bound legs only', async () => {
+    sessionRows = [parentSession()];
+    attempts = [
+      row(IDS[0], TIED, true),
+      row(IDS[1], TIED, true),
+      { ...row(IDS[2], '2026-09-24T13:00:00.000Z', true), session_id: null, recording_session_id: SESSION },
+    ];
+    const tables: string[] = [];
+    vi.mocked(supabase.from).mockImplementation((table: string) => {
+      tables.push(table);
+      return chain(table, table === 'phone_call_attempts' ? attempts : []) as never;
+    });
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.status).toBe(200);
+    expect(tables.filter((t) => t === 'phone_call_events')).toHaveLength(1);
+    expect(eventIns).toEqual([
+      ['attempt_id', [IDS[0], IDS[1]]],
+      ['event_type', ['candidate.opt_out', 'callback.deferred_in_call']],
+    ]);
+  });
+
+  it('fails the page (503) rather than calling a leg "after consent" when its facts cannot be read', async () => {
+    sessionRows = [parentSession()];
+    attempts = [row(IDS[0], TIED, true)];
+    eventsError = { message: 'pooler reset' };
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.status).toBe(503);
+    expect(res.body).not.toHaveProperty('attempts');
+  });
+
+  it('tells a non-owning interviewer nothing about the recording: no length, anchor or tail note', async () => {
+    sessionRows = [parentSession({ owner_id: 'someone-else' })];
+    attempts = zeroAnswerShape();
+    const res = await request(app('interviewer', 'owner-1')).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.status).toBe(200);
+    for (const attempt of res.body.attempts) {
+      expect(attempt).toMatchObject({
+        recorded_sec: null,
+        recorded_sec_estimated: false,
+        recording_started_at_ms: null,
+        tail_may_be_missing: false,
+      });
+    }
+    // The connected window is a call fact, as duration_sec always was.
+    expect(res.body.attempts[2].connected_sec).toBe(75.534);
+  });
+
+  it('a failed capture has no recorded length and no tail note', async () => {
+    sessionRows = [parentSession()];
+    attempts = [workerLeg(LEG_A, {
+      admitted_at: TIED,
+      answered_at: TIED,
+      ended_at: '2026-09-25T13:01:00.000Z',
+      state: 'ended',
+      outcome_class: 'disconnected',
+      recording_size_bytes: 100_000,
+      recording_duration_ms: 12_000,
+      recording_ready: false,
+      egress_status: 'failed',
+    })];
+    const res = await request(app()).get(`/api/candidates/${CANDIDATE}/phone-attempts`);
+    expect(res.body.attempts[0]).toMatchObject({
+      recorded_sec: null,
+      tail_may_be_missing: false,
+      recording: { state: 'unavailable', reason: 'recording_failed' },
+    });
   });
 });

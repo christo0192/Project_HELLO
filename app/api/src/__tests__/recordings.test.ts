@@ -77,7 +77,7 @@ vi.mock('../lib/supabase.js', () => ({
  *  records insert/update payloads for later assertions. */
 function chain(value: unknown, insertCalls: unknown[], updateCalls: unknown[]) {
   const c: Record<string, unknown> = {};
-  const methods = ['select', 'insert', 'update', 'delete', 'upsert', 'eq', 'is', 'single', 'maybeSingle', 'order', 'limit'];
+  const methods = ['select', 'insert', 'update', 'delete', 'upsert', 'eq', 'in', 'is', 'single', 'maybeSingle', 'order', 'limit'];
   for (const m of methods) {
     c[m] = (...args: unknown[]) => {
       if (m === 'insert') insertCalls.push(args[0]);
@@ -1912,8 +1912,13 @@ describe('GET /api/recordings/attempts/:attemptId/download (0107)', () => {
     mockCreateSignedUrl.mockResolvedValue({ data: { signedUrl: SIGNED_URL }, error: null });
   });
 
-  function configureAttempt(overrides: Record<string, unknown> = {}, session: Record<string, unknown> = {}) {
+  function configureAttempt(
+    overrides: Record<string, unknown> = {},
+    session: Record<string, unknown> = {},
+    events?: Array<Record<string, unknown>>,
+  ) {
     configureTables({
+      ...(events ? { phone_call_events: events } : {}),
       phone_call_attempts: {
         id: ATTEMPT,
         session_id: SESSION,
@@ -2093,6 +2098,76 @@ describe('GET /api/recordings/attempts/:attemptId/download (0107)', () => {
       expect(quarantined.status).toBe(409);
       expect(mockCreateSignedUrl).not.toHaveBeenCalled();
       expect(entries.filter((e) => e.event === 'recording.download')).toHaveLength(0);
+    });
+
+    // M013 S02 (D8): the per-leg consent facts, read by the SAME helper the
+    // attempt history uses. Every recording is kept; the audit says what the
+    // candidate did on THIS leg.
+    describe('per-leg withdrawal and deferral (M013 S02 D8)', () => {
+      async function mintAudit(): Promise<Record<string, any> | undefined> {
+        const entries: Array<Record<string, any>> = [];
+        const res = await request(appCapturingAudit('admin', 'admin-1', entries))
+          .get(`/api/recordings/attempts/${ATTEMPT}/download`)
+          .set('Authorization', AUTH_HEADER);
+        expect(res.status).toBe(200);
+        return entries.find((e) => e.event === 'recording.download')?.metadata;
+      }
+
+      it('flags a consented leg whose own candidate.opt_out event names it (C7-a lost race)', async () => {
+        // The lost-race post keeps the attempt `disconnected`; only the event
+        // names the attempt.
+        configureAttempt({ outcome_class: 'disconnected' }, { status: 'cancelled' }, [
+          { attempt_id: ATTEMPT, event_type: 'candidate.opt_out' },
+        ]);
+        const metadata = await mintAudit();
+        expect(metadata).toMatchObject({ scope: 'attempt', pre_consent: false, consent_withdrawn: true });
+        expect(metadata).not.toHaveProperty('deferred_after_consent');
+      });
+
+      it('flags a consented leg that ended opt_out without needing an event', async () => {
+        configureAttempt({ outcome_class: 'opt_out' }, { status: 'cancelled' }, []);
+        expect(await mintAudit()).toMatchObject({ pre_consent: false, consent_withdrawn: true });
+      });
+
+      it('flags an in-call callback deferral as deferred_after_consent, not withdrawn', async () => {
+        configureAttempt({ outcome_class: 'callback_deferred' }, { status: 'in_progress' }, []);
+        const metadata = await mintAudit();
+        expect(metadata).toMatchObject({ pre_consent: false, deferred_after_consent: true });
+        expect(metadata).not.toHaveProperty('consent_withdrawn');
+      });
+
+      it('ignores another leg\'s events: only this attempt id counts', async () => {
+        configureAttempt({ outcome_class: 'completed' }, { status: 'completed' }, [
+          { attempt_id: '00000000-0000-4000-8000-0000000000ee', event_type: 'candidate.opt_out' },
+        ]);
+        const metadata = await mintAudit();
+        expect(metadata).toMatchObject({ pre_consent: false });
+        expect(metadata).not.toHaveProperty('consent_withdrawn');
+        expect(metadata).not.toHaveProperty('deferred_after_consent');
+      });
+
+      it('reports pre_consent unknown (null) when the leg facts cannot be read, never a confident false', async () => {
+        configureAttempt({ outcome_class: 'completed' }, { status: 'completed' });
+        const base = mockFrom.getMockImplementation()!;
+        mockFrom.mockImplementation((table: string) => table === 'phone_call_events'
+          ? chain({ data: null, error: { message: 'pooler reset' } }, insertCalls, updateCalls)
+          : base(table));
+        const metadata = await mintAudit();
+        expect(metadata).toMatchObject({ pre_consent: null });
+        expect(metadata).not.toHaveProperty('consent_withdrawn');
+      });
+
+      it('never reads leg events for an unbound (pre-consent) leg', async () => {
+        configureAttempt({ session_id: null, recording_session_id: SESSION, outcome_class: 'opt_out' }, { status: 'completed' }, [
+          { attempt_id: ATTEMPT, event_type: 'candidate.opt_out' },
+        ]);
+        const tables: string[] = [];
+        const base = mockFrom.getMockImplementation()!;
+        mockFrom.mockImplementation((table: string) => { tables.push(table); return base(table); });
+        // A refused disclosure (opt_out) on an unbound leg is BEFORE consent.
+        expect(await mintAudit()).toMatchObject({ pre_consent: true });
+        expect(tables).not.toContain('phone_call_events');
+      });
     });
   });
 
