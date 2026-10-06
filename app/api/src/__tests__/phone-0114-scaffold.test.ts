@@ -76,11 +76,14 @@ describe('0114 registration', () => {
     expect(names.filter((n) => n === '0114')).toHaveLength(1);
   });
 
-  it('points at 0114_phone_outcome_integrity.sql and is the newest migration file', () => {
+  it('points at 0114_phone_outcome_integrity.sql and is the newest phone migration file', () => {
     expect(path.basename(MIGRATION_0114_PATH)).toBe('0114_phone_outcome_integrity.sql');
     const files = readdirSync(MIGRATIONS).filter((f) => /^\d{4}_.*\.sql$/.test(f)).sort();
     expect(files.filter((f) => f.startsWith('0114_'))).toEqual(['0114_phone_outcome_integrity.sql']);
-    expect(files[files.length - 1]).toBe('0114_phone_outcome_integrity.sql');
+    // Same relaxation #329 applied to 0113. 0114 stays the newest PHONE migration,
+    // and only R1-lane migrations (0115+, `_r1_` in the name) may follow it.
+    const after = files.slice(files.indexOf('0114_phone_outcome_integrity.sql') + 1);
+    expect(after.every((f) => /_r1_/.test(f))).toBe(true);
   });
 });
 

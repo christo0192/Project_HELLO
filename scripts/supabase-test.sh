@@ -786,7 +786,9 @@ log '0096: PASS — a connected call inside the grace is spared and one past it 
 # reuses this local Supabase database; it does not build permissive stubs.
 # =====================================================================
 log '0115/0116: R1 full-chain admission, privacy, Ashby and capacity assertions...'
-SUPABASE_DB_CONTAINER="$SUPABASE_DB_CONTAINER" bash scripts/test-r1-foundation.sh 2>&1 | tee -a "$RESULTS_FILE"
+# SUPABASE_DB_CONTAINER is readonly in this script, so a `VAR=value cmd` prefix
+# is rejected; `env` passes it to the child process instead.
+env SUPABASE_DB_CONTAINER="$SUPABASE_DB_CONTAINER" bash scripts/test-r1-foundation.sh 2>&1 | tee -a "$RESULTS_FILE"
 if [ "${PIPESTATUS[0]}" -ne 0 ]; then
   log 'ERROR: 0115/0116 R1 full-chain assertions FAILED.'
   exit 1
