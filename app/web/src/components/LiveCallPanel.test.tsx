@@ -4,7 +4,7 @@
 
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { act, render, screen } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { LiveCallPanel } from './LiveCallPanel';
 
@@ -108,10 +108,19 @@ describe('LiveCallPanel', () => {
       <LiveCallPanel candidateId="candidate-1" candidateName="Jane Doe" />,
     );
     await screen.findByRole('region', { name: 'Live transcript' });
+    // The live region is committed when the session is adopted; its nested
+    // effect installs the session channel one React effect tick later. Wait
+    // for the observable subscription instead of racing it in CI.
+    await waitFor(() => {
+      expect(
+        rt.listeners.find(
+          (l) => l.type === 'broadcast' && l.filter.event === 'interim',
+        ),
+      ).toBeDefined();
+    });
     const interim = rt.listeners.find(
       (l) => l.type === 'broadcast' && l.filter.event === 'interim',
     );
-    expect(interim).toBeDefined();
     act(() => interim!.handler({ payload: { text: 'I have five years in support' } }));
 
     const words = await screen.findByText(/I have five years in support/);
