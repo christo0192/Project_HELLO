@@ -35,11 +35,20 @@ fly ips allocate-v4 -a project-hello-r1-rtc-spike
 fly secrets set -a project-hello-r1-rtc-spike \
   LIVEKIT_KEYS="r1-spike:$(openssl rand -base64 48)" \
   NODE_IP=replace_me   # the dedicated IPv4 printed by `fly ips allocate-v4`
-fly deploy --ha=false --config infra/livekit-r1/fly.toml
+fly deploy infra/livekit-r1 --ha=false --remote-only -a project-hello-r1-rtc-spike
 ```
 
 `--ha=false` is required: Redis is intentionally absent, and Fly routes UDP per
 packet rather than by flow. Do not add a second Machine or a UDP port range.
+The build context must be `infra/livekit-r1`; the old root-context `--config`
+form cannot find `/entrypoint.sh` during the Docker build.
+
+The SFU scripts and templates are pinned to LF in `.gitattributes`, and the
+Dockerfile removes CRLF defensively: a CRLF entrypoint makes its shebang
+`/bin/sh\r`, which Fly reports as “No such file or directory”. The entrypoint
+also unsets `LIVEKIT_KEYS` before it starts LiveKit. The rendered YAML already
+contains the validated key mapping, while the environment variable uses a
+different format that would otherwise collide with LiveKit's own parser.
 
 Before every deploy or repeat, prove the existing app has exactly one Machine
 in `sin`; this script accepts captured JSON too and never invokes Fly itself:

@@ -28,7 +28,7 @@ case "$NODE_IP" in
   *[!0-9.]* | .* | *..* | '') die "NODE_IP must be an IPv4 address" ;;
 esac
 
-RTC_IPS=""
+FGS=""
 if [ "$R1_CONFIG" = "B" ]; then
   # `getent hosts` resolves Fly's per-Machine reply-source address, not public
   # DNS. Docker lacks that hostname, so the override is local-only (above).
@@ -42,7 +42,6 @@ if [ "$R1_CONFIG" = "B" ]; then
   case "$FGS" in
     *[!0-9.]* | .* | *..* | '') die "fly-global-services returned an invalid IPv4 address" ;;
   esac
-  RTC_IPS="  ips:\n    includes:\n      - \"${FGS}/32\""
 fi
 
 # A mapping line is accepted, rather than arbitrary YAML, so a malformed or
@@ -58,11 +57,51 @@ KEYS_YAML="$KEY_NAME: $KEY_SECRET"
 
 umask 077
 CONFIG_FILE=/tmp/livekit.yaml
-sed \
-  -e "s|__NODE_IP__|$NODE_IP|g" \
-  -e "/__RTC_IPS__/c\\$RTC_IPS" \
-  -e "s|__LIVEKIT_KEYS__|$KEYS_YAML|g" \
-  /etc/livekit/livekit.yaml.tmpl > "$CONFIG_FILE"
+TEMPLATE_FILE=/etc/livekit/livekit.yaml.tmpl
+# Render-only mode deliberately works from a checkout too, so the rendering
+# contract can be tested without building or running the image.
+if [ "${LIVEKIT_R1_RENDER_ONLY:-}" = "1" ] && [ ! -f "$TEMPLATE_FILE" ]; then
+  TEMPLATE_FILE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/livekit.yaml.tmpl"
+fi
+[ -r "$TEMPLATE_FILE" ] || die "LiveKit configuration template is unreadable: $TEMPLATE_FILE"
+
+# The template has a standalone marker for the optional Config-B block. Render
+# line-by-line instead of sed's multi-line `c\` command: an empty Config-A
+# replacement can consume the following sed expression, and literal newlines
+# are not portable across sed implementations.
+if [ "${LIVEKIT_R1_RENDER_ONLY:-}" = "1" ]; then
+  KEYS_YAML="$KEY_NAME: REDACTED"
+fi
+awk -v node_ip="$NODE_IP" -v keys_yaml="$KEYS_YAML" -v r1_config="$R1_CONFIG" -v fgs="$FGS" '
+  /__RTC_IPS__/ {
+    if (r1_config == "B") {
+      print "  ips:"
+      print "    includes:"
+      print "      - \"" fgs "/32\""
+    }
+    next
+  }
+  {
+    gsub(/__NODE_IP__/, node_ip)
+    sub(/__LIVEKIT_KEYS__/, keys_yaml)
+    print
+  }
+' "$TEMPLATE_FILE" > "$CONFIG_FILE"
+
+if [ "${LIVEKIT_R1_RENDER_ONLY:-}" = "1" ]; then
+  cat "$CONFIG_FILE"
+  exit 0
+fi
+
+if sysctl -w net.core.rmem_max=5000000 net.core.rmem_default=5000000 >/dev/null 2>&1; then
+  echo "livekit-r1-entrypoint: set UDP receive buffers to 5000000" >&2
+else
+  echo "livekit-r1-entrypoint: could not set UDP receive buffers to 5000000; continuing" >&2
+fi
 
 echo "livekit-r1-entrypoint: Config ${R1_CONFIG}; advertising ${NODE_IP}:7882" >&2
+# livekit-server also reads LIVEKIT_KEYS from the environment, in its own
+# "key: secret" format, which conflicts with our validated form. The keys are
+# already rendered into $CONFIG_FILE, so drop the env copy.
+unset LIVEKIT_KEYS
 exec /livekit-server --config "$CONFIG_FILE"

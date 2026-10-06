@@ -9,6 +9,9 @@ RUN apk add --no-cache musl-utils
 
 COPY livekit.yaml.tmpl /etc/livekit/livekit.yaml.tmpl
 COPY entrypoint.sh /usr/local/bin/livekit-r1-entrypoint
-RUN chmod 0755 /usr/local/bin/livekit-r1-entrypoint
+# Docker build contexts copied from a Windows checkout can retain CRLF; remove
+# it defensively so the shell shebang never becomes /bin/sh\\r on Fly.
+RUN sed -i 's/\r$//' /etc/livekit/livekit.yaml.tmpl /usr/local/bin/livekit-r1-entrypoint \
+ && chmod 0755 /usr/local/bin/livekit-r1-entrypoint
 
 ENTRYPOINT ["/usr/local/bin/livekit-r1-entrypoint"]

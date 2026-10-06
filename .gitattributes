@@ -1,2 +1,5 @@
 app/api/src/__tests__/fixtures/*.pdf binary
 app/api/src/__tests__/fixtures/*.docx binary
+infra/livekit-r1/**/*.sh text eol=lf
+infra/livekit-r1/*.tmpl text eol=lf
+infra/livekit-r1/spike/*.py text eol=lf
