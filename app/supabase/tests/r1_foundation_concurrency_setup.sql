@@ -1,13 +1,7 @@
--- Two distinct eligible rounds contend for the same 55-minute monthly hold.
+-- Two distinct eligible candidates contend for the same 55-minute Send-R1 hold.
 insert into screening_v2.candidates (id, role_id, name) values
   ('20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000002', 'race one'),
   ('20000000-0000-4000-8000-000000000002', '10000000-0000-4000-8000-000000000002', 'race two');
-insert into screening_v2.interview_rounds (id, candidate_id, role_id, link_token_digest, expires_at, created_by) values
-  ('20000000-0000-4000-8000-000000000003', '20000000-0000-4000-8000-000000000001', '10000000-0000-4000-8000-000000000002', encode(sha256('r1-race-round-one'::bytea), 'hex'), now() + interval '1 day', '10000000-0000-4000-8000-000000000001'),
-  ('20000000-0000-4000-8000-000000000004', '20000000-0000-4000-8000-000000000002', '10000000-0000-4000-8000-000000000002', encode(sha256('r1-race-round-two'::bytea), 'hex'), now() + interval '1 day', '10000000-0000-4000-8000-000000000001');
-insert into screening_v2.interview_round_consents (round_id, template_id) values
-  ('20000000-0000-4000-8000-000000000003', '10000000-0000-4000-8000-000000000052'),
-  ('20000000-0000-4000-8000-000000000004', '10000000-0000-4000-8000-000000000052');
 -- This creates genuine first-of-month contention: neither caller can observe a
 -- pre-existing budget row before the blocker releases the settings lock.
 delete from screening_v2.r1_budget_month where month_start = date_trunc('month', now())::date;

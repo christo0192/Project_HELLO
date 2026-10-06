@@ -27,7 +27,7 @@ import { extractBearerToken, resolveFullAuth } from '../lib/auth.js';
 import type { AuthUser } from '../lib/auth.js';
 import { createSession, transitionSession } from '../lib/session-lifecycle.js';
 import { getCorrelationId } from '../lib/correlation.js';
-import { handleRecordingGrant } from './invites.js';
+import { handleRecordingGrant, validateRecordingGrant } from './invites.js';
 import { runAssessment } from '../services/assessment.js';
 import { resolveWorkerContext, ERR_DB_FAILED } from '../lib/worker-context.js';
 import {
@@ -57,7 +57,10 @@ export const livekitRouter = Router();
 /** Additive R1 fence: legacy browser recording/completion paths must never
  * operate on an R1-bound session. Phone rows have NULL interview_round_id. */
 async function rejectR1Session(sessionId: string, res: import('express').Response): Promise<boolean> {
-  const { data } = await supabase.from('call_sessions').select('interview_round_id').eq('id', sessionId).maybeSingle();
+  const { data, error } = await supabase.from('call_sessions').select('interview_round_id').eq('id', sessionId).maybeSingle();
+  // This is an isolation boundary, not a best-effort feature flag.  An
+  // indeterminate lookup must never permit legacy mutation or scoring.
+  if (error) { res.status(503).json({ error: 'service_unavailable' }); return true; }
   if (data?.interview_round_id) { res.status(409).json({ error: 'r1_session' }); return true; }
   return false;
 }
@@ -359,6 +362,9 @@ livekitRouter.post(
   async (req, res, next) => {
     try {
       const { grant_token, session_id } = req.body as { grant_token: string; session_id: string };
+      // Preserve the old authentication ordering: a bad/missing candidate
+      // grant must be rejected without consulting R1 state.
+      await validateRecordingGrant(grant_token, session_id);
       if (await rejectR1Session(session_id, res)) return;
 
       // ── Revocation/quarantine/deleted gate (REC-05, invariant 7) ──
@@ -385,6 +391,8 @@ livekitRouter.post(
         return res.status(403).json({ error: 'access_denied' });
       }
 
+      // Auth was intentionally validated above; this repeats the pure
+      // validation defensively before the mint operation.
       const result = await handleRecordingGrant(grant_token, session_id);
       res.json(result);
     } catch (error: any) {
@@ -434,7 +442,6 @@ livekitRouter.post(
   async (req, res, next) => {
     try {
       const sessionId = req.params.sessionId;
-      if (await rejectR1Session(sessionId, res)) return;
       const grantHeader = req.headers['x-grant-token'];
       const grantToken = typeof grantHeader === 'string' && /^[a-f0-9]{64}$/.test(grantHeader)
         ? grantHeader
@@ -448,6 +455,7 @@ livekitRouter.post(
       if (!validation.ok || validation.payload.session_id !== sessionId) {
         return res.status(403).json({ error: 'access_denied' });
       }
+      if (await rejectR1Session(sessionId, res)) return;
 
       const { data: session, error: sessionErr } = await supabase
         .from('call_sessions')
@@ -538,7 +546,6 @@ livekitRouter.post(
   async (req, res, next) => {
     try {
       const sessionId = req.params.sessionId;
-      if (await rejectR1Session(sessionId, res)) return;
       const file = req.file!;
       let user = req.authUser;
 
@@ -566,6 +573,11 @@ livekitRouter.post(
         }
         user = auth.user;
       }
+
+      // Authentication (candidate grant or recruiter bearer) is intentionally
+      // complete before the R1 fence.  Invalid credentials therefore keep the
+      // exact legacy response and do not query call_sessions for the fence.
+      if (await rejectR1Session(sessionId, res)) return;
 
       // ── Fetch session for preflight gates in one query (F-D repair) ─
       const { data: session, error: sessionErr } = await supabase

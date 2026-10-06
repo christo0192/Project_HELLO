@@ -34,21 +34,19 @@ describe('legacy paths fence R1 sessions', () => {
     mocks.runner.mockRejectedValue(new Error('r1_session'));
   });
 
-  it('returns 409 before legacy completion and recording-grant work', async () => {
+  it('preserves legacy authentication responses before the R1 fence', async () => {
     const app = express();
     app.use(express.json());
     app.use('/api/livekit', livekitRouter);
     const complete = await request(app).post(`/api/livekit/${SESSION}/complete`);
-    expect(complete.status).toBe(409);
-    expect(complete.body).toEqual({ error: 'r1_session' });
-    const grant = await request(app).post('/api/livekit/grant/recording')
-      .send({ session_id: SESSION, grant_token: 'a'.repeat(64) });
-    expect(grant.status).toBe(409);
-    expect(grant.body).toEqual({ error: 'r1_session' });
+    expect(complete.status).toBe(403);
+    expect(complete.body).toEqual({ error: 'access_denied' });
+    expect(mocks.from).not.toHaveBeenCalled();
     const upload = await request(app).post(`/api/livekit/${SESSION}/recording`)
       .attach('file', Buffer.from('not inspected because R1 is fenced'), 'recording.webm');
-    expect(upload.status).toBe(409);
-    expect(upload.body).toEqual({ error: 'r1_session' });
+    expect(upload.status).toBe(401);
+    expect(upload.body).toEqual({ error: 'authentication_required' });
+    expect(mocks.from).not.toHaveBeenCalled();
   });
 
   it('maps R1 scorer fences to 409 for recruiter and worker callers', async () => {

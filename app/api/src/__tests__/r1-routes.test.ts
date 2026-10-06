@@ -3,9 +3,9 @@ import express, { type NextFunction, type Request, type Response } from 'express
 import request from 'supertest';
 import { createHash } from 'node:crypto';
 
-const mocks = vi.hoisted(() => ({ from: vi.fn() }));
-const { from } = mocks;
-vi.mock('../lib/supabase.js', () => ({ supabase: { from: mocks.from } }));
+const mocks = vi.hoisted(() => ({ from: vi.fn(), rpc: vi.fn() }));
+const { from, rpc } = mocks;
+vi.mock('../lib/supabase.js', () => ({ supabase: { from: mocks.from, rpc: mocks.rpc } }));
 
 import { r1InternalRouter, r1Router } from '../routes/r1.js';
 import { getAuditSink, setAuditSink, type AuditEntry } from '../lib/audit.js';
@@ -65,6 +65,30 @@ function baseTables(): Tables {
 
 function appFor(role: 'admin' | 'interviewer' | 'viewer', id = OWNER, tables = baseTables()) {
   from.mockImplementation((table: string) => query(table, tables));
+  rpc.mockImplementation(async (fn: string, args: any) => {
+    if (fn === 'r1_send_round') {
+      const settings = tables.r1_settings[0];
+      if (!settings.enabled || settings.paused) return { data: { status: settings.paused ? 'paused' : 'disabled' }, error: null };
+      if ((tables.r1_budget_month[0]?.minutes_used ?? 0) + 55 > Math.min(settings.monthly_cap_minutes, settings.pause_line_minutes)) return { data: { status: 'capacity_exhausted' }, error: null };
+      if (tables.phone_engagements.some((x) => ['pending_prereqs', 'eligible', 'scheduled', 'dialing', 'in_call', 'reconnecting', 'awaiting_retry'].includes(x.state))) return { data: { status: 'phone_engagement_active' }, error: null };
+      if (tables.call_sessions.some((s) => s.mode === 'live') && tables.job_queue.some((j) => j.name === 'phone.assessment')) return { data: { status: 'phone_assessment_pending' }, error: null };
+      const row = { id: `round-${tables.interview_rounds.length + 1}`, status: 'invited', candidate_id: args.p_candidate_id, role_id: args.p_role_id, created_by: args.p_created_by, link_token_digest: args.p_link_token_digest, expires_at: args.p_expires_at, held_minutes: 55 };
+      tables.interview_rounds.push(row); tables.r1_budget_month[0].minutes_reserved += 55;
+      return { data: { status: 'ok', id: row.id, round_status: row.status, expires_at: row.expires_at }, error: null };
+    }
+    if (fn === 'r1_transition_round') {
+      const row = tables.interview_rounds.find((r) => r.id === args.p_round_id);
+      if (!row || row.version !== args.p_expected_version) return { data: { status: 'version_conflict' }, error: null };
+      if (args.p_action === 'reissue' && row.status !== 'invited') return { data: { status: 'round_terminal' }, error: null };
+      if (args.p_action === 'grant-retake' && !(row.status === 'completed' && row.attempts_counted === 1 && row.attempts_allowed > 1)) return { data: { status: 'retake_not_allowed' }, error: null };
+      if (args.p_action === 'cancel') row.status = 'cancelled';
+      if (args.p_action === 'grant-retake') { row.status = 'invited'; row.expires_at = args.p_expires_at; }
+      if (args.p_action === 'reissue') { row.link_token_digest = args.p_link_token_digest; row.expires_at = args.p_expires_at; }
+      row.version += 1; return { data: { status: 'ok' }, error: null };
+    }
+    if (fn === 'r1_record_usage') { const duplicate = tables.r1_usage_ledger.some((r) => r.session_id === args.p_session_id && r.event_key === args.p_event_key); if (!duplicate) tables.r1_usage_ledger.push({ session_id: args.p_session_id, round_id: args.p_round_id, participant_kind: args.p_participant_kind, event: args.p_event, seconds: args.p_seconds, event_key: args.p_event_key }); return { data: { duplicate }, error: null }; }
+    return { data: null, error: null };
+  });
   const app = express();
   app.use(express.json());
   app.use((req: Request, _res: Response, next: NextFunction) => {
@@ -77,6 +101,7 @@ function appFor(role: 'admin' | 'interviewer' | 'viewer', id = OWNER, tables = b
 
 function internalApp(tables = baseTables()) {
   from.mockImplementation((table: string) => query(table, tables));
+  rpc.mockImplementation(async (fn: string, args: any) => { if (fn === 'r1_record_usage') { const duplicate = tables.r1_usage_ledger.some((row) => row.session_id === args.p_session_id && row.event_key === args.p_event_key); if (!duplicate) tables.r1_usage_ledger.push({ session_id: args.p_session_id, event_key: args.p_event_key }); return { data: { duplicate }, error: null }; } return { data: null, error: null }; });
   const app = express();
   app.use(express.json());
   app.use('/api/internal/r1', r1InternalRouter);
@@ -91,6 +116,7 @@ describe('R1 recruiter routes', () => {
     process.env.R1_ENABLED = 'true';
     process.env.WORKER_CONTEXT_SECRET = SECRET;
     from.mockReset();
+    rpc.mockReset();
     audits = [];
     originalSink = getAuditSink();
     setAuditSink((entry) => { audits.push(entry); });
@@ -158,6 +184,7 @@ describe('R1 recruiter routes', () => {
     expect(live.status).toBe(200);
     expect(tables.interview_rounds[0].link_token_digest).not.toBe('a'.repeat(64));
     expect(live.headers['cache-control']).toContain('no-store');
+    tables.interview_rounds[0].status = 'completed';
     const retake = await request(app).post(`/api/interview-rounds/${ROUND}/grant-retake`);
     expect(retake.status).toBe(200);
     tables.interview_rounds[0].attempts_counted = 2;
@@ -171,6 +198,12 @@ describe('R1 recruiter routes', () => {
     expect(response.status).toBe(200);
     expect(tables.r1_settings[0]).toMatchObject({ paused: true, livekit_target: 'r1', updated_by: OWNER });
     expect(audits.some((entry) => entry.event === 'resource.update' && entry.metadata?.resource === 'r1_settings')).toBe(true);
+  });
+
+  it.each([{ monthly_cap_minutes: 0 }, { pause_line_minutes: 1.5 }, { advance_threshold: 101 }, { hold_threshold: -1 }, { dashboard_minutes: -1 }, { livekit_target: 'elsewhere' }])('rejects invalid settings %#', async (body) => {
+    const response = await request(appFor('admin').app).put('/api/admin/r1/settings').send(body);
+    expect(response.status).toBe(400);
+    expect(response.body).toEqual({ error: 'invalid_r1_settings' });
   });
 });
 
@@ -207,7 +240,16 @@ describe('R1 internal worker routes', () => {
     expect(context.body.first_name).toBe('Ava');
     expect(JSON.stringify(context.body)).not.toMatch(/resume|o'neil/i);
     expect((await request(app).post('/api/internal/r1/usage').set('authorization', `Bearer ${SECRET}`).send({ room, participant_kind: 'candidate', seconds: -1 })).status).toBe(400);
-    expect((await request(app).post('/api/internal/r1/usage').set('authorization', `Bearer ${SECRET}`).send({ room, participant_kind: 'candidate', seconds: 12, event: 'disconnect' })).status).toBe(201);
-    expect(tables.r1_usage_ledger[0]).toMatchObject({ session_id: SESSION, participant_kind: 'candidate', event: 'disconnect', seconds: 12 });
+    expect((await request(app).post('/api/internal/r1/usage').set('authorization', `Bearer ${SECRET}`).send({ room, participant_kind: 'candidate', seconds: 12, event: 'disconnect', event_key: 'first' })).status).toBe(201);
+    expect((await request(app).post('/api/internal/r1/usage').set('authorization', `Bearer ${SECRET}`).send({ room, participant_kind: 'candidate', seconds: 12, event: 'disconnect', event_key: 'first' })).status).toBe(200);
+    expect(tables.r1_usage_ledger).toHaveLength(1);
+    expect((await request(app).post('/api/internal/r1/usage').set('authorization', `Bearer ${SECRET}`).send({ room, participant_kind: 'preflight', seconds: 16, event_key: 'bad' })).status).toBe(400);
+  });
+
+  it.each(['\u{1f600}', 'Robert; DROP TABLE candidates;--', 'a'.repeat(100), 'नमस्ते'])('falls back safely for unsafe worker names: %s', async (name) => {
+    const tables = readyTables(); tables.candidates[0].name = name;
+    const response = await request(internalApp(tables).app).post('/api/internal/r1/context').set('authorization', `Bearer ${SECRET}`).send({ room: `screening-${SESSION}` });
+    expect(response.status).toBe(200);
+    expect(response.body.first_name).toBe('there');
   });
 });

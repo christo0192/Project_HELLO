@@ -310,6 +310,31 @@ begin
 end;
 $$;
 
+-- 0117: Send itself reserves capacity atomically; cancel/expiry release the
+-- round-owned hold.  These are SQL assertions over the applied functions, not
+-- route mocks.
+do $$
+declare
+  owner constant uuid := '10000000-0000-4000-8000-000000000001';
+  role_r1 constant uuid := '10000000-0000-4000-8000-000000000002';
+  candidate constant uuid := '10000000-0000-4000-8000-000000000081';
+  sent jsonb; rid uuid; before_reserved numeric; after_reserved numeric;
+begin
+  insert into screening_v2.candidates(id,role_id,name) values(candidate,role_r1,'hold assertion');
+  update screening_v2.r1_settings set enabled=true,paused=false,livekit_target='r1',monthly_cap_minutes=10000,pause_line_minutes=10000,dashboard_minutes=0,dashboard_read_at=now();
+  select minutes_reserved into before_reserved from screening_v2.r1_budget_month where month_start=date_trunc('month',now())::date;
+  sent := screening_v2.r1_send_round(candidate,role_r1,owner,repeat('8',64),null,now()+interval '1 hour');
+  rid := (sent->>'id')::uuid;
+  select minutes_reserved into after_reserved from screening_v2.r1_budget_month where month_start=date_trunc('month',now())::date;
+  perform _r1_tests.assert('Send R1 atomically inserts a round and reserves exactly its hold', sent->>'status'='ok' and (select held_minutes=55 from screening_v2.interview_rounds where id=rid) and after_reserved=before_reserved+55, sent::text);
+  perform screening_v2.r1_transition_round(rid,'cancel',1,null,null);
+  perform _r1_tests.assert('cancel releases the round hold', (select held_minutes=0 from screening_v2.interview_rounds where id=rid) and (select minutes_reserved=after_reserved-55 from screening_v2.r1_budget_month where month_start=date_trunc('month',now())::date));
+  -- The view must include sessions with no usage row (session-timestamp fallback).
+  perform _r1_tests.assert('estimate has session timestamp fallback', exists(select 1 from screening_v2.v_webrtc_minutes_estimate where month_start=date_trunc('month',now())::date));
+  perform _r1_tests.assert('ledger has required idempotency and upper-bound constraints', exists(select 1 from pg_constraint where conrelid='screening_v2.r1_usage_ledger'::regclass and conname='chk_r1_usage_event_bounds') and exists(select 1 from pg_indexes where schemaname='screening_v2' and indexname='uq_r1_usage_ledger_session_event_key'));
+end;
+$$;
+
 -- M2: worker-only append tables remain RLS-protected, while capacity views
 -- execute as the caller and cannot be used as a write path into phone/legacy
 -- sources. These are catalog assertions against the applied full chain, not

@@ -42,6 +42,9 @@ const assessmentLog = createLogger('assessment');
  * the authoritative `conversation_complete` terminal reason.
  */
 export const ERR_SESSION_NOT_COMPLETED = 'ERR_SESSION_NOT_COMPLETED';
+/** The R1 isolation read is unavailable; callers must fail closed before any
+ * legacy scoring work. */
+export const ERR_R1_FENCE_UNAVAILABLE = 'ERR_R1_FENCE_UNAVAILABLE';
 
 /**
  * Phase 4: a RESCORE was requested for a session whose role has no active v2
@@ -159,7 +162,11 @@ async function runAssessmentImpl(
     .select('id,candidate_id,owner_id,role_id,status,terminal_reason,external_call_id,started_at,interview_round_id')
     .eq('id', sessionId)
     .single();
-  if (sErr || !session) throw new Error(`session not found: ${sErr?.message}`);
+  // PostgREST represents a missing .single() row as PGRST116.  That remains
+  // the established not-found outcome; every other lookup failure is an
+  // indeterminate R1 fence and must fail closed.
+  if (sErr && (sErr as any).code !== 'PGRST116' && !/not found/i.test(sErr.message ?? '')) throw new Error(ERR_R1_FENCE_UNAVAILABLE);
+  if (!session) throw new Error('session not found');
   if (session.interview_round_id) throw new Error('r1_session');
 
   // ── THE SOURCE IS DERIVED, NOT TRUSTED ──────────────────────────────

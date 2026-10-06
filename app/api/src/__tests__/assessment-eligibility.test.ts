@@ -317,11 +317,12 @@ describe('VOI-08 assessment eligibility preflight', () => {
   //  3. NOT_FOUND — existing session-not-found error preserved
   // ══════════════════════════════════════════════════════════════════
 
-  it('rejects with the existing session-not-found error and never reaches the provider', async () => {
-    // DB error case
+  it('fails closed on a fence DB error and never reaches the provider', async () => {
+    // An indeterminate session/R1 fence is service-unavailable, never a
+    // best-effort legacy score.
     resetTracking();
     configureTable('call_sessions', { data: null, error: { message: 'row missing' } });
-    await expect(runAssessment(SESSION_ID)).rejects.toThrow(/session not found/);
+    await expect(runAssessment(SESSION_ID)).rejects.toThrow(/ERR_R1_FENCE_UNAVAILABLE/);
     expect(runClaudeJSONWithProvenance).not.toHaveBeenCalled();
     expect(fromCalls('transcript_turns')).toBe(0);
     expect(fromCalls('assessments')).toBe(0);

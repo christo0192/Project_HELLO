@@ -601,21 +601,25 @@ invitesRouter.post(
 // ── POST /api/livekit/grant/recording ────────────────────────────────
 // Validate grant and return short-lived signed recording URL.
 
+/** Validate only the candidate grant.  The LiveKit route deliberately does this
+ * before its R1 fence so invalid legacy credentials retain their old response
+ * and never cause an R1 lookup. */
+export async function validateRecordingGrant(
+  grantToken: string,
+  sessionId: string,
+): Promise<void> {
+  const { validateGrant } = await import('../lib/candidate-access.js');
+  const validation = await validateGrant(grantToken);
+  if (!validation.ok || validation.payload.session_id !== sessionId) {
+    throw Object.assign(new Error('ERR_GRANT_BINDING'), { statusCode: 403 });
+  }
+}
+
 export async function handleRecordingGrant(
   grantToken: string,
   sessionId: string,
 ): Promise<{ url: string }> {
-  const { validateGrant } = await import('../lib/candidate-access.js');
-
-  const validation = await validateGrant(grantToken);
-  if (!validation.ok) {
-    throw Object.assign(new Error(validation.code), { statusCode: 403 });
-  }
-
-  // Compare request session_id AND room_name independently, not payload to itself.
-  if (validation.payload.session_id !== sessionId) {
-    throw Object.assign(new Error('ERR_GRANT_BINDING'), { statusCode: 403 });
-  }
+  await validateRecordingGrant(grantToken, sessionId);
 
   // Look up recording object key from session
   const { data: session } = await supabase
