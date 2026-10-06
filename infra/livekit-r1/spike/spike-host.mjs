@@ -16,6 +16,9 @@ export function assertSpikeUrl(value, name = "R1_SPIKE_URL") {
   if (
     !["wss:", "https:"].includes(parsed.protocol)
     || parsed.hostname.toLowerCase() !== SPIKE_HOST
+    // Empty userinfo (`@host`, `:@host`) parses to falsy username/password,
+    // so reject any `@` in the raw authority as well.
+    || authority.includes("@")
     || parsed.username
     || parsed.password
     || parsed.port

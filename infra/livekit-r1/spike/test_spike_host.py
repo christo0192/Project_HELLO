@@ -17,6 +17,8 @@ class SpikeHostTests(unittest.TestCase):
             f"wss://{SPIKE_HOST}.evil.com",
             f"wss://evil{SPIKE_HOST}",
             f"wss://user@{SPIKE_HOST}",
+            f"wss://@{SPIKE_HOST}",
+            f"wss://:@{SPIKE_HOST}",
             f"wss://{SPIKE_HOST}:7880",
             f"https://{SPIKE_HOST}:443",
             f"http://{SPIKE_HOST}",

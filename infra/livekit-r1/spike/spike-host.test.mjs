@@ -18,6 +18,8 @@ test("spike URL fence rejects all other endpoint forms", () => {
     "wss://project-hello-r1-rtc-spike.fly.dev.evil.com",
     "wss://evilproject-hello-r1-rtc-spike.fly.dev",
     "wss://user@project-hello-r1-rtc-spike.fly.dev",
+    "wss://@project-hello-r1-rtc-spike.fly.dev",
+    "wss://:@project-hello-r1-rtc-spike.fly.dev",
     "wss://project-hello-r1-rtc-spike.fly.dev:7880",
     "https://project-hello-r1-rtc-spike.fly.dev:443",
     "http://project-hello-r1-rtc-spike.fly.dev",

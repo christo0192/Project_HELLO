@@ -1,6 +1,6 @@
 # S0-F laptop spike results — 2026-10-06
 
-## Results
+## Initial run (Config A: no `rtc.ips` filter)
 
 | Check | Attempts | Measurements | Result |
 |---|---:|---|---|
@@ -11,17 +11,20 @@
 
 The isolated worker ran from `.spike-venv` and was stopped after the test. It used `livekit-agents==1.6.4` and `httpx==0.28.1` (the matching direct pin needed by the worker's runtime).
 
-## Sanitized evidence
+## Sanitized evidence (Config A)
 
-- [S0-F1 90-second stats](s0-f1-sanitized.json)
-- [S0-F2-lite cycles](s0-f2-sanitized.json)
-- [S0-F3-lite dispatch/echo cycles](s0-f3-sanitized.json)
+- [S0-F3-lite dispatch/echo cycles](s0-f3-sanitized.json): the only retained Config A artifact.
+- The Config A S0-F1 and S0-F2-lite artifacts were overwritten by the Config B rerun and are
+  not retained. Their figures in the table above come from the run report at the time and
+  cannot be re-derived from committed artifacts. The Config A conclusion (TCP-only, so FAIL)
+  is the reason Config B was run. `s0-f1-sanitized.json` and `s0-f2-sanitized.json` are
+  Config B data; see the rerun section below.
 
 No tokens, API secret, participant identifiers, or raw media are recorded in these artifacts.
 
 ## Not covered
 
-Not covered by this laptop spike: the wider field matrix, 4G/mobile networks, corporate networks, Safari, long-duration soak, Cloud baseline comparison, Config B, 20-cycle reconnect testing, and cold/warm 20+20 dispatch testing.
+Not covered by the initial Config A run: the wider field matrix, 4G/mobile networks, corporate networks, Safari, long-duration soak, Cloud baseline comparison, 20-cycle reconnect testing, and cold/warm 20+20 dispatch testing. Config B is covered by the rerun below; the field-matrix items remain open for both configs.
 
 ## Config B rerun
 
