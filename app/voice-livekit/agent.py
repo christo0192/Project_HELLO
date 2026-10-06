@@ -2845,6 +2845,10 @@ def classify_answer_text(text: str) -> str | None:
         return phone.CLASSIFY_WRONG_NUMBER
     if _OPT_OUT_RE.search(value):
         return phone.CLASSIFY_OPT_OUT
+    if (phone.phone_preconsent_callback_requested(value)
+            and not _RECORDING_CONFLICT_RE.search(value)
+            and not re.search(r"\bnot interested\b", value, re.IGNORECASE)):
+        return phone.CLASSIFY_CALLBACK_REQUESTED
     if _REFUSED_RE.search(value):
         return phone.CLASSIFY_REFUSED
     # Before the affirmative, deliberately: an `^`-anchored affirmative would
@@ -5400,28 +5404,12 @@ async def _run_native_phone_screening(
                 add_turn_instruction(turn_ctx, phone_question_instructions(question, state.role_title))
                 return
 
-            # PR-8: Q&A is a bounded LOOP, not the old one-answer trapdoor. A
-            # clear "nothing else" closes immediately; otherwise answer and
-            # re-invite until the third real question, then answer and wrap.
-            # A filler or half-finished utterance ("Uh, yeah, so") is the
-            # candidate still forming a thought — it must NOT burn a Q&A round or
-            # trigger the close mid-sentence (2026-09-02: the room was torn down on
-            # exactly this, cutting the candidate off with no goodbye). Give them a
-            # warm moment and re-invite, staying in Q&A.
-            if phone.phone_qna_incomplete(text):
-                set_reply_snapshot(
-                    "No rush at all — is there anything else you'd like to ask, "
-                    "or anything I can help with from my side?",
-                    phase="candidate_qna",
-                )
-                setattr(agent, "_turn_policy", "clarification")
-                add_turn_instruction(
-                    turn_ctx,
-                    "The candidate hasn't finished their thought. Warmly give them "
-                    "a moment and gently invite anything else they'd like to ask. "
-                    "Do NOT say goodbye and do NOT move on.",
-                )
-                return
+            # Invite once on entry. Acknowledgement after an answer closes;
+            # unfinished thoughts get space, never another invitation.
+            qna_ack = qna_rounds["value"] > 0 and phone.phone_qna_acknowledgement(text)
+            if phone.phone_qna_incomplete(text) and not qna_ack:
+                from livekit.agents import StopResponse
+                raise StopResponse()
             # FIX D (2026-09-06): an EXPLICIT dismissal ("no follow up from me,
             # you can just disconnect the call") during the questions-for-me phase
             # proceeds to the closing goodbye instead of RE-OPENING with "Do you
@@ -5430,7 +5418,7 @@ async def _run_native_phone_screening(
             # closed on any turn that also carries a question, so a genuine late
             # question is never swallowed. Treated exactly like `phone_qna_done`
             # (close warmly), so no new terminal path is introduced.
-            if phone.phone_qna_done(text) or phone.phone_qna_dismissal(text):
+            if phone.phone_qna_done(text) or phone.phone_qna_dismissal(text) or qna_ack:
                 close_instruction = (
                     "The candidate has no more questions. Thank them warmly and "
                     "personally, say the team will review and be in touch soon, "
@@ -5493,38 +5481,17 @@ async def _run_native_phone_screening(
                 turn_is_question = route == "candidate_question"
                 if qna_rounds["value"] < phone.PHONE_QNA_MAX_ROUNDS:
                     set_reply_snapshot(
-                        "Thanks for the question. Anything else you'd like to ask?"
+                        "The hiring team can help with that detail."
                         if turn_is_question else
-                        "Got it. Anything else you'd like to ask?",
+                        "Understood.",
                         phase="candidate_qna",
                     )
                     setattr(agent, "_turn_policy", "clarification")
                     add_turn_instruction(
                         turn_ctx,
-                        grounded_answer + "Then ask naturally whether there is anything else "
-                        "they'd like to ask. Do not say goodbye yet and do not add unsupported claims.",
-                    )
-                    return
-                if qna_rounds["value"] == phone.PHONE_QNA_MAX_ROUNDS:
-                    # F8 (owner spec): the round cap must not slam the door. The
-                    # cap round still answers, then TELLS the candidate we're
-                    # wrapping up and invites one last quick thing — the actual
-                    # goodbye happens on their NEXT turn (a "no" closes warmly;
-                    # one more question gets a brief answer + goodbye below).
-                    set_reply_snapshot(
-                        ("Thanks for the question. " if turn_is_question else "Got it. ")
-                        + "I should let you go shortly — "
-                        "is there anything quick you'd like to ask before we "
-                        "wrap up?",
-                        phase="candidate_qna",
-                    )
-                    setattr(agent, "_turn_policy", "clarification")
-                    add_turn_instruction(
-                        turn_ctx,
-                        grounded_answer + "Then mention warmly that you're "
-                        "coming up on time and ask if there's anything quick "
-                        "they'd like to know before you wrap up. Do not say "
-                        "goodbye yet.",
+                        grounded_answer + "Answer only, then leave space for the candidate. "
+                        "Do not ask a question or invite more questions: the candidate "
+                        "has already been invited. Do not say goodbye yet.",
                     )
                     return
                 close_instruction = (
@@ -9962,6 +9929,40 @@ async def _run_phone_session(
         """Drop the barrier when the gate is done, so screening turns flow."""
         gate_question_anchor[0] = None
 
+    async def _compose_gate_line(instructions: str) -> str | None:
+        """Buffer the session's own model, with no tools or candidate records.
+
+        The gate validates the draft before calling say. No generated tokens
+        enter TTS here, and cancellation closes the provider stream.
+        """
+        await _await_output_subscription()
+        if phone.phone_deterministic_opener():
+            return None
+        try:
+            from livekit.agents.llm import ChatContext
+
+            chat = ChatContext()
+            chat.add_message(role="system", content=instructions)
+            chat.add_message(role="user", content="Write only the short spoken line.")
+
+            async def collect() -> str:
+                parts: list[str] = []
+                async with session.llm.chat(chat_ctx=chat, tools=[]) as stream:
+                    async for chunk in stream:
+                        delta = getattr(chunk, "delta", None)
+                        content = getattr(delta, "content", None)
+                        if isinstance(content, str):
+                            parts.append(content)
+                            if sum(map(len, parts)) > 650:
+                                return ""
+                return "".join(parts).strip()
+
+            return await asyncio.wait_for(collect(), timeout=4.0)
+        except Exception:
+            _log.info("unknown_event", error_type="phone_opening_fallback",
+                      error_category="draft_unavailable")
+            return None
+
     async def speak_opening() -> str | None:
         """Generate a warm, verified opening through the tool-less gate window.
 
@@ -9987,7 +9988,7 @@ async def _run_phone_session(
                 "include this exact sentence "
             )
         opening_instructions = (
-            "You are Christy, an AI voice assistant calling from the company "
+            f"You are Christy, an AI voice assistant calling from {phone._COMPANY} "
             "about the candidate's job application. " + greeting_clause +
             "verbatim, word for word, somewhere in your reply: "
             f"\"{phone.PHONE_DISCLOSURE_RECORDING_SENTENCE}\" "
@@ -10023,7 +10024,7 @@ async def _run_phone_session(
         # speaks the fixed fallback when this returns None.
         if phone.phone_deterministic_opener():
             return None
-        return await _speak_gate_generation(opening_instructions)
+        return await _compose_gate_line(opening_instructions)
 
     async def speak_role_opening(role_title: str) -> str | None:
         """Author the role-opening OUT OF BAND, validate it, then speak it.
@@ -11067,7 +11068,8 @@ async def _run_phone_session(
             # Recording-from-answer: post call.answered before the disclosure so the
             # server can start the egress from the top of the call.
             post_call_answered=True,
-            speak_opening=speak_opening,
+            compose_opening=speak_opening,
+            classify_gate_reply=classify_answer_text,
             # Deterministic opener (default): withhold the LLM role opener so
             # `_deliver_role_opening` speaks the FIXED `phone_role_opening_text`
             # ("Before we dive in, just to confirm — this is about the {role} role at
@@ -11100,7 +11102,7 @@ async def _run_phone_session(
             # branching keeps one call site and lets a flag flip change behaviour
             # without a deploy, exactly like every other knob in this lane.
             next_candidate_turn=_next_candidate_turn,
-            speak_gate_line=_speak_gate_line,
+            compose_gate_line=_compose_gate_line,
             mark_question_asked=_mark_question_asked,
             candidate_name=getattr(instruction_state, "candidate_name", None),
             gate_phase_out=gate_lifecycle,

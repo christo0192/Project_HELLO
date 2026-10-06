@@ -1551,7 +1551,7 @@ def phone_deterministic_opener() -> bool:
     # flip was dropped: production selects the authored openers by SECRET, so an
     # unconfigured deployment keeps the verified-by-construction copy and a
     # mistyped rollback token still fails safe.
-    return (os.getenv("PHONE_DETERMINISTIC_OPENER") or "true").strip().lower() not in (
+    return (os.getenv("PHONE_DETERMINISTIC_OPENER") or "false").strip().lower() not in (
         "false", "0", "no", "off",
     )
 
@@ -5742,6 +5742,22 @@ CLASSIFY_WRONG_NUMBER = "wrong_number"
 #: charged, the engagement leaves `dialing` for `eligible` and defers to the
 #: next IST day.
 CLASSIFY_DEFERRED_PRE_DISCLOSURE = "deferred_pre_disclosure"
+CLASSIFY_CALLBACK_REQUESTED = "callback_requested"
+
+
+def phone_preconsent_callback_requested(text: Any) -> bool:
+    """Gate-only availability: a bare 'I'm busy' also requests a callback."""
+    if not isinstance(text, str):
+        return False
+    if callback_request_match(text):
+        return True
+    clean = text.strip().lower().replace("’", "'")
+    return bool(re.fullmatch(
+        r"(?:(?:sorry|yes|yeah|no|actually|hi|hello)[\s,.]*)*"
+        r"(?:i(?:'m|m| am)\s+(?:(?:really|very|currently|a bit)\s+)?"
+        r"(?:busy|driving|in a meeting)|i (?:can't|cannot) talk)"
+        r"(?:\s+(?:right now|now|at the moment))?[\s,.!]*", clean,
+    ))
 
 PHONE_CLASSIFICATIONS: frozenset[str] = frozenset([
     CLASSIFY_HUMAN,
@@ -6346,6 +6362,27 @@ def _opening_is_verified(text: Any) -> bool:
     return True
 
 
+def phone_opening_draft_verified(text: Any, *, identity_done: bool = False) -> bool:
+    """Check an UNSPOKEN draft; no model text reaches TTS before this passes."""
+    if not _opening_is_verified(text):
+        return False
+    clean = text.strip()
+    if len(clean) > 650 or clean.count("?") != 1:
+        return False
+    # Keep the disclosure contract while allowing the introduction and question
+    # to be naturally authored. A mention of 'record' alone is not disclosure.
+    if PHONE_DISCLOSURE_RECORDING_SENTENCE not in clean:
+        return False
+    if _OPENING_IDENTITY_CUE_RE.search(clean):
+        return False
+    if not identity_done and not (
+        "christy" in clean.lower() and "ai" in clean.lower().split()
+        and _COMPANY.lower() in clean.lower()
+    ):
+        return False
+    return not any(token in clean for token in ("```", "**", "<", ">"))
+
+
 async def run_phone_gate(
     *,
     attempt_id: str,
@@ -6375,6 +6412,11 @@ async def run_phone_gate(
     classify_timeout_sec: float | None = None,
     session_id: str | None = None,
     speak_opening: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
+    # Production composes privately, then the gate validates and speaks ONCE.
+    # Legacy speak_* seams remain for older callers; never wire both paths.
+    compose_opening: Optional[Callable[[], Awaitable[Optional[str]]]] = None,
+    compose_gate_line: Optional[Callable[[str], Awaitable[Optional[str]]]] = None,
+    classify_gate_reply: Optional[Callable[[str], Optional[str]]] = None,
     # Call G: authors the role-opening from the model (verbatim role, verified).
     # Given the server role title, returns the SPOKEN line, or None if generation
     # failed / did not name the role — in which case the gate speaks the fixed
@@ -7184,6 +7226,20 @@ async def run_phone_gate(
         # predate the anchor and be dropped, which is how the stage-2 identity
         # check ended up verifying nothing on a live call.
         _ask_barrier()
+        if compose_gate_line is not None:
+            draft = await compose_gate_line(instruction)
+            valid = (
+                isinstance(draft, str) and len(draft) <= 650
+                and draft.count("?") == 1
+                and _identity_line_asks_identity(draft)
+            )
+            line = draft.strip() if valid else fixed_line
+            await _say(line)
+            gate_turns.append({"speaker": "bot", "text": line})
+            reply = await next_candidate_turn()
+            if reply:
+                gate_turns.append({"speaker": "candidate", "text": reply})
+            return reply
         spoken_line: str | None = None
         if speak_gate_line is not None:
             try:
@@ -7238,11 +7294,53 @@ async def run_phone_gate(
             gate_turns.append({"speaker": "candidate", "text": reply})
         return reply
 
+    async def _schedule_before_consent(first_reply: str) -> PhoneGateResult:
+        """Use the existing calendar pipeline without authorizing screening."""
+        await _await_answered_post()
+        flow = CallbackFlowState()
+        reply = first_reply
+        for _ in range(5):
+            verdict = classify_gate_reply(reply) if classify_gate_reply else None
+            if verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER, CLASSIFY_REFUSED}:
+                return await _terminal_outcome(verdict)
+            decision = await run_callback_turn(
+                flow, client, attempt_id, reply, datetime.now(timezone.utc),
+            )
+            if decision.terminal:
+                if decision.booked:
+                    # Confirmation has durably ended the attempt. Latch before
+                    # farewell: a hangup must never post a second terminal.
+                    _phase("terminal_posted")
+                    await _say(decision.spoken)
+                    return PhoneGateResult(HALT_CALLBACK_SCHEDULED, events=events, spoken=spoken)
+                if decision.terminal_reason == HALT_CALLBACK_RECOVERY:
+                    _phase("consent_failure")
+                    outcome = await client.post_event(attempt_id, "consent.failed", epoch=epoch)
+                    if event_applied(outcome):
+                        events.append("consent.failed")
+                        _phase("terminal_posted")
+                    await _say(decision.spoken)
+                    return PhoneGateResult(HALT_CALLBACK_RECOVERY, events=events, spoken=spoken)
+                result = await _terminal_outcome(CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+                await _say(decision.spoken)
+                return result
+            _ask_barrier()
+            await _say(decision.spoken)
+            reply = await next_candidate_turn() if next_candidate_turn else ""
+        return await _terminal_outcome(CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+
+    identity_reply = ""
     if identity_ran:
         first_reply = await _ask_identity(
             phone_identity_instruction(candidate_name),
             phone_identity_text(candidate_name),
         )
+        identity_reply = first_reply
+        gate_verdict = classify_gate_reply(first_reply) if classify_gate_reply else None
+        if gate_verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER}:
+            return await _terminal_outcome(gate_verdict)
+        if gate_verdict == CLASSIFY_CALLBACK_REQUESTED:
+            return await _schedule_before_consent(first_reply)
         identity_verdict = await phone_classify_identity(first_reply, candidate_name)
         _log.info(
             "unknown_event", error_type="phone_identity_verdict",
@@ -7256,6 +7354,12 @@ async def run_phone_gate(
                 phone_identity_reask_instruction(candidate_name),
                 phone_identity_reask_text(candidate_name),
             )
+            identity_reply = second_reply
+            gate_verdict = classify_gate_reply(second_reply) if classify_gate_reply else None
+            if gate_verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER}:
+                return await _terminal_outcome(gate_verdict)
+            if gate_verdict == CLASSIFY_CALLBACK_REQUESTED:
+                return await _schedule_before_consent(second_reply)
             identity_verdict = await phone_classify_identity(
                 second_reply, candidate_name,
             )
@@ -7272,6 +7376,8 @@ async def run_phone_gate(
             # verdict vocabulary itself: only `other_person` ends the call.
 
     if identity_verdict == PHONE_IDENTITY_UNAVAILABLE:
+        if classify_gate_reply is not None:
+            return await _schedule_before_consent(identity_reply)
         # The candidate is reachable here but cannot talk now. This is the
         # CALLBACK path and it must never be confused with a wrong number: the
         # existing deferral copy already says the team will arrange another
@@ -7346,7 +7452,17 @@ async def run_phone_gate(
         _ask_barrier()
 
     # ── The opening: model-generated-and-verified, or the fixed disclosure ─
-    if speak_opening is not None:
+    if compose_opening is not None:
+        draft = await compose_opening()
+        line = (
+            draft.strip() if phone_opening_draft_verified(draft, identity_done=identity_ran)
+            else _fixed_disclosure_text()
+        )
+        # Playout errors propagate. Replaying a fallback after audio may have
+        # started would recreate the duplicate opening this path removes.
+        await _say(line)
+        opening_spoken.append(line)
+    elif speak_opening is not None:
         try:
             generated = await speak_opening()
         except Exception:  # noqa: BLE001
@@ -7458,6 +7574,8 @@ async def run_phone_gate(
                     "unknown_event", error_type="phone_consent_endpointing",
                     schema="restore_failed", duration_sec=normal_max,
                 )
+    if decision == CLASSIFY_CALLBACK_REQUESTED and consent_reply_out:
+        return await _schedule_before_consent(consent_reply_out[-1])
     if decision not in PHONE_CLASSIFICATIONS:
         decision = CLASSIFY_MACHINE
 
@@ -7942,7 +8060,7 @@ def classify_withdrawal_confirm_reply(text: Any) -> str:
     return WITHDRAWAL_REPLY_AMBIGUOUS
 
 
-# Post-plan candidate Q&A is deliberately bounded. Three real questions is
+# Post-plan candidate Q&A is deliberately bounded. Five real questions is
 # enough space for a candidate to understand the role without turning a phone
 # screen into an unbounded support call that holds a fleet slot indefinitely.
 PHONE_QNA_MAX_ROUNDS = 5
@@ -8125,6 +8243,17 @@ def phone_qna_done(text: Any) -> bool:
         return False
     normalized = text.replace("’", "'").replace("‘", "'")
     return _QNA_DONE_RE.fullmatch(normalized) is not None
+
+
+def phone_qna_acknowledgement(text: Any) -> bool:
+    """An acknowledgement of an answer, never a mixed acknowledgement/question."""
+    if not isinstance(text, str):
+        return False
+    return bool(re.fullmatch(
+        r"\s*(?:(?:okay|ok|alright|right|great|perfect|understood|got it|"
+        r"thank you|thanks|that helps|that's helpful)[\s,.!]*)+", text,
+        re.IGNORECASE,
+    ))
 
 
 #: FIX D (2026-09-06): an EXPLICIT dismissal during the questions-for-me phase.
