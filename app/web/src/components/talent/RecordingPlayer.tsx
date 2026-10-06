@@ -42,6 +42,18 @@ export interface RecordingPlayerHandle {
 
 export interface RecordingPlayerProps {
   sessionId: string;
+  /**
+   * M013 S02: play ONE LEG of the session instead of the session recording.
+   * The URL is minted through the attempt download route (same role,
+   * lifecycle, integrity and audit checks as the call-attempt list), still
+   * only on an explicit action.
+   */
+  attemptId?: string;
+  /**
+   * Accessible name for the player (and its heading). Each leg's player
+   * names its leg, so two players never share a label.
+   */
+  label?: string;
   onTimeUpdate?: (currentTime: number) => void;
   onPlayState?: (playing: boolean) => void;
   onCanPlay?: () => void;
@@ -55,7 +67,7 @@ export interface RecordingPlayerProps {
 }
 
 export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayerProps>(
-  function RecordingPlayer({ sessionId, onTimeUpdate, onPlayState, onCanPlay, className }, ref) {
+  function RecordingPlayer({ sessionId, attemptId, label, onTimeUpdate, onPlayState, onCanPlay, className }, ref) {
     const [url, setUrl] = useState<string | null>(null);
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
@@ -75,7 +87,13 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
       return () => { mountedRef.current = false; };
     }, []);
 
-    // Invalidate on session change
+    // One mint for both sources: the session recording, or one leg of it.
+    const mintUrl = useCallback(
+      () => (attemptId ? api.getAttemptRecordingDownloadUrl(attemptId) : api.getRecordingDownloadUrl(sessionId)),
+      [attemptId, sessionId],
+    );
+
+    // Invalidate on session (or leg) change
     useEffect(() => {
       reqIdRef.current += 1;
       pendingLoadPromise.current = null;
@@ -85,7 +103,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
       setUrl(null);
       setError(null);
       setLoading(false);
-    }, [sessionId]);
+    }, [sessionId, attemptId]);
 
     const fetchUrl = useCallback((): Promise<void> => {
       // If already loaded with a URL, resolve immediately
@@ -103,8 +121,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
       });
       pendingLoadPromise.current = promise;
 
-      api
-        .getRecordingDownloadUrl(sessionId)
+      mintUrl()
         .then((res) => {
           if (!mountedRef.current || reqId !== reqIdRef.current) return;
           setUrl(res.url);
@@ -123,7 +140,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
         });
 
       return promise;
-    }, [sessionId, url, error]);
+    }, [mintUrl, url, error]);
 
     // Refresh: capture state, re-mint, restore on canplay
     const refreshUrl = useCallback(() => {
@@ -135,8 +152,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
       setLoading(true);
       setError(null);
 
-      api
-        .getRecordingDownloadUrl(sessionId)
+      mintUrl()
         .then((res) => {
           if (!mountedRef.current || reqId !== reqIdRef.current) return;
           setUrl(res.url);
@@ -158,7 +174,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
           setError(e.message || 'Failed to load recording');
           setLoading(false);
         });
-    }, [sessionId]);
+    }, [mintUrl]);
 
     // Apply a queued playFrom() offset against the (now-mounted) <audio>.
     // With preload="none" the element may be at HAVE_NOTHING, so kick a
@@ -263,7 +279,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
     if (!url && !loading && !error) {
       return (
         <div className={cx(row, className)}>
-          <h3 className="sr-only">Recording</h3>
+          <h3 className="sr-only">{label ?? 'Recording'}</h3>
           <p className="text-[13px] text-[var(--c-ink-secondary)]">
             Recording loads on request; the link expires automatically.
           </p>
@@ -292,7 +308,7 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
     if (error) {
       return (
         <div className={cx(row, className)} role="alert">
-          <h3 className="sr-only">Recording</h3>
+          <h3 className="sr-only">{label ?? 'Recording'}</h3>
           <p className="text-[13px] text-[var(--c-ink-secondary)]">{error}</p>
           <CandidateButton
             variant="secondary"
@@ -308,15 +324,17 @@ export const RecordingPlayer = forwardRef<RecordingPlayerHandle, RecordingPlayer
     // ── active player ────────────────────────────────────────────
     return (
       <div className={cx('flex flex-col gap-1.5', className)}>
-        <h3 className="sr-only">Recording</h3>
+        <h3 className="sr-only">{label ?? 'Recording'}</h3>
         <audio
           ref={audioRef}
-          id="sync-workspace-audio"
+          // The fixed id belongs to the single session player; a leg player
+          // has none, so several legs never repeat an id.
+          id={attemptId ? undefined : 'sync-workspace-audio'}
           controls
           preload="none"
           src={url!}
           className="h-9 w-full"
-          aria-label="Session recording player"
+          aria-label={label ? `${label} recording player` : 'Session recording player'}
         >
           <a href={url!} target="_blank" rel="noreferrer">
             Download recording

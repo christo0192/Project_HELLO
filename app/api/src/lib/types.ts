@@ -37,6 +37,10 @@ export interface TranscriptTurn {
    *  NULL when either anchor is missing (legacy rows, simulation sessions,
    *  non-egress recordings). */
   start_offset_sec?: number | null;
+  /** M013 S02: the turn's own validated epoch-ms start (worker clock), so a
+   *  phone turn can be placed on its leg's recording. NULL for legacy rows.
+   *  Only `GET /api/screening/:id` sets it. */
+  started_at_ms?: number | null;
   /** 0067: true for a PRE-CONSENT (gate) turn — the greeting/consent exchange
    *  the recruiter transcript shows but the scorer excludes. Additive and
    *  optional; the scoring path never sets it. */

@@ -244,9 +244,15 @@ const ROUTES: Array<[string, string, Handler]> = [
   ['DELETE', '/api/candidates/:id/phone-appointments/:appointmentId', ({ params }) => ok({ ok: true, appointment_id: params.appointmentId, version: 3, already_cancelled: false })],
   ['POST', '/api/candidates/:id/phone-rescreens', () => ok({ ok: true, status: 'ok', cycle_number: 2 })],
   ['POST', '/api/candidates/:id/phone-number-verification', () => ok({ ok: true })],
-  ['GET', '/api/candidates/:id/phone-attempts', ({ params }, db) => {
+  ['GET', '/api/candidates/:id/phone-attempts', ({ params, query }, db) => {
     const c = db.candidates.find((x) => x.id === params.id);
-    return c ? ok({ attempts: db.phoneAttempts(c), next_cursor: null }) : notFound('candidate');
+    if (!c) return notFound('candidate');
+    // M013 S02: `session_id` lists only that session's legs, OLDEST first.
+    const sessionId = query.get('session_id');
+    const attempts = sessionId
+      ? db.phoneAttempts(c).filter((a) => a.session_ref === sessionId).reverse()
+      : db.phoneAttempts(c);
+    return ok({ attempts, next_cursor: null });
   }],
   ['GET', '/api/candidates/:id/ashby-workflow', ({ params }, db) => ok({ ok: true, workflow: db.ashbyWorkflowFor(params.id) })],
 

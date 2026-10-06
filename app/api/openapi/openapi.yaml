@@ -8818,6 +8818,10 @@ components:
           type: number
           nullable: true
           description: Seconds from the authoritative recording start to this turn start. NULL when either anchor is missing (legacy rows, simulation sessions, non-egress recordings).
+        started_at_ms:
+          type: integer
+          nullable: true
+          description: M013 S02. GET /api/screening/{id} only. The turn's own epoch-ms start (worker clock), so the review UI can place a phone turn on its leg's recording (CandidatePhoneAttempt.recording_started_at_ms). null for legacy rows without timing.
         is_gate:
           type: boolean
           description: 0067 — true for a pre-consent (gate) turn (the greeting/consent exchange). Shown in the recruiter transcript but excluded from scoring. Absent/legacy rows are false.

@@ -371,6 +371,28 @@ export interface Session {
    * know, and the badge is then absent rather than accusing them of silence.
    */
   candidate_words?: number | null;
+  /**
+   * M013 S02 (0115). Answered phone legs left out of `duration_sec` because
+   * their end was never observed (lease reclaim). null when not computed.
+   */
+  duration_unobserved_legs?: number | null;
+  /**
+   * M013 S02, `GET /api/candidates/:id` only: the session's legs rolled up.
+   * Phone sessions show these, never `duration_sec`, as their length.
+   * `recorded_*` null = unknown (no phone legs, unreadable, or hidden from
+   * an interviewer who does not own the session).
+   */
+  recorded_total_sec?: number | null;
+  recorded_legs?: number | null;
+  /** true when every answered leg's end is known; false when any is not. */
+  connected_complete?: boolean | null;
+  /** Only when `connected_complete` is true. */
+  connected_total_sec?: number | null;
+  /**
+   * 0026 session-level recording anchor (epoch ms), on `GET /api/screening/:id`
+   * (`select *`). null for a worker in-band phone session.
+   */
+  recording_egress_started_at_ms?: number | null;
 }
 
 export type Speaker = "bot" | "candidate";
@@ -380,6 +402,12 @@ export interface TranscriptLine {
   text: string;
   /** Seconds from the authoritative recording start. null when timing data is unavailable (legacy, simulation). */
   start_offset_sec?: number | null;
+  /**
+   * M013 S02. The turn's own epoch-ms start (worker clock), so a phone turn
+   * can be placed on its LEG's recording. null for legacy rows; absent on
+   * older payloads.
+   */
+  started_at_ms?: number | null;
   /**
    * 0105. TRUE for the pre-consent gate — the disclosure, the identity turn,
    * the consent reply — which is now persisted as it happens so a call that
@@ -818,6 +846,19 @@ export type PhoneAttemptRecordingReason =
   | 'deleted'
   | 'revoked';
 export type PhoneAttemptTranscriptKind = 'gate_only' | 'session';
+/**
+ * M013 S02. Where a leg's end came from: `observed` = the SIP leave the
+ * worker saw; `ledger` = the ledger end; `unobserved` = only the lease
+ * reclaim ended it, so the real end is unknown.
+ */
+export type PhoneLegEndSource = 'observed' | 'ledger' | 'unobserved';
+export type PhoneAttemptConsentStage =
+  | 'before_consent'
+  | 'after_consent'
+  /** This leg's own opt-out after consent. The recording is kept. */
+  | 'consent_withdrawn'
+  /** A "call me later" on this leg after consent: not a withdrawal. */
+  | 'deferred_after_consent';
 
 export interface CandidatePhoneAttempt {
   id: string;
@@ -833,14 +874,36 @@ export interface CandidatePhoneAttempt {
    */
   abandon_reason: 'infra_deferred' | null;
   outcome_class: string | null;
+  /** Same as `connected_sec`: null for a leg whose end was never observed. */
   duration_sec: number | null;
+  /*
+   * M013 S02 per-leg truth. All optional: absent on older payloads.
+   */
+  /** When the leg was answered; null if never answered. */
+  connected_from?: string | null;
+  /** The leg end per `connected_to_source`. For `unobserved` it is when the timeout DETECTED the drop. */
+  connected_to?: string | null;
+  connected_to_source?: PhoneLegEndSource | null;
+  /** null when unobserved, live or never answered. */
+  connected_sec?: number | null;
+  /** This leg's recording length; null when unknown. */
+  recorded_sec?: number | null;
+  /** `recorded_sec` is a size-based estimate: show it as approximate. */
+  recorded_sec_estimated?: boolean;
+  /** Epoch ms of t = 0 in this leg's file; null for legacy legs. */
+  recording_started_at_ms?: number | null;
+  /** The recording may end a few seconds before the call did. */
+  tail_may_be_missing?: boolean;
+  /** The session this leg belongs to (reconnect legs share it). */
+  session_ref?: string | null;
   recording: { state: PhoneAttemptRecordingState; reason?: PhoneAttemptRecordingReason };
   /**
    * Whether this leg's audio was captured before the candidate consented
-   * (kept under the 2026-09-26 retention decision, 0105). null = cannot be
-   * told; absent on older payloads.
+   * (kept under the 2026-09-26 retention decision, 0105), and what the
+   * candidate did about consent on it. null = cannot be told; absent on
+   * older payloads.
    */
-  consent_stage?: 'before_consent' | 'after_consent' | null;
+  consent_stage?: PhoneAttemptConsentStage | null;
   transcript: {
     href: string;
     scope: 'session';

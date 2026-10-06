@@ -10,7 +10,7 @@
 
 import type { Locator, Page } from '@playwright/test';
 import { expect, type AppHarness } from './harness';
-import { STAR_CANDIDATE_ID } from './data';
+import { LEGACY_CANDIDATE_ID, STAR_CANDIDATE_ID } from './data';
 import type { RouteCase } from './routes';
 
 /** The route's `<h1>`; a string heading is matched exactly (no "Ashby Mission Control" for "Mission Control"). */
@@ -223,6 +223,30 @@ export const KEY_STATES: KeyState[] = [
       await app.settle();
       const panel = app.page.getByRole('tabpanel', { name: 'Review' });
       await expect(panel).toBeVisible();
+      return panel;
+    },
+  },
+  {
+    // M013 S02: a screening that spans two phone legs. The Review tab lists
+    // BOTH calls in order with their own notes, and groups the transcript by
+    // call. Nothing is minted until a player is asked for.
+    name: 'candidate-review-two-legs',
+    fullPage: true,
+    async run(app) {
+      await app.goto(`/candidates/${LEGACY_CANDIDATE_ID}`);
+      await app.page.getByRole('tab', { name: 'Review' }).click();
+      const panel = app.page.getByRole('tabpanel', { name: 'Review' });
+      const calls = panel.getByRole('list', { name: 'Calls in this session' });
+      await expect(calls.getByRole('listitem')).toHaveCount(2);
+      await expect(calls.getByText('Call 2 of 2 · reconnect')).toBeVisible();
+      await expect(calls.getByText(/Line dropped; end not observed \(detected \d{2}:\d{2} IST by timeout\)/)).toBeVisible();
+      await expect(calls.getByText('This recording may end a few seconds before the call did.')).toBeVisible();
+      await expect(panel.getByRole('group', { name: 'Call 1 of 2 · first call' })).toBeVisible();
+      await expect(panel.getByRole('group', { name: 'Call 2 of 2 · reconnect' })).toBeVisible();
+      await expect(panel.getByRole('combobox')).toContainText(/Recorded \d+m \d+s across 2 calls/);
+      const mints = app.calls.filter((c) => c.method === 'GET' && /^\/api\/recordings\//.test(new URL(c.url).pathname));
+      expect(mints, 'no recording URL may be minted before a player is asked for').toEqual([]);
+      await app.settle();
       return panel;
     },
   },

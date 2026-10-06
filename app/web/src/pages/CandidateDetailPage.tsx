@@ -415,6 +415,8 @@ export function CandidateDetailPage() {
                   sessions={sessions}
                   assessments={assessments}
                   blocked={decisionBlocked}
+                  // M013 S02: a phone session lists every leg with its own player.
+                  candidateId={candidate.id}
                   // Mounted only while Review is the open tab (and the Overview
                   // copy only while Overview is): one player on the page at a
                   // time, and switching tabs unmounts the <audio>, so nothing

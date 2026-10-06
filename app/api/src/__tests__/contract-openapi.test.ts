@@ -2061,6 +2061,33 @@ describe('live handler shapes match documented schemas', () => {
     expect(validateResponseBody(res.body, 'ScreeningSessionDetail', spec)).toEqual([]);
   });
 
+  it('GET /api/screening/{id} carries each turn\'s own start (M013 S02 T08a), validated', async () => {
+    // A worker in-band phone session: no session egress anchor, so every
+    // start_offset_sec is null, but the turns still carry their own start
+    // so the Review tab can place them on a leg's recording.
+    configureTables({
+      call_sessions: ok({ ...mockSessionRow, recording_egress_started_at_ms: null }),
+      transcript_turns: ok([
+        { speaker: 'bot', text: 'Hello.', turn_started_at_ms: 1700000005000, is_gate: true },
+        { speaker: 'candidate', text: 'Hi.', turn_started_at_ms: '1700000007250', is_gate: false },
+        { speaker: 'bot', text: 'Legacy row.', turn_started_at_ms: null, is_gate: false },
+        { speaker: 'bot', text: 'Bad row.', turn_started_at_ms: 1.5, is_gate: false },
+      ]),
+      assessments: ok(mockAssessmentRecord),
+    });
+    const app = createContractApp();
+    const res = await request(app).get(`/api/screening/${UUID_1}`).set('Authorization', AUTH_HEADER);
+    expect(res.status).toBe(200);
+    expect(validateResponseBody(res.body, 'ScreeningSessionDetail', spec)).toEqual([]);
+    expect(res.body.transcript.map((t: { started_at_ms: unknown }) => t.started_at_ms)).toEqual([
+      1700000005000,
+      1700000007250,
+      null,
+      null,
+    ]);
+    expect(res.body.transcript.every((t: { start_offset_sec: unknown }) => t.start_offset_sec === null)).toBe(true);
+  });
+
   it('POST /api/assess/{sessionId} → Assessment (injected runner)', async () => {
     injectAssessmentRunner(async () => mockAssessmentCamel);
     const app = createContractApp();
