@@ -778,5 +778,146 @@ class TestIdentityJudgeThroughTheGate(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.assessment_allowed)
 
 
+# ── T06: the 32757295 replay CONTINUED into the callback conversation ────────
+
+from dataclasses import replace as _replace  # noqa: E402
+from datetime import datetime as _dt, timezone as _tz  # noqa: E402
+
+#: Tuesday 2026-10-06 09:00 IST, so a bare "11 am" would read as TODAY
+#: without the remembered day; "tomorrow 11 am" is 2026-10-07 05:30Z.
+_CB_NOW = _dt(2026, 10, 6, 3, 30, tzinfo=_tz.utc)
+_TOMORROW_11 = "2026-10-07T05:30:00Z"
+
+
+def _continued_32757295():
+    """The real 32757295 timeline plus ONE synthetic reply ("11 am") to the
+    bot's "what time tomorrow?". The real call's last utterance ("I am busy
+    right now, can you call me back tomorrow?", segment 30280-33556) lands
+    after this build's "what day and time?" line, so it is kept as is."""
+    fixture = gr.load_fixture("32757295")
+    return _replace(
+        fixture,
+        name=f"{fixture.name}[+11am]",
+        vad_events=fixture.vad_events + (
+            gr.VadEvent(45060, "start_of_speech", 50, 0, 10),
+            gr.VadEvent(46056, "end_of_speech", 700, 256, 0),
+        ),
+        stt_finals=fixture.stt_finals + (gr.SttFinal(46400, "11 am"),),
+        committed_turns=fixture.committed_turns + (
+            gr.CommittedTurn(46410, "11 am", 45000, 46410),),
+    )
+
+
+class _CallbackClient:
+    def __init__(self):
+        self.propose_calls, self.confirm_calls = [], []
+
+    async def propose_callback(self, attempt_id, starts_at):
+        self.propose_calls.append(starts_at)
+        return phone.PhoneApiOutcome(True, "proposal_valid"), None
+
+    async def confirm_callback(self, attempt_id, starts_at):
+        self.confirm_calls.append(starts_at)
+        return phone.PhoneApiOutcome(True, "ok")
+
+
+class TestCallbackConversationReplay(unittest.TestCase):
+    """S01-PLAN T06 acceptance: "I am busy right now" -> "call me back
+    tomorrow?" -> "what time tomorrow?" -> "11 am" -> propose -> confirm ->
+    read-back -> HALT_CALLBACK_SCHEDULED. Never voicemail, never consent."""
+
+    def _check(self, result, client):
+        self.assertEqual(result.decision, phone.CLASSIFY_CALLBACK_REQUESTED)
+        end = result.callback_end
+        self.assertIsNotNone(end)
+        self.assertEqual(end.kind, phone.GATE_CALLBACK_END_DECISION)
+        self.assertTrue(end.decision.booked)
+        self.assertEqual(end.decision.terminal_reason, phone.HALT_CALLBACK_SCHEDULED)
+        self.assertEqual(client.propose_calls, [_TOMORROW_11])
+        self.assertEqual(client.confirm_calls, [_TOMORROW_11])
+        callback_lines = [line.text for line in result.spoken if line.kind == "callback"]
+        self.assertEqual(callback_lines[:2], [
+            phone._CALLBACK_ASK_TIME_TEXT,
+            "Sure, what time tomorrow works? Anywhere between 9 in the morning and 9 at night.",
+        ])
+        self.assertTrue(callback_lines[-1].startswith(
+            "Done, I've booked you for Wednesday at 11:00 am India time."))
+        self.assertNotIn("reask", result.spoken_kinds())
+        self.assertEqual(_logs(result, "phone_classify_fallback_machine"), [])
+        self.assertEqual(result.leaked_text_in_logs(), [])
+
+    def test_llm_mode_books_tomorrow_at_11_and_the_judge_reads_two_replies(self):
+        client = _CallbackClient()
+        result = _llm(_continued_32757295(), {
+            "identity": [(gr.judge_json("unclear"), 800)],
+            "consent": [(gr.judge_json(
+                "not_now_busy", "I am busy right now", callback=_BUSY_CB), 900)],
+            "callback_time": [
+                (gr.judge_json("not_now_busy", "call me back tomorrow", callback={
+                    "day_text": "tomorrow", "time_text": "", "resolved_ist": None}), 700),
+                (gr.judge_json("not_now_busy", "11 am", callback={
+                    "day_text": "", "time_text": "11 am",
+                    "resolved_ist": "2026-10-07T11:00"}), 600),
+            ],
+        }, callback_client=client, callback_now=lambda: _CB_NOW)
+        self._check(result, client)
+        phases = [phase for phase, _t, _p in result.judge_transport.calls]
+        # The busy reply is read ONCE (by the consent judge, then reused).
+        self.assertEqual(phases, ["identity", "consent", "callback_time", "callback_time"])
+        cross = [r.error_category for r in result.logs if r.error_type == "phone_callback_judge"]
+        self.assertEqual(cross, ["resolved_match"])
+
+    def test_legacy_mode_books_the_same_slot_with_the_parser_alone(self):
+        client = _CallbackClient()
+        result = gr.replay(_continued_32757295(), driver=gr.drive_with_judge(
+            mode="legacy", callback_client=client, callback_now=lambda: _CB_NOW))
+        self._check(result, client)
+        self.assertEqual(result.judge_transport.calls, [])
+
+
+class TestJudgeCallbackSeam(unittest.IsolatedAsyncioTestCase):
+    """`_GateJudgeWiring.judge_callback`, and the session wiring that calls it."""
+
+    def _wiring(self, mode, responses=None):
+        rt = types.SimpleNamespace(now_ms=0, fixture=types.SimpleNamespace(name="seam"),
+                                   _replay_errors=[])
+        capture = agent_mod._new_gate_turn_capture(lambda _turn: None)
+        transport = gr.ReplayJudgeTransport(rt, responses or {})
+        wiring = agent_mod._GateJudgeWiring(
+            capture=capture, latch=gate_judge.HumanSpeechLatch(),
+            question_anchor=lambda: None, mode=mode, config=gr.JUDGE_CONFIG,
+            transport=transport, breaker=gr.replay_breaker(), log=lambda **_k: None)
+        return wiring, transport
+
+    async def test_legacy_and_shadow_never_judge_a_callback_reply(self):
+        for mode in ("legacy", "shadow"):
+            wiring, transport = self._wiring(mode)
+            self.assertIsNone(await wiring.judge_callback("tomorrow at 3", "line"))
+            self.assertEqual(transport.calls, [])
+
+    async def test_the_first_reply_reuses_a_busy_verdict_and_is_never_rejudged(self):
+        wiring, transport = self._wiring("llm")
+        self.assertIsNone(await wiring.judge_callback("I'm busy", "line", first=True))
+        busy = gate_judge.GateDecision(intent="not_now_busy", source="llm")
+        wiring.last_decision = busy
+        self.assertIs(await wiring.judge_callback("I'm busy", "line", first=True), busy)
+        wiring.last_decision = gate_judge.GateDecision(intent=None, source="llm",
+                                                       error_category="timeout")
+        self.assertIsNone(await wiring.judge_callback("I'm busy", "line", first=True))
+        self.assertEqual(transport.calls, [])
+
+    async def test_an_unavailable_judge_is_no_reading(self):
+        wiring, transport = self._wiring("llm", {"callback_time": [("not json", 10)]})
+        self.assertIsNone(await wiring.judge_callback("tomorrow at 3", "line"))
+        self.assertEqual([c[0] for c in transport.calls], ["callback_time"])
+
+    def test_the_session_passes_the_seam_against_the_last_line(self):
+        import inspect
+        src = inspect.getsource(agent_mod)
+        self.assertIn(
+            "judge_callback=lambda reply, first=False: gate_judge_wiring.judge_callback(\n"
+            "                reply, gate_last_line[0], first=first),", src)
+
+
 if __name__ == "__main__":
     unittest.main()

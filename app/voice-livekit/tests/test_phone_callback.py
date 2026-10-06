@@ -532,7 +532,9 @@ class C5ParserTableTests(unittest.TestCase):
         # Unresolved dates and relative offsets are None, never today/tomorrow.
         ("on the 5th at 4pm", None),
         ("on the fifth at 4pm", None),
-        ("October 5 at 4pm", None),
+        # M013 S01 T06: a date named WITH its month now resolves (to its next
+        # occurrence); "5 May" stays refused ("at 4 may be fine").
+        ("October 5 at 4pm", _ist_on("2026-10-05", 16)),
         ("5 May at 4pm", None),
         ("next week at 4pm", None),
         ("this weekend at 11am", None),
@@ -704,6 +706,449 @@ class C5BookedReadBackTests(unittest.TestCase):
         ))
         self.assertTrue(turn.booked)
         self.assertIn("Sunday at 3:30 pm India time", turn.spoken)
+
+
+# ── M013 S01 T06: the gate's callback CONVERSATION ───────────────────────────
+
+import gate_judge  # noqa: E402
+
+#: Saturday 2026-10-03 14:00 IST (as in C5). Tomorrow is Sunday 2026-10-04.
+_T06_NOW = _C5_NOW
+_TOMORROW = "2026-10-04"
+
+
+def _judged(intent="not_now_busy", day="", when="", resolved=None, source="llm"):
+    """A gate judge decision as `judge_callback` returns it (synthetic)."""
+    callback = None
+    if intent == "not_now_busy":
+        callback = gate_judge.JudgeCallback(day_text=day, time_text=when, resolved_ist=resolved)
+    return gate_judge.GateDecision(intent=intent, source=source, callback=callback)
+
+
+class _ScriptedClient:
+    """propose answers from a script (then valid); confirm answers ``confirm``."""
+
+    def __init__(self, proposals=(), confirm=None):
+        self.proposals = list(proposals)
+        self.confirm = confirm or phone.PhoneApiOutcome(True, "ok")
+        self.propose_calls: list[str] = []
+        self.confirm_calls: list[str] = []
+
+    async def propose_callback(self, attempt_id, starts_at):
+        self.propose_calls.append(starts_at)
+        if self.proposals:
+            return self.proposals.pop(0), None
+        return phone.PhoneApiOutcome(True, "proposal_valid"), None
+
+    async def confirm_callback(self, attempt_id, starts_at):
+        self.confirm_calls.append(starts_at)
+        return self.confirm
+
+
+class T06ParserTests(unittest.TestCase):
+    """`parse_callback_time_ist` (month dates, a settled day) and
+    `parse_callback_day_ist`, anchored at Saturday 2026-10-03 14:00 IST."""
+
+    def test_dates_named_with_their_month_resolve_to_the_next_occurrence(self):
+        table = [
+            ("the 8th of October at 11am", _ist_on("2026-10-08", 11)),
+            ("Oct 8 11am", _ist_on("2026-10-08", 11)),
+            ("8th October at 3", _ist_on("2026-10-08", 15)),
+            ("on October 12th at 4:30 pm", _ist_on("2026-10-12", 16, 30)),
+            ("5th May at 4pm", _ist_on("2027-05-05", 16)),     # next year
+            ("October 1 at 4pm", _ist_on("2027-10-01", 16)),   # passed -> next year
+            ("October 3 at 5pm", _ist_on("2026-10-03", 17)),   # today (the flow refuses)
+            ("February 30 at 3pm", None),                      # not a date
+            ("October 8 or the 9th of October at 3pm", None),  # two dates: a guess
+            ("tomorrow at 4 may be fine", None),               # "4 may" is not May 4
+            ("on the 5th at 4pm", None),                       # no month: still refused
+            ("October at 4pm", None),                          # a month, no day
+        ]
+        for text, expected in table:
+            with self.subTest(text=text):
+                self.assertEqual(phone.parse_callback_time_ist(text, _T06_NOW), expected)
+
+    def test_a_settled_day_is_used_only_when_the_reply_names_none(self):
+        from datetime import date
+        monday = date(2026, 10, 5)
+        self.assertEqual(
+            phone.parse_callback_time_ist("11 am", _T06_NOW, default_day=monday),
+            _ist_on("2026-10-05", 11))
+        self.assertEqual(
+            phone.parse_callback_time_ist("at 3", _T06_NOW, default_day=monday),
+            _ist_on("2026-10-05", 15))
+        # The reply's own day wins over the settled one.
+        self.assertEqual(
+            phone.parse_callback_time_ist("tomorrow at 11 am", _T06_NOW, default_day=monday),
+            _ist_on(_TOMORROW, 11))
+        # Still no clock evidence: no instant.
+        self.assertIsNone(phone.parse_callback_time_ist("11", _T06_NOW, default_day=monday))
+        # Without a settled day a bare clock keeps its old reading.
+        self.assertEqual(phone.parse_callback_time_ist("11 am", _T06_NOW), _ist_on(_TOMORROW, 11))
+
+    def test_the_day_alone(self):
+        from datetime import date
+        table = [
+            ("Can you call me back tomorrow?", date(2026, 10, 4)),
+            ("day after tomorrow", date(2026, 10, 5)),
+            ("Monday is better", date(2026, 10, 5)),
+            ("today", date(2026, 10, 3)),
+            ("the 8th of October", date(2026, 10, 8)),
+            ("next week", None),
+            ("I am busy right now", None),
+            ("", None),
+            (None, None),
+        ]
+        for text, expected in table:
+            with self.subTest(text=text):
+                self.assertEqual(phone.parse_callback_day_ist(text, _T06_NOW), expected)
+
+
+class T06SlotValidationAndCopyTests(unittest.TestCase):
+
+    def test_the_local_revalidation(self):
+        table = [
+            (_ist_on(_TOMORROW, 11), None),
+            (_ist_on(_TOMORROW, 9), None),
+            (_ist_on(_TOMORROW, 20, 59), None),
+            (_ist_on("2026-10-17", 11), None),           # 14 days: allowed
+            (_ist_on("2026-10-18", 11), "too_far"),      # 15 days
+            (_ist_on("2026-10-03", 17), "same_day"),
+            (_ist_on("2026-10-02", 17), "same_day"),     # the past
+            (_ist_on(_TOMORROW, 8, 59), "outside_hours"),
+            (_ist_on(_TOMORROW, 21), "outside_hours"),
+            ("tomorrow", "unreadable"),
+            (None, "unreadable"),
+        ]
+        for starts_at, expected in table:
+            with self.subTest(starts_at=starts_at):
+                self.assertEqual(phone.callback_slot_problem(starts_at, _T06_NOW), expected)
+
+    def test_the_spoken_lines_and_their_registration(self):
+        from datetime import date
+        partial = phone._callback_partial_time_text(date(2026, 10, 4), _T06_NOW)
+        self.assertEqual(
+            partial,
+            "Sure, what time tomorrow works? Anywhere between 9 in the morning and 9 at night.")
+        self.assertEqual(
+            phone._callback_partial_time_text(date(2026, 10, 7), _T06_NOW),
+            "Sure, what time on Wednesday works? Anywhere between 9 in the morning and 9 at night.")
+        offer = phone._callback_offer_text("confirm", _ist_on(_TOMORROW, 14), _T06_NOW)
+        self.assertEqual(
+            offer, "So that's tomorrow at 2 in the afternoon, India time. Does that work?")
+        self.assertEqual(
+            phone._callback_offer_text("anytime", _ist_on("2026-10-05", 11), _T06_NOW),
+            "Sure. I can do the day after tomorrow at 11 in the morning, India time. "
+            "Does that work?")
+        self.assertIn(
+            "on Monday, October 12 at 12 noon",
+            phone._callback_offer_text("confirm", _ist_on("2026-10-12", 12), _T06_NOW))
+        self.assertIn(
+            "at 5:30 in the evening",
+            phone._callback_offer_text("earliest", _ist_on(_TOMORROW, 17, 30), _T06_NOW))
+        for line in (
+            partial, offer,
+            phone._callback_offer_text("anytime", _ist_on(_TOMORROW, 11), _T06_NOW),
+            phone._callback_offer_text("earliest", _ist_on(_TOMORROW, 17), _T06_NOW),
+            phone._CALLBACK_EARLIEST_TOMORROW_TEXT, phone._CALLBACK_TOO_FAR_TEXT,
+            phone._CALLBACK_OUTSIDE_HOURS_TEXT, phone.PHONE_CALLBACK_NOTHING_BOOKED_TEXT,
+        ):
+            with self.subTest(line=line):
+                self.assertTrue(phone.is_gate_copy(line))
+        # The frames do not swallow an ordinary sentence.
+        self.assertFalse(phone.is_gate_copy("So that's my experience with Kafka."))
+        self.assertFalse(phone.is_gate_copy("Sure, what time do the interviews start?"))
+
+    def test_the_new_lines_add_no_ai_wording_and_no_invented_numbers(self):
+        for line in (
+            phone._CALLBACK_EARLIEST_TOMORROW_TEXT, phone._CALLBACK_TOO_FAR_TEXT,
+            phone._CALLBACK_OUTSIDE_HOURS_TEXT, phone.PHONE_CALLBACK_NOTHING_BOOKED_TEXT,
+            phone._CALLBACK_PARTIAL_TIME_PREFIX + phone._CALLBACK_PARTIAL_TIME_SUFFIX,
+            *phone._CALLBACK_OFFER_PREFIXES.values(), phone._CALLBACK_OFFER_SUFFIX,
+        ):
+            with self.subTest(line=line):
+                self.assertNotRegex(line, r"\bAI\b|assistant|robot|bot\b")
+
+
+class T06ConversationTests(unittest.TestCase):
+    """`run_callback_turn` on a conversational flow (the pre-consent gate)."""
+
+    def setUp(self):
+        self.logged: list[dict] = []
+        real_info = phone._log.info
+
+        def capture(event, **meta):
+            self.logged.append(dict(meta))
+            return real_info(event, **meta)
+
+        patcher = unittest.mock.patch.object(phone._log, "info", side_effect=capture)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _turn(self, flow, client, text, judged=None):
+        return asyncio.run(phone.run_callback_turn(
+            flow, client, "attempt-1", text, _T06_NOW, judged=judged))
+
+    def _logged(self, error_type):
+        return [m.get("error_category") for m in self.logged if m.get("error_type") == error_type]
+
+    def test_call_me_back_tomorrow_then_11_am_books_tomorrow(self):
+        flow = phone.CallbackFlowState(conversational=True)
+        client = _ScriptedClient()
+        first = self._turn(flow, client, "I am busy right now")
+        self.assertFalse(first.terminal)
+        self.assertEqual(first.spoken, phone._CALLBACK_ASK_TIME_TEXT)
+        second = self._turn(flow, client, "Can you call me back tomorrow?")
+        self.assertFalse(second.terminal)
+        self.assertEqual(
+            second.spoken,
+            "Sure, what time tomorrow works? Anywhere between 9 in the morning and 9 at night.")
+        self.assertEqual(client.propose_calls, [])
+        third = self._turn(flow, client, "11 am")
+        self.assertTrue(third.booked)
+        self.assertEqual(third.terminal_reason, phone.HALT_CALLBACK_SCHEDULED)
+        self.assertEqual(client.propose_calls, [_ist_on(_TOMORROW, 11)])
+        self.assertEqual(client.confirm_calls, [_ist_on(_TOMORROW, 11)])
+        self.assertTrue(third.spoken.startswith(
+            "Done, I've booked you for Sunday at 11:00 am India time."))
+
+    def test_the_settled_day_is_remembered_for_a_bare_clock(self):
+        # At 14:00 IST a bare "4 pm" alone would be TODAY (and refused); after
+        # "tomorrow" it is tomorrow.
+        self.assertEqual(phone.parse_callback_time_ist("4 pm", _T06_NOW), _ist_on("2026-10-03", 16))
+        flow = phone.CallbackFlowState(conversational=True)
+        client = _ScriptedClient()
+        self._turn(flow, client, "Call me tomorrow")
+        self.assertTrue(self._turn(flow, client, "4 pm").booked)
+        self.assertEqual(client.propose_calls, [_ist_on(_TOMORROW, 16)])
+
+    def test_two_clarifications_then_the_nothing_booked_goodbye(self):
+        flow = phone.CallbackFlowState(conversational=True)
+        client = _ScriptedClient()
+        # The first reply, then TWO clarifications (in-call: one).
+        for text in ("I'm busy", "not sure"):
+            with self.subTest(text=text):
+                self.assertFalse(self._turn(flow, client, text).terminal)
+        last = self._turn(flow, client, "no idea")
+        self.assertTrue(last.terminal)
+        self.assertFalse(last.booked)
+        self.assertEqual(last.terminal_reason, phone.HALT_CALLBACK_DEFERRED)
+        self.assertEqual(last.sub_reason, "unparseable")
+        self.assertEqual(last.spoken, phone.PHONE_CALLBACK_NOTHING_BOOKED_TEXT)
+        self.assertEqual(client.propose_calls, [])
+        self.assertEqual(flow.phase, phone.CALLBACK_PHASE_DONE)
+
+    def test_today_at_5_gets_the_tomorrow_offer_and_a_yes_books_it(self):
+        flow = phone.CallbackFlowState(conversational=True)
+        client = _ScriptedClient()
+        offer = self._turn(flow, client, "Call me today at 5")
+        self.assertFalse(offer.terminal)
+        self.assertEqual(
+            offer.spoken,
+            "Sorry, the earliest I can do is tomorrow. I can do tomorrow at 5 in the "
+            "evening, India time. Does that work?")
+        self.assertEqual(client.propose_calls, [], "the same-day time is never proposed")
+        booked = self._turn(flow, client, "Yes, that works")
+        self.assertTrue(booked.booked)
+        self.assertEqual(client.propose_calls, [_ist_on(_TOMORROW, 17)])
+
+    def test_today_without_a_time_asks_what_time_tomorrow(self):
+        flow = phone.CallbackFlowState(conversational=True)
+        client = _ScriptedClient()
+        d = self._turn(flow, client, "Maybe later today")
+        self.assertEqual(d.spoken, phone._CALLBACK_EARLIEST_TOMORROW_TEXT)
+        booked = self._turn(flow, client, "4 pm")
+        self.assertTrue(booked.booked)
+        self.assertEqual(client.propose_calls, [_ist_on(_TOMORROW, 16)])
+
+    def test_too_far_and_outside_hours_are_clarified_never_proposed(self):
+        for text, expected in (
+            ("October 30 at 11am", phone._CALLBACK_TOO_FAR_TEXT),
+            ("the 2nd of December at 11am", phone._CALLBACK_TOO_FAR_TEXT),
+        ):
+            with self.subTest(text=text):
+                flow = phone.CallbackFlowState(conversational=True)
+                client = _ScriptedClient()
+                d = self._turn(flow, client, text)
+                self.assertFalse(d.terminal)
+                self.assertEqual(d.spoken, expected)
+                self.assertEqual(client.propose_calls, [])
+        # A judge-only time outside the window is clarified too.
+        flow = phone.CallbackFlowState(conversational=True)
+        client = _ScriptedClient()
+        d = self._turn(flow, client, "kal raat ko",
+                       _judged(day="kal", when="raat ko", resolved=f"{_TOMORROW}T22:00"))
+        self.assertEqual(d.spoken, phone._CALLBACK_OUTSIDE_HOURS_TEXT)
+        self.assertEqual(client.propose_calls, [])
+
+    def test_a_judge_only_resolution_is_confirmed_before_it_is_proposed(self):
+        flow = phone.CallbackFlowState(conversational=True)
+        client = _ScriptedClient()
+        offer = self._turn(
+            flow, client, "kal lunch ke baad",
+            _judged(day="kal", when="lunch ke baad", resolved=f"{_TOMORROW}T14:00"))
+        self.assertFalse(offer.terminal)
+        self.assertEqual(
+            offer.spoken, "So that's tomorrow at 2 in the afternoon, India time. Does that work?")
+        self.assertEqual(client.propose_calls, [], "never proposed before the candidate confirms")
+        booked = self._turn(flow, client, "haan", _judged("consent_granted"))
+        self.assertTrue(booked.booked)
+        self.assertEqual(client.propose_calls, [_ist_on(_TOMORROW, 14)])
+        self.assertIn("offer_confirmed", self._logged("phone_callback_turn"))
+
+    def test_anything_but_a_yes_to_the_offer_is_a_clarification_turn(self):
+        cases = (
+            # (reply, the judge's reading of it)
+            ("hmm", _judged("unclear")),            # a valid non-yes verdict
+            ("I'm not sure", None),                 # no judge: the regex reads no yes
+            ("no", None),
+        )
+        for reply, judged in cases:
+            with self.subTest(reply=reply):
+                flow = phone.CallbackFlowState(conversational=True)
+                client = _ScriptedClient()
+                self._turn(flow, client, "kal lunch ke baad",
+                           _judged(day="kal", when="lunch ke baad", resolved=f"{_TOMORROW}T14:00"))
+                d = self._turn(flow, client, reply, judged)
+                self.assertFalse(d.terminal)
+                self.assertEqual(client.propose_calls, [])
+                self.assertIsNone(flow.pending_slot)
+        # The deterministic yes confirms when the judge has no verdict.
+        flow = phone.CallbackFlowState(conversational=True)
+        client = _ScriptedClient()
+        self._turn(flow, client, "kal lunch ke baad",
+                   _judged(day="kal", when="lunch ke baad", resolved=f"{_TOMORROW}T14:00"))
+        self.assertTrue(self._turn(flow, client, "Yes, okay").booked)
+
+    def test_a_different_time_in_reply_to_the_offer_is_read_as_the_new_time(self):
+        flow = phone.CallbackFlowState(conversational=True)
+        client = _ScriptedClient()
+        self._turn(flow, client, "kal lunch ke baad",
+                   _judged(day="kal", when="lunch ke baad", resolved=f"{_TOMORROW}T14:00"))
+        d = self._turn(flow, client, "Yes, but make it 4 pm")
+        self.assertTrue(d.booked)
+        self.assertEqual(client.propose_calls, [_ist_on(_TOMORROW, 16)])
+
+    def test_judge_spans_not_in_the_candidates_words_are_ignored(self):
+        flow = phone.CallbackFlowState(conversational=True)
+        client = _ScriptedClient()
+        # The model invents "monday 4 pm"; the candidate said nothing like it.
+        d = self._turn(flow, client, "after lunch maybe",
+                       _judged(day="monday", when="4 pm", resolved="2026-10-05T16:00"))
+        self.assertFalse(d.terminal)
+        self.assertEqual(d.spoken, phone._CALLBACK_ASK_TIME_TEXT)
+        self.assertEqual(client.propose_calls, [])
+        self.assertIsNone(flow.pending_slot, "an invented time is not even offered")
+        self.assertIn("spans_not_in_reply", self._logged("phone_callback_judge"))
+
+    def test_the_parser_reads_the_spans_and_the_judges_date_is_only_cross_checked(self):
+        flow = phone.CallbackFlowState(conversational=True)
+        client = _ScriptedClient()
+        d = self._turn(flow, client, "tomorrow at 3 pm",
+                       _judged(day="tomorrow", when="3 pm", resolved=f"{_TOMORROW}T16:00"))
+        self.assertTrue(d.booked)
+        self.assertEqual(client.propose_calls, [_ist_on(_TOMORROW, 15)])
+        self.assertIn("resolved_mismatch", self._logged("phone_callback_judge"))
+        flow = phone.CallbackFlowState(conversational=True)
+        self._turn(flow, _ScriptedClient(), "tomorrow at 3 pm",
+                   _judged(day="tomorrow", when="3 pm", resolved=f"{_TOMORROW}T15:00"))
+        self.assertIn("resolved_match", self._logged("phone_callback_judge"))
+
+    def test_the_judges_spans_pick_the_words_when_the_reply_holds_two_times(self):
+        flow = phone.CallbackFlowState(conversational=True)
+        client = _ScriptedClient()
+        d = self._turn(flow, client, "not at 5 pm, tomorrow at 11 am is better",
+                       _judged(day="tomorrow", when="11 am", resolved=f"{_TOMORROW}T11:00"))
+        self.assertTrue(d.booked)
+        self.assertEqual(client.propose_calls, [_ist_on(_TOMORROW, 11)])
+
+    def test_anytime_is_offered_and_confirmed(self):
+        flow = phone.CallbackFlowState(conversational=True)
+        client = _ScriptedClient()
+        d = self._turn(flow, client, "Anytime tomorrow is fine")
+        self.assertEqual(
+            d.spoken,
+            "Sure. I can do tomorrow at 11 in the morning, India time. Does that work?")
+        self.assertEqual(client.propose_calls, [])
+        self.assertTrue(self._turn(flow, client, "yes").booked)
+        self.assertEqual(client.propose_calls, [_ist_on(_TOMORROW, 11)])
+
+    def test_anytime_on_a_full_slot_gets_the_servers_alternatives(self):
+        flow = phone.CallbackFlowState(conversational=True)
+        full = phone.PhoneApiOutcome(False, "slot_full")
+        full.alternatives = [_alt("2026-10-04T06:30:00Z", "12:00")]
+        client = _ScriptedClient(proposals=[full])
+        self._turn(flow, client, "whenever, anytime")
+        d = self._turn(flow, client, "yes")
+        self.assertFalse(d.terminal)
+        self.assertIn("The nearest I have is", d.spoken)
+        self.assertEqual(flow.phase, phone.CALLBACK_PHASE_AWAITING_ALT_PICK)
+        self.assertTrue(self._turn(flow, client, "yes").booked)
+
+    def test_slot_not_yet_eligible_says_tomorrow_and_settles_the_day(self):
+        flow = phone.CallbackFlowState(conversational=True)
+        client = _ScriptedClient(proposals=[phone.PhoneApiOutcome(False, "slot_not_yet_eligible")])
+        d = self._turn(flow, client, "tomorrow at 11 am")
+        self.assertFalse(d.terminal)
+        self.assertEqual(d.spoken, phone._CALLBACK_EARLIEST_TOMORROW_TEXT)
+        self.assertEqual(flow.phase, phone.CALLBACK_PHASE_AWAITING_RETIME)
+        booked = self._turn(flow, client, "3 pm then")
+        self.assertTrue(booked.booked)
+        self.assertEqual(client.propose_calls[-1], _ist_on(_TOMORROW, 15))
+
+    def test_the_in_call_flow_keeps_its_one_clarification(self):
+        flow = phone.CallbackFlowState()
+        self.assertFalse(flow.conversational)
+        client = _ScriptedClient()
+        first = self._turn(flow, client, "Can you call me back tomorrow?")
+        self.assertEqual(first.spoken, phone._CALLBACK_ASK_TIME_TEXT)
+        second = self._turn(flow, client, "11 am")  # no day memory in-call
+        self.assertTrue(second.booked)
+        self.assertEqual(client.propose_calls, [_ist_on(_TOMORROW, 11)])
+        flow = phone.CallbackFlowState()
+        self._turn(flow, client, "later")
+        self.assertEqual(self._turn(flow, client, "not sure").sub_reason, "unparseable")
+        self.assertEqual(
+            phone.schedule_refusal_text("slot_not_yet_eligible"),
+            phone._SCHEDULE_REFUSAL_TEXT["slot_not_yet_eligible"])
+
+    def test_the_conversation_always_ends_within_the_turn_bound(self):
+        """Adversarial replies (no time, refusals, unconfirmed offers): every
+        conversation is terminal within `CALLBACK_GATE_MAX_TURNS` replies."""
+        refusals = [phone.PhoneApiOutcome(False, "window_closed"),
+                    phone.PhoneApiOutcome(False, "slot_full")]
+        refusals[1].alternatives = [_alt("2026-10-04T06:30:00Z", "12:00")]
+        scripts = [
+            ["busy"] + ["no idea"] * 10,
+            ["busy", "kal lunch ke baad", "hmm", "tomorrow at 11 am", "tomorrow at 3 pm",
+             "neither", "nope", "no"],
+            ["anytime", "no", "tomorrow", "nah"] + ["?"] * 6,
+            ["today at 5", "no", "tomorrow at 11 am", "tomorrow 3 pm", "the second one"] + ["x"] * 5,
+        ]
+        for script in scripts:
+            with self.subTest(script=script[:3]):
+                flow = phone.CallbackFlowState(conversational=True)
+                client = _ScriptedClient(proposals=list(refusals))
+                judged = _judged(day="kal", when="lunch ke baad", resolved=f"{_TOMORROW}T14:00")
+                for n, reply in enumerate(script, start=1):
+                    d = self._turn(flow, client, reply, judged if "kal" in reply else None)
+                    if d.terminal:
+                        break
+                self.assertTrue(d.terminal, script)
+                self.assertLessEqual(n, phone.CALLBACK_GATE_MAX_TURNS)
+
+    def test_logs_carry_no_candidate_words(self):
+        flow = phone.CallbackFlowState(conversational=True)
+        client = _ScriptedClient()
+        self._turn(flow, client, "kal lunch ke baad",
+                   _judged(day="kal", when="lunch ke baad", resolved=f"{_TOMORROW}T14:00"))
+        self._turn(flow, client, "after lunch maybe",
+                   _judged(day="monday", when="4 pm", resolved="2026-10-05T16:00"))
+        for meta in self.logged:
+            for value in meta.values():
+                if isinstance(value, str):
+                    self.assertNotIn("lunch", value.lower())
+                    self.assertNotIn("kal ", value.lower())
 
 
 if __name__ == "__main__":

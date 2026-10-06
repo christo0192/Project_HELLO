@@ -43,7 +43,10 @@ SDK's speech start) with the per-final capture. T05 adds ``drive_with_judge``:
 the session's judge wiring (``agent._GateJudgeWiring``) on a recorded,
 virtual-clock judge transport (``ReplayJudgeTransport``), the consent line
 split at the recording sentence (``GateReplay.say_split``) and the recording
-anchor (``agent._GateRecordingAnchor``). Extend this module; do not fork it.
+anchor (``agent._GateRecordingAnchor``). T06 lets ``drive_with_judge``
+continue a callback request into the gate's real callback conversation
+(``phone.converse_callback_before_consent``). Extend this module; do not
+fork it.
 
 PRIVACY. Fixture files are named by session prefix only, hold a synthetic first
 name, relative times and short non-identifying utterances. ``load_fixture``
@@ -678,6 +681,9 @@ class GateReplayResult:
     judge: Any = None
     judge_transport: Any = None
     split_times: tuple[int, int] | None = None
+    # T06 (`drive_with_judge(callback_client=...)`): how the pre-consent
+    # callback conversation ended (`phone.GateCallbackEnd`).
+    callback_end: Any = None
 
     def candidate_rows(self) -> list[tuple]:
         """The candidate `gate_pending` rows the session would have buffered."""
@@ -1100,6 +1106,8 @@ def drive_with_judge(
     budget_seconds: float | None = 180.0,
     role_title: str | None = None,
     shadow_settle_ms: int = 5000,
+    callback_client: Any = None,
+    callback_now: Any = None,
 ) -> Callable[["GateReplay"], Awaitable[Any]]:
     """A driver like ``drive_identity_then_consent``, with the T05 judge.
 
@@ -1112,6 +1120,16 @@ def drive_with_judge(
     the consent read is the real `_classify_phone_answer` with the wiring.
     ``anchor_consent=False`` models the deterministic flow, which sets no
     question anchor before the consent line.
+
+    T06: with ``callback_client`` (a fake propose/confirm client), a consent
+    read that ends in a callback request CONTINUES into the real
+    `phone.converse_callback_before_consent` — the gate's own callback
+    conversation — with the session's seams: the callback reader
+    (`agent._next_callback_turn`'s `_read_fresh_turn` call), the question
+    barrier, the budget, and the wiring's `judge_callback` against the line
+    just spoken. Its end is ``result.callback_end``; a terminal line it ends
+    with is spoken (kind ``callback``) like the gate does after posting.
+    ``callback_now`` fixes the clock the spoken days resolve against.
     """
     async def _driver(rt: "GateReplay") -> GateReplayResult:
         result = rt.result
@@ -1192,6 +1210,11 @@ def drive_with_judge(
             role_title=role_title,
         )
         result.decision_at_ms = rt.now_ms
+        if (callback_client is not None
+                and result.decision == phone.CLASSIFY_CALLBACK_REQUESTED
+                and result.consumed):
+            result.callback_end = await _converse_callback(
+                rt, wiring, budget, callback_client, callback_now)
         if wiring.shadowing and shadow_settle_ms:
             # Let in-flight shadow calls finish so their logs can be read; the
             # decision time above was taken BEFORE this wait.
@@ -1199,6 +1222,45 @@ def drive_with_judge(
         return result
 
     return _driver
+
+
+async def _converse_callback(
+    rt: "GateReplay", wiring: Any, budget: Any, client: Any, now: Any,
+) -> Any:
+    """The gate's `_schedule_before_consent`, with the session's seams (T06)."""
+    glue = rt.glue
+
+    async def _say(text: str) -> None:
+        await rt.say(text, kind="callback")
+
+    async def _read() -> str:
+        # agent.py `_next_callback_turn`
+        return await agent_mod._read_fresh_turn(
+            glue.user_turns, glue.question_anchor,
+            phone.phone_classify_answer_timeout_sec(),
+            spoke=glue.spoke, spoke_source=gate_judge.SPOKE_SOURCE_CALLBACK,
+        )
+
+    def _budget_allows(phase: str) -> bool:
+        return True if budget is None else budget.can_ask(phase)
+
+    kwargs: dict[str, Any] = {}
+    if now is not None:
+        kwargs["now"] = now
+    end = await phone.converse_callback_before_consent(
+        rt.result.consumed[-1],
+        client=client, attempt_id="replay-attempt", say=_say, read_reply=_read,
+        ask_barrier=glue.mark_question_asked, budget_allows=_budget_allows,
+        gate_budget=budget, classify_gate_reply=agent_mod.classify_answer_text,
+        # agent.py: `judge_callback=lambda reply, first=False:
+        # gate_judge_wiring.judge_callback(reply, gate_last_line[0], first=first)`
+        judge_callback=lambda reply, first=False: wiring.judge_callback(
+            reply, glue.last_line[0], first=first),
+        **kwargs,
+    )
+    if end.decision is not None and end.decision.terminal:
+        await _say(end.decision.spoken)
+    return end
 
 
 def replay(

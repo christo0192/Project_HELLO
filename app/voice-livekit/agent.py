@@ -1814,6 +1814,10 @@ class _GateJudgeWiring:
         self._shadow_tasks: "set[asyncio.Task[Any]]" = set()
         self._identity_shadow: "asyncio.Task[Any] | None" = None
         self.stopped = False
+        # T06: the last ACTING decision, so the callback conversation can
+        # reuse the busy verdict that started it instead of judging the same
+        # reply twice.
+        self.last_decision: "gate_judge.GateDecision | None" = None
 
     # ── mode ─────────────────────────────────────────────────────────────
     @property
@@ -1890,6 +1894,37 @@ class _GateJudgeWiring:
         )
         if decision.source == gate_judge.SOURCE_LLM and decision.intent is not None:
             self.latch.note_judge_intent(decision.intent)
+        self.last_decision = decision
+        return decision
+
+    async def judge_callback(
+        self, reply: Any, bot_line: Any, *, first: bool = False,
+    ) -> "gate_judge.GateDecision | None":
+        """T06: the `callback_time` reading of one callback reply, or None.
+
+        llm mode only (legacy and shadow: None, so the deterministic parser
+        alone decides). The FIRST reply of the conversation is the busy reply
+        the identity or consent judge just read: its decision is reused when
+        it was a valid busy verdict, and otherwise not re-judged (the judge was
+        unavailable, or legacy routed it). Never raises.
+        """
+        if not self.acting or not isinstance(reply, str) or not reply.strip():
+            return None
+        if first:
+            last = self.last_decision
+            if (last is not None and last.source == gate_judge.SOURCE_LLM
+                    and last.intent == gate_judge.INTENT_NOT_NOW_BUSY):
+                return last
+            return None
+        try:
+            decision = await self.decide(
+                gate_judge.PHASE_CALLBACK_TIME, bot_line, legacy=lambda: None)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — the judge never fails the gate
+            return None
+        if decision.source != gate_judge.SOURCE_LLM or decision.intent is None:
+            return None
         return decision
 
     def shadow(self, phase: str, bot_line: Any, legacy_intent: str | None) -> "asyncio.Task[Any] | None":
@@ -12488,6 +12523,10 @@ async def _run_phone_session(
             judge_identity=_judge_identity,
             note_identity_route=gate_judge_wiring.note_identity_route,
             mark_recording_sentence=_mark_recording_sentence,
+            # M013 S01 T06: the judge's reading of each callback reply (llm
+            # mode; None otherwise), against the bot line just spoken.
+            judge_callback=lambda reply, first=False: gate_judge_wiring.judge_callback(
+                reply, gate_last_line[0], first=first),
         )
 
     # Boolean phase marks from the gate, plus E3's `sip_left_reason` (a fixed

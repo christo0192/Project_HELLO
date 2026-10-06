@@ -5,6 +5,9 @@ import unittest
 import sys
 from unittest.mock import AsyncMock, patch
 
+from datetime import datetime, timezone
+
+import gate_judge
 import phone
 from test_phone_gate import agent_mod
 import test_phone_gate as harness
@@ -12,7 +15,7 @@ import test_phone_gate as harness
 
 class ConversationGateTests(unittest.IsolatedAsyncioTestCase):
     async def gate(self, replies, *, draft=None, identity=False, confirm=True,
-                   say_error=False):
+                   say_error=False, **extra):
         queue = asyncio.Queue()
         for reply in replies:
             queue.put_nowait(reply)
@@ -56,7 +59,7 @@ class ConversationGateTests(unittest.IsolatedAsyncioTestCase):
                 next_candidate_turn=next_turn, consent_reply_out=consumed,
                 classify_gate_reply=agent_mod.classify_answer_text,
                 gate_phase_out=phases, candidate_name="Taylor Example",
-                session_id="synthetic-session", epoch=1,
+                session_id="synthetic-session", epoch=1, **extra,
             )
         client.consent_and_start_assessment.assert_not_awaited()
         self.assertFalse(result.assessment_allowed)
@@ -150,6 +153,129 @@ class ConversationGateTests(unittest.IsolatedAsyncioTestCase):
     async def test_playout_failure_does_not_replay_an_opener(self):
         with self.assertRaisesRegex(RuntimeError, "playout"):
             await self.gate(["No thanks"], say_error=True)
+
+
+#: M013 S01 T06: Tuesday 2026-10-06 09:00 IST (a bare "11 am" alone would be
+#: TODAY); tomorrow is Wednesday 10-07.
+_T06_NOW = datetime(2026, 10, 6, 3, 30, tzinfo=timezone.utc)
+
+
+def _ist(day, hh, mm=0):
+    local = datetime.fromisoformat(f"{day}T{hh:02d}:{mm:02d}:00+05:30")
+    return local.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _judged(intent="not_now_busy", day="", when="", resolved=None):
+    callback = None
+    if intent == "not_now_busy":
+        callback = gate_judge.JudgeCallback(day_text=day, time_text=when, resolved_ist=resolved)
+    return gate_judge.GateDecision(intent=intent, source="llm", callback=callback)
+
+
+class _CallbackJudge:
+    """A `judge_callback` seam answering from a script, keyed by reply."""
+
+    def __init__(self, readings):
+        self.readings = dict(readings)
+        self.calls = []
+
+    async def __call__(self, reply, first=False):
+        self.calls.append((reply, first))
+        return self.readings.get(reply)
+
+
+class CallbackConversationGateTests(ConversationGateTests):
+    """M013 S01 T06: the gate's callback conversation, through `run_phone_gate`."""
+
+    def setUp(self):
+        patcher = patch.object(phone, "_callback_now", lambda: _T06_NOW)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _proposed(self, client):
+        return [c.args[1] for c in client.propose_callback.await_args_list]
+
+    async def test_32757295_shape_busy_then_tomorrow_then_11_am_books_and_reads_back(self):
+        result, client, spoken, events, phases = await self.gate(
+            ["I am busy right now", "Can you call me back tomorrow?", "11 am"])
+        self.assertEqual(result.outcome, phone.HALT_CALLBACK_SCHEDULED)
+        self.assertEqual(self._proposed(client), [_ist("2026-10-07", 11)])
+        client.confirm_callback.assert_awaited_once()
+        self.assertEqual(spoken[1:3], [
+            phone._CALLBACK_ASK_TIME_TEXT,
+            "Sure, what time tomorrow works? Anywhere between 9 in the morning and 9 at night.",
+        ])
+        self.assertTrue(spoken[-1].startswith(phone._CALLBACK_BOOKED_PREFIX))
+        self.assertTrue(phases["terminal_posted"])
+        # Never voicemail, never a consent event, never a yes/no re-ask.
+        self.assertEqual(events, ["call.answered"])
+        for reask in (phone.PHONE_CONSENT_REASK_UNCLEAR_TEXT,
+                      phone.PHONE_CONSENT_REASK_SILENCE_TEXT,
+                      phone.PHONE_CONSENT_REASK_QUESTION_TEXT):
+            self.assertNotIn(reask, spoken)
+
+    async def test_tomorrow_then_silence_is_the_deferral_goodbye(self):
+        result, client, spoken, events, _ = await self.gate(["I'm busy", "tomorrow"])
+        self.assertEqual(result.outcome, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        self.assertEqual(spoken[-2], phone._callback_partial_time_text(
+            datetime(2026, 10, 7).date(), _T06_NOW))
+        self.assertEqual(spoken[-1], phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT)
+        self.assertEqual(events, ["call.answered", "candidate.deferred_pre_disclosure"])
+        client.propose_callback.assert_not_awaited()
+
+    async def test_today_at_5_gets_the_tomorrow_offer(self):
+        result, client, spoken, _, _ = await self.gate(["I'm busy", "today at 5", "Yes"])
+        self.assertIn(
+            "Sorry, the earliest I can do is tomorrow. I can do tomorrow at 5 in the "
+            "evening, India time. Does that work?", spoken)
+        self.assertEqual(result.outcome, phone.HALT_CALLBACK_SCHEDULED)
+        self.assertEqual(self._proposed(client), [_ist("2026-10-07", 17)])
+
+    async def test_nothing_booked_after_two_clarifications(self):
+        result, client, spoken, events, _ = await self.gate(
+            ["I'm busy", "not sure", "no idea"])
+        self.assertEqual(result.outcome, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        self.assertEqual(spoken[-1], phone.PHONE_CALLBACK_NOTHING_BOOKED_TEXT)
+        self.assertEqual(events[-1], "candidate.deferred_pre_disclosure")
+        self.assertEqual(spoken.count(phone._CALLBACK_ASK_TIME_TEXT), 2)
+        client.propose_callback.assert_not_awaited()
+
+    async def test_a_judge_only_resolution_is_confirmed_before_propose(self):
+        judge = _CallbackJudge({
+            "kal lunch ke baad": _judged(day="kal", when="lunch ke baad",
+                                         resolved="2026-10-07T14:00"),
+            "haan": _judged("consent_granted"),
+        })
+        result, client, spoken, _, _ = await self.gate(
+            ["I'm busy", "kal lunch ke baad", "haan"], judge_callback=judge)
+        self.assertEqual(result.outcome, phone.HALT_CALLBACK_SCHEDULED)
+        offer = "So that's tomorrow at 2 in the afternoon, India time. Does that work?"
+        self.assertIn(offer, spoken)
+        self.assertEqual(self._proposed(client), [_ist("2026-10-07", 14)])
+        # The busy reply that started the conversation is the consent judge's
+        # to read (`first=True`); every later reply is judged.
+        self.assertEqual(judge.calls, [("I'm busy", True), ("kal lunch ke baad", False),
+                                       ("haan", False)])
+
+    async def test_a_judge_resolution_whose_spans_are_not_in_the_words_is_ignored(self):
+        judge = _CallbackJudge({
+            "after lunch": _judged(day="monday", when="4 pm", resolved="2026-10-12T16:00"),
+        })
+        result, client, spoken, _, _ = await self.gate(
+            ["I'm busy", "after lunch"], judge_callback=judge)
+        client.propose_callback.assert_not_awaited()
+        self.assertFalse(any(s.endswith(phone._CALLBACK_OFFER_SUFFIX) for s in spoken))
+        self.assertEqual(spoken[-1], phone.PHONE_GATE_DEFERRAL_GOODBYE_TEXT)
+        self.assertEqual(result.outcome, phone.CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+
+    async def test_a_broken_judge_seam_is_the_deterministic_parser(self):
+        async def broken(reply, first=False):
+            raise RuntimeError("judge down")
+
+        result, client, _, _, _ = await self.gate(
+            ["I'm busy", "tomorrow at 3 pm"], judge_callback=broken)
+        self.assertEqual(result.outcome, phone.HALT_CALLBACK_SCHEDULED)
+        self.assertEqual(self._proposed(client), [_ist("2026-10-07", 15)])
 
 
 class IntentTests(unittest.TestCase):

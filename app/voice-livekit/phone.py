@@ -1026,6 +1026,13 @@ def gate_copy_texts() -> frozenset[str]:
         # The terminal wording of the same refusals. Omitting these would make
         # the bot's own sign-off look like a screening answer.
         *_SCHEDULE_TERMINAL_TEXT.values(),
+        # M013 S01 T06: the gate's callback conversation. The day-specific
+        # time question and the confirm question name a day/time, so
+        # `is_gate_copy` matches them by their fixed frames.
+        _CALLBACK_EARLIEST_TOMORROW_TEXT,
+        _CALLBACK_TOO_FAR_TEXT,
+        _CALLBACK_OUTSIDE_HOURS_TEXT,
+        PHONE_CALLBACK_NOTHING_BOOKED_TEXT,
     ])
 
 
@@ -1044,6 +1051,16 @@ def is_gate_copy(text: Any) -> bool:
         # M013 S01 T05: the consent-turn "what role?" answer names the role.
         clean.startswith(_CONSENT_FAQ_ROLE_PREFIX)
         and clean.endswith(_CONSENT_FAQ_ROLE_SUFFIX)
+    ) or (
+        # M013 S01 T06: "Sure, what time tomorrow works? Anywhere between …".
+        clean.startswith(_CALLBACK_PARTIAL_TIME_PREFIX)
+        and clean.endswith(_CALLBACK_PARTIAL_TIME_SUFFIX)
+    ) or (
+        # M013 S01 T06: the confirm question for a time the candidate did not
+        # say verbatim ("So that's tomorrow at 2 in the afternoon, India time.
+        # Does that work?").
+        clean.endswith(_CALLBACK_OFFER_SUFFIX)
+        and any(clean.startswith(p) for p in _CALLBACK_OFFER_PREFIXES.values())
     )
 
 
@@ -4881,6 +4898,49 @@ _WEEKDAY_RE = re.compile(
 # ISO date the candidate (or a downstream) might have already resolved.
 _EXPLICIT_DATE_RE = re.compile(r"\b(\d{4})-(\d{2})-(\d{2})\b")
 
+#: M013 S01 T06: a calendar date NAMED with its month ("October 8", "8th
+#: October", "the 8th of Oct"). C5 refused these because they used to be
+#: silently dropped (and the call booked today/tomorrow at the clock); they
+#: now resolve to their NEXT occurrence instead. A day number WITHOUT a month
+#: ("on the 5th") is still refused: which month is a guess.
+_MONTHS = {
+    "january": 1, "jan": 1, "february": 2, "feb": 2, "march": 3, "mar": 3,
+    "april": 4, "apr": 4, "may": 5, "june": 6, "jun": 6, "july": 7, "jul": 7,
+    "august": 8, "aug": 8, "september": 9, "sept": 9, "sep": 9,
+    "october": 10, "oct": 10, "november": 11, "nov": 11, "december": 12, "dec": 12,
+}
+_MONTH_NAME_ALT = "|".join(sorted(_MONTHS, key=len, reverse=True))
+_MONTH_DAY_NUM = r"(?:3[01]|[12]\d|0?[1-9])"
+_MONTH_DATE_RE = re.compile(
+    r"\b(?:(?P<m1>" + _MONTH_NAME_ALT + r")\.?\s+(?:the\s+)?(?P<d1>" + _MONTH_DAY_NUM
+    + r")(?:st|nd|rd|th)?"
+    r"|(?:the\s+)?(?P<d2>" + _MONTH_DAY_NUM + r")(?P<ord2>st|nd|rd|th)?\s+(?P<of2>of\s+)?"
+    r"(?P<m2>" + _MONTH_NAME_ALT + r"))\b",
+    re.IGNORECASE,
+)
+#: "4 may" is also "at 4 may be fine": a bare number before may/mar/march is
+#: a date only with an ordinal or "of" ("4th May", "4 of March"); otherwise it
+#: stays unresolved, exactly as C5 refused it.
+_AMBIGUOUS_TRAILING_MONTHS = frozenset({"may", "mar", "march"})
+
+
+def _month_date_matches(clean: str) -> tuple[bool, list[re.Match[str]]]:
+    """``(ok, matches)``: month-named dates, refusing the ambiguous form."""
+    matches = list(_MONTH_DATE_RE.finditer(clean))
+    for m in matches:
+        if (m.group("m2") and m.group("m2").lower() in _AMBIGUOUS_TRAILING_MONTHS
+                and not (m.group("ord2") or m.group("of2"))):
+            return False, []
+    return True, matches
+
+
+def _strip_month_dates(clean: str, matches: list[re.Match[str]]) -> str:
+    """``clean`` with each month-named date blanked (by position)."""
+    out = clean
+    for m in reversed(matches):
+        out = out[:m.start()] + " " + out[m.end():]
+    return out
+
 
 #: M009 PR-C (C5). The bookable IST window, in minutes after midnight: a
 #: resolved start outside [09:00, 21:00) returns None (one clarification)
@@ -5078,7 +5138,95 @@ def _resolve_ist_hour(
     return None
 
 
-def parse_callback_time_ist(text: Any, now: datetime) -> str | None:
+def _callback_now_ist(now: datetime) -> datetime:
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now.astimezone(_IST_ZONE)
+
+
+def _month_date_next(month: int, day: int, now_ist: datetime) -> Optional[Any]:
+    """The NEXT occurrence (today counts) of a month/day, or None if invalid."""
+    year = now_ist.year
+    for candidate_year in (year, year + 1):
+        try:
+            value = datetime(candidate_year, month, day).date()
+        except ValueError:
+            # Feb 29 in a non-leap year, "April 31": not a date.
+            continue
+        if value >= now_ist.date():
+            return value
+    return None
+
+
+def _callback_day_ist(clean: str, now_ist: datetime) -> tuple[bool, Any]:
+    """The IST calendar DAY an utterance names: ``(ok, date | None)``.
+
+    ``ok`` is False when the day is named in a way that cannot be resolved
+    honestly (an ordinal with no month, "next week", two named dates); the
+    caller then returns None rather than guess. ``(True, None)``: no day named.
+    """
+    ok_months, month_dates = _month_date_matches(clean)
+    if not ok_months:
+        return False, None
+    without_dates = _strip_month_dates(clean, month_dates)
+    if _UNRESOLVED_DAY_RE.search(_EXPLICIT_DATE_RE.sub(" ", without_dates)):
+        return False, None
+    low = clean.lower()
+    m_date = _EXPLICIT_DATE_RE.search(clean)
+    if (m_date is not None) + len(month_dates) > 1:
+        # "the 8th of October or the 9th of October": which one is a guess.
+        return False, None
+    if m_date:
+        try:
+            return True, datetime(
+                int(m_date.group(1)), int(m_date.group(2)), int(m_date.group(3)),
+            ).date()
+        except ValueError:
+            return False, None
+    if month_dates:
+        m = month_dates[0]
+        month = _MONTHS[(m.group("m1") or m.group("m2")).lower()]
+        day = int(m.group("d1") or m.group("d2"))
+        value = _month_date_next(month, day, now_ist)
+        return (value is not None), value
+    if re.search(r"\bday after tomorrow\b", low):
+        return True, (now_ist + timedelta(days=2)).date()
+    if re.search(r"\btomorrow\b", low):
+        return True, (now_ist + timedelta(days=1)).date()
+    if re.search(r"\b(?:today|tonight)\b", low):
+        return True, now_ist.date()
+    m_wd = _WEEKDAY_RE.search(low)
+    if m_wd:
+        target_wd = _WEEKDAYS[m_wd.group(1).lower()]
+        # The NEXT occurrence of that weekday, strictly ahead (0 days would
+        # mean "today", which the candidate would have said as "today").
+        delta = (target_wd - now_ist.weekday()) % 7
+        if delta == 0:
+            delta = 7
+        return True, (now_ist + timedelta(days=delta)).date()
+    return True, None
+
+
+def parse_callback_day_ist(text: Any, now: datetime) -> Any:
+    """M013 S01 T06: the IST DAY a reply names, with or without a clock.
+
+    "call me back tomorrow?" -> tomorrow's IST date. None when no day is
+    named or it cannot be resolved honestly (same refusals as
+    `parse_callback_time_ist`). Used to remember a day across a "what time
+    tomorrow?" turn; never booked on its own.
+    """
+    if not isinstance(text, str):
+        return None
+    clean = " ".join(text.strip().split())
+    if not clean:
+        return None
+    ok, value = _callback_day_ist(clean, _callback_now_ist(now))
+    return value if ok else None
+
+
+def parse_callback_time_ist(
+    text: Any, now: datetime, *, default_day: Any = None,
+) -> str | None:
     """Resolve a candidate's spoken callback time to a UTC ISO-8601 instant.
 
     Deterministic and IST-aware. `now` is the anchor instant (tz-aware; the
@@ -5098,56 +5246,40 @@ def parse_callback_time_ist(text: Any, now: datetime) -> str | None:
     * a daypart binds only as a phrase (see `_DAYPART_PHRASE_RE`);
     * a bare 1-6 reads as PM; a bare 7/8, or h:mm before 09:00 without
       am/pm, is None;
-    * a date it cannot resolve ("on the 5th", "October 4", "next week"), or a
-      relative offset ("in 2 hours"), is None — never silently today/tomorrow;
+    * a date it cannot resolve ("on the 5th", "next week"), or a relative
+      offset ("in 2 hours"), is None — never silently today/tomorrow;
     * a resolved start outside 09:00-21:00 IST is None.
+
+    M013 S01 T06 additions:
+    * a date named with its month ("October 8 at 11am", "8th October at 3")
+      resolves to its next occurrence (it used to be refused as unresolved);
+    * ``default_day`` (an IST ``date``) is the day the conversation already
+      settled ("call me back tomorrow?" -> "what time tomorrow?" -> "11 am"):
+      it is used only when THIS utterance names no day of its own.
     """
     if not isinstance(text, str):
         return None
     clean = " ".join(text.strip().split())
     if not clean:
         return None
-    if now.tzinfo is None:
-        now = now.replace(tzinfo=timezone.utc)
-    now_ist = now.astimezone(_IST_ZONE)
+    now_ist = _callback_now_ist(now)
 
     # 0) Refuse what cannot be resolved honestly, before any guessing.
-    if _UNRESOLVED_DAY_RE.search(_EXPLICIT_DATE_RE.sub(" ", clean)):
+    ok_day, named_day = _callback_day_ist(clean, now_ist)
+    if not ok_day:
         return None
     if _RELATIVE_OFFSET_RE.search(clean):
         return None
-    clean = _normalize_clock_words(clean)
+    clean = _normalize_clock_words(
+        _strip_month_dates(clean, _month_date_matches(clean)[1]))
     low = clean.lower()
     day_part = _utterance_daypart(low)
     if day_part is False:
         return None
 
-    # 1) Resolve the DAY (IST calendar date).
-    target_date = None
-    m_date = _EXPLICIT_DATE_RE.search(clean)
-    if m_date:
-        try:
-            target_date = datetime(
-                int(m_date.group(1)), int(m_date.group(2)), int(m_date.group(3)),
-            ).date()
-        except ValueError:
-            return None
-    elif re.search(r"\bday after tomorrow\b", low):
-        target_date = (now_ist + timedelta(days=2)).date()
-    elif re.search(r"\btomorrow\b", low):
-        target_date = (now_ist + timedelta(days=1)).date()
-    elif re.search(r"\b(?:today|tonight)\b", low):
-        target_date = now_ist.date()
-    else:
-        m_wd = _WEEKDAY_RE.search(low)
-        if m_wd:
-            target_wd = _WEEKDAYS[m_wd.group(1).lower()]
-            # The NEXT occurrence of that weekday, strictly ahead (0 days would
-            # mean "today", which the candidate would have said as "today").
-            delta = (target_wd - now_ist.weekday()) % 7
-            if delta == 0:
-                delta = 7
-            target_date = (now_ist + timedelta(days=delta)).date()
+    # 1) The DAY (IST calendar date): the one this utterance names, else the
+    # conversation's settled day, else (step 3) today-or-tomorrow.
+    target_date = named_day if named_day is not None else default_day
 
     # 2) Resolve the TIME. Strip the day words first so "tomorrow" cannot be read
     # as an hour, then find the first clock phrase carrying real time evidence
@@ -5603,6 +5735,249 @@ _CALLBACK_ASK_TIME_TEXT = (
     "You can say something like tomorrow at 3 in the afternoon."
 )
 
+# ── M013 S01 T06: the gate's callback CONVERSATION ─────────────────────
+#
+# Before consent (`run_phone_gate` -> `converse_callback_before_consent`) the
+# callback flow runs CONVERSATIONALLY (`CallbackFlowState(conversational=True)`):
+# it remembers a day the candidate already gave ("call me back tomorrow?" ->
+# "what time tomorrow?" -> "11 am"), asks up to TWO clarifications instead of
+# one, offers tomorrow instead of a same-day time the server would refuse,
+# re-validates every instant locally (09:00-21:00 IST, at most 14 days ahead,
+# never the same IST day), and CONFIRMS any time it did not hear verbatim
+# (a judge-only resolution, an "anytime" slot, a moved same-day time) before
+# proposing it. The in-call (post-consent) flow keeps the original behaviour.
+#
+# Every line below is gate copy (`gate_copy_texts` / `is_gate_copy`).
+CALLBACK_GATE_MAX_CLARIFICATIONS = 2
+#: Confirm questions ("So that's tomorrow at 2 in the afternoon, India time.
+#: Does that work?"). One per conversation: a second one becomes a
+#: clarification, so the conversation stays bounded.
+CALLBACK_GATE_MAX_OFFERS = 1
+#: The furthest ahead a callback may be booked (IST calendar days).
+CALLBACK_MAX_DAYS_AHEAD = 14
+#: The clock offered for "anytime" (IST), on the settled day or tomorrow.
+_CALLBACK_ANYTIME_HOUR = 11
+
+_CALLBACK_PARTIAL_TIME_PREFIX = "Sure, what time "
+_CALLBACK_PARTIAL_TIME_SUFFIX = (
+    " works? Anywhere between 9 in the morning and 9 at night."
+)
+_CALLBACK_EARLIEST_TOMORROW_TEXT = (
+    "Sorry, the earliest I can do is tomorrow. What time tomorrow works for "
+    "you? Anywhere between 9 in the morning and 9 at night."
+)
+_CALLBACK_TOO_FAR_TEXT = (
+    "I can only book a call within the next two weeks. What day and time in "
+    "the next two weeks works for you?"
+)
+_CALLBACK_OUTSIDE_HOURS_TEXT = (
+    "I can only set up calls between 9 in the morning and 9 at night. What "
+    "time in that window works for you?"
+)
+#: The confirm question. Composed at runtime (it names the time), so
+#: `is_gate_copy` matches it by one of these prefixes AND this suffix.
+_CALLBACK_OFFER_SUFFIX = ", India time. Does that work?"
+_CALLBACK_OFFER_PREFIXES: dict[str, str] = {
+    "confirm": "So that's ",
+    "anytime": "Sure. I can do ",
+    "earliest": "Sorry, the earliest I can do is tomorrow. I can do ",
+}
+#: The sign-off when the conversation ends with nothing booked (and nothing
+#: more specific to say): `candidate.deferred_pre_disclosure` is posted.
+PHONE_CALLBACK_NOTHING_BOOKED_TEXT = (
+    "No problem, our team will reach out to find a better time. Thanks, bye!"
+)
+
+#: "anytime", "whenever", "any time is fine", "kabhi bhi", "koi bhi time".
+_CALLBACK_ANYTIME_RE = re.compile(
+    r"\b(?:any\s?time|whenever|whatever\s+time|any\s+time\s+is\s+(?:fine|ok|okay)"
+    r"|kabhi\s+bhi|koi\s+bhi\s+time)\b",
+    re.IGNORECASE,
+)
+_JUDGE_RESOLVED_IST_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})[T ](\d{2}):(\d{2})(?::\d{2})?$"
+)
+
+
+def _callback_now() -> datetime:
+    """The gate's clock for resolving spoken days (a seam for tests)."""
+    return datetime.now(timezone.utc)
+
+
+def _utc_iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_utc_iso(starts_at: Any) -> Optional[datetime]:
+    if not isinstance(starts_at, str) or not _ISO_UTC_RE.match(starts_at.strip()):
+        return None
+    try:
+        return datetime.fromisoformat(starts_at.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def callback_slot_problem(starts_at: Any, now: datetime) -> Optional[str]:
+    """Why a resolved callback instant may NOT be proposed (None = it may).
+
+    The worker's own re-validation (the server stays the authority):
+    ``unreadable``; ``same_day`` (today or earlier, IST: the server refuses a
+    same-IST-day callback during the call); ``outside_hours`` (start outside
+    09:00-21:00 IST); ``too_far`` (more than 14 IST days ahead).
+    """
+    instant = _parse_utc_iso(starts_at)
+    if instant is None:
+        return "unreadable"
+    now_ist = _callback_now_ist(now)
+    ist = instant.astimezone(_IST_ZONE)
+    if ist.date() <= now_ist.date():
+        return "same_day"
+    minutes = ist.hour * 60 + ist.minute
+    if not _CALLBACK_WINDOW_OPEN_MIN <= minutes < _CALLBACK_WINDOW_CLOSE_MIN:
+        return "outside_hours"
+    if (ist.date() - now_ist.date()).days > CALLBACK_MAX_DAYS_AHEAD:
+        return "too_far"
+    return None
+
+
+def _callback_day_phrase(day: Any, now: datetime) -> str:
+    """'tomorrow', 'the day after tomorrow', 'on Monday', 'on Monday, October 12'."""
+    delta = (day - _callback_now_ist(now).date()).days
+    if delta == 0:
+        return "today"
+    if delta == 1:
+        return "tomorrow"
+    if delta == 2:
+        return "the day after tomorrow"
+    weekday = _WEEKDAY_NAMES[day.weekday()]
+    if 2 < delta < 7:
+        return f"on {weekday}"
+    month = (
+        "January", "February", "March", "April", "May", "June", "July",
+        "August", "September", "October", "November", "December",
+    )[day.month - 1]
+    return f"on {weekday}, {month} {day.day}"
+
+
+def _callback_clock_phrase(hour: int, minute: int) -> str:
+    """'11 in the morning', '2:30 in the afternoon', '12 noon', '6 in the evening'."""
+    if hour == 12 and minute == 0:
+        return "12 noon"
+    hour12 = hour % 12 or 12
+    clock = f"{hour12}" if minute == 0 else f"{hour12}:{minute:02d}"
+    if hour < 12:
+        part = "in the morning"
+    elif hour < 17:
+        part = "in the afternoon"
+    else:
+        part = "in the evening"
+    return f"{clock} {part}"
+
+
+def _callback_when_text(starts_at: str, now: datetime) -> str:
+    instant = _parse_utc_iso(starts_at)
+    ist = instant.astimezone(_IST_ZONE)  # type: ignore[union-attr]
+    return (
+        f"{_callback_day_phrase(ist.date(), now)} at "
+        f"{_callback_clock_phrase(ist.hour, ist.minute)}"
+    )
+
+
+def _callback_offer_text(kind: str, starts_at: str, now: datetime) -> str:
+    return (
+        _CALLBACK_OFFER_PREFIXES[kind] + _callback_when_text(starts_at, now)
+        + _CALLBACK_OFFER_SUFFIX
+    )
+
+
+def _callback_partial_time_text(day: Any, now: datetime) -> str:
+    """'Sure, what time tomorrow works? Anywhere between 9 … and 9 at night.'"""
+    return (
+        _CALLBACK_PARTIAL_TIME_PREFIX + _callback_day_phrase(day, now)
+        + _CALLBACK_PARTIAL_TIME_SUFFIX
+    )
+
+
+def _callback_at(day: Any, hour: int, minute: int) -> str:
+    return _utc_iso(datetime.combine(day, dt_time(hour, minute), tzinfo=_IST_ZONE))
+
+
+def _judge_resolved_ist_utc(value: Any) -> Optional[str]:
+    """The judge's ``resolved_ist`` ("YYYY-MM-DDTHH:MM", India time) as UTC."""
+    if not isinstance(value, str):
+        return None
+    m = _JUDGE_RESOLVED_IST_RE.match(value.strip())
+    if m is None:
+        return None
+    try:
+        local = datetime(
+            int(m.group(1)), int(m.group(2)), int(m.group(3)),
+            int(m.group(4)), int(m.group(5)), tzinfo=_IST_ZONE,
+        )
+    except ValueError:
+        return None
+    return _utc_iso(local)
+
+
+class _CallbackSpans:
+    """The judge's callback spans, already checked against the candidate's words."""
+
+    __slots__ = ("day_text", "time_text", "resolved_utc")
+
+    def __init__(self, day_text: str, time_text: str, resolved_utc: Optional[str]) -> None:
+        self.day_text = day_text
+        self.time_text = time_text
+        self.resolved_utc = resolved_utc
+
+
+def _usable_judged(judged: Any) -> bool:
+    """A valid judge verdict (llm source, known intent); else legacy decides."""
+    return (
+        judged is not None
+        and getattr(judged, "source", None) == gate_judge.SOURCE_LLM
+        and getattr(judged, "intent", None) in gate_judge.INTENTS
+    )
+
+
+def _judge_callback_spans(judged: Any, heard: list[str]) -> Optional[_CallbackSpans]:
+    """The judge's day/time spans, or None when unusable.
+
+    Owner rule (S01-PLAN T06, critique 15): each non-empty span must be a
+    normalised, word-bounded substring of something the candidate SAID in
+    this conversation (`gate_judge.evidence_in_text`, the grant-evidence
+    rule); otherwise the judge's whole callback is ignored, so an invented
+    date can never be booked. Logs categories only, never the spans.
+    """
+    if not _usable_judged(judged):
+        return None
+    callback = getattr(judged, "callback", None)
+    if not isinstance(callback, gate_judge.JudgeCallback):
+        return None
+    day_text = str(callback.day_text or "").strip()
+    time_text = str(callback.time_text or "").strip()
+    if not day_text and not time_text:
+        return None
+    for span in (day_text, time_text):
+        if span and not any(gate_judge.evidence_in_text(span, said) for said in heard):
+            _log.info(
+                "unknown_event", error_type="phone_callback_judge",
+                error_category="spans_not_in_reply",
+            )
+            return None
+    return _CallbackSpans(day_text, time_text, _judge_resolved_ist_utc(callback.resolved_ist))
+
+
+def _callback_reply_confirms(text: Any, judged: Any) -> bool:
+    """Is this reply a yes to the time just offered?
+
+    A valid judge verdict decides (``consent_granted`` = the affirmative; it
+    passed the grant guards in `gate_judge.judge_gate`); with no usable
+    verdict the deterministic read-back classifier decides.
+    """
+    if _usable_judged(judged):
+        return getattr(judged, "intent", None) == gate_judge.INTENT_CONSENT_GRANTED
+    return callback_confirmation_decision(text) == "confirmed"
+
 
 def _alternatives_offer_text(alternatives: list[CallbackAlternative]) -> str:
     """One spoken line offering the nearest one or two free slots."""
@@ -5659,13 +6034,33 @@ def _match_alternative(text: Any, alternatives: list[CallbackAlternative]) -> Ca
 
 
 class CallbackFlowState:
-    """The bounded, forward-only state of one in-call callback negotiation."""
+    """The bounded, forward-only state of one in-call callback negotiation.
 
-    __slots__ = ("phase", "alternatives")
+    M013 S01 T06: ``conversational=True`` (the pre-consent gate) adds the
+    conversation's memory and its bounds. The phase still only moves forward;
+    inside the time-capture phases each extra question spends one of
+    ``max_clarifications`` or ``max_offers``, so the flow stays finite:
+    ``day`` (a settled IST date), ``pending_slot`` (an offered, unconfirmed
+    instant) and ``heard`` (the candidate's words in this flow, held only to
+    check the judge's spans; never logged).
+    """
 
-    def __init__(self) -> None:
+    __slots__ = (
+        "phase", "alternatives", "conversational", "max_clarifications",
+        "clarifications", "max_offers", "offers", "day", "pending_slot", "heard",
+    )
+
+    def __init__(self, *, conversational: bool = False) -> None:
         self.phase = CALLBACK_PHASE_AWAITING_TIME
         self.alternatives: list[CallbackAlternative] = []
+        self.conversational = bool(conversational)
+        self.max_clarifications = CALLBACK_GATE_MAX_CLARIFICATIONS if conversational else 1
+        self.clarifications = 0
+        self.max_offers = CALLBACK_GATE_MAX_OFFERS if conversational else 0
+        self.offers = 0
+        self.day: Any = None
+        self.pending_slot: Optional[str] = None
+        self.heard: list[str] = []
 
 
 class CallbackDecision:
@@ -5770,11 +6165,25 @@ def _confirmation_failure_decision() -> CallbackDecision:
     )
 
 
+def _retry_refusal_text(status: str, flow: CallbackFlowState, now: Optional[datetime]) -> str:
+    """The re-ask for a refusal the candidate can fix.
+
+    T06: in the gate's conversation `slot_not_yet_eligible` (today is
+    refused) says plainly that tomorrow is the earliest, and settles the day
+    on tomorrow so a bare "11 am" next is read as tomorrow.
+    """
+    if flow.conversational and status == "slot_not_yet_eligible" and now is not None:
+        flow.day = (_callback_now_ist(now) + timedelta(days=1)).date()
+        return _CALLBACK_EARLIEST_TOMORROW_TEXT
+    return schedule_refusal_text(status)
+
+
 async def _propose_and_confirm(
     client: PhoneEventClient,
     attempt_id: str,
     starts_at: str,
     flow: CallbackFlowState,
+    now: Optional[datetime] = None,
 ) -> CallbackDecision:
     """Propose a resolved instant and, if valid, confirm it in the same turn.
 
@@ -5853,7 +6262,7 @@ async def _propose_and_confirm(
             )
             flow.phase = CALLBACK_PHASE_AWAITING_RETIME
             return CallbackDecision(
-                schedule_refusal_text(confirm_status), terminal=False,
+                _retry_refusal_text(confirm_status, flow, now), terminal=False,
             )
         # THE RE-ASK IS SPENT ON THIS LEG TOO. This used to fall straight
         # through to `_confirmation_failure_decision()`, which speaks the bare
@@ -5921,7 +6330,7 @@ async def _propose_and_confirm(
             error_category=status, schema="retried",
         )
         flow.phase = CALLBACK_PHASE_AWAITING_RETIME
-        return CallbackDecision(schedule_refusal_text(status), terminal=False)
+        return CallbackDecision(_retry_refusal_text(status, flow, now), terminal=False)
 
     # ── THE RE-ASK IS SPENT, BUT THE CANDIDATE STILL DESERVES THE REASON ──
     # A retryable status reaching here means the time was refused for something
@@ -5958,12 +6367,230 @@ async def _propose_and_confirm(
     )
 
 
+def _callback_clarify(flow: CallbackFlowState, spoken: str) -> CallbackDecision:
+    """T06: one more time question, or the end when the clarifications are spent.
+
+    Never moves the phase backwards: from `awaiting_time` it moves to
+    `awaiting_clarify`; in a later phase it stays put and only the counter
+    moves. The end is the bounded deferral (`retime_spent` after a refusal
+    re-ask, else `unparseable`), spoken as the nothing-booked sign-off.
+    """
+    if flow.clarifications >= flow.max_clarifications:
+        sub_reason = (
+            "retime_spent" if flow.phase == CALLBACK_PHASE_AWAITING_RETIME
+            else "unparseable"
+        )
+        flow.phase = CALLBACK_PHASE_DONE
+        flow.pending_slot = None
+        return _deferral_decision(sub_reason, PHONE_CALLBACK_NOTHING_BOOKED_TEXT)
+    flow.clarifications += 1
+    if flow.phase == CALLBACK_PHASE_AWAITING_TIME:
+        flow.phase = CALLBACK_PHASE_AWAITING_CLARIFY
+    return CallbackDecision(spoken, terminal=False)
+
+
+def _callback_offer(
+    flow: CallbackFlowState, kind: str, starts_at: str, now: datetime,
+    fallback_spoken: str,
+) -> CallbackDecision:
+    """T06: offer a time the candidate did not say verbatim, to be confirmed.
+
+    Bounded by ``max_offers``; past it the same turn is a clarification.
+    """
+    if flow.offers >= flow.max_offers:
+        return _callback_clarify(flow, fallback_spoken)
+    flow.offers += 1
+    flow.pending_slot = starts_at
+    # The offered day is now the conversation's day: "yes, but make it 4 pm"
+    # means 4 pm on THAT day.
+    flow.day = _parse_utc_iso(starts_at).astimezone(_IST_ZONE).date()  # type: ignore[union-attr]
+    if flow.phase == CALLBACK_PHASE_AWAITING_TIME:
+        flow.phase = CALLBACK_PHASE_AWAITING_CLARIFY
+    _log.info(
+        "unknown_event", error_type="phone_callback_turn",
+        error_category="offer", schema=kind,
+    )
+    return CallbackDecision(_callback_offer_text(kind, starts_at, now), terminal=False)
+
+
+def _callback_ask_text(flow: CallbackFlowState, now: datetime) -> str:
+    """The generic time question, or the day-specific one once a day is settled."""
+    if flow.day is not None:
+        return _callback_partial_time_text(flow.day, now)
+    return _CALLBACK_ASK_TIME_TEXT
+
+
+def _deterministic_slot(
+    text: str, spans: Optional[_CallbackSpans], flow: CallbackFlowState, now: datetime,
+) -> tuple[Optional[str], str]:
+    """(instant, source): the judge's spans read by the parser first, then
+    the whole reply. Deterministic either way: the model chose WHICH words,
+    the parser decides WHAT they mean."""
+    if spans is not None:
+        joined = " ".join(part for part in (spans.day_text, spans.time_text) if part)
+        candidates = [joined]
+        if spans.time_text and not re.match(r"(?i)at\b", spans.time_text):
+            candidates.append(" ".join(
+                part for part in (spans.day_text, "at " + spans.time_text) if part))
+        for candidate in candidates:
+            slot = parse_callback_time_ist(candidate, now, default_day=flow.day)
+            if slot is not None:
+                return slot, "judge_spans"
+    slot = parse_callback_time_ist(text, now, default_day=flow.day)
+    return slot, "deterministic"
+
+
+async def _conversational_callback_turn(
+    flow: CallbackFlowState,
+    client: PhoneEventClient,
+    attempt_id: str,
+    text: str,
+    now: datetime,
+    judged: Any,
+) -> CallbackDecision:
+    """T06: one turn of the gate's callback conversation (time-capture phases).
+
+    Order: a pending offer is confirmed or dropped; then the reply is
+    resolved — the judge's spans and the whole reply by the deterministic
+    parser (the judge's ``resolved_ist`` only cross-checked), a judge-only
+    resolution (confirmed before it is proposed), "anytime" (a confirmed
+    offer), a day with no time (remembered; "what time tomorrow?"), or
+    nothing (a clarification). Every instant is re-validated locally before
+    it is proposed or offered.
+    """
+    if text.strip():
+        flow.heard.append(text)
+    spans = _judge_callback_spans(judged, flow.heard)
+
+    pending, flow.pending_slot = flow.pending_slot, None
+    if pending is not None:
+        restated = parse_callback_time_ist(text, now, default_day=flow.day)
+        if restated in (None, pending) and _callback_reply_confirms(text, judged):
+            _log.info(
+                "unknown_event", error_type="phone_callback_turn",
+                error_category="offer_confirmed",
+            )
+            return await _propose_and_confirm(client, attempt_id, pending, flow, now)
+        # Anything else is a clarification turn: the reply is read below.
+        _log.info(
+            "unknown_event", error_type="phone_callback_turn",
+            error_category="offer_not_confirmed",
+        )
+
+    slot, source = _deterministic_slot(text, spans, flow, now)
+    if slot is not None:
+        if spans is not None and spans.resolved_utc is not None:
+            _log.info(
+                "unknown_event", error_type="phone_callback_judge",
+                error_category=(
+                    "resolved_match" if spans.resolved_utc == slot else "resolved_mismatch"
+                ),
+            )
+        problem = callback_slot_problem(slot, now)
+        _log.info(
+            "unknown_event", error_type="phone_callback_turn",
+            error_category="resolved", schema=f"{source}:{problem or 'ok'}",
+        )
+        return await _resolved_slot_turn(flow, client, attempt_id, slot, problem, now, "slot")
+
+    if spans is not None and spans.resolved_utc is not None and spans.time_text:
+        judge_slot = spans.resolved_utc
+        if not spans.day_text and flow.day is not None:
+            # The day was settled earlier; only the clock is the judge's.
+            clock = _parse_utc_iso(judge_slot).astimezone(_IST_ZONE)  # type: ignore[union-attr]
+            judge_slot = _callback_at(flow.day, clock.hour, clock.minute)
+        problem = callback_slot_problem(judge_slot, now)
+        _log.info(
+            "unknown_event", error_type="phone_callback_turn",
+            error_category="resolved", schema=f"judge_only:{problem or 'ok'}",
+        )
+        return await _resolved_slot_turn(
+            flow, client, attempt_id, judge_slot, problem, now, "confirm")
+
+    day = parse_callback_day_ist(text, now)
+    if day is None and spans is not None and spans.day_text:
+        day = parse_callback_day_ist(spans.day_text, now)
+
+    if _CALLBACK_ANYTIME_RE.search(text):
+        offer_day = day or flow.day or (_callback_now_ist(now) + timedelta(days=1)).date()
+        anytime = _callback_at(offer_day, _CALLBACK_ANYTIME_HOUR, 0)
+        problem = callback_slot_problem(anytime, now)
+        _log.info(
+            "unknown_event", error_type="phone_callback_turn",
+            error_category="resolved", schema=f"anytime:{problem or 'ok'}",
+        )
+        return await _resolved_slot_turn(
+            flow, client, attempt_id, anytime, problem, now, "anytime")
+
+    if day is not None:
+        today = _callback_now_ist(now).date()
+        if day <= today:
+            flow.day = today + timedelta(days=1)
+            spoken = _CALLBACK_EARLIEST_TOMORROW_TEXT
+            category = "same_day"
+        elif (day - today).days > CALLBACK_MAX_DAYS_AHEAD:
+            spoken = _CALLBACK_TOO_FAR_TEXT
+            category = "too_far"
+        else:
+            flow.day = day
+            spoken = _callback_partial_time_text(day, now)
+            category = "ok"
+        _log.info(
+            "unknown_event", error_type="phone_callback_turn",
+            error_category="day_only", schema=category,
+        )
+        return _callback_clarify(flow, spoken)
+
+    _log.info(
+        "unknown_event", error_type="phone_callback_turn",
+        error_category="unresolved",
+    )
+    return _callback_clarify(flow, _callback_ask_text(flow, now))
+
+
+async def _resolved_slot_turn(
+    flow: CallbackFlowState,
+    client: PhoneEventClient,
+    attempt_id: str,
+    slot: str,
+    problem: Optional[str],
+    now: datetime,
+    kind: str,
+) -> CallbackDecision:
+    """Propose a resolved instant, or offer/clarify when it may not be.
+
+    ``kind``: ``slot`` (the candidate's own words: proposed directly),
+    ``confirm`` (judge-only) or ``anytime`` (offered and confirmed first).
+    """
+    if problem is None:
+        if kind == "slot":
+            return await _propose_and_confirm(client, attempt_id, slot, flow, now)
+        return _callback_offer(flow, kind, slot, now, _callback_ask_text(flow, now))
+    if problem == "same_day":
+        # "today at 5": the server refuses today, so offer the same clock
+        # tomorrow (confirmed), or ask what time tomorrow.
+        tomorrow = (_callback_now_ist(now) + timedelta(days=1)).date()
+        flow.day = tomorrow
+        clock = _parse_utc_iso(slot).astimezone(_IST_ZONE)  # type: ignore[union-attr]
+        moved = _callback_at(tomorrow, clock.hour, clock.minute)
+        if callback_slot_problem(moved, now) is None:
+            return _callback_offer(flow, "earliest", moved, now, _CALLBACK_EARLIEST_TOMORROW_TEXT)
+        return _callback_clarify(flow, _CALLBACK_EARLIEST_TOMORROW_TEXT)
+    if problem == "too_far":
+        return _callback_clarify(flow, _CALLBACK_TOO_FAR_TEXT)
+    if problem == "outside_hours":
+        return _callback_clarify(flow, _CALLBACK_OUTSIDE_HOURS_TEXT)
+    return _callback_clarify(flow, _callback_ask_text(flow, now))
+
+
 async def run_callback_turn(
     flow: CallbackFlowState,
     client: PhoneEventClient,
     attempt_id: str,
     candidate_text: Any,
     now: datetime,
+    *,
+    judged: Any = None,
 ) -> CallbackDecision:
     """Advance the bounded callback flow by exactly one candidate turn.
 
@@ -5977,13 +6604,48 @@ async def run_callback_turn(
     round is reachable AFTER the re-ask because it ranks strictly later, so
     counting it out (as an earlier version of this docstring did) understates
     the bound by one turn.
+
+    M013 S01 T06: a ``conversational`` flow (the pre-consent gate) handles
+    the time-capture phases in `_conversational_callback_turn`, with
+    ``judged`` (the gate judge's `callback_time` decision, or None). Its
+    extra questions are bounded by counters (``max_clarifications``,
+    ``max_offers``) while the phase still only moves forward, so its longest
+    chain is: initial → 2 clarifications → 1 offer → 1 refusal re-ask → 1
+    alternatives round → end (`CALLBACK_GATE_MAX_TURNS` replies). A plain
+    deferral it ends in is spoken as `PHONE_CALLBACK_NOTHING_BOOKED_TEXT`.
     """
+    if flow.conversational:
+        decision = await _run_callback_phase(
+            flow, client, attempt_id, candidate_text, now, judged)
+        if (decision.terminal and decision.terminal_reason == HALT_CALLBACK_DEFERRED
+                and decision.spoken == PHONE_CALLBACK_DEFERRAL_TEXT):
+            decision.spoken = PHONE_CALLBACK_NOTHING_BOOKED_TEXT
+        return decision
+    return await _run_callback_phase(flow, client, attempt_id, candidate_text, now, None)
+
+
+async def _run_callback_phase(
+    flow: CallbackFlowState,
+    client: PhoneEventClient,
+    attempt_id: str,
+    candidate_text: Any,
+    now: datetime,
+    judged: Any,
+) -> CallbackDecision:
     phase = flow.phase
+
+    if flow.conversational and phase in (
+        CALLBACK_PHASE_AWAITING_TIME, CALLBACK_PHASE_AWAITING_CLARIFY,
+        CALLBACK_PHASE_AWAITING_RETIME,
+    ):
+        text = candidate_text if isinstance(candidate_text, str) else ""
+        return await _conversational_callback_turn(
+            flow, client, attempt_id, text, now, judged)
 
     if phase == CALLBACK_PHASE_AWAITING_TIME:
         starts_at = parse_callback_time_ist(candidate_text, now)
         if starts_at is not None:
-            return await _propose_and_confirm(client, attempt_id, starts_at, flow)
+            return await _propose_and_confirm(client, attempt_id, starts_at, flow, now)
         # Unparseable: ask ONCE for a specific time.
         flow.phase = CALLBACK_PHASE_AWAITING_CLARIFY
         return CallbackDecision(_CALLBACK_ASK_TIME_TEXT, terminal=False)
@@ -5991,7 +6653,7 @@ async def run_callback_turn(
     if phase == CALLBACK_PHASE_AWAITING_CLARIFY:
         starts_at = parse_callback_time_ist(candidate_text, now)
         if starts_at is not None:
-            return await _propose_and_confirm(client, attempt_id, starts_at, flow)
+            return await _propose_and_confirm(client, attempt_id, starts_at, flow, now)
         # Still unparseable after the one clarification: terminal deferral.
         flow.phase = CALLBACK_PHASE_DONE
         return _deferral_decision("unparseable")
@@ -6004,14 +6666,14 @@ async def run_callback_turn(
         # can no longer re-ask, and an unparseable answer defers immediately.
         starts_at = parse_callback_time_ist(candidate_text, now)
         if starts_at is not None:
-            return await _propose_and_confirm(client, attempt_id, starts_at, flow)
+            return await _propose_and_confirm(client, attempt_id, starts_at, flow, now)
         flow.phase = CALLBACK_PHASE_DONE
         return _deferral_decision("retime_spent")
 
     if phase == CALLBACK_PHASE_AWAITING_ALT_PICK:
         picked = _match_alternative(candidate_text, flow.alternatives)
         if picked is not None:
-            return await _propose_and_confirm(client, attempt_id, picked.starts_at, flow)
+            return await _propose_and_confirm(client, attempt_id, picked.starts_at, flow, now)
         # No clear pick from the offered slots: terminal deferral. ONE round only.
         flow.phase = CALLBACK_PHASE_DONE
         return _deferral_decision("alt_unpicked")
@@ -6022,6 +6684,136 @@ async def run_callback_turn(
     # the bounded catch-all.
     flow.phase = CALLBACK_PHASE_DONE
     return _deferral_decision(_PROPOSE_STATUS_PREFIX + "unknown")
+
+
+#: T06: the most candidate replies the gate's callback conversation reads —
+#: the first reply, the clarifications, the offer, one refusal re-ask and
+#: one alternatives round (see `run_callback_turn`). The budget usually ends
+#: it sooner.
+CALLBACK_GATE_MAX_TURNS = 1 + CALLBACK_GATE_MAX_CLARIFICATIONS + CALLBACK_GATE_MAX_OFFERS + 2
+
+GATE_CALLBACK_END_DECISION = "decision"        # a terminal CallbackDecision
+GATE_CALLBACK_END_VERDICT = "verdict"          # opt-out / wrong number / refusal
+GATE_CALLBACK_END_REQUESTED = "end_requested"  # "please hang up"
+GATE_CALLBACK_END_BUDGET = "budget"            # the T03 gate budget ran out
+GATE_CALLBACK_END_NO_REPLY = "no_reply"        # silence after a callback question
+GATE_CALLBACK_END_TURNS = "turns_exhausted"    # the turn bound (defensive)
+
+
+class GateCallbackEnd:
+    """How the gate's callback conversation ended. The gate posts the
+    terminal FIRST and then speaks (``decision.spoken`` or its own goodbye),
+    so nothing here posts an event."""
+
+    __slots__ = ("kind", "decision", "verdict", "schema")
+
+    def __init__(
+        self, kind: str, *, decision: Optional[CallbackDecision] = None,
+        verdict: Optional[str] = None, schema: Optional[str] = None,
+    ) -> None:
+        self.kind = kind
+        self.decision = decision
+        self.verdict = verdict
+        self.schema = schema
+
+
+async def _judge_callback_reply(
+    judge_callback: Optional[Callable[..., Awaitable[Any]]], reply: str, *, first: bool,
+) -> Any:
+    """The judge's reading of one callback reply, or None. Never raises."""
+    if judge_callback is None or not isinstance(reply, str) or not reply.strip():
+        return None
+    try:
+        return await judge_callback(reply, first=first)
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 — a broken judge is "no verdict"
+        _log.warn(
+            "unknown_event", error_type="phone_callback_judge",
+            error_category="judge_seam_failed",
+        )
+        return None
+
+
+async def converse_callback_before_consent(
+    first_reply: str,
+    *,
+    client: PhoneEventClient,
+    attempt_id: str,
+    say: Callable[[str], Awaitable[Any]],
+    read_reply: Optional[Callable[[], Awaitable[str]]],
+    ask_barrier: Callable[[], None],
+    budget_allows: Callable[[str], bool],
+    gate_budget: Any = None,
+    classify_gate_reply: Optional[Callable[[str], Optional[str]]] = None,
+    judge_callback: Optional[Callable[..., Awaitable[Any]]] = None,
+    now: Optional[Callable[[], datetime]] = None,
+) -> GateCallbackEnd:
+    """M013 S01 T06: the pre-consent callback CONVERSATION.
+
+    The calendar pipeline (propose, then confirm) without authorizing the
+    screening. Each reply: the hard exits first (opt-out / wrong number, an
+    explicit end request, a recording refusal — the regex reader, as before),
+    then the gate judge's ``callback_time`` reading (llm mode only; None
+    otherwise), then one `run_callback_turn` of a conversational flow. A
+    non-terminal line is spoken only when its answer still fits the T03
+    budget, after the question barrier. Silence after a callback question
+    ends the conversation (the gate says its deferral goodbye). Returns how
+    it ended; the gate posts and speaks the terminal.
+    """
+    clock = now if now is not None else _callback_now
+    flow = CallbackFlowState(conversational=True)
+    reply = first_reply if isinstance(first_reply, str) else ""
+    for turn in range(CALLBACK_GATE_MAX_TURNS):
+        if turn > 0 and not reply.strip():
+            return GateCallbackEnd(GATE_CALLBACK_END_NO_REPLY, schema="callback_no_reply")
+        verdict = classify_gate_reply(reply) if classify_gate_reply else None
+        if verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER}:
+            return GateCallbackEnd(GATE_CALLBACK_END_VERDICT, verdict=verdict)
+        if phone_preconsent_end_requested(reply):
+            return GateCallbackEnd(GATE_CALLBACK_END_REQUESTED)
+        # 'No, tomorrow at three' corrects the proposed TIME; it is not a
+        # recording refusal. Strong recording/participation refusals remain
+        # terminal even when they also mention a time.
+        if verdict == CLASSIFY_REFUSED and re.search(
+            r"\brecord\w*\b|\bnot interested\b", reply, re.IGNORECASE,
+        ):
+            return GateCallbackEnd(GATE_CALLBACK_END_VERDICT, verdict=verdict)
+
+        async def _one_turn(reply: str = reply, first: bool = turn == 0) -> CallbackDecision:
+            judged = await _judge_callback_reply(judge_callback, reply, first=first)
+            return await run_callback_turn(
+                flow, client, attempt_id, reply, clock(), judged=judged,
+            )
+
+        if gate_budget is None:
+            decision = await _one_turn()
+        else:
+            # T03: the judge call and a slow propose/confirm round trip are
+            # bounded by what is left of the budget, so they end in a spoken
+            # deferral and not in the wall clock cancelling the gate.
+            try:
+                decision = await asyncio.wait_for(
+                    _one_turn(), timeout=gate_budget.bound(gate_budget.remaining()),
+                )
+            except asyncio.TimeoutError:
+                _log.warn(
+                    "unknown_event", error_type="phone_gate_budget",
+                    error_category="exhausted", phase="callback_booking",
+                )
+                return GateCallbackEnd(GATE_CALLBACK_END_BUDGET)
+        if decision.terminal:
+            return GateCallbackEnd(GATE_CALLBACK_END_DECISION, decision=decision)
+        # T03: one more callback question only if its answer still fits.
+        if not budget_allows("callback_turn"):
+            return GateCallbackEnd(GATE_CALLBACK_END_BUDGET)
+        ask_barrier()
+        await say(decision.spoken)
+        reply = await read_reply() if read_reply else ""
+        if not isinstance(reply, str):
+            reply = ""
+    # Out of turns: still a goodbye, never a silent hang-up (S01 T02).
+    return GateCallbackEnd(GATE_CALLBACK_END_TURNS, schema="callback_turns_exhausted")
 
 
 # ── LLM tool binding ──────────────────────────────────────────────────
@@ -6938,6 +7730,13 @@ async def run_phone_gate(
     # (or just before the line when the sentence opens it). Absent ⇒ the line
     # is spoken whole, byte-identical.
     mark_recording_sentence: Optional[Callable[[], Any]] = None,
+    # ── M013 S01 T06 (optional; absent ⇒ the deterministic parser alone) ─
+    # The gate judge's `callback_time` reading of one callback reply:
+    # `judge_callback(reply, first=bool)` returns a `gate_judge.GateDecision`
+    # (only a valid llm verdict is used: its day/time spans, which must be
+    # the candidate's own words, and its affirmative for a confirm question),
+    # or None (legacy / shadow mode, or the judge unavailable).
+    judge_callback: Optional[Callable[..., Awaitable[Any]]] = None,
 ) -> PhoneGateResult:
     """Run the phone screening's opening, in the ONLY order that is safe.
 
@@ -7806,69 +8605,48 @@ async def run_phone_gate(
         return result
 
     async def _schedule_before_consent(first_reply: str) -> PhoneGateResult:
-        """Use the existing calendar pipeline without authorizing screening."""
+        """Use the existing calendar pipeline without authorizing screening.
+
+        M013 S01 T06: the conversation itself is
+        `converse_callback_before_consent`; this posts and speaks its end.
+        """
         await _await_answered_post()
-        flow = CallbackFlowState()
-        reply = first_reply
-        for _ in range(5):
-            verdict = classify_gate_reply(reply) if classify_gate_reply else None
-            if verdict in {CLASSIFY_OPT_OUT, CLASSIFY_WRONG_NUMBER}:
-                return await _terminal_outcome(verdict)
-            if phone_preconsent_end_requested(reply):
-                return await _end_before_consent()
-            # 'No, tomorrow at three' corrects the proposed TIME; it is not a
-            # recording refusal. Strong recording/participation refusals remain
-            # terminal even when they also mention a time.
-            if verdict == CLASSIFY_REFUSED and re.search(
-                r"\brecord\w*\b|\bnot interested\b", reply, re.IGNORECASE,
-            ):
-                return await _terminal_outcome(verdict)
-            turn = run_callback_turn(
-                flow, client, attempt_id, reply, datetime.now(timezone.utc),
-            )
-            if gate_budget is None:
-                decision = await turn
-            else:
-                # T03: a slow propose/confirm round trip is bounded by what
-                # is left of the budget, so it ends in a spoken deferral and
-                # not in the wall clock cancelling the gate mid-sentence.
-                try:
-                    decision = await asyncio.wait_for(
-                        turn, timeout=gate_budget.bound(gate_budget.remaining()),
-                    )
-                except asyncio.TimeoutError:
-                    _log.warn(
-                        "unknown_event", error_type="phone_gate_budget",
-                        error_category="exhausted", phase="callback_booking",
-                    )
-                    return await _defer_with_goodbye(GATE_BUDGET_EXHAUSTED_SCHEMA)
-            if decision.terminal:
-                if decision.booked:
-                    # Confirmation has durably ended the attempt. Latch before
-                    # farewell: a hangup must never post a second terminal.
-                    _phase("terminal_posted")
-                    await _say(decision.spoken)
-                    return PhoneGateResult(HALT_CALLBACK_SCHEDULED, events=events, spoken=spoken)
-                if decision.terminal_reason == HALT_CALLBACK_RECOVERY:
-                    _phase("consent_failure")
-                    outcome = await client.post_event(attempt_id, "consent.failed", epoch=epoch)
-                    if event_applied(outcome):
-                        events.append("consent.failed")
-                        _phase("terminal_posted")
-                    await _say(decision.spoken)
-                    return PhoneGateResult(HALT_CALLBACK_RECOVERY, events=events, spoken=spoken)
-                result = await _terminal_outcome(CLASSIFY_DEFERRED_PRE_DISCLOSURE)
-                await _say(decision.spoken)
-                return result
-            # T03: one more callback question only if its answer still fits.
-            if not _budget_allows("callback_turn"):
-                return await _defer_with_goodbye(GATE_BUDGET_EXHAUSTED_SCHEMA)
-            _ask_barrier()
+        end = await converse_callback_before_consent(
+            first_reply,
+            client=client, attempt_id=attempt_id, say=_say,
+            read_reply=next_callback_turn or next_candidate_turn,
+            ask_barrier=_ask_barrier, budget_allows=_budget_allows,
+            gate_budget=gate_budget, classify_gate_reply=classify_gate_reply,
+            judge_callback=judge_callback,
+        )
+        if end.kind == GATE_CALLBACK_END_VERDICT:
+            return await _terminal_outcome(end.verdict)
+        if end.kind == GATE_CALLBACK_END_REQUESTED:
+            return await _end_before_consent()
+        if end.kind == GATE_CALLBACK_END_BUDGET:
+            return await _defer_with_goodbye(GATE_BUDGET_EXHAUSTED_SCHEMA)
+        decision = end.decision
+        if end.kind != GATE_CALLBACK_END_DECISION or decision is None:
+            # Silence after a callback question, or the turn bound: still a
+            # goodbye, never a silent hang-up (S01 T02).
+            return await _defer_with_goodbye(end.schema or "callback_turns_exhausted")
+        if decision.booked:
+            # Confirmation has durably ended the attempt. Latch before
+            # farewell: a hangup must never post a second terminal.
+            _phase("terminal_posted")
             await _say(decision.spoken)
-            reader = next_callback_turn or next_candidate_turn
-            reply = await reader() if reader else ""
-        # Out of turns: still a goodbye, never a silent hang-up (S01 T02).
-        return await _defer_with_goodbye("callback_turns_exhausted")
+            return PhoneGateResult(HALT_CALLBACK_SCHEDULED, events=events, spoken=spoken)
+        if decision.terminal_reason == HALT_CALLBACK_RECOVERY:
+            _phase("consent_failure")
+            outcome = await client.post_event(attempt_id, "consent.failed", epoch=epoch)
+            if event_applied(outcome):
+                events.append("consent.failed")
+                _phase("terminal_posted")
+            await _say(decision.spoken)
+            return PhoneGateResult(HALT_CALLBACK_RECOVERY, events=events, spoken=spoken)
+        result = await _terminal_outcome(CLASSIFY_DEFERRED_PRE_DISCLOSURE)
+        await _say(decision.spoken)
+        return result
 
     async def _judge_identity_reply(reply: str) -> Optional[str]:
         """T05: the judge's acting intent for one identity reply, or None."""

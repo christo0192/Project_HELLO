@@ -1089,7 +1089,11 @@ def resolve_judge_config() -> JudgeConfig:
 @dataclass(frozen=True)
 class JudgeCallback:
     """Callback spans from a busy verdict. ``day_text``/``time_text`` must be
-    verbatim spans of the candidate's words (checked by T06 before use)."""
+    verbatim spans of the candidate's words: `phone._judge_callback_spans`
+    (T06) checks each against what the candidate said and otherwise ignores
+    the whole callback; ``resolved_ist`` is only cross-checked when the
+    deterministic parser resolves the spans, and a judge-only resolution is
+    confirmed by a question before it is proposed."""
 
     day_text: str
     time_text: str
@@ -1190,6 +1194,7 @@ INTENTS:
 - voicemail_machine: a voicemail greeting, a carrier or IVR message; not a live person.
 - unclear: anything else: fillers, noise, cut-off words, mixed or contradictory replies.
 When in doubt, answer unclear, never consent_granted.
+In the callback_time phase: a reply that says when to call back (a day, a time, or both) is not_now_busy with the callback spans; a yes to a time the assistant just proposed is consent_granted; copy day_text and time_text only from the person's own words.
 
 OUTPUT: exactly one JSON object and nothing else (no markdown, no prose):
 {"intent": "<one intent>", "evidence": "<the words from ONE utterance that show the intent, copied exactly, or empty>", "confidence": <0.0-1.0>}
@@ -1222,7 +1227,11 @@ DATA {"phase":"identity","utterances":[{"order":1,"tag":"post_question","text":"
 DATA {"phase":"identity","utterances":[{"order":1,"tag":"post_question","text":"Hi, you have reached Ravi, please leave a message after the tone."}]}
 {"intent":"voicemail_machine","evidence":"please leave a message after the tone","confidence":0.96}
 DATA {"phase":"consent","utterances":[{"order":1,"tag":"post_question","text":"Please don't call me again"}]}
-{"intent":"opt_out","evidence":"Please don't call me again","confidence":0.95}"""
+{"intent":"opt_out","evidence":"Please don't call me again","confidence":0.95}
+DATA {"phase":"callback_time","now_ist":"2026-01-05 10:00 Monday","utterances":[{"order":1,"tag":"post_question","text":"tomorrow after lunch is better"}]}
+{"intent":"not_now_busy","evidence":"tomorrow after lunch","confidence":0.9,"callback":{"day_text":"tomorrow","time_text":"after lunch","resolved_ist":"2026-01-06T14:00"}}
+DATA {"phase":"callback_time","utterances":[{"order":1,"tag":"post_question","text":"Yes, that works"}]}
+{"intent":"consent_granted","evidence":"Yes, that works","confidence":0.92}"""
 
 _JUDGE_USER_TEMPLATE = "DATA {payload}"
 
