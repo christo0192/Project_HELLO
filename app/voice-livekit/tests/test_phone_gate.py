@@ -12893,7 +12893,10 @@ class TestPhoneSpeechWatchdog(unittest.IsolatedAsyncioTestCase):
             stale = _FakeSpeech(events=events)
             hooks["reply_handle"][0] = stale
             hooks["reply_started"].set()
-            await asyncio.sleep(0.08)
+            # Await observable completion, not a scheduler-sensitive 80ms nap.
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while len(session.spoken) == before and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
         self.assertEqual(stale.interrupt_calls, [True])
         self.assertEqual(events, ["interrupt", "drained", "fallback"])
         self.assertEqual(len(session.spoken), before + 1)
@@ -12909,7 +12912,10 @@ class TestPhoneSpeechWatchdog(unittest.IsolatedAsyncioTestCase):
         with patch.object(agent_mod, "PHONE_SPEECH_FIRST_AUDIO_TIMEOUT_SEC", 4.0):
             await agent._on_reply_expected()
             agent._on_generation_empty()
-            await asyncio.sleep(0.05)
+            # Still well below the four-second watchdog; tolerate loaded CI.
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while len(session.spoken) == before and asyncio.get_running_loop().time() < deadline:
+                await asyncio.sleep(0.01)
         self.assertEqual(len(session.spoken), before + 1)
         categories = [
             c.kwargs.get("error_category")
