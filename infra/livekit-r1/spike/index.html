@@ -29,7 +29,7 @@
   const query = new URLSearchParams(location.search);
   $("url").value = query.get("url") || "";
   $("token").value = query.get("token") || "";
-  const state = { startedAt: null, samples: [], errors: [], result: "PENDING: no selected UDP candidate pair sampled yet." };
+  const state = { startedAt: null, samples: [], remoteTrackEvents: [], errors: [], result: "PENDING: no selected UDP candidate pair sampled yet." };
   let room, tracks = [], timer;
   const setStatus = (text) => { $("status").textContent = text; };
   const write = () => { $("summary").textContent = JSON.stringify({ ...state, samples: state.samples.slice(-24) }, null, 2); };
@@ -60,8 +60,8 @@
           const local = byId.get(v.localCandidateId), remote = byId.get(v.remoteCandidateId);
           sample.pairs.push({ role, protocol: local?.protocol || remote?.protocol || "unknown", remote: remote?.address ? `${remote.address}:${remote.port}` : undefined, rttMs: v.currentRoundTripTime == null ? null : Math.round(v.currentRoundTripTime * 1000), availableOutgoingBitrate: v.availableOutgoingBitrate ?? null });
         }
-        if (v.type === "outbound-rtp" && (v.kind === "video" || v.mediaType === "video")) sample.outbound.push({ fps: v.framesPerSecond ?? null, packetsLost: v.packetsLost ?? null, qualityLimitationReason: v.qualityLimitationReason ?? null, bandwidthLimitedSeconds: v.qualityLimitationDurations?.bandwidth ?? null });
-        if (v.type === "inbound-rtp" && (v.kind === "audio" || v.mediaType === "audio")) sample.inbound.push({ jitterMs: v.jitter == null ? null : Math.round(v.jitter * 1000), packetsLost: v.packetsLost ?? null });
+        if (v.type === "outbound-rtp" && (v.kind === "video" || v.mediaType === "video")) sample.outbound.push({ fps: v.framesPerSecond ?? null, bytesSent: v.bytesSent ?? null, packetsLost: v.packetsLost ?? null, qualityLimitationReason: v.qualityLimitationReason ?? null, bandwidthLimitedSeconds: v.qualityLimitationDurations?.bandwidth ?? null });
+        if (v.type === "inbound-rtp" && (v.kind === "audio" || v.mediaType === "audio")) sample.inbound.push({ jitterMs: v.jitter == null ? null : Math.round(v.jitter * 1000), packetsLost: v.packetsLost ?? null, bytesReceived: v.bytesReceived ?? null });
       });
     }
     sample.udpSelected = sample.pairs.some((pair) => pair.protocol.toLowerCase() === "udp");
@@ -79,6 +79,9 @@
     setStatus("Requesting camera and microphone…");
     try {
       room = new Room({ adaptiveStream: false, dynacast: false });
+      room.on("trackSubscribed", (track) => {
+        if (track.kind === "audio") state.remoteTrackEvents.push({ at: new Date().toISOString(), kind: "audio" });
+      });
       await room.connect($("url").value.trim(), $("token").value.trim());
       const mic = await createLocalAudioTrack();
       const camera = await createLocalVideoTrack({ resolution: { width: 640, height: 360, frameRate: 15 }, videoEncoding: { maxBitrate: 500_000, maxFramerate: 15 } });

@@ -1,0 +1,145 @@
+{
+  "check": "S0-F2-lite",
+  "cycles": [
+    {
+      "cycle": 1,
+      "success": true,
+      "joinMs": 1160,
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 48,
+          "availableOutgoingBitrate": 450000
+        }
+      ]
+    },
+    {
+      "cycle": 2,
+      "success": true,
+      "joinMs": 792,
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 63,
+          "availableOutgoingBitrate": 450000
+        }
+      ]
+    },
+    {
+      "cycle": 3,
+      "success": true,
+      "joinMs": 751,
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 52,
+          "availableOutgoingBitrate": 450000
+        }
+      ]
+    },
+    {
+      "cycle": 4,
+      "success": true,
+      "joinMs": 865,
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 68,
+          "availableOutgoingBitrate": 450000
+        }
+      ]
+    },
+    {
+      "cycle": 5,
+      "success": true,
+      "joinMs": 904,
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 150,
+          "availableOutgoingBitrate": 450000
+        }
+      ]
+    },
+    {
+      "cycle": 6,
+      "success": true,
+      "joinMs": 844,
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 53,
+          "availableOutgoingBitrate": 450000
+        }
+      ]
+    },
+    {
+      "cycle": 7,
+      "success": true,
+      "joinMs": 906,
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 62,
+          "availableOutgoingBitrate": 450000
+        }
+      ]
+    },
+    {
+      "cycle": 8,
+      "success": true,
+      "joinMs": 744,
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 59,
+          "availableOutgoingBitrate": 450000
+        }
+      ]
+    },
+    {
+      "cycle": 9,
+      "success": true,
+      "joinMs": 890,
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 57,
+          "availableOutgoingBitrate": 450000
+        }
+      ]
+    },
+    {
+      "cycle": 10,
+      "success": true,
+      "joinMs": 788,
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 49,
+          "availableOutgoingBitrate": 450000
+        }
+      ]
+    }
+  ]
+}

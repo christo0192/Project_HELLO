@@ -1,0 +1,34 @@
+{
+  "check": "S0-F3-lite",
+  "cycles": [
+    {
+      "cycle": 1,
+      "success": false,
+      "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeGreaterThan\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m\n\nExpected: > \u001b[32m0\u001b[39m\nReceived:   \u001b[31m0\u001b[39m\n\nCall Log:\n- Timeout 30000ms exceeded while waiting on the predicate"
+    },
+    {
+      "cycle": 2,
+      "success": false,
+      "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeGreaterThan\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m\n\nExpected: > \u001b[32m0\u001b[39m\nReceived:   \u001b[31m0\u001b[39m\n\nCall Log:\n- Timeout 30000ms exceeded while waiting on the predicate"
+    },
+    {
+      "cycle": 3,
+      "success": true,
+      "dispatchToTrackMs": 13493,
+      "remoteTrackAt": "2026-10-06T08:40:39.727Z",
+      "maxInboundAudioBytes": 79479
+    },
+    {
+      "cycle": 4,
+      "success": false,
+      "error": "Error: \u001b[2mexpect(\u001b[22m\u001b[31mreceived\u001b[39m\u001b[2m).\u001b[22mtoBeGreaterThan\u001b[2m(\u001b[22m\u001b[32mexpected\u001b[39m\u001b[2m)\u001b[22m\n\nExpected: > \u001b[32m0\u001b[39m\nReceived:   \u001b[31m0\u001b[39m\n\nCall Log:\n- Timeout 30000ms exceeded while waiting on the predicate"
+    },
+    {
+      "cycle": 5,
+      "success": true,
+      "dispatchToTrackMs": 13659,
+      "remoteTrackAt": "2026-10-06T08:41:24.207Z",
+      "maxInboundAudioBytes": 78047
+    }
+  ]
+}

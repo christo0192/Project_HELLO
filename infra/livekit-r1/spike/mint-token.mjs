@@ -9,7 +9,7 @@
 import { createRequire } from "node:module";
 
 const require = createRequire(new URL("../../../app/api/package.json", import.meta.url));
-const { AccessToken, RoomServiceClient, AgentDispatchClient } = require("livekit-server-sdk");
+const { AccessToken, RoomServiceClient, AgentDispatchClient, TrackSource } = require("livekit-server-sdk");
 
 const required = (name) => {
   const value = process.env[name];
@@ -40,7 +40,7 @@ function candidateToken() {
     roomJoin: true,
     room,
     canPublish: true,
-    canPublishSources: ["camera", "microphone"],
+    canPublishSources: [TrackSource.CAMERA, TrackSource.MICROPHONE],
     canSubscribe: true,
     canPublishData: false,
   });

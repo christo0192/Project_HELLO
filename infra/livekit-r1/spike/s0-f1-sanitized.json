@@ -1,0 +1,414 @@
+{
+  "check": "S0-F1",
+  "joinMs": 1148,
+  "samples": [
+    {
+      "at": "2026-10-06T08:57:40.410Z",
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 61,
+          "availableOutgoingBitrate": 450000
+        }
+      ],
+      "outbound": [
+        {
+          "fps": null,
+          "bytesSent": 0,
+          "packetsLost": null,
+          "qualityLimitationReason": "none",
+          "bandwidthLimitedSeconds": 0
+        }
+      ],
+      "inbound": [],
+      "udpSelected": true
+    },
+    {
+      "at": "2026-10-06T08:57:45.421Z",
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 61,
+          "availableOutgoingBitrate": 888000
+        }
+      ],
+      "outbound": [
+        {
+          "fps": 14,
+          "bytesSent": 92795,
+          "packetsLost": null,
+          "qualityLimitationReason": "none",
+          "bandwidthLimitedSeconds": 0
+        }
+      ],
+      "inbound": [],
+      "udpSelected": true
+    },
+    {
+      "at": "2026-10-06T08:57:50.417Z",
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 49,
+          "availableOutgoingBitrate": 888000
+        }
+      ],
+      "outbound": [
+        {
+          "fps": 14,
+          "bytesSent": 191727,
+          "packetsLost": null,
+          "qualityLimitationReason": "none",
+          "bandwidthLimitedSeconds": 0
+        }
+      ],
+      "inbound": [],
+      "udpSelected": true
+    },
+    {
+      "at": "2026-10-06T08:57:55.412Z",
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 87,
+          "availableOutgoingBitrate": 888000
+        }
+      ],
+      "outbound": [
+        {
+          "fps": 14,
+          "bytesSent": 285237,
+          "packetsLost": null,
+          "qualityLimitationReason": "none",
+          "bandwidthLimitedSeconds": 0
+        }
+      ],
+      "inbound": [],
+      "udpSelected": true
+    },
+    {
+      "at": "2026-10-06T08:58:00.420Z",
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 66,
+          "availableOutgoingBitrate": 888000
+        }
+      ],
+      "outbound": [
+        {
+          "fps": 14,
+          "bytesSent": 373116,
+          "packetsLost": null,
+          "qualityLimitationReason": "none",
+          "bandwidthLimitedSeconds": 0
+        }
+      ],
+      "inbound": [],
+      "udpSelected": true
+    },
+    {
+      "at": "2026-10-06T08:58:05.414Z",
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 48,
+          "availableOutgoingBitrate": 888000
+        }
+      ],
+      "outbound": [
+        {
+          "fps": 15,
+          "bytesSent": 469618,
+          "packetsLost": null,
+          "qualityLimitationReason": "none",
+          "bandwidthLimitedSeconds": 0
+        }
+      ],
+      "inbound": [],
+      "udpSelected": true
+    },
+    {
+      "at": "2026-10-06T08:58:10.412Z",
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 45,
+          "availableOutgoingBitrate": 888000
+        }
+      ],
+      "outbound": [
+        {
+          "fps": 15,
+          "bytesSent": 565483,
+          "packetsLost": null,
+          "qualityLimitationReason": "none",
+          "bandwidthLimitedSeconds": 0
+        }
+      ],
+      "inbound": [],
+      "udpSelected": true
+    },
+    {
+      "at": "2026-10-06T08:58:15.412Z",
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 49,
+          "availableOutgoingBitrate": 888000
+        }
+      ],
+      "outbound": [
+        {
+          "fps": 14,
+          "bytesSent": 658031,
+          "packetsLost": null,
+          "qualityLimitationReason": "none",
+          "bandwidthLimitedSeconds": 0
+        }
+      ],
+      "inbound": [],
+      "udpSelected": true
+    },
+    {
+      "at": "2026-10-06T08:58:20.412Z",
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 48,
+          "availableOutgoingBitrate": 888000
+        }
+      ],
+      "outbound": [
+        {
+          "fps": 15,
+          "bytesSent": 748019,
+          "packetsLost": null,
+          "qualityLimitationReason": "none",
+          "bandwidthLimitedSeconds": 0
+        }
+      ],
+      "inbound": [],
+      "udpSelected": true
+    },
+    {
+      "at": "2026-10-06T08:58:25.413Z",
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 51,
+          "availableOutgoingBitrate": 888000
+        }
+      ],
+      "outbound": [
+        {
+          "fps": 15,
+          "bytesSent": 847064,
+          "packetsLost": null,
+          "qualityLimitationReason": "none",
+          "bandwidthLimitedSeconds": 0
+        }
+      ],
+      "inbound": [],
+      "udpSelected": true
+    },
+    {
+      "at": "2026-10-06T08:58:30.412Z",
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 46,
+          "availableOutgoingBitrate": 888000
+        }
+      ],
+      "outbound": [
+        {
+          "fps": 15,
+          "bytesSent": 938284,
+          "packetsLost": null,
+          "qualityLimitationReason": "none",
+          "bandwidthLimitedSeconds": 0
+        }
+      ],
+      "inbound": [],
+      "udpSelected": true
+    },
+    {
+      "at": "2026-10-06T08:58:35.413Z",
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 56,
+          "availableOutgoingBitrate": 888000
+        }
+      ],
+      "outbound": [
+        {
+          "fps": 14,
+          "bytesSent": 1025556,
+          "packetsLost": null,
+          "qualityLimitationReason": "none",
+          "bandwidthLimitedSeconds": 0
+        }
+      ],
+      "inbound": [],
+      "udpSelected": true
+    },
+    {
+      "at": "2026-10-06T08:58:40.413Z",
+      "pairs": [],
+      "outbound": [
+        {
+          "fps": 15,
+          "bytesSent": 1132803,
+          "packetsLost": null,
+          "qualityLimitationReason": "none",
+          "bandwidthLimitedSeconds": 0
+        }
+      ],
+      "inbound": [],
+      "udpSelected": false
+    },
+    {
+      "at": "2026-10-06T08:58:45.412Z",
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 60,
+          "availableOutgoingBitrate": 888000
+        }
+      ],
+      "outbound": [
+        {
+          "fps": 16,
+          "bytesSent": 1227996,
+          "packetsLost": null,
+          "qualityLimitationReason": "none",
+          "bandwidthLimitedSeconds": 0
+        }
+      ],
+      "inbound": [],
+      "udpSelected": true
+    },
+    {
+      "at": "2026-10-06T08:58:50.413Z",
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 51,
+          "availableOutgoingBitrate": 888000
+        }
+      ],
+      "outbound": [
+        {
+          "fps": 15,
+          "bytesSent": 1320885,
+          "packetsLost": null,
+          "qualityLimitationReason": "none",
+          "bandwidthLimitedSeconds": 0
+        }
+      ],
+      "inbound": [],
+      "udpSelected": true
+    },
+    {
+      "at": "2026-10-06T08:58:55.418Z",
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 81,
+          "availableOutgoingBitrate": 888000
+        }
+      ],
+      "outbound": [
+        {
+          "fps": 14,
+          "bytesSent": 1408107,
+          "packetsLost": null,
+          "qualityLimitationReason": "none",
+          "bandwidthLimitedSeconds": 0
+        }
+      ],
+      "inbound": [],
+      "udpSelected": true
+    },
+    {
+      "at": "2026-10-06T08:59:00.425Z",
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 58,
+          "availableOutgoingBitrate": 888000
+        }
+      ],
+      "outbound": [
+        {
+          "fps": 14,
+          "bytesSent": 1504475,
+          "packetsLost": null,
+          "qualityLimitationReason": "none",
+          "bandwidthLimitedSeconds": 0
+        }
+      ],
+      "inbound": [],
+      "udpSelected": true
+    },
+    {
+      "at": "2026-10-06T08:59:05.413Z",
+      "pairs": [
+        {
+          "role": "publisher",
+          "protocol": "udp",
+          "remote": "37.16.23.137:7882",
+          "rttMs": 49,
+          "availableOutgoingBitrate": 888000
+        }
+      ],
+      "outbound": [
+        {
+          "fps": 15,
+          "bytesSent": 1601181,
+          "packetsLost": null,
+          "qualityLimitationReason": "none",
+          "bandwidthLimitedSeconds": 0
+        }
+      ],
+      "inbound": [],
+      "udpSelected": true
+    }
+  ],
+  "errors": [],
+  "result": "GO: selected UDP candidate pair sampled."
+}

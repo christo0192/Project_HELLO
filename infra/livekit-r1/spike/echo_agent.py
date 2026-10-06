@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 
 from livekit import agents, rtc
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("r1-spike")
 
 
@@ -34,10 +34,17 @@ async def echo_track(track: rtc.Track, source: rtc.AudioSource) -> None:
 
 
 async def entrypoint(ctx: agents.JobContext) -> None:
+    # Per-room markers are intentionally limited to the disposable test room name.
+    # They let the laptop diagnostic distinguish dispatch delivery from a later
+    # connection or publication failure without logging credentials or media.
+    room_name = ctx.job.room.name
+    logger.info("S0F_DISPATCH_RECEIVED room=%s", room_name)
     await ctx.connect(auto_subscribe=agents.AutoSubscribe.AUDIO_ONLY)
+    logger.info("S0F_AGENT_CONNECTED room=%s", room_name)
     source = rtc.AudioSource(sample_rate=48_000, num_channels=1)
     local_track = rtc.LocalAudioTrack.create_audio_track("r1-spike-echo", source)
     await ctx.room.local_participant.publish_track(local_track)
+    logger.info("S0F_AUDIO_PUBLISHED room=%s", room_name)
 
     echo_tasks: set[asyncio.Task[None]] = set()
     echoed_track_sids: set[str] = set()
@@ -82,6 +89,39 @@ async def entrypoint(ctx: agents.JobContext) -> None:
         await source.aclose()
 
 
+async def accept_job(request: agents.JobRequest) -> None:
+    """Log the worker-side acceptance boundary for the disposable diagnosis."""
+    room_name = request.room.name
+    logger.info("S0F_AVAILABILITY_ACCEPTING room=%s", room_name)
+    await request.accept()
+    # `accept()` only returns after the SFU has sent an assignment, so this is
+    # stronger evidence than the request-received marker alone.
+    logger.info("S0F_AVAILABILITY_ACCEPTED room=%s", room_name)
+
+
+def worker_options() -> agents.WorkerOptions:
+    """Build disposable-worker options, including the explicit load experiment."""
+    options: dict[str, object] = {
+        "entrypoint_fnc": entrypoint,
+        "request_fnc": accept_job,
+        "agent_name": "r1-spike",
+        # 1.6.4 supports this WorkerOptions argument; retain protocol debug
+        # output for availability, assignment, and reconnect diagnosis.
+        "log_level": "DEBUG",
+    }
+    load_threshold = os.environ.get("R1_SPIKE_LOAD_THRESHOLD")
+    if load_threshold is not None:
+        if load_threshold.strip().lower() != "inf":
+            raise RuntimeError("R1_SPIKE_LOAD_THRESHOLD only supports the diagnostic value 'inf'")
+        # In livekit-agents 1.6.4 an infinite threshold makes `_is_available`
+        # return True, while retaining the SDK's ordinary load measurements.
+        options["load_threshold"] = float("inf")
+        logger.info("S0F_LOAD_OVERRIDE threshold=inf")
+    else:
+        logger.info("S0F_LOAD_OVERRIDE threshold=default")
+    return agents.WorkerOptions(**options)
+
+
 if __name__ == "__main__":
     assert_spike_url()
-    agents.cli.run_app(agents.WorkerOptions(entrypoint_fnc=entrypoint, agent_name="r1-spike"))
+    agents.cli.run_app(worker_options())
