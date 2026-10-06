@@ -12,7 +12,7 @@ frame TIMINGS through the real recorder and decode the resulting OGG:
   5. late close: `close` 2.5 s after the leave, TTS still being captured —
      the file must not extend past the leave;
   6. anchor: a tone at a known wall time lands at
-     (tone_wall - max(recording_started_at, begun_at)) +/- 50 ms, with an
+     (tone_wall - manifest.recording_started_at_ms) +/- 50 ms, with an
      output frame captured BEFORE begin();
   plus the close-latency bound (a 20 s pending tail closes well inside
   RECORDER_CLOSE_TIMEOUT_SEC) and the kill-switch control (the stock recorder
@@ -176,6 +176,7 @@ class _Replay:
         self.tail_flush = tail_flush
         self.recorder = None
         self.ogg: bytes | None = None
+        self.manifest = None
         self._tone_in = _tone_frame(440.0)
         self._tone_out = _tone_frame(880.0)
         self._silence = _silence_frame()
@@ -256,6 +257,7 @@ class _Replay:
     async def finish(self) -> None:
         manifest = await self.recorder.finish("https://upload.test/put")
         assert manifest is not None, "the recording must upload"
+        self.manifest = manifest
         oggs = [b for ct, b in self.uploads if ct == "audio/ogg"]
         assert oggs, "the durable OGG PUT must have happened"
         self.ogg = oggs[-1]
@@ -394,6 +396,12 @@ class TestRecorderTailFlushRealSdk(unittest.TestCase):
         self.assertTrue(_energy_everywhere(pcm, 0, 21.6, 23.4))
         self.assertTrue(_energy_everywhere(pcm, 0, 40.9, 42.4))
         self.assertEqual(replay.recorder.leg_end_source, "sip_left")
+        # M013 S02 T02: the manifest reports the truth about this file.
+        m = replay.manifest
+        self.assertAlmostEqual(m.duration_ms / 1000.0, duration, delta=0.05)
+        self.assertEqual(m.leg_ended_at_ms, int(round((_T0 + _LEG1_LEAVE) * 1000)))
+        self.assertEqual(m.recording_started_at_ms, int(round(_T0 * 1000)))
+        self.assertIs(m.tail_flushed, True)
 
     def test_kill_switch_control_reproduces_todays_truncation(self):
         with unittest.mock.patch.dict(os.environ, {"PHONE_RECORDING_TAIL_FLUSH": "off"}):
@@ -411,6 +419,8 @@ class TestRecorderTailFlushRealSdk(unittest.TestCase):
         # at the role line's playback end (53.18 s on the real call).
         self.assertLess(duration, 53.6, duration)
         self.assertFalse(replay.recorder.tail_flushed)
+        self.assertIs(replay.manifest.tail_flushed, False)
+        self.assertAlmostEqual(replay.manifest.duration_ms / 1000.0, duration, delta=0.05)
 
     # 3 ────────────────────────────────────────────────────────────────────
     def test_replay_9f60523d_leg2_input_only_tail(self):
@@ -425,6 +435,7 @@ class TestRecorderTailFlushRealSdk(unittest.TestCase):
         pcm = self._run(replay, scenario)
         duration = pcm.shape[1] / _OUT_RATE
         self.assertGreaterEqual(duration, 17.9, f"today 17.59 s; got {duration}")
+        self.assertAlmostEqual(replay.manifest.duration_ms / 1000.0, duration, delta=0.05)
         self.assertTrue(_energy_everywhere(pcm, 1, 10.5, 16.7), "Q1 missing")
 
     # 4 ────────────────────────────────────────────────────────────────────
@@ -494,13 +505,16 @@ class TestRecorderTailFlushRealSdk(unittest.TestCase):
                 rec_io = replay.recorder._recorder
                 started = rec_io.recording_started_at
                 begun = replay.recorder._begun_at_ms / 1000.0
-                self.anchor = max(started, begun)
                 self.assertLess(started, begun)  # the pre-begin frame moved the SDK anchor
                 await replay.finish()
 
         asyncio.run(main())
         pcm = _decode(replay.ogg)
-        expected = (_T0 + tone_at) - self.anchor
+        # M013 S02 T02: the anchor is the manifest's own field, never before
+        # begin() even though the SDK's combined value is.
+        anchor = replay.manifest.recording_started_at_ms / 1000.0
+        self.assertGreaterEqual(anchor, _T0)
+        expected = (_T0 + tone_at) - anchor
         onset = None
         win = int(0.005 * _OUT_RATE)
         for start in range(0, pcm.shape[1] - win, win):

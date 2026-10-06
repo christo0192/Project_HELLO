@@ -10330,6 +10330,7 @@ async def _run_phone_session(
                 await recording_api.complete_recording(
                     attempt_id, sid, manifest.sha256, manifest.size_bytes,
                     manifest.duration_ms,
+                    **recording.manifest_timing_kwargs(manifest),
                 )
                 _log.info(
                     "unknown_event", error_type="phone_teardown",
@@ -10434,6 +10435,7 @@ async def _run_phone_session(
                     recording_api.complete_recording(
                         attempt_id, sid, manifest.sha256, manifest.size_bytes,
                         manifest.duration_ms,
+                        **recording.manifest_timing_kwargs(manifest),
                     ),
                     _teardown_timeout(PHONE_TEARDOWN_STEP_SECONDS),
                     category="recording_completion", deadline=deadline,

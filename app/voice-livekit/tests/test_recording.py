@@ -1994,5 +1994,372 @@ class TestTailFlushKillSwitch(unittest.TestCase):
         ))
 
 
+# ── M013 S02 T02: truthful recording metadata ────────────────────────────────
+
+
+class _Clock:
+    def __init__(self, t):
+        self.t = t
+
+    def time(self):
+        return self.t
+
+
+class _Tap:
+    def __init__(self, started_wall_time):
+        self.started_wall_time = started_wall_time
+
+
+class _AnchoredRecorder(_FakeRecorder):
+    """A fake recorder exposing the SDK's per-tap ``started_wall_time``."""
+
+    in_started = None
+    out_started = None
+
+    async def start(self, *, output_path):
+        await super().start(output_path=output_path)
+        self._in_record = _Tap(self.in_started)
+        self._out_record = _Tap(self.out_started)
+
+
+def _make_tmp(test, **kw):
+    d = tempfile.TemporaryDirectory()
+    test.addCleanup(d.cleanup)
+    return _make(tmp=Path(d.name), **kw)
+
+
+class TestTruthfulManifest(unittest.TestCase):
+    def test_mp3_path_duration_is_the_encoded_length(self):
+        async def transcode(ogg, mp3):
+            Path(mp3).write_bytes(b"ID3fake-mp3-bytes")
+            return 2000
+
+        r, _s, _h = _make_tmp(self, transcode=transcode)
+        r.wire()
+        _begin(r)
+        with unittest.mock.patch.object(rec, "_ogg_duration_ms",
+                                        side_effect=AssertionError("not needed")):
+            manifest = _finish(r)
+        self.assertEqual(manifest.content_type, "audio/mpeg")
+        self.assertEqual(manifest.duration_ms, 2000)
+
+    def test_zero_negative_or_unknown_length_is_none(self):
+        for value in (0, -5, None, True, "2000", 0.4):
+            with self.subTest(value=value):
+                async def transcode(ogg, mp3, _v=value):
+                    Path(mp3).write_bytes(b"ID3fake-mp3-bytes")
+                    return _v
+
+                r, _s, _h = _make_tmp(self, transcode=transcode)
+                r.wire()
+                _begin(r)
+                with unittest.mock.patch.object(rec, "_ogg_duration_ms", return_value=None):
+                    manifest = _finish(r)
+                self.assertIsNotNone(manifest)
+                self.assertIsNone(manifest.duration_ms)
+
+    def test_unknown_encoded_length_falls_back_to_the_ogg_container(self):
+        async def transcode(ogg, mp3):
+            Path(mp3).write_bytes(b"ID3fake-mp3-bytes")
+            return None
+
+        r, _s, _h = _make_tmp(self, transcode=transcode)
+        r.wire()
+        _begin(r)
+        with unittest.mock.patch.object(rec, "_ogg_duration_ms", return_value=1987):
+            manifest = _finish(r)
+        self.assertEqual(manifest.content_type, "audio/mpeg")
+        self.assertEqual(manifest.duration_ms, 1987)
+
+    def test_ogg_fallback_reads_the_container_before_cleanup(self):
+        async def boom(ogg, mp3):
+            raise RuntimeError("transcode_failed")
+
+        seen = []
+
+        def probe(path):
+            seen.append(Path(path).exists())
+            return 1999
+
+        r, _s, _h = _make_tmp(self, transcode=boom)
+        r.wire()
+        _begin(r)
+        with unittest.mock.patch.object(rec, "_ogg_duration_ms", side_effect=probe):
+            manifest = _finish(r)
+        self.assertEqual(manifest.content_type, "audio/ogg")
+        self.assertEqual(manifest.duration_ms, 1999)
+        self.assertEqual(seen, [True])  # read while the OGG still existed
+        self.assertFalse(r._ogg_path.exists())  # then cleaned up
+
+    def test_cancelled_upgrade_manifest_reads_the_ogg_before_cleanup(self):
+        async def cancelled(ogg, mp3):
+            raise asyncio.CancelledError()
+
+        seen = []
+
+        def probe(path):
+            seen.append(Path(path).exists())
+            return 1500
+
+        r, _s, _h = _make_tmp(self, transcode=cancelled)
+        r.wire()
+        _begin(r)
+        with unittest.mock.patch.object(rec, "_ogg_duration_ms", side_effect=probe):
+            manifest = _finish(r)
+        self.assertEqual(manifest.content_type, "audio/ogg")
+        self.assertEqual(manifest.duration_ms, 1500)
+        self.assertEqual(seen, [True])
+        self.assertFalse(r._ogg_path.exists())
+
+    def test_cancelled_upgrade_zero_length_is_none(self):
+        async def cancelled(ogg, mp3):
+            raise asyncio.CancelledError()
+
+        r, _s, _h = _make_tmp(self, transcode=cancelled)
+        r.wire()
+        _begin(r)
+        with unittest.mock.patch.object(rec, "_ogg_duration_ms", return_value=None):
+            manifest = _finish(r)
+        self.assertIsNone(manifest.duration_ms)
+
+    def test_ogg_duration_helper_never_raises(self):
+        self.assertIsNone(rec._ogg_duration_ms(None))
+        with tempfile.TemporaryDirectory() as d:
+            junk = Path(d) / "junk.ogg"
+            junk.write_bytes(b"OggS\x00not-a-real-container")
+            self.assertIsNone(rec._ogg_duration_ms(junk))
+            self.assertIsNone(rec._ogg_duration_ms(Path(d) / "missing.ogg"))
+
+    def test_manifest_carries_the_leg_timing_and_tail_flushed(self):
+        room = _FakeRoom()
+        r, _s, holder, _sink = _make_flushing(room=room)
+        clock = _Clock(1_000.0)
+        with unittest.mock.patch.object(rec.time, "time", clock.time):
+            self.assertTrue(r.wire())
+            self.assertTrue(_begin(r))
+            io = holder["recorder"]
+            for f in _frames(2.0, "cand"):
+                io._in_record.push(f)
+            for f in _frames(3.0, "bot"):
+                io._out_record.capture(f, 1_001.0)
+            clock.t = 1_003.5
+            room.emit("participant_disconnected", _Participant(SIP_IDENTITY))
+            clock.t = 1_010.0
+            manifest = _finish(r)
+        self.assertEqual(manifest.leg_ended_at_ms, 1_003_500)
+        self.assertEqual(manifest.recording_started_at_ms, 1_000_000)
+        self.assertIs(manifest.tail_flushed, True)
+        self.assertEqual(manifest.timing_kwargs(), {
+            "recording_started_at_ms": 1_000_000,
+            "leg_ended_at_ms": 1_003_500,
+            "tail_flushed": True,
+        })
+
+    def test_plain_recorder_reports_the_tail_not_flushed(self):
+        r, _s, _h = _make_tmp(self)
+        clock = _Clock(2_000.0)
+        with unittest.mock.patch.object(rec.time, "time", clock.time):
+            r.wire()
+            _begin(r)
+            clock.t = 2_012.25
+            manifest = _finish(r)
+        self.assertIs(manifest.tail_flushed, False)
+        # finish() is the last-resort leg end.
+        self.assertEqual(manifest.leg_ended_at_ms, 2_012_250)
+        self.assertEqual(manifest.recording_started_at_ms, 2_000_000)
+
+    def test_close_timeout_is_not_reported_flushed(self):
+        room = _FakeRoom()
+        r, _s, holder, _sink = _make_flushing(room=room)
+        r.wire()
+        _begin(r)
+        io = holder["recorder"]
+        io.tail_flushed = True  # the flush ran, but the encoder never acked
+
+        async def hang():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                return None
+
+        io.aclose = hang
+        with unittest.mock.patch.object(rec, "RECORDER_CLOSE_TIMEOUT_SEC", 0.01):
+            manifest = _finish(r)
+        self.assertEqual(manifest.content_type, "audio/ogg")
+        self.assertIsNone(manifest.duration_ms)
+        self.assertIs(manifest.tail_flushed, False)
+        self.assertIsNotNone(manifest.leg_ended_at_ms)
+
+    def _anchored(self, *, in_started, out_started, sdk_started=None):
+        holder = {}
+
+        def factory(sess, sr):
+            x = _AnchoredRecorder(sess, sr)
+            x.in_started = in_started
+            x.out_started = out_started
+            holder["recorder"] = x
+            return x
+
+        d = tempfile.TemporaryDirectory()
+        self.addCleanup(d.cleanup)
+        async def transcode(ogg, mp3):
+            Path(mp3).write_bytes(b"ID3fake-mp3-bytes")
+            return 1000
+
+        r = rec.InWorkerRecorder(_FakeSession(), work_dir=Path(d.name),
+                                 recorder_factory=factory, transcode_fn=transcode,
+                                 upload_fn=_noop_upload)
+        with unittest.mock.patch.object(rec.time, "time", _Clock(5_000.0).time):
+            r.wire()
+            _begin(r)
+        return r
+
+    def test_pre_begin_output_frame_does_not_move_the_anchor_earlier(self):
+        # The SDK stamps the OUTPUT start on the first capture_frame even when
+        # not recording: a bot frame 1 s before begin() must not pull the
+        # anchor before the file's t = 0.
+        r = self._anchored(in_started=5_000.02, out_started=4_999.0)
+        self.assertEqual(r.recording_started_at_ms, 5_000_020)
+        self.assertGreaterEqual(r.recording_started_at_ms, 5_000_000)
+        manifest = _finish(r)
+        self.assertEqual(manifest.recording_started_at_ms, 5_000_020)
+
+    def test_anchor_floor_is_begin_when_no_tap_started_after_it(self):
+        r = self._anchored(in_started=None, out_started=4_999.0)
+        self.assertEqual(r.recording_started_at_ms, 5_000_000)
+
+    def test_anchor_is_the_earliest_post_begin_tap(self):
+        r = self._anchored(in_started=5_000.3, out_started=5_000.1)
+        self.assertEqual(r.recording_started_at_ms, 5_000_100)
+
+    def test_combined_sdk_value_is_floored_at_begin(self):
+        for sdk, expected in ((4_990.0, 5_000_000), (5_000.5, 5_000_500)):
+            with self.subTest(sdk=sdk):
+                r, _s, holder = _make_tmp(self)
+                with unittest.mock.patch.object(rec.time, "time", _Clock(5_000.0).time):
+                    r.wire()
+                    _begin(r)
+                holder["recorder"].recording_started_at = sdk
+                self.assertEqual(r.recording_started_at_ms, expected)
+
+    def test_no_anchor_or_leg_end_before_begin(self):
+        r, _s, _h = _make_tmp(self)
+        r.wire()
+        self.assertIsNone(r.recording_started_at_ms)
+        self.assertIsNone(r.leg_ended_at_ms)
+
+    def test_manifest_timing_kwargs_helper(self):
+        import types
+
+        m = rec.RecordingManifest(sha256="a" * 64, size_bytes=1, duration_ms=None)
+        self.assertEqual(m.timing_kwargs(), {
+            "recording_started_at_ms": None, "leg_ended_at_ms": None, "tail_flushed": None,
+        })
+        self.assertEqual(rec.manifest_timing_kwargs(m), m.timing_kwargs())
+        # A test double / older shape: the legacy body, never a raise.
+        legacy = types.SimpleNamespace(sha256="s", size_bytes=1, duration_ms=2)
+        self.assertEqual(rec.manifest_timing_kwargs(legacy), {})
+
+        class _Broken:
+            def timing_kwargs(self):
+                raise RuntimeError("boom")
+
+        self.assertEqual(rec.manifest_timing_kwargs(_Broken()), {})
+        self.assertEqual(rec.manifest_timing_kwargs(None), {})
+
+
+def _synth_ogg(path, seconds):
+    """A synthetic stereo Opus OGG of exactly ``seconds`` of input audio."""
+    sr = 48000
+    oc = _av.open(str(path), mode="w")
+    st = oc.add_stream("libopus", rate=sr, layout="stereo")
+    n = int(sr * seconds)
+    t = _np.arange(n) / sr
+    left = (0.3 * _np.sin(2 * _np.pi * 440 * t) * 32767).astype(_np.int16)
+    right = (0.3 * _np.sin(2 * _np.pi * 880 * t) * 32767).astype(_np.int16)
+    step = 960  # 20 ms frames, as the recorder writes
+    for i in range(0, n, step):
+        inter = _np.empty(2 * len(left[i:i + step]), dtype=_np.int16)
+        inter[0::2] = left[i:i + step]
+        inter[1::2] = right[i:i + step]
+        frame = _av.AudioFrame.from_ndarray(inter.reshape(1, -1), format="s16", layout="stereo")
+        frame.sample_rate = sr
+        for p in st.encode(frame):
+            oc.mux(p)
+    for p in st.encode(None):
+        oc.mux(p)
+    oc.close()
+
+
+@unittest.skipUnless(_HAS_AV, "PyAV/numpy not installed (CI worker env) — validated where present")
+class TestTruthfulDurationRealPyAv(unittest.TestCase):
+    """duration_ms is the encoded length (±50 ms) of a synthetic 2 s file, on
+    both manifest paths (MP3 upgrade and raw-OGG fallback)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.dir = Path(self._tmp.name)
+        self.src = self.dir / "synth.ogg"
+        _synth_ogg(self.src, 2.0)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_transcode_returns_the_encoded_length(self):
+        ms = _run(rec._default_transcode(self.src, self.dir / "out.mp3"))
+        self.assertIsInstance(ms, int)
+        self.assertAlmostEqual(ms, 2000, delta=50)
+
+    def test_ogg_container_length(self):
+        ms = rec._ogg_duration_ms(self.src)
+        self.assertIsInstance(ms, int)
+        self.assertAlmostEqual(ms, 2000, delta=50)
+
+    def _finish_with(self, transcode):
+        src = self.src.read_bytes()
+
+        class _RealOggRecorder(_FakeRecorder):
+            async def start(self, *, output_path):
+                await super().start(output_path=output_path)
+                Path(output_path).write_bytes(src)
+
+        def factory(sess, sr):
+            return _RealOggRecorder(sess, sr)
+
+        work = self.dir / "work"
+        r = rec.InWorkerRecorder(
+            _FakeSession(), work_dir=work, recorder_factory=factory,
+            transcode_fn=transcode, upload_fn=_noop_upload,
+        )
+        r.wire()
+        _begin(r)
+        return _finish(r)
+
+    def test_mp3_manifest_duration(self):
+        manifest = self._finish_with(rec._default_transcode)
+        self.assertEqual(manifest.content_type, "audio/mpeg")
+        self.assertAlmostEqual(manifest.duration_ms, 2000, delta=50)
+
+    def test_ogg_fallback_manifest_duration(self):
+        async def boom(ogg, mp3):
+            raise RuntimeError("transcode_failed")
+
+        manifest = self._finish_with(boom)
+        self.assertEqual(manifest.content_type, "audio/ogg")
+        self.assertAlmostEqual(manifest.duration_ms, 2000, delta=50)
+
+    def test_cancelled_upgrade_manifest_duration(self):
+        async def cancelled(ogg, mp3):
+            raise asyncio.CancelledError()
+
+        manifest = self._finish_with(cancelled)
+        self.assertEqual(manifest.content_type, "audio/ogg")
+        self.assertAlmostEqual(manifest.duration_ms, 2000, delta=50)
+
+
+async def _noop_upload(url, body, content_type="audio/mpeg"):
+    return None
+
+
 if __name__ == "__main__":
     unittest.main()

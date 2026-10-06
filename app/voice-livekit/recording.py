@@ -50,7 +50,9 @@ The downstream finalizer/download/integrity pipeline expects an **MP3** at the
 attempt-scoped object key. RecorderIO emits OGG/Opus, so :meth:`finish`
 transcodes OGG→MP3 once at call end (off the hot path) and PUTs the MP3 to the
 presigned URL the API minted. It returns a manifest (sha256, size, duration_ms)
-for the API to persist and finalize.
+for the API to persist and finalize. Since M013 S02 the manifest also carries
+the leg timing (recording anchor, leg end, whether the tail was flushed), and
+``duration_ms`` is the true audio length rather than a wall-clock span.
 """
 
 from __future__ import annotations
@@ -151,18 +153,74 @@ class RecordingManifest:
     is advisory to the worker's own logging — the server sniffs the object's
     real container bytes at finalize time — but carrying it here keeps the
     worker's report honest and lets a caller tell the two apart without a
-    re-download."""
+    re-download.
+
+    M013 S02 (T02) — truthful timing, reported as data only:
+      * ``duration_ms`` is the TRUE audio length (samples encoded / rate, or the
+        OGG container's own length on the fallback), never a wall-clock span.
+        ``None`` when unknown or not positive: the API schema is
+        ``.int().positive()``, so a 0 would 400 the completion.
+      * ``recording_started_at_ms`` — epoch ms of the file's t = 0, never
+        earlier than the moment :meth:`InWorkerRecorder.begin` ran.
+      * ``leg_ended_at_ms`` — epoch ms of the earliest leg-end mark.
+      * ``tail_flushed`` — True only when the tail flush actually ran and the
+        recorder closed cleanly (the flush is fail-open, so the API must not
+        infer it)."""
 
     sha256: str
     size_bytes: int
     duration_ms: Optional[int]
     content_type: str = "audio/mpeg"
+    recording_started_at_ms: Optional[int] = None
+    leg_ended_at_ms: Optional[int] = None
+    tail_flushed: Optional[bool] = None
+
+    def timing_kwargs(self) -> dict[str, Any]:
+        """The keyword arguments :func:`recording_api.complete_recording`
+        takes for the leg timing (``None`` values are omitted from the body
+        there, so an unknown value is simply not sent)."""
+        return {
+            "recording_started_at_ms": self.recording_started_at_ms,
+            "leg_ended_at_ms": self.leg_ended_at_ms,
+            "tail_flushed": self.tail_flushed,
+        }
+
+
+def manifest_timing_kwargs(manifest: Any) -> dict[str, Any]:
+    """``manifest.timing_kwargs()`` when the manifest has it, else ``{}``.
+
+    The agent's completion call sites use this so a manifest that is not a
+    :class:`RecordingManifest` (a test double, or an older shape) still posts
+    the legacy body instead of raising inside the teardown. Never raises."""
+    try:
+        fn = getattr(manifest, "timing_kwargs", None)
+        if callable(fn):
+            out = fn()
+            if isinstance(out, dict):
+                return out
+    except Exception:  # noqa: BLE001 — the completion itself matters more
+        pass
+    return {}
+
+
+def _positive_ms(value: Any) -> Optional[int]:
+    """An int > 0, else ``None`` (bools and non-numbers are ``None``)."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        ms = int(round(value))
+    except (OverflowError, ValueError):
+        return None
+    return ms if ms > 0 else None
 
 
 # Injected seams (real defaults below) so the lifecycle is unit-testable with no
 # livekit/PyAV/ffmpeg/network present.
 RecorderFactory = Callable[[Any, int], Any]
-TranscodeFn = Callable[[Path, Path], Awaitable[None]]
+# (ogg_path, mp3_path) -> the ENCODED audio length in ms (samples fed to the
+# MP3 encoder / its rate), or None when the transcoder cannot tell. A value
+# that is not a positive int is treated as unknown (M013 S02 T02).
+TranscodeFn = Callable[[Path, Path], Awaitable[Optional[int]]]
 # (upload_url, body, content_type) — content_type is "audio/mpeg" for the normal
 # MP3 and "audio/ogg" for the v114 raw-OGG fallback, so the PUT declares the
 # real Content-Type of whichever body survived.
@@ -371,8 +429,14 @@ def build_flushing_recorder_cls(base: type, split_frame: Callable[[Any, float], 
     return _FlushingRecorderIO
 
 
-async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
+async def _default_transcode(ogg_path: Path, mp3_path: Path) -> Optional[int]:
     """One-shot OGG→MP3 transcode, off the hot path, IN-PROCESS via PyAV.
+
+    Returns the ENCODED audio length in ms: every sample handed to the MP3
+    encoder (the FIFO chunks plus the final short frame) divided by the output
+    rate. That is the true length of the recording (M013 S02 T02 — the old
+    wall-clock "duration" counted from the recorder's start to the upload).
+    ``None`` when nothing was counted.
 
     Deliberately NOT an ``ffmpeg`` subprocess: the worker image is
     ``python:3.12-slim`` with no ffmpeg BINARY, so shelling out silently failed
@@ -413,7 +477,7 @@ async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
          that preserves the raw bytes), but a normal desynced call now yields a
          complete MP3 with zero skipped frames.
     """
-    def _run() -> None:
+    def _run() -> Optional[int]:
         import av  # noqa: PLC0415
         from av.audio.fifo import AudioFifo  # noqa: PLC0415
         from av.audio.resampler import AudioResampler  # noqa: PLC0415
@@ -423,6 +487,10 @@ async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
         decoded_frames = 0
         encoded_frames = 0
         skipped_frames = 0
+        # M013 S02 T02: samples actually handed to the MP3 encoder — the
+        # recording's TRUE length once divided by the output rate.
+        encoded_samples = 0
+        out_rate = _SAMPLE_RATE
         try:
             in_stream = in_container.streams.audio[0]
             out_rate = in_stream.rate or _SAMPLE_RATE
@@ -480,6 +548,7 @@ async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
                 # dropped), THEN encode the final short remainder as the one
                 # legitimately-undersized last frame. `fifo.read` returns None
                 # when fewer than the requested samples remain.
+                nonlocal encoded_samples
                 while fifo.samples >= frame_size:
                     chunk = fifo.read(frame_size)
                     if chunk is None:
@@ -487,6 +556,7 @@ async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
                     chunk.pts = None
                     for packet in out_stream.encode(chunk):
                         out_container.mux(packet)
+                    encoded_samples += chunk.samples
                 if final:
                     # The true last frame: everything still buffered (< frame_size).
                     tail = fifo.read()
@@ -494,6 +564,7 @@ async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
                         tail.pts = None
                         for packet in out_stream.encode(tail):
                             out_container.mux(packet)
+                        encoded_samples += tail.samples
 
             for frame in in_container.decode(in_stream):
                 decoded_frames += 1
@@ -585,8 +656,46 @@ async def _default_transcode(ogg_path: Path, mp3_path: Path) -> None:
                     _TRANSCODE_MAX_SKIPPED_FRACTION,
                 )
                 raise RuntimeError("transcode_truncated_below_floor")
+        if encoded_samples <= 0 or not out_rate:
+            return None
+        return _positive_ms(encoded_samples * 1000.0 / out_rate)
 
-    await asyncio.to_thread(_run)
+    return await asyncio.to_thread(_run)
+
+
+def _ogg_duration_ms(ogg_path: Optional[Path]) -> Optional[int]:
+    """The OGG container's own audio length in ms, read with PyAV by demuxing
+    packets (no decode, so it is cheap even for a long call). Used for the
+    raw-OGG manifests, where no MP3 encode counted the samples.
+
+    Sums the packet durations (the Opus demuxer gives each packet its real
+    duration, and the end trim lives in the last packet's duration); falls
+    back to the container's own duration when the packets carry none.
+    ``None`` when PyAV is absent, the file is unreadable or the length is not
+    positive. Never raises."""
+    if ogg_path is None:
+        return None
+    try:
+        import av  # noqa: PLC0415
+
+        container = av.open(str(ogg_path))
+        try:
+            stream = container.streams.audio[0]
+            time_base = stream.time_base
+            total = 0
+            for packet in container.demux(stream):
+                if packet.duration:
+                    total += int(packet.duration)
+            if total > 0 and time_base is not None:
+                return _positive_ms(float(total * time_base) * 1000.0)
+            if container.duration:
+                # Container duration is in AV_TIME_BASE (microseconds).
+                return _positive_ms(container.duration / 1000.0)
+            return None
+        finally:
+            container.close()
+    except Exception:  # noqa: BLE001 — a missing duration is acceptable
+        return None
 
 
 async def _default_upload(
@@ -748,6 +857,9 @@ class InWorkerRecorder:
         self._counter = _FrameCounter()
         self._wired_at_ms: Optional[int] = None
         self._begun_at_ms: Optional[int] = None
+        # M013 S02 T02: epoch seconds stamped just BEFORE the recorder's
+        # start() — the floor for the reported recording anchor.
+        self._begin_called_at: Optional[float] = None
         # FIX 4: the call.answered wall-clock (epoch ms), passed to begin() so the
         # recording START offset vs answer (the observed ~28s head-gap) is logged
         # once at recorder start. None → the offset line is skipped.
@@ -804,6 +916,55 @@ class InWorkerRecorder:
     def leg_end_source(self) -> Optional[str]:
         """``sip_left`` | ``session_close`` | ``finish`` (the earliest mark)."""
         return self._leg_end_source
+
+    @property
+    def leg_ended_at_ms(self) -> Optional[int]:
+        """:attr:`leg_ended_at` as epoch ms, else ``None``."""
+        ts = self._leg_end_ts
+        if ts is None:
+            return None
+        try:
+            return _positive_ms(ts * 1000.0)
+        except Exception:  # noqa: BLE001
+            return None
+
+    @property
+    def recording_started_at_ms(self) -> Optional[int]:
+        """Epoch ms of the recording file's t = 0, or ``None`` before begin.
+
+        The SDK's ``RecorderIO.recording_started_at`` is the earliest of the
+        two taps' ``started_wall_time``, but the OUTPUT tap stamps its start on
+        the first ``capture_frame`` EVEN WHEN NOT RECORDING (1.6.4
+        ``recorder_io.py:547-548``) — so a bot frame spoken before
+        :meth:`begin` would pull the anchor before the file's t = 0. Only tap
+        starts at or after the moment begin() started the recorder count; the
+        earliest of those is the anchor, and begin's own stamp is the floor
+        (equivalently ``max(recording_started_at, begun_at)`` when the SDK
+        exposes only the combined value, as the test doubles do). Never
+        raises."""
+        floor = self._begin_called_at
+        if floor is None:
+            return None
+        try:
+            rec = self._recorder
+            starts: list[float] = []
+            for tap_name in ("_in_record", "_out_record"):
+                tap = getattr(rec, tap_name, None)
+                t = getattr(tap, "started_wall_time", None) if tap is not None else None
+                if isinstance(t, (int, float)) and not isinstance(t, bool):
+                    starts.append(float(t))
+            if starts:
+                valid = [t for t in starts if t >= floor]
+                anchor = min(valid) if valid else floor
+            else:
+                sdk = getattr(rec, "recording_started_at", None)
+                if isinstance(sdk, (int, float)) and not isinstance(sdk, bool):
+                    anchor = max(float(sdk), floor)
+                else:
+                    anchor = floor
+            return _positive_ms(anchor * 1000.0)
+        except Exception:  # noqa: BLE001
+            return _positive_ms(floor * 1000.0)
 
     @property
     def tail_flushed(self) -> bool:
@@ -1003,6 +1164,7 @@ class InWorkerRecorder:
             base = self._work_dir or Path(tempfile.gettempdir()) / "inworker-recordings"
             base.mkdir(parents=True, exist_ok=True)
             self._ogg_path = base / (Path(object_key).name + ".ogg")
+            self._begin_called_at = time.time()
             await self._recorder.start(output_path=self._ogg_path)
             self._begun = True
             self._begun_at_ms = int(time.time() * 1000)
@@ -1203,6 +1365,8 @@ class InWorkerRecorder:
         mp3_path = self._ogg_path.with_suffix(".mp3")
         body: Optional[bytes] = None
         content_type = "audio/ogg"
+        # M013 S02 T02: the true audio length in ms (None until known).
+        encoded_ms: Optional[int] = None
         try:
             # ── NO-AUDIO GUARD (RCA 2026-09-04, STEP 4): the OGG is MISSING or
             # EMPTY. This is the ACTUAL live failure on every phone call — zero
@@ -1264,12 +1428,11 @@ class InWorkerRecorder:
                 # retain the raw evidence, but do not run transcode or invent a
                 # duration for bytes that may still be missing tail packets.
                 self._cleanup()
-                sha256 = hashlib.sha256(body).hexdigest()
-                return RecordingManifest(
-                    sha256=sha256,
-                    size_bytes=len(body),
-                    duration_ms=None,
-                    content_type=content_type,
+                # No duration, and the tail is NOT reported flushed: the
+                # encoder never acknowledged the close, so tail packets may be
+                # missing from the file whatever the flush did.
+                return self._build_manifest(
+                    body, content_type, None, close_completed=False,
                 )
 
             # ── BEST-EFFORT MP3 UPGRADE ─────────────────────────────────────
@@ -1287,7 +1450,9 @@ class InWorkerRecorder:
             # realistically lands on the OGG PUT await above (the first slow
             # network await), not here; either way the OGG is already durable.
             try:
-                await self._transcode_fn(self._ogg_path, mp3_path)
+                encoded_ms = _positive_ms(
+                    await self._transcode_fn(self._ogg_path, mp3_path),
+                )
                 mp3_body = mp3_path.read_bytes()
                 if not mp3_body:
                     raise RuntimeError("empty_mp3")
@@ -1320,6 +1485,12 @@ class InWorkerRecorder:
                     extra={"object_key": self._object_key},
                     exc_info=True,
                 )
+            # M013 S02 T02: the TRUE audio length. The MP3 encode counted its
+            # samples; otherwise (raw-OGG manifest, or a transcoder that could
+            # not tell) read the OGG container's own length. Off the loop: a
+            # long call's OGG has tens of thousands of packets.
+            if encoded_ms is None:
+                encoded_ms = await asyncio.to_thread(_ogg_duration_ms, self._ogg_path)
         except asyncio.CancelledError:
             # Cancellation propagated from the upgrade block AFTER the durable
             # OGG PUT succeeded (body/content_type are the OGG). Build the OGG
@@ -1328,17 +1499,15 @@ class InWorkerRecorder:
             # and falls through to the fail-open None return below via the outer
             # structure — but that PUT is the first slow await, so in practice
             # the OGG is durable well before any transcode-window cancel.)
-            self._cleanup()
             if body is None:
+                self._cleanup()
                 raise
-            sha256 = hashlib.sha256(body).hexdigest()
-            duration_ms = self._probe_duration_ms()
-            return RecordingManifest(
-                sha256=sha256,
-                size_bytes=len(body),
-                duration_ms=duration_ms,
-                content_type=content_type,
-            )
+            # Read the OGG's length BEFORE the cleanup deletes it (a rare
+            # shutdown path, so the short synchronous demux is acceptable).
+            if encoded_ms is None:
+                encoded_ms = _ogg_duration_ms(self._ogg_path)
+            self._cleanup()
+            return self._build_manifest(body, content_type, encoded_ms)
         except Exception:  # noqa: BLE001 — fail-open, the call is already over
             logger.warning(
                 "in_worker_recording_finish_failed %s",
@@ -1363,14 +1532,7 @@ class InWorkerRecorder:
 
         self._cleanup()
         assert body is not None
-        sha256 = hashlib.sha256(body).hexdigest()
-        duration_ms = self._probe_duration_ms()
-        return RecordingManifest(
-            sha256=sha256,
-            size_bytes=len(body),
-            duration_ms=duration_ms,
-            content_type=content_type,
-        )
+        return self._build_manifest(body, content_type, encoded_ms)
 
     async def discard(self) -> None:
         """Wrong-number/identity-mismatch privacy path: stop recording and
@@ -1406,18 +1568,28 @@ class InWorkerRecorder:
         self._cleanup()
         logger.info("in_worker_recording_discarded", extra={"object_key": self._object_key})
 
-    def _probe_duration_ms(self) -> Optional[int]:
-        """Best-effort duration from the recorder's started-at anchor. Never
-        raises — a missing duration is acceptable to the finalizer."""
-        try:
-            started = getattr(self._recorder, "recording_started_at", None)
-            if started is None:
-                return None
-            import time  # noqa: PLC0415
-
-            return max(0, int((time.time() - started) * 1000))
-        except Exception:  # noqa: BLE001
-            return None
+    def _build_manifest(
+        self,
+        body: bytes,
+        content_type: str,
+        duration_ms: Optional[int],
+        *,
+        close_completed: bool = True,
+    ) -> RecordingManifest:
+        """The manifest for whichever body landed, with the M013 S02 timing
+        (data only: the API stamps it on the attempt, it never drives a state
+        transition). ``duration_ms`` is the TRUE audio length or ``None`` —
+        never 0 and never a wall-clock span (the old ``_probe_duration_ms``
+        measured recorder start → upload)."""
+        return RecordingManifest(
+            sha256=hashlib.sha256(body).hexdigest(),
+            size_bytes=len(body),
+            duration_ms=_positive_ms(duration_ms),
+            content_type=content_type,
+            recording_started_at_ms=self.recording_started_at_ms,
+            leg_ended_at_ms=self.leg_ended_at_ms,
+            tail_flushed=bool(close_completed and self.tail_flushed),
+        )
 
     def _cleanup(self) -> None:
         for p in (self._ogg_path, self._ogg_path.with_suffix(".mp3") if self._ogg_path else None):
