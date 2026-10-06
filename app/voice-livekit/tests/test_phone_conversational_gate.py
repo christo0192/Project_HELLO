@@ -1859,6 +1859,80 @@ class TestRoleOpeningIsComposedNotStreamed(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(
                 await phone.phone_compose_role_opening(role, infer=_never))
 
+    # ── M013 S01 T08b: no third greeting ────────────────────────────────
+
+    def test_the_LIVE_turn6_third_greeting_is_rejected(self):
+        # #334 stage 2, turn 6: the role line greeted a third time, after the
+        # identity line and the consent line had both said hello.
+        live = ("Hi there, thanks for hopping on! This chat is about the Sales "
+                "Program Advisor role at Interview Kickstart.")
+        self.assertTrue(
+            phone.phone_role_opening_faithful(live, self.ROLE),
+            "it names the role, so the old check passed it",
+        )
+        self.assertEqual(phone.phone_generated_question_act_count(live), 0)
+        self.assertFalse(phone.phone_role_opening_clean(live, self.ROLE))
+
+    def test_every_shape_of_a_repeat_greeting_is_rejected(self):
+        role = f"the {self.ROLE} role at Interview Kickstart"
+        for line in (
+            f"Hello! This chat is about {role}.",
+            f"Hey, so this is about {role}.",
+            f"Good afternoon — this chat is about {role}.",
+            f"Great, hi again! This is about {role}.",
+            f"Hi, I'm Christy and I'm glad you could hop on to chat about {role}.",
+            f"This chat is about {role}. Thanks so much for joining.",
+            f"Thank you for taking the call — this is about {role}.",
+            f"Thanks for making the time; this chat is about {role}.",
+            f"This is Christy again, and this chat is about {role}.",
+        ):
+            with self.subTest(line=line):
+                self.assertTrue(phone.phone_role_opening_faithful(line, self.ROLE))
+                self.assertTrue(phone.phone_role_opening_greets(line))
+                self.assertFalse(phone.phone_role_opening_clean(line, self.ROLE))
+
+    def test_a_handover_with_no_greeting_is_still_accepted(self):
+        for line in (
+            "Great — this chat is about the Sales Program Advisor role at "
+            "Interview Kickstart, and I'm glad you could hop on.",
+            "Perfect. So this is about the Sales Program Advisor role at "
+            "Interview Kickstart — let's get into it.",
+            "Thanks for that! This chat is about the Sales Program Advisor role "
+            "at Interview Kickstart.",
+            # "this" before a word that is not the persona name is no intro.
+            "This is about the Sales Program Advisor role at Interview Kickstart.",
+        ):
+            with self.subTest(line=line):
+                self.assertFalse(phone.phone_role_opening_greets(line))
+                self.assertTrue(phone.phone_role_opening_clean(line, self.ROLE))
+        self.assertTrue(phone.phone_role_opening_greets(None), "fail closed")
+
+    def test_the_fixed_fallback_line_does_not_greet(self):
+        fixed = phone.phone_role_opening_text(self.ROLE)
+        self.assertFalse(phone.phone_role_opening_greets(fixed))
+        self.assertTrue(phone.phone_role_opening_clean(fixed, self.ROLE))
+
+    def test_the_INSTRUCTION_says_already_greeted_and_forbids_a_greeting(self):
+        text = phone.phone_role_opening_instruction(self.ROLE)
+        low = text.lower()
+        self.assertIn("already been greeted", low)
+        self.assertIn("do not say hi, hello or hey", low)
+        self.assertIn("do not thank them for hopping on", low)
+        self.assertIn("do not introduce yourself again", low)
+        # It no longer asks for the "glad you could hop on" pleasantry that
+        # the model turned into "thanks for hopping on".
+        self.assertNotIn("glad they could", low)
+        self.assertNotIn("warmly opening", low)
+
+    async def test_compose_withholds_a_greeting_draft(self):
+        async def _greets(_instruction):
+            return ("Hi there, thanks for hopping on! This chat is about the "
+                    "Sales Program Advisor role at Interview Kickstart.")
+        self.assertIsNone(
+            await phone.phone_compose_role_opening(self.ROLE, infer=_greets),
+            "a greeting draft falls back to the fixed line",
+        )
+
 
 class TestControlRunForming(unittest.TestCase):
     """`phone_control_run_forming` — the hold predicate, on its own.

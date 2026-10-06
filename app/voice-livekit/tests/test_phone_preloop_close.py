@@ -298,6 +298,139 @@ class TestGuardedPreloopSpeech(unittest.IsolatedAsyncioTestCase):
             agent_mod._participant_gone_from(RuntimeError("boom"), category="x")
 
 
+_REPHRASED_Q1 = "To start us off, what kind of work are you doing right now?"
+
+
+def _done(value):
+    future = asyncio.get_event_loop().create_future()
+    future.set_result(value)
+    return future
+
+
+def _prefetch(*, cursor=0, key="k1", planned="First question?", text=_REPHRASED_Q1,
+              frames=("frame-1", "frame-2"), rephrase=None, render=None):
+    """A `PhoneQ1Prefetch` as the gate hands it over: done tasks by default."""
+    return phone.PhoneQ1Prefetch(
+        cursor=cursor, key=key, planned_text=planned,
+        rephrase_task=rephrase if rephrase is not None else _done(text),
+        frames_task=(
+            render if render is not None
+            else (_done(list(frames)) if frames is not None else None)
+        ),
+    )
+
+
+class _RefusesAudioSession(_PreloopSession):
+    """An SDK that will not take pre-rendered audio (`say` raises at once)."""
+
+    def say(self, text, **kwargs):
+        if "audio" in kwargs:
+            self.say_calls.append({"text": text, "refused": True})
+            raise TypeError("unexpected keyword argument 'audio'")
+        return super().say(text, **kwargs)
+
+
+class TestPreloopUsesTheQ1Prefetch(unittest.IsolatedAsyncioTestCase):
+    """M013 S01 T08b: the pre-loop speaks the Q1 the gate prepared."""
+
+    def _q1_call(self, session):
+        calls = [c for c in session.say_calls if not c.get("refused")]
+        return calls[-1]
+
+    async def test_a_ready_prefetch_is_spoken_with_its_frames_and_no_second_rephrase(self):
+        session = _PreloopSession()
+        h = _NativeHarness(session, state=_state(), role_opening_spoken=True)
+        h.result.q1_prefetch = _prefetch()
+        await h.run()
+        h.rephrase.assert_not_awaited()
+        call = self._q1_call(session)
+        self.assertEqual(call["text"], _REPHRASED_Q1)
+        self.assertTrue(call["allow_interruptions"])
+        self.assertIn("audio", call, "pre-rendered frames are played")
+        # Q1 priming uses the text actually spoken.
+        self.assertEqual(h.latest_assistant[0], _REPHRASED_Q1)
+        self.assertTrue(h.logged("phone_q1_prefetch", phone.Q1_PREFETCH_PRERENDERED))
+
+    async def test_a_rephrase_with_no_frames_is_synthesised_on_demand(self):
+        session = _PreloopSession()
+        h = _NativeHarness(session, state=_state(), role_opening_spoken=True)
+        h.result.q1_prefetch = _prefetch(frames=None)
+        await h.run()
+        h.rephrase.assert_not_awaited()
+        self.assertEqual(
+            self._q1_call(session),
+            {"text": _REPHRASED_Q1, "allow_interruptions": True},
+        )
+
+    async def test_a_RECONNECT_leg_with_another_cursor_speaks_ITS_question_verbatim(self):
+        # The prefetch was made for cursor 0; this leg resumes at cursor 1.
+        state = phone.PhoneAssessmentState.parse(
+            fixtures._plan_payload(cursor=1, completed=["k1"], role_title=_ROLE))
+        session = _PreloopSession()
+        h = _NativeHarness(session, state=state, role_opening_spoken=True)
+        pending = asyncio.get_event_loop().create_future()
+        h.result.q1_prefetch = _prefetch(rephrase=pending, frames=None)
+        await h.run()
+        h.rephrase.assert_not_awaited()
+        self.assertEqual(
+            self._q1_call(session),
+            {"text": "Second question?", "allow_interruptions": True},
+        )
+        self.assertTrue(pending.cancelled(), "the stale prefetch is stopped")
+        self.assertEqual(h.latest_assistant[0], "Second question?")
+        self.assertTrue(h.logged("phone_q1_prefetch", phone.Q1_PREFETCH_MISMATCH))
+
+    async def test_a_reconnect_leg_with_no_prefetch_rephrases_its_own_cursor(self):
+        state = phone.PhoneAssessmentState.parse(
+            fixtures._plan_payload(cursor=1, completed=["k1"], role_title=_ROLE))
+        session = _PreloopSession()
+        h = _NativeHarness(session, state=state)
+        await h.run()
+        h.rephrase.assert_awaited_once()
+        self.assertEqual(h.rephrase.await_args.args[0], "Second question?")
+        self.assertEqual(self._q1_call(session)["text"], "Second question?")
+        self.assertTrue(h.logged("phone_q1_prefetch", "on_demand"))
+
+    async def test_a_rephrase_still_running_is_not_waited_for(self):
+        session = _PreloopSession()
+        h = _NativeHarness(session, state=_state(), role_opening_spoken=True)
+        pending = asyncio.get_event_loop().create_future()
+        h.result.q1_prefetch = _prefetch(rephrase=pending)
+        loop = asyncio.get_running_loop()
+        with patch.object(phone, "PHONE_Q1_PREFETCH_WAIT_SEC", 0.05):
+            started = loop.time()
+            await h.run()
+        self.assertEqual(self._q1_call(session)["text"], "First question?")
+        self.assertTrue(pending.cancelled())
+        self.assertTrue(h.logged("phone_q1_prefetch", phone.Q1_PREFETCH_TIMEOUT))
+        self.assertLess(loop.time() - started, 2.0)
+
+    async def test_an_SDK_that_refuses_the_audio_gets_the_line_synthesised(self):
+        session = _RefusesAudioSession()
+        h = _NativeHarness(session, state=_state(), role_opening_spoken=True)
+        h.result.q1_prefetch = _prefetch()
+        await h.run()
+        spoken_q1 = [c for c in session.say_calls if c["text"] == _REPHRASED_Q1]
+        self.assertEqual(
+            spoken_q1,
+            [{"text": _REPHRASED_Q1, "refused": True},
+             {"text": _REPHRASED_Q1, "allow_interruptions": True}],
+            "refused at say (nothing queued), then spoken once on demand",
+        )
+        self.assertTrue(h.logged("phone_q1_prefetch", "prerendered_say_refused"))
+
+    async def test_a_role_line_nobody_heard_stops_the_prefetch(self):
+        session = _PreloopSession(drop_say=lambda t: _ROLE in t)
+        h = _NativeHarness(session, state=_state())
+        rephrase = asyncio.get_event_loop().create_future()
+        render = asyncio.get_event_loop().create_future()
+        h.result.q1_prefetch = _prefetch(rephrase=rephrase, render=render)
+        await h.run()
+        self.assertEqual(h.terminal_reason, "disconnect")
+        self.assertTrue(rephrase.cancelled())
+        self.assertTrue(render.cancelled())
+
+
 class _ClosingDropsSession(fixtures._FakePhoneSession):
     """The candidate is gone by the time the closing courtesy line is said."""
 

@@ -865,10 +865,19 @@ def phone_role_opening_instruction(role_title: str | None) -> str | None:
     if not role:
         return None
     return (
-        "You are Christy, warmly opening a friendly phone screening. In ONE or "
-        "two short, natural spoken sentences: confirm this chat is about the "
-        f"\"{role}\" role at Interview Kickstart, and say you're glad they could "
-        "hop on. You MUST say the exact role title "
+        # M013 S01 T08b: THE THIRD GREETING. This one-shot has no context, so
+        # it did not know the call was already open: live, the role line
+        # opened "Hi there, thanks for hopping on…" after the identity line
+        # and the consent line had both greeted. Say so, and
+        # `phone_role_opening_clean` rejects a draft that greets anyway.
+        "You are Christy, partway into a friendly phone screening you have "
+        "ALREADY opened: the candidate has already been greeted and has just "
+        "agreed to continue. In ONE or two short, natural spoken sentences: "
+        f"confirm this chat is about the \"{role}\" role at Interview "
+        "Kickstart and hand over warmly to the questions. Do NOT greet them "
+        "again: do not say hi, hello or hey, do not introduce yourself again, "
+        "and do not thank them for hopping on, joining or taking the call. "
+        "You MUST say the exact role title "
         f"\"{role}\" verbatim, word for word — never paraphrase, shorten, or "
         "guess a different role. No stage directions. "
         # THE CONTRADICTION THAT CAUSED THE DOUBLE QUESTION. This used to say
@@ -932,7 +941,49 @@ def phone_role_opening_clean(text: Any, role_title: Any) -> bool:
     """
     if not phone_role_opening_faithful(text, role_title):
         return False
+    if phone_role_opening_greets(text):
+        return False
     return phone_generated_question_act_count(text) == 0
+
+
+# M013 S01 T08b: the role line is the THIRD bot turn of the call, after the
+# identity line and the consent line have both greeted. A leading greeting
+# (optionally after one filler word: "Great, hi there"), a self-introduction,
+# or "thanks for hopping on / joining / taking the call" is a third greeting.
+_ROLE_OPENING_LEADING_GREETING_RE = re.compile(
+    r"^\W*(?:(?:okay|ok|great|awesome|lovely|perfect|wonderful|alright|"
+    r"all right|so|well|oh)\W+)?"
+    r"(?:hi|hello|hey|hiya|howdy|namaste|greetings|"
+    r"good\s+(?:morning|afternoon|evening|day))\b",
+    re.IGNORECASE,
+)
+_ROLE_OPENING_THANKS_FOR_JOINING_RE = re.compile(
+    r"\bthank(?:s|\s+you)\b[^.!?]{0,40}?\b(?:"
+    r"hop(?:ping)?\s+on|join(?:ing)?|"
+    r"tak(?:e|ing)\s+(?:the|this|my|our)\s+call|"
+    r"mak(?:e|ing)\s+(?:the\s+)?time|pick(?:ing)?\s+up|com(?:e|ing)\s+on)\b",
+    re.IGNORECASE,
+)
+_ROLE_OPENING_SELF_INTRO_RE = re.compile(
+    r"\b(?:i\s+am|i'm|i’m|this\s+is|my\s+name\s+is|it's|it’s)\s+christy\b",
+    re.IGNORECASE,
+)
+
+
+def phone_role_opening_greets(text: Any) -> bool:
+    """True when a role-opening draft greets the candidate (again).
+
+    Fail-closed for non-strings (True), so a caller that forgets the type
+    check still falls back to the fixed line.
+    """
+    if not isinstance(text, str):
+        return True
+    compact = " ".join(text.split())
+    return bool(
+        _ROLE_OPENING_LEADING_GREETING_RE.search(compact)
+        or _ROLE_OPENING_THANKS_FOR_JOINING_RE.search(compact)
+        or _ROLE_OPENING_SELF_INTRO_RE.search(compact)
+    )
 
 
 def phone_q1_rephrase_instruction(question_text: Any) -> str | None:
@@ -7166,6 +7217,7 @@ class PhoneGateResult:
         "assessment_state",
         "role_opening_spoken",
         "scoring_queue_owned",
+        "q1_prefetch",
     )
 
     def __init__(
@@ -7178,6 +7230,7 @@ class PhoneGateResult:
         spoken: Optional[list[str]] = None,
         assessment_state: Optional["PhoneAssessmentState"] = None,
         role_opening_spoken: bool = False,
+        q1_prefetch: Optional["PhoneQ1Prefetch"] = None,
     ) -> None:
         self.outcome = outcome
         self.assessment_allowed = assessment_allowed
@@ -7200,6 +7253,11 @@ class PhoneGateResult:
         # `abandoned`). Not a constructor arg — only the coordinator sets it.
         self.scoring_queue_owned = False
         self.not_the_candidate = False
+        # M013 S01 T08b: the first question, rephrased (and maybe rendered)
+        # while the role line played. Started the moment the atomic
+        # consent/start RPC returned; None on every other path, where the
+        # pre-loop rephrases on demand as before.
+        self.q1_prefetch = q1_prefetch
 
     def __repr__(self) -> str:  # pragma: no cover - diagnostics only
         return (
@@ -7816,6 +7874,17 @@ async def run_phone_gate(
     # the candidate's own words, and its affirmative for a confirm question),
     # or None (legacy / shadow mode, or the judge unavailable).
     judge_callback: Optional[Callable[..., Awaitable[Any]]] = None,
+    # ── M013 S01 T08b (both optional; absent ⇒ today's behaviour) ─────────
+    # Start preparing the first question from the state the atomic
+    # consent/start RPC just returned (`phone_start_q1_prefetch`). Returns a
+    # `PhoneQ1Prefetch` (or None), carried out on the result so the pre-loop
+    # speaks Q1 the moment the role line ends instead of rephrasing it then.
+    start_q1_prefetch: Optional[Callable[[Any], Any]] = None,
+    # Start composing the role line while the consent question is asked
+    # (the role title is known before the call). Fired once, just before the
+    # consent line; `speak_role_opening` then uses the draft when the title
+    # the RPC returns is the same one.
+    start_role_compose: Optional[Callable[[], Any]] = None,
 ) -> PhoneGateResult:
     """Run the phone screening's opening, in the ONLY order that is safe.
 
@@ -8981,6 +9050,15 @@ async def run_phone_gate(
         return await _defer_with_goodbye(GATE_BUDGET_EXHAUSTED_SCHEMA)
     if identity_ran:
         _ask_barrier()
+    if start_role_compose is not None:
+        # T08b: the role line composes during the consent wait.
+        try:
+            start_role_compose()
+        except Exception:  # noqa: BLE001 — the role line then composes after consent
+            _log.warn(
+                "unknown_event", error_type="phone_role_opening",
+                error_category="precompose_start_failed",
+            )
 
     def _mark_recording_heard() -> None:
         if mark_recording_sentence is None:
@@ -9261,6 +9339,18 @@ async def run_phone_gate(
             return PhoneGateResult(CLASSIFY_HUMAN, events=events, spoken=spoken)
         _phase("consent_durable")
         events.extend(["classify.human", "disclosure.delivered"])
+        # T08b: the plan is known now, a whole role line before Q1 is due, so
+        # Q1's rephrase (and its audio) is prepared underneath the role line.
+        q1_prefetch = None
+        if start_q1_prefetch is not None:
+            try:
+                q1_prefetch = start_q1_prefetch(combined)
+            except Exception:  # noqa: BLE001 — the pre-loop rephrases on demand
+                q1_prefetch = None
+                _log.warn(
+                    "unknown_event", error_type="phone_q1_prefetch",
+                    error_category="start_failed",
+                )
         # THE LATENCY MASK. The deterministic role-opening line (a USEFUL
         # sentence, not a throwaway bridge) is spoken as a background task so it
         # plays WHILE the gate-turn commit and the egress start run underneath
@@ -9316,23 +9406,31 @@ async def run_phone_gate(
             return False
 
         role_spoken = False
-        role_task = asyncio.ensure_future(_deliver_role_opening())
         try:
-            await _commit_gate_turns()
-            if start_recording is not None:
-                await start_recording()
-        finally:
+            role_task = asyncio.ensure_future(_deliver_role_opening())
             try:
-                role_spoken = await role_task
-            except Exception:  # noqa: BLE001
-                _log.warn(
-                    "unknown_event", error_type="phone_role_opening_failed",
-                    error_category="role_opening",
-                )
+                await _commit_gate_turns()
+                if start_recording is not None:
+                    await start_recording()
+            finally:
+                try:
+                    role_spoken = await role_task
+                except Exception:  # noqa: BLE001
+                    _log.warn(
+                        "unknown_event", error_type="phone_role_opening_failed",
+                        error_category="role_opening",
+                    )
+        except BaseException:
+            # T08b: a gate that does not return leaves nothing preparing Q1.
+            cancel_prefetch = getattr(q1_prefetch, "cancel", None)
+            if callable(cancel_prefetch):
+                cancel_prefetch()
+            raise
         return PhoneGateResult(CLASSIFY_HUMAN, assessment_allowed=True,
                                recording_allowed=True, events=events, spoken=spoken,
                                assessment_state=combined,
-                               role_opening_spoken=role_spoken)
+                               role_opening_spoken=role_spoken,
+                               q1_prefetch=q1_prefetch)
 
     await _await_answered_post()
     human = await client.post_event(attempt_id, "classify.human", epoch=epoch)
@@ -10825,6 +10923,179 @@ async def phone_rephrase_first_question(
     if candidate and phone_rephrased_question_acceptable(candidate):
         return candidate
     return text
+
+
+# ── M013 S01 T08b: the first question, prepared during the role line ────────
+#
+# THE Q1 GAP. After consent the role line plays (5-8 s), and only once it had
+# finished did the pre-loop ask the model to rephrase Q1 (a one-shot of up to
+# 3 s), then synthesise it. Live 9f60523d: 1.8 s of silence between the role
+# line and Q1; worst case about 9 s; in #334's stage-2 call the candidate
+# filled it with "Okay" and Q1 was cut off. The plan, and so Q1, is known the
+# moment the atomic consent/start RPC returns, a whole role line earlier.
+#
+# So the gate starts the rephrase there (and, when enabled, renders its audio
+# straight after), and the pre-loop takes whatever is ready once the role line
+# ends. It waits at most `PHONE_Q1_PREFETCH_WAIT_SEC` for a rephrase that is
+# still running: the verbatim planned question is always a correct thing to
+# say, and silence is not. The role line and Q1 stay two utterances (the
+# ffab6c2a double-question risk).
+
+#: The longest the pre-loop waits, after the role line, for a rephrase started
+#: at consent before it speaks the verbatim planned question instead.
+PHONE_Q1_PREFETCH_WAIT_SEC = 0.3
+
+#: `phone_take_q1_prefetch` outcome categories (logged, never text).
+Q1_PREFETCH_PRERENDERED = "prerendered"
+Q1_PREFETCH_REPHRASED = "rephrased"
+Q1_PREFETCH_RENDER_UNAVAILABLE = "render_unavailable"
+Q1_PREFETCH_TIMEOUT = "timeout"
+Q1_PREFETCH_MISMATCH = "mismatch"
+Q1_PREFETCH_ERROR = "error"
+
+
+def phone_q1_prerender_enabled() -> bool:
+    """Pre-render the first question's audio during the role line (T08b).
+
+    DEFAULT ON; an explicit off token (``false``/``0``/``no``/``off``)
+    disables it, and Q1 is then synthesised on demand as before (the rephrase
+    still starts at consent). Read with the literal name so the env-contract
+    scanner sees it.
+    """
+    return (os.getenv("PHONE_Q1_PRERENDER") or "true").strip().lower() not in (
+        "false", "0", "no", "off",
+    )
+
+
+class PhoneQ1Prefetch:
+    """The first question, being prepared while the role line plays.
+
+    Carries what it was prepared FOR (cursor, key, planned text), so the
+    pre-loop can refuse it when the leg's question differs, and the two
+    tasks: the rephrase, and the optional audio render of its result.
+    """
+
+    __slots__ = ("cursor", "key", "planned_text", "rephrase_task", "frames_task")
+
+    def __init__(
+        self,
+        *,
+        cursor: int,
+        key: str,
+        planned_text: str,
+        rephrase_task: "asyncio.Future[str]",
+        frames_task: "asyncio.Future[list[Any]] | None" = None,
+    ) -> None:
+        self.cursor = cursor
+        self.key = key
+        self.planned_text = planned_text
+        self.rephrase_task = rephrase_task
+        self.frames_task = frames_task
+
+    def matches(self, cursor: int, question: Any) -> bool:
+        return (
+            question is not None
+            and self.cursor == cursor
+            and self.key == getattr(question, "key", None)
+            and self.planned_text == getattr(question, "spoken_text", None)
+        )
+
+    def cancel(self) -> None:
+        """Stop whatever is still running. Idempotent; never raises."""
+        for task in (self.frames_task, self.rephrase_task):
+            if task is not None and not task.done():
+                task.cancel()
+
+
+def phone_start_q1_prefetch(
+    state: Any,
+    *,
+    render: Optional[Callable[[str], Awaitable[Any]]] = None,
+) -> Optional[PhoneQ1Prefetch]:
+    """Start rephrasing (and optionally rendering) the leg's next question.
+
+    Called by the gate the moment the atomic consent/start RPC returns. None
+    when the state has no question at its cursor. ``render(text)`` returns
+    the audio frames for ``text`` (an empty list on any failure); it runs on
+    the rephrase's RESULT, so the frames always match the text spoken.
+    """
+    if state is None or not getattr(state, "ok", False):
+        return None
+    cursor = getattr(state, "cursor", 0)
+    question_at = getattr(state, "question_at", None)
+    question = question_at(cursor) if callable(question_at) else None
+    if question is None:
+        return None
+    planned = question.spoken_text
+    rephrase_task = asyncio.ensure_future(phone_rephrase_first_question(planned))
+    frames_task = None
+    if render is not None:
+        async def _render_rephrased() -> list[Any]:
+            text = await rephrase_task
+            frames = await render(text)
+            return list(frames or [])
+
+        frames_task = asyncio.ensure_future(_render_rephrased())
+        # A render that fails or is cancelled is simply not used; retrieve
+        # its outcome so asyncio never reports it as unretrieved.
+        frames_task.add_done_callback(_q1_prefetch_consume)
+    return PhoneQ1Prefetch(
+        cursor=cursor, key=question.key, planned_text=planned,
+        rephrase_task=rephrase_task, frames_task=frames_task,
+    )
+
+
+def _q1_prefetch_consume(task: "asyncio.Future[Any]") -> None:
+    if not task.cancelled():
+        task.exception()
+
+
+async def phone_take_q1_prefetch(
+    prefetch: Optional[PhoneQ1Prefetch],
+    *,
+    cursor: int,
+    question: Any,
+    wait_sec: float | None = None,
+) -> Optional[tuple[str, Optional[list[Any]], str]]:
+    """What to say for the first question: ``(text, frames, outcome)``.
+
+    None when there is no prefetch (the caller rephrases now, as before).
+    ``frames`` is None unless pre-rendered audio for exactly ``text`` is
+    ready. A prefetch made for another cursor, key or planned text, a
+    rephrase still running after ``wait_sec``, or a failed one gives the
+    VERBATIM planned question of ``question`` — never the prefetched one.
+    """
+    if prefetch is None:
+        return None
+    planned = getattr(question, "spoken_text", None) or ""
+    if not prefetch.matches(cursor, question):
+        prefetch.cancel()
+        return planned, None, Q1_PREFETCH_MISMATCH
+    wait = PHONE_Q1_PREFETCH_WAIT_SEC if wait_sec is None else max(0.0, wait_sec)
+    task = prefetch.rephrase_task
+    if not task.done():
+        done, _pending = await asyncio.wait({task}, timeout=wait)
+        if not done:
+            prefetch.cancel()
+            return planned, None, Q1_PREFETCH_TIMEOUT
+    if task.cancelled() or task.exception() is not None:
+        prefetch.cancel()
+        return planned, None, Q1_PREFETCH_ERROR
+    text = task.result()
+    if not isinstance(text, str) or not text.strip():
+        prefetch.cancel()
+        return planned, None, Q1_PREFETCH_ERROR
+    frames_task = prefetch.frames_task
+    if frames_task is None:
+        return text, None, Q1_PREFETCH_REPHRASED
+    if (
+        frames_task.done() and not frames_task.cancelled()
+        and frames_task.exception() is None and frames_task.result()
+    ):
+        return text, list(frames_task.result()), Q1_PREFETCH_PRERENDERED
+    # Not ready (or failed): synthesise on demand rather than wait for it.
+    prefetch.cancel()
+    return text, None, Q1_PREFETCH_RENDER_UNAVAILABLE
 
 
 def _coverage_keywords(text: Any) -> set[str]:

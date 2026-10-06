@@ -14391,6 +14391,10 @@ class TestPhoneTurnTakingRound2(unittest.IsolatedAsyncioTestCase):
         self.assertIn("interrupted", rendered,
                       "the follow-up after an interrupt must trigger the re-ask")
         self.assertIn("ask that same topic again", rendered)
+        # M013 S01 T08b (#334 stage 2): the re-ask thanked the candidate for an
+        # answer they never gave. They have not answered; it must say so.
+        self.assertIn("they have not answered it yet", rendered)
+        self.assertIn("do not thank them", rendered)
         # The re-ask must be AUTHORIZED (not merely instructed) or the
         # one-question validator can drop it, leaving the silence FIX 2 fixes.
         self.assertIsNotNone(agent._generation_objective,

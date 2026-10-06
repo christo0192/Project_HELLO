@@ -1857,6 +1857,58 @@ def _is_disclosure_line_start(text: Any, composed_starts: set[str]) -> bool:
     return isinstance(text, str) and text.strip() in composed_starts
 
 
+async def _render_tts_frames(session: Any, text: str) -> list[Any]:
+    """Synthesise ``text`` to audio frames ahead of time, or [] on any miss.
+
+    M013 S01 T08b: the first question is rendered while the role line plays
+    (the pattern of the role line's own pre-render), so it starts with no
+    synthesis latency. The markdown strip `tts_node` applies on the live path
+    is applied here, because pre-rendered audio never passes through it. Never
+    raises; the stream is always closed.
+    """
+    tts_obj = getattr(session, "tts", None)
+    synth = getattr(tts_obj, "synthesize", None)
+    spoken = phone.strip_markdown_for_speech(text)
+    if not callable(synth) or not spoken.strip():
+        return []
+    frames: list[Any] = []
+    stream = None
+    try:
+        stream = synth(spoken)
+        async for ev in stream:
+            frame = getattr(ev, "frame", None)
+            if frame is not None:
+                frames.append(frame)
+    except Exception:  # noqa: BLE001 — the say path synthesises on demand
+        frames = []
+    finally:
+        aclose = getattr(stream, "aclose", None)
+        if callable(aclose):
+            try:
+                await aclose()
+            except Exception:  # noqa: BLE001
+                pass
+    return frames
+
+
+def _cancel_q1_prefetch(result: Any) -> None:
+    """T08b: stop preparing Q1 for a leg that will not ask it. Never raises."""
+    cancel = getattr(getattr(result, "q1_prefetch", None), "cancel", None)
+    if callable(cancel):
+        try:
+            cancel()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _same_role_title(a: Any, b: Any) -> bool:
+    """Do two role titles name the same role (case/whitespace-insensitive)?"""
+    if not isinstance(a, str) or not isinstance(b, str):
+        return False
+    norm_a = " ".join(a.split()).strip().lower()
+    return bool(norm_a) and norm_a == " ".join(b.split()).strip().lower()
+
+
 class _GateRecordingAnchor:
     """When the recording sentence of the consent line was heard (ms).
 
@@ -7976,11 +8028,11 @@ async def _run_native_phone_screening(
                     interrupted_reask_counts[question.key] = interrupted_seen + 1
                     prior_turn_interrupted["value"] = False
                     setattr(agent, "_turn_policy", "interrupted_reask")
-                    add_turn_instruction(turn_ctx, "The previous question was interrupted. Ask that same topic again in your own natural words and wait; do not advance.")
+                    add_turn_instruction(turn_ctx, "The previous question was interrupted. Ask that same topic again in your own natural words and wait; do not advance. They have not answered it yet, so do not thank them or react as if they had.")
                     set_question_reply_snapshot(question, text)
                     authorize_generated_reply(
                         question.spoken_text,
-                        control_text="The previous question was interrupted. Re-ask the same topic naturally and wait; do not advance.",
+                        control_text="The previous question was interrupted. Re-ask the same topic naturally and wait; do not advance. They have not answered it yet, so do not thank them.",
                     )
                     _log.info(
                         "unknown_event", error_type="phone_interrupted_recovery",
@@ -8014,7 +8066,7 @@ async def _run_native_phone_screening(
                 # first-audio watchdog via `_on_reply_expected()` after this
                 # normal return, so no explicit arm is added here.)
                 prior_turn_interrupted["value"] = False
-                add_turn_instruction(turn_ctx, "The previous question was interrupted. Ask that same topic again in your own natural words and wait; do not advance.")
+                add_turn_instruction(turn_ctx, "The previous question was interrupted. Ask that same topic again in your own natural words and wait; do not advance. They have not answered it yet, so do not thank them or react as if they had.")
                 set_reply_snapshot(
                     phone.PHONE_POST_INTERRUPT_ACK_TEXT, phase="post_interrupt_ack",
                 )
@@ -10045,12 +10097,40 @@ async def _run_native_phone_screening(
     # phone-e5f260c9, agent.py:7162). Now a line that cannot be heard ends the
     # pre-loop as a DISCONNECT and falls through to that try/finally. A
     # non-marker RuntimeError still propagates, unchanged.
-    async def _speak_preloop(text: str, category: str) -> bool:
-        """Speak one pre-loop line. True only if it played with the leg up."""
+    async def _speak_preloop(
+        text: str, category: str, frames: list[Any] | None = None,
+    ) -> bool:
+        """Speak one pre-loop line. True only if it played with the leg up.
+
+        T08b: ``frames`` is pre-rendered audio for exactly ``text``; it plays
+        with no synthesis latency. If the SDK refuses it at ``say`` (nothing
+        was queued), the line is synthesised on demand instead.
+        """
         if close_event.is_set():
             return False
         try:
-            speech = session.say(text, allow_interruptions=True)
+            speech = None
+            if frames:
+                prerendered = list(frames)
+
+                async def _frames() -> Any:
+                    for frame in prerendered:
+                        yield frame
+
+                try:
+                    speech = session.say(
+                        text, audio=_frames(), allow_interruptions=True,
+                    )
+                except RuntimeError:
+                    raise
+                except Exception:  # noqa: BLE001 — nothing queued: synthesise
+                    speech = None
+                    _log.warn(
+                        "unknown_event", error_type="phone_q1_prefetch",
+                        error_category="prerendered_say_refused",
+                    )
+            if speech is None:
+                speech = session.say(text, allow_interruptions=True)
             wait = getattr(speech, "wait_for_playout", None)
             if callable(wait):
                 value = wait()
@@ -10077,6 +10157,8 @@ async def _run_native_phone_screening(
     # egress start), so agent.py must NOT speak it again when it already did.
     preloop_done = asyncio.Event()
     setattr(agent, "_native_preloop_done", preloop_done)
+    # T08b: Q1 as prepared during the role line (None unless the gate made one).
+    q1_prefetch = getattr(result, "q1_prefetch", None)
     preloop_heard = True
     role_opening = phone.phone_role_opening_text(state.role_title)
     if role_opening is not None and not getattr(result, "role_opening_spoken", False):
@@ -10115,7 +10197,27 @@ async def _run_native_phone_screening(
         # rephrase LLM is already warm (the gate ran the consent + role openings),
         # and the owed objective is unchanged: the candidate's first answer binds
         # to it regardless of the phrasing actually spoken.
-        q1_text = await phone.phone_rephrase_first_question(question.spoken_text)
+        # M013 S01 T08b: the gate started that rephrase (and its audio) at
+        # consent, so it is normally ready the moment the role line ends. A
+        # prefetch made for another question, or not ready within
+        # `PHONE_Q1_PREFETCH_WAIT_SEC`, gives the verbatim planned question of
+        # THIS leg's cursor. No prefetch (a reconnect leg, a legacy gate):
+        # rephrase now, as before.
+        q1_frames: list[Any] | None = None
+        q1_wait_started = _monotonic()
+        taken = await phone.phone_take_q1_prefetch(
+            q1_prefetch, cursor=cursor, question=question,
+        )
+        if taken is None:
+            q1_text = await phone.phone_rephrase_first_question(question.spoken_text)
+            q1_outcome = "on_demand"
+        else:
+            q1_text, q1_frames, q1_outcome = taken
+        _log.info(
+            "unknown_event", error_type="phone_q1_prefetch",
+            error_category=q1_outcome,
+            duration_ms=int(round((_monotonic() - q1_wait_started) * 1000)),
+        )
         if revocation["confirm_pending"] or revocation["withdrawal_latched"]:
             # M013 S01 T07: a turn committed during the rephrase was judged a
             # revocation and its confirmation is owed: do not ask the first
@@ -10127,7 +10229,7 @@ async def _run_native_phone_screening(
             revocation["q1_spoken"] = True
         if question is None:
             pass
-        elif not await _speak_preloop(q1_text, "preloop_q1"):
+        elif not await _speak_preloop(q1_text, "preloop_q1", frames=q1_frames):
             # Q1 was not heard: a disconnect, and F0a is skipped (there is no
             # delivered ask to prime the turn tracking with).
             _preloop_disconnect()
@@ -10173,6 +10275,9 @@ async def _run_native_phone_screening(
             if not assistant_delivery_complete.is_set():
                 assistant_delivery_complete.set()
             await prime_preemptive_objective(state.question_at(cursor + 1))
+    # T08b: whatever path the pre-loop took, nothing keeps preparing Q1 (a
+    # leg that never asked it does not pay for its rephrase or its audio).
+    _cancel_q1_prefetch(result)
     # M009 C4 test seam: the pre-loop (role opening, Q1, F0a) is over, either
     # way. Session harnesses that end a fake call by firing `close` wait for it,
     # because a close that lands earlier is now (correctly) a disconnect.
@@ -10833,6 +10938,25 @@ async def _run_phone_session(
     item_seq: list[int] = [0]
     persist_session_id = phone.session_id_from_room_name(room_name)
     persist_tasks: set[asyncio.Task] = set()
+    # M013 S01 T08b: the post-consent gate flush runs alongside the first
+    # question instead of in front of it. Every per-item screening row waits
+    # for it (`_spawn_item_persist`), so the gate rows still come first in
+    # `turn_index` order. The boundary commit is deliberately NOT made to
+    # wait: delaying it changes the toolless commit timing the next turn
+    # relies on. It cannot run before Q1 has played and been answered, which
+    # outlasts the flush's 5 s bound (one row, normally a single round trip).
+    gate_flush_holder: list["asyncio.Task[Any] | None"] = [None]
+
+    async def _await_gate_flush() -> None:
+        """Wait for the concurrent gate flush, if one is running.
+
+        Bounded by the flush's own budget. Never raises, except this task's
+        own cancellation.
+        """
+        task = gate_flush_holder[0]
+        if task is None or task.done() or task is asyncio.current_task():
+            return
+        await asyncio.wait({task})
 
     async def _persist_phone_item(speaker: str, text: str, anchor_ms: int | None,
                                   source_item_id: str, is_gate: bool = False) -> None:
@@ -10878,14 +11002,23 @@ async def _run_phone_session(
         dedups on it, so a duplicate cannot double-insert. Never awaited on the
         hot path; tracked so a stop can drain it.
         """
+        source_item_id = f"phone-gate-item-{seq}" if is_gate else f"phone-item-{seq}"
+        flush = gate_flush_holder[0]
+        if not is_gate and flush is not None and not flush.done():
+            # T08b: a screening row never lands before the gate rows.
+            async def _after_gate_flush() -> None:
+                await _await_gate_flush()
+                await _persist_phone_item(
+                    speaker, text, anchor_ms, source_item_id, is_gate)
+
+            persist = _after_gate_flush()
+        else:
+            persist = _persist_phone_item(
+                speaker, text, anchor_ms, source_item_id, is_gate)
         try:
-            task = asyncio.create_task(
-                _persist_phone_item(
-                    speaker, text, anchor_ms,
-                    f"phone-gate-item-{seq}" if is_gate else f"phone-item-{seq}",
-                    is_gate,
-                ))
+            task = asyncio.create_task(persist)
         except RuntimeError:
+            persist.close()
             # No running loop (e.g. a synthetic test emitting outside the
             # session loop): the boundary path still persists the pair.
             return
@@ -10905,6 +11038,12 @@ async def _run_phone_session(
         died at the gate still has its transcript. Idempotent: an empty buffer
         is a no-op. Bounded: a persist that hangs cannot hold the call.
         """
+        running = gate_flush_holder[0]
+        if (running is not None and not running.done()
+                and running is not asyncio.current_task()):
+            # T08b: one flush at a time, so two callers never write the same
+            # turns in an interleaved order. Bounded by this call's budget.
+            await asyncio.wait({running}, timeout=max(0.05, budget))
         pending = list(gate_pending)
         if not pending:
             return
@@ -12148,6 +12287,58 @@ async def _run_phone_session(
         composed_consent_starts.update(_consent_line_starts(draft))
         return draft
 
+    # ── M013 S01 T08b: the role line composes during the consent wait ──────
+    # The role title is known before the call (`instruction_state.role_title`),
+    # so the one-shot that writes the role line runs while the consent line
+    # plays and the candidate answers, not after "yes" (live: 2.3 s from the
+    # end of "Yes, yes." to the role line). After consent the draft is used
+    # only when the RPC's verbatim title names the same role, and it is
+    # re-checked against THAT title; otherwise it is composed then, as before.
+    role_precompose: dict[str, Any] = {"task": None, "title": None}
+
+    def _start_role_compose() -> None:
+        if role_precompose["task"] is not None:
+            return
+        title = getattr(instruction_state, "role_title", None)
+        if not isinstance(title, str) or not title.strip():
+            return
+        role_precompose["title"] = title
+        role_precompose["task"] = asyncio.ensure_future(
+            phone.phone_compose_role_opening(title))
+        role_precompose["task"].add_done_callback(_consume_detached_task)
+
+    def _cancel_role_compose() -> None:
+        task = role_precompose["task"]
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _take_role_draft(role_title: str) -> str | None:
+        task = role_precompose["task"]
+        if task is None or not _same_role_title(role_precompose["title"], role_title):
+            if task is not None:
+                _cancel_role_compose()
+                _log.info(
+                    "unknown_event", error_type="phone_role_opening",
+                    error_category="precomposed_title_changed",
+                )
+            return await phone.phone_compose_role_opening(role_title)
+        try:
+            # Bounded: the compose carries its own timeout from its start.
+            draft = await task
+        except (Exception, asyncio.CancelledError):  # noqa: BLE001
+            current = asyncio.current_task()
+            cancelling = getattr(current, "cancelling", None)
+            if callable(cancelling) and cancelling():
+                raise
+            draft = None
+        if isinstance(draft, str) and phone.phone_role_opening_clean(draft, role_title):
+            _log.info(
+                "unknown_event", error_type="phone_role_opening",
+                error_category="precomposed_used",
+            )
+            return draft
+        return None
+
     async def speak_role_opening(role_title: str) -> str | None:
         """Author the role-opening OUT OF BAND, validate it, then speak it.
 
@@ -12180,7 +12371,7 @@ async def _run_phone_session(
         #
         # Nothing is emitted until `phone_role_opening_clean` passes, so exactly
         # one of {model line, fixed line} is ever spoken.
-        composed = await phone.phone_compose_role_opening(role_title)
+        composed = await _take_role_draft(role_title)
         if composed is None:
             # Timed out, or asked something, or renamed the role. The gate speaks
             # the deterministic `phone_role_opening_text` — the verbatim role is
@@ -12454,6 +12645,25 @@ async def _run_phone_session(
                         pass
                 return
         await say(text)
+
+    # ── M013 S01 T08b: Q1 is prepared while the role line plays ──────────
+    def _start_q1_prefetch(state: Any) -> "phone.PhoneQ1Prefetch | None":
+        """The gate's `start_q1_prefetch` seam: rephrase the leg's next
+        question now and, unless `PHONE_Q1_PRERENDER` is off, render its
+        audio as soon as the rephrase lands."""
+        render = (
+            (lambda text: _render_tts_frames(session, text))
+            if phone.phone_q1_prerender_enabled() else None
+        )
+        prefetch = phone.phone_start_q1_prefetch(state, render=render)
+        _log.info(
+            "unknown_event", error_type="phone_q1_prefetch",
+            error_category=(
+                "not_started" if prefetch is None
+                else "started_prerender" if render is not None else "started"
+            ),
+        )
+        return prefetch
 
     async def _next_candidate_turn() -> str:
         """One candidate utterance for the gate's identity turn, or "" on silence.
@@ -13331,6 +13541,13 @@ async def _run_phone_session(
             # mode; None otherwise), against the bot line just spoken.
             judge_callback=lambda reply, first=False: gate_judge_wiring.judge_callback(
                 reply, gate_last_line[0], first=first),
+            # M013 S01 T08b: Q1 is rephrased (and rendered) under the role line,
+            # and the model-written role line composes during the consent wait
+            # (only when that line is model-written at all).
+            start_q1_prefetch=_start_q1_prefetch,
+            start_role_compose=(
+                None if phone.phone_deterministic_opener() else _start_role_compose
+            ),
         )
 
     # Boolean phase marks from the gate, plus E3's `sip_left_reason` (a fixed
@@ -13559,6 +13776,8 @@ async def _run_phone_session(
         # `latest_assistant_anchor` machinery for that job.
         _clear_question_anchor()
         gate_done.set()
+        # T08b: a role-line draft still composing is never used after this.
+        _cancel_role_compose()
         # E3: the gate is over, so the SIP-departure listener has nothing left
         # to end. Deregister before any teardown await.
         if sip_left_registered:
@@ -13609,14 +13828,29 @@ async def _run_phone_session(
     # wrong-number privacy discard. A consented human must flush the gate
     # transcript here before entering screening; the coordinator settles it on
     # every later exit. This keeps discard/finish ownership single-flight.
+    #
+    # M013 S01 T08b: the flush no longer sits in front of the first question
+    # (it was dead air between the role line and Q1). It runs alongside it,
+    # and every per-item screening row waits for it (`_spawn_item_persist`),
+    # so the gate rows still land first. Single-flight with the settle-time
+    # flush.
     if result.assessment_allowed:
-        try:
-            await _flush_gate_transcript()
-        except Exception:  # noqa: BLE001
-            _log.warn(
-                "unknown_event", error_type="phone_item_persist",
-                error_category="gate_flush_failed",
-            )
+        async def _flush_after_gate() -> None:
+            try:
+                await _flush_gate_transcript()
+            except Exception:  # noqa: BLE001
+                _log.warn(
+                    "unknown_event", error_type="phone_item_persist",
+                    error_category="gate_flush_failed",
+                )
+
+        gate_flush_task = asyncio.ensure_future(_flush_after_gate())
+        gate_flush_holder[0] = gate_flush_task
+        persist_tasks.add(gate_flush_task)
+        gate_flush_task.add_done_callback(persist_tasks.discard)
+    else:
+        # T08b: no screening, so nothing may keep preparing Q1.
+        _cancel_q1_prefetch(result)
     # The gate phase is over: nothing after this line is ever flagged as it.
     gate_persist_active[0] = False
     if not result.assessment_allowed:
@@ -13643,6 +13877,7 @@ async def _run_phone_session(
                 "unknown_event", error_type="phone_assessment_unstarted",
                 error_category="session_unresolved",
             )
+            _cancel_q1_prefetch(result)  # T08b
             await _request_room_close()
             return result
 
@@ -13690,6 +13925,7 @@ async def _run_phone_session(
             state = gate_state if gate_state is not None and gate_state.ok \
                 else await events.start_assessment(attempt_id, session_id)
             if not state.ok:
+                _cancel_q1_prefetch(result)  # T08b: no question will be asked
                 # ── A REFUSED START IS NOT PROOF THAT NOTHING HAPPENED ────────
                 # `session_not_active` is exactly what a session that is ALREADY
                 # COMPLETED presents — which is the state a scored-but-unacknowledged

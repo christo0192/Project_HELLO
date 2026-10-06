@@ -760,5 +760,465 @@ class TestComposedConsentLineCarriesTheDisclosureMetric(unittest.IsolatedAsyncio
         self.assertEqual(names.count("voice_phone_participant_to_disclosure_sec"), 1)
 
 
+# ── M013 S01 T08b: the Q1 gap, and the role line composed during consent ────
+
+ROLE = "Sales Program Advisor"
+REPHRASED_Q1 = "To start us off, what kind of work are you doing right now?"
+COMPOSED_ROLE_LINE = (
+    f"Perfect, so this chat is about the {ROLE} role at Interview Kickstart "
+    "— let's get into it."
+)
+
+
+def _q1_state(*, cursor=0, role_title=ROLE):
+    payload = tpg._plan_payload(
+        cursor=cursor, completed=["k1"] if cursor else None, role_title=role_title)
+    state = phone.PhoneAssessmentState.parse(payload)
+    assert state.ok, state.status
+    return state
+
+
+class TestQ1Prefetch(unittest.IsolatedAsyncioTestCase):
+    """`phone_start_q1_prefetch` / `phone_take_q1_prefetch` on their own."""
+
+    def _patch_rephrase(self, *, delay=0.0, hang=False, text=REPHRASED_Q1, error=None):
+        self.rephrase_calls: list[str] = []
+
+        async def rephrase(question_text, **_k):
+            self.rephrase_calls.append(question_text)
+            if hang:
+                await asyncio.Event().wait()
+            if delay:
+                await asyncio.sleep(delay)
+            if error is not None:
+                raise error
+            return text
+
+        patcher = mock.patch.object(phone, "phone_rephrase_first_question", rephrase)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _render(self, *, delay=0.0, frames=("f1", "f2")):
+        self.rendered: list[str] = []
+
+        async def render(text):
+            self.rendered.append(text)
+            if delay:
+                await asyncio.sleep(delay)
+            return list(frames)
+        return render
+
+    async def test_the_rephrase_starts_at_once_and_the_render_uses_its_result(self):
+        self._patch_rephrase(delay=0.02)
+        prefetch = phone.phone_start_q1_prefetch(_q1_state(), render=self._render())
+        await asyncio.sleep(0)
+        self.assertEqual(self.rephrase_calls, ["First question?"],
+                         "started by the call itself, not on first await")
+        self.assertEqual((prefetch.cursor, prefetch.key, prefetch.planned_text),
+                         (0, "k1", "First question?"))
+        frames = await prefetch.frames_task
+        self.assertEqual(self.rendered, [REPHRASED_Q1], "frames match the text spoken")
+        self.assertEqual(frames, ["f1", "f2"])
+
+    async def test_a_ready_prefetch_hands_over_text_and_frames(self):
+        self._patch_rephrase()
+        state = _q1_state()
+        prefetch = phone.phone_start_q1_prefetch(state, render=self._render())
+        await prefetch.frames_task
+        got = await phone.phone_take_q1_prefetch(
+            prefetch, cursor=0, question=state.question_at(0))
+        self.assertEqual(got, (REPHRASED_Q1, ["f1", "f2"], phone.Q1_PREFETCH_PRERENDERED))
+
+    async def test_without_a_renderer_only_the_text_is_handed_over(self):
+        self._patch_rephrase()
+        state = _q1_state()
+        prefetch = phone.phone_start_q1_prefetch(state)
+        self.assertIsNone(prefetch.frames_task)
+        got = await phone.phone_take_q1_prefetch(
+            prefetch, cursor=0, question=state.question_at(0))
+        self.assertEqual(got, (REPHRASED_Q1, None, phone.Q1_PREFETCH_REPHRASED))
+
+    async def test_another_cursor_key_or_text_gets_the_VERBATIM_question(self):
+        self._patch_rephrase(hang=True)
+        state = _q1_state()
+        resumed = _q1_state(cursor=1)
+        other_text = phone.PhonePlanQuestion("k1", "A different first question?", True, None)
+        for cursor, question in (
+            (1, resumed.question_at(1)),     # a reconnect leg at cursor 1
+            (0, resumed.question_at(1)),     # another key
+            (0, other_text),                 # same key, other planned text
+        ):
+            with self.subTest(cursor=cursor, key=question.key):
+                prefetch = phone.phone_start_q1_prefetch(state, render=self._render())
+                got = await phone.phone_take_q1_prefetch(
+                    prefetch, cursor=cursor, question=question)
+                self.assertEqual(
+                    got, (question.spoken_text, None, phone.Q1_PREFETCH_MISMATCH))
+                await asyncio.sleep(0)
+                self.assertTrue(prefetch.rephrase_task.cancelled())
+                self.assertTrue(prefetch.frames_task.cancelled())
+
+    async def test_a_rephrase_still_running_is_cut_at_the_wait(self):
+        self._patch_rephrase(hang=True)
+        state = _q1_state()
+        prefetch = phone.phone_start_q1_prefetch(state, render=self._render())
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        got = await phone.phone_take_q1_prefetch(
+            prefetch, cursor=0, question=state.question_at(0), wait_sec=0.05)
+        self.assertLess(loop.time() - started, 0.5)
+        self.assertEqual(got, ("First question?", None, phone.Q1_PREFETCH_TIMEOUT))
+        await asyncio.sleep(0)
+        self.assertTrue(prefetch.rephrase_task.cancelled())
+
+    def test_the_default_wait_is_short(self):
+        # The verbatim question is always correct to say; silence is not.
+        self.assertLessEqual(phone.PHONE_Q1_PREFETCH_WAIT_SEC, 0.3)
+
+    async def test_a_failed_rephrase_gets_the_verbatim_question(self):
+        self._patch_rephrase(error=RuntimeError("provider down"))
+        state = _q1_state()
+        prefetch = phone.phone_start_q1_prefetch(state, render=self._render())
+        await asyncio.wait({prefetch.rephrase_task})
+        got = await phone.phone_take_q1_prefetch(
+            prefetch, cursor=0, question=state.question_at(0))
+        self.assertEqual(got, ("First question?", None, phone.Q1_PREFETCH_ERROR))
+
+    async def test_frames_not_ready_are_dropped_and_the_text_synthesised(self):
+        self._patch_rephrase()
+        state = _q1_state()
+        prefetch = phone.phone_start_q1_prefetch(
+            state, render=self._render(delay=10))
+        await prefetch.rephrase_task
+        got = await phone.phone_take_q1_prefetch(
+            prefetch, cursor=0, question=state.question_at(0))
+        self.assertEqual(got, (REPHRASED_Q1, None, phone.Q1_PREFETCH_RENDER_UNAVAILABLE))
+        await asyncio.sleep(0)
+        self.assertTrue(prefetch.frames_task.cancelled())
+
+    async def test_no_prefetch_and_no_question(self):
+        self.assertIsNone(await phone.phone_take_q1_prefetch(
+            None, cursor=0, question=_q1_state().question_at(0)))
+        exhausted = phone.PhoneAssessmentState.parse(
+            tpg._plan_payload(cursor=2, completed=["k1", "k2"]))
+        self.assertIsNone(phone.phone_start_q1_prefetch(exhausted))
+        self.assertIsNone(phone.phone_start_q1_prefetch(
+            phone.PhoneAssessmentState(False, "plan_missing")))
+
+    def test_the_prerender_kill_switch(self):
+        for value, expected in (("", True), ("true", True), ("off", False),
+                                ("false", False), ("0", False), ("no", False)):
+            with self.subTest(value=value), \
+                    mock.patch.dict(os.environ, {"PHONE_Q1_PRERENDER": value}):
+                self.assertIs(phone.phone_q1_prerender_enabled(), expected)
+
+
+class _CancelProbe:
+    """Stands in for a `PhoneQ1Prefetch`: counts cancellations."""
+
+    def __init__(self):
+        self.cancels = 0
+
+    def cancel(self):
+        self.cancels += 1
+
+
+class TestGateStartsTheQ1PrefetchAtConsent(unittest.IsolatedAsyncioTestCase):
+    """`run_phone_gate`: the prefetch and role-compose seams."""
+
+    async def _gate(self, *, decision=phone.CLASSIFY_HUMAN, recorder=None,
+                    client=None, **seams):
+        recorder = recorder or tpg.Recorder()
+        client = client or tpg._AtomicEventClient(state=tpg._default_state(role_title=ROLE))
+
+        async def classify():
+            recorder.order.append("classify")
+            return decision
+
+        result = await phone.run_phone_gate(
+            attempt_id=tpg._ATTEMPT_ID, client=client,
+            wait_for_participant=lambda: asyncio.sleep(0, result=tpg._participant()),
+            classify=classify, say=recorder.say,
+            start_recording=recorder.start_recording,
+            classify_timeout_sec=0.05, session_id=tpg._SESSION_ID, epoch=tpg._EPOCH,
+            post_call_answered=True, consent_reply_out=["Yes, go ahead."],
+            **seams,
+        )
+        return result, recorder, client
+
+    async def test_the_prefetch_starts_from_the_rpc_state_before_the_role_line(self):
+        probe = _CancelProbe()
+        seen = []
+
+        def start_q1_prefetch(state):
+            seen.append(state)
+            recorder.order.append("q1_prefetch")
+            return probe
+
+        recorder = tpg.Recorder()
+        result, recorder, client = await self._gate(
+            recorder=recorder, start_q1_prefetch=start_q1_prefetch)
+        self.assertTrue(result.assessment_allowed)
+        self.assertIs(result.q1_prefetch, probe)
+        self.assertEqual(len(seen), 1)
+        self.assertIs(seen[0], result.assessment_state, "the consent/start RPC's state")
+        role_line = phone.phone_role_opening_text(ROLE)
+        role_say = f"say:{role_line[:24]}"
+        self.assertLess(recorder.order.index("q1_prefetch"), recorder.order.index(role_say))
+        self.assertEqual(probe.cancels, 0)
+
+    async def test_no_prefetch_on_a_gate_that_does_not_consent(self):
+        calls = []
+        result, _recorder, _client = await self._gate(
+            decision=phone.CLASSIFY_REFUSED,
+            start_q1_prefetch=lambda state: calls.append(state))
+        self.assertFalse(result.assessment_allowed)
+        self.assertEqual(calls, [])
+        self.assertIsNone(result.q1_prefetch)
+
+    async def test_a_gate_that_fails_after_the_rpc_cancels_the_prefetch(self):
+        probe = _CancelProbe()
+
+        class _BrokenRecorder(tpg.Recorder):
+            async def start_recording(self):
+                raise RuntimeError("egress boom")
+
+        with self.assertRaises(RuntimeError):
+            await self._gate(recorder=_BrokenRecorder(),
+                             start_q1_prefetch=lambda state: probe)
+        self.assertEqual(probe.cancels, 1)
+
+    async def test_a_failing_seam_never_fails_the_gate(self):
+        def boom(_state):
+            raise RuntimeError("prefetch boom")
+        result, _recorder, _client = await self._gate(start_q1_prefetch=boom)
+        self.assertTrue(result.assessment_allowed)
+        self.assertIsNone(result.q1_prefetch)
+
+    async def test_the_role_compose_starts_once_before_the_consent_line(self):
+        recorder = tpg.Recorder()
+        fired = []
+
+        def start_role_compose():
+            fired.append(1)
+            recorder.order.append("role_compose")
+
+        result, recorder, _client = await self._gate(
+            recorder=recorder, start_role_compose=start_role_compose)
+        self.assertTrue(result.assessment_allowed)
+        self.assertEqual(len(fired), 1)
+        disclosure = next(i for i, step in enumerate(recorder.order)
+                          if step.startswith("say:"))
+        self.assertLess(recorder.order.index("role_compose"), disclosure)
+        self.assertLess(recorder.order.index("role_compose"),
+                        recorder.order.index("classify"))
+
+    def test_the_result_defaults_to_no_prefetch(self):
+        self.assertIsNone(phone.PhoneGateResult(phone.CLASSIFY_HUMAN).q1_prefetch)
+
+
+class _TimedTTS:
+    """`session.tts`: renders a few frames after a delay (fake synthesis)."""
+
+    def __init__(self, render_sec):
+        self.render_sec = render_sec
+        self.texts: list[str] = []
+
+    def synthesize(self, text):
+        self.texts.append(text)
+        tts = self
+
+        async def _frames():
+            await asyncio.sleep(tts.render_sec)
+            for index in range(3):
+                yield types.SimpleNamespace(frame=f"frame-{index}")
+
+        return _frames()
+
+
+class _TimedSession(tpg._FakePhoneSession):
+    """A fake session whose lines take time to play, with a fake TTS.
+
+    On-demand synthesis costs `TTFB_SEC` before first audio; a line given
+    pre-rendered `audio` starts at once. A line's conversation item lands at
+    the end of its playout, as on the real SDK.
+    """
+
+    ROLE_SEC = 0.6
+    LINE_SEC = 0.02
+    TTFB_SEC = 0.3
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.tts = _TimedTTS(0.1)
+        self.say_log: list[tuple[str, bool]] = []
+        self.first_frame: dict[str, float] = {}
+        self.role_end: float | None = None
+
+    def say(self, text, **kwargs):
+        loop = asyncio.get_running_loop()
+        has_audio = kwargs.get("audio") is not None
+        self.say_log.append((text, has_audio))
+        start = loop.time() + (0.0 if has_audio else self.TTFB_SEC)
+        self.first_frame.setdefault(text, start)
+        is_role = ROLE in text
+        playout = start - loop.time() + (self.ROLE_SEC if is_role else self.LINE_SEC)
+        session = self
+
+        class _Speech:
+            interrupted = False
+
+            def interrupt(self, **_k):
+                return self
+
+            async def wait_for_playout(self):
+                await asyncio.sleep(playout)
+                if is_role:
+                    session.role_end = loop.time()
+                # The item (and, for a question, the scripted answer) lands now.
+                tpg._FakePhoneSession.say(session, text)
+
+        return _Speech()
+
+
+class _SlowGateWritesClient(tpg._AtomicEventClient):
+    """Gate rows are slow to write, screening rows fast: a screening row that
+    did not wait for the gate flush would land FIRST."""
+
+    # Longer than the 400 ms target on its own, so a flush awaited in front
+    # of Q1 (the old order) fails the gap test too.
+    GATE_WRITE_SEC = 0.45
+
+    def __init__(self, *, preloaded=None, **kwargs):
+        super().__init__(**kwargs)
+        self._preloaded = preloaded
+
+    async def commit_item_turn(self, session_id, speaker, text, source_item_id,
+                               turn_started_at_ms=None, *, is_gate=False):
+        await asyncio.sleep(self.GATE_WRITE_SEC if is_gate else 0.01)
+        return await super().commit_item_turn(
+            session_id, speaker, text, source_item_id, turn_started_at_ms,
+            is_gate=is_gate)
+
+    async def fetch_assessment_state(self, _session_id):
+        # The pre-call projection: the role title is known before the call.
+        return self._preloaded
+
+
+class TestQ1GapEndToEnd(unittest.IsolatedAsyncioTestCase):
+    """The real `_run_phone_session`, with fake TTS timings (roadmap 7)."""
+
+    REPHRASE_SEC = 0.5
+    COMPOSE_SEC = 0.2
+
+    def setUp(self):
+        self.rephrase_at: list[tuple[float, str]] = []
+        self.compose_at: list[tuple[float, str]] = []
+
+    async def _run(self, *, pre_title=ROLE, server_title=ROLE, consent_sec=0.3):
+        loop = asyncio.get_running_loop()
+
+        async def rephrase(question_text, **_k):
+            self.rephrase_at.append((loop.time(), question_text))
+            await asyncio.sleep(self.REPHRASE_SEC)
+            return REPHRASED_Q1
+
+        async def compose_role(role_title, **_k):
+            self.compose_at.append((loop.time(), role_title))
+            await asyncio.sleep(self.COMPOSE_SEC)
+            return COMPOSED_ROLE_LINE.replace(ROLE, str(role_title))
+
+        self.classified_at: list[float] = []
+
+        async def classifier(_turns, _say):
+            await asyncio.sleep(consent_sec)
+            self.classified_at.append(loop.time())
+            return phone.CLASSIFY_HUMAN
+
+        async def recording_seam():
+            return None
+
+        preloaded = phone.PhoneAssessmentState.parse(
+            tpg._plan_payload(role_title=pre_title))
+        client = _SlowGateWritesClient(
+            preloaded=preloaded, state=tpg._default_state(role_title=server_title))
+        tpg._FakePhoneSession.instances = []
+        tpg._FakePhoneSession.default_answers = ["First answer."]
+        tpg._FakePhoneSession.default_gate_user_turns = []
+        ctx = tpg.FakeCtx(tpg._PHONE_ROOM, participants=[tpg._participant()])
+        with mock.patch.dict(os.environ, {"PHONE_DETERMINISTIC_OPENER": "false"}), \
+                mock.patch.dict(sys.modules, {
+                    "livekit.agents.llm": types.SimpleNamespace(ChatContext=_Ctx)}), \
+                mock.patch.object(agent_mod, "AgentSession", _TimedSession), \
+                mock.patch.object(agent_mod, "persistence", MagicMock()), \
+                mock.patch.object(agent_mod, "_delete_livekit_room", new_callable=AsyncMock), \
+                mock.patch.object(agent_mod, "_phone_recording_permitted", new=recording_seam), \
+                mock.patch.object(phone, "phone_rephrase_first_question", rephrase), \
+                mock.patch.object(phone, "phone_compose_role_opening", compose_role), \
+                mock.patch.object(agent_mod, "SESSION_MAX_RESIDENCY_SEC",
+                                  tpg._HARNESS_RESIDENCY_SEC):
+            os.environ.pop("PHONE_GATE_FLOW", None)
+            os.environ.pop("PHONE_Q1_PRERENDER", None)
+            await asyncio.wait_for(
+                agent_mod._run_phone_session(
+                    ctx, tpg._PHONE_ROOM, tpg._ATTEMPT_ID, tpg._EPOCH,
+                    client=client, classifier=classifier,
+                ),
+                timeout=10,
+            )
+        return tpg._FakePhoneSession.instances[-1], client
+
+    async def test_role_line_end_to_q1_first_frame_is_within_400ms(self):
+        session, _client = await self._run()
+        self.assertIsNotNone(session.role_end, "the role line played")
+        self.assertIn((REPHRASED_Q1, True), session.say_log,
+                      "Q1 is the rephrase, played from pre-rendered frames")
+        gap = session.first_frame[REPHRASED_Q1] - session.role_end
+        self.assertGreaterEqual(gap, 0.0, "Q1 never starts over the role line")
+        self.assertLessEqual(gap, 0.4, f"role line end -> Q1 first frame {gap:.3f}s")
+        # Non-vacuous: rephrase + gate flush + synthesis, in series (the old
+        # order), would have been well over the target.
+        self.assertGreater(
+            self.REPHRASE_SEC + _SlowGateWritesClient.GATE_WRITE_SEC
+            + _TimedSession.TTFB_SEC, 0.4)
+        # The rephrase began at consent, under the role line.
+        self.assertEqual(len(self.rephrase_at), 1)
+        self.assertLess(self.rephrase_at[0][0], session.role_end)
+        self.assertEqual(session.tts.texts.count(REPHRASED_Q1), 1)
+        # Two utterances: the role line, then Q1 (never merged).
+        role_lines = [t for t, _a in session.say_log if ROLE in t]
+        self.assertEqual(role_lines, [COMPOSED_ROLE_LINE])
+        self.assertNotIn(REPHRASED_Q1, COMPOSED_ROLE_LINE)
+
+    async def test_the_gate_transcript_lands_before_the_first_screening_row(self):
+        _session, client = await self._run()
+        flags = [row["is_gate"] for row in client.item_turns]
+        self.assertIn(True, flags)
+        self.assertIn(False, flags, "a screening row was written")
+        last_gate = max(i for i, flag in enumerate(flags) if flag)
+        first_screening = flags.index(False)
+        self.assertLess(last_gate, first_screening, client.item_turns)
+        gate_texts = [row["text"] for row in client.item_turns if row["is_gate"]]
+        self.assertIn(COMPOSED_ROLE_LINE, gate_texts, "the role line is a gate row")
+
+    async def test_the_role_line_composes_during_the_consent_wait(self):
+        session, _client = await self._run(consent_sec=0.3)
+        self.assertEqual([title for _t, title in self.compose_at], [ROLE],
+                         "composed once, from the pre-call title")
+        self.assertLess(self.compose_at[0][0], self.classified_at[0],
+                        "started before the consent reply was read")
+        self.assertIn(COMPOSED_ROLE_LINE, [t for t, _a in session.say_log])
+
+    async def test_a_changed_role_title_is_composed_again_from_the_server_title(self):
+        server = "Senior Sales Program Advisor"
+        session, _client = await self._run(pre_title="Inside Sales Advisor",
+                                           server_title=server)
+        self.assertEqual([title for _t, title in self.compose_at],
+                         ["Inside Sales Advisor", server])
+        spoken = [t for t, _a in session.say_log]
+        self.assertIn(COMPOSED_ROLE_LINE.replace(ROLE, server), spoken)
+        self.assertFalse(any("Inside Sales Advisor" in t for t in spoken))
+
+
 if __name__ == "__main__":
     unittest.main()
