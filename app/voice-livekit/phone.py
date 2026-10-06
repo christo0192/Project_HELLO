@@ -475,6 +475,11 @@ PHONE_WITHDRAWAL_CONFIRM_REASK_TEXT = (
 PHONE_REVOCATION_BUSY_CONFIRM_TEXT = (
     "Would you prefer I call you back at a better time?"
 )
+# M013 S01 T09: the reply to a bare "Yes" / "Yeah" / "Right" after the
+# end-of-screening "any questions?" invite. The candidate is saying they have a
+# question but has not asked it yet; the old silent hold left them waiting for
+# a prompt that never came. Fixed copy, never a screening turn.
+PHONE_QNA_GO_AHEAD_TEXT = "Sure, go ahead."
 # ── The consent re-ask, worded by WHY it is asked (M013 S01 T02) ──────────
 # Asked at most once when the first reply cannot be read as an outcome. Consent
 # must be affirmative, so an unreadable answer is re-asked rather than assumed
@@ -1076,6 +1081,8 @@ def gate_copy_texts() -> frozenset[str]:
         PHONE_WITHDRAWAL_CONFIRM_REASK_TEXT,
         # M013 S01 T07: the post-consent busy confirmation.
         PHONE_REVOCATION_BUSY_CONFIRM_TEXT,
+        # M013 S01 T09: the go-ahead after a bare "Yes" to the Q&A invite.
+        PHONE_QNA_GO_AHEAD_TEXT,
         PHONE_WRONG_NUMBER_TEXT,
         PHONE_ASSESSMENT_CLOSING_TEXT,
         PHONE_CANDIDATE_END_TEXT,
@@ -9806,6 +9813,9 @@ def classify_revocation_busy_confirm_reply(text: Any) -> str:
 # Post-plan candidate Q&A is deliberately bounded. Five real questions is
 # enough space for a candidate to understand the role without turning a phone
 # screen into an unbounded support call that holds a fleet slot indefinitely.
+# M013 S01 T09: fillers and go-aheads ("Okay", a bare "Yes") are counted
+# against the same bound in their own counter, so a stream of them cannot hold
+# the phase open forever either.
 PHONE_QNA_MAX_ROUNDS = 5
 _QNA_DONE_RE = re.compile(
     r"^\s*(?:"
@@ -10091,6 +10101,127 @@ def phone_qna_incomplete(text: Any) -> bool:
     if _QUESTION_OPEN_RE.match(clean) or _CONTENT_DIGIT_RE.search(clean) or clean.endswith("?"):
         return False
     return bool(_QNA_INCOMPLETE_RE.fullmatch(clean))
+
+
+# ── M013 S01 T09: the Q&A closing fallback grammar ───────────────────────
+#
+# At the end of the screening the bot asks "any questions?". The judge
+# (phase `qna_close`) decides decline vs question vs anything else; these two
+# deterministic readers are used only when the judge is not acting (legacy
+# mode, or the judge unavailable), and for the bare "Yes" go-ahead, which needs
+# no model. Live (session 62aec5d9): "No ma'am, thank you so much.", "No
+# ma'am", "It's all good" each burned a Q&A round because the anchored
+# `_QNA_DONE_RE` could not see past "ma'am" or "so much", and the bot asked
+# "anything else?" four times.
+
+#: Honorifics stripped before the decline grammar runs ("No ma'am, thanks").
+_QNA_HONORIFIC_RE = re.compile(
+    r"\b(?:ma'?a?m|maam|mam|madam|sir|ji|mister)\b", re.IGNORECASE,
+)
+_QNA_DECLINE_RE = re.compile(
+    # Up to three leading tokens: "No", "No no", "Okay", "Nahi", "Yes" ("yes,
+    # thank you" is a polite close); never enough on their own (see the
+    # closure-word check in `phone_qna_decline`).
+    r"^(?:(?:no|nope|nah|nahi|nahin|nai|na|ok|okay|yeah|yes|ya|alright|fine|"
+    r"actually|right|sure|no\s+no)[\s,.!-]*){0,3}"
+    # An optional core: nothing (else) | no (more) questions | all good |
+    # it's clear | that's all | bas, in English and romanised Hindi.
+    r"(?:(?:nothing|kuch\s+nahi|kuch\s+nahin|kuch\s+bhi\s+nahi|koi\s+nahi)"
+    r"(?:\s+(?:else|more|much|as\s+such))?(?:\s+for\s+now)?"
+    r"|no\s+(?:more\s+|other\s+|further\s+)?(?:questions?|quer(?:y|ies)|doubts?)"
+    r"(?:\s+as\s+such)?"
+    r"|(?:it(?:'s|\s+is)|its|everything(?:'s|\s+is)?|i(?:'m|\s+am)|we(?:'re|\s+are))"
+    r"\s+(?:all\s+)?(?:good|fine|clear|ok(?:ay)?|done|set)"
+    r"|all\s+(?:good|clear|fine|set)|that(?:'s|\s+is)\s+(?:all|it|fine)|bas"
+    r")?[\s,.!-]*"
+    # An optional thanks ending.
+    r"(?:(?:thank\s*you|thanks|thank\s+u)(?:\s+(?:so|very)\s+much|\s+a\s+lot|"
+    r"\s+again)?[\s,.!-]*)?$",
+    re.IGNORECASE,
+)
+#: A decline needs at least one negative, closure or thank-you word: a bare
+#: "Yes" / "Okay" means "I have a question", never "I am done".
+_QNA_DECLINE_WORD_RE = re.compile(
+    r"\b(?:no|nope|nah|nahi|nahin|nai|na|nothing|good|fine|clear|done|set|all|"
+    r"it|bas|thank|thanks)\b",
+    re.IGNORECASE,
+)
+_QNA_ASKS_RE = re.compile(
+    r"\b(?:one|a|another|quick|last|small|final)\s+(?:more\s+)?"
+    r"(?:question|query|doubt)s?\b",
+    re.IGNORECASE,
+)
+#: Longest reply the decline grammar may close on (after honorifics are
+#: stripped). A long reply is never a bare "no more questions".
+_QNA_DECLINE_MAX_TOKENS = 10
+
+
+def phone_qna_decline(text: Any) -> bool:
+    """True when a Q&A reply politely declines to ask anything (M013 T09).
+
+    The fallback for the `qna_close` judge. Honorifics are stripped, then the
+    whole reply must match a short decline: leading no/okay tokens, an optional
+    "nothing else / no more questions / it's all good / that's all / kuch
+    nahi", and an optional thanks ending ("thank you so much"). Fails CLOSED
+    (False) on any "?", on a clause that opens with a question word, on "one
+    more question" / "a doubt", on more than ten words, and on a reply with no
+    negative, closure or thank-you word, so "Yes", "Okay" and "No ma'am, what
+    is the stipend" stay open.
+    """
+    if not isinstance(text, str):
+        return False
+    clean = " ".join(text.replace("’", "'").replace("‘", "'").strip().split())
+    if not clean or "?" in clean:
+        return False
+    if _QNA_ASKS_RE.search(clean):
+        return False
+    for clause in re.split(r"[.;!,]|\b(?:but|and|although|though)\b",
+                           clean, flags=re.IGNORECASE):
+        clause = clause.strip()
+        if clause and _QUESTION_OPEN_RE.match(clause):
+            return False
+    stripped = " ".join(_QNA_HONORIFIC_RE.sub(" ", clean).split())
+    stripped = re.sub(r"\s+([,.!])", r"\1", stripped).strip(" ,.!-")
+    if not stripped or len(stripped.split()) > _QNA_DECLINE_MAX_TOKENS:
+        return False
+    if not _QNA_DECLINE_WORD_RE.search(stripped):
+        return False
+    return _QNA_DECLINE_RE.fullmatch(stripped) is not None
+
+
+#: A bare "yes" to the Q&A invite: the candidate has a question but has not
+#: asked it yet ("Yes", "Yeah", "Right", "Yes ma'am", "Haan ji", "Yes, I have
+#: a question"). Never a question itself and never a decline.
+_QNA_BARE_YES_RE = re.compile(
+    r"^(?:(?:yes|yeah|yea|yep|yup|ya|right|sure|haan|han|okay\s+yes)"
+    r"[\s,.!-]*){1,2}"
+    r"(?:(?:i\s+(?:do|have|had)|there\s+is|i've\s+got|i\s+have\s+got)"
+    r"(?:\s+(?:one|a|some|a\s+few|few|a\s+couple\s+of|couple\s+of))?"
+    r"(?:\s+(?:questions?|quer(?:y|ies)|doubts?))?"
+    r"|(?:one|a)\s+(?:question|query|doubt)|please)?[\s.!-]*$",
+    re.IGNORECASE,
+)
+
+
+def phone_qna_bare_yes(text: Any) -> bool:
+    """True when a Q&A reply is a bare "yes, I have a question" (M013 T09).
+
+    The bot answers it with ``PHONE_QNA_GO_AHEAD_TEXT`` instead of the old
+    silent hold. A reply that already carries the question ("Yes, what is the
+    stipend?") is not bare: a question word or a "?" after the yes fails it.
+    """
+    if not isinstance(text, str):
+        return False
+    clean = " ".join(text.replace("’", "'").replace("‘", "'").strip().split())
+    if not clean:
+        return False
+    stripped = " ".join(_QNA_HONORIFIC_RE.sub(" ", clean).split())
+    stripped = re.sub(r"\s+([,.!?])", r"\1", stripped).strip(" ,.!-")
+    # One trailing "?" on the bare word itself ("Yes?") is still a go-ahead.
+    stripped = stripped[:-1] if stripped.endswith("?") else stripped
+    if not stripped or "?" in stripped:
+        return False
+    return _QNA_BARE_YES_RE.fullmatch(stripped) is not None
 
 
 # ── PR-9: shadow coverage + resume-conflict judge ─────────────────────
@@ -14542,7 +14673,12 @@ _QUESTION_OPEN_RE = re.compile(
     # for a substantive answer (call 24, turn 23: "And what do you think about
     # my workflow? ..." fell through this gate because it did not start with an
     # interrogative). Up to two leading conjunctions/fillers are skipped.
-    r"^\s*(?:(?:and|so|but|ok|okay|well|hmm+|now|um+|uh+|yeah|right)[\s,.!?-]+){0,4}"
+    # M013 S01 T09 (session 62aec5d9): also a leading "Yes/No ma'am|sir", a
+    # bare "Ma'am"/"Sir" and "Wait," — "Yes ma'am, what is the role…?" and
+    # "No ma'am, what is the stipend?" are questions. "Yes"/"No" are skipped
+    # only together with the honorific, so "Yes, I can join" stays an answer.
+    r"^\s*(?:(?:and|so|but|ok|okay|well|hmm+|now|um+|uh+|yeah|right|wait|"
+    r"(?:(?:yes|no)[\s,.!-]*)?(?:ma['’]?a?m|maam|mam|madam|sir))[\s,.!?-]+){0,4}"
     r"(?:can|could|would|will|what|which|who|where|when|why|how|"
     r"is|are|do|does|did)\b",
     re.IGNORECASE,

@@ -577,6 +577,63 @@ class TestQnaDismissalDetector(unittest.TestCase):
             with self.subTest(text=text):
                 self.assertTrue(phone.phone_qna_dismissal(text))
 
+    # ── M013 S01 T09: the polite-decline fallback grammar ─────────────────
+    # (evidence/pr334-wrapup-rca.md; session 62aec5d9.) Used only when the
+    # `qna_close` judge is not acting.
+
+    #: The four live declines (verbatim) plus the politeness forms.
+    POLITENESS_DECLINES = (
+        "No ma'am, thank you so much.", "No ma'am", "It's all good",
+        "No, thank you so much.", "Nahi ma'am", "kuch nahi ma'am",
+        "No sir, that's all", "No doubts ma'am", "Okay, thank you ma'am",
+        "Thank you so much.", "Everything is clear", "Nothing ma'am",
+        "No no, thank you", "No questions", "No more questions sir",
+        "Nothing else", "I'm clear, thanks", "No ma'am. It's all good.",
+        "Nope, all good", "That's it, thank you very much", "No thank you",
+        "No ma’am, thank you so much.",  # curly apostrophe from STT
+    )
+    #: Real questions and answers that must never close the call.
+    FAIL_CLOSED_NEGATIVES = (
+        "Yes ma'am, what is the role and the process of hiring and also the package?",
+        "No ma'am, I have one question",
+        "No, I have a doubt",
+        "No ma'am, what about the salary",
+        "No but how many rounds are there",
+        "Actually I wanted to know about the stipend",
+        "Yes",
+        "Okay",
+        "Yes ma'am",
+        "Is it a remote role",
+        "No, what is the work timing",
+        "Thank you, and when will I hear back",
+        "Salary details please",
+        "I'm good at sales",
+        "No it's not clear what the shift is",
+        "Not really sure about the process, can you explain",
+    )
+
+    def test_indian_politeness_declines_close(self):
+        for text in self.POLITENESS_DECLINES:
+            with self.subTest(text=text):
+                self.assertTrue(phone.phone_qna_decline(text))
+
+    def test_decline_fails_closed_on_any_question(self):
+        self.assertEqual(len(self.FAIL_CLOSED_NEGATIVES), 16)
+        for text in self.FAIL_CLOSED_NEGATIVES:
+            with self.subTest(text=text):
+                self.assertFalse(phone.phone_qna_decline(text))
+        for text in ("No, that's all?", "No ma'am, one more question",
+                     "Nothing else but when do I hear back", None, "", "   ",
+                     "No no no no no no no no no no no no thank you"):
+            with self.subTest(text=text):
+                self.assertFalse(phone.phone_qna_decline(text))
+
+    def test_bare_yes_is_not_a_decline(self):
+        for text in ("Yes", "Yeah", "Yes ma'am", "Haan", "Right", "Sure"):
+            with self.subTest(text=text):
+                self.assertFalse(phone.phone_qna_decline(text))
+                self.assertTrue(phone.phone_qna_bare_yes(text))
+
 
 class TestTtsFlushKnobLive(unittest.TestCase):
     """F4 — the env knob is honored again; 0 remains the instant rollback."""

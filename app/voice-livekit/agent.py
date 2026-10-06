@@ -2247,6 +2247,12 @@ class _RevocationWindow:
     replay recorded answers.
     """
 
+    #: The judge phase, the intents that act and the log line's type. T09's
+    #: `_QnaCloseWindow` reuses the window machinery with its own three.
+    _PHASE = gate_judge.PHASE_POST_CONSENT
+    _ACTING_INTENTS = _REVOCATION_INTENTS
+    _LOG_TYPE = "phone_revocation_window"
+
     def __init__(
         self,
         *,
@@ -2342,8 +2348,8 @@ class _RevocationWindow:
         """One `phone_revocation_window` line: the outcome category, no text."""
         try:
             self.log(
-                error_type="phone_revocation_window", error_category=category,
-                phase=gate_judge.PHASE_POST_CONSENT, **fields,
+                error_type=self._LOG_TYPE, error_category=category,
+                phase=self._PHASE, **fields,
             )
         except Exception:  # noqa: BLE001
             pass
@@ -2387,7 +2393,7 @@ class _RevocationWindow:
             tag=gate_judge.TAG_POST_QUESTION,
         )
         request = gate_judge.GateJudgeRequest(
-            phase=gate_judge.PHASE_POST_CONSENT, bot_line=self.bot_line(),
+            phase=self._PHASE, bot_line=self.bot_line(),
             utterances=(utterance,), first_name=self.first_name,
         )
         model = ""
@@ -2416,13 +2422,15 @@ class _RevocationWindow:
             idx: int | None = None
             if gate_judge.evidence_in_text(evidence, entry.text):
                 idx = entry.idx
-            if intent in _REVOCATION_INTENTS:
+            if intent in self._ACTING_INTENTS:
                 if not evidence.strip():
                     rejected = "no_evidence"
                 elif gate_judge.evidence_names_a_label(evidence):
                     rejected = "evidence_is_label"
                 elif idx is None:
                     rejected = "evidence_not_found"
+                else:
+                    rejected = self._extra_guard(entry)
                 if rejected is not None:
                     intent, idx = gate_judge.INTENT_UNCLEAR, None
             decision = gate_judge.GateDecision(
@@ -2433,7 +2441,7 @@ class _RevocationWindow:
             )
         try:
             gate_judge.log_decision(
-                decision, phase=gate_judge.PHASE_POST_CONSENT, model=model,
+                decision, phase=self._PHASE, model=model,
                 n_utterances=1, n_tagged=1, evidence_len=len(evidence),
                 rejection_reason=rejected or (
                     f"err.{decision.error_category}" if decision.error_category else None),
@@ -2459,13 +2467,17 @@ class _RevocationWindow:
         decision = task.result()
         self.note(f"shadow_{decision.intent or 'judge_unavailable'}")
 
-    @staticmethod
-    def acting_decision(decision: Any) -> bool:
+    def _extra_guard(self, entry: _RevocationEntry) -> str | None:
+        """A further reason an acting verdict may not act (None = it may)."""
+        return None
+
+    @classmethod
+    def acting_decision(cls, decision: Any) -> bool:
         """A valid judge revocation verdict grounded in the candidate's words."""
         return (
             isinstance(decision, gate_judge.GateDecision)
             and decision.source == gate_judge.SOURCE_LLM
-            and decision.intent in _REVOCATION_INTENTS
+            and decision.intent in cls._ACTING_INTENTS
             and decision.evidence_idx is not None
         )
 
@@ -2583,6 +2595,87 @@ def _consume_task_exception(task: "asyncio.Task[Any]") -> None:
 def _revocation_log(**fields: Any) -> None:
     """The revocation window's log sink: categories and durations only."""
     _log.info("unknown_event", **fields)
+
+
+# ── M013 S01 T09: the end-of-screening Q&A judge ─────────────────────────
+#
+# Once the bot has asked "any questions?", every STT final is judged with phase
+# `qna_close` the moment it lands (speculatively, bounded by
+# `PHONE_QNA_JUDGE_TIMEOUT_SEC`), so most of the judge's latency hides behind
+# end-of-turn detection; the committed turn reuses the verdict for the same
+# words. The judge decides decline vs question vs anything else. Acts only in
+# `PHONE_GATE_JUDGE=llm`; `shadow` judges and logs; in `legacy`, or when the
+# judge is unavailable, the deterministic fallback grammar decides
+# (`phone.phone_qna_decline` and the question readers).
+
+#: Judge intents that close the Q&A. Each needs evidence copied from the
+#: candidate's own words, and no "?" in the reply (`_QnaCloseWindow`).
+_QNA_DECLINE_INTENTS = frozenset({
+    gate_judge.INTENT_END_CALL,
+    gate_judge.INTENT_CONSENT_DECLINED,
+})
+
+QNA_KIND_DECLINE = "decline"
+QNA_KIND_QUESTION = "question"
+QNA_KIND_OTHER = "other"
+
+
+class _QnaCloseWindow(_RevocationWindow):
+    """The `qna_close` judge for one call (T09). Never raises.
+
+    Built by `_run_phone_session` (``on_final`` from the transcript hook),
+    armed by `_run_native_phone_screening` when it asks "any questions?", read
+    per committed turn with ``read_qna`` and closed at leg end. Any leg may arm
+    it: unlike the revocation window it is not tied to the consent leg.
+    """
+
+    _PHASE = gate_judge.PHASE_QNA_CLOSE
+    _ACTING_INTENTS = _QNA_DECLINE_INTENTS
+    _LOG_TYPE = "phone_qna_close_judge"
+
+    def _extra_guard(self, entry: _RevocationEntry) -> str | None:
+        # A reply with a "?" is never closed on, whatever the judge says.
+        return "question_mark" if "?" in entry.text else None
+
+    def bind_bot_line(self, source: "Callable[[], Any] | None") -> None:
+        """The line the candidate is answering (the invite, then each answer)."""
+        self._bot_line_source = source
+        self._bot_line_override = None
+
+    async def read_qna(self, text: Any) -> "tuple[str, gate_judge.GateDecision | None]":
+        """The judge's reading of one committed Q&A turn: ``(kind, decision)``.
+
+        ``kind``: ``question`` (wins over everything else: a question is never
+        closed on), ``decline`` (a grounded end_call/consent_declined verdict),
+        ``other`` (any other valid verdict), ``unavailable`` (no usable
+        verdict: the fallback grammar decides) or ``inactive``.
+        """
+        if not self.acting:
+            return "inactive", None
+        clean = text.strip() if isinstance(text, str) else ""
+        norm = gate_judge.normalize_gate_text(clean)
+        if not norm:
+            return "inactive", None
+        matched = [
+            e for e in self._entries
+            if e.consumed_by is None and e.norm and (e.norm in norm or norm in e.norm)
+        ]
+        if not matched:
+            fresh = self._add_entry(clean)
+            matched = [fresh] if fresh is not None else []
+        for entry in matched:
+            entry.consumed_by = "turn"
+        results = await self._await_entries(matched)
+        decisions = [d for _, d in results if d is not None and d.intent is not None]
+        for decision in decisions:
+            if decision.intent == gate_judge.INTENT_QUESTION:
+                return QNA_KIND_QUESTION, decision
+        for decision in decisions:
+            if self.acting_decision(decision) and "?" not in clean:
+                return QNA_KIND_DECLINE, decision
+        if decisions:
+            return QNA_KIND_OTHER, decisions[0]
+        return "unavailable", None
 
 
 def _turn_started_after(item: Any, anchor_ms: int | None) -> bool:
@@ -5568,6 +5661,10 @@ async def _run_native_phone_screening(
     # M013 S01 T07: the call's post-consent revocation window (armed by the
     # gate on a grant in THIS call). None, unarmed, or a reconnect leg: inert.
     revocation_window: "_RevocationWindow | None" = None,
+    # M013 S01 T09: the call's end-of-screening Q&A judge (fed every STT
+    # final by the session). None: a private one that only judges committed
+    # turns (and only in llm/shadow mode).
+    qna_close_window: "_QnaCloseWindow | None" = None,
 ) -> phone.PhoneGateResult:
     """Run post-consent screening through LiveKit's native turn lifecycle.
 
@@ -5642,6 +5739,22 @@ async def _run_native_phone_screening(
     closing = ClosingStateMachine()
     qna_rounds = {"value": 0}
     qna_answer_delivery = {"sequence": None, "delivered": False}
+    # M013 S01 T09: the Q&A judge, the filler/go-ahead counter (bounded by
+    # PHONE_QNA_MAX_ROUNDS like the answer rounds), the count of non-question
+    # replies (the second one closes), and the one late question answered
+    # after the goodbye played (`used` caps it at one per call; `closed` once
+    # the teardown is past the point where the room is still open).
+    qna_window = (
+        qna_close_window if qna_close_window is not None
+        else _QnaCloseWindow(first_name="")
+    )
+    qna_fillers = {"value": 0}
+    qna_kind_cache: dict[str, Any] = {"key": None, "kind": None}
+    qna_other = {"value": 0}
+    late_qna: dict[str, Any] = {
+        "used": False, "closed": False, "judging": False, "sequence": None,
+        "done": None, "finished_mono": None,
+    }
     silence_prompted = {"value": False}
     # The bounded in-call callback negotiation. `None` until the candidate first
     # asks for a callback; then a forward-only state machine that CANNOT loop
@@ -6144,6 +6257,22 @@ async def _run_native_phone_screening(
                     task.cancel()
             await asyncio.gather(*waiters, return_exceptions=True)
 
+    def _qna_silence_closes() -> bool:
+        """T09: silence in the "any questions?" phase completes the screening.
+
+        Only while nothing else owns the call: no planned question owed, no
+        callback negotiation, no withdrawal confirmation, no armed terminal.
+        """
+        return (
+            closing.state is ClosingState.CANDIDATE_QNA
+            and state.question_at(cursor) is None
+            and callback_flow["state"] is None
+            and not withdrawal["pending"]
+            and pending_terminal_reason.get("value") is None
+            and not candidate_end_requested.is_set()
+            and not finished.is_set()
+        )
+
     async def native_silence_loop() -> None:
         """Use LiveKit state/activity as the only phone inactivity authority."""
         while not finished.is_set():
@@ -6183,6 +6312,21 @@ async def _run_native_phone_screening(
             # Consume the away latch so a still-set flag cannot re-trigger the
             # next pass's first wait without a fresh away transition.
             away_event.clear()
+            if _qna_silence_closes():
+                # M013 S01 T09: every planned question is answered and the
+                # candidate has gone quiet in the "any questions?" phase
+                # (after a decline the bot missed, an answer, or the invite):
+                # that is a finished screening, not a no-answer abort. The
+                # teardown speaks the fixed closing goodbye (nothing armed
+                # played it) and posts `assessment.completed`.
+                _log.info(
+                    "unknown_event", error_type="phone_silence",
+                    error_category="qna_silence_close",
+                )
+                closing.candidate_questions_handled()
+                terminal_reason.setdefault("reason", "completed")
+                finished.set()
+                return
             silence_prompted["value"] = True
             _log.info(
                 "unknown_event", error_type="phone_silence",
@@ -7080,6 +7224,128 @@ async def _run_native_phone_screening(
         heard = await _speak_preloop(line, "preloop_revocation_confirm")
         return "spoken" if heard else "unheard"
 
+    # ── M013 S01 T09: the end-of-screening Q&A ─────────────────────────────
+    _QNA_DONE_CLOSE_INSTRUCTION = (
+        "The candidate has no more questions. Thank them warmly and "
+        "personally, say the team will review and be in touch soon, "
+        "wish them well, and say goodbye. Do not ask another question."
+    )
+
+    def _qna_note(category: str) -> None:
+        """One `phone_qna_close` line: the routing category, never the text."""
+        _log.info(
+            "unknown_event", error_type="phone_qna_close", error_category=category,
+            source=("judge" if qna_window.acting else "fallback"),
+        )
+
+    async def _qna_kind(text: str, route: str | None) -> str:
+        """Decline, question or other, for one Q&A turn (T09).
+
+        A valid `qna_close` judge verdict decides (llm mode); otherwise the
+        fallback grammar: the old done/dismissal readers plus
+        `phone_qna_decline` for a decline, the question route or a directed
+        question for a question.
+        """
+        key = (native_turn_seq[0], text)
+        if qna_kind_cache.get("key") == key:
+            # Read once per turn: a reopened pending close reuses the verdict.
+            return str(qna_kind_cache["kind"])
+        kind, _ = await qna_window.read_qna(text)
+        if kind == QNA_KIND_OTHER and phone.phone_candidate_question_directed(text):
+            # Only in the safe direction: a reply shaped as a question to the
+            # interviewer ("…?", "what does the role pay") is answered even if
+            # the judge heard none. Nothing here can close the call.
+            _qna_note("judged_other_question_shape")
+            kind = QNA_KIND_QUESTION
+        elif kind in (QNA_KIND_DECLINE, QNA_KIND_QUESTION, QNA_KIND_OTHER):
+            _qna_note(f"judged_{kind}")
+        else:
+            if kind == "unavailable":
+                _qna_note("judge_unavailable")
+            if (
+                phone.phone_qna_done(text)
+                or phone.phone_qna_dismissal(text)
+                or phone.phone_qna_decline(text)
+            ):
+                kind = QNA_KIND_DECLINE
+            elif (route == "candidate_question"
+                    or phone.phone_candidate_question_directed(text)):
+                kind = QNA_KIND_QUESTION
+            else:
+                kind = QNA_KIND_OTHER
+        qna_kind_cache.update(key=key, kind=kind)
+        return kind
+
+    def _qna_close(turn_ctx: Any, close_instruction: str) -> None:
+        """Author the closing goodbye and arm the `completed` terminal."""
+        closing.candidate_questions_handled()
+        set_reply_snapshot(phone.PHONE_ASSESSMENT_CLOSING_TEXT, phase="closing")
+        setattr(agent, "_turn_policy", "closing")
+        authorize_generated_reply(
+            "Close the completed screening without making promises or asking another question.",
+            allow_closing=True,
+            control_text=close_instruction,
+        )
+        arm_terminal_reply("completed")
+        add_turn_instruction(turn_ctx, close_instruction)
+
+    def _qna_filler_cap_reached() -> bool:
+        """Count one filler or go-ahead; True once PHONE_QNA_MAX_ROUNDS is hit."""
+        qna_fillers["value"] += 1
+        return qna_fillers["value"] >= phone.PHONE_QNA_MAX_ROUNDS
+
+    async def _late_qna_question(turn_ctx: Any, text: str) -> bool:
+        """T09: a question asked after the goodbye played, room still open.
+
+        One short answer plus the goodbye again, once per call. Anything else
+        (a thank-you, a bye, a second late question) stays terminal.
+        """
+        if (
+            late_qna["used"] or late_qna["closed"] or late_qna["judging"]
+            or terminal_reason.get("reason") != "completed"
+            or closing.state is not ClosingState.CLOSING_PLAYED
+            or turn_ctx is None
+        ):
+            return False
+        # Hold the teardown while this turn is judged: it waits on `done`
+        # (bounded) before it closes the late window and deletes the room.
+        gate = asyncio.Event()
+        late_qna["done"] = gate
+        late_qna["judging"] = True
+        try:
+            kind = await _qna_kind(text, phone.candidate_turn_route(text))
+        except Exception:  # noqa: BLE001 — never answer on a failed read
+            kind = QNA_KIND_OTHER
+        finally:
+            late_qna["judging"] = False
+        if kind != QNA_KIND_QUESTION or late_qna["closed"]:
+            gate.set()
+            late_qna["done"] = None
+            return False
+        late_qna["used"] = True
+        late_qna["sequence"] = speech_sequence[0] + 1
+        instruction = (
+            "After your goodbye the candidate asked one more question. Answer it "
+            "in one or two short sentences like a warm human recruiter; for role "
+            "or company facts use only verified role context, and if you don't "
+            "have the detail, say plainly that the hiring team can answer it. "
+            "Never invent specifics. Then thank them and say goodbye again. Do "
+            "not ask any question."
+        )
+        set_reply_snapshot(phone.PHONE_ASSESSMENT_CLOSING_TEXT, phase="closing")
+        setattr(agent, "_turn_policy", "closing")
+        authorize_generated_reply(
+            "Answer the late question briefly, then say goodbye again.",
+            allow_closing=True,
+            control_text=instruction,
+        )
+        add_turn_instruction(turn_ctx, instruction)
+        _log.info(
+            "unknown_event", error_type="phone_qna_late_question",
+            error_category="late_question_answered",
+        )
+        return True
+
     async def on_native_turn(
         text: str, message: Any = None, turn_ctx: Any = None,
     ) -> None:
@@ -7196,6 +7462,10 @@ async def _run_native_phone_screening(
         compensation_slots.update(phone.phone_compensation_slots(text))
         authorize_generated_reply(None)
         if finished.is_set():
+            # M013 S01 T09: one late question after the goodbye played is
+            # answered (with the goodbye again) while the room is still open.
+            if await _late_qna_question(turn_ctx, text):
+                return
             from livekit.agents import StopResponse  # noqa: PLC0415
             raise StopResponse()
         # Finding E (Codex review §7): grade the ONE candidate turn that
@@ -7418,6 +7688,16 @@ async def _run_native_phone_screening(
             and not prior_interrupted
             and (route == "hesitation" or substance == phone.PHONE_SUBSTANCE_HESITATION)
         ):
+            if (
+                closing.state is ClosingState.CANDIDATE_QNA
+                and question is None
+                and _qna_filler_cap_reached()
+            ):
+                # M013 S01 T09: a stream of "Okay"s in the Q&A phase is
+                # bounded too; at the cap the screening closes warmly.
+                _qna_note("filler_cap_close")
+                _qna_close(turn_ctx, _QNA_DONE_CLOSE_INSTRUCTION)
+                return
             setattr(agent, "_turn_policy", "patience_suppressed")
             _log.info(
                 "unknown_event", error_type="phone_turn_completion",
@@ -7430,10 +7710,16 @@ async def _run_native_phone_screening(
             set_reply_snapshot("Take your time.", phase="patience")
             add_turn_instruction(turn_ctx, phone.PHONE_PATIENCE_ENCOURAGEMENT_TEXT)
             return
-        if closing.state is ClosingState.CLOSING_PENDING and route == "candidate_question":
+        if closing.state is ClosingState.CLOSING_PENDING and (
+            route == "candidate_question"
+            or phone.phone_candidate_question_directed(text)
+            or await _qna_kind(text, route) == QNA_KIND_QUESTION
+        ):
             # A genuine late question outranks an authored-but-unplayed close.
             # Cancel the exact handle and terminal correlation, reopen Q&A, and
             # let the ordinary bounded Q&A branch below answer this same turn.
+            # M013 S01 T09: any judged question or directed question cancels it
+            # ("No ma'am, what is the stipend?"), not only the question route.
             stale_handle = reply_handle[0]
             interrupt = getattr(stale_handle, "interrupt", None)
             if callable(interrupt):
@@ -7478,7 +7764,27 @@ async def _run_native_phone_screening(
 
             # Invite once on entry. Acknowledgement after an answer closes;
             # unfinished thoughts get space, never another invitation.
+            #
+            # M013 S01 T09: a bare "Yes" / "Yeah" / "Right" to the invite means
+            # "I have a question": it gets the spoken go-ahead instead of the
+            # old silent hold. Fillers keep the silent hold. Both count toward
+            # PHONE_QNA_MAX_ROUNDS (their own counter), so neither can hold the
+            # phase open forever.
+            if not qna_ack and phone.phone_qna_bare_yes(text):
+                if _qna_filler_cap_reached():
+                    _qna_note("filler_cap_close")
+                    _qna_close(turn_ctx, _QNA_DONE_CLOSE_INSTRUCTION)
+                    return
+                _qna_note("go_ahead")
+                _speak_withdrawal_line(
+                    turn_ctx, phone.PHONE_QNA_GO_AHEAD_TEXT, phase="candidate_qna",
+                )
+                return
             if phone.phone_qna_incomplete(text) and not qna_ack:
+                if _qna_filler_cap_reached():
+                    _qna_note("filler_cap_close")
+                    _qna_close(turn_ctx, _QNA_DONE_CLOSE_INSTRUCTION)
+                    return
                 if prior_interrupted:
                     set_reply_snapshot("Take your time.", phase="candidate_qna")
                     setattr(agent, "_turn_policy", "clarification")
@@ -7496,11 +7802,39 @@ async def _run_native_phone_screening(
             # closed on any turn that also carries a question, so a genuine late
             # question is never swallowed. Treated exactly like `phone_qna_done`
             # (close warmly), so no new terminal path is introduced.
-            if phone.phone_qna_done(text) or phone.phone_qna_dismissal(text) or qna_ack:
+            #
+            # M013 S01 T09: decline vs question vs anything else is now the
+            # `qna_close` judge's call (llm mode); the fallback grammar adds the
+            # polite declines the live call missed ("No ma'am, thank you so
+            # much."). A reply that is neither a decline nor a question is
+            # never sent down the "answer their question" path: the first gets
+            # a short acknowledgement, the second closes (answering it first).
+            qna_kind = QNA_KIND_DECLINE if qna_ack else await _qna_kind(text, route)
+            if qna_kind == QNA_KIND_DECLINE:
+                close_instruction = _QNA_DONE_CLOSE_INSTRUCTION
+            elif qna_kind == QNA_KIND_OTHER and qna_other["value"] < 1:
+                qna_other["value"] += 1
+                _qna_note("non_question_acknowledged")
+                qna_answer_delivery.update(sequence=speech_sequence[0] + 1, delivered=False)
+                set_reply_snapshot("Understood.", phase="candidate_qna")
+                setattr(agent, "_turn_policy", "clarification")
+                add_turn_instruction(
+                    turn_ctx,
+                    "The candidate's reply is not a question for you, so there is "
+                    "nothing to answer. Acknowledge it warmly in a few words. If it "
+                    "sounds like they started to ask something, invite them to go "
+                    "ahead. Do not answer a question nobody asked, do not invent "
+                    "details, and do not say goodbye yet.",
+                )
+                return
+            elif qna_kind == QNA_KIND_OTHER:
+                _qna_note("non_question_close")
                 close_instruction = (
-                    "The candidate has no more questions. Thank them warmly and "
-                    "personally, say the team will review and be in touch soon, "
-                    "wish them well, and say goodbye. Do not ask another question."
+                    "The candidate has nothing more to ask. If what they just said "
+                    "needs a reply, respond to it briefly in one short sentence "
+                    "without inventing details; then thank them warmly for their "
+                    "time, say the team will review and be in touch soon, and say "
+                    "goodbye. Do not ask another question."
                 )
             else:
                 # F-P0c (call #2 RCA, 2026-09-07): count Q&A rounds per
@@ -7556,7 +7890,7 @@ async def _run_native_phone_screening(
                 # (`candidate_question`) rather than inventing a detector. A
                 # non-question that still landed here (e.g. a "Nope" that
                 # `phone_qna_done` failed to catch) gets a neutral ack instead.
-                turn_is_question = route == "candidate_question"
+                turn_is_question = route == "candidate_question" or qna_kind == QNA_KIND_QUESTION
                 if qna_rounds["value"] < phone.PHONE_QNA_MAX_ROUNDS:
                     qna_answer_delivery.update(sequence=speech_sequence[0] + 1, delivered=False)
                     set_reply_snapshot(
@@ -7580,16 +7914,7 @@ async def _run_native_phone_screening(
                     "ask another question and do not add unsupported claims."
                 )
 
-            closing.candidate_questions_handled()
-            set_reply_snapshot(phone.PHONE_ASSESSMENT_CLOSING_TEXT, phase="closing")
-            setattr(agent, "_turn_policy", "closing")
-            authorize_generated_reply(
-                "Close the completed screening without making promises or asking another question.",
-                allow_closing=True,
-                control_text=close_instruction,
-            )
-            arm_terminal_reply("completed")
-            add_turn_instruction(turn_ctx, close_instruction)
+            _qna_close(turn_ctx, close_instruction)
             return
         if silence_prompted["value"]:
             silence_prompted["value"] = False
@@ -8992,6 +9317,10 @@ async def _run_native_phone_screening(
             if callable(getattr(events, "record_probe", None)):
                 closing.plan_completed()
                 closing.wind_down_delivered()
+                # M013 S01 T09: from the "any questions?" invite on, every
+                # final is judged with phase `qna_close` (llm/shadow only).
+                qna_window.bind_bot_line(lambda: latest_assistant[0])
+                qna_window.arm()
                 set_reply_snapshot(
                     "Thank you. Do you have any questions about the role, team, company, or process?",
                     objective="Ask whether the candidate has questions about the role, team, company, or process.",
@@ -9702,6 +10031,13 @@ async def _run_native_phone_screening(
         if (delivered_seq is not None
                 and delivered_seq == qna_answer_delivery["sequence"]):
             qna_answer_delivery["delivered"] = not interrupted
+        # T09: the late answer (and its second goodbye) has stopped playing,
+        # cleanly or not: the teardown may now take the room down.
+        late_done = late_qna.get("done")
+        if (late_done is not None and not late_done.is_set() and late_qna["used"]
+                and (delivered_seq is None or delivered_seq == late_qna.get("sequence"))):
+            late_qna["finished_mono"] = time.monotonic()
+            late_done.set()
         reason = pending_terminal_reason.get("value")
         expected_seq = pending_terminal_speech_seq.get("value")
         conflict_seq = conflict_delivery.get("sequence")
@@ -10293,6 +10629,10 @@ async def _run_native_phone_screening(
         # M013 S01 T07: nothing of the window outlives the leg.
         if window is not None:
             window.close("leg_ended")
+        # T09: the Q&A judge stays open through a completed teardown, which
+        # may still answer one late question (`_await_late_qna_answer`).
+        if terminal_reason.get("reason") != "completed":
+            qna_window.close("leg_ended")
         silence_task.cancel()
         await asyncio.gather(silence_task, return_exceptions=True)
         watchdog = speech_watchdog_task[0]
@@ -10504,6 +10844,38 @@ async def _run_native_phone_screening(
                     min(PHONE_CLOSE_VAD_RECENT_SEC, max(remaining, 0.0)),
                 )
 
+    async def _await_late_qna_answer() -> float:
+        """T09: let the one late answer (and its goodbye) finish before delete.
+
+        A question asked after the goodbye played, while the room was still
+        open, got one short answer plus the goodbye again (the turn hook,
+        capped at one per call). Wait for that reply to stop playing, bounded
+        like the fixed farewell; then close the late window so any later turn
+        is terminal, exactly as before. Returns the monotonic time the late
+        answer ended (0.0 if there was none), the new tail-grace anchor.
+        """
+        try:
+            done = late_qna.get("done")
+            if done is not None and not done.is_set():
+                try:
+                    await asyncio.wait_for(
+                        done.wait(),
+                        timeout=max(
+                            PHONE_TERMINAL_REPLY_TIMEOUT_SEC,
+                            PHONE_FAREWELL_PLAYOUT_FLOOR_SEC,
+                        ),
+                    )
+                except asyncio.TimeoutError:
+                    _log.info(
+                        "unknown_event", error_type="phone_qna_late_question",
+                        error_category="late_answer_wait_timeout",
+                    )
+            ended = late_qna.get("finished_mono")
+            return float(ended) if isinstance(ended, (int, float)) else 0.0
+        finally:
+            late_qna["closed"] = True
+            qna_window.close("leg_ended")
+
     if reason != "completed":
         # Every non-completed terminal exit (candidate hangup, no-answer,
         # malformed, disconnect, retryable recovery, aborts) persists its
@@ -10569,6 +10941,10 @@ async def _run_native_phone_screening(
             # F-P0b: the candidate may still be mid-sentence (a late thanks,
             # a question racing the goodbye) — wait for end-of-speech, bounded.
             await _await_candidate_silence_before_delete()
+            # T09: one late question answered after the goodbye plays out.
+            goodbye_finished_monotonic = max(
+                goodbye_finished_monotonic, await _await_late_qna_answer(),
+            )
             close_grace = phone.PHONE_CLOSE_TAIL_GRACE_SEC - (
                 time.monotonic() - goodbye_finished_monotonic
             )
@@ -10729,6 +11105,10 @@ async def _run_native_phone_screening(
         # F-P0b: the closing-state VAD check runs BEFORE the tail grace — the
         # room must not come down while the candidate is audibly mid-sentence.
         await _await_candidate_silence_before_delete()
+        # T09: one late question answered after the goodbye plays out.
+        goodbye_finished_monotonic = max(
+            goodbye_finished_monotonic, await _await_late_qna_answer(),
+        )
         # Pre-delete tail grace, minus whatever the completion round-trips
         # already spent: deleting the room kills the SIP audio buffers
         # instantly and a goodbye clipped on its last words is perceived as a
@@ -11478,6 +11858,12 @@ async def _run_phone_session(
                     revocation_window.on_final(str(getattr(event, "transcript", "") or ""))
                 except Exception:  # noqa: BLE001 — never breaks the transcript hook
                     pass
+                # M013 S01 T09: and, once "any questions?" is asked, the Q&A
+                # judge (its call starts on the final, hiding its latency).
+                try:
+                    qna_close_window.on_final(str(getattr(event, "transcript", "") or ""))
+                except Exception:  # noqa: BLE001 — never breaks the transcript hook
+                    pass
 
     @session.on("agent_state_changed")
     def _on_phone_agent_state_changed(event):  # noqa: ANN001
@@ -12047,6 +12433,11 @@ async def _run_phone_session(
     revocation_window = _RevocationWindow(
         first_name=getattr(instruction_state, "candidate_name", None),
         bot_line=lambda: gate_last_line[0],
+    )
+    # M013 S01 T09: the end-of-screening Q&A judge, armed by the screening
+    # when it asks "any questions?" (any leg) and fed every STT final.
+    qna_close_window = _QnaCloseWindow(
+        first_name=getattr(instruction_state, "candidate_name", None),
     )
 
     async def classify() -> str:
@@ -14062,6 +14453,7 @@ async def _run_phone_session(
                 turn_mode=turn_mode,
                 coverage_judge_enabled=coverage_judge_enabled,
                 revocation_window=revocation_window,
+                qna_close_window=qna_close_window,
                 candidate_speaking=candidate_speaking,
                 candidate_speech_ended=candidate_speech_ended,
                 close_room=_request_room_close,
