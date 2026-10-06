@@ -34,6 +34,20 @@
   const setStatus = (text) => { $("status").textContent = text; };
   const write = () => { $("summary").textContent = JSON.stringify({ ...state, samples: state.samples.slice(-24) }, null, 2); };
 
+  function assertSpikeUrl(value) {
+    let parsed;
+    try { parsed = new URL(value); }
+    catch { throw new Error("LiveKit URL must be an absolute wss:// or https:// URL."); }
+    const authority = value.match(/^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i)?.[1] || "";
+    const authorityHost = authority.slice(authority.lastIndexOf("@") + 1);
+    if (!["wss:", "https:"].includes(parsed.protocol)
+      || parsed.hostname.toLowerCase() !== "project-hello-r1-rtc-spike.fly.dev"
+      || parsed.username || parsed.password || parsed.port || authorityHost.includes(":")) {
+      throw new Error("LiveKit URL must use the approved disposable spike host without credentials or a port.");
+    }
+    return parsed.href;
+  }
+
   function peerConnections() {
     const engine = room?.engine;
     // livekit-client 2.21 exposes PCTransport instances here. Their public
@@ -76,13 +90,16 @@
   $("join-form").addEventListener("submit", async (event) => {
     event.preventDefault();
     if (room) return;
+    let url;
+    try { url = assertSpikeUrl($("url").value.trim()); }
+    catch (error) { state.errors.push(String(error)); write(); setStatus(`Join blocked: ${error}`); return; }
     setStatus("Requesting camera and microphone…");
     try {
       room = new Room({ adaptiveStream: false, dynacast: false });
       room.on("trackSubscribed", (track) => {
         if (track.kind === "audio") state.remoteTrackEvents.push({ at: new Date().toISOString(), kind: "audio" });
       });
-      await room.connect($("url").value.trim(), $("token").value.trim());
+      await room.connect(url, $("token").value.trim());
       const mic = await createLocalAudioTrack();
       const camera = await createLocalVideoTrack({ resolution: { width: 640, height: 360, frameRate: 15 }, videoEncoding: { maxBitrate: 500_000, maxFramerate: 15 } });
       tracks = [mic, camera];

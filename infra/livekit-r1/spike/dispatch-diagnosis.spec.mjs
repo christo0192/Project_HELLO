@@ -8,14 +8,16 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createRequire } from 'node:module';
+import { assertSpikeUrl } from './spike-host.mjs';
 
 const execFileAsync = promisify(execFile);
 const spikeDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(spikeDir, '../../..');
 const apiDir = resolve(root, 'app/api');
+const url = 'wss://project-hello-r1-rtc-spike.fly.dev';
+assertSpikeUrl(url);
 const require = createRequire(new URL('../../../app/api/package.json', import.meta.url));
 const { RoomServiceClient } = require('livekit-server-sdk');
-const url = 'wss://project-hello-r1-rtc-spike.fly.dev';
 const workerLog = process.env.R1_SPIKE_WORKER_LOG;
 const workerStartedAtMs = Number(process.env.R1_SPIKE_WORKER_STARTED_MS || 0);
 const cycleCount = Number(process.env.R1_SPIKE_CYCLE_COUNT || 10);

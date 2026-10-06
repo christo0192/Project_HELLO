@@ -3,18 +3,12 @@
 import asyncio
 import logging
 import os
-from urllib.parse import urlparse
 
 from livekit import agents, rtc
+from spike_host import assert_spike_url
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("r1-s0e")
-
-
-def assert_spike_url() -> None:
-    host = (urlparse(os.environ.get("LIVEKIT_URL", "")).hostname or "").lower()
-    if not host.endswith("-r1-rtc-spike.fly.dev"):
-        raise RuntimeError("S0-E is restricted to the disposable spike host")
 
 
 def request_low_video_quality(publication: rtc.RemoteTrackPublication) -> None:
@@ -89,6 +83,7 @@ async def accept_job(request: agents.JobRequest) -> None:
 
 def worker_options() -> agents.WorkerOptions:
     """Build the disposable worker with the same explicit diagnostic override as S0-F."""
+    assert_spike_url(os.environ.get("LIVEKIT_URL", ""))
     options: dict[str, object] = {
         "entrypoint_fnc": entrypoint,
         "request_fnc": accept_job,
@@ -110,5 +105,4 @@ def worker_options() -> agents.WorkerOptions:
 
 
 if __name__ == "__main__":
-    assert_spike_url()
     agents.cli.run_app(worker_options())

@@ -6,6 +6,7 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { assertSpikeUrl } from './spike-host.mjs';
 
 
 const execFileAsync = promisify(execFile);
@@ -13,6 +14,7 @@ const spikeDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(spikeDir, '../../..');
 const apiDir = resolve(root, 'app/api');
 const url = 'wss://project-hello-r1-rtc-spike.fly.dev';
+assertSpikeUrl(url);
 const server = createServer(async (req, res) => {
   if (req.url !== '/' && req.url !== '/index.html') { res.writeHead(404); return res.end(); }
   res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });

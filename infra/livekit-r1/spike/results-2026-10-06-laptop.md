@@ -5,7 +5,7 @@
 - Run window: 2026-10-06 approximately 08:29–08:46 UTC.
 - Device: Windows 11 Pro 64-bit (10.0.26200), headless Chromium 153.0.8010.12 via Playwright 1.63.0.
 - Media: Chromium fake camera and microphone, requested at 640×360 @ 15 fps; page served from localhost.
-- Network: Indian home broadband; `ipinfo.io/org` reported AS24309, Atria Convergence Technologies Pvt. Ltd. Broadband Internet Service Provider INDIA.
+- Network: Indian residential fibre broadband.
 - Endpoint: disposable spike SFU only, `wss://project-hello-r1-rtc-spike.fly.dev` / dedicated IP 37.16.23.137. No Fly/SFU or firewall changes were made.
 
 ## Results
@@ -34,7 +34,7 @@ Not covered by this laptop spike: the wider field matrix, 4G/mobile networks, co
 ## Config B rerun
 
 - Run window: 2026-10-06 approximately 08:45-09:10 UTC.
-- Server configuration under test: UDP bound to Fly global-services `172.19.46.243:7882`, advertised as `37.16.23.137:7882`; receive buffers set to 5 MB. No Fly/SFU configuration or firewall change, commit, or push was made for this run.
+- Server configuration under test: UDP bound internally and advertised as `37.16.23.137:7882`; receive buffers set to 5 MB. No Fly/SFU configuration or firewall change, commit, or push was made for this run.
 - Same laptop/browser/media setup as above. The isolated `.spike-venv` was reused. The worker was stopped after the checks.
 
 | Check | Attempts | Measurements | Result |

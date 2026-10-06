@@ -7,9 +7,7 @@
  * Optional: R1_SPIKE_ROOM (default r1-spike-<timestamp>).
  */
 import { createRequire } from "node:module";
-
-const require = createRequire(new URL("../../../app/api/package.json", import.meta.url));
-const { AccessToken, RoomServiceClient, AgentDispatchClient, TrackSource } = require("livekit-server-sdk");
+import { assertSpikeUrl } from "./spike-host.mjs";
 
 const required = (name) => {
   const value = process.env[name];
@@ -18,21 +16,12 @@ const required = (name) => {
 };
 
 const url = required("R1_SPIKE_URL");
+assertSpikeUrl(url);
 const apiKey = required("R1_SPIKE_API_KEY");
 const apiSecret = required("R1_SPIKE_API_SECRET");
 const room = process.env.R1_SPIKE_ROOM || `r1-spike-${Date.now()}`;
-
-function assertSpikeUrl(value) {
-  let host;
-  try { host = new URL(value).hostname.toLowerCase(); }
-  catch { throw new Error("R1_SPIKE_URL must be an absolute URL"); }
-  const allowed = process.env.R1_SPIKE_ALLOWED_HOST?.toLowerCase();
-  const isFlySpike = /^[a-z0-9-]+-r1-rtc-spike\.fly\.dev$/.test(host);
-  if (host.endsWith(".livekit.cloud") || host === "project-hello-r1-rtc.fly.dev" || (!isFlySpike && host !== allowed)) {
-    throw new Error(`R1_SPIKE_URL host is not an approved disposable spike host: ${host}`);
-  }
-}
-assertSpikeUrl(url);
+const require = createRequire(new URL("../../../app/api/package.json", import.meta.url));
+const { AccessToken, RoomServiceClient, AgentDispatchClient, TrackSource } = require("livekit-server-sdk");
 
 function candidateToken() {
   const accessToken = new AccessToken(apiKey, apiSecret, { identity: "r1-spike-candidate", name: "S0-F candidate", ttl: "15m" });

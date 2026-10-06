@@ -35,7 +35,12 @@ const goodTemplate = readFileSync(path.join(source, "livekit.yaml.tmpl"), "utf8"
 const readme = readFileSync(path.join(source, "README.md"), "utf8");
 const page = readFileSync(path.join(source, "spike/index.html"), "utf8");
 const mint = readFileSync(path.join(source, "spike/mint-token.mjs"), "utf8");
+const coldDispatch = readFileSync(path.join(source, "spike/cold-dispatch-diagnosis.mjs"), "utf8");
+const dispatchDiagnosis = readFileSync(path.join(source, "spike/dispatch-diagnosis.spec.mjs"), "utf8");
+const laptopCheck = readFileSync(path.join(source, "spike/laptop-check.spec.mjs"), "utf8");
 const echo = readFileSync(path.join(source, "spike/echo_agent.py"), "utf8");
+const s0eAgent = readFileSync(path.join(source, "spike/s0e_agent.py"), "utf8");
+const spikeHost = readFileSync(path.join(source, "spike/spike-host.mjs"), "utf8");
 const results = readFileSync(path.join(source, "spike/results-template.md"), "utf8");
 ok(/fly apps create/.test(readme) && /fly ips allocate-v4/.test(readme) && /openssl rand/.test(readme) && /fly deploy infra\/livekit-r1 --ha=false --remote-only -a project-hello-r1-rtc-spike/.test(readme), "runbook must cover spike app, dedicated IPv4, generated keys, and the scoped remote single-Machine deploy");
 ok(/ss -ulpn/.test(readme) && /lk token create/.test(readme) && /fly ips release/.test(readme), "runbook must cover S0-F1 socket proof, lk tokens, and IPv4 teardown");
@@ -51,8 +56,9 @@ ok(/cdn\.jsdelivr\.net\/npm\/livekit-client/.test(page) && /URLSearchParams/.tes
 ok(/width: 640, height: 360, frameRate: 15/.test(page) && /simulcast: false/.test(page) && /maxBitrate: 500_000/.test(page), "spike page must publish the prescribed 640x360/15fps, no-simulcast, 500k video");
 ok(/manager\?\.publisher/.test(page) && /manager\?\.subscriber/.test(page) && /getStats\(\)/.test(page) && /NO-GO: no selected UDP/.test(page) && /setInterval\(.*5_000/.test(page) && /currentRoundTripTime/.test(page) && /jitter/.test(page) && /packetsLost/.test(page) && /framesPerSecond/.test(page) && /qualityLimitation/.test(page), "spike page must sample public PCTransport stats and mark a missing selected UDP pair NO-GO");
 ok(/RoomServiceClient/.test(mint) && /AgentDispatchClient/.test(mint) && /createRoom/.test(mint) && /createDispatch/.test(mint) && /canPublishSources/.test(mint) && /canPublishData: false/.test(mint) && !/r1-spike-agent/.test(mint), "mint helper must create a room, dispatch r1-spike, and mint only a least-privilege candidate token");
-ok(/agent_name="r1-spike"/.test(echo) && /AudioStream/.test(echo) && /capture_frame/.test(echo) && /participant_disconnected/.test(echo) && /await candidate_left/.test(echo) && /await source\.aclose\(\)/.test(echo), "echo worker must return subscribed audio until the candidate disconnects, then close its source");
-ok(/R1_SPIKE_ALLOWED_HOST/.test(mint) && /livekit\.cloud/.test(mint) && /R1_SPIKE_ALLOWED_HOST/.test(echo) && /livekit\.cloud/.test(echo), "spike helpers must hard-fence disposable hosts and refuse Cloud");
+ok(/agent_name(?:=|"\s*:\s*)"r1-spike"/.test(echo) && /AudioStream/.test(echo) && /capture_frame/.test(echo) && /participant_disconnected/.test(echo) && /await candidate_left/.test(echo) && /await source\.aclose\(\)/.test(echo), "echo worker must return subscribed audio until the candidate disconnects, then close its source");
+const spikeTools = [mint, coldDispatch, dispatchDiagnosis, laptopCheck, echo, s0eAgent];
+ok(spikeTools.every((tool) => /assertSpikeUrl|assert_spike_url/.test(tool)) && /SPIKE_HOST/.test(spikeHost) && /project-hello-r1-rtc-spike\.fly\.dev/.test(spikeHost), "all spike tools must use the shared exact-host fence without an environment override");
 ok(!/(?:browser-screener|phone-screener)/.test(echo), "echo worker must never use a production agent name");
 ok(/≥98%/.test(results) && /≥90%/.test(results) && /≤200ms/.test(results) && /≥12fps/.test(results) && /NO-GO/.test(results), "results template must preserve v2 S0-F pass thresholds and kill switch");
 const cases = [

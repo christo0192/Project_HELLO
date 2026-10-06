@@ -9,6 +9,20 @@
   const write = () => document.querySelector('#state').textContent = JSON.stringify(state);
   let room, mic, camera;
 
+  const assertSpikeUrl = (value) => {
+    let parsed;
+    try { parsed = new URL(value); }
+    catch { throw new Error('LiveKit URL must be an absolute wss:// or https:// URL.'); }
+    const authority = value.match(/^[a-z][a-z0-9+.-]*:\/\/([^/?#]*)/i)?.[1] || '';
+    const authorityHost = authority.slice(authority.lastIndexOf('@') + 1);
+    if (!['wss:', 'https:'].includes(parsed.protocol)
+      || parsed.hostname.toLowerCase() !== 'project-hello-r1-rtc-spike.fly.dev'
+      || parsed.username || parsed.password || parsed.port || authorityHost.includes(':')) {
+      throw new Error('LiveKit URL must use the approved disposable spike host without credentials or a port.');
+    }
+    return parsed.href;
+  };
+
   const videoStats = async () => {
     const report = await room?.engine?.pcManager?.publisher?.getStats?.();
     if (!report) return [];
@@ -20,6 +34,8 @@
 
   window.s0e = {
     async connect(url, token) {
+      try { url = assertSpikeUrl(url); }
+      catch (error) { state.status = 'error'; state.errors.push(String(error)); write(); throw error; }
       room = new Room({ adaptiveStream: false, dynacast: false });
       room.on(RoomEvent.ParticipantAttributesChanged, (changed, participant) => {
         state.attributes.push({ identity: participant.identity, changed }); write();

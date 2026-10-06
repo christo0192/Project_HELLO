@@ -6,12 +6,10 @@ import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
+import { assertSpikeUrl } from './spike-host.mjs';
 
 const spikeDir = dirname(fileURLToPath(import.meta.url));
 const root = resolve(spikeDir, '../../..');
-const require = createRequire(new URL('../../../app/api/package.json', import.meta.url));
-const { AccessToken, RoomServiceClient, AgentDispatchClient, TrackSource } = require('livekit-server-sdk');
-const { chromium } = require('playwright');
 const url = process.env.R1_SPIKE_URL;
 const apiKey = process.env.R1_SPIKE_API_KEY;
 const apiSecret = process.env.R1_SPIKE_API_SECRET;
@@ -21,6 +19,10 @@ const resultFile = process.env.R1_SPIKE_RESULT_FILE || 's0-f3-cold-config-b-sani
 const probeTimeoutMs = Number(process.env.R1_SPIKE_CYCLE_TIMEOUT_MS || 30000);
 if (!url || !apiKey || !apiSecret || !workerLog || !workerStartedAtMs) throw new Error('missing required diagnostic environment');
 if (!Number.isInteger(probeTimeoutMs) || probeTimeoutMs < 1000 || probeTimeoutMs > 30000) throw new Error('invalid R1_SPIKE_CYCLE_TIMEOUT_MS');
+assertSpikeUrl(url);
+const require = createRequire(new URL('../../../app/api/package.json', import.meta.url));
+const { AccessToken, RoomServiceClient, AgentDispatchClient, TrackSource } = require('livekit-server-sdk');
+const { chromium } = require('playwright');
 
 const room = `r1-spike-cold-${Date.now()}`;
 const candidateIdentity = 'r1-spike-candidate';

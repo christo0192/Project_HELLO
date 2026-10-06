@@ -4,23 +4,12 @@
 import asyncio
 import logging
 import os
-from urllib.parse import urlparse
 
 from livekit import agents, rtc
+from spike_host import assert_spike_url
 
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger("r1-spike")
-
-
-def assert_spike_url() -> None:
-    """Refuse Cloud, production, and any endpoint outside this disposable app."""
-    value = os.environ.get("LIVEKIT_URL", "")
-    host = (urlparse(value).hostname or "").lower()
-    allowed = os.environ.get("R1_SPIKE_ALLOWED_HOST", "").lower()
-    suffix = "-r1-rtc-spike.fly.dev"
-    is_fly_spike = host.endswith(suffix) and host[:-len(suffix)].replace("-", "").isalnum()
-    if not host or host.endswith(".livekit.cloud") or host == "project-hello-r1-rtc.fly.dev" or (not is_fly_spike and host != allowed):
-        raise RuntimeError(f"LIVEKIT_URL is not an approved disposable spike host: {host or '<missing>'}")
 
 
 async def echo_track(track: rtc.Track, source: rtc.AudioSource) -> None:
@@ -101,6 +90,7 @@ async def accept_job(request: agents.JobRequest) -> None:
 
 def worker_options() -> agents.WorkerOptions:
     """Build disposable-worker options, including the explicit load experiment."""
+    assert_spike_url(os.environ.get("LIVEKIT_URL", ""))
     options: dict[str, object] = {
         "entrypoint_fnc": entrypoint,
         "request_fnc": accept_job,
@@ -123,5 +113,4 @@ def worker_options() -> agents.WorkerOptions:
 
 
 if __name__ == "__main__":
-    assert_spike_url()
     agents.cli.run_app(worker_options())
