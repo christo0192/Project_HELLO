@@ -164,7 +164,8 @@ begin
   res := screening_v2.r1_admit_attempt(round_a, repeat('e', 64));
   sid := (res->>'session_id')::uuid;
   perform _r1_tests.assert('counted retake receives a different persona', res->>'status' = 'ok' and
-    (select persona_id from screening_v2.interview_round_attempts where session_id = sid) <> first_persona);
+    (select persona_id from screening_v2.interview_round_attempts where session_id = sid) <> first_persona and
+    (select hold_month = date_trunc('month',now())::date from screening_v2.interview_rounds where id=round_a));
 
   update screening_v2.r1_settings set paused = true;
   perform _r1_tests.assert('pause refuses admission',
@@ -332,6 +333,32 @@ begin
   -- The view must include sessions with no usage row (session-timestamp fallback).
   perform _r1_tests.assert('estimate has session timestamp fallback', exists(select 1 from screening_v2.v_webrtc_minutes_estimate where month_start=date_trunc('month',now())::date));
   perform _r1_tests.assert('ledger has required idempotency and upper-bound constraints', exists(select 1 from pg_constraint where conrelid='screening_v2.r1_usage_ledger'::regclass and conname='chk_r1_usage_event_bounds') and exists(select 1 from pg_indexes where schemaname='screening_v2' and indexname='uq_r1_usage_ledger_session_event_key'));
+end;
+$$;
+
+-- A hold belongs to its originating budget month.  A February cancellation of
+-- a January Send must release January and must not create or touch February.
+do $$
+declare
+  owner constant uuid := '10000000-0000-4000-8000-000000000001';
+  role_r1 constant uuid := '10000000-0000-4000-8000-000000000002';
+  candidate constant uuid := '10000000-0000-4000-8000-000000000082';
+  month_m constant date := '2030-01-01';
+  month_next constant date := '2030-02-01';
+  sent jsonb; rid uuid; version_before integer;
+begin
+  insert into screening_v2.candidates(id,role_id,name) values(candidate,role_r1,'cross-month hold assertion');
+  update screening_v2.r1_settings set enabled=true,paused=false,livekit_target='r1',monthly_cap_minutes=10000,pause_line_minutes=10000,dashboard_minutes=0,dashboard_read_at='2030-01-01T00:00:00Z';
+  sent := screening_v2.r1_send_round(candidate,role_r1,owner,repeat('9',64),null,'2030-01-20T00:00:00Z','2030-01-15T00:00:00Z');
+  rid := (sent->>'id')::uuid;
+  select version into version_before from screening_v2.interview_rounds where id=rid;
+  perform _r1_tests.assert('Send persists the hold originating month',
+    sent->>'status'='ok' and (select held_minutes=55 and hold_month=month_m from screening_v2.interview_rounds where id=rid), sent::text);
+  perform screening_v2.r1_transition_round(rid,'cancel',version_before,null,null,'2030-02-02T00:00:00Z');
+  perform _r1_tests.assert('cross-month cancel releases only the originating month',
+    (select held_minutes=0 from screening_v2.interview_rounds where id=rid)
+    and (select minutes_reserved=0 from screening_v2.r1_budget_month where month_start=month_m)
+    and not exists(select 1 from screening_v2.r1_budget_month where month_start=month_next));
 end;
 $$;
 

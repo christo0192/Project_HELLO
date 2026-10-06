@@ -63,6 +63,21 @@ describe('legacy paths fence R1 sessions', () => {
     expect(worker.body).toEqual({ error: 'r1_session' });
   });
 
+  it('maps an indeterminate scorer fence to 503 for recruiter and worker callers', async () => {
+    mocks.runner.mockRejectedValue(new Error('ERR_R1_FENCE_UNAVAILABLE'));
+    const app = express();
+    app.use(express.json());
+    app.use((req, _res, next) => { (req as any).authUser = { id: 'admin', appRole: 'admin' }; next(); });
+    app.use('/api/assess', assessRouter);
+    app.use('/api/internal/assess', workerAssessRouter);
+    const recruiter = await request(app).post(`/api/assess/${SESSION}`);
+    expect(recruiter.status).toBe(503);
+    expect(recruiter.body).toEqual({ error: 'service_unavailable' });
+    const worker = await request(app).post(`/api/internal/assess/${SESSION}`).set('authorization', `Bearer ${SECRET}`);
+    expect(worker.status).toBe(503);
+    expect(worker.body).toEqual({ error: 'service_unavailable' });
+  });
+
   it('does not turn an ordinary phone/legacy result into r1_session', async () => {
     mocks.from.mockImplementation(() => r1SessionQuery(null));
     mocks.runner.mockResolvedValue({ id: 'legacy-assessment' });

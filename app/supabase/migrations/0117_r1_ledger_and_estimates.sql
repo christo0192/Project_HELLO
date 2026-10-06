@@ -74,6 +74,13 @@ grant select on screening_v2.v_webrtc_minutes_estimate, screening_v2.v_r1_budget
 alter table screening_v2.interview_rounds
   add column if not exists held_minutes numeric(10,2) not null default 0
   check (held_minutes in (0, 55));
+-- Holds are charged to the month in which they were created, not the month
+-- in which a later cancellation, expiry, or admission happens.
+alter table screening_v2.interview_rounds
+  add column if not exists hold_month date;
+alter table screening_v2.interview_rounds
+  add constraint chk_interview_round_hold_month
+  check (held_minutes = 0 or hold_month is not null);
 alter table screening_v2.r1_usage_ledger
   add column if not exists event_key text;
 update screening_v2.r1_usage_ledger set event_key = id::text where event_key is null;
@@ -140,35 +147,62 @@ begin
   select coalesce(e.r1_minutes + e.phone_minutes + e.legacy_browser_minutes,0) into v_pure from screening_v2.v_webrtc_minutes_estimate e where e.month_start=v_month;
   v_guard := greatest(v_settings.dashboard_minutes + v_ledger_since, v_pure) * 1.15;
   if greatest(v_budget.minutes_used + v_budget.minutes_reserved, v_guard) + 55 > least(v_settings.monthly_cap_minutes,v_settings.pause_line_minutes) then return jsonb_build_object('status','capacity_exhausted'); end if;
-  insert into screening_v2.interview_rounds(id,candidate_id,role_id,kind,link_token_digest,expires_at,candidate_status_at_send,created_by,held_minutes) values(v_round,p_candidate_id,p_role_id,'sales_r1',p_link_token_digest,p_expires_at,p_candidate_status_at_send,p_created_by,55);
+  insert into screening_v2.interview_rounds(id,candidate_id,role_id,kind,link_token_digest,expires_at,candidate_status_at_send,created_by,held_minutes,hold_month) values(v_round,p_candidate_id,p_role_id,'sales_r1',p_link_token_digest,p_expires_at,p_candidate_status_at_send,p_created_by,55,v_month);
   update screening_v2.r1_budget_month set minutes_reserved=minutes_reserved+55,updated_at=p_now where month_start=v_month;
   return jsonb_build_object('status','ok','id',v_round,'round_status','invited','expires_at',p_expires_at);
 end; $$;
 
 create or replace function screening_v2.r1_release_round_hold(p_round_id uuid, p_now timestamptz default now())
 returns jsonb language plpgsql security definer set search_path = pg_catalog, screening_v2 as $$
-declare v_round screening_v2.interview_rounds%rowtype; v_month date := date_trunc('month',p_now)::date;
+declare v_settings screening_v2.r1_settings%rowtype; v_round screening_v2.interview_rounds%rowtype;
+  v_hold_minutes numeric; v_hold_month date;
 begin
-  select * into v_round from screening_v2.interview_rounds where id=p_round_id for update;
+  -- Capacity writers always take settings -> hold month -> round.  Read the
+  -- immutable hold metadata before taking the later locks; settings serializes
+  -- all writers that can change it.
+  select * into v_settings from screening_v2.r1_settings where singleton for update;
+  select held_minutes, hold_month into v_hold_minutes, v_hold_month
+    from screening_v2.interview_rounds where id=p_round_id;
   if not found then return jsonb_build_object('status','round_not_found'); end if;
+  if v_hold_minutes > 0 then
+    if v_hold_month is null then return jsonb_build_object('status','hold_month_missing'); end if;
+    perform 1 from screening_v2.r1_budget_month where month_start=v_hold_month for update;
+    if not found then return jsonb_build_object('status','hold_month_missing'); end if;
+  end if;
+  select * into v_round from screening_v2.interview_rounds where id=p_round_id for update;
   if v_round.held_minutes = 0 then return jsonb_build_object('status','ok','released',0); end if;
-  insert into screening_v2.r1_budget_month(month_start) values(v_month) on conflict do nothing;
-  perform 1 from screening_v2.r1_budget_month where month_start=v_month for update;
-  update screening_v2.r1_budget_month set minutes_reserved=greatest(0,minutes_reserved-v_round.held_minutes),updated_at=p_now where month_start=v_month;
+  -- The month is persisted at hold creation; p_now is deliberately irrelevant.
+  update screening_v2.r1_budget_month set minutes_reserved=greatest(0,minutes_reserved-v_round.held_minutes),updated_at=p_now where month_start=v_round.hold_month;
   update screening_v2.interview_rounds set held_minutes=0,updated_at=p_now where id=p_round_id;
   return jsonb_build_object('status','ok','released',v_round.held_minutes);
 end; $$;
 
 create or replace function screening_v2.r1_transition_round(p_round_id uuid,p_action text,p_expected_version integer,p_link_token_digest text default null,p_expires_at timestamptz default null,p_now timestamptz default now())
 returns jsonb language plpgsql security definer set search_path = pg_catalog, screening_v2 as $$
-declare v screening_v2.interview_rounds%rowtype;
+declare v_settings screening_v2.r1_settings%rowtype; v screening_v2.interview_rounds%rowtype;
+  v_hold_minutes numeric; v_hold_month date;
 begin
+ -- This includes cancel and expiry, which release capacity.  Do not take the
+ -- round lock first: admission takes settings -> budget -> round.
+ select * into v_settings from screening_v2.r1_settings where singleton for update;
+ select held_minutes, hold_month into v_hold_minutes, v_hold_month
+   from screening_v2.interview_rounds where id=p_round_id;
+ if not found then return jsonb_build_object('status','version_conflict'); end if;
+ if v_hold_minutes > 0 then
+   if v_hold_month is null then return jsonb_build_object('status','hold_month_missing'); end if;
+   perform 1 from screening_v2.r1_budget_month where month_start=v_hold_month for update;
+   if not found then return jsonb_build_object('status','hold_month_missing'); end if;
+ end if;
  select * into v from screening_v2.interview_rounds where id=p_round_id for update;
  if not found or v.version <> p_expected_version then return jsonb_build_object('status','version_conflict'); end if;
- if p_action='cancel' then
+ if p_action in ('cancel','expire') then
    if v.status in ('completed','expired','cancelled') then return jsonb_build_object('status','round_terminal'); end if;
-   update screening_v2.interview_rounds set status='cancelled',version=version+1,updated_at=p_now where id=v.id;
-   perform screening_v2.r1_release_round_hold(v.id,p_now); return jsonb_build_object('status','ok');
+   update screening_v2.interview_rounds set status=case when p_action='cancel' then 'cancelled' else 'expired' end,version=version+1,updated_at=p_now where id=v.id;
+   if v.held_minutes > 0 then
+     update screening_v2.r1_budget_month set minutes_reserved=greatest(0,minutes_reserved-v.held_minutes),updated_at=p_now where month_start=v.hold_month;
+     update screening_v2.interview_rounds set held_minutes=0,updated_at=p_now where id=v.id;
+   end if;
+   return jsonb_build_object('status','ok');
  end if;
  if p_action='reissue' then
    if v.status <> 'invited' or p_link_token_digest is null or p_expires_at <= p_now then return jsonb_build_object('status','round_terminal'); end if;
@@ -199,11 +233,14 @@ end; $$;
 
 create or replace function screening_v2.r1_sweep_expired_rounds(p_now timestamptz default now(),p_limit integer default 100)
 returns integer language plpgsql security definer set search_path = pg_catalog, screening_v2 as $$
-declare r record; n integer:=0;
+declare v_settings screening_v2.r1_settings%rowtype; r record; v_result jsonb; n integer:=0;
 begin
- for r in select id from screening_v2.interview_rounds where status='invited' and expires_at<=p_now order by expires_at limit greatest(1,least(p_limit,1000)) for update skip locked loop
-   update screening_v2.interview_rounds set status='expired',version=version+1,updated_at=p_now where id=r.id;
-   perform screening_v2.r1_release_round_hold(r.id,p_now); n:=n+1;
+ -- Do not lock rounds in the scan.  Each transition below takes settings ->
+ -- originating month -> round, matching admission and Send.
+ select * into v_settings from screening_v2.r1_settings where singleton for update;
+ for r in select id,version from screening_v2.interview_rounds where status='invited' and expires_at<=p_now order by expires_at limit greatest(1,least(p_limit,1000)) loop
+   v_result := screening_v2.r1_transition_round(r.id,'expire',r.version,null,null,p_now);
+   if v_result->>'status' = 'ok' then n:=n+1; end if;
  end loop; return n;
 end; $$;
 
@@ -213,15 +250,21 @@ end; $$;
 create or replace function screening_v2.r1_admit_attempt(p_round_id uuid,p_nonce_digest text,p_now timestamptz default now())
 returns jsonb language plpgsql security definer set search_path = pg_catalog, screening_v2 as $$
 declare v_round screening_v2.interview_rounds%rowtype; v_settings screening_v2.r1_settings%rowtype; v_budget screening_v2.r1_budget_month%rowtype;
- v_month date:=date_trunc('month',p_now)::date; v_attempt integer; v_persona text; v_session uuid:=gen_random_uuid(); v_hold numeric:=55;
+ v_month date:=date_trunc('month',p_now)::date; v_hold_month date; v_existing_hold numeric; v_attempt integer; v_persona text; v_session uuid:=gen_random_uuid(); v_hold numeric:=55;
  v_ledger_since numeric:=0; v_pure numeric:=0; v_guard numeric:=0; v_live_r1 integer; v_live_phone integer;
 begin
  if p_nonce_digest is null or p_nonce_digest !~ '^[a-f0-9]{64}$' then return jsonb_build_object('status','invalid_nonce'); end if;
  select * into v_settings from screening_v2.r1_settings where singleton for update;
  if not found or not v_settings.enabled then return jsonb_build_object('status','disabled'); end if;
  if v_settings.paused then return jsonb_build_object('status','paused'); end if;
- insert into screening_v2.r1_budget_month(month_start) values(v_month) on conflict do nothing;
- select * into v_budget from screening_v2.r1_budget_month where month_start=v_month for update;
+ -- Determine the immutable originating month before the budget/round locks.
+ -- A retake creates its short-lived hold at admission, so its origin is now.
+ select held_minutes, hold_month into v_existing_hold, v_hold_month from screening_v2.interview_rounds where id=p_round_id;
+ if not found then return jsonb_build_object('status','round_not_found'); end if;
+ if v_existing_hold = 0 then v_hold_month:=v_month;
+ elsif v_hold_month is null then return jsonb_build_object('status','hold_month_missing'); end if;
+ insert into screening_v2.r1_budget_month(month_start) values(v_hold_month) on conflict do nothing;
+ select * into v_budget from screening_v2.r1_budget_month where month_start=v_hold_month for update;
  select * into v_round from screening_v2.interview_rounds where id=p_round_id for update;
  if not found then return jsonb_build_object('status','round_not_found'); end if;
  if v_round.status not in ('invited','in_progress') then return jsonb_build_object('status','round_not_admissible'); end if;
@@ -238,9 +281,9 @@ begin
    select coalesce(r1_minutes+phone_minutes+legacy_browser_minutes,0) into v_pure from screening_v2.v_webrtc_minutes_estimate where month_start=v_month;
    v_guard:=greatest(v_settings.dashboard_minutes+v_ledger_since,v_pure)*1.15;
    if greatest(v_budget.minutes_used+v_budget.minutes_reserved,v_guard)+v_hold>least(v_settings.monthly_cap_minutes,v_settings.pause_line_minutes) then return jsonb_build_object('status','capacity_exhausted'); end if;
-   update screening_v2.r1_budget_month set minutes_used=minutes_used+v_hold,starts_admitted=starts_admitted+1,updated_at=p_now where month_start=v_month;
+   update screening_v2.r1_budget_month set minutes_used=minutes_used+v_hold,starts_admitted=starts_admitted+1,updated_at=p_now where month_start=v_hold_month;
  else
-   update screening_v2.r1_budget_month set minutes_reserved=greatest(0,minutes_reserved-v_round.held_minutes),minutes_used=minutes_used+v_round.held_minutes,starts_admitted=starts_admitted+1,updated_at=p_now where month_start=v_month;
+   update screening_v2.r1_budget_month set minutes_reserved=greatest(0,minutes_reserved-v_round.held_minutes),minutes_used=minutes_used+v_round.held_minutes,starts_admitted=starts_admitted+1,updated_at=p_now where month_start=v_hold_month;
    update screening_v2.interview_rounds set held_minutes=0 where id=v_round.id;
  end if;
  v_attempt:=v_round.attempts_counted+1;
@@ -248,7 +291,7 @@ begin
  if v_persona is null then select p.persona_id into v_persona from unnest(array['p1_career_switcher','p2_recent_grad','p3_data_analyst','p4_research_scholar']) p(persona_id) where not exists(select 1 from screening_v2.interview_round_attempts prior where prior.round_id=v_round.id and prior.counted and prior.persona_id=p.persona_id) order by random() limit 1; end if;
  insert into screening_v2.call_sessions(id,candidate_id,role_id,mode,provider,external_call_id,status,interview_round_id,owner_id) values(v_session,v_round.candidate_id,v_round.role_id,'browser','livekit','screening-'||v_session::text,'created',v_round.id,v_round.created_by);
  insert into screening_v2.interview_round_attempts(session_id,round_id,attempt_number,persona_id,nonce_digest) values(v_session,v_round.id,v_attempt,v_persona,p_nonce_digest);
- update screening_v2.interview_rounds set starts_used=starts_used+1,status='in_progress',version=version+1,updated_at=p_now where id=v_round.id;
+ update screening_v2.interview_rounds set starts_used=starts_used+1,status='in_progress',version=version+1,hold_month=case when v_round.held_minutes=0 then v_hold_month else hold_month end,updated_at=p_now where id=v_round.id;
  return jsonb_build_object('status','ok','session_id',v_session,'attempt_number',v_attempt,'persona_id',v_persona);
 end; $$;
 

@@ -327,6 +327,15 @@ describe('VOI-08 assessment eligibility preflight', () => {
     expect(fromCalls('transcript_turns')).toBe(0);
     expect(fromCalls('assessments')).toBe(0);
 
+    // Only PGRST116 is a known zero-row response. An arbitrary database
+    // error that happens to say "not found" remains indeterminate.
+    resetTracking();
+    configureTable('call_sessions', { data: null, error: { message: 'relation not found during fence lookup' } });
+    await expect(runAssessment(SESSION_ID)).rejects.toThrow(/ERR_R1_FENCE_UNAVAILABLE/);
+    expect(runClaudeJSONWithProvenance).not.toHaveBeenCalled();
+    expect(fromCalls('transcript_turns')).toBe(0);
+    expect(fromCalls('assessments')).toBe(0);
+
     // Null session case
     resetTracking();
     configureTable('call_sessions', ok(null));

@@ -165,7 +165,7 @@ async function runAssessmentImpl(
   // PostgREST represents a missing .single() row as PGRST116.  That remains
   // the established not-found outcome; every other lookup failure is an
   // indeterminate R1 fence and must fail closed.
-  if (sErr && (sErr as any).code !== 'PGRST116' && !/not found/i.test(sErr.message ?? '')) throw new Error(ERR_R1_FENCE_UNAVAILABLE);
+  if (sErr && (sErr as any).code !== 'PGRST116') throw new Error(ERR_R1_FENCE_UNAVAILABLE);
   if (!session) throw new Error('session not found');
   if (session.interview_round_id) throw new Error('r1_session');
 
