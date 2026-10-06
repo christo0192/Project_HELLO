@@ -526,10 +526,14 @@ export function createAshbyMissionControlRouter(deps: AshbyMissionControlDeps = 
     }
     // The database trigger is authoritative; this early check gives the admin
     // a stable, useful 400 instead of surfacing a constraint violation.
-    const { data: mappedRole, error: mappedRoleError } = await supabase
-      .from('roles').select('interview_kind').eq('id', roleId).maybeSingle();
-    if (mappedRoleError || !mappedRole) { res.status(400).json({ ok: false, error: 'invalid_role_id' }); return; }
-    if (mappedRole.interview_kind) { res.status(400).json({ ok: false, error: 'r1_role_not_mappable' }); return; }
+    let mappedRole: Awaited<ReturnType<MissionControlStore['roleInterviewKind']>>;
+    try {
+      mappedRole = await store().roleInterviewKind(roleId);
+    } catch {
+      res.status(400).json({ ok: false, error: 'invalid_role_id' }); return;
+    }
+    if (!mappedRole) { res.status(400).json({ ok: false, error: 'invalid_role_id' }); return; }
+    if (mappedRole.interviewKind) { res.status(400).json({ ok: false, error: 'r1_role_not_mappable' }); return; }
     const ownerId = typeof body.owner_id === 'string' && UUID_RE.test(body.owner_id)
       ? body.owner_id
       : actorId;

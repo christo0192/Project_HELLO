@@ -109,6 +109,7 @@ describe('previewScorecardBinding', () => {
 
 function fakeStore(): MissionControlStore {
   return {
+    roleInterviewKind: async () => ({ interviewKind: null }),
     listMappings: async () => [], listWorkflows: async () => [],
     setMappingStatus: async () => ({ status: 'ok', mappingStatus: 'paused' }),
     cancelApplication: async () => ({ status: 'ok', cancelledOperations: 0, cancelledIngestion: 0 }),

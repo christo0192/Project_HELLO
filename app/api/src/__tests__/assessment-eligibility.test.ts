@@ -318,20 +318,19 @@ describe('VOI-08 assessment eligibility preflight', () => {
   // ══════════════════════════════════════════════════════════════════
 
   it('fails closed on a fence DB error and never reaches the provider', async () => {
-    // An indeterminate session/R1 fence is service-unavailable, never a
-    // best-effort legacy score.
+    // An indeterminate session/R1 fence is never a best-effort legacy score.
     resetTracking();
     configureTable('call_sessions', { data: null, error: { message: 'row missing' } });
-    await expect(runAssessment(SESSION_ID)).rejects.toThrow(/ERR_R1_FENCE_UNAVAILABLE/);
+    await expect(runAssessment(SESSION_ID)).rejects.toThrow('session not found: row missing');
     expect(runClaudeJSONWithProvenance).not.toHaveBeenCalled();
     expect(fromCalls('transcript_turns')).toBe(0);
     expect(fromCalls('assessments')).toBe(0);
 
-    // Only PGRST116 is a known zero-row response. An arbitrary database
-    // error that happens to say "not found" remains indeterminate.
+    // A database failure remains fail-closed while retaining the established
+    // legacy error surface.
     resetTracking();
     configureTable('call_sessions', { data: null, error: { message: 'relation not found during fence lookup' } });
-    await expect(runAssessment(SESSION_ID)).rejects.toThrow(/ERR_R1_FENCE_UNAVAILABLE/);
+    await expect(runAssessment(SESSION_ID)).rejects.toThrow('session not found: relation not found during fence lookup');
     expect(runClaudeJSONWithProvenance).not.toHaveBeenCalled();
     expect(fromCalls('transcript_turns')).toBe(0);
     expect(fromCalls('assessments')).toBe(0);

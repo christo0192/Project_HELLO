@@ -110,7 +110,7 @@ with ledger as (
   group by 1
 ), legacy_browser as (
   select date_trunc('month', coalesce(ended_at, started_at, updated_at))::date as month_start,
-    sum((greatest(0, extract(epoch from (coalesce(ended_at, updated_at) - coalesce(started_at, updated_at))) * 2 + 60) / 60.0) as minutes
+    sum((greatest(0, extract(epoch from (coalesce(ended_at, updated_at) - coalesce(started_at, updated_at)))) * 2 + 60) / 60.0) as minutes
   from screening_v2.call_sessions where mode = 'browser' and interview_round_id is null group by 1
 ), phone as (
   select date_trunc('month', coalesce(a.ended_at, a.created_at))::date as month_start,

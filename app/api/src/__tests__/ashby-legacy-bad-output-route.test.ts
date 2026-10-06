@@ -35,6 +35,7 @@ const PATH = `/mc/ingestions/${UUID}/retry-legacy-parse`;
 
 function fakeStore(over: Partial<MissionControlStore> = {}): MissionControlStore {
   return {
+    roleInterviewKind: async () => ({ interviewKind: null }),
     listMappings: async () => [],
     listWorkflows: async () => [],
     setMappingStatus: async () => ({ status: 'ok' }),

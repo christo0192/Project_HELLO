@@ -46,6 +46,7 @@ interface Recorder {
 function recorder(status = 'ok'): Recorder {
   const rec: Recorder = { reissues: [], audits: [], store: null as never };
   rec.store = {
+    roleInterviewKind: async () => ({ interviewKind: null }),
     listMappings: async () => [],
     listWorkflows: async () => [],
     setMappingStatus: async () => ({ status: 'ok' }),

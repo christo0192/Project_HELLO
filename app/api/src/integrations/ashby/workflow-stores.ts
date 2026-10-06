@@ -718,6 +718,12 @@ export interface MissionControlArchiveResult {
 }
 
 export interface MissionControlStore {
+  /**
+   * Read the role discriminator before an Ashby mapping is created.  This is
+   * deliberately part of the injected store: Mission Control routes must not
+   * bypass their test/runtime store with a global Supabase client.
+   */
+  roleInterviewKind(roleId: string): Promise<{ interviewKind: string | null } | null>;
   /** Live (non-archived) mappings only — an archived mapping is "deleted". */
   listMappings(limit: number): Promise<MissionControlMapping[]>;
   listWorkflows(limit: number): Promise<MissionControlWorkflow[]>;
@@ -911,6 +917,18 @@ const PG_UNIQUE_VIOLATION = '23505';
 /** Mission Control read/action store (service-role; sanitized projections). */
 export function createMissionControlStore(client: SupabaseClient): MissionControlStore {
   return {
+    async roleInterviewKind(roleId) {
+      const { data, error } = await client
+        .from('roles')
+        .select('interview_kind')
+        .eq('id', roleId)
+        .maybeSingle();
+      if (error) throw new Error('ashby_mc_role_read_error');
+      if (!data) return null;
+      return {
+        interviewKind: typeof data.interview_kind === 'string' ? data.interview_kind : null,
+      };
+    },
     async listMappings(limit): Promise<MissionControlMapping[]> {
       const { data, error } = await client
         .from('ashby_job_mappings')

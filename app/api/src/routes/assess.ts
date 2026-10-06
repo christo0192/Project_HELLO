@@ -5,7 +5,6 @@ import {
   ERR_SESSION_NOT_COMPLETED,
   ERR_RESCORE_NO_SCORECARD,
   ERR_RESCORE_REVISION_CONFLICT,
-  ERR_R1_FENCE_UNAVAILABLE,
 } from '../services/assessment.js';
 import { validateParams } from '../lib/validation.js';
 import { assessSessionIdParamSchema, rescoreBodySchema } from '../schemas/assess.js';
@@ -49,7 +48,6 @@ workerAssessRouter.post(
       res.json(assessment);
     } catch (error) {
       if (error instanceof Error && error.message === 'r1_session') return res.status(409).json({ error: 'r1_session' });
-      if (error instanceof Error && error.message === ERR_R1_FENCE_UNAVAILABLE) return res.status(503).json({ error: 'service_unavailable' });
       if (error instanceof Error && error.message === ERR_SESSION_NOT_COMPLETED) {
         return res.status(409).json({
           error: { type: 'session_not_completed', message: 'Session is not eligible for assessment' },
@@ -82,7 +80,6 @@ assessRouter.post(
       res.json(assessment);
     } catch (error) {
       if (error instanceof Error && error.message === 'r1_session') return res.status(409).json({ error: 'r1_session' });
-      if (error instanceof Error && error.message === ERR_R1_FENCE_UNAVAILABLE) return res.status(503).json({ error: 'service_unavailable' });
       // VOI-08: ineligible sessions → stable non-retryable 409.
       // All other errors flow to the global error handler (500).
       if (error instanceof Error && error.message === ERR_SESSION_NOT_COMPLETED) {
@@ -139,7 +136,6 @@ assessRouter.post(
       res.json(assessment);
     } catch (error) {
       if (error instanceof Error && error.message === 'r1_session') return res.status(409).json({ error: 'r1_session' });
-      if (error instanceof Error && error.message === ERR_R1_FENCE_UNAVAILABLE) return res.status(503).json({ error: 'service_unavailable' });
       // A rescore on a session that never completed → the same non-retryable 409.
       if (error instanceof Error && error.message === ERR_SESSION_NOT_COMPLETED) {
         return res.status(409).json({
