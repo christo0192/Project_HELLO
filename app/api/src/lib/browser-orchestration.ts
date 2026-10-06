@@ -44,6 +44,10 @@ import {
 import { BROWSER_FLY_APP } from './worker-orchestration-runtime.js';
 import { roomNameForSession } from './room-provisioning.js';
 import { createLogger } from './logger.js';
+import {
+  agentDispatchClientFor,
+  requireBrowserLiveKitConfigured,
+} from './livekit-endpoints.js';
 
 const log = createLogger('browser-orchestration');
 
@@ -129,11 +133,8 @@ export function browserOrchestrationGate(
   let dispatchClient = deps.dispatchClient ?? null;
   const dispatchClientFor = async (): Promise<BrowserAgentDispatchClientLike> => {
     if (dispatchClient === null) {
-      const { AgentDispatchClient } = await import('livekit-server-sdk');
-      dispatchClient = new AgentDispatchClient(
-        env.livekitUrl,
-        env.livekitApiKey,
-        env.livekitApiSecret,
+      dispatchClient = agentDispatchClientFor(
+        requireBrowserLiveKitConfigured(),
       ) as unknown as BrowserAgentDispatchClientLike;
     }
     return dispatchClient;

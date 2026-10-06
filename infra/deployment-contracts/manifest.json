@@ -87,6 +87,26 @@
           "secretSource": "managed-infisical-runtime"
         },
         {
+          "name": "BROWSER_LIVEKIT_TARGET",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "R1_LIVEKIT_URL",
+          "secret": false,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "R1_LIVEKIT_API_KEY",
+          "secret": true,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
+          "name": "R1_LIVEKIT_API_SECRET",
+          "secret": true,
+          "secretSource": "managed-infisical-runtime"
+        },
+        {
           "name": "RECORDINGS_BUCKET",
           "secret": false,
           "secretSource": "managed-infisical-runtime"

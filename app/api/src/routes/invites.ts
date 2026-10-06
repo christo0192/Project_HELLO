@@ -45,11 +45,16 @@ import {
 import { createGrant } from '../lib/candidate-access.js';
 import { readMaintenanceState, maintenanceBlockedBody } from '../lib/maintenance.js';
 import type { InviteCreateResponse, InviteExchangeResponse } from '../schemas/invites.js';
-import { AccessToken, RoomServiceClient, TrackSource } from 'livekit-server-sdk';
+import { TrackSource } from 'livekit-server-sdk';
 import {
   provisionRoomForCreatedSession,
-  requireLiveKitConfigured,
 } from '../lib/room-provisioning.js';
+import {
+  accessTokenFor,
+  requireBrowserLiveKitConfigured,
+  roomServiceClientFor,
+  type LiveKitEndpoint,
+} from '../lib/livekit-endpoints.js';
 import { validateInvite, STABLE_INVITE_ERROR } from '../lib/invite-validation.js';
 import {
   browserOrchestrationGate,
@@ -133,7 +138,7 @@ invitesRouter.post(
   validateBody(inviteCreateSchema),
   async (req, res, next) => {
     try {
-      requireLiveKitConfigured();
+      requireBrowserLiveKitConfigured();
       const inviteCtx: InviteRequestContext | undefined = (req as any)._inviteContext;
       if (!inviteCtx) {
         return res.status(401).json({ error: 'authentication_required' });
@@ -268,8 +273,9 @@ invitesRouter.post(
   validateBody(invitePreflightSchema),
   async (req, res, next) => {
     let diagnosticRoom: string | null = null;
+    let endpoint: LiveKitEndpoint | null = null;
     try {
-      requireLiveKitConfigured();
+      endpoint = requireBrowserLiveKitConfigured();
       const { invite_token } = req.body as { invite_token: string };
       const result = await validateInvite(invite_token);
       if (!result.ok) return res.status(404).json({ error: STABLE_INVITE_ERROR });
@@ -302,7 +308,7 @@ invitesRouter.post(
         return res.status(409).json({ error: 'consent_required' });
       }
 
-      const rooms = new RoomServiceClient(env.livekitUrl, env.livekitApiKey, env.livekitApiSecret);
+      const rooms = roomServiceClientFor(endpoint);
       diagnosticRoom = `preflight-${randomUUID()}`;
       await rooms.createRoom({
         name: diagnosticRoom,
@@ -313,7 +319,7 @@ invitesRouter.post(
       });
 
       const expiresAt = new Date(Date.now() + 2 * 60 * 1000);
-      const token = new AccessToken(env.livekitApiKey, env.livekitApiSecret, {
+      const token = accessTokenFor(endpoint, {
         identity: `preflight-${randomUUID()}`,
         ttl: '2m',
       });
@@ -326,15 +332,15 @@ invitesRouter.post(
         canPublishData: false,
       });
       const response: InvitePreflightResponse = {
-        url: env.livekitUrl,
+        url: endpoint.url,
         livekit_token: await token.toJwt(),
         expires_at: expiresAt.toISOString(),
         policy_version: 'voice-v1',
       };
       res.set('Cache-Control', 'no-store').json(response);
     } catch (error) {
-      if (diagnosticRoom) {
-        await new RoomServiceClient(env.livekitUrl, env.livekitApiKey, env.livekitApiSecret)
+      if (diagnosticRoom && endpoint) {
+        await roomServiceClientFor(endpoint)
           .deleteRoom(diagnosticRoom).catch(() => undefined);
       }
       next(error);
@@ -350,7 +356,7 @@ invitesRouter.post(
   validateBody(inviteExchangeSchema),
   async (req, res, next) => {
     try {
-      requireLiveKitConfigured();
+      const endpoint = requireBrowserLiveKitConfigured();
       const { token } = req.body as { token: string };
       const digest = hashToken(token);
 
@@ -458,6 +464,7 @@ invitesRouter.post(
         const provisioned = await provisionRoomForCreatedSession(
           session.id as string,
           'existing_session',
+          { endpoint },
         );
         if (!provisioned.ok) {
           if (provisioned.code === 'provider_failed') {
@@ -565,6 +572,7 @@ invitesRouter.post(
 
       // Step 5: Build minimal LiveKit JWT (short TTL, one room, no admin)
       const livekitToken = await buildCandidateToken(
+        endpoint,
         invite.candidate_id,
         invite.session_id,
         roomName,
@@ -578,7 +586,7 @@ invitesRouter.post(
 
       res.status(200).json({
         grant_token: grant.grantToken,
-        url: env.livekitUrl,
+        url: endpoint.url,
         room_name: roomName,
         session_id: invite.session_id,
         expires_at: grant.expiresAt.toISOString(),
@@ -635,11 +643,12 @@ export async function handleRecordingGrant(
 // ── Build minimal LiveKit candidate token ────────────────────────────
 
 async function buildCandidateToken(
+  endpoint: LiveKitEndpoint,
   candidateId: string,
   sessionId: string,
   roomName: string,
 ): Promise<string> {
-  const token = new AccessToken(env.livekitApiKey, env.livekitApiSecret, {
+  const token = accessTokenFor(endpoint, {
     identity: `candidate-${candidateId.slice(0, 8)}-${sessionId.slice(0, 8)}`,
     ttl: '5m',
   });

@@ -13,6 +13,21 @@
  */
 
 import { describe, it, expect, vi } from 'vitest';
+const agentDispatchCtor = vi.hoisted(() => vi.fn());
+
+vi.mock('livekit-server-sdk', () => {
+  class AgentDispatchClient {
+    constructor(...args: unknown[]) {
+      agentDispatchCtor(...args);
+    }
+    async createDispatch(): Promise<void> {}
+  }
+  return {
+    AgentDispatchClient,
+    AccessToken: class {},
+    RoomServiceClient: class {},
+  };
+});
 import {
   browserOrchestrationGate,
   type BrowserAgentDispatchClientLike,
@@ -118,6 +133,29 @@ describe('browserOrchestrationGate — the naming+dispatch pairing gate', () => 
     })!;
     const ok = await gate.dispatch({ sessionId: 'sess-1', roomName: 'screening-sess-1' });
     expect(ok).toBe(false);
+  });
+
+  it('dispatches through the selected R1 endpoint', async () => {
+    process.env.BROWSER_LIVEKIT_TARGET = 'r1';
+    process.env.R1_LIVEKIT_URL = 'wss://r1.example.test';
+    process.env.R1_LIVEKIT_API_KEY = 'r1-key';
+    process.env.R1_LIVEKIT_API_SECRET = 'r1-secret';
+    try {
+      const gate = browserOrchestrationGate({
+        enabled: true,
+        agentName: 'browser-screener',
+        service: fakeService({ status: 'ready', machineId: 'm1' }),
+      })!;
+      await expect(gate.dispatch({ sessionId: 'sess-1', roomName: 'screening-sess-1' })).resolves.toBe(true);
+      expect(agentDispatchCtor).toHaveBeenLastCalledWith(
+        'wss://r1.example.test', 'r1-key', 'r1-secret',
+      );
+    } finally {
+      delete process.env.BROWSER_LIVEKIT_TARGET;
+      delete process.env.R1_LIVEKIT_URL;
+      delete process.env.R1_LIVEKIT_API_KEY;
+      delete process.env.R1_LIVEKIT_API_SECRET;
+    }
   });
 
   it('releaseWorker delegates to the service (fail-open, never throws)', async () => {

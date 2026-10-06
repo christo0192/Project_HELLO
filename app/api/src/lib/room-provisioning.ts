@@ -35,12 +35,16 @@
  *     ROOM_EMPTY_TIMEOUT_SEC and no token was ever minted for it.
  */
 
-import { RoomServiceClient } from 'livekit-server-sdk';
-import { env } from './env.js';
 import { supabase } from './supabase.js';
 import { getCorrelationId } from './correlation.js';
 import { startAuthoritativeRecording } from './recording-egress.js';
 import { transitionSession } from './session-lifecycle.js';
+import {
+  cloudLiveKitEndpoint,
+  requireLiveKitEndpointConfigured,
+  roomServiceClientFor,
+  type LiveKitEndpoint,
+} from './livekit-endpoints.js';
 
 /** Room lifetime with nobody connected, in seconds. */
 export const ROOM_EMPTY_TIMEOUT_SEC = 10 * 60;
@@ -48,11 +52,7 @@ export const ROOM_EMPTY_TIMEOUT_SEC = 10 * 60;
 export const ROOM_MAX_PARTICIPANTS = 4;
 
 export function requireLiveKitConfigured(): void {
-  if (!env.livekitUrl || !env.livekitApiKey || !env.livekitApiSecret) {
-    throw new Error(
-      'LIVEKIT_URL, LIVEKIT_API_KEY, and LIVEKIT_API_SECRET must be set in app/api/.env',
-    );
-  }
+  requireLiveKitEndpointConfigured(cloudLiveKitEndpoint());
 }
 
 /** Deterministic room name — derived from the session id, never stored state. */
@@ -86,6 +86,11 @@ export interface RoomServiceClientLike {
 
 export interface ProvisionRoomDeps {
   rooms?: RoomServiceClientLike;
+  /**
+   * Browser-only endpoint override. Omitted means the permanent Cloud default,
+   * preserving callers such as the phone room path exactly as before.
+   */
+  endpoint?: LiveKitEndpoint;
   /**
    * Used ONLY by the `existing_session` adopt re-read. Room creation and the
    * `created` → `waiting` CAS go through `transitionSession`, which holds its
@@ -121,12 +126,8 @@ export type ProvisionRoomResult =
    *  concurrent actor moved it somewhere other than our room). */
   | { ok: false; code: 'not_joinable'; roomName: string };
 
-function roomClient(): RoomServiceClientLike {
-  return new RoomServiceClient(
-    env.livekitUrl,
-    env.livekitApiKey,
-    env.livekitApiSecret,
-  ) as unknown as RoomServiceClientLike;
+function roomClient(endpoint: LiveKitEndpoint): RoomServiceClientLike {
+  return roomServiceClientFor(endpoint) as unknown as RoomServiceClientLike;
 }
 
 /**
@@ -158,11 +159,12 @@ export async function provisionRoomForCreatedSession(
   mode: ProvisionRoomMode,
   deps: ProvisionRoomDeps = {},
 ): Promise<ProvisionRoomResult> {
-  requireLiveKitConfigured();
+  const endpoint = deps.endpoint ?? cloudLiveKitEndpoint();
+  requireLiveKitEndpointConfigured(endpoint);
 
   const roomName = roomNameForSession(sessionId);
   const metadata = buildMinimalRoomMetadata(sessionId, roomName);
-  const rooms = deps.rooms ?? roomClient();
+  const rooms = deps.rooms ?? roomClient(endpoint);
   const db = deps.db ?? supabase;
   const startRecording = deps.startRecording ?? startAuthoritativeRecording;
 

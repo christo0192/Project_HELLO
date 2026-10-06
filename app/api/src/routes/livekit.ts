@@ -38,8 +38,8 @@ import {
 import { createLogger } from '../lib/logger.js';
 import {
   provisionRoomForCreatedSession,
-  requireLiveKitConfigured,
 } from '../lib/room-provisioning.js';
+import { requireBrowserLiveKitConfigured } from '../lib/livekit-endpoints.js';
 import { createMaintenanceMiddleware } from '../lib/maintenance.js';
 import {
   extractIdempotencyKey,
@@ -139,7 +139,7 @@ livekitRouter.post(
   createMaintenanceMiddleware({ allowAdmin: true }),
   async (req, res, next) => {
     try {
-      requireLiveKitConfigured();
+      const endpoint = requireBrowserLiveKitConfigured();
       const candidateId = req.body?.candidate_id as string;
       if (!candidateId) return res.status(400).json({ error: 'candidate_id is required' });
 
@@ -206,7 +206,7 @@ livekitRouter.post(
         // + created → waiting CAS. `new_session` mode terminates the row it
         // just created on a provider failure and reaps an orphan room on a
         // lost CAS (this request owns the row end-to-end).
-        const provisioned = await provisionRoomForCreatedSession(session.id, 'new_session');
+        const provisioned = await provisionRoomForCreatedSession(session.id, 'new_session', { endpoint });
         if (!provisioned.ok) {
           if (provisioned.code === 'provider_failed') {
             if (provisioned.terminateFailed) {
@@ -247,7 +247,7 @@ livekitRouter.post(
         res.status(201).json({
           session_id: session.id,
           room_name: roomName,
-          url: env.livekitUrl,
+          url: endpoint.url,
         });
       };
 
