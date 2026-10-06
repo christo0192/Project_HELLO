@@ -1,0 +1,24 @@
+# Rendered by entrypoint.sh. This file intentionally contains no credentials.
+port: 7880
+logging: { level: info, json: true }
+
+rtc:
+  tcp_port: 7881
+  udp_port: 7882
+  use_external_ip: false
+  node_ip: "__NODE_IP__"
+  allow_tcp_fallback: true
+  # Config B only: entrypoint replaces the marker with rtc.ips.includes.
+__RTC_IPS__
+
+room:
+  auto_create: false
+
+# LIVEKIT_KEYS is injected only as a Fly secret. The entrypoint validates it
+# before this template is rendered as the single YAML mapping below.
+keys:
+  __LIVEKIT_KEYS__
+
+# Redis, TURN, webhooks, Egress, SIP, and Ingress are deliberately absent.
+turn: { enabled: false }
+prometheus: { port: 6789 }

@@ -1,0 +1,65 @@
+# S0-F spike only. Production changes only the app name/hostname after S0-F
+# passes: project-hello-r1-rtc uses an IK-controlled rtc-r1 domain, the same
+# single-Machine layout, and a separately reviewed manual deploy workflow.
+app = "project-hello-r1-rtc-spike"
+primary_region = "sin" # memo §3.2 / v2 §10.2: sin is the reviewed region; never bom.
+kill_signal = "SIGINT" # memo §3.7: let LiveKit drain before Fly's final kill.
+kill_timeout = 300 # memo §3.7: Fly maximum; deployments require zero live rooms.
+
+[build]
+  dockerfile = "Dockerfile" # memo §3.7: this isolated SFU image is never built by deploy-fly.yml.
+
+[env]
+  # memo §3.2: set this non-secret value to the dedicated IPv4 from `fly ips allocate-v4`.
+  # NODE_IP = "<dedicated IPv4>"
+  # LIVEKIT_KEYS is a Fly secret, never a checked-in environment value.
+
+[[vm]]
+  cpu_kind = "performance" # memo §3.2: performance-1x avoids shared-CPU media throttling.
+  cpus = 1
+  memory_mb = 2048
+
+[metrics]
+  port = 6789 # memo §3.1: metrics are private because no service exposes this port.
+  path = "/metrics"
+
+# memo §3.1/§3.7: WSS, Twirp, agent WebSocket, and GET / health over Fly TLS.
+[[services]]
+  protocol = "tcp"
+  internal_port = 7880
+  auto_start_machines = true # S0-F2 proves a proxy wake reaches UDP on the first join.
+  auto_stop_machines = "stop" # v2 D16 default: on-demand; use `fly deploy --ha=false` for one Machine.
+  min_machines_running = 0 # no autoscale / no always-on machine during the spike.
+  [services.concurrency]
+    type = "connections"
+    soft_limit = 100
+    hard_limit = 250
+  [[services.ports]]
+    port = 443
+    handlers = ["tls", "http"] # memo §3.1: public signaling/Twirp/agent endpoint.
+  [[services.ports]]
+    port = 80
+    handlers = ["http"] # memo §3.1: redirect-only HTTP service.
+    force_https = true
+  [[services.http_checks]]
+    method = "get"
+    path = "/" # memo §3.7: LiveKit's root health endpoint on :7880.
+    interval = "15s"
+    timeout = "2s"
+    grace_period = "10s"
+
+# memo §3.1: raw ICE/TCP fallback; handlers must stay empty (no TLS/proxy HTTP).
+[[services]]
+  protocol = "tcp"
+  internal_port = 7881
+  [[services.ports]]
+    port = 7881
+    handlers = []
+
+# memo §3.1/§3.3: one dedicated-IPv4 UDP mux. The entrypoint filters binding
+# to fly-global-services; S0-F1 must prove the resulting socket and ICE pair.
+[[services]]
+  protocol = "udp"
+  internal_port = 7882
+  [[services.ports]]
+    port = 7882

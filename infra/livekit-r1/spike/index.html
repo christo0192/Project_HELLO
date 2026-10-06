@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>R1 SFU S0-F spike</title>
+<style>
+  body { font: 16px system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+  input { width: 100%; box-sizing: border-box; margin: .25rem 0 1rem; padding: .5rem; }
+  button { padding: .5rem .8rem; } pre { background: #111; color: #ddd; overflow: auto; padding: 1rem; }
+  #status { font-weight: 600; } video { width: 320px; max-width: 100%; background: #111; }
+</style>
+<h1>R1 SFU S0-F media spike</h1>
+<p>Use headphones: the dispatched <code>r1-spike</code> worker echoes microphone audio.</p>
+<form id="join-form">
+  <label>LiveKit URL <input id="url" name="url" required placeholder="wss://project-hello-r1-rtc-spike.fly.dev"></label>
+  <label>Candidate token <input id="token" name="token" required></label>
+  <button>Join with camera + microphone</button>
+  <button type="button" id="leave">Leave</button>
+</form>
+<p id="status">Not connected.</p>
+<video id="preview" autoplay muted playsinline></video>
+<h2>Five-second summary</h2>
+<pre id="summary">No samples yet.</pre>
+<button id="copy" type="button">Copy JSON</button>
+<script type="module">
+  import { Room, createLocalAudioTrack, createLocalVideoTrack } from "https://cdn.jsdelivr.net/npm/livekit-client@2.21.0/+esm";
+
+  const $ = (id) => document.getElementById(id);
+  const query = new URLSearchParams(location.search);
+  $("url").value = query.get("url") || "";
+  $("token").value = query.get("token") || "";
+  const state = { startedAt: null, samples: [], errors: [], result: "PENDING: no selected UDP candidate pair sampled yet." };
+  let room, tracks = [], timer;
+  const setStatus = (text) => { $("status").textContent = text; };
+  const write = () => { $("summary").textContent = JSON.stringify({ ...state, samples: state.samples.slice(-24) }, null, 2); };
+
+  function peerConnections() {
+    const engine = room?.engine;
+    // livekit-client 2.21 exposes PCTransport instances here. Their public
+    // getStats() API returns native RTC stats without relying on private PC fields.
+    const manager = engine?.pcManager;
+    return [["publisher", manager?.publisher], ["subscriber", manager?.subscriber]]
+      .filter(([, transport]) => transport && typeof transport.getStats === "function");
+  }
+
+  async function sampleStats() {
+    const sample = { at: new Date().toISOString(), pairs: [], outbound: [], inbound: [] };
+    const connections = peerConnections();
+    if (!connections.length) sample.diagnostic = "No native RTCPeerConnection was exposed by this livekit-client build.";
+    for (const [role, transport] of connections) {
+      const report = await transport.getStats();
+      const byId = new Map();
+      report.forEach((v) => byId.set(v.id, v));
+      const selectedPairIds = new Set();
+      report.forEach((v) => {
+        if (v.type === "transport" && v.selectedCandidatePairId) selectedPairIds.add(v.selectedCandidatePairId);
+      });
+      report.forEach((v) => {
+        if (v.type === "candidate-pair" && (v.selected || selectedPairIds.has(v.id)) && v.state === "succeeded") {
+          const local = byId.get(v.localCandidateId), remote = byId.get(v.remoteCandidateId);
+          sample.pairs.push({ role, protocol: local?.protocol || remote?.protocol || "unknown", remote: remote?.address ? `${remote.address}:${remote.port}` : undefined, rttMs: v.currentRoundTripTime == null ? null : Math.round(v.currentRoundTripTime * 1000), availableOutgoingBitrate: v.availableOutgoingBitrate ?? null });
+        }
+        if (v.type === "outbound-rtp" && (v.kind === "video" || v.mediaType === "video")) sample.outbound.push({ fps: v.framesPerSecond ?? null, packetsLost: v.packetsLost ?? null, qualityLimitationReason: v.qualityLimitationReason ?? null, bandwidthLimitedSeconds: v.qualityLimitationDurations?.bandwidth ?? null });
+        if (v.type === "inbound-rtp" && (v.kind === "audio" || v.mediaType === "audio")) sample.inbound.push({ jitterMs: v.jitter == null ? null : Math.round(v.jitter * 1000), packetsLost: v.packetsLost ?? null });
+      });
+    }
+    sample.udpSelected = sample.pairs.some((pair) => pair.protocol.toLowerCase() === "udp");
+    state.result = sample.udpSelected
+      ? "GO: selected UDP candidate pair sampled."
+      : "NO-GO: no selected UDP candidate pair was sampled.";
+    state.samples.push(sample);
+    write();
+    if (!sample.udpSelected) setStatus("NO-GO: no selected UDP candidate pair sampled.");
+  }
+
+  $("join-form").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    if (room) return;
+    setStatus("Requesting camera and microphone…");
+    try {
+      room = new Room({ adaptiveStream: false, dynacast: false });
+      await room.connect($("url").value.trim(), $("token").value.trim());
+      const mic = await createLocalAudioTrack();
+      const camera = await createLocalVideoTrack({ resolution: { width: 640, height: 360, frameRate: 15 }, videoEncoding: { maxBitrate: 500_000, maxFramerate: 15 } });
+      tracks = [mic, camera];
+      await room.localParticipant.publishTrack(mic);
+      await room.localParticipant.publishTrack(camera, { simulcast: false, videoEncoding: { maxBitrate: 500_000, maxFramerate: 15 } });
+      camera.attach($("preview"));
+      state.startedAt = new Date().toISOString();
+      setStatus("Joined. Sampling selected ICE pair and media stats every 5 seconds.");
+      await sampleStats();
+      timer = setInterval(() => sampleStats().catch((error) => { state.errors.push(String(error)); write(); }), 5_000);
+    } catch (error) {
+      state.errors.push(String(error)); write(); setStatus(`Join failed: ${error}`); room?.disconnect(); room = undefined;
+    }
+  });
+  $("leave").addEventListener("click", () => { clearInterval(timer); tracks.forEach((track) => track.stop()); tracks = []; room?.disconnect(); room = undefined; setStatus("Left."); });
+  $("copy").addEventListener("click", async () => { await navigator.clipboard.writeText($("summary").textContent); setStatus("JSON copied."); });
+</script>
+</html>

@@ -56,6 +56,12 @@ ok(/if:\s*needs\.detect\.outputs\.voice == 'true'/.test(voice), "deploy-browser-
 ok(/if:\s*needs\.detect\.outputs\.phone == 'true'/.test(phone), "deploy-phone-voice must gate on detect.outputs.phone == true");
 ok(/\^app\/supabase\/migrations\//.test(detect), "detect must select production migrations by app/supabase/migrations/ path");
 ok(/database=true/.test(detect), "application/manual deploys must request migration convergence");
+// PR-SFU-1: the disposable/self-hosted SFU is intentionally manual-only. An
+// infra/livekit-r1-only change must select no existing app, no migration, and
+// no implicit fourth app/token. The executable detector has no matching path;
+// keep that absence explicit so a broad '^infra/' condition cannot grow later.
+ok(!/infra\/livekit-r1/.test(detect), "automatic deploy detection must not mention infra/livekit-r1; SFU deploys are manual-only");
+ok(!/project-hello-r1-rtc/.test(wf), "automatic deploy workflow must not add an R1 SFU app or token");
 
 // 3b. Shared voice source deploys BOTH voice apps (browser + phone), and the
 // detect job declares both outputs.

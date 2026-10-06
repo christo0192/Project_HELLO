@@ -34,6 +34,8 @@ jobs:
         run: node scripts/deploy-fly-workflow.test.mjs
       - name: Validate voice worker app configs (browser vs phone isolation)
         run: node scripts/validate-voice-worker-apps.mjs && node scripts/validate-voice-worker-apps.test.mjs
+      - name: Validate isolated R1 LiveKit SFU spike config
+        run: node scripts/validate-livekit-r1-sfu.mjs && node scripts/validate-livekit-r1-sfu.test.mjs
       - name: Validate architecture decision records
         run: node scripts/check-adrs.mjs
       - name: Validate approved HR design system
