@@ -1195,6 +1195,7 @@ INTENTS:
 - unclear: anything else: fillers, noise, cut-off words, mixed or contradictory replies.
 When in doubt, answer unclear, never consent_granted.
 In the callback_time phase: a reply that says when to call back (a day, a time, or both) is not_now_busy with the callback spans; a yes to a time the assistant just proposed is consent_granted; copy day_text and time_text only from the person's own words.
+In the post_consent phase the person has already agreed and the screening has started; the bot line is the role line or the first question. Answering that question is never a revocation: an answer that mentions being busy at work, a project or a job is unclear. Only a request not to do the call now (reschedule, call back later, out, driving, in a meeting) is not_now_busy, only a refusal to go on is consent_declined, and the evidence must be the person's own words that say so.
 
 OUTPUT: exactly one JSON object and nothing else (no markdown, no prose):
 {"intent": "<one intent>", "evidence": "<the words from ONE utterance that show the intent, copied exactly, or empty>", "confidence": <0.0-1.0>}
@@ -1231,7 +1232,11 @@ DATA {"phase":"consent","utterances":[{"order":1,"tag":"post_question","text":"P
 DATA {"phase":"callback_time","now_ist":"2026-01-05 10:00 Monday","utterances":[{"order":1,"tag":"post_question","text":"tomorrow after lunch is better"}]}
 {"intent":"not_now_busy","evidence":"tomorrow after lunch","confidence":0.9,"callback":{"day_text":"tomorrow","time_text":"after lunch","resolved_ist":"2026-01-06T14:00"}}
 DATA {"phase":"callback_time","utterances":[{"order":1,"tag":"post_question","text":"Yes, that works"}]}
-{"intent":"consent_granted","evidence":"Yes, that works","confidence":0.92}"""
+{"intent":"consent_granted","evidence":"Yes, that works","confidence":0.92}
+DATA {"phase":"post_consent","utterances":[{"order":1,"tag":"post_question","text":"Can we do this later, I'm in a meeting right now"}]}
+{"intent":"not_now_busy","evidence":"Can we do this later, I'm in a meeting right now","confidence":0.92,"callback":{"day_text":"","time_text":"","resolved_ist":null}}
+DATA {"phase":"post_consent","utterances":[{"order":1,"tag":"post_question","text":"These days I'm busy handling a billing system upgrade at my company"}]}
+{"intent":"unclear","evidence":"","confidence":0.88}"""
 
 _JUDGE_USER_TEMPLATE = "DATA {payload}"
 

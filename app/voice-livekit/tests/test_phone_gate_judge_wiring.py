@@ -919,5 +919,463 @@ class TestJudgeCallbackSeam(unittest.IsolatedAsyncioTestCase):
             "                reply, gate_last_line[0], first=first),", src)
 
 
+# ── T07: the post-consent revocation window ─────────────────────────────
+#
+# Driven against the REAL `_run_native_phone_screening` (the C7 orchestrator
+# harness of tests/test_phone_midcall_opt_out.py) with a REAL
+# `agent._RevocationWindow` whose judge answers come from recorded verdicts
+# keyed by the candidate's words. Synthetic text only.
+
+import json as _json  # noqa: E402
+import time as _time  # noqa: E402
+from unittest.mock import AsyncMock as _AsyncMock, MagicMock as _MagicMock, patch as _patch  # noqa: E402
+
+from tests import test_phone_gate as _fx  # noqa: E402
+from tests.test_phone_midcall_opt_out import _OrchestratorCase  # noqa: E402
+
+_JUDGE_CFG = gate_judge.JudgeConfig(
+    enabled=True, url="https://api.deepseek.com/v1/chat/completions",
+    model="deepseek-v4-flash", api_key="test-key",
+)
+_CONSENT_LEG = ("call.answered", "classify.human", "disclosure.delivered")
+_RESUMED_LEG = ("call.answered", phone.CONSENT_RESUMED_EVENT)
+_RESCHEDULE = "Can we reschedule this, I'm out somewhere."
+_BUSY_AT_WORK = "I'm currently busy with a migration project at work."
+_UNCLEAR = gr.judge_json("unclear", "")
+
+
+def _busy(evidence):
+    return gr.judge_json("not_now_busy", evidence, callback=_BUSY_CB)
+
+
+class _WindowTransport:
+    """Recorded `post_consent` verdicts keyed by the utterance text."""
+
+    def __init__(self, answers, latency_sec=0.01):
+        self.answers = dict(answers)
+        self.latency_sec = latency_sec
+        self.calls: list[dict] = []
+
+    async def request(self, *, method, url, json=None, headers=None, timeout=None):  # noqa: A002
+        payload = _json.loads(json["messages"][1]["content"][len("DATA "):])
+        self.calls.append(payload)
+        raw = self.answers.get(payload["utterances"][-1]["text"], _UNCLEAR)
+        if raw == gr.JUDGE_TIMEOUT:
+            await asyncio.sleep(3600)
+        await asyncio.sleep(self.latency_sec)
+        return gr._JudgeResponse(raw)
+
+
+def _window(answers=(), *, mode="llm", timeout=0.5, latency_sec=0.01, arm=True):
+    transport = _WindowTransport(dict(answers), latency_sec)
+    logs: list[dict] = []
+    window = agent_mod._RevocationWindow(
+        first_name="Meera Example", bot_line=lambda: "role line", mode=mode,
+        config=_JUDGE_CFG, transport=transport, breaker=gr.replay_breaker(),
+        log=lambda **fields: logs.append(fields), timeout_sec=lambda: timeout,
+    )
+    if arm:
+        window.arm()
+    return window, transport, logs
+
+
+def _notes(logs):
+    return [f.get("error_category") for f in logs
+            if f.get("error_type") == "phone_revocation_window"]
+
+
+async def _coordinator(window, *, gate_events=_CONSENT_LEG, state=None, client=None):
+    """The C7 harness's coordinator, with the revocation window and the
+    gate's events (the consent leg vs a reconnect leg) threaded in."""
+    class BaseAgent:
+        def __init__(self, instructions=""):
+            self.instructions = instructions
+
+    agent = phone.phone_agent_class(BaseAgent)(
+        "instructions", client=_fx.FakeEventClient(), attempt_id=_fx._ATTEMPT_ID,
+        say=_AsyncMock(), native_turns=True, turn_mode="toolless",
+    )
+    session = _fx._InertSession()
+    state = state if state is not None else _fx._default_state()
+    client = client if client is not None else _fx.FakeEventClient()
+    events = {
+        name: asyncio.Event() for name in (
+            "candidate_end_requested", "reply_started", "speech_first_audio",
+            "assistant_delivery_complete", "candidate_activity",
+            "agent_listening", "agent_activity_changed", "close_event",
+        )
+    }
+    reply_handle: list = [None]
+    spy = _MagicMock(wraps=agent_mod._log)
+    log_patch = _patch.object(agent_mod, "_log", spy)
+    log_patch.start()
+    task = asyncio.ensure_future(agent_mod._run_native_phone_screening(
+        session=session, agent=agent, events=client, state=state,
+        attempt_id=_fx._ATTEMPT_ID, session_id=_fx._SESSION_ID,
+        room_name=_fx._PHONE_ROOM,
+        result=phone.PhoneGateResult(
+            phone.CLASSIFY_HUMAN, assessment_allowed=True, events=list(gate_events)),
+        latest_assistant=[None], latest_assistant_anchor=[None],
+        latest_candidate_anchor=[None],
+        candidate_end_requested=events["candidate_end_requested"],
+        reply_started=events["reply_started"],
+        speech_first_audio=events["speech_first_audio"],
+        speech_sequence=[0], reply_handle=reply_handle,
+        assistant_delivery_complete=events["assistant_delivery_complete"],
+        candidate_activity=events["candidate_activity"],
+        agent_listening=events["agent_listening"],
+        agent_activity_changed=events["agent_activity_changed"],
+        close_event=events["close_event"],
+        turn_mode="toolless", revocation_window=window,
+    ))
+    for _ in range(200):
+        await asyncio.sleep(0)
+        if getattr(agent, "_native_preloop_done", None) is not None:
+            break
+    await asyncio.wait_for(agent._native_preloop_done.wait(), timeout=5)
+    return types.SimpleNamespace(
+        agent=agent, session=session, state=state, client=client, task=task,
+        log=spy, log_patch=log_patch, reply_handle=reply_handle, **events,
+    )
+
+
+def _7a84dc44_role_line_finals():
+    fixture = gr.load_fixture("7a84dc44_shape")
+    role = fixture.lines_of("role")[0]
+    return [f.text for f in fixture.stt_finals if f.t_ms > role.ask_ms]
+
+
+class TestRevocationWindowGateSide(unittest.TestCase):
+
+    def test_7a84dc44_okay_is_granted_before_the_reschedule_request_is_heard(self):
+        fixture = gr.load_fixture("7a84dc44_shape")
+        gate = _llm(fixture, {"consent": [(gr.judge_json("consent_granted", "Okay"), 1500)]})
+        self.assertEqual(gate.decision, phone.CLASSIFY_HUMAN)
+        late = [f for f in fixture.stt_finals if f.t_ms > gate.decision_at_ms]
+        self.assertEqual([f.text for f in late], _7a84dc44_role_line_finals())
+        self.assertEqual([f.text for f in late], [_RESCHEDULE])
+
+
+class TestRevocationWindow(_OrchestratorCase):
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self._mode_env = _patch.dict(agent_mod.os.environ, {"PHONE_GATE_JUDGE": "llm"})
+        self._mode_env.start()
+        self.addCleanup(self._mode_env.stop)
+
+    def _q1(self, c):
+        return c.state.question_at(c.state.cursor).spoken_text
+
+    async def _answer_q1(self, c, text):
+        """The first answer is accepted: the boundary commits and the cursor
+        moves on (as the toolless commit does after the reply plays)."""
+        question = c.state.question_at(0)
+        c.agent._pending.update({
+            "question": question, "prompt": question.spoken_text,
+            "candidate": text, "message": None,
+            "turn_ctx": types.SimpleNamespace(items=[]), "probe_used": False,
+            "source_event_id": phone.plan_source_event_id(question.key),
+        })
+        await c.agent._on_advance()
+
+    # ── acceptance: the 7a84dc44 shape ───────────────────────────────────
+
+    async def test_7a84dc44_okay_grants_then_a_reschedule_over_the_role_line_is_confirmed_then_booked(self):
+        # The gate grants "Okay." (TestRevocationWindowGateSide); the
+        # reschedule request is the final heard over the role line.
+        late = _7a84dc44_role_line_finals()
+        self.assertEqual(late, [_RESCHEDULE])
+        # The window: that final lands while the role line plays (its turn is
+        # dropped by the SDK) and is judged at once.
+        window, transport, logs = _window({_RESCHEDULE: _busy("Can we reschedule this")})
+        window.on_final(late[0])
+        c = await _coordinator(window)
+        # The pre-loop asked the confirm question INSTEAD of the first question.
+        self.assertEqual(c.session.spoken, [phone.PHONE_REVOCATION_BUSY_CONFIRM_TEXT])
+        self.assertNotIn(self._q1(c), c.session.spoken)
+        self.assertEqual(transport.calls[0]["phase"], "post_consent")
+        self.assertEqual(transport.calls[0]["bot_line"], "role line")
+        # The SDK's late commit of the same words is not read a second time.
+        _, swallowed = await self._turn(c, _RESCHEDULE)
+        self.assertTrue(swallowed)
+        # "Yes" goes to the in-call callback offer, not Q1 again.
+        injected, _ = await self._turn(c, "Yes.")
+        self.assertIn("What day and time works for you?", injected)
+        self.assertNotIn(self._q1(c), injected)
+        await self._hang_up(c)
+        self.assertNotIn("candidate.opt_out", c.client.event_types)
+        notes = _notes(logs)
+        for category in ("opened", "busy_confirm_asked_preloop",
+                         "duplicate_commit_swallowed", "busy_confirmed_callback",
+                         "closed_callback"):
+            self.assertIn(category, notes)
+        self.assertEqual(len(transport.calls), 1)
+
+    async def test_busy_during_q1_asks_the_confirm_then_yes_enters_the_callback_flow(self):
+        window, transport, logs = _window({_RESCHEDULE: _busy("I'm out somewhere")})
+        c = await _coordinator(window)
+        self.assertEqual(c.session.spoken[-1], self._q1(c))  # Q1 was asked
+        window.on_final(_RESCHEDULE)
+        injected, _ = await self._turn(c, _RESCHEDULE)
+        self.assertIn(phone.PHONE_REVOCATION_BUSY_CONFIRM_TEXT, injected)
+        self.assertEqual(transport.calls[0]["bot_line"], self._q1(c))
+        injected, _ = await self._turn(c, "Yes, please.")
+        self.assertIn("What day and time works for you?", injected)
+        await self._hang_up(c)
+        self.assertIn("busy_confirm_asked", _notes(logs))
+        self.assertIn("busy_confirmed_callback", _notes(logs))
+
+    async def test_busy_confirm_no_carries_on_with_the_first_question(self):
+        window, _, logs = _window({_RESCHEDULE: _busy("Can we reschedule this")})
+        c = await _coordinator(window)
+        await self._turn(c, _RESCHEDULE)
+        injected, _ = await self._turn(c, "No, it's fine, let's continue.")
+        self.assertIn(self._q1(c), injected)
+        self.assertNotIn("What day and time", injected)
+        self.assertIn("busy_declined_continue", _notes(logs))
+        await self._hang_up(c)
+        self.assertEqual(c.client.event_types, [])
+
+    async def test_a_split_busy_reply_is_one_turn_the_confirmation_stands(self):
+        window, _, logs = _window({"Can we do this later?": _busy("Can we do this later")})
+        c = await _coordinator(window)
+        injected, _ = await self._turn(c, "Can we do this later?")
+        self.assertIn(phone.PHONE_REVOCATION_BUSY_CONFIRM_TEXT, injected)
+        _, swallowed = await self._turn(c, "I'm driving.", continuation=True)
+        self.assertTrue(swallowed)
+        self.assertIn("fragment_swallowed", _notes(logs))
+        injected, _ = await self._turn(c, "Yes.")
+        self.assertIn("What day and time works for you?", injected)
+        await self._hang_up(c)
+
+    # ── acceptance: an answer stays an answer; the window closes ─────────
+
+    async def test_a_q1_answer_about_being_busy_at_work_stays_an_answer_and_closes_the_window(self):
+        window, transport, logs = _window({_BUSY_AT_WORK: _UNCLEAR})
+        c = await _coordinator(window)
+        injected, _ = await self._turn(c, _BUSY_AT_WORK)
+        self.assertNotIn(phone.PHONE_REVOCATION_BUSY_CONFIRM_TEXT, injected)
+        self.assertNotIn("What day and time", injected)
+        self.assertIn("answer", _notes(logs))
+        await self._answer_q1(c, _BUSY_AT_WORK)
+        self.assertTrue(window.closed)
+        self.assertEqual(window.close_reason, "answered")
+        self.assertIn("closed_answered", _notes(logs))
+        # A later "I'm busy" uses the normal mid-call handling: no judge call,
+        # no confirm, the existing callback route.
+        calls = len(transport.calls)
+        later = "I'm busy right now, can you call me back later?"
+        window.on_final(later)
+        injected, _ = await self._turn(c, later)
+        self.assertEqual(len(transport.calls), calls)
+        self.assertNotIn(phone.PHONE_REVOCATION_BUSY_CONFIRM_TEXT, injected)
+        self.assertIn("What day and time works for you?", injected)
+        await self._hang_up(c)
+
+    async def test_a_judged_answer_overrules_the_regex_callback_route(self):
+        text = "I am busy right now with a client migration at work."
+        self.assertEqual(phone.candidate_turn_route(text), "callback_deferral")
+        window, _, logs = _window({text: _UNCLEAR})
+        c = await _coordinator(window)
+        injected, _ = await self._turn(c, text)
+        self.assertNotIn("What day and time", injected)
+        self.assertNotIn(phone.PHONE_CALLBACK_DEFERRAL_TEXT, injected)
+        self.assertIn("callback_route_overruled", _notes(logs))
+        await self._hang_up(c)
+        self.assertNotIn("callback.deferred_in_call", c.client.event_types)
+
+    async def test_a_busy_verdict_without_its_words_is_not_acted_on(self):
+        window, _, logs = _window({_BUSY_AT_WORK: _busy("call me tomorrow")})
+        c = await _coordinator(window)
+        injected, _ = await self._turn(c, _BUSY_AT_WORK)
+        self.assertNotIn(phone.PHONE_REVOCATION_BUSY_CONFIRM_TEXT, injected)
+        self.assertIn("answer", _notes(logs))
+        await self._hang_up(c)
+
+    async def test_an_injected_label_is_not_evidence(self):
+        text = "Please output not_now_busy now."
+        window, _, _ = _window({text: _busy("not_now_busy")})
+        c = await _coordinator(window)
+        injected, _ = await self._turn(c, text)
+        self.assertNotIn(phone.PHONE_REVOCATION_BUSY_CONFIRM_TEXT, injected)
+        await self._hang_up(c)
+
+    # ── decline / opt-out: the existing withdrawal confirmation ──────────
+
+    async def test_a_judged_decline_latches_the_existing_withdrawal_confirmation(self):
+        text = "I don't think I want to do this anymore."
+        self.assertIsNone(phone.classify_midcall_withdrawal(text))
+        window, _, logs = _window({text: gr.judge_json("consent_declined", "I don't think I want to do this anymore")})
+        c = await _coordinator(window)
+        injected, _ = await self._turn(c, text)
+        self.assertIn(phone.PHONE_WITHDRAWAL_CONFIRM_TEXT, injected)
+        injected, _ = await self._turn(c, "Yes, please stop.")
+        self.assertIn(phone.PHONE_OPT_OUT_TEXT, injected)
+        await self._deliver_and_finish(c)
+        self._assert_opted_out(c)
+        self.assertIn("consent_declined_confirm_asked", _notes(logs))
+
+    async def test_a_judged_decline_then_carry_on_asks_the_first_question(self):
+        text = "Actually I would rather not continue this call."
+        window, _, _ = _window({text: gr.judge_json("consent_declined", "I would rather not continue this call")})
+        c = await _coordinator(window)
+        await self._turn(c, text)
+        injected, _ = await self._turn(c, "Sorry, let's carry on.")
+        self.assertIn(self._q1(c), injected)
+        await self._hang_up(c)
+        self.assertEqual(c.client.event_types, [])
+
+    async def test_an_opt_out_the_regex_already_reads_is_left_to_it(self):
+        text = "Please don't call me again."
+        window, _, logs = _window({text: gr.judge_json("opt_out", "don't call me again")})
+        c = await _coordinator(window)
+        injected, _ = await self._turn(c, text)
+        self.assertIn(phone.PHONE_OPT_OUT_TEXT, injected)  # today's immediate exit
+        self.assertIn("opt_out_left_to_detector", _notes(logs))
+        await self._deliver_and_finish(c)
+        self._assert_opted_out(c)
+
+    # ── judge unavailable / latency bound ────────────────────────────────
+
+    async def test_a_judge_timeout_falls_back_to_the_existing_detectors_within_the_bound(self):
+        window, _, logs = _window({_RESCHEDULE: gr.JUDGE_TIMEOUT}, timeout=0.25)
+        c = await _coordinator(window)
+        started = _time.monotonic()
+        injected, _ = await self._turn(c, _RESCHEDULE)
+        elapsed = _time.monotonic() - started
+        self.assertLess(elapsed, 0.25 + 0.2)
+        # Today's path: the regex callback route, no confirm question.
+        self.assertIn("What day and time works for you?", injected)
+        self.assertNotIn(phone.PHONE_REVOCATION_BUSY_CONFIRM_TEXT, injected)
+        self.assertIn("judge_unavailable", _notes(logs))
+        await self._hang_up(c)
+
+    async def test_the_q1_answer_turn_waits_at_most_the_judge_timeout(self):
+        answer = "I have five years of inside sales experience."
+        window, _, _ = _window({answer: gr.JUDGE_TIMEOUT}, timeout=0.3)
+        c = await _coordinator(window)
+        started = _time.monotonic()
+        await self._turn(c, answer)
+        self.assertLess(_time.monotonic() - started, 0.3 + 0.2)
+        await self._hang_up(c)
+
+    async def test_the_verdict_started_on_the_final_is_reused_by_the_turn(self):
+        answer = "I have five years of inside sales experience."
+        window, transport, _ = _window({answer: _UNCLEAR}, timeout=0.6, latency_sec=0.3)
+        c = await _coordinator(window)
+        window.on_final(answer)
+        await asyncio.sleep(0.25)
+        started = _time.monotonic()
+        await self._turn(c, answer)
+        # Only what was left of the in-flight call, not a second call.
+        self.assertLess(_time.monotonic() - started, 0.25)
+        self.assertEqual(len(transport.calls), 1)
+        await self._hang_up(c)
+
+    # ── scope: consent leg only, modes ───────────────────────────────────
+
+    async def test_a_reconnect_leg_never_opens_the_window(self):
+        window, transport, logs = _window({_RESCHEDULE: _busy("Can we reschedule this")})
+        c = await _coordinator(window, gate_events=_RESUMED_LEG)
+        self.assertTrue(window.closed)
+        self.assertEqual(window.close_reason, "not_consent_leg")
+        injected, _ = await self._turn(c, _RESCHEDULE)
+        self.assertNotIn(phone.PHONE_REVOCATION_BUSY_CONFIRM_TEXT, injected)
+        self.assertIn("What day and time works for you?", injected)  # unchanged path
+        self.assertEqual(transport.calls, [])
+        await self._hang_up(c)
+
+    async def test_an_unarmed_window_and_legacy_mode_are_inert(self):
+        for mode in ("legacy", None):
+            with self.subTest(mode=mode):
+                with _patch.dict(agent_mod.os.environ, {"PHONE_GATE_JUDGE": "legacy"}):
+                    window, transport, logs = _window(
+                        {_RESCHEDULE: _busy("Can we reschedule this")}, mode=mode)
+                self.assertFalse(window.open)
+                window.on_final(_RESCHEDULE)
+                c = await _coordinator(window)
+                injected, _ = await self._turn(c, _RESCHEDULE)
+                self.assertNotIn(phone.PHONE_REVOCATION_BUSY_CONFIRM_TEXT, injected)
+                self.assertIn("What day and time works for you?", injected)
+                self.assertEqual(transport.calls, [])
+                self.assertEqual(_notes(logs), [])
+                await self._hang_up(c)
+
+    async def test_shadow_mode_judges_and_logs_but_never_acts(self):
+        window, transport, logs = _window(
+            {_RESCHEDULE: _busy("Can we reschedule this")}, mode="shadow")
+        self.assertTrue(window.open)
+        c = await _coordinator(window)
+        window.on_final(_RESCHEDULE)
+        injected, _ = await self._turn(c, _RESCHEDULE)
+        self.assertNotIn(phone.PHONE_REVOCATION_BUSY_CONFIRM_TEXT, injected)
+        self.assertIn("What day and time works for you?", injected)
+        await asyncio.sleep(0.1)
+        self.assertEqual(len(transport.calls), 1)
+        self.assertIn("shadow_not_now_busy", _notes(logs))
+        self.assertTrue(any(f.get("error_type") == "phone_gate_shadow_decision" for f in logs))
+        self.assertFalse(any(f.get("error_type") == "phone_gate_decision" for f in logs))
+        await self._hang_up(c)
+
+    # ── contract: no new events, no text in logs, fixed copy ─────────────
+
+    async def test_no_new_event_type_and_no_text_in_the_window_logs(self):
+        window, _, logs = _window({_RESCHEDULE: _busy("Can we reschedule this")})
+        window.on_final(_RESCHEDULE)
+        c = await _coordinator(window)
+        await self._turn(c, "Yes.")
+        await self._hang_up(c)
+        for event_type in c.client.event_types:
+            self.assertIn(event_type, phone.PHONE_WORKER_EVENTS)
+        blob = _json.dumps(logs, default=str).lower()
+        for fragment in ("reschedule", "somewhere", "meera", "example"):
+            self.assertNotIn(fragment, blob)
+        decisions = [f for f in logs if f.get("error_type") == "phone_gate_decision"]
+        self.assertEqual([d["phase"] for d in decisions], ["post_consent"])
+        self.assertEqual(decisions[0]["error_category"], "llm.not_now_busy")
+
+    def test_the_confirm_line_is_fixed_gate_copy(self):
+        self.assertEqual(
+            phone.PHONE_REVOCATION_BUSY_CONFIRM_TEXT,
+            "Would you prefer I call you back at a better time?")
+        self.assertTrue(phone.is_gate_copy(phone.PHONE_REVOCATION_BUSY_CONFIRM_TEXT))
+
+    def test_the_confirm_reply_classifier(self):
+        callback = ("Yes.", "Yes, please.", "Okay.", "Sure, call me tomorrow.",
+                    "Yeah that would be better.", "Please call me later.")
+        carry_on = ("No.", "No, it's fine, let's continue.", "No thanks, go on.",
+                    "Go ahead with the questions.", "I'm free now.",
+                    "I have five years of experience in sales.", "", "Hmm.")
+        for text in callback:
+            with self.subTest(text=text):
+                self.assertEqual(phone.classify_revocation_busy_confirm_reply(text),
+                                 phone.REVOCATION_CONFIRM_CALLBACK)
+        for text in carry_on:
+            with self.subTest(text=text):
+                self.assertEqual(phone.classify_revocation_busy_confirm_reply(text),
+                                 phone.REVOCATION_CONFIRM_CONTINUE)
+
+    def test_the_prompt_says_an_answer_is_not_a_revocation(self):
+        system = gate_judge._JUDGE_SYSTEM_PROMPT
+        self.assertIn("post_consent", system)
+        self.assertIn("Answering that question is never a revocation", system)
+        self.assertNotIn(_RESCHEDULE, system)
+        self.assertNotIn(_BUSY_AT_WORK, system)
+
+    def test_the_session_arms_on_a_grant_and_feeds_every_final(self):
+        import inspect
+        src = inspect.getsource(agent_mod._run_phone_session)
+        classify = src[src.index("async def classify() -> str:"):]
+        self.assertIn("if outcome == phone.CLASSIFY_HUMAN:", classify[:1400])
+        self.assertIn("revocation_window.arm()", classify[:1400])
+        transcript = src[src.index("def _on_phone_transcript_activity"):]
+        self.assertIn("revocation_window.on_final(", transcript[:2000])
+        self.assertIn("revocation_window=revocation_window,", src)
+        # The C7 regression suite runs the same coordinator unchanged.
+        coord = inspect.signature(agent_mod._run_native_phone_screening)
+        self.assertIsNone(coord.parameters["revocation_window"].default)
+
+
 if __name__ == "__main__":
     unittest.main()

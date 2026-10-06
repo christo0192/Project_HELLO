@@ -465,6 +465,16 @@ PHONE_WITHDRAWAL_CONFIRM_REASK_TEXT = (
     "Sorry, just so I get this right: should I stop here, or carry on with "
     "the questions?"
 )
+# M013 S01 T07: the ONE confirmation asked when, right after consent (during
+# the role line or the first question), the judge reads the candidate as busy
+# ("can we reschedule this, I'm out somewhere"). A yes goes to the existing
+# in-call callback path; a no, or an answer, carries on with the first
+# question. Asked before anything ends, so a Q1 answer like "I'm busy with a
+# project at work" can never end the screening. Fixed copy: it is gate copy,
+# never a screening turn.
+PHONE_REVOCATION_BUSY_CONFIRM_TEXT = (
+    "Would you prefer I call you back at a better time?"
+)
 # ── The consent re-ask, worded by WHY it is asked (M013 S01 T02) ──────────
 # Asked at most once when the first reply cannot be read as an outcome. Consent
 # must be affirmative, so an unreadable answer is re-asked rather than assumed
@@ -1013,6 +1023,8 @@ def gate_copy_texts() -> frozenset[str]:
         # open question's boundary as if it were a screening turn.
         PHONE_WITHDRAWAL_CONFIRM_TEXT,
         PHONE_WITHDRAWAL_CONFIRM_REASK_TEXT,
+        # M013 S01 T07: the post-consent busy confirmation.
+        PHONE_REVOCATION_BUSY_CONFIRM_TEXT,
         PHONE_WRONG_NUMBER_TEXT,
         PHONE_ASSESSMENT_CLOSING_TEXT,
         PHONE_CANDIDATE_END_TEXT,
@@ -9511,6 +9523,49 @@ def classify_withdrawal_confirm_reply(text: Any) -> str:
     if go_on and not stop:
         return WITHDRAWAL_REPLY_CONTINUE
     return WITHDRAWAL_REPLY_AMBIGUOUS
+
+
+# ── M013 S01 T07: the reply to PHONE_REVOCATION_BUSY_CONFIRM_TEXT ─────────
+REVOCATION_CONFIRM_CALLBACK = "callback"
+REVOCATION_CONFIRM_CONTINUE = "continue"
+
+_RV_YES_RE = re.compile(
+    r"^\s*(?:yes|yeah|yep|yup|ya|yah|haan|haa|han|ji|sure|please|ok|okay|"
+    r"alright|all\s+right|definitely|of\s+course|that\s+would\s+be\s+"
+    r"(?:better|great|good|nice)|that'?s\s+better|better)\b",
+    re.IGNORECASE,
+)
+_RV_NO_RE = re.compile(
+    r"\b(?:no|nope|nah|nahi|not\s+needed|no\s+need|it'?s\s+(?:fine|okay|ok|alright)|"
+    r"(?:i'?m|i\s+am)\s+(?:fine|free|okay|ok|good|available)(?:\s+now)?|"
+    r"(?:now|this)\s+is\s+(?:fine|okay|ok|good))\b",
+    re.IGNORECASE,
+)
+
+
+def classify_revocation_busy_confirm_reply(text: Any) -> str:
+    """Classify the reply to PHONE_REVOCATION_BUSY_CONFIRM_TEXT (M013 T07).
+
+    ``callback`` only on a clear yes or a callback request ("yes", "please",
+    "call me later"); everything else (a no, "carry on", an answer to the
+    question, silence-shaped noise) is ``continue``. Wrongly carrying on is
+    recoverable (the candidate can still ask for a callback, which the
+    ordinary in-call path books); wrongly ending the screening is not, so an
+    unclear reply carries on. A withdrawal-shaped reply is the caller's to
+    route to the existing withdrawal confirmation before this is consulted.
+    """
+    value = _wd_normalise(text)
+    if not value:
+        return REVOCATION_CONFIRM_CONTINUE
+    if classify_withdrawal_confirm_reply(value) == WITHDRAWAL_REPLY_CONTINUE:
+        return REVOCATION_CONFIRM_CONTINUE
+    if candidate_turn_route(value) == "callback_deferral":
+        return REVOCATION_CONFIRM_CALLBACK
+    if _RV_NO_RE.search(value):
+        return REVOCATION_CONFIRM_CONTINUE
+    if _RV_YES_RE.match(value):
+        return REVOCATION_CONFIRM_CALLBACK
+    return REVOCATION_CONFIRM_CONTINUE
 
 
 # Post-plan candidate Q&A is deliberately bounded. Five real questions is
