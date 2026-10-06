@@ -150,7 +150,9 @@ begin
   select coalesce(sum(l.seconds)/60.0,0) into v_ledger_since from screening_v2.r1_usage_ledger l where l.occurred_at >= coalesce(v_settings.dashboard_read_at, p_now);
   select coalesce(e.r1_minutes + e.phone_minutes + e.legacy_browser_minutes,0) into v_pure from screening_v2.v_webrtc_minutes_estimate e where e.month_start=v_month;
   v_guard := greatest(v_settings.dashboard_minutes + v_ledger_since, v_pure) * 1.15;
-  if greatest(v_budget.minutes_used + v_budget.minutes_reserved, v_guard) + 55 > least(v_settings.monthly_cap_minutes,v_settings.pause_line_minutes) then return jsonb_build_object('status','capacity_exhausted'); end if;
+  -- Holds are FUTURE minutes the estimate cannot contain, so they are always
+  -- added. Only admitted minutes overlap the estimate's R1 actuals (greatest).
+  if greatest(v_budget.minutes_used, v_guard) + v_budget.minutes_reserved + 55 > least(v_settings.monthly_cap_minutes,v_settings.pause_line_minutes) then return jsonb_build_object('status','capacity_exhausted'); end if;
   insert into screening_v2.interview_rounds(id,candidate_id,role_id,kind,link_token_digest,expires_at,candidate_status_at_send,created_by,held_minutes,hold_month) values(v_round,p_candidate_id,p_role_id,'sales_r1',p_link_token_digest,p_expires_at,p_candidate_status_at_send,p_created_by,55,v_month);
   update screening_v2.r1_budget_month set minutes_reserved=minutes_reserved+55,updated_at=p_now where month_start=v_month;
   return jsonb_build_object('status','ok','id',v_round,'round_status','invited','expires_at',p_expires_at);
@@ -284,7 +286,8 @@ begin
    select coalesce(sum(seconds)/60.0,0) into v_ledger_since from screening_v2.r1_usage_ledger where occurred_at>=coalesce(v_settings.dashboard_read_at,p_now);
    select coalesce(r1_minutes+phone_minutes+legacy_browser_minutes,0) into v_pure from screening_v2.v_webrtc_minutes_estimate where month_start=v_month;
    v_guard:=greatest(v_settings.dashboard_minutes+v_ledger_since,v_pure)*1.15;
-   if greatest(v_budget.minutes_used+v_budget.minutes_reserved,v_guard)+v_hold>least(v_settings.monthly_cap_minutes,v_settings.pause_line_minutes) then return jsonb_build_object('status','capacity_exhausted'); end if;
+   -- Same rule as r1_send_round: outstanding holds add to the estimate.
+   if greatest(v_budget.minutes_used,v_guard)+v_budget.minutes_reserved+v_hold>least(v_settings.monthly_cap_minutes,v_settings.pause_line_minutes) then return jsonb_build_object('status','capacity_exhausted'); end if;
    update screening_v2.r1_budget_month set minutes_used=minutes_used+v_hold,starts_admitted=starts_admitted+1,updated_at=p_now where month_start=v_hold_month;
  else
    update screening_v2.r1_budget_month set minutes_reserved=greatest(0,minutes_reserved-v_round.held_minutes),minutes_used=minutes_used+v_round.held_minutes,starts_admitted=starts_admitted+1,updated_at=p_now where month_start=v_hold_month;

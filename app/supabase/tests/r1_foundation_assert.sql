@@ -344,6 +344,50 @@ begin
 end;
 $$;
 
+-- Outstanding holds are FUTURE minutes the estimate cannot contain (plan section
+-- 3.3), so they count ON TOP of an estimate that already exceeds admitted plus
+-- reserved minutes. The pre-fix rule, greatest(used + reserved, guard) + hold,
+-- silently dropped every reservation once phone usage dominated the estimate.
+do $$
+declare
+  owner constant uuid := '10000000-0000-4000-8000-000000000001';
+  role_r1 constant uuid := '10000000-0000-4000-8000-000000000002';
+  first_candidate constant uuid := '10000000-0000-4000-8000-000000000083';
+  second_candidate constant uuid := '10000000-0000-4000-8000-000000000084';
+  first_sent jsonb; second_sent jsonb; guard numeric; used numeric; reserved numeric;
+begin
+  insert into screening_v2.candidates(id, role_id, name) values
+    (first_candidate, role_r1, 'reservation one'),
+    (second_candidate, role_r1, 'reservation two');
+  update screening_v2.r1_settings
+     set enabled = true, paused = false, livekit_target = 'r1',
+         monthly_cap_minutes = 100000, pause_line_minutes = 100000,
+         dashboard_minutes = 5000, dashboard_read_at = now();
+  first_sent := screening_v2.r1_send_round(first_candidate, role_r1, owner,
+    encode(sha256('r1-reservation-one'::bytea), 'hex'), null, now() + interval '1 hour');
+  select greatest(5000, coalesce((select e.r1_minutes + e.phone_minutes + e.legacy_browser_minutes
+           from screening_v2.v_webrtc_minutes_estimate e
+          where e.month_start = date_trunc('month', now())::date), 0)) * 1.15
+    into guard;
+  select minutes_used, minutes_reserved into used, reserved
+    from screening_v2.r1_budget_month where month_start = date_trunc('month', now())::date;
+  -- One minute short of fitting another hold once reservations are counted.
+  update screening_v2.r1_settings
+     set monthly_cap_minutes = ceil(greatest(used, guard) + reserved) + 54,
+         pause_line_minutes = ceil(greatest(used, guard) + reserved) + 54;
+  second_sent := screening_v2.r1_send_round(second_candidate, role_r1, owner,
+    encode(sha256('r1-reservation-two'::bytea), 'hex'), null, now() + interval '1 hour');
+  perform _r1_tests.assert('outstanding holds count on top of a dominant estimate',
+    first_sent->>'status' = 'ok' and reserved >= 55 and guard > used + reserved
+      and second_sent->>'status' = 'capacity_exhausted',
+    second_sent::text);
+  perform screening_v2.r1_transition_round((first_sent->>'id')::uuid, 'cancel', 1, null, null);
+  update screening_v2.r1_settings
+     set monthly_cap_minutes = 10000, pause_line_minutes = 10000,
+         dashboard_minutes = 0, dashboard_read_at = now();
+end;
+$$;
+
 -- A hold belongs to its originating budget month.  A February cancellation of
 -- a January Send must release January and must not create or touch February.
 do $$
