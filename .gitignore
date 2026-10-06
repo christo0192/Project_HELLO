@@ -82,3 +82,6 @@ Thumbs.db
 
 # Phase-0 evidence manifest (real evidence stays local; only the example is committed)
 config/phase0-evidence.local.json
+
+# S0-B raw per-turn logs contain LLM-invented contact details: never commit
+app/voice-livekit/spikes/r1_s0b/results/*.jsonl
